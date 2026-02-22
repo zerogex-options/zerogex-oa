@@ -1,18 +1,24 @@
-# src/ingestion/__init__.py
 """
 Data ingestion modules for ZeroGEX
+
+Components:
+- TradeStationAuth: OAuth2 authentication manager
+- TradeStationClient: Market data API client with retry logic
+- BackfillManager: Historical data fetching (yields data to MainEngine)
+- StreamManager: Real-time data fetching (yields data to MainEngine)
+- MainEngine: Orchestration, aggregation, and storage
 """
 
-from .tradestation_auth import TradeStationAuth
-from .tradestation_client import TradeStationClient
-from .backfill_manager import BackfillManager
-from .stream_manager import StreamManager
-from .main_engine import MainEngine
+from src.ingestion.tradestation_auth import TradeStationAuth
+from src.ingestion.tradestation_client import TradeStationClient
+from src.ingestion.backfill_manager import BackfillManager
+from src.ingestion.stream_manager import StreamManager
+from src.ingestion.main_engine import MainEngine
 
 __all__ = [
-    'TradeStationAuth',
-    'TradeStationClient', 
-    'BackfillManager',
-    'StreamManager',
-    'MainEngine'
+    "TradeStationAuth",
+    "TradeStationClient", 
+    "BackfillManager",
+    "StreamManager",
+    "MainEngine",
 ]

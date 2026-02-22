@@ -1,23 +1,39 @@
 """
-Underlying Quote and Options Chain Streaming Manager
+Stream Manager - Streams real-time data and yields to MainEngine
 
-Streams real-time underlying quotes and options chain data for a given symbol.
-Configurable by number of expirations and strike distance from current price.
+This manager ONLY fetches data from TradeStation API.
+Storage is handled by MainEngine.
 """
 
-import os
 import time
-import json
-from datetime import datetime, date, timedelta
-from typing import List, Dict, Any, Optional, Set
+from datetime import datetime, date
+from typing import Generator, List, Dict, Any, Optional, Set
+import pytz
+
 from src.ingestion.tradestation_client import TradeStationClient
 from src.utils import get_logger
+from src.validation import (
+    safe_float, safe_int, safe_datetime,
+    validate_quote_data, get_market_session
+)
+from src.config import (
+    OPTION_BATCH_SIZE,
+    MARKET_HOURS_POLL_INTERVAL,
+    EXTENDED_HOURS_POLL_INTERVAL,
+    CLOSED_HOURS_POLL_INTERVAL,
+    STRIKE_RECALC_INTERVAL,
+    PRICE_MOVE_THRESHOLD,
+    STRIKE_CLEANUP_INTERVAL,
+)
 
 logger = get_logger(__name__)
 
+# Eastern Time timezone
+ET = pytz.timezone("US/Eastern")
+
 
 class StreamManager:
-    """Manages streaming of underlying quotes and options chain data"""
+    """Manages streaming of real-time underlying and options data"""
 
     def __init__(
         self,
@@ -25,23 +41,12 @@ class StreamManager:
         underlying: str = "SPY",
         num_expirations: int = 3,
         strike_distance: float = 10.0,
-        poll_interval: int = 5
     ):
-        """
-        Initialize options stream manager
-
-        Args:
-            client: TradeStationClient instance
-            underlying: Underlying symbol to track (default: SPY)
-            num_expirations: Number of expiration dates to track from today (default: 3)
-            strike_distance: Strike distance from current price (default: 10.0)
-            poll_interval: Seconds between polls (default: 5)
-        """
+        """Initialize stream manager"""
         self.client = client
         self.underlying = underlying.upper()
         self.num_expirations = num_expirations
         self.strike_distance = strike_distance
-        self.poll_interval = poll_interval
 
         # Track state
         self.current_price: Optional[float] = None
@@ -49,29 +54,27 @@ class StreamManager:
         self.tracked_strikes: Set[float] = set()
         self.tracked_option_symbols: List[str] = []
 
+        # Track expired strikes for cleanup
+        self.all_tracked_strikes: Dict[date, Set[float]] = {}
+
         logger.info(f"Initialized StreamManager for {underlying}")
-        logger.info(f"Config: {num_expirations} expirations, ±${strike_distance} strikes, {poll_interval}s interval")
+        logger.info(f"Config: {num_expirations} expirations, ±${strike_distance} strikes")
 
     def _get_underlying_price(self) -> Optional[float]:
-        """
-        Fetch current underlying price
-
-        Returns:
-            Current price or None if unavailable
-        """
+        """Fetch current underlying price"""
         try:
             quote_data = self.client.get_quote(self.underlying, warn_if_closed=False)
 
-            if 'Quotes' not in quote_data or len(quote_data['Quotes']) == 0:
+            if "Quotes" not in quote_data or len(quote_data["Quotes"]) == 0:
                 logger.warning(f"No quote data returned for {self.underlying}")
                 return None
 
-            quote = quote_data['Quotes'][0]
-            price = float(quote.get('Last', 0))
+            quote = quote_data["Quotes"][0]
+            price = safe_float(quote.get("Last"), field_name="Last")
 
             if price == 0:
-                logger.warning(f"Price is 0 for {self.underlying}, trying Close or Bid")
-                price = float(quote.get('Close', quote.get('Bid', 0)))
+                logger.warning(f"Price is 0, trying Close or Bid")
+                price = safe_float(quote.get("Close", quote.get("Bid")), field_name="Close/Bid")
 
             logger.debug(f"Current {self.underlying} price: ${price:.2f}")
             return price
@@ -81,12 +84,7 @@ class StreamManager:
             return None
 
     def _get_target_expirations(self) -> List[date]:
-        """
-        Get target expiration dates based on configuration
-
-        Returns:
-            List of expiration dates (sorted)
-        """
+        """Get target expiration dates"""
         try:
             all_expirations = self.client.get_option_expirations(self.underlying)
 
@@ -94,7 +92,7 @@ class StreamManager:
                 logger.warning(f"No expirations found for {self.underlying}")
                 return []
 
-            # Filter to expirations >= today
+            # Filter to future expirations
             today = date.today()
             future_expirations = [exp for exp in all_expirations if exp >= today]
 
@@ -102,7 +100,7 @@ class StreamManager:
                 logger.warning("No future expirations available")
                 return []
 
-            # Take first N expirations
+            # Take first N
             target_exps = future_expirations[:self.num_expirations]
 
             logger.info(f"Target expirations: {[str(exp) for exp in target_exps]}")
@@ -113,25 +111,15 @@ class StreamManager:
             return []
 
     def _get_strikes_near_price(self, expiration: date, current_price: float) -> List[float]:
-        """
-        Get strikes within configured distance of current price
-
-        Args:
-            expiration: Expiration date
-            current_price: Current underlying price
-
-        Returns:
-            List of strikes within range
-        """
+        """Get strikes within configured distance"""
         try:
-            exp_str = expiration.strftime('%m-%d-%Y')
+            exp_str = expiration.strftime("%m-%d-%Y")
             all_strikes = self.client.get_option_strikes(self.underlying, expiration=exp_str)
 
             if not all_strikes:
-                logger.warning(f"No strikes found for {self.underlying} exp {exp_str}")
+                logger.warning(f"No strikes found for exp {exp_str}")
                 return []
 
-            # Filter strikes within distance
             min_strike = current_price - self.strike_distance
             max_strike = current_price + self.strike_distance
 
@@ -150,28 +138,25 @@ class StreamManager:
             return []
 
     def _build_option_symbols(self) -> List[str]:
-        """
-        Build list of option symbols to track based on current configuration
-
-        Returns:
-            List of option symbols in TradeStation format
-        """
+        """Build list of option symbols to track"""
         if not self.current_price:
-            logger.warning("No current price available, cannot build option symbols")
+            logger.warning("No current price, cannot build option symbols")
             return []
 
         option_symbols = []
+        self.tracked_strikes = set()
+        self.all_tracked_strikes = {}
 
         for expiration in self.target_expirations:
             strikes = self._get_strikes_near_price(expiration, self.current_price)
+            self.all_tracked_strikes[expiration] = set(strikes)
 
             for strike in strikes:
-                # Build both call and put symbols
                 call_symbol = self.client.build_option_symbol(
-                    self.underlying, expiration, 'C', strike
+                    self.underlying, expiration, "C", strike
                 )
                 put_symbol = self.client.build_option_symbol(
-                    self.underlying, expiration, 'P', strike
+                    self.underlying, expiration, "P", strike
                 )
 
                 option_symbols.append(call_symbol)
@@ -179,88 +164,19 @@ class StreamManager:
                 self.tracked_strikes.add(strike)
 
         logger.info(f"Built {len(option_symbols)} option symbols to track")
-        logger.debug(f"Tracking {len(self.tracked_strikes)} unique strikes: "
-                    f"{sorted(self.tracked_strikes)}")
-
         return option_symbols
 
-    def _fetch_underlying_quote(self) -> None:
-        """Fetch and log underlying quote"""
-        try:
-            quote_data = self.client.get_quote(self.underlying, warn_if_closed=False)
+    def _cleanup_expired_strikes(self):
+        """Remove strikes for expired expirations to prevent memory leak"""
+        today = date.today()
+        expired = [exp for exp in self.all_tracked_strikes.keys() if exp < today]
 
-            if 'Quotes' in quote_data and len(quote_data['Quotes']) > 0:
-                quote = quote_data['Quotes'][0]
-
-                logger.debug("="*80)
-                logger.debug(f"UNDERLYING QUOTE: {self.underlying}")
-                logger.debug("-"*80)
-                logger.debug(f"  Last:      ${quote.get('Last', 'N/A')}")
-                logger.debug(f"  Bid:       ${quote.get('Bid', 'N/A')} x {quote.get('BidSize', 0)}")
-                logger.debug(f"  Ask:       ${quote.get('Ask', 'N/A')} x {quote.get('AskSize', 0)}")
-                logger.debug(f"  Volume:    {quote.get('Volume', 0):,}")
-                logger.debug(f"  Timestamp: {quote.get('TimeStamp', 'N/A')}")
-                logger.debug("="*80)
-
-        except Exception as e:
-            logger.error(f"Error fetching underlying quote: {e}", exc_info=True)
-
-    def _fetch_options_quotes(self) -> None:
-        """Fetch and log options chain quotes"""
-        if not self.tracked_option_symbols:
-            logger.warning("No option symbols to track")
-            return
-
-        try:
-            # TradeStation API has a 500 symbol limit per request
-            # Split into batches if needed
-            batch_size = 100
-
-            for i in range(0, len(self.tracked_option_symbols), batch_size):
-                batch = self.tracked_option_symbols[i:i + batch_size]
-
-                logger.debug(f"Fetching quotes for {len(batch)} options...")
-                options_data = self.client.get_option_quotes(batch)
-
-                if 'Quotes' in options_data:
-                    logger.debug("="*80)
-                    logger.debug(f"OPTIONS CHAIN QUOTES (batch {i//batch_size + 1})")
-                    logger.debug("-"*80)
-
-                    for opt_quote in options_data['Quotes']:
-                        symbol = opt_quote.get('Symbol', 'N/A')
-
-                        # Safely convert numeric values
-                        try:
-                            volume = int(opt_quote.get('Volume', 0)) if opt_quote.get('Volume') else 0
-                            open_interest = int(opt_quote.get('OpenInterest', 0)) if opt_quote.get('OpenInterest') else 0
-                        except (ValueError, TypeError):
-                            volume = 0
-                            open_interest = 0
-
-                        logger.debug(f"  {symbol}")
-                        logger.debug(f"    Last: ${opt_quote.get('Last', 'N/A')} | "
-                                   f"Bid: ${opt_quote.get('Bid', 'N/A')} x {opt_quote.get('BidSize', 0)} | "
-                                   f"Ask: ${opt_quote.get('Ask', 'N/A')} x {opt_quote.get('AskSize', 0)}")
-                        logger.debug(f"    Volume: {volume:,} | "
-                                   f"OpenInterest: {open_interest:,}")
-
-                    logger.debug("="*80)
-
-                # Small delay between batches
-                if i + batch_size < len(self.tracked_option_symbols):
-                    time.sleep(0.5)
-
-        except Exception as e:
-            logger.error(f"Error fetching options quotes: {e}", exc_info=True)
+        for exp in expired:
+            del self.all_tracked_strikes[exp]
+            logger.debug(f"Cleaned up strikes for expired expiration: {exp}")
 
     def initialize(self) -> bool:
-        """
-        Initialize stream by fetching expirations and building symbol list
-
-        Returns:
-            True if successful, False otherwise
-        """
+        """Initialize stream"""
         logger.info(f"Initializing stream for {self.underlying}...")
 
         # Get current price
@@ -275,175 +191,184 @@ class StreamManager:
             logger.error("Failed to get target expirations")
             return False
 
-        # Build option symbols list
+        # Build option symbols
         self.tracked_option_symbols = self._build_option_symbols()
         if not self.tracked_option_symbols:
-            logger.error("Failed to build option symbols list")
+            logger.error("Failed to build option symbols")
             return False
 
         logger.info(f"✅ Initialization complete:")
-        logger.info(f"   Underlying price: ${self.current_price:.2f}")
+        logger.info(f"   Price: ${self.current_price:.2f}")
         logger.info(f"   Tracking {len(self.target_expirations)} expirations")
         logger.info(f"   Tracking {len(self.tracked_option_symbols)} option contracts")
 
         return True
 
-    def stream(self, max_iterations: Optional[int] = None) -> None:
+    def stream(
+        self,
+        max_iterations: Optional[int] = None
+    ) -> Generator[Dict[str, Any], None, None]:
         """
-        Start streaming loop
+        Stream real-time data and yield to caller
 
-        Args:
-            max_iterations: Maximum iterations (None for infinite)
+        Yields dictionaries with:
+            {
+                'type': 'underlying' | 'option',
+                'data': {...}
+            }
         """
         if not self.tracked_option_symbols:
             logger.error("Not initialized. Call initialize() first.")
             return
 
-        logger.info(f"Starting stream loop (poll interval: {self.poll_interval}s)...")
+        logger.info("Starting stream loop...")
         logger.info("Press Ctrl+C to stop")
 
         iteration = 0
 
-        try:
-            while True:
-                iteration += 1
-                logger.info(f"\n{'='*80}")
-                logger.info(f"ITERATION {iteration} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                logger.info(f"{'='*80}")
+        while True:
+            iteration += 1
 
+            # Get current market session for dynamic polling
+            session = get_market_session()
+
+            # Determine poll interval based on session
+            if session == "regular":
+                poll_interval = MARKET_HOURS_POLL_INTERVAL
+            elif session in ["pre-market", "after-hours"]:
+                poll_interval = EXTENDED_HOURS_POLL_INTERVAL
+            else:  # closed
+                poll_interval = CLOSED_HOURS_POLL_INTERVAL
+
+            logger.info(f"Iteration {iteration} - {datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S ET')} "
+                       f"[{session}]")
+
+            try:
                 # Fetch underlying quote
-                self._fetch_underlying_quote()
+                quote_data = self.client.get_quote(self.underlying, warn_if_closed=False)
 
-                # Fetch options quotes
-                self._fetch_options_quotes()
+                if "Quotes" in quote_data and len(quote_data["Quotes"]) > 0:
+                    quote = quote_data["Quotes"][0]
 
-                # Check if we should update price and recalculate strikes
-                # (every 10 iterations, check if price moved significantly)
-                if iteration % 10 == 0:
+                    # Validate quote
+                    if validate_quote_data(quote):
+                        # Parse timestamp
+                        timestamp_str = quote.get("TimeStamp", "")
+                        timestamp = safe_datetime(timestamp_str, field_name="TimeStamp")
+
+                        if not timestamp:
+                            timestamp = datetime.now(ET)
+
+                        # Parse quote data
+                        last = safe_float(quote.get("Last"), field_name="Last")
+                        bid = safe_float(quote.get("Bid"), field_name="Bid")
+                        ask = safe_float(quote.get("Ask"), field_name="Ask")
+                        volume = safe_int(quote.get("Volume"), field_name="Volume")
+
+                        # Yield underlying data
+                        underlying_data = {
+                            "symbol": self.underlying,
+                            "timestamp": timestamp,
+                            "last": last,
+                            "bid": bid,
+                            "ask": ask,
+                            "volume": volume,
+                        }
+
+                        logger.debug(f"{self.underlying}: Last=${last:.2f} "
+                                   f"Bid=${bid:.2f}x{quote.get('BidSize', 0)} "
+                                   f"Ask=${ask:.2f}x{quote.get('AskSize', 0)} "
+                                   f"Vol={volume:,}")
+
+                        yield {"type": "underlying", "data": underlying_data}
+
+                # Fetch options quotes in batches
+                for i in range(0, len(self.tracked_option_symbols), OPTION_BATCH_SIZE):
+                    batch = self.tracked_option_symbols[i:i + OPTION_BATCH_SIZE]
+
+                    try:
+                        options_data = self.client.get_option_quotes(batch)
+
+                        if "Quotes" in options_data:
+                            for opt_quote in options_data["Quotes"]:
+                                # Parse option symbol
+                                option_symbol = opt_quote.get("Symbol", "")
+                                parts = option_symbol.split()
+
+                                if len(parts) < 2:
+                                    continue
+
+                                option_part = parts[1]
+                                option_type = "C" if "C" in option_part else "P"
+
+                                exp_str = option_part[:6]
+                                try:
+                                    expiration = datetime.strptime(exp_str, "%y%m%d").date()
+                                except ValueError:
+                                    continue
+
+                                strike_str = option_part.split(option_type)[1]
+                                strike = safe_float(strike_str, field_name="strike")
+
+                                # Parse timestamp
+                                timestamp_str = opt_quote.get("TimeStamp", "")
+                                timestamp = safe_datetime(timestamp_str, field_name="TimeStamp")
+
+                                if not timestamp:
+                                    timestamp = datetime.now(ET)
+
+                                # Parse quote data
+                                last = safe_float(opt_quote.get("Last"), field_name="Last")
+                                bid = safe_float(opt_quote.get("Bid"), field_name="Bid")
+                                ask = safe_float(opt_quote.get("Ask"), field_name="Ask")
+                                volume = safe_int(opt_quote.get("Volume"), field_name="Volume")
+                                open_interest = safe_int(opt_quote.get("OpenInterest"), 
+                                                        field_name="OpenInterest")
+
+                                # Yield option data
+                                option_data = {
+                                    "option_symbol": option_symbol,
+                                    "timestamp": timestamp,
+                                    "underlying": self.underlying,
+                                    "strike": strike,
+                                    "expiration": expiration,
+                                    "option_type": option_type,
+                                    "last": last,
+                                    "bid": bid,
+                                    "ask": ask,
+                                    "volume": volume,
+                                    "open_interest": open_interest,
+                                }
+
+                                yield {"type": "option", "data": option_data}
+
+                    except Exception as e:
+                        logger.error(f"Error fetching options batch: {e}")
+
+                # Check if we should recalculate strikes
+                if iteration % STRIKE_RECALC_INTERVAL == 0:
                     new_price = self._get_underlying_price()
-                    if new_price and abs(new_price - self.current_price) > 1.0:
+                    if new_price and abs(new_price - self.current_price) > PRICE_MOVE_THRESHOLD:
                         logger.info(f"Price moved from ${self.current_price:.2f} to ${new_price:.2f}")
                         logger.info("Recalculating tracked strikes...")
                         self.current_price = new_price
                         self.tracked_option_symbols = self._build_option_symbols()
+
+                # Cleanup expired strikes periodically
+                if iteration % STRIKE_CLEANUP_INTERVAL == 0:
+                    self._cleanup_expired_strikes()
 
                 # Check max iterations
                 if max_iterations and iteration >= max_iterations:
                     logger.info(f"Reached max iterations ({max_iterations})")
                     break
 
-                # Sleep until next poll
-                logger.debug(f"Sleeping for {self.poll_interval} seconds...")
-                time.sleep(self.poll_interval)
+                # Sleep with dynamic interval
+                logger.debug(f"Sleeping for {poll_interval}s...")
+                time.sleep(poll_interval)
 
-        except KeyboardInterrupt:
-            logger.info("\n\n⚠️  Stream interrupted by user")
-        except Exception as e:
-            logger.error(f"Stream error: {e}", exc_info=True)
-        finally:
-            logger.info("Stream stopped")
+            except Exception as e:
+                logger.error(f"Stream iteration error: {e}", exc_info=True)
+                time.sleep(poll_interval)
 
-
-def main():
-    """Main entry point with argument parsing"""
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description='Stream real-time underlying and options chain data',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
-Examples:
-  # Stream SPY with defaults (3 expirations, ±$10 strikes, 5s interval)
-  python -m src.ingestion.options_stream
-
-  # Stream AAPL with custom configuration
-  python -m src.ingestion.options_stream --underlying AAPL --expirations 5 --strike-distance 20
-
-  # Test with just 10 iterations
-  python -m src.ingestion.options_stream --max-iterations 10
-
-  # Fast polling with debug logging
-  python -m src.ingestion.options_stream --interval 2 --debug
-
-Environment Variables (.env):
-  TRADESTATION_CLIENT_ID           Required: Your API client ID
-  TRADESTATION_CLIENT_SECRET       Required: Your API client secret
-  TRADESTATION_REFRESH_TOKEN       Required: Your refresh token
-  TRADESTATION_USE_SANDBOX=false   Optional: Use sandbox environment
-  LOG_LEVEL=INFO                   Optional: Logging level
-
-  Stream Configuration (optional):
-  STREAM_UNDERLYING=SPY            Underlying symbol (default: SPY)
-  STREAM_EXPIRATIONS=3             Number of expirations (default: 3)
-  STREAM_STRIKE_DISTANCE=10.0      Strike distance from price (default: 10.0)
-  STREAM_POLL_INTERVAL=5           Seconds between polls (default: 5)
-        '''
-    )
-
-    parser.add_argument('--underlying', type=str,
-                       help='Underlying symbol (default: SPY, env: STREAM_UNDERLYING)')
-    parser.add_argument('--expirations', type=int,
-                       help='Number of expirations to track (default: 3, env: STREAM_EXPIRATIONS)')
-    parser.add_argument('--strike-distance', type=float,
-                       help='Strike distance from current price (default: 10.0, env: STREAM_STRIKE_DISTANCE)')
-    parser.add_argument('--interval', type=int,
-                       help='Poll interval in seconds (default: 5, env: STREAM_POLL_INTERVAL)')
-    parser.add_argument('--max-iterations', type=int,
-                       help='Maximum iterations (default: infinite)')
-    parser.add_argument('--debug', action='store_true',
-                       help='Enable debug logging')
-
-    args = parser.parse_args()
-
-    # Load from env with CLI override
-    underlying = args.underlying or os.getenv('STREAM_UNDERLYING', 'SPY')
-    num_expirations = args.expirations or int(os.getenv('STREAM_EXPIRATIONS', '3'))
-    strike_distance = args.strike_distance or float(os.getenv('STREAM_STRIKE_DISTANCE', '10.0'))
-    poll_interval = args.interval or int(os.getenv('STREAM_POLL_INTERVAL', '5'))
-
-    # Set logging
-    if args.debug or os.getenv('LOG_LEVEL', '').upper() == 'DEBUG':
-        from src.utils import set_log_level
-        set_log_level('DEBUG')
-
-    print("\n" + "="*80)
-    print("Options Chain Streaming")
-    print("="*80)
-    print(f"Underlying:       {underlying}")
-    print(f"Expirations:      {num_expirations}")
-    print(f"Strike Distance:  ±${strike_distance}")
-    print(f"Poll Interval:    {poll_interval}s")
-    print("="*80 + "\n")
-
-    # Initialize client
-    try:
-        client = TradeStationClient(
-            os.getenv('TRADESTATION_CLIENT_ID'),
-            os.getenv('TRADESTATION_CLIENT_SECRET'),
-            os.getenv('TRADESTATION_REFRESH_TOKEN'),
-            sandbox=os.getenv('TRADESTATION_USE_SANDBOX', 'false').lower() == 'true'
-        )
-    except Exception as e:
-        logger.error(f"Failed to initialize TradeStation client: {e}")
-        return
-
-    # Create stream manager
-    stream_manager = StreamManager(
-        client=client,
-        underlying=underlying,
-        num_expirations=num_expirations,
-        strike_distance=strike_distance,
-        poll_interval=poll_interval
-    )
-
-    # Initialize
-    if not stream_manager.initialize():
-        logger.error("Failed to initialize stream")
-        return
-
-    # Start streaming
-    stream_manager.stream(max_iterations=args.max_iterations)
-
-
-if __name__ == '__main__':
-    main()
+        logger.info("Stream stopped")
