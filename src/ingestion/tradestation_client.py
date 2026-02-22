@@ -89,8 +89,33 @@ class TradeStationClient:
 
             if response.status_code in [200, 201]:
                 result = response.json()
-                logger.debug(f"Response: {json.dumps(result, indent=2)}...")
+                logger.debug(f"Response: {json.dumps(result, indent=2)[:1000]}...")
                 return result
+
+            # Handle 404 "No data available" - don't retry, just return empty
+            if response.status_code == 404:
+                try:
+                    error_data = response.json()
+                    if error_data.get("Message") == "No data available.":
+                        logger.warning(f"No data available for request (404) - this is normal for weekends/holidays")
+                        # Return empty but valid response structure based on endpoint
+                        if "barcharts" in endpoint:
+                            return {"Bars": []}
+                        elif "quotes" in endpoint:
+                            return {"Quotes": []}
+                        elif "expirations" in endpoint:
+                            return {"Expirations": []}
+                        elif "strikes" in endpoint:
+                            return {"Strikes": []}
+                        else:
+                            return {}
+                except:
+                    pass
+
+                # For other 404s, log and raise
+                logger.error(f"API request failed: {response.status_code}")
+                logger.error(f"Response: {response.text}")
+                response.raise_for_status()
 
             # Handle rate limiting with exponential backoff
             if response.status_code == 429:
@@ -225,6 +250,7 @@ class TradeStationClient:
             option_symbols = ",".join(option_symbols)
 
         logger.info(f"Fetching option quotes for {len(option_symbols.split(','))} symbols")
+        logger.debug(f"{option_symbols.split(',')}")
         return self._request("GET", f"marketdata/quotes/{option_symbols}")
 
     def search_symbols(self, search: str) -> List[Dict[str, Any]]:

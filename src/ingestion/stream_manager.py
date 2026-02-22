@@ -372,3 +372,103 @@ class StreamManager:
                 time.sleep(poll_interval)
 
         logger.info("Stream stopped")
+
+
+def main():
+    """Standalone streaming for testing"""
+    import argparse
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    parser = argparse.ArgumentParser(description="Stream real-time options data")
+    parser.add_argument("--underlying", default=os.getenv("STREAM_UNDERLYING", "SPY"),
+                       help="Underlying symbol (default: SPY)")
+    parser.add_argument("--expirations", type=int,
+                       default=int(os.getenv("STREAM_EXPIRATIONS", "3")),
+                       help="Number of expirations to track (default: 3)")
+    parser.add_argument("--strike-distance", type=float,
+                       default=float(os.getenv("STREAM_STRIKE_DISTANCE", "10.0")),
+                       help="Strike distance from price (default: 10.0)")
+    parser.add_argument("--max-iterations", type=int,
+                       help="Maximum iterations (default: unlimited)")
+    parser.add_argument("--debug", action="store_true",
+                       help="Enable debug logging")
+
+    args = parser.parse_args()
+
+    # Set logging level
+    if args.debug:
+        from src.utils import set_log_level
+        set_log_level("DEBUG")
+
+    print("\n" + "="*80)
+    print("STREAM MANAGER - STANDALONE TEST")
+    print("="*80)
+    print(f"Underlying: {args.underlying}")
+    print(f"Expirations: {args.expirations}")
+    print(f"Strike Distance: ±${args.strike_distance}")
+    if args.max_iterations:
+        print(f"Max Iterations: {args.max_iterations}")
+    else:
+        print("Max Iterations: Unlimited (press Ctrl+C to stop)")
+    print("="*80 + "\n")
+
+    # Initialize client
+    client = TradeStationClient(
+        os.getenv("TRADESTATION_CLIENT_ID"),
+        os.getenv("TRADESTATION_CLIENT_SECRET"),
+        os.getenv("TRADESTATION_REFRESH_TOKEN"),
+        sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true"
+    )
+
+    # Initialize stream manager
+    manager = StreamManager(
+        client=client,
+        underlying=args.underlying,
+        num_expirations=args.expirations,
+        strike_distance=args.strike_distance
+    )
+
+    # Initialize
+    if not manager.initialize():
+        print("❌ Failed to initialize stream manager")
+        import sys
+        sys.exit(1)
+
+    print()
+
+    # Track counts
+    underlying_count = 0
+    option_count = 0
+
+    try:
+        # Run stream and count yielded items
+        for item in manager.stream(max_iterations=args.max_iterations):
+            if item["type"] == "underlying":
+                underlying_count += 1
+            elif item["type"] == "option":
+                option_count += 1
+
+        print("\n" + "="*80)
+        print("STREAM COMPLETE")
+        print("="*80)
+        print(f"✅ Underlying quotes yielded: {underlying_count}")
+        print(f"✅ Option quotes yielded: {option_count}")
+        print("="*80 + "\n")
+        print("NOTE: This standalone test only YIELDS data, it does NOT store it.")
+        print("Use 'python run.py ingest' to stream AND store data in database.")
+        print()
+
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Stream interrupted by user")
+        print(f"Results: {underlying_count} underlying, {option_count} options yielded")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        logger.error(f"Stream failed: {e}", exc_info=True)
+        import sys
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

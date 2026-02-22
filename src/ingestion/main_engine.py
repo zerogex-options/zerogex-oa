@@ -499,3 +499,56 @@ class MainEngine:
             sys.exit(1)
         finally:
             close_connection_pool()
+
+
+def main():
+    """Main entry point"""
+    import argparse
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    parser = argparse.ArgumentParser(description="ZeroGEX Main Ingestion Engine")
+    parser.add_argument("--underlying", default=os.getenv("INGEST_UNDERLYING", "SPY"),
+                       help="Underlying symbol (default: SPY)")
+    parser.add_argument("--lookback-days", type=int,
+                       default=int(os.getenv("INGEST_LOOKBACK_DAYS", "7")),
+                       help="Days to backfill (default: 7)")
+    parser.add_argument("--expirations", type=int,
+                       default=int(os.getenv("INGEST_EXPIRATIONS", "3")),
+                       help="Number of expirations (default: 3)")
+    parser.add_argument("--strike-distance", type=float,
+                       default=float(os.getenv("INGEST_STRIKE_DISTANCE", "10.0")),
+                       help="Strike distance (default: 10.0)")
+    parser.add_argument("--debug", action="store_true",
+                       help="Enable debug logging")
+
+    args = parser.parse_args()
+
+    # Set logging level
+    if args.debug:
+        from src.utils import set_log_level
+        set_log_level("DEBUG")
+
+    # Initialize client
+    client = TradeStationClient(
+        os.getenv("TRADESTATION_CLIENT_ID"),
+        os.getenv("TRADESTATION_CLIENT_SECRET"),
+        os.getenv("TRADESTATION_REFRESH_TOKEN"),
+        sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true"
+    )
+
+    # Initialize and run engine
+    engine = MainEngine(
+        client=client,
+        underlying=args.underlying,
+        num_expirations=args.expirations,
+        strike_distance=args.strike_distance,
+        lookback_days=args.lookback_days
+    )
+
+    engine.run()
+
+
+if __name__ == "__main__":
+    main()

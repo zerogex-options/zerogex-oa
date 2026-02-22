@@ -3,6 +3,8 @@ Backfill Manager - Fetches historical data and yields to MainEngine
 
 This manager ONLY fetches data from TradeStation API.
 Storage is handled by MainEngine.
+
+Enhanced with progress tracking that accounts for market hours.
 """
 
 import os
@@ -13,7 +15,7 @@ import pytz
 
 from src.ingestion.tradestation_client import TradeStationClient
 from src.utils import get_logger
-from src.validation import safe_float, safe_int, safe_datetime, validate_bar_data
+from src.validation import safe_float, safe_int, safe_datetime, validate_bar_data, is_market_hours
 from src.config import (
     OPTION_BATCH_SIZE,
     DELAY_BETWEEN_BATCHES,
@@ -45,6 +47,50 @@ class BackfillManager:
         logger.info(f"Initialized BackfillManager for {underlying}")
         logger.info(f"Config: {num_expirations} expirations, ±${strike_distance} strikes")
 
+    def _calculate_market_minutes(self, start_date: datetime, end_date: datetime) -> int:
+        """
+        Calculate number of 1-minute market hours between two dates
+
+        Only counts minutes during market hours (including extended hours):
+        - Monday-Friday: 4:00 AM - 8:00 PM ET
+        - Excludes weekends
+
+        Args:
+            start_date: Start datetime
+            end_date: End datetime
+
+        Returns:
+            Number of market minutes
+        """
+        if start_date >= end_date:
+            return 0
+
+        # Ensure datetimes are in ET
+        if start_date.tzinfo != ET:
+            start_date = start_date.astimezone(ET)
+        if end_date.tzinfo != ET:
+            end_date = end_date.astimezone(ET)
+
+        total_minutes = 0
+        current = start_date.replace(second=0, microsecond=0)  # Round to minute
+        end = end_date.replace(second=0, microsecond=0)
+
+        # Market hours: 4:00 AM - 8:00 PM ET (16 hours = 960 minutes per day)
+        market_open = datetime.strptime("04:00:00", "%H:%M:%S").time()
+        market_close = datetime.strptime("20:00:00", "%H:%M:%S").time()
+
+        while current <= end:
+            # Skip weekends
+            if current.weekday() < 5:  # Monday=0, Friday=4
+                current_time = current.time()
+                # Check if within market hours
+                if market_open <= current_time <= market_close:
+                    total_minutes += 1
+
+            current += timedelta(minutes=1)
+
+        return total_minutes
+
     def _get_underlying_bars(
         self,
         start_date: datetime,
@@ -74,7 +120,12 @@ class BackfillManager:
                 return []
 
             bars = bars_data["Bars"]
-            logger.info(f"✅ Retrieved {len(bars)} bars for {self.underlying}")
+
+            # **CRITICAL: Sort bars chronologically (oldest to newest)**
+            # This ensures we always process in chronological order
+            bars.sort(key=lambda x: x.get("TimeStamp", ""))
+
+            logger.info(f"✅ Retrieved {len(bars)} bars for {self.underlying} (sorted oldest→newest)")
 
             return bars
 
@@ -173,6 +224,10 @@ class BackfillManager:
         end_date = datetime.now(timezone.utc)
         start_date = end_date - timedelta(days=lookback_days)
 
+        # Calculate total market minutes for progress tracking
+        total_market_minutes = self._calculate_market_minutes(start_date, end_date)
+        logger.info(f"Total market minutes in range: {total_market_minutes:,}")
+
         # Fetch underlying bars
         bars = self._get_underlying_bars(start_date, end_date, interval, unit)
 
@@ -180,7 +235,12 @@ class BackfillManager:
             logger.error("No bars retrieved, aborting backfill")
             return
 
-        logger.info(f"Processing {len(bars)} bars...")
+        # **Bars are already sorted oldest→newest from _get_underlying_bars**
+        logger.info(f"Processing {len(bars)} bars in chronological order (oldest→newest)...")
+
+        # Track progress
+        minutes_processed = 0
+        last_progress_pct = 0
 
         # Process each bar
         for i, bar in enumerate(bars):
@@ -210,6 +270,17 @@ class BackfillManager:
                 if close_price == 0:
                     logger.warning(f"Bar {i}: Zero close price, skipping")
                     continue
+
+                # **Update progress tracking**
+                # Calculate minutes processed up to this bar
+                minutes_processed = self._calculate_market_minutes(start_date, bar_dt)
+                progress_pct = (minutes_processed / total_market_minutes * 100) if total_market_minutes > 0 else 0
+
+                # Log progress every 5% increment
+                if int(progress_pct / 5) > int(last_progress_pct / 5):
+                    logger.info(f"Progress: {progress_pct:.1f}% [{minutes_processed:,}/{total_market_minutes:,} market minutes] - "
+                               f"Processing {bar_dt.strftime('%Y-%m-%d %H:%M ET')}")
+                    last_progress_pct = progress_pct
 
                 # Yield underlying bar data
                 underlying_data = {
@@ -321,4 +392,116 @@ class BackfillManager:
                 logger.error(f"Error processing bar {i}: {e}", exc_info=True)
                 continue
 
+        # Final progress update
+        logger.info(f"Progress: 100.0% [{total_market_minutes:,}/{total_market_minutes:,} market minutes] - Complete!")
         logger.info("Backfill complete - all data yielded")
+
+
+def main():
+    """Standalone backfill for testing"""
+    import argparse
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    parser = argparse.ArgumentParser(description="Backfill historical options data")
+    parser.add_argument("--underlying", default=os.getenv("BACKFILL_UNDERLYING", "SPY"),
+                       help="Underlying symbol (default: SPY)")
+    parser.add_argument("--lookback-days", type=int, 
+                       default=int(os.getenv("BACKFILL_LOOKBACK_DAYS", "1")),
+                       help="Days to backfill (default: 1)")
+    parser.add_argument("--interval", type=int,
+                       default=int(os.getenv("BACKFILL_INTERVAL", "5")),
+                       help="Bar interval (default: 5)")
+    parser.add_argument("--unit", default=os.getenv("BACKFILL_UNIT", "Minute"),
+                       choices=["Minute", "Daily", "Weekly", "Monthly"],
+                       help="Bar unit (default: Minute)")
+    parser.add_argument("--expirations", type=int,
+                       default=int(os.getenv("BACKFILL_EXPIRATIONS", "3")),
+                       help="Number of expirations to track (default: 3)")
+    parser.add_argument("--strike-distance", type=float,
+                       default=float(os.getenv("BACKFILL_STRIKE_DISTANCE", "10.0")),
+                       help="Strike distance from price (default: 10.0)")
+    parser.add_argument("--sample-every", type=int,
+                       default=int(os.getenv("BACKFILL_SAMPLE_EVERY", "1")),
+                       help="Sample options every N bars (default: 1)")
+    parser.add_argument("--debug", action="store_true",
+                       help="Enable debug logging")
+
+    args = parser.parse_args()
+
+    # Set logging level
+    if args.debug:
+        from src.utils import set_log_level
+        set_log_level("DEBUG")
+
+    print("\n" + "="*80)
+    print("BACKFILL MANAGER - STANDALONE TEST")
+    print("="*80)
+    print(f"Underlying: {args.underlying}")
+    print(f"Lookback: {args.lookback_days} days")
+    print(f"Interval: {args.interval}{args.unit}")
+    print(f"Expirations: {args.expirations}")
+    print(f"Strike Distance: ±${args.strike_distance}")
+    print(f"Sample Every: {args.sample_every} bar(s)")
+    print("="*80 + "\n")
+
+    # Initialize client
+    client = TradeStationClient(
+        os.getenv("TRADESTATION_CLIENT_ID"),
+        os.getenv("TRADESTATION_CLIENT_SECRET"),
+        os.getenv("TRADESTATION_REFRESH_TOKEN"),
+        sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true"
+    )
+
+    # Initialize backfill manager
+    manager = BackfillManager(
+        client=client,
+        underlying=args.underlying,
+        num_expirations=args.expirations,
+        strike_distance=args.strike_distance
+    )
+
+    # Track counts
+    underlying_count = 0
+    option_count = 0
+
+    try:
+        # Run backfill and count yielded items
+        for item in manager.backfill(
+            lookback_days=args.lookback_days,
+            interval=args.interval,
+            unit=args.unit,
+            sample_every_n_bars=args.sample_every
+        ):
+            if item["type"] == "underlying":
+                underlying_count += 1
+                if underlying_count % 100 == 0:
+                    logger.info(f"Yielded {underlying_count} underlying bars...")
+            elif item["type"] == "option":
+                option_count += 1
+                if option_count % 1000 == 0:
+                    logger.info(f"Yielded {option_count} option quotes...")
+
+        print("\n" + "="*80)
+        print("BACKFILL COMPLETE")
+        print("="*80)
+        print(f"✅ Underlying bars yielded: {underlying_count}")
+        print(f"✅ Option quotes yielded: {option_count}")
+        print("="*80 + "\n")
+        print("NOTE: This standalone test only YIELDS data, it does NOT store it.")
+        print("Use 'python run.py ingest' to backfill AND store data in database.")
+        print()
+
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Backfill interrupted by user")
+        print(f"Partial results: {underlying_count} underlying, {option_count} options yielded")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        logger.error(f"Backfill failed: {e}", exc_info=True)
+        import sys
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
