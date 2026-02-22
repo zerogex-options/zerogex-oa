@@ -93,7 +93,7 @@ class TradeStationClient:
                 response.raise_for_status()
 
             result = response.json()
-            logger.debug(f"Response: {json.dumps(result, indent=2)[:500]}...")
+            logger.debug(f"Response: {json.dumps(result, indent=2)}...")
             return result
 
         except requests.exceptions.Timeout:
@@ -343,6 +343,8 @@ class TradeStationClient:
         """
         Get quotes for specific option symbols
 
+        Note: Options use the same quotes endpoint as equities
+
         Args:
             option_symbols: Single option symbol or list (max 500)
                           Format: SPY 260221C450 (underlying YYMMDD C/P strike)
@@ -357,8 +359,10 @@ class TradeStationClient:
         if isinstance(option_symbols, list):
             option_symbols = ",".join(option_symbols)
 
-        logger.info(f"Fetching option quotes for: {option_symbols}")
-        return self._request("GET", f"marketdata/options/quotes/{option_symbols}")
+        logger.info(f"Fetching option quotes for: {option_symbols[:100]}...")
+
+        # Options use the same quotes endpoint as equities
+        return self._request("GET", f"marketdata/quotes/{option_symbols}")
 
     def spread_quote(self, spread: str, legs: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
