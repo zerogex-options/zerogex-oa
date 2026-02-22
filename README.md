@@ -463,7 +463,7 @@ Proprietary - All Rights Reserved
 
 ## Contact
 
-**Author:** Michael  
+**Author:** ZeroGEX, LLC (zerogexoptions@gmail.com)  
 **Project:** ZeroGEX Options Analytics Platform  
 **Status:** Active Development
 
