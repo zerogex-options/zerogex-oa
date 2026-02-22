@@ -1,5 +1,5 @@
 """
-Underlying Quote and Options Chain Streaming Module
+Underlying Quote and Options Chain Streaming Manager
 
 Streams real-time underlying quotes and options chain data for a given symbol.
 Configurable by number of expirations and strike distance from current price.
@@ -16,7 +16,7 @@ from src.utils import get_logger
 logger = get_logger(__name__)
 
 
-class OptionsStreamManager:
+class StreamManager:
     """Manages streaming of underlying quotes and options chain data"""
 
     def __init__(
@@ -49,7 +49,7 @@ class OptionsStreamManager:
         self.tracked_strikes: Set[float] = set()
         self.tracked_option_symbols: List[str] = []
 
-        logger.info(f"Initialized OptionsStreamManager for {underlying}")
+        logger.info(f"Initialized StreamManager for {underlying}")
         logger.info(f"Config: {num_expirations} expirations, ±${strike_distance} strikes, {poll_interval}s interval")
 
     def _get_underlying_price(self) -> Optional[float]:
@@ -428,7 +428,7 @@ Environment Variables (.env):
         return
 
     # Create stream manager
-    stream_manager = OptionsStreamManager(
+    stream_manager = StreamManager(
         client=client,
         underlying=underlying,
         num_expirations=num_expirations,

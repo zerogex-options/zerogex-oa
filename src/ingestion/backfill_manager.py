@@ -1,5 +1,5 @@
 """
-Underlying Quote and Options Chain Backfill Module
+Underlying Quote and Options Chain Backfill Manager
 
 Backfills historical underlying quotes and options chain data for a specified time period.
 """
@@ -15,7 +15,7 @@ from src.utils import get_logger
 logger = get_logger(__name__)
 
 
-class OptionsBackfillManager:
+class BackfillManager:
     """Manages backfilling of historical underlying and options chain data"""
 
     def __init__(
@@ -39,7 +39,7 @@ class OptionsBackfillManager:
         self.num_expirations = num_expirations
         self.strike_distance = strike_distance
 
-        logger.info(f"Initialized OptionsBackfillManager for {underlying}")
+        logger.info(f"Initialized BackfillManager for {underlying}")
         logger.info(f"Config: {num_expirations} expirations, ±${strike_distance} strikes")
 
     def _get_underlying_bars(
@@ -435,7 +435,7 @@ Environment Variables (.env):
         return
 
     # Create backfill manager
-    backfill_manager = OptionsBackfillManager(
+    backfill_manager = BackfillManager(
         client=client,
         underlying=underlying,
         num_expirations=num_expirations,
