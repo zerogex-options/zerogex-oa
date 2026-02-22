@@ -89,6 +89,7 @@ def _initialize_connection_pool():
     max_connections = int(os.getenv('DB_POOL_MAX', '10'))
 
     # Get password from configured provider
+    # Note: For .pgpass, this returns None (psycopg2 reads .pgpass automatically)
     try:
         db_password = get_db_password()
     except Exception as e:
@@ -98,15 +99,21 @@ def _initialize_connection_pool():
     logger.info(f"Connecting to PostgreSQL: {db_user}@{db_host}:{db_port}/{db_name}")
 
     try:
-        _connection_pool = pool.SimpleConnectionPool(
-            minconn=min_connections,
-            maxconn=max_connections,
-            host=db_host,
-            port=db_port,
-            database=db_name,
-            user=db_user,
-            password=db_password
-        )
+        # Build connection parameters
+        conn_params = {
+            'minconn': min_connections,
+            'maxconn': max_connections,
+            'host': db_host,
+            'port': db_port,
+            'database': db_name,
+            'user': db_user,
+        }
+
+        # Only add password if it's not None (i.e., not using .pgpass)
+        if db_password is not None:
+            conn_params['password'] = db_password
+
+        _connection_pool = pool.SimpleConnectionPool(**conn_params)
 
         # Test the connection
         test_conn = _connection_pool.getconn()

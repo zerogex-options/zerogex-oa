@@ -2,42 +2,86 @@
 Database password provider plugins
 
 Allows swapping password retrieval mechanism without changing core code.
-Currently supports AWS Secrets Manager, can be extended for other providers.
+Supports: .pgpass file, AWS Secrets Manager, and environment variables.
 """
 
 import os
 import json
+from pathlib import Path
 from typing import Optional
 from src.utils import get_logger
 
 logger = get_logger(__name__)
 
 
-def get_db_password() -> str:
+def get_db_password() -> Optional[str]:
     """
     Get database password from configured provider
 
     Checks DB_PASSWORD_PROVIDER env var to determine which provider to use.
     Supported providers:
-    - 'aws_secrets_manager' (default for RDS)
-    - 'env' (direct from environment variable)
+    - 'pgpass' (default - uses ~/.pgpass file, no password needed in code)
+    - 'aws_secrets_manager' (for AWS RDS deployments)
+    - 'env' (direct from environment variable, not recommended for production)
 
     Returns:
-        Database password string
+        Database password string, or None if using .pgpass
 
     Raises:
         ValueError: If password cannot be retrieved
     """
-    provider = os.getenv('DB_PASSWORD_PROVIDER', 'aws_secrets_manager')
+    provider = os.getenv('DB_PASSWORD_PROVIDER', 'pgpass')
 
     logger.debug(f"Using password provider: {provider}")
 
-    if provider == 'aws_secrets_manager':
+    if provider == 'pgpass':
+        return _get_password_from_pgpass()
+    elif provider == 'aws_secrets_manager':
         return _get_password_from_aws_secrets_manager()
     elif provider == 'env':
         return _get_password_from_env()
     else:
         raise ValueError(f"Unknown password provider: {provider}")
+
+
+def _get_password_from_pgpass() -> None:
+    """
+    Use .pgpass file for authentication (PostgreSQL standard)
+
+    When using .pgpass, we don't pass a password to psycopg2.
+    PostgreSQL client library automatically reads ~/.pgpass
+
+    Returns:
+        None (psycopg2 will read .pgpass automatically)
+
+    Raises:
+        ValueError: If .pgpass file doesn't exist or has wrong permissions
+    """
+    pgpass_path = Path.home() / '.pgpass'
+
+    if not pgpass_path.exists():
+        raise ValueError(
+            f".pgpass file not found at {pgpass_path}\n"
+            "Create it with: nano ~/.pgpass\n"
+            "Format: hostname:port:database:username:password\n"
+            "Then run: chmod 600 ~/.pgpass"
+        )
+
+    # Check permissions (must be 0600)
+    pgpass_stat = pgpass_path.stat()
+    pgpass_mode = oct(pgpass_stat.st_mode)[-3:]
+
+    if pgpass_mode != '600':
+        raise ValueError(
+            f".pgpass file has incorrect permissions: {pgpass_mode}\n"
+            f"PostgreSQL requires exactly 600 (read/write for owner only)\n"
+            f"Fix with: chmod 600 {pgpass_path}"
+        )
+
+    logger.info(f"✅ Using .pgpass file for authentication: {pgpass_path}")
+
+    # Return None - psycopg2 will automatically use .pgpass
+    return None
 
 
 def _get_password_from_aws_secrets_manager() -> str:
@@ -135,11 +179,5 @@ def _get_password_from_env() -> str:
             "DB_PASSWORD environment variable is required when using 'env' provider"
         )
 
-    logger.info("✅ Retrieved password from environment variable")
+    logger.warning("⚠️  Using password from environment variable (not recommended for production)")
     return password
-
-
-# Future providers can be added here, e.g.:
-# def _get_password_from_hashicorp_vault() -> str:
-#     """Retrieve password from HashiCorp Vault"""
-#     pass
