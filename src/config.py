@@ -99,10 +99,21 @@ GEX_ENABLED = os.getenv("GEX_ENABLED", "false").lower() == "true"
 GEX_CALCULATION_INTERVAL = int(os.getenv("GEX_CALCULATION_INTERVAL", "60"))  # seconds
 GEX_STRIKE_RANGE = float(os.getenv("GEX_STRIKE_RANGE", "50.0"))  # dollars from current price
 
+# =============================================================================
+# Greeks & IV Calculation Configuration
+# =============================================================================
+
 # Greeks Calculation
-GREEKS_ENABLED = os.getenv("GREEKS_ENABLED", "false").lower() == "true"
+GREEKS_ENABLED = os.getenv("GREEKS_ENABLED", "true").lower() == "true"
 RISK_FREE_RATE = float(os.getenv("RISK_FREE_RATE", "0.05"))  # 5%
 IMPLIED_VOLATILITY_DEFAULT = float(os.getenv("IMPLIED_VOLATILITY_DEFAULT", "0.20"))  # 20%
+
+# IV Calculation
+IV_CALCULATION_ENABLED = os.getenv("IV_CALCULATION_ENABLED", "true").lower() == "true"
+IV_MAX_ITERATIONS = int(os.getenv("IV_MAX_ITERATIONS", "100"))
+IV_TOLERANCE = float(os.getenv("IV_TOLERANCE", "0.00001"))
+IV_MIN = float(os.getenv("IV_MIN", "0.01"))
+IV_MAX = float(os.getenv("IV_MAX", "5.0"))
 
 # =============================================================================
 # Backfill Configuration

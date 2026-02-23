@@ -43,6 +43,7 @@ dependencies = [
     "boto3>=1.28.0",
     "pytz>=2023.3",
     "numpy>=1.24.0",
+    "scipy>=1.11.0",
 ]
 
 [project.optional-dependencies]
@@ -76,6 +77,8 @@ zerogex = "src.ingestion.main_engine:main"
 zerogex-backfill = "src.ingestion.backfill_manager:main"
 zerogex-stream = "src.ingestion.stream_manager:main"
 zerogex-test-api = "src.ingestion.tradestation_client:main"
+zerogex-test-greeks = "src.ingestion.greeks_calculator:main"
+zerogex-test-iv = "src.ingestion.iv_calculator:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

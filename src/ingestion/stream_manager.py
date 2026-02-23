@@ -8,6 +8,7 @@ This manager ONLY fetches data from TradeStation API.
 Storage is handled by MainEngine.
 """
 
+import os
 import time
 from datetime import datetime, date
 from typing import Generator, List, Dict, Any, Optional, Set

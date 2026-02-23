@@ -238,6 +238,11 @@ class MainEngine:
         Args:
             data: Option quote data
         """
+        # Validate data is not None
+        if data is None:
+            logger.error("Received None data in _store_option, skipping")
+            return
+
         # Calculate Greeks if enabled and we have underlying price
         if self.greeks_calculator and self.latest_underlying_price:
             try:
@@ -246,21 +251,32 @@ class MainEngine:
                     logger.info(f"Starting Greeks calculation with underlying price: ${self.latest_underlying_price:.2f}")
                     logger.debug(f"Sample option data before Greeks: {data}")
 
-                data = self.greeks_calculator.enrich_option_data(
+                enriched_data = self.greeks_calculator.enrich_option_data(
                     data, 
                     self.latest_underlying_price
                 )
-                self.greeks_calculated += 1
 
-                if self.greeks_calculated % 100 == 0:
-                    logger.info(f"Calculated Greeks for {self.greeks_calculated} options")
+                # Check if enrichment returned None
+                if enriched_data is None:
+                    logger.error(f"Greeks calculator returned None for {data.get('option_symbol', 'unknown')}, using original data")
+                    # Add zero Greeks to original data
+                    data["delta"] = None
+                    data["gamma"] = None
+                    data["theta"] = None
+                    data["vega"] = None
+                else:
+                    data = enriched_data  # Use enriched data
+                    self.greeks_calculated += 1
 
-                # Log first successful Greek calculation
-                if self.greeks_calculated == 1:
-                    logger.info(f"✅ First Greek calculated successfully: delta={data.get('delta')}, gamma={data.get('gamma')}")
+                    if self.greeks_calculated % 100 == 0:
+                        logger.info(f"Calculated Greeks for {self.greeks_calculated} options")
+
+                    # Log first successful Greek calculation
+                    if self.greeks_calculated == 1:
+                        logger.info(f"✅ First Greek calculated successfully: delta={data.get('delta')}, gamma={data.get('gamma')}")
 
             except Exception as e:
-                logger.error(f"Error calculating Greeks for {data.get('option_symbol')}: {e}", exc_info=True)
+                logger.error(f"Error calculating Greeks for {data.get('option_symbol', 'unknown')}: {e}", exc_info=True)
                 # Add zero Greeks as fallback
                 data["delta"] = None
                 data["gamma"] = None
@@ -282,11 +298,19 @@ class MainEngine:
             data["vega"] = None
 
         # Get timestamp and bucket it
-        timestamp = data["timestamp"]
+        timestamp = data.get("timestamp")
+        if timestamp is None:
+            logger.error(f"Option data missing timestamp: {data.get('option_symbol', 'unknown')}")
+            return
+
         bucket = bucket_timestamp(timestamp, AGGREGATION_BUCKET_SECONDS)
 
         # Buffer by option symbol
-        option_symbol = data["option_symbol"]
+        option_symbol = data.get("option_symbol")
+        if option_symbol is None:
+            logger.error(f"Option data missing option_symbol")
+            return
+
         self.options_buffer[option_symbol].append(data)
 
         # Check TOTAL buffer size across all options, not per-symbol

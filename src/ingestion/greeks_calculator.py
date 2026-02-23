@@ -17,6 +17,8 @@ import pytz
 
 from src.utils import get_logger
 from src.config import RISK_FREE_RATE, IMPLIED_VOLATILITY_DEFAULT
+from src.ingestion.iv_calculator import IVCalculator
+from src.config import IV_CALCULATION_ENABLED
 
 logger = get_logger(__name__)
 
@@ -51,6 +53,14 @@ class GreeksCalculator:
         self.default_iv = default_iv
 
         logger.info(f"Initialized GreeksCalculator: r={risk_free_rate:.4f}, default_iv={default_iv:.4f}")
+
+        # Add IV calculator if enabled
+        if IV_CALCULATION_ENABLED:
+            self.iv_calculator = IVCalculator()
+            logger.info("✅ IV calculation ENABLED - will calculate from option prices when API doesn't provide it")
+        else:
+            self.iv_calculator = None
+            logger.info("⚠️  IV calculation DISABLED - will only use API-provided IV or default")
 
     def _calculate_time_to_expiration(
         self, 
@@ -371,7 +381,7 @@ class GreeksCalculator:
         underlying_price: float
     ) -> Dict[str, Any]:
         """
-        Enrich option data dictionary with calculated Greeks
+        Enrich option data dictionary with IV (calculated if needed) and Greeks
 
         This is the main integration point with the ingestion pipeline.
 
@@ -381,40 +391,98 @@ class GreeksCalculator:
             underlying_price: Current underlying price
 
         Returns:
-            Enriched option data with Greeks added
+            Enriched option data with IV and Greeks added (never returns None)
         """
-        # Extract required fields
+        # Defensive check: ensure option_data is not None
+        if option_data is None:
+            logger.error("Received None as option_data, returning empty dict")
+            return {}
+
+        # Defensive check: ensure underlying_price is valid
+        if underlying_price is None or underlying_price <= 0:
+            logger.warning(f"Invalid underlying_price: {underlying_price}, cannot calculate IV/Greeks")
+            option_data["implied_volatility"] = None
+            option_data["delta"] = None
+            option_data["gamma"] = None
+            option_data["theta"] = None
+            option_data["vega"] = None
+            return option_data
+
+        # Step 1: Calculate/enrich IV if calculator is available
+        if self.iv_calculator:
+            try:
+                enriched_data = self.iv_calculator.enrich_option_data_with_iv(
+                    option_data,
+                    underlying_price,
+                    self.risk_free_rate
+                )
+
+                # Defensive check: ensure IV calculator didn't return None
+                if enriched_data is not None:
+                    option_data = enriched_data
+                else:
+                    logger.warning("IV calculator returned None, using original data")
+            except Exception as e:
+                logger.error(f"Error in IV calculation: {e}", exc_info=True)
+                # Continue with original data
+
+        # Step 2: Get IV to use for Greeks calculation
+        implied_volatility = option_data.get("implied_volatility")
+
+        # If still no IV, use default
+        if not implied_volatility or implied_volatility <= 0:
+            implied_volatility = self.default_iv
+            logger.debug(f"Using default IV: {implied_volatility:.4f}")
+            # Store the default IV we're using
+            option_data["implied_volatility"] = implied_volatility
+
+        # Step 3: Extract required fields for Greeks
         strike = option_data.get("strike")
         expiration = option_data.get("expiration")
         option_type = option_data.get("option_type")
         timestamp = option_data.get("timestamp")
 
-        # Use IV from data if available, otherwise use default
-        implied_volatility = option_data.get("implied_volatility")
-
         # Validate required fields
         if not all([strike, expiration, option_type, timestamp]):
-            logger.warning("Missing required fields for Greeks calculation")
-            # Add zero Greeks
-            option_data["delta"] = 0.0
-            option_data["gamma"] = 0.0
-            option_data["theta"] = 0.0
-            option_data["vega"] = 0.0
+            logger.warning(f"Missing required fields for Greeks calculation: "
+                          f"strike={strike}, exp={expiration}, type={option_type}, ts={timestamp}")
+            # Add None Greeks
+            option_data["delta"] = None
+            option_data["gamma"] = None
+            option_data["theta"] = None
+            option_data["vega"] = None
             return option_data
 
-        # Calculate Greeks
-        greeks = self.calculate_all_greeks(
-            underlying_price=underlying_price,
-            strike=strike,
-            expiration=expiration,
-            option_type=option_type,
-            current_time=timestamp,
-            implied_volatility=implied_volatility
-        )
+        # Step 4: Calculate Greeks with IV
+        try:
+            greeks = self.calculate_all_greeks(
+                underlying_price=underlying_price,
+                strike=strike,
+                expiration=expiration,
+                option_type=option_type,
+                current_time=timestamp,
+                implied_volatility=implied_volatility
+            )
 
-        # Add Greeks to option data
-        option_data.update(greeks)
+            # Defensive check: ensure calculate_all_greeks returned a dict
+            if greeks and isinstance(greeks, dict):
+                # Add Greeks to option data
+                option_data.update(greeks)
+            else:
+                logger.warning("calculate_all_greeks returned invalid data, adding None Greeks")
+                option_data["delta"] = None
+                option_data["gamma"] = None
+                option_data["theta"] = None
+                option_data["vega"] = None
+        except Exception as e:
+            logger.error(f"Error calculating Greeks: {e}", exc_info=True)
+            # Add None Greeks on error
+            option_data["delta"] = None
+            option_data["gamma"] = None
+            option_data["theta"] = None
+            option_data["vega"] = None
 
+        # Always return the option_data dict (never None)
         return option_data
 
 

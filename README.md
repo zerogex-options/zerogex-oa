@@ -18,6 +18,7 @@ ZeroGEX is a sophisticated options trading platform that calculates real-time ga
   - [TradeStation Client](#tradestation-client)
   - [Backfill Manager](#backfill-manager)
   - [Stream Manager](#stream-manager)
+  - [Greeks & IV Calculator](#greeks--iv-calculator)
 - [Database Schema](#database-schema)
 - [Development](#development)
 - [Project Structure](#project-structure)
@@ -35,6 +36,8 @@ ZeroGEX is a sophisticated options trading platform that calculates real-time ga
 - **Real-time Options Data Streaming** - Live underlying quotes and options chain data with intelligent polling
 - **Historical Data Backfilling** - Configurable lookback periods with automatic gap detection
 - **1-Minute Data Aggregation** - OHLC aggregation for underlying and last/bid/ask for options
+- **Implied Volatility Calculation** - Newton-Raphson solver calculates IV from option prices when API doesn't provide it
+- **Real-time Greeks Calculation** - Black-Scholes Greeks (Delta, Gamma, Theta, Vega) calculated for every option
 - **Intelligent Strike Selection** - Automatically tracks strikes near current price with dynamic recalculation
 - **Multi-Expiration Support** - Configurable number of expiration dates to track
 - **Market Hours Detection** - Dynamic polling intervals based on market session (regular/extended/closed)
@@ -49,16 +52,27 @@ ZeroGEX is a sophisticated options trading platform that calculates real-time ga
 - **Real-time GEX Calculation** - Gamma exposure engine (schema ready)
 - **Data Quality Monitoring** - Automated detection of stale/missing data (schema ready)
 - **Grafana Dashboards** - Real-time visualization and alerting (metrics schema ready)
-- **Greeks Calculation** - Delta, gamma, theta, vega (schema ready)
 
 ### 📊 TradeStation API Integration
 - Quote snapshots (equity & options)
 - Historical OHLCV bars (1min, 5min, daily, etc.)
+- Stream bars with Up/Down volume breakdown
 - Options chain data (expirations, strikes, quotes)
 - Symbol search and metadata
 - Market depth (Level 2)
 - Retry logic with exponential backoff
 - Configurable timeouts and batch sizes
+
+### 📐 Greeks & Implied Volatility
+- **IV Calculation**: Newton-Raphson method solves for IV from option prices
+- **Greeks**: Delta, Gamma, Theta, Vega using Black-Scholes model
+- **Priority Logic**: 
+  1. Use IV from API if available
+  2. Calculate IV from bid/ask mid-price
+  3. Calculate IV from last price
+  4. Fall back to configurable default IV
+- **Robust Validation**: Checks for intrinsic value violations, constrains IV to reasonable ranges
+- **Real-time Storage**: Both IV and Greeks stored in database for historical analysis
 
 ---
 
@@ -75,6 +89,9 @@ ZeroGEX Platform
 │   ├── 1-minute data aggregation
 │   ├── Buffer management and flushing
 │   └── Database storage coordination
+├── Analytics Layer
+│   ├── IV Calculator (Newton-Raphson solver)
+│   └── Greeks Calculator (Black-Scholes model)
 ├── Data Storage Layer
 │   ├── PostgreSQL (relational data)
 │   ├── TimescaleDB (time-series optimization)
@@ -96,6 +113,10 @@ ZeroGEX Platform
 TradeStation API
       ↓
 BackfillManager / StreamManager (fetch & yield data)
+      ↓
+IVCalculator (calculate IV from prices if not provided)
+      ↓
+GreeksCalculator (calculate Greeks using IV)
       ↓
 MainEngine (aggregate in 1-minute buckets)
       ↓
@@ -153,6 +174,9 @@ pip install -e .
 
 # Or install with development dependencies
 pip install -e ".[dev]"
+
+# Or install everything including Greeks/IV calculation
+pip install -e ".[all]"
 ```
 
 **Core dependencies:**
@@ -163,6 +187,8 @@ pip install -e ".[dev]"
 - `websocket-client` - WebSocket support (future)
 - `boto3` - AWS SDK (for Secrets Manager)
 - `pytz` - Timezone handling
+- `numpy` - Numerical computing
+- `scipy` - Scientific computing (for Greeks & IV)
 
 ### 4. Set Up Database
 
@@ -171,7 +197,7 @@ pip install -e ".[dev]"
 createdb zerogex
 
 # Run schema migration
-psql -d zerogex -f sql/001_create_tables.sql
+psql -d zerogex -f setup/database/schema.sql
 ```
 
 **For TimescaleDB (recommended):**
@@ -225,7 +251,25 @@ DB_SECRET_NAME=zerogex/db/password
 AWS_REGION=us-east-1
 ```
 
-### 4. Get TradeStation API Credentials
+### 4. Configure Greeks & IV Calculation
+
+```bash
+# Enable/disable features
+GREEKS_ENABLED=true
+IV_CALCULATION_ENABLED=true
+
+# IV solver parameters
+IV_MAX_ITERATIONS=100      # Max Newton-Raphson iterations
+IV_TOLERANCE=0.00001       # Convergence tolerance
+IV_MIN=0.01                # Minimum IV (1%)
+IV_MAX=5.0                 # Maximum IV (500%)
+
+# Greeks parameters
+RISK_FREE_RATE=0.05                # 5% annual risk-free rate
+IMPLIED_VOLATILITY_DEFAULT=0.20    # 20% default IV
+```
+
+### 5. Get TradeStation API Credentials
 
 1. Go to [TradeStation Developer Portal](https://api.tradestation.com/docs/)
 2. Create a new application
@@ -233,10 +277,10 @@ AWS_REGION=us-east-1
 4. Generate a **Refresh Token**:
 
 ```bash
-python scripts/get_tradestation_tokens.py
+python setup/app/get_tradestation_tokens.py
 ```
 
-### 5. Review Configuration Options
+### 6. Review Configuration Options
 
 See [Environment Variables](#environment-variables) section for complete configuration options.
 
@@ -249,13 +293,12 @@ See [Environment Variables](#environment-variables) section for complete configu
 **The primary entry point for the complete data pipeline:**
 
 ```bash
-# Run with defaults (7 days backfill, then stream)
+# Run with defaults (streams real-time data)
 python -m src.ingestion.main_engine
 
 # Custom configuration
 python -m src.ingestion.main_engine \
     --underlying SPY \
-    --lookback-days 14 \
     --expirations 5 \
     --strike-distance 20.0
 
@@ -267,47 +310,46 @@ python -m src.ingestion.main_engine --help
 ```
 
 **What it does:**
-1. **Backfill Phase** - Fetches historical data for configured lookback period
-2. **Gap Detection** - Checks for missing data and backfills gaps (if enabled)
-3. **Streaming Phase** - Streams real-time data with dynamic polling
+1. **Streaming Phase** - Streams real-time data with dynamic polling
+2. **IV Calculation** - Calculates implied volatility from option prices (if enabled)
+3. **Greeks Calculation** - Calculates Delta, Gamma, Theta, Vega (if enabled)
 4. **1-Minute Aggregation** - Buffers and aggregates data into 1-minute bars
-5. **Database Storage** - Stores aggregated data in PostgreSQL
+5. **Database Storage** - Stores aggregated data with IV and Greeks in PostgreSQL
 
 **Production deployment:**
 
-```bash
-# Create systemd service
-sudo nano /etc/systemd/system/zerogex-ingest.service
-```
-
-```ini
-[Unit]
-Description=ZeroGEX Ingestion Engine
-After=network.target postgresql.service
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/zerogex-oa
-Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin"
-ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.ingestion.main_engine
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
+The systemd service file is already provided in `setup/systemd/zerogex-oa-ingestion.service`. Use the Makefile for easy service management:
 
 ```bash
-# Enable and start service
-sudo systemctl enable zerogex-ingest
-sudo systemctl start zerogex-ingest
+# Service Management
+make start              # Start the service
+make stop               # Stop the service
+make restart            # Restart the service
+make status             # Check service status
+make enable             # Enable on boot
+make disable            # Disable on boot
+make health             # Health check with errors/warnings
 
-# Check status
-sudo systemctl status zerogex-ingest
+# Log Management
+make logs               # Watch live logs (Ctrl+C to stop)
+make logs-tail          # Show last 100 lines
+make logs-errors        # Show recent errors only
+make logs-clear         # Clear all logs (with confirmation)
+```
 
-# View logs
-journalctl -u zerogex-ingest -f
+**Initial setup:**
+
+```bash
+# Install the systemd service
+sudo cp setup/systemd/zerogex-oa-ingestion.service /etc/systemd/system/
+sudo systemctl daemon-reload
+
+# Enable and start
+make enable
+make start
+
+# Watch logs
+make logs
 ```
 
 ---
@@ -318,23 +360,23 @@ journalctl -u zerogex-ingest -f
 
 ```bash
 # Run all tests
-python -m src.ingestion.tradestation_client
+make run-client
 
-# Test specific endpoint
+# Test with specific options (pass through to Python module)
+make run-client
+
+# For advanced testing, use Python directly:
 python -m src.ingestion.tradestation_client --test quote --symbol SPY
 python -m src.ingestion.tradestation_client --test bars --symbol SPY --bars-back 10
+python -m src.ingestion.tradestation_client --test stream-bars --symbol SPY
 python -m src.ingestion.tradestation_client --test options --symbol SPY
-
-# Enable debug logging
 python -m src.ingestion.tradestation_client --debug
-
-# Multiple symbols
-python -m src.ingestion.tradestation_client --test quote --symbol SPY,QQQ,AAPL
 ```
 
 **Available tests:**
 - `quote` - Current quotes
 - `bars` - Historical OHLCV bars
+- `stream-bars` - Real-time bars with Up/Down volume
 - `options` - Option expirations and strikes
 - `search` - Symbol search
 - `market-hours` - Market status and hours
@@ -344,45 +386,79 @@ python -m src.ingestion.tradestation_client --test quote --symbol SPY,QQQ,AAPL
 
 ### Backfill Manager
 
-**Standalone historical data backfill (for testing/manual use):**
+**Standalone historical data backfill:**
 
 ```bash
-# Backfill last 1 day of 5-minute data
-python -m src.ingestion.backfill_manager
+# Run backfill with defaults
+make run-backfill
 
-# Backfill last 3 days
+# For custom options, use Python directly:
 python -m src.ingestion.backfill_manager --lookback-days 3
-
-# Daily bars for 30 days
 python -m src.ingestion.backfill_manager --unit Daily --lookback-days 30
-
-# Sample options every 10 bars (faster)
 python -m src.ingestion.backfill_manager --sample-every 10
 ```
 
-**Note:** In production, use `main_engine` which handles backfill automatically.
+**Note:** Backfill runs independently and stores data directly in the database.
 
 ---
 
 ### Stream Manager
 
-**Standalone real-time streaming (for testing/manual use):**
+**Standalone real-time streaming (for testing):**
 
 ```bash
-# Stream SPY with defaults
-python -m src.ingestion.stream_manager
+# Test streaming
+make run-stream
 
-# Stream AAPL with custom config
-python -m src.ingestion.stream_manager \
-    --underlying AAPL \
-    --expirations 5 \
-    --strike-distance 20
-
-# Test with limited iterations
+# For custom options, use Python directly:
+python -m src.ingestion.stream_manager --underlying AAPL --expirations 5
 python -m src.ingestion.stream_manager --max-iterations 10
 ```
 
-**Note:** In production, use `main_engine` which handles streaming automatically.
+**Note:** For production, use `make start` which runs the main engine automatically.
+
+---
+
+### Greeks & IV Calculator
+
+**Test Greeks and IV calculation standalone:**
+
+```bash
+# Test Greeks calculator
+make run-greeks
+
+# Test IV calculator
+make run-iv
+
+# Test authentication
+make run-auth
+
+# Show current configuration
+make run-config
+```
+
+**How it works in production:**
+
+When the main engine is running with `GREEKS_ENABLED=true` and `IV_CALCULATION_ENABLED=true`:
+
+1. **Option quote received** from TradeStation API
+2. **IV Calculation** (if API doesn't provide IV):
+   - Try to calculate from bid/ask mid-price
+   - Fall back to last price
+   - Use default IV if all else fails
+3. **Greeks Calculation** using the IV:
+   - Delta (rate of change with underlying price)
+   - Gamma (rate of change of Delta)
+   - Theta (time decay per day)
+   - Vega (sensitivity to volatility)
+4. **Storage** - Both IV and Greeks stored in database
+
+**Example output:**
+```
+✅ First Greek calculated successfully: delta=0.5234, gamma=0.0123
+✅ Calculated IV for SPY 260322C455: 0.2145 (21.45%)
+✅ Stored option with Greeks: SPY 260322C455 delta=0.5234 gamma=0.0123
+```
 
 ---
 
@@ -407,7 +483,7 @@ Stores 1-minute aggregated underlying symbol quotes.
 **Primary Key:** `(symbol, timestamp)`
 
 #### `option_chains`
-Stores 1-minute aggregated option contract data.
+Stores 1-minute aggregated option contract data with IV and Greeks.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -422,11 +498,11 @@ Stores 1-minute aggregated option contract data.
 | `ask` | NUMERIC(12,4) | Ask price |
 | `volume` | BIGINT | RAW cumulative volume |
 | `open_interest` | BIGINT | RAW open interest |
-| `implied_volatility` | NUMERIC(8,6) | IV (if available) |
-| `delta` | NUMERIC(8,6) | Option delta (if available) |
-| `gamma` | NUMERIC(10,8) | Option gamma (if available) |
-| `theta` | NUMERIC(10,6) | Option theta (if available) |
-| `vega` | NUMERIC(10,6) | Option vega (if available) |
+| `implied_volatility` | NUMERIC(8,6) | IV (calculated or from API) |
+| `delta` | NUMERIC(8,6) | Option delta |
+| `gamma` | NUMERIC(10,8) | Option gamma |
+| `theta` | NUMERIC(10,6) | Option theta (per day) |
+| `vega` | NUMERIC(10,6) | Option vega (per 1% IV) |
 
 **Primary Key:** `(option_symbol, timestamp)`
 
@@ -495,10 +571,12 @@ zerogex-oa/
 │   ├── ingestion/
 │   │   ├── __init__.py
 │   │   ├── tradestation_auth.py     # OAuth2 authentication
-│   │   ├── tradestation_client.py   # Market data API client (with retry)
+│   │   ├── tradestation_client.py   # Market data API client
+│   │   ├── iv_calculator.py         # IV calculation (Newton-Raphson)
+│   │   ├── greeks_calculator.py     # Black-Scholes Greeks
 │   │   ├── backfill_manager.py      # Historical data fetching
 │   │   ├── stream_manager.py        # Real-time data fetching
-│   │   └── main_engine.py           # Orchestration + storage + aggregation
+│   │   └── main_engine.py           # Orchestration + storage
 │   ├── database/
 │   │   ├── __init__.py
 │   │   ├── connection.py            # Connection pool management
@@ -506,11 +584,15 @@ zerogex-oa/
 │   └── utils/
 │       ├── __init__.py
 │       └── logging.py               # Centralized logging config
-├── sql/
-│   └── 001_create_tables.sql        # Database schema
-├── scripts/
-│   └── get_tradestation_tokens.py   # OAuth token generator
+├── setup/
+│   ├── app/
+│   │   └── get_tradestation_tokens.py
+│   ├── database/
+│   │   └── schema.sql               # Complete database schema
+│   └── systemd/
+│       └── zerogex-oa-ingestion.service
 ├── pyproject.toml                    # Project metadata & dependencies
+├── Makefile                          # Service management & DB queries
 ├── .env.example                      # Environment template
 ├── .env                              # Your local config (git-ignored)
 └── README.md                         # This file
@@ -536,7 +618,7 @@ zerogex-oa/
 | `DB_PORT` | Database port | `5432` |
 | `DB_NAME` | Database name | `zerogex` |
 | `DB_USER` | Database user | `postgres` |
-| `DB_PASSWORD_PROVIDER` | Password provider (`env` or `aws_secrets_manager`) | `aws_secrets_manager` |
+| `DB_PASSWORD_PROVIDER` | Password provider (`env`, `aws_secrets_manager`, `pgpass`) | `pgpass` |
 | `DB_PASSWORD` | Database password (if using `env` provider) | - |
 | `DB_SECRET_NAME` | AWS secret name (if using `aws_secrets_manager`) | `zerogex/db/password` |
 | `AWS_REGION` | AWS region | `us-east-1` |
@@ -551,6 +633,19 @@ zerogex-oa/
 | `API_RETRY_BACKOFF` | Exponential backoff multiplier | `2.0` |
 | `QUOTE_BATCH_SIZE` | Quote batch size | `100` |
 | `OPTION_BATCH_SIZE` | Option batch size | `100` |
+
+### Greeks & IV Configuration
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `GREEKS_ENABLED` | Enable Greeks calculation | `true` |
+| `IV_CALCULATION_ENABLED` | Enable IV calculation from prices | `true` |
+| `IV_MAX_ITERATIONS` | Max Newton-Raphson iterations | `100` |
+| `IV_TOLERANCE` | Convergence tolerance | `0.00001` |
+| `IV_MIN` | Minimum IV | `0.01` (1%) |
+| `IV_MAX` | Maximum IV | `5.0` (500%) |
+| `RISK_FREE_RATE` | Risk-free rate for calculations | `0.05` (5%) |
+| `IMPLIED_VOLATILITY_DEFAULT` | Default IV fallback | `0.20` (20%) |
 
 ### Streaming Configuration
 
@@ -585,6 +680,115 @@ See `.env.example` for complete list of configuration options.
 
 ## Monitoring & Observability
 
+### Makefile Shortcuts
+
+ZeroGEX provides comprehensive Makefile commands for monitoring, service management, and database queries:
+
+```bash
+# Service Management
+make start              # Start the ingestion service
+make stop               # Stop the ingestion service
+make restart            # Restart the ingestion service
+make status             # Show service status
+make enable             # Enable service to start on boot
+make disable            # Disable service from starting on boot
+make health             # Service health check with recent errors
+
+# Log Management
+make logs               # Watch live logs (Ctrl+C to stop)
+make logs-tail          # Show last 100 log lines
+make logs-errors        # Show recent errors only
+make logs-grep PATTERN="Greeks"  # Search logs for pattern
+make logs-clear         # Clear all journalctl logs (with confirmation)
+
+# Quick Stats
+make stats              # Overall data statistics
+make latest             # Latest data from all tables
+make today              # Today's data summary
+make check-streaming    # Check if data is actively streaming
+
+# Underlying Data
+make underlying         # Last 10 underlying bars
+make underlying-latest  # Latest underlying bar
+make underlying-today   # Today's underlying bars
+make underlying-volume  # Volume analysis for today
+
+# Option Data
+make options            # Last 10 option quotes
+make options-latest     # Latest option quotes (top 10 by volume)
+make options-today      # Today's option activity
+make options-strikes    # Active strikes summary
+make options-raw        # Raw option data
+make options-fields     # Check field population (including IV/Greeks)
+
+# Greeks & Analytics
+make greeks             # Latest Greeks by strike
+make greeks-summary     # Greeks summary statistics
+make gex-preview        # Preview GEX calculation data
+
+# Data Quality
+make gaps               # Check for data gaps
+make gaps-today         # Today's data gaps
+make quality            # Data quality report
+
+# Data Management
+make clear-data         # Clear all data (with confirmation)
+make clear-options      # Clear only option chains
+make clear-underlying   # Clear only underlying quotes
+
+# Maintenance
+make vacuum             # Vacuum analyze all tables
+make size               # Show table sizes
+make refresh-views      # Refresh materialized views
+
+# Run Components
+make run-auth           # Test TradeStation authentication
+make run-client         # Test TradeStation API client
+make run-backfill       # Run historical data backfill
+make run-stream         # Test real-time streaming
+make run-ingest         # Run main ingestion engine
+make run-greeks         # Test Greeks calculator
+make run-iv             # Test IV calculator
+make run-config         # Show current configuration
+
+# Interactive
+make psql               # Open PostgreSQL shell
+make query SQL="..."    # Run custom SQL query
+
+# Get help
+make help               # Show all available commands
+```
+
+### Common Workflows
+
+**Start and monitor:**
+```bash
+make start
+make logs
+```
+
+**Check data health:**
+```bash
+make health
+make check-streaming
+make quality
+```
+
+**Troubleshoot issues:**
+```bash
+make logs-errors
+make greeks-summary
+make options-fields
+```
+
+**Clear and restart:**
+```bash
+make stop
+make clear-data
+make logs-clear
+make start
+```
+
 ### Logging
 
 All components use centralized logging with configurable levels:
@@ -610,24 +814,32 @@ curl http://localhost:9090/metrics
 **Available metrics:**
 - `bars_stored_total` - Total underlying bars stored
 - `options_stored_total` - Total option quotes stored
+- `greeks_calculated_total` - Total Greeks calculations
+- `iv_calculated_total` - Total IV calculations
 - `api_requests_total` - API requests by endpoint
 - `api_latency_seconds` - API request latency histogram
 - `buffer_size` - Current buffer sizes
 - `errors_total` - Errors by type
 
-### Grafana Dashboards (Future)
-
-When `GRAFANA_DASHBOARD_ENABLED=true`:
-
-**Dashboards:**
-1. **Ingestion Pipeline** - Throughput, latency, error rates
-2. **Data Quality** - Gaps, staleness, validation failures
-3. **GEX Analysis** - Real-time gamma exposure visualization
-4. **System Health** - CPU, memory, database connections
-
 ---
 
 ## Troubleshooting
+
+### Quick Diagnostics
+
+```bash
+# Check service status
+make status
+make health
+
+# View recent logs
+make logs-tail
+make logs-errors
+
+# Check data flow
+make check-streaming
+make stats
+```
 
 ### Authentication Errors
 
@@ -640,6 +852,11 @@ TRADESTATION_CLIENT_SECRET=your_actual_secret
 TRADESTATION_REFRESH_TOKEN=your_actual_token
 ```
 
+**Test authentication:**
+```bash
+make run-auth
+```
+
 ### Database Connection Errors
 
 **Error:** `Failed to connect to database`
@@ -650,6 +867,12 @@ TRADESTATION_REFRESH_TOKEN=your_actual_token
 3. Check database exists: `psql -l | grep zerogex`
 4. For AWS Secrets Manager, verify IAM permissions
 
+**Test connection:**
+```bash
+make psql
+make query SQL="SELECT NOW();"
+```
+
 ### Import Errors
 
 **Error:** `ModuleNotFoundError: No module named 'src'`
@@ -657,6 +880,69 @@ TRADESTATION_REFRESH_TOKEN=your_actual_token
 **Solution:** Install in editable mode:
 ```bash
 pip install -e .
+```
+
+### Greeks/IV Not Calculating
+
+**Check configuration:**
+```bash
+make run-config
+```
+
+**Check in database:**
+```bash
+make options-fields
+make greeks-summary
+```
+
+**Verify in logs:**
+```bash
+make logs-grep PATTERN="Greek"
+make logs-grep PATTERN="IV"
+
+# Should see:
+# ✅ Greeks calculation ENABLED
+# ✅ IV calculation ENABLED
+# 🎯 First underlying price received: $450.23
+# ✅ First Greek calculated successfully: delta=0.5234, gamma=0.0123
+```
+
+**Common issues:**
+1. `GREEKS_ENABLED=false` in `.env`
+2. `IV_CALCULATION_ENABLED=false` in `.env`
+3. No underlying price available yet (wait for first bar)
+4. Option prices invalid (zero or negative)
+
+**Fix and restart:**
+```bash
+# Edit .env to enable features
+nano .env
+
+# Restart service
+make restart
+make logs
+```
+
+### Service Won't Start
+
+**Check logs:**
+```bash
+make status
+make logs-tail
+make logs-errors
+```
+
+**Common issues:**
+1. Invalid `.env` format (inline comments not allowed)
+2. Missing dependencies: `pip install -e .`
+3. Database not running: `sudo systemctl status postgresql`
+4. Port already in use
+
+**Clear logs and restart:**
+```bash
+make logs-clear
+make restart
+make logs
 ```
 
 ### API Rate Limiting
@@ -674,11 +960,16 @@ pip install -e .
   DELAY_BETWEEN_BATCHES=1.0
   DELAY_BETWEEN_BARS=2.0
   ```
-- Retry logic handles this automatically with exponential backoff
+- Restart: `make restart`
 
 ### Memory Issues
 
 **Error:** High memory usage over time
+
+**Check memory:**
+```bash
+make health  # Shows memory usage
+```
 
 **Solutions:**
 - Decrease `MAX_BUFFER_SIZE`:
@@ -687,32 +978,39 @@ pip install -e .
   ```
 - Verify strike cleanup is running:
   ```bash
-  STRIKE_CLEANUP_INTERVAL=50  # Clean more frequently
+  STRIKE_CLEANUP_INTERVAL=50
   ```
-- Check for database connection leaks in logs
+- Restart service: `make restart`
 
-### Data Quality Issues
+### Data Not Storing
 
-**Missing data:**
-1. Check logs for API errors
-2. Run gap detection:
-   ```sql
-   SELECT * FROM data_quality_log 
-   WHERE resolved = false 
-   ORDER BY check_timestamp DESC;
-   ```
-3. Manual backfill:
-   ```bash
-   python -m src.ingestion.backfill_manager --lookback-days 1
-   ```
+**Check what's in database:**
+```bash
+make stats
+make latest
+make check-streaming
+```
 
-**Stale data:**
-1. Check if streaming is running:
-   ```bash
-   sudo systemctl status zerogex-ingest
-   ```
-2. Check market hours - no updates when market closed
-3. Review logs for streaming errors
+**Check service is running:**
+```bash
+make status
+make logs-tail
+```
+
+**Look for errors:**
+```bash
+make logs-errors
+make logs-grep PATTERN="Error|Exception"
+```
+
+**Nuclear option - clear and restart:**
+```bash
+make stop
+make clear-data
+make logs-clear
+make start
+make logs
+```
 
 ### Debug Logging
 
@@ -722,35 +1020,40 @@ Enable verbose logging for troubleshooting:
 # Set in .env
 LOG_LEVEL=DEBUG
 
-# Or via command line
-python -m src.ingestion.main_engine --debug
+# Restart service
+make restart
+
+# Watch debug logs
+make logs
 ```
 
 ---
 
 ## Roadmap
 
-### ✅ Completed (v0.1.0)
+### ✅ Completed (v0.2.0)
 - [x] TradeStation API integration
-- [x] Real-time data streaming
+- [x] Real-time data streaming with Up/Down volume
 - [x] Historical data backfilling
 - [x] 1-minute data aggregation
 - [x] Database storage (PostgreSQL/TimescaleDB)
+- [x] **Implied Volatility calculation (Newton-Raphson)**
+- [x] **Black-Scholes Greeks calculation (Delta, Gamma, Theta, Vega)**
 - [x] Data validation and error handling
 - [x] Retry logic with exponential backoff
 - [x] Dynamic polling based on market hours
 - [x] Memory leak prevention
 - [x] Graceful shutdown handling
 
-### 🚧 In Progress (v0.2.0)
+### 🚧 In Progress (v0.3.0)
 - [ ] WebSocket streaming implementation
 - [ ] Automated gap backfilling
 - [ ] Data quality monitoring
 - [ ] Prometheus metrics integration
 
-### 📋 Planned (v0.3.0)
+### 📋 Planned (v0.4.0)
 - [ ] Real-time GEX calculation engine
-- [ ] Greeks calculation (Black-Scholes)
+- [ ] Vanna and Charm (2nd order Greeks)
 - [ ] Grafana dashboards
 - [ ] Alert system for GEX thresholds
 - [ ] Customer-facing web UI
@@ -798,10 +1101,11 @@ MIT License - See [LICENSE](LICENSE) file for details.
 
 - TradeStation for providing comprehensive market data API
 - TimescaleDB team for time-series database optimization
-- Python community for excellent libraries (requests, psycopg2, pytz)
+- Python community for excellent libraries (requests, psycopg2, scipy, numpy)
+- Black-Scholes model pioneers: Fischer Black, Myron Scholes, Robert Merton
 
 ---
 
-**Built with:** Python • TradeStation API • PostgreSQL • TimescaleDB • AWS
+**Built with:** Python • TradeStation API • PostgreSQL • TimescaleDB • Black-Scholes • Newton-Raphson • AWS
 
 **Deploy with confidence** - ZeroGEX is production-ready! 🚀

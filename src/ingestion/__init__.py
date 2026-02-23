@@ -8,6 +8,7 @@ Components:
 - StreamManager: Real-time data fetching (yields data to MainEngine)
 - MainEngine: Orchestration, aggregation, and storage
 - GreeksCalculator: Black-Scholes Greeks calculation
+- IVCalculator: Implied volatility calculation from option prices
 """
 
 from src.ingestion.tradestation_auth import TradeStationAuth
@@ -16,12 +17,14 @@ from src.ingestion.backfill_manager import BackfillManager
 from src.ingestion.stream_manager import StreamManager
 from src.ingestion.main_engine import MainEngine
 from src.ingestion.greeks_calculator import GreeksCalculator
+from src.ingestion.iv_calculator import IVCalculator
 
 __all__ = [
     "TradeStationAuth",
-    "TradeStationClient", 
+    "TradeStationClient",
     "BackfillManager",
     "StreamManager",
     "MainEngine",
     "GreeksCalculator",
+    "IVCalculator",
 ]

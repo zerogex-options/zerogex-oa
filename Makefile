@@ -1,5 +1,5 @@
-# ZeroGEX Database Query Shortcuts
-# ===================================
+# ZeroGEX Database Query Shortcuts & Service Management
+# ======================================================
 # Usage: make <target>
 #
 # Common queries for monitoring and debugging the ZeroGEX platform
@@ -11,16 +11,49 @@ export
 # PostgreSQL connection string
 PSQL = PGPASSFILE=~/.pgpass psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) -d $(DB_NAME)
 
+# Service name
+SERVICE_NAME = zerogex-oa-ingestion
+
+# Python virtual environment
+VENV_PYTHON = venv/bin/python
+
 # Colors for output
 BLUE = \033[0;34m
 GREEN = \033[0;32m
 YELLOW = \033[1;33m
+RED = \033[0;31m
 NC = \033[0m
 
 .PHONY: help
 help: ## Show this help message
-	@echo "$(BLUE)ZeroGEX Database Query Shortcuts$(NC)"
-	@echo "=================================="
+	@echo "$(BLUE)ZeroGEX Management & Database Shortcuts$(NC)"
+	@echo "=========================================="
+	@echo ""
+	@echo "$(GREEN)Service Management:$(NC)"
+	@echo "  make start              - Start the ingestion service"
+	@echo "  make stop               - Stop the ingestion service"
+	@echo "  make restart            - Restart the ingestion service"
+	@echo "  make status             - Show service status"
+	@echo "  make enable             - Enable service to start on boot"
+	@echo "  make disable            - Disable service from starting on boot"
+	@echo "  make health             - Show service health and recent errors"
+	@echo ""
+	@echo "$(GREEN)Logs:$(NC)"
+	@echo "  make logs               - Show live logs (Ctrl+C to exit)"
+	@echo "  make logs-tail          - Show last 100 log lines"
+	@echo "  make logs-errors        - Show recent errors"
+	@echo "  make logs-grep PATTERN=\"text\" - Search logs for pattern"
+	@echo "  make logs-clear         - Clear all journalctl logs for service"
+	@echo ""
+	@echo "$(GREEN)Run Components:$(NC)"
+	@echo "  make run-auth           - Test TradeStation authentication"
+	@echo "  make run-client         - Test TradeStation API client"
+	@echo "  make run-backfill       - Run historical data backfill"
+	@echo "  make run-stream         - Test real-time streaming"
+	@echo "  make run-ingest         - Run main ingestion engine"
+	@echo "  make run-greeks         - Test Greeks calculator"
+	@echo "  make run-iv             - Test IV calculator"
+	@echo "  make run-config         - Show current configuration"
 	@echo ""
 	@echo "$(GREEN)Quick Stats:$(NC)"
 	@echo "  make stats              - Show overall data statistics"
@@ -38,6 +71,8 @@ help: ## Show this help message
 	@echo "  make options-latest     - Latest option quotes"
 	@echo "  make options-today      - Today's option activity"
 	@echo "  make options-strikes    - Active strikes summary"
+	@echo "  make options-raw        - Raw option data"
+	@echo "  make options-fields     - Check field population"
 	@echo ""
 	@echo "$(GREEN)Greeks & Analytics:$(NC)"
 	@echo "  make greeks             - Latest Greeks by strike"
@@ -49,6 +84,11 @@ help: ## Show this help message
 	@echo "  make gaps-today         - Today's data gaps"
 	@echo "  make quality            - Data quality report"
 	@echo ""
+	@echo "$(GREEN)Data Management:$(NC)"
+	@echo "  make clear-data         - Clear all data (with confirmation)"
+	@echo "  make clear-options      - Clear only option chains"
+	@echo "  make clear-underlying   - Clear only underlying quotes"
+	@echo ""
 	@echo "$(GREEN)Maintenance:$(NC)"
 	@echo "  make vacuum             - Vacuum analyze all tables"
 	@echo "  make size               - Show table sizes"
@@ -57,6 +97,178 @@ help: ## Show this help message
 	@echo "$(GREEN)Interactive:$(NC)"
 	@echo "  make psql               - Open PostgreSQL shell"
 	@echo "  make query SQL=\"...\"    - Run custom query"
+
+# =============================================================================
+# Service Management (from manage_service.sh)
+# =============================================================================
+
+.PHONY: start
+start: ## Start the ingestion service
+	@echo "$(GREEN)Starting $(SERVICE_NAME)...$(NC)"
+	@sudo systemctl start $(SERVICE_NAME)
+	@sleep 2
+	@sudo systemctl status $(SERVICE_NAME) --no-pager
+
+.PHONY: stop
+stop: ## Stop the ingestion service
+	@echo "$(YELLOW)Stopping $(SERVICE_NAME)...$(NC)"
+	@sudo systemctl stop $(SERVICE_NAME)
+	@sleep 1
+	@echo "$(GREEN)Service stopped$(NC)"
+
+.PHONY: restart
+restart: ## Restart the ingestion service
+	@echo "$(YELLOW)Restarting $(SERVICE_NAME)...$(NC)"
+	@sudo systemctl restart $(SERVICE_NAME)
+	@sleep 2
+	@sudo systemctl status $(SERVICE_NAME) --no-pager
+
+.PHONY: status
+status: ## Show service status
+	@sudo systemctl status $(SERVICE_NAME) --no-pager -l
+
+.PHONY: enable
+enable: ## Enable service to start on boot
+	@echo "$(GREEN)Enabling $(SERVICE_NAME) to start on boot...$(NC)"
+	@sudo systemctl enable $(SERVICE_NAME)
+	@echo "$(GREEN)Service enabled$(NC)"
+
+.PHONY: disable
+disable: ## Disable service from starting on boot
+	@echo "$(YELLOW)Disabling $(SERVICE_NAME) from starting on boot...$(NC)"
+	@sudo systemctl disable $(SERVICE_NAME)
+	@echo "$(YELLOW)Service disabled$(NC)"
+
+.PHONY: health
+health: ## Check service health and recent errors
+	@echo "$(GREEN)Service Health Check$(NC)"
+	@echo "===================="
+	@echo ""
+	@if systemctl is-active --quiet $(SERVICE_NAME); then \
+		echo "Status: $(GREEN)ACTIVE$(NC)"; \
+	else \
+		echo "Status: $(RED)INACTIVE$(NC)"; \
+	fi
+	@echo ""
+	@UPTIME=$$(systemctl show $(SERVICE_NAME) --property=ActiveEnterTimestamp --value); \
+	if [ -n "$$UPTIME" ]; then \
+		echo "Started: $$UPTIME"; \
+	fi
+	@echo ""
+	@MEMORY=$$(systemctl show $(SERVICE_NAME) --property=MemoryCurrent --value); \
+	if [ "$$MEMORY" != "[not set]" ] && [ -n "$$MEMORY" ]; then \
+		MEMORY_MB=$$(($$MEMORY / 1024 / 1024)); \
+		echo "Memory: $${MEMORY_MB} MB"; \
+	fi
+	@echo ""
+	@echo "Recent Errors (last 10):"
+	@echo "------------------------"
+	@sudo journalctl -u $(SERVICE_NAME) -p err -n 10 --no-pager || echo "No recent errors"
+	@echo ""
+	@echo "Recent Warnings (last 5):"
+	@echo "-------------------------"
+	@sudo journalctl -u $(SERVICE_NAME) -p warning -n 5 --no-pager || echo "No recent warnings"
+
+# =============================================================================
+# Logs
+# =============================================================================
+
+.PHONY: logs
+logs: ## Watch ingestion logs in real-time (Ctrl+C to stop)
+	@echo "$(BLUE)=== Watching ZeroGEX Logs (Ctrl+C to stop) ===$(NC)"
+	@sudo journalctl -u $(SERVICE_NAME) -f -n 50
+
+.PHONY: logs-tail
+logs-tail: ## Show last 100 log lines
+	@echo "$(GREEN)Last 100 log lines:$(NC)"
+	@sudo journalctl -u $(SERVICE_NAME) -n 100 --no-pager
+
+.PHONY: logs-errors
+logs-errors: ## Show recent errors in logs
+	@echo "$(BLUE)=== Recent Errors ===$(NC)"
+	@sudo journalctl -u $(SERVICE_NAME) -p err -n 50 --no-pager
+
+.PHONY: logs-grep
+logs-grep: ## Grep logs for specific pattern (use: make logs-grep PATTERN="Greeks")
+	@sudo journalctl -u $(SERVICE_NAME) -n 1000 --no-pager | grep "$(PATTERN)" || echo "No matches found for: $(PATTERN)"
+
+.PHONY: logs-clear
+logs-clear: ## Clear all journalctl logs for the service
+	@echo "$(RED)⚠️  WARNING: This will permanently delete ALL logs for $(SERVICE_NAME)!$(NC)"
+	@read -p "Are you sure? Type 'yes' to confirm: " confirm; \
+	if [ "$$confirm" = "yes" ]; then \
+		echo "$(YELLOW)Clearing logs...$(NC)"; \
+		sudo journalctl --rotate; \
+		sudo journalctl --vacuum-time=1s -u $(SERVICE_NAME); \
+		echo "$(GREEN)✅ Logs cleared for $(SERVICE_NAME)$(NC)"; \
+	else \
+		echo "$(RED)❌ Aborted$(NC)"; \
+	fi
+
+# =============================================================================
+# Run Components (from run.py)
+# =============================================================================
+
+.PHONY: run-auth
+run-auth: ## Test TradeStation authentication
+	@echo "$(BLUE)=== Testing TradeStation Authentication ===$(NC)"
+	@$(VENV_PYTHON) -m src.ingestion.tradestation_auth
+
+.PHONY: run-client
+run-client: ## Test TradeStation API client
+	@echo "$(BLUE)=== Testing TradeStation Client ===$(NC)"
+	@$(VENV_PYTHON) -m src.ingestion.tradestation_client
+
+.PHONY: run-backfill
+run-backfill: ## Run historical data backfill
+	@echo ""
+	@echo "$(BLUE)================================================================================$(NC)"
+	@echo "$(BLUE)RUNNING INDEPENDENT BACKFILL$(NC)"
+	@echo "$(BLUE)================================================================================$(NC)"
+	@echo "Note: Backfill runs independently and stores data directly."
+	@echo "      Use this to populate historical data as needed."
+	@echo "$(BLUE)================================================================================$(NC)"
+	@echo ""
+	@$(VENV_PYTHON) -m src.ingestion.backfill_manager
+
+.PHONY: run-stream
+run-stream: ## Test real-time streaming
+	@echo ""
+	@echo "$(BLUE)================================================================================$(NC)"
+	@echo "$(BLUE)TESTING STREAM MANAGER$(NC)"
+	@echo "$(BLUE)================================================================================$(NC)"
+	@echo "Note: This is a standalone test of the streaming component."
+	@echo "      For production streaming, use 'make run-ingest' or 'make start'"
+	@echo "$(BLUE)================================================================================$(NC)"
+	@echo ""
+	@$(VENV_PYTHON) -m src.ingestion.stream_manager
+
+.PHONY: run-ingest
+run-ingest: ## Run main ingestion engine (forward-only)
+	@echo ""
+	@echo "$(BLUE)================================================================================$(NC)"
+	@echo "$(BLUE)RUNNING MAIN INGESTION ENGINE (FORWARD-ONLY)$(NC)"
+	@echo "$(BLUE)================================================================================$(NC)"
+	@echo "Note: Main engine only streams forward-looking data."
+	@echo "      For historical backfill, run 'make run-backfill'"
+	@echo "$(BLUE)================================================================================$(NC)"
+	@echo ""
+	@$(VENV_PYTHON) -m src.ingestion.main_engine
+
+.PHONY: run-greeks
+run-greeks: ## Test Greeks calculator
+	@echo "$(BLUE)=== Testing Greeks Calculator ===$(NC)"
+	@$(VENV_PYTHON) -m src.ingestion.greeks_calculator
+
+.PHONY: run-iv
+run-iv: ## Test IV calculator
+	@echo "$(BLUE)=== Testing IV Calculator ===$(NC)"
+	@$(VENV_PYTHON) -m src.ingestion.iv_calculator
+
+.PHONY: run-config
+run-config: ## Show current configuration
+	@echo "$(BLUE)=== ZeroGEX Configuration ===$(NC)"
+	@$(VENV_PYTHON) -c "from src.config import print_config; print_config()"
 
 # =============================================================================
 # Quick Stats
@@ -228,79 +440,6 @@ options-raw: ## Show raw option data (what's actually stored)
 		FROM option_chains \
 		ORDER BY timestamp DESC \
 		LIMIT 5;"
-
-.PHONY: underlying-count
-underlying-count: ## Count underlying bars by hour
-	@echo "$(BLUE)=== Underlying Bars by Hour (Last 24h) ===$(NC)"
-	@$(PSQL) -c "\
-		SELECT \
-			DATE_TRUNC('hour', timestamp AT TIME ZONE 'America/New_York') as hour_et, \
-			COUNT(*) as bars \
-		FROM underlying_quotes \
-		WHERE timestamp > NOW() - INTERVAL '24 hours' \
-		GROUP BY DATE_TRUNC('hour', timestamp AT TIME ZONE 'America/New_York') \
-		ORDER BY hour_et DESC;"
-
-.PHONY: options-count
-options-count: ## Count option quotes by hour
-	@echo "$(BLUE)=== Option Quotes by Hour (Last 24h) ===$(NC)"
-	@$(PSQL) -c "\
-		SELECT \
-			DATE_TRUNC('hour', timestamp AT TIME ZONE 'America/New_York') as hour_et, \
-			COUNT(*) as quotes, \
-			COUNT(DISTINCT option_symbol) as unique_contracts \
-		FROM option_chains \
-		WHERE timestamp > NOW() - INTERVAL '24 hours' \
-		GROUP BY DATE_TRUNC('hour', timestamp AT TIME ZONE 'America/New_York') \
-		ORDER BY hour_et DESC;"
-
-.PHONY: check-streaming
-check-streaming: ## Check if data is actively streaming
-	@echo "$(BLUE)=== Streaming Health Check ===$(NC)"
-	@echo "Latest underlying bar:"
-	@$(PSQL) -t -c "\
-		SELECT \
-			timestamp AT TIME ZONE 'America/New_York' as time_et, \
-			AGE(NOW(), timestamp) as age \
-		FROM underlying_quotes \
-		ORDER BY timestamp DESC \
-		LIMIT 1;"
-	@echo ""
-	@echo "Latest option quote:"
-	@$(PSQL) -t -c "\
-		SELECT \
-			timestamp AT TIME ZONE 'America/New_York' as time_et, \
-			AGE(NOW(), timestamp) as age \
-		FROM option_chains \
-		ORDER BY timestamp DESC \
-		LIMIT 1;"
-	@echo ""
-	@echo "$(YELLOW)If age is > 5 minutes during market hours, streaming may be stuck.$(NC)"
-
-.PHONY: logs
-logs: ## Watch ingestion logs in real-time
-	@echo "$(BLUE)=== Watching ZeroGEX Logs (Ctrl+C to stop) ===$(NC)"
-	@sudo journalctl -u zerogex-oa-ingestion -f -n 50
-
-.PHONY: logs-grep
-logs-grep: ## Grep logs for specific pattern (use: make logs-grep PATTERN="Greeks")
-	@sudo journalctl -u zerogex-oa-ingestion -n 1000 --no-pager | grep "$(PATTERN)" || echo "No matches found for: $(PATTERN)"
-
-.PHONY: logs-errors
-logs-errors: ## Show recent errors in logs
-	@echo "$(BLUE)=== Recent Errors ===$(NC)"
-	@sudo journalctl -u zerogex-oa-ingestion -p err -n 50 --no-pager
-
-.PHONY: check-config
-check-config: ## Check ZeroGEX configuration
-	@echo "$(BLUE)=== ZeroGEX Configuration Check ===$(NC)"
-	@echo "Checking .env file..."
-	@grep "GREEKS_ENABLED" .env || echo "GREEKS_ENABLED not found in .env"
-	@grep "INGEST_UNDERLYING" .env || echo "INGEST_UNDERLYING not found in .env"
-	@grep "INGEST_EXPIRATIONS" .env || echo "INGEST_EXPIRATIONS not found in .env"
-	@echo ""
-	@echo "Checking if ingestion is running..."
-	@ps aux | grep "[p]ython.*main_engine" || echo "Main engine not running"
 
 .PHONY: options-fields
 options-fields: ## Check which fields are populated
@@ -519,6 +658,34 @@ quality: ## Data quality report
 		WHERE timestamp > NOW() - INTERVAL '24 hours';"
 
 # =============================================================================
+# Data Management
+# =============================================================================
+
+.PHONY: clear-data
+clear-data: ## Clear all data from tables (keeps schema)
+	@echo "$(RED)⚠️  WARNING: This will delete ALL data from tables!$(NC)"
+	@read -p "Are you sure? Type 'yes' to confirm: " confirm; \
+	if [ "$$confirm" = "yes" ]; then \
+		echo "$(YELLOW)Clearing all data...$(NC)"; \
+		$(PSQL) -c "TRUNCATE TABLE underlying_quotes, option_chains, gex_summary, gex_by_strike, data_quality_log, ingestion_metrics RESTART IDENTITY CASCADE;"; \
+		echo "$(GREEN)✅ All data cleared$(NC)"; \
+	else \
+		echo "$(RED)❌ Aborted$(NC)"; \
+	fi
+
+.PHONY: clear-options
+clear-options: ## Clear only option chains data
+	@echo "$(YELLOW)Clearing option chains...$(NC)"
+	@$(PSQL) -c "TRUNCATE TABLE option_chains RESTART IDENTITY CASCADE;"
+	@echo "$(GREEN)✅ Option chains cleared$(NC)"
+
+.PHONY: clear-underlying
+clear-underlying: ## Clear only underlying quotes
+	@echo "$(YELLOW)Clearing underlying quotes...$(NC)"
+	@$(PSQL) -c "TRUNCATE TABLE underlying_quotes RESTART IDENTITY CASCADE;"
+	@echo "$(GREEN)✅ Underlying quotes cleared$(NC)"
+
+# =============================================================================
 # Maintenance
 # =============================================================================
 
@@ -566,6 +733,29 @@ query: ## Run custom query (use: make query SQL="SELECT * FROM ...")
 # =============================================================================
 # Advanced Queries
 # =============================================================================
+
+.PHONY: check-streaming
+check-streaming: ## Check if data is actively streaming
+	@echo "$(BLUE)=== Streaming Health Check ===$(NC)"
+	@echo "Latest underlying bar:"
+	@$(PSQL) -t -c "\
+		SELECT \
+			timestamp AT TIME ZONE 'America/New_York' as time_et, \
+			AGE(NOW(), timestamp) as age \
+		FROM underlying_quotes \
+		ORDER BY timestamp DESC \
+		LIMIT 1;"
+	@echo ""
+	@echo "Latest option quote:"
+	@$(PSQL) -t -c "\
+		SELECT \
+			timestamp AT TIME ZONE 'America/New_York' as time_et, \
+			AGE(NOW(), timestamp) as age \
+		FROM option_chains \
+		ORDER BY timestamp DESC \
+		LIMIT 1;"
+	@echo ""
+	@echo "$(YELLOW)If age is > 5 minutes during market hours, streaming may be stuck.$(NC)"
 
 .PHONY: volume-profile
 volume-profile: ## Volume profile for today
