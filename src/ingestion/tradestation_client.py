@@ -2,6 +2,7 @@
 TradeStation Market Data Client
 
 Comprehensive client for TradeStation Market Data API v3 with retry logic.
+Updated with Stream Bars endpoint for real-time volume tracking.
 """
 
 import os
@@ -88,6 +89,21 @@ class TradeStationClient:
             )
 
             if response.status_code in [200, 201]:
+                # Check if response has content
+                if not response.content or len(response.content) == 0:
+                    logger.warning(f"API returned 200 but empty response - likely market closed or no data available")
+                    # Return empty structure based on endpoint
+                    if "barcharts" in endpoint or "stream/barcharts" in endpoint:
+                        return {"Bars": []}
+                    elif "quotes" in endpoint:
+                        return {"Quotes": []}
+                    elif "expirations" in endpoint:
+                        return {"Expirations": []}
+                    elif "strikes" in endpoint:
+                        return {"Strikes": []}
+                    else:
+                        return {}
+
                 result = response.json()
                 logger.debug(f"Response: {json.dumps(result, indent=2)[:1000]}...")
                 return result
@@ -99,7 +115,7 @@ class TradeStationClient:
                     if error_data.get("Message") == "No data available.":
                         logger.warning(f"No data available for request (404) - this is normal for weekends/holidays")
                         # Return empty but valid response structure based on endpoint
-                        if "barcharts" in endpoint:
+                        if "barcharts" in endpoint or "stream/barcharts" in endpoint:
                             return {"Bars": []}
                         elif "quotes" in endpoint:
                             return {"Quotes": []}
@@ -205,6 +221,89 @@ class TradeStationClient:
                     logger.warning("⚠️  Market is closed - intraday bars may be delayed")
 
         return self._request("GET", f"marketdata/barcharts/{symbol}", params=params)
+
+    def get_stream_bars(
+        self,
+        symbol: str,
+        interval: int,
+        unit: str,
+        barsback: Optional[int] = None,
+        firstdate: Optional[str] = None,
+        lastdate: Optional[str] = None,
+        sessiontemplate: str = "Default",
+        warn_if_closed: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Get streaming bars with volume breakdown (UpVolume/DownVolume)
+
+        This endpoint provides UpVolume and DownVolume which are critical
+        for gamma exposure calculations and directional flow analysis.
+
+        IMPORTANT: For real-time streaming, DO NOT use barsback parameter.
+        Use firstdate/lastdate for historical data, or omit all date params
+        for the most recent bar.
+
+        Key differences from get_bars():
+        - Returns UpVolume and DownVolume (not in regular bars endpoint)
+        - Optimized for real-time streaming
+        - Better for intraday 1-minute bars
+        - During market hours: returns latest completing bar
+        - During closed hours: may return empty if no recent data
+
+        Args:
+            symbol: Symbol to stream
+            interval: Bar interval (e.g., 1, 5, 15)
+            unit: Time unit (Minute, Daily, Weekly, Monthly)
+            barsback: Number of bars to retrieve (use None for latest, or for historical only)
+            firstdate: Optional start date (ISO format: YYYY-MM-DDTHH:MM:SSZ)
+            lastdate: Optional end date (ISO format: YYYY-MM-DDTHH:MM:SSZ)
+            sessiontemplate: Session template (Default, USEQPre, USEQ24Hour, etc.)
+            warn_if_closed: Warn if market is closed
+
+        Returns:
+            Dict with Bars array containing:
+            - TimeStamp, Open, High, Low, Close
+            - TotalVolume, UpVolume, DownVolume
+            - OpenInterest (for futures)
+
+        Example:
+            # Get latest bar during market hours (RECOMMENDED for streaming)
+            bars = client.get_stream_bars("SPY", 1, "Minute")
+
+            # Get bars for specific date range (historical)
+            bars = client.get_stream_bars(
+                "SPY", 1, "Minute",
+                firstdate="2026-02-21T09:30:00Z",
+                lastdate="2026-02-21T16:00:00Z"
+            )
+        """
+        params = {
+            "interval": interval,
+            "unit": unit,
+            "sessiontemplate": sessiontemplate
+        }
+
+        # Only add parameters that are explicitly set
+        if barsback is not None:
+            params["barsback"] = barsback
+        if firstdate:
+            params["firstdate"] = firstdate
+        if lastdate:
+            params["lastdate"] = lastdate
+
+        if barsback:
+            logger.info(f"Streaming bars for {symbol}: {interval}{unit}, barsback={barsback}")
+        elif firstdate or lastdate:
+            logger.info(f"Streaming bars for {symbol}: {interval}{unit}, date range specified")
+        else:
+            logger.info(f"Streaming bars for {symbol}: {interval}{unit} (latest bar)")
+
+        if warn_if_closed and self.warn_market_hours:
+            if unit == "Minute" and not firstdate and not lastdate:
+                if not self.is_market_open(check_extended=True):
+                    logger.warning("⚠️  Market is closed - intraday bars may be delayed")
+
+        return self._request("GET", f"marketdata/stream/barcharts/{symbol}", params=params)
 
     # =========================================================================
     # OPTIONS ENDPOINTS
@@ -361,6 +460,7 @@ Examples:
   # Test specific endpoint
   python -m src.ingestion.tradestation_client --test quote --symbol AAPL
   python -m src.ingestion.tradestation_client --test bars --symbol SPY --bars-back 10
+  python -m src.ingestion.tradestation_client --test stream-bars --symbol SPY
   python -m src.ingestion.tradestation_client --test options --symbol SPY
   python -m src.ingestion.tradestation_client --test search --query Apple
   python -m src.ingestion.tradestation_client --test market-hours
@@ -371,7 +471,7 @@ Examples:
     )
 
     parser.add_argument("--test", 
-                       choices=["all", "quote", "bars", "options", "search", "market-hours", "depth"],
+                       choices=["all", "quote", "bars", "stream-bars", "options", "search", "market-hours", "depth"],
                        help="Which test to run (default: all, env: TS_TEST)")
 
     parser.add_argument("--symbol", type=str,
@@ -392,6 +492,9 @@ Examples:
 
     parser.add_argument("--debug", action="store_true",
                        help="Enable debug logging (env: LOG_LEVEL=DEBUG)")
+
+    parser.add_argument("--test-historical", action="store_true",
+                       help="For stream-bars test, use historical date range (last Friday)")
 
     args = parser.parse_args()
 
@@ -457,6 +560,78 @@ Examples:
 
                     print(f"   {bar['TimeStamp']}: O=${open_price:.2f} H=${high_price:.2f} "
                           f"L=${low_price:.2f} C=${close_price:.2f} V={total_vol:,}")
+            print()
+
+        # Test 2.5: Get stream bars (NEW)
+        if test in ["all", "stream-bars"]:
+            print(f"Test: Get Stream Bars with Up/Down Volume")
+            print("-" * 60)
+            sym = symbols[0] if isinstance(symbols, list) else symbols
+
+            # If testing with historical data, use last Friday's date
+            if args.test_historical:
+                from datetime import datetime, timedelta
+                import pytz
+                ET = pytz.timezone("US/Eastern")
+                now = datetime.now(ET)
+
+                # Find last Friday
+                days_since_friday = (now.weekday() - 4) % 7
+                if days_since_friday == 0 and now.hour < 16:
+                    days_since_friday = 7  # If before close on Friday, use previous Friday
+
+                last_friday = now - timedelta(days=days_since_friday)
+
+                # Use 2:00 PM - 2:05 PM ET window
+                start_time = last_friday.replace(hour=14, minute=0, second=0, microsecond=0)
+                end_time = start_time + timedelta(minutes=5)
+
+                print(f"Testing with historical data from {start_time.strftime('%Y-%m-%d %H:%M ET')}")
+
+                bars = client.get_stream_bars(
+                    sym, 1, "Minute",
+                    firstdate=start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    lastdate=end_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    sessiontemplate="USEQ24Hour"
+                )
+            else:
+                # For real-time during market hours, don't use barsback
+                # Just get the latest bar
+                print(f"Getting latest 1-minute bar for {sym} (real-time)")
+                bars = client.get_stream_bars(sym, 1, "Minute", sessiontemplate="USEQ24Hour")
+
+            if "Bars" in bars and len(bars["Bars"]) > 0:
+                print(f"✅ Retrieved {len(bars['Bars'])} stream bar(s) for {sym}")
+                for bar in bars["Bars"][-3:]:
+                    open_price = safe_float(bar.get("Open"), field_name="Open")
+                    high_price = safe_float(bar.get("High"), field_name="High")
+                    low_price = safe_float(bar.get("Low"), field_name="Low")
+                    close_price = safe_float(bar.get("Close"), field_name="Close")
+                    total_vol = safe_int(bar.get("TotalVolume"), field_name="TotalVolume")
+                    up_vol = safe_int(bar.get("UpVolume"), field_name="UpVolume")
+                    down_vol = safe_int(bar.get("DownVolume"), field_name="DownVolume")
+
+                    print(f"   {bar['TimeStamp']}: O=${open_price:.2f} H=${high_price:.2f} "
+                          f"L=${low_price:.2f} C=${close_price:.2f}")
+                    print(f"      Volume: {total_vol:,} (Up: {up_vol:,}, Down: {down_vol:,})")
+
+                    # Show volume breakdown percentage
+                    if total_vol > 0:
+                        up_pct = (up_vol / total_vol) * 100
+                        down_pct = (down_vol / total_vol) * 100
+                        print(f"      Breakdown: {up_pct:.1f}% buying, {down_pct:.1f}% selling")
+            else:
+                print(f"⚠️  No stream bars data available for {sym}")
+                if not args.test_historical:
+                    print(f"   This could mean:")
+                    print(f"   1. Market just opened and first bar hasn't completed yet")
+                    print(f"   2. API delay in returning data")
+                    print(f"   3. Market is closed (weekend/holiday)")
+                    print(f"\n   Market hours: Mon-Fri 4:00 AM - 8:00 PM ET")
+                    print(f"   Current time: {datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S ET')}")
+                    print(f"   Try: python run.py client --test stream-bars --test-historical")
+                else:
+                    print(f"   No data found for requested time range")
             print()
 
         # Test 3: Get option expirations

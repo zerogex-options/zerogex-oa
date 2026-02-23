@@ -1,25 +1,29 @@
 """
-Backfill Manager - Fetches historical data and yields to MainEngine
+Backfill Manager - Independent Historical Data Backfilling
 
-This manager ONLY fetches data from TradeStation API.
-Storage is handled by MainEngine.
+This manager fetches historical data and stores it directly in the database.
+Updated to use Stream Bars API for proper UpVolume/DownVolume tracking.
 
-Enhanced with progress tracking that accounts for market hours.
+Run independently when historical data is needed:
+    python -m src.ingestion.backfill_manager --lookback-days 7
 """
 
 import os
 import time
 from datetime import datetime, date, timedelta, timezone
-from typing import Generator, List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional
 import pytz
 
 from src.ingestion.tradestation_client import TradeStationClient
+from src.ingestion.greeks_calculator import GreeksCalculator
+from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
-from src.validation import safe_float, safe_int, safe_datetime, validate_bar_data, is_market_hours
+from src.validation import safe_float, safe_int, safe_datetime, validate_bar_data
 from src.config import (
     OPTION_BATCH_SIZE,
     DELAY_BETWEEN_BATCHES,
     DELAY_BETWEEN_BARS,
+    GREEKS_ENABLED,
 )
 
 logger = get_logger(__name__)
@@ -29,7 +33,7 @@ ET = pytz.timezone("US/Eastern")
 
 
 class BackfillManager:
-    """Manages fetching of historical underlying and options data"""
+    """Manages fetching and storing of historical underlying and options data"""
 
     def __init__(
         self,
@@ -43,6 +47,22 @@ class BackfillManager:
         self.underlying = underlying.upper()
         self.num_expirations = num_expirations
         self.strike_distance = strike_distance
+
+        # Greeks calculator (initialize if enabled)
+        self.greeks_calculator = None
+        if GREEKS_ENABLED:
+            self.greeks_calculator = GreeksCalculator()
+            logger.info("✅ Greeks calculation ENABLED")
+        else:
+            logger.info("⚠️  Greeks calculation DISABLED")
+
+        # Track latest underlying price for Greeks
+        self.latest_underlying_price: Optional[float] = None
+
+        # Metrics
+        self.underlying_bars_stored = 0
+        self.option_quotes_stored = 0
+        self.greeks_calculated = 0
 
         logger.info(f"Initialized BackfillManager for {underlying}")
         logger.info(f"Config: {num_expirations} expirations, ±${strike_distance} strikes")
@@ -72,18 +92,17 @@ class BackfillManager:
             end_date = end_date.astimezone(ET)
 
         total_minutes = 0
-        current = start_date.replace(second=0, microsecond=0)  # Round to minute
+        current = start_date.replace(second=0, microsecond=0)
         end = end_date.replace(second=0, microsecond=0)
 
-        # Market hours: 4:00 AM - 8:00 PM ET (16 hours = 960 minutes per day)
+        # Market hours: 4:00 AM - 8:00 PM ET
         market_open = datetime.strptime("04:00:00", "%H:%M:%S").time()
         market_close = datetime.strptime("20:00:00", "%H:%M:%S").time()
 
         while current <= end:
             # Skip weekends
-            if current.weekday() < 5:  # Monday=0, Friday=4
+            if current.weekday() < 5:
                 current_time = current.time()
-                # Check if within market hours
                 if market_open <= current_time <= market_close:
                     total_minutes += 1
 
@@ -95,16 +114,76 @@ class BackfillManager:
         self,
         start_date: datetime,
         end_date: datetime,
-        interval: int = 5,
+        interval: int = 1,
         unit: str = "Minute"
     ) -> List[Dict[str, Any]]:
-        """Fetch underlying price bars for date range"""
+        """
+        Fetch underlying price bars using regular Bars API
+
+        Note: Regular bars API includes UpVolume and DownVolume,
+        so we use get_bars() instead of get_stream_bars()
+        """
+        try:
+            # For historical data, we may need to make multiple requests
+            # TradeStation has limits on historical data retrieval
+
+            logger.info(f"Fetching {interval}{unit} bars from {start_date} to {end_date}")
+
+            # Calculate days between dates
+            days_diff = (end_date - start_date).days
+
+            all_bars = []
+
+            # If requesting more than 30 days of 1-minute data, chunk it
+            if unit == "Minute" and days_diff > 30:
+                logger.info(f"Large date range ({days_diff} days), fetching in chunks...")
+
+                current_start = start_date
+                chunk_size = timedelta(days=30)
+
+                while current_start < end_date:
+                    current_end = min(current_start + chunk_size, end_date)
+
+                    logger.info(f"Fetching chunk: {current_start} to {current_end}")
+
+                    chunk_bars = self._fetch_bars_chunk(
+                        current_start, current_end, interval, unit
+                    )
+
+                    all_bars.extend(chunk_bars)
+                    current_start = current_end
+
+                    # Rate limiting between chunks
+                    if current_start < end_date:
+                        time.sleep(2.0)
+            else:
+                # Single request for smaller ranges
+                all_bars = self._fetch_bars_chunk(start_date, end_date, interval, unit)
+
+            # Sort chronologically (oldest to newest)
+            all_bars.sort(key=lambda x: x.get("TimeStamp", ""))
+
+            logger.info(f"✅ Retrieved {len(all_bars)} bars for {self.underlying} (sorted oldest→newest)")
+
+            return all_bars
+
+        except Exception as e:
+            logger.error(f"Error fetching underlying bars: {e}", exc_info=True)
+            return []
+
+    def _fetch_bars_chunk(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        interval: int,
+        unit: str
+    ) -> List[Dict[str, Any]]:
+        """Fetch a single chunk of bars using regular bars API"""
         try:
             start_str = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
             end_str = end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-            logger.info(f"Fetching {interval}{unit} bars from {start_str} to {end_str}")
-
+            # Use regular bars API - it includes UpVolume/DownVolume
             bars_data = self.client.get_bars(
                 symbol=self.underlying,
                 interval=interval,
@@ -116,21 +195,13 @@ class BackfillManager:
             )
 
             if "Bars" not in bars_data or len(bars_data["Bars"]) == 0:
-                logger.warning(f"No bar data returned for {self.underlying}")
+                logger.warning(f"No bar data returned for range {start_str} to {end_str}")
                 return []
 
-            bars = bars_data["Bars"]
-
-            # **CRITICAL: Sort bars chronologically (oldest to newest)**
-            # This ensures we always process in chronological order
-            bars.sort(key=lambda x: x.get("TimeStamp", ""))
-
-            logger.info(f"✅ Retrieved {len(bars)} bars for {self.underlying} (sorted oldest→newest)")
-
-            return bars
+            return bars_data["Bars"]
 
         except Exception as e:
-            logger.error(f"Error fetching underlying bars: {e}", exc_info=True)
+            logger.error(f"Error fetching bars chunk: {e}", exc_info=True)
             return []
 
     def _get_expirations_for_date(self, as_of_date: date) -> List[date]:
@@ -200,21 +271,100 @@ class BackfillManager:
 
         return option_symbols
 
+    def _store_underlying_bar(self, bar_data: Dict[str, Any]):
+        """Store underlying bar directly in database"""
+        try:
+            with db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO underlying_quotes 
+                    (symbol, timestamp, open, high, low, close, up_volume, down_volume)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (symbol, timestamp) DO UPDATE SET
+                        open = EXCLUDED.open,
+                        high = EXCLUDED.high,
+                        low = EXCLUDED.low,
+                        close = EXCLUDED.close,
+                        up_volume = EXCLUDED.up_volume,
+                        down_volume = EXCLUDED.down_volume,
+                        updated_at = NOW()
+                """, (
+                    bar_data["symbol"],
+                    bar_data["timestamp"],
+                    bar_data["open"],
+                    bar_data["high"],
+                    bar_data["low"],
+                    bar_data["close"],
+                    bar_data["up_volume"],
+                    bar_data["down_volume"]
+                ))
+                conn.commit()
+
+            self.underlying_bars_stored += 1
+
+        except Exception as e:
+            logger.error(f"Error storing underlying bar: {e}", exc_info=True)
+
+    def _store_option_quote(self, option_data: Dict[str, Any]):
+        """Store option quote directly in database"""
+        try:
+            with db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO option_chains 
+                    (option_symbol, timestamp, underlying, strike, expiration, option_type,
+                     last, bid, ask, volume, open_interest, delta, gamma, theta, vega)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (option_symbol, timestamp) DO UPDATE SET
+                        last = EXCLUDED.last,
+                        bid = EXCLUDED.bid,
+                        ask = EXCLUDED.ask,
+                        volume = EXCLUDED.volume,
+                        open_interest = EXCLUDED.open_interest,
+                        delta = EXCLUDED.delta,
+                        gamma = EXCLUDED.gamma,
+                        theta = EXCLUDED.theta,
+                        vega = EXCLUDED.vega,
+                        updated_at = NOW()
+                """, (
+                    option_data["option_symbol"],
+                    option_data["timestamp"],
+                    option_data["underlying"],
+                    option_data["strike"],
+                    option_data["expiration"],
+                    option_data["option_type"],
+                    option_data["last"],
+                    option_data["bid"],
+                    option_data["ask"],
+                    option_data["volume"],
+                    option_data["open_interest"],
+                    option_data.get("delta"),
+                    option_data.get("gamma"),
+                    option_data.get("theta"),
+                    option_data.get("vega")
+                ))
+                conn.commit()
+
+            self.option_quotes_stored += 1
+
+        except Exception as e:
+            logger.error(f"Error storing option quote: {e}", exc_info=True)
+
     def backfill(
         self,
         lookback_days: int = 1,
-        interval: int = 5,
+        interval: int = 1,
         unit: str = "Minute",
         sample_every_n_bars: int = 1
-    ) -> Generator[Dict[str, Any], None, None]:
+    ):
         """
-        Fetch historical data and yield to caller
+        Fetch historical data and store directly in database
 
-        Yields dictionaries with:
-            {
-                'type': 'underlying' | 'option',
-                'data': {...}
-            }
+        Args:
+            lookback_days: Number of days to look back
+            interval: Bar interval
+            unit: Time unit
+            sample_every_n_bars: Sample options every N bars
         """
         logger.info(f"Starting backfill for {self.underlying}")
         logger.info(f"Lookback: {lookback_days} days, Interval: {interval}{unit}")
@@ -235,7 +385,6 @@ class BackfillManager:
             logger.error("No bars retrieved, aborting backfill")
             return
 
-        # **Bars are already sorted oldest→newest from _get_underlying_bars**
         logger.info(f"Processing {len(bars)} bars in chronological order (oldest→newest)...")
 
         # Track progress
@@ -260,19 +409,20 @@ class BackfillManager:
 
                 bar_date = bar_dt.date()
 
-                # Parse OHLCV with validation
+                # Parse OHLCV with volume breakdown
                 open_price = safe_float(bar.get("Open"), field_name="Open")
                 high_price = safe_float(bar.get("High"), field_name="High")
                 low_price = safe_float(bar.get("Low"), field_name="Low")
                 close_price = safe_float(bar.get("Close"), field_name="Close")
+                up_volume = safe_int(bar.get("UpVolume"), field_name="UpVolume")
+                down_volume = safe_int(bar.get("DownVolume"), field_name="DownVolume")
                 total_volume = safe_int(bar.get("TotalVolume"), field_name="TotalVolume")
 
                 if close_price == 0:
                     logger.warning(f"Bar {i}: Zero close price, skipping")
                     continue
 
-                # **Update progress tracking**
-                # Calculate minutes processed up to this bar
+                # Update progress tracking
                 minutes_processed = self._calculate_market_minutes(start_date, bar_dt)
                 progress_pct = (minutes_processed / total_market_minutes * 100) if total_market_minutes > 0 else 0
 
@@ -282,7 +432,7 @@ class BackfillManager:
                                f"Processing {bar_dt.strftime('%Y-%m-%d %H:%M ET')}")
                     last_progress_pct = progress_pct
 
-                # Yield underlying bar data
+                # Store underlying bar
                 underlying_data = {
                     "symbol": self.underlying,
                     "timestamp": bar_dt,
@@ -290,14 +440,17 @@ class BackfillManager:
                     "high": high_price,
                     "low": low_price,
                     "close": close_price,
-                    "volume": total_volume,
+                    "up_volume": up_volume,
+                    "down_volume": down_volume,
                 }
 
-                logger.debug(f"Bar {i+1}/{len(bars)}: {self.underlying} @ {bar_dt} "
-                           f"O=${open_price:.2f} H=${high_price:.2f} "
-                           f"L=${low_price:.2f} C=${close_price:.2f} V={total_volume:,}")
+                self._store_underlying_bar(underlying_data)
 
-                yield {"type": "underlying", "data": underlying_data}
+                # Update latest price for Greeks
+                self.latest_underlying_price = close_price
+
+                logger.debug(f"Bar {i+1}/{len(bars)}: {self.underlying} @ {bar_dt} "
+                           f"C=${close_price:.2f} UpVol={up_volume:,} DownVol={down_volume:,}")
 
                 # Check if we should sample options for this bar
                 if i % sample_every_n_bars != 0:
@@ -329,19 +482,15 @@ class BackfillManager:
                                 # Parse option quote
                                 option_symbol = opt_quote.get("Symbol", "")
 
-                                # Parse option symbol to extract components
-                                # Format: "SPY 260221C450"
+                                # Parse option symbol
                                 parts = option_symbol.split()
                                 if len(parts) < 2:
                                     logger.warning(f"Invalid option symbol: {option_symbol}")
                                     continue
 
                                 option_part = parts[1]
-
-                                # Extract option type (C or P)
                                 option_type = "C" if "C" in option_part else "P"
 
-                                # Extract expiration (YYMMDD)
                                 exp_str = option_part[:6]
                                 try:
                                     expiration = datetime.strptime(exp_str, "%y%m%d").date()
@@ -349,7 +498,6 @@ class BackfillManager:
                                     logger.warning(f"Invalid expiration in {option_symbol}")
                                     continue
 
-                                # Extract strike
                                 strike_str = option_part.split(option_type)[1]
                                 strike = safe_float(strike_str, field_name="strike")
 
@@ -361,7 +509,7 @@ class BackfillManager:
                                 open_interest = safe_int(opt_quote.get("OpenInterest"),
                                                         field_name="OpenInterest")
 
-                                # Yield option data
+                                # Build option data
                                 option_data = {
                                     "option_symbol": option_symbol,
                                     "timestamp": bar_dt,
@@ -376,7 +524,23 @@ class BackfillManager:
                                     "open_interest": open_interest,
                                 }
 
-                                yield {"type": "option", "data": option_data}
+                                # Calculate Greeks if enabled
+                                if self.greeks_calculator and self.latest_underlying_price:
+                                    try:
+                                        option_data = self.greeks_calculator.enrich_option_data(
+                                            option_data,
+                                            self.latest_underlying_price
+                                        )
+                                        self.greeks_calculated += 1
+                                    except Exception as e:
+                                        logger.error(f"Error calculating Greeks: {e}")
+                                        option_data["delta"] = None
+                                        option_data["gamma"] = None
+                                        option_data["theta"] = None
+                                        option_data["vega"] = None
+
+                                # Store option quote
+                                self._store_option_quote(option_data)
 
                         # Rate limiting between batches
                         time.sleep(DELAY_BETWEEN_BATCHES)
@@ -394,11 +558,11 @@ class BackfillManager:
 
         # Final progress update
         logger.info(f"Progress: 100.0% [{total_market_minutes:,}/{total_market_minutes:,} market minutes] - Complete!")
-        logger.info("Backfill complete - all data yielded")
+        logger.info("Backfill complete - all data stored in database")
 
 
 def main():
-    """Standalone backfill for testing"""
+    """Standalone backfill"""
     import argparse
     from dotenv import load_dotenv
 
@@ -411,8 +575,8 @@ def main():
                        default=int(os.getenv("BACKFILL_LOOKBACK_DAYS", "1")),
                        help="Days to backfill (default: 1)")
     parser.add_argument("--interval", type=int,
-                       default=int(os.getenv("BACKFILL_INTERVAL", "5")),
-                       help="Bar interval (default: 5)")
+                       default=int(os.getenv("BACKFILL_INTERVAL", "1")),
+                       help="Bar interval (default: 1)")
     parser.add_argument("--unit", default=os.getenv("BACKFILL_UNIT", "Minute"),
                        choices=["Minute", "Daily", "Weekly", "Monthly"],
                        help="Bar unit (default: Minute)")
@@ -436,7 +600,7 @@ def main():
         set_log_level("DEBUG")
 
     print("\n" + "="*80)
-    print("BACKFILL MANAGER - STANDALONE TEST")
+    print("BACKFILL MANAGER - INDEPENDENT HISTORICAL DATA BACKFILL")
     print("="*80)
     print(f"Underlying: {args.underlying}")
     print(f"Lookback: {args.lookback_days} days")
@@ -444,6 +608,7 @@ def main():
     print(f"Expirations: {args.expirations}")
     print(f"Strike Distance: ±${args.strike_distance}")
     print(f"Sample Every: {args.sample_every} bar(s)")
+    print(f"Greeks: {'ENABLED' if GREEKS_ENABLED else 'DISABLED'}")
     print("="*80 + "\n")
 
     # Initialize client
@@ -462,45 +627,35 @@ def main():
         strike_distance=args.strike_distance
     )
 
-    # Track counts
-    underlying_count = 0
-    option_count = 0
-
     try:
-        # Run backfill and count yielded items
-        for item in manager.backfill(
+        # Run backfill
+        manager.backfill(
             lookback_days=args.lookback_days,
             interval=args.interval,
             unit=args.unit,
             sample_every_n_bars=args.sample_every
-        ):
-            if item["type"] == "underlying":
-                underlying_count += 1
-                if underlying_count % 100 == 0:
-                    logger.info(f"Yielded {underlying_count} underlying bars...")
-            elif item["type"] == "option":
-                option_count += 1
-                if option_count % 1000 == 0:
-                    logger.info(f"Yielded {option_count} option quotes...")
+        )
 
         print("\n" + "="*80)
         print("BACKFILL COMPLETE")
         print("="*80)
-        print(f"✅ Underlying bars yielded: {underlying_count}")
-        print(f"✅ Option quotes yielded: {option_count}")
+        print(f"✅ Underlying bars stored: {manager.underlying_bars_stored}")
+        print(f"✅ Option quotes stored: {manager.option_quotes_stored}")
+        if GREEKS_ENABLED:
+            print(f"✅ Greeks calculated: {manager.greeks_calculated}")
         print("="*80 + "\n")
-        print("NOTE: This standalone test only YIELDS data, it does NOT store it.")
-        print("Use 'python run.py ingest' to backfill AND store data in database.")
-        print()
 
     except KeyboardInterrupt:
         print("\n\n⚠️  Backfill interrupted by user")
-        print(f"Partial results: {underlying_count} underlying, {option_count} options yielded")
+        print(f"Partial results: {manager.underlying_bars_stored} underlying, "
+              f"{manager.option_quotes_stored} options stored")
     except Exception as e:
         print(f"\n❌ Error: {e}")
         logger.error(f"Backfill failed: {e}", exc_info=True)
         import sys
         sys.exit(1)
+    finally:
+        close_connection_pool()
 
 
 if __name__ == "__main__":

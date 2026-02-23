@@ -8,9 +8,10 @@ Usage:
 Examples:
     python run.py auth
     python run.py client --test quote --symbol SPY
-    python run.py backfill --lookback-days 3
-    python run.py stream --underlying SPY
-    python run.py ingest --lookback-days 7
+    python run.py client --test stream-bars --symbol SPY
+    python run.py backfill --lookback-days 7    # Run backfill independently
+    python run.py stream --underlying SPY       # Test streaming only
+    python run.py ingest --underlying SPY       # Forward-only (no backfill)
     python run.py config
 """
 import sys
@@ -20,11 +21,15 @@ def print_usage():
     print(__doc__)
     print("\nAvailable modules:")
     print("  auth          - Test TradeStation authentication")
-    print("  client        - Test TradeStation API client")
-    print("  backfill      - Run historical data backfill")
-    print("  stream        - Run real-time options data streaming")
-    print("  ingest        - Run main ingestion engine (backfill + stream)")
+    print("  client        - Test TradeStation API client (including stream-bars)")
+    print("  backfill      - Run historical data backfill (INDEPENDENT)")
+    print("  stream        - Test real-time options data streaming")
+    print("  ingest        - Run main ingestion engine (FORWARD-ONLY)")
     print("  config        - Display current configuration")
+    print("\nArchitecture:")
+    print("  • main_engine (ingest) = Forward-only streaming")
+    print("  • backfill_manager     = Independent historical data backfill")
+    print("  • stream_manager       = Real-time data streaming (used by main_engine)")
     print("\nFor module-specific help, run:")
     print("  python run.py <module> --help")
 
@@ -48,14 +53,32 @@ if __name__ == "__main__":
             main()
 
         elif module == "backfill":
+            print("\n" + "="*80)
+            print("RUNNING INDEPENDENT BACKFILL")
+            print("="*80)
+            print("Note: Backfill now runs independently and stores data directly.")
+            print("      Use this to populate historical data as needed.")
+            print("="*80 + "\n")
             from src.ingestion.backfill_manager import main
             main()
 
         elif module == "stream":
+            print("\n" + "="*80)
+            print("TESTING STREAM MANAGER")
+            print("="*80)
+            print("Note: This is a standalone test of the streaming component.")
+            print("      For production streaming, use 'python run.py ingest'")
+            print("="*80 + "\n")
             from src.ingestion.stream_manager import main
             main()
 
         elif module == "ingest":
+            print("\n" + "="*80)
+            print("RUNNING MAIN INGESTION ENGINE (FORWARD-ONLY)")
+            print("="*80)
+            print("Note: Main engine only streams forward-looking data.")
+            print("      For historical backfill, run 'python run.py backfill'")
+            print("="*80 + "\n")
             from src.ingestion.main_engine import main
             main()
 

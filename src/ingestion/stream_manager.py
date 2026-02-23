@@ -1,6 +1,9 @@
 """
 Stream Manager - Streams real-time data and yields to MainEngine
 
+Updated to use TradeStation Stream Bars API for underlying quotes,
+which provides proper UpVolume and DownVolume tracking.
+
 This manager ONLY fetches data from TradeStation API.
 Storage is handled by MainEngine.
 """
@@ -14,7 +17,7 @@ from src.ingestion.tradestation_client import TradeStationClient
 from src.utils import get_logger
 from src.validation import (
     safe_float, safe_int, safe_datetime,
-    validate_quote_data, get_market_session
+    validate_bar_data, get_market_session
 )
 from src.config import (
     OPTION_BATCH_SIZE,
@@ -60,24 +63,86 @@ class StreamManager:
         logger.info(f"Initialized StreamManager for {underlying}")
         logger.info(f"Config: {num_expirations} expirations, ±${strike_distance} strikes")
 
-    def _get_underlying_price(self) -> Optional[float]:
-        """Fetch current underlying price"""
-        try:
-            quote_data = self.client.get_quote(self.underlying, warn_if_closed=False)
+    def _fetch_underlying_bar(self) -> Optional[Dict[str, Any]]:
+        """
+        Fetch latest underlying bar with volume breakdown using regular Bars API
 
-            if "Quotes" not in quote_data or len(quote_data["Quotes"]) == 0:
-                logger.warning(f"No quote data returned for {self.underlying}")
+        Note: The regular bars endpoint includes UpVolume/DownVolume,
+        so we don't need the stream/barcharts endpoint.
+
+        Returns bar data with OHLC + UpVolume/DownVolume
+        """
+        try:
+            # Use regular bars API with barsback=1 to get latest completed bar
+            # This works reliably and includes UpVolume/DownVolume
+            bars_data = self.client.get_bars(
+                symbol=self.underlying,
+                interval=1,
+                unit="Minute",
+                barsback=1,
+                sessiontemplate="USEQPre",  # Include pre/post market
+                warn_if_closed=False
+            )
+
+            if "Bars" not in bars_data or len(bars_data["Bars"]) == 0:
+                logger.debug(f"No bar data returned for {self.underlying} - likely between bars or market just opened")
                 return None
 
-            quote = quote_data["Quotes"][0]
-            price = safe_float(quote.get("Last"), field_name="Last")
+            bar = bars_data["Bars"][0]
 
-            if price == 0:
-                logger.warning(f"Price is 0, trying Close or Bid")
-                price = safe_float(quote.get("Close", quote.get("Bid")), field_name="Close/Bid")
+            # Validate bar data
+            if not validate_bar_data(bar):
+                logger.warning("Invalid bar data, skipping")
+                return None
 
-            logger.debug(f"Current {self.underlying} price: ${price:.2f}")
-            return price
+            # Parse bar timestamp
+            timestamp_str = bar.get("TimeStamp", "")
+            timestamp = safe_datetime(timestamp_str, field_name="TimeStamp")
+
+            if not timestamp:
+                timestamp = datetime.now(ET)
+
+            # Parse OHLCV with volume breakdown
+            underlying_data = {
+                "symbol": self.underlying,
+                "timestamp": timestamp,
+                "open": safe_float(bar.get("Open"), field_name="Open"),
+                "high": safe_float(bar.get("High"), field_name="High"),
+                "low": safe_float(bar.get("Low"), field_name="Low"),
+                "close": safe_float(bar.get("Close"), field_name="Close"),
+                "up_volume": safe_int(bar.get("UpVolume"), field_name="UpVolume"),
+                "down_volume": safe_int(bar.get("DownVolume"), field_name="DownVolume"),
+                "volume": safe_int(bar.get("TotalVolume"), field_name="TotalVolume"),
+            }
+
+            logger.debug(f"Bar: {self.underlying} @ {timestamp} "
+                        f"C=${underlying_data['close']:.2f} "
+                        f"UpVol={underlying_data['up_volume']:,} "
+                        f"DownVol={underlying_data['down_volume']:,}")
+
+            return underlying_data
+
+        except Exception as e:
+            logger.error(f"Error fetching underlying bar: {e}", exc_info=True)
+            return None
+
+    def _get_underlying_price(self) -> Optional[float]:
+        """
+        Fetch current underlying price
+
+        Used only for initialization and strike recalculation
+        For streaming data, use _fetch_underlying_bar()
+        """
+        try:
+            # Fetch latest bar and extract close price
+            bar_data = self._fetch_underlying_bar()
+
+            if bar_data:
+                price = bar_data["close"]
+                logger.debug(f"Current {self.underlying} price: ${price:.2f}")
+                return price
+
+            return None
 
         except Exception as e:
             logger.error(f"Error fetching underlying price: {e}", exc_info=True)
@@ -243,44 +308,19 @@ class StreamManager:
             logger.info(f"Iteration {iteration} - {datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S ET')} "
                        f"[{session}]")
 
+            # Track option count for debugging
+            option_count = 0
+
             try:
-                # Fetch underlying quote
-                quote_data = self.client.get_quote(self.underlying, warn_if_closed=False)
+                # Fetch underlying bar using Stream Bars API
+                underlying_data = self._fetch_underlying_bar()
 
-                if "Quotes" in quote_data and len(quote_data["Quotes"]) > 0:
-                    quote = quote_data["Quotes"][0]
+                if underlying_data:
+                    # Update current price for strike calculations
+                    self.current_price = underlying_data["close"]
 
-                    # Validate quote
-                    if validate_quote_data(quote):
-                        # Parse timestamp
-                        timestamp_str = quote.get("TimeStamp", "")
-                        timestamp = safe_datetime(timestamp_str, field_name="TimeStamp")
-
-                        if not timestamp:
-                            timestamp = datetime.now(ET)
-
-                        # Parse quote data
-                        last = safe_float(quote.get("Last"), field_name="Last")
-                        bid = safe_float(quote.get("Bid"), field_name="Bid")
-                        ask = safe_float(quote.get("Ask"), field_name="Ask")
-                        volume = safe_int(quote.get("Volume"), field_name="Volume")
-
-                        # Yield underlying data
-                        underlying_data = {
-                            "symbol": self.underlying,
-                            "timestamp": timestamp,
-                            "last": last,
-                            "bid": bid,
-                            "ask": ask,
-                            "volume": volume,
-                        }
-
-                        logger.debug(f"{self.underlying}: Last=${last:.2f} "
-                                   f"Bid=${bid:.2f}x{quote.get('BidSize', 0)} "
-                                   f"Ask=${ask:.2f}x{quote.get('AskSize', 0)} "
-                                   f"Vol={volume:,}")
-
-                        yield {"type": "underlying", "data": underlying_data}
+                    # Yield underlying data
+                    yield {"type": "underlying", "data": underlying_data}
 
                 # Fetch options quotes in batches
                 for i in range(0, len(self.tracked_option_symbols), OPTION_BATCH_SIZE):
@@ -325,6 +365,28 @@ class StreamManager:
                                 open_interest = safe_int(opt_quote.get("OpenInterest"), 
                                                         field_name="OpenInterest")
 
+                                # Try multiple field names for implied volatility
+                                # TradeStation may use different field names
+                                implied_volatility = None
+                                for iv_field in ["ImpliedVolatility", "IV", "Volatility", "IVol"]:
+                                    iv_value = safe_float(opt_quote.get(iv_field), field_name=iv_field)
+                                    if iv_value and iv_value > 0:
+                                        implied_volatility = iv_value
+                                        break
+
+                                # Log what we're getting from API (only first option for debugging)
+                                if option_count == 0:
+                                    logger.debug(f"Sample option quote from API: {opt_quote}")
+                                    logger.debug(f"  Available fields: {list(opt_quote.keys())}")
+                                    logger.debug(f"  OpenInterest: {opt_quote.get('OpenInterest')}")
+                                    logger.debug(f"  DailyOpenInterest: {opt_quote.get('DailyOpenInterest')}")
+                                    logger.debug(f"  ImpliedVolatility found: {implied_volatility}")
+                                    # Check for any field containing 'vol' or 'IV'
+                                    vol_fields = {k: v for k, v in opt_quote.items() 
+                                                 if 'vol' in k.lower() or 'iv' in k.lower()}
+                                    if vol_fields:
+                                        logger.debug(f"  Fields containing 'vol' or 'iv': {vol_fields}")
+
                                 # Yield option data
                                 option_data = {
                                     "option_symbol": option_symbol,
@@ -338,21 +400,30 @@ class StreamManager:
                                     "ask": ask,
                                     "volume": volume,
                                     "open_interest": open_interest,
+                                    "implied_volatility": implied_volatility if implied_volatility else None,
                                 }
 
                                 yield {"type": "option", "data": option_data}
+                                option_count += 1
 
                     except Exception as e:
                         logger.error(f"Error fetching options batch: {e}")
 
                 # Check if we should recalculate strikes
                 if iteration % STRIKE_RECALC_INTERVAL == 0:
-                    new_price = self._get_underlying_price()
-                    if new_price and abs(new_price - self.current_price) > PRICE_MOVE_THRESHOLD:
-                        logger.info(f"Price moved from ${self.current_price:.2f} to ${new_price:.2f}")
-                        logger.info("Recalculating tracked strikes...")
-                        self.current_price = new_price
-                        self.tracked_option_symbols = self._build_option_symbols()
+                    if self.current_price:
+                        # Check if we have a previous price to compare
+                        # If first time, just log current price
+                        if iteration == STRIKE_RECALC_INTERVAL:
+                            logger.debug(f"Current price: ${self.current_price:.2f}")
+                        else:
+                            # Get fresh price data
+                            new_price = self._get_underlying_price()
+                            if new_price and abs(new_price - self.current_price) > PRICE_MOVE_THRESHOLD:
+                                logger.info(f"Price moved from ${self.current_price:.2f} to ${new_price:.2f}")
+                                logger.info("Recalculating tracked strikes...")
+                                self.current_price = new_price
+                                self.tracked_option_symbols = self._build_option_symbols()
 
                 # Cleanup expired strikes periodically
                 if iteration % STRIKE_CLEANUP_INTERVAL == 0:
@@ -447,13 +518,20 @@ def main():
         for item in manager.stream(max_iterations=args.max_iterations):
             if item["type"] == "underlying":
                 underlying_count += 1
+                if underlying_count % 10 == 0:
+                    data = item["data"]
+                    print(f"Underlying bars: {underlying_count} - Latest: "
+                          f"${data['close']:.2f} "
+                          f"(Up: {data['up_volume']:,}, Down: {data['down_volume']:,})")
             elif item["type"] == "option":
                 option_count += 1
+                if option_count % 100 == 0:
+                    print(f"Option quotes: {option_count}")
 
         print("\n" + "="*80)
         print("STREAM COMPLETE")
         print("="*80)
-        print(f"✅ Underlying quotes yielded: {underlying_count}")
+        print(f"✅ Underlying bars yielded: {underlying_count}")
         print(f"✅ Option quotes yielded: {option_count}")
         print("="*80 + "\n")
         print("NOTE: This standalone test only YIELDS data, it does NOT store it.")
