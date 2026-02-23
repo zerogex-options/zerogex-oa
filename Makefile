@@ -79,6 +79,14 @@ help: ## Show this help message
 	@echo "  make greeks-summary     - Greeks summary statistics"
 	@echo "  make gex-preview        - Preview GEX calculation data"
 	@echo ""
+	@echo "$(GREEN)Real-Time Flow Analysis:$(NC)"
+	@echo "  make flow-by-type       - Puts vs calls flow (all strikes/expirations)"
+	@echo "  make flow-by-strike     - Flow by strike level"
+	@echo "  make flow-by-expiration - Flow by expiration date"
+	@echo "  make flow-smart-money   - Unusual activity detection"
+	@echo "  make flow-buying-pressure - Underlying buying/selling pressure"
+	@echo "  make flow-live          - Combined real-time flow dashboard"
+	@echo ""
 	@echo "$(GREEN)Data Quality:$(NC)"
 	@echo "  make gaps               - Check for data gaps"
 	@echo "  make gaps-today         - Today's data gaps"
@@ -530,6 +538,175 @@ options-strikes: ## Active strikes summary
 		WHERE timestamp = (SELECT MAX(timestamp) FROM option_chains) \
 		GROUP BY strike, expiration \
 		ORDER BY expiration, strike;"
+
+# =============================================================================
+# Real-Time Flow Analysis
+# =============================================================================
+
+.PHONY: flow-by-type
+flow-by-type: ## Puts vs calls flow (all strikes/expirations)
+	@echo "$(BLUE)=== Option Flow by Type (Last Hour) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			TO_CHAR(time_et, 'HH24:MI') as time, \
+			underlying, \
+			call_flow, \
+			put_flow, \
+			net_flow, \
+			put_call_ratio, \
+			total_flow, \
+			CASE \
+				WHEN put_call_ratio > 1.5 THEN '🔴 Heavy Puts' \
+				WHEN put_call_ratio > 1.0 THEN '📉 More Puts' \
+				WHEN put_call_ratio > 0.5 THEN '⚖️ Balanced' \
+				ELSE '📈 More Calls' \
+			END as sentiment \
+		FROM option_flow_by_type \
+		WHERE timestamp > NOW() - INTERVAL '1 hour' \
+		ORDER BY timestamp DESC \
+		LIMIT 20;"
+
+.PHONY: flow-by-strike
+flow-by-strike: ## Flow by strike level
+	@echo "$(BLUE)=== Option Flow by Strike (Last Hour, Top 15) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			TO_CHAR(time_et, 'HH24:MI') as time, \
+			underlying, \
+			strike, \
+			call_flow, \
+			put_flow, \
+			net_flow, \
+			total_flow, \
+			ROUND(avg_iv * 100, 1) as avg_iv_pct \
+		FROM option_flow_by_strike \
+		WHERE timestamp > NOW() - INTERVAL '1 hour' \
+		ORDER BY total_flow DESC \
+		LIMIT 15;"
+
+.PHONY: flow-by-expiration
+flow-by-expiration: ## Flow by expiration date
+	@echo "$(BLUE)=== Option Flow by Expiration (Last Hour) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			TO_CHAR(time_et, 'HH24:MI') as time, \
+			underlying, \
+			expiration, \
+			days_to_expiry as dte, \
+			call_flow, \
+			put_flow, \
+			net_flow, \
+			total_flow, \
+			total_contracts \
+		FROM option_flow_by_expiration \
+		WHERE timestamp > NOW() - INTERVAL '1 hour' \
+		ORDER BY timestamp DESC, total_flow DESC \
+		LIMIT 20;"
+
+.PHONY: flow-smart-money
+flow-smart-money: ## Unusual activity detection
+	@echo "$(BLUE)=== Smart Money Flow / Unusual Activity (Last Hour) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			TO_CHAR(time_et, 'HH24:MI') as time, \
+			option_symbol, \
+			strike, \
+			expiration, \
+			days_to_expiry as dte, \
+			option_type, \
+			flow, \
+			ROUND(price, 2) as price, \
+			ROUND(iv * 100, 1) as iv_pct, \
+			delta, \
+			unusual_score, \
+			size_class, \
+			iv_class, \
+			moneyness \
+		FROM option_flow_smart_money \
+		WHERE timestamp > NOW() - INTERVAL '1 hour' \
+		ORDER BY unusual_score DESC, flow DESC \
+		LIMIT 25;"
+
+.PHONY: flow-buying-pressure
+flow-buying-pressure: ## Underlying buying/selling pressure
+	@echo "$(BLUE)=== Underlying Buying Pressure (Last 30 Bars) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			TO_CHAR(time_et, 'HH24:MI') as time, \
+			symbol, \
+			ROUND(close, 2) as price, \
+			total_volume_delta as volume, \
+			buying_pressure_pct as buy_pct, \
+			period_buying_pressure_pct as period_buy_pct, \
+			ROUND(price_change, 2) as price_chg, \
+			momentum \
+		FROM underlying_buying_pressure \
+		ORDER BY timestamp DESC \
+		LIMIT 30;"
+
+.PHONY: flow-live
+flow-live: ## Combined real-time flow dashboard
+	@echo "$(BLUE)================================================================================$(NC)"
+	@echo "$(BLUE)REAL-TIME FLOW DASHBOARD$(NC)"
+	@echo "$(BLUE)================================================================================$(NC)"
+	@echo ""
+	@echo "$(GREEN)1. UNDERLYING BUYING PRESSURE (Last 10 Bars)$(NC)"
+	@echo "--------------------------------------------------------------------------------"
+	@$(PSQL) -c "\
+		SELECT \
+			TO_CHAR(time_et, 'HH24:MI') as time, \
+			ROUND(close, 2) as price, \
+			total_volume_delta as vol, \
+			period_buying_pressure_pct as buy_pct, \
+			momentum \
+		FROM underlying_buying_pressure \
+		ORDER BY timestamp DESC \
+		LIMIT 10;" 2>/dev/null
+	@echo ""
+	@echo "$(GREEN)2. PUTS VS CALLS FLOW (Last 10 Minutes)$(NC)"
+	@echo "--------------------------------------------------------------------------------"
+	@$(PSQL) -c "\
+		SELECT \
+			TO_CHAR(time_et, 'HH24:MI') as time, \
+			call_flow as calls, \
+			put_flow as puts, \
+			net_flow as net, \
+			put_call_ratio as pc_ratio \
+		FROM option_flow_by_type \
+		WHERE timestamp > NOW() - INTERVAL '30 minutes' \
+		ORDER BY timestamp DESC \
+		LIMIT 10;" 2>/dev/null
+	@echo ""
+	@echo "$(GREEN)3. SMART MONEY / UNUSUAL ACTIVITY (Top 10)$(NC)"
+	@echo "--------------------------------------------------------------------------------"
+	@$(PSQL) -c "\
+		SELECT \
+			TO_CHAR(time_et, 'HH24:MI') as time, \
+			SUBSTRING(option_symbol, 1, 15) as contract, \
+			option_type as type, \
+			flow, \
+			unusual_score as score, \
+			size_class \
+		FROM option_flow_smart_money \
+		WHERE timestamp > NOW() - INTERVAL '1 hour' \
+		ORDER BY unusual_score DESC, flow DESC \
+		LIMIT 10;" 2>/dev/null
+	@echo ""
+	@echo "$(GREEN)4. TOP STRIKES BY FLOW (Top 10)$(NC)"
+	@echo "--------------------------------------------------------------------------------"
+	@$(PSQL) -c "\
+		SELECT \
+			strike, \
+			call_flow as calls, \
+			put_flow as puts, \
+			net_flow as net, \
+			total_flow as total \
+		FROM option_flow_by_strike \
+		WHERE timestamp > NOW() - INTERVAL '30 minutes' \
+		ORDER BY total_flow DESC \
+		LIMIT 10;" 2>/dev/null
+	@echo ""
+	@echo "$(BLUE)================================================================================$(NC)"
 
 # =============================================================================
 # Greeks & Analytics

@@ -726,6 +726,14 @@ make greeks             # Latest Greeks by strike
 make greeks-summary     # Greeks summary statistics
 make gex-preview        # Preview GEX calculation data
 
+# Real-Time Flow Analysis (🔥 For Trading Decisions)
+make flow-by-type       # Puts vs calls flow (all strikes/expirations)
+make flow-by-strike     # Flow by strike level
+make flow-by-expiration # Flow by expiration date
+make flow-smart-money   # Unusual activity detection
+make flow-buying-pressure # Underlying buying/selling pressure
+make flow-live          # Combined real-time flow dashboard ⭐
+
 # Data Quality
 make gaps               # Check for data gaps
 make gaps-today         # Today's data gaps
@@ -759,12 +767,91 @@ make query SQL="..."    # Run custom SQL query
 make help               # Show all available commands
 ```
 
+### Real-Time Flow Analysis
+
+ZeroGEX includes 5 real-time flow views for making trading decisions with **zero lag**:
+
+#### 1. Flow by Type (`make flow-by-type`)
+Shows aggregate puts vs calls flow across all strikes and expirations:
+- Total call/put flow per minute
+- Put/Call ratio
+- Net flow (bullish/bearish indicator)
+- Sentiment classification
+
+**Use case:** Overall market sentiment, identifying put or call heavy periods
+
+#### 2. Flow by Strike (`make flow-by-strike`)
+Shows flow aggregated by strike level across all expirations:
+- Which strikes are getting hit with flow
+- Call/Put breakdown per strike
+- Average Greeks at each strike level
+
+**Use case:** Identifying key support/resistance levels, gamma walls, pin risk
+
+#### 3. Flow by Expiration (`make flow-by-expiration`)
+Shows flow aggregated by expiration date across all strikes:
+- Which expiration cycles are active
+- Days to expiry (DTE)
+- Average IV and theta per expiration
+
+**Use case:** Identifying where traders are positioning (0DTE, weeklies, monthlies)
+
+#### 4. Smart Money Flow (`make flow-smart-money`)
+Filters for unusual activity indicating informed trading:
+- Large blocks (100+, 200+, 500+ contracts)
+- High IV plays (>40%, >60%, >100% IV)
+- Deep OTM unusual activity
+- **Automatic unusual score (0-10)** for each trade
+
+**Use case:** Spotting potential edge, following smart money, finding asymmetric setups
+
+#### 5. Underlying Buying Pressure (`make flow-buying-pressure`)
+Time series of buying vs selling pressure in the underlying:
+- Buying pressure percentage
+- Up/down volume breakdown
+- Price momentum classification
+- Period-over-period flow changes
+
+**Use case:** Confirming directional bias, spotting divergences with options flow
+
+#### Combined Dashboard (`make flow-live`)
+Real-time dashboard showing all 5 views in one command:
+```bash
+make flow-live
+
+# Shows:
+# 1. Underlying buying pressure (last 10 bars)
+# 2. Puts vs calls flow (last 10 minutes)
+# 3. Smart money/unusual activity (top 10)
+# 4. Top strikes by flow (top 10)
+```
+
+Perfect for keeping open in a terminal during trading hours!
+
 ### Common Workflows
 
 **Start and monitor:**
 ```bash
 make start
 make logs
+```
+
+**Real-time trading decisions:**
+```bash
+# Quick check on market sentiment
+make flow-by-type
+
+# See what strikes are getting hit
+make flow-by-strike
+
+# Look for unusual activity
+make flow-smart-money
+
+# Full dashboard
+make flow-live
+
+# Keep it updating every 10 seconds
+watch -n 10 make flow-live
 ```
 
 **Check data health:**

@@ -1,5 +1,5 @@
 -- =============================================================================
--- ZeroGEX Complete Database Schema
+-- ZeroGEX Complete Database Schema with Real-Time Flow Views
 -- =============================================================================
 -- Single idempotent schema file - safe to run multiple times
 -- Run with: psql -h <host> -U <user> -d zerogex -f schema.sql
@@ -440,14 +440,378 @@ $$ LANGUAGE plpgsql;
 
 
 -- =============================================================================
--- Verification
+-- Real-Time Options Flow & Buying Pressure Views
+-- =============================================================================
+-- Created for real-time trading decisions with zero lag
+-- All views are regular (non-materialized) for instant data
+-- =============================================================================
+
+-- =============================================================================
+-- View 1: Option Flow by Type (Puts vs Calls)
+-- =============================================================================
+-- Shows aggregate puts vs calls flow across all strikes and expirations
+-- Use case: Overall market sentiment, put/call ratio tracking
+
+CREATE OR REPLACE VIEW option_flow_by_type AS
+SELECT 
+    timestamp AT TIME ZONE 'America/New_York' as time_et,
+    timestamp,
+    underlying,
+    -- Call flow
+    SUM(volume_delta) FILTER (WHERE option_type = 'C' AND volume_delta > 0) as call_flow,
+    COUNT(DISTINCT option_symbol) FILTER (WHERE option_type = 'C' AND volume_delta > 0) as call_contracts,
+    -- Put flow
+    SUM(volume_delta) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as put_flow,
+    COUNT(DISTINCT option_symbol) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as put_contracts,
+    -- Net flow (calls - puts)
+    SUM(volume_delta) FILTER (WHERE option_type = 'C' AND volume_delta > 0) - 
+    SUM(volume_delta) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as net_flow,
+    -- Put/Call ratio
+    ROUND(
+        SUM(volume_delta) FILTER (WHERE option_type = 'P' AND volume_delta > 0)::numeric / 
+        NULLIF(SUM(volume_delta) FILTER (WHERE option_type = 'C' AND volume_delta > 0), 0),
+        3
+    ) as put_call_ratio,
+    -- Total flow
+    SUM(volume_delta) FILTER (WHERE volume_delta > 0) as total_flow,
+    COUNT(DISTINCT option_symbol) FILTER (WHERE volume_delta > 0) as total_contracts
+FROM option_chains_with_deltas
+WHERE volume_delta > 0  -- Only actual trades
+GROUP BY timestamp, underlying
+ORDER BY timestamp DESC;
+
+COMMENT ON VIEW option_flow_by_type IS 
+'Real-time puts vs calls flow aggregated across all strikes and expirations. Zero lag.';
+
+
+-- =============================================================================
+-- View 2: Option Flow by Strike
+-- =============================================================================
+-- Shows flow aggregated by strike across all expirations
+-- Use case: Identifying key strike levels with heavy flow
+
+CREATE OR REPLACE VIEW option_flow_by_strike AS
+SELECT 
+    timestamp AT TIME ZONE 'America/New_York' as time_et,
+    timestamp,
+    underlying,
+    strike,
+    -- Call flow at this strike
+    SUM(volume_delta) FILTER (WHERE option_type = 'C' AND volume_delta > 0) as call_flow,
+    COUNT(DISTINCT expiration) FILTER (WHERE option_type = 'C' AND volume_delta > 0) as call_expirations,
+    -- Put flow at this strike
+    SUM(volume_delta) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as put_flow,
+    COUNT(DISTINCT expiration) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as put_expirations,
+    -- Net flow at strike
+    SUM(volume_delta) FILTER (WHERE option_type = 'C' AND volume_delta > 0) - 
+    SUM(volume_delta) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as net_flow,
+    -- Total flow at strike
+    SUM(volume_delta) FILTER (WHERE volume_delta > 0) as total_flow,
+    -- Average Greeks at this strike (for context)
+    ROUND(AVG(delta) FILTER (WHERE volume_delta > 0), 4) as avg_delta,
+    ROUND(AVG(gamma) FILTER (WHERE volume_delta > 0), 6) as avg_gamma,
+    ROUND(AVG(implied_volatility) FILTER (WHERE volume_delta > 0), 4) as avg_iv
+FROM option_chains_with_deltas
+WHERE volume_delta > 0
+GROUP BY timestamp, underlying, strike
+ORDER BY timestamp DESC, total_flow DESC;
+
+COMMENT ON VIEW option_flow_by_strike IS 
+'Real-time flow by strike level across all expirations. Shows key strike concentration.';
+
+
+-- =============================================================================
+-- View 3: Option Flow by Expiration
+-- =============================================================================
+-- Shows flow aggregated by expiration across all strikes
+-- Use case: Identifying which expiry cycles are getting action
+
+CREATE OR REPLACE VIEW option_flow_by_expiration AS
+SELECT 
+    timestamp AT TIME ZONE 'America/New_York' as time_et,
+    timestamp,
+    underlying,
+    expiration,
+    -- Days to expiration
+    (expiration - CURRENT_DATE) as days_to_expiry,
+    -- Call flow for this expiration
+    SUM(volume_delta) FILTER (WHERE option_type = 'C' AND volume_delta > 0) as call_flow,
+    COUNT(DISTINCT strike) FILTER (WHERE option_type = 'C' AND volume_delta > 0) as call_strikes,
+    -- Put flow for this expiration
+    SUM(volume_delta) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as put_flow,
+    COUNT(DISTINCT strike) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as put_strikes,
+    -- Net flow
+    SUM(volume_delta) FILTER (WHERE option_type = 'C' AND volume_delta > 0) - 
+    SUM(volume_delta) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as net_flow,
+    -- Total flow
+    SUM(volume_delta) FILTER (WHERE volume_delta > 0) as total_flow,
+    COUNT(DISTINCT option_symbol) FILTER (WHERE volume_delta > 0) as total_contracts,
+    -- Average Greeks for this expiration
+    ROUND(AVG(implied_volatility) FILTER (WHERE volume_delta > 0), 4) as avg_iv,
+    ROUND(AVG(theta) FILTER (WHERE volume_delta > 0), 4) as avg_theta
+FROM option_chains_with_deltas
+WHERE volume_delta > 0
+GROUP BY timestamp, underlying, expiration
+ORDER BY timestamp DESC, days_to_expiry ASC;
+
+COMMENT ON VIEW option_flow_by_expiration IS 
+'Real-time flow by expiration across all strikes. Shows which expiry cycles are active.';
+
+
+-- =============================================================================
+-- View 4: Smart Money Flow (Unusual Activity)
+-- =============================================================================
+-- Filters for potentially significant trades indicating informed trading
+-- Use case: Spotting unusual activity, large blocks, high IV plays
+
+CREATE OR REPLACE VIEW option_flow_smart_money AS
+SELECT 
+    timestamp AT TIME ZONE 'America/New_York' as time_et,
+    timestamp,
+    option_symbol,
+    underlying,
+    strike,
+    expiration,
+    (expiration - CURRENT_DATE) as days_to_expiry,
+    option_type,
+    -- Flow metrics
+    volume_delta as flow,
+    last as price,
+    last - LAG(last) OVER (PARTITION BY option_symbol ORDER BY timestamp) as price_change,
+    -- Greeks context
+    ROUND(delta, 4) as delta,
+    ROUND(gamma, 6) as gamma,
+    ROUND(implied_volatility, 4) as iv,
+    ROUND(theta, 4) as theta,
+    ROUND(vega, 4) as vega,
+    -- Classification flags
+    CASE 
+        WHEN volume_delta >= 500 THEN '🔥 Massive Block'
+        WHEN volume_delta >= 200 THEN '📦 Large Block'
+        WHEN volume_delta >= 100 THEN '📊 Medium Block'
+        ELSE '💼 Standard'
+    END as size_class,
+    CASE 
+        WHEN implied_volatility > 1.0 THEN '⚡ Extreme IV'
+        WHEN implied_volatility > 0.6 THEN '🌩️ Very High IV'
+        WHEN implied_volatility > 0.4 THEN '☁️ High IV'
+        ELSE '🌤️ Normal IV'
+    END as iv_class,
+    CASE 
+        WHEN ABS(delta) < 0.15 THEN '💰 Deep OTM'
+        WHEN ABS(delta) < 0.35 THEN '🎯 OTM'
+        WHEN ABS(delta) < 0.65 THEN '⚖️ ATM'
+        ELSE '💎 ITM'
+    END as moneyness,
+    -- Unusual activity score (0-10)
+    LEAST(10, GREATEST(0,
+        -- Size component (0-4 points)
+        CASE 
+            WHEN volume_delta >= 500 THEN 4
+            WHEN volume_delta >= 200 THEN 3
+            WHEN volume_delta >= 100 THEN 2
+            WHEN volume_delta >= 50 THEN 1
+            ELSE 0
+        END +
+        -- IV component (0-3 points)
+        CASE 
+            WHEN implied_volatility > 1.0 THEN 3
+            WHEN implied_volatility > 0.6 THEN 2
+            WHEN implied_volatility > 0.4 THEN 1
+            ELSE 0
+        END +
+        -- Deep OTM component (0-2 points)
+        CASE 
+            WHEN ABS(delta) < 0.15 THEN 2
+            WHEN ABS(delta) < 0.25 THEN 1
+            ELSE 0
+        END +
+        -- Short DTE component (0-1 point)
+        CASE 
+            WHEN (expiration - CURRENT_DATE) <= 2 THEN 1
+            ELSE 0
+        END
+    )) as unusual_score
+FROM option_chains_with_deltas
+WHERE 
+    volume_delta > 0
+    AND (
+        volume_delta >= 50  -- Minimum threshold for "smart money"
+        OR implied_volatility > 0.4  -- High IV plays
+        OR (ABS(delta) < 0.15 AND volume_delta >= 20)  -- Deep OTM with decent volume
+    )
+ORDER BY timestamp DESC, unusual_score DESC, volume_delta DESC;
+
+COMMENT ON VIEW option_flow_smart_money IS 
+'Real-time unusual activity detection. Filters for large blocks, high IV, and deep OTM plays.';
+
+
+-- =============================================================================
+-- View 5: Underlying Buying Pressure Time Series
+-- =============================================================================
+-- Shows directional flow in the underlying over time
+-- Use case: Correlate with option flow to spot hedging, confirm trends
+
+CREATE OR REPLACE VIEW underlying_buying_pressure AS
+SELECT 
+    timestamp AT TIME ZONE 'America/New_York' as time_et,
+    timestamp,
+    symbol,
+    -- OHLC
+    open,
+    high,
+    low,
+    close,
+    -- Volume breakdown
+    up_volume,
+    down_volume,
+    up_volume + down_volume as total_volume,
+    -- Volume deltas (from view)
+    up_volume_delta,
+    down_volume_delta,
+    up_volume_delta + down_volume_delta as total_volume_delta,
+    -- Buying pressure percentage
+    ROUND(
+        CASE 
+            WHEN (up_volume + down_volume) > 0 
+            THEN (up_volume::numeric / (up_volume + down_volume) * 100)
+            ELSE 50
+        END,
+        2
+    ) as buying_pressure_pct,
+    -- Delta-based buying pressure (actual trades this period)
+    ROUND(
+        CASE 
+            WHEN (up_volume_delta + down_volume_delta) > 0 
+            THEN (up_volume_delta::numeric / (up_volume_delta + down_volume_delta) * 100)
+            ELSE 50
+        END,
+        2
+    ) as period_buying_pressure_pct,
+    -- Price change
+    close - LAG(close) OVER (PARTITION BY symbol ORDER BY timestamp) as price_change,
+    ROUND(
+        ((close - LAG(close) OVER (PARTITION BY symbol ORDER BY timestamp)) / 
+        NULLIF(LAG(close) OVER (PARTITION BY symbol ORDER BY timestamp), 0) * 100),
+        3
+    ) as price_change_pct,
+    -- Momentum classification
+    CASE 
+        WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) > 0.7 
+            THEN '🟢 Strong Buying'
+        WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) > 0.55 
+            THEN '✅ Buying'
+        WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) >= 0.45 
+            THEN '⚪ Neutral'
+        WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) >= 0.3 
+            THEN '❌ Selling'
+        ELSE '🔴 Strong Selling'
+    END as momentum
+FROM underlying_quotes_with_deltas
+ORDER BY timestamp DESC;
+
+COMMENT ON VIEW underlying_buying_pressure IS 
+'Real-time buying vs selling pressure in underlying. Shows directional flow and momentum.';
+
+
+-- =============================================================================
+-- Performance Indexes for Flow Views
+-- =============================================================================
+-- These indexes optimize the real-time views for fast queries
+
+-- Index for time-based filtering (most common use case)
+CREATE INDEX IF NOT EXISTS idx_option_chains_timestamp_volfilter 
+    ON option_chains(timestamp DESC) 
+    WHERE volume > 0;
+
+CREATE INDEX IF NOT EXISTS idx_underlying_quotes_timestamp_desc
+    ON underlying_quotes(timestamp DESC);
+
+-- Composite indexes for multi-column GROUP BY queries
+CREATE INDEX IF NOT EXISTS idx_option_chains_timestamp_strike 
+    ON option_chains(timestamp DESC, strike);
+
+CREATE INDEX IF NOT EXISTS idx_option_chains_timestamp_expiration 
+    ON option_chains(timestamp DESC, expiration);
+
+CREATE INDEX IF NOT EXISTS idx_option_chains_timestamp_type 
+    ON option_chains(timestamp DESC, option_type);
+
+-- Index for smart money filtering
+CREATE INDEX IF NOT EXISTS idx_option_chains_iv_volume 
+    ON option_chains(implied_volatility, volume) 
+    WHERE implied_volatility IS NOT NULL;
+
+
+-- =============================================================================
+-- Verification & Stats
 -- =============================================================================
 
 \echo ''
 \echo '✅ ZeroGEX schema setup complete'
 \echo ''
+
+-- Verify all tables exist
+SELECT 
+    tablename,
+    schemaname
+FROM pg_tables
+WHERE schemaname = 'public'
+    AND tablename IN (
+        'symbols',
+        'underlying_quotes',
+        'option_chains',
+        'gex_summary',
+        'gex_by_strike',
+        'data_quality_log',
+        'ingestion_metrics',
+        'data_retention_policy'
+    )
+ORDER BY tablename;
+
+\echo ''
+
+-- Verify all views exist
+SELECT 
+    viewname,
+    definition IS NOT NULL as has_definition
+FROM pg_views 
+WHERE schemaname = 'public' 
+    AND viewname IN (
+        'option_flow_by_type',
+        'option_flow_by_strike', 
+        'option_flow_by_expiration',
+        'option_flow_smart_money',
+        'underlying_buying_pressure'
+    )
+ORDER BY viewname;
+
+\echo ''
+
+-- Verify materialized views exist
+SELECT 
+    matviewname,
+    schemaname
+FROM pg_matviews
+WHERE schemaname = 'public'
+    AND matviewname IN (
+        'underlying_quotes_with_deltas',
+        'option_chains_with_deltas'
+    )
+ORDER BY matviewname;
+
+\echo ''
 \echo 'Next steps:'
 \echo '  1. Add symbols: INSERT INTO symbols (symbol, name, asset_type) VALUES (''SPY'', ''SPDR S&P 500'', ''ETF'');'
 \echo '  2. Test functions: SELECT * FROM refresh_delta_views();'
 \echo '  3. Test cleanup: SELECT * FROM cleanup_old_data();'
+\echo '  4. Test flow views: SELECT * FROM option_flow_by_type LIMIT 5;'
+\echo ''
+\echo 'Makefile shortcuts for flow analysis:'
+\echo '  make flow-by-type'
+\echo '  make flow-by-strike'
+\echo '  make flow-by-expiration'
+\echo '  make flow-smart-money'
+\echo '  make flow-buying-pressure'
+\echo '  make flow-live              # Combined dashboard'
 \echo ''
