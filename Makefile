@@ -551,16 +551,13 @@ flow-by-type: ## Puts vs calls flow (all strikes/expirations)
 			TO_CHAR(time_et, 'HH24:MI') as time, \
 			underlying, \
 			call_flow, \
+			TO_CHAR(call_notional, 'FM999,999,999') as call_notional, \
 			put_flow, \
+			TO_CHAR(put_notional, 'FM999,999,999') as put_notional, \
 			net_flow, \
-			put_call_ratio, \
-			total_flow, \
-			CASE \
-				WHEN put_call_ratio > 1.5 THEN '🔴 Heavy Puts' \
-				WHEN put_call_ratio > 1.0 THEN '📉 More Puts' \
-				WHEN put_call_ratio > 0.5 THEN '⚖️ Balanced' \
-				ELSE '📈 More Calls' \
-			END as sentiment \
+			TO_CHAR(net_notional, 'FM999,999,999') as net_notional, \
+			put_call_ratio as pc_ratio, \
+			put_call_notional_ratio as pc_not_ratio \
 		FROM option_flow_by_type \
 		WHERE timestamp > NOW() - INTERVAL '1 hour' \
 		ORDER BY timestamp DESC \
@@ -575,13 +572,13 @@ flow-by-strike: ## Flow by strike level
 			underlying, \
 			strike, \
 			call_flow, \
+			TO_CHAR(call_notional, 'FM999,999') as call_notional, \
 			put_flow, \
-			net_flow, \
-			total_flow, \
-			ROUND(avg_iv * 100, 1) as avg_iv_pct \
+			TO_CHAR(put_notional, 'FM999,999') as put_notional, \
+			TO_CHAR(total_notional, 'FM999,999') as total_notional \
 		FROM option_flow_by_strike \
 		WHERE timestamp > NOW() - INTERVAL '1 hour' \
-		ORDER BY total_flow DESC \
+		ORDER BY total_notional DESC \
 		LIMIT 15;"
 
 .PHONY: flow-by-expiration
@@ -594,13 +591,13 @@ flow-by-expiration: ## Flow by expiration date
 			expiration, \
 			days_to_expiry as dte, \
 			call_flow, \
+			TO_CHAR(call_notional, 'FM999,999') as call_notional, \
 			put_flow, \
-			net_flow, \
-			total_flow, \
-			total_contracts \
+			TO_CHAR(put_notional, 'FM999,999') as put_notional, \
+			TO_CHAR(total_notional, 'FM999,999') as total_notional \
 		FROM option_flow_by_expiration \
 		WHERE timestamp > NOW() - INTERVAL '1 hour' \
-		ORDER BY timestamp DESC, total_flow DESC \
+		ORDER BY timestamp DESC, total_notional DESC \
 		LIMIT 20;"
 
 .PHONY: flow-smart-money
@@ -609,22 +606,20 @@ flow-smart-money: ## Unusual activity detection
 	@$(PSQL) -c "\
 		SELECT \
 			TO_CHAR(time_et, 'HH24:MI') as time, \
-			option_symbol, \
+			SUBSTRING(option_symbol, 1, 15) as contract, \
 			strike, \
 			expiration, \
 			days_to_expiry as dte, \
 			option_type, \
 			flow, \
+			TO_CHAR(notional, 'FM999,999') as notional, \
 			ROUND(price, 2) as price, \
-			ROUND(iv * 100, 1) as iv_pct, \
-			delta, \
-			unusual_score, \
-			size_class, \
-			iv_class, \
-			moneyness \
+			unusual_score as score, \
+			notional_class, \
+			size_class \
 		FROM option_flow_smart_money \
 		WHERE timestamp > NOW() - INTERVAL '1 hour' \
-		ORDER BY unusual_score DESC, flow DESC \
+		ORDER BY unusual_score DESC, notional DESC \
 		LIMIT 25;"
 
 .PHONY: flow-buying-pressure
