@@ -6,6 +6,10 @@ All configurable constants in one place for easy tuning.
 
 import os
 from typing import Dict, Any
+from dotenv import load_dotenv
+
+# CRITICAL: Load environment variables FIRST before any config is read
+load_dotenv()
 
 # =============================================================================
 # API Configuration
@@ -149,6 +153,7 @@ def get_all_config() -> Dict[str, Any]:
         "features": {
             "websocket_enabled": WEBSOCKET_ENABLED,
             "gex_enabled": GEX_ENABLED,
+            "greeks_enabled": GREEKS_ENABLED,
             "metrics_enabled": METRICS_ENABLED,
             "backfill_on_startup": BACKFILL_ON_STARTUP,
         },

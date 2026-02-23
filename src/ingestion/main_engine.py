@@ -4,8 +4,9 @@ ZeroGEX Main Ingestion Engine - Orchestrates backfill, streaming, and storage
 This engine:
 1. Delegates data fetching to BackfillManager and StreamManager
 2. Handles 1-minute aggregation
-3. Stores data in PostgreSQL/TimescaleDB
-4. Monitors data quality and pipeline health
+3. Calculates Greeks for options (if enabled)
+4. Stores data in PostgreSQL/TimescaleDB
+5. Monitors data quality and pipeline health
 """
 
 import os
@@ -19,6 +20,7 @@ import pytz
 from src.ingestion.tradestation_client import TradeStationClient
 from src.ingestion.backfill_manager import BackfillManager
 from src.ingestion.stream_manager import StreamManager
+from src.ingestion.greeks_calculator import GreeksCalculator
 from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
 from src.validation import bucket_timestamp
@@ -28,6 +30,7 @@ from src.config import (
     BUFFER_FLUSH_INTERVAL,
     BACKFILL_ON_STARTUP,
     MAX_GAP_MINUTES,
+    GREEKS_ENABLED,
 )
 
 logger = get_logger(__name__)
@@ -65,9 +68,21 @@ class MainEngine:
         self.underlying_buffer: List[Dict[str, Any]] = []
         self.options_buffer: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
+        # Track latest underlying price for Greeks calculation
+        self.latest_underlying_price: Optional[float] = None
+
+        # Greeks calculator (initialize if enabled)
+        self.greeks_calculator = None
+        if GREEKS_ENABLED:
+            self.greeks_calculator = GreeksCalculator()
+            logger.info("✅ Greeks calculation ENABLED")
+        else:
+            logger.info("⚠️  Greeks calculation DISABLED (set GREEKS_ENABLED=true to enable)")
+
         # Metrics
         self.underlying_bars_stored = 0
         self.option_quotes_stored = 0
+        self.greeks_calculated = 0
         self.last_flush_time = datetime.now(ET)
         self.errors_count = 0
 
@@ -112,7 +127,7 @@ class MainEngine:
                 existing_tables = [row[0] for row in cursor.fetchall()]
 
                 if len(existing_tables) < 2:
-                    logger.warning("Database tables not found. Please run sql/001_create_tables.sql")
+                    logger.warning("Database tables not found. Please run sql/schema.sql")
                     logger.warning("Attempting to continue, but storage will fail...")
                 else:
                     logger.info(f"✅ Database initialized: {existing_tables}")
@@ -183,6 +198,12 @@ class MainEngine:
 
         self.current_bucket = bucket
         self.underlying_buffer.append(data)
+
+        # Track latest underlying price for Greeks calculation
+        if "last" in data and data["last"] > 0:
+            self.latest_underlying_price = data["last"]
+        elif "close" in data and data["close"] > 0:
+            self.latest_underlying_price = data["close"]
 
         # Flush if buffer too large
         if len(self.underlying_buffer) >= MAX_BUFFER_SIZE:
@@ -272,9 +293,38 @@ class MainEngine:
         """
         Buffer option quote for 1-minute aggregation
 
+        Calculates Greeks before buffering if enabled.
+
         Args:
             data: Option quote data
         """
+        # Calculate Greeks if enabled and we have underlying price
+        if self.greeks_calculator and self.latest_underlying_price:
+            try:
+                data = self.greeks_calculator.enrich_option_data(
+                    data, 
+                    self.latest_underlying_price
+                )
+                self.greeks_calculated += 1
+
+                if self.greeks_calculated % 100 == 0:
+                    logger.debug(f"Calculated Greeks for {self.greeks_calculated} options")
+
+            except Exception as e:
+                logger.error(f"Error calculating Greeks for {data.get('option_symbol')}: {e}")
+                # Add zero Greeks as fallback
+                data["delta"] = 0.0
+                data["gamma"] = 0.0
+                data["theta"] = 0.0
+                data["vega"] = 0.0
+        elif self.greeks_calculator and not self.latest_underlying_price:
+            logger.debug("Skipping Greeks calculation - no underlying price available yet")
+            # Add zero Greeks
+            data["delta"] = 0.0
+            data["gamma"] = 0.0
+            data["theta"] = 0.0
+            data["vega"] = 0.0
+
         # Get timestamp and bucket it
         timestamp = data["timestamp"]
         bucket = bucket_timestamp(timestamp, AGGREGATION_BUCKET_SECONDS)
@@ -310,6 +360,10 @@ class MainEngine:
                 "ask": last.get("ask", 0),
                 "volume": last.get("volume", 0),
                 "open_interest": last.get("open_interest", 0),
+                "delta": last.get("delta"),
+                "gamma": last.get("gamma"),
+                "theta": last.get("theta"),
+                "vega": last.get("vega"),
             }
 
             # Store in database
@@ -318,14 +372,18 @@ class MainEngine:
                 cursor.execute("""
                     INSERT INTO option_chains 
                     (option_symbol, timestamp, underlying, strike, expiration, option_type,
-                     last, bid, ask, volume, open_interest)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     last, bid, ask, volume, open_interest, delta, gamma, theta, vega)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (option_symbol, timestamp) DO UPDATE SET
                         last = EXCLUDED.last,
                         bid = EXCLUDED.bid,
                         ask = EXCLUDED.ask,
                         volume = EXCLUDED.volume,
                         open_interest = EXCLUDED.open_interest,
+                        delta = EXCLUDED.delta,
+                        gamma = EXCLUDED.gamma,
+                        theta = EXCLUDED.theta,
+                        vega = EXCLUDED.vega,
                         updated_at = NOW()
                 """, (
                     agg["option_symbol"],
@@ -338,7 +396,11 @@ class MainEngine:
                     agg["bid"],
                     agg["ask"],
                     agg["volume"],
-                    agg["open_interest"]
+                    agg["open_interest"],
+                    agg["delta"],
+                    agg["gamma"],
+                    agg["theta"],
+                    agg["vega"]
                 ))
                 conn.commit()
 
@@ -432,6 +494,8 @@ class MainEngine:
         logger.info(f"\n✅ Backfill complete:")
         logger.info(f"   Underlying bars: {self.underlying_bars_stored}")
         logger.info(f"   Option quotes: {self.option_quotes_stored}")
+        if GREEKS_ENABLED:
+            logger.info(f"   Greeks calculated: {self.greeks_calculated}")
 
     def run_streaming(self):
         """Run streaming phase"""
@@ -485,6 +549,7 @@ class MainEngine:
         logger.info(f"Expirations: {self.num_expirations}")
         logger.info(f"Strike Distance: ±${self.strike_distance}")
         logger.info(f"Lookback: {self.lookback_days} days")
+        logger.info(f"Greeks: {'ENABLED' if GREEKS_ENABLED else 'DISABLED'}")
         logger.info("="*80 + "\n")
 
         try:
