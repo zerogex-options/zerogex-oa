@@ -118,7 +118,7 @@ IVCalculator (calculate IV from prices if not provided)
       ↓
 GreeksCalculator (calculate Greeks using IV)
       ↓
-MainEngine (aggregate in 1-minute buckets)
+IngestionEngine (aggregate in 1-minute buckets)
       ↓
 PostgreSQL/TimescaleDB (store with timezone awareness)
       ↓

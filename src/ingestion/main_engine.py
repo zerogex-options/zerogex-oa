@@ -1,5 +1,5 @@
 """
-ZeroGEX Main Ingestion Engine - Forward-Only Streaming
+ZeroGEX Main Ingestion Engine
 
 This engine:
 1. Streams real-time data using StreamManager (no backfill)
@@ -38,11 +38,11 @@ logger = get_logger(__name__)
 ET = pytz.timezone("US/Eastern")
 
 
-class MainEngine:
+class IngestionEngine:
     """
     Main ingestion engine - forward-only streaming with storage
 
-    StreamManager fetches data, MainEngine stores it.
+    StreamManager fetches data, IngestionEngine stores it.
     """
 
     def __init__(
@@ -84,7 +84,7 @@ class MainEngine:
         self.last_flush_time = datetime.now(ET)
         self.errors_count = 0
 
-        logger.info(f"Initialized MainEngine for {underlying}")
+        logger.info(f"Initialized IngestionEngine for {underlying}")
         logger.info(f"Config: {num_expirations} expirations, ±${strike_distance} strikes")
 
         # Setup signal handlers for graceful shutdown
@@ -530,7 +530,7 @@ def main():
 
     load_dotenv()
 
-    parser = argparse.ArgumentParser(description="ZeroGEX Main Ingestion Engine - Forward Only")
+    parser = argparse.ArgumentParser(description="ZeroGEX Main Ingestion Engine")
     parser.add_argument("--underlying", default=os.getenv("INGEST_UNDERLYING", "SPY"),
                        help="Underlying symbol (default: SPY)")
     parser.add_argument("--expirations", type=int,
@@ -558,7 +558,7 @@ def main():
     )
 
     # Initialize and run engine
-    engine = MainEngine(
+    engine = IngestionEngine(
         client=client,
         underlying=args.underlying,
         num_expirations=args.expirations,

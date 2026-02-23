@@ -1,11 +1,11 @@
 """
-Stream Manager - Streams real-time data and yields to MainEngine
+Stream Manager - Streams real-time data and yields to IngestionEngine
 
 Updated to use TradeStation Stream Bars API for underlying quotes,
 which provides proper UpVolume and DownVolume tracking.
 
 This manager ONLY fetches data from TradeStation API.
-Storage is handled by MainEngine.
+Storage is handled by IngestionEngine.
 """
 
 import os
