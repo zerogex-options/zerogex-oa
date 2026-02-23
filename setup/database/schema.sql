@@ -759,6 +759,456 @@ COMMENT ON VIEW underlying_buying_pressure IS
 
 
 -- =============================================================================
+-- Day Trading Decision Support Views
+-- =============================================================================
+-- Advanced views for intraday trading decisions
+-- =============================================================================
+
+-- Drop existing day trading views first (required when modifying view structure)
+DROP VIEW IF EXISTS underlying_vwap_deviation CASCADE;
+DROP VIEW IF EXISTS opening_range_breakout CASCADE;
+DROP VIEW IF EXISTS gamma_exposure_levels CASCADE;
+DROP VIEW IF EXISTS dealer_hedging_pressure CASCADE;
+DROP VIEW IF EXISTS unusual_volume_spikes CASCADE;
+DROP VIEW IF EXISTS momentum_divergence CASCADE;
+
+-- =============================================================================
+-- View 6: VWAP Deviation
+-- =============================================================================
+-- Shows when price is significantly above/below VWAP
+-- Use case: Mean reversion when price >0.2% from VWAP, breakout confirmation
+
+CREATE VIEW underlying_vwap_deviation AS
+SELECT
+    timestamp AT TIME ZONE 'America/New_York' as time_et,
+    timestamp,
+    symbol,
+    close as price,
+    -- VWAP calculation (cumulative from market open)
+    SUM((close * (up_volume + down_volume))) OVER (
+        PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+        ORDER BY timestamp
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) / NULLIF(
+        SUM(up_volume + down_volume) OVER (
+            PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+            ORDER BY timestamp
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ), 0
+    ) as vwap,
+    -- Deviation from VWAP
+    ROUND(
+        (close - (
+            SUM((close * (up_volume + down_volume))) OVER (
+                PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+                ORDER BY timestamp
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) / NULLIF(
+                SUM(up_volume + down_volume) OVER (
+                    PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+                    ORDER BY timestamp
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ), 0
+            )
+        )) / close * 100,
+        2
+    ) as vwap_deviation_pct,
+    -- Volume
+    up_volume + down_volume as volume,
+    -- Classify position
+    CASE
+        WHEN close > (SUM((close * (up_volume + down_volume))) OVER (
+            PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+            ORDER BY timestamp
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) / NULLIF(
+            SUM(up_volume + down_volume) OVER (
+                PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+                ORDER BY timestamp
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ), 0
+        )) * 1.002 THEN '🔥 Extended Above VWAP'
+        WHEN close > (SUM((close * (up_volume + down_volume))) OVER (
+            PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+            ORDER BY timestamp
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) / NULLIF(
+            SUM(up_volume + down_volume) OVER (
+                PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+                ORDER BY timestamp
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ), 0
+        )) THEN '✅ Above VWAP'
+        WHEN close < (SUM((close * (up_volume + down_volume))) OVER (
+            PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+            ORDER BY timestamp
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) / NULLIF(
+            SUM(up_volume + down_volume) OVER (
+                PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+                ORDER BY timestamp
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ), 0
+        )) * 0.998 THEN '🔥 Extended Below VWAP'
+        ELSE '❌ Below VWAP'
+    END as vwap_position
+FROM underlying_quotes
+WHERE DATE(timestamp AT TIME ZONE 'America/New_York') = CURRENT_DATE
+ORDER BY timestamp DESC;
+
+COMMENT ON VIEW underlying_vwap_deviation IS
+'VWAP deviation for mean reversion and breakout trading. Price >0.2% from VWAP often reverts.';
+
+
+-- =============================================================================
+-- View 7: Opening Range Breakout (ORB)
+-- =============================================================================
+-- Critical for momentum day trading - tracks if price breaks first 30min range
+-- Use case: ORB breakouts often lead to trend days
+
+CREATE VIEW opening_range_breakout AS
+WITH first_30min AS (
+    SELECT
+        symbol,
+        DATE(timestamp AT TIME ZONE 'America/New_York') as trade_date,
+        MAX(high) as orb_high,
+        MIN(low) as orb_low,
+        MAX(high) - MIN(low) as orb_range
+    FROM underlying_quotes
+    WHERE EXTRACT(HOUR FROM timestamp AT TIME ZONE 'America/New_York') = 9
+      AND EXTRACT(MINUTE FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 30 AND 59
+    GROUP BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+)
+SELECT
+    q.timestamp AT TIME ZONE 'America/New_York' as time_et,
+    q.timestamp,
+    q.symbol,
+    q.close as current_price,
+    orb.orb_high,
+    orb.orb_low,
+    orb.orb_range,
+    -- Distance from ORB boundaries
+    ROUND(q.close - orb.orb_high, 2) as distance_above_orb_high,
+    ROUND(orb.orb_low - q.close, 2) as distance_below_orb_low,
+    -- Percentage of ORB range
+    ROUND((q.close - orb.orb_low) / NULLIF(orb.orb_range, 0) * 100, 1) as orb_pct,
+    -- Breakout status
+    CASE
+        WHEN q.close > orb.orb_high THEN '🚀 ORB Breakout (Long)'
+        WHEN q.close < orb.orb_low THEN '💥 ORB Breakdown (Short)'
+        WHEN q.close >= orb.orb_high * 0.998 THEN '⚡ Near ORB High'
+        WHEN q.close <= orb.orb_low * 1.002 THEN '⚡ Near ORB Low'
+        ELSE '⏸️ Inside ORB'
+    END as orb_status,
+    -- Volume context
+    q.up_volume + q.down_volume as volume
+FROM underlying_quotes q
+JOIN first_30min orb
+    ON q.symbol = orb.symbol
+    AND DATE(q.timestamp AT TIME ZONE 'America/New_York') = orb.trade_date
+WHERE DATE(q.timestamp AT TIME ZONE 'America/New_York') = CURRENT_DATE
+  AND EXTRACT(HOUR FROM q.timestamp AT TIME ZONE 'America/New_York') >= 9
+ORDER BY q.timestamp DESC;
+
+COMMENT ON VIEW opening_range_breakout IS
+'Opening range breakout tracker. Breaks of first 30min high/low often lead to trend days.';
+
+
+-- =============================================================================
+-- View 8: Gamma Exposure Levels
+-- =============================================================================
+-- Shows where dealers are long/short gamma - creates support/resistance
+-- Use case: Large positive GEX = support, large negative GEX = resistance
+
+CREATE VIEW gamma_exposure_levels AS
+WITH latest_options AS (
+    SELECT DISTINCT ON (option_symbol)
+        option_symbol,
+        underlying,
+        strike,
+        expiration,
+        option_type,
+        gamma,
+        open_interest,
+        delta
+    FROM option_chains
+    WHERE timestamp >= NOW() - INTERVAL '5 minutes'
+      AND gamma IS NOT NULL
+      AND open_interest > 0
+    ORDER BY option_symbol, timestamp DESC
+)
+SELECT
+    underlying,
+    strike,
+    -- Net GEX at this strike (calls are positive, puts are negative for dealers)
+    SUM(
+        CASE
+            WHEN option_type = 'C' THEN gamma * open_interest * 100
+            ELSE -1 * gamma * open_interest * 100
+        END
+    ) as net_gex,
+    -- Total absolute GEX
+    SUM(ABS(gamma * open_interest * 100)) as total_gex,
+    -- Call vs Put breakdown
+    SUM(gamma * open_interest * 100) FILTER (WHERE option_type = 'C') as call_gex,
+    SUM(gamma * open_interest * 100) FILTER (WHERE option_type = 'P') as put_gex,
+    -- Count of contracts
+    COUNT(*) as num_contracts,
+    SUM(open_interest) as total_oi,
+    -- GEX classification
+    CASE
+        WHEN SUM(
+            CASE
+                WHEN option_type = 'C' THEN gamma * open_interest * 100
+                ELSE -1 * gamma * open_interest * 100
+            END
+        ) > 1000000 THEN '🟢 Major Support (Dealers Short Gamma)'
+        WHEN SUM(
+            CASE
+                WHEN option_type = 'C' THEN gamma * open_interest * 100
+                ELSE -1 * gamma * open_interest * 100
+            END
+        ) > 500000 THEN '✅ Support Level'
+        WHEN SUM(
+            CASE
+                WHEN option_type = 'C' THEN gamma * open_interest * 100
+                ELSE -1 * gamma * open_interest * 100
+            END
+        ) < -1000000 THEN '🔴 Major Resistance (Dealers Long Gamma)'
+        WHEN SUM(
+            CASE
+                WHEN option_type = 'C' THEN gamma * open_interest * 100
+                ELSE -1 * gamma * open_interest * 100
+            END
+        ) < -500000 THEN '❌ Resistance Level'
+        ELSE '⚪ Neutral'
+    END as gex_level
+FROM latest_options
+WHERE (expiration - CURRENT_DATE) <= 30  -- Only next 30 days
+GROUP BY underlying, strike
+HAVING SUM(ABS(gamma * open_interest * 100)) > 100000  -- Filter noise
+ORDER BY ABS(SUM(
+    CASE
+        WHEN option_type = 'C' THEN gamma * open_interest * 100
+        ELSE -1 * gamma * open_interest * 100
+    END
+)) DESC;
+
+COMMENT ON VIEW gamma_exposure_levels IS
+'Gamma exposure by strike. Large positive GEX = support, negative = resistance. Dealers hedge at these levels.';
+
+
+-- =============================================================================
+-- View 9: Dealer Hedging Pressure
+-- =============================================================================
+-- Detects when dealers need to hedge (buy/sell underlying)
+-- Use case: Amplifies moves when dealers chase price
+
+CREATE VIEW dealer_hedging_pressure AS
+WITH price_moves AS (
+    SELECT
+        symbol,
+        timestamp,
+        close,
+        close - LAG(close) OVER (PARTITION BY symbol ORDER BY timestamp) as price_change,
+        LAG(close) OVER (PARTITION BY symbol ORDER BY timestamp) as prev_close
+    FROM underlying_quotes
+    WHERE timestamp >= NOW() - INTERVAL '30 minutes'
+),
+latest_options AS (
+    SELECT DISTINCT ON (option_symbol)
+        option_symbol,
+        underlying,
+        strike,
+        option_type,
+        delta,
+        gamma,
+        open_interest
+    FROM option_chains
+    WHERE timestamp >= NOW() - INTERVAL '5 minutes'
+      AND gamma IS NOT NULL
+      AND delta IS NOT NULL
+      AND open_interest > 0
+    ORDER BY option_symbol, timestamp DESC
+)
+SELECT
+    pm.timestamp,
+    pm.timestamp AT TIME ZONE 'America/New_York' as time_et,
+    pm.symbol,
+    pm.close as current_price,
+    ROUND(pm.price_change, 2) as price_change,
+    -- Calculate expected dealer hedging flow
+    ROUND(
+        SUM(
+            -- For calls: dealers are short, need to buy when price rises
+            CASE WHEN opt.option_type = 'C'
+            THEN opt.gamma * opt.open_interest * 100 * pm.price_change
+            -- For puts: dealers are short, need to sell when price falls
+            ELSE -1 * opt.gamma * opt.open_interest * 100 * pm.price_change
+            END
+        ), 0
+    ) as expected_hedge_shares,
+    -- Classify hedging pressure
+    CASE
+        WHEN SUM(
+            CASE WHEN opt.option_type = 'C'
+            THEN opt.gamma * opt.open_interest * 100 * pm.price_change
+            ELSE -1 * opt.gamma * opt.open_interest * 100 * pm.price_change
+            END
+        ) > 100000 THEN '🟢 Strong Dealer Buying Pressure'
+        WHEN SUM(
+            CASE WHEN opt.option_type = 'C'
+            THEN opt.gamma * opt.open_interest * 100 * pm.price_change
+            ELSE -1 * opt.gamma * opt.open_interest * 100 * pm.price_change
+            END
+        ) > 50000 THEN '✅ Dealer Buying Pressure'
+        WHEN SUM(
+            CASE WHEN opt.option_type = 'C'
+            THEN opt.gamma * opt.open_interest * 100 * pm.price_change
+            ELSE -1 * opt.gamma * opt.open_interest * 100 * pm.price_change
+            END
+        ) < -100000 THEN '🔴 Strong Dealer Selling Pressure'
+        WHEN SUM(
+            CASE WHEN opt.option_type = 'C'
+            THEN opt.gamma * opt.open_interest * 100 * pm.price_change
+            ELSE -1 * opt.gamma * opt.open_interest * 100 * pm.price_change
+            END
+        ) < -50000 THEN '❌ Dealer Selling Pressure'
+        ELSE '⚪ Neutral'
+    END as hedge_pressure
+FROM price_moves pm
+JOIN latest_options opt ON pm.symbol = opt.underlying
+WHERE pm.price_change IS NOT NULL
+  AND DATE(pm.timestamp AT TIME ZONE 'America/New_York') = CURRENT_DATE
+GROUP BY pm.timestamp, pm.symbol, pm.close, pm.price_change
+ORDER BY pm.timestamp DESC;
+
+COMMENT ON VIEW dealer_hedging_pressure IS
+'Expected dealer hedging flow based on price moves and gamma. Amplifies moves when dealers chase price.';
+
+
+-- =============================================================================
+-- View 10: Unusual Volume Spikes
+-- =============================================================================
+-- Detects when volume is significantly above average
+-- Use case: Volume spikes >2 sigma often precede big moves or news
+
+CREATE VIEW unusual_volume_spikes AS
+WITH volume_stats AS (
+    SELECT
+        symbol,
+        EXTRACT(HOUR FROM timestamp AT TIME ZONE 'America/New_York') as hour,
+        EXTRACT(MINUTE FROM timestamp AT TIME ZONE 'America/New_York') as minute,
+        AVG(up_volume + down_volume) as avg_volume,
+        STDDEV(up_volume + down_volume) as stddev_volume
+    FROM underlying_quotes
+    WHERE timestamp >= NOW() - INTERVAL '5 days'
+      AND DATE(timestamp AT TIME ZONE 'America/New_York') != CURRENT_DATE
+    GROUP BY symbol,
+             EXTRACT(HOUR FROM timestamp AT TIME ZONE 'America/New_York'),
+             EXTRACT(MINUTE FROM timestamp AT TIME ZONE 'America/New_York')
+)
+SELECT
+    q.timestamp AT TIME ZONE 'America/New_York' as time_et,
+    q.timestamp,
+    q.symbol,
+    q.close as price,
+    q.up_volume + q.down_volume as current_volume,
+    ROUND(vs.avg_volume, 0) as avg_volume,
+    -- Standard deviations above average
+    ROUND(
+        (q.up_volume + q.down_volume - vs.avg_volume) / NULLIF(vs.stddev_volume, 0),
+        2
+    ) as volume_sigma,
+    -- Volume ratio vs average
+    ROUND(
+        (q.up_volume + q.down_volume) / NULLIF(vs.avg_volume, 0),
+        2
+    ) as volume_ratio,
+    -- Buying pressure
+    ROUND(
+        q.up_volume::numeric / NULLIF(q.up_volume + q.down_volume, 0) * 100,
+        1
+    ) as buying_pressure_pct,
+    -- Classification
+    CASE
+        WHEN (q.up_volume + q.down_volume - vs.avg_volume) / NULLIF(vs.stddev_volume, 0) > 3 THEN '🔥 Extreme Volume Spike'
+        WHEN (q.up_volume + q.down_volume - vs.avg_volume) / NULLIF(vs.stddev_volume, 0) > 2 THEN '⚡ High Volume'
+        WHEN (q.up_volume + q.down_volume - vs.avg_volume) / NULLIF(vs.stddev_volume, 0) > 1 THEN '📊 Above Average'
+        ELSE '📉 Normal/Below Average'
+    END as volume_class
+FROM underlying_quotes q
+JOIN volume_stats vs
+    ON q.symbol = vs.symbol
+    AND EXTRACT(HOUR FROM q.timestamp AT TIME ZONE 'America/New_York') = vs.hour
+    AND EXTRACT(MINUTE FROM q.timestamp AT TIME ZONE 'America/New_York') = vs.minute
+WHERE DATE(q.timestamp AT TIME ZONE 'America/New_York') = CURRENT_DATE
+  AND (q.up_volume + q.down_volume - vs.avg_volume) / NULLIF(vs.stddev_volume, 0) > 1
+ORDER BY (q.up_volume + q.down_volume - vs.avg_volume) / NULLIF(vs.stddev_volume, 0) DESC;
+
+COMMENT ON VIEW unusual_volume_spikes IS
+'Volume spikes >2 standard deviations above average often signal pending moves or news.';
+
+
+-- =============================================================================
+-- View 11: Intraday Momentum Divergence
+-- =============================================================================
+-- Compares price action to option flow to find divergences
+-- Use case: Divergences between price and option flow often precede reversals
+
+CREATE VIEW momentum_divergence AS
+WITH underlying_momentum AS (
+    SELECT
+        timestamp,
+        symbol,
+        close,
+        close - LAG(close, 5) OVER (PARTITION BY symbol ORDER BY timestamp) as price_change_5min,
+        up_volume - down_volume as net_volume
+    FROM underlying_quotes
+    WHERE timestamp >= NOW() - INTERVAL '1 hour'
+),
+option_momentum AS (
+    SELECT
+        timestamp,
+        underlying,
+        SUM(volume_delta * last * 100) FILTER (WHERE option_type = 'C' AND volume_delta > 0) -
+        SUM(volume_delta * last * 100) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as net_option_flow
+    FROM option_chains_with_deltas
+    WHERE timestamp >= NOW() - INTERVAL '1 hour'
+      AND volume_delta > 0
+    GROUP BY timestamp, underlying
+)
+SELECT
+    um.timestamp,
+    um.timestamp AT TIME ZONE 'America/New_York' as time_et,
+    um.symbol,
+    um.close as price,
+    ROUND(um.price_change_5min, 2) as price_change_5min,
+    um.net_volume,
+    om.net_option_flow,
+    -- Detect divergences
+    CASE
+        WHEN um.price_change_5min > 0 AND om.net_option_flow < -50000 THEN '🚨 Bearish Divergence (Price Up, Puts Buying)'
+        WHEN um.price_change_5min < 0 AND om.net_option_flow > 50000 THEN '🚨 Bullish Divergence (Price Down, Calls Buying)'
+        WHEN um.price_change_5min > 0 AND om.net_option_flow > 50000 THEN '🟢 Bullish Confirmation'
+        WHEN um.price_change_5min < 0 AND om.net_option_flow < -50000 THEN '🔴 Bearish Confirmation'
+        WHEN um.price_change_5min > 0 AND um.net_volume < 0 THEN '⚠️ Weak Rally (Selling Volume)'
+        WHEN um.price_change_5min < 0 AND um.net_volume > 0 THEN '⚠️ Weak Selloff (Buying Volume)'
+        ELSE '⚪ Neutral'
+    END as divergence_signal
+FROM underlying_momentum um
+LEFT JOIN option_momentum om
+    ON um.timestamp = om.timestamp
+    AND um.symbol = om.underlying
+WHERE um.price_change_5min IS NOT NULL
+  AND DATE(um.timestamp AT TIME ZONE 'America/New_York') = CURRENT_DATE
+ORDER BY um.timestamp DESC;
+
+COMMENT ON VIEW momentum_divergence IS
+'Divergences between price action and option flow. Divergences often precede reversals.';
+
+
+-- =============================================================================
 -- Performance Indexes for Flow Views
 -- =============================================================================
 -- These indexes optimize the real-time views for fast queries
@@ -785,6 +1235,64 @@ CREATE INDEX IF NOT EXISTS idx_option_chains_timestamp_type
 CREATE INDEX IF NOT EXISTS idx_option_chains_iv_volume 
     ON option_chains(implied_volatility, volume) 
     WHERE implied_volatility IS NOT NULL;
+
+
+-- =============================================================================
+-- Performance Indexes for Day Trading Views
+-- =============================================================================
+-- These indexes optimize the day trading views for fast queries
+
+-- VWAP calculation optimization - date-partitioned queries
+CREATE INDEX IF NOT EXISTS idx_underlying_quotes_date_timestamp
+    ON underlying_quotes(DATE(timestamp AT TIME ZONE 'America/New_York'), timestamp)
+    WHERE DATE(timestamp AT TIME ZONE 'America/New_York') = CURRENT_DATE;
+
+-- Opening Range Breakout - first 30 minutes queries
+CREATE INDEX IF NOT EXISTS idx_underlying_quotes_orb_time
+    ON underlying_quotes(symbol, timestamp)
+    WHERE EXTRACT(HOUR FROM timestamp AT TIME ZONE 'America/New_York') = 9
+      AND EXTRACT(MINUTE FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 30 AND 59;
+
+-- Gamma levels - recent options with gamma and OI
+CREATE INDEX IF NOT EXISTS idx_option_chains_gamma_oi
+    ON option_chains(underlying, strike, timestamp DESC)
+    WHERE gamma IS NOT NULL AND open_interest > 0;
+
+-- Dealer hedging - recent price movements
+CREATE INDEX IF NOT EXISTS idx_underlying_quotes_recent
+    ON underlying_quotes(symbol, timestamp DESC)
+    WHERE timestamp >= NOW() - INTERVAL '30 minutes';
+
+CREATE INDEX IF NOT EXISTS idx_option_chains_recent_gamma
+    ON option_chains(underlying, timestamp DESC)
+    WHERE timestamp >= NOW() - INTERVAL '5 minutes'
+      AND gamma IS NOT NULL
+      AND delta IS NOT NULL
+      AND open_interest > 0;
+
+-- Volume spikes - historical volume patterns by time of day
+CREATE INDEX IF NOT EXISTS idx_underlying_quotes_time_components
+    ON underlying_quotes(
+        symbol,
+        EXTRACT(HOUR FROM timestamp AT TIME ZONE 'America/New_York'),
+        EXTRACT(MINUTE FROM timestamp AT TIME ZONE 'America/New_York'),
+        timestamp
+    )
+    WHERE timestamp >= NOW() - INTERVAL '5 days';
+
+-- Momentum divergence - recent underlying and options data
+CREATE INDEX IF NOT EXISTS idx_underlying_quotes_momentum
+    ON underlying_quotes(symbol, timestamp DESC)
+    WHERE timestamp >= NOW() - INTERVAL '1 hour';
+
+CREATE INDEX IF NOT EXISTS idx_option_chains_deltas_momentum
+    ON option_chains(underlying, timestamp DESC, option_type)
+    WHERE timestamp >= NOW() - INTERVAL '1 hour';
+
+-- Composite index for expiration filtering (gamma levels)
+CREATE INDEX IF NOT EXISTS idx_option_chains_expiration_range
+    ON option_chains(underlying, expiration, timestamp DESC)
+    WHERE gamma IS NOT NULL;
 
 
 -- =============================================================================

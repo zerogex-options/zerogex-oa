@@ -87,6 +87,15 @@ help: ## Show this help message
 	@echo "  make flow-buying-pressure - Underlying buying/selling pressure"
 	@echo "  make flow-live          - Combined real-time flow dashboard"
 	@echo ""
+	@echo "$(GREEN)Day Trading Support:$(NC)"
+	@echo "  make vwap               - VWAP deviation tracker"
+	@echo "  make orb                - Opening range breakout status"
+	@echo "  make gamma-levels       - Key gamma exposure levels"
+	@echo "  make hedge-pressure     - Dealer hedging pressure"
+	@echo "  make volume-spikes      - Unusual volume detection"
+	@echo "  make divergence         - Momentum divergence signals"
+	@echo "  make day-trading        - Combined day trading dashboard"
+	@echo ""
 	@echo "$(GREEN)Data Quality:$(NC)"
 	@echo "  make gaps               - Check for data gaps"
 	@echo "  make gaps-today         - Today's data gaps"
@@ -699,6 +708,176 @@ flow-live: ## Combined real-time flow dashboard
 		FROM option_flow_by_strike \
 		WHERE timestamp > NOW() - INTERVAL '30 minutes' \
 		ORDER BY total_flow DESC \
+		LIMIT 10;" 2>/dev/null
+	@echo ""
+	@echo "$(BLUE)================================================================================$(NC)"
+
+# =============================================================================
+# Day Trading Decision Support
+# =============================================================================
+
+.PHONY: vwap
+vwap: ## VWAP deviation tracker
+	@echo "$(BLUE)=== VWAP Deviation (Last 30 mins) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			TO_CHAR(time_et, 'HH24:MI') as time, \
+			symbol, \
+			ROUND(price, 2) as price, \
+			ROUND(vwap, 2) as vwap, \
+			vwap_deviation_pct as vwap_dev, \
+			vwap_position \
+		FROM underlying_vwap_deviation \
+		WHERE timestamp > NOW() - INTERVAL '30 minutes' \
+		ORDER BY timestamp DESC \
+		LIMIT 30;"
+
+.PHONY: orb
+orb: ## Opening range breakout status
+	@echo "$(BLUE)=== Opening Range Breakout ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			TO_CHAR(time_et, 'HH24:MI') as time, \
+			symbol, \
+			ROUND(current_price, 2) as price, \
+			ROUND(orb_high, 2) as orb_high, \
+			ROUND(orb_low, 2) as orb_low, \
+			ROUND(orb_range, 2) as range, \
+			orb_status \
+		FROM opening_range_breakout \
+		ORDER BY timestamp DESC \
+		LIMIT 10;"
+
+.PHONY: gamma-levels
+gamma-levels: ## Key gamma exposure levels
+	@echo "$(BLUE)=== Gamma Exposure Levels (Top 15) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			underlying, \
+			strike, \
+			TO_CHAR(net_gex, 'FM999,999,999') as net_gex, \
+			TO_CHAR(total_oi, 'FM999,999') as oi, \
+			gex_level \
+		FROM gamma_exposure_levels \
+		ORDER BY ABS(net_gex) DESC \
+		LIMIT 15;"
+
+.PHONY: hedge-pressure
+hedge-pressure: ## Dealer hedging pressure
+	@echo "$(BLUE)=== Dealer Hedging Pressure (Last 30 mins) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			TO_CHAR(time_et, 'HH24:MI') as time, \
+			symbol, \
+			ROUND(current_price, 2) as price, \
+			ROUND(price_change, 2) as chg, \
+			TO_CHAR(expected_hedge_shares, 'FM999,999') as hedge_shares, \
+			hedge_pressure \
+		FROM dealer_hedging_pressure \
+		ORDER BY timestamp DESC \
+		LIMIT 20;"
+
+.PHONY: volume-spikes
+volume-spikes: ## Unusual volume detection
+	@echo "$(BLUE)=== Unusual Volume Spikes ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			TO_CHAR(time_et, 'HH24:MI') as time, \
+			symbol, \
+			ROUND(price, 2) as price, \
+			TO_CHAR(current_volume, 'FM999,999') as volume, \
+			volume_ratio as vol_ratio, \
+			volume_sigma as sigma, \
+			buying_pressure_pct as buy_pct, \
+			volume_class \
+		FROM unusual_volume_spikes \
+		ORDER BY volume_sigma DESC \
+		LIMIT 20;"
+
+.PHONY: divergence
+divergence: ## Momentum divergence signals
+	@echo "$(BLUE)=== Momentum Divergence Signals (Last Hour) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			TO_CHAR(time_et, 'HH24:MI') as time, \
+			symbol, \
+			ROUND(price, 2) as price, \
+			ROUND(price_change_5min, 2) as chg_5m, \
+			TO_CHAR(net_option_flow, 'FM999,999') as opt_flow, \
+			divergence_signal \
+		FROM momentum_divergence \
+		WHERE divergence_signal != '⚪ Neutral' \
+		ORDER BY timestamp DESC \
+		LIMIT 20;"
+
+.PHONY: day-trading
+day-trading: ## Combined day trading dashboard
+	@echo "$(BLUE)================================================================================$(NC)"
+	@echo "$(BLUE)DAY TRADING DASHBOARD$(NC)"
+	@echo "$(BLUE)================================================================================$(NC)"
+	@echo ""
+	@echo "$(GREEN)1. VWAP DEVIATION$(NC)"
+	@echo "--------------------------------------------------------------------------------"
+	@$(PSQL) -c "\
+		SELECT \
+			TO_CHAR(time_et, 'HH24:MI') as time, \
+			ROUND(price, 2) as price, \
+			ROUND(vwap, 2) as vwap, \
+			vwap_deviation_pct as dev, \
+			vwap_position \
+		FROM underlying_vwap_deviation \
+		WHERE timestamp > NOW() - INTERVAL '30 minutes' \
+		ORDER BY timestamp DESC \
+		LIMIT 10;" 2>/dev/null
+	@echo ""
+	@echo "$(GREEN)2. OPENING RANGE BREAKOUT$(NC)"
+	@echo "--------------------------------------------------------------------------------"
+	@$(PSQL) -c "\
+		SELECT \
+			TO_CHAR(time_et, 'HH24:MI') as time, \
+			ROUND(current_price, 2) as price, \
+			ROUND(orb_high, 2) as high, \
+			ROUND(orb_low, 2) as low, \
+			orb_status \
+		FROM opening_range_breakout \
+		ORDER BY timestamp DESC \
+		LIMIT 5;" 2>/dev/null
+	@echo ""
+	@echo "$(GREEN)3. GAMMA LEVELS (Top 10)$(NC)"
+	@echo "--------------------------------------------------------------------------------"
+	@$(PSQL) -c "\
+		SELECT \
+			strike, \
+			TO_CHAR(net_gex, 'FM999,999,999') as net_gex, \
+			gex_level \
+		FROM gamma_exposure_levels \
+		ORDER BY ABS(net_gex) DESC \
+		LIMIT 10;" 2>/dev/null
+	@echo ""
+	@echo "$(GREEN)4. VOLUME SPIKES (Top 10)$(NC)"
+	@echo "--------------------------------------------------------------------------------"
+	@$(PSQL) -c "\
+		SELECT \
+			TO_CHAR(time_et, 'HH24:MI') as time, \
+			ROUND(price, 2) as price, \
+			volume_sigma as sigma, \
+			buying_pressure_pct as buy_pct, \
+			volume_class \
+		FROM unusual_volume_spikes \
+		ORDER BY volume_sigma DESC \
+		LIMIT 10;" 2>/dev/null
+	@echo ""
+	@echo "$(GREEN)5. DIVERGENCE SIGNALS$(NC)"
+	@echo "--------------------------------------------------------------------------------"
+	@$(PSQL) -c "\
+		SELECT \
+			TO_CHAR(time_et, 'HH24:MI') as time, \
+			ROUND(price, 2) as price, \
+			ROUND(price_change_5min, 2) as chg_5m, \
+			divergence_signal \
+		FROM momentum_divergence \
+		WHERE divergence_signal != '⚪ Neutral' \
+		ORDER BY timestamp DESC \
 		LIMIT 10;" 2>/dev/null
 	@echo ""
 	@echo "$(BLUE)================================================================================$(NC)"
