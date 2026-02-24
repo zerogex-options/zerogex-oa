@@ -62,7 +62,7 @@ BEGIN
         ADD CONSTRAINT check_positive_prices 
         CHECK (open > 0 AND high > 0 AND low > 0 AND close > 0);
     END IF;
-    
+
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint WHERE conname = 'check_high_low'
     ) THEN
@@ -126,7 +126,7 @@ BEGIN
         ADD CONSTRAINT option_type_check 
         CHECK (option_type IN ('C', 'P'));
     END IF;
-    
+
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint WHERE conname = 'check_positive_strike'
     ) THEN
@@ -324,7 +324,7 @@ BEGIN
         SELECT * FROM data_retention_policy WHERE enabled = TRUE
     LOOP
         cleanup_ts := NOW();
-        
+
         CASE policy.table_name
             WHEN 'underlying_quotes', 'option_chains', 'gex_summary', 'gex_by_strike' THEN
                 EXECUTE format(
@@ -347,13 +347,13 @@ BEGIN
             ELSE
                 CONTINUE;
         END CASE;
-        
+
         GET DIAGNOSTICS deleted_count = ROW_COUNT;
-        
+
         UPDATE data_retention_policy 
         SET last_cleanup = cleanup_ts 
         WHERE data_retention_policy.table_name = policy.table_name;
-        
+
         table_name := policy.table_name;
         rows_deleted := deleted_count;
         cleanup_time := cleanup_ts;
@@ -364,15 +364,21 @@ $$ LANGUAGE plpgsql;
 
 
 -- =============================================================================
--- Materialized Views
+-- Real-Time Delta Views (Regular Views - Zero Lag)
+-- =============================================================================
+-- CHANGED: Converted from materialized views to regular views for real-time data
+-- These now query the base tables directly with zero lag
 -- =============================================================================
 
--- Drop old regular views if they exist
-DROP VIEW IF EXISTS underlying_quotes_with_deltas;
-DROP VIEW IF EXISTS option_chains_with_deltas;
+-- Drop old materialized views if they exist
+DROP MATERIALIZED VIEW IF EXISTS underlying_quotes_with_deltas CASCADE;
+DROP MATERIALIZED VIEW IF EXISTS option_chains_with_deltas CASCADE;
 
--- Create materialized views
-CREATE MATERIALIZED VIEW IF NOT EXISTS underlying_quotes_with_deltas AS
+-- Drop the refresh function (no longer needed)
+DROP FUNCTION IF EXISTS refresh_delta_views();
+
+-- Create regular views for real-time deltas
+CREATE OR REPLACE VIEW underlying_quotes_with_deltas AS
 SELECT
     symbol,
     timestamp,
@@ -383,10 +389,10 @@ SELECT
     updated_at
 FROM underlying_quotes;
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_uq_deltas_symbol_timestamp 
-    ON underlying_quotes_with_deltas(symbol, timestamp DESC);
+COMMENT ON VIEW underlying_quotes_with_deltas IS
+'Real-time view calculating volume deltas using window functions. Zero lag from base table.';
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS option_chains_with_deltas AS
+CREATE OR REPLACE VIEW option_chains_with_deltas AS
 SELECT
     option_symbol,
     timestamp,
@@ -403,40 +409,8 @@ SELECT
     updated_at
 FROM option_chains;
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_oc_deltas_symbol_timestamp 
-    ON option_chains_with_deltas(option_symbol, timestamp DESC);
-
-
--- =============================================================================
--- Refresh Function
--- =============================================================================
-
-CREATE OR REPLACE FUNCTION refresh_delta_views()
-RETURNS TABLE(view_name TEXT, refresh_status TEXT) AS $$
-BEGIN
-    BEGIN
-        REFRESH MATERIALIZED VIEW CONCURRENTLY underlying_quotes_with_deltas;
-        view_name := 'underlying_quotes_with_deltas';
-        refresh_status := 'SUCCESS';
-        RETURN NEXT;
-    EXCEPTION WHEN OTHERS THEN
-        view_name := 'underlying_quotes_with_deltas';
-        refresh_status := 'FAILED: ' || SQLERRM;
-        RETURN NEXT;
-    END;
-    
-    BEGIN
-        REFRESH MATERIALIZED VIEW CONCURRENTLY option_chains_with_deltas;
-        view_name := 'option_chains_with_deltas';
-        refresh_status := 'SUCCESS';
-        RETURN NEXT;
-    EXCEPTION WHEN OTHERS THEN
-        view_name := 'option_chains_with_deltas';
-        refresh_status := 'FAILED: ' || SQLERRM;
-        RETURN NEXT;
-    END;
-END;
-$$ LANGUAGE plpgsql;
+COMMENT ON VIEW option_chains_with_deltas IS
+'Real-time view calculating volume and OI deltas using window functions. Zero lag from base table.';
 
 
 -- =============================================================================
@@ -452,7 +426,6 @@ DROP VIEW IF EXISTS option_flow_by_type CASCADE;
 DROP VIEW IF EXISTS option_flow_by_strike CASCADE;
 DROP VIEW IF EXISTS option_flow_by_expiration CASCADE;
 DROP VIEW IF EXISTS option_flow_smart_money CASCADE;
--- underlying_buying_pressure doesn't depend on others, no CASCADE needed
 DROP VIEW IF EXISTS underlying_buying_pressure;
 
 -- =============================================================================
@@ -1330,34 +1303,27 @@ SELECT
 FROM pg_views 
 WHERE schemaname = 'public' 
     AND viewname IN (
+        'underlying_quotes_with_deltas',
+        'option_chains_with_deltas',
         'option_flow_by_type',
         'option_flow_by_strike', 
         'option_flow_by_expiration',
         'option_flow_smart_money',
-        'underlying_buying_pressure'
+        'underlying_buying_pressure',
+        'underlying_vwap_deviation',
+        'opening_range_breakout',
+        'gamma_exposure_levels',
+        'dealer_hedging_pressure',
+        'unusual_volume_spikes',
+        'momentum_divergence'
     )
 ORDER BY viewname;
 
 \echo ''
-
--- Verify materialized views exist
-SELECT 
-    matviewname,
-    schemaname
-FROM pg_matviews
-WHERE schemaname = 'public'
-    AND matviewname IN (
-        'underlying_quotes_with_deltas',
-        'option_chains_with_deltas'
-    )
-ORDER BY matviewname;
-
-\echo ''
 \echo 'Next steps:'
 \echo '  1. Add symbols: INSERT INTO symbols (symbol, name, asset_type) VALUES (''SPY'', ''SPDR S&P 500'', ''ETF'');'
-\echo '  2. Test functions: SELECT * FROM refresh_delta_views();'
-\echo '  3. Test cleanup: SELECT * FROM cleanup_old_data();'
-\echo '  4. Test flow views: SELECT * FROM option_flow_by_type LIMIT 5;'
+\echo '  2. Test cleanup: SELECT * FROM cleanup_old_data();'
+\echo '  3. Test flow views: SELECT * FROM option_flow_by_type LIMIT 5;'
 \echo ''
 \echo 'Makefile shortcuts for flow analysis:'
 \echo '  make flow-by-type'

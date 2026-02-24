@@ -1037,6 +1037,56 @@ clear-underlying: ## Clear only underlying quotes
 	@echo "$(GREEN)✅ Underlying quotes cleared$(NC)"
 
 # =============================================================================
+# Database Schema Management
+# =============================================================================
+
+.PHONY: schema-apply
+schema-apply: ## Apply/update database schema (idempotent)
+	@echo "$(BLUE)=== Applying Database Schema ===$(NC)"
+	@echo "$(YELLOW)Running schema.sql on $(DB_HOST)...$(NC)"
+	@PGPASSFILE=~/.pgpass psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) -d $(DB_NAME) -f setup/database/schema.sql
+	@echo ""
+	@echo "$(GREEN)✅ Schema applied successfully$(NC)"
+	@echo ""
+	@echo "$(BLUE)Verifying tables and views...$(NC)"
+	@$(PSQL) -c "\
+		SELECT 'Tables:' as type, COUNT(*) as count FROM pg_tables WHERE schemaname = 'public' \
+		UNION ALL \
+		SELECT 'Views:', COUNT(*) FROM pg_views WHERE schemaname = 'public' \
+		UNION ALL \
+		SELECT 'Indexes:', COUNT(*) FROM pg_indexes WHERE schemaname = 'public';"
+
+.PHONY: schema-verify
+schema-verify: ## Verify schema components exist
+	@echo "$(BLUE)=== Schema Verification ===$(NC)"
+	@echo ""
+	@echo "$(GREEN)Tables:$(NC)"
+	@$(PSQL) -c "\
+		SELECT tablename FROM pg_tables \
+		WHERE schemaname = 'public' \
+		ORDER BY tablename;"
+	@echo ""
+	@echo "$(GREEN)Views:$(NC)"
+	@$(PSQL) -c "\
+		SELECT viewname FROM pg_views \
+		WHERE schemaname = 'public' \
+		ORDER BY viewname;"
+	@echo ""
+	@echo "$(GREEN)Functions:$(NC)"
+	@$(PSQL) -c "\
+		SELECT routine_name FROM information_schema.routines \
+		WHERE routine_schema = 'public' \
+		ORDER BY routine_name;"
+
+.PHONY: schema-backup
+schema-backup: ## Backup current schema to file
+	@echo "$(BLUE)=== Backing Up Schema ===$(NC)"
+	@BACKUP_FILE="setup/database/schema_backup_$$(date +%Y%m%d_%H%M%S).sql"; \
+	echo "$(YELLOW)Creating backup: $$BACKUP_FILE$(NC)"; \
+	PGPASSFILE=~/.pgpass pg_dump -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) -d $(DB_NAME) --schema-only -f $$BACKUP_FILE; \
+	echo "$(GREEN)✅ Schema backed up to $$BACKUP_FILE$(NC)"
+
+# =============================================================================
 # Maintenance
 # =============================================================================
 
@@ -1061,13 +1111,6 @@ size: ## Show table sizes
 		WHERE schemaname = 'public' \
 		AND tablename IN ('underlying_quotes', 'option_chains', 'symbols', 'gex_summary', 'gex_by_strike') \
 		ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;"
-
-.PHONY: refresh-views
-refresh-views: ## Refresh materialized views
-	@echo "$(YELLOW)Refreshing materialized views...$(NC)"
-	@$(PSQL) -c "REFRESH MATERIALIZED VIEW CONCURRENTLY underlying_quotes_with_deltas;"
-	@$(PSQL) -c "REFRESH MATERIALIZED VIEW CONCURRENTLY option_chains_with_deltas;"
-	@echo "$(GREEN)✅ Done$(NC)"
 
 # =============================================================================
 # Interactive
