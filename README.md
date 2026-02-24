@@ -322,19 +322,19 @@ The systemd service file is already provided in `setup/systemd/zerogex-oa-ingest
 
 ```bash
 # Service Management
-make start              # Start the service
-make stop               # Stop the service
-make restart            # Restart the service
-make status             # Check service status
-make enable             # Enable on boot
-make disable            # Disable on boot
-make health             # Health check with errors/warnings
+make ingestion-start    # Start the service
+make ingestion-stop     # Stop the service
+make ingestion-restart  # Restart the service
+make ingestion-status   # Check service status
+make ingestion-enable   # Enable on boot
+make ingestion-disable  # Disable on boot
+make ingestion-health   # Health check with errors/warnings
 
 # Log Management
-make logs               # Watch live logs (Ctrl+C to stop)
-make logs-tail          # Show last 100 lines
-make logs-errors        # Show recent errors only
-make logs-clear         # Clear all logs (with confirmation)
+make ingestion-logs         # Watch live logs (Ctrl+C to stop)
+make ingestion-logs-tail    # Show last 100 lines
+make ingestion-logs-errors  # Show recent errors only
+make logs-clear             # Clear all logs (with confirmation)
 ```
 
 **Initial setup:**
@@ -345,11 +345,11 @@ sudo cp setup/systemd/zerogex-oa-ingestion.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
 # Enable and start
-make enable
-make start
+make ingestion-enable
+make ingestion-start
 
 # Watch logs
-make logs
+make ingestion-logs
 ```
 
 ---
@@ -458,6 +458,103 @@ When the main engine is running with `GREEKS_ENABLED=true` and `IV_CALCULATION_E
 ✅ First Greek calculated successfully: delta=0.5234, gamma=0.0123
 ✅ Calculated IV for SPY 260322C455: 0.2145 (21.45%)
 ✅ Stored option with Greeks: SPY 260322C455 delta=0.5234 gamma=0.0123
+```
+
+---
+
+### Analytics Engine
+
+**Independent GEX, Max Pain, and second-order Greeks calculator:**
+
+```bash
+# Run analytics engine (development)
+make run-analytics
+
+# Run once for testing
+make run-analytics-once
+
+# Query latest GEX summary
+make gex-summary
+
+# Query GEX by strike
+make gex-strikes
+```
+
+**Production deployment:**
+
+```bash
+# Install systemd service
+sudo cp setup/systemd/zerogex-analytics.service /etc/systemd/system/
+sudo systemctl daemon-reload
+
+# Enable and start
+make analytics-enable
+make analytics-start
+
+# Watch logs
+make analytics-logs
+
+# Check status
+make analytics-status
+make analytics-health
+```
+
+**What it calculates:**
+
+1. **Gamma Exposure (GEX)** by strike and in aggregate
+   - Call GEX (positive for dealers who are short)
+   - Put GEX (negative for dealers who are long)
+   - Net GEX (call - put from dealer perspective)
+
+2. **Gamma Flip Point** - Strike where net GEX crosses zero
+   - Above: Dealers are long gamma (stabilizing market)
+   - Below: Dealers are short gamma (destabilizing market)
+
+3. **Max Pain** - Strike where option holders lose most value
+   - Calculated by minimizing total option value across all strikes
+   - Useful for understanding potential pinning behavior
+
+4. **Second-Order Greeks** - Vanna and Charm
+   - **Vanna**: How delta changes with volatility (∂²V/∂S∂σ)
+   - **Charm**: How delta decays with time (∂²V/∂S∂T)
+
+5. **Put/Call Ratios** - Volume and Open Interest based
+
+**Key features:**
+
+- **Decoupled from ingestion** - Runs independently on its own schedule
+- **Configurable interval** - Default 60 seconds, adjustable via `ANALYTICS_INTERVAL`
+- **Uses latest database data** - Works with whatever data is available
+- **Dual timestamps** - Data timestamp + calculation timestamp via `created_at`
+- **No market hours logic** - Just calculates against available data
+
+**Example output:**
+```
+================================================================================
+GEX SUMMARY
+================================================================================
+Max Gamma Strike: $455.00
+Max Gamma Value: 2,547,893
+Gamma Flip Point: $448.75
+Max Pain: $450.00
+Put/Call Ratio: 1.23
+Total Net GEX: 1,234,567
+================================================================================
+```
+
+**Configuration (.env):**
+```bash
+# Enable analytics
+ANALYTICS_ENABLED=true
+
+# Calculation interval (seconds)
+ANALYTICS_INTERVAL=60
+
+# Underlying to analyze
+ANALYTICS_UNDERLYING=SPY
+
+# Risk-free rate for Greeks
+RISK_FREE_RATE=0.05
 ```
 
 ---
@@ -577,6 +674,9 @@ zerogex-oa/
 │   │   ├── backfill_manager.py      # Historical data fetching
 │   │   ├── stream_manager.py        # Real-time data fetching
 │   │   └── main_engine.py           # Orchestration + storage
+│   ├── analytics/                    # ⭐ NEW
+│   │   ├── __init__.py              # ⭐ NEW
+│   │   └── main_engine.py           # ⭐ NEW - GEX & Max Pain calculator
 │   ├── database/
 │   │   ├── __init__.py
 │   │   ├── connection.py            # Connection pool management
@@ -590,7 +690,8 @@ zerogex-oa/
 │   ├── database/
 │   │   └── schema.sql               # Complete database schema
 │   └── systemd/
-│       └── zerogex-oa-ingestion.service
+│       ├── zerogex-oa-ingestion.service
+│       └── zerogex-analytics.service # ⭐ NEW
 ├── pyproject.toml                    # Project metadata & dependencies
 ├── Makefile                          # Service management & DB queries
 ├── .env.example                      # Environment template
@@ -616,7 +717,7 @@ zerogex-oa/
 |----------|-------------|---------|
 | `DB_HOST` | Database host | `localhost` |
 | `DB_PORT` | Database port | `5432` |
-| `DB_NAME` | Database name | `zerogex` |
+| `DB_NAME` | Database name | `zerogexdb` |
 | `DB_USER` | Database user | `postgres` |
 | `DB_PASSWORD_PROVIDER` | Password provider (`env`, `aws_secrets_manager`, `pgpass`) | `pgpass` |
 | `DB_PASSWORD` | Database password (if using `env` provider) | - |
@@ -633,6 +734,15 @@ zerogex-oa/
 | `API_RETRY_BACKOFF` | Exponential backoff multiplier | `2.0` |
 | `QUOTE_BATCH_SIZE` | Quote batch size | `100` |
 | `OPTION_BATCH_SIZE` | Option batch size | `100` |
+
+### Analytics Configuration
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ANALYTICS_UNDERLYING` | Underlying symbol to analyze | `SPY` |
+| `ANALYTICS_INTERVAL` | Calculation interval in seconds | `60` |
+
+**Note:** Analytics engine also uses `RISK_FREE_RATE` from the Greeks & IV Configuration section above.
 
 ### Greeks & IV Configuration
 
@@ -685,21 +795,33 @@ See `.env.example` for complete list of configuration options.
 ZeroGEX provides comprehensive Makefile commands for monitoring, service management, and database queries:
 
 ```bash
-# Service Management
-make start              # Start the ingestion service
-make stop               # Stop the ingestion service
-make restart            # Restart the ingestion service
-make status             # Show service status
-make enable             # Enable service to start on boot
-make disable            # Disable service from starting on boot
-make health             # Service health check with recent errors
+# Ingestion Service Management
+make ingestion-start    # Start the ingestion service
+make ingestion-stop     # Stop the ingestion service
+make ingestion-restart  # Restart the ingestion service
+make ingestion-status   # Show service status
+make ingestion-enable   # Enable service to start on boot
+make ingestion-disable  # Disable service from starting on boot
+make ingestion-health   # Service health check with recent errors
+
+# Analytics Service Management
+make analytics-start    # Start the analytics service
+make analytics-stop     # Stop the analytics service
+make analytics-restart  # Restart the analytics service
+make analytics-status   # Show service status
+make analytics-enable   # Enable service to start on boot
+make analytics-disable  # Disable service from starting on boot
+make analytics-health   # Service health check with recent errors
 
 # Log Management
-make logs               # Watch live logs (Ctrl+C to stop)
-make logs-tail          # Show last 100 log lines
-make logs-errors        # Show recent errors only
+make ingestion-logs         # Watch live ingestion logs (Ctrl+C to stop)
+make ingestion-logs-tail    # Show last 100 ingestion log lines
+make ingestion-logs-errors  # Show recent ingestion errors only
+make analytics-logs         # Watch live analytics logs (Ctrl+C to stop)
+make analytics-logs-tail    # Show last 100 analytics log lines
+make analytics-logs-errors  # Show recent analytics errors only
 make logs-grep PATTERN="Greeks"  # Search logs for pattern
-make logs-clear         # Clear all journalctl logs (with confirmation)
+make logs-clear             # Clear all journalctl logs (with confirmation)
 
 # Quick Stats
 make stats              # Overall data statistics
@@ -724,7 +846,9 @@ make options-fields     # Check field population (including IV/Greeks)
 # Greeks & Analytics
 make greeks             # Latest Greeks by strike
 make greeks-summary     # Greeks summary statistics
-make gex-preview        # Preview GEX calculation data
+make gex-summary        # Latest GEX summary ⭐ NEW
+make gex-strikes        # GEX by strike (top 20) ⭐ NEW
+make gex-preview
 
 # Real-Time Flow Analysis (🔥 For Trading Decisions)
 make flow-by-type       # Puts vs calls flow (all strikes/expirations)
@@ -832,8 +956,10 @@ Perfect for keeping open in a terminal during trading hours!
 
 **Start and monitor:**
 ```bash
-make start
-make logs
+make ingestion-start
+make analytics-start
+make ingestion-logs      # In one terminal
+make analytics-logs      # In another terminal
 ```
 
 **Real-time trading decisions:**
@@ -847,6 +973,10 @@ make flow-by-strike
 # Look for unusual activity
 make flow-smart-money
 
+# Check GEX levels
+make gex-summary
+make gex-strikes
+
 # Full dashboard
 make flow-live
 
@@ -856,24 +986,28 @@ watch -n 10 make flow-live
 
 **Check data health:**
 ```bash
-make health
+make ingestion-health
+make analytics-health
 make check-streaming
 make quality
 ```
 
 **Troubleshoot issues:**
 ```bash
-make logs-errors
+make ingestion-logs-errors
+make analytics-logs-errors
 make greeks-summary
 make options-fields
 ```
 
 **Clear and restart:**
 ```bash
-make stop
+make ingestion-stop
+make analytics-stop
 make clear-data
 make logs-clear
-make start
+make ingestion-start
+make analytics-start
 ```
 
 ### Logging

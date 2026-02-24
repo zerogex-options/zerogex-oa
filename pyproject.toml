@@ -73,12 +73,13 @@ Repository = "https://github.com/zerogex/zerogex-oa"
 Issues = "https://github.com/zerogex/zerogex-oa/issues"
 
 [project.scripts]
-zerogex = "src.ingestion.main_engine:main"
+zerogex-ingestion = "src.ingestion.main_engine:main"
 zerogex-backfill = "src.ingestion.backfill_manager:main"
 zerogex-stream = "src.ingestion.stream_manager:main"
 zerogex-test-api = "src.ingestion.tradestation_client:main"
 zerogex-test-greeks = "src.ingestion.greeks_calculator:main"
 zerogex-test-iv = "src.ingestion.iv_calculator:main"
+zerogex-analytics = "src.analytics.analytics_engine:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

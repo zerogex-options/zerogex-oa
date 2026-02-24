@@ -11,8 +11,9 @@ export
 # PostgreSQL connection string
 PSQL = PGPASSFILE=~/.pgpass psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) -d $(DB_NAME)
 
-# Service name
-SERVICE_NAME = zerogex-oa-ingestion
+# Service names
+INGESTION_SERVICE = zerogex-oa-ingestion
+ANALYTICS_SERVICE = zerogex-oa-analytics
 
 # Python virtual environment
 VENV_PYTHON = venv/bin/python
@@ -29,21 +30,33 @@ help: ## Show this help message
 	@echo "$(BLUE)ZeroGEX Management & Database Shortcuts$(NC)"
 	@echo "=========================================="
 	@echo ""
-	@echo "$(GREEN)Service Management:$(NC)"
-	@echo "  make start              - Start the ingestion service"
-	@echo "  make stop               - Stop the ingestion service"
-	@echo "  make restart            - Restart the ingestion service"
-	@echo "  make status             - Show service status"
-	@echo "  make enable             - Enable service to start on boot"
-	@echo "  make disable            - Disable service from starting on boot"
-	@echo "  make health             - Show service health and recent errors"
+	@echo "$(GREEN)Ingestion Service Management:$(NC)"
+	@echo "  make ingestion-start    - Start the ingestion service"
+	@echo "  make ingestion-stop     - Stop the ingestion service"
+	@echo "  make ingestion-restart  - Restart the ingestion service"
+	@echo "  make ingestion-status   - Show ingestion service status"
+	@echo "  make ingestion-enable   - Enable ingestion service to start on boot"
+	@echo "  make ingestion-disable  - Disable ingestion service from starting on boot"
+	@echo "  make ingestion-health   - Show ingestion service health and recent errors"
+	@echo ""
+	@echo "$(GREEN)Analytics Service Management:$(NC)"
+	@echo "  make analytics-start    - Start the analytics service"
+	@echo "  make analytics-stop     - Stop the analytics service"
+	@echo "  make analytics-restart  - Restart the analytics service"
+	@echo "  make analytics-status   - Show analytics service status"
+	@echo "  make analytics-enable   - Enable analytics service to start on boot"
+	@echo "  make analytics-disable  - Disable analytics service from starting on boot"
+	@echo "  make analytics-health   - Show analytics service health and recent errors"
 	@echo ""
 	@echo "$(GREEN)Logs:$(NC)"
-	@echo "  make logs               - Show live logs (Ctrl+C to exit)"
-	@echo "  make logs-tail          - Show last 100 log lines"
-	@echo "  make logs-errors        - Show recent errors"
+	@echo "  make ingestion-logs          - Show live ingestion logs (Ctrl+C to exit)"
+	@echo "  make ingestion-logs-tail     - Show last 100 ingestion log lines"
+	@echo "  make ingestion-logs-errors   - Show recent ingestion errors"
+	@echo "  make analytics-logs          - Show live analytics logs (Ctrl+C to exit)"
+	@echo "  make analytics-logs-tail     - Show last 100 analytics log lines"
+	@echo "  make analytics-logs-errors   - Show recent analytics errors"
 	@echo "  make logs-grep PATTERN=\"text\" - Search logs for pattern"
-	@echo "  make logs-clear         - Clear all journalctl logs for service"
+	@echo "  make logs-clear              - Clear all journalctl logs for services"
 	@echo ""
 	@echo "$(GREEN)Run Components:$(NC)"
 	@echo "  make run-auth           - Test TradeStation authentication"
@@ -51,6 +64,8 @@ help: ## Show this help message
 	@echo "  make run-backfill       - Run historical data backfill"
 	@echo "  make run-stream         - Test real-time streaming"
 	@echo "  make run-ingest         - Run main ingestion engine"
+	@echo "  make run-analytics      - Run analytics engine"
+	@echo "  make run-analytics-once - Run analytics once (testing)"
 	@echo "  make run-greeks         - Test Greeks calculator"
 	@echo "  make run-iv             - Test IV calculator"
 	@echo "  make run-config         - Show current configuration"
@@ -77,6 +92,8 @@ help: ## Show this help message
 	@echo "$(GREEN)Greeks & Analytics:$(NC)"
 	@echo "  make greeks             - Latest Greeks by strike"
 	@echo "  make greeks-summary     - Greeks summary statistics"
+	@echo "  make gex-summary        - Latest GEX summary"
+	@echo "  make gex-strikes        - GEX by strike (top 20)"
 	@echo "  make gex-preview        - Preview GEX calculation data"
 	@echo ""
 	@echo "$(GREEN)Real-Time Flow Analysis:$(NC)"
@@ -116,63 +133,63 @@ help: ## Show this help message
 	@echo "  make query SQL=\"...\"    - Run custom query"
 
 # =============================================================================
-# Service Management (from manage_service.sh)
+# Ingestion Service Management
 # =============================================================================
 
-.PHONY: start
-start: ## Start the ingestion service
-	@echo "$(GREEN)Starting $(SERVICE_NAME)...$(NC)"
-	@sudo systemctl start $(SERVICE_NAME)
+.PHONY: ingestion-start
+ingestion-start: ## Start the ingestion service
+	@echo "$(GREEN)Starting $(INGESTION_SERVICE)...$(NC)"
+	@sudo systemctl start $(INGESTION_SERVICE)
 	@sleep 2
-	@sudo systemctl status $(SERVICE_NAME) --no-pager
+	@sudo systemctl status $(INGESTION_SERVICE) --no-pager
 
-.PHONY: stop
-stop: ## Stop the ingestion service
-	@echo "$(YELLOW)Stopping $(SERVICE_NAME)...$(NC)"
-	@sudo systemctl stop $(SERVICE_NAME)
+.PHONY: ingestion-stop
+ingestion-stop: ## Stop the ingestion service
+	@echo "$(YELLOW)Stopping $(INGESTION_SERVICE)...$(NC)"
+	@sudo systemctl stop $(INGESTION_SERVICE)
 	@sleep 1
 	@echo "$(GREEN)Service stopped$(NC)"
 
-.PHONY: restart
-restart: ## Restart the ingestion service
-	@echo "$(YELLOW)Restarting $(SERVICE_NAME)...$(NC)"
-	@sudo systemctl restart $(SERVICE_NAME)
+.PHONY: ingestion-restart
+ingestion-restart: ## Restart the ingestion service
+	@echo "$(YELLOW)Restarting $(INGESTION_SERVICE)...$(NC)"
+	@sudo systemctl restart $(INGESTION_SERVICE)
 	@sleep 2
-	@sudo systemctl status $(SERVICE_NAME) --no-pager
+	@sudo systemctl status $(INGESTION_SERVICE) --no-pager
 
-.PHONY: status
-status: ## Show service status
-	@sudo systemctl status $(SERVICE_NAME) --no-pager -l
+.PHONY: ingestion-status
+ingestion-status: ## Show ingestion service status
+	@sudo systemctl status $(INGESTION_SERVICE) --no-pager -l
 
-.PHONY: enable
-enable: ## Enable service to start on boot
-	@echo "$(GREEN)Enabling $(SERVICE_NAME) to start on boot...$(NC)"
-	@sudo systemctl enable $(SERVICE_NAME)
+.PHONY: ingestion-enable
+ingestion-enable: ## Enable ingestion service to start on boot
+	@echo "$(GREEN)Enabling $(INGESTION_SERVICE) to start on boot...$(NC)"
+	@sudo systemctl enable $(INGESTION_SERVICE)
 	@echo "$(GREEN)Service enabled$(NC)"
 
-.PHONY: disable
-disable: ## Disable service from starting on boot
-	@echo "$(YELLOW)Disabling $(SERVICE_NAME) from starting on boot...$(NC)"
-	@sudo systemctl disable $(SERVICE_NAME)
+.PHONY: ingestion-disable
+ingestion-disable: ## Disable ingestion service from starting on boot
+	@echo "$(YELLOW)Disabling $(INGESTION_SERVICE) from starting on boot...$(NC)"
+	@sudo systemctl disable $(INGESTION_SERVICE)
 	@echo "$(YELLOW)Service disabled$(NC)"
 
-.PHONY: health
-health: ## Check service health and recent errors
-	@echo "$(GREEN)Service Health Check$(NC)"
+.PHONY: ingestion-health
+ingestion-health: ## Check ingestion service health and recent errors
+	@echo "$(GREEN)Ingestion Service Health Check$(NC)"
 	@echo "===================="
 	@echo ""
-	@if systemctl is-active --quiet $(SERVICE_NAME); then \
+	@if systemctl is-active --quiet $(INGESTION_SERVICE); then \
 		echo "Status: $(GREEN)ACTIVE$(NC)"; \
 	else \
 		echo "Status: $(RED)INACTIVE$(NC)"; \
 	fi
 	@echo ""
-	@UPTIME=$$(systemctl show $(SERVICE_NAME) --property=ActiveEnterTimestamp --value); \
+	@UPTIME=$$(systemctl show $(INGESTION_SERVICE) --property=ActiveEnterTimestamp --value); \
 	if [ -n "$$UPTIME" ]; then \
 		echo "Started: $$UPTIME"; \
 	fi
 	@echo ""
-	@MEMORY=$$(systemctl show $(SERVICE_NAME) --property=MemoryCurrent --value); \
+	@MEMORY=$$(systemctl show $(INGESTION_SERVICE) --property=MemoryCurrent --value); \
 	if [ "$$MEMORY" != "[not set]" ] && [ -n "$$MEMORY" ]; then \
 		MEMORY_MB=$$(($$MEMORY / 1024 / 1024)); \
 		echo "Memory: $${MEMORY_MB} MB"; \
@@ -180,44 +197,135 @@ health: ## Check service health and recent errors
 	@echo ""
 	@echo "Recent Errors (last 10):"
 	@echo "------------------------"
-	@sudo journalctl -u $(SERVICE_NAME) -p err -n 10 --no-pager || echo "No recent errors"
+	@sudo journalctl -u $(INGESTION_SERVICE) -p err -n 10 --no-pager || echo "No recent errors"
 	@echo ""
 	@echo "Recent Warnings (last 5):"
 	@echo "-------------------------"
-	@sudo journalctl -u $(SERVICE_NAME) -p warning -n 5 --no-pager || echo "No recent warnings"
+	@sudo journalctl -u $(INGESTION_SERVICE) -p warning -n 5 --no-pager || echo "No recent warnings"
+
+# =============================================================================
+# Analytics Service Management
+# =============================================================================
+
+.PHONY: analytics-start
+analytics-start: ## Start the analytics service
+	@echo "$(GREEN)Starting $(ANALYTICS_SERVICE)...$(NC)"
+	@sudo systemctl start $(ANALYTICS_SERVICE)
+	@sleep 2
+	@sudo systemctl status $(ANALYTICS_SERVICE) --no-pager
+
+.PHONY: analytics-stop
+analytics-stop: ## Stop the analytics service
+	@echo "$(YELLOW)Stopping $(ANALYTICS_SERVICE)...$(NC)"
+	@sudo systemctl stop $(ANALYTICS_SERVICE)
+	@sleep 1
+	@echo "$(GREEN)Service stopped$(NC)"
+
+.PHONY: analytics-restart
+analytics-restart: ## Restart the analytics service
+	@echo "$(YELLOW)Restarting $(ANALYTICS_SERVICE)...$(NC)"
+	@sudo systemctl restart $(ANALYTICS_SERVICE)
+	@sleep 2
+	@sudo systemctl status $(ANALYTICS_SERVICE) --no-pager
+
+.PHONY: analytics-status
+analytics-status: ## Show analytics service status
+	@sudo systemctl status $(ANALYTICS_SERVICE) --no-pager -l
+
+.PHONY: analytics-enable
+analytics-enable: ## Enable analytics service to start on boot
+	@echo "$(GREEN)Enabling $(ANALYTICS_SERVICE) to start on boot...$(NC)"
+	@sudo systemctl enable $(ANALYTICS_SERVICE)
+	@echo "$(GREEN)Service enabled$(NC)"
+
+.PHONY: analytics-disable
+analytics-disable: ## Disable analytics service from starting on boot
+	@echo "$(YELLOW)Disabling $(ANALYTICS_SERVICE) from starting on boot...$(NC)"
+	@sudo systemctl disable $(ANALYTICS_SERVICE)
+	@echo "$(YELLOW)Service disabled$(NC)"
+
+.PHONY: analytics-health
+analytics-health: ## Check analytics service health and recent errors
+	@echo "$(GREEN)Analytics Service Health Check$(NC)"
+	@echo "===================="
+	@echo ""
+	@if systemctl is-active --quiet $(ANALYTICS_SERVICE); then \
+		echo "Status: $(GREEN)ACTIVE$(NC)"; \
+	else \
+		echo "Status: $(RED)INACTIVE$(NC)"; \
+	fi
+	@echo ""
+	@UPTIME=$$(systemctl show $(ANALYTICS_SERVICE) --property=ActiveEnterTimestamp --value); \
+	if [ -n "$$UPTIME" ]; then \
+		echo "Started: $$UPTIME"; \
+	fi
+	@echo ""
+	@MEMORY=$$(systemctl show $(ANALYTICS_SERVICE) --property=MemoryCurrent --value); \
+	if [ "$$MEMORY" != "[not set]" ] && [ -n "$$MEMORY" ]; then \
+		MEMORY_MB=$$(($$MEMORY / 1024 / 1024)); \
+		echo "Memory: $${MEMORY_MB} MB"; \
+	fi
+	@echo ""
+	@echo "Recent Errors (last 10):"
+	@echo "------------------------"
+	@sudo journalctl -u $(ANALYTICS_SERVICE) -p err -n 10 --no-pager || echo "No recent errors"
+	@echo ""
+	@echo "Recent Warnings (last 5):"
+	@echo "-------------------------"
+	@sudo journalctl -u $(ANALYTICS_SERVICE) -p warning -n 5 --no-pager || echo "No recent warnings"
 
 # =============================================================================
 # Logs
 # =============================================================================
 
-.PHONY: logs
-logs: ## Watch ingestion logs in real-time (Ctrl+C to stop)
-	@echo "$(BLUE)=== Watching ZeroGEX Logs (Ctrl+C to stop) ===$(NC)"
-	@sudo journalctl -u $(SERVICE_NAME) -f -n 50
+.PHONY: ingestion-logs
+ingestion-logs: ## Watch ingestion logs in real-time (Ctrl+C to stop)
+	@echo "$(BLUE)=== Watching Ingestion Logs (Ctrl+C to stop) ===$(NC)"
+	@sudo journalctl -u $(INGESTION_SERVICE) -f -n 50
 
-.PHONY: logs-tail
-logs-tail: ## Show last 100 log lines
-	@echo "$(GREEN)Last 100 log lines:$(NC)"
-	@sudo journalctl -u $(SERVICE_NAME) -n 100 --no-pager
+.PHONY: ingestion-logs-tail
+ingestion-logs-tail: ## Show last 100 ingestion log lines
+	@echo "$(GREEN)Last 100 ingestion log lines:$(NC)"
+	@sudo journalctl -u $(INGESTION_SERVICE) -n 100 --no-pager
 
-.PHONY: logs-errors
-logs-errors: ## Show recent errors in logs
-	@echo "$(BLUE)=== Recent Errors ===$(NC)"
-	@sudo journalctl -u $(SERVICE_NAME) -p err -n 50 --no-pager
+.PHONY: ingestion-logs-errors
+ingestion-logs-errors: ## Show recent ingestion errors
+	@echo "$(BLUE)=== Recent Ingestion Errors ===$(NC)"
+	@sudo journalctl -u $(INGESTION_SERVICE) -p err -n 50 --no-pager
+
+.PHONY: analytics-logs
+analytics-logs: ## Watch analytics logs in real-time (Ctrl+C to stop)
+	@echo "$(BLUE)=== Watching Analytics Logs (Ctrl+C to stop) ===$(NC)"
+	@sudo journalctl -u $(ANALYTICS_SERVICE) -f -n 50
+
+.PHONY: analytics-logs-tail
+analytics-logs-tail: ## Show last 100 analytics log lines
+	@echo "$(GREEN)Last 100 analytics log lines:$(NC)"
+	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 100 --no-pager
+
+.PHONY: analytics-logs-errors
+analytics-logs-errors: ## Show recent analytics errors
+	@echo "$(BLUE)=== Recent Analytics Errors ===$(NC)"
+	@sudo journalctl -u $(ANALYTICS_SERVICE) -p err -n 50 --no-pager
 
 .PHONY: logs-grep
 logs-grep: ## Grep logs for specific pattern (use: make logs-grep PATTERN="Greeks")
-	@sudo journalctl -u $(SERVICE_NAME) -n 1000 --no-pager | grep "$(PATTERN)" || echo "No matches found for: $(PATTERN)"
+	@echo "$(BLUE)=== Searching Ingestion Logs ===$(NC)"
+	@sudo journalctl -u $(INGESTION_SERVICE) -n 1000 --no-pager | grep "$(PATTERN)" || echo "No matches in ingestion logs"
+	@echo ""
+	@echo "$(BLUE)=== Searching Analytics Logs ===$(NC)"
+	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 1000 --no-pager | grep "$(PATTERN)" || echo "No matches in analytics logs"
 
 .PHONY: logs-clear
-logs-clear: ## Clear all journalctl logs for the service
-	@echo "$(RED)⚠️  WARNING: This will permanently delete ALL logs for $(SERVICE_NAME)!$(NC)"
+logs-clear: ## Clear all journalctl logs for the services
+	@echo "$(RED)⚠️  WARNING: This will permanently delete ALL logs for ZeroGEX services!$(NC)"
 	@read -p "Are you sure? Type 'yes' to confirm: " confirm; \
 	if [ "$$confirm" = "yes" ]; then \
 		echo "$(YELLOW)Clearing logs...$(NC)"; \
 		sudo journalctl --rotate; \
-		sudo journalctl --vacuum-time=1s -u $(SERVICE_NAME); \
-		echo "$(GREEN)✅ Logs cleared for $(SERVICE_NAME)$(NC)"; \
+		sudo journalctl --vacuum-time=1s -u $(INGESTION_SERVICE); \
+		sudo journalctl --vacuum-time=1s -u $(ANALYTICS_SERVICE); \
+		echo "$(GREEN)✅ Logs cleared for ZeroGEX services$(NC)"; \
 	else \
 		echo "$(RED)❌ Aborted$(NC)"; \
 	fi
@@ -255,7 +363,7 @@ run-stream: ## Test real-time streaming
 	@echo "$(BLUE)TESTING STREAM MANAGER$(NC)"
 	@echo "$(BLUE)================================================================================$(NC)"
 	@echo "Note: This is a standalone test of the streaming component."
-	@echo "      For production streaming, use 'make run-ingest' or 'make start'"
+	@echo "      For production streaming, use 'make run-ingest' or 'make ingestion-start'"
 	@echo "$(BLUE)================================================================================$(NC)"
 	@echo ""
 	@$(VENV_PYTHON) -m src.ingestion.stream_manager
@@ -271,6 +379,23 @@ run-ingest: ## Run main ingestion engine (forward-only)
 	@echo "$(BLUE)================================================================================$(NC)"
 	@echo ""
 	@$(VENV_PYTHON) -m src.ingestion.main_engine
+
+.PHONY: run-analytics
+run-analytics: ## Run analytics engine
+	@echo ""
+	@echo "$(BLUE)================================================================================$(NC)"
+	@echo "$(BLUE)RUNNING ANALYTICS ENGINE$(NC)"
+	@echo "$(BLUE)================================================================================$(NC)"
+	@echo "Note: Analytics engine calculates GEX and Max Pain from database data."
+	@echo "      Runs independently of ingestion on configured interval."
+	@echo "$(BLUE)================================================================================$(NC)"
+	@echo ""
+	@$(VENV_PYTHON) -m src.analytics.main_engine
+
+.PHONY: run-analytics-once
+run-analytics-once: ## Run analytics once (testing)
+	@echo "$(BLUE)=== Running Analytics Once (Testing) ===$(NC)"
+	@$(VENV_PYTHON) -m src.analytics.main_engine --once
 
 .PHONY: run-greeks
 run-greeks: ## Test Greeks calculator
@@ -307,7 +432,21 @@ stats: ## Show overall data statistics
 			COUNT(*), \
 			MIN(timestamp AT TIME ZONE 'America/New_York'), \
 			MAX(timestamp AT TIME ZONE 'America/New_York') \
-		FROM option_chains;"
+		FROM option_chains \
+		UNION ALL \
+		SELECT \
+			'GEX Summary', \
+			COUNT(*), \
+			MIN(timestamp AT TIME ZONE 'America/New_York'), \
+			MAX(timestamp AT TIME ZONE 'America/New_York') \
+		FROM gex_summary \
+		UNION ALL \
+		SELECT \
+			'GEX by Strike', \
+			COUNT(*), \
+			MIN(timestamp AT TIME ZONE 'America/New_York'), \
+			MAX(timestamp AT TIME ZONE 'America/New_York') \
+		FROM gex_by_strike;"
 
 .PHONY: latest
 latest: ## Show latest data from all tables
@@ -344,6 +483,21 @@ latest: ## Show latest data from all tables
 		WHERE timestamp = (SELECT MAX(timestamp) FROM option_chains) \
 		ORDER BY volume DESC \
 		LIMIT 5;"
+	@echo ""
+	@echo "$(BLUE)=== Latest GEX Summary ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			underlying, \
+			timestamp AT TIME ZONE 'America/New_York' as time_et, \
+			max_gamma_strike, \
+			max_gamma_value, \
+			gamma_flip_point, \
+			max_pain, \
+			put_call_ratio, \
+			total_net_gex \
+		FROM gex_summary \
+		ORDER BY timestamp DESC \
+		LIMIT 1;"
 
 .PHONY: today
 today: ## Show today's data summary
@@ -365,6 +519,14 @@ today: ## Show today's data summary
 			SUM(volume) as total_volume, \
 			COUNT(DISTINCT strike) as unique_strikes \
 		FROM option_chains \
+		WHERE DATE(timestamp AT TIME ZONE 'America/New_York') = CURRENT_DATE;"
+	@echo ""
+	@$(PSQL) -c "\
+		SELECT \
+			COUNT(*) as gex_calculations, \
+			MIN(timestamp AT TIME ZONE 'America/New_York') as first_calc, \
+			MAX(timestamp AT TIME ZONE 'America/New_York') as last_calc \
+		FROM gex_summary \
 		WHERE DATE(timestamp AT TIME ZONE 'America/New_York') = CURRENT_DATE;"
 
 # =============================================================================
@@ -545,6 +707,100 @@ options-strikes: ## Active strikes summary
 			SUM(volume) FILTER (WHERE option_type = 'P') as put_volume \
 		FROM option_chains \
 		WHERE timestamp = (SELECT MAX(timestamp) FROM option_chains) \
+		GROUP BY strike, expiration \
+		ORDER BY expiration, strike;"
+
+# =============================================================================
+# Greeks & Analytics
+# =============================================================================
+
+.PHONY: greeks
+greeks: ## Latest Greeks by strike
+	@echo "$(BLUE)=== Latest Greeks by Strike ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			strike, \
+			expiration, \
+			option_type, \
+			last, \
+			delta, \
+			gamma, \
+			theta, \
+			vega, \
+			volume, \
+			open_interest \
+		FROM option_chains \
+		WHERE timestamp = (SELECT MAX(timestamp) FROM option_chains) \
+		AND (delta IS NOT NULL OR gamma IS NOT NULL) \
+		ORDER BY expiration, strike, option_type;"
+
+.PHONY: greeks-summary
+greeks-summary: ## Greeks summary statistics
+	@echo "$(BLUE)=== Greeks Summary (Latest Data) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			option_type, \
+			COUNT(*) as contracts, \
+			ROUND(AVG(delta), 4) as avg_delta, \
+			ROUND(AVG(gamma), 6) as avg_gamma, \
+			ROUND(AVG(theta), 4) as avg_theta, \
+			ROUND(AVG(vega), 4) as avg_vega \
+		FROM option_chains \
+		WHERE timestamp = (SELECT MAX(timestamp) FROM option_chains) \
+		AND delta IS NOT NULL \
+		GROUP BY option_type;"
+
+.PHONY: gex-summary
+gex-summary: ## Show latest GEX summary
+	@echo "$(BLUE)=== Latest GEX Summary ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			underlying, \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI') as time_et, \
+			max_gamma_strike, \
+			TO_CHAR(max_gamma_value, 'FM999,999,999') as max_gamma, \
+			gamma_flip_point, \
+			put_call_ratio, \
+			max_pain, \
+			TO_CHAR(total_net_gex, 'FM999,999,999') as net_gex, \
+			TO_CHAR(created_at AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI:SS') as calculated_at \
+		FROM gex_summary \
+		ORDER BY timestamp DESC \
+		LIMIT 10;"
+
+.PHONY: gex-strikes
+gex-strikes: ## Show GEX by strike (top 20)
+	@echo "$(BLUE)=== GEX by Strike (Top 20) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			strike, \
+			expiration, \
+			TO_CHAR(net_gex, 'FM999,999,999') as net_gex, \
+			TO_CHAR(call_oi, 'FM999,999') as call_oi, \
+			TO_CHAR(put_oi, 'FM999,999') as put_oi, \
+			TO_CHAR(vanna_exposure, 'FM999,999') as vanna, \
+			TO_CHAR(charm_exposure, 'FM999,999') as charm \
+		FROM gex_by_strike \
+		WHERE timestamp = (SELECT MAX(timestamp) FROM gex_by_strike) \
+		ORDER BY ABS(net_gex) DESC \
+		LIMIT 20;"
+
+.PHONY: gex-preview
+gex-preview: ## Preview GEX calculation data
+	@echo "$(BLUE)=== GEX Preview (Gamma by Strike) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			strike, \
+			expiration, \
+			SUM(gamma) FILTER (WHERE option_type = 'C') as call_gamma, \
+			SUM(gamma) FILTER (WHERE option_type = 'P') as put_gamma, \
+			SUM(gamma * open_interest) FILTER (WHERE option_type = 'C') as call_gex, \
+			SUM(gamma * open_interest) FILTER (WHERE option_type = 'P') as put_gex, \
+			SUM(volume) FILTER (WHERE option_type = 'C') as call_vol, \
+			SUM(volume) FILTER (WHERE option_type = 'P') as put_vol \
+		FROM option_chains \
+		WHERE timestamp = (SELECT MAX(timestamp) FROM option_chains) \
+		AND gamma IS NOT NULL \
 		GROUP BY strike, expiration \
 		ORDER BY expiration, strike;"
 
@@ -883,65 +1139,6 @@ day-trading: ## Combined day trading dashboard
 	@echo "$(BLUE)================================================================================$(NC)"
 
 # =============================================================================
-# Greeks & Analytics
-# =============================================================================
-
-.PHONY: greeks
-greeks: ## Latest Greeks by strike
-	@echo "$(BLUE)=== Latest Greeks by Strike ===$(NC)"
-	@$(PSQL) -c "\
-		SELECT \
-			strike, \
-			expiration, \
-			option_type, \
-			last, \
-			delta, \
-			gamma, \
-			theta, \
-			vega, \
-			volume, \
-			open_interest \
-		FROM option_chains \
-		WHERE timestamp = (SELECT MAX(timestamp) FROM option_chains) \
-		AND (delta IS NOT NULL OR gamma IS NOT NULL) \
-		ORDER BY expiration, strike, option_type;"
-
-.PHONY: greeks-summary
-greeks-summary: ## Greeks summary statistics
-	@echo "$(BLUE)=== Greeks Summary (Latest Data) ===$(NC)"
-	@$(PSQL) -c "\
-		SELECT \
-			option_type, \
-			COUNT(*) as contracts, \
-			ROUND(AVG(delta), 4) as avg_delta, \
-			ROUND(AVG(gamma), 6) as avg_gamma, \
-			ROUND(AVG(theta), 4) as avg_theta, \
-			ROUND(AVG(vega), 4) as avg_vega \
-		FROM option_chains \
-		WHERE timestamp = (SELECT MAX(timestamp) FROM option_chains) \
-		AND delta IS NOT NULL \
-		GROUP BY option_type;"
-
-.PHONY: gex-preview
-gex-preview: ## Preview GEX calculation data
-	@echo "$(BLUE)=== GEX Preview (Gamma by Strike) ===$(NC)"
-	@$(PSQL) -c "\
-		SELECT \
-			strike, \
-			expiration, \
-			SUM(gamma) FILTER (WHERE option_type = 'C') as call_gamma, \
-			SUM(gamma) FILTER (WHERE option_type = 'P') as put_gamma, \
-			SUM(gamma * open_interest) FILTER (WHERE option_type = 'C') as call_gex, \
-			SUM(gamma * open_interest) FILTER (WHERE option_type = 'P') as put_gex, \
-			SUM(volume) FILTER (WHERE option_type = 'C') as call_vol, \
-			SUM(volume) FILTER (WHERE option_type = 'P') as put_vol \
-		FROM option_chains \
-		WHERE timestamp = (SELECT MAX(timestamp) FROM option_chains) \
-		AND gamma IS NOT NULL \
-		GROUP BY strike, expiration \
-		ORDER BY expiration, strike;"
-
-# =============================================================================
 # Data Quality
 # =============================================================================
 
@@ -1095,6 +1292,8 @@ vacuum: ## Vacuum analyze all tables
 	@echo "$(YELLOW)Running VACUUM ANALYZE on all tables...$(NC)"
 	@$(PSQL) -c "VACUUM ANALYZE underlying_quotes;"
 	@$(PSQL) -c "VACUUM ANALYZE option_chains;"
+	@$(PSQL) -c "VACUUM ANALYZE gex_summary;"
+	@$(PSQL) -c "VACUUM ANALYZE gex_by_strike;"
 	@echo "$(GREEN)✅ Done$(NC)"
 
 .PHONY: size
@@ -1149,7 +1348,16 @@ check-streaming: ## Check if data is actively streaming
 		ORDER BY timestamp DESC \
 		LIMIT 1;"
 	@echo ""
-	@echo "$(YELLOW)If age is > 5 minutes during market hours, streaming may be stuck.$(NC)"
+	@echo "Latest GEX calculation:"
+	@$(PSQL) -t -c "\
+		SELECT \
+			timestamp AT TIME ZONE 'America/New_York' as time_et, \
+			AGE(NOW(), timestamp) as age \
+		FROM gex_summary \
+		ORDER BY timestamp DESC \
+		LIMIT 1;"
+	@echo ""
+	@echo "$(YELLOW)If age is > 5 minutes during market hours, services may be stuck.$(NC)"
 
 .PHONY: volume-profile
 volume-profile: ## Volume profile for today

@@ -363,8 +363,7 @@ class StreamManager:
                                 bid = safe_float(opt_quote.get("Bid"), field_name="Bid")
                                 ask = safe_float(opt_quote.get("Ask"), field_name="Ask")
                                 volume = safe_int(opt_quote.get("Volume"), field_name="Volume")
-                                open_interest = safe_int(opt_quote.get("OpenInterest"), 
-                                                        field_name="OpenInterest")
+                                open_interest = safe_int(opt_quote.get("DailyOpenInterest"), field_name="DailyOpenInterest")
 
                                 # Try multiple field names for implied volatility
                                 # TradeStation may use different field names

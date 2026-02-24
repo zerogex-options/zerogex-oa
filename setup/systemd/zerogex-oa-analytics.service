@@ -1,7 +1,7 @@
 [Unit]
-Description=ZeroGEX Ingestion Engine
+Description=ZeroGEX Options Analytics Engine
 Documentation=https://github.com/zerogex-options/zerogex-oa
-After=network-online.target postgresql.service
+After=network-online.target postgresql.service zerogex-oa-ingestion.service
 Wants=network-online.target
 Requires=postgresql.service
 
@@ -16,12 +16,12 @@ Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=/home/ubuntu/zerogex-oa/.env
 
 # Execution
-ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.ingestion.main_engine
+ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.analytics.main_engine
 ExecReload=/bin/kill -HUP $MAINPID
 
 # Restart policy
 Restart=always
-RestartSec=10
+RestartSec=30
 StartLimitBurst=5
 StartLimitInterval=300
 
@@ -32,8 +32,8 @@ TimeoutStopSec=30
 SendSIGKILL=yes
 
 # Resource limits
-MemoryMax=2G
-CPUQuota=150%
+MemoryMax=1G
+CPUQuota=100%
 
 # Security
 NoNewPrivileges=true
@@ -45,7 +45,7 @@ ReadWritePaths=/home/ubuntu/zerogex-oa
 # Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=zerogex-oa-ingestion
+SyslogIdentifier=zerogex-oa-analytics
 
 [Install]
 WantedBy=multi-user.target
