@@ -1,6 +1,6 @@
 # ZeroGEX - Options Analytics Platform
 
-**Real-time gamma exposure (GEX) calculations for SPY/SPX options using TradeStation API integration.**
+**Real-time gamma exposure (GEX) calculations for options using TradeStation API integration.**
 
 ZeroGEX is a sophisticated options trading platform that calculates real-time gamma exposure for equity options, providing traders with critical market positioning data. The platform integrates with TradeStation's API for live market data and historical backfilling capabilities.
 
@@ -46,10 +46,10 @@ ZeroGEX is a sophisticated options trading platform that calculates real-time ga
 - **Database Storage** - PostgreSQL/TimescaleDB with proper timezone handling
 - **Memory Management** - Automatic cleanup of expired strikes to prevent memory leaks
 - **Graceful Shutdown** - Proper buffer flushing and connection cleanup on shutdown
+- **Real-time Analytics Engine** - Calculates real-time gamma exposure, max pain, and second order Greeks
 
 ### 🚀 Future Enhancements (Foundation Ready)
 - **WebSocket Streaming** - Low-latency real-time data (config ready)
-- **Real-time GEX Calculation** - Gamma exposure engine (schema ready)
 - **Data Quality Monitoring** - Automated detection of stale/missing data (schema ready)
 - **Grafana Dashboards** - Real-time visualization and alerting (metrics schema ready)
 
@@ -91,7 +91,8 @@ ZeroGEX Platform
 │   └── Database storage coordination
 ├── Analytics Layer
 │   ├── IV Calculator (Newton-Raphson solver)
-│   └── Greeks Calculator (Black-Scholes model)
+│   ├── Greeks Calculator (Black-Scholes model)
+|   └── GEX, max pain and second order Greeks Calculation Engine
 ├── Data Storage Layer
 │   ├── PostgreSQL (relational data)
 │   ├── TimescaleDB (time-series optimization)
@@ -101,7 +102,6 @@ ZeroGEX Platform
 │   ├── Timezone handling (pytz)
 │   └── Centralized configuration
 └── Future Layers
-    ├── GEX Calculation Engine
     ├── Data Quality Monitor
     ├── WebSocket Stream Manager
     └── Metrics & Monitoring (Prometheus/Grafana)
