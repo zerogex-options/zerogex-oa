@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================
-# Step 080: Deployment Validation
+# Step 200: Deployment Validation
 # ==============================================
 
 set -e
@@ -9,6 +9,19 @@ set -e
 log "Deployment Validation"
 
 APP_DIR="$HOME/zerogex-oa"
+PGPASS_FILE="$HOME/.pgpass"
+
+# Parse RDS connection details from .pgpass
+if [ -f "$PGPASS_FILE" ]; then
+    DB_HOST=$(cat "$PGPASS_FILE" | awk -F: '{print $1}')
+    DB_PORT=$(cat "$PGPASS_FILE" | awk -F: '{print $2}')
+    DB_NAME=$(cat "$PGPASS_FILE" | awk -F: '{print $3}')
+    DB_USER=$(cat "$PGPASS_FILE" | awk -F: '{print $4}')
+else
+    log "  ✗ .pgpass file not found at $PGPASS_FILE"
+    log "     Cannot determine database connection parameters"
+    exit 1
+fi
 
 # Validation results tracking
 TOTAL_CHECKS=0
@@ -39,21 +52,28 @@ log "1. Service Status Checks"
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 check_service "zerogex-oa-ingestion" "Ingestion Service"
 check_service "zerogex-oa-analytics" "Analytics Service"
-check_service "postgresql" "PostgreSQL Database"
 log ""
 
 # Section 2: Database Connection
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-log "2. Database Connection Test"
+log "2. Database Connection Test (AWS RDS)"
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "  Connection Details:"
+log "    Host: $DB_HOST"
+log "    Port: $DB_PORT"
+log "    Database: $DB_NAME"
+log "    User: $DB_USER"
+log ""
 TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
-if psql -h localhost -U zerogex_user -d zerogex -c "SELECT NOW();" > /dev/null 2>&1; then
-    DB_TIME=$(psql -h localhost -U zerogex_user -d zerogex -t -c "SELECT NOW();")
+if psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "SELECT NOW();" > /dev/null 2>&1; then
+    DB_TIME=$(psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -t -c "SELECT NOW();")
     log "  ✓ Database connection successful"
     log "     Database time: $DB_TIME"
     PASSED_CHECKS=$((PASSED_CHECKS + 1))
 else
     log "  ✗ Database connection failed"
+    log "     Check RDS security group settings"
+    log "     Ensure EC2 instance can connect to RDS"
     FAILED_CHECKS=$((FAILED_CHECKS + 1))
 fi
 log ""
@@ -69,11 +89,14 @@ TABLES=(
     "option_chains"
     "gex_summary"
     "gex_by_strike"
+    "data_quality_log"
+    "ingestion_metrics"
+    "data_retention_policy"
 )
 
 for table in "${TABLES[@]}"; do
     TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
-    if psql -h localhost -U zerogex_user -d zerogex -t -c "\dt $table" 2>/dev/null | grep -q "$table"; then
+    if psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -t -c "\dt $table" 2>/dev/null | grep -q "$table"; then
         log "  ✓ Table exists: $table"
         PASSED_CHECKS=$((PASSED_CHECKS + 1))
     else
@@ -85,19 +108,28 @@ log ""
 
 # Section 4: Views
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-log "4. Database Views"
+log "4. Database Views (Real-Time)"
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 VIEWS=(
     "underlying_quotes_with_deltas"
     "option_chains_with_deltas"
     "option_flow_by_type"
+    "option_flow_by_strike"
+    "option_flow_by_expiration"
     "option_flow_smart_money"
+    "underlying_buying_pressure"
+    "underlying_vwap_deviation"
+    "opening_range_breakout"
+    "gamma_exposure_levels"
+    "dealer_hedging_pressure"
+    "unusual_volume_spikes"
+    "momentum_divergence"
 )
 
 for view in "${VIEWS[@]}"; do
     TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
-    if psql -h localhost -U zerogex_user -d zerogex -t -c "\dv $view" 2>/dev/null | grep -q "$view"; then
+    if psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -t -c "\dv $view" 2>/dev/null | grep -q "$view"; then
         log "  ✓ View exists: $view"
         PASSED_CHECKS=$((PASSED_CHECKS + 1))
     else
@@ -107,20 +139,59 @@ for view in "${VIEWS[@]}"; do
 done
 log ""
 
-# Section 5: Python Environment
+# Section 5: Data Retention Configuration
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-log "5. Python Environment"
+log "5. Data Retention Configuration"
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+RETENTION_COUNT=$(psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -t -c "SELECT COUNT(*) FROM data_retention_policy WHERE enabled = true;" 2>/dev/null | xargs || echo "0")
+if [ "$RETENTION_COUNT" -gt 0 ]; then
+    log "  ✓ Data retention policies configured: $RETENTION_COUNT active"
+    PASSED_CHECKS=$((PASSED_CHECKS + 1))
+
+    # Show retention policies
+    log ""
+    log "  Active Retention Policies:"
+    psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "SELECT table_name, retention_days, last_cleanup FROM data_retention_policy WHERE enabled = true ORDER BY table_name;" 2>/dev/null || true
+else
+    log "  ⚠ No data retention policies found"
+    WARNING_CHECKS=$((WARNING_CHECKS + 1))
+fi
+log ""
+
+# Section 6: Cron Job
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "6. Data Retention Cron Job"
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+if crontab -l 2>/dev/null | grep -q "cleanup_old_data"; then
+    log "  ✓ Cleanup cron job configured"
+    PASSED_CHECKS=$((PASSED_CHECKS + 1))
+    log ""
+    log "  Cron Job Details:"
+    crontab -l 2>/dev/null | grep "cleanup_old_data" || true
+else
+    log "  ✗ Cleanup cron job not found"
+    FAILED_CHECKS=$((FAILED_CHECKS + 1))
+fi
+log ""
+
+# Section 7: Python Environment
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "7. Python Environment"
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
 if [ -d "$APP_DIR/venv" ]; then
     log "  ✓ Virtual environment exists"
     PASSED_CHECKS=$((PASSED_CHECKS + 1))
-    
+
     # Check key packages
     cd "$APP_DIR"
     source venv/bin/activate
-    
+
     PACKAGES=("psycopg2" "pandas" "numpy" "scipy" "requests" "pytz")
     for package in "${PACKAGES[@]}"; do
         TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
@@ -132,7 +203,7 @@ if [ -d "$APP_DIR/venv" ]; then
             FAILED_CHECKS=$((FAILED_CHECKS + 1))
         fi
     done
-    
+
     deactivate
 else
     log "  ✗ Virtual environment not found"
@@ -140,9 +211,9 @@ else
 fi
 log ""
 
-# Section 6: Configuration Files
+# Section 8: Configuration Files
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-log "6. Configuration Files"
+log "8. Configuration Files"
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 CONFIG_FILES=(
@@ -153,8 +224,14 @@ CONFIG_FILES=(
 for config_file in "${CONFIG_FILES[@]}"; do
     TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
     if [ -f "$config_file" ]; then
-        log "  ✓ Config file exists: $config_file"
-        PASSED_CHECKS=$((PASSED_CHECKS + 1))
+        PERMS=$(stat -c "%a" "$config_file")
+        if [ "$PERMS" = "600" ]; then
+            log "  ✓ Config file exists with secure permissions (600): $(basename $config_file)"
+            PASSED_CHECKS=$((PASSED_CHECKS + 1))
+        else
+            log "  ⚠ Config file exists but permissions not 600: $(basename $config_file) ($PERMS)"
+            WARNING_CHECKS=$((WARNING_CHECKS + 1))
+        fi
     else
         log "  ✗ Missing config file: $config_file"
         FAILED_CHECKS=$((FAILED_CHECKS + 1))
@@ -162,25 +239,26 @@ for config_file in "${CONFIG_FILES[@]}"; do
 done
 log ""
 
-# Section 7: Recent Data Check
+# Section 9: Recent Data Check
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-log "7. Recent Data Check"
+log "9. Recent Data Check"
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # Check for SPY symbol
 TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
-SPY_COUNT=$(psql -h localhost -U zerogex_user -d zerogex -t -c "SELECT COUNT(*) FROM symbols WHERE symbol = 'SPY';" 2>/dev/null | xargs || echo "0")
+SPY_COUNT=$(psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -t -c "SELECT COUNT(*) FROM symbols WHERE symbol = 'SPY';" 2>/dev/null | xargs || echo "0")
 if [ "$SPY_COUNT" -gt 0 ]; then
     log "  ✓ SPY symbol configured"
     PASSED_CHECKS=$((PASSED_CHECKS + 1))
 else
     log "  ⚠ SPY symbol not yet configured"
+    log "     Add with: make psql, then INSERT INTO symbols..."
     WARNING_CHECKS=$((WARNING_CHECKS + 1))
 fi
 
 # Check for recent data
 TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
-RECENT_DATA=$(psql -h localhost -U zerogex_user -d zerogex -t -c "SELECT COUNT(*) FROM underlying_quotes WHERE timestamp > NOW() - INTERVAL '1 hour';" 2>/dev/null | xargs || echo "0")
+RECENT_DATA=$(psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -t -c "SELECT COUNT(*) FROM underlying_quotes WHERE timestamp > NOW() - INTERVAL '1 hour';" 2>/dev/null | xargs || echo "0")
 if [ "$RECENT_DATA" -gt 0 ]; then
     log "  ✓ Recent data found: $RECENT_DATA rows (last hour)"
     PASSED_CHECKS=$((PASSED_CHECKS + 1))
@@ -190,9 +268,9 @@ else
 fi
 log ""
 
-# Section 8: Service Logs
+# Section 10: Service Logs
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-log "8. Recent Service Logs (Last 5 lines)"
+log "10. Recent Service Logs (Last 5 lines)"
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log ""
 log "Ingestion Service:"
@@ -219,10 +297,12 @@ if [ "$FAILED_CHECKS" -eq 0 ]; then
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     log ""
     log "ZeroGEX-OA platform is ready!"
-    
+
     if [ "$WARNING_CHECKS" -gt 0 ]; then
         log ""
         log "Note: Some warnings detected (normal for fresh deployment)"
+        log "  • SPY symbol can be added via: make psql"
+        log "  • Recent data will appear when markets open and services run"
     fi
 else
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -230,9 +310,21 @@ else
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     log ""
     log "Please review failed checks and resolve issues."
+    log ""
+    log "Common issues:"
+    log "  • RDS security group not allowing EC2 connections"
+    log "  • Incorrect RDS credentials in .pgpass"
+    log "  • TradeStation API credentials not configured"
+    log "  • Python packages not installed correctly"
     exit 1
 fi
 
+log ""
+log "Next Steps:"
+log "  1. Add SPY symbol (if not already done)"
+log "  2. Monitor services: make ingestion-logs"
+log "  3. Check data flow: make stats"
+log "  4. View service status: make ingestion-status"
 log ""
 log "Deployment validation complete!"
 log ""

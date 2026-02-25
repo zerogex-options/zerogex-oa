@@ -1,25 +1,29 @@
 # ZeroGEX-OA Deployment Guide
 
-Complete deployment automation for the ZeroGEX Options Analytics platform on a fresh Ubuntu server.
+Complete deployment automation for the ZeroGEX Options Analytics platform on a fresh Ubuntu server with AWS RDS PostgreSQL database.
 
 ## Overview
 
 This deployment system automates the complete setup of ZeroGEX-OA including:
 - System configuration and package installation
-- PostgreSQL + TimescaleDB database setup
+- AWS RDS PostgreSQL database connection and schema setup
 - Python application and dependencies
 - TradeStation API integration
 - Systemd service configuration
 - Security hardening
-- Automated backups
-- Monitoring dashboard
+- Automated data retention (cleanup cron job)
+- Deployment validation
 
 ## Prerequisites
 
-- Ubuntu 20.04 or 22.04 LTS server
+- Ubuntu 20.04 or 22.04 LTS server (EC2 instance)
 - Sudo access
 - At least 4GB RAM (8GB+ recommended)
 - 50GB+ storage (100GB+ recommended for production)
+- **AWS RDS PostgreSQL instance** (already provisioned)
+  - PostgreSQL 13+ recommended
+  - Endpoint, port, database name, and master credentials
+  - Security group allowing EC2 instance to connect
 - TradeStation API credentials (Client ID, Secret, and Refresh Token)
 
 ## Quick Start
@@ -44,69 +48,72 @@ The deployment process runs these steps in order:
 
 ### Step 010: System Setup
 - Updates system packages
-- Installs essential tools (git, curl, python3, postgresql, etc.)
+- Installs essential tools (git, curl, python3, postgresql-client, etc.)
 - Configures timezone to America/New_York
 - Sets up .bashrc with ZeroGEX environment
 
 ### Step 015: Data Volume Setup
-- Detects and mounts secondary storage volumes
-- Creates `/data` mount point for PostgreSQL, backups, and monitoring
+- Detects and mounts secondary storage volumes (if available)
+- Creates `/data` mount point for monitoring and backups
 - Falls back to root volume if no secondary volume available
+- Creates `/data/monitoring` and `/data/backups` directories
 
-### Step 020: Database Setup
-- Installs PostgreSQL and TimescaleDB extension
-- Moves PostgreSQL data directory to `/data/postgresql` (if available)
-- Creates `zerogex` database and `zerogex_user`
-- Applies database schema from `setup/database/schema.sql`
+### Step 020: Database Setup (AWS RDS)
+- Installs PostgreSQL client tools for psql
+- Prompts for AWS RDS connection details (endpoint, port, database, credentials)
+- Tests database connection
 - Creates `.pgpass` file for passwordless access
-
-### Step 021: Database Tuning
-- Optimizes PostgreSQL for time-series workloads
-- Configures connection limits and timeouts
-- Sets up query logging for slow queries
-- Tunes autovacuum for better performance
+- Checks for TimescaleDB extension (optional)
+- Applies database schema from `setup/database/schema.sql`
+- Verifies core tables are created
+- **Sets up data retention cron job** (runs daily at 2:00 AM ET)
+  - Cleans up data older than retention policy (90 days)
+  - Logs to `/var/log/zerogex/cleanup.log`
 
 ### Step 030: Application Setup
 - Creates Python virtual environment
 - Installs zerogex package in editable mode
 - Installs all dependencies (core + optional)
 - Creates `.env` file from template
+- Prompts for TradeStation API credentials (Client ID and Secret)
 
-### Step 040: TradeStation Tokens
+### Step 040: TradeStation Auth
 - Interactive script to obtain TradeStation OAuth tokens
 - Guides through authorization code flow
 - Saves refresh token to `.env` file
 
 ### Step 050: Security Hardening
-- Configures UFW firewall (SSH only)
+- Configures UFW firewall (SSH only by default)
 - Hardens SSH (disables root login, password auth)
 - Sets up fail2ban for brute-force protection
-- Enables automatic security updates
+- Enables automatic security updates (with auto-reboot at 3:00 AM)
 
-### Step 060: Automated Backups
-- Installs database backup script
-- Configures daily backups via cron (2:00 AM)
-- Sets 7-day retention policy
-- Stores backups in `/data/backups`
-
-### Step 070: Systemd Services
+### Step 100: Systemd Services
 - Installs systemd service files:
   - `zerogex-oa-ingestion.service` - Data ingestion engine
   - `zerogex-oa-analytics.service` - GEX analytics engine
 - Enables services to start on boot
 - Starts services and verifies status
 
-### Step 080: Validation
-- Comprehensive deployment validation
-- Checks service status, database connectivity
-- Verifies schema, tables, and views
+### Step 200: Validation
+- Comprehensive deployment validation with RDS connection
+- Checks service status
+- Verifies database connectivity using `.pgpass` credentials
+- Validates schema (8 core tables, 13 real-time views)
+- Confirms data retention policies and cron job
 - Tests Python environment and packages
+- Checks configuration file permissions
 - Reports summary with pass/fail/warnings
 
-### Step 090: Monitoring (Optional)
-- Sets up monitoring dashboard on port 8080
-- Collects system, service, and database metrics
-- Stores metrics in `/data/monitoring`
+**Validation Checks Include:**
+- Service status (ingestion, analytics)
+- RDS database connection
+- Core tables: symbols, underlying_quotes, option_chains, gex_summary, gex_by_strike, data_quality_log, ingestion_metrics, data_retention_policy
+- Real-time views: deltas, flow analysis, VWAP, ORB, gamma levels, dealer hedging, volume spikes, momentum divergence
+- Data retention configuration
+- Cleanup cron job
+- Python packages (psycopg2, pandas, numpy, scipy, requests, pytz)
+- Configuration files (.pgpass, .env) with secure permissions (600)
 
 ## Partial Deployment
 
@@ -114,40 +121,52 @@ You can start deployment from any step:
 
 ```bash
 # Start from database setup
-./deploy/deploy.sh --start-from database
+./deploy/deploy.sh --start-from 020
 
 # Start from application setup
 ./deploy/deploy.sh --start-from 030
 
 # Start from systemd services
-./deploy/deploy.sh --start-from systemd
+./deploy/deploy.sh --start-from 100
+
+# Start from validation
+./deploy/deploy.sh --start-from 200
 ```
 
 ## Post-Deployment Configuration
 
-### 1. Configure TradeStation API
+### 1. Verify Database Connection
 
-Edit `~/zerogex-oa/.env`:
+The deployment creates `~/.pgpass` with your RDS credentials:
+
+```
+<rds-endpoint>:5432:zerogex:postgres:<your-password>
+```
+
+Permissions are automatically set to `600` for security.
+
+Test connection:
+```bash
+# Using .pgpass (no password prompt)
+psql -h <rds-endpoint> -U postgres -d zerogex -c "SELECT NOW();"
+
+# Or use Makefile
+make psql
+```
+
+### 2. Verify .env Configuration
+
+Check `~/zerogex-oa/.env`:
 
 ```bash
-TRADESTATION_CLIENT_ID=your_client_id_here
-TRADESTATION_CLIENT_SECRET=your_client_secret_here
-TRADESTATION_REFRESH_TOKEN=will_be_set_by_step_040
-TRADESTATION_USE_SANDBOX=false
-```
-
-### 2. Configure Database Password (if not using default)
-
-Edit `~/.pgpass`:
-
-```
-localhost:5432:zerogex:zerogex_user:your_secure_password
-```
-
-Then update `.env` to use pgpass:
-
-```bash
+# Database (RDS connection via .pgpass)
 DB_PASSWORD_PROVIDER=pgpass
+
+# TradeStation API
+TRADESTATION_CLIENT_ID=<set-during-deployment>
+TRADESTATION_CLIENT_SECRET=<set-during-deployment>
+TRADESTATION_REFRESH_TOKEN=<set-by-step-040>
+TRADESTATION_USE_SANDBOX=false
 ```
 
 ### 3. Add SPY Symbol
@@ -155,10 +174,16 @@ DB_PASSWORD_PROVIDER=pgpass
 ```bash
 cd ~/zerogex-oa
 source venv/bin/activate
-psql -h localhost -U zerogex_user -d zerogex -c \
+
+# Connect to RDS and add SPY
+psql -h <rds-endpoint> -U postgres -d zerogex -c \
   "INSERT INTO symbols (symbol, name, asset_type) 
    VALUES ('SPY', 'SPDR S&P 500 ETF', 'ETF') 
    ON CONFLICT DO NOTHING;"
+
+# Or use Makefile
+make psql
+# Then run the INSERT command
 ```
 
 ### 4. Test Data Ingestion
@@ -235,23 +260,65 @@ make flow-live
 ### Direct SQL
 
 ```bash
-# Connect to database
+# Connect to database (uses .pgpass)
 make psql
 
 # Run custom query
 make query SQL="SELECT COUNT(*) FROM underlying_quotes;"
 ```
 
-## Monitoring
+## Data Retention & Cleanup
 
-Access monitoring dashboard:
-```
-http://<server-ip>:8080
-```
+### Automated Cleanup
 
-View metrics:
+The deployment automatically configures a cron job that runs daily at 2:00 AM ET:
+
 ```bash
-cat /data/monitoring/current_metrics.json | jq
+# View cron job
+crontab -l | grep cleanup_old_data
+
+# View cleanup logs
+tail -f /var/log/zerogex/cleanup.log
+
+# Test cleanup manually
+psql -h <rds-endpoint> -U postgres -d zerogex -c "SELECT * FROM cleanup_old_data();"
+```
+
+### Retention Policies
+
+Default retention (configurable in `data_retention_policy` table):
+- `underlying_quotes`: 90 days
+- `option_chains`: 90 days
+- `gex_summary`: 90 days
+- `gex_by_strike`: 90 days
+- `data_quality_log`: 365 days
+- `ingestion_metrics`: 30 days
+
+View current policies:
+```bash
+make psql
+SELECT * FROM data_retention_policy ORDER BY table_name;
+```
+
+### Modify Retention Policies
+
+```bash
+make psql
+
+-- Update retention for a specific table
+UPDATE data_retention_policy 
+SET retention_days = 60 
+WHERE table_name = 'underlying_quotes';
+
+-- Disable cleanup for a table
+UPDATE data_retention_policy 
+SET enabled = false 
+WHERE table_name = 'option_chains';
+
+-- Re-enable cleanup
+UPDATE data_retention_policy 
+SET enabled = true 
+WHERE table_name = 'option_chains';
 ```
 
 ## Troubleshooting
@@ -268,9 +335,40 @@ sudo journalctl -u zerogex-oa-ingestion -n 50
 ```
 
 Common issues:
-- TradeStation credentials not configured
-- Database connection issues
-- Missing .pgpass file or wrong permissions
+- TradeStation credentials not configured in `.env`
+- Database connection issues (check RDS security group)
+- Missing `.pgpass` file or wrong permissions
+- AWS RDS endpoint unreachable from EC2 instance
+
+### Database Connection Errors
+
+Verify .pgpass file:
+```bash
+# Check permissions (must be 600)
+ls -la ~/.pgpass
+
+# Fix permissions if needed
+chmod 600 ~/.pgpass
+
+# View contents (should show RDS endpoint, not localhost)
+cat ~/.pgpass
+```
+
+Test RDS connection:
+```bash
+# Should connect without password prompt
+psql -h <rds-endpoint> -U postgres -d zerogex -c "SELECT NOW();"
+
+# If fails, check:
+# 1. RDS endpoint is correct
+# 2. RDS security group allows EC2 instance
+# 3. Network connectivity
+ping <rds-endpoint>
+```
+
+Check RDS security group:
+- Inbound rule allowing PostgreSQL (port 5432) from EC2 instance's security group
+- Or allow from EC2 instance's private IP address
 
 ### No Data Appearing
 
@@ -285,18 +383,54 @@ python -m src.ingestion.tradestation_client --test quote
 3. Check ingestion service is running:
 ```bash
 make ingestion-status
+sudo journalctl -u zerogex-oa-ingestion -f
 ```
 
-### Database Connection Errors
-
-Verify .pgpass permissions:
+4. Verify SPY symbol exists:
 ```bash
-chmod 600 ~/.pgpass
+make psql
+SELECT * FROM symbols WHERE symbol = 'SPY';
 ```
 
-Test connection:
+### Cleanup Job Not Running
+
 ```bash
-psql -h localhost -U zerogex_user -d zerogex -c "SELECT NOW();"
+# Check if cron job exists
+crontab -l | grep cleanup_old_data
+
+# Check cleanup logs for errors
+tail -50 /var/log/zerogex/cleanup.log
+
+# Run cleanup manually to test
+psql -h <rds-endpoint> -U postgres -d zerogex -c "SELECT * FROM cleanup_old_data();"
+
+# Re-add cron job if missing (run Step 020 again)
+./deploy/deploy.sh --start-from 020
+```
+
+### Validation Failures
+
+If Step 200 validation fails:
+
+```bash
+# Re-run validation
+./deploy/deploy.sh --start-from 200
+
+# Check specific issues:
+# - RDS connectivity
+psql -h <rds-endpoint> -U postgres -d zerogex -c "SELECT NOW();"
+
+# - Service status
+sudo systemctl status zerogex-oa-ingestion
+sudo systemctl status zerogex-oa-analytics
+
+# - Python packages
+cd ~/zerogex-oa
+source venv/bin/activate
+pip list | grep psycopg2
+
+# - Config file permissions
+ls -la ~/.pgpass ~/zerogex-oa/.env
 ```
 
 ## Directory Structure
@@ -308,13 +442,15 @@ psql -h localhost -U zerogex_user -d zerogex -c "SELECT NOW();"
 │   ├── .env                 # Configuration
 │   ├── src/                 # Source code
 │   └── setup/               # Setup files
-├── .pgpass                  # PostgreSQL password file
+├── .pgpass                  # PostgreSQL password file (RDS credentials)
 └── logs/                    # Deployment logs
 
 /data/                       # Data volume (if available)
-├── postgresql/              # PostgreSQL data files
-├── backups/                 # Database backups
-└── monitoring/              # Monitoring metrics
+├── monitoring/              # Monitoring metrics (if enabled)
+└── backups/                 # Database backups (if configured)
+
+/var/log/zerogex/
+└── cleanup.log              # Data retention cleanup logs
 
 /etc/systemd/system/
 ├── zerogex-oa-ingestion.service
@@ -323,51 +459,104 @@ psql -h localhost -U zerogex_user -d zerogex -c "SELECT NOW();"
 
 ## Security Notes
 
-1. **Change default passwords** in `.pgpass` immediately after deployment
-2. **SSH access** is key-based only (password auth disabled)
-3. **Firewall** allows only SSH (port 22) and monitoring (port 8080)
-4. **fail2ban** protects against brute-force attacks
-5. **Automatic updates** enabled for security patches
+1. **RDS Security**
+   - Use RDS security groups to restrict database access to EC2 instances only
+   - Never expose RDS to 0.0.0.0/0 (public internet)
+   - Consider using AWS Secrets Manager for credentials (future enhancement)
+   - Enable encryption at rest and in transit
 
-## Backup and Recovery
+2. **EC2 Security**
+   - SSH access is key-based only (password auth disabled)
+   - Firewall allows only SSH (port 22) by default
+   - fail2ban protects against brute-force attacks
+   - Automatic security updates enabled
 
-### Manual Backup
+3. **Credentials**
+   - `.pgpass` file has 600 permissions (owner read/write only)
+   - `.env` file has 600 permissions
+   - TradeStation tokens stored securely in `.env`
+   - Validation checks confirm secure permissions
 
-```bash
-# Run backup now
-sudo -u ubuntu /usr/local/bin/backup-zerogex-db.sh
-```
+## AWS RDS Best Practices
 
-### List Backups
+### Connection Pooling
+For production, consider implementing connection pooling to reduce RDS connection overhead.
 
-```bash
-ls -lh /data/backups/
-```
+### Monitoring
+Enable RDS Enhanced Monitoring and CloudWatch alarms for:
+- High CPU utilization (>80%)
+- Low free storage space (<10GB)
+- High database connections (>80% of max)
+- Read/Write IOPS approaching limits
 
-### Restore from Backup
+### Backups
+- RDS automated backups are enabled by default (7-day retention)
+- Consider point-in-time recovery (PITR) for production
+- Test restore procedures regularly
+- Enable backup retention for 30+ days for production
 
-```bash
-pg_restore -h localhost -U zerogex_user -d zerogex /data/backups/zerogex_YYYYMMDD_HHMMSS.dump
-```
+### Performance Tuning
+RDS parameter groups can be tuned for time-series workloads:
+- `shared_buffers`: 25% of available RAM
+- `work_mem`: 50-100MB per connection
+- `maintenance_work_mem`: 512MB-2GB
+- `effective_cache_size`: 75% of available RAM
+- `random_page_cost`: 1.1 (for SSD storage)
 
-## Performance Tuning
+### High Availability
+- Consider Multi-AZ deployment for production
+- Set up read replicas for reporting/analytics queries
+- Configure automatic failover
 
-PostgreSQL is pre-tuned for time-series workloads, but you can adjust:
+## Performance Considerations
 
-```bash
-# Edit PostgreSQL config
-sudo vim /etc/postgresql/*/main/postgresql.conf
+### Real-Time Views
+The schema uses **regular views** (not materialized) for real-time data access with zero lag:
 
-# Restart PostgreSQL
-sudo systemctl restart postgresql
-```
+**Core Data Views:**
+- `underlying_quotes_with_deltas` - Volume deltas for underlying
+- `option_chains_with_deltas` - Volume and OI deltas for options
+
+**Option Flow Views:**
+- `option_flow_by_type` - Puts vs Calls aggregated
+- `option_flow_by_strike` - Flow by strike level
+- `option_flow_by_expiration` - Flow by expiration
+- `option_flow_smart_money` - Unusual activity detection
+- `underlying_buying_pressure` - Directional flow
+
+**Day Trading Views:**
+- `underlying_vwap_deviation` - Mean reversion signals
+- `opening_range_breakout` - ORB tracking
+- `gamma_exposure_levels` - Support/resistance from GEX
+- `dealer_hedging_pressure` - Dealer flow amplification
+- `unusual_volume_spikes` - Volume anomaly detection
+- `momentum_divergence` - Price vs option flow divergence
+
+These compute results on-the-fly using window functions, so no refresh needed.
+
+### Indexes
+The schema includes optimized indexes for:
+- Time-based queries (most common pattern)
+- Strike/expiration filtering
+- Volume and gamma filtering
+- VWAP calculations
+- Opening range queries
+- Recent data access patterns
+
+### Query Performance
+- Most queries are optimized for the last 1-5 minutes of data
+- Indexes support date-partitioned queries
+- Window functions used efficiently in views
+- Consider adding custom indexes for specific query patterns
 
 ## Support
 
 For issues or questions:
 1. Check deployment logs: `~/logs/deployment_*.log`
 2. Review service logs via Makefile commands
-3. Verify configuration in `.env` and `.pgpass`
+3. Verify RDS security group settings
+4. Check `.env` and `.pgpass` configuration
+5. Run validation: `./deploy/deploy.sh --start-from 200`
 
 ## License
 

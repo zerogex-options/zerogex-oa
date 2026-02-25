@@ -30,6 +30,11 @@ help: ## Show this help message
 	@echo "$(BLUE)ZeroGEX Management & Database Shortcuts$(NC)"
 	@echo "=========================================="
 	@echo ""
+	@echo "$(GREEN)Platform Deployment:$(NC)"
+	@echo "  make deploy             - Deploy Options Analytics platform"
+	@echo "  make deploy-from        - Deploy Options Analytics platform (start-from)"
+	@echo "  make deploy-validate    - Validate Options Analytics platform deployment"
+	@echo ""
 	@echo "$(GREEN)Ingestion Service Management:$(NC)"
 	@echo "  make ingestion-start    - Start the ingestion service"
 	@echo "  make ingestion-stop     - Stop the ingestion service"
@@ -131,6 +136,26 @@ help: ## Show this help message
 	@echo "$(GREEN)Interactive:$(NC)"
 	@echo "  make psql               - Open PostgreSQL shell"
 	@echo "  make query SQL=\"...\"    - Run custom query"
+
+
+# =============================================================================
+# Platform Deployment
+# =============================================================================
+
+.PHONY: deploy
+deploy: ## Deploy Options Analytics platform
+	@echo "$(GREEN)Deploying ZeroGEX Options Analytics Platform to ~/zerogex-oa...$(NC)"
+	@./deploy/deploy.sh
+
+.PHONY: deploy-from
+deploy-from: ## Deploy Options Analytics platform from step (use: make deploy-from STEP="<step>")
+	@echo "$(GREEN)Deploying ZeroGEX Options Analytics Platform to ~/zerogex-oa starting from step $(STEP)...$(NC)"
+	@./deploy/deploy.sh --start-from "$(STEP)"
+
+.PHONY: deploy-validate
+deploy-validate: ## Validate Options Analytics platform deployment
+	@echo "$(GREEN)Validating Options Analytics platform deployment...$(NC)"
+	@./deploy/deploy.sh --start-from "validation"
 
 # =============================================================================
 # Ingestion Service Management
