@@ -83,7 +83,7 @@ def _initialize_connection_pool():
     # Get database configuration from environment
     db_host = os.getenv('DB_HOST', 'localhost')
     db_port = int(os.getenv('DB_PORT', '5432'))
-    db_name = os.getenv('DB_NAME', 'zerogex')
+    db_name = os.getenv('DB_NAME', 'zerogexdb')
     db_user = os.getenv('DB_USER', 'postgres')
     min_connections = int(os.getenv('DB_POOL_MIN', '1'))
     max_connections = int(os.getenv('DB_POOL_MAX', '10'))

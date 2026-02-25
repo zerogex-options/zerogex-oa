@@ -36,7 +36,7 @@ log "  → Upgrading pip..."
 pip install --upgrade pip
 
 # Install the package in editable mode (this installs all dependencies)
-log "  → Installing zerogex package with dependencies..."
+log "  → Installing zerogex-oa package with dependencies..."
 pip install -e .
 
 # Install all optional dependencies for full functionality
