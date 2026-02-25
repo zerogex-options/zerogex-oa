@@ -766,6 +766,7 @@ zerogex-oa/
 | `CLOSED_HOURS_POLL_INTERVAL` | Poll interval when market closed (seconds) | `300` |
 | `STRIKE_RECALC_INTERVAL` | Strike recalculation frequency (iterations) | `10` |
 | `PRICE_MOVE_THRESHOLD` | Price change to trigger recalc (dollars) | `1.0` |
+| `SESSION_TEMPLATE` | Session template for streaming data | `Default` |
 
 ### Aggregation Configuration
 

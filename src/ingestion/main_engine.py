@@ -539,6 +539,10 @@ def main():
     parser.add_argument("--strike-distance", type=float,
                        default=float(os.getenv("INGEST_STRIKE_DISTANCE", "10.0")),
                        help="Strike distance (default: 10.0)")
+    parser.add_argument("--session-template", 
+                       default=os.getenv("SESSION_TEMPLATE", "Default"),
+                       choices=["Default", "USEQPre", "USEQ24Hour"],
+                       help="Session template (default: Default)")
     parser.add_argument("--debug", action="store_true",
                        help="Enable debug logging")
 

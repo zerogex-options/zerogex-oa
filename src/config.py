@@ -56,6 +56,10 @@ PRICE_MOVE_THRESHOLD = float(os.getenv("PRICE_MOVE_THRESHOLD", "1.0"))  # dollar
 # Memory Management
 STRIKE_CLEANUP_INTERVAL = int(os.getenv("STRIKE_CLEANUP_INTERVAL", "100"))  # iterations
 
+# Session template for market data
+# Options: "Default" (9:30-16:00), "USEQPre" (4:00-9:30), "USEQ24Hour" (4:00-20:00)
+SESSION_TEMPLATE = os.getenv("SESSION_TEMPLATE", "Default")
+
 # =============================================================================
 # Aggregation Configuration
 # =============================================================================

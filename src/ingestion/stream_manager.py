@@ -28,6 +28,7 @@ from src.config import (
     STRIKE_RECALC_INTERVAL,
     PRICE_MOVE_THRESHOLD,
     STRIKE_CLEANUP_INTERVAL,
+    SESSION_TEMPLATE,
 )
 
 logger = get_logger(__name__)
@@ -81,7 +82,7 @@ class StreamManager:
                 interval=1,
                 unit="Minute",
                 barsback=1,
-                sessiontemplate="USEQPre",  # Include pre/post market
+                sessiontemplate=SESSION_TEMPLATE,
                 warn_if_closed=False
             )
 
