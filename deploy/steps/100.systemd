@@ -1,0 +1,127 @@
+#!/bin/bash
+
+# ==============================================
+# Step 070: Systemd Services Setup
+# ==============================================
+
+set -e
+
+log "Systemd Services Setup"
+
+# Define paths
+APP_DIR="$HOME/zerogex-oa"
+SYSTEMD_SOURCE="$APP_DIR/setup/systemd"
+SYSTEMD_TARGET="/etc/systemd/system"
+
+# Check if application directory exists
+if [ ! -d "$APP_DIR" ]; then
+    log "  ✗ Application directory not found: $APP_DIR"
+    exit 1
+fi
+
+# Check if systemd service files exist
+if [ ! -d "$SYSTEMD_SOURCE" ]; then
+    log "  ✗ Systemd configuration directory not found: $SYSTEMD_SOURCE"
+    exit 1
+fi
+
+# List of expected services
+SERVICES=(
+    "zerogex-oa-ingestion"
+    "zerogex-oa-analytics"
+)
+
+# Copy systemd service files
+log "  → Copying systemd service files..."
+for service in "${SERVICES[@]}"; do
+    if [ -f "$SYSTEMD_SOURCE/${service}.service" ]; then
+        sudo cp "$SYSTEMD_SOURCE/${service}.service" "$SYSTEMD_TARGET/"
+        log "     ✓ ${service}.service"
+    else
+        log "     ⚠ Warning: ${service}.service not found"
+    fi
+done
+
+# Reload systemd daemon
+log "  → Reloading systemd daemon..."
+sudo systemctl daemon-reload
+
+# Enable services
+log "  → Enabling services to start on boot..."
+for service in "${SERVICES[@]}"; do
+    if [ -f "$SYSTEMD_TARGET/${service}.service" ]; then
+        log "     • Enabling ${service}..."
+        sudo systemctl enable "${service}"
+    fi
+done
+
+# Start services
+log "  → Starting services..."
+for service in "${SERVICES[@]}"; do
+    if [ -f "$SYSTEMD_TARGET/${service}.service" ]; then
+        log "     • Starting ${service}..."
+        if sudo systemctl start "${service}"; then
+            sleep 2
+            if sudo systemctl is-active --quiet "${service}"; then
+                log "       ✓ ${service} started successfully"
+            else
+                log "       ✗ ${service} failed to start"
+            fi
+        else
+            log "       ✗ Failed to start ${service}"
+        fi
+    fi
+done
+
+# Wait a moment for services to initialize
+sleep 3
+
+# Check status of each service
+log ""
+log "  → Service Status Check:"
+log ""
+for service in "${SERVICES[@]}"; do
+    if [ -f "$SYSTEMD_TARGET/${service}.service" ]; then
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log "  Service: ${service}"
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        sudo systemctl status "${service}" --no-pager -l || true
+        log ""
+    fi
+done
+
+# Summary of running services
+log "Systemd services setup complete!"
+log ""
+log "Summary:"
+log "  ✓ Service files copied to $SYSTEMD_TARGET"
+log "  ✓ Systemd daemon reloaded"
+
+# Check which services are actually running
+RUNNING_COUNT=0
+for service in "${SERVICES[@]}"; do
+    if sudo systemctl is-active --quiet "${service}"; then
+        log "  ✓ ${service} is running"
+        ((++RUNNING_COUNT))
+    else
+        log "  ✗ ${service} is not running"
+    fi
+done
+
+log ""
+log "Useful commands (via Makefile):"
+log "  • make ingestion-start        - Start ingestion service"
+log "  • make ingestion-stop         - Stop ingestion service"
+log "  • make ingestion-logs         - View live ingestion logs"
+log "  • make analytics-start        - Start analytics service"
+log "  • make analytics-stop         - Stop analytics service"
+log "  • make analytics-logs         - View live analytics logs"
+log ""
+log "Or use systemctl directly:"
+log "  • sudo systemctl status zerogex-oa-ingestion"
+log "  • sudo journalctl -u zerogex-oa-ingestion -f"
+log ""
+
+if [ "$RUNNING_COUNT" -lt "${#SERVICES[@]}" ]; then
+    log "⚠ Warning: Not all services are running. Check logs for details."
+fi

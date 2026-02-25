@@ -1,0 +1,122 @@
+#!/bin/bash
+
+# ==============================================
+# Step 030: Application Setup and Initialization
+# ==============================================
+
+set -e
+
+log "Application Setup and Initialization"
+
+# Define application directory
+APP_DIR="$HOME/zerogex-oa"
+
+# Check if application directory exists
+if [ ! -d "$APP_DIR" ]; then
+    log "  ✗ Application directory not found: $APP_DIR"
+    log "     Please clone the repository first:"
+    log "     git clone <your-repo-url> $APP_DIR"
+    exit 1
+fi
+
+# Navigate to application directory
+log "  → Navigating to application directory..."
+cd "$APP_DIR"
+
+# Create virtual environment
+log "  → Creating Python virtual environment..."
+python3 -m venv venv
+
+# Activate virtual environment
+log "  → Activating virtual environment..."
+source venv/bin/activate
+
+# Upgrade pip
+log "  → Upgrading pip..."
+pip install --upgrade pip
+
+# Install the package in editable mode (this installs all dependencies)
+log "  → Installing zerogex package with dependencies..."
+pip install -e .
+
+# Install all optional dependencies for full functionality
+log "  → Installing all optional dependencies..."
+pip install -e ".[all]"
+
+# Verify key packages
+log "  → Verifying key packages..."
+python -c "
+import psycopg2
+import pandas
+import numpy
+import scipy
+from scipy import stats
+import pytz
+import requests
+print('✓ Core packages verified')
+" 2>/dev/null || {
+    log "  ⚠ Some packages may not have installed correctly"
+}
+
+# Create .env file if it doesn't exist
+ENV_FILE="$APP_DIR/.env"
+if [ ! -f "$ENV_FILE" ]; then
+    log "  → Creating .env file from template..."
+    cp "$APP_DIR/.env.example" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    
+    log "  → Configuring TradeStation API credentials..."
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  TradeStation API Setup"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "  Please provide your TradeStation API credentials."
+    echo "  You can find these in the API welcome packet you received from TradeStation."
+    echo ""
+
+    # Prompt for API client ID
+    read -p "  TradeStation Client ID (aka API Key): " TS_API_KEY
+    while [ -z "$TS_API_KEY" ]; do
+        echo "     ✗ Client ID cannot be empty"
+        read -p "  TradeStation Client ID: " TS_API_KEY
+    done
+
+    # Prompt for API secret
+    read -s -p "  TradeStation API Secret: " TS_API_SECRET
+    echo ""
+    while [ -z "$TS_API_SECRET" ]; do
+        echo "     ✗ API Secret cannot be empty"
+        read -s -p "  TradeStation API Secret: " TS_API_SECRET
+        echo ""
+    done
+
+    # Update TradeStation credentials in .env file
+    log ""
+    log "  → Updating .env file with TradeStation credentials..."
+
+    sed -i "s/^TRADESTATION_CLIENT_ID=.*/TRADESTATION_CLIENT_ID=${TS_API_KEY}/" "$ENV_FILE"
+    sed -i "s/^TRADESTATION_CLIENT_SECRET=.*/TRADESTATION_CLIENT_SECRET=${TS_API_SECRET}/" "$ENV_FILE"
+    
+    log "     ✓ .env file created at: $ENV_FILE"
+    log "     ✓ TradeStation credentials securely stored"
+
+else
+    log "     ℹ .env file already exists, skipping configuration..."
+    log "     If you need to update TradeStation credentials, edit: $ENV_FILE"
+fi
+
+# Deactivate virtual environment
+deactivate
+
+log "Application setup complete!"
+log ""
+log "Summary:"
+log "  ✓ Virtual environment created"
+log "  ✓ ZeroGEX package installed (editable mode)"
+log "  ✓ All dependencies installed"
+log "  ✓ .env file ready for configuration"
+log ""
+log "Next steps:"
+log "  1. Run step 040 to initialize tokens"
+log ""

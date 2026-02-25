@@ -1,0 +1,116 @@
+#!/bin/bash
+
+# ==============================================
+# Step 040: TradeStation Auth Initialization
+# ==============================================
+
+set -e
+
+log "TradeStation Token Initialization"
+
+# Define paths
+APP_DIR="$HOME/zerogex-oa"
+TOKEN_SCRIPT="$APP_DIR/setup/app/get_tradestation_tokens.py"
+ENV_FILE="$APP_DIR/.env"
+
+# Check if application directory exists
+if [ ! -d "$APP_DIR" ]; then
+    log "  ✗ Application directory not found: $APP_DIR"
+    exit 1
+fi
+
+# Check if token script exists
+if [ ! -f "$TOKEN_SCRIPT" ]; then
+    log "  ✗ TradeStation token script not found: $TOKEN_SCRIPT"
+    exit 1
+fi
+
+# Check if .env file exists
+if [ ! -f "$ENV_FILE" ]; then
+    log "  ✗ .env file not found: $ENV_FILE"
+    log "     Run step 030.application first"
+    exit 1
+fi
+
+# Check if TradeStation credentials are configured
+log "  → Checking TradeStation API configuration..."
+if grep -q "your_api_key_here" "$ENV_FILE" || grep -q "your_api_secret_here" "$ENV_FILE"; then
+    echo ""
+    echo "  ⚠ TradeStation API credentials not configured!"
+    echo ""
+    echo "  Please update your .env file with TradeStation credentials:"
+    echo "    TRADESTATION_CLIENT_ID=<your_client_id>"
+    echo "    TRADESTATION_CLIENT_SECRET=<your_client_secret>"
+    echo ""
+    echo "  Edit the file now: vi $ENV_FILE"
+    echo ""
+    read -p "  Press Enter after updating credentials, or Ctrl+C to skip..."
+    echo ""
+fi
+
+# Activate virtual environment
+log "  → Activating virtual environment..."
+cd "$APP_DIR"
+if [ ! -d "venv" ]; then
+    log "  ✗ Virtual environment not found"
+    log "     Run step 030.application first"
+    exit 1
+fi
+source venv/bin/activate
+
+# Run the token initialization script
+log "  → Running TradeStation token initialization..."
+log ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  INTERACTIVE MODE"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "  This script will guide you through the TradeStation OAuth flow."
+echo "  You will need to:"
+echo "    1. Authorize the application in your browser"
+echo "    2. Copy the authorization code from the redirect URL"
+echo "    3. Paste it when prompted"
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+# Run the Python script
+if python "$TOKEN_SCRIPT"; then
+    log ""
+    log "  ✓ TradeStation tokens obtained successfully!"
+else
+    log ""
+    log "  ✗ Failed to obtain TradeStation tokens"
+    log ""
+    log "  Common issues:"
+    log "    • API credentials not configured correctly in .env"
+    log "    • Authorization code expired (try again quickly)"
+    log "    • Network connectivity issues"
+    log "    • TradeStation API service issues"
+    log ""
+    log "  You can retry this step later by running:"
+    log "    cd $APP_DIR && source venv/bin/activate"
+    log "    python initialize/get_tradestation_tokens.py"
+    log ""
+    read -p "  Continue with deployment anyway? (y/N): " continue_choice
+    if [[ ! "$continue_choice" =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+    log "  ⚠ Continuing without TradeStation tokens..."
+fi
+
+# Deactivate virtual environment
+deactivate
+
+log ""
+log "TradeStation token initialization complete!"
+log ""
+log "Summary:"
+log "  ✓ Token initialization script executed"
+log "  ✓ Tokens stored (if successful)"
+log ""
+log "Note:"
+log "  • Tokens are typically stored in a secure location"
+log "  • Refresh tokens allow automatic token renewal"
+log "  • If tokens expire, re-run: python setup/app/get_tradestation_tokens.py"
+log ""

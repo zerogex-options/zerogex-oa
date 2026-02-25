@@ -1,0 +1,94 @@
+#!/bin/bash
+
+# ==============================================
+# Step 015: Data Volume Setup
+# ==============================================
+
+set -e
+
+log "Data Volume Setup"
+
+# Check if we have a secondary volume available
+SECONDARY_VOLUME=$(lsblk -ndo NAME,SIZE,TYPE,MOUNTPOINT | grep -E "nvme1n1|xvdb|sdb" | grep "disk" | grep -v "/" | awk '{print "/dev/"$1}' | head -1)
+
+if [ -z "$SECONDARY_VOLUME" ]; then
+    log "  ℹ No secondary volume detected"
+    log "     Using root volume for all data"
+    log "     Creating directories on root volume..."
+
+    # Create directories on root volume
+    sudo mkdir -p /data/monitoring
+    sudo mkdir -p /data/backups
+    sudo chown ubuntu:ubuntu /data/monitoring
+    sudo chown ubuntu:ubuntu /data/backups
+
+    log "  ✓ Data directories created on root volume"
+    exit 0
+fi
+
+log "  → Secondary volume detected: $SECONDARY_VOLUME"
+
+# Check if already mounted
+if mount | grep -q "^$SECONDARY_VOLUME"; then
+    MOUNT_POINT=$(mount | grep "^$SECONDARY_VOLUME" | awk '{print $3}')
+    log "  ℹ Volume already mounted at $MOUNT_POINT"
+
+    # If mounted somewhere other than /data, this is unexpected
+    if [ "$MOUNT_POINT" != "/data" ]; then
+        log "  ⚠ Warning: Volume mounted at unexpected location: $MOUNT_POINT"
+    fi
+else
+    # Format volume if needed
+    if sudo blkid "$SECONDARY_VOLUME" | grep -q "TYPE="; then
+        log "  → Volume already formatted"
+    else
+        log "  → Formatting volume as ext4..."
+        sudo mkfs.ext4 -F "$SECONDARY_VOLUME"
+    fi
+
+    # Create mount point
+    log "  → Creating /data mount point..."
+    sudo mkdir -p /data
+
+    # Mount the volume
+    log "  → Mounting volume..."
+    sudo mount "$SECONDARY_VOLUME" /data
+
+    # Add to fstab for persistence
+    if ! grep -q "$SECONDARY_VOLUME" /etc/fstab; then
+        log "  → Adding to /etc/fstab for persistence..."
+        echo "$SECONDARY_VOLUME /data ext4 defaults,nofail 0 2" | sudo tee -a /etc/fstab
+    fi
+
+    log "  ✓ Volume mounted at /data"
+fi
+
+# Set ownership on /data
+sudo chown ubuntu:ubuntu /data
+
+# Create data subdirectories
+log "  → Creating data subdirectories..."
+sudo mkdir -p /data/monitoring
+sudo mkdir -p /data/backups
+
+# Set ownership
+sudo chown ubuntu:ubuntu /data/monitoring
+sudo chown ubuntu:ubuntu /data/backups
+
+log "  ✓ Data directories created"
+
+# Get available space
+AVAILABLE_SPACE=$(df -h /data | tail -1 | awk '{print $4}')
+
+log ""
+log "Data volume setup complete!"
+log ""
+log "Summary:"
+log "  ✓ Data volume: $SECONDARY_VOLUME"
+log "  ✓ Mount point: /data"
+log "  ✓ Available space: $AVAILABLE_SPACE"
+log "  ✓ Directories:"
+log "      - /data/monitoring (for monitoring JSON files)"
+log "      - /data/backups (for database backups)"
+log "      - /data/postgresql (for PostgreSQL data - will be configured in next step)"
+log ""

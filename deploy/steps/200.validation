@@ -1,0 +1,238 @@
+#!/bin/bash
+
+# ==============================================
+# Step 080: Deployment Validation
+# ==============================================
+
+set -e
+
+log "Deployment Validation"
+
+APP_DIR="$HOME/zerogex-oa"
+
+# Validation results tracking
+TOTAL_CHECKS=0
+PASSED_CHECKS=0
+FAILED_CHECKS=0
+WARNING_CHECKS=0
+
+# Check function
+check_service() {
+    TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+    local service_name=$1
+    local display_name=$2
+
+    if systemctl is-active --quiet "$service_name"; then
+        log "  ✓ $display_name: $(systemctl is-active "$service_name")"
+        PASSED_CHECKS=$((PASSED_CHECKS + 1))
+        return 0
+    else
+        log "  ✗ $display_name: $(systemctl is-active "$service_name")"
+        FAILED_CHECKS=$((FAILED_CHECKS + 1))
+        return 1
+    fi
+}
+
+# Section 1: Service Status
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "1. Service Status Checks"
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+check_service "zerogex-oa-ingestion" "Ingestion Service"
+check_service "zerogex-oa-analytics" "Analytics Service"
+check_service "postgresql" "PostgreSQL Database"
+log ""
+
+# Section 2: Database Connection
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "2. Database Connection Test"
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+if psql -h localhost -U zerogex_user -d zerogex -c "SELECT NOW();" > /dev/null 2>&1; then
+    DB_TIME=$(psql -h localhost -U zerogex_user -d zerogex -t -c "SELECT NOW();")
+    log "  ✓ Database connection successful"
+    log "     Database time: $DB_TIME"
+    PASSED_CHECKS=$((PASSED_CHECKS + 1))
+else
+    log "  ✗ Database connection failed"
+    FAILED_CHECKS=$((FAILED_CHECKS + 1))
+fi
+log ""
+
+# Section 3: Database Tables
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "3. Database Schema Validation"
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+TABLES=(
+    "symbols"
+    "underlying_quotes"
+    "option_chains"
+    "gex_summary"
+    "gex_by_strike"
+)
+
+for table in "${TABLES[@]}"; do
+    TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+    if psql -h localhost -U zerogex_user -d zerogex -t -c "\dt $table" 2>/dev/null | grep -q "$table"; then
+        log "  ✓ Table exists: $table"
+        PASSED_CHECKS=$((PASSED_CHECKS + 1))
+    else
+        log "  ⚠ Table not found: $table"
+        WARNING_CHECKS=$((WARNING_CHECKS + 1))
+    fi
+done
+log ""
+
+# Section 4: Views
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "4. Database Views"
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+VIEWS=(
+    "underlying_quotes_with_deltas"
+    "option_chains_with_deltas"
+    "option_flow_by_type"
+    "option_flow_smart_money"
+)
+
+for view in "${VIEWS[@]}"; do
+    TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+    if psql -h localhost -U zerogex_user -d zerogex -t -c "\dv $view" 2>/dev/null | grep -q "$view"; then
+        log "  ✓ View exists: $view"
+        PASSED_CHECKS=$((PASSED_CHECKS + 1))
+    else
+        log "  ⚠ View not found: $view"
+        WARNING_CHECKS=$((WARNING_CHECKS + 1))
+    fi
+done
+log ""
+
+# Section 5: Python Environment
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "5. Python Environment"
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+if [ -d "$APP_DIR/venv" ]; then
+    log "  ✓ Virtual environment exists"
+    PASSED_CHECKS=$((PASSED_CHECKS + 1))
+    
+    # Check key packages
+    cd "$APP_DIR"
+    source venv/bin/activate
+    
+    PACKAGES=("psycopg2" "pandas" "numpy" "scipy" "requests" "pytz")
+    for package in "${PACKAGES[@]}"; do
+        TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+        if python -c "import $package" 2>/dev/null; then
+            log "  ✓ Package installed: $package"
+            PASSED_CHECKS=$((PASSED_CHECKS + 1))
+        else
+            log "  ✗ Package missing: $package"
+            FAILED_CHECKS=$((FAILED_CHECKS + 1))
+        fi
+    done
+    
+    deactivate
+else
+    log "  ✗ Virtual environment not found"
+    FAILED_CHECKS=$((FAILED_CHECKS + 1))
+fi
+log ""
+
+# Section 6: Configuration Files
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "6. Configuration Files"
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+CONFIG_FILES=(
+    "$HOME/.pgpass"
+    "$APP_DIR/.env"
+)
+
+for config_file in "${CONFIG_FILES[@]}"; do
+    TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+    if [ -f "$config_file" ]; then
+        log "  ✓ Config file exists: $config_file"
+        PASSED_CHECKS=$((PASSED_CHECKS + 1))
+    else
+        log "  ✗ Missing config file: $config_file"
+        FAILED_CHECKS=$((FAILED_CHECKS + 1))
+    fi
+done
+log ""
+
+# Section 7: Recent Data Check
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "7. Recent Data Check"
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# Check for SPY symbol
+TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+SPY_COUNT=$(psql -h localhost -U zerogex_user -d zerogex -t -c "SELECT COUNT(*) FROM symbols WHERE symbol = 'SPY';" 2>/dev/null | xargs || echo "0")
+if [ "$SPY_COUNT" -gt 0 ]; then
+    log "  ✓ SPY symbol configured"
+    PASSED_CHECKS=$((PASSED_CHECKS + 1))
+else
+    log "  ⚠ SPY symbol not yet configured"
+    WARNING_CHECKS=$((WARNING_CHECKS + 1))
+fi
+
+# Check for recent data
+TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+RECENT_DATA=$(psql -h localhost -U zerogex_user -d zerogex -t -c "SELECT COUNT(*) FROM underlying_quotes WHERE timestamp > NOW() - INTERVAL '1 hour';" 2>/dev/null | xargs || echo "0")
+if [ "$RECENT_DATA" -gt 0 ]; then
+    log "  ✓ Recent data found: $RECENT_DATA rows (last hour)"
+    PASSED_CHECKS=$((PASSED_CHECKS + 1))
+else
+    log "  ⚠ No recent data (normal if just started or market closed)"
+    WARNING_CHECKS=$((WARNING_CHECKS + 1))
+fi
+log ""
+
+# Section 8: Service Logs
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "8. Recent Service Logs (Last 5 lines)"
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log ""
+log "Ingestion Service:"
+sudo journalctl -u zerogex-oa-ingestion -n 5 --no-pager || log "  (no logs yet)"
+log ""
+log "Analytics Service:"
+sudo journalctl -u zerogex-oa-analytics -n 5 --no-pager || log "  (no logs yet)"
+log ""
+
+# Final Summary
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "VALIDATION SUMMARY"
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log ""
+log "Total Checks: $TOTAL_CHECKS"
+log "Passed: $PASSED_CHECKS"
+log "Warnings: $WARNING_CHECKS"
+log "Failed: $FAILED_CHECKS"
+log ""
+
+if [ "$FAILED_CHECKS" -eq 0 ]; then
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log "✓ Deployment validation PASSED!"
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log ""
+    log "ZeroGEX-OA platform is ready!"
+    
+    if [ "$WARNING_CHECKS" -gt 0 ]; then
+        log ""
+        log "Note: Some warnings detected (normal for fresh deployment)"
+    fi
+else
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log "✗ Deployment validation FAILED!"
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log ""
+    log "Please review failed checks and resolve issues."
+    exit 1
+fi
+
+log ""
+log "Deployment validation complete!"
+log ""

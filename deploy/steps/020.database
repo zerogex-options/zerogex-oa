@@ -1,0 +1,191 @@
+#!/bin/bash
+
+# ==============================================
+# Step 020: Database Setup (AWS RDS)
+# ==============================================
+
+set -e
+
+log "Database Setup (AWS RDS)"
+
+# Define .pgpass file path and initialize variables
+# needed in full scope
+PGPASS_FILE="$HOME/.pgpass"
+DB_HOST=""
+DB_PORT=""
+DB_NAME=""
+DB_USER=""
+
+# Install PostgreSQL client tools for psql
+log "  → Installing PostgreSQL client tools..."
+sudo apt install -y postgresql-client
+
+# Create .pgpass file if it doesn't exist
+if [ ! -f "$PGPASS_FILE" ]; then
+    log ""
+    log "  → AWS RDS Database Configuration"
+    log "     You will need the following information from your RDS instance:"
+    log "       - Endpoint (hostname)"
+    log "       - Port (usually 5432)"
+    log "       - Database name"
+    log "       - Master username"
+    log "       - Master password"
+    log ""
+
+    # Prompt for RDS connection details
+    read -p "  RDS Endpoint (e.g., mydb.123456.us-east-1.rds.amazonaws.com): " DB_HOST
+    while [ -z "$DB_HOST" ]; do
+        echo "     ✗ Endpoint cannot be empty"
+        read -p "  RDS Endpoint: " DB_HOST
+    done
+
+    read -p "  Port [5432]: " DB_PORT
+    DB_PORT=${DB_PORT:-5432}
+
+    read -p "  Database Name [zerogex]: " DB_NAME
+    DB_NAME=${DB_NAME:-zerogex}
+
+    read -p "  Username [postgres]: " DB_USER
+    DB_USER=${DB_USER:-postgres}
+
+    read -s -p "  Password: " DB_PASSWORD
+    echo ""
+    while [ -z "$DB_PASSWORD" ]; do
+        echo "     ✗ Password cannot be empty"
+        read -s -p "  Password: " DB_PASSWORD
+        echo ""
+    done
+
+    # Test connection
+    log ""
+    log "  → Testing database connection..."
+    export PGPASSWORD="$DB_PASSWORD"
+    if psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "SELECT NOW();" > /dev/null 2>&1; then
+        log "     ✓ Database connection successful!"
+    else
+        log "     ✗ Database connection failed!"
+        log "     Please check your credentials and RDS security group settings."
+        log "     Ensure your EC2 instance's security group is allowed to connect to RDS."
+        exit 1
+    fi
+
+    # Create .pgpass file for passwordless access
+    log "  → Creating .pgpass file for passwordless access..."
+    cat > "$PGPASS_FILE" << EOF
+${DB_HOST}:${DB_PORT}:${DB_NAME}:${DB_USER}:${DB_PASSWORD}
+EOF
+    chmod 600 "$PGPASS_FILE"
+    log "     ✓ .pgpass file created"
+else
+    # Parse contents of .pgpass file
+    DB_HOST=`cat $PGPASS_FILE | awk -F\: '{print $1}'`
+    DB_PORT=`cat $PGPASS_FILE | awk -F\: '{print $2}'`
+    DB_USER=`cat $PGPASS_FILE | awk -F\: '{print $4}'`
+    DB_NAME=`cat $PGPASS_FILE | awk -F\: '{print $3}'`
+fi
+
+# Verify .pgpass works
+log "  → Verifying .pgpass configuration..."
+unset PGPASSWORD
+
+if psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "SELECT NOW();" > /dev/null 2>&1; then
+    log "     ✓ Passwordless connection works!"
+else
+    log "     ✗ Passwordless connection failed!"
+    exit 1
+fi
+
+# Check if TimescaleDB extension exists (RDS must have it enabled)
+log "  → Checking for TimescaleDB extension..."
+if psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -t -c "SELECT 1 FROM pg_extension WHERE extname = 'timescaledb';" | grep -q 1; then
+    log "     ✓ TimescaleDB extension already enabled"
+else
+    log "     ℹ TimescaleDB extension not found, attempting to enable..."
+    if psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;" 2>&1 | tee /tmp/timescale_output.log; then
+        log "     ✓ TimescaleDB extension enabled"
+    else
+        log "     ⚠ Could not enable TimescaleDB extension"
+        log "     This is normal if your RDS instance doesn't have TimescaleDB installed."
+        log "     ZeroGEX will still work, but without TimescaleDB optimizations."
+        log "     To enable TimescaleDB on RDS, see: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL_TimescaleDB.html"
+    fi
+fi
+
+# Apply database schema
+log "  → Applying database schema..."
+APP_DIR="$HOME/zerogex-oa"
+SCHEMA_FILE="$APP_DIR/setup/database/schema.sql"
+
+if [ -f "$SCHEMA_FILE" ]; then
+    if psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f "$SCHEMA_FILE"; then
+        log "     ✓ Database schema applied successfully!"
+    else
+        log "     ✗ Failed to apply schema"
+        exit 1
+    fi
+else
+    log "     ✗ Schema file not found: $SCHEMA_FILE"
+    exit 1
+fi
+
+# Verify schema was applied
+log "  → Verifying schema..."
+TABLE_COUNT=$(psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('symbols', 'underlying_quotes', 'option_chains', 'gex_summary', 'gex_by_strike');" | xargs)
+
+if [ "$TABLE_COUNT" -eq 5 ]; then
+    log "     ✓ All core tables created successfully"
+else
+    log "     ⚠ Warning: Expected 5 core tables, found $TABLE_COUNT"
+fi
+
+# Setup data retention cron job
+log "  → Setting up data retention cron job..."
+
+# Ensure log directory exists
+sudo mkdir -p /var/log/zerogex
+sudo chown $(whoami):$(whoami) /var/log/zerogex
+
+# Define cron job
+CRON_JOB="0 2 * * * psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} -d ${DB_NAME} -c \"SELECT * FROM cleanup_old_data();\" >> /var/log/zerogex/cleanup.log 2>&1"
+
+# Check if cron job already exists
+if crontab -l 2>/dev/null | grep -q "cleanup_old_data"; then
+    log "     ℹ Data retention cron job already exists, skipping..."
+else
+    (crontab -l 2>/dev/null; echo "$CRON_JOB") | crontab -
+    log "     ✓ Data retention cron job added (runs daily at 2:00 AM)"
+fi
+
+# Verify cron job installation
+if crontab -l 2>/dev/null | grep -q "cleanup_old_data"; then
+    log "     ✓ Cron job verified successfully"
+else
+    log "     ⚠ Warning: Cron job verification failed"
+fi
+
+log ""
+log "Database setup complete!"
+log ""
+log "Summary:"
+log "  ✓ PostgreSQL client tools installed"
+log "  ✓ Connection to AWS RDS verified"
+log "  ✓ Database schema applied"
+log "  ✓ .pgpass file created for passwordless access"
+log "  ✓ Data retention cron job scheduled"
+log ""
+log "Connection Details:"
+log "  Host: $DB_HOST"
+log "  Port: $DB_PORT"
+log "  Database: $DB_NAME"
+log "  User: $DB_USER"
+log "  Password: (stored in ~/.pgpass)"
+log ""
+log "Data Retention:"
+log "  Cleanup Job: Daily at 2:00 AM ET"
+log "  Retention: 90 days for data tables"
+log "  Logs: /var/log/zerogex/cleanup.log"
+log ""
+log "Next Steps:"
+log "  1. Ensure your .env file has DB_PASSWORD_PROVIDER=pgpass"
+log "  2. Verify RDS security group allows connections from this EC2 instance"
+log ""
