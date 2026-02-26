@@ -53,15 +53,27 @@ help: ## Show this help message
 	@echo "  make analytics-disable  - Disable analytics service from starting on boot"
 	@echo "  make analytics-health   - Show analytics service health and recent errors"
 	@echo ""
+	@echo "$(GREEN)API Server:$(NC)"
+	@echo "  make api-dev             - Run API in development mode (hot reload)"
+	@echo "  make api-prod            - Run API in production mode (4 workers)"
+	@echo "  make api-start           - Start API systemd service"
+	@echo "  make api-stop            - Stop API systemd service"
+	@echo "  make api-restart         - Restart API systemd service"
+	@echo "  make api-status          - Check API service status"
+	@echo "  make api-logs            - View API logs (live)"
+	@echo "  make api-logs-error      - View API error logs only"
+	@echo "  make api-test            - Test API endpoints"
+	@echo "  make api-install-service - Install API as systemd service"
+	@echo ""
 	@echo "$(GREEN)Logs:$(NC)"
-	@echo "  make ingestion-logs          - Show live ingestion logs (Ctrl+C to exit)"
-	@echo "  make ingestion-logs-tail     - Show last 100 ingestion log lines"
-	@echo "  make ingestion-logs-errors   - Show recent ingestion errors"
-	@echo "  make analytics-logs          - Show live analytics logs (Ctrl+C to exit)"
-	@echo "  make analytics-logs-tail     - Show last 100 analytics log lines"
-	@echo "  make analytics-logs-errors   - Show recent analytics errors"
+	@echo "  make ingestion-logs             - Show live ingestion logs (Ctrl+C to exit)"
+	@echo "  make ingestion-logs-tail        - Show last 100 ingestion log lines"
+	@echo "  make ingestion-logs-errors      - Show recent ingestion errors"
+	@echo "  make analytics-logs             - Show live analytics logs (Ctrl+C to exit)"
+	@echo "  make analytics-logs-tail        - Show last 100 analytics log lines"
+	@echo "  make analytics-logs-errors      - Show recent analytics errors"
 	@echo "  make logs-grep PATTERN=\"text\" - Search logs for pattern"
-	@echo "  make logs-clear              - Clear all journalctl logs for services"
+	@echo "  make logs-clear                 - Clear all journalctl logs for services"
 	@echo ""
 	@echo "$(GREEN)Run Components:$(NC)"
 	@echo "  make run-auth           - Test TradeStation authentication"
@@ -102,12 +114,12 @@ help: ## Show this help message
 	@echo "  make gex-preview        - Preview GEX calculation data"
 	@echo ""
 	@echo "$(GREEN)Real-Time Flow Analysis:$(NC)"
-	@echo "  make flow-by-type       - Puts vs calls flow (all strikes/expirations)"
-	@echo "  make flow-by-strike     - Flow by strike level"
-	@echo "  make flow-by-expiration - Flow by expiration date"
-	@echo "  make flow-smart-money   - Unusual activity detection"
+	@echo "  make flow-by-type         - Puts vs calls flow (all strikes/expirations)"
+	@echo "  make flow-by-strike       - Flow by strike level"
+	@echo "  make flow-by-expiration   - Flow by expiration date"
+	@echo "  make flow-smart-money     - Unusual activity detection"
 	@echo "  make flow-buying-pressure - Underlying buying/selling pressure"
-	@echo "  make flow-live          - Combined real-time flow dashboard"
+	@echo "  make flow-live            - Combined real-time flow dashboard"
 	@echo ""
 	@echo "$(GREEN)Day Trading Support:$(NC)"
 	@echo "  make vwap               - VWAP deviation tracker"
@@ -135,7 +147,7 @@ help: ## Show this help message
 	@echo ""
 	@echo "$(GREEN)Interactive:$(NC)"
 	@echo "  make psql               - Open PostgreSQL shell"
-	@echo "  make query SQL=\"...\"    - Run custom query"
+	@echo "  make query SQL=\"...\"  - Run custom query"
 
 
 # =============================================================================
@@ -1456,3 +1468,171 @@ atm-options: ## At-the-money options analysis
 		WHERE o.timestamp = (SELECT MAX(timestamp) FROM option_chains) \
 		AND ABS(o.strike - cp.close) < 5.0 \
 		ORDER BY o.expiration, o.strike, o.option_type;"
+
+# =============================================================================
+# API Server Commands
+# =============================================================================
+
+.PHONY: api-dev
+api-dev: ## Run API server in development mode
+	@echo "$(BLUE)=== Starting API Server (Development) ===$(NC)"
+	@echo "$(YELLOW)API will be available at http://localhost:8000$(NC)"
+	@echo "$(YELLOW)API docs at http://localhost:8000/docs$(NC)"
+	@echo ""
+	uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000
+
+.PHONY: api-prod
+api-prod: ## Run API server in production mode
+	@echo "$(BLUE)=== Starting API Server (Production) ===$(NC)"
+	uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --workers 4
+
+.PHONY: api-start
+api-start: ## Start API systemd service
+	@echo "$(BLUE)=== Starting API Service ===$(NC)"
+	@sudo systemctl start zerogex-oa-api
+	@sleep 2
+	@sudo systemctl status zerogex-oa-api --no-pager
+
+.PHONY: api-stop
+api-stop: ## Stop API systemd service
+	@echo "$(BLUE)=== Stopping API Service ===$(NC)"
+	@sudo systemctl stop zerogex-oa-api
+	@echo "$(GREEN)✅ API service stopped$(NC)"
+
+.PHONY: api-restart
+api-restart: ## Restart API systemd service
+	@echo "$(BLUE)=== Restarting API Service ===$(NC)"
+	@sudo systemctl restart zerogex-oa-api
+	@sleep 2
+	@sudo systemctl status zerogex-oa-api --no-pager
+
+.PHONY: api-status
+api-status: ## Check API service status
+	@sudo systemctl status zerogex-oa-api --no-pager
+
+.PHONY: api-logs
+api-logs: ## View API service logs
+	@sudo journalctl -u zerogex-oa-api -f
+
+.PHONY: api-logs-error
+api-logs-error: ## View API error logs only
+	@sudo journalctl -u zerogex-oa-api -p err -f
+
+.PHONY: api-test
+api-test: ## Test ALL API endpoints
+	@echo "$(BLUE)=== Testing All API Endpoints ===$(NC)"
+	@echo ""
+
+	# Health & Status
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@echo "$(GREEN)Health Check:$(NC)"
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@curl -s http://localhost:8000/api/health | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
+	@echo ""
+
+	# GEX Endpoints
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@echo "$(GREEN)GEX Summary:$(NC)"
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@curl -s http://localhost:8000/api/gex/summary | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
+	@echo ""
+
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@echo "$(GREEN)GEX by Strike (Top 10):$(NC)"
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@curl -s "http://localhost:8000/api/gex/by-strike?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
+	@echo ""
+
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@echo "$(GREEN)GEX Historical (Last 10):$(NC)"
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@curl -s "http://localhost:8000/api/gex/historical?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
+	@echo ""
+
+	# Options Flow Endpoints
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@echo "$(GREEN)Option Flow by Type (Calls vs Puts):$(NC)"
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@curl -s "http://localhost:8000/api/flow/by-type?window_minutes=60" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
+	@echo ""
+
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@echo "$(GREEN)Option Flow by Strike (Top 10):$(NC)"
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@curl -s "http://localhost:8000/api/flow/by-strike?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
+	@echo ""
+
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@echo "$(GREEN)Smart Money Flow (Unusual Activity):$(NC)"
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@curl -s "http://localhost:8000/api/flow/smart-money?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
+	@echo ""
+
+	# Day Trading Endpoints
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@echo "$(GREEN)VWAP Deviation (Mean Reversion):$(NC)"
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@curl -s "http://localhost:8000/api/trading/vwap-deviation?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
+	@echo ""
+
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@echo "$(GREEN)Opening Range Breakout (ORB):$(NC)"
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@curl -s "http://localhost:8000/api/trading/opening-range?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
+	@echo ""
+
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@echo "$(GREEN)Gamma Exposure Levels (Support/Resistance):$(NC)"
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@curl -s "http://localhost:8000/api/trading/gamma-levels?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
+	@echo ""
+
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@echo "$(GREEN)Dealer Hedging Pressure:$(NC)"
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@curl -s "http://localhost:8000/api/trading/dealer-hedging?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
+	@echo ""
+
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@echo "$(GREEN)Unusual Volume Spikes:$(NC)"
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@curl -s "http://localhost:8000/api/trading/volume-spikes?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
+	@echo ""
+
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@echo "$(GREEN)Momentum Divergence Signals:$(NC)"
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@curl -s "http://localhost:8000/api/trading/momentum-divergence?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
+	@echo ""
+
+	# Market Data Endpoints
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@echo "$(GREEN)Current Market Quote:$(NC)"
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@curl -s http://localhost:8000/api/market/quote | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
+	@echo ""
+
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@echo "$(GREEN)Historical Quotes (Last 10):$(NC)"
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@curl -s "http://localhost:8000/api/market/historical?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
+	@echo ""
+
+	# Summary
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@echo "$(GREEN)✅ All API Endpoints Tested$(NC)"
+	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
+	@echo ""
+	@echo "$(YELLOW)API Documentation available at:$(NC)"
+	@echo "  • Swagger UI: http://localhost:8000/docs"
+	@echo "  • ReDoc:      http://localhost:8000/redoc"
+	@echo ""
+
+.PHONY: api-install-service
+api-install-service: ## Install API as systemd service
+	@echo "$(BLUE)=== Installing API Systemd Service ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-api.service /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable zerogex-oa-api
+	@echo "$(GREEN)✅ API service installed$(NC)"
+	@echo "$(YELLOW)Start with: make api-start$(NC)"

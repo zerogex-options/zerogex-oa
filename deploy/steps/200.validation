@@ -52,6 +52,7 @@ log "1. Service Status Checks"
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 check_service "zerogex-oa-ingestion" "Ingestion Service"
 check_service "zerogex-oa-analytics" "Analytics Service"
+check_service "zerogex-oa-api" "API Service"
 log ""
 
 # Section 2: Database Connection
@@ -192,7 +193,7 @@ if [ -d "$APP_DIR/venv" ]; then
     cd "$APP_DIR"
     source venv/bin/activate
 
-    PACKAGES=("psycopg2" "pandas" "numpy" "scipy" "requests" "pytz")
+    PACKAGES=("psycopg2" "pandas" "numpy" "scipy" "requests" "pytz" "fastapi" "uvicorn" "asyncpg" "pydantic")
     for package in "${PACKAGES[@]}"; do
         TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
         if python -c "import $package" 2>/dev/null; then
@@ -239,9 +240,31 @@ for config_file in "${CONFIG_FILES[@]}"; do
 done
 log ""
 
-# Section 9: Recent Data Check
+# Section 9: API Health Check
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-log "9. Recent Data Check"
+log "9. API Health Check"
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+if curl -s -f http://localhost:8000/api/health > /dev/null 2>&1; then
+    log "  ✓ API health endpoint accessible"
+    PASSED_CHECKS=$((PASSED_CHECKS + 1))
+
+    # Show API response
+    log ""
+    log "  API Health Response:"
+    curl -s http://localhost:8000/api/health | python3 -m json.tool 2>/dev/null | head -20 || log "     (could not parse JSON)"
+    log ""
+else
+    log "  ✗ API health endpoint not accessible"
+    log "     API may not be running or still starting"
+    FAILED_CHECKS=$((FAILED_CHECKS + 1))
+fi
+log ""
+
+# Section 10: Recent Data Check
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "10. Recent Data Check"
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # Check for SPY symbol
@@ -268,9 +291,9 @@ else
 fi
 log ""
 
-# Section 10: Service Logs
+# Section 11: Service Logs
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-log "10. Recent Service Logs (Last 5 lines)"
+log "11. Recent Service Logs (Last 5 lines)"
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log ""
 log "Ingestion Service:"
@@ -278,6 +301,9 @@ sudo journalctl -u zerogex-oa-ingestion -n 5 --no-pager || log "  (no logs yet)"
 log ""
 log "Analytics Service:"
 sudo journalctl -u zerogex-oa-analytics -n 5 --no-pager || log "  (no logs yet)"
+log ""
+log "API Service:"
+sudo journalctl -u zerogex-oa-api -n 5 --no-pager || log "  (no logs yet)"
 log ""
 
 # Final Summary
@@ -316,15 +342,17 @@ else
     log "  • Incorrect RDS credentials in .pgpass"
     log "  • TradeStation API credentials not configured"
     log "  • Python packages not installed correctly"
+    log "  • API service not running (check: sudo systemctl status zerogex-oa-api)"
     exit 1
 fi
 
 log ""
 log "Next Steps:"
 log "  1. Add SPY symbol (if not already done)"
-log "  2. Monitor services: make ingestion-logs"
+log "  2. Monitor services: make ingestion-logs, make analytics-logs, make api-logs"
 log "  3. Check data flow: make stats"
-log "  4. View service status: make ingestion-status"
+log "  4. Test API: make api-test"
+log "  5. View API docs: http://localhost:8000/docs"
 log ""
 log "Deployment validation complete!"
 log ""

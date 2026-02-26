@@ -54,7 +54,7 @@ if [ -d "$ZEROGEX_HOME" ]; then
   alias zerogex-oa="cd $ZEROGEX_HOME && source venv/bin/activate"
   echo "╔════════════════════════════════════════╗"
   echo "║  ZeroGEX-OA Environment Available      ║"
-  echo "║  Run 'zerogex-oa' to activate             ║"
+  echo "║  Run 'zerogex-oa' to activate          ║"
   echo "╚════════════════════════════════════════╝"
 fi
 EOF

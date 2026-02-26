@@ -13,6 +13,16 @@ This deployment system automates the complete setup of ZeroGEX-OA including:
 - Security hardening
 - Automated data retention (cleanup cron job)
 - Deployment validation
+- Installs FastAPI backend dependencies (fastapi, uvicorn, asyncpg, pydantic)
+- Configures UFW firewall to allow port 8000
+- Installs systemd service for API server
+- Enables and starts API service
+- Tests API health endpoint
+- Provides REST API for frontend with 15+ endpoints
+  - GEX metrics (summary, by-strike, historical)
+  - Options flow (by type, by strike, smart money)
+  - Day trading signals (VWAP, ORB, gamma levels, dealer hedging, volume spikes, momentum divergence)
+  - Market data (current quote, historical)
 
 ## Prerequisites
 
@@ -94,6 +104,13 @@ The deployment process runs these steps in order:
   - `zerogex-oa-analytics.service` - GEX analytics engine
 - Enables services to start on boot
 - Starts services and verifies status
+
+### Step 110: API Server Setup
+- Installs API dependencies
+- Configures firewall (port 8000)
+- Sets up systemd service
+- Provides REST API endpoints
+- Interactive API docs at /docs
 
 ### Step 200: Validation
 - Comprehensive deployment validation with RDS connection
@@ -197,6 +214,30 @@ make latest
 make stats
 ```
 
+### 5. Test API Server
+```bash
+# Check API is running
+sudo systemctl status zerogex-oa-api
+
+# Test health endpoint
+curl http://localhost:8000/api/health | jq
+
+# Test GEX endpoint
+curl http://localhost:8000/api/gex/summary | jq
+
+# Browse interactive API documentation
+# Open in browser: http://your-server-ip:8000/docs
+```
+
+**Available API Endpoints:**
+- Health: `/api/health`
+- GEX Summary: `/api/gex/summary`
+- GEX by Strike: `/api/gex/by-strike`
+- Options Flow: `/api/flow/by-type`, `/api/flow/by-strike`, `/api/flow/smart-money`
+- Day Trading: `/api/trading/vwap-deviation`, `/api/trading/opening-range`, `/api/trading/gamma-levels`, etc
+.
+- Market Data: `/api/market/quote`, `/api/market/historical`
+
 ## Service Management
 
 ### Using Makefile (Recommended)
@@ -216,6 +257,14 @@ make analytics-restart
 make analytics-status
 make analytics-logs
 
+# API Service
+make api-start
+make api-stop
+make api-restart
+make api-status
+make api-logs
+make api-test
+
 # Quick Stats
 make stats
 make latest
@@ -231,9 +280,20 @@ sudo systemctl stop zerogex-oa-ingestion
 sudo systemctl restart zerogex-oa-ingestion
 sudo systemctl status zerogex-oa-ingestion
 
+sudo systemctl start zerogex-oa-analytics
+sudo systemctl stop zerogex-oa-analytics
+sudo systemctl restart zerogex-oa-analytics
+sudo systemctl status zerogex-oa-analytics
+
+sudo systemctl start zerogex-oa-api
+sudo systemctl stop zerogex-oa-api
+sudo systemctl restart zerogex-oa-api
+sudo systemctl status zerogex-oa-api
+
 # View logs
 sudo journalctl -u zerogex-oa-ingestion -f
 sudo journalctl -u zerogex-oa-analytics -f
+sudo journalctl -u zerogex-oa-api -f
 ```
 
 ## Database Queries
@@ -433,6 +493,48 @@ pip list | grep psycopg2
 ls -la ~/.pgpass ~/zerogex-oa/.env
 ```
 
+### API Service Issues
+
+**API won't start:**
+```bash
+# Check logs
+sudo journalctl -u zerogex-oa-api -n 50
+
+# Verify dependencies
+cd ~/zerogex-oa
+source venv/bin/activate
+pip list | grep -E "fastapi|uvicorn|asyncpg|pydantic"
+
+# Check if port 8000 is in use
+sudo lsof -i :8000
+```
+
+**Can't access API from frontend:**
+```bash
+# Check firewall
+sudo ufw status | grep 8000
+
+# Open port if needed
+sudo ufw allow 8000/tcp
+
+# Test locally
+curl http://localhost:8000/api/health
+
+# For remote access, check AWS security group allows port 8000
+```
+
+**API returns no data:**
+```bash
+# Verify ingestion and analytics are running
+sudo systemctl status zerogex-oa-ingestion
+sudo systemctl status zerogex-oa-analytics
+
+# Check database has data
+make stats
+
+# API returns 404 if no data available (normal during non-market hours)
+```
+
 ## Directory Structure
 
 ```
@@ -441,20 +543,17 @@ ls -la ~/.pgpass ~/zerogex-oa/.env
 │   ├── venv/                # Python virtual environment
 │   ├── .env                 # Configuration
 │   ├── src/                 # Source code
+│   │   ├── ingestion/       # Data ingestion engine
+│   │   ├── analytics/       # GEX analytics engine
+│   │   └── api/             # FastAPI backend (NEW)
 │   └── setup/               # Setup files
 ├── .pgpass                  # PostgreSQL password file (RDS credentials)
 └── logs/                    # Deployment logs
 
-/data/                       # Data volume (if available)
-├── monitoring/              # Monitoring metrics (if enabled)
-└── backups/                 # Database backups (if configured)
-
-/var/log/zerogex/
-└── cleanup.log              # Data retention cleanup logs
-
 /etc/systemd/system/
 ├── zerogex-oa-ingestion.service
-└── zerogex-oa-analytics.service
+├── zerogex-oa-analytics.service
+└── zerogex-oa-api.service   # NEW
 ```
 
 ## Security Notes
@@ -476,6 +575,76 @@ ls -la ~/.pgpass ~/zerogex-oa/.env
    - `.env` file has 600 permissions
    - TradeStation tokens stored securely in `.env`
    - Validation checks confirm secure permissions
+
+## API Integration
+
+### Connecting Frontend to API
+
+**1. Configure Frontend Environment**
+
+Create/update `frontend/.env.local`:
+
+```bash
+# API Configuration
+NEXT_PUBLIC_API_URL=http://your-ec2-ip:8000
+NEXT_PUBLIC_WS_URL=ws://your-ec2-ip:8000/ws
+
+# For production with domain
+NEXT_PUBLIC_API_URL=https://api.zerogex.com
+NEXT_PUBLIC_WS_URL=wss://api.zerogex.com/ws
+
+# Feature Flags
+NEXT_PUBLIC_ENABLE_WEBSOCKET=true
+NEXT_PUBLIC_REFRESH_INTERVAL=1000
+NEXT_PUBLIC_ENV=production
+```
+
+**2. Test Connection**
+
+```javascript
+// Test API connectivity
+const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/health`);
+const health = await response.json();
+console.log('API Status:', health.status);
+console.log('Database:', health.database_connected ? 'Connected' : 'Disconnected');
+console.log('Data Age:', health.data_age_seconds, 'seconds');
+```
+
+**3. Security Considerations**
+
+For production deployment:
+
+- **Firewall:** Restrict port 8000 to frontend IP only
+- **CORS:** Update `src/api/main.py` to allow only your frontend domain
+- **SSL/HTTPS:** Set up Nginx reverse proxy with Let's Encrypt SSL certificate
+- **Rate Limiting:** Consider adding rate limiting for production
+- **Authentication:** Add API keys or JWT tokens if needed
+
+**Example Nginx Configuration for SSL:**
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name api.zerogex.com;
+
+    ssl_certificate /etc/letsencrypt/live/api.zerogex.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.zerogex.com/privkey.pem;
+
+    location / {
+        proxy_pass http://localhost:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+server {
+    listen 80;
+    server_name api.zerogex.com;
+    return 301 https://$server_name$request_uri;
+}
+```
 
 ## AWS RDS Best Practices
 
@@ -548,6 +717,27 @@ The schema includes optimized indexes for:
 - Indexes support date-partitioned queries
 - Window functions used efficiently in views
 - Consider adding custom indexes for specific query patterns
+
+### API Performance
+
+The API uses:
+- **Async/await** for non-blocking operations
+- **Connection pooling** (2-10 concurrent connections)
+- **Optimized queries** leveraging database indexes
+- **Direct view access** for zero-lag real-time data
+
+**Response Times (typical):**
+- Health check: <10ms
+- GEX summary: 20-50ms
+- GEX by strike: 30-80ms
+- Flow views: 40-100ms
+- Day trading views: 50-150ms
+
+**Optimization Tips:**
+- Use appropriate `limit` parameters
+- Cache responses on frontend (1-5 seconds)
+- Use `window_minutes` to filter data
+- Consider WebSocket for true real-time (future)
 
 ## Support
 

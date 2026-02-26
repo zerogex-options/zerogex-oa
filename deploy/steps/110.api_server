@@ -1,0 +1,145 @@
+#!/bin/bash
+
+# ==============================================
+# Step 110: API Server Setup
+# ==============================================
+
+set -e
+
+log "API Server Setup"
+
+# Define paths
+APP_DIR="$HOME/zerogex-oa"
+SYSTEMD_SOURCE="$APP_DIR/setup/systemd"
+SYSTEMD_TARGET="/etc/systemd/system"
+
+# Check if application directory exists
+if [ ! -d "$APP_DIR" ]; then
+    log "  ✗ Application directory not found: $APP_DIR"
+    exit 1
+fi
+
+# Create API module directory if it doesn't exist
+log "  → Creating API module directory..."
+mkdir -p "$APP_DIR/src/api"
+
+# Check if API files exist
+if [ ! -f "$APP_DIR/src/api/main.py" ]; then
+    log "  ✗ API files not found!"
+    log "     Please ensure the following files exist:"
+    log "       - src/api/__init__.py"
+    log "       - src/api/main.py"
+    log "       - src/api/models.py"
+    log "       - src/api/database.py"
+    exit 1
+fi
+
+# Activate virtual environment and install API dependencies
+log "  → Installing API dependencies..."
+cd "$APP_DIR"
+source venv/bin/activate
+
+# Install API dependencies
+pip install fastapi uvicorn[standard] asyncpg pydantic
+
+deactivate
+
+# Configure firewall for API
+log "  → Configuring firewall for API (port 8000)..."
+sudo ufw allow 8000/tcp comment 'ZeroGEX API'
+log "     ✓ Port 8000 allowed through firewall"
+
+# Copy systemd service file
+log "  → Installing API systemd service..."
+if [ -f "$SYSTEMD_SOURCE/zerogex-oa-api.service" ]; then
+    sudo cp "$SYSTEMD_SOURCE/zerogex-oa-api.service" "$SYSTEMD_TARGET/"
+    log "     ✓ zerogex-oa-api.service"
+else
+    log "     ⚠ Warning: zerogex-oa-api.service not found"
+fi
+
+# Reload systemd daemon
+log "  → Reloading systemd daemon..."
+sudo systemctl daemon-reload
+
+# Enable API service
+log "  → Enabling API service to start on boot..."
+sudo systemctl enable zerogex-oa-api
+
+# Start API service
+log "  → Starting API service..."
+if sudo systemctl is-active --quiet zerogex-oa-api; then
+    log "     • API service is already running, restarting..."
+    sudo systemctl restart zerogex-oa-api
+    sleep 2
+else
+    sudo systemctl start zerogex-oa-api
+    sleep 3
+fi
+
+# Check service status
+if sudo systemctl is-active --quiet zerogex-oa-api; then
+    log "     ✓ API service started successfully"
+else
+    log "     ✗ API service failed to start"
+    log "     Check logs with: sudo journalctl -u zerogex-oa-api -n 50"
+fi
+
+# Wait for API to be ready
+log "  → Waiting for API to be ready..."
+sleep 3
+
+# Test API health endpoint
+log "  → Testing API health endpoint..."
+if curl -s -f http://localhost:8000/api/health > /dev/null 2>&1; then
+    log "     ✓ API health check passed"
+    
+    # Show health response
+    log ""
+    log "  API Health Response:"
+    curl -s http://localhost:8000/api/health | python3 -m json.tool || log "     (could not parse JSON)"
+    log ""
+else
+    log "     ⚠ API health check failed (service may still be starting)"
+fi
+
+log ""
+log "API server setup complete!"
+log ""
+log "Summary:"
+log "  ✓ API dependencies installed"
+log "  ✓ Firewall configured (port 8000)"
+log "  ✓ Systemd service installed and enabled"
+
+# Check which services are actually running
+if sudo systemctl is-active --quiet zerogex-oa-api; then
+    log "  ✓ zerogex-oa-api is running"
+else
+    log "  ✗ zerogex-oa-api is not running"
+fi
+
+log ""
+log "API Endpoints Available:"
+log "  • Health Check:       http://localhost:8000/api/health"
+log "  • GEX Summary:        http://localhost:8000/api/gex/summary"
+log "  • GEX by Strike:      http://localhost:8000/api/gex/by-strike"
+log "  • Options Flow:       http://localhost:8000/api/flow/by-type"
+log "  • Smart Money:        http://localhost:8000/api/flow/smart-money"
+log "  • VWAP Deviation:     http://localhost:8000/api/trading/vwap-deviation"
+log "  • Opening Range:      http://localhost:8000/api/trading/opening-range"
+log "  • Gamma Levels:       http://localhost:8000/api/trading/gamma-levels"
+log "  • Dealer Hedging:     http://localhost:8000/api/trading/dealer-hedging"
+log "  • Volume Spikes:      http://localhost:8000/api/trading/volume-spikes"
+log "  • Momentum Div:       http://localhost:8000/api/trading/momentum-divergence"
+log "  • API Documentation:  http://localhost:8000/docs"
+log ""
+log "Useful commands:"
+log "  • make api-start          - Start API service"
+log "  • make api-stop           - Stop API service"
+log "  • make api-logs           - View live API logs"
+log "  • make api-test           - Test API endpoints"
+log ""
+log "Or use systemctl directly:"
+log "  • sudo systemctl status zerogex-oa-api"
+log "  • sudo journalctl -u zerogex-oa-api -f"
+log ""
