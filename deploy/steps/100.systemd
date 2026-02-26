@@ -59,6 +59,13 @@ done
 log "  → Starting services..."
 for service in "${SERVICES[@]}"; do
     if [ -f "$SYSTEMD_TARGET/${service}.service" ]; then
+        # Check if service is already running
+        if sudo systemctl is-active --quiet "${service}"; then
+            log "     • ${service} is already running, stopping first..."
+            sudo systemctl stop "${service}"
+            sleep 1
+        fi
+
         log "     • Starting ${service}..."
         if sudo systemctl start "${service}"; then
             sleep 2

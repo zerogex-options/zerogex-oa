@@ -36,7 +36,7 @@ Examples:
 Available Steps:
 EOF
 
-    for step in `ls ./steps/`; do desc=`grep "# Step" steps/$step | awk -F\: '{print $2}'`; printf "%s\t%s\n" "$step" "-$desc"; done
+    for step in `ls ${STEPS_DIR}/`; do desc=`grep "# Step" ${STEPS_DIR}/$step | awk -F\: '{print $2}'`; printf "%s\t%s\n" "$step" "-$desc"; done
 
     echo
     echo "Logs are saved to: /home/ubuntu/logs/deployment_YYYYMMDD_HHMMSS.log"

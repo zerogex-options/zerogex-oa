@@ -82,7 +82,7 @@ fi
 
 # Restart SSH service
 log "  → Restarting SSH service..."
-sudo systemctl restart sshd
+sudo systemctl restart ssh
 log "     ✓ SSH service restarted"
 
 # Set up automatic security updates

@@ -48,6 +48,23 @@ if grep -q "your_api_key_here" "$ENV_FILE" || grep -q "your_api_secret_here" "$E
     echo ""
 fi
 
+# Check if refresh token already exists
+log "  → Checking for existing refresh token..."
+EXISTING_TOKEN=$(grep "^TRADESTATION_REFRESH_TOKEN=" "$ENV_FILE" | cut -d= -f2 | tr -d '"' | tr -d "'" | xargs)
+
+if [ -n "$EXISTING_TOKEN" ] && [ "$EXISTING_TOKEN" != "your_refresh_token_here" ]; then
+    log "     ✓ Refresh token already exists in .env file"
+    log "     Skipping token initialization..."
+    log ""
+    log "  To re-initialize tokens manually later, run:"
+    log "    cd $APP_DIR && source venv/bin/activate"
+    log "    python setup/app/get_tradestation_tokens.py"
+    log ""
+    exit 0
+fi
+
+log "     ℹ No refresh token found, proceeding with token initialization..."
+
 # Activate virtual environment
 log "  → Activating virtual environment..."
 cd "$APP_DIR"
@@ -90,7 +107,7 @@ else
     log ""
     log "  You can retry this step later by running:"
     log "    cd $APP_DIR && source venv/bin/activate"
-    log "    python initialize/get_tradestation_tokens.py"
+    log "    python setup/app/get_tradestation_tokens.py"
     log ""
     read -p "  Continue with deployment anyway? (y/N): " continue_choice
     if [[ ! "$continue_choice" =~ ^[Yy]$ ]]; then

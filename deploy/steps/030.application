@@ -94,12 +94,23 @@ if [ ! -f "$ENV_FILE" ]; then
     # Update TradeStation credentials in .env file
     log ""
     log "  → Updating .env file with TradeStation credentials..."
-
     sed -i "s/^TRADESTATION_CLIENT_ID=.*/TRADESTATION_CLIENT_ID=${TS_API_KEY}/" "$ENV_FILE"
     sed -i "s/^TRADESTATION_CLIENT_SECRET=.*/TRADESTATION_CLIENT_SECRET=${TS_API_SECRET}/" "$ENV_FILE"
-    
     log "     ✓ .env file created at: $ENV_FILE"
     log "     ✓ TradeStation credentials securely stored"
+
+    # Update Database settings in .env file
+    log ""
+    log "  → Updating .env file with database connectivity settings from ~/.pgpass"
+    DB_HOST=`cat ~/.pgpass | awk -F\: '{print $1}'`
+    DB_PORT=`cat ~/.pgpass | awk -F\: '{print $2}'`
+    DB_NAME=`cat ~/.pgpass | awk -F\: '{print $3}'`
+    DB_USER=`cat ~/.pgpass | awk -F\: '{print $4}'`
+    sed -i "s/^DB_HOST=.*/DB_HOST=${DB_HOST}/" "$ENV_FILE"
+    sed -i "s/^DB_PORT=.*/DB_PORT=${DB_PORT}/" "$ENV_FILE"
+    sed -i "s/^DB_NAME=.*/DB_NAME=${DB_NAME}/" "$ENV_FILE"
+    sed -i "s/^DB_USER=.*/DB_USER=${DB_USER}/" "$ENV_FILE"
+    log "     ✓ Database connectivity settings copied from ~/.pgpass"
 
 else
     log "     ℹ .env file already exists, skipping configuration..."

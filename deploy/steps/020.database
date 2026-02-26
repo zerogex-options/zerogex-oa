@@ -80,8 +80,8 @@ else
     # Parse contents of .pgpass file
     DB_HOST=`cat $PGPASS_FILE | awk -F\: '{print $1}'`
     DB_PORT=`cat $PGPASS_FILE | awk -F\: '{print $2}'`
-    DB_USER=`cat $PGPASS_FILE | awk -F\: '{print $4}'`
     DB_NAME=`cat $PGPASS_FILE | awk -F\: '{print $3}'`
+    DB_USER=`cat $PGPASS_FILE | awk -F\: '{print $4}'`
 fi
 
 # Verify .pgpass works
