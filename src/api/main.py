@@ -19,6 +19,7 @@ from .models import (
     GEXByStrike,
     OptionFlow,
     UnderlyingQuote,
+    PreviousClose,
     HealthStatus,
 )
 
@@ -241,6 +242,21 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
         raise
     except Exception as e:
         logger.error(f"Error fetching quote: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/market/previous-close", response_model=PreviousClose)
+async def get_previous_close(symbol: str = Query(default="SPY")):
+    """Get previous trading day's closing price"""
+    try:
+        data = await db_manager.get_previous_close(symbol)
+        if not data:
+            raise HTTPException(status_code=404, detail="No previous close data available")
+
+        return PreviousClose(**data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching previous close: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/market/historical", response_model=List[UnderlyingQuote])

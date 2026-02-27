@@ -9,6 +9,7 @@ from .models import (
     GEXByStrike,
     OptionFlow,
     UnderlyingQuote,
+    PreviousClose,
     HealthStatus,
 )
 from .database import DatabaseManager
@@ -19,6 +20,7 @@ __all__ = [
     'GEXByStrike',
     'OptionFlow',
     'UnderlyingQuote',
+    'PreviousClose',
     'HealthStatus',
     'DatabaseManager',
 ]

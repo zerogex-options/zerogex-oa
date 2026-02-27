@@ -22,7 +22,7 @@ class GEXSummary(BaseModel):
     total_call_oi: Optional[int] = None
     total_put_oi: Optional[int] = None
     put_call_ratio: Optional[Decimal] = None
-    
+
     class Config:
         from_attributes = True
         json_encoders = {
@@ -44,7 +44,7 @@ class GEXByStrike(BaseModel):
     net_gex: Decimal
     spot_price: Decimal
     distance_from_spot: Decimal
-    
+
     class Config:
         from_attributes = True
         json_encoders = {
@@ -65,7 +65,7 @@ class OptionFlow(BaseModel):
     net_delta: Optional[Decimal] = None
     sentiment: Optional[str] = None  # 'bullish', 'bearish', 'neutral'
     unusual_activity_score: Optional[Decimal] = None
-    
+
     class Config:
         from_attributes = True
         json_encoders = {
@@ -82,7 +82,20 @@ class UnderlyingQuote(BaseModel):
     low: Decimal
     close: Decimal
     volume: Optional[int] = None
-    
+
+    class Config:
+        from_attributes = True
+        json_encoders = {
+            Decimal: lambda v: float(v) if v is not None else None,
+            datetime: lambda v: v.isoformat() if v is not None else None,
+        }
+
+class PreviousClose(BaseModel):
+    """Previous Close Response"""
+    symbol: str
+    previous_close: Decimal
+    timestamp: datetime
+
     class Config:
         from_attributes = True
         json_encoders = {
@@ -96,7 +109,7 @@ class HealthStatus(BaseModel):
     database_connected: bool
     last_data_update: Optional[datetime] = None
     data_age_seconds: Optional[int] = None
-    
+
     class Config:
         json_encoders = {
             datetime: lambda v: v.isoformat() if v is not None else None,

@@ -555,6 +555,65 @@ class DatabaseManager:
             logger.error(f"Error fetching latest quote: {e}")
             raise
 
+    async def get_previous_close(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
+        """Get previous trading day's cash close (16:00 ET)"""
+        query = """
+            WITH today_quotes AS (
+                SELECT DATE(timestamp AT TIME ZONE 'America/New_York') as trade_date
+                FROM underlying_quotes
+                WHERE symbol = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            previous_day_close AS (
+                SELECT 
+                    timestamp,
+                    symbol,
+                    close as previous_close,
+                    EXTRACT(HOUR FROM timestamp AT TIME ZONE 'America/New_York') as hour,
+                    EXTRACT(MINUTE FROM timestamp AT TIME ZONE 'America/New_York') as minute
+                FROM underlying_quotes
+                WHERE symbol = $1
+                    AND DATE(timestamp AT TIME ZONE 'America/New_York') < (SELECT trade_date FROM today_quotes)
+                    -- Market close is 16:00 ET
+                    AND EXTRACT(HOUR FROM timestamp AT TIME ZONE 'America/New_York') = 16
+                    AND EXTRACT(MINUTE FROM timestamp AT TIME ZONE 'America/New_York') = 0
+                ORDER BY timestamp DESC
+                LIMIT 1
+            )
+            -- If no exact 16:00 close found, get the last quote before 16:01
+            SELECT 
+                timestamp,
+                symbol,
+                previous_close
+            FROM previous_day_close
+            WHERE previous_day_close.previous_close IS NOT NULL
+
+            UNION ALL
+
+            SELECT 
+                timestamp,
+                symbol,
+                close as previous_close
+            FROM underlying_quotes
+            WHERE symbol = $1
+                AND DATE(timestamp AT TIME ZONE 'America/New_York') < (SELECT trade_date FROM today_quotes)
+                AND EXTRACT(HOUR FROM timestamp AT TIME ZONE 'America/New_York') < 16
+                OR (EXTRACT(HOUR FROM timestamp AT TIME ZONE 'America/New_York') = 16 
+                    AND EXTRACT(MINUTE FROM timestamp AT TIME ZONE 'America/New_York') <= 1)
+                AND NOT EXISTS (SELECT 1 FROM previous_day_close)
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(query, symbol)
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error fetching previous close: {e}")
+            raise
+
     async def get_historical_quotes(
         self,
         symbol: str = 'SPY',
