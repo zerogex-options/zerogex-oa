@@ -667,3 +667,95 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error fetching historical quotes: {e}")
             raise
+    # ========================================================================
+    # Chart Data Queries
+    # ========================================================================
+
+    async def get_gex_heatmap(
+        self,
+        symbol: str = 'SPY',
+        window_minutes: int = 60,
+        interval_minutes: int = 5
+    ) -> List[Dict[str, Any]]:
+        """
+        Get GEX data by strike over time for heatmap visualization
+        Returns time-series data of GEX by strike
+        """
+        query = """
+            WITH recent_data AS (
+                SELECT 
+                    timestamp,
+                    strike,
+                    net_gex
+                FROM gex_by_strike
+                WHERE underlying = $1
+                    AND timestamp >= $2
+            ),
+            latest_price AS (
+                SELECT close 
+                FROM underlying_quotes 
+                WHERE symbol = $1 
+                ORDER BY timestamp DESC 
+                LIMIT 1
+            ),
+            filtered_data AS (
+                SELECT 
+                    r.timestamp,
+                    r.strike,
+                    r.net_gex
+                FROM recent_data r
+                CROSS JOIN latest_price l
+                WHERE ABS(r.strike - l.close) <= 50
+            )
+            SELECT 
+                timestamp,
+                strike,
+                net_gex
+            FROM filtered_data
+            ORDER BY timestamp ASC, strike ASC
+        """
+
+        try:
+            # Calculate cutoff time in Python
+            cutoff_time = datetime.now() - timedelta(minutes=window_minutes)
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(query, symbol, cutoff_time)
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error fetching GEX heatmap: {e}")
+            raise
+
+    async def get_flow_timeseries(
+        self,
+        symbol: str = 'SPY',
+        window_minutes: int = 60,
+        interval_minutes: int = 5
+    ) -> List[Dict[str, Any]]:
+        """
+        Get aggregated call/put notional flow over time
+        Returns time-series data for flow chart
+        """
+        query = """
+            SELECT 
+                timestamp,
+                call_notional,
+                put_notional,
+                call_flow,
+                put_flow,
+                net_notional,
+                net_flow
+            FROM option_flow_by_type
+            WHERE underlying = $1
+                AND timestamp >= $2
+            ORDER BY timestamp ASC
+        """
+
+        try:
+            # Calculate cutoff time in Python
+            cutoff_time = datetime.now() - timedelta(minutes=window_minutes)
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(query, symbol, cutoff_time)
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error fetching flow timeseries: {e}")
+            raise

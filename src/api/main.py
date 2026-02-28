@@ -392,6 +392,46 @@ async def get_momentum_divergence(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 # ============================================================================
+# Chart Data Endpoints
+# ============================================================================
+
+@app.get("/api/gex/heatmap")
+async def get_gex_heatmap(
+    symbol: str = Query(default="SPY"),
+    window_minutes: int = Query(default=60, le=240),
+    interval_minutes: int = Query(default=5, le=30)
+):
+    """Get GEX heatmap data (strike x time)"""
+    try:
+        data = await db_manager.get_gex_heatmap(symbol, window_minutes, interval_minutes)
+        if not data:
+            raise HTTPException(status_code=404, detail="No GEX heatmap data available")
+        return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching GEX heatmap: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/flow/timeseries")
+async def get_flow_timeseries(
+    symbol: str = Query(default="SPY"),
+    window_minutes: int = Query(default=60, le=240),
+    interval_minutes: int = Query(default=5, le=30)
+):
+    """Get options flow time-series data (call/put notional over time)"""
+    try:
+        data = await db_manager.get_flow_timeseries(symbol, window_minutes, interval_minutes)
+        if not data:
+            raise HTTPException(status_code=404, detail="No flow timeseries data available")
+        return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching flow timeseries: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+# ============================================================================
 # Error Handlers
 # ============================================================================
 
