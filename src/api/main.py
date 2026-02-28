@@ -422,11 +422,7 @@ async def get_flow_timeseries(
     """Get options flow time-series data (call/put notional over time)"""
     try:
         data = await db_manager.get_flow_timeseries(symbol, window_minutes, interval_minutes)
-        if not data:
-            raise HTTPException(status_code=404, detail="No flow timeseries data available")
-        return data
-    except HTTPException:
-        raise
+        return data if data else []
     except Exception as e:
         logger.error(f"Error fetching flow timeseries: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")

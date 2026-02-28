@@ -734,8 +734,24 @@ class DatabaseManager:
         """
         Get aggregated call/put notional flow over time
         Returns time-series data for flow chart
+        If no recent data, returns the last available window of data
         """
         query = """
+            WITH latest_timestamp AS (
+                SELECT MAX(timestamp) as max_ts
+                FROM option_flow_by_type
+                WHERE underlying = $1
+            ),
+            time_window AS (
+                SELECT 
+                    CASE 
+                        WHEN max_ts >= NOW() - INTERVAL '1 minute' * $2
+                        THEN NOW() - INTERVAL '1 minute' * $2
+                        ELSE max_ts - INTERVAL '1 minute' * $2
+                    END as start_time,
+                    max_ts as end_time
+                FROM latest_timestamp
+            )
             SELECT 
                 timestamp,
                 call_notional,
@@ -746,15 +762,14 @@ class DatabaseManager:
                 net_flow
             FROM option_flow_by_type
             WHERE underlying = $1
-                AND timestamp >= $2
+                AND timestamp >= (SELECT start_time FROM time_window)
+                AND timestamp <= (SELECT end_time FROM time_window)
             ORDER BY timestamp ASC
         """
 
         try:
-            # Calculate cutoff time in Python
-            cutoff_time = datetime.now() - timedelta(minutes=window_minutes)
             async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, symbol, cutoff_time)
+                rows = await conn.fetch(query, symbol, window_minutes)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching flow timeseries: {e}")
