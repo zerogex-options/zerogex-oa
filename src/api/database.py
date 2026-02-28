@@ -679,17 +679,20 @@ class DatabaseManager:
     ) -> List[Dict[str, Any]]:
         """
         Get GEX data by strike over time for heatmap visualization
-        Returns time-series data of GEX by strike
+        Returns time-series data of GEX by strike aligned to underlying price timestamps
         """
         query = """
-            WITH recent_data AS (
+            WITH latest_price_timestamp AS (
+                -- Use latest underlying price timestamp as baseline
+                SELECT MAX(timestamp) as max_ts
+                FROM underlying_quotes
+                WHERE symbol = $1
+            ),
+            time_window AS (
                 SELECT 
-                    timestamp,
-                    strike,
-                    net_gex
-                FROM gex_by_strike
-                WHERE underlying = $1
-                    AND timestamp >= $2
+                    max_ts - INTERVAL '1 minute' * $2 as start_time,
+                    max_ts as end_time
+                FROM latest_price_timestamp
             ),
             latest_price AS (
                 SELECT close 
@@ -697,6 +700,16 @@ class DatabaseManager:
                 WHERE symbol = $1 
                 ORDER BY timestamp DESC 
                 LIMIT 1
+            ),
+            recent_data AS (
+                SELECT 
+                    timestamp,
+                    strike,
+                    net_gex
+                FROM gex_by_strike
+                WHERE underlying = $1
+                    AND timestamp >= (SELECT start_time FROM time_window)
+                    AND timestamp <= (SELECT end_time FROM time_window)
             ),
             filtered_data AS (
                 SELECT 
@@ -716,10 +729,8 @@ class DatabaseManager:
         """
 
         try:
-            # Calculate cutoff time in Python
-            cutoff_time = datetime.now() - timedelta(minutes=window_minutes)
             async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, symbol, cutoff_time)
+                rows = await conn.fetch(query, symbol, window_minutes)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching GEX heatmap: {e}")
