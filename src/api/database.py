@@ -774,3 +774,48 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error fetching flow timeseries: {e}")
             raise
+
+    async def get_price_timeseries(
+        self,
+        symbol: str = 'SPY',
+        window_minutes: int = 60,
+        interval_minutes: int = 5
+    ) -> List[Dict[str, Any]]:
+        """
+        Get underlying price time-series data
+        Returns timestamp and price for chart overlay
+        If no recent data, returns the last available window of data
+        """
+        query = """
+            WITH latest_timestamp AS (
+                SELECT MAX(timestamp) as max_ts
+                FROM underlying_quotes
+                WHERE symbol = $1
+            ),
+            time_window AS (
+                SELECT 
+                    CASE 
+                        WHEN max_ts >= NOW() - INTERVAL '1 minute' * $2
+                        THEN NOW() - INTERVAL '1 minute' * $2
+                        ELSE max_ts - INTERVAL '1 minute' * $2
+                    END as start_time,
+                    max_ts as end_time
+                FROM latest_timestamp
+            )
+            SELECT 
+                timestamp,
+                close as price
+            FROM underlying_quotes
+            WHERE symbol = $1
+                AND timestamp >= (SELECT start_time FROM time_window)
+                AND timestamp <= (SELECT end_time FROM time_window)
+            ORDER BY timestamp ASC
+        """
+
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(query, symbol, window_minutes)
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error fetching price timeseries: {e}")
+            raise

@@ -427,6 +427,20 @@ async def get_flow_timeseries(
         logger.error(f"Error fetching flow timeseries: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+@app.get("/api/price/timeseries")
+async def get_price_timeseries(
+    symbol: str = Query(default="SPY"),
+    window_minutes: int = Query(default=60, le=240),
+    interval_minutes: int = Query(default=5, le=30)
+):
+    """Get underlying price time-series data for chart overlay"""
+    try:
+        data = await db_manager.get_price_timeseries(symbol, window_minutes, interval_minutes)
+        return data if data else []
+    except Exception as e:
+        logger.error(f"Error fetching price timeseries: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 # ============================================================================
 # Error Handlers
 # ============================================================================
