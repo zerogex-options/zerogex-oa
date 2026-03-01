@@ -398,8 +398,8 @@ async def get_momentum_divergence(
 @app.get("/api/gex/heatmap")
 async def get_gex_heatmap(
     symbol: str = Query(default="SPY"),
-    window_minutes: int = Query(default=60, le=1440),
-    interval_minutes: int = Query(default=5, le=60)
+    window_minutes: int = Query(default=60, le=7200),
+    interval_minutes: int = Query(default=5, le=1440)
 ):
     """Get GEX heatmap data (strike x time)"""
     try:
@@ -416,8 +416,8 @@ async def get_gex_heatmap(
 @app.get("/api/flow/timeseries")
 async def get_flow_timeseries(
     symbol: str = Query(default="SPY"),
-    window_minutes: int = Query(default=60, le=1440),
-    interval_minutes: int = Query(default=5, le=60)
+    window_minutes: int = Query(default=60, le=7200),
+    interval_minutes: int = Query(default=5, le=1440)
 ):
     """Get options flow time-series data (call/put notional over time)"""
     try:
