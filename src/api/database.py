@@ -557,68 +557,59 @@ class DatabaseManager:
 
     async def get_previous_close(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
         """
-        Get the most recent 4:00 PM ET close price as reference.
-        This acts as the baseline for calculating daily change.
-
-        Logic:
-        - If current time is before 4:00 PM ET today, return yesterday's 4:00 PM close
-        - If current time is 4:00 PM ET or later today, return today's 4:00 PM close
+        Get the most recent 4:00 PM ET close price (previous trading day's close).
+        Works on any day including weekends and holidays.
         """
         query = """
-            WITH current_time_et AS (
-                SELECT NOW() AT TIME ZONE 'America/New_York' as now_et
-            ),
-            reference_time AS (
-                SELECT 
-                    CASE 
-                        -- If before 4:00 PM ET today, use yesterday's 4:00 PM
-                        WHEN EXTRACT(HOUR FROM now_et) < 16 THEN
-                            DATE_TRUNC('day', now_et - INTERVAL '1 day') + INTERVAL '16 hours'
-                        -- If 4:00 PM ET or later today, use today's 4:00 PM
-                        ELSE
-                            DATE_TRUNC('day', now_et) + INTERVAL '16 hours'
-                    END as target_time
-                FROM current_time_et
-            ),
-            exact_close AS (
-                -- Try to find the exact 16:00 ET bar first
+            WITH market_close_time AS (
+                -- Find the most recent 4:00 PM ET bar
                 SELECT 
                     timestamp,
                     symbol,
                     close as previous_close
                 FROM underlying_quotes
                 WHERE symbol = $1
-                    AND timestamp AT TIME ZONE 'America/New_York' = (SELECT target_time FROM reference_time)
+                    AND EXTRACT(HOUR FROM timestamp AT TIME ZONE 'America/New_York') = 16
+                    AND EXTRACT(MINUTE FROM timestamp AT TIME ZONE 'America/New_York') = 0
+                    AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
+                ORDER BY timestamp DESC
                 LIMIT 1
             ),
             nearest_close AS (
-                -- Fallback: find the closest bar to 16:00 ET on that date
+                -- Fallback: find the bar closest to 4:00 PM on the most recent trading day
                 SELECT 
-                    timestamp,
-                    symbol,
-                    close as previous_close,
+                    q.timestamp,
+                    q.symbol,
+                    q.close as previous_close,
                     ABS(EXTRACT(EPOCH FROM (
-                        timestamp AT TIME ZONE 'America/New_York' - 
-                        (SELECT target_time FROM reference_time)
+                        (q.timestamp AT TIME ZONE 'America/New_York')::time - '16:00:00'::time
                     ))) as time_diff_seconds
-                FROM underlying_quotes
-                WHERE symbol = $1
-                    AND DATE(timestamp AT TIME ZONE 'America/New_York') = 
-                        DATE((SELECT target_time FROM reference_time))
-                    AND EXTRACT(HOUR FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 15 AND 16
+                FROM underlying_quotes q
+                CROSS JOIN (
+                    -- Get the most recent trading day that has data
+                    SELECT DISTINCT DATE(timestamp AT TIME ZONE 'America/New_York') as trade_date
+                    FROM underlying_quotes
+                    WHERE symbol = $1
+                        AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
+                    ORDER BY DATE(timestamp AT TIME ZONE 'America/New_York') DESC
+                    LIMIT 1
+                ) recent_day
+                WHERE q.symbol = $1
+                    AND DATE(q.timestamp AT TIME ZONE 'America/New_York') = recent_day.trade_date
+                    AND EXTRACT(HOUR FROM q.timestamp AT TIME ZONE 'America/New_York') BETWEEN 15 AND 16
                 ORDER BY time_diff_seconds ASC
                 LIMIT 1
             )
-            -- Return exact close if found, otherwise nearest
+            -- Return exact 4:00 PM close if found, otherwise nearest
             SELECT timestamp, symbol, previous_close
-            FROM exact_close
+            FROM market_close_time
             WHERE previous_close IS NOT NULL
 
             UNION ALL
 
             SELECT timestamp, symbol, previous_close
             FROM nearest_close
-            WHERE NOT EXISTS (SELECT 1 FROM exact_close WHERE previous_close IS NOT NULL)
+            WHERE NOT EXISTS (SELECT 1 FROM market_close_time WHERE previous_close IS NOT NULL)
 
             LIMIT 1
         """

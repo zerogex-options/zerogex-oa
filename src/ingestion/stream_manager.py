@@ -62,6 +62,9 @@ class StreamManager:
         # Track expired strikes for cleanup
         self.all_tracked_strikes: Dict[date, Set[float]] = {}
 
+        # Track last expiration refresh time
+        self.last_expiration_refresh: Optional[datetime] = None
+
         logger.info(f"Initialized StreamManager for {underlying}")
         logger.info(f"Config: {num_expirations} expirations, ±${strike_distance} strikes")
 
@@ -149,6 +152,92 @@ class StreamManager:
         except Exception as e:
             logger.error(f"Error fetching underlying price: {e}", exc_info=True)
             return None
+
+    def _should_refresh_expirations(self) -> bool:
+        """
+        Check if expirations need to be refreshed
+
+        Refresh conditions:
+        1. First time (never refreshed)
+        2. Market close occurred since last refresh (4:00 PM ET)
+        3. Any tracked expiration has expired (is in the past)
+
+        Returns:
+            True if expirations should be refreshed
+        """
+        now_et = datetime.now(ET)
+        today = now_et.date()
+
+        # First time - always refresh
+        if self.last_expiration_refresh is None:
+            logger.info("First expiration refresh needed")
+            return True
+
+        # Check if any tracked expiration has expired
+        if self.target_expirations:
+            earliest_exp = min(self.target_expirations)
+            if earliest_exp < today:
+                logger.info(f"Expiration {earliest_exp} has passed, refresh needed")
+                return True
+
+        # Check if we've crossed 4:00 PM ET since last refresh
+        last_refresh_et = self.last_expiration_refresh.astimezone(ET)
+        market_close_time = datetime.strptime("16:00:00", "%H:%M:%S").time()
+
+        # If last refresh was before today's 4:00 PM and now is after 4:00 PM
+        if (last_refresh_et.date() < now_et.date() or 
+            (last_refresh_et.date() == now_et.date() and 
+             last_refresh_et.time() < market_close_time and 
+             now_et.time() >= market_close_time)):
+            logger.info("Market close occurred since last refresh, expirations may need update")
+            return True
+
+        return False
+
+    def _refresh_expirations(self) -> bool:
+        """
+        Refresh target expirations and rebuild option symbols
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            logger.info("Refreshing target expirations...")
+
+            # Get fresh expirations
+            new_expirations = self._get_target_expirations()
+
+            if not new_expirations:
+                logger.error("Failed to get new expirations")
+                return False
+
+            # Check if expirations actually changed
+            if new_expirations == self.target_expirations:
+                logger.info("Expirations unchanged, skipping rebuild")
+                self.last_expiration_refresh = datetime.now(ET)
+                return True
+
+            # Log the change
+            logger.info(f"Expirations changed:")
+            logger.info(f"  Old: {[str(exp) for exp in self.target_expirations]}")
+            logger.info(f"  New: {[str(exp) for exp in new_expirations]}")
+
+            # Update expirations
+            self.target_expirations = new_expirations
+
+            # Rebuild option symbols with new expirations
+            if self.current_price:
+                self.tracked_option_symbols = self._build_option_symbols()
+                logger.info(f"Rebuilt {len(self.tracked_option_symbols)} option symbols with new expirations")
+
+            # Update refresh timestamp
+            self.last_expiration_refresh = datetime.now(ET)
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error refreshing expirations: {e}", exc_info=True)
+            return False
 
     def _get_target_expirations(self) -> List[date]:
         """Get target expiration dates"""
@@ -264,6 +353,9 @@ class StreamManager:
             logger.error("Failed to build option symbols")
             return False
 
+        # Set initial refresh timestamp (NEW)
+        self.last_expiration_refresh = datetime.now(ET)
+
         logger.info(f"✅ Initialization complete:")
         logger.info(f"   Price: ${self.current_price:.2f}")
         logger.info(f"   Tracking {len(self.target_expirations)} expirations")
@@ -309,6 +401,14 @@ class StreamManager:
 
             logger.info(f"Iteration {iteration} - {datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S ET')} "
                        f"[{session}]")
+
+            # Check if expirations need refresh (NEW)
+            if self._should_refresh_expirations():
+                logger.info("Refreshing expirations...")
+                if self._refresh_expirations():
+                    logger.info("✅ Expirations refreshed successfully")
+                else:
+                    logger.warning("⚠️  Expiration refresh failed, continuing with current expirations")
 
             # Track option count for debugging
             option_count = 0
