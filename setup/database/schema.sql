@@ -104,6 +104,10 @@ CREATE INDEX IF NOT EXISTS idx_option_chains_expiration ON option_chains(expirat
 CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_timestamp ON option_chains(underlying, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_exp_strike ON option_chains(underlying, expiration, strike);
 
+CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_time_type_strike
+    ON option_chains(underlying, timestamp DESC, option_type, strike);
+
+
 -- Add foreign key if it doesn't exist
 DO $$ 
 BEGIN

@@ -193,7 +193,7 @@ class DatabaseManager:
         if not end_date:
             end_date = datetime.now()
 
-        bucket = _bucket_expr(timeframe)
+        bucket = _bucket_expr(timeframe if timeframe else "5min")
         query = f"""
             WITH base AS (
                 SELECT
@@ -255,50 +255,51 @@ class DatabaseManager:
     ) -> List[Dict[str, Any]]:
         """Get option flow by type (calls vs puts)"""
         query = """
-            SELECT 
+            WITH filtered AS (
+                SELECT *
+                FROM option_flow_by_type
+                WHERE underlying = $1
+                  AND timestamp >= $2
+            )
+            SELECT
                 time_et as time_window_start,
                 timestamp as time_window_end,
                 underlying as symbol,
                 'CALL' as option_type,
-                call_flow as total_volume,
-                call_notional as total_premium,
+                COALESCE(call_flow, 0)::bigint as total_volume,
+                COALESCE(call_notional, 0)::numeric as total_premium,
                 NULL::numeric as avg_iv,
-                call_flow - put_flow as net_delta,
-                CASE 
-                    WHEN call_flow > put_flow THEN 'bullish'
-                    WHEN put_flow > call_flow THEN 'bearish'
+                (COALESCE(call_flow, 0) - COALESCE(put_flow, 0))::numeric as net_delta,
+                CASE
+                    WHEN COALESCE(call_flow, 0) > COALESCE(put_flow, 0) THEN 'bullish'
+                    WHEN COALESCE(put_flow, 0) > COALESCE(call_flow, 0) THEN 'bearish'
                     ELSE 'neutral'
                 END as sentiment
-            FROM option_flow_by_type
-            WHERE underlying = $1
-                AND timestamp >= $2
+            FROM filtered
 
             UNION ALL
 
-            SELECT 
+            SELECT
                 time_et as time_window_start,
                 timestamp as time_window_end,
                 underlying as symbol,
                 'PUT' as option_type,
-                put_flow as total_volume,
-                put_notional as total_premium,
+                COALESCE(put_flow, 0)::bigint as total_volume,
+                COALESCE(put_notional, 0)::numeric as total_premium,
                 NULL::numeric as avg_iv,
-                put_flow - call_flow as net_delta,
-                CASE 
-                    WHEN put_flow > call_flow THEN 'bearish'
-                    WHEN call_flow > put_flow THEN 'bullish'
+                (COALESCE(put_flow, 0) - COALESCE(call_flow, 0))::numeric as net_delta,
+                CASE
+                    WHEN COALESCE(put_flow, 0) > COALESCE(call_flow, 0) THEN 'bearish'
+                    WHEN COALESCE(call_flow, 0) > COALESCE(put_flow, 0) THEN 'bullish'
                     ELSE 'neutral'
                 END as sentiment
-            FROM option_flow_by_type
-            WHERE underlying = $1
-                AND timestamp >= $2
+            FROM filtered
 
             ORDER BY time_window_end DESC, option_type
         """
 
         try:
             async with self.pool.acquire() as conn:
-                # Calculate cutoff time in Python
                 cutoff_time = datetime.now() - timedelta(minutes=window_minutes)
                 rows = await conn.fetch(query, symbol, cutoff_time)
                 return [dict(row) for row in rows]
@@ -314,25 +315,24 @@ class DatabaseManager:
     ) -> List[Dict[str, Any]]:
         """Get option flow by strike level"""
         query = """
-            SELECT 
+            SELECT
                 time_et as time_window_start,
                 timestamp as time_window_end,
                 underlying as symbol,
                 strike,
-                total_flow as total_volume,
-                total_notional as total_premium,
+                COALESCE(total_flow, 0)::bigint as total_volume,
+                COALESCE(total_notional, 0)::numeric as total_premium,
                 avg_iv,
-                net_flow as net_delta
+                COALESCE(net_flow, 0)::numeric as net_delta
             FROM option_flow_by_strike
             WHERE underlying = $1
                 AND timestamp >= $2
-            ORDER BY total_notional DESC
+            ORDER BY total_notional DESC NULLS LAST
             LIMIT $3
         """
 
         try:
             async with self.pool.acquire() as conn:
-                # Calculate cutoff time in Python
                 cutoff_time = datetime.now() - timedelta(minutes=window_minutes)
                 rows = await conn.fetch(query, symbol, cutoff_time, limit)
                 return [dict(row) for row in rows]
@@ -348,14 +348,14 @@ class DatabaseManager:
     ) -> List[Dict[str, Any]]:
         """Get unusual activity / smart money flow"""
         query = """
-            SELECT 
+            SELECT
                 time_et as time_window_start,
                 timestamp as time_window_end,
                 underlying as symbol,
                 option_type,
                 strike,
-                flow as total_volume,
-                notional as total_premium,
+                COALESCE(flow, 0)::bigint as total_volume,
+                COALESCE(notional, 0)::numeric as total_premium,
                 iv as avg_iv,
                 unusual_score as unusual_activity_score,
                 size_class,
@@ -371,17 +371,12 @@ class DatabaseManager:
 
         try:
             async with self.pool.acquire() as conn:
-                # Calculate cutoff time in Python
                 cutoff_time = datetime.now() - timedelta(minutes=window_minutes)
                 rows = await conn.fetch(query, symbol, cutoff_time, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching smart money flow: {e}")
             raise
-
-    # ========================================================================
-    # Day Trading Views Queries
-    # ========================================================================
 
     async def get_vwap_deviation(
         self,
@@ -733,7 +728,8 @@ class DatabaseManager:
         Get GEX data by strike over time for heatmap visualization
         Returns time-series data of GEX by strike aligned to underlying price timestamps
         """
-        query = """
+        bucket = _bucket_expr(timeframe)
+        query = f"""
             WITH latest_price_timestamp AS (
                 -- Use latest underlying price timestamp as baseline
                 SELECT MAX(timestamp) as max_ts
@@ -755,7 +751,7 @@ class DatabaseManager:
             ),
             recent_data AS (
                 SELECT 
-                    {_bucket_expr(timeframe)} as timestamp,
+                    {bucket} as timestamp,
                     strike,
                     AVG(net_gex) as net_gex
                 FROM gex_by_strike
@@ -820,12 +816,12 @@ class DatabaseManager:
             )
             SELECT
                 {bucket} as timestamp,
-                SUM(call_notional) as call_notional,
-                SUM(put_notional) as put_notional,
-                SUM(call_flow) as call_flow,
-                SUM(put_flow) as put_flow,
-                SUM(net_notional) as net_notional,
-                SUM(net_flow) as net_flow
+                COALESCE(SUM(call_notional), 0)::numeric as call_notional,
+                COALESCE(SUM(put_notional), 0)::numeric as put_notional,
+                COALESCE(SUM(call_flow), 0)::bigint as call_flow,
+                COALESCE(SUM(put_flow), 0)::bigint as put_flow,
+                COALESCE(SUM(net_notional), 0)::numeric as net_notional,
+                COALESCE(SUM(net_flow), 0)::numeric as net_flow
             FROM option_flow_by_type
             WHERE underlying = $1
                 AND timestamp >= (SELECT start_time FROM time_window)
@@ -854,7 +850,7 @@ class DatabaseManager:
         Returns timestamp and price for chart overlay
         If no recent data, returns the last available window of data
         """
-        bucket = _bucket_expr(timeframe)
+        bucket = _bucket_expr(timeframe if timeframe else "5min")
         query = f"""
             WITH latest_timestamp AS (
                 SELECT MAX(timestamp) as max_ts
