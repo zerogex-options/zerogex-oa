@@ -18,7 +18,7 @@ from src.ingestion.tradestation_client import TradeStationClient
 from src.utils import get_logger
 from src.validation import (
     safe_float, safe_int, safe_datetime,
-    validate_bar_data, get_market_session
+    get_market_session
 )
 from src.config import (
     OPTION_BATCH_SIZE,
@@ -28,7 +28,6 @@ from src.config import (
     STRIKE_RECALC_INTERVAL,
     PRICE_MOVE_THRESHOLD,
     STRIKE_CLEANUP_INTERVAL,
-    SESSION_TEMPLATE,
 )
 
 logger = get_logger(__name__)
@@ -70,65 +69,63 @@ class StreamManager:
 
     def _fetch_underlying_bar(self) -> Optional[Dict[str, Any]]:
         """
-        Fetch latest underlying bar with volume breakdown using regular Bars API
+        Fetch latest underlying quote and normalize to in-progress minute bar.
 
-        Note: The regular bars endpoint includes UpVolume/DownVolume,
-        so we don't need the stream/barcharts endpoint.
-
-        Returns bar data with OHLC + UpVolume/DownVolume
+        This keeps the latest row in underlying_quotes updating throughout the minute,
+        instead of waiting for the next completed minute bar.
         """
         try:
-            # Use regular bars API with barsback=1 to get latest completed bar
-            # This works reliably and includes UpVolume/DownVolume
-            bars_data = self.client.get_bars(
-                symbol=self.underlying,
-                interval=1,
-                unit="Minute",
-                barsback=1,
-                sessiontemplate=SESSION_TEMPLATE,
-                warn_if_closed=False
+            quote_data = self.client.get_quote(self.underlying, warn_if_closed=False)
+            quotes = quote_data.get("Quotes", [])
+            if not quotes:
+                logger.debug(f"No quote data returned for {self.underlying}")
+                return None
+
+            quote = quotes[0]
+            last_price = safe_float(quote.get("Last"), field_name="Last")
+            if last_price <= 0:
+                logger.warning(f"Invalid live last price for {self.underlying}: {last_price}")
+                return None
+
+            quote_ts = safe_datetime(
+                quote.get("TradeTime")
+                or quote.get("TimeStamp")
+                or quote.get("CloseTime")
+                or "",
+                default=datetime.now(ET),
+                field_name="TradeTime"
+            )
+            if not quote_ts:
+                quote_ts = datetime.now(ET)
+
+            minute_ts = quote_ts.replace(second=0, microsecond=0)
+            total_volume = safe_int(
+                quote.get("TotalVolume")
+                or quote.get("Volume")
+                or quote.get("DailyVolume"),
+                field_name="TotalVolume"
             )
 
-            if "Bars" not in bars_data or len(bars_data["Bars"]) == 0:
-                logger.debug(f"No bar data returned for {self.underlying} - likely between bars or market just opened")
-                return None
-
-            bar = bars_data["Bars"][0]
-
-            # Validate bar data
-            if not validate_bar_data(bar):
-                logger.warning("Invalid bar data, skipping")
-                return None
-
-            # Parse bar timestamp
-            timestamp_str = bar.get("TimeStamp", "")
-            timestamp = safe_datetime(timestamp_str, field_name="TimeStamp")
-
-            if not timestamp:
-                timestamp = datetime.now(ET)
-
-            # Parse OHLCV with volume breakdown
             underlying_data = {
                 "symbol": self.underlying,
-                "timestamp": timestamp,
-                "open": safe_float(bar.get("Open"), field_name="Open"),
-                "high": safe_float(bar.get("High"), field_name="High"),
-                "low": safe_float(bar.get("Low"), field_name="Low"),
-                "close": safe_float(bar.get("Close"), field_name="Close"),
-                "up_volume": safe_int(bar.get("UpVolume"), field_name="UpVolume"),
-                "down_volume": safe_int(bar.get("DownVolume"), field_name="DownVolume"),
-                "volume": safe_int(bar.get("TotalVolume"), field_name="TotalVolume"),
+                "timestamp": minute_ts,
+                "open": last_price,
+                "high": last_price,
+                "low": last_price,
+                "close": last_price,
+                "up_volume": total_volume,
+                "down_volume": 0,
+                "volume": total_volume,
             }
 
-            logger.debug(f"Bar: {self.underlying} @ {timestamp} "
-                        f"C=${underlying_data['close']:.2f} "
-                        f"UpVol={underlying_data['up_volume']:,} "
-                        f"DownVol={underlying_data['down_volume']:,}")
-
+            logger.debug(
+                f"Live quote normalized as bar: {self.underlying} @ {quote_ts} "
+                f"(bucket={minute_ts}) C=${underlying_data['close']:.2f} Vol={total_volume:,}"
+            )
             return underlying_data
 
         except Exception as e:
-            logger.error(f"Error fetching underlying bar: {e}", exc_info=True)
+            logger.error(f"Error fetching underlying quote: {e}", exc_info=True)
             return None
 
     def _get_underlying_price(self) -> Optional[float]:

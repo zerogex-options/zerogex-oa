@@ -144,7 +144,8 @@ async def get_historical_gex(
     symbol: str = Query(default="SPY"),
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    limit: int = Query(default=100, le=1000)
+    limit: int = Query(default=100, le=1000),
+    timeframe: str = Query(default="1m", pattern="^(1m|5m|15m|1h|1d)$")
 ):
     """Get historical GEX data"""
     try:
@@ -152,7 +153,7 @@ async def get_historical_gex(
         start_dt = datetime.fromisoformat(start_date) if start_date else None
         end_dt = datetime.fromisoformat(end_date) if end_date else None
 
-        data = await db_manager.get_historical_gex(symbol, start_dt, end_dt, limit)
+        data = await db_manager.get_historical_gex(symbol, start_dt, end_dt, limit, timeframe)
         if not data:
             raise HTTPException(status_code=404, detail="No historical data available")
 
@@ -264,7 +265,8 @@ async def get_historical_quotes(
     symbol: str = Query(default="SPY"),
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    limit: int = Query(default=100, le=1000)
+    limit: int = Query(default=100, le=1000),
+    timeframe: str = Query(default="1m", pattern="^(1m|5m|15m|1h|1d)$")
 ):
     """Get historical quotes"""
     try:
@@ -272,7 +274,7 @@ async def get_historical_quotes(
         start_dt = datetime.fromisoformat(start_date) if start_date else None
         end_dt = datetime.fromisoformat(end_date) if end_date else None
 
-        data = await db_manager.get_historical_quotes(symbol, start_dt, end_dt, limit)
+        data = await db_manager.get_historical_quotes(symbol, start_dt, end_dt, limit, timeframe)
         if not data:
             raise HTTPException(status_code=404, detail="No historical data available")
 
@@ -399,11 +401,12 @@ async def get_momentum_divergence(
 async def get_gex_heatmap(
     symbol: str = Query(default="SPY"),
     window_minutes: int = Query(default=60, le=7200),
-    interval_minutes: int = Query(default=5, le=1440)
+    interval_minutes: int = Query(default=5, le=1440),
+    timeframe: str = Query(default="1m", pattern="^(1m|5m|15m|1h|1d)$")
 ):
     """Get GEX heatmap data (strike x time)"""
     try:
-        data = await db_manager.get_gex_heatmap(symbol, window_minutes, interval_minutes)
+        data = await db_manager.get_gex_heatmap(symbol, window_minutes, interval_minutes, timeframe)
         if not data:
             raise HTTPException(status_code=404, detail="No GEX heatmap data available")
         return data
@@ -417,11 +420,12 @@ async def get_gex_heatmap(
 async def get_flow_timeseries(
     symbol: str = Query(default="SPY"),
     window_minutes: int = Query(default=60, le=7200),
-    interval_minutes: int = Query(default=5, le=1440)
+    interval_minutes: int = Query(default=5, le=1440),
+    timeframe: str = Query(default="1m", pattern="^(1m|5m|15m|1h|1d)$")
 ):
     """Get options flow time-series data (call/put notional over time)"""
     try:
-        data = await db_manager.get_flow_timeseries(symbol, window_minutes, interval_minutes)
+        data = await db_manager.get_flow_timeseries(symbol, window_minutes, interval_minutes, timeframe)
         return data if data else []
     except Exception as e:
         logger.error(f"Error fetching flow timeseries: {e}")
@@ -431,11 +435,12 @@ async def get_flow_timeseries(
 async def get_price_timeseries(
     symbol: str = Query(default="SPY"),
     window_minutes: int = Query(default=60, le=1440),
-    interval_minutes: int = Query(default=5, le=60)
+    interval_minutes: int = Query(default=5, le=60),
+    timeframe: str = Query(default="1m", pattern="^(1m|5m|15m|1h|1d)$")
 ):
     """Get underlying price time-series data for chart overlay"""
     try:
-        data = await db_manager.get_price_timeseries(symbol, window_minutes, interval_minutes)
+        data = await db_manager.get_price_timeseries(symbol, window_minutes, interval_minutes, timeframe)
         return data if data else []
     except Exception as e:
         logger.error(f"Error fetching price timeseries: {e}")

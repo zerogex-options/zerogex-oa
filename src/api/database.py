@@ -12,6 +12,14 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+TIMEFRAME_TO_MINUTES = {
+    "1m": 1,
+    "5m": 5,
+    "15m": 15,
+    "1h": 60,
+    "1d": 1440,
+}
+
 class DatabaseManager:
     """Manages database connections and queries"""
 
@@ -81,6 +89,13 @@ class DatabaseManager:
     # ========================================================================
     # GEX Queries
     # ========================================================================
+
+    def _get_timeframe_minutes(self, timeframe: str) -> int:
+        """Convert API timeframe alias to minute count."""
+        tf = timeframe.lower()
+        if tf not in TIMEFRAME_TO_MINUTES:
+            raise ValueError(f"Unsupported timeframe '{timeframe}'. Use one of: {', '.join(TIMEFRAME_TO_MINUTES)}")
+        return TIMEFRAME_TO_MINUTES[tf]
 
     async def get_latest_gex_summary(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
         """Get latest GEX summary"""
@@ -163,39 +178,42 @@ class DatabaseManager:
         symbol: str = 'SPY',
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
-        limit: int = 100
+        limit: int = 100,
+        timeframe: str = "1m",
     ) -> List[Dict[str, Any]]:
         """Get historical GEX summary data"""
+        timeframe_minutes = self._get_timeframe_minutes(timeframe)
         if not start_date:
             start_date = datetime.now() - timedelta(days=1)
         if not end_date:
             end_date = datetime.now()
 
         query = """
-            SELECT 
-                timestamp,
+            SELECT
+                DATE_BIN(($5 || ' minutes')::interval, timestamp, TIMESTAMP '2001-01-01') as timestamp,
                 underlying as symbol,
-                max_gamma_strike as spot_price,
-                total_call_oi::numeric as total_call_gex,
-                total_put_oi::numeric as total_put_gex,
-                total_net_gex as net_gex,
-                gamma_flip_point as gamma_flip,
-                max_pain,
-                max_gamma_strike as call_wall,
-                max_gamma_strike as put_wall,
-                total_call_oi,
-                total_put_oi,
-                put_call_ratio
+                AVG(max_gamma_strike)::numeric as spot_price,
+                AVG(total_call_oi)::numeric as total_call_gex,
+                AVG(total_put_oi)::numeric as total_put_gex,
+                AVG(total_net_gex)::numeric as net_gex,
+                AVG(gamma_flip_point)::numeric as gamma_flip,
+                AVG(max_pain)::numeric as max_pain,
+                AVG(max_gamma_strike)::numeric as call_wall,
+                AVG(max_gamma_strike)::numeric as put_wall,
+                AVG(total_call_oi)::bigint as total_call_oi,
+                AVG(total_put_oi)::bigint as total_put_oi,
+                AVG(put_call_ratio)::numeric as put_call_ratio
             FROM gex_summary
             WHERE underlying = $1
                 AND timestamp BETWEEN $2 AND $3
+            GROUP BY DATE_BIN(($5 || ' minutes')::interval, timestamp, TIMESTAMP '2001-01-01'), underlying
             ORDER BY timestamp DESC
             LIMIT $4
         """
 
         try:
             async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, symbol, start_date, end_date, limit)
+                rows = await conn.fetch(query, symbol, start_date, end_date, limit, timeframe_minutes)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching historical GEX: {e}")
@@ -627,33 +645,49 @@ class DatabaseManager:
         symbol: str = 'SPY',
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
-        limit: int = 100
+        limit: int = 100,
+        timeframe: str = "1m",
     ) -> List[Dict[str, Any]]:
         """Get historical quotes"""
+        timeframe_minutes = self._get_timeframe_minutes(timeframe)
         if not start_date:
             start_date = datetime.now() - timedelta(days=1)
         if not end_date:
             end_date = datetime.now()
 
         query = """
-            SELECT 
-                timestamp,
+            WITH bucketed AS (
+                SELECT
+                    DATE_BIN(($5 || ' minutes')::interval, timestamp, TIMESTAMP '2001-01-01') as bucket_ts,
+                    symbol,
+                    open,
+                    high,
+                    low,
+                    close,
+                    up_volume,
+                    down_volume,
+                    timestamp
+                FROM underlying_quotes
+                WHERE symbol = $1
+                    AND timestamp BETWEEN $2 AND $3
+            )
+            SELECT
+                bucket_ts as timestamp,
                 symbol,
-                open,
-                high,
-                low,
-                close,
-                up_volume + down_volume as volume
-            FROM underlying_quotes
-            WHERE symbol = $1
-                AND timestamp BETWEEN $2 AND $3
+                (ARRAY_AGG(open ORDER BY timestamp ASC))[1] as open,
+                MAX(high) as high,
+                MIN(low) as low,
+                (ARRAY_AGG(close ORDER BY timestamp DESC))[1] as close,
+                SUM(up_volume + down_volume) as volume
+            FROM bucketed
+            GROUP BY bucket_ts, symbol
             ORDER BY timestamp DESC
             LIMIT $4
         """
 
         try:
             async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, symbol, start_date, end_date, limit)
+                rows = await conn.fetch(query, symbol, start_date, end_date, limit, timeframe_minutes)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching historical quotes: {e}")
@@ -666,12 +700,14 @@ class DatabaseManager:
         self,
         symbol: str = 'SPY',
         window_minutes: int = 60,
-        interval_minutes: int = 5
+        interval_minutes: int = 5,
+        timeframe: str = "1m",
     ) -> List[Dict[str, Any]]:
         """
         Get GEX data by strike over time for heatmap visualization
         Returns time-series data of GEX by strike aligned to underlying price timestamps
         """
+        timeframe_minutes = self._get_timeframe_minutes(timeframe)
         query = """
             WITH latest_price_timestamp AS (
                 -- Use latest underlying price timestamp as baseline
@@ -693,14 +729,15 @@ class DatabaseManager:
                 LIMIT 1
             ),
             recent_data AS (
-                SELECT 
-                    timestamp,
+                SELECT
+                    DATE_BIN(($3 || ' minutes')::interval, timestamp, TIMESTAMP '2001-01-01') as timestamp,
                     strike,
-                    net_gex
+                    AVG(net_gex) as net_gex
                 FROM gex_by_strike
                 WHERE underlying = $1
                     AND timestamp >= (SELECT start_time FROM time_window)
                     AND timestamp <= (SELECT end_time FROM time_window)
+                GROUP BY DATE_BIN(($3 || ' minutes')::interval, timestamp, TIMESTAMP '2001-01-01'), strike
             ),
             filtered_data AS (
                 SELECT 
@@ -721,7 +758,7 @@ class DatabaseManager:
 
         try:
             async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, symbol, window_minutes)
+                rows = await conn.fetch(query, symbol, window_minutes, timeframe_minutes)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching GEX heatmap: {e}")
@@ -731,13 +768,15 @@ class DatabaseManager:
         self,
         symbol: str = 'SPY',
         window_minutes: int = 60,
-        interval_minutes: int = 5
+        interval_minutes: int = 5,
+        timeframe: str = "1m",
     ) -> List[Dict[str, Any]]:
         """
         Get aggregated call/put notional flow over time
         Returns time-series data for flow chart
         If no recent data, returns the last available window of data
         """
+        timeframe_minutes = self._get_timeframe_minutes(timeframe)
         query = """
             WITH latest_timestamp AS (
                 SELECT MAX(timestamp) as max_ts
@@ -755,23 +794,24 @@ class DatabaseManager:
                 FROM latest_timestamp
             )
             SELECT 
-                timestamp,
-                call_notional,
-                put_notional,
-                call_flow,
-                put_flow,
-                net_notional,
-                net_flow
+                DATE_BIN(($3 || ' minutes')::interval, timestamp, TIMESTAMP '2001-01-01') as timestamp,
+                SUM(call_notional) as call_notional,
+                SUM(put_notional) as put_notional,
+                SUM(call_flow) as call_flow,
+                SUM(put_flow) as put_flow,
+                SUM(net_notional) as net_notional,
+                SUM(net_flow) as net_flow
             FROM option_flow_by_type
             WHERE underlying = $1
                 AND timestamp >= (SELECT start_time FROM time_window)
                 AND timestamp <= (SELECT end_time FROM time_window)
+            GROUP BY DATE_BIN(($3 || ' minutes')::interval, timestamp, TIMESTAMP '2001-01-01')
             ORDER BY timestamp ASC
         """
 
         try:
             async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, symbol, window_minutes)
+                rows = await conn.fetch(query, symbol, window_minutes, timeframe_minutes)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching flow timeseries: {e}")
@@ -781,13 +821,15 @@ class DatabaseManager:
         self,
         symbol: str = 'SPY',
         window_minutes: int = 60,
-        interval_minutes: int = 5
+        interval_minutes: int = 5,
+        timeframe: str = "1m",
     ) -> List[Dict[str, Any]]:
         """
         Get underlying price time-series data
         Returns timestamp and price for chart overlay
         If no recent data, returns the last available window of data
         """
+        timeframe_minutes = self._get_timeframe_minutes(timeframe)
         query = """
             WITH latest_timestamp AS (
                 SELECT MAX(timestamp) as max_ts
@@ -804,19 +846,20 @@ class DatabaseManager:
                     max_ts as end_time
                 FROM latest_timestamp
             )
-            SELECT 
-                timestamp,
-                close as price
+            SELECT
+                DATE_BIN(($3 || ' minutes')::interval, timestamp, TIMESTAMP '2001-01-01') as timestamp,
+                (ARRAY_AGG(close ORDER BY timestamp DESC))[1] as price
             FROM underlying_quotes
             WHERE symbol = $1
                 AND timestamp >= (SELECT start_time FROM time_window)
                 AND timestamp <= (SELECT end_time FROM time_window)
+            GROUP BY DATE_BIN(($3 || ' minutes')::interval, timestamp, TIMESTAMP '2001-01-01')
             ORDER BY timestamp ASC
         """
 
         try:
             async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, symbol, window_minutes)
+                rows = await conn.fetch(query, symbol, window_minutes, timeframe_minutes)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching price timeseries: {e}")
