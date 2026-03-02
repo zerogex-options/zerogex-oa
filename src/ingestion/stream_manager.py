@@ -64,11 +64,27 @@ class StreamManager:
         # Track last expiration refresh time
         self.last_expiration_refresh: Optional[datetime] = None
 
+        # Directional volume cache (avoid blocking on stream-bars each quote poll)
+        self._last_directional_volume: Dict[str, Optional[int]] = {
+            "up_volume": None,
+            "down_volume": None,
+            "total_volume": None,
+        }
+        self._last_directional_volume_fetch_ts: Optional[datetime] = None
+
         logger.info(f"Initialized StreamManager for {underlying}")
         logger.info(f"Config: {num_expirations} expirations, ±${strike_distance} strikes")
 
-    def _fetch_directional_volume_from_stream_bar(self) -> Dict[str, Optional[int]]:
-        """Fetch latest stream bar and return direct up/down/total volume fields."""
+    def _fetch_directional_volume_from_stream_bar(self, force: bool = False) -> Dict[str, Optional[int]]:
+        """Fetch latest stream bar and return direct up/down/total volume fields.
+
+        This call is throttled and cached to prevent stream-loop stalls.
+        """
+        now_et = datetime.now(ET)
+        if (not force and self._last_directional_volume_fetch_ts and
+                (now_et - self._last_directional_volume_fetch_ts).total_seconds() < 20):
+            return self._last_directional_volume
+
         try:
             bars_data = self.client.get_stream_bars(
                 symbol=self.underlying,
@@ -78,18 +94,21 @@ class StreamManager:
                 warn_if_closed=False,
             )
             bars = bars_data.get("Bars", [])
+            self._last_directional_volume_fetch_ts = now_et
             if not bars:
-                return {"up_volume": None, "down_volume": None, "total_volume": None}
+                return self._last_directional_volume
 
             bar = bars[-1]
-            return {
+            result = {
                 "up_volume": safe_int(bar.get("UpVolume"), field_name="UpVolume") if bar.get("UpVolume") is not None else None,
                 "down_volume": safe_int(bar.get("DownVolume"), field_name="DownVolume") if bar.get("DownVolume") is not None else None,
                 "total_volume": safe_int(bar.get("TotalVolume"), field_name="TotalVolume") if bar.get("TotalVolume") is not None else None,
             }
+            self._last_directional_volume = result
+            return result
         except Exception as e:
             logger.debug(f"Stream bar volume fallback unavailable: {e}")
-            return {"up_volume": None, "down_volume": None, "total_volume": None}
+            return self._last_directional_volume
 
     def _fetch_underlying_bar(self) -> Optional[Dict[str, Any]]:
         """
@@ -134,8 +153,8 @@ class StreamManager:
             down_volume = safe_int(raw_down_volume, field_name="DownVolume") if raw_down_volume is not None else None
 
             # Non-inferred fallback: if quote payload omits directional volume fields,
-            # read them directly from the latest stream bar payload.
-            if up_volume is None or down_volume is None:
+            # read direct fields from stream-bar payload (cached/throttled).
+            if up_volume is None or down_volume is None or total_volume is None:
                 stream_vol = self._fetch_directional_volume_from_stream_bar()
                 if up_volume is None:
                     up_volume = stream_vol["up_volume"]
