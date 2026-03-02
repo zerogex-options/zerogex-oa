@@ -67,6 +67,30 @@ class StreamManager:
         logger.info(f"Initialized StreamManager for {underlying}")
         logger.info(f"Config: {num_expirations} expirations, ±${strike_distance} strikes")
 
+    def _fetch_directional_volume_from_stream_bar(self) -> Dict[str, Optional[int]]:
+        """Fetch latest stream bar and return direct up/down/total volume fields."""
+        try:
+            bars_data = self.client.get_stream_bars(
+                symbol=self.underlying,
+                interval=1,
+                unit="Minute",
+                sessiontemplate="USEQ24Hour",
+                warn_if_closed=False,
+            )
+            bars = bars_data.get("Bars", [])
+            if not bars:
+                return {"up_volume": None, "down_volume": None, "total_volume": None}
+
+            bar = bars[-1]
+            return {
+                "up_volume": safe_int(bar.get("UpVolume"), field_name="UpVolume") if bar.get("UpVolume") is not None else None,
+                "down_volume": safe_int(bar.get("DownVolume"), field_name="DownVolume") if bar.get("DownVolume") is not None else None,
+                "total_volume": safe_int(bar.get("TotalVolume"), field_name="TotalVolume") if bar.get("TotalVolume") is not None else None,
+            }
+        except Exception as e:
+            logger.debug(f"Stream bar volume fallback unavailable: {e}")
+            return {"up_volume": None, "down_volume": None, "total_volume": None}
+
     def _fetch_underlying_bar(self) -> Optional[Dict[str, Any]]:
         """
         Fetch latest underlying quote and normalize to in-progress minute bar.
@@ -108,6 +132,17 @@ class StreamManager:
 
             raw_down_volume = quote.get("DownVolume") or quote.get("DailyDownVolume")
             down_volume = safe_int(raw_down_volume, field_name="DownVolume") if raw_down_volume is not None else None
+
+            # Non-inferred fallback: if quote payload omits directional volume fields,
+            # read them directly from the latest stream bar payload.
+            if up_volume is None or down_volume is None:
+                stream_vol = self._fetch_directional_volume_from_stream_bar()
+                if up_volume is None:
+                    up_volume = stream_vol["up_volume"]
+                if down_volume is None:
+                    down_volume = stream_vol["down_volume"]
+                if total_volume is None:
+                    total_volume = stream_vol["total_volume"]
 
             underlying_data = {
                 "symbol": self.underlying,
