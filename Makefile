@@ -849,21 +849,35 @@ gex-preview: ## Preview GEX calculation data
 flow-by-type: ## Puts vs calls flow (all strikes/expirations)
 	@echo "$(BLUE)=== Option Flow by Type (Last Hour) ===$(NC)"
 	@$(PSQL) -c "\
+		WITH latest AS ( \
+			SELECT MAX(timestamp) AS max_ts \
+			FROM option_flow_by_type \
+		), flow_window AS ( \
+			SELECT \
+				TO_CHAR(time_et, 'HH24:MI') as time, \
+				underlying, \
+				call_flow, \
+				TO_CHAR(call_notional, 'FM999,999,999') as call_notional, \
+				put_flow, \
+				TO_CHAR(put_notional, 'FM999,999,999') as put_notional, \
+				net_flow, \
+				TO_CHAR(net_notional, 'FM999,999,999') as net_notional, \
+				put_call_ratio as pc_ratio, \
+				put_call_notional_ratio as pc_not_ratio, \
+				timestamp \
+			FROM option_flow_by_type \
+			WHERE timestamp >= COALESCE((SELECT max_ts - INTERVAL '1 hour' FROM latest), NOW() - INTERVAL '1 hour') \
+			ORDER BY timestamp DESC \
+			LIMIT 20 \
+		) \
+		SELECT time, underlying, call_flow, call_notional, put_flow, put_notional, net_flow, net_notional, pc_ratio, pc_not_ratio \
+		FROM flow_window \
+		UNION ALL \
 		SELECT \
-			TO_CHAR(time_et, 'HH24:MI') as time, \
-			underlying, \
-			call_flow, \
-			TO_CHAR(call_notional, 'FM999,999,999') as call_notional, \
-			put_flow, \
-			TO_CHAR(put_notional, 'FM999,999,999') as put_notional, \
-			net_flow, \
-			TO_CHAR(net_notional, 'FM999,999,999') as net_notional, \
-			put_call_ratio as pc_ratio, \
-			put_call_notional_ratio as pc_not_ratio \
-		FROM option_flow_by_type \
-		WHERE timestamp > NOW() - INTERVAL '1 hour' \
-		ORDER BY timestamp DESC \
-		LIMIT 20;"
+			NULL::text as time, \
+			'No option flow rows available in option_flow_by_type (check ingestion and volume_delta > 0 filters).'::text as underlying, \
+			NULL::bigint, NULL::text, NULL::bigint, NULL::text, NULL::bigint, NULL::text, NULL::numeric, NULL::numeric \
+		WHERE NOT EXISTS (SELECT 1 FROM flow_window);"
 
 .PHONY: flow-by-strike
 flow-by-strike: ## Flow by strike level
