@@ -60,8 +60,7 @@ class IngestionEngine:
 
         self.running = False
 
-        # Aggregation buffers
-        self.current_bucket: Optional[datetime] = None
+        # Buffering for options only (underlying writes every update)
         self.underlying_buffer: List[Dict[str, Any]] = []
         self.options_buffer: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
@@ -133,24 +132,24 @@ class IngestionEngine:
             logger.error(f"Error checking database: {e}", exc_info=True)
 
     def _store_underlying(self, data: Dict[str, Any]):
-        """
-        Buffer underlying bar for 1-minute aggregation
-
-        Now receives bar data (OHLC + up/down volumes) from Stream Bars API
-
-        Args:
-            data: Underlying bar data with OHLC and up/down volumes
-        """
-        # Get timestamp and bucket it
+        """Store latest 1-minute underlying bar snapshot with upsert semantics."""
+        # The stream delivers the current 1-minute bar continuously.
+        # Persist each update immediately and overwrite the in-progress minute.
         timestamp = data["timestamp"]
         bucket = bucket_timestamp(timestamp, AGGREGATION_BUCKET_SECONDS)
 
-        # If new bucket, flush previous
-        if self.current_bucket and bucket > self.current_bucket:
-            self._flush_underlying_bucket()
+        payload = {
+            "symbol": data["symbol"],
+            "timestamp": bucket,
+            "open": data["open"],
+            "high": data["high"],
+            "low": data["low"],
+            "close": data["close"],
+            "up_volume": data.get("up_volume", 0),
+            "down_volume": data.get("down_volume", 0),
+        }
 
-        self.current_bucket = bucket
-        self.underlying_buffer.append(data)
+        self._upsert_underlying_quote(payload)
 
         # Track latest underlying price for Greeks calculation
         old_price = self.latest_underlying_price
@@ -164,36 +163,13 @@ class IngestionEngine:
             elif self.underlying_bars_stored % 10 == 0:  # Log every 10 bars
                 logger.debug(f"Underlying price updated: ${self.latest_underlying_price:.2f}")
 
-        # Flush if buffer too large
-        if len(self.underlying_buffer) >= MAX_BUFFER_SIZE:
-            self._flush_underlying_bucket()
-
-    def _flush_underlying_bucket(self):
-        """Aggregate and store 1-minute underlying bar"""
-        if not self.underlying_buffer:
-            return
-
+    def _upsert_underlying_quote(self, quote: Dict[str, Any]):
+        """Upsert one underlying quote row for the current minute bucket."""
         try:
-            # Aggregate: first open, max high, min low, last close, sum volumes
-            first = self.underlying_buffer[0]
-            last = self.underlying_buffer[-1]
-
-            agg = {
-                "symbol": first["symbol"],
-                "timestamp": self.current_bucket,
-                "open": first["open"],
-                "high": max(d["high"] for d in self.underlying_buffer),
-                "low": min(d["low"] for d in self.underlying_buffer),
-                "close": last["close"],
-                "up_volume": sum(d.get("up_volume", 0) for d in self.underlying_buffer),
-                "down_volume": sum(d.get("down_volume", 0) for d in self.underlying_buffer),
-            }
-
-            # Store in database
             with db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    INSERT INTO underlying_quotes 
+                    INSERT INTO underlying_quotes
                     (symbol, timestamp, open, high, low, close, up_volume, down_volume)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (symbol, timestamp) DO UPDATE SET
@@ -205,29 +181,27 @@ class IngestionEngine:
                         down_volume = EXCLUDED.down_volume,
                         updated_at = NOW()
                 """, (
-                    agg["symbol"], 
-                    agg["timestamp"],
-                    agg["open"],
-                    agg["high"],
-                    agg["low"],
-                    agg["close"],
-                    agg["up_volume"],
-                    agg["down_volume"]
+                    quote["symbol"],
+                    quote["timestamp"],
+                    quote["open"],
+                    quote["high"],
+                    quote["low"],
+                    quote["close"],
+                    quote["up_volume"],
+                    quote["down_volume"],
                 ))
                 conn.commit()
 
             self.underlying_bars_stored += 1
-            logger.info(f"✅ Stored 1-min bar: {agg['symbol']} @ {agg['timestamp']} "
-                       f"O=${agg['open']:.2f} H=${agg['high']:.2f} "
-                       f"L=${agg['low']:.2f} C=${agg['close']:.2f} "
-                       f"UpVol={agg['up_volume']:,} DownVol={agg['down_volume']:,}")
-
-            self.underlying_buffer = []
             self.last_flush_time = datetime.now(ET)
 
         except Exception as e:
-            logger.error(f"Error flushing underlying bucket: {e}", exc_info=True)
+            logger.error(f"Error upserting underlying quote: {e}", exc_info=True)
             self.errors_count += 1
+
+    def _flush_underlying_bucket(self):
+        """No-op: underlying bars are written immediately per update."""
+        return
 
     def _store_option(self, data: Dict[str, Any]):
         """

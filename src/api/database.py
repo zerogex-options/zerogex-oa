@@ -12,6 +12,27 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+
+def _bucket_expr(timeframe: str, column: str = 'timestamp') -> str:
+    if timeframe == '1min':
+        return f"date_trunc('minute', {column})"
+    if timeframe == '5min':
+        return (
+            f"date_trunc('hour', {column}) + "
+            f"FLOOR(EXTRACT(MINUTE FROM {column}) / 5) * INTERVAL '5 minutes'"
+        )
+    if timeframe == '15min':
+        return (
+            f"date_trunc('hour', {column}) + "
+            f"FLOOR(EXTRACT(MINUTE FROM {column}) / 15) * INTERVAL '15 minutes'"
+        )
+    if timeframe == '1hour':
+        return f"date_trunc('hour', {column})"
+    if timeframe == '1day':
+        return f"date_trunc('day', {column})"
+    raise ValueError(f'Unsupported timeframe: {timeframe}')
+
 class DatabaseManager:
     """Manages database connections and queries"""
 
@@ -163,7 +184,8 @@ class DatabaseManager:
         symbol: str = 'SPY',
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
-        limit: int = 100
+        limit: int = 100,
+        timeframe: str = '1min'
     ) -> List[Dict[str, Any]]:
         """Get historical GEX summary data"""
         if not start_date:
@@ -171,24 +193,45 @@ class DatabaseManager:
         if not end_date:
             end_date = datetime.now()
 
-        query = """
-            SELECT 
-                timestamp,
-                underlying as symbol,
-                max_gamma_strike as spot_price,
-                total_call_oi::numeric as total_call_gex,
-                total_put_oi::numeric as total_put_gex,
-                total_net_gex as net_gex,
-                gamma_flip_point as gamma_flip,
+        bucket = _bucket_expr(timeframe if timeframe else "5min")
+        query = f"""
+            WITH base AS (
+                SELECT
+                    timestamp,
+                    underlying as symbol,
+                    max_gamma_strike as spot_price,
+                    total_call_oi::numeric as total_call_gex,
+                    total_put_oi::numeric as total_put_gex,
+                    total_net_gex as net_gex,
+                    gamma_flip_point as gamma_flip,
+                    max_pain,
+                    max_gamma_strike as call_wall,
+                    max_gamma_strike as put_wall,
+                    total_call_oi,
+                    total_put_oi,
+                    put_call_ratio,
+                    {bucket} as bucket_ts,
+                    ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) as rn
+                FROM gex_summary
+                WHERE underlying = $1
+                    AND timestamp BETWEEN $2 AND $3
+            )
+            SELECT
+                bucket_ts as timestamp,
+                symbol,
+                spot_price,
+                total_call_gex,
+                total_put_gex,
+                net_gex,
+                gamma_flip,
                 max_pain,
-                max_gamma_strike as call_wall,
-                max_gamma_strike as put_wall,
+                call_wall,
+                put_wall,
                 total_call_oi,
                 total_put_oi,
                 put_call_ratio
-            FROM gex_summary
-            WHERE underlying = $1
-                AND timestamp BETWEEN $2 AND $3
+            FROM base
+            WHERE rn = 1
             ORDER BY timestamp DESC
             LIMIT $4
         """
@@ -212,50 +255,51 @@ class DatabaseManager:
     ) -> List[Dict[str, Any]]:
         """Get option flow by type (calls vs puts)"""
         query = """
-            SELECT 
+            WITH filtered AS (
+                SELECT *
+                FROM option_flow_by_type
+                WHERE underlying = $1
+                  AND timestamp >= $2
+            )
+            SELECT
                 time_et as time_window_start,
                 timestamp as time_window_end,
                 underlying as symbol,
                 'CALL' as option_type,
-                call_flow as total_volume,
-                call_notional as total_premium,
+                COALESCE(call_flow, 0)::bigint as total_volume,
+                COALESCE(call_notional, 0)::numeric as total_premium,
                 NULL::numeric as avg_iv,
-                call_flow - put_flow as net_delta,
-                CASE 
-                    WHEN call_flow > put_flow THEN 'bullish'
-                    WHEN put_flow > call_flow THEN 'bearish'
+                (COALESCE(call_flow, 0) - COALESCE(put_flow, 0))::numeric as net_delta,
+                CASE
+                    WHEN COALESCE(call_flow, 0) > COALESCE(put_flow, 0) THEN 'bullish'
+                    WHEN COALESCE(put_flow, 0) > COALESCE(call_flow, 0) THEN 'bearish'
                     ELSE 'neutral'
                 END as sentiment
-            FROM option_flow_by_type
-            WHERE underlying = $1
-                AND timestamp >= $2
+            FROM filtered
 
             UNION ALL
 
-            SELECT 
+            SELECT
                 time_et as time_window_start,
                 timestamp as time_window_end,
                 underlying as symbol,
                 'PUT' as option_type,
-                put_flow as total_volume,
-                put_notional as total_premium,
+                COALESCE(put_flow, 0)::bigint as total_volume,
+                COALESCE(put_notional, 0)::numeric as total_premium,
                 NULL::numeric as avg_iv,
-                put_flow - call_flow as net_delta,
-                CASE 
-                    WHEN put_flow > call_flow THEN 'bearish'
-                    WHEN call_flow > put_flow THEN 'bullish'
+                (COALESCE(put_flow, 0) - COALESCE(call_flow, 0))::numeric as net_delta,
+                CASE
+                    WHEN COALESCE(put_flow, 0) > COALESCE(call_flow, 0) THEN 'bearish'
+                    WHEN COALESCE(call_flow, 0) > COALESCE(put_flow, 0) THEN 'bullish'
                     ELSE 'neutral'
                 END as sentiment
-            FROM option_flow_by_type
-            WHERE underlying = $1
-                AND timestamp >= $2
+            FROM filtered
 
             ORDER BY time_window_end DESC, option_type
         """
 
         try:
             async with self.pool.acquire() as conn:
-                # Calculate cutoff time in Python
                 cutoff_time = datetime.now() - timedelta(minutes=window_minutes)
                 rows = await conn.fetch(query, symbol, cutoff_time)
                 return [dict(row) for row in rows]
@@ -271,25 +315,24 @@ class DatabaseManager:
     ) -> List[Dict[str, Any]]:
         """Get option flow by strike level"""
         query = """
-            SELECT 
+            SELECT
                 time_et as time_window_start,
                 timestamp as time_window_end,
                 underlying as symbol,
                 strike,
-                total_flow as total_volume,
-                total_notional as total_premium,
+                COALESCE(total_flow, 0)::bigint as total_volume,
+                COALESCE(total_notional, 0)::numeric as total_premium,
                 avg_iv,
-                net_flow as net_delta
+                COALESCE(net_flow, 0)::numeric as net_delta
             FROM option_flow_by_strike
             WHERE underlying = $1
                 AND timestamp >= $2
-            ORDER BY total_notional DESC
+            ORDER BY total_notional DESC NULLS LAST
             LIMIT $3
         """
 
         try:
             async with self.pool.acquire() as conn:
-                # Calculate cutoff time in Python
                 cutoff_time = datetime.now() - timedelta(minutes=window_minutes)
                 rows = await conn.fetch(query, symbol, cutoff_time, limit)
                 return [dict(row) for row in rows]
@@ -305,14 +348,14 @@ class DatabaseManager:
     ) -> List[Dict[str, Any]]:
         """Get unusual activity / smart money flow"""
         query = """
-            SELECT 
+            SELECT
                 time_et as time_window_start,
                 timestamp as time_window_end,
                 underlying as symbol,
                 option_type,
                 strike,
-                flow as total_volume,
-                notional as total_premium,
+                COALESCE(flow, 0)::bigint as total_volume,
+                COALESCE(notional, 0)::numeric as total_premium,
                 iv as avg_iv,
                 unusual_score as unusual_activity_score,
                 size_class,
@@ -328,17 +371,12 @@ class DatabaseManager:
 
         try:
             async with self.pool.acquire() as conn:
-                # Calculate cutoff time in Python
                 cutoff_time = datetime.now() - timedelta(minutes=window_minutes)
                 rows = await conn.fetch(query, symbol, cutoff_time, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching smart money flow: {e}")
             raise
-
-    # ========================================================================
-    # Day Trading Views Queries
-    # ========================================================================
 
     async def get_vwap_deviation(
         self,
@@ -627,7 +665,8 @@ class DatabaseManager:
         symbol: str = 'SPY',
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
-        limit: int = 100
+        limit: int = 100,
+        timeframe: str = '1min'
     ) -> List[Dict[str, Any]]:
         """Get historical quotes"""
         if not start_date:
@@ -635,18 +674,34 @@ class DatabaseManager:
         if not end_date:
             end_date = datetime.now()
 
-        query = """
-            SELECT 
-                timestamp,
+        bucket = _bucket_expr(timeframe)
+        query = f"""
+            WITH base AS (
+                SELECT
+                    {bucket} as bucket_ts,
+                    symbol,
+                    timestamp,
+                    open,
+                    high,
+                    low,
+                    close,
+                    up_volume + down_volume as volume,
+                    ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp ASC) as rn_open,
+                    ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) as rn_close
+                FROM underlying_quotes
+                WHERE symbol = $1
+                    AND timestamp BETWEEN $2 AND $3
+            )
+            SELECT
+                bucket_ts as timestamp,
                 symbol,
-                open,
-                high,
-                low,
-                close,
-                up_volume + down_volume as volume
-            FROM underlying_quotes
-            WHERE symbol = $1
-                AND timestamp BETWEEN $2 AND $3
+                MAX(open) FILTER (WHERE rn_open = 1) as open,
+                MAX(high) as high,
+                MIN(low) as low,
+                MAX(close) FILTER (WHERE rn_close = 1) as close,
+                SUM(volume)::bigint as volume
+            FROM base
+            GROUP BY bucket_ts, symbol
             ORDER BY timestamp DESC
             LIMIT $4
         """
@@ -666,13 +721,15 @@ class DatabaseManager:
         self,
         symbol: str = 'SPY',
         window_minutes: int = 60,
-        interval_minutes: int = 5
+        interval_minutes: int = 5,
+        timeframe: str = '5min'
     ) -> List[Dict[str, Any]]:
         """
         Get GEX data by strike over time for heatmap visualization
         Returns time-series data of GEX by strike aligned to underlying price timestamps
         """
-        query = """
+        bucket = _bucket_expr(timeframe)
+        query = f"""
             WITH latest_price_timestamp AS (
                 -- Use latest underlying price timestamp as baseline
                 SELECT MAX(timestamp) as max_ts
@@ -694,13 +751,14 @@ class DatabaseManager:
             ),
             recent_data AS (
                 SELECT 
-                    timestamp,
+                    {bucket} as timestamp,
                     strike,
-                    net_gex
+                    AVG(net_gex) as net_gex
                 FROM gex_by_strike
                 WHERE underlying = $1
                     AND timestamp >= (SELECT start_time FROM time_window)
                     AND timestamp <= (SELECT end_time FROM time_window)
+                GROUP BY 1, strike
             ),
             filtered_data AS (
                 SELECT 
@@ -731,22 +789,24 @@ class DatabaseManager:
         self,
         symbol: str = 'SPY',
         window_minutes: int = 60,
-        interval_minutes: int = 5
+        interval_minutes: int = 5,
+        timeframe: str = '5min'
     ) -> List[Dict[str, Any]]:
         """
         Get aggregated call/put notional flow over time
         Returns time-series data for flow chart
         If no recent data, returns the last available window of data
         """
-        query = """
+        bucket = _bucket_expr(timeframe)
+        query = f"""
             WITH latest_timestamp AS (
                 SELECT MAX(timestamp) as max_ts
                 FROM option_flow_by_type
                 WHERE underlying = $1
             ),
             time_window AS (
-                SELECT 
-                    CASE 
+                SELECT
+                    CASE
                         WHEN max_ts >= NOW() - INTERVAL '1 minute' * $2
                         THEN NOW() - INTERVAL '1 minute' * $2
                         ELSE max_ts - INTERVAL '1 minute' * $2
@@ -754,18 +814,19 @@ class DatabaseManager:
                     max_ts as end_time
                 FROM latest_timestamp
             )
-            SELECT 
-                timestamp,
-                call_notional,
-                put_notional,
-                call_flow,
-                put_flow,
-                net_notional,
-                net_flow
+            SELECT
+                {bucket} as timestamp,
+                COALESCE(SUM(call_notional), 0)::numeric as call_notional,
+                COALESCE(SUM(put_notional), 0)::numeric as put_notional,
+                COALESCE(SUM(call_flow), 0)::numeric as call_flow,
+                COALESCE(SUM(put_flow), 0)::numeric as put_flow,
+                COALESCE(SUM(net_notional), 0)::numeric as net_notional,
+                COALESCE(SUM(net_flow), 0)::numeric as net_flow
             FROM option_flow_by_type
             WHERE underlying = $1
                 AND timestamp >= (SELECT start_time FROM time_window)
                 AND timestamp <= (SELECT end_time FROM time_window)
+            GROUP BY 1
             ORDER BY timestamp ASC
         """
 
@@ -781,36 +842,47 @@ class DatabaseManager:
         self,
         symbol: str = 'SPY',
         window_minutes: int = 60,
-        interval_minutes: int = 5
+        interval_minutes: int = 5,
+        timeframe: str = '5min'
     ) -> List[Dict[str, Any]]:
         """
         Get underlying price time-series data
         Returns timestamp and price for chart overlay
         If no recent data, returns the last available window of data
         """
-        query = """
+        bucket = _bucket_expr(timeframe if timeframe else "5min")
+        query = f"""
             WITH latest_timestamp AS (
                 SELECT MAX(timestamp) as max_ts
                 FROM underlying_quotes
                 WHERE symbol = $1
             ),
             time_window AS (
-                SELECT 
-                    CASE 
+                SELECT
+                    CASE
                         WHEN max_ts >= NOW() - INTERVAL '1 minute' * $2
                         THEN NOW() - INTERVAL '1 minute' * $2
                         ELSE max_ts - INTERVAL '1 minute' * $2
                     END as start_time,
                     max_ts as end_time
                 FROM latest_timestamp
+            ),
+            ranked AS (
+                SELECT
+                    {bucket} as bucket_ts,
+                    timestamp,
+                    close,
+                    ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) as rn
+                FROM underlying_quotes
+                WHERE symbol = $1
+                    AND timestamp >= (SELECT start_time FROM time_window)
+                    AND timestamp <= (SELECT end_time FROM time_window)
             )
-            SELECT 
-                timestamp,
+            SELECT
+                bucket_ts as timestamp,
                 close as price
-            FROM underlying_quotes
-            WHERE symbol = $1
-                AND timestamp >= (SELECT start_time FROM time_window)
-                AND timestamp <= (SELECT end_time FROM time_window)
+            FROM ranked
+            WHERE rn = 1
             ORDER BY timestamp ASC
         """
 

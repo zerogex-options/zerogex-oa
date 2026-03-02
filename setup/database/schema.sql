@@ -104,6 +104,10 @@ CREATE INDEX IF NOT EXISTS idx_option_chains_expiration ON option_chains(expirat
 CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_timestamp ON option_chains(underlying, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_exp_strike ON option_chains(underlying, expiration, strike);
 
+CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_time_type_strike
+    ON option_chains(underlying, timestamp DESC, option_type, strike);
+
+
 -- Add foreign key if it doesn't exist
 DO $$ 
 BEGIN
@@ -161,6 +165,8 @@ CREATE TABLE IF NOT EXISTS gex_summary (
 CREATE INDEX IF NOT EXISTS idx_gex_summary_timestamp ON gex_summary(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_gex_summary_underlying ON gex_summary(underlying);
 
+CREATE INDEX IF NOT EXISTS idx_gex_summary_underlying_timestamp ON gex_summary(underlying, timestamp DESC);
+
 -- Add foreign key if it doesn't exist
 DO $$ 
 BEGIN
@@ -200,6 +206,8 @@ CREATE TABLE IF NOT EXISTS gex_by_strike (
 CREATE INDEX IF NOT EXISTS idx_gex_by_strike_timestamp ON gex_by_strike(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_gex_by_strike_underlying ON gex_by_strike(underlying);
 CREATE INDEX IF NOT EXISTS idx_gex_by_strike_expiration ON gex_by_strike(expiration);
+
+CREATE INDEX IF NOT EXISTS idx_gex_by_strike_underlying_timestamp_strike ON gex_by_strike(underlying, timestamp DESC, strike);
 
 -- Add foreign key if it doesn't exist
 DO $$ 
