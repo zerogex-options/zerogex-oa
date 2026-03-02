@@ -18,6 +18,9 @@ ANALYTICS_SERVICE = zerogex-oa-analytics
 # Python virtual environment
 VENV_PYTHON = venv/bin/python
 
+# Flow query symbol filter (override with: make flow-by-type FLOW_SYMBOL=QQQ)
+FLOW_SYMBOL ?= SPY
+
 # Colors for output
 BLUE = \033[0;34m
 GREEN = \033[0;32m
@@ -114,12 +117,14 @@ help: ## Show this help message
 	@echo "  make gex-preview        - Preview GEX calculation data"
 	@echo ""
 	@echo "$(GREEN)Real-Time Flow Analysis:$(NC)"
-	@echo "  make flow-by-type         - Puts vs calls flow (all strikes/expirations)"
+	@echo "  make flow-by-type         - Puts vs calls flow (all strikes/expirations) [fast]"
+	@echo "  make flow-by-type-safe    - Puts vs calls flow with stale-data fallback [safe]"
 	@echo "  make flow-by-strike       - Flow by strike level"
 	@echo "  make flow-by-expiration   - Flow by expiration date"
 	@echo "  make flow-smart-money     - Unusual activity detection"
 	@echo "  make flow-buying-pressure - Underlying buying/selling pressure"
 	@echo "  make flow-live            - Combined real-time flow dashboard"
+	@echo "    (optional: FLOW_SYMBOL=SPY|QQQ|IWM, default SPY)"
 	@echo ""
 	@echo "$(GREEN)Day Trading Support:$(NC)"
 	@echo "  make vwap               - VWAP deviation tracker"
@@ -139,6 +144,11 @@ help: ## Show this help message
 	@echo "  make clear-data         - Clear all data (with confirmation)"
 	@echo "  make clear-options      - Clear only option chains"
 	@echo "  make clear-underlying   - Clear only underlying quotes"
+	@echo ""
+	@echo "$(GREEN)Database Schema:$(NC)"
+	@echo "  make schema-apply       - Apply/update setup/database/schema.sql"
+	@echo "  make schema-verify      - Verify schema components exist"
+	@echo "  make schema-backup      - Backup current schema to file"
 	@echo ""
 	@echo "$(GREEN)Maintenance:$(NC)"
 	@echo "  make vacuum             - Vacuum analyze all tables"
@@ -846,7 +856,7 @@ gex-preview: ## Preview GEX calculation data
 # =============================================================================
 
 .PHONY: flow-by-type
-flow-by-type: ## Puts vs calls flow (all strikes/expirations)
+flow-by-type: ## Puts vs calls flow (all strikes/expirations) [fast]
 	@echo "$(BLUE)=== Option Flow by Type (Last Hour) ===$(NC)"
 	@$(PSQL) -c "\
 		SELECT \
@@ -861,10 +871,45 @@ flow-by-type: ## Puts vs calls flow (all strikes/expirations)
 			put_call_ratio as pc_ratio, \
 			put_call_notional_ratio as pc_not_ratio \
 		FROM option_flow_by_type \
-		WHERE timestamp > NOW() - INTERVAL '1 hour' \
+		WHERE underlying = '$(FLOW_SYMBOL)' \
+			AND timestamp > NOW() - INTERVAL '1 hour' \
 		ORDER BY timestamp DESC \
 		LIMIT 20;"
 
+.PHONY: flow-by-type-safe
+flow-by-type-safe: ## Puts vs calls flow with stale-data fallback window [safe]
+	@echo "$(BLUE)=== Option Flow by Type (Safe Window) ===$(NC)"
+	@$(PSQL) -c "\
+		WITH latest AS ( \
+			SELECT MAX(timestamp) AS max_ts \
+			FROM option_flow_by_type \
+		), flow_window AS ( \
+			SELECT \
+				TO_CHAR(time_et, 'HH24:MI') as time, \
+				underlying, \
+				call_flow, \
+				TO_CHAR(call_notional, 'FM999,999,999') as call_notional, \
+				put_flow, \
+				TO_CHAR(put_notional, 'FM999,999,999') as put_notional, \
+				net_flow, \
+				TO_CHAR(net_notional, 'FM999,999,999') as net_notional, \
+				put_call_ratio as pc_ratio, \
+				put_call_notional_ratio as pc_not_ratio, \
+				timestamp \
+			FROM option_flow_by_type \
+			WHERE underlying = '$(FLOW_SYMBOL)' \
+				AND timestamp >= COALESCE((SELECT max_ts - INTERVAL '1 hour' FROM latest), NOW() - INTERVAL '1 hour') \
+			ORDER BY timestamp DESC \
+			LIMIT 20 \
+		) \
+		SELECT time, underlying, call_flow, call_notional, put_flow, put_notional, net_flow, net_notional, pc_ratio, pc_not_ratio \
+		FROM flow_window \
+		UNION ALL \
+		SELECT \
+			NULL::text as time, \
+			'No option flow rows available in option_flow_by_type (check ingestion and volume_delta > 0 filters).'::text as underlying, \
+			NULL::bigint, NULL::text, NULL::bigint, NULL::text, NULL::bigint, NULL::text, NULL::numeric, NULL::numeric \
+		WHERE NOT EXISTS (SELECT 1 FROM flow_window);"
 .PHONY: flow-by-strike
 flow-by-strike: ## Flow by strike level
 	@echo "$(BLUE)=== Option Flow by Strike (Last Hour, Top 15) ===$(NC)"
@@ -879,7 +924,8 @@ flow-by-strike: ## Flow by strike level
 			TO_CHAR(put_notional, 'FM999,999') as put_notional, \
 			TO_CHAR(total_notional, 'FM999,999') as total_notional \
 		FROM option_flow_by_strike \
-		WHERE timestamp > NOW() - INTERVAL '1 hour' \
+		WHERE underlying = '$(FLOW_SYMBOL)' \
+			AND timestamp > NOW() - INTERVAL '1 hour' \
 		ORDER BY total_notional DESC \
 		LIMIT 15;"
 
@@ -898,7 +944,8 @@ flow-by-expiration: ## Flow by expiration date
 			TO_CHAR(put_notional, 'FM999,999') as put_notional, \
 			TO_CHAR(total_notional, 'FM999,999') as total_notional \
 		FROM option_flow_by_expiration \
-		WHERE timestamp > NOW() - INTERVAL '1 hour' \
+		WHERE underlying = '$(FLOW_SYMBOL)' \
+			AND timestamp > NOW() - INTERVAL '1 hour' \
 		ORDER BY timestamp DESC, total_notional DESC \
 		LIMIT 20;"
 
@@ -920,7 +967,8 @@ flow-smart-money: ## Unusual activity detection
 			notional_class, \
 			size_class \
 		FROM option_flow_smart_money \
-		WHERE timestamp > NOW() - INTERVAL '1 hour' \
+		WHERE underlying = '$(FLOW_SYMBOL)' \
+			AND timestamp > NOW() - INTERVAL '1 hour' \
 		ORDER BY unusual_score DESC, notional DESC \
 		LIMIT 25;"
 
@@ -938,6 +986,7 @@ flow-buying-pressure: ## Underlying buying/selling pressure
 			ROUND(price_change, 2) as price_chg, \
 			momentum \
 		FROM underlying_buying_pressure \
+		WHERE symbol = '$(FLOW_SYMBOL)' \
 		ORDER BY timestamp DESC \
 		LIMIT 30;"
 
@@ -957,8 +1006,9 @@ flow-live: ## Combined real-time flow dashboard
 			period_buying_pressure_pct as buy_pct, \
 			momentum \
 		FROM underlying_buying_pressure \
+		WHERE symbol = '$(FLOW_SYMBOL)' \
 		ORDER BY timestamp DESC \
-		LIMIT 10;" 2>/dev/null
+		LIMIT 10;"
 	@echo ""
 	@echo "$(GREEN)2. PUTS VS CALLS FLOW (Last 10 Minutes)$(NC)"
 	@echo "--------------------------------------------------------------------------------"
@@ -970,9 +1020,10 @@ flow-live: ## Combined real-time flow dashboard
 			net_flow as net, \
 			put_call_ratio as pc_ratio \
 		FROM option_flow_by_type \
-		WHERE timestamp > NOW() - INTERVAL '30 minutes' \
+		WHERE underlying = '$(FLOW_SYMBOL)' \
+			AND timestamp > NOW() - INTERVAL '30 minutes' \
 		ORDER BY timestamp DESC \
-		LIMIT 10;" 2>/dev/null
+		LIMIT 10;"
 	@echo ""
 	@echo "$(GREEN)3. SMART MONEY / UNUSUAL ACTIVITY (Top 10)$(NC)"
 	@echo "--------------------------------------------------------------------------------"
@@ -985,9 +1036,10 @@ flow-live: ## Combined real-time flow dashboard
 			unusual_score as score, \
 			size_class \
 		FROM option_flow_smart_money \
-		WHERE timestamp > NOW() - INTERVAL '1 hour' \
+		WHERE underlying = '$(FLOW_SYMBOL)' \
+			AND timestamp > NOW() - INTERVAL '1 hour' \
 		ORDER BY unusual_score DESC, flow DESC \
-		LIMIT 10;" 2>/dev/null
+		LIMIT 10;"
 	@echo ""
 	@echo "$(GREEN)4. TOP STRIKES BY FLOW (Top 10)$(NC)"
 	@echo "--------------------------------------------------------------------------------"
@@ -999,9 +1051,10 @@ flow-live: ## Combined real-time flow dashboard
 			net_flow as net, \
 			total_flow as total \
 		FROM option_flow_by_strike \
-		WHERE timestamp > NOW() - INTERVAL '30 minutes' \
+		WHERE underlying = '$(FLOW_SYMBOL)' \
+			AND timestamp > NOW() - INTERVAL '30 minutes' \
 		ORDER BY total_flow DESC \
-		LIMIT 10;" 2>/dev/null
+		LIMIT 10;"
 	@echo ""
 	@echo "$(BLUE)================================================================================$(NC)"
 
@@ -1121,7 +1174,7 @@ day-trading: ## Combined day trading dashboard
 		FROM underlying_vwap_deviation \
 		WHERE timestamp > NOW() - INTERVAL '30 minutes' \
 		ORDER BY timestamp DESC \
-		LIMIT 10;" 2>/dev/null
+		LIMIT 10;"
 	@echo ""
 	@echo "$(GREEN)2. OPENING RANGE BREAKOUT$(NC)"
 	@echo "--------------------------------------------------------------------------------"
@@ -1134,7 +1187,7 @@ day-trading: ## Combined day trading dashboard
 			orb_status \
 		FROM opening_range_breakout \
 		ORDER BY timestamp DESC \
-		LIMIT 5;" 2>/dev/null
+		LIMIT 5;"
 	@echo ""
 	@echo "$(GREEN)3. GAMMA LEVELS (Top 10)$(NC)"
 	@echo "--------------------------------------------------------------------------------"
@@ -1145,7 +1198,7 @@ day-trading: ## Combined day trading dashboard
 			gex_level \
 		FROM gamma_exposure_levels \
 		ORDER BY ABS(net_gex) DESC \
-		LIMIT 10;" 2>/dev/null
+		LIMIT 10;"
 	@echo ""
 	@echo "$(GREEN)4. VOLUME SPIKES (Top 10)$(NC)"
 	@echo "--------------------------------------------------------------------------------"
@@ -1158,7 +1211,7 @@ day-trading: ## Combined day trading dashboard
 			volume_class \
 		FROM unusual_volume_spikes \
 		ORDER BY volume_sigma DESC \
-		LIMIT 10;" 2>/dev/null
+		LIMIT 10;"
 	@echo ""
 	@echo "$(GREEN)5. DIVERGENCE SIGNALS$(NC)"
 	@echo "--------------------------------------------------------------------------------"
@@ -1171,7 +1224,7 @@ day-trading: ## Combined day trading dashboard
 		FROM momentum_divergence \
 		WHERE divergence_signal != '⚪ Neutral' \
 		ORDER BY timestamp DESC \
-		LIMIT 10;" 2>/dev/null
+		LIMIT 10;"
 	@echo ""
 	@echo "$(BLUE)================================================================================$(NC)"
 
