@@ -402,7 +402,18 @@ SELECT
     option_type,
     last, bid, ask,
     volume, open_interest,
-    COALESCE(volume - LAG(volume) OVER (PARTITION BY option_symbol ORDER BY timestamp), 0) AS volume_delta,
+    -- Volume from data providers is typically session-cumulative and can reset each trading day.
+    -- Partitioning by ET trade date keeps deltas live/positive across session boundaries.
+    COALESCE(
+        GREATEST(
+            volume - LAG(volume) OVER (
+                PARTITION BY option_symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+                ORDER BY timestamp
+            ),
+            0
+        ),
+        0
+    ) AS volume_delta,
     COALESCE(open_interest - LAG(open_interest) OVER (PARTITION BY option_symbol ORDER BY timestamp), 0) AS oi_delta,
     implied_volatility,
     delta, gamma, theta, vega,
@@ -410,7 +421,7 @@ SELECT
 FROM option_chains;
 
 COMMENT ON VIEW option_chains_with_deltas IS
-'Real-time view calculating volume and OI deltas using window functions. Zero lag from base table.';
+'Real-time view calculating session-aware volume deltas (ET trading day partition) and OI deltas with window functions. Zero lag from base table.';
 
 
 -- =============================================================================
