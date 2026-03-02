@@ -430,11 +430,15 @@ async def get_flow_timeseries(
 @app.get("/api/price/timeseries")
 async def get_price_timeseries(
     symbol: str = Query(default="SPY"),
-    window_minutes: int = Query(default=60, le=1440),
-    interval_minutes: int = Query(default=5, le=60)
+    window_minutes: int = Query(default=60, le=10080),
+    interval_minutes: int = Query(default=5, le=60),
+    multi_timeframe: bool = Query(default=True)
 ):
-    """Get underlying price time-series data for chart overlay"""
+    """Get underlying price time-series data for chart overlay."""
     try:
+        if multi_timeframe:
+            return await db_manager.get_price_timeseries_multi_timeframe(symbol, window_minutes)
+
         data = await db_manager.get_price_timeseries(symbol, window_minutes, interval_minutes)
         return data if data else []
     except Exception as e:

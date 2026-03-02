@@ -134,66 +134,23 @@ class IngestionEngine:
 
     def _store_underlying(self, data: Dict[str, Any]):
         """
-        Buffer underlying bar for 1-minute aggregation
+        Store underlying quote immediately.
 
-        Now receives bar data (OHLC + up/down volumes) from Stream Bars API
+        Price fields are inserted directly from the latest TradeStation quote
+        so API consumers see intraminute updates without waiting for a bar close.
+        Up/down volume values are copied from get_bars() snapshots (no inference
+        or aggregation is performed in the ingestion engine).
 
         Args:
-            data: Underlying bar data with OHLC and up/down volumes
+            data: Underlying quote data with OHLC and up/down volumes
         """
-        # Get timestamp and bucket it
-        timestamp = data["timestamp"]
-        bucket = bucket_timestamp(timestamp, AGGREGATION_BUCKET_SECONDS)
-
-        # If new bucket, flush previous
-        if self.current_bucket and bucket > self.current_bucket:
-            self._flush_underlying_bucket()
-
-        self.current_bucket = bucket
-        self.underlying_buffer.append(data)
-
-        # Track latest underlying price for Greeks calculation
-        old_price = self.latest_underlying_price
-        if "close" in data and data["close"] > 0:
-            self.latest_underlying_price = data["close"]
-
-            # Log when we first get underlying price (important for Greeks)
-            if old_price is None:
-                logger.info(f"🎯 First underlying price received: ${self.latest_underlying_price:.2f}")
-                logger.info("   Greeks calculation can now proceed for options")
-            elif self.underlying_bars_stored % 10 == 0:  # Log every 10 bars
-                logger.debug(f"Underlying price updated: ${self.latest_underlying_price:.2f}")
-
-        # Flush if buffer too large
-        if len(self.underlying_buffer) >= MAX_BUFFER_SIZE:
-            self._flush_underlying_bucket()
-
-    def _flush_underlying_bucket(self):
-        """Aggregate and store 1-minute underlying bar"""
-        if not self.underlying_buffer:
-            return
-
         try:
-            # Aggregate: first open, max high, min low, last close, sum volumes
-            first = self.underlying_buffer[0]
-            last = self.underlying_buffer[-1]
+            timestamp = data["timestamp"]
 
-            agg = {
-                "symbol": first["symbol"],
-                "timestamp": self.current_bucket,
-                "open": first["open"],
-                "high": max(d["high"] for d in self.underlying_buffer),
-                "low": min(d["low"] for d in self.underlying_buffer),
-                "close": last["close"],
-                "up_volume": sum(d.get("up_volume", 0) for d in self.underlying_buffer),
-                "down_volume": sum(d.get("down_volume", 0) for d in self.underlying_buffer),
-            }
-
-            # Store in database
             with db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    INSERT INTO underlying_quotes 
+                    INSERT INTO underlying_quotes
                     (symbol, timestamp, open, high, low, close, up_volume, down_volume)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (symbol, timestamp) DO UPDATE SET
@@ -205,29 +162,44 @@ class IngestionEngine:
                         down_volume = EXCLUDED.down_volume,
                         updated_at = NOW()
                 """, (
-                    agg["symbol"], 
-                    agg["timestamp"],
-                    agg["open"],
-                    agg["high"],
-                    agg["low"],
-                    agg["close"],
-                    agg["up_volume"],
-                    agg["down_volume"]
+                    data["symbol"],
+                    timestamp,
+                    data.get("open", data.get("close")),
+                    data.get("high", data.get("close")),
+                    data.get("low", data.get("close")),
+                    data["close"],
+                    data.get("up_volume", 0),
+                    data.get("down_volume", 0),
                 ))
                 conn.commit()
 
-            self.underlying_bars_stored += 1
-            logger.info(f"✅ Stored 1-min bar: {agg['symbol']} @ {agg['timestamp']} "
-                       f"O=${agg['open']:.2f} H=${agg['high']:.2f} "
-                       f"L=${agg['low']:.2f} C=${agg['close']:.2f} "
-                       f"UpVol={agg['up_volume']:,} DownVol={agg['down_volume']:,}")
+            old_price = self.latest_underlying_price
+            if "close" in data and data["close"] > 0:
+                self.latest_underlying_price = data["close"]
+                if old_price is None:
+                    logger.info(f"🎯 First underlying price received: ${self.latest_underlying_price:.2f}")
+                    logger.info("   Greeks calculation can now proceed for options")
 
-            self.underlying_buffer = []
+            self.underlying_bars_stored += 1
             self.last_flush_time = datetime.now(ET)
 
+            logger.info(
+                f"✅ Stored quote: {data['symbol']} @ {timestamp} "
+                f"O=${data.get('open', data['close']):.2f} "
+                f"H=${data.get('high', data['close']):.2f} "
+                f"L=${data.get('low', data['close']):.2f} "
+                f"C=${data['close']:.2f} "
+                f"UpVol={data.get('up_volume', 0):,} DownVol={data.get('down_volume', 0):,}"
+            )
+
         except Exception as e:
-            logger.error(f"Error flushing underlying bucket: {e}", exc_info=True)
+            logger.error(f"Error storing underlying quote: {e}", exc_info=True)
             self.errors_count += 1
+
+    def _flush_underlying_bucket(self):
+        """Underlying quotes are stored immediately; no bucket flush needed."""
+        self.underlying_buffer = []
+        self.current_bucket = None
 
     def _store_option(self, data: Dict[str, Any]):
         """

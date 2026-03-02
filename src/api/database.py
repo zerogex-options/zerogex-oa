@@ -777,6 +777,76 @@ class DatabaseManager:
             logger.error(f"Error fetching flow timeseries: {e}")
             raise
 
+
+    async def get_price_timeseries_multi_timeframe(
+        self,
+        symbol: str = 'SPY',
+        window_minutes: int = 60
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Get underlying price time-series at multiple granularities.
+        Timeframes: 1m, 5m, 15m, 1h, 1d.
+        """
+        intervals = {
+            "1m": "1 minute",
+            "5m": "5 minutes",
+            "15m": "15 minutes",
+            "1h": "1 hour",
+            "1d": "1 day",
+        }
+
+        base_query = """
+            WITH latest_timestamp AS (
+                SELECT MAX(timestamp) as max_ts
+                FROM underlying_quotes
+                WHERE symbol = $1
+            ),
+            time_window AS (
+                SELECT
+                    CASE
+                        WHEN max_ts >= NOW() - INTERVAL '1 minute' * $2
+                        THEN NOW() - INTERVAL '1 minute' * $2
+                        ELSE max_ts - INTERVAL '1 minute' * $2
+                    END as start_time,
+                    max_ts as end_time
+                FROM latest_timestamp
+            )
+            SELECT
+                time_bucket($3::interval, timestamp) AS bucket_ts,
+                first(close, timestamp) AS open,
+                max(high) AS high,
+                min(low) AS low,
+                last(close, timestamp) AS close,
+                sum(up_volume + down_volume) AS volume
+            FROM underlying_quotes
+            WHERE symbol = $1
+                AND timestamp >= (SELECT start_time FROM time_window)
+                AND timestamp <= (SELECT end_time FROM time_window)
+            GROUP BY bucket_ts
+            ORDER BY bucket_ts ASC
+        """
+
+        try:
+            results: Dict[str, List[Dict[str, Any]]] = {}
+            async with self.pool.acquire() as conn:
+                for label, interval in intervals.items():
+                    rows = await conn.fetch(base_query, symbol, window_minutes, interval)
+                    results[label] = [
+                        {
+                            "timestamp": row["bucket_ts"],
+                            "open": row["open"],
+                            "high": row["high"],
+                            "low": row["low"],
+                            "close": row["close"],
+                            "volume": row["volume"] or 0,
+                        }
+                        for row in rows
+                    ]
+            return results
+        except Exception as e:
+            logger.error(f"Error fetching multi-timeframe price timeseries: {e}")
+            raise
+
     async def get_price_timeseries(
         self,
         symbol: str = 'SPY',

@@ -70,16 +70,36 @@ class StreamManager:
 
     def _fetch_underlying_bar(self) -> Optional[Dict[str, Any]]:
         """
-        Fetch latest underlying bar with volume breakdown using regular Bars API
+        Fetch current underlying quote and latest up/down volume snapshot.
 
-        Note: The regular bars endpoint includes UpVolume/DownVolume,
-        so we don't need the stream/barcharts endpoint.
+        Price fields come directly from the quote endpoint so intraminute
+        movements are captured immediately. UpVolume/DownVolume continue to
+        come from get_bars(), as required by TradeStation data availability.
 
-        Returns bar data with OHLC + UpVolume/DownVolume
+        Returns quote-aligned data with OHLC + UpVolume/DownVolume
         """
         try:
-            # Use regular bars API with barsback=1 to get latest completed bar
-            # This works reliably and includes UpVolume/DownVolume
+            quote_data = self.client.get_quote(self.underlying, warn_if_closed=False)
+            quotes = quote_data.get("Quotes", [])
+
+            if not quotes:
+                logger.debug(f"No quote data returned for {self.underlying}")
+                return None
+
+            quote = quotes[0]
+
+            quote_timestamp = safe_datetime(quote.get("TradeTime", ""), field_name="TradeTime")
+            if not quote_timestamp:
+                quote_timestamp = safe_datetime(quote.get("TimeStamp", ""), field_name="TimeStamp")
+            if not quote_timestamp:
+                quote_timestamp = datetime.now(ET)
+
+            last_price = safe_float(quote.get("Last"), field_name="Last")
+            if last_price <= 0:
+                logger.debug(f"Invalid quote last price for {self.underlying}, skipping")
+                return None
+
+            # Keep using get_bars for up/down volume (latest completed bar)
             bars_data = self.client.get_bars(
                 symbol=self.underlying,
                 interval=1,
@@ -89,38 +109,24 @@ class StreamManager:
                 warn_if_closed=False
             )
 
-            if "Bars" not in bars_data or len(bars_data["Bars"]) == 0:
-                logger.debug(f"No bar data returned for {self.underlying} - likely between bars or market just opened")
-                return None
+            bar = bars_data.get("Bars", [{}])[0]
+            if bar and not validate_bar_data(bar):
+                logger.warning("Invalid bar data for volume snapshot, using zero volumes")
+                bar = {}
 
-            bar = bars_data["Bars"][0]
-
-            # Validate bar data
-            if not validate_bar_data(bar):
-                logger.warning("Invalid bar data, skipping")
-                return None
-
-            # Parse bar timestamp
-            timestamp_str = bar.get("TimeStamp", "")
-            timestamp = safe_datetime(timestamp_str, field_name="TimeStamp")
-
-            if not timestamp:
-                timestamp = datetime.now(ET)
-
-            # Parse OHLCV with volume breakdown
             underlying_data = {
                 "symbol": self.underlying,
-                "timestamp": timestamp,
-                "open": safe_float(bar.get("Open"), field_name="Open"),
-                "high": safe_float(bar.get("High"), field_name="High"),
-                "low": safe_float(bar.get("Low"), field_name="Low"),
-                "close": safe_float(bar.get("Close"), field_name="Close"),
+                "timestamp": quote_timestamp,
+                "open": safe_float(quote.get("Open"), field_name="Open") or last_price,
+                "high": safe_float(quote.get("High"), field_name="High") or last_price,
+                "low": safe_float(quote.get("Low"), field_name="Low") or last_price,
+                "close": last_price,
                 "up_volume": safe_int(bar.get("UpVolume"), field_name="UpVolume"),
                 "down_volume": safe_int(bar.get("DownVolume"), field_name="DownVolume"),
                 "volume": safe_int(bar.get("TotalVolume"), field_name="TotalVolume"),
             }
 
-            logger.debug(f"Bar: {self.underlying} @ {timestamp} "
+            logger.debug(f"Quote: {self.underlying} @ {quote_timestamp} "
                         f"C=${underlying_data['close']:.2f} "
                         f"UpVol={underlying_data['up_volume']:,} "
                         f"DownVol={underlying_data['down_volume']:,}")
