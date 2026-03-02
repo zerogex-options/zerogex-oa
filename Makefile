@@ -859,6 +859,30 @@ gex-preview: ## Preview GEX calculation data
 flow-by-type: ## Puts vs calls flow (all strikes/expirations) [fast]
 	@echo "$(BLUE)=== Option Flow by Type (Last Hour) ===$(NC)"
 	@$(PSQL) -c "\
+		WITH latest AS ( \
+			SELECT MAX(timestamp) AS max_ts \
+			FROM option_flow_by_type \
+		), flow_window AS ( \
+			SELECT \
+				TO_CHAR(time_et, 'HH24:MI') as time, \
+				underlying, \
+				call_flow, \
+				TO_CHAR(call_notional, 'FM999,999,999') as call_notional, \
+				put_flow, \
+				TO_CHAR(put_notional, 'FM999,999,999') as put_notional, \
+				net_flow, \
+				TO_CHAR(net_notional, 'FM999,999,999') as net_notional, \
+				put_call_ratio as pc_ratio, \
+				put_call_notional_ratio as pc_not_ratio, \
+				timestamp \
+			FROM option_flow_by_type \
+			WHERE timestamp >= COALESCE((SELECT max_ts - INTERVAL '1 hour' FROM latest), NOW() - INTERVAL '1 hour') \
+			ORDER BY timestamp DESC \
+			LIMIT 20 \
+		) \
+		SELECT time, underlying, call_flow, call_notional, put_flow, put_notional, net_flow, net_notional, pc_ratio, pc_not_ratio \
+		FROM flow_window \
+		UNION ALL \
 		SELECT \
 			TO_CHAR(time_et, 'HH24:MI') as time, \
 			underlying, \
@@ -1074,7 +1098,7 @@ vwap: ## VWAP deviation tracker
 			vwap_deviation_pct as vwap_dev, \
 			vwap_position \
 		FROM underlying_vwap_deviation \
-		WHERE timestamp > NOW() - INTERVAL '30 minutes' \
+		WHERE timestamp >= COALESCE((SELECT MAX(timestamp) - INTERVAL '30 minutes' FROM underlying_vwap_deviation), NOW() - INTERVAL '30 minutes') \
 		ORDER BY timestamp DESC \
 		LIMIT 30;"
 
@@ -1172,7 +1196,7 @@ day-trading: ## Combined day trading dashboard
 			vwap_deviation_pct as dev, \
 			vwap_position \
 		FROM underlying_vwap_deviation \
-		WHERE timestamp > NOW() - INTERVAL '30 minutes' \
+		WHERE timestamp >= COALESCE((SELECT MAX(timestamp) - INTERVAL '30 minutes' FROM underlying_vwap_deviation), NOW() - INTERVAL '30 minutes') \
 		ORDER BY timestamp DESC \
 		LIMIT 10;"
 	@echo ""
