@@ -99,12 +99,33 @@ class StreamManager:
                 quote_ts = datetime.now(ET)
 
             minute_ts = quote_ts.replace(second=0, microsecond=0)
-            total_volume = safe_int(
+
+            raw_total_volume = (
                 quote.get("TotalVolume")
                 or quote.get("Volume")
-                or quote.get("DailyVolume"),
-                field_name="TotalVolume"
+                or quote.get("DailyVolume")
             )
+            total_volume = safe_int(raw_total_volume, field_name="TotalVolume") if raw_total_volume is not None else None
+
+            raw_up_volume = (
+                quote.get("UpVolume")
+                or quote.get("DailyUpVolume")
+                or quote.get("UpTicks")
+            )
+            up_volume = safe_int(raw_up_volume, field_name="UpVolume") if raw_up_volume is not None else None
+
+            raw_down_volume = (
+                quote.get("DownVolume")
+                or quote.get("DailyDownVolume")
+                or quote.get("DownTicks")
+            )
+            down_volume = safe_int(raw_down_volume, field_name="DownVolume") if raw_down_volume is not None else None
+
+            # If provider returns only total + one side, infer the other side.
+            if total_volume is not None and up_volume is not None and down_volume is None:
+                down_volume = max(total_volume - up_volume, 0)
+            elif total_volume is not None and down_volume is not None and up_volume is None:
+                up_volume = max(total_volume - down_volume, 0)
 
             underlying_data = {
                 "symbol": self.underlying,
@@ -113,14 +134,16 @@ class StreamManager:
                 "high": last_price,
                 "low": last_price,
                 "close": last_price,
-                "up_volume": total_volume,
-                "down_volume": 0,
+                "up_volume": up_volume,
+                "down_volume": down_volume,
                 "volume": total_volume,
             }
 
             logger.debug(
                 f"Live quote normalized as bar: {self.underlying} @ {quote_ts} "
-                f"(bucket={minute_ts}) C=${underlying_data['close']:.2f} Vol={total_volume:,}"
+                f"(bucket={minute_ts}) C=${underlying_data['close']:.2f} Vol={underlying_data['volume'] if underlying_data['volume'] is not None else 'n/a'} "
+                f"UpVol={underlying_data['up_volume'] if underlying_data['up_volume'] is not None else 'n/a'} "
+                f"DownVol={underlying_data['down_volume'] if underlying_data['down_volume'] is not None else 'n/a'}"
             )
             return underlying_data
 
@@ -618,9 +641,11 @@ def main():
                 underlying_count += 1
                 if underlying_count % 10 == 0:
                     data = item["data"]
+                    up = data.get('up_volume')
+                    down = data.get('down_volume')
                     print(f"Underlying bars: {underlying_count} - Latest: "
                           f"${data['close']:.2f} "
-                          f"(Up: {data['up_volume']:,}, Down: {data['down_volume']:,})")
+                          f"(Up: {up if up is not None else 'n/a'}, Down: {down if down is not None else 'n/a'})")
             elif item["type"] == "option":
                 option_count += 1
                 if option_count % 100 == 0:

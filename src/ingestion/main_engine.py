@@ -169,8 +169,16 @@ class IngestionEngine:
                         high = GREATEST(underlying_quotes.high, EXCLUDED.high),
                         low = LEAST(underlying_quotes.low, EXCLUDED.low),
                         close = EXCLUDED.close,
-                        up_volume = GREATEST(underlying_quotes.up_volume, EXCLUDED.up_volume),
-                        down_volume = GREATEST(underlying_quotes.down_volume, EXCLUDED.down_volume),
+                        up_volume = COALESCE(
+                            GREATEST(underlying_quotes.up_volume, EXCLUDED.up_volume),
+                            underlying_quotes.up_volume,
+                            EXCLUDED.up_volume
+                        ),
+                        down_volume = COALESCE(
+                            GREATEST(underlying_quotes.down_volume, EXCLUDED.down_volume),
+                            underlying_quotes.down_volume,
+                            EXCLUDED.down_volume
+                        ),
                         updated_at = NOW()
                 """, (
                     data["symbol"],
@@ -179,8 +187,8 @@ class IngestionEngine:
                     data["high"],
                     data["low"],
                     data["close"],
-                    data.get("up_volume", 0),
-                    data.get("down_volume", 0),
+                    data.get("up_volume"),
+                    data.get("down_volume"),
                 ))
                 conn.commit()
 
