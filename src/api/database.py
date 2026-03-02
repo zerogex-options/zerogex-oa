@@ -818,8 +818,8 @@ class DatabaseManager:
                 {bucket} as timestamp,
                 COALESCE(SUM(call_notional), 0)::numeric as call_notional,
                 COALESCE(SUM(put_notional), 0)::numeric as put_notional,
-                COALESCE(SUM(call_flow), 0)::bigint as call_flow,
-                COALESCE(SUM(put_flow), 0)::bigint as put_flow,
+                COALESCE(SUM(call_flow), 0)::numeric as call_flow,
+                COALESCE(SUM(put_flow), 0)::numeric as put_flow,
                 COALESCE(SUM(net_notional), 0)::numeric as net_notional,
                 COALESCE(SUM(net_flow), 0)::numeric as net_flow
             FROM option_flow_by_type
