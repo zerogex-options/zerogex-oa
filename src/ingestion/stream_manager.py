@@ -100,13 +100,13 @@ class StreamManager:
 
             minute_ts = quote_ts.replace(second=0, microsecond=0)
 
-            raw_total_volume = quote.get("TotalVolume")
+            raw_total_volume = quote.get("TotalVolume") or quote.get("Volume") or quote.get("DailyVolume")
             total_volume = safe_int(raw_total_volume, field_name="TotalVolume") if raw_total_volume is not None else None
 
-            raw_up_volume = quote.get("UpVolume")
+            raw_up_volume = quote.get("UpVolume") or quote.get("DailyUpVolume")
             up_volume = safe_int(raw_up_volume, field_name="UpVolume") if raw_up_volume is not None else None
 
-            raw_down_volume = quote.get("DownVolume")
+            raw_down_volume = quote.get("DownVolume") or quote.get("DailyDownVolume")
             down_volume = safe_int(raw_down_volume, field_name="DownVolume") if raw_down_volume is not None else None
 
             underlying_data = {
