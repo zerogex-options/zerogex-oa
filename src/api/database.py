@@ -190,7 +190,7 @@ class DatabaseManager:
 
         query = """
             SELECT
-                DATE_BIN(($5 || ' minutes')::interval, timestamp, TIMESTAMP '2001-01-01') as timestamp,
+                DATE_BIN(INTERVAL '1 minute' * $5, timestamp, TIMESTAMP '2001-01-01') as timestamp,
                 underlying as symbol,
                 AVG(max_gamma_strike)::numeric as spot_price,
                 AVG(total_call_oi)::numeric as total_call_gex,
@@ -206,7 +206,7 @@ class DatabaseManager:
             FROM gex_summary
             WHERE underlying = $1
                 AND timestamp BETWEEN $2 AND $3
-            GROUP BY DATE_BIN(($5 || ' minutes')::interval, timestamp, TIMESTAMP '2001-01-01'), underlying
+            GROUP BY DATE_BIN(INTERVAL '1 minute' * $5, timestamp, TIMESTAMP '2001-01-01'), underlying
             ORDER BY timestamp DESC
             LIMIT $4
         """
@@ -230,44 +230,37 @@ class DatabaseManager:
     ) -> List[Dict[str, Any]]:
         """Get option flow by type (calls vs puts)"""
         query = """
-            SELECT 
-                time_et as time_window_start,
-                timestamp as time_window_end,
-                underlying as symbol,
-                'CALL' as option_type,
-                call_flow as total_volume,
-                call_notional as total_premium,
+            WITH filtered AS (
+                SELECT
+                    time_et,
+                    timestamp,
+                    underlying,
+                    call_flow,
+                    put_flow,
+                    call_notional,
+                    put_notional
+                FROM option_flow_by_type
+                WHERE underlying = $1
+                    AND timestamp >= $2
+            )
+            SELECT
+                f.time_et as time_window_start,
+                f.timestamp as time_window_end,
+                f.underlying as symbol,
+                t.option_type,
+                CASE WHEN t.option_type = 'CALL' THEN f.call_flow ELSE f.put_flow END as total_volume,
+                CASE WHEN t.option_type = 'CALL' THEN f.call_notional ELSE f.put_notional END as total_premium,
                 NULL::numeric as avg_iv,
-                call_flow - put_flow as net_delta,
-                CASE 
-                    WHEN call_flow > put_flow THEN 'bullish'
-                    WHEN put_flow > call_flow THEN 'bearish'
-                    ELSE 'neutral'
+                CASE WHEN t.option_type = 'CALL' THEN f.call_flow - f.put_flow ELSE f.put_flow - f.call_flow END as net_delta,
+                CASE
+                    WHEN f.call_flow = f.put_flow THEN 'neutral'
+                    WHEN t.option_type = 'CALL' AND f.call_flow > f.put_flow THEN 'bullish'
+                    WHEN t.option_type = 'PUT' AND f.put_flow > f.call_flow THEN 'bearish'
+                    WHEN t.option_type = 'CALL' THEN 'bearish'
+                    ELSE 'bullish'
                 END as sentiment
-            FROM option_flow_by_type
-            WHERE underlying = $1
-                AND timestamp >= $2
-
-            UNION ALL
-
-            SELECT 
-                time_et as time_window_start,
-                timestamp as time_window_end,
-                underlying as symbol,
-                'PUT' as option_type,
-                put_flow as total_volume,
-                put_notional as total_premium,
-                NULL::numeric as avg_iv,
-                put_flow - call_flow as net_delta,
-                CASE 
-                    WHEN put_flow > call_flow THEN 'bearish'
-                    WHEN call_flow > put_flow THEN 'bullish'
-                    ELSE 'neutral'
-                END as sentiment
-            FROM option_flow_by_type
-            WHERE underlying = $1
-                AND timestamp >= $2
-
+            FROM filtered f
+            CROSS JOIN (VALUES ('CALL'), ('PUT')) AS t(option_type)
             ORDER BY time_window_end DESC, option_type
         """
 
@@ -658,7 +651,7 @@ class DatabaseManager:
         query = """
             WITH bucketed AS (
                 SELECT
-                    DATE_BIN(($5 || ' minutes')::interval, timestamp, TIMESTAMP '2001-01-01') as bucket_ts,
+                    DATE_BIN(INTERVAL '1 minute' * $5, timestamp, TIMESTAMP '2001-01-01') as bucket_ts,
                     symbol,
                     open,
                     high,
@@ -730,14 +723,14 @@ class DatabaseManager:
             ),
             recent_data AS (
                 SELECT
-                    DATE_BIN(($3 || ' minutes')::interval, timestamp, TIMESTAMP '2001-01-01') as timestamp,
+                    DATE_BIN(INTERVAL '1 minute' * $3, timestamp, TIMESTAMP '2001-01-01') as timestamp,
                     strike,
                     AVG(net_gex) as net_gex
                 FROM gex_by_strike
                 WHERE underlying = $1
                     AND timestamp >= (SELECT start_time FROM time_window)
                     AND timestamp <= (SELECT end_time FROM time_window)
-                GROUP BY DATE_BIN(($3 || ' minutes')::interval, timestamp, TIMESTAMP '2001-01-01'), strike
+                GROUP BY DATE_BIN(INTERVAL '1 minute' * $3, timestamp, TIMESTAMP '2001-01-01'), strike
             ),
             filtered_data AS (
                 SELECT 
@@ -794,7 +787,7 @@ class DatabaseManager:
                 FROM latest_timestamp
             )
             SELECT 
-                DATE_BIN(($3 || ' minutes')::interval, timestamp, TIMESTAMP '2001-01-01') as timestamp,
+                DATE_BIN(INTERVAL '1 minute' * $3, timestamp, TIMESTAMP '2001-01-01') as timestamp,
                 SUM(call_notional) as call_notional,
                 SUM(put_notional) as put_notional,
                 SUM(call_flow) as call_flow,
@@ -805,7 +798,7 @@ class DatabaseManager:
             WHERE underlying = $1
                 AND timestamp >= (SELECT start_time FROM time_window)
                 AND timestamp <= (SELECT end_time FROM time_window)
-            GROUP BY DATE_BIN(($3 || ' minutes')::interval, timestamp, TIMESTAMP '2001-01-01')
+            GROUP BY DATE_BIN(INTERVAL '1 minute' * $3, timestamp, TIMESTAMP '2001-01-01')
             ORDER BY timestamp ASC
         """
 
@@ -847,13 +840,13 @@ class DatabaseManager:
                 FROM latest_timestamp
             )
             SELECT
-                DATE_BIN(($3 || ' minutes')::interval, timestamp, TIMESTAMP '2001-01-01') as timestamp,
+                DATE_BIN(INTERVAL '1 minute' * $3, timestamp, TIMESTAMP '2001-01-01') as timestamp,
                 (ARRAY_AGG(close ORDER BY timestamp DESC))[1] as price
             FROM underlying_quotes
             WHERE symbol = $1
                 AND timestamp >= (SELECT start_time FROM time_window)
                 AND timestamp <= (SELECT end_time FROM time_window)
-            GROUP BY DATE_BIN(($3 || ' minutes')::interval, timestamp, TIMESTAMP '2001-01-01')
+            GROUP BY DATE_BIN(INTERVAL '1 minute' * $3, timestamp, TIMESTAMP '2001-01-01')
             ORDER BY timestamp ASC
         """
 

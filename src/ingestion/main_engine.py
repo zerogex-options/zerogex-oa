@@ -145,28 +145,51 @@ class IngestionEngine:
         timestamp = data["timestamp"]
         bucket = bucket_timestamp(timestamp, AGGREGATION_BUCKET_SECONDS)
 
-        # If new bucket, flush previous
-        if self.current_bucket and bucket > self.current_bucket:
-            self._flush_underlying_bucket()
-
         self.current_bucket = bucket
-        self.underlying_buffer.append(data)
 
         # Track latest underlying price for Greeks calculation
         old_price = self.latest_underlying_price
         if "close" in data and data["close"] > 0:
             self.latest_underlying_price = data["close"]
 
-            # Log when we first get underlying price (important for Greeks)
             if old_price is None:
                 logger.info(f"🎯 First underlying price received: ${self.latest_underlying_price:.2f}")
                 logger.info("   Greeks calculation can now proceed for options")
-            elif self.underlying_bars_stored % 10 == 0:  # Log every 10 bars
-                logger.debug(f"Underlying price updated: ${self.latest_underlying_price:.2f}")
 
-        # Flush if buffer too large
-        if len(self.underlying_buffer) >= MAX_BUFFER_SIZE:
-            self._flush_underlying_bucket()
+        # Write-through upsert for near real-time quote updates within the current minute
+        try:
+            with db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO underlying_quotes
+                    (symbol, timestamp, open, high, low, close, up_volume, down_volume)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (symbol, timestamp) DO UPDATE SET
+                        open = underlying_quotes.open,
+                        high = GREATEST(underlying_quotes.high, EXCLUDED.high),
+                        low = LEAST(underlying_quotes.low, EXCLUDED.low),
+                        close = EXCLUDED.close,
+                        up_volume = GREATEST(underlying_quotes.up_volume, EXCLUDED.up_volume),
+                        down_volume = GREATEST(underlying_quotes.down_volume, EXCLUDED.down_volume),
+                        updated_at = NOW()
+                """, (
+                    data["symbol"],
+                    bucket,
+                    data["open"],
+                    data["high"],
+                    data["low"],
+                    data["close"],
+                    data.get("up_volume", 0),
+                    data.get("down_volume", 0),
+                ))
+                conn.commit()
+
+            self.underlying_bars_stored += 1
+            self.last_flush_time = datetime.now(ET)
+
+        except Exception as e:
+            logger.error(f"Error storing underlying snapshot: {e}", exc_info=True)
+            self.errors_count += 1
 
     def _flush_underlying_bucket(self):
         """Aggregate and store 1-minute underlying bar"""
