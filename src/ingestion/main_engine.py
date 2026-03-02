@@ -170,8 +170,8 @@ class IngestionEngine:
                         high = EXCLUDED.high,
                         low = EXCLUDED.low,
                         close = EXCLUDED.close,
-                        up_volume = EXCLUDED.up_volume,
-                        down_volume = EXCLUDED.down_volume,
+                        up_volume = COALESCE(EXCLUDED.up_volume, underlying_quotes.up_volume),
+                        down_volume = COALESCE(EXCLUDED.down_volume, underlying_quotes.down_volume),
                         updated_at = NOW()
                 """, (
                     data["symbol"],
@@ -225,8 +225,8 @@ class IngestionEngine:
                         high = EXCLUDED.high,
                         low = EXCLUDED.low,
                         close = EXCLUDED.close,
-                        up_volume = EXCLUDED.up_volume,
-                        down_volume = EXCLUDED.down_volume,
+                        up_volume = COALESCE(EXCLUDED.up_volume, underlying_quotes.up_volume),
+                        down_volume = COALESCE(EXCLUDED.down_volume, underlying_quotes.down_volume),
                         updated_at = NOW()
                 """, (
                     agg["symbol"], 
