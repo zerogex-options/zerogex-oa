@@ -100,32 +100,14 @@ class StreamManager:
 
             minute_ts = quote_ts.replace(second=0, microsecond=0)
 
-            raw_total_volume = (
-                quote.get("TotalVolume")
-                or quote.get("Volume")
-                or quote.get("DailyVolume")
-            )
+            raw_total_volume = quote.get("TotalVolume")
             total_volume = safe_int(raw_total_volume, field_name="TotalVolume") if raw_total_volume is not None else None
 
-            raw_up_volume = (
-                quote.get("UpVolume")
-                or quote.get("DailyUpVolume")
-                or quote.get("UpTicks")
-            )
+            raw_up_volume = quote.get("UpVolume")
             up_volume = safe_int(raw_up_volume, field_name="UpVolume") if raw_up_volume is not None else None
 
-            raw_down_volume = (
-                quote.get("DownVolume")
-                or quote.get("DailyDownVolume")
-                or quote.get("DownTicks")
-            )
+            raw_down_volume = quote.get("DownVolume")
             down_volume = safe_int(raw_down_volume, field_name="DownVolume") if raw_down_volume is not None else None
-
-            # If provider returns only total + one side, infer the other side.
-            if total_volume is not None and up_volume is not None and down_volume is None:
-                down_volume = max(total_volume - up_volume, 0)
-            elif total_volume is not None and down_volume is not None and up_volume is None:
-                up_volume = max(total_volume - down_volume, 0)
 
             underlying_data = {
                 "symbol": self.underlying,

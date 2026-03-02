@@ -134,12 +134,13 @@ class IngestionEngine:
 
     def _store_underlying(self, data: Dict[str, Any]):
         """
-        Buffer underlying bar for 1-minute aggregation
+        Store underlying quote snapshot into a 1-minute bucket.
 
-        Now receives bar data (OHLC + up/down volumes) from Stream Bars API
+        For each incoming quote, write directly to the current minute bucket and
+        overwrite that same row on conflict for real-time updates.
 
         Args:
-            data: Underlying bar data with OHLC and up/down volumes
+            data: Underlying quote snapshot data
         """
         # Get timestamp and bucket it
         timestamp = data["timestamp"]
@@ -165,20 +166,12 @@ class IngestionEngine:
                     (symbol, timestamp, open, high, low, close, up_volume, down_volume)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (symbol, timestamp) DO UPDATE SET
-                        open = underlying_quotes.open,
-                        high = GREATEST(underlying_quotes.high, EXCLUDED.high),
-                        low = LEAST(underlying_quotes.low, EXCLUDED.low),
+                        open = EXCLUDED.open,
+                        high = EXCLUDED.high,
+                        low = EXCLUDED.low,
                         close = EXCLUDED.close,
-                        up_volume = COALESCE(
-                            GREATEST(underlying_quotes.up_volume, EXCLUDED.up_volume),
-                            underlying_quotes.up_volume,
-                            EXCLUDED.up_volume
-                        ),
-                        down_volume = COALESCE(
-                            GREATEST(underlying_quotes.down_volume, EXCLUDED.down_volume),
-                            underlying_quotes.down_volume,
-                            EXCLUDED.down_volume
-                        ),
+                        up_volume = EXCLUDED.up_volume,
+                        down_volume = EXCLUDED.down_volume,
                         updated_at = NOW()
                 """, (
                     data["symbol"],
