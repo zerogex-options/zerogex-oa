@@ -1,0 +1,8 @@
+[Unit]
+Description=Renew Let's Encrypt certificates for ZeroGEX API
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/certbot renew --deploy-hook "/usr/local/bin/zerogex-certbot-deploy-hook.sh" --quiet

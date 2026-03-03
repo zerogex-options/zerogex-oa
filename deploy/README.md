@@ -107,10 +107,22 @@ The deployment process runs these steps in order:
 
 ### Step 110: API Server Setup
 - Installs API dependencies
-- Configures firewall (port 8000)
 - Sets up systemd service
+- Keeps API as private upstream on localhost:8000
 - Provides REST API endpoints
 - Interactive API docs at /docs
+
+### Step 120: Nginx Reverse Proxy (Hardened API)
+- Installs and configures Nginx for `api.zerogex.io`
+- Proxies all API/docs traffic to `http://127.0.0.1:8000`
+- Applies security headers and per-IP rate limiting
+- Enables HTTP/HTTPS firewall rules and removes public 8000 exposure
+
+### Step 130: SSL/HTTPS + Auto-Renew
+- Automatically issues/renews Let's Encrypt cert for `api.zerogex.io`
+- Enforces HTTP→HTTPS redirect with HSTS + OCSP stapling
+- Installs systemd renewal units (`zerogex-cert-renew.service/.timer`)
+- Validates renewal flow with a dry-run
 
 ### Step 200: Validation
 - Comprehensive deployment validation with RDS connection
@@ -614,10 +626,10 @@ console.log('Data Age:', health.data_age_seconds, 'seconds');
 
 For production deployment:
 
-- **Firewall:** Restrict port 8000 to frontend IP only
+- **Firewall:** Keep port 8000 private and expose only 80/443 via Nginx
 - **CORS:** Update `src/api/main.py` to allow only your frontend domain
-- **SSL/HTTPS:** Set up Nginx reverse proxy with Let's Encrypt SSL certificate
-- **Rate Limiting:** Consider adding rate limiting for production
+- **SSL/HTTPS:** Use deployment steps 120 + 130 for Nginx + Let's Encrypt
+- **Rate Limiting:** Enabled in step 120 (tune limits for your traffic profile)
 - **Authentication:** Add API keys or JWT tokens if needed
 
 **Example Nginx Configuration for SSL:**
