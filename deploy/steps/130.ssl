@@ -1,0 +1,158 @@
+#!/bin/bash
+
+# ==============================================
+# Step 130: SSL/HTTPS Setup + Auto-Renew (Hardened)
+# ==============================================
+
+set -e
+
+log "SSL/HTTPS Setup + Auto-Renew (Hardened)"
+
+APP_DIR="$HOME/zerogex-oa"
+SYSTEMD_SOURCE="$APP_DIR/setup/systemd"
+DOMAIN_NAME="${OA_API_DOMAIN:-api.zerogex.io}"
+SITE_CONF="/etc/nginx/sites-available/zerogex-oa-api"
+LE_EMAIL="${LETSENCRYPT_EMAIL:-}"
+
+if [ ! -f "$SITE_CONF" ]; then
+    log "  ✗ Nginx site config not found: $SITE_CONF"
+    log "    Run step 120 first."
+    exit 1
+fi
+
+if [ -z "$LE_EMAIL" ]; then
+    read -p "  Enter email for Let's Encrypt notifications: " LE_EMAIL
+fi
+
+while [ -z "$LE_EMAIL" ]; do
+    echo "     ✗ Email cannot be empty"
+    read -p "  Enter email: " LE_EMAIL
+done
+
+log "  → Installing certbot nginx plugin..."
+sudo apt install -y certbot python3-certbot-nginx
+
+log "  → Requesting/renewing certificate for ${DOMAIN_NAME}..."
+if sudo certbot --nginx \
+    -d "$DOMAIN_NAME" \
+    --non-interactive \
+    --agree-tos \
+    -m "$LE_EMAIL" \
+    --redirect \
+    --hsts \
+    --staple-ocsp \
+    --keep-until-expiring; then
+    log "     ✓ Certificate is present and nginx is configured"
+else
+    log "     ✗ Failed to obtain certificate"
+    log ""
+    log "Common issues:"
+    log "  • DNS for ${DOMAIN_NAME} is not pointing to this server"
+    log "  • Port 80/443 is blocked by security group or firewall"
+    log "  • Nginx config test fails"
+    exit 1
+fi
+
+log "  → Installing hardened HTTPS nginx config..."
+sudo tee "$SITE_CONF" > /dev/null <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN_NAME};
+
+    # ACME challenge path for certbot
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${DOMAIN_NAME};
+
+    ssl_certificate /etc/letsencrypt/live/${DOMAIN_NAME}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN_NAME}/privkey.pem;
+
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:MozSSL:10m;
+    ssl_session_tickets off;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+    add_header X-XSS-Protection "0" always;
+
+    server_tokens off;
+    client_max_body_size 10m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+
+        proxy_connect_timeout 15s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+
+        limit_req zone=zerogex_api_per_ip burst=40 nodelay;
+    }
+}
+EOF
+
+log "  → Testing nginx configuration..."
+sudo nginx -t
+log "  → Reloading nginx..."
+sudo systemctl reload nginx
+
+log "  → Writing cert deploy hook..."
+sudo tee /usr/local/bin/zerogex-certbot-deploy-hook.sh > /dev/null <<'HOOKEOF'
+#!/bin/bash
+set -e
+systemctl reload nginx
+HOOKEOF
+sudo chmod 755 /usr/local/bin/zerogex-certbot-deploy-hook.sh
+
+log "  → Installing systemd renewal units..."
+if [ -f "$SYSTEMD_SOURCE/zerogex-cert-renew.service" ] && [ -f "$SYSTEMD_SOURCE/zerogex-cert-renew.timer" ]; then
+    sudo cp "$SYSTEMD_SOURCE/zerogex-cert-renew.service" /etc/systemd/system/
+    sudo cp "$SYSTEMD_SOURCE/zerogex-cert-renew.timer" /etc/systemd/system/
+else
+    log "     ✗ Missing renewal unit files in $SYSTEMD_SOURCE"
+    exit 1
+fi
+
+log "  → Enabling renewal timer..."
+sudo systemctl daemon-reload
+sudo systemctl enable --now zerogex-cert-renew.timer
+
+log "  → Testing renewal flow (dry-run)..."
+sudo certbot renew --dry-run --cert-name "$DOMAIN_NAME" --deploy-hook "/usr/local/bin/zerogex-certbot-deploy-hook.sh"
+
+log ""
+log "SSL setup complete!"
+log ""
+log "Summary:"
+log "  ✓ TLS certificate configured for ${DOMAIN_NAME}"
+log "  ✓ Hardened HTTPS reverse proxy installed"
+log "  ✓ HTTP -> HTTPS redirect enabled"
+log "  ✓ Systemd timer enabled: zerogex-cert-renew.timer"
+log ""
+log "Documentation endpoints:"
+log "  • https://${DOMAIN_NAME}/docs"
+log "  • https://${DOMAIN_NAME}/redoc"
+log "  • https://${DOMAIN_NAME}/openapi.json"
+log ""

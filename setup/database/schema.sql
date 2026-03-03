@@ -40,6 +40,9 @@ CREATE TABLE IF NOT EXISTS underlying_quotes (
 
 CREATE INDEX IF NOT EXISTS idx_underlying_quotes_timestamp ON underlying_quotes(timestamp DESC);
 
+CREATE INDEX IF NOT EXISTS idx_underlying_quotes_symbol_timestamp
+    ON underlying_quotes(symbol, timestamp DESC);
+
 -- Add foreign key if it doesn't exist
 DO $$ 
 BEGIN
@@ -106,6 +109,12 @@ CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_exp_strike ON option_cha
 
 CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_time_type_strike
     ON option_chains(underlying, timestamp DESC, option_type, strike);
+
+CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_option_symbol_timestamp
+    ON option_chains(underlying, option_symbol, timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_timestamp_option_symbol
+    ON option_chains(underlying, timestamp DESC, option_symbol);
 
 
 -- Add foreign key if it doesn't exist

@@ -14,7 +14,15 @@ logger = logging.getLogger(__name__)
 
 
 
+def _normalize_timeframe(timeframe: str) -> str:
+    normalized = (timeframe or '1min').lower()
+    if normalized == '1hour':
+        return '1hr'
+    return normalized
+
+
 def _bucket_expr(timeframe: str, column: str = 'timestamp') -> str:
+    timeframe = _normalize_timeframe(timeframe)
     if timeframe == '1min':
         return f"date_trunc('minute', {column})"
     if timeframe == '5min':
@@ -27,11 +35,25 @@ def _bucket_expr(timeframe: str, column: str = 'timestamp') -> str:
             f"date_trunc('hour', {column}) + "
             f"FLOOR(EXTRACT(MINUTE FROM {column}) / 15) * INTERVAL '15 minutes'"
         )
-    if timeframe == '1hour':
+    if timeframe == '1hr':
         return f"date_trunc('hour', {column})"
     if timeframe == '1day':
         return f"date_trunc('day', {column})"
     raise ValueError(f'Unsupported timeframe: {timeframe}')
+
+
+def _interval_expr(timeframe: str) -> str:
+    timeframe = _normalize_timeframe(timeframe)
+    mapping = {
+        '1min': "INTERVAL '1 minute'",
+        '5min': "INTERVAL '5 minutes'",
+        '15min': "INTERVAL '15 minutes'",
+        '1hr': "INTERVAL '1 hour'",
+        '1day': "INTERVAL '1 day'",
+    }
+    if timeframe not in mapping:
+        raise ValueError(f'Unsupported timeframe: {timeframe}')
+    return mapping[timeframe]
 
 class DatabaseManager:
     """Manages database connections and queries"""
@@ -184,18 +206,25 @@ class DatabaseManager:
         symbol: str = 'SPY',
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
-        limit: int = 100,
+        limit: int = 90,
         timeframe: str = '1min'
     ) -> List[Dict[str, Any]]:
-        """Get historical GEX summary data"""
-        if not start_date:
-            start_date = datetime.now() - timedelta(days=1)
-        if not end_date:
-            end_date = datetime.now()
-
-        bucket = _bucket_expr(timeframe if timeframe else "5min")
+        """Get historical GEX summary data aggregated by timeframe."""
+        bucket = _bucket_expr(timeframe)
+        step_interval = _interval_expr(timeframe)
         query = f"""
-            WITH base AS (
+            WITH latest AS (
+                SELECT MAX(timestamp) AS max_ts
+                FROM gex_summary
+                WHERE underlying = $1
+            ),
+            bounds AS (
+                SELECT
+                    COALESCE($2::timestamptz, max_ts - ({step_interval} * ($4 - 1))) AS start_ts,
+                    COALESCE($3::timestamptz, max_ts) AS end_ts
+                FROM latest
+            ),
+            base AS (
                 SELECT
                     timestamp,
                     underlying as symbol,
@@ -214,7 +243,7 @@ class DatabaseManager:
                     ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) as rn
                 FROM gex_summary
                 WHERE underlying = $1
-                    AND timestamp BETWEEN $2 AND $3
+                    AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
             )
             SELECT
                 bucket_ts as timestamp,
@@ -253,55 +282,62 @@ class DatabaseManager:
         symbol: str = 'SPY',
         window_minutes: int = 60
     ) -> List[Dict[str, Any]]:
-        """Get option flow by type (calls vs puts)"""
+        """Get option flow by type (calls vs puts)."""
         query = """
-            WITH filtered AS (
-                SELECT *
-                FROM option_flow_by_type
+            WITH latest AS (
+                SELECT MAX(timestamp) AS max_ts
+                FROM option_chains
                 WHERE underlying = $1
-                  AND timestamp >= $2
+            ),
+            windowed AS (
+                SELECT oc.*
+                FROM option_chains oc
+                CROSS JOIN latest l
+                WHERE oc.underlying = $1
+                    AND oc.timestamp BETWEEN l.max_ts - INTERVAL '1 minute' * $2 AND l.max_ts
+            ),
+            contract_agg AS (
+                SELECT
+                    option_symbol,
+                    option_type,
+                    GREATEST(MAX(volume) - MIN(volume), 0) AS flow,
+                    (ARRAY_AGG(last ORDER BY timestamp DESC))[1] AS last_price,
+                    MIN(timestamp) AS time_window_start,
+                    MAX(timestamp) AS time_window_end
+                FROM windowed
+                GROUP BY option_symbol, option_type
+            ),
+            type_agg AS (
+                SELECT
+                    MIN(time_window_start) AS time_window_start,
+                    MAX(time_window_end) AS time_window_end,
+                    option_type,
+                    SUM(flow)::bigint AS total_volume,
+                    SUM(flow * COALESCE(last_price, 0) * 100)::numeric AS total_premium
+                FROM contract_agg
+                GROUP BY option_type
             )
             SELECT
-                time_et as time_window_start,
-                timestamp as time_window_end,
-                underlying as symbol,
-                'CALL' as option_type,
-                COALESCE(call_flow, 0)::bigint as total_volume,
-                COALESCE(call_notional, 0)::numeric as total_premium,
-                NULL::numeric as avg_iv,
-                (COALESCE(call_flow, 0) - COALESCE(put_flow, 0))::numeric as net_delta,
+                time_window_start,
+                time_window_end,
+                $1::varchar AS symbol,
+                CASE WHEN option_type = 'C' THEN 'CALL' ELSE 'PUT' END AS option_type,
+                total_volume,
+                total_premium,
+                NULL::numeric AS avg_iv,
+                NULL::numeric AS net_delta,
                 CASE
-                    WHEN COALESCE(call_flow, 0) > COALESCE(put_flow, 0) THEN 'bullish'
-                    WHEN COALESCE(put_flow, 0) > COALESCE(call_flow, 0) THEN 'bearish'
+                    WHEN option_type = 'C' AND total_volume > COALESCE((SELECT total_volume FROM type_agg WHERE option_type = 'P'), 0) THEN 'bullish'
+                    WHEN option_type = 'P' AND total_volume > COALESCE((SELECT total_volume FROM type_agg WHERE option_type = 'C'), 0) THEN 'bearish'
                     ELSE 'neutral'
-                END as sentiment
-            FROM filtered
-
-            UNION ALL
-
-            SELECT
-                time_et as time_window_start,
-                timestamp as time_window_end,
-                underlying as symbol,
-                'PUT' as option_type,
-                COALESCE(put_flow, 0)::bigint as total_volume,
-                COALESCE(put_notional, 0)::numeric as total_premium,
-                NULL::numeric as avg_iv,
-                (COALESCE(put_flow, 0) - COALESCE(call_flow, 0))::numeric as net_delta,
-                CASE
-                    WHEN COALESCE(put_flow, 0) > COALESCE(call_flow, 0) THEN 'bearish'
-                    WHEN COALESCE(call_flow, 0) > COALESCE(put_flow, 0) THEN 'bullish'
-                    ELSE 'neutral'
-                END as sentiment
-            FROM filtered
-
-            ORDER BY time_window_end DESC, option_type
+                END AS sentiment
+            FROM type_agg
+            ORDER BY option_type
         """
 
         try:
             async with self.pool.acquire() as conn:
-                cutoff_time = datetime.now() - timedelta(minutes=window_minutes)
-                rows = await conn.fetch(query, symbol, cutoff_time)
+                rows = await conn.fetch(query, symbol, window_minutes)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching flow by type: {e}")
@@ -313,28 +349,62 @@ class DatabaseManager:
         window_minutes: int = 60,
         limit: int = 20
     ) -> List[Dict[str, Any]]:
-        """Get option flow by strike level"""
+        """Get option flow by strike level."""
         query = """
+            WITH latest AS (
+                SELECT MAX(timestamp) AS max_ts
+                FROM option_chains
+                WHERE underlying = $1
+            ),
+            windowed AS (
+                SELECT oc.*
+                FROM option_chains oc
+                CROSS JOIN latest l
+                WHERE oc.underlying = $1
+                    AND oc.timestamp BETWEEN l.max_ts - INTERVAL '1 minute' * $2 AND l.max_ts
+            ),
+            contract_agg AS (
+                SELECT
+                    option_symbol,
+                    strike,
+                    option_type,
+                    GREATEST(MAX(volume) - MIN(volume), 0) AS flow,
+                    (ARRAY_AGG(last ORDER BY timestamp DESC))[1] AS last_price,
+                    AVG(implied_volatility) AS avg_iv,
+                    MIN(timestamp) AS time_window_start,
+                    MAX(timestamp) AS time_window_end
+                FROM windowed
+                GROUP BY option_symbol, strike, option_type
+            ),
+            strike_agg AS (
+                SELECT
+                    MIN(time_window_start) AS time_window_start,
+                    MAX(time_window_end) AS time_window_end,
+                    strike,
+                    SUM(flow)::bigint AS total_volume,
+                    SUM(flow * COALESCE(last_price, 0) * 100)::numeric AS total_premium,
+                    AVG(avg_iv)::numeric AS avg_iv,
+                    SUM(CASE WHEN option_type = 'C' THEN flow ELSE -flow END)::numeric AS net_delta
+                FROM contract_agg
+                GROUP BY strike
+            )
             SELECT
-                time_et as time_window_start,
-                timestamp as time_window_end,
-                underlying as symbol,
+                time_window_start,
+                time_window_end,
+                $1::varchar AS symbol,
                 strike,
-                COALESCE(total_flow, 0)::bigint as total_volume,
-                COALESCE(total_notional, 0)::numeric as total_premium,
+                total_volume,
+                total_premium,
                 avg_iv,
-                COALESCE(net_flow, 0)::numeric as net_delta
-            FROM option_flow_by_strike
-            WHERE underlying = $1
-                AND timestamp >= $2
-            ORDER BY total_notional DESC NULLS LAST
+                net_delta
+            FROM strike_agg
+            ORDER BY total_premium DESC NULLS LAST
             LIMIT $3
         """
 
         try:
             async with self.pool.acquire() as conn:
-                cutoff_time = datetime.now() - timedelta(minutes=window_minutes)
-                rows = await conn.fetch(query, symbol, cutoff_time, limit)
+                rows = await conn.fetch(query, symbol, window_minutes, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching flow by strike: {e}")
@@ -346,33 +416,61 @@ class DatabaseManager:
         window_minutes: int = 60,
         limit: int = 10
     ) -> List[Dict[str, Any]]:
-        """Get unusual activity / smart money flow"""
+        """Get unusual activity / smart money flow."""
         query = """
+            WITH latest AS (
+                SELECT MAX(timestamp) AS max_ts
+                FROM option_chains
+                WHERE underlying = $1
+            ),
+            windowed AS (
+                SELECT oc.*
+                FROM option_chains oc
+                CROSS JOIN latest l
+                WHERE oc.underlying = $1
+                    AND oc.timestamp BETWEEN l.max_ts - INTERVAL '1 minute' * $2 AND l.max_ts
+            ),
+            contract_agg AS (
+                SELECT
+                    option_symbol,
+                    strike,
+                    expiration,
+                    option_type,
+                    GREATEST(MAX(volume) - MIN(volume), 0) AS flow,
+                    (ARRAY_AGG(last ORDER BY timestamp DESC))[1] AS last_price,
+                    AVG(implied_volatility)::numeric AS iv,
+                    AVG(delta)::numeric AS avg_delta,
+                    MIN(timestamp) AS time_window_start,
+                    MAX(timestamp) AS time_window_end
+                FROM windowed
+                GROUP BY option_symbol, strike, expiration, option_type
+            )
             SELECT
-                time_et as time_window_start,
-                timestamp as time_window_end,
-                underlying as symbol,
+                time_window_start,
+                time_window_end,
+                $1::varchar AS symbol,
                 option_type,
                 strike,
-                COALESCE(flow, 0)::bigint as total_volume,
-                COALESCE(notional, 0)::numeric as total_premium,
-                iv as avg_iv,
-                unusual_score as unusual_activity_score,
-                size_class,
-                notional_class,
-                moneyness
-            FROM option_flow_smart_money
-            WHERE underlying = $1
-                AND timestamp >= $2
-                AND unusual_score > 5
-            ORDER BY unusual_score DESC, notional DESC
+                flow::bigint AS total_volume,
+                (flow * COALESCE(last_price, 0) * 100)::numeric AS total_premium,
+                iv AS avg_iv,
+                LEAST(10, GREATEST(0,
+                    CASE WHEN flow >= 500 THEN 4 WHEN flow >= 200 THEN 3 WHEN flow >= 100 THEN 2 WHEN flow >= 50 THEN 1 ELSE 0 END +
+                    CASE WHEN flow * COALESCE(last_price, 0) * 100 >= 500000 THEN 4 WHEN flow * COALESCE(last_price, 0) * 100 >= 250000 THEN 3 WHEN flow * COALESCE(last_price, 0) * 100 >= 100000 THEN 2 WHEN flow * COALESCE(last_price, 0) * 100 >= 50000 THEN 1 ELSE 0 END +
+                    CASE WHEN iv > 1.0 THEN 2 WHEN iv > 0.6 THEN 1 ELSE 0 END
+                ))::numeric AS unusual_activity_score,
+                CASE WHEN flow >= 500 THEN '🔥 Massive Block' WHEN flow >= 200 THEN '📦 Large Block' WHEN flow >= 100 THEN '📊 Medium Block' ELSE '💼 Standard' END AS size_class,
+                CASE WHEN flow * COALESCE(last_price, 0) * 100 >= 500000 THEN '💰 $500K+' WHEN flow * COALESCE(last_price, 0) * 100 >= 250000 THEN '💵 $250K+' WHEN flow * COALESCE(last_price, 0) * 100 >= 100000 THEN '💸 $100K+' WHEN flow * COALESCE(last_price, 0) * 100 >= 50000 THEN '💳 $50K+' ELSE '💴 <$50K' END AS notional_class,
+                CASE WHEN ABS(COALESCE(avg_delta, 0)) < 0.15 THEN '💰 Deep OTM' WHEN ABS(COALESCE(avg_delta, 0)) < 0.35 THEN '🎯 OTM' WHEN ABS(COALESCE(avg_delta, 0)) < 0.65 THEN '⚖️ ATM' ELSE '💎 ITM' END AS moneyness
+            FROM contract_agg
+            WHERE flow > 0
+            ORDER BY unusual_activity_score DESC, total_premium DESC
             LIMIT $3
         """
 
         try:
             async with self.pool.acquire() as conn:
-                cutoff_time = datetime.now() - timedelta(minutes=window_minutes)
-                rows = await conn.fetch(query, symbol, cutoff_time, limit)
+                rows = await conn.fetch(query, symbol, window_minutes, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching smart money flow: {e}")
@@ -665,18 +763,25 @@ class DatabaseManager:
         symbol: str = 'SPY',
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
-        limit: int = 100,
+        limit: int = 90,
         timeframe: str = '1min'
     ) -> List[Dict[str, Any]]:
-        """Get historical quotes"""
-        if not start_date:
-            start_date = datetime.now() - timedelta(days=1)
-        if not end_date:
-            end_date = datetime.now()
-
+        """Get historical quotes aggregated by timeframe."""
         bucket = _bucket_expr(timeframe)
+        step_interval = _interval_expr(timeframe)
         query = f"""
-            WITH base AS (
+            WITH latest AS (
+                SELECT MAX(timestamp) AS max_ts
+                FROM underlying_quotes
+                WHERE symbol = $1
+            ),
+            bounds AS (
+                SELECT
+                    COALESCE($2::timestamptz, max_ts - ({step_interval} * ($4 - 1))) AS start_ts,
+                    COALESCE($3::timestamptz, max_ts) AS end_ts
+                FROM latest
+            ),
+            base AS (
                 SELECT
                     {bucket} as bucket_ts,
                     symbol,
@@ -685,12 +790,13 @@ class DatabaseManager:
                     high,
                     low,
                     close,
-                    up_volume + down_volume as volume,
+                    up_volume,
+                    down_volume,
                     ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp ASC) as rn_open,
                     ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) as rn_close
                 FROM underlying_quotes
                 WHERE symbol = $1
-                    AND timestamp BETWEEN $2 AND $3
+                    AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
             )
             SELECT
                 bucket_ts as timestamp,
@@ -699,7 +805,9 @@ class DatabaseManager:
                 MAX(high) as high,
                 MIN(low) as low,
                 MAX(close) FILTER (WHERE rn_close = 1) as close,
-                SUM(volume)::bigint as volume
+                SUM(up_volume)::bigint as up_volume,
+                SUM(down_volume)::bigint as down_volume,
+                (SUM(up_volume) + SUM(down_volume))::bigint as volume
             FROM base
             GROUP BY bucket_ts, symbol
             ORDER BY timestamp DESC
@@ -713,6 +821,112 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error fetching historical quotes: {e}")
             raise
+
+    async def get_max_pain_timeseries(
+        self,
+        symbol: str = 'SPY',
+        timeframe: str = '5min',
+        limit: int = 90
+    ) -> List[Dict[str, Any]]:
+        """Get max pain timeseries aggregated to timeframe."""
+        bucket = _bucket_expr(timeframe)
+        step_interval = _interval_expr(timeframe)
+        query = f"""
+            WITH latest AS (
+                SELECT MAX(timestamp) AS max_ts
+                FROM gex_summary
+                WHERE underlying = $1
+            ),
+            bounds AS (
+                SELECT max_ts - ({step_interval} * ($2 - 1)) AS start_ts, max_ts AS end_ts
+                FROM latest
+            ),
+            ranked AS (
+                SELECT
+                    {bucket} AS bucket_ts,
+                    underlying AS symbol,
+                    timestamp,
+                    max_pain::numeric AS max_pain,
+                    ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) AS rn
+                FROM gex_summary
+                WHERE underlying = $1
+                    AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+            )
+            SELECT bucket_ts AS timestamp, symbol, max_pain
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY timestamp ASC
+            LIMIT $2
+        """
+
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, symbol, limit)
+            return [dict(row) for row in rows]
+
+    async def get_max_pain_current(self, symbol: str = 'SPY', strike_limit: int = 200) -> Optional[Dict[str, Any]]:
+        """Get current max pain and payout/notional grid by settlement strike."""
+        query = """
+            WITH latest AS (
+                SELECT MAX(timestamp) AS max_ts
+                FROM option_chains
+                WHERE underlying = $1
+            ),
+            contracts AS (
+                SELECT strike, option_type, SUM(open_interest)::numeric AS oi
+                FROM option_chains oc
+                CROSS JOIN latest l
+                WHERE oc.underlying = $1
+                    AND oc.timestamp = l.max_ts
+                GROUP BY strike, option_type
+            ),
+            strikes AS (
+                SELECT DISTINCT strike
+                FROM contracts
+                ORDER BY strike
+                LIMIT $2
+            ),
+            payout AS (
+                SELECT
+                    s.strike AS settlement_price,
+                    SUM(CASE WHEN c.option_type = 'C' THEN GREATEST(s.strike - c.strike, 0) * c.oi * 100 ELSE 0 END)::numeric AS call_notional,
+                    SUM(CASE WHEN c.option_type = 'P' THEN GREATEST(c.strike - s.strike, 0) * c.oi * 100 ELSE 0 END)::numeric AS put_notional
+                FROM strikes s
+                CROSS JOIN contracts c
+                GROUP BY s.strike
+            ),
+            with_total AS (
+                SELECT settlement_price, call_notional, put_notional,
+                    (COALESCE(call_notional,0)+COALESCE(put_notional,0))::numeric AS total_notional
+                FROM payout
+            ),
+            best AS (
+                SELECT settlement_price AS max_pain
+                FROM with_total
+                ORDER BY total_notional ASC, settlement_price ASC
+                LIMIT 1
+            )
+            SELECT
+                (SELECT max_ts FROM latest) AS timestamp,
+                $1::varchar AS symbol,
+                (SELECT max_pain FROM best)::numeric AS max_pain,
+                COALESCE(
+                    JSON_AGG(
+                        JSON_BUILD_OBJECT(
+                            'settlement_price', settlement_price,
+                            'call_notional', call_notional,
+                            'put_notional', put_notional,
+                            'total_notional', total_notional
+                        ) ORDER BY settlement_price
+                    ),
+                    '[]'::json
+                ) AS strikes
+            FROM with_total
+        """
+
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(query, symbol, strike_limit)
+            return dict(row) if row and row['timestamp'] else None
+
     # ========================================================================
     # Chart Data Queries
     # ========================================================================
@@ -785,111 +999,4 @@ class DatabaseManager:
             logger.error(f"Error fetching GEX heatmap: {e}")
             raise
 
-    async def get_flow_timeseries(
-        self,
-        symbol: str = 'SPY',
-        window_minutes: int = 60,
-        interval_minutes: int = 5,
-        timeframe: str = '5min'
-    ) -> List[Dict[str, Any]]:
-        """
-        Get aggregated call/put notional flow over time
-        Returns time-series data for flow chart
-        If no recent data, returns the last available window of data
-        """
-        bucket = _bucket_expr(timeframe)
-        query = f"""
-            WITH latest_timestamp AS (
-                SELECT MAX(timestamp) as max_ts
-                FROM option_flow_by_type
-                WHERE underlying = $1
-            ),
-            time_window AS (
-                SELECT
-                    CASE
-                        WHEN max_ts >= NOW() - INTERVAL '1 minute' * $2
-                        THEN NOW() - INTERVAL '1 minute' * $2
-                        ELSE max_ts - INTERVAL '1 minute' * $2
-                    END as start_time,
-                    max_ts as end_time
-                FROM latest_timestamp
-            )
-            SELECT
-                {bucket} as timestamp,
-                COALESCE(SUM(call_notional), 0)::numeric as call_notional,
-                COALESCE(SUM(put_notional), 0)::numeric as put_notional,
-                COALESCE(SUM(call_flow), 0)::numeric as call_flow,
-                COALESCE(SUM(put_flow), 0)::numeric as put_flow,
-                COALESCE(SUM(net_notional), 0)::numeric as net_notional,
-                COALESCE(SUM(net_flow), 0)::numeric as net_flow
-            FROM option_flow_by_type
-            WHERE underlying = $1
-                AND timestamp >= (SELECT start_time FROM time_window)
-                AND timestamp <= (SELECT end_time FROM time_window)
-            GROUP BY 1
-            ORDER BY timestamp ASC
-        """
 
-        try:
-            async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, symbol, window_minutes)
-                return [dict(row) for row in rows]
-        except Exception as e:
-            logger.error(f"Error fetching flow timeseries: {e}")
-            raise
-
-    async def get_price_timeseries(
-        self,
-        symbol: str = 'SPY',
-        window_minutes: int = 60,
-        interval_minutes: int = 5,
-        timeframe: str = '5min'
-    ) -> List[Dict[str, Any]]:
-        """
-        Get underlying price time-series data
-        Returns timestamp and price for chart overlay
-        If no recent data, returns the last available window of data
-        """
-        bucket = _bucket_expr(timeframe if timeframe else "5min")
-        query = f"""
-            WITH latest_timestamp AS (
-                SELECT MAX(timestamp) as max_ts
-                FROM underlying_quotes
-                WHERE symbol = $1
-            ),
-            time_window AS (
-                SELECT
-                    CASE
-                        WHEN max_ts >= NOW() - INTERVAL '1 minute' * $2
-                        THEN NOW() - INTERVAL '1 minute' * $2
-                        ELSE max_ts - INTERVAL '1 minute' * $2
-                    END as start_time,
-                    max_ts as end_time
-                FROM latest_timestamp
-            ),
-            ranked AS (
-                SELECT
-                    {bucket} as bucket_ts,
-                    timestamp,
-                    close,
-                    ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) as rn
-                FROM underlying_quotes
-                WHERE symbol = $1
-                    AND timestamp >= (SELECT start_time FROM time_window)
-                    AND timestamp <= (SELECT end_time FROM time_window)
-            )
-            SELECT
-                bucket_ts as timestamp,
-                close as price
-            FROM ranked
-            WHERE rn = 1
-            ORDER BY timestamp ASC
-        """
-
-        try:
-            async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, symbol, window_minutes)
-                return [dict(row) for row in rows]
-        except Exception as e:
-            logger.error(f"Error fetching price timeseries: {e}")
-            raise
