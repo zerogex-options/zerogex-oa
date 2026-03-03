@@ -37,6 +37,7 @@ help: ## Show this help message
 	@echo "  make deploy             - Deploy Options Analytics platform"
 	@echo "  make deploy-from        - Deploy Options Analytics platform (start-from)"
 	@echo "  make deploy-validate    - Validate Options Analytics platform deployment"
+	@echo "  make staging-smoke      - Run post-deploy staging smoke checklist"
 	@echo ""
 	@echo "$(GREEN)Ingestion Service Management:$(NC)"
 	@echo "  make ingestion-start    - Start the ingestion service"
@@ -1539,16 +1540,80 @@ api-logs-error: ## View API error logs only
 api-test: ## Test ALL API endpoints
 	@echo "$(BLUE)=== Testing All API Endpoints ===$(NC)"
 	@echo ""
+	@BASE_URL="http://localhost:8000"; \
+	SYMBOL="SPY"; \
+	TIMEFRAME="5min"; \
+	test_endpoint() { \
+		label="$$1"; \
+		url="$$2"; \
+		echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; \
+		echo "$(GREEN)$${label}:$(NC)"; \
+		echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; \
+		curl -s "$$url" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"; \
+		echo ""; \
+	}; \
+	\
+	# Health \
+	test_endpoint "Health Check" "$$BASE_URL/api/health"; \
+	\
+	# GEX \
+	test_endpoint "GEX Summary" "$$BASE_URL/api/gex/summary?symbol=$$SYMBOL"; \
+	test_endpoint "GEX by Strike (Top 10)" "$$BASE_URL/api/gex/by-strike?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "GEX Historical (Last 10)" "$$BASE_URL/api/gex/historical?symbol=$$SYMBOL&limit=10&timeframe=$$TIMEFRAME"; \
+	test_endpoint "GEX Heatmap" "$$BASE_URL/api/gex/heatmap?symbol=$$SYMBOL&timeframe=$$TIMEFRAME&window_minutes=60&interval_minutes=5"; \
+	\
+	# Max Pain \
+	test_endpoint "Max Pain Timeseries (Last 10)" "$$BASE_URL/api/max-pain/timeseries?symbol=$$SYMBOL&limit=10&timeframe=$$TIMEFRAME"; \
+	test_endpoint "Max Pain Current" "$$BASE_URL/api/max-pain/current?symbol=$$SYMBOL&strike_limit=100"; \
+	\
+	# Flow \
+	test_endpoint "Option Flow by Type" "$$BASE_URL/api/flow/by-type?symbol=$$SYMBOL&window_minutes=60"; \
+	test_endpoint "Option Flow by Strike (Top 10)" "$$BASE_URL/api/flow/by-strike?symbol=$$SYMBOL&window_minutes=60&limit=10"; \
+	test_endpoint "Smart Money Flow" "$$BASE_URL/api/flow/smart-money?symbol=$$SYMBOL&window_minutes=60&limit=10"; \
+	\
+	# Market \
+	test_endpoint "Current Market Quote" "$$BASE_URL/api/market/quote?symbol=$$SYMBOL"; \
+	test_endpoint "Previous Close" "$$BASE_URL/api/market/previous-close?symbol=$$SYMBOL"; \
+	test_endpoint "Historical Quotes (Last 10)" "$$BASE_URL/api/market/historical?symbol=$$SYMBOL&limit=10&timeframe=$$TIMEFRAME"; \
+	\
+	# Trading \
+	test_endpoint "VWAP Deviation" "$$BASE_URL/api/trading/vwap-deviation?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "Opening Range Breakout" "$$BASE_URL/api/trading/opening-range?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "Gamma Exposure Levels" "$$BASE_URL/api/trading/gamma-levels?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "Dealer Hedging Pressure" "$$BASE_URL/api/trading/dealer-hedging?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "Unusual Volume Spikes" "$$BASE_URL/api/trading/volume-spikes?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "Momentum Divergence" "$$BASE_URL/api/trading/momentum-divergence?symbol=$$SYMBOL&limit=10"; \
+	\
+	# Docs \
+	test_endpoint "Swagger UI Availability" "$$BASE_URL/docs"; \
+	test_endpoint "ReDoc Availability" "$$BASE_URL/redoc"; \
+	test_endpoint "OpenAPI JSON" "$$BASE_URL/openapi.json"; \
+	\
+	echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; \
+	echo "$(GREEN)✅ All API Endpoints Tested$(NC)"; \
+	echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; \
+	echo ""; \
+	echo "$(YELLOW)API Documentation available at:$(NC)"; \
+	echo "  • Swagger UI: $$BASE_URL/docs"; \
+	echo "  • ReDoc:      $$BASE_URL/redoc"; \
+	echo "  • OpenAPI:    $$BASE_URL/openapi.json"; \
+	echo ""
 
-	# Config
-	@BASE_URL="http://localhost:8000"; 	SYMBOL="SPY"; 	TIMEFRAME="5min"; 	test_endpoint() { 		label="$$1"; 		url="$$2"; 		echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; 		echo "$(GREEN)$${label}:$(NC)"; 		echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; 		curl -s "$$url" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"; 		echo ""; 	}; 	# Health
-	test_endpoint "Health Check" "$$BASE_URL/api/health"; 	# GEX
-	test_endpoint "GEX Summary" "$$BASE_URL/api/gex/summary?symbol=$$SYMBOL"; 	test_endpoint "GEX by Strike (Top 10)" "$$BASE_URL/api/gex/by-strike?symbol=$$SYMBOL&limit=10"; 	test_endpoint "GEX Historical (Last 10)" "$$BASE_URL/api/gex/historical?symbol=$$SYMBOL&limit=10&timeframe=$$TIMEFRAME"; 	test_endpoint "GEX Heatmap" "$$BASE_URL/api/gex/heatmap?symbol=$$SYMBOL&timeframe=$$TIMEFRAME&window_minutes=60&interval_minutes=5"; 	# Max Pain
-	test_endpoint "Max Pain Timeseries (Last 10)" "$$BASE_URL/api/max-pain/timeseries?symbol=$$SYMBOL&limit=10&timeframe=$$TIMEFRAME"; 	test_endpoint "Max Pain Current" "$$BASE_URL/api/max-pain/current?symbol=$$SYMBOL&strike_limit=100"; 	# Flow
-	test_endpoint "Option Flow by Type" "$$BASE_URL/api/flow/by-type?symbol=$$SYMBOL&window_minutes=60"; 	test_endpoint "Option Flow by Strike (Top 10)" "$$BASE_URL/api/flow/by-strike?symbol=$$SYMBOL&window_minutes=60&limit=10"; 	test_endpoint "Smart Money Flow" "$$BASE_URL/api/flow/smart-money?symbol=$$SYMBOL&window_minutes=60&limit=10"; 	# Market
-	test_endpoint "Current Market Quote" "$$BASE_URL/api/market/quote?symbol=$$SYMBOL"; 	test_endpoint "Previous Close" "$$BASE_URL/api/market/previous-close?symbol=$$SYMBOL"; 	test_endpoint "Historical Quotes (Last 10)" "$$BASE_URL/api/market/historical?symbol=$$SYMBOL&limit=10&timeframe=$$TIMEFRAME"; 	# Trading
-	test_endpoint "VWAP Deviation" "$$BASE_URL/api/trading/vwap-deviation?symbol=$$SYMBOL&limit=10"; 	test_endpoint "Opening Range Breakout" "$$BASE_URL/api/trading/opening-range?symbol=$$SYMBOL&limit=10"; 	test_endpoint "Gamma Exposure Levels" "$$BASE_URL/api/trading/gamma-levels?symbol=$$SYMBOL&limit=10"; 	test_endpoint "Dealer Hedging Pressure" "$$BASE_URL/api/trading/dealer-hedging?symbol=$$SYMBOL&limit=10"; 	test_endpoint "Unusual Volume Spikes" "$$BASE_URL/api/trading/volume-spikes?symbol=$$SYMBOL&limit=10"; 	test_endpoint "Momentum Divergence" "$$BASE_URL/api/trading/momentum-divergence?symbol=$$SYMBOL&limit=10"; 	# Docs
-	test_endpoint "Swagger UI Availability" "$$BASE_URL/docs"; 	test_endpoint "ReDoc Availability" "$$BASE_URL/redoc"; 	test_endpoint "OpenAPI JSON" "$$BASE_URL/openapi.json"; 	echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; 	echo "$(GREEN)✅ All API Endpoints Tested$(NC)"; 	echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; 	echo ""; 	echo "$(YELLOW)API Documentation available at:$(NC)"; 	echo "  • Swagger UI: $$BASE_URL/docs"; 	echo "  • ReDoc:      $$BASE_URL/redoc"; 	echo "  • OpenAPI:    $$BASE_URL/openapi.json"; 	echo ""
+.PHONY: staging-smoke
+staging-smoke: ## Run post-deploy staging smoke checklist
+	@echo "$(BLUE)=== Staging Smoke Checklist ===$(NC)"
+	@echo "$(YELLOW)Checking systemd services...$(NC)"
+	@systemctl is-active --quiet $(INGESTION_SERVICE) && echo "$(GREEN)✅ Ingestion service active$(NC)" || (echo "$(RED)❌ Ingestion service inactive$(NC)" && exit 1)
+	@systemctl is-active --quiet $(ANALYTICS_SERVICE) && echo "$(GREEN)✅ Analytics service active$(NC)" || (echo "$(RED)❌ Analytics service inactive$(NC)" && exit 1)
+	@systemctl is-active --quiet zerogex-oa-api && echo "$(GREEN)✅ API service active$(NC)" || (echo "$(RED)❌ API service inactive$(NC)" && exit 1)
+	@echo ""
+	@echo "$(YELLOW)Checking core API endpoints...$(NC)"
+	@curl -fsS "http://localhost:8000/api/health" > /dev/null && echo "$(GREEN)✅ /api/health$(NC)" || (echo "$(RED)❌ /api/health$(NC)" && exit 1)
+	@curl -fsS "http://localhost:8000/api/gex/summary?symbol=SPY" > /dev/null && echo "$(GREEN)✅ /api/gex/summary$(NC)" || (echo "$(RED)❌ /api/gex/summary$(NC)" && exit 1)
+	@curl -fsS "http://localhost:8000/api/market/quote?symbol=SPY" > /dev/null && echo "$(GREEN)✅ /api/market/quote$(NC)" || (echo "$(RED)❌ /api/market/quote$(NC)" && exit 1)
+	@curl -fsS "http://localhost:8000/api/flow/by-type?symbol=SPY&window_minutes=60" > /dev/null && echo "$(GREEN)✅ /api/flow/by-type$(NC)" || (echo "$(RED)❌ /api/flow/by-type$(NC)" && exit 1)
+	@echo ""
+	@echo "$(GREEN)✅ Staging smoke checklist passed$(NC)"
 
 .PHONY: api-install-service
 api-install-service: ## Install API as systemd service
