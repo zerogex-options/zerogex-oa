@@ -118,6 +118,12 @@ Get GEX breakdown by individual strikes
 ### GET /api/gex/historical
 Get historical GEX data
 
+**Parameters:**
+- `symbol` (optional): Default "SPY"
+- `start_date` (optional): ISO format
+- `end_date` (optional): ISO format
+- `limit` (optional): Max 1000, default 90
+
 ### GET /api/gex/heatmap
 Get GEX heatmap data (strike x time)
 
@@ -126,13 +132,6 @@ Get GEX heatmap data (strike x time)
 - `window_minutes` (optional): Max 7200, default 60
 - `interval_minutes` (optional): Max 1440, default 5
 - `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day`
-
-
-**Parameters:**
-- `symbol` (optional): Default "SPY"
-- `start_date` (optional): ISO format
-- `end_date` (optional): ISO format
-- `limit` (optional): Max 1000, default 90
 
 ---
 
