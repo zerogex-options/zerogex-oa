@@ -21,6 +21,8 @@ from .models import (
     UnderlyingQuote,
     PreviousClose,
     HealthStatus,
+    MaxPainCurrent,
+    MaxPainTimeseriesPoint,
 )
 
 # Configure logging
@@ -57,6 +59,9 @@ app = FastAPI(
     title="ZeroGEX API",
     description="Real-time options analytics API",
     version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
     lifespan=lifespan
 )
 
@@ -144,8 +149,8 @@ async def get_historical_gex(
     symbol: str = Query(default="SPY"),
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    limit: int = Query(default=100, le=1000),
-    timeframe: Literal["1min", "5min", "15min", "1hour", "1day"] = Query(default="1min")
+    limit: int = Query(default=90, le=1000),
+    timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min")
 ):
     """Get historical GEX data"""
     try:
@@ -265,8 +270,8 @@ async def get_historical_quotes(
     symbol: str = Query(default="SPY"),
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    limit: int = Query(default=100, le=1000),
-    timeframe: Literal["1min", "5min", "15min", "1hour", "1day"] = Query(default="1min")
+    limit: int = Query(default=90, le=1000),
+    timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min")
 ):
     """Get historical quotes"""
     try:
@@ -286,6 +291,43 @@ async def get_historical_quotes(
     except Exception as e:
         logger.error(f"Error fetching historical quotes: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/max-pain/timeseries", response_model=List[MaxPainTimeseriesPoint])
+async def get_max_pain_timeseries(
+    symbol: str = Query(default="SPY"),
+    timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="5min"),
+    limit: int = Query(default=90, le=500)
+):
+    """Get max pain over time aggregated by timeframe."""
+    try:
+        data = await db_manager.get_max_pain_timeseries(symbol, timeframe, limit)
+        if not data:
+            raise HTTPException(status_code=404, detail="No max pain data available")
+        return [MaxPainTimeseriesPoint(**row) for row in data]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching max pain timeseries: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/api/max-pain/current", response_model=MaxPainCurrent)
+async def get_max_pain_current(
+    symbol: str = Query(default="SPY"),
+    strike_limit: int = Query(default=200, ge=10, le=1000)
+):
+    """Get current max pain and strike-by-strike call/put payout notional."""
+    try:
+        data = await db_manager.get_max_pain_current(symbol, strike_limit)
+        if not data:
+            raise HTTPException(status_code=404, detail="No max pain data available")
+        return MaxPainCurrent(**data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching current max pain: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 
 # ============================================================================
 # Day Trading Endpoints
@@ -402,7 +444,7 @@ async def get_gex_heatmap(
     symbol: str = Query(default="SPY"),
     window_minutes: int = Query(default=60, le=7200),
     interval_minutes: int = Query(default=5, le=1440),
-    timeframe: Literal["1min", "5min", "15min", "1hour", "1day"] = Query(default="5min")
+    timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="5min")
 ):
     """Get GEX heatmap data (strike x time)"""
     try:
@@ -421,7 +463,7 @@ async def get_flow_timeseries(
     symbol: str = Query(default="SPY"),
     window_minutes: int = Query(default=60, le=7200),
     interval_minutes: int = Query(default=5, le=1440),
-    timeframe: Literal["1min", "5min", "15min", "1hour", "1day"] = Query(default="5min")
+    timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="5min")
 ):
     """Get options flow time-series data (call/put notional over time)"""
     try:
@@ -436,7 +478,7 @@ async def get_price_timeseries(
     symbol: str = Query(default="SPY"),
     window_minutes: int = Query(default=60, le=1440),
     interval_minutes: int = Query(default=5, le=60),
-    timeframe: Literal["1min", "5min", "15min", "1hour", "1day"] = Query(default="5min")
+    timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="5min")
 ):
     """Get underlying price time-series data for chart overlay"""
     try:
