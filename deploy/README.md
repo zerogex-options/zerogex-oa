@@ -112,15 +112,15 @@ The deployment process runs these steps in order:
 - Provides REST API endpoints
 - Interactive API docs at /docs
 
-### Step 120: Nginx Reverse Proxy (Hardened API)
+### Step 120: Nginx Reverse Proxy (HTTP Bootstrap)
 - Installs and configures Nginx for `api.zerogex.io`
-- Proxies all API/docs traffic to `http://127.0.0.1:8000`
-- Applies security headers and per-IP rate limiting
+- Proxies API/docs traffic to `http://127.0.0.1:8000` over HTTP only
+- Prepares ACME challenge path for certificate issuance
 - Enables HTTP/HTTPS firewall rules and removes public 8000 exposure
 
-### Step 130: SSL/HTTPS + Auto-Renew
+### Step 130: SSL/HTTPS + Auto-Renew (Hardened)
 - Automatically issues/renews Let's Encrypt cert for `api.zerogex.io`
-- Enforces HTTP→HTTPS redirect with HSTS + OCSP stapling
+- Rewrites nginx site to hardened HTTPS config with HTTP→HTTPS redirect
 - Installs systemd renewal units (`zerogex-cert-renew.service/.timer`)
 - Validates renewal flow with a dry-run
 
