@@ -121,7 +121,7 @@ The deployment process runs these steps in order:
 ### Step 130: SSL/HTTPS + Auto-Renew (Hardened)
 - Automatically issues/renews Let's Encrypt cert for `api.zerogex.io`
 - Rewrites nginx site to hardened HTTPS config with HTTP→HTTPS redirect
-- Installs systemd renewal units (`zerogex-cert-renew.service/.timer`)
+- Installs systemd renewal units (`zerogex-cert-renew.service/.timer`) scoped to `api.zerogex.io`
 - Validates renewal flow with a dry-run
 
 ### Step 200: Validation

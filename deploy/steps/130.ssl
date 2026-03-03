@@ -139,13 +139,8 @@ log "  → Enabling renewal timer..."
 sudo systemctl daemon-reload
 sudo systemctl enable --now zerogex-cert-renew.timer
 
-# Disable distro timer to avoid overlapping schedules if present
-if systemctl list-unit-files | grep -q '^certbot.timer'; then
-    sudo systemctl disable --now certbot.timer >/dev/null 2>&1 || true
-fi
-
 log "  → Testing renewal flow (dry-run)..."
-sudo certbot renew --dry-run --deploy-hook "/usr/local/bin/zerogex-certbot-deploy-hook.sh"
+sudo certbot renew --dry-run --cert-name "$DOMAIN_NAME" --deploy-hook "/usr/local/bin/zerogex-certbot-deploy-hook.sh"
 
 log ""
 log "SSL setup complete!"
