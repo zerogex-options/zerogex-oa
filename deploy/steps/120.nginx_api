@@ -1,0 +1,91 @@
+#!/bin/bash
+
+# ==============================================
+# Step 120: Nginx Reverse Proxy (HTTP bootstrap)
+# ==============================================
+
+set -e
+
+log "Nginx Reverse Proxy (HTTP bootstrap)"
+
+DOMAIN_NAME="${OA_API_DOMAIN:-api.zerogex.io}"
+NGINX_SITE="/etc/nginx/sites-available/zerogex-oa-api"
+
+log "  → Installing nginx..."
+sudo apt install -y nginx
+
+log "  → Writing shared nginx snippets (upgrade map + rate limit zone)..."
+sudo tee /etc/nginx/conf.d/zerogex-upgrade-map.conf > /dev/null <<'MAPEOF'
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+MAPEOF
+
+sudo tee /etc/nginx/conf.d/zerogex-rate-limit.conf > /dev/null <<'LIMITEOF'
+# Per-IP rate limiting for API and docs endpoints
+limit_req_zone $binary_remote_addr zone=zerogex_api_per_ip:10m rate=20r/s;
+LIMITEOF
+
+log "  → Creating HTTP-only nginx bootstrap configuration for ${DOMAIN_NAME}..."
+sudo tee "$NGINX_SITE" > /dev/null <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN_NAME};
+
+    # ACME challenge path for certbot
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+
+        proxy_connect_timeout 15s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+
+        limit_req zone=zerogex_api_per_ip burst=40 nodelay;
+    }
+}
+EOF
+
+log "  → Enabling site..."
+sudo ln -sf "$NGINX_SITE" /etc/nginx/sites-enabled/zerogex-oa-api
+
+log "  → Removing default nginx site..."
+sudo rm -f /etc/nginx/sites-enabled/default
+
+log "  → Testing nginx configuration..."
+sudo nginx -t
+
+log "  → Restarting nginx..."
+sudo systemctl restart nginx
+sudo systemctl enable nginx
+
+log "  → Updating firewall rules for reverse proxy..."
+sudo ufw allow 80/tcp comment 'HTTP' || true
+sudo ufw allow 443/tcp comment 'HTTPS' || true
+# Keep API service private behind nginx
+sudo ufw delete allow 8000/tcp >/dev/null 2>&1 || true
+
+log ""
+log "Nginx bootstrap configuration complete!"
+log ""
+log "Summary:"
+log "  ✓ Nginx configured for domain: ${DOMAIN_NAME}"
+log "  ✓ HTTP reverse proxy active: http://${DOMAIN_NAME} -> http://127.0.0.1:8000"
+log "  ✓ ACME challenge path ready for certbot"
+log "  ✓ Firewall updated (80/443 allowed, 8000 removed)"
+log ""
+log "Next step:"
+log "  • Run step 130 to issue Let's Encrypt TLS cert and install hardened HTTPS config"
+log ""

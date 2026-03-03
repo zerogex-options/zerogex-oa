@@ -7,8 +7,8 @@ from datetime import datetime
 from typing import Optional
 from decimal import Decimal
 
+
 class GEXSummary(BaseModel):
-    """GEX Summary Response"""
     timestamp: datetime
     symbol: str
     spot_price: Decimal
@@ -30,8 +30,8 @@ class GEXSummary(BaseModel):
             datetime: lambda v: v.isoformat() if v is not None else None,
         }
 
+
 class GEXByStrike(BaseModel):
-    """GEX by Strike Response"""
     timestamp: datetime
     symbol: str
     strike: Decimal
@@ -52,18 +52,18 @@ class GEXByStrike(BaseModel):
             datetime: lambda v: v.isoformat() if v is not None else None,
         }
 
+
 class OptionFlow(BaseModel):
-    """Option Flow Response"""
     time_window_start: datetime
     time_window_end: datetime
     symbol: str
-    option_type: Optional[str] = None  # 'CALL' or 'PUT'
+    option_type: Optional[str] = None
     strike: Optional[Decimal] = None
     total_volume: int
     total_premium: Decimal
     avg_iv: Optional[Decimal] = None
     net_delta: Optional[Decimal] = None
-    sentiment: Optional[str] = None  # 'bullish', 'bearish', 'neutral'
+    sentiment: Optional[str] = None
     unusual_activity_score: Optional[Decimal] = None
 
     class Config:
@@ -73,8 +73,8 @@ class OptionFlow(BaseModel):
             datetime: lambda v: v.isoformat() if v is not None else None,
         }
 
+
 class UnderlyingQuote(BaseModel):
-    """Underlying Quote Response"""
     timestamp: datetime
     symbol: str
     open: Decimal
@@ -82,6 +82,8 @@ class UnderlyingQuote(BaseModel):
     low: Decimal
     close: Decimal
     volume: Optional[int] = None
+    up_volume: Optional[int] = None
+    down_volume: Optional[int] = None
 
     class Config:
         from_attributes = True
@@ -90,8 +92,8 @@ class UnderlyingQuote(BaseModel):
             datetime: lambda v: v.isoformat() if v is not None else None,
         }
 
+
 class PreviousClose(BaseModel):
-    """Previous Close Response"""
     symbol: str
     previous_close: Decimal
     timestamp: datetime
@@ -103,8 +105,28 @@ class PreviousClose(BaseModel):
             datetime: lambda v: v.isoformat() if v is not None else None,
         }
 
+
+class MaxPainPoint(BaseModel):
+    settlement_price: Decimal
+    call_notional: Decimal
+    put_notional: Decimal
+    total_notional: Decimal
+
+
+class MaxPainCurrent(BaseModel):
+    timestamp: datetime
+    symbol: str
+    max_pain: Decimal
+    strikes: list[MaxPainPoint]
+
+
+class MaxPainTimeseriesPoint(BaseModel):
+    timestamp: datetime
+    symbol: str
+    max_pain: Decimal
+
+
 class HealthStatus(BaseModel):
-    """Health Check Response"""
     status: str = Field(..., description="healthy, degraded, or unhealthy")
     database_connected: bool
     last_data_update: Optional[datetime] = None

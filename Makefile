@@ -20,6 +20,9 @@ VENV_PYTHON = venv/bin/python
 
 # Flow query symbol filter (override with: make flow-by-type FLOW_SYMBOL=QQQ)
 FLOW_SYMBOL ?= SPY
+API_TEST_BASE_URL ?= http://localhost:8000
+API_TEST_SYMBOL ?= SPY
+API_TEST_TIMEFRAME ?= 5min
 
 # Colors for output
 BLUE = \033[0;34m
@@ -66,6 +69,7 @@ help: ## Show this help message
 	@echo "  make api-logs            - View API logs (live)"
 	@echo "  make api-logs-error      - View API error logs only"
 	@echo "  make api-test            - Test API endpoints"
+	@echo "  make api-smoke-staging   - Smoke test staging/prod API endpoints"
 	@echo "  make api-install-service - Install API as systemd service"
 	@echo ""
 	@echo "$(GREEN)Logs:$(NC)"
@@ -1536,115 +1540,56 @@ api-logs-error: ## View API error logs only
 	@sudo journalctl -u zerogex-oa-api -p err -f
 
 .PHONY: api-test
-api-test: ## Test ALL API endpoints
+api-test: ## Test ALL API endpoints (override with API_TEST_BASE_URL/API_TEST_SYMBOL/API_TEST_TIMEFRAME)
 	@echo "$(BLUE)=== Testing All API Endpoints ===$(NC)"
 	@echo ""
+	@BASE_URL="$(API_TEST_BASE_URL)"; \
+	SYMBOL="$(API_TEST_SYMBOL)"; \
+	TIMEFRAME="$(API_TEST_TIMEFRAME)"; \
+	test_endpoint() { \
+		label="$$1"; \
+		url="$$2"; \
+		echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; \
+		echo "$(GREEN)$${label}:$(NC)"; \
+		echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; \
+		curl -s "$$url" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"; \
+		echo ""; \
+	}; \
+	test_endpoint "Health Check" "$$BASE_URL/api/health"; \
+	test_endpoint "GEX Summary" "$$BASE_URL/api/gex/summary?symbol=$$SYMBOL"; \
+	test_endpoint "GEX by Strike (Top 10)" "$$BASE_URL/api/gex/by-strike?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "GEX Historical (Last 10)" "$$BASE_URL/api/gex/historical?symbol=$$SYMBOL&limit=10&timeframe=$$TIMEFRAME"; \
+	test_endpoint "GEX Heatmap" "$$BASE_URL/api/gex/heatmap?symbol=$$SYMBOL&timeframe=$$TIMEFRAME&window_minutes=60&interval_minutes=5"; \
+	test_endpoint "Max Pain Timeseries (Last 10)" "$$BASE_URL/api/max-pain/timeseries?symbol=$$SYMBOL&limit=10&timeframe=$$TIMEFRAME"; \
+	test_endpoint "Max Pain Current" "$$BASE_URL/api/max-pain/current?symbol=$$SYMBOL&strike_limit=100"; \
+	test_endpoint "Option Flow by Type" "$$BASE_URL/api/flow/by-type?symbol=$$SYMBOL&window_minutes=60"; \
+	test_endpoint "Option Flow by Strike (Top 10)" "$$BASE_URL/api/flow/by-strike?symbol=$$SYMBOL&window_minutes=60&limit=10"; \
+	test_endpoint "Smart Money Flow" "$$BASE_URL/api/flow/smart-money?symbol=$$SYMBOL&window_minutes=60&limit=10"; \
+	test_endpoint "Current Market Quote" "$$BASE_URL/api/market/quote?symbol=$$SYMBOL"; \
+	test_endpoint "Previous Close" "$$BASE_URL/api/market/previous-close?symbol=$$SYMBOL"; \
+	test_endpoint "Historical Quotes (Last 10)" "$$BASE_URL/api/market/historical?symbol=$$SYMBOL&limit=10&timeframe=$$TIMEFRAME"; \
+	test_endpoint "VWAP Deviation" "$$BASE_URL/api/trading/vwap-deviation?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "Opening Range Breakout" "$$BASE_URL/api/trading/opening-range?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "Gamma Exposure Levels" "$$BASE_URL/api/trading/gamma-levels?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "Dealer Hedging Pressure" "$$BASE_URL/api/trading/dealer-hedging?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "Unusual Volume Spikes" "$$BASE_URL/api/trading/volume-spikes?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "Momentum Divergence" "$$BASE_URL/api/trading/momentum-divergence?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "Swagger UI Availability" "$$BASE_URL/docs"; \
+	test_endpoint "ReDoc Availability" "$$BASE_URL/redoc"; \
+	test_endpoint "OpenAPI JSON" "$$BASE_URL/openapi.json"; \
+	echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; \
+	echo "$(GREEN)✅ All API Endpoints Tested$(NC)"; \
+	echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; \
+	echo ""; \
+	echo "$(YELLOW)API Documentation available at:$(NC)"; \
+	echo "  • Swagger UI: $$BASE_URL/docs"; \
+	echo "  • ReDoc:      $$BASE_URL/redoc"; \
+	echo "  • OpenAPI:    $$BASE_URL/openapi.json"; \
+	echo ""
 
-	# Health & Status
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@echo "$(GREEN)Health Check:$(NC)"
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@curl -s http://localhost:8000/api/health | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
-	@echo ""
-
-	# GEX Endpoints
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@echo "$(GREEN)GEX Summary:$(NC)"
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@curl -s http://localhost:8000/api/gex/summary | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
-	@echo ""
-
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@echo "$(GREEN)GEX by Strike (Top 10):$(NC)"
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@curl -s "http://localhost:8000/api/gex/by-strike?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
-	@echo ""
-
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@echo "$(GREEN)GEX Historical (Last 10):$(NC)"
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@curl -s "http://localhost:8000/api/gex/historical?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
-	@echo ""
-
-	# Options Flow Endpoints
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@echo "$(GREEN)Option Flow by Type (Calls vs Puts):$(NC)"
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@curl -s "http://localhost:8000/api/flow/by-type?window_minutes=60" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
-	@echo ""
-
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@echo "$(GREEN)Option Flow by Strike (Top 10):$(NC)"
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@curl -s "http://localhost:8000/api/flow/by-strike?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
-	@echo ""
-
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@echo "$(GREEN)Smart Money Flow (Unusual Activity):$(NC)"
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@curl -s "http://localhost:8000/api/flow/smart-money?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
-	@echo ""
-
-	# Day Trading Endpoints
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@echo "$(GREEN)VWAP Deviation (Mean Reversion):$(NC)"
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@curl -s "http://localhost:8000/api/trading/vwap-deviation?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
-	@echo ""
-
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@echo "$(GREEN)Opening Range Breakout (ORB):$(NC)"
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@curl -s "http://localhost:8000/api/trading/opening-range?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
-	@echo ""
-
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@echo "$(GREEN)Gamma Exposure Levels (Support/Resistance):$(NC)"
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@curl -s "http://localhost:8000/api/trading/gamma-levels?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
-	@echo ""
-
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@echo "$(GREEN)Dealer Hedging Pressure:$(NC)"
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@curl -s "http://localhost:8000/api/trading/dealer-hedging?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
-	@echo ""
-
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@echo "$(GREEN)Unusual Volume Spikes:$(NC)"
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@curl -s "http://localhost:8000/api/trading/volume-spikes?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
-	@echo ""
-
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@echo "$(GREEN)Momentum Divergence Signals:$(NC)"
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@curl -s "http://localhost:8000/api/trading/momentum-divergence?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
-	@echo ""
-
-	# Market Data Endpoints
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@echo "$(GREEN)Current Market Quote:$(NC)"
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@curl -s http://localhost:8000/api/market/quote | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
-	@echo ""
-
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@echo "$(GREEN)Historical Quotes (Last 10):$(NC)"
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@curl -s "http://localhost:8000/api/market/historical?limit=10" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"
-	@echo ""
-
-	# Summary
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@echo "$(GREEN)✅ All API Endpoints Tested$(NC)"
-	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
-	@echo ""
-	@echo "$(YELLOW)API Documentation available at:$(NC)"
-	@echo "  • Swagger UI: http://localhost:8000/docs"
-	@echo "  • ReDoc:      http://localhost:8000/redoc"
-	@echo ""
-
+.PHONY: api-smoke-staging
+api-smoke-staging: ## Smoke test staging/prod API endpoints (default base URL: https://api.zerogex.io)
+	@$(MAKE) api-test API_TEST_BASE_URL="https://api.zerogex.io"
 .PHONY: api-install-service
 api-install-service: ## Install API as systemd service
 	@echo "$(BLUE)=== Installing API Systemd Service ===$(NC)"

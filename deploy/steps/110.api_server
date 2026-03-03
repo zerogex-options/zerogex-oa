@@ -44,10 +44,8 @@ pip install fastapi uvicorn[standard] asyncpg pydantic
 
 deactivate
 
-# Configure firewall for API
-log "  → Configuring firewall for API (port 8000)..."
-sudo ufw allow 8000/tcp comment 'ZeroGEX API'
-log "     ✓ Port 8000 allowed through firewall"
+# Keep API bound locally; ingress handled by nginx in step 120
+log "  → Skipping public firewall rule for port 8000 (nginx reverse proxy handles ingress)..."
 
 # Copy systemd service file
 log "  → Installing API systemd service..."
@@ -108,7 +106,7 @@ log "API server setup complete!"
 log ""
 log "Summary:"
 log "  ✓ API dependencies installed"
-log "  ✓ Firewall configured (port 8000)"
+log "  ✓ API service configured (private upstream for nginx)"
 log "  ✓ Systemd service installed and enabled"
 
 # Check which services are actually running

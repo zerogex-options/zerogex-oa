@@ -6,6 +6,44 @@ Base URL: `http://your-server:8000`
 
 ---
 
+## Current Endpoint Order (Authoritative)
+
+The API currently exposes endpoints in this hierarchy/order:
+
+1. Health
+   - `GET /api/health`
+2. GEX
+   - `GET /api/gex/summary`
+   - `GET /api/gex/by-strike`
+   - `GET /api/gex/historical`
+   - `GET /api/gex/heatmap`
+3. Max Pain
+   - `GET /api/max-pain/timeseries`
+   - `GET /api/max-pain/current`
+4. Flow
+   - `GET /api/flow/by-type`
+   - `GET /api/flow/by-strike`
+   - `GET /api/flow/smart-money`
+5. Market
+   - `GET /api/market/quote`
+   - `GET /api/market/previous-close`
+   - `GET /api/market/historical`
+6. Trading
+   - `GET /api/trading/vwap-deviation`
+   - `GET /api/trading/opening-range`
+   - `GET /api/trading/gamma-levels`
+   - `GET /api/trading/dealer-hedging`
+   - `GET /api/trading/volume-spikes`
+   - `GET /api/trading/momentum-divergence`
+7. Docs
+   - `GET /docs`
+   - `GET /redoc`
+   - `GET /openapi.json`
+
+> Note: `/api/flow/timeseries` and `/api/price/timeseries` are intentionally removed.
+
+---
+
 ## Health & Status
 
 ### GET /api/health
@@ -80,11 +118,40 @@ Get GEX breakdown by individual strikes
 ### GET /api/gex/historical
 Get historical GEX data
 
+### GET /api/gex/heatmap
+Get GEX heatmap data (strike x time)
+
+**Parameters:**
+- `symbol` (optional): Default "SPY"
+- `window_minutes` (optional): Max 7200, default 60
+- `interval_minutes` (optional): Max 1440, default 5
+- `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day`
+
+
 **Parameters:**
 - `symbol` (optional): Default "SPY"
 - `start_date` (optional): ISO format
 - `end_date` (optional): ISO format
-- `limit` (optional): Max 1000, default 100
+- `limit` (optional): Max 1000, default 90
+
+---
+
+## Max Pain Endpoints
+
+### GET /api/max-pain/timeseries
+Get max pain over time
+
+**Parameters:**
+- `symbol` (optional): Default "SPY"
+- `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day`
+- `limit` (optional): Max 500, default 90
+
+### GET /api/max-pain/current
+Get current max pain and strike-level call/put payout notional grid
+
+**Parameters:**
+- `symbol` (optional): Default "SPY"
+- `strike_limit` (optional): Max 1000, default 200
 
 ---
 
@@ -151,6 +218,12 @@ Get unusual activity / smart money flow
 ```
 
 ---
+
+### GET /api/market/previous-close
+Get previous trading day close
+
+**Parameters:**
+- `symbol` (optional): Default "SPY"
 
 ## Day Trading Endpoints
 
@@ -340,7 +413,7 @@ Get historical quotes
 - `symbol` (optional): Default "SPY"
 - `start_date` (optional): ISO format
 - `end_date` (optional): ISO format
-- `limit` (optional): Max 1000, default 100
+- `limit` (optional): Max 1000, default 90
 
 ---
 
