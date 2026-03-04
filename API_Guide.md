@@ -52,7 +52,7 @@ Get GEX heatmap matrix (strike × time).
 ## Options Flow
 
 ### GET /api/flow/by-type
-Get option flow by type (calls vs puts).
+Get option flow by type (calls vs puts) across the full selected interval (time-series rows).
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
@@ -113,7 +113,7 @@ Get max pain over time (aggregated by timeframe).
 - `limit` (optional): min `1`, max `500`, default `90`
 
 ### GET /api/max-pain/current
-Get current max pain plus strike-by-strike payout notional.
+Get current max pain with current underlying price, difference (`max_pain - underlying_price`), and per-expiration strike payout/notional grids.
 
 **Parameters:**
 - `symbol` (optional): default `SPY`

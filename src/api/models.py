@@ -3,7 +3,7 @@ Pydantic models for API request/response validation
 """
 
 from pydantic import BaseModel, Field
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
 from decimal import Decimal
 
@@ -107,17 +107,27 @@ class PreviousClose(BaseModel):
 
 
 class MaxPainPoint(BaseModel):
+    expiration: date | None = None
     settlement_price: Decimal
     call_notional: Decimal
     put_notional: Decimal
     total_notional: Decimal
 
 
+class MaxPainExpiration(BaseModel):
+    expiration: date
+    max_pain: Decimal
+    difference_from_underlying: Decimal
+    strikes: list[MaxPainPoint]
+
+
 class MaxPainCurrent(BaseModel):
     timestamp: datetime
     symbol: str
+    underlying_price: Decimal
     max_pain: Decimal
-    strikes: list[MaxPainPoint]
+    difference: Decimal
+    expirations: list[MaxPainExpiration]
 
 
 class MaxPainTimeseriesPoint(BaseModel):

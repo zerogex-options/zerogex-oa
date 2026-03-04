@@ -121,6 +121,388 @@ class DatabaseManager:
             logger.error(f"Health check failed: {e}")
             return False
 
+    async def _refresh_flow_cache(self, conn: asyncpg.Connection, symbol: str, window_minutes: int) -> None:
+        """Incrementally cache per-minute flow aggregates for missing timestamps in the requested window."""
+        window_minutes = max(1, min(window_minutes, 1440))
+
+        cache_by_type_query = """
+            WITH latest AS (
+                SELECT MAX(timestamp) AS max_ts
+                FROM option_chains
+                WHERE underlying = $1
+            ),
+            missing AS (
+                SELECT DISTINCT oc.timestamp
+                FROM option_chains oc
+                CROSS JOIN latest l
+                WHERE oc.underlying = $1
+                  AND oc.timestamp BETWEEN l.max_ts - INTERVAL '1 minute' * $2 AND l.max_ts
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM flow_cache_by_type_minute c
+                      WHERE c.symbol = $1
+                        AND c.timestamp = oc.timestamp
+                  )
+            )
+            INSERT INTO flow_cache_by_type_minute (
+                timestamp,
+                symbol,
+                option_type,
+                total_volume,
+                total_premium,
+                avg_iv,
+                net_delta
+            )
+            SELECT
+                o.timestamp,
+                $1::varchar AS symbol,
+                o.option_type,
+                SUM(GREATEST(o.volume_delta, 0))::bigint AS total_volume,
+                SUM(GREATEST(o.volume_delta, 0) * COALESCE(o.last, 0) * 100)::numeric AS total_premium,
+                AVG(o.implied_volatility)::numeric AS avg_iv,
+                SUM(CASE WHEN o.option_type = 'C' THEN GREATEST(o.volume_delta, 0) ELSE -GREATEST(o.volume_delta, 0) END)::numeric AS net_delta
+            FROM option_chains_with_deltas o
+            JOIN missing m ON m.timestamp = o.timestamp
+            WHERE o.underlying = $1
+              AND o.volume_delta > 0
+            GROUP BY o.timestamp, o.option_type
+            ON CONFLICT (timestamp, symbol, option_type)
+            DO UPDATE SET
+                total_volume = EXCLUDED.total_volume,
+                total_premium = EXCLUDED.total_premium,
+                avg_iv = EXCLUDED.avg_iv,
+                net_delta = EXCLUDED.net_delta,
+                updated_at = NOW()
+        """
+
+        cache_by_strike_query = """
+            WITH latest AS (
+                SELECT MAX(timestamp) AS max_ts
+                FROM option_chains
+                WHERE underlying = $1
+            ),
+            missing AS (
+                SELECT DISTINCT oc.timestamp
+                FROM option_chains oc
+                CROSS JOIN latest l
+                WHERE oc.underlying = $1
+                  AND oc.timestamp BETWEEN l.max_ts - INTERVAL '1 minute' * $2 AND l.max_ts
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM flow_cache_by_strike_minute c
+                      WHERE c.symbol = $1
+                        AND c.timestamp = oc.timestamp
+                  )
+            )
+            INSERT INTO flow_cache_by_strike_minute (
+                timestamp,
+                symbol,
+                strike,
+                total_volume,
+                total_premium,
+                avg_iv,
+                net_delta
+            )
+            SELECT
+                o.timestamp,
+                $1::varchar AS symbol,
+                o.strike,
+                SUM(GREATEST(o.volume_delta, 0))::bigint AS total_volume,
+                SUM(GREATEST(o.volume_delta, 0) * COALESCE(o.last, 0) * 100)::numeric AS total_premium,
+                AVG(o.implied_volatility)::numeric AS avg_iv,
+                SUM(CASE WHEN o.option_type = 'C' THEN GREATEST(o.volume_delta, 0) ELSE -GREATEST(o.volume_delta, 0) END)::numeric AS net_delta
+            FROM option_chains_with_deltas o
+            JOIN missing m ON m.timestamp = o.timestamp
+            WHERE o.underlying = $1
+              AND o.volume_delta > 0
+            GROUP BY o.timestamp, o.strike
+            ON CONFLICT (timestamp, symbol, strike)
+            DO UPDATE SET
+                total_volume = EXCLUDED.total_volume,
+                total_premium = EXCLUDED.total_premium,
+                avg_iv = EXCLUDED.avg_iv,
+                net_delta = EXCLUDED.net_delta,
+                updated_at = NOW()
+        """
+
+        cache_smart_money_query = """
+            WITH latest AS (
+                SELECT MAX(timestamp) AS max_ts
+                FROM option_chains
+                WHERE underlying = $1
+            ),
+            missing AS (
+                SELECT DISTINCT oc.timestamp
+                FROM option_chains oc
+                CROSS JOIN latest l
+                WHERE oc.underlying = $1
+                  AND oc.timestamp BETWEEN l.max_ts - INTERVAL '1 minute' * $2 AND l.max_ts
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM flow_cache_smart_money_minute c
+                      WHERE c.symbol = $1
+                        AND c.timestamp = oc.timestamp
+                  )
+            )
+            INSERT INTO flow_cache_smart_money_minute (
+                timestamp,
+                symbol,
+                option_symbol,
+                strike,
+                expiration,
+                option_type,
+                total_volume,
+                total_premium,
+                avg_iv,
+                avg_delta,
+                unusual_activity_score
+            )
+            SELECT
+                o.timestamp,
+                $1::varchar AS symbol,
+                o.option_symbol,
+                o.strike,
+                o.expiration,
+                o.option_type,
+                GREATEST(o.volume_delta, 0)::bigint AS total_volume,
+                (GREATEST(o.volume_delta, 0) * COALESCE(o.last, 0) * 100)::numeric AS total_premium,
+                o.implied_volatility::numeric AS avg_iv,
+                o.delta::numeric AS avg_delta,
+                LEAST(10, GREATEST(0,
+                    CASE WHEN GREATEST(o.volume_delta, 0) >= 500 THEN 4 WHEN GREATEST(o.volume_delta, 0) >= 200 THEN 3 WHEN GREATEST(o.volume_delta, 0) >= 100 THEN 2 WHEN GREATEST(o.volume_delta, 0) >= 50 THEN 1 ELSE 0 END +
+                    CASE WHEN GREATEST(o.volume_delta, 0) * COALESCE(o.last, 0) * 100 >= 500000 THEN 4 WHEN GREATEST(o.volume_delta, 0) * COALESCE(o.last, 0) * 100 >= 250000 THEN 3 WHEN GREATEST(o.volume_delta, 0) * COALESCE(o.last, 0) * 100 >= 100000 THEN 2 WHEN GREATEST(o.volume_delta, 0) * COALESCE(o.last, 0) * 100 >= 50000 THEN 1 ELSE 0 END +
+                    CASE WHEN o.implied_volatility > 1.0 THEN 2 WHEN o.implied_volatility > 0.6 THEN 1 ELSE 0 END
+                ))::numeric AS unusual_activity_score
+            FROM option_chains_with_deltas o
+            JOIN missing m ON m.timestamp = o.timestamp
+            WHERE o.underlying = $1
+              AND o.volume_delta > 0
+            ON CONFLICT (timestamp, symbol, option_symbol)
+            DO UPDATE SET
+                strike = EXCLUDED.strike,
+                expiration = EXCLUDED.expiration,
+                option_type = EXCLUDED.option_type,
+                total_volume = EXCLUDED.total_volume,
+                total_premium = EXCLUDED.total_premium,
+                avg_iv = EXCLUDED.avg_iv,
+                avg_delta = EXCLUDED.avg_delta,
+                unusual_activity_score = EXCLUDED.unusual_activity_score,
+                updated_at = NOW()
+        """
+
+        await conn.execute(cache_by_type_query, symbol, window_minutes)
+        await conn.execute(cache_by_strike_query, symbol, window_minutes)
+        await conn.execute(cache_smart_money_query, symbol, window_minutes)
+
+    async def _refresh_max_pain_snapshot(self, conn: asyncpg.Connection, symbol: str, strike_limit: int) -> None:
+        """Refresh daily max pain OI snapshot for the symbol if latest chain timestamp changed."""
+        strike_limit = max(10, min(strike_limit, 1000))
+        query = """
+            WITH latest AS (
+                SELECT MAX(timestamp) AS max_ts
+                FROM option_chains
+                WHERE underlying = $1
+            ),
+            existing AS (
+                SELECT source_timestamp
+                FROM max_pain_oi_snapshot
+                WHERE symbol = $1
+                  AND as_of_date = (
+                      SELECT (max_ts AT TIME ZONE 'America/New_York')::date
+                      FROM latest
+                  )
+            ),
+            should_refresh AS (
+                SELECT l.max_ts
+                FROM latest l
+                LEFT JOIN existing e ON TRUE
+                WHERE l.max_ts IS NOT NULL
+                  AND (e.source_timestamp IS NULL OR e.source_timestamp < l.max_ts)
+            ),
+            underlying AS (
+                SELECT close::numeric AS underlying_price
+                FROM underlying_quotes
+                WHERE symbol = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            contracts AS (
+                SELECT
+                    oc.expiration,
+                    oc.strike,
+                    oc.option_type,
+                    SUM(oc.open_interest)::numeric AS oi
+                FROM option_chains oc
+                JOIN should_refresh r ON oc.timestamp = r.max_ts
+                WHERE oc.underlying = $1
+                  AND oc.open_interest > 0
+                GROUP BY oc.expiration, oc.strike, oc.option_type
+            ),
+            ranked_strikes AS (
+                SELECT
+                    expiration,
+                    strike,
+                    ROW_NUMBER() OVER (PARTITION BY expiration ORDER BY strike) AS rn
+                FROM (SELECT DISTINCT expiration, strike FROM contracts) s
+            ),
+            settlement_candidates AS (
+                SELECT expiration, strike AS settlement_price
+                FROM ranked_strikes
+                WHERE rn <= $2
+            ),
+            payout AS (
+                SELECT
+                    s.expiration,
+                    s.settlement_price,
+                    SUM(CASE WHEN c.option_type = 'C' THEN GREATEST(s.settlement_price - c.strike, 0) * c.oi * 100 ELSE 0 END)::numeric AS call_notional,
+                    SUM(CASE WHEN c.option_type = 'P' THEN GREATEST(c.strike - s.settlement_price, 0) * c.oi * 100 ELSE 0 END)::numeric AS put_notional
+                FROM settlement_candidates s
+                JOIN contracts c ON c.expiration = s.expiration
+                GROUP BY s.expiration, s.settlement_price
+            ),
+            with_total AS (
+                SELECT
+                    expiration,
+                    settlement_price,
+                    call_notional,
+                    put_notional,
+                    (COALESCE(call_notional, 0) + COALESCE(put_notional, 0))::numeric AS total_notional
+                FROM payout
+            ),
+            best_per_exp AS (
+                SELECT DISTINCT ON (expiration)
+                    expiration,
+                    settlement_price AS max_pain
+                FROM with_total
+                ORDER BY expiration, total_notional ASC, settlement_price ASC
+            ),
+            expiration_payload AS (
+                SELECT
+                    b.expiration,
+                    b.max_pain,
+                    (b.max_pain - u.underlying_price)::numeric AS difference_from_underlying,
+                    JSON_AGG(
+                        JSON_BUILD_OBJECT(
+                            'expiration', wt.expiration,
+                            'settlement_price', wt.settlement_price,
+                            'call_notional', wt.call_notional,
+                            'put_notional', wt.put_notional,
+                            'total_notional', wt.total_notional
+                        ) ORDER BY wt.settlement_price
+                    ) AS strikes
+                FROM best_per_exp b
+                JOIN with_total wt ON wt.expiration = b.expiration
+                CROSS JOIN underlying u
+                GROUP BY b.expiration, b.max_pain, u.underlying_price
+            ),
+            snapshot_payload AS (
+                SELECT
+                    (r.max_ts AT TIME ZONE 'America/New_York')::date AS as_of_date,
+                    r.max_ts AS source_timestamp,
+                    $1::varchar AS symbol,
+                    u.underlying_price,
+                    bp.max_pain,
+                    (bp.max_pain - u.underlying_price)::numeric AS difference,
+                    COALESCE(
+                        JSON_AGG(
+                            JSON_BUILD_OBJECT(
+                                'expiration', ep.expiration,
+                                'max_pain', ep.max_pain,
+                                'difference_from_underlying', ep.difference_from_underlying,
+                                'strikes', ep.strikes
+                            ) ORDER BY ep.expiration
+                        ),
+                        '[]'::json
+                    ) AS expirations
+                FROM should_refresh r
+                CROSS JOIN underlying u
+                LEFT JOIN LATERAL (
+                    SELECT max_pain
+                    FROM best_per_exp
+                    ORDER BY expiration
+                    LIMIT 1
+                ) bp ON TRUE
+                LEFT JOIN expiration_payload ep ON TRUE
+                GROUP BY r.max_ts, u.underlying_price, bp.max_pain
+            )
+            INSERT INTO max_pain_oi_snapshot (
+                symbol,
+                as_of_date,
+                source_timestamp,
+                underlying_price,
+                max_pain,
+                difference,
+                expirations
+            )
+            SELECT
+                symbol,
+                as_of_date,
+                source_timestamp,
+                underlying_price,
+                max_pain,
+                difference,
+                expirations::jsonb
+            FROM snapshot_payload
+            WHERE max_pain IS NOT NULL
+            ON CONFLICT (symbol, as_of_date)
+            DO UPDATE SET
+                source_timestamp = EXCLUDED.source_timestamp,
+                underlying_price = EXCLUDED.underlying_price,
+                max_pain = EXCLUDED.max_pain,
+                difference = EXCLUDED.difference,
+                expirations = EXCLUDED.expirations,
+                updated_at = NOW()
+        """
+        await conn.execute(query, symbol, strike_limit)
+
+        sync_expirations_query = """
+            WITH snap AS (
+                SELECT symbol, as_of_date, source_timestamp, expirations
+                FROM max_pain_oi_snapshot
+                WHERE symbol = $1
+                ORDER BY as_of_date DESC
+                LIMIT 1
+            ),
+            parsed AS (
+                SELECT
+                    s.symbol,
+                    s.as_of_date,
+                    s.source_timestamp,
+                    (e->>'expiration')::date AS expiration,
+                    (e->>'max_pain')::numeric AS max_pain,
+                    (e->>'difference_from_underlying')::numeric AS difference_from_underlying,
+                    (e->'strikes')::jsonb AS strikes
+                FROM snap s
+                CROSS JOIN LATERAL jsonb_array_elements(s.expirations) e
+            )
+            INSERT INTO max_pain_oi_snapshot_expiration (
+                symbol,
+                as_of_date,
+                source_timestamp,
+                expiration,
+                max_pain,
+                difference_from_underlying,
+                strikes
+            )
+            SELECT
+                symbol,
+                as_of_date,
+                source_timestamp,
+                expiration,
+                max_pain,
+                difference_from_underlying,
+                strikes
+            FROM parsed
+            ON CONFLICT (symbol, as_of_date, expiration)
+            DO UPDATE SET
+                source_timestamp = EXCLUDED.source_timestamp,
+                max_pain = EXCLUDED.max_pain,
+                difference_from_underlying = EXCLUDED.difference_from_underlying,
+                strikes = EXCLUDED.strikes,
+                updated_at = NOW()
+        """
+        await conn.execute(sync_expirations_query, symbol)
+
     # ========================================================================
     # GEX Queries
     # ========================================================================
@@ -282,61 +664,51 @@ class DatabaseManager:
         symbol: str = 'SPY',
         window_minutes: int = 60
     ) -> List[Dict[str, Any]]:
-        """Get option flow by type (calls vs puts)."""
+        """Get option flow by type (calls vs puts) across the full selected interval."""
         query = """
             WITH latest AS (
                 SELECT MAX(timestamp) AS max_ts
-                FROM option_chains
-                WHERE underlying = $1
+                FROM flow_cache_by_type_minute
+                WHERE symbol = $1
             ),
-            windowed AS (
-                SELECT oc.*
-                FROM option_chains oc
-                CROSS JOIN latest l
-                WHERE oc.underlying = $1
-                    AND oc.timestamp BETWEEN l.max_ts - INTERVAL '1 minute' * $2 AND l.max_ts
-            ),
-            contract_agg AS (
-                SELECT
-                    option_symbol,
-                    option_type,
-                    GREATEST(MAX(volume) - MIN(volume), 0) AS flow,
-                    (ARRAY_AGG(last ORDER BY timestamp DESC))[1] AS last_price,
-                    MIN(timestamp) AS time_window_start,
-                    MAX(timestamp) AS time_window_end
-                FROM windowed
-                GROUP BY option_symbol, option_type
-            ),
-            type_agg AS (
-                SELECT
-                    MIN(time_window_start) AS time_window_start,
-                    MAX(time_window_end) AS time_window_end,
-                    option_type,
-                    SUM(flow)::bigint AS total_volume,
-                    SUM(flow * COALESCE(last_price, 0) * 100)::numeric AS total_premium
-                FROM contract_agg
-                GROUP BY option_type
+            bounds AS (
+                SELECT max_ts - INTERVAL '1 minute' * $2 AS time_window_start, max_ts AS time_window_end
+                FROM latest
             )
             SELECT
-                time_window_start,
-                time_window_end,
-                $1::varchar AS symbol,
-                CASE WHEN option_type = 'C' THEN 'CALL' ELSE 'PUT' END AS option_type,
-                total_volume,
-                total_premium,
-                NULL::numeric AS avg_iv,
-                NULL::numeric AS net_delta,
+                b.time_window_start,
+                b.time_window_end,
+                c.symbol,
+                CASE WHEN c.option_type = 'C' THEN 'CALL' ELSE 'PUT' END AS option_type,
+                c.total_volume,
+                c.total_premium,
+                c.avg_iv,
+                c.net_delta,
                 CASE
-                    WHEN option_type = 'C' AND total_volume > COALESCE((SELECT total_volume FROM type_agg WHERE option_type = 'P'), 0) THEN 'bullish'
-                    WHEN option_type = 'P' AND total_volume > COALESCE((SELECT total_volume FROM type_agg WHERE option_type = 'C'), 0) THEN 'bearish'
+                    WHEN c.option_type = 'C' AND c.total_premium > COALESCE((
+                        SELECT c2.total_premium FROM flow_cache_by_type_minute c2
+                        WHERE c2.symbol = c.symbol
+                          AND c2.timestamp = c.timestamp
+                          AND c2.option_type = 'P'
+                    ), 0) THEN 'bullish'
+                    WHEN c.option_type = 'P' AND c.total_premium > COALESCE((
+                        SELECT c2.total_premium FROM flow_cache_by_type_minute c2
+                        WHERE c2.symbol = c.symbol
+                          AND c2.timestamp = c.timestamp
+                          AND c2.option_type = 'C'
+                    ), 0) THEN 'bearish'
                     ELSE 'neutral'
                 END AS sentiment
-            FROM type_agg
-            ORDER BY option_type
+            FROM flow_cache_by_type_minute c
+            CROSS JOIN bounds b
+            WHERE c.symbol = $1
+              AND c.timestamp BETWEEN b.time_window_start AND b.time_window_end
+            ORDER BY c.timestamp DESC, option_type
         """
 
         try:
             async with self.pool.acquire() as conn:
+                await self._refresh_flow_cache(conn, symbol, window_minutes)
                 rows = await conn.fetch(query, symbol, window_minutes)
                 return [dict(row) for row in rows]
         except Exception as e:
@@ -353,57 +725,44 @@ class DatabaseManager:
         query = """
             WITH latest AS (
                 SELECT MAX(timestamp) AS max_ts
-                FROM option_chains
-                WHERE underlying = $1
+                FROM flow_cache_by_strike_minute
+                WHERE symbol = $1
             ),
-            windowed AS (
-                SELECT oc.*
-                FROM option_chains oc
-                CROSS JOIN latest l
-                WHERE oc.underlying = $1
-                    AND oc.timestamp BETWEEN l.max_ts - INTERVAL '1 minute' * $2 AND l.max_ts
-            ),
-            contract_agg AS (
-                SELECT
-                    option_symbol,
-                    strike,
-                    option_type,
-                    GREATEST(MAX(volume) - MIN(volume), 0) AS flow,
-                    (ARRAY_AGG(last ORDER BY timestamp DESC))[1] AS last_price,
-                    AVG(implied_volatility) AS avg_iv,
-                    MIN(timestamp) AS time_window_start,
-                    MAX(timestamp) AS time_window_end
-                FROM windowed
-                GROUP BY option_symbol, strike, option_type
+            bounds AS (
+                SELECT max_ts - INTERVAL '1 minute' * $2 AS time_window_start, max_ts AS time_window_end
+                FROM latest
             ),
             strike_agg AS (
                 SELECT
-                    MIN(time_window_start) AS time_window_start,
-                    MAX(time_window_end) AS time_window_end,
-                    strike,
-                    SUM(flow)::bigint AS total_volume,
-                    SUM(flow * COALESCE(last_price, 0) * 100)::numeric AS total_premium,
-                    AVG(avg_iv)::numeric AS avg_iv,
-                    SUM(CASE WHEN option_type = 'C' THEN flow ELSE -flow END)::numeric AS net_delta
-                FROM contract_agg
-                GROUP BY strike
+                    c.strike,
+                    SUM(c.total_volume)::bigint AS total_volume,
+                    SUM(c.total_premium)::numeric AS total_premium,
+                    AVG(c.avg_iv)::numeric AS avg_iv,
+                    SUM(c.net_delta)::numeric AS net_delta
+                FROM flow_cache_by_strike_minute c
+                CROSS JOIN bounds b
+                WHERE c.symbol = $1
+                  AND c.timestamp BETWEEN b.time_window_start AND b.time_window_end
+                GROUP BY c.strike
             )
             SELECT
-                time_window_start,
-                time_window_end,
+                b.time_window_start,
+                b.time_window_end,
                 $1::varchar AS symbol,
-                strike,
-                total_volume,
-                total_premium,
-                avg_iv,
-                net_delta
-            FROM strike_agg
-            ORDER BY total_premium DESC NULLS LAST
+                s.strike,
+                s.total_volume,
+                s.total_premium,
+                s.avg_iv,
+                s.net_delta
+            FROM strike_agg s
+            CROSS JOIN bounds b
+            ORDER BY s.total_premium DESC NULLS LAST
             LIMIT $3
         """
 
         try:
             async with self.pool.acquire() as conn:
+                await self._refresh_flow_cache(conn, symbol, window_minutes)
                 rows = await conn.fetch(query, symbol, window_minutes, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
@@ -420,56 +779,34 @@ class DatabaseManager:
         query = """
             WITH latest AS (
                 SELECT MAX(timestamp) AS max_ts
-                FROM option_chains
-                WHERE underlying = $1
+                FROM flow_cache_smart_money_minute
+                WHERE symbol = $1
             ),
-            windowed AS (
-                SELECT oc.*
-                FROM option_chains oc
-                CROSS JOIN latest l
-                WHERE oc.underlying = $1
-                    AND oc.timestamp BETWEEN l.max_ts - INTERVAL '1 minute' * $2 AND l.max_ts
-            ),
-            contract_agg AS (
-                SELECT
-                    option_symbol,
-                    strike,
-                    expiration,
-                    option_type,
-                    GREATEST(MAX(volume) - MIN(volume), 0) AS flow,
-                    (ARRAY_AGG(last ORDER BY timestamp DESC))[1] AS last_price,
-                    AVG(implied_volatility)::numeric AS iv,
-                    AVG(delta)::numeric AS avg_delta,
-                    MIN(timestamp) AS time_window_start,
-                    MAX(timestamp) AS time_window_end
-                FROM windowed
-                GROUP BY option_symbol, strike, expiration, option_type
+            bounds AS (
+                SELECT max_ts - INTERVAL '1 minute' * $2 AS time_window_start, max_ts AS time_window_end
+                FROM latest
             )
             SELECT
-                time_window_start,
-                time_window_end,
-                $1::varchar AS symbol,
-                option_type,
-                strike,
-                flow::bigint AS total_volume,
-                (flow * COALESCE(last_price, 0) * 100)::numeric AS total_premium,
-                iv AS avg_iv,
-                LEAST(10, GREATEST(0,
-                    CASE WHEN flow >= 500 THEN 4 WHEN flow >= 200 THEN 3 WHEN flow >= 100 THEN 2 WHEN flow >= 50 THEN 1 ELSE 0 END +
-                    CASE WHEN flow * COALESCE(last_price, 0) * 100 >= 500000 THEN 4 WHEN flow * COALESCE(last_price, 0) * 100 >= 250000 THEN 3 WHEN flow * COALESCE(last_price, 0) * 100 >= 100000 THEN 2 WHEN flow * COALESCE(last_price, 0) * 100 >= 50000 THEN 1 ELSE 0 END +
-                    CASE WHEN iv > 1.0 THEN 2 WHEN iv > 0.6 THEN 1 ELSE 0 END
-                ))::numeric AS unusual_activity_score,
-                CASE WHEN flow >= 500 THEN '🔥 Massive Block' WHEN flow >= 200 THEN '📦 Large Block' WHEN flow >= 100 THEN '📊 Medium Block' ELSE '💼 Standard' END AS size_class,
-                CASE WHEN flow * COALESCE(last_price, 0) * 100 >= 500000 THEN '💰 $500K+' WHEN flow * COALESCE(last_price, 0) * 100 >= 250000 THEN '💵 $250K+' WHEN flow * COALESCE(last_price, 0) * 100 >= 100000 THEN '💸 $100K+' WHEN flow * COALESCE(last_price, 0) * 100 >= 50000 THEN '💳 $50K+' ELSE '💴 <$50K' END AS notional_class,
-                CASE WHEN ABS(COALESCE(avg_delta, 0)) < 0.15 THEN '💰 Deep OTM' WHEN ABS(COALESCE(avg_delta, 0)) < 0.35 THEN '🎯 OTM' WHEN ABS(COALESCE(avg_delta, 0)) < 0.65 THEN '⚖️ ATM' ELSE '💎 ITM' END AS moneyness
-            FROM contract_agg
-            WHERE flow > 0
-            ORDER BY unusual_activity_score DESC, total_premium DESC
+                b.time_window_start,
+                b.time_window_end,
+                c.symbol,
+                c.option_type,
+                c.strike,
+                c.total_volume,
+                c.total_premium,
+                c.avg_iv,
+                c.unusual_activity_score
+            FROM flow_cache_smart_money_minute c
+            CROSS JOIN bounds b
+            WHERE c.symbol = $1
+              AND c.timestamp BETWEEN b.time_window_start AND b.time_window_end
+            ORDER BY c.unusual_activity_score DESC, c.total_premium DESC
             LIMIT $3
         """
 
         try:
             async with self.pool.acquire() as conn:
+                await self._refresh_flow_cache(conn, symbol, window_minutes)
                 rows = await conn.fetch(query, symbol, window_minutes, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
@@ -864,68 +1201,49 @@ class DatabaseManager:
             return [dict(row) for row in rows]
 
     async def get_max_pain_current(self, symbol: str = 'SPY', strike_limit: int = 200) -> Optional[Dict[str, Any]]:
-        """Get current max pain and payout/notional grid by settlement strike."""
+        """Get current max pain from daily OI snapshot cache."""
         query = """
-            WITH latest AS (
-                SELECT MAX(timestamp) AS max_ts
-                FROM option_chains
-                WHERE underlying = $1
-            ),
-            contracts AS (
-                SELECT strike, option_type, SUM(open_interest)::numeric AS oi
-                FROM option_chains oc
-                CROSS JOIN latest l
-                WHERE oc.underlying = $1
-                    AND oc.timestamp = l.max_ts
-                GROUP BY strike, option_type
-            ),
-            strikes AS (
-                SELECT DISTINCT strike
-                FROM contracts
-                ORDER BY strike
-                LIMIT $2
-            ),
-            payout AS (
+            WITH snap AS (
                 SELECT
-                    s.strike AS settlement_price,
-                    SUM(CASE WHEN c.option_type = 'C' THEN GREATEST(s.strike - c.strike, 0) * c.oi * 100 ELSE 0 END)::numeric AS call_notional,
-                    SUM(CASE WHEN c.option_type = 'P' THEN GREATEST(c.strike - s.strike, 0) * c.oi * 100 ELSE 0 END)::numeric AS put_notional
-                FROM strikes s
-                CROSS JOIN contracts c
-                GROUP BY s.strike
-            ),
-            with_total AS (
-                SELECT settlement_price, call_notional, put_notional,
-                    (COALESCE(call_notional,0)+COALESCE(put_notional,0))::numeric AS total_notional
-                FROM payout
-            ),
-            best AS (
-                SELECT settlement_price AS max_pain
-                FROM with_total
-                ORDER BY total_notional ASC, settlement_price ASC
+                    source_timestamp AS timestamp,
+                    symbol,
+                    as_of_date,
+                    underlying_price,
+                    max_pain,
+                    difference
+                FROM max_pain_oi_snapshot
+                WHERE symbol = $1
+                ORDER BY as_of_date DESC
                 LIMIT 1
             )
             SELECT
-                (SELECT max_ts FROM latest) AS timestamp,
-                $1::varchar AS symbol,
-                (SELECT max_pain FROM best)::numeric AS max_pain,
+                s.timestamp,
+                s.symbol,
+                s.underlying_price,
+                s.max_pain,
+                s.difference,
                 COALESCE(
                     JSON_AGG(
                         JSON_BUILD_OBJECT(
-                            'settlement_price', settlement_price,
-                            'call_notional', call_notional,
-                            'put_notional', put_notional,
-                            'total_notional', total_notional
-                        ) ORDER BY settlement_price
-                    ),
+                            'expiration', e.expiration,
+                            'max_pain', e.max_pain,
+                            'difference_from_underlying', e.difference_from_underlying,
+                            'strikes', e.strikes
+                        ) ORDER BY e.expiration
+                    ) FILTER (WHERE e.expiration IS NOT NULL),
                     '[]'::json
-                ) AS strikes
-            FROM with_total
+                ) AS expirations
+            FROM snap s
+            LEFT JOIN max_pain_oi_snapshot_expiration e
+              ON e.symbol = s.symbol
+             AND e.as_of_date = s.as_of_date
+            GROUP BY s.timestamp, s.symbol, s.underlying_price, s.max_pain, s.difference
         """
 
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(query, symbol, strike_limit)
-            return dict(row) if row and row['timestamp'] else None
+            await self._refresh_max_pain_snapshot(conn, symbol, strike_limit)
+            row = await conn.fetchrow(query, symbol)
+            return dict(row) if row else None
 
     # ========================================================================
     # Chart Data Queries
