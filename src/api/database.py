@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timedelta
 import logging
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -121,178 +122,261 @@ class DatabaseManager:
             logger.error(f"Health check failed: {e}")
             return False
 
-    async def _refresh_flow_cache(self, conn: asyncpg.Connection, symbol: str, window_minutes: int) -> None:
-        """Incrementally cache per-minute flow aggregates for missing timestamps in the requested window."""
-        window_minutes = max(1, min(window_minutes, 1440))
+    async def _refresh_flow_cache(self, conn: asyncpg.Connection, symbol: str) -> None:
+        """Refresh flow caches for only the latest minute snapshot for a symbol."""
+        latest_ts = await conn.fetchval(
+            """
+            SELECT MAX(timestamp)
+            FROM option_chains
+            WHERE underlying = $1
+            """,
+            symbol,
+        )
+        if latest_ts is None:
+            return
 
-        cache_by_type_query = """
-            WITH latest AS (
-                SELECT MAX(timestamp) AS max_ts
-                FROM option_chains
-                WHERE underlying = $1
-            ),
-            missing AS (
-                SELECT DISTINCT oc.timestamp
-                FROM option_chains oc
-                CROSS JOIN latest l
-                WHERE oc.underlying = $1
-                  AND oc.timestamp BETWEEN l.max_ts - INTERVAL '1 minute' * $2 AND l.max_ts
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM flow_cache_by_type_minute c
-                      WHERE c.symbol = $1
-                        AND c.timestamp = oc.timestamp
-                  )
-            )
-            INSERT INTO flow_cache_by_type_minute (
-                timestamp,
+        type_exists = await conn.fetchval(
+            """
+            SELECT 1 FROM flow_cache_by_type_minute
+            WHERE symbol = $1 AND timestamp = $2
+            LIMIT 1
+            """,
+            symbol,
+            latest_ts,
+        )
+        if not type_exists:
+            await conn.execute(
+                """
+                WITH latest_rows AS (
+                    SELECT oc.*
+                    FROM option_chains oc
+                    WHERE oc.underlying = $1
+                      AND oc.timestamp = $2
+                ),
+                with_prev AS (
+                    SELECT
+                        l.timestamp,
+                        l.option_symbol,
+                        l.option_type,
+                        l.strike,
+                        l.expiration,
+                        l.last,
+                        l.implied_volatility,
+                        l.delta,
+                        CASE
+                            WHEN p.prev_volume IS NULL THEN COALESCE(l.volume, 0)
+                            WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
+                                = (l.timestamp AT TIME ZONE 'America/New_York')::date
+                                THEN GREATEST(COALESCE(l.volume, 0) - COALESCE(p.prev_volume, 0), 0)
+                            ELSE COALESCE(l.volume, 0)
+                        END::bigint AS volume_delta
+                    FROM latest_rows l
+                    LEFT JOIN LATERAL (
+                        SELECT oc2.timestamp AS prev_ts, oc2.volume AS prev_volume
+                        FROM option_chains oc2
+                        WHERE oc2.option_symbol = l.option_symbol
+                          AND oc2.timestamp < l.timestamp
+                        ORDER BY oc2.timestamp DESC
+                        LIMIT 1
+                    ) p ON TRUE
+                )
+                INSERT INTO flow_cache_by_type_minute (
+                    timestamp,
+                    symbol,
+                    option_type,
+                    total_volume,
+                    total_premium,
+                    avg_iv,
+                    net_delta
+                )
+                SELECT
+                    timestamp,
+                    $1::varchar,
+                    option_type,
+                    SUM(volume_delta)::bigint,
+                    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
+                    AVG(implied_volatility)::numeric,
+                    SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric
+                FROM with_prev
+                WHERE volume_delta > 0
+                GROUP BY timestamp, option_type
+                ON CONFLICT (timestamp, symbol, option_type)
+                DO UPDATE SET
+                    total_volume = EXCLUDED.total_volume,
+                    total_premium = EXCLUDED.total_premium,
+                    avg_iv = EXCLUDED.avg_iv,
+                    net_delta = EXCLUDED.net_delta,
+                    updated_at = NOW()
+                """,
                 symbol,
-                option_type,
-                total_volume,
-                total_premium,
-                avg_iv,
-                net_delta
+                latest_ts,
             )
-            SELECT
-                o.timestamp,
-                $1::varchar AS symbol,
-                o.option_type,
-                SUM(GREATEST(o.volume_delta, 0))::bigint AS total_volume,
-                SUM(GREATEST(o.volume_delta, 0) * COALESCE(o.last, 0) * 100)::numeric AS total_premium,
-                AVG(o.implied_volatility)::numeric AS avg_iv,
-                SUM(CASE WHEN o.option_type = 'C' THEN GREATEST(o.volume_delta, 0) ELSE -GREATEST(o.volume_delta, 0) END)::numeric AS net_delta
-            FROM option_chains_with_deltas o
-            JOIN missing m ON m.timestamp = o.timestamp
-            WHERE o.underlying = $1
-              AND o.volume_delta > 0
-            GROUP BY o.timestamp, o.option_type
-            ON CONFLICT (timestamp, symbol, option_type)
-            DO UPDATE SET
-                total_volume = EXCLUDED.total_volume,
-                total_premium = EXCLUDED.total_premium,
-                avg_iv = EXCLUDED.avg_iv,
-                net_delta = EXCLUDED.net_delta,
-                updated_at = NOW()
-        """
 
-        cache_by_strike_query = """
-            WITH latest AS (
-                SELECT MAX(timestamp) AS max_ts
-                FROM option_chains
-                WHERE underlying = $1
-            ),
-            missing AS (
-                SELECT DISTINCT oc.timestamp
-                FROM option_chains oc
-                CROSS JOIN latest l
-                WHERE oc.underlying = $1
-                  AND oc.timestamp BETWEEN l.max_ts - INTERVAL '1 minute' * $2 AND l.max_ts
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM flow_cache_by_strike_minute c
-                      WHERE c.symbol = $1
-                        AND c.timestamp = oc.timestamp
-                  )
-            )
-            INSERT INTO flow_cache_by_strike_minute (
-                timestamp,
+        strike_exists = await conn.fetchval(
+            """
+            SELECT 1 FROM flow_cache_by_strike_minute
+            WHERE symbol = $1 AND timestamp = $2
+            LIMIT 1
+            """,
+            symbol,
+            latest_ts,
+        )
+        if not strike_exists:
+            await conn.execute(
+                """
+                WITH latest_rows AS (
+                    SELECT oc.*
+                    FROM option_chains oc
+                    WHERE oc.underlying = $1
+                      AND oc.timestamp = $2
+                ),
+                with_prev AS (
+                    SELECT
+                        l.timestamp,
+                        l.option_type,
+                        l.strike,
+                        l.last,
+                        l.implied_volatility,
+                        CASE
+                            WHEN p.prev_volume IS NULL THEN COALESCE(l.volume, 0)
+                            WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
+                                = (l.timestamp AT TIME ZONE 'America/New_York')::date
+                                THEN GREATEST(COALESCE(l.volume, 0) - COALESCE(p.prev_volume, 0), 0)
+                            ELSE COALESCE(l.volume, 0)
+                        END::bigint AS volume_delta
+                    FROM latest_rows l
+                    LEFT JOIN LATERAL (
+                        SELECT oc2.timestamp AS prev_ts, oc2.volume AS prev_volume
+                        FROM option_chains oc2
+                        WHERE oc2.option_symbol = l.option_symbol
+                          AND oc2.timestamp < l.timestamp
+                        ORDER BY oc2.timestamp DESC
+                        LIMIT 1
+                    ) p ON TRUE
+                )
+                INSERT INTO flow_cache_by_strike_minute (
+                    timestamp,
+                    symbol,
+                    strike,
+                    total_volume,
+                    total_premium,
+                    avg_iv,
+                    net_delta
+                )
+                SELECT
+                    timestamp,
+                    $1::varchar,
+                    strike,
+                    SUM(volume_delta)::bigint,
+                    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
+                    AVG(implied_volatility)::numeric,
+                    SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric
+                FROM with_prev
+                WHERE volume_delta > 0
+                GROUP BY timestamp, strike
+                ON CONFLICT (timestamp, symbol, strike)
+                DO UPDATE SET
+                    total_volume = EXCLUDED.total_volume,
+                    total_premium = EXCLUDED.total_premium,
+                    avg_iv = EXCLUDED.avg_iv,
+                    net_delta = EXCLUDED.net_delta,
+                    updated_at = NOW()
+                """,
                 symbol,
-                strike,
-                total_volume,
-                total_premium,
-                avg_iv,
-                net_delta
+                latest_ts,
             )
-            SELECT
-                o.timestamp,
-                $1::varchar AS symbol,
-                o.strike,
-                SUM(GREATEST(o.volume_delta, 0))::bigint AS total_volume,
-                SUM(GREATEST(o.volume_delta, 0) * COALESCE(o.last, 0) * 100)::numeric AS total_premium,
-                AVG(o.implied_volatility)::numeric AS avg_iv,
-                SUM(CASE WHEN o.option_type = 'C' THEN GREATEST(o.volume_delta, 0) ELSE -GREATEST(o.volume_delta, 0) END)::numeric AS net_delta
-            FROM option_chains_with_deltas o
-            JOIN missing m ON m.timestamp = o.timestamp
-            WHERE o.underlying = $1
-              AND o.volume_delta > 0
-            GROUP BY o.timestamp, o.strike
-            ON CONFLICT (timestamp, symbol, strike)
-            DO UPDATE SET
-                total_volume = EXCLUDED.total_volume,
-                total_premium = EXCLUDED.total_premium,
-                avg_iv = EXCLUDED.avg_iv,
-                net_delta = EXCLUDED.net_delta,
-                updated_at = NOW()
-        """
 
-        cache_smart_money_query = """
-            WITH latest AS (
-                SELECT MAX(timestamp) AS max_ts
-                FROM option_chains
-                WHERE underlying = $1
-            ),
-            missing AS (
-                SELECT DISTINCT oc.timestamp
-                FROM option_chains oc
-                CROSS JOIN latest l
-                WHERE oc.underlying = $1
-                  AND oc.timestamp BETWEEN l.max_ts - INTERVAL '1 minute' * $2 AND l.max_ts
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM flow_cache_smart_money_minute c
-                      WHERE c.symbol = $1
-                        AND c.timestamp = oc.timestamp
-                  )
-            )
-            INSERT INTO flow_cache_smart_money_minute (
-                timestamp,
+        smart_exists = await conn.fetchval(
+            """
+            SELECT 1 FROM flow_cache_smart_money_minute
+            WHERE symbol = $1 AND timestamp = $2
+            LIMIT 1
+            """,
+            symbol,
+            latest_ts,
+        )
+        if not smart_exists:
+            await conn.execute(
+                """
+                WITH latest_rows AS (
+                    SELECT oc.*
+                    FROM option_chains oc
+                    WHERE oc.underlying = $1
+                      AND oc.timestamp = $2
+                ),
+                with_prev AS (
+                    SELECT
+                        l.timestamp,
+                        l.option_symbol,
+                        l.option_type,
+                        l.strike,
+                        l.expiration,
+                        l.last,
+                        l.implied_volatility,
+                        l.delta,
+                        CASE
+                            WHEN p.prev_volume IS NULL THEN COALESCE(l.volume, 0)
+                            WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
+                                = (l.timestamp AT TIME ZONE 'America/New_York')::date
+                                THEN GREATEST(COALESCE(l.volume, 0) - COALESCE(p.prev_volume, 0), 0)
+                            ELSE COALESCE(l.volume, 0)
+                        END::bigint AS volume_delta
+                    FROM latest_rows l
+                    LEFT JOIN LATERAL (
+                        SELECT oc2.timestamp AS prev_ts, oc2.volume AS prev_volume
+                        FROM option_chains oc2
+                        WHERE oc2.option_symbol = l.option_symbol
+                          AND oc2.timestamp < l.timestamp
+                        ORDER BY oc2.timestamp DESC
+                        LIMIT 1
+                    ) p ON TRUE
+                )
+                INSERT INTO flow_cache_smart_money_minute (
+                    timestamp,
+                    symbol,
+                    option_symbol,
+                    strike,
+                    expiration,
+                    option_type,
+                    total_volume,
+                    total_premium,
+                    avg_iv,
+                    avg_delta,
+                    unusual_activity_score
+                )
+                SELECT
+                    timestamp,
+                    $1::varchar,
+                    option_symbol,
+                    strike,
+                    expiration,
+                    option_type,
+                    volume_delta::bigint,
+                    (volume_delta * COALESCE(last, 0) * 100)::numeric,
+                    implied_volatility::numeric,
+                    delta::numeric,
+                    LEAST(10, GREATEST(0,
+                        CASE WHEN volume_delta >= 500 THEN 4 WHEN volume_delta >= 200 THEN 3 WHEN volume_delta >= 100 THEN 2 WHEN volume_delta >= 50 THEN 1 ELSE 0 END +
+                        CASE WHEN volume_delta * COALESCE(last, 0) * 100 >= 500000 THEN 4 WHEN volume_delta * COALESCE(last, 0) * 100 >= 250000 THEN 3 WHEN volume_delta * COALESCE(last, 0) * 100 >= 100000 THEN 2 WHEN volume_delta * COALESCE(last, 0) * 100 >= 50000 THEN 1 ELSE 0 END +
+                        CASE WHEN implied_volatility > 1.0 THEN 2 WHEN implied_volatility > 0.6 THEN 1 ELSE 0 END
+                    ))::numeric
+                FROM with_prev
+                WHERE volume_delta > 0
+                ON CONFLICT (timestamp, symbol, option_symbol)
+                DO UPDATE SET
+                    strike = EXCLUDED.strike,
+                    expiration = EXCLUDED.expiration,
+                    option_type = EXCLUDED.option_type,
+                    total_volume = EXCLUDED.total_volume,
+                    total_premium = EXCLUDED.total_premium,
+                    avg_iv = EXCLUDED.avg_iv,
+                    avg_delta = EXCLUDED.avg_delta,
+                    unusual_activity_score = EXCLUDED.unusual_activity_score,
+                    updated_at = NOW()
+                """,
                 symbol,
-                option_symbol,
-                strike,
-                expiration,
-                option_type,
-                total_volume,
-                total_premium,
-                avg_iv,
-                avg_delta,
-                unusual_activity_score
+                latest_ts,
             )
-            SELECT
-                o.timestamp,
-                $1::varchar AS symbol,
-                o.option_symbol,
-                o.strike,
-                o.expiration,
-                o.option_type,
-                GREATEST(o.volume_delta, 0)::bigint AS total_volume,
-                (GREATEST(o.volume_delta, 0) * COALESCE(o.last, 0) * 100)::numeric AS total_premium,
-                o.implied_volatility::numeric AS avg_iv,
-                o.delta::numeric AS avg_delta,
-                LEAST(10, GREATEST(0,
-                    CASE WHEN GREATEST(o.volume_delta, 0) >= 500 THEN 4 WHEN GREATEST(o.volume_delta, 0) >= 200 THEN 3 WHEN GREATEST(o.volume_delta, 0) >= 100 THEN 2 WHEN GREATEST(o.volume_delta, 0) >= 50 THEN 1 ELSE 0 END +
-                    CASE WHEN GREATEST(o.volume_delta, 0) * COALESCE(o.last, 0) * 100 >= 500000 THEN 4 WHEN GREATEST(o.volume_delta, 0) * COALESCE(o.last, 0) * 100 >= 250000 THEN 3 WHEN GREATEST(o.volume_delta, 0) * COALESCE(o.last, 0) * 100 >= 100000 THEN 2 WHEN GREATEST(o.volume_delta, 0) * COALESCE(o.last, 0) * 100 >= 50000 THEN 1 ELSE 0 END +
-                    CASE WHEN o.implied_volatility > 1.0 THEN 2 WHEN o.implied_volatility > 0.6 THEN 1 ELSE 0 END
-                ))::numeric AS unusual_activity_score
-            FROM option_chains_with_deltas o
-            JOIN missing m ON m.timestamp = o.timestamp
-            WHERE o.underlying = $1
-              AND o.volume_delta > 0
-            ON CONFLICT (timestamp, symbol, option_symbol)
-            DO UPDATE SET
-                strike = EXCLUDED.strike,
-                expiration = EXCLUDED.expiration,
-                option_type = EXCLUDED.option_type,
-                total_volume = EXCLUDED.total_volume,
-                total_premium = EXCLUDED.total_premium,
-                avg_iv = EXCLUDED.avg_iv,
-                avg_delta = EXCLUDED.avg_delta,
-                unusual_activity_score = EXCLUDED.unusual_activity_score,
-                updated_at = NOW()
-        """
-
-        await conn.execute(cache_by_type_query, symbol, window_minutes)
-        await conn.execute(cache_by_strike_query, symbol, window_minutes)
-        await conn.execute(cache_smart_money_query, symbol, window_minutes)
 
     async def _refresh_max_pain_snapshot(self, conn: asyncpg.Connection, symbol: str, strike_limit: int) -> None:
         """Refresh daily max pain OI snapshot for the symbol if latest chain timestamp changed."""
@@ -708,7 +792,7 @@ class DatabaseManager:
 
         try:
             async with self.pool.acquire() as conn:
-                await self._refresh_flow_cache(conn, symbol, window_minutes)
+                await self._refresh_flow_cache(conn, symbol)
                 rows = await conn.fetch(query, symbol, window_minutes)
                 return [dict(row) for row in rows]
         except Exception as e:
@@ -762,7 +846,7 @@ class DatabaseManager:
 
         try:
             async with self.pool.acquire() as conn:
-                await self._refresh_flow_cache(conn, symbol, window_minutes)
+                await self._refresh_flow_cache(conn, symbol)
                 rows = await conn.fetch(query, symbol, window_minutes, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
@@ -806,7 +890,7 @@ class DatabaseManager:
 
         try:
             async with self.pool.acquire() as conn:
-                await self._refresh_flow_cache(conn, symbol, window_minutes)
+                await self._refresh_flow_cache(conn, symbol)
                 rows = await conn.fetch(query, symbol, window_minutes, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
@@ -1202,48 +1286,58 @@ class DatabaseManager:
 
     async def get_max_pain_current(self, symbol: str = 'SPY', strike_limit: int = 200) -> Optional[Dict[str, Any]]:
         """Get current max pain from daily OI snapshot cache."""
-        query = """
-            WITH snap AS (
-                SELECT
-                    source_timestamp AS timestamp,
-                    symbol,
-                    as_of_date,
-                    underlying_price,
-                    max_pain,
-                    difference
-                FROM max_pain_oi_snapshot
-                WHERE symbol = $1
-                ORDER BY as_of_date DESC
-                LIMIT 1
-            )
+        snapshot_query = """
             SELECT
-                s.timestamp,
-                s.symbol,
-                s.underlying_price,
-                s.max_pain,
-                s.difference,
-                COALESCE(
-                    JSON_AGG(
-                        JSON_BUILD_OBJECT(
-                            'expiration', e.expiration,
-                            'max_pain', e.max_pain,
-                            'difference_from_underlying', e.difference_from_underlying,
-                            'strikes', e.strikes
-                        ) ORDER BY e.expiration
-                    ) FILTER (WHERE e.expiration IS NOT NULL),
-                    '[]'::json
-                ) AS expirations
-            FROM snap s
-            LEFT JOIN max_pain_oi_snapshot_expiration e
-              ON e.symbol = s.symbol
-             AND e.as_of_date = s.as_of_date
-            GROUP BY s.timestamp, s.symbol, s.underlying_price, s.max_pain, s.difference
+                symbol,
+                as_of_date,
+                source_timestamp AS timestamp,
+                underlying_price,
+                max_pain,
+                difference
+            FROM max_pain_oi_snapshot
+            WHERE symbol = $1
+            ORDER BY as_of_date DESC
+            LIMIT 1
+        """
+        expiration_query = """
+            SELECT
+                expiration,
+                max_pain,
+                difference_from_underlying,
+                strikes
+            FROM max_pain_oi_snapshot_expiration
+            WHERE symbol = $1
+              AND as_of_date = $2
+            ORDER BY expiration
         """
 
         async with self.pool.acquire() as conn:
             await self._refresh_max_pain_snapshot(conn, symbol, strike_limit)
-            row = await conn.fetchrow(query, symbol)
-            return dict(row) if row else None
+            snapshot = await conn.fetchrow(snapshot_query, symbol)
+            if not snapshot:
+                return None
+
+            expiration_rows = await conn.fetch(expiration_query, symbol, snapshot['as_of_date'])
+            expirations: List[Dict[str, Any]] = []
+            for row in expiration_rows:
+                strikes = row['strikes']
+                if isinstance(strikes, str):
+                    strikes = json.loads(strikes)
+                expirations.append({
+                    'expiration': row['expiration'],
+                    'max_pain': row['max_pain'],
+                    'difference_from_underlying': row['difference_from_underlying'],
+                    'strikes': strikes or [],
+                })
+
+            return {
+                'timestamp': snapshot['timestamp'],
+                'symbol': snapshot['symbol'],
+                'underlying_price': snapshot['underlying_price'],
+                'max_pain': snapshot['max_pain'],
+                'difference': snapshot['difference'],
+                'expirations': expirations,
+            }
 
     # ========================================================================
     # Chart Data Queries
