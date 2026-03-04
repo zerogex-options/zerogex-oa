@@ -149,7 +149,7 @@ async def get_historical_gex(
     symbol: str = Query(default="SPY"),
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    limit: int = Query(default=90, le=1000),
+    window_units: int = Query(default=90, ge=1, le=90),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min")
 ):
     """Get historical GEX data"""
@@ -158,7 +158,7 @@ async def get_historical_gex(
         start_dt = datetime.fromisoformat(start_date) if start_date else None
         end_dt = datetime.fromisoformat(end_date) if end_date else None
 
-        data = await db_manager.get_historical_gex(symbol, start_dt, end_dt, limit, timeframe)
+        data = await db_manager.get_historical_gex(symbol, start_dt, end_dt, window_units, timeframe)
         if not data:
             raise HTTPException(status_code=404, detail="No historical data available")
 
@@ -174,13 +174,12 @@ async def get_historical_gex(
 @app.get("/api/gex/heatmap")
 async def get_gex_heatmap(
     symbol: str = Query(default="SPY"),
-    window_minutes: int = Query(default=60, le=7200),
-    interval_minutes: int = Query(default=5, le=1440),
-    timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="5min")
+    timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="5min"),
+    window_units: int = Query(default=60, ge=1, le=90)
 ):
     """Get GEX heatmap data (strike x time)"""
     try:
-        data = await db_manager.get_gex_heatmap(symbol, window_minutes, interval_minutes, timeframe)
+        data = await db_manager.get_gex_heatmap(symbol, timeframe, window_units)
         if not data:
             raise HTTPException(status_code=404, detail="No GEX heatmap data available")
         return data
@@ -198,11 +197,12 @@ async def get_gex_heatmap(
 @app.get("/api/flow/by-type", response_model=List[OptionFlow])
 async def get_flow_by_type(
     symbol: str = Query(default="SPY"),
-    window_minutes: int = Query(default=60, le=1440)
+    timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
+    window_units: int = Query(default=60, ge=1, le=90)
 ):
     """Get option flow by type (calls vs puts)"""
     try:
-        data = await db_manager.get_flow_by_type(symbol, window_minutes)
+        data = await db_manager.get_flow_by_type(symbol, timeframe, window_units)
         if not data:
             raise HTTPException(status_code=404, detail="No flow data available")
 
@@ -216,12 +216,13 @@ async def get_flow_by_type(
 @app.get("/api/flow/by-strike", response_model=List[OptionFlow])
 async def get_flow_by_strike(
     symbol: str = Query(default="SPY"),
-    window_minutes: int = Query(default=60, le=1440),
-    limit: int = Query(default=20, le=100)
+    timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
+    window_units: int = Query(default=60, ge=1, le=90),
+    limit: int = Query(default=1000, ge=1, le=50000)
 ):
     """Get option flow by strike level"""
     try:
-        data = await db_manager.get_flow_by_strike(symbol, window_minutes, limit)
+        data = await db_manager.get_flow_by_strike(symbol, timeframe, window_units, limit)
         if not data:
             raise HTTPException(status_code=404, detail="No flow data available")
 
@@ -235,12 +236,13 @@ async def get_flow_by_strike(
 @app.get("/api/flow/smart-money", response_model=List[OptionFlow])
 async def get_smart_money_flow(
     symbol: str = Query(default="SPY"),
-    window_minutes: int = Query(default=60, le=1440),
+    timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
+    window_units: int = Query(default=60, ge=1, le=90),
     limit: int = Query(default=10, le=50)
 ):
     """Get unusual activity / smart money flow"""
     try:
-        data = await db_manager.get_smart_money_flow(symbol, window_minutes, limit)
+        data = await db_manager.get_smart_money_flow(symbol, timeframe, window_units, limit)
         if not data:
             raise HTTPException(status_code=404, detail="No unusual activity detected")
 
@@ -290,7 +292,7 @@ async def get_historical_quotes(
     symbol: str = Query(default="SPY"),
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    limit: int = Query(default=90, le=1000),
+    window_units: int = Query(default=90, ge=1, le=90),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min")
 ):
     """Get historical quotes"""
@@ -299,7 +301,7 @@ async def get_historical_quotes(
         start_dt = datetime.fromisoformat(start_date) if start_date else None
         end_dt = datetime.fromisoformat(end_date) if end_date else None
 
-        data = await db_manager.get_historical_quotes(symbol, start_dt, end_dt, limit, timeframe)
+        data = await db_manager.get_historical_quotes(symbol, start_dt, end_dt, window_units, timeframe)
         if not data:
             raise HTTPException(status_code=404, detail="No historical data available")
 
@@ -316,11 +318,11 @@ async def get_historical_quotes(
 async def get_max_pain_timeseries(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="5min"),
-    limit: int = Query(default=90, le=500)
+    window_units: int = Query(default=90, ge=1, le=90)
 ):
     """Get max pain over time aggregated by timeframe."""
     try:
-        data = await db_manager.get_max_pain_timeseries(symbol, timeframe, limit)
+        data = await db_manager.get_max_pain_timeseries(symbol, timeframe, window_units)
         if not data:
             raise HTTPException(status_code=404, detail="No max pain data available")
         return [MaxPainTimeseriesPoint(**row) for row in data]
@@ -356,11 +358,12 @@ async def get_max_pain_current(
 @app.get("/api/trading/vwap-deviation")
 async def get_vwap_deviation(
     symbol: str = Query(default="SPY"),
-    limit: int = Query(default=20, le=100)
+    timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
+    window_units: int = Query(default=20, ge=1, le=90)
 ):
     """Get VWAP deviation for mean reversion signals"""
     try:
-        data = await db_manager.get_vwap_deviation(symbol, limit)
+        data = await db_manager.get_vwap_deviation(symbol, timeframe, window_units)
         if not data:
             raise HTTPException(status_code=404, detail="No VWAP data available")
         return data
@@ -373,11 +376,12 @@ async def get_vwap_deviation(
 @app.get("/api/trading/opening-range")
 async def get_opening_range(
     symbol: str = Query(default="SPY"),
-    limit: int = Query(default=20, le=100)
+    timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
+    window_units: int = Query(default=20, ge=1, le=90)
 ):
     """Get opening range breakout status"""
     try:
-        data = await db_manager.get_opening_range_breakout(symbol, limit)
+        data = await db_manager.get_opening_range_breakout(symbol, timeframe, window_units)
         if not data:
             raise HTTPException(status_code=404, detail="No ORB data available")
         return data
@@ -441,11 +445,12 @@ async def get_volume_spikes(
 @app.get("/api/trading/momentum-divergence")
 async def get_momentum_divergence(
     symbol: str = Query(default="SPY"),
-    limit: int = Query(default=20, le=100)
+    timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
+    window_units: int = Query(default=20, ge=1, le=90)
 ):
     """Get momentum divergence signals"""
     try:
-        data = await db_manager.get_momentum_divergence(symbol, limit)
+        data = await db_manager.get_momentum_divergence(symbol, timeframe, window_units)
         if not data:
             raise HTTPException(status_code=404, detail="No divergence data available")
         return data

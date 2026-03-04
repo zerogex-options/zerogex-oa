@@ -56,6 +56,7 @@ class GEXByStrike(BaseModel):
 class OptionFlow(BaseModel):
     time_window_start: datetime
     time_window_end: datetime
+    interval_timestamp: Optional[datetime] = None
     symbol: str
     option_type: Optional[str] = None
     strike: Optional[Decimal] = None

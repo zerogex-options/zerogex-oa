@@ -672,7 +672,7 @@ class DatabaseManager:
         symbol: str = 'SPY',
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
-        limit: int = 90,
+        window_units: int = 90,
         timeframe: str = '1min'
     ) -> List[Dict[str, Any]]:
         """Get historical GEX summary data aggregated by timeframe."""
@@ -733,7 +733,8 @@ class DatabaseManager:
 
         try:
             async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, symbol, start_date, end_date, limit)
+                window_units = max(1, min(window_units, 90))
+                rows = await conn.fetch(query, symbol, start_date, end_date, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching historical GEX: {e}")
@@ -746,54 +747,69 @@ class DatabaseManager:
     async def get_flow_by_type(
         self,
         symbol: str = 'SPY',
-        window_minutes: int = 60
+        timeframe: str = '1min',
+        window_units: int = 60
     ) -> List[Dict[str, Any]]:
-        """Get option flow by type (calls vs puts) across the full selected interval."""
-        query = """
+        """Get option flow by type (calls vs puts) across interval buckets in the selected window."""
+        window_units = max(1, min(window_units, 90))
+        step_interval = _interval_expr(timeframe)
+        bucket = _bucket_expr(timeframe, 'c.timestamp')
+        query = f"""
             WITH latest AS (
                 SELECT MAX(timestamp) AS max_ts
                 FROM flow_cache_by_type_minute
                 WHERE symbol = $1
             ),
             bounds AS (
-                SELECT max_ts - INTERVAL '1 minute' * $2 AS time_window_start, max_ts AS time_window_end
+                SELECT
+                    max_ts - ({step_interval} * ($2 - 1)) AS time_window_start,
+                    max_ts AS time_window_end
                 FROM latest
+            ),
+            bucketed AS (
+                SELECT
+                    {bucket} AS interval_timestamp,
+                    c.option_type,
+                    SUM(c.total_volume)::bigint AS total_volume,
+                    SUM(c.total_premium)::numeric AS total_premium,
+                    AVG(c.avg_iv)::numeric AS avg_iv,
+                    SUM(c.net_delta)::numeric AS net_delta
+                FROM flow_cache_by_type_minute c
+                CROSS JOIN bounds b
+                WHERE c.symbol = $1
+                  AND c.timestamp BETWEEN b.time_window_start AND b.time_window_end
+                GROUP BY {bucket}, c.option_type
             )
             SELECT
                 b.time_window_start,
                 b.time_window_end,
-                c.symbol,
-                CASE WHEN c.option_type = 'C' THEN 'CALL' ELSE 'PUT' END AS option_type,
-                c.total_volume,
-                c.total_premium,
-                c.avg_iv,
-                c.net_delta,
+                t.interval_timestamp,
+                $1::varchar AS symbol,
+                CASE WHEN t.option_type = 'C' THEN 'CALL' ELSE 'PUT' END AS option_type,
+                t.total_volume,
+                t.total_premium,
+                t.avg_iv,
+                t.net_delta,
                 CASE
-                    WHEN c.option_type = 'C' AND c.total_premium > COALESCE((
-                        SELECT c2.total_premium FROM flow_cache_by_type_minute c2
-                        WHERE c2.symbol = c.symbol
-                          AND c2.timestamp = c.timestamp
-                          AND c2.option_type = 'P'
+                    WHEN t.option_type = 'C' AND t.total_premium > COALESCE((
+                        SELECT t2.total_premium FROM bucketed t2
+                        WHERE t2.interval_timestamp = t.interval_timestamp AND t2.option_type = 'P'
                     ), 0) THEN 'bullish'
-                    WHEN c.option_type = 'P' AND c.total_premium > COALESCE((
-                        SELECT c2.total_premium FROM flow_cache_by_type_minute c2
-                        WHERE c2.symbol = c.symbol
-                          AND c2.timestamp = c.timestamp
-                          AND c2.option_type = 'C'
+                    WHEN t.option_type = 'P' AND t.total_premium > COALESCE((
+                        SELECT t2.total_premium FROM bucketed t2
+                        WHERE t2.interval_timestamp = t.interval_timestamp AND t2.option_type = 'C'
                     ), 0) THEN 'bearish'
                     ELSE 'neutral'
                 END AS sentiment
-            FROM flow_cache_by_type_minute c
+            FROM bucketed t
             CROSS JOIN bounds b
-            WHERE c.symbol = $1
-              AND c.timestamp BETWEEN b.time_window_start AND b.time_window_end
-            ORDER BY c.timestamp DESC, option_type
+            ORDER BY t.interval_timestamp DESC, option_type
         """
 
         try:
             async with self.pool.acquire() as conn:
                 await self._refresh_flow_cache(conn, symbol)
-                rows = await conn.fetch(query, symbol, window_minutes)
+                rows = await conn.fetch(query, symbol, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching flow by type: {e}")
@@ -802,22 +818,29 @@ class DatabaseManager:
     async def get_flow_by_strike(
         self,
         symbol: str = 'SPY',
-        window_minutes: int = 60,
-        limit: int = 20
+        timeframe: str = '1min',
+        window_units: int = 60,
+        limit: int = 1000
     ) -> List[Dict[str, Any]]:
-        """Get option flow by strike level."""
-        query = """
+        """Get option flow by strike across interval buckets in the selected window."""
+        window_units = max(1, min(window_units, 90))
+        step_interval = _interval_expr(timeframe)
+        bucket = _bucket_expr(timeframe, 'c.timestamp')
+        query = f"""
             WITH latest AS (
                 SELECT MAX(timestamp) AS max_ts
                 FROM flow_cache_by_strike_minute
                 WHERE symbol = $1
             ),
             bounds AS (
-                SELECT max_ts - INTERVAL '1 minute' * $2 AS time_window_start, max_ts AS time_window_end
+                SELECT
+                    max_ts - ({step_interval} * ($2 - 1)) AS time_window_start,
+                    max_ts AS time_window_end
                 FROM latest
             ),
             strike_agg AS (
                 SELECT
+                    {bucket} AS interval_timestamp,
                     c.strike,
                     SUM(c.total_volume)::bigint AS total_volume,
                     SUM(c.total_premium)::numeric AS total_premium,
@@ -827,11 +850,12 @@ class DatabaseManager:
                 CROSS JOIN bounds b
                 WHERE c.symbol = $1
                   AND c.timestamp BETWEEN b.time_window_start AND b.time_window_end
-                GROUP BY c.strike
+                GROUP BY {bucket}, c.strike
             )
             SELECT
                 b.time_window_start,
                 b.time_window_end,
+                s.interval_timestamp,
                 $1::varchar AS symbol,
                 s.strike,
                 s.total_volume,
@@ -840,14 +864,14 @@ class DatabaseManager:
                 s.net_delta
             FROM strike_agg s
             CROSS JOIN bounds b
-            ORDER BY s.total_premium DESC NULLS LAST
+            ORDER BY s.interval_timestamp DESC, s.total_premium DESC NULLS LAST
             LIMIT $3
         """
 
         try:
             async with self.pool.acquire() as conn:
                 await self._refresh_flow_cache(conn, symbol)
-                rows = await conn.fetch(query, symbol, window_minutes, limit)
+                rows = await conn.fetch(query, symbol, window_units, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching flow by strike: {e}")
@@ -856,42 +880,63 @@ class DatabaseManager:
     async def get_smart_money_flow(
         self,
         symbol: str = 'SPY',
-        window_minutes: int = 60,
+        timeframe: str = '1min',
+        window_units: int = 60,
         limit: int = 10
     ) -> List[Dict[str, Any]]:
-        """Get unusual activity / smart money flow."""
-        query = """
+        """Get unusual activity / smart money flow across interval buckets in the selected window."""
+        window_units = max(1, min(window_units, 90))
+        step_interval = _interval_expr(timeframe)
+        bucket = _bucket_expr(timeframe, 'c.timestamp')
+        query = f"""
             WITH latest AS (
                 SELECT MAX(timestamp) AS max_ts
                 FROM flow_cache_smart_money_minute
                 WHERE symbol = $1
             ),
             bounds AS (
-                SELECT max_ts - INTERVAL '1 minute' * $2 AS time_window_start, max_ts AS time_window_end
+                SELECT
+                    max_ts - ({step_interval} * ($2 - 1)) AS time_window_start,
+                    max_ts AS time_window_end
                 FROM latest
+            ),
+            ranked AS (
+                SELECT
+                    {bucket} AS interval_timestamp,
+                    c.symbol,
+                    c.option_type,
+                    c.strike,
+                    SUM(c.total_volume)::bigint AS total_volume,
+                    SUM(c.total_premium)::numeric AS total_premium,
+                    AVG(c.avg_iv)::numeric AS avg_iv,
+                    MAX(c.unusual_activity_score)::numeric AS unusual_activity_score
+                FROM flow_cache_smart_money_minute c
+                CROSS JOIN bounds b
+                WHERE c.symbol = $1
+                  AND c.timestamp BETWEEN b.time_window_start AND b.time_window_end
+                GROUP BY {bucket}, c.symbol, c.option_type, c.strike
             )
             SELECT
                 b.time_window_start,
                 b.time_window_end,
-                c.symbol,
-                c.option_type,
-                c.strike,
-                c.total_volume,
-                c.total_premium,
-                c.avg_iv,
-                c.unusual_activity_score
-            FROM flow_cache_smart_money_minute c
+                r.interval_timestamp,
+                r.symbol,
+                r.option_type,
+                r.strike,
+                r.total_volume,
+                r.total_premium,
+                r.avg_iv,
+                r.unusual_activity_score
+            FROM ranked r
             CROSS JOIN bounds b
-            WHERE c.symbol = $1
-              AND c.timestamp BETWEEN b.time_window_start AND b.time_window_end
-            ORDER BY c.unusual_activity_score DESC, c.total_premium DESC
+            ORDER BY r.interval_timestamp DESC, r.unusual_activity_score DESC, r.total_premium DESC
             LIMIT $3
         """
 
         try:
             async with self.pool.acquire() as conn:
                 await self._refresh_flow_cache(conn, symbol)
-                rows = await conn.fetch(query, symbol, window_minutes, limit)
+                rows = await conn.fetch(query, symbol, window_units, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching smart money flow: {e}")
@@ -900,28 +945,59 @@ class DatabaseManager:
     async def get_vwap_deviation(
         self,
         symbol: str = 'SPY',
-        limit: int = 20
+        timeframe: str = '1min',
+        window_units: int = 20
     ) -> List[Dict[str, Any]]:
-        """Get VWAP deviation for mean reversion signals"""
-        query = """
-            SELECT 
+        """Get VWAP deviation for mean reversion signals by interval/window."""
+        window_units = max(1, min(window_units, 90))
+        step_interval = _interval_expr(timeframe)
+        bucket = _bucket_expr(timeframe)
+        query = f"""
+            WITH latest AS (
+                SELECT MAX(timestamp) AS max_ts
+                FROM underlying_vwap_deviation
+                WHERE symbol = $1
+            ),
+            bounds AS (
+                SELECT
+                    max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
+                    max_ts AS end_ts
+                FROM latest
+            ),
+            base AS (
+                SELECT
+                    time_et,
+                    timestamp,
+                    symbol,
+                    price,
+                    vwap,
+                    vwap_deviation_pct,
+                    volume,
+                    vwap_position,
+                    {bucket} AS bucket_ts,
+                    ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) AS rn
+                FROM underlying_vwap_deviation
+                WHERE symbol = $1
+                  AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+            )
+            SELECT
                 time_et,
-                timestamp,
+                bucket_ts AS timestamp,
                 symbol,
                 price,
                 vwap,
                 vwap_deviation_pct,
                 volume,
                 vwap_position
-            FROM underlying_vwap_deviation
-            WHERE symbol = $1
+            FROM base
+            WHERE rn = 1
             ORDER BY timestamp DESC
             LIMIT $2
         """
 
         try:
             async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, symbol, limit)
+                rows = await conn.fetch(query, symbol, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching VWAP deviation: {e}")
@@ -930,13 +1006,48 @@ class DatabaseManager:
     async def get_opening_range_breakout(
         self,
         symbol: str = 'SPY',
-        limit: int = 20
+        timeframe: str = '1min',
+        window_units: int = 20
     ) -> List[Dict[str, Any]]:
-        """Get opening range breakout status"""
-        query = """
-            SELECT 
+        """Get opening range breakout status by interval/window."""
+        window_units = max(1, min(window_units, 90))
+        step_interval = _interval_expr(timeframe)
+        bucket = _bucket_expr(timeframe)
+        query = f"""
+            WITH latest AS (
+                SELECT MAX(timestamp) AS max_ts
+                FROM opening_range_breakout
+                WHERE symbol = $1
+            ),
+            bounds AS (
+                SELECT
+                    max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
+                    max_ts AS end_ts
+                FROM latest
+            ),
+            base AS (
+                SELECT
+                    time_et,
+                    timestamp,
+                    symbol,
+                    current_price,
+                    orb_high,
+                    orb_low,
+                    orb_range,
+                    distance_above_orb_high,
+                    distance_below_orb_low,
+                    orb_pct,
+                    orb_status,
+                    volume,
+                    {bucket} AS bucket_ts,
+                    ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) AS rn
+                FROM opening_range_breakout
+                WHERE symbol = $1
+                  AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+            )
+            SELECT
                 time_et,
-                timestamp,
+                bucket_ts AS timestamp,
                 symbol,
                 current_price,
                 orb_high,
@@ -947,15 +1058,15 @@ class DatabaseManager:
                 orb_pct,
                 orb_status,
                 volume
-            FROM opening_range_breakout
-            WHERE symbol = $1
+            FROM base
+            WHERE rn = 1
             ORDER BY timestamp DESC
             LIMIT $2
         """
 
         try:
             async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, symbol, limit)
+                rows = await conn.fetch(query, symbol, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching ORB: {e}")
@@ -1056,36 +1167,63 @@ class DatabaseManager:
     async def get_momentum_divergence(
         self,
         symbol: str = 'SPY',
-        limit: int = 20
+        timeframe: str = '1min',
+        window_units: int = 20
     ) -> List[Dict[str, Any]]:
-        """Get momentum divergence signals"""
-        query = """
-            SELECT 
+        """Get momentum divergence signals by interval/window."""
+        window_units = max(1, min(window_units, 90))
+        step_interval = _interval_expr(timeframe)
+        bucket = _bucket_expr(timeframe)
+        query = f"""
+            WITH latest AS (
+                SELECT MAX(timestamp) AS max_ts
+                FROM momentum_divergence
+                WHERE symbol = $1
+            ),
+            bounds AS (
+                SELECT
+                    max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
+                    max_ts AS end_ts
+                FROM latest
+            ),
+            base AS (
+                SELECT
+                    time_et,
+                    timestamp,
+                    symbol,
+                    price,
+                    price_change_5min,
+                    net_volume,
+                    net_option_flow,
+                    divergence_signal,
+                    {bucket} AS bucket_ts,
+                    ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) AS rn
+                FROM momentum_divergence
+                WHERE symbol = $1
+                  AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+            )
+            SELECT
                 time_et,
-                timestamp,
+                bucket_ts AS timestamp,
                 symbol,
                 price,
                 price_change_5min,
                 net_volume,
                 net_option_flow,
                 divergence_signal
-            FROM momentum_divergence
-            WHERE symbol = $1
+            FROM base
+            WHERE rn = 1
             ORDER BY timestamp DESC
             LIMIT $2
         """
 
         try:
             async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, symbol, limit)
+                rows = await conn.fetch(query, symbol, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching momentum divergence: {e}")
             raise
-
-    # ========================================================================
-    # Market Data Queries
-    # ========================================================================
 
     async def get_latest_quote(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
         """Get latest underlying quote"""
@@ -1184,7 +1322,7 @@ class DatabaseManager:
         symbol: str = 'SPY',
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
-        limit: int = 90,
+        window_units: int = 90,
         timeframe: str = '1min'
     ) -> List[Dict[str, Any]]:
         """Get historical quotes aggregated by timeframe."""
@@ -1237,7 +1375,8 @@ class DatabaseManager:
 
         try:
             async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, symbol, start_date, end_date, limit)
+                window_units = max(1, min(window_units, 90))
+                rows = await conn.fetch(query, symbol, start_date, end_date, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching historical quotes: {e}")
@@ -1247,9 +1386,10 @@ class DatabaseManager:
         self,
         symbol: str = 'SPY',
         timeframe: str = '5min',
-        limit: int = 90
+        window_units: int = 90
     ) -> List[Dict[str, Any]]:
-        """Get max pain timeseries aggregated to timeframe."""
+        """Get max pain timeseries aggregated to timeframe over window units."""
+        window_units = max(1, min(window_units, 90))
         bucket = _bucket_expr(timeframe)
         step_interval = _interval_expr(timeframe)
         query = f"""
@@ -1281,7 +1421,7 @@ class DatabaseManager:
         """
 
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch(query, symbol, limit)
+            rows = await conn.fetch(query, symbol, window_units)
             return [dict(row) for row in rows]
 
     async def get_max_pain_current(self, symbol: str = 'SPY', strike_limit: int = 200) -> Optional[Dict[str, Any]]:
@@ -1346,37 +1486,36 @@ class DatabaseManager:
     async def get_gex_heatmap(
         self,
         symbol: str = 'SPY',
-        window_minutes: int = 60,
-        interval_minutes: int = 5,
-        timeframe: str = '5min'
+        timeframe: str = '5min',
+        window_units: int = 60
     ) -> List[Dict[str, Any]]:
         """
-        Get GEX data by strike over time for heatmap visualization
-        Returns time-series data of GEX by strike aligned to underlying price timestamps
+        Get GEX data by strike over time for heatmap visualization using interval + window units.
         """
+        window_units = max(1, min(window_units, 90))
         bucket = _bucket_expr(timeframe)
+        step_interval = _interval_expr(timeframe)
         query = f"""
             WITH latest_price_timestamp AS (
-                -- Use latest underlying price timestamp as baseline
                 SELECT MAX(timestamp) as max_ts
                 FROM underlying_quotes
                 WHERE symbol = $1
             ),
             time_window AS (
-                SELECT 
-                    max_ts - INTERVAL '1 minute' * $2 as start_time,
+                SELECT
+                    max_ts - ({step_interval} * ($2 - 1)) as start_time,
                     max_ts as end_time
                 FROM latest_price_timestamp
             ),
             latest_price AS (
-                SELECT close 
-                FROM underlying_quotes 
-                WHERE symbol = $1 
-                ORDER BY timestamp DESC 
+                SELECT close
+                FROM underlying_quotes
+                WHERE symbol = $1
+                ORDER BY timestamp DESC
                 LIMIT 1
             ),
             recent_data AS (
-                SELECT 
+                SELECT
                     {bucket} as timestamp,
                     strike,
                     AVG(net_gex) as net_gex
@@ -1387,7 +1526,7 @@ class DatabaseManager:
                 GROUP BY 1, strike
             ),
             filtered_data AS (
-                SELECT 
+                SELECT
                     r.timestamp,
                     r.strike,
                     r.net_gex
@@ -1395,7 +1534,7 @@ class DatabaseManager:
                 CROSS JOIN latest_price l
                 WHERE ABS(r.strike - l.close) <= 50
             )
-            SELECT 
+            SELECT
                 timestamp,
                 strike,
                 net_gex
@@ -1405,10 +1544,9 @@ class DatabaseManager:
 
         try:
             async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, symbol, window_minutes)
+                rows = await conn.fetch(query, symbol, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching GEX heatmap: {e}")
             raise
-
 
