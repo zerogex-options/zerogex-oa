@@ -1297,6 +1297,92 @@ CREATE INDEX IF NOT EXISTS idx_option_chains_expiration_range
 
 
 -- =============================================================================
+-- Cached Analytics Tables (Incremental / Rolling)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS max_pain_oi_snapshot (
+    symbol VARCHAR(10) NOT NULL,
+    as_of_date DATE NOT NULL,
+    source_timestamp TIMESTAMPTZ NOT NULL,
+    underlying_price NUMERIC(12, 4) NOT NULL,
+    max_pain NUMERIC(12, 4) NOT NULL,
+    difference NUMERIC(12, 4) NOT NULL,
+    expirations JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (symbol, as_of_date)
+);
+
+CREATE TABLE IF NOT EXISTS max_pain_oi_snapshot_expiration (
+    symbol VARCHAR(10) NOT NULL,
+    as_of_date DATE NOT NULL,
+    source_timestamp TIMESTAMPTZ NOT NULL,
+    expiration DATE NOT NULL,
+    max_pain NUMERIC(12, 4) NOT NULL,
+    difference_from_underlying NUMERIC(12, 4) NOT NULL,
+    strikes JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (symbol, as_of_date, expiration)
+);
+
+CREATE INDEX IF NOT EXISTS idx_max_pain_oi_snapshot_symbol_date
+    ON max_pain_oi_snapshot(symbol, as_of_date DESC);
+
+CREATE INDEX IF NOT EXISTS idx_max_pain_oi_snapshot_exp_symbol_exp
+    ON max_pain_oi_snapshot_expiration(symbol, as_of_date DESC, expiration);
+
+CREATE TABLE IF NOT EXISTS flow_cache_by_type_minute (
+    timestamp TIMESTAMPTZ NOT NULL,
+    symbol VARCHAR(10) NOT NULL,
+    option_type CHAR(1) NOT NULL CHECK (option_type IN ('C', 'P')),
+    total_volume BIGINT NOT NULL,
+    total_premium NUMERIC(18, 2) NOT NULL,
+    avg_iv NUMERIC(8, 6),
+    net_delta NUMERIC(18, 2),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (timestamp, symbol, option_type)
+);
+
+CREATE TABLE IF NOT EXISTS flow_cache_by_strike_minute (
+    timestamp TIMESTAMPTZ NOT NULL,
+    symbol VARCHAR(10) NOT NULL,
+    strike NUMERIC(12, 4) NOT NULL,
+    total_volume BIGINT NOT NULL,
+    total_premium NUMERIC(18, 2) NOT NULL,
+    avg_iv NUMERIC(8, 6),
+    net_delta NUMERIC(18, 2),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (timestamp, symbol, strike)
+);
+
+CREATE TABLE IF NOT EXISTS flow_cache_smart_money_minute (
+    timestamp TIMESTAMPTZ NOT NULL,
+    symbol VARCHAR(10) NOT NULL,
+    option_symbol VARCHAR(50) NOT NULL,
+    strike NUMERIC(12, 4) NOT NULL,
+    expiration DATE NOT NULL,
+    option_type CHAR(1) NOT NULL CHECK (option_type IN ('C', 'P')),
+    total_volume BIGINT NOT NULL,
+    total_premium NUMERIC(18, 2) NOT NULL,
+    avg_iv NUMERIC(8, 6),
+    avg_delta NUMERIC(8, 6),
+    unusual_activity_score NUMERIC(6, 3) NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (timestamp, symbol, option_symbol)
+);
+
+CREATE INDEX IF NOT EXISTS idx_flow_cache_by_type_symbol_ts
+    ON flow_cache_by_type_minute(symbol, timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS idx_flow_cache_by_strike_symbol_ts
+    ON flow_cache_by_strike_minute(symbol, timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS idx_flow_cache_smart_money_symbol_ts
+    ON flow_cache_smart_money_minute(symbol, timestamp DESC);
+
+
+-- =============================================================================
 -- Verification & Stats
 -- =============================================================================
 
@@ -1318,7 +1404,12 @@ WHERE schemaname = 'public'
         'gex_by_strike',
         'data_quality_log',
         'ingestion_metrics',
-        'data_retention_policy'
+        'data_retention_policy',
+        'max_pain_oi_snapshot',
+        'max_pain_oi_snapshot_expiration',
+        'flow_cache_by_type_minute',
+        'flow_cache_by_strike_minute',
+        'flow_cache_smart_money_minute'
     )
 ORDER BY tablename;
 

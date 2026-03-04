@@ -35,7 +35,7 @@ Get historical GEX data.
 - `symbol` (optional): default `SPY`
 - `start_date` (optional): ISO format datetime/date
 - `end_date` (optional): ISO format datetime/date
-- `limit` (optional): max `1000`, default `90`
+- `window_units` (optional): max `90`, default `90`
 - `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `1min`
 
 ### GET /api/gex/heatmap
@@ -43,35 +43,37 @@ Get GEX heatmap matrix (strike × time).
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
-- `window_minutes` (optional): max `7200`, default `60`
-- `interval_minutes` (optional): max `1440`, default `5`
 - `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `5min`
+- `window_units` (optional): max `90`, default `60`
 
 ---
 
 ## Options Flow
 
 ### GET /api/flow/by-type
-Get option flow by type (calls vs puts).
+Get option flow by type (calls vs puts) across the full selected interval (time-series rows).
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
-- `window_minutes` (optional): max `1440`, default `60`
+- `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `1min`
+- `window_units` (optional): max `90`, default `60`
 
 ### GET /api/flow/by-strike
 Get option flow by strike level.
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
-- `window_minutes` (optional): max `1440`, default `60`
-- `limit` (optional): max `100`, default `20`
+- `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `1min`
+- `window_units` (optional): max `90`, default `60`
+- `limit` (optional): max `50000`, default `1000`
 
 ### GET /api/flow/smart-money
 Get unusual activity / smart money flow.
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
-- `window_minutes` (optional): max `1440`, default `60`
+- `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `1min`
+- `window_units` (optional): max `90`, default `60`
 - `limit` (optional): max `50`, default `10`
 
 ---
@@ -97,7 +99,7 @@ Get historical underlying quotes.
 - `symbol` (optional): default `SPY`
 - `start_date` (optional): ISO format datetime/date
 - `end_date` (optional): ISO format datetime/date
-- `limit` (optional): max `1000`, default `90`
+- `window_units` (optional): max `90`, default `90`
 - `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `1min`
 
 ---
@@ -110,10 +112,10 @@ Get max pain over time (aggregated by timeframe).
 **Parameters:**
 - `symbol` (optional): default `SPY`
 - `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `5min`
-- `limit` (optional): min `1`, max `500`, default `90`
+- `window_units` (optional): min `1`, max `90`, default `90`
 
 ### GET /api/max-pain/current
-Get current max pain plus strike-by-strike payout notional.
+Get current max pain with current underlying price, difference (`max_pain - underlying_price`), and per-expiration strike payout/notional grids.
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
@@ -128,14 +130,16 @@ Get VWAP deviation for mean reversion monitoring.
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
-- `limit` (optional): max `100`, default `20`
+- `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `1min`
+- `window_units` (optional): max `90`, default `20`
 
 ### GET /api/trading/opening-range
 Get opening range breakout status.
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
-- `limit` (optional): max `100`, default `20`
+- `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `1min`
+- `window_units` (optional): max `90`, default `20`
 
 ### GET /api/trading/gamma-levels
 Get gamma exposure levels (support/resistance zones).
@@ -163,7 +167,8 @@ Get momentum divergence signals.
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
-- `limit` (optional): max `100`, default `20`
+- `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `1min`
+- `window_units` (optional): max `90`, default `20`
 
 ---
 
