@@ -18,6 +18,8 @@ from .models import (
     GEXSummary,
     GEXByStrike,
     OptionFlow,
+    FlowByTypeBucket,
+    FlowByStrikeBucket,
     UnderlyingQuote,
     PreviousClose,
     HealthStatus,
@@ -194,7 +196,7 @@ async def get_gex_heatmap(
 # Options Flow Endpoints
 # ============================================================================
 
-@app.get("/api/flow/by-type", response_model=List[OptionFlow])
+@app.get("/api/flow/by-type", response_model=List[FlowByTypeBucket])
 async def get_flow_by_type(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
@@ -206,14 +208,14 @@ async def get_flow_by_type(
         if not data:
             raise HTTPException(status_code=404, detail="No flow data available")
 
-        return [OptionFlow(**row) for row in data]
+        return [FlowByTypeBucket(**row) for row in data]
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error fetching flow by type: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/flow/by-strike", response_model=List[OptionFlow])
+@app.get("/api/flow/by-strike", response_model=List[FlowByStrikeBucket])
 async def get_flow_by_strike(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
@@ -226,7 +228,7 @@ async def get_flow_by_strike(
         if not data:
             raise HTTPException(status_code=404, detail="No flow data available")
 
-        return [OptionFlow(**row) for row in data]
+        return [FlowByStrikeBucket(**row) for row in data]
     except HTTPException:
         raise
     except Exception as e:

@@ -4,7 +4,7 @@ Pydantic models for API request/response validation
 
 from pydantic import BaseModel, Field
 from datetime import datetime, date
-from typing import Optional
+from typing import Optional, Dict
 from decimal import Decimal
 
 
@@ -75,6 +75,25 @@ class OptionFlow(BaseModel):
         }
 
 
+class FlowByTypeBucket(BaseModel):
+    time_window_start: datetime
+    time_window_end: datetime
+    timestamp: datetime
+    symbol: str
+    total_volume: Dict[str, int]
+    total_premium: Dict[str, Decimal]
+
+
+class FlowByStrikeBucket(BaseModel):
+    time_window_start: datetime
+    time_window_end: datetime
+    timestamp: datetime
+    symbol: str
+    strike: Decimal
+    total_volume: Dict[str, int]
+    total_premium: Dict[str, Decimal]
+
+
 class UnderlyingQuote(BaseModel):
     timestamp: datetime
     symbol: str
@@ -83,8 +102,6 @@ class UnderlyingQuote(BaseModel):
     low: Decimal
     close: Decimal
     volume: Optional[int] = None
-    up_volume: Optional[int] = None
-    down_volume: Optional[int] = None
 
     class Config:
         from_attributes = True

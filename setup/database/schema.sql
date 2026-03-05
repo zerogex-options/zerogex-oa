@@ -457,6 +457,11 @@ DROP VIEW IF EXISTS option_flow_by_type_15min CASCADE;
 DROP VIEW IF EXISTS option_flow_by_type_1hr CASCADE;
 DROP VIEW IF EXISTS option_flow_by_type_1day CASCADE;
 DROP VIEW IF EXISTS option_flow_by_strike CASCADE;
+DROP VIEW IF EXISTS option_flow_by_strike_1min CASCADE;
+DROP VIEW IF EXISTS option_flow_by_strike_5min CASCADE;
+DROP VIEW IF EXISTS option_flow_by_strike_15min CASCADE;
+DROP VIEW IF EXISTS option_flow_by_strike_1hr CASCADE;
+DROP VIEW IF EXISTS option_flow_by_strike_1day CASCADE;
 DROP VIEW IF EXISTS option_flow_by_expiration CASCADE;
 DROP VIEW IF EXISTS option_flow_smart_money CASCADE;
 DROP VIEW IF EXISTS underlying_buying_pressure;
@@ -469,133 +474,147 @@ DROP VIEW IF EXISTS underlying_buying_pressure;
 
 CREATE VIEW option_flow_by_type_1min AS
 SELECT
-    c.timestamp AT TIME ZONE 'America/New_York' as time_et,
-    c.timestamp,
-    c.symbol,
-    CASE WHEN c.option_type = 'C' THEN 'CALL' ELSE 'PUT' END AS option_type,
-    c.total_volume,
-    c.total_premium,
-    c.avg_iv,
-    c.net_delta,
-    CASE
-        WHEN c.option_type = 'C' AND c.total_premium > COALESCE((
-            SELECT p.total_premium
-            FROM flow_cache_by_type_minute p
-            WHERE p.symbol = c.symbol
-              AND p.timestamp = c.timestamp
-              AND p.option_type = 'P'
-        ), 0) THEN 'bullish'
-        WHEN c.option_type = 'P' AND c.total_premium > COALESCE((
-            SELECT p.total_premium
-            FROM flow_cache_by_type_minute p
-            WHERE p.symbol = c.symbol
-              AND p.timestamp = c.timestamp
-              AND p.option_type = 'C'
-        ), 0) THEN 'bearish'
-        ELSE 'neutral'
-    END AS sentiment
-FROM flow_cache_by_type_minute c;
+    date_trunc('minute', timestamp) + INTERVAL '1 minute' AS timestamp,
+    symbol,
+    option_type,
+    SUM(total_volume)::bigint AS total_volume,
+    SUM(total_premium)::numeric AS total_premium
+FROM flow_cache_by_type_minute
+GROUP BY 1, symbol, option_type;
 
 CREATE VIEW option_flow_by_type_5min AS
 SELECT
-    timestamp AT TIME ZONE 'America/New_York' as time_et,
-    timestamp,
+    (
+        date_trunc('hour', timestamp)
+        + FLOOR(EXTRACT(MINUTE FROM timestamp) / 5) * INTERVAL '5 minutes'
+        + INTERVAL '5 minutes'
+    ) AS timestamp,
     symbol,
     option_type,
-    total_volume,
-    total_premium,
-    avg_iv,
-    net_delta,
-    sentiment
-FROM option_flow_by_type_1min;
+    SUM(total_volume)::bigint AS total_volume,
+    SUM(total_premium)::numeric AS total_premium
+FROM flow_cache_by_type_minute
+GROUP BY 1, symbol, option_type;
 
 CREATE VIEW option_flow_by_type_15min AS
 SELECT
-    timestamp AT TIME ZONE 'America/New_York' as time_et,
-    timestamp,
+    (
+        date_trunc('hour', timestamp)
+        + FLOOR(EXTRACT(MINUTE FROM timestamp) / 15) * INTERVAL '15 minutes'
+        + INTERVAL '15 minutes'
+    ) AS timestamp,
     symbol,
     option_type,
-    total_volume,
-    total_premium,
-    avg_iv,
-    net_delta,
-    sentiment
-FROM option_flow_by_type_1min;
+    SUM(total_volume)::bigint AS total_volume,
+    SUM(total_premium)::numeric AS total_premium
+FROM flow_cache_by_type_minute
+GROUP BY 1, symbol, option_type;
 
 CREATE VIEW option_flow_by_type_1hr AS
 SELECT
-    timestamp AT TIME ZONE 'America/New_York' as time_et,
-    timestamp,
+    date_trunc('hour', timestamp) + INTERVAL '1 hour' AS timestamp,
     symbol,
     option_type,
-    total_volume,
-    total_premium,
-    avg_iv,
-    net_delta,
-    sentiment
-FROM option_flow_by_type_1min;
+    SUM(total_volume)::bigint AS total_volume,
+    SUM(total_premium)::numeric AS total_premium
+FROM flow_cache_by_type_minute
+GROUP BY 1, symbol, option_type;
 
 CREATE VIEW option_flow_by_type_1day AS
 SELECT
-    timestamp AT TIME ZONE 'America/New_York' as time_et,
-    timestamp,
+    date_trunc('day', timestamp) + INTERVAL '1 day' AS timestamp,
     symbol,
     option_type,
-    total_volume,
-    total_premium,
-    avg_iv,
-    net_delta,
-    sentiment
-FROM option_flow_by_type_1min;
+    SUM(total_volume)::bigint AS total_volume,
+    SUM(total_premium)::numeric AS total_premium
+FROM flow_cache_by_type_minute
+GROUP BY 1, symbol, option_type;
 
 CREATE VIEW option_flow_by_type AS
 SELECT * FROM option_flow_by_type_1min;
 
 COMMENT ON VIEW option_flow_by_type IS
-'Cached minute option flow by type. Interval-specific views (1min/5min/15min/1hr/1day) are selected by the API.';
+'Cached flow-by-type aggregates by interval. Buckets use end-of-bucket timestamps.';
 
 
 -- =============================================================================
 -- View 2: Option Flow by Strike
 -- =============================================================================
--- Shows flow aggregated by strike across all expirations
--- Use case: Identifying key strike levels with heavy flow
+-- Shows flow aggregated by strike in interval buckets
+
+CREATE VIEW option_flow_by_strike_1min AS
+SELECT
+    date_trunc('minute', timestamp) + INTERVAL '1 minute' AS timestamp,
+    symbol,
+    strike,
+    SUM(call_volume)::bigint AS call_volume,
+    SUM(put_volume)::bigint AS put_volume,
+    SUM(call_premium)::numeric AS call_premium,
+    SUM(put_premium)::numeric AS put_premium
+FROM flow_cache_by_strike_minute
+GROUP BY 1, symbol, strike;
+
+CREATE VIEW option_flow_by_strike_5min AS
+SELECT
+    (
+        date_trunc('hour', timestamp)
+        + FLOOR(EXTRACT(MINUTE FROM timestamp) / 5) * INTERVAL '5 minutes'
+        + INTERVAL '5 minutes'
+    ) AS timestamp,
+    symbol,
+    strike,
+    SUM(call_volume)::bigint AS call_volume,
+    SUM(put_volume)::bigint AS put_volume,
+    SUM(call_premium)::numeric AS call_premium,
+    SUM(put_premium)::numeric AS put_premium
+FROM flow_cache_by_strike_minute
+GROUP BY 1, symbol, strike;
+
+CREATE VIEW option_flow_by_strike_15min AS
+SELECT
+    (
+        date_trunc('hour', timestamp)
+        + FLOOR(EXTRACT(MINUTE FROM timestamp) / 15) * INTERVAL '15 minutes'
+        + INTERVAL '15 minutes'
+    ) AS timestamp,
+    symbol,
+    strike,
+    SUM(call_volume)::bigint AS call_volume,
+    SUM(put_volume)::bigint AS put_volume,
+    SUM(call_premium)::numeric AS call_premium,
+    SUM(put_premium)::numeric AS put_premium
+FROM flow_cache_by_strike_minute
+GROUP BY 1, symbol, strike;
+
+CREATE VIEW option_flow_by_strike_1hr AS
+SELECT
+    date_trunc('hour', timestamp) + INTERVAL '1 hour' AS timestamp,
+    symbol,
+    strike,
+    SUM(call_volume)::bigint AS call_volume,
+    SUM(put_volume)::bigint AS put_volume,
+    SUM(call_premium)::numeric AS call_premium,
+    SUM(put_premium)::numeric AS put_premium
+FROM flow_cache_by_strike_minute
+GROUP BY 1, symbol, strike;
+
+CREATE VIEW option_flow_by_strike_1day AS
+SELECT
+    date_trunc('day', timestamp) + INTERVAL '1 day' AS timestamp,
+    symbol,
+    strike,
+    SUM(call_volume)::bigint AS call_volume,
+    SUM(put_volume)::bigint AS put_volume,
+    SUM(call_premium)::numeric AS call_premium,
+    SUM(put_premium)::numeric AS put_premium
+FROM flow_cache_by_strike_minute
+GROUP BY 1, symbol, strike;
 
 CREATE VIEW option_flow_by_strike AS
-SELECT
-    timestamp AT TIME ZONE 'America/New_York' as time_et,
-    timestamp,
-    underlying,
-    strike,
-    -- Call flow at this strike
-    SUM(volume_delta) FILTER (WHERE option_type = 'C' AND volume_delta > 0) as call_flow,
-    SUM(volume_delta * last * 100) FILTER (WHERE option_type = 'C' AND volume_delta > 0) as call_notional,
-    COUNT(DISTINCT expiration) FILTER (WHERE option_type = 'C' AND volume_delta > 0) as call_expirations,
-    -- Put flow at this strike
-    SUM(volume_delta) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as put_flow,
-    SUM(volume_delta * last * 100) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as put_notional,
-    COUNT(DISTINCT expiration) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as put_expirations,
-    -- Net flow at strike
-    SUM(volume_delta) FILTER (WHERE option_type = 'C' AND volume_delta > 0) -
-    SUM(volume_delta) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as net_flow,
-    SUM(volume_delta * last * 100) FILTER (WHERE option_type = 'C' AND volume_delta > 0) -
-    SUM(volume_delta * last * 100) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as net_notional,
-    -- Total flow at strike
-    SUM(volume_delta) FILTER (WHERE volume_delta > 0) as total_flow,
-    SUM(volume_delta * last * 100) FILTER (WHERE volume_delta > 0) as total_notional,
-    -- Average Greeks at this strike (for context)
-    ROUND(AVG(delta) FILTER (WHERE volume_delta > 0), 4) as avg_delta,
-    ROUND(AVG(gamma) FILTER (WHERE volume_delta > 0), 6) as avg_gamma,
-    ROUND(AVG(implied_volatility) FILTER (WHERE volume_delta > 0), 4) as avg_iv,
-    -- Average price (useful for context)
-    ROUND(AVG(last) FILTER (WHERE volume_delta > 0), 2) as avg_price
-FROM option_chains_with_deltas
-WHERE volume_delta > 0
-GROUP BY timestamp, underlying, strike
-ORDER BY timestamp DESC, total_notional DESC;
+SELECT * FROM option_flow_by_strike_1min;
 
 COMMENT ON VIEW option_flow_by_strike IS
-'Real-time flow by strike level with notional values across all expirations. Shows key strike concentration.';
+'Cached flow-by-strike aggregates by interval. Buckets use end-of-bucket timestamps.';
 
 
 -- =============================================================================
@@ -1424,10 +1443,11 @@ CREATE TABLE IF NOT EXISTS flow_cache_by_strike_minute (
     timestamp TIMESTAMPTZ NOT NULL,
     symbol VARCHAR(10) NOT NULL,
     strike NUMERIC(12, 4) NOT NULL,
-    total_volume BIGINT NOT NULL,
-    total_premium NUMERIC(18, 2) NOT NULL,
+    call_volume BIGINT NOT NULL DEFAULT 0,
+    put_volume BIGINT NOT NULL DEFAULT 0,
+    call_premium NUMERIC(18, 2) NOT NULL DEFAULT 0,
+    put_premium NUMERIC(18, 2) NOT NULL DEFAULT 0,
     avg_iv NUMERIC(8, 6),
-    net_delta NUMERIC(18, 2),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (timestamp, symbol, strike)
 );
@@ -1523,6 +1543,11 @@ WHERE schemaname = 'public'
         'option_flow_by_type_1hr',
         'option_flow_by_type_1day',
         'option_flow_by_strike', 
+        'option_flow_by_strike_1min',
+        'option_flow_by_strike_5min',
+        'option_flow_by_strike_15min',
+        'option_flow_by_strike_1hr',
+        'option_flow_by_strike_1day',
         'option_flow_by_expiration',
         'option_flow_smart_money',
         'underlying_buying_pressure',

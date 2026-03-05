@@ -84,6 +84,20 @@ def _momentum_view(timeframe: str) -> str:
         raise ValueError(f'Unsupported timeframe: {timeframe}')
     return mapping[normalized]
 
+
+def _flow_by_strike_view(timeframe: str) -> str:
+    mapping = {
+        '1min': 'option_flow_by_strike_1min',
+        '5min': 'option_flow_by_strike_5min',
+        '15min': 'option_flow_by_strike_15min',
+        '1hr': 'option_flow_by_strike_1hr',
+        '1day': 'option_flow_by_strike_1day',
+    }
+    normalized = _normalize_timeframe(timeframe)
+    if normalized not in mapping:
+        raise ValueError(f'Unsupported timeframe: {timeframe}')
+    return mapping[normalized]
+
 class DatabaseManager:
     """Manages database connections and queries"""
 
@@ -286,28 +300,31 @@ class DatabaseManager:
                     timestamp,
                     symbol,
                     strike,
-                    total_volume,
-                    total_premium,
-                    avg_iv,
-                    net_delta
+                    call_volume,
+                    put_volume,
+                    call_premium,
+                    put_premium,
+                    avg_iv
                 )
                 SELECT
                     timestamp,
                     $1::varchar,
                     strike,
-                    SUM(volume_delta)::bigint,
-                    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
-                    AVG(implied_volatility)::numeric,
-                    SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric
+                    SUM(volume_delta) FILTER (WHERE option_type = 'C')::bigint,
+                    SUM(volume_delta) FILTER (WHERE option_type = 'P')::bigint,
+                    SUM(volume_delta * COALESCE(last, 0) * 100) FILTER (WHERE option_type = 'C')::numeric,
+                    SUM(volume_delta * COALESCE(last, 0) * 100) FILTER (WHERE option_type = 'P')::numeric,
+                    AVG(implied_volatility)::numeric
                 FROM with_prev
                 WHERE volume_delta > 0
                 GROUP BY timestamp, strike
                 ON CONFLICT (timestamp, symbol, strike)
                 DO UPDATE SET
-                    total_volume = EXCLUDED.total_volume,
-                    total_premium = EXCLUDED.total_premium,
+                    call_volume = EXCLUDED.call_volume,
+                    put_volume = EXCLUDED.put_volume,
+                    call_premium = EXCLUDED.call_premium,
+                    put_premium = EXCLUDED.put_premium,
                     avg_iv = EXCLUDED.avg_iv,
-                    net_delta = EXCLUDED.net_delta,
                     updated_at = NOW()
                 """,
                 symbol,
@@ -865,7 +882,7 @@ class DatabaseManager:
         timeframe: str = '1min',
         window_units: int = 60
     ) -> List[Dict[str, Any]]:
-        """Get option flow by type (calls vs puts) across interval buckets in the selected window."""
+        """Get flow by type in interval buckets with bucket-end timestamps."""
         window_units = max(1, min(window_units, 90))
         view_name = _flow_by_type_view(timeframe)
         step_interval = _interval_expr(timeframe)
@@ -880,36 +897,27 @@ class DatabaseManager:
                     max_ts - ({step_interval} * ($2 - 1)) AS time_window_start,
                     max_ts AS time_window_end
                 FROM latest
-            ),
-            base AS (
-                SELECT
-                    timestamp,
-                    symbol,
-                    option_type,
-                    total_volume,
-                    total_premium,
-                    avg_iv,
-                    net_delta,
-                    sentiment
-                FROM {view_name} c
-                CROSS JOIN bounds b
-                WHERE c.symbol = $1
-                  AND c.timestamp BETWEEN b.time_window_start AND b.time_window_end
             )
             SELECT
                 b.time_window_start,
                 b.time_window_end,
-                t.timestamp AS interval_timestamp,
-                t.symbol,
-                t.option_type,
-                t.total_volume,
-                t.total_premium,
-                t.avg_iv,
-                t.net_delta,
-                t.sentiment
-            FROM base t
+                v.timestamp,
+                v.symbol,
+                json_build_object(
+                    'puts', COALESCE(SUM(v.total_volume) FILTER (WHERE v.option_type = 'P'), 0),
+                    'calls', COALESCE(SUM(v.total_volume) FILTER (WHERE v.option_type = 'C'), 0)
+                ) AS total_volume,
+                json_build_object(
+                    'puts', COALESCE(SUM(v.total_premium) FILTER (WHERE v.option_type = 'P'), 0),
+                    'calls', COALESCE(SUM(v.total_premium) FILTER (WHERE v.option_type = 'C'), 0)
+                ) AS total_premium
+            FROM {view_name} v
             CROSS JOIN bounds b
-            ORDER BY t.timestamp DESC, option_type
+            WHERE v.symbol = $1
+              AND v.timestamp BETWEEN b.time_window_start AND b.time_window_end
+            GROUP BY b.time_window_start, b.time_window_end, v.timestamp, v.symbol
+            ORDER BY v.timestamp DESC
+            LIMIT $2
         """
 
         try:
@@ -928,14 +936,14 @@ class DatabaseManager:
         window_units: int = 60,
         limit: int = 1000
     ) -> List[Dict[str, Any]]:
-        """Get option flow by strike across interval buckets in the selected window."""
+        """Get flow by strike in interval buckets with bucket-end timestamps."""
         window_units = max(1, min(window_units, 90))
+        view_name = _flow_by_strike_view(timeframe)
         step_interval = _interval_expr(timeframe)
-        bucket = _bucket_expr(timeframe, 'c.timestamp')
         query = f"""
             WITH latest AS (
                 SELECT MAX(timestamp) AS max_ts
-                FROM flow_cache_by_strike_minute
+                FROM {view_name}
                 WHERE symbol = $1
             ),
             bounds AS (
@@ -943,34 +951,27 @@ class DatabaseManager:
                     max_ts - ({step_interval} * ($2 - 1)) AS time_window_start,
                     max_ts AS time_window_end
                 FROM latest
-            ),
-            strike_agg AS (
-                SELECT
-                    {bucket} AS interval_timestamp,
-                    c.strike,
-                    SUM(c.total_volume)::bigint AS total_volume,
-                    SUM(c.total_premium)::numeric AS total_premium,
-                    AVG(c.avg_iv)::numeric AS avg_iv,
-                    SUM(c.net_delta)::numeric AS net_delta
-                FROM flow_cache_by_strike_minute c
-                CROSS JOIN bounds b
-                WHERE c.symbol = $1
-                  AND c.timestamp BETWEEN b.time_window_start AND b.time_window_end
-                GROUP BY {bucket}, c.strike
             )
             SELECT
                 b.time_window_start,
                 b.time_window_end,
-                s.interval_timestamp,
-                $1::varchar AS symbol,
-                s.strike,
-                s.total_volume,
-                s.total_premium,
-                s.avg_iv,
-                s.net_delta
-            FROM strike_agg s
+                v.timestamp,
+                v.symbol,
+                v.strike,
+                json_build_object(
+                    'puts', COALESCE(SUM(v.put_volume), 0),
+                    'calls', COALESCE(SUM(v.call_volume), 0)
+                ) AS total_volume,
+                json_build_object(
+                    'puts', COALESCE(SUM(v.put_premium), 0),
+                    'calls', COALESCE(SUM(v.call_premium), 0)
+                ) AS total_premium
+            FROM {view_name} v
             CROSS JOIN bounds b
-            ORDER BY s.interval_timestamp DESC, s.total_premium DESC NULLS LAST
+            WHERE v.symbol = $1
+              AND v.timestamp BETWEEN b.time_window_start AND b.time_window_end
+            GROUP BY b.time_window_start, b.time_window_end, v.timestamp, v.symbol, v.strike
+            ORDER BY v.timestamp DESC, (SUM(v.call_premium) + SUM(v.put_premium)) DESC
             LIMIT $3
         """
 
