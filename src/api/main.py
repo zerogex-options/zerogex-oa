@@ -231,21 +231,21 @@ async def get_flow_by_strike(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@app.get("/api/flow/by-expiry", response_model=List[FlowByExpiryBucket])
-async def get_flow_by_expiry(
+@app.get("/api/flow/by-expiration", response_model=List[FlowByExpiryBucket])
+async def get_flow_by_expiration(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
     window_units: int = Query(default=60, ge=1, le=90),
     limit: int = Query(default=1000, ge=1, le=50000)
 ):
-    """Get option flow by expiry bucket map."""
+    """Get option flow by expiration bucket map."""
     try:
-        data = await db_manager.get_flow_by_expiry(symbol, timeframe, window_units, limit)
+        data = await db_manager.get_flow_by_expiration(symbol, timeframe, window_units, limit)
         return [FlowByExpiryBucket(**row) for row in data]
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching flow by expiry: {e}")
+        logger.error(f"Error fetching flow by expiration: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/flow/smart-money", response_model=List[OptionFlow])
