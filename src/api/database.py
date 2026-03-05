@@ -274,7 +274,6 @@ class DatabaseManager:
 
     async def _refresh_flow_cache(self, conn: asyncpg.Connection, symbol: str) -> None:
         """Refresh flow caches for only the latest minute snapshot for a symbol."""
-        await self._ensure_flow_cache_schema(conn)
         latest_ts = await conn.fetchval(
             """
             SELECT MAX(timestamp)
