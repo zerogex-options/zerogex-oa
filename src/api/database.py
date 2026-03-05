@@ -241,6 +241,27 @@ class DatabaseManager:
             "ALTER TABLE flow_cache_by_strike_minute ADD COLUMN IF NOT EXISTS put_volume BIGINT NOT NULL DEFAULT 0",
             "ALTER TABLE flow_cache_by_strike_minute ADD COLUMN IF NOT EXISTS call_premium NUMERIC(18, 2) NOT NULL DEFAULT 0",
             "ALTER TABLE flow_cache_by_strike_minute ADD COLUMN IF NOT EXISTS put_premium NUMERIC(18, 2) NOT NULL DEFAULT 0",
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'flow_cache_by_strike_minute'
+                      AND column_name = 'total_volume'
+                ) THEN
+                    EXECUTE 'ALTER TABLE flow_cache_by_strike_minute ALTER COLUMN total_volume SET DEFAULT 0';
+                END IF;
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'flow_cache_by_strike_minute'
+                      AND column_name = 'total_premium'
+                ) THEN
+                    EXECUTE 'ALTER TABLE flow_cache_by_strike_minute ALTER COLUMN total_premium SET DEFAULT 0';
+                END IF;
+            END $$
+            """,
             "CREATE INDEX IF NOT EXISTS idx_flow_cache_by_type_symbol_ts ON flow_cache_by_type_minute(symbol, timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_flow_cache_by_strike_symbol_ts ON flow_cache_by_strike_minute(symbol, timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_flow_cache_smart_money_symbol_ts ON flow_cache_smart_money_minute(symbol, timestamp DESC)",
