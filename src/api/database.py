@@ -1132,7 +1132,7 @@ class DatabaseManager:
             logger.error(f"Error fetching flow by strike: {e}")
             raise
 
-    async def get_flow_by_expiry(
+    async def get_flow_by_expiration(
         self,
         symbol: str = 'SPY',
         timeframe: str = '1min',
@@ -1208,8 +1208,18 @@ class DatabaseManager:
                 grouped[key]['total_premium'][expiry_key] = row['total_premium']
             return list(grouped.values())
         except Exception as e:
-            logger.error(f"Error fetching flow by expiry: {e}")
+            logger.error(f"Error fetching flow by expiration: {e}")
             raise
+
+    async def get_flow_by_expiry(
+        self,
+        symbol: str = 'SPY',
+        timeframe: str = '1min',
+        window_units: int = 60,
+        limit: int = 1000
+    ) -> List[Dict[str, Any]]:
+        """Backward-compatible alias for get_flow_by_expiration."""
+        return await self.get_flow_by_expiration(symbol, timeframe, window_units, limit)
 
     async def get_smart_money_flow(
         self,

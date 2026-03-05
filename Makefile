@@ -858,21 +858,55 @@ gex-preview: ## Preview GEX calculation data
 flow-by-type: ## Puts vs calls flow (all strikes/expirations)
 	@echo "$(BLUE)=== Option Flow by Type (Last Hour) ===$(NC)"
 	@$(PSQL) -c "\
+		WITH cache_data AS ( \
+			SELECT timestamp, symbol, option_type, total_volume, total_premium \
+			FROM option_flow_by_type \
+			WHERE symbol = '$(FLOW_SYMBOL)' \
+				AND timestamp > NOW() - INTERVAL '1 hour' \
+		), fallback_data AS ( \
+			SELECT \
+				timestamp, \
+				underlying AS symbol, \
+				option_type, \
+				SUM(volume_delta)::bigint AS total_volume, \
+				SUM(volume_delta * COALESCE(last, 0) * 100)::numeric AS total_premium \
+			FROM option_chains_with_deltas \
+			WHERE underlying = '$(FLOW_SYMBOL)' \
+				AND volume_delta > 0 \
+				AND timestamp > NOW() - INTERVAL '1 hour' \
+			GROUP BY timestamp, underlying, option_type \
+		), source AS ( \
+			SELECT * FROM cache_data \
+			UNION ALL \
+			SELECT * FROM fallback_data WHERE NOT EXISTS (SELECT 1 FROM cache_data) \
+		) \
 		SELECT \
-			TO_CHAR(time_et, 'HH24:MI') as time, \
-			underlying, \
-			call_flow, \
-			TO_CHAR(call_notional, 'FM999,999,999') as call_notional, \
-			put_flow, \
-			TO_CHAR(put_notional, 'FM999,999,999') as put_notional, \
-			net_flow, \
-			TO_CHAR(net_notional, 'FM999,999,999') as net_notional, \
-			put_call_ratio as pc_ratio, \
-			put_call_notional_ratio as pc_not_ratio \
-		FROM option_flow_by_type \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
-			AND timestamp > NOW() - INTERVAL '1 hour' \
-		ORDER BY timestamp DESC \
+			TO_CHAR(s.timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
+			s.symbol, \
+			COALESCE(SUM(s.total_volume) FILTER (WHERE s.option_type = 'C'), 0) as call_flow, \
+			TO_CHAR(COALESCE(SUM(s.total_premium) FILTER (WHERE s.option_type = 'C'), 0), 'FM999,999,999') as call_notional, \
+			COALESCE(SUM(s.total_volume) FILTER (WHERE s.option_type = 'P'), 0) as put_flow, \
+			TO_CHAR(COALESCE(SUM(s.total_premium) FILTER (WHERE s.option_type = 'P'), 0), 'FM999,999,999') as put_notional, \
+			COALESCE(SUM(s.total_volume) FILTER (WHERE s.option_type = 'C'), 0) \
+				- COALESCE(SUM(s.total_volume) FILTER (WHERE s.option_type = 'P'), 0) as net_flow, \
+			TO_CHAR( \
+				COALESCE(SUM(s.total_premium) FILTER (WHERE s.option_type = 'C'), 0) \
+				- COALESCE(SUM(s.total_premium) FILTER (WHERE s.option_type = 'P'), 0), \
+				'FM999,999,999' \
+			) as net_notional, \
+			ROUND( \
+				COALESCE(SUM(s.total_volume) FILTER (WHERE s.option_type = 'P'), 0)::numeric \
+				/ NULLIF(COALESCE(SUM(s.total_volume) FILTER (WHERE s.option_type = 'C'), 0), 0), \
+				2 \
+			) as pc_ratio, \
+			ROUND( \
+				COALESCE(SUM(s.total_premium) FILTER (WHERE s.option_type = 'P'), 0)::numeric \
+				/ NULLIF(COALESCE(SUM(s.total_premium) FILTER (WHERE s.option_type = 'C'), 0), 0), \
+				2 \
+			) as pc_not_ratio \
+		FROM source s \
+		GROUP BY s.timestamp, s.symbol \
+		ORDER BY s.timestamp DESC \
 		LIMIT 20;"
 
 .PHONY: flow-by-strike
@@ -1109,15 +1143,56 @@ volume-spikes: ## Unusual volume detection
 divergence: ## Momentum divergence signals
 	@echo "$(BLUE)=== Momentum Divergence Signals (Last Hour) ===$(NC)"
 	@$(PSQL) -c "\
+		WITH u AS ( \
+			SELECT \
+				q.timestamp, \
+				q.symbol, \
+				q.close AS price, \
+				ROUND((q.close - LAG(q.close, 5) OVER (PARTITION BY q.symbol ORDER BY q.timestamp))::numeric, 2) AS price_change_5min, \
+				(q.up_volume - q.down_volume) AS net_volume \
+			FROM underlying_quotes q \
+			WHERE q.symbol = '$(FLOW_SYMBOL)' \
+				AND q.timestamp > NOW() - INTERVAL '70 minutes' \
+		), o AS ( \
+			SELECT \
+				c.timestamp, \
+				c.underlying AS symbol, \
+				COALESCE(SUM(c.volume_delta * COALESCE(c.last, 0) * 100) FILTER (WHERE c.option_type = 'C'), 0) \
+				- COALESCE(SUM(c.volume_delta * COALESCE(c.last, 0) * 100) FILTER (WHERE c.option_type = 'P'), 0) AS net_option_flow \
+			FROM option_chains_with_deltas c \
+			WHERE c.underlying = '$(FLOW_SYMBOL)' \
+				AND c.volume_delta > 0 \
+				AND c.timestamp > NOW() - INTERVAL '70 minutes' \
+			GROUP BY c.timestamp, c.underlying \
+		), joined AS ( \
+			SELECT \
+				u.timestamp, \
+				u.symbol, \
+				u.price, \
+				u.price_change_5min, \
+				u.net_volume, \
+				COALESCE(o.net_option_flow, 0) AS net_option_flow \
+			FROM u \
+			LEFT JOIN o ON u.symbol = o.symbol AND u.timestamp = o.timestamp \
+			WHERE u.price_change_5min IS NOT NULL \
+				AND u.timestamp > NOW() - INTERVAL '1 hour' \
+		) \
 		SELECT \
-			TO_CHAR(time_et, 'HH24:MI') as time, \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
 			symbol, \
 			ROUND(price, 2) as price, \
 			ROUND(price_change_5min, 2) as chg_5m, \
 			TO_CHAR(net_option_flow, 'FM999,999') as opt_flow, \
-			divergence_signal \
-		FROM momentum_divergence \
-		WHERE divergence_signal != '⚪ Neutral' \
+			CASE \
+				WHEN price_change_5min > 0 AND net_option_flow < -50000 THEN '🚨 Bearish Divergence (Price Up, Puts Buying)' \
+				WHEN price_change_5min < 0 AND net_option_flow > 50000 THEN '🚨 Bullish Divergence (Price Down, Calls Buying)' \
+				WHEN price_change_5min > 0 AND net_option_flow > 50000 THEN '🟢 Bullish Confirmation' \
+				WHEN price_change_5min < 0 AND net_option_flow < -50000 THEN '🔴 Bearish Confirmation' \
+				WHEN price_change_5min > 0 AND net_volume < 0 THEN '⚠️ Weak Rally (Selling Volume)' \
+				WHEN price_change_5min < 0 AND net_volume > 0 THEN '⚠️ Weak Selloff (Buying Volume)' \
+				ELSE '⚪ Neutral' \
+			END as divergence_signal \
+		FROM joined \
 		ORDER BY timestamp DESC \
 		LIMIT 20;"
 
@@ -1568,7 +1643,7 @@ api-test: ## Test ALL API endpoints
 		test_json "/api/market/historical?timeframe=$$tf" "$$BASE_URL/api/market/historical?symbol=$$SYMBOL&window_units=10&timeframe=$$tf"; \
 		test_json "/api/flow/by-type?timeframe=$$tf" "$$BASE_URL/api/flow/by-type?symbol=$$SYMBOL&window_units=10&timeframe=$$tf"; \
 		test_json "/api/flow/by-strike?timeframe=$$tf" "$$BASE_URL/api/flow/by-strike?symbol=$$SYMBOL&window_units=10&timeframe=$$tf&limit=25"; \
-		test_json "/api/flow/by-expiry?timeframe=$$tf" "$$BASE_URL/api/flow/by-expiry?symbol=$$SYMBOL&window_units=10&timeframe=$$tf&limit=25"; \
+		test_json "/api/flow/by-expiration?timeframe=$$tf" "$$BASE_URL/api/flow/by-expiration?symbol=$$SYMBOL&window_units=10&timeframe=$$tf&limit=25"; \
 		test_json "/api/flow/smart-money?timeframe=$$tf" "$$BASE_URL/api/flow/smart-money?symbol=$$SYMBOL&window_units=10&timeframe=$$tf&limit=10"; \
 		test_json "/api/max-pain/timeseries?timeframe=$$tf" "$$BASE_URL/api/max-pain/timeseries?symbol=$$SYMBOL&window_units=10&timeframe=$$tf"; \
 		test_json "/api/trading/vwap-deviation?timeframe=$$tf" "$$BASE_URL/api/trading/vwap-deviation?symbol=$$SYMBOL&window_units=10&timeframe=$$tf"; \
