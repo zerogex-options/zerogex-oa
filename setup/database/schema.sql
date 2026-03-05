@@ -1356,6 +1356,16 @@ CREATE TABLE IF NOT EXISTS flow_cache_by_strike_minute (
     PRIMARY KEY (timestamp, symbol, strike)
 );
 
+CREATE TABLE IF NOT EXISTS flow_cache_by_expiration_minute (
+    timestamp TIMESTAMPTZ NOT NULL,
+    symbol VARCHAR(10) NOT NULL,
+    expiration DATE NOT NULL,
+    total_volume BIGINT NOT NULL,
+    total_premium NUMERIC(18, 2) NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (timestamp, symbol, expiration)
+);
+
 CREATE TABLE IF NOT EXISTS flow_cache_smart_money_minute (
     timestamp TIMESTAMPTZ NOT NULL,
     symbol VARCHAR(10) NOT NULL,
@@ -1378,8 +1388,344 @@ CREATE INDEX IF NOT EXISTS idx_flow_cache_by_type_symbol_ts
 CREATE INDEX IF NOT EXISTS idx_flow_cache_by_strike_symbol_ts
     ON flow_cache_by_strike_minute(symbol, timestamp DESC);
 
+CREATE INDEX IF NOT EXISTS idx_flow_cache_by_expiration_symbol_ts
+    ON flow_cache_by_expiration_minute(symbol, timestamp DESC);
+
 CREATE INDEX IF NOT EXISTS idx_flow_cache_smart_money_symbol_ts
     ON flow_cache_smart_money_minute(symbol, timestamp DESC);
+
+
+-- =============================================================================
+-- Interval Aggregate Views for API Consumption
+-- =============================================================================
+
+DROP VIEW IF EXISTS flow_by_type_1min CASCADE;
+DROP VIEW IF EXISTS flow_by_type_5min CASCADE;
+DROP VIEW IF EXISTS flow_by_type_15min CASCADE;
+DROP VIEW IF EXISTS flow_by_type_1hr CASCADE;
+DROP VIEW IF EXISTS flow_by_type_1day CASCADE;
+
+CREATE VIEW flow_by_type_1min AS
+SELECT
+    date_trunc('minute', timestamp) + INTERVAL '1 minute' AS timestamp,
+    symbol,
+    SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END)::bigint AS put_volume,
+    SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END)::bigint AS call_volume,
+    SUM(CASE WHEN option_type = 'P' THEN total_premium ELSE 0 END)::numeric AS put_premium,
+    SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE 0 END)::numeric AS call_premium
+FROM flow_cache_by_type_minute
+GROUP BY 1, 2;
+
+CREATE VIEW flow_by_type_5min AS
+SELECT
+    date_trunc('hour', timestamp)
+        + FLOOR(EXTRACT(MINUTE FROM timestamp) / 5) * INTERVAL '5 minutes'
+        + INTERVAL '5 minutes' AS timestamp,
+    symbol,
+    SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END)::bigint AS put_volume,
+    SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END)::bigint AS call_volume,
+    SUM(CASE WHEN option_type = 'P' THEN total_premium ELSE 0 END)::numeric AS put_premium,
+    SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE 0 END)::numeric AS call_premium
+FROM flow_cache_by_type_minute
+GROUP BY 1, 2;
+
+CREATE VIEW flow_by_type_15min AS
+SELECT
+    date_trunc('hour', timestamp)
+        + FLOOR(EXTRACT(MINUTE FROM timestamp) / 15) * INTERVAL '15 minutes'
+        + INTERVAL '15 minutes' AS timestamp,
+    symbol,
+    SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END)::bigint AS put_volume,
+    SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END)::bigint AS call_volume,
+    SUM(CASE WHEN option_type = 'P' THEN total_premium ELSE 0 END)::numeric AS put_premium,
+    SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE 0 END)::numeric AS call_premium
+FROM flow_cache_by_type_minute
+GROUP BY 1, 2;
+
+CREATE VIEW flow_by_type_1hr AS
+SELECT
+    date_trunc('hour', timestamp) + INTERVAL '1 hour' AS timestamp,
+    symbol,
+    SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END)::bigint AS put_volume,
+    SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END)::bigint AS call_volume,
+    SUM(CASE WHEN option_type = 'P' THEN total_premium ELSE 0 END)::numeric AS put_premium,
+    SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE 0 END)::numeric AS call_premium
+FROM flow_cache_by_type_minute
+GROUP BY 1, 2;
+
+CREATE VIEW flow_by_type_1day AS
+SELECT
+    date_trunc('day', timestamp) + INTERVAL '1 day' AS timestamp,
+    symbol,
+    SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END)::bigint AS put_volume,
+    SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END)::bigint AS call_volume,
+    SUM(CASE WHEN option_type = 'P' THEN total_premium ELSE 0 END)::numeric AS put_premium,
+    SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE 0 END)::numeric AS call_premium
+FROM flow_cache_by_type_minute
+GROUP BY 1, 2;
+
+DROP VIEW IF EXISTS flow_by_strike_1min CASCADE;
+DROP VIEW IF EXISTS flow_by_strike_5min CASCADE;
+DROP VIEW IF EXISTS flow_by_strike_15min CASCADE;
+DROP VIEW IF EXISTS flow_by_strike_1hr CASCADE;
+DROP VIEW IF EXISTS flow_by_strike_1day CASCADE;
+
+CREATE VIEW flow_by_strike_1min AS
+SELECT
+    date_trunc('minute', timestamp) + INTERVAL '1 minute' AS timestamp,
+    symbol,
+    jsonb_object_agg(strike::text, volume_sum ORDER BY strike) AS total_volume,
+    jsonb_object_agg(strike::text, premium_sum ORDER BY strike) AS total_premium
+FROM (
+    SELECT
+        timestamp,
+        symbol,
+        strike,
+        SUM(total_volume)::bigint AS volume_sum,
+        SUM(total_premium)::numeric AS premium_sum
+    FROM flow_cache_by_strike_minute
+    GROUP BY 1,2,3
+) t
+GROUP BY 1,2;
+
+CREATE VIEW flow_by_strike_5min AS
+SELECT
+    date_trunc('hour', timestamp)
+        + FLOOR(EXTRACT(MINUTE FROM timestamp) / 5) * INTERVAL '5 minutes'
+        + INTERVAL '5 minutes' AS timestamp,
+    symbol,
+    jsonb_object_agg(strike::text, volume_sum ORDER BY strike) AS total_volume,
+    jsonb_object_agg(strike::text, premium_sum ORDER BY strike) AS total_premium
+FROM (
+    SELECT
+        timestamp,
+        symbol,
+        strike,
+        SUM(total_volume)::bigint AS volume_sum,
+        SUM(total_premium)::numeric AS premium_sum
+    FROM flow_cache_by_strike_minute
+    GROUP BY 1,2,3
+) t
+GROUP BY 1,2;
+
+CREATE VIEW flow_by_strike_15min AS
+SELECT
+    date_trunc('hour', timestamp)
+        + FLOOR(EXTRACT(MINUTE FROM timestamp) / 15) * INTERVAL '15 minutes'
+        + INTERVAL '15 minutes' AS timestamp,
+    symbol,
+    jsonb_object_agg(strike::text, volume_sum ORDER BY strike) AS total_volume,
+    jsonb_object_agg(strike::text, premium_sum ORDER BY strike) AS total_premium
+FROM (
+    SELECT
+        timestamp,
+        symbol,
+        strike,
+        SUM(total_volume)::bigint AS volume_sum,
+        SUM(total_premium)::numeric AS premium_sum
+    FROM flow_cache_by_strike_minute
+    GROUP BY 1,2,3
+) t
+GROUP BY 1,2;
+
+CREATE VIEW flow_by_strike_1hr AS
+SELECT
+    date_trunc('hour', timestamp) + INTERVAL '1 hour' AS timestamp,
+    symbol,
+    jsonb_object_agg(strike::text, volume_sum ORDER BY strike) AS total_volume,
+    jsonb_object_agg(strike::text, premium_sum ORDER BY strike) AS total_premium
+FROM (
+    SELECT
+        timestamp,
+        symbol,
+        strike,
+        SUM(total_volume)::bigint AS volume_sum,
+        SUM(total_premium)::numeric AS premium_sum
+    FROM flow_cache_by_strike_minute
+    GROUP BY 1,2,3
+) t
+GROUP BY 1,2;
+
+CREATE VIEW flow_by_strike_1day AS
+SELECT
+    date_trunc('day', timestamp) + INTERVAL '1 day' AS timestamp,
+    symbol,
+    jsonb_object_agg(strike::text, volume_sum ORDER BY strike) AS total_volume,
+    jsonb_object_agg(strike::text, premium_sum ORDER BY strike) AS total_premium
+FROM (
+    SELECT
+        timestamp,
+        symbol,
+        strike,
+        SUM(total_volume)::bigint AS volume_sum,
+        SUM(total_premium)::numeric AS premium_sum
+    FROM flow_cache_by_strike_minute
+    GROUP BY 1,2,3
+) t
+GROUP BY 1,2;
+
+DROP VIEW IF EXISTS flow_by_expiration_1min CASCADE;
+DROP VIEW IF EXISTS flow_by_expiration_5min CASCADE;
+DROP VIEW IF EXISTS flow_by_expiration_15min CASCADE;
+DROP VIEW IF EXISTS flow_by_expiration_1hr CASCADE;
+DROP VIEW IF EXISTS flow_by_expiration_1day CASCADE;
+
+CREATE VIEW flow_by_expiration_1min AS
+SELECT
+    date_trunc('minute', timestamp) + INTERVAL '1 minute' AS timestamp,
+    symbol,
+    jsonb_object_agg(expiration::text, volume_sum ORDER BY expiration) AS total_volume,
+    jsonb_object_agg(expiration::text, premium_sum ORDER BY expiration) AS total_premium
+FROM (
+    SELECT timestamp, symbol, expiration,
+           SUM(total_volume)::bigint AS volume_sum,
+           SUM(total_premium)::numeric AS premium_sum
+    FROM flow_cache_by_expiration_minute
+    GROUP BY 1,2,3
+) t
+GROUP BY 1,2;
+
+CREATE VIEW flow_by_expiration_5min AS
+SELECT
+    date_trunc('hour', timestamp)
+        + FLOOR(EXTRACT(MINUTE FROM timestamp) / 5) * INTERVAL '5 minutes'
+        + INTERVAL '5 minutes' AS timestamp,
+    symbol,
+    jsonb_object_agg(expiration::text, volume_sum ORDER BY expiration) AS total_volume,
+    jsonb_object_agg(expiration::text, premium_sum ORDER BY expiration) AS total_premium
+FROM (
+    SELECT timestamp, symbol, expiration,
+           SUM(total_volume)::bigint AS volume_sum,
+           SUM(total_premium)::numeric AS premium_sum
+    FROM flow_cache_by_expiration_minute
+    GROUP BY 1,2,3
+) t
+GROUP BY 1,2;
+
+CREATE VIEW flow_by_expiration_15min AS
+SELECT
+    date_trunc('hour', timestamp)
+        + FLOOR(EXTRACT(MINUTE FROM timestamp) / 15) * INTERVAL '15 minutes'
+        + INTERVAL '15 minutes' AS timestamp,
+    symbol,
+    jsonb_object_agg(expiration::text, volume_sum ORDER BY expiration) AS total_volume,
+    jsonb_object_agg(expiration::text, premium_sum ORDER BY expiration) AS total_premium
+FROM (
+    SELECT timestamp, symbol, expiration,
+           SUM(total_volume)::bigint AS volume_sum,
+           SUM(total_premium)::numeric AS premium_sum
+    FROM flow_cache_by_expiration_minute
+    GROUP BY 1,2,3
+) t
+GROUP BY 1,2;
+
+CREATE VIEW flow_by_expiration_1hr AS
+SELECT
+    date_trunc('hour', timestamp) + INTERVAL '1 hour' AS timestamp,
+    symbol,
+    jsonb_object_agg(expiration::text, volume_sum ORDER BY expiration) AS total_volume,
+    jsonb_object_agg(expiration::text, premium_sum ORDER BY expiration) AS total_premium
+FROM (
+    SELECT timestamp, symbol, expiration,
+           SUM(total_volume)::bigint AS volume_sum,
+           SUM(total_premium)::numeric AS premium_sum
+    FROM flow_cache_by_expiration_minute
+    GROUP BY 1,2,3
+) t
+GROUP BY 1,2;
+
+CREATE VIEW flow_by_expiration_1day AS
+SELECT
+    date_trunc('day', timestamp) + INTERVAL '1 day' AS timestamp,
+    symbol,
+    jsonb_object_agg(expiration::text, volume_sum ORDER BY expiration) AS total_volume,
+    jsonb_object_agg(expiration::text, premium_sum ORDER BY expiration) AS total_premium
+FROM (
+    SELECT timestamp, symbol, expiration,
+           SUM(total_volume)::bigint AS volume_sum,
+           SUM(total_premium)::numeric AS premium_sum
+    FROM flow_cache_by_expiration_minute
+    GROUP BY 1,2,3
+) t
+GROUP BY 1,2;
+
+DROP VIEW IF EXISTS momentum_divergence_1min CASCADE;
+DROP VIEW IF EXISTS momentum_divergence_5min CASCADE;
+DROP VIEW IF EXISTS momentum_divergence_15min CASCADE;
+DROP VIEW IF EXISTS momentum_divergence_1hr CASCADE;
+DROP VIEW IF EXISTS momentum_divergence_1day CASCADE;
+
+CREATE VIEW momentum_divergence_1min AS SELECT * FROM momentum_divergence;
+
+CREATE VIEW momentum_divergence_5min AS
+SELECT DISTINCT ON (bucket_ts, symbol)
+    bucket_ts AS timestamp,
+    bucket_ts AT TIME ZONE 'America/New_York' AS time_et,
+    symbol,
+    price,
+    price_change_5min,
+    net_volume,
+    net_option_flow,
+    divergence_signal
+FROM (
+    SELECT *,
+        date_trunc('hour', timestamp)
+        + FLOOR(EXTRACT(MINUTE FROM timestamp) / 5) * INTERVAL '5 minutes'
+        + INTERVAL '5 minutes' AS bucket_ts
+    FROM momentum_divergence
+) b
+ORDER BY bucket_ts DESC, symbol, timestamp DESC;
+
+CREATE VIEW momentum_divergence_15min AS
+SELECT DISTINCT ON (bucket_ts, symbol)
+    bucket_ts AS timestamp,
+    bucket_ts AT TIME ZONE 'America/New_York' AS time_et,
+    symbol,
+    price,
+    price_change_5min,
+    net_volume,
+    net_option_flow,
+    divergence_signal
+FROM (
+    SELECT *,
+        date_trunc('hour', timestamp)
+        + FLOOR(EXTRACT(MINUTE FROM timestamp) / 15) * INTERVAL '15 minutes'
+        + INTERVAL '15 minutes' AS bucket_ts
+    FROM momentum_divergence
+) b
+ORDER BY bucket_ts DESC, symbol, timestamp DESC;
+
+CREATE VIEW momentum_divergence_1hr AS
+SELECT DISTINCT ON (bucket_ts, symbol)
+    bucket_ts AS timestamp,
+    bucket_ts AT TIME ZONE 'America/New_York' AS time_et,
+    symbol,
+    price,
+    price_change_5min,
+    net_volume,
+    net_option_flow,
+    divergence_signal
+FROM (
+    SELECT *, date_trunc('hour', timestamp) + INTERVAL '1 hour' AS bucket_ts
+    FROM momentum_divergence
+) b
+ORDER BY bucket_ts DESC, symbol, timestamp DESC;
+
+CREATE VIEW momentum_divergence_1day AS
+SELECT DISTINCT ON (bucket_ts, symbol)
+    bucket_ts AS timestamp,
+    bucket_ts AT TIME ZONE 'America/New_York' AS time_et,
+    symbol,
+    price,
+    price_change_5min,
+    net_volume,
+    net_option_flow,
+    divergence_signal
+FROM (
+    SELECT *, date_trunc('day', timestamp) + INTERVAL '1 day' AS bucket_ts
+    FROM momentum_divergence
+) b
+ORDER BY bucket_ts DESC, symbol, timestamp DESC;
 
 
 -- =============================================================================
@@ -1409,6 +1755,7 @@ WHERE schemaname = 'public'
         'max_pain_oi_snapshot_expiration',
         'flow_cache_by_type_minute',
         'flow_cache_by_strike_minute',
+        'flow_cache_by_expiration_minute',
         'flow_cache_smart_money_minute'
     )
 ORDER BY tablename;
@@ -1427,6 +1774,21 @@ WHERE schemaname = 'public'
         'option_flow_by_type',
         'option_flow_by_strike', 
         'option_flow_by_expiration',
+        'flow_by_type_1min',
+        'flow_by_type_5min',
+        'flow_by_type_15min',
+        'flow_by_type_1hr',
+        'flow_by_type_1day',
+        'flow_by_strike_1min',
+        'flow_by_strike_5min',
+        'flow_by_strike_15min',
+        'flow_by_strike_1hr',
+        'flow_by_strike_1day',
+        'flow_by_expiration_1min',
+        'flow_by_expiration_5min',
+        'flow_by_expiration_15min',
+        'flow_by_expiration_1hr',
+        'flow_by_expiration_1day',
         'option_flow_smart_money',
         'underlying_buying_pressure',
         'underlying_vwap_deviation',
@@ -1434,7 +1796,12 @@ WHERE schemaname = 'public'
         'gamma_exposure_levels',
         'dealer_hedging_pressure',
         'unusual_volume_spikes',
-        'momentum_divergence'
+        'momentum_divergence',
+        'momentum_divergence_1min',
+        'momentum_divergence_5min',
+        'momentum_divergence_15min',
+        'momentum_divergence_1hr',
+        'momentum_divergence_1day'
     )
 ORDER BY viewname;
 
