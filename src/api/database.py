@@ -1428,14 +1428,18 @@ class DatabaseManager:
         timeframe: str = '1min',
         window_units: int = 20
     ) -> List[Dict[str, Any]]:
-        """Get momentum divergence signals by interval/window."""
+        """Get momentum divergence signals by interval/window.
+
+        Uses lightweight cache tables directly (instead of heavy momentum views)
+        so the query only scans the requested recent window.
+        """
         window_units = max(1, min(window_units, 90))
         step_interval = _interval_expr(timeframe)
-        timeframe_suffix = _timeframe_view_suffix(timeframe)
+        bucket = _bucket_expr(timeframe, 'u.timestamp')
         query = f"""
             WITH latest AS (
                 SELECT MAX(timestamp) AS max_ts
-                FROM momentum_divergence_{timeframe_suffix}
+                FROM underlying_quotes
                 WHERE symbol = $1
             ),
             bounds AS (
@@ -1443,19 +1447,66 @@ class DatabaseManager:
                     max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
                     max_ts AS end_ts
                 FROM latest
+            ),
+            underlying_window AS (
+                SELECT
+                    u.timestamp,
+                    u.symbol,
+                    u.close,
+                    (u.up_volume - u.down_volume)::bigint AS net_volume,
+                    u.close - LAG(u.close, 5) OVER (PARTITION BY u.symbol ORDER BY u.timestamp) AS price_change_5min
+                FROM underlying_quotes u
+                WHERE u.symbol = $1
+                  AND u.timestamp BETWEEN (
+                        (SELECT start_ts FROM bounds) - INTERVAL '10 minutes'
+                    ) AND (SELECT end_ts FROM bounds)
+            ),
+            option_momentum AS (
+                SELECT
+                    c.timestamp,
+                    c.symbol,
+                    SUM(CASE WHEN c.option_type = 'C' THEN c.total_premium ELSE -c.total_premium END)::numeric AS net_option_flow
+                FROM flow_cache_by_type_minute c
+                WHERE c.symbol = $1
+                  AND c.timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+                GROUP BY c.timestamp, c.symbol
+            ),
+            base AS (
+                SELECT
+                    {bucket} + {step_interval} AS bucket_ts,
+                    uw.timestamp,
+                    uw.symbol,
+                    uw.close AS price,
+                    uw.price_change_5min,
+                    uw.net_volume,
+                    om.net_option_flow,
+                    ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY uw.timestamp DESC) AS rn
+                FROM underlying_window uw
+                LEFT JOIN option_momentum om
+                    ON om.timestamp = uw.timestamp
+                    AND om.symbol = uw.symbol
+                WHERE uw.price_change_5min IS NOT NULL
+                  AND uw.timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
             )
             SELECT
-                time_et,
-                timestamp,
+                bucket_ts AT TIME ZONE 'America/New_York' AS time_et,
+                bucket_ts AS timestamp,
                 symbol,
                 price,
-                price_change_5min,
+                ROUND(price_change_5min::numeric, 2) AS price_change_5min,
                 net_volume,
                 net_option_flow,
-                divergence_signal
-            FROM momentum_divergence_{timeframe_suffix}
-            WHERE symbol = $1
-              AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+                CASE
+                    WHEN price_change_5min > 0 AND net_option_flow < -50000 THEN '🚨 Bearish Divergence (Price Up, Puts Buying)'
+                    WHEN price_change_5min < 0 AND net_option_flow > 50000 THEN '🚨 Bullish Divergence (Price Down, Calls Buying)'
+                    WHEN price_change_5min > 0 AND net_option_flow > 50000 THEN '🟢 Bullish Confirmation'
+                    WHEN price_change_5min < 0 AND net_option_flow < -50000 THEN '🔴 Bearish Confirmation'
+                    WHEN price_change_5min > 0 AND net_volume < 0 THEN '⚠️ Weak Rally (Selling Volume)'
+                    WHEN price_change_5min < 0 AND net_volume > 0 THEN '⚠️ Weak Selloff (Buying Volume)'
+                    ELSE '⚪ Neutral'
+                END AS divergence_signal
+            FROM base
+            WHERE rn = 1
             ORDER BY timestamp DESC
             LIMIT $2
         """
@@ -1463,54 +1514,6 @@ class DatabaseManager:
         try:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch(query, symbol, window_units)
-                return [dict(row) for row in rows]
-        except UndefinedTableError:
-            logger.warning("momentum_divergence interval views missing; falling back to base view bucketing")
-            bucket = _bucket_expr(timeframe)
-            fallback_query = f"""
-                WITH latest AS (
-                    SELECT MAX(timestamp) AS max_ts
-                    FROM momentum_divergence
-                    WHERE symbol = $1
-                ),
-                bounds AS (
-                    SELECT
-                        max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
-                        max_ts AS end_ts
-                    FROM latest
-                ),
-                base AS (
-                    SELECT
-                        time_et,
-                        timestamp,
-                        symbol,
-                        price,
-                        price_change_5min,
-                        net_volume,
-                        net_option_flow,
-                        divergence_signal,
-                        {bucket} + {step_interval} AS bucket_ts,
-                        ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) AS rn
-                    FROM momentum_divergence
-                    WHERE symbol = $1
-                      AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
-                )
-                SELECT
-                    time_et,
-                    bucket_ts AS timestamp,
-                    symbol,
-                    price,
-                    price_change_5min,
-                    net_volume,
-                    net_option_flow,
-                    divergence_signal
-                FROM base
-                WHERE rn = 1
-                ORDER BY timestamp DESC
-                LIMIT $2
-            """
-            async with self.pool.acquire() as conn:
-                rows = await conn.fetch(fallback_query, symbol, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching momentum divergence: {e}")

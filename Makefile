@@ -9,7 +9,7 @@
 export
 
 # PostgreSQL connection string
-PSQL = PGPASSFILE=~/.pgpass psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) -d $(DB_NAME)
+PSQL = PGPASSFILE=~/.pgpass psql "sslmode=require host=$(DB_HOST) port=$(DB_PORT) user=$(DB_USER) dbname=$(DB_NAME)"
 
 # Service names
 INGESTION_SERVICE = zerogex-oa-ingestion
@@ -862,13 +862,14 @@ flow-by-type: ## Puts vs calls flow (all strikes/expirations)
 		SELECT \
 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
 			symbol, \
-			call_volume, \
-			TO_CHAR(call_premium, 'FM999,999,999') as call_premium, \
-			put_volume, \
-			TO_CHAR(put_premium, 'FM999,999,999') as put_premium \
-		FROM flow_by_type_1min \
+			SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END) AS call_volume, \
+			TO_CHAR(SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE 0 END), 'FM999,999,999') as call_premium, \
+			SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END) AS put_volume, \
+			TO_CHAR(SUM(CASE WHEN option_type = 'P' THEN total_premium ELSE 0 END), 'FM999,999,999') as put_premium \
+		FROM flow_cache_by_type_minute \
 		WHERE symbol = '$(FLOW_SYMBOL)' \
 			AND timestamp > NOW() - INTERVAL '1 hour' \
+		GROUP BY timestamp, symbol \
 		ORDER BY timestamp DESC \
 		LIMIT 20;"
 
@@ -880,11 +881,12 @@ flow-by-strike: ## Flow by strike level
 		SELECT \
 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
 			symbol, \
-			total_volume, \
-			total_premium \
-		FROM flow_by_strike_1min \
+			jsonb_object_agg(strike::text, total_volume ORDER BY strike) AS total_volume, \
+			jsonb_object_agg(strike::text, total_premium ORDER BY strike) AS total_premium \
+		FROM flow_cache_by_strike_minute \
 		WHERE symbol = '$(FLOW_SYMBOL)' \
 			AND timestamp > NOW() - INTERVAL '1 hour' \
+		GROUP BY timestamp, symbol \
 		ORDER BY timestamp DESC \
 		LIMIT 15;"
 
@@ -896,11 +898,12 @@ flow-by-expiration: ## Flow by expiration date
 		SELECT \
 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
 			symbol, \
-			total_volume, \
-			total_premium \
-		FROM flow_by_expiration_1min \
+			jsonb_object_agg(expiration::text, total_volume ORDER BY expiration) AS total_volume, \
+			jsonb_object_agg(expiration::text, total_premium ORDER BY expiration) AS total_premium \
+		FROM flow_cache_by_expiration_minute \
 		WHERE symbol = '$(FLOW_SYMBOL)' \
 			AND timestamp > NOW() - INTERVAL '1 hour' \
+		GROUP BY timestamp, symbol \
 		ORDER BY timestamp DESC \
 		LIMIT 20;"
 
@@ -1100,15 +1103,43 @@ divergence: ## Momentum divergence signals
 	@echo "$(BLUE)=== Momentum Divergence Signals (1min, Last Hour) ===$(NC)"
 	@$(PSQL) -c "\
 		SET statement_timeout = '10s'; \
+		WITH option_flow AS ( \
+			SELECT timestamp, symbol, \
+				SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE -total_premium END)::numeric AS net_option_flow \
+			FROM flow_cache_by_type_minute \
+			WHERE symbol = '$(FLOW_SYMBOL)' \
+				AND timestamp > NOW() - INTERVAL '70 minutes' \
+			GROUP BY timestamp, symbol \
+		), base AS ( \
+			SELECT \
+				u.timestamp, \
+				u.symbol, \
+				u.close as price, \
+				u.close - LAG(u.close, 5) OVER (PARTITION BY u.symbol ORDER BY u.timestamp) AS price_change_5min, \
+				(u.up_volume - u.down_volume)::bigint AS net_volume, \
+				of.net_option_flow \
+			FROM underlying_quotes u \
+			LEFT JOIN option_flow of ON of.timestamp = u.timestamp AND of.symbol = u.symbol \
+			WHERE u.symbol = '$(FLOW_SYMBOL)' \
+				AND u.timestamp > NOW() - INTERVAL '70 minutes' \
+		) \
 		SELECT \
-			TO_CHAR(time_et, 'HH24:MI') as time, \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
 			symbol, \
 			ROUND(price, 2) as price, \
 			ROUND(price_change_5min, 2) as chg_5m, \
 			TO_CHAR(net_option_flow, 'FM999,999') as opt_flow, \
-			divergence_signal \
-		FROM momentum_divergence_1min \
-		WHERE divergence_signal != '⚪ Neutral' \
+			CASE \
+				WHEN price_change_5min > 0 AND net_option_flow < -50000 THEN '🚨 Bearish Divergence (Price Up, Puts Buying)' \
+				WHEN price_change_5min < 0 AND net_option_flow > 50000 THEN '🚨 Bullish Divergence (Price Down, Calls Buying)' \
+				WHEN price_change_5min > 0 AND net_option_flow > 50000 THEN '🟢 Bullish Confirmation' \
+				WHEN price_change_5min < 0 AND net_option_flow < -50000 THEN '🔴 Bearish Confirmation' \
+				WHEN price_change_5min > 0 AND net_volume < 0 THEN '⚠️ Weak Rally (Selling Volume)' \
+				WHEN price_change_5min < 0 AND net_volume > 0 THEN '⚠️ Weak Selloff (Buying Volume)' \
+				ELSE '⚪ Neutral' \
+			END AS divergence_signal \
+		FROM base \
+		WHERE price_change_5min IS NOT NULL \
 		ORDER BY timestamp DESC \
 		LIMIT 20;"
 
