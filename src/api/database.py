@@ -4,6 +4,7 @@ Uses asyncpg for async PostgreSQL operations
 """
 
 import asyncpg
+from asyncpg.exceptions import UndefinedTableError
 import os
 from pathlib import Path
 from typing import List, Dict, Optional, Any
@@ -136,6 +137,20 @@ class DatabaseManager:
             logger.error(f"Health check failed: {e}")
             return False
 
+    @staticmethod
+    def _decode_json_field(value: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return value
+        return value
+
+    def _normalize_flow_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        row['total_volume'] = self._decode_json_field(row.get('total_volume'))
+        row['total_premium'] = self._decode_json_field(row.get('total_premium'))
+        return row
+
     async def _refresh_flow_cache(self, conn: asyncpg.Connection, symbol: str) -> None:
         """Refresh flow caches for only the latest minute snapshot for a symbol."""
         latest_ts = await conn.fetchval(
@@ -148,6 +163,44 @@ class DatabaseManager:
         )
         if latest_ts is None:
             return
+
+        # One-time bootstrap for the new expiration cache table so endpoint
+        # can serve historical buckets immediately after deployment.
+        expiration_seeded = await conn.fetchval(
+            """
+            SELECT 1
+            FROM flow_cache_by_expiration_minute
+            WHERE symbol = $1
+            LIMIT 1
+            """,
+            symbol,
+        )
+        if not expiration_seeded:
+            await conn.execute(
+                """
+                INSERT INTO flow_cache_by_expiration_minute (
+                    timestamp,
+                    symbol,
+                    expiration,
+                    total_volume,
+                    total_premium
+                )
+                SELECT
+                    timestamp,
+                    underlying,
+                    expiration,
+                    SUM(volume_delta)::bigint,
+                    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric
+                FROM option_chains_with_deltas
+                WHERE underlying = $1
+                  AND timestamp >= NOW() - INTERVAL '90 minutes'
+                  AND volume_delta > 0
+                GROUP BY timestamp, underlying, expiration
+                ON CONFLICT (timestamp, symbol, expiration)
+                DO NOTHING
+                """,
+                symbol,
+            )
 
         type_exists = await conn.fetchval(
             """
@@ -862,7 +915,48 @@ class DatabaseManager:
             async with self.pool.acquire() as conn:
                 await self._refresh_flow_cache(conn, symbol)
                 rows = await conn.fetch(query, symbol, window_units)
-                return [dict(row) for row in rows]
+                return [self._normalize_flow_payload(dict(row)) for row in rows]
+        except UndefinedTableError:
+            logger.warning("flow_by_type interval views missing; falling back to minute cache bucketing")
+            fallback_bucket = _bucket_expr(timeframe, 'c.timestamp')
+            fallback_query = f"""
+                WITH latest AS (
+                    SELECT MAX(timestamp) AS max_ts
+                    FROM flow_cache_by_type_minute
+                    WHERE symbol = $1
+                ),
+                bounds AS (
+                    SELECT
+                        max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
+                        max_ts AS end_ts
+                    FROM latest
+                ),
+                agg AS (
+                    SELECT
+                        {fallback_bucket} + {step_interval} AS timestamp,
+                        c.symbol,
+                        SUM(CASE WHEN c.option_type = 'P' THEN c.total_volume ELSE 0 END)::bigint AS put_volume,
+                        SUM(CASE WHEN c.option_type = 'C' THEN c.total_volume ELSE 0 END)::bigint AS call_volume,
+                        SUM(CASE WHEN c.option_type = 'P' THEN c.total_premium ELSE 0 END)::numeric AS put_premium,
+                        SUM(CASE WHEN c.option_type = 'C' THEN c.total_premium ELSE 0 END)::numeric AS call_premium
+                    FROM flow_cache_by_type_minute c
+                    WHERE c.symbol = $1
+                      AND c.timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+                    GROUP BY 1,2
+                )
+                SELECT
+                    timestamp,
+                    symbol,
+                    json_build_object('puts', COALESCE(put_volume, 0), 'calls', COALESCE(call_volume, 0)) AS total_volume,
+                    json_build_object('puts', COALESCE(put_premium, 0), 'calls', COALESCE(call_premium, 0)) AS total_premium
+                FROM agg
+                ORDER BY timestamp DESC
+                LIMIT $2
+            """
+            async with self.pool.acquire() as conn:
+                await self._refresh_flow_cache(conn, symbol)
+                rows = await conn.fetch(fallback_query, symbol, window_units)
+                return [self._normalize_flow_payload(dict(row)) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching flow by type: {e}")
             raise
@@ -906,7 +1000,52 @@ class DatabaseManager:
             async with self.pool.acquire() as conn:
                 await self._refresh_flow_cache(conn, symbol)
                 rows = await conn.fetch(query, symbol, window_units, limit)
-                return [dict(row) for row in rows]
+                return [self._normalize_flow_payload(dict(row)) for row in rows]
+        except UndefinedTableError:
+            logger.warning("flow_by_strike interval views missing; falling back to minute cache bucketing")
+            fallback_bucket = _bucket_expr(timeframe, 'c.timestamp')
+            fallback_query = f"""
+                WITH latest AS (
+                    SELECT MAX(timestamp) AS max_ts
+                    FROM flow_cache_by_strike_minute
+                    WHERE symbol = $1
+                ),
+                bounds AS (
+                    SELECT
+                        max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
+                        max_ts AS end_ts
+                    FROM latest
+                ),
+                grouped AS (
+                    SELECT
+                        {fallback_bucket} + {step_interval} AS timestamp,
+                        c.symbol,
+                        c.strike::text AS strike_key,
+                        SUM(c.total_volume)::bigint AS volume_sum,
+                        SUM(c.total_premium)::numeric AS premium_sum
+                    FROM flow_cache_by_strike_minute c
+                    WHERE c.symbol = $1
+                      AND c.timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+                    GROUP BY 1,2,3
+                ),
+                agg AS (
+                    SELECT
+                        timestamp,
+                        symbol,
+                        jsonb_object_agg(strike_key, volume_sum ORDER BY strike_key) AS total_volume,
+                        jsonb_object_agg(strike_key, premium_sum ORDER BY strike_key) AS total_premium
+                    FROM grouped
+                    GROUP BY 1,2
+                )
+                SELECT timestamp, symbol, total_volume, total_premium
+                FROM agg
+                ORDER BY timestamp DESC
+                LIMIT $3
+            """
+            async with self.pool.acquire() as conn:
+                await self._refresh_flow_cache(conn, symbol)
+                rows = await conn.fetch(fallback_query, symbol, window_units, limit)
+                return [self._normalize_flow_payload(dict(row)) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching flow by strike: {e}")
             raise
@@ -950,7 +1089,48 @@ class DatabaseManager:
             async with self.pool.acquire() as conn:
                 await self._refresh_flow_cache(conn, symbol)
                 rows = await conn.fetch(query, symbol, window_units, limit)
-                return [dict(row) for row in rows]
+                return [self._normalize_flow_payload(dict(row)) for row in rows]
+        except UndefinedTableError:
+            logger.warning("flow_by_expiration interval views missing; falling back to minute cache bucketing")
+            fallback_bucket = _bucket_expr(timeframe, 'c.timestamp')
+            fallback_query = f"""
+                WITH latest AS (
+                    SELECT MAX(timestamp) AS max_ts
+                    FROM flow_cache_by_expiration_minute
+                    WHERE symbol = $1
+                ),
+                bounds AS (
+                    SELECT
+                        max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
+                        max_ts AS end_ts
+                    FROM latest
+                ),
+                grouped AS (
+                    SELECT
+                        ({fallback_bucket} + {step_interval}) AS timestamp,
+                        c.symbol,
+                        c.expiration::text AS expiration_key,
+                        SUM(c.total_volume)::bigint AS volume_sum,
+                        SUM(c.total_premium)::numeric AS premium_sum
+                    FROM flow_cache_by_expiration_minute c
+                    WHERE c.symbol = $1
+                      AND c.timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+                    GROUP BY 1,2,3
+                )
+                SELECT
+                    timestamp,
+                    symbol,
+                    jsonb_object_agg(expiration_key, volume_sum ORDER BY expiration_key) AS total_volume,
+                    jsonb_object_agg(expiration_key, premium_sum ORDER BY expiration_key) AS total_premium
+                FROM grouped
+                GROUP BY timestamp, symbol
+                ORDER BY timestamp DESC
+                LIMIT $3
+            """
+            async with self.pool.acquire() as conn:
+                await self._refresh_flow_cache(conn, symbol)
+                rows = await conn.fetch(fallback_query, symbol, window_units, limit)
+                return [self._normalize_flow_payload(dict(row)) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching flow by expiration: {e}")
             raise
@@ -1283,6 +1463,54 @@ class DatabaseManager:
         try:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch(query, symbol, window_units)
+                return [dict(row) for row in rows]
+        except UndefinedTableError:
+            logger.warning("momentum_divergence interval views missing; falling back to base view bucketing")
+            bucket = _bucket_expr(timeframe)
+            fallback_query = f"""
+                WITH latest AS (
+                    SELECT MAX(timestamp) AS max_ts
+                    FROM momentum_divergence
+                    WHERE symbol = $1
+                ),
+                bounds AS (
+                    SELECT
+                        max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
+                        max_ts AS end_ts
+                    FROM latest
+                ),
+                base AS (
+                    SELECT
+                        time_et,
+                        timestamp,
+                        symbol,
+                        price,
+                        price_change_5min,
+                        net_volume,
+                        net_option_flow,
+                        divergence_signal,
+                        {bucket} + {step_interval} AS bucket_ts,
+                        ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) AS rn
+                    FROM momentum_divergence
+                    WHERE symbol = $1
+                      AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+                )
+                SELECT
+                    time_et,
+                    bucket_ts AS timestamp,
+                    symbol,
+                    price,
+                    price_change_5min,
+                    net_volume,
+                    net_option_flow,
+                    divergence_signal
+                FROM base
+                WHERE rn = 1
+                ORDER BY timestamp DESC
+                LIMIT $2
+            """
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(fallback_query, symbol, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching momentum divergence: {e}")

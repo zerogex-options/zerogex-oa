@@ -856,62 +856,52 @@ gex-preview: ## Preview GEX calculation data
 
 .PHONY: flow-by-type
 flow-by-type: ## Puts vs calls flow (all strikes/expirations)
-	@echo "$(BLUE)=== Option Flow by Type (Last Hour) ===$(NC)"
+	@echo "$(BLUE)=== Option Flow by Type (1min buckets, Last Hour) ===$(NC)"
 	@$(PSQL) -c "\
+		SET statement_timeout = '10s'; \
 		SELECT \
-			TO_CHAR(time_et, 'HH24:MI') as time, \
-			underlying, \
-			call_flow, \
-			TO_CHAR(call_notional, 'FM999,999,999') as call_notional, \
-			put_flow, \
-			TO_CHAR(put_notional, 'FM999,999,999') as put_notional, \
-			net_flow, \
-			TO_CHAR(net_notional, 'FM999,999,999') as net_notional, \
-			put_call_ratio as pc_ratio, \
-			put_call_notional_ratio as pc_not_ratio \
-		FROM option_flow_by_type \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
+			symbol, \
+			call_volume, \
+			TO_CHAR(call_premium, 'FM999,999,999') as call_premium, \
+			put_volume, \
+			TO_CHAR(put_premium, 'FM999,999,999') as put_premium \
+		FROM flow_by_type_1min \
+		WHERE symbol = '$(FLOW_SYMBOL)' \
 			AND timestamp > NOW() - INTERVAL '1 hour' \
 		ORDER BY timestamp DESC \
 		LIMIT 20;"
 
 .PHONY: flow-by-strike
 flow-by-strike: ## Flow by strike level
-	@echo "$(BLUE)=== Option Flow by Strike (Last Hour, Top 15) ===$(NC)"
+	@echo "$(BLUE)=== Option Flow by Strike (1min buckets, Last Hour) ===$(NC)"
 	@$(PSQL) -c "\
+		SET statement_timeout = '10s'; \
 		SELECT \
-			TO_CHAR(time_et, 'HH24:MI') as time, \
-			underlying, \
-			strike, \
-			call_flow, \
-			TO_CHAR(call_notional, 'FM999,999') as call_notional, \
-			put_flow, \
-			TO_CHAR(put_notional, 'FM999,999') as put_notional, \
-			TO_CHAR(total_notional, 'FM999,999') as total_notional \
-		FROM option_flow_by_strike \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
+			symbol, \
+			total_volume, \
+			total_premium \
+		FROM flow_by_strike_1min \
+		WHERE symbol = '$(FLOW_SYMBOL)' \
 			AND timestamp > NOW() - INTERVAL '1 hour' \
-		ORDER BY total_notional DESC \
+		ORDER BY timestamp DESC \
 		LIMIT 15;"
 
 .PHONY: flow-by-expiration
 flow-by-expiration: ## Flow by expiration date
-	@echo "$(BLUE)=== Option Flow by Expiration (Last Hour) ===$(NC)"
+	@echo "$(BLUE)=== Option Flow by Expiration (1min buckets, Last Hour) ===$(NC)"
 	@$(PSQL) -c "\
+		SET statement_timeout = '10s'; \
 		SELECT \
-			TO_CHAR(time_et, 'HH24:MI') as time, \
-			underlying, \
-			expiration, \
-			days_to_expiry as dte, \
-			call_flow, \
-			TO_CHAR(call_notional, 'FM999,999') as call_notional, \
-			put_flow, \
-			TO_CHAR(put_notional, 'FM999,999') as put_notional, \
-			TO_CHAR(total_notional, 'FM999,999') as total_notional \
-		FROM option_flow_by_expiration \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
+			symbol, \
+			total_volume, \
+			total_premium \
+		FROM flow_by_expiration_1min \
+		WHERE symbol = '$(FLOW_SYMBOL)' \
 			AND timestamp > NOW() - INTERVAL '1 hour' \
-		ORDER BY timestamp DESC, total_notional DESC \
+		ORDER BY timestamp DESC \
 		LIMIT 20;"
 
 .PHONY: flow-smart-money
@@ -1107,8 +1097,9 @@ volume-spikes: ## Unusual volume detection
 
 .PHONY: divergence
 divergence: ## Momentum divergence signals
-	@echo "$(BLUE)=== Momentum Divergence Signals (Last Hour) ===$(NC)"
+	@echo "$(BLUE)=== Momentum Divergence Signals (1min, Last Hour) ===$(NC)"
 	@$(PSQL) -c "\
+		SET statement_timeout = '10s'; \
 		SELECT \
 			TO_CHAR(time_et, 'HH24:MI') as time, \
 			symbol, \
@@ -1116,7 +1107,7 @@ divergence: ## Momentum divergence signals
 			ROUND(price_change_5min, 2) as chg_5m, \
 			TO_CHAR(net_option_flow, 'FM999,999') as opt_flow, \
 			divergence_signal \
-		FROM momentum_divergence \
+		FROM momentum_divergence_1min \
 		WHERE divergence_signal != '⚪ Neutral' \
 		ORDER BY timestamp DESC \
 		LIMIT 20;"
