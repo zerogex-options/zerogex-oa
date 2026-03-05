@@ -192,7 +192,7 @@ class DatabaseManager:
         if self._flow_cache_schema_checked:
             return
 
-        await conn.execute(
+        statements = [
             """
             CREATE TABLE IF NOT EXISTS flow_cache_by_type_minute (
                 timestamp TIMESTAMPTZ NOT NULL,
@@ -204,8 +204,9 @@ class DatabaseManager:
                 net_delta NUMERIC(18, 2),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (timestamp, symbol, option_type)
-            );
-
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS flow_cache_by_strike_minute (
                 timestamp TIMESTAMPTZ NOT NULL,
                 symbol VARCHAR(10) NOT NULL,
@@ -217,8 +218,9 @@ class DatabaseManager:
                 avg_iv NUMERIC(8, 6),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (timestamp, symbol, strike)
-            );
-
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS flow_cache_smart_money_minute (
                 timestamp TIMESTAMPTZ NOT NULL,
                 symbol VARCHAR(10) NOT NULL,
@@ -233,21 +235,20 @@ class DatabaseManager:
                 unusual_activity_score NUMERIC(6, 3) NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (timestamp, symbol, option_symbol)
-            );
+            )
+            """,
+            "ALTER TABLE flow_cache_by_strike_minute ADD COLUMN IF NOT EXISTS call_volume BIGINT NOT NULL DEFAULT 0",
+            "ALTER TABLE flow_cache_by_strike_minute ADD COLUMN IF NOT EXISTS put_volume BIGINT NOT NULL DEFAULT 0",
+            "ALTER TABLE flow_cache_by_strike_minute ADD COLUMN IF NOT EXISTS call_premium NUMERIC(18, 2) NOT NULL DEFAULT 0",
+            "ALTER TABLE flow_cache_by_strike_minute ADD COLUMN IF NOT EXISTS put_premium NUMERIC(18, 2) NOT NULL DEFAULT 0",
+            "CREATE INDEX IF NOT EXISTS idx_flow_cache_by_type_symbol_ts ON flow_cache_by_type_minute(symbol, timestamp DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_flow_cache_by_strike_symbol_ts ON flow_cache_by_strike_minute(symbol, timestamp DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_flow_cache_smart_money_symbol_ts ON flow_cache_smart_money_minute(symbol, timestamp DESC)",
+        ]
 
-            ALTER TABLE flow_cache_by_strike_minute ADD COLUMN IF NOT EXISTS call_volume BIGINT NOT NULL DEFAULT 0;
-            ALTER TABLE flow_cache_by_strike_minute ADD COLUMN IF NOT EXISTS put_volume BIGINT NOT NULL DEFAULT 0;
-            ALTER TABLE flow_cache_by_strike_minute ADD COLUMN IF NOT EXISTS call_premium NUMERIC(18, 2) NOT NULL DEFAULT 0;
-            ALTER TABLE flow_cache_by_strike_minute ADD COLUMN IF NOT EXISTS put_premium NUMERIC(18, 2) NOT NULL DEFAULT 0;
-            
-            CREATE INDEX IF NOT EXISTS idx_flow_cache_by_type_symbol_ts
-                ON flow_cache_by_type_minute(symbol, timestamp DESC);
-            CREATE INDEX IF NOT EXISTS idx_flow_cache_by_strike_symbol_ts
-                ON flow_cache_by_strike_minute(symbol, timestamp DESC);
-            CREATE INDEX IF NOT EXISTS idx_flow_cache_smart_money_symbol_ts
-                ON flow_cache_smart_money_minute(symbol, timestamp DESC);
-            """
-        )
+        for stmt in statements:
+            await conn.execute(stmt)
+
         self._flow_cache_schema_checked = True
 
     async def _refresh_flow_cache(self, conn: asyncpg.Connection, symbol: str) -> None:
