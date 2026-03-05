@@ -1540,64 +1540,57 @@ api-logs-error: ## View API error logs only
 api-test: ## Test ALL API endpoints
 	@echo "$(BLUE)=== Testing All API Endpoints ===$(NC)"
 	@echo ""
-	@BASE_URL="http://localhost:8000"; \
+	@bash -lc '\
+	BASE_URL="http://localhost:8000"; \
 	SYMBOL="SPY"; \
-	TIMEFRAME="5min"; \
-	test_endpoint() { \
-		label="$$1"; \
+	TIMEFRAMES="1min 5min 15min 1hr 1day"; \
+	RESULT_FILE="/tmp/zerogex_api_test_results.txt"; \
+	: > "$$RESULT_FILE"; \
+	test_json() { \
+		name="$$1"; \
 		url="$$2"; \
-		echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; \
-		echo "$(GREEN)$${label}:$(NC)"; \
-		echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; \
-		curl -s "$$url" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"; \
-		echo ""; \
+		if curl -fsS "$$url" > /tmp/zerogex_api_test.json 2>/dev/null && python -m json.tool /tmp/zerogex_api_test.json >/dev/null 2>&1; then \
+			echo "$(GREEN)✅ $$name$(NC)"; \
+			echo "✅ $$name" >> "$$RESULT_FILE"; \
+		else \
+			echo "$(RED)❌ $$name$(NC)"; \
+			echo "❌ $$name" >> "$$RESULT_FILE"; \
+		fi; \
 	}; \
-	\
-	# Health \
-	test_endpoint "Health Check" "$$BASE_URL/api/health"; \
-	\
-	# GEX \
-	test_endpoint "GEX Summary" "$$BASE_URL/api/gex/summary?symbol=$$SYMBOL"; \
-	test_endpoint "GEX by Strike (Top 10)" "$$BASE_URL/api/gex/by-strike?symbol=$$SYMBOL&limit=10"; \
-	test_endpoint "GEX Historical (Last 10)" "$$BASE_URL/api/gex/historical?symbol=$$SYMBOL&limit=10&timeframe=$$TIMEFRAME"; \
-	test_endpoint "GEX Heatmap" "$$BASE_URL/api/gex/heatmap?symbol=$$SYMBOL&timeframe=$$TIMEFRAME&window_minutes=60&interval_minutes=5"; \
-	\
-	# Max Pain \
-	test_endpoint "Max Pain Timeseries (Last 10)" "$$BASE_URL/api/max-pain/timeseries?symbol=$$SYMBOL&limit=10&timeframe=$$TIMEFRAME"; \
-	test_endpoint "Max Pain Current" "$$BASE_URL/api/max-pain/current?symbol=$$SYMBOL&strike_limit=100"; \
-	\
-	# Flow \
-	test_endpoint "Option Flow by Type" "$$BASE_URL/api/flow/by-type?symbol=$$SYMBOL&window_minutes=60"; \
-	test_endpoint "Option Flow by Strike (Top 10)" "$$BASE_URL/api/flow/by-strike?symbol=$$SYMBOL&window_minutes=60&limit=10"; \
-	test_endpoint "Smart Money Flow" "$$BASE_URL/api/flow/smart-money?symbol=$$SYMBOL&window_minutes=60&limit=10"; \
-	\
-	# Market \
-	test_endpoint "Current Market Quote" "$$BASE_URL/api/market/quote?symbol=$$SYMBOL"; \
-	test_endpoint "Previous Close" "$$BASE_URL/api/market/previous-close?symbol=$$SYMBOL"; \
-	test_endpoint "Historical Quotes (Last 10)" "$$BASE_URL/api/market/historical?symbol=$$SYMBOL&limit=10&timeframe=$$TIMEFRAME"; \
-	\
-	# Trading \
-	test_endpoint "VWAP Deviation" "$$BASE_URL/api/trading/vwap-deviation?symbol=$$SYMBOL&limit=10"; \
-	test_endpoint "Opening Range Breakout" "$$BASE_URL/api/trading/opening-range?symbol=$$SYMBOL&limit=10"; \
-	test_endpoint "Gamma Exposure Levels" "$$BASE_URL/api/trading/gamma-levels?symbol=$$SYMBOL&limit=10"; \
-	test_endpoint "Dealer Hedging Pressure" "$$BASE_URL/api/trading/dealer-hedging?symbol=$$SYMBOL&limit=10"; \
-	test_endpoint "Unusual Volume Spikes" "$$BASE_URL/api/trading/volume-spikes?symbol=$$SYMBOL&limit=10"; \
-	test_endpoint "Momentum Divergence" "$$BASE_URL/api/trading/momentum-divergence?symbol=$$SYMBOL&limit=10"; \
-	\
-	# Docs \
-	test_endpoint "Swagger UI Availability" "$$BASE_URL/docs"; \
-	test_endpoint "ReDoc Availability" "$$BASE_URL/redoc"; \
-	test_endpoint "OpenAPI JSON" "$$BASE_URL/openapi.json"; \
-	\
-	echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; \
-	echo "$(GREEN)✅ All API Endpoints Tested$(NC)"; \
-	echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; \
+	echo "$(YELLOW)Core endpoints$(NC)"; \
+	test_json "/api/health" "$$BASE_URL/api/health"; \
+	test_json "/api/gex/summary" "$$BASE_URL/api/gex/summary?symbol=$$SYMBOL"; \
+	test_json "/api/market/quote" "$$BASE_URL/api/market/quote?symbol=$$SYMBOL"; \
 	echo ""; \
-	echo "$(YELLOW)API Documentation available at:$(NC)"; \
-	echo "  • Swagger UI: $$BASE_URL/docs"; \
-	echo "  • ReDoc:      $$BASE_URL/redoc"; \
-	echo "  • OpenAPI:    $$BASE_URL/openapi.json"; \
-	echo ""
+	echo "$(YELLOW)Interval-aware endpoints$(NC)"; \
+	for tf in $$TIMEFRAMES; do \
+		test_json "/api/gex/historical?timeframe=$$tf" "$$BASE_URL/api/gex/historical?symbol=$$SYMBOL&window_units=10&timeframe=$$tf"; \
+		test_json "/api/market/historical?timeframe=$$tf" "$$BASE_URL/api/market/historical?symbol=$$SYMBOL&window_units=10&timeframe=$$tf"; \
+		test_json "/api/flow/by-type?timeframe=$$tf" "$$BASE_URL/api/flow/by-type?symbol=$$SYMBOL&window_units=10&timeframe=$$tf"; \
+		test_json "/api/flow/by-strike?timeframe=$$tf" "$$BASE_URL/api/flow/by-strike?symbol=$$SYMBOL&window_units=10&timeframe=$$tf&limit=25"; \
+		test_json "/api/flow/by-expiry?timeframe=$$tf" "$$BASE_URL/api/flow/by-expiry?symbol=$$SYMBOL&window_units=10&timeframe=$$tf&limit=25"; \
+		test_json "/api/flow/smart-money?timeframe=$$tf" "$$BASE_URL/api/flow/smart-money?symbol=$$SYMBOL&window_units=10&timeframe=$$tf&limit=10"; \
+		test_json "/api/max-pain/timeseries?timeframe=$$tf" "$$BASE_URL/api/max-pain/timeseries?symbol=$$SYMBOL&window_units=10&timeframe=$$tf"; \
+		test_json "/api/trading/vwap-deviation?timeframe=$$tf" "$$BASE_URL/api/trading/vwap-deviation?symbol=$$SYMBOL&window_units=10&timeframe=$$tf"; \
+		test_json "/api/trading/opening-range?timeframe=$$tf" "$$BASE_URL/api/trading/opening-range?symbol=$$SYMBOL&window_units=10&timeframe=$$tf"; \
+		test_json "/api/trading/momentum-divergence?timeframe=$$tf" "$$BASE_URL/api/trading/momentum-divergence?symbol=$$SYMBOL&window_units=10&timeframe=$$tf"; \
+	done; \
+	echo ""; \
+	echo "$(YELLOW)Other endpoints$(NC)"; \
+	test_json "/api/gex/by-strike" "$$BASE_URL/api/gex/by-strike?symbol=$$SYMBOL&limit=10"; \
+	test_json "/api/gex/heatmap" "$$BASE_URL/api/gex/heatmap?symbol=$$SYMBOL&timeframe=5min&window_units=10"; \
+	test_json "/api/max-pain/current" "$$BASE_URL/api/max-pain/current?symbol=$$SYMBOL&strike_limit=100"; \
+	test_json "/api/market/previous-close" "$$BASE_URL/api/market/previous-close?symbol=$$SYMBOL"; \
+	test_json "/api/trading/gamma-levels" "$$BASE_URL/api/trading/gamma-levels?symbol=$$SYMBOL&limit=10"; \
+	test_json "/api/trading/dealer-hedging" "$$BASE_URL/api/trading/dealer-hedging?symbol=$$SYMBOL&limit=10"; \
+	test_json "/api/trading/volume-spikes" "$$BASE_URL/api/trading/volume-spikes?symbol=$$SYMBOL&limit=10"; \
+	echo ""; \
+	echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; \
+	echo "$(GREEN)API Test Report$(NC)"; \
+	echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; \
+	cat "$$RESULT_FILE"; \
+	echo ""; \
+	'
 
 .PHONY: staging-smoke
 staging-smoke: ## Run post-deploy staging smoke checklist

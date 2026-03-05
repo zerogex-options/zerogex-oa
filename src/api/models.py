@@ -94,6 +94,15 @@ class FlowByStrikeBucket(BaseModel):
     total_premium: Dict[str, Decimal]
 
 
+class FlowByExpiryBucket(BaseModel):
+    time_window_start: datetime
+    time_window_end: datetime
+    timestamp: datetime
+    symbol: str
+    total_volume: Dict[str, int]
+    total_premium: Dict[str, Decimal]
+
+
 class UnderlyingQuote(BaseModel):
     timestamp: datetime
     symbol: str
