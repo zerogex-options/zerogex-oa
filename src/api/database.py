@@ -56,6 +56,34 @@ def _interval_expr(timeframe: str) -> str:
         raise ValueError(f'Unsupported timeframe: {timeframe}')
     return mapping[timeframe]
 
+
+def _flow_by_type_view(timeframe: str) -> str:
+    mapping = {
+        '1min': 'option_flow_by_type_1min',
+        '5min': 'option_flow_by_type_5min',
+        '15min': 'option_flow_by_type_15min',
+        '1hr': 'option_flow_by_type_1hr',
+        '1day': 'option_flow_by_type_1day',
+    }
+    normalized = _normalize_timeframe(timeframe)
+    if normalized not in mapping:
+        raise ValueError(f'Unsupported timeframe: {timeframe}')
+    return mapping[normalized]
+
+
+def _momentum_view(timeframe: str) -> str:
+    mapping = {
+        '1min': 'momentum_divergence_1min',
+        '5min': 'momentum_divergence_5min',
+        '15min': 'momentum_divergence_15min',
+        '1hr': 'momentum_divergence_1hr',
+        '1day': 'momentum_divergence_1day',
+    }
+    normalized = _normalize_timeframe(timeframe)
+    if normalized not in mapping:
+        raise ValueError(f'Unsupported timeframe: {timeframe}')
+    return mapping[normalized]
+
 class DatabaseManager:
     """Manages database connections and queries"""
 
@@ -377,6 +405,93 @@ class DatabaseManager:
                 symbol,
                 latest_ts,
             )
+
+    async def _refresh_momentum_cache(self, conn: asyncpg.Connection, symbol: str) -> None:
+        """Refresh momentum divergence cache for only the latest quote timestamp for a symbol."""
+        latest_ts = await conn.fetchval(
+            """
+            SELECT MAX(timestamp)
+            FROM underlying_quotes
+            WHERE symbol = $1
+            """,
+            symbol,
+        )
+        if latest_ts is None:
+            return
+
+        await conn.execute(
+            """
+            WITH current_quote AS (
+                SELECT
+                    q.timestamp,
+                    q.symbol,
+                    q.close AS price,
+                    q.up_volume - q.down_volume AS net_volume
+                FROM underlying_quotes q
+                WHERE q.symbol = $1
+                  AND q.timestamp = $2
+            ),
+            prior_quote AS (
+                SELECT q.close AS prior_price
+                FROM underlying_quotes q
+                WHERE q.symbol = $1
+                  AND q.timestamp = $2 - INTERVAL '5 minutes'
+                LIMIT 1
+            ),
+            option_flow AS (
+                SELECT
+                    COALESCE(
+                        SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE -total_premium END),
+                        0
+                    )::numeric AS net_option_flow
+                FROM flow_cache_by_type_minute
+                WHERE symbol = $1
+                  AND timestamp = $2
+            )
+            INSERT INTO momentum_divergence_cache_minute (
+                timestamp,
+                symbol,
+                price,
+                price_change_5min,
+                net_volume,
+                net_option_flow,
+                divergence_signal
+            )
+            SELECT
+                c.timestamp,
+                c.symbol,
+                c.price,
+                CASE
+                    WHEN p.prior_price IS NULL THEN NULL
+                    ELSE ROUND((c.price - p.prior_price)::numeric, 2)
+                END AS price_change_5min,
+                c.net_volume,
+                o.net_option_flow,
+                CASE
+                    WHEN p.prior_price IS NULL THEN '⚪ Neutral'
+                    WHEN c.price - p.prior_price > 0 AND o.net_option_flow < -50000 THEN '🚨 Bearish Divergence (Price Up, Puts Buying)'
+                    WHEN c.price - p.prior_price < 0 AND o.net_option_flow > 50000 THEN '🚨 Bullish Divergence (Price Down, Calls Buying)'
+                    WHEN c.price - p.prior_price > 0 AND o.net_option_flow > 50000 THEN '🟢 Bullish Confirmation'
+                    WHEN c.price - p.prior_price < 0 AND o.net_option_flow < -50000 THEN '🔴 Bearish Confirmation'
+                    WHEN c.price - p.prior_price > 0 AND c.net_volume < 0 THEN '⚠️ Weak Rally (Selling Volume)'
+                    WHEN c.price - p.prior_price < 0 AND c.net_volume > 0 THEN '⚠️ Weak Selloff (Buying Volume)'
+                    ELSE '⚪ Neutral'
+                END AS divergence_signal
+            FROM current_quote c
+            LEFT JOIN prior_quote p ON TRUE
+            CROSS JOIN option_flow o
+            ON CONFLICT (timestamp, symbol)
+            DO UPDATE SET
+                price = EXCLUDED.price,
+                price_change_5min = EXCLUDED.price_change_5min,
+                net_volume = EXCLUDED.net_volume,
+                net_option_flow = EXCLUDED.net_option_flow,
+                divergence_signal = EXCLUDED.divergence_signal,
+                updated_at = NOW()
+            """,
+            symbol,
+            latest_ts,
+        )
 
     async def _refresh_max_pain_snapshot(self, conn: asyncpg.Connection, symbol: str, strike_limit: int) -> None:
         """Refresh daily max pain OI snapshot for the symbol if latest chain timestamp changed."""
@@ -752,12 +867,12 @@ class DatabaseManager:
     ) -> List[Dict[str, Any]]:
         """Get option flow by type (calls vs puts) across interval buckets in the selected window."""
         window_units = max(1, min(window_units, 90))
+        view_name = _flow_by_type_view(timeframe)
         step_interval = _interval_expr(timeframe)
-        bucket = _bucket_expr(timeframe, 'c.timestamp')
         query = f"""
             WITH latest AS (
                 SELECT MAX(timestamp) AS max_ts
-                FROM flow_cache_by_type_minute
+                FROM {view_name}
                 WHERE symbol = $1
             ),
             bounds AS (
@@ -766,44 +881,35 @@ class DatabaseManager:
                     max_ts AS time_window_end
                 FROM latest
             ),
-            bucketed AS (
+            base AS (
                 SELECT
-                    {bucket} AS interval_timestamp,
-                    c.option_type,
-                    SUM(c.total_volume)::bigint AS total_volume,
-                    SUM(c.total_premium)::numeric AS total_premium,
-                    AVG(c.avg_iv)::numeric AS avg_iv,
-                    SUM(c.net_delta)::numeric AS net_delta
-                FROM flow_cache_by_type_minute c
+                    timestamp,
+                    symbol,
+                    option_type,
+                    total_volume,
+                    total_premium,
+                    avg_iv,
+                    net_delta,
+                    sentiment
+                FROM {view_name} c
                 CROSS JOIN bounds b
                 WHERE c.symbol = $1
                   AND c.timestamp BETWEEN b.time_window_start AND b.time_window_end
-                GROUP BY {bucket}, c.option_type
             )
             SELECT
                 b.time_window_start,
                 b.time_window_end,
-                t.interval_timestamp,
-                $1::varchar AS symbol,
-                CASE WHEN t.option_type = 'C' THEN 'CALL' ELSE 'PUT' END AS option_type,
+                t.timestamp AS interval_timestamp,
+                t.symbol,
+                t.option_type,
                 t.total_volume,
                 t.total_premium,
                 t.avg_iv,
                 t.net_delta,
-                CASE
-                    WHEN t.option_type = 'C' AND t.total_premium > COALESCE((
-                        SELECT t2.total_premium FROM bucketed t2
-                        WHERE t2.interval_timestamp = t.interval_timestamp AND t2.option_type = 'P'
-                    ), 0) THEN 'bullish'
-                    WHEN t.option_type = 'P' AND t.total_premium > COALESCE((
-                        SELECT t2.total_premium FROM bucketed t2
-                        WHERE t2.interval_timestamp = t.interval_timestamp AND t2.option_type = 'C'
-                    ), 0) THEN 'bearish'
-                    ELSE 'neutral'
-                END AS sentiment
-            FROM bucketed t
+                t.sentiment
+            FROM base t
             CROSS JOIN bounds b
-            ORDER BY t.interval_timestamp DESC, option_type
+            ORDER BY t.timestamp DESC, option_type
         """
 
         try:
@@ -1172,12 +1278,12 @@ class DatabaseManager:
     ) -> List[Dict[str, Any]]:
         """Get momentum divergence signals by interval/window."""
         window_units = max(1, min(window_units, 90))
+        view_name = _momentum_view(timeframe)
         step_interval = _interval_expr(timeframe)
-        bucket = _bucket_expr(timeframe)
         query = f"""
             WITH latest AS (
                 SELECT MAX(timestamp) AS max_ts
-                FROM momentum_divergence
+                FROM {view_name}
                 WHERE symbol = $1
             ),
             bounds AS (
@@ -1185,40 +1291,27 @@ class DatabaseManager:
                     max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
                     max_ts AS end_ts
                 FROM latest
-            ),
-            base AS (
-                SELECT
-                    time_et,
-                    timestamp,
-                    symbol,
-                    price,
-                    price_change_5min,
-                    net_volume,
-                    net_option_flow,
-                    divergence_signal,
-                    {bucket} AS bucket_ts,
-                    ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) AS rn
-                FROM momentum_divergence
-                WHERE symbol = $1
-                  AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
             )
             SELECT
                 time_et,
-                bucket_ts AS timestamp,
+                timestamp,
                 symbol,
                 price,
                 price_change_5min,
                 net_volume,
                 net_option_flow,
                 divergence_signal
-            FROM base
-            WHERE rn = 1
+            FROM {view_name}
+            WHERE symbol = $1
+              AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
             ORDER BY timestamp DESC
             LIMIT $2
         """
 
         try:
             async with self.pool.acquire() as conn:
+                await self._refresh_flow_cache(conn, symbol)
+                await self._refresh_momentum_cache(conn, symbol)
                 rows = await conn.fetch(query, symbol, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
@@ -1549,4 +1642,3 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error fetching GEX heatmap: {e}")
             raise
-

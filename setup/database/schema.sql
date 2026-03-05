@@ -451,6 +451,11 @@ COMMENT ON VIEW option_chains_with_deltas IS
 
 -- Drop existing views first (required when adding new columns)
 DROP VIEW IF EXISTS option_flow_by_type CASCADE;
+DROP VIEW IF EXISTS option_flow_by_type_1min CASCADE;
+DROP VIEW IF EXISTS option_flow_by_type_5min CASCADE;
+DROP VIEW IF EXISTS option_flow_by_type_15min CASCADE;
+DROP VIEW IF EXISTS option_flow_by_type_1hr CASCADE;
+DROP VIEW IF EXISTS option_flow_by_type_1day CASCADE;
 DROP VIEW IF EXISTS option_flow_by_strike CASCADE;
 DROP VIEW IF EXISTS option_flow_by_expiration CASCADE;
 DROP VIEW IF EXISTS option_flow_smart_money CASCADE;
@@ -462,46 +467,92 @@ DROP VIEW IF EXISTS underlying_buying_pressure;
 -- Shows aggregate puts vs calls flow across all strikes and expirations
 -- Use case: Overall market sentiment, put/call ratio tracking
 
-CREATE VIEW option_flow_by_type AS
+CREATE VIEW option_flow_by_type_1min AS
+SELECT
+    c.timestamp AT TIME ZONE 'America/New_York' as time_et,
+    c.timestamp,
+    c.symbol,
+    CASE WHEN c.option_type = 'C' THEN 'CALL' ELSE 'PUT' END AS option_type,
+    c.total_volume,
+    c.total_premium,
+    c.avg_iv,
+    c.net_delta,
+    CASE
+        WHEN c.option_type = 'C' AND c.total_premium > COALESCE((
+            SELECT p.total_premium
+            FROM flow_cache_by_type_minute p
+            WHERE p.symbol = c.symbol
+              AND p.timestamp = c.timestamp
+              AND p.option_type = 'P'
+        ), 0) THEN 'bullish'
+        WHEN c.option_type = 'P' AND c.total_premium > COALESCE((
+            SELECT p.total_premium
+            FROM flow_cache_by_type_minute p
+            WHERE p.symbol = c.symbol
+              AND p.timestamp = c.timestamp
+              AND p.option_type = 'C'
+        ), 0) THEN 'bearish'
+        ELSE 'neutral'
+    END AS sentiment
+FROM flow_cache_by_type_minute c;
+
+CREATE VIEW option_flow_by_type_5min AS
 SELECT
     timestamp AT TIME ZONE 'America/New_York' as time_et,
     timestamp,
-    underlying,
-    -- Call flow
-    SUM(volume_delta) FILTER (WHERE option_type = 'C' AND volume_delta > 0) as call_flow,
-    SUM(volume_delta * last * 100) FILTER (WHERE option_type = 'C' AND volume_delta > 0) as call_notional,
-    COUNT(DISTINCT option_symbol) FILTER (WHERE option_type = 'C' AND volume_delta > 0) as call_contracts,
-    -- Put flow
-    SUM(volume_delta) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as put_flow,
-    SUM(volume_delta * last * 100) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as put_notional,
-    COUNT(DISTINCT option_symbol) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as put_contracts,
-    -- Net flow (calls - puts)
-    SUM(volume_delta) FILTER (WHERE option_type = 'C' AND volume_delta > 0) -
-    SUM(volume_delta) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as net_flow,
-    SUM(volume_delta * last * 100) FILTER (WHERE option_type = 'C' AND volume_delta > 0) -
-    SUM(volume_delta * last * 100) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as net_notional,
-    -- Put/Call ratios
-    ROUND(
-        SUM(volume_delta) FILTER (WHERE option_type = 'P' AND volume_delta > 0)::numeric /
-        NULLIF(SUM(volume_delta) FILTER (WHERE option_type = 'C' AND volume_delta > 0), 0),
-        3
-    ) as put_call_ratio,
-    ROUND(
-        SUM(volume_delta * last * 100) FILTER (WHERE option_type = 'P' AND volume_delta > 0)::numeric /
-        NULLIF(SUM(volume_delta * last * 100) FILTER (WHERE option_type = 'C' AND volume_delta > 0), 0),
-        3
-    ) as put_call_notional_ratio,
-    -- Total flow
-    SUM(volume_delta) FILTER (WHERE volume_delta > 0) as total_flow,
-    SUM(volume_delta * last * 100) FILTER (WHERE volume_delta > 0) as total_notional,
-    COUNT(DISTINCT option_symbol) FILTER (WHERE volume_delta > 0) as total_contracts
-FROM option_chains_with_deltas
-WHERE volume_delta > 0  -- Only actual trades
-GROUP BY timestamp, underlying
-ORDER BY timestamp DESC;
+    symbol,
+    option_type,
+    total_volume,
+    total_premium,
+    avg_iv,
+    net_delta,
+    sentiment
+FROM option_flow_by_type_1min;
+
+CREATE VIEW option_flow_by_type_15min AS
+SELECT
+    timestamp AT TIME ZONE 'America/New_York' as time_et,
+    timestamp,
+    symbol,
+    option_type,
+    total_volume,
+    total_premium,
+    avg_iv,
+    net_delta,
+    sentiment
+FROM option_flow_by_type_1min;
+
+CREATE VIEW option_flow_by_type_1hr AS
+SELECT
+    timestamp AT TIME ZONE 'America/New_York' as time_et,
+    timestamp,
+    symbol,
+    option_type,
+    total_volume,
+    total_premium,
+    avg_iv,
+    net_delta,
+    sentiment
+FROM option_flow_by_type_1min;
+
+CREATE VIEW option_flow_by_type_1day AS
+SELECT
+    timestamp AT TIME ZONE 'America/New_York' as time_et,
+    timestamp,
+    symbol,
+    option_type,
+    total_volume,
+    total_premium,
+    avg_iv,
+    net_delta,
+    sentiment
+FROM option_flow_by_type_1min;
+
+CREATE VIEW option_flow_by_type AS
+SELECT * FROM option_flow_by_type_1min;
 
 COMMENT ON VIEW option_flow_by_type IS
-'Real-time puts vs calls flow with notional values aggregated across all strikes and expirations. Zero lag.';
+'Cached minute option flow by type. Interval-specific views (1min/5min/15min/1hr/1day) are selected by the API.';
 
 
 -- =============================================================================
@@ -772,6 +823,11 @@ DROP VIEW IF EXISTS gamma_exposure_levels CASCADE;
 DROP VIEW IF EXISTS dealer_hedging_pressure CASCADE;
 DROP VIEW IF EXISTS unusual_volume_spikes CASCADE;
 DROP VIEW IF EXISTS momentum_divergence CASCADE;
+DROP VIEW IF EXISTS momentum_divergence_1min CASCADE;
+DROP VIEW IF EXISTS momentum_divergence_5min CASCADE;
+DROP VIEW IF EXISTS momentum_divergence_15min CASCADE;
+DROP VIEW IF EXISTS momentum_divergence_1hr CASCADE;
+DROP VIEW IF EXISTS momentum_divergence_1day CASCADE;
 
 -- =============================================================================
 -- View 6: VWAP Deviation
@@ -1157,56 +1213,76 @@ COMMENT ON VIEW unusual_volume_spikes IS
 -- Compares price action to option flow to find divergences
 -- Use case: Divergences between price and option flow often precede reversals
 
-CREATE VIEW momentum_divergence AS
-WITH underlying_momentum AS (
-    SELECT
-        timestamp,
-        symbol,
-        close,
-        close - LAG(close, 5) OVER (PARTITION BY symbol ORDER BY timestamp) as price_change_5min,
-        up_volume - down_volume as net_volume
-    FROM underlying_quotes
-    WHERE timestamp >= NOW() - INTERVAL '1 hour'
-),
-option_momentum AS (
-    SELECT
-        timestamp,
-        underlying,
-        SUM(volume_delta * last * 100) FILTER (WHERE option_type = 'C' AND volume_delta > 0) -
-        SUM(volume_delta * last * 100) FILTER (WHERE option_type = 'P' AND volume_delta > 0) as net_option_flow
-    FROM option_chains_with_deltas
-    WHERE timestamp >= NOW() - INTERVAL '1 hour'
-      AND volume_delta > 0
-    GROUP BY timestamp, underlying
-)
+CREATE VIEW momentum_divergence_1min AS
 SELECT
-    um.timestamp,
-    um.timestamp AT TIME ZONE 'America/New_York' as time_et,
-    um.symbol,
-    um.close as price,
-    ROUND(um.price_change_5min, 2) as price_change_5min,
-    um.net_volume,
-    om.net_option_flow,
-    -- Detect divergences
-    CASE
-        WHEN um.price_change_5min > 0 AND om.net_option_flow < -50000 THEN '🚨 Bearish Divergence (Price Up, Puts Buying)'
-        WHEN um.price_change_5min < 0 AND om.net_option_flow > 50000 THEN '🚨 Bullish Divergence (Price Down, Calls Buying)'
-        WHEN um.price_change_5min > 0 AND om.net_option_flow > 50000 THEN '🟢 Bullish Confirmation'
-        WHEN um.price_change_5min < 0 AND om.net_option_flow < -50000 THEN '🔴 Bearish Confirmation'
-        WHEN um.price_change_5min > 0 AND um.net_volume < 0 THEN '⚠️ Weak Rally (Selling Volume)'
-        WHEN um.price_change_5min < 0 AND um.net_volume > 0 THEN '⚠️ Weak Selloff (Buying Volume)'
-        ELSE '⚪ Neutral'
-    END as divergence_signal
-FROM underlying_momentum um
-LEFT JOIN option_momentum om
-    ON um.timestamp = om.timestamp
-    AND um.symbol = om.underlying
-WHERE um.price_change_5min IS NOT NULL
-  AND DATE(um.timestamp AT TIME ZONE 'America/New_York') = CURRENT_DATE
-ORDER BY um.timestamp DESC;
+    timestamp,
+    timestamp AT TIME ZONE 'America/New_York' as time_et,
+    symbol,
+    price,
+    price_change_5min,
+    net_volume,
+    net_option_flow,
+    divergence_signal
+FROM momentum_divergence_cache_minute
+WHERE DATE(timestamp AT TIME ZONE 'America/New_York') = CURRENT_DATE;
+
+CREATE VIEW momentum_divergence_5min AS
+SELECT
+    timestamp,
+    timestamp AT TIME ZONE 'America/New_York' as time_et,
+    symbol,
+    price,
+    price_change_5min,
+    net_volume,
+    net_option_flow,
+    divergence_signal
+FROM momentum_divergence_cache_minute
+WHERE DATE(timestamp AT TIME ZONE 'America/New_York') = CURRENT_DATE;
+
+CREATE VIEW momentum_divergence_15min AS
+SELECT
+    timestamp,
+    timestamp AT TIME ZONE 'America/New_York' as time_et,
+    symbol,
+    price,
+    price_change_5min,
+    net_volume,
+    net_option_flow,
+    divergence_signal
+FROM momentum_divergence_cache_minute
+WHERE DATE(timestamp AT TIME ZONE 'America/New_York') = CURRENT_DATE;
+
+CREATE VIEW momentum_divergence_1hr AS
+SELECT
+    timestamp,
+    timestamp AT TIME ZONE 'America/New_York' as time_et,
+    symbol,
+    price,
+    price_change_5min,
+    net_volume,
+    net_option_flow,
+    divergence_signal
+FROM momentum_divergence_cache_minute
+WHERE DATE(timestamp AT TIME ZONE 'America/New_York') = CURRENT_DATE;
+
+CREATE VIEW momentum_divergence_1day AS
+SELECT
+    timestamp,
+    timestamp AT TIME ZONE 'America/New_York' as time_et,
+    symbol,
+    price,
+    price_change_5min,
+    net_volume,
+    net_option_flow,
+    divergence_signal
+FROM momentum_divergence_cache_minute
+WHERE DATE(timestamp AT TIME ZONE 'America/New_York') = CURRENT_DATE;
+
+CREATE VIEW momentum_divergence AS
+SELECT * FROM momentum_divergence_1min;
 
 COMMENT ON VIEW momentum_divergence IS
-'Divergences between price action and option flow. Divergences often precede reversals.';
+'Cached momentum divergence from incremental minute cache. Interval-specific views (1min/5min/15min/1hr/1day) are selected by the API.';
 
 
 -- =============================================================================
@@ -1372,6 +1448,18 @@ CREATE TABLE IF NOT EXISTS flow_cache_smart_money_minute (
     PRIMARY KEY (timestamp, symbol, option_symbol)
 );
 
+CREATE TABLE IF NOT EXISTS momentum_divergence_cache_minute (
+    timestamp TIMESTAMPTZ NOT NULL,
+    symbol VARCHAR(10) NOT NULL,
+    price NUMERIC(12, 4) NOT NULL,
+    price_change_5min NUMERIC(12, 4),
+    net_volume BIGINT,
+    net_option_flow NUMERIC(18, 2),
+    divergence_signal TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (timestamp, symbol)
+);
+
 CREATE INDEX IF NOT EXISTS idx_flow_cache_by_type_symbol_ts
     ON flow_cache_by_type_minute(symbol, timestamp DESC);
 
@@ -1380,6 +1468,9 @@ CREATE INDEX IF NOT EXISTS idx_flow_cache_by_strike_symbol_ts
 
 CREATE INDEX IF NOT EXISTS idx_flow_cache_smart_money_symbol_ts
     ON flow_cache_smart_money_minute(symbol, timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS idx_momentum_divergence_cache_symbol_ts
+    ON momentum_divergence_cache_minute(symbol, timestamp DESC);
 
 
 -- =============================================================================
@@ -1409,7 +1500,8 @@ WHERE schemaname = 'public'
         'max_pain_oi_snapshot_expiration',
         'flow_cache_by_type_minute',
         'flow_cache_by_strike_minute',
-        'flow_cache_smart_money_minute'
+        'flow_cache_smart_money_minute',
+        'momentum_divergence_cache_minute'
     )
 ORDER BY tablename;
 
@@ -1425,6 +1517,11 @@ WHERE schemaname = 'public'
         'underlying_quotes_with_deltas',
         'option_chains_with_deltas',
         'option_flow_by_type',
+        'option_flow_by_type_1min',
+        'option_flow_by_type_5min',
+        'option_flow_by_type_15min',
+        'option_flow_by_type_1hr',
+        'option_flow_by_type_1day',
         'option_flow_by_strike', 
         'option_flow_by_expiration',
         'option_flow_smart_money',
@@ -1434,7 +1531,12 @@ WHERE schemaname = 'public'
         'gamma_exposure_levels',
         'dealer_hedging_pressure',
         'unusual_volume_spikes',
-        'momentum_divergence'
+        'momentum_divergence',
+        'momentum_divergence_1min',
+        'momentum_divergence_5min',
+        'momentum_divergence_15min',
+        'momentum_divergence_1hr',
+        'momentum_divergence_1day'
     )
 ORDER BY viewname;
 
