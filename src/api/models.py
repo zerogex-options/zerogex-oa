@@ -89,7 +89,6 @@ class FlowByStrikeBucket(BaseModel):
     time_window_end: datetime
     timestamp: datetime
     symbol: str
-    strike: Decimal
     total_volume: Dict[str, int]
     total_premium: Dict[str, Decimal]
 

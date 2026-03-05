@@ -1134,15 +1134,17 @@ class DatabaseManager:
         window_units: int = 60,
         limit: int = 10
     ) -> List[Dict[str, Any]]:
-        """Get unusual activity / smart money flow across interval buckets in the selected window."""
+        """Get unusual activity / smart money flow across timeframe buckets."""
         window_units = max(1, min(window_units, 90))
+        limit = max(1, min(limit, 50))
         step_interval = _interval_expr(timeframe)
-        bucket = _bucket_expr(timeframe, 'c.timestamp')
+        bucket = _bucket_end_expr(timeframe, 'c.timestamp')
         query = f"""
             WITH latest AS (
                 SELECT MAX(timestamp) AS max_ts
-                FROM flow_cache_smart_money_minute
-                WHERE symbol = $1
+                FROM option_chains_with_deltas
+                WHERE underlying = $1
+                  AND volume_delta > 0
             ),
             bounds AS (
                 SELECT
@@ -1153,18 +1155,23 @@ class DatabaseManager:
             ranked AS (
                 SELECT
                     {bucket} AS interval_timestamp,
-                    c.symbol,
+                    c.underlying AS symbol,
                     c.option_type,
                     c.strike,
-                    SUM(c.total_volume)::bigint AS total_volume,
-                    SUM(c.total_premium)::numeric AS total_premium,
-                    AVG(c.avg_iv)::numeric AS avg_iv,
-                    MAX(c.unusual_activity_score)::numeric AS unusual_activity_score
-                FROM flow_cache_smart_money_minute c
+                    SUM(c.volume_delta)::bigint AS total_volume,
+                    SUM(c.volume_delta * COALESCE(c.last, 0) * 100)::numeric AS total_premium,
+                    AVG(c.implied_volatility)::numeric AS avg_iv,
+                    LEAST(10, GREATEST(0,
+                        CASE WHEN SUM(c.volume_delta) >= 500 THEN 4 WHEN SUM(c.volume_delta) >= 200 THEN 3 WHEN SUM(c.volume_delta) >= 100 THEN 2 WHEN SUM(c.volume_delta) >= 50 THEN 1 ELSE 0 END +
+                        CASE WHEN SUM(c.volume_delta * COALESCE(c.last, 0) * 100) >= 500000 THEN 4 WHEN SUM(c.volume_delta * COALESCE(c.last, 0) * 100) >= 250000 THEN 3 WHEN SUM(c.volume_delta * COALESCE(c.last, 0) * 100) >= 100000 THEN 2 WHEN SUM(c.volume_delta * COALESCE(c.last, 0) * 100) >= 50000 THEN 1 ELSE 0 END +
+                        CASE WHEN AVG(c.implied_volatility) > 1.0 THEN 2 WHEN AVG(c.implied_volatility) > 0.6 THEN 1 ELSE 0 END
+                    ))::numeric AS unusual_activity_score
+                FROM option_chains_with_deltas c
                 CROSS JOIN bounds b
-                WHERE c.symbol = $1
+                WHERE c.underlying = $1
+                  AND c.volume_delta > 0
                   AND c.timestamp BETWEEN b.time_window_start AND b.time_window_end
-                GROUP BY {bucket}, c.symbol, c.option_type, c.strike
+                GROUP BY {bucket}, c.underlying, c.option_type, c.strike
             )
             SELECT
                 b.time_window_start,
@@ -1185,7 +1192,6 @@ class DatabaseManager:
 
         try:
             async with self.pool.acquire() as conn:
-                await self._refresh_flow_cache(conn, symbol)
                 rows = await conn.fetch(query, symbol, window_units, limit)
                 return [dict(row) for row in rows]
         except Exception as e:

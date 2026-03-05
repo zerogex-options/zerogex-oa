@@ -1538,7 +1538,7 @@ api-logs-error: ## View API error logs only
 
 .PHONY: api-test
 api-test: ## Test ALL API endpoints
-	@echo "$(BLUE)=== Testing All API Endpoints ===$(NC)"
+	@echo "=== Testing All API Endpoints ==="
 	@echo ""
 	@bash -lc '\
 	BASE_URL="http://localhost:8000"; \
@@ -1550,19 +1550,19 @@ api-test: ## Test ALL API endpoints
 		name="$$1"; \
 		url="$$2"; \
 		if curl -fsS "$$url" > /tmp/zerogex_api_test.json 2>/dev/null && python -m json.tool /tmp/zerogex_api_test.json >/dev/null 2>&1; then \
-			echo "$(GREEN)✅ $$name$(NC)"; \
+			echo "✅ $$name"; \
 			echo "✅ $$name" >> "$$RESULT_FILE"; \
 		else \
-			echo "$(RED)❌ $$name$(NC)"; \
+			echo "❌ $$name"; \
 			echo "❌ $$name" >> "$$RESULT_FILE"; \
 		fi; \
 	}; \
-	echo "$(YELLOW)Core endpoints$(NC)"; \
+	echo "Core endpoints"; \
 	test_json "/api/health" "$$BASE_URL/api/health"; \
 	test_json "/api/gex/summary" "$$BASE_URL/api/gex/summary?symbol=$$SYMBOL"; \
 	test_json "/api/market/quote" "$$BASE_URL/api/market/quote?symbol=$$SYMBOL"; \
 	echo ""; \
-	echo "$(YELLOW)Interval-aware endpoints$(NC)"; \
+	echo "Interval-aware endpoints"; \
 	for tf in $$TIMEFRAMES; do \
 		test_json "/api/gex/historical?timeframe=$$tf" "$$BASE_URL/api/gex/historical?symbol=$$SYMBOL&window_units=10&timeframe=$$tf"; \
 		test_json "/api/market/historical?timeframe=$$tf" "$$BASE_URL/api/market/historical?symbol=$$SYMBOL&window_units=10&timeframe=$$tf"; \
@@ -1576,7 +1576,7 @@ api-test: ## Test ALL API endpoints
 		test_json "/api/trading/momentum-divergence?timeframe=$$tf" "$$BASE_URL/api/trading/momentum-divergence?symbol=$$SYMBOL&window_units=10&timeframe=$$tf"; \
 	done; \
 	echo ""; \
-	echo "$(YELLOW)Other endpoints$(NC)"; \
+	echo "Other endpoints"; \
 	test_json "/api/gex/by-strike" "$$BASE_URL/api/gex/by-strike?symbol=$$SYMBOL&limit=10"; \
 	test_json "/api/gex/heatmap" "$$BASE_URL/api/gex/heatmap?symbol=$$SYMBOL&timeframe=5min&window_units=10"; \
 	test_json "/api/max-pain/current" "$$BASE_URL/api/max-pain/current?symbol=$$SYMBOL&strike_limit=100"; \
@@ -1585,9 +1585,9 @@ api-test: ## Test ALL API endpoints
 	test_json "/api/trading/dealer-hedging" "$$BASE_URL/api/trading/dealer-hedging?symbol=$$SYMBOL&limit=10"; \
 	test_json "/api/trading/volume-spikes" "$$BASE_URL/api/trading/volume-spikes?symbol=$$SYMBOL&limit=10"; \
 	echo ""; \
-	echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; \
-	echo "$(GREEN)API Test Report$(NC)"; \
-	echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; \
+	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
+	echo "API Test Report"; \
+	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
 	cat "$$RESULT_FILE"; \
 	echo ""; \
 	'

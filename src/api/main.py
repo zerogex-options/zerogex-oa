@@ -206,9 +206,6 @@ async def get_flow_by_type(
     """Get option flow by type (calls vs puts)"""
     try:
         data = await db_manager.get_flow_by_type(symbol, timeframe, window_units)
-        if not data:
-            raise HTTPException(status_code=404, detail="No flow data available")
-
         return [FlowByTypeBucket(**row) for row in data]
     except HTTPException:
         raise
@@ -226,9 +223,6 @@ async def get_flow_by_strike(
     """Get option flow by strike level"""
     try:
         data = await db_manager.get_flow_by_strike(symbol, timeframe, window_units, limit)
-        if not data:
-            raise HTTPException(status_code=404, detail="No flow data available")
-
         return [FlowByStrikeBucket(**row) for row in data]
     except HTTPException:
         raise
@@ -247,9 +241,6 @@ async def get_flow_by_expiry(
     """Get option flow by expiry bucket map."""
     try:
         data = await db_manager.get_flow_by_expiry(symbol, timeframe, window_units, limit)
-        if not data:
-            raise HTTPException(status_code=404, detail="No flow data available")
-
         return [FlowByExpiryBucket(**row) for row in data]
     except HTTPException:
         raise
@@ -267,9 +258,6 @@ async def get_smart_money_flow(
     """Get unusual activity / smart money flow"""
     try:
         data = await db_manager.get_smart_money_flow(symbol, timeframe, window_units, limit)
-        if not data:
-            raise HTTPException(status_code=404, detail="No unusual activity detected")
-
         return [OptionFlow(**row) for row in data]
     except HTTPException:
         raise
