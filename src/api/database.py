@@ -124,6 +124,7 @@ class DatabaseManager:
 
     def __init__(self):
         self.pool: Optional[asyncpg.Pool] = None
+        self._flow_cache_schema_checked = False
         self._load_credentials()
 
     def _load_credentials(self):
@@ -185,8 +186,73 @@ class DatabaseManager:
             logger.error(f"Health check failed: {e}")
             return False
 
+
+    async def _ensure_flow_cache_schema(self, conn: asyncpg.Connection) -> None:
+        """Best-effort runtime schema compatibility for flow cache tables."""
+        if self._flow_cache_schema_checked:
+            return
+
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS flow_cache_by_type_minute (
+                timestamp TIMESTAMPTZ NOT NULL,
+                symbol VARCHAR(10) NOT NULL,
+                option_type CHAR(1) NOT NULL,
+                total_volume BIGINT NOT NULL,
+                total_premium NUMERIC(18, 2) NOT NULL,
+                avg_iv NUMERIC(8, 6),
+                net_delta NUMERIC(18, 2),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (timestamp, symbol, option_type)
+            );
+
+            CREATE TABLE IF NOT EXISTS flow_cache_by_strike_minute (
+                timestamp TIMESTAMPTZ NOT NULL,
+                symbol VARCHAR(10) NOT NULL,
+                strike NUMERIC(12, 4) NOT NULL,
+                call_volume BIGINT NOT NULL DEFAULT 0,
+                put_volume BIGINT NOT NULL DEFAULT 0,
+                call_premium NUMERIC(18, 2) NOT NULL DEFAULT 0,
+                put_premium NUMERIC(18, 2) NOT NULL DEFAULT 0,
+                avg_iv NUMERIC(8, 6),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (timestamp, symbol, strike)
+            );
+
+            CREATE TABLE IF NOT EXISTS flow_cache_smart_money_minute (
+                timestamp TIMESTAMPTZ NOT NULL,
+                symbol VARCHAR(10) NOT NULL,
+                option_symbol VARCHAR(50) NOT NULL,
+                strike NUMERIC(12, 4) NOT NULL,
+                expiration DATE NOT NULL,
+                option_type CHAR(1) NOT NULL,
+                total_volume BIGINT NOT NULL,
+                total_premium NUMERIC(18, 2) NOT NULL,
+                avg_iv NUMERIC(8, 6),
+                avg_delta NUMERIC(8, 6),
+                unusual_activity_score NUMERIC(6, 3) NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (timestamp, symbol, option_symbol)
+            );
+
+            ALTER TABLE flow_cache_by_strike_minute ADD COLUMN IF NOT EXISTS call_volume BIGINT NOT NULL DEFAULT 0;
+            ALTER TABLE flow_cache_by_strike_minute ADD COLUMN IF NOT EXISTS put_volume BIGINT NOT NULL DEFAULT 0;
+            ALTER TABLE flow_cache_by_strike_minute ADD COLUMN IF NOT EXISTS call_premium NUMERIC(18, 2) NOT NULL DEFAULT 0;
+            ALTER TABLE flow_cache_by_strike_minute ADD COLUMN IF NOT EXISTS put_premium NUMERIC(18, 2) NOT NULL DEFAULT 0;
+            
+            CREATE INDEX IF NOT EXISTS idx_flow_cache_by_type_symbol_ts
+                ON flow_cache_by_type_minute(symbol, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_flow_cache_by_strike_symbol_ts
+                ON flow_cache_by_strike_minute(symbol, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_flow_cache_smart_money_symbol_ts
+                ON flow_cache_smart_money_minute(symbol, timestamp DESC);
+            """
+        )
+        self._flow_cache_schema_checked = True
+
     async def _refresh_flow_cache(self, conn: asyncpg.Connection, symbol: str) -> None:
         """Refresh flow caches for only the latest minute snapshot for a symbol."""
+        await self._ensure_flow_cache_schema(conn)
         latest_ts = await conn.fetchval(
             """
             SELECT MAX(timestamp)
