@@ -393,6 +393,7 @@ DROP MATERIALIZED VIEW IF EXISTS option_chains_with_deltas CASCADE;
 
 -- Drop the refresh function (no longer needed)
 DROP FUNCTION IF EXISTS refresh_delta_views();
+DROP FUNCTION IF EXISTS refresh_all_materialized_views();
 
 -- Create regular views for real-time deltas
 CREATE OR REPLACE VIEW underlying_quotes_with_deltas AS

@@ -153,6 +153,7 @@ help: ## Show this help message
 	@echo "  make vacuum             - Vacuum analyze all tables"
 	@echo "  make size               - Show table sizes"
 	@echo "  make refresh-views      - Refresh materialized views"
+	@echo "  make db-prune-legacy    - Drop obsolete legacy refresh/materialized-view artifacts"
 	@echo ""
 	@echo "$(GREEN)Interactive:$(NC)"
 	@echo "  make psql               - Open PostgreSQL shell"
@@ -971,15 +972,20 @@ flow-live: ## Combined real-time flow dashboard
 	@echo "$(GREEN)2. PUTS VS CALLS FLOW (Last 10 Minutes)$(NC)"
 	@echo "--------------------------------------------------------------------------------"
 	@$(PSQL) -c "\
+		SET statement_timeout = '10s'; \
 		SELECT \
-			TO_CHAR(time_et, 'HH24:MI') as time, \
-			call_flow as calls, \
-			put_flow as puts, \
-			net_flow as net, \
-			put_call_ratio as pc_ratio \
-		FROM option_flow_by_type \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
+			SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END) as calls, \
+			SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END) as puts, \
+			SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE -total_volume END) as net, \
+			ROUND( \
+				SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END)::numeric \
+				/ NULLIF(SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END), 0), 2 \
+			) as pc_ratio \
+		FROM flow_cache_by_type_minute \
+		WHERE symbol = '$(FLOW_SYMBOL)' \
 			AND timestamp > NOW() - INTERVAL '30 minutes' \
+		GROUP BY timestamp \
 		ORDER BY timestamp DESC \
 		LIMIT 10;"
 	@echo ""
@@ -1002,15 +1008,18 @@ flow-live: ## Combined real-time flow dashboard
 	@echo "$(GREEN)4. TOP STRIKES BY FLOW (Top 10)$(NC)"
 	@echo "--------------------------------------------------------------------------------"
 	@$(PSQL) -c "\
+		SET statement_timeout = '10s'; \
+		WITH strike_window AS ( \
+			SELECT strike, SUM(total_volume)::bigint AS total_flow \
+			FROM flow_cache_by_strike_minute \
+			WHERE symbol = '$(FLOW_SYMBOL)' \
+				AND timestamp > NOW() - INTERVAL '30 minutes' \
+			GROUP BY strike \
+		) \
 		SELECT \
 			strike, \
-			call_flow as calls, \
-			put_flow as puts, \
-			net_flow as net, \
 			total_flow as total \
-		FROM option_flow_by_strike \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
-			AND timestamp > NOW() - INTERVAL '30 minutes' \
+		FROM strike_window \
 		ORDER BY total_flow DESC \
 		LIMIT 10;"
 	@echo ""
@@ -1203,13 +1212,49 @@ day-trading: ## Combined day trading dashboard
 	@echo "$(GREEN)5. DIVERGENCE SIGNALS$(NC)"
 	@echo "--------------------------------------------------------------------------------"
 	@$(PSQL) -c "\
+		SET statement_timeout = '10s'; \
+		WITH option_flow AS ( \
+			SELECT timestamp, symbol, \
+				SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE -total_premium END)::numeric AS net_option_flow \
+			FROM flow_cache_by_type_minute \
+			WHERE symbol = '$(FLOW_SYMBOL)' \
+				AND timestamp > NOW() - INTERVAL '70 minutes' \
+			GROUP BY timestamp, symbol \
+		), base AS ( \
+			SELECT \
+				u.timestamp, \
+				u.close as price, \
+				u.close - LAG(u.close, 5) OVER (PARTITION BY u.symbol ORDER BY u.timestamp) AS price_change_5min, \
+				(u.up_volume - u.down_volume)::bigint AS net_volume, \
+				of.net_option_flow \
+			FROM underlying_quotes u \
+			LEFT JOIN option_flow of ON of.timestamp = u.timestamp AND of.symbol = u.symbol \
+			WHERE u.symbol = '$(FLOW_SYMBOL)' \
+				AND u.timestamp > NOW() - INTERVAL '70 minutes' \
+		) \
 		SELECT \
-			TO_CHAR(time_et, 'HH24:MI') as time, \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
 			ROUND(price, 2) as price, \
 			ROUND(price_change_5min, 2) as chg_5m, \
-			divergence_signal \
-		FROM momentum_divergence \
-		WHERE divergence_signal != '⚪ Neutral' \
+			CASE \
+				WHEN price_change_5min > 0 AND net_option_flow < -50000 THEN '🚨 Bearish Divergence (Price Up, Puts Buying)' \
+				WHEN price_change_5min < 0 AND net_option_flow > 50000 THEN '🚨 Bullish Divergence (Price Down, Calls Buying)' \
+				WHEN price_change_5min > 0 AND net_option_flow > 50000 THEN '🟢 Bullish Confirmation' \
+				WHEN price_change_5min < 0 AND net_option_flow < -50000 THEN '🔴 Bearish Confirmation' \
+				WHEN price_change_5min > 0 AND net_volume < 0 THEN '⚠️ Weak Rally (Selling Volume)' \
+				WHEN price_change_5min < 0 AND net_volume > 0 THEN '⚠️ Weak Selloff (Buying Volume)' \
+				ELSE '⚪ Neutral' \
+			END AS divergence_signal \
+		FROM base \
+		WHERE price_change_5min IS NOT NULL \
+			AND ( \
+				(price_change_5min > 0 AND net_option_flow < -50000) OR \
+				(price_change_5min < 0 AND net_option_flow > 50000) OR \
+				(price_change_5min > 0 AND net_option_flow > 50000) OR \
+				(price_change_5min < 0 AND net_option_flow < -50000) OR \
+				(price_change_5min > 0 AND net_volume < 0) OR \
+				(price_change_5min < 0 AND net_volume > 0) \
+			) \
 		ORDER BY timestamp DESC \
 		LIMIT 10;"
 	@echo ""
@@ -1387,6 +1432,16 @@ size: ## Show table sizes
 		WHERE schemaname = 'public' \
 		AND tablename IN ('underlying_quotes', 'option_chains', 'symbols', 'gex_summary', 'gex_by_strike') \
 		ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;"
+
+.PHONY: db-prune-legacy
+db-prune-legacy: ## Drop obsolete legacy refresh/materialized-view artifacts
+	@echo "$(BLUE)=== Pruning legacy materialized-view refresh artifacts ===$(NC)"
+	@$(PSQL) -c "\
+		DROP FUNCTION IF EXISTS refresh_all_materialized_views(); \
+		DROP FUNCTION IF EXISTS refresh_delta_views(); \
+		DROP MATERIALIZED VIEW IF EXISTS underlying_quotes_with_deltas CASCADE; \
+		DROP MATERIALIZED VIEW IF EXISTS option_chains_with_deltas CASCADE; \
+		SELECT 'legacy artifacts pruned' as status;"
 
 # =============================================================================
 # Interactive
