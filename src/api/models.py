@@ -125,6 +125,77 @@ class FlowMapBucketResponse(BaseModel):
         }
 
 
+class FlowByTypePoint(BaseModel):
+    timestamp: datetime
+    symbol: str
+    call_volume: int
+    call_premium: Decimal
+    put_volume: int
+    put_premium: Decimal
+    net_volume: int
+    net_premium: Decimal
+    flow_bias: str
+
+
+class FlowByStrikePoint(BaseModel):
+    timestamp: datetime
+    symbol: str
+    strike: Decimal
+    volume: int
+    premium: Decimal
+    net_volume: int
+    net_premium: Decimal
+    flow_bias: str
+
+
+class FlowByExpirationPoint(BaseModel):
+    timestamp: datetime
+    symbol: str
+    expiration: date
+    dte: int
+    volume: int
+    premium: Decimal
+    net_volume: int
+    net_premium: Decimal
+    flow_bias: str
+
+
+class SmartMoneyFlowPoint(BaseModel):
+    timestamp: datetime
+    symbol: str
+    contract: str
+    strike: Decimal
+    expiration: date
+    dte: int
+    option_type: str
+    flow: int
+    notional: Decimal
+    delta: Optional[Decimal] = None
+    score: Optional[Decimal] = None
+    notional_class: str
+    size_class: str
+
+
+class MomentumDivergencePoint(BaseModel):
+    timestamp: datetime
+    symbol: str
+    price: Decimal
+    chg_5m: Decimal
+    opt_flow: Decimal
+    divergence_signal: str
+
+
+class FlowBuyingPressurePoint(BaseModel):
+    timestamp: datetime
+    symbol: str
+    price: Decimal
+    volume: int
+    buy_pct: Decimal
+    period_buy_pct: Decimal
+    price_chg: Optional[Decimal] = None
+    momentum: str
+
+
 class PreviousClose(BaseModel):
     symbol: str
     previous_close: Decimal
