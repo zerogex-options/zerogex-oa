@@ -22,6 +22,7 @@ from .models import (
     FlowByExpirationPoint,
     SmartMoneyFlowPoint,
     MomentumDivergencePoint,
+    FlowBuyingPressurePoint,
     UnderlyingQuote,
     PreviousClose,
     HealthStatus,
@@ -276,6 +277,24 @@ async def get_smart_money_flow(
         raise
     except Exception as e:
         logger.error(f"Error fetching smart money flow: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/flow/buying-pressure", response_model=List[FlowBuyingPressurePoint])
+async def get_flow_buying_pressure(
+    symbol: str = Query(default="SPY"),
+    limit: int = Query(default=20, ge=1, le=500)
+):
+    """Get underlying buying/selling pressure"""
+    try:
+        data = await db_manager.get_flow_buying_pressure(symbol, limit)
+        if not data:
+            raise HTTPException(status_code=404, detail="No buying pressure data available")
+
+        return [FlowBuyingPressurePoint(**row) for row in data]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching buying pressure: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 # ============================================================================

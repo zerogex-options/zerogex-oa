@@ -185,6 +185,17 @@ class MomentumDivergencePoint(BaseModel):
     divergence_signal: str
 
 
+class FlowBuyingPressurePoint(BaseModel):
+    timestamp: datetime
+    symbol: str
+    price: Decimal
+    volume: int
+    buy_pct: Decimal
+    period_buy_pct: Decimal
+    price_chg: Optional[Decimal] = None
+    momentum: str
+
+
 class PreviousClose(BaseModel):
     symbol: str
     previous_close: Decimal

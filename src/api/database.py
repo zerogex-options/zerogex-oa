@@ -1059,6 +1059,85 @@ class DatabaseManager:
             logger.error(f"Error fetching smart money flow: {e}")
             raise
 
+    async def get_flow_buying_pressure(
+        self,
+        symbol: str = 'SPY',
+        limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """Get underlying buying/selling pressure matching Makefile flow-buying-pressure."""
+        query = """
+            WITH quote_deltas AS (
+                SELECT
+                    timestamp,
+                    symbol,
+                    close,
+                    up_volume,
+                    down_volume,
+                    COALESCE(
+                        GREATEST(
+                            up_volume - LAG(up_volume) OVER (
+                                PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+                                ORDER BY timestamp
+                            ),
+                            0
+                        ),
+                        0
+                    ) AS up_volume_delta,
+                    COALESCE(
+                        GREATEST(
+                            down_volume - LAG(down_volume) OVER (
+                                PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+                                ORDER BY timestamp
+                            ),
+                            0
+                        ),
+                        0
+                    ) AS down_volume_delta
+                FROM underlying_quotes
+                WHERE symbol = $1
+            )
+            SELECT
+                timestamp,
+                symbol,
+                ROUND(close, 2) AS price,
+                (up_volume_delta + down_volume_delta)::bigint AS volume,
+                ROUND(
+                    CASE
+                        WHEN (up_volume + down_volume) > 0
+                        THEN up_volume::numeric / (up_volume + down_volume) * 100
+                        ELSE 50
+                    END,
+                    2
+                ) AS buy_pct,
+                ROUND(
+                    CASE
+                        WHEN (up_volume_delta + down_volume_delta) > 0
+                        THEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) * 100
+                        ELSE 50
+                    END,
+                    2
+                ) AS period_buy_pct,
+                ROUND(close - LAG(close) OVER (PARTITION BY symbol ORDER BY timestamp), 2) AS price_chg,
+                CASE
+                    WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) > 0.7 THEN '🟢 Strong Buying'
+                    WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) > 0.55 THEN '✅ Buying'
+                    WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) >= 0.45 THEN '⚪ Neutral'
+                    WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) >= 0.3 THEN '❌ Selling'
+                    ELSE '🔴 Strong Selling'
+                END AS momentum
+            FROM quote_deltas
+            ORDER BY timestamp DESC
+            LIMIT $2
+        """
+
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(query, symbol, limit)
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error fetching buying pressure: {e}")
+            raise
+
     async def get_vwap_deviation(
         self,
         symbol: str = 'SPY',
