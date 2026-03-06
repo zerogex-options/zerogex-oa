@@ -902,11 +902,18 @@ class DatabaseManager:
             SELECT
                 timestamp,
                 symbol,
-                json_build_object('puts', COALESCE(put_volume, 0), 'calls', COALESCE(call_volume, 0)) AS total_volume,
-                json_build_object('puts', COALESCE(put_premium, 0), 'calls', COALESCE(call_premium, 0)) AS total_premium
+                json_build_object(
+                    'puts', COALESCE(SUM(volume) FILTER (WHERE option_type = 'P'), 0),
+                    'calls', COALESCE(SUM(volume) FILTER (WHERE option_type = 'C'), 0)
+                ) AS total_volume,
+                json_build_object(
+                    'puts', COALESCE(SUM(premium) FILTER (WHERE option_type = 'P'), 0),
+                    'calls', COALESCE(SUM(premium) FILTER (WHERE option_type = 'C'), 0)
+                ) AS total_premium
             FROM flow_by_type_{timeframe_suffix}
             WHERE symbol = $1
               AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+            GROUP BY timestamp, symbol
             ORDER BY timestamp DESC
             LIMIT $2
         """
@@ -987,11 +994,12 @@ class DatabaseManager:
             SELECT
                 timestamp,
                 symbol,
-                total_volume,
-                total_premium
+                jsonb_object_agg(strike::text, volume ORDER BY strike) AS total_volume,
+                jsonb_object_agg(strike::text, premium ORDER BY strike) AS total_premium
             FROM flow_by_strike_{timeframe_suffix}
             WHERE symbol = $1
               AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+            GROUP BY timestamp, symbol
             ORDER BY timestamp DESC
             LIMIT $3
         """
@@ -1076,11 +1084,12 @@ class DatabaseManager:
             SELECT
                 timestamp,
                 symbol,
-                total_volume,
-                total_premium
+                jsonb_object_agg(expiration::text, volume ORDER BY expiration) AS total_volume,
+                jsonb_object_agg(expiration::text, premium ORDER BY expiration) AS total_premium
             FROM flow_by_expiration_{timeframe_suffix}
             WHERE symbol = $1
               AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+            GROUP BY timestamp, symbol
             ORDER BY timestamp DESC
             LIMIT $3
         """

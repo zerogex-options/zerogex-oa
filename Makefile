@@ -865,82 +865,45 @@ flow-by-type: ## Puts vs calls flow (all strikes/expirations)
 		SELECT \
 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
 			symbol, \
-			put_volume, \
-			TO_CHAR(put_premium, 'FM999,999,999') as put_premium, \
-			call_volume, \
-			TO_CHAR(call_premium, 'FM999,999,999') as call_premium \
+			option_type as type, \
+			volume, \
+			TO_CHAR(premium, 'FM999,999,999') as premium \
 		FROM flow_by_type_$(FLOW_INTERVAL) \
 		WHERE symbol = '$(FLOW_SYMBOL)' \
-		ORDER BY timestamp DESC \
+		ORDER BY timestamp DESC, option_type \
 		LIMIT 20;"
 
 .PHONY: flow-by-strike
 flow-by-strike: ## Flow by strike level
 	@echo "$(BLUE)=== Option Flow by Strike ($(FLOW_INTERVAL), Most Recent 20 Rows) ===$(NC)"
-	@COUNT=$$($(PSQL) -tAc "SELECT COUNT(*) FROM flow_by_strike_$(FLOW_INTERVAL) WHERE symbol = '$(FLOW_SYMBOL)';"); \
-	if [ "$$COUNT" -gt 0 ]; then \
-		$(PSQL) -c "\
-			SET statement_timeout = '10s'; \
-			SELECT \
-				TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
-				symbol, \
-				total_volume, \
-				total_premium \
-			FROM flow_by_strike_$(FLOW_INTERVAL) \
-			WHERE symbol = '$(FLOW_SYMBOL)' \
-			ORDER BY timestamp DESC \
-			LIMIT 20;"; \
-	else \
-		echo "$(YELLOW)No rows in flow_by_strike_$(FLOW_INTERVAL); falling back to option_flow_by_strike view.$(NC)"; \
-		$(PSQL) -c "\
-			SET statement_timeout = '10s'; \
-			SELECT \
-				TO_CHAR(time_et, 'HH24:MI') as time, \
-				underlying as symbol, \
-				strike, \
-				COALESCE(call_flow, 0) as call_volume, \
-				TO_CHAR(COALESCE(call_notional, 0), 'FM999,999,999') as call_premium, \
-				COALESCE(put_flow, 0) as put_volume, \
-				TO_CHAR(COALESCE(put_notional, 0), 'FM999,999,999') as put_premium \
-			FROM option_flow_by_strike \
-			WHERE underlying = '$(FLOW_SYMBOL)' \
-			ORDER BY timestamp DESC, strike \
-			LIMIT 20;"; \
-	fi
+	@$(PSQL) -c "\
+		SET statement_timeout = '10s'; \
+		SELECT \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
+			symbol, \
+			strike, \
+			volume, \
+			TO_CHAR(premium, 'FM999,999,999') as premium \
+		FROM flow_by_strike_$(FLOW_INTERVAL) \
+		WHERE symbol = '$(FLOW_SYMBOL)' \
+		ORDER BY timestamp DESC, strike \
+		LIMIT 20;"
 
 .PHONY: flow-by-expiration
 flow-by-expiration: ## Flow by expiration date
 	@echo "$(BLUE)=== Option Flow by Expiration ($(FLOW_INTERVAL), Most Recent 20 Rows) ===$(NC)"
-	@COUNT=$$($(PSQL) -tAc "SELECT COUNT(*) FROM flow_by_expiration_$(FLOW_INTERVAL) WHERE symbol = '$(FLOW_SYMBOL)';"); \
-	if [ "$$COUNT" -gt 0 ]; then \
-		$(PSQL) -c "\
-			SET statement_timeout = '10s'; \
-			SELECT \
-				TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
-				symbol, \
-				total_volume, \
-				total_premium \
-			FROM flow_by_expiration_$(FLOW_INTERVAL) \
-			WHERE symbol = '$(FLOW_SYMBOL)' \
-			ORDER BY timestamp DESC \
-			LIMIT 20;"; \
-	else \
-		echo "$(YELLOW)No rows in flow_by_expiration_$(FLOW_INTERVAL); falling back to option_flow_by_expiration view.$(NC)"; \
-		$(PSQL) -c "\
-			SET statement_timeout = '10s'; \
-			SELECT \
-				TO_CHAR(time_et, 'HH24:MI') as time, \
-				underlying as symbol, \
-				expiration, \
-				COALESCE(call_flow, 0) as call_volume, \
-				TO_CHAR(COALESCE(call_notional, 0), 'FM999,999,999') as call_premium, \
-				COALESCE(put_flow, 0) as put_volume, \
-				TO_CHAR(COALESCE(put_notional, 0), 'FM999,999,999') as put_premium \
-			FROM option_flow_by_expiration \
-			WHERE underlying = '$(FLOW_SYMBOL)' \
-			ORDER BY timestamp DESC, expiration \
-			LIMIT 20;"; \
-	fi
+	@$(PSQL) -c "\
+		SET statement_timeout = '10s'; \
+		SELECT \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
+			symbol, \
+			expiration, \
+			volume, \
+			TO_CHAR(premium, 'FM999,999,999') as premium \
+		FROM flow_by_expiration_$(FLOW_INTERVAL) \
+		WHERE symbol = '$(FLOW_SYMBOL)' \
+		ORDER BY timestamp DESC, expiration \
+		LIMIT 20;"
 
 .PHONY: flow-smart-money
 flow-smart-money: ## Unusual activity detection
