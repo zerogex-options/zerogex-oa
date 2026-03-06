@@ -17,9 +17,11 @@ from .database import DatabaseManager
 from .models import (
     GEXSummary,
     GEXByStrike,
-    OptionFlow,
-    FlowBucketResponse,
-    FlowMapBucketResponse,
+    FlowByTypePoint,
+    FlowByStrikePoint,
+    FlowByExpirationPoint,
+    SmartMoneyFlowPoint,
+    MomentumDivergencePoint,
     UnderlyingQuote,
     PreviousClose,
     HealthStatus,
@@ -196,11 +198,11 @@ async def get_gex_heatmap(
 # Options Flow Endpoints
 # ============================================================================
 
-@app.get("/api/flow/by-type", response_model=List[FlowBucketResponse])
+@app.get("/api/flow/by-type", response_model=List[FlowByTypePoint])
 async def get_flow_by_type(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
-    window_units: int = Query(default=60, ge=1, le=90)
+    window_units: int = Query(default=20, ge=1, le=90)
 ):
     """Get option flow by type (calls vs puts)"""
     try:
@@ -208,19 +210,19 @@ async def get_flow_by_type(
         if not data:
             raise HTTPException(status_code=404, detail="No flow data available")
 
-        return [FlowBucketResponse(**row) for row in data]
+        return [FlowByTypePoint(**row) for row in data]
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error fetching flow by type: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/flow/by-strike", response_model=List[FlowMapBucketResponse])
+@app.get("/api/flow/by-strike", response_model=List[FlowByStrikePoint])
 async def get_flow_by_strike(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
-    window_units: int = Query(default=60, ge=1, le=90),
-    limit: int = Query(default=1000, ge=1, le=50000)
+    window_units: int = Query(default=20, ge=1, le=90),
+    limit: int = Query(default=20, ge=1, le=50000)
 ):
     """Get option flow by strike level"""
     try:
@@ -228,7 +230,7 @@ async def get_flow_by_strike(
         if not data:
             raise HTTPException(status_code=404, detail="No flow data available")
 
-        return [FlowMapBucketResponse(**row) for row in data]
+        return [FlowByStrikePoint(**row) for row in data]
     except HTTPException:
         raise
     except Exception as e:
@@ -236,12 +238,12 @@ async def get_flow_by_strike(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@app.get("/api/flow/by-expiration", response_model=List[FlowMapBucketResponse])
+@app.get("/api/flow/by-expiration", response_model=List[FlowByExpirationPoint])
 async def get_flow_by_expiration(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
-    window_units: int = Query(default=60, ge=1, le=90),
-    limit: int = Query(default=5000, ge=1, le=50000)
+    window_units: int = Query(default=20, ge=1, le=90),
+    limit: int = Query(default=20, ge=1, le=50000)
 ):
     """Get option flow by expiration date"""
     try:
@@ -249,19 +251,19 @@ async def get_flow_by_expiration(
         if not data:
             raise HTTPException(status_code=404, detail="No flow data available")
 
-        return [FlowMapBucketResponse(**row) for row in data]
+        return [FlowByExpirationPoint(**row) for row in data]
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error fetching flow by expiration: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/flow/smart-money", response_model=List[OptionFlow])
+@app.get("/api/flow/smart-money", response_model=List[SmartMoneyFlowPoint])
 async def get_smart_money_flow(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
-    window_units: int = Query(default=60, ge=1, le=90),
-    limit: int = Query(default=10, le=50)
+    window_units: int = Query(default=20, ge=1, le=90),
+    limit: int = Query(default=20, le=100)
 ):
     """Get unusual activity / smart money flow"""
     try:
@@ -269,7 +271,7 @@ async def get_smart_money_flow(
         if not data:
             raise HTTPException(status_code=404, detail="No unusual activity detected")
 
-        return [OptionFlow(**row) for row in data]
+        return [SmartMoneyFlowPoint(**row) for row in data]
     except HTTPException:
         raise
     except Exception as e:
@@ -465,7 +467,7 @@ async def get_volume_spikes(
         logger.error(f"Error fetching volume spikes: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/trading/momentum-divergence")
+@app.get("/api/trading/momentum-divergence", response_model=List[MomentumDivergencePoint])
 async def get_momentum_divergence(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
@@ -476,7 +478,7 @@ async def get_momentum_divergence(
         data = await db_manager.get_momentum_divergence(symbol, timeframe, window_units)
         if not data:
             raise HTTPException(status_code=404, detail="No divergence data available")
-        return data
+        return [MomentumDivergencePoint(**row) for row in data]
     except HTTPException:
         raise
     except Exception as e:
