@@ -20,6 +20,7 @@ VENV_PYTHON = venv/bin/python
 
 # Flow query symbol filter (override with: make flow-by-type FLOW_SYMBOL=QQQ)
 FLOW_SYMBOL ?= SPY
+FLOW_INTERVAL ?= 1min
 
 # Colors for output
 BLUE = \033[0;34m
@@ -121,6 +122,7 @@ help: ## Show this help message
 	@echo "  make flow-by-type         - Puts vs calls flow (all strikes/expirations)"
 	@echo "  make flow-by-strike       - Flow by strike level"
 	@echo "  make flow-by-expiration   - Flow by expiration date"
+	@echo "    (set FLOW_INTERVAL=1min|5min|15min|1hr|1day)"
 	@echo "  make flow-smart-money     - Unusual activity detection"
 	@echo "  make flow-buying-pressure - Underlying buying/selling pressure"
 	@echo "  make flow-live            - Combined real-time flow dashboard"
@@ -857,61 +859,115 @@ gex-preview: ## Preview GEX calculation data
 
 .PHONY: flow-by-type
 flow-by-type: ## Puts vs calls flow (all strikes/expirations)
-	@echo "$(BLUE)=== Option Flow by Type (1min buckets, Last Hour) ===$(NC)"
+	@echo "$(BLUE)=== Option Flow by Type ($(FLOW_INTERVAL), Most Recent 20 Rows) ===$(NC)"
 	@$(PSQL) -c "\
 		SET statement_timeout = '10s'; \
 		SELECT \
 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
 			symbol, \
-			SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END) AS call_volume, \
-			TO_CHAR(SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE 0 END), 'FM999,999,999') as call_premium, \
-			SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END) AS put_volume, \
-			TO_CHAR(SUM(CASE WHEN option_type = 'P' THEN total_premium ELSE 0 END), 'FM999,999,999') as put_premium \
-		FROM flow_cache_by_type_minute \
+			option_type as type, \
+			volume, \
+			TO_CHAR(premium, 'FM999,999,999') as premium \
+		FROM flow_by_type_$(FLOW_INTERVAL) \
 		WHERE symbol = '$(FLOW_SYMBOL)' \
-			AND timestamp > NOW() - INTERVAL '1 hour' \
-		GROUP BY timestamp, symbol \
-		ORDER BY timestamp DESC \
+		ORDER BY timestamp DESC, option_type \
 		LIMIT 20;"
 
 .PHONY: flow-by-strike
 flow-by-strike: ## Flow by strike level
-	@echo "$(BLUE)=== Option Flow by Strike (1min buckets, Last Hour) ===$(NC)"
+	@echo "$(BLUE)=== Option Flow by Strike ($(FLOW_INTERVAL), Most Recent 20 Rows) ===$(NC)"
 	@$(PSQL) -c "\
 		SET statement_timeout = '10s'; \
 		SELECT \
 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
 			symbol, \
-			jsonb_object_agg(strike::text, total_volume ORDER BY strike) AS total_volume, \
-			jsonb_object_agg(strike::text, total_premium ORDER BY strike) AS total_premium \
-		FROM flow_cache_by_strike_minute \
+			strike, \
+			volume, \
+			TO_CHAR(premium, 'FM999,999,999') as premium \
+		FROM flow_by_strike_$(FLOW_INTERVAL) \
 		WHERE symbol = '$(FLOW_SYMBOL)' \
-			AND timestamp > NOW() - INTERVAL '1 hour' \
-		GROUP BY timestamp, symbol \
-		ORDER BY timestamp DESC \
-		LIMIT 15;"
+		ORDER BY timestamp DESC, strike \
+		LIMIT 20;"
 
 .PHONY: flow-by-expiration
 flow-by-expiration: ## Flow by expiration date
-	@echo "$(BLUE)=== Option Flow by Expiration (1min buckets, Last Hour) ===$(NC)"
+	@echo "$(BLUE)=== Option Flow by Expiration ($(FLOW_INTERVAL), Most Recent 20 Rows) ===$(NC)"
 	@$(PSQL) -c "\
 		SET statement_timeout = '10s'; \
 		SELECT \
 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
 			symbol, \
-			jsonb_object_agg(expiration::text, total_volume ORDER BY expiration) AS total_volume, \
-			jsonb_object_agg(expiration::text, total_premium ORDER BY expiration) AS total_premium \
-		FROM flow_cache_by_expiration_minute \
+			expiration, \
+			volume, \
+			TO_CHAR(premium, 'FM999,999,999') as premium \
+		FROM flow_by_expiration_$(FLOW_INTERVAL) \
 		WHERE symbol = '$(FLOW_SYMBOL)' \
-			AND timestamp > NOW() - INTERVAL '1 hour' \
-		GROUP BY timestamp, symbol \
-		ORDER BY timestamp DESC \
+		ORDER BY timestamp DESC, expiration \
 		LIMIT 20;"
 
 .PHONY: flow-smart-money
 flow-smart-money: ## Unusual activity detection
-	@echo "$(BLUE)=== Smart Money Flow / Unusual Activity (Last Hour) ===$(NC)"
+	@echo "$(BLUE)=== Smart Money Flow / Unusual Activity (Most Recent 20 Rows) ===$(NC)"
 	@$(PSQL) -c "\
+		WITH latest AS ( \
+			SELECT MAX(timestamp) as max_ts \
+			FROM option_chains \
+			WHERE underlying = '$(FLOW_SYMBOL)' \
+		), option_chain_deltas AS ( \
+			SELECT \
+				timestamp, option_symbol, underlying, strike, expiration, option_type, last, implied_volatility, delta, \
+				COALESCE( \
+					GREATEST( \
+						volume - LAG(volume) OVER ( \
+							PARTITION BY option_symbol, DATE(timestamp AT TIME ZONE 'America/New_York') \
+							ORDER BY timestamp \
+						), \
+						0 \
+					), \
+					0 \
+				) AS volume_delta \
+			FROM option_chains, latest \
+			WHERE underlying = '$(FLOW_SYMBOL)' \
+				AND latest.max_ts IS NOT NULL \
+				AND timestamp >= latest.max_ts - INTERVAL '120 minutes' \
+		), scored AS ( \
+			SELECT \
+				timestamp AT TIME ZONE 'America/New_York' as time_et, \
+				timestamp, option_symbol, strike, expiration, \
+				(expiration - CURRENT_DATE) as days_to_expiry, \
+				option_type, \
+				volume_delta as flow, \
+				(volume_delta * last * 100) as notional, \
+				last as price, \
+				CASE \
+					WHEN volume_delta * last * 100 >= 500000 THEN '💰 $$500K+' \
+					WHEN volume_delta * last * 100 >= 250000 THEN '💵 $$250K+' \
+					WHEN volume_delta * last * 100 >= 100000 THEN '💸 $$100K+' \
+					WHEN volume_delta * last * 100 >= 50000 THEN '💳 $$50K+' \
+					ELSE '💴 <$$50K' \
+				END as notional_class, \
+				CASE \
+					WHEN volume_delta >= 500 THEN '🔥 Massive Block' \
+					WHEN volume_delta >= 200 THEN '📦 Large Block' \
+					WHEN volume_delta >= 100 THEN '📊 Medium Block' \
+					ELSE '💼 Standard' \
+				END as size_class, \
+				LEAST(10, GREATEST(0, \
+					CASE WHEN volume_delta >= 500 THEN 3 WHEN volume_delta >= 200 THEN 2 WHEN volume_delta >= 100 THEN 1 ELSE 0 END + \
+					CASE WHEN volume_delta * last * 100 >= 500000 THEN 3 WHEN volume_delta * last * 100 >= 250000 THEN 2 WHEN volume_delta * last * 100 >= 100000 THEN 1 ELSE 0 END + \
+					CASE WHEN implied_volatility > 1.0 THEN 2 WHEN implied_volatility > 0.6 THEN 1 ELSE 0 END + \
+					CASE WHEN ABS(delta) < 0.15 THEN 1 ELSE 0 END + \
+					CASE WHEN (expiration - CURRENT_DATE) <= 2 THEN 1 ELSE 0 END \
+				)) as unusual_score \
+			FROM option_chain_deltas \
+			WHERE volume_delta > 0 \
+				AND ( \
+					volume_delta >= 50 \
+					OR volume_delta * last * 100 >= 50000 \
+					OR implied_volatility > 0.4 \
+					OR (ABS(delta) < 0.15 AND volume_delta >= 20) \
+				) \
+		) \
 		SELECT \
 			TO_CHAR(time_et, 'HH24:MI') as time, \
 			SUBSTRING(option_symbol, 1, 15) as contract, \
@@ -925,29 +981,58 @@ flow-smart-money: ## Unusual activity detection
 			unusual_score as score, \
 			notional_class, \
 			size_class \
-		FROM option_flow_smart_money \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
-			AND timestamp > NOW() - INTERVAL '1 hour' \
-		ORDER BY unusual_score DESC, notional DESC \
-		LIMIT 25;"
+		FROM scored \
+		ORDER BY timestamp DESC, unusual_score DESC, notional DESC \
+		LIMIT 20;"
 
 .PHONY: flow-buying-pressure
 flow-buying-pressure: ## Underlying buying/selling pressure
-	@echo "$(BLUE)=== Underlying Buying Pressure (Last 30 Bars) ===$(NC)"
+	@echo "$(BLUE)=== Underlying Buying Pressure (Most Recent 20 Rows) ===$(NC)"
 	@$(PSQL) -c "\
+		WITH quote_deltas AS ( \
+			SELECT \
+				timestamp, symbol, close, up_volume, down_volume, \
+				COALESCE( \
+					GREATEST( \
+						up_volume - LAG(up_volume) OVER ( \
+							PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York') \
+							ORDER BY timestamp \
+						), \
+						0 \
+					), \
+					0 \
+				) AS up_volume_delta, \
+				COALESCE( \
+					GREATEST( \
+						down_volume - LAG(down_volume) OVER ( \
+							PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York') \
+							ORDER BY timestamp \
+						), \
+						0 \
+					), \
+					0 \
+				) AS down_volume_delta \
+			FROM underlying_quotes \
+			WHERE symbol = '$(FLOW_SYMBOL)' \
+		) \
 		SELECT \
-			TO_CHAR(time_et, 'HH24:MI') as time, \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
 			symbol, \
 			ROUND(close, 2) as price, \
-			total_volume_delta as volume, \
-			buying_pressure_pct as buy_pct, \
-			period_buying_pressure_pct as period_buy_pct, \
-			ROUND(price_change, 2) as price_chg, \
-			momentum \
-		FROM underlying_buying_pressure \
-		WHERE symbol = '$(FLOW_SYMBOL)' \
+			(up_volume_delta + down_volume_delta) as volume, \
+			ROUND(CASE WHEN (up_volume + down_volume) > 0 THEN up_volume::numeric / (up_volume + down_volume) * 100 ELSE 50 END, 2) as buy_pct, \
+			ROUND(CASE WHEN (up_volume_delta + down_volume_delta) > 0 THEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) * 100 ELSE 50 END, 2) as period_buy_pct, \
+			ROUND(close - LAG(close) OVER (PARTITION BY symbol ORDER BY timestamp), 2) as price_chg, \
+			CASE \
+				WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) > 0.7 THEN '🟢 Strong Buying' \
+				WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) > 0.55 THEN '✅ Buying' \
+				WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) >= 0.45 THEN '⚪ Neutral' \
+				WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) >= 0.3 THEN '❌ Selling' \
+				ELSE '🔴 Strong Selling' \
+			END as momentum \
+		FROM quote_deltas \
 		ORDER BY timestamp DESC \
-		LIMIT 30;"
+		LIMIT 20;"
 
 .PHONY: flow-live
 flow-live: ## Combined real-time flow dashboard
@@ -958,14 +1043,45 @@ flow-live: ## Combined real-time flow dashboard
 	@echo "$(GREEN)1. UNDERLYING BUYING PRESSURE (Last 10 Bars)$(NC)"
 	@echo "--------------------------------------------------------------------------------"
 	@$(PSQL) -c "\
+		WITH quote_deltas AS ( \
+			SELECT \
+				timestamp, symbol, close, up_volume, down_volume, \
+				COALESCE( \
+					GREATEST( \
+						up_volume - LAG(up_volume) OVER ( \
+							PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York') \
+							ORDER BY timestamp \
+						), \
+						0 \
+					), \
+					0 \
+				) AS up_volume_delta, \
+				COALESCE( \
+					GREATEST( \
+						down_volume - LAG(down_volume) OVER ( \
+							PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York') \
+							ORDER BY timestamp \
+						), \
+						0 \
+					), \
+					0 \
+				) AS down_volume_delta \
+			FROM underlying_quotes \
+			WHERE symbol = '$(FLOW_SYMBOL)' \
+		) \
 		SELECT \
-			TO_CHAR(time_et, 'HH24:MI') as time, \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
 			ROUND(close, 2) as price, \
-			total_volume_delta as vol, \
-			period_buying_pressure_pct as buy_pct, \
-			momentum \
-		FROM underlying_buying_pressure \
-		WHERE symbol = '$(FLOW_SYMBOL)' \
+			(up_volume_delta + down_volume_delta) as vol, \
+			ROUND(CASE WHEN (up_volume_delta + down_volume_delta) > 0 THEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) * 100 ELSE 50 END, 2) as buy_pct, \
+			CASE \
+				WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) > 0.7 THEN '🟢 Strong Buying' \
+				WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) > 0.55 THEN '✅ Buying' \
+				WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) >= 0.45 THEN '⚪ Neutral' \
+				WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) >= 0.3 THEN '❌ Selling' \
+				ELSE '🔴 Strong Selling' \
+			END as momentum \
+		FROM quote_deltas \
 		ORDER BY timestamp DESC \
 		LIMIT 10;"
 	@echo ""
@@ -992,6 +1108,41 @@ flow-live: ## Combined real-time flow dashboard
 	@echo "$(GREEN)3. SMART MONEY / UNUSUAL ACTIVITY (Top 10)$(NC)"
 	@echo "--------------------------------------------------------------------------------"
 	@$(PSQL) -c "\
+		WITH option_chain_deltas AS ( \
+			SELECT \
+				timestamp, option_symbol, underlying, option_type, last, implied_volatility, delta, expiration, \
+				COALESCE( \
+					GREATEST( \
+						volume - LAG(volume) OVER ( \
+							PARTITION BY option_symbol, DATE(timestamp AT TIME ZONE 'America/New_York') \
+							ORDER BY timestamp \
+						), \
+						0 \
+					), \
+					0 \
+				) AS volume_delta \
+			FROM option_chains \
+			WHERE underlying = '$(FLOW_SYMBOL)' \
+		), scored AS ( \
+			SELECT \
+				timestamp AT TIME ZONE 'America/New_York' as time_et, \
+				option_symbol, option_type, volume_delta as flow, \
+				CASE \
+					WHEN volume_delta >= 500 THEN '🔥 Massive Block' \
+					WHEN volume_delta >= 200 THEN '📦 Large Block' \
+					WHEN volume_delta >= 100 THEN '📊 Medium Block' \
+					ELSE '💼 Standard' \
+				END as size_class, \
+				LEAST(10, GREATEST(0, \
+					CASE WHEN volume_delta >= 500 THEN 3 WHEN volume_delta >= 200 THEN 2 WHEN volume_delta >= 100 THEN 1 ELSE 0 END + \
+					CASE WHEN volume_delta * last * 100 >= 500000 THEN 3 WHEN volume_delta * last * 100 >= 250000 THEN 2 WHEN volume_delta * last * 100 >= 100000 THEN 1 ELSE 0 END + \
+					CASE WHEN implied_volatility > 1.0 THEN 2 WHEN implied_volatility > 0.6 THEN 1 ELSE 0 END + \
+					CASE WHEN ABS(delta) < 0.15 THEN 1 ELSE 0 END + \
+					CASE WHEN (expiration - CURRENT_DATE) <= 2 THEN 1 ELSE 0 END \
+				)) as unusual_score \
+			FROM option_chain_deltas \
+			WHERE volume_delta > 0 \
+		) \
 		SELECT \
 			TO_CHAR(time_et, 'HH24:MI') as time, \
 			SUBSTRING(option_symbol, 1, 15) as contract, \
@@ -999,9 +1150,7 @@ flow-live: ## Combined real-time flow dashboard
 			flow, \
 			unusual_score as score, \
 			size_class \
-		FROM option_flow_smart_money \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
-			AND timestamp > NOW() - INTERVAL '1 hour' \
+		FROM scored \
 		ORDER BY unusual_score DESC, flow DESC \
 		LIMIT 10;"
 	@echo ""
@@ -1109,7 +1258,7 @@ volume-spikes: ## Unusual volume detection
 
 .PHONY: divergence
 divergence: ## Momentum divergence signals
-	@echo "$(BLUE)=== Momentum Divergence Signals (1min, Last Hour) ===$(NC)"
+	@echo "$(BLUE)=== Momentum Divergence Signals (Most Recent 20 Rows) ===$(NC)"
 	@$(PSQL) -c "\
 		SET statement_timeout = '10s'; \
 		WITH option_flow AS ( \
@@ -1117,7 +1266,6 @@ divergence: ## Momentum divergence signals
 				SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE -total_premium END)::numeric AS net_option_flow \
 			FROM flow_cache_by_type_minute \
 			WHERE symbol = '$(FLOW_SYMBOL)' \
-				AND timestamp > NOW() - INTERVAL '70 minutes' \
 			GROUP BY timestamp, symbol \
 		), base AS ( \
 			SELECT \
@@ -1130,7 +1278,6 @@ divergence: ## Momentum divergence signals
 			FROM underlying_quotes u \
 			LEFT JOIN option_flow of ON of.timestamp = u.timestamp AND of.symbol = u.symbol \
 			WHERE u.symbol = '$(FLOW_SYMBOL)' \
-				AND u.timestamp > NOW() - INTERVAL '70 minutes' \
 		) \
 		SELECT \
 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \

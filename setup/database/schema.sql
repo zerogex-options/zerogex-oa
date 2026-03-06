@@ -1411,6 +1411,9 @@ CREATE INDEX IF NOT EXISTS idx_flow_cache_smart_money_symbol_ts
 -- =============================================================================
 -- Interval Aggregate Views for API Consumption
 -- =============================================================================
+-- Normalized shape across all flow views:
+--   timestamp (interval window end), symbol, dimension, volume, premium
+-- Live source: option_chains_with_deltas (bounded recent window for performance).
 
 DROP VIEW IF EXISTS flow_by_type_1min CASCADE;
 DROP VIEW IF EXISTS flow_by_type_5min CASCADE;
@@ -1421,61 +1424,66 @@ DROP VIEW IF EXISTS flow_by_type_1day CASCADE;
 CREATE VIEW flow_by_type_1min AS
 SELECT
     date_trunc('minute', timestamp) + INTERVAL '1 minute' AS timestamp,
-    symbol,
-    SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END)::bigint AS put_volume,
-    SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END)::bigint AS call_volume,
-    SUM(CASE WHEN option_type = 'P' THEN total_premium ELSE 0 END)::numeric AS put_premium,
-    SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE 0 END)::numeric AS call_premium
-FROM flow_cache_by_type_minute
-GROUP BY 1, 2;
+    underlying AS symbol,
+    option_type,
+    SUM(volume_delta)::bigint AS volume,
+    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric AS premium
+FROM option_chains_with_deltas
+WHERE volume_delta > 0
+  AND timestamp >= COALESCE((SELECT MAX(timestamp) - INTERVAL '24 hours' FROM option_chains), NOW() - INTERVAL '24 hours')
+GROUP BY 1, 2, 3;
 
 CREATE VIEW flow_by_type_5min AS
 SELECT
     date_trunc('hour', timestamp)
         + FLOOR(EXTRACT(MINUTE FROM timestamp) / 5) * INTERVAL '5 minutes'
         + INTERVAL '5 minutes' AS timestamp,
-    symbol,
-    SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END)::bigint AS put_volume,
-    SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END)::bigint AS call_volume,
-    SUM(CASE WHEN option_type = 'P' THEN total_premium ELSE 0 END)::numeric AS put_premium,
-    SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE 0 END)::numeric AS call_premium
-FROM flow_cache_by_type_minute
-GROUP BY 1, 2;
+    underlying AS symbol,
+    option_type,
+    SUM(volume_delta)::bigint AS volume,
+    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric AS premium
+FROM option_chains_with_deltas
+WHERE volume_delta > 0
+  AND timestamp >= COALESCE((SELECT MAX(timestamp) - INTERVAL '24 hours' FROM option_chains), NOW() - INTERVAL '24 hours')
+GROUP BY 1, 2, 3;
 
 CREATE VIEW flow_by_type_15min AS
 SELECT
     date_trunc('hour', timestamp)
         + FLOOR(EXTRACT(MINUTE FROM timestamp) / 15) * INTERVAL '15 minutes'
         + INTERVAL '15 minutes' AS timestamp,
-    symbol,
-    SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END)::bigint AS put_volume,
-    SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END)::bigint AS call_volume,
-    SUM(CASE WHEN option_type = 'P' THEN total_premium ELSE 0 END)::numeric AS put_premium,
-    SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE 0 END)::numeric AS call_premium
-FROM flow_cache_by_type_minute
-GROUP BY 1, 2;
+    underlying AS symbol,
+    option_type,
+    SUM(volume_delta)::bigint AS volume,
+    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric AS premium
+FROM option_chains_with_deltas
+WHERE volume_delta > 0
+  AND timestamp >= COALESCE((SELECT MAX(timestamp) - INTERVAL '24 hours' FROM option_chains), NOW() - INTERVAL '24 hours')
+GROUP BY 1, 2, 3;
 
 CREATE VIEW flow_by_type_1hr AS
 SELECT
     date_trunc('hour', timestamp) + INTERVAL '1 hour' AS timestamp,
-    symbol,
-    SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END)::bigint AS put_volume,
-    SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END)::bigint AS call_volume,
-    SUM(CASE WHEN option_type = 'P' THEN total_premium ELSE 0 END)::numeric AS put_premium,
-    SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE 0 END)::numeric AS call_premium
-FROM flow_cache_by_type_minute
-GROUP BY 1, 2;
+    underlying AS symbol,
+    option_type,
+    SUM(volume_delta)::bigint AS volume,
+    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric AS premium
+FROM option_chains_with_deltas
+WHERE volume_delta > 0
+  AND timestamp >= COALESCE((SELECT MAX(timestamp) - INTERVAL '72 hours' FROM option_chains), NOW() - INTERVAL '72 hours')
+GROUP BY 1, 2, 3;
 
 CREATE VIEW flow_by_type_1day AS
 SELECT
     date_trunc('day', timestamp) + INTERVAL '1 day' AS timestamp,
-    symbol,
-    SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END)::bigint AS put_volume,
-    SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END)::bigint AS call_volume,
-    SUM(CASE WHEN option_type = 'P' THEN total_premium ELSE 0 END)::numeric AS put_premium,
-    SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE 0 END)::numeric AS call_premium
-FROM flow_cache_by_type_minute
-GROUP BY 1, 2;
+    underlying AS symbol,
+    option_type,
+    SUM(volume_delta)::bigint AS volume,
+    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric AS premium
+FROM option_chains_with_deltas
+WHERE volume_delta > 0
+  AND timestamp >= COALESCE((SELECT MAX(timestamp) - INTERVAL '30 days' FROM option_chains), NOW() - INTERVAL '30 days')
+GROUP BY 1, 2, 3;
 
 DROP VIEW IF EXISTS flow_by_strike_1min CASCADE;
 DROP VIEW IF EXISTS flow_by_strike_5min CASCADE;
@@ -1486,96 +1494,66 @@ DROP VIEW IF EXISTS flow_by_strike_1day CASCADE;
 CREATE VIEW flow_by_strike_1min AS
 SELECT
     date_trunc('minute', timestamp) + INTERVAL '1 minute' AS timestamp,
-    symbol,
-    jsonb_object_agg(strike::text, volume_sum ORDER BY strike) AS total_volume,
-    jsonb_object_agg(strike::text, premium_sum ORDER BY strike) AS total_premium
-FROM (
-    SELECT
-        timestamp,
-        symbol,
-        strike,
-        SUM(total_volume)::bigint AS volume_sum,
-        SUM(total_premium)::numeric AS premium_sum
-    FROM flow_cache_by_strike_minute
-    GROUP BY 1,2,3
-) t
-GROUP BY 1,2;
+    underlying AS symbol,
+    strike,
+    SUM(volume_delta)::bigint AS volume,
+    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric AS premium
+FROM option_chains_with_deltas
+WHERE volume_delta > 0
+  AND timestamp >= COALESCE((SELECT MAX(timestamp) - INTERVAL '24 hours' FROM option_chains), NOW() - INTERVAL '24 hours')
+GROUP BY 1, 2, 3;
 
 CREATE VIEW flow_by_strike_5min AS
 SELECT
     date_trunc('hour', timestamp)
         + FLOOR(EXTRACT(MINUTE FROM timestamp) / 5) * INTERVAL '5 minutes'
         + INTERVAL '5 minutes' AS timestamp,
-    symbol,
-    jsonb_object_agg(strike::text, volume_sum ORDER BY strike) AS total_volume,
-    jsonb_object_agg(strike::text, premium_sum ORDER BY strike) AS total_premium
-FROM (
-    SELECT
-        timestamp,
-        symbol,
-        strike,
-        SUM(total_volume)::bigint AS volume_sum,
-        SUM(total_premium)::numeric AS premium_sum
-    FROM flow_cache_by_strike_minute
-    GROUP BY 1,2,3
-) t
-GROUP BY 1,2;
+    underlying AS symbol,
+    strike,
+    SUM(volume_delta)::bigint AS volume,
+    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric AS premium
+FROM option_chains_with_deltas
+WHERE volume_delta > 0
+  AND timestamp >= COALESCE((SELECT MAX(timestamp) - INTERVAL '24 hours' FROM option_chains), NOW() - INTERVAL '24 hours')
+GROUP BY 1, 2, 3;
 
 CREATE VIEW flow_by_strike_15min AS
 SELECT
     date_trunc('hour', timestamp)
         + FLOOR(EXTRACT(MINUTE FROM timestamp) / 15) * INTERVAL '15 minutes'
         + INTERVAL '15 minutes' AS timestamp,
-    symbol,
-    jsonb_object_agg(strike::text, volume_sum ORDER BY strike) AS total_volume,
-    jsonb_object_agg(strike::text, premium_sum ORDER BY strike) AS total_premium
-FROM (
-    SELECT
-        timestamp,
-        symbol,
-        strike,
-        SUM(total_volume)::bigint AS volume_sum,
-        SUM(total_premium)::numeric AS premium_sum
-    FROM flow_cache_by_strike_minute
-    GROUP BY 1,2,3
-) t
-GROUP BY 1,2;
+    underlying AS symbol,
+    strike,
+    SUM(volume_delta)::bigint AS volume,
+    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric AS premium
+FROM option_chains_with_deltas
+WHERE volume_delta > 0
+  AND timestamp >= COALESCE((SELECT MAX(timestamp) - INTERVAL '24 hours' FROM option_chains), NOW() - INTERVAL '24 hours')
+GROUP BY 1, 2, 3;
 
 CREATE VIEW flow_by_strike_1hr AS
 SELECT
     date_trunc('hour', timestamp) + INTERVAL '1 hour' AS timestamp,
-    symbol,
-    jsonb_object_agg(strike::text, volume_sum ORDER BY strike) AS total_volume,
-    jsonb_object_agg(strike::text, premium_sum ORDER BY strike) AS total_premium
-FROM (
-    SELECT
-        timestamp,
-        symbol,
-        strike,
-        SUM(total_volume)::bigint AS volume_sum,
-        SUM(total_premium)::numeric AS premium_sum
-    FROM flow_cache_by_strike_minute
-    GROUP BY 1,2,3
-) t
-GROUP BY 1,2;
+    underlying AS symbol,
+    strike,
+    SUM(volume_delta)::bigint AS volume,
+    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric AS premium
+FROM option_chains_with_deltas
+WHERE volume_delta > 0
+  AND timestamp >= COALESCE((SELECT MAX(timestamp) - INTERVAL '72 hours' FROM option_chains), NOW() - INTERVAL '72 hours')
+GROUP BY 1, 2, 3;
 
 CREATE VIEW flow_by_strike_1day AS
 SELECT
     date_trunc('day', timestamp) + INTERVAL '1 day' AS timestamp,
-    symbol,
-    jsonb_object_agg(strike::text, volume_sum ORDER BY strike) AS total_volume,
-    jsonb_object_agg(strike::text, premium_sum ORDER BY strike) AS total_premium
-FROM (
-    SELECT
-        timestamp,
-        symbol,
-        strike,
-        SUM(total_volume)::bigint AS volume_sum,
-        SUM(total_premium)::numeric AS premium_sum
-    FROM flow_cache_by_strike_minute
-    GROUP BY 1,2,3
-) t
-GROUP BY 1,2;
+    underlying AS symbol,
+    strike,
+    SUM(volume_delta)::bigint AS volume,
+    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric AS premium
+FROM option_chains_with_deltas
+WHERE volume_delta > 0
+  AND timestamp >= COALESCE((SELECT MAX(timestamp) - INTERVAL '30 days' FROM option_chains), NOW() - INTERVAL '30 days')
+GROUP BY 1, 2, 3;
 
 DROP VIEW IF EXISTS flow_by_expiration_1min CASCADE;
 DROP VIEW IF EXISTS flow_by_expiration_5min CASCADE;
@@ -1586,81 +1564,66 @@ DROP VIEW IF EXISTS flow_by_expiration_1day CASCADE;
 CREATE VIEW flow_by_expiration_1min AS
 SELECT
     date_trunc('minute', timestamp) + INTERVAL '1 minute' AS timestamp,
-    symbol,
-    jsonb_object_agg(expiration::text, volume_sum ORDER BY expiration) AS total_volume,
-    jsonb_object_agg(expiration::text, premium_sum ORDER BY expiration) AS total_premium
-FROM (
-    SELECT timestamp, symbol, expiration,
-           SUM(total_volume)::bigint AS volume_sum,
-           SUM(total_premium)::numeric AS premium_sum
-    FROM flow_cache_by_expiration_minute
-    GROUP BY 1,2,3
-) t
-GROUP BY 1,2;
+    underlying AS symbol,
+    expiration,
+    SUM(volume_delta)::bigint AS volume,
+    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric AS premium
+FROM option_chains_with_deltas
+WHERE volume_delta > 0
+  AND timestamp >= COALESCE((SELECT MAX(timestamp) - INTERVAL '24 hours' FROM option_chains), NOW() - INTERVAL '24 hours')
+GROUP BY 1, 2, 3;
 
 CREATE VIEW flow_by_expiration_5min AS
 SELECT
     date_trunc('hour', timestamp)
         + FLOOR(EXTRACT(MINUTE FROM timestamp) / 5) * INTERVAL '5 minutes'
         + INTERVAL '5 minutes' AS timestamp,
-    symbol,
-    jsonb_object_agg(expiration::text, volume_sum ORDER BY expiration) AS total_volume,
-    jsonb_object_agg(expiration::text, premium_sum ORDER BY expiration) AS total_premium
-FROM (
-    SELECT timestamp, symbol, expiration,
-           SUM(total_volume)::bigint AS volume_sum,
-           SUM(total_premium)::numeric AS premium_sum
-    FROM flow_cache_by_expiration_minute
-    GROUP BY 1,2,3
-) t
-GROUP BY 1,2;
+    underlying AS symbol,
+    expiration,
+    SUM(volume_delta)::bigint AS volume,
+    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric AS premium
+FROM option_chains_with_deltas
+WHERE volume_delta > 0
+  AND timestamp >= COALESCE((SELECT MAX(timestamp) - INTERVAL '24 hours' FROM option_chains), NOW() - INTERVAL '24 hours')
+GROUP BY 1, 2, 3;
 
 CREATE VIEW flow_by_expiration_15min AS
 SELECT
     date_trunc('hour', timestamp)
         + FLOOR(EXTRACT(MINUTE FROM timestamp) / 15) * INTERVAL '15 minutes'
         + INTERVAL '15 minutes' AS timestamp,
-    symbol,
-    jsonb_object_agg(expiration::text, volume_sum ORDER BY expiration) AS total_volume,
-    jsonb_object_agg(expiration::text, premium_sum ORDER BY expiration) AS total_premium
-FROM (
-    SELECT timestamp, symbol, expiration,
-           SUM(total_volume)::bigint AS volume_sum,
-           SUM(total_premium)::numeric AS premium_sum
-    FROM flow_cache_by_expiration_minute
-    GROUP BY 1,2,3
-) t
-GROUP BY 1,2;
+    underlying AS symbol,
+    expiration,
+    SUM(volume_delta)::bigint AS volume,
+    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric AS premium
+FROM option_chains_with_deltas
+WHERE volume_delta > 0
+  AND timestamp >= COALESCE((SELECT MAX(timestamp) - INTERVAL '24 hours' FROM option_chains), NOW() - INTERVAL '24 hours')
+GROUP BY 1, 2, 3;
 
 CREATE VIEW flow_by_expiration_1hr AS
 SELECT
     date_trunc('hour', timestamp) + INTERVAL '1 hour' AS timestamp,
-    symbol,
-    jsonb_object_agg(expiration::text, volume_sum ORDER BY expiration) AS total_volume,
-    jsonb_object_agg(expiration::text, premium_sum ORDER BY expiration) AS total_premium
-FROM (
-    SELECT timestamp, symbol, expiration,
-           SUM(total_volume)::bigint AS volume_sum,
-           SUM(total_premium)::numeric AS premium_sum
-    FROM flow_cache_by_expiration_minute
-    GROUP BY 1,2,3
-) t
-GROUP BY 1,2;
+    underlying AS symbol,
+    expiration,
+    SUM(volume_delta)::bigint AS volume,
+    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric AS premium
+FROM option_chains_with_deltas
+WHERE volume_delta > 0
+  AND timestamp >= COALESCE((SELECT MAX(timestamp) - INTERVAL '72 hours' FROM option_chains), NOW() - INTERVAL '72 hours')
+GROUP BY 1, 2, 3;
 
 CREATE VIEW flow_by_expiration_1day AS
 SELECT
     date_trunc('day', timestamp) + INTERVAL '1 day' AS timestamp,
-    symbol,
-    jsonb_object_agg(expiration::text, volume_sum ORDER BY expiration) AS total_volume,
-    jsonb_object_agg(expiration::text, premium_sum ORDER BY expiration) AS total_premium
-FROM (
-    SELECT timestamp, symbol, expiration,
-           SUM(total_volume)::bigint AS volume_sum,
-           SUM(total_premium)::numeric AS premium_sum
-    FROM flow_cache_by_expiration_minute
-    GROUP BY 1,2,3
-) t
-GROUP BY 1,2;
+    underlying AS symbol,
+    expiration,
+    SUM(volume_delta)::bigint AS volume,
+    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric AS premium
+FROM option_chains_with_deltas
+WHERE volume_delta > 0
+  AND timestamp >= COALESCE((SELECT MAX(timestamp) - INTERVAL '30 days' FROM option_chains), NOW() - INTERVAL '30 days')
+GROUP BY 1, 2, 3;
 
 DROP VIEW IF EXISTS momentum_divergence_1min CASCADE;
 DROP VIEW IF EXISTS momentum_divergence_5min CASCADE;
