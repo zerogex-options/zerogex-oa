@@ -1891,7 +1891,56 @@ api-logs-error: ## View API error logs only
 .PHONY: api-test
 api-test: ## Test ALL API endpoints
 	@echo "$(BLUE)=== Testing All API Endpoints ===$(NC)"
-	@BASE_URL="http://localhost:8000"; 	SYMBOL="SPY"; 	TIMEFRAMES="1min 5min 15min 1hr 1day"; 	PASSED=0; FAILED=0; 	test_endpoint() { 		path="$$1"; 		url="$$BASE_URL$$path"; 		if curl -fsS "$$url" > /dev/null; then 			echo "$(GREEN)✅ $$path$(NC)"; PASSED=$$((PASSED+1)); 		else 			echo "$(RED)❌ $$path$(NC)"; FAILED=$$((FAILED+1)); 		fi; 	}; 	echo "$(YELLOW)Core endpoints$(NC)"; 	test_endpoint "/api/health"; 	test_endpoint "/api/gex/summary?symbol=$$SYMBOL"; 	test_endpoint "/api/gex/by-strike?symbol=$$SYMBOL&limit=10"; 	test_endpoint "/api/market/quote?symbol=$$SYMBOL"; 	test_endpoint "/api/market/previous-close?symbol=$$SYMBOL"; 	test_endpoint "/api/trading/gamma-levels?symbol=$$SYMBOL&limit=10"; 	test_endpoint "/api/trading/dealer-hedging?symbol=$$SYMBOL&limit=10"; 	test_endpoint "/api/trading/volume-spikes?symbol=$$SYMBOL&limit=10"; 	test_endpoint "/docs"; 	test_endpoint "/redoc"; 	test_endpoint "/openapi.json"; 	echo ""; 	echo "$(YELLOW)Timeframe endpoints$(NC)"; 	for TF in $$TIMEFRAMES; do 		test_endpoint "/api/gex/historical?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; 		test_endpoint "/api/gex/heatmap?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; 		test_endpoint "/api/max-pain/timeseries?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; 		test_endpoint "/api/market/historical?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; 		test_endpoint "/api/flow/by-type?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; 		test_endpoint "/api/flow/by-strike?symbol=$$SYMBOL&window_units=10&timeframe=$$TF&limit=10"; 		test_endpoint "/api/flow/by-expiration?symbol=$$SYMBOL&window_units=10&timeframe=$$TF&limit=10"; 		test_endpoint "/api/flow/smart-money?symbol=$$SYMBOL&window_units=10&timeframe=$$TF&limit=10"; 		test_endpoint "/api/trading/vwap-deviation?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; 		test_endpoint "/api/trading/opening-range?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; 		test_endpoint "/api/trading/momentum-divergence?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; 	done; 	echo ""; 	echo "$(YELLOW)Max pain current snapshot$(NC)"; 	test_endpoint "/api/max-pain/current?symbol=$$SYMBOL&strike_limit=100"; 	echo ""; 	echo "$(BLUE)=== API Test Report ===$(NC)"; 	echo "$(GREEN)Passed: $$PASSED$(NC)"; 	echo "$(RED)Failed: $$FAILED$(NC)"; 	if [ $$FAILED -gt 0 ]; then exit 1; fi
+	@BASE_URL="http://localhost:8000"; \
+	SYMBOL="SPY"; \
+	TIMEFRAMES="1min 5min 15min 1hr 1day"; \
+	PASSED=0; \
+	FAILED=0; \
+	test_endpoint() { \
+		path="$$1"; \
+		url="$$BASE_URL$$path"; \
+		if curl -fsS "$$url" > /dev/null; then \
+			echo "$(GREEN)✅ $$path$(NC)"; PASSED=$$((PASSED+1)); \
+		else \
+			echo "$(RED)❌ $$path$(NC)"; FAILED=$$((FAILED+1)); \
+		fi; \
+	}; \
+	echo "$(YELLOW)Core endpoints$(NC)"; \
+	test_endpoint "/api/health"; \
+	test_endpoint "/api/gex/summary?symbol=$$SYMBOL"; \
+	test_endpoint "/api/gex/by-strike?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "/api/market/quote?symbol=$$SYMBOL"; \
+	test_endpoint "/api/market/previous-close?symbol=$$SYMBOL"; \
+	test_endpoint "/api/trading/gamma-levels?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "/api/trading/dealer-hedging?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "/api/trading/volume-spikes?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "/docs"; \
+	test_endpoint "/redoc"; \
+	test_endpoint "/openapi.json"; \
+	echo ""; \
+	echo "$(YELLOW)Timeframe endpoints$(NC)"; \
+	for TF in $$TIMEFRAMES; do \
+		test_endpoint "/api/gex/historical?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; \
+		test_endpoint "/api/gex/heatmap?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; \
+		test_endpoint "/api/max-pain/timeseries?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; \
+		test_endpoint "/api/market/historical?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; \
+		test_endpoint "/api/flow/by-type?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; \
+		test_endpoint "/api/flow/by-strike?symbol=$$SYMBOL&window_units=10&timeframe=$$TF&limit=10"; \
+		test_endpoint "/api/flow/by-expiration?symbol=$$SYMBOL&window_units=10&timeframe=$$TF&limit=10"; \
+		test_endpoint "/api/flow/smart-money?symbol=$$SYMBOL&window_units=10&timeframe=$$TF&limit=10"; \
+		test_endpoint "/api/flow/buying-pressure?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; \
+		test_endpoint "/api/trading/vwap-deviation?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; \
+		test_endpoint "/api/trading/opening-range?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; \
+		test_endpoint "/api/trading/momentum-divergence?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; \
+	done; \
+	echo ""; \
+	echo "$(YELLOW)Max pain current snapshot$(NC)"; \
+	test_endpoint "/api/max-pain/current?symbol=$$SYMBOL&strike_limit=100"; \
+	echo ""; \
+	echo "$(BLUE)=== API Test Report ===$(NC)"; \
+	echo "$(GREEN)Passed: $$PASSED$(NC)"; \
+	echo "$(RED)Failed: $$FAILED$(NC)"; \
+	if [ $$FAILED -gt 0 ]; then exit 1; fi
 
 .PHONY: staging-smoke
 staging-smoke: ## Run post-deploy staging smoke checklist
