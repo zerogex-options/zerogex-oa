@@ -1440,7 +1440,7 @@ db-prune-legacy: ## Drop obsolete legacy refresh/materialized-view artifacts
 		DROP FUNCTION IF EXISTS refresh_all_materialized_views(); \
 		DROP FUNCTION IF EXISTS refresh_delta_views(); \
 		DO \
-		\$$ \
+		$$$$ \
 		BEGIN \
 			IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'underlying_quotes_with_deltas' AND relkind = 'm') THEN \
 				EXECUTE 'DROP MATERIALIZED VIEW underlying_quotes_with_deltas CASCADE'; \
@@ -1453,7 +1453,7 @@ db-prune-legacy: ## Drop obsolete legacy refresh/materialized-view artifacts
 				EXECUTE 'DROP VIEW option_chains_with_deltas CASCADE'; \
 			END IF; \
 		END \
-		\$$; \
+		$$$$; \
 		SELECT 'legacy artifacts pruned' as status;"
 
 # =============================================================================
