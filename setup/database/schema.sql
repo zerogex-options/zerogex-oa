@@ -1544,11 +1544,11 @@ DROP VIEW IF EXISTS flow_by_expiration_1day CASCADE;
 CREATE VIEW flow_by_expiration_1min AS
 SELECT
     date_trunc('minute', timestamp) + INTERVAL '1 minute' AS timestamp,
-    symbol,
+    underlying AS symbol,
     expiration,
-    SUM(total_volume)::bigint AS volume,
-    SUM(total_premium)::numeric AS premium
-FROM flow_cache_by_expiration_minute
+    SUM(total_flow)::bigint AS volume,
+    SUM(total_notional)::numeric AS premium
+FROM option_flow_by_expiration
 GROUP BY 1, 2, 3;
 
 CREATE VIEW flow_by_expiration_5min AS
@@ -1556,11 +1556,11 @@ SELECT
     date_trunc('hour', timestamp)
         + FLOOR(EXTRACT(MINUTE FROM timestamp) / 5) * INTERVAL '5 minutes'
         + INTERVAL '5 minutes' AS timestamp,
-    symbol,
+    underlying AS symbol,
     expiration,
-    SUM(total_volume)::bigint AS volume,
-    SUM(total_premium)::numeric AS premium
-FROM flow_cache_by_expiration_minute
+    SUM(total_flow)::bigint AS volume,
+    SUM(total_notional)::numeric AS premium
+FROM option_flow_by_expiration
 GROUP BY 1, 2, 3;
 
 CREATE VIEW flow_by_expiration_15min AS
@@ -1568,31 +1568,31 @@ SELECT
     date_trunc('hour', timestamp)
         + FLOOR(EXTRACT(MINUTE FROM timestamp) / 15) * INTERVAL '15 minutes'
         + INTERVAL '15 minutes' AS timestamp,
-    symbol,
+    underlying AS symbol,
     expiration,
-    SUM(total_volume)::bigint AS volume,
-    SUM(total_premium)::numeric AS premium
-FROM flow_cache_by_expiration_minute
+    SUM(total_flow)::bigint AS volume,
+    SUM(total_notional)::numeric AS premium
+FROM option_flow_by_expiration
 GROUP BY 1, 2, 3;
 
 CREATE VIEW flow_by_expiration_1hr AS
 SELECT
     date_trunc('hour', timestamp) + INTERVAL '1 hour' AS timestamp,
-    symbol,
+    underlying AS symbol,
     expiration,
-    SUM(total_volume)::bigint AS volume,
-    SUM(total_premium)::numeric AS premium
-FROM flow_cache_by_expiration_minute
+    SUM(total_flow)::bigint AS volume,
+    SUM(total_notional)::numeric AS premium
+FROM option_flow_by_expiration
 GROUP BY 1, 2, 3;
 
 CREATE VIEW flow_by_expiration_1day AS
 SELECT
     date_trunc('day', timestamp) + INTERVAL '1 day' AS timestamp,
-    symbol,
+    underlying AS symbol,
     expiration,
-    SUM(total_volume)::bigint AS volume,
-    SUM(total_premium)::numeric AS premium
-FROM flow_cache_by_expiration_minute
+    SUM(total_flow)::bigint AS volume,
+    SUM(total_notional)::numeric AS premium
+FROM option_flow_by_expiration
 GROUP BY 1, 2, 3;
 
 DROP VIEW IF EXISTS momentum_divergence_1min CASCADE;
