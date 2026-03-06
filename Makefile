@@ -880,13 +880,17 @@ flow-by-strike: ## Flow by strike level
 		SET statement_timeout = '10s'; \
 		SELECT \
 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
-			symbol, \
-			jsonb_object_agg(strike::text, total_volume ORDER BY strike) AS total_volume, \
-			jsonb_object_agg(strike::text, total_premium ORDER BY strike) AS total_premium \
-		FROM flow_cache_by_strike_minute \
-		WHERE symbol = '$(FLOW_SYMBOL)' \
-		GROUP BY timestamp, symbol \
-		ORDER BY timestamp DESC \
+			underlying as symbol, \
+			strike, \
+			SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE 0 END) AS call_volume, \
+			TO_CHAR(SUM(CASE WHEN option_type = 'C' THEN volume_delta * last * 100 ELSE 0 END), 'FM999,999,999') as call_premium, \
+			SUM(CASE WHEN option_type = 'P' THEN volume_delta ELSE 0 END) AS put_volume, \
+			TO_CHAR(SUM(CASE WHEN option_type = 'P' THEN volume_delta * last * 100 ELSE 0 END), 'FM999,999,999') as put_premium \
+		FROM option_chains_with_deltas \
+		WHERE underlying = '$(FLOW_SYMBOL)' \
+			AND volume_delta > 0 \
+		GROUP BY timestamp, underlying, strike \
+		ORDER BY timestamp DESC, strike \
 		LIMIT 20;"
 
 .PHONY: flow-by-expiration
@@ -896,13 +900,17 @@ flow-by-expiration: ## Flow by expiration date
 		SET statement_timeout = '10s'; \
 		SELECT \
 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
-			symbol, \
-			jsonb_object_agg(expiration::text, total_volume ORDER BY expiration) AS total_volume, \
-			jsonb_object_agg(expiration::text, total_premium ORDER BY expiration) AS total_premium \
-		FROM flow_cache_by_expiration_minute \
-		WHERE symbol = '$(FLOW_SYMBOL)' \
-		GROUP BY timestamp, symbol \
-		ORDER BY timestamp DESC \
+			underlying as symbol, \
+			expiration, \
+			SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE 0 END) AS call_volume, \
+			TO_CHAR(SUM(CASE WHEN option_type = 'C' THEN volume_delta * last * 100 ELSE 0 END), 'FM999,999,999') as call_premium, \
+			SUM(CASE WHEN option_type = 'P' THEN volume_delta ELSE 0 END) AS put_volume, \
+			TO_CHAR(SUM(CASE WHEN option_type = 'P' THEN volume_delta * last * 100 ELSE 0 END), 'FM999,999,999') as put_premium \
+		FROM option_chains_with_deltas \
+		WHERE underlying = '$(FLOW_SYMBOL)' \
+			AND volume_delta > 0 \
+		GROUP BY timestamp, underlying, expiration \
+		ORDER BY timestamp DESC, expiration \
 		LIMIT 20;"
 
 .PHONY: flow-smart-money
