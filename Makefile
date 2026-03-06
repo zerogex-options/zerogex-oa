@@ -5,11 +5,11 @@
 # Common queries for monitoring and debugging the ZeroGEX platform
 
 # Load database connection from .env
-include .env
+-include .env
 export
 
 # PostgreSQL connection string
-PSQL = PGPASSFILE=~/.pgpass psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) -d $(DB_NAME)
+PSQL = PGPASSFILE=~/.pgpass psql "sslmode=require host=$(DB_HOST) port=$(DB_PORT) user=$(DB_USER) dbname=$(DB_NAME)"
 
 # Service names
 INGESTION_SERVICE = zerogex-oa-ingestion
@@ -153,6 +153,7 @@ help: ## Show this help message
 	@echo "  make vacuum             - Vacuum analyze all tables"
 	@echo "  make size               - Show table sizes"
 	@echo "  make refresh-views      - Refresh materialized views"
+	@echo "  make db-prune-legacy    - Drop obsolete legacy refresh/materialized-view artifacts"
 	@echo ""
 	@echo "$(GREEN)Interactive:$(NC)"
 	@echo "  make psql               - Open PostgreSQL shell"
@@ -856,62 +857,55 @@ gex-preview: ## Preview GEX calculation data
 
 .PHONY: flow-by-type
 flow-by-type: ## Puts vs calls flow (all strikes/expirations)
-	@echo "$(BLUE)=== Option Flow by Type (Last Hour) ===$(NC)"
+	@echo "$(BLUE)=== Option Flow by Type (1min buckets, Last Hour) ===$(NC)"
 	@$(PSQL) -c "\
+		SET statement_timeout = '10s'; \
 		SELECT \
-			TO_CHAR(time_et, 'HH24:MI') as time, \
-			underlying, \
-			call_flow, \
-			TO_CHAR(call_notional, 'FM999,999,999') as call_notional, \
-			put_flow, \
-			TO_CHAR(put_notional, 'FM999,999,999') as put_notional, \
-			net_flow, \
-			TO_CHAR(net_notional, 'FM999,999,999') as net_notional, \
-			put_call_ratio as pc_ratio, \
-			put_call_notional_ratio as pc_not_ratio \
-		FROM option_flow_by_type \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
+			symbol, \
+			SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END) AS call_volume, \
+			TO_CHAR(SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE 0 END), 'FM999,999,999') as call_premium, \
+			SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END) AS put_volume, \
+			TO_CHAR(SUM(CASE WHEN option_type = 'P' THEN total_premium ELSE 0 END), 'FM999,999,999') as put_premium \
+		FROM flow_cache_by_type_minute \
+		WHERE symbol = '$(FLOW_SYMBOL)' \
 			AND timestamp > NOW() - INTERVAL '1 hour' \
+		GROUP BY timestamp, symbol \
 		ORDER BY timestamp DESC \
 		LIMIT 20;"
 
 .PHONY: flow-by-strike
 flow-by-strike: ## Flow by strike level
-	@echo "$(BLUE)=== Option Flow by Strike (Last Hour, Top 15) ===$(NC)"
+	@echo "$(BLUE)=== Option Flow by Strike (1min buckets, Last Hour) ===$(NC)"
 	@$(PSQL) -c "\
+		SET statement_timeout = '10s'; \
 		SELECT \
-			TO_CHAR(time_et, 'HH24:MI') as time, \
-			underlying, \
-			strike, \
-			call_flow, \
-			TO_CHAR(call_notional, 'FM999,999') as call_notional, \
-			put_flow, \
-			TO_CHAR(put_notional, 'FM999,999') as put_notional, \
-			TO_CHAR(total_notional, 'FM999,999') as total_notional \
-		FROM option_flow_by_strike \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
+			symbol, \
+			jsonb_object_agg(strike::text, total_volume ORDER BY strike) AS total_volume, \
+			jsonb_object_agg(strike::text, total_premium ORDER BY strike) AS total_premium \
+		FROM flow_cache_by_strike_minute \
+		WHERE symbol = '$(FLOW_SYMBOL)' \
 			AND timestamp > NOW() - INTERVAL '1 hour' \
-		ORDER BY total_notional DESC \
+		GROUP BY timestamp, symbol \
+		ORDER BY timestamp DESC \
 		LIMIT 15;"
 
 .PHONY: flow-by-expiration
 flow-by-expiration: ## Flow by expiration date
-	@echo "$(BLUE)=== Option Flow by Expiration (Last Hour) ===$(NC)"
+	@echo "$(BLUE)=== Option Flow by Expiration (1min buckets, Last Hour) ===$(NC)"
 	@$(PSQL) -c "\
+		SET statement_timeout = '10s'; \
 		SELECT \
-			TO_CHAR(time_et, 'HH24:MI') as time, \
-			underlying, \
-			expiration, \
-			days_to_expiry as dte, \
-			call_flow, \
-			TO_CHAR(call_notional, 'FM999,999') as call_notional, \
-			put_flow, \
-			TO_CHAR(put_notional, 'FM999,999') as put_notional, \
-			TO_CHAR(total_notional, 'FM999,999') as total_notional \
-		FROM option_flow_by_expiration \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
+			symbol, \
+			jsonb_object_agg(expiration::text, total_volume ORDER BY expiration) AS total_volume, \
+			jsonb_object_agg(expiration::text, total_premium ORDER BY expiration) AS total_premium \
+		FROM flow_cache_by_expiration_minute \
+		WHERE symbol = '$(FLOW_SYMBOL)' \
 			AND timestamp > NOW() - INTERVAL '1 hour' \
-		ORDER BY timestamp DESC, total_notional DESC \
+		GROUP BY timestamp, symbol \
+		ORDER BY timestamp DESC \
 		LIMIT 20;"
 
 .PHONY: flow-smart-money
@@ -978,15 +972,20 @@ flow-live: ## Combined real-time flow dashboard
 	@echo "$(GREEN)2. PUTS VS CALLS FLOW (Last 10 Minutes)$(NC)"
 	@echo "--------------------------------------------------------------------------------"
 	@$(PSQL) -c "\
+		SET statement_timeout = '10s'; \
 		SELECT \
-			TO_CHAR(time_et, 'HH24:MI') as time, \
-			call_flow as calls, \
-			put_flow as puts, \
-			net_flow as net, \
-			put_call_ratio as pc_ratio \
-		FROM option_flow_by_type \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
+			SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END) as calls, \
+			SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END) as puts, \
+			SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE -total_volume END) as net, \
+			ROUND( \
+				SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END)::numeric \
+				/ NULLIF(SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END), 0), 2 \
+			) as pc_ratio \
+		FROM flow_cache_by_type_minute \
+		WHERE symbol = '$(FLOW_SYMBOL)' \
 			AND timestamp > NOW() - INTERVAL '30 minutes' \
+		GROUP BY timestamp \
 		ORDER BY timestamp DESC \
 		LIMIT 10;"
 	@echo ""
@@ -1009,15 +1008,18 @@ flow-live: ## Combined real-time flow dashboard
 	@echo "$(GREEN)4. TOP STRIKES BY FLOW (Top 10)$(NC)"
 	@echo "--------------------------------------------------------------------------------"
 	@$(PSQL) -c "\
+		SET statement_timeout = '10s'; \
+		WITH strike_window AS ( \
+			SELECT strike, SUM(total_volume)::bigint AS total_flow \
+			FROM flow_cache_by_strike_minute \
+			WHERE symbol = '$(FLOW_SYMBOL)' \
+				AND timestamp > NOW() - INTERVAL '30 minutes' \
+			GROUP BY strike \
+		) \
 		SELECT \
 			strike, \
-			call_flow as calls, \
-			put_flow as puts, \
-			net_flow as net, \
 			total_flow as total \
-		FROM option_flow_by_strike \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
-			AND timestamp > NOW() - INTERVAL '30 minutes' \
+		FROM strike_window \
 		ORDER BY total_flow DESC \
 		LIMIT 10;"
 	@echo ""
@@ -1107,17 +1109,46 @@ volume-spikes: ## Unusual volume detection
 
 .PHONY: divergence
 divergence: ## Momentum divergence signals
-	@echo "$(BLUE)=== Momentum Divergence Signals (Last Hour) ===$(NC)"
+	@echo "$(BLUE)=== Momentum Divergence Signals (1min, Last Hour) ===$(NC)"
 	@$(PSQL) -c "\
+		SET statement_timeout = '10s'; \
+		WITH option_flow AS ( \
+			SELECT timestamp, symbol, \
+				SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE -total_premium END)::numeric AS net_option_flow \
+			FROM flow_cache_by_type_minute \
+			WHERE symbol = '$(FLOW_SYMBOL)' \
+				AND timestamp > NOW() - INTERVAL '70 minutes' \
+			GROUP BY timestamp, symbol \
+		), base AS ( \
+			SELECT \
+				u.timestamp, \
+				u.symbol, \
+				u.close as price, \
+				u.close - LAG(u.close, 5) OVER (PARTITION BY u.symbol ORDER BY u.timestamp) AS price_change_5min, \
+				(u.up_volume - u.down_volume)::bigint AS net_volume, \
+				of.net_option_flow \
+			FROM underlying_quotes u \
+			LEFT JOIN option_flow of ON of.timestamp = u.timestamp AND of.symbol = u.symbol \
+			WHERE u.symbol = '$(FLOW_SYMBOL)' \
+				AND u.timestamp > NOW() - INTERVAL '70 minutes' \
+		) \
 		SELECT \
-			TO_CHAR(time_et, 'HH24:MI') as time, \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
 			symbol, \
 			ROUND(price, 2) as price, \
 			ROUND(price_change_5min, 2) as chg_5m, \
 			TO_CHAR(net_option_flow, 'FM999,999') as opt_flow, \
-			divergence_signal \
-		FROM momentum_divergence \
-		WHERE divergence_signal != '⚪ Neutral' \
+			CASE \
+				WHEN price_change_5min > 0 AND net_option_flow < -50000 THEN '🚨 Bearish Divergence (Price Up, Puts Buying)' \
+				WHEN price_change_5min < 0 AND net_option_flow > 50000 THEN '🚨 Bullish Divergence (Price Down, Calls Buying)' \
+				WHEN price_change_5min > 0 AND net_option_flow > 50000 THEN '🟢 Bullish Confirmation' \
+				WHEN price_change_5min < 0 AND net_option_flow < -50000 THEN '🔴 Bearish Confirmation' \
+				WHEN price_change_5min > 0 AND net_volume < 0 THEN '⚠️ Weak Rally (Selling Volume)' \
+				WHEN price_change_5min < 0 AND net_volume > 0 THEN '⚠️ Weak Selloff (Buying Volume)' \
+				ELSE '⚪ Neutral' \
+			END AS divergence_signal \
+		FROM base \
+		WHERE price_change_5min IS NOT NULL \
 		ORDER BY timestamp DESC \
 		LIMIT 20;"
 
@@ -1181,13 +1212,49 @@ day-trading: ## Combined day trading dashboard
 	@echo "$(GREEN)5. DIVERGENCE SIGNALS$(NC)"
 	@echo "--------------------------------------------------------------------------------"
 	@$(PSQL) -c "\
+		SET statement_timeout = '10s'; \
+		WITH option_flow AS ( \
+			SELECT timestamp, symbol, \
+				SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE -total_premium END)::numeric AS net_option_flow \
+			FROM flow_cache_by_type_minute \
+			WHERE symbol = '$(FLOW_SYMBOL)' \
+				AND timestamp > NOW() - INTERVAL '70 minutes' \
+			GROUP BY timestamp, symbol \
+		), base AS ( \
+			SELECT \
+				u.timestamp, \
+				u.close as price, \
+				u.close - LAG(u.close, 5) OVER (PARTITION BY u.symbol ORDER BY u.timestamp) AS price_change_5min, \
+				(u.up_volume - u.down_volume)::bigint AS net_volume, \
+				of.net_option_flow \
+			FROM underlying_quotes u \
+			LEFT JOIN option_flow of ON of.timestamp = u.timestamp AND of.symbol = u.symbol \
+			WHERE u.symbol = '$(FLOW_SYMBOL)' \
+				AND u.timestamp > NOW() - INTERVAL '70 minutes' \
+		) \
 		SELECT \
-			TO_CHAR(time_et, 'HH24:MI') as time, \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
 			ROUND(price, 2) as price, \
 			ROUND(price_change_5min, 2) as chg_5m, \
-			divergence_signal \
-		FROM momentum_divergence \
-		WHERE divergence_signal != '⚪ Neutral' \
+			CASE \
+				WHEN price_change_5min > 0 AND net_option_flow < -50000 THEN '🚨 Bearish Divergence (Price Up, Puts Buying)' \
+				WHEN price_change_5min < 0 AND net_option_flow > 50000 THEN '🚨 Bullish Divergence (Price Down, Calls Buying)' \
+				WHEN price_change_5min > 0 AND net_option_flow > 50000 THEN '🟢 Bullish Confirmation' \
+				WHEN price_change_5min < 0 AND net_option_flow < -50000 THEN '🔴 Bearish Confirmation' \
+				WHEN price_change_5min > 0 AND net_volume < 0 THEN '⚠️ Weak Rally (Selling Volume)' \
+				WHEN price_change_5min < 0 AND net_volume > 0 THEN '⚠️ Weak Selloff (Buying Volume)' \
+				ELSE '⚪ Neutral' \
+			END AS divergence_signal \
+		FROM base \
+		WHERE price_change_5min IS NOT NULL \
+			AND ( \
+				(price_change_5min > 0 AND net_option_flow < -50000) OR \
+				(price_change_5min < 0 AND net_option_flow > 50000) OR \
+				(price_change_5min > 0 AND net_option_flow > 50000) OR \
+				(price_change_5min < 0 AND net_option_flow < -50000) OR \
+				(price_change_5min > 0 AND net_volume < 0) OR \
+				(price_change_5min < 0 AND net_volume > 0) \
+			) \
 		ORDER BY timestamp DESC \
 		LIMIT 10;"
 	@echo ""
@@ -1366,6 +1433,20 @@ size: ## Show table sizes
 		AND tablename IN ('underlying_quotes', 'option_chains', 'symbols', 'gex_summary', 'gex_by_strike') \
 		ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;"
 
+.PHONY: db-prune-legacy
+db-prune-legacy: ## Drop obsolete legacy refresh/materialized-view artifacts
+	@echo "$(BLUE)=== Pruning legacy materialized-view refresh artifacts ===$(NC)"
+	@printf "%s\n" \
+		"DROP FUNCTION IF EXISTS refresh_all_materialized_views();" \
+		"DROP FUNCTION IF EXISTS refresh_delta_views();" \
+		"SELECT 'DROP MATERIALIZED VIEW underlying_quotes_with_deltas CASCADE' WHERE EXISTS (SELECT 1 FROM pg_class WHERE relname = 'underlying_quotes_with_deltas' AND relkind = 'm')" \
+		"UNION ALL SELECT 'DROP VIEW underlying_quotes_with_deltas CASCADE' WHERE EXISTS (SELECT 1 FROM pg_class WHERE relname = 'underlying_quotes_with_deltas' AND relkind = 'v')" \
+		"UNION ALL SELECT 'DROP MATERIALIZED VIEW option_chains_with_deltas CASCADE' WHERE EXISTS (SELECT 1 FROM pg_class WHERE relname = 'option_chains_with_deltas' AND relkind = 'm')" \
+		"UNION ALL SELECT 'DROP VIEW option_chains_with_deltas CASCADE' WHERE EXISTS (SELECT 1 FROM pg_class WHERE relname = 'option_chains_with_deltas' AND relkind = 'v');" \
+		"\\gexec" \
+		"SELECT 'legacy artifacts pruned' AS status;" \
+	| $(PSQL)
+
 # =============================================================================
 # Interactive
 # =============================================================================
@@ -1539,65 +1620,7 @@ api-logs-error: ## View API error logs only
 .PHONY: api-test
 api-test: ## Test ALL API endpoints
 	@echo "$(BLUE)=== Testing All API Endpoints ===$(NC)"
-	@echo ""
-	@BASE_URL="http://localhost:8000"; \
-	SYMBOL="SPY"; \
-	TIMEFRAME="5min"; \
-	test_endpoint() { \
-		label="$$1"; \
-		url="$$2"; \
-		echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; \
-		echo "$(GREEN)$${label}:$(NC)"; \
-		echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; \
-		curl -s "$$url" | python -m json.tool || echo "$(RED)✗ Failed$(NC)"; \
-		echo ""; \
-	}; \
-	\
-	# Health \
-	test_endpoint "Health Check" "$$BASE_URL/api/health"; \
-	\
-	# GEX \
-	test_endpoint "GEX Summary" "$$BASE_URL/api/gex/summary?symbol=$$SYMBOL"; \
-	test_endpoint "GEX by Strike (Top 10)" "$$BASE_URL/api/gex/by-strike?symbol=$$SYMBOL&limit=10"; \
-	test_endpoint "GEX Historical (Last 10)" "$$BASE_URL/api/gex/historical?symbol=$$SYMBOL&limit=10&timeframe=$$TIMEFRAME"; \
-	test_endpoint "GEX Heatmap" "$$BASE_URL/api/gex/heatmap?symbol=$$SYMBOL&timeframe=$$TIMEFRAME&window_minutes=60&interval_minutes=5"; \
-	\
-	# Max Pain \
-	test_endpoint "Max Pain Timeseries (Last 10)" "$$BASE_URL/api/max-pain/timeseries?symbol=$$SYMBOL&limit=10&timeframe=$$TIMEFRAME"; \
-	test_endpoint "Max Pain Current" "$$BASE_URL/api/max-pain/current?symbol=$$SYMBOL&strike_limit=100"; \
-	\
-	# Flow \
-	test_endpoint "Option Flow by Type" "$$BASE_URL/api/flow/by-type?symbol=$$SYMBOL&window_minutes=60"; \
-	test_endpoint "Option Flow by Strike (Top 10)" "$$BASE_URL/api/flow/by-strike?symbol=$$SYMBOL&window_minutes=60&limit=10"; \
-	test_endpoint "Smart Money Flow" "$$BASE_URL/api/flow/smart-money?symbol=$$SYMBOL&window_minutes=60&limit=10"; \
-	\
-	# Market \
-	test_endpoint "Current Market Quote" "$$BASE_URL/api/market/quote?symbol=$$SYMBOL"; \
-	test_endpoint "Previous Close" "$$BASE_URL/api/market/previous-close?symbol=$$SYMBOL"; \
-	test_endpoint "Historical Quotes (Last 10)" "$$BASE_URL/api/market/historical?symbol=$$SYMBOL&limit=10&timeframe=$$TIMEFRAME"; \
-	\
-	# Trading \
-	test_endpoint "VWAP Deviation" "$$BASE_URL/api/trading/vwap-deviation?symbol=$$SYMBOL&limit=10"; \
-	test_endpoint "Opening Range Breakout" "$$BASE_URL/api/trading/opening-range?symbol=$$SYMBOL&limit=10"; \
-	test_endpoint "Gamma Exposure Levels" "$$BASE_URL/api/trading/gamma-levels?symbol=$$SYMBOL&limit=10"; \
-	test_endpoint "Dealer Hedging Pressure" "$$BASE_URL/api/trading/dealer-hedging?symbol=$$SYMBOL&limit=10"; \
-	test_endpoint "Unusual Volume Spikes" "$$BASE_URL/api/trading/volume-spikes?symbol=$$SYMBOL&limit=10"; \
-	test_endpoint "Momentum Divergence" "$$BASE_URL/api/trading/momentum-divergence?symbol=$$SYMBOL&limit=10"; \
-	\
-	# Docs \
-	test_endpoint "Swagger UI Availability" "$$BASE_URL/docs"; \
-	test_endpoint "ReDoc Availability" "$$BASE_URL/redoc"; \
-	test_endpoint "OpenAPI JSON" "$$BASE_URL/openapi.json"; \
-	\
-	echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; \
-	echo "$(GREEN)✅ All API Endpoints Tested$(NC)"; \
-	echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"; \
-	echo ""; \
-	echo "$(YELLOW)API Documentation available at:$(NC)"; \
-	echo "  • Swagger UI: $$BASE_URL/docs"; \
-	echo "  • ReDoc:      $$BASE_URL/redoc"; \
-	echo "  • OpenAPI:    $$BASE_URL/openapi.json"; \
-	echo ""
+	@BASE_URL="http://localhost:8000"; 	SYMBOL="SPY"; 	TIMEFRAMES="1min 5min 15min 1hr 1day"; 	PASSED=0; FAILED=0; 	test_endpoint() { 		path="$$1"; 		url="$$BASE_URL$$path"; 		if curl -fsS "$$url" > /dev/null; then 			echo "$(GREEN)✅ $$path$(NC)"; PASSED=$$((PASSED+1)); 		else 			echo "$(RED)❌ $$path$(NC)"; FAILED=$$((FAILED+1)); 		fi; 	}; 	echo "$(YELLOW)Core endpoints$(NC)"; 	test_endpoint "/api/health"; 	test_endpoint "/api/gex/summary?symbol=$$SYMBOL"; 	test_endpoint "/api/gex/by-strike?symbol=$$SYMBOL&limit=10"; 	test_endpoint "/api/market/quote?symbol=$$SYMBOL"; 	test_endpoint "/api/market/previous-close?symbol=$$SYMBOL"; 	test_endpoint "/api/trading/gamma-levels?symbol=$$SYMBOL&limit=10"; 	test_endpoint "/api/trading/dealer-hedging?symbol=$$SYMBOL&limit=10"; 	test_endpoint "/api/trading/volume-spikes?symbol=$$SYMBOL&limit=10"; 	test_endpoint "/docs"; 	test_endpoint "/redoc"; 	test_endpoint "/openapi.json"; 	echo ""; 	echo "$(YELLOW)Timeframe endpoints$(NC)"; 	for TF in $$TIMEFRAMES; do 		test_endpoint "/api/gex/historical?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; 		test_endpoint "/api/gex/heatmap?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; 		test_endpoint "/api/max-pain/timeseries?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; 		test_endpoint "/api/market/historical?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; 		test_endpoint "/api/flow/by-type?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; 		test_endpoint "/api/flow/by-strike?symbol=$$SYMBOL&window_units=10&timeframe=$$TF&limit=10"; 		test_endpoint "/api/flow/by-expiration?symbol=$$SYMBOL&window_units=10&timeframe=$$TF&limit=10"; 		test_endpoint "/api/flow/smart-money?symbol=$$SYMBOL&window_units=10&timeframe=$$TF&limit=10"; 		test_endpoint "/api/trading/vwap-deviation?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; 		test_endpoint "/api/trading/opening-range?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; 		test_endpoint "/api/trading/momentum-divergence?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; 	done; 	echo ""; 	echo "$(YELLOW)Max pain current snapshot$(NC)"; 	test_endpoint "/api/max-pain/current?symbol=$$SYMBOL&strike_limit=100"; 	echo ""; 	echo "$(BLUE)=== API Test Report ===$(NC)"; 	echo "$(GREEN)Passed: $$PASSED$(NC)"; 	echo "$(RED)Failed: $$FAILED$(NC)"; 	if [ $$FAILED -gt 0 ]; then exit 1; fi
 
 .PHONY: staging-smoke
 staging-smoke: ## Run post-deploy staging smoke checklist

@@ -83,8 +83,39 @@ class UnderlyingQuote(BaseModel):
     low: Decimal
     close: Decimal
     volume: Optional[int] = None
-    up_volume: Optional[int] = None
-    down_volume: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+        json_encoders = {
+            Decimal: lambda v: float(v) if v is not None else None,
+            datetime: lambda v: v.isoformat() if v is not None else None,
+        }
+
+
+class FlowCallPutTotals(BaseModel):
+    puts: Decimal | int = 0
+    calls: Decimal | int = 0
+
+
+class FlowBucketResponse(BaseModel):
+    timestamp: datetime
+    symbol: str
+    total_volume: FlowCallPutTotals
+    total_premium: FlowCallPutTotals
+
+    class Config:
+        from_attributes = True
+        json_encoders = {
+            Decimal: lambda v: float(v) if v is not None else None,
+            datetime: lambda v: v.isoformat() if v is not None else None,
+        }
+
+
+class FlowMapBucketResponse(BaseModel):
+    timestamp: datetime
+    symbol: str
+    total_volume: dict[str, int]
+    total_premium: dict[str, float]
 
     class Config:
         from_attributes = True

@@ -4,6 +4,7 @@ Uses asyncpg for async PostgreSQL operations
 """
 
 import asyncpg
+from asyncpg.exceptions import UndefinedTableError
 import os
 from pathlib import Path
 from typing import List, Dict, Optional, Any
@@ -51,6 +52,20 @@ def _interval_expr(timeframe: str) -> str:
         '15min': "INTERVAL '15 minutes'",
         '1hr': "INTERVAL '1 hour'",
         '1day': "INTERVAL '1 day'",
+    }
+    if timeframe not in mapping:
+        raise ValueError(f'Unsupported timeframe: {timeframe}')
+    return mapping[timeframe]
+
+
+def _timeframe_view_suffix(timeframe: str) -> str:
+    timeframe = _normalize_timeframe(timeframe)
+    mapping = {
+        '1min': '1min',
+        '5min': '5min',
+        '15min': '15min',
+        '1hr': '1hr',
+        '1day': '1day',
     }
     if timeframe not in mapping:
         raise ValueError(f'Unsupported timeframe: {timeframe}')
@@ -122,6 +137,20 @@ class DatabaseManager:
             logger.error(f"Health check failed: {e}")
             return False
 
+    @staticmethod
+    def _decode_json_field(value: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return value
+        return value
+
+    def _normalize_flow_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        row['total_volume'] = self._decode_json_field(row.get('total_volume'))
+        row['total_premium'] = self._decode_json_field(row.get('total_premium'))
+        return row
+
     async def _refresh_flow_cache(self, conn: asyncpg.Connection, symbol: str) -> None:
         """Refresh flow caches for only the latest minute snapshot for a symbol."""
         latest_ts = await conn.fetchval(
@@ -134,6 +163,44 @@ class DatabaseManager:
         )
         if latest_ts is None:
             return
+
+        # One-time bootstrap for the new expiration cache table so endpoint
+        # can serve historical buckets immediately after deployment.
+        expiration_seeded = await conn.fetchval(
+            """
+            SELECT 1
+            FROM flow_cache_by_expiration_minute
+            WHERE symbol = $1
+            LIMIT 1
+            """,
+            symbol,
+        )
+        if not expiration_seeded:
+            await conn.execute(
+                """
+                INSERT INTO flow_cache_by_expiration_minute (
+                    timestamp,
+                    symbol,
+                    expiration,
+                    total_volume,
+                    total_premium
+                )
+                SELECT
+                    timestamp,
+                    underlying,
+                    expiration,
+                    SUM(volume_delta)::bigint,
+                    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric
+                FROM option_chains_with_deltas
+                WHERE underlying = $1
+                  AND timestamp >= NOW() - INTERVAL '90 minutes'
+                  AND volume_delta > 0
+                GROUP BY timestamp, underlying, expiration
+                ON CONFLICT (timestamp, symbol, expiration)
+                DO NOTHING
+                """,
+                symbol,
+            )
 
         type_exists = await conn.fetchval(
             """
@@ -280,6 +347,72 @@ class DatabaseManager:
                     total_premium = EXCLUDED.total_premium,
                     avg_iv = EXCLUDED.avg_iv,
                     net_delta = EXCLUDED.net_delta,
+                    updated_at = NOW()
+                """,
+                symbol,
+                latest_ts,
+            )
+
+        expiration_exists = await conn.fetchval(
+            """
+            SELECT 1 FROM flow_cache_by_expiration_minute
+            WHERE symbol = $1 AND timestamp = $2
+            LIMIT 1
+            """,
+            symbol,
+            latest_ts,
+        )
+        if not expiration_exists:
+            await conn.execute(
+                """
+                WITH latest_rows AS (
+                    SELECT oc.*
+                    FROM option_chains oc
+                    WHERE oc.underlying = $1
+                      AND oc.timestamp = $2
+                ),
+                with_prev AS (
+                    SELECT
+                        l.timestamp,
+                        l.expiration,
+                        l.last,
+                        CASE
+                            WHEN p.prev_volume IS NULL THEN COALESCE(l.volume, 0)
+                            WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
+                                = (l.timestamp AT TIME ZONE 'America/New_York')::date
+                                THEN GREATEST(COALESCE(l.volume, 0) - COALESCE(p.prev_volume, 0), 0)
+                            ELSE COALESCE(l.volume, 0)
+                        END::bigint AS volume_delta
+                    FROM latest_rows l
+                    LEFT JOIN LATERAL (
+                        SELECT oc2.timestamp AS prev_ts, oc2.volume AS prev_volume
+                        FROM option_chains oc2
+                        WHERE oc2.option_symbol = l.option_symbol
+                          AND oc2.timestamp < l.timestamp
+                        ORDER BY oc2.timestamp DESC
+                        LIMIT 1
+                    ) p ON TRUE
+                )
+                INSERT INTO flow_cache_by_expiration_minute (
+                    timestamp,
+                    symbol,
+                    expiration,
+                    total_volume,
+                    total_premium
+                )
+                SELECT
+                    timestamp,
+                    $1::varchar,
+                    expiration,
+                    SUM(volume_delta)::bigint,
+                    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric
+                FROM with_prev
+                WHERE volume_delta > 0
+                GROUP BY timestamp, expiration
+                ON CONFLICT (timestamp, symbol, expiration)
+                DO UPDATE SET
+                    total_volume = EXCLUDED.total_volume,
+                    total_premium = EXCLUDED.total_premium,
                     updated_at = NOW()
                 """,
                 symbol,
@@ -753,64 +886,77 @@ class DatabaseManager:
         """Get option flow by type (calls vs puts) across interval buckets in the selected window."""
         window_units = max(1, min(window_units, 90))
         step_interval = _interval_expr(timeframe)
-        bucket = _bucket_expr(timeframe, 'c.timestamp')
+        timeframe_suffix = _timeframe_view_suffix(timeframe)
         query = f"""
             WITH latest AS (
                 SELECT MAX(timestamp) AS max_ts
-                FROM flow_cache_by_type_minute
+                FROM flow_by_type_{timeframe_suffix}
                 WHERE symbol = $1
             ),
             bounds AS (
                 SELECT
-                    max_ts - ({step_interval} * ($2 - 1)) AS time_window_start,
-                    max_ts AS time_window_end
+                    max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
+                    max_ts AS end_ts
                 FROM latest
-            ),
-            bucketed AS (
-                SELECT
-                    {bucket} AS interval_timestamp,
-                    c.option_type,
-                    SUM(c.total_volume)::bigint AS total_volume,
-                    SUM(c.total_premium)::numeric AS total_premium,
-                    AVG(c.avg_iv)::numeric AS avg_iv,
-                    SUM(c.net_delta)::numeric AS net_delta
-                FROM flow_cache_by_type_minute c
-                CROSS JOIN bounds b
-                WHERE c.symbol = $1
-                  AND c.timestamp BETWEEN b.time_window_start AND b.time_window_end
-                GROUP BY {bucket}, c.option_type
             )
             SELECT
-                b.time_window_start,
-                b.time_window_end,
-                t.interval_timestamp,
-                $1::varchar AS symbol,
-                CASE WHEN t.option_type = 'C' THEN 'CALL' ELSE 'PUT' END AS option_type,
-                t.total_volume,
-                t.total_premium,
-                t.avg_iv,
-                t.net_delta,
-                CASE
-                    WHEN t.option_type = 'C' AND t.total_premium > COALESCE((
-                        SELECT t2.total_premium FROM bucketed t2
-                        WHERE t2.interval_timestamp = t.interval_timestamp AND t2.option_type = 'P'
-                    ), 0) THEN 'bullish'
-                    WHEN t.option_type = 'P' AND t.total_premium > COALESCE((
-                        SELECT t2.total_premium FROM bucketed t2
-                        WHERE t2.interval_timestamp = t.interval_timestamp AND t2.option_type = 'C'
-                    ), 0) THEN 'bearish'
-                    ELSE 'neutral'
-                END AS sentiment
-            FROM bucketed t
-            CROSS JOIN bounds b
-            ORDER BY t.interval_timestamp DESC, option_type
+                timestamp,
+                symbol,
+                json_build_object('puts', COALESCE(put_volume, 0), 'calls', COALESCE(call_volume, 0)) AS total_volume,
+                json_build_object('puts', COALESCE(put_premium, 0), 'calls', COALESCE(call_premium, 0)) AS total_premium
+            FROM flow_by_type_{timeframe_suffix}
+            WHERE symbol = $1
+              AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+            ORDER BY timestamp DESC
+            LIMIT $2
         """
 
         try:
             async with self.pool.acquire() as conn:
                 await self._refresh_flow_cache(conn, symbol)
                 rows = await conn.fetch(query, symbol, window_units)
-                return [dict(row) for row in rows]
+                return [self._normalize_flow_payload(dict(row)) for row in rows]
+        except UndefinedTableError:
+            logger.warning("flow_by_type interval views missing; falling back to minute cache bucketing")
+            fallback_bucket = _bucket_expr(timeframe, 'c.timestamp')
+            fallback_query = f"""
+                WITH latest AS (
+                    SELECT MAX(timestamp) AS max_ts
+                    FROM flow_cache_by_type_minute
+                    WHERE symbol = $1
+                ),
+                bounds AS (
+                    SELECT
+                        max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
+                        max_ts AS end_ts
+                    FROM latest
+                ),
+                agg AS (
+                    SELECT
+                        {fallback_bucket} + {step_interval} AS timestamp,
+                        c.symbol,
+                        SUM(CASE WHEN c.option_type = 'P' THEN c.total_volume ELSE 0 END)::bigint AS put_volume,
+                        SUM(CASE WHEN c.option_type = 'C' THEN c.total_volume ELSE 0 END)::bigint AS call_volume,
+                        SUM(CASE WHEN c.option_type = 'P' THEN c.total_premium ELSE 0 END)::numeric AS put_premium,
+                        SUM(CASE WHEN c.option_type = 'C' THEN c.total_premium ELSE 0 END)::numeric AS call_premium
+                    FROM flow_cache_by_type_minute c
+                    WHERE c.symbol = $1
+                      AND c.timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+                    GROUP BY 1,2
+                )
+                SELECT
+                    timestamp,
+                    symbol,
+                    json_build_object('puts', COALESCE(put_volume, 0), 'calls', COALESCE(call_volume, 0)) AS total_volume,
+                    json_build_object('puts', COALESCE(put_premium, 0), 'calls', COALESCE(call_premium, 0)) AS total_premium
+                FROM agg
+                ORDER BY timestamp DESC
+                LIMIT $2
+            """
+            async with self.pool.acquire() as conn:
+                await self._refresh_flow_cache(conn, symbol)
+                rows = await conn.fetch(fallback_query, symbol, window_units)
+                return [self._normalize_flow_payload(dict(row)) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching flow by type: {e}")
             raise
@@ -825,46 +971,28 @@ class DatabaseManager:
         """Get option flow by strike across interval buckets in the selected window."""
         window_units = max(1, min(window_units, 90))
         step_interval = _interval_expr(timeframe)
-        bucket = _bucket_expr(timeframe, 'c.timestamp')
+        timeframe_suffix = _timeframe_view_suffix(timeframe)
         query = f"""
             WITH latest AS (
                 SELECT MAX(timestamp) AS max_ts
-                FROM flow_cache_by_strike_minute
+                FROM flow_by_strike_{timeframe_suffix}
                 WHERE symbol = $1
             ),
             bounds AS (
                 SELECT
-                    max_ts - ({step_interval} * ($2 - 1)) AS time_window_start,
-                    max_ts AS time_window_end
+                    max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
+                    max_ts AS end_ts
                 FROM latest
-            ),
-            strike_agg AS (
-                SELECT
-                    {bucket} AS interval_timestamp,
-                    c.strike,
-                    SUM(c.total_volume)::bigint AS total_volume,
-                    SUM(c.total_premium)::numeric AS total_premium,
-                    AVG(c.avg_iv)::numeric AS avg_iv,
-                    SUM(c.net_delta)::numeric AS net_delta
-                FROM flow_cache_by_strike_minute c
-                CROSS JOIN bounds b
-                WHERE c.symbol = $1
-                  AND c.timestamp BETWEEN b.time_window_start AND b.time_window_end
-                GROUP BY {bucket}, c.strike
             )
             SELECT
-                b.time_window_start,
-                b.time_window_end,
-                s.interval_timestamp,
-                $1::varchar AS symbol,
-                s.strike,
-                s.total_volume,
-                s.total_premium,
-                s.avg_iv,
-                s.net_delta
-            FROM strike_agg s
-            CROSS JOIN bounds b
-            ORDER BY s.interval_timestamp DESC, s.total_premium DESC NULLS LAST
+                timestamp,
+                symbol,
+                total_volume,
+                total_premium
+            FROM flow_by_strike_{timeframe_suffix}
+            WHERE symbol = $1
+              AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+            ORDER BY timestamp DESC
             LIMIT $3
         """
 
@@ -872,9 +1000,139 @@ class DatabaseManager:
             async with self.pool.acquire() as conn:
                 await self._refresh_flow_cache(conn, symbol)
                 rows = await conn.fetch(query, symbol, window_units, limit)
-                return [dict(row) for row in rows]
+                return [self._normalize_flow_payload(dict(row)) for row in rows]
+        except UndefinedTableError:
+            logger.warning("flow_by_strike interval views missing; falling back to minute cache bucketing")
+            fallback_bucket = _bucket_expr(timeframe, 'c.timestamp')
+            fallback_query = f"""
+                WITH latest AS (
+                    SELECT MAX(timestamp) AS max_ts
+                    FROM flow_cache_by_strike_minute
+                    WHERE symbol = $1
+                ),
+                bounds AS (
+                    SELECT
+                        max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
+                        max_ts AS end_ts
+                    FROM latest
+                ),
+                grouped AS (
+                    SELECT
+                        {fallback_bucket} + {step_interval} AS timestamp,
+                        c.symbol,
+                        c.strike::text AS strike_key,
+                        SUM(c.total_volume)::bigint AS volume_sum,
+                        SUM(c.total_premium)::numeric AS premium_sum
+                    FROM flow_cache_by_strike_minute c
+                    WHERE c.symbol = $1
+                      AND c.timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+                    GROUP BY 1,2,3
+                ),
+                agg AS (
+                    SELECT
+                        timestamp,
+                        symbol,
+                        jsonb_object_agg(strike_key, volume_sum ORDER BY strike_key) AS total_volume,
+                        jsonb_object_agg(strike_key, premium_sum ORDER BY strike_key) AS total_premium
+                    FROM grouped
+                    GROUP BY 1,2
+                )
+                SELECT timestamp, symbol, total_volume, total_premium
+                FROM agg
+                ORDER BY timestamp DESC
+                LIMIT $3
+            """
+            async with self.pool.acquire() as conn:
+                await self._refresh_flow_cache(conn, symbol)
+                rows = await conn.fetch(fallback_query, symbol, window_units, limit)
+                return [self._normalize_flow_payload(dict(row)) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching flow by strike: {e}")
+            raise
+
+    async def get_flow_by_expiration(
+        self,
+        symbol: str = 'SPY',
+        timeframe: str = '1min',
+        window_units: int = 60,
+        limit: int = 5000
+    ) -> List[Dict[str, Any]]:
+        """Get option flow by expiration across interval buckets in the selected window."""
+        window_units = max(1, min(window_units, 90))
+        step_interval = _interval_expr(timeframe)
+        timeframe_suffix = _timeframe_view_suffix(timeframe)
+        query = f"""
+            WITH latest AS (
+                SELECT MAX(timestamp) AS max_ts
+                FROM flow_by_expiration_{timeframe_suffix}
+                WHERE symbol = $1
+            ),
+            bounds AS (
+                SELECT
+                    max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
+                    max_ts AS end_ts
+                FROM latest
+            )
+            SELECT
+                timestamp,
+                symbol,
+                total_volume,
+                total_premium
+            FROM flow_by_expiration_{timeframe_suffix}
+            WHERE symbol = $1
+              AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+            ORDER BY timestamp DESC
+            LIMIT $3
+        """
+
+        try:
+            async with self.pool.acquire() as conn:
+                await self._refresh_flow_cache(conn, symbol)
+                rows = await conn.fetch(query, symbol, window_units, limit)
+                return [self._normalize_flow_payload(dict(row)) for row in rows]
+        except UndefinedTableError:
+            logger.warning("flow_by_expiration interval views missing; falling back to minute cache bucketing")
+            fallback_bucket = _bucket_expr(timeframe, 'c.timestamp')
+            fallback_query = f"""
+                WITH latest AS (
+                    SELECT MAX(timestamp) AS max_ts
+                    FROM flow_cache_by_expiration_minute
+                    WHERE symbol = $1
+                ),
+                bounds AS (
+                    SELECT
+                        max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
+                        max_ts AS end_ts
+                    FROM latest
+                ),
+                grouped AS (
+                    SELECT
+                        ({fallback_bucket} + {step_interval}) AS timestamp,
+                        c.symbol,
+                        c.expiration::text AS expiration_key,
+                        SUM(c.total_volume)::bigint AS volume_sum,
+                        SUM(c.total_premium)::numeric AS premium_sum
+                    FROM flow_cache_by_expiration_minute c
+                    WHERE c.symbol = $1
+                      AND c.timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+                    GROUP BY 1,2,3
+                )
+                SELECT
+                    timestamp,
+                    symbol,
+                    jsonb_object_agg(expiration_key, volume_sum ORDER BY expiration_key) AS total_volume,
+                    jsonb_object_agg(expiration_key, premium_sum ORDER BY expiration_key) AS total_premium
+                FROM grouped
+                GROUP BY timestamp, symbol
+                ORDER BY timestamp DESC
+                LIMIT $3
+            """
+            async with self.pool.acquire() as conn:
+                await self._refresh_flow_cache(conn, symbol)
+                rows = await conn.fetch(fallback_query, symbol, window_units, limit)
+                return [self._normalize_flow_payload(dict(row)) for row in rows]
+        except Exception as e:
+            logger.error(f"Error fetching flow by expiration: {e}")
             raise
 
     async def get_smart_money_flow(
@@ -1170,14 +1428,18 @@ class DatabaseManager:
         timeframe: str = '1min',
         window_units: int = 20
     ) -> List[Dict[str, Any]]:
-        """Get momentum divergence signals by interval/window."""
+        """Get momentum divergence signals by interval/window.
+
+        Uses lightweight cache tables directly (instead of heavy momentum views)
+        so the query only scans the requested recent window.
+        """
         window_units = max(1, min(window_units, 90))
         step_interval = _interval_expr(timeframe)
-        bucket = _bucket_expr(timeframe)
+        bucket = _bucket_expr(timeframe, 'u.timestamp')
         query = f"""
             WITH latest AS (
                 SELECT MAX(timestamp) AS max_ts
-                FROM momentum_divergence
+                FROM underlying_quotes
                 WHERE symbol = $1
             ),
             bounds AS (
@@ -1186,31 +1448,63 @@ class DatabaseManager:
                     max_ts AS end_ts
                 FROM latest
             ),
+            underlying_window AS (
+                SELECT
+                    u.timestamp,
+                    u.symbol,
+                    u.close,
+                    (u.up_volume - u.down_volume)::bigint AS net_volume,
+                    u.close - LAG(u.close, 5) OVER (PARTITION BY u.symbol ORDER BY u.timestamp) AS price_change_5min
+                FROM underlying_quotes u
+                WHERE u.symbol = $1
+                  AND u.timestamp BETWEEN (
+                        (SELECT start_ts FROM bounds) - INTERVAL '10 minutes'
+                    ) AND (SELECT end_ts FROM bounds)
+            ),
+            option_momentum AS (
+                SELECT
+                    c.timestamp,
+                    c.symbol,
+                    SUM(CASE WHEN c.option_type = 'C' THEN c.total_premium ELSE -c.total_premium END)::numeric AS net_option_flow
+                FROM flow_cache_by_type_minute c
+                WHERE c.symbol = $1
+                  AND c.timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+                GROUP BY c.timestamp, c.symbol
+            ),
             base AS (
                 SELECT
-                    time_et,
-                    timestamp,
-                    symbol,
-                    price,
-                    price_change_5min,
-                    net_volume,
-                    net_option_flow,
-                    divergence_signal,
-                    {bucket} AS bucket_ts,
-                    ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) AS rn
-                FROM momentum_divergence
-                WHERE symbol = $1
-                  AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+                    {bucket} + {step_interval} AS bucket_ts,
+                    uw.timestamp,
+                    uw.symbol,
+                    uw.close AS price,
+                    uw.price_change_5min,
+                    uw.net_volume,
+                    om.net_option_flow,
+                    ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY uw.timestamp DESC) AS rn
+                FROM underlying_window uw
+                LEFT JOIN option_momentum om
+                    ON om.timestamp = uw.timestamp
+                    AND om.symbol = uw.symbol
+                WHERE uw.price_change_5min IS NOT NULL
+                  AND uw.timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
             )
             SELECT
-                time_et,
+                bucket_ts AT TIME ZONE 'America/New_York' AS time_et,
                 bucket_ts AS timestamp,
                 symbol,
                 price,
-                price_change_5min,
+                ROUND(price_change_5min::numeric, 2) AS price_change_5min,
                 net_volume,
                 net_option_flow,
-                divergence_signal
+                CASE
+                    WHEN price_change_5min > 0 AND net_option_flow < -50000 THEN '🚨 Bearish Divergence (Price Up, Puts Buying)'
+                    WHEN price_change_5min < 0 AND net_option_flow > 50000 THEN '🚨 Bullish Divergence (Price Down, Calls Buying)'
+                    WHEN price_change_5min > 0 AND net_option_flow > 50000 THEN '🟢 Bullish Confirmation'
+                    WHEN price_change_5min < 0 AND net_option_flow < -50000 THEN '🔴 Bearish Confirmation'
+                    WHEN price_change_5min > 0 AND net_volume < 0 THEN '⚠️ Weak Rally (Selling Volume)'
+                    WHEN price_change_5min < 0 AND net_volume > 0 THEN '⚠️ Weak Selloff (Buying Volume)'
+                    ELSE '⚪ Neutral'
+                END AS divergence_signal
             FROM base
             WHERE rn = 1
             ORDER BY timestamp DESC
@@ -1549,4 +1843,3 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error fetching GEX heatmap: {e}")
             raise
-
