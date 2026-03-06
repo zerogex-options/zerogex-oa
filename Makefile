@@ -1436,25 +1436,16 @@ size: ## Show table sizes
 .PHONY: db-prune-legacy
 db-prune-legacy: ## Drop obsolete legacy refresh/materialized-view artifacts
 	@echo "$(BLUE)=== Pruning legacy materialized-view refresh artifacts ===$(NC)"
-	@$(PSQL) <<-'SQL'
-	DROP FUNCTION IF EXISTS refresh_all_materialized_views();
-	DROP FUNCTION IF EXISTS refresh_delta_views();
-	DO $$$$
-	BEGIN
-	    IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'underlying_quotes_with_deltas' AND relkind = 'm') THEN
-	        EXECUTE 'DROP MATERIALIZED VIEW underlying_quotes_with_deltas CASCADE';
-	    ELSIF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'underlying_quotes_with_deltas' AND relkind = 'v') THEN
-	        EXECUTE 'DROP VIEW underlying_quotes_with_deltas CASCADE';
-	    END IF;
-
-	    IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'option_chains_with_deltas' AND relkind = 'm') THEN
-	        EXECUTE 'DROP MATERIALIZED VIEW option_chains_with_deltas CASCADE';
-	    ELSIF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'option_chains_with_deltas' AND relkind = 'v') THEN
-	        EXECUTE 'DROP VIEW option_chains_with_deltas CASCADE';
-	    END IF;
-	END $$$$;
-	SELECT 'legacy artifacts pruned' AS status;
-	SQL
+	@printf "%s\n" \
+		"DROP FUNCTION IF EXISTS refresh_all_materialized_views();" \
+		"DROP FUNCTION IF EXISTS refresh_delta_views();" \
+		"SELECT 'DROP MATERIALIZED VIEW underlying_quotes_with_deltas CASCADE' WHERE EXISTS (SELECT 1 FROM pg_class WHERE relname = 'underlying_quotes_with_deltas' AND relkind = 'm')" \
+		"UNION ALL SELECT 'DROP VIEW underlying_quotes_with_deltas CASCADE' WHERE EXISTS (SELECT 1 FROM pg_class WHERE relname = 'underlying_quotes_with_deltas' AND relkind = 'v')" \
+		"UNION ALL SELECT 'DROP MATERIALIZED VIEW option_chains_with_deltas CASCADE' WHERE EXISTS (SELECT 1 FROM pg_class WHERE relname = 'option_chains_with_deltas' AND relkind = 'm')" \
+		"UNION ALL SELECT 'DROP VIEW option_chains_with_deltas CASCADE' WHERE EXISTS (SELECT 1 FROM pg_class WHERE relname = 'option_chains_with_deltas' AND relkind = 'v');" \
+		"\\gexec" \
+		"SELECT 'legacy artifacts pruned' AS status;" \
+	| $(PSQL)
 
 # =============================================================================
 # Interactive
