@@ -1484,7 +1484,7 @@ clear-data: ## Clear all data from tables (keeps schema)
 	@read -p "Are you sure? Type 'yes' to confirm: " confirm; \
 	if [ "$$confirm" = "yes" ]; then \
 		echo "$(YELLOW)Clearing all data...$(NC)"; \
-		$(PSQL) -c "TRUNCATE TABLE underlying_quotes, option_chains, gex_summary, gex_by_strike, data_quality_log, ingestion_metrics RESTART IDENTITY CASCADE;"; \
+		$(PSQL) -c "TRUNCATE TABLE underlying_quotes, option_chains, gex_summary, gex_by_strike, flow_cache_by_type_minute, flow_cache_by_strike_minute, flow_cache_by_expiration_minute, flow_cache_smart_money_minute, max_pain_oi_snapshot, max_pain_oi_snapshot_expiration RESTART IDENTITY CASCADE;"; \
 		echo "$(GREEN)✅ All data cleared$(NC)"; \
 	else \
 		echo "$(RED)❌ Aborted$(NC)"; \
