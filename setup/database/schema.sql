@@ -311,6 +311,8 @@ CREATE INDEX IF NOT EXISTS idx_flow_cache_smart_money_symbol_ts
 -- =============================================================================
 -- Interval flow views: 1min/5min/15min/1hr/1day
 -- =============================================================================
+
+-- Flow by Type views
 DROP VIEW IF EXISTS flow_by_type_1min CASCADE;
 DROP VIEW IF EXISTS flow_by_type_5min CASCADE;
 DROP VIEW IF EXISTS flow_by_type_15min CASCADE;
@@ -366,6 +368,7 @@ SELECT
 FROM flow_cache_by_type_minute
 GROUP BY 1, 2, 3;
 
+-- Flow by Strike views
 DROP VIEW IF EXISTS flow_by_strike_1min CASCADE;
 DROP VIEW IF EXISTS flow_by_strike_5min CASCADE;
 DROP VIEW IF EXISTS flow_by_strike_15min CASCADE;
@@ -373,7 +376,14 @@ DROP VIEW IF EXISTS flow_by_strike_1hr CASCADE;
 DROP VIEW IF EXISTS flow_by_strike_1day CASCADE;
 
 CREATE VIEW flow_by_strike_1min AS
-SELECT timestamp, symbol, strike, total_volume AS volume, total_premium AS premium
+SELECT
+    timestamp,
+    symbol,
+    strike,
+    total_volume AS volume,
+    total_premium AS premium,
+    net_delta AS net_volume,
+    net_delta * (total_premium::numeric / NULLIF(total_volume, 0)) AS net_premium
 FROM flow_cache_by_strike_minute;
 
 CREATE VIEW flow_by_strike_5min AS
@@ -382,7 +392,9 @@ SELECT
     symbol,
     strike,
     SUM(total_volume)::BIGINT AS volume,
-    SUM(total_premium)::NUMERIC(18, 2) AS premium
+    SUM(total_premium)::NUMERIC(18, 2) AS premium,
+    SUM(net_delta)::BIGINT AS net_volume,
+    SUM(net_delta * (total_premium::numeric / NULLIF(total_volume, 0)))::NUMERIC(18, 2) AS net_premium
 FROM flow_cache_by_strike_minute
 GROUP BY 1, 2, 3;
 
@@ -392,7 +404,9 @@ SELECT
     symbol,
     strike,
     SUM(total_volume)::BIGINT AS volume,
-    SUM(total_premium)::NUMERIC(18, 2) AS premium
+    SUM(total_premium)::NUMERIC(18, 2) AS premium,
+    SUM(net_delta)::BIGINT AS net_volume,
+    SUM(net_delta * (total_premium::numeric / NULLIF(total_volume, 0)))::NUMERIC(18, 2) AS net_premium
 FROM flow_cache_by_strike_minute
 GROUP BY 1, 2, 3;
 
@@ -402,7 +416,9 @@ SELECT
     symbol,
     strike,
     SUM(total_volume)::BIGINT AS volume,
-    SUM(total_premium)::NUMERIC(18, 2) AS premium
+    SUM(total_premium)::NUMERIC(18, 2) AS premium,
+    SUM(net_delta)::BIGINT AS net_volume,
+    SUM(net_delta * (total_premium::numeric / NULLIF(total_volume, 0)))::NUMERIC(18, 2) AS net_premium
 FROM flow_cache_by_strike_minute
 GROUP BY 1, 2, 3;
 
@@ -412,10 +428,13 @@ SELECT
     symbol,
     strike,
     SUM(total_volume)::BIGINT AS volume,
-    SUM(total_premium)::NUMERIC(18, 2) AS premium
+    SUM(total_premium)::NUMERIC(18, 2) AS premium,
+    SUM(net_delta)::BIGINT AS net_volume,
+    SUM(net_delta * (total_premium::numeric / NULLIF(total_volume, 0)))::NUMERIC(18, 2) AS net_premium
 FROM flow_cache_by_strike_minute
 GROUP BY 1, 2, 3;
 
+-- Flow by Expiration views
 DROP VIEW IF EXISTS flow_by_expiration_1min CASCADE;
 DROP VIEW IF EXISTS flow_by_expiration_5min CASCADE;
 DROP VIEW IF EXISTS flow_by_expiration_15min CASCADE;
@@ -423,52 +442,229 @@ DROP VIEW IF EXISTS flow_by_expiration_1hr CASCADE;
 DROP VIEW IF EXISTS flow_by_expiration_1day CASCADE;
 
 CREATE VIEW flow_by_expiration_1min AS
-SELECT timestamp, symbol, expiration, total_volume AS volume, total_premium AS premium
-FROM flow_cache_by_expiration_minute;
+WITH call_put_split AS (
+    SELECT
+        c.timestamp,
+        c.symbol,
+        e.expiration,
+        SUM(CASE WHEN c.option_type = 'C' THEN c.total_volume ELSE 0 END)::BIGINT AS call_volume,
+        SUM(CASE WHEN c.option_type = 'P' THEN c.total_volume ELSE 0 END)::BIGINT AS put_volume,
+        SUM(CASE WHEN c.option_type = 'C' THEN c.total_premium ELSE 0 END)::NUMERIC AS call_premium,
+        SUM(CASE WHEN c.option_type = 'P' THEN c.total_premium ELSE 0 END)::NUMERIC AS put_premium
+    FROM flow_cache_by_type_minute c
+    JOIN flow_cache_by_expiration_minute e ON e.timestamp = c.timestamp AND e.symbol = c.symbol
+    GROUP BY c.timestamp, c.symbol, e.expiration
+)
+SELECT
+    e.timestamp,
+    e.symbol,
+    e.expiration,
+    e.total_volume AS volume,
+    e.total_premium AS premium,
+    COALESCE(s.call_volume - s.put_volume, 0)::BIGINT AS net_volume,
+    COALESCE(s.call_premium - s.put_premium, 0)::NUMERIC(18, 2) AS net_premium
+FROM flow_cache_by_expiration_minute e
+LEFT JOIN call_put_split s ON s.timestamp = e.timestamp AND s.symbol = e.symbol AND s.expiration = e.expiration;
 
 CREATE VIEW flow_by_expiration_5min AS
+WITH call_put_split AS (
+    SELECT
+        date_trunc('hour', c.timestamp) + FLOOR(EXTRACT(MINUTE FROM c.timestamp) / 5) * INTERVAL '5 minutes' + INTERVAL '5 minutes' AS bucket_ts,
+        c.symbol,
+        e.expiration,
+        SUM(CASE WHEN c.option_type = 'C' THEN c.total_volume ELSE 0 END)::BIGINT AS call_volume,
+        SUM(CASE WHEN c.option_type = 'P' THEN c.total_volume ELSE 0 END)::BIGINT AS put_volume,
+        SUM(CASE WHEN c.option_type = 'C' THEN c.total_premium ELSE 0 END)::NUMERIC AS call_premium,
+        SUM(CASE WHEN c.option_type = 'P' THEN c.total_premium ELSE 0 END)::NUMERIC AS put_premium
+    FROM flow_cache_by_type_minute c
+    JOIN flow_cache_by_expiration_minute e ON e.timestamp = c.timestamp AND e.symbol = c.symbol
+    GROUP BY 1, 2, e.expiration
+)
 SELECT
-    date_trunc('hour', timestamp) + FLOOR(EXTRACT(MINUTE FROM timestamp) / 5) * INTERVAL '5 minutes' + INTERVAL '5 minutes' AS timestamp,
-    symbol,
-    expiration,
-    SUM(total_volume)::BIGINT AS volume,
-    SUM(total_premium)::NUMERIC(18, 2) AS premium
-FROM flow_cache_by_expiration_minute
+    date_trunc('hour', e.timestamp) + FLOOR(EXTRACT(MINUTE FROM e.timestamp) / 5) * INTERVAL '5 minutes' + INTERVAL '5 minutes' AS timestamp,
+    e.symbol,
+    e.expiration,
+    SUM(e.total_volume)::BIGINT AS volume,
+    SUM(e.total_premium)::NUMERIC(18, 2) AS premium,
+    COALESCE(MAX(s.call_volume - s.put_volume), 0)::BIGINT AS net_volume,
+    COALESCE(MAX(s.call_premium - s.put_premium), 0)::NUMERIC(18, 2) AS net_premium
+FROM flow_cache_by_expiration_minute e
+LEFT JOIN call_put_split s ON s.bucket_ts = date_trunc('hour', e.timestamp) + FLOOR(EXTRACT(MINUTE FROM e.timestamp) / 5) * INTERVAL '5 minutes' + INTERVAL '5 minutes'
+    AND s.symbol = e.symbol AND s.expiration = e.expiration
 GROUP BY 1, 2, 3;
 
 CREATE VIEW flow_by_expiration_15min AS
+WITH call_put_split AS (
+    SELECT
+        date_trunc('hour', c.timestamp) + FLOOR(EXTRACT(MINUTE FROM c.timestamp) / 15) * INTERVAL '15 minutes' + INTERVAL '15 minutes' AS bucket_ts,
+        c.symbol,
+        e.expiration,
+        SUM(CASE WHEN c.option_type = 'C' THEN c.total_volume ELSE 0 END)::BIGINT AS call_volume,
+        SUM(CASE WHEN c.option_type = 'P' THEN c.total_volume ELSE 0 END)::BIGINT AS put_volume,
+        SUM(CASE WHEN c.option_type = 'C' THEN c.total_premium ELSE 0 END)::NUMERIC AS call_premium,
+        SUM(CASE WHEN c.option_type = 'P' THEN c.total_premium ELSE 0 END)::NUMERIC AS put_premium
+    FROM flow_cache_by_type_minute c
+    JOIN flow_cache_by_expiration_minute e ON e.timestamp = c.timestamp AND e.symbol = c.symbol
+    GROUP BY 1, 2, e.expiration
+)
 SELECT
-    date_trunc('hour', timestamp) + FLOOR(EXTRACT(MINUTE FROM timestamp) / 15) * INTERVAL '15 minutes' + INTERVAL '15 minutes' AS timestamp,
-    symbol,
-    expiration,
-    SUM(total_volume)::BIGINT AS volume,
-    SUM(total_premium)::NUMERIC(18, 2) AS premium
-FROM flow_cache_by_expiration_minute
+    date_trunc('hour', e.timestamp) + FLOOR(EXTRACT(MINUTE FROM e.timestamp) / 15) * INTERVAL '15 minutes' + INTERVAL '15 minutes' AS timestamp,
+    e.symbol,
+    e.expiration,
+    SUM(e.total_volume)::BIGINT AS volume,
+    SUM(e.total_premium)::NUMERIC(18, 2) AS premium,
+    COALESCE(MAX(s.call_volume - s.put_volume), 0)::BIGINT AS net_volume,
+    COALESCE(MAX(s.call_premium - s.put_premium), 0)::NUMERIC(18, 2) AS net_premium
+FROM flow_cache_by_expiration_minute e
+LEFT JOIN call_put_split s ON s.bucket_ts = date_trunc('hour', e.timestamp) + FLOOR(EXTRACT(MINUTE FROM e.timestamp) / 15) * INTERVAL '15 minutes' + INTERVAL '15 minutes'
+    AND s.symbol = e.symbol AND s.expiration = e.expiration
 GROUP BY 1, 2, 3;
 
 CREATE VIEW flow_by_expiration_1hr AS
+WITH call_put_split AS (
+    SELECT
+        date_trunc('hour', c.timestamp) + INTERVAL '1 hour' AS bucket_ts,
+        c.symbol,
+        e.expiration,
+        SUM(CASE WHEN c.option_type = 'C' THEN c.total_volume ELSE 0 END)::BIGINT AS call_volume,
+        SUM(CASE WHEN c.option_type = 'P' THEN c.total_volume ELSE 0 END)::BIGINT AS put_volume,
+        SUM(CASE WHEN c.option_type = 'C' THEN c.total_premium ELSE 0 END)::NUMERIC AS call_premium,
+        SUM(CASE WHEN c.option_type = 'P' THEN c.total_premium ELSE 0 END)::NUMERIC AS put_premium
+    FROM flow_cache_by_type_minute c
+    JOIN flow_cache_by_expiration_minute e ON e.timestamp = c.timestamp AND e.symbol = c.symbol
+    GROUP BY 1, 2, e.expiration
+)
 SELECT
-    date_trunc('hour', timestamp) + INTERVAL '1 hour' AS timestamp,
-    symbol,
-    expiration,
-    SUM(total_volume)::BIGINT AS volume,
-    SUM(total_premium)::NUMERIC(18, 2) AS premium
-FROM flow_cache_by_expiration_minute
+    date_trunc('hour', e.timestamp) + INTERVAL '1 hour' AS timestamp,
+    e.symbol,
+    e.expiration,
+    SUM(e.total_volume)::BIGINT AS volume,
+    SUM(e.total_premium)::NUMERIC(18, 2) AS premium,
+    COALESCE(MAX(s.call_volume - s.put_volume), 0)::BIGINT AS net_volume,
+    COALESCE(MAX(s.call_premium - s.put_premium), 0)::NUMERIC(18, 2) AS net_premium
+FROM flow_cache_by_expiration_minute e
+LEFT JOIN call_put_split s ON s.bucket_ts = date_trunc('hour', e.timestamp) + INTERVAL '1 hour'
+    AND s.symbol = e.symbol AND s.expiration = e.expiration
 GROUP BY 1, 2, 3;
 
 CREATE VIEW flow_by_expiration_1day AS
+WITH call_put_split AS (
+    SELECT
+        date_trunc('day', c.timestamp) + INTERVAL '1 day' AS bucket_ts,
+        c.symbol,
+        e.expiration,
+        SUM(CASE WHEN c.option_type = 'C' THEN c.total_volume ELSE 0 END)::BIGINT AS call_volume,
+        SUM(CASE WHEN c.option_type = 'P' THEN c.total_volume ELSE 0 END)::BIGINT AS put_volume,
+        SUM(CASE WHEN c.option_type = 'C' THEN c.total_premium ELSE 0 END)::NUMERIC AS call_premium,
+        SUM(CASE WHEN c.option_type = 'P' THEN c.total_premium ELSE 0 END)::NUMERIC AS put_premium
+    FROM flow_cache_by_type_minute c
+    JOIN flow_cache_by_expiration_minute e ON e.timestamp = c.timestamp AND e.symbol = c.symbol
+    GROUP BY 1, 2, e.expiration
+)
 SELECT
-    date_trunc('day', timestamp) + INTERVAL '1 day' AS timestamp,
-    symbol,
-    expiration,
-    SUM(total_volume)::BIGINT AS volume,
-    SUM(total_premium)::NUMERIC(18, 2) AS premium
-FROM flow_cache_by_expiration_minute
+    date_trunc('day', e.timestamp) + INTERVAL '1 day' AS timestamp,
+    e.symbol,
+    e.expiration,
+    SUM(e.total_volume)::BIGINT AS volume,
+    SUM(e.total_premium)::NUMERIC(18, 2) AS premium,
+    COALESCE(MAX(s.call_volume - s.put_volume), 0)::BIGINT AS net_volume,
+    COALESCE(MAX(s.call_premium - s.put_premium), 0)::NUMERIC(18, 2) AS net_premium
+FROM flow_cache_by_expiration_minute e
+LEFT JOIN call_put_split s ON s.bucket_ts = date_trunc('day', e.timestamp) + INTERVAL '1 day'
+    AND s.symbol = e.symbol AND s.expiration = e.expiration
 GROUP BY 1, 2, 3;
 
 -- =============================================================================
 -- Flow smart money + buying pressure
 -- =============================================================================
+
+-- Smart money interval views: 1min/5min/15min/1hr/1day
+DROP VIEW IF EXISTS flow_smart_money_1min CASCADE;
+DROP VIEW IF EXISTS flow_smart_money_5min CASCADE;
+DROP VIEW IF EXISTS flow_smart_money_15min CASCADE;
+DROP VIEW IF EXISTS flow_smart_money_1hr CASCADE;
+DROP VIEW IF EXISTS flow_smart_money_1day CASCADE;
+
+CREATE VIEW flow_smart_money_1min AS
+SELECT
+    timestamp,
+    symbol,
+    option_symbol AS contract,
+    strike,
+    expiration,
+    (expiration - CURRENT_DATE) AS dte,
+    option_type,
+    total_volume AS flow,
+    total_premium AS notional,
+    avg_delta AS delta,
+    unusual_activity_score AS score
+FROM flow_cache_smart_money_minute;
+
+CREATE VIEW flow_smart_money_5min AS
+SELECT
+    date_trunc('hour', timestamp) + FLOOR(EXTRACT(MINUTE FROM timestamp) / 5) * INTERVAL '5 minutes' + INTERVAL '5 minutes' AS timestamp,
+    symbol,
+    option_symbol AS contract,
+    strike,
+    expiration,
+    (expiration - CURRENT_DATE) AS dte,
+    option_type,
+    SUM(total_volume)::BIGINT AS flow,
+    SUM(total_premium)::NUMERIC(18, 2) AS notional,
+    AVG(avg_delta)::NUMERIC(10, 6) AS delta,
+    MAX(unusual_activity_score)::NUMERIC(5, 2) AS score
+FROM flow_cache_smart_money_minute
+GROUP BY 1, 2, 3, 4, 5, 6, 7;
+
+CREATE VIEW flow_smart_money_15min AS
+SELECT
+    date_trunc('hour', timestamp) + FLOOR(EXTRACT(MINUTE FROM timestamp) / 15) * INTERVAL '15 minutes' + INTERVAL '15 minutes' AS timestamp,
+    symbol,
+    option_symbol AS contract,
+    strike,
+    expiration,
+    (expiration - CURRENT_DATE) AS dte,
+    option_type,
+    SUM(total_volume)::BIGINT AS flow,
+    SUM(total_premium)::NUMERIC(18, 2) AS notional,
+    AVG(avg_delta)::NUMERIC(10, 6) AS delta,
+    MAX(unusual_activity_score)::NUMERIC(5, 2) AS score
+FROM flow_cache_smart_money_minute
+GROUP BY 1, 2, 3, 4, 5, 6, 7;
+
+CREATE VIEW flow_smart_money_1hr AS
+SELECT
+    date_trunc('hour', timestamp) + INTERVAL '1 hour' AS timestamp,
+    symbol,
+    option_symbol AS contract,
+    strike,
+    expiration,
+    (expiration - CURRENT_DATE) AS dte,
+    option_type,
+    SUM(total_volume)::BIGINT AS flow,
+    SUM(total_premium)::NUMERIC(18, 2) AS notional,
+    AVG(avg_delta)::NUMERIC(10, 6) AS delta,
+    MAX(unusual_activity_score)::NUMERIC(5, 2) AS score
+FROM flow_cache_smart_money_minute
+GROUP BY 1, 2, 3, 4, 5, 6, 7;
+
+CREATE VIEW flow_smart_money_1day AS
+SELECT
+    date_trunc('day', timestamp) + INTERVAL '1 day' AS timestamp,
+    symbol,
+    option_symbol AS contract,
+    strike,
+    expiration,
+    (expiration - CURRENT_DATE) AS dte,
+    option_type,
+    SUM(total_volume)::BIGINT AS flow,
+    SUM(total_premium)::NUMERIC(18, 2) AS notional,
+    AVG(avg_delta)::NUMERIC(10, 6) AS delta,
+    MAX(unusual_activity_score)::NUMERIC(5, 2) AS score
+FROM flow_cache_smart_money_minute
+GROUP BY 1, 2, 3, 4, 5, 6, 7;
+
+-- Legacy view with formatting (for backwards compatibility)
 DROP VIEW IF EXISTS option_flow_smart_money CASCADE;
 CREATE VIEW option_flow_smart_money AS
 SELECT
@@ -624,162 +820,3 @@ SELECT
     END AS gex_level
 FROM latest_options
 GROUP BY underlying, strike;
-
-DROP VIEW IF EXISTS dealer_hedging_pressure CASCADE;
-CREATE VIEW dealer_hedging_pressure AS
-WITH latest_price AS (
-    SELECT DISTINCT ON (symbol)
-        symbol,
-        timestamp,
-        close AS current_price,
-        close - LAG(close) OVER (PARTITION BY symbol ORDER BY timestamp) AS price_change
-    FROM underlying_quotes
-    ORDER BY symbol, timestamp DESC
-),
-latest_delta AS (
-    SELECT
-        underlying AS symbol,
-        SUM(delta * open_interest * 100)::numeric AS expected_hedge_shares
-    FROM (
-        SELECT DISTINCT ON (option_symbol)
-            option_symbol,
-            underlying,
-            delta,
-            open_interest,
-            timestamp
-        FROM option_chains
-        WHERE timestamp >= NOW() - INTERVAL '10 minutes'
-          AND delta IS NOT NULL
-          AND open_interest > 0
-        ORDER BY option_symbol, timestamp DESC
-    ) t
-    GROUP BY underlying
-)
-SELECT
-    p.timestamp AT TIME ZONE 'America/New_York' AS time_et,
-    p.timestamp,
-    p.symbol,
-    p.current_price,
-    p.price_change,
-    COALESCE(d.expected_hedge_shares, 0) AS expected_hedge_shares,
-    CASE
-        WHEN COALESCE(d.expected_hedge_shares, 0) > 1000000 THEN '🔴 Heavy Sell-Hedging Risk'
-        WHEN COALESCE(d.expected_hedge_shares, 0) < -1000000 THEN '🟢 Heavy Buy-Hedging Risk'
-        ELSE '⚪ Balanced Hedging'
-    END AS hedge_pressure
-FROM latest_price p
-LEFT JOIN latest_delta d ON d.symbol = p.symbol;
-
-DROP VIEW IF EXISTS unusual_volume_spikes CASCADE;
-CREATE VIEW unusual_volume_spikes AS
-WITH base AS (
-    SELECT
-        timestamp AT TIME ZONE 'America/New_York' AS time_et,
-        timestamp,
-        symbol,
-        close AS price,
-        (up_volume + down_volume) AS current_volume,
-        AVG(up_volume + down_volume) OVER (
-            PARTITION BY symbol
-            ORDER BY timestamp
-            ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
-        ) AS avg_volume,
-        STDDEV_SAMP(up_volume + down_volume) OVER (
-            PARTITION BY symbol
-            ORDER BY timestamp
-            ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
-        ) AS volume_stddev,
-        ROUND(COALESCE((up_volume::numeric / NULLIF(up_volume + down_volume, 0)) * 100, 50), 2) AS buying_pressure_pct
-    FROM underlying_quotes
-)
-SELECT
-    time_et,
-    timestamp,
-    symbol,
-    price,
-    current_volume,
-    COALESCE(avg_volume, 0)::numeric(18,2) AS avg_volume,
-    ROUND(COALESCE((current_volume - avg_volume) / NULLIF(volume_stddev, 0), 0)::numeric, 2) AS volume_sigma,
-    ROUND(COALESCE(current_volume / NULLIF(avg_volume, 0), 1)::numeric, 2) AS volume_ratio,
-    buying_pressure_pct,
-    CASE
-        WHEN COALESCE((current_volume - avg_volume) / NULLIF(volume_stddev, 0), 0) >= 3 THEN '🚨 Extreme Spike'
-        WHEN COALESCE((current_volume - avg_volume) / NULLIF(volume_stddev, 0), 0) >= 2 THEN '⚡ High Spike'
-        WHEN COALESCE((current_volume - avg_volume) / NULLIF(volume_stddev, 0), 0) >= 1 THEN '📈 Moderate Spike'
-        ELSE '⚪ Normal'
-    END AS volume_class
-FROM base;
-
-DROP VIEW IF EXISTS momentum_divergence CASCADE;
-CREATE VIEW momentum_divergence AS
-WITH option_flow AS (
-    SELECT
-        timestamp,
-        symbol,
-        SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE -total_premium END)::numeric AS net_option_flow
-    FROM flow_cache_by_type_minute
-    GROUP BY timestamp, symbol
-),
-base AS (
-    SELECT
-        u.timestamp AT TIME ZONE 'America/New_York' AS time_et,
-        u.timestamp,
-        u.symbol,
-        u.close AS price,
-        u.close - LAG(u.close, 5) OVER (PARTITION BY u.symbol ORDER BY u.timestamp) AS price_change_5min,
-        (u.up_volume - u.down_volume)::bigint AS net_volume,
-        o.net_option_flow
-    FROM underlying_quotes u
-    LEFT JOIN option_flow o ON o.timestamp = u.timestamp AND o.symbol = u.symbol
-)
-SELECT
-    time_et,
-    timestamp,
-    symbol,
-    price,
-    ROUND(price_change_5min::numeric, 2) AS price_change_5min,
-    net_volume,
-    net_option_flow,
-    CASE
-        WHEN price_change_5min > 0 AND net_option_flow < -50000 THEN '🚨 Bearish Divergence (Price Up, Puts Buying)'
-        WHEN price_change_5min < 0 AND net_option_flow > 50000 THEN '🚨 Bullish Divergence (Price Down, Calls Buying)'
-        WHEN price_change_5min > 0 AND net_option_flow > 50000 THEN '🟢 Bullish Confirmation'
-        WHEN price_change_5min < 0 AND net_option_flow < -50000 THEN '🔴 Bearish Confirmation'
-        WHEN price_change_5min > 0 AND net_volume < 0 THEN '⚠️ Weak Rally (Selling Volume)'
-        WHEN price_change_5min < 0 AND net_volume > 0 THEN '⚠️ Weak Selloff (Buying Volume)'
-        ELSE '⚪ Neutral'
-    END AS divergence_signal
-FROM base
-WHERE price_change_5min IS NOT NULL;
-
--- =============================================================================
--- Max pain cache tables for /api/max-pain/current
--- =============================================================================
-CREATE TABLE IF NOT EXISTS max_pain_oi_snapshot (
-    symbol VARCHAR(10) NOT NULL,
-    as_of_date DATE NOT NULL,
-    source_timestamp TIMESTAMPTZ NOT NULL,
-    underlying_price NUMERIC(12, 4) NOT NULL,
-    max_pain NUMERIC(12, 4) NOT NULL,
-    difference NUMERIC(12, 4) NOT NULL,
-    expirations JSONB NOT NULL DEFAULT '[]'::jsonb,
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (symbol, as_of_date)
-);
-
-CREATE TABLE IF NOT EXISTS max_pain_oi_snapshot_expiration (
-    symbol VARCHAR(10) NOT NULL,
-    as_of_date DATE NOT NULL,
-    source_timestamp TIMESTAMPTZ NOT NULL,
-    expiration DATE NOT NULL,
-    max_pain NUMERIC(12, 4) NOT NULL,
-    difference_from_underlying NUMERIC(12, 4) NOT NULL,
-    strikes JSONB NOT NULL DEFAULT '[]'::jsonb,
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (symbol, as_of_date, expiration)
-);
-
-CREATE INDEX IF NOT EXISTS idx_max_pain_oi_snapshot_symbol_date
-    ON max_pain_oi_snapshot(symbol, as_of_date DESC);
-CREATE INDEX IF NOT EXISTS idx_max_pain_oi_snapshot_exp_symbol_exp
-    ON max_pain_oi_snapshot_expiration(symbol, as_of_date DESC, expiration);

@@ -136,6 +136,11 @@ help: ## Show this help message
 	@echo "  make divergence         - Momentum divergence signals"
 	@echo "  make day-trading        - Combined day trading dashboard"
 	@echo ""
+	@echo "$(GREEN)Max Pain:$(NC)"
+	@echo "  make max-pain-current      - Max-pain snapshot"
+	@echo "  make max-pain-expirations  - All expirations from latest snapshot"
+	@echo "  make max-pain-strikes      - Detailed strike breakdown for nearest expiration"
+	@echo ""
 	@echo "$(GREEN)Data Quality:$(NC)"
 	@echo "  make gaps               - Check for data gaps"
 	@echo "  make gaps-today         - Today's data gaps"
@@ -862,15 +867,36 @@ flow-by-type: ## Puts vs calls flow (all strikes/expirations)
 	@echo "$(BLUE)=== Option Flow by Type ($(FLOW_INTERVAL), Most Recent 20 Rows) ===$(NC)"
 	@$(PSQL) -c "\
 		SET statement_timeout = '10s'; \
+		WITH aggregated AS ( \
+			SELECT \
+				timestamp, \
+				symbol, \
+				MAX(CASE WHEN option_type = 'C' THEN volume END) as call_volume, \
+				MAX(CASE WHEN option_type = 'C' THEN premium END) as call_premium, \
+				MAX(CASE WHEN option_type = 'P' THEN volume END) as put_volume, \
+				MAX(CASE WHEN option_type = 'P' THEN premium END) as put_premium \
+			FROM flow_by_type_$(FLOW_INTERVAL) \
+			WHERE symbol = '$(FLOW_SYMBOL)' \
+			GROUP BY timestamp, symbol \
+		) \
 		SELECT \
 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
 			symbol, \
-			option_type as type, \
-			volume, \
-			TO_CHAR(premium, 'FM999,999,999') as premium \
-		FROM flow_by_type_$(FLOW_INTERVAL) \
-		WHERE symbol = '$(FLOW_SYMBOL)' \
-		ORDER BY timestamp DESC, option_type \
+			COALESCE(call_volume, 0) as call_volume, \
+			TO_CHAR(COALESCE(call_premium, 0), 'FM999,999,999') as call_premium, \
+			COALESCE(put_volume, 0) as put_volume, \
+			TO_CHAR(COALESCE(put_premium, 0), 'FM999,999,999') as put_premium, \
+			COALESCE(call_volume, 0) - COALESCE(put_volume, 0) as net_volume, \
+			TO_CHAR(COALESCE(call_premium, 0) - COALESCE(put_premium, 0), 'FM999,999,999') as net_premium, \
+			CASE \
+				WHEN COALESCE(call_volume, 0) - COALESCE(put_volume, 0) > 500 THEN '🟢 Strong Calls' \
+				WHEN COALESCE(call_volume, 0) - COALESCE(put_volume, 0) > 0 THEN '✅ Calls' \
+				WHEN COALESCE(call_volume, 0) - COALESCE(put_volume, 0) < -500 THEN '🔴 Strong Puts' \
+				WHEN COALESCE(call_volume, 0) - COALESCE(put_volume, 0) < 0 THEN '❌ Puts' \
+				ELSE '⚪ Neutral' \
+			END as flow_bias \
+		FROM aggregated \
+		ORDER BY timestamp DESC \
 		LIMIT 20;"
 
 .PHONY: flow-by-strike
@@ -883,7 +909,16 @@ flow-by-strike: ## Flow by strike level
 			symbol, \
 			strike, \
 			volume, \
-			TO_CHAR(premium, 'FM999,999,999') as premium \
+			TO_CHAR(premium, 'FM999,999,999') as premium, \
+			net_volume, \
+			TO_CHAR(net_premium, 'FM999,999,999') as net_premium, \
+			CASE \
+				WHEN net_volume > 100 THEN '🟢 Strong Calls' \
+				WHEN net_volume > 0 THEN '✅ Calls' \
+				WHEN net_volume < -100 THEN '🔴 Strong Puts' \
+				WHEN net_volume < 0 THEN '❌ Puts' \
+				ELSE '⚪ Neutral' \
+			END as flow_bias \
 		FROM flow_by_strike_$(FLOW_INTERVAL) \
 		WHERE symbol = '$(FLOW_SYMBOL)' \
 		ORDER BY timestamp DESC, strike \
@@ -898,8 +933,18 @@ flow-by-expiration: ## Flow by expiration date
 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
 			symbol, \
 			expiration, \
+			(expiration - CURRENT_DATE) as dte, \
 			volume, \
-			TO_CHAR(premium, 'FM999,999,999') as premium \
+			TO_CHAR(premium, 'FM999,999,999') as premium, \
+			net_volume, \
+			TO_CHAR(net_premium, 'FM999,999,999') as net_premium, \
+			CASE \
+				WHEN net_volume > 500 THEN '🟢 Strong Calls' \
+				WHEN net_volume > 0 THEN '✅ Calls' \
+				WHEN net_volume < -500 THEN '🔴 Strong Puts' \
+				WHEN net_volume < 0 THEN '❌ Puts' \
+				ELSE '⚪ Neutral' \
+			END as flow_bias \
 		FROM flow_by_expiration_$(FLOW_INTERVAL) \
 		WHERE symbol = '$(FLOW_SYMBOL)' \
 		ORDER BY timestamp DESC, expiration \
@@ -1159,7 +1204,10 @@ flow-live: ## Combined real-time flow dashboard
 	@$(PSQL) -c "\
 		SET statement_timeout = '10s'; \
 		WITH strike_window AS ( \
-			SELECT strike, SUM(total_volume)::bigint AS total_flow \
+			SELECT \
+				strike, \
+				SUM(total_volume)::bigint AS total_flow, \
+				SUM(net_delta)::bigint AS net_flow \
 			FROM flow_cache_by_strike_minute \
 			WHERE symbol = '$(FLOW_SYMBOL)' \
 				AND timestamp > NOW() - INTERVAL '30 minutes' \
@@ -1167,7 +1215,13 @@ flow-live: ## Combined real-time flow dashboard
 		) \
 		SELECT \
 			strike, \
-			total_flow as total \
+			total_flow as total, \
+			net_flow, \
+			CASE \
+				WHEN net_flow > 100 THEN '🟢 Calls' \
+				WHEN net_flow < -100 THEN '🔴 Puts' \
+				ELSE '⚪ Mixed' \
+			END as bias \
 		FROM strike_window \
 		ORDER BY total_flow DESC \
 		LIMIT 10;"
@@ -1406,6 +1460,77 @@ day-trading: ## Combined day trading dashboard
 		LIMIT 10;"
 	@echo ""
 	@echo "$(BLUE)================================================================================$(NC)"
+
+# =============================================================================
+# Max Pain
+# =============================================================================
+
+.PHONY: max-pain-current
+max-pain-current:
+	@echo "=== Max Pain Current (Latest OI Snapshot) ==="
+	@$(PSQL) -c "\
+		SELECT \
+			symbol, \
+			as_of_date, \
+			TO_CHAR(source_timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI:SS TZ') AS source_timestamp_et, \
+			underlying_price, \
+			max_pain, \
+			difference, \
+			jsonb_array_length(expirations) AS num_expirations \
+		FROM max_pain_oi_snapshot \
+		WHERE symbol = 'SPY' \
+		ORDER BY as_of_date DESC \
+		LIMIT 1;"
+
+.PHONY: max-pain-expirations
+max-pain-expirations:
+	@echo "=== Max Pain by Expiration (Latest Snapshot) ==="
+	@$(PSQL) -c "\
+		WITH latest_snapshot AS ( \
+			SELECT as_of_date \
+			FROM max_pain_oi_snapshot \
+			WHERE symbol = 'SPY' \
+			ORDER BY as_of_date DESC \
+			LIMIT 1 \
+		) \
+		SELECT \
+			e.expiration, \
+			e.max_pain, \
+			e.difference_from_underlying, \
+			jsonb_array_length(e.strikes) AS num_strikes \
+		FROM max_pain_oi_snapshot_expiration e \
+		WHERE e.symbol = 'SPY' \
+			AND e.as_of_date = (SELECT as_of_date FROM latest_snapshot) \
+		ORDER BY e.expiration;"
+
+.PHONY: max-pain-strikes
+max-pain-strikes:
+	@echo "=== Max Pain Strikes for Nearest Expiration ==="
+	@$(PSQL) -c "\
+		WITH latest_snapshot AS ( \
+			SELECT as_of_date \
+			FROM max_pain_oi_snapshot \
+			WHERE symbol = 'SPY' \
+			ORDER BY as_of_date DESC \
+			LIMIT 1 \
+		), \
+		nearest_exp AS ( \
+			SELECT expiration, strikes \
+			FROM max_pain_oi_snapshot_expiration \
+			WHERE symbol = 'SPY' \
+				AND as_of_date = (SELECT as_of_date FROM latest_snapshot) \
+			ORDER BY expiration \
+			LIMIT 1 \
+		) \
+		SELECT \
+			(strike->>'settlement_price')::numeric AS settlement_price, \
+			(strike->>'call_notional')::numeric AS call_notional, \
+			(strike->>'put_notional')::numeric AS put_notional, \
+			(strike->>'total_notional')::numeric AS total_notional \
+		FROM nearest_exp, \
+			jsonb_array_elements(strikes) AS strike \
+		ORDER BY (strike->>'settlement_price')::numeric \
+		LIMIT 20;"
 
 # =============================================================================
 # Data Quality
@@ -1682,16 +1807,15 @@ expiration-summary: ## Summary by expiration
 	@$(PSQL) -c "\
 		SELECT \
 			expiration, \
+			option_type, \
 			COUNT(DISTINCT option_symbol) as contracts, \
-			SUM(volume) FILTER (WHERE option_type = 'C') as call_volume, \
-			SUM(volume) FILTER (WHERE option_type = 'P') as put_volume, \
-			ROUND(SUM(volume) FILTER (WHERE option_type = 'P')::numeric / NULLIF(SUM(volume) FILTER (WHERE option_type = 'C'), 0), 2) as put_call_ratio, \
-			SUM(open_interest) FILTER (WHERE option_type = 'C') as call_oi, \
-			SUM(open_interest) FILTER (WHERE option_type = 'P') as put_oi \
+			SUM(volume) as total_volume, \
+			SUM(open_interest) as total_oi, \
+			ROUND(AVG(last), 2) as avg_price \
 		FROM option_chains \
 		WHERE timestamp = (SELECT MAX(timestamp) FROM option_chains) \
-		GROUP BY expiration \
-		ORDER BY expiration;"
+		GROUP BY expiration, option_type \
+		ORDER BY expiration, option_type;"
 
 .PHONY: atm-options
 atm-options: ## At-the-money options analysis
