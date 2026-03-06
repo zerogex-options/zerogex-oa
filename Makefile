@@ -1436,25 +1436,25 @@ size: ## Show table sizes
 .PHONY: db-prune-legacy
 db-prune-legacy: ## Drop obsolete legacy refresh/materialized-view artifacts
 	@echo "$(BLUE)=== Pruning legacy materialized-view refresh artifacts ===$(NC)"
-	@$(PSQL) -c "\
-		DROP FUNCTION IF EXISTS refresh_all_materialized_views(); \
-		DROP FUNCTION IF EXISTS refresh_delta_views(); \
-		DO \
-		$$$$ \
-		BEGIN \
-			IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'underlying_quotes_with_deltas' AND relkind = 'm') THEN \
-				EXECUTE 'DROP MATERIALIZED VIEW underlying_quotes_with_deltas CASCADE'; \
-			ELSIF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'underlying_quotes_with_deltas' AND relkind = 'v') THEN \
-				EXECUTE 'DROP VIEW underlying_quotes_with_deltas CASCADE'; \
-			END IF; \
-			IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'option_chains_with_deltas' AND relkind = 'm') THEN \
-				EXECUTE 'DROP MATERIALIZED VIEW option_chains_with_deltas CASCADE'; \
-			ELSIF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'option_chains_with_deltas' AND relkind = 'v') THEN \
-				EXECUTE 'DROP VIEW option_chains_with_deltas CASCADE'; \
-			END IF; \
-		END \
-		$$$$; \
-		SELECT 'legacy artifacts pruned' as status;"
+	@cat <<'SQL' | $(PSQL)
+	DROP FUNCTION IF EXISTS refresh_all_materialized_views();
+	DROP FUNCTION IF EXISTS refresh_delta_views();
+	DO $$$$
+	BEGIN
+		IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'underlying_quotes_with_deltas' AND relkind = 'm') THEN
+			EXECUTE 'DROP MATERIALIZED VIEW underlying_quotes_with_deltas CASCADE';
+		ELSIF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'underlying_quotes_with_deltas' AND relkind = 'v') THEN
+			EXECUTE 'DROP VIEW underlying_quotes_with_deltas CASCADE';
+		END IF;
+
+		IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'option_chains_with_deltas' AND relkind = 'm') THEN
+			EXECUTE 'DROP MATERIALIZED VIEW option_chains_with_deltas CASCADE';
+		ELSIF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'option_chains_with_deltas' AND relkind = 'v') THEN
+			EXECUTE 'DROP VIEW option_chains_with_deltas CASCADE';
+		END IF;
+	END $$$$;
+	SELECT 'legacy artifacts pruned' as status;
+	SQL
 
 # =============================================================================
 # Interactive
