@@ -878,6 +878,28 @@ flow-by-strike: ## Flow by strike level
 	@echo "$(BLUE)=== Option Flow by Strike (Most Recent 20 Rows) ===$(NC)"
 	@$(PSQL) -c "\
 		SET statement_timeout = '10s'; \
+		WITH latest AS ( \
+			SELECT MAX(timestamp) as max_ts \
+			FROM option_chains \
+			WHERE underlying = '$(FLOW_SYMBOL)' \
+		), option_chain_deltas AS ( \
+			SELECT \
+				timestamp, underlying, strike, option_type, last, \
+				COALESCE( \
+					GREATEST( \
+						volume - LAG(volume) OVER ( \
+							PARTITION BY option_symbol, DATE(timestamp AT TIME ZONE 'America/New_York') \
+							ORDER BY timestamp \
+						), \
+						0 \
+					), \
+					0 \
+				) AS volume_delta \
+			FROM option_chains, latest \
+			WHERE underlying = '$(FLOW_SYMBOL)' \
+				AND latest.max_ts IS NOT NULL \
+				AND timestamp >= latest.max_ts - INTERVAL '120 minutes' \
+		) \
 		SELECT \
 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
 			underlying as symbol, \
@@ -886,9 +908,8 @@ flow-by-strike: ## Flow by strike level
 			TO_CHAR(SUM(CASE WHEN option_type = 'C' THEN volume_delta * last * 100 ELSE 0 END), 'FM999,999,999') as call_premium, \
 			SUM(CASE WHEN option_type = 'P' THEN volume_delta ELSE 0 END) AS put_volume, \
 			TO_CHAR(SUM(CASE WHEN option_type = 'P' THEN volume_delta * last * 100 ELSE 0 END), 'FM999,999,999') as put_premium \
-		FROM option_chains_with_deltas \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
-			AND volume_delta > 0 \
+		FROM option_chain_deltas \
+		WHERE volume_delta > 0 \
 		GROUP BY timestamp, underlying, strike \
 		ORDER BY timestamp DESC, strike \
 		LIMIT 20;"
@@ -898,6 +919,28 @@ flow-by-expiration: ## Flow by expiration date
 	@echo "$(BLUE)=== Option Flow by Expiration (Most Recent 20 Rows) ===$(NC)"
 	@$(PSQL) -c "\
 		SET statement_timeout = '10s'; \
+		WITH latest AS ( \
+			SELECT MAX(timestamp) as max_ts \
+			FROM option_chains \
+			WHERE underlying = '$(FLOW_SYMBOL)' \
+		), option_chain_deltas AS ( \
+			SELECT \
+				timestamp, underlying, expiration, option_type, last, \
+				COALESCE( \
+					GREATEST( \
+						volume - LAG(volume) OVER ( \
+							PARTITION BY option_symbol, DATE(timestamp AT TIME ZONE 'America/New_York') \
+							ORDER BY timestamp \
+						), \
+						0 \
+					), \
+					0 \
+				) AS volume_delta \
+			FROM option_chains, latest \
+			WHERE underlying = '$(FLOW_SYMBOL)' \
+				AND latest.max_ts IS NOT NULL \
+				AND timestamp >= latest.max_ts - INTERVAL '120 minutes' \
+		) \
 		SELECT \
 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
 			underlying as symbol, \
@@ -906,9 +949,8 @@ flow-by-expiration: ## Flow by expiration date
 			TO_CHAR(SUM(CASE WHEN option_type = 'C' THEN volume_delta * last * 100 ELSE 0 END), 'FM999,999,999') as call_premium, \
 			SUM(CASE WHEN option_type = 'P' THEN volume_delta ELSE 0 END) AS put_volume, \
 			TO_CHAR(SUM(CASE WHEN option_type = 'P' THEN volume_delta * last * 100 ELSE 0 END), 'FM999,999,999') as put_premium \
-		FROM option_chains_with_deltas \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
-			AND volume_delta > 0 \
+		FROM option_chain_deltas \
+		WHERE volume_delta > 0 \
 		GROUP BY timestamp, underlying, expiration \
 		ORDER BY timestamp DESC, expiration \
 		LIMIT 20;"
@@ -917,7 +959,11 @@ flow-by-expiration: ## Flow by expiration date
 flow-smart-money: ## Unusual activity detection
 	@echo "$(BLUE)=== Smart Money Flow / Unusual Activity (Most Recent 20 Rows) ===$(NC)"
 	@$(PSQL) -c "\
-		WITH option_chain_deltas AS ( \
+		WITH latest AS ( \
+			SELECT MAX(timestamp) as max_ts \
+			FROM option_chains \
+			WHERE underlying = '$(FLOW_SYMBOL)' \
+		), option_chain_deltas AS ( \
 			SELECT \
 				timestamp, option_symbol, underlying, strike, expiration, option_type, last, implied_volatility, delta, \
 				COALESCE( \
@@ -930,8 +976,10 @@ flow-smart-money: ## Unusual activity detection
 					), \
 					0 \
 				) AS volume_delta \
-			FROM option_chains \
+			FROM option_chains, latest \
 			WHERE underlying = '$(FLOW_SYMBOL)' \
+				AND latest.max_ts IS NOT NULL \
+				AND timestamp >= latest.max_ts - INTERVAL '120 minutes' \
 		), scored AS ( \
 			SELECT \
 				timestamp AT TIME ZONE 'America/New_York' as time_et, \
@@ -984,7 +1032,7 @@ flow-smart-money: ## Unusual activity detection
 			notional_class, \
 			size_class \
 		FROM scored \
-		ORDER BY unusual_score DESC, notional DESC \
+		ORDER BY timestamp DESC, unusual_score DESC, notional DESC \
 		LIMIT 20;"
 
 .PHONY: flow-buying-pressure
