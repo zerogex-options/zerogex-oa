@@ -20,6 +20,7 @@ VENV_PYTHON = venv/bin/python
 
 # Flow query symbol filter (override with: make flow-by-type FLOW_SYMBOL=QQQ)
 FLOW_SYMBOL ?= SPY
+FLOW_INTERVAL ?= 1min
 
 # Colors for output
 BLUE = \033[0;34m
@@ -121,6 +122,7 @@ help: ## Show this help message
 	@echo "  make flow-by-type         - Puts vs calls flow (all strikes/expirations)"
 	@echo "  make flow-by-strike       - Flow by strike level"
 	@echo "  make flow-by-expiration   - Flow by expiration date"
+	@echo "    (set FLOW_INTERVAL=1min|5min|15min|1hr|1day)"
 	@echo "  make flow-smart-money     - Unusual activity detection"
 	@echo "  make flow-buying-pressure - Underlying buying/selling pressure"
 	@echo "  make flow-live            - Combined real-time flow dashboard"
@@ -857,102 +859,49 @@ gex-preview: ## Preview GEX calculation data
 
 .PHONY: flow-by-type
 flow-by-type: ## Puts vs calls flow (all strikes/expirations)
-	@echo "$(BLUE)=== Option Flow by Type (Most Recent 20 Rows) ===$(NC)"
+	@echo "$(BLUE)=== Option Flow by Type ($(FLOW_INTERVAL), Most Recent 20 Rows) ===$(NC)"
 	@$(PSQL) -c "\
 		SET statement_timeout = '10s'; \
 		SELECT \
 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
 			symbol, \
-			SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END) AS call_volume, \
-			TO_CHAR(SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE 0 END), 'FM999,999,999') as call_premium, \
-			SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END) AS put_volume, \
-			TO_CHAR(SUM(CASE WHEN option_type = 'P' THEN total_premium ELSE 0 END), 'FM999,999,999') as put_premium \
-		FROM flow_cache_by_type_minute \
+			put_volume, \
+			TO_CHAR(put_premium, 'FM999,999,999') as put_premium, \
+			call_volume, \
+			TO_CHAR(call_premium, 'FM999,999,999') as call_premium \
+		FROM flow_by_type_$(FLOW_INTERVAL) \
 		WHERE symbol = '$(FLOW_SYMBOL)' \
-		GROUP BY timestamp, symbol \
 		ORDER BY timestamp DESC \
 		LIMIT 20;"
 
 .PHONY: flow-by-strike
 flow-by-strike: ## Flow by strike level
-	@echo "$(BLUE)=== Option Flow by Strike (Most Recent 20 Rows) ===$(NC)"
+	@echo "$(BLUE)=== Option Flow by Strike ($(FLOW_INTERVAL), Most Recent 20 Rows) ===$(NC)"
 	@$(PSQL) -c "\
 		SET statement_timeout = '10s'; \
-		WITH latest AS ( \
-			SELECT MAX(timestamp) as max_ts \
-			FROM option_chains \
-			WHERE underlying = '$(FLOW_SYMBOL)' \
-		), option_chain_deltas AS ( \
-			SELECT \
-				timestamp, underlying, strike, option_type, last, \
-				COALESCE( \
-					GREATEST( \
-						volume - LAG(volume) OVER ( \
-							PARTITION BY option_symbol, DATE(timestamp AT TIME ZONE 'America/New_York') \
-							ORDER BY timestamp \
-						), \
-						0 \
-					), \
-					0 \
-				) AS volume_delta \
-			FROM option_chains, latest \
-			WHERE underlying = '$(FLOW_SYMBOL)' \
-				AND latest.max_ts IS NOT NULL \
-				AND timestamp >= latest.max_ts - INTERVAL '120 minutes' \
-		) \
 		SELECT \
 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
-			underlying as symbol, \
-			strike, \
-			SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE 0 END) AS call_volume, \
-			TO_CHAR(SUM(CASE WHEN option_type = 'C' THEN volume_delta * last * 100 ELSE 0 END), 'FM999,999,999') as call_premium, \
-			SUM(CASE WHEN option_type = 'P' THEN volume_delta ELSE 0 END) AS put_volume, \
-			TO_CHAR(SUM(CASE WHEN option_type = 'P' THEN volume_delta * last * 100 ELSE 0 END), 'FM999,999,999') as put_premium \
-		FROM option_chain_deltas \
-		WHERE volume_delta > 0 \
-		GROUP BY timestamp, underlying, strike \
-		ORDER BY timestamp DESC, strike \
+			symbol, \
+			total_volume, \
+			total_premium \
+		FROM flow_by_strike_$(FLOW_INTERVAL) \
+		WHERE symbol = '$(FLOW_SYMBOL)' \
+		ORDER BY timestamp DESC \
 		LIMIT 20;"
 
 .PHONY: flow-by-expiration
 flow-by-expiration: ## Flow by expiration date
-	@echo "$(BLUE)=== Option Flow by Expiration (Most Recent 20 Rows) ===$(NC)"
+	@echo "$(BLUE)=== Option Flow by Expiration ($(FLOW_INTERVAL), Most Recent 20 Rows) ===$(NC)"
 	@$(PSQL) -c "\
 		SET statement_timeout = '10s'; \
-		WITH latest AS ( \
-			SELECT MAX(timestamp) as max_ts \
-			FROM option_chains \
-			WHERE underlying = '$(FLOW_SYMBOL)' \
-		), option_chain_deltas AS ( \
-			SELECT \
-				timestamp, underlying, expiration, option_type, last, \
-				COALESCE( \
-					GREATEST( \
-						volume - LAG(volume) OVER ( \
-							PARTITION BY option_symbol, DATE(timestamp AT TIME ZONE 'America/New_York') \
-							ORDER BY timestamp \
-						), \
-						0 \
-					), \
-					0 \
-				) AS volume_delta \
-			FROM option_chains, latest \
-			WHERE underlying = '$(FLOW_SYMBOL)' \
-				AND latest.max_ts IS NOT NULL \
-				AND timestamp >= latest.max_ts - INTERVAL '120 minutes' \
-		) \
 		SELECT \
 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
-			underlying as symbol, \
-			expiration, \
-			SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE 0 END) AS call_volume, \
-			TO_CHAR(SUM(CASE WHEN option_type = 'C' THEN volume_delta * last * 100 ELSE 0 END), 'FM999,999,999') as call_premium, \
-			SUM(CASE WHEN option_type = 'P' THEN volume_delta ELSE 0 END) AS put_volume, \
-			TO_CHAR(SUM(CASE WHEN option_type = 'P' THEN volume_delta * last * 100 ELSE 0 END), 'FM999,999,999') as put_premium \
-		FROM option_chain_deltas \
-		WHERE volume_delta > 0 \
-		GROUP BY timestamp, underlying, expiration \
-		ORDER BY timestamp DESC, expiration \
+			symbol, \
+			total_volume, \
+			total_premium \
+		FROM flow_by_expiration_$(FLOW_INTERVAL) \
+		WHERE symbol = '$(FLOW_SYMBOL)' \
+		ORDER BY timestamp DESC \
 		LIMIT 20;"
 
 .PHONY: flow-smart-money
