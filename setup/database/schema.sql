@@ -388,8 +388,20 @@ $$ LANGUAGE plpgsql;
 -- =============================================================================
 
 -- Drop old materialized views if they exist
-DROP MATERIALIZED VIEW IF EXISTS underlying_quotes_with_deltas CASCADE;
-DROP MATERIALIZED VIEW IF EXISTS option_chains_with_deltas CASCADE;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'underlying_quotes_with_deltas' AND relkind = 'm') THEN
+        EXECUTE 'DROP MATERIALIZED VIEW underlying_quotes_with_deltas CASCADE';
+    ELSIF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'underlying_quotes_with_deltas' AND relkind = 'v') THEN
+        EXECUTE 'DROP VIEW underlying_quotes_with_deltas CASCADE';
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'option_chains_with_deltas' AND relkind = 'm') THEN
+        EXECUTE 'DROP MATERIALIZED VIEW option_chains_with_deltas CASCADE';
+    ELSIF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'option_chains_with_deltas' AND relkind = 'v') THEN
+        EXECUTE 'DROP VIEW option_chains_with_deltas CASCADE';
+    END IF;
+END $$;
 
 -- Drop the refresh function (no longer needed)
 DROP FUNCTION IF EXISTS refresh_delta_views();
