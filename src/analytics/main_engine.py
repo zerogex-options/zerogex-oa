@@ -623,6 +623,282 @@ class AnalyticsEngine:
             logger.error(f"Error storing GEX summary: {e}", exc_info=True)
             self.errors_count += 1
 
+    def _refresh_flow_caches(self, timestamp: datetime):
+        """
+        Refresh flow cache tables for the given timestamp
+
+        This populates the cache tables that the flow views depend on.
+        """
+        try:
+            with db_connection() as conn:
+                cursor = conn.cursor()
+
+                # 1. Refresh flow_cache_by_type_minute
+                logger.debug("Refreshing flow_cache_by_type_minute...")
+                cursor.execute("""
+                    WITH latest_rows AS (
+                        SELECT oc.*
+                        FROM option_chains oc
+                        WHERE oc.underlying = %s
+                          AND oc.timestamp = %s
+                    ),
+                    with_prev AS (
+                        SELECT
+                            l.timestamp,
+                            l.option_symbol,
+                            l.option_type,
+                            l.last,
+                            l.implied_volatility,
+                            l.delta,
+                            CASE
+                                WHEN p.prev_volume IS NULL THEN COALESCE(l.volume, 0)
+                                WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
+                                    = (l.timestamp AT TIME ZONE 'America/New_York')::date
+                                    THEN GREATEST(COALESCE(l.volume, 0) - COALESCE(p.prev_volume, 0), 0)
+                                ELSE COALESCE(l.volume, 0)
+                            END::bigint AS volume_delta
+                        FROM latest_rows l
+                        LEFT JOIN LATERAL (
+                            SELECT oc2.timestamp AS prev_ts, oc2.volume AS prev_volume
+                            FROM option_chains oc2
+                            WHERE oc2.option_symbol = l.option_symbol
+                              AND oc2.timestamp < l.timestamp
+                            ORDER BY oc2.timestamp DESC
+                            LIMIT 1
+                        ) p ON TRUE
+                    )
+                    INSERT INTO flow_cache_by_type_minute (
+                        timestamp,
+                        symbol,
+                        option_type,
+                        total_volume,
+                        total_premium,
+                        avg_iv,
+                        net_delta
+                    )
+                    SELECT
+                        timestamp,
+                        %s::varchar,
+                        option_type,
+                        SUM(volume_delta)::bigint,
+                        SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
+                        AVG(implied_volatility)::numeric,
+                        SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric
+                    FROM with_prev
+                    WHERE volume_delta > 0
+                    GROUP BY timestamp, option_type
+                    ON CONFLICT (timestamp, symbol, option_type)
+                    DO UPDATE SET
+                        total_volume = EXCLUDED.total_volume,
+                        total_premium = EXCLUDED.total_premium,
+                        avg_iv = EXCLUDED.avg_iv,
+                        net_delta = EXCLUDED.net_delta,
+                        updated_at = NOW()
+                """, (self.underlying, timestamp, self.underlying))
+
+                # 2. Refresh flow_cache_by_strike_minute
+                logger.debug("Refreshing flow_cache_by_strike_minute...")
+                cursor.execute("""
+                    WITH latest_rows AS (
+                        SELECT oc.*
+                        FROM option_chains oc
+                        WHERE oc.underlying = %s
+                          AND oc.timestamp = %s
+                    ),
+                    with_prev AS (
+                        SELECT
+                            l.timestamp,
+                            l.strike,
+                            l.last,
+                            l.implied_volatility,
+                            l.option_type,
+                            CASE
+                                WHEN p.prev_volume IS NULL THEN COALESCE(l.volume, 0)
+                                WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
+                                    = (l.timestamp AT TIME ZONE 'America/New_York')::date
+                                    THEN GREATEST(COALESCE(l.volume, 0) - COALESCE(p.prev_volume, 0), 0)
+                                ELSE COALESCE(l.volume, 0)
+                            END::bigint AS volume_delta
+                        FROM latest_rows l
+                        LEFT JOIN LATERAL (
+                            SELECT oc2.timestamp AS prev_ts, oc2.volume AS prev_volume
+                            FROM option_chains oc2
+                            WHERE oc2.option_symbol = l.option_symbol
+                              AND oc2.timestamp < l.timestamp
+                            ORDER BY oc2.timestamp DESC
+                            LIMIT 1
+                        ) p ON TRUE
+                    )
+                    INSERT INTO flow_cache_by_strike_minute (
+                        timestamp,
+                        symbol,
+                        strike,
+                        total_volume,
+                        total_premium,
+                        avg_iv,
+                        net_delta
+                    )
+                    SELECT
+                        timestamp,
+                        %s::varchar,
+                        strike,
+                        SUM(volume_delta)::bigint,
+                        SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
+                        AVG(implied_volatility)::numeric,
+                        SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric
+                    FROM with_prev
+                    WHERE volume_delta > 0
+                    GROUP BY timestamp, strike
+                    ON CONFLICT (timestamp, symbol, strike)
+                    DO UPDATE SET
+                        total_volume = EXCLUDED.total_volume,
+                        total_premium = EXCLUDED.total_premium,
+                        avg_iv = EXCLUDED.avg_iv,
+                        net_delta = EXCLUDED.net_delta,
+                        updated_at = NOW()
+                """, (self.underlying, timestamp, self.underlying))
+
+                # 3. Refresh flow_cache_by_expiration_minute
+                logger.debug("Refreshing flow_cache_by_expiration_minute...")
+                cursor.execute("""
+                    WITH latest_rows AS (
+                        SELECT oc.*
+                        FROM option_chains oc
+                        WHERE oc.underlying = %s
+                          AND oc.timestamp = %s
+                    ),
+                    with_prev AS (
+                        SELECT
+                            l.timestamp,
+                            l.expiration,
+                            l.last,
+                            CASE
+                                WHEN p.prev_volume IS NULL THEN COALESCE(l.volume, 0)
+                                WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
+                                    = (l.timestamp AT TIME ZONE 'America/New_York')::date
+                                    THEN GREATEST(COALESCE(l.volume, 0) - COALESCE(p.prev_volume, 0), 0)
+                                ELSE COALESCE(l.volume, 0)
+                            END::bigint AS volume_delta
+                        FROM latest_rows l
+                        LEFT JOIN LATERAL (
+                            SELECT oc2.timestamp AS prev_ts, oc2.volume AS prev_volume
+                            FROM option_chains oc2
+                            WHERE oc2.option_symbol = l.option_symbol
+                              AND oc2.timestamp < l.timestamp
+                            ORDER BY oc2.timestamp DESC
+                            LIMIT 1
+                        ) p ON TRUE
+                    )
+                    INSERT INTO flow_cache_by_expiration_minute (
+                        timestamp,
+                        symbol,
+                        expiration,
+                        total_volume,
+                        total_premium
+                    )
+                    SELECT
+                        timestamp,
+                        %s::varchar,
+                        expiration,
+                        SUM(volume_delta)::bigint,
+                        SUM(volume_delta * COALESCE(last, 0) * 100)::numeric
+                    FROM with_prev
+                    WHERE volume_delta > 0
+                    GROUP BY timestamp, expiration
+                    ON CONFLICT (timestamp, symbol, expiration)
+                    DO UPDATE SET
+                        total_volume = EXCLUDED.total_volume,
+                        total_premium = EXCLUDED.total_premium,
+                        updated_at = NOW()
+                """, (self.underlying, timestamp, self.underlying))
+
+                # 4. Refresh flow_cache_smart_money_minute
+                logger.debug("Refreshing flow_cache_smart_money_minute...")
+                cursor.execute("""
+                    WITH latest_rows AS (
+                        SELECT oc.*
+                        FROM option_chains oc
+                        WHERE oc.underlying = %s
+                          AND oc.timestamp = %s
+                    ),
+                    with_prev AS (
+                        SELECT
+                            l.timestamp,
+                            l.option_symbol,
+                            l.option_type,
+                            l.strike,
+                            l.expiration,
+                            l.last,
+                            l.implied_volatility,
+                            l.delta,
+                            CASE
+                                WHEN p.prev_volume IS NULL THEN COALESCE(l.volume, 0)
+                                WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
+                                    = (l.timestamp AT TIME ZONE 'America/New_York')::date
+                                    THEN GREATEST(COALESCE(l.volume, 0) - COALESCE(p.prev_volume, 0), 0)
+                                ELSE COALESCE(l.volume, 0)
+                            END::bigint AS volume_delta
+                        FROM latest_rows l
+                        LEFT JOIN LATERAL (
+                            SELECT oc2.timestamp AS prev_ts, oc2.volume AS prev_volume
+                            FROM option_chains oc2
+                            WHERE oc2.option_symbol = l.option_symbol
+                              AND oc2.timestamp < l.timestamp
+                            ORDER BY oc2.timestamp DESC
+                            LIMIT 1
+                        ) p ON TRUE
+                    )
+                    INSERT INTO flow_cache_smart_money_minute (
+                        timestamp,
+                        symbol,
+                        option_symbol,
+                        strike,
+                        expiration,
+                        option_type,
+                        total_volume,
+                        total_premium,
+                        avg_iv,
+                        avg_delta,
+                        unusual_activity_score
+                    )
+                    SELECT
+                        timestamp,
+                        %s::varchar,
+                        option_symbol,
+                        strike,
+                        expiration,
+                        option_type,
+                        volume_delta::bigint,
+                        (volume_delta * COALESCE(last, 0) * 100)::numeric,
+                        implied_volatility::numeric,
+                        delta::numeric,
+                        LEAST(10, GREATEST(0,
+                            CASE WHEN volume_delta >= 500 THEN 4 WHEN volume_delta >= 200 THEN 3 WHEN volume_delta >= 100 THEN 2 WHEN volume_delta >= 50 THEN 1 ELSE 0 END +
+                            CASE WHEN volume_delta * COALESCE(last, 0) * 100 >= 500000 THEN 4 WHEN volume_delta * COALESCE(last, 0) * 100 >= 250000 THEN 3 WHEN volume_delta * COALESCE(last, 0) * 100 >= 100000 THEN 2 WHEN volume_delta * COALESCE(last, 0) * 100 >= 50000 THEN 1 ELSE 0 END +
+                            CASE WHEN implied_volatility > 1.0 THEN 2 WHEN implied_volatility > 0.6 THEN 1 ELSE 0 END
+                        ))::numeric
+                    FROM with_prev
+                    WHERE volume_delta > 0
+                    ON CONFLICT (timestamp, symbol, option_symbol)
+                    DO UPDATE SET
+                        strike = EXCLUDED.strike,
+                        expiration = EXCLUDED.expiration,
+                        option_type = EXCLUDED.option_type,
+                        total_volume = EXCLUDED.total_volume,
+                        total_premium = EXCLUDED.total_premium,
+                        avg_iv = EXCLUDED.avg_iv,
+                        avg_delta = EXCLUDED.avg_delta,
+                        unusual_activity_score = EXCLUDED.unusual_activity_score,
+                        updated_at = NOW()
+                """, (self.underlying, timestamp, self.underlying))
+
+                conn.commit()
+                logger.info("✅ Flow cache tables refreshed successfully")
+
+        except Exception as e:
+            logger.error(f"Error refreshing flow caches: {e}", exc_info=True)
+
+
     def run_calculation(self) -> bool:
         """
         Run one complete analytics calculation cycle
@@ -687,6 +963,10 @@ class AnalyticsEngine:
             logger.info("Storing results to database...")
             self._store_gex_by_strike(gex_by_strike)
             self._store_gex_summary(gex_summary)
+
+            # Refresh flow cache tables
+            logger.info("Refreshing flow cache tables...")
+            self._refresh_flow_caches(latest_timestamp)
 
             # Log summary
             logger.info("")
