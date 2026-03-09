@@ -1764,11 +1764,9 @@ api-test-signals-summary: ## Quick one-liner signal check across all timeframes
 	@for TF in intraday swing multi_day; do \
 		echo ""; \
 		echo "$(GREEN)$$TF:$(NC)"; \
-		curl -s "http://localhost:8000/api/signals/trade?symbol=SPY&timeframe=$$TF" \
-			| python3 -c "\
-import sys, json; d=json.load(sys.stdin); \
-print(f\"  direction={d['direction']}  strength={d['strength']}  score={d['composite_score']}/{d['max_possible_score']}  win_pct={d['estimated_win_pct']:.0%}  trade={d['trade_idea']['trade_type']}\") \
-" 2>/dev/null || echo "  (no data yet)"; \
+		curl -s "http://localhost:8000/api/signals/trade?symbol=SPY&timeframe=$$TF" 2>/dev/null \
+			| python3 -c 'import sys,json;d=json.load(sys.stdin);print("  direction=%s  strength=%s  score=%d/%d  win_pct=%.0f%%  trade=%s" % (d["direction"], d["strength"], d["composite_score"], d["max_possible_score"], d["estimated_win_pct"]*100, d["trade_idea"]["trade_type"]))' \
+			|| echo "  (no data yet)"; \
 	done
 
 # =============================================================================
