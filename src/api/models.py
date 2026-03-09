@@ -249,3 +249,81 @@ class HealthStatus(BaseModel):
         json_encoders = {
             datetime: lambda v: v.isoformat() if v is not None else None,
         }
+
+
+from enum import Enum  # already imported via pydantic internals but be explicit
+from typing import List  # already imported above, included here for clarity
+
+
+class SignalDirection(str, Enum):
+    BULLISH = "bullish"
+    BEARISH = "bearish"
+    NEUTRAL = "neutral"
+
+
+class SignalStrength(str, Enum):
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+class TradeType(str, Enum):
+    SHORT_CALL_SPREAD = "short_call_spread"
+    SHORT_PUT_SPREAD = "short_put_spread"
+    LONG_CALL_SPREAD = "long_call_spread"
+    LONG_PUT_SPREAD = "long_put_spread"
+    IRON_CONDOR = "iron_condor"
+    NO_TRADE = "no_trade"
+
+
+class Timeframe(str, Enum):
+    INTRADAY = "intraday"
+    SWING = "swing"
+    MULTI_DAY = "multi_day"
+
+
+class SignalComponent(BaseModel):
+    name: str
+    weight: int
+    score: int
+    description: str
+    value: Optional[float] = None
+    applicable: bool = True
+
+
+class TradeIdea(BaseModel):
+    trade_type: TradeType
+    rationale: str
+    target_expiry: str
+    suggested_strikes: str
+    estimated_win_pct: float
+
+
+class TradeSignalResponse(BaseModel):
+    symbol: str
+    timeframe: Timeframe
+    timestamp: datetime
+    current_price: float
+    composite_score: int
+    max_possible_score: int
+    normalized_score: float
+    direction: SignalDirection
+    strength: SignalStrength
+    estimated_win_pct: float
+    components: List[SignalComponent]
+    trade_idea: TradeIdea
+    net_gex: Optional[float] = None
+    gamma_flip: Optional[float] = None
+    price_vs_flip: Optional[float] = None
+    vwap: Optional[float] = None
+    vwap_deviation_pct: Optional[float] = None
+    put_call_ratio: Optional[float] = None
+    dealer_net_delta: Optional[float] = None
+    smart_money_direction: Optional[SignalDirection] = None
+    unusual_volume_detected: bool = False
+    orb_breakout_direction: Optional[SignalDirection] = None
+
+    class Config:
+        json_encoders = {
+            datetime: lambda v: v.isoformat() if v is not None else None,
+        }

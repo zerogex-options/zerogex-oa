@@ -24,6 +24,7 @@ from scipy import stats
 from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
 from src.config import RISK_FREE_RATE
+from src.analytics.signal_engine import SignalEngine
 
 logger = get_logger(__name__)
 
@@ -61,6 +62,11 @@ class AnalyticsEngine:
         self.calculations_completed = 0
         self.errors_count = 0
         self.last_calculation_time: Optional[datetime] = None
+
+        # Signal engine runs on its own 5-minute cadence
+        self._signal_engine = SignalEngine(underlying=underlying)
+        self._signal_interval: int = 300
+        self._last_signal_run: Optional[float] = None
 
         logger.info(f"Initialized AnalyticsEngine for {underlying}")
         logger.info(f"Calculation interval: {calculation_interval}s")
@@ -967,6 +973,22 @@ class AnalyticsEngine:
             # Refresh flow cache tables
             logger.info("Refreshing flow cache tables...")
             self._refresh_flow_caches(latest_timestamp)
+
+            # --- Signal engine: run every _signal_interval seconds ---
+            import time as _time
+            now_ts = _time.time()
+            if (self._last_signal_run is None or
+                    now_ts - self._last_signal_run >= self._signal_interval):
+                try:
+                    logger.info("Running signal engine...")
+                    ok = self._signal_engine.run_calculation()
+                    if ok:
+                        logger.info("✅ Signal engine cycle complete")
+                    else:
+                        logger.warning("⚠️  Signal engine cycle had no output")
+                except Exception as _e:
+                    logger.error(f"Signal engine error: {_e}", exc_info=True)
+                self._last_signal_run = now_ts
 
             # Log summary
             logger.info("")

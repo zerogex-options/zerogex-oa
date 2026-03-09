@@ -820,3 +820,106 @@ SELECT
     END AS gex_level
 FROM latest_options
 GROUP BY underlying, strike;
+
+-- =============================================================================
+-- Trade Signals Tables
+-- Append to the bottom of setup/database/schema.sql
+-- =============================================================================
+
+-- ---------------------------------------------------------------------------
+-- trade_signals
+-- Written by AnalyticsEngine every ~5 min.
+-- One row per (underlying, timestamp, timeframe).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS trade_signals (
+    underlying      VARCHAR(10)     NOT NULL,
+    timestamp       TIMESTAMPTZ     NOT NULL,
+    timeframe       VARCHAR(20)     NOT NULL CHECK (timeframe IN ('intraday', 'swing', 'multi_day')),
+
+    -- Composite score
+    composite_score         INTEGER         NOT NULL,
+    max_possible_score      INTEGER         NOT NULL,
+    normalized_score        NUMERIC(6, 4)   NOT NULL,   -- 0.000 – 1.000
+
+    -- Direction / strength
+    direction               VARCHAR(10)     NOT NULL CHECK (direction IN ('bullish', 'bearish', 'neutral')),
+    strength                VARCHAR(10)     NOT NULL CHECK (strength IN ('high', 'medium', 'low')),
+    estimated_win_pct       NUMERIC(6, 4)   NOT NULL,
+
+    -- Trade idea
+    trade_type              VARCHAR(30)     NOT NULL,
+    trade_rationale         TEXT,
+    target_expiry           VARCHAR(20),
+    suggested_strikes       VARCHAR(100),
+
+    -- Raw context values stored for display / backtesting
+    current_price           NUMERIC(12, 4),
+    net_gex                 DOUBLE PRECISION,
+    gamma_flip              DOUBLE PRECISION,
+    price_vs_flip           NUMERIC(8, 4),
+    vwap                    NUMERIC(12, 4),
+    vwap_deviation_pct      NUMERIC(8, 4),
+    put_call_ratio          DOUBLE PRECISION,
+    dealer_net_delta        DOUBLE PRECISION,
+    smart_money_direction   VARCHAR(10),
+    unusual_volume_detected BOOLEAN         DEFAULT FALSE,
+    orb_breakout_direction  VARCHAR(10),
+
+    -- Full component breakdown (JSON array of SignalComponent objects)
+    components              JSONB,
+
+    created_at              TIMESTAMPTZ     DEFAULT NOW(),
+
+    PRIMARY KEY (underlying, timestamp, timeframe)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trade_signals_underlying_ts
+    ON trade_signals(underlying, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_trade_signals_underlying_tf_ts
+    ON trade_signals(underlying, timeframe, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_trade_signals_direction
+    ON trade_signals(direction, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_trade_signals_strength
+    ON trade_signals(strength, timestamp DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_trade_signals_underlying') THEN
+        ALTER TABLE trade_signals
+        ADD CONSTRAINT fk_trade_signals_underlying
+        FOREIGN KEY (underlying) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+END $$;
+
+
+-- ---------------------------------------------------------------------------
+-- signal_accuracy
+-- One row per (underlying, trade_date, timeframe, strength_bucket).
+-- Updated nightly (or on demand) by comparing past signals to actual outcomes.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS signal_accuracy (
+    underlying      VARCHAR(10)     NOT NULL,
+    trade_date      DATE            NOT NULL,
+    timeframe       VARCHAR(20)     NOT NULL CHECK (timeframe IN ('intraday', 'swing', 'multi_day')),
+    strength_bucket VARCHAR(10)     NOT NULL CHECK (strength_bucket IN ('high', 'medium', 'low')),
+
+    total_signals   INTEGER         NOT NULL DEFAULT 0,
+    correct_signals INTEGER         NOT NULL DEFAULT 0,
+    win_pct         NUMERIC(6, 4),   -- NULL until at least 1 signal resolved
+
+    updated_at      TIMESTAMPTZ     DEFAULT NOW(),
+
+    PRIMARY KEY (underlying, trade_date, timeframe, strength_bucket)
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_accuracy_underlying_date
+    ON signal_accuracy(underlying, trade_date DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_signal_accuracy_underlying') THEN
+        ALTER TABLE signal_accuracy
+        ADD CONSTRAINT fk_signal_accuracy_underlying
+        FOREIGN KEY (underlying) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+END $$;

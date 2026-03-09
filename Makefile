@@ -1894,6 +1894,7 @@ api-test: ## Test ALL API endpoints
 	@BASE_URL="http://localhost:8000"; \
 	SYMBOL="SPY"; \
 	TIMEFRAMES="1min 5min 15min 1hr 1day"; \
+	SIGNAL_TIMEFRAMES="intraday swing multi_day"; \
 	PASSED=0; \
 	FAILED=0; \
 	test_endpoint() { \
@@ -1936,6 +1937,12 @@ api-test: ## Test ALL API endpoints
 	echo ""; \
 	echo "$(YELLOW)Max pain current snapshot$(NC)"; \
 	test_endpoint "/api/max-pain/current?symbol=$$SYMBOL&strike_limit=100"; \
+	echo ""; \
+	echo "$(YELLOW)Trade signal endpoints$(NC)"; \
+	for STF in $$SIGNAL_TIMEFRAMES; do \
+		test_endpoint "/api/signals/trade?symbol=$$SYMBOL&timeframe=$$STF"; \
+	done; \
+	test_endpoint "/api/signals/accuracy?symbol=$$SYMBOL&lookback_days=30"; \
 	echo ""; \
 	echo "$(BLUE)=== API Test Report ===$(NC)"; \
 	echo "$(GREEN)Passed: $$PASSED$(NC)"; \

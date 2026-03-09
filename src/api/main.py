@@ -29,6 +29,7 @@ from .models import (
     MaxPainCurrent,
     MaxPainTimeseriesPoint,
 )
+from .routers.trade_signals import router as trade_signals_router
 
 # Configure logging
 logging.basicConfig(
@@ -78,6 +79,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(trade_signals_router)
 
 # ============================================================================
 # Health Check

@@ -1419,6 +1419,112 @@ class DatabaseManager:
             logger.error(f"Error fetching momentum divergence: {e}")
             raise
 
+    # ========================================================================
+    # Trade Signal Queries
+    # ========================================================================
+
+    async def get_trade_signal(
+        self,
+        symbol: str = "SPY",
+        timeframe: str = "intraday",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Return the most recent trade_signals row for this symbol + timeframe.
+        Falls back to the previous row if the latest is >10 min stale.
+        """
+        query = """
+            SELECT
+                underlying,
+                timestamp,
+                timeframe,
+                composite_score,
+                max_possible_score,
+                normalized_score,
+                direction,
+                strength,
+                estimated_win_pct,
+                trade_type,
+                trade_rationale,
+                target_expiry,
+                suggested_strikes,
+                current_price,
+                net_gex,
+                gamma_flip,
+                price_vs_flip,
+                vwap,
+                vwap_deviation_pct,
+                put_call_ratio,
+                dealer_net_delta,
+                smart_money_direction,
+                unusual_volume_detected,
+                orb_breakout_direction,
+                components
+            FROM trade_signals
+            WHERE underlying = $1
+              AND timeframe  = $2
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(query, symbol, timeframe)
+                if not row:
+                    return None
+                d = dict(row)
+                # components is stored as JSONB; asyncpg returns it as a string
+                if isinstance(d.get("components"), str):
+                    d["components"] = json.loads(d["components"])
+                return d
+        except Exception as e:
+            logger.error(f"get_trade_signal failed ({symbol}, {timeframe}): {e}")
+            return None
+
+    async def get_signal_accuracy(
+        self,
+        symbol: str = "SPY",
+        lookback_days: int = 30,
+    ) -> Dict[str, Any]:
+        """
+        Return calibrated win rates from signal_accuracy for all timeframes
+        and strength buckets over the requested lookback window.
+
+        Shape:
+        {
+          "intraday":  {"high": {"total": N, "correct": M, "win_pct": 0.68}, ...},
+          "swing":     {...},
+          "multi_day": {...},
+        }
+        """
+        query = """
+            SELECT
+                timeframe,
+                strength_bucket,
+                SUM(total_signals)::int   AS total,
+                SUM(correct_signals)::int AS correct
+            FROM signal_accuracy
+            WHERE underlying  = $1
+              AND trade_date  >= CURRENT_DATE - $2
+            GROUP BY timeframe, strength_bucket
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(query, symbol, lookback_days)
+            result: Dict[str, Any] = {}
+            for row in rows:
+                tf  = row["timeframe"]
+                sb  = row["strength_bucket"]
+                tot = row["total"] or 0
+                cor = row["correct"] or 0
+                result.setdefault(tf, {})[sb] = {
+                    "total":   tot,
+                    "correct": cor,
+                    "win_pct": round(cor / tot, 4) if tot > 0 else None,
+                }
+            return result
+        except Exception as e:
+            logger.error(f"get_signal_accuracy failed: {e}")
+            return {}
+
     async def get_latest_quote(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
         """Get latest underlying quote"""
         query = """
