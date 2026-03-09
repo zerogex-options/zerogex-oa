@@ -31,6 +31,7 @@ NC = \033[0m
 
 .PHONY: help
 help: ## Show this help message
+	@echo "=========================================="
 	@echo "$(BLUE)ZeroGEX Management & Database Shortcuts$(NC)"
 	@echo "=========================================="
 	@echo ""
@@ -141,6 +142,22 @@ help: ## Show this help message
 	@echo "  make max-pain-expirations  - All expirations from latest snapshot"
 	@echo "  make max-pain-strikes      - Detailed strike breakdown for nearest expiration"
 	@echo ""
+	@echo "$(GREEN)Signals:$(NC)"
+	@echo "  make signals                  - Latest trade signals for all timeframes"
+	@echo "  make signals-detail           - Full detail for latest signal (usage: make signals-detail TF=intraday)"
+	@echo "  make signals-components       - Signal component breakdown (usage: make signals-components TF=intraday)"
+	@echo "  make signals-history          - Signal history for today (usage: make signals-history TF=intraday)"
+	@echo "  make signals-all-symbols      - Latest signal for every tracked symbol"
+	@echo "  make signal-accuracy          - Win rate calibration by timeframe + strength (last 30 days)"
+	@echo "  make signal-accuracy-daily    - Daily accuracy breakdown for the last 14 days"
+	@echo "  make signal-accuracy-all      - Full accuracy table — all dates, all symbols"
+	@echo "  make signal-logs              - Watch SignalEngine log output live (Ctrl+C to stop)"
+	@echo "  make signal-logs-tail         - Last 100 SignalEngine log lines"
+	@echo "  make signal-logs-errors       - SignalEngine errors and warnings only"
+	@echo "  make signal-logs-cycles       - Show each completed signal engine cycle"
+	@echo "  make api-test-signals         - Test all /api/signals endpoints"
+	@echo "  make api-test-signals-summary - Quick one-liner signal check across all timeframes"
+	@echo ""
 	@echo "$(GREEN)Data Quality:$(NC)"
 	@echo "  make gaps               - Check for data gaps"
 	@echo "  make gaps-today         - Today's data gaps"
@@ -163,7 +180,7 @@ help: ## Show this help message
 	@echo "  make db-prune-legacy    - Drop obsolete legacy refresh/materialized-view artifacts"
 	@echo ""
 	@echo "$(GREEN)Interactive:$(NC)"
-	@echo "  make psql               - Open PostgreSQL shell"
+	@echo "  make psql             - Open PostgreSQL shell"
 	@echo "  make query SQL=\"...\"  - Run custom query"
 
 
@@ -1531,6 +1548,228 @@ max-pain-strikes:
 			jsonb_array_elements(strikes) AS strike \
 		ORDER BY (strike->>'settlement_price')::numeric \
 		LIMIT 20;"
+
+# =============================================================================
+# Signal Engine — DB Queries
+# =============================================================================
+
+.PHONY: signals
+signals: ## Latest trade signals for all timeframes (SPY)
+	@echo "$(BLUE)=== Latest Trade Signals (SPY) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			timeframe, \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI:SS') AS time_et, \
+			direction, \
+			strength, \
+			composite_score || '/' || max_possible_score AS score, \
+			ROUND(normalized_score * 100, 1) || '%' AS pct, \
+			ROUND(estimated_win_pct * 100, 1) || '%' AS win_pct, \
+			trade_type, \
+			target_expiry \
+		FROM trade_signals \
+		WHERE underlying = 'SPY' \
+		ORDER BY timestamp DESC, timeframe;"
+
+.PHONY: signals-detail
+signals-detail: ## Full detail for latest signal (usage: make signals-detail TF=intraday)
+	@$(eval TF ?= intraday)
+	@echo "$(BLUE)=== Signal Detail: SPY / $(TF) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			timeframe, \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI:SS') AS time_et, \
+			direction, \
+			strength, \
+			composite_score || '/' || max_possible_score AS score, \
+			ROUND(normalized_score * 100, 1) || '%' AS normalized, \
+			ROUND(estimated_win_pct * 100, 1) || '%' AS win_pct, \
+			trade_type, \
+			trade_rationale, \
+			target_expiry, \
+			suggested_strikes, \
+			ROUND(current_price::numeric, 2) AS price, \
+			ROUND(net_gex::numeric, 0) AS net_gex, \
+			ROUND(gamma_flip::numeric, 2) AS gamma_flip, \
+			price_vs_flip || '%' AS vs_flip, \
+			ROUND(vwap::numeric, 2) AS vwap, \
+			vwap_deviation_pct || '%' AS vwap_dev, \
+			ROUND(put_call_ratio::numeric, 3) AS pcr, \
+			ROUND(dealer_net_delta::numeric, 0) AS dealer_delta, \
+			smart_money_direction AS sm_dir, \
+			unusual_volume_detected AS unusual_vol, \
+			orb_breakout_direction AS orb_dir \
+		FROM trade_signals \
+		WHERE underlying = 'SPY' \
+		  AND timeframe = '$(TF)' \
+		ORDER BY timestamp DESC \
+		LIMIT 1;"
+
+.PHONY: signals-components
+signals-components: ## Signal component breakdown (usage: make signals-components TF=intraday)
+	@$(eval TF ?= intraday)
+	@echo "$(BLUE)=== Signal Components: SPY / $(TF) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			comp->>'name'        AS signal, \
+			comp->>'weight'      AS weight, \
+			comp->>'score'       AS score, \
+			comp->>'applicable'  AS active, \
+			comp->>'description' AS description \
+		FROM trade_signals, \
+		     jsonb_array_elements(components) AS comp \
+		WHERE underlying = 'SPY' \
+		  AND timeframe  = '$(TF)' \
+		ORDER BY timestamp DESC \
+		LIMIT 9;"
+
+.PHONY: signals-history
+signals-history: ## Signal history for today (usage: make signals-history TF=intraday)
+	@$(eval TF ?= intraday)
+	@echo "$(BLUE)=== Signal History Today: SPY / $(TF) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') AS time_et, \
+			direction, \
+			strength, \
+			composite_score || '/' || max_possible_score AS score, \
+			ROUND(estimated_win_pct * 100, 1) || '%' AS win_pct, \
+			trade_type \
+		FROM trade_signals \
+		WHERE underlying = 'SPY' \
+		  AND timeframe  = '$(TF)' \
+		  AND DATE(timestamp AT TIME ZONE 'America/New_York') = CURRENT_DATE \
+		ORDER BY timestamp DESC;"
+
+.PHONY: signals-all-symbols
+signals-all-symbols: ## Latest signal for every tracked symbol
+	@echo "$(BLUE)=== Latest Signals — All Symbols ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT DISTINCT ON (underlying, timeframe) \
+			underlying, \
+			timeframe, \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') AS time_et, \
+			direction, \
+			strength, \
+			composite_score || '/' || max_possible_score AS score, \
+			trade_type \
+		FROM trade_signals \
+		ORDER BY underlying, timeframe, timestamp DESC;"
+
+# =============================================================================
+# Signal Engine — Accuracy / Backtesting
+# =============================================================================
+
+.PHONY: signal-accuracy
+signal-accuracy: ## Win rate calibration by timeframe + strength (last 30 days)
+	@echo "$(BLUE)=== Signal Accuracy — Last 30 Days (SPY) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			timeframe, \
+			strength_bucket AS strength, \
+			SUM(total_signals)   AS total, \
+			SUM(correct_signals) AS correct, \
+			ROUND(SUM(correct_signals)::numeric / NULLIF(SUM(total_signals), 0) * 100, 1) || '%' AS win_pct \
+		FROM signal_accuracy \
+		WHERE underlying  = 'SPY' \
+		  AND trade_date >= CURRENT_DATE - 30 \
+		GROUP BY timeframe, strength_bucket \
+		ORDER BY timeframe, strength_bucket;"
+
+.PHONY: signal-accuracy-daily
+signal-accuracy-daily: ## Daily accuracy breakdown for the last 14 days
+	@echo "$(BLUE)=== Daily Signal Accuracy — Last 14 Days (SPY) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			trade_date, \
+			timeframe, \
+			strength_bucket AS strength, \
+			total_signals   AS total, \
+			correct_signals AS correct, \
+			ROUND(win_pct * 100, 1) || '%' AS win_pct \
+		FROM signal_accuracy \
+		WHERE underlying  = 'SPY' \
+		  AND trade_date >= CURRENT_DATE - 14 \
+		ORDER BY trade_date DESC, timeframe, strength_bucket;"
+
+.PHONY: signal-accuracy-all
+signal-accuracy-all: ## Full accuracy table — all dates, all symbols
+	@echo "$(BLUE)=== Full Signal Accuracy Table ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			underlying, \
+			trade_date, \
+			timeframe, \
+			strength_bucket AS strength, \
+			total_signals   AS total, \
+			correct_signals AS correct, \
+			ROUND(win_pct * 100, 1) || '%' AS win_pct, \
+			updated_at \
+		FROM signal_accuracy \
+		ORDER BY trade_date DESC, underlying, timeframe, strength_bucket \
+		LIMIT 100;"
+
+# =============================================================================
+# Signal Engine — Logs
+# =============================================================================
+
+.PHONY: signal-logs
+signal-logs: ## Watch SignalEngine log output live (Ctrl+C to stop)
+	@echo "$(BLUE)=== Signal Engine Logs (live) — Ctrl+C to stop ===$(NC)"
+	@sudo journalctl -u $(ANALYTICS_SERVICE) -f | grep --line-buffered -i "signal"
+
+.PHONY: signal-logs-tail
+signal-logs-tail: ## Last 100 SignalEngine log lines
+	@echo "$(BLUE)=== Last 100 Signal Engine Log Lines ===$(NC)"
+	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 500 --no-pager | grep -i "signal" | tail -100
+
+.PHONY: signal-logs-errors
+signal-logs-errors: ## SignalEngine errors and warnings only
+	@echo "$(BLUE)=== Signal Engine Errors & Warnings ===$(NC)"
+	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 1000 --no-pager \
+		| grep -i "signal" \
+		| grep -iE "(error|warning|failed|exception|traceback)" \
+		|| echo "$(GREEN)No signal errors found in last 1000 log lines$(NC)"
+
+.PHONY: signal-logs-cycles
+signal-logs-cycles: ## Show each completed signal engine cycle
+	@echo "$(BLUE)=== Signal Engine Cycle History ===$(NC)"
+	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 2000 --no-pager \
+		| grep -iE "(signal engine cycle|✅ Signal \[)" \
+		| tail -50
+
+# =============================================================================
+# API Signals — Endpoint Tests
+# =============================================================================
+
+.PHONY: api-test-signals
+api-test-signals: ## Test all /api/signals endpoints
+	@echo "$(BLUE)=== Testing /api/signals Endpoints ===$(NC)"
+	@echo ""
+	@echo "$(GREEN)Intraday Signal:$(NC)"
+	@curl -s "http://localhost:8000/api/signals/trade?symbol=SPY&timeframe=intraday" | python3 -m json.tool
+	@echo ""
+	@echo "$(GREEN)Swing Signal:$(NC)"
+	@curl -s "http://localhost:8000/api/signals/trade?symbol=SPY&timeframe=swing" | python3 -m json.tool
+	@echo ""
+	@echo "$(GREEN)Multi-Day Signal:$(NC)"
+	@curl -s "http://localhost:8000/api/signals/trade?symbol=SPY&timeframe=multi_day" | python3 -m json.tool
+	@echo ""
+	@echo "$(GREEN)Signal Accuracy (30-day):$(NC)"
+	@curl -s "http://localhost:8000/api/signals/accuracy?symbol=SPY&lookback_days=30" | python3 -m json.tool
+
+.PHONY: api-test-signals-summary
+api-test-signals-summary: ## Quick one-liner signal check across all timeframes
+	@echo "$(BLUE)=== Signal Summary (all timeframes) ===$(NC)"
+	@for TF in intraday swing multi_day; do \
+		echo ""; \
+		echo "$(GREEN)$$TF:$(NC)"; \
+		curl -s "http://localhost:8000/api/signals/trade?symbol=SPY&timeframe=$$TF" \
+			| python3 -c "\
+import sys, json; d=json.load(sys.stdin); \
+print(f\"  direction={d['direction']}  strength={d['strength']}  score={d['composite_score']}/{d['max_possible_score']}  win_pct={d['estimated_win_pct']:.0%}  trade={d['trade_idea']['trade_type']}\") \
+" 2>/dev/null || echo "  (no data yet)"; \
+	done
 
 # =============================================================================
 # Data Quality
