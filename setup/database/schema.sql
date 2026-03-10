@@ -788,39 +788,6 @@ JOIN first_30min orb
   ON q.symbol = orb.symbol
  AND DATE(q.timestamp AT TIME ZONE 'America/New_York') = orb.trade_date;
 
-DROP VIEW IF EXISTS gamma_exposure_levels CASCADE;
-CREATE VIEW gamma_exposure_levels AS
-WITH latest_options AS (
-    SELECT DISTINCT ON (option_symbol)
-        option_symbol,
-        underlying,
-        strike,
-        option_type,
-        gamma,
-        open_interest
-    FROM option_chains
-    WHERE timestamp >= NOW() - INTERVAL '10 minutes'
-      AND gamma IS NOT NULL
-      AND open_interest > 0
-    ORDER BY option_symbol, timestamp DESC
-)
-SELECT
-    underlying,
-    strike,
-    SUM(CASE WHEN option_type = 'C' THEN gamma * open_interest * 100 ELSE -gamma * open_interest * 100 END) AS net_gex,
-    SUM(ABS(gamma * open_interest * 100)) AS total_gex,
-    SUM(gamma * open_interest * 100) FILTER (WHERE option_type = 'C') AS call_gex,
-    SUM(gamma * open_interest * 100) FILTER (WHERE option_type = 'P') AS put_gex,
-    COUNT(*) AS num_contracts,
-    SUM(open_interest) AS total_oi,
-    CASE
-        WHEN SUM(CASE WHEN option_type = 'C' THEN gamma * open_interest * 100 ELSE -gamma * open_interest * 100 END) > 1000000 THEN '🟢 Strong +GEX'
-        WHEN SUM(CASE WHEN option_type = 'C' THEN gamma * open_interest * 100 ELSE -gamma * open_interest * 100 END) < -1000000 THEN '🔴 Strong -GEX'
-        ELSE '⚪ Neutral GEX'
-    END AS gex_level
-FROM latest_options
-GROUP BY underlying, strike;
-
 -- =============================================================================
 -- Trade Signals Tables
 -- Append to the bottom of setup/database/schema.sql

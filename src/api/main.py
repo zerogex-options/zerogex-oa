@@ -137,11 +137,23 @@ async def get_gex_summary(symbol: str = Query(default="SPY")):
 @app.get("/api/gex/by-strike", response_model=List[GEXByStrike])
 async def get_gex_by_strike(
     symbol: str = Query(default="SPY"),
-    limit: int = Query(default=50, le=200)
+    limit: int = Query(default=50, le=200),
+    sort_by: str = Query(
+        default="distance",
+        pattern="^(distance|impact)$",
+        description="Sort by 'distance' (closest to spot) or 'impact' (highest absolute net GEX)"
+    )
 ):
-    """Get GEX breakdown by strike"""
+    """
+    Get GEX breakdown by strike
+
+    Returns detailed gamma exposure data including vanna/charm for each strike.
+
+    - sort_by=distance: Returns strikes closest to current spot price (default)
+    - sort_by=impact: Returns strikes with highest absolute net GEX (like 'make gex-strikes')
+    """
     try:
-        data = await db_manager.get_gex_by_strike(symbol, limit)
+        data = await db_manager.get_gex_by_strike(symbol, limit, sort_by)
         if not data:
             raise HTTPException(status_code=404, detail="No GEX data available")
 
@@ -436,23 +448,6 @@ async def get_opening_range(
         raise
     except Exception as e:
         logger.error(f"Error fetching ORB: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.get("/api/trading/gamma-levels")
-async def get_gamma_levels(
-    symbol: str = Query(default="SPY"),
-    limit: int = Query(default=20, le=100)
-):
-    """Get gamma exposure levels (support/resistance)"""
-    try:
-        data = await db_manager.get_gamma_exposure_levels(symbol, limit)
-        if not data:
-            raise HTTPException(status_code=404, detail="No gamma data available")
-        return data
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching gamma levels: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/trading/dealer-hedging")

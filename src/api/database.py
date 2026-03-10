@@ -755,16 +755,34 @@ class DatabaseManager:
             raise
 
     async def get_gex_by_strike(
-        self, 
+        self,
         symbol: str = 'SPY',
-        limit: int = 50
+        limit: int = 50,
+        sort_by: str = 'distance'  # 'distance' or 'impact'
     ) -> List[Dict[str, Any]]:
-        """Get latest GEX breakdown by strike"""
-        query = """
-            SELECT 
+        """
+        Get latest GEX breakdown by strike
+
+        Args:
+            symbol: Underlying symbol
+            limit: Number of strikes to return
+            sort_by: 'distance' (closest to spot) or 'impact' (highest absolute net GEX)
+        """
+
+        # Choose sort order
+        if sort_by == 'impact':
+            order_clause = "ORDER BY ABS(net_gex) DESC"
+        else:
+            order_clause = """ORDER BY ABS(strike - (SELECT close FROM underlying_quotes
+                                       WHERE symbol = $1
+                                       ORDER BY timestamp DESC LIMIT 1)) ASC"""
+
+        query = f"""
+            SELECT
                 timestamp,
                 underlying as symbol,
                 strike,
+                expiration,
                 call_oi,
                 put_oi,
                 call_volume,
@@ -772,22 +790,22 @@ class DatabaseManager:
                 call_gamma as call_gex,
                 put_gamma as put_gex,
                 net_gex,
-                (SELECT close FROM underlying_quotes 
-                 WHERE symbol = $1 
+                vanna_exposure,
+                charm_exposure,
+                (SELECT close FROM underlying_quotes
+                 WHERE symbol = $1
                  ORDER BY timestamp DESC LIMIT 1) as spot_price,
-                strike - (SELECT close FROM underlying_quotes 
-                          WHERE symbol = $1 
+                strike - (SELECT close FROM underlying_quotes
+                          WHERE symbol = $1
                           ORDER BY timestamp DESC LIMIT 1) as distance_from_spot
             FROM gex_by_strike
             WHERE underlying = $1
                 AND timestamp = (
-                    SELECT MAX(timestamp) 
-                    FROM gex_by_strike 
+                    SELECT MAX(timestamp)
+                    FROM gex_by_strike
                     WHERE underlying = $1
                 )
-            ORDER BY ABS(strike - (SELECT close FROM underlying_quotes 
-                                   WHERE symbol = $1 
-                                   ORDER BY timestamp DESC LIMIT 1)) ASC
+            {order_clause}
             LIMIT $2
         """
 
@@ -1266,37 +1284,6 @@ class DatabaseManager:
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching ORB: {e}")
-            raise
-
-    async def get_gamma_exposure_levels(
-        self,
-        symbol: str = 'SPY',
-        limit: int = 20
-    ) -> List[Dict[str, Any]]:
-        """Get gamma exposure by strike (support/resistance)"""
-        query = """
-            SELECT 
-                underlying as symbol,
-                strike,
-                net_gex,
-                total_gex,
-                call_gex,
-                put_gex,
-                num_contracts,
-                total_oi,
-                gex_level
-            FROM gamma_exposure_levels
-            WHERE underlying = $1
-            ORDER BY ABS(net_gex) DESC
-            LIMIT $2
-        """
-
-        try:
-            async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, symbol, limit)
-                return [dict(row) for row in rows]
-        except Exception as e:
-            logger.error(f"Error fetching gamma levels: {e}")
             raise
 
     async def get_dealer_hedging_pressure(

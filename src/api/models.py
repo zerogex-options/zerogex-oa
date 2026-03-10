@@ -35,6 +35,7 @@ class GEXByStrike(BaseModel):
     timestamp: datetime
     symbol: str
     strike: Decimal
+    expiration: date
     call_oi: int
     put_oi: int
     call_volume: int
@@ -42,6 +43,8 @@ class GEXByStrike(BaseModel):
     call_gex: Decimal
     put_gex: Decimal
     net_gex: Decimal
+    vanna_exposure: Optional[Decimal] = None
+    charm_exposure: Optional[Decimal] = None
     spot_price: Decimal
     distance_from_spot: Decimal
 
@@ -50,6 +53,7 @@ class GEXByStrike(BaseModel):
         json_encoders = {
             Decimal: lambda v: float(v) if v is not None else None,
             datetime: lambda v: v.isoformat() if v is not None else None,
+            date: lambda v: v.isoformat() if v is not None else None,
         }
 
 

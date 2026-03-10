@@ -131,7 +131,6 @@ help: ## Show this help message
 	@echo "$(GREEN)Day Trading Support:$(NC)"
 	@echo "  make vwap               - VWAP deviation tracker"
 	@echo "  make orb                - Opening range breakout status"
-	@echo "  make gamma-levels       - Key gamma exposure levels"
 	@echo "  make hedge-pressure     - Dealer hedging pressure"
 	@echo "  make volume-spikes      - Unusual volume detection"
 	@echo "  make divergence         - Momentum divergence signals"
@@ -1281,20 +1280,6 @@ orb: ## Opening range breakout status
 		ORDER BY timestamp DESC \
 		LIMIT 10;"
 
-.PHONY: gamma-levels
-gamma-levels: ## Key gamma exposure levels
-	@echo "$(BLUE)=== Gamma Exposure Levels (Top 15) ===$(NC)"
-	@$(PSQL) -c "\
-		SELECT \
-			underlying, \
-			strike, \
-			TO_CHAR(net_gex, 'FM999,999,999') as net_gex, \
-			TO_CHAR(total_oi, 'FM999,999') as oi, \
-			gex_level \
-		FROM gamma_exposure_levels \
-		ORDER BY ABS(net_gex) DESC \
-		LIMIT 15;"
-
 .PHONY: hedge-pressure
 hedge-pressure: ## Dealer hedging pressure
 	@echo "$(BLUE)=== Dealer Hedging Pressure (Last 30 mins) ===$(NC)"
@@ -1402,17 +1387,6 @@ day-trading: ## Combined day trading dashboard
 		FROM opening_range_breakout \
 		ORDER BY timestamp DESC \
 		LIMIT 5;"
-	@echo ""
-	@echo "$(GREEN)3. GAMMA LEVELS (Top 10)$(NC)"
-	@echo "--------------------------------------------------------------------------------"
-	@$(PSQL) -c "\
-		SELECT \
-			strike, \
-			TO_CHAR(net_gex, 'FM999,999,999') as net_gex, \
-			gex_level \
-		FROM gamma_exposure_levels \
-		ORDER BY ABS(net_gex) DESC \
-		LIMIT 10;"
 	@echo ""
 	@echo "$(GREEN)4. VOLUME SPIKES (Top 10)$(NC)"
 	@echo "--------------------------------------------------------------------------------"
@@ -2146,10 +2120,10 @@ api-test: ## Test ALL API endpoints
 	echo "$(YELLOW)Core endpoints$(NC)"; \
 	test_endpoint "/api/health"; \
 	test_endpoint "/api/gex/summary?symbol=$$SYMBOL"; \
-	test_endpoint "/api/gex/by-strike?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "/api/gex/by-strike?symbol=$$SYMBOL&limit=10&sort_by=distance"; \
+	test_endpoint "/api/gex/by-strike?symbol=$$SYMBOL&limit=10&sort_by=impact"; \
 	test_endpoint "/api/market/quote?symbol=$$SYMBOL"; \
 	test_endpoint "/api/market/previous-close?symbol=$$SYMBOL"; \
-	test_endpoint "/api/trading/gamma-levels?symbol=$$SYMBOL&limit=10"; \
 	test_endpoint "/api/trading/dealer-hedging?symbol=$$SYMBOL&limit=10"; \
 	test_endpoint "/api/trading/volume-spikes?symbol=$$SYMBOL&limit=10"; \
 	test_endpoint "/docs"; \
