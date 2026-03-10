@@ -468,12 +468,7 @@ class SignalEngine:
                 # net_dealer_delta = -(sum of delta×OI×100 for all live options)
                 cur.execute("""
                     SELECT
-                        SUM(
-                            CASE WHEN oc.option_type = 'C'
-                                 THEN  oc.delta * oc.open_interest * 100
-                                 ELSE  oc.delta * oc.open_interest * 100
-                            END
-                        ) AS gross_delta
+                        SUM(oc.delta * oc.open_interest * 100) AS gross_delta
                     FROM option_chains oc
                     WHERE oc.underlying = %s
                       AND oc.timestamp = (

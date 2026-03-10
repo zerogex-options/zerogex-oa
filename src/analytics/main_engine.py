@@ -295,7 +295,9 @@ class AnalyticsEngine:
         """
         Calculate gamma exposure by strike
 
-        GEX = Gamma × Open Interest × 100 (contract multiplier)
+        GEX = Gamma × Open Interest × 100 × Underlying Price
+
+        This represents the notional dollar value of dealer gamma exposure.
 
         For dealers (who are typically short options):
         - Call GEX is POSITIVE (dealers are short gamma on calls)
@@ -324,13 +326,13 @@ class AnalyticsEngine:
             call_gamma = sum(opt['gamma'] for opt in data['calls'])
             call_oi = sum(opt['open_interest'] for opt in data['calls'])
             call_volume = sum(opt['volume'] for opt in data['calls'])
-            call_gex = call_gamma * call_oi * 100
+            call_gex = call_gamma * call_oi * 100 * underlying_price
 
             # Calculate put GEX (negative for dealers)
             put_gamma = sum(opt['gamma'] for opt in data['puts'])
             put_oi = sum(opt['open_interest'] for opt in data['puts'])
             put_volume = sum(opt['volume'] for opt in data['puts'])
-            put_gex = -1 * put_gamma * put_oi * 100  # Negative for dealers
+            put_gex = -1 * put_gamma * put_oi * 100 * underlying_price
 
             # Total gamma (absolute)
             total_gamma = call_gamma + put_gamma
@@ -362,9 +364,9 @@ class AnalyticsEngine:
                     opt['option_type']
                 )
 
-                # Multiply by OI and contract multiplier
-                vanna_exposure += vanna * opt['open_interest'] * 100
-                charm_exposure += charm * opt['open_interest'] * 100
+                # Multiply by OI, contract multiplier, and underlying price for notional exposure
+                vanna_exposure += vanna * opt['open_interest'] * 100 * underlying_price
+                charm_exposure += charm * opt['open_interest'] * 100 * underlying_price
 
             gex_results.append({
                 'underlying': self.underlying,
