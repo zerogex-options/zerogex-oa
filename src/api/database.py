@@ -1840,30 +1840,46 @@ class DatabaseManager:
     async def get_option_quote(
         self,
         underlying: str,
-        strike: float,
-        expiration: str,
-        option_type: str,
+        strike: Optional[float] = None,
+        expiration: Optional[str] = None,
+        option_type: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Get the most recent quote for a specific option contract"""
-        query = """
+        """Get the most recent quote matching the provided filters"""
+        conditions = ["underlying = $1"]
+        params: list = [underlying]
+
+        if strike is not None:
+            params.append(float(strike))
+            conditions.append(f"strike = ${len(params)}")
+
+        if expiration is not None:
+            expiration_date = datetime.strptime(expiration, "%Y-%m-%d").date()
+            params.append(expiration_date)
+            conditions.append(f"expiration = ${len(params)}")
+
+        if option_type is not None:
+            params.append(option_type)
+            conditions.append(f"option_type = ${len(params)}")
+
+        query = f"""
             SELECT
                 timestamp,
+                underlying,
+                strike,
+                expiration,
+                option_type,
                 bid,
                 ask,
                 volume,
                 open_interest
             FROM option_chains
-            WHERE underlying = $1
-              AND strike = $2
-              AND expiration = $3
-              AND option_type = $4
+            WHERE {" AND ".join(conditions)}
             ORDER BY timestamp DESC
             LIMIT 1
         """
         try:
-            expiration_date = datetime.strptime(expiration, "%Y-%m-%d").date()
             async with self.pool.acquire() as conn:
-                row = await conn.fetchrow(query, underlying, float(strike), expiration_date, option_type)
+                row = await conn.fetchrow(query, *params)
                 return dict(row) if row else None
         except ValueError as e:
             logger.error(f"Invalid expiration format '{expiration}': {e}")

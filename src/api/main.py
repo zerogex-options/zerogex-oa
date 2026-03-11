@@ -377,9 +377,9 @@ async def get_historical_quotes(
 @app.get("/api/option/quote", response_model=OptionQuote)
 async def get_option_quote(
     underlying: str = Query(default="SPY", description="Underlying symbol, e.g. SPY"),
-    strike: float = Query(..., description="Strike price"),
-    expiration: str = Query(..., description="Expiration date (YYYY-MM-DD)"),
-    type: Literal["C", "P"] = Query(..., description="Option type: C for Call, P for Put"),
+    strike: Optional[float] = Query(default=None, description="Strike price"),
+    expiration: Optional[str] = Query(default=None, description="Expiration date (YYYY-MM-DD)"),
+    type: Optional[Literal["C", "P"]] = Query(default=None, description="Option type: C for Call, P for Put"),
 ):
     """Get the most recent quote for a specific option contract"""
     try:

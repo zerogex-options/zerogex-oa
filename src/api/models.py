@@ -245,6 +245,10 @@ class MaxPainTimeseriesPoint(BaseModel):
 
 class OptionQuote(BaseModel):
     timestamp: datetime
+    underlying: str
+    strike: Decimal
+    expiration: date
+    option_type: str
     bid: Optional[Decimal] = None
     ask: Optional[Decimal] = None
     volume: Optional[int] = None
