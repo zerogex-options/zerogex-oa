@@ -28,6 +28,7 @@ from .models import (
     HealthStatus,
     MaxPainCurrent,
     MaxPainTimeseriesPoint,
+    OptionQuote,
 )
 from .routers.trade_signals import router as trade_signals_router
 
@@ -372,6 +373,26 @@ async def get_historical_quotes(
     except Exception as e:
         logger.error(f"Error fetching historical quotes: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/option/quote", response_model=OptionQuote)
+async def get_option_quote(
+    underlying: str = Query(default="SPY", description="Underlying symbol, e.g. SPY"),
+    strike: float = Query(..., description="Strike price"),
+    expiration: str = Query(..., description="Expiration date (YYYY-MM-DD)"),
+    type: Literal["C", "P"] = Query(..., description="Option type: C for Call, P for Put"),
+):
+    """Get the most recent quote for a specific option contract"""
+    try:
+        data = await db_manager.get_option_quote(underlying, strike, expiration, type)
+        if not data:
+            raise HTTPException(status_code=404, detail="No option quote data available")
+        return OptionQuote(**data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching option quote: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 
 @app.get("/api/max-pain/timeseries", response_model=List[MaxPainTimeseriesPoint])
 async def get_max_pain_timeseries(

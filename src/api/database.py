@@ -1836,3 +1836,34 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error fetching GEX heatmap: {e}")
             raise
+
+    async def get_option_quote(
+        self,
+        underlying: str,
+        strike: float,
+        expiration: str,
+        option_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Get the most recent quote for a specific option contract"""
+        query = """
+            SELECT
+                timestamp,
+                bid,
+                ask,
+                volume,
+                open_interest
+            FROM option_chains
+            WHERE underlying = $1
+              AND strike = $2
+              AND expiration = $3
+              AND option_type = $4
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(query, underlying, strike, expiration, option_type)
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error fetching option quote: {e}")
+            raise

@@ -243,6 +243,21 @@ class MaxPainTimeseriesPoint(BaseModel):
     max_pain: Decimal
 
 
+class OptionQuote(BaseModel):
+    timestamp: datetime
+    bid: Optional[Decimal] = None
+    ask: Optional[Decimal] = None
+    volume: Optional[int] = None
+    open_interest: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+        json_encoders = {
+            Decimal: lambda v: float(v) if v is not None else None,
+            datetime: lambda v: v.isoformat() if v is not None else None,
+        }
+
+
 class HealthStatus(BaseModel):
     status: str = Field(..., description="healthy, degraded, or unhealthy")
     database_connected: bool
