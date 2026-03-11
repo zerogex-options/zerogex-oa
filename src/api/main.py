@@ -534,9 +534,12 @@ async def get_momentum_divergence(
 
 @app.exception_handler(404)
 async def not_found_handler(request, exc):
+    detail = getattr(exc, "detail", None)
+    if not detail or detail == "Not Found":
+        detail = "Endpoint not found"
     return JSONResponse(
         status_code=404,
-        content={"detail": "Endpoint not found"}
+        content={"detail": detail}
     )
 
 @app.exception_handler(500)
