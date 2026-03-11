@@ -1861,9 +1861,13 @@ class DatabaseManager:
             LIMIT 1
         """
         try:
+            expiration_date = datetime.strptime(expiration, "%Y-%m-%d").date()
             async with self.pool.acquire() as conn:
-                row = await conn.fetchrow(query, underlying, strike, expiration, option_type)
+                row = await conn.fetchrow(query, underlying, float(strike), expiration_date, option_type)
                 return dict(row) if row else None
+        except ValueError as e:
+            logger.error(f"Invalid expiration format '{expiration}': {e}")
+            raise
         except Exception as e:
             logger.error(f"Error fetching option quote: {e}")
             raise
