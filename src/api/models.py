@@ -213,6 +213,21 @@ class PreviousClose(BaseModel):
         }
 
 
+class SessionCloses(BaseModel):
+    symbol: str
+    current_session_close: Decimal
+    current_session_close_ts: datetime
+    prior_session_close: Decimal
+    prior_session_close_ts: datetime
+
+    class Config:
+        from_attributes = True
+        json_encoders = {
+            Decimal: lambda v: float(v) if v is not None else None,
+            datetime: lambda v: v.isoformat() if v is not None else None,
+        }
+
+
 class MaxPainPoint(BaseModel):
     expiration: date | None = None
     settlement_price: Decimal

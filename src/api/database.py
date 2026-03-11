@@ -1604,6 +1604,60 @@ class DatabaseManager:
             logger.error(f"Error fetching previous close: {e}")
             raise
 
+    async def get_session_closes(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
+        """
+        Get the two most recently completed regular session closes (4:00 PM ET bars).
+
+        current_session_close = last 4pm ET bar whose timestamp is <= NOW().
+          - During market hours Wednesday (before 4pm ET) → Tuesday's 4pm close.
+          - During Wednesday after-hours or Thursday pre-market → Wednesday's 4pm close.
+        prior_session_close = the 4pm ET bar immediately before current_session_close.
+        """
+        query = """
+            WITH session_closes AS (
+                SELECT
+                    timestamp,
+                    close
+                FROM underlying_quotes
+                WHERE symbol = $1
+                    AND EXTRACT(HOUR FROM timestamp AT TIME ZONE 'America/New_York') = 16
+                    AND EXTRACT(MINUTE FROM timestamp AT TIME ZONE 'America/New_York') = 0
+                    AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
+                    AND timestamp <= NOW()
+                ORDER BY timestamp DESC
+                LIMIT 2
+            ),
+            ranked AS (
+                SELECT
+                    close,
+                    timestamp,
+                    ROW_NUMBER() OVER (ORDER BY timestamp DESC) AS rn
+                FROM session_closes
+            )
+            SELECT
+                MAX(CASE WHEN rn = 1 THEN close END)     AS current_session_close,
+                MAX(CASE WHEN rn = 1 THEN timestamp END) AS current_session_close_ts,
+                MAX(CASE WHEN rn = 2 THEN close END)     AS prior_session_close,
+                MAX(CASE WHEN rn = 2 THEN timestamp END) AS prior_session_close_ts
+            FROM ranked
+        """
+
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(query, symbol)
+                if not row or row['current_session_close'] is None or row['prior_session_close'] is None:
+                    return None
+                return {
+                    'symbol': symbol,
+                    'current_session_close': row['current_session_close'],
+                    'current_session_close_ts': row['current_session_close_ts'],
+                    'prior_session_close': row['prior_session_close'],
+                    'prior_session_close_ts': row['prior_session_close_ts'],
+                }
+        except Exception as e:
+            logger.error(f"Error fetching session closes: {e}")
+            raise
+
     async def get_historical_quotes(
         self,
         symbol: str = 'SPY',

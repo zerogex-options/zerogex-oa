@@ -25,6 +25,7 @@ from .models import (
     FlowBuyingPressurePoint,
     UnderlyingQuote,
     PreviousClose,
+    SessionCloses,
     HealthStatus,
     MaxPainCurrent,
     MaxPainTimeseriesPoint,
@@ -346,6 +347,29 @@ async def get_previous_close(symbol: str = Query(default="SPY")):
     except Exception as e:
         logger.error(f"Error fetching previous close: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/market/session-closes", response_model=SessionCloses)
+async def get_session_closes(symbol: str = Query(default="SPY")):
+    """
+    Get the two most recently completed regular session closes (4:00 PM ET bars).
+
+    - current_session_close: last completed 4pm ET bar.
+      During market hours Wednesday → Tuesday's close.
+      During Wednesday after-hours or Thursday pre-market → Wednesday's close.
+    - prior_session_close: the session close immediately before current_session_close.
+    """
+    try:
+        data = await db_manager.get_session_closes(symbol)
+        if not data:
+            raise HTTPException(status_code=404, detail="No session close data available")
+
+        return SessionCloses(**data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching session closes: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 
 @app.get("/api/market/historical", response_model=List[UnderlyingQuote])
 async def get_historical_quotes(

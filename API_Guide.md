@@ -92,6 +92,26 @@ Get previous trading day close.
 **Parameters:**
 - `symbol` (optional): default `SPY`
 
+### GET /api/market/session-closes
+Get the two most recently completed regular session closes (4:00 PM ET bars).
+
+- `current_session_close` — last completed 4pm ET close. During market hours on a given day (before 4pm ET), this is the previous day's close; during after-hours or the following pre-market, it is that day's close.
+- `prior_session_close` — the session close immediately before `current_session_close`.
+
+**Parameters:**
+- `symbol` (optional): default `SPY`
+
+**Example response:**
+```json
+{
+  "symbol": "SPY",
+  "current_session_close": 676.04,
+  "current_session_close_ts": "2026-03-11T21:00:00Z",
+  "prior_session_close": 675.73,
+  "prior_session_close_ts": "2026-03-10T21:00:00Z"
+}
+```
+
 ### GET /api/market/historical
 Get historical underlying quotes.
 
