@@ -1774,7 +1774,7 @@ gaps-today: ## Today's data gaps
 	@$(PSQL) -c "\
 		WITH time_gaps AS ( \
 			SELECT \
-				timestamp AT TIME ZONE 'America/New_York' as current_time, \
+				timestamp AT TIME ZONE 'America/New_York' as curr_time, \
 				LAG(timestamp AT TIME ZONE 'America/New_York') OVER (ORDER BY timestamp) as prev_time, \
 				EXTRACT(EPOCH FROM (timestamp - LAG(timestamp) OVER (ORDER BY timestamp)))/60 as gap_minutes \
 			FROM underlying_quotes \
@@ -1782,11 +1782,11 @@ gaps-today: ## Today's data gaps
 		) \
 		SELECT \
 			TO_CHAR(prev_time, 'HH24:MI') as from_time, \
-			TO_CHAR(current_time, 'HH24:MI') as to_time, \
+			TO_CHAR(curr_time, 'HH24:MI') as to_time, \
 			ROUND(gap_minutes::numeric, 1) as gap_minutes \
 		FROM time_gaps \
 		WHERE gap_minutes > 2 \
-		ORDER BY current_time;"
+		ORDER BY curr_time;"
 
 .PHONY: quality
 quality: ## Data quality report
