@@ -3,7 +3,7 @@ Volatility Gauge Router
 
 GET /api/volatility/gauge
 
-Returns VIX.X metrics as car dashboard gauges:
+Returns $VIX.X metrics as car dashboard gauges:
   - speedometer (0–10): Current VIX level — how fast the market is moving
   - tachometer  (0–10): VIX rate of change across time scales — how fast
                          volatility itself is accelerating or decelerating
@@ -11,7 +11,7 @@ Returns VIX.X metrics as car dashboard gauges:
 Cache behaviour
 ---------------
 * First call after startup: fetches ~2 trading sessions (≈156 bars) of 5-min
-  VIX.X bars from TradeStation and stores them in memory.
+  $VIX.X bars from TradeStation and stores them in memory.
 * Subsequent calls: fetches only the latest 5-min bar and appends it.
 * Cache is trimmed after every update so it never reaches back further than
   2 regular trading sessions (Mon–Fri, 9:30–16:00 ET).
@@ -143,11 +143,11 @@ def _trim_cache() -> None:
 # ============================================================================
 
 def _do_initial_fetch() -> None:
-    """Fetch ~2 sessions (156 bars) of 5-min VIX.X bars and populate cache."""
+    """Fetch ~2 sessions (156 bars) of 5-min $VIX.X bars and populate cache."""
     global _vix_bars, _cache_initialized
     client = _make_ts_client()
     result = client.get_bars(
-        symbol="VIX.X",
+        symbol="$VIX.X",
         interval=5,
         unit="Minute",
         barsback=156,
@@ -168,7 +168,7 @@ def _do_incremental_fetch() -> None:
     """Fetch the latest 5-min bar and append it to the cache if it is new."""
     client = _make_ts_client()
     result = client.get_bars(
-        symbol="VIX.X",
+        symbol="$VIX.X",
         interval=5,
         unit="Minute",
         barsback=2,          # grab 2 to guard against partial-bar edge cases
@@ -316,7 +316,7 @@ class VIXBar(BaseModel):
 
 class VolatilityGaugeResponse(BaseModel):
     timestamp: datetime = Field(description="Timestamp of the latest VIX bar (ET)")
-    vix: float = Field(description="Current VIX.X close")
+    vix: float = Field(description="Current $VIX.X close")
 
     speedometer: float = Field(
         description=(
@@ -354,10 +354,10 @@ class VolatilityGaugeResponse(BaseModel):
 @router.get("/gauge", response_model=VolatilityGaugeResponse)
 async def get_volatility_gauge():
     """
-    Returns VIX.X volatility metrics as a two-dial car dashboard.
+    Returns $VIX.X volatility metrics as a two-dial car dashboard.
 
     **Speedometer** — *how fast are we going?*
-    Maps the current VIX.X level to a 0–10 scale using a log curve that
+    Maps the current $VIX.X level to a 0–10 scale using a log curve that
     matches the historical distribution of VIX readings:
     - `0–2`  → Idle (VIX ~10–14, ultra-low volatility)
     - `2–4`  → Cruising (VIX ~14–19, below-average vol)
