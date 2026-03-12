@@ -2162,6 +2162,9 @@ api-test: ## Test ALL API endpoints
 	echo "$(YELLOW)Max pain current snapshot$(NC)"; \
 	test_endpoint "/api/max-pain/current?symbol=$$SYMBOL&strike_limit=100"; \
 	echo ""; \
+	echo "$(YELLOW)Volatility endpoints$(NC)"; \
+	test_endpoint "/api/volatility/gauge"; \
+	echo ""; \
 	echo "$(YELLOW)Trade signal endpoints$(NC)"; \
 	for STF in $$SIGNAL_TIMEFRAMES; do \
 		test_endpoint "/api/signals/trade?symbol=$$SYMBOL&timeframe=$$STF"; \
