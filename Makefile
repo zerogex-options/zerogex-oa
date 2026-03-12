@@ -2124,6 +2124,7 @@ api-test: ## Test ALL API endpoints
 	test_endpoint "/api/gex/by-strike?symbol=$$SYMBOL&limit=10&sort_by=impact"; \
 	test_endpoint "/api/market/quote?symbol=$$SYMBOL"; \
 	test_endpoint "/api/market/previous-close?symbol=$$SYMBOL"; \
+	test_endpoint "/api/market/session-closes?symbol=$$SYMBOL"; \
 	test_endpoint "/api/option/quote?underlying=$$SYMBOL&type=C"; \
 	test_endpoint "/api/trading/dealer-hedging?symbol=$$SYMBOL&limit=10"; \
 	test_endpoint "/api/trading/volume-spikes?symbol=$$SYMBOL&limit=10"; \
