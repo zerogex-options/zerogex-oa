@@ -32,6 +32,7 @@ from .models import (
     OptionQuote,
 )
 from .routers.trade_signals import router as trade_signals_router
+from .routers.volatility_gauge import router as volatility_gauge_router
 
 # Configure logging
 logging.basicConfig(
@@ -83,6 +84,7 @@ app.add_middleware(
 )
 
 app.include_router(trade_signals_router)
+app.include_router(volatility_gauge_router)
 
 # ============================================================================
 # Health Check
