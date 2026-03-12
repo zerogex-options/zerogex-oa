@@ -416,12 +416,12 @@ run-auth: ## Test TradeStation authentication
 run-client: ## Test TradeStation API client (TEST, SYMBOL, BARS_BACK, INTERVAL, UNIT, QUERY, DEBUG, TEST_HISTORICAL)
 	@echo "$(BLUE)=== Testing TradeStation Client ===$(NC)"
 	@$(VENV_PYTHON) -m src.ingestion.tradestation_client \
-		$(if $(TEST),--test $(TEST)) \
-		$(if $(SYMBOL),--symbol $(SYMBOL)) \
-		$(if $(BARS_BACK),--bars-back $(BARS_BACK)) \
-		$(if $(INTERVAL),--interval $(INTERVAL)) \
-		$(if $(UNIT),--unit $(UNIT)) \
-		$(if $(QUERY),--query $(QUERY)) \
+		$(if $(TEST),--test '$(TEST)') \
+		$(if $(SYMBOL),--symbol '$(SYMBOL)') \
+		$(if $(BARS_BACK),--bars-back '$(BARS_BACK)') \
+		$(if $(INTERVAL),--interval '$(INTERVAL)') \
+		$(if $(UNIT),--unit '$(UNIT)') \
+		$(if $(QUERY),--query '$(QUERY)') \
 		$(if $(DEBUG),--debug) \
 		$(if $(TEST_HISTORICAL),--test-historical)
 
