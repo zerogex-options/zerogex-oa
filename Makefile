@@ -84,6 +84,9 @@ help: ## Show this help message
 	@echo "$(GREEN)Run Components:$(NC)"
 	@echo "  make run-auth           - Test TradeStation authentication"
 	@echo "  make run-client         - Test TradeStation API client"
+	@echo "    TEST=<all|quote|bars|stream-bars|options|search|market-hours|depth>"
+	@echo "    SYMBOL=<sym>  BARS_BACK=<n>  INTERVAL=<n>  UNIT=<Minute|Daily|Weekly|Monthly>"
+	@echo "    QUERY=<str>   DEBUG=1        TEST_HISTORICAL=1"
 	@echo "  make run-backfill       - Run historical data backfill"
 	@echo "  make run-stream         - Test real-time streaming"
 	@echo "  make run-ingest         - Run main ingestion engine"
@@ -410,9 +413,17 @@ run-auth: ## Test TradeStation authentication
 	@$(VENV_PYTHON) -m src.ingestion.tradestation_auth
 
 .PHONY: run-client
-run-client: ## Test TradeStation API client
+run-client: ## Test TradeStation API client (TEST, SYMBOL, BARS_BACK, INTERVAL, UNIT, QUERY, DEBUG, TEST_HISTORICAL)
 	@echo "$(BLUE)=== Testing TradeStation Client ===$(NC)"
-	@$(VENV_PYTHON) -m src.ingestion.tradestation_client
+	@$(VENV_PYTHON) -m src.ingestion.tradestation_client \
+		$(if $(TEST),--test $(TEST)) \
+		$(if $(SYMBOL),--symbol $(SYMBOL)) \
+		$(if $(BARS_BACK),--bars-back $(BARS_BACK)) \
+		$(if $(INTERVAL),--interval $(INTERVAL)) \
+		$(if $(UNIT),--unit $(UNIT)) \
+		$(if $(QUERY),--query $(QUERY)) \
+		$(if $(DEBUG),--debug) \
+		$(if $(TEST_HISTORICAL),--test-historical)
 
 .PHONY: run-backfill
 run-backfill: ## Run historical data backfill
