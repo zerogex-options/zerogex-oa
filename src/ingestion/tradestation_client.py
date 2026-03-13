@@ -642,7 +642,7 @@ Examples:
                     print(f"   No data found for requested time range")
             print()
 
-        # Test 3: Get option expirations
+        # Test 3: Get option expirations/strikes and sample option quote
         if test in ["all", "options"]:
             print("Test: Get Option Expirations (first 5)")
             print("-" * 60)
@@ -657,6 +657,25 @@ Examples:
                 strikes = client.get_option_strikes(sym, expiration=exp_str)
                 for strike in strikes[:10]:
                     print(f"      ${strike}")
+
+                # Quote one sample option to verify quote endpoint symbol handling
+                if strikes:
+                    sample_strike = strikes[len(strikes) // 2]  # choose a mid strike
+                    sample_option = client.build_option_symbol(sym, expirations[0], "C", sample_strike)
+                    print(f"\n   Quote test for sample option: {sample_option}")
+                    option_quote = client.get_option_quotes([sample_option])
+
+                    if "Errors" in option_quote and option_quote["Errors"]:
+                        err = option_quote["Errors"][0]
+                        print(f"   ❌ Quote error: {err.get('Error', 'Unknown error')}")
+                    elif "Quotes" in option_quote and option_quote["Quotes"]:
+                        q = option_quote["Quotes"][0]
+                        print(f"   ✅ {q.get('Symbol', sample_option)}")
+                        print(f"      Last: ${q.get('Last', 'N/A')}")
+                        print(f"      Bid/Ask: ${q.get('Bid', 'N/A')} / ${q.get('Ask', 'N/A')}")
+                        print(f"      Volume: {safe_int(q.get('Volume'), field_name='Volume'):,}")
+                    else:
+                        print("   ⚠️  Quote request returned no data and no explicit error")
             print()
 
         # Test 4: Symbol search

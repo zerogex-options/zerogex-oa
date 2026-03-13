@@ -398,7 +398,7 @@ python -m src.ingestion.tradestation_client --debug
 - `quote` - Current quotes
 - `bars` - Historical OHLCV bars
 - `stream-bars` - Real-time bars with Up/Down volume
-- `options` - Option expirations and strikes
+- `options` - Option expirations, strikes, and a sample option quote test
 - `search` - Symbol search
 - `market-hours` - Market status and hours
 - `depth` - Level 2 market depth
