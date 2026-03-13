@@ -580,6 +580,10 @@ ANALYTICS_UNDERLYINGS=SPY,SPX
 # Optional alias map (alias -> TradeStation symbol)
 SYMBOL_ALIASES=SPX=$SPX.X
 
+# Optional option-root override for option quote symbol formatting
+# (when quote endpoint uses a different root than expirations/strikes)
+OPTION_ROOT_ALIASES=$SPX.X=SPXW
+
 # Risk-free rate for Greeks
 RISK_FREE_RATE=0.05
 ```
@@ -770,6 +774,7 @@ zerogex-oa/
 | `ANALYTICS_UNDERLYINGS` | Comma-separated underlyings for parallel analytics workers | _(empty)_ |
 | `ANALYTICS_INTERVAL` | Calculation interval in seconds | `60` |
 | `SYMBOL_ALIASES` | Alias map (`ALIAS=TS_SYMBOL`) used by ingestion/analytics | _(empty)_ |
+| `OPTION_ROOT_ALIASES` | Option symbol root overrides (`UNDERLYING=OPTION_ROOT`) | _(empty)_ |
 
 **Note:** Analytics engine also uses `RISK_FREE_RATE` from the Greeks & IV Configuration section above.
 

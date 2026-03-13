@@ -16,7 +16,7 @@ import json
 from src.ingestion.tradestation_auth import TradeStationAuth
 from src.utils import get_logger
 from src.validation import safe_float, safe_int
-from src.symbols import parse_underlyings
+from src.symbols import parse_underlyings, resolve_option_root
 from src.config import (
     API_REQUEST_TIMEOUT,
     API_RETRY_ATTEMPTS,
@@ -382,6 +382,7 @@ class TradeStationClient:
         Example: SPY 260221C450 or SPY 260221P450.50
         """
         exp_str = expiration.strftime("%y%m%d")
+        option_root = resolve_option_root(underlying)
 
         # Format strike with proper precision
         if strike == int(strike):
@@ -389,7 +390,9 @@ class TradeStationClient:
         else:
             strike_str = f"{strike:.2f}"
 
-        symbol = f"{underlying} {exp_str}{option_type.upper()}{strike_str}"
+        symbol = f"{option_root} {exp_str}{option_type.upper()}{strike_str}"
+        if option_root != underlying:
+            logger.debug(f"Option root override: {underlying} -> {option_root}")
         logger.debug(f"Built option symbol: {symbol}")
         return symbol
 

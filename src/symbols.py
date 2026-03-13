@@ -5,7 +5,7 @@ from typing import Dict, List
 
 
 def _parse_alias_mapping(raw_mapping: str) -> Dict[str, str]:
-    """Parse SYMBOL_ALIASES env var in the format: ALIAS=SYMBOL,ALIAS2=SYMBOL2."""
+    """Parse mapping env vars in the format: KEY=VALUE,KEY2=VALUE2."""
     mapping: Dict[str, str] = {}
 
     if not raw_mapping:
@@ -28,6 +28,11 @@ def _parse_alias_mapping(raw_mapping: str) -> Dict[str, str]:
 def get_symbol_aliases() -> Dict[str, str]:
     """Return alias mapping from env (SYMBOL_ALIASES)."""
     return _parse_alias_mapping(os.getenv("SYMBOL_ALIASES", ""))
+
+
+def get_option_root_aliases() -> Dict[str, str]:
+    """Return option-root mapping from env (OPTION_ROOT_ALIASES)."""
+    return _parse_alias_mapping(os.getenv("OPTION_ROOT_ALIASES", ""))
 
 
 def resolve_symbol(symbol_or_alias: str) -> str:
@@ -57,3 +62,12 @@ def parse_underlyings(raw_underlyings: str) -> List[str]:
 
     return resolved
 
+
+def resolve_option_root(underlying: str) -> str:
+    """Resolve option root for a given underlying, defaulting to underlying itself."""
+    normalized = underlying.strip().upper()
+    if not normalized:
+        return normalized
+
+    option_roots = get_option_root_aliases()
+    return option_roots.get(normalized, normalized)
