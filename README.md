@@ -374,6 +374,9 @@ python -m src.ingestion.tradestation_client --test quote --symbol SPY
 python -m src.ingestion.tradestation_client --test bars --symbol SPY --bars-back 10
 python -m src.ingestion.tradestation_client --test stream-bars --symbol SPY
 python -m src.ingestion.tradestation_client --test options --symbol SPY
+python -m src.ingestion.tradestation_client --test options-expirations --symbol '$SPX.X'
+python -m src.ingestion.tradestation_client --test options-strikes --symbol '$SPX.X' --expiration 03-20-2026
+python -m src.ingestion.tradestation_client --test option-quote --option-symbol 'SPXW 260320C6630'
 # Alias example (with SYMBOL_ALIASES=SPX=$SPX.X in .env)
 python -m src.ingestion.tradestation_client --test quote --symbol SPX
 
@@ -398,7 +401,10 @@ python -m src.ingestion.tradestation_client --debug
 - `quote` - Current quotes
 - `bars` - Historical OHLCV bars
 - `stream-bars` - Real-time bars with Up/Down volume
-- `options` - Option expirations, strikes, and a sample option quote test
+- `options` - Runs expirations + strikes + sample option quote
+- `options-expirations` - Only option expirations
+- `options-strikes` - Only option strikes (optional `--expiration MM-DD-YYYY`)
+- `option-quote` - Only option quote (use `--option-symbol` or auto-sampled)
 - `search` - Symbol search
 - `market-hours` - Market status and hours
 - `depth` - Level 2 market depth

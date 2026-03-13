@@ -466,6 +466,9 @@ Examples:
   python -m src.ingestion.tradestation_client --test bars --symbol SPY --bars-back 10
   python -m src.ingestion.tradestation_client --test stream-bars --symbol SPY
   python -m src.ingestion.tradestation_client --test options --symbol SPY
+  python -m src.ingestion.tradestation_client --test options-expirations --symbol '$SPX.X'
+  python -m src.ingestion.tradestation_client --test options-strikes --symbol '$SPX.X' --expiration 03-20-2026
+  python -m src.ingestion.tradestation_client --test option-quote --option-symbol 'SPXW 260320C6630'
   python -m src.ingestion.tradestation_client --test search --query Apple
   python -m src.ingestion.tradestation_client --test market-hours
 
@@ -475,11 +478,17 @@ Examples:
     )
 
     parser.add_argument("--test", 
-                       choices=["all", "quote", "bars", "stream-bars", "options", "search", "market-hours", "depth"],
+                       choices=["all", "quote", "bars", "stream-bars", "options", "options-expirations", "options-strikes", "option-quote", "search", "market-hours", "depth"],
                        help="Which test to run (default: all, env: TS_TEST)")
 
     parser.add_argument("--symbol", type=str,
                        help="Symbol(s) to test with, comma-separated (default: SPY, env: TS_SYMBOL)")
+
+    parser.add_argument("--option-symbol", type=str,
+                       help="Direct option contract symbol for option-quote test (e.g., 'SPXW 260320C6630')")
+
+    parser.add_argument("--expiration", type=str,
+                       help="Expiration for options-strikes test (MM-DD-YYYY)")
 
     parser.add_argument("--bars-back", type=int,
                        help="Number of bars to retrieve (default: 5, env: TS_BARS_BACK)")
@@ -509,6 +518,8 @@ Examples:
     interval = args.interval if args.interval else int(os.getenv("TS_INTERVAL", "1"))
     unit = args.unit if args.unit else os.getenv("TS_UNIT", "Daily")
     query = args.query if args.query else os.getenv("TS_QUERY", "Apple")
+    expiration = args.expiration if args.expiration else None
+    option_symbol_arg = args.option_symbol if args.option_symbol else None
     debug = args.debug or os.getenv("LOG_LEVEL", "").upper() == "DEBUG"
 
     # Set logging level
@@ -645,40 +656,77 @@ Examples:
                     print(f"   No data found for requested time range")
             print()
 
-        # Test 3: Get option expirations/strikes and sample option quote
-        if test in ["all", "options"]:
+        # Test 3a: Option expirations
+        if test in ["all", "options", "options-expirations"]:
             print("Test: Get Option Expirations (first 5)")
             print("-" * 60)
             sym = symbols[0] if isinstance(symbols, list) else symbols
             expirations = client.get_option_expirations(sym)
             for exp in expirations[:5]:
                 print(f"   {exp}")
+            print()
 
-            if expirations:
-                print(f"\n   Strikes for {expirations[0]} (first 10):")
-                exp_str = expirations[0].strftime("%m-%d-%Y")
+        # Test 3b: Option strikes
+        if test in ["all", "options", "options-strikes"]:
+            print("Test: Get Option Strikes")
+            print("-" * 60)
+            sym = symbols[0] if isinstance(symbols, list) else symbols
+
+            if expiration:
+                exp_str = expiration
+            else:
+                expirations = client.get_option_expirations(sym)
+                exp_str = expirations[0].strftime("%m-%d-%Y") if expirations else None
+
+            if exp_str:
+                print(f"   Expiration: {exp_str}")
                 strikes = client.get_option_strikes(sym, expiration=exp_str)
+                print("   First 10 strikes:")
                 for strike in strikes[:10]:
                     print(f"      ${strike}")
+            else:
+                print("   ⚠️  No expirations available to fetch strikes")
+            print()
 
-                # Quote one sample option to verify quote endpoint symbol handling
-                if strikes:
-                    sample_strike = strikes[len(strikes) // 2]  # choose a mid strike
-                    sample_option = client.build_option_symbol(sym, expirations[0], "C", sample_strike)
-                    print(f"\n   Quote test for sample option: {sample_option}")
-                    option_quote = client.get_option_quotes([sample_option])
+        # Test 3c: Direct option quote (or sampled from first expiration/strikes)
+        if test in ["all", "options", "option-quote"]:
+            print("Test: Option Quote")
+            print("-" * 60)
+            sym = symbols[0] if isinstance(symbols, list) else symbols
 
-                    if "Errors" in option_quote and option_quote["Errors"]:
-                        err = option_quote["Errors"][0]
-                        print(f"   ❌ Quote error: {err.get('Error', 'Unknown error')}")
-                    elif "Quotes" in option_quote and option_quote["Quotes"]:
-                        q = option_quote["Quotes"][0]
-                        print(f"   ✅ {q.get('Symbol', sample_option)}")
-                        print(f"      Last: ${q.get('Last', 'N/A')}")
-                        print(f"      Bid/Ask: ${q.get('Bid', 'N/A')} / ${q.get('Ask', 'N/A')}")
-                        print(f"      Volume: {safe_int(q.get('Volume'), field_name='Volume'):,}")
+            if option_symbol_arg:
+                sample_option = option_symbol_arg
+            else:
+                expirations = client.get_option_expirations(sym)
+                if not expirations:
+                    print("   ⚠️  No expirations available for quote test")
+                    sample_option = None
+                else:
+                    exp_str = expiration if expiration else expirations[0].strftime("%m-%d-%Y")
+                    strikes = client.get_option_strikes(sym, expiration=exp_str)
+                    if not strikes:
+                        print("   ⚠️  No strikes available for quote test")
+                        sample_option = None
                     else:
-                        print("   ⚠️  Quote request returned no data and no explicit error")
+                        sample_strike = strikes[len(strikes) // 2]
+                        exp_date = datetime.strptime(exp_str, "%m-%d-%Y").date()
+                        sample_option = client.build_option_symbol(sym, exp_date, "C", sample_strike)
+
+            if sample_option:
+                print(f"   Quote test option: {sample_option}")
+                option_quote = client.get_option_quotes([sample_option])
+
+                if "Errors" in option_quote and option_quote["Errors"]:
+                    err = option_quote["Errors"][0]
+                    print(f"   ❌ Quote error: {err.get('Error', 'Unknown error')}")
+                elif "Quotes" in option_quote and option_quote["Quotes"]:
+                    q = option_quote["Quotes"][0]
+                    print(f"   ✅ {q.get('Symbol', sample_option)}")
+                    print(f"      Last: ${q.get('Last', 'N/A')}")
+                    print(f"      Bid/Ask: ${q.get('Bid', 'N/A')} / ${q.get('Ask', 'N/A')}")
+                    print(f"      Volume: {safe_int(q.get('Volume'), field_name='Volume'):,}")
+                else:
+                    print("   ⚠️  Quote request returned no data and no explicit error")
             print()
 
         # Test 4: Symbol search
