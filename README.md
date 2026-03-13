@@ -387,6 +387,9 @@ make alias-check ALIAS=SPX TICKER='$$SPX.X' INPUT='SPY,SPX'
 # Run ingestion with alias-aware input (resolves then launches main engine)
 make run-ingest-alias INPUT='SPY,SPX' ALIASES='SPX=$$SPX.X'
 make run-ingest-alias INPUT='SPY,SPX' ALIAS=SPX TICKER='$$SPX.X'
+
+# Upsert symbol metadata into legacy symbols table
+make symbol-add SYMBOL='$$SPX.X' NAME='S&P 500 Index' ASSET_TYPE=INDEX IS_ACTIVE=true
 python -m src.ingestion.tradestation_client --debug
 ```
 

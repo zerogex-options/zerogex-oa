@@ -175,6 +175,8 @@ help: ## Show this help message
 	@echo "  make clear-underlying   - Clear only underlying quotes"
 	@echo ""
 	@echo "$(GREEN)Database Schema:$(NC)"
+	@echo "  make symbol-add        - Upsert one row into symbols table"
+	@echo "    SYMBOL=<sym> NAME=<name> ASSET_TYPE=<EQUITY|INDEX|ETF> IS_ACTIVE=<true|false>"
 	@echo "  make schema-apply       - Apply/update setup/database/schema.sql"
 	@echo "  make schema-verify      - Verify schema components exist"
 	@echo "  make schema-backup      - Backup current schema to file"
@@ -1900,6 +1902,35 @@ clear-underlying: ## Clear only underlying quotes
 # =============================================================================
 # Database Schema Management
 # =============================================================================
+
+.PHONY: symbol-add
+symbol-add: ## Upsert into symbols table (required: SYMBOL; optional: NAME, ASSET_TYPE, IS_ACTIVE)
+	@echo "$(BLUE)=== Upserting symbol into symbols table ===$(NC)"
+	@if [ -z "$(SYMBOL)" ]; then \
+		echo "$(RED)❌ SYMBOL is required$(NC)"; \
+		echo "Usage: make symbol-add SYMBOL=SPY NAME='SPDR S&P 500 ETF' ASSET_TYPE=ETF IS_ACTIVE=true"; \
+		exit 1; \
+	fi
+	@SYMBOL_UPPER="$$(echo '$(SYMBOL)' | tr '[:lower:]' '[:upper:]')"; \
+	ASSET_UPPER="$$(echo '$(or $(ASSET_TYPE),EQUITY)' | tr '[:lower:]' '[:upper:]')"; \
+	ACTIVE_VAL='$(or $(IS_ACTIVE),true)'; \
+	if [ "$$ASSET_UPPER" != "EQUITY" ] && [ "$$ASSET_UPPER" != "INDEX" ] && [ "$$ASSET_UPPER" != "ETF" ]; then \
+		echo "$(RED)❌ ASSET_TYPE must be one of: EQUITY, INDEX, ETF$(NC)"; \
+		exit 1; \
+	fi; \
+	if [ "$$ACTIVE_VAL" != "true" ] && [ "$$ACTIVE_VAL" != "false" ]; then \
+		echo "$(RED)❌ IS_ACTIVE must be true or false$(NC)"; \
+		exit 1; \
+	fi; \
+	$(PSQL) -c "\
+		INSERT INTO symbols (symbol, name, asset_type, is_active) \
+		VALUES ('$$SYMBOL_UPPER', NULLIF('$(NAME)', ''), '$$ASSET_UPPER', $$ACTIVE_VAL) \
+		ON CONFLICT (symbol) DO UPDATE SET \
+			name = EXCLUDED.name, \
+			asset_type = EXCLUDED.asset_type, \
+			is_active = EXCLUDED.is_active, \
+			updated_at = NOW();"; \
+	echo "$(GREEN)✅ Upserted symbol $$SYMBOL_UPPER$(NC)"
 
 .PHONY: schema-apply
 schema-apply: ## Apply/update database schema (idempotent)
