@@ -373,6 +373,8 @@ python -m src.ingestion.tradestation_client --test quote --symbol SPY
 python -m src.ingestion.tradestation_client --test bars --symbol SPY --bars-back 10
 python -m src.ingestion.tradestation_client --test stream-bars --symbol SPY
 python -m src.ingestion.tradestation_client --test options --symbol SPY
+# Alias example (with SYMBOL_ALIASES=SPX=$SPX.X in .env)
+python -m src.ingestion.tradestation_client --test quote --symbol SPX
 python -m src.ingestion.tradestation_client --debug
 ```
 

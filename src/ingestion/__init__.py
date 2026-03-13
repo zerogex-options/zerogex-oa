@@ -1,23 +1,8 @@
-"""
-Data ingestion modules for ZeroGEX
+"""Data ingestion package.
 
-Components:
-- TradeStationAuth: OAuth2 authentication manager
-- TradeStationClient: Market data API client with retry logic
-- BackfillManager: Historical data fetching (yields data to IngestionEngine)
-- StreamManager: Real-time data fetching (yields data to IngestionEngine)
-- IngestionEngine: Orchestration, aggregation, and storage
-- GreeksCalculator: Black-Scholes Greeks calculation
-- IVCalculator: Implied volatility calculation from option prices
+Intentionally avoids importing `main_engine` at package import time to prevent
+`python -m src.ingestion.main_engine` runpy warnings.
 """
-
-from src.ingestion.tradestation_auth import TradeStationAuth
-from src.ingestion.tradestation_client import TradeStationClient
-from src.ingestion.backfill_manager import BackfillManager
-from src.ingestion.stream_manager import StreamManager
-from src.ingestion.main_engine import IngestionEngine 
-from src.ingestion.greeks_calculator import GreeksCalculator
-from src.ingestion.iv_calculator import IVCalculator
 
 __all__ = [
     "TradeStationAuth",
@@ -28,3 +13,30 @@ __all__ = [
     "GreeksCalculator",
     "IVCalculator",
 ]
+
+
+def __getattr__(name):
+    """Lazy-load modules to avoid circular/module-run side effects."""
+    if name == "TradeStationAuth":
+        from src.ingestion.tradestation_auth import TradeStationAuth
+        return TradeStationAuth
+    if name == "TradeStationClient":
+        from src.ingestion.tradestation_client import TradeStationClient
+        return TradeStationClient
+    if name == "BackfillManager":
+        from src.ingestion.backfill_manager import BackfillManager
+        return BackfillManager
+    if name == "StreamManager":
+        from src.ingestion.stream_manager import StreamManager
+        return StreamManager
+    if name == "IngestionEngine":
+        from src.ingestion.main_engine import IngestionEngine
+        return IngestionEngine
+    if name == "GreeksCalculator":
+        from src.ingestion.greeks_calculator import GreeksCalculator
+        return GreeksCalculator
+    if name == "IVCalculator":
+        from src.ingestion.iv_calculator import IVCalculator
+        return IVCalculator
+
+    raise AttributeError(f"module 'src.ingestion' has no attribute '{name}'")

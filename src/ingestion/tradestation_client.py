@@ -16,6 +16,7 @@ import json
 from src.ingestion.tradestation_auth import TradeStationAuth
 from src.utils import get_logger
 from src.validation import safe_float, safe_int
+from src.symbols import parse_underlyings
 from src.config import (
     API_REQUEST_TIMEOUT,
     API_RETRY_ATTEMPTS,
@@ -526,8 +527,15 @@ Examples:
     )
 
     try:
-        # Convert comma-separated symbols to list
-        symbols = symbol.split(",") if "," in symbol else symbol
+        # Convert comma-separated symbols to list and resolve aliases
+        resolved_symbols = parse_underlyings(symbol)
+        if not resolved_symbols:
+            raise ValueError("No valid symbols provided")
+
+        symbols = resolved_symbols if len(resolved_symbols) > 1 else resolved_symbols[0]
+
+        if symbol.strip().upper() != ",".join(resolved_symbols):
+            print(f"Resolved symbols: {symbol} -> {', '.join(resolved_symbols)}")
 
         # Test 1: Get quote
         if test in ["all", "quote"]:
