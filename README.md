@@ -375,6 +375,9 @@ python -m src.ingestion.tradestation_client --test stream-bars --symbol SPY
 python -m src.ingestion.tradestation_client --test options --symbol SPY
 # Alias example (with SYMBOL_ALIASES=SPX=$SPX.X in .env)
 python -m src.ingestion.tradestation_client --test quote --symbol SPX
+
+# Quick alias resolution check (safe one-liner, no heredoc required)
+SYMBOL_ALIASES='SPX=$SPX.X' python -c "from src.symbols import parse_underlyings; print(parse_underlyings('SPY,SPX'))"
 python -m src.ingestion.tradestation_client --debug
 ```
 
