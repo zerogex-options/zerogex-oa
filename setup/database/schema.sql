@@ -2,7 +2,7 @@
 -- ZeroGEX Schema (Idempotent, minimal production footprint)
 -- =============================================================================
 
--- Keep legacy support table for existing foreign-key relationships.
+-- Required symbol registry used by FK relationships.
 CREATE TABLE IF NOT EXISTS symbols (
     symbol VARCHAR(10) PRIMARY KEY,
     name VARCHAR(100),

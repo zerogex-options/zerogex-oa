@@ -175,7 +175,7 @@ help: ## Show this help message
 	@echo "  make clear-underlying   - Clear only underlying quotes"
 	@echo ""
 	@echo "$(GREEN)Database Schema:$(NC)"
-	@echo "  make symbol-add        - Upsert one row into symbols table"
+	@echo "  make symbol-add        - Upsert one row into required symbols table"
 	@echo "    SYMBOL=<sym> NAME=<name> ASSET_TYPE=<EQUITY|INDEX|ETF> IS_ACTIVE=<true|false>"
 	@echo "  make schema-apply       - Apply/update setup/database/schema.sql"
 	@echo "  make schema-verify      - Verify schema components exist"

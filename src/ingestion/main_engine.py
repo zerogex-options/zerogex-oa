@@ -94,6 +94,39 @@ class IngestionEngine:
 
         # Initialize database
         self._initialize_database()
+        self._ensure_symbol_exists()
+
+    def _infer_asset_type(self, symbol: str) -> str:
+        """Infer a sensible asset type for symbols table bootstrap."""
+        if symbol.startswith("$"):
+            return "INDEX"
+        if symbol in {"SPY", "QQQ", "IWM", "DIA"}:
+            return "ETF"
+        return "EQUITY"
+
+    def _ensure_symbol_exists(self):
+        """Ensure underlying exists in symbols table (required by FK on underlying_quotes)."""
+        try:
+            with db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO symbols (symbol, name, asset_type, is_active)
+                    VALUES (%s, %s, %s, TRUE)
+                    ON CONFLICT (symbol) DO UPDATE SET
+                        is_active = TRUE,
+                        updated_at = NOW()
+                    """,
+                    (
+                        self.underlying,
+                        self.underlying,
+                        self._infer_asset_type(self.underlying),
+                    ),
+                )
+                conn.commit()
+            logger.info(f"✅ Ensured symbols row exists for {self.underlying}")
+        except Exception as e:
+            logger.error(f"Error ensuring symbols row for {self.underlying}: {e}", exc_info=True)
 
     def _signal_handler(self, signum, frame):
         """
