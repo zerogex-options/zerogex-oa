@@ -383,6 +383,10 @@ SYMBOL_ALIASES='SPX=$SPX.X' python -c "from src.symbols import parse_underlyings
 # Note: in make args, use $$ for literal $ characters.
 make alias-check ALIASES='SPX=$$SPX.X,NDX=$$NDX.X' INPUT='SPY,SPX,NDX'
 make alias-check ALIAS=SPX TICKER='$$SPX.X' INPUT='SPY,SPX'
+
+# Run ingestion with alias-aware input (resolves then launches main engine)
+make run-ingest-alias INPUT='SPY,SPX' ALIASES='SPX=$$SPX.X'
+make run-ingest-alias INPUT='SPY,SPX' ALIAS=SPX TICKER='$$SPX.X'
 python -m src.ingestion.tradestation_client --debug
 ```
 

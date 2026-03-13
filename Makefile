@@ -89,6 +89,8 @@ help: ## Show this help message
 	@echo "    QUERY=<str>   DEBUG=1        TEST_HISTORICAL=1"
 	@echo "  make alias-check        - Resolve aliases to TradeStation symbols"
 	@echo "    ALIAS=<name> ALIASES=\"A=$$A.B,C=$$C.D\" INPUT=\"SPY,<alias>\""
+	@echo "  make run-ingest-alias   - Run ingestion with alias-aware underlyings"
+	@echo "    INPUT=\"SPY,SPX\" ALIASES=\"SPX=$$$$SPX.X\" (or ALIAS+TICKER)"
 	@echo "  make run-backfill       - Run historical data backfill"
 	@echo "  make run-stream         - Test real-time streaming"
 	@echo "  make run-ingest         - Run main ingestion engine"
@@ -477,6 +479,35 @@ run-ingest: ## Run main ingestion engine (forward-only)
 	@echo "$(BLUE)================================================================================$(NC)"
 	@echo ""
 	@$(VENV_PYTHON) -m src.ingestion.main_engine
+
+.PHONY: run-ingest-alias
+run-ingest-alias: ## Run ingestion engine with alias-aware INPUT (INPUT, ALIASES or ALIAS+TICKER)
+	@echo ""
+	@echo "$(BLUE)================================================================================$(NC)"
+	@echo "$(BLUE)RUNNING INGESTION WITH ALIAS RESOLUTION$(NC)"
+	@echo "$(BLUE)================================================================================$(NC)"
+	@ALIASES_ENV='$(ALIASES)'; \
+	if [ -z "$$ALIASES_ENV" ] && [ -n "$(ALIAS)" ] && [ -n "$(TICKER)" ]; then \
+		ALIASES_ENV='$(ALIAS)=$(TICKER)'; \
+	fi; \
+	INPUT_VALUE='$(or $(INPUT),SPY)'; \
+	if [ -z "$$ALIASES_ENV" ]; then \
+		RESOLVED="$$( $(VENV_PYTHON) -c "from src.symbols import parse_underlyings; print(','.join(parse_underlyings('$$INPUT_VALUE')))")"; \
+		echo "Using environment/.env SYMBOL_ALIASES"; \
+	else \
+		RESOLVED="$$( $(VENV_PYTHON) -c "import os,sys; from src.symbols import parse_underlyings; os.environ['SYMBOL_ALIASES']=sys.argv[1]; print(','.join(parse_underlyings(sys.argv[2])))" "$$ALIASES_ENV" "$$INPUT_VALUE")"; \
+		echo "Using override SYMBOL_ALIASES=$$ALIASES_ENV"; \
+	fi; \
+	echo "INPUT=$$INPUT_VALUE"; \
+	echo "RESOLVED_UNDERLYINGS=$$RESOLVED"; \
+	if [ -z "$$RESOLVED" ]; then \
+		echo "$(RED)No resolved underlyings; aborting$(NC)"; \
+		exit 1; \
+	fi; \
+	$(VENV_PYTHON) -m src.ingestion.main_engine --underlyings "$$RESOLVED" \
+		$(if $(EXPIRATIONS),--expirations '$(EXPIRATIONS)') \
+		$(if $(STRIKE_DISTANCE),--strike-distance '$(STRIKE_DISTANCE)') \
+		$(if $(DEBUG),--debug)
 
 .PHONY: run-analytics
 run-analytics: ## Run analytics engine
