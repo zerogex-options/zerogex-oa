@@ -87,6 +87,8 @@ help: ## Show this help message
 	@echo "    TEST=<all|quote|bars|stream-bars|options|search|market-hours|depth>"
 	@echo "    SYMBOL=<sym>  BARS_BACK=<n>  INTERVAL=<n>  UNIT=<Minute|Daily|Weekly|Monthly>"
 	@echo "    QUERY=<str>   DEBUG=1        TEST_HISTORICAL=1"
+	@echo "  make alias-check        - Resolve aliases to TradeStation symbols"
+	@echo "    ALIAS=<name> ALIASES=\"A=$$A.B,C=$$C.D\" INPUT=\"SPY,<alias>\""
 	@echo "  make run-backfill       - Run historical data backfill"
 	@echo "  make run-stream         - Test real-time streaming"
 	@echo "  make run-ingest         - Run main ingestion engine"
@@ -424,6 +426,21 @@ run-client: ## Test TradeStation API client (TEST, SYMBOL, BARS_BACK, INTERVAL, 
 		$(if $(QUERY),--query '$(QUERY)') \
 		$(if $(DEBUG),--debug) \
 		$(if $(TEST_HISTORICAL),--test-historical)
+
+.PHONY: alias-check
+alias-check: ## Resolve alias mapping (optional: ALIASES, ALIAS, INPUT)
+	@echo "$(BLUE)=== Symbol Alias Resolution Check ===$(NC)"
+	@ALIASES_ENV='$(ALIASES)'; \
+	if [ -z "$$ALIASES_ENV" ] && [ -n "$(ALIAS)" ] && [ -n "$(TICKER)" ]; then \
+		ALIASES_ENV='$(ALIAS)=$(TICKER)'; \
+	fi; \
+	INPUT_VALUE='$(or $(INPUT),SPY)'; \
+	if [ -z "$$ALIASES_ENV" ]; then \
+		echo "$(YELLOW)No ALIASES/ALIAS provided; using current SYMBOL_ALIASES from environment/.env$(NC)"; \
+		$(VENV_PYTHON) -c "from src.symbols import parse_underlyings, get_symbol_aliases; print('SYMBOL_ALIASES=', get_symbol_aliases()); print('INPUT=', '$$INPUT_VALUE'); print('RESOLVED=', parse_underlyings('$$INPUT_VALUE'))"; \
+	else \
+		$(VENV_PYTHON) -c "import os,sys; from src.symbols import parse_underlyings, get_symbol_aliases; os.environ['SYMBOL_ALIASES']=sys.argv[1]; input_value=sys.argv[2]; print('SYMBOL_ALIASES=', get_symbol_aliases()); print('INPUT=', input_value); print('RESOLVED=', parse_underlyings(input_value))" "$$ALIASES_ENV" "$$INPUT_VALUE"; \
+	fi
 
 .PHONY: run-backfill
 run-backfill: ## Run historical data backfill

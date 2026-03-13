@@ -378,6 +378,11 @@ python -m src.ingestion.tradestation_client --test quote --symbol SPX
 
 # Quick alias resolution check (safe one-liner, no heredoc required)
 SYMBOL_ALIASES='SPX=$SPX.X' python -c "from src.symbols import parse_underlyings; print(parse_underlyings('SPY,SPX'))"
+
+# Same check via Makefile (generic inputs)
+# Note: in make args, use $$ for literal $ characters.
+make alias-check ALIASES='SPX=$$SPX.X,NDX=$$NDX.X' INPUT='SPY,SPX,NDX'
+make alias-check ALIAS=SPX TICKER='$$SPX.X' INPUT='SPY,SPX'
 python -m src.ingestion.tradestation_client --debug
 ```
 
