@@ -14,6 +14,7 @@ For historical data backfilling, use backfill_manager.py independently.
 import os
 import signal
 import sys
+from multiprocessing import Process
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from collections import defaultdict
@@ -25,6 +26,7 @@ from src.ingestion.greeks_calculator import GreeksCalculator
 from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
 from src.validation import bucket_timestamp
+from src.symbols import parse_underlyings
 from src.config import (
     AGGREGATION_BUCKET_SECONDS,
     MAX_BUFFER_SIZE,
@@ -505,8 +507,13 @@ def main():
     load_dotenv()
 
     parser = argparse.ArgumentParser(description="ZeroGEX Main Ingestion Engine")
-    parser.add_argument("--underlying", default=os.getenv("INGEST_UNDERLYING", "SPY"),
-                       help="Underlying symbol (default: SPY)")
+    parser.add_argument("--underlying", default=None,
+                       help="Single underlying symbol (backward compatible)")
+    parser.add_argument(
+        "--underlyings",
+        default=os.getenv("INGEST_UNDERLYINGS", os.getenv("INGEST_UNDERLYING", "SPY")),
+        help="Comma-separated underlying symbols or aliases (default: SPY)",
+    )
     parser.add_argument("--expirations", type=int,
                        default=int(os.getenv("INGEST_EXPIRATIONS", "3")),
                        help="Number of expirations (default: 3)")
@@ -527,23 +534,56 @@ def main():
         from src.utils import set_log_level
         set_log_level("DEBUG")
 
-    # Initialize client
-    client = TradeStationClient(
-        os.getenv("TRADESTATION_CLIENT_ID"),
-        os.getenv("TRADESTATION_CLIENT_SECRET"),
-        os.getenv("TRADESTATION_REFRESH_TOKEN"),
-        sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true"
-    )
+    raw_underlyings = args.underlying if args.underlying else args.underlyings
+    symbols = parse_underlyings(raw_underlyings)
 
-    # Initialize and run engine
-    engine = IngestionEngine(
-        client=client,
-        underlying=args.underlying,
-        num_expirations=args.expirations,
-        strike_distance=args.strike_distance,
-    )
+    if not symbols:
+        logger.error("No valid underlyings provided")
+        sys.exit(1)
 
-    engine.run()
+    def run_for_symbol(symbol: str):
+        client = TradeStationClient(
+            os.getenv("TRADESTATION_CLIENT_ID"),
+            os.getenv("TRADESTATION_CLIENT_SECRET"),
+            os.getenv("TRADESTATION_REFRESH_TOKEN"),
+            sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true"
+        )
+        engine = IngestionEngine(
+            client=client,
+            underlying=symbol,
+            num_expirations=args.expirations,
+            strike_distance=args.strike_distance,
+        )
+        engine.run()
+
+    if len(symbols) == 1:
+        run_for_symbol(symbols[0])
+        return
+
+    logger.info(f"Starting ingestion engines for symbols: {', '.join(symbols)}")
+    processes: List[Process] = []
+
+    for symbol in symbols:
+        process = Process(target=run_for_symbol, args=(symbol,), name=f"ingest-{symbol}")
+        process.start()
+        processes.append(process)
+
+    def shutdown_children(signum, frame):
+        logger.info(f"Received signal {signum}, terminating ingestion workers...")
+        for proc in processes:
+            if proc.is_alive():
+                proc.terminate()
+
+    signal.signal(signal.SIGINT, shutdown_children)
+    signal.signal(signal.SIGTERM, shutdown_children)
+
+    exit_code = 0
+    for proc in processes:
+        proc.join()
+        if proc.exitcode not in (0, None):
+            exit_code = 1
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

@@ -302,6 +302,9 @@ python -m src.ingestion.main_engine \
     --expirations 5 \
     --strike-distance 20.0
 
+# Multi-symbol ingestion in one supervisor process
+python -m src.ingestion.main_engine --underlyings SPY,SPX
+
 # Debug mode
 python -m src.ingestion.main_engine --debug
 
@@ -553,6 +556,12 @@ ANALYTICS_INTERVAL=60
 # Underlying to analyze
 ANALYTICS_UNDERLYING=SPY
 
+# Optional multi-symbol analytics
+ANALYTICS_UNDERLYINGS=SPY,SPX
+
+# Optional alias map (alias -> TradeStation symbol)
+SYMBOL_ALIASES=SPX=$SPX.X
+
 # Risk-free rate for Greeks
 RISK_FREE_RATE=0.05
 ```
@@ -740,7 +749,9 @@ zerogex-oa/
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `ANALYTICS_UNDERLYING` | Underlying symbol to analyze | `SPY` |
+| `ANALYTICS_UNDERLYINGS` | Comma-separated underlyings for parallel analytics workers | _(empty)_ |
 | `ANALYTICS_INTERVAL` | Calculation interval in seconds | `60` |
+| `SYMBOL_ALIASES` | Alias map (`ALIAS=TS_SYMBOL`) used by ingestion/analytics | _(empty)_ |
 
 **Note:** Analytics engine also uses `RISK_FREE_RATE` from the Greeks & IV Configuration section above.
 

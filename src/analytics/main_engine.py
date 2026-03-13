@@ -14,6 +14,7 @@ import os
 import signal
 import sys
 import time
+from multiprocessing import Process
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 from collections import defaultdict
@@ -25,6 +26,7 @@ from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
 from src.config import RISK_FREE_RATE
 from src.analytics.signal_engine import SignalEngine
+from src.symbols import parse_underlyings
 
 logger = get_logger(__name__)
 
@@ -1080,8 +1082,13 @@ def main():
     load_dotenv()
 
     parser = argparse.ArgumentParser(description="ZeroGEX Analytics Engine")
-    parser.add_argument("--underlying", default=os.getenv("ANALYTICS_UNDERLYING", "SPY"),
-                       help="Underlying symbol (default: SPY)")
+    parser.add_argument("--underlying", default=None,
+                       help="Single underlying symbol (backward compatible)")
+    parser.add_argument(
+        "--underlyings",
+        default=os.getenv("ANALYTICS_UNDERLYINGS", os.getenv("ANALYTICS_UNDERLYING", "SPY")),
+        help="Comma-separated underlying symbols or aliases (default: SPY)",
+    )
     parser.add_argument("--interval", type=int,
                        default=int(os.getenv("ANALYTICS_INTERVAL", "60")),
                        help="Calculation interval in seconds (default: 60)")
@@ -1100,21 +1107,55 @@ def main():
         from src.utils import set_log_level
         set_log_level("DEBUG")
 
-    # Initialize engine
-    engine = AnalyticsEngine(
-        underlying=args.underlying,
-        calculation_interval=args.interval,
-        risk_free_rate=args.risk_free_rate
-    )
+    raw_underlyings = args.underlying if args.underlying else args.underlyings
+    symbols = parse_underlyings(raw_underlyings)
 
-    if args.once:
-        # Run once for testing
-        logger.info("Running single calculation cycle...")
-        success = engine.run_calculation()
-        sys.exit(0 if success else 1)
-    else:
-        # Run continuously
-        engine.run()
+    if not symbols:
+        logger.error("No valid underlyings provided")
+        sys.exit(1)
+
+    def run_for_symbol(symbol: str):
+        engine = AnalyticsEngine(
+            underlying=symbol,
+            calculation_interval=args.interval,
+            risk_free_rate=args.risk_free_rate
+        )
+
+        if args.once:
+            logger.info(f"Running single calculation cycle for {symbol}...")
+            success = engine.run_calculation()
+            sys.exit(0 if success else 1)
+        else:
+            engine.run()
+
+    if len(symbols) == 1:
+        run_for_symbol(symbols[0])
+        return
+
+    logger.info(f"Starting analytics engines for symbols: {', '.join(symbols)}")
+    processes: List[Process] = []
+
+    for symbol in symbols:
+        process = Process(target=run_for_symbol, args=(symbol,), name=f"analytics-{symbol}")
+        process.start()
+        processes.append(process)
+
+    def shutdown_children(signum, frame):
+        logger.info(f"Received signal {signum}, terminating analytics workers...")
+        for proc in processes:
+            if proc.is_alive():
+                proc.terminate()
+
+    signal.signal(signal.SIGINT, shutdown_children)
+    signal.signal(signal.SIGTERM, shutdown_children)
+
+    exit_code = 0
+    for proc in processes:
+        proc.join()
+        if proc.exitcode not in (0, None):
+            exit_code = 1
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
