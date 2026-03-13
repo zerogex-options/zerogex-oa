@@ -331,6 +331,42 @@ class StreamManager:
             del self.all_tracked_strikes[exp]
             logger.debug(f"Cleaned up strikes for expired expiration: {exp}")
 
+    def _validate_option_quote_symbol(self) -> bool:
+        """Validate at least one built option symbol returns a quote without API symbol errors."""
+        if not self.tracked_option_symbols:
+            logger.error("No option symbols available for validation")
+            return False
+
+        test_symbol = self.tracked_option_symbols[0]
+        logger.info(f"Validating option quote symbol: {test_symbol}")
+
+        try:
+            result = self.client.get_option_quotes([test_symbol])
+
+            errors = result.get("Errors", []) if isinstance(result, dict) else []
+            if errors:
+                logger.error(f"Option quote validation failed for {test_symbol}: {errors[0]}")
+                logger.error(
+                    "This usually means the option symbol format is not accepted by TradeStation quotes endpoint "
+                    "for this underlying."
+                )
+                return False
+
+            quotes = result.get("Quotes", []) if isinstance(result, dict) else []
+            if not quotes:
+                logger.warning(
+                    f"Option quote validation returned no quotes for {test_symbol}; continuing "
+                    "because endpoint did not report INVALID SYMBOL"
+                )
+                return True
+
+            logger.info(f"✅ Option quote validation passed for {test_symbol}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error validating option quote symbol {test_symbol}: {e}", exc_info=True)
+            return False
+
     def initialize(self) -> bool:
         """Initialize stream"""
         logger.info(f"Initializing stream for {self.underlying}...")
@@ -351,6 +387,11 @@ class StreamManager:
         self.tracked_option_symbols = self._build_option_symbols()
         if not self.tracked_option_symbols:
             logger.error("Failed to build option symbols")
+            return False
+
+        # Validate at least one option quote symbol actually resolves on quote endpoint
+        if not self._validate_option_quote_symbol():
+            logger.error("Failed option quote validation during initialization")
             return False
 
         # Set initial refresh timestamp (NEW)

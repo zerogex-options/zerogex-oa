@@ -318,6 +318,7 @@ python -m src.ingestion.main_engine --help
 3. **Greeks Calculation** - Calculates Delta, Gamma, Theta, Vega (if enabled)
 4. **1-Minute Aggregation** - Buffers and aggregates data into 1-minute bars
 5. **Database Storage** - Stores aggregated data with IV and Greeks in PostgreSQL
+6. **Option Symbol Validation** - Performs a startup option-quote check to catch invalid option symbol formatting early
 
 **Production deployment:**
 
