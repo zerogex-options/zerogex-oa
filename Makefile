@@ -951,7 +951,8 @@ flow-by-type: ## Puts vs calls flow — 1-min intervals (default: SPY, override:
 				MAX(CASE WHEN option_type = 'C' THEN total_volume END) as call_volume, \
 				MAX(CASE WHEN option_type = 'C' THEN total_premium END) as call_premium, \
 				MAX(CASE WHEN option_type = 'P' THEN total_volume END) as put_volume, \
-				MAX(CASE WHEN option_type = 'P' THEN total_premium END) as put_premium \
+				MAX(CASE WHEN option_type = 'P' THEN total_premium END) as put_premium, \
+				MAX(underlying_price) as underlying_price \
 			FROM flow_by_type \
 			WHERE symbol = '$(FLOW_SYMBOL)' \
 			GROUP BY timestamp, symbol \
@@ -971,7 +972,8 @@ flow-by-type: ## Puts vs calls flow — 1-min intervals (default: SPY, override:
 				WHEN COALESCE(call_volume, 0) - COALESCE(put_volume, 0) < -500 THEN '🔴 Strong Puts' \
 				WHEN COALESCE(call_volume, 0) - COALESCE(put_volume, 0) < 0 THEN '❌ Puts' \
 				ELSE '⚪ Neutral' \
-			END as flow_bias \
+			END as flow_bias, \
+			TO_CHAR(underlying_price, 'FM999,990.99') as underlying_price \
 		FROM aggregated \
 		ORDER BY timestamp DESC \
 		LIMIT 20;"
@@ -995,7 +997,8 @@ flow-by-strike: ## Flow by strike level — 1-min intervals (default: SPY, overr
 				WHEN net_delta < -100 THEN '🔴 Strong Puts' \
 				WHEN net_delta < 0 THEN '❌ Puts' \
 				ELSE '⚪ Neutral' \
-			END as flow_bias \
+			END as flow_bias, \
+			TO_CHAR(underlying_price, 'FM999,990.99') as underlying_price \
 		FROM flow_by_strike \
 		WHERE symbol = '$(FLOW_SYMBOL)' \
 		ORDER BY timestamp DESC, strike \
@@ -1021,7 +1024,8 @@ flow-by-expiration: ## Flow by expiration date — 1-min intervals (default: SPY
 				WHEN (COALESCE(t.call_vol, 0) - COALESCE(t.put_vol, 0)) < -500 THEN '🔴 Strong Puts' \
 				WHEN (COALESCE(t.call_vol, 0) - COALESCE(t.put_vol, 0)) < 0 THEN '❌ Puts' \
 				ELSE '⚪ Neutral' \
-			END as flow_bias \
+			END as flow_bias, \
+			TO_CHAR(e.underlying_price, 'FM999,990.99') as underlying_price \
 		FROM flow_by_expiration e \
 		LEFT JOIN ( \
 			SELECT \
