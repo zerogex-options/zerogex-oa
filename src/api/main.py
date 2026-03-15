@@ -226,9 +226,6 @@ async def get_flow_by_type(
     """Get option flow by type (calls vs puts) — 1-min intervals"""
     try:
         data = await db_manager.get_flow_by_type(symbol, window_minutes)
-        if not data:
-            raise HTTPException(status_code=404, detail="No flow data available")
-
         return [FlowByTypePoint(**row) for row in data]
     except HTTPException:
         raise
@@ -245,9 +242,6 @@ async def get_flow_by_strike(
     """Get option flow by strike level — 1-min intervals"""
     try:
         data = await db_manager.get_flow_by_strike(symbol, window_minutes, limit)
-        if not data:
-            raise HTTPException(status_code=404, detail="No flow data available")
-
         return [FlowByStrikePoint(**row) for row in data]
     except HTTPException:
         raise
@@ -265,9 +259,6 @@ async def get_flow_by_expiration(
     """Get option flow by expiration date — 1-min intervals"""
     try:
         data = await db_manager.get_flow_by_expiration(symbol, window_minutes, limit)
-        if not data:
-            raise HTTPException(status_code=404, detail="No flow data available")
-
         return [FlowByExpirationPoint(**row) for row in data]
     except HTTPException:
         raise
@@ -284,9 +275,6 @@ async def get_smart_money_flow(
     """Get unusual activity / smart money flow — 1-min intervals"""
     try:
         data = await db_manager.get_smart_money_flow(symbol, window_minutes, limit)
-        if not data:
-            raise HTTPException(status_code=404, detail="No unusual activity detected")
-
         return [SmartMoneyFlowPoint(**row) for row in data]
     except HTTPException:
         raise

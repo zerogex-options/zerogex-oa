@@ -2244,7 +2244,7 @@ api-test: ## Test ALL API endpoints
 		test_endpoint "/api/trading/momentum-divergence?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; \
 	done; \
 	echo ""; \
-	echo "$(YELLOW)Flow endpoints (1-min cache tables)$(NC)"; \
+	echo "$(YELLOW)Flow endpoints$(NC)"; \
 	test_endpoint "/api/flow/by-type?symbol=$$SYMBOL&window_minutes=60"; \
 	test_endpoint "/api/flow/by-strike?symbol=$$SYMBOL&window_minutes=60&limit=10"; \
 	test_endpoint "/api/flow/by-expiration?symbol=$$SYMBOL&window_minutes=60&limit=10"; \
