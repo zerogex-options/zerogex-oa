@@ -249,7 +249,7 @@ FROM option_chains;
 -- =============================================================================
 -- Real-time flow cache tables
 -- =============================================================================
-CREATE TABLE IF NOT EXISTS flow_cache_by_type_minute (
+CREATE TABLE IF NOT EXISTS flow_by_type (
     timestamp TIMESTAMPTZ NOT NULL,
     symbol VARCHAR(10) NOT NULL,
     option_type CHAR(1) NOT NULL CHECK (option_type IN ('C', 'P')),
@@ -262,7 +262,7 @@ CREATE TABLE IF NOT EXISTS flow_cache_by_type_minute (
     PRIMARY KEY (timestamp, symbol, option_type)
 );
 
-CREATE TABLE IF NOT EXISTS flow_cache_by_strike_minute (
+CREATE TABLE IF NOT EXISTS flow_by_strike (
     timestamp TIMESTAMPTZ NOT NULL,
     symbol VARCHAR(10) NOT NULL,
     strike NUMERIC(12, 4) NOT NULL,
@@ -275,7 +275,7 @@ CREATE TABLE IF NOT EXISTS flow_cache_by_strike_minute (
     PRIMARY KEY (timestamp, symbol, strike)
 );
 
-CREATE TABLE IF NOT EXISTS flow_cache_by_expiration_minute (
+CREATE TABLE IF NOT EXISTS flow_by_expiration (
     timestamp TIMESTAMPTZ NOT NULL,
     symbol VARCHAR(10) NOT NULL,
     expiration DATE NOT NULL,
@@ -286,7 +286,7 @@ CREATE TABLE IF NOT EXISTS flow_cache_by_expiration_minute (
     PRIMARY KEY (timestamp, symbol, expiration)
 );
 
-CREATE TABLE IF NOT EXISTS flow_cache_smart_money_minute (
+CREATE TABLE IF NOT EXISTS flow_smart_money (
     timestamp TIMESTAMPTZ NOT NULL,
     symbol VARCHAR(10) NOT NULL,
     option_symbol VARCHAR(50) NOT NULL,
@@ -303,14 +303,14 @@ CREATE TABLE IF NOT EXISTS flow_cache_smart_money_minute (
     PRIMARY KEY (timestamp, symbol, option_symbol)
 );
 
-CREATE INDEX IF NOT EXISTS idx_flow_cache_by_type_symbol_ts
-    ON flow_cache_by_type_minute(symbol, timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_flow_cache_by_strike_symbol_ts
-    ON flow_cache_by_strike_minute(symbol, timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_flow_cache_by_expiration_symbol_ts
-    ON flow_cache_by_expiration_minute(symbol, timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_flow_cache_smart_money_symbol_ts
-    ON flow_cache_smart_money_minute(symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_flow_by_type_symbol_ts
+    ON flow_by_type(symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_flow_by_strike_symbol_ts
+    ON flow_by_strike(symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_flow_by_expiration_symbol_ts
+    ON flow_by_expiration(symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_flow_smart_money_symbol_ts
+    ON flow_smart_money(symbol, timestamp DESC);
 
 -- =============================================================================
 -- Interval flow views removed — queries go directly to the 1-min cache tables.

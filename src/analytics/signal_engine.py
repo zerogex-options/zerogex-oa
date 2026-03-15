@@ -450,7 +450,7 @@ class SignalEngine:
                 # --- Smart money: call vs put premium (last 30 min) ---
                 cur.execute("""
                     SELECT option_type, SUM(total_premium)
-                    FROM flow_cache_smart_money_minute
+                    FROM flow_smart_money
                     WHERE symbol = %s
                       AND timestamp >= NOW() - INTERVAL '30 minutes'
                     GROUP BY option_type
@@ -516,7 +516,7 @@ class SignalEngine:
                         SUM(CASE WHEN option_type = 'C'
                                  THEN total_premium
                                  ELSE -total_premium END) AS net_flow
-                    FROM flow_cache_by_type_minute
+                    FROM flow_by_type
                     WHERE symbol = %s
                       AND timestamp >= NOW() - INTERVAL '5 minutes'
                 """, (self.underlying,))

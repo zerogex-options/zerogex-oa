@@ -182,7 +182,7 @@ class DatabaseManager:
         expiration_seeded = await conn.fetchval(
             """
             SELECT 1
-            FROM flow_cache_by_expiration_minute
+            FROM flow_by_expiration
             WHERE symbol = $1
             LIMIT 1
             """,
@@ -191,7 +191,7 @@ class DatabaseManager:
         if not expiration_seeded:
             await conn.execute(
                 """
-                INSERT INTO flow_cache_by_expiration_minute (
+                INSERT INTO flow_by_expiration (
                     timestamp,
                     symbol,
                     expiration,
@@ -217,7 +217,7 @@ class DatabaseManager:
 
         type_exists = await conn.fetchval(
             """
-            SELECT 1 FROM flow_cache_by_type_minute
+            SELECT 1 FROM flow_by_type
             WHERE symbol = $1 AND timestamp = $2
             LIMIT 1
             """,
@@ -260,7 +260,7 @@ class DatabaseManager:
                         LIMIT 1
                     ) p ON TRUE
                 )
-                INSERT INTO flow_cache_by_type_minute (
+                INSERT INTO flow_by_type (
                     timestamp,
                     symbol,
                     option_type,
@@ -298,7 +298,7 @@ class DatabaseManager:
 
         strike_exists = await conn.fetchval(
             """
-            SELECT 1 FROM flow_cache_by_strike_minute
+            SELECT 1 FROM flow_by_strike
             WHERE symbol = $1 AND timestamp = $2
             LIMIT 1
             """,
@@ -338,7 +338,7 @@ class DatabaseManager:
                         LIMIT 1
                     ) p ON TRUE
                 )
-                INSERT INTO flow_cache_by_strike_minute (
+                INSERT INTO flow_by_strike (
                     timestamp,
                     symbol,
                     strike,
@@ -376,7 +376,7 @@ class DatabaseManager:
 
         expiration_exists = await conn.fetchval(
             """
-            SELECT 1 FROM flow_cache_by_expiration_minute
+            SELECT 1 FROM flow_by_expiration
             WHERE symbol = $1 AND timestamp = $2
             LIMIT 1
             """,
@@ -414,7 +414,7 @@ class DatabaseManager:
                         LIMIT 1
                     ) p ON TRUE
                 )
-                INSERT INTO flow_cache_by_expiration_minute (
+                INSERT INTO flow_by_expiration (
                     timestamp,
                     symbol,
                     expiration,
@@ -446,7 +446,7 @@ class DatabaseManager:
 
         smart_exists = await conn.fetchval(
             """
-            SELECT 1 FROM flow_cache_smart_money_minute
+            SELECT 1 FROM flow_smart_money
             WHERE symbol = $1 AND timestamp = $2
             LIMIT 1
             """,
@@ -489,7 +489,7 @@ class DatabaseManager:
                         LIMIT 1
                     ) p ON TRUE
                 )
-                INSERT INTO flow_cache_smart_money_minute (
+                INSERT INTO flow_smart_money (
                     timestamp,
                     symbol,
                     option_symbol,
@@ -929,7 +929,7 @@ class DatabaseManager:
         symbol: str = 'SPY',
         window_minutes: int = 60
     ) -> List[Dict[str, Any]]:
-        """Get option flow by type from flow_cache_by_type_minute (1-min intervals)."""
+        """Get option flow by type from flow_by_type (1-min intervals)."""
         window_minutes = max(1, min(window_minutes, 1440))
         query = """
             WITH aggregated AS (
@@ -941,7 +941,7 @@ class DatabaseManager:
                     MAX(CASE WHEN option_type = 'P' THEN total_volume END) AS put_volume,
                     MAX(CASE WHEN option_type = 'P' THEN total_premium END) AS put_premium,
                     MAX(underlying_price) AS underlying_price
-                FROM flow_cache_by_type_minute
+                FROM flow_by_type
                 WHERE symbol = $1
                   AND timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
                 GROUP BY timestamp, symbol
@@ -982,7 +982,7 @@ class DatabaseManager:
         window_minutes: int = 60,
         limit: int = 20
     ) -> List[Dict[str, Any]]:
-        """Get option flow by strike from flow_cache_by_strike_minute (1-min intervals)."""
+        """Get option flow by strike from flow_by_strike (1-min intervals)."""
         window_minutes = max(1, min(window_minutes, 1440))
         query = """
             SELECT
@@ -1001,7 +1001,7 @@ class DatabaseManager:
                     ELSE '⚪ Neutral'
                 END AS flow_bias,
                 underlying_price
-            FROM flow_cache_by_strike_minute
+            FROM flow_by_strike
             WHERE symbol = $1
               AND timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
             ORDER BY timestamp DESC, strike
@@ -1023,7 +1023,7 @@ class DatabaseManager:
         window_minutes: int = 60,
         limit: int = 20
     ) -> List[Dict[str, Any]]:
-        """Get option flow by expiration from flow_cache_by_expiration_minute (1-min intervals)."""
+        """Get option flow by expiration from flow_by_expiration (1-min intervals)."""
         window_minutes = max(1, min(window_minutes, 1440))
         query = """
             SELECT
@@ -1043,7 +1043,7 @@ class DatabaseManager:
                     ELSE '⚪ Neutral'
                 END AS flow_bias,
                 e.underlying_price
-            FROM flow_cache_by_expiration_minute e
+            FROM flow_by_expiration e
             LEFT JOIN (
                 SELECT
                     timestamp, symbol,
@@ -1051,7 +1051,7 @@ class DatabaseManager:
                     MAX(CASE WHEN option_type = 'P' THEN total_volume END) AS put_vol,
                     MAX(CASE WHEN option_type = 'C' THEN total_premium END) AS call_prem,
                     MAX(CASE WHEN option_type = 'P' THEN total_premium END) AS put_prem
-                FROM flow_cache_by_type_minute
+                FROM flow_by_type
                 WHERE symbol = $1
                   AND timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
                 GROUP BY timestamp, symbol
@@ -1077,7 +1077,7 @@ class DatabaseManager:
         window_minutes: int = 60,
         limit: int = 20
     ) -> List[Dict[str, Any]]:
-        """Get smart money flow from flow_cache_smart_money_minute (1-min intervals)."""
+        """Get smart money flow from flow_smart_money (1-min intervals)."""
         window_minutes = max(1, min(window_minutes, 1440))
         query = """
             SELECT
@@ -1106,7 +1106,7 @@ class DatabaseManager:
                     ELSE '💼 Standard'
                 END AS size_class,
                 underlying_price
-            FROM flow_cache_smart_money_minute
+            FROM flow_smart_money
             WHERE symbol = $1
               AND timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
             ORDER BY timestamp DESC, unusual_activity_score DESC, total_premium DESC
@@ -1406,7 +1406,7 @@ class DatabaseManager:
                     timestamp,
                     symbol,
                     SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE -total_premium END)::numeric AS net_option_flow
-                FROM flow_cache_by_type_minute
+                FROM flow_by_type
                 WHERE symbol = $1
                 GROUP BY timestamp, symbol
             ),

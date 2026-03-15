@@ -952,7 +952,7 @@ flow-by-type: ## Puts vs calls flow — 1-min intervals (default: SPY, override:
 				MAX(CASE WHEN option_type = 'C' THEN total_premium END) as call_premium, \
 				MAX(CASE WHEN option_type = 'P' THEN total_volume END) as put_volume, \
 				MAX(CASE WHEN option_type = 'P' THEN total_premium END) as put_premium \
-			FROM flow_cache_by_type_minute \
+			FROM flow_by_type \
 			WHERE symbol = '$(FLOW_SYMBOL)' \
 			GROUP BY timestamp, symbol \
 		) \
@@ -996,7 +996,7 @@ flow-by-strike: ## Flow by strike level — 1-min intervals (default: SPY, overr
 				WHEN net_delta < 0 THEN '❌ Puts' \
 				ELSE '⚪ Neutral' \
 			END as flow_bias \
-		FROM flow_cache_by_strike_minute \
+		FROM flow_by_strike \
 		WHERE symbol = '$(FLOW_SYMBOL)' \
 		ORDER BY timestamp DESC, strike \
 		LIMIT 20;"
@@ -1022,7 +1022,7 @@ flow-by-expiration: ## Flow by expiration date — 1-min intervals (default: SPY
 				WHEN (COALESCE(t.call_vol, 0) - COALESCE(t.put_vol, 0)) < 0 THEN '❌ Puts' \
 				ELSE '⚪ Neutral' \
 			END as flow_bias \
-		FROM flow_cache_by_expiration_minute e \
+		FROM flow_by_expiration e \
 		LEFT JOIN ( \
 			SELECT \
 				timestamp, symbol, \
@@ -1030,7 +1030,7 @@ flow-by-expiration: ## Flow by expiration date — 1-min intervals (default: SPY
 				MAX(CASE WHEN option_type = 'P' THEN total_volume END) AS put_vol, \
 				MAX(CASE WHEN option_type = 'C' THEN total_premium END) AS call_prem, \
 				MAX(CASE WHEN option_type = 'P' THEN total_premium END) AS put_prem \
-			FROM flow_cache_by_type_minute \
+			FROM flow_by_type \
 			WHERE symbol = '$(FLOW_SYMBOL)' \
 			GROUP BY timestamp, symbol \
 		) t ON t.timestamp = e.timestamp AND t.symbol = e.symbol \
@@ -1231,7 +1231,7 @@ flow-live: ## Combined real-time flow dashboard
 				SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END)::numeric \
 				/ NULLIF(SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END), 0), 2 \
 			) as pc_ratio \
-		FROM flow_cache_by_type_minute \
+		FROM flow_by_type \
 		WHERE symbol = '$(FLOW_SYMBOL)' \
 			AND timestamp > NOW() - INTERVAL '30 minutes' \
 		GROUP BY timestamp \
@@ -1296,7 +1296,7 @@ flow-live: ## Combined real-time flow dashboard
 				strike, \
 				SUM(total_volume)::bigint AS total_flow, \
 				SUM(net_delta)::bigint AS net_flow \
-			FROM flow_cache_by_strike_minute \
+			FROM flow_by_strike \
 			WHERE symbol = '$(FLOW_SYMBOL)' \
 				AND timestamp > NOW() - INTERVAL '30 minutes' \
 			GROUP BY strike \
@@ -1392,7 +1392,7 @@ divergence: ## Momentum divergence signals
 		WITH option_flow AS ( \
 			SELECT timestamp, symbol, \
 				SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE -total_premium END)::numeric AS net_option_flow \
-			FROM flow_cache_by_type_minute \
+			FROM flow_by_type \
 			WHERE symbol = '$(FLOW_SYMBOL)' \
 			GROUP BY timestamp, symbol \
 		), base AS ( \
@@ -1480,7 +1480,7 @@ day-trading: ## Combined day trading dashboard
 		WITH option_flow AS ( \
 			SELECT timestamp, symbol, \
 				SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE -total_premium END)::numeric AS net_option_flow \
-			FROM flow_cache_by_type_minute \
+			FROM flow_by_type \
 			WHERE symbol = '$(FLOW_SYMBOL)' \
 				AND timestamp > NOW() - INTERVAL '70 minutes' \
 			GROUP BY timestamp, symbol \
@@ -1892,7 +1892,7 @@ clear-data: ## Clear all data from tables (keeps schema)
 	@read -p "Are you sure? Type 'yes' to confirm: " confirm; \
 	if [ "$$confirm" = "yes" ]; then \
 		echo "$(YELLOW)Clearing all data...$(NC)"; \
-		$(PSQL) -c "TRUNCATE TABLE underlying_quotes, option_chains, gex_summary, gex_by_strike, flow_cache_by_type_minute, flow_cache_by_strike_minute, flow_cache_by_expiration_minute, flow_cache_smart_money_minute, max_pain_oi_snapshot, max_pain_oi_snapshot_expiration RESTART IDENTITY CASCADE;"; \
+		$(PSQL) -c "TRUNCATE TABLE underlying_quotes, option_chains, gex_summary, gex_by_strike, flow_by_type, flow_by_strike, flow_by_expiration, flow_smart_money, max_pain_oi_snapshot, max_pain_oi_snapshot_expiration RESTART IDENTITY CASCADE;"; \
 		echo "$(GREEN)✅ All data cleared$(NC)"; \
 	else \
 		echo "$(RED)❌ Aborted$(NC)"; \
@@ -2035,6 +2035,21 @@ db-prune-legacy: ## Drop obsolete legacy refresh/materialized-view artifacts
 # One-Time Migrations
 # =============================================================================
 
+.PHONY: db-rename-flow-tables
+db-rename-flow-tables: ## (One-time) Rename flow_cache_*_minute tables to flow_by_* / flow_smart_money
+	@echo "$(BLUE)=== Renaming flow cache tables ===$(NC)"
+	@$(PSQL) -c "\
+		ALTER TABLE IF EXISTS flow_cache_by_type_minute RENAME TO flow_by_type; \
+		ALTER TABLE IF EXISTS flow_cache_by_strike_minute RENAME TO flow_by_strike; \
+		ALTER TABLE IF EXISTS flow_cache_by_expiration_minute RENAME TO flow_by_expiration; \
+		ALTER TABLE IF EXISTS flow_cache_smart_money_minute RENAME TO flow_smart_money; \
+		ALTER INDEX IF EXISTS idx_flow_cache_by_type_symbol_ts RENAME TO idx_flow_by_type_symbol_ts; \
+		ALTER INDEX IF EXISTS idx_flow_cache_by_strike_symbol_ts RENAME TO idx_flow_by_strike_symbol_ts; \
+		ALTER INDEX IF EXISTS idx_flow_cache_by_expiration_symbol_ts RENAME TO idx_flow_by_expiration_symbol_ts; \
+		ALTER INDEX IF EXISTS idx_flow_cache_smart_money_symbol_ts RENAME TO idx_flow_smart_money_symbol_ts; \
+		SELECT 'Flow tables renamed successfully' AS status;"
+	@echo "$(GREEN)✅ Flow tables renamed$(NC)"
+
 .PHONY: db-drop-flow-views
 db-drop-flow-views: ## (One-time) Drop all interval flow views — tables remain intact
 	@echo "$(BLUE)=== Dropping interval flow views ===$(NC)"
@@ -2067,13 +2082,13 @@ db-drop-flow-views: ## (One-time) Drop all interval flow views — tables remain
 db-add-underlying-price: ## (One-time) Add underlying_price column to all flow cache tables
 	@echo "$(BLUE)=== Adding underlying_price column to flow cache tables ===$(NC)"
 	@$(PSQL) -c "\
-		ALTER TABLE flow_cache_by_type_minute \
+		ALTER TABLE flow_by_type \
 			ADD COLUMN IF NOT EXISTS underlying_price NUMERIC(12, 4); \
-		ALTER TABLE flow_cache_by_strike_minute \
+		ALTER TABLE flow_by_strike \
 			ADD COLUMN IF NOT EXISTS underlying_price NUMERIC(12, 4); \
-		ALTER TABLE flow_cache_by_expiration_minute \
+		ALTER TABLE flow_by_expiration \
 			ADD COLUMN IF NOT EXISTS underlying_price NUMERIC(12, 4); \
-		ALTER TABLE flow_cache_smart_money_minute \
+		ALTER TABLE flow_smart_money \
 			ADD COLUMN IF NOT EXISTS underlying_price NUMERIC(12, 4); \
 		SELECT 'underlying_price column added to all flow cache tables' AS status;"
 	@echo "$(GREEN)✅ underlying_price column added$(NC)"

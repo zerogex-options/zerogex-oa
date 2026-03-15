@@ -633,36 +633,19 @@ class AnalyticsEngine:
             logger.error(f"Error storing GEX summary: {e}", exc_info=True)
             self.errors_count += 1
 
-    def _refresh_flow_caches(self, timestamp: datetime):
+    def _refresh_flow_caches(self, timestamp: datetime, underlying_price: Optional[float] = None):
         """
-        Refresh flow cache tables for the given timestamp
+        Refresh flow cache tables for the given timestamp.
 
-        This populates the 1-min flow cache tables with the latest option flow data
-        and the underlying price at that timestamp.
+        underlying_price should be passed in from run_calculation() where it is
+        already fetched, avoiding a redundant query.
         """
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
 
-                # Fetch underlying price at this timestamp
-                underlying_price = None
-                try:
-                    cursor.execute("""
-                        SELECT close
-                        FROM underlying_quotes
-                        WHERE symbol = %s
-                          AND timestamp <= %s
-                        ORDER BY timestamp DESC
-                        LIMIT 1
-                    """, (self.underlying, timestamp))
-                    row = cursor.fetchone()
-                    if row:
-                        underlying_price = float(row[0])
-                except Exception as e:
-                    logger.warning(f"Could not fetch underlying price for flow cache: {e}")
-
-                # 1. Refresh flow_cache_by_type_minute
-                logger.debug("Refreshing flow_cache_by_type_minute...")
+                # 1. Refresh flow_by_type
+                logger.debug("Refreshing flow_by_type...")
                 cursor.execute("""
                     WITH latest_rows AS (
                         SELECT oc.*
@@ -695,7 +678,7 @@ class AnalyticsEngine:
                             LIMIT 1
                         ) p ON TRUE
                     )
-                    INSERT INTO flow_cache_by_type_minute (
+                    INSERT INTO flow_by_type (
                         timestamp,
                         symbol,
                         option_type,
@@ -727,8 +710,8 @@ class AnalyticsEngine:
                         updated_at = NOW()
                 """, (self.underlying, timestamp, self.underlying, underlying_price))
 
-                # 2. Refresh flow_cache_by_strike_minute
-                logger.debug("Refreshing flow_cache_by_strike_minute...")
+                # 2. Refresh flow_by_strike
+                logger.debug("Refreshing flow_by_strike...")
                 cursor.execute("""
                     WITH latest_rows AS (
                         SELECT oc.*
@@ -760,7 +743,7 @@ class AnalyticsEngine:
                             LIMIT 1
                         ) p ON TRUE
                     )
-                    INSERT INTO flow_cache_by_strike_minute (
+                    INSERT INTO flow_by_strike (
                         timestamp,
                         symbol,
                         strike,
@@ -792,8 +775,8 @@ class AnalyticsEngine:
                         updated_at = NOW()
                 """, (self.underlying, timestamp, self.underlying, underlying_price))
 
-                # 3. Refresh flow_cache_by_expiration_minute
-                logger.debug("Refreshing flow_cache_by_expiration_minute...")
+                # 3. Refresh flow_by_expiration
+                logger.debug("Refreshing flow_by_expiration...")
                 cursor.execute("""
                     WITH latest_rows AS (
                         SELECT oc.*
@@ -823,7 +806,7 @@ class AnalyticsEngine:
                             LIMIT 1
                         ) p ON TRUE
                     )
-                    INSERT INTO flow_cache_by_expiration_minute (
+                    INSERT INTO flow_by_expiration (
                         timestamp,
                         symbol,
                         expiration,
@@ -849,8 +832,8 @@ class AnalyticsEngine:
                         updated_at = NOW()
                 """, (self.underlying, timestamp, self.underlying, underlying_price))
 
-                # 4. Refresh flow_cache_smart_money_minute
-                logger.debug("Refreshing flow_cache_smart_money_minute...")
+                # 4. Refresh flow_smart_money
+                logger.debug("Refreshing flow_smart_money...")
                 cursor.execute("""
                     WITH latest_rows AS (
                         SELECT oc.*
@@ -885,7 +868,7 @@ class AnalyticsEngine:
                             LIMIT 1
                         ) p ON TRUE
                     )
-                    INSERT INTO flow_cache_smart_money_minute (
+                    INSERT INTO flow_smart_money (
                         timestamp,
                         symbol,
                         option_symbol,
@@ -1006,7 +989,7 @@ class AnalyticsEngine:
 
             # Refresh flow cache tables
             logger.info("Refreshing flow cache tables...")
-            self._refresh_flow_caches(latest_timestamp)
+            self._refresh_flow_caches(latest_timestamp, underlying_price)
 
             # --- Signal engine: run every _signal_interval seconds ---
             import time as _time
