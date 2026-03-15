@@ -637,11 +637,29 @@ class AnalyticsEngine:
         """
         Refresh flow cache tables for the given timestamp
 
-        This populates the cache tables that the flow views depend on.
+        This populates the 1-min flow cache tables with the latest option flow data
+        and the underlying price at that timestamp.
         """
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
+
+                # Fetch underlying price at this timestamp
+                underlying_price = None
+                try:
+                    cursor.execute("""
+                        SELECT close
+                        FROM underlying_quotes
+                        WHERE symbol = %s
+                          AND timestamp <= %s
+                        ORDER BY timestamp DESC
+                        LIMIT 1
+                    """, (self.underlying, timestamp))
+                    row = cursor.fetchone()
+                    if row:
+                        underlying_price = float(row[0])
+                except Exception as e:
+                    logger.warning(f"Could not fetch underlying price for flow cache: {e}")
 
                 # 1. Refresh flow_cache_by_type_minute
                 logger.debug("Refreshing flow_cache_by_type_minute...")
@@ -684,7 +702,8 @@ class AnalyticsEngine:
                         total_volume,
                         total_premium,
                         avg_iv,
-                        net_delta
+                        net_delta,
+                        underlying_price
                     )
                     SELECT
                         timestamp,
@@ -693,7 +712,8 @@ class AnalyticsEngine:
                         SUM(volume_delta)::bigint,
                         SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
                         AVG(implied_volatility)::numeric,
-                        SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric
+                        SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric,
+                        %s::numeric
                     FROM with_prev
                     WHERE volume_delta > 0
                     GROUP BY timestamp, option_type
@@ -703,8 +723,9 @@ class AnalyticsEngine:
                         total_premium = EXCLUDED.total_premium,
                         avg_iv = EXCLUDED.avg_iv,
                         net_delta = EXCLUDED.net_delta,
+                        underlying_price = EXCLUDED.underlying_price,
                         updated_at = NOW()
-                """, (self.underlying, timestamp, self.underlying))
+                """, (self.underlying, timestamp, self.underlying, underlying_price))
 
                 # 2. Refresh flow_cache_by_strike_minute
                 logger.debug("Refreshing flow_cache_by_strike_minute...")
@@ -746,7 +767,8 @@ class AnalyticsEngine:
                         total_volume,
                         total_premium,
                         avg_iv,
-                        net_delta
+                        net_delta,
+                        underlying_price
                     )
                     SELECT
                         timestamp,
@@ -755,7 +777,8 @@ class AnalyticsEngine:
                         SUM(volume_delta)::bigint,
                         SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
                         AVG(implied_volatility)::numeric,
-                        SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric
+                        SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric,
+                        %s::numeric
                     FROM with_prev
                     WHERE volume_delta > 0
                     GROUP BY timestamp, strike
@@ -765,8 +788,9 @@ class AnalyticsEngine:
                         total_premium = EXCLUDED.total_premium,
                         avg_iv = EXCLUDED.avg_iv,
                         net_delta = EXCLUDED.net_delta,
+                        underlying_price = EXCLUDED.underlying_price,
                         updated_at = NOW()
-                """, (self.underlying, timestamp, self.underlying))
+                """, (self.underlying, timestamp, self.underlying, underlying_price))
 
                 # 3. Refresh flow_cache_by_expiration_minute
                 logger.debug("Refreshing flow_cache_by_expiration_minute...")
@@ -804,14 +828,16 @@ class AnalyticsEngine:
                         symbol,
                         expiration,
                         total_volume,
-                        total_premium
+                        total_premium,
+                        underlying_price
                     )
                     SELECT
                         timestamp,
                         %s::varchar,
                         expiration,
                         SUM(volume_delta)::bigint,
-                        SUM(volume_delta * COALESCE(last, 0) * 100)::numeric
+                        SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
+                        %s::numeric
                     FROM with_prev
                     WHERE volume_delta > 0
                     GROUP BY timestamp, expiration
@@ -819,8 +845,9 @@ class AnalyticsEngine:
                     DO UPDATE SET
                         total_volume = EXCLUDED.total_volume,
                         total_premium = EXCLUDED.total_premium,
+                        underlying_price = EXCLUDED.underlying_price,
                         updated_at = NOW()
-                """, (self.underlying, timestamp, self.underlying))
+                """, (self.underlying, timestamp, self.underlying, underlying_price))
 
                 # 4. Refresh flow_cache_smart_money_minute
                 logger.debug("Refreshing flow_cache_smart_money_minute...")
@@ -869,7 +896,8 @@ class AnalyticsEngine:
                         total_premium,
                         avg_iv,
                         avg_delta,
-                        unusual_activity_score
+                        unusual_activity_score,
+                        underlying_price
                     )
                     SELECT
                         timestamp,
@@ -886,7 +914,8 @@ class AnalyticsEngine:
                             CASE WHEN volume_delta >= 500 THEN 4 WHEN volume_delta >= 200 THEN 3 WHEN volume_delta >= 100 THEN 2 WHEN volume_delta >= 50 THEN 1 ELSE 0 END +
                             CASE WHEN volume_delta * COALESCE(last, 0) * 100 >= 500000 THEN 4 WHEN volume_delta * COALESCE(last, 0) * 100 >= 250000 THEN 3 WHEN volume_delta * COALESCE(last, 0) * 100 >= 100000 THEN 2 WHEN volume_delta * COALESCE(last, 0) * 100 >= 50000 THEN 1 ELSE 0 END +
                             CASE WHEN implied_volatility > 1.0 THEN 2 WHEN implied_volatility > 0.6 THEN 1 ELSE 0 END
-                        ))::numeric
+                        ))::numeric,
+                        %s::numeric
                     FROM with_prev
                     WHERE volume_delta > 0
                     ON CONFLICT (timestamp, symbol, option_symbol)
@@ -899,8 +928,9 @@ class AnalyticsEngine:
                         avg_iv = EXCLUDED.avg_iv,
                         avg_delta = EXCLUDED.avg_delta,
                         unusual_activity_score = EXCLUDED.unusual_activity_score,
+                        underlying_price = EXCLUDED.underlying_price,
                         updated_at = NOW()
-                """, (self.underlying, timestamp, self.underlying))
+                """, (self.underlying, timestamp, self.underlying, underlying_price))
 
                 conn.commit()
                 logger.info("✅ Flow cache tables refreshed successfully")

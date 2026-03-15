@@ -163,6 +163,20 @@ class DatabaseManager:
         if latest_ts is None:
             return
 
+        # Fetch underlying price at this timestamp
+        underlying_price = await conn.fetchval(
+            """
+            SELECT close
+            FROM underlying_quotes
+            WHERE symbol = $1
+              AND timestamp <= $2
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            symbol,
+            latest_ts,
+        )
+
         # One-time bootstrap for the new expiration cache table so endpoint
         # can serve historical buckets immediately after deployment.
         expiration_seeded = await conn.fetchval(
@@ -253,7 +267,8 @@ class DatabaseManager:
                     total_volume,
                     total_premium,
                     avg_iv,
-                    net_delta
+                    net_delta,
+                    underlying_price
                 )
                 SELECT
                     timestamp,
@@ -262,7 +277,8 @@ class DatabaseManager:
                     SUM(volume_delta)::bigint,
                     SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
                     AVG(implied_volatility)::numeric,
-                    SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric
+                    SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric,
+                    $3::numeric
                 FROM with_prev
                 WHERE volume_delta > 0
                 GROUP BY timestamp, option_type
@@ -272,10 +288,12 @@ class DatabaseManager:
                     total_premium = EXCLUDED.total_premium,
                     avg_iv = EXCLUDED.avg_iv,
                     net_delta = EXCLUDED.net_delta,
+                    underlying_price = EXCLUDED.underlying_price,
                     updated_at = NOW()
                 """,
                 symbol,
                 latest_ts,
+                underlying_price,
             )
 
         strike_exists = await conn.fetchval(
@@ -327,7 +345,8 @@ class DatabaseManager:
                     total_volume,
                     total_premium,
                     avg_iv,
-                    net_delta
+                    net_delta,
+                    underlying_price
                 )
                 SELECT
                     timestamp,
@@ -336,7 +355,8 @@ class DatabaseManager:
                     SUM(volume_delta)::bigint,
                     SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
                     AVG(implied_volatility)::numeric,
-                    SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric
+                    SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric,
+                    $3::numeric
                 FROM with_prev
                 WHERE volume_delta > 0
                 GROUP BY timestamp, strike
@@ -346,10 +366,12 @@ class DatabaseManager:
                     total_premium = EXCLUDED.total_premium,
                     avg_iv = EXCLUDED.avg_iv,
                     net_delta = EXCLUDED.net_delta,
+                    underlying_price = EXCLUDED.underlying_price,
                     updated_at = NOW()
                 """,
                 symbol,
                 latest_ts,
+                underlying_price,
             )
 
         expiration_exists = await conn.fetchval(
@@ -397,14 +419,16 @@ class DatabaseManager:
                     symbol,
                     expiration,
                     total_volume,
-                    total_premium
+                    total_premium,
+                    underlying_price
                 )
                 SELECT
                     timestamp,
                     $1::varchar,
                     expiration,
                     SUM(volume_delta)::bigint,
-                    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric
+                    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
+                    $3::numeric
                 FROM with_prev
                 WHERE volume_delta > 0
                 GROUP BY timestamp, expiration
@@ -412,10 +436,12 @@ class DatabaseManager:
                 DO UPDATE SET
                     total_volume = EXCLUDED.total_volume,
                     total_premium = EXCLUDED.total_premium,
+                    underlying_price = EXCLUDED.underlying_price,
                     updated_at = NOW()
                 """,
                 symbol,
                 latest_ts,
+                underlying_price,
             )
 
         smart_exists = await conn.fetchval(
@@ -474,7 +500,8 @@ class DatabaseManager:
                     total_premium,
                     avg_iv,
                     avg_delta,
-                    unusual_activity_score
+                    unusual_activity_score,
+                    underlying_price
                 )
                 SELECT
                     timestamp,
@@ -491,7 +518,8 @@ class DatabaseManager:
                         CASE WHEN volume_delta >= 500 THEN 4 WHEN volume_delta >= 200 THEN 3 WHEN volume_delta >= 100 THEN 2 WHEN volume_delta >= 50 THEN 1 ELSE 0 END +
                         CASE WHEN volume_delta * COALESCE(last, 0) * 100 >= 500000 THEN 4 WHEN volume_delta * COALESCE(last, 0) * 100 >= 250000 THEN 3 WHEN volume_delta * COALESCE(last, 0) * 100 >= 100000 THEN 2 WHEN volume_delta * COALESCE(last, 0) * 100 >= 50000 THEN 1 ELSE 0 END +
                         CASE WHEN implied_volatility > 1.0 THEN 2 WHEN implied_volatility > 0.6 THEN 1 ELSE 0 END
-                    ))::numeric
+                    ))::numeric,
+                    $3::numeric
                 FROM with_prev
                 WHERE volume_delta > 0
                 ON CONFLICT (timestamp, symbol, option_symbol)
@@ -504,10 +532,12 @@ class DatabaseManager:
                     avg_iv = EXCLUDED.avg_iv,
                     avg_delta = EXCLUDED.avg_delta,
                     unusual_activity_score = EXCLUDED.unusual_activity_score,
+                    underlying_price = EXCLUDED.underlying_price,
                     updated_at = NOW()
                 """,
                 symbol,
                 latest_ts,
+                underlying_price,
             )
 
     async def _refresh_max_pain_snapshot(self, conn: asyncpg.Connection, symbol: str, strike_limit: int) -> None:
@@ -897,23 +927,23 @@ class DatabaseManager:
     async def get_flow_by_type(
         self,
         symbol: str = 'SPY',
-        timeframe: str = '1min',
-        window_units: int = 20
+        window_minutes: int = 60
     ) -> List[Dict[str, Any]]:
-        """Get option flow by type from flow_by_type_* views (Makefile-aligned output)."""
-        window_units = max(1, min(window_units, 90))
-        timeframe_suffix = _timeframe_view_suffix(timeframe)
-        query = f"""
+        """Get option flow by type from flow_cache_by_type_minute (1-min intervals)."""
+        window_minutes = max(1, min(window_minutes, 1440))
+        query = """
             WITH aggregated AS (
                 SELECT
                     timestamp,
                     symbol,
-                    MAX(CASE WHEN option_type = 'C' THEN volume END) AS call_volume,
-                    MAX(CASE WHEN option_type = 'C' THEN premium END) AS call_premium,
-                    MAX(CASE WHEN option_type = 'P' THEN volume END) AS put_volume,
-                    MAX(CASE WHEN option_type = 'P' THEN premium END) AS put_premium
-                FROM flow_by_type_{timeframe_suffix}
+                    MAX(CASE WHEN option_type = 'C' THEN total_volume END) AS call_volume,
+                    MAX(CASE WHEN option_type = 'C' THEN total_premium END) AS call_premium,
+                    MAX(CASE WHEN option_type = 'P' THEN total_volume END) AS put_volume,
+                    MAX(CASE WHEN option_type = 'P' THEN total_premium END) AS put_premium,
+                    MAX(underlying_price) AS underlying_price
+                FROM flow_cache_by_type_minute
                 WHERE symbol = $1
+                  AND timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
                 GROUP BY timestamp, symbol
             )
             SELECT
@@ -931,16 +961,16 @@ class DatabaseManager:
                     WHEN COALESCE(call_volume, 0) - COALESCE(put_volume, 0) < -500 THEN '🔴 Strong Puts'
                     WHEN COALESCE(call_volume, 0) - COALESCE(put_volume, 0) < 0 THEN '❌ Puts'
                     ELSE '⚪ Neutral'
-                END AS flow_bias
+                END AS flow_bias,
+                underlying_price
             FROM aggregated
             ORDER BY timestamp DESC
-            LIMIT $2
         """
 
         try:
             async with self.pool.acquire() as conn:
                 await self._refresh_flow_cache(conn, symbol)
-                rows = await conn.fetch(query, symbol, window_units)
+                rows = await conn.fetch(query, symbol, window_minutes)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching flow by type: {e}")
@@ -949,38 +979,39 @@ class DatabaseManager:
     async def get_flow_by_strike(
         self,
         symbol: str = 'SPY',
-        timeframe: str = '1min',
-        window_units: int = 20,
+        window_minutes: int = 60,
         limit: int = 20
     ) -> List[Dict[str, Any]]:
-        """Get option flow by strike from flow_by_strike_* views (Makefile-aligned output)."""
-        timeframe_suffix = _timeframe_view_suffix(timeframe)
-        query = f"""
+        """Get option flow by strike from flow_cache_by_strike_minute (1-min intervals)."""
+        window_minutes = max(1, min(window_minutes, 1440))
+        query = """
             SELECT
                 timestamp,
                 symbol,
                 strike,
-                volume,
-                premium,
-                net_volume,
-                net_premium,
+                total_volume AS volume,
+                total_premium AS premium,
+                net_delta::bigint AS net_volume,
+                (net_delta * (total_premium::numeric / NULLIF(total_volume, 0)))::numeric AS net_premium,
                 CASE
-                    WHEN net_volume > 100 THEN '🟢 Strong Calls'
-                    WHEN net_volume > 0 THEN '✅ Calls'
-                    WHEN net_volume < -100 THEN '🔴 Strong Puts'
-                    WHEN net_volume < 0 THEN '❌ Puts'
+                    WHEN net_delta > 100 THEN '🟢 Strong Calls'
+                    WHEN net_delta > 0 THEN '✅ Calls'
+                    WHEN net_delta < -100 THEN '🔴 Strong Puts'
+                    WHEN net_delta < 0 THEN '❌ Puts'
                     ELSE '⚪ Neutral'
-                END AS flow_bias
-            FROM flow_by_strike_{timeframe_suffix}
+                END AS flow_bias,
+                underlying_price
+            FROM flow_cache_by_strike_minute
             WHERE symbol = $1
+              AND timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
             ORDER BY timestamp DESC, strike
-            LIMIT $2
+            LIMIT $3
         """
 
         try:
             async with self.pool.acquire() as conn:
                 await self._refresh_flow_cache(conn, symbol)
-                rows = await conn.fetch(query, symbol, limit)
+                rows = await conn.fetch(query, symbol, window_minutes, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching flow by strike: {e}")
@@ -989,39 +1020,52 @@ class DatabaseManager:
     async def get_flow_by_expiration(
         self,
         symbol: str = 'SPY',
-        timeframe: str = '1min',
-        window_units: int = 20,
+        window_minutes: int = 60,
         limit: int = 20
     ) -> List[Dict[str, Any]]:
-        """Get option flow by expiration from flow_by_expiration_* views (Makefile-aligned output)."""
-        timeframe_suffix = _timeframe_view_suffix(timeframe)
-        query = f"""
+        """Get option flow by expiration from flow_cache_by_expiration_minute (1-min intervals)."""
+        window_minutes = max(1, min(window_minutes, 1440))
+        query = """
             SELECT
-                timestamp,
-                symbol,
-                expiration,
-                (expiration - CURRENT_DATE)::int AS dte,
-                volume,
-                premium,
-                net_volume,
-                net_premium,
+                e.timestamp,
+                e.symbol,
+                e.expiration,
+                (e.expiration - CURRENT_DATE)::int AS dte,
+                e.total_volume AS volume,
+                e.total_premium AS premium,
+                (COALESCE(t.call_vol, 0) - COALESCE(t.put_vol, 0))::bigint AS net_volume,
+                (COALESCE(t.call_prem, 0) - COALESCE(t.put_prem, 0))::numeric AS net_premium,
                 CASE
-                    WHEN net_volume > 500 THEN '🟢 Strong Calls'
-                    WHEN net_volume > 0 THEN '✅ Calls'
-                    WHEN net_volume < -500 THEN '🔴 Strong Puts'
-                    WHEN net_volume < 0 THEN '❌ Puts'
+                    WHEN (COALESCE(t.call_vol, 0) - COALESCE(t.put_vol, 0)) > 500 THEN '🟢 Strong Calls'
+                    WHEN (COALESCE(t.call_vol, 0) - COALESCE(t.put_vol, 0)) > 0 THEN '✅ Calls'
+                    WHEN (COALESCE(t.call_vol, 0) - COALESCE(t.put_vol, 0)) < -500 THEN '🔴 Strong Puts'
+                    WHEN (COALESCE(t.call_vol, 0) - COALESCE(t.put_vol, 0)) < 0 THEN '❌ Puts'
                     ELSE '⚪ Neutral'
-                END AS flow_bias
-            FROM flow_by_expiration_{timeframe_suffix}
-            WHERE symbol = $1
-            ORDER BY timestamp DESC, expiration
-            LIMIT $2
+                END AS flow_bias,
+                e.underlying_price
+            FROM flow_cache_by_expiration_minute e
+            LEFT JOIN (
+                SELECT
+                    timestamp, symbol,
+                    MAX(CASE WHEN option_type = 'C' THEN total_volume END) AS call_vol,
+                    MAX(CASE WHEN option_type = 'P' THEN total_volume END) AS put_vol,
+                    MAX(CASE WHEN option_type = 'C' THEN total_premium END) AS call_prem,
+                    MAX(CASE WHEN option_type = 'P' THEN total_premium END) AS put_prem
+                FROM flow_cache_by_type_minute
+                WHERE symbol = $1
+                  AND timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
+                GROUP BY timestamp, symbol
+            ) t ON t.timestamp = e.timestamp AND t.symbol = e.symbol
+            WHERE e.symbol = $1
+              AND e.timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
+            ORDER BY e.timestamp DESC, e.expiration
+            LIMIT $3
         """
 
         try:
             async with self.pool.acquire() as conn:
                 await self._refresh_flow_cache(conn, symbol)
-                rows = await conn.fetch(query, symbol, limit)
+                rows = await conn.fetch(query, symbol, window_minutes, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching flow by expiration: {e}")
@@ -1030,48 +1074,49 @@ class DatabaseManager:
     async def get_smart_money_flow(
         self,
         symbol: str = 'SPY',
-        timeframe: str = '1min',
-        window_units: int = 20,
+        window_minutes: int = 60,
         limit: int = 20
     ) -> List[Dict[str, Any]]:
-        """Get smart money flow from flow_smart_money_* views with Makefile-style labels."""
-        timeframe_suffix = _timeframe_view_suffix(timeframe)
-        query = f"""
+        """Get smart money flow from flow_cache_smart_money_minute (1-min intervals)."""
+        window_minutes = max(1, min(window_minutes, 1440))
+        query = """
             SELECT
                 timestamp,
                 symbol,
-                contract,
+                option_symbol AS contract,
                 strike,
                 expiration,
-                dte,
+                (expiration - CURRENT_DATE)::int AS dte,
                 option_type,
-                flow,
-                notional,
-                delta,
-                score,
+                total_volume AS flow,
+                total_premium AS notional,
+                avg_delta AS delta,
+                unusual_activity_score AS score,
                 CASE
-                    WHEN notional >= 500000 THEN '💰 $500K+'
-                    WHEN notional >= 250000 THEN '💵 $250K+'
-                    WHEN notional >= 100000 THEN '💸 $100K+'
-                    WHEN notional >= 50000 THEN '💳 $50K+'
+                    WHEN total_premium >= 500000 THEN '💰 $500K+'
+                    WHEN total_premium >= 250000 THEN '💵 $250K+'
+                    WHEN total_premium >= 100000 THEN '💸 $100K+'
+                    WHEN total_premium >= 50000 THEN '💳 $50K+'
                     ELSE '💴 <$50K'
                 END AS notional_class,
                 CASE
-                    WHEN flow >= 500 THEN '🔥 Massive Block'
-                    WHEN flow >= 200 THEN '📦 Large Block'
-                    WHEN flow >= 100 THEN '📊 Medium Block'
+                    WHEN total_volume >= 500 THEN '🔥 Massive Block'
+                    WHEN total_volume >= 200 THEN '📦 Large Block'
+                    WHEN total_volume >= 100 THEN '📊 Medium Block'
                     ELSE '💼 Standard'
-                END AS size_class
-            FROM flow_smart_money_{timeframe_suffix}
+                END AS size_class,
+                underlying_price
+            FROM flow_cache_smart_money_minute
             WHERE symbol = $1
-            ORDER BY timestamp DESC, score DESC, notional DESC
-            LIMIT $2
+              AND timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
+            ORDER BY timestamp DESC, unusual_activity_score DESC, total_premium DESC
+            LIMIT $3
         """
 
         try:
             async with self.pool.acquire() as conn:
                 await self._refresh_flow_cache(conn, symbol)
-                rows = await conn.fetch(query, symbol, limit)
+                rows = await conn.fetch(query, symbol, window_minutes, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching smart money flow: {e}")

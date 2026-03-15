@@ -221,12 +221,11 @@ async def get_gex_heatmap(
 @app.get("/api/flow/by-type", response_model=List[FlowByTypePoint])
 async def get_flow_by_type(
     symbol: str = Query(default="SPY"),
-    timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
-    window_units: int = Query(default=20, ge=1, le=90)
+    window_minutes: int = Query(default=60, ge=1, le=1440)
 ):
-    """Get option flow by type (calls vs puts)"""
+    """Get option flow by type (calls vs puts) — 1-min intervals"""
     try:
-        data = await db_manager.get_flow_by_type(symbol, timeframe, window_units)
+        data = await db_manager.get_flow_by_type(symbol, window_minutes)
         if not data:
             raise HTTPException(status_code=404, detail="No flow data available")
 
@@ -240,13 +239,12 @@ async def get_flow_by_type(
 @app.get("/api/flow/by-strike", response_model=List[FlowByStrikePoint])
 async def get_flow_by_strike(
     symbol: str = Query(default="SPY"),
-    timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
-    window_units: int = Query(default=20, ge=1, le=90),
+    window_minutes: int = Query(default=60, ge=1, le=1440),
     limit: int = Query(default=20, ge=1, le=50000)
 ):
-    """Get option flow by strike level"""
+    """Get option flow by strike level — 1-min intervals"""
     try:
-        data = await db_manager.get_flow_by_strike(symbol, timeframe, window_units, limit)
+        data = await db_manager.get_flow_by_strike(symbol, window_minutes, limit)
         if not data:
             raise HTTPException(status_code=404, detail="No flow data available")
 
@@ -261,13 +259,12 @@ async def get_flow_by_strike(
 @app.get("/api/flow/by-expiration", response_model=List[FlowByExpirationPoint])
 async def get_flow_by_expiration(
     symbol: str = Query(default="SPY"),
-    timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
-    window_units: int = Query(default=20, ge=1, le=90),
+    window_minutes: int = Query(default=60, ge=1, le=1440),
     limit: int = Query(default=20, ge=1, le=50000)
 ):
-    """Get option flow by expiration date"""
+    """Get option flow by expiration date — 1-min intervals"""
     try:
-        data = await db_manager.get_flow_by_expiration(symbol, timeframe, window_units, limit)
+        data = await db_manager.get_flow_by_expiration(symbol, window_minutes, limit)
         if not data:
             raise HTTPException(status_code=404, detail="No flow data available")
 
@@ -281,13 +278,12 @@ async def get_flow_by_expiration(
 @app.get("/api/flow/smart-money", response_model=List[SmartMoneyFlowPoint])
 async def get_smart_money_flow(
     symbol: str = Query(default="SPY"),
-    timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
-    window_units: int = Query(default=20, ge=1, le=90),
+    window_minutes: int = Query(default=60, ge=1, le=1440),
     limit: int = Query(default=20, le=100)
 ):
-    """Get unusual activity / smart money flow"""
+    """Get unusual activity / smart money flow — 1-min intervals"""
     try:
-        data = await db_manager.get_smart_money_flow(symbol, timeframe, window_units, limit)
+        data = await db_manager.get_smart_money_flow(symbol, window_minutes, limit)
         if not data:
             raise HTTPException(status_code=404, detail="No unusual activity detected")
 

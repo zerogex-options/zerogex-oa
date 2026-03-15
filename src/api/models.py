@@ -139,6 +139,7 @@ class FlowByTypePoint(BaseModel):
     net_volume: int
     net_premium: Decimal
     flow_bias: str
+    underlying_price: Optional[Decimal] = None
 
 
 class FlowByStrikePoint(BaseModel):
@@ -150,6 +151,7 @@ class FlowByStrikePoint(BaseModel):
     net_volume: int
     net_premium: Decimal
     flow_bias: str
+    underlying_price: Optional[Decimal] = None
 
 
 class FlowByExpirationPoint(BaseModel):
@@ -162,6 +164,7 @@ class FlowByExpirationPoint(BaseModel):
     net_volume: int
     net_premium: Decimal
     flow_bias: str
+    underlying_price: Optional[Decimal] = None
 
 
 class SmartMoneyFlowPoint(BaseModel):
@@ -178,6 +181,7 @@ class SmartMoneyFlowPoint(BaseModel):
     score: Optional[Decimal] = None
     notional_class: str
     size_class: str
+    underlying_price: Optional[Decimal] = None
 
 
 class MomentumDivergencePoint(BaseModel):
