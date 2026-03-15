@@ -3,10 +3,12 @@ Volatility Gauge Router
 
 GET /api/volatility/gauge
 
-Returns $VIX.X metrics as car dashboard gauges:
-  - speedometer (0–10): Current VIX level — how fast the market is moving
-  - tachometer  (0–10): VIX rate of change across time scales — how fast
-                         volatility itself is accelerating or decelerating
+Returns $VIX.X metrics as two scored dimensions:
+  - level    (0–10): Current VIX reading expressed on a log scale anchored to
+                     historical percentiles — where VIX sits right now.
+  - momentum (0–10): Weighted rate-of-change of VIX across five time scales,
+                     normalised to ±2σ — which direction and how fast VIX is
+                     moving relative to its own recent behaviour.
 
 Cache behaviour
 ---------------
@@ -190,10 +192,10 @@ def _do_incremental_fetch() -> None:
 
 
 # ============================================================================
-# Rating system
+# Scoring
 # ============================================================================
 
-def _speedometer(vix_close: float) -> float:
+def _level(vix_close: float) -> float:
     """
     Map VIX level → 0–10 using a log scale anchored to historical percentiles.
 
@@ -214,25 +216,29 @@ def _speedometer(vix_close: float) -> float:
     return round(max(0.0, min(10.0, score)), 2)
 
 
-def _tachometer(bars: List[Dict[str, Any]]) -> float:
+def _momentum(bars: List[Dict[str, Any]]) -> float:
     """
-    Map VIX acceleration → 0–10.
+    Map VIX momentum → 0–10.
 
     Steps:
     1. Compute a weighted composite rate-of-change (RoC) across five lookback
-       windows.  Shorter windows carry more weight so the reading responds
-       quickly to recent moves.
+       windows.  Weights are distributed across short and medium-term horizons
+       so that a single noisy bar does not dominate the reading.
     2. Normalise the composite RoC by the rolling 1-bar RoC std derived from
-       the cache itself (i.e. the realised per-bar volatility of VIX).
-    3. Map the z-score linearly:  z = -1 → 0, z = 0 → 5, z = +1 → 10.
+       the cache itself (realised per-bar volatility of VIX).
+    3. Map the z-score using a ±2σ range so that genuinely rare moves are
+       required to reach the extremes:
+         z = –2 → 0   (sharply falling)
+         z =  0 → 5   (flat / stable)
+         z = +2 → 10  (sharply rising)
        Clamped to [0, 10].
 
     Lookback windows (5-min bars) and weights:
-      1 bar  (5 min)  → 0.35
-      3 bars (15 min) → 0.25
-      6 bars (30 min) → 0.20
-      12 bars (1 hr)  → 0.12
-      26 bars (2 hr)  → 0.08
+      1 bar  ( 5 min) → 0.15   reduced vs. prior to limit single-bar noise
+      3 bars (15 min) → 0.20
+      6 bars (30 min) → 0.25
+      12 bars ( 1 hr) → 0.25
+      26 bars ( 2 hr) → 0.15
     """
     if len(bars) < 2:
         return 5.0   # neutral — not enough data
@@ -240,7 +246,8 @@ def _tachometer(bars: List[Dict[str, Any]]) -> float:
     closes = [b["close"] for b in bars]
     current = closes[-1]
 
-    windows = [(1, 0.35), (3, 0.25), (6, 0.20), (12, 0.12), (26, 0.08)]
+    # Weights rebalanced: short-term bias removed, medium-term windows dominate
+    windows = [(1, 0.15), (3, 0.20), (6, 0.25), (12, 0.25), (26, 0.15)]
     composite_roc = 0.0
     total_weight = 0.0
 
@@ -273,33 +280,34 @@ def _tachometer(bars: List[Dict[str, Any]]) -> float:
         variance = sum((x - mean) ** 2 for x in one_bar_rocs) / (n - 1)
         sigma = max(math.sqrt(variance) if variance > 0 else 0.001, 0.001)
 
+    # Map ±2σ → 0–10 (previously ±1σ → 0–10, halving sensitivity)
     z_score = composite_roc / sigma
-    tach = 5.0 + 5.0 * z_score
-    return round(max(0.0, min(10.0, tach)), 2)
+    score = 5.0 + 2.5 * z_score
+    return round(max(0.0, min(10.0, score)), 2)
 
 
-def _speed_label(score: float) -> str:
+def _level_label(score: float) -> str:
     if score < 2.0:
-        return "Idle"
+        return "Subdued"
     if score < 4.0:
-        return "Cruising"
+        return "Low"
     if score < 6.0:
+        return "Moderate"
+    if score < 8.0:
         return "Elevated"
-    if score < 8.0:
-        return "High Speed"
-    return "Redline"
+    return "Extreme"
 
 
-def _tach_label(score: float) -> str:
+def _momentum_label(score: float) -> str:
     if score < 2.0:
-        return "Hard Braking"
+        return "Collapsing"
     if score < 4.0:
-        return "Decelerating"
+        return "Easing"
     if score < 6.0:
-        return "Steady"
+        return "Stable"
     if score < 8.0:
-        return "Accelerating"
-    return "Full Throttle"
+        return "Rising"
+    return "Surging"
 
 
 # ============================================================================
@@ -318,24 +326,24 @@ class VolatilityGaugeResponse(BaseModel):
     timestamp: datetime = Field(description="Timestamp of the latest VIX bar (ET)")
     vix: float = Field(description="Current $VIX.X close")
 
-    speedometer: float = Field(
+    level: float = Field(
         description=(
             "VIX level mapped to 0–10 (log scale). "
             "0 = ultra-calm (VIX ~10), 5 = VIX ~25, 10 = extreme fear (VIX ~50+)."
         )
     )
-    speedometer_label: str = Field(
-        description="Human-readable label: Idle / Cruising / Elevated / High Speed / Redline"
+    level_label: str = Field(
+        description="Human-readable label: Subdued / Low / Moderate / Elevated / Extreme"
     )
 
-    tachometer: float = Field(
+    momentum: float = Field(
         description=(
-            "VIX acceleration mapped to 0–10. "
-            "0 = sharply decelerating (–1σ), 5 = steady, 10 = sharply accelerating (+1σ)."
+            "VIX rate-of-change mapped to 0–10 (±2σ range). "
+            "0 = collapsing (–2σ), 5 = stable, 10 = surging (+2σ)."
         )
     )
-    tachometer_label: str = Field(
-        description="Human-readable label: Hard Braking / Decelerating / Steady / Accelerating / Full Throttle"
+    momentum_label: str = Field(
+        description="Human-readable label: Collapsing / Easing / Stable / Rising / Surging"
     )
 
     cache_bars: int = Field(description="5-min bars currently held in the in-memory cache")
@@ -354,26 +362,27 @@ class VolatilityGaugeResponse(BaseModel):
 @router.get("/gauge", response_model=VolatilityGaugeResponse)
 async def get_volatility_gauge():
     """
-    Returns $VIX.X volatility metrics as a two-dial car dashboard.
+    Returns $VIX.X volatility metrics as two scored dimensions.
 
-    **Speedometer** — *how fast are we going?*
-    Maps the current $VIX.X level to a 0–10 scale using a log curve that
-    matches the historical distribution of VIX readings:
-    - `0–2`  → Idle (VIX ~10–14, ultra-low volatility)
-    - `2–4`  → Cruising (VIX ~14–19, below-average vol)
-    - `4–6`  → Elevated (VIX ~19–27, above-average vol)
-    - `6–8`  → High Speed (VIX ~27–38, high fear)
-    - `8–10` → Redline (VIX ~38+, extreme panic)
+    **Level** — *where is VIX right now?*
+    Maps the current $VIX.X reading to a 0–10 log scale anchored to
+    historical percentiles:
+    - `0–2`  → Subdued  (VIX ~10–15, historically quiet)
+    - `2–4`  → Low      (VIX ~15–19, below-average vol)
+    - `4–6`  → Moderate (VIX ~19–27, near long-run average)
+    - `6–8`  → Elevated (VIX ~27–38, above-average fear)
+    - `8–10` → Extreme  (VIX ~38+, crisis-level fear)
 
-    **Tachometer** — *how fast is the speed changing?*
-    Measures the rate of change of VIX across five time scales (5 min through
-    2 hrs), weighted toward recent moves, then normalises by the realised
-    per-bar volatility of VIX itself so that +1σ maps to 10 and –1σ maps to 0:
-    - `0–2`  → Hard Braking (fear collapsing fast)
-    - `2–4`  → Decelerating (vol trending lower)
-    - `4–6`  → Steady (no meaningful acceleration)
-    - `6–8`  → Accelerating (vol climbing)
-    - `8–10` → Full Throttle (fear spiking hard)
+    **Momentum** — *which direction and how fast is VIX moving?*
+    Weighted composite rate-of-change across five time scales (5 min through
+    2 hrs), normalised against realised per-bar volatility of VIX.  Scaled so
+    that ±2σ maps to the full 0–10 range, meaning routine intraday moves stay
+    in the middle band and only genuine trend moves reach the extremes:
+    - `0–2`  → Collapsing (fear unwinding sharply, –2σ)
+    - `2–4`  → Easing     (vol declining)
+    - `4–6`  → Stable     (no meaningful directional move)
+    - `6–8`  → Rising     (vol building)
+    - `8–10` → Surging    (fear spiking hard, +2σ)
 
     **Cache behaviour** — on the first call after startup the endpoint fetches
     ≈2 full trading sessions of 5-min VIX bars and stores them in memory.
@@ -417,8 +426,8 @@ async def get_volatility_gauge():
     latest = bars_snapshot[-1]
     vix_close = latest["close"]
 
-    speed = _speedometer(vix_close)
-    tach  = _tachometer(bars_snapshot)
+    lvl  = _level(vix_close)
+    mom  = _momentum(bars_snapshot)
 
     recent_bars = [
         VIXBar(timestamp=b["timestamp"], close=b["close"])
@@ -428,10 +437,10 @@ async def get_volatility_gauge():
     return VolatilityGaugeResponse(
         timestamp=latest["timestamp"],
         vix=round(vix_close, 2),
-        speedometer=speed,
-        speedometer_label=_speed_label(speed),
-        tachometer=tach,
-        tachometer_label=_tach_label(tach),
+        level=lvl,
+        level_label=_level_label(lvl),
+        momentum=mom,
+        momentum_label=_momentum_label(mom),
         cache_bars=len(bars_snapshot),
         latest_bars=recent_bars,
     )
