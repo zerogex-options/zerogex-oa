@@ -2032,68 +2032,6 @@ db-prune-legacy: ## Drop obsolete legacy refresh/materialized-view artifacts
 	| $(PSQL)
 
 # =============================================================================
-# One-Time Migrations
-# =============================================================================
-
-.PHONY: db-rename-flow-tables
-db-rename-flow-tables: ## (One-time) Rename flow_cache_*_minute tables to flow_by_* / flow_smart_money
-	@echo "$(BLUE)=== Renaming flow cache tables ===$(NC)"
-	@$(PSQL) -c "\
-		ALTER TABLE IF EXISTS flow_cache_by_type_minute RENAME TO flow_by_type; \
-		ALTER TABLE IF EXISTS flow_cache_by_strike_minute RENAME TO flow_by_strike; \
-		ALTER TABLE IF EXISTS flow_cache_by_expiration_minute RENAME TO flow_by_expiration; \
-		ALTER TABLE IF EXISTS flow_cache_smart_money_minute RENAME TO flow_smart_money; \
-		ALTER INDEX IF EXISTS idx_flow_cache_by_type_symbol_ts RENAME TO idx_flow_by_type_symbol_ts; \
-		ALTER INDEX IF EXISTS idx_flow_cache_by_strike_symbol_ts RENAME TO idx_flow_by_strike_symbol_ts; \
-		ALTER INDEX IF EXISTS idx_flow_cache_by_expiration_symbol_ts RENAME TO idx_flow_by_expiration_symbol_ts; \
-		ALTER INDEX IF EXISTS idx_flow_cache_smart_money_symbol_ts RENAME TO idx_flow_smart_money_symbol_ts; \
-		SELECT 'Flow tables renamed successfully' AS status;"
-	@echo "$(GREEN)✅ Flow tables renamed$(NC)"
-
-.PHONY: db-drop-flow-views
-db-drop-flow-views: ## (One-time) Drop all interval flow views — tables remain intact
-	@echo "$(BLUE)=== Dropping interval flow views ===$(NC)"
-	@$(PSQL) -c "\
-		DROP VIEW IF EXISTS flow_by_type_1min CASCADE; \
-		DROP VIEW IF EXISTS flow_by_type_5min CASCADE; \
-		DROP VIEW IF EXISTS flow_by_type_15min CASCADE; \
-		DROP VIEW IF EXISTS flow_by_type_1hr CASCADE; \
-		DROP VIEW IF EXISTS flow_by_type_1day CASCADE; \
-		DROP VIEW IF EXISTS flow_by_strike_1min CASCADE; \
-		DROP VIEW IF EXISTS flow_by_strike_5min CASCADE; \
-		DROP VIEW IF EXISTS flow_by_strike_15min CASCADE; \
-		DROP VIEW IF EXISTS flow_by_strike_1hr CASCADE; \
-		DROP VIEW IF EXISTS flow_by_strike_1day CASCADE; \
-		DROP VIEW IF EXISTS flow_by_expiration_1min CASCADE; \
-		DROP VIEW IF EXISTS flow_by_expiration_5min CASCADE; \
-		DROP VIEW IF EXISTS flow_by_expiration_15min CASCADE; \
-		DROP VIEW IF EXISTS flow_by_expiration_1hr CASCADE; \
-		DROP VIEW IF EXISTS flow_by_expiration_1day CASCADE; \
-		DROP VIEW IF EXISTS flow_smart_money_1min CASCADE; \
-		DROP VIEW IF EXISTS flow_smart_money_5min CASCADE; \
-		DROP VIEW IF EXISTS flow_smart_money_15min CASCADE; \
-		DROP VIEW IF EXISTS flow_smart_money_1hr CASCADE; \
-		DROP VIEW IF EXISTS flow_smart_money_1day CASCADE; \
-		DROP VIEW IF EXISTS option_flow_smart_money CASCADE; \
-		SELECT 'Flow interval views dropped' AS status;"
-	@echo "$(GREEN)✅ Flow interval views dropped$(NC)"
-
-.PHONY: db-add-underlying-price
-db-add-underlying-price: ## (One-time) Add underlying_price column to all flow cache tables
-	@echo "$(BLUE)=== Adding underlying_price column to flow cache tables ===$(NC)"
-	@$(PSQL) -c "\
-		ALTER TABLE flow_by_type \
-			ADD COLUMN IF NOT EXISTS underlying_price NUMERIC(12, 4); \
-		ALTER TABLE flow_by_strike \
-			ADD COLUMN IF NOT EXISTS underlying_price NUMERIC(12, 4); \
-		ALTER TABLE flow_by_expiration \
-			ADD COLUMN IF NOT EXISTS underlying_price NUMERIC(12, 4); \
-		ALTER TABLE flow_smart_money \
-			ADD COLUMN IF NOT EXISTS underlying_price NUMERIC(12, 4); \
-		SELECT 'underlying_price column added to all flow cache tables' AS status;"
-	@echo "$(GREEN)✅ underlying_price column added$(NC)"
-
-# =============================================================================
 # Interactive
 # =============================================================================
 
