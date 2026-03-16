@@ -14,7 +14,7 @@ PSQL = PGPASSFILE=~/.pgpass psql "sslmode=require host=$(DB_HOST) port=$(DB_PORT
 # Service names
 INGESTION_SERVICE = zerogex-oa-ingestion
 ANALYTICS_SERVICE = zerogex-oa-analytics
-API_SERVICE = $(API_SERVICE)
+API_SERVICE = zerogex-oa-api
 
 # Python virtual environment
 VENV_PYTHON = venv/bin/python
