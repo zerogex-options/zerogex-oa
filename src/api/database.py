@@ -7,12 +7,53 @@ import asyncpg
 import os
 from pathlib import Path
 from typing import List, Dict, Optional, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date, time
+from zoneinfo import ZoneInfo
 import logging
 import json
 
 logger = logging.getLogger(__name__)
 
+
+_ET = ZoneInfo('America/New_York')
+
+
+def _get_session_bounds(session: str = 'current') -> tuple:
+    """Return (start_ts, end_ts) as timezone-aware datetimes for the requested trading session.
+
+    'current': today 09:30–now if market is open, else most recent session 09:30–16:00 ET.
+    'prior':   the full trading session immediately before the current one.
+    """
+    now_et = datetime.now(_ET)
+    today = now_et.date()
+    market_open_time = time(9, 30)
+    market_close_time = time(16, 0)
+
+    def prev_trading_day(d):
+        d -= timedelta(days=1)
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        return d
+
+    def make_ts(d, t):
+        return datetime(d.year, d.month, d.day, t.hour, t.minute, tzinfo=_ET)
+
+    # Current session date: last/current weekday on or after market open
+    is_weekday = today.weekday() < 5
+    past_open = now_et.time() >= market_open_time
+    current_session_date = today if (is_weekday and past_open) else prev_trading_day(today)
+
+    market_is_open = (current_session_date == today and now_et.time() < market_close_time)
+
+    if session == 'current':
+        start = make_ts(current_session_date, market_open_time)
+        end = now_et if market_is_open else make_ts(current_session_date, market_close_time)
+    else:  # 'prior'
+        prior_date = prev_trading_day(current_session_date)
+        start = make_ts(prior_date, market_open_time)
+        end = make_ts(prior_date, market_close_time)
+
+    return start, end
 
 
 def _normalize_timeframe(timeframe: str) -> str:
@@ -927,10 +968,10 @@ class DatabaseManager:
     async def get_flow_by_type(
         self,
         symbol: str = 'SPY',
-        window_minutes: int = 60
+        session: str = 'current'
     ) -> List[Dict[str, Any]]:
         """Get option flow by type from flow_by_type (1-min intervals)."""
-        window_minutes = max(1, min(window_minutes, 1440))
+        session_start, session_end = _get_session_bounds(session)
         query = """
             WITH aggregated AS (
                 SELECT
@@ -943,7 +984,8 @@ class DatabaseManager:
                     MAX(underlying_price) AS underlying_price
                 FROM flow_by_type
                 WHERE symbol = $1
-                  AND timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
+                  AND timestamp >= $2
+                  AND timestamp <= $3
                 GROUP BY timestamp, symbol
             )
             SELECT
@@ -970,7 +1012,7 @@ class DatabaseManager:
         try:
             async with self.pool.acquire() as conn:
                 await self._refresh_flow_cache(conn, symbol)
-                rows = await conn.fetch(query, symbol, window_minutes)
+                rows = await conn.fetch(query, symbol, session_start, session_end)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching flow by type: {e}")
@@ -979,11 +1021,11 @@ class DatabaseManager:
     async def get_flow_by_strike(
         self,
         symbol: str = 'SPY',
-        window_minutes: int = 60,
+        session: str = 'current',
         limit: int = 20
     ) -> List[Dict[str, Any]]:
         """Get option flow by strike from flow_by_strike (1-min intervals)."""
-        window_minutes = max(1, min(window_minutes, 1440))
+        session_start, session_end = _get_session_bounds(session)
         query = """
             SELECT
                 timestamp,
@@ -1003,15 +1045,16 @@ class DatabaseManager:
                 underlying_price
             FROM flow_by_strike
             WHERE symbol = $1
-              AND timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
+              AND timestamp >= $2
+              AND timestamp <= $3
             ORDER BY timestamp DESC, strike
-            LIMIT $3
+            LIMIT $4
         """
 
         try:
             async with self.pool.acquire() as conn:
                 await self._refresh_flow_cache(conn, symbol)
-                rows = await conn.fetch(query, symbol, window_minutes, limit)
+                rows = await conn.fetch(query, symbol, session_start, session_end, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching flow by strike: {e}")
@@ -1020,11 +1063,11 @@ class DatabaseManager:
     async def get_flow_by_expiration(
         self,
         symbol: str = 'SPY',
-        window_minutes: int = 60,
+        session: str = 'current',
         limit: int = 20
     ) -> List[Dict[str, Any]]:
         """Get option flow by expiration from flow_by_expiration (1-min intervals)."""
-        window_minutes = max(1, min(window_minutes, 1440))
+        session_start, session_end = _get_session_bounds(session)
         query = """
             SELECT
                 e.timestamp,
@@ -1053,19 +1096,21 @@ class DatabaseManager:
                     MAX(CASE WHEN option_type = 'P' THEN total_premium END) AS put_prem
                 FROM flow_by_type
                 WHERE symbol = $1
-                  AND timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
+                  AND timestamp >= $2
+                  AND timestamp <= $3
                 GROUP BY timestamp, symbol
             ) t ON t.timestamp = e.timestamp AND t.symbol = e.symbol
             WHERE e.symbol = $1
-              AND e.timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
+              AND e.timestamp >= $2
+              AND e.timestamp <= $3
             ORDER BY e.timestamp DESC, e.expiration
-            LIMIT $3
+            LIMIT $4
         """
 
         try:
             async with self.pool.acquire() as conn:
                 await self._refresh_flow_cache(conn, symbol)
-                rows = await conn.fetch(query, symbol, window_minutes, limit)
+                rows = await conn.fetch(query, symbol, session_start, session_end, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching flow by expiration: {e}")
@@ -1074,11 +1119,11 @@ class DatabaseManager:
     async def get_smart_money_flow(
         self,
         symbol: str = 'SPY',
-        window_minutes: int = 60,
+        session: str = 'current',
         limit: int = 20
     ) -> List[Dict[str, Any]]:
         """Get smart money flow from flow_smart_money (1-min intervals)."""
-        window_minutes = max(1, min(window_minutes, 1440))
+        session_start, session_end = _get_session_bounds(session)
         query = """
             SELECT
                 timestamp,
@@ -1108,15 +1153,16 @@ class DatabaseManager:
                 underlying_price
             FROM flow_smart_money
             WHERE symbol = $1
-              AND timestamp >= NOW() - ($2::int * INTERVAL '1 minute')
+              AND timestamp >= $2
+              AND timestamp <= $3
             ORDER BY timestamp DESC, unusual_activity_score DESC, total_premium DESC
-            LIMIT $3
+            LIMIT $4
         """
 
         try:
             async with self.pool.acquire() as conn:
                 await self._refresh_flow_cache(conn, symbol)
-                rows = await conn.fetch(query, symbol, window_minutes, limit)
+                rows = await conn.fetch(query, symbol, session_start, session_end, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching smart money flow: {e}")

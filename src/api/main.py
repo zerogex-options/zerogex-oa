@@ -230,11 +230,12 @@ async def get_gex_heatmap(
 @app.get("/api/flow/by-type", response_model=List[FlowByTypePoint], tags=["Options Flow"])
 async def get_flow_by_type(
     symbol: str = Query(default="SPY"),
-    window_minutes: int = Query(default=60, ge=1, le=1440)
+    session: str = Query(default="current", pattern="^(current|prior)$")
 ):
-    """Get option flow by type (calls vs puts) — 1-min intervals"""
+    """Get option flow by type (calls vs puts) — 1-min intervals.
+    session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
     try:
-        data = await db_manager.get_flow_by_type(symbol, window_minutes)
+        data = await db_manager.get_flow_by_type(symbol, session)
         return [FlowByTypePoint(**row) for row in data]
     except HTTPException:
         raise
@@ -245,12 +246,13 @@ async def get_flow_by_type(
 @app.get("/api/flow/by-strike", response_model=List[FlowByStrikePoint], tags=["Options Flow"])
 async def get_flow_by_strike(
     symbol: str = Query(default="SPY"),
-    window_minutes: int = Query(default=60, ge=1, le=1440),
+    session: str = Query(default="current", pattern="^(current|prior)$"),
     limit: int = Query(default=20, ge=1, le=50000)
 ):
-    """Get option flow by strike level — 1-min intervals"""
+    """Get option flow by strike level — 1-min intervals.
+    session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
     try:
-        data = await db_manager.get_flow_by_strike(symbol, window_minutes, limit)
+        data = await db_manager.get_flow_by_strike(symbol, session, limit)
         return [FlowByStrikePoint(**row) for row in data]
     except HTTPException:
         raise
@@ -262,12 +264,13 @@ async def get_flow_by_strike(
 @app.get("/api/flow/by-expiration", response_model=List[FlowByExpirationPoint], tags=["Options Flow"])
 async def get_flow_by_expiration(
     symbol: str = Query(default="SPY"),
-    window_minutes: int = Query(default=60, ge=1, le=1440),
+    session: str = Query(default="current", pattern="^(current|prior)$"),
     limit: int = Query(default=20, ge=1, le=50000)
 ):
-    """Get option flow by expiration date — 1-min intervals"""
+    """Get option flow by expiration date — 1-min intervals.
+    session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
     try:
-        data = await db_manager.get_flow_by_expiration(symbol, window_minutes, limit)
+        data = await db_manager.get_flow_by_expiration(symbol, session, limit)
         return [FlowByExpirationPoint(**row) for row in data]
     except HTTPException:
         raise
@@ -278,12 +281,13 @@ async def get_flow_by_expiration(
 @app.get("/api/flow/smart-money", response_model=List[SmartMoneyFlowPoint], tags=["Options Flow"])
 async def get_smart_money_flow(
     symbol: str = Query(default="SPY"),
-    window_minutes: int = Query(default=60, ge=1, le=1440),
+    session: str = Query(default="current", pattern="^(current|prior)$"),
     limit: int = Query(default=20, le=100)
 ):
-    """Get unusual activity / smart money flow — 1-min intervals"""
+    """Get unusual activity / smart money flow — 1-min intervals.
+    session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
     try:
-        data = await db_manager.get_smart_money_flow(symbol, window_minutes, limit)
+        data = await db_manager.get_smart_money_flow(symbol, session, limit)
         return [SmartMoneyFlowPoint(**row) for row in data]
     except HTTPException:
         raise
