@@ -63,6 +63,18 @@ def parse_underlyings(raw_underlyings: str) -> List[str]:
     return resolved
 
 
+def get_canonical_symbol(ts_symbol: str) -> str:
+    """Reverse-lookup: return the user alias for a resolved TradeStation symbol.
+
+    e.g. "$SPX.X" → "SPX" if SYMBOL_ALIASES contains SPX=$SPX.X, else returns ts_symbol unchanged.
+    """
+    normalized = ts_symbol.strip().upper()
+    if not normalized:
+        return normalized
+    reverse = {v: k for k, v in get_symbol_aliases().items()}
+    return reverse.get(normalized, normalized)
+
+
 def resolve_option_root(underlying: str) -> str:
     """Resolve option root for a given underlying, defaulting to underlying itself."""
     normalized = underlying.strip().upper()

@@ -26,7 +26,7 @@ from src.ingestion.greeks_calculator import GreeksCalculator
 from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
 from src.validation import bucket_timestamp
-from src.symbols import parse_underlyings
+from src.symbols import parse_underlyings, get_canonical_symbol
 from src.config import (
     AGGREGATION_BUCKET_SECONDS,
     MAX_BUFFER_SIZE,
@@ -56,7 +56,8 @@ class IngestionEngine:
     ):
         """Initialize main ingestion engine"""
         self.client = client
-        self.underlying = underlying.upper()
+        self.underlying = underlying.upper()         # TradeStation API symbol (e.g. "$SPX.X")
+        self.db_symbol = get_canonical_symbol(self.underlying)  # canonical alias for DB (e.g. "SPX")
         self.num_expirations = num_expirations
         self.strike_distance = strike_distance
 
@@ -118,15 +119,15 @@ class IngestionEngine:
                         updated_at = NOW()
                     """,
                     (
-                        self.underlying,
-                        self.underlying,
-                        self._infer_asset_type(self.underlying),
+                        self.db_symbol,
+                        self.db_symbol,
+                        self._infer_asset_type(self.underlying),  # ts_symbol has $ prefix for indexes
                     ),
                 )
                 conn.commit()
-            logger.info(f"✅ Ensured symbols row exists for {self.underlying}")
+            logger.info(f"✅ Ensured symbols row exists for {self.db_symbol}")
         except Exception as e:
-            logger.error(f"Error ensuring symbols row for {self.underlying}: {e}", exc_info=True)
+            logger.error(f"Error ensuring symbols row for {self.db_symbol}: {e}", exc_info=True)
 
     def _signal_handler(self, signum, frame):
         """
@@ -174,7 +175,7 @@ class IngestionEngine:
         bucket = bucket_timestamp(timestamp, AGGREGATION_BUCKET_SECONDS)
 
         payload = {
-            "symbol": data["symbol"],
+            "symbol": self.db_symbol,
             "timestamp": bucket,
             "open": data["open"],
             "high": data["high"],
@@ -462,6 +463,7 @@ class IngestionEngine:
         stream_manager = StreamManager(
             client=self.client,
             underlying=self.underlying,
+            db_underlying=self.db_symbol,
             num_expirations=self.num_expirations,
             strike_distance=self.strike_distance,
         )

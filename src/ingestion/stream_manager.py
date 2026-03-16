@@ -44,12 +44,14 @@ class StreamManager:
         self,
         client: TradeStationClient,
         underlying: str = "SPY",
+        db_underlying: str = None,
         num_expirations: int = 3,
         strike_distance: float = 10.0,
     ):
         """Initialize stream manager"""
         self.client = client
-        self.underlying = underlying.upper()
+        self.underlying = underlying.upper()           # TradeStation API symbol (e.g. "$SPX.X")
+        self.db_underlying = (db_underlying or underlying).upper()  # canonical alias for DB (e.g. "SPX")
         self.num_expirations = num_expirations
         self.strike_distance = strike_distance
 
@@ -109,7 +111,7 @@ class StreamManager:
 
             # Parse OHLCV with volume breakdown
             underlying_data = {
-                "symbol": self.underlying,
+                "symbol": self.db_underlying,
                 "timestamp": timestamp,
                 "open": safe_float(bar.get("Open"), field_name="Open"),
                 "high": safe_float(bar.get("High"), field_name="High"),
@@ -533,7 +535,7 @@ class StreamManager:
                                 option_data = {
                                     "option_symbol": option_symbol,
                                     "timestamp": timestamp,
-                                    "underlying": self.underlying,
+                                    "underlying": self.db_underlying,
                                     "strike": strike,
                                     "expiration": expiration,
                                     "option_type": option_type,
