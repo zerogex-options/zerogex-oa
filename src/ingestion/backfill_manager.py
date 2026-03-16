@@ -443,7 +443,7 @@ class BackfillManager:
 
                 # Store underlying bar
                 underlying_data = {
-                    "symbol": self.underlying,
+                    "symbol": self.db_symbol,
                     "timestamp": bar_dt,
                     "open": open_price,
                     "high": high_price,
@@ -522,7 +522,7 @@ class BackfillManager:
                                 option_data = {
                                     "option_symbol": option_symbol,
                                     "timestamp": bar_dt,
-                                    "underlying": self.underlying,
+                                    "underlying": self.db_symbol,
                                     "strike": strike,
                                     "expiration": expiration,
                                     "option_type": option_type,
