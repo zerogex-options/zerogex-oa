@@ -19,7 +19,7 @@ from src.ingestion.greeks_calculator import GreeksCalculator
 from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
 from src.validation import safe_float, safe_int, safe_datetime, validate_bar_data
-from src.symbols import resolve_option_root, get_canonical_symbol
+from src.symbols import resolve_option_root, get_canonical_symbol, get_weekly_option_roots
 from src.config import (
     OPTION_BATCH_SIZE,
     DELAY_BETWEEN_BATCHES,
@@ -211,14 +211,18 @@ class BackfillManager:
     def _get_expirations_for_date(self, as_of_date: date) -> List[date]:
         """Get expirations available on a given date"""
         try:
-            all_expirations = self.client.get_option_expirations(self.option_root)
+            all_expirations = self.client.get_option_expirations(self.underlying)
 
             if not all_expirations:
-                logger.warning(f"No expirations found for option root {self.option_root}")
+                logger.warning(f"No expirations found for {self.underlying}")
                 return []
 
             # Filter to expirations >= as_of_date
             future_exps = [exp for exp in all_expirations if exp >= as_of_date]
+
+            # If the option root is weekly-only (e.g. SPXW), keep only Mon/Wed/Fri
+            if self.option_root in get_weekly_option_roots():
+                future_exps = [exp for exp in future_exps if exp.weekday() in (0, 2, 4)]
 
             # Take first N
             target_exps = future_exps[:self.num_expirations]

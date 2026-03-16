@@ -20,7 +20,7 @@ from src.validation import (
     safe_float, safe_int, safe_datetime,
     validate_bar_data, get_market_session
 )
-from src.symbols import resolve_option_root
+from src.symbols import resolve_option_root, get_weekly_option_roots
 from src.config import (
     OPTION_BATCH_SIZE,
     MARKET_HOURS_POLL_INTERVAL,
@@ -245,16 +245,20 @@ class StreamManager:
     def _get_target_expirations(self) -> List[date]:
         """Get target expiration dates.
 
-        Uses self.option_root (e.g. "SPXW") rather than self.underlying (e.g. "$SPX.X")
-        so that TradeStation returns only the expirations valid for the configured option
-        root. For SPXW this yields weekly expirations only; for standard roots it returns
-        the same set as querying the underlying directly.
+        Always queries get_option_expirations(self.underlying) — e.g. "$SPX.X" — since
+        that is the symbol TradeStation uses for expiration/strike structure lookups.
+        self.option_root (e.g. "SPXW") is only used later inside build_option_symbol()
+        when constructing the actual option chain symbols for get_option_quotes().
+
+        If self.option_root is listed in OPTION_WEEKLY_ROOTS, the returned dates are
+        filtered to Mon/Wed/Fri only, because building a "SPXW ..." symbol for a
+        non-weekly expiration would be rejected by the TradeStation API.
         """
         try:
-            all_expirations = self.client.get_option_expirations(self.option_root)
+            all_expirations = self.client.get_option_expirations(self.underlying)
 
             if not all_expirations:
-                logger.warning(f"No expirations found for option root {self.option_root}")
+                logger.warning(f"No expirations found for {self.underlying}")
                 return []
 
             # Filter to future expirations
@@ -265,10 +269,15 @@ class StreamManager:
                 logger.warning("No future expirations available")
                 return []
 
+            # If the option root is weekly-only (e.g. SPXW), keep only Mon/Wed/Fri dates
+            if self.option_root in get_weekly_option_roots():
+                future_expirations = [exp for exp in future_expirations if exp.weekday() in (0, 2, 4)]
+                logger.info(f"Filtered to weekly expirations for {self.option_root} (Mon/Wed/Fri)")
+
             # Take first N
             target_exps = future_expirations[:self.num_expirations]
 
-            logger.info(f"Target expirations ({self.option_root}): {[str(exp) for exp in target_exps]}")
+            logger.info(f"Target expirations: {[str(exp) for exp in target_exps]}")
             return target_exps
 
         except Exception as e:
