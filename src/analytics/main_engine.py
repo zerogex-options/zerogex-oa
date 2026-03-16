@@ -26,7 +26,7 @@ from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
 from src.config import RISK_FREE_RATE
 from src.analytics.signal_engine import SignalEngine
-from src.symbols import parse_underlyings
+from src.symbols import parse_underlyings, get_canonical_symbol
 
 logger = get_logger(__name__)
 
@@ -56,6 +56,7 @@ class AnalyticsEngine:
             risk_free_rate: Risk-free rate for Greeks
         """
         self.underlying = underlying.upper()
+        self.db_symbol = get_canonical_symbol(self.underlying)  # canonical alias for DB queries (e.g. "SPX")
         self.calculation_interval = calculation_interval
         self.risk_free_rate = risk_free_rate
         self.running = False
@@ -92,7 +93,7 @@ class AnalyticsEngine:
                     SELECT MAX(timestamp) 
                     FROM option_chains 
                     WHERE underlying = %s
-                """, (self.underlying,))
+                """, (self.db_symbol,))
 
                 result = cursor.fetchone()
                 if result and result[0]:
@@ -116,7 +117,7 @@ class AnalyticsEngine:
                       AND timestamp <= %s
                     ORDER BY timestamp DESC 
                     LIMIT 1
-                """, (self.underlying, timestamp))
+                """, (self.db_symbol, timestamp))
 
                 result = cursor.fetchone()
                 if result:
@@ -162,7 +163,7 @@ class AnalyticsEngine:
                       AND timestamp = %s
                       AND gamma IS NOT NULL
                     ORDER BY expiration, strike
-                """, (self.underlying, timestamp))
+                """, (self.db_symbol, timestamp))
 
                 rows = cursor.fetchall()
 
@@ -371,7 +372,7 @@ class AnalyticsEngine:
                 charm_exposure += charm * opt['open_interest'] * 100 * underlying_price
 
             gex_results.append({
-                'underlying': self.underlying,
+                'underlying': self.db_symbol,
                 'timestamp': timestamp,
                 'strike': strike,
                 'expiration': expiration,
@@ -520,7 +521,7 @@ class AnalyticsEngine:
         total_net_gex = sum(strike['net_gex'] for strike in gex_by_strike)
 
         summary = {
-            'underlying': self.underlying,
+            'underlying': self.db_symbol,
             'timestamp': timestamp,
             'max_gamma_strike': max_gamma_strike['strike'],
             'max_gamma_value': max_gamma_strike['net_gex'],
@@ -708,7 +709,7 @@ class AnalyticsEngine:
                         net_delta = EXCLUDED.net_delta,
                         underlying_price = EXCLUDED.underlying_price,
                         updated_at = NOW()
-                """, (self.underlying, timestamp, self.underlying, underlying_price))
+                """, (self.db_symbol, timestamp, self.db_symbol, underlying_price))
 
                 # 2. Refresh flow_by_strike
                 logger.debug("Refreshing flow_by_strike...")
@@ -773,7 +774,7 @@ class AnalyticsEngine:
                         net_delta = EXCLUDED.net_delta,
                         underlying_price = EXCLUDED.underlying_price,
                         updated_at = NOW()
-                """, (self.underlying, timestamp, self.underlying, underlying_price))
+                """, (self.db_symbol, timestamp, self.db_symbol, underlying_price))
 
                 # 3. Refresh flow_by_expiration
                 logger.debug("Refreshing flow_by_expiration...")
@@ -830,7 +831,7 @@ class AnalyticsEngine:
                         total_premium = EXCLUDED.total_premium,
                         underlying_price = EXCLUDED.underlying_price,
                         updated_at = NOW()
-                """, (self.underlying, timestamp, self.underlying, underlying_price))
+                """, (self.db_symbol, timestamp, self.db_symbol, underlying_price))
 
                 # 4. Refresh flow_smart_money
                 logger.debug("Refreshing flow_smart_money...")
@@ -913,7 +914,7 @@ class AnalyticsEngine:
                         unusual_activity_score = EXCLUDED.unusual_activity_score,
                         underlying_price = EXCLUDED.underlying_price,
                         updated_at = NOW()
-                """, (self.underlying, timestamp, self.underlying, underlying_price))
+                """, (self.db_symbol, timestamp, self.db_symbol, underlying_price))
 
                 conn.commit()
                 logger.info("✅ Flow cache tables refreshed successfully")

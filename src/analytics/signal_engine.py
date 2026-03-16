@@ -25,6 +25,7 @@ import pytz
 
 from src.database import db_connection
 from src.utils import get_logger
+from src.symbols import get_canonical_symbol
 
 logger = get_logger(__name__)
 
@@ -377,6 +378,7 @@ class SignalEngine:
 
     def __init__(self, underlying: str = "SPY"):
         self.underlying = underlying.upper()
+        self.db_symbol = get_canonical_symbol(self.underlying)  # canonical alias for DB queries (e.g. "SPX")
         self._last_accuracy_update: Optional[date] = None
 
     # ------------------------------------------------------------------
@@ -402,7 +404,7 @@ class SignalEngine:
                     WHERE underlying = %s
                     ORDER BY timestamp DESC
                     LIMIT 1
-                """, (self.underlying,))
+                """, (self.db_symbol,))
                 gex_row = cur.fetchone()
                 if not gex_row:
                     logger.warning("SignalEngine: no gex_summary rows found")
@@ -417,7 +419,7 @@ class SignalEngine:
                     WHERE symbol = %s
                     ORDER BY timestamp DESC
                     LIMIT 1
-                """, (self.underlying,))
+                """, (self.db_symbol,))
                 price_row = cur.fetchone()
                 if not price_row:
                     logger.warning("SignalEngine: no underlying_quotes rows found")
@@ -431,7 +433,7 @@ class SignalEngine:
                     WHERE symbol = %s
                     ORDER BY timestamp DESC
                     LIMIT 1
-                """, (self.underlying,))
+                """, (self.db_symbol,))
                 vwap_row = cur.fetchone()
                 vwap = float(vwap_row[0]) if vwap_row else 0.0
                 vwap_dev = float(vwap_row[1]) if vwap_row else 0.0
@@ -443,7 +445,7 @@ class SignalEngine:
                     WHERE symbol = %s
                     ORDER BY timestamp DESC
                     LIMIT 1
-                """, (self.underlying,))
+                """, (self.db_symbol,))
                 orb_row = cur.fetchone()
                 orb_status = orb_row[0] if orb_row else ""
 
@@ -454,7 +456,7 @@ class SignalEngine:
                     WHERE symbol = %s
                       AND timestamp >= NOW() - INTERVAL '30 minutes'
                     GROUP BY option_type
-                """, (self.underlying,))
+                """, (self.db_symbol,))
                 sm_call = sm_put = 0.0
                 for row in cur.fetchall():
                     if row[0] == 'C':
@@ -478,7 +480,7 @@ class SignalEngine:
                       )
                       AND oc.delta IS NOT NULL
                       AND oc.open_interest > 0
-                """, (self.underlying, self.underlying))
+                """, (self.db_symbol, self.db_symbol))
                 delta_row = cur.fetchone()
                 # Dealer delta is the negative of aggregate customer delta
                 dealer_net_delta = -(float(delta_row[0]) if delta_row and delta_row[0] else 0.0)
@@ -494,7 +496,7 @@ class SignalEngine:
                           AND oc.volume::float / oc.open_interest > 3.0
                           AND oc.timestamp >= NOW() - INTERVAL '30 minutes'
                     )
-                """, (self.underlying,))
+                """, (self.db_symbol,))
                 unusual_call_volume = bool(cur.fetchone()[0])
 
                 # --- Momentum divergence: 5-min price change + net option flow ---
@@ -507,7 +509,7 @@ class SignalEngine:
                     WHERE symbol = %s
                     ORDER BY timestamp DESC
                     LIMIT 1
-                """, (self.underlying,))
+                """, (self.db_symbol,))
                 pc5_row = cur.fetchone()
                 price_change_5min = float(pc5_row[0]) if (pc5_row and pc5_row[0]) else 0.0
 
@@ -519,7 +521,7 @@ class SignalEngine:
                     FROM flow_by_type
                     WHERE symbol = %s
                       AND timestamp >= NOW() - INTERVAL '5 minutes'
-                """, (self.underlying,))
+                """, (self.db_symbol,))
                 nof_row = cur.fetchone()
                 net_option_flow = float(nof_row[0]) if (nof_row and nof_row[0]) else 0.0
 
@@ -535,7 +537,7 @@ class SignalEngine:
                           FROM gex_by_strike
                           WHERE underlying = %s
                       )
-                """, (self.underlying, self.underlying))
+                """, (self.db_symbol, self.db_symbol))
                 vc_row = cur.fetchone()
                 vanna = float(vc_row[0]) if (vc_row and vc_row[0]) else 0.0
                 charm = float(vc_row[1]) if (vc_row and vc_row[1]) else 0.0
@@ -579,7 +581,7 @@ class SignalEngine:
                       AND timeframe       = %s
                       AND strength_bucket = %s
                       AND trade_date      >= CURRENT_DATE - %s
-                """, (self.underlying, tf, strength, lookback_days))
+                """, (self.db_symbol, tf, strength, lookback_days))
                 row = cur.fetchone()
                 if row and row[0] and row[0] > 0:
                     return round(float(row[1]) / float(row[0]), 4)
@@ -636,7 +638,7 @@ class SignalEngine:
                         orb_breakout_direction = EXCLUDED.orb_breakout_direction,
                         components             = EXCLUDED.components
                 """, (
-                    self.underlying, sig.timestamp, sig.timeframe,
+                    self.db_symbol, sig.timestamp, sig.timeframe,
                     sig.composite_score, sig.max_possible_score, sig.normalized_score,
                     sig.direction, sig.strength, sig.estimated_win_pct,
                     sig.trade_type, sig.trade_rationale, sig.target_expiry, sig.suggested_strikes,
@@ -675,7 +677,7 @@ class SignalEngine:
                     FROM trade_signals ts
                     WHERE ts.underlying = %s
                       AND DATE(ts.timestamp AT TIME ZONE 'America/New_York') = %s
-                """, (self.underlying, yesterday))
+                """, (self.db_symbol, yesterday))
                 signals = cur.fetchall()
                 if not signals:
                     self._last_accuracy_update = today
@@ -693,7 +695,7 @@ class SignalEngine:
                     WHERE symbol = %s
                       AND DATE(timestamp AT TIME ZONE 'America/New_York') = %s
                     LIMIT 1
-                """, (self.underlying, yesterday))
+                """, (self.db_symbol, yesterday))
                 outcome_row = cur.fetchone()
                 if not outcome_row:
                     return
@@ -723,7 +725,7 @@ class SignalEngine:
                             win_pct         = EXCLUDED.win_pct,
                             updated_at      = NOW()
                     """, (
-                        self.underlying, yesterday, tf, strength,
+                        self.db_symbol, yesterday, tf, strength,
                         total, correct,
                         round(correct / total, 4) if total > 0 else None,
                     ))
@@ -776,7 +778,7 @@ class SignalEngine:
                 sm_dir  = _sm_direction(ctx.smart_call_premium, ctx.smart_put_premium)
 
                 sig = TradeSignal(
-                    underlying=self.underlying,
+                    underlying=self.db_symbol,
                     timestamp=ctx.timestamp,
                     timeframe=tf,
                     composite_score=composite,
