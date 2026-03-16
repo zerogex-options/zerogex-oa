@@ -24,7 +24,6 @@ from .models import (
     MomentumDivergencePoint,
     FlowBuyingPressurePoint,
     UnderlyingQuote,
-    PreviousClose,
     SessionCloses,
     HealthStatus,
     MaxPainCurrent,
@@ -71,7 +70,17 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
-    lifespan=lifespan
+    lifespan=lifespan,
+    openapi_tags=[
+        {"name": "Health", "description": "API and database health checks"},
+        {"name": "GEX", "description": "Gamma Exposure (GEX) analytics"},
+        {"name": "Options Flow", "description": "Options flow and buying pressure data"},
+        {"name": "Market Data", "description": "Underlying and option quote data"},
+        {"name": "Max Pain", "description": "Max pain analysis"},
+        {"name": "Day Trading", "description": "Intraday trading signals: VWAP, ORB, dealer hedging, volume, momentum"},
+        {"name": "Trade Signals", "description": "Composite trade signal generation"},
+        {"name": "Volatility", "description": "Volatility gauge and regime analysis"},
+    ]
 )
 
 # CORS middleware
@@ -90,7 +99,7 @@ app.include_router(volatility_gauge_router)
 # Health Check
 # ============================================================================
 
-@app.get("/api/health", response_model=HealthStatus)
+@app.get("/api/health", response_model=HealthStatus, tags=["Health"])
 async def health_check():
     """Check API and database health"""
     try:
@@ -123,7 +132,7 @@ async def health_check():
 # GEX Endpoints
 # ============================================================================
 
-@app.get("/api/gex/summary", response_model=GEXSummary)
+@app.get("/api/gex/summary", response_model=GEXSummary, tags=["GEX"])
 async def get_gex_summary(symbol: str = Query(default="SPY")):
     """Get latest GEX summary"""
     try:
@@ -138,7 +147,7 @@ async def get_gex_summary(symbol: str = Query(default="SPY")):
         logger.error(f"Error fetching GEX summary: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/gex/by-strike", response_model=List[GEXByStrike])
+@app.get("/api/gex/by-strike", response_model=List[GEXByStrike], tags=["GEX"])
 async def get_gex_by_strike(
     symbol: str = Query(default="SPY"),
     limit: int = Query(default=50, le=200),
@@ -168,7 +177,7 @@ async def get_gex_by_strike(
         logger.error(f"Error fetching GEX by strike: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/gex/historical", response_model=List[GEXSummary])
+@app.get("/api/gex/historical", response_model=List[GEXSummary], tags=["GEX"])
 async def get_historical_gex(
     symbol: str = Query(default="SPY"),
     start_date: Optional[str] = None,
@@ -195,7 +204,7 @@ async def get_historical_gex(
         logger.error(f"Error fetching historical GEX: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/gex/heatmap")
+@app.get("/api/gex/heatmap", tags=["GEX"])
 async def get_gex_heatmap(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="5min"),
@@ -218,7 +227,7 @@ async def get_gex_heatmap(
 # Options Flow Endpoints
 # ============================================================================
 
-@app.get("/api/flow/by-type", response_model=List[FlowByTypePoint])
+@app.get("/api/flow/by-type", response_model=List[FlowByTypePoint], tags=["Options Flow"])
 async def get_flow_by_type(
     symbol: str = Query(default="SPY"),
     window_minutes: int = Query(default=60, ge=1, le=1440)
@@ -233,7 +242,7 @@ async def get_flow_by_type(
         logger.error(f"Error fetching flow by type: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/flow/by-strike", response_model=List[FlowByStrikePoint])
+@app.get("/api/flow/by-strike", response_model=List[FlowByStrikePoint], tags=["Options Flow"])
 async def get_flow_by_strike(
     symbol: str = Query(default="SPY"),
     window_minutes: int = Query(default=60, ge=1, le=1440),
@@ -250,7 +259,7 @@ async def get_flow_by_strike(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@app.get("/api/flow/by-expiration", response_model=List[FlowByExpirationPoint])
+@app.get("/api/flow/by-expiration", response_model=List[FlowByExpirationPoint], tags=["Options Flow"])
 async def get_flow_by_expiration(
     symbol: str = Query(default="SPY"),
     window_minutes: int = Query(default=60, ge=1, le=1440),
@@ -266,7 +275,7 @@ async def get_flow_by_expiration(
         logger.error(f"Error fetching flow by expiration: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/flow/smart-money", response_model=List[SmartMoneyFlowPoint])
+@app.get("/api/flow/smart-money", response_model=List[SmartMoneyFlowPoint], tags=["Options Flow"])
 async def get_smart_money_flow(
     symbol: str = Query(default="SPY"),
     window_minutes: int = Query(default=60, ge=1, le=1440),
@@ -282,7 +291,7 @@ async def get_smart_money_flow(
         logger.error(f"Error fetching smart money flow: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/flow/buying-pressure", response_model=List[FlowBuyingPressurePoint])
+@app.get("/api/flow/buying-pressure", response_model=List[FlowBuyingPressurePoint], tags=["Options Flow"])
 async def get_flow_buying_pressure(
     symbol: str = Query(default="SPY"),
     limit: int = Query(default=20, ge=1, le=500)
@@ -304,7 +313,7 @@ async def get_flow_buying_pressure(
 # Market Data Endpoints
 # ============================================================================
 
-@app.get("/api/market/quote", response_model=UnderlyingQuote)
+@app.get("/api/market/quote", response_model=UnderlyingQuote, tags=["Market Data"])
 async def get_current_quote(symbol: str = Query(default="SPY")):
     """Get current underlying quote"""
     try:
@@ -319,22 +328,7 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
         logger.error(f"Error fetching quote: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/market/previous-close", response_model=PreviousClose)
-async def get_previous_close(symbol: str = Query(default="SPY")):
-    """Get previous trading day's closing price"""
-    try:
-        data = await db_manager.get_previous_close(symbol)
-        if not data:
-            raise HTTPException(status_code=404, detail="No previous close data available")
-
-        return PreviousClose(**data)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching previous close: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.get("/api/market/session-closes", response_model=SessionCloses)
+@app.get("/api/market/session-closes", response_model=SessionCloses, tags=["Market Data"])
 async def get_session_closes(symbol: str = Query(default="SPY")):
     """
     Get the two most recently completed regular session closes (4:00 PM ET bars).
@@ -357,7 +351,7 @@ async def get_session_closes(symbol: str = Query(default="SPY")):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@app.get("/api/market/historical", response_model=List[UnderlyingQuote])
+@app.get("/api/market/historical", response_model=List[UnderlyingQuote], tags=["Market Data"])
 async def get_historical_quotes(
     symbol: str = Query(default="SPY"),
     start_date: Optional[str] = None,
@@ -384,7 +378,7 @@ async def get_historical_quotes(
         logger.error(f"Error fetching historical quotes: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/option/quote", response_model=OptionQuote)
+@app.get("/api/option/quote", response_model=OptionQuote, tags=["Market Data"])
 async def get_option_quote(
     underlying: str = Query(default="SPY", description="Underlying symbol, e.g. SPY"),
     strike: Optional[float] = Query(default=None, description="Strike price"),
@@ -406,7 +400,7 @@ async def get_option_quote(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@app.get("/api/max-pain/timeseries", response_model=List[MaxPainTimeseriesPoint])
+@app.get("/api/max-pain/timeseries", response_model=List[MaxPainTimeseriesPoint], tags=["Max Pain"])
 async def get_max_pain_timeseries(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="5min"),
@@ -425,7 +419,7 @@ async def get_max_pain_timeseries(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@app.get("/api/max-pain/current", response_model=MaxPainCurrent)
+@app.get("/api/max-pain/current", response_model=MaxPainCurrent, tags=["Max Pain"])
 async def get_max_pain_current(
     symbol: str = Query(default="SPY"),
     strike_limit: int = Query(default=200, ge=10, le=1000)
@@ -447,7 +441,7 @@ async def get_max_pain_current(
 # Day Trading Endpoints
 # ============================================================================
 
-@app.get("/api/trading/vwap-deviation")
+@app.get("/api/trading/vwap-deviation", tags=["Day Trading"])
 async def get_vwap_deviation(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
@@ -465,7 +459,7 @@ async def get_vwap_deviation(
         logger.error(f"Error fetching VWAP deviation: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/trading/opening-range")
+@app.get("/api/trading/opening-range", tags=["Day Trading"])
 async def get_opening_range(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
@@ -483,7 +477,7 @@ async def get_opening_range(
         logger.error(f"Error fetching ORB: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/trading/dealer-hedging")
+@app.get("/api/trading/dealer-hedging", tags=["Day Trading"])
 async def get_dealer_hedging(
     symbol: str = Query(default="SPY"),
     limit: int = Query(default=20, le=100)
@@ -500,7 +494,7 @@ async def get_dealer_hedging(
         logger.error(f"Error fetching dealer hedging: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/trading/volume-spikes")
+@app.get("/api/trading/volume-spikes", tags=["Day Trading"])
 async def get_volume_spikes(
     symbol: str = Query(default="SPY"),
     limit: int = Query(default=20, le=100)
@@ -517,7 +511,7 @@ async def get_volume_spikes(
         logger.error(f"Error fetching volume spikes: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/trading/momentum-divergence", response_model=List[MomentumDivergencePoint])
+@app.get("/api/trading/momentum-divergence", response_model=List[MomentumDivergencePoint], tags=["Day Trading"])
 async def get_momentum_divergence(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
