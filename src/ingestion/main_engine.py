@@ -52,14 +52,14 @@ class IngestionEngine:
         client: TradeStationClient,
         underlying: str = "SPY",
         num_expirations: int = 3,
-        strike_distance: float = 10.0,
+        strike_pct: float = 5.0,
     ):
         """Initialize main ingestion engine"""
         self.client = client
         self.underlying = underlying.upper()         # TradeStation API symbol (e.g. "$SPX.X")
         self.db_symbol = get_canonical_symbol(self.underlying)  # canonical alias for DB (e.g. "SPX")
         self.num_expirations = num_expirations
-        self.strike_distance = strike_distance
+        self.strike_pct = strike_pct
 
         self.running = False
 
@@ -465,7 +465,7 @@ class IngestionEngine:
             underlying=self.underlying,
             db_underlying=self.db_symbol,
             num_expirations=self.num_expirations,
-            strike_distance=self.strike_distance,
+            strike_pct=self.strike_pct,
         )
 
         if not stream_manager.initialize():
@@ -552,9 +552,9 @@ def main():
     parser.add_argument("--expirations", type=int,
                        default=int(os.getenv("INGEST_EXPIRATIONS", "3")),
                        help="Number of expirations (default: 3)")
-    parser.add_argument("--strike-distance", type=float,
-                       default=float(os.getenv("INGEST_STRIKE_DISTANCE", "10.0")),
-                       help="Strike distance (default: 10.0)")
+    parser.add_argument("--strike-pct", type=float,
+                       default=float(os.getenv("INGEST_STRIKE_PCT", "5.0")),
+                       help="Strike range as %% of price (default: 5.0)")
     parser.add_argument("--session-template", 
                        default=os.getenv("SESSION_TEMPLATE", "Default"),
                        choices=["Default", "USEQPre", "USEQ24Hour"],
@@ -587,7 +587,7 @@ def main():
             client=client,
             underlying=symbol,
             num_expirations=args.expirations,
-            strike_distance=args.strike_distance,
+            strike_pct=args.strike_pct,
         )
         engine.run()
 

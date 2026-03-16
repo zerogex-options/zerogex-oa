@@ -19,6 +19,7 @@ from src.ingestion.greeks_calculator import GreeksCalculator
 from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
 from src.validation import safe_float, safe_int, safe_datetime, validate_bar_data
+from src.symbols import resolve_option_root, get_canonical_symbol
 from src.config import (
     OPTION_BATCH_SIZE,
     DELAY_BETWEEN_BATCHES,
@@ -40,13 +41,15 @@ class BackfillManager:
         client: TradeStationClient,
         underlying: str = "SPY",
         num_expirations: int = 3,
-        strike_distance: float = 10.0
+        strike_pct: float = 5.0
     ):
         """Initialize backfill manager"""
         self.client = client
         self.underlying = underlying.upper()
+        self.db_symbol = get_canonical_symbol(self.underlying)
+        self.option_root = resolve_option_root(self.underlying)
         self.num_expirations = num_expirations
-        self.strike_distance = strike_distance
+        self.strike_pct = strike_pct
 
         # Greeks calculator (initialize if enabled)
         self.greeks_calculator = None
@@ -64,8 +67,9 @@ class BackfillManager:
         self.option_quotes_stored = 0
         self.greeks_calculated = 0
 
-        logger.info(f"Initialized BackfillManager for {underlying}")
-        logger.info(f"Config: {num_expirations} expirations, ±${strike_distance} strikes")
+        logger.info(f"Initialized BackfillManager for {self.db_symbol} "
+                    f"(API: {self.underlying}, option root: {self.option_root})")
+        logger.info(f"Config: {num_expirations} expirations, ±{strike_pct}% strikes")
 
     def _calculate_market_minutes(self, start_date: datetime, end_date: datetime) -> int:
         """
@@ -207,10 +211,10 @@ class BackfillManager:
     def _get_expirations_for_date(self, as_of_date: date) -> List[date]:
         """Get expirations available on a given date"""
         try:
-            all_expirations = self.client.get_option_expirations(self.underlying)
+            all_expirations = self.client.get_option_expirations(self.option_root)
 
             if not all_expirations:
-                logger.warning(f"No expirations found for {self.underlying}")
+                logger.warning(f"No expirations found for option root {self.option_root}")
                 return []
 
             # Filter to expirations >= as_of_date
@@ -236,8 +240,9 @@ class BackfillManager:
                 logger.warning(f"No strikes found for exp {exp_str}")
                 return []
 
-            min_strike = price - self.strike_distance
-            max_strike = price + self.strike_distance
+            half_range = price * self.strike_pct / 100.0
+            min_strike = price - half_range
+            max_strike = price + half_range
 
             nearby_strikes = [
                 strike for strike in all_strikes
@@ -583,9 +588,9 @@ def main():
     parser.add_argument("--expirations", type=int,
                        default=int(os.getenv("BACKFILL_EXPIRATIONS", "3")),
                        help="Number of expirations to track (default: 3)")
-    parser.add_argument("--strike-distance", type=float,
-                       default=float(os.getenv("BACKFILL_STRIKE_DISTANCE", "10.0")),
-                       help="Strike distance from price (default: 10.0)")
+    parser.add_argument("--strike-pct", type=float,
+                       default=float(os.getenv("BACKFILL_STRIKE_PCT", "5.0")),
+                       help="Strike range as %% of price (default: 5.0)")
     parser.add_argument("--sample-every", type=int,
                        default=int(os.getenv("BACKFILL_SAMPLE_EVERY", "1")),
                        help="Sample options every N bars (default: 1)")
@@ -606,7 +611,7 @@ def main():
     print(f"Lookback: {args.lookback_days} days")
     print(f"Interval: {args.interval}{args.unit}")
     print(f"Expirations: {args.expirations}")
-    print(f"Strike Distance: ±${args.strike_distance}")
+    print(f"Strike Range: ±{args.strike_pct}% of price")
     print(f"Sample Every: {args.sample_every} bar(s)")
     print(f"Greeks: {'ENABLED' if GREEKS_ENABLED else 'DISABLED'}")
     print("="*80 + "\n")
@@ -624,7 +629,7 @@ def main():
         client=client,
         underlying=args.underlying,
         num_expirations=args.expirations,
-        strike_distance=args.strike_distance
+        strike_pct=args.strike_pct,
     )
 
     try:

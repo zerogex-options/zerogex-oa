@@ -523,7 +523,7 @@ run-ingest-alias: ## Run ingestion engine with alias-aware INPUT (INPUT, ALIASES
 	fi; \
 	$(VENV_PYTHON) -m src.ingestion.main_engine --underlyings "$$RESOLVED" \
 		$(if $(EXPIRATIONS),--expirations '$(EXPIRATIONS)') \
-		$(if $(STRIKE_DISTANCE),--strike-distance '$(STRIKE_DISTANCE)') \
+		$(if $(STRIKE_PCT),--strike-pct '$(STRIKE_PCT)') \
 		$(if $(DEBUG),--debug)
 
 .PHONY: run-analytics

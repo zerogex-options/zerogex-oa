@@ -20,13 +20,13 @@ from src.validation import (
     safe_float, safe_int, safe_datetime,
     validate_bar_data, get_market_session
 )
+from src.symbols import resolve_option_root
 from src.config import (
     OPTION_BATCH_SIZE,
     MARKET_HOURS_POLL_INTERVAL,
     EXTENDED_HOURS_POLL_INTERVAL,
     CLOSED_HOURS_POLL_INTERVAL,
     STRIKE_RECALC_INTERVAL,
-    PRICE_MOVE_THRESHOLD,
     STRIKE_CLEANUP_INTERVAL,
     SESSION_TEMPLATE,
 )
@@ -46,13 +46,15 @@ class StreamManager:
         underlying: str = "SPY",
         db_underlying: str = None,
         num_expirations: int = 3,
-        strike_distance: float = 10.0,
+        strike_pct: float = 5.0,
     ):
         """Initialize stream manager"""
         self.client = client
-        self.underlying = underlying.upper()           # TradeStation API symbol (e.g. "$SPX.X")
+        self.underlying = underlying.upper()           # TradeStation API symbol for underlying (e.g. "$SPX.X")
         self.db_underlying = (db_underlying or underlying).upper()  # canonical alias for DB (e.g. "SPX")
+        self.option_root = resolve_option_root(self.underlying)  # option root for expirations/chains (e.g. "SPXW")
         self.num_expirations = num_expirations
+        self.strike_pct = strike_pct  # ± percentage of price to track (e.g. 5.0 = ±5%)
         self.strike_distance = strike_distance
 
         # Track state
@@ -242,12 +244,18 @@ class StreamManager:
             return False
 
     def _get_target_expirations(self) -> List[date]:
-        """Get target expiration dates"""
+        """Get target expiration dates.
+
+        Uses self.option_root (e.g. "SPXW") rather than self.underlying (e.g. "$SPX.X")
+        so that TradeStation returns only the expirations valid for the configured option
+        root. For SPXW this yields weekly expirations only; for standard roots it returns
+        the same set as querying the underlying directly.
+        """
         try:
-            all_expirations = self.client.get_option_expirations(self.underlying)
+            all_expirations = self.client.get_option_expirations(self.option_root)
 
             if not all_expirations:
-                logger.warning(f"No expirations found for {self.underlying}")
+                logger.warning(f"No expirations found for option root {self.option_root}")
                 return []
 
             # Filter to future expirations
@@ -261,7 +269,7 @@ class StreamManager:
             # Take first N
             target_exps = future_expirations[:self.num_expirations]
 
-            logger.info(f"Target expirations: {[str(exp) for exp in target_exps]}")
+            logger.info(f"Target expirations ({self.option_root}): {[str(exp) for exp in target_exps]}")
             return target_exps
 
         except Exception as e:
@@ -269,7 +277,7 @@ class StreamManager:
             return []
 
     def _get_strikes_near_price(self, expiration: date, current_price: float) -> List[float]:
-        """Get strikes within configured distance"""
+        """Get strikes within ±strike_pct% of current price."""
         try:
             exp_str = expiration.strftime("%m-%d-%Y")
             all_strikes = self.client.get_option_strikes(self.underlying, expiration=exp_str)
@@ -278,16 +286,18 @@ class StreamManager:
                 logger.warning(f"No strikes found for exp {exp_str}")
                 return []
 
-            min_strike = current_price - self.strike_distance
-            max_strike = current_price + self.strike_distance
+            half_range = current_price * self.strike_pct / 100.0
+            min_strike = current_price - half_range
+            max_strike = current_price + half_range
 
             nearby_strikes = [
                 strike for strike in all_strikes
                 if min_strike <= strike <= max_strike
             ]
 
-            logger.debug(f"Exp {exp_str}: {len(nearby_strikes)} strikes in range "
-                        f"[${min_strike:.2f}, ${max_strike:.2f}]")
+            logger.debug(f"Exp {exp_str}: {len(nearby_strikes)} strikes in "
+                        f"[${min_strike:.2f}, ${max_strike:.2f}] "
+                        f"(±{self.strike_pct}% of ${current_price:.2f})")
 
             return sorted(nearby_strikes)
 
@@ -553,21 +563,16 @@ class StreamManager:
                     except Exception as e:
                         logger.error(f"Error fetching options batch: {e}")
 
-                # Check if we should recalculate strikes
-                if iteration % STRIKE_RECALC_INTERVAL == 0:
+                # Recalibrate strike range periodically — re-centers ±strike_pct% around
+                # the latest price unconditionally, so the tracked window always stays current.
+                if iteration % STRIKE_RECALC_INTERVAL == 0 and iteration > 0:
                     if self.current_price:
-                        # Check if we have a previous price to compare
-                        # If first time, just log current price
-                        if iteration == STRIKE_RECALC_INTERVAL:
-                            logger.debug(f"Current price: ${self.current_price:.2f}")
-                        else:
-                            # Get fresh price data
-                            new_price = self._get_underlying_price()
-                            if new_price and abs(new_price - self.current_price) > PRICE_MOVE_THRESHOLD:
-                                logger.info(f"Price moved from ${self.current_price:.2f} to ${new_price:.2f}")
-                                logger.info("Recalculating tracked strikes...")
-                                self.current_price = new_price
-                                self.tracked_option_symbols = self._build_option_symbols()
+                        new_price = self._get_underlying_price()
+                        if new_price:
+                            self.current_price = new_price
+                            self.tracked_option_symbols = self._build_option_symbols()
+                            logger.info(f"Recalibrated strikes around ${self.current_price:.2f} "
+                                       f"(±{self.strike_pct}%)")
 
                 # Cleanup expired strikes periodically
                 if iteration % STRIKE_CLEANUP_INTERVAL == 0:
@@ -597,14 +602,14 @@ def main():
     load_dotenv()
 
     parser = argparse.ArgumentParser(description="Stream real-time options data")
-    parser.add_argument("--underlying", default=os.getenv("STREAM_UNDERLYING", "SPY"),
-                       help="Underlying symbol (default: SPY)")
+    parser.add_argument("--underlying", default=os.getenv("INGEST_UNDERLYING", "SPY"),
+                       help="Underlying symbol or alias (default: SPY)")
     parser.add_argument("--expirations", type=int,
-                       default=int(os.getenv("STREAM_EXPIRATIONS", "3")),
+                       default=int(os.getenv("INGEST_EXPIRATIONS", "3")),
                        help="Number of expirations to track (default: 3)")
-    parser.add_argument("--strike-distance", type=float,
-                       default=float(os.getenv("STREAM_STRIKE_DISTANCE", "10.0")),
-                       help="Strike distance from price (default: 10.0)")
+    parser.add_argument("--strike-pct", type=float,
+                       default=float(os.getenv("INGEST_STRIKE_PCT", "5.0")),
+                       help="Strike range as %% of price (default: 5.0)")
     parser.add_argument("--max-iterations", type=int,
                        help="Maximum iterations (default: unlimited)")
     parser.add_argument("--debug", action="store_true",
@@ -622,7 +627,7 @@ def main():
     print("="*80)
     print(f"Underlying: {args.underlying}")
     print(f"Expirations: {args.expirations}")
-    print(f"Strike Distance: ±${args.strike_distance}")
+    print(f"Strike Range: ±{args.strike_pct}% of price")
     if args.max_iterations:
         print(f"Max Iterations: {args.max_iterations}")
     else:
@@ -642,7 +647,7 @@ def main():
         client=client,
         underlying=args.underlying,
         num_expirations=args.expirations,
-        strike_distance=args.strike_distance
+        strike_pct=args.strike_pct,
     )
 
     # Initialize
