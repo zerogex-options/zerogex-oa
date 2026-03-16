@@ -14,6 +14,7 @@ PSQL = PGPASSFILE=~/.pgpass psql "sslmode=require host=$(DB_HOST) port=$(DB_PORT
 # Service names
 INGESTION_SERVICE = zerogex-oa-ingestion
 ANALYTICS_SERVICE = zerogex-oa-analytics
+API_SERVICE = $(API_SERVICE)
 
 # Python virtual environment
 VENV_PYTHON = venv/bin/python
@@ -66,6 +67,7 @@ help: ## Show this help message
 	@echo "  make api-stop            - Stop API systemd service"
 	@echo "  make api-restart         - Restart API systemd service"
 	@echo "  make api-status          - Check API service status"
+	@echo "  make api-health          - Show API service health and recent errors"
 	@echo "  make api-logs            - View API logs (live)"
 	@echo "  make api-logs-error      - View API error logs only"
 	@echo "  make api-test            - Test API endpoints"
@@ -181,6 +183,19 @@ help: ## Show this help message
 	@echo "  make schema-verify      - Verify schema components exist"
 	@echo "  make schema-backup      - Backup current schema to file"
 	@echo ""
+	@echo "$(GREEN)DB Table Tail:$(NC)"
+	@echo "  make db-tail-symbols              - Last 20 rows from symbols"
+	@echo "  make db-tail-underlying-quotes    - Last 20 rows from underlying_quotes"
+	@echo "  make db-tail-option-chains        - Last 20 rows from option_chains"
+	@echo "  make db-tail-gex-summary          - Last 20 rows from gex_summary"
+	@echo "  make db-tail-gex-by-strike        - Last 20 rows from gex_by_strike"
+	@echo "  make db-tail-flow-by-type         - Last 20 rows from flow_by_type"
+	@echo "  make db-tail-flow-by-strike       - Last 20 rows from flow_by_strike"
+	@echo "  make db-tail-flow-by-expiration   - Last 20 rows from flow_by_expiration"
+	@echo "  make db-tail-flow-smart-money     - Last 20 rows from flow_smart_money"
+	@echo "  make db-tail-trade-signals        - Last 20 rows from trade_signals"
+	@echo "  make db-tail-signal-accuracy      - Last 20 rows from signal_accuracy"
+	@echo ""
 	@echo "$(GREEN)Maintenance:$(NC)"
 	@echo "  make vacuum             - Vacuum analyze all tables"
 	@echo "  make size               - Show table sizes"
@@ -276,11 +291,11 @@ ingestion-health: ## Check ingestion service health and recent errors
 	@echo ""
 	@echo "Recent Errors (last 10):"
 	@echo "------------------------"
-	@sudo journalctl -u $(INGESTION_SERVICE) -p err -n 10 --no-pager || echo "No recent errors"
+	@sudo journalctl -u $(INGESTION_SERVICE) -n 500 --no-pager | grep -i " ERROR" | tail -10 || echo "No recent errors"
 	@echo ""
 	@echo "Recent Warnings (last 5):"
 	@echo "-------------------------"
-	@sudo journalctl -u $(INGESTION_SERVICE) -p warning -n 5 --no-pager || echo "No recent warnings"
+	@sudo journalctl -u $(INGESTION_SERVICE) -n 500 --no-pager | grep -i " WARNING" | tail -5 || echo "No recent warnings"
 
 # =============================================================================
 # Analytics Service Management
@@ -347,11 +362,11 @@ analytics-health: ## Check analytics service health and recent errors
 	@echo ""
 	@echo "Recent Errors (last 10):"
 	@echo "------------------------"
-	@sudo journalctl -u $(ANALYTICS_SERVICE) -p err -n 10 --no-pager || echo "No recent errors"
+	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 500 --no-pager | grep -i " ERROR" | tail -10 || echo "No recent errors"
 	@echo ""
 	@echo "Recent Warnings (last 5):"
 	@echo "-------------------------"
-	@sudo journalctl -u $(ANALYTICS_SERVICE) -p warning -n 5 --no-pager || echo "No recent warnings"
+	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 500 --no-pager | grep -i " WARNING" | tail -5 || echo "No recent warnings"
 
 # =============================================================================
 # Logs
@@ -2048,6 +2063,65 @@ query: ## Run custom query (use: make query SQL="SELECT * FROM ...")
 	@$(PSQL) -c "$(SQL)"
 
 # =============================================================================
+# DB Table Tail (most recent 20 rows)
+# =============================================================================
+
+.PHONY: db-tail-symbols
+db-tail-symbols: ## Show 20 most recent rows from symbols
+	@echo "$(BLUE)=== symbols (last 20) ===$(NC)"
+	@$(PSQL) -c "SELECT * FROM symbols ORDER BY created_at DESC LIMIT 20;"
+
+.PHONY: db-tail-underlying-quotes
+db-tail-underlying-quotes: ## Show 20 most recent rows from underlying_quotes
+	@echo "$(BLUE)=== underlying_quotes (last 20) ===$(NC)"
+	@$(PSQL) -c "SELECT * FROM underlying_quotes ORDER BY timestamp DESC LIMIT 20;"
+
+.PHONY: db-tail-option-chains
+db-tail-option-chains: ## Show 20 most recent rows from option_chains
+	@echo "$(BLUE)=== option_chains (last 20) ===$(NC)"
+	@$(PSQL) -c "SELECT * FROM option_chains ORDER BY timestamp DESC LIMIT 20;"
+
+.PHONY: db-tail-gex-summary
+db-tail-gex-summary: ## Show 20 most recent rows from gex_summary
+	@echo "$(BLUE)=== gex_summary (last 20) ===$(NC)"
+	@$(PSQL) -c "SELECT * FROM gex_summary ORDER BY timestamp DESC LIMIT 20;"
+
+.PHONY: db-tail-gex-by-strike
+db-tail-gex-by-strike: ## Show 20 most recent rows from gex_by_strike
+	@echo "$(BLUE)=== gex_by_strike (last 20) ===$(NC)"
+	@$(PSQL) -c "SELECT * FROM gex_by_strike ORDER BY timestamp DESC LIMIT 20;"
+
+.PHONY: db-tail-flow-by-type
+db-tail-flow-by-type: ## Show 20 most recent rows from flow_by_type
+	@echo "$(BLUE)=== flow_by_type (last 20) ===$(NC)"
+	@$(PSQL) -c "SELECT * FROM flow_by_type ORDER BY timestamp DESC LIMIT 20;"
+
+.PHONY: db-tail-flow-by-strike
+db-tail-flow-by-strike: ## Show 20 most recent rows from flow_by_strike
+	@echo "$(BLUE)=== flow_by_strike (last 20) ===$(NC)"
+	@$(PSQL) -c "SELECT * FROM flow_by_strike ORDER BY timestamp DESC LIMIT 20;"
+
+.PHONY: db-tail-flow-by-expiration
+db-tail-flow-by-expiration: ## Show 20 most recent rows from flow_by_expiration
+	@echo "$(BLUE)=== flow_by_expiration (last 20) ===$(NC)"
+	@$(PSQL) -c "SELECT * FROM flow_by_expiration ORDER BY timestamp DESC LIMIT 20;"
+
+.PHONY: db-tail-flow-smart-money
+db-tail-flow-smart-money: ## Show 20 most recent rows from flow_smart_money
+	@echo "$(BLUE)=== flow_smart_money (last 20) ===$(NC)"
+	@$(PSQL) -c "SELECT * FROM flow_smart_money ORDER BY timestamp DESC LIMIT 20;"
+
+.PHONY: db-tail-trade-signals
+db-tail-trade-signals: ## Show 20 most recent rows from trade_signals
+	@echo "$(BLUE)=== trade_signals (last 20) ===$(NC)"
+	@$(PSQL) -c "SELECT * FROM trade_signals ORDER BY timestamp DESC LIMIT 20;"
+
+.PHONY: db-tail-signal-accuracy
+db-tail-signal-accuracy: ## Show 20 most recent rows from signal_accuracy
+	@echo "$(BLUE)=== signal_accuracy (last 20) ===$(NC)"
+	@$(PSQL) -c "SELECT * FROM signal_accuracy ORDER BY trade_date DESC LIMIT 20;"
+
+# =============================================================================
 # Advanced Queries
 # =============================================================================
 
@@ -2175,34 +2249,64 @@ api-prod: ## Run API server in production mode
 .PHONY: api-start
 api-start: ## Start API systemd service
 	@echo "$(BLUE)=== Starting API Service ===$(NC)"
-	@sudo systemctl start zerogex-oa-api
+	@sudo systemctl start $(API_SERVICE)
 	@sleep 2
-	@sudo systemctl status zerogex-oa-api --no-pager
+	@sudo systemctl status $(API_SERVICE) --no-pager
 
 .PHONY: api-stop
 api-stop: ## Stop API systemd service
 	@echo "$(BLUE)=== Stopping API Service ===$(NC)"
-	@sudo systemctl stop zerogex-oa-api
+	@sudo systemctl stop $(API_SERVICE)
 	@echo "$(GREEN)✅ API service stopped$(NC)"
 
 .PHONY: api-restart
 api-restart: ## Restart API systemd service
 	@echo "$(BLUE)=== Restarting API Service ===$(NC)"
-	@sudo systemctl restart zerogex-oa-api
+	@sudo systemctl restart $(API_SERVICE)
 	@sleep 2
-	@sudo systemctl status zerogex-oa-api --no-pager
+	@sudo systemctl status $(API_SERVICE) --no-pager
 
 .PHONY: api-status
 api-status: ## Check API service status
-	@sudo systemctl status zerogex-oa-api --no-pager
+	@sudo systemctl status $(API_SERVICE) --no-pager
+
+.PHONY: api-health
+api-health: ## Check API service health and recent errors
+	@echo "$(GREEN)API Service Health Check$(NC)"
+	@echo "===================="
+	@echo ""
+	@if systemctl is-active --quiet $(API_SERVICE); then \
+		echo "Status: $(GREEN)ACTIVE$(NC)"; \
+	else \
+		echo "Status: $(RED)INACTIVE$(NC)"; \
+	fi
+	@echo ""
+	@UPTIME=$$(systemctl show $(API_SERVICE) --property=ActiveEnterTimestamp --value); \
+	if [ -n "$$UPTIME" ]; then \
+		echo "Started: $$UPTIME"; \
+	fi
+	@echo ""
+	@MEMORY=$$(systemctl show $(API_SERVICE) --property=MemoryCurrent --value); \
+	if [ "$$MEMORY" != "[not set]" ] && [ -n "$$MEMORY" ]; then \
+		MEMORY_MB=$$(($$MEMORY / 1024 / 1024)); \
+		echo "Memory: $${MEMORY_MB} MB"; \
+	fi
+	@echo ""
+	@echo "Recent Errors (last 10):"
+	@echo "------------------------"
+	@sudo journalctl -u $(API_SERVICE) -n 500 --no-pager | grep -i " ERROR" | tail -10 || echo "No recent errors"
+	@echo ""
+	@echo "Recent Warnings (last 5):"
+	@echo "-------------------------"
+	@sudo journalctl -u $(API_SERVICE) -n 500 --no-pager | grep -i " WARNING" | tail -5 || echo "No recent warnings"
 
 .PHONY: api-logs
 api-logs: ## View API service logs
-	@sudo journalctl -u zerogex-oa-api -f
+	@sudo journalctl -u $(API_SERVICE) -f
 
 .PHONY: api-logs-error
 api-logs-error: ## View API error logs only
-	@sudo journalctl -u zerogex-oa-api -p err -f
+	@sudo journalctl -u $(API_SERVICE) -p err -f
 
 .PHONY: api-test
 api-test: ## Test ALL API endpoints
@@ -2278,7 +2382,7 @@ staging-smoke: ## Run post-deploy staging smoke checklist
 	@echo "$(YELLOW)Checking systemd services...$(NC)"
 	@systemctl is-active --quiet $(INGESTION_SERVICE) && echo "$(GREEN)✅ Ingestion service active$(NC)" || (echo "$(RED)❌ Ingestion service inactive$(NC)" && exit 1)
 	@systemctl is-active --quiet $(ANALYTICS_SERVICE) && echo "$(GREEN)✅ Analytics service active$(NC)" || (echo "$(RED)❌ Analytics service inactive$(NC)" && exit 1)
-	@systemctl is-active --quiet zerogex-oa-api && echo "$(GREEN)✅ API service active$(NC)" || (echo "$(RED)❌ API service inactive$(NC)" && exit 1)
+	@systemctl is-active --quiet $(API_SERVICE) && echo "$(GREEN)✅ API service active$(NC)" || (echo "$(RED)❌ API service inactive$(NC)" && exit 1)
 	@echo ""
 	@echo "$(YELLOW)Checking core API endpoints...$(NC)"
 	@curl -fsS "http://localhost:8000/api/health" > /dev/null && echo "$(GREEN)✅ /api/health$(NC)" || (echo "$(RED)❌ /api/health$(NC)" && exit 1)
@@ -2291,8 +2395,8 @@ staging-smoke: ## Run post-deploy staging smoke checklist
 .PHONY: api-install-service
 api-install-service: ## Install API as systemd service
 	@echo "$(BLUE)=== Installing API Systemd Service ===$(NC)"
-	@sudo cp setup/systemd/zerogex-oa-api.service /etc/systemd/system/
+	@sudo cp setup/systemd/$(API_SERVICE).service /etc/systemd/system/
 	@sudo systemctl daemon-reload
-	@sudo systemctl enable zerogex-oa-api
+	@sudo systemctl enable $(API_SERVICE)
 	@echo "$(GREEN)✅ API service installed$(NC)"
 	@echo "$(YELLOW)Start with: make api-start$(NC)"
