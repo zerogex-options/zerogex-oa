@@ -87,7 +87,7 @@ class IngestionEngine:
         self.errors_count = 0
 
         logger.info(f"Initialized IngestionEngine for {underlying}")
-        logger.info(f"Config: {num_expirations} expirations, ±${strike_distance} strikes")
+        logger.info(f"Config: {num_expirations} expirations, ±{strike_pct}% strikes")
 
         # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -505,7 +505,7 @@ class IngestionEngine:
         logger.info("="*80)
         logger.info(f"Underlying: {self.underlying}")
         logger.info(f"Expirations: {self.num_expirations}")
-        logger.info(f"Strike Distance: ±${self.strike_distance}")
+        logger.info(f"Strike Range: ±{self.strike_pct}%")
         logger.info(f"Greeks: {'ENABLED' if GREEKS_ENABLED else 'DISABLED'}")
         logger.info("")
         logger.info("NOTE: This engine only streams forward-looking data.")

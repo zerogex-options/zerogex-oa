@@ -55,7 +55,6 @@ class StreamManager:
         self.option_root = resolve_option_root(self.underlying)  # option root for expirations/chains (e.g. "SPXW")
         self.num_expirations = num_expirations
         self.strike_pct = strike_pct  # ± percentage of price to track (e.g. 5.0 = ±5%)
-        self.strike_distance = strike_distance
 
         # Track state
         self.current_price: Optional[float] = None
@@ -70,7 +69,7 @@ class StreamManager:
         self.last_expiration_refresh: Optional[datetime] = None
 
         logger.info(f"Initialized StreamManager for {underlying}")
-        logger.info(f"Config: {num_expirations} expirations, ±${strike_distance} strikes")
+        logger.info(f"Config: {num_expirations} expirations, ±{strike_pct}% strikes")
 
     def _fetch_underlying_bar(self) -> Optional[Dict[str, Any]]:
         """
