@@ -1581,7 +1581,7 @@ class DatabaseManager:
                 SUM(correct_signals)::int AS correct
             FROM signal_accuracy
             WHERE underlying  = $1
-              AND trade_date  >= CURRENT_DATE - $2
+              AND trade_date  >= CURRENT_DATE - ($2 * INTERVAL '1 day')
             GROUP BY timeframe, strength_bucket
         """
         try:
