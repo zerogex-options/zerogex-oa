@@ -8,8 +8,9 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, date as date_type, time as time_type
+from datetime import datetime, timedelta, date as date_type
 import logging
+import os
 from typing import List, Optional, Literal
 import pytz
 
@@ -318,62 +319,93 @@ async def get_flow_buying_pressure(
 # ============================================================================
 
 _ET = pytz.timezone("US/Eastern")
-
-# NYSE observed holidays through 2027.  Update annually.
-_NYSE_HOLIDAYS: set[date_type] = {
-    # 2024
-    date_type(2024, 1, 1), date_type(2024, 1, 15), date_type(2024, 2, 19),
-    date_type(2024, 3, 29), date_type(2024, 5, 27), date_type(2024, 6, 19),
-    date_type(2024, 7, 4), date_type(2024, 9, 2), date_type(2024, 11, 28),
-    date_type(2024, 12, 25),
-    # 2025
-    date_type(2025, 1, 1), date_type(2025, 1, 9), date_type(2025, 1, 20),
-    date_type(2025, 2, 17), date_type(2025, 4, 18), date_type(2025, 5, 26),
-    date_type(2025, 6, 19), date_type(2025, 7, 4), date_type(2025, 9, 1),
-    date_type(2025, 11, 27), date_type(2025, 12, 25),
-    # 2026
-    date_type(2026, 1, 1), date_type(2026, 1, 19), date_type(2026, 2, 16),
-    date_type(2026, 4, 3), date_type(2026, 5, 25), date_type(2026, 6, 19),
-    date_type(2026, 7, 3), date_type(2026, 9, 7), date_type(2026, 11, 26),
-    date_type(2026, 12, 25),
-    # 2027
-    date_type(2027, 1, 1), date_type(2027, 1, 18), date_type(2027, 2, 15),
-    date_type(2027, 3, 26), date_type(2027, 5, 31), date_type(2027, 6, 18),
-    date_type(2027, 7, 5), date_type(2027, 9, 6), date_type(2027, 11, 25),
-    date_type(2027, 12, 24),
-}
-
-_MARKET_OPEN  = time_type(9, 30)
-_MARKET_CLOSE = time_type(16, 0)
-_PRE_OPEN     = time_type(4, 0)
-_AH_CLOSE     = time_type(20, 0)
+_SOFT_CLOSE_WINDOW = timedelta(seconds=30)
 
 
-def get_market_session(asset_type: Optional[str] = None) -> str:
+def _load_nyse_holidays() -> set[date_type]:
+    """Load NYSE holiday dates from the NYSE_HOLIDAYS env var (comma-separated YYYY-MM-DD)."""
+    raw = os.getenv("NYSE_HOLIDAYS", "")
+    holidays: set[date_type] = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            holidays.add(date_type.fromisoformat(token))
+        except ValueError:
+            logger.warning(f"Invalid date in NYSE_HOLIDAYS env var, skipping: {token!r}")
+    if not holidays:
+        logger.warning("NYSE_HOLIDAYS env var is empty — no holiday filtering will occur")
+    return holidays
+
+
+_NYSE_HOLIDAYS: set[date_type] = _load_nyse_holidays()
+
+
+def _to_et(ts: datetime) -> datetime:
+    """Normalize a datetime (UTC-aware or naive) to US/Eastern."""
+    if ts.tzinfo is None:
+        return _ET.localize(ts)
+    return ts.astimezone(_ET)
+
+
+def get_market_session(asset_type: Optional[str], latest_timestamp: Optional[datetime]) -> str:
     """Return the current US equity market session label.
 
-    asset_type='INDEX' — no pre-market or after-hours session.
+    Boundaries (all times ET, exact to the second):
+      pre-market   04:00:00 – 09:29:59   (non-INDEX only)
+      open         09:30:00 – 15:59:59
+      after-hours  16:00:00 – 19:59:59   (non-INDEX only)
+      closed       all other times, weekends, NYSE holidays
+
+    Soft-close behaviour:
+      INDEX        : [16:00:00, 16:00:30) — stay "open" while latest quote
+                     was updated at or after 16:00:00; otherwise "closed".
+      non-INDEX    : [20:00:00, 20:00:30) — stay "after-hours" while latest
+                     quote was updated at or after 20:00:00; otherwise "closed".
     """
     now_et = datetime.now(_ET)
     today = now_et.date()
-    t = now_et.time()
 
     # Weekends and NYSE holidays are always closed
     if today.weekday() >= 5 or today in _NYSE_HOLIDAYS:
         return "closed"
 
-    if _MARKET_OPEN <= t < _MARKET_CLOSE:
+    # Build exact-second ET boundary datetimes for today
+    def _boundary(h: int, m: int, s: int = 0) -> datetime:
+        return _ET.localize(datetime(today.year, today.month, today.day, h, m, s))
+
+    pre_open_dt    = _boundary(4, 0)
+    market_open_dt = _boundary(9, 30)
+    market_close_dt = _boundary(16, 0)
+    ah_close_dt    = _boundary(20, 0)
+
+    is_index = asset_type == "INDEX"
+
+    # Cash session — same for all instrument types
+    if market_open_dt <= now_et < market_close_dt:
         return "open"
 
-    # Index instruments have no extended session
-    if asset_type == "INDEX":
+    if is_index:
+        # Soft close: [16:00:00, 16:00:30)
+        if market_close_dt <= now_et < market_close_dt + _SOFT_CLOSE_WINDOW:
+            if latest_timestamp and _to_et(latest_timestamp) >= market_close_dt:
+                return "open"
+            return "closed"
         return "closed"
 
-    if _PRE_OPEN <= t < _MARKET_OPEN:
+    # Non-index extended sessions
+    if pre_open_dt <= now_et < market_open_dt:
         return "pre-market"
 
-    if _MARKET_CLOSE <= t < _AH_CLOSE:
+    if market_close_dt <= now_et < ah_close_dt:
         return "after-hours"
+
+    # Soft close: [20:00:00, 20:00:30)
+    if ah_close_dt <= now_et < ah_close_dt + _SOFT_CLOSE_WINDOW:
+        if latest_timestamp and _to_et(latest_timestamp) >= ah_close_dt:
+            return "after-hours"
+        return "closed"
 
     return "closed"
 
@@ -392,7 +424,7 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
 
         data = dict(data)
         asset_type = data.pop("asset_type", None)
-        data["session"] = get_market_session(asset_type)
+        data["session"] = get_market_session(asset_type, data.get("timestamp"))
         return UnderlyingQuote(**data)
     except HTTPException:
         raise
