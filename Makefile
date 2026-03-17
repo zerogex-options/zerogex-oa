@@ -16,6 +16,9 @@ INGESTION_SERVICE = zerogex-oa-ingestion
 ANALYTICS_SERVICE = zerogex-oa-analytics
 API_SERVICE = zerogex-oa-api
 
+# Optional filter for db-tail targets (e.g. make db-tail-option-chains UNDERLYING=SPY)
+UNDERLYING ?=
+
 # Python virtual environment
 VENV_PYTHON = venv/bin/python
 
@@ -2067,59 +2070,59 @@ query: ## Run custom query (use: make query SQL="SELECT * FROM ...")
 # =============================================================================
 
 .PHONY: db-tail-symbols
-db-tail-symbols: ## Show 20 most recent rows from symbols
+db-tail-symbols: ## Show 20 most recent rows from symbols (UNDERLYING=SPY to filter)
 	@echo "$(BLUE)=== symbols (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM symbols ORDER BY created_at DESC LIMIT 20;"
+	@$(PSQL) -c "SELECT * FROM symbols $(if $(UNDERLYING),WHERE symbol='$(UNDERLYING)',) ORDER BY created_at DESC LIMIT 20;"
 
 .PHONY: db-tail-underlying-quotes
-db-tail-underlying-quotes: ## Show 20 most recent rows from underlying_quotes
+db-tail-underlying-quotes: ## Show 20 most recent rows from underlying_quotes (UNDERLYING=SPY to filter)
 	@echo "$(BLUE)=== underlying_quotes (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM underlying_quotes ORDER BY timestamp DESC LIMIT 20;"
+	@$(PSQL) -c "SELECT * FROM underlying_quotes $(if $(UNDERLYING),WHERE symbol='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
 
 .PHONY: db-tail-option-chains
-db-tail-option-chains: ## Show 20 most recent rows from option_chains
+db-tail-option-chains: ## Show 20 most recent rows from option_chains (UNDERLYING=SPY to filter)
 	@echo "$(BLUE)=== option_chains (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM option_chains ORDER BY timestamp DESC LIMIT 20;"
+	@$(PSQL) -c "SELECT * FROM option_chains $(if $(UNDERLYING),WHERE underlying='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
 
 .PHONY: db-tail-gex-summary
-db-tail-gex-summary: ## Show 20 most recent rows from gex_summary
+db-tail-gex-summary: ## Show 20 most recent rows from gex_summary (UNDERLYING=SPY to filter)
 	@echo "$(BLUE)=== gex_summary (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM gex_summary ORDER BY timestamp DESC LIMIT 20;"
+	@$(PSQL) -c "SELECT * FROM gex_summary $(if $(UNDERLYING),WHERE underlying='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
 
 .PHONY: db-tail-gex-by-strike
-db-tail-gex-by-strike: ## Show 20 most recent rows from gex_by_strike
+db-tail-gex-by-strike: ## Show 20 most recent rows from gex_by_strike (UNDERLYING=SPY to filter)
 	@echo "$(BLUE)=== gex_by_strike (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM gex_by_strike ORDER BY timestamp DESC LIMIT 20;"
+	@$(PSQL) -c "SELECT * FROM gex_by_strike $(if $(UNDERLYING),WHERE underlying='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
 
 .PHONY: db-tail-flow-by-type
-db-tail-flow-by-type: ## Show 20 most recent rows from flow_by_type
+db-tail-flow-by-type: ## Show 20 most recent rows from flow_by_type (UNDERLYING=SPY to filter)
 	@echo "$(BLUE)=== flow_by_type (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM flow_by_type ORDER BY timestamp DESC LIMIT 20;"
+	@$(PSQL) -c "SELECT * FROM flow_by_type $(if $(UNDERLYING),WHERE symbol='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
 
 .PHONY: db-tail-flow-by-strike
-db-tail-flow-by-strike: ## Show 20 most recent rows from flow_by_strike
+db-tail-flow-by-strike: ## Show 20 most recent rows from flow_by_strike (UNDERLYING=SPY to filter)
 	@echo "$(BLUE)=== flow_by_strike (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM flow_by_strike ORDER BY timestamp DESC LIMIT 20;"
+	@$(PSQL) -c "SELECT * FROM flow_by_strike $(if $(UNDERLYING),WHERE symbol='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
 
 .PHONY: db-tail-flow-by-expiration
-db-tail-flow-by-expiration: ## Show 20 most recent rows from flow_by_expiration
+db-tail-flow-by-expiration: ## Show 20 most recent rows from flow_by_expiration (UNDERLYING=SPY to filter)
 	@echo "$(BLUE)=== flow_by_expiration (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM flow_by_expiration ORDER BY timestamp DESC LIMIT 20;"
+	@$(PSQL) -c "SELECT * FROM flow_by_expiration $(if $(UNDERLYING),WHERE symbol='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
 
 .PHONY: db-tail-flow-smart-money
-db-tail-flow-smart-money: ## Show 20 most recent rows from flow_smart_money
+db-tail-flow-smart-money: ## Show 20 most recent rows from flow_smart_money (UNDERLYING=SPY to filter)
 	@echo "$(BLUE)=== flow_smart_money (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM flow_smart_money ORDER BY timestamp DESC LIMIT 20;"
+	@$(PSQL) -c "SELECT * FROM flow_smart_money $(if $(UNDERLYING),WHERE symbol='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
 
 .PHONY: db-tail-trade-signals
-db-tail-trade-signals: ## Show 20 most recent rows from trade_signals
+db-tail-trade-signals: ## Show 20 most recent rows from trade_signals (UNDERLYING=SPY to filter)
 	@echo "$(BLUE)=== trade_signals (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM trade_signals ORDER BY timestamp DESC LIMIT 20;"
+	@$(PSQL) -c "SELECT * FROM trade_signals $(if $(UNDERLYING),WHERE underlying='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
 
 .PHONY: db-tail-signal-accuracy
-db-tail-signal-accuracy: ## Show 20 most recent rows from signal_accuracy
+db-tail-signal-accuracy: ## Show 20 most recent rows from signal_accuracy (UNDERLYING=SPY to filter)
 	@echo "$(BLUE)=== signal_accuracy (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM signal_accuracy ORDER BY trade_date DESC LIMIT 20;"
+	@$(PSQL) -c "SELECT * FROM signal_accuracy $(if $(UNDERLYING),WHERE underlying='$(UNDERLYING)',) ORDER BY trade_date DESC LIMIT 20;"
 
 # =============================================================================
 # Advanced Queries
