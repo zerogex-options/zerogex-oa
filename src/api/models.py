@@ -87,6 +87,7 @@ class UnderlyingQuote(BaseModel):
     low: Decimal
     close: Decimal
     volume: Optional[int] = None
+    session: Optional[str] = None
 
     class Config:
         from_attributes = True

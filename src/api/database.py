@@ -1606,17 +1606,19 @@ class DatabaseManager:
     async def get_latest_quote(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
         """Get latest underlying quote"""
         query = """
-            SELECT 
-                timestamp,
-                symbol,
-                open,
-                high,
-                low,
-                close,
-                up_volume + down_volume as volume
-            FROM underlying_quotes
-            WHERE symbol = $1
-            ORDER BY timestamp DESC
+            SELECT
+                uq.timestamp,
+                uq.symbol,
+                uq.open,
+                uq.high,
+                uq.low,
+                uq.close,
+                uq.up_volume + uq.down_volume AS volume,
+                s.asset_type
+            FROM underlying_quotes uq
+            LEFT JOIN symbols s ON s.symbol = uq.symbol
+            WHERE uq.symbol = $1
+            ORDER BY uq.timestamp DESC
             LIMIT 1
         """
 

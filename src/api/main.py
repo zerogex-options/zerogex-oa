@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date as date_type, time as time_type
 import logging
 from typing import List, Optional, Literal
 import pytz
@@ -314,6 +314,71 @@ async def get_flow_buying_pressure(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 # ============================================================================
+# Market Session Helper
+# ============================================================================
+
+_ET = pytz.timezone("US/Eastern")
+
+# NYSE observed holidays through 2027.  Update annually.
+_NYSE_HOLIDAYS: set[date_type] = {
+    # 2024
+    date_type(2024, 1, 1), date_type(2024, 1, 15), date_type(2024, 2, 19),
+    date_type(2024, 3, 29), date_type(2024, 5, 27), date_type(2024, 6, 19),
+    date_type(2024, 7, 4), date_type(2024, 9, 2), date_type(2024, 11, 28),
+    date_type(2024, 12, 25),
+    # 2025
+    date_type(2025, 1, 1), date_type(2025, 1, 9), date_type(2025, 1, 20),
+    date_type(2025, 2, 17), date_type(2025, 4, 18), date_type(2025, 5, 26),
+    date_type(2025, 6, 19), date_type(2025, 7, 4), date_type(2025, 9, 1),
+    date_type(2025, 11, 27), date_type(2025, 12, 25),
+    # 2026
+    date_type(2026, 1, 1), date_type(2026, 1, 19), date_type(2026, 2, 16),
+    date_type(2026, 4, 3), date_type(2026, 5, 25), date_type(2026, 6, 19),
+    date_type(2026, 7, 3), date_type(2026, 9, 7), date_type(2026, 11, 26),
+    date_type(2026, 12, 25),
+    # 2027
+    date_type(2027, 1, 1), date_type(2027, 1, 18), date_type(2027, 2, 15),
+    date_type(2027, 3, 26), date_type(2027, 5, 31), date_type(2027, 6, 18),
+    date_type(2027, 7, 5), date_type(2027, 9, 6), date_type(2027, 11, 25),
+    date_type(2027, 12, 24),
+}
+
+_MARKET_OPEN  = time_type(9, 30)
+_MARKET_CLOSE = time_type(16, 0)
+_PRE_OPEN     = time_type(4, 0)
+_AH_CLOSE     = time_type(20, 0)
+
+
+def get_market_session(asset_type: Optional[str] = None) -> str:
+    """Return the current US equity market session label.
+
+    asset_type='INDEX' — no pre-market or after-hours session.
+    """
+    now_et = datetime.now(_ET)
+    today = now_et.date()
+    t = now_et.time()
+
+    # Weekends and NYSE holidays are always closed
+    if today.weekday() >= 5 or today in _NYSE_HOLIDAYS:
+        return "closed"
+
+    if _MARKET_OPEN <= t < _MARKET_CLOSE:
+        return "open"
+
+    # Index instruments have no extended session
+    if asset_type == "INDEX":
+        return "closed"
+
+    if _PRE_OPEN <= t < _MARKET_OPEN:
+        return "pre-market"
+
+    if _MARKET_CLOSE <= t < _AH_CLOSE:
+        return "after-hours"
+
+    return "closed"
+
+
+# ============================================================================
 # Market Data Endpoints
 # ============================================================================
 
@@ -325,6 +390,9 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
         if not data:
             raise HTTPException(status_code=404, detail="No quote data available")
 
+        data = dict(data)
+        asset_type = data.pop("asset_type", None)
+        data["session"] = get_market_session(asset_type)
         return UnderlyingQuote(**data)
     except HTTPException:
         raise
