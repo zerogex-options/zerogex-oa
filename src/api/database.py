@@ -2112,6 +2112,32 @@ class DatabaseManager:
                 raise
 
         query = """
+            WITH bars AS (
+                SELECT
+                    DATE_TRUNC('minute', timestamp)                         AS timestamp,
+                    underlying,
+                    strike,
+                    expiration,
+                    option_type,
+                    (array_agg(last              ORDER BY timestamp DESC))[1] AS last,
+                    (array_agg(bid               ORDER BY timestamp DESC))[1] AS bid,
+                    (array_agg(ask               ORDER BY timestamp DESC))[1] AS ask,
+                    MAX(volume)                                               AS volume,
+                    MAX(open_interest)                                        AS open_interest,
+                    (array_agg(implied_volatility ORDER BY timestamp DESC))[1] AS implied_volatility,
+                    (array_agg(delta             ORDER BY timestamp DESC))[1] AS delta,
+                    (array_agg(gamma             ORDER BY timestamp DESC))[1] AS gamma,
+                    (array_agg(theta             ORDER BY timestamp DESC))[1] AS theta,
+                    (array_agg(vega              ORDER BY timestamp DESC))[1] AS vega,
+                    MAX(updated_at)                                           AS updated_at
+                FROM option_chains
+                WHERE underlying = $1
+                  AND strike = $2
+                  AND expiration = $3
+                  AND option_type = $4
+                  AND DATE(timestamp AT TIME ZONE 'America/New_York') = $5
+                GROUP BY 1, 2, 3, 4, 5
+            )
             SELECT
                 timestamp,
                 underlying,
@@ -2128,13 +2154,13 @@ class DatabaseManager:
                 gamma,
                 theta,
                 vega,
-                updated_at
-            FROM option_chains
-            WHERE underlying = $1
-              AND strike = $2
-              AND expiration = $3
-              AND option_type = $4
-              AND DATE(timestamp AT TIME ZONE 'America/New_York') = $5
+                updated_at,
+                GREATEST(
+                    COALESCE(volume, 0)
+                        - COALESCE(LAG(volume) OVER (ORDER BY timestamp), 0),
+                    0
+                )::bigint AS volume_delta
+            FROM bars
             ORDER BY timestamp ASC
         """
         try:
