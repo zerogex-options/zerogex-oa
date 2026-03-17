@@ -2064,3 +2064,85 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error fetching option quote: {e}")
             raise
+
+    async def get_option_contract_history(
+        self,
+        underlying: str,
+        strike: float,
+        expiration: str,
+        option_type: str,
+    ) -> List[Dict[str, Any]]:
+        """Get all rows for a specific option contract.
+
+        If the regular market session is currently open (weekday 09:30–16:00 ET)
+        returns today's data; otherwise returns data for the most recent date
+        that has rows for this contract in the database.
+        """
+        from datetime import time as _time
+        expiration_date = datetime.strptime(expiration, "%Y-%m-%d").date()
+
+        now_et = datetime.now(_ET)
+        today = now_et.date()
+        session_is_open = (
+            today.weekday() < 5
+            and _time(9, 30) <= now_et.time() < _time(16, 0)
+        )
+
+        if session_is_open:
+            target_date = today
+        else:
+            date_query = """
+                SELECT MAX(DATE(timestamp AT TIME ZONE 'America/New_York')) AS latest_date
+                FROM option_chains
+                WHERE underlying = $1
+                  AND strike = $2
+                  AND expiration = $3
+                  AND option_type = $4
+            """
+            try:
+                async with self.pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        date_query, underlying, float(strike), expiration_date, option_type
+                    )
+                    if not row or row["latest_date"] is None:
+                        return []
+                    target_date = row["latest_date"]
+            except Exception as e:
+                logger.error(f"Error finding most recent date for option contract: {e}")
+                raise
+
+        query = """
+            SELECT
+                timestamp,
+                underlying,
+                strike,
+                expiration,
+                option_type,
+                last,
+                bid,
+                ask,
+                volume,
+                open_interest,
+                implied_volatility,
+                delta,
+                gamma,
+                theta,
+                vega,
+                updated_at
+            FROM option_chains
+            WHERE underlying = $1
+              AND strike = $2
+              AND expiration = $3
+              AND option_type = $4
+              AND DATE(timestamp AT TIME ZONE 'America/New_York') = $5
+            ORDER BY timestamp ASC
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    query, underlying, float(strike), expiration_date, option_type, target_date
+                )
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error fetching option contract history: {e}")
+            raise
