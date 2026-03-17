@@ -294,11 +294,11 @@ ingestion-health: ## Check ingestion service health and recent errors
 	@echo ""
 	@echo "Recent Errors (last 10):"
 	@echo "------------------------"
-	@sudo journalctl -u $(INGESTION_SERVICE) -n 500 --no-pager | grep -i " ERROR" | tail -10 || echo "No recent errors"
+	@sudo journalctl -u $(INGESTION_SERVICE) -n 500 --no-pager | grep " - ERROR - " | tail -10 || echo "No recent errors"
 	@echo ""
 	@echo "Recent Warnings (last 5):"
 	@echo "-------------------------"
-	@sudo journalctl -u $(INGESTION_SERVICE) -n 500 --no-pager | grep -i " WARNING" | tail -5 || echo "No recent warnings"
+	@sudo journalctl -u $(INGESTION_SERVICE) -n 500 --no-pager | grep " - WARNING - " | tail -5 || echo "No recent warnings"
 
 # =============================================================================
 # Analytics Service Management
@@ -365,11 +365,11 @@ analytics-health: ## Check analytics service health and recent errors
 	@echo ""
 	@echo "Recent Errors (last 10):"
 	@echo "------------------------"
-	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 500 --no-pager | grep -i " ERROR" | tail -10 || echo "No recent errors"
+	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 500 --no-pager | grep " - ERROR - " | tail -10 || echo "No recent errors"
 	@echo ""
 	@echo "Recent Warnings (last 5):"
 	@echo "-------------------------"
-	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 500 --no-pager | grep -i " WARNING" | tail -5 || echo "No recent warnings"
+	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 500 --no-pager | grep " - WARNING - " | tail -5 || echo "No recent warnings"
 
 # =============================================================================
 # Logs
@@ -2297,11 +2297,11 @@ api-health: ## Check API service health and recent errors
 	@echo ""
 	@echo "Recent Errors (last 10):"
 	@echo "------------------------"
-	@sudo journalctl -u $(API_SERVICE) -n 500 --no-pager | grep -i " ERROR" | tail -10 || echo "No recent errors"
+	@sudo journalctl -u $(API_SERVICE) -n 500 --no-pager | grep " - ERROR - " | tail -10 || echo "No recent errors"
 	@echo ""
 	@echo "Recent Warnings (last 5):"
 	@echo "-------------------------"
-	@sudo journalctl -u $(API_SERVICE) -n 500 --no-pager | grep -i " WARNING" | tail -5 || echo "No recent warnings"
+	@sudo journalctl -u $(API_SERVICE) -n 500 --no-pager | grep " - WARNING - " | tail -5 || echo "No recent warnings"
 
 .PHONY: api-logs
 api-logs: ## View API service logs
