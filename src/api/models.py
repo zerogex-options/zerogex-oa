@@ -221,9 +221,9 @@ class PreviousClose(BaseModel):
 class SessionCloses(BaseModel):
     symbol: str
     current_session_close: Decimal
-    current_session_close_ts: datetime
+    current_session_close_ts: Optional[datetime]
     prior_session_close: Decimal
-    prior_session_close_ts: datetime
+    prior_session_close_ts: Optional[datetime]
 
     class Config:
         from_attributes = True

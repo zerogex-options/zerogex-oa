@@ -1738,14 +1738,44 @@ class DatabaseManager:
         try:
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(query, symbol)
-                if not row or row['current_session_close'] is None or row['prior_session_close'] is None:
+
+                current_close = row['current_session_close'] if row else None
+                current_ts = row['current_session_close_ts'] if row else None
+                prior_close = row['prior_session_close'] if row else None
+                prior_ts = row['prior_session_close_ts'] if row else None
+
+                # Fall back to the most recent quote price if a session close is missing
+                if current_close is None or prior_close is None:
+                    fallback = await conn.fetchrow(
+                        """
+                        SELECT close, timestamp
+                        FROM underlying_quotes
+                        WHERE symbol = $1
+                        ORDER BY timestamp DESC
+                        LIMIT 1
+                        """,
+                        symbol,
+                    )
+                    fallback_price = fallback['close'] if fallback else None
+                    fallback_ts = fallback['timestamp'] if fallback else None
+
+                    if current_close is None:
+                        current_close = fallback_price
+                        current_ts = fallback_ts
+
+                    if prior_close is None:
+                        prior_close = current_close
+                        prior_ts = current_ts
+
+                if current_close is None:
                     return None
+
                 return {
                     'symbol': symbol,
-                    'current_session_close': row['current_session_close'],
-                    'current_session_close_ts': row['current_session_close_ts'],
-                    'prior_session_close': row['prior_session_close'],
-                    'prior_session_close_ts': row['prior_session_close_ts'],
+                    'current_session_close': current_close,
+                    'current_session_close_ts': current_ts,
+                    'prior_session_close': prior_close,
+                    'prior_session_close_ts': prior_ts,
                 }
         except Exception as e:
             logger.error(f"Error fetching session closes: {e}")
