@@ -226,11 +226,12 @@ def _momentum(bars: List[Dict[str, Any]]) -> float:
        so that a single noisy bar does not dominate the reading.
     2. Normalise the composite RoC by the rolling 1-bar RoC std derived from
        the cache itself (realised per-bar volatility of VIX).
-    3. Map the z-score using a ±2σ range so that genuinely rare moves are
-       required to reach the extremes:
-         z = –2 → 0   (sharply falling)
+    3. Map the z-score using a ±4σ range so that only truly extreme moves
+       reach the extremes (e.g. market dropping whole percentage points in
+       minutes):
+         z = –4 → 0   (sharply falling)
          z =  0 → 5   (flat / stable)
-         z = +2 → 10  (sharply rising)
+         z = +4 → 10  (sharply rising)
        Clamped to [0, 10].
 
     Lookback windows (5-min bars) and weights:
@@ -280,9 +281,9 @@ def _momentum(bars: List[Dict[str, Any]]) -> float:
         variance = sum((x - mean) ** 2 for x in one_bar_rocs) / (n - 1)
         sigma = max(math.sqrt(variance) if variance > 0 else 0.001, 0.001)
 
-    # Map ±2σ → 0–10 (previously ±1σ → 0–10, halving sensitivity)
+    # Map ±4σ → 0–10 (widened from ±2σ to reduce sensitivity further)
     z_score = composite_roc / sigma
-    score = 5.0 + 2.5 * z_score
+    score = 5.0 + 1.25 * z_score
     return round(max(0.0, min(10.0, score)), 2)
 
 
