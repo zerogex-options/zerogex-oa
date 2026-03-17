@@ -7,6 +7,7 @@ FastAPI backend for serving analytics data to the frontend
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, date as date_type
 import logging
@@ -342,70 +343,100 @@ def _load_nyse_holidays() -> set[date_type]:
 _NYSE_HOLIDAYS: set[date_type] = _load_nyse_holidays()
 
 
-def _to_et(ts: datetime) -> datetime:
-    """Normalize a datetime (UTC-aware or naive) to US/Eastern."""
-    if ts.tzinfo is None:
-        return _ET.localize(ts)
-    return ts.astimezone(_ET)
+class _SoftCloseTracker:
+    """Rolling window of the last 3 close prices for a symbol.
+
+    Used to evaluate soft-close stability: if the last 3 consecutive
+    price observations are all identical the price is considered stable
+    and the session can transition to 'closed'.
+    """
+
+    __slots__ = ("_prices",)
+
+    def __init__(self) -> None:
+        self._prices: deque = deque(maxlen=3)
+
+    def record(self, price) -> None:
+        if price is not None:
+            self._prices.append(price)
+
+    def is_stable(self) -> bool:
+        """True when 3 consecutive identical prices have been observed."""
+        return len(self._prices) >= 3 and len(set(self._prices)) == 1
 
 
-def get_market_session(asset_type: Optional[str], latest_timestamp: Optional[datetime]) -> str:
+# Per-symbol soft-close trackers (populated lazily on first quote request)
+_soft_close_trackers: dict[str, _SoftCloseTracker] = {}
+
+
+def get_market_session(asset_type: Optional[str], price_is_stable: bool = False) -> str:
     """Return the current US equity market session label.
 
-    Boundaries (all times ET, exact to the second):
-      pre-market   04:00:00 – 09:29:59   (non-INDEX only)
-      open         09:30:00 – 15:59:59
-      after-hours  16:00:00 – 19:59:59   (non-INDEX only)
-      closed       all other times, weekends, NYSE holidays
+    Session boundaries (all times US/Eastern, exact to the second):
 
-    Soft-close behaviour:
-      INDEX        : [16:00:00, 16:00:30) — stay "open" while latest quote
-                     was updated at or after 16:00:00; otherwise "closed".
-      non-INDEX    : [20:00:00, 20:00:30) — stay "after-hours" while latest
-                     quote was updated at or after 20:00:00; otherwise "closed".
+      Both types
+        < 04:00:00            closed
+        >= 20:00:30           closed
+        weekends / holidays   closed
+
+      non-INDEX only
+        04:00:00 – 09:29:59   pre-market
+        16:00:00 – 19:59:59   after-hours
+        20:00:00 – 20:00:29   after-hours (soft close: closed once price_is_stable)
+
+      INDEX only
+        16:00:00 – 16:00:29   open (soft close: closed once price_is_stable)
+        16:00:30 – 19:59:59   closed
+
+      Both types
+        09:30:00 – 15:59:59   open
     """
     now_et = datetime.now(_ET)
     today = now_et.date()
 
-    # Weekends and NYSE holidays are always closed
     if today.weekday() >= 5 or today in _NYSE_HOLIDAYS:
         return "closed"
 
-    # Build exact-second ET boundary datetimes for today
     def _boundary(h: int, m: int, s: int = 0) -> datetime:
         return _ET.localize(datetime(today.year, today.month, today.day, h, m, s))
 
-    pre_open_dt    = _boundary(4, 0)
-    market_open_dt = _boundary(9, 30)
+    pre_open_dt     = _boundary(4, 0)
+    market_open_dt  = _boundary(9, 30)
     market_close_dt = _boundary(16, 0)
-    ah_close_dt    = _boundary(20, 0)
+    ah_close_dt     = _boundary(20, 0)
 
     is_index = asset_type == "INDEX"
 
-    # Cash session — same for all instrument types
+    # Before pre-market
+    if now_et < pre_open_dt:
+        return "closed"
+
+    # Pre-market (non-INDEX only)
+    if pre_open_dt <= now_et < market_open_dt:
+        return "pre-market" if not is_index else "closed"
+
+    # Cash session — open for both types
     if market_open_dt <= now_et < market_close_dt:
         return "open"
 
-    if is_index:
-        # Soft close: [16:00:00, 16:00:30)
-        if market_close_dt <= now_et < market_close_dt + _SOFT_CLOSE_WINDOW:
-            if latest_timestamp and _to_et(latest_timestamp) >= market_close_dt:
-                return "open"
-            return "closed"
-        return "closed"
-
-    # Non-index extended sessions
-    if pre_open_dt <= now_et < market_open_dt:
-        return "pre-market"
-
-    if market_close_dt <= now_et < ah_close_dt:
-        return "after-hours"
-
-    # Soft close: [20:00:00, 20:00:30)
-    if ah_close_dt <= now_et < ah_close_dt + _SOFT_CLOSE_WINDOW:
-        if latest_timestamp and _to_et(latest_timestamp) >= ah_close_dt:
+    # Soft-close window at market close
+    if market_close_dt <= now_et < market_close_dt + _SOFT_CLOSE_WINDOW:
+        if is_index:
+            # INDEX: soft close from 16:00:00 — closed once price is stable
+            return "closed" if price_is_stable else "open"
+        else:
+            # non-INDEX: hard transition to after-hours at exactly 16:00:00
             return "after-hours"
-        return "closed"
+
+    # [16:00:30, 20:00:00) window
+    if market_close_dt + _SOFT_CLOSE_WINDOW <= now_et < ah_close_dt:
+        return "closed" if is_index else "after-hours"
+
+    # Soft-close window at after-hours close (non-INDEX only)
+    if ah_close_dt <= now_et < ah_close_dt + _SOFT_CLOSE_WINDOW:
+        if is_index:
+            return "closed"
+        return "closed" if price_is_stable else "after-hours"
 
     return "closed"
 
@@ -424,7 +455,12 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
 
         data = dict(data)
         asset_type = data.pop("asset_type", None)
-        data["session"] = get_market_session(asset_type, data.get("timestamp"))
+
+        # Update per-symbol soft-close tracker and evaluate stability
+        tracker = _soft_close_trackers.setdefault(symbol, _SoftCloseTracker())
+        tracker.record(data.get("close"))
+
+        data["session"] = get_market_session(asset_type, tracker.is_stable())
         return UnderlyingQuote(**data)
     except HTTPException:
         raise
