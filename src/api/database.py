@@ -2112,34 +2112,26 @@ class DatabaseManager:
                 raise
 
         query = """
-            WITH bars AS (
+            WITH ranked AS (
                 SELECT
-                    DATE_TRUNC('minute', timestamp)                         AS timestamp,
-                    underlying,
-                    strike,
-                    expiration,
-                    option_type,
-                    (array_agg(last              ORDER BY timestamp DESC))[1] AS last,
-                    (array_agg(bid               ORDER BY timestamp DESC))[1] AS bid,
-                    (array_agg(ask               ORDER BY timestamp DESC))[1] AS ask,
-                    MAX(volume)                                               AS volume,
-                    MAX(open_interest)                                        AS open_interest,
-                    (array_agg(implied_volatility ORDER BY timestamp DESC))[1] AS implied_volatility,
-                    (array_agg(delta             ORDER BY timestamp DESC))[1] AS delta,
-                    (array_agg(gamma             ORDER BY timestamp DESC))[1] AS gamma,
-                    (array_agg(theta             ORDER BY timestamp DESC))[1] AS theta,
-                    (array_agg(vega              ORDER BY timestamp DESC))[1] AS vega,
-                    MAX(updated_at)                                           AS updated_at
+                    *,
+                    DATE_TRUNC('minute', timestamp)                          AS bar_ts,
+                    MAX(volume)      OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_volume,
+                    MAX(open_interest) OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_oi,
+                    MAX(updated_at)  OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_updated_at,
+                    ROW_NUMBER()     OVER (
+                        PARTITION BY DATE_TRUNC('minute', timestamp)
+                        ORDER BY timestamp DESC
+                    ) AS rn
                 FROM option_chains
                 WHERE underlying = $1
                   AND strike = $2
                   AND expiration = $3
                   AND option_type = $4
                   AND DATE(timestamp AT TIME ZONE 'America/New_York') = $5
-                GROUP BY 1, 2, 3, 4, 5
             )
             SELECT
-                timestamp,
+                bar_ts             AS timestamp,
                 underlying,
                 strike,
                 expiration,
@@ -2147,20 +2139,21 @@ class DatabaseManager:
                 last,
                 bid,
                 ask,
-                volume,
-                open_interest,
+                bar_volume         AS volume,
+                bar_oi             AS open_interest,
                 implied_volatility,
                 delta,
                 gamma,
                 theta,
                 vega,
-                updated_at,
+                bar_updated_at     AS updated_at,
                 GREATEST(
-                    COALESCE(volume, 0)
-                        - COALESCE(LAG(volume) OVER (ORDER BY timestamp), 0),
+                    COALESCE(bar_volume, 0)
+                        - COALESCE(LAG(bar_volume) OVER (ORDER BY bar_ts), 0),
                     0
-                )::bigint AS volume_delta
-            FROM bars
+                )::bigint          AS volume_delta
+            FROM ranked
+            WHERE rn = 1
             ORDER BY timestamp ASC
         """
         try:
