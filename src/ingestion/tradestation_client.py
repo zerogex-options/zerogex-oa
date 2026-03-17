@@ -134,6 +134,23 @@ class TradeStationClient:
                 logger.error(f"Response: {response.text}")
                 response.raise_for_status()
 
+            # Handle quota exceeded (403) - do not retry, log actionable guidance
+            if response.status_code == 403:
+                try:
+                    error_data = response.json()
+                    if error_data.get("Message", "").lower() == "quota exceeded":
+                        logger.error(
+                            "TradeStation API quota exceeded (403). Your account has hit its daily "
+                            "API call limit. Reduce INGEST_STRIKE_COUNT (e.g. 5) or INGEST_EXPIRATIONS "
+                            "to lower call volume. Quota resets daily."
+                        )
+                        response.raise_for_status()
+                except Exception:
+                    pass
+                logger.error(f"API request failed: {response.status_code}")
+                logger.error(f"Response: {response.text}")
+                response.raise_for_status()
+
             # Handle rate limiting with exponential backoff
             if response.status_code == 429:
                 if retry_count < API_RETRY_ATTEMPTS - 1:

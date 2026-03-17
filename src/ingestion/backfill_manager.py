@@ -41,7 +41,7 @@ class BackfillManager:
         client: TradeStationClient,
         underlying: str = "SPY",
         num_expirations: int = 3,
-        strike_pct: float = 5.0
+        num_strikes: int = 10,
     ):
         """Initialize backfill manager"""
         self.client = client
@@ -49,7 +49,7 @@ class BackfillManager:
         self.db_symbol = get_canonical_symbol(self.underlying)
         self.option_root = resolve_option_root(self.underlying)
         self.num_expirations = num_expirations
-        self.strike_pct = strike_pct
+        self.num_strikes = num_strikes  # number of strikes to track on each side of current price
 
         # Greeks calculator (initialize if enabled)
         self.greeks_calculator = None
@@ -69,7 +69,7 @@ class BackfillManager:
 
         logger.info(f"Initialized BackfillManager for {self.db_symbol} "
                     f"(API: {self.underlying}, option root: {self.option_root})")
-        logger.info(f"Config: {num_expirations} expirations, ±{strike_pct}% strikes")
+        logger.info(f"Config: {num_expirations} expirations, {num_strikes} strikes each side")
 
     def _calculate_market_minutes(self, start_date: datetime, end_date: datetime) -> int:
         """
@@ -244,16 +244,10 @@ class BackfillManager:
                 logger.warning(f"No strikes found for exp {exp_str}")
                 return []
 
-            half_range = price * self.strike_pct / 100.0
-            min_strike = price - half_range
-            max_strike = price + half_range
+            below = sorted([s for s in all_strikes if s <= price], reverse=True)[:self.num_strikes]
+            above = sorted([s for s in all_strikes if s > price])[:self.num_strikes]
 
-            nearby_strikes = [
-                strike for strike in all_strikes
-                if min_strike <= strike <= max_strike
-            ]
-
-            return sorted(nearby_strikes)
+            return sorted(below + above)
 
         except Exception as e:
             logger.error(f"Error fetching strikes: {e}", exc_info=True)
@@ -592,9 +586,9 @@ def main():
     parser.add_argument("--expirations", type=int,
                        default=int(os.getenv("BACKFILL_EXPIRATIONS", "3")),
                        help="Number of expirations to track (default: 3)")
-    parser.add_argument("--strike-pct", type=float,
-                       default=float(os.getenv("BACKFILL_STRIKE_PCT", "5.0")),
-                       help="Strike range as %% of price (default: 5.0)")
+    parser.add_argument("--num-strikes", type=int,
+                       default=int(os.getenv("BACKFILL_STRIKE_COUNT", "10")),
+                       help="Number of strikes to track on each side of current price (default: 10)")
     parser.add_argument("--sample-every", type=int,
                        default=int(os.getenv("BACKFILL_SAMPLE_EVERY", "1")),
                        help="Sample options every N bars (default: 1)")
@@ -615,7 +609,7 @@ def main():
     print(f"Lookback: {args.lookback_days} days")
     print(f"Interval: {args.interval}{args.unit}")
     print(f"Expirations: {args.expirations}")
-    print(f"Strike Range: ±{args.strike_pct}% of price")
+    print(f"Strikes Each Side: {args.num_strikes}")
     print(f"Sample Every: {args.sample_every} bar(s)")
     print(f"Greeks: {'ENABLED' if GREEKS_ENABLED else 'DISABLED'}")
     print("="*80 + "\n")
@@ -633,7 +627,7 @@ def main():
         client=client,
         underlying=args.underlying,
         num_expirations=args.expirations,
-        strike_pct=args.strike_pct,
+        num_strikes=args.num_strikes,
     )
 
     try:

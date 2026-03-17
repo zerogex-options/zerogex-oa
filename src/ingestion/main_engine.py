@@ -52,14 +52,14 @@ class IngestionEngine:
         client: TradeStationClient,
         underlying: str = "SPY",
         num_expirations: int = 3,
-        strike_pct: float = 5.0,
+        num_strikes: int = 10,
     ):
         """Initialize main ingestion engine"""
         self.client = client
         self.underlying = underlying.upper()         # TradeStation API symbol (e.g. "$SPX.X")
         self.db_symbol = get_canonical_symbol(self.underlying)  # canonical alias for DB (e.g. "SPX")
         self.num_expirations = num_expirations
-        self.strike_pct = strike_pct
+        self.num_strikes = num_strikes
 
         self.running = False
 
@@ -87,7 +87,7 @@ class IngestionEngine:
         self.errors_count = 0
 
         logger.info(f"Initialized IngestionEngine for {underlying}")
-        logger.info(f"Config: {num_expirations} expirations, ±{strike_pct}% strikes")
+        logger.info(f"Config: {num_expirations} expirations, {num_strikes} strikes each side")
 
         # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -465,7 +465,7 @@ class IngestionEngine:
             underlying=self.underlying,
             db_underlying=self.db_symbol,
             num_expirations=self.num_expirations,
-            strike_pct=self.strike_pct,
+            num_strikes=self.num_strikes,
         )
 
         if not stream_manager.initialize():
@@ -505,7 +505,7 @@ class IngestionEngine:
         logger.info("="*80)
         logger.info(f"Underlying: {self.underlying}")
         logger.info(f"Expirations: {self.num_expirations}")
-        logger.info(f"Strike Range: ±{self.strike_pct}%")
+        logger.info(f"Strikes Each Side: {self.num_strikes}")
         logger.info(f"Greeks: {'ENABLED' if GREEKS_ENABLED else 'DISABLED'}")
         logger.info("")
         logger.info("NOTE: This engine only streams forward-looking data.")
@@ -552,9 +552,9 @@ def main():
     parser.add_argument("--expirations", type=int,
                        default=int(os.getenv("INGEST_EXPIRATIONS", "3")),
                        help="Number of expirations (default: 3)")
-    parser.add_argument("--strike-pct", type=float,
-                       default=float(os.getenv("INGEST_STRIKE_PCT", "5.0")),
-                       help="Strike range as %% of price (default: 5.0)")
+    parser.add_argument("--num-strikes", type=int,
+                       default=int(os.getenv("INGEST_STRIKE_COUNT", "10")),
+                       help="Number of strikes to track on each side of current price (default: 10)")
     parser.add_argument("--session-template", 
                        default=os.getenv("SESSION_TEMPLATE", "Default"),
                        choices=["Default", "USEQPre", "USEQ24Hour"],
@@ -587,7 +587,7 @@ def main():
             client=client,
             underlying=symbol,
             num_expirations=args.expirations,
-            strike_pct=args.strike_pct,
+            num_strikes=args.num_strikes,
         )
         engine.run()
 
