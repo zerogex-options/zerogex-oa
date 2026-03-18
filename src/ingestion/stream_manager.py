@@ -518,6 +518,10 @@ class StreamManager:
                                 last = safe_float(opt_quote.get("Last"), field_name="Last")
                                 bid = safe_float(opt_quote.get("Bid"), field_name="Bid")
                                 ask = safe_float(opt_quote.get("Ask"), field_name="Ask")
+                                mid = safe_float(opt_quote.get("Mid"), field_name="Mid")
+                                # Fall back to computed mid if TradeStation doesn't provide it
+                                if mid is None and bid is not None and ask is not None:
+                                    mid = (bid + ask) / 2.0
                                 volume = safe_int(opt_quote.get("Volume"), field_name="Volume")
                                 open_interest = safe_int(opt_quote.get("DailyOpenInterest"), field_name="DailyOpenInterest")
 
@@ -554,6 +558,7 @@ class StreamManager:
                                     "last": last,
                                     "bid": bid,
                                     "ask": ask,
+                                    "mid": mid,
                                     "volume": volume,
                                     "open_interest": open_interest,
                                     "implied_volatility": implied_volatility if implied_volatility else None,

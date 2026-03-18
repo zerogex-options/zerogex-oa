@@ -335,6 +335,41 @@ class IngestionEngine:
                 if self.options_buffer[sym]:
                     self._flush_option_bucket(sym, flush_bucket)
 
+    def _classify_volume_chunk(self, volume_delta: int, last: Optional[float], bid: Optional[float], ask: Optional[float], mid: Optional[float]) -> tuple:
+        """
+        Classify a volume chunk into ask_volume, mid_volume, or bid_volume
+        based on how close the last traded price is to each level.
+
+        Returns (ask_vol, mid_vol, bid_vol) tuple where exactly one is non-zero.
+        """
+        if volume_delta <= 0:
+            return (0, 0, 0)
+
+        # Need last price and at least bid/ask to classify
+        if last is None or last <= 0:
+            return (0, volume_delta, 0)  # Default to mid if we can't determine
+
+        # Compute mid if not provided
+        effective_mid = mid
+        if effective_mid is None:
+            if bid is not None and ask is not None:
+                effective_mid = (bid + ask) / 2.0
+            else:
+                return (0, volume_delta, 0)  # Can't classify without bid/ask
+
+        dist_to_ask = abs(last - ask) if ask is not None else float("inf")
+        dist_to_mid = abs(last - effective_mid)
+        dist_to_bid = abs(last - bid) if bid is not None else float("inf")
+
+        min_dist = min(dist_to_ask, dist_to_mid, dist_to_bid)
+
+        if dist_to_ask == min_dist:
+            return (volume_delta, 0, 0)
+        elif dist_to_bid == min_dist:
+            return (0, 0, volume_delta)
+        else:
+            return (0, volume_delta, 0)
+
     def _flush_option_bucket(self, option_symbol: str, bucket: datetime):
         """Aggregate and store 1-minute option quote"""
         buffer = self.options_buffer.get(option_symbol, [])
@@ -352,6 +387,30 @@ class IngestionEngine:
             theta = float(last.get("theta")) if last.get("theta") is not None else None
             vega = float(last.get("vega")) if last.get("vega") is not None else None
 
+            # Classify each volume delta chunk in the buffer into ask/mid/bid buckets.
+            # Iterate consecutive pairs; the volume delta between two snapshots is
+            # attributed to whichever price level (ask/mid/bid) the 'last' price
+            # of the newer snapshot is closest to.
+            ask_volume = 0
+            mid_volume = 0
+            bid_volume = 0
+            for i in range(1, len(buffer)):
+                prev_vol = buffer[i - 1].get("volume") or 0
+                curr = buffer[i]
+                curr_vol = curr.get("volume") or 0
+                vol_delta = max(curr_vol - prev_vol, 0)
+                if vol_delta > 0:
+                    av, mv, bv = self._classify_volume_chunk(
+                        vol_delta,
+                        curr.get("last"),
+                        curr.get("bid"),
+                        curr.get("ask"),
+                        curr.get("mid"),
+                    )
+                    ask_volume += av
+                    mid_volume += mv
+                    bid_volume += bv
+
             agg = {
                 "option_symbol": last["option_symbol"],
                 "timestamp": bucket,
@@ -362,8 +421,12 @@ class IngestionEngine:
                 "last": last.get("last", 0),
                 "bid": last.get("bid", 0),
                 "ask": last.get("ask", 0),
+                "mid": last.get("mid"),
                 "volume": max((b.get("volume") or 0) for b in buffer),
                 "open_interest": max((b.get("open_interest") or 0) for b in buffer),
+                "ask_volume": ask_volume,
+                "mid_volume": mid_volume,
+                "bid_volume": bid_volume,
                 "delta": delta,
                 "gamma": gamma,
                 "theta": theta,
@@ -374,16 +437,22 @@ class IngestionEngine:
             with db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    INSERT INTO option_chains 
+                    INSERT INTO option_chains
                     (option_symbol, timestamp, underlying, strike, expiration, option_type,
-                     last, bid, ask, volume, open_interest, delta, gamma, theta, vega)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     last, bid, ask, mid, volume, open_interest,
+                     ask_volume, mid_volume, bid_volume,
+                     delta, gamma, theta, vega)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (option_symbol, timestamp) DO UPDATE SET
                         last = EXCLUDED.last,
                         bid = EXCLUDED.bid,
                         ask = EXCLUDED.ask,
+                        mid = EXCLUDED.mid,
                         volume = GREATEST(option_chains.volume, EXCLUDED.volume),
                         open_interest = GREATEST(option_chains.open_interest, EXCLUDED.open_interest),
+                        ask_volume = option_chains.ask_volume + EXCLUDED.ask_volume,
+                        mid_volume = option_chains.mid_volume + EXCLUDED.mid_volume,
+                        bid_volume = option_chains.bid_volume + EXCLUDED.bid_volume,
                         delta = EXCLUDED.delta,
                         gamma = EXCLUDED.gamma,
                         theta = EXCLUDED.theta,
@@ -399,8 +468,12 @@ class IngestionEngine:
                     agg["last"],
                     agg["bid"],
                     agg["ask"],
+                    agg["mid"],
                     agg["volume"],
                     agg["open_interest"],
+                    agg["ask_volume"],
+                    agg["mid_volume"],
+                    agg["bid_volume"],
                     agg["delta"],
                     agg["gamma"],
                     agg["theta"],

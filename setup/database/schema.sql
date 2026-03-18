@@ -66,8 +66,12 @@ CREATE TABLE IF NOT EXISTS option_chains (
     last NUMERIC(12, 4),
     bid NUMERIC(12, 4),
     ask NUMERIC(12, 4),
+    mid NUMERIC(12, 4),
     volume BIGINT DEFAULT 0,
     open_interest BIGINT DEFAULT 0,
+    ask_volume BIGINT DEFAULT 0,
+    mid_volume BIGINT DEFAULT 0,
+    bid_volume BIGINT DEFAULT 0,
     implied_volatility NUMERIC(8, 6),
     delta NUMERIC(8, 6),
     gamma NUMERIC(10, 8),
@@ -76,6 +80,23 @@ CREATE TABLE IF NOT EXISTS option_chains (
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (option_symbol, timestamp)
 );
+
+-- Idempotent migration: add new columns if they don't exist yet (for existing databases)
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='option_chains' AND column_name='mid') THEN
+        ALTER TABLE option_chains ADD COLUMN mid NUMERIC(12, 4);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='option_chains' AND column_name='ask_volume') THEN
+        ALTER TABLE option_chains ADD COLUMN ask_volume BIGINT DEFAULT 0;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='option_chains' AND column_name='mid_volume') THEN
+        ALTER TABLE option_chains ADD COLUMN mid_volume BIGINT DEFAULT 0;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='option_chains' AND column_name='bid_volume') THEN
+        ALTER TABLE option_chains ADD COLUMN bid_volume BIGINT DEFAULT 0;
+    END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_option_chains_timestamp ON option_chains(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_option_chains_underlying ON option_chains(underlying);
@@ -225,8 +246,12 @@ SELECT
     last,
     bid,
     ask,
+    mid,
     volume,
     open_interest,
+    ask_volume,
+    mid_volume,
+    bid_volume,
     COALESCE(
         GREATEST(
             volume - LAG(volume) OVER (

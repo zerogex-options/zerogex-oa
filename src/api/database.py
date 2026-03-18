@@ -2119,6 +2119,9 @@ class DatabaseManager:
                     MAX(volume)      OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_volume,
                     MAX(open_interest) OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_oi,
                     MAX(updated_at)  OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_updated_at,
+                    SUM(ask_volume)  OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_ask_volume,
+                    SUM(mid_volume)  OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_mid_volume,
+                    SUM(bid_volume)  OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_bid_volume,
                     ROW_NUMBER()     OVER (
                         PARTITION BY DATE_TRUNC('minute', timestamp)
                         ORDER BY timestamp DESC
@@ -2139,8 +2142,12 @@ class DatabaseManager:
                 last,
                 bid,
                 ask,
+                mid,
                 bar_volume         AS volume,
                 bar_oi             AS open_interest,
+                bar_ask_volume     AS ask_volume,
+                bar_mid_volume     AS mid_volume,
+                bar_bid_volume     AS bid_volume,
                 implied_volatility,
                 delta,
                 gamma,

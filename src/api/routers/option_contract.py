@@ -30,9 +30,13 @@ class OptionContractRow(BaseModel):
     last: Optional[Decimal] = None
     bid: Optional[Decimal] = None
     ask: Optional[Decimal] = None
+    mid: Optional[Decimal] = None
     volume: Optional[int] = None
     volume_delta: Optional[int] = None
     open_interest: Optional[int] = None
+    ask_volume: Optional[int] = None
+    mid_volume: Optional[int] = None
+    bid_volume: Optional[int] = None
     implied_volatility: Optional[Decimal] = None
     delta: Optional[Decimal] = None
     gamma: Optional[Decimal] = None
