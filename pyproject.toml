@@ -89,7 +89,9 @@ zerogex-stream = "src.ingestion.stream_manager:main"
 zerogex-test-api = "src.ingestion.tradestation_client:main"
 zerogex-test-greeks = "src.ingestion.greeks_calculator:main"
 zerogex-test-iv = "src.ingestion.iv_calculator:main"
-zerogex-analytics = "src.analytics.analytics_engine:main"
+zerogex-analytics = "src.analytics.main_engine:main"
+zerogex-vol-expansion = "src.analytics.vol_expansion_engine:main"
+zerogex-vol-backtest = "src.analytics.vol_expansion_backtest:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

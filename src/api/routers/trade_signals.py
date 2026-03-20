@@ -3,6 +3,8 @@ Trade Signals Router — reads pre-computed rows from trade_signals table.
 
 GET /api/signals/trade?symbol=SPY&timeframe=intraday
 GET /api/signals/accuracy?symbol=SPY&lookback_days=30
+GET /api/signals/vol-expansion?symbol=SPY
+GET /api/signals/vol-expansion/accuracy?symbol=SPY&lookback_days=30
 
 The AnalyticsEngine writes fresh signal rows every ~5 minutes.
 The API simply reads the latest row; no scoring logic lives here.
@@ -21,6 +23,9 @@ from ..models import (
     TradeIdea,
     TradeType,
     Timeframe,
+    VolExpansionSignalResponse,
+    VolExpansionComponent,
+    VolExpansionDirection,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,6 +80,29 @@ def _map_components(raw_list: list) -> list[SignalComponent]:
             description=item.get("description", ""),
             value=item.get("value"),
             applicable=item.get("applicable", True),
+        ))
+    return out
+
+
+def _map_vol_direction(raw: str) -> VolExpansionDirection:
+    try:
+        return VolExpansionDirection(raw)
+    except ValueError:
+        return VolExpansionDirection.NEUTRAL
+
+
+def _map_vol_components(raw_list: list) -> list[VolExpansionComponent]:
+    out = []
+    for item in (raw_list or []):
+        if not isinstance(item, dict):
+            continue
+        out.append(VolExpansionComponent(
+            name=item.get("name", ""),
+            weight=item.get("weight", 0),
+            raw_score=item.get("raw_score", 0),
+            weighted_score=item.get("weighted_score", 0),
+            description=item.get("description", ""),
+            value=item.get("value"),
         ))
     return out
 
@@ -188,6 +216,80 @@ async def get_signal_accuracy(
             "lookback_days": lookback_days,
             "note": "Insufficient historical data. Defaults in use.",
             "defaults": _WIN_PCT_DEFAULTS,
+        }
+    return {
+        "symbol": symbol,
+        "lookback_days": lookback_days,
+        "accuracy": accuracy,
+    }
+
+
+@router.get("/vol-expansion", response_model=VolExpansionSignalResponse)
+async def get_vol_expansion_signal(
+    symbol: str = Query(default="SPY", description="Underlying symbol"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Return the latest volatility-expansion / large-move prediction for the symbol."""
+    row = await db.get_vol_expansion_signal(symbol)
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No volatility expansion signal found for {symbol}. "
+                "The AnalyticsEngine may not have run yet, or no market data is available."
+            ),
+        )
+
+    ts: datetime = row["timestamp"]
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - ts).total_seconds()
+    if age_seconds > STALE_THRESHOLD_SECONDS:
+        logger.warning(
+            f"Vol expansion signal for {symbol} is {age_seconds:.0f}s old "
+            f"(threshold: {STALE_THRESHOLD_SECONDS}s)"
+        )
+
+    return VolExpansionSignalResponse(
+        symbol=row["underlying"],
+        timestamp=row["timestamp"],
+        composite_score=row.get("composite_score", 0),
+        max_possible_score=row.get("max_possible_score", 1),
+        normalized_score=float(row.get("normalized_score") or 0),
+        move_probability=float(row.get("move_probability") or 0),
+        expected_direction=_map_vol_direction(row.get("expected_direction", "neutral")),
+        expected_magnitude_pct=float(row.get("expected_magnitude_pct") or 0),
+        confidence=_map_strength(row.get("confidence", "low")),
+        catalyst_type=row.get("catalyst_type", "mixed"),
+        time_horizon=row.get("time_horizon", "intraday"),
+        strategy_type=row.get("strategy_type", "wait"),
+        entry_window=row.get("entry_window"),
+        current_price=float(row["current_price"]) if row.get("current_price") is not None else None,
+        net_gex=float(row["net_gex"]) if row.get("net_gex") is not None else None,
+        gamma_flip=float(row["gamma_flip"]) if row.get("gamma_flip") is not None else None,
+        max_pain=float(row["max_pain"]) if row.get("max_pain") is not None else None,
+        put_call_ratio=float(row["put_call_ratio"]) if row.get("put_call_ratio") is not None else None,
+        dealer_net_delta=float(row["dealer_net_delta"]) if row.get("dealer_net_delta") is not None else None,
+        smart_money_direction=_map_vol_direction(row.get("smart_money_direction", "neutral")) if row.get("smart_money_direction") else None,
+        vwap_deviation_pct=float(row["vwap_deviation_pct"]) if row.get("vwap_deviation_pct") is not None else None,
+        hours_to_next_expiry=float(row["hours_to_next_expiry"]) if row.get("hours_to_next_expiry") is not None else None,
+        components=_map_vol_components(row.get("components") or []),
+    )
+
+
+@router.get("/vol-expansion/accuracy")
+async def get_vol_expansion_accuracy(
+    symbol: str = Query(default="SPY"),
+    lookback_days: int = Query(default=30, ge=7, le=365),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Return historical large-move hit rates for volatility-expansion signals."""
+    accuracy = await db.get_vol_expansion_accuracy(symbol, lookback_days)
+    if not accuracy:
+        return {
+            "symbol": symbol,
+            "lookback_days": lookback_days,
+            "note": "Insufficient historical data for volatility expansion calibration.",
         }
     return {
         "symbol": symbol,

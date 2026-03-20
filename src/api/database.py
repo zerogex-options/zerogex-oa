@@ -1603,6 +1603,100 @@ class DatabaseManager:
             logger.error(f"get_signal_accuracy failed: {e}")
             return {}
 
+
+    async def get_vol_expansion_signal(
+        self,
+        symbol: str = "SPY",
+    ) -> Optional[Dict[str, Any]]:
+        """Return the most recent volatility expansion signal for this symbol."""
+        query = """
+            SELECT
+                underlying,
+                timestamp,
+                composite_score,
+                max_possible_score,
+                normalized_score,
+                move_probability,
+                expected_direction,
+                expected_magnitude_pct,
+                confidence,
+                catalyst_type,
+                time_horizon,
+                strategy_type,
+                entry_window,
+                current_price,
+                net_gex,
+                gamma_flip,
+                max_pain,
+                put_call_ratio,
+                dealer_net_delta,
+                smart_money_direction,
+                vwap_deviation_pct,
+                hours_to_next_expiry,
+                components
+            FROM volatility_expansion_signals
+            WHERE underlying = $1
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(query, symbol)
+                if not row:
+                    return None
+                d = dict(row)
+                if isinstance(d.get("components"), str):
+                    d["components"] = json.loads(d["components"])
+                return d
+        except Exception as e:
+            logger.error(f"get_vol_expansion_signal failed ({symbol}): {e}")
+            return None
+
+    async def get_vol_expansion_accuracy(
+        self,
+        symbol: str = "SPY",
+        lookback_days: int = 30,
+    ) -> Dict[str, Any]:
+        """Return historical large-move hit rates by confidence and catalyst."""
+        query = """
+            SELECT
+                confidence,
+                catalyst_type,
+                SUM(total_signals)::int AS total,
+                SUM(large_move_hits)::int AS large_move_hits,
+                SUM(direction_correct_hits)::int AS direction_correct_hits,
+                AVG(empirical_move_pct)::float AS empirical_move_pct,
+                AVG(avg_predicted_probability)::float AS avg_predicted_probability
+            FROM vol_expansion_accuracy
+            WHERE underlying = $1
+              AND trade_date >= CURRENT_DATE - ($2 * INTERVAL '1 day')
+            GROUP BY confidence, catalyst_type
+            ORDER BY confidence, catalyst_type
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(query, symbol, lookback_days)
+            result: Dict[str, Any] = {}
+            for row in rows:
+                confidence = row["confidence"]
+                catalyst = row["catalyst_type"]
+                total = row["total"] or 0
+                large_move_hits = row["large_move_hits"] or 0
+                direction_correct_hits = row["direction_correct_hits"] or 0
+                result.setdefault(confidence, {})[catalyst] = {
+                    "total": total,
+                    "large_move_hits": large_move_hits,
+                    "direction_correct_hits": direction_correct_hits,
+                    "large_move_hit_rate": round(large_move_hits / total, 4) if total > 0 else None,
+                    "direction_accuracy": round(direction_correct_hits / total, 4) if total > 0 else None,
+                    "empirical_move_pct": round(float(row["empirical_move_pct"]), 4) if row["empirical_move_pct"] is not None else None,
+                    "avg_predicted_probability": round(float(row["avg_predicted_probability"]), 4) if row["avg_predicted_probability"] is not None else None,
+                }
+            return result
+        except Exception as e:
+            logger.error(f"get_vol_expansion_accuracy failed: {e}")
+            return {}
+
     async def get_latest_quote(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
         """Get latest underlying quote"""
         query = """
