@@ -162,6 +162,10 @@ help: ## Show this help message
 	@echo "  make signal-accuracy          - Win rate calibration by timeframe + strength (last 30 days)"
 	@echo "  make signal-accuracy-daily    - Daily accuracy breakdown for the last 14 days"
 	@echo "  make signal-accuracy-all      - Full accuracy table — all dates, all symbols"
+	@echo "  make vol-signals              - Latest volatility-expansion signal"
+	@echo "  make vol-signals-components   - Vol-expansion component breakdown"
+	@echo "  make vol-accuracy             - Vol-expansion hit-rate calibration"
+	@echo "  make api-test-vol-signals     - Test new vol-expansion /api/signals endpoints"
 	@echo "  make signal-logs              - Watch SignalEngine log output live (Ctrl+C to stop)"
 	@echo "  make signal-logs-tail         - Last 100 SignalEngine log lines"
 	@echo "  make signal-logs-errors       - SignalEngine errors and warnings only"
@@ -198,6 +202,8 @@ help: ## Show this help message
 	@echo "  make db-tail-flow-smart-money     - Last 20 rows from flow_smart_money"
 	@echo "  make db-tail-trade-signals        - Last 20 rows from trade_signals"
 	@echo "  make db-tail-signal-accuracy      - Last 20 rows from signal_accuracy"
+	@echo "  make db-tail-vol-expansion-signals  - Last 20 rows from volatility_expansion_signals"
+	@echo "  make db-tail-vol-expansion-accuracy - Last 20 rows from vol_expansion_accuracy"
 	@echo ""
 	@echo "$(GREEN)Maintenance:$(NC)"
 	@echo "  make vacuum             - Vacuum analyze all tables"
@@ -1777,6 +1783,58 @@ signal-accuracy-all: ## Full accuracy table — all dates, all symbols
 		ORDER BY trade_date DESC, underlying, timeframe, strength_bucket \
 		LIMIT 100;"
 
+.PHONY: vol-signals
+vol-signals: ## Latest volatility-expansion signal (default: SPY, override: make vol-signals FLOW_SYMBOL=QQQ)
+	@echo "$(BLUE)=== Latest Volatility Expansion Signal ($(FLOW_SYMBOL)) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI:SS') AS time_et, \
+			expected_direction, \
+			confidence, \
+			ROUND(move_probability * 100, 1) || '%' AS move_prob, \
+			ROUND(expected_magnitude_pct::numeric, 2) || '%' AS expected_move, \
+			catalyst_type, \
+			strategy_type, \
+			time_horizon \
+		FROM volatility_expansion_signals \
+		WHERE underlying = '$(FLOW_SYMBOL)' \
+		ORDER BY timestamp DESC \
+		LIMIT 1;"
+
+.PHONY: vol-signals-components
+vol-signals-components: ## Vol-expansion component breakdown (default: SPY, override: make vol-signals-components FLOW_SYMBOL=QQQ)
+	@echo "$(BLUE)=== Volatility Expansion Components ($(FLOW_SYMBOL)) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			comp->>'name' AS component, \
+			comp->>'weight' AS weight, \
+			comp->>'raw_score' AS raw_score, \
+			comp->>'weighted_score' AS weighted_score, \
+			comp->>'description' AS description \
+		FROM volatility_expansion_signals, \
+		     jsonb_array_elements(components) AS comp \
+		WHERE underlying = '$(FLOW_SYMBOL)' \
+		ORDER BY timestamp DESC \
+		LIMIT 10;"
+
+.PHONY: vol-accuracy
+vol-accuracy: ## Vol-expansion large-move hit-rate calibration (default: SPY, override: make vol-accuracy FLOW_SYMBOL=QQQ)
+	@echo "$(BLUE)=== Volatility Expansion Accuracy — Last 30 Days ($(FLOW_SYMBOL)) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			confidence, \
+			catalyst_type, \
+			SUM(total_signals) AS total, \
+			SUM(large_move_hits) AS large_move_hits, \
+			SUM(direction_correct_hits) AS direction_correct_hits, \
+			ROUND(SUM(large_move_hits)::numeric / NULLIF(SUM(total_signals), 0) * 100, 1) || '%' AS large_move_hit_rate, \
+			ROUND(AVG(avg_predicted_probability)::numeric * 100, 1) || '%' AS avg_predicted_prob \
+		FROM vol_expansion_accuracy \
+		WHERE underlying = '$(FLOW_SYMBOL)' \
+		  AND trade_date >= CURRENT_DATE - 30 \
+		GROUP BY confidence, catalyst_type \
+		ORDER BY confidence, catalyst_type;"
+
 # =============================================================================
 # Signal Engine — Logs
 # =============================================================================
@@ -1825,6 +1883,16 @@ api-test-signals: ## Test all /api/signals endpoints
 	@echo ""
 	@echo "$(GREEN)Signal Accuracy (30-day):$(NC)"
 	@curl -s "http://localhost:8000/api/signals/accuracy?symbol=SPY&lookback_days=30" | python3 -m json.tool
+
+.PHONY: api-test-vol-signals
+api-test-vol-signals: ## Test new vol-expansion /api/signals endpoints
+	@echo "$(BLUE)=== Testing /api/signals/vol-expansion Endpoints ===$(NC)"
+	@echo ""
+	@echo "$(GREEN)Latest Vol Expansion Signal:$(NC)"
+	@curl -s "http://localhost:8000/api/signals/vol-expansion?symbol=SPY" | python3 -m json.tool
+	@echo ""
+	@echo "$(GREEN)Vol Expansion Accuracy (30-day):$(NC)"
+	@curl -s "http://localhost:8000/api/signals/vol-expansion/accuracy?symbol=SPY&lookback_days=30" | python3 -m json.tool
 
 .PHONY: api-test-signals-summary
 api-test-signals-summary: ## Quick one-liner signal check across all timeframes
@@ -2123,6 +2191,16 @@ db-tail-trade-signals: ## Show 20 most recent rows from trade_signals (UNDERLYIN
 db-tail-signal-accuracy: ## Show 20 most recent rows from signal_accuracy (UNDERLYING=SPY to filter)
 	@echo "$(BLUE)=== signal_accuracy (last 20) ===$(NC)"
 	@$(PSQL) -c "SELECT * FROM signal_accuracy $(if $(UNDERLYING),WHERE underlying='$(UNDERLYING)',) ORDER BY trade_date DESC LIMIT 20;"
+
+.PHONY: db-tail-vol-expansion-signals
+db-tail-vol-expansion-signals: ## Show 20 most recent rows from volatility_expansion_signals (UNDERLYING=SPY to filter)
+	@echo "$(BLUE)=== volatility_expansion_signals (last 20) ===$(NC)"
+	@$(PSQL) -c "SELECT * FROM volatility_expansion_signals $(if $(UNDERLYING),WHERE underlying='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
+
+.PHONY: db-tail-vol-expansion-accuracy
+db-tail-vol-expansion-accuracy: ## Show 20 most recent rows from vol_expansion_accuracy (UNDERLYING=SPY to filter)
+	@echo "$(BLUE)=== vol_expansion_accuracy (last 20) ===$(NC)"
+	@$(PSQL) -c "SELECT * FROM vol_expansion_accuracy $(if $(UNDERLYING),WHERE underlying='$(UNDERLYING)',) ORDER BY trade_date DESC LIMIT 20;"
 
 # =============================================================================
 # Advanced Queries

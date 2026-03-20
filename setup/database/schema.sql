@@ -568,3 +568,83 @@ BEGIN
         FOREIGN KEY (underlying) REFERENCES symbols(symbol) ON DELETE CASCADE;
     END IF;
 END $$;
+
+-- ---------------------------------------------------------------------------
+-- volatility_expansion_signals
+-- Written by VolExpansionEngine every ~5 min.
+-- One row per (underlying, timestamp).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS volatility_expansion_signals (
+    underlying               VARCHAR(10)   NOT NULL,
+    timestamp                TIMESTAMPTZ   NOT NULL,
+    composite_score          INTEGER       NOT NULL,
+    max_possible_score       INTEGER       NOT NULL,
+    normalized_score         NUMERIC(6, 4) NOT NULL,
+    move_probability         NUMERIC(6, 4) NOT NULL,
+    expected_direction       VARCHAR(10)   NOT NULL CHECK (expected_direction IN ('up', 'down', 'neutral')),
+    expected_magnitude_pct   NUMERIC(8, 4) NOT NULL,
+    confidence               VARCHAR(10)   NOT NULL CHECK (confidence IN ('high', 'medium', 'low')),
+    catalyst_type            VARCHAR(30)   NOT NULL,
+    time_horizon             VARCHAR(20)   NOT NULL,
+    strategy_type            VARCHAR(40)   NOT NULL,
+    entry_window             VARCHAR(50),
+    current_price            NUMERIC(12, 4),
+    net_gex                  DOUBLE PRECISION,
+    gamma_flip               DOUBLE PRECISION,
+    max_pain                 DOUBLE PRECISION,
+    put_call_ratio           DOUBLE PRECISION,
+    dealer_net_delta         DOUBLE PRECISION,
+    smart_money_direction    VARCHAR(10),
+    vwap_deviation_pct       NUMERIC(8, 4),
+    hours_to_next_expiry     NUMERIC(8, 2),
+    components               JSONB,
+    updated_at               TIMESTAMPTZ   DEFAULT NOW(),
+    created_at               TIMESTAMPTZ   DEFAULT NOW(),
+    PRIMARY KEY (underlying, timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vol_expansion_signals_underlying_ts
+    ON volatility_expansion_signals(underlying, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_vol_expansion_signals_probability
+    ON volatility_expansion_signals(move_probability DESC, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_vol_expansion_signals_confidence
+    ON volatility_expansion_signals(confidence, timestamp DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_vol_expansion_underlying') THEN
+        ALTER TABLE volatility_expansion_signals
+        ADD CONSTRAINT fk_vol_expansion_underlying
+        FOREIGN KEY (underlying) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- vol_expansion_accuracy
+-- One row per (underlying, trade_date, confidence, catalyst_type).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS vol_expansion_accuracy (
+    underlying                VARCHAR(10)   NOT NULL,
+    trade_date                DATE          NOT NULL,
+    confidence                VARCHAR(10)   NOT NULL CHECK (confidence IN ('high', 'medium', 'low')),
+    catalyst_type             VARCHAR(30)   NOT NULL,
+    total_signals             INTEGER       NOT NULL DEFAULT 0,
+    large_move_hits           INTEGER       NOT NULL DEFAULT 0,
+    direction_correct_hits    INTEGER       NOT NULL DEFAULT 0,
+    empirical_move_pct        NUMERIC(6, 4),
+    avg_predicted_probability NUMERIC(6, 4),
+    updated_at                TIMESTAMPTZ   DEFAULT NOW(),
+    PRIMARY KEY (underlying, trade_date, confidence, catalyst_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vol_expansion_accuracy_underlying_date
+    ON vol_expansion_accuracy(underlying, trade_date DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_vol_expansion_accuracy_underlying') THEN
+        ALTER TABLE vol_expansion_accuracy
+        ADD CONSTRAINT fk_vol_expansion_accuracy_underlying
+        FOREIGN KEY (underlying) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+END $$;
