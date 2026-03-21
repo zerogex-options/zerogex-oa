@@ -204,6 +204,8 @@ help: ## Show this help message
 	@echo "  make db-tail-signal-accuracy      - Last 20 rows from signal_accuracy"
 	@echo "  make db-tail-vol-expansion-signals  - Last 20 rows from volatility_expansion_signals"
 	@echo "  make db-tail-vol-expansion-accuracy - Last 20 rows from vol_expansion_accuracy"
+	@echo "  make db-tail-position-optimizer-signals - Last 20 rows from position_optimizer_signals"
+	@echo "  make db-tail-position-optimizer-accuracy - Last 20 rows from position_optimizer_accuracy"
 	@echo ""
 	@echo "$(GREEN)Maintenance:$(NC)"
 	@echo "  make vacuum             - Vacuum analyze all tables"
@@ -1835,6 +1837,68 @@ vol-accuracy: ## Vol-expansion large-move hit-rate calibration (default: SPY, ov
 		GROUP BY confidence, catalyst_type \
 		ORDER BY confidence, catalyst_type;"
 
+
+.PHONY: position-optimizer-latest
+position-optimizer-latest: ## Latest position optimizer signal (default: SPY, override: make position-optimizer-latest FLOW_SYMBOL=QQQ)
+	@echo "$(BLUE)=== Position Optimizer Latest ($(FLOW_SYMBOL)) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI:SS') AS time_et, \
+			signal_direction, \
+			signal_timeframe, \
+			top_strategy_type, \
+			top_strikes, \
+			ROUND(top_probability_of_profit::numeric * 100, 1) || '%' AS pop, \
+			ROUND(top_expected_value::numeric, 2) AS expected_value, \
+			ROUND(top_kelly_fraction::numeric * 100, 2) || '%' AS kelly \
+		FROM position_optimizer_signals \
+		WHERE underlying = '$(FLOW_SYMBOL)' \
+		ORDER BY timestamp DESC \
+		LIMIT 1;"
+
+.PHONY: position-optimizer-components
+position-optimizer-components: ## Position optimizer component breakdown (default: SPY, override: make position-optimizer-components FLOW_SYMBOL=QQQ)
+	@echo "$(BLUE)=== Position Optimizer Components ($(FLOW_SYMBOL)) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			cand->>'rank' AS rank, \
+			cand->>'strategy_type' AS strategy_type, \
+			comp->>'name' AS component, \
+			comp->>'raw_score' AS raw_score, \
+			comp->>'weighted_score' AS weighted_score, \
+			comp->>'description' AS description \
+		FROM position_optimizer_signals, \
+			 jsonb_array_elements(candidates) AS cand, \
+			 jsonb_array_elements(cand->'components') AS comp \
+		WHERE underlying = '$(FLOW_SYMBOL)' \
+		ORDER BY timestamp DESC, (cand->>'rank')::int ASC \
+		LIMIT 30;"
+
+.PHONY: position-optimizer-accuracy
+position-optimizer-accuracy: ## Position optimizer accuracy summary (default: SPY, override: make position-optimizer-accuracy FLOW_SYMBOL=QQQ)
+	@echo "$(BLUE)=== Position Optimizer Accuracy — Last 30 Days ($(FLOW_SYMBOL)) ===$(NC)"
+	@$(PSQL) -c "\
+		SELECT \
+			signal_direction, \
+			strategy_type, \
+			SUM(total_signals) AS total, \
+			SUM(profitable_signals) AS profitable, \
+			ROUND(SUM(profitable_signals)::numeric / NULLIF(SUM(total_signals), 0) * 100, 1) || '%' AS profitability_rate, \
+			ROUND(AVG(avg_expected_value)::numeric, 2) AS avg_expected_value, \
+			ROUND(AVG(avg_realized_return_pct)::numeric, 2) || '%' AS avg_realized_return_pct \
+		FROM position_optimizer_accuracy \
+		WHERE underlying = '$(FLOW_SYMBOL)' \
+		  AND trade_date >= CURRENT_DATE - 30 \
+		GROUP BY signal_direction, strategy_type \
+		ORDER BY signal_direction, strategy_type;"
+
+.PHONY: position-optimizer-api-smoke
+position-optimizer-api-smoke: ## Smoke test position optimizer API endpoints (default: SPY, override: make position-optimizer-api-smoke FLOW_SYMBOL=QQQ API_BASE=http://localhost:8000)
+	@echo "$(BLUE)=== Position Optimizer API Smoke ($(FLOW_SYMBOL)) ===$(NC)"
+	@curl -fsS "$(or $(API_BASE),http://localhost:8000)/api/signals/position-optimizer?symbol=$(FLOW_SYMBOL)" | python -m json.tool
+	@echo ""
+	@curl -fsS "$(or $(API_BASE),http://localhost:8000)/api/signals/position-optimizer/accuracy?symbol=$(FLOW_SYMBOL)" | python -m json.tool
+
 # =============================================================================
 # Signal Engine — Logs
 # =============================================================================
@@ -2201,6 +2265,16 @@ db-tail-vol-expansion-signals: ## Show 20 most recent rows from volatility_expan
 db-tail-vol-expansion-accuracy: ## Show 20 most recent rows from vol_expansion_accuracy (UNDERLYING=SPY to filter)
 	@echo "$(BLUE)=== vol_expansion_accuracy (last 20) ===$(NC)"
 	@$(PSQL) -c "SELECT * FROM vol_expansion_accuracy $(if $(UNDERLYING),WHERE underlying='$(UNDERLYING)',) ORDER BY trade_date DESC LIMIT 20;"
+
+.PHONY: db-tail-position-optimizer-signals
+db-tail-position-optimizer-signals: ## Show 20 most recent rows from position_optimizer_signals (UNDERLYING=SPY to filter)
+	@echo "$(BLUE)=== position_optimizer_signals (last 20) ===$(NC)"
+	@$(PSQL) -c "SELECT * FROM position_optimizer_signals $(if $(UNDERLYING),WHERE underlying='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
+
+.PHONY: db-tail-position-optimizer-accuracy
+db-tail-position-optimizer-accuracy: ## Show 20 most recent rows from position_optimizer_accuracy (UNDERLYING=SPY to filter)
+	@echo "$(BLUE)=== position_optimizer_accuracy (last 20) ===$(NC)"
+	@$(PSQL) -c "SELECT * FROM position_optimizer_accuracy $(if $(UNDERLYING),WHERE underlying='$(UNDERLYING)',) ORDER BY trade_date DESC LIMIT 20;"
 
 # =============================================================================
 # Advanced Queries

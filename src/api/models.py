@@ -416,3 +416,90 @@ class VolExpansionSignalResponse(BaseModel):
         json_encoders = {
             datetime: lambda v: v.isoformat() if v is not None else None,
         }
+
+
+class PositionOptimizerDirection(str, Enum):
+    BULLISH = "bullish"
+    BEARISH = "bearish"
+    NEUTRAL = "neutral"
+
+
+class PositionOptimizerCandidateComponent(BaseModel):
+    name: str
+    weight: int
+    raw_score: int
+    weighted_score: int
+    description: str
+    value: Optional[float] = None
+
+
+class PositionOptimizerSizingProfile(BaseModel):
+    profile: str
+    contracts: int
+    max_risk_dollars: float
+    expected_value_dollars: float
+    constrained_by: str
+
+
+class PositionOptimizerCandidate(BaseModel):
+    rank: int
+    strategy_type: str
+    expiry: date
+    dte: int
+    strikes: str
+    option_type: str
+    entry_debit: float
+    entry_credit: float
+    width: float
+    max_profit: float
+    max_loss: float
+    risk_reward_ratio: float
+    probability_of_profit: float
+    expected_value: float
+    sharpe_like_ratio: float
+    liquidity_score: float
+    net_delta: float
+    net_gamma: float
+    net_theta: float
+    premium_efficiency: float
+    market_structure_fit: float
+    greek_alignment_score: float
+    edge_score: float
+    kelly_fraction: float
+    sizing_profiles: list[PositionOptimizerSizingProfile]
+    components: list[PositionOptimizerCandidateComponent]
+    reasoning: list[str]
+
+
+class PositionOptimizerSignalResponse(BaseModel):
+    symbol: str
+    timestamp: datetime
+    signal_timestamp: datetime
+    signal_timeframe: Timeframe
+    signal_direction: PositionOptimizerDirection
+    signal_strength: SignalStrength
+    trade_type: str
+    current_price: float
+    composite_score: float
+    max_possible_score: int
+    normalized_score: float
+    top_strategy_type: str
+    top_expiry: date
+    top_dte: int
+    top_strikes: str
+    top_probability_of_profit: float
+    top_expected_value: float
+    top_max_profit: float
+    top_max_loss: float
+    top_kelly_fraction: float
+    top_sharpe_like_ratio: Optional[float] = None
+    top_liquidity_score: Optional[float] = None
+    top_market_structure_fit: Optional[float] = None
+    top_reasoning: list[str]
+    candidates: list[PositionOptimizerCandidate]
+
+    class Config:
+        json_encoders = {
+            datetime: lambda v: v.isoformat() if v is not None else None,
+            date: lambda v: v.isoformat() if v is not None else None,
+        }

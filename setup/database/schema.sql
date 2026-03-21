@@ -648,3 +648,89 @@ BEGIN
         FOREIGN KEY (underlying) REFERENCES symbols(symbol) ON DELETE CASCADE;
     END IF;
 END $$;
+
+
+-- ---------------------------------------------------------------------------
+-- position_optimizer_signals
+-- Written by PositionOptimizerEngine every ~5 min.
+-- One row per (underlying, timestamp).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS position_optimizer_signals (
+    underlying                  VARCHAR(10)   NOT NULL,
+    timestamp                   TIMESTAMPTZ   NOT NULL,
+    signal_timestamp            TIMESTAMPTZ   NOT NULL,
+    signal_timeframe            VARCHAR(20)   NOT NULL CHECK (signal_timeframe IN ('intraday', 'swing', 'multi_day')),
+    signal_direction            VARCHAR(10)   NOT NULL CHECK (signal_direction IN ('bullish', 'bearish', 'neutral')),
+    signal_strength             VARCHAR(10)   NOT NULL CHECK (signal_strength IN ('high', 'medium', 'low')),
+    trade_type                  VARCHAR(40)   NOT NULL,
+    current_price               NUMERIC(12, 4),
+    composite_score             NUMERIC(10, 2) NOT NULL,
+    max_possible_score          INTEGER       NOT NULL,
+    normalized_score            NUMERIC(6, 4) NOT NULL,
+    top_strategy_type           VARCHAR(40)   NOT NULL,
+    top_expiry                  DATE          NOT NULL,
+    top_dte                     INTEGER       NOT NULL,
+    top_strikes                 VARCHAR(120)  NOT NULL,
+    top_probability_of_profit   NUMERIC(6, 4) NOT NULL,
+    top_expected_value          NUMERIC(12, 2) NOT NULL,
+    top_max_profit              NUMERIC(12, 2) NOT NULL,
+    top_max_loss                NUMERIC(12, 2) NOT NULL,
+    top_kelly_fraction          NUMERIC(6, 4) NOT NULL,
+    top_sharpe_like_ratio       NUMERIC(8, 4),
+    top_liquidity_score         NUMERIC(6, 4),
+    top_market_structure_fit    NUMERIC(6, 4),
+    top_reasoning               JSONB,
+    candidates                  JSONB,
+    updated_at                  TIMESTAMPTZ   DEFAULT NOW(),
+    created_at                  TIMESTAMPTZ   DEFAULT NOW(),
+    PRIMARY KEY (underlying, timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_position_optimizer_signals_underlying_ts
+    ON position_optimizer_signals(underlying, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_position_optimizer_signals_signal_ts
+    ON position_optimizer_signals(signal_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_position_optimizer_signals_strategy
+    ON position_optimizer_signals(top_strategy_type, timestamp DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_position_optimizer_underlying') THEN
+        ALTER TABLE position_optimizer_signals
+        ADD CONSTRAINT fk_position_optimizer_underlying
+        FOREIGN KEY (underlying) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- position_optimizer_accuracy
+-- One row per (underlying, trade_date, signal_direction, strategy_type).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS position_optimizer_accuracy (
+    underlying                VARCHAR(10)   NOT NULL,
+    trade_date                DATE          NOT NULL,
+    signal_direction          VARCHAR(10)   NOT NULL CHECK (signal_direction IN ('bullish', 'bearish', 'neutral')),
+    strategy_type             VARCHAR(40)   NOT NULL,
+    total_signals             INTEGER       NOT NULL DEFAULT 0,
+    profitable_signals        INTEGER       NOT NULL DEFAULT 0,
+    avg_realized_return_pct   NUMERIC(10, 4),
+    avg_expected_value        NUMERIC(12, 4),
+    avg_predicted_pop         NUMERIC(6, 4),
+    avg_realized_move_pct     NUMERIC(8, 4),
+    updated_at                TIMESTAMPTZ   DEFAULT NOW(),
+    PRIMARY KEY (underlying, trade_date, signal_direction, strategy_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_position_optimizer_accuracy_underlying_date
+    ON position_optimizer_accuracy(underlying, trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_position_optimizer_accuracy_strategy
+    ON position_optimizer_accuracy(strategy_type, trade_date DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_position_optimizer_accuracy_underlying') THEN
+        ALTER TABLE position_optimizer_accuracy
+        ADD CONSTRAINT fk_position_optimizer_accuracy_underlying
+        FOREIGN KEY (underlying) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+END $$;

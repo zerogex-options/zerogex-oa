@@ -26,6 +26,11 @@ from ..models import (
     VolExpansionSignalResponse,
     VolExpansionComponent,
     VolExpansionDirection,
+    PositionOptimizerSignalResponse,
+    PositionOptimizerDirection,
+    PositionOptimizerCandidate,
+    PositionOptimizerCandidateComponent,
+    PositionOptimizerSizingProfile,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,6 +95,74 @@ def _map_vol_direction(raw: str) -> VolExpansionDirection:
     except ValueError:
         return VolExpansionDirection.NEUTRAL
 
+
+
+
+def _map_position_direction(raw: str) -> PositionOptimizerDirection:
+    try:
+        return PositionOptimizerDirection(raw)
+    except ValueError:
+        return PositionOptimizerDirection.NEUTRAL
+
+
+def _map_position_candidates(raw_list: list) -> list[PositionOptimizerCandidate]:
+    out = []
+    for item in (raw_list or []):
+        if not isinstance(item, dict):
+            continue
+        components = []
+        for comp in (item.get("components") or []):
+            if not isinstance(comp, dict):
+                continue
+            components.append(PositionOptimizerCandidateComponent(
+                name=comp.get("name", ""),
+                weight=comp.get("weight", 0),
+                raw_score=comp.get("raw_score", 0),
+                weighted_score=comp.get("weighted_score", 0),
+                description=comp.get("description", ""),
+                value=comp.get("value"),
+            ))
+        sizing_profiles = []
+        for profile in (item.get("sizing_profiles") or []):
+            if not isinstance(profile, dict):
+                continue
+            sizing_profiles.append(PositionOptimizerSizingProfile(
+                profile=profile.get("profile", ""),
+                contracts=profile.get("contracts", 0),
+                max_risk_dollars=float(profile.get("max_risk_dollars") or 0),
+                expected_value_dollars=float(profile.get("expected_value_dollars") or 0),
+                constrained_by=profile.get("constrained_by", ""),
+            ))
+        out.append(PositionOptimizerCandidate(
+            rank=item.get("rank", 0),
+            strategy_type=item.get("strategy_type", ""),
+            expiry=item.get("expiry"),
+            dte=item.get("dte", 0),
+            strikes=item.get("strikes", ""),
+            option_type=item.get("option_type", ""),
+            entry_debit=float(item.get("entry_debit") or 0),
+            entry_credit=float(item.get("entry_credit") or 0),
+            width=float(item.get("width") or 0),
+            max_profit=float(item.get("max_profit") or 0),
+            max_loss=float(item.get("max_loss") or 0),
+            risk_reward_ratio=float(item.get("risk_reward_ratio") or 0),
+            probability_of_profit=float(item.get("probability_of_profit") or 0),
+            expected_value=float(item.get("expected_value") or 0),
+            sharpe_like_ratio=float(item.get("sharpe_like_ratio") or 0),
+            liquidity_score=float(item.get("liquidity_score") or 0),
+            net_delta=float(item.get("net_delta") or 0),
+            net_gamma=float(item.get("net_gamma") or 0),
+            net_theta=float(item.get("net_theta") or 0),
+            premium_efficiency=float(item.get("premium_efficiency") or 0),
+            market_structure_fit=float(item.get("market_structure_fit") or 0),
+            greek_alignment_score=float(item.get("greek_alignment_score") or 0),
+            edge_score=float(item.get("edge_score") or 0),
+            kelly_fraction=float(item.get("kelly_fraction") or 0),
+            sizing_profiles=sizing_profiles,
+            components=components,
+            reasoning=[str(reason) for reason in (item.get("reasoning") or [])],
+        ))
+    return out
 
 def _map_vol_components(raw_list: list) -> list[VolExpansionComponent]:
     out = []
@@ -290,6 +363,82 @@ async def get_vol_expansion_accuracy(
             "symbol": symbol,
             "lookback_days": lookback_days,
             "note": "Insufficient historical data for volatility expansion calibration.",
+        }
+    return {
+        "symbol": symbol,
+        "lookback_days": lookback_days,
+        "accuracy": accuracy,
+    }
+
+
+@router.get("/position-optimizer", response_model=PositionOptimizerSignalResponse)
+async def get_position_optimizer_signal(
+    symbol: str = Query(default="SPY", description="Underlying symbol"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Return the latest position-optimizer spread ranking for the symbol."""
+    row = await db.get_position_optimizer_signal(symbol)
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No position optimizer signal found for {symbol}. "
+                "The AnalyticsEngine may not have run yet, or no market data is available."
+            ),
+        )
+
+    ts: datetime = row["timestamp"]
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - ts).total_seconds()
+    if age_seconds > STALE_THRESHOLD_SECONDS:
+        logger.warning(
+            f"Position optimizer signal for {symbol} is {age_seconds:.0f}s old "
+            f"(threshold: {STALE_THRESHOLD_SECONDS}s)"
+        )
+
+    return PositionOptimizerSignalResponse(
+        symbol=row["underlying"],
+        timestamp=row["timestamp"],
+        signal_timestamp=row["signal_timestamp"],
+        signal_timeframe=Timeframe(row.get("signal_timeframe", "intraday")),
+        signal_direction=_map_position_direction(row.get("signal_direction", "neutral")),
+        signal_strength=_map_strength(row.get("signal_strength", "low")),
+        trade_type=row.get("trade_type", "no_trade"),
+        current_price=float(row.get("current_price") or 0),
+        composite_score=float(row.get("composite_score") or 0),
+        max_possible_score=row.get("max_possible_score", 1),
+        normalized_score=float(row.get("normalized_score") or 0),
+        top_strategy_type=row.get("top_strategy_type", ""),
+        top_expiry=row.get("top_expiry"),
+        top_dte=row.get("top_dte", 0),
+        top_strikes=row.get("top_strikes", ""),
+        top_probability_of_profit=float(row.get("top_probability_of_profit") or 0),
+        top_expected_value=float(row.get("top_expected_value") or 0),
+        top_max_profit=float(row.get("top_max_profit") or 0),
+        top_max_loss=float(row.get("top_max_loss") or 0),
+        top_kelly_fraction=float(row.get("top_kelly_fraction") or 0),
+        top_sharpe_like_ratio=float(row["top_sharpe_like_ratio"]) if row.get("top_sharpe_like_ratio") is not None else None,
+        top_liquidity_score=float(row["top_liquidity_score"]) if row.get("top_liquidity_score") is not None else None,
+        top_market_structure_fit=float(row["top_market_structure_fit"]) if row.get("top_market_structure_fit") is not None else None,
+        top_reasoning=[str(reason) for reason in (row.get("top_reasoning") or [])],
+        candidates=_map_position_candidates(row.get("candidates") or []),
+    )
+
+
+@router.get("/position-optimizer/accuracy")
+async def get_position_optimizer_accuracy(
+    symbol: str = Query(default="SPY"),
+    lookback_days: int = Query(default=30, ge=7, le=365),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Return historical profitability / calibration stats for position optimizer signals."""
+    accuracy = await db.get_position_optimizer_accuracy(symbol, lookback_days)
+    if not accuracy:
+        return {
+            "symbol": symbol,
+            "lookback_days": lookback_days,
+            "note": "Insufficient historical data for position optimizer calibration.",
         }
     return {
         "symbol": symbol,

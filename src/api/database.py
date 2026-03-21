@@ -1697,6 +1697,104 @@ class DatabaseManager:
             logger.error(f"get_vol_expansion_accuracy failed: {e}")
             return {}
 
+
+    async def get_position_optimizer_signal(
+        self,
+        symbol: str = "SPY",
+    ) -> Optional[Dict[str, Any]]:
+        """Return the most recent position optimizer signal for this symbol."""
+        query = """
+            SELECT
+                underlying,
+                timestamp,
+                signal_timestamp,
+                signal_timeframe,
+                signal_direction,
+                signal_strength,
+                trade_type,
+                current_price,
+                composite_score,
+                max_possible_score,
+                normalized_score,
+                top_strategy_type,
+                top_expiry,
+                top_dte,
+                top_strikes,
+                top_probability_of_profit,
+                top_expected_value,
+                top_max_profit,
+                top_max_loss,
+                top_kelly_fraction,
+                top_sharpe_like_ratio,
+                top_liquidity_score,
+                top_market_structure_fit,
+                top_reasoning,
+                candidates
+            FROM position_optimizer_signals
+            WHERE underlying = $1
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(query, symbol)
+                if not row:
+                    return None
+                d = dict(row)
+                for key in ("top_reasoning", "candidates"):
+                    if isinstance(d.get(key), str):
+                        d[key] = json.loads(d[key])
+                return d
+        except Exception as e:
+            logger.error(f"get_position_optimizer_signal failed ({symbol}): {e}")
+            return None
+
+    async def get_position_optimizer_accuracy(
+        self,
+        symbol: str = "SPY",
+        lookback_days: int = 30,
+    ) -> Dict[str, Any]:
+        """Return historical profitability / calibration stats for the position optimizer."""
+        query = """
+            SELECT
+                signal_direction,
+                strategy_type,
+                SUM(total_signals)::int AS total,
+                SUM(profitable_signals)::int AS profitable_signals,
+                AVG(avg_realized_return_pct)::float AS avg_realized_return_pct,
+                AVG(avg_expected_value)::float AS avg_expected_value,
+                AVG(avg_predicted_pop)::float AS avg_predicted_pop,
+                AVG(avg_realized_move_pct)::float AS avg_realized_move_pct
+            FROM position_optimizer_accuracy
+            WHERE underlying = $1
+              AND trade_date >= CURRENT_DATE - ($2 * INTERVAL '1 day')
+            GROUP BY signal_direction, strategy_type
+            ORDER BY signal_direction, strategy_type
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(query, symbol, lookback_days)
+            result: Dict[str, Any] = {}
+            for row in rows:
+                direction = row["signal_direction"]
+                strategy = row["strategy_type"]
+                total = row["total"] or 0
+                profitable = row["profitable_signals"] or 0
+                result.setdefault(direction, {})[strategy] = {
+                    "total": total,
+                    "profitable_signals": profitable,
+                    "profitability_rate": round(profitable / total, 4) if total > 0 else None,
+                    "avg_realized_return_pct": round(float(row["avg_realized_return_pct"]), 4) if row["avg_realized_return_pct"] is not None else None,
+                    "avg_expected_value": round(float(row["avg_expected_value"]), 4) if row["avg_expected_value"] is not None else None,
+                    "avg_predicted_pop": round(float(row["avg_predicted_pop"]), 4) if row["avg_predicted_pop"] is not None else None,
+                    "avg_realized_move_pct": round(float(row["avg_realized_move_pct"]), 4) if row["avg_realized_move_pct"] is not None else None,
+                }
+            return result
+        except Exception as e:
+            logger.error(f"get_position_optimizer_accuracy failed: {e}")
+            return {}
+
+
     async def get_latest_quote(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
         """Get latest underlying quote"""
         query = """
