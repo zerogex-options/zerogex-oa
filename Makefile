@@ -2524,6 +2524,10 @@ api-test: ## Test ALL API endpoints
 		test_endpoint "/api/signals/trade?symbol=$$SYMBOL&timeframe=$$STF"; \
 	done; \
 	test_endpoint "/api/signals/accuracy?symbol=$$SYMBOL&lookback_days=30"; \
+	test_endpoint "/api/signals/vol-expansion?symbol=$$SYMBOL"; \
+	test_endpoint "/api/signals/vol-expansion/accuracy?symbol=$$SYMBOL&lookback_days=30"; \
+	test_endpoint "/api/signals/position-optimizer?symbol=$$SYMBOL"; \
+	test_endpoint "/api/signals/position-optimizer/accuracy?symbol=$$SYMBOL&lookback_days=30"; \
 	echo ""; \
 	echo "$(BLUE)=== API Test Report ===$(NC)"; \
 	echo "$(GREEN)Passed: $$PASSED$(NC)"; \
