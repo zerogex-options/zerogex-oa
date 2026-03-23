@@ -14,6 +14,8 @@ from fastapi import APIRouter, HTTPException, Query, Depends
 from datetime import datetime, timezone
 import logging
 
+from src.analytics.position_optimizer_engine import ASSUMED_ACCOUNT_EQUITY, RISK_PROFILE_BUDGETS
+
 from ..database import DatabaseManager
 from ..models import (
     TradeSignalResponse,
@@ -103,6 +105,50 @@ def _map_position_direction(raw: str) -> PositionOptimizerDirection:
         return PositionOptimizerDirection(raw)
     except ValueError:
         return PositionOptimizerDirection.NEUTRAL
+
+
+def _rescaled_sizing_profiles(
+    candidate: PositionOptimizerCandidate,
+    portfolio_value: float,
+) -> list[PositionOptimizerSizingProfile]:
+    effective_risk = max(candidate.max_loss, candidate.entry_debit, 1.0)
+    sizing_profiles: list[PositionOptimizerSizingProfile] = []
+
+    for profile, heat_pct in RISK_PROFILE_BUDGETS.items():
+        budget = portfolio_value * heat_pct
+        kelly_adjusted_budget = max(
+            budget * max(candidate.kelly_fraction, 0.10),
+            min(budget, effective_risk),
+        )
+        contracts = max(1, int(kelly_adjusted_budget // effective_risk)) if candidate.expected_value > 0 else 0
+        constrained_by = (
+            "edge filter"
+            if candidate.expected_value <= 0
+            else ("kelly fraction" if kelly_adjusted_budget < budget else "portfolio heat cap")
+        )
+        sizing_profiles.append(
+            PositionOptimizerSizingProfile(
+                profile=profile,
+                contracts=contracts,
+                max_risk_dollars=round(contracts * effective_risk, 2),
+                expected_value_dollars=round(contracts * candidate.expected_value, 2),
+                constrained_by=constrained_by,
+            )
+        )
+
+    return sizing_profiles
+
+
+def _apply_portfolio_value_to_candidates(
+    candidates: list[PositionOptimizerCandidate],
+    portfolio_value: float | None,
+) -> list[PositionOptimizerCandidate]:
+    if portfolio_value is None or portfolio_value == ASSUMED_ACCOUNT_EQUITY:
+        return candidates
+
+    for candidate in candidates:
+        candidate.sizing_profiles = _rescaled_sizing_profiles(candidate, portfolio_value)
+    return candidates
 
 
 def _map_position_candidates(raw_list: list) -> list[PositionOptimizerCandidate]:
@@ -374,6 +420,14 @@ async def get_vol_expansion_accuracy(
 @router.get("/position-optimizer", response_model=PositionOptimizerSignalResponse)
 async def get_position_optimizer_signal(
     symbol: str = Query(default="SPY", description="Underlying symbol"),
+    portfolio_value: float | None = Query(
+        default=None,
+        gt=0,
+        description=(
+            "Optional account equity override used to rescale candidate sizing profiles. "
+            f"Defaults to the optimizer's assumed equity of ${ASSUMED_ACCOUNT_EQUITY:,.0f}."
+        ),
+    ),
     db: DatabaseManager = Depends(get_db),
 ):
     """Return the latest position-optimizer spread ranking for the symbol."""
@@ -396,6 +450,11 @@ async def get_position_optimizer_signal(
             f"Position optimizer signal for {symbol} is {age_seconds:.0f}s old "
             f"(threshold: {STALE_THRESHOLD_SECONDS}s)"
         )
+
+    candidates = _apply_portfolio_value_to_candidates(
+        _map_position_candidates(row.get("candidates") or []),
+        portfolio_value,
+    )
 
     return PositionOptimizerSignalResponse(
         symbol=row["underlying"],
@@ -422,7 +481,7 @@ async def get_position_optimizer_signal(
         top_liquidity_score=float(row["top_liquidity_score"]) if row.get("top_liquidity_score") is not None else None,
         top_market_structure_fit=float(row["top_market_structure_fit"]) if row.get("top_market_structure_fit") is not None else None,
         top_reasoning=[str(reason) for reason in (row.get("top_reasoning") or [])],
-        candidates=_map_position_candidates(row.get("candidates") or []),
+        candidates=candidates,
     )
 
 
