@@ -813,11 +813,15 @@ class DatabaseManager:
                 LIMIT 1
             ),
             latest_quote AS (
-                SELECT uq.close::numeric AS spot_price
-                FROM underlying_quotes uq
-                JOIN latest_summary ls ON ls.underlying = uq.symbol
-                ORDER BY (uq.timestamp <= ls.timestamp) DESC, uq.timestamp DESC
-                LIMIT 1
+                SELECT COALESCE(uq.close, 0)::numeric AS spot_price
+                FROM latest_summary ls
+                LEFT JOIN LATERAL (
+                    SELECT close
+                    FROM underlying_quotes uq
+                    WHERE uq.symbol = ls.underlying
+                    ORDER BY (uq.timestamp <= ls.timestamp) DESC, uq.timestamp DESC
+                    LIMIT 1
+                ) uq ON TRUE
             ),
             strike_exposures AS (
                 SELECT
@@ -999,8 +1003,8 @@ class DatabaseManager:
                 b.total_put_oi,
                 b.put_call_ratio
             FROM base b
-            JOIN LATERAL (
-                SELECT uq.close::numeric AS spot_price
+            LEFT JOIN LATERAL (
+                SELECT COALESCE(uq.close, 0)::numeric AS spot_price
                 FROM underlying_quotes uq
                 WHERE uq.symbol = b.symbol
                 ORDER BY (uq.timestamp <= b.timestamp) DESC, uq.timestamp DESC
