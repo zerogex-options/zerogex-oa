@@ -2480,12 +2480,15 @@ class DatabaseManager:
                 WHERE underlying = $1
             ),
             eligible_strikes AS (
-                SELECT DISTINCT strike
-                FROM option_chains, latest_ts
-                WHERE underlying = $1
-                  AND timestamp = latest_ts.ts
-                  AND expiration <= CURRENT_DATE + $2
-                ORDER BY ABS(strike - $3)
+                SELECT strike
+                FROM (
+                    SELECT DISTINCT strike
+                    FROM option_chains, latest_ts
+                    WHERE underlying = $1
+                      AND timestamp = latest_ts.ts
+                      AND expiration <= CURRENT_DATE + make_interval(days => $2)
+                ) sub
+                ORDER BY ABS(sub.strike - $3::numeric)
                 LIMIT $4
             )
             SELECT
@@ -2500,7 +2503,7 @@ class DatabaseManager:
             JOIN eligible_strikes es ON es.strike = oc.strike
             WHERE oc.underlying = $1
               AND oc.timestamp = lt.ts
-              AND oc.expiration <= CURRENT_DATE + $2
+              AND oc.expiration <= CURRENT_DATE + make_interval(days => $2)
             ORDER BY oc.expiration, oc.strike, oc.option_type
         """
 
