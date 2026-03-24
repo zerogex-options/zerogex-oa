@@ -2518,7 +2518,7 @@ api-test: ## Test ALL API endpoints
 	echo ""; \
 	echo "$(YELLOW)Volatility endpoints$(NC)"; \
 	test_endpoint "/api/volatility/gauge"; \
-	test_endpoint "/api/vol-surface?symbol=$$SYMBOL"; \
+	test_endpoint "/api/volatility/surface?symbol=$$SYMBOL"; \
 	echo ""; \
 	echo "$(YELLOW)Trade signal endpoints$(NC)"; \
 	for STF in $$SIGNAL_TIMEFRAMES; do \
