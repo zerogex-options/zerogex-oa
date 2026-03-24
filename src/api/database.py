@@ -797,24 +797,69 @@ class DatabaseManager:
     async def get_latest_gex_summary(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
         """Get latest GEX summary"""
         query = """
-            SELECT 
-                timestamp,
-                underlying as symbol,
-                max_gamma_strike as spot_price,
-                total_call_oi::numeric as total_call_gex,
-                total_put_oi::numeric as total_put_gex,
-                total_net_gex as net_gex,
-                gamma_flip_point as gamma_flip,
-                max_pain,
-                max_gamma_strike as call_wall,
-                max_gamma_strike as put_wall,
-                total_call_oi,
-                total_put_oi,
-                put_call_ratio
-            FROM gex_summary
-            WHERE underlying = $1
-            ORDER BY timestamp DESC
-            LIMIT 1
+            WITH latest_summary AS (
+                SELECT
+                    gs.timestamp,
+                    gs.underlying,
+                    gs.gamma_flip_point,
+                    gs.max_pain,
+                    gs.total_call_oi,
+                    gs.total_put_oi,
+                    gs.put_call_ratio,
+                    gs.total_net_gex
+                FROM gex_summary gs
+                WHERE gs.underlying = $1
+                ORDER BY gs.timestamp DESC
+                LIMIT 1
+            ),
+            latest_quote AS (
+                SELECT uq.close AS spot_price
+                FROM underlying_quotes uq
+                JOIN latest_summary ls ON ls.underlying = uq.symbol
+                ORDER BY (uq.timestamp <= ls.timestamp) DESC, uq.timestamp DESC
+                LIMIT 1
+            ),
+            strike_totals AS (
+                SELECT
+                    COALESCE(SUM(gbs.call_gamma * gbs.call_oi * 100 * lq.spot_price), 0)::numeric AS total_call_gex,
+                    COALESCE(SUM(-1 * gbs.put_gamma * gbs.put_oi * 100 * lq.spot_price), 0)::numeric AS total_put_gex,
+                    (
+                        SELECT strike
+                        FROM gex_by_strike cws
+                        WHERE cws.underlying = ls.underlying AND cws.timestamp = ls.timestamp
+                        ORDER BY ABS(cws.call_gamma * cws.call_oi * 100 * lq.spot_price) DESC, strike
+                        LIMIT 1
+                    )::numeric AS call_wall,
+                    (
+                        SELECT strike
+                        FROM gex_by_strike pws
+                        WHERE pws.underlying = ls.underlying AND pws.timestamp = ls.timestamp
+                        ORDER BY ABS(-1 * pws.put_gamma * pws.put_oi * 100 * lq.spot_price) DESC, strike
+                        LIMIT 1
+                    )::numeric AS put_wall
+                FROM latest_summary ls
+                JOIN latest_quote lq ON TRUE
+                LEFT JOIN gex_by_strike gbs
+                    ON gbs.underlying = ls.underlying
+                   AND gbs.timestamp = ls.timestamp
+            )
+            SELECT
+                ls.timestamp,
+                ls.underlying AS symbol,
+                lq.spot_price,
+                st.total_call_gex,
+                st.total_put_gex,
+                ls.total_net_gex AS net_gex,
+                ls.gamma_flip_point AS gamma_flip,
+                ls.max_pain,
+                st.call_wall,
+                st.put_wall,
+                ls.total_call_oi,
+                ls.total_put_oi,
+                ls.put_call_ratio
+            FROM latest_summary ls
+            JOIN latest_quote lq ON TRUE
+            JOIN strike_totals st ON TRUE
         """
 
         try:
@@ -911,43 +956,71 @@ class DatabaseManager:
                     COALESCE($3::timestamptz, max_ts) AS end_ts
                 FROM latest
             ),
-            base AS (
+            bucketed AS (
                 SELECT
-                    timestamp,
-                    underlying as symbol,
-                    max_gamma_strike as spot_price,
-                    total_call_oi::numeric as total_call_gex,
-                    total_put_oi::numeric as total_put_gex,
-                    total_net_gex as net_gex,
-                    gamma_flip_point as gamma_flip,
-                    max_pain,
-                    max_gamma_strike as call_wall,
-                    max_gamma_strike as put_wall,
-                    total_call_oi,
-                    total_put_oi,
-                    put_call_ratio,
+                    gs.timestamp,
+                    gs.underlying as symbol,
+                    gs.total_net_gex as net_gex,
+                    gs.gamma_flip_point as gamma_flip,
+                    gs.max_pain,
+                    gs.total_call_oi,
+                    gs.total_put_oi,
+                    gs.put_call_ratio,
                     {bucket} as bucket_ts,
-                    ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) as rn
-                FROM gex_summary
-                WHERE underlying = $1
-                    AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+                    ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY gs.timestamp DESC) as rn
+                FROM gex_summary gs
+                WHERE gs.underlying = $1
+                    AND gs.timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+            ),
+            base AS (
+                SELECT *
+                FROM bucketed
+                WHERE rn = 1
             )
             SELECT
-                bucket_ts as timestamp,
-                symbol,
-                spot_price,
-                total_call_gex,
-                total_put_gex,
-                net_gex,
-                gamma_flip,
-                max_pain,
-                call_wall,
-                put_wall,
-                total_call_oi,
-                total_put_oi,
-                put_call_ratio
-            FROM base
-            WHERE rn = 1
+                b.bucket_ts as timestamp,
+                b.symbol,
+                q.spot_price,
+                x.total_call_gex,
+                x.total_put_gex,
+                b.net_gex,
+                b.gamma_flip,
+                b.max_pain,
+                x.call_wall,
+                x.put_wall,
+                b.total_call_oi,
+                b.total_put_oi,
+                b.put_call_ratio
+            FROM base b
+            JOIN LATERAL (
+                SELECT uq.close::numeric AS spot_price
+                FROM underlying_quotes uq
+                WHERE uq.symbol = b.symbol
+                ORDER BY (uq.timestamp <= b.timestamp) DESC, uq.timestamp DESC
+                LIMIT 1
+            ) q ON TRUE
+            JOIN LATERAL (
+                SELECT
+                    COALESCE(SUM(gbs.call_gamma * gbs.call_oi * 100 * q.spot_price), 0)::numeric AS total_call_gex,
+                    COALESCE(SUM(-1 * gbs.put_gamma * gbs.put_oi * 100 * q.spot_price), 0)::numeric AS total_put_gex,
+                    (
+                        SELECT strike
+                        FROM gex_by_strike cws
+                        WHERE cws.underlying = b.symbol AND cws.timestamp = b.timestamp
+                        ORDER BY ABS(cws.call_gamma * cws.call_oi * 100 * q.spot_price) DESC, strike
+                        LIMIT 1
+                    )::numeric AS call_wall,
+                    (
+                        SELECT strike
+                        FROM gex_by_strike pws
+                        WHERE pws.underlying = b.symbol AND pws.timestamp = b.timestamp
+                        ORDER BY ABS(-1 * pws.put_gamma * pws.put_oi * 100 * q.spot_price) DESC, strike
+                        LIMIT 1
+                    )::numeric AS put_wall
+                FROM gex_by_strike gbs
+                WHERE gbs.underlying = b.symbol
+                  AND gbs.timestamp = b.timestamp
+            ) x ON TRUE
             ORDER BY timestamp DESC
             LIMIT $4
         """
