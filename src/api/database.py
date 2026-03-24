@@ -813,35 +813,40 @@ class DatabaseManager:
                 LIMIT 1
             ),
             latest_quote AS (
-                SELECT uq.close AS spot_price
+                SELECT uq.close::numeric AS spot_price
                 FROM underlying_quotes uq
                 JOIN latest_summary ls ON ls.underlying = uq.symbol
                 ORDER BY (uq.timestamp <= ls.timestamp) DESC, uq.timestamp DESC
                 LIMIT 1
             ),
+            strike_exposures AS (
+                SELECT
+                    gbs.strike,
+                    (gbs.call_gamma * gbs.call_oi * 100 * lq.spot_price)::numeric AS call_exposure,
+                    (-1 * gbs.put_gamma * gbs.put_oi * 100 * lq.spot_price)::numeric AS put_exposure
+                FROM gex_by_strike gbs
+                JOIN latest_summary ls
+                  ON gbs.underlying = ls.underlying
+                 AND gbs.timestamp = ls.timestamp
+                JOIN latest_quote lq ON TRUE
+            ),
             strike_totals AS (
                 SELECT
-                    COALESCE(SUM(gbs.call_gamma * gbs.call_oi * 100 * lq.spot_price), 0)::numeric AS total_call_gex,
-                    COALESCE(SUM(-1 * gbs.put_gamma * gbs.put_oi * 100 * lq.spot_price), 0)::numeric AS total_put_gex,
-                    (
-                        SELECT strike
-                        FROM gex_by_strike cws
-                        WHERE cws.underlying = ls.underlying AND cws.timestamp = ls.timestamp
-                        ORDER BY ABS(cws.call_gamma * cws.call_oi * 100 * lq.spot_price) DESC, strike
-                        LIMIT 1
-                    )::numeric AS call_wall,
-                    (
-                        SELECT strike
-                        FROM gex_by_strike pws
-                        WHERE pws.underlying = ls.underlying AND pws.timestamp = ls.timestamp
-                        ORDER BY ABS(-1 * pws.put_gamma * pws.put_oi * 100 * lq.spot_price) DESC, strike
-                        LIMIT 1
-                    )::numeric AS put_wall
-                FROM latest_summary ls
-                JOIN latest_quote lq ON TRUE
-                LEFT JOIN gex_by_strike gbs
-                    ON gbs.underlying = ls.underlying
-                   AND gbs.timestamp = ls.timestamp
+                    COALESCE(SUM(se.call_exposure), 0)::numeric AS total_call_gex,
+                    COALESCE(SUM(se.put_exposure), 0)::numeric AS total_put_gex
+                FROM strike_exposures se
+            ),
+            call_wall AS (
+                SELECT se.strike::numeric AS call_wall
+                FROM strike_exposures se
+                ORDER BY ABS(se.call_exposure) DESC, se.strike
+                LIMIT 1
+            ),
+            put_wall AS (
+                SELECT se.strike::numeric AS put_wall
+                FROM strike_exposures se
+                ORDER BY ABS(se.put_exposure) DESC, se.strike
+                LIMIT 1
             )
             SELECT
                 ls.timestamp,
@@ -852,14 +857,16 @@ class DatabaseManager:
                 ls.total_net_gex AS net_gex,
                 ls.gamma_flip_point AS gamma_flip,
                 ls.max_pain,
-                st.call_wall,
-                st.put_wall,
+                cw.call_wall,
+                pw.put_wall,
                 ls.total_call_oi,
                 ls.total_put_oi,
                 ls.put_call_ratio
             FROM latest_summary ls
             JOIN latest_quote lq ON TRUE
             JOIN strike_totals st ON TRUE
+            LEFT JOIN call_wall cw ON TRUE
+            LEFT JOIN put_wall pw ON TRUE
         """
 
         try:
@@ -981,13 +988,13 @@ class DatabaseManager:
                 b.bucket_ts as timestamp,
                 b.symbol,
                 q.spot_price,
-                x.total_call_gex,
-                x.total_put_gex,
+                totals.total_call_gex,
+                totals.total_put_gex,
                 b.net_gex,
                 b.gamma_flip,
                 b.max_pain,
-                x.call_wall,
-                x.put_wall,
+                cw.call_wall,
+                pw.put_wall,
                 b.total_call_oi,
                 b.total_put_oi,
                 b.put_call_ratio
@@ -1002,25 +1009,27 @@ class DatabaseManager:
             JOIN LATERAL (
                 SELECT
                     COALESCE(SUM(gbs.call_gamma * gbs.call_oi * 100 * q.spot_price), 0)::numeric AS total_call_gex,
-                    COALESCE(SUM(-1 * gbs.put_gamma * gbs.put_oi * 100 * q.spot_price), 0)::numeric AS total_put_gex,
-                    (
-                        SELECT strike
-                        FROM gex_by_strike cws
-                        WHERE cws.underlying = b.symbol AND cws.timestamp = b.timestamp
-                        ORDER BY ABS(cws.call_gamma * cws.call_oi * 100 * q.spot_price) DESC, strike
-                        LIMIT 1
-                    )::numeric AS call_wall,
-                    (
-                        SELECT strike
-                        FROM gex_by_strike pws
-                        WHERE pws.underlying = b.symbol AND pws.timestamp = b.timestamp
-                        ORDER BY ABS(-1 * pws.put_gamma * pws.put_oi * 100 * q.spot_price) DESC, strike
-                        LIMIT 1
-                    )::numeric AS put_wall
+                    COALESCE(SUM(-1 * gbs.put_gamma * gbs.put_oi * 100 * q.spot_price), 0)::numeric AS total_put_gex
                 FROM gex_by_strike gbs
                 WHERE gbs.underlying = b.symbol
                   AND gbs.timestamp = b.timestamp
-            ) x ON TRUE
+            ) totals ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT gbs.strike::numeric AS call_wall
+                FROM gex_by_strike gbs
+                WHERE gbs.underlying = b.symbol
+                  AND gbs.timestamp = b.timestamp
+                ORDER BY ABS(gbs.call_gamma * gbs.call_oi * 100 * q.spot_price) DESC, gbs.strike
+                LIMIT 1
+            ) cw ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT gbs.strike::numeric AS put_wall
+                FROM gex_by_strike gbs
+                WHERE gbs.underlying = b.symbol
+                  AND gbs.timestamp = b.timestamp
+                ORDER BY ABS(-1 * gbs.put_gamma * gbs.put_oi * 100 * q.spot_price) DESC, gbs.strike
+                LIMIT 1
+            ) pw ON TRUE
             ORDER BY timestamp DESC
             LIMIT $4
         """
