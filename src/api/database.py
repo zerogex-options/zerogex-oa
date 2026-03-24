@@ -2447,3 +2447,80 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error fetching option contract history: {e}")
             raise
+
+    # ------------------------------------------------------------------
+    # Vol Surface
+    # ------------------------------------------------------------------
+
+    async def get_vol_surface_data(
+        self,
+        symbol: str,
+        dte_max: int,
+        strike_count: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch latest option-chain snapshot for a vol surface.
+
+        Returns spot price, snapshot timestamp, and rows of
+        (strike, expiration, option_type, implied_volatility, delta,
+        open_interest) filtered to the `strike_count` strikes nearest
+        spot and expirations within `dte_max` days.
+        """
+        spot_query = """
+            SELECT close, timestamp
+            FROM underlying_quotes
+            WHERE symbol = $1
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+
+        chain_query = """
+            WITH latest_ts AS (
+                SELECT MAX(timestamp) AS ts
+                FROM option_chains
+                WHERE underlying = $1
+            ),
+            eligible_strikes AS (
+                SELECT DISTINCT strike
+                FROM option_chains, latest_ts
+                WHERE underlying = $1
+                  AND timestamp = latest_ts.ts
+                  AND expiration <= CURRENT_DATE + $2
+                ORDER BY ABS(strike - $3)
+                LIMIT $4
+            )
+            SELECT
+                oc.strike,
+                oc.expiration,
+                oc.option_type,
+                oc.implied_volatility,
+                oc.delta,
+                oc.open_interest
+            FROM option_chains oc
+            CROSS JOIN latest_ts lt
+            JOIN eligible_strikes es ON es.strike = oc.strike
+            WHERE oc.underlying = $1
+              AND oc.timestamp = lt.ts
+              AND oc.expiration <= CURRENT_DATE + $2
+            ORDER BY oc.expiration, oc.strike, oc.option_type
+        """
+
+        try:
+            async with self.pool.acquire() as conn:
+                spot_row = await conn.fetchrow(spot_query, symbol)
+                if not spot_row:
+                    return None
+
+                spot_price = float(spot_row["close"])
+                timestamp = spot_row["timestamp"]
+
+                rows = await conn.fetch(
+                    chain_query, symbol, dte_max, spot_price, strike_count
+                )
+                return {
+                    "spot_price": spot_price,
+                    "timestamp": timestamp,
+                    "rows": [dict(r) for r in rows],
+                }
+        except Exception as e:
+            logger.error(f"Error fetching vol surface data: {e}")
+            raise

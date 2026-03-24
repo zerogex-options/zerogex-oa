@@ -35,6 +35,7 @@ from .models import (
 from .routers.trade_signals import router as trade_signals_router
 from .routers.volatility_gauge import router as volatility_gauge_router
 from .routers.option_contract import router as option_contract_router
+from .routers.vol_surface import router as vol_surface_router
 
 # Configure logging
 logging.basicConfig(
@@ -83,6 +84,7 @@ app = FastAPI(
         {"name": "Day Trading", "description": "Intraday trading signals: VWAP, ORB, dealer hedging, volume, momentum"},
         {"name": "Trade Signals", "description": "Composite trade signal generation"},
         {"name": "Volatility", "description": "Volatility gauge and regime analysis"},
+        {"name": "Vol Surface", "description": "Implied volatility surface and term structure"},
     ]
 )
 
@@ -98,6 +100,7 @@ app.add_middleware(
 app.include_router(trade_signals_router)
 app.include_router(volatility_gauge_router)
 app.include_router(option_contract_router)
+app.include_router(vol_surface_router)
 
 # ============================================================================
 # Health Check
