@@ -96,6 +96,21 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='option_chains' AND column_name='bid_volume') THEN
         ALTER TABLE option_chains ADD COLUMN bid_volume BIGINT DEFAULT 0;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='option_chains' AND column_name='implied_volatility') THEN
+        ALTER TABLE option_chains ADD COLUMN implied_volatility NUMERIC(8, 6);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='option_chains' AND column_name='delta') THEN
+        ALTER TABLE option_chains ADD COLUMN delta NUMERIC(8, 6);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='option_chains' AND column_name='gamma') THEN
+        ALTER TABLE option_chains ADD COLUMN gamma NUMERIC(10, 8);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='option_chains' AND column_name='theta') THEN
+        ALTER TABLE option_chains ADD COLUMN theta NUMERIC(10, 6);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='option_chains' AND column_name='vega') THEN
+        ALTER TABLE option_chains ADD COLUMN vega NUMERIC(10, 6);
+    END IF;
 END $$;
 
 CREATE INDEX IF NOT EXISTS idx_option_chains_timestamp ON option_chains(timestamp DESC);
