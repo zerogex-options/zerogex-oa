@@ -1098,11 +1098,11 @@ flow-smart-money: ## Unusual activity detection
 				(volume_delta * last * 100) as notional, \
 				last as price, \
 				CASE \
-					WHEN volume_delta * last * 100 >= 500000 THEN '💰 $$500K+' \
-					WHEN volume_delta * last * 100 >= 250000 THEN '💵 $$250K+' \
-					WHEN volume_delta * last * 100 >= 100000 THEN '💸 $$100K+' \
-					WHEN volume_delta * last * 100 >= 50000 THEN '💳 $$50K+' \
-					ELSE '💴 <$$50K' \
+					WHEN volume_delta * last * 100 >= 500000 THEN '💰 500K+' \
+					WHEN volume_delta * last * 100 >= 250000 THEN '💵 250K+' \
+					WHEN volume_delta * last * 100 >= 100000 THEN '💸 100K+' \
+					WHEN volume_delta * last * 100 >= 50000 THEN '💳 50K+' \
+					ELSE '💴 <50K' \
 				END as notional_class, \
 				CASE \
 					WHEN volume_delta >= 500 THEN '🔥 Massive Block' \
