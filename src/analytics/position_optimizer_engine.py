@@ -329,11 +329,28 @@ class PositionOptimizerEngine:
                 raw_option_rows = cur.fetchall()
 
                 if not raw_option_rows:
+                    cur.execute(
+                        """
+                        SELECT option_symbol
+                        FROM option_chains
+                        WHERE underlying = %s
+                          AND timestamp <= %s
+                          AND expiration BETWEEN (%s::date + (%s * INTERVAL '1 day'))
+                                              AND (%s::date + (%s * INTERVAL '1 day'))
+                        ORDER BY timestamp DESC, option_symbol
+                        LIMIT 5
+                        """,
+                        (self.db_symbol, anchor_ts, trade_date, dte_min, trade_date, dte_max),
+                    )
+                    candidate_contracts = [row[0] for row in cur.fetchall()]
                     logger.warning(
-                        "PositionOptimizerEngine: no option rows in %s DTE window (%s-%s); widening window",
+                        "PositionOptimizerEngine: no option rows in %s DTE window (%s-%s) at snapshot=%s; "
+                        "candidate contracts=%s; widening window",
                         signal_timeframe,
                         dte_min,
                         dte_max,
+                        snapshot_ts,
+                        ", ".join(candidate_contracts) if candidate_contracts else "none",
                     )
                     cur.execute(
                         """
