@@ -261,27 +261,39 @@ class PositionOptimizerEngine:
                     elif option_type == "P":
                         smart_put = float(premium or 0.0)
 
-                cur.execute(
-                    """
-                    SELECT SUM(delta * open_interest * 100)
-                    FROM option_chains
-                    WHERE underlying = %s
-                      AND timestamp = (
-                          SELECT MAX(timestamp)
-                          FROM option_chains
-                          WHERE underlying = %s
-                            AND timestamp <= %s
-                      )
-                      AND delta IS NOT NULL
-                      AND open_interest > 0
-                    """,
-                    (self.db_symbol, self.db_symbol, anchor_ts),
-                )
-                delta_row = cur.fetchone()
-                dealer_net_delta = -(float(delta_row[0]) if delta_row and delta_row[0] else 0.0)
-
                 dte_min, dte_max = TARGET_DTE_WINDOWS.get(signal_timeframe, (1, 7))
                 trade_date = anchor_ts.astimezone(ET).date() if anchor_ts.tzinfo else anchor_ts.date()
+                cur.execute(
+                    """
+                    SELECT MAX(timestamp)
+                    FROM option_chains
+                    WHERE underlying = %s
+                      AND timestamp <= %s
+                      AND expiration BETWEEN (%s::date + (%s * INTERVAL '1 day'))
+                                          AND (%s::date + (%s * INTERVAL '1 day'))
+                    """,
+                    (self.db_symbol, anchor_ts, trade_date, dte_min, trade_date, dte_max),
+                )
+                snapshot_row = cur.fetchone()
+                snapshot_ts = snapshot_row[0] if snapshot_row else None
+
+                if snapshot_ts is not None:
+                    cur.execute(
+                        """
+                        SELECT SUM(delta * open_interest * 100)
+                        FROM option_chains
+                        WHERE underlying = %s
+                          AND timestamp = %s
+                          AND delta IS NOT NULL
+                          AND open_interest > 0
+                        """,
+                        (self.db_symbol, snapshot_ts),
+                    )
+                    delta_row = cur.fetchone()
+                    dealer_net_delta = -(float(delta_row[0]) if delta_row and delta_row[0] else 0.0)
+                else:
+                    dealer_net_delta = 0.0
+
                 cur.execute(
                     """
                     SELECT
@@ -299,12 +311,7 @@ class PositionOptimizerEngine:
                         open_interest
                     FROM option_chains
                     WHERE underlying = %s
-                      AND timestamp = (
-                          SELECT MAX(timestamp)
-                          FROM option_chains
-                          WHERE underlying = %s
-                            AND timestamp <= %s
-                      )
+                      AND timestamp = %s
                       AND expiration BETWEEN (%s::date + (%s * INTERVAL '1 day'))
                                           AND (%s::date + (%s * INTERVAL '1 day'))
                       AND (
@@ -313,7 +320,7 @@ class PositionOptimizerEngine:
                       )
                     ORDER BY expiration, option_type, strike
                     """,
-                    (self.db_symbol, self.db_symbol, anchor_ts, trade_date, dte_min, trade_date, dte_max),
+                    (self.db_symbol, snapshot_ts, trade_date, dte_min, trade_date, dte_max),
                 )
                 raw_option_rows = cur.fetchall()
 
@@ -324,6 +331,18 @@ class PositionOptimizerEngine:
                         dte_min,
                         dte_max,
                     )
+                    cur.execute(
+                        """
+                        SELECT MAX(timestamp)
+                        FROM option_chains
+                        WHERE underlying = %s
+                          AND timestamp <= %s
+                          AND expiration BETWEEN %s::date AND (%s::date + INTERVAL '45 day')
+                        """,
+                        (self.db_symbol, anchor_ts, trade_date, trade_date),
+                    )
+                    snapshot_row = cur.fetchone()
+                    snapshot_ts = snapshot_row[0] if snapshot_row else None
                     cur.execute(
                         """
                         SELECT
@@ -341,12 +360,7 @@ class PositionOptimizerEngine:
                             open_interest
                         FROM option_chains
                         WHERE underlying = %s
-                          AND timestamp = (
-                              SELECT MAX(timestamp)
-                              FROM option_chains
-                              WHERE underlying = %s
-                                AND timestamp <= %s
-                          )
+                          AND timestamp = %s
                           AND expiration BETWEEN %s::date AND (%s::date + INTERVAL '45 day')
                           AND (
                               (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
@@ -354,7 +368,7 @@ class PositionOptimizerEngine:
                           )
                         ORDER BY expiration, option_type, strike
                         """,
-                        (self.db_symbol, self.db_symbol, anchor_ts, trade_date, trade_date),
+                        (self.db_symbol, snapshot_ts, trade_date, trade_date),
                     )
                     raw_option_rows = cur.fetchall()
 
