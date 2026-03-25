@@ -271,6 +271,10 @@ class PositionOptimizerEngine:
                       AND timestamp <= %s
                       AND expiration BETWEEN (%s::date + (%s * INTERVAL '1 day'))
                                           AND (%s::date + (%s * INTERVAL '1 day'))
+                      AND (
+                          (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
+                          OR (last IS NOT NULL AND last > 0)
+                      )
                     """,
                     (self.db_symbol, anchor_ts, trade_date, dte_min, trade_date, dte_max),
                 )
@@ -338,6 +342,10 @@ class PositionOptimizerEngine:
                         WHERE underlying = %s
                           AND timestamp <= %s
                           AND expiration BETWEEN %s::date AND (%s::date + INTERVAL '45 day')
+                          AND (
+                              (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
+                              OR (last IS NOT NULL AND last > 0)
+                          )
                         """,
                         (self.db_symbol, anchor_ts, trade_date, trade_date),
                     )
