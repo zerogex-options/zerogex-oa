@@ -40,6 +40,19 @@ logger = get_logger(__name__)
 ET = pytz.timezone("US/Eastern")
 
 
+def _to_db_float(value: Any) -> Optional[float]:
+    """Convert numeric-like values (including numpy scalars) to plain float for DB writes."""
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed:  # NaN check
+        return None
+    return parsed
+
+
 class IngestionEngine:
     """
     Main ingestion engine - forward-only streaming with storage
@@ -381,11 +394,12 @@ class IngestionEngine:
             # Aggregate: last of each field
             last = buffer[-1]
 
-            # Convert numpy types to Python native types for PostgreSQL
-            delta = float(last.get("delta")) if last.get("delta") is not None else None
-            gamma = float(last.get("gamma")) if last.get("gamma") is not None else None
-            theta = float(last.get("theta")) if last.get("theta") is not None else None
-            vega = float(last.get("vega")) if last.get("vega") is not None else None
+            # Convert numeric scalars (including numpy types) to Python floats for PostgreSQL
+            delta = _to_db_float(last.get("delta"))
+            gamma = _to_db_float(last.get("gamma"))
+            theta = _to_db_float(last.get("theta"))
+            vega = _to_db_float(last.get("vega"))
+            implied_volatility = _to_db_float(last.get("implied_volatility"))
 
             # Classify each volume delta chunk in the buffer into ask/mid/bid buckets.
             # Iterate consecutive pairs; the volume delta between two snapshots is
@@ -424,7 +438,7 @@ class IngestionEngine:
                 "mid": last.get("mid"),
                 "volume": max((b.get("volume") or 0) for b in buffer),
                 "open_interest": max((b.get("open_interest") or 0) for b in buffer),
-                "implied_volatility": last.get("implied_volatility"),
+                "implied_volatility": implied_volatility,
                 "ask_volume": ask_volume,
                 "mid_volume": mid_volume,
                 "bid_volume": bid_volume,

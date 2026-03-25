@@ -311,6 +311,10 @@ class BackfillManager:
     def _store_option_quote(self, option_data: Dict[str, Any]):
         """Store option quote directly in database"""
         try:
+            implied_volatility = safe_float(
+                option_data.get("implied_volatility"),
+                field_name="implied_volatility",
+            )
             with db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
@@ -342,7 +346,7 @@ class BackfillManager:
                     option_data["ask"],
                     option_data["volume"],
                     option_data["open_interest"],
-                    option_data.get("implied_volatility"),
+                    implied_volatility,
                     option_data.get("delta"),
                     option_data.get("gamma"),
                     option_data.get("theta"),
