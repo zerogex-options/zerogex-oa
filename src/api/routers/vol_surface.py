@@ -17,7 +17,7 @@ import threading
 from ..database import DatabaseManager
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/volatility/surface", tags=["Vol Surface"])
+router = APIRouter(prefix="/api/volatility/surface", tags=["Volatility"])
 
 # ---------------------------------------------------------------------------
 # Response models
@@ -95,10 +95,9 @@ def get_db() -> DatabaseManager:
 # ---------------------------------------------------------------------------
 
 def _iv_or_null(row: dict) -> Optional[float]:
-    """Return IV as float, or None if OI is zero/missing."""
+    """Return IV as float, or None if IV is missing/non-positive."""
     iv = row.get("implied_volatility")
-    oi = row.get("open_interest")
-    if iv is None or oi is None or oi <= 0:
+    if iv is None or iv <= 0:
         return None
     return float(iv)
 
@@ -173,7 +172,7 @@ def _compute_25d_skew(rows_for_exp: List[dict]) -> Optional[float]:
 
 @router.get("", response_model=VolSurfaceResponse)
 async def get_vol_surface(
-    symbol: str = Query(..., description="Underlying symbol (e.g. SPY)"),
+    symbol: str = Query(default="SPY", description="Underlying symbol (e.g. SPY)"),
     dte_max: int = Query(default=60, ge=1, le=365, description="Max days to expiration to include"),
     strike_count: int = Query(default=30, ge=5, le=100, description="Number of strikes centered on spot"),
     db: DatabaseManager = Depends(get_db),

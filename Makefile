@@ -1072,11 +1072,7 @@ flow-by-expiration: ## Flow by expiration date — 1-min intervals (default: SPY
 flow-smart-money: ## Unusual activity detection
 	@echo "$(BLUE)=== Smart Money Flow / Unusual Activity (Most Recent 20 Rows) ===$(NC)"
 	@$(PSQL) -c "\
-		WITH latest AS ( \
-			SELECT MAX(timestamp) as max_ts \
-			FROM option_chains \
-			WHERE underlying = '$(FLOW_SYMBOL)' \
-		), option_chain_deltas AS ( \
+		WITH option_chain_deltas AS ( \
 			SELECT \
 				timestamp, option_symbol, underlying, strike, expiration, option_type, last, implied_volatility, delta, \
 				COALESCE( \
@@ -1089,10 +1085,9 @@ flow-smart-money: ## Unusual activity detection
 					), \
 					0 \
 				) AS volume_delta \
-			FROM option_chains, latest \
+			FROM option_chains \
 			WHERE underlying = '$(FLOW_SYMBOL)' \
-				AND latest.max_ts IS NOT NULL \
-				AND timestamp >= latest.max_ts - INTERVAL '120 minutes' \
+				AND timestamp >= NOW() - INTERVAL '120 minutes' \
 		), scored AS ( \
 			SELECT \
 				timestamp AT TIME ZONE 'America/New_York' as time_et, \
@@ -1121,7 +1116,8 @@ flow-smart-money: ## Unusual activity detection
 					CASE WHEN implied_volatility > 1.0 THEN 2 WHEN implied_volatility > 0.6 THEN 1 ELSE 0 END + \
 					CASE WHEN ABS(delta) < 0.15 THEN 1 ELSE 0 END + \
 					CASE WHEN (expiration - CURRENT_DATE) <= 2 THEN 1 ELSE 0 END \
-				)) as unusual_score \
+				)) as unusual_score, \
+				ROW_NUMBER() OVER (PARTITION BY option_symbol ORDER BY timestamp DESC) as rn_contract \
 			FROM option_chain_deltas \
 			WHERE volume_delta > 0 \
 				AND ( \
@@ -1145,7 +1141,8 @@ flow-smart-money: ## Unusual activity detection
 			notional_class, \
 			size_class \
 		FROM scored \
-		ORDER BY timestamp DESC, unusual_score DESC, notional DESC \
+		WHERE rn_contract = 1 \
+		ORDER BY unusual_score DESC, notional DESC, timestamp DESC \
 		LIMIT 20;"
 
 .PHONY: flow-buying-pressure

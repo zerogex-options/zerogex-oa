@@ -1208,46 +1208,118 @@ class DatabaseManager:
         session: str = 'current',
         limit: int = 20
     ) -> List[Dict[str, Any]]:
-        """Get smart money flow from flow_smart_money (1-min intervals)."""
+        """Get smart-money events directly from option_chains volume deltas."""
         session_start, session_end = _get_session_bounds(session)
         query = """
+            WITH chain_deltas AS (
+                SELECT
+                    oc.timestamp,
+                    oc.underlying AS symbol,
+                    oc.option_symbol,
+                    oc.strike,
+                    oc.expiration,
+                    oc.option_type,
+                    COALESCE(oc.last, 0)::numeric AS last,
+                    oc.implied_volatility::numeric AS implied_volatility,
+                    oc.delta::numeric AS delta,
+                    uq.close::numeric AS underlying_price,
+                    CASE
+                        WHEN p.prev_volume IS NULL THEN COALESCE(oc.volume, 0)
+                        WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
+                           = (oc.timestamp AT TIME ZONE 'America/New_York')::date
+                            THEN GREATEST(COALESCE(oc.volume, 0) - COALESCE(p.prev_volume, 0), 0)
+                        ELSE COALESCE(oc.volume, 0)
+                    END::bigint AS volume_delta
+                FROM option_chains oc
+                LEFT JOIN LATERAL (
+                    SELECT oc2.timestamp AS prev_ts, oc2.volume AS prev_volume
+                    FROM option_chains oc2
+                    WHERE oc2.option_symbol = oc.option_symbol
+                      AND oc2.timestamp < oc.timestamp
+                    ORDER BY oc2.timestamp DESC
+                    LIMIT 1
+                ) p ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT close
+                    FROM underlying_quotes uq
+                    WHERE uq.symbol = oc.underlying
+                      AND uq.timestamp <= oc.timestamp
+                    ORDER BY uq.timestamp DESC
+                    LIMIT 1
+                ) uq ON TRUE
+                WHERE oc.underlying = $1
+                  AND oc.timestamp >= $2
+                  AND oc.timestamp <= $3
+            ),
+            scored AS (
+                SELECT
+                    timestamp,
+                    symbol,
+                    option_symbol AS contract,
+                    strike,
+                    expiration,
+                    (expiration - CURRENT_DATE)::int AS dte,
+                    option_type,
+                    volume_delta AS flow,
+                    (volume_delta * last * 100)::numeric AS notional,
+                    delta,
+                    LEAST(10, GREATEST(0,
+                        CASE WHEN volume_delta >= 500 THEN 4 WHEN volume_delta >= 200 THEN 3 WHEN volume_delta >= 100 THEN 2 WHEN volume_delta >= 50 THEN 1 ELSE 0 END +
+                        CASE WHEN volume_delta * last * 100 >= 500000 THEN 4 WHEN volume_delta * last * 100 >= 250000 THEN 3 WHEN volume_delta * last * 100 >= 100000 THEN 2 WHEN volume_delta * last * 100 >= 50000 THEN 1 ELSE 0 END +
+                        CASE WHEN implied_volatility > 1.0 THEN 2 WHEN implied_volatility > 0.6 THEN 1 ELSE 0 END +
+                        CASE WHEN ABS(delta) < 0.15 THEN 1 ELSE 0 END +
+                        CASE WHEN (expiration - CURRENT_DATE) <= 2 THEN 1 ELSE 0 END
+                    ))::numeric AS score,
+                    CASE
+                        WHEN volume_delta * last * 100 >= 500000 THEN '💰 $500K+'
+                        WHEN volume_delta * last * 100 >= 250000 THEN '💵 $250K+'
+                        WHEN volume_delta * last * 100 >= 100000 THEN '💸 $100K+'
+                        WHEN volume_delta * last * 100 >= 50000 THEN '💳 $50K+'
+                        ELSE '💴 <$50K'
+                    END AS notional_class,
+                    CASE
+                        WHEN volume_delta >= 500 THEN '🔥 Massive Block'
+                        WHEN volume_delta >= 200 THEN '📦 Large Block'
+                        WHEN volume_delta >= 100 THEN '📊 Medium Block'
+                        ELSE '💼 Standard'
+                    END AS size_class,
+                    underlying_price,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY option_symbol
+                        ORDER BY timestamp DESC
+                    ) AS rn_contract
+                FROM chain_deltas
+                WHERE volume_delta > 0
+                  AND (
+                    volume_delta >= 50
+                    OR volume_delta * last * 100 >= 50000
+                    OR implied_volatility > 0.4
+                    OR (ABS(delta) < 0.15 AND volume_delta >= 20)
+                  )
+            )
             SELECT
                 timestamp,
                 symbol,
-                option_symbol AS contract,
+                contract,
                 strike,
                 expiration,
-                (expiration - CURRENT_DATE)::int AS dte,
+                dte,
                 option_type,
-                total_volume AS flow,
-                total_premium AS notional,
-                avg_delta AS delta,
-                unusual_activity_score AS score,
-                CASE
-                    WHEN total_premium >= 500000 THEN '💰 $500K+'
-                    WHEN total_premium >= 250000 THEN '💵 $250K+'
-                    WHEN total_premium >= 100000 THEN '💸 $100K+'
-                    WHEN total_premium >= 50000 THEN '💳 $50K+'
-                    ELSE '💴 <$50K'
-                END AS notional_class,
-                CASE
-                    WHEN total_volume >= 500 THEN '🔥 Massive Block'
-                    WHEN total_volume >= 200 THEN '📦 Large Block'
-                    WHEN total_volume >= 100 THEN '📊 Medium Block'
-                    ELSE '💼 Standard'
-                END AS size_class,
+                flow,
+                notional,
+                delta,
+                score,
+                notional_class,
+                size_class,
                 underlying_price
-            FROM flow_smart_money
-            WHERE symbol = $1
-              AND timestamp >= $2
-              AND timestamp <= $3
-            ORDER BY timestamp DESC, unusual_activity_score DESC, total_premium DESC
+            FROM scored
+            WHERE rn_contract = 1
+            ORDER BY score DESC, notional DESC, timestamp DESC
             LIMIT $4
         """
 
         try:
             async with self.pool.acquire() as conn:
-                await self._refresh_flow_cache(conn, symbol)
                 rows = await conn.fetch(query, symbol, session_start, session_end, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
