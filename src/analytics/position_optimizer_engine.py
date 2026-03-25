@@ -343,7 +343,7 @@ class PositionOptimizerEngine:
                         (self.db_symbol, anchor_ts, trade_date, dte_min, trade_date, dte_max),
                     )
                     candidate_contracts = [row[0] for row in cur.fetchall()]
-                    logger.warning(
+                    logger.info(
                         "PositionOptimizerEngine: no option rows in %s DTE window (%s-%s) at snapshot=%s; "
                         "candidate contracts=%s; widening window",
                         signal_timeframe,
@@ -416,7 +416,15 @@ class PositionOptimizerEngine:
                         }
                     )
                 if not option_rows:
-                    logger.warning("PositionOptimizerEngine: no option rows in target expiry window")
+                    logger.warning(
+                        "PositionOptimizerEngine: no option rows in target expiry window for %s "
+                        "(timeframe=%s anchor=%s trade_date=%s snapshot=%s)",
+                        self.db_symbol,
+                        signal_timeframe,
+                        anchor_ts,
+                        trade_date,
+                        snapshot_ts,
+                    )
                     return None
 
                 available_dtes = sorted({max((row["expiration"] - trade_date).days, 0) for row in option_rows})
