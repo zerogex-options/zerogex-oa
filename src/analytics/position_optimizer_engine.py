@@ -307,15 +307,59 @@ class PositionOptimizerEngine:
                       )
                       AND expiration BETWEEN (%s::date + (%s * INTERVAL '1 day'))
                                           AND (%s::date + (%s * INTERVAL '1 day'))
-                      AND bid IS NOT NULL
-                      AND ask IS NOT NULL
-                      AND ask > 0
+                      AND (
+                          (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
+                          OR (last IS NOT NULL AND last > 0)
+                      )
                     ORDER BY expiration, option_type, strike
                     """,
                     (self.db_symbol, self.db_symbol, anchor_ts, trade_date, dte_min, trade_date, dte_max),
                 )
+                raw_option_rows = cur.fetchall()
+
+                if not raw_option_rows:
+                    logger.warning(
+                        "PositionOptimizerEngine: no option rows in %s DTE window (%s-%s); widening window",
+                        signal_timeframe,
+                        dte_min,
+                        dte_max,
+                    )
+                    cur.execute(
+                        """
+                        SELECT
+                            expiration,
+                            strike,
+                            option_type,
+                            bid,
+                            ask,
+                            last,
+                            delta,
+                            gamma,
+                            theta,
+                            implied_volatility,
+                            volume,
+                            open_interest
+                        FROM option_chains
+                        WHERE underlying = %s
+                          AND timestamp = (
+                              SELECT MAX(timestamp)
+                              FROM option_chains
+                              WHERE underlying = %s
+                                AND timestamp <= %s
+                          )
+                          AND expiration BETWEEN %s::date AND (%s::date + INTERVAL '45 day')
+                          AND (
+                              (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
+                              OR (last IS NOT NULL AND last > 0)
+                          )
+                        ORDER BY expiration, option_type, strike
+                        """,
+                        (self.db_symbol, self.db_symbol, anchor_ts, trade_date, trade_date),
+                    )
+                    raw_option_rows = cur.fetchall()
+
                 option_rows = []
-                for row in cur.fetchall():
+                for row in raw_option_rows:
                     option_rows.append(
                         {
                             "expiration": row[0],
@@ -336,6 +380,10 @@ class PositionOptimizerEngine:
                     logger.warning("PositionOptimizerEngine: no option rows in target expiry window")
                     return None
 
+                available_dtes = sorted({max((row["expiration"] - trade_date).days, 0) for row in option_rows})
+                effective_dte_min = available_dtes[0] if available_dtes else dte_min
+                effective_dte_max = available_dtes[-1] if available_dtes else dte_max
+
                 return PositionOptimizerContext(
                     timestamp=anchor_ts,
                     signal_timestamp=signal_ts,
@@ -351,8 +399,8 @@ class PositionOptimizerEngine:
                     smart_call_premium=smart_call,
                     smart_put_premium=smart_put,
                     dealer_net_delta=dealer_net_delta,
-                    target_dte_min=dte_min,
-                    target_dte_max=dte_max,
+                    target_dte_min=effective_dte_min,
+                    target_dte_max=effective_dte_max,
                     option_rows=option_rows,
                 )
         except Exception as exc:
