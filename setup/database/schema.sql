@@ -84,31 +84,67 @@ CREATE TABLE IF NOT EXISTS option_chains (
 -- Idempotent migration: add new columns if they don't exist yet (for existing databases)
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='option_chains' AND column_name='mid') THEN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='option_chains' AND column_name='mid'
+    ) THEN
         ALTER TABLE option_chains ADD COLUMN mid NUMERIC(12, 4);
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='option_chains' AND column_name='ask_volume') THEN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='option_chains' AND column_name='ask_volume'
+    ) THEN
         ALTER TABLE option_chains ADD COLUMN ask_volume BIGINT DEFAULT 0;
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='option_chains' AND column_name='mid_volume') THEN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='option_chains' AND column_name='mid_volume'
+    ) THEN
         ALTER TABLE option_chains ADD COLUMN mid_volume BIGINT DEFAULT 0;
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='option_chains' AND column_name='bid_volume') THEN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='option_chains' AND column_name='bid_volume'
+    ) THEN
         ALTER TABLE option_chains ADD COLUMN bid_volume BIGINT DEFAULT 0;
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='option_chains' AND column_name='implied_volatility') THEN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='option_chains' AND column_name='implied_volatility'
+    ) THEN
         ALTER TABLE option_chains ADD COLUMN implied_volatility NUMERIC(8, 6);
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='option_chains' AND column_name='delta') THEN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='option_chains' AND column_name='delta'
+    ) THEN
         ALTER TABLE option_chains ADD COLUMN delta NUMERIC(8, 6);
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='option_chains' AND column_name='gamma') THEN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='option_chains' AND column_name='gamma'
+    ) THEN
         ALTER TABLE option_chains ADD COLUMN gamma NUMERIC(10, 8);
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='option_chains' AND column_name='theta') THEN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='option_chains' AND column_name='theta'
+    ) THEN
         ALTER TABLE option_chains ADD COLUMN theta NUMERIC(10, 6);
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='option_chains' AND column_name='vega') THEN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='option_chains' AND column_name='vega'
+    ) THEN
         ALTER TABLE option_chains ADD COLUMN vega NUMERIC(10, 6);
     END IF;
 END $$;
