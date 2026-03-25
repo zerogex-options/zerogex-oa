@@ -316,14 +316,15 @@ class BackfillManager:
                 cursor.execute("""
                     INSERT INTO option_chains 
                     (option_symbol, timestamp, underlying, strike, expiration, option_type,
-                     last, bid, ask, volume, open_interest, delta, gamma, theta, vega)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     last, bid, ask, volume, open_interest, implied_volatility, delta, gamma, theta, vega)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (option_symbol, timestamp) DO UPDATE SET
                         last = EXCLUDED.last,
                         bid = EXCLUDED.bid,
                         ask = EXCLUDED.ask,
                         volume = GREATEST(option_chains.volume, EXCLUDED.volume),
                         open_interest = GREATEST(option_chains.open_interest, EXCLUDED.open_interest),
+                        implied_volatility = COALESCE(EXCLUDED.implied_volatility, option_chains.implied_volatility),
                         delta = EXCLUDED.delta,
                         gamma = EXCLUDED.gamma,
                         theta = EXCLUDED.theta,
@@ -341,6 +342,7 @@ class BackfillManager:
                     option_data["ask"],
                     option_data["volume"],
                     option_data["open_interest"],
+                    option_data.get("implied_volatility"),
                     option_data.get("delta"),
                     option_data.get("gamma"),
                     option_data.get("theta"),

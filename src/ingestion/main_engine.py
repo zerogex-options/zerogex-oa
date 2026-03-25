@@ -424,6 +424,7 @@ class IngestionEngine:
                 "mid": last.get("mid"),
                 "volume": max((b.get("volume") or 0) for b in buffer),
                 "open_interest": max((b.get("open_interest") or 0) for b in buffer),
+                "implied_volatility": last.get("implied_volatility"),
                 "ask_volume": ask_volume,
                 "mid_volume": mid_volume,
                 "bid_volume": bid_volume,
@@ -439,10 +440,10 @@ class IngestionEngine:
                 cursor.execute("""
                     INSERT INTO option_chains
                     (option_symbol, timestamp, underlying, strike, expiration, option_type,
-                     last, bid, ask, mid, volume, open_interest,
+                     last, bid, ask, mid, volume, open_interest, implied_volatility,
                      ask_volume, mid_volume, bid_volume,
                      delta, gamma, theta, vega)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (option_symbol, timestamp) DO UPDATE SET
                         last = EXCLUDED.last,
                         bid = EXCLUDED.bid,
@@ -450,6 +451,7 @@ class IngestionEngine:
                         mid = EXCLUDED.mid,
                         volume = GREATEST(option_chains.volume, EXCLUDED.volume),
                         open_interest = GREATEST(option_chains.open_interest, EXCLUDED.open_interest),
+                        implied_volatility = COALESCE(EXCLUDED.implied_volatility, option_chains.implied_volatility),
                         ask_volume = option_chains.ask_volume + EXCLUDED.ask_volume,
                         mid_volume = option_chains.mid_volume + EXCLUDED.mid_volume,
                         bid_volume = option_chains.bid_volume + EXCLUDED.bid_volume,
@@ -471,6 +473,7 @@ class IngestionEngine:
                     agg["mid"],
                     agg["volume"],
                     agg["open_interest"],
+                    agg["implied_volatility"],
                     agg["ask_volume"],
                     agg["mid_volume"],
                     agg["bid_volume"],
