@@ -1070,7 +1070,7 @@ flow-by-expiration: ## Flow by expiration date — 1-min intervals (default: SPY
 
 .PHONY: flow-smart-money
 flow-smart-money: ## Unusual activity detection
-	@echo "$(BLUE)=== Smart Money Flow / Unusual Activity (Most Recent 20 Rows) ===$(NC)"
+	@echo "$(BLUE)=== Smart Money Flow / Unusual Activity (SPY Current Session Top 20 by Notional) ===$(NC)"
 	@$(PSQL) -c "\
 		WITH option_chain_deltas AS ( \
 			SELECT \
@@ -1086,8 +1086,9 @@ flow-smart-money: ## Unusual activity detection
 					0 \
 				) AS volume_delta \
 			FROM option_chains \
-			WHERE underlying = '$(FLOW_SYMBOL)' \
-				AND timestamp >= NOW() - INTERVAL '120 minutes' \
+			WHERE underlying = 'SPY' \
+				AND DATE(timestamp AT TIME ZONE 'America/New_York') = DATE(NOW() AT TIME ZONE 'America/New_York') \
+				AND (timestamp AT TIME ZONE 'America/New_York')::time >= TIME '09:30:00' \
 		), scored AS ( \
 			SELECT \
 				timestamp AT TIME ZONE 'America/New_York' as time_et, \
@@ -1142,7 +1143,7 @@ flow-smart-money: ## Unusual activity detection
 			size_class \
 		FROM scored \
 		WHERE rn_contract = 1 \
-		ORDER BY unusual_score DESC, notional DESC, timestamp DESC \
+		ORDER BY notional DESC, unusual_score DESC, timestamp DESC \
 		LIMIT 20;"
 
 .PHONY: flow-buying-pressure

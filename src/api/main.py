@@ -288,7 +288,7 @@ async def get_flow_by_expiration(
 async def get_smart_money_flow(
     symbol: str = Query(default="SPY"),
     session: str = Query(default="current", pattern="^(current|prior)$"),
-    limit: int = Query(default=20, le=100)
+    limit: int = Query(default=50, ge=1, le=50000)
 ):
     """Get unusual activity / smart money flow — 1-min intervals.
     session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""

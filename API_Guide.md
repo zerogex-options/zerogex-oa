@@ -74,7 +74,7 @@ Get unusual activity / smart money flow.
 - `symbol` (optional): default `SPY`
 - `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `1min`
 - `window_units` (optional): max `90`, default `60`
-- `limit` (optional): max `50`, default `10`
+- `limit` (optional): max `50000`, default `50`
 
 ---
 

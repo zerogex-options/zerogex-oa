@@ -1206,7 +1206,7 @@ class DatabaseManager:
         self,
         symbol: str = 'SPY',
         session: str = 'current',
-        limit: int = 20
+        limit: int = 50
     ) -> List[Dict[str, Any]]:
         """Get smart-money events directly from option_chains volume deltas."""
         session_start, session_end = _get_session_bounds(session)
@@ -1314,7 +1314,7 @@ class DatabaseManager:
                 underlying_price
             FROM scored
             WHERE rn_contract = 1
-            ORDER BY score DESC, notional DESC, timestamp DESC
+            ORDER BY notional DESC, score DESC, timestamp DESC
             LIMIT $4
         """
 
