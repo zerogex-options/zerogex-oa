@@ -1070,81 +1070,8 @@ flow-by-expiration: ## Flow by expiration date — 1-min intervals (default: SPY
 
 .PHONY: flow-smart-money
 flow-smart-money: ## Unusual activity detection
-	@echo "$(BLUE)=== Smart Money Flow / Unusual Activity (SPY Current Session Top 20 by Notional) ===$(NC)"
-	@$(PSQL) -c "\
-		WITH option_chain_deltas AS ( \
-			SELECT \
-				timestamp, option_symbol, underlying, strike, expiration, option_type, \
-				COALESCE(last, mid, (COALESCE(bid, 0) + COALESCE(ask, 0)) / 2.0, bid, ask, 0) AS last, \
-				implied_volatility, delta, \
-				COALESCE( \
-					GREATEST( \
-						volume - LAG(volume) OVER ( \
-							PARTITION BY option_symbol, DATE(timestamp AT TIME ZONE 'America/New_York') \
-							ORDER BY timestamp \
-						), \
-						0 \
-					), \
-					0 \
-				) AS volume_delta \
-			FROM option_chains \
-			WHERE underlying = 'SPY' \
-				AND DATE(timestamp AT TIME ZONE 'America/New_York') = DATE(NOW() AT TIME ZONE 'America/New_York') \
-				AND (timestamp AT TIME ZONE 'America/New_York')::time >= TIME '09:30:00' \
-		), scored AS ( \
-			SELECT \
-				timestamp AT TIME ZONE 'America/New_York' as time_et, \
-				timestamp, option_symbol, strike, expiration, \
-				(expiration - CURRENT_DATE) as days_to_expiry, \
-				option_type, \
-				volume_delta as flow, \
-				(volume_delta * last * 100) as notional, \
-				last as price, \
-				CASE \
-					WHEN volume_delta * last * 100 >= 500000 THEN '💰 500K+' \
-					WHEN volume_delta * last * 100 >= 250000 THEN '💵 250K+' \
-					WHEN volume_delta * last * 100 >= 100000 THEN '💸 100K+' \
-					WHEN volume_delta * last * 100 >= 50000 THEN '💳 50K+' \
-					ELSE '💴 <50K' \
-				END as notional_class, \
-				CASE \
-					WHEN volume_delta >= 500 THEN '🔥 Massive Block' \
-					WHEN volume_delta >= 200 THEN '📦 Large Block' \
-					WHEN volume_delta >= 100 THEN '📊 Medium Block' \
-					ELSE '💼 Standard' \
-				END as size_class, \
-				LEAST(10, GREATEST(0, \
-					CASE WHEN volume_delta >= 500 THEN 3 WHEN volume_delta >= 200 THEN 2 WHEN volume_delta >= 100 THEN 1 ELSE 0 END + \
-					CASE WHEN volume_delta * last * 100 >= 500000 THEN 3 WHEN volume_delta * last * 100 >= 250000 THEN 2 WHEN volume_delta * last * 100 >= 100000 THEN 1 ELSE 0 END + \
-					CASE WHEN implied_volatility > 1.0 THEN 2 WHEN implied_volatility > 0.6 THEN 1 ELSE 0 END + \
-					CASE WHEN ABS(delta) < 0.15 THEN 1 ELSE 0 END + \
-					CASE WHEN (expiration - CURRENT_DATE) <= 2 THEN 1 ELSE 0 END \
-				)) as unusual_score \
-			FROM option_chain_deltas \
-			WHERE volume_delta > 0 \
-				AND ( \
-					volume_delta >= 50 \
-					OR volume_delta * last * 100 >= 50000 \
-					OR implied_volatility > 0.4 \
-					OR (ABS(delta) < 0.15 AND volume_delta >= 20) \
-				) \
-		) \
-		SELECT \
-			TO_CHAR(time_et, 'HH24:MI') as time, \
-			SUBSTRING(option_symbol, 1, 15) as contract, \
-			strike, \
-			expiration, \
-			days_to_expiry as dte, \
-			option_type, \
-			flow, \
-			TO_CHAR(notional, 'FM999,999') as notional, \
-			ROUND(price, 2) as price, \
-			unusual_score as score, \
-			notional_class, \
-			size_class \
-		FROM scored \
-		ORDER BY notional DESC, unusual_score DESC, timestamp DESC \
-		LIMIT 20;"
+	@echo "$(BLUE)=== Smart Money Flow / Unusual Activity (SPY Current Session Top 20 by Notional, via API) ===$(NC)"
+	@curl -fsS "$(or $(API_BASE),http://localhost:8000)/api/flow/smart-money?symbol=SPY&session=current&limit=20" | python -m json.tool
 
 .PHONY: flow-buying-pressure
 flow-buying-pressure: ## Underlying buying/selling pressure
