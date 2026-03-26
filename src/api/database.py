@@ -563,6 +563,12 @@ class DatabaseManager:
                     $3::numeric
                 FROM with_prev
                 WHERE volume_delta > 0
+                  AND (
+                    volume_delta >= 50
+                    OR volume_delta * COALESCE(last, 0) * 100 >= 50000
+                    OR implied_volatility > 0.4
+                    OR (ABS(delta) < 0.15 AND volume_delta >= 20)
+                  )
                 ON CONFLICT (timestamp, symbol, option_symbol)
                 DO UPDATE SET
                     strike = EXCLUDED.strike,
@@ -580,6 +586,14 @@ class DatabaseManager:
                 latest_ts,
                 underlying_price,
             )
+
+        # Retention policy: keep only recent smart-money cache rows
+        await conn.execute(
+            """
+            DELETE FROM flow_smart_money
+            WHERE timestamp < NOW() - INTERVAL '7 days'
+            """
+        )
 
     async def _refresh_max_pain_snapshot(self, conn: asyncpg.Connection, symbol: str, strike_limit: int) -> None:
         """Refresh daily max pain OI snapshot for the symbol if latest chain timestamp changed."""

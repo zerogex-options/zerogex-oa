@@ -1070,8 +1070,124 @@ flow-by-expiration: ## Flow by expiration date — 1-min intervals (default: SPY
 
 .PHONY: flow-smart-money
 flow-smart-money: ## Unusual activity detection
-	@echo "$(BLUE)=== Smart Money Flow / Unusual Activity (SPY Current Session Top 20 by Notional, via API) ===$(NC)"
-	@curl -fsS "$(or $(API_BASE),http://localhost:8000)/api/flow/smart-money?symbol=SPY&session=current&limit=20" | python -m json.tool
+	@echo "$(BLUE)=== Smart Money Flow / Unusual Activity (SPY Current Session Top 20 by Notional) ===$(NC)"
+	@$(PSQL) -c "\
+		WITH now_ctx AS ( \
+			SELECT timezone('America/New_York', NOW()) AS now_et \
+		), day_ctx AS ( \
+			SELECT \
+				now_et, \
+				now_et::date AS today_et, \
+				(EXTRACT(ISODOW FROM now_et)::int BETWEEN 1 AND 5) AS is_weekday, \
+				(now_et::time >= TIME '09:30:00') AS past_open \
+			FROM now_ctx \
+		), session_ctx AS ( \
+			SELECT \
+				now_et, \
+				today_et, \
+				CASE \
+					WHEN is_weekday AND past_open THEN today_et \
+					WHEN EXTRACT(ISODOW FROM today_et) = 1 THEN today_et - INTERVAL '3 days' \
+					WHEN EXTRACT(ISODOW FROM today_et) = 7 THEN today_et - INTERVAL '2 days' \
+					WHEN EXTRACT(ISODOW FROM today_et) = 6 THEN today_et - INTERVAL '1 day' \
+					ELSE today_et - INTERVAL '1 day' \
+				END::date AS current_session_date \
+			FROM day_ctx \
+		), session_bounds AS ( \
+			SELECT \
+				((current_session_date + TIME '09:30:00') AT TIME ZONE 'America/New_York') AS session_start, \
+				CASE \
+					WHEN current_session_date = today_et AND now_et::time < TIME '16:00:00' THEN NOW() \
+					ELSE ((current_session_date + TIME '16:00:00') AT TIME ZONE 'America/New_York') \
+				END AS session_end \
+			FROM session_ctx \
+		), chain_deltas AS ( \
+			SELECT \
+				oc.timestamp, \
+				oc.option_symbol AS contract, \
+				oc.strike, \
+				oc.expiration, \
+				(oc.expiration - CURRENT_DATE)::int AS dte, \
+				oc.option_type, \
+				COALESCE(oc.last, oc.mid, (COALESCE(oc.bid, 0) + COALESCE(oc.ask, 0)) / 2.0, oc.bid, oc.ask, 0)::numeric AS price, \
+				oc.implied_volatility::numeric AS implied_volatility, \
+				oc.delta::numeric AS delta, \
+				CASE \
+					WHEN p.prev_volume IS NULL THEN COALESCE(oc.volume, 0) \
+					WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date = (oc.timestamp AT TIME ZONE 'America/New_York')::date \
+						THEN GREATEST(COALESCE(oc.volume, 0) - COALESCE(p.prev_volume, 0), 0) \
+					ELSE COALESCE(oc.volume, 0) \
+				END::bigint AS flow \
+			FROM option_chains oc \
+			LEFT JOIN LATERAL ( \
+				SELECT oc2.timestamp AS prev_ts, oc2.volume AS prev_volume \
+				FROM option_chains oc2 \
+				WHERE oc2.option_symbol = oc.option_symbol \
+					AND oc2.timestamp < oc.timestamp \
+				ORDER BY oc2.timestamp DESC \
+				LIMIT 1 \
+			) p ON TRUE \
+			CROSS JOIN session_bounds sb \
+			WHERE oc.underlying = 'SPY' \
+				AND oc.timestamp >= sb.session_start \
+				AND oc.timestamp <= sb.session_end \
+		), scored AS ( \
+			SELECT \
+				timestamp AT TIME ZONE 'America/New_York' AS time_et, \
+				contract, \
+				strike, \
+				expiration, \
+				dte, \
+				option_type, \
+				flow, \
+				(flow * price * 100)::numeric AS notional, \
+				price, \
+				LEAST(10, GREATEST(0, \
+					CASE WHEN flow >= 500 THEN 4 WHEN flow >= 200 THEN 3 WHEN flow >= 100 THEN 2 WHEN flow >= 50 THEN 1 ELSE 0 END + \
+					CASE WHEN flow * price * 100 >= 500000 THEN 4 WHEN flow * price * 100 >= 250000 THEN 3 WHEN flow * price * 100 >= 100000 THEN 2 WHEN flow * price * 100 >= 50000 THEN 1 ELSE 0 END + \
+					CASE WHEN implied_volatility > 1.0 THEN 2 WHEN implied_volatility > 0.6 THEN 1 ELSE 0 END + \
+					CASE WHEN ABS(delta) < 0.15 THEN 1 ELSE 0 END + \
+					CASE WHEN dte <= 2 THEN 1 ELSE 0 END \
+				))::numeric AS score, \
+				CASE \
+					WHEN flow * price * 100 >= 500000 THEN '💰 $$500K+' \
+					WHEN flow * price * 100 >= 250000 THEN '💵 $$250K+' \
+					WHEN flow * price * 100 >= 100000 THEN '💸 $$100K+' \
+					WHEN flow * price * 100 >= 50000 THEN '💳 $$50K+' \
+					ELSE '💴 <$$50K' \
+				END AS notional_class, \
+				CASE \
+					WHEN flow >= 500 THEN '🔥 Massive Block' \
+					WHEN flow >= 200 THEN '📦 Large Block' \
+					WHEN flow >= 100 THEN '📊 Medium Block' \
+					ELSE '💼 Standard' \
+				END AS size_class, \
+				timestamp \
+			FROM chain_deltas \
+			WHERE flow > 0 \
+				AND ( \
+					flow >= 50 \
+					OR flow * price * 100 >= 50000 \
+					OR implied_volatility > 0.4 \
+					OR (ABS(delta) < 0.15 AND flow >= 20) \
+				) \
+		) \
+		SELECT \
+			TO_CHAR(time_et, 'HH24:MI') AS time, \
+			SUBSTRING(contract, 1, 15) AS contract, \
+			strike, \
+			expiration, \
+			dte, \
+			option_type, \
+			flow, \
+			TO_CHAR(notional, 'FM999,999,999') AS notional, \
+			ROUND(price, 2) AS price, \
+			score, \
+			notional_class, \
+			size_class \
+		FROM scored \
+		ORDER BY notional DESC, score DESC, timestamp DESC \
+		LIMIT 20;"
 
 .PHONY: flow-buying-pressure
 flow-buying-pressure: ## Underlying buying/selling pressure

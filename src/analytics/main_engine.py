@@ -906,6 +906,12 @@ class AnalyticsEngine:
                         %s::numeric
                     FROM with_prev
                     WHERE volume_delta > 0
+                      AND (
+                        volume_delta >= 50
+                        OR volume_delta * COALESCE(last, 0) * 100 >= 50000
+                        OR implied_volatility > 0.4
+                        OR (ABS(delta) < 0.15 AND volume_delta >= 20)
+                      )
                     ON CONFLICT (timestamp, symbol, option_symbol)
                     DO UPDATE SET
                         strike = EXCLUDED.strike,
@@ -919,6 +925,12 @@ class AnalyticsEngine:
                         underlying_price = EXCLUDED.underlying_price,
                         updated_at = NOW()
                 """, (self.db_symbol, timestamp, self.db_symbol, underlying_price))
+
+                # Retention policy: keep only recent smart-money cache rows
+                cursor.execute("""
+                    DELETE FROM flow_smart_money
+                    WHERE timestamp < NOW() - INTERVAL '7 days'
+                """)
 
                 conn.commit()
                 logger.info("✅ Flow cache tables refreshed successfully")
