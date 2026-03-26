@@ -1150,11 +1150,11 @@ flow-smart-money: ## Unusual activity detection
 					CASE WHEN dte <= 2 THEN 1 ELSE 0 END \
 				))::numeric AS score, \
 				CASE \
-					WHEN flow * price * 100 >= 500000 THEN '💰 $$500K+' \
-					WHEN flow * price * 100 >= 250000 THEN '💵 $$250K+' \
-					WHEN flow * price * 100 >= 100000 THEN '💸 $$100K+' \
-					WHEN flow * price * 100 >= 50000 THEN '💳 $$50K+' \
-					ELSE '💴 <$$50K' \
+					WHEN flow * price * 100 >= 500000 THEN '💰 500K+' \
+					WHEN flow * price * 100 >= 250000 THEN '💵 250K+' \
+					WHEN flow * price * 100 >= 100000 THEN '💸 100K+' \
+					WHEN flow * price * 100 >= 50000 THEN '💳 50K+' \
+					ELSE '💴 <50K' \
 				END AS notional_class, \
 				CASE \
 					WHEN flow >= 500 THEN '🔥 Massive Block' \
