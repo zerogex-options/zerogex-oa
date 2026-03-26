@@ -1219,7 +1219,14 @@ class DatabaseManager:
                     oc.strike,
                     oc.expiration,
                     oc.option_type,
-                    COALESCE(oc.last, 0)::numeric AS last,
+                    COALESCE(
+                        oc.last,
+                        oc.mid,
+                        (COALESCE(oc.bid, 0) + COALESCE(oc.ask, 0)) / 2.0,
+                        oc.bid,
+                        oc.ask,
+                        0
+                    )::numeric AS last,
                     oc.implied_volatility::numeric AS implied_volatility,
                     oc.delta::numeric AS delta,
                     uq.close::numeric AS underlying_price,
@@ -1283,11 +1290,7 @@ class DatabaseManager:
                         WHEN volume_delta >= 100 THEN '📊 Medium Block'
                         ELSE '💼 Standard'
                     END AS size_class,
-                    underlying_price,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY option_symbol
-                        ORDER BY timestamp DESC
-                    ) AS rn_contract
+                    underlying_price
                 FROM chain_deltas
                 WHERE volume_delta > 0
                   AND (
@@ -1313,7 +1316,6 @@ class DatabaseManager:
                 size_class,
                 underlying_price
             FROM scored
-            WHERE rn_contract = 1
             ORDER BY notional DESC, score DESC, timestamp DESC
             LIMIT $4
         """

@@ -1074,7 +1074,9 @@ flow-smart-money: ## Unusual activity detection
 	@$(PSQL) -c "\
 		WITH option_chain_deltas AS ( \
 			SELECT \
-				timestamp, option_symbol, underlying, strike, expiration, option_type, last, implied_volatility, delta, \
+				timestamp, option_symbol, underlying, strike, expiration, option_type, \
+				COALESCE(last, mid, (COALESCE(bid, 0) + COALESCE(ask, 0)) / 2.0, bid, ask, 0) AS last, \
+				implied_volatility, delta, \
 				COALESCE( \
 					GREATEST( \
 						volume - LAG(volume) OVER ( \
@@ -1117,8 +1119,7 @@ flow-smart-money: ## Unusual activity detection
 					CASE WHEN implied_volatility > 1.0 THEN 2 WHEN implied_volatility > 0.6 THEN 1 ELSE 0 END + \
 					CASE WHEN ABS(delta) < 0.15 THEN 1 ELSE 0 END + \
 					CASE WHEN (expiration - CURRENT_DATE) <= 2 THEN 1 ELSE 0 END \
-				)) as unusual_score, \
-				ROW_NUMBER() OVER (PARTITION BY option_symbol ORDER BY timestamp DESC) as rn_contract \
+				)) as unusual_score \
 			FROM option_chain_deltas \
 			WHERE volume_delta > 0 \
 				AND ( \
@@ -1142,7 +1143,6 @@ flow-smart-money: ## Unusual activity detection
 			notional_class, \
 			size_class \
 		FROM scored \
-		WHERE rn_contract = 1 \
 		ORDER BY notional DESC, unusual_score DESC, timestamp DESC \
 		LIMIT 20;"
 
