@@ -62,6 +62,9 @@ class StreamManager:
         self.target_expirations: List[date] = []
         self.tracked_strikes: Set[float] = set()
         self.tracked_option_symbols: List[str] = []
+        # Per-contract quote state used to merge partial stream updates.
+        # TradeStation stream/quotes may emit deltas that omit fields like OI.
+        self._option_quote_state: Dict[str, Dict[str, Any]] = {}
 
         # Track expired strikes for cleanup
         self.all_tracked_strikes: Dict[date, Set[float]] = {}
@@ -512,14 +515,30 @@ class StreamManager:
                                     timestamp = datetime.now(ET)
 
                                 # Parse quote data
+                                prior = self._option_quote_state.get(option_symbol, {})
+
                                 last = safe_float(opt_quote.get("Last"), field_name="Last")
                                 bid = safe_float(opt_quote.get("Bid"), field_name="Bid")
                                 ask = safe_float(opt_quote.get("Ask"), field_name="Ask")
                                 mid = safe_float(opt_quote.get("Mid"), field_name="Mid")
+
+                                # Stream payloads can be partial (delta updates). Carry
+                                # forward previously seen values when fields are omitted.
+                                if last is None:
+                                    last = prior.get("last")
+                                if bid is None:
+                                    bid = prior.get("bid")
+                                if ask is None:
+                                    ask = prior.get("ask")
+                                if mid is None:
+                                    mid = prior.get("mid")
+
                                 # Fall back to computed mid if TradeStation doesn't provide it
                                 if mid is None and bid is not None and ask is not None:
                                     mid = (bid + ask) / 2.0
                                 volume = safe_int(opt_quote.get("Volume"), field_name="Volume")
+                                if volume is None:
+                                    volume = prior.get("volume")
                                 open_interest = safe_int(
                                     opt_quote.get("DailyOpenInterest"),
                                     field_name="DailyOpenInterest"
@@ -529,6 +548,8 @@ class StreamManager:
                                         opt_quote.get("OpenInterest"),
                                         field_name="OpenInterest"
                                     )
+                                if open_interest is None:
+                                    open_interest = prior.get("open_interest")
 
                                 # Try multiple field names for implied volatility
                                 # TradeStation may use different field names
@@ -567,6 +588,17 @@ class StreamManager:
                                     "volume": volume,
                                     "open_interest": open_interest,
                                     "implied_volatility": implied_volatility if implied_volatility else None,
+                                }
+
+                                # Persist merged state for next partial update.
+                                self._option_quote_state[option_symbol] = {
+                                    "last": option_data["last"],
+                                    "bid": option_data["bid"],
+                                    "ask": option_data["ask"],
+                                    "mid": option_data["mid"],
+                                    "volume": option_data["volume"],
+                                    "open_interest": option_data["open_interest"],
+                                    "implied_volatility": option_data["implied_volatility"],
                                 }
 
                                 yield {"type": "option", "data": option_data}
