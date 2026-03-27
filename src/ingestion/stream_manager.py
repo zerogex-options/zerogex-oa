@@ -1,19 +1,28 @@
 """
-Stream Manager - Fetches real-time data and yields to IngestionEngine
+Stream Manager - Streams real-time data and yields to IngestionEngine
 
 Uses TradeStation Stream Bars API for underlying quotes (provides
-UpVolume/DownVolume tracking) and REST quote snapshots for option
-chains (guarantees complete data for all tracked contracts every cycle).
+UpVolume/DownVolume tracking) and a persistent streaming connection
+for option chain quotes.
+
+Option quotes are accumulated in a background thread that continuously
+reads from TradeStation's streaming quotes endpoint.  The main polling
+loop periodically snapshots the accumulated state.  A single REST
+snapshot at startup (and on strike recalibration) seeds fields like
+open interest and IV that stream deltas may omit.
 
 This manager ONLY fetches data from TradeStation API.
 Storage is handled by IngestionEngine.
 """
 
+import json
 import os
+import threading
 import time
 from datetime import datetime, date
 from typing import Generator, List, Dict, Any, Optional, Set
 import pytz
+import requests as _requests
 
 from src.ingestion.tradestation_client import TradeStationClient
 from src.utils import get_logger
@@ -31,12 +40,243 @@ from src.config import (
     STRIKE_RECALC_INTERVAL,
     STRIKE_CLEANUP_INTERVAL,
     SESSION_TEMPLATE,
+    API_REQUEST_TIMEOUT,
 )
 
 logger = get_logger(__name__)
 
 # Eastern Time timezone
 ET = pytz.timezone("US/Eastern")
+
+# Stream read timeout — how long the background reader waits for the next
+# event before the socket times out (triggers a reconnect).
+_STREAM_READ_TIMEOUT = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
+
+
+# ---------------------------------------------------------------------------
+# OptionStreamAccumulator — background thread for persistent quote streaming
+# ---------------------------------------------------------------------------
+
+class OptionStreamAccumulator:
+    """
+    Persistent background reader for TradeStation streaming option quotes.
+
+    Opens a streaming HTTP connection in a daemon thread and continuously
+    merges quote updates into per-contract state.  The main thread can
+    call :meth:`snapshot` at any cadence to read the latest accumulated
+    values for every contract.
+
+    Key behaviours:
+    * Seeded from a REST snapshot on :meth:`start` so that OI, IV, and
+      prices are fully populated before the first poll iteration.
+    * OI is only overwritten when a new **positive** value arrives
+      (OI updates once daily at settlement; stream deltas often send 0).
+    * IV is only overwritten when a new **positive** value arrives.
+    * All other fields (price, volume, timestamp) overwrite on every
+      update so the snapshot always reflects the latest tick.
+    """
+
+    def __init__(
+        self,
+        client: TradeStationClient,
+        symbols: List[str],
+    ):
+        self._client = client
+        self._symbols = list(symbols)
+        self._state: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._current_response = None
+        self._response_lock = threading.Lock()
+        self._updates_received: int = 0
+        self._connected = threading.Event()
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def start(self):
+        """Seed state from REST, then begin background stream reading."""
+        self._seed_from_rest()
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._reader_loop, daemon=True, name="option-stream",
+        )
+        self._thread.start()
+        # Give the stream a moment to connect before returning.
+        self._connected.wait(timeout=10)
+
+    def stop(self):
+        """Stop the background reader and close the stream connection."""
+        self._running = False
+        # Interrupt any blocking iter_lines() call.
+        with self._response_lock:
+            if self._current_response is not None:
+                try:
+                    self._current_response.close()
+                except Exception:
+                    pass
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+            self._thread = None
+
+    @property
+    def is_alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def updates_received(self) -> int:
+        return self._updates_received
+
+    # -- public API --------------------------------------------------------
+
+    def snapshot(self) -> Dict[str, Dict[str, Any]]:
+        """Return a copy of the current accumulated state keyed by symbol."""
+        with self._lock:
+            return {k: dict(v) for k, v in self._state.items()}
+
+    # -- internal ----------------------------------------------------------
+
+    def _seed_from_rest(self):
+        """Fetch one full REST snapshot to populate OI, IV, and prices."""
+        logger.info(
+            f"Seeding option state from REST ({len(self._symbols)} symbols)..."
+        )
+        seeded = 0
+        for i in range(0, len(self._symbols), OPTION_BATCH_SIZE):
+            batch = self._symbols[i : i + OPTION_BATCH_SIZE]
+            try:
+                data = self._client.get_option_quotes(batch)
+                for q in data.get("Quotes", []):
+                    self._merge_single_quote(q)
+                    seeded += 1
+            except Exception as e:
+                logger.warning(f"REST seed batch failed: {e}")
+            if DELAY_BETWEEN_BATCHES > 0:
+                time.sleep(DELAY_BETWEEN_BATCHES)
+        logger.info(f"REST seed complete: {seeded} quotes loaded")
+
+    def _reader_loop(self):
+        """Continuously read stream events; auto-reconnect on failure."""
+        while self._running:
+            try:
+                self._read_stream()
+            except Exception as e:
+                if self._running:
+                    logger.warning(
+                        f"Option stream disconnected ({e}), reconnecting in 2s..."
+                    )
+                    time.sleep(2)
+
+    def _read_stream(self):
+        """Open one stream connection and read events until it ends."""
+        symbols_str = ",".join(self._symbols)
+        url = (
+            f"{self._client.base_url}/marketdata/stream/quotes/{symbols_str}"
+        )
+        headers = self._client.auth.get_headers()
+
+        response = _requests.get(
+            url,
+            headers=headers,
+            stream=True,
+            timeout=(API_REQUEST_TIMEOUT, _STREAM_READ_TIMEOUT),
+        )
+
+        if response.status_code == 401:
+            response.close()
+            self._client.auth.force_refresh_access_token()
+            return  # will retry on next loop iteration
+
+        response.raise_for_status()
+
+        with self._response_lock:
+            self._current_response = response
+
+        self._connected.set()
+
+        try:
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if not self._running:
+                    break
+                if not raw_line:
+                    continue
+                line = (
+                    raw_line.strip()
+                    if isinstance(raw_line, str)
+                    else raw_line.decode("utf-8", errors="ignore").strip()
+                )
+                if not line or line in ("[DONE]", "heartbeat"):
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if not line:
+                    continue
+
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                # Handle both {"Quotes": [...]} wrappers and bare objects.
+                if isinstance(payload, dict) and "Quotes" in payload:
+                    for q in payload["Quotes"]:
+                        if isinstance(q, dict):
+                            self._merge_single_quote(q)
+                elif isinstance(payload, dict) and "Symbol" in payload:
+                    self._merge_single_quote(payload)
+        finally:
+            with self._response_lock:
+                self._current_response = None
+            response.close()
+
+    def _merge_single_quote(self, q: dict):
+        """Merge one raw quote into accumulated state.
+
+        Price/volume fields always overwrite.  OI and IV only overwrite
+        when the incoming value is positive — these fields update
+        infrequently and stream deltas often send 0 or omit them.
+        """
+        symbol = q.get("Symbol", "")
+        if not symbol:
+            return
+
+        with self._lock:
+            prior = self._state.get(symbol, {})
+            merged = dict(prior)
+            merged["Symbol"] = symbol
+
+            # Always-overwrite fields
+            for key in (
+                "Last", "Bid", "Ask", "Mid", "Volume", "TimeStamp",
+                "High", "Low", "Open", "Close", "NetChange",
+                "NetChangePct", "BidSize", "AskSize",
+            ):
+                val = q.get(key)
+                if val is not None:
+                    merged[key] = val
+
+            # OI: only overwrite when new value > 0
+            for oi_key in ("DailyOpenInterest", "OpenInterest"):
+                val = q.get(oi_key)
+                if val is not None:
+                    try:
+                        if int(val) > 0:
+                            merged[oi_key] = val
+                    except (ValueError, TypeError):
+                        pass
+
+            # IV: only overwrite when new value > 0
+            for iv_key in ("ImpliedVolatility", "IV", "Volatility", "IVol"):
+                val = q.get(iv_key)
+                if val is not None:
+                    try:
+                        if float(val) > 0:
+                            merged[iv_key] = val
+                    except (ValueError, TypeError):
+                        pass
+
+            self._state[symbol] = merged
+            self._updates_received += 1
 
 
 class StreamManager:
@@ -66,9 +306,11 @@ class StreamManager:
         # Last seen underlying bar snapshot keyed by minute bucket, used to merge
         # partial stream bar payloads that may omit one side of volume.
         self._underlying_bar_state: Dict[datetime, Dict[str, Any]] = {}
-        # Per-contract quote state used to merge partial stream updates.
-        # TradeStation stream/quotes may emit deltas that omit fields like OI.
-        self._option_quote_state: Dict[str, Dict[str, Any]] = {}
+        # Pre-parsed metadata (strike, expiration, option_type) per option symbol
+        # so we don't re-parse the symbol string every poll cycle.
+        self._symbol_metadata: Dict[str, Dict[str, Any]] = {}
+        # Background accumulator for persistent option quote streaming.
+        self._accumulator: Optional[OptionStreamAccumulator] = None
 
         # Track expired strikes for cleanup
         self.all_tracked_strikes: Dict[date, Set[float]] = {}
@@ -349,7 +591,7 @@ class StreamManager:
             return []
 
     def _build_option_symbols(self) -> List[str]:
-        """Build list of option symbols to track"""
+        """Build list of option symbols to track and pre-parse metadata."""
         if not self.current_price:
             logger.warning("No current price, cannot build option symbols")
             return []
@@ -357,28 +599,24 @@ class StreamManager:
         option_symbols = []
         self.tracked_strikes = set()
         self.all_tracked_strikes = {}
+        self._symbol_metadata = {}
 
         for expiration in self.target_expirations:
             strikes = self._get_strikes_near_price(expiration, self.current_price)
             self.all_tracked_strikes[expiration] = set(strikes)
 
             for strike in strikes:
-                call_symbol = self.client.build_option_symbol(
-                    self.underlying, expiration, "C", strike
-                )
-                put_symbol = self.client.build_option_symbol(
-                    self.underlying, expiration, "P", strike
-                )
-
-                option_symbols.append(call_symbol)
-                option_symbols.append(put_symbol)
-                self.tracked_strikes.add(strike)
-
-        # Evict cached quote state for contracts we no longer track.
-        tracked_set = set(option_symbols)
-        stale_symbols = [s for s in self._option_quote_state if s not in tracked_set]
-        for s in stale_symbols:
-            del self._option_quote_state[s]
+                for opt_type in ("C", "P"):
+                    symbol = self.client.build_option_symbol(
+                        self.underlying, expiration, opt_type, strike
+                    )
+                    option_symbols.append(symbol)
+                    self.tracked_strikes.add(strike)
+                    self._symbol_metadata[symbol] = {
+                        "strike": strike,
+                        "expiration": expiration,
+                        "option_type": opt_type,
+                    }
 
         logger.info(f"Built {len(option_symbols)} option symbols to track")
         return option_symbols
@@ -465,12 +703,98 @@ class StreamManager:
 
         return True
 
+    def _start_accumulator(self):
+        """Start (or restart) the background option quote stream."""
+        if self._accumulator is not None:
+            self._accumulator.stop()
+        self._accumulator = OptionStreamAccumulator(
+            client=self.client,
+            symbols=self.tracked_option_symbols,
+        )
+        self._accumulator.start()
+
+    def _yield_option_snapshot(self, state: Dict[str, Dict[str, Any]]):
+        """
+        Convert raw accumulator state into yielded option data dicts.
+
+        Returns a list (not a generator) so callers can count results.
+        """
+        results = []
+        for option_symbol in self.tracked_option_symbols:
+            raw = state.get(option_symbol)
+            if not raw:
+                continue  # no data received yet for this contract
+
+            meta = self._symbol_metadata.get(option_symbol)
+            if not meta:
+                continue
+
+            timestamp = safe_datetime(
+                raw.get("TimeStamp", ""), field_name="TimeStamp"
+            )
+            if not timestamp:
+                timestamp = datetime.now(ET)
+
+            last = safe_float(raw.get("Last"), default=None, field_name="Last")
+            bid = safe_float(raw.get("Bid"), default=None, field_name="Bid")
+            ask = safe_float(raw.get("Ask"), default=None, field_name="Ask")
+            mid = safe_float(raw.get("Mid"), default=None, field_name="Mid")
+
+            if mid is None and bid is not None and ask is not None:
+                mid = (bid + ask) / 2.0
+
+            volume = safe_int(
+                raw.get("Volume"), default=None, field_name="Volume"
+            )
+
+            open_interest = safe_int(
+                raw.get("DailyOpenInterest"),
+                default=None,
+                field_name="DailyOpenInterest",
+            )
+            if open_interest is None:
+                open_interest = safe_int(
+                    raw.get("OpenInterest"),
+                    default=None,
+                    field_name="OpenInterest",
+                )
+
+            implied_volatility = None
+            for iv_field in ("ImpliedVolatility", "IV", "Volatility", "IVol"):
+                iv_val = safe_float(raw.get(iv_field), field_name=iv_field)
+                if iv_val and iv_val > 0:
+                    implied_volatility = iv_val
+                    break
+
+            results.append({
+                "option_symbol": option_symbol,
+                "timestamp": timestamp,
+                "underlying": self.db_underlying,
+                "strike": meta["strike"],
+                "expiration": meta["expiration"],
+                "option_type": meta["option_type"],
+                "last": last,
+                "bid": bid,
+                "ask": ask,
+                "mid": mid,
+                "volume": volume,
+                "open_interest": open_interest,
+                "implied_volatility": implied_volatility,
+            })
+
+        return results
+
     def stream(
         self,
         max_iterations: Optional[int] = None
     ) -> Generator[Dict[str, Any], None, None]:
         """
-        Stream real-time data and yield to caller
+        Stream real-time data and yield to caller.
+
+        Underlying bars are fetched via Stream Bars snapshot each cycle.
+        Option quotes are accumulated by a background thread reading from
+        a persistent streaming connection; this method snapshots that state
+        on each poll interval and yields all contracts.
 
         Yields dictionaries with:
             {
@@ -485,243 +809,134 @@ class StreamManager:
         logger.info("Starting stream loop...")
         logger.info("Press Ctrl+C to stop")
 
+        # Start persistent background stream for option quotes.
+        self._start_accumulator()
+
         iteration = 0
 
-        while True:
-            iteration += 1
+        try:
+            while True:
+                iteration += 1
 
-            # Get current market session for dynamic polling
-            session = get_market_session()
+                # Get current market session for dynamic polling
+                session = get_market_session()
 
-            # Determine poll interval based on session
-            if session == "regular":
-                poll_interval = MARKET_HOURS_POLL_INTERVAL
-            elif session in ["pre-market", "after-hours"]:
-                poll_interval = EXTENDED_HOURS_POLL_INTERVAL
-            else:  # closed
-                poll_interval = CLOSED_HOURS_POLL_INTERVAL
+                # Determine poll interval based on session
+                if session == "regular":
+                    poll_interval = MARKET_HOURS_POLL_INTERVAL
+                elif session in ["pre-market", "after-hours"]:
+                    poll_interval = EXTENDED_HOURS_POLL_INTERVAL
+                else:  # closed
+                    poll_interval = CLOSED_HOURS_POLL_INTERVAL
 
-            logger.info(f"Iteration {iteration} - {datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S ET')} "
-                       f"[{session}]")
+                logger.info(
+                    f"Iteration {iteration} - "
+                    f"{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S ET')} "
+                    f"[{session}]"
+                )
 
-            # Check if expirations need refresh (NEW)
-            if self._should_refresh_expirations():
-                logger.info("Refreshing expirations...")
-                if self._refresh_expirations():
-                    logger.info("✅ Expirations refreshed successfully")
-                else:
-                    logger.warning("⚠️  Expiration refresh failed, continuing with current expirations")
+                # Check if expirations need refresh
+                if self._should_refresh_expirations():
+                    logger.info("Refreshing expirations...")
+                    if self._refresh_expirations():
+                        logger.info("✅ Expirations refreshed successfully")
+                        # Symbols may have changed — restart accumulator.
+                        self._start_accumulator()
+                    else:
+                        logger.warning(
+                            "⚠️  Expiration refresh failed, continuing "
+                            "with current expirations"
+                        )
 
-            # Track option count for debugging
-            option_count = 0
-            option_with_oi = 0
-            option_with_volume = 0
+                try:
+                    # Fetch underlying bar using Stream Bars API
+                    # (single symbol — stream snapshot works well here)
+                    underlying_data = self._fetch_underlying_bar()
 
-            try:
-                # Fetch underlying bar using Stream Bars API
-                # (single symbol — stream snapshot works well here)
-                underlying_data = self._fetch_underlying_bar()
+                    if underlying_data:
+                        self.current_price = underlying_data["close"]
+                        yield {"type": "underlying", "data": underlying_data}
 
-                if underlying_data:
-                    # Update current price for strike calculations
-                    self.current_price = underlying_data["close"]
+                    # Snapshot accumulated option state from background stream.
+                    state = self._accumulator.snapshot()
+                    option_results = self._yield_option_snapshot(state)
 
-                    # Yield underlying data
-                    yield {"type": "underlying", "data": underlying_data}
+                    option_count = len(option_results)
+                    option_with_oi = 0
+                    option_with_volume = 0
 
-                # Fetch option quotes via REST to guarantee complete snapshots.
-                #
-                # The streaming quotes endpoint emits individual updates as they
-                # happen, so reading one line per poll gives at most one symbol's
-                # data — leaving the vast majority of contracts with no update.
-                # REST returns all requested symbols in a single response, which
-                # is the correct choice for a synchronous polling model.
-                for i in range(0, len(self.tracked_option_symbols), OPTION_BATCH_SIZE):
-                    batch = self.tracked_option_symbols[i:i + OPTION_BATCH_SIZE]
+                    for option_data in option_results:
+                        yield {"type": "option", "data": option_data}
+                        if (option_data.get("open_interest") or 0) > 0:
+                            option_with_oi += 1
+                        if (option_data.get("volume") or 0) > 0:
+                            option_with_volume += 1
 
-                    try:
-                        options_data = self.client.get_option_quotes(batch)
+                    if option_count > 0:
+                        oi_coverage = option_with_oi / option_count
+                        volume_coverage = option_with_volume / option_count
+                        logger.info(
+                            f"Option snapshot: total={option_count}, "
+                            f"oi_coverage={oi_coverage:.1%}, "
+                            f"volume_coverage={volume_coverage:.1%}, "
+                            f"stream_updates={self._accumulator.updates_received}"
+                        )
+                        if oi_coverage < self.option_oi_coverage_alert_threshold:
+                            logger.warning(
+                                f"⚠️ Low option OI coverage: {oi_coverage:.1%} "
+                                f"(threshold "
+                                f"{self.option_oi_coverage_alert_threshold:.1%})"
+                            )
+                        if volume_coverage < self.option_volume_coverage_alert_threshold:
+                            logger.warning(
+                                f"⚠️ Low option volume coverage: "
+                                f"{volume_coverage:.1%} "
+                                f"(threshold "
+                                f"{self.option_volume_coverage_alert_threshold:.1%})"
+                            )
 
-                        if "Quotes" in options_data:
-                            for opt_quote in options_data["Quotes"]:
-                                # Parse option symbol
-                                option_symbol = opt_quote.get("Symbol", "")
-                                parts = option_symbol.split()
-
-                                if len(parts) < 2:
-                                    continue
-
-                                option_part = parts[1]
-                                option_type = "C" if "C" in option_part else "P"
-
-                                exp_str = option_part[:6]
-                                try:
-                                    expiration = datetime.strptime(exp_str, "%y%m%d").date()
-                                except ValueError:
-                                    continue
-
-                                strike_str = option_part.split(option_type)[1]
-                                strike = safe_float(strike_str, default=None, field_name="strike")
-                                if strike is None:
-                                    continue
-
-                                # Parse timestamp
-                                timestamp_str = opt_quote.get("TimeStamp", "")
-                                timestamp = safe_datetime(timestamp_str, field_name="TimeStamp")
-
-                                if not timestamp:
-                                    timestamp = datetime.now(ET)
-
-                                # Parse quote data — REST returns complete snapshots,
-                                # but some fields (e.g. OI outside settlement) may
-                                # still be absent. Fall back to last known value.
-                                prior = self._option_quote_state.get(option_symbol, {})
-
-                                last = safe_float(opt_quote.get("Last"), default=None, field_name="Last")
-                                bid = safe_float(opt_quote.get("Bid"), default=None, field_name="Bid")
-                                ask = safe_float(opt_quote.get("Ask"), default=None, field_name="Ask")
-                                mid = safe_float(opt_quote.get("Mid"), default=None, field_name="Mid")
-
-                                if last is None:
-                                    last = prior.get("last")
-                                if bid is None:
-                                    bid = prior.get("bid")
-                                if ask is None:
-                                    ask = prior.get("ask")
-                                if mid is None:
-                                    mid = prior.get("mid")
-
-                                # Fall back to computed mid if TradeStation doesn't provide it
-                                if mid is None and bid is not None and ask is not None:
-                                    mid = (bid + ask) / 2.0
-
-                                volume = safe_int(opt_quote.get("Volume"), default=None, field_name="Volume")
-                                if volume is None:
-                                    volume = prior.get("volume")
-                                open_interest = safe_int(
-                                    opt_quote.get("DailyOpenInterest"),
-                                    default=None,
-                                    field_name="DailyOpenInterest"
+                    # Recalibrate strike range periodically.
+                    if iteration % STRIKE_RECALC_INTERVAL == 0 and iteration > 0:
+                        if self.current_price:
+                            new_price = self._get_underlying_price()
+                            if new_price:
+                                self.current_price = new_price
+                                self.tracked_option_symbols = (
+                                    self._build_option_symbols()
                                 )
-                                if open_interest is None:
-                                    open_interest = safe_int(
-                                        opt_quote.get("OpenInterest"),
-                                        default=None,
-                                        field_name="OpenInterest"
-                                    )
-                                if open_interest is None:
-                                    open_interest = prior.get("open_interest")
+                                # Restart accumulator with new symbol set.
+                                self._start_accumulator()
+                                logger.info(
+                                    f"Recalibrated strikes around "
+                                    f"${self.current_price:.2f} "
+                                    f"(±{self.num_strikes} strikes each side)"
+                                )
 
-                                # Try multiple field names for implied volatility
-                                implied_volatility = None
-                                for iv_field in ["ImpliedVolatility", "IV", "Volatility", "IVol"]:
-                                    iv_value = safe_float(opt_quote.get(iv_field), field_name=iv_field)
-                                    if iv_value and iv_value > 0:
-                                        implied_volatility = iv_value
-                                        break
+                    # Cleanup expired strikes periodically
+                    if iteration % STRIKE_CLEANUP_INTERVAL == 0:
+                        self._cleanup_expired_strikes()
 
-                                # Log what we're getting from API (only first option for debugging)
-                                if option_count == 0:
-                                    logger.debug(f"Sample option quote from API: {opt_quote}")
-                                    logger.debug(f"  Available fields: {list(opt_quote.keys())}")
-                                    logger.debug(f"  OpenInterest: {opt_quote.get('OpenInterest')}")
-                                    logger.debug(f"  DailyOpenInterest: {opt_quote.get('DailyOpenInterest')}")
-                                    logger.debug(f"  ImpliedVolatility found: {implied_volatility}")
-                                    vol_fields = {k: v for k, v in opt_quote.items()
-                                                 if 'vol' in k.lower() or 'iv' in k.lower()}
-                                    if vol_fields:
-                                        logger.debug(f"  Fields containing 'vol' or 'iv': {vol_fields}")
+                    # Check max iterations
+                    if max_iterations and iteration >= max_iterations:
+                        logger.info(
+                            f"Reached max iterations ({max_iterations})"
+                        )
+                        break
 
-                                # Yield option data
-                                option_data = {
-                                    "option_symbol": option_symbol,
-                                    "timestamp": timestamp,
-                                    "underlying": self.db_underlying,
-                                    "strike": strike,
-                                    "expiration": expiration,
-                                    "option_type": option_type,
-                                    "last": last,
-                                    "bid": bid,
-                                    "ask": ask,
-                                    "mid": mid,
-                                    "volume": volume,
-                                    "open_interest": open_interest,
-                                    "implied_volatility": implied_volatility if implied_volatility else None,
-                                }
+                    # Sleep with dynamic interval
+                    logger.debug(f"Sleeping for {poll_interval}s...")
+                    time.sleep(poll_interval)
 
-                                # Cache state for field-level fallback on next cycle.
-                                self._option_quote_state[option_symbol] = {
-                                    "last": option_data["last"],
-                                    "bid": option_data["bid"],
-                                    "ask": option_data["ask"],
-                                    "mid": option_data["mid"],
-                                    "volume": option_data["volume"],
-                                    "open_interest": option_data["open_interest"],
-                                    "implied_volatility": option_data["implied_volatility"],
-                                }
-
-                                yield {"type": "option", "data": option_data}
-                                option_count += 1
-                                if (option_data.get("open_interest") or 0) > 0:
-                                    option_with_oi += 1
-                                if (option_data.get("volume") or 0) > 0:
-                                    option_with_volume += 1
-
-                    except Exception as e:
-                        logger.error(f"Error fetching options batch: {e}")
-                        # Back off harder on rate-limit responses to reduce retry storms.
-                        if "429" in str(e):
-                            time.sleep(max(DELAY_BETWEEN_BATCHES, 2.0))
-
-                    # Small pacing delay between option batches to avoid API bursts.
-                    if DELAY_BETWEEN_BATCHES > 0:
-                        time.sleep(DELAY_BETWEEN_BATCHES)
-
-                if option_count > 0:
-                    oi_coverage = option_with_oi / option_count
-                    volume_coverage = option_with_volume / option_count
-                    logger.info(
-                        f"Option quote quality: total={option_count}, "
-                        f"oi_coverage={oi_coverage:.1%}, volume_coverage={volume_coverage:.1%}"
+                except Exception as e:
+                    logger.error(
+                        f"Stream iteration error: {e}", exc_info=True
                     )
-                    if oi_coverage < self.option_oi_coverage_alert_threshold:
-                        logger.warning(
-                            f"⚠️ Low option OI coverage: {oi_coverage:.1%} "
-                            f"(threshold {self.option_oi_coverage_alert_threshold:.1%})"
-                        )
-                    if volume_coverage < self.option_volume_coverage_alert_threshold:
-                        logger.warning(
-                            f"⚠️ Low option volume coverage: {volume_coverage:.1%} "
-                            f"(threshold {self.option_volume_coverage_alert_threshold:.1%})"
-                        )
-
-                # Recalibrate strike range periodically — re-centers N strikes around
-                # the latest price unconditionally, so the tracked window always stays current.
-                if iteration % STRIKE_RECALC_INTERVAL == 0 and iteration > 0:
-                    if self.current_price:
-                        new_price = self._get_underlying_price()
-                        if new_price:
-                            self.current_price = new_price
-                            self.tracked_option_symbols = self._build_option_symbols()
-                            logger.info(f"Recalibrated strikes around ${self.current_price:.2f} "
-                                       f"(±{self.num_strikes} strikes each side)")
-
-                # Cleanup expired strikes periodically
-                if iteration % STRIKE_CLEANUP_INTERVAL == 0:
-                    self._cleanup_expired_strikes()
-
-                # Check max iterations
-                if max_iterations and iteration >= max_iterations:
-                    logger.info(f"Reached max iterations ({max_iterations})")
-                    break
-
-                # Sleep with dynamic interval
-                logger.debug(f"Sleeping for {poll_interval}s...")
-                time.sleep(poll_interval)
-
-            except Exception as e:
-                logger.error(f"Stream iteration error: {e}", exc_info=True)
-                time.sleep(poll_interval)
+                    time.sleep(poll_interval)
+        finally:
+            # Always clean up the background stream thread.
+            if self._accumulator is not None:
+                self._accumulator.stop()
+                self._accumulator = None
 
         logger.info("Stream stopped")
 
