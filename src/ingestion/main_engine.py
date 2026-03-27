@@ -602,7 +602,7 @@ class IngestionEngine:
                           f"delta={delta:.4f} gamma={gamma:.6f}")
 
             logger.debug(f"Stored option: {agg['option_symbol']} @ {agg['timestamp']} "
-                        f"Last=${agg['last']:.2f}")
+                        f"Last=${agg['last'] or 0:.2f}")
 
             # Clear buffer (or keep only the latest snapshot for incremental volume deltas)
             if keep_last_snapshot and buffer:
