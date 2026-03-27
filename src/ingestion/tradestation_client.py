@@ -31,6 +31,8 @@ logger = get_logger(__name__)
 # Eastern Time timezone
 ET = pytz.timezone("US/Eastern")
 STREAM_READ_TIMEOUT_SECONDS = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
+STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").lower() == "true"
+STREAM_REUSE_QUOTES = os.getenv("TS_STREAM_REUSE_QUOTES", "true").lower() == "true"
 
 
 class TradeStationClient:
@@ -226,7 +228,15 @@ class TradeStationClient:
             if line is None:
                 return {}
             return json.loads(line)
-        except (StopIteration, requests.exceptions.RequestException, json.JSONDecodeError) as e:
+        except StopIteration:
+            # Stream endpoints may rotate/terminate connections. Treat this as a
+            # normal reconnect event instead of warning-level noise.
+            self._close_stream(stream_key)
+            if retry_count < API_RETRY_ATTEMPTS - 1:
+                return self._request_stream_snapshot(endpoint, params, retry_count + 1)
+            logger.debug("Stream ended repeatedly; returning empty snapshot")
+            return {}
+        except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
             self._close_stream(stream_key)
             if retry_count < API_RETRY_ATTEMPTS - 1:
                 retry_delay = API_RETRY_DELAY * (API_RETRY_BACKOFF ** retry_count)
@@ -235,6 +245,16 @@ class TradeStationClient:
                 return self._request_stream_snapshot(endpoint, params, retry_count + 1)
             logger.error(f"Stream request failed after {API_RETRY_ATTEMPTS} attempts: {e}")
             raise
+        finally:
+            # Snapshot mode should not hold the stream open by default.
+            # Reusing a stream for one-line snapshots can block until the *next*
+            # event on subsequent reads, which introduces write lag.
+            # Quote streams are reused by default to avoid reconnect churn/rate limits.
+            reuse_stream = STREAM_REUSE_CONNECTIONS or (
+                STREAM_REUSE_QUOTES and endpoint.startswith("marketdata/stream/quotes/")
+            )
+            if not reuse_stream:
+                self._close_stream(stream_key)
 
     def _build_stream_key(self, endpoint: str, params: Optional[Dict]) -> str:
         params_key = json.dumps(params or {}, sort_keys=True)
