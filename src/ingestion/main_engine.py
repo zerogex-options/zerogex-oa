@@ -347,7 +347,21 @@ class IngestionEngine:
             logger.error(f"Option data missing option_symbol")
             return
 
+        # If this symbol crossed into a new time bucket, flush the previous one first.
+        existing = self.options_buffer.get(option_symbol)
+        if existing:
+            prev_timestamp = existing[-1].get("timestamp")
+            if prev_timestamp is not None:
+                prev_bucket = bucket_timestamp(prev_timestamp, AGGREGATION_BUCKET_SECONDS)
+                if prev_bucket != bucket:
+                    self._flush_option_bucket(option_symbol, prev_bucket, keep_last_snapshot=False)
+
         self.options_buffer[option_symbol].append(data)
+
+        # Flush incrementally on every update so option rows are upserted promptly.
+        # Keep only the latest snapshot in memory so we can compute the next
+        # volume delta chunk without introducing DB write lag.
+        self._flush_option_bucket(option_symbol, bucket, keep_last_snapshot=True)
 
         # Check TOTAL buffer size across all options, not per-symbol
         total_buffered = sum(len(v) for v in self.options_buffer.values())
@@ -412,7 +426,7 @@ class IngestionEngine:
         else:
             return (0, volume_delta, 0)
 
-    def _flush_option_bucket(self, option_symbol: str, bucket: datetime):
+    def _flush_option_bucket(self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False):
         """Aggregate and store 1-minute option quote"""
         buffer = self.options_buffer.get(option_symbol, [])
 
@@ -539,8 +553,11 @@ class IngestionEngine:
             logger.debug(f"Stored option: {agg['option_symbol']} @ {agg['timestamp']} "
                         f"Last=${agg['last']:.2f}")
 
-            # Clear buffer
-            self.options_buffer[option_symbol] = []
+            # Clear buffer (or keep only the latest snapshot for incremental volume deltas)
+            if keep_last_snapshot and buffer:
+                self.options_buffer[option_symbol] = [buffer[-1]]
+            else:
+                self.options_buffer[option_symbol] = []
 
         except Exception as e:
             logger.error(f"Error flushing option bucket for {option_symbol}: {e}", exc_info=True)
