@@ -311,6 +311,9 @@ class StreamManager:
         self._symbol_metadata: Dict[str, Dict[str, Any]] = {}
         # Background accumulator for persistent option quote streaming.
         self._accumulator: Optional[OptionStreamAccumulator] = None
+        # Last-yielded raw TimeStamp string per contract so we only write to
+        # the DB when the stream has actually delivered a newer update.
+        self._last_yielded_ts: Dict[str, str] = {}
 
         # Track expired strikes for cleanup
         self.all_tracked_strikes: Dict[date, Set[float]] = {}
@@ -712,10 +715,17 @@ class StreamManager:
             symbols=self.tracked_option_symbols,
         )
         self._accumulator.start()
+        # Reset change-tracking so the fresh REST seed gets yielded.
+        self._last_yielded_ts.clear()
 
     def _yield_option_snapshot(self, state: Dict[str, Dict[str, Any]]):
         """
         Convert raw accumulator state into yielded option data dicts.
+
+        Only yields a contract when the stream has delivered a newer
+        update (compared by raw TimeStamp string) since the last time
+        we yielded it.  This prevents writing duplicate rows to the DB
+        when a contract has no new activity.
 
         Returns a list (not a generator) so callers can count results.
         """
@@ -729,9 +739,13 @@ class StreamManager:
             if not meta:
                 continue
 
-            timestamp = safe_datetime(
-                raw.get("TimeStamp", ""), field_name="TimeStamp"
-            )
+            # Skip if the stream hasn't delivered a newer update.
+            raw_ts = raw.get("TimeStamp", "")
+            prev_ts = self._last_yielded_ts.get(option_symbol)
+            if prev_ts is not None and raw_ts == prev_ts:
+                continue
+
+            timestamp = safe_datetime(raw_ts, field_name="TimeStamp")
             if not timestamp:
                 timestamp = datetime.now(ET)
 
@@ -765,6 +779,8 @@ class StreamManager:
                 if iv_val and iv_val > 0:
                     implied_volatility = iv_val
                     break
+
+            self._last_yielded_ts[option_symbol] = raw_ts
 
             results.append({
                 "option_symbol": option_symbol,
@@ -872,14 +888,23 @@ class StreamManager:
                         if (option_data.get("volume") or 0) > 0:
                             option_with_volume += 1
 
+                    tracked_total = len(self.tracked_option_symbols)
+                    skipped = tracked_total - option_count
+
                     if option_count > 0:
                         oi_coverage = option_with_oi / option_count
                         volume_coverage = option_with_volume / option_count
                         logger.info(
-                            f"Option snapshot: total={option_count}, "
+                            f"Option snapshot: yielded={option_count}, "
+                            f"unchanged={skipped}, "
                             f"oi_coverage={oi_coverage:.1%}, "
                             f"volume_coverage={volume_coverage:.1%}, "
                             f"stream_updates={self._accumulator.updates_received}"
+                        )
+                    elif skipped > 0:
+                        logger.debug(
+                            f"Option snapshot: no new updates "
+                            f"({skipped} contracts unchanged)"
                         )
                         if oi_coverage < self.option_oi_coverage_alert_threshold:
                             logger.warning(
