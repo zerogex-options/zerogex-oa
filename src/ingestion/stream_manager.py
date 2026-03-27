@@ -559,7 +559,9 @@ class StreamManager:
                                     continue
 
                                 strike_str = option_part.split(option_type)[1]
-                                strike = safe_float(strike_str, field_name="strike")
+                                strike = safe_float(strike_str, default=None, field_name="strike")
+                                if strike is None:
+                                    continue
 
                                 # Parse timestamp
                                 timestamp_str = opt_quote.get("TimeStamp", "")
@@ -571,10 +573,10 @@ class StreamManager:
                                 # Parse quote data
                                 prior = self._option_quote_state.get(option_symbol, {})
 
-                                last = safe_float(opt_quote.get("Last"), field_name="Last")
-                                bid = safe_float(opt_quote.get("Bid"), field_name="Bid")
-                                ask = safe_float(opt_quote.get("Ask"), field_name="Ask")
-                                mid = safe_float(opt_quote.get("Mid"), field_name="Mid")
+                                last = safe_float(opt_quote.get("Last"), default=None, field_name="Last")
+                                bid = safe_float(opt_quote.get("Bid"), default=None, field_name="Bid")
+                                ask = safe_float(opt_quote.get("Ask"), default=None, field_name="Ask")
+                                mid = safe_float(opt_quote.get("Mid"), default=None, field_name="Mid")
 
                                 # Stream payloads can be partial (delta updates). Carry
                                 # forward previously seen values when fields are omitted.
@@ -590,16 +592,18 @@ class StreamManager:
                                 # Fall back to computed mid if TradeStation doesn't provide it
                                 if mid is None and bid is not None and ask is not None:
                                     mid = (bid + ask) / 2.0
-                                volume = safe_int(opt_quote.get("Volume"), field_name="Volume")
+                                volume = safe_int(opt_quote.get("Volume"), default=None, field_name="Volume")
                                 if volume is None:
                                     volume = prior.get("volume")
                                 open_interest = safe_int(
                                     opt_quote.get("DailyOpenInterest"),
+                                    default=None,
                                     field_name="DailyOpenInterest"
                                 )
                                 if open_interest is None:
                                     open_interest = safe_int(
                                         opt_quote.get("OpenInterest"),
+                                        default=None,
                                         field_name="OpenInterest"
                                     )
                                 if open_interest is None:
