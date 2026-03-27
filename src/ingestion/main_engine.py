@@ -82,6 +82,7 @@ class IngestionEngine:
         # Buffering for options only (underlying writes every update)
         self.underlying_buffer: List[Dict[str, Any]] = []
         self.options_buffer: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        self._option_volume_baseline: Dict[str, int] = {}
 
         # Track latest underlying price for Greeks calculation
         self.latest_underlying_price: Optional[float] = None
@@ -430,6 +431,34 @@ class IngestionEngine:
         else:
             return (0, volume_delta, 0)
 
+    def _get_option_volume_baseline(self, option_symbol: str, bucket: datetime) -> int:
+        """Get latest persisted cumulative volume before current bucket for a contract."""
+        cached = self._option_volume_baseline.get(option_symbol)
+        if cached is not None:
+            return cached
+
+        try:
+            with db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT volume
+                    FROM option_chains
+                    WHERE option_symbol = %s
+                      AND timestamp < %s
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                    """,
+                    (option_symbol, bucket),
+                )
+                row = cursor.fetchone()
+                baseline = int(row[0]) if row and row[0] is not None else 0
+                self._option_volume_baseline[option_symbol] = baseline
+                return baseline
+        except Exception as e:
+            logger.warning(f"Failed loading volume baseline for {option_symbol}: {e}")
+            return 0
+
     def _flush_option_bucket(self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False):
         """Aggregate and store 1-minute option quote"""
         buffer = self.options_buffer.get(option_symbol, [])
@@ -455,11 +484,11 @@ class IngestionEngine:
             ask_volume = 0
             mid_volume = 0
             bid_volume = 0
-            for i in range(1, len(buffer)):
-                prev_vol = buffer[i - 1].get("volume") or 0
-                curr = buffer[i]
+            if len(buffer) == 1:
+                curr = buffer[0]
                 curr_vol = curr.get("volume") or 0
-                vol_delta = max(curr_vol - prev_vol, 0)
+                baseline = self._get_option_volume_baseline(option_symbol, bucket)
+                vol_delta = max(curr_vol - baseline, 0)
                 if vol_delta > 0:
                     av, mv, bv = self._classify_volume_chunk(
                         vol_delta,
@@ -471,6 +500,23 @@ class IngestionEngine:
                     ask_volume += av
                     mid_volume += mv
                     bid_volume += bv
+            else:
+                for i in range(1, len(buffer)):
+                    prev_vol = buffer[i - 1].get("volume") or 0
+                    curr = buffer[i]
+                    curr_vol = curr.get("volume") or 0
+                    vol_delta = max(curr_vol - prev_vol, 0)
+                    if vol_delta > 0:
+                        av, mv, bv = self._classify_volume_chunk(
+                            vol_delta,
+                            curr.get("last"),
+                            curr.get("bid"),
+                            curr.get("ask"),
+                            curr.get("mid"),
+                        )
+                        ask_volume += av
+                        mid_volume += mv
+                        bid_volume += bv
 
             agg = {
                 "option_symbol": last["option_symbol"],
@@ -548,6 +594,7 @@ class IngestionEngine:
                 conn.commit()
 
             self.option_quotes_stored += 1
+            self._option_volume_baseline[option_symbol] = int(agg["volume"] or 0)
 
             # Log first few with Greeks to confirm storage
             if self.option_quotes_stored <= 3 and delta is not None:
