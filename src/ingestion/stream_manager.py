@@ -84,6 +84,7 @@ class StreamManager:
             os.getenv("OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD", "0.35")
         )
         self._last_option_reconcile_ts: float = 0.0
+        self._last_option_emit_bucket: Dict[str, datetime] = {}
 
         logger.info(f"Initialized StreamManager for {underlying}")
         logger.info(f"Config: {num_expirations} expirations, {num_strikes} strikes each side")
@@ -508,6 +509,7 @@ class StreamManager:
             option_count = 0
             option_with_oi = 0
             option_with_volume = 0
+            seen_option_symbols: Set[str] = set()
             run_option_reconcile = (
                 self.option_reconcile_interval_seconds > 0
                 and (time.time() - self._last_option_reconcile_ts) >= self.option_reconcile_interval_seconds
@@ -644,6 +646,11 @@ class StreamManager:
 
                                 # Persist merged state for next partial update.
                                 self._option_quote_state[option_symbol] = {
+                                    "option_symbol": option_symbol,
+                                    "underlying": self.db_underlying,
+                                    "strike": strike,
+                                    "expiration": expiration,
+                                    "option_type": option_type,
                                     "last": option_data["last"],
                                     "bid": option_data["bid"],
                                     "ask": option_data["ask"],
@@ -655,6 +662,7 @@ class StreamManager:
 
                                 yield {"type": "option", "data": option_data}
                                 option_count += 1
+                                seen_option_symbols.add(option_symbol)
                                 if (option_data.get("open_interest") or 0) > 0:
                                     option_with_oi += 1
                                 if (option_data.get("volume") or 0) > 0:
@@ -672,6 +680,52 @@ class StreamManager:
 
                 if run_option_reconcile:
                     self._last_option_reconcile_ts = time.time()
+
+                # Ensure each tracked contract has at least one row per minute bucket.
+                # If a symbol has no update in the current iteration, emit a carry-forward
+                # snapshot from last known state once per minute.
+                current_bucket = datetime.now(ET).replace(second=0, microsecond=0)
+                for option_symbol in self.tracked_option_symbols:
+                    if option_symbol in seen_option_symbols:
+                        self._last_option_emit_bucket[option_symbol] = current_bucket
+                        continue
+                    state = self._option_quote_state.get(option_symbol)
+                    if not state:
+                        continue
+                    if self._last_option_emit_bucket.get(option_symbol) == current_bucket:
+                        continue
+
+                    carry_forward_data = {
+                        "option_symbol": state.get("option_symbol", option_symbol),
+                        "timestamp": datetime.now(ET),
+                        "underlying": state.get("underlying", self.db_underlying),
+                        "strike": state.get("strike"),
+                        "expiration": state.get("expiration"),
+                        "option_type": state.get("option_type"),
+                        "last": state.get("last"),
+                        "bid": state.get("bid"),
+                        "ask": state.get("ask"),
+                        "mid": state.get("mid"),
+                        "volume": state.get("volume"),
+                        "open_interest": state.get("open_interest"),
+                        "implied_volatility": state.get("implied_volatility"),
+                    }
+
+                    # Skip if metadata is incomplete (can happen before first full parse).
+                    if (
+                        carry_forward_data["strike"] is None
+                        or carry_forward_data["expiration"] is None
+                        or carry_forward_data["option_type"] is None
+                    ):
+                        continue
+
+                    yield {"type": "option", "data": carry_forward_data}
+                    option_count += 1
+                    if (carry_forward_data.get("open_interest") or 0) > 0:
+                        option_with_oi += 1
+                    if (carry_forward_data.get("volume") or 0) > 0:
+                        option_with_volume += 1
+                    self._last_option_emit_bucket[option_symbol] = current_bucket
 
                 if option_count > 0:
                     oi_coverage = option_with_oi / option_count
