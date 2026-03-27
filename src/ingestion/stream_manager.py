@@ -23,6 +23,7 @@ from src.validation import (
 from src.symbols import resolve_option_root, get_weekly_option_roots
 from src.config import (
     OPTION_BATCH_SIZE,
+    DELAY_BETWEEN_BATCHES,
     MARKET_HOURS_POLL_INTERVAL,
     EXTENDED_HOURS_POLL_INTERVAL,
     CLOSED_HOURS_POLL_INTERVAL,
@@ -573,6 +574,13 @@ class StreamManager:
 
                     except Exception as e:
                         logger.error(f"Error fetching options batch: {e}")
+                        # Back off harder on rate-limit responses to reduce retry storms.
+                        if "429" in str(e):
+                            time.sleep(max(DELAY_BETWEEN_BATCHES, 2.0))
+
+                    # Small pacing delay between option batches to avoid API bursts.
+                    if DELAY_BETWEEN_BATCHES > 0:
+                        time.sleep(DELAY_BETWEEN_BATCHES)
 
                 # Recalibrate strike range periodically — re-centers N strikes around
                 # the latest price unconditionally, so the tracked window always stays current.

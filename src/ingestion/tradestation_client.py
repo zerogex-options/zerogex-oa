@@ -32,6 +32,7 @@ logger = get_logger(__name__)
 ET = pytz.timezone("US/Eastern")
 STREAM_READ_TIMEOUT_SECONDS = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
 STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").lower() == "true"
+STREAM_REUSE_QUOTES = os.getenv("TS_STREAM_REUSE_QUOTES", "true").lower() == "true"
 
 
 class TradeStationClient:
@@ -240,7 +241,11 @@ class TradeStationClient:
             # Snapshot mode should not hold the stream open by default.
             # Reusing a stream for one-line snapshots can block until the *next*
             # event on subsequent reads, which introduces write lag.
-            if not STREAM_REUSE_CONNECTIONS:
+            # Quote streams are reused by default to avoid reconnect churn/rate limits.
+            reuse_stream = STREAM_REUSE_CONNECTIONS or (
+                STREAM_REUSE_QUOTES and endpoint.startswith("marketdata/stream/quotes/")
+            )
+            if not reuse_stream:
                 self._close_stream(stream_key)
 
     def _build_stream_key(self, endpoint: str, params: Optional[Dict]) -> str:
