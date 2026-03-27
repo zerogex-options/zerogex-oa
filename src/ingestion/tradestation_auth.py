@@ -8,6 +8,7 @@ import os
 import requests
 import time
 from datetime import datetime, timedelta
+from threading import Lock
 from src.utils import get_logger
 
 # Initialize logger
@@ -45,6 +46,7 @@ class TradeStationAuth:
         # Cached access token
         self.access_token = None
         self.token_expiry = None
+        self._token_lock = Lock()
 
         logger.info(f"TradeStationAuth initialized for {'sandbox' if sandbox else 'production'}")
 
@@ -55,26 +57,39 @@ class TradeStationAuth:
         Returns:
             Valid access token
         """
-        logger.debug("Checking access token validity...")
+        with self._token_lock:
+            logger.debug("Checking access token validity...")
 
-        # If we already have an access token and it's not expired
-        # or coming up for expiry, then return it
-        # Otherwise, refresh it
-        if self.access_token and self.token_expiry:
-            time_until_expiry = (self.token_expiry - datetime.now()).total_seconds()
-            logger.debug(f"Token expires in {time_until_expiry:.0f} seconds")
+            # If we already have an access token and it's not expired
+            # or coming up for expiry, then return it
+            # Otherwise, refresh it
+            if self.access_token and self.token_expiry:
+                time_until_expiry = (self.token_expiry - datetime.now()).total_seconds()
+                logger.debug(f"Token expires in {time_until_expiry:.0f} seconds")
 
-            if time_until_expiry > 5*60:
-                logger.debug("Using cached access token")
-                return self.access_token
-            elif time_until_expiry > 0:
-                logger.debug("Access token will expire in <5 minutes, refreshing...")
+                if time_until_expiry > 5*60:
+                    logger.debug("Using cached access token")
+                    return self.access_token
+                elif time_until_expiry > 0:
+                    logger.debug("Access token will expire in <5 minutes, refreshing...")
+                else:
+                    logger.info("Access token expired, refreshing...")
             else:
-                logger.info("Access token expired, refreshing...")
-        else:
-            logger.info("No cached token, obtaining new access token...")
+                logger.info("No cached token, obtaining new access token...")
 
-        return self._refresh_access_token()
+            return self._refresh_access_token()
+
+    def force_refresh_access_token(self) -> str:
+        """Force-refresh access token (used when API returns 401)."""
+        with self._token_lock:
+            logger.warning("Forcing TradeStation access token refresh after auth failure")
+            return self._refresh_access_token()
+
+    def invalidate_token(self):
+        """Invalidate cached token so the next request must refresh."""
+        with self._token_lock:
+            self.access_token = None
+            self.token_expiry = None
 
     def _refresh_access_token(self) -> str:
         """

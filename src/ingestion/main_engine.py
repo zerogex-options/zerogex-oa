@@ -14,6 +14,8 @@ For historical data backfilling, use backfill_manager.py independently.
 import os
 import signal
 import sys
+import hashlib
+import json
 from multiprocessing import Process
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
@@ -32,6 +34,7 @@ from src.config import (
     MAX_BUFFER_SIZE,
     BUFFER_FLUSH_INTERVAL,
     GREEKS_ENABLED,
+    INGEST_PARITY_GUARD_ENABLED,
 )
 
 logger = get_logger(__name__)
@@ -121,6 +124,14 @@ class IngestionEngine:
     def _ensure_symbol_exists(self):
         """Ensure underlying exists in symbols table (required by FK on underlying_quotes)."""
         try:
+            symbol_payload = {
+                "symbol": self.db_symbol,
+                "name": self.db_symbol,
+                "asset_type": self._infer_asset_type(self.underlying),
+                "is_active": True,
+            }
+            self._log_parity_signature("symbols", symbol_payload)
+
             with db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -132,9 +143,9 @@ class IngestionEngine:
                         updated_at = NOW()
                     """,
                     (
-                        self.db_symbol,
-                        self.db_symbol,
-                        self._infer_asset_type(self.underlying),  # ts_symbol has $ prefix for indexes
+                        symbol_payload["symbol"],
+                        symbol_payload["name"],
+                        symbol_payload["asset_type"],  # ts_symbol has $ prefix for indexes
                     ),
                 )
                 conn.commit()
@@ -197,6 +208,8 @@ class IngestionEngine:
             "up_volume": data.get("up_volume", 0),
             "down_volume": data.get("down_volume", 0),
         }
+
+        self._log_parity_signature("underlying_quotes", payload)
 
         self._upsert_underlying_quote(payload)
 
@@ -348,6 +361,22 @@ class IngestionEngine:
                 if self.options_buffer[sym]:
                     self._flush_option_bucket(sym, flush_bucket)
 
+    def _log_parity_signature(self, stream_name: str, payload: Dict[str, Any]):
+        """
+        Emit a stable payload signature for runtime parity checks.
+
+        This is feature-flagged and does not alter DB writes.
+        """
+        if not INGEST_PARITY_GUARD_ENABLED:
+            return
+
+        try:
+            canonical = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
+            digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+            logger.info(f"[PARITY] {stream_name} sig={digest} payload={canonical}")
+        except Exception as e:
+            logger.warning(f"Failed to emit parity signature for {stream_name}: {e}")
+
     def _classify_volume_chunk(self, volume_delta: int, last: Optional[float], bid: Optional[float], ask: Optional[float], mid: Optional[float]) -> tuple:
         """
         Classify a volume chunk into ask_volume, mid_volume, or bid_volume
@@ -447,6 +476,8 @@ class IngestionEngine:
                 "theta": theta,
                 "vega": vega,
             }
+
+            self._log_parity_signature("option_chains", agg)
 
             # Store in database
             with db_connection() as conn:

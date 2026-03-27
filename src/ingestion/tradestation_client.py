@@ -12,6 +12,7 @@ from datetime import datetime, date, timedelta
 from typing import Optional, List, Dict, Any, Union
 import pytz
 import json
+from requests import Response
 
 from src.ingestion.tradestation_auth import TradeStationAuth
 from src.utils import get_logger
@@ -80,14 +81,7 @@ class TradeStationClient:
         logger.debug(f"{method} {endpoint} (attempt {retry_count + 1}/{API_RETRY_ATTEMPTS})")
 
         try:
-            response = requests.request(
-                method=method,
-                url=url,
-                headers=headers,
-                params=params,
-                json=data,
-                timeout=API_REQUEST_TIMEOUT
-            )
+            response = self._build_request_response(method, url, headers, params, data)
 
             if response.status_code in [200, 201]:
                 # Check if response has content
@@ -108,6 +102,15 @@ class TradeStationClient:
                 result = response.json()
                 logger.debug(f"Response: {json.dumps(result, indent=2)[:1000]}...")
                 return result
+
+            # Handle expired/invalid token - force refresh and retry once
+            if response.status_code == 401:
+                if retry_count < API_RETRY_ATTEMPTS - 1:
+                    logger.warning("TradeStation returned 401; forcing token refresh and retrying")
+                    self.auth.force_refresh_access_token()
+                    return self._request(method, endpoint, params, data, retry_count + 1)
+                logger.error("TradeStation returned 401 after retries")
+                response.raise_for_status()
 
             # Handle 404 "No data available" - don't retry, just return empty
             if response.status_code == 404:
@@ -181,13 +184,83 @@ class TradeStationClient:
             logger.error(f"Request timed out after {API_RETRY_ATTEMPTS} attempts")
             raise
 
+    def _build_request_response(
+        self,
+        method: str,
+        url: str,
+        headers: Dict[str, str],
+        params: Optional[Dict],
+        data: Optional[Dict]
+    ) -> Response:
+        """Build and execute a standard JSON API request."""
+        return requests.request(
+            method=method,
+            url=url,
+            headers=headers,
+            params=params,
+            json=data,
+            timeout=API_REQUEST_TIMEOUT
+        )
+
+    def _request_stream_snapshot(
+        self,
+        endpoint: str,
+        params: Optional[Dict] = None,
+        retry_count: int = 0
+    ) -> Dict[str, Any]:
+        """
+        Read a single JSON payload from a TradeStation stream endpoint.
+
+        TradeStation stream endpoints may keep the connection open. For ingestion
+        compatibility we consume one payload and return immediately.
+        """
+        url = f"{self.base_url}/{endpoint}"
+        headers = self.auth.get_headers()
+
+        try:
+            with requests.get(
+                url,
+                headers=headers,
+                params=params,
+                stream=True,
+                timeout=(API_REQUEST_TIMEOUT, API_REQUEST_TIMEOUT),
+            ) as response:
+                if response.status_code == 401:
+                    if retry_count < API_RETRY_ATTEMPTS - 1:
+                        logger.warning("Stream endpoint returned 401; refreshing token and retrying")
+                        self.auth.force_refresh_access_token()
+                        return self._request_stream_snapshot(endpoint, params, retry_count + 1)
+                    response.raise_for_status()
+
+                if response.status_code not in [200, 201]:
+                    logger.error(f"Stream request failed: {response.status_code} [{endpoint}]")
+                    logger.error(f"Response: {response.text}")
+                    response.raise_for_status()
+
+                for raw_line in response.iter_lines(decode_unicode=True):
+                    if not raw_line:
+                        continue
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if line in {"[DONE]", "heartbeat"}:
+                        continue
+                    try:
+                        return json.loads(line)
+                    except json.JSONDecodeError:
+                        logger.debug(f"Skipping non-JSON stream line from {endpoint}: {line[:200]}")
+                        continue
+
+                return {}
         except requests.exceptions.RequestException as e:
             if retry_count < API_RETRY_ATTEMPTS - 1:
                 retry_delay = API_RETRY_DELAY * (API_RETRY_BACKOFF ** retry_count)
-                logger.warning(f"Request failed: {e}, retrying in {retry_delay}s...")
+                logger.warning(f"Stream request failed: {e}, retrying in {retry_delay}s...")
                 time.sleep(retry_delay)
-                return self._request(method, endpoint, params, data, retry_count + 1)
-            logger.error(f"Request failed after {API_RETRY_ATTEMPTS} attempts: {e}")
+                return self._request_stream_snapshot(endpoint, params, retry_count + 1)
+            logger.error(f"Stream request failed after {API_RETRY_ATTEMPTS} attempts: {e}")
             raise
 
     # =========================================================================
@@ -321,7 +394,15 @@ class TradeStationClient:
                 if not self.is_market_open(check_extended=True):
                     logger.warning("⚠️  Market is closed - intraday bars may be delayed")
 
-        return self._request("GET", f"marketdata/stream/barcharts/{symbol}", params=params)
+        result = self._request_stream_snapshot(f"marketdata/stream/barcharts/{symbol}", params=params)
+
+        if isinstance(result, dict) and "Bars" in result:
+            return result
+        if isinstance(result, dict) and "Bar" in result and isinstance(result["Bar"], dict):
+            return {"Bars": [result["Bar"]]}
+        if isinstance(result, dict) and "TimeStamp" in result:
+            return {"Bars": [result]}
+        return {"Bars": []}
 
     # =========================================================================
     # OPTIONS ENDPOINTS
@@ -369,6 +450,37 @@ class TradeStationClient:
         logger.info(f"Fetching option quotes for {len(option_symbols.split(','))} symbols")
         logger.debug(f"{option_symbols.split(',')}")
         return self._request("GET", f"marketdata/quotes/{option_symbols}")
+
+    def get_stream_quotes(self, symbols: Union[str, List[str]]) -> Dict[str, Any]:
+        """
+        Get quote updates from TradeStation streaming quotes endpoint.
+
+        The caller can consume this exactly like get_quote/get_option_quotes
+        because this method normalizes one read into {"Quotes": [...]}.
+        """
+        if isinstance(symbols, list):
+            symbols = ",".join(symbols)
+
+        logger.info(f"Streaming quotes for {len(symbols.split(','))} symbols")
+        result = self._request_stream_snapshot(f"marketdata/stream/quotes/{symbols}")
+
+        if isinstance(result, dict) and "Quotes" in result:
+            quotes = result.get("Quotes")
+            if isinstance(quotes, list):
+                return {"Quotes": quotes}
+            if isinstance(quotes, dict):
+                return {"Quotes": [quotes]}
+            return {"Quotes": []}
+
+        # Defensive normalization in case stream response comes back as a single quote object
+        if isinstance(result, dict) and "Symbol" in result:
+            return {"Quotes": [result]}
+
+        if isinstance(result, list):
+            # Defensive handling if stream emits line-delimited quote objects
+            return {"Quotes": [q for q in result if isinstance(q, dict)]}
+
+        return {"Quotes": []}
 
     def search_symbols(self, search: str) -> List[Dict[str, Any]]:
         """Search for symbols by name or description"""

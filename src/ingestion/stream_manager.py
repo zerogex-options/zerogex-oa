@@ -73,17 +73,13 @@ class StreamManager:
 
     def _fetch_underlying_bar(self) -> Optional[Dict[str, Any]]:
         """
-        Fetch latest underlying bar with volume breakdown using regular Bars API
-
-        Note: The regular bars endpoint includes UpVolume/DownVolume,
-        so we don't need the stream/barcharts endpoint.
+        Fetch latest underlying bar with volume breakdown using Stream Bars API.
 
         Returns bar data with OHLC + UpVolume/DownVolume
         """
         try:
-            # Use regular bars API with barsback=1 to get latest completed bar
-            # This works reliably and includes UpVolume/DownVolume
-            bars_data = self.client.get_bars(
+            # Use stream bars API with barsback=1 to fetch the latest bar payload
+            bars_data = self.client.get_stream_bars(
                 symbol=self.underlying,
                 interval=1,
                 unit="Minute",
@@ -484,7 +480,7 @@ class StreamManager:
                     batch = self.tracked_option_symbols[i:i + OPTION_BATCH_SIZE]
 
                     try:
-                        options_data = self.client.get_option_quotes(batch)
+                        options_data = self.client.get_stream_quotes(batch)
 
                         if "Quotes" in options_data:
                             for opt_quote in options_data["Quotes"]:
@@ -523,7 +519,15 @@ class StreamManager:
                                 if mid is None and bid is not None and ask is not None:
                                     mid = (bid + ask) / 2.0
                                 volume = safe_int(opt_quote.get("Volume"), field_name="Volume")
-                                open_interest = safe_int(opt_quote.get("DailyOpenInterest"), field_name="DailyOpenInterest")
+                                open_interest = safe_int(
+                                    opt_quote.get("DailyOpenInterest"),
+                                    field_name="DailyOpenInterest"
+                                )
+                                if open_interest is None:
+                                    open_interest = safe_int(
+                                        opt_quote.get("OpenInterest"),
+                                        field_name="OpenInterest"
+                                    )
 
                                 # Try multiple field names for implied volatility
                                 # TradeStation may use different field names

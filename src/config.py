@@ -144,6 +144,14 @@ METRICS_PORT = int(os.getenv("METRICS_PORT", "9090"))
 GRAFANA_DASHBOARD_ENABLED = os.getenv("GRAFANA_DASHBOARD_ENABLED", "false").lower() == "true"
 
 # =============================================================================
+# Ingestion Parity Guard
+# =============================================================================
+
+# Emits deterministic payload signatures before DB writes so stream-vs-rest
+# ingestion parity can be validated in production without schema changes.
+INGEST_PARITY_GUARD_ENABLED = os.getenv("INGEST_PARITY_GUARD_ENABLED", "false").lower() == "true"
+
+# =============================================================================
 # Helper Functions
 # =============================================================================
 
@@ -178,6 +186,7 @@ def get_all_config() -> Dict[str, Any]:
             "greeks_enabled": GREEKS_ENABLED,
             "metrics_enabled": METRICS_ENABLED,
             "backfill_on_startup": BACKFILL_ON_STARTUP,
+            "ingest_parity_guard_enabled": INGEST_PARITY_GUARD_ENABLED,
         },
     }
 
