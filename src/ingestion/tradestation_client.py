@@ -228,7 +228,15 @@ class TradeStationClient:
             if line is None:
                 return {}
             return json.loads(line)
-        except (StopIteration, requests.exceptions.RequestException, json.JSONDecodeError) as e:
+        except StopIteration:
+            # Stream endpoints may rotate/terminate connections. Treat this as a
+            # normal reconnect event instead of warning-level noise.
+            self._close_stream(stream_key)
+            if retry_count < API_RETRY_ATTEMPTS - 1:
+                return self._request_stream_snapshot(endpoint, params, retry_count + 1)
+            logger.debug("Stream ended repeatedly; returning empty snapshot")
+            return {}
+        except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
             self._close_stream(stream_key)
             if retry_count < API_RETRY_ATTEMPTS - 1:
                 retry_delay = API_RETRY_DELAY * (API_RETRY_BACKOFF ** retry_count)
