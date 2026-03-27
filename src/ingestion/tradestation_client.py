@@ -13,6 +13,7 @@ from typing import Optional, List, Dict, Any, Union
 import pytz
 import json
 from requests import Response
+from threading import Lock
 
 from src.ingestion.tradestation_auth import TradeStationAuth
 from src.utils import get_logger
@@ -29,6 +30,7 @@ logger = get_logger(__name__)
 
 # Eastern Time timezone
 ET = pytz.timezone("US/Eastern")
+STREAM_READ_TIMEOUT_SECONDS = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
 
 
 class TradeStationClient:
@@ -44,6 +46,8 @@ class TradeStationClient:
         self.base_url = self.SANDBOX_URL if sandbox else self.BASE_URL
         self.auth = TradeStationAuth(client_id, client_secret, refresh_token, sandbox)
         self.sandbox = sandbox
+        self._stream_lock = Lock()
+        self._stream_state: Dict[str, Dict[str, Any]] = {}
 
         # Check if market hours warnings should be suppressed
         self.warn_market_hours = os.getenv("TS_WARN_MARKET_HOURS", "true").lower() != "false"
@@ -214,50 +218,16 @@ class TradeStationClient:
         TradeStation stream endpoints may keep the connection open. For ingestion
         compatibility we consume one payload and return immediately.
         """
-        url = f"{self.base_url}/{endpoint}"
-        headers = self.auth.get_headers()
+        stream_key = self._build_stream_key(endpoint, params)
 
         try:
-            with requests.get(
-                url,
-                headers=headers,
-                params=params,
-                stream=True,
-                timeout=(API_REQUEST_TIMEOUT, API_REQUEST_TIMEOUT),
-            ) as response:
-                if response.status_code == 401:
-                    if retry_count < API_RETRY_ATTEMPTS - 1:
-                        logger.warning("Stream endpoint returned 401; refreshing token and retrying")
-                        self.auth.force_refresh_access_token()
-                        return self._request_stream_snapshot(endpoint, params, retry_count + 1)
-                    response.raise_for_status()
-
-                if response.status_code not in [200, 201]:
-                    logger.error(f"Stream request failed: {response.status_code} [{endpoint}]")
-                    logger.error(f"Response: {response.text}")
-                    response.raise_for_status()
-
-                for raw_line in response.iter_lines(decode_unicode=True):
-                    if not raw_line:
-                        continue
-                    if isinstance(raw_line, bytes):
-                        line = raw_line.decode("utf-8", errors="ignore").strip()
-                    else:
-                        line = raw_line.strip()
-                    if not line:
-                        continue
-                    if line.startswith("data:"):
-                        line = line[5:].strip()
-                    if line in {"[DONE]", "heartbeat"}:
-                        continue
-                    try:
-                        return json.loads(line)
-                    except json.JSONDecodeError:
-                        logger.debug(f"Skipping non-JSON stream line from {endpoint}: {line[:200]}")
-                        continue
-
+            state = self._get_or_open_stream(stream_key, endpoint, params)
+            line = self._next_stream_json_line(stream_key, state)
+            if line is None:
                 return {}
-        except requests.exceptions.RequestException as e:
+            return json.loads(line)
+        except (StopIteration, requests.exceptions.RequestException, json.JSONDecodeError) as e:
+            self._close_stream(stream_key)
             if retry_count < API_RETRY_ATTEMPTS - 1:
                 retry_delay = API_RETRY_DELAY * (API_RETRY_BACKOFF ** retry_count)
                 logger.warning(f"Stream request failed: {e}, retrying in {retry_delay}s...")
@@ -265,6 +235,87 @@ class TradeStationClient:
                 return self._request_stream_snapshot(endpoint, params, retry_count + 1)
             logger.error(f"Stream request failed after {API_RETRY_ATTEMPTS} attempts: {e}")
             raise
+
+    def _build_stream_key(self, endpoint: str, params: Optional[Dict]) -> str:
+        params_key = json.dumps(params or {}, sort_keys=True)
+        return f"{endpoint}?{params_key}"
+
+    def _get_or_open_stream(self, stream_key: str, endpoint: str, params: Optional[Dict]) -> Dict[str, Any]:
+        with self._stream_lock:
+            existing = self._stream_state.get(stream_key)
+            if existing:
+                return existing
+
+            url = f"{self.base_url}/{endpoint}"
+            headers = self.auth.get_headers()
+            response = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                stream=True,
+                timeout=(API_REQUEST_TIMEOUT, STREAM_READ_TIMEOUT_SECONDS),
+            )
+
+            if response.status_code == 401:
+                response.close()
+                self.auth.force_refresh_access_token()
+                headers = self.auth.get_headers()
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    params=params,
+                    stream=True,
+                    timeout=(API_REQUEST_TIMEOUT, STREAM_READ_TIMEOUT_SECONDS),
+                )
+
+            if response.status_code not in [200, 201]:
+                logger.error(f"Stream request failed: {response.status_code} [{endpoint}]")
+                logger.error(f"Response: {response.text}")
+                response.raise_for_status()
+
+            state = {
+                "response": response,
+                "iterator": response.iter_lines(decode_unicode=True),
+            }
+            self._stream_state[stream_key] = state
+            return state
+
+    def _next_stream_json_line(self, stream_key: str, state: Dict[str, Any]) -> Optional[str]:
+        iterator = state["iterator"]
+        for raw_line in iterator:
+            if not raw_line:
+                continue
+            if isinstance(raw_line, bytes):
+                line = raw_line.decode("utf-8", errors="ignore").strip()
+            else:
+                line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("data:"):
+                line = line[5:].strip()
+            if line in {"[DONE]", "heartbeat"}:
+                continue
+            return line
+
+        # Iterator exhausted -> close and signal caller to retry.
+        self._close_stream(stream_key)
+        raise StopIteration("Stream ended")
+
+    def _close_stream(self, stream_key: str):
+        with self._stream_lock:
+            state = self._stream_state.pop(stream_key, None)
+            if state and state.get("response") is not None:
+                try:
+                    state["response"].close()
+                except Exception:
+                    pass
+
+    def close_all_streams(self):
+        """Close all open stream HTTP connections."""
+        with self._stream_lock:
+            keys = list(self._stream_state.keys())
+        for key in keys:
+            self._close_stream(key)
 
     # =========================================================================
     # QUOTE ENDPOINTS

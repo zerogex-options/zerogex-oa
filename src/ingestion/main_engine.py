@@ -617,6 +617,10 @@ class IngestionEngine:
             logger.error(f"Streaming error: {e}", exc_info=True)
         finally:
             self._flush_all_buffers()
+            try:
+                self.client.close_all_streams()
+            except Exception as e:
+                logger.warning(f"Error closing TradeStation streams: {e}")
             logger.info("Streaming stopped")
 
     def run(self):
