@@ -1,8 +1,9 @@
 """
-Stream Manager - Streams real-time data and yields to IngestionEngine
+Stream Manager - Fetches real-time data and yields to IngestionEngine
 
-Updated to use TradeStation Stream Bars API for underlying quotes,
-which provides proper UpVolume and DownVolume tracking.
+Uses TradeStation Stream Bars API for underlying quotes (provides
+UpVolume/DownVolume tracking) and REST quote snapshots for option
+chains (guarantees complete data for all tracked contracts every cycle).
 
 This manager ONLY fetches data from TradeStation API.
 Storage is handled by IngestionEngine.
@@ -74,17 +75,12 @@ class StreamManager:
 
         # Track last expiration refresh time
         self.last_expiration_refresh: Optional[datetime] = None
-        self.option_reconcile_interval_seconds = max(
-            0, int(os.getenv("OPTION_REST_RECONCILE_INTERVAL_SECONDS", "300"))
-        )
         self.option_oi_coverage_alert_threshold = float(
             os.getenv("OPTION_OI_COVERAGE_ALERT_THRESHOLD", "0.35")
         )
         self.option_volume_coverage_alert_threshold = float(
             os.getenv("OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD", "0.35")
         )
-        self._last_option_reconcile_ts: float = 0.0
-        self._last_option_emit_bucket: Dict[str, datetime] = {}
 
         logger.info(f"Initialized StreamManager for {underlying}")
         logger.info(f"Config: {num_expirations} expirations, {num_strikes} strikes each side")
@@ -162,6 +158,11 @@ class StreamManager:
                 "down_volume": underlying_data["down_volume"],
                 "volume": underlying_data["volume"],
             }
+
+            # Evict stale minute buckets to prevent unbounded memory growth.
+            stale_keys = [k for k in self._underlying_bar_state if k < minute_bucket]
+            for k in stale_keys:
+                del self._underlying_bar_state[k]
 
             logger.debug(f"Bar: {self.underlying} @ {timestamp} "
                         f"C=${underlying_data['close']:.2f} "
@@ -373,6 +374,12 @@ class StreamManager:
                 option_symbols.append(put_symbol)
                 self.tracked_strikes.add(strike)
 
+        # Evict cached quote state for contracts we no longer track.
+        tracked_set = set(option_symbols)
+        stale_symbols = [s for s in self._option_quote_state if s not in tracked_set]
+        for s in stale_symbols:
+            del self._option_quote_state[s]
+
         logger.info(f"Built {len(option_symbols)} option symbols to track")
         return option_symbols
 
@@ -509,16 +516,10 @@ class StreamManager:
             option_count = 0
             option_with_oi = 0
             option_with_volume = 0
-            seen_option_symbols: Set[str] = set()
-            run_option_reconcile = (
-                self.option_reconcile_interval_seconds > 0
-                and (time.time() - self._last_option_reconcile_ts) >= self.option_reconcile_interval_seconds
-            )
-            if run_option_reconcile:
-                logger.info("Running periodic option REST snapshot reconciliation")
 
             try:
                 # Fetch underlying bar using Stream Bars API
+                # (single symbol — stream snapshot works well here)
                 underlying_data = self._fetch_underlying_bar()
 
                 if underlying_data:
@@ -528,17 +529,18 @@ class StreamManager:
                     # Yield underlying data
                     yield {"type": "underlying", "data": underlying_data}
 
-                # Fetch options quotes in batches
+                # Fetch option quotes via REST to guarantee complete snapshots.
+                #
+                # The streaming quotes endpoint emits individual updates as they
+                # happen, so reading one line per poll gives at most one symbol's
+                # data — leaving the vast majority of contracts with no update.
+                # REST returns all requested symbols in a single response, which
+                # is the correct choice for a synchronous polling model.
                 for i in range(0, len(self.tracked_option_symbols), OPTION_BATCH_SIZE):
                     batch = self.tracked_option_symbols[i:i + OPTION_BATCH_SIZE]
 
                     try:
-                        # Periodically reconcile from full REST quote snapshots to
-                        # heal any drift/missing fields from streaming deltas.
-                        if run_option_reconcile:
-                            options_data = self.client.get_option_quotes(batch)
-                        else:
-                            options_data = self.client.get_stream_quotes(batch)
+                        options_data = self.client.get_option_quotes(batch)
 
                         if "Quotes" in options_data:
                             for opt_quote in options_data["Quotes"]:
@@ -570,7 +572,9 @@ class StreamManager:
                                 if not timestamp:
                                     timestamp = datetime.now(ET)
 
-                                # Parse quote data
+                                # Parse quote data — REST returns complete snapshots,
+                                # but some fields (e.g. OI outside settlement) may
+                                # still be absent. Fall back to last known value.
                                 prior = self._option_quote_state.get(option_symbol, {})
 
                                 last = safe_float(opt_quote.get("Last"), default=None, field_name="Last")
@@ -578,8 +582,6 @@ class StreamManager:
                                 ask = safe_float(opt_quote.get("Ask"), default=None, field_name="Ask")
                                 mid = safe_float(opt_quote.get("Mid"), default=None, field_name="Mid")
 
-                                # Stream payloads can be partial (delta updates). Carry
-                                # forward previously seen values when fields are omitted.
                                 if last is None:
                                     last = prior.get("last")
                                 if bid is None:
@@ -592,6 +594,7 @@ class StreamManager:
                                 # Fall back to computed mid if TradeStation doesn't provide it
                                 if mid is None and bid is not None and ask is not None:
                                     mid = (bid + ask) / 2.0
+
                                 volume = safe_int(opt_quote.get("Volume"), default=None, field_name="Volume")
                                 if volume is None:
                                     volume = prior.get("volume")
@@ -610,7 +613,6 @@ class StreamManager:
                                     open_interest = prior.get("open_interest")
 
                                 # Try multiple field names for implied volatility
-                                # TradeStation may use different field names
                                 implied_volatility = None
                                 for iv_field in ["ImpliedVolatility", "IV", "Volatility", "IVol"]:
                                     iv_value = safe_float(opt_quote.get(iv_field), field_name=iv_field)
@@ -625,8 +627,7 @@ class StreamManager:
                                     logger.debug(f"  OpenInterest: {opt_quote.get('OpenInterest')}")
                                     logger.debug(f"  DailyOpenInterest: {opt_quote.get('DailyOpenInterest')}")
                                     logger.debug(f"  ImpliedVolatility found: {implied_volatility}")
-                                    # Check for any field containing 'vol' or 'IV'
-                                    vol_fields = {k: v for k, v in opt_quote.items() 
+                                    vol_fields = {k: v for k, v in opt_quote.items()
                                                  if 'vol' in k.lower() or 'iv' in k.lower()}
                                     if vol_fields:
                                         logger.debug(f"  Fields containing 'vol' or 'iv': {vol_fields}")
@@ -648,13 +649,8 @@ class StreamManager:
                                     "implied_volatility": implied_volatility if implied_volatility else None,
                                 }
 
-                                # Persist merged state for next partial update.
+                                # Cache state for field-level fallback on next cycle.
                                 self._option_quote_state[option_symbol] = {
-                                    "option_symbol": option_symbol,
-                                    "underlying": self.db_underlying,
-                                    "strike": strike,
-                                    "expiration": expiration,
-                                    "option_type": option_type,
                                     "last": option_data["last"],
                                     "bid": option_data["bid"],
                                     "ask": option_data["ask"],
@@ -666,7 +662,6 @@ class StreamManager:
 
                                 yield {"type": "option", "data": option_data}
                                 option_count += 1
-                                seen_option_symbols.add(option_symbol)
                                 if (option_data.get("open_interest") or 0) > 0:
                                     option_with_oi += 1
                                 if (option_data.get("volume") or 0) > 0:
@@ -681,55 +676,6 @@ class StreamManager:
                     # Small pacing delay between option batches to avoid API bursts.
                     if DELAY_BETWEEN_BATCHES > 0:
                         time.sleep(DELAY_BETWEEN_BATCHES)
-
-                if run_option_reconcile:
-                    self._last_option_reconcile_ts = time.time()
-
-                # Ensure each tracked contract has at least one row per minute bucket.
-                # If a symbol has no update in the current iteration, emit a carry-forward
-                # snapshot from last known state once per minute.
-                current_bucket = datetime.now(ET).replace(second=0, microsecond=0)
-                for option_symbol in self.tracked_option_symbols:
-                    if option_symbol in seen_option_symbols:
-                        self._last_option_emit_bucket[option_symbol] = current_bucket
-                        continue
-                    state = self._option_quote_state.get(option_symbol)
-                    if not state:
-                        continue
-                    if self._last_option_emit_bucket.get(option_symbol) == current_bucket:
-                        continue
-
-                    carry_forward_data = {
-                        "option_symbol": state.get("option_symbol", option_symbol),
-                        "timestamp": datetime.now(ET),
-                        "underlying": state.get("underlying", self.db_underlying),
-                        "strike": state.get("strike"),
-                        "expiration": state.get("expiration"),
-                        "option_type": state.get("option_type"),
-                        "last": state.get("last"),
-                        "bid": state.get("bid"),
-                        "ask": state.get("ask"),
-                        "mid": state.get("mid"),
-                        "volume": state.get("volume"),
-                        "open_interest": state.get("open_interest"),
-                        "implied_volatility": state.get("implied_volatility"),
-                    }
-
-                    # Skip if metadata is incomplete (can happen before first full parse).
-                    if (
-                        carry_forward_data["strike"] is None
-                        or carry_forward_data["expiration"] is None
-                        or carry_forward_data["option_type"] is None
-                    ):
-                        continue
-
-                    yield {"type": "option", "data": carry_forward_data}
-                    option_count += 1
-                    if (carry_forward_data.get("open_interest") or 0) > 0:
-                        option_with_oi += 1
-                    if (carry_forward_data.get("volume") or 0) > 0:
-                        option_with_volume += 1
-                    self._last_option_emit_bucket[option_symbol] = current_bucket
 
                 if option_count > 0:
                     oi_coverage = option_with_oi / option_count

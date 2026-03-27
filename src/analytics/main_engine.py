@@ -720,7 +720,7 @@ class AnalyticsEngine:
                             l.implied_volatility,
                             l.delta,
                             CASE
-                                WHEN p.prev_volume IS NULL THEN 0
+                                WHEN p.prev_volume IS NULL THEN COALESCE(l.volume, 0)
                                 WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
                                     = (l.timestamp AT TIME ZONE 'America/New_York')::date
                                     THEN GREATEST(COALESCE(l.volume, 0) - COALESCE(p.prev_volume, 0), 0)
@@ -785,7 +785,7 @@ class AnalyticsEngine:
                             l.implied_volatility,
                             l.option_type,
                             CASE
-                                WHEN p.prev_volume IS NULL THEN 0
+                                WHEN p.prev_volume IS NULL THEN COALESCE(l.volume, 0)
                                 WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
                                     = (l.timestamp AT TIME ZONE 'America/New_York')::date
                                     THEN GREATEST(COALESCE(l.volume, 0) - COALESCE(p.prev_volume, 0), 0)
@@ -848,7 +848,7 @@ class AnalyticsEngine:
                             l.expiration,
                             l.last,
                             CASE
-                                WHEN p.prev_volume IS NULL THEN 0
+                                WHEN p.prev_volume IS NULL THEN COALESCE(l.volume, 0)
                                 WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
                                     = (l.timestamp AT TIME ZONE 'America/New_York')::date
                                     THEN GREATEST(COALESCE(l.volume, 0) - COALESCE(p.prev_volume, 0), 0)
@@ -910,7 +910,7 @@ class AnalyticsEngine:
                             l.implied_volatility,
                             l.delta,
                             CASE
-                                WHEN p.prev_volume IS NULL THEN 0
+                                WHEN p.prev_volume IS NULL THEN COALESCE(l.volume, 0)
                                 WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
                                     = (l.timestamp AT TIME ZONE 'America/New_York')::date
                                     THEN GREATEST(COALESCE(l.volume, 0) - COALESCE(p.prev_volume, 0), 0)

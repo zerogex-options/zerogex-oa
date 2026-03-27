@@ -32,7 +32,7 @@ logger = get_logger(__name__)
 ET = pytz.timezone("US/Eastern")
 STREAM_READ_TIMEOUT_SECONDS = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
 STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").lower() == "true"
-STREAM_REUSE_QUOTES = os.getenv("TS_STREAM_REUSE_QUOTES", "true").lower() == "true"
+STREAM_REUSE_QUOTES = os.getenv("TS_STREAM_REUSE_QUOTES", "false").lower() == "true"
 
 
 class TradeStationClient:
