@@ -62,6 +62,7 @@ class AnalyticsEngine:
         self.calculation_interval = calculation_interval
         self.risk_free_rate = risk_free_rate
         self.running = False
+        self.snapshot_lookback_minutes = max(1, int(os.getenv("ANALYTICS_SNAPSHOT_LOOKBACK_MINUTES", "5")))
 
         # Metrics
         self.calculations_completed = 0
@@ -147,7 +148,33 @@ class AnalyticsEngine:
             with db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    SELECT 
+                    WITH latest_per_contract AS (
+                        SELECT
+                            option_symbol,
+                            strike,
+                            expiration,
+                            option_type,
+                            last,
+                            bid,
+                            ask,
+                            volume,
+                            open_interest,
+                            delta,
+                            gamma,
+                            theta,
+                            vega,
+                            implied_volatility,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY option_symbol
+                                ORDER BY timestamp DESC
+                            ) AS rn
+                        FROM option_chains
+                        WHERE underlying = %s
+                          AND timestamp <= %s
+                          AND timestamp >= (%s - (%s * INTERVAL '1 minute'))
+                          AND gamma IS NOT NULL
+                    )
+                    SELECT
                         option_symbol,
                         strike,
                         expiration,
@@ -162,12 +189,10 @@ class AnalyticsEngine:
                         theta,
                         vega,
                         implied_volatility
-                    FROM option_chains
-                    WHERE underlying = %s
-                      AND timestamp = %s
-                      AND gamma IS NOT NULL
+                    FROM latest_per_contract
+                    WHERE rn = 1
                     ORDER BY expiration, strike
-                """, (self.db_symbol, timestamp))
+                """, (self.db_symbol, timestamp, timestamp, self.snapshot_lookback_minutes))
 
                 rows = cursor.fetchall()
 
@@ -190,7 +215,10 @@ class AnalyticsEngine:
                         'implied_volatility': float(row[13]) if row[13] else 0.2
                     })
 
-                logger.info(f"Fetched {len(options)} options with Greeks")
+                logger.info(
+                    f"Fetched {len(options)} options with Greeks "
+                    f"(latest-per-contract over {self.snapshot_lookback_minutes}m lookback)"
+                )
 
                 # Count how many have OI > 0 for informational purposes
                 options_with_oi = sum(1 for opt in options if opt['open_interest'] > 0)
