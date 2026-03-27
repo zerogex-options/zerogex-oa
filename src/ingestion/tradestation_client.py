@@ -240,7 +240,10 @@ class TradeStationClient:
                 for raw_line in response.iter_lines(decode_unicode=True):
                     if not raw_line:
                         continue
-                    line = raw_line.strip()
+                    if isinstance(raw_line, bytes):
+                        line = raw_line.decode("utf-8", errors="ignore").strip()
+                    else:
+                        line = raw_line.strip()
                     if not line:
                         continue
                     if line.startswith("data:"):
