@@ -63,6 +63,8 @@ class AnalyticsEngine:
         self.risk_free_rate = risk_free_rate
         self.running = False
         self.snapshot_lookback_minutes = max(1, int(os.getenv("ANALYTICS_SNAPSHOT_LOOKBACK_MINUTES", "5")))
+        self.snapshot_freshness_seconds = max(30, int(os.getenv("ANALYTICS_SNAPSHOT_FRESHNESS_SECONDS", "180")))
+        self.min_oi_coverage_pct_alert = float(os.getenv("ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT", "0.35"))
 
         # Metrics
         self.calculations_completed = 0
@@ -164,6 +166,7 @@ class AnalyticsEngine:
                             theta,
                             vega,
                             implied_volatility,
+                            timestamp,
                             ROW_NUMBER() OVER (
                                 PARTITION BY option_symbol
                                 ORDER BY timestamp DESC
@@ -188,7 +191,8 @@ class AnalyticsEngine:
                         gamma,
                         theta,
                         vega,
-                        implied_volatility
+                        implied_volatility,
+                        timestamp
                     FROM latest_per_contract
                     WHERE rn = 1
                     ORDER BY expiration, strike
@@ -197,7 +201,14 @@ class AnalyticsEngine:
                 rows = cursor.fetchall()
 
                 options = []
+                stale_cutoff = timestamp - timedelta(seconds=self.snapshot_freshness_seconds)
+                stale_dropped = 0
+
                 for row in rows:
+                    quote_ts = row[14]
+                    if quote_ts and quote_ts < stale_cutoff:
+                        stale_dropped += 1
+                        continue
                     options.append({
                         'option_symbol': row[0],
                         'strike': float(row[1]),
@@ -219,14 +230,28 @@ class AnalyticsEngine:
                     f"Fetched {len(options)} options with Greeks "
                     f"(latest-per-contract over {self.snapshot_lookback_minutes}m lookback)"
                 )
+                if stale_dropped > 0:
+                    logger.info(
+                        f"Dropped {stale_dropped} stale contracts older than "
+                        f"{self.snapshot_freshness_seconds}s freshness limit"
+                    )
 
                 # Count how many have OI > 0 for informational purposes
                 options_with_oi = sum(1 for opt in options if opt['open_interest'] > 0)
+                oi_coverage = (options_with_oi / len(options)) if options else 0.0
                 if options_with_oi > 0:
-                    logger.info(f"  {options_with_oi} options have open interest > 0")
+                    logger.info(
+                        f"  {options_with_oi} options have open interest > 0 "
+                        f"({oi_coverage:.1%} coverage)"
+                    )
                 else:
                     logger.info(f"  Note: All options have OI=0 (normal for real-time data)")
                     logger.info(f"  GEX will be calculated but will be 0 until OI updates")
+                if options and oi_coverage < self.min_oi_coverage_pct_alert:
+                    logger.warning(
+                        f"⚠️ Low OI coverage in analytics snapshot: {oi_coverage:.1%} "
+                        f"(threshold {self.min_oi_coverage_pct_alert:.1%})"
+                    )
 
                 return options
 

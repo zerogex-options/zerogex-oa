@@ -74,6 +74,16 @@ class StreamManager:
 
         # Track last expiration refresh time
         self.last_expiration_refresh: Optional[datetime] = None
+        self.option_reconcile_interval_seconds = max(
+            0, int(os.getenv("OPTION_REST_RECONCILE_INTERVAL_SECONDS", "300"))
+        )
+        self.option_oi_coverage_alert_threshold = float(
+            os.getenv("OPTION_OI_COVERAGE_ALERT_THRESHOLD", "0.35")
+        )
+        self.option_volume_coverage_alert_threshold = float(
+            os.getenv("OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD", "0.35")
+        )
+        self._last_option_reconcile_ts: float = 0.0
 
         logger.info(f"Initialized StreamManager for {underlying}")
         logger.info(f"Config: {num_expirations} expirations, {num_strikes} strikes each side")
@@ -496,6 +506,14 @@ class StreamManager:
 
             # Track option count for debugging
             option_count = 0
+            option_with_oi = 0
+            option_with_volume = 0
+            run_option_reconcile = (
+                self.option_reconcile_interval_seconds > 0
+                and (time.time() - self._last_option_reconcile_ts) >= self.option_reconcile_interval_seconds
+            )
+            if run_option_reconcile:
+                logger.info("Running periodic option REST snapshot reconciliation")
 
             try:
                 # Fetch underlying bar using Stream Bars API
@@ -513,7 +531,12 @@ class StreamManager:
                     batch = self.tracked_option_symbols[i:i + OPTION_BATCH_SIZE]
 
                     try:
-                        options_data = self.client.get_stream_quotes(batch)
+                        # Periodically reconcile from full REST quote snapshots to
+                        # heal any drift/missing fields from streaming deltas.
+                        if run_option_reconcile:
+                            options_data = self.client.get_option_quotes(batch)
+                        else:
+                            options_data = self.client.get_stream_quotes(batch)
 
                         if "Quotes" in options_data:
                             for opt_quote in options_data["Quotes"]:
@@ -632,6 +655,10 @@ class StreamManager:
 
                                 yield {"type": "option", "data": option_data}
                                 option_count += 1
+                                if (option_data.get("open_interest") or 0) > 0:
+                                    option_with_oi += 1
+                                if (option_data.get("volume") or 0) > 0:
+                                    option_with_volume += 1
 
                     except Exception as e:
                         logger.error(f"Error fetching options batch: {e}")
@@ -642,6 +669,27 @@ class StreamManager:
                     # Small pacing delay between option batches to avoid API bursts.
                     if DELAY_BETWEEN_BATCHES > 0:
                         time.sleep(DELAY_BETWEEN_BATCHES)
+
+                if run_option_reconcile:
+                    self._last_option_reconcile_ts = time.time()
+
+                if option_count > 0:
+                    oi_coverage = option_with_oi / option_count
+                    volume_coverage = option_with_volume / option_count
+                    logger.info(
+                        f"Option quote quality: total={option_count}, "
+                        f"oi_coverage={oi_coverage:.1%}, volume_coverage={volume_coverage:.1%}"
+                    )
+                    if oi_coverage < self.option_oi_coverage_alert_threshold:
+                        logger.warning(
+                            f"⚠️ Low option OI coverage: {oi_coverage:.1%} "
+                            f"(threshold {self.option_oi_coverage_alert_threshold:.1%})"
+                        )
+                    if volume_coverage < self.option_volume_coverage_alert_threshold:
+                        logger.warning(
+                            f"⚠️ Low option volume coverage: {volume_coverage:.1%} "
+                            f"(threshold {self.option_volume_coverage_alert_threshold:.1%})"
+                        )
 
                 # Recalibrate strike range periodically — re-centers N strikes around
                 # the latest price unconditionally, so the tracked window always stays current.
