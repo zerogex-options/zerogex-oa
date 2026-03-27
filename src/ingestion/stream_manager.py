@@ -91,6 +91,8 @@ class OptionStreamAccumulator:
         self._response_lock = threading.Lock()
         self._updates_received: int = 0
         self._connected = threading.Event()
+        # Symbols that have received at least one update since last drain().
+        self._dirty: Set[str] = set()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -133,6 +135,20 @@ class OptionStreamAccumulator:
         """Return a copy of the current accumulated state keyed by symbol."""
         with self._lock:
             return {k: dict(v) for k, v in self._state.items()}
+
+    def drain(self) -> Dict[str, Dict[str, Any]]:
+        """Return state for contracts updated since last drain and clear the dirty set.
+
+        Unlike :meth:`snapshot`, this only returns contracts that received at
+        least one stream update (or were REST-seeded) since the previous drain.
+        This eliminates the need for external change-detection.
+        """
+        with self._lock:
+            if not self._dirty:
+                return {}
+            result = {sym: dict(self._state[sym]) for sym in self._dirty if sym in self._state}
+            self._dirty.clear()
+            return result
 
     # -- internal ----------------------------------------------------------
 
@@ -276,6 +292,7 @@ class OptionStreamAccumulator:
                         pass
 
             self._state[symbol] = merged
+            self._dirty.add(symbol)
             self._updates_received += 1
 
 
@@ -311,9 +328,6 @@ class StreamManager:
         self._symbol_metadata: Dict[str, Dict[str, Any]] = {}
         # Background accumulator for persistent option quote streaming.
         self._accumulator: Optional[OptionStreamAccumulator] = None
-        # Last-yielded raw TimeStamp string per contract so we only write to
-        # the DB when the stream has actually delivered a newer update.
-        self._last_yielded_ts: Dict[str, str] = {}
 
         # Track expired strikes for cleanup
         self.all_tracked_strikes: Dict[date, Set[float]] = {}
@@ -715,36 +729,24 @@ class StreamManager:
             symbols=self.tracked_option_symbols,
         )
         self._accumulator.start()
-        # Reset change-tracking so the fresh REST seed gets yielded.
-        self._last_yielded_ts.clear()
 
     def _yield_option_snapshot(self, state: Dict[str, Dict[str, Any]]):
         """
         Convert raw accumulator state into yielded option data dicts.
 
-        Only yields a contract when the stream has delivered a newer
-        update (compared by raw TimeStamp string) since the last time
-        we yielded it.  This prevents writing duplicate rows to the DB
-        when a contract has no new activity.
+        *state* should come from :meth:`OptionStreamAccumulator.drain` so
+        it only contains contracts that have received new data since the
+        last drain — no external change-detection needed.
 
         Returns a list (not a generator) so callers can count results.
         """
         results = []
-        for option_symbol in self.tracked_option_symbols:
-            raw = state.get(option_symbol)
-            if not raw:
-                continue  # no data received yet for this contract
-
+        for option_symbol, raw in state.items():
             meta = self._symbol_metadata.get(option_symbol)
             if not meta:
                 continue
 
-            # Skip if the stream hasn't delivered a newer update.
             raw_ts = raw.get("TimeStamp", "")
-            prev_ts = self._last_yielded_ts.get(option_symbol)
-            if prev_ts is not None and raw_ts == prev_ts:
-                continue
-
             timestamp = safe_datetime(raw_ts, field_name="TimeStamp")
             if not timestamp:
                 timestamp = datetime.now(ET)
@@ -780,8 +782,6 @@ class StreamManager:
                     implied_volatility = iv_val
                     break
 
-            self._last_yielded_ts[option_symbol] = raw_ts
-
             results.append({
                 "option_symbol": option_symbol,
                 "timestamp": timestamp,
@@ -808,14 +808,19 @@ class StreamManager:
         Stream real-time data and yield to caller.
 
         Underlying bars are fetched via Stream Bars snapshot each cycle.
-        Option quotes are accumulated by a background thread reading from
-        a persistent streaming connection; this method snapshots that state
-        on each poll interval and yields all contracts.
+        Option quotes are accumulated by a background thread; this method
+        drains only the contracts that received new data since the last
+        cycle and yields them as a single batch for efficient DB writes.
 
         Yields dictionaries with:
             {
-                'type': 'underlying' | 'option',
+                'type': 'underlying',
                 'data': {...}
+            }
+        or:
+            {
+                'type': 'option_batch',
+                'data': [list of option dicts]
             }
         """
         if not self.tracked_option_symbols:
@@ -873,52 +878,54 @@ class StreamManager:
                         self.current_price = underlying_data["close"]
                         yield {"type": "underlying", "data": underlying_data}
 
-                    # Snapshot accumulated option state from background stream.
-                    state = self._accumulator.snapshot()
-                    option_results = self._yield_option_snapshot(state)
+                    # Drain only contracts that changed since last cycle.
+                    changed = self._accumulator.drain()
+                    if changed:
+                        option_results = self._yield_option_snapshot(changed)
 
-                    option_count = len(option_results)
-                    option_with_oi = 0
-                    option_with_volume = 0
+                        if option_results:
+                            option_count = len(option_results)
+                            option_with_oi = sum(
+                                1 for o in option_results
+                                if (o.get("open_interest") or 0) > 0
+                            )
+                            option_with_volume = sum(
+                                1 for o in option_results
+                                if (o.get("volume") or 0) > 0
+                            )
 
-                    for option_data in option_results:
-                        yield {"type": "option", "data": option_data}
-                        if (option_data.get("open_interest") or 0) > 0:
-                            option_with_oi += 1
-                        if (option_data.get("volume") or 0) > 0:
-                            option_with_volume += 1
+                            tracked_total = len(self.tracked_option_symbols)
+                            oi_coverage = option_with_oi / option_count
+                            volume_coverage = option_with_volume / option_count
 
-                    tracked_total = len(self.tracked_option_symbols)
-                    skipped = tracked_total - option_count
+                            logger.info(
+                                f"Option batch: {option_count} updated, "
+                                f"{tracked_total - option_count} unchanged, "
+                                f"oi_coverage={oi_coverage:.1%}, "
+                                f"volume_coverage={volume_coverage:.1%}, "
+                                f"stream_updates={self._accumulator.updates_received}"
+                            )
 
-                    if option_count > 0:
-                        oi_coverage = option_with_oi / option_count
-                        volume_coverage = option_with_volume / option_count
-                        logger.info(
-                            f"Option snapshot: yielded={option_count}, "
-                            f"unchanged={skipped}, "
-                            f"oi_coverage={oi_coverage:.1%}, "
-                            f"volume_coverage={volume_coverage:.1%}, "
-                            f"stream_updates={self._accumulator.updates_received}"
-                        )
-                    elif skipped > 0:
+                            if oi_coverage < self.option_oi_coverage_alert_threshold:
+                                logger.warning(
+                                    f"⚠️ Low option OI coverage: {oi_coverage:.1%} "
+                                    f"(threshold "
+                                    f"{self.option_oi_coverage_alert_threshold:.1%})"
+                                )
+                            if volume_coverage < self.option_volume_coverage_alert_threshold:
+                                logger.warning(
+                                    f"⚠️ Low option volume coverage: "
+                                    f"{volume_coverage:.1%} "
+                                    f"(threshold "
+                                    f"{self.option_volume_coverage_alert_threshold:.1%})"
+                                )
+
+                            # Yield the entire batch as one item for batched DB writes.
+                            yield {"type": "option_batch", "data": option_results}
+                    else:
                         logger.debug(
-                            f"Option snapshot: no new updates "
-                            f"({skipped} contracts unchanged)"
+                            "No new option updates this cycle"
                         )
-                        if oi_coverage < self.option_oi_coverage_alert_threshold:
-                            logger.warning(
-                                f"⚠️ Low option OI coverage: {oi_coverage:.1%} "
-                                f"(threshold "
-                                f"{self.option_oi_coverage_alert_threshold:.1%})"
-                            )
-                        if volume_coverage < self.option_volume_coverage_alert_threshold:
-                            logger.warning(
-                                f"⚠️ Low option volume coverage: "
-                                f"{volume_coverage:.1%} "
-                                f"(threshold "
-                                f"{self.option_volume_coverage_alert_threshold:.1%})"
-                            )
 
                     # Recalibrate strike range periodically.
                     if iteration % STRIKE_RECALC_INTERVAL == 0 and iteration > 0:
@@ -1044,9 +1051,9 @@ def main():
                     print(f"Underlying bars: {underlying_count} - Latest: "
                           f"${data['close']:.2f} "
                           f"(Up: {data['up_volume']:,}, Down: {data['down_volume']:,})")
-            elif item["type"] == "option":
-                option_count += 1
-                if option_count % 100 == 0:
+            elif item["type"] == "option_batch":
+                option_count += len(item["data"])
+                if option_count % 100 < len(item["data"]):
                     print(f"Option quotes: {option_count}")
 
         print("\n" + "="*80)
