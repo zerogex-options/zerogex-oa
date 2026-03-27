@@ -354,7 +354,11 @@ class IngestionEngine:
             if prev_timestamp is not None:
                 prev_bucket = bucket_timestamp(prev_timestamp, AGGREGATION_BUCKET_SECONDS)
                 if prev_bucket != bucket:
+                    prev_snapshot = existing[-1]
                     self._flush_option_bucket(option_symbol, prev_bucket, keep_last_snapshot=False)
+                    # Seed the new bucket with the previous snapshot so the first
+                    # update in the new minute can produce a volume delta.
+                    self.options_buffer[option_symbol] = [prev_snapshot]
 
         self.options_buffer[option_symbol].append(data)
 
