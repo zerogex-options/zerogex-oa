@@ -31,6 +31,7 @@ logger = get_logger(__name__)
 # Eastern Time timezone
 ET = pytz.timezone("US/Eastern")
 STREAM_READ_TIMEOUT_SECONDS = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
+STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").lower() == "true"
 
 
 class TradeStationClient:
@@ -235,6 +236,12 @@ class TradeStationClient:
                 return self._request_stream_snapshot(endpoint, params, retry_count + 1)
             logger.error(f"Stream request failed after {API_RETRY_ATTEMPTS} attempts: {e}")
             raise
+        finally:
+            # Snapshot mode should not hold the stream open by default.
+            # Reusing a stream for one-line snapshots can block until the *next*
+            # event on subsequent reads, which introduces write lag.
+            if not STREAM_REUSE_CONNECTIONS:
+                self._close_stream(stream_key)
 
     def _build_stream_key(self, endpoint: str, params: Optional[Dict]) -> str:
         params_key = json.dumps(params or {}, sort_keys=True)
