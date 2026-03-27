@@ -62,6 +62,9 @@ class StreamManager:
         self.target_expirations: List[date] = []
         self.tracked_strikes: Set[float] = set()
         self.tracked_option_symbols: List[str] = []
+        # Last seen underlying bar snapshot keyed by minute bucket, used to merge
+        # partial stream bar payloads that may omit one side of volume.
+        self._underlying_bar_state: Dict[datetime, Dict[str, Any]] = {}
         # Per-contract quote state used to merge partial stream updates.
         # TradeStation stream/quotes may emit deltas that omit fields like OI.
         self._option_quote_state: Dict[str, Dict[str, Any]] = {}
@@ -110,6 +113,26 @@ class StreamManager:
             if not timestamp:
                 timestamp = datetime.now(ET)
 
+            minute_bucket = timestamp.replace(second=0, microsecond=0)
+            prior_bar = self._underlying_bar_state.get(minute_bucket, {})
+
+            raw_up_volume = bar.get("UpVolume")
+            raw_down_volume = bar.get("DownVolume")
+            raw_total_volume = bar.get("TotalVolume")
+
+            up_volume = safe_int(raw_up_volume, field_name="UpVolume")
+            down_volume = safe_int(raw_down_volume, field_name="DownVolume")
+            total_volume = safe_int(raw_total_volume, field_name="TotalVolume")
+
+            # Stream bar payloads can be partial. If a field is omitted, carry
+            # forward the last seen value for this minute bucket.
+            if raw_up_volume in (None, "", "N/A"):
+                up_volume = prior_bar.get("up_volume", up_volume)
+            if raw_down_volume in (None, "", "N/A"):
+                down_volume = prior_bar.get("down_volume", down_volume)
+            if raw_total_volume in (None, "", "N/A"):
+                total_volume = prior_bar.get("volume", total_volume)
+
             # Parse OHLCV with volume breakdown
             underlying_data = {
                 "symbol": self.db_underlying,
@@ -118,9 +141,15 @@ class StreamManager:
                 "high": safe_float(bar.get("High"), field_name="High"),
                 "low": safe_float(bar.get("Low"), field_name="Low"),
                 "close": safe_float(bar.get("Close"), field_name="Close"),
-                "up_volume": safe_int(bar.get("UpVolume"), field_name="UpVolume"),
-                "down_volume": safe_int(bar.get("DownVolume"), field_name="DownVolume"),
-                "volume": safe_int(bar.get("TotalVolume"), field_name="TotalVolume"),
+                "up_volume": up_volume,
+                "down_volume": down_volume,
+                "volume": total_volume,
+            }
+
+            self._underlying_bar_state[minute_bucket] = {
+                "up_volume": underlying_data["up_volume"],
+                "down_volume": underlying_data["down_volume"],
+                "volume": underlying_data["volume"],
             }
 
             logger.debug(f"Bar: {self.underlying} @ {timestamp} "
