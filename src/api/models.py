@@ -86,6 +86,8 @@ class UnderlyingQuote(BaseModel):
     high: Decimal
     low: Decimal
     close: Decimal
+    up_volume: Optional[int] = None
+    down_volume: Optional[int] = None
     volume: Optional[int] = None
     session: Optional[str] = None
 
