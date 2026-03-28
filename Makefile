@@ -33,6 +33,105 @@ YELLOW = \033[1;33m
 RED = \033[0;31m
 NC = \033[0m
 
+# =============================================================================
+# Macros — generate repetitive targets for each service / table
+# =============================================================================
+# SERVICE_TARGETS: systemctl start/stop/restart/status/enable/disable + journalctl logs
+# $(1) = target prefix   (e.g. ingestion)
+# $(2) = Make variable    (e.g. INGESTION_SERVICE)
+# $(3) = human label      (e.g. Ingestion)
+
+define SERVICE_TARGETS
+
+.PHONY: $(1)-start
+$(1)-start: ## Start the $(3) service
+	@echo "$$(GREEN)Starting $$($(2))...$$(NC)"
+	@sudo systemctl start $$($(2))
+	@sleep 2
+	@sudo systemctl status $$($(2)) --no-pager
+
+.PHONY: $(1)-stop
+$(1)-stop: ## Stop the $(3) service
+	@echo "$$(YELLOW)Stopping $$($(2))...$$(NC)"
+	@sudo systemctl stop $$($(2))
+	@sleep 1
+	@echo "$$(GREEN)Service stopped$$(NC)"
+
+.PHONY: $(1)-restart
+$(1)-restart: ## Restart the $(3) service
+	@echo "$$(YELLOW)Restarting $$($(2))...$$(NC)"
+	@sudo systemctl restart $$($(2))
+	@sleep 2
+	@sudo systemctl status $$($(2)) --no-pager
+
+.PHONY: $(1)-status
+$(1)-status: ## Show $(3) service status
+	@sudo systemctl status $$($(2)) --no-pager -l
+
+.PHONY: $(1)-enable
+$(1)-enable: ## Enable $(3) service to start on boot
+	@echo "$$(GREEN)Enabling $$($(2)) to start on boot...$$(NC)"
+	@sudo systemctl enable $$($(2))
+	@echo "$$(GREEN)Service enabled$$(NC)"
+
+.PHONY: $(1)-disable
+$(1)-disable: ## Disable $(3) service from starting on boot
+	@echo "$$(YELLOW)Disabling $$($(2)) from starting on boot...$$(NC)"
+	@sudo systemctl disable $$($(2))
+	@echo "$$(YELLOW)Service disabled$$(NC)"
+
+.PHONY: $(1)-logs
+$(1)-logs: ## Watch $(3) logs in real-time (Ctrl+C to stop)
+	@echo "$$(BLUE)=== Watching $(3) Logs (Ctrl+C to stop) ===$$(NC)"
+	@sudo journalctl -u $$($(2)) -f -n 50
+
+.PHONY: $(1)-logs-tail
+$(1)-logs-tail: ## Show last 100 $(3) log lines
+	@echo "$$(GREEN)Last 100 $(3) log lines:$$(NC)"
+	@sudo journalctl -u $$($(2)) -n 100 --no-pager
+
+.PHONY: $(1)-logs-errors
+$(1)-logs-errors: ## Show recent $(3) errors
+	@echo "$$(BLUE)=== Recent $(3) Errors ===$$(NC)"
+	@sudo journalctl -u $$($(2)) -p err -n 50 --no-pager
+
+endef
+
+$(eval $(call SERVICE_TARGETS,ingestion,INGESTION_SERVICE,Ingestion))
+$(eval $(call SERVICE_TARGETS,analytics,ANALYTICS_SERVICE,Analytics))
+$(eval $(call SERVICE_TARGETS,api,API_SERVICE,API))
+
+# DB_TAIL: show 20 most recent rows from a table with optional UNDERLYING filter
+# $(1) = target suffix   (e.g. option-chains)
+# $(2) = table name       (e.g. option_chains)
+# $(3) = filter column    (e.g. underlying)
+# $(4) = order column     (e.g. timestamp)
+
+define DB_TAIL
+
+.PHONY: db-tail-$(1)
+db-tail-$(1): ## Show 20 most recent rows from $(2) (UNDERLYING=X to filter)
+	@echo "$$(BLUE)=== $(2) (last 20) ===$$(NC)"
+	@$$(PSQL) -c "SELECT * FROM $(2) $$(if $$(UNDERLYING),WHERE $(3)='$$(UNDERLYING)',) ORDER BY $(4) DESC LIMIT 20;"
+
+endef
+
+$(eval $(call DB_TAIL,symbols,symbols,symbol,created_at))
+$(eval $(call DB_TAIL,underlying-quotes,underlying_quotes,symbol,timestamp))
+$(eval $(call DB_TAIL,option-chains,option_chains,underlying,timestamp))
+$(eval $(call DB_TAIL,gex-summary,gex_summary,underlying,timestamp))
+$(eval $(call DB_TAIL,gex-by-strike,gex_by_strike,underlying,timestamp))
+$(eval $(call DB_TAIL,flow-by-type,flow_by_type,symbol,timestamp))
+$(eval $(call DB_TAIL,flow-by-strike,flow_by_strike,symbol,timestamp))
+$(eval $(call DB_TAIL,flow-by-expiration,flow_by_expiration,symbol,timestamp))
+$(eval $(call DB_TAIL,flow-smart-money,flow_smart_money,symbol,timestamp))
+$(eval $(call DB_TAIL,trade-signals,trade_signals,underlying,timestamp))
+$(eval $(call DB_TAIL,signal-accuracy,signal_accuracy,underlying,trade_date))
+$(eval $(call DB_TAIL,vol-expansion-signals,volatility_expansion_signals,underlying,timestamp))
+$(eval $(call DB_TAIL,vol-expansion-accuracy,vol_expansion_accuracy,underlying,trade_date))
+$(eval $(call DB_TAIL,position-optimizer-signals,position_optimizer_signals,underlying,timestamp))
+$(eval $(call DB_TAIL,position-optimizer-accuracy,position_optimizer_accuracy,underlying,trade_date))
+
 .PHONY: help
 help: ## Show this help message
 	@echo "=========================================="
@@ -70,20 +169,18 @@ help: ## Show this help message
 	@echo "  make api-stop            - Stop API systemd service"
 	@echo "  make api-restart         - Restart API systemd service"
 	@echo "  make api-status          - Check API service status"
+	@echo "  make api-enable          - Enable API service to start on boot"
+	@echo "  make api-disable         - Disable API service from starting on boot"
 	@echo "  make api-health          - Show API service health and recent errors"
-	@echo "  make api-logs            - View API logs (live)"
-	@echo "  make api-logs-error      - View API error logs only"
 	@echo "  make api-test            - Test API endpoints"
 	@echo "  make api-install-service - Install API as systemd service"
 	@echo ""
-	@echo "$(GREEN)Logs:$(NC)"
-	@echo "  make ingestion-logs             - Show live ingestion logs (Ctrl+C to exit)"
-	@echo "  make ingestion-logs-tail        - Show last 100 ingestion log lines"
-	@echo "  make ingestion-logs-errors      - Show recent ingestion errors"
-	@echo "  make analytics-logs             - Show live analytics logs (Ctrl+C to exit)"
-	@echo "  make analytics-logs-tail        - Show last 100 analytics log lines"
-	@echo "  make analytics-logs-errors      - Show recent analytics errors"
-	@echo "  make logs-grep PATTERN=\"text\" - Search logs for pattern"
+	@echo "$(GREEN)Logs (all services):$(NC)"
+	@echo "  make {service}-logs             - Show live logs (Ctrl+C to exit)"
+	@echo "  make {service}-logs-tail        - Show last 100 log lines"
+	@echo "  make {service}-logs-errors      - Show recent errors"
+	@echo "  (service = ingestion | analytics | api)"
+	@echo "  make logs-grep PATTERN=\"text\" - Search all service logs for pattern"
 	@echo "  make logs-clear                 - Clear all journalctl logs for services"
 	@echo ""
 	@echo "$(GREEN)Run Components:$(NC)"
@@ -238,45 +335,8 @@ deploy-validate: ## Validate Options Analytics platform deployment
 	@./deploy/deploy.sh --start-from "validation"
 
 # =============================================================================
-# Ingestion Service Management
+# Service Health Checks (kept inline — shell variable escaping is clearer here)
 # =============================================================================
-
-.PHONY: ingestion-start
-ingestion-start: ## Start the ingestion service
-	@echo "$(GREEN)Starting $(INGESTION_SERVICE)...$(NC)"
-	@sudo systemctl start $(INGESTION_SERVICE)
-	@sleep 2
-	@sudo systemctl status $(INGESTION_SERVICE) --no-pager
-
-.PHONY: ingestion-stop
-ingestion-stop: ## Stop the ingestion service
-	@echo "$(YELLOW)Stopping $(INGESTION_SERVICE)...$(NC)"
-	@sudo systemctl stop $(INGESTION_SERVICE)
-	@sleep 1
-	@echo "$(GREEN)Service stopped$(NC)"
-
-.PHONY: ingestion-restart
-ingestion-restart: ## Restart the ingestion service
-	@echo "$(YELLOW)Restarting $(INGESTION_SERVICE)...$(NC)"
-	@sudo systemctl restart $(INGESTION_SERVICE)
-	@sleep 2
-	@sudo systemctl status $(INGESTION_SERVICE) --no-pager
-
-.PHONY: ingestion-status
-ingestion-status: ## Show ingestion service status
-	@sudo systemctl status $(INGESTION_SERVICE) --no-pager -l
-
-.PHONY: ingestion-enable
-ingestion-enable: ## Enable ingestion service to start on boot
-	@echo "$(GREEN)Enabling $(INGESTION_SERVICE) to start on boot...$(NC)"
-	@sudo systemctl enable $(INGESTION_SERVICE)
-	@echo "$(GREEN)Service enabled$(NC)"
-
-.PHONY: ingestion-disable
-ingestion-disable: ## Disable ingestion service from starting on boot
-	@echo "$(YELLOW)Disabling $(INGESTION_SERVICE) from starting on boot...$(NC)"
-	@sudo systemctl disable $(INGESTION_SERVICE)
-	@echo "$(YELLOW)Service disabled$(NC)"
 
 .PHONY: ingestion-health
 ingestion-health: ## Check ingestion service health and recent errors
@@ -308,47 +368,6 @@ ingestion-health: ## Check ingestion service health and recent errors
 	@echo "-------------------------"
 	@sudo journalctl -u $(INGESTION_SERVICE) -n 500 --no-pager | grep " - WARNING - " | tail -5 || echo "No recent warnings"
 
-# =============================================================================
-# Analytics Service Management
-# =============================================================================
-
-.PHONY: analytics-start
-analytics-start: ## Start the analytics service
-	@echo "$(GREEN)Starting $(ANALYTICS_SERVICE)...$(NC)"
-	@sudo systemctl start $(ANALYTICS_SERVICE)
-	@sleep 2
-	@sudo systemctl status $(ANALYTICS_SERVICE) --no-pager
-
-.PHONY: analytics-stop
-analytics-stop: ## Stop the analytics service
-	@echo "$(YELLOW)Stopping $(ANALYTICS_SERVICE)...$(NC)"
-	@sudo systemctl stop $(ANALYTICS_SERVICE)
-	@sleep 1
-	@echo "$(GREEN)Service stopped$(NC)"
-
-.PHONY: analytics-restart
-analytics-restart: ## Restart the analytics service
-	@echo "$(YELLOW)Restarting $(ANALYTICS_SERVICE)...$(NC)"
-	@sudo systemctl restart $(ANALYTICS_SERVICE)
-	@sleep 2
-	@sudo systemctl status $(ANALYTICS_SERVICE) --no-pager
-
-.PHONY: analytics-status
-analytics-status: ## Show analytics service status
-	@sudo systemctl status $(ANALYTICS_SERVICE) --no-pager -l
-
-.PHONY: analytics-enable
-analytics-enable: ## Enable analytics service to start on boot
-	@echo "$(GREEN)Enabling $(ANALYTICS_SERVICE) to start on boot...$(NC)"
-	@sudo systemctl enable $(ANALYTICS_SERVICE)
-	@echo "$(GREEN)Service enabled$(NC)"
-
-.PHONY: analytics-disable
-analytics-disable: ## Disable analytics service from starting on boot
-	@echo "$(YELLOW)Disabling $(ANALYTICS_SERVICE) from starting on boot...$(NC)"
-	@sudo systemctl disable $(ANALYTICS_SERVICE)
-	@echo "$(YELLOW)Service disabled$(NC)"
-
 .PHONY: analytics-health
 analytics-health: ## Check analytics service health and recent errors
 	@echo "$(GREEN)Analytics Service Health Check$(NC)"
@@ -379,39 +398,39 @@ analytics-health: ## Check analytics service health and recent errors
 	@echo "-------------------------"
 	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 500 --no-pager | grep " - WARNING - " | tail -5 || echo "No recent warnings"
 
+.PHONY: api-health
+api-health: ## Check API service health and recent errors
+	@echo "$(GREEN)API Service Health Check$(NC)"
+	@echo "===================="
+	@echo ""
+	@if systemctl is-active --quiet $(API_SERVICE); then \
+		echo "Status: $(GREEN)ACTIVE$(NC)"; \
+	else \
+		echo "Status: $(RED)INACTIVE$(NC)"; \
+	fi
+	@echo ""
+	@UPTIME=$$(systemctl show $(API_SERVICE) --property=ActiveEnterTimestamp --value); \
+	if [ -n "$$UPTIME" ]; then \
+		echo "Started: $$UPTIME"; \
+	fi
+	@echo ""
+	@MEMORY=$$(systemctl show $(API_SERVICE) --property=MemoryCurrent --value); \
+	if [ "$$MEMORY" != "[not set]" ] && [ -n "$$MEMORY" ]; then \
+		MEMORY_MB=$$(($$MEMORY / 1024 / 1024)); \
+		echo "Memory: $${MEMORY_MB} MB"; \
+	fi
+	@echo ""
+	@echo "Recent Errors (last 10):"
+	@echo "------------------------"
+	@sudo journalctl -u $(API_SERVICE) -n 500 --no-pager | grep " - ERROR - " | tail -10 || echo "No recent errors"
+	@echo ""
+	@echo "Recent Warnings (last 5):"
+	@echo "-------------------------"
+	@sudo journalctl -u $(API_SERVICE) -n 500 --no-pager | grep " - WARNING - " | tail -5 || echo "No recent warnings"
+
 # =============================================================================
-# Logs
+# Cross-Service Log Utilities
 # =============================================================================
-
-.PHONY: ingestion-logs
-ingestion-logs: ## Watch ingestion logs in real-time (Ctrl+C to stop)
-	@echo "$(BLUE)=== Watching Ingestion Logs (Ctrl+C to stop) ===$(NC)"
-	@sudo journalctl -u $(INGESTION_SERVICE) -f -n 50
-
-.PHONY: ingestion-logs-tail
-ingestion-logs-tail: ## Show last 100 ingestion log lines
-	@echo "$(GREEN)Last 100 ingestion log lines:$(NC)"
-	@sudo journalctl -u $(INGESTION_SERVICE) -n 100 --no-pager
-
-.PHONY: ingestion-logs-errors
-ingestion-logs-errors: ## Show recent ingestion errors
-	@echo "$(BLUE)=== Recent Ingestion Errors ===$(NC)"
-	@sudo journalctl -u $(INGESTION_SERVICE) -p err -n 50 --no-pager
-
-.PHONY: analytics-logs
-analytics-logs: ## Watch analytics logs in real-time (Ctrl+C to stop)
-	@echo "$(BLUE)=== Watching Analytics Logs (Ctrl+C to stop) ===$(NC)"
-	@sudo journalctl -u $(ANALYTICS_SERVICE) -f -n 50
-
-.PHONY: analytics-logs-tail
-analytics-logs-tail: ## Show last 100 analytics log lines
-	@echo "$(GREEN)Last 100 analytics log lines:$(NC)"
-	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 100 --no-pager
-
-.PHONY: analytics-logs-errors
-analytics-logs-errors: ## Show recent analytics errors
-	@echo "$(BLUE)=== Recent Analytics Errors ===$(NC)"
-	@sudo journalctl -u $(ANALYTICS_SERVICE) -p err -n 50 --no-pager
 
 .PHONY: logs-grep
 logs-grep: ## Grep logs for specific pattern (use: make logs-grep PATTERN="Greeks")
@@ -1071,7 +1090,7 @@ flow-by-expiration: ## Flow by expiration date — 1-min intervals (default: SPY
 .PHONY: flow-smart-money
 flow-smart-money: ## Unusual activity detection
 	@echo "$(BLUE)=== Smart Money Flow / Unusual Activity (SPY Current Session Top 20 by Notional) ===$(NC)"
-	@python -m src.tools.flow_smart_money_cli
+	@$(VENV_PYTHON) -m src.tools.flow_smart_money_cli
 
 .PHONY: flow-buying-pressure
 flow-buying-pressure: ## Underlying buying/selling pressure
@@ -2123,83 +2142,8 @@ query: ## Run custom query (use: make query SQL="SELECT * FROM ...")
 	@$(PSQL) -c "$(SQL)"
 
 # =============================================================================
-# DB Table Tail (most recent 20 rows)
+# DB Table Tail — targets generated by DB_TAIL macro (see top of file)
 # =============================================================================
-
-.PHONY: db-tail-symbols
-db-tail-symbols: ## Show 20 most recent rows from symbols (UNDERLYING=SPY to filter)
-	@echo "$(BLUE)=== symbols (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM symbols $(if $(UNDERLYING),WHERE symbol='$(UNDERLYING)',) ORDER BY created_at DESC LIMIT 20;"
-
-.PHONY: db-tail-underlying-quotes
-db-tail-underlying-quotes: ## Show 20 most recent rows from underlying_quotes (UNDERLYING=SPY to filter)
-	@echo "$(BLUE)=== underlying_quotes (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM underlying_quotes $(if $(UNDERLYING),WHERE symbol='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
-
-.PHONY: db-tail-option-chains
-db-tail-option-chains: ## Show 20 most recent rows from option_chains (UNDERLYING=SPY to filter)
-	@echo "$(BLUE)=== option_chains (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM option_chains $(if $(UNDERLYING),WHERE underlying='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
-
-.PHONY: db-tail-gex-summary
-db-tail-gex-summary: ## Show 20 most recent rows from gex_summary (UNDERLYING=SPY to filter)
-	@echo "$(BLUE)=== gex_summary (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM gex_summary $(if $(UNDERLYING),WHERE underlying='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
-
-.PHONY: db-tail-gex-by-strike
-db-tail-gex-by-strike: ## Show 20 most recent rows from gex_by_strike (UNDERLYING=SPY to filter)
-	@echo "$(BLUE)=== gex_by_strike (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM gex_by_strike $(if $(UNDERLYING),WHERE underlying='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
-
-.PHONY: db-tail-flow-by-type
-db-tail-flow-by-type: ## Show 20 most recent rows from flow_by_type (UNDERLYING=SPY to filter)
-	@echo "$(BLUE)=== flow_by_type (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM flow_by_type $(if $(UNDERLYING),WHERE symbol='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
-
-.PHONY: db-tail-flow-by-strike
-db-tail-flow-by-strike: ## Show 20 most recent rows from flow_by_strike (UNDERLYING=SPY to filter)
-	@echo "$(BLUE)=== flow_by_strike (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM flow_by_strike $(if $(UNDERLYING),WHERE symbol='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
-
-.PHONY: db-tail-flow-by-expiration
-db-tail-flow-by-expiration: ## Show 20 most recent rows from flow_by_expiration (UNDERLYING=SPY to filter)
-	@echo "$(BLUE)=== flow_by_expiration (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM flow_by_expiration $(if $(UNDERLYING),WHERE symbol='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
-
-.PHONY: db-tail-flow-smart-money
-db-tail-flow-smart-money: ## Show 20 most recent rows from flow_smart_money (UNDERLYING=SPY to filter)
-	@echo "$(BLUE)=== flow_smart_money (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM flow_smart_money $(if $(UNDERLYING),WHERE symbol='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
-
-.PHONY: db-tail-trade-signals
-db-tail-trade-signals: ## Show 20 most recent rows from trade_signals (UNDERLYING=SPY to filter)
-	@echo "$(BLUE)=== trade_signals (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM trade_signals $(if $(UNDERLYING),WHERE underlying='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
-
-.PHONY: db-tail-signal-accuracy
-db-tail-signal-accuracy: ## Show 20 most recent rows from signal_accuracy (UNDERLYING=SPY to filter)
-	@echo "$(BLUE)=== signal_accuracy (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM signal_accuracy $(if $(UNDERLYING),WHERE underlying='$(UNDERLYING)',) ORDER BY trade_date DESC LIMIT 20;"
-
-.PHONY: db-tail-vol-expansion-signals
-db-tail-vol-expansion-signals: ## Show 20 most recent rows from volatility_expansion_signals (UNDERLYING=SPY to filter)
-	@echo "$(BLUE)=== volatility_expansion_signals (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM volatility_expansion_signals $(if $(UNDERLYING),WHERE underlying='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
-
-.PHONY: db-tail-vol-expansion-accuracy
-db-tail-vol-expansion-accuracy: ## Show 20 most recent rows from vol_expansion_accuracy (UNDERLYING=SPY to filter)
-	@echo "$(BLUE)=== vol_expansion_accuracy (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM vol_expansion_accuracy $(if $(UNDERLYING),WHERE underlying='$(UNDERLYING)',) ORDER BY trade_date DESC LIMIT 20;"
-
-.PHONY: db-tail-position-optimizer-signals
-db-tail-position-optimizer-signals: ## Show 20 most recent rows from position_optimizer_signals (UNDERLYING=SPY to filter)
-	@echo "$(BLUE)=== position_optimizer_signals (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM position_optimizer_signals $(if $(UNDERLYING),WHERE underlying='$(UNDERLYING)',) ORDER BY timestamp DESC LIMIT 20;"
-
-.PHONY: db-tail-position-optimizer-accuracy
-db-tail-position-optimizer-accuracy: ## Show 20 most recent rows from position_optimizer_accuracy (UNDERLYING=SPY to filter)
-	@echo "$(BLUE)=== position_optimizer_accuracy (last 20) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM position_optimizer_accuracy $(if $(UNDERLYING),WHERE underlying='$(UNDERLYING)',) ORDER BY trade_date DESC LIMIT 20;"
 
 # =============================================================================
 # Advanced Queries
@@ -2326,67 +2270,8 @@ api-prod: ## Run API server in production mode
 	@echo "$(BLUE)=== Starting API Server (Production) ===$(NC)"
 	uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --workers 4
 
-.PHONY: api-start
-api-start: ## Start API systemd service
-	@echo "$(BLUE)=== Starting API Service ===$(NC)"
-	@sudo systemctl start $(API_SERVICE)
-	@sleep 2
-	@sudo systemctl status $(API_SERVICE) --no-pager
-
-.PHONY: api-stop
-api-stop: ## Stop API systemd service
-	@echo "$(BLUE)=== Stopping API Service ===$(NC)"
-	@sudo systemctl stop $(API_SERVICE)
-	@echo "$(GREEN)✅ API service stopped$(NC)"
-
-.PHONY: api-restart
-api-restart: ## Restart API systemd service
-	@echo "$(BLUE)=== Restarting API Service ===$(NC)"
-	@sudo systemctl restart $(API_SERVICE)
-	@sleep 2
-	@sudo systemctl status $(API_SERVICE) --no-pager
-
-.PHONY: api-status
-api-status: ## Check API service status
-	@sudo systemctl status $(API_SERVICE) --no-pager
-
-.PHONY: api-health
-api-health: ## Check API service health and recent errors
-	@echo "$(GREEN)API Service Health Check$(NC)"
-	@echo "===================="
-	@echo ""
-	@if systemctl is-active --quiet $(API_SERVICE); then \
-		echo "Status: $(GREEN)ACTIVE$(NC)"; \
-	else \
-		echo "Status: $(RED)INACTIVE$(NC)"; \
-	fi
-	@echo ""
-	@UPTIME=$$(systemctl show $(API_SERVICE) --property=ActiveEnterTimestamp --value); \
-	if [ -n "$$UPTIME" ]; then \
-		echo "Started: $$UPTIME"; \
-	fi
-	@echo ""
-	@MEMORY=$$(systemctl show $(API_SERVICE) --property=MemoryCurrent --value); \
-	if [ "$$MEMORY" != "[not set]" ] && [ -n "$$MEMORY" ]; then \
-		MEMORY_MB=$$(($$MEMORY / 1024 / 1024)); \
-		echo "Memory: $${MEMORY_MB} MB"; \
-	fi
-	@echo ""
-	@echo "Recent Errors (last 10):"
-	@echo "------------------------"
-	@sudo journalctl -u $(API_SERVICE) -n 500 --no-pager | grep " - ERROR - " | tail -10 || echo "No recent errors"
-	@echo ""
-	@echo "Recent Warnings (last 5):"
-	@echo "-------------------------"
-	@sudo journalctl -u $(API_SERVICE) -n 500 --no-pager | grep " - WARNING - " | tail -5 || echo "No recent warnings"
-
-.PHONY: api-logs
-api-logs: ## View API service logs
-	@sudo journalctl -u $(API_SERVICE) -f
-
-.PHONY: api-logs-error
-api-logs-error: ## View API error logs only
-	@sudo journalctl -u $(API_SERVICE) -p err -f
+# api-start/stop/restart/status/enable/disable/logs/logs-tail/logs-errors
+# and api-health are generated by SERVICE_TARGETS macro and health section above.
 
 .PHONY: api-test
 api-test: ## Test ALL API endpoints

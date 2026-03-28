@@ -16,6 +16,7 @@ import signal
 import sys
 import hashlib
 import json
+import time as _time
 from multiprocessing import Process
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
@@ -102,6 +103,12 @@ class IngestionEngine:
         self.greeks_calculated = 0
         self.last_flush_time = datetime.now(ET)
         self.errors_count = 0
+
+        # Observability: write-path performance counters (reset on log).
+        self._obs_batches_written = 0
+        self._obs_rows_written = 0
+        self._obs_write_time_ms = 0.0
+        self._obs_last_log = _time.monotonic()
 
         logger.info(f"Initialized IngestionEngine for {underlying}")
         logger.info(f"Config: {num_expirations} expirations, {num_strikes} strikes each side")
@@ -266,119 +273,122 @@ class IngestionEngine:
         """No-op: underlying bars are written immediately per update."""
         return
 
-    def _store_option(self, data: Dict[str, Any]):
-        """
-        Buffer option quote for 1-minute aggregation
-
-        Calculates Greeks before buffering if enabled.
-
-        Args:
-            data: Option quote data
-        """
-        # Validate data is not None
+    def _enrich_with_greeks(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Apply Greeks calculation to option data, returning enriched copy."""
         if data is None:
-            logger.error("Received None data in _store_option, skipping")
-            return
+            return None
 
-        # Calculate Greeks if enabled and we have underlying price
         if self.greeks_calculator and self.latest_underlying_price:
             try:
-                # Log what we're working with
                 if self.greeks_calculated == 0:
                     logger.info(f"Starting Greeks calculation with underlying price: ${self.latest_underlying_price:.2f}")
                     logger.debug(f"Sample option data before Greeks: {data}")
 
                 enriched_data = self.greeks_calculator.enrich_option_data(
-                    data, 
+                    data,
                     self.latest_underlying_price
                 )
 
-                # Check if enrichment returned None
                 if enriched_data is None:
                     logger.error(f"Greeks calculator returned None for {data.get('option_symbol', 'unknown')}, using original data")
-                    # Add zero Greeks to original data
-                    data["delta"] = None
-                    data["gamma"] = None
-                    data["theta"] = None
-                    data["vega"] = None
+                    data["delta"] = data["gamma"] = data["theta"] = data["vega"] = None
                 else:
-                    data = enriched_data  # Use enriched data
+                    data = enriched_data
                     self.greeks_calculated += 1
-
                     if self.greeks_calculated % 100 == 0:
                         logger.info(f"Calculated Greeks for {self.greeks_calculated} options")
-
-                    # Log first successful Greek calculation
                     if self.greeks_calculated == 1:
                         logger.info(f"✅ First Greek calculated successfully: delta={data.get('delta')}, gamma={data.get('gamma')}")
 
             except Exception as e:
                 logger.error(f"Error calculating Greeks for {data.get('option_symbol', 'unknown')}: {e}", exc_info=True)
-                # Add zero Greeks as fallback
-                data["delta"] = None
-                data["gamma"] = None
-                data["theta"] = None
-                data["vega"] = None
+                data["delta"] = data["gamma"] = data["theta"] = data["vega"] = None
         elif self.greeks_calculator and not self.latest_underlying_price:
-            if self.greeks_calculated == 0:  # Only warn once
+            if self.greeks_calculated == 0:
                 logger.warning("⚠️  Skipping Greeks calculation - no underlying price available yet")
-            # Add zero Greeks
-            data["delta"] = None
-            data["gamma"] = None
-            data["theta"] = None
-            data["vega"] = None
-        elif not self.greeks_calculator:
-            # Greeks not enabled
-            data["delta"] = None
-            data["gamma"] = None
-            data["theta"] = None
-            data["vega"] = None
+            data["delta"] = data["gamma"] = data["theta"] = data["vega"] = None
+        else:
+            data["delta"] = data["gamma"] = data["theta"] = data["vega"] = None
 
-        # Get timestamp and bucket it
-        timestamp = data.get("timestamp")
-        if timestamp is None:
-            logger.error(f"Option data missing timestamp: {data.get('option_symbol', 'unknown')}")
+        return data
+
+    def _store_option(self, data: Dict[str, Any]):
+        """Store a single option quote (delegates to batch method)."""
+        self._store_option_batch([data])
+
+    def _store_option_batch(self, batch: List[Dict[str, Any]]):
+        """
+        Process a batch of option quotes with batched DB writes.
+
+        Each quote is enriched with Greeks and buffered into per-symbol
+        1-minute buckets.  All pending aggregations are then flushed to
+        the database in a single transaction — one commit for the entire
+        batch rather than one commit per contract.
+        """
+        if not batch:
             return
 
-        bucket = bucket_timestamp(timestamp, AGGREGATION_BUCKET_SECONDS)
+        rows_to_write: List[Dict[str, Any]] = []
 
-        # Buffer by option symbol
-        option_symbol = data.get("option_symbol")
-        if option_symbol is None:
-            logger.error(f"Option data missing option_symbol")
-            return
+        for data in batch:
+            if data is None:
+                continue
 
-        # If this symbol crossed into a new time bucket, flush the previous one first.
-        existing = self.options_buffer.get(option_symbol)
-        if existing:
-            prev_timestamp = existing[-1].get("timestamp")
-            if prev_timestamp is not None:
-                prev_bucket = bucket_timestamp(prev_timestamp, AGGREGATION_BUCKET_SECONDS)
-                if prev_bucket != bucket:
-                    prev_snapshot = existing[-1]
-                    self._flush_option_bucket(option_symbol, prev_bucket, keep_last_snapshot=False)
-                    # Seed the new bucket with the previous snapshot so the first
-                    # update in the new minute can produce a volume delta.
-                    self.options_buffer[option_symbol] = [prev_snapshot]
+            data = self._enrich_with_greeks(data)
+            if data is None:
+                continue
 
-        self.options_buffer[option_symbol].append(data)
+            timestamp = data.get("timestamp")
+            if timestamp is None:
+                logger.error(f"Option data missing timestamp: {data.get('option_symbol', 'unknown')}")
+                continue
 
-        # Flush incrementally on every update so option rows are upserted promptly.
-        # Keep only the latest snapshot in memory so we can compute the next
-        # volume delta chunk without introducing DB write lag.
-        self._flush_option_bucket(option_symbol, bucket, keep_last_snapshot=True)
+            bucket = bucket_timestamp(timestamp, AGGREGATION_BUCKET_SECONDS)
 
-        # Check TOTAL buffer size across all options, not per-symbol
+            option_symbol = data.get("option_symbol")
+            if option_symbol is None:
+                logger.error("Option data missing option_symbol")
+                continue
+
+            # If this symbol crossed into a new time bucket, aggregate the previous one.
+            existing = self.options_buffer.get(option_symbol)
+            if existing:
+                prev_timestamp = existing[-1].get("timestamp")
+                if prev_timestamp is not None:
+                    prev_bucket = bucket_timestamp(prev_timestamp, AGGREGATION_BUCKET_SECONDS)
+                    if prev_bucket != bucket:
+                        prev_snapshot = existing[-1]
+                        agg = self._prepare_option_agg(option_symbol, prev_bucket, keep_last_snapshot=False)
+                        if agg:
+                            rows_to_write.append(agg)
+                        # Seed the new bucket with the previous snapshot for volume delta.
+                        self.options_buffer[option_symbol] = [prev_snapshot]
+
+            self.options_buffer[option_symbol].append(data)
+
+            # Prepare aggregation for the current bucket.
+            agg = self._prepare_option_agg(option_symbol, bucket, keep_last_snapshot=True)
+            if agg:
+                rows_to_write.append(agg)
+
+        # Write all aggregated rows in a single DB transaction.
+        if rows_to_write:
+            self._write_option_rows(rows_to_write)
+
+        # Safety valve: flush everything if total buffer exceeds limit.
         total_buffered = sum(len(v) for v in self.options_buffer.values())
-
-        # Flush all buffers if total exceeds limit
         if total_buffered >= MAX_BUFFER_SIZE:
             logger.debug(f"Option buffer limit reached ({total_buffered} items), flushing all option buffers")
             current_time = datetime.now(ET)
             flush_bucket = bucket_timestamp(current_time, AGGREGATION_BUCKET_SECONDS)
+            overflow_rows = []
             for sym in list(self.options_buffer.keys()):
                 if self.options_buffer[sym]:
-                    self._flush_option_bucket(sym, flush_bucket)
+                    agg = self._prepare_option_agg(sym, flush_bucket)
+                    if agg:
+                        overflow_rows.append(agg)
+            if overflow_rows:
+                self._write_option_rows(overflow_rows)
 
     def _log_parity_signature(self, stream_name: str, payload: Dict[str, Any]):
         """
@@ -459,28 +469,27 @@ class IngestionEngine:
             logger.warning(f"Failed loading volume baseline for {option_symbol}: {e}")
             return 0
 
-    def _flush_option_bucket(self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False):
-        """Aggregate and store 1-minute option quote"""
-        buffer = self.options_buffer.get(option_symbol, [])
+    def _prepare_option_agg(self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False) -> Optional[Dict[str, Any]]:
+        """Aggregate a per-symbol option buffer into a single row dict.
 
+        Handles volume delta classification and buffer cleanup.
+        Returns the aggregated dict ready for DB write, or None if the
+        buffer is empty.
+        """
+        buffer = self.options_buffer.get(option_symbol, [])
         if not buffer:
-            return
+            return None
 
         try:
-            # Aggregate: last of each field
             last = buffer[-1]
 
-            # Convert numeric scalars (including numpy types) to Python floats for PostgreSQL
             delta = _to_db_float(last.get("delta"))
             gamma = _to_db_float(last.get("gamma"))
             theta = _to_db_float(last.get("theta"))
             vega = _to_db_float(last.get("vega"))
             implied_volatility = _to_db_float(last.get("implied_volatility"))
 
-            # Classify each volume delta chunk in the buffer into ask/mid/bid buckets.
-            # Iterate consecutive pairs; the volume delta between two snapshots is
-            # attributed to whichever price level (ask/mid/bid) the 'last' price
-            # of the newer snapshot is closest to.
+            # Volume delta classification
             ask_volume = 0
             mid_volume = 0
             bid_volume = 0
@@ -492,10 +501,8 @@ class IngestionEngine:
                 if vol_delta > 0:
                     av, mv, bv = self._classify_volume_chunk(
                         vol_delta,
-                        curr.get("last"),
-                        curr.get("bid"),
-                        curr.get("ask"),
-                        curr.get("mid"),
+                        curr.get("last"), curr.get("bid"),
+                        curr.get("ask"), curr.get("mid"),
                     )
                     ask_volume += av
                     mid_volume += mv
@@ -509,10 +516,8 @@ class IngestionEngine:
                     if vol_delta > 0:
                         av, mv, bv = self._classify_volume_chunk(
                             vol_delta,
-                            curr.get("last"),
-                            curr.get("bid"),
-                            curr.get("ask"),
-                            curr.get("mid"),
+                            curr.get("last"), curr.get("bid"),
+                            curr.get("ask"), curr.get("mid"),
                         )
                         ask_volume += av
                         mid_volume += mv
@@ -543,76 +548,135 @@ class IngestionEngine:
 
             self._log_parity_signature("option_chains", agg)
 
-            # Store in database
-            with db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO option_chains
-                    (option_symbol, timestamp, underlying, strike, expiration, option_type,
-                     last, bid, ask, mid, volume, open_interest, implied_volatility,
-                     ask_volume, mid_volume, bid_volume,
-                     delta, gamma, theta, vega)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (option_symbol, timestamp) DO UPDATE SET
-                        last = EXCLUDED.last,
-                        bid = EXCLUDED.bid,
-                        ask = EXCLUDED.ask,
-                        mid = EXCLUDED.mid,
-                        volume = GREATEST(option_chains.volume, EXCLUDED.volume),
-                        open_interest = GREATEST(option_chains.open_interest, EXCLUDED.open_interest),
-                        implied_volatility = COALESCE(EXCLUDED.implied_volatility, option_chains.implied_volatility),
-                        ask_volume = option_chains.ask_volume + EXCLUDED.ask_volume,
-                        mid_volume = option_chains.mid_volume + EXCLUDED.mid_volume,
-                        bid_volume = option_chains.bid_volume + EXCLUDED.bid_volume,
-                        delta = EXCLUDED.delta,
-                        gamma = EXCLUDED.gamma,
-                        theta = EXCLUDED.theta,
-                        vega = EXCLUDED.vega,
-                        updated_at = NOW()
-                """, (
-                    agg["option_symbol"],
-                    agg["timestamp"],
-                    agg["underlying"],
-                    agg["strike"],
-                    agg["expiration"],
-                    agg["option_type"],
-                    agg["last"],
-                    agg["bid"],
-                    agg["ask"],
-                    agg["mid"],
-                    agg["volume"],
-                    agg["open_interest"],
-                    agg["implied_volatility"],
-                    agg["ask_volume"],
-                    agg["mid_volume"],
-                    agg["bid_volume"],
-                    agg["delta"],
-                    agg["gamma"],
-                    agg["theta"],
-                    agg["vega"]
-                ))
-                conn.commit()
-
-            self.option_quotes_stored += 1
+            # Update volume baseline cache.
             self._option_volume_baseline[option_symbol] = int(agg["volume"] or 0)
 
-            # Log first few with Greeks to confirm storage
-            if self.option_quotes_stored <= 3 and delta is not None:
-                logger.info(f"✅ Stored option with Greeks: {agg['option_symbol']} "
-                          f"delta={delta:.4f} gamma={gamma:.6f}")
-
-            logger.debug(f"Stored option: {agg['option_symbol']} @ {agg['timestamp']} "
-                        f"Last=${agg['last']:.2f}")
-
-            # Clear buffer (or keep only the latest snapshot for incremental volume deltas)
+            # Trim buffer.
             if keep_last_snapshot and buffer:
                 self.options_buffer[option_symbol] = [buffer[-1]]
             else:
                 self.options_buffer[option_symbol] = []
 
+            return agg
+
         except Exception as e:
-            logger.error(f"Error flushing option bucket for {option_symbol}: {e}", exc_info=True)
+            logger.error(f"Error preparing option agg for {option_symbol}: {e}", exc_info=True)
             self.errors_count += 1
+            return None
+
+    # SQL template shared by single and batch writes.
+    _OPTION_UPSERT_SQL = """
+        INSERT INTO option_chains
+        (option_symbol, timestamp, underlying, strike, expiration, option_type,
+         last, bid, ask, mid, volume, open_interest, implied_volatility,
+         ask_volume, mid_volume, bid_volume,
+         delta, gamma, theta, vega)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (option_symbol, timestamp) DO UPDATE SET
+            last = EXCLUDED.last,
+            bid = EXCLUDED.bid,
+            ask = EXCLUDED.ask,
+            mid = EXCLUDED.mid,
+            volume = GREATEST(option_chains.volume, EXCLUDED.volume),
+            open_interest = GREATEST(option_chains.open_interest, EXCLUDED.open_interest),
+            implied_volatility = COALESCE(EXCLUDED.implied_volatility, option_chains.implied_volatility),
+            ask_volume = option_chains.ask_volume + EXCLUDED.ask_volume,
+            mid_volume = option_chains.mid_volume + EXCLUDED.mid_volume,
+            bid_volume = option_chains.bid_volume + EXCLUDED.bid_volume,
+            delta = EXCLUDED.delta,
+            gamma = EXCLUDED.gamma,
+            theta = EXCLUDED.theta,
+            vega = EXCLUDED.vega,
+            updated_at = NOW()
+    """
+
+    def _write_option_rows(self, rows: List[Dict[str, Any]]):
+        """Write multiple aggregated option rows in a single DB transaction."""
+        if not rows:
+            return
+        t0 = _time.monotonic()
+        try:
+            with db_connection() as conn:
+                cursor = conn.cursor()
+                for agg in rows:
+                    cursor.execute(self._OPTION_UPSERT_SQL, (
+                        agg["option_symbol"],
+                        agg["timestamp"],
+                        agg["underlying"],
+                        agg["strike"],
+                        agg["expiration"],
+                        agg["option_type"],
+                        agg["last"],
+                        agg["bid"],
+                        agg["ask"],
+                        agg["mid"],
+                        agg["volume"],
+                        agg["open_interest"],
+                        agg["implied_volatility"],
+                        agg["ask_volume"],
+                        agg["mid_volume"],
+                        agg["bid_volume"],
+                        agg["delta"],
+                        agg["gamma"],
+                        agg["theta"],
+                        agg["vega"],
+                    ))
+                conn.commit()
+
+            elapsed_ms = (_time.monotonic() - t0) * 1000
+            self.option_quotes_stored += len(rows)
+            self.last_flush_time = datetime.now(ET)
+
+            # Observability accumulators.
+            self._obs_batches_written += 1
+            self._obs_rows_written += len(rows)
+            self._obs_write_time_ms += elapsed_ms
+
+            # Log first few with Greeks.
+            if self.option_quotes_stored <= len(rows) + 3:
+                for agg in rows[:3]:
+                    d = agg.get("delta")
+                    if d is not None:
+                        logger.info(
+                            f"✅ Stored option with Greeks: {agg['option_symbol']} "
+                            f"delta={d:.4f} gamma={agg.get('gamma', 0):.6f}"
+                        )
+
+            logger.debug(
+                f"Wrote {len(rows)} option rows in single transaction "
+                f"({elapsed_ms:.1f}ms)"
+            )
+
+            # Periodic observability summary (every 60s).
+            now = _time.monotonic()
+            if now - self._obs_last_log >= 60:
+                avg_ms = (
+                    self._obs_write_time_ms / self._obs_batches_written
+                    if self._obs_batches_written
+                    else 0
+                )
+                logger.info(
+                    f"[DB-METRICS] last 60s: "
+                    f"batches={self._obs_batches_written} "
+                    f"rows={self._obs_rows_written} "
+                    f"avg_write_ms={avg_ms:.1f} "
+                    f"total_stored={self.option_quotes_stored} "
+                    f"errors={self.errors_count}"
+                )
+                self._obs_batches_written = 0
+                self._obs_rows_written = 0
+                self._obs_write_time_ms = 0.0
+                self._obs_last_log = now
+
+        except Exception as e:
+            logger.error(f"Error writing option batch ({len(rows)} rows): {e}", exc_info=True)
+            self.errors_count += 1
+
+    def _flush_option_bucket(self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False):
+        """Flush a single option bucket (used by _flush_all_buffers)."""
+        agg = self._prepare_option_agg(option_symbol, bucket, keep_last_snapshot)
+        if agg:
+            self._write_option_rows([agg])
 
     def _flush_all_buffers(self):
         """Flush all pending buffers"""
@@ -673,6 +737,8 @@ class IngestionEngine:
 
                 if item["type"] == "underlying":
                     self._store_underlying(item["data"])
+                elif item["type"] == "option_batch":
+                    self._store_option_batch(item["data"])
                 elif item["type"] == "option":
                     self._store_option(item["data"])
 
