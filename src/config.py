@@ -50,7 +50,9 @@ DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", "90"))  # days to kee
 # Streaming Configuration
 # =============================================================================
 
-# Poll Intervals
+# Maximum wait between drain cycles.  The main loop wakes *immediately*
+# when a stream accumulator receives data; these values only cap the
+# longest the loop will block when the streams are quiet.
 MARKET_HOURS_POLL_INTERVAL = int(os.getenv("MARKET_HOURS_POLL_INTERVAL", "5"))  # seconds
 EXTENDED_HOURS_POLL_INTERVAL = int(os.getenv("EXTENDED_HOURS_POLL_INTERVAL", "30"))  # seconds
 CLOSED_HOURS_POLL_INTERVAL = int(os.getenv("CLOSED_HOURS_POLL_INTERVAL", "300"))  # 5 minutes
@@ -79,38 +81,6 @@ MAX_BUFFER_SIZE = int(os.getenv("MAX_BUFFER_SIZE", "1000"))  # flush if buffer e
 BUFFER_FLUSH_INTERVAL = int(os.getenv("BUFFER_FLUSH_INTERVAL", "60"))  # seconds
 
 # =============================================================================
-# Monitoring & Alerting
-# =============================================================================
-
-# Health Check Intervals
-HEALTH_CHECK_INTERVAL = int(os.getenv("HEALTH_CHECK_INTERVAL", "60"))  # seconds
-
-# Stale Data Thresholds
-UNDERLYING_STALE_THRESHOLD = int(os.getenv("UNDERLYING_STALE_THRESHOLD", "300"))  # 5 minutes
-OPTION_STALE_THRESHOLD = int(os.getenv("OPTION_STALE_THRESHOLD", "600"))  # 10 minutes
-
-# Alert Thresholds
-CONSECUTIVE_FAILURES_ALERT = int(os.getenv("CONSECUTIVE_FAILURES_ALERT", "5"))
-ERROR_RATE_ALERT_THRESHOLD = float(os.getenv("ERROR_RATE_ALERT_THRESHOLD", "0.1"))  # 10%
-
-# =============================================================================
-# WebSocket Configuration
-# =============================================================================
-
-WEBSOCKET_ENABLED = os.getenv("WEBSOCKET_ENABLED", "false").lower() == "true"
-WEBSOCKET_RECONNECT_DELAY = float(os.getenv("WEBSOCKET_RECONNECT_DELAY", "5.0"))  # seconds
-WEBSOCKET_PING_INTERVAL = int(os.getenv("WEBSOCKET_PING_INTERVAL", "30"))  # seconds
-WEBSOCKET_MAX_RECONNECT_ATTEMPTS = int(os.getenv("WEBSOCKET_MAX_RECONNECT_ATTEMPTS", "10"))
-
-# =============================================================================
-# GEX Calculation Configuration
-# =============================================================================
-
-GEX_ENABLED = os.getenv("GEX_ENABLED", "false").lower() == "true"
-GEX_CALCULATION_INTERVAL = int(os.getenv("GEX_CALCULATION_INTERVAL", "60"))  # seconds
-GEX_STRIKE_RANGE = float(os.getenv("GEX_STRIKE_RANGE", "50.0"))  # dollars from current price
-
-# =============================================================================
 # Greeks & IV Calculation Configuration
 # =============================================================================
 
@@ -125,23 +95,6 @@ IV_MAX_ITERATIONS = int(os.getenv("IV_MAX_ITERATIONS", "100"))
 IV_TOLERANCE = float(os.getenv("IV_TOLERANCE", "0.00001"))
 IV_MIN = float(os.getenv("IV_MIN", "0.01"))
 IV_MAX = float(os.getenv("IV_MAX", "5.0"))
-
-# =============================================================================
-# Backfill Configuration
-# =============================================================================
-
-# Gap Detection
-BACKFILL_ON_STARTUP = os.getenv("BACKFILL_ON_STARTUP", "true").lower() == "true"
-MAX_GAP_MINUTES = int(os.getenv("MAX_GAP_MINUTES", "60"))  # auto-backfill if gap > 1 hour
-BACKFILL_CHUNK_SIZE = int(os.getenv("BACKFILL_CHUNK_SIZE", "1000"))  # bars per chunk
-
-# =============================================================================
-# Grafana/Metrics Configuration
-# =============================================================================
-
-METRICS_ENABLED = os.getenv("METRICS_ENABLED", "false").lower() == "true"
-METRICS_PORT = int(os.getenv("METRICS_PORT", "9090"))
-GRAFANA_DASHBOARD_ENABLED = os.getenv("GRAFANA_DASHBOARD_ENABLED", "false").lower() == "true"
 
 # =============================================================================
 # Ingestion Parity Guard
@@ -171,21 +124,12 @@ def get_all_config() -> Dict[str, Any]:
             "retention_days": DATA_RETENTION_DAYS,
         },
         "streaming": {
-            "market_hours_poll": MARKET_HOURS_POLL_INTERVAL,
-            "extended_hours_poll": EXTENDED_HOURS_POLL_INTERVAL,
-            "closed_hours_poll": CLOSED_HOURS_POLL_INTERVAL,
-        },
-        "monitoring": {
-            "health_check_interval": HEALTH_CHECK_INTERVAL,
-            "underlying_stale_threshold": UNDERLYING_STALE_THRESHOLD,
-            "option_stale_threshold": OPTION_STALE_THRESHOLD,
+            "market_hours_max_wait": MARKET_HOURS_POLL_INTERVAL,
+            "extended_hours_max_wait": EXTENDED_HOURS_POLL_INTERVAL,
+            "closed_hours_max_wait": CLOSED_HOURS_POLL_INTERVAL,
         },
         "features": {
-            "websocket_enabled": WEBSOCKET_ENABLED,
-            "gex_enabled": GEX_ENABLED,
             "greeks_enabled": GREEKS_ENABLED,
-            "metrics_enabled": METRICS_ENABLED,
-            "backfill_on_startup": BACKFILL_ON_STARTUP,
             "ingest_parity_guard_enabled": INGEST_PARITY_GUARD_ENABLED,
         },
     }
