@@ -16,7 +16,7 @@ import sys
 import time
 from multiprocessing import Process
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from collections import defaultdict
 import pytz
 import numpy as np
