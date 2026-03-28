@@ -503,6 +503,8 @@ class AnalyticsEngine:
             strike_losses[test_strike] = total_loss
 
         # Max pain is where total loss is minimized
+        if not strike_losses:
+            return 0.0
         max_pain_strike = min(strike_losses.items(), key=lambda x: x[1])[0]
 
         return max_pain_strike
