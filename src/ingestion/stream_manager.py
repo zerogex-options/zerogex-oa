@@ -80,6 +80,7 @@ class OptionStreamAccumulator:
         self,
         client: TradeStationClient,
         symbols: List[str],
+        wakeup: Optional[threading.Event] = None,
     ):
         self._client = client
         self._symbols = list(symbols)
@@ -93,6 +94,8 @@ class OptionStreamAccumulator:
         self._connected = threading.Event()
         # Symbols that have received at least one update since last drain().
         self._dirty: Set[str] = set()
+        # Shared event the main loop blocks on; set whenever new data arrives.
+        self._wakeup = wakeup
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -295,6 +298,238 @@ class OptionStreamAccumulator:
             self._dirty.add(symbol)
             self._updates_received += 1
 
+        # Signal the main loop outside the lock to avoid holding it
+        # while the main thread wakes.
+        if self._wakeup is not None:
+            self._wakeup.set()
+
+
+# ---------------------------------------------------------------------------
+# UnderlyingBarAccumulator — persistent stream for underlying OHLCV bars
+# ---------------------------------------------------------------------------
+
+class UnderlyingBarAccumulator:
+    """
+    Persistent background reader for TradeStation streaming bar data.
+
+    Mirrors :class:`OptionStreamAccumulator` but for 1-minute OHLCV bars
+    of a single underlying symbol.  Partial bar payloads are merged
+    with carry-forward semantics for volume fields that may be omitted.
+    """
+
+    def __init__(
+        self,
+        client: TradeStationClient,
+        symbol: str,
+        db_symbol: str,
+        session_template: str = "Default",
+        wakeup: Optional[threading.Event] = None,
+    ):
+        self._client = client
+        self._symbol = symbol
+        self._db_symbol = db_symbol
+        self._session_template = session_template
+        self._wakeup = wakeup
+
+        self._bar: Optional[Dict[str, Any]] = None
+        self._dirty = False
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._current_response = None
+        self._response_lock = threading.Lock()
+        self._connected = threading.Event()
+        self._updates_received: int = 0
+        # Carry-forward state for partial bar payloads, keyed by minute bucket.
+        self._bar_state: Dict[datetime, Dict[str, Any]] = {}
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def start(self):
+        """Begin background bar stream reading."""
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._reader_loop, daemon=True, name="underlying-stream",
+        )
+        self._thread.start()
+        self._connected.wait(timeout=10)
+
+    def stop(self):
+        """Stop the background reader and close the stream connection."""
+        self._running = False
+        with self._response_lock:
+            if self._current_response is not None:
+                try:
+                    self._current_response.close()
+                except Exception:
+                    pass
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+            self._thread = None
+
+    @property
+    def is_alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def updates_received(self) -> int:
+        return self._updates_received
+
+    # -- public API --------------------------------------------------------
+
+    def drain(self) -> Optional[Dict[str, Any]]:
+        """Return latest bar if updated since last drain, else None."""
+        with self._lock:
+            if not self._dirty:
+                return None
+            self._dirty = False
+            return dict(self._bar) if self._bar else None
+
+    # -- internal ----------------------------------------------------------
+
+    def _reader_loop(self):
+        """Continuously read bar stream events; auto-reconnect on failure."""
+        while self._running:
+            try:
+                self._read_stream()
+            except Exception as e:
+                if self._running:
+                    logger.warning(
+                        f"Underlying bar stream disconnected ({e}), reconnecting in 2s..."
+                    )
+                    time.sleep(2)
+
+    def _read_stream(self):
+        """Open one stream connection and read bar events until it ends."""
+        url = (
+            f"{self._client.base_url}/marketdata/stream/barcharts/{self._symbol}"
+        )
+        headers = self._client.auth.get_headers()
+        params = {
+            "interval": "1",
+            "unit": "Minute",
+            "barsback": "1",
+            "sessiontemplate": self._session_template,
+        }
+
+        response = _requests.get(
+            url,
+            headers=headers,
+            params=params,
+            stream=True,
+            timeout=(API_REQUEST_TIMEOUT, _STREAM_READ_TIMEOUT),
+        )
+
+        if response.status_code == 401:
+            response.close()
+            self._client.auth.force_refresh_access_token()
+            return
+
+        response.raise_for_status()
+
+        with self._response_lock:
+            self._current_response = response
+
+        self._connected.set()
+
+        try:
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if not self._running:
+                    break
+                if not raw_line:
+                    continue
+                line = (
+                    raw_line.strip()
+                    if isinstance(raw_line, str)
+                    else raw_line.decode("utf-8", errors="ignore").strip()
+                )
+                if not line or line in ("[DONE]", "heartbeat"):
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if not line:
+                    continue
+
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                # Handle various bar payload shapes.
+                bars: list = []
+                if isinstance(payload, dict) and "Bars" in payload:
+                    bars = payload["Bars"]
+                elif isinstance(payload, dict) and "Bar" in payload and isinstance(payload["Bar"], dict):
+                    bars = [payload["Bar"]]
+                elif isinstance(payload, dict) and "TimeStamp" in payload:
+                    bars = [payload]
+
+                for bar in bars:
+                    self._merge_bar(bar)
+        finally:
+            with self._response_lock:
+                self._current_response = None
+            response.close()
+
+    def _merge_bar(self, bar: dict):
+        """Merge one raw bar into accumulated state with carry-forward."""
+        if not validate_bar_data(bar):
+            return
+
+        timestamp_str = bar.get("TimeStamp", "")
+        timestamp = safe_datetime(timestamp_str, field_name="TimeStamp")
+        if not timestamp:
+            timestamp = datetime.now(ET)
+
+        minute_bucket = timestamp.replace(second=0, microsecond=0)
+        prior = self._bar_state.get(minute_bucket, {})
+
+        raw_up = bar.get("UpVolume")
+        raw_down = bar.get("DownVolume")
+        raw_total = bar.get("TotalVolume")
+
+        up_volume = safe_int(raw_up, field_name="UpVolume")
+        down_volume = safe_int(raw_down, field_name="DownVolume")
+        total_volume = safe_int(raw_total, field_name="TotalVolume")
+
+        # Carry forward omitted volume fields from the same minute bucket.
+        if raw_up in (None, "", "N/A"):
+            up_volume = prior.get("up_volume", up_volume)
+        if raw_down in (None, "", "N/A"):
+            down_volume = prior.get("down_volume", down_volume)
+        if raw_total in (None, "", "N/A"):
+            total_volume = prior.get("volume", total_volume)
+
+        bar_data = {
+            "symbol": self._db_symbol,
+            "timestamp": timestamp,
+            "open": safe_float(bar.get("Open"), field_name="Open"),
+            "high": safe_float(bar.get("High"), field_name="High"),
+            "low": safe_float(bar.get("Low"), field_name="Low"),
+            "close": safe_float(bar.get("Close"), field_name="Close"),
+            "up_volume": up_volume,
+            "down_volume": down_volume,
+            "volume": total_volume,
+        }
+
+        # Update carry-forward state for this minute.
+        self._bar_state[minute_bucket] = {
+            "up_volume": up_volume,
+            "down_volume": down_volume,
+            "volume": total_volume,
+        }
+        # Evict stale minute buckets.
+        for k in [k for k in self._bar_state if k < minute_bucket]:
+            del self._bar_state[k]
+
+        with self._lock:
+            self._bar = bar_data
+            self._dirty = True
+            self._updates_received += 1
+
+        if self._wakeup is not None:
+            self._wakeup.set()
+
 
 class StreamManager:
     """Manages streaming of real-time underlying and options data"""
@@ -320,14 +555,16 @@ class StreamManager:
         self.target_expirations: List[date] = []
         self.tracked_strikes: Set[float] = set()
         self.tracked_option_symbols: List[str] = []
-        # Last seen underlying bar snapshot keyed by minute bucket, used to merge
-        # partial stream bar payloads that may omit one side of volume.
-        self._underlying_bar_state: Dict[datetime, Dict[str, Any]] = {}
         # Pre-parsed metadata (strike, expiration, option_type) per option symbol
         # so we don't re-parse the symbol string every poll cycle.
         self._symbol_metadata: Dict[str, Dict[str, Any]] = {}
-        # Background accumulator for persistent option quote streaming.
+
+        # Shared wakeup event — either accumulator sets this when new data arrives
+        # so the main loop can react immediately instead of sleeping a fixed interval.
+        self._wakeup = threading.Event()
+        # Background accumulators for persistent streaming connections.
         self._accumulator: Optional[OptionStreamAccumulator] = None
+        self._underlying_accumulator: Optional[UnderlyingBarAccumulator] = None
 
         # Track expired strikes for cleanup
         self.all_tracked_strikes: Dict[date, Set[float]] = {}
@@ -346,60 +583,33 @@ class StreamManager:
 
     def _fetch_underlying_bar(self) -> Optional[Dict[str, Any]]:
         """
-        Fetch latest underlying bar with volume breakdown using Stream Bars API.
-
-        Returns bar data with OHLC + UpVolume/DownVolume
+        Fetch a single underlying bar via REST (used only for initialization
+        and strike recalibration, NOT for the hot streaming path).
         """
         try:
-            # Use stream bars API with barsback=1 to fetch the latest bar payload
             bars_data = self.client.get_stream_bars(
                 symbol=self.underlying,
                 interval=1,
                 unit="Minute",
                 barsback=1,
                 sessiontemplate=SESSION_TEMPLATE,
-                warn_if_closed=False
+                warn_if_closed=False,
             )
 
             if "Bars" not in bars_data or len(bars_data["Bars"]) == 0:
-                logger.debug(f"No bar data returned for {self.underlying} - likely between bars or market just opened")
+                logger.debug(f"No bar data returned for {self.underlying}")
                 return None
 
             bar = bars_data["Bars"][0]
-
-            # Validate bar data
             if not validate_bar_data(bar):
                 logger.warning("Invalid bar data, skipping")
                 return None
 
-            # Parse bar timestamp
             timestamp_str = bar.get("TimeStamp", "")
             timestamp = safe_datetime(timestamp_str, field_name="TimeStamp")
-
             if not timestamp:
                 timestamp = datetime.now(ET)
 
-            minute_bucket = timestamp.replace(second=0, microsecond=0)
-            prior_bar = self._underlying_bar_state.get(minute_bucket, {})
-
-            raw_up_volume = bar.get("UpVolume")
-            raw_down_volume = bar.get("DownVolume")
-            raw_total_volume = bar.get("TotalVolume")
-
-            up_volume = safe_int(raw_up_volume, field_name="UpVolume")
-            down_volume = safe_int(raw_down_volume, field_name="DownVolume")
-            total_volume = safe_int(raw_total_volume, field_name="TotalVolume")
-
-            # Stream bar payloads can be partial. If a field is omitted, carry
-            # forward the last seen value for this minute bucket.
-            if raw_up_volume in (None, "", "N/A"):
-                up_volume = prior_bar.get("up_volume", up_volume)
-            if raw_down_volume in (None, "", "N/A"):
-                down_volume = prior_bar.get("down_volume", down_volume)
-            if raw_total_volume in (None, "", "N/A"):
-                total_volume = prior_bar.get("volume", total_volume)
-
-            # Parse OHLCV with volume breakdown
             underlying_data = {
                 "symbol": self.db_underlying,
                 "timestamp": timestamp,
@@ -407,27 +617,15 @@ class StreamManager:
                 "high": safe_float(bar.get("High"), field_name="High"),
                 "low": safe_float(bar.get("Low"), field_name="Low"),
                 "close": safe_float(bar.get("Close"), field_name="Close"),
-                "up_volume": up_volume,
-                "down_volume": down_volume,
-                "volume": total_volume,
+                "up_volume": safe_int(bar.get("UpVolume"), field_name="UpVolume"),
+                "down_volume": safe_int(bar.get("DownVolume"), field_name="DownVolume"),
+                "volume": safe_int(bar.get("TotalVolume"), field_name="TotalVolume"),
             }
 
-            self._underlying_bar_state[minute_bucket] = {
-                "up_volume": underlying_data["up_volume"],
-                "down_volume": underlying_data["down_volume"],
-                "volume": underlying_data["volume"],
-            }
-
-            # Evict stale minute buckets to prevent unbounded memory growth.
-            stale_keys = [k for k in self._underlying_bar_state if k < minute_bucket]
-            for k in stale_keys:
-                del self._underlying_bar_state[k]
-
-            logger.debug(f"Bar: {self.underlying} @ {timestamp} "
-                        f"C=${underlying_data['close']:.2f} "
-                        f"UpVol={underlying_data['up_volume']:,} "
-                        f"DownVol={underlying_data['down_volume']:,}")
-
+            logger.debug(
+                f"Bar (REST): {self.underlying} @ {timestamp} "
+                f"C=${underlying_data['close']:.2f}"
+            )
             return underlying_data
 
         except Exception as e:
@@ -720,15 +918,30 @@ class StreamManager:
 
         return True
 
-    def _start_accumulator(self):
-        """Start (or restart) the background option quote stream."""
+    def _start_accumulators(self):
+        """Start (or restart) background stream readers for options and underlying."""
+        # Stop existing accumulators if any.
         if self._accumulator is not None:
             self._accumulator.stop()
+        if self._underlying_accumulator is not None:
+            self._underlying_accumulator.stop()
+
+        self._wakeup.clear()
+
         self._accumulator = OptionStreamAccumulator(
             client=self.client,
             symbols=self.tracked_option_symbols,
+            wakeup=self._wakeup,
+        )
+        self._underlying_accumulator = UnderlyingBarAccumulator(
+            client=self.client,
+            symbol=self.underlying,
+            db_symbol=self.db_underlying,
+            session_template=SESSION_TEMPLATE,
+            wakeup=self._wakeup,
         )
         self._accumulator.start()
+        self._underlying_accumulator.start()
 
     def _yield_option_snapshot(self, state: Dict[str, Dict[str, Any]]):
         """
@@ -827,13 +1040,20 @@ class StreamManager:
             logger.error("Not initialized. Call initialize() first.")
             return
 
-        logger.info("Starting stream loop...")
+        logger.info("Starting stream loop (event-driven)...")
         logger.info("Press Ctrl+C to stop")
 
-        # Start persistent background stream for option quotes.
-        self._start_accumulator()
+        # Start persistent background streams for underlying and options.
+        self._start_accumulators()
 
         iteration = 0
+        # Observability counters — logged every _METRICS_LOG_INTERVAL cycles.
+        _METRICS_LOG_INTERVAL = 20
+        _total_option_batches = 0
+        _total_options_yielded = 0
+        _total_underlying_yields = 0
+        _total_empty_cycles = 0
+        _last_metrics_time = time.monotonic()
 
         try:
             while True:
@@ -842,27 +1062,35 @@ class StreamManager:
                 # Get current market session for dynamic polling
                 session = get_market_session()
 
-                # Determine poll interval based on session
+                # Determine max wait: used as the *timeout* on the wakeup
+                # event, not as a fixed sleep.  When data arrives, the loop
+                # wakes immediately.
                 if session == "regular":
-                    poll_interval = MARKET_HOURS_POLL_INTERVAL
+                    max_wait = MARKET_HOURS_POLL_INTERVAL
                 elif session in ["pre-market", "after-hours"]:
-                    poll_interval = EXTENDED_HOURS_POLL_INTERVAL
+                    max_wait = EXTENDED_HOURS_POLL_INTERVAL
                 else:  # closed
-                    poll_interval = CLOSED_HOURS_POLL_INTERVAL
+                    max_wait = CLOSED_HOURS_POLL_INTERVAL
 
-                logger.info(
-                    f"Iteration {iteration} - "
-                    f"{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S ET')} "
-                    f"[{session}]"
-                )
+                # --- block until data arrives or timeout for housekeeping ---
+                self._wakeup.wait(timeout=max_wait)
+                self._wakeup.clear()
+
+                cycle_start = time.monotonic()
+
+                if iteration % 10 == 1:
+                    logger.info(
+                        f"Iteration {iteration} - "
+                        f"{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S ET')} "
+                        f"[{session}]"
+                    )
 
                 # Check if expirations need refresh
                 if self._should_refresh_expirations():
                     logger.info("Refreshing expirations...")
                     if self._refresh_expirations():
                         logger.info("✅ Expirations refreshed successfully")
-                        # Symbols may have changed — restart accumulator.
-                        self._start_accumulator()
+                        self._start_accumulators()
                     else:
                         logger.warning(
                             "⚠️  Expiration refresh failed, continuing "
@@ -870,21 +1098,23 @@ class StreamManager:
                         )
 
                 try:
-                    # Fetch underlying bar using Stream Bars API
-                    # (single symbol — stream snapshot works well here)
-                    underlying_data = self._fetch_underlying_bar()
-
+                    # Drain underlying bar from persistent stream.
+                    underlying_data = self._underlying_accumulator.drain()
                     if underlying_data:
                         self.current_price = underlying_data["close"]
                         yield {"type": "underlying", "data": underlying_data}
+                        _total_underlying_yields += 1
 
-                    # Drain only contracts that changed since last cycle.
+                    # Drain only option contracts that changed since last cycle.
                     changed = self._accumulator.drain()
                     if changed:
                         option_results = self._yield_option_snapshot(changed)
 
                         if option_results:
                             option_count = len(option_results)
+                            _total_option_batches += 1
+                            _total_options_yielded += option_count
+
                             option_with_oi = sum(
                                 1 for o in option_results
                                 if (o.get("open_interest") or 0) > 0
@@ -920,12 +1150,29 @@ class StreamManager:
                                     f"{self.option_volume_coverage_alert_threshold:.1%})"
                                 )
 
-                            # Yield the entire batch as one item for batched DB writes.
                             yield {"type": "option_batch", "data": option_results}
                     else:
-                        logger.debug(
-                            "No new option updates this cycle"
+                        _total_empty_cycles += 1
+
+                    # --- observability: periodic metrics summary ---
+                    if iteration % _METRICS_LOG_INTERVAL == 0:
+                        elapsed = time.monotonic() - _last_metrics_time
+                        cycle_ms = (time.monotonic() - cycle_start) * 1000
+                        logger.info(
+                            f"[METRICS] last {_METRICS_LOG_INTERVAL} cycles in {elapsed:.1f}s | "
+                            f"option_batches={_total_option_batches} "
+                            f"options_yielded={_total_options_yielded} "
+                            f"underlying_yields={_total_underlying_yields} "
+                            f"empty_cycles={_total_empty_cycles} "
+                            f"opt_stream_updates={self._accumulator.updates_received} "
+                            f"bar_stream_updates={self._underlying_accumulator.updates_received} "
+                            f"cycle_ms={cycle_ms:.1f}"
                         )
+                        _total_option_batches = 0
+                        _total_options_yielded = 0
+                        _total_underlying_yields = 0
+                        _total_empty_cycles = 0
+                        _last_metrics_time = time.monotonic()
 
                     # Recalibrate strike range periodically.
                     if iteration % STRIKE_RECALC_INTERVAL == 0 and iteration > 0:
@@ -936,8 +1183,7 @@ class StreamManager:
                                 self.tracked_option_symbols = (
                                     self._build_option_symbols()
                                 )
-                                # Restart accumulator with new symbol set.
-                                self._start_accumulator()
+                                self._start_accumulators()
                                 logger.info(
                                     f"Recalibrated strikes around "
                                     f"${self.current_price:.2f} "
@@ -955,20 +1201,19 @@ class StreamManager:
                         )
                         break
 
-                    # Sleep with dynamic interval
-                    logger.debug(f"Sleeping for {poll_interval}s...")
-                    time.sleep(poll_interval)
-
                 except Exception as e:
                     logger.error(
                         f"Stream iteration error: {e}", exc_info=True
                     )
-                    time.sleep(poll_interval)
+                    time.sleep(max_wait)
         finally:
-            # Always clean up the background stream thread.
+            # Always clean up the background stream threads.
             if self._accumulator is not None:
                 self._accumulator.stop()
                 self._accumulator = None
+            if self._underlying_accumulator is not None:
+                self._underlying_accumulator.stop()
+                self._underlying_accumulator = None
 
         logger.info("Stream stopped")
 

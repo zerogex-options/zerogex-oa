@@ -16,6 +16,7 @@ import signal
 import sys
 import hashlib
 import json
+import time as _time
 from multiprocessing import Process
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
@@ -102,6 +103,12 @@ class IngestionEngine:
         self.greeks_calculated = 0
         self.last_flush_time = datetime.now(ET)
         self.errors_count = 0
+
+        # Observability: write-path performance counters (reset on log).
+        self._obs_batches_written = 0
+        self._obs_rows_written = 0
+        self._obs_write_time_ms = 0.0
+        self._obs_last_log = _time.monotonic()
 
         logger.info(f"Initialized IngestionEngine for {underlying}")
         logger.info(f"Config: {num_expirations} expirations, {num_strikes} strikes each side")
@@ -587,6 +594,7 @@ class IngestionEngine:
         """Write multiple aggregated option rows in a single DB transaction."""
         if not rows:
             return
+        t0 = _time.monotonic()
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
@@ -615,8 +623,14 @@ class IngestionEngine:
                     ))
                 conn.commit()
 
+            elapsed_ms = (_time.monotonic() - t0) * 1000
             self.option_quotes_stored += len(rows)
             self.last_flush_time = datetime.now(ET)
+
+            # Observability accumulators.
+            self._obs_batches_written += 1
+            self._obs_rows_written += len(rows)
+            self._obs_write_time_ms += elapsed_ms
 
             # Log first few with Greeks.
             if self.option_quotes_stored <= len(rows) + 3:
@@ -628,7 +642,31 @@ class IngestionEngine:
                             f"delta={d:.4f} gamma={agg.get('gamma', 0):.6f}"
                         )
 
-            logger.debug(f"Wrote {len(rows)} option rows in single transaction")
+            logger.debug(
+                f"Wrote {len(rows)} option rows in single transaction "
+                f"({elapsed_ms:.1f}ms)"
+            )
+
+            # Periodic observability summary (every 60s).
+            now = _time.monotonic()
+            if now - self._obs_last_log >= 60:
+                avg_ms = (
+                    self._obs_write_time_ms / self._obs_batches_written
+                    if self._obs_batches_written
+                    else 0
+                )
+                logger.info(
+                    f"[DB-METRICS] last 60s: "
+                    f"batches={self._obs_batches_written} "
+                    f"rows={self._obs_rows_written} "
+                    f"avg_write_ms={avg_ms:.1f} "
+                    f"total_stored={self.option_quotes_stored} "
+                    f"errors={self.errors_count}"
+                )
+                self._obs_batches_written = 0
+                self._obs_rows_written = 0
+                self._obs_write_time_ms = 0.0
+                self._obs_last_log = now
 
         except Exception as e:
             logger.error(f"Error writing option batch ({len(rows)} rows): {e}", exc_info=True)
