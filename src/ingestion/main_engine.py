@@ -18,7 +18,7 @@ import hashlib
 import json
 import time as _time
 from multiprocessing import Process
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 from collections import defaultdict
 import pytz
@@ -268,10 +268,6 @@ class IngestionEngine:
         except Exception as e:
             logger.error(f"Error upserting underlying quote: {e}", exc_info=True)
             self.errors_count += 1
-
-    def _flush_underlying_bucket(self):
-        """No-op: underlying bars are written immediately per update."""
-        return
 
     def _enrich_with_greeks(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Apply Greeks calculation to option data, returning enriched copy."""
@@ -681,10 +677,6 @@ class IngestionEngine:
     def _flush_all_buffers(self):
         """Flush all pending buffers"""
         logger.info(f"Flushing all buffers... (Underlying: {len(self.underlying_buffer)}, Options: {sum(len(v) for v in self.options_buffer.values())} across {len(self.options_buffer)} symbols)")
-
-        # Flush underlying
-        if self.underlying_buffer:
-            self._flush_underlying_bucket()
 
         # Flush all options
         current_time = datetime.now(ET)

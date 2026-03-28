@@ -16,7 +16,7 @@ import sys
 import time
 from multiprocessing import Process
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 from collections import defaultdict
 import pytz
 import numpy as np
@@ -332,14 +332,16 @@ class AnalyticsEngine:
         d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
         d2 = d1 - sigma * np.sqrt(T)
 
+        # Call charm: -N'(d1) * [2rT - d2*sigma*sqrt(T)] / [2T*sigma*sqrt(T)]
+        # Put charm adds the risk-free drift term: call_charm + r*e^{-rT}
+        call_charm = -stats.norm.pdf(d1) * (
+            2 * r * T - d2 * sigma * np.sqrt(T)
+        ) / (2 * T * sigma * np.sqrt(T))
+
         if option_type == 'C':
-            charm = -stats.norm.pdf(d1) * (
-                2 * r * T - d2 * sigma * np.sqrt(T)
-            ) / (2 * T * sigma * np.sqrt(T))
+            charm = call_charm
         else:  # Put
-            charm = -stats.norm.pdf(d1) * (
-                2 * r * T - d2 * sigma * np.sqrt(T)
-            ) / (2 * T * sigma * np.sqrt(T))
+            charm = call_charm + r * np.exp(-r * T)
 
         # Convert to per day
         charm_per_day = charm / 365.0
@@ -1062,8 +1064,7 @@ class AnalyticsEngine:
             self._refresh_flow_caches(latest_timestamp, underlying_price)
 
             # --- Signal engine: run every _signal_interval seconds ---
-            import time as _time
-            now_ts = _time.time()
+            now_ts = time.time()
             if (self._last_signal_run is None or
                     now_ts - self._last_signal_run >= self._signal_interval):
                 try:

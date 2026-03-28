@@ -64,7 +64,6 @@ metrics = [
 ]
 greeks = [
     "scipy>=1.11.0",
-    "py_vollib>=1.0.1",
 ]
 api = [
     "fastapi>=0.109.0",

@@ -12,6 +12,7 @@ The API simply reads the latest row; no scoring logic lives here.
 
 from fastapi import APIRouter, HTTPException, Query, Depends
 from datetime import datetime, timezone
+import enum
 import logging
 
 from src.analytics.position_optimizer_engine import ASSUMED_ACCOUNT_EQUITY, RISK_PROFILE_BUDGETS
@@ -53,25 +54,32 @@ def get_db() -> DatabaseManager:
     return db_manager
 
 
-def _map_trade_type(raw: str) -> TradeType:
+def _map_enum(raw: str, enum_cls: type[enum.Enum], default: enum.Enum) -> enum.Enum:
+    """Map a raw string to an enum value, returning *default* on mismatch."""
     try:
-        return TradeType(raw)
+        return enum_cls(raw)
     except ValueError:
-        return TradeType.NO_TRADE
+        return default
+
+
+def _map_trade_type(raw: str) -> TradeType:
+    return _map_enum(raw, TradeType, TradeType.NO_TRADE)
 
 
 def _map_direction(raw: str) -> SignalDirection:
-    try:
-        return SignalDirection(raw)
-    except ValueError:
-        return SignalDirection.NEUTRAL
+    return _map_enum(raw, SignalDirection, SignalDirection.NEUTRAL)
 
 
 def _map_strength(raw: str) -> SignalStrength:
-    try:
-        return SignalStrength(raw)
-    except ValueError:
-        return SignalStrength.LOW
+    return _map_enum(raw, SignalStrength, SignalStrength.LOW)
+
+
+def _map_vol_direction(raw: str) -> VolExpansionDirection:
+    return _map_enum(raw, VolExpansionDirection, VolExpansionDirection.NEUTRAL)
+
+
+def _map_position_direction(raw: str) -> PositionOptimizerDirection:
+    return _map_enum(raw, PositionOptimizerDirection, PositionOptimizerDirection.NEUTRAL)
 
 
 def _map_components(raw_list: list) -> list[SignalComponent]:
@@ -89,22 +97,6 @@ def _map_components(raw_list: list) -> list[SignalComponent]:
             applicable=item.get("applicable", True),
         ))
     return out
-
-
-def _map_vol_direction(raw: str) -> VolExpansionDirection:
-    try:
-        return VolExpansionDirection(raw)
-    except ValueError:
-        return VolExpansionDirection.NEUTRAL
-
-
-
-
-def _map_position_direction(raw: str) -> PositionOptimizerDirection:
-    try:
-        return PositionOptimizerDirection(raw)
-    except ValueError:
-        return PositionOptimizerDirection.NEUTRAL
 
 
 def _rescaled_sizing_profiles(

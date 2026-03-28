@@ -52,6 +52,9 @@ ET = pytz.timezone("US/Eastern")
 # event before the socket times out (triggers a reconnect).
 _STREAM_READ_TIMEOUT = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
 
+# Possible field names for implied volatility across TradeStation payload variants
+_IV_FIELD_NAMES = ("ImpliedVolatility", "IV", "Volatility", "IVol")
+
 
 # ---------------------------------------------------------------------------
 # OptionStreamAccumulator — background thread for persistent quote streaming
@@ -201,12 +204,16 @@ class OptionStreamAccumulator:
             timeout=(API_REQUEST_TIMEOUT, _STREAM_READ_TIMEOUT),
         )
 
-        if response.status_code == 401:
-            response.close()
-            self._client.auth.force_refresh_access_token()
-            return  # will retry on next loop iteration
+        try:
+            if response.status_code == 401:
+                response.close()
+                self._client.auth.force_refresh_access_token()
+                return  # will retry on next loop iteration
 
-        response.raise_for_status()
+            response.raise_for_status()
+        except Exception:
+            response.close()
+            raise
 
         with self._response_lock:
             self._current_response = response
@@ -285,7 +292,7 @@ class OptionStreamAccumulator:
                         pass
 
             # IV: only overwrite when new value > 0
-            for iv_key in ("ImpliedVolatility", "IV", "Volatility", "IVol"):
+            for iv_key in _IV_FIELD_NAMES:
                 val = q.get(iv_key)
                 if val is not None:
                     try:
@@ -519,7 +526,8 @@ class UnderlyingBarAccumulator:
             "volume": total_volume,
         }
         # Evict stale minute buckets.
-        for k in [k for k in self._bar_state if k < minute_bucket]:
+        stale = [k for k in self._bar_state if k < minute_bucket]
+        for k in stale:
             del self._bar_state[k]
 
         with self._lock:
@@ -989,7 +997,7 @@ class StreamManager:
                 )
 
             implied_volatility = None
-            for iv_field in ("ImpliedVolatility", "IV", "Volatility", "IVol"):
+            for iv_field in _IV_FIELD_NAMES:
                 iv_val = safe_float(raw.get(iv_field), field_name=iv_field)
                 if iv_val and iv_val > 0:
                     implied_volatility = iv_val
@@ -1073,8 +1081,10 @@ class StreamManager:
                     max_wait = CLOSED_HOURS_POLL_INTERVAL
 
                 # --- block until data arrives or timeout for housekeeping ---
-                self._wakeup.wait(timeout=max_wait)
+                # Clear before waiting so signals arriving during processing
+                # are not lost (set-before-clear race).
                 self._wakeup.clear()
+                self._wakeup.wait(timeout=max_wait)
 
                 cycle_start = time.monotonic()
 

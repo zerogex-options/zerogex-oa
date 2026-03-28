@@ -139,7 +139,7 @@ class DatabaseManager:
         # Fallback to environment variables
         self.host = os.getenv('DB_HOST', 'localhost')
         self.port = os.getenv('DB_PORT', '5432')
-        self.database = os.getenv('DB_NAME', 'zerogexdb')
+        self.database = os.getenv('DB_NAME', 'zerogex')
         self.user = os.getenv('DB_USER', 'postgres')
         self.password = os.getenv('DB_PASSWORD', '')
 
