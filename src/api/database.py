@@ -1087,25 +1087,42 @@ class DatabaseManager:
                   AND timestamp >= $2
                   AND timestamp <= $3
                 GROUP BY timestamp, symbol
+            ),
+            with_net AS (
+                SELECT
+                    timestamp,
+                    symbol,
+                    COALESCE(call_volume, 0)::bigint AS call_volume,
+                    COALESCE(call_premium, 0)::numeric AS call_premium,
+                    COALESCE(put_volume, 0)::bigint AS put_volume,
+                    COALESCE(put_premium, 0)::numeric AS put_premium,
+                    (COALESCE(call_volume, 0) - COALESCE(put_volume, 0))::bigint AS net_volume,
+                    (COALESCE(call_premium, 0) - COALESCE(put_premium, 0))::numeric AS net_premium,
+                    underlying_price
+                FROM aggregated
             )
             SELECT
                 timestamp,
                 symbol,
-                COALESCE(call_volume, 0)::bigint AS call_volume,
-                COALESCE(call_premium, 0)::numeric AS call_premium,
-                COALESCE(put_volume, 0)::bigint AS put_volume,
-                COALESCE(put_premium, 0)::numeric AS put_premium,
-                (COALESCE(call_volume, 0) - COALESCE(put_volume, 0))::bigint AS net_volume,
-                (COALESCE(call_premium, 0) - COALESCE(put_premium, 0))::numeric AS net_premium,
+                call_volume,
+                call_premium,
+                put_volume,
+                put_premium,
+                net_volume,
+                net_premium,
+                SUM(call_premium) OVER (ORDER BY timestamp)::numeric AS cumulative_call_premium,
+                (-SUM(put_premium) OVER (ORDER BY timestamp))::numeric AS cumulative_put_premium,
+                SUM(call_volume + put_volume) OVER (ORDER BY timestamp)::bigint AS cumulative_volume,
+                SUM(net_premium) OVER (ORDER BY timestamp)::numeric AS cumulative_net_premium,
                 CASE
-                    WHEN COALESCE(call_volume, 0) - COALESCE(put_volume, 0) > 500 THEN '🟢 Strong Calls'
-                    WHEN COALESCE(call_volume, 0) - COALESCE(put_volume, 0) > 0 THEN '✅ Calls'
-                    WHEN COALESCE(call_volume, 0) - COALESCE(put_volume, 0) < -500 THEN '🔴 Strong Puts'
-                    WHEN COALESCE(call_volume, 0) - COALESCE(put_volume, 0) < 0 THEN '❌ Puts'
+                    WHEN net_volume > 500 THEN '🟢 Strong Calls'
+                    WHEN net_volume > 0 THEN '✅ Calls'
+                    WHEN net_volume < -500 THEN '🔴 Strong Puts'
+                    WHEN net_volume < 0 THEN '❌ Puts'
                     ELSE '⚪ Neutral'
                 END AS flow_bias,
                 underlying_price
-            FROM aggregated
+            FROM with_net
             ORDER BY timestamp DESC
         """
 
