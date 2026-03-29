@@ -379,6 +379,45 @@ CREATE TABLE IF NOT EXISTS flow_smart_money (
     PRIMARY KEY (timestamp, symbol, option_symbol)
 );
 
+-- Idempotent migration: add buy/sell volume & premium columns for Lee-Ready
+-- trade direction classification.
+DO $$
+BEGIN
+    -- flow_by_type
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='flow_by_type' AND column_name='buy_volume'
+    ) THEN
+        ALTER TABLE flow_by_type
+            ADD COLUMN buy_volume BIGINT DEFAULT 0,
+            ADD COLUMN sell_volume BIGINT DEFAULT 0,
+            ADD COLUMN buy_premium NUMERIC(18, 2) DEFAULT 0,
+            ADD COLUMN sell_premium NUMERIC(18, 2) DEFAULT 0;
+    END IF;
+    -- flow_by_strike
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='flow_by_strike' AND column_name='buy_volume'
+    ) THEN
+        ALTER TABLE flow_by_strike
+            ADD COLUMN buy_volume BIGINT DEFAULT 0,
+            ADD COLUMN sell_volume BIGINT DEFAULT 0,
+            ADD COLUMN buy_premium NUMERIC(18, 2) DEFAULT 0,
+            ADD COLUMN sell_premium NUMERIC(18, 2) DEFAULT 0;
+    END IF;
+    -- flow_by_expiration
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='flow_by_expiration' AND column_name='buy_volume'
+    ) THEN
+        ALTER TABLE flow_by_expiration
+            ADD COLUMN buy_volume BIGINT DEFAULT 0,
+            ADD COLUMN sell_volume BIGINT DEFAULT 0,
+            ADD COLUMN buy_premium NUMERIC(18, 2) DEFAULT 0,
+            ADD COLUMN sell_premium NUMERIC(18, 2) DEFAULT 0;
+    END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS idx_flow_by_type_symbol_ts
     ON flow_by_type(symbol, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_flow_by_strike_symbol_ts

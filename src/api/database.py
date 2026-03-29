@@ -290,10 +290,30 @@ class DatabaseManager:
                                 = (l.timestamp AT TIME ZONE 'America/New_York')::date
                                 THEN GREATEST(COALESCE(l.volume, 0) - COALESCE(p.prev_volume, 0), 0)
                             ELSE COALESCE(l.volume, 0)
-                        END::bigint AS volume_delta
+                        END::bigint AS volume_delta,
+                        -- Lee-Ready: buyer-initiated volume (filled at/near ask)
+                        CASE
+                            WHEN p.prev_ask_vol IS NULL THEN COALESCE(l.ask_volume, 0)
+                            WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
+                                = (l.timestamp AT TIME ZONE 'America/New_York')::date
+                                THEN GREATEST(COALESCE(l.ask_volume, 0) - COALESCE(p.prev_ask_vol, 0), 0)
+                            ELSE COALESCE(l.ask_volume, 0)
+                        END::bigint AS ask_vol_delta,
+                        -- Lee-Ready: seller-initiated volume (filled at/near bid)
+                        CASE
+                            WHEN p.prev_bid_vol IS NULL THEN COALESCE(l.bid_volume, 0)
+                            WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
+                                = (l.timestamp AT TIME ZONE 'America/New_York')::date
+                                THEN GREATEST(COALESCE(l.bid_volume, 0) - COALESCE(p.prev_bid_vol, 0), 0)
+                            ELSE COALESCE(l.bid_volume, 0)
+                        END::bigint AS bid_vol_delta
                     FROM latest_rows l
                     LEFT JOIN LATERAL (
-                        SELECT oc2.timestamp AS prev_ts, oc2.volume AS prev_volume
+                        SELECT
+                            oc2.timestamp AS prev_ts,
+                            oc2.volume AS prev_volume,
+                            oc2.ask_volume AS prev_ask_vol,
+                            oc2.bid_volume AS prev_bid_vol
                         FROM option_chains oc2
                         WHERE oc2.option_symbol = l.option_symbol
                           AND oc2.timestamp < l.timestamp
@@ -309,6 +329,10 @@ class DatabaseManager:
                     total_premium,
                     avg_iv,
                     net_delta,
+                    buy_volume,
+                    sell_volume,
+                    buy_premium,
+                    sell_premium,
                     underlying_price
                 )
                 SELECT
@@ -319,6 +343,10 @@ class DatabaseManager:
                     SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
                     AVG(implied_volatility)::numeric,
                     SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric,
+                    SUM(ask_vol_delta)::bigint,
+                    SUM(bid_vol_delta)::bigint,
+                    SUM(ask_vol_delta * COALESCE(last, 0) * 100)::numeric,
+                    SUM(bid_vol_delta * COALESCE(last, 0) * 100)::numeric,
                     $3::numeric
                 FROM with_prev
                 WHERE volume_delta > 0
@@ -329,6 +357,10 @@ class DatabaseManager:
                     total_premium = EXCLUDED.total_premium,
                     avg_iv = EXCLUDED.avg_iv,
                     net_delta = EXCLUDED.net_delta,
+                    buy_volume = EXCLUDED.buy_volume,
+                    sell_volume = EXCLUDED.sell_volume,
+                    buy_premium = EXCLUDED.buy_premium,
+                    sell_premium = EXCLUDED.sell_premium,
                     underlying_price = EXCLUDED.underlying_price,
                     updated_at = NOW()
                 """,
@@ -368,10 +400,28 @@ class DatabaseManager:
                                 = (l.timestamp AT TIME ZONE 'America/New_York')::date
                                 THEN GREATEST(COALESCE(l.volume, 0) - COALESCE(p.prev_volume, 0), 0)
                             ELSE COALESCE(l.volume, 0)
-                        END::bigint AS volume_delta
+                        END::bigint AS volume_delta,
+                        CASE
+                            WHEN p.prev_ask_vol IS NULL THEN COALESCE(l.ask_volume, 0)
+                            WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
+                                = (l.timestamp AT TIME ZONE 'America/New_York')::date
+                                THEN GREATEST(COALESCE(l.ask_volume, 0) - COALESCE(p.prev_ask_vol, 0), 0)
+                            ELSE COALESCE(l.ask_volume, 0)
+                        END::bigint AS ask_vol_delta,
+                        CASE
+                            WHEN p.prev_bid_vol IS NULL THEN COALESCE(l.bid_volume, 0)
+                            WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
+                                = (l.timestamp AT TIME ZONE 'America/New_York')::date
+                                THEN GREATEST(COALESCE(l.bid_volume, 0) - COALESCE(p.prev_bid_vol, 0), 0)
+                            ELSE COALESCE(l.bid_volume, 0)
+                        END::bigint AS bid_vol_delta
                     FROM latest_rows l
                     LEFT JOIN LATERAL (
-                        SELECT oc2.timestamp AS prev_ts, oc2.volume AS prev_volume
+                        SELECT
+                            oc2.timestamp AS prev_ts,
+                            oc2.volume AS prev_volume,
+                            oc2.ask_volume AS prev_ask_vol,
+                            oc2.bid_volume AS prev_bid_vol
                         FROM option_chains oc2
                         WHERE oc2.option_symbol = l.option_symbol
                           AND oc2.timestamp < l.timestamp
@@ -387,6 +437,10 @@ class DatabaseManager:
                     total_premium,
                     avg_iv,
                     net_delta,
+                    buy_volume,
+                    sell_volume,
+                    buy_premium,
+                    sell_premium,
                     underlying_price
                 )
                 SELECT
@@ -397,6 +451,10 @@ class DatabaseManager:
                     SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
                     AVG(implied_volatility)::numeric,
                     SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric,
+                    SUM(ask_vol_delta)::bigint,
+                    SUM(bid_vol_delta)::bigint,
+                    SUM(ask_vol_delta * COALESCE(last, 0) * 100)::numeric,
+                    SUM(bid_vol_delta * COALESCE(last, 0) * 100)::numeric,
                     $3::numeric
                 FROM with_prev
                 WHERE volume_delta > 0
@@ -407,6 +465,10 @@ class DatabaseManager:
                     total_premium = EXCLUDED.total_premium,
                     avg_iv = EXCLUDED.avg_iv,
                     net_delta = EXCLUDED.net_delta,
+                    buy_volume = EXCLUDED.buy_volume,
+                    sell_volume = EXCLUDED.sell_volume,
+                    buy_premium = EXCLUDED.buy_premium,
+                    sell_premium = EXCLUDED.sell_premium,
                     underlying_price = EXCLUDED.underlying_price,
                     updated_at = NOW()
                 """,
@@ -444,10 +506,28 @@ class DatabaseManager:
                                 = (l.timestamp AT TIME ZONE 'America/New_York')::date
                                 THEN GREATEST(COALESCE(l.volume, 0) - COALESCE(p.prev_volume, 0), 0)
                             ELSE COALESCE(l.volume, 0)
-                        END::bigint AS volume_delta
+                        END::bigint AS volume_delta,
+                        CASE
+                            WHEN p.prev_ask_vol IS NULL THEN COALESCE(l.ask_volume, 0)
+                            WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
+                                = (l.timestamp AT TIME ZONE 'America/New_York')::date
+                                THEN GREATEST(COALESCE(l.ask_volume, 0) - COALESCE(p.prev_ask_vol, 0), 0)
+                            ELSE COALESCE(l.ask_volume, 0)
+                        END::bigint AS ask_vol_delta,
+                        CASE
+                            WHEN p.prev_bid_vol IS NULL THEN COALESCE(l.bid_volume, 0)
+                            WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
+                                = (l.timestamp AT TIME ZONE 'America/New_York')::date
+                                THEN GREATEST(COALESCE(l.bid_volume, 0) - COALESCE(p.prev_bid_vol, 0), 0)
+                            ELSE COALESCE(l.bid_volume, 0)
+                        END::bigint AS bid_vol_delta
                     FROM latest_rows l
                     LEFT JOIN LATERAL (
-                        SELECT oc2.timestamp AS prev_ts, oc2.volume AS prev_volume
+                        SELECT
+                            oc2.timestamp AS prev_ts,
+                            oc2.volume AS prev_volume,
+                            oc2.ask_volume AS prev_ask_vol,
+                            oc2.bid_volume AS prev_bid_vol
                         FROM option_chains oc2
                         WHERE oc2.option_symbol = l.option_symbol
                           AND oc2.timestamp < l.timestamp
@@ -461,6 +541,10 @@ class DatabaseManager:
                     expiration,
                     total_volume,
                     total_premium,
+                    buy_volume,
+                    sell_volume,
+                    buy_premium,
+                    sell_premium,
                     underlying_price
                 )
                 SELECT
@@ -469,6 +553,10 @@ class DatabaseManager:
                     expiration,
                     SUM(volume_delta)::bigint,
                     SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
+                    SUM(ask_vol_delta)::bigint,
+                    SUM(bid_vol_delta)::bigint,
+                    SUM(ask_vol_delta * COALESCE(last, 0) * 100)::numeric,
+                    SUM(bid_vol_delta * COALESCE(last, 0) * 100)::numeric,
                     $3::numeric
                 FROM with_prev
                 WHERE volume_delta > 0
@@ -477,6 +565,10 @@ class DatabaseManager:
                 DO UPDATE SET
                     total_volume = EXCLUDED.total_volume,
                     total_premium = EXCLUDED.total_premium,
+                    buy_volume = EXCLUDED.buy_volume,
+                    sell_volume = EXCLUDED.sell_volume,
+                    buy_premium = EXCLUDED.buy_premium,
+                    sell_premium = EXCLUDED.sell_premium,
                     underlying_price = EXCLUDED.underlying_price,
                     updated_at = NOW()
                 """,
@@ -1081,6 +1173,15 @@ class DatabaseManager:
                     MAX(CASE WHEN option_type = 'C' THEN total_premium END) AS call_premium,
                     MAX(CASE WHEN option_type = 'P' THEN total_volume END) AS put_volume,
                     MAX(CASE WHEN option_type = 'P' THEN total_premium END) AS put_premium,
+                    -- Lee-Ready buy/sell breakdown per type
+                    MAX(CASE WHEN option_type = 'C' THEN buy_premium END) AS call_buy_premium,
+                    MAX(CASE WHEN option_type = 'C' THEN sell_premium END) AS call_sell_premium,
+                    MAX(CASE WHEN option_type = 'P' THEN buy_premium END) AS put_buy_premium,
+                    MAX(CASE WHEN option_type = 'P' THEN sell_premium END) AS put_sell_premium,
+                    MAX(CASE WHEN option_type = 'C' THEN buy_volume END) AS call_buy_volume,
+                    MAX(CASE WHEN option_type = 'C' THEN sell_volume END) AS call_sell_volume,
+                    MAX(CASE WHEN option_type = 'P' THEN buy_volume END) AS put_buy_volume,
+                    MAX(CASE WHEN option_type = 'P' THEN sell_volume END) AS put_sell_volume,
                     MAX(underlying_price) AS underlying_price
                 FROM flow_by_type
                 WHERE symbol = $1
@@ -1098,6 +1199,10 @@ class DatabaseManager:
                     COALESCE(put_premium, 0)::numeric AS put_premium,
                     (COALESCE(call_volume, 0) - COALESCE(put_volume, 0))::bigint AS net_volume,
                     (COALESCE(call_premium, 0) - COALESCE(put_premium, 0))::numeric AS net_premium,
+                    -- Net Call Premium (NCP): buy pressure minus sell pressure on calls
+                    (COALESCE(call_buy_premium, 0) - COALESCE(call_sell_premium, 0))::numeric AS ncp,
+                    -- Net Put Premium (NPP): buy pressure minus sell pressure on puts (negated)
+                    (-(COALESCE(put_buy_premium, 0) - COALESCE(put_sell_premium, 0)))::numeric AS npp,
                     underlying_price
                 FROM aggregated
             )
@@ -1110,10 +1215,12 @@ class DatabaseManager:
                 put_premium,
                 net_volume,
                 net_premium,
-                SUM(call_premium) OVER (ORDER BY timestamp)::numeric AS cumulative_call_premium,
-                (-SUM(put_premium) OVER (ORDER BY timestamp))::numeric AS cumulative_put_premium,
+                -- Cumulative NCP: running sum of net call buying (positive = net call buying)
+                SUM(ncp) OVER (ORDER BY timestamp)::numeric AS cumulative_call_premium,
+                -- Cumulative NPP: running sum of net put buying (negative = net put buying)
+                SUM(npp) OVER (ORDER BY timestamp)::numeric AS cumulative_put_premium,
                 SUM(call_volume + put_volume) OVER (ORDER BY timestamp)::bigint AS cumulative_volume,
-                SUM(net_premium) OVER (ORDER BY timestamp)::numeric AS cumulative_net_premium,
+                SUM(ncp + npp) OVER (ORDER BY timestamp)::numeric AS cumulative_net_premium,
                 CASE
                     WHEN net_volume > 500 THEN '🟢 Strong Calls'
                     WHEN net_volume > 0 THEN '✅ Calls'
@@ -1151,7 +1258,7 @@ class DatabaseManager:
                 total_volume AS volume,
                 total_premium AS premium,
                 net_delta::bigint AS net_volume,
-                (net_delta * (total_premium::numeric / NULLIF(total_volume, 0)))::numeric AS net_premium,
+                (COALESCE(buy_premium, 0) - COALESCE(sell_premium, 0))::numeric AS net_premium,
                 CASE
                     WHEN net_delta > 100 THEN '🟢 Strong Calls'
                     WHEN net_delta > 0 THEN '✅ Calls'
@@ -1267,10 +1374,30 @@ class DatabaseManager:
                            = (oc.timestamp AT TIME ZONE 'America/New_York')::date
                             THEN GREATEST(COALESCE(oc.volume, 0) - COALESCE(p.prev_volume, 0), 0)
                         ELSE COALESCE(oc.volume, 0)
-                    END::bigint AS volume_delta
+                    END::bigint AS volume_delta,
+                    -- Lee-Ready: buyer-initiated volume delta
+                    CASE
+                        WHEN p.prev_ask_vol IS NULL THEN COALESCE(oc.ask_volume, 0)
+                        WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
+                           = (oc.timestamp AT TIME ZONE 'America/New_York')::date
+                            THEN GREATEST(COALESCE(oc.ask_volume, 0) - COALESCE(p.prev_ask_vol, 0), 0)
+                        ELSE COALESCE(oc.ask_volume, 0)
+                    END::bigint AS ask_vol_delta,
+                    -- Lee-Ready: seller-initiated volume delta
+                    CASE
+                        WHEN p.prev_bid_vol IS NULL THEN COALESCE(oc.bid_volume, 0)
+                        WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
+                           = (oc.timestamp AT TIME ZONE 'America/New_York')::date
+                            THEN GREATEST(COALESCE(oc.bid_volume, 0) - COALESCE(p.prev_bid_vol, 0), 0)
+                        ELSE COALESCE(oc.bid_volume, 0)
+                    END::bigint AS bid_vol_delta
                 FROM option_chains oc
                 LEFT JOIN LATERAL (
-                    SELECT oc2.timestamp AS prev_ts, oc2.volume AS prev_volume
+                    SELECT
+                        oc2.timestamp AS prev_ts,
+                        oc2.volume AS prev_volume,
+                        oc2.ask_volume AS prev_ask_vol,
+                        oc2.bid_volume AS prev_bid_vol
                     FROM option_chains oc2
                     WHERE oc2.option_symbol = oc.option_symbol
                       AND oc2.timestamp < oc.timestamp
@@ -1300,6 +1427,12 @@ class DatabaseManager:
                     option_type,
                     volume_delta AS flow,
                     (volume_delta * last * 100)::numeric AS notional,
+                    -- Trade direction: 'BUY' if majority at ask, 'SELL' if majority at bid
+                    CASE
+                        WHEN ask_vol_delta > bid_vol_delta THEN 'BUY'
+                        WHEN bid_vol_delta > ask_vol_delta THEN 'SELL'
+                        ELSE 'NEUTRAL'
+                    END AS trade_side,
                     delta,
                     LEAST(10, GREATEST(0,
                         CASE WHEN volume_delta >= 500 THEN 4 WHEN volume_delta >= 200 THEN 3 WHEN volume_delta >= 100 THEN 2 WHEN volume_delta >= 50 THEN 1 ELSE 0 END +
@@ -1341,6 +1474,7 @@ class DatabaseManager:
                 option_type,
                 flow,
                 notional,
+                trade_side,
                 delta,
                 score,
                 notional_class,

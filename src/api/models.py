@@ -184,6 +184,7 @@ class SmartMoneyFlowPoint(BaseModel):
     option_type: str
     flow: int
     notional: Decimal
+    trade_side: str
     delta: Optional[Decimal] = None
     score: Optional[Decimal] = None
     notional_class: str
