@@ -110,6 +110,10 @@ class IngestionEngine:
         self._obs_write_time_ms = 0.0
         self._obs_last_log = _time.monotonic()
 
+        # Circuit breaker: stop hammering a dead database.
+        self._db_consecutive_failures = 0
+        self._db_backoff_until = 0.0  # monotonic timestamp
+
         logger.info(f"Initialized IngestionEngine for {underlying}")
         logger.info(f"Config: {num_expirations} expirations, {num_strikes} strikes each side")
 
@@ -235,6 +239,9 @@ class IngestionEngine:
 
     def _upsert_underlying_quote(self, quote: Dict[str, Any]):
         """Upsert one underlying quote row for the current minute bucket."""
+        # Share circuit breaker with option writes — if DB is down, skip.
+        if _time.monotonic() < self._db_backoff_until:
+            return
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
@@ -261,13 +268,23 @@ class IngestionEngine:
                     quote["down_volume"],
                 ))
                 conn.commit()
+                # Reset breaker on success (underlying writes confirm DB is alive).
+                self._db_consecutive_failures = 0
+                self._db_backoff_until = 0.0
 
             self.underlying_bars_stored += 1
             self.last_flush_time = datetime.now(ET)
 
         except Exception as e:
-            logger.error(f"Error upserting underlying quote: {e}", exc_info=True)
+            self._db_consecutive_failures += 1
             self.errors_count += 1
+            backoff = min(2 ** self._db_consecutive_failures, 60)
+            self._db_backoff_until = _time.monotonic() + backoff
+            logger.error(
+                f"[CIRCUIT-BREAKER] Underlying upsert failed "
+                f"(attempt #{self._db_consecutive_failures}, backoff {backoff}s): {e}",
+                exc_info=True,
+            )
 
     def _enrich_with_greeks(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Apply Greeks calculation to option data, returning enriched copy."""
@@ -372,15 +389,21 @@ class IngestionEngine:
             self._write_option_rows(rows_to_write)
 
         # Safety valve: flush everything if total buffer exceeds limit.
+        # Use each symbol's latest buffered timestamp so data lands in the
+        # correct time bucket (not forced into "now").
         total_buffered = sum(len(v) for v in self.options_buffer.values())
         if total_buffered >= MAX_BUFFER_SIZE:
-            logger.debug(f"Option buffer limit reached ({total_buffered} items), flushing all option buffers")
-            current_time = datetime.now(ET)
-            flush_bucket = bucket_timestamp(current_time, AGGREGATION_BUCKET_SECONDS)
+            logger.warning(f"Option buffer limit reached ({total_buffered} items), flushing all option buffers")
             overflow_rows = []
             for sym in list(self.options_buffer.keys()):
-                if self.options_buffer[sym]:
-                    agg = self._prepare_option_agg(sym, flush_bucket)
+                buf = self.options_buffer.get(sym)
+                if buf:
+                    last_ts = buf[-1].get("timestamp")
+                    sym_bucket = bucket_timestamp(
+                        last_ts if last_ts else datetime.now(ET),
+                        AGGREGATION_BUCKET_SECONDS,
+                    )
+                    agg = self._prepare_option_agg(sym, sym_bucket)
                     if agg:
                         overflow_rows.append(agg)
             if overflow_rows:
@@ -587,9 +610,24 @@ class IngestionEngine:
     """
 
     def _write_option_rows(self, rows: List[Dict[str, Any]]):
-        """Write multiple aggregated option rows in a single DB transaction."""
+        """Write multiple aggregated option rows in a single DB transaction.
+
+        Includes a circuit breaker: after consecutive failures the engine
+        backs off exponentially (2s, 4s, 8s … capped at 60s) so we don't
+        hammer a dead database.  On recovery the breaker resets immediately.
+        """
         if not rows:
             return
+
+        # Circuit breaker: skip write if still in backoff window.
+        now_mono = _time.monotonic()
+        if now_mono < self._db_backoff_until:
+            logger.warning(
+                f"[CIRCUIT-BREAKER] Skipping write of {len(rows)} rows — "
+                f"DB backoff for {self._db_backoff_until - now_mono:.1f}s more"
+            )
+            return
+
         t0 = _time.monotonic()
         try:
             with db_connection() as conn:
@@ -622,6 +660,15 @@ class IngestionEngine:
             elapsed_ms = (_time.monotonic() - t0) * 1000
             self.option_quotes_stored += len(rows)
             self.last_flush_time = datetime.now(ET)
+
+            # Reset circuit breaker on success.
+            if self._db_consecutive_failures > 0:
+                logger.info(
+                    f"[CIRCUIT-BREAKER] DB recovered after "
+                    f"{self._db_consecutive_failures} consecutive failures"
+                )
+            self._db_consecutive_failures = 0
+            self._db_backoff_until = 0.0
 
             # Observability accumulators.
             self._obs_batches_written += 1
@@ -665,8 +712,23 @@ class IngestionEngine:
                 self._obs_last_log = now
 
         except Exception as e:
-            logger.error(f"Error writing option batch ({len(rows)} rows): {e}", exc_info=True)
+            self._db_consecutive_failures += 1
             self.errors_count += 1
+            # Exponential backoff: 2s, 4s, 8s, 16s, 32s, 60s cap
+            backoff = min(2 ** self._db_consecutive_failures, 60)
+            self._db_backoff_until = _time.monotonic() + backoff
+
+            # Include affected symbols and time range for debugging.
+            symbols = sorted({r["option_symbol"] for r in rows[:5]})
+            ts_range = [r.get("timestamp") for r in (rows[0:1] + rows[-1:])]
+            logger.error(
+                f"[CIRCUIT-BREAKER] DB write failed ({len(rows)} rows, "
+                f"attempt #{self._db_consecutive_failures}, "
+                f"backoff {backoff}s): {e}\n"
+                f"  affected symbols (sample): {symbols}\n"
+                f"  timestamp range: {ts_range}",
+                exc_info=True,
+            )
 
     def _flush_option_bucket(self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False):
         """Flush a single option bucket (used by _flush_all_buffers)."""

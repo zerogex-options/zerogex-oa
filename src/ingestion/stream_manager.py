@@ -427,12 +427,16 @@ class UnderlyingBarAccumulator:
             timeout=(API_REQUEST_TIMEOUT, _STREAM_READ_TIMEOUT),
         )
 
-        if response.status_code == 401:
-            response.close()
-            self._client.auth.force_refresh_access_token()
-            return
+        try:
+            if response.status_code == 401:
+                response.close()
+                self._client.auth.force_refresh_access_token()
+                return
 
-        response.raise_for_status()
+            response.raise_for_status()
+        except Exception:
+            response.close()
+            raise
 
         with self._response_lock:
             self._current_response = response
