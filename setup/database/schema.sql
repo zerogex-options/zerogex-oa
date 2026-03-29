@@ -323,8 +323,39 @@ SELECT
 FROM option_chains;
 
 -- =============================================================================
--- Real-time flow cache tables
+-- Canonical option flow facts + legacy rollup cache tables
 -- =============================================================================
+CREATE TABLE IF NOT EXISTS flow_contract_facts (
+    timestamp TIMESTAMPTZ NOT NULL,
+    symbol VARCHAR(10) NOT NULL,
+    option_symbol VARCHAR(50) NOT NULL,
+    strike NUMERIC(12, 4) NOT NULL,
+    expiration DATE NOT NULL,
+    option_type CHAR(1) NOT NULL CHECK (option_type IN ('C', 'P')),
+    volume_delta BIGINT NOT NULL,
+    premium_delta NUMERIC(18, 2) NOT NULL,
+    signed_volume BIGINT NOT NULL,
+    signed_premium NUMERIC(18, 2) NOT NULL,
+    buy_volume BIGINT NOT NULL DEFAULT 0,
+    sell_volume BIGINT NOT NULL DEFAULT 0,
+    buy_premium NUMERIC(18, 2) NOT NULL DEFAULT 0,
+    sell_premium NUMERIC(18, 2) NOT NULL DEFAULT 0,
+    implied_volatility NUMERIC(10, 6),
+    delta NUMERIC(10, 6),
+    underlying_price NUMERIC(12, 4),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (timestamp, symbol, option_symbol)
+);
+
+CREATE INDEX IF NOT EXISTS idx_flow_contract_facts_symbol_ts
+    ON flow_contract_facts(symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_flow_contract_facts_symbol_ts_strike
+    ON flow_contract_facts(symbol, timestamp DESC, strike);
+CREATE INDEX IF NOT EXISTS idx_flow_contract_facts_symbol_ts_exp
+    ON flow_contract_facts(symbol, timestamp DESC, expiration);
+CREATE INDEX IF NOT EXISTS idx_flow_contract_facts_symbol_ts_type
+    ON flow_contract_facts(symbol, timestamp DESC, option_type);
+
 CREATE TABLE IF NOT EXISTS flow_by_type (
     timestamp TIMESTAMPTZ NOT NULL,
     symbol VARCHAR(10) NOT NULL,

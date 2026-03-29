@@ -42,6 +42,7 @@ ZeroGEX is a sophisticated options trading platform that calculates real-time ga
 - **Robust Error Handling** - Exponential backoff retry logic for API failures
 - **Data Validation** - Comprehensive validation of all API responses
 - **Database Storage** - PostgreSQL/TimescaleDB with proper timezone handling
+- **Canonical Flow Facts** - Single per-contract flow fact table with derived strike/type/expiration aggregations
 - **Memory Management** - Automatic cleanup of expired strikes to prevent memory leaks
 - **Graceful Shutdown** - Proper buffer flushing and connection cleanup on shutdown
 - **Real-time Analytics Engine** - Calculates real-time gamma exposure, max pain, and second order Greeks
@@ -127,7 +128,7 @@ Views (calculate deltas with LAG() functions)
 ## Prerequisites
 
 ### Required
-- **Python 3.8+** (tested on 3.10)
+- **Python 3.10+**
 - **PostgreSQL 12+** (for data persistence)
 - **TradeStation API Account** - [Sign up here](https://api.tradestation.com/docs/)
   - Client ID
@@ -238,6 +239,10 @@ DB_PORT=5432
 DB_NAME=zerogex
 DB_USER=postgres
 
+# API CORS (comma-separated; use explicit origins in production)
+# Example: CORS_ALLOW_ORIGINS=https://app.example.com,https://staging.example.com
+CORS_ALLOW_ORIGINS=*
+
 # For local development
 DB_PASSWORD_PROVIDER=env
 DB_PASSWORD=your_password_here
@@ -258,6 +263,25 @@ IV_CALCULATION_ENABLED=true
 # IV solver parameters
 IV_MAX_ITERATIONS=100      # Max Newton-Raphson iterations
 IV_TOLERANCE=0.00001       # Convergence tolerance
+
+# Signal calibration knobs (optional; defaults in code)
+SIGNAL_AUTO_TUNE_ENABLED=true
+SIGNAL_AUTO_TUNE_LOOKBACK_DAYS=20
+SIGNAL_SMART_MONEY_DOMINANCE_RATIO=1.2
+SIGNAL_VWAP_DEV_BULL_THRESHOLD_PCT=0.2
+SIGNAL_VWAP_DEV_BEAR_THRESHOLD_PCT=-0.2
+SIGNAL_PCR_BULLISH_THRESHOLD=0.7
+SIGNAL_PCR_BEARISH_THRESHOLD=1.3
+
+# Volatility expansion calibration knobs (optional)
+VOL_AUTO_TUNE_ENABLED=true
+VOL_AUTO_TUNE_LOOKBACK_DAYS=30
+VOL_SMART_MONEY_DOMINANCE_RATIO=1.2
+VOL_GAMMA_DEEP_NEGATIVE=-5000000000
+VOL_GAMMA_NEGATIVE=-3000000000
+VOL_GAMMA_FLIP_NEAR_PCT=0.003
+VOL_PCR_HIGH=1.8
+VOL_PCR_LOW=0.4
 IV_MIN=0.01                # Minimum IV (1%)
 IV_MAX=5.0                 # Maximum IV (500%)
 

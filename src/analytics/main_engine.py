@@ -384,17 +384,20 @@ class AnalyticsEngine:
         gex_results = []
 
         for (strike, expiration), data in strike_data.items():
-            # Calculate call GEX (positive for dealers)
-            call_gamma = sum(opt['gamma'] for opt in data['calls'])
+            # Aggregate gamma by contract with OI weighting.
+            # Note: there is typically one call/put contract per strike+expiration,
+            # but we still compute this as a true weighted sum so the math remains
+            # correct if upstream snapshots ever include multiple rows.
+            call_gamma = sum(opt['gamma'] * opt['open_interest'] for opt in data['calls'])
             call_oi = sum(opt['open_interest'] for opt in data['calls'])
             call_volume = sum(opt['volume'] for opt in data['calls'])
-            call_gex = call_gamma * call_oi * 100 * underlying_price
+            call_gex = call_gamma * 100 * underlying_price
 
             # Calculate put GEX (negative for dealers)
-            put_gamma = sum(opt['gamma'] for opt in data['puts'])
+            put_gamma = sum(opt['gamma'] * opt['open_interest'] for opt in data['puts'])
             put_oi = sum(opt['open_interest'] for opt in data['puts'])
             put_volume = sum(opt['volume'] for opt in data['puts'])
-            put_gex = -1 * put_gamma * put_oi * 100 * underlying_price
+            put_gex = -1 * put_gamma * 100 * underlying_price
 
             # Total gamma (absolute)
             total_gamma = call_gamma + put_gamma
@@ -455,10 +458,12 @@ class AnalyticsEngine:
         strike_range: Optional[Tuple[float, float]] = None
     ) -> float:
         """
-        Calculate Max Pain - the strike where option holders lose most money
+        Calculate Max Pain as the strike that minimizes total intrinsic payout.
 
-        Max Pain is the strike price where the total value of outstanding
-        options (calls + puts) is minimized.
+        Convention used here:
+        - We compute intrinsic payout to option holders at each candidate strike.
+        - "Max pain" is the strike where this aggregate payout is lowest
+          (i.e., minimum liability for option writers).
 
         Args:
             options: List of option data
@@ -476,11 +481,11 @@ class AnalyticsEngine:
         if not strikes:
             return 0.0
 
-        # Calculate total loss at each strike
-        strike_losses = {}
+        # Calculate total intrinsic payout at each candidate settlement strike.
+        strike_payouts = {}
 
         for test_strike in strikes:
-            total_loss = 0.0
+            total_payout = 0.0
 
             for opt in options:
                 if opt['open_interest'] == 0:
@@ -490,22 +495,20 @@ class AnalyticsEngine:
                 oi = opt['open_interest']
 
                 if opt['option_type'] == 'C':
-                    # Call holders lose if underlying < strike
-                    # Call holders gain: max(0, underlying - strike)
+                    # Call intrinsic payoff at settlement: max(0, S - K)
                     if test_strike > strike:
-                        total_loss += (test_strike - strike) * oi * 100
+                        total_payout += (test_strike - strike) * oi * 100
                 else:  # Put
-                    # Put holders lose if underlying > strike
-                    # Put holders gain: max(0, strike - underlying)
+                    # Put intrinsic payoff at settlement: max(0, K - S)
                     if test_strike < strike:
-                        total_loss += (strike - test_strike) * oi * 100
+                        total_payout += (strike - test_strike) * oi * 100
 
-            strike_losses[test_strike] = total_loss
+            strike_payouts[test_strike] = total_payout
 
-        # Max pain is where total loss is minimized
-        if not strike_losses:
+        # Max pain is where aggregate payout to holders is minimized
+        if not strike_payouts:
             return 0.0
-        max_pain_strike = min(strike_losses.items(), key=lambda x: x[1])[0]
+        max_pain_strike = min(strike_payouts.items(), key=lambda x: x[1])[0]
 
         return max_pain_strike
 

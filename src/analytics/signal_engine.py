@@ -18,6 +18,7 @@ Responsibilities
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, date, timedelta
 from typing import Optional
@@ -80,6 +81,13 @@ STRIKE_GUIDANCE: dict[str, dict[str, str]] = {
         "bear_debit":  "ATM / ATM - 1.5%",
     },
 }
+
+# Calibration knobs (env-overridable) so thresholds can be tuned by symbol/regime.
+SMART_MONEY_DOMINANCE_RATIO = float(os.getenv("SIGNAL_SMART_MONEY_DOMINANCE_RATIO", "1.2"))
+VWAP_DEV_BULL_THRESHOLD = float(os.getenv("SIGNAL_VWAP_DEV_BULL_THRESHOLD_PCT", "0.2"))
+VWAP_DEV_BEAR_THRESHOLD = float(os.getenv("SIGNAL_VWAP_DEV_BEAR_THRESHOLD_PCT", "-0.2"))
+PCR_BULLISH_THRESHOLD = float(os.getenv("SIGNAL_PCR_BULLISH_THRESHOLD", "0.7"))
+PCR_BEARISH_THRESHOLD = float(os.getenv("SIGNAL_PCR_BEARISH_THRESHOLD", "1.3"))
 
 
 # ---------------------------------------------------------------------------
@@ -188,9 +196,9 @@ def _orb_direction(orb_status: str) -> Optional[str]:
 
 
 def _sm_direction(call_prem: float, put_prem: float) -> str:
-    if call_prem > put_prem * 1.2:
+    if call_prem > put_prem * SMART_MONEY_DOMINANCE_RATIO:
         return "bullish"
-    if put_prem > call_prem * 1.2:
+    if put_prem > call_prem * SMART_MONEY_DOMINANCE_RATIO:
         return "bearish"
     return "neutral"
 
@@ -282,10 +290,10 @@ def _score_components(ctx: SignalContext, tf: str) -> tuple[int, list[SignalComp
 
     # 3. Smart Money Flow
     diff = ctx.smart_call_premium - ctx.smart_put_premium
-    if ctx.smart_call_premium > ctx.smart_put_premium * 1.2:
+    if ctx.smart_call_premium > ctx.smart_put_premium * SMART_MONEY_DOMINANCE_RATIO:
         sm_raw, sm_desc = 1, (f"Call sweeps dominate "
             f"(${ctx.smart_call_premium:,.0f} vs ${ctx.smart_put_premium:,.0f} put).")
-    elif ctx.smart_put_premium > ctx.smart_call_premium * 1.2:
+    elif ctx.smart_put_premium > ctx.smart_call_premium * SMART_MONEY_DOMINANCE_RATIO:
         sm_raw, sm_desc = -1, (f"Put sweeps dominate "
             f"(${ctx.smart_put_premium:,.0f} vs ${ctx.smart_call_premium:,.0f} call).")
     else:
@@ -295,7 +303,7 @@ def _score_components(ctx: SignalContext, tf: str) -> tuple[int, list[SignalComp
     # 4. VWAP Position
     vd = ctx.vwap_deviation_pct
     add("VWAP Position", "vwap_position",
-        1 if vd > 0.2 else (-1 if vd < -0.2 else 0),
+        1 if vd > VWAP_DEV_BULL_THRESHOLD else (-1 if vd < VWAP_DEV_BEAR_THRESHOLD else 0),
         f"Price is {vd:+.2f}% {'above' if vd > 0 else 'below'} VWAP."
         if SIGNAL_WEIGHTS["vwap_position"][tf] > 0
         else "Not applicable for multi-day timeframe.",
@@ -314,9 +322,9 @@ def _score_components(ctx: SignalContext, tf: str) -> tuple[int, list[SignalComp
     # 6. Put/Call Ratio
     pcr = ctx.put_call_ratio or 1.0
     add("Put/Call Ratio", "put_call_ratio",
-        1 if pcr < 0.7 else (-1 if pcr > 1.3 else 0),
+        1 if pcr < PCR_BULLISH_THRESHOLD else (-1 if pcr > PCR_BEARISH_THRESHOLD else 0),
         f"P/C ratio: {pcr:.2f} "
-        f"({'call-heavy/bullish' if pcr < 0.7 else 'put-heavy/bearish' if pcr > 1.3 else 'neutral'}).",
+        f"({'call-heavy/bullish' if pcr < PCR_BULLISH_THRESHOLD else 'put-heavy/bearish' if pcr > PCR_BEARISH_THRESHOLD else 'neutral'}).",
         round(pcr, 3))
 
     # 7. Unusual Volume
@@ -380,6 +388,94 @@ class SignalEngine:
         self.underlying = underlying.upper()
         self.db_symbol = get_canonical_symbol(self.underlying)  # canonical alias for DB queries (e.g. "SPX")
         self._last_accuracy_update: Optional[date] = None
+        self.auto_tune_enabled = os.getenv("SIGNAL_AUTO_TUNE_ENABLED", "true").lower() == "true"
+        self.auto_tune_lookback_days = max(5, int(os.getenv("SIGNAL_AUTO_TUNE_LOOKBACK_DAYS", "20")))
+        self._defaults = {
+            "sm_ratio": SMART_MONEY_DOMINANCE_RATIO,
+            "vwap_bull": VWAP_DEV_BULL_THRESHOLD,
+            "vwap_bear": VWAP_DEV_BEAR_THRESHOLD,
+            "pcr_bull": PCR_BULLISH_THRESHOLD,
+            "pcr_bear": PCR_BEARISH_THRESHOLD,
+        }
+
+    def _auto_tune_thresholds(self) -> None:
+        """Blend defaults with recent distribution stats for regime-adaptive thresholds."""
+        global SMART_MONEY_DOMINANCE_RATIO
+        global VWAP_DEV_BULL_THRESHOLD
+        global VWAP_DEV_BEAR_THRESHOLD
+        global PCR_BULLISH_THRESHOLD
+        global PCR_BEARISH_THRESHOLD
+
+        if not self.auto_tune_enabled:
+            return
+
+        try:
+            with db_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT
+                        PERCENTILE_CONT(0.3) WITHIN GROUP (ORDER BY put_call_ratio) AS pcr_bull,
+                        PERCENTILE_CONT(0.7) WITHIN GROUP (ORDER BY put_call_ratio) AS pcr_bear
+                    FROM gex_summary
+                    WHERE underlying = %s
+                      AND timestamp >= NOW() - (%s * INTERVAL '1 day')
+                      AND put_call_ratio IS NOT NULL
+                    """,
+                    (self.db_symbol, self.auto_tune_lookback_days),
+                )
+                row = cur.fetchone() or (None, None)
+                pcr_bull = float(row[0]) if row[0] is not None else self._defaults["pcr_bull"]
+                pcr_bear = float(row[1]) if row[1] is not None else self._defaults["pcr_bear"]
+
+                cur.execute(
+                    """
+                    SELECT
+                        PERCENTILE_CONT(0.7) WITHIN GROUP (ORDER BY vwap_deviation_pct) FILTER (WHERE vwap_deviation_pct > 0) AS bull_dev,
+                        PERCENTILE_CONT(0.3) WITHIN GROUP (ORDER BY vwap_deviation_pct) FILTER (WHERE vwap_deviation_pct < 0) AS bear_dev
+                    FROM underlying_vwap_deviation
+                    WHERE symbol = %s
+                      AND timestamp >= NOW() - (%s * INTERVAL '1 day')
+                    """,
+                    (self.db_symbol, self.auto_tune_lookback_days),
+                )
+                row = cur.fetchone() or (None, None)
+                vwap_bull = float(row[0]) if row[0] is not None else self._defaults["vwap_bull"]
+                vwap_bear = float(row[1]) if row[1] is not None else self._defaults["vwap_bear"]
+
+                cur.execute(
+                    """
+                    WITH sm AS (
+                        SELECT
+                            timestamp,
+                            SUM(CASE WHEN option_type='C' THEN total_premium ELSE 0 END)::float AS call_p,
+                            SUM(CASE WHEN option_type='P' THEN total_premium ELSE 0 END)::float AS put_p
+                        FROM flow_smart_money
+                        WHERE symbol = %s
+                          AND timestamp >= NOW() - (%s * INTERVAL '1 day')
+                        GROUP BY timestamp
+                    )
+                    SELECT
+                        PERCENTILE_CONT(0.6) WITHIN GROUP (
+                            ORDER BY GREATEST(call_p, put_p) / NULLIF(LEAST(call_p, put_p), 0)
+                        )
+                    FROM sm
+                    WHERE call_p > 0 AND put_p > 0
+                    """,
+                    (self.db_symbol, self.auto_tune_lookback_days),
+                )
+                row = cur.fetchone()
+                sm_ratio = float(row[0]) if row and row[0] is not None else self._defaults["sm_ratio"]
+
+            alpha = 0.20
+            SMART_MONEY_DOMINANCE_RATIO = max(1.05, min(1.80, (1 - alpha) * self._defaults["sm_ratio"] + alpha * sm_ratio))
+            VWAP_DEV_BULL_THRESHOLD = max(0.05, min(1.00, (1 - alpha) * self._defaults["vwap_bull"] + alpha * vwap_bull))
+            VWAP_DEV_BEAR_THRESHOLD = min(-0.05, max(-1.00, (1 - alpha) * self._defaults["vwap_bear"] + alpha * vwap_bear))
+            PCR_BULLISH_THRESHOLD = max(0.40, min(1.00, (1 - alpha) * self._defaults["pcr_bull"] + alpha * pcr_bull))
+            PCR_BEARISH_THRESHOLD = max(1.00, min(2.20, (1 - alpha) * self._defaults["pcr_bear"] + alpha * pcr_bear))
+
+        except Exception as e:
+            logger.error(f"SignalEngine auto-tune failed: {e}")
 
     # ------------------------------------------------------------------
     # DB reads — all use the synchronous db_connection() context manager
@@ -751,6 +847,7 @@ class SignalEngine:
         if ctx is None:
             logger.warning("SignalEngine: no context available, skipping")
             return False
+        self._auto_tune_thresholds()
 
         stored = 0
         for tf in ("intraday", "swing", "multi_day"):

@@ -7,6 +7,7 @@ inputs around one question: when is the market most vulnerable to a 0.5%+ move?
 
 import argparse
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Optional
@@ -38,6 +39,14 @@ MOVE_PROBABILITY_DEFAULTS = {
     "medium": 0.58,
     "low": 0.44,
 }
+
+# Env-overridable calibration knobs for regime tuning.
+VOL_SMART_MONEY_DOMINANCE_RATIO = float(os.getenv("VOL_SMART_MONEY_DOMINANCE_RATIO", "1.2"))
+VOL_GAMMA_DEEP_NEGATIVE = float(os.getenv("VOL_GAMMA_DEEP_NEGATIVE", "-5000000000"))
+VOL_GAMMA_NEGATIVE = float(os.getenv("VOL_GAMMA_NEGATIVE", "-3000000000"))
+VOL_GAMMA_FLIP_NEAR_PCT = float(os.getenv("VOL_GAMMA_FLIP_NEAR_PCT", "0.003"))
+VOL_PCR_HIGH = float(os.getenv("VOL_PCR_HIGH", "1.8"))
+VOL_PCR_LOW = float(os.getenv("VOL_PCR_LOW", "0.4"))
 
 
 @dataclass
@@ -114,6 +123,87 @@ class VolExpansionEngine:
         self.underlying = underlying.upper()
         self.db_symbol = get_canonical_symbol(self.underlying)
         self._last_accuracy_update: Optional[date] = None
+        self.auto_tune_enabled = os.getenv("VOL_AUTO_TUNE_ENABLED", "true").lower() == "true"
+        self.auto_tune_lookback_days = max(5, int(os.getenv("VOL_AUTO_TUNE_LOOKBACK_DAYS", "30")))
+        self._defaults = {
+            "sm_ratio": VOL_SMART_MONEY_DOMINANCE_RATIO,
+            "deep_neg_gex": VOL_GAMMA_DEEP_NEGATIVE,
+            "neg_gex": VOL_GAMMA_NEGATIVE,
+            "flip_near": VOL_GAMMA_FLIP_NEAR_PCT,
+            "pcr_high": VOL_PCR_HIGH,
+            "pcr_low": VOL_PCR_LOW,
+        }
+
+    def _auto_tune_thresholds(self) -> None:
+        """Adapt vol thresholds from recent regime distributions while anchoring to defaults."""
+        global VOL_SMART_MONEY_DOMINANCE_RATIO
+        global VOL_GAMMA_DEEP_NEGATIVE
+        global VOL_GAMMA_NEGATIVE
+        global VOL_GAMMA_FLIP_NEAR_PCT
+        global VOL_PCR_HIGH
+        global VOL_PCR_LOW
+
+        if not self.auto_tune_enabled:
+            return
+
+        try:
+            with db_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT
+                        PERCENTILE_CONT(0.15) WITHIN GROUP (ORDER BY total_net_gex) AS deep_neg,
+                        PERCENTILE_CONT(0.30) WITHIN GROUP (ORDER BY total_net_gex) AS neg_gex,
+                        PERCENTILE_CONT(0.8) WITHIN GROUP (ORDER BY put_call_ratio) AS pcr_hi,
+                        PERCENTILE_CONT(0.2) WITHIN GROUP (ORDER BY put_call_ratio) AS pcr_lo
+                    FROM gex_summary
+                    WHERE underlying = %s
+                      AND timestamp >= NOW() - (%s * INTERVAL '1 day')
+                    """,
+                    (self.db_symbol, self.auto_tune_lookback_days),
+                )
+                row = cur.fetchone() or (None, None, None, None)
+                deep_neg = float(row[0]) if row[0] is not None else self._defaults["deep_neg_gex"]
+                neg_gex = float(row[1]) if row[1] is not None else self._defaults["neg_gex"]
+                pcr_hi = float(row[2]) if row[2] is not None else self._defaults["pcr_high"]
+                pcr_lo = float(row[3]) if row[3] is not None else self._defaults["pcr_low"]
+
+                cur.execute(
+                    """
+                    WITH joined AS (
+                        SELECT
+                            gs.timestamp,
+                            ABS((uq.close - gs.gamma_flip_point) / NULLIF(gs.gamma_flip_point, 0)) AS flip_dist
+                        FROM gex_summary gs
+                        JOIN LATERAL (
+                            SELECT close
+                            FROM underlying_quotes uq
+                            WHERE uq.symbol = gs.underlying
+                              AND uq.timestamp <= gs.timestamp
+                            ORDER BY uq.timestamp DESC
+                            LIMIT 1
+                        ) uq ON TRUE
+                        WHERE gs.underlying = %s
+                          AND gs.gamma_flip_point IS NOT NULL
+                          AND gs.timestamp >= NOW() - (%s * INTERVAL '1 day')
+                    )
+                    SELECT PERCENTILE_CONT(0.2) WITHIN GROUP (ORDER BY flip_dist) FROM joined
+                    """,
+                    (self.db_symbol, self.auto_tune_lookback_days),
+                )
+                row = cur.fetchone()
+                flip_near = float(row[0]) if row and row[0] is not None else self._defaults["flip_near"]
+
+            alpha = 0.20
+            VOL_GAMMA_DEEP_NEGATIVE = (1 - alpha) * self._defaults["deep_neg_gex"] + alpha * min(deep_neg, -1e9)
+            VOL_GAMMA_NEGATIVE = (1 - alpha) * self._defaults["neg_gex"] + alpha * min(neg_gex, -5e8)
+            VOL_GAMMA_FLIP_NEAR_PCT = max(0.001, min(0.01, (1 - alpha) * self._defaults["flip_near"] + alpha * flip_near))
+            VOL_PCR_HIGH = max(1.10, min(2.50, (1 - alpha) * self._defaults["pcr_high"] + alpha * pcr_hi))
+            VOL_PCR_LOW = max(0.20, min(0.90, (1 - alpha) * self._defaults["pcr_low"] + alpha * pcr_lo))
+            VOL_SMART_MONEY_DOMINANCE_RATIO = self._defaults["sm_ratio"]
+
+        except Exception as exc:
+            logger.error("VolExpansionEngine auto-tune failed: %s", exc)
 
     def _fetch_context(self, as_of: Optional[datetime] = None) -> Optional[VolExpansionContext]:
         try:
@@ -342,9 +432,9 @@ class VolExpansionEngine:
 
     @staticmethod
     def _smart_money_direction(call_premium: float, put_premium: float) -> str:
-        if call_premium > put_premium * 1.2:
+        if call_premium > put_premium * VOL_SMART_MONEY_DOMINANCE_RATIO:
             return "up"
-        if put_premium > call_premium * 1.2:
+        if put_premium > call_premium * VOL_SMART_MONEY_DOMINANCE_RATIO:
             return "down"
         return "neutral"
 
@@ -352,15 +442,15 @@ class VolExpansionEngine:
         if not ctx.gamma_flip:
             return 0, "No gamma flip available.", None
         distance = abs(ctx.current_price - ctx.gamma_flip) / ctx.gamma_flip
-        if distance < 0.003:
-            if ctx.net_gex < -5e9:
+        if distance < VOL_GAMMA_FLIP_NEAR_PCT:
+            if ctx.net_gex < VOL_GAMMA_DEEP_NEGATIVE:
                 return 10, "Price is sitting on the gamma flip with deeply negative GEX.", distance
             if ctx.net_gex < 0:
                 return 7, "Price is near the gamma flip in a short-gamma regime.", distance
             return -3, "Price is near the flip but positive GEX should damp volatility.", distance
-        if ctx.current_price < ctx.gamma_flip and ctx.net_gex < -3e9:
+        if ctx.current_price < ctx.gamma_flip and ctx.net_gex < VOL_GAMMA_NEGATIVE:
             return -5, "Below gamma flip with negative GEX increases downside chase risk.", distance
-        if ctx.current_price > ctx.gamma_flip and ctx.net_gex < -3e9:
+        if ctx.current_price > ctx.gamma_flip and ctx.net_gex < VOL_GAMMA_NEGATIVE:
             return 5, "Above gamma flip with negative GEX increases upside squeeze risk.", distance
         return 0, "Gamma regime is not near an unstable transition.", distance
 
@@ -417,9 +507,9 @@ class VolExpansionEngine:
 
     def _score_put_call_extreme(self, ctx: VolExpansionContext) -> tuple[int, str, float]:
         pcr = ctx.put_call_ratio or 1.0
-        if pcr > 1.8:
+        if pcr > VOL_PCR_HIGH:
             raw = 5
-        elif pcr < 0.4:
+        elif pcr < VOL_PCR_LOW:
             raw = -5
         else:
             raw = 0
@@ -797,6 +887,7 @@ class VolExpansionEngine:
             logger.error("VolExpansionEngine._update_accuracy failed: %s", exc, exc_info=True)
 
     def run_calculation(self) -> bool:
+        self._auto_tune_thresholds()
         ctx = self._fetch_context()
         if ctx is None:
             logger.warning("VolExpansionEngine: no context available, skipping")

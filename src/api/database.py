@@ -218,6 +218,107 @@ class DatabaseManager:
             latest_ts,
         )
 
+        # Canonical per-contract fact table used as the source of truth for flow APIs.
+        await conn.execute(
+            """
+            WITH latest_rows AS (
+                SELECT oc.*
+                FROM option_chains oc
+                WHERE oc.underlying = $1
+                  AND oc.timestamp = $2
+            ),
+            with_prev AS (
+                SELECT
+                    l.timestamp,
+                    l.underlying AS symbol,
+                    l.option_symbol,
+                    l.strike,
+                    l.expiration,
+                    l.option_type,
+                    COALESCE(l.last, l.mid, (COALESCE(l.bid, 0) + COALESCE(l.ask, 0)) / 2.0, 0) AS trade_price,
+                    l.implied_volatility,
+                    l.delta,
+                    CASE
+                        WHEN p.prev_volume IS NULL THEN COALESCE(l.volume, 0)
+                        WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
+                            = (l.timestamp AT TIME ZONE 'America/New_York')::date
+                            THEN GREATEST(COALESCE(l.volume, 0) - COALESCE(p.prev_volume, 0), 0)
+                        ELSE COALESCE(l.volume, 0)
+                    END::bigint AS volume_delta,
+                    CASE
+                        WHEN p.prev_ask_vol IS NULL THEN COALESCE(l.ask_volume, 0)
+                        WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
+                            = (l.timestamp AT TIME ZONE 'America/New_York')::date
+                            THEN GREATEST(COALESCE(l.ask_volume, 0) - COALESCE(p.prev_ask_vol, 0), 0)
+                        ELSE COALESCE(l.ask_volume, 0)
+                    END::bigint AS ask_vol_delta,
+                    CASE
+                        WHEN p.prev_bid_vol IS NULL THEN COALESCE(l.bid_volume, 0)
+                        WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
+                            = (l.timestamp AT TIME ZONE 'America/New_York')::date
+                            THEN GREATEST(COALESCE(l.bid_volume, 0) - COALESCE(p.prev_bid_vol, 0), 0)
+                        ELSE COALESCE(l.bid_volume, 0)
+                    END::bigint AS bid_vol_delta
+                FROM latest_rows l
+                LEFT JOIN LATERAL (
+                    SELECT
+                        oc2.timestamp AS prev_ts,
+                        oc2.volume AS prev_volume,
+                        oc2.ask_volume AS prev_ask_vol,
+                        oc2.bid_volume AS prev_bid_vol
+                    FROM option_chains oc2
+                    WHERE oc2.option_symbol = l.option_symbol
+                      AND oc2.timestamp < l.timestamp
+                    ORDER BY oc2.timestamp DESC
+                    LIMIT 1
+                ) p ON TRUE
+            )
+            INSERT INTO flow_contract_facts (
+                timestamp, symbol, option_symbol, strike, expiration, option_type,
+                volume_delta, premium_delta, signed_volume, signed_premium,
+                buy_volume, sell_volume, buy_premium, sell_premium,
+                implied_volatility, delta, underlying_price
+            )
+            SELECT
+                timestamp,
+                symbol,
+                option_symbol,
+                strike,
+                expiration,
+                option_type,
+                volume_delta,
+                (volume_delta * trade_price * 100)::numeric AS premium_delta,
+                (CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::bigint AS signed_volume,
+                (CASE WHEN option_type = 'C' THEN 1 ELSE -1 END * volume_delta * trade_price * 100)::numeric AS signed_premium,
+                ask_vol_delta,
+                bid_vol_delta,
+                (ask_vol_delta * trade_price * 100)::numeric,
+                (bid_vol_delta * trade_price * 100)::numeric,
+                implied_volatility,
+                delta,
+                $3::numeric
+            FROM with_prev
+            WHERE volume_delta > 0
+            ON CONFLICT (timestamp, symbol, option_symbol)
+            DO UPDATE SET
+                volume_delta = EXCLUDED.volume_delta,
+                premium_delta = EXCLUDED.premium_delta,
+                signed_volume = EXCLUDED.signed_volume,
+                signed_premium = EXCLUDED.signed_premium,
+                buy_volume = EXCLUDED.buy_volume,
+                sell_volume = EXCLUDED.sell_volume,
+                buy_premium = EXCLUDED.buy_premium,
+                sell_premium = EXCLUDED.sell_premium,
+                implied_volatility = EXCLUDED.implied_volatility,
+                delta = EXCLUDED.delta,
+                underlying_price = EXCLUDED.underlying_price,
+                updated_at = NOW()
+            """,
+            symbol,
+            latest_ts,
+            underlying_price,
+        )
+
         # One-time bootstrap for the new expiration cache table so endpoint
         # can serve historical buckets immediately after deployment.
         expiration_seeded = await conn.fetchval(
@@ -1162,28 +1263,23 @@ class DatabaseManager:
         symbol: str = 'SPY',
         session: str = 'current'
     ) -> List[Dict[str, Any]]:
-        """Get option flow by type from flow_by_type (1-min intervals)."""
+        """Get option flow by type from canonical flow_contract_facts."""
         session_start, session_end = _get_session_bounds(session)
         query = """
             WITH aggregated AS (
                 SELECT
                     timestamp,
                     symbol,
-                    MAX(CASE WHEN option_type = 'C' THEN total_volume END) AS call_volume,
-                    MAX(CASE WHEN option_type = 'C' THEN total_premium END) AS call_premium,
-                    MAX(CASE WHEN option_type = 'P' THEN total_volume END) AS put_volume,
-                    MAX(CASE WHEN option_type = 'P' THEN total_premium END) AS put_premium,
-                    -- Lee-Ready buy/sell breakdown per type
-                    MAX(CASE WHEN option_type = 'C' THEN buy_premium END) AS call_buy_premium,
-                    MAX(CASE WHEN option_type = 'C' THEN sell_premium END) AS call_sell_premium,
-                    MAX(CASE WHEN option_type = 'P' THEN buy_premium END) AS put_buy_premium,
-                    MAX(CASE WHEN option_type = 'P' THEN sell_premium END) AS put_sell_premium,
-                    MAX(CASE WHEN option_type = 'C' THEN buy_volume END) AS call_buy_volume,
-                    MAX(CASE WHEN option_type = 'C' THEN sell_volume END) AS call_sell_volume,
-                    MAX(CASE WHEN option_type = 'P' THEN buy_volume END) AS put_buy_volume,
-                    MAX(CASE WHEN option_type = 'P' THEN sell_volume END) AS put_sell_volume,
+                    SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE 0 END) AS call_volume,
+                    SUM(CASE WHEN option_type = 'C' THEN premium_delta ELSE 0 END) AS call_premium,
+                    SUM(CASE WHEN option_type = 'P' THEN volume_delta ELSE 0 END) AS put_volume,
+                    SUM(CASE WHEN option_type = 'P' THEN premium_delta ELSE 0 END) AS put_premium,
+                    SUM(CASE WHEN option_type = 'C' THEN buy_premium ELSE 0 END) AS call_buy_premium,
+                    SUM(CASE WHEN option_type = 'C' THEN sell_premium ELSE 0 END) AS call_sell_premium,
+                    SUM(CASE WHEN option_type = 'P' THEN buy_premium ELSE 0 END) AS put_buy_premium,
+                    SUM(CASE WHEN option_type = 'P' THEN sell_premium ELSE 0 END) AS put_sell_premium,
                     MAX(underlying_price) AS underlying_price
-                FROM flow_by_type
+                FROM flow_contract_facts
                 WHERE symbol = $1
                   AND timestamp >= $2
                   AND timestamp <= $3
@@ -1248,29 +1344,41 @@ class DatabaseManager:
         session: str = 'current',
         limit: int = 20
     ) -> List[Dict[str, Any]]:
-        """Get option flow by strike from flow_by_strike (1-min intervals)."""
+        """Get option flow by strike from canonical flow_contract_facts."""
         session_start, session_end = _get_session_bounds(session)
         query = """
+            WITH agg AS (
             SELECT
                 timestamp,
                 symbol,
                 strike,
-                total_volume AS volume,
-                total_premium AS premium,
-                net_delta::bigint AS net_volume,
-                (COALESCE(buy_premium, 0) - COALESCE(sell_premium, 0))::numeric AS net_premium,
-                CASE
-                    WHEN net_delta > 100 THEN '🟢 Strong Calls'
-                    WHEN net_delta > 0 THEN '✅ Calls'
-                    WHEN net_delta < -100 THEN '🔴 Strong Puts'
-                    WHEN net_delta < 0 THEN '❌ Puts'
-                    ELSE '⚪ Neutral'
-                END AS flow_bias,
-                underlying_price
-            FROM flow_by_strike
+                SUM(volume_delta)::bigint AS volume,
+                SUM(premium_delta)::numeric AS premium,
+                SUM(signed_volume)::bigint AS net_volume,
+                SUM(signed_premium)::numeric AS net_premium,
+                MAX(underlying_price) AS underlying_price
+            FROM flow_contract_facts
             WHERE symbol = $1
               AND timestamp >= $2
               AND timestamp <= $3
+            GROUP BY timestamp, symbol, strike
+            )
+            SELECT
+                timestamp,
+                symbol,
+                strike,
+                volume,
+                premium,
+                net_volume,
+                net_premium,
+                CASE
+                    WHEN net_volume > 100 THEN '🟢 Strong Calls'
+                    WHEN net_volume > 0 THEN '✅ Calls'
+                    WHEN net_volume < -100 THEN '🔴 Strong Puts'
+                    WHEN net_volume < 0 THEN '❌ Puts'
+                    ELSE '⚪ Neutral'
+                END AS flow_bias,
+                underlying_price
             ORDER BY timestamp DESC, strike
             LIMIT $4
         """
@@ -1290,44 +1398,44 @@ class DatabaseManager:
         session: str = 'current',
         limit: int = 20
     ) -> List[Dict[str, Any]]:
-        """Get option flow by expiration from flow_by_expiration (1-min intervals)."""
+        """Get option flow by expiration from canonical flow_contract_facts."""
         session_start, session_end = _get_session_bounds(session)
         query = """
-            SELECT
-                e.timestamp,
-                e.symbol,
-                e.expiration,
-                (e.expiration - CURRENT_DATE)::int AS dte,
-                e.total_volume AS volume,
-                e.total_premium AS premium,
-                (COALESCE(t.call_vol, 0) - COALESCE(t.put_vol, 0))::bigint AS net_volume,
-                (COALESCE(t.call_prem, 0) - COALESCE(t.put_prem, 0))::numeric AS net_premium,
-                CASE
-                    WHEN (COALESCE(t.call_vol, 0) - COALESCE(t.put_vol, 0)) > 500 THEN '🟢 Strong Calls'
-                    WHEN (COALESCE(t.call_vol, 0) - COALESCE(t.put_vol, 0)) > 0 THEN '✅ Calls'
-                    WHEN (COALESCE(t.call_vol, 0) - COALESCE(t.put_vol, 0)) < -500 THEN '🔴 Strong Puts'
-                    WHEN (COALESCE(t.call_vol, 0) - COALESCE(t.put_vol, 0)) < 0 THEN '❌ Puts'
-                    ELSE '⚪ Neutral'
-                END AS flow_bias,
-                e.underlying_price
-            FROM flow_by_expiration e
-            LEFT JOIN (
+            WITH agg AS (
                 SELECT
-                    timestamp, symbol,
-                    MAX(CASE WHEN option_type = 'C' THEN total_volume END) AS call_vol,
-                    MAX(CASE WHEN option_type = 'P' THEN total_volume END) AS put_vol,
-                    MAX(CASE WHEN option_type = 'C' THEN total_premium END) AS call_prem,
-                    MAX(CASE WHEN option_type = 'P' THEN total_premium END) AS put_prem
-                FROM flow_by_type
+                    timestamp,
+                    symbol,
+                    expiration,
+                    SUM(volume_delta)::bigint AS volume,
+                    SUM(premium_delta)::numeric AS premium,
+                    SUM(signed_volume)::bigint AS net_volume,
+                    SUM(signed_premium)::numeric AS net_premium,
+                    MAX(underlying_price) AS underlying_price
+                FROM flow_contract_facts
                 WHERE symbol = $1
                   AND timestamp >= $2
                   AND timestamp <= $3
-                GROUP BY timestamp, symbol
-            ) t ON t.timestamp = e.timestamp AND t.symbol = e.symbol
-            WHERE e.symbol = $1
-              AND e.timestamp >= $2
-              AND e.timestamp <= $3
-            ORDER BY e.timestamp DESC, e.expiration
+                GROUP BY timestamp, symbol, expiration
+            )
+            SELECT
+                timestamp,
+                symbol,
+                expiration,
+                (expiration - CURRENT_DATE)::int AS dte,
+                volume,
+                premium,
+                net_volume,
+                net_premium,
+                CASE
+                    WHEN net_volume > 500 THEN '🟢 Strong Calls'
+                    WHEN net_volume > 0 THEN '✅ Calls'
+                    WHEN net_volume < -500 THEN '🔴 Strong Puts'
+                    WHEN net_volume < 0 THEN '❌ Puts'
+                    ELSE '⚪ Neutral'
+                END AS flow_bias,
+                underlying_price
+            FROM agg
+            ORDER BY timestamp DESC, expiration
             LIMIT $4
         """
 

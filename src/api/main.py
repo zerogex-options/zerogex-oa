@@ -47,6 +47,16 @@ logger = logging.getLogger(__name__)
 # Database manager
 db_manager: Optional[DatabaseManager] = None
 
+
+def _parse_cors_origins(raw_origins: Optional[str]) -> List[str]:
+    """Parse comma-separated origins from env var into a normalized list."""
+    if not raw_origins:
+        return ["*"]
+
+    origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+    return origins or ["*"]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
@@ -88,10 +98,17 @@ app = FastAPI(
 )
 
 # CORS middleware
+cors_origins = _parse_cors_origins(os.getenv("CORS_ALLOW_ORIGINS"))
+allow_credentials = "*" not in cors_origins
+if not allow_credentials:
+    logger.info(
+        "CORS_ALLOW_ORIGINS contains '*'; disabling allow_credentials for standards compliance."
+    )
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update with your frontend URL in production
-    allow_credentials=True,
+    allow_origins=cors_origins,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
