@@ -1219,8 +1219,8 @@ class DatabaseManager:
             ) q ON TRUE
             JOIN LATERAL (
                 SELECT
-                    COALESCE(SUM(gbs.call_gamma * gbs.call_oi * 100 * q.spot_price), 0)::numeric AS total_call_gex,
-                    COALESCE(SUM(-1 * gbs.put_gamma * gbs.put_oi * 100 * q.spot_price), 0)::numeric AS total_put_gex
+                    COALESCE(SUM(gbs.call_gamma * 100 * q.spot_price), 0)::numeric AS total_call_gex,
+                    COALESCE(SUM(-1 * gbs.put_gamma * 100 * q.spot_price), 0)::numeric AS total_put_gex
                 FROM gex_by_strike gbs
                 WHERE gbs.underlying = b.symbol
                   AND gbs.timestamp = b.timestamp
@@ -1230,7 +1230,7 @@ class DatabaseManager:
                 FROM gex_by_strike gbs
                 WHERE gbs.underlying = b.symbol
                   AND gbs.timestamp = b.timestamp
-                ORDER BY ABS(gbs.call_gamma * gbs.call_oi * 100 * q.spot_price) DESC, gbs.strike
+                ORDER BY ABS(gbs.call_gamma * 100 * q.spot_price) DESC, gbs.strike
                 LIMIT 1
             ) cw ON TRUE
             LEFT JOIN LATERAL (
@@ -1238,7 +1238,7 @@ class DatabaseManager:
                 FROM gex_by_strike gbs
                 WHERE gbs.underlying = b.symbol
                   AND gbs.timestamp = b.timestamp
-                ORDER BY ABS(-1 * gbs.put_gamma * gbs.put_oi * 100 * q.spot_price) DESC, gbs.strike
+                ORDER BY ABS(-1 * gbs.put_gamma * 100 * q.spot_price) DESC, gbs.strike
                 LIMIT 1
             ) pw ON TRUE
             ORDER BY timestamp DESC
