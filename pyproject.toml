@@ -83,7 +83,6 @@ Issues = "https://github.com/zerogex/zerogex-oa/issues"
 
 [project.scripts]
 zerogex-ingestion = "src.ingestion.main_engine:main"
-zerogex-backfill = "src.ingestion.backfill_manager:main"
 zerogex-stream = "src.ingestion.stream_manager:main"
 zerogex-test-api = "src.ingestion.tradestation_client:main"
 zerogex-test-greeks = "src.ingestion.greeks_calculator:main"

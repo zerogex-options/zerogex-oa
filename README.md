@@ -2,7 +2,7 @@
 
 **Real-time gamma exposure (GEX) calculations for options using TradeStation API integration.**
 
-ZeroGEX is a sophisticated options trading platform that calculates real-time gamma exposure for equity options, providing traders with critical market positioning data. The platform integrates with TradeStation's API for live market data and historical backfilling capabilities.
+ZeroGEX is a sophisticated options trading platform that calculates real-time gamma exposure for equity options, providing traders with critical market positioning data. The platform integrates with TradeStation's API for live market data.
 
 ---
 
@@ -16,7 +16,6 @@ ZeroGEX is a sophisticated options trading platform that calculates real-time ga
 - [Usage](#usage)
   - [Main Ingestion Engine](#main-ingestion-engine)
   - [TradeStation Client](#tradestation-client)
-  - [Backfill Manager](#backfill-manager)
   - [Stream Manager](#stream-manager)
   - [Greeks & IV Calculator](#greeks--iv-calculator)
 - [Database Schema](#database-schema)
@@ -34,7 +33,6 @@ ZeroGEX is a sophisticated options trading platform that calculates real-time ga
 
 ### ✅ Core Capabilities (Production Ready)
 - **Real-time Options Data Streaming** - Live underlying quotes and options chain data with intelligent polling
-- **Historical Data Backfilling** - Configurable lookback periods with automatic gap detection
 - **1-Minute Data Aggregation** - OHLC aggregation for underlying and last/bid/ask for options
 - **Implied Volatility Calculation** - Newton-Raphson solver calculates IV from option prices when API doesn't provide it
 - **Real-time Greeks Calculation** - Black-Scholes Greeks (Delta, Gamma, Theta, Vega) calculated for every option
@@ -82,10 +80,9 @@ ZeroGEX is a sophisticated options trading platform that calculates real-time ga
 ZeroGEX Platform
 ├── Data Ingestion Layer
 │   ├── TradeStation API Client (with retry logic)
-│   ├── Backfill Manager (fetches historical data)
 │   └── Stream Manager (fetches real-time data)
 ├── Main Ingestion Engine
-│   ├── Orchestrates backfill → streaming
+│   ├── Orchestrates streaming
 │   ├── 1-minute data aggregation
 │   ├── Buffer management and flushing
 │   └── Database storage coordination
@@ -112,7 +109,7 @@ ZeroGEX Platform
 ```
 TradeStation API
       ↓
-BackfillManager / StreamManager (fetch & yield data)
+StreamManager (fetch & yield data)
       ↓
 IVCalculator (calculate IV from prices if not provided)
       ↓
@@ -411,24 +408,6 @@ python -m src.ingestion.tradestation_client --debug
 
 ---
 
-### Backfill Manager
-
-**Standalone historical data backfill:**
-
-```bash
-# Run backfill with defaults
-make run-backfill
-
-# For custom options, use Python directly:
-python -m src.ingestion.backfill_manager --lookback-days 3
-python -m src.ingestion.backfill_manager --unit Daily --lookback-days 30
-python -m src.ingestion.backfill_manager --sample-every 10
-```
-
-**Note:** Backfill runs independently and stores data directly in the database.
-
----
-
 ### Stream Manager
 
 **Standalone real-time streaming (for testing):**
@@ -708,7 +687,6 @@ zerogex-oa/
 │   │   ├── tradestation_client.py   # Market data API client
 │   │   ├── iv_calculator.py         # IV calculation (Newton-Raphson)
 │   │   ├── greeks_calculator.py     # Black-Scholes Greeks
-│   │   ├── backfill_manager.py      # Historical data fetching
 │   │   ├── stream_manager.py        # Real-time data fetching
 │   │   └── main_engine.py           # Orchestration + storage
 │   ├── analytics/                    # ⭐ NEW
@@ -820,7 +798,6 @@ zerogex-oa/
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `BACKFILL_ON_STARTUP` | Auto-backfill gaps on startup | `true` |
 | `WEBSOCKET_ENABLED` | Use WebSocket streaming | `false` |
 | `GEX_ENABLED` | Enable GEX calculations | `false` |
 | `METRICS_ENABLED` | Enable Prometheus metrics | `false` |
@@ -917,7 +894,6 @@ make refresh-views      # Refresh materialized views
 # Run Components
 make run-auth           # Test TradeStation authentication
 make run-client         # Test TradeStation API client
-make run-backfill       # Run historical data backfill
 make run-stream         # Test real-time streaming
 make run-ingest         # Run main ingestion engine
 make run-greeks         # Test Greeks calculator
@@ -1296,7 +1272,6 @@ make logs
 ### ✅ Completed (v0.2.0)
 - [x] TradeStation API integration
 - [x] Real-time data streaming with Up/Down volume
-- [x] Historical data backfilling
 - [x] 1-minute data aggregation
 - [x] Database storage (PostgreSQL/TimescaleDB)
 - [x] **Implied Volatility calculation (Newton-Raphson)**
@@ -1309,7 +1284,6 @@ make logs
 
 ### 🚧 In Progress (v0.3.0)
 - [ ] WebSocket streaming implementation
-- [ ] Automated gap backfilling
 - [ ] Data quality monitoring
 - [ ] Prometheus metrics integration
 

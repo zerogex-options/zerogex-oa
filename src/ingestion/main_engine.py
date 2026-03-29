@@ -2,13 +2,11 @@
 ZeroGEX Main Ingestion Engine
 
 This engine:
-1. Streams real-time data using StreamManager (no backfill)
+1. Streams real-time data using StreamManager
 2. Handles 1-minute aggregation
 3. Calculates Greeks for options (if enabled)
 4. Stores data in PostgreSQL/TimescaleDB
 5. Monitors data quality and pipeline health
-
-For historical data backfilling, use backfill_manager.py independently.
 """
 
 import os
@@ -821,12 +819,11 @@ class IngestionEngine:
         logger.info(f"Strikes Each Side: {self.num_strikes}")
         logger.info(f"Greeks: {'ENABLED' if GREEKS_ENABLED else 'DISABLED'}")
         logger.info("")
-        logger.info("NOTE: This engine only streams forward-looking data.")
-        logger.info("      For historical backfill, run backfill_manager.py independently.")
+        logger.info("NOTE: This engine streams forward-looking data.")
         logger.info("="*80 + "\n")
 
         try:
-            # Only run streaming (no backfill)
+            # Run streaming
             self.run_streaming()
 
         except Exception as e:

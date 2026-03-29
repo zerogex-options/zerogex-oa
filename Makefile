@@ -193,7 +193,6 @@ help: ## Show this help message
 	@echo "    ALIAS=<name> ALIASES=\"A=$$A.B,C=$$C.D\" INPUT=\"SPY,<alias>\""
 	@echo "  make run-ingest-alias   - Run ingestion with alias-aware underlyings"
 	@echo "    INPUT=\"SPY,SPX\" ALIASES=\"SPX=$$$$SPX.X\" (or ALIAS+TICKER)"
-	@echo "  make run-backfill       - Run historical data backfill"
 	@echo "  make run-stream         - Test real-time streaming"
 	@echo "  make run-ingest         - Run main ingestion engine"
 	@echo "  make run-analytics      - Run analytics engine"
@@ -491,18 +490,6 @@ alias-check: ## Resolve alias mapping (optional: ALIASES, ALIAS, INPUT)
 		$(VENV_PYTHON) -c "import os,sys; from src.symbols import parse_underlyings, get_symbol_aliases; os.environ['SYMBOL_ALIASES']=sys.argv[1]; input_value=sys.argv[2]; print('SYMBOL_ALIASES=', get_symbol_aliases()); print('INPUT=', input_value); print('RESOLVED=', parse_underlyings(input_value))" "$$ALIASES_ENV" "$$INPUT_VALUE"; \
 	fi
 
-.PHONY: run-backfill
-run-backfill: ## Run historical data backfill
-	@echo ""
-	@echo "$(BLUE)================================================================================$(NC)"
-	@echo "$(BLUE)RUNNING INDEPENDENT BACKFILL$(NC)"
-	@echo "$(BLUE)================================================================================$(NC)"
-	@echo "Note: Backfill runs independently and stores data directly."
-	@echo "      Use this to populate historical data as needed."
-	@echo "$(BLUE)================================================================================$(NC)"
-	@echo ""
-	@$(VENV_PYTHON) -m src.ingestion.backfill_manager
-
 .PHONY: run-stream
 run-stream: ## Test real-time streaming
 	@echo ""
@@ -522,7 +509,6 @@ run-ingest: ## Run main ingestion engine (forward-only)
 	@echo "$(BLUE)RUNNING MAIN INGESTION ENGINE (FORWARD-ONLY)$(NC)"
 	@echo "$(BLUE)================================================================================$(NC)"
 	@echo "Note: Main engine only streams forward-looking data."
-	@echo "      For historical backfill, run 'make run-backfill'"
 	@echo "$(BLUE)================================================================================$(NC)"
 	@echo ""
 	@$(VENV_PYTHON) -m src.ingestion.main_engine

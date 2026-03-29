@@ -7,7 +7,6 @@ Intentionally avoids importing `main_engine` at package import time to prevent
 __all__ = [
     "TradeStationAuth",
     "TradeStationClient",
-    "BackfillManager",
     "StreamManager",
     "IngestionEngine",
     "GreeksCalculator",
@@ -23,9 +22,6 @@ def __getattr__(name):
     if name == "TradeStationClient":
         from src.ingestion.tradestation_client import TradeStationClient
         return TradeStationClient
-    if name == "BackfillManager":
-        from src.ingestion.backfill_manager import BackfillManager
-        return BackfillManager
     if name == "StreamManager":
         from src.ingestion.stream_manager import StreamManager
         return StreamManager
