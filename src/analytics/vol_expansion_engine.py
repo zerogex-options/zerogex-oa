@@ -118,6 +118,16 @@ class AccuracySnapshot:
     magnitude_bucket: str
 
 
+@dataclass
+class VolThresholds:
+    smart_money_ratio: float = VOL_SMART_MONEY_DOMINANCE_RATIO
+    deep_negative_gex: float = VOL_GAMMA_DEEP_NEGATIVE
+    negative_gex: float = VOL_GAMMA_NEGATIVE
+    gamma_flip_near_pct: float = VOL_GAMMA_FLIP_NEAR_PCT
+    pcr_high: float = VOL_PCR_HIGH
+    pcr_low: float = VOL_PCR_LOW
+
+
 class VolExpansionEngine:
     def __init__(self, underlying: str = "SPY"):
         self.underlying = underlying.upper()
@@ -125,6 +135,8 @@ class VolExpansionEngine:
         self._last_accuracy_update: Optional[date] = None
         self.auto_tune_enabled = os.getenv("VOL_AUTO_TUNE_ENABLED", "true").lower() == "true"
         self.auto_tune_lookback_days = max(5, int(os.getenv("VOL_AUTO_TUNE_LOOKBACK_DAYS", "30")))
+        self.auto_tune_min_samples = max(50, int(os.getenv("VOL_AUTO_TUNE_MIN_SAMPLES", "250")))
+        self._last_auto_tune_date: Optional[date] = None
         self._defaults = {
             "sm_ratio": VOL_SMART_MONEY_DOMINANCE_RATIO,
             "deep_neg_gex": VOL_GAMMA_DEEP_NEGATIVE,
@@ -133,17 +145,21 @@ class VolExpansionEngine:
             "pcr_high": VOL_PCR_HIGH,
             "pcr_low": VOL_PCR_LOW,
         }
+        self.thresholds = VolThresholds(
+            smart_money_ratio=self._defaults["sm_ratio"],
+            deep_negative_gex=self._defaults["deep_neg_gex"],
+            negative_gex=self._defaults["neg_gex"],
+            gamma_flip_near_pct=self._defaults["flip_near"],
+            pcr_high=self._defaults["pcr_high"],
+            pcr_low=self._defaults["pcr_low"],
+        )
 
     def _auto_tune_thresholds(self) -> None:
         """Adapt vol thresholds from recent regime distributions while anchoring to defaults."""
-        global VOL_SMART_MONEY_DOMINANCE_RATIO
-        global VOL_GAMMA_DEEP_NEGATIVE
-        global VOL_GAMMA_NEGATIVE
-        global VOL_GAMMA_FLIP_NEAR_PCT
-        global VOL_PCR_HIGH
-        global VOL_PCR_LOW
-
         if not self.auto_tune_enabled:
+            return
+        today = datetime.now(ET).date()
+        if self._last_auto_tune_date == today:
             return
 
         try:
@@ -152,6 +168,7 @@ class VolExpansionEngine:
                 cur.execute(
                     """
                     SELECT
+                        COUNT(*) AS n,
                         PERCENTILE_CONT(0.15) WITHIN GROUP (ORDER BY total_net_gex) AS deep_neg,
                         PERCENTILE_CONT(0.30) WITHIN GROUP (ORDER BY total_net_gex) AS neg_gex,
                         PERCENTILE_CONT(0.8) WITHIN GROUP (ORDER BY put_call_ratio) AS pcr_hi,
@@ -162,11 +179,14 @@ class VolExpansionEngine:
                     """,
                     (self.db_symbol, self.auto_tune_lookback_days),
                 )
-                row = cur.fetchone() or (None, None, None, None)
-                deep_neg = float(row[0]) if row[0] is not None else self._defaults["deep_neg_gex"]
-                neg_gex = float(row[1]) if row[1] is not None else self._defaults["neg_gex"]
-                pcr_hi = float(row[2]) if row[2] is not None else self._defaults["pcr_high"]
-                pcr_lo = float(row[3]) if row[3] is not None else self._defaults["pcr_low"]
+                row = cur.fetchone() or (0, None, None, None, None)
+                if int(row[0] or 0) < self.auto_tune_min_samples:
+                    logger.info("VolExpansionEngine auto-tune skipped: insufficient GEX samples")
+                    return
+                deep_neg = float(row[1]) if row[1] is not None else self._defaults["deep_neg_gex"]
+                neg_gex = float(row[2]) if row[2] is not None else self._defaults["neg_gex"]
+                pcr_hi = float(row[3]) if row[3] is not None else self._defaults["pcr_high"]
+                pcr_lo = float(row[4]) if row[4] is not None else self._defaults["pcr_low"]
 
                 cur.execute(
                     """
@@ -195,12 +215,15 @@ class VolExpansionEngine:
                 flip_near = float(row[0]) if row and row[0] is not None else self._defaults["flip_near"]
 
             alpha = 0.20
-            VOL_GAMMA_DEEP_NEGATIVE = (1 - alpha) * self._defaults["deep_neg_gex"] + alpha * min(deep_neg, -1e9)
-            VOL_GAMMA_NEGATIVE = (1 - alpha) * self._defaults["neg_gex"] + alpha * min(neg_gex, -5e8)
-            VOL_GAMMA_FLIP_NEAR_PCT = max(0.001, min(0.01, (1 - alpha) * self._defaults["flip_near"] + alpha * flip_near))
-            VOL_PCR_HIGH = max(1.10, min(2.50, (1 - alpha) * self._defaults["pcr_high"] + alpha * pcr_hi))
-            VOL_PCR_LOW = max(0.20, min(0.90, (1 - alpha) * self._defaults["pcr_low"] + alpha * pcr_lo))
-            VOL_SMART_MONEY_DOMINANCE_RATIO = self._defaults["sm_ratio"]
+            self.thresholds.deep_negative_gex = (1 - alpha) * self._defaults["deep_neg_gex"] + alpha * min(deep_neg, -1e9)
+            self.thresholds.negative_gex = (1 - alpha) * self._defaults["neg_gex"] + alpha * min(neg_gex, -5e8)
+            self.thresholds.gamma_flip_near_pct = max(0.001, min(0.01, (1 - alpha) * self._defaults["flip_near"] + alpha * flip_near))
+            self.thresholds.pcr_high = max(1.10, min(2.50, (1 - alpha) * self._defaults["pcr_high"] + alpha * pcr_hi))
+            self.thresholds.pcr_low = max(0.20, min(0.90, (1 - alpha) * self._defaults["pcr_low"] + alpha * pcr_lo))
+            self.thresholds.smart_money_ratio = self._defaults["sm_ratio"]
+            self._last_auto_tune_date = today
+            if abs(self.thresholds.gamma_flip_near_pct - self._defaults["flip_near"]) > 0.003:
+                logger.warning("VolExpansionEngine auto-tune drift alert: gamma flip near threshold moved materially.")
 
         except Exception as exc:
             logger.error("VolExpansionEngine auto-tune failed: %s", exc)
@@ -430,11 +453,10 @@ class VolExpansionEngine:
     def _normalize(composite_score: int, max_possible: int) -> float:
         return round(min(abs(composite_score) / max_possible, 1.0), 4) if max_possible else 0.0
 
-    @staticmethod
-    def _smart_money_direction(call_premium: float, put_premium: float) -> str:
-        if call_premium > put_premium * VOL_SMART_MONEY_DOMINANCE_RATIO:
+    def _smart_money_direction(self, call_premium: float, put_premium: float) -> str:
+        if call_premium > put_premium * self.thresholds.smart_money_ratio:
             return "up"
-        if put_premium > call_premium * VOL_SMART_MONEY_DOMINANCE_RATIO:
+        if put_premium > call_premium * self.thresholds.smart_money_ratio:
             return "down"
         return "neutral"
 
@@ -442,15 +464,15 @@ class VolExpansionEngine:
         if not ctx.gamma_flip:
             return 0, "No gamma flip available.", None
         distance = abs(ctx.current_price - ctx.gamma_flip) / ctx.gamma_flip
-        if distance < VOL_GAMMA_FLIP_NEAR_PCT:
-            if ctx.net_gex < VOL_GAMMA_DEEP_NEGATIVE:
+        if distance < self.thresholds.gamma_flip_near_pct:
+            if ctx.net_gex < self.thresholds.deep_negative_gex:
                 return 10, "Price is sitting on the gamma flip with deeply negative GEX.", distance
             if ctx.net_gex < 0:
                 return 7, "Price is near the gamma flip in a short-gamma regime.", distance
             return -3, "Price is near the flip but positive GEX should damp volatility.", distance
-        if ctx.current_price < ctx.gamma_flip and ctx.net_gex < VOL_GAMMA_NEGATIVE:
+        if ctx.current_price < ctx.gamma_flip and ctx.net_gex < self.thresholds.negative_gex:
             return -5, "Below gamma flip with negative GEX increases downside chase risk.", distance
-        if ctx.current_price > ctx.gamma_flip and ctx.net_gex < VOL_GAMMA_NEGATIVE:
+        if ctx.current_price > ctx.gamma_flip and ctx.net_gex < self.thresholds.negative_gex:
             return 5, "Above gamma flip with negative GEX increases upside squeeze risk.", distance
         return 0, "Gamma regime is not near an unstable transition.", distance
 
@@ -507,9 +529,9 @@ class VolExpansionEngine:
 
     def _score_put_call_extreme(self, ctx: VolExpansionContext) -> tuple[int, str, float]:
         pcr = ctx.put_call_ratio or 1.0
-        if pcr > VOL_PCR_HIGH:
+        if pcr > self.thresholds.pcr_high:
             raw = 5
-        elif pcr < VOL_PCR_LOW:
+        elif pcr < self.thresholds.pcr_low:
             raw = -5
         else:
             raw = 0
@@ -595,6 +617,23 @@ class VolExpansionEngine:
                 )
             )
             catalyst_rank.append((key, abs(weighted)))
+
+        components.append(
+            VolComponent(
+                name="Calibration Snapshot",
+                weight=0,
+                raw_score=0,
+                weighted_score=0,
+                description=(
+                    f"deep_neg_gex={self.thresholds.deep_negative_gex:.0f}, "
+                    f"neg_gex={self.thresholds.negative_gex:.0f}, "
+                    f"flip_near={self.thresholds.gamma_flip_near_pct:.4f}, "
+                    f"pcr_hi={self.thresholds.pcr_high:.3f}, "
+                    f"pcr_lo={self.thresholds.pcr_low:.3f}"
+                ),
+                value=None,
+            )
+        )
 
         max_possible = sum(weight * 10 for weight in VOL_SIGNAL_WEIGHTS.values())
         normalized = self._normalize(composite, max_possible)

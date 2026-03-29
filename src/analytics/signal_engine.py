@@ -157,6 +157,15 @@ class TradeSignal:
     components: list = field(default_factory=list)
 
 
+@dataclass
+class SignalThresholds:
+    smart_money_ratio: float = SMART_MONEY_DOMINANCE_RATIO
+    vwap_bull_threshold: float = VWAP_DEV_BULL_THRESHOLD
+    vwap_bear_threshold: float = VWAP_DEV_BEAR_THRESHOLD
+    pcr_bullish_threshold: float = PCR_BULLISH_THRESHOLD
+    pcr_bearish_threshold: float = PCR_BEARISH_THRESHOLD
+
+
 # ---------------------------------------------------------------------------
 # Scoring helpers
 # ---------------------------------------------------------------------------
@@ -195,10 +204,14 @@ def _orb_direction(orb_status: str) -> Optional[str]:
     return None
 
 
-def _sm_direction(call_prem: float, put_prem: float) -> str:
-    if call_prem > put_prem * SMART_MONEY_DOMINANCE_RATIO:
+def _sm_direction(
+    call_prem: float,
+    put_prem: float,
+    smart_money_ratio: float = SMART_MONEY_DOMINANCE_RATIO,
+) -> str:
+    if call_prem > put_prem * smart_money_ratio:
         return "bullish"
-    if put_prem > call_prem * SMART_MONEY_DOMINANCE_RATIO:
+    if put_prem > call_prem * smart_money_ratio:
         return "bearish"
     return "neutral"
 
@@ -257,7 +270,12 @@ def _build_trade_idea(
 # Component scorer
 # ---------------------------------------------------------------------------
 
-def _score_components(ctx: SignalContext, tf: str) -> tuple[int, list[SignalComponent]]:
+def _score_components(
+    ctx: SignalContext,
+    tf: str,
+    thresholds: Optional[SignalThresholds] = None,
+) -> tuple[int, list[SignalComponent]]:
+    thresholds = thresholds or SignalThresholds()
     comps: list[SignalComponent] = []
     total = 0
 
@@ -290,10 +308,10 @@ def _score_components(ctx: SignalContext, tf: str) -> tuple[int, list[SignalComp
 
     # 3. Smart Money Flow
     diff = ctx.smart_call_premium - ctx.smart_put_premium
-    if ctx.smart_call_premium > ctx.smart_put_premium * SMART_MONEY_DOMINANCE_RATIO:
+    if ctx.smart_call_premium > ctx.smart_put_premium * thresholds.smart_money_ratio:
         sm_raw, sm_desc = 1, (f"Call sweeps dominate "
             f"(${ctx.smart_call_premium:,.0f} vs ${ctx.smart_put_premium:,.0f} put).")
-    elif ctx.smart_put_premium > ctx.smart_call_premium * SMART_MONEY_DOMINANCE_RATIO:
+    elif ctx.smart_put_premium > ctx.smart_call_premium * thresholds.smart_money_ratio:
         sm_raw, sm_desc = -1, (f"Put sweeps dominate "
             f"(${ctx.smart_put_premium:,.0f} vs ${ctx.smart_call_premium:,.0f} call).")
     else:
@@ -303,7 +321,7 @@ def _score_components(ctx: SignalContext, tf: str) -> tuple[int, list[SignalComp
     # 4. VWAP Position
     vd = ctx.vwap_deviation_pct
     add("VWAP Position", "vwap_position",
-        1 if vd > VWAP_DEV_BULL_THRESHOLD else (-1 if vd < VWAP_DEV_BEAR_THRESHOLD else 0),
+        1 if vd > thresholds.vwap_bull_threshold else (-1 if vd < thresholds.vwap_bear_threshold else 0),
         f"Price is {vd:+.2f}% {'above' if vd > 0 else 'below'} VWAP."
         if SIGNAL_WEIGHTS["vwap_position"][tf] > 0
         else "Not applicable for multi-day timeframe.",
@@ -322,9 +340,9 @@ def _score_components(ctx: SignalContext, tf: str) -> tuple[int, list[SignalComp
     # 6. Put/Call Ratio
     pcr = ctx.put_call_ratio or 1.0
     add("Put/Call Ratio", "put_call_ratio",
-        1 if pcr < PCR_BULLISH_THRESHOLD else (-1 if pcr > PCR_BEARISH_THRESHOLD else 0),
+        1 if pcr < thresholds.pcr_bullish_threshold else (-1 if pcr > thresholds.pcr_bearish_threshold else 0),
         f"P/C ratio: {pcr:.2f} "
-        f"({'call-heavy/bullish' if pcr < PCR_BULLISH_THRESHOLD else 'put-heavy/bearish' if pcr > PCR_BEARISH_THRESHOLD else 'neutral'}).",
+        f"({'call-heavy/bullish' if pcr < thresholds.pcr_bullish_threshold else 'put-heavy/bearish' if pcr > thresholds.pcr_bearish_threshold else 'neutral'}).",
         round(pcr, 3))
 
     # 7. Unusual Volume
@@ -390,6 +408,8 @@ class SignalEngine:
         self._last_accuracy_update: Optional[date] = None
         self.auto_tune_enabled = os.getenv("SIGNAL_AUTO_TUNE_ENABLED", "true").lower() == "true"
         self.auto_tune_lookback_days = max(5, int(os.getenv("SIGNAL_AUTO_TUNE_LOOKBACK_DAYS", "20")))
+        self.auto_tune_min_samples = max(50, int(os.getenv("SIGNAL_AUTO_TUNE_MIN_SAMPLES", "250")))
+        self._last_auto_tune_date: Optional[date] = None
         self._defaults = {
             "sm_ratio": SMART_MONEY_DOMINANCE_RATIO,
             "vwap_bull": VWAP_DEV_BULL_THRESHOLD,
@@ -397,16 +417,20 @@ class SignalEngine:
             "pcr_bull": PCR_BULLISH_THRESHOLD,
             "pcr_bear": PCR_BEARISH_THRESHOLD,
         }
+        self.thresholds = SignalThresholds(
+            smart_money_ratio=self._defaults["sm_ratio"],
+            vwap_bull_threshold=self._defaults["vwap_bull"],
+            vwap_bear_threshold=self._defaults["vwap_bear"],
+            pcr_bullish_threshold=self._defaults["pcr_bull"],
+            pcr_bearish_threshold=self._defaults["pcr_bear"],
+        )
 
     def _auto_tune_thresholds(self) -> None:
         """Blend defaults with recent distribution stats for regime-adaptive thresholds."""
-        global SMART_MONEY_DOMINANCE_RATIO
-        global VWAP_DEV_BULL_THRESHOLD
-        global VWAP_DEV_BEAR_THRESHOLD
-        global PCR_BULLISH_THRESHOLD
-        global PCR_BEARISH_THRESHOLD
-
         if not self.auto_tune_enabled:
+            return
+        today = datetime.now(ET).date()
+        if self._last_auto_tune_date == today:
             return
 
         try:
@@ -415,6 +439,7 @@ class SignalEngine:
                 cur.execute(
                     """
                     SELECT
+                        COUNT(*) AS n,
                         PERCENTILE_CONT(0.3) WITHIN GROUP (ORDER BY put_call_ratio) AS pcr_bull,
                         PERCENTILE_CONT(0.7) WITHIN GROUP (ORDER BY put_call_ratio) AS pcr_bear
                     FROM gex_summary
@@ -424,9 +449,12 @@ class SignalEngine:
                     """,
                     (self.db_symbol, self.auto_tune_lookback_days),
                 )
-                row = cur.fetchone() or (None, None)
-                pcr_bull = float(row[0]) if row[0] is not None else self._defaults["pcr_bull"]
-                pcr_bear = float(row[1]) if row[1] is not None else self._defaults["pcr_bear"]
+                row = cur.fetchone() or (0, None, None)
+                if int(row[0] or 0) < self.auto_tune_min_samples:
+                    logger.info("SignalEngine auto-tune skipped: insufficient GEX samples")
+                    return
+                pcr_bull = float(row[1]) if row[1] is not None else self._defaults["pcr_bull"]
+                pcr_bear = float(row[2]) if row[2] is not None else self._defaults["pcr_bear"]
 
                 cur.execute(
                     """
@@ -468,11 +496,15 @@ class SignalEngine:
                 sm_ratio = float(row[0]) if row and row[0] is not None else self._defaults["sm_ratio"]
 
             alpha = 0.20
-            SMART_MONEY_DOMINANCE_RATIO = max(1.05, min(1.80, (1 - alpha) * self._defaults["sm_ratio"] + alpha * sm_ratio))
-            VWAP_DEV_BULL_THRESHOLD = max(0.05, min(1.00, (1 - alpha) * self._defaults["vwap_bull"] + alpha * vwap_bull))
-            VWAP_DEV_BEAR_THRESHOLD = min(-0.05, max(-1.00, (1 - alpha) * self._defaults["vwap_bear"] + alpha * vwap_bear))
-            PCR_BULLISH_THRESHOLD = max(0.40, min(1.00, (1 - alpha) * self._defaults["pcr_bull"] + alpha * pcr_bull))
-            PCR_BEARISH_THRESHOLD = max(1.00, min(2.20, (1 - alpha) * self._defaults["pcr_bear"] + alpha * pcr_bear))
+            self.thresholds.smart_money_ratio = max(1.05, min(1.80, (1 - alpha) * self._defaults["sm_ratio"] + alpha * sm_ratio))
+            self.thresholds.vwap_bull_threshold = max(0.05, min(1.00, (1 - alpha) * self._defaults["vwap_bull"] + alpha * vwap_bull))
+            self.thresholds.vwap_bear_threshold = min(-0.05, max(-1.00, (1 - alpha) * self._defaults["vwap_bear"] + alpha * vwap_bear))
+            self.thresholds.pcr_bullish_threshold = max(0.40, min(1.00, (1 - alpha) * self._defaults["pcr_bull"] + alpha * pcr_bull))
+            self.thresholds.pcr_bearish_threshold = max(1.00, min(2.20, (1 - alpha) * self._defaults["pcr_bear"] + alpha * pcr_bear))
+            self._last_auto_tune_date = today
+
+            if abs(self.thresholds.pcr_bullish_threshold - self._defaults["pcr_bull"]) > 0.20:
+                logger.warning("SignalEngine auto-tune drift alert: bullish PCR threshold moved materially.")
 
         except Exception as e:
             logger.error(f"SignalEngine auto-tune failed: {e}")
@@ -852,7 +884,23 @@ class SignalEngine:
         stored = 0
         for tf in ("intraday", "swing", "multi_day"):
             try:
-                composite, comps = _score_components(ctx, tf)
+                composite, comps = _score_components(ctx, tf, self.thresholds)
+                comps.append(
+                    SignalComponent(
+                        name="Calibration Snapshot",
+                        weight=0,
+                        score=0,
+                        description=(
+                            f"sm_ratio={self.thresholds.smart_money_ratio:.3f}, "
+                            f"vwap_bull={self.thresholds.vwap_bull_threshold:.3f}, "
+                            f"vwap_bear={self.thresholds.vwap_bear_threshold:.3f}, "
+                            f"pcr_bull={self.thresholds.pcr_bullish_threshold:.3f}, "
+                            f"pcr_bear={self.thresholds.pcr_bearish_threshold:.3f}"
+                        ),
+                        value=None,
+                        applicable=False,
+                    )
+                )
                 mx      = _max_possible(tf)
                 normed  = _normalize(composite, tf)
                 direction = _to_direction(composite)
@@ -872,7 +920,11 @@ class SignalEngine:
                 gf  = ctx.gamma_flip or None
                 pvf = round((ctx.current_price - gf) / gf * 100, 4) if gf else None
                 orb_dir = _orb_direction(ctx.orb_status) if ctx.orb_status else None
-                sm_dir  = _sm_direction(ctx.smart_call_premium, ctx.smart_put_premium)
+                sm_dir  = _sm_direction(
+                    ctx.smart_call_premium,
+                    ctx.smart_put_premium,
+                    self.thresholds.smart_money_ratio,
+                )
 
                 sig = TradeSignal(
                     underlying=self.db_symbol,

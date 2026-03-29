@@ -193,6 +193,7 @@ class DatabaseManager:
 
     async def _refresh_flow_cache(self, conn: asyncpg.Connection, symbol: str) -> None:
         """Refresh flow caches for only the latest minute snapshot for a symbol."""
+        canonical_only = os.getenv("FLOW_CANONICAL_ONLY", "true").lower() == "true"
         latest_ts = await conn.fetchval(
             """
             SELECT MAX(timestamp)
@@ -319,45 +320,46 @@ class DatabaseManager:
             underlying_price,
         )
 
-        # One-time bootstrap for the new expiration cache table so endpoint
-        # can serve historical buckets immediately after deployment.
-        expiration_seeded = await conn.fetchval(
-            """
-            SELECT 1
-            FROM flow_by_expiration
-            WHERE symbol = $1
-            LIMIT 1
-            """,
-            symbol,
-        )
-        if not expiration_seeded:
-            await conn.execute(
+        if not canonical_only:
+            # One-time bootstrap for the new expiration cache table so endpoint
+            # can serve historical buckets immediately after deployment.
+            expiration_seeded = await conn.fetchval(
                 """
-                INSERT INTO flow_by_expiration (
-                    timestamp,
-                    symbol,
-                    expiration,
-                    total_volume,
-                    total_premium
-                )
-                SELECT
-                    timestamp,
-                    underlying,
-                    expiration,
-                    SUM(volume_delta)::bigint,
-                    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric
-                FROM option_chains_with_deltas
-                WHERE underlying = $1
-                  AND timestamp >= NOW() - INTERVAL '90 minutes'
-                  AND volume_delta > 0
-                GROUP BY timestamp, underlying, expiration
-                ON CONFLICT (timestamp, symbol, expiration)
-                DO NOTHING
+                SELECT 1
+                FROM flow_by_expiration
+                WHERE symbol = $1
+                LIMIT 1
                 """,
                 symbol,
             )
+            if not expiration_seeded:
+                await conn.execute(
+                    """
+                    INSERT INTO flow_by_expiration (
+                        timestamp,
+                        symbol,
+                        expiration,
+                        total_volume,
+                        total_premium
+                    )
+                    SELECT
+                        timestamp,
+                        underlying,
+                        expiration,
+                        SUM(volume_delta)::bigint,
+                        SUM(volume_delta * COALESCE(last, 0) * 100)::numeric
+                    FROM option_chains_with_deltas
+                    WHERE underlying = $1
+                      AND timestamp >= NOW() - INTERVAL '90 minutes'
+                      AND volume_delta > 0
+                    GROUP BY timestamp, underlying, expiration
+                    ON CONFLICT (timestamp, symbol, expiration)
+                    DO NOTHING
+                    """,
+                    symbol,
+                )
 
-        type_exists = await conn.fetchval(
+        type_exists = True if canonical_only else await conn.fetchval(
             """
             SELECT 1 FROM flow_by_type
             WHERE symbol = $1 AND timestamp = $2
@@ -470,7 +472,7 @@ class DatabaseManager:
                 underlying_price,
             )
 
-        strike_exists = await conn.fetchval(
+        strike_exists = True if canonical_only else await conn.fetchval(
             """
             SELECT 1 FROM flow_by_strike
             WHERE symbol = $1 AND timestamp = $2
@@ -578,7 +580,7 @@ class DatabaseManager:
                 underlying_price,
             )
 
-        expiration_exists = await conn.fetchval(
+        expiration_exists = True if canonical_only else await conn.fetchval(
             """
             SELECT 1 FROM flow_by_expiration
             WHERE symbol = $1 AND timestamp = $2
