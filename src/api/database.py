@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timedelta, date, time
+from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
 import logging
 import json
@@ -210,10 +211,29 @@ class DatabaseManager:
                 except Exception:
                     logger.warning("Failed to close old database pool during reconnect", exc_info=True)
 
+    @asynccontextmanager
+    async def _acquire_connection(self):
+        """
+        Acquire a DB connection with lazy pool initialization.
+
+        This prevents transient `'NoneType' object has no attribute 'acquire'` failures when
+        a request arrives before pool initialization completes or during pool recycling.
+        """
+        pool = self.pool
+        if pool is None:
+            await self.connect()
+            pool = self.pool
+
+        if pool is None:
+            raise RuntimeError("Database pool is unavailable")
+
+        async with pool.acquire() as conn:
+            yield conn
+
     async def check_health(self) -> bool:
         """Check database connection health"""
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 await conn.fetchval("SELECT 1")
             return True
         except Exception as e:
@@ -1126,7 +1146,7 @@ class DatabaseManager:
         """
 
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 row = await conn.fetchrow(query, symbol)
                 return dict(row) if row else None
         except Exception as e:
@@ -1189,7 +1209,7 @@ class DatabaseManager:
         """
 
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 rows = await conn.fetch(query, symbol, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
@@ -1291,7 +1311,7 @@ class DatabaseManager:
         """
 
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 window_units = max(1, min(window_units, 90))
                 rows = await conn.fetch(query, symbol, start_date, end_date, window_units)
                 return [dict(row) for row in rows]
@@ -1375,7 +1395,7 @@ class DatabaseManager:
         """
 
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 await self._refresh_flow_cache(conn, symbol)
                 rows = await conn.fetch(query, symbol, session_start, session_end)
                 return [dict(row) for row in rows]
@@ -1387,7 +1407,7 @@ class DatabaseManager:
                     exc_info=True,
                 )
                 await self._reconnect_pool()
-                async with self.pool.acquire() as conn:
+                async with self._acquire_connection() as conn:
                     await self._refresh_flow_cache(conn, symbol)
                     rows = await conn.fetch(query, symbol, session_start, session_end)
                     return [dict(row) for row in rows]
@@ -1440,7 +1460,7 @@ class DatabaseManager:
         """
 
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 await self._refresh_flow_cache(conn, symbol)
                 rows = await conn.fetch(query, symbol, session_start, session_end, limit)
                 return [dict(row) for row in rows]
@@ -1496,7 +1516,7 @@ class DatabaseManager:
         """
 
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 await self._refresh_flow_cache(conn, symbol)
                 rows = await conn.fetch(query, symbol, session_start, session_end, limit)
                 return [dict(row) for row in rows]
@@ -1650,7 +1670,7 @@ class DatabaseManager:
         """
 
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 rows = await conn.fetch(query, symbol, session_start, session_end, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
@@ -1729,7 +1749,7 @@ class DatabaseManager:
         """
 
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 rows = await conn.fetch(query, symbol, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
@@ -1790,7 +1810,7 @@ class DatabaseManager:
         """
 
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 rows = await conn.fetch(query, symbol, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
@@ -1859,7 +1879,7 @@ class DatabaseManager:
         """
 
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 rows = await conn.fetch(query, symbol, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
@@ -1888,7 +1908,7 @@ class DatabaseManager:
         """
 
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 rows = await conn.fetch(query, symbol, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
@@ -1920,7 +1940,7 @@ class DatabaseManager:
         """
 
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 rows = await conn.fetch(query, symbol, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
@@ -1979,7 +1999,7 @@ class DatabaseManager:
         """
 
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 rows = await conn.fetch(query, symbol, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
@@ -2033,7 +2053,7 @@ class DatabaseManager:
             LIMIT 1
         """
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 row = await conn.fetchrow(query, symbol, timeframe)
                 if not row:
                     return None
@@ -2074,7 +2094,7 @@ class DatabaseManager:
             GROUP BY timeframe, strength_bucket
         """
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 rows = await conn.fetch(query, symbol, lookback_days)
             result: Dict[str, Any] = {}
             for row in rows:
@@ -2129,7 +2149,7 @@ class DatabaseManager:
             LIMIT 1
         """
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 row = await conn.fetchrow(query, symbol)
                 if not row:
                     return None
@@ -2163,7 +2183,7 @@ class DatabaseManager:
             ORDER BY confidence, catalyst_type
         """
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 rows = await conn.fetch(query, symbol, lookback_days)
             result: Dict[str, Any] = {}
             for row in rows:
@@ -2225,7 +2245,7 @@ class DatabaseManager:
             LIMIT 1
         """
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 row = await conn.fetchrow(query, symbol)
                 if not row:
                     return None
@@ -2261,7 +2281,7 @@ class DatabaseManager:
             ORDER BY signal_direction, strategy_type
         """
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 rows = await conn.fetch(query, symbol, lookback_days)
             result: Dict[str, Any] = {}
             for row in rows:
@@ -2304,7 +2324,7 @@ class DatabaseManager:
         """
 
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 row = await conn.fetchrow(query, symbol)
                 return dict(row) if row else None
         except Exception as e:
@@ -2315,7 +2335,7 @@ class DatabaseManager:
                     exc_info=True,
                 )
                 await self._reconnect_pool()
-                async with self.pool.acquire() as conn:
+                async with self._acquire_connection() as conn:
                     row = await conn.fetchrow(query, symbol)
                     return dict(row) if row else None
             logger.error(f"Error fetching latest quote: {e}", exc_info=True)
@@ -2381,7 +2401,7 @@ class DatabaseManager:
         """
 
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 row = await conn.fetchrow(query, symbol)
                 return dict(row) if row else None
         except Exception as e:
@@ -2427,7 +2447,7 @@ class DatabaseManager:
         """
 
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 row = await conn.fetchrow(query, symbol)
 
                 current_close = row['current_session_close'] if row else None
@@ -2529,7 +2549,7 @@ class DatabaseManager:
         """
 
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 window_units = max(1, min(window_units, 90))
                 rows = await conn.fetch(query, symbol, start_date, end_date, window_units)
                 return [dict(row) for row in rows]
@@ -2575,7 +2595,7 @@ class DatabaseManager:
             LIMIT $2
         """
 
-        async with self.pool.acquire() as conn:
+        async with self._acquire_connection() as conn:
             rows = await conn.fetch(query, symbol, window_units)
             return [dict(row) for row in rows]
 
@@ -2606,7 +2626,7 @@ class DatabaseManager:
             ORDER BY expiration
         """
 
-        async with self.pool.acquire() as conn:
+        async with self._acquire_connection() as conn:
             await self._refresh_max_pain_snapshot(conn, symbol, strike_limit)
             snapshot = await conn.fetchrow(snapshot_query, symbol)
             if not snapshot:
@@ -2698,7 +2718,7 @@ class DatabaseManager:
         """
 
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 rows = await conn.fetch(query, symbol, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
@@ -2746,7 +2766,7 @@ class DatabaseManager:
             LIMIT 1
         """
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 row = await conn.fetchrow(query, *params)
                 return dict(row) if row else None
         except ValueError as e:
@@ -2791,7 +2811,7 @@ class DatabaseManager:
                   AND option_type = $4
             """
             try:
-                async with self.pool.acquire() as conn:
+                async with self._acquire_connection() as conn:
                     row = await conn.fetchrow(
                         date_query, underlying, float(strike), expiration_date, option_type
                     )
@@ -2852,7 +2872,7 @@ class DatabaseManager:
             ORDER BY timestamp ASC
         """
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 rows = await conn.fetch(
                     query, underlying, float(strike), expiration_date, option_type, target_date
                 )
@@ -2921,7 +2941,7 @@ class DatabaseManager:
         """
 
         try:
-            async with self.pool.acquire() as conn:
+            async with self._acquire_connection() as conn:
                 spot_row = await conn.fetchrow(spot_query, symbol)
                 if not spot_row:
                     return None
