@@ -6,7 +6,6 @@ Uses asyncpg for async PostgreSQL operations
 import asyncio
 import asyncpg
 import os
-import time as time_module
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timedelta, date, time
@@ -120,11 +119,6 @@ class DatabaseManager:
     def __init__(self):
         self.pool: Optional[asyncpg.Pool] = None
         self._pool_lock = asyncio.Lock()
-        self._last_connect_failure_ts: float = 0.0
-        self._last_connect_error: Optional[str] = None
-        self._connect_retry_cooldown_seconds: float = float(
-            os.getenv("DB_CONNECT_RETRY_COOLDOWN_SECONDS", "5")
-        )
         self._load_credentials()
 
     async def _create_pool(self) -> asyncpg.Pool:
@@ -172,25 +166,9 @@ class DatabaseManager:
         try:
             async with self._pool_lock:
                 if not self._pool_is_usable(self.pool):
-                    now = time_module.monotonic()
-                    if (
-                        self._last_connect_failure_ts > 0
-                        and (now - self._last_connect_failure_ts) < self._connect_retry_cooldown_seconds
-                    ):
-                        cooldown_remaining = self._connect_retry_cooldown_seconds - (
-                            now - self._last_connect_failure_ts
-                        )
-                        raise RuntimeError(
-                            f"DB connect cooldown active ({cooldown_remaining:.1f}s remaining); "
-                            f"last error: {self._last_connect_error or 'unknown'}"
-                        )
                     self.pool = await self._create_pool()
-                    self._last_connect_failure_ts = 0.0
-                    self._last_connect_error = None
             logger.info(f"Database pool created: {self.database}@{self.host}")
         except Exception as e:
-            self._last_connect_failure_ts = time_module.monotonic()
-            self._last_connect_error = f"{type(e).__name__}: {e!r}"
             logger.error("Failed to create database pool: %r", e, exc_info=True)
             raise
 
@@ -199,23 +177,6 @@ class DatabaseManager:
         if self.pool:
             await self.pool.close()
             logger.info("Database pool closed")
-
-    def _is_connection_error(self, error: Exception) -> bool:
-        """Return True when an exception indicates a transient DB connectivity issue."""
-        error_text = str(error).lower()
-        return isinstance(error, (asyncio.TimeoutError, ConnectionError, OSError)) or any(
-            token in error_text
-            for token in (
-                "ssl handshake",
-                "connection",
-                "timeout",
-                "temporarily unavailable",
-                "cannot connect",
-                "closed the connection",
-                "pool is closed",
-                "pool is closing",
-            )
-        )
 
     @staticmethod
     def _pool_is_usable(pool: Optional[asyncpg.Pool]) -> bool:
@@ -227,59 +188,20 @@ class DatabaseManager:
         except Exception:
             return False
 
-    async def _reconnect_pool(self) -> None:
-        """Recycle the asyncpg pool to recover from transient connectivity failures."""
-        old_pool: Optional[asyncpg.Pool] = None
-        try:
-            async with self._pool_lock:
-                old_pool = self.pool
-                self.pool = await self._create_pool()
-            logger.info("Database pool reconnected successfully")
-        except Exception:
-            logger.error("Failed to reconnect database pool", exc_info=True)
-            raise
-        finally:
-            if old_pool is not None:
-                try:
-                    await old_pool.close()
-                except Exception:
-                    logger.warning("Failed to close old database pool during reconnect", exc_info=True)
-
     @asynccontextmanager
     async def _acquire_connection(self):
         """
-        Acquire a DB connection with lazy pool initialization.
+        Acquire a DB connection from the existing pool.
 
-        This prevents transient `'NoneType' object has no attribute 'acquire'` failures when
-        a request arrives before pool initialization completes or during pool recycling.
+        Fail fast when pool is unavailable/closing to avoid hidden retries and
+        request-level latency amplification.
         """
-        last_error: Optional[Exception] = None
-        for attempt in range(2):
-            pool = self.pool
-            if not self._pool_is_usable(pool):
-                await self.connect()
-                pool = self.pool
+        pool = self.pool
+        if not self._pool_is_usable(pool):
+            raise RuntimeError("Database pool is unavailable or closing")
 
-            if not self._pool_is_usable(pool):
-                raise RuntimeError("Database pool is unavailable")
-
-            try:
-                async with pool.acquire() as conn:
-                    yield conn
-                    return
-            except Exception as e:
-                last_error = e
-                if attempt == 0 and self._is_connection_error(e):
-                    logger.warning(
-                        "Transient DB pool/acquire failure; reconnecting and retrying once",
-                        exc_info=True,
-                    )
-                    await self._reconnect_pool()
-                    continue
-                raise
-
-        if last_error is not None:
-            raise last_error
+        async with pool.acquire() as conn:
+            yield conn
 
     async def check_health(self) -> bool:
         """Check database connection health"""
@@ -1451,17 +1373,6 @@ class DatabaseManager:
                 rows = await conn.fetch(query, symbol, session_start, session_end)
                 return [dict(row) for row in rows]
         except Exception as e:
-            if self._is_connection_error(e):
-                logger.warning(
-                    "Transient DB error fetching flow by type for %s; reconnecting pool and retrying once",
-                    symbol,
-                    exc_info=True,
-                )
-                await self._reconnect_pool()
-                async with self._acquire_connection() as conn:
-                    await self._refresh_flow_cache(conn, symbol)
-                    rows = await conn.fetch(query, symbol, session_start, session_end)
-                    return [dict(row) for row in rows]
             logger.error(f"Error fetching flow by type: {e}", exc_info=True)
             raise
 
@@ -2379,16 +2290,6 @@ class DatabaseManager:
                 row = await conn.fetchrow(query, symbol)
                 return dict(row) if row else None
         except Exception as e:
-            if self._is_connection_error(e):
-                logger.warning(
-                    "Transient DB error fetching latest quote for %s; reconnecting pool and retrying once",
-                    symbol,
-                    exc_info=True,
-                )
-                await self._reconnect_pool()
-                async with self._acquire_connection() as conn:
-                    row = await conn.fetchrow(query, symbol)
-                    return dict(row) if row else None
             logger.error(f"Error fetching latest quote: {e}", exc_info=True)
             raise
 
@@ -2773,16 +2674,6 @@ class DatabaseManager:
                 rows = await conn.fetch(query, symbol, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
-            if self._is_connection_error(e):
-                logger.warning(
-                    "Transient DB error fetching GEX heatmap for %s; reconnecting pool and retrying once",
-                    symbol,
-                    exc_info=True,
-                )
-                await self._reconnect_pool()
-                async with self._acquire_connection() as conn:
-                    rows = await conn.fetch(query, symbol, window_units)
-                    return [dict(row) for row in rows]
             logger.error(f"Error fetching GEX heatmap: {e}", exc_info=True)
             raise
 
