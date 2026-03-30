@@ -6,6 +6,7 @@ Uses asyncpg for async PostgreSQL operations
 import asyncio
 import asyncpg
 import os
+import time as time_module
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timedelta, date, time
@@ -119,6 +120,10 @@ class DatabaseManager:
     def __init__(self):
         self.pool: Optional[asyncpg.Pool] = None
         self._pool_lock = asyncio.Lock()
+        self._last_flow_refresh_by_symbol: Dict[str, float] = {}
+        self._flow_refresh_min_seconds: float = float(
+            os.getenv("FLOW_CACHE_REFRESH_MIN_SECONDS", "15")
+        )
         self._load_credentials()
 
     async def _create_pool(self) -> asyncpg.Pool:
@@ -229,6 +234,12 @@ class DatabaseManager:
 
     async def _refresh_flow_cache(self, conn: asyncpg.Connection, symbol: str) -> None:
         """Refresh flow caches for only the latest minute snapshot for a symbol."""
+        now = time_module.monotonic()
+        last_refresh = self._last_flow_refresh_by_symbol.get(symbol, 0.0)
+        if (now - last_refresh) < self._flow_refresh_min_seconds:
+            return
+        self._last_flow_refresh_by_symbol[symbol] = now
+
         canonical_only = os.getenv("FLOW_CANONICAL_ONLY", "true").lower() == "true"
         latest_ts = await conn.fetchval(
             """
