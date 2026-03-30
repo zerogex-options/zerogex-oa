@@ -197,7 +197,7 @@ async def get_gex_by_strike(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching GEX by strike: {e}")
+        logger.error(f"Error fetching GEX by strike: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/gex/historical", response_model=List[GEXSummary], tags=["GEX"])
@@ -224,7 +224,7 @@ async def get_historical_gex(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Invalid date format: {e}")
     except Exception as e:
-        logger.error(f"Error fetching historical GEX: {e}")
+        logger.error(f"Error fetching historical GEX: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/gex/heatmap", tags=["GEX"])
@@ -263,7 +263,7 @@ async def get_flow_by_type(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching flow by type: {e}")
+        logger.error(f"Error fetching flow by type: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/flow/by-strike", response_model=List[FlowByStrikePoint], tags=["Options Flow"])
@@ -280,7 +280,7 @@ async def get_flow_by_strike(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching flow by strike: {e}")
+        logger.error(f"Error fetching flow by strike: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -298,7 +298,7 @@ async def get_flow_by_expiration(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching flow by expiration: {e}")
+        logger.error(f"Error fetching flow by expiration: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/flow/smart-money", response_model=List[SmartMoneyFlowPoint], tags=["Options Flow"])
@@ -315,7 +315,7 @@ async def get_smart_money_flow(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching smart money flow: {e}")
+        logger.error(f"Error fetching smart money flow: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/flow/buying-pressure", response_model=List[FlowBuyingPressurePoint], tags=["Options Flow"])
@@ -333,7 +333,7 @@ async def get_flow_buying_pressure(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching buying pressure: {e}")
+        logger.error(f"Error fetching buying pressure: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 # ============================================================================
@@ -508,7 +508,7 @@ async def get_session_closes(symbol: str = Query(default="SPY")):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching session closes: {e}")
+        logger.error(f"Error fetching session closes: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -536,7 +536,7 @@ async def get_historical_quotes(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Invalid date format: {e}")
     except Exception as e:
-        logger.error(f"Error fetching historical quotes: {e}")
+        logger.error(f"Error fetching historical quotes: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/option/quote", response_model=OptionQuote, tags=["Market Data"])
@@ -557,7 +557,7 @@ async def get_option_quote(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Invalid parameter: {e}")
     except Exception as e:
-        logger.error(f"Error fetching option quote: {e}")
+        logger.error(f"Error fetching option quote: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -576,7 +576,7 @@ async def get_max_pain_timeseries(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching max pain timeseries: {e}")
+        logger.error(f"Error fetching max pain timeseries: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -594,7 +594,7 @@ async def get_max_pain_current(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching current max pain: {e}")
+        logger.error(f"Error fetching current max pain: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -617,7 +617,7 @@ async def get_vwap_deviation(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching VWAP deviation: {e}")
+        logger.error(f"Error fetching VWAP deviation: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/trading/opening-range", tags=["Day Trading"])
@@ -635,7 +635,7 @@ async def get_opening_range(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching ORB: {e}")
+        logger.error(f"Error fetching ORB: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/trading/dealer-hedging", tags=["Day Trading"])
@@ -652,7 +652,7 @@ async def get_dealer_hedging(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching dealer hedging: {e}")
+        logger.error(f"Error fetching dealer hedging: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/trading/volume-spikes", tags=["Day Trading"])
@@ -669,7 +669,7 @@ async def get_volume_spikes(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching volume spikes: {e}")
+        logger.error(f"Error fetching volume spikes: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/trading/momentum-divergence", response_model=List[MomentumDivergencePoint], tags=["Day Trading"])
@@ -687,7 +687,7 @@ async def get_momentum_divergence(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching momentum divergence: {e}")
+        logger.error(f"Error fetching momentum divergence: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 

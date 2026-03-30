@@ -1201,7 +1201,7 @@ class DatabaseManager:
                 row = await conn.fetchrow(query, symbol)
                 return dict(row) if row else None
         except Exception as e:
-            logger.error(f"Error fetching GEX summary: {e}")
+            logger.error(f"Error fetching GEX summary: {e}", exc_info=True)
             raise
 
     async def get_gex_by_strike(
@@ -1264,7 +1264,7 @@ class DatabaseManager:
                 rows = await conn.fetch(query, symbol, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error fetching GEX by strike: {e}")
+            logger.error(f"Error fetching GEX by strike: {e}", exc_info=True)
             raise
 
     async def get_historical_gex(
@@ -1367,7 +1367,7 @@ class DatabaseManager:
                 rows = await conn.fetch(query, symbol, start_date, end_date, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error fetching historical GEX: {e}")
+            logger.error(f"Error fetching historical GEX: {e}", exc_info=True)
             raise
 
     # ========================================================================
@@ -1516,7 +1516,7 @@ class DatabaseManager:
                 rows = await conn.fetch(query, symbol, session_start, session_end, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error fetching flow by strike: {e}")
+            logger.error(f"Error fetching flow by strike: {e}", exc_info=True)
             raise
 
     async def get_flow_by_expiration(
@@ -1572,7 +1572,7 @@ class DatabaseManager:
                 rows = await conn.fetch(query, symbol, session_start, session_end, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error fetching flow by expiration: {e}")
+            logger.error(f"Error fetching flow by expiration: {e}", exc_info=True)
             raise
 
     async def get_smart_money_flow(
@@ -1725,7 +1725,7 @@ class DatabaseManager:
                 rows = await conn.fetch(query, symbol, session_start, session_end, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error fetching smart money flow: {e}")
+            logger.error(f"Error fetching smart money flow: {e}", exc_info=True)
             raise
 
     async def get_flow_buying_pressure(
@@ -1804,7 +1804,7 @@ class DatabaseManager:
                 rows = await conn.fetch(query, symbol, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error fetching buying pressure: {e}")
+            logger.error(f"Error fetching buying pressure: {e}", exc_info=True)
             raise
 
     async def get_vwap_deviation(
@@ -1865,7 +1865,7 @@ class DatabaseManager:
                 rows = await conn.fetch(query, symbol, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error fetching VWAP deviation: {e}")
+            logger.error(f"Error fetching VWAP deviation: {e}", exc_info=True)
             raise
 
     async def get_opening_range_breakout(
@@ -1934,7 +1934,7 @@ class DatabaseManager:
                 rows = await conn.fetch(query, symbol, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error fetching ORB: {e}")
+            logger.error(f"Error fetching ORB: {e}", exc_info=True)
             raise
 
     async def get_dealer_hedging_pressure(
@@ -1963,7 +1963,7 @@ class DatabaseManager:
                 rows = await conn.fetch(query, symbol, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error fetching dealer hedging: {e}")
+            logger.error(f"Error fetching dealer hedging: {e}", exc_info=True)
             raise
 
     async def get_unusual_volume_spikes(
@@ -1995,7 +1995,7 @@ class DatabaseManager:
                 rows = await conn.fetch(query, symbol, limit)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error fetching volume spikes: {e}")
+            logger.error(f"Error fetching volume spikes: {e}", exc_info=True)
             raise
 
     async def get_momentum_divergence(
@@ -2054,7 +2054,7 @@ class DatabaseManager:
                 rows = await conn.fetch(query, symbol, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error fetching momentum divergence: {e}")
+            logger.error(f"Error fetching momentum divergence: {e}", exc_info=True)
             raise
 
     # ========================================================================
@@ -2456,7 +2456,7 @@ class DatabaseManager:
                 row = await conn.fetchrow(query, symbol)
                 return dict(row) if row else None
         except Exception as e:
-            logger.error(f"Error fetching previous close: {e}")
+            logger.error(f"Error fetching previous close: {e}", exc_info=True)
             raise
 
     async def get_session_closes(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
@@ -2540,7 +2540,7 @@ class DatabaseManager:
                     'prior_session_close_ts': prior_ts,
                 }
         except Exception as e:
-            logger.error(f"Error fetching session closes: {e}")
+            logger.error(f"Error fetching session closes: {e}", exc_info=True)
             raise
 
     async def get_historical_quotes(
@@ -2605,7 +2605,7 @@ class DatabaseManager:
                 rows = await conn.fetch(query, symbol, start_date, end_date, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error fetching historical quotes: {e}")
+            logger.error(f"Error fetching historical quotes: {e}", exc_info=True)
             raise
 
     async def get_max_pain_timeseries(
@@ -2834,7 +2834,7 @@ class DatabaseManager:
             logger.error(f"Invalid expiration format '{expiration}': {e}")
             raise
         except Exception as e:
-            logger.error(f"Error fetching option quote: {e}")
+            logger.error(f"Error fetching option quote: {e}", exc_info=True)
             raise
 
     async def get_option_contract_history(
@@ -2939,7 +2939,7 @@ class DatabaseManager:
                 )
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error fetching option contract history: {e}")
+            logger.error(f"Error fetching option contract history: {e}", exc_info=True)
             raise
 
     # ------------------------------------------------------------------
@@ -3019,5 +3019,5 @@ class DatabaseManager:
                     "rows": [dict(r) for r in rows],
                 }
         except Exception as e:
-            logger.error(f"Error fetching vol surface data: {e}")
+            logger.error(f"Error fetching vol surface data: {e}", exc_info=True)
             raise
