@@ -117,7 +117,23 @@ class DatabaseManager:
 
     def __init__(self):
         self.pool: Optional[asyncpg.Pool] = None
+        self._pool_lock = asyncio.Lock()
         self._load_credentials()
+
+    async def _create_pool(self) -> asyncpg.Pool:
+        """Create and return a fresh asyncpg pool instance."""
+        connect_timeout = float(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "20"))
+        return await asyncpg.create_pool(
+            host=self.host,
+            port=self.port,
+            database=self.database,
+            user=self.user,
+            password=self.password,
+            min_size=2,
+            max_size=10,
+            command_timeout=30,
+            timeout=connect_timeout,
+        )
 
     def _load_credentials(self):
         """Load database credentials from .pgpass or environment"""
@@ -147,18 +163,9 @@ class DatabaseManager:
     async def connect(self):
         """Create connection pool"""
         try:
-            connect_timeout = float(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "20"))
-            self.pool = await asyncpg.create_pool(
-                host=self.host,
-                port=self.port,
-                database=self.database,
-                user=self.user,
-                password=self.password,
-                min_size=2,
-                max_size=10,
-                command_timeout=30,
-                timeout=connect_timeout,
-            )
+            async with self._pool_lock:
+                if self.pool is None:
+                    self.pool = await self._create_pool()
             logger.info(f"Database pool created: {self.database}@{self.host}")
         except Exception as e:
             logger.error(f"Failed to create database pool: {e}")
@@ -187,15 +194,21 @@ class DatabaseManager:
 
     async def _reconnect_pool(self) -> None:
         """Recycle the asyncpg pool to recover from transient connectivity failures."""
+        old_pool: Optional[asyncpg.Pool] = None
         try:
-            if self.pool:
-                await self.pool.close()
+            async with self._pool_lock:
+                old_pool = self.pool
+                self.pool = await self._create_pool()
+            logger.info("Database pool reconnected successfully")
         except Exception:
-            logger.warning("Failed to close database pool during reconnect", exc_info=True)
+            logger.error("Failed to reconnect database pool", exc_info=True)
+            raise
         finally:
-            self.pool = None
-
-        await self.connect()
+            if old_pool is not None:
+                try:
+                    await old_pool.close()
+                except Exception:
+                    logger.warning("Failed to close old database pool during reconnect", exc_info=True)
 
     async def check_health(self) -> bool:
         """Check database connection health"""
