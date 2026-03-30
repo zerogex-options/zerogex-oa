@@ -2722,7 +2722,17 @@ class DatabaseManager:
                 rows = await conn.fetch(query, symbol, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error fetching GEX heatmap: {e}")
+            if self._is_connection_error(e):
+                logger.warning(
+                    "Transient DB error fetching GEX heatmap for %s; reconnecting pool and retrying once",
+                    symbol,
+                    exc_info=True,
+                )
+                await self._reconnect_pool()
+                async with self._acquire_connection() as conn:
+                    rows = await conn.fetch(query, symbol, window_units)
+                    return [dict(row) for row in rows]
+            logger.error(f"Error fetching GEX heatmap: {e}", exc_info=True)
             raise
 
     async def get_option_quote(

@@ -242,7 +242,7 @@ async def get_gex_heatmap(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching GEX heatmap: {e}")
+        logger.error(f"Error fetching GEX heatmap: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
