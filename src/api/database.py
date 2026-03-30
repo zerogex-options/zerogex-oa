@@ -165,7 +165,7 @@ class DatabaseManager:
         """Create connection pool"""
         try:
             async with self._pool_lock:
-                if self.pool is None:
+                if not self._pool_is_usable(self.pool):
                     self.pool = await self._create_pool()
             logger.info(f"Database pool created: {self.database}@{self.host}")
         except Exception as e:
@@ -190,8 +190,20 @@ class DatabaseManager:
                 "temporarily unavailable",
                 "cannot connect",
                 "closed the connection",
+                "pool is closed",
+                "pool is closing",
             )
         )
+
+    @staticmethod
+    def _pool_is_usable(pool: Optional[asyncpg.Pool]) -> bool:
+        """True when pool exists and is not already closing."""
+        if pool is None:
+            return False
+        try:
+            return not pool.is_closing()
+        except Exception:
+            return False
 
     async def _reconnect_pool(self) -> None:
         """Recycle the asyncpg pool to recover from transient connectivity failures."""
@@ -219,16 +231,33 @@ class DatabaseManager:
         This prevents transient `'NoneType' object has no attribute 'acquire'` failures when
         a request arrives before pool initialization completes or during pool recycling.
         """
-        pool = self.pool
-        if pool is None:
-            await self.connect()
+        last_error: Optional[Exception] = None
+        for attempt in range(2):
             pool = self.pool
+            if not self._pool_is_usable(pool):
+                await self.connect()
+                pool = self.pool
 
-        if pool is None:
-            raise RuntimeError("Database pool is unavailable")
+            if not self._pool_is_usable(pool):
+                raise RuntimeError("Database pool is unavailable")
 
-        async with pool.acquire() as conn:
-            yield conn
+            try:
+                async with pool.acquire() as conn:
+                    yield conn
+                    return
+            except Exception as e:
+                last_error = e
+                if attempt == 0 and self._is_connection_error(e):
+                    logger.warning(
+                        "Transient DB pool/acquire failure; reconnecting and retrying once",
+                        exc_info=True,
+                    )
+                    await self._reconnect_pool()
+                    continue
+                raise
+
+        if last_error is not None:
+            raise last_error
 
     async def check_health(self) -> bool:
         """Check database connection health"""
