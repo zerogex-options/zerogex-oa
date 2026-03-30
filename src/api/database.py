@@ -138,6 +138,7 @@ class DatabaseManager:
             min_size=2,
             max_size=10,
             command_timeout=30,
+            max_inactive_connection_lifetime=120,
             timeout=connect_timeout,
         )
 
@@ -193,6 +194,33 @@ class DatabaseManager:
         except Exception:
             return False
 
+    @staticmethod
+    def _is_transient_db_error(error: Exception) -> bool:
+        text = str(error).lower()
+        return any(
+            token in text
+            for token in (
+                "ssl handshake",
+                "connection reset",
+                "connection refused",
+                "connection is closed",
+                "pool is closed",
+                "pool is closing",
+                "timeout",
+            )
+        ) or isinstance(error, (TimeoutError, ConnectionError, OSError))
+
+    async def _reconnect_pool(self) -> None:
+        """Reconnect DB pool once under lock."""
+        async with self._pool_lock:
+            old_pool = self.pool
+            self.pool = await self._create_pool()
+        if old_pool is not None:
+            try:
+                await old_pool.close()
+            except Exception:
+                logger.warning("Failed to close old pool during reconnect", exc_info=True)
+
     @asynccontextmanager
     async def _acquire_connection(self):
         """
@@ -201,12 +229,20 @@ class DatabaseManager:
         Fail fast when pool is unavailable/closing to avoid hidden retries and
         request-level latency amplification.
         """
-        pool = self.pool
-        if not self._pool_is_usable(pool):
-            raise RuntimeError("Database pool is unavailable or closing")
-
-        async with pool.acquire() as conn:
-            yield conn
+        for attempt in range(2):
+            pool = self.pool
+            if not self._pool_is_usable(pool):
+                raise RuntimeError("Database pool is unavailable or closing")
+            try:
+                async with pool.acquire() as conn:
+                    yield conn
+                    return
+            except Exception as e:
+                if attempt == 0 and self._is_transient_db_error(e):
+                    logger.warning("Transient DB acquire error; reconnecting pool and retrying once", exc_info=True)
+                    await self._reconnect_pool()
+                    continue
+                raise
 
     async def check_health(self) -> bool:
         """Check database connection health"""
@@ -2238,7 +2274,7 @@ class DatabaseManager:
                 row = await conn.fetchrow(query, symbol)
                 return dict(row) if row else None
         except Exception as e:
-            logger.error(f"Error fetching latest quote: {e}", exc_info=True)
+            logger.error(f"Error fetching latest quote: {e!r}", exc_info=True)
             raise
 
     async def get_previous_close(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
@@ -2622,7 +2658,7 @@ class DatabaseManager:
                 rows = await conn.fetch(query, symbol, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error fetching GEX heatmap: {e}", exc_info=True)
+            logger.error(f"Error fetching GEX heatmap: {e!r}", exc_info=True)
             raise
 
     async def get_option_quote(

@@ -240,7 +240,7 @@ async def get_gex_heatmap(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching GEX heatmap: {e}", exc_info=True)
+        logger.error(f"Error fetching GEX heatmap: {e!r}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -484,7 +484,7 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching quote: {e}", exc_info=True)
+        logger.error(f"Error fetching quote: {e!r}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/market/session-closes", response_model=SessionCloses, tags=["Market Data"])
