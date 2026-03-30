@@ -236,9 +236,7 @@ async def get_gex_heatmap(
     """Get GEX heatmap data (strike x time)"""
     try:
         data = await db_manager.get_gex_heatmap(symbol, timeframe, window_units)
-        if not data:
-            raise HTTPException(status_code=404, detail="No GEX heatmap data available")
-        return data
+        return data or []
     except HTTPException:
         raise
     except Exception as e:

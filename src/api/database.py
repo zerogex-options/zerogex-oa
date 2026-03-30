@@ -1417,6 +1417,7 @@ class DatabaseManager:
                     ELSE '⚪ Neutral'
                 END AS flow_bias,
                 underlying_price
+            FROM agg
             ORDER BY timestamp DESC, strike
             LIMIT $4
         """
@@ -1492,76 +1493,10 @@ class DatabaseManager:
         session: str = 'current',
         limit: int = 50
     ) -> List[Dict[str, Any]]:
-        """Get smart-money events directly from option_chains volume deltas."""
+        """Get smart-money events from canonical flow_contract_facts."""
         session_start, session_end = _get_session_bounds(session)
         query = """
-            WITH chain_deltas AS (
-                SELECT
-                    oc.timestamp,
-                    oc.underlying AS symbol,
-                    oc.option_symbol,
-                    oc.strike,
-                    oc.expiration,
-                    oc.option_type,
-                    COALESCE(
-                        oc.last,
-                        oc.mid,
-                        (COALESCE(oc.bid, 0) + COALESCE(oc.ask, 0)) / 2.0,
-                        oc.bid,
-                        oc.ask,
-                        0
-                    )::numeric AS last,
-                    oc.implied_volatility::numeric AS implied_volatility,
-                    oc.delta::numeric AS delta,
-                    uq.close::numeric AS underlying_price,
-                    CASE
-                        WHEN p.prev_volume IS NULL THEN COALESCE(oc.volume, 0)
-                        WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
-                           = (oc.timestamp AT TIME ZONE 'America/New_York')::date
-                            THEN GREATEST(COALESCE(oc.volume, 0) - COALESCE(p.prev_volume, 0), 0)
-                        ELSE COALESCE(oc.volume, 0)
-                    END::bigint AS volume_delta,
-                    -- Lee-Ready: buyer-initiated volume delta
-                    CASE
-                        WHEN p.prev_ask_vol IS NULL THEN COALESCE(oc.ask_volume, 0)
-                        WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
-                           = (oc.timestamp AT TIME ZONE 'America/New_York')::date
-                            THEN GREATEST(COALESCE(oc.ask_volume, 0) - COALESCE(p.prev_ask_vol, 0), 0)
-                        ELSE COALESCE(oc.ask_volume, 0)
-                    END::bigint AS ask_vol_delta,
-                    -- Lee-Ready: seller-initiated volume delta
-                    CASE
-                        WHEN p.prev_bid_vol IS NULL THEN COALESCE(oc.bid_volume, 0)
-                        WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
-                           = (oc.timestamp AT TIME ZONE 'America/New_York')::date
-                            THEN GREATEST(COALESCE(oc.bid_volume, 0) - COALESCE(p.prev_bid_vol, 0), 0)
-                        ELSE COALESCE(oc.bid_volume, 0)
-                    END::bigint AS bid_vol_delta
-                FROM option_chains oc
-                LEFT JOIN LATERAL (
-                    SELECT
-                        oc2.timestamp AS prev_ts,
-                        oc2.volume AS prev_volume,
-                        oc2.ask_volume AS prev_ask_vol,
-                        oc2.bid_volume AS prev_bid_vol
-                    FROM option_chains oc2
-                    WHERE oc2.option_symbol = oc.option_symbol
-                      AND oc2.timestamp < oc.timestamp
-                    ORDER BY oc2.timestamp DESC
-                    LIMIT 1
-                ) p ON TRUE
-                LEFT JOIN LATERAL (
-                    SELECT close
-                    FROM underlying_quotes uq
-                    WHERE uq.symbol = oc.underlying
-                      AND uq.timestamp <= oc.timestamp
-                    ORDER BY uq.timestamp DESC
-                    LIMIT 1
-                ) uq ON TRUE
-                WHERE oc.underlying = $1
-                  AND oc.timestamp >= $2
-                  AND oc.timestamp <= $3
-            ),
+            WITH
             scored AS (
                 SELECT
                     timestamp,
@@ -1572,26 +1507,25 @@ class DatabaseManager:
                     (expiration - CURRENT_DATE)::int AS dte,
                     option_type,
                     volume_delta AS flow,
-                    (volume_delta * last * 100)::numeric AS notional,
-                    -- Trade direction: 'BUY' if majority at ask, 'SELL' if majority at bid
+                    premium_delta::numeric AS notional,
                     CASE
-                        WHEN ask_vol_delta > bid_vol_delta THEN 'BUY'
-                        WHEN bid_vol_delta > ask_vol_delta THEN 'SELL'
+                        WHEN buy_premium > sell_premium THEN 'BUY'
+                        WHEN sell_premium > buy_premium THEN 'SELL'
                         ELSE 'NEUTRAL'
                     END AS trade_side,
                     delta,
                     LEAST(10, GREATEST(0,
                         CASE WHEN volume_delta >= 500 THEN 4 WHEN volume_delta >= 200 THEN 3 WHEN volume_delta >= 100 THEN 2 WHEN volume_delta >= 50 THEN 1 ELSE 0 END +
-                        CASE WHEN volume_delta * last * 100 >= 500000 THEN 4 WHEN volume_delta * last * 100 >= 250000 THEN 3 WHEN volume_delta * last * 100 >= 100000 THEN 2 WHEN volume_delta * last * 100 >= 50000 THEN 1 ELSE 0 END +
+                        CASE WHEN premium_delta >= 500000 THEN 4 WHEN premium_delta >= 250000 THEN 3 WHEN premium_delta >= 100000 THEN 2 WHEN premium_delta >= 50000 THEN 1 ELSE 0 END +
                         CASE WHEN implied_volatility > 1.0 THEN 2 WHEN implied_volatility > 0.6 THEN 1 ELSE 0 END +
                         CASE WHEN ABS(delta) < 0.15 THEN 1 ELSE 0 END +
                         CASE WHEN (expiration - CURRENT_DATE) <= 2 THEN 1 ELSE 0 END
                     ))::numeric AS score,
                     CASE
-                        WHEN volume_delta * last * 100 >= 500000 THEN '💰 $500K+'
-                        WHEN volume_delta * last * 100 >= 250000 THEN '💵 $250K+'
-                        WHEN volume_delta * last * 100 >= 100000 THEN '💸 $100K+'
-                        WHEN volume_delta * last * 100 >= 50000 THEN '💳 $50K+'
+                        WHEN premium_delta >= 500000 THEN '💰 $500K+'
+                        WHEN premium_delta >= 250000 THEN '💵 $250K+'
+                        WHEN premium_delta >= 100000 THEN '💸 $100K+'
+                        WHEN premium_delta >= 50000 THEN '💳 $50K+'
                         ELSE '💴 <$50K'
                     END AS notional_class,
                     CASE
@@ -1601,11 +1535,14 @@ class DatabaseManager:
                         ELSE '💼 Standard'
                     END AS size_class,
                     underlying_price
-                FROM chain_deltas
-                WHERE volume_delta > 0
+                FROM flow_contract_facts
+                WHERE symbol = $1
+                  AND timestamp >= $2
+                  AND timestamp <= $3
+                  AND volume_delta > 0
                   AND (
                     volume_delta >= 50
-                    OR volume_delta * last * 100 >= 50000
+                    OR premium_delta >= 50000
                     OR implied_volatility > 0.4
                     OR (ABS(delta) < 0.15 AND volume_delta >= 20)
                   )
