@@ -167,7 +167,7 @@ async def get_gex_summary(symbol: str = Query(default="SPY")):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching GEX summary: {e}")
+        logger.error(f"Error fetching GEX summary: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/gex/by-strike", response_model=List[GEXByStrike], tags=["GEX"])
@@ -486,7 +486,7 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching quote: {e}")
+        logger.error(f"Error fetching quote: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/market/session-closes", response_model=SessionCloses, tags=["Market Data"])

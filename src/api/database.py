@@ -6,6 +6,7 @@ Uses asyncpg for async PostgreSQL operations
 import asyncio
 import asyncpg
 import os
+import time as time_module
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timedelta, date, time
@@ -119,6 +120,11 @@ class DatabaseManager:
     def __init__(self):
         self.pool: Optional[asyncpg.Pool] = None
         self._pool_lock = asyncio.Lock()
+        self._last_connect_failure_ts: float = 0.0
+        self._last_connect_error: Optional[str] = None
+        self._connect_retry_cooldown_seconds: float = float(
+            os.getenv("DB_CONNECT_RETRY_COOLDOWN_SECONDS", "5")
+        )
         self._load_credentials()
 
     async def _create_pool(self) -> asyncpg.Pool:
@@ -166,10 +172,26 @@ class DatabaseManager:
         try:
             async with self._pool_lock:
                 if not self._pool_is_usable(self.pool):
+                    now = time_module.monotonic()
+                    if (
+                        self._last_connect_failure_ts > 0
+                        and (now - self._last_connect_failure_ts) < self._connect_retry_cooldown_seconds
+                    ):
+                        cooldown_remaining = self._connect_retry_cooldown_seconds - (
+                            now - self._last_connect_failure_ts
+                        )
+                        raise RuntimeError(
+                            f"DB connect cooldown active ({cooldown_remaining:.1f}s remaining); "
+                            f"last error: {self._last_connect_error or 'unknown'}"
+                        )
                     self.pool = await self._create_pool()
+                    self._last_connect_failure_ts = 0.0
+                    self._last_connect_error = None
             logger.info(f"Database pool created: {self.database}@{self.host}")
         except Exception as e:
-            logger.error(f"Failed to create database pool: {e}")
+            self._last_connect_failure_ts = time_module.monotonic()
+            self._last_connect_error = f"{type(e).__name__}: {e!r}"
+            logger.error("Failed to create database pool: %r", e, exc_info=True)
             raise
 
     async def disconnect(self):
