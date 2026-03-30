@@ -3,6 +3,7 @@ Database manager for API queries
 Uses asyncpg for async PostgreSQL operations
 """
 
+import asyncio
 import asyncpg
 import os
 from pathlib import Path
@@ -146,6 +147,7 @@ class DatabaseManager:
     async def connect(self):
         """Create connection pool"""
         try:
+            connect_timeout = float(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "20"))
             self.pool = await asyncpg.create_pool(
                 host=self.host,
                 port=self.port,
@@ -154,7 +156,8 @@ class DatabaseManager:
                 password=self.password,
                 min_size=2,
                 max_size=10,
-                command_timeout=30
+                command_timeout=30,
+                timeout=connect_timeout,
             )
             logger.info(f"Database pool created: {self.database}@{self.host}")
         except Exception as e:
@@ -166,6 +169,33 @@ class DatabaseManager:
         if self.pool:
             await self.pool.close()
             logger.info("Database pool closed")
+
+    def _is_connection_error(self, error: Exception) -> bool:
+        """Return True when an exception indicates a transient DB connectivity issue."""
+        error_text = str(error).lower()
+        return isinstance(error, (asyncio.TimeoutError, ConnectionError, OSError)) or any(
+            token in error_text
+            for token in (
+                "ssl handshake",
+                "connection",
+                "timeout",
+                "temporarily unavailable",
+                "cannot connect",
+                "closed the connection",
+            )
+        )
+
+    async def _reconnect_pool(self) -> None:
+        """Recycle the asyncpg pool to recover from transient connectivity failures."""
+        try:
+            if self.pool:
+                await self.pool.close()
+        except Exception:
+            logger.warning("Failed to close database pool during reconnect", exc_info=True)
+        finally:
+            self.pool = None
+
+        await self.connect()
 
     async def check_health(self) -> bool:
         """Check database connection health"""
@@ -1337,7 +1367,18 @@ class DatabaseManager:
                 rows = await conn.fetch(query, symbol, session_start, session_end)
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error fetching flow by type: {e}")
+            if self._is_connection_error(e):
+                logger.warning(
+                    "Transient DB error fetching flow by type for %s; reconnecting pool and retrying once",
+                    symbol,
+                    exc_info=True,
+                )
+                await self._reconnect_pool()
+                async with self.pool.acquire() as conn:
+                    await self._refresh_flow_cache(conn, symbol)
+                    rows = await conn.fetch(query, symbol, session_start, session_end)
+                    return [dict(row) for row in rows]
+            logger.error(f"Error fetching flow by type: {e}", exc_info=True)
             raise
 
     async def get_flow_by_strike(
@@ -2254,7 +2295,17 @@ class DatabaseManager:
                 row = await conn.fetchrow(query, symbol)
                 return dict(row) if row else None
         except Exception as e:
-            logger.error(f"Error fetching latest quote: {e}")
+            if self._is_connection_error(e):
+                logger.warning(
+                    "Transient DB error fetching latest quote for %s; reconnecting pool and retrying once",
+                    symbol,
+                    exc_info=True,
+                )
+                await self._reconnect_pool()
+                async with self.pool.acquire() as conn:
+                    row = await conn.fetchrow(query, symbol)
+                    return dict(row) if row else None
+            logger.error(f"Error fetching latest quote: {e}", exc_info=True)
             raise
 
     async def get_previous_close(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
