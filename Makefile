@@ -174,6 +174,7 @@ help: ## Show this help message
 	@echo "  make api-health          - Show API service health and recent errors"
 	@echo "  make api-test            - Test API endpoints"
 	@echo "  make api-install-service - Install API as systemd service"
+	@echo "  make db-maintain-install - Install daily DB maintenance timer (prune + vacuum)"
 	@echo ""
 	@echo "$(GREEN)Logs (all services):$(NC)"
 	@echo "  make {service}-logs             - Show live logs (Ctrl+C to exit)"
@@ -2426,3 +2427,14 @@ api-install-service: ## Install API as systemd service
 	@sudo systemctl enable $(API_SERVICE)
 	@echo "$(GREEN)✅ API service installed$(NC)"
 	@echo "$(YELLOW)Start with: make api-start$(NC)"
+
+.PHONY: db-maintain-install
+db-maintain-install: ## Install daily DB maintenance timer (prune old data + vacuum)
+	@echo "$(BLUE)=== Installing DB Maintenance Timer ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-db-maintain.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-db-maintain.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-db-maintain.timer
+	@echo "$(GREEN)✅ DB maintenance timer installed and started$(NC)"
+	@echo "$(YELLOW)Runs daily at 2:00 AM. Check status: systemctl status zerogex-oa-db-maintain.timer$(NC)"
+	@echo "$(YELLOW)View logs: journalctl -u zerogex-oa-db-maintain$(NC)"

@@ -1,0 +1,36 @@
+[Unit]
+Description=ZeroGEX daily database maintenance (prune + vacuum + reindex)
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+# Environment
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Run the lightweight daily maintenance:
+#   1. Prune rows older than DATA_RETENTION_DAYS (default 90)
+#   2. Regular VACUUM ANALYZE (not FULL — safe while services run)
+ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa db-prune
+ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa vacuum
+
+# Allow up to 30 minutes for large tables
+TimeoutStartSec=1800
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-db-maintain

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily database maintenance timer for ZeroGEX (2:00 AM ET)
+
+[Timer]
+# Run daily at 2:00 AM server time (schedule for ET overnight)
+OnCalendar=*-*-* 02:00:00
+RandomizedDelaySec=5m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
