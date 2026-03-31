@@ -103,9 +103,11 @@ class AnalyticsEngine:
                 # Single query: get latest timestamp + underlying price + option data
                 cursor.execute("""
                     WITH latest_ts AS (
-                        SELECT MAX(timestamp) AS ts
+                        SELECT timestamp AS ts
                         FROM option_chains
                         WHERE underlying = %s
+                        ORDER BY timestamp DESC
+                        LIMIT 1
                     ),
                     underlying AS (
                         SELECT uq.close

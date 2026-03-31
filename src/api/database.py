@@ -269,19 +269,37 @@ class DatabaseManager:
         return row
 
     async def _refresh_flow_cache(self, conn: asyncpg.Connection, symbol: str) -> None:
-        """Refresh flow caches for only the latest minute snapshot for a symbol."""
+        """Refresh flow caches for only the latest minute snapshot for a symbol.
+
+        Failures here are non-fatal: the endpoint will serve whatever data
+        already exists in the cache tables rather than returning a 500.
+        """
         now = time_module.monotonic()
         last_refresh = self._last_flow_refresh_by_symbol.get(symbol, 0.0)
         if (now - last_refresh) < self._flow_refresh_min_seconds:
             return
-        self._last_flow_refresh_by_symbol[symbol] = now
 
+        try:
+            await self._do_refresh_flow_cache(conn, symbol)
+        except Exception as e:
+            logger.warning(f"Flow cache refresh failed for {symbol} (non-fatal): {e}")
+        finally:
+            # Always update the throttle timestamp so we don't retry
+            # a failing refresh on every request.
+            self._last_flow_refresh_by_symbol[symbol] = time_module.monotonic()
+
+    async def _do_refresh_flow_cache(self, conn: asyncpg.Connection, symbol: str) -> None:
+        """Inner implementation of flow cache refresh."""
         canonical_only = os.getenv("FLOW_CANONICAL_ONLY", "true").lower() == "true"
+        # Use ORDER BY + LIMIT 1 instead of MAX() to exploit the
+        # (underlying, timestamp DESC) index as an index-only scan.
         latest_ts = await conn.fetchval(
             """
-            SELECT MAX(timestamp)
+            SELECT timestamp
             FROM option_chains
             WHERE underlying = $1
+            ORDER BY timestamp DESC
+            LIMIT 1
             """,
             symbol,
         )
@@ -816,9 +834,11 @@ class DatabaseManager:
         strike_limit = max(10, min(strike_limit, 1000))
         query = """
             WITH latest AS (
-                SELECT MAX(timestamp) AS max_ts
+                SELECT timestamp AS max_ts
                 FROM option_chains
                 WHERE underlying = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
             ),
             existing AS (
                 SELECT source_timestamp
@@ -1158,9 +1178,11 @@ class DatabaseManager:
             FROM gex_by_strike
             WHERE underlying = $1
                 AND timestamp = (
-                    SELECT MAX(timestamp)
+                    SELECT timestamp
                     FROM gex_by_strike
                     WHERE underlying = $1
+                    ORDER BY timestamp DESC
+                    LIMIT 1
                 )
             {order_clause}
             LIMIT $2
@@ -1187,9 +1209,11 @@ class DatabaseManager:
         step_interval = _interval_expr(timeframe)
         query = f"""
             WITH latest AS (
-                SELECT MAX(timestamp) AS max_ts
+                SELECT timestamp AS max_ts
                 FROM gex_summary
                 WHERE underlying = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
             ),
             bounds AS (
                 SELECT
@@ -1652,9 +1676,11 @@ class DatabaseManager:
         bucket = _bucket_expr(timeframe)
         query = f"""
             WITH latest AS (
-                SELECT MAX(timestamp) AS max_ts
+                SELECT timestamp AS max_ts
                 FROM underlying_vwap_deviation
                 WHERE symbol = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
             ),
             bounds AS (
                 SELECT
@@ -1713,9 +1739,11 @@ class DatabaseManager:
         bucket = _bucket_expr(timeframe)
         query = f"""
             WITH latest AS (
-                SELECT MAX(timestamp) AS max_ts
+                SELECT timestamp AS max_ts
                 FROM opening_range_breakout
                 WHERE symbol = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
             ),
             bounds AS (
                 SELECT
@@ -2379,9 +2407,11 @@ class DatabaseManager:
         step_interval = _interval_expr(timeframe)
         query = f"""
             WITH latest AS (
-                SELECT MAX(timestamp) AS max_ts
+                SELECT timestamp AS max_ts
                 FROM underlying_quotes
                 WHERE symbol = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
             ),
             bounds AS (
                 SELECT
@@ -2443,9 +2473,11 @@ class DatabaseManager:
         step_interval = _interval_expr(timeframe)
         query = f"""
             WITH latest AS (
-                SELECT MAX(timestamp) AS max_ts
+                SELECT timestamp AS max_ts
                 FROM gex_summary
                 WHERE underlying = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
             ),
             bounds AS (
                 SELECT max_ts - ({step_interval} * ($2 - 1)) AS start_ts, max_ts AS end_ts
@@ -2546,9 +2578,11 @@ class DatabaseManager:
         step_interval = _interval_expr(timeframe)
         query = f"""
             WITH latest_price_timestamp AS (
-                SELECT MAX(timestamp) as max_ts
+                SELECT timestamp as max_ts
                 FROM underlying_quotes
                 WHERE symbol = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
             ),
             time_window AS (
                 SELECT
@@ -2782,9 +2816,11 @@ class DatabaseManager:
 
         chain_query = """
             WITH latest_ts AS (
-                SELECT MAX(timestamp) AS ts
+                SELECT timestamp AS ts
                 FROM option_chains
                 WHERE underlying = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
             ),
             eligible_strikes AS (
                 SELECT strike

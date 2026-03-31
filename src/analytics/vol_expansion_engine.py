@@ -237,9 +237,11 @@ class VolExpansionEngine:
                 if anchor_ts is None:
                     cur.execute(
                         """
-                        SELECT MAX(timestamp)
+                        SELECT timestamp
                         FROM gex_summary
                         WHERE underlying = %s
+                        ORDER BY timestamp DESC
+                        LIMIT 1
                         """,
                         (self.db_symbol,),
                     )
@@ -334,7 +336,7 @@ class VolExpansionEngine:
                     FROM option_chains
                     WHERE underlying = %s
                       AND timestamp = (
-                          SELECT MAX(timestamp) FROM option_chains WHERE underlying = %s AND timestamp <= %s
+                          SELECT timestamp FROM option_chains WHERE underlying = %s AND timestamp <= %s ORDER BY timestamp DESC LIMIT 1
                       )
                       AND delta IS NOT NULL
                       AND open_interest > 0
@@ -352,7 +354,7 @@ class VolExpansionEngine:
                     FROM gex_by_strike
                     WHERE underlying = %s
                       AND timestamp = (
-                          SELECT MAX(timestamp) FROM gex_by_strike WHERE underlying = %s AND timestamp <= %s
+                          SELECT timestamp FROM gex_by_strike WHERE underlying = %s AND timestamp <= %s ORDER BY timestamp DESC LIMIT 1
                       )
                     """,
                     (self.db_symbol, self.db_symbol, anchor_ts),
@@ -407,7 +409,7 @@ class VolExpansionEngine:
                     FROM option_chains
                     WHERE underlying = %s
                       AND timestamp = (
-                          SELECT MAX(timestamp) FROM option_chains WHERE underlying = %s AND timestamp <= %s
+                          SELECT timestamp FROM option_chains WHERE underlying = %s AND timestamp <= %s ORDER BY timestamp DESC LIMIT 1
                       )
                       AND expiration >= DATE(%s AT TIME ZONE 'America/New_York')
                     """,

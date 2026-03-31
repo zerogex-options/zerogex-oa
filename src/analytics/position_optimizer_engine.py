@@ -265,7 +265,7 @@ class PositionOptimizerEngine:
                 trade_date = anchor_ts.astimezone(ET).date() if anchor_ts.tzinfo else anchor_ts.date()
                 cur.execute(
                     """
-                    SELECT MAX(timestamp)
+                    SELECT timestamp
                     FROM option_chains
                     WHERE underlying = %s
                       AND timestamp <= %s
@@ -275,6 +275,8 @@ class PositionOptimizerEngine:
                           (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
                           OR (last IS NOT NULL AND last > 0)
                       )
+                    ORDER BY timestamp DESC
+                    LIMIT 1
                     """,
                     (self.db_symbol, anchor_ts, trade_date, dte_min, trade_date, dte_max),
                 )
@@ -385,7 +387,7 @@ class PositionOptimizerEngine:
                     )
                     cur.execute(
                         """
-                        SELECT MAX(timestamp)
+                        SELECT timestamp
                         FROM option_chains
                         WHERE underlying = %s
                           AND timestamp <= %s
@@ -394,6 +396,8 @@ class PositionOptimizerEngine:
                               (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
                               OR (last IS NOT NULL AND last > 0)
                           )
+                        ORDER BY timestamp DESC
+                        LIMIT 1
                         """,
                         (self.db_symbol, anchor_ts, trade_date, trade_date),
                     )

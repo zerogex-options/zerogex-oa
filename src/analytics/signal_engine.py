@@ -602,9 +602,11 @@ class SignalEngine:
                     FROM option_chains oc
                     WHERE oc.underlying = %s
                       AND oc.timestamp = (
-                          SELECT MAX(timestamp)
+                          SELECT timestamp
                           FROM option_chains
                           WHERE underlying = %s
+                          ORDER BY timestamp DESC
+                          LIMIT 1
                       )
                       AND oc.delta IS NOT NULL
                       AND oc.open_interest > 0
@@ -661,9 +663,11 @@ class SignalEngine:
                     FROM gex_by_strike
                     WHERE underlying = %s
                       AND timestamp = (
-                          SELECT MAX(timestamp)
+                          SELECT timestamp
                           FROM gex_by_strike
                           WHERE underlying = %s
+                          ORDER BY timestamp DESC
+                          LIMIT 1
                       )
                 """, (self.db_symbol, self.db_symbol))
                 vc_row = cur.fetchone()
