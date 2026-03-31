@@ -8,8 +8,8 @@
 -include .env
 export
 
-# PostgreSQL connection string
-PSQL = PGPASSFILE=~/.pgpass psql "sslmode=require host=$(DB_HOST) port=$(DB_PORT) user=$(DB_USER) dbname=$(DB_NAME)"
+# PostgreSQL connection string (keepalives prevent RDS from dropping idle SSL connections)
+PSQL = PGPASSFILE=~/.pgpass psql "sslmode=require host=$(DB_HOST) port=$(DB_PORT) user=$(DB_USER) dbname=$(DB_NAME) keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=3"
 
 # Service names
 INGESTION_SERVICE = zerogex-oa-ingestion
@@ -2083,37 +2083,27 @@ schema-backup: ## Backup current schema to file
 .PHONY: vacuum
 vacuum: ## Vacuum analyze all tables
 	@echo "$(YELLOW)Running VACUUM ANALYZE on all tables...$(NC)"
-	@$(PSQL) -c "VACUUM ANALYZE underlying_quotes;"
-	@$(PSQL) -c "VACUUM ANALYZE option_chains;"
-	@$(PSQL) -c "VACUUM ANALYZE gex_summary;"
-	@$(PSQL) -c "VACUUM ANALYZE gex_by_strike;"
-	@$(PSQL) -c "VACUUM ANALYZE flow_contract_facts;"
-	@$(PSQL) -c "VACUUM ANALYZE flow_by_type;"
-	@$(PSQL) -c "VACUUM ANALYZE flow_by_strike;"
-	@$(PSQL) -c "VACUUM ANALYZE flow_by_expiration;"
-	@$(PSQL) -c "VACUUM ANALYZE flow_smart_money;"
-	@$(PSQL) -c "VACUUM ANALYZE trade_signals;"
-	@$(PSQL) -c "VACUUM ANALYZE volatility_expansion_signals;"
-	@$(PSQL) -c "VACUUM ANALYZE position_optimizer_signals;"
+	@for tbl in $(DB_MAINTAIN_TABLES); do \
+		echo "  VACUUM ANALYZE $$tbl ..."; \
+		$(PSQL) -c "VACUUM ANALYZE $$tbl;" || echo "$(RED)  ⚠️  Failed for $$tbl, continuing...$(NC)"; \
+	done
 	@echo "$(GREEN)✅ Done$(NC)"
 
 DATA_RETENTION_DAYS ?= 90
 
+# Helper: all tables that hold timestamped data and need regular maintenance.
+DB_MAINTAIN_TABLES = option_chains underlying_quotes gex_summary gex_by_strike \
+	flow_contract_facts flow_by_type flow_by_strike flow_by_expiration \
+	flow_smart_money trade_signals volatility_expansion_signals \
+	position_optimizer_signals
+
 .PHONY: db-prune
 db-prune: ## Delete data older than DATA_RETENTION_DAYS (default 90)
 	@echo "$(YELLOW)Pruning data older than $(DATA_RETENTION_DAYS) days...$(NC)"
-	@$(PSQL) -c "DELETE FROM option_chains WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
-	@$(PSQL) -c "DELETE FROM underlying_quotes WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
-	@$(PSQL) -c "DELETE FROM gex_summary WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
-	@$(PSQL) -c "DELETE FROM gex_by_strike WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
-	@$(PSQL) -c "DELETE FROM flow_contract_facts WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
-	@$(PSQL) -c "DELETE FROM flow_by_type WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
-	@$(PSQL) -c "DELETE FROM flow_by_strike WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
-	@$(PSQL) -c "DELETE FROM flow_by_expiration WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
-	@$(PSQL) -c "DELETE FROM flow_smart_money WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
-	@$(PSQL) -c "DELETE FROM trade_signals WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
-	@$(PSQL) -c "DELETE FROM volatility_expansion_signals WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
-	@$(PSQL) -c "DELETE FROM position_optimizer_signals WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
+	@for tbl in $(DB_MAINTAIN_TABLES); do \
+		echo "  Pruning $$tbl ..."; \
+		$(PSQL) -c "DELETE FROM $$tbl WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';" || true; \
+	done
 	@echo "$(GREEN)✅ Prune complete$(NC)"
 
 .PHONY: db-maintain
@@ -2121,38 +2111,18 @@ db-maintain: ## Full maintenance: prune old data, vacuum full, reindex (run with
 	@echo "$(BLUE)=== Full Database Maintenance ===$(NC)"
 	@echo "$(RED)⚠️  This can take several minutes on large databases. Services should be stopped.$(NC)"
 	@echo ""
-	@echo "$(YELLOW)Step 1/4: Pruning data older than $(DATA_RETENTION_DAYS) days...$(NC)"
+	@echo "$(YELLOW)Step 1/3: Pruning data older than $(DATA_RETENTION_DAYS) days...$(NC)"
 	@$(MAKE) db-prune
 	@echo ""
-	@echo "$(YELLOW)Step 2/4: Running VACUUM FULL (reclaims disk space, rewrites tables)...$(NC)"
-	@$(PSQL) -c "VACUUM FULL ANALYZE underlying_quotes;"
-	@$(PSQL) -c "VACUUM FULL ANALYZE option_chains;"
-	@$(PSQL) -c "VACUUM FULL ANALYZE gex_summary;"
-	@$(PSQL) -c "VACUUM FULL ANALYZE gex_by_strike;"
-	@$(PSQL) -c "VACUUM FULL ANALYZE flow_contract_facts;"
-	@$(PSQL) -c "VACUUM FULL ANALYZE flow_by_type;"
-	@$(PSQL) -c "VACUUM FULL ANALYZE flow_by_strike;"
-	@$(PSQL) -c "VACUUM FULL ANALYZE flow_by_expiration;"
-	@$(PSQL) -c "VACUUM FULL ANALYZE flow_smart_money;"
-	@$(PSQL) -c "VACUUM FULL ANALYZE trade_signals;"
-	@$(PSQL) -c "VACUUM FULL ANALYZE volatility_expansion_signals;"
-	@$(PSQL) -c "VACUUM FULL ANALYZE position_optimizer_signals;"
+	@echo "$(YELLOW)Step 2/3: Running VACUUM FULL + REINDEX per table (reclaims disk space)...$(NC)"
+	@for tbl in $(DB_MAINTAIN_TABLES); do \
+		echo "  VACUUM FULL $$tbl ..."; \
+		$(PSQL) -c "VACUUM FULL ANALYZE $$tbl;" || echo "$(RED)  ⚠️  VACUUM FULL failed for $$tbl, continuing...$(NC)"; \
+		echo "  REINDEX $$tbl ..."; \
+		$(PSQL) -c "REINDEX TABLE $$tbl;" || echo "$(RED)  ⚠️  REINDEX failed for $$tbl, continuing...$(NC)"; \
+	done
 	@echo ""
-	@echo "$(YELLOW)Step 3/4: Reindexing all tables...$(NC)"
-	@$(PSQL) -c "REINDEX TABLE underlying_quotes;"
-	@$(PSQL) -c "REINDEX TABLE option_chains;"
-	@$(PSQL) -c "REINDEX TABLE gex_summary;"
-	@$(PSQL) -c "REINDEX TABLE gex_by_strike;"
-	@$(PSQL) -c "REINDEX TABLE flow_contract_facts;"
-	@$(PSQL) -c "REINDEX TABLE flow_by_type;"
-	@$(PSQL) -c "REINDEX TABLE flow_by_strike;"
-	@$(PSQL) -c "REINDEX TABLE flow_by_expiration;"
-	@$(PSQL) -c "REINDEX TABLE flow_smart_money;"
-	@$(PSQL) -c "REINDEX TABLE trade_signals;"
-	@$(PSQL) -c "REINDEX TABLE volatility_expansion_signals;"
-	@$(PSQL) -c "REINDEX TABLE position_optimizer_signals;"
-	@echo ""
-	@echo "$(YELLOW)Step 4/4: Updating planner statistics...$(NC)"
+	@echo "$(YELLOW)Step 3/3: Updating planner statistics...$(NC)"
 	@$(PSQL) -c "ANALYZE;"
 	@echo ""
 	@echo "$(GREEN)✅ Full maintenance complete$(NC)"
