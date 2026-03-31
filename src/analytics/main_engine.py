@@ -700,6 +700,8 @@ class AnalyticsEngine:
 
         underlying_price should be passed in from run_calculation() where it is
         already fetched, avoiding a redundant query.
+
+        Uses LAG() window functions instead of LATERAL joins for O(n) performance.
         """
         try:
             with db_connection() as conn:
@@ -708,36 +710,26 @@ class AnalyticsEngine:
                 # 1. Refresh flow_by_type
                 logger.debug("Refreshing flow_by_type...")
                 cursor.execute("""
-                    WITH latest_rows AS (
-                        SELECT oc.*
+                    WITH with_prev AS (
+                        SELECT
+                            oc.timestamp,
+                            oc.option_symbol,
+                            oc.option_type,
+                            oc.last,
+                            oc.implied_volatility,
+                            oc.delta,
+                            CASE
+                                WHEN LAG(oc.volume) OVER w IS NULL THEN COALESCE(oc.volume, 0)
+                                WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
+                                    = (oc.timestamp AT TIME ZONE 'America/New_York')::date
+                                    THEN GREATEST(COALESCE(oc.volume, 0) - COALESCE(LAG(oc.volume) OVER w, 0), 0)
+                                ELSE COALESCE(oc.volume, 0)
+                            END::bigint AS volume_delta
                         FROM option_chains oc
                         WHERE oc.underlying = %s
-                          AND oc.timestamp = %s
-                    ),
-                    with_prev AS (
-                        SELECT
-                            l.timestamp,
-                            l.option_symbol,
-                            l.option_type,
-                            l.last,
-                            l.implied_volatility,
-                            l.delta,
-                            CASE
-                                WHEN p.prev_volume IS NULL THEN COALESCE(l.volume, 0)
-                                WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
-                                    = (l.timestamp AT TIME ZONE 'America/New_York')::date
-                                    THEN GREATEST(COALESCE(l.volume, 0) - COALESCE(p.prev_volume, 0), 0)
-                                ELSE COALESCE(l.volume, 0)
-                            END::bigint AS volume_delta
-                        FROM latest_rows l
-                        LEFT JOIN LATERAL (
-                            SELECT oc2.timestamp AS prev_ts, oc2.volume AS prev_volume
-                            FROM option_chains oc2
-                            WHERE oc2.option_symbol = l.option_symbol
-                              AND oc2.timestamp < l.timestamp
-                            ORDER BY oc2.timestamp DESC
-                            LIMIT 1
-                        ) p ON TRUE
+                          AND oc.timestamp >= %s - INTERVAL '2 minutes'
+                          AND oc.timestamp <= %s
+                        WINDOW w AS (PARTITION BY oc.option_symbol ORDER BY oc.timestamp)
                     )
                     INSERT INTO flow_by_type (
                         timestamp,
@@ -759,7 +751,8 @@ class AnalyticsEngine:
                         SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric,
                         %s::numeric
                     FROM with_prev
-                    WHERE volume_delta > 0
+                    WHERE timestamp = %s
+                      AND volume_delta > 0
                     GROUP BY timestamp, option_type
                     ON CONFLICT (timestamp, symbol, option_type)
                     DO UPDATE SET
@@ -769,40 +762,30 @@ class AnalyticsEngine:
                         net_delta = EXCLUDED.net_delta,
                         underlying_price = EXCLUDED.underlying_price,
                         updated_at = NOW()
-                """, (self.db_symbol, timestamp, self.db_symbol, underlying_price))
+                """, (self.db_symbol, timestamp, timestamp, self.db_symbol, underlying_price, timestamp))
 
                 # 2. Refresh flow_by_strike
                 logger.debug("Refreshing flow_by_strike...")
                 cursor.execute("""
-                    WITH latest_rows AS (
-                        SELECT oc.*
+                    WITH with_prev AS (
+                        SELECT
+                            oc.timestamp,
+                            oc.strike,
+                            oc.last,
+                            oc.implied_volatility,
+                            oc.option_type,
+                            CASE
+                                WHEN LAG(oc.volume) OVER w IS NULL THEN COALESCE(oc.volume, 0)
+                                WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
+                                    = (oc.timestamp AT TIME ZONE 'America/New_York')::date
+                                    THEN GREATEST(COALESCE(oc.volume, 0) - COALESCE(LAG(oc.volume) OVER w, 0), 0)
+                                ELSE COALESCE(oc.volume, 0)
+                            END::bigint AS volume_delta
                         FROM option_chains oc
                         WHERE oc.underlying = %s
-                          AND oc.timestamp = %s
-                    ),
-                    with_prev AS (
-                        SELECT
-                            l.timestamp,
-                            l.strike,
-                            l.last,
-                            l.implied_volatility,
-                            l.option_type,
-                            CASE
-                                WHEN p.prev_volume IS NULL THEN COALESCE(l.volume, 0)
-                                WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
-                                    = (l.timestamp AT TIME ZONE 'America/New_York')::date
-                                    THEN GREATEST(COALESCE(l.volume, 0) - COALESCE(p.prev_volume, 0), 0)
-                                ELSE COALESCE(l.volume, 0)
-                            END::bigint AS volume_delta
-                        FROM latest_rows l
-                        LEFT JOIN LATERAL (
-                            SELECT oc2.timestamp AS prev_ts, oc2.volume AS prev_volume
-                            FROM option_chains oc2
-                            WHERE oc2.option_symbol = l.option_symbol
-                              AND oc2.timestamp < l.timestamp
-                            ORDER BY oc2.timestamp DESC
-                            LIMIT 1
-                        ) p ON TRUE
+                          AND oc.timestamp >= %s - INTERVAL '2 minutes'
+                          AND oc.timestamp <= %s
+                        WINDOW w AS (PARTITION BY oc.option_symbol ORDER BY oc.timestamp)
                     )
                     INSERT INTO flow_by_strike (
                         timestamp,
@@ -824,7 +807,8 @@ class AnalyticsEngine:
                         SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric,
                         %s::numeric
                     FROM with_prev
-                    WHERE volume_delta > 0
+                    WHERE timestamp = %s
+                      AND volume_delta > 0
                     GROUP BY timestamp, strike
                     ON CONFLICT (timestamp, symbol, strike)
                     DO UPDATE SET
@@ -834,38 +818,28 @@ class AnalyticsEngine:
                         net_delta = EXCLUDED.net_delta,
                         underlying_price = EXCLUDED.underlying_price,
                         updated_at = NOW()
-                """, (self.db_symbol, timestamp, self.db_symbol, underlying_price))
+                """, (self.db_symbol, timestamp, timestamp, self.db_symbol, underlying_price, timestamp))
 
                 # 3. Refresh flow_by_expiration
                 logger.debug("Refreshing flow_by_expiration...")
                 cursor.execute("""
-                    WITH latest_rows AS (
-                        SELECT oc.*
+                    WITH with_prev AS (
+                        SELECT
+                            oc.timestamp,
+                            oc.expiration,
+                            oc.last,
+                            CASE
+                                WHEN LAG(oc.volume) OVER w IS NULL THEN COALESCE(oc.volume, 0)
+                                WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
+                                    = (oc.timestamp AT TIME ZONE 'America/New_York')::date
+                                    THEN GREATEST(COALESCE(oc.volume, 0) - COALESCE(LAG(oc.volume) OVER w, 0), 0)
+                                ELSE COALESCE(oc.volume, 0)
+                            END::bigint AS volume_delta
                         FROM option_chains oc
                         WHERE oc.underlying = %s
-                          AND oc.timestamp = %s
-                    ),
-                    with_prev AS (
-                        SELECT
-                            l.timestamp,
-                            l.expiration,
-                            l.last,
-                            CASE
-                                WHEN p.prev_volume IS NULL THEN COALESCE(l.volume, 0)
-                                WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
-                                    = (l.timestamp AT TIME ZONE 'America/New_York')::date
-                                    THEN GREATEST(COALESCE(l.volume, 0) - COALESCE(p.prev_volume, 0), 0)
-                                ELSE COALESCE(l.volume, 0)
-                            END::bigint AS volume_delta
-                        FROM latest_rows l
-                        LEFT JOIN LATERAL (
-                            SELECT oc2.timestamp AS prev_ts, oc2.volume AS prev_volume
-                            FROM option_chains oc2
-                            WHERE oc2.option_symbol = l.option_symbol
-                              AND oc2.timestamp < l.timestamp
-                            ORDER BY oc2.timestamp DESC
-                            LIMIT 1
-                        ) p ON TRUE
+                          AND oc.timestamp >= %s - INTERVAL '2 minutes'
+                          AND oc.timestamp <= %s
+                        WINDOW w AS (PARTITION BY oc.option_symbol ORDER BY oc.timestamp)
                     )
                     INSERT INTO flow_by_expiration (
                         timestamp,
@@ -883,7 +857,8 @@ class AnalyticsEngine:
                         SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
                         %s::numeric
                     FROM with_prev
-                    WHERE volume_delta > 0
+                    WHERE timestamp = %s
+                      AND volume_delta > 0
                     GROUP BY timestamp, expiration
                     ON CONFLICT (timestamp, symbol, expiration)
                     DO UPDATE SET
@@ -891,43 +866,33 @@ class AnalyticsEngine:
                         total_premium = EXCLUDED.total_premium,
                         underlying_price = EXCLUDED.underlying_price,
                         updated_at = NOW()
-                """, (self.db_symbol, timestamp, self.db_symbol, underlying_price))
+                """, (self.db_symbol, timestamp, timestamp, self.db_symbol, underlying_price, timestamp))
 
                 # 4. Refresh flow_smart_money
                 logger.debug("Refreshing flow_smart_money...")
                 cursor.execute("""
-                    WITH latest_rows AS (
-                        SELECT oc.*
+                    WITH with_prev AS (
+                        SELECT
+                            oc.timestamp,
+                            oc.option_symbol,
+                            oc.option_type,
+                            oc.strike,
+                            oc.expiration,
+                            oc.last,
+                            oc.implied_volatility,
+                            oc.delta,
+                            CASE
+                                WHEN LAG(oc.volume) OVER w IS NULL THEN COALESCE(oc.volume, 0)
+                                WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
+                                    = (oc.timestamp AT TIME ZONE 'America/New_York')::date
+                                    THEN GREATEST(COALESCE(oc.volume, 0) - COALESCE(LAG(oc.volume) OVER w, 0), 0)
+                                ELSE COALESCE(oc.volume, 0)
+                            END::bigint AS volume_delta
                         FROM option_chains oc
                         WHERE oc.underlying = %s
-                          AND oc.timestamp = %s
-                    ),
-                    with_prev AS (
-                        SELECT
-                            l.timestamp,
-                            l.option_symbol,
-                            l.option_type,
-                            l.strike,
-                            l.expiration,
-                            l.last,
-                            l.implied_volatility,
-                            l.delta,
-                            CASE
-                                WHEN p.prev_volume IS NULL THEN COALESCE(l.volume, 0)
-                                WHEN (p.prev_ts AT TIME ZONE 'America/New_York')::date
-                                    = (l.timestamp AT TIME ZONE 'America/New_York')::date
-                                    THEN GREATEST(COALESCE(l.volume, 0) - COALESCE(p.prev_volume, 0), 0)
-                                ELSE COALESCE(l.volume, 0)
-                            END::bigint AS volume_delta
-                        FROM latest_rows l
-                        LEFT JOIN LATERAL (
-                            SELECT oc2.timestamp AS prev_ts, oc2.volume AS prev_volume
-                            FROM option_chains oc2
-                            WHERE oc2.option_symbol = l.option_symbol
-                              AND oc2.timestamp < l.timestamp
-                            ORDER BY oc2.timestamp DESC
-                            LIMIT 1
-                        ) p ON TRUE
+                          AND oc.timestamp >= %s - INTERVAL '2 minutes'
+                          AND oc.timestamp <= %s
+                        WINDOW w AS (PARTITION BY oc.option_symbol ORDER BY oc.timestamp)
                     )
                     INSERT INTO flow_smart_money (
                         timestamp,
@@ -961,7 +926,8 @@ class AnalyticsEngine:
                         ))::numeric,
                         %s::numeric
                     FROM with_prev
-                    WHERE volume_delta > 0
+                    WHERE timestamp = %s
+                      AND volume_delta > 0
                       AND (
                         volume_delta >= 50
                         OR volume_delta * COALESCE(last, 0) * 100 >= 50000
@@ -980,7 +946,7 @@ class AnalyticsEngine:
                         unusual_activity_score = EXCLUDED.unusual_activity_score,
                         underlying_price = EXCLUDED.underlying_price,
                         updated_at = NOW()
-                """, (self.db_symbol, timestamp, self.db_symbol, underlying_price))
+                """, (self.db_symbol, timestamp, timestamp, self.db_symbol, underlying_price, timestamp))
 
                 # Retention policy: keep only recent smart-money cache rows
                 cursor.execute("""
