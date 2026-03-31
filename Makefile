@@ -305,6 +305,8 @@ help: ## Show this help message
 	@echo ""
 	@echo "$(GREEN)Maintenance:$(NC)"
 	@echo "  make vacuum             - Vacuum analyze all tables"
+	@echo "  make db-maintain        - Full maintenance: prune old data, vacuum full, reindex"
+	@echo "  make db-prune           - Delete data older than DATA_RETENTION_DAYS (default 90)"
 	@echo "  make size               - Show table sizes"
 	@echo "  make refresh-views      - Refresh materialized views"
 	@echo "  make db-prune-legacy    - Drop obsolete legacy refresh/materialized-view artifacts"
@@ -2084,7 +2086,76 @@ vacuum: ## Vacuum analyze all tables
 	@$(PSQL) -c "VACUUM ANALYZE option_chains;"
 	@$(PSQL) -c "VACUUM ANALYZE gex_summary;"
 	@$(PSQL) -c "VACUUM ANALYZE gex_by_strike;"
+	@$(PSQL) -c "VACUUM ANALYZE flow_contract_facts;"
+	@$(PSQL) -c "VACUUM ANALYZE flow_by_type;"
+	@$(PSQL) -c "VACUUM ANALYZE flow_by_strike;"
+	@$(PSQL) -c "VACUUM ANALYZE flow_by_expiration;"
+	@$(PSQL) -c "VACUUM ANALYZE flow_smart_money;"
+	@$(PSQL) -c "VACUUM ANALYZE trade_signals;"
+	@$(PSQL) -c "VACUUM ANALYZE volatility_expansion_signals;"
+	@$(PSQL) -c "VACUUM ANALYZE position_optimizer_signals;"
 	@echo "$(GREEN)✅ Done$(NC)"
+
+DATA_RETENTION_DAYS ?= 90
+
+.PHONY: db-prune
+db-prune: ## Delete data older than DATA_RETENTION_DAYS (default 90)
+	@echo "$(YELLOW)Pruning data older than $(DATA_RETENTION_DAYS) days...$(NC)"
+	@$(PSQL) -c "DELETE FROM option_chains WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
+	@$(PSQL) -c "DELETE FROM underlying_quotes WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
+	@$(PSQL) -c "DELETE FROM gex_summary WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
+	@$(PSQL) -c "DELETE FROM gex_by_strike WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
+	@$(PSQL) -c "DELETE FROM flow_contract_facts WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
+	@$(PSQL) -c "DELETE FROM flow_by_type WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
+	@$(PSQL) -c "DELETE FROM flow_by_strike WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
+	@$(PSQL) -c "DELETE FROM flow_by_expiration WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
+	@$(PSQL) -c "DELETE FROM flow_smart_money WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
+	@$(PSQL) -c "DELETE FROM trade_signals WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
+	@$(PSQL) -c "DELETE FROM volatility_expansion_signals WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
+	@$(PSQL) -c "DELETE FROM position_optimizer_signals WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"
+	@echo "$(GREEN)✅ Prune complete$(NC)"
+
+.PHONY: db-maintain
+db-maintain: ## Full maintenance: prune old data, vacuum full, reindex (run with services stopped)
+	@echo "$(BLUE)=== Full Database Maintenance ===$(NC)"
+	@echo "$(RED)⚠️  This can take several minutes on large databases. Services should be stopped.$(NC)"
+	@echo ""
+	@echo "$(YELLOW)Step 1/4: Pruning data older than $(DATA_RETENTION_DAYS) days...$(NC)"
+	@$(MAKE) db-prune
+	@echo ""
+	@echo "$(YELLOW)Step 2/4: Running VACUUM FULL (reclaims disk space, rewrites tables)...$(NC)"
+	@$(PSQL) -c "VACUUM FULL ANALYZE underlying_quotes;"
+	@$(PSQL) -c "VACUUM FULL ANALYZE option_chains;"
+	@$(PSQL) -c "VACUUM FULL ANALYZE gex_summary;"
+	@$(PSQL) -c "VACUUM FULL ANALYZE gex_by_strike;"
+	@$(PSQL) -c "VACUUM FULL ANALYZE flow_contract_facts;"
+	@$(PSQL) -c "VACUUM FULL ANALYZE flow_by_type;"
+	@$(PSQL) -c "VACUUM FULL ANALYZE flow_by_strike;"
+	@$(PSQL) -c "VACUUM FULL ANALYZE flow_by_expiration;"
+	@$(PSQL) -c "VACUUM FULL ANALYZE flow_smart_money;"
+	@$(PSQL) -c "VACUUM FULL ANALYZE trade_signals;"
+	@$(PSQL) -c "VACUUM FULL ANALYZE volatility_expansion_signals;"
+	@$(PSQL) -c "VACUUM FULL ANALYZE position_optimizer_signals;"
+	@echo ""
+	@echo "$(YELLOW)Step 3/4: Reindexing all tables...$(NC)"
+	@$(PSQL) -c "REINDEX TABLE underlying_quotes;"
+	@$(PSQL) -c "REINDEX TABLE option_chains;"
+	@$(PSQL) -c "REINDEX TABLE gex_summary;"
+	@$(PSQL) -c "REINDEX TABLE gex_by_strike;"
+	@$(PSQL) -c "REINDEX TABLE flow_contract_facts;"
+	@$(PSQL) -c "REINDEX TABLE flow_by_type;"
+	@$(PSQL) -c "REINDEX TABLE flow_by_strike;"
+	@$(PSQL) -c "REINDEX TABLE flow_by_expiration;"
+	@$(PSQL) -c "REINDEX TABLE flow_smart_money;"
+	@$(PSQL) -c "REINDEX TABLE trade_signals;"
+	@$(PSQL) -c "REINDEX TABLE volatility_expansion_signals;"
+	@$(PSQL) -c "REINDEX TABLE position_optimizer_signals;"
+	@echo ""
+	@echo "$(YELLOW)Step 4/4: Updating planner statistics...$(NC)"
+	@$(PSQL) -c "ANALYZE;"
+	@echo ""
+	@echo "$(GREEN)✅ Full maintenance complete$(NC)"
+	@$(MAKE) size
 
 .PHONY: size
 size: ## Show table sizes
@@ -2098,7 +2169,7 @@ size: ## Show table sizes
 			pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename) - pg_relation_size(schemaname||'.'||tablename)) AS index_size \
 		FROM pg_tables \
 		WHERE schemaname = 'public' \
-		AND tablename IN ('underlying_quotes', 'option_chains', 'symbols', 'gex_summary', 'gex_by_strike') \
+		AND tablename IN ('underlying_quotes', 'option_chains', 'symbols', 'gex_summary', 'gex_by_strike', 'flow_contract_facts', 'flow_by_type', 'flow_by_strike', 'flow_by_expiration', 'flow_smart_money', 'trade_signals', 'volatility_expansion_signals', 'position_optimizer_signals') \
 		ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;"
 
 .PHONY: db-prune-legacy
