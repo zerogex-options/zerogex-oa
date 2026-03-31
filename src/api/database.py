@@ -2627,11 +2627,17 @@ class DatabaseManager:
 
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, symbol, window_units)
+                rows = await asyncio.wait_for(
+                    conn.fetch(query, symbol, window_units),
+                    timeout=15.0
+                )
                 return [dict(row) for row in rows]
+        except asyncio.TimeoutError:
+            logger.warning(f"GEX heatmap query timed out for {symbol} timeframe={timeframe} window={window_units}, returning empty")
+            return []
         except Exception as e:
-            logger.error(f"Error fetching GEX heatmap: {e!r}", exc_info=True)
-            raise
+            logger.warning(f"GEX heatmap query failed for {symbol} (returning empty): {e!r}")
+            return []
 
     async def get_option_quote(
         self,
