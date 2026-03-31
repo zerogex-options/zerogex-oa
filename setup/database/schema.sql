@@ -160,6 +160,8 @@ CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_option_symbol_timestamp
     ON option_chains(underlying, option_symbol, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_timestamp_option_symbol
     ON option_chains(underlying, timestamp DESC, option_symbol);
+CREATE INDEX IF NOT EXISTS idx_option_chains_option_symbol_timestamp
+    ON option_chains(option_symbol, timestamp DESC);
 
 DO $$
 BEGIN

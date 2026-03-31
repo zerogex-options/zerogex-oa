@@ -386,6 +386,7 @@ class _SoftCloseTracker:
 
 # Per-symbol soft-close trackers (populated lazily on first quote request)
 _soft_close_trackers: dict[str, _SoftCloseTracker] = {}
+_SOFT_CLOSE_TRACKER_MAX = 100  # prevent unbounded growth
 
 
 def get_market_session(asset_type: Optional[str], price_is_stable: bool = False) -> str:
@@ -476,6 +477,10 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
         asset_type = data.pop("asset_type", None)
 
         # Update per-symbol soft-close tracker and evaluate stability
+        # Evict oldest entries if tracker dict grows too large
+        if symbol not in _soft_close_trackers and len(_soft_close_trackers) >= _SOFT_CLOSE_TRACKER_MAX:
+            oldest_key = next(iter(_soft_close_trackers))
+            del _soft_close_trackers[oldest_key]
         tracker = _soft_close_trackers.setdefault(symbol, _SoftCloseTracker())
         tracker.record(data.get("close"))
 

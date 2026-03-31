@@ -91,139 +91,120 @@ class AnalyticsEngine:
         logger.info(f"\n⚠️  Received signal {signum}, shutting down...")
         self.running = False
 
-    def _get_latest_option_timestamp(self) -> Optional[datetime]:
-        """Get timestamp of most recent option data in database"""
-        try:
-            with db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT MAX(timestamp) 
-                    FROM option_chains 
-                    WHERE underlying = %s
-                """, (self.db_symbol,))
+    def _get_snapshot(self) -> Optional[Dict[str, Any]]:
+        """Fetch latest timestamp, underlying price, and option data in a single DB call.
 
-                result = cursor.fetchone()
-                if result and result[0]:
-                    return result[0]
-
-                return None
-
-        except Exception as e:
-            logger.error(f"Error fetching latest option timestamp: {e}")
-            return None
-
-    def _get_latest_underlying_price(self, timestamp: datetime) -> Optional[float]:
-        """Get underlying price at or before given timestamp"""
-        try:
-            with db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT close 
-                    FROM underlying_quotes 
-                    WHERE symbol = %s 
-                      AND timestamp <= %s
-                    ORDER BY timestamp DESC 
-                    LIMIT 1
-                """, (self.db_symbol, timestamp))
-
-                result = cursor.fetchone()
-                if result:
-                    return float(result[0])
-
-                return None
-
-        except Exception as e:
-            logger.error(f"Error fetching underlying price: {e}")
-            return None
-
-    def _fetch_option_data(self, timestamp: datetime) -> List[Dict[str, Any]]:
-        """
-        Fetch all option data at given timestamp
-
-        Returns list of options with strike, expiration, type, OI, Greeks
-
-        Note: We fetch all options with Greeks, even if OI=0. OI is often 0 in 
-        real-time data and only updates once daily after settlement. For GEX
-        calculations, OI=0 simply means that strike contributes 0 to GEX.
+        Returns dict with keys 'timestamp', 'underlying_price', 'options' or None
+        if no data is available.
         """
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
+                # Single query: get latest timestamp + underlying price + option data
                 cursor.execute("""
-                    WITH latest_per_contract AS (
-                        SELECT
-                            option_symbol,
-                            strike,
-                            expiration,
-                            option_type,
-                            last,
-                            bid,
-                            ask,
-                            volume,
-                            open_interest,
-                            delta,
-                            gamma,
-                            theta,
-                            vega,
-                            implied_volatility,
-                            timestamp,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY option_symbol
-                                ORDER BY timestamp DESC
-                            ) AS rn
+                    WITH latest_ts AS (
+                        SELECT MAX(timestamp) AS ts
                         FROM option_chains
                         WHERE underlying = %s
-                          AND timestamp <= %s
-                          AND timestamp >= (%s - (%s * INTERVAL '1 minute'))
-                          AND gamma IS NOT NULL
+                    ),
+                    underlying AS (
+                        SELECT uq.close
+                        FROM underlying_quotes uq, latest_ts lt
+                        WHERE uq.symbol = %s
+                          AND uq.timestamp <= lt.ts
+                        ORDER BY uq.timestamp DESC
+                        LIMIT 1
+                    ),
+                    latest_per_contract AS (
+                        SELECT
+                            oc.option_symbol,
+                            oc.strike,
+                            oc.expiration,
+                            oc.option_type,
+                            oc.last,
+                            oc.bid,
+                            oc.ask,
+                            oc.volume,
+                            oc.open_interest,
+                            oc.delta,
+                            oc.gamma,
+                            oc.theta,
+                            oc.vega,
+                            oc.implied_volatility,
+                            oc.timestamp,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY oc.option_symbol
+                                ORDER BY oc.timestamp DESC
+                            ) AS rn
+                        FROM option_chains oc, latest_ts lt
+                        WHERE oc.underlying = %s
+                          AND oc.timestamp <= lt.ts
+                          AND oc.timestamp >= (lt.ts - (%s * INTERVAL '1 minute'))
+                          AND oc.gamma IS NOT NULL
                     )
                     SELECT
-                        option_symbol,
-                        strike,
-                        expiration,
-                        option_type,
-                        last,
-                        bid,
-                        ask,
-                        volume,
-                        open_interest,
-                        delta,
-                        gamma,
-                        theta,
-                        vega,
-                        implied_volatility,
-                        timestamp
-                    FROM latest_per_contract
-                    WHERE rn = 1
-                    ORDER BY expiration, strike
-                """, (self.db_symbol, timestamp, timestamp, self.snapshot_lookback_minutes))
+                        lt.ts,
+                        u.close,
+                        lpc.option_symbol,
+                        lpc.strike,
+                        lpc.expiration,
+                        lpc.option_type,
+                        lpc.last,
+                        lpc.bid,
+                        lpc.ask,
+                        lpc.volume,
+                        lpc.open_interest,
+                        lpc.delta,
+                        lpc.gamma,
+                        lpc.theta,
+                        lpc.vega,
+                        lpc.implied_volatility,
+                        lpc.timestamp
+                    FROM latest_ts lt
+                    LEFT JOIN underlying u ON TRUE
+                    LEFT JOIN latest_per_contract lpc ON lpc.rn = 1
+                    WHERE lt.ts IS NOT NULL
+                    ORDER BY lpc.expiration, lpc.strike
+                    LIMIT 2000
+                """, (self.db_symbol, self.db_symbol, self.db_symbol, self.snapshot_lookback_minutes))
 
                 rows = cursor.fetchall()
+                if not rows or rows[0][0] is None:
+                    return None
+
+                timestamp = rows[0][0]
+                underlying_price = float(rows[0][1]) if rows[0][1] else None
+
+                if underlying_price is None:
+                    logger.warning("No underlying price found for snapshot")
+                    return None
 
                 options = []
                 stale_cutoff = timestamp - timedelta(seconds=self.snapshot_freshness_seconds)
                 stale_dropped = 0
 
                 for row in rows:
-                    quote_ts = row[14]
+                    if row[2] is None:  # no option data in this row
+                        continue
+                    quote_ts = row[16]
                     if quote_ts and quote_ts < stale_cutoff:
                         stale_dropped += 1
                         continue
                     options.append({
-                        'option_symbol': row[0],
-                        'strike': float(row[1]),
-                        'expiration': row[2],
-                        'option_type': row[3],
-                        'last': float(row[4]) if row[4] else 0.0,
-                        'bid': float(row[5]) if row[5] else 0.0,
-                        'ask': float(row[6]) if row[6] else 0.0,
-                        'volume': int(row[7]) if row[7] else 0,
-                        'open_interest': int(row[8]) if row[8] else 0,
-                        'delta': float(row[9]) if row[9] else 0.0,
-                        'gamma': float(row[10]) if row[10] else 0.0,
-                        'theta': float(row[11]) if row[11] else 0.0,
-                        'vega': float(row[12]) if row[12] else 0.0,
-                        'implied_volatility': float(row[13]) if row[13] else 0.2
+                        'option_symbol': row[2],
+                        'strike': float(row[3]),
+                        'expiration': row[4],
+                        'option_type': row[5],
+                        'last': float(row[6]) if row[6] else 0.0,
+                        'bid': float(row[7]) if row[7] else 0.0,
+                        'ask': float(row[8]) if row[8] else 0.0,
+                        'volume': int(row[9]) if row[9] else 0,
+                        'open_interest': int(row[10]) if row[10] else 0,
+                        'delta': float(row[11]) if row[11] else 0.0,
+                        'gamma': float(row[12]) if row[12] else 0.0,
+                        'theta': float(row[13]) if row[13] else 0.0,
+                        'vega': float(row[14]) if row[14] else 0.0,
+                        'implied_volatility': float(row[15]) if row[15] else 0.2
                     })
 
                 logger.info(
@@ -253,11 +234,15 @@ class AnalyticsEngine:
                         f"(threshold {self.min_oi_coverage_pct_alert:.1%})"
                     )
 
-                return options
+                return {
+                    'timestamp': timestamp,
+                    'underlying_price': underlying_price,
+                    'options': options
+                }
 
         except Exception as e:
-            logger.error(f"Error fetching option data: {e}", exc_info=True)
-            return []
+            logger.error(f"Error fetching analytics snapshot: {e}", exc_info=True)
+            return None
 
     def _calculate_time_to_expiration(
         self, 
@@ -367,6 +352,10 @@ class AnalyticsEngine:
 
         Net GEX = Call GEX - Put GEX
         """
+        # Cache time-to-expiration per expiration date to avoid redundant
+        # datetime arithmetic and scipy calls inside the inner loop.
+        _tte_cache: Dict = {}
+
         # Group by strike and expiration
         strike_data = defaultdict(lambda: {
             'calls': [],
@@ -409,9 +398,14 @@ class AnalyticsEngine:
             vanna_exposure = 0.0
             charm_exposure = 0.0
 
-            for opt in data['calls'] + data['puts']:
-                T = self._calculate_time_to_expiration(timestamp, opt['expiration'])
+            # T is the same for all options at this (strike, expiration),
+            # so cache it to avoid redundant datetime math.
+            T = _tte_cache.get(expiration)
+            if T is None:
+                T = self._calculate_time_to_expiration(timestamp, expiration)
+                _tte_cache[expiration] = T
 
+            for opt in data['calls'] + data['puts']:
                 vanna = self._calculate_vanna(
                     underlying_price,
                     strike,
@@ -1007,26 +1001,19 @@ class AnalyticsEngine:
             True if successful, False otherwise
         """
         try:
-            # Get latest option timestamp
-            latest_timestamp = self._get_latest_option_timestamp()
+            # Single DB call: get timestamp, underlying price, and option data
+            snapshot = self._get_snapshot()
 
-            if not latest_timestamp:
+            if not snapshot:
                 logger.warning("No option data available in database")
                 return False
 
+            latest_timestamp = snapshot['timestamp']
+            underlying_price = snapshot['underlying_price']
+            options = snapshot['options']
+
             logger.info(f"Running calculation for timestamp: {latest_timestamp}")
-
-            # Get underlying price
-            underlying_price = self._get_latest_underlying_price(latest_timestamp)
-
-            if not underlying_price:
-                logger.warning("No underlying price available")
-                return False
-
             logger.info(f"Underlying price: ${underlying_price:.2f}")
-
-            # Fetch option data
-            options = self._fetch_option_data(latest_timestamp)
 
             if not options:
                 logger.warning("No options with Greeks available for calculation")

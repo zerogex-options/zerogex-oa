@@ -68,6 +68,7 @@ class VolSurfaceResponse(BaseModel):
 _cache: Dict[tuple, Dict[str, Any]] = {}
 _cache_lock = threading.Lock()
 _CACHE_TTL = 30  # seconds
+_CACHE_MAX_SIZE = 64  # max number of cached entries
 
 
 def _get_cached(key: tuple) -> Optional[VolSurfaceResponse]:
@@ -80,6 +81,18 @@ def _get_cached(key: tuple) -> Optional[VolSurfaceResponse]:
 
 def _set_cached(key: tuple, data: VolSurfaceResponse) -> None:
     with _cache_lock:
+        # Evict expired entries when approaching max size
+        if len(_cache) >= _CACHE_MAX_SIZE:
+            now = datetime.now(timezone.utc)
+            expired = [k for k, v in _cache.items()
+                       if (now - v["ts"]).total_seconds() >= _CACHE_TTL]
+            for k in expired:
+                del _cache[k]
+            # If still over limit after evicting expired, drop oldest entries
+            if len(_cache) >= _CACHE_MAX_SIZE:
+                oldest = sorted(_cache.items(), key=lambda x: x[1]["ts"])
+                for k, _ in oldest[:len(_cache) - _CACHE_MAX_SIZE + 1]:
+                    del _cache[k]
         _cache[key] = {"data": data, "ts": datetime.now(timezone.utc)}
 
 # ---------------------------------------------------------------------------
