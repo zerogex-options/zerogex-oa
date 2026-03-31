@@ -540,6 +540,16 @@ class IngestionEngine:
                         mid_volume += mv
                         bid_volume += bv
 
+            # Use the best available bid/ask/last from any snapshot in
+            # the buffer — fall back through the buffer so a single delta
+            # that omits price fields doesn't wipe previously-seen values.
+            best_last = next((b["last"] for b in reversed(buffer) if b.get("last") is not None), None)
+            best_bid = next((b["bid"] for b in reversed(buffer) if b.get("bid") is not None), None)
+            best_ask = next((b["ask"] for b in reversed(buffer) if b.get("ask") is not None), None)
+            best_mid = next((b["mid"] for b in reversed(buffer) if b.get("mid") is not None), None)
+            if best_mid is None and best_bid is not None and best_ask is not None:
+                best_mid = (best_bid + best_ask) / 2.0
+
             agg = {
                 "option_symbol": last["option_symbol"],
                 "timestamp": bucket,
@@ -547,10 +557,10 @@ class IngestionEngine:
                 "strike": last["strike"],
                 "expiration": last["expiration"],
                 "option_type": last["option_type"],
-                "last": last.get("last", 0),
-                "bid": last.get("bid", 0),
-                "ask": last.get("ask", 0),
-                "mid": last.get("mid"),
+                "last": best_last,
+                "bid": best_bid,
+                "ask": best_ask,
+                "mid": best_mid,
                 "volume": max((b.get("volume") or 0) for b in buffer),
                 "open_interest": max((b.get("open_interest") or 0) for b in buffer),
                 "implied_volatility": implied_volatility,
@@ -590,10 +600,10 @@ class IngestionEngine:
          delta, gamma, theta, vega)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (option_symbol, timestamp) DO UPDATE SET
-            last = EXCLUDED.last,
-            bid = EXCLUDED.bid,
-            ask = EXCLUDED.ask,
-            mid = EXCLUDED.mid,
+            last = COALESCE(EXCLUDED.last, option_chains.last),
+            bid = COALESCE(EXCLUDED.bid, option_chains.bid),
+            ask = COALESCE(EXCLUDED.ask, option_chains.ask),
+            mid = COALESCE(EXCLUDED.mid, option_chains.mid),
             volume = GREATEST(option_chains.volume, EXCLUDED.volume),
             open_interest = GREATEST(option_chains.open_interest, EXCLUDED.open_interest),
             implied_volatility = COALESCE(EXCLUDED.implied_volatility, option_chains.implied_volatility),
