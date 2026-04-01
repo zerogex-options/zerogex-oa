@@ -91,6 +91,17 @@ class TradeStationAuth:
             self.access_token = None
             self.token_expiry = None
 
+    def token_seconds_remaining(self) -> float:
+        """Return seconds until token expiry (negative means expired/unknown)."""
+        with self._token_lock:
+            if not self.access_token or not self.token_expiry:
+                return -1.0
+            return (self.token_expiry - datetime.now()).total_seconds()
+
+    def should_refresh_soon(self, buffer_seconds: int = 120) -> bool:
+        """Whether token is missing/expired/near expiry and should be refreshed."""
+        return self.token_seconds_remaining() <= buffer_seconds
+
     def _refresh_access_token(self) -> str:
         """
         Refresh access token using refresh token

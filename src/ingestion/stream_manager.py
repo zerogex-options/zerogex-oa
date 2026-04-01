@@ -56,6 +56,18 @@ _STREAM_READ_TIMEOUT = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
 _IV_FIELD_NAMES = ("ImpliedVolatility", "IV", "Volatility", "IVol")
 
 
+def _is_auth_error_payload(payload: Dict[str, Any]) -> bool:
+    """Best-effort detection of auth-expiry messages inside stream payloads."""
+    fields = (
+        str(payload.get("Error", "")),
+        str(payload.get("Message", "")),
+        str(payload.get("Description", "")),
+        str(payload.get("Code", "")),
+    )
+    text = " ".join(fields).lower()
+    return any(token in text for token in ("unauthorized", "401", "token", "forbidden"))
+
+
 # ---------------------------------------------------------------------------
 # OptionStreamAccumulator — background thread for persistent quote streaming
 # ---------------------------------------------------------------------------
@@ -224,6 +236,12 @@ class OptionStreamAccumulator:
             for raw_line in response.iter_lines(decode_unicode=True):
                 if not self._running:
                     break
+                if self._client.auth.should_refresh_soon(buffer_seconds=90):
+                    logger.info(
+                        "Option stream token near expiry; refreshing and reconnecting stream"
+                    )
+                    self._client.auth.force_refresh_access_token()
+                    break
                 if not raw_line:
                     continue
                 line = (
@@ -242,6 +260,13 @@ class OptionStreamAccumulator:
                     payload = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+
+                if isinstance(payload, dict) and _is_auth_error_payload(payload):
+                    logger.warning(
+                        "Option stream reported auth error payload; refreshing token and reconnecting"
+                    )
+                    self._client.auth.force_refresh_access_token()
+                    break
 
                 # Handle both {"Quotes": [...]} wrappers and bare objects.
                 if isinstance(payload, dict) and "Quotes" in payload:
@@ -458,6 +483,12 @@ class UnderlyingBarAccumulator:
             for raw_line in response.iter_lines(decode_unicode=True):
                 if not self._running:
                     break
+                if self._client.auth.should_refresh_soon(buffer_seconds=90):
+                    logger.info(
+                        "Underlying bar stream token near expiry; refreshing and reconnecting stream"
+                    )
+                    self._client.auth.force_refresh_access_token()
+                    break
                 if not raw_line:
                     continue
                 line = (
@@ -492,6 +523,13 @@ class UnderlyingBarAccumulator:
                         line[:200],
                     )
                     continue
+
+                if isinstance(payload, dict) and _is_auth_error_payload(payload):
+                    logger.warning(
+                        "Underlying bar stream reported auth error payload; refreshing token and reconnecting"
+                    )
+                    self._client.auth.force_refresh_access_token()
+                    break
 
                 # Handle various bar payload shapes.
                 bars: list = []
@@ -1151,7 +1189,7 @@ class StreamManager:
 
                 try:
                     # --- underlying stream health checks ---
-                    if not self._underlying_accumulator.is_alive():
+                    if not self._underlying_accumulator.is_alive:
                         logger.error(
                             "Underlying bar stream thread is DEAD — "
                             "restarting accumulators"
@@ -1182,7 +1220,7 @@ class StreamManager:
                                 _consecutive_empty_underlying,
                                 cur_updates,
                                 cur_updates - _last_bar_updates,
-                                self._underlying_accumulator.is_alive(),
+                                self._underlying_accumulator.is_alive,
                             )
                         elif (
                             _consecutive_empty_underlying

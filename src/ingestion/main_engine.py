@@ -111,6 +111,7 @@ class IngestionEngine:
         # Circuit breaker: stop hammering a dead database.
         self._db_consecutive_failures = 0
         self._db_backoff_until = 0.0  # monotonic timestamp
+        self._last_underlying_signature: Optional[str] = None
 
         logger.info(f"Initialized IngestionEngine for {underlying}")
         logger.info(f"Config: {num_expirations} expirations, {num_strikes} strikes each side")
@@ -219,9 +220,16 @@ class IngestionEngine:
             "down_volume": data.get("down_volume", 0),
         }
 
+        payload_sig = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
+        if payload_sig == self._last_underlying_signature:
+            # Stream can emit many duplicate updates for the same minute bucket.
+            # Skip redundant upserts to reduce DB load.
+            return
+
         self._log_parity_signature("underlying_quotes", payload)
 
         self._upsert_underlying_quote(payload)
+        self._last_underlying_signature = payload_sig
 
         # Track latest underlying price for Greeks calculation
         old_price = self.latest_underlying_price
