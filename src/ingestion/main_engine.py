@@ -20,6 +20,7 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional
 from collections import defaultdict
 import pytz
+from psycopg2.extras import execute_values
 
 from src.ingestion.tradestation_client import TradeStationClient
 from src.ingestion.stream_manager import StreamManager
@@ -606,7 +607,7 @@ class IngestionEngine:
          last, bid, ask, mid, volume, open_interest, implied_volatility,
          ask_volume, mid_volume, bid_volume,
          delta, gamma, theta, vega)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES %s
         ON CONFLICT (option_symbol, timestamp) DO UPDATE SET
             last = COALESCE(EXCLUDED.last, option_chains.last),
             bid = COALESCE(EXCLUDED.bid, option_chains.bid),
@@ -679,8 +680,8 @@ class IngestionEngine:
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
-                for agg in rows:
-                    cursor.execute(self._OPTION_UPSERT_SQL, (
+                values = [
+                    (
                         agg["option_symbol"],
                         agg["timestamp"],
                         agg["underlying"],
@@ -701,7 +702,15 @@ class IngestionEngine:
                         agg["gamma"],
                         agg["theta"],
                         agg["vega"],
-                    ))
+                    )
+                    for agg in rows
+                ]
+                execute_values(
+                    cursor,
+                    self._OPTION_UPSERT_SQL,
+                    values,
+                    page_size=500,
+                )
                 conn.commit()
 
             elapsed_ms = (_time.monotonic() - t0) * 1000
