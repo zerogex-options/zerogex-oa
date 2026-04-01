@@ -430,6 +430,10 @@ class UnderlyingBarAccumulator:
         try:
             if response.status_code == 401:
                 response.close()
+                logger.warning(
+                    "Underlying bar stream: 401 auth failure, "
+                    "forcing token refresh and retrying"
+                )
                 self._client.auth.force_refresh_access_token()
                 return
 
@@ -438,10 +442,17 @@ class UnderlyingBarAccumulator:
             response.close()
             raise
 
+        logger.debug(
+            "Underlying bar stream: connected (HTTP %s)", response.status_code
+        )
+
         with self._response_lock:
             self._current_response = response
 
         self._connected.set()
+
+        _heartbeat_count = 0
+        _line_count = 0
 
         try:
             for raw_line in response.iter_lines(decode_unicode=True):
@@ -454,8 +465,19 @@ class UnderlyingBarAccumulator:
                     if isinstance(raw_line, str)
                     else raw_line.decode("utf-8", errors="ignore").strip()
                 )
-                if not line or line in ("[DONE]", "heartbeat"):
+                if not line:
                     continue
+                if line in ("[DONE]", "heartbeat"):
+                    _heartbeat_count += 1
+                    if _heartbeat_count % 50 == 0:
+                        logger.debug(
+                            "Underlying bar stream: %d heartbeats, "
+                            "%d data lines so far",
+                            _heartbeat_count,
+                            _line_count,
+                        )
+                    continue
+                _line_count += 1
                 if line.startswith("data:"):
                     line = line[5:].strip()
                 if not line:
@@ -464,6 +486,11 @@ class UnderlyingBarAccumulator:
                 try:
                     payload = json.loads(line)
                 except json.JSONDecodeError:
+                    logger.warning(
+                        "Underlying bar stream: JSON decode failed, "
+                        "skipping line: %s",
+                        line[:200],
+                    )
                     continue
 
                 # Handle various bar payload shapes.
@@ -474,6 +501,13 @@ class UnderlyingBarAccumulator:
                     bars = [payload["Bar"]]
                 elif isinstance(payload, dict) and "TimeStamp" in payload:
                     bars = [payload]
+
+                if not bars:
+                    logger.debug(
+                        "Underlying bar stream: received payload with "
+                        "no bar data: keys=%s",
+                        list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__,
+                    )
 
                 for bar in bars:
                     self._merge_bar(bar)
@@ -1066,6 +1100,10 @@ class StreamManager:
         _total_underlying_yields = 0
         _total_empty_cycles = 0
         _last_metrics_time = time.monotonic()
+        # Stale stream detection: consecutive cycles with no underlying data.
+        _consecutive_empty_underlying = 0
+        _STALE_UNDERLYING_THRESHOLD = 10  # warn after this many empty drains
+        _last_bar_updates = 0  # track updates_received delta
 
         try:
             while True:
@@ -1112,12 +1150,50 @@ class StreamManager:
                         )
 
                 try:
+                    # --- underlying stream health checks ---
+                    if not self._underlying_accumulator.is_alive():
+                        logger.error(
+                            "Underlying bar stream thread is DEAD — "
+                            "restarting accumulators"
+                        )
+                        self._start_accumulators()
+
                     # Drain underlying bar from persistent stream.
                     underlying_data = self._underlying_accumulator.drain()
                     if underlying_data:
                         self.current_price = underlying_data["close"]
                         yield {"type": "underlying", "data": underlying_data}
                         _total_underlying_yields += 1
+                        _consecutive_empty_underlying = 0
+                    else:
+                        _consecutive_empty_underlying += 1
+                        if (
+                            _consecutive_empty_underlying
+                            == _STALE_UNDERLYING_THRESHOLD
+                        ):
+                            cur_updates = (
+                                self._underlying_accumulator.updates_received
+                            )
+                            logger.warning(
+                                "Underlying bar stream appears STALE: "
+                                "%d consecutive empty drains, "
+                                "bar_stream_updates=%d (delta=%d), "
+                                "thread_alive=%s",
+                                _consecutive_empty_underlying,
+                                cur_updates,
+                                cur_updates - _last_bar_updates,
+                                self._underlying_accumulator.is_alive(),
+                            )
+                        elif (
+                            _consecutive_empty_underlying
+                            > _STALE_UNDERLYING_THRESHOLD
+                            and _consecutive_empty_underlying % 50 == 0
+                        ):
+                            logger.warning(
+                                "Underlying bar stream still stale: "
+                                "%d consecutive empty drains",
+                                _consecutive_empty_underlying,
+                            )
 
                     # Drain only option contracts that changed since last cycle.
                     changed = self._accumulator.drain()
@@ -1181,6 +1257,9 @@ class StreamManager:
                             f"opt_stream_updates={self._accumulator.updates_received} "
                             f"bar_stream_updates={self._underlying_accumulator.updates_received} "
                             f"cycle_ms={cycle_ms:.1f}"
+                        )
+                        _last_bar_updates = (
+                            self._underlying_accumulator.updates_received
                         )
                         _total_option_batches = 0
                         _total_options_yielded = 0
