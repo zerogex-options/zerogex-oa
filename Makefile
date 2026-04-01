@@ -212,6 +212,7 @@ help: ## Show this help message
 	@echo "  make underlying         - Last 10 underlying bars"
 	@echo "  make underlying-latest  - Latest underlying bar"
 	@echo "  make underlying-live    - Live latest underlying row (1s refresh, overwrite)"
+	@echo "  make underlying-live-raw - Live latest underlying row (raw values, 1s refresh)"
 	@echo "  make underlying-today   - Today's underlying bars"
 	@echo "  make underlying-volume  - Volume analysis for today"
 	@echo ""
@@ -738,7 +739,7 @@ underlying-live: ## Live latest underlying row (default SPY) refreshed every sec
 	@echo "$(BLUE)=== Live Underlying ($(UNDERLYING_LIVE_SYMBOL)) — Ctrl+C to stop ===$(NC)"
 	@echo "symbol |       timestamp        |   open    |   high    |    low    |   close   | up_volume | down_volume |          created_at           |          updated_at"
 	@while true; do \
-		ROW="$$( $(PSQL) -At -F ' | ' -c \"\
+		ROW=$$($(PSQL) -At -F ' | ' -c "\
 			SELECT \
 				LPAD(symbol, 6, ' ') as symbol, \
 				TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI:SS') as timestamp, \
@@ -753,8 +754,33 @@ underlying-live: ## Live latest underlying row (default SPY) refreshed every sec
 			FROM underlying_quotes \
 			WHERE symbol = '$(UNDERLYING_LIVE_SYMBOL)' \
 			ORDER BY timestamp DESC \
-			LIMIT 1;\" )"; \
-		printf '\033[2K\r%s\n\033[1A' "$$ROW"; \
+			LIMIT 1;"); \
+		printf '\033[2K\r%s\n\033[1A' "$${ROW:-<no rows>}"; \
+		sleep 1; \
+	done
+
+.PHONY: underlying-live-raw
+underlying-live-raw: ## Live latest underlying row (raw values, default SPY) refreshed every second in-place
+	@echo "$(BLUE)=== Live Underlying Raw ($(UNDERLYING_LIVE_SYMBOL)) — Ctrl+C to stop ===$(NC)"
+	@echo "symbol |       timestamp        |   open    |   high    |    low    |   close   | up_volume | down_volume |          created_at           |          updated_at"
+	@while true; do \
+		ROW=$$($(PSQL) -At -F ' | ' -c "\
+			SELECT \
+				symbol, \
+				timestamp, \
+				open, \
+				high, \
+				low, \
+				close, \
+				up_volume, \
+				down_volume, \
+				created_at, \
+				updated_at \
+			FROM underlying_quotes \
+			WHERE symbol = '$(UNDERLYING_LIVE_SYMBOL)' \
+			ORDER BY timestamp DESC \
+			LIMIT 1;"); \
+		printf '\033[2K\r%s\n\033[1A' "$${ROW:-<no rows>}"; \
 		sleep 1; \
 	done
 
