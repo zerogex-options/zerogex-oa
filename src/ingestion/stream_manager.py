@@ -114,9 +114,10 @@ class OptionStreamAccumulator:
 
     # -- lifecycle ---------------------------------------------------------
 
-    def start(self):
+    def start(self, seed_from_rest: bool = True):
         """Seed state from REST, then begin background stream reading."""
-        self._seed_from_rest()
+        if seed_from_rest:
+            self._seed_from_rest()
         self._running = True
         self._thread = threading.Thread(
             target=self._reader_loop, daemon=True, name="option-stream",
@@ -649,9 +650,16 @@ class StreamManager:
         self.option_volume_coverage_alert_threshold = float(
             os.getenv("OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD", "0.35")
         )
+        self.seed_rest_on_recalc = (
+            os.getenv("OPTION_REST_SEED_ON_RECALC", "false").lower() == "true"
+        )
 
         logger.info(f"Initialized StreamManager for {underlying}")
         logger.info(f"Config: {num_expirations} expirations, {num_strikes} strikes each side")
+        logger.info(
+            "Option REST seed on strike recalibration: %s",
+            "enabled" if self.seed_rest_on_recalc else "disabled",
+        )
 
     def _fetch_underlying_bar(self) -> Optional[Dict[str, Any]]:
         """
@@ -990,7 +998,7 @@ class StreamManager:
 
         return True
 
-    def _start_accumulators(self):
+    def _start_accumulators(self, seed_option_rest: bool = True):
         """Start (or restart) background stream readers for options and underlying."""
         # Stop existing accumulators if any.
         if self._accumulator is not None:
@@ -1012,7 +1020,7 @@ class StreamManager:
             session_template=SESSION_TEMPLATE,
             wakeup=self._wakeup,
         )
-        self._accumulator.start()
+        self._accumulator.start(seed_from_rest=seed_option_rest)
         self._underlying_accumulator.start()
 
     def _yield_option_snapshot(self, state: Dict[str, Dict[str, Any]]):
@@ -1302,7 +1310,9 @@ class StreamManager:
                                 self.tracked_option_symbols = (
                                     self._build_option_symbols()
                                 )
-                                self._start_accumulators()
+                                self._start_accumulators(
+                                    seed_option_rest=self.seed_rest_on_recalc
+                                )
                                 logger.info(
                                     f"Recalibrated strikes around "
                                     f"${self.current_price:.2f} "
