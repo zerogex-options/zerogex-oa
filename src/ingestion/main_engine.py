@@ -625,6 +625,33 @@ class IngestionEngine:
             updated_at = NOW()
     """
 
+    def _coalesce_option_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Collapse duplicate (option_symbol, timestamp) rows before DB writes."""
+        coalesced: Dict[tuple, Dict[str, Any]] = {}
+
+        for row in rows:
+            key = (row["option_symbol"], row["timestamp"])
+            existing = coalesced.get(key)
+            if existing is None:
+                coalesced[key] = dict(row)
+                continue
+
+            # Preserve latest non-null quote fields.
+            for field in ("last", "bid", "ask", "mid", "implied_volatility", "delta", "gamma", "theta", "vega"):
+                if row.get(field) is not None:
+                    existing[field] = row[field]
+
+            # Preserve monotonic fields.
+            existing["volume"] = max(existing.get("volume") or 0, row.get("volume") or 0)
+            existing["open_interest"] = max(existing.get("open_interest") or 0, row.get("open_interest") or 0)
+
+            # Preserve additive flow fields.
+            existing["ask_volume"] = (existing.get("ask_volume") or 0) + (row.get("ask_volume") or 0)
+            existing["mid_volume"] = (existing.get("mid_volume") or 0) + (row.get("mid_volume") or 0)
+            existing["bid_volume"] = (existing.get("bid_volume") or 0) + (row.get("bid_volume") or 0)
+
+        return list(coalesced.values())
+
     def _write_option_rows(self, rows: List[Dict[str, Any]]):
         """Write multiple aggregated option rows in a single DB transaction.
 
@@ -634,6 +661,10 @@ class IngestionEngine:
         """
         if not rows:
             return
+
+        # Many stream iterations can generate repeated updates for the same
+        # option/timestamp key. Coalesce them before touching the DB.
+        rows = self._coalesce_option_rows(rows)
 
         # Circuit breaker: skip write if still in backoff window.
         now_mono = _time.monotonic()
