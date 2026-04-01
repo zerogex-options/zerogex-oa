@@ -19,10 +19,12 @@ Responsibilities
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, date, timedelta
 from typing import Optional
 import pytz
+import requests
 
 from src.database import db_connection
 from src.utils import get_logger
@@ -168,6 +170,91 @@ class SignalThresholds:
     vwap_bear_threshold: float = VWAP_DEV_BEAR_THRESHOLD
     pcr_bullish_threshold: float = PCR_BULLISH_THRESHOLD
     pcr_bearish_threshold: float = PCR_BEARISH_THRESHOLD
+
+
+class SignalSmsNotifier:
+    """Optional SMS notifier for high-conviction signal hits."""
+
+    def __init__(self, underlying: str):
+        self.underlying = underlying.upper()
+        self.enabled = os.getenv("SIGNAL_SMS_ENABLED", "false").lower() == "true"
+        self.provider = os.getenv("SIGNAL_SMS_PROVIDER", "twilio").lower()
+        self.from_number = os.getenv("SIGNAL_SMS_FROM_NUMBER", "").strip()
+        self.to_numbers = [
+            n.strip() for n in os.getenv("SIGNAL_SMS_TO_NUMBERS", "").split(",") if n.strip()
+        ]
+        self.account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+        self.auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+        self.min_normalized = float(os.getenv("SIGNAL_SMS_MIN_NORMALIZED_SCORE", "0.67"))
+        self.min_strength = os.getenv("SIGNAL_SMS_MIN_STRENGTH", "high").lower()
+        self.allowed_timeframes = {
+            tf.strip() for tf in os.getenv("SIGNAL_SMS_TIMEFRAMES", "intraday,swing").split(",")
+            if tf.strip()
+        }
+        self.cooldown_seconds = int(os.getenv("SIGNAL_SMS_COOLDOWN_SECONDS", "900"))
+        self._last_sent_by_key: dict[str, float] = {}
+
+    def maybe_send(self, sig: TradeSignal) -> None:
+        if not self.enabled:
+            return
+        if self.provider != "twilio":
+            logger.warning("SignalSmsNotifier: unsupported provider=%s", self.provider)
+            return
+        if not self._is_eligible(sig):
+            return
+        if not (self.account_sid and self.auth_token and self.from_number and self.to_numbers):
+            logger.warning("SignalSmsNotifier: missing Twilio credentials or numbers")
+            return
+
+        key = f"{sig.underlying}:{sig.timeframe}:{sig.direction}:{sig.strength}"
+        now = time.time()
+        last_sent = self._last_sent_by_key.get(key, 0.0)
+        if now - last_sent < self.cooldown_seconds:
+            return
+
+        zes_value = next(
+            (
+                c.value for c in sig.components
+                if c.name == "ZeroGEX Exhaustion Score" and c.value is not None
+            ),
+            None,
+        )
+        message = (
+            f"ZeroGEX {sig.underlying} {sig.timeframe} {sig.direction.upper()} "
+            f"{sig.strength.upper()} signal | score {sig.composite_score}/{sig.max_possible_score} "
+            f"({sig.normalized_score * 100:.1f}%) | trade={sig.trade_type}"
+        )
+        if zes_value is not None:
+            message += f" | ZES={float(zes_value):.1f}"
+
+        for phone in self.to_numbers:
+            self._send_twilio_sms(phone, message)
+        self._last_sent_by_key[key] = now
+
+    def _is_eligible(self, sig: TradeSignal) -> bool:
+        if sig.timeframe not in self.allowed_timeframes:
+            return False
+        if sig.direction == "neutral":
+            return False
+        if sig.normalized_score < self.min_normalized:
+            return False
+        rank = {"low": 0, "medium": 1, "high": 2}
+        return rank.get(sig.strength, 0) >= rank.get(self.min_strength, 2)
+
+    def _send_twilio_sms(self, to_number: str, body: str) -> None:
+        url = f"https://api.twilio.com/2010-04-01/Accounts/{self.account_sid}/Messages.json"
+        payload = {"From": self.from_number, "To": to_number, "Body": body[:1500]}
+        try:
+            response = requests.post(
+                url,
+                data=payload,
+                auth=(self.account_sid, self.auth_token),
+                timeout=10,
+            )
+            response.raise_for_status()
+            logger.info("SignalSmsNotifier: sent SMS to %s", to_number)
+        except Exception as exc:
+            logger.error("SignalSmsNotifier: SMS send failed for %s: %s", to_number, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -563,6 +650,7 @@ class SignalEngine:
             pcr_bullish_threshold=self._defaults["pcr_bull"],
             pcr_bearish_threshold=self._defaults["pcr_bear"],
         )
+        self.sms_notifier = SignalSmsNotifier(self.db_symbol)
 
     def _auto_tune_thresholds(self) -> None:
         """Blend defaults with recent distribution stats for regime-adaptive thresholds."""
@@ -1112,6 +1200,7 @@ class SignalEngine:
                     components=comps,
                 )
                 self._store_signal(sig)
+                self.sms_notifier.maybe_send(sig)
                 stored += 1
                 logger.info(
                     f"✅ Signal [{tf}] {direction.upper()} | "
