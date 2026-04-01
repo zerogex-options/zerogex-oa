@@ -279,6 +279,7 @@ help: ## Show this help message
 	@echo "  make signals                  - Latest trade signals for all timeframes"
 	@echo "  make signals-detail           - Full detail for latest signal (usage: make signals-detail TF=intraday)"
 	@echo "  make signals-components       - Signal component breakdown (usage: make signals-components TF=intraday)"
+	@echo "  make signals-exhaustion       - Latest ZeroGEX Exhaustion Score by timeframe"
 	@echo "  make signals-history          - Signal history for today (usage: make signals-history TF=intraday)"
 	@echo "  make signals-all-symbols      - Latest signal for every tracked symbol"
 	@echo "  make signal-accuracy          - Win rate calibration by timeframe + strength (last 30 days)"
@@ -1697,18 +1698,45 @@ signals-components: ## Signal component breakdown (usage: make signals-component
 	@$(eval TF ?= intraday)
 	@echo "$(BLUE)=== Signal Components: $(FLOW_SYMBOL) / $(TF) ===$(NC)"
 	@$(PSQL) -c "\
+		WITH latest AS ( \
+			SELECT components \
+			FROM trade_signals \
+			WHERE underlying = '$(FLOW_SYMBOL)' \
+			  AND timeframe  = '$(TF)' \
+			ORDER BY timestamp DESC \
+			LIMIT 1 \
+		) \
 		SELECT \
 			comp->>'name'        AS signal, \
 			comp->>'weight'      AS weight, \
 			comp->>'score'       AS score, \
 			comp->>'applicable'  AS active, \
 			comp->>'description' AS description \
-		FROM trade_signals, \
-		     jsonb_array_elements(components) AS comp \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
-		  AND timeframe  = '$(TF)' \
-		ORDER BY timestamp DESC \
-		LIMIT 9;"
+		FROM latest, \
+		     jsonb_array_elements(components) AS comp;"
+
+.PHONY: signals-exhaustion
+signals-exhaustion: ## Latest ZES result by timeframe (usage: make signals-exhaustion FLOW_SYMBOL=QQQ)
+	@echo "$(BLUE)=== ZeroGEX Exhaustion Score (ZES): $(FLOW_SYMBOL) ===$(NC)"
+	@$(PSQL) -c "\
+		WITH latest AS ( \
+			SELECT DISTINCT ON (timeframe) \
+				timeframe, \
+				timestamp, \
+				components \
+			FROM trade_signals \
+			WHERE underlying = '$(FLOW_SYMBOL)' \
+			ORDER BY timeframe, timestamp DESC \
+		) \
+		SELECT \
+			l.timeframe, \
+			TO_CHAR(l.timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI:SS') AS time_et, \
+			comp->>'value' AS zes_score, \
+			comp->>'description' AS status \
+		FROM latest l, \
+		     jsonb_array_elements(l.components) AS comp \
+		WHERE comp->>'name' = 'ZeroGEX Exhaustion Score' \
+		ORDER BY l.timeframe;"
 
 .PHONY: signals-history
 signals-history: ## Signal history for today (usage: make signals-history TF=intraday FLOW_SYMBOL=QQQ)
