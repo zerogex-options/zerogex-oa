@@ -129,14 +129,18 @@ class DatabaseManager:
     async def _create_pool(self) -> asyncpg.Pool:
         """Create and return a fresh asyncpg pool instance."""
         connect_timeout = float(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "20"))
+        min_size = int(os.getenv("DB_POOL_MIN", "2"))
+        max_size = int(os.getenv("DB_POOL_MAX", "20"))
+        if min_size > max_size:
+            min_size = max_size
         return await asyncpg.create_pool(
             host=self.host,
             port=self.port,
             database=self.database,
             user=self.user,
             password=self.password,
-            min_size=2,
-            max_size=10,
+            min_size=min_size,
+            max_size=max_size,
             command_timeout=30,
             max_inactive_connection_lifetime=120,
             timeout=connect_timeout,
@@ -280,7 +284,8 @@ class DatabaseManager:
             return
 
         try:
-            await self._do_refresh_flow_cache(conn, symbol)
+            async with conn.transaction():
+                await self._do_refresh_flow_cache(conn, symbol)
         except Exception as e:
             logger.warning(f"Flow cache refresh failed for {symbol} (non-fatal): {e}")
         finally:

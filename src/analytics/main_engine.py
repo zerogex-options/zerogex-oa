@@ -14,6 +14,7 @@ import os
 import signal
 import sys
 import time
+import time as _time
 from multiprocessing import Process
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
@@ -77,6 +78,11 @@ class AnalyticsEngine:
         self._position_optimizer_engine = PositionOptimizerEngine(underlying=underlying)
         self._signal_interval: int = 300
         self._last_signal_run: Optional[float] = None
+        self._last_flow_cache_ts: Optional[datetime] = None
+        self._last_flow_cache_refresh_mono: float = 0.0
+        self._flow_cache_refresh_min_seconds: float = float(
+            os.getenv("FLOW_CACHE_REFRESH_MIN_SECONDS", "15")
+        )
 
         logger.info(f"Initialized AnalyticsEngine for {underlying}")
         logger.info(f"Calculation interval: {calculation_interval}s")
@@ -118,7 +124,7 @@ class AnalyticsEngine:
                         LIMIT 1
                     ),
                     latest_per_contract AS (
-                        SELECT
+                        SELECT DISTINCT ON (oc.option_symbol)
                             oc.option_symbol,
                             oc.strike,
                             oc.expiration,
@@ -133,16 +139,13 @@ class AnalyticsEngine:
                             oc.theta,
                             oc.vega,
                             oc.implied_volatility,
-                            oc.timestamp,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY oc.option_symbol
-                                ORDER BY oc.timestamp DESC
-                            ) AS rn
+                            oc.timestamp
                         FROM option_chains oc, latest_ts lt
                         WHERE oc.underlying = %s
                           AND oc.timestamp <= lt.ts
                           AND oc.timestamp >= (lt.ts - (%s * INTERVAL '1 minute'))
                           AND oc.gamma IS NOT NULL
+                        ORDER BY oc.option_symbol, oc.timestamp DESC
                     )
                     SELECT
                         lt.ts,
@@ -164,7 +167,7 @@ class AnalyticsEngine:
                         lpc.timestamp
                     FROM latest_ts lt
                     LEFT JOIN underlying u ON TRUE
-                    LEFT JOIN latest_per_contract lpc ON lpc.rn = 1
+                    LEFT JOIN latest_per_contract lpc ON TRUE
                     WHERE lt.ts IS NOT NULL
                     ORDER BY lpc.expiration, lpc.strike
                     LIMIT 2000
@@ -714,6 +717,15 @@ class AnalyticsEngine:
 
         Uses LAG() window functions instead of LATERAL joins for O(n) performance.
         """
+        if self._last_flow_cache_ts == timestamp:
+            logger.debug("Skipping flow cache refresh (timestamp unchanged)")
+            return
+
+        now_mono = _time.monotonic()
+        if (now_mono - self._last_flow_cache_refresh_mono) < self._flow_cache_refresh_min_seconds:
+            logger.debug("Skipping flow cache refresh (min-seconds throttle)")
+            return
+
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
@@ -966,6 +978,8 @@ class AnalyticsEngine:
                 """)
 
                 conn.commit()
+                self._last_flow_cache_ts = timestamp
+                self._last_flow_cache_refresh_mono = now_mono
                 logger.info("✅ Flow cache tables refreshed successfully")
 
         except Exception as e:
