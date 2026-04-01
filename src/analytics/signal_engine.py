@@ -47,6 +47,7 @@ SIGNAL_WEIGHTS: dict[str, dict[str, int]] = {
     "unusual_volume":     {"intraday": 1, "swing": 1, "multi_day": 0},
     "momentum_divergence":{"intraday": 1, "swing": 1, "multi_day": 0},
     "vanna_charm_drift":  {"intraday": 0, "swing": 1, "multi_day": 2},
+    "exhaustion_score":   {"intraday": 2, "swing": 2, "multi_day": 1},
 }
 
 WIN_PCT_DEFAULTS: dict[str, dict[str, float]] = {
@@ -109,6 +110,7 @@ class SignalContext:
     """All raw values needed to score signals. Populated from DB queries."""
     timestamp: datetime
     current_price: float = 0.0
+    max_gamma_strike: float = 0.0
     net_gex: float = 0.0
     gamma_flip: float = 0.0
     put_call_ratio: float = 1.0
@@ -126,6 +128,8 @@ class SignalContext:
     # Greeks
     vanna_exposure: float = 0.0
     charm_exposure: float = 0.0
+    recent_closes: list[float] = field(default_factory=list)
+    recent_highs: list[float] = field(default_factory=list)
 
 
 @dataclass
@@ -193,6 +197,124 @@ def _to_direction(score: int) -> str:
     if score < 0:
         return "bearish"
     return "neutral"
+
+
+def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
+    return max(lower, min(upper, value))
+
+
+def _compute_rsi(closes: list[float], period: int = 14) -> Optional[float]:
+    if len(closes) < period + 1:
+        return None
+    gains = losses = 0.0
+    for i in range(-period, 0):
+        delta = closes[i] - closes[i - 1]
+        if delta >= 0:
+            gains += delta
+        else:
+            losses += abs(delta)
+    avg_gain = gains / period
+    avg_loss = losses / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def _compute_zes(ctx: SignalContext) -> tuple[float, str, bool]:
+    """
+    ZeroGEX Exhaustion Score (ZES), scaled 0..100.
+    Returns (score, state_label, trap_triggered).
+    """
+    closes = ctx.recent_closes
+    highs = ctx.recent_highs
+    if len(closes) < 12:
+        return 0.0, "Trend Control", False
+
+    # 1) Distance to max gamma (25%)
+    if ctx.current_price > 0 and ctx.max_gamma_strike > 0:
+        dist = abs(ctx.current_price - ctx.max_gamma_strike) / ctx.current_price
+        max_gamma_score = 1 - min(dist / 0.005, 1.0)
+    else:
+        max_gamma_score = 0.0
+
+    # 2) Momentum divergence (20%) via RSI swing-high divergence fallback
+    rsi_now = _compute_rsi(closes, 14)
+    rsi_prev = _compute_rsi(closes[:-3], 14) if len(closes) >= 18 else None
+    price_higher_high = max(closes[-3:]) > max(closes[-7:-3])
+    rsi_lower_high = (
+        rsi_now is not None
+        and rsi_prev is not None
+        and rsi_now < rsi_prev
+    )
+    if price_higher_high and rsi_lower_high:
+        divergence_score = 1.0
+    elif rsi_now is not None and rsi_prev is not None:
+        rsi_decay = max(rsi_prev - rsi_now, 0.0) / 15.0
+        divergence_score = _clamp(rsi_decay)
+    else:
+        divergence_score = 0.0
+
+    # 3) Velocity decay (15%) over two 5-bar windows
+    velocity_now = abs(closes[-1] - closes[-6])
+    velocity_prev = abs(closes[-6] - closes[-11])
+    if velocity_prev > 0:
+        velocity_score = 1 - min(velocity_now / velocity_prev, 1.0)
+    else:
+        velocity_score = 0.0
+
+    # 4) Gamma regime context (20%)
+    near_gamma_flip = (
+        ctx.gamma_flip > 0
+        and (abs(ctx.current_price - ctx.gamma_flip) / max(ctx.current_price, 1e-9)) <= 0.003
+    )
+    if ctx.net_gex > 0:
+        gamma_score = 0.3
+    elif near_gamma_flip:
+        gamma_score = 0.7
+    else:
+        gamma_score = 1.0
+    if (
+        ctx.gamma_flip > 0
+        and closes[-1] > ctx.gamma_flip
+        and closes[-1] < closes[-2]
+    ):
+        gamma_score = _clamp(gamma_score + 0.1)
+
+    # 5) Structure failure (20%)
+    prior_high = max(highs[-10:-3]) if len(highs) >= 10 else max(highs[:-3], default=0.0)
+    recent_push_high = max(highs[-3:])
+    failed_breakout = recent_push_high > prior_high and closes[-1] < prior_high
+    lost_vwap = ctx.vwap > 0 and closes[-2] > ctx.vwap and closes[-1] < ctx.vwap
+    lower_high = len(highs) >= 6 and max(highs[-3:]) < max(highs[-6:-3])
+
+    structure_score = 0.0
+    if failed_breakout:
+        structure_score += 0.4
+    if lost_vwap:
+        structure_score += 0.3
+    if lower_high:
+        structure_score += 0.3
+    structure_score = _clamp(structure_score)
+
+    zes = (
+        0.25 * max_gamma_score +
+        0.20 * divergence_score +
+        0.15 * velocity_score +
+        0.20 * gamma_score +
+        0.20 * structure_score
+    ) * 100
+
+    trap_triggered = zes >= 85 and structure_score >= 0.7
+    if trap_triggered:
+        state = "Trap Triggered"
+    elif zes >= 70:
+        state = "Exhaustion Zone"
+    elif zes >= 40:
+        state = "Late Trend"
+    else:
+        state = "Trend Control"
+    return round(zes, 2), state, trap_triggered
 
 
 def _orb_direction(orb_status: str) -> Optional[str]:
@@ -389,6 +511,23 @@ def _score_components(
     add("Vanna/Charm Drift", "vanna_charm_drift", vc_raw, vc_desc,
         round(ctx.vanna_exposure, 4))
 
+    # 10. ZeroGEX Exhaustion Score (ZES)
+    zes, state_label, trap_triggered = _compute_zes(ctx)
+    if zes >= 85:
+        ex_raw = -1 if ctx.price_change_5min >= 0 else 1
+    elif zes >= 70:
+        ex_raw = -1 if ctx.price_change_5min >= 0 else 0
+    else:
+        ex_raw = 0
+    trigger_text = "Reversal trigger active." if trap_triggered else "Awaiting structure break confirmation."
+    add(
+        "ZeroGEX Exhaustion Score",
+        "exhaustion_score",
+        ex_raw,
+        f"ZES={zes:.1f}/100 ({state_label}). {trigger_text}",
+        zes,
+    )
+
     return total, comps
 
 
@@ -538,7 +677,7 @@ class SignalEngine:
                     logger.warning("SignalEngine: no gex_summary rows found")
                     return None
 
-                ts, net_gex, gamma_flip, pcr, _ = gex_row
+                ts, net_gex, gamma_flip, pcr, max_gamma_strike = gex_row
 
                 # --- Latest underlying price ---
                 cur.execute("""
@@ -553,6 +692,18 @@ class SignalEngine:
                     logger.warning("SignalEngine: no underlying_quotes rows found")
                     return None
                 current_price = float(price_row[0])
+
+                # --- Recent bars for RSI/velocity/structure exhaustion state ---
+                cur.execute("""
+                    SELECT close, high
+                    FROM underlying_quotes
+                    WHERE symbol = %s
+                    ORDER BY timestamp DESC
+                    LIMIT 30
+                """, (self.db_symbol,))
+                history_rows = cur.fetchall()
+                recent_closes = [float(r[0]) for r in reversed(history_rows)] if history_rows else []
+                recent_highs = [float(r[1]) for r in reversed(history_rows)] if history_rows else []
 
                 # --- Latest VWAP deviation ---
                 cur.execute("""
@@ -677,6 +828,7 @@ class SignalEngine:
                 return SignalContext(
                     timestamp=ts,
                     current_price=current_price,
+                    max_gamma_strike=float(max_gamma_strike or 0),
                     net_gex=float(net_gex or 0),
                     gamma_flip=float(gamma_flip or 0),
                     put_call_ratio=float(pcr or 1.0),
@@ -691,6 +843,8 @@ class SignalEngine:
                     net_option_flow=net_option_flow,
                     vanna_exposure=vanna,
                     charm_exposure=charm,
+                    recent_closes=recent_closes,
+                    recent_highs=recent_highs,
                 )
 
         except Exception as e:
