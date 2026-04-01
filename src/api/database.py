@@ -2343,25 +2343,25 @@ class DatabaseManager:
 
     async def get_session_closes(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
         """
-        Get the two most recently completed regular session closes (4:00 PM ET bars).
+        Get the two most recently completed regular session closes.
 
-        current_session_close = last 4pm ET bar whose timestamp is <= NOW().
-          - During market hours Wednesday (before 4pm ET) → Tuesday's 4pm close.
-          - During Wednesday after-hours or Thursday pre-market → Wednesday's 4pm close.
-        prior_session_close = the 4pm ET bar immediately before current_session_close.
+        current_session_close = the most recent cash session close.
+          - Before 16:00 ET on a market day → previous session's close.
+          - At/after 16:00 ET on a market day → that day's close.
+          - Weekends/holidays → most recent session's close.
+        prior_session_close = the session close immediately before current.
         """
         query = """
             WITH session_closes AS (
-                SELECT
+                SELECT DISTINCT ON ((timestamp AT TIME ZONE 'America/New_York')::date)
                     timestamp,
                     close
                 FROM underlying_quotes
                 WHERE symbol = $1
-                    AND EXTRACT(HOUR FROM timestamp AT TIME ZONE 'America/New_York') = 16
-                    AND EXTRACT(MINUTE FROM timestamp AT TIME ZONE 'America/New_York') = 0
                     AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
+                    AND (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '09:30' AND '16:00'
                     AND timestamp <= NOW()
-                ORDER BY timestamp DESC
+                ORDER BY (timestamp AT TIME ZONE 'America/New_York')::date DESC, timestamp DESC
                 LIMIT 2
             ),
             ranked AS (

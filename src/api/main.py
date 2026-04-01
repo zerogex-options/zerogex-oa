@@ -492,12 +492,11 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
 @app.get("/api/market/session-closes", response_model=SessionCloses, tags=["Market Data"])
 async def get_session_closes(symbol: str = Query(default="SPY")):
     """
-    Get the two most recently completed regular session closes (4:00 PM ET bars).
+    Get the two most recently completed regular session closes.
 
-    - current_session_close: last completed 4pm ET bar.
-      During market hours Wednesday → Tuesday's close.
-      During Wednesday after-hours or Thursday pre-market → Wednesday's close.
-    - prior_session_close: the session close immediately before current_session_close.
+    - current_session_close: the most recent cash session close (last bar <= 16:00 ET
+      on the most recent completed trading day).
+    - prior_session_close: the session close immediately before current.
     """
     try:
         data = await db_manager.get_session_closes(symbol)
