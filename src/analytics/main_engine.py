@@ -523,28 +523,39 @@ class AnalyticsEngine:
         if not gex_by_strike:
             return None
 
-        # Sort by strike
-        sorted_strikes = sorted(gex_by_strike, key=lambda x: x['strike'])
+        # Aggregate net_gex by strike across all expirations.
+        # The raw gex_by_strike has one entry per (strike, expiration),
+        # so we must sum before looking for zero crossings.
+        agg: Dict[float, float] = defaultdict(float)
+        for entry in gex_by_strike:
+            agg[entry['strike']] += entry['net_gex']
 
-        # Find where net GEX changes sign
-        for i in range(len(sorted_strikes) - 1):
-            current = sorted_strikes[i]
-            next_strike = sorted_strikes[i + 1]
+        strikes_sorted = sorted(agg.items())  # list of (strike, net_gex)
+        if len(strikes_sorted) < 2:
+            return None
 
-            # Check for sign change
-            if current['net_gex'] * next_strike['net_gex'] < 0:
-                # Linear interpolation to find zero crossing
-                s1, gex1 = current['strike'], current['net_gex']
-                s2, gex2 = next_strike['strike'], next_strike['net_gex']
+        # Find the zero crossing closest to the current underlying price.
+        # There can be multiple crossings; the one nearest spot is the
+        # most meaningful "flip point".
+        best_flip = None
+        best_dist = float('inf')
 
-                flip_point = s1 + (s2 - s1) * (-gex1) / (gex2 - gex1)
+        for i in range(len(strikes_sorted) - 1):
+            s1, gex1 = strikes_sorted[i]
+            s2, gex2 = strikes_sorted[i + 1]
 
-                logger.info(f"Gamma flip point: ${flip_point:.2f} "
-                           f"(between ${s1:.2f} and ${s2:.2f})")
+            if gex1 * gex2 < 0:
+                flip = s1 + (s2 - s1) * (-gex1) / (gex2 - gex1)
+                dist = abs(flip - underlying_price)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_flip = flip
 
-                return flip_point
+        if best_flip is not None:
+            logger.info(f"Gamma flip point: ${best_flip:.2f} "
+                       f"(nearest to spot ${underlying_price:.2f})")
 
-        return None
+        return best_flip
 
     def _calculate_gex_summary(
         self,
