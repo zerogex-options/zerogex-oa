@@ -2345,10 +2345,9 @@ class DatabaseManager:
         """
         Get the two most recently completed regular session closes.
 
-        current_session_close = the most recent cash session close.
-          - Before 16:00 ET on a market day → previous session's close.
-          - At/after 16:00 ET on a market day → that day's close.
-          - Weekends/holidays → most recent session's close.
+        current_session_close = the most recent completed cash session close
+          (last bar <= 16:00 ET on the most recent day whose session has ended).
+          Today's session is only included if the current time is at/after 16:00 ET.
         prior_session_close = the session close immediately before current.
         """
         query = """
@@ -2361,6 +2360,12 @@ class DatabaseManager:
                     AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
                     AND (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '09:30' AND '16:00'
                     AND timestamp <= NOW()
+                    -- Exclude today's date if the session hasn't closed yet (before 16:00 ET)
+                    AND (
+                        (timestamp AT TIME ZONE 'America/New_York')::date
+                        < (NOW() AT TIME ZONE 'America/New_York')::date
+                        OR (NOW() AT TIME ZONE 'America/New_York')::time >= '16:00'
+                    )
                 ORDER BY (timestamp AT TIME ZONE 'America/New_York')::date DESC, timestamp DESC
                 LIMIT 2
             ),
