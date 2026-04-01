@@ -145,7 +145,12 @@ db-diagnostics: ## Run DB diagnostics snapshot (sessions, waits, blockers, slow 
 		"\\echo [3/5] Long-running active queries" \
 		"SELECT pid, usename, application_name, state, now() - query_start AS runtime, wait_event_type, wait_event, LEFT(query, 220) AS query FROM pg_stat_activity WHERE datname = current_database() AND state <> 'idle' ORDER BY runtime DESC LIMIT 30;" \
 		"\\echo [4/5] pg_stat_statements (if enabled)" \
+		"SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements') AS has_pgss \\gset" \
+		"\\if :has_pgss" \
 		"SELECT query, calls, mean_exec_time, total_exec_time FROM pg_stat_statements ORDER BY mean_exec_time DESC LIMIT 10;" \
+		"\\else" \
+		"\\echo pg_stat_statements not available (extension disabled)." \
+		"\\endif" \
 		"\\echo [5/5] Dead tuple pressure" \
 		"SELECT relname, n_dead_tup, n_live_tup, ROUND(n_dead_tup::numeric / NULLIF(n_live_tup, 0) * 100, 1) AS dead_pct FROM pg_stat_user_tables WHERE n_dead_tup > 1000 ORDER BY n_dead_tup DESC LIMIT 25;" \
 		| $(PSQL) -v ON_ERROR_STOP=0
