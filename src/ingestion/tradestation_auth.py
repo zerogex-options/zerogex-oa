@@ -47,6 +47,13 @@ class TradeStationAuth:
         self.access_token = None
         self.token_expiry = None
         self._token_lock = Lock()
+        self._last_refresh_epoch: float = 0.0
+        self.refresh_buffer_seconds = int(
+            os.getenv("TS_REFRESH_BUFFER_SECONDS", "30")
+        )
+        self.min_force_refresh_interval_seconds = int(
+            os.getenv("TS_MIN_FORCE_REFRESH_INTERVAL_SECONDS", "60")
+        )
 
         logger.info(f"TradeStationAuth initialized for {'sandbox' if sandbox else 'production'}")
 
@@ -67,11 +74,14 @@ class TradeStationAuth:
                 time_until_expiry = (self.token_expiry - datetime.now()).total_seconds()
                 logger.debug(f"Token expires in {time_until_expiry:.0f} seconds")
 
-                if time_until_expiry > 5*60:
+                if time_until_expiry > self.refresh_buffer_seconds:
                     logger.debug("Using cached access token")
                     return self.access_token
                 elif time_until_expiry > 0:
-                    logger.debug("Access token will expire in <5 minutes, refreshing...")
+                    logger.debug(
+                        "Access token expires soon (<=%ss), refreshing...",
+                        self.refresh_buffer_seconds,
+                    )
                 else:
                     logger.info("Access token expired, refreshing...")
             else:
@@ -82,6 +92,18 @@ class TradeStationAuth:
     def force_refresh_access_token(self) -> str:
         """Force-refresh access token (used when API returns 401)."""
         with self._token_lock:
+            now_epoch = time.time()
+            if (
+                self.access_token
+                and self.token_expiry
+                and (self.token_expiry - datetime.now()).total_seconds() > self.refresh_buffer_seconds
+                and (now_epoch - self._last_refresh_epoch) < self.min_force_refresh_interval_seconds
+            ):
+                logger.warning(
+                    "Skipping force-refresh: last refresh %.1fs ago and token still valid",
+                    now_epoch - self._last_refresh_epoch,
+                )
+                return self.access_token
             logger.warning("Forcing TradeStation access token refresh after auth failure")
             return self._refresh_access_token()
 
@@ -146,6 +168,7 @@ class TradeStationAuth:
             self.access_token = data['access_token']
             expires_in = data.get('expires_in', 1200)
             self.token_expiry = datetime.now() + timedelta(seconds=expires_in)
+            self._last_refresh_epoch = time.time()
             logger.info(f"✅ Access token refreshed successfully (expires in {expires_in}s)")
             logger.debug(f"Token expiry set to: {self.token_expiry}")
 

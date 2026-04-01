@@ -236,12 +236,6 @@ class OptionStreamAccumulator:
             for raw_line in response.iter_lines(decode_unicode=True):
                 if not self._running:
                     break
-                if self._client.auth.should_refresh_soon(buffer_seconds=90):
-                    logger.info(
-                        "Option stream token near expiry; refreshing and reconnecting stream"
-                    )
-                    self._client.auth.force_refresh_access_token()
-                    break
                 if not raw_line:
                     continue
                 line = (
@@ -482,12 +476,6 @@ class UnderlyingBarAccumulator:
         try:
             for raw_line in response.iter_lines(decode_unicode=True):
                 if not self._running:
-                    break
-                if self._client.auth.should_refresh_soon(buffer_seconds=90):
-                    logger.info(
-                        "Underlying bar stream token near expiry; refreshing and reconnecting stream"
-                    )
-                    self._client.auth.force_refresh_access_token()
                     break
                 if not raw_line:
                     continue
