@@ -42,6 +42,7 @@ DB_USER = os.getenv("DB_USER", "postgres")
 # Connection Pool
 DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "1"))
 DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
+DB_CONNECT_TIMEOUT_SECONDS = float(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "20"))
 
 # Data Retention
 DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", "90"))  # days to keep data
@@ -68,6 +69,24 @@ STRIKE_CLEANUP_INTERVAL = int(os.getenv("STRIKE_CLEANUP_INTERVAL", "100"))  # it
 # Session template for market data
 # Options: "Default" (9:30-16:00), "USEQPre" (4:00-9:30), "USEQ24Hour" (4:00-20:00)
 SESSION_TEMPLATE = os.getenv("SESSION_TEMPLATE", "Default")
+TS_STREAM_READ_TIMEOUT = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
+OPTION_OI_COVERAGE_ALERT_THRESHOLD = float(
+    os.getenv("OPTION_OI_COVERAGE_ALERT_THRESHOLD", "0.35")
+)
+OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD = float(
+    os.getenv("OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD", "0.35")
+)
+OPTION_REST_SEED_ON_RECALC = (
+    os.getenv("OPTION_REST_SEED_ON_RECALC", "false").lower() == "true"
+)
+FLOW_CACHE_REFRESH_MIN_SECONDS = float(
+    os.getenv("FLOW_CACHE_REFRESH_MIN_SECONDS", "15")
+)
+FLOW_CANONICAL_ONLY = os.getenv("FLOW_CANONICAL_ONLY", "true").lower() == "true"
+TS_REFRESH_BUFFER_SECONDS = int(os.getenv("TS_REFRESH_BUFFER_SECONDS", "30"))
+TS_MIN_FORCE_REFRESH_INTERVAL_SECONDS = int(
+    os.getenv("TS_MIN_FORCE_REFRESH_INTERVAL_SECONDS", "60")
+)
 
 # =============================================================================
 # Aggregation Configuration
@@ -97,6 +116,51 @@ IV_MIN = float(os.getenv("IV_MIN", "0.01"))
 IV_MAX = float(os.getenv("IV_MAX", "5.0"))
 
 # =============================================================================
+# Analytics Signal Configuration
+# =============================================================================
+SIGNAL_SMART_MONEY_DOMINANCE_RATIO = float(
+    os.getenv("SIGNAL_SMART_MONEY_DOMINANCE_RATIO", "1.2")
+)
+SIGNAL_VWAP_DEV_BULL_THRESHOLD_PCT = float(
+    os.getenv("SIGNAL_VWAP_DEV_BULL_THRESHOLD_PCT", "0.2")
+)
+SIGNAL_VWAP_DEV_BEAR_THRESHOLD_PCT = float(
+    os.getenv("SIGNAL_VWAP_DEV_BEAR_THRESHOLD_PCT", "-0.2")
+)
+SIGNAL_PCR_BULLISH_THRESHOLD = float(
+    os.getenv("SIGNAL_PCR_BULLISH_THRESHOLD", "0.7")
+)
+SIGNAL_PCR_BEARISH_THRESHOLD = float(
+    os.getenv("SIGNAL_PCR_BEARISH_THRESHOLD", "1.3")
+)
+SIGNAL_AUTO_TUNE_ENABLED = os.getenv("SIGNAL_AUTO_TUNE_ENABLED", "true").lower() == "true"
+SIGNAL_AUTO_TUNE_LOOKBACK_DAYS = max(
+    5, int(os.getenv("SIGNAL_AUTO_TUNE_LOOKBACK_DAYS", "20"))
+)
+SIGNAL_AUTO_TUNE_MIN_SAMPLES = max(
+    50, int(os.getenv("SIGNAL_AUTO_TUNE_MIN_SAMPLES", "250"))
+)
+
+# =============================================================================
+# Volatility Expansion Configuration
+# =============================================================================
+VOL_SMART_MONEY_DOMINANCE_RATIO = float(
+    os.getenv("VOL_SMART_MONEY_DOMINANCE_RATIO", "1.2")
+)
+VOL_GAMMA_DEEP_NEGATIVE = float(os.getenv("VOL_GAMMA_DEEP_NEGATIVE", "-5000000000"))
+VOL_GAMMA_NEGATIVE = float(os.getenv("VOL_GAMMA_NEGATIVE", "-3000000000"))
+VOL_GAMMA_FLIP_NEAR_PCT = float(os.getenv("VOL_GAMMA_FLIP_NEAR_PCT", "0.003"))
+VOL_PCR_HIGH = float(os.getenv("VOL_PCR_HIGH", "1.8"))
+VOL_PCR_LOW = float(os.getenv("VOL_PCR_LOW", "0.4"))
+VOL_AUTO_TUNE_ENABLED = os.getenv("VOL_AUTO_TUNE_ENABLED", "true").lower() == "true"
+VOL_AUTO_TUNE_LOOKBACK_DAYS = max(
+    5, int(os.getenv("VOL_AUTO_TUNE_LOOKBACK_DAYS", "30"))
+)
+VOL_AUTO_TUNE_MIN_SAMPLES = max(
+    50, int(os.getenv("VOL_AUTO_TUNE_MIN_SAMPLES", "250"))
+)
+
+# =============================================================================
 # Ingestion Parity Guard
 # =============================================================================
 
@@ -121,16 +185,27 @@ def get_all_config() -> Dict[str, Any]:
         "database": {
             "pool_min": DB_POOL_MIN,
             "pool_max": DB_POOL_MAX,
+            "connect_timeout_seconds": DB_CONNECT_TIMEOUT_SECONDS,
             "retention_days": DATA_RETENTION_DAYS,
         },
         "streaming": {
             "market_hours_max_wait": MARKET_HOURS_POLL_INTERVAL,
             "extended_hours_max_wait": EXTENDED_HOURS_POLL_INTERVAL,
             "closed_hours_max_wait": CLOSED_HOURS_POLL_INTERVAL,
+            "stream_read_timeout": TS_STREAM_READ_TIMEOUT,
+            "option_oi_coverage_alert_threshold": OPTION_OI_COVERAGE_ALERT_THRESHOLD,
+            "option_volume_coverage_alert_threshold": OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD,
+            "option_rest_seed_on_recalc": OPTION_REST_SEED_ON_RECALC,
+            "flow_cache_refresh_min_seconds": FLOW_CACHE_REFRESH_MIN_SECONDS,
         },
         "features": {
             "greeks_enabled": GREEKS_ENABLED,
             "ingest_parity_guard_enabled": INGEST_PARITY_GUARD_ENABLED,
+            "flow_canonical_only": FLOW_CANONICAL_ONLY,
+        },
+        "auth": {
+            "refresh_buffer_seconds": TS_REFRESH_BUFFER_SECONDS,
+            "min_force_refresh_interval_seconds": TS_MIN_FORCE_REFRESH_INTERVAL_SECONDS,
         },
     }
 
