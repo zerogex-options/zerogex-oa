@@ -25,6 +25,7 @@ VENV_PYTHON = venv/bin/python
 # Underlying symbol filter — used by flow, signal, and max-pain queries
 # Override with: make flow-by-type FLOW_SYMBOL=QQQ
 FLOW_SYMBOL ?= SPY
+UNDERLYING_LIVE_SYMBOL ?= SPY
 
 # Colors for output
 BLUE = \033[0;34m
@@ -210,6 +211,7 @@ help: ## Show this help message
 	@echo "$(GREEN)Underlying Quotes:$(NC)"
 	@echo "  make underlying         - Last 10 underlying bars"
 	@echo "  make underlying-latest  - Latest underlying bar"
+	@echo "  make underlying-live    - Live latest underlying row (1s refresh, overwrite)"
 	@echo "  make underlying-today   - Today's underlying bars"
 	@echo "  make underlying-volume  - Volume analysis for today"
 	@echo ""
@@ -730,6 +732,31 @@ underlying-latest: ## Latest underlying bar
 		FROM underlying_quotes \
 		ORDER BY timestamp DESC \
 		LIMIT 1;"
+
+.PHONY: underlying-live
+underlying-live: ## Live latest underlying row (default SPY) refreshed every second in-place
+	@echo "$(BLUE)=== Live Underlying ($(UNDERLYING_LIVE_SYMBOL)) — Ctrl+C to stop ===$(NC)"
+	@echo "symbol |       timestamp        |   open    |   high    |    low    |   close   | up_volume | down_volume |          created_at           |          updated_at"
+	@while true; do \
+		ROW="$$( $(PSQL) -At -F ' | ' -c \"\
+			SELECT \
+				LPAD(symbol, 6, ' ') as symbol, \
+				TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI:SS') as timestamp, \
+				TO_CHAR(open, 'FM9999990.00') as open, \
+				TO_CHAR(high, 'FM9999990.00') as high, \
+				TO_CHAR(low, 'FM9999990.00') as low, \
+				TO_CHAR(close, 'FM9999990.00') as close, \
+				COALESCE(up_volume::text, '0') as up_volume, \
+				COALESCE(down_volume::text, '0') as down_volume, \
+				TO_CHAR(created_at AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI:SS.US') as created_at, \
+				TO_CHAR(updated_at AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI:SS.US') as updated_at \
+			FROM underlying_quotes \
+			WHERE symbol = '$(UNDERLYING_LIVE_SYMBOL)' \
+			ORDER BY timestamp DESC \
+			LIMIT 1;\" )"; \
+		printf '\033[2K\r%s\n\033[1A' "$$ROW"; \
+		sleep 1; \
+	done
 
 .PHONY: underlying-today
 underlying-today: ## Today's underlying bars
