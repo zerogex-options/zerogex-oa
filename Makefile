@@ -136,59 +136,19 @@ $(eval $(call DB_TAIL,position-optimizer-accuracy,position_optimizer_accuracy,un
 .PHONY: db-diagnostics
 db-diagnostics: ## Run DB diagnostics snapshot (sessions, waits, blockers, slow queries, dead tuples)
 	@echo "$(BLUE)=== DB Diagnostics Snapshot ===$(NC)"
-	@echo "$(YELLOW)[1/5] Session + wait overview$(NC)"
-	@$(PSQL) -c "\
-		SELECT now() AS captured_at, \
-		       count(*) AS total_sessions, \
-		       count(*) FILTER (WHERE state = 'active') AS active_sessions, \
-		       count(*) FILTER (WHERE wait_event_type IS NOT NULL) AS waiting_sessions \
-		FROM pg_stat_activity \
-		WHERE datname = current_database();"
-	@$(PSQL) -c "\
-		SELECT state, wait_event_type, wait_event, count(*) AS sessions \
-		FROM pg_stat_activity \
-		WHERE datname = current_database() \
-		GROUP BY 1,2,3 \
-		ORDER BY sessions DESC, state;"
-	@echo "$(YELLOW)[2/5] Blocking chains$(NC)"
-	@$(PSQL) -c "\
-		SELECT blocked.pid AS blocked_pid, \
-		       blocked.usename AS blocked_user, \
-		       now() - blocked.query_start AS blocked_for, \
-		       blocker.pid AS blocker_pid, \
-		       blocker.usename AS blocker_user, \
-		       now() - blocker.query_start AS blocker_running_for, \
-		       LEFT(blocked.query, 140) AS blocked_query, \
-		       LEFT(blocker.query, 140) AS blocker_query \
-		FROM pg_stat_activity blocked \
-		JOIN pg_stat_activity blocker \
-		  ON blocker.pid = ANY(pg_blocking_pids(blocked.pid)) \
-		WHERE blocked.datname = current_database();"
-	@echo "$(YELLOW)[3/5] Long-running active queries$(NC)"
-	@$(PSQL) -c "\
-		SELECT pid, usename, application_name, state, \
-		       now() - query_start AS runtime, \
-		       wait_event_type, wait_event, \
-		       LEFT(query, 220) AS query \
-		FROM pg_stat_activity \
-		WHERE datname = current_database() \
-		  AND state <> 'idle' \
-		ORDER BY runtime DESC \
-		LIMIT 30;"
-	@echo "$(YELLOW)[4/5] pg_stat_statements (if enabled)$(NC)"
-	@$(PSQL) -c "\
-		SELECT query, calls, mean_exec_time, total_exec_time \
-		FROM pg_stat_statements \
-		ORDER BY mean_exec_time DESC \
-		LIMIT 10;" || echo "$(YELLOW)pg_stat_statements not available (extension disabled).$(NC)"
-	@echo "$(YELLOW)[5/5] Dead tuple pressure$(NC)"
-	@$(PSQL) -c "\
-		SELECT relname, n_dead_tup, n_live_tup, \
-		       ROUND(n_dead_tup::numeric / NULLIF(n_live_tup, 0) * 100, 1) AS dead_pct \
-		FROM pg_stat_user_tables \
-		WHERE n_dead_tup > 1000 \
-		ORDER BY n_dead_tup DESC \
-		LIMIT 25;"
+	@printf "%s\n" \
+		"\\echo [1/5] Session + wait overview" \
+		"SELECT now() AS captured_at, count(*) AS total_sessions, count(*) FILTER (WHERE state = 'active') AS active_sessions, count(*) FILTER (WHERE wait_event_type IS NOT NULL) AS waiting_sessions FROM pg_stat_activity WHERE datname = current_database();" \
+		"SELECT state, wait_event_type, wait_event, count(*) AS sessions FROM pg_stat_activity WHERE datname = current_database() GROUP BY 1,2,3 ORDER BY sessions DESC, state;" \
+		"\\echo [2/5] Blocking chains" \
+		"SELECT blocked.pid AS blocked_pid, blocked.usename AS blocked_user, now() - blocked.query_start AS blocked_for, blocker.pid AS blocker_pid, blocker.usename AS blocker_user, now() - blocker.query_start AS blocker_running_for, LEFT(blocked.query, 140) AS blocked_query, LEFT(blocker.query, 140) AS blocker_query FROM pg_stat_activity blocked JOIN pg_stat_activity blocker ON blocker.pid = ANY(pg_blocking_pids(blocked.pid)) WHERE blocked.datname = current_database();" \
+		"\\echo [3/5] Long-running active queries" \
+		"SELECT pid, usename, application_name, state, now() - query_start AS runtime, wait_event_type, wait_event, LEFT(query, 220) AS query FROM pg_stat_activity WHERE datname = current_database() AND state <> 'idle' ORDER BY runtime DESC LIMIT 30;" \
+		"\\echo [4/5] pg_stat_statements (if enabled)" \
+		"SELECT query, calls, mean_exec_time, total_exec_time FROM pg_stat_statements ORDER BY mean_exec_time DESC LIMIT 10;" \
+		"\\echo [5/5] Dead tuple pressure" \
+		"SELECT relname, n_dead_tup, n_live_tup, ROUND(n_dead_tup::numeric / NULLIF(n_live_tup, 0) * 100, 1) AS dead_pct FROM pg_stat_user_tables WHERE n_dead_tup > 1000 ORDER BY n_dead_tup DESC LIMIT 25;" \
+		| $(PSQL) -v ON_ERROR_STOP=0
 
 .PHONY: help
 help: ## Show this help message
