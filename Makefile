@@ -451,6 +451,8 @@ logs-clear: ## Clear all journalctl logs for the services
 		sudo journalctl --rotate; \
 		sudo journalctl --vacuum-time=1s -u $(INGESTION_SERVICE); \
 		sudo journalctl --vacuum-time=1s -u $(ANALYTICS_SERVICE); \
+		echo "$(YELLOW)Truncating /var/log/syslog...$(NC)"; \
+		sudo truncate -s 0 /var/log/syslog; \
 		echo "$(GREEN)✅ Logs cleared for ZeroGEX services$(NC)"; \
 	else \
 		echo "$(RED)❌ Aborted$(NC)"; \
