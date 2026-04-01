@@ -358,7 +358,7 @@ class DatabaseManager:
                     END::bigint AS bid_vol_delta
                 FROM option_chains oc
                 WHERE oc.underlying = $1
-                  AND oc.timestamp >= $2 - INTERVAL '2 minutes'
+                  AND oc.timestamp >= $2::timestamptz - INTERVAL '2 minutes'
                   AND oc.timestamp <= $2
                 WINDOW w AS (PARTITION BY oc.option_symbol ORDER BY oc.timestamp)
             )
@@ -493,7 +493,7 @@ class DatabaseManager:
                         END::bigint AS bid_vol_delta
                     FROM option_chains oc
                     WHERE oc.underlying = $1
-                      AND oc.timestamp >= $2 - INTERVAL '2 minutes'
+                      AND oc.timestamp >= $2::timestamptz - INTERVAL '2 minutes'
                       AND oc.timestamp <= $2
                     WINDOW w AS (PARTITION BY oc.option_symbol ORDER BY oc.timestamp)
                 )
@@ -588,7 +588,7 @@ class DatabaseManager:
                         END::bigint AS bid_vol_delta
                     FROM option_chains oc
                     WHERE oc.underlying = $1
-                      AND oc.timestamp >= $2 - INTERVAL '2 minutes'
+                      AND oc.timestamp >= $2::timestamptz - INTERVAL '2 minutes'
                       AND oc.timestamp <= $2
                     WINDOW w AS (PARTITION BY oc.option_symbol ORDER BY oc.timestamp)
                 )
@@ -681,7 +681,7 @@ class DatabaseManager:
                         END::bigint AS bid_vol_delta
                     FROM option_chains oc
                     WHERE oc.underlying = $1
-                      AND oc.timestamp >= $2 - INTERVAL '2 minutes'
+                      AND oc.timestamp >= $2::timestamptz - INTERVAL '2 minutes'
                       AND oc.timestamp <= $2
                     WINDOW w AS (PARTITION BY oc.option_symbol ORDER BY oc.timestamp)
                 )
@@ -759,7 +759,7 @@ class DatabaseManager:
                         END::bigint AS volume_delta
                     FROM option_chains oc
                     WHERE oc.underlying = $1
-                      AND oc.timestamp >= $2 - INTERVAL '2 minutes'
+                      AND oc.timestamp >= $2::timestamptz - INTERVAL '2 minutes'
                       AND oc.timestamp <= $2
                     WINDOW w AS (PARTITION BY oc.option_symbol ORDER BY oc.timestamp)
                 )
