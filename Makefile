@@ -1698,22 +1698,48 @@ signals-components: ## Signal component breakdown (usage: make signals-component
 	@$(eval TF ?= intraday)
 	@echo "$(BLUE)=== Signal Components: $(FLOW_SYMBOL) / $(TF) ===$(NC)"
 	@$(PSQL) -c "\
-		WITH latest AS ( \
+		WITH expected AS ( \
+			SELECT * FROM (VALUES \
+				('GEX Regime', 1), \
+				('Dealer Hedging Pressure', 2), \
+				('Smart Money Flow', 3), \
+				('VWAP Position', 4), \
+				('Opening Range Breakout', 5), \
+				('Put/Call Ratio', 6), \
+				('Unusual Volume Spike', 7), \
+				('Momentum Divergence', 8), \
+				('Vanna/Charm Drift', 9), \
+				('ZeroGEX Exhaustion Score', 10), \
+				('Calibration Snapshot', 11) \
+			) AS t(name, ord) \
+		), \
+		latest AS ( \
 			SELECT components \
 			FROM trade_signals \
 			WHERE underlying = '$(FLOW_SYMBOL)' \
 			  AND timeframe  = '$(TF)' \
 			ORDER BY timestamp DESC \
 			LIMIT 1 \
+		), \
+		expanded AS ( \
+			SELECT \
+				comp->>'name'        AS signal, \
+				comp->>'weight'      AS weight, \
+				comp->>'score'       AS score, \
+				comp->>'applicable'  AS active, \
+				comp->>'description' AS description \
+			FROM latest, \
+			     jsonb_array_elements(components) AS comp \
 		) \
 		SELECT \
-			comp->>'name'        AS signal, \
-			comp->>'weight'      AS weight, \
-			comp->>'score'       AS score, \
-			comp->>'applicable'  AS active, \
-			comp->>'description' AS description \
-		FROM latest, \
-		     jsonb_array_elements(components) AS comp;"
+			e.name AS signal, \
+			COALESCE(x.weight, 'n/a') AS weight, \
+			COALESCE(x.score, 'n/a') AS score, \
+			COALESCE(x.active, 'n/a') AS active, \
+			COALESCE(x.description, 'Missing from latest row. Restart analytics and run one cycle to emit this component.') AS description \
+		FROM expected e \
+		LEFT JOIN expanded x ON x.signal = e.name \
+		ORDER BY e.ord;"
 
 .PHONY: signals-exhaustion
 signals-exhaustion: ## Latest ZES result by timeframe (usage: make signals-exhaustion FLOW_SYMBOL=QQQ)
