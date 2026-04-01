@@ -324,10 +324,7 @@ async def get_flow_buying_pressure(
     """Get underlying buying/selling pressure"""
     try:
         data = await db_manager.get_flow_buying_pressure(symbol, limit)
-        if not data:
-            raise HTTPException(status_code=404, detail="No buying pressure data available")
-
-        return [FlowBuyingPressurePoint(**row) for row in data]
+        return [FlowBuyingPressurePoint(**row) for row in data] if data else []
     except HTTPException:
         raise
     except Exception as e:

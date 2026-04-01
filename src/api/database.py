@@ -1379,11 +1379,17 @@ class DatabaseManager:
         try:
             async with self._acquire_connection() as conn:
                 await self._refresh_flow_cache(conn, symbol)
-                rows = await conn.fetch(query, symbol, session_start, session_end)
+                rows = await asyncio.wait_for(
+                    conn.fetch(query, symbol, session_start, session_end),
+                    timeout=15.0,
+                )
                 return [dict(row) for row in rows]
+        except asyncio.TimeoutError:
+            logger.warning(f"Flow by type query timed out for {symbol}, returning empty")
+            return []
         except Exception as e:
-            logger.error(f"Error fetching flow by type: {e}", exc_info=True)
-            raise
+            logger.warning(f"Flow by type query failed for {symbol} (returning empty): {e!r}")
+            return []
 
     async def get_flow_by_strike(
         self,
@@ -1434,11 +1440,17 @@ class DatabaseManager:
         try:
             async with self._acquire_connection() as conn:
                 await self._refresh_flow_cache(conn, symbol)
-                rows = await conn.fetch(query, symbol, session_start, session_end, limit)
+                rows = await asyncio.wait_for(
+                    conn.fetch(query, symbol, session_start, session_end, limit),
+                    timeout=15.0,
+                )
                 return [dict(row) for row in rows]
+        except asyncio.TimeoutError:
+            logger.warning(f"Flow by strike query timed out for {symbol}, returning empty")
+            return []
         except Exception as e:
-            logger.error(f"Error fetching flow by strike: {e}", exc_info=True)
-            raise
+            logger.warning(f"Flow by strike query failed for {symbol} (returning empty): {e!r}")
+            return []
 
     async def get_flow_by_expiration(
         self,
@@ -1490,11 +1502,17 @@ class DatabaseManager:
         try:
             async with self._acquire_connection() as conn:
                 await self._refresh_flow_cache(conn, symbol)
-                rows = await conn.fetch(query, symbol, session_start, session_end, limit)
+                rows = await asyncio.wait_for(
+                    conn.fetch(query, symbol, session_start, session_end, limit),
+                    timeout=15.0,
+                )
                 return [dict(row) for row in rows]
+        except asyncio.TimeoutError:
+            logger.warning(f"Flow by expiration query timed out for {symbol}, returning empty")
+            return []
         except Exception as e:
-            logger.error(f"Error fetching flow by expiration: {e}", exc_info=True)
-            raise
+            logger.warning(f"Flow by expiration query failed for {symbol} (returning empty): {e!r}")
+            return []
 
     async def get_smart_money_flow(
         self,
@@ -1579,11 +1597,17 @@ class DatabaseManager:
 
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, symbol, session_start, session_end, limit)
+                rows = await asyncio.wait_for(
+                    conn.fetch(query, symbol, session_start, session_end, limit),
+                    timeout=15.0,
+                )
                 return [dict(row) for row in rows]
+        except asyncio.TimeoutError:
+            logger.warning(f"Smart money flow query timed out for {symbol}, returning empty")
+            return []
         except Exception as e:
-            logger.error(f"Error fetching smart money flow: {e}", exc_info=True)
-            raise
+            logger.warning(f"Smart money flow query failed for {symbol} (returning empty): {e!r}")
+            return []
 
     async def get_flow_buying_pressure(
         self,
@@ -1621,6 +1645,7 @@ class DatabaseManager:
                     ) AS down_volume_delta
                 FROM underlying_quotes
                 WHERE symbol = $1
+                  AND timestamp >= NOW() - INTERVAL '2 days'
             )
             SELECT
                 timestamp,
@@ -1658,11 +1683,17 @@ class DatabaseManager:
 
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, symbol, limit)
+                rows = await asyncio.wait_for(
+                    conn.fetch(query, symbol, limit),
+                    timeout=15.0,
+                )
                 return [dict(row) for row in rows]
+        except asyncio.TimeoutError:
+            logger.warning(f"Buying pressure query timed out for {symbol}, returning empty")
+            return []
         except Exception as e:
-            logger.error(f"Error fetching buying pressure: {e}", exc_info=True)
-            raise
+            logger.warning(f"Buying pressure query failed for {symbol} (returning empty): {e!r}")
+            return []
 
     async def get_vwap_deviation(
         self,
