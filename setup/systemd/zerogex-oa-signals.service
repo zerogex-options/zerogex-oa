@@ -1,19 +1,47 @@
 [Unit]
 Description=ZeroGEX Signal Engine
-After=network.target postgresql.service zerogex-oa-analytics.service
-Wants=network.target
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target postgresql.service zerogex-oa-analytics.service
+Wants=network-online.target
+Requires=postgresql.service
 
 [Service]
 Type=simple
 User=ubuntu
 Group=ubuntu
-WorkingDirectory=/opt/zerogex-oa
-EnvironmentFile=/opt/zerogex-oa/.env
-ExecStart=/opt/zerogex-oa/venv/bin/python -m src.signals.main_engine --underlying ${ZEROGEX_UNDERLYINGS:-SPY}
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+# Environment
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Execution
+ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.signals.main_engine --underlying ${ZEROGEX_UNDERLYINGS:-SPY}
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Restart policy
 Restart=always
 RestartSec=10
-StandardOutput=append:/var/log/zerogex-oa/signals.log
-StandardError=append:/var/log/zerogex-oa/signals.log
+StartLimitBurst=5
+StartLimitInterval=300
+
+# Process management
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+SendSIGKILL=yes
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-signals
 
 [Install]
 WantedBy=multi-user.target
