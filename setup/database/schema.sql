@@ -1029,6 +1029,29 @@ CREATE TABLE IF NOT EXISTS signal_scores (
     PRIMARY KEY (underlying, timestamp)
 );
 
+-- Ensure existing installations converge to the latest signal_scores shape.
+ALTER TABLE signal_scores
+    ADD COLUMN IF NOT EXISTS composite_score DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS normalized_score DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS direction VARCHAR(10),
+    ADD COLUMN IF NOT EXISTS components JSONB DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'signal_scores_direction_check'
+          AND conrelid = 'signal_scores'::regclass
+    ) THEN
+        ALTER TABLE signal_scores
+            ADD CONSTRAINT signal_scores_direction_check
+            CHECK (direction IN ('bullish', 'bearish', 'neutral'));
+    END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS idx_signal_scores_underlying_ts
     ON signal_scores(underlying, timestamp DESC);
 
@@ -1059,6 +1082,77 @@ CREATE TABLE IF NOT EXISTS signal_trades (
     components_latest JSONB,
     CONSTRAINT uq_signal_trades_unique_signal UNIQUE (underlying, signal_timestamp)
 );
+
+-- Ensure existing installations converge to the latest signal_trades shape.
+ALTER TABLE signal_trades
+    ADD COLUMN IF NOT EXISTS signal_timestamp TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS status VARCHAR(12),
+    ADD COLUMN IF NOT EXISTS direction VARCHAR(10),
+    ADD COLUMN IF NOT EXISTS score_at_entry DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS score_latest DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS option_symbol VARCHAR(50),
+    ADD COLUMN IF NOT EXISTS option_type CHAR(1),
+    ADD COLUMN IF NOT EXISTS expiration DATE,
+    ADD COLUMN IF NOT EXISTS strike NUMERIC(12,4),
+    ADD COLUMN IF NOT EXISTS entry_price NUMERIC(12,6),
+    ADD COLUMN IF NOT EXISTS current_price NUMERIC(12,6),
+    ADD COLUMN IF NOT EXISTS quantity_initial INTEGER,
+    ADD COLUMN IF NOT EXISTS quantity_open INTEGER,
+    ADD COLUMN IF NOT EXISTS realized_pnl NUMERIC(14,4) DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS unrealized_pnl NUMERIC(14,4) DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_pnl NUMERIC(14,4) DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS pnl_percent NUMERIC(12,4) DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS components_at_entry JSONB DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS components_latest JSONB;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'signal_trades_status_check'
+          AND conrelid = 'signal_trades'::regclass
+    ) THEN
+        ALTER TABLE signal_trades
+            ADD CONSTRAINT signal_trades_status_check
+            CHECK (status IN ('open', 'closed'));
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'signal_trades_direction_check'
+          AND conrelid = 'signal_trades'::regclass
+    ) THEN
+        ALTER TABLE signal_trades
+            ADD CONSTRAINT signal_trades_direction_check
+            CHECK (direction IN ('bullish', 'bearish'));
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'signal_trades_option_type_check'
+          AND conrelid = 'signal_trades'::regclass
+    ) THEN
+        ALTER TABLE signal_trades
+            ADD CONSTRAINT signal_trades_option_type_check
+            CHECK (option_type IN ('C','P'));
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'uq_signal_trades_unique_signal'
+          AND conrelid = 'signal_trades'::regclass
+    ) THEN
+        ALTER TABLE signal_trades
+            ADD CONSTRAINT uq_signal_trades_unique_signal UNIQUE (underlying, signal_timestamp);
+    END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_signal_trades_underlying_open
     ON signal_trades(underlying, status, opened_at DESC);
