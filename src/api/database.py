@@ -1110,8 +1110,10 @@ class DatabaseManager:
             strike_exposures AS (
                 SELECT
                     gbs.strike,
-                    (gbs.call_gamma * gbs.call_oi * 100 * lq.spot_price)::numeric AS call_exposure,
-                    (-1 * gbs.put_gamma * gbs.put_oi * 100 * lq.spot_price)::numeric AS put_exposure
+                    -- call_gamma / put_gamma are already OI-weighted in analytics
+                    -- (gamma * open_interest). Do NOT multiply by OI again here.
+                    (gbs.call_gamma * 100 * lq.spot_price)::numeric AS call_exposure,
+                    (-1 * gbs.put_gamma * 100 * lq.spot_price)::numeric AS put_exposure
                 FROM gex_by_strike gbs
                 JOIN latest_summary ls
                   ON gbs.underlying = ls.underlying
