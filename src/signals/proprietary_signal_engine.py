@@ -61,7 +61,6 @@ class ProprietarySignalEngine:
                 FROM consolidated_trade_signals
                 WHERE underlying = %s
                 ORDER BY timestamp DESC
-                LIMIT 1
                 """,
                 (self.db_symbol,),
             )
@@ -79,7 +78,7 @@ class ProprietarySignalEngine:
                 "candidate": parsed,
             }
 
-    def _fetch_active_trade(self) -> Optional[dict]:
+    def _fetch_active_trades(self) -> list[dict]:
         with db_connection() as conn:
             cur = conn.cursor()
             cur.execute(
@@ -90,26 +89,26 @@ class ProprietarySignalEngine:
                 WHERE underlying = %s
                   AND status IN (%s, %s, %s)
                 ORDER BY timestamp DESC
-                LIMIT 1
                 """,
                 (self.db_symbol, STATUS_ACTIVE, STATUS_TRIMMED, STATUS_READY),
             )
-            row = cur.fetchone()
-            if not row:
-                return None
-            return {
-                "id": row[0],
-                "status": row[1],
-                "entry_price": float(row[2]),
-                "target_1": float(row[3]),
-                "target_2": float(row[4]),
-                "stop_price": float(row[5]),
-                "contracts": int(row[6]),
-                "strategy_type": row[7],
-                "strikes": row[8],
-                "expiry": row[9],
-                "signal_direction": row[10],
-            }
+            rows = cur.fetchall()
+            trades: list[dict] = []
+            for row in rows:
+                trades.append({
+                    "id": row[0],
+                    "status": row[1],
+                    "entry_price": float(row[2]),
+                    "target_1": float(row[3]),
+                    "target_2": float(row[4]),
+                    "stop_price": float(row[5]),
+                    "contracts": int(row[6]),
+                    "strategy_type": row[7],
+                    "strikes": row[8],
+                    "expiry": row[9],
+                    "signal_direction": row[10],
+                })
+            return trades
 
     def _fetch_underlying_mark(self) -> Optional[float]:
         with db_connection() as conn:
@@ -120,7 +119,6 @@ class ProprietarySignalEngine:
                 FROM underlying_quotes
                 WHERE symbol = %s
                 ORDER BY timestamp DESC
-                LIMIT 1
                 """,
                 (self.db_symbol,),
             )
@@ -248,22 +246,45 @@ class ProprietarySignalEngine:
         logger.info("ProprietarySignalEngine [%s] status=%s pnl=%.2f", self.db_symbol, status, total)
         return True
 
+
+    def _trade_exists_for_signal(self, signal_ts: datetime, strategy_type: str, strikes: str) -> bool:
+        with db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT 1
+                FROM signal_engine_trade_ideas
+                WHERE underlying = %s
+                  AND signal_timestamp = %s
+                  AND strategy_type = %s
+                  AND strikes = %s
+                LIMIT 1
+                """,
+                (self.db_symbol, signal_ts, strategy_type, strikes),
+            )
+            return cur.fetchone() is not None
+
     def run_cycle(self) -> bool:
         mark = self._fetch_underlying_mark()
         if mark is None:
             logger.warning("ProprietarySignalEngine: no underlying mark, skipping")
             return False
 
-        active = self._fetch_active_trade()
-        if active:
-            return self._update_active_trade(active, mark)
+        active_trades = self._fetch_active_trades()
+        updated_any = False
+        for trade in active_trades:
+            updated_any = self._update_active_trade(trade, mark) or updated_any
 
         optimizer_signal = self._fetch_latest_optimizer_signal()
         if not optimizer_signal or optimizer_signal["direction"] == "neutral":
-            logger.info("ProprietarySignalEngine [%s] %s", self.db_symbol, STATUS_READY)
-            return False
+            if not updated_any:
+                logger.info("ProprietarySignalEngine [%s] %s", self.db_symbol, STATUS_READY)
+            return updated_any
 
         idea = self._build_idea(optimizer_signal, mark)
+        if self._trade_exists_for_signal(idea.signal_timestamp, idea.strategy_type, idea.strikes):
+            return updated_any
+
         self._store_new_trade(idea)
         logger.info("ProprietarySignalEngine [%s] launched %s", self.db_symbol, asdict(idea))
         return True
