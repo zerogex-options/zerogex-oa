@@ -2112,7 +2112,7 @@ class DatabaseManager:
                 timestamp,
                 timeframe,
                 composite_score,
-                max_possible_score,
+                100 AS max_possible_score,
                 normalized_score,
                 direction,
                 strength,
@@ -2124,16 +2124,18 @@ class DatabaseManager:
                 current_price,
                 net_gex,
                 gamma_flip,
-                price_vs_flip,
-                vwap,
+                CASE WHEN gamma_flip IS NOT NULL AND gamma_flip <> 0
+                     THEN ROUND(((current_price - gamma_flip) / gamma_flip) * 100, 4)
+                     ELSE NULL END AS price_vs_flip,
+                NULL::numeric AS vwap,
                 vwap_deviation_pct,
                 put_call_ratio,
                 dealer_net_delta,
-                smart_money_direction,
-                unusual_volume_detected,
-                orb_breakout_direction,
+                direction AS smart_money_direction,
+                false AS unusual_volume_detected,
+                NULL::text AS orb_breakout_direction,
                 components
-            FROM trade_signals
+            FROM consolidated_trade_signals
             WHERE underlying = $1
               AND timeframe  = $2
             ORDER BY timestamp DESC
@@ -2175,7 +2177,7 @@ class DatabaseManager:
                 strength_bucket,
                 SUM(total_signals)::int   AS total,
                 SUM(correct_signals)::int AS correct
-            FROM signal_accuracy
+            FROM consolidated_signal_accuracy
             WHERE underlying  = $1
               AND trade_date  >= CURRENT_DATE - ($2 * INTERVAL '1 day')
             GROUP BY timeframe, strength_bucket
@@ -2303,30 +2305,30 @@ class DatabaseManager:
             SELECT
                 underlying,
                 timestamp,
-                signal_timestamp,
-                signal_timeframe,
-                signal_direction,
-                signal_strength,
+                timestamp AS signal_timestamp,
+                timeframe AS signal_timeframe,
+                direction AS signal_direction,
+                strength AS signal_strength,
                 trade_type,
                 current_price,
                 composite_score,
-                max_possible_score,
+                100 AS max_possible_score,
                 normalized_score,
                 top_strategy_type,
-                top_expiry,
-                top_dte,
-                top_strikes,
-                top_probability_of_profit,
-                top_expected_value,
-                top_max_profit,
-                top_max_loss,
-                top_kelly_fraction,
-                top_sharpe_like_ratio,
-                top_liquidity_score,
-                top_market_structure_fit,
-                top_reasoning,
-                candidates
-            FROM position_optimizer_signals
+                (top_candidate::jsonb ->> 'expiry')::date AS top_expiry,
+                COALESCE((top_candidate::jsonb ->> 'dte')::int, 0) AS top_dte,
+                COALESCE(top_candidate::jsonb ->> 'strikes', '') AS top_strikes,
+                COALESCE((top_candidate::jsonb ->> 'probability_of_profit')::numeric, 0) AS top_probability_of_profit,
+                COALESCE((top_candidate::jsonb ->> 'expected_value')::numeric, 0) AS top_expected_value,
+                COALESCE((top_candidate::jsonb ->> 'max_profit')::numeric, 0) AS top_max_profit,
+                COALESCE((top_candidate::jsonb ->> 'max_loss')::numeric, 0) AS top_max_loss,
+                COALESCE((top_candidate::jsonb ->> 'kelly_fraction')::numeric, 0) AS top_kelly_fraction,
+                COALESCE((top_candidate::jsonb ->> 'sharpe_like_ratio')::numeric, 0) AS top_sharpe_like_ratio,
+                COALESCE((top_candidate::jsonb ->> 'liquidity_score')::numeric, 0) AS top_liquidity_score,
+                COALESCE((top_candidate::jsonb ->> 'market_structure_fit')::numeric, 0) AS top_market_structure_fit,
+                '[]'::jsonb AS top_reasoning,
+                jsonb_build_array(top_candidate::jsonb) AS candidates
+            FROM consolidated_trade_signals
             WHERE underlying = $1
             ORDER BY timestamp DESC
             LIMIT 1
@@ -2361,7 +2363,7 @@ class DatabaseManager:
                 AVG(avg_expected_value)::float AS avg_expected_value,
                 AVG(avg_predicted_pop)::float AS avg_predicted_pop,
                 AVG(avg_realized_move_pct)::float AS avg_realized_move_pct
-            FROM position_optimizer_accuracy
+            FROM consolidated_position_accuracy
             WHERE underlying = $1
               AND trade_date >= CURRENT_DATE - ($2 * INTERVAL '1 day')
             GROUP BY signal_direction, strategy_type

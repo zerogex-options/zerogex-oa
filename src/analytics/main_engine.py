@@ -27,9 +27,6 @@ from psycopg2.extras import execute_values
 from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
 from src.config import RISK_FREE_RATE
-from src.analytics.signal_engine import SignalEngine
-from src.analytics.vol_expansion_engine import VolExpansionEngine
-from src.analytics.position_optimizer_engine import PositionOptimizerEngine
 from src.symbols import parse_underlyings, get_canonical_symbol
 
 logger = get_logger(__name__)
@@ -73,12 +70,6 @@ class AnalyticsEngine:
         self.errors_count = 0
         self.last_calculation_time: Optional[datetime] = None
 
-        # Signal engine runs on its own 5-minute cadence
-        self._signal_engine = SignalEngine(underlying=underlying)
-        self._vol_expansion_engine = VolExpansionEngine(underlying=underlying)
-        self._position_optimizer_engine = PositionOptimizerEngine(underlying=underlying)
-        self._signal_interval: int = 300
-        self._last_signal_run: Optional[float] = None
         self._last_flow_cache_ts: Optional[datetime] = None
         self._last_flow_cache_refresh_mono: float = 0.0
         self._flow_cache_refresh_min_seconds: float = float(
@@ -1156,35 +1147,6 @@ class AnalyticsEngine:
             # Refresh flow cache tables
             logger.info("Refreshing flow cache tables...")
             self._refresh_flow_caches(latest_timestamp, underlying_price)
-
-            # --- Signal engine: run every _signal_interval seconds ---
-            now_ts = time.time()
-            if (self._last_signal_run is None or
-                    now_ts - self._last_signal_run >= self._signal_interval):
-                try:
-                    logger.info("Running signal engine...")
-                    ok = self._signal_engine.run_calculation()
-                    if ok:
-                        logger.info("✅ Signal engine cycle complete")
-                    else:
-                        logger.warning("⚠️  Signal engine cycle had no output")
-
-                    logger.info("Running volatility expansion engine...")
-                    vol_ok = self._vol_expansion_engine.run_calculation()
-                    if vol_ok:
-                        logger.info("✅ Volatility expansion cycle complete")
-                    else:
-                        logger.warning("⚠️  Volatility expansion cycle had no output")
-
-                    logger.info("Running position optimizer engine...")
-                    pos_ok = self._position_optimizer_engine.run_calculation()
-                    if pos_ok:
-                        logger.info("✅ Position optimizer cycle complete")
-                    else:
-                        logger.warning("⚠️  Position optimizer cycle had no output")
-                except Exception as _e:
-                    logger.error(f"Signal engine error: {_e}", exc_info=True)
-                self._last_signal_run = now_ts
 
             # Log summary
             logger.info("")

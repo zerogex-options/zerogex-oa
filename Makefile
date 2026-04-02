@@ -15,6 +15,7 @@ PSQL = PGPASSFILE=~/.pgpass psql "sslmode=require host=$(DB_HOST) port=$(DB_PORT
 INGESTION_SERVICE = zerogex-oa-ingestion
 ANALYTICS_SERVICE = zerogex-oa-analytics
 API_SERVICE = zerogex-oa-api
+SIGNALS_SERVICE = zerogex-oa-signals
 
 # Optional filter for db-tail targets (e.g. make db-tail-option-chains UNDERLYING=SPY)
 UNDERLYING ?=
@@ -101,6 +102,7 @@ endef
 $(eval $(call SERVICE_TARGETS,ingestion,INGESTION_SERVICE,Ingestion))
 $(eval $(call SERVICE_TARGETS,analytics,ANALYTICS_SERVICE,Analytics))
 $(eval $(call SERVICE_TARGETS,api,API_SERVICE,API))
+$(eval $(call SERVICE_TARGETS,signals,SIGNALS_SERVICE,Signals))
 
 # DB_TAIL: show 20 most recent rows from a table with optional UNDERLYING filter
 # $(1) = target suffix   (e.g. option-chains)
@@ -203,7 +205,7 @@ help: ## Show this help message
 	@echo "  make {service}-logs             - Show live logs (Ctrl+C to exit)"
 	@echo "  make {service}-logs-tail        - Show last 100 log lines"
 	@echo "  make {service}-logs-errors      - Show recent errors"
-	@echo "  (service = ingestion | analytics | api)"
+	@echo "  (service = ingestion | analytics | signals | api)"
 	@echo "  make logs-grep PATTERN=\"text\" - Search all service logs for pattern"
 	@echo "  make logs-clear                 - Clear all journalctl logs for services"
 	@echo ""

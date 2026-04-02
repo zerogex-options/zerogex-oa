@@ -29,6 +29,7 @@ fi
 SERVICES=(
     "zerogex-oa-ingestion"
     "zerogex-oa-analytics"
+    "zerogex-oa-signals"
 )
 
 # Copy systemd service files
@@ -123,6 +124,9 @@ log "  • make ingestion-logs         - View live ingestion logs"
 log "  • make analytics-start        - Start analytics service"
 log "  • make analytics-stop         - Stop analytics service"
 log "  • make analytics-logs         - View live analytics logs"
+log "  • make signals-start          - Start signals service"
+log "  • make signals-stop           - Stop signals service"
+log "  • make signals-logs           - View live signals logs"
 log ""
 log "Or use systemctl directly:"
 log "  • sudo systemctl status zerogex-oa-ingestion"

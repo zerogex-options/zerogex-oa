@@ -1,0 +1,19 @@
+[Unit]
+Description=ZeroGEX Signal Engine
+After=network.target postgresql.service zerogex-oa-analytics.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/zerogex-oa
+EnvironmentFile=/opt/zerogex-oa/.env
+ExecStart=/opt/zerogex-oa/venv/bin/python -m src.signals.main_engine --underlying ${ZEROGEX_UNDERLYINGS:-SPY}
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/zerogex-oa/signals.log
+StandardError=append:/var/log/zerogex-oa/signals.log
+
+[Install]
+WantedBy=multi-user.target

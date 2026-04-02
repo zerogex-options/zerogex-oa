@@ -6,7 +6,7 @@ GET /api/signals/accuracy?symbol=SPY&lookback_days=30
 GET /api/signals/vol-expansion?symbol=SPY
 GET /api/signals/vol-expansion/accuracy?symbol=SPY&lookback_days=30
 
-The AnalyticsEngine writes fresh signal rows every ~5 minutes.
+The standalone Signal Engine writes fresh signal rows every ~5 minutes.
 The API simply reads the latest row; no scoring logic lives here.
 """
 
@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 import enum
 import logging
 
-from src.analytics.position_optimizer_engine import ASSUMED_ACCOUNT_EQUITY, RISK_PROFILE_BUDGETS
+from src.signals.position_optimizer_engine import ASSUMED_ACCOUNT_EQUITY, RISK_PROFILE_BUDGETS
 
 from ..database import DatabaseManager
 from ..models import (
@@ -241,7 +241,7 @@ async def get_trade_signal(
             status_code=404,
             detail=(
                 f"No trade signal found for {symbol} / {timeframe.value}. "
-                "The AnalyticsEngine may not have run yet, or no market data "
+                "The Signal Engine may not have run yet, or no market data "
                 "is available for this symbol."
             ),
         )
