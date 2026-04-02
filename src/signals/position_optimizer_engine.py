@@ -169,51 +169,61 @@ class PositionOptimizerEngine:
             os.getenv("POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS", "false").lower() == "true"
         )
 
-    def _fetch_context(self, as_of: Optional[datetime] = None) -> Optional[PositionOptimizerContext]:
+    def _fetch_context(self, as_of: Optional[datetime] = None, signal: Optional[dict] = None) -> Optional[PositionOptimizerContext]:
         try:
             with db_connection() as conn:
                 cur = conn.cursor()
                 anchor_ts = as_of
 
-                if anchor_ts is None:
-                    cur.execute(
-                        """
-                        SELECT timestamp, timeframe, direction, strength, trade_type
-                        FROM trade_signals
-                        WHERE underlying = %s
-                        ORDER BY timestamp DESC,
-                                 CASE timeframe
-                                   WHEN 'intraday' THEN 1
-                                   WHEN 'swing' THEN 2
-                                   ELSE 3
-                                 END ASC
-                        LIMIT 1
-                        """,
-                        (self.db_symbol,),
-                    )
+                if signal is not None:
+                    signal_ts = signal.get("timestamp")
+                    signal_timeframe = signal.get("timeframe", "intraday")
+                    signal_direction = signal.get("direction", "neutral")
+                    signal_strength = signal.get("strength", "low")
+                    trade_type = signal.get("trade_type", "no_trade")
+                    if signal_ts is None:
+                        signal_ts = anchor_ts
+                    anchor_ts = anchor_ts or signal_ts
                 else:
-                    cur.execute(
-                        """
-                        SELECT timestamp, timeframe, direction, strength, trade_type
-                        FROM trade_signals
-                        WHERE underlying = %s
-                          AND timestamp <= %s
-                        ORDER BY timestamp DESC,
-                                 CASE timeframe
-                                   WHEN 'intraday' THEN 1
-                                   WHEN 'swing' THEN 2
-                                   ELSE 3
-                                 END ASC
-                        LIMIT 1
-                        """,
-                        (self.db_symbol, anchor_ts),
-                    )
-                signal_row = cur.fetchone()
-                if not signal_row:
-                    logger.warning("PositionOptimizerEngine: no trade_signals rows found")
-                    return None
-                signal_ts, signal_timeframe, signal_direction, signal_strength, trade_type = signal_row
-                anchor_ts = anchor_ts or signal_ts
+                    if anchor_ts is None:
+                        cur.execute(
+                            """
+                            SELECT timestamp, timeframe, direction, strength, trade_type
+                            FROM trade_signals
+                            WHERE underlying = %s
+                            ORDER BY timestamp DESC,
+                                     CASE timeframe
+                                       WHEN 'intraday' THEN 1
+                                       WHEN 'swing' THEN 2
+                                       ELSE 3
+                                     END ASC
+                            LIMIT 1
+                            """,
+                            (self.db_symbol,),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT timestamp, timeframe, direction, strength, trade_type
+                            FROM trade_signals
+                            WHERE underlying = %s
+                              AND timestamp <= %s
+                            ORDER BY timestamp DESC,
+                                     CASE timeframe
+                                       WHEN 'intraday' THEN 1
+                                       WHEN 'swing' THEN 2
+                                       ELSE 3
+                                     END ASC
+                            LIMIT 1
+                            """,
+                            (self.db_symbol, anchor_ts),
+                        )
+                    signal_row = cur.fetchone()
+                    if not signal_row:
+                        logger.warning("PositionOptimizerEngine: no trade_signals rows found")
+                        return None
+                    signal_ts, signal_timeframe, signal_direction, signal_strength, trade_type = signal_row
+                    anchor_ts = anchor_ts or signal_ts
 
                 cur.execute(
                     """

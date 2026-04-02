@@ -2097,63 +2097,71 @@ class DatabaseManager:
     # Trade Signal Queries
     # ========================================================================
 
-    async def get_trade_signal(
-        self,
-        symbol: str = "SPY",
-        timeframe: str = "intraday",
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Return the most recent trade_signals row for this symbol + timeframe.
-        Falls back to the previous row if the latest is >10 min stale.
-        """
+    async def get_latest_signal_score(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
+        """Return latest score snapshot for one symbol."""
         query = """
             SELECT
                 underlying,
                 timestamp,
-                timeframe,
                 composite_score,
-                100 AS max_possible_score,
+                max_possible_score,
                 normalized_score,
                 direction,
                 strength,
-                estimated_win_pct,
-                trade_type,
-                trade_rationale,
-                target_expiry,
-                suggested_strikes,
-                current_price,
-                net_gex,
-                gamma_flip,
-                CASE WHEN gamma_flip IS NOT NULL AND gamma_flip <> 0
-                     THEN ROUND(((current_price - gamma_flip) / gamma_flip) * 100, 4)
-                     ELSE NULL END AS price_vs_flip,
-                NULL::numeric AS vwap,
-                vwap_deviation_pct,
-                put_call_ratio,
-                dealer_net_delta,
-                direction AS smart_money_direction,
-                false AS unusual_volume_detected,
-                NULL::text AS orb_breakout_direction,
+                regime,
+                recommended_trade_type,
+                recommended_timeframe,
                 components
-            FROM consolidated_trade_signals
+            FROM signal_scores
             WHERE underlying = $1
-              AND timeframe  = $2
             ORDER BY timestamp DESC
             LIMIT 1
         """
         try:
             async with self._acquire_connection() as conn:
-                row = await conn.fetchrow(query, symbol, timeframe)
+                row = await conn.fetchrow(query, symbol)
                 if not row:
                     return None
                 d = dict(row)
-                # components is stored as JSONB; asyncpg returns it as a string
                 if isinstance(d.get("components"), str):
                     d["components"] = json.loads(d["components"])
                 return d
         except Exception as e:
-            logger.error(f"get_trade_signal failed ({symbol}, {timeframe}): {e}")
+            logger.error(f"get_latest_signal_score failed ({symbol}): {e}")
             return None
+
+    async def get_signal_scores_history(self, limit: int = 100) -> list[Dict[str, Any]]:
+        """Return latest score history rows across all symbols."""
+        query = """
+            SELECT
+                underlying,
+                timestamp,
+                composite_score,
+                max_possible_score,
+                normalized_score,
+                direction,
+                strength,
+                regime,
+                recommended_trade_type,
+                recommended_timeframe,
+                components
+            FROM signal_scores
+            ORDER BY timestamp DESC
+            LIMIT $1
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, limit)
+                out = []
+                for row in rows:
+                    d = dict(row)
+                    if isinstance(d.get("components"), str):
+                        d["components"] = json.loads(d["components"])
+                    out.append(d)
+                return out
+        except Exception as e:
+            logger.error(f"get_signal_scores_history failed: {e}")
+            return []
 
     async def get_signal_accuracy(
         self,
@@ -2206,7 +2214,7 @@ class DatabaseManager:
         self,
         symbol: str = "SPY",
     ) -> Optional[Dict[str, Any]]:
-        """Return the most recent volatility expansion signal for this symbol."""
+        """Return volatility-focused view from latest score components for this symbol."""
         query = """
             SELECT
                 underlying,
@@ -2214,25 +2222,8 @@ class DatabaseManager:
                 composite_score,
                 max_possible_score,
                 normalized_score,
-                move_probability,
-                expected_direction,
-                expected_magnitude_pct,
-                confidence,
-                catalyst_type,
-                time_horizon,
-                strategy_type,
-                entry_window,
-                current_price,
-                net_gex,
-                gamma_flip,
-                max_pain,
-                put_call_ratio,
-                dealer_net_delta,
-                smart_money_direction,
-                vwap_deviation_pct,
-                hours_to_next_expiry,
                 components
-            FROM volatility_expansion_signals
+            FROM signal_scores
             WHERE underlying = $1
             ORDER BY timestamp DESC
             LIMIT 1
@@ -2243,8 +2234,26 @@ class DatabaseManager:
                 if not row:
                     return None
                 d = dict(row)
-                if isinstance(d.get("components"), str):
-                    d["components"] = json.loads(d["components"])
+                comps = d.get("components")
+                if isinstance(comps, str):
+                    comps = json.loads(comps)
+                comps = comps or []
+                vol_keys = {"vol_instability", "exhaustion", "vwap", "gex_regime"}
+                vol_components = [c for c in comps if isinstance(c, dict) and c.get("key") in vol_keys]
+                expected_direction = "up" if (d.get("composite_score") or 0) > 0 else ("down" if (d.get("composite_score") or 0) < 0 else "neutral")
+                d.update(
+                    {
+                        "move_probability": round(min(0.95, 0.20 + float(d.get("normalized_score") or 0) * 0.75), 4),
+                        "expected_direction": expected_direction,
+                        "expected_magnitude_pct": round(0.15 + float(d.get("normalized_score") or 0) * 0.80, 4),
+                        "confidence": d.get("strength", "low"),
+                        "catalyst_type": "score_integrated_vol",
+                        "time_horizon": d.get("recommended_timeframe", "intraday"),
+                        "strategy_type": d.get("recommended_trade_type", "wait"),
+                        "entry_window": "Signal-cycle immediate",
+                        "components": vol_components,
+                    }
+                )
                 return d
         except Exception as e:
             logger.error(f"get_vol_expansion_signal failed ({symbol}): {e}")
@@ -2296,56 +2305,65 @@ class DatabaseManager:
             return {}
 
 
-    async def get_position_optimizer_signal(
-        self,
-        symbol: str = "SPY",
-    ) -> Optional[Dict[str, Any]]:
-        """Return the most recent position optimizer signal for this symbol."""
+    async def get_live_signal_trades(self) -> list[Dict[str, Any]]:
+        """Return all open/trimmed live signal trades for all symbols."""
         query = """
             SELECT
-                underlying,
-                timestamp,
-                timestamp AS signal_timestamp,
-                timeframe AS signal_timeframe,
-                direction AS signal_direction,
-                strength AS signal_strength,
-                trade_type,
-                current_price,
-                composite_score,
-                100 AS max_possible_score,
-                normalized_score,
-                top_strategy_type,
-                (top_candidate::jsonb ->> 'expiry')::date AS top_expiry,
-                COALESCE((top_candidate::jsonb ->> 'dte')::int, 0) AS top_dte,
-                COALESCE(top_candidate::jsonb ->> 'strikes', '') AS top_strikes,
-                COALESCE((top_candidate::jsonb ->> 'probability_of_profit')::numeric, 0) AS top_probability_of_profit,
-                COALESCE((top_candidate::jsonb ->> 'expected_value')::numeric, 0) AS top_expected_value,
-                COALESCE((top_candidate::jsonb ->> 'max_profit')::numeric, 0) AS top_max_profit,
-                COALESCE((top_candidate::jsonb ->> 'max_loss')::numeric, 0) AS top_max_loss,
-                COALESCE((top_candidate::jsonb ->> 'kelly_fraction')::numeric, 0) AS top_kelly_fraction,
-                COALESCE((top_candidate::jsonb ->> 'sharpe_like_ratio')::numeric, 0) AS top_sharpe_like_ratio,
-                COALESCE((top_candidate::jsonb ->> 'liquidity_score')::numeric, 0) AS top_liquidity_score,
-                COALESCE((top_candidate::jsonb ->> 'market_structure_fit')::numeric, 0) AS top_market_structure_fit,
-                '[]'::jsonb AS top_reasoning,
-                jsonb_build_array(top_candidate::jsonb) AS candidates
-            FROM consolidated_trade_signals
-            WHERE underlying = $1
-            ORDER BY timestamp DESC
-            LIMIT 1
+                id, underlying, score_timestamp, opened_at, status,
+                signal_direction, signal_strength, strategy_type, expiry, strikes,
+                contracts, entry_price, avg_cost, current_mark,
+                stop_price, target_1, target_2, trim_count, add_count,
+                realized_pnl, unrealized_pnl, total_pnl, win_loss_pct,
+                notes, candidate, updated_at
+            FROM signal_trades
+            WHERE status IN ('open', 'trimmed')
+            ORDER BY opened_at DESC
         """
         try:
             async with self._acquire_connection() as conn:
-                row = await conn.fetchrow(query, symbol)
-                if not row:
-                    return None
-                d = dict(row)
-                for key in ("top_reasoning", "candidates"):
-                    if isinstance(d.get(key), str):
-                        d[key] = json.loads(d[key])
-                return d
+                rows = await conn.fetch(query)
+                out = []
+                for row in rows:
+                    d = dict(row)
+                    if isinstance(d.get("candidate"), str):
+                        d["candidate"] = json.loads(d["candidate"])
+                    out.append(d)
+                return out
         except Exception as e:
-            logger.error(f"get_position_optimizer_signal failed ({symbol}): {e}")
-            return None
+            logger.error(f"get_live_signal_trades failed: {e}")
+            return []
+
+    async def get_closed_signal_trades(self, limit: int = 500) -> list[Dict[str, Any]]:
+        """Return closed signal trades for all symbols."""
+        query = """
+            SELECT
+                id, underlying, score_timestamp, opened_at, closed_at, status,
+                signal_direction, signal_strength, strategy_type, expiry, strikes,
+                contracts, entry_price, avg_cost, current_mark,
+                stop_price, target_1, target_2, trim_count, add_count,
+                realized_pnl, unrealized_pnl, total_pnl, win_loss_pct,
+                CASE WHEN total_pnl > 0 THEN 'win'
+                     WHEN total_pnl < 0 THEN 'loss'
+                     ELSE 'flat' END AS outcome,
+                notes, candidate, updated_at
+            FROM signal_trades
+            WHERE closed_at IS NOT NULL
+            ORDER BY closed_at DESC
+            LIMIT $1
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, limit)
+                out = []
+                for row in rows:
+                    d = dict(row)
+                    if isinstance(d.get("candidate"), str):
+                        d["candidate"] = json.loads(d["candidate"])
+                    out.append(d)
+                return out
+        except Exception as e:
+            logger.error(f"get_closed_signal_trades failed: {e}")
+            return []
 
     async def get_position_optimizer_accuracy(
         self,

@@ -1002,3 +1002,97 @@ CREATE TABLE IF NOT EXISTS consolidated_position_accuracy (
 
 CREATE INDEX IF NOT EXISTS idx_consolidated_position_accuracy_underlying_date
     ON consolidated_position_accuracy(underlying, trade_date DESC);
+
+-- ---------------------------------------------------------------------------
+-- NEW SIGNALING SYSTEM (decoupled from analytics)
+-- ---------------------------------------------------------------------------
+
+-- Fresh-start migration path for signaling tables.
+DROP TABLE IF EXISTS consolidated_position_accuracy;
+DROP TABLE IF EXISTS consolidated_signal_accuracy;
+DROP TABLE IF EXISTS consolidated_trade_signals;
+DROP TABLE IF EXISTS signal_engine_trade_ideas;
+DROP TABLE IF EXISTS position_optimizer_accuracy;
+DROP TABLE IF EXISTS position_optimizer_signals;
+DROP TABLE IF EXISTS vol_expansion_accuracy;
+DROP TABLE IF EXISTS volatility_expansion_signals;
+DROP TABLE IF EXISTS signal_accuracy;
+DROP TABLE IF EXISTS trade_signals;
+
+CREATE TABLE IF NOT EXISTS signal_scores (
+    underlying               VARCHAR(20)   NOT NULL,
+    timestamp                TIMESTAMPTZ   NOT NULL,
+    composite_score          INTEGER       NOT NULL,
+    max_possible_score       INTEGER       NOT NULL,
+    normalized_score         NUMERIC(8, 4) NOT NULL,
+    direction                VARCHAR(10)   NOT NULL CHECK (direction IN ('bullish', 'bearish', 'neutral')),
+    strength                 VARCHAR(10)   NOT NULL CHECK (strength IN ('high', 'medium', 'low')),
+    regime                   VARCHAR(20)   NOT NULL,
+    recommended_trade_type   VARCHAR(40)   NOT NULL,
+    recommended_timeframe    VARCHAR(20)   NOT NULL,
+    components               JSONB         NOT NULL DEFAULT '[]'::jsonb,
+    created_at               TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    updated_at               TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (underlying, timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_scores_underlying_ts
+    ON signal_scores(underlying, timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS signal_trades (
+    id                       BIGSERIAL     PRIMARY KEY,
+    underlying               VARCHAR(20)   NOT NULL,
+    score_timestamp          TIMESTAMPTZ   NOT NULL,
+    opened_at                TIMESTAMPTZ   NOT NULL,
+    closed_at                TIMESTAMPTZ,
+    status                   VARCHAR(20)   NOT NULL CHECK (status IN ('open', 'trimmed', 'stopped', 'target_hit', 'score_exit', 'expired')),
+    signal_direction         VARCHAR(10)   NOT NULL CHECK (signal_direction IN ('bullish', 'bearish', 'neutral')),
+    signal_strength          VARCHAR(10)   NOT NULL CHECK (signal_strength IN ('high', 'medium', 'low')),
+    strategy_type            VARCHAR(40)   NOT NULL,
+    expiry                   DATE          NOT NULL,
+    strikes                  VARCHAR(160)  NOT NULL,
+    contracts                INTEGER       NOT NULL,
+    entry_price              NUMERIC(18, 6) NOT NULL,
+    avg_cost                 NUMERIC(18, 6) NOT NULL,
+    current_mark             NUMERIC(18, 6) NOT NULL,
+    stop_price               NUMERIC(18, 6) NOT NULL,
+    target_1                 NUMERIC(18, 6) NOT NULL,
+    target_2                 NUMERIC(18, 6) NOT NULL,
+    trim_count               INTEGER       NOT NULL DEFAULT 0,
+    add_count                INTEGER       NOT NULL DEFAULT 0,
+    realized_pnl             NUMERIC(18, 6) NOT NULL DEFAULT 0,
+    unrealized_pnl           NUMERIC(18, 6) NOT NULL DEFAULT 0,
+    total_pnl                NUMERIC(18, 6) NOT NULL DEFAULT 0,
+    win_loss_pct             NUMERIC(10, 4) NOT NULL DEFAULT 0,
+    notes                    TEXT          NOT NULL DEFAULT '',
+    candidate                JSONB         NOT NULL DEFAULT '{}'::jsonb,
+    created_at               TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    updated_at               TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_signal_trades_signal_scores
+        FOREIGN KEY (underlying, score_timestamp)
+        REFERENCES signal_scores(underlying, timestamp)
+        ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_trades_unique_signal_contract
+    ON signal_trades(underlying, score_timestamp, strategy_type, strikes);
+CREATE INDEX IF NOT EXISTS idx_signal_trades_underlying_status
+    ON signal_trades(underlying, status, opened_at DESC);
+
+-- Enforce immutability after close.
+CREATE OR REPLACE FUNCTION signal_trades_prevent_closed_updates()
+RETURNS trigger AS $$
+BEGIN
+    IF OLD.closed_at IS NOT NULL THEN
+        RAISE EXCEPTION 'signal_trades row % is immutable after close', OLD.id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_signal_trades_immutable_after_close ON signal_trades;
+CREATE TRIGGER trg_signal_trades_immutable_after_close
+BEFORE UPDATE ON signal_trades
+FOR EACH ROW
+WHEN (OLD.closed_at IS NOT NULL)
+EXECUTE FUNCTION signal_trades_prevent_closed_updates();
