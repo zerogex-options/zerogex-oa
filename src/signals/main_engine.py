@@ -12,8 +12,7 @@ import time
 from multiprocessing import Process
 
 from src.config import SIGNALS_UNDERLYINGS
-from src.signals.consolidated_signal_engine import ConsolidatedSignalEngine
-from src.signals.proprietary_signal_engine import ProprietarySignalEngine
+from src.signals.unified_signal_engine import UnifiedSignalEngine
 from src.symbols import parse_underlyings
 from src.utils import get_logger
 
@@ -25,8 +24,7 @@ class SignalEngineService:
         self.underlying = underlying.upper()
         self.interval_seconds = max(30, int(interval_seconds))
         self.running = False
-        self.consolidated_engine = ConsolidatedSignalEngine(underlying=self.underlying)
-        self.proprietary_engine = ProprietarySignalEngine(underlying=self.underlying)
+        self.unified_engine = UnifiedSignalEngine(underlying=self.underlying)
 
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -36,13 +34,11 @@ class SignalEngineService:
         self.running = False
 
     def run_cycle(self) -> None:
-        consolidated_ok = self.consolidated_engine.run_cycle()
-        prop_ok = self.proprietary_engine.run_cycle()
+        unified_ok = self.unified_engine.run_cycle()
         logger.info(
-            "SignalEngineService cycle [%s] complete | consolidated=%s proprietary=%s",
+            "SignalEngineService cycle [%s] complete | unified=%s",
             self.underlying,
-            consolidated_ok,
-            prop_ok,
+            unified_ok,
         )
 
     def run(self) -> None:
