@@ -869,6 +869,8 @@ CREATE TABLE IF NOT EXISTS signal_engine_trade_ideas (
     underlying          VARCHAR(20)   NOT NULL,
     signal_timestamp    TIMESTAMPTZ   NOT NULL,
     timestamp           TIMESTAMPTZ   NOT NULL,
+    time_opened         TIMESTAMPTZ   NOT NULL,
+    time_closed         TIMESTAMPTZ,
     status              VARCHAR(40)   NOT NULL CHECK (
         status IN (
             'ready_to_trigger',
@@ -898,6 +900,19 @@ CREATE TABLE IF NOT EXISTS signal_engine_trade_ideas (
     updated_at          TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
     created_at          TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE signal_engine_trade_ideas
+    ADD COLUMN IF NOT EXISTS time_opened TIMESTAMPTZ;
+
+ALTER TABLE signal_engine_trade_ideas
+    ADD COLUMN IF NOT EXISTS time_closed TIMESTAMPTZ;
+
+UPDATE signal_engine_trade_ideas
+SET time_opened = COALESCE(time_opened, timestamp)
+WHERE time_opened IS NULL;
+
+ALTER TABLE signal_engine_trade_ideas
+    ALTER COLUMN time_opened SET NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_signal_engine_trade_ideas_underlying_ts
     ON signal_engine_trade_ideas(underlying, timestamp DESC);
