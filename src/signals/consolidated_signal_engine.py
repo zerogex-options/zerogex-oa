@@ -94,6 +94,8 @@ class ConsolidatedSignalEngine:
             logger.warning("ConsolidatedSignalEngine: vol context unavailable")
             return False
         vol_signal = self.vol_engine.compute_signal(vctx)
+        # Keep /api/signals/vol-expansion fresh even with consolidated pipeline.
+        self.vol_engine._store_signal(vol_signal)
 
         pctx = self.position_engine._fetch_context(as_of=tctx.timestamp)
         if pctx is None:
