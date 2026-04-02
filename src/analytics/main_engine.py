@@ -22,6 +22,7 @@ from collections import defaultdict
 import pytz
 import numpy as np
 from scipy import stats
+from psycopg2.extras import execute_values
 
 from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
@@ -613,100 +614,178 @@ class AnalyticsEngine:
 
     def _store_gex_by_strike(
         self,
-        gex_data: List[Dict[str, Any]]
+        gex_data: List[Dict[str, Any]],
+        conn=None,
+        cursor=None,
+        commit: bool = True,
     ):
         """Store GEX by strike data in database"""
+        if (conn is None) != (cursor is None):
+            raise ValueError("conn and cursor must be provided together")
+        if conn is None:
+            with db_connection() as local_conn:
+                local_cursor = local_conn.cursor()
+                self._store_gex_by_strike(
+                    gex_data,
+                    conn=local_conn,
+                    cursor=local_cursor,
+                    commit=True,
+                )
+            return
         try:
-            with db_connection() as conn:
-                cursor = conn.cursor()
+            rows = [(
+                data['underlying'],
+                data['timestamp'],
+                float(data['strike']),
+                data['expiration'],
+                float(data['total_gamma']),
+                float(data['call_gamma']),
+                float(data['put_gamma']),
+                float(data['net_gex']),
+                int(data['call_volume']),
+                int(data['put_volume']),
+                int(data['call_oi']),
+                int(data['put_oi']),
+                float(data['vanna_exposure']),
+                float(data['charm_exposure'])
+            ) for data in gex_data]
 
-                for data in gex_data:
-                    cursor.execute("""
-                        INSERT INTO gex_by_strike
-                        (underlying, timestamp, strike, expiration, total_gamma,
-                         call_gamma, put_gamma, net_gex, call_volume, put_volume,
-                         call_oi, put_oi, vanna_exposure, charm_exposure)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (underlying, timestamp, strike, expiration) DO UPDATE SET
-                            total_gamma = EXCLUDED.total_gamma,
-                            call_gamma = EXCLUDED.call_gamma,
-                            put_gamma = EXCLUDED.put_gamma,
-                            net_gex = EXCLUDED.net_gex,
-                            call_volume = EXCLUDED.call_volume,
-                            put_volume = EXCLUDED.put_volume,
-                            call_oi = EXCLUDED.call_oi,
-                            put_oi = EXCLUDED.put_oi,
-                            vanna_exposure = EXCLUDED.vanna_exposure,
-                            charm_exposure = EXCLUDED.charm_exposure
-                    """, (
-                        data['underlying'],
-                        data['timestamp'],
-                        float(data['strike']),
-                        data['expiration'],
-                        float(data['total_gamma']),
-                        float(data['call_gamma']),
-                        float(data['put_gamma']),
-                        float(data['net_gex']),
-                        int(data['call_volume']),
-                        int(data['put_volume']),
-                        int(data['call_oi']),
-                        int(data['put_oi']),
-                        float(data['vanna_exposure']),
-                        float(data['charm_exposure'])
-                    ))
+            execute_values(
+                cursor,
+                """
+                INSERT INTO gex_by_strike
+                (underlying, timestamp, strike, expiration, total_gamma,
+                 call_gamma, put_gamma, net_gex, call_volume, put_volume,
+                 call_oi, put_oi, vanna_exposure, charm_exposure)
+                VALUES %s
+                ON CONFLICT (underlying, timestamp, strike, expiration) DO UPDATE SET
+                    total_gamma = EXCLUDED.total_gamma,
+                    call_gamma = EXCLUDED.call_gamma,
+                    put_gamma = EXCLUDED.put_gamma,
+                    net_gex = EXCLUDED.net_gex,
+                    call_volume = EXCLUDED.call_volume,
+                    put_volume = EXCLUDED.put_volume,
+                    call_oi = EXCLUDED.call_oi,
+                    put_oi = EXCLUDED.put_oi,
+                    vanna_exposure = EXCLUDED.vanna_exposure,
+                    charm_exposure = EXCLUDED.charm_exposure
+                """,
+                rows,
+            )
 
+            if commit:
                 conn.commit()
-                logger.info(f"✅ Stored {len(gex_data)} GEX by strike records")
+            logger.info(f"✅ Stored {len(gex_data)} GEX by strike records")
 
         except Exception as e:
             logger.error(f"Error storing GEX by strike: {e}", exc_info=True)
             self.errors_count += 1
+            if conn is not None:
+                conn.rollback()
+            raise
 
     def _store_gex_summary(
         self,
-        summary: Dict[str, Any]
+        summary: Dict[str, Any],
+        conn=None,
+        cursor=None,
+        commit: bool = True,
     ):
         """Store GEX summary in database"""
+        if (conn is None) != (cursor is None):
+            raise ValueError("conn and cursor must be provided together")
+        if conn is None:
+            with db_connection() as local_conn:
+                local_cursor = local_conn.cursor()
+                self._store_gex_summary(
+                    summary,
+                    conn=local_conn,
+                    cursor=local_cursor,
+                    commit=True,
+                )
+            return
         try:
-            with db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO gex_summary
-                    (underlying, timestamp, max_gamma_strike, max_gamma_value,
-                     gamma_flip_point, put_call_ratio, max_pain, total_call_volume,
-                     total_put_volume, total_call_oi, total_put_oi, total_net_gex)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (underlying, timestamp) DO UPDATE SET
-                        max_gamma_strike = EXCLUDED.max_gamma_strike,
-                        max_gamma_value = EXCLUDED.max_gamma_value,
-                        gamma_flip_point = EXCLUDED.gamma_flip_point,
-                        put_call_ratio = EXCLUDED.put_call_ratio,
-                        max_pain = EXCLUDED.max_pain,
-                        total_call_volume = EXCLUDED.total_call_volume,
-                        total_put_volume = EXCLUDED.total_put_volume,
-                        total_call_oi = EXCLUDED.total_call_oi,
-                        total_put_oi = EXCLUDED.total_put_oi,
-                        total_net_gex = EXCLUDED.total_net_gex
-                """, (
-                    summary['underlying'],
-                    summary['timestamp'],
-                    float(summary['max_gamma_strike']),
-                    float(summary['max_gamma_value']),
-                    float(summary['gamma_flip_point']) if summary['gamma_flip_point'] else None,
-                    float(summary['put_call_ratio']),
-                    float(summary['max_pain']),
-                    int(summary['total_call_volume']),
-                    int(summary['total_put_volume']),
-                    int(summary['total_call_oi']),
-                    int(summary['total_put_oi']),
-                    float(summary['total_net_gex'])
-                ))
+            cursor.execute("""
+                INSERT INTO gex_summary
+                (underlying, timestamp, max_gamma_strike, max_gamma_value,
+                 gamma_flip_point, put_call_ratio, max_pain, total_call_volume,
+                 total_put_volume, total_call_oi, total_put_oi, total_net_gex)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (underlying, timestamp) DO UPDATE SET
+                    max_gamma_strike = EXCLUDED.max_gamma_strike,
+                    max_gamma_value = EXCLUDED.max_gamma_value,
+                    gamma_flip_point = EXCLUDED.gamma_flip_point,
+                    put_call_ratio = EXCLUDED.put_call_ratio,
+                    max_pain = EXCLUDED.max_pain,
+                    total_call_volume = EXCLUDED.total_call_volume,
+                    total_put_volume = EXCLUDED.total_put_volume,
+                    total_call_oi = EXCLUDED.total_call_oi,
+                    total_put_oi = EXCLUDED.total_put_oi,
+                    total_net_gex = EXCLUDED.total_net_gex
+            """, (
+                summary['underlying'],
+                summary['timestamp'],
+                float(summary['max_gamma_strike']),
+                float(summary['max_gamma_value']),
+                float(summary['gamma_flip_point']) if summary['gamma_flip_point'] else None,
+                float(summary['put_call_ratio']),
+                float(summary['max_pain']),
+                int(summary['total_call_volume']),
+                int(summary['total_put_volume']),
+                int(summary['total_call_oi']),
+                int(summary['total_put_oi']),
+                float(summary['total_net_gex'])
+            ))
+            if commit:
                 conn.commit()
-                logger.info(f"✅ Stored GEX summary")
+            logger.info("✅ Stored GEX summary")
 
         except Exception as e:
             logger.error(f"Error storing GEX summary: {e}", exc_info=True)
             self.errors_count += 1
+            if conn is not None:
+                conn.rollback()
+            raise
+
+    def _store_calculation_results(
+        self,
+        gex_data: List[Dict[str, Any]],
+        summary: Dict[str, Any],
+    ):
+        """Store by-strike + summary metrics in a single transaction."""
+        with db_connection() as conn:
+            cursor = conn.cursor()
+            self._store_gex_by_strike(gex_data, conn=conn, cursor=cursor, commit=False)
+            self._store_gex_summary(summary, conn=conn, cursor=cursor, commit=False)
+            conn.commit()
+
+    def _validate_gex_calculations(
+        self,
+        gex_by_strike: List[Dict[str, Any]],
+        summary: Dict[str, Any],
+        underlying_price: float,
+    ):
+        """Run consistency checks and log any numerical drift or sign anomalies."""
+        mismatches = 0
+        sign_anomalies = 0
+        for row in gex_by_strike:
+            call_gex = row["call_gamma"] * 100 * underlying_price
+            put_gex = -1 * row["put_gamma"] * 100 * underlying_price
+            if abs((call_gex + put_gex) - row["net_gex"]) > 1e-6:
+                mismatches += 1
+            if row["call_gamma"] < 0 or row["put_gamma"] < 0:
+                sign_anomalies += 1
+
+        summary_total = sum(strike["net_gex"] for strike in gex_by_strike)
+        if abs(summary_total - summary["total_net_gex"]) > 1e-6:
+            mismatches += 1
+
+        if mismatches:
+            logger.warning("GEX validation: detected %d by-strike arithmetic mismatches", mismatches)
+        if sign_anomalies:
+            logger.warning("GEX validation: detected %d sign anomalies (negative aggregated gamma)", sign_anomalies)
+        if not mismatches and not sign_anomalies:
+            logger.info("GEX validation: all by-strike calculations passed")
 
     def _refresh_flow_caches(self, timestamp: datetime, underlying_price: Optional[float] = None):
         """
@@ -1039,10 +1118,12 @@ class AnalyticsEngine:
                 logger.warning("Failed to calculate GEX summary")
                 return False
 
+            # Validate internal arithmetic consistency before persisting.
+            self._validate_gex_calculations(gex_by_strike, gex_summary, underlying_price)
+
             # Store results
             logger.info("Storing results to database...")
-            self._store_gex_by_strike(gex_by_strike)
-            self._store_gex_summary(gex_summary)
+            self._store_calculation_results(gex_by_strike, gex_summary)
 
             # Refresh flow cache tables
             logger.info("Refreshing flow cache tables...")

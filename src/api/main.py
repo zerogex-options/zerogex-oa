@@ -19,6 +19,7 @@ from .database import DatabaseManager
 from .models import (
     GEXSummary,
     GEXByStrike,
+    GEXWallsResponse,
     FlowByTypePoint,
     FlowByStrikePoint,
     FlowByExpirationPoint,
@@ -241,6 +242,25 @@ async def get_gex_heatmap(
         raise
     except Exception as e:
         logger.error(f"Error fetching GEX heatmap: {e!r}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/api/gex/walls", response_model=GEXWallsResponse, tags=["GEX"])
+async def get_gex_walls(symbol: str = Query(default="SPY")):
+    """
+    Get dominant call and put wall levels relative to current spot price.
+
+    Walls are aggregated across expirations using directional gamma notional.
+    """
+    try:
+        data = await db_manager.get_gex_walls(symbol)
+        if not data:
+            raise HTTPException(status_code=404, detail="No GEX wall data available")
+        return GEXWallsResponse(**data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching GEX walls: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 

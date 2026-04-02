@@ -1169,8 +1169,18 @@ class DatabaseManager:
                 put_oi,
                 call_volume,
                 put_volume,
-                call_gamma as call_gex,
-                put_gamma as put_gex,
+                (call_gamma * 100 * COALESCE(
+                    (SELECT close FROM underlying_quotes
+                     WHERE symbol = $1
+                     ORDER BY timestamp DESC LIMIT 1),
+                    0
+                )) as call_gex,
+                (-1 * put_gamma * 100 * COALESCE(
+                    (SELECT close FROM underlying_quotes
+                     WHERE symbol = $1
+                     ORDER BY timestamp DESC LIMIT 1),
+                    0
+                )) as put_gex,
                 net_gex,
                 vanna_exposure,
                 charm_exposure,
@@ -1199,6 +1209,104 @@ class DatabaseManager:
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching GEX by strike: {e}", exc_info=True)
+            raise
+
+    async def get_gex_walls(
+        self,
+        symbol: str = "SPY",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get latest strongest call and put wall levels relative to spot.
+
+        Wall levels are determined by the largest absolute directional gamma
+        exposure aggregated by strike across expirations.
+        """
+        query = """
+            WITH latest AS (
+                SELECT MAX(timestamp) AS ts
+                FROM gex_by_strike
+                WHERE underlying = $1
+            ),
+            spot AS (
+                SELECT close::numeric AS spot_price
+                FROM underlying_quotes
+                WHERE symbol = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            strike_agg AS (
+                SELECT
+                    g.timestamp,
+                    g.strike,
+                    SUM(g.call_gamma * 100 * s.spot_price)::numeric AS call_exposure,
+                    SUM(-1 * g.put_gamma * 100 * s.spot_price)::numeric AS put_exposure,
+                    s.spot_price
+                FROM gex_by_strike g
+                CROSS JOIN spot s
+                WHERE g.underlying = $1
+                  AND g.timestamp = (SELECT ts FROM latest)
+                GROUP BY g.timestamp, g.strike, s.spot_price
+            ),
+            call_wall AS (
+                SELECT *
+                FROM strike_agg
+                ORDER BY call_exposure DESC, strike
+                LIMIT 1
+            ),
+            put_wall AS (
+                SELECT *
+                FROM strike_agg
+                ORDER BY put_exposure ASC, strike
+                LIMIT 1
+            )
+            SELECT
+                c.timestamp,
+                $1::varchar AS symbol,
+                c.spot_price,
+                c.strike AS call_wall_strike,
+                c.call_exposure AS call_wall_exposure,
+                (c.strike - c.spot_price)::numeric AS call_wall_distance,
+                CASE
+                    WHEN c.spot_price = 0 THEN 0::numeric
+                    ELSE ((c.strike - c.spot_price) / c.spot_price * 100)::numeric
+                END AS call_wall_pct_from_spot,
+                p.strike AS put_wall_strike,
+                p.put_exposure AS put_wall_exposure,
+                (p.strike - p.spot_price)::numeric AS put_wall_distance,
+                CASE
+                    WHEN p.spot_price = 0 THEN 0::numeric
+                    ELSE ((p.strike - p.spot_price) / p.spot_price * 100)::numeric
+                END AS put_wall_pct_from_spot
+            FROM call_wall c
+            CROSS JOIN put_wall p
+        """
+
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(query, symbol)
+                if not row:
+                    return None
+
+                r = dict(row)
+                return {
+                    "timestamp": r["timestamp"],
+                    "symbol": r["symbol"],
+                    "spot_price": r["spot_price"],
+                    "call_wall": {
+                        "strike": r["call_wall_strike"],
+                        "exposure": r["call_wall_exposure"],
+                        "distance_from_spot": r["call_wall_distance"],
+                        "pct_from_spot": r["call_wall_pct_from_spot"],
+                    },
+                    "put_wall": {
+                        "strike": r["put_wall_strike"],
+                        "exposure": r["put_wall_exposure"],
+                        "distance_from_spot": r["put_wall_distance"],
+                        "pct_from_spot": r["put_wall_pct_from_spot"],
+                    },
+                }
+        except Exception as e:
+            logger.error(f"Error fetching GEX walls: {e}", exc_info=True)
             raise
 
     async def get_historical_gex(

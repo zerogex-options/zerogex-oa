@@ -8,7 +8,7 @@ Updated with Stream Bars endpoint for real-time volume tracking.
 import os
 import requests
 import time
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional, List, Dict, Any, Union
 import pytz
 import json
@@ -50,6 +50,9 @@ class TradeStationClient:
         self.sandbox = sandbox
         self._stream_lock = Lock()
         self._stream_state: Dict[str, Dict[str, Any]] = {}
+        self._api_session_counter_lock = Lock()
+        self._api_session_window_start = self._floor_to_five_minute_window(datetime.now(timezone.utc))
+        self._api_session_window_count = 0
 
         # Check if market hours warnings should be suppressed
         self.warn_market_hours = os.getenv("TS_WARN_MARKET_HOURS", "true").lower() != "false"
@@ -58,6 +61,41 @@ class TradeStationClient:
             logger.warning(f"Using SANDBOX environment [{self.base_url}]")
         else:
             logger.info(f"Using PRODUCTION environment [{self.base_url}]")
+
+    @staticmethod
+    def _floor_to_five_minute_window(ts: datetime) -> datetime:
+        """Round timestamp down to the start of its 5-minute UTC bucket."""
+        floored_minute = (ts.minute // 5) * 5
+        return ts.replace(minute=floored_minute, second=0, microsecond=0)
+
+    def _record_api_https_session_open(self):
+        """
+        Track each new HTTPS session open to api.tradestation.com in 5-min windows.
+
+        This increments once per outbound `requests.request/get` invocation in this
+        client. When the 5-minute bucket rolls, it logs the completed bucket count.
+        """
+        tracked_hosts = ("api.tradestation.com", "sim-api.tradestation.com")
+        if not any(host in self.base_url for host in tracked_hosts):
+            return
+
+        now_utc = datetime.now(timezone.utc)
+        current_window = self._floor_to_five_minute_window(now_utc)
+
+        with self._api_session_counter_lock:
+            if current_window != self._api_session_window_start:
+                previous_start = self._api_session_window_start
+                previous_end = previous_start + timedelta(minutes=5)
+                logger.info(
+                    "TradeStation HTTPS sessions opened [%s - %s UTC]: %d",
+                    previous_start.isoformat(),
+                    previous_end.isoformat(),
+                    self._api_session_window_count,
+                )
+                self._api_session_window_start = current_window
+                self._api_session_window_count = 0
+
+            self._api_session_window_count += 1
 
     def _request(
         self, 
@@ -199,6 +237,7 @@ class TradeStationClient:
         data: Optional[Dict]
     ) -> Response:
         """Build and execute a standard JSON API request."""
+        self._record_api_https_session_open()
         return requests.request(
             method=method,
             url=url,
@@ -268,6 +307,7 @@ class TradeStationClient:
 
             url = f"{self.base_url}/{endpoint}"
             headers = self.auth.get_headers()
+            self._record_api_https_session_open()
             response = requests.get(
                 url,
                 headers=headers,
@@ -280,6 +320,7 @@ class TradeStationClient:
                 response.close()
                 self.auth.force_refresh_access_token()
                 headers = self.auth.get_headers()
+                self._record_api_https_session_open()
                 response = requests.get(
                     url,
                     headers=headers,
@@ -336,6 +377,16 @@ class TradeStationClient:
             keys = list(self._stream_state.keys())
         for key in keys:
             self._close_stream(key)
+
+        with self._api_session_counter_lock:
+            window_start = self._api_session_window_start
+            window_end = window_start + timedelta(minutes=5)
+            logger.info(
+                "TradeStation HTTPS sessions opened [%s - %s UTC]: %d (partial window)",
+                window_start.isoformat(),
+                window_end.isoformat(),
+                self._api_session_window_count,
+            )
 
     # =========================================================================
     # QUOTE ENDPOINTS
