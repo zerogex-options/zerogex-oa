@@ -1002,3 +1002,190 @@ CREATE TABLE IF NOT EXISTS consolidated_position_accuracy (
 
 CREATE INDEX IF NOT EXISTS idx_consolidated_position_accuracy_underlying_date
     ON consolidated_position_accuracy(underlying, trade_date DESC);
+
+-- =============================================================================
+-- Unified signal engine (v2)
+-- =============================================================================
+
+-- Fresh start for legacy signaling objects.
+DROP TABLE IF EXISTS trade_signals CASCADE;
+DROP TABLE IF EXISTS signal_accuracy CASCADE;
+DROP TABLE IF EXISTS position_optimizer_signals CASCADE;
+DROP TABLE IF EXISTS position_optimizer_accuracy CASCADE;
+DROP TABLE IF EXISTS signal_engine_trade_ideas CASCADE;
+DROP TABLE IF EXISTS consolidated_trade_signals CASCADE;
+DROP TABLE IF EXISTS consolidated_signal_accuracy CASCADE;
+DROP TABLE IF EXISTS consolidated_position_accuracy CASCADE;
+
+CREATE TABLE IF NOT EXISTS signal_scores (
+    underlying VARCHAR(10) NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    timestamp TIMESTAMPTZ NOT NULL,
+    composite_score DOUBLE PRECISION NOT NULL,
+    normalized_score DOUBLE PRECISION NOT NULL,
+    direction VARCHAR(10) NOT NULL CHECK (direction IN ('bullish', 'bearish', 'neutral')),
+    components JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (underlying, timestamp)
+);
+
+-- Ensure existing installations converge to the latest signal_scores shape.
+ALTER TABLE signal_scores
+    ADD COLUMN IF NOT EXISTS composite_score DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS normalized_score DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS direction VARCHAR(10),
+    ADD COLUMN IF NOT EXISTS components JSONB DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'signal_scores_direction_check'
+          AND conrelid = 'signal_scores'::regclass
+    ) THEN
+        ALTER TABLE signal_scores
+            ADD CONSTRAINT signal_scores_direction_check
+            CHECK (direction IN ('bullish', 'bearish', 'neutral'));
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_signal_scores_underlying_ts
+    ON signal_scores(underlying, timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS signal_trades (
+    id BIGSERIAL PRIMARY KEY,
+    underlying VARCHAR(10) NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    signal_timestamp TIMESTAMPTZ NOT NULL,
+    opened_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    closed_at TIMESTAMPTZ,
+    status VARCHAR(12) NOT NULL CHECK (status IN ('open', 'closed')),
+    direction VARCHAR(10) NOT NULL CHECK (direction IN ('bullish', 'bearish')),
+    score_at_entry DOUBLE PRECISION NOT NULL,
+    score_latest DOUBLE PRECISION,
+    option_symbol VARCHAR(50) NOT NULL,
+    option_type CHAR(1) NOT NULL CHECK (option_type IN ('C','P')),
+    expiration DATE NOT NULL,
+    strike NUMERIC(12,4) NOT NULL,
+    entry_price NUMERIC(12,6) NOT NULL,
+    current_price NUMERIC(12,6) NOT NULL,
+    quantity_initial INTEGER NOT NULL,
+    quantity_open INTEGER NOT NULL,
+    realized_pnl NUMERIC(14,4) NOT NULL DEFAULT 0,
+    unrealized_pnl NUMERIC(14,4) NOT NULL DEFAULT 0,
+    total_pnl NUMERIC(14,4) NOT NULL DEFAULT 0,
+    pnl_percent NUMERIC(12,4) NOT NULL DEFAULT 0,
+    components_at_entry JSONB NOT NULL DEFAULT '{}'::jsonb,
+    components_latest JSONB,
+    CONSTRAINT uq_signal_trades_unique_signal UNIQUE (underlying, signal_timestamp)
+);
+
+-- Ensure existing installations converge to the latest signal_trades shape.
+ALTER TABLE signal_trades
+    ADD COLUMN IF NOT EXISTS signal_timestamp TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS status VARCHAR(12),
+    ADD COLUMN IF NOT EXISTS direction VARCHAR(10),
+    ADD COLUMN IF NOT EXISTS score_at_entry DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS score_latest DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS option_symbol VARCHAR(50),
+    ADD COLUMN IF NOT EXISTS option_type CHAR(1),
+    ADD COLUMN IF NOT EXISTS expiration DATE,
+    ADD COLUMN IF NOT EXISTS strike NUMERIC(12,4),
+    ADD COLUMN IF NOT EXISTS entry_price NUMERIC(12,6),
+    ADD COLUMN IF NOT EXISTS current_price NUMERIC(12,6),
+    ADD COLUMN IF NOT EXISTS quantity_initial INTEGER,
+    ADD COLUMN IF NOT EXISTS quantity_open INTEGER,
+    ADD COLUMN IF NOT EXISTS realized_pnl NUMERIC(14,4) DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS unrealized_pnl NUMERIC(14,4) DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_pnl NUMERIC(14,4) DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS pnl_percent NUMERIC(12,4) DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS components_at_entry JSONB DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS components_latest JSONB;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'signal_trades_status_check'
+          AND conrelid = 'signal_trades'::regclass
+    ) THEN
+        ALTER TABLE signal_trades
+            ADD CONSTRAINT signal_trades_status_check
+            CHECK (status IN ('open', 'closed'));
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'signal_trades_direction_check'
+          AND conrelid = 'signal_trades'::regclass
+    ) THEN
+        ALTER TABLE signal_trades
+            ADD CONSTRAINT signal_trades_direction_check
+            CHECK (direction IN ('bullish', 'bearish'));
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'signal_trades_option_type_check'
+          AND conrelid = 'signal_trades'::regclass
+    ) THEN
+        ALTER TABLE signal_trades
+            ADD CONSTRAINT signal_trades_option_type_check
+            CHECK (option_type IN ('C','P'));
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'uq_signal_trades_unique_signal'
+          AND conrelid = 'signal_trades'::regclass
+    ) THEN
+        ALTER TABLE signal_trades
+            ADD CONSTRAINT uq_signal_trades_unique_signal UNIQUE (underlying, signal_timestamp);
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_signal_trades_underlying_open
+    ON signal_trades(underlying, status, opened_at DESC);
+CREATE INDEX IF NOT EXISTS idx_signal_trades_underlying_closed
+    ON signal_trades(underlying, closed_at DESC)
+    WHERE status = 'closed';
+
+DROP TRIGGER IF EXISTS update_signal_scores_updated_at ON signal_scores;
+CREATE TRIGGER update_signal_scores_updated_at
+    BEFORE UPDATE ON signal_scores
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_signal_trades_updated_at ON signal_trades;
+CREATE TRIGGER update_signal_trades_updated_at
+    BEFORE UPDATE ON signal_trades
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+-- Closed trades are immutable.
+CREATE OR REPLACE FUNCTION prevent_closed_signal_trade_updates()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.status = 'closed' THEN
+        RAISE EXCEPTION 'signal_trades row % is immutable after close', OLD.id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS lock_closed_signal_trade ON signal_trades;
+CREATE TRIGGER lock_closed_signal_trade
+    BEFORE UPDATE ON signal_trades
+    FOR EACH ROW
+    WHEN (OLD.status = 'closed')
+    EXECUTE FUNCTION prevent_closed_signal_trade_updates();

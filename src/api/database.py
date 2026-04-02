@@ -3141,3 +3141,104 @@ class DatabaseManager:
             signal_row["active_trades"] = []
             signal_row["has_active_trade"] = False
             return signal_row
+
+    async def get_live_signal_trades(self) -> list[Dict[str, Any]]:
+        query = """
+            SELECT id, underlying, signal_timestamp, opened_at, updated_at,
+                   status, direction, score_at_entry, score_latest,
+                   option_symbol, option_type, expiration, strike,
+                   entry_price, current_price, quantity_initial, quantity_open,
+                   realized_pnl, unrealized_pnl, total_pnl, pnl_percent
+            FROM signal_trades
+            WHERE status = 'open'
+            ORDER BY opened_at DESC
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query)
+                return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error(f"get_live_signal_trades failed: {e}")
+            return []
+
+    async def get_closed_signal_trades(self, limit: int = 500) -> list[Dict[str, Any]]:
+        query = """
+            SELECT id, underlying, signal_timestamp, opened_at, updated_at, closed_at,
+                   status, direction, score_at_entry, score_latest,
+                   option_symbol, option_type, expiration, strike,
+                   entry_price, current_price, quantity_initial, quantity_open,
+                   realized_pnl, unrealized_pnl, total_pnl, pnl_percent,
+                   CASE WHEN total_pnl > 0 THEN 'win'
+                        WHEN total_pnl < 0 THEN 'loss'
+                        ELSE 'flat' END AS outcome
+            FROM signal_trades
+            WHERE status = 'closed'
+            ORDER BY closed_at DESC NULLS LAST
+            LIMIT $1
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, limit)
+                return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error(f"get_closed_signal_trades failed: {e}")
+            return []
+
+    async def get_latest_signal_score(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
+        query = """
+            SELECT underlying, timestamp, composite_score, normalized_score, direction, components
+            FROM signal_scores
+            WHERE underlying = $1
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(query, symbol)
+                if not row:
+                    return None
+                d = dict(row)
+                if isinstance(d.get("components"), str):
+                    d["components"] = json.loads(d["components"])
+                return d
+        except Exception as e:
+            logger.error(f"get_latest_signal_score failed ({symbol}): {e}")
+            return None
+
+    async def get_signal_score_history(self, symbol: str = "SPY", limit: int = 100) -> list[Dict[str, Any]]:
+        query = """
+            SELECT underlying, timestamp, composite_score, normalized_score, direction, components
+            FROM signal_scores
+            WHERE underlying = $1
+            ORDER BY timestamp DESC
+            LIMIT $2
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, limit)
+                out = []
+                for row in rows:
+                    d = dict(row)
+                    if isinstance(d.get("components"), str):
+                        d["components"] = json.loads(d["components"])
+                    out.append(d)
+                return out
+        except Exception as e:
+            logger.error(f"get_signal_score_history failed ({symbol}): {e}")
+            return []
+
+    async def get_vol_expansion_from_scores(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
+        score = await self.get_latest_signal_score(symbol)
+        if not score:
+            return None
+        components = score.get("components") or {}
+        vol = components.get("vol_expansion") or {}
+        return {
+            "symbol": score["underlying"],
+            "timestamp": score["timestamp"],
+            "direction": score["direction"],
+            "vol_component": vol,
+            "components": components,
+            "composite_score": score["composite_score"],
+            "normalized_score": score["normalized_score"],
+        }
