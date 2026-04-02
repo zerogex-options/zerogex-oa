@@ -1,8 +1,24 @@
-"""Signal services package."""
+"""Signals package with lazy imports to avoid runpy side effects."""
 
-from src.signals.main_engine import SignalEngineService
-from src.signals.position_optimizer_engine import PositionOptimizerEngine
-from src.signals.proprietary_signal_engine import ProprietarySignalEngine
-from src.signals.consolidated_signal_engine import ConsolidatedSignalEngine
+__all__ = [
+    "SignalEngineService",
+    "PositionOptimizerEngine",
+    "ProprietarySignalEngine",
+    "ConsolidatedSignalEngine",
+]
 
-__all__ = ["SignalEngineService", "PositionOptimizerEngine", "ProprietarySignalEngine", "ConsolidatedSignalEngine"]
+
+def __getattr__(name):
+    if name == "SignalEngineService":
+        from src.signals.main_engine import SignalEngineService
+        return SignalEngineService
+    if name == "PositionOptimizerEngine":
+        from src.signals.position_optimizer_engine import PositionOptimizerEngine
+        return PositionOptimizerEngine
+    if name == "ProprietarySignalEngine":
+        from src.signals.proprietary_signal_engine import ProprietarySignalEngine
+        return ProprietarySignalEngine
+    if name == "ConsolidatedSignalEngine":
+        from src.signals.consolidated_signal_engine import ConsolidatedSignalEngine
+        return ConsolidatedSignalEngine
+    raise AttributeError(f"module 'src.signals' has no attribute '{name}'")

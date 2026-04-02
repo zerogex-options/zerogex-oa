@@ -13,10 +13,11 @@ WorkingDirectory=/home/ubuntu/zerogex-oa
 
 # Environment
 Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="ZEROGEX_UNDERLYINGS=SPY"
 EnvironmentFile=/home/ubuntu/zerogex-oa/.env
 
 # Execution
-ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.signals.main_engine --underlying ${ZEROGEX_UNDERLYINGS:-SPY}
+ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.signals.main_engine --underlying ${ZEROGEX_UNDERLYINGS}
 ExecReload=/bin/kill -HUP $MAINPID
 
 # Restart policy
