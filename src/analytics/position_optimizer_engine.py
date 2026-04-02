@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Optional
@@ -163,6 +164,9 @@ class PositionOptimizerEngine:
         self.underlying = underlying.upper()
         self.db_symbol = get_canonical_symbol(self.underlying)
         self._last_accuracy_update: Optional[date] = None
+        self._verbose_no_snapshot_diagnostics = (
+            os.getenv("POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS", "false").lower() == "true"
+        )
 
     def _fetch_context(self, as_of: Optional[datetime] = None) -> Optional[PositionOptimizerContext]:
         try:
@@ -331,60 +335,47 @@ class PositionOptimizerEngine:
                 raw_option_rows = cur.fetchall()
 
                 if not raw_option_rows:
-                    cur.execute(
-                        """
-                        SELECT
-                            COUNT(*)::bigint AS total_rows,
-                            COUNT(*) FILTER (
-                                WHERE (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
-                                   OR (last IS NOT NULL AND last > 0)
-                            )::bigint AS quote_eligible_rows,
-                            MAX(timestamp) AS latest_ts_in_window
-                        FROM option_chains
-                        WHERE underlying = %s
-                          AND timestamp <= %s
-                          AND expiration BETWEEN (%s::date + (%s * INTERVAL '1 day'))
-                                              AND (%s::date + (%s * INTERVAL '1 day'))
-                        """,
-                        (self.db_symbol, anchor_ts, trade_date, dte_min, trade_date, dte_max),
-                    )
-                    diag_row = cur.fetchone()
-                    total_rows = int(diag_row[0] or 0) if diag_row else 0
-                    quote_eligible_rows = int(diag_row[1] or 0) if diag_row else 0
-                    latest_ts_in_window = diag_row[2] if diag_row else None
-
-                    cur.execute(
-                        """
-                        SELECT option_symbol
-                        FROM option_chains
-                        WHERE underlying = %s
-                          AND timestamp <= %s
-                          AND expiration BETWEEN (%s::date + (%s * INTERVAL '1 day'))
-                                              AND (%s::date + (%s * INTERVAL '1 day'))
-                        ORDER BY timestamp DESC, option_symbol
-                        LIMIT 5
-                        """,
-                        (self.db_symbol, anchor_ts, trade_date, dte_min, trade_date, dte_max),
-                    )
-                    candidate_contracts = [row[0] for row in cur.fetchall()]
                     logger.info(
-                        "PositionOptimizerEngine: no option rows for conditions "
-                        "[underlying=%s, timeframe=%s, dte_range=%s-%s, trade_date=%s, anchor_ts<=%s, "
-                        "quote_eligibility=(ask>0 with bid/ask present OR last>0)]. "
-                        "Observed in window: total_rows=%s, quote_eligible_rows=%s, latest_ts_in_window=%s, "
-                        "selected_snapshot=%s, candidate_contracts=%s. Widening window.",
+                        "PositionOptimizerEngine: no option rows for snapshot "
+                        "[underlying=%s, timeframe=%s, dte_range=%s-%s, trade_date=%s, anchor_ts<=%s]. "
+                        "Widening window.",
                         self.db_symbol,
                         signal_timeframe,
                         dte_min,
                         dte_max,
                         trade_date,
                         anchor_ts,
-                        total_rows,
-                        quote_eligible_rows,
-                        latest_ts_in_window,
-                        snapshot_ts,
-                        ", ".join(candidate_contracts) if candidate_contracts else "none",
                     )
+                    if self._verbose_no_snapshot_diagnostics:
+                        cur.execute(
+                            """
+                            SELECT
+                                COUNT(*)::bigint AS total_rows,
+                                COUNT(*) FILTER (
+                                    WHERE (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
+                                       OR (last IS NOT NULL AND last > 0)
+                                )::bigint AS quote_eligible_rows,
+                                MAX(timestamp) AS latest_ts_in_window
+                            FROM option_chains
+                            WHERE underlying = %s
+                              AND timestamp <= %s
+                              AND expiration BETWEEN (%s::date + (%s * INTERVAL '1 day'))
+                                                  AND (%s::date + (%s * INTERVAL '1 day'))
+                            """,
+                            (self.db_symbol, anchor_ts, trade_date, dte_min, trade_date, dte_max),
+                        )
+                        diag_row = cur.fetchone()
+                        total_rows = int(diag_row[0] or 0) if diag_row else 0
+                        quote_eligible_rows = int(diag_row[1] or 0) if diag_row else 0
+                        latest_ts_in_window = diag_row[2] if diag_row else None
+                        logger.info(
+                            "PositionOptimizerEngine diagnostics: total_rows=%s quote_eligible_rows=%s "
+                            "latest_ts_in_window=%s selected_snapshot=%s",
+                            total_rows,
+                            quote_eligible_rows,
+                            latest_ts_in_window,
+                            snapshot_ts,
+                        )
                     cur.execute(
                         """
                         SELECT timestamp

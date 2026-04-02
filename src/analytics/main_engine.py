@@ -124,6 +124,28 @@ class AnalyticsEngine:
                         ORDER BY uq.timestamp DESC
                         LIMIT 1
                     ),
+                    latest_snapshot AS (
+                        SELECT
+                            oc.option_symbol,
+                            oc.strike,
+                            oc.expiration,
+                            oc.option_type,
+                            oc.last,
+                            oc.bid,
+                            oc.ask,
+                            oc.volume,
+                            oc.open_interest,
+                            oc.delta,
+                            oc.gamma,
+                            oc.theta,
+                            oc.vega,
+                            oc.implied_volatility,
+                            oc.timestamp
+                        FROM option_chains oc, latest_ts lt
+                        WHERE oc.underlying = %s
+                          AND oc.timestamp = lt.ts
+                          AND oc.gamma IS NOT NULL
+                    ),
                     latest_per_contract AS (
                         SELECT DISTINCT ON (oc.option_symbol)
                             oc.option_symbol,
@@ -146,33 +168,39 @@ class AnalyticsEngine:
                           AND oc.timestamp <= lt.ts
                           AND oc.timestamp >= (lt.ts - (%s * INTERVAL '1 minute'))
                           AND oc.gamma IS NOT NULL
+                          AND NOT EXISTS (SELECT 1 FROM latest_snapshot)
                         ORDER BY oc.option_symbol, oc.timestamp DESC
+                    ),
+                    selected_rows AS (
+                        SELECT * FROM latest_snapshot
+                        UNION ALL
+                        SELECT * FROM latest_per_contract
                     )
                     SELECT
                         lt.ts,
                         u.close,
-                        lpc.option_symbol,
-                        lpc.strike,
-                        lpc.expiration,
-                        lpc.option_type,
-                        lpc.last,
-                        lpc.bid,
-                        lpc.ask,
-                        lpc.volume,
-                        lpc.open_interest,
-                        lpc.delta,
-                        lpc.gamma,
-                        lpc.theta,
-                        lpc.vega,
-                        lpc.implied_volatility,
-                        lpc.timestamp
+                        sr.option_symbol,
+                        sr.strike,
+                        sr.expiration,
+                        sr.option_type,
+                        sr.last,
+                        sr.bid,
+                        sr.ask,
+                        sr.volume,
+                        sr.open_interest,
+                        sr.delta,
+                        sr.gamma,
+                        sr.theta,
+                        sr.vega,
+                        sr.implied_volatility,
+                        sr.timestamp
                     FROM latest_ts lt
                     LEFT JOIN underlying u ON TRUE
-                    LEFT JOIN latest_per_contract lpc ON TRUE
+                    LEFT JOIN selected_rows sr ON TRUE
                     WHERE lt.ts IS NOT NULL
-                    ORDER BY lpc.expiration, lpc.strike
+                    ORDER BY sr.expiration, sr.strike
                     LIMIT 2000
-                """, (self.db_symbol, self.db_symbol, self.db_symbol, self.snapshot_lookback_minutes))
+                """, (self.db_symbol, self.db_symbol, self.db_symbol, self.db_symbol, self.snapshot_lookback_minutes))
 
                 rows = cursor.fetchall()
                 if not rows or rows[0][0] is None:
