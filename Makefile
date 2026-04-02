@@ -1692,8 +1692,9 @@ signals-history: ## Managed trade history with outcomes and PnL
 	@echo "$(BLUE)=== Managed Trade History ($(FLOW_SYMBOL)) ===$(NC)"
 	@$(PSQL) -c "		SELECT 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI') AS time_et, 			signal_timeframe, signal_direction, strategy_type, status, 			ROUND(entry_price::numeric, 2) AS entry_price, 			ROUND(current_mark::numeric, 2) AS current_mark, 			ROUND(total_pnl::numeric, 2) AS total_pnl, 			CASE WHEN total_pnl > 0 THEN 'win' WHEN total_pnl < 0 THEN 'loss' ELSE 'flat' END AS outcome 		FROM signal_engine_trade_ideas 		WHERE underlying = '$(FLOW_SYMBOL)' 		ORDER BY timestamp DESC 		LIMIT 50;"
 
-.PHONY: signals-trades
-signals-trades: signals-history ## Alias: latest managed trades with outcomes + PnL
+signals-trades: ## Active trades
+	@echo "$(BLUE)=== Active Managed Trades ($(FLOW_SYMBOL)) ===$(NC)"
+	@$(PSQL) -c "SELECT TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI') AS time_et, signal_timeframe AS timeframe, underlying, signal_direction AS direction, strategy_type, ROUND(entry_price::numeric, 2) AS entry_price, ROUND(current_mark::numeric, 2) AS current_price, ROUND(unrealized_pnl::numeric, 2) AS unrealized_pnl, ROUND(realized_pnl::numeric, 2) AS realized_pnl, CASE WHEN total_pnl > 0 THEN 'up' WHEN total_pnl < 0 THEN 'down' ELSE 'flat' END AS outcome FROM signal_engine_trade_ideas WHERE status='position_open' ORDER BY timestamp DESC LIMIT 50;"
 
 .PHONY: signals-trades-raw
 signals-trades-raw: ## Raw managed-trade rows from signal_engine_trade_ideas (usage: make signals-trades-raw FLOW_SYMBOL=QQQ LIMIT=20)
