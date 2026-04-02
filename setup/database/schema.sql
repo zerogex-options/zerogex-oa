@@ -1002,3 +1002,96 @@ CREATE TABLE IF NOT EXISTS consolidated_position_accuracy (
 
 CREATE INDEX IF NOT EXISTS idx_consolidated_position_accuracy_underlying_date
     ON consolidated_position_accuracy(underlying, trade_date DESC);
+
+-- =============================================================================
+-- Unified signal engine (v2)
+-- =============================================================================
+
+-- Fresh start for legacy signaling objects.
+DROP TABLE IF EXISTS trade_signals CASCADE;
+DROP TABLE IF EXISTS signal_accuracy CASCADE;
+DROP TABLE IF EXISTS position_optimizer_signals CASCADE;
+DROP TABLE IF EXISTS position_optimizer_accuracy CASCADE;
+DROP TABLE IF EXISTS signal_engine_trade_ideas CASCADE;
+DROP TABLE IF EXISTS consolidated_trade_signals CASCADE;
+DROP TABLE IF EXISTS consolidated_signal_accuracy CASCADE;
+DROP TABLE IF EXISTS consolidated_position_accuracy CASCADE;
+
+CREATE TABLE IF NOT EXISTS signal_scores (
+    underlying VARCHAR(10) NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    timestamp TIMESTAMPTZ NOT NULL,
+    composite_score DOUBLE PRECISION NOT NULL,
+    normalized_score DOUBLE PRECISION NOT NULL,
+    direction VARCHAR(10) NOT NULL CHECK (direction IN ('bullish', 'bearish', 'neutral')),
+    components JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (underlying, timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_scores_underlying_ts
+    ON signal_scores(underlying, timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS signal_trades (
+    id BIGSERIAL PRIMARY KEY,
+    underlying VARCHAR(10) NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    signal_timestamp TIMESTAMPTZ NOT NULL,
+    opened_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    closed_at TIMESTAMPTZ,
+    status VARCHAR(12) NOT NULL CHECK (status IN ('open', 'closed')),
+    direction VARCHAR(10) NOT NULL CHECK (direction IN ('bullish', 'bearish')),
+    score_at_entry DOUBLE PRECISION NOT NULL,
+    score_latest DOUBLE PRECISION,
+    option_symbol VARCHAR(50) NOT NULL,
+    option_type CHAR(1) NOT NULL CHECK (option_type IN ('C','P')),
+    expiration DATE NOT NULL,
+    strike NUMERIC(12,4) NOT NULL,
+    entry_price NUMERIC(12,6) NOT NULL,
+    current_price NUMERIC(12,6) NOT NULL,
+    quantity_initial INTEGER NOT NULL,
+    quantity_open INTEGER NOT NULL,
+    realized_pnl NUMERIC(14,4) NOT NULL DEFAULT 0,
+    unrealized_pnl NUMERIC(14,4) NOT NULL DEFAULT 0,
+    total_pnl NUMERIC(14,4) NOT NULL DEFAULT 0,
+    pnl_percent NUMERIC(12,4) NOT NULL DEFAULT 0,
+    components_at_entry JSONB NOT NULL DEFAULT '{}'::jsonb,
+    components_latest JSONB,
+    CONSTRAINT uq_signal_trades_unique_signal UNIQUE (underlying, signal_timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_trades_underlying_open
+    ON signal_trades(underlying, status, opened_at DESC);
+CREATE INDEX IF NOT EXISTS idx_signal_trades_underlying_closed
+    ON signal_trades(underlying, closed_at DESC)
+    WHERE status = 'closed';
+
+DROP TRIGGER IF EXISTS update_signal_scores_updated_at ON signal_scores;
+CREATE TRIGGER update_signal_scores_updated_at
+    BEFORE UPDATE ON signal_scores
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_signal_trades_updated_at ON signal_trades;
+CREATE TRIGGER update_signal_trades_updated_at
+    BEFORE UPDATE ON signal_trades
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+-- Closed trades are immutable.
+CREATE OR REPLACE FUNCTION prevent_closed_signal_trade_updates()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.status = 'closed' THEN
+        RAISE EXCEPTION 'signal_trades row % is immutable after close', OLD.id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS lock_closed_signal_trade ON signal_trades;
+CREATE TRIGGER lock_closed_signal_trade
+    BEFORE UPDATE ON signal_trades
+    FOR EACH ROW
+    WHEN (OLD.status = 'closed')
+    EXECUTE FUNCTION prevent_closed_signal_trade_updates();
