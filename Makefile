@@ -129,7 +129,7 @@ $(eval $(call DB_TAIL,flow-by-strike,flow_by_strike,symbol,timestamp))
 $(eval $(call DB_TAIL,flow-by-expiration,flow_by_expiration,symbol,timestamp))
 $(eval $(call DB_TAIL,flow-smart-money,flow_smart_money,symbol,timestamp))
 $(eval $(call DB_TAIL,trade-signals,trade_signals,underlying,timestamp))
-$(eval $(call DB_TAIL,signal-accuracy,signal_accuracy,underlying,trade_date))
+$(eval $(call DB_TAIL,signals-accuracy,signal_accuracy,underlying,trade_date))
 $(eval $(call DB_TAIL,vol-expansion-signals,volatility_expansion_signals,underlying,timestamp))
 $(eval $(call DB_TAIL,vol-expansion-accuracy,vol_expansion_accuracy,underlying,trade_date))
 $(eval $(call DB_TAIL,position-optimizer-signals,position_optimizer_signals,underlying,timestamp))
@@ -283,16 +283,16 @@ help: ## Show this help message
 	@echo "  make signals-exhaustion       - Latest ZeroGEX Exhaustion from consolidated payload"
 	@echo "  make signals-history          - Managed trade history with outcomes + P&L"
 	@echo "  make signals-all-symbols      - Latest consolidated signal for every tracked symbol"
-	@echo "  make signal-accuracy          - Consolidated win rate by timeframe + strength (last 30 days)"
-	@echo "  make signal-accuracy-daily    - Daily consolidated accuracy (last 14 days)"
-	@echo "  make signal-accuracy-all      - Full consolidated accuracy table"
+	@echo "  make signals-accuracy         - Consolidated win rate by timeframe + strength (last 30 days)"
+	@echo "  make signals-accuracy-daily   - Daily consolidated accuracy (last 14 days)"
+	@echo "  make signals-accuracy-all     - Full consolidated accuracy table"
 	@echo "  make vol-signals              - Latest volatility-expansion signal"
 	@echo "  make vol-signals-components   - Vol-expansion component breakdown"
 	@echo "  make api-test-vol-signals     - Test /api/signals/vol-expansion endpoint"
-	@echo "  make signal-logs              - Watch Signal Engine service logs live"
-	@echo "  make signal-logs-tail         - Last 200 Signal Engine log lines"
-	@echo "  make signal-logs-errors       - Signal Engine warnings/errors"
-	@echo "  make signal-logs-cycles       - Show each completed signal engine cycle"
+	@echo "  make signals-logs             - Watch Signals service logs live"
+	@echo "  make signals-logs-tail        - Last 100 Signals log lines"
+	@echo "  make signals-logs-errors      - Show recent Signals service errors"
+	@echo "  make signals-logs-cycles      - Show each completed signal engine cycle"
 	@echo "  make api-test-signals         - Test trade/history/position endpoints"
 	@echo "  make api-test-signals-summary - One-liner trade status + history summary"
 	@echo ""
@@ -324,7 +324,7 @@ help: ## Show this help message
 	@echo "  make db-tail-flow-by-expiration   - Last 20 rows from flow_by_expiration"
 	@echo "  make db-tail-flow-smart-money     - Last 20 rows from flow_smart_money"
 	@echo "  make db-tail-trade-signals        - Last 20 rows from trade_signals"
-	@echo "  make db-tail-signal-accuracy      - Last 20 rows from signal_accuracy"
+	@echo "  make db-tail-signals-accuracy      - Last 20 rows from signal_accuracy"
 	@echo "  make db-tail-vol-expansion-signals  - Last 20 rows from volatility_expansion_signals"
 	@echo "  make db-tail-vol-expansion-accuracy - Last 20 rows from vol_expansion_accuracy"
 	@echo "  make db-tail-position-optimizer-signals - Last 20 rows from position_optimizer_signals"
@@ -1658,18 +1658,18 @@ signals-all-symbols: ## Latest consolidated signal for every tracked symbol
 	@echo "$(BLUE)=== Consolidated Signals — All Symbols ===$(NC)"
 	@$(PSQL) -c "		SELECT DISTINCT ON (underlying) 			underlying, 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI') AS time_et, 			timeframe, direction, strength, trade_type, top_strategy_type 		FROM consolidated_trade_signals 		ORDER BY underlying, timestamp DESC;"
 
-.PHONY: signal-accuracy
-signal-accuracy: ## Consolidated win-rate by timeframe + strength (last 30 days)
+.PHONY: signals-accuracy
+signals-accuracy: ## Consolidated win-rate by timeframe + strength (last 30 days)
 	@echo "$(BLUE)=== Consolidated Signal Accuracy — Last 30 Days ($(FLOW_SYMBOL)) ===$(NC)"
 	@$(PSQL) -c "		SELECT 			timeframe, strength_bucket AS strength, 			SUM(total_signals) AS total, 			SUM(correct_signals) AS correct, 			ROUND(SUM(correct_signals)::numeric / NULLIF(SUM(total_signals),0) * 100, 1) || '%' AS win_pct 		FROM consolidated_signal_accuracy 		WHERE underlying = '$(FLOW_SYMBOL)' 		  AND trade_date >= CURRENT_DATE - 30 		GROUP BY timeframe, strength_bucket 		ORDER BY timeframe, strength_bucket;"
 
-.PHONY: signal-accuracy-daily
-signal-accuracy-daily: ## Daily consolidated accuracy (last 14 days)
+.PHONY: signals-accuracy-daily
+signals-accuracy-daily: ## Daily consolidated accuracy (last 14 days)
 	@echo "$(BLUE)=== Daily Consolidated Accuracy ($(FLOW_SYMBOL)) ===$(NC)"
 	@$(PSQL) -c "		SELECT 			trade_date, timeframe, strength_bucket AS strength, 			total_signals AS total, correct_signals AS correct, 			ROUND(win_pct * 100, 1) || '%' AS win_pct 		FROM consolidated_signal_accuracy 		WHERE underlying = '$(FLOW_SYMBOL)' 		  AND trade_date >= CURRENT_DATE - 14 		ORDER BY trade_date DESC, timeframe, strength_bucket;"
 
-.PHONY: signal-accuracy-all
-signal-accuracy-all: ## Full consolidated accuracy table
+.PHONY: signals-accuracy-all
+signals-accuracy-all: ## Full consolidated accuracy table
 	@echo "$(BLUE)=== Full Consolidated Accuracy Table ===$(NC)"
 	@$(PSQL) -c "		SELECT 			underlying, trade_date, timeframe, strength_bucket, 			total_signals, correct_signals, ROUND(win_pct * 100, 1) || '%' AS win_pct, updated_at 		FROM consolidated_signal_accuracy 		ORDER BY trade_date DESC, underlying, timeframe, strength_bucket 		LIMIT 200;"
 
@@ -1687,23 +1687,8 @@ vol-signals-components: ## Volatility-expansion component breakdown
 # Signal Engine — Logs
 # =============================================================================
 
-.PHONY: signal-logs
-signal-logs: ## Watch Signal Engine service logs live
-	@echo "$(BLUE)=== Signal Engine Logs (live) — Ctrl+C to stop ===$(NC)"
-	@sudo journalctl -u $(SIGNALS_SERVICE) -f
-
-.PHONY: signal-logs-tail
-signal-logs-tail: ## Last 200 Signal Engine log lines
-	@echo "$(BLUE)=== Last 200 Signal Engine Log Lines ===$(NC)"
-	@sudo journalctl -u $(SIGNALS_SERVICE) -n 200 --no-pager
-
-.PHONY: signal-logs-errors
-signal-logs-errors: ## Signal Engine errors and warnings
-	@echo "$(BLUE)=== Signal Engine Errors & Warnings ===$(NC)"
-	@sudo journalctl -u $(SIGNALS_SERVICE) -p warning -n 200 --no-pager
-
-.PHONY: signal-logs-cycles
-signal-logs-cycles: ## Show completed Signal Engine cycles
+.PHONY: signals-logs-cycles
+signals-logs-cycles: ## Show completed Signal Engine cycles
 	@echo "$(BLUE)=== Signal Engine Cycle History ===$(NC)"
 	@sudo journalctl -u $(SIGNALS_SERVICE) -n 2000 --no-pager | grep -i "SignalEngineService cycle" | tail -50
 
