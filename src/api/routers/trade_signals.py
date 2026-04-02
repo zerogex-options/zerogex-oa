@@ -2,9 +2,8 @@
 Trade Signals Router — reads pre-computed rows from trade_signals table.
 
 GET /api/signals/trade?symbol=SPY&timeframe=intraday
-GET /api/signals/accuracy?symbol=SPY&lookback_days=30
+GET /api/signals/history?symbol=SPY&limit=100
 GET /api/signals/vol-expansion?symbol=SPY
-GET /api/signals/vol-expansion/accuracy?symbol=SPY&lookback_days=30
 
 The standalone Signal Engine writes fresh signal rows every ~5 minutes.
 The API simply reads the latest row; no scoring logic lives here.
@@ -218,120 +217,79 @@ def _map_vol_components(raw_list: list) -> list[VolExpansionComponent]:
     return out
 
 
-@router.get("/trade", response_model=TradeSignalResponse)
+@router.get("/trade")
 async def get_trade_signal(
     symbol: str = Query(default="SPY", description="Underlying symbol"),
-    timeframe: Timeframe = Query(
-        default=Timeframe.INTRADAY,
-        description=(
-            "intraday (0DTE, same-session), "
-            "swing (1-2DTE, balanced), "
-            "multi_day (2-5DTE, structural)"
-        ),
-    ),
+    timeframe: Timeframe = Query(default=Timeframe.INTRADAY),
     db: DatabaseManager = Depends(get_db),
 ):
-    """
-    Returns the latest pre-computed trade signal for the requested symbol
-    and timeframe. Signals are written by the AnalyticsEngine every ~5 min.
-    """
-    row = await db.get_trade_signal(symbol, timeframe.value)
+    """Return current consolidated signal plus active trade status from Signal Engine."""
+    row = await db.get_current_signal_with_trades(symbol, timeframe.value)
     if not row:
         raise HTTPException(
             status_code=404,
             detail=(
                 f"No trade signal found for {symbol} / {timeframe.value}. "
-                "The Signal Engine may not have run yet, or no market data "
-                "is available for this symbol."
+                "The Signal Engine may not have run yet, or no market data is available."
             ),
         )
 
-    # Staleness warning in logs (doesn't fail the request)
     ts: datetime = row["timestamp"]
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
     age_seconds = (datetime.now(timezone.utc) - ts).total_seconds()
     if age_seconds > STALE_THRESHOLD_SECONDS:
         logger.warning(
-            f"Trade signal for {symbol}/{timeframe.value} is "
-            f"{age_seconds:.0f}s old (threshold: {STALE_THRESHOLD_SECONDS}s)"
+            f"Trade signal for {symbol}/{timeframe.value} is {age_seconds:.0f}s old "
+            f"(threshold: {STALE_THRESHOLD_SECONDS}s)"
         )
 
-    # Re-apply calibrated win_pct if a fresher value exists in signal_accuracy
     accuracy = await db.get_signal_accuracy(symbol, lookback_days=30)
     strength_str = row.get("strength", "low")
     tf_str = timeframe.value
-    calibrated = (
-        accuracy.get(tf_str, {})
-                .get(strength_str, {})
-                .get("win_pct")
-    )
-    win_pct = calibrated if calibrated is not None else (
-        row.get("estimated_win_pct")
-        or _WIN_PCT_DEFAULTS[tf_str][strength_str]
-    )
+    calibrated = accuracy.get(tf_str, {}).get(strength_str, {}).get("win_pct")
+    win_pct = calibrated if calibrated is not None else (row.get("estimated_win_pct") or _WIN_PCT_DEFAULTS[tf_str][strength_str])
 
-    components = _map_components(row.get("components") or [])
-
-    trade_idea = TradeIdea(
-        trade_type=_map_trade_type(row.get("trade_type", "no_trade")),
-        rationale=row.get("trade_rationale", ""),
-        target_expiry=row.get("target_expiry", "N/A"),
-        suggested_strikes=row.get("suggested_strikes", "N/A"),
-        estimated_win_pct=round(win_pct, 4),
-    )
-
-    orb_raw = row.get("orb_breakout_direction")
-    sm_raw  = row.get("smart_money_direction")
-
-    return TradeSignalResponse(
-        symbol=row["underlying"],
-        timeframe=timeframe,
-        timestamp=row["timestamp"],
-        current_price=float(row.get("current_price") or 0),
-        composite_score=row.get("composite_score", 0),
-        max_possible_score=row.get("max_possible_score", 1),
-        normalized_score=float(row.get("normalized_score") or 0),
-        direction=_map_direction(row.get("direction", "neutral")),
-        strength=_map_strength(strength_str),
-        estimated_win_pct=round(win_pct, 4),
-        components=components,
-        trade_idea=trade_idea,
-        net_gex=row.get("net_gex"),
-        gamma_flip=row.get("gamma_flip"),
-        price_vs_flip=float(row["price_vs_flip"]) if row.get("price_vs_flip") else None,
-        vwap=float(row["vwap"]) if row.get("vwap") else None,
-        vwap_deviation_pct=float(row["vwap_deviation_pct"]) if row.get("vwap_deviation_pct") else None,
-        put_call_ratio=row.get("put_call_ratio"),
-        dealer_net_delta=float(row["dealer_net_delta"]) if row.get("dealer_net_delta") else None,
-        smart_money_direction=_map_direction(sm_raw) if sm_raw else None,
-        unusual_volume_detected=bool(row.get("unusual_volume_detected")),
-        orb_breakout_direction=_map_direction(orb_raw) if orb_raw else None,
-    )
+    return {
+        "symbol": row["underlying"],
+        "timeframe": timeframe.value,
+        "timestamp": row["timestamp"],
+        "status": "in_position" if row.get("has_active_trade") else "monitoring",
+        "direction": row.get("direction", "neutral"),
+        "strength": strength_str,
+        "estimated_win_pct": round(float(win_pct), 4),
+        "trade_idea": {
+            "trade_type": row.get("trade_type", "no_trade"),
+            "rationale": row.get("trade_rationale", ""),
+            "target_expiry": row.get("target_expiry", "N/A"),
+            "suggested_strikes": row.get("suggested_strikes", "N/A"),
+        },
+        "active_trades": row.get("active_trades", []),
+        "components": row.get("components", {}),
+    }
 
 
-@router.get("/accuracy")
-async def get_signal_accuracy(
+@router.get("/history")
+async def get_signal_history(
     symbol: str = Query(default="SPY"),
-    lookback_days: int = Query(default=30, ge=7, le=365),
+    limit: int = Query(default=100, ge=1, le=1000),
     db: DatabaseManager = Depends(get_db),
 ):
-    """
-    Returns historically calibrated win rates per timeframe × strength bucket
-    over the requested lookback window.
-    """
-    accuracy = await db.get_signal_accuracy(symbol, lookback_days)
-    if not accuracy:
-        return {
-            "symbol": symbol,
-            "lookback_days": lookback_days,
-            "note": "Insufficient historical data. Defaults in use.",
-            "defaults": _WIN_PCT_DEFAULTS,
-        }
+    """Past trade details with win/loss and realized/unrealized/total P&L."""
+    rows = await db.get_signal_history(symbol, limit)
+    total_pnl = round(sum(float(r.get("total_pnl") or 0) for r in rows), 2)
+    wins = sum(1 for r in rows if r.get("outcome") == "win")
+    losses = sum(1 for r in rows if r.get("outcome") == "loss")
     return {
         "symbol": symbol,
-        "lookback_days": lookback_days,
-        "accuracy": accuracy,
+        "trades": rows,
+        "summary": {
+            "total_trades": len(rows),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round((wins / len(rows)), 4) if rows else None,
+            "total_pnl": total_pnl,
+        },
     }
 
 
@@ -347,7 +305,7 @@ async def get_vol_expansion_signal(
             status_code=404,
             detail=(
                 f"No volatility expansion signal found for {symbol}. "
-                "The AnalyticsEngine may not have run yet, or no market data is available."
+                "The Signal Engine may not have run yet, or no market data is available."
             ),
         )
 
@@ -388,27 +346,6 @@ async def get_vol_expansion_signal(
     )
 
 
-@router.get("/vol-expansion/accuracy")
-async def get_vol_expansion_accuracy(
-    symbol: str = Query(default="SPY"),
-    lookback_days: int = Query(default=30, ge=7, le=365),
-    db: DatabaseManager = Depends(get_db),
-):
-    """Return historical large-move hit rates for volatility-expansion signals."""
-    accuracy = await db.get_vol_expansion_accuracy(symbol, lookback_days)
-    if not accuracy:
-        return {
-            "symbol": symbol,
-            "lookback_days": lookback_days,
-            "note": "Insufficient historical data for volatility expansion calibration.",
-        }
-    return {
-        "symbol": symbol,
-        "lookback_days": lookback_days,
-        "accuracy": accuracy,
-    }
-
-
 @router.get("/position-optimizer", response_model=PositionOptimizerSignalResponse)
 async def get_position_optimizer_signal(
     symbol: str = Query(default="SPY", description="Underlying symbol"),
@@ -429,7 +366,7 @@ async def get_position_optimizer_signal(
             status_code=404,
             detail=(
                 f"No position optimizer signal found for {symbol}. "
-                "The AnalyticsEngine may not have run yet, or no market data is available."
+                "The Signal Engine may not have run yet, or no market data is available."
             ),
         )
 
@@ -477,22 +414,3 @@ async def get_position_optimizer_signal(
     )
 
 
-@router.get("/position-optimizer/accuracy")
-async def get_position_optimizer_accuracy(
-    symbol: str = Query(default="SPY"),
-    lookback_days: int = Query(default=30, ge=7, le=365),
-    db: DatabaseManager = Depends(get_db),
-):
-    """Return historical profitability / calibration stats for position optimizer signals."""
-    accuracy = await db.get_position_optimizer_accuracy(symbol, lookback_days)
-    if not accuracy:
-        return {
-            "symbol": symbol,
-            "lookback_days": lookback_days,
-            "note": "Insufficient historical data for position optimizer calibration.",
-        }
-    return {
-        "symbol": symbol,
-        "lookback_days": lookback_days,
-        "accuracy": accuracy,
-    }

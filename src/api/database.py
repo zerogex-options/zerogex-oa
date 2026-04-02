@@ -3058,3 +3058,82 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error fetching vol surface data: {e}", exc_info=True)
             raise
+
+    async def get_signal_history(self, symbol: str = "SPY", limit: int = 100) -> list[Dict[str, Any]]:
+        """Return recent managed trade history with win/loss and realized P&L."""
+        query = """
+            SELECT
+                id,
+                underlying,
+                timestamp,
+                signal_timestamp,
+                signal_timeframe,
+                signal_direction,
+                strategy_type,
+                status,
+                contracts,
+                entry_price,
+                current_mark,
+                trade_cost,
+                realized_pnl,
+                unrealized_pnl,
+                total_pnl,
+                CASE WHEN total_pnl > 0 THEN 'win'
+                     WHEN total_pnl < 0 THEN 'loss'
+                     ELSE 'flat' END AS outcome,
+                notes
+            FROM signal_engine_trade_ideas
+            WHERE underlying = $1
+            ORDER BY timestamp DESC
+            LIMIT $2
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, limit)
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"get_signal_history failed ({symbol}): {e}")
+            return []
+
+    async def get_current_signal_with_trades(self, symbol: str = "SPY", timeframe: str = "intraday") -> Optional[Dict[str, Any]]:
+        """Return current consolidated signal plus active trade statuses."""
+        signal_row = await self.get_trade_signal(symbol=symbol, timeframe=timeframe)
+        if not signal_row:
+            return None
+
+        trades_query = """
+            SELECT
+                id,
+                timestamp,
+                status,
+                signal_timeframe,
+                signal_direction,
+                strategy_type,
+                strikes,
+                contracts,
+                entry_price,
+                current_mark,
+                stop_price,
+                target_1,
+                target_2,
+                realized_pnl,
+                unrealized_pnl,
+                total_pnl,
+                trade_cost
+            FROM signal_engine_trade_ideas
+            WHERE underlying = $1
+              AND status IN ('ready_to_trigger', 'position_open', 'partial_take_profit')
+            ORDER BY timestamp DESC
+        """
+
+        try:
+            async with self._acquire_connection() as conn:
+                trades = await conn.fetch(trades_query, symbol)
+            signal_row["active_trades"] = [dict(row) for row in trades]
+            signal_row["has_active_trade"] = len(trades) > 0
+            return signal_row
+        except Exception as e:
+            logger.error(f"get_current_signal_with_trades failed ({symbol}): {e}")
+            signal_row["active_trades"] = []
+            signal_row["has_active_trade"] = False
+            return signal_row
