@@ -43,6 +43,8 @@ class ManagedTradeIdea:
     total_pnl: float
     trade_cost: float
     notes: str
+    time_opened: datetime
+    time_closed: Optional[datetime]
 
 
 class ProprietarySignalEngine:
@@ -84,13 +86,13 @@ class ProprietarySignalEngine:
             cur.execute(
                 """
                 SELECT id, status, entry_price, target_1, target_2, stop_price, contracts,
-                       strategy_type, strikes, expiry, signal_direction
+                       strategy_type, strikes, expiry, signal_direction, realized_pnl
                 FROM signal_engine_trade_ideas
                 WHERE underlying = %s
-                  AND status IN (%s, %s, %s)
+                  AND status IN (%s, %s)
                 ORDER BY timestamp DESC
                 """,
-                (self.db_symbol, STATUS_ACTIVE, STATUS_TRIMMED, STATUS_READY),
+                (self.db_symbol, STATUS_ACTIVE, STATUS_TRIMMED),
             )
             rows = cur.fetchall()
             trades: list[dict] = []
@@ -107,6 +109,7 @@ class ProprietarySignalEngine:
                     "strikes": row[8],
                     "expiry": row[9],
                     "signal_direction": row[10],
+                    "realized_pnl": float(row[11]),
                 })
             return trades
 
@@ -154,6 +157,8 @@ class ProprietarySignalEngine:
             total_pnl=0.0,
             trade_cost=trade_cost,
             notes=f"Triggered at underlying {mark:.2f}.",
+            time_opened=datetime.utcnow(),
+            time_closed=None,
         )
 
     def _store_new_trade(self, idea: ManagedTradeIdea) -> None:
@@ -166,11 +171,13 @@ class ProprietarySignalEngine:
                     signal_direction, strategy_type, expiry, strikes, contracts,
                     entry_price, current_mark, stop_price, target_1, target_2,
                     realized_pnl, unrealized_pnl, total_pnl, trade_cost, notes
+                    , time_opened, time_closed
                 ) VALUES (
                     %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s,
+                    %s, %s
                 )
                 """,
                 (
@@ -194,28 +201,45 @@ class ProprietarySignalEngine:
                     idea.total_pnl,
                     idea.trade_cost,
                     idea.notes,
+                    idea.time_opened,
+                    idea.time_closed,
                 ),
             )
             conn.commit()
 
     def _update_active_trade(self, trade: dict, mark: float) -> bool:
+        # Entry price is immutable for lifecycle P&L. Only the live mark changes.
         entry = trade["entry_price"]
         contracts = trade["contracts"]
         status = STATUS_ACTIVE
-        realized = 0.0
+        realized = float(trade["realized_pnl"])
+        unrealized_contracts = contracts
+
+        was_trimmed = trade["status"] == STATUS_TRIMMED or realized > 0
 
         if mark <= trade["stop_price"]:
             status = STATUS_STOPPED
-            realized = (mark - entry) * contracts * 100
+            if was_trimmed:
+                realized = float(trade["realized_pnl"]) + ((mark - entry) * (contracts * 0.5) * 100)
+            else:
+                realized = (mark - entry) * contracts * 100
+            unrealized_contracts = 0
         elif mark >= trade["target_2"]:
             status = STATUS_TARGET_HIT
-            realized = (trade["target_2"] - entry) * contracts * 100
+            if was_trimmed:
+                realized = float(trade["realized_pnl"]) + ((trade["target_2"] - entry) * (contracts * 0.5) * 100)
+            else:
+                realized = (trade["target_2"] - entry) * contracts * 100
+            unrealized_contracts = 0
         elif mark >= trade["target_1"]:
             status = STATUS_TRIMMED
-            realized = (trade["target_1"] - entry) * (contracts * 0.5) * 100
+            trim_realized = (trade["target_1"] - entry) * (contracts * 0.5) * 100
+            realized = max(realized, trim_realized)
+            unrealized_contracts = contracts * 0.5
 
-        unrealized = (mark - entry) * contracts * 100 if status in {STATUS_ACTIVE, STATUS_TRIMMED} else 0.0
+        unrealized = (mark - entry) * unrealized_contracts * 100 if status in {STATUS_ACTIVE, STATUS_TRIMMED} else 0.0
         total = realized + unrealized
+        closed_at = datetime.utcnow() if status in {STATUS_STOPPED, STATUS_TARGET_HIT} else None
 
         with db_connection() as conn:
             cur = conn.cursor()
@@ -227,6 +251,7 @@ class ProprietarySignalEngine:
                     realized_pnl = %s,
                     unrealized_pnl = %s,
                     total_pnl = %s,
+                    time_closed = COALESCE(time_closed, %s),
                     updated_at = NOW(),
                     notes = %s
                 WHERE id = %s
@@ -237,6 +262,7 @@ class ProprietarySignalEngine:
                     round(realized, 2),
                     round(unrealized, 2),
                     round(total, 2),
+                    closed_at,
                     f"Lifecycle update at underlying mark {mark:.2f}",
                     trade["id"],
                 ),

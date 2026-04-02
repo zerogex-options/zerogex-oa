@@ -894,10 +894,37 @@ CREATE TABLE IF NOT EXISTS signal_engine_trade_ideas (
     unrealized_pnl      NUMERIC(18, 6) NOT NULL DEFAULT 0,
     total_pnl           NUMERIC(18, 6) NOT NULL DEFAULT 0,
     trade_cost          NUMERIC(18, 6) NOT NULL,
+    time_opened         TIMESTAMPTZ   NOT NULL,
+    time_closed         TIMESTAMPTZ,
     notes               TEXT          NOT NULL DEFAULT '',
     updated_at          TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
     created_at          TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='signal_engine_trade_ideas' AND column_name='time_opened'
+    ) THEN
+        ALTER TABLE signal_engine_trade_ideas ADD COLUMN time_opened TIMESTAMPTZ;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='signal_engine_trade_ideas' AND column_name='time_closed'
+    ) THEN
+        ALTER TABLE signal_engine_trade_ideas ADD COLUMN time_closed TIMESTAMPTZ;
+    END IF;
+
+    UPDATE signal_engine_trade_ideas
+    SET time_opened = timestamp
+    WHERE time_opened IS NULL;
+
+    ALTER TABLE signal_engine_trade_ideas
+    ALTER COLUMN time_opened SET NOT NULL;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_signal_engine_trade_ideas_underlying_ts
     ON signal_engine_trade_ideas(underlying, timestamp DESC);

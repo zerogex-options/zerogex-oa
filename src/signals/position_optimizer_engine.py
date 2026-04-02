@@ -11,6 +11,7 @@ from typing import Optional
 import pytz
 
 from src.database import db_connection
+from src.config import SIGNALS_PORTFOLIO_SIZE
 from src.symbols import get_canonical_symbol
 from src.utils import get_logger
 
@@ -45,7 +46,7 @@ RISK_PROFILE_BUDGETS = {
     "aggressive": 0.035,
 }
 
-ASSUMED_ACCOUNT_EQUITY = 100_000.0
+ASSUMED_ACCOUNT_EQUITY = SIGNALS_PORTFOLIO_SIZE
 KELLY_FRACTION = 0.25
 MAX_CANDIDATES = 3
 

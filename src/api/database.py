@@ -3071,6 +3071,8 @@ class DatabaseManager:
                 signal_direction,
                 strategy_type,
                 status,
+                time_opened,
+                time_closed,
                 contracts,
                 entry_price,
                 current_mark,
@@ -3106,6 +3108,8 @@ class DatabaseManager:
                 id,
                 timestamp,
                 status,
+                time_opened,
+                time_closed,
                 signal_timeframe,
                 signal_direction,
                 strategy_type,
@@ -3122,7 +3126,7 @@ class DatabaseManager:
                 trade_cost
             FROM signal_engine_trade_ideas
             WHERE underlying = $1
-              AND status IN ('ready_to_trigger', 'position_open', 'partial_take_profit')
+              AND status IN ('position_open', 'partial_take_profit')
             ORDER BY timestamp DESC
         """
 

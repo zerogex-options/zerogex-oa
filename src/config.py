@@ -166,6 +166,7 @@ VOL_AUTO_TUNE_MIN_SAMPLES = max(
 # =============================================================================
 
 SIGNALS_UNDERLYINGS = os.getenv("SIGNALS_UNDERLYINGS", "SPY")
+SIGNALS_PORTFOLIO_SIZE = float(os.getenv("SIGNALS_PORTFOLIO_SIZE", "1000000"))
 
 # =============================================================================
 # Ingestion Parity Guard
@@ -216,6 +217,7 @@ def get_all_config() -> Dict[str, Any]:
         },
         "signals": {
             "underlyings": SIGNALS_UNDERLYINGS,
+            "portfolio_size": SIGNALS_PORTFOLIO_SIZE,
         },
     }
 
