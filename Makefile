@@ -187,6 +187,15 @@ help: ## Show this help message
 	@echo "  make analytics-disable  - Disable analytics service from starting on boot"
 	@echo "  make analytics-health   - Show analytics service health and recent errors"
 	@echo ""
+	@echo "$(GREEN)Signals Service Management:$(NC)"
+	@echo "  make signals-start      - Start the signals service"
+	@echo "  make signals-stop       - Stop the signals service"
+	@echo "  make signals-restart    - Restart the signals service"
+	@echo "  make signals-status     - Show signals service status"
+	@echo "  make signals-enable     - Enable signals service to start on boot"
+	@echo "  make signals-disable    - Disable signals service from starting on boot"
+	@echo "  make signals-health     - Show signals service health and recent errors"
+	@echo ""
 	@echo "$(GREEN)API Server:$(NC)"
 	@echo "  make api-dev             - Run API in development mode (hot reload)"
 	@echo "  make api-prod            - Run API in production mode (4 workers)"
@@ -426,6 +435,26 @@ analytics-health: ## Check analytics service health and recent errors
 	@echo "Recent Warnings (last 5):"
 	@echo "-------------------------"
 	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 500 --no-pager | grep " - WARNING - " | tail -5 || echo "No recent warnings"
+
+
+.PHONY: signals-health
+signals-health: ## Check signals service health and recent errors
+	@echo "$(GREEN)Signals Service Health Check$(NC)"
+	@echo "===================="
+	@echo ""
+	@if systemctl is-active --quiet $(SIGNALS_SERVICE); then 		echo "Status: $(GREEN)ACTIVE$(NC)"; 	else 		echo "Status: $(RED)INACTIVE$(NC)"; 	fi
+	@echo ""
+	@UPTIME=$$(systemctl show $(SIGNALS_SERVICE) --property=ActiveEnterTimestamp --value); 	if [ -n "$$UPTIME" ]; then 		echo "Started: $$UPTIME"; 	fi
+	@echo ""
+	@MEMORY=$$(systemctl show $(SIGNALS_SERVICE) --property=MemoryCurrent --value); 	if [ "$$MEMORY" != "[not set]" ] && [ -n "$$MEMORY" ]; then 		MEMORY_MB=$$(($$MEMORY / 1024 / 1024)); 		echo "Memory: $${MEMORY_MB} MB"; 	fi
+	@echo ""
+	@echo "Recent Errors (last 10):"
+	@echo "------------------------"
+	@sudo journalctl -u $(SIGNALS_SERVICE) -n 500 --no-pager | grep " - ERROR - " | tail -10 || echo "No recent errors"
+	@echo ""
+	@echo "Recent Warnings (last 5):"
+	@echo "-------------------------"
+	@sudo journalctl -u $(SIGNALS_SERVICE) -n 500 --no-pager | grep " - WARNING - " | tail -5 || echo "No recent warnings"
 
 .PHONY: api-health
 api-health: ## Check API service health and recent errors
