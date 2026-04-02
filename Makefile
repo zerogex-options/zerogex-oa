@@ -277,25 +277,24 @@ help: ## Show this help message
 	@echo "  make max-pain-strikes      - Detailed strike breakdown for nearest expiration"
 	@echo ""
 	@echo "$(GREEN)Signals:$(NC)"
-	@echo "  make signals                  - Latest trade signals for all timeframes"
-	@echo "  make signals-detail           - Full detail for latest signal (usage: make signals-detail TF=intraday)"
-	@echo "  make signals-components       - Signal component breakdown (usage: make signals-components TF=intraday)"
-	@echo "  make signals-exhaustion       - Latest ZeroGEX Exhaustion Score by timeframe"
-	@echo "  make signals-history          - Signal history for today (usage: make signals-history TF=intraday)"
-	@echo "  make signals-all-symbols      - Latest signal for every tracked symbol"
-	@echo "  make signal-accuracy          - Win rate calibration by timeframe + strength (last 30 days)"
-	@echo "  make signal-accuracy-daily    - Daily accuracy breakdown for the last 14 days"
-	@echo "  make signal-accuracy-all      - Full accuracy table — all dates, all symbols"
+	@echo "  make signals                  - Latest consolidated signal snapshot"
+	@echo "  make signals-detail           - Full consolidated signal detail"
+	@echo "  make signals-components       - Consolidated component-group breakdown"
+	@echo "  make signals-exhaustion       - Latest ZeroGEX Exhaustion from consolidated payload"
+	@echo "  make signals-history          - Managed trade history with outcomes + P&L"
+	@echo "  make signals-all-symbols      - Latest consolidated signal for every tracked symbol"
+	@echo "  make signal-accuracy          - Consolidated win rate by timeframe + strength (last 30 days)"
+	@echo "  make signal-accuracy-daily    - Daily consolidated accuracy (last 14 days)"
+	@echo "  make signal-accuracy-all      - Full consolidated accuracy table"
 	@echo "  make vol-signals              - Latest volatility-expansion signal"
 	@echo "  make vol-signals-components   - Vol-expansion component breakdown"
-	@echo "  make vol-accuracy             - Vol-expansion hit-rate calibration"
-	@echo "  make api-test-vol-signals     - Test new vol-expansion /api/signals endpoints"
-	@echo "  make signal-logs              - Watch SignalEngine log output live (Ctrl+C to stop)"
-	@echo "  make signal-logs-tail         - Last 100 SignalEngine log lines"
-	@echo "  make signal-logs-errors       - SignalEngine errors and warnings only"
+	@echo "  make api-test-vol-signals     - Test /api/signals/vol-expansion endpoint"
+	@echo "  make signal-logs              - Watch Signal Engine service logs live"
+	@echo "  make signal-logs-tail         - Last 200 Signal Engine log lines"
+	@echo "  make signal-logs-errors       - Signal Engine warnings/errors"
 	@echo "  make signal-logs-cycles       - Show each completed signal engine cycle"
-	@echo "  make api-test-signals         - Test all /api/signals endpoints"
-	@echo "  make api-test-signals-summary - Quick one-liner signal check across all timeframes"
+	@echo "  make api-test-signals         - Test trade/history/position endpoints"
+	@echo "  make api-test-signals-summary - One-liner trade status + history summary"
 	@echo ""
 	@echo "$(GREEN)Data Quality:$(NC)"
 	@echo "  make gaps               - Check for data gaps"
@@ -1630,397 +1629,111 @@ max-pain-strikes: ## Max pain strikes for nearest expiration (default: SPY, over
 # =============================================================================
 
 .PHONY: signals
-signals: ## Latest trade signals for all timeframes (default: SPY, override: make signals FLOW_SYMBOL=QQQ)
-	@echo "$(BLUE)=== Latest Trade Signals ($(FLOW_SYMBOL)) ===$(NC)"
-	@$(PSQL) -c "\
-		SELECT \
-			timeframe, \
-			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI:SS') AS time_et, \
-			direction, \
-			strength, \
-			composite_score || '/' || max_possible_score AS score, \
-			ROUND(normalized_score * 100, 1) || '%' AS pct, \
-			ROUND(estimated_win_pct * 100, 1) || '%' AS win_pct, \
-			trade_type, \
-			target_expiry \
-		FROM trade_signals \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
-		ORDER BY timestamp DESC, timeframe;"
+signals: ## Latest consolidated signal snapshot (default: SPY, override: make signals FLOW_SYMBOL=QQQ)
+	@echo "$(BLUE)=== Latest Consolidated Signal ($(FLOW_SYMBOL)) ===$(NC)"
+	@$(PSQL) -c "		SELECT 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI:SS') AS time_et, 			timeframe, direction, strength, 			ROUND(normalized_score * 100, 1) || '%' AS confidence, 			ROUND(estimated_win_pct * 100, 1) || '%' AS win_pct, 			trade_type, top_strategy_type 		FROM consolidated_trade_signals 		WHERE underlying = '$(FLOW_SYMBOL)' 		ORDER BY timestamp DESC 		LIMIT 1;"
 
 .PHONY: signals-detail
-signals-detail: ## Full detail for latest signal (usage: make signals-detail TF=intraday FLOW_SYMBOL=QQQ)
-	@$(eval TF ?= intraday)
-	@echo "$(BLUE)=== Signal Detail: $(FLOW_SYMBOL) / $(TF) ===$(NC)"
-	@$(PSQL) -c "\
-		SELECT \
-			timeframe, \
-			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI:SS') AS time_et, \
-			direction, \
-			strength, \
-			composite_score || '/' || max_possible_score AS score, \
-			ROUND(normalized_score * 100, 1) || '%' AS normalized, \
-			ROUND(estimated_win_pct * 100, 1) || '%' AS win_pct, \
-			trade_type, \
-			trade_rationale, \
-			target_expiry, \
-			suggested_strikes, \
-			ROUND(current_price::numeric, 2) AS price, \
-			ROUND(net_gex::numeric, 0) AS net_gex, \
-			ROUND(gamma_flip::numeric, 2) AS gamma_flip, \
-			price_vs_flip || '%' AS vs_flip, \
-			ROUND(vwap::numeric, 2) AS vwap, \
-			vwap_deviation_pct || '%' AS vwap_dev, \
-			ROUND(put_call_ratio::numeric, 3) AS pcr, \
-			ROUND(dealer_net_delta::numeric, 0) AS dealer_delta, \
-			smart_money_direction AS sm_dir, \
-			unusual_volume_detected AS unusual_vol, \
-			orb_breakout_direction AS orb_dir \
-		FROM trade_signals \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
-		  AND timeframe = '$(TF)' \
-		ORDER BY timestamp DESC \
-		LIMIT 1;"
+signals-detail: ## Full consolidated signal detail (usage: make signals-detail FLOW_SYMBOL=QQQ)
+	@echo "$(BLUE)=== Consolidated Signal Detail ($(FLOW_SYMBOL)) ===$(NC)"
+	@$(PSQL) -c "		SELECT 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI:SS') AS time_et, 			timeframe, direction, strength, composite_score, normalized_score, 			estimated_win_pct, trade_type, trade_rationale, target_expiry, suggested_strikes, 			ROUND(current_price::numeric, 2) AS current_price, 			ROUND(net_gex::numeric, 0) AS net_gex, 			ROUND(gamma_flip::numeric, 2) AS gamma_flip, 			ROUND(put_call_ratio::numeric, 3) AS pcr, 			ROUND(dealer_net_delta::numeric, 0) AS dealer_delta, 			ROUND(move_probability::numeric * 100, 1) || '%' AS move_probability, 			top_strategy_type 		FROM consolidated_trade_signals 		WHERE underlying = '$(FLOW_SYMBOL)' 		ORDER BY timestamp DESC 		LIMIT 1;"
 
 .PHONY: signals-components
-signals-components: ## Signal component breakdown (usage: make signals-components TF=intraday FLOW_SYMBOL=QQQ)
-	@$(eval TF ?= intraday)
-	@echo "$(BLUE)=== Signal Components: $(FLOW_SYMBOL) / $(TF) ===$(NC)"
-	@$(PSQL) -c "\
-		WITH expected AS ( \
-			SELECT * FROM (VALUES \
-				('GEX Regime', 1), \
-				('Dealer Hedging Pressure', 2), \
-				('Smart Money Flow', 3), \
-				('VWAP Position', 4), \
-				('Opening Range Breakout', 5), \
-				('Put/Call Ratio', 6), \
-				('Unusual Volume Spike', 7), \
-				('Momentum Divergence', 8), \
-				('Vanna/Charm Drift', 9), \
-				('ZeroGEX Exhaustion Score', 10), \
-				('Calibration Snapshot', 11) \
-			) AS t(name, ord) \
-		), \
-		latest AS ( \
-			SELECT components \
-			FROM trade_signals \
-			WHERE underlying = '$(FLOW_SYMBOL)' \
-			  AND timeframe  = '$(TF)' \
-			ORDER BY timestamp DESC \
-			LIMIT 1 \
-		), \
-		expanded AS ( \
-			SELECT \
-				comp->>'name'        AS signal, \
-				comp->>'weight'      AS weight, \
-				comp->>'score'       AS score, \
-				comp->>'applicable'  AS active, \
-				comp->>'description' AS description \
-			FROM latest, \
-			     jsonb_array_elements(components) AS comp \
-		) \
-		SELECT \
-			e.name AS signal, \
-			COALESCE(x.weight, 'n/a') AS weight, \
-			COALESCE(x.score, 'n/a') AS score, \
-			COALESCE(x.active, 'n/a') AS active, \
-			COALESCE(x.description, 'Missing from latest row. Restart analytics and run one cycle to emit this component.') AS description \
-		FROM expected e \
-		LEFT JOIN expanded x ON x.signal = e.name \
-		ORDER BY e.ord;"
+signals-components: ## Consolidated signal component groups (trade/vol/position)
+	@echo "$(BLUE)=== Consolidated Component Groups ($(FLOW_SYMBOL)) ===$(NC)"
+	@$(PSQL) -c "		WITH latest AS ( 			SELECT components 			FROM consolidated_trade_signals 			WHERE underlying = '$(FLOW_SYMBOL)' 			ORDER BY timestamp DESC 			LIMIT 1 		) 		SELECT key AS component_group, jsonb_array_length(value) AS item_count 		FROM latest, jsonb_each(components) 		ORDER BY key;"
 
 .PHONY: signals-exhaustion
-signals-exhaustion: ## Latest ZES result by timeframe (usage: make signals-exhaustion FLOW_SYMBOL=QQQ)
-	@echo "$(BLUE)=== ZeroGEX Exhaustion Score (ZES): $(FLOW_SYMBOL) ===$(NC)"
-	@$(PSQL) -c "\
-		WITH latest AS ( \
-			SELECT DISTINCT ON (timeframe) \
-				timeframe, \
-				timestamp, \
-				components \
-			FROM trade_signals \
-			WHERE underlying = '$(FLOW_SYMBOL)' \
-			ORDER BY timeframe, timestamp DESC \
-		) \
-		SELECT \
-			l.timeframe, \
-			TO_CHAR(l.timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI:SS') AS time_et, \
-			comp->>'value' AS zes_score, \
-			comp->>'description' AS status \
-		FROM latest l, \
-		     jsonb_array_elements(l.components) AS comp \
-		WHERE comp->>'name' = 'ZeroGEX Exhaustion Score' \
-		ORDER BY l.timeframe;"
+signals-exhaustion: ## Extract latest ZeroGEX Exhaustion from consolidated trade component payload
+	@echo "$(BLUE)=== ZeroGEX Exhaustion (from consolidated payload) ($(FLOW_SYMBOL)) ===$(NC)"
+	@$(PSQL) -c "		WITH latest AS ( 			SELECT components 			FROM consolidated_trade_signals 			WHERE underlying = '$(FLOW_SYMBOL)' 			ORDER BY timestamp DESC 			LIMIT 1 		), expanded AS ( 			SELECT comp 			FROM latest, jsonb_array_elements(components->'trade_signal_components') comp 		) 		SELECT 			comp->>'name' AS component, 			comp->>'value' AS value, 			comp->>'description' AS description 		FROM expanded 		WHERE comp->>'name' = 'ZeroGEX Exhaustion Score';"
 
 .PHONY: signals-history
-signals-history: ## Signal history for today (usage: make signals-history TF=intraday FLOW_SYMBOL=QQQ)
-	@$(eval TF ?= intraday)
-	@echo "$(BLUE)=== Signal History Today: $(FLOW_SYMBOL) / $(TF) ===$(NC)"
-	@$(PSQL) -c "\
-		SELECT \
-			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') AS time_et, \
-			direction, \
-			strength, \
-			composite_score || '/' || max_possible_score AS score, \
-			ROUND(estimated_win_pct * 100, 1) || '%' AS win_pct, \
-			trade_type \
-		FROM trade_signals \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
-		  AND timeframe  = '$(TF)' \
-		  AND DATE(timestamp AT TIME ZONE 'America/New_York') = CURRENT_DATE \
-		ORDER BY timestamp DESC;"
+signals-history: ## Managed trade history with outcomes and PnL
+	@echo "$(BLUE)=== Managed Trade History ($(FLOW_SYMBOL)) ===$(NC)"
+	@$(PSQL) -c "		SELECT 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI') AS time_et, 			signal_timeframe, signal_direction, strategy_type, status, 			ROUND(entry_price::numeric, 2) AS entry_price, 			ROUND(current_mark::numeric, 2) AS current_mark, 			ROUND(total_pnl::numeric, 2) AS total_pnl, 			CASE WHEN total_pnl > 0 THEN 'win' WHEN total_pnl < 0 THEN 'loss' ELSE 'flat' END AS outcome 		FROM signal_engine_trade_ideas 		WHERE underlying = '$(FLOW_SYMBOL)' 		ORDER BY timestamp DESC 		LIMIT 50;"
 
 .PHONY: signals-all-symbols
-signals-all-symbols: ## Latest signal for every tracked symbol
-	@echo "$(BLUE)=== Latest Signals — All Symbols ===$(NC)"
-	@$(PSQL) -c "\
-		SELECT DISTINCT ON (underlying, timeframe) \
-			underlying, \
-			timeframe, \
-			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') AS time_et, \
-			direction, \
-			strength, \
-			composite_score || '/' || max_possible_score AS score, \
-			trade_type \
-		FROM trade_signals \
-		ORDER BY underlying, timeframe, timestamp DESC;"
-
-# =============================================================================
-# Signal Engine — Accuracy / Backtesting
-# =============================================================================
+signals-all-symbols: ## Latest consolidated signal for every tracked symbol
+	@echo "$(BLUE)=== Consolidated Signals — All Symbols ===$(NC)"
+	@$(PSQL) -c "		SELECT DISTINCT ON (underlying) 			underlying, 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI') AS time_et, 			timeframe, direction, strength, trade_type, top_strategy_type 		FROM consolidated_trade_signals 		ORDER BY underlying, timestamp DESC;"
 
 .PHONY: signal-accuracy
-signal-accuracy: ## Win rate calibration by timeframe + strength, last 30 days (default: SPY, override: make signal-accuracy FLOW_SYMBOL=QQQ)
-	@echo "$(BLUE)=== Signal Accuracy — Last 30 Days ($(FLOW_SYMBOL)) ===$(NC)"
-	@$(PSQL) -c "\
-		SELECT \
-			timeframe, \
-			strength_bucket AS strength, \
-			SUM(total_signals)   AS total, \
-			SUM(correct_signals) AS correct, \
-			ROUND(SUM(correct_signals)::numeric / NULLIF(SUM(total_signals), 0) * 100, 1) || '%' AS win_pct \
-		FROM signal_accuracy \
-		WHERE underlying  = '$(FLOW_SYMBOL)' \
-		  AND trade_date >= CURRENT_DATE - 30 \
-		GROUP BY timeframe, strength_bucket \
-		ORDER BY timeframe, strength_bucket;"
+signal-accuracy: ## Consolidated win-rate by timeframe + strength (last 30 days)
+	@echo "$(BLUE)=== Consolidated Signal Accuracy — Last 30 Days ($(FLOW_SYMBOL)) ===$(NC)"
+	@$(PSQL) -c "		SELECT 			timeframe, strength_bucket AS strength, 			SUM(total_signals) AS total, 			SUM(correct_signals) AS correct, 			ROUND(SUM(correct_signals)::numeric / NULLIF(SUM(total_signals),0) * 100, 1) || '%' AS win_pct 		FROM consolidated_signal_accuracy 		WHERE underlying = '$(FLOW_SYMBOL)' 		  AND trade_date >= CURRENT_DATE - 30 		GROUP BY timeframe, strength_bucket 		ORDER BY timeframe, strength_bucket;"
 
 .PHONY: signal-accuracy-daily
-signal-accuracy-daily: ## Daily accuracy breakdown for the last 14 days (default: SPY, override: make signal-accuracy-daily FLOW_SYMBOL=QQQ)
-	@echo "$(BLUE)=== Daily Signal Accuracy — Last 14 Days ($(FLOW_SYMBOL)) ===$(NC)"
-	@$(PSQL) -c "\
-		SELECT \
-			trade_date, \
-			timeframe, \
-			strength_bucket AS strength, \
-			total_signals   AS total, \
-			correct_signals AS correct, \
-			ROUND(win_pct * 100, 1) || '%' AS win_pct \
-		FROM signal_accuracy \
-		WHERE underlying  = '$(FLOW_SYMBOL)' \
-		  AND trade_date >= CURRENT_DATE - 14 \
-		ORDER BY trade_date DESC, timeframe, strength_bucket;"
+signal-accuracy-daily: ## Daily consolidated accuracy (last 14 days)
+	@echo "$(BLUE)=== Daily Consolidated Accuracy ($(FLOW_SYMBOL)) ===$(NC)"
+	@$(PSQL) -c "		SELECT 			trade_date, timeframe, strength_bucket AS strength, 			total_signals AS total, correct_signals AS correct, 			ROUND(win_pct * 100, 1) || '%' AS win_pct 		FROM consolidated_signal_accuracy 		WHERE underlying = '$(FLOW_SYMBOL)' 		  AND trade_date >= CURRENT_DATE - 14 		ORDER BY trade_date DESC, timeframe, strength_bucket;"
 
 .PHONY: signal-accuracy-all
-signal-accuracy-all: ## Full accuracy table — all dates, all symbols
-	@echo "$(BLUE)=== Full Signal Accuracy Table ===$(NC)"
-	@$(PSQL) -c "\
-		SELECT \
-			underlying, \
-			trade_date, \
-			timeframe, \
-			strength_bucket AS strength, \
-			total_signals   AS total, \
-			correct_signals AS correct, \
-			ROUND(win_pct * 100, 1) || '%' AS win_pct, \
-			updated_at \
-		FROM signal_accuracy \
-		ORDER BY trade_date DESC, underlying, timeframe, strength_bucket \
-		LIMIT 100;"
+signal-accuracy-all: ## Full consolidated accuracy table
+	@echo "$(BLUE)=== Full Consolidated Accuracy Table ===$(NC)"
+	@$(PSQL) -c "		SELECT 			underlying, trade_date, timeframe, strength_bucket, 			total_signals, correct_signals, ROUND(win_pct * 100, 1) || '%' AS win_pct, updated_at 		FROM consolidated_signal_accuracy 		ORDER BY trade_date DESC, underlying, timeframe, strength_bucket 		LIMIT 200;"
 
 .PHONY: vol-signals
-vol-signals: ## Latest volatility-expansion signal (default: SPY, override: make vol-signals FLOW_SYMBOL=QQQ)
+vol-signals: ## Latest volatility-expansion signal
 	@echo "$(BLUE)=== Latest Volatility Expansion Signal ($(FLOW_SYMBOL)) ===$(NC)"
-	@$(PSQL) -c "\
-		SELECT \
-			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI:SS') AS time_et, \
-			expected_direction, \
-			confidence, \
-			ROUND(move_probability * 100, 1) || '%' AS move_prob, \
-			ROUND(expected_magnitude_pct::numeric, 2) || '%' AS expected_move, \
-			catalyst_type, \
-			strategy_type, \
-			time_horizon \
-		FROM volatility_expansion_signals \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
-		ORDER BY timestamp DESC \
-		LIMIT 1;"
+	@$(PSQL) -c "		SELECT 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI:SS') AS time_et, 			expected_direction, confidence, 			ROUND(move_probability * 100, 1) || '%' AS move_prob, 			ROUND(expected_magnitude_pct::numeric, 2) || '%' AS expected_move, 			catalyst_type, strategy_type, time_horizon 		FROM volatility_expansion_signals 		WHERE underlying = '$(FLOW_SYMBOL)' 		ORDER BY timestamp DESC 		LIMIT 1;"
 
 .PHONY: vol-signals-components
-vol-signals-components: ## Vol-expansion component breakdown (default: SPY, override: make vol-signals-components FLOW_SYMBOL=QQQ)
+vol-signals-components: ## Volatility-expansion component breakdown
 	@echo "$(BLUE)=== Volatility Expansion Components ($(FLOW_SYMBOL)) ===$(NC)"
-	@$(PSQL) -c "\
-		SELECT \
-			comp->>'name' AS component, \
-			comp->>'weight' AS weight, \
-			comp->>'raw_score' AS raw_score, \
-			comp->>'weighted_score' AS weighted_score, \
-			comp->>'description' AS description \
-		FROM volatility_expansion_signals, \
-		     jsonb_array_elements(components) AS comp \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
-		ORDER BY timestamp DESC \
-		LIMIT 10;"
-
-.PHONY: vol-accuracy
-vol-accuracy: ## Vol-expansion large-move hit-rate calibration (default: SPY, override: make vol-accuracy FLOW_SYMBOL=QQQ)
-	@echo "$(BLUE)=== Volatility Expansion Accuracy — Last 30 Days ($(FLOW_SYMBOL)) ===$(NC)"
-	@$(PSQL) -c "\
-		SELECT \
-			confidence, \
-			catalyst_type, \
-			SUM(total_signals) AS total, \
-			SUM(large_move_hits) AS large_move_hits, \
-			SUM(direction_correct_hits) AS direction_correct_hits, \
-			ROUND(SUM(large_move_hits)::numeric / NULLIF(SUM(total_signals), 0) * 100, 1) || '%' AS large_move_hit_rate, \
-			ROUND(AVG(avg_predicted_probability)::numeric * 100, 1) || '%' AS avg_predicted_prob \
-		FROM vol_expansion_accuracy \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
-		  AND trade_date >= CURRENT_DATE - 30 \
-		GROUP BY confidence, catalyst_type \
-		ORDER BY confidence, catalyst_type;"
-
-
-.PHONY: position-optimizer-latest
-position-optimizer-latest: ## Latest position optimizer signal (default: SPY, override: make position-optimizer-latest FLOW_SYMBOL=QQQ)
-	@echo "$(BLUE)=== Position Optimizer Latest ($(FLOW_SYMBOL)) ===$(NC)"
-	@$(PSQL) -c "\
-		SELECT \
-			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI:SS') AS time_et, \
-			signal_direction, \
-			signal_timeframe, \
-			top_strategy_type, \
-			top_strikes, \
-			ROUND(top_probability_of_profit::numeric * 100, 1) || '%' AS pop, \
-			ROUND(top_expected_value::numeric, 2) AS expected_value, \
-			ROUND(top_kelly_fraction::numeric * 100, 2) || '%' AS kelly \
-		FROM position_optimizer_signals \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
-		ORDER BY timestamp DESC \
-		LIMIT 1;"
-
-.PHONY: position-optimizer-components
-position-optimizer-components: ## Position optimizer component breakdown (default: SPY, override: make position-optimizer-components FLOW_SYMBOL=QQQ)
-	@echo "$(BLUE)=== Position Optimizer Components ($(FLOW_SYMBOL)) ===$(NC)"
-	@$(PSQL) -c "\
-		SELECT \
-			cand->>'rank' AS rank, \
-			cand->>'strategy_type' AS strategy_type, \
-			comp->>'name' AS component, \
-			comp->>'raw_score' AS raw_score, \
-			comp->>'weighted_score' AS weighted_score, \
-			comp->>'description' AS description \
-		FROM position_optimizer_signals, \
-			 jsonb_array_elements(candidates) AS cand, \
-			 jsonb_array_elements(cand->'components') AS comp \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
-		ORDER BY timestamp DESC, (cand->>'rank')::int ASC \
-		LIMIT 30;"
-
-.PHONY: position-optimizer-accuracy
-position-optimizer-accuracy: ## Position optimizer accuracy summary (default: SPY, override: make position-optimizer-accuracy FLOW_SYMBOL=QQQ)
-	@echo "$(BLUE)=== Position Optimizer Accuracy — Last 30 Days ($(FLOW_SYMBOL)) ===$(NC)"
-	@$(PSQL) -c "\
-		SELECT \
-			signal_direction, \
-			strategy_type, \
-			SUM(total_signals) AS total, \
-			SUM(profitable_signals) AS profitable, \
-			ROUND(SUM(profitable_signals)::numeric / NULLIF(SUM(total_signals), 0) * 100, 1) || '%' AS profitability_rate, \
-			ROUND(AVG(avg_expected_value)::numeric, 2) AS avg_expected_value, \
-			ROUND(AVG(avg_realized_return_pct)::numeric, 2) || '%' AS avg_realized_return_pct \
-		FROM position_optimizer_accuracy \
-		WHERE underlying = '$(FLOW_SYMBOL)' \
-		  AND trade_date >= CURRENT_DATE - 30 \
-		GROUP BY signal_direction, strategy_type \
-		ORDER BY signal_direction, strategy_type;"
-
-.PHONY: position-optimizer-api-smoke
-position-optimizer-api-smoke: ## Smoke test position optimizer API endpoints (default: SPY, override: make position-optimizer-api-smoke FLOW_SYMBOL=QQQ API_BASE=http://localhost:8000)
-	@echo "$(BLUE)=== Position Optimizer API Smoke ($(FLOW_SYMBOL)) ===$(NC)"
-	@curl -fsS "$(or $(API_BASE),http://localhost:8000)/api/signals/position-optimizer?symbol=$(FLOW_SYMBOL)" | python -m json.tool
-	@echo ""
-	@curl -fsS "$(or $(API_BASE),http://localhost:8000)/api/signals/position-optimizer/accuracy?symbol=$(FLOW_SYMBOL)" | python -m json.tool
+	@$(PSQL) -c "		SELECT 			comp->>'name' AS component, comp->>'weight' AS weight, 			comp->>'raw_score' AS raw_score, comp->>'weighted_score' AS weighted_score, 			comp->>'description' AS description 		FROM volatility_expansion_signals, jsonb_array_elements(components) AS comp 		WHERE underlying = '$(FLOW_SYMBOL)' 		ORDER BY timestamp DESC 		LIMIT 20;"
 
 # =============================================================================
 # Signal Engine — Logs
 # =============================================================================
 
 .PHONY: signal-logs
-signal-logs: ## Watch SignalEngine log output live (Ctrl+C to stop)
+signal-logs: ## Watch Signal Engine service logs live
 	@echo "$(BLUE)=== Signal Engine Logs (live) — Ctrl+C to stop ===$(NC)"
-	@sudo journalctl -u $(ANALYTICS_SERVICE) -f | grep --line-buffered -i "signal"
+	@sudo journalctl -u $(SIGNALS_SERVICE) -f
 
 .PHONY: signal-logs-tail
-signal-logs-tail: ## Last 100 SignalEngine log lines
-	@echo "$(BLUE)=== Last 100 Signal Engine Log Lines ===$(NC)"
-	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 500 --no-pager | grep -i "signal" | tail -100
+signal-logs-tail: ## Last 200 Signal Engine log lines
+	@echo "$(BLUE)=== Last 200 Signal Engine Log Lines ===$(NC)"
+	@sudo journalctl -u $(SIGNALS_SERVICE) -n 200 --no-pager
 
 .PHONY: signal-logs-errors
-signal-logs-errors: ## SignalEngine errors and warnings only
+signal-logs-errors: ## Signal Engine errors and warnings
 	@echo "$(BLUE)=== Signal Engine Errors & Warnings ===$(NC)"
-	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 1000 --no-pager \
-		| grep -i "signal" \
-		| grep -iE "(error|warning|failed|exception|traceback)" \
-		|| echo "$(GREEN)No signal errors found in last 1000 log lines$(NC)"
+	@sudo journalctl -u $(SIGNALS_SERVICE) -p warning -n 200 --no-pager
 
 .PHONY: signal-logs-cycles
-signal-logs-cycles: ## Show each completed signal engine cycle
+signal-logs-cycles: ## Show completed Signal Engine cycles
 	@echo "$(BLUE)=== Signal Engine Cycle History ===$(NC)"
-	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 2000 --no-pager \
-		| grep -iE "(signal engine cycle|✅ Signal \[)" \
-		| tail -50
+	@sudo journalctl -u $(SIGNALS_SERVICE) -n 2000 --no-pager | grep -i "SignalEngineService cycle" | tail -50
 
 # =============================================================================
 # API Signals — Endpoint Tests
 # =============================================================================
 
 .PHONY: api-test-signals
-api-test-signals: ## Test all /api/signals endpoints
+api-test-signals: ## Test active /api/signals endpoints
 	@echo "$(BLUE)=== Testing /api/signals Endpoints ===$(NC)"
 	@echo ""
-	@echo "$(GREEN)Intraday Signal:$(NC)"
+	@echo "$(GREEN)Trade + Active Status:$(NC)"
 	@curl -s "http://localhost:8000/api/signals/trade?symbol=SPY&timeframe=intraday" | python3 -m json.tool
 	@echo ""
-	@echo "$(GREEN)Swing Signal:$(NC)"
-	@curl -s "http://localhost:8000/api/signals/trade?symbol=SPY&timeframe=swing" | python3 -m json.tool
+	@echo "$(GREEN)History:$(NC)"
+	@curl -s "http://localhost:8000/api/signals/history?symbol=SPY&limit=20" | python3 -m json.tool
 	@echo ""
-	@echo "$(GREEN)Multi-Day Signal:$(NC)"
-	@curl -s "http://localhost:8000/api/signals/trade?symbol=SPY&timeframe=multi_day" | python3 -m json.tool
-	@echo ""
-	@echo "$(GREEN)Signal Accuracy (30-day):$(NC)"
-	@curl -s "http://localhost:8000/api/signals/accuracy?symbol=SPY&lookback_days=30" | python3 -m json.tool
+	@echo "$(GREEN)Position Optimizer:$(NC)"
+	@curl -s "http://localhost:8000/api/signals/position-optimizer?symbol=SPY" | python3 -m json.tool
 
 .PHONY: api-test-vol-signals
-api-test-vol-signals: ## Test new vol-expansion /api/signals endpoints
-	@echo "$(BLUE)=== Testing /api/signals/vol-expansion Endpoints ===$(NC)"
-	@echo ""
-	@echo "$(GREEN)Latest Vol Expansion Signal:$(NC)"
+api-test-vol-signals: ## Test /api/signals/vol-expansion endpoint
+	@echo "$(BLUE)=== Testing /api/signals/vol-expansion ===$(NC)"
 	@curl -s "http://localhost:8000/api/signals/vol-expansion?symbol=SPY" | python3 -m json.tool
-	@echo ""
-	@echo "$(GREEN)Vol Expansion Accuracy (30-day):$(NC)"
-	@curl -s "http://localhost:8000/api/signals/vol-expansion/accuracy?symbol=SPY&lookback_days=30" | python3 -m json.tool
 
 .PHONY: api-test-signals-summary
-api-test-signals-summary: ## Quick one-liner signal check across all timeframes
-	@echo "$(BLUE)=== Signal Summary (all timeframes) ===$(NC)"
-	@for TF in intraday swing multi_day; do \
-		echo ""; \
-		echo "$(GREEN)$$TF:$(NC)"; \
-		curl -s "http://localhost:8000/api/signals/trade?symbol=SPY&timeframe=$$TF" 2>/dev/null \
-			| python3 -c 'import sys,json;d=json.load(sys.stdin);print("  direction=%s  strength=%s  score=%d/%d  win_pct=%.0f%%  trade=%s" % (d["direction"], d["strength"], d["composite_score"], d["max_possible_score"], d["estimated_win_pct"]*100, d["trade_idea"]["trade_type"]))' \
-			|| echo "  (no data yet)"; \
-	done
+api-test-signals-summary: ## Quick one-liner status for trade + history summary
+	@echo "$(BLUE)=== Signals Summary ===$(NC)"
+	@curl -s "http://localhost:8000/api/signals/trade?symbol=SPY&timeframe=intraday" 2>/dev/null 		| python3 -c 'import sys,json; d=json.load(sys.stdin); print(f"status={d.get('status')} direction={d.get('direction')} strength={d.get('strength')} win_pct={d.get('estimated_win_pct')}")' 		|| echo "(no trade data yet)"
+	@curl -s "http://localhost:8000/api/signals/history?symbol=SPY&limit=50" 2>/dev/null 		| python3 -c 'import sys,json; d=json.load(sys.stdin); s=d.get("summary",{}); print(f"trades={s.get('total_trades')} wins={s.get('wins')} losses={s.get('losses')} total_pnl={s.get('total_pnl')}")' 		|| echo "(no history data yet)"
 
 # =============================================================================
 # Data Quality
@@ -2482,11 +2195,9 @@ api-test: ## Test ALL API endpoints
 	for STF in $$SIGNAL_TIMEFRAMES; do \
 		test_endpoint "/api/signals/trade?symbol=$$SYMBOL&timeframe=$$STF"; \
 	done; \
-	test_endpoint "/api/signals/accuracy?symbol=$$SYMBOL&lookback_days=30"; \
+	test_endpoint "/api/signals/history?symbol=$$SYMBOL&limit=20"; \
 	test_endpoint "/api/signals/vol-expansion?symbol=$$SYMBOL"; \
-	test_endpoint "/api/signals/vol-expansion/accuracy?symbol=$$SYMBOL&lookback_days=30"; \
 	test_endpoint "/api/signals/position-optimizer?symbol=$$SYMBOL"; \
-	test_endpoint "/api/signals/position-optimizer/accuracy?symbol=$$SYMBOL&lookback_days=30"; \
 	echo ""; \
 	echo "$(BLUE)=== API Test Report ===$(NC)"; \
 	echo "$(GREEN)Passed: $$PASSED$(NC)"; \
