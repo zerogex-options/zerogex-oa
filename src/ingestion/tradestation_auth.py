@@ -160,6 +160,7 @@ class TradeStationAuth:
 
             # Parse JSON response
             data = response.json()
+            logger.debug(f"Response: {data}")
 
             # Pull access token from JSON response
             # Access tokens have a 20-minute lifetime

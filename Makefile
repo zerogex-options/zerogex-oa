@@ -232,7 +232,6 @@ help: ## Show this help message
 	@echo ""
 	@echo "$(GREEN)Underlying Quotes:$(NC)"
 	@echo "  make underlying         - Last 10 underlying bars"
-	@echo "  make underlying-latest  - Latest underlying bar"
 	@echo "  make underlying-live    - Live latest underlying row (1s refresh, overwrite)"
 	@echo "  make underlying-live-raw - Live latest underlying row (raw values, 1s refresh)"
 	@echo "  make underlying-today   - Today's underlying bars"
@@ -744,19 +743,6 @@ underlying: ## Last 10 underlying bars
 		FROM underlying_quotes \
 		ORDER BY timestamp DESC \
 		LIMIT 10;"
-
-.PHONY: underlying-latest
-underlying-latest: ## Latest underlying bar
-	@$(PSQL) -c "\
-		SELECT \
-			symbol, \
-			timestamp AT TIME ZONE 'America/New_York' as time_et, \
-			open, high, low, close, \
-			up_volume, down_volume, \
-			ROUND((up_volume::numeric / (up_volume + down_volume) * 100), 1) as buying_pressure_pct \
-		FROM underlying_quotes \
-		ORDER BY timestamp DESC \
-		LIMIT 1;"
 
 .PHONY: underlying-live
 underlying-live: ## Live latest underlying row (default SPY) refreshed every second in-place
