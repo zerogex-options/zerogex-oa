@@ -7,11 +7,13 @@ src/analytics modules.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
 from src.database import db_connection
+from src.signals.position_optimizer_engine import PositionOptimizerContext, PositionOptimizerEngine
 from src.symbols import get_canonical_symbol
 from src.utils import get_logger
 
@@ -33,6 +35,7 @@ class UnifiedSignalEngine:
         self.underlying = underlying.upper()
         self.db_symbol = get_canonical_symbol(self.underlying)
         self.trigger_threshold = 0.58
+        self.position_optimizer = PositionOptimizerEngine(self.underlying)
 
     def _fetch_market_context(self) -> Optional[dict]:
         with db_connection() as conn:
@@ -225,13 +228,191 @@ class UnifiedSignalEngine:
                 "option_type": opt_type,
             }
 
+    @staticmethod
+    def _infer_signal_strength(normalized_score: float) -> str:
+        if normalized_score >= 0.82:
+            return "high"
+        if normalized_score >= 0.64:
+            return "medium"
+        return "low"
+
+    @staticmethod
+    def _infer_signal_timeframe(normalized_score: float) -> str:
+        if normalized_score >= 0.84:
+            return "intraday"
+        if normalized_score >= 0.68:
+            return "swing"
+        return "multi_day"
+
+    def _fetch_optimizer_snapshot_rows(self, as_of: datetime, timeframe: str) -> tuple[list[dict], int, int]:
+        # Keep defaults in sync with optimizer module constants.
+        dte_min, dte_max = (1, 7)
+        if timeframe == "intraday":
+            dte_min, dte_max = (0, 2)
+        elif timeframe == "swing":
+            dte_min, dte_max = (1, 7)
+        elif timeframe == "multi_day":
+            dte_min, dte_max = (3, 14)
+
+        with db_connection() as conn:
+            cur = conn.cursor()
+            trade_date = as_of.date()
+            cur.execute(
+                """
+                SELECT timestamp
+                FROM option_chains
+                WHERE underlying = %s
+                  AND timestamp <= %s
+                  AND expiration BETWEEN (%s::date + (%s * INTERVAL '1 day'))
+                                      AND (%s::date + (%s * INTERVAL '1 day'))
+                  AND (
+                      (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
+                      OR (last IS NOT NULL AND last > 0)
+                  )
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                (self.db_symbol, as_of, trade_date, dte_min, trade_date, dte_max),
+            )
+            snapshot_row = cur.fetchone()
+            snapshot_ts = snapshot_row[0] if snapshot_row else None
+            if not snapshot_ts:
+                return [], dte_min, dte_max
+
+            cur.execute(
+                """
+                SELECT expiration, strike, option_type, bid, ask, last, delta, gamma, theta,
+                       implied_volatility, volume, open_interest
+                FROM option_chains
+                WHERE underlying = %s
+                  AND timestamp = %s
+                  AND expiration BETWEEN (%s::date + (%s * INTERVAL '1 day'))
+                                      AND (%s::date + (%s * INTERVAL '1 day'))
+                  AND (
+                      (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
+                      OR (last IS NOT NULL AND last > 0)
+                  )
+                ORDER BY expiration, option_type, strike
+                """,
+                (self.db_symbol, snapshot_ts, trade_date, dte_min, trade_date, dte_max),
+            )
+            rows = cur.fetchall()
+            option_rows = [
+                {
+                    "expiration": row[0],
+                    "strike": float(row[1]),
+                    "option_type": row[2],
+                    "bid": float(row[3] or 0.0),
+                    "ask": float(row[4] or 0.0),
+                    "last": float(row[5] or 0.0),
+                    "delta": float(row[6] or 0.0),
+                    "gamma": float(row[7] or 0.0),
+                    "theta": float(row[8] or 0.0),
+                    "iv": float(row[9] or 0.0),
+                    "volume": int(row[10] or 0),
+                    "open_interest": int(row[11] or 0),
+                }
+                for row in rows
+            ]
+            return option_rows, dte_min, dte_max
+
+    @staticmethod
+    def _legs_from_candidate(candidate: dict) -> list[dict]:
+        strikes = candidate.get("strikes", "")
+        strategy = candidate.get("strategy_type")
+        expiry = candidate.get("expiry")
+        parts = [float(p) for p in re.findall(r"(\d+(?:\.\d+)?)", strikes)]
+        if strategy == "bull_call_debit" and len(parts) >= 2:
+            return [
+                {"side": "long", "option_type": "C", "strike": parts[0], "expiry": expiry},
+                {"side": "short", "option_type": "C", "strike": parts[1], "expiry": expiry},
+            ]
+        if strategy == "bear_put_debit" and len(parts) >= 2:
+            return [
+                {"side": "long", "option_type": "P", "strike": parts[0], "expiry": expiry},
+                {"side": "short", "option_type": "P", "strike": parts[1], "expiry": expiry},
+            ]
+        if strategy == "bull_put_credit" and len(parts) >= 2:
+            return [
+                {"side": "short", "option_type": "P", "strike": parts[0], "expiry": expiry},
+                {"side": "long", "option_type": "P", "strike": parts[1], "expiry": expiry},
+            ]
+        if strategy == "bear_call_credit" and len(parts) >= 2:
+            return [
+                {"side": "short", "option_type": "C", "strike": parts[0], "expiry": expiry},
+                {"side": "long", "option_type": "C", "strike": parts[1], "expiry": expiry},
+            ]
+        if strategy == "iron_condor" and len(parts) >= 4:
+            return [
+                {"side": "short", "option_type": "P", "strike": parts[0], "expiry": expiry},
+                {"side": "short", "option_type": "C", "strike": parts[1], "expiry": expiry},
+                {"side": "long", "option_type": "P", "strike": parts[2], "expiry": expiry},
+                {"side": "long", "option_type": "C", "strike": parts[3], "expiry": expiry},
+            ]
+        return []
+
+    def _resolve_option_symbol_for_leg(self, as_of: datetime, leg: dict) -> Optional[str]:
+        with db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT option_symbol
+                FROM option_chains
+                WHERE underlying = %s
+                  AND timestamp <= %s
+                  AND expiration = %s
+                  AND option_type = %s
+                  AND ABS(strike - %s) < 0.01
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                (self.db_symbol, as_of, leg["expiry"], leg["option_type"], leg["strike"]),
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def _select_optimizer_candidate(self, score: ScoreSnapshot, ctx: dict) -> Optional[dict]:
+        signal_timeframe = self._infer_signal_timeframe(score.normalized_score)
+        signal_strength = self._infer_signal_strength(score.normalized_score)
+        option_rows, dte_min, dte_max = self._fetch_optimizer_snapshot_rows(score.timestamp, signal_timeframe)
+        if not option_rows:
+            return None
+        optimizer_ctx = PositionOptimizerContext(
+            timestamp=score.timestamp,
+            signal_timestamp=score.timestamp,
+            signal_timeframe=signal_timeframe,
+            signal_direction=score.direction,
+            signal_strength=signal_strength,
+            trade_type="trend_follow" if score.direction != "neutral" else "range",
+            current_price=ctx["close"],
+            net_gex=ctx["net_gex"],
+            gamma_flip=ctx["gamma_flip"],
+            put_call_ratio=ctx["put_call_ratio"],
+            max_pain=ctx["max_pain"],
+            smart_call_premium=ctx["smart_call"],
+            smart_put_premium=ctx["smart_put"],
+            dealer_net_delta=0.0,
+            target_dte_min=dte_min,
+            target_dte_max=dte_max,
+            option_rows=option_rows,
+        )
+        candidates = self.position_optimizer._generate_candidates(optimizer_ctx)
+        if not candidates:
+            return None
+        for candidate in candidates:
+            profiles = {p.profile: p for p in candidate.sizing_profiles}
+            optimal = profiles.get("optimal")
+            if optimal and optimal.contracts > 0:
+                return {"candidate": candidate, "signal_timeframe": signal_timeframe, "signal_strength": signal_strength}
+        return None
+
     def _fetch_open_trades(self) -> list[dict]:
         with db_connection() as conn:
             cur = conn.cursor()
             cur.execute(
                 """
                 SELECT id, option_symbol, entry_price, current_price, quantity_open,
-                       quantity_initial, status, direction, realized_pnl
+                       quantity_initial, status, direction, realized_pnl, components_at_entry
                 FROM signal_trades
                 WHERE underlying = %s
                   AND status = 'open'
@@ -251,6 +432,7 @@ class UnifiedSignalEngine:
                     "status": r[6],
                     "direction": r[7],
                     "realized_pnl": float(r[8] or 0.0),
+                    "components_at_entry": r[9] or {},
                 }
                 for r in rows
             ]
@@ -272,15 +454,70 @@ class UnifiedSignalEngine:
             row = cur.fetchone()
             return float(row[0]) if row and row[0] is not None else None
 
-    def _open_trade(self, score: ScoreSnapshot, spot: float) -> bool:
+    def _open_trade(self, score: ScoreSnapshot, market_ctx: dict) -> bool:
         if score.direction == "neutral" or score.normalized_score < self.trigger_threshold:
             return False
 
-        contract = self._select_contract(score.timestamp, score.direction, spot)
-        if not contract:
-            return False
+        selected = None
+        spot = float(market_ctx["close"])
+        optimizer_pick = self._select_optimizer_candidate(score, market_ctx)
+        if optimizer_pick:
+            candidate = optimizer_pick["candidate"]
+            sizing = next((p for p in candidate.sizing_profiles if p.profile == "optimal"), None)
+            if sizing and sizing.contracts > 0:
+                entry_price = (candidate.entry_debit or candidate.entry_credit) / 100.0
+                opt_type = "C" if score.direction == "bullish" else "P"
+                legs = self._legs_from_candidate(
+                    {
+                        "strategy_type": candidate.strategy_type,
+                        "strikes": candidate.strikes,
+                        "expiry": candidate.expiry,
+                    }
+                )
+                enriched_legs = []
+                for leg in legs:
+                    option_symbol = self._resolve_option_symbol_for_leg(score.timestamp, leg)
+                    enriched_legs.append({**leg, "option_symbol": option_symbol})
+                selected = {
+                    "option_symbol": enriched_legs[0]["option_symbol"] if enriched_legs else f"{self.db_symbol}-SYNTHETIC",
+                    "expiration": candidate.expiry,
+                    "strike": round(spot, 4),
+                    "entry_mark": entry_price,
+                    "option_type": opt_type,
+                    "quantity": int(sizing.contracts),
+                    "optimizer_payload": {
+                        "strategy_type": candidate.strategy_type,
+                        "pricing_mode": "debit" if candidate.entry_debit > 0 else "credit",
+                        "strikes": candidate.strikes,
+                        "expiry": str(candidate.expiry),
+                        "legs": enriched_legs,
+                        "probability_of_profit": candidate.probability_of_profit,
+                        "expected_value": candidate.expected_value,
+                        "signal_timeframe": optimizer_pick["signal_timeframe"],
+                        "signal_strength": optimizer_pick["signal_strength"],
+                    },
+                }
+        if not selected:
+            contract = self._select_contract(score.timestamp, score.direction, spot)
+            if not contract:
+                return False
+            selected = {
+                **contract,
+                "quantity": 1,
+                "optimizer_payload": {
+                    "strategy_type": "single_leg_fallback",
+                    "pricing_mode": "single_leg",
+                    "strikes": str(contract["strike"]),
+                    "expiry": str(contract["expiration"]),
+                    "legs": [{"side": "long", "option_type": contract["option_type"], "strike": contract["strike"], "option_symbol": contract["option_symbol"], "expiry": str(contract["expiration"])}],
+                    "probability_of_profit": None,
+                    "expected_value": None,
+                },
+            }
 
-        quantity = 1
+        quantity = selected["quantity"]
+        components_at_entry = dict(score.components)
+        components_at_entry["optimizer"] = selected["optimizer_payload"]
         with db_connection() as conn:
             cur = conn.cursor()
             cur.execute(
@@ -306,22 +543,42 @@ class UnifiedSignalEngine:
                     score.timestamp,
                     score.direction,
                     score.composite_score,
-                    contract["option_symbol"],
-                    contract["option_type"],
-                    contract["expiration"],
-                    contract["strike"],
-                    contract["entry_mark"],
-                    contract["entry_mark"],
+                    selected["option_symbol"],
+                    selected["option_type"],
+                    selected["expiration"],
+                    selected["strike"],
+                    selected["entry_mark"],
+                    selected["entry_mark"],
                     quantity,
                     quantity,
-                    json.dumps(score.components, default=str),
+                    json.dumps(components_at_entry, default=str),
                 ),
             )
             conn.commit()
             return cur.rowcount > 0
 
+    def _latest_trade_mark(self, trade: dict, as_of: datetime) -> Optional[float]:
+        meta = trade.get("components_at_entry") or {}
+        optimizer_meta = meta.get("optimizer") if isinstance(meta, dict) else None
+        legs = optimizer_meta.get("legs") if isinstance(optimizer_meta, dict) else None
+        pricing_mode = optimizer_meta.get("pricing_mode") if isinstance(optimizer_meta, dict) else None
+        if legs and pricing_mode in {"debit", "credit"}:
+            total = 0.0
+            for leg in legs:
+                option_symbol = leg.get("option_symbol")
+                if not option_symbol:
+                    return self._latest_option_mark(trade["option_symbol"], as_of)
+                leg_mark = self._latest_option_mark(option_symbol, as_of)
+                if leg_mark is None:
+                    return self._latest_option_mark(trade["option_symbol"], as_of)
+                total += leg_mark if leg.get("side") == "long" else -leg_mark
+            if pricing_mode == "credit":
+                total = -total
+            return max(total, 0.0)
+        return self._latest_option_mark(trade["option_symbol"], as_of)
+
     def _update_open_trade(self, trade: dict, score: ScoreSnapshot) -> None:
-        mark = self._latest_option_mark(trade["option_symbol"], score.timestamp)
+        mark = self._latest_trade_mark(trade, score.timestamp)
         if mark is None:
             return
 
@@ -415,7 +672,7 @@ class UnifiedSignalEngine:
         for trade in open_trades:
             self._update_open_trade(trade, score)
 
-        opened = self._open_trade(score, ctx["close"])
+        opened = self._open_trade(score, ctx)
         logger.info(
             "UnifiedSignalEngine [%s] score=%.3f norm=%.3f dir=%s open_trades=%d opened_new=%s",
             self.db_symbol,
