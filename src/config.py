@@ -160,6 +160,14 @@ VOL_AUTO_TUNE_MIN_SAMPLES = max(
     50, int(os.getenv("VOL_AUTO_TUNE_MIN_SAMPLES", "250"))
 )
 
+
+# =============================================================================
+# Signals Engine Configuration
+# =============================================================================
+
+SIGNALS_UNDERLYINGS = os.getenv("SIGNALS_UNDERLYINGS", "SPY")
+SIGNALS_PORTFOLIO_SIZE = float(os.getenv("SIGNALS_PORTFOLIO_SIZE", "1000000"))
+
 # =============================================================================
 # Ingestion Parity Guard
 # =============================================================================
@@ -206,6 +214,10 @@ def get_all_config() -> Dict[str, Any]:
         "auth": {
             "refresh_buffer_seconds": TS_REFRESH_BUFFER_SECONDS,
             "min_force_refresh_interval_seconds": TS_MIN_FORCE_REFRESH_INTERVAL_SECONDS,
+        },
+        "signals": {
+            "underlyings": SIGNALS_UNDERLYINGS,
+            "portfolio_size": SIGNALS_PORTFOLIO_SIZE,
         },
     }
 

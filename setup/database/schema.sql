@@ -860,3 +860,118 @@ BEGIN
         FOREIGN KEY (underlying) REFERENCES symbols(symbol) ON DELETE CASCADE;
     END IF;
 END $$;
+
+-- signal_engine_trade_ideas
+-- Proprietary trade lifecycle records managed by standalone Signal Engine service.
+
+CREATE TABLE IF NOT EXISTS signal_engine_trade_ideas (
+    id                  BIGSERIAL PRIMARY KEY,
+    underlying          VARCHAR(20)   NOT NULL,
+    signal_timestamp    TIMESTAMPTZ   NOT NULL,
+    timestamp           TIMESTAMPTZ   NOT NULL,
+    status              VARCHAR(40)   NOT NULL CHECK (
+        status IN (
+            'ready_to_trigger',
+            'position_open',
+            'partial_take_profit',
+            'stopped_out',
+            'target_fully_hit',
+            'closed'
+        )
+    ),
+    signal_timeframe    VARCHAR(20)   NOT NULL CHECK (signal_timeframe IN ('intraday', 'swing', 'multi_day')),
+    signal_direction    VARCHAR(10)   NOT NULL CHECK (signal_direction IN ('bullish', 'bearish', 'neutral')),
+    strategy_type       VARCHAR(40)   NOT NULL,
+    expiry              DATE          NOT NULL,
+    strikes             VARCHAR(120)  NOT NULL,
+    contracts           INTEGER       NOT NULL,
+    entry_price         NUMERIC(18, 6) NOT NULL,
+    current_mark        NUMERIC(18, 6) NOT NULL,
+    stop_price          NUMERIC(18, 6) NOT NULL,
+    target_1            NUMERIC(18, 6) NOT NULL,
+    target_2            NUMERIC(18, 6) NOT NULL,
+    realized_pnl        NUMERIC(18, 6) NOT NULL DEFAULT 0,
+    unrealized_pnl      NUMERIC(18, 6) NOT NULL DEFAULT 0,
+    total_pnl           NUMERIC(18, 6) NOT NULL DEFAULT 0,
+    trade_cost          NUMERIC(18, 6) NOT NULL,
+    notes               TEXT          NOT NULL DEFAULT '',
+    updated_at          TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    created_at          TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_engine_trade_ideas_underlying_ts
+    ON signal_engine_trade_ideas(underlying, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_signal_engine_trade_ideas_status
+    ON signal_engine_trade_ideas(status, timestamp DESC);
+
+-- consolidated_trade_signals
+-- Single unified signal stream combining trade, volatility expansion, and optimizer logic.
+
+CREATE TABLE IF NOT EXISTS consolidated_trade_signals (
+    underlying              VARCHAR(20)   NOT NULL,
+    timestamp               TIMESTAMPTZ   NOT NULL,
+    timeframe               VARCHAR(20)   NOT NULL CHECK (timeframe IN ('intraday', 'swing', 'multi_day')),
+    composite_score         NUMERIC(12, 4) NOT NULL,
+    normalized_score        NUMERIC(8, 4)  NOT NULL,
+    direction               VARCHAR(10)   NOT NULL CHECK (direction IN ('bullish', 'bearish', 'neutral')),
+    strength                VARCHAR(10)   NOT NULL CHECK (strength IN ('high', 'medium', 'low')),
+    estimated_win_pct       NUMERIC(6, 4),
+    trade_type              VARCHAR(40)   NOT NULL,
+    trade_rationale         TEXT          NOT NULL,
+    target_expiry           VARCHAR(20),
+    suggested_strikes       VARCHAR(120),
+    current_price           NUMERIC(18, 6) NOT NULL,
+    net_gex                 NUMERIC(18, 2),
+    gamma_flip              NUMERIC(18, 6),
+    put_call_ratio          NUMERIC(12, 6),
+    dealer_net_delta        NUMERIC(18, 2),
+    vwap_deviation_pct      NUMERIC(10, 4),
+    move_probability        NUMERIC(8, 4),
+    expected_magnitude_pct  NUMERIC(8, 4),
+    top_strategy_type       VARCHAR(40),
+    top_candidate           JSONB         NOT NULL DEFAULT '{}'::jsonb,
+    components              JSONB         NOT NULL DEFAULT '{}'::jsonb,
+    updated_at              TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    created_at              TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (underlying, timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_consolidated_trade_signals_underlying_ts
+    ON consolidated_trade_signals(underlying, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_consolidated_trade_signals_tf
+    ON consolidated_trade_signals(timeframe, timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS consolidated_signal_accuracy (
+    underlying       VARCHAR(20)    NOT NULL,
+    trade_date       DATE           NOT NULL,
+    timeframe        VARCHAR(20)    NOT NULL CHECK (timeframe IN ('intraday', 'swing', 'multi_day')),
+    strength_bucket  VARCHAR(10)    NOT NULL CHECK (strength_bucket IN ('high', 'medium', 'low')),
+    total_signals    INTEGER        NOT NULL DEFAULT 0,
+    correct_signals  INTEGER        NOT NULL DEFAULT 0,
+    win_pct          NUMERIC(6, 4),
+    updated_at       TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+    created_at       TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (underlying, trade_date, timeframe, strength_bucket)
+);
+
+CREATE INDEX IF NOT EXISTS idx_consolidated_signal_accuracy_underlying_date
+    ON consolidated_signal_accuracy(underlying, trade_date DESC);
+
+CREATE TABLE IF NOT EXISTS consolidated_position_accuracy (
+    underlying                VARCHAR(20)   NOT NULL,
+    trade_date                DATE          NOT NULL,
+    signal_direction          VARCHAR(10)   NOT NULL CHECK (signal_direction IN ('bullish', 'bearish', 'neutral')),
+    strategy_type             VARCHAR(40)   NOT NULL,
+    total_signals             INTEGER       NOT NULL DEFAULT 0,
+    profitable_signals        INTEGER       NOT NULL DEFAULT 0,
+    avg_realized_return_pct   NUMERIC(8, 4),
+    avg_expected_value        NUMERIC(12, 4),
+    avg_predicted_pop         NUMERIC(8, 4),
+    avg_realized_move_pct     NUMERIC(8, 4),
+    updated_at                TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    created_at                TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (underlying, trade_date, signal_direction, strategy_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_consolidated_position_accuracy_underlying_date
+    ON consolidated_position_accuracy(underlying, trade_date DESC);
