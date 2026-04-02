@@ -288,6 +288,7 @@ help: ## Show this help message
 	@echo "$(GREEN)Signals:$(NC)"
 	@echo "  make signals                  - Latest consolidated signal snapshot"
 	@echo "  make signals-detail           - Full consolidated signal detail"
+	@echo "  make signals-raw              - Raw latest rows from consolidated_trade_signals"
 	@echo "  make signals-components       - Consolidated component-group breakdown"
 	@echo "  make signals-exhaustion       - Latest ZeroGEX Exhaustion from consolidated payload"
 	@echo "  make signals-history          - Managed trade history with outcomes + P&L"
@@ -1666,6 +1667,13 @@ signals: ## Latest consolidated signal snapshot (default: SPY, override: make si
 signals-detail: ## Full consolidated signal detail (usage: make signals-detail FLOW_SYMBOL=QQQ)
 	@echo "$(BLUE)=== Consolidated Signal Detail ($(FLOW_SYMBOL)) ===$(NC)"
 	@$(PSQL) -c "		SELECT 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI:SS') AS time_et, 			timeframe, direction, strength, composite_score, normalized_score, 			estimated_win_pct, trade_type, trade_rationale, target_expiry, suggested_strikes, 			ROUND(current_price::numeric, 2) AS current_price, 			ROUND(net_gex::numeric, 0) AS net_gex, 			ROUND(gamma_flip::numeric, 2) AS gamma_flip, 			ROUND(put_call_ratio::numeric, 3) AS pcr, 			ROUND(dealer_net_delta::numeric, 0) AS dealer_delta, 			ROUND(move_probability::numeric * 100, 1) || '%' AS move_probability, 			top_strategy_type 		FROM consolidated_trade_signals 		WHERE underlying = '$(FLOW_SYMBOL)' 		ORDER BY timestamp DESC 		LIMIT 1;"
+
+
+.PHONY: signals-raw
+signals-raw: ## Raw latest rows from consolidated_trade_signals (usage: make signals-raw FLOW_SYMBOL=QQQ LIMIT=10)
+	@$(eval LIMIT ?= 10)
+	@echo "$(BLUE)=== Raw Consolidated Signal Rows ($(FLOW_SYMBOL), limit=$(LIMIT)) ===$(NC)"
+	@$(PSQL) -c "		SELECT * 		FROM consolidated_trade_signals 		WHERE underlying = '$(FLOW_SYMBOL)' 		ORDER BY timestamp DESC 		LIMIT $(LIMIT);"
 
 .PHONY: signals-components
 signals-components: ## Consolidated signal component groups (trade/vol/position)
