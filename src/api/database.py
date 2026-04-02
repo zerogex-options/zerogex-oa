@@ -131,6 +131,11 @@ class DatabaseManager:
         connect_timeout = float(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "20"))
         min_size = int(os.getenv("DB_POOL_MIN", "2"))
         max_size = int(os.getenv("DB_POOL_MAX", "20"))
+        statement_timeout_ms = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "30000"))
+        ssl_mode = os.getenv("DB_SSLMODE", "").strip().lower()
+        ssl = None
+        if ssl_mode in {"require", "verify-ca", "verify-full"}:
+            ssl = True
         if min_size > max_size:
             min_size = max_size
         return await asyncpg.create_pool(
@@ -144,6 +149,10 @@ class DatabaseManager:
             command_timeout=30,
             max_inactive_connection_lifetime=120,
             timeout=connect_timeout,
+            ssl=ssl,
+            server_settings={
+                "statement_timeout": str(statement_timeout_ms),
+            },
         )
 
     def _load_credentials(self):
@@ -173,14 +182,32 @@ class DatabaseManager:
 
     async def connect(self):
         """Create connection pool"""
-        try:
-            async with self._pool_lock:
-                if not self._pool_is_usable(self.pool):
-                    self.pool = await self._create_pool()
-            logger.info(f"Database pool created: {self.database}@{self.host}")
-        except Exception as e:
-            logger.error("Failed to create database pool: %r", e, exc_info=True)
-            raise
+        retries = int(os.getenv("DB_CONNECT_RETRIES", "5"))
+        retry_base_delay = float(os.getenv("DB_CONNECT_RETRY_DELAY_SECONDS", "1.5"))
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, retries + 1):
+            try:
+                async with self._pool_lock:
+                    if not self._pool_is_usable(self.pool):
+                        self.pool = await self._create_pool()
+                logger.info(f"Database pool created: {self.database}@{self.host}")
+                return
+            except Exception as e:
+                last_error = e
+                logger.error(
+                    "Failed to create database pool (attempt %d/%d): %r",
+                    attempt,
+                    retries,
+                    e,
+                    exc_info=True,
+                )
+                if attempt < retries:
+                    delay = retry_base_delay * attempt
+                    logger.warning("Retrying database pool creation in %.1fs...", delay)
+                    await asyncio.sleep(delay)
+
+        raise RuntimeError(f"Failed to create database pool after {retries} attempts: {last_error}")
 
     async def disconnect(self):
         """Close connection pool"""
@@ -205,6 +232,8 @@ class DatabaseManager:
             token in text
             for token in (
                 "ssl handshake",
+                "ssl syscall error",
+                "eof detected",
                 "connection reset",
                 "connection refused",
                 "connection is closed",

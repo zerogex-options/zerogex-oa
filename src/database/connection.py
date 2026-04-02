@@ -5,6 +5,7 @@ Database connection management for PostgreSQL
 import os
 import psycopg2
 from psycopg2 import pool
+import time
 from typing import Optional
 from contextlib import contextmanager
 from src.database.password_providers import get_db_password
@@ -87,6 +88,10 @@ def _initialize_connection_pool():
     db_user = os.getenv('DB_USER', 'postgres')
     min_connections = int(os.getenv('DB_POOL_MIN', '1'))
     max_connections = int(os.getenv('DB_POOL_MAX', '10'))
+    connect_timeout = int(os.getenv('DB_CONNECT_TIMEOUT_SECONDS', '20'))
+    connect_retries = int(os.getenv('DB_CONNECT_RETRIES', '5'))
+    retry_base_delay = float(os.getenv('DB_CONNECT_RETRY_DELAY_SECONDS', '1.5'))
+    sslmode = os.getenv('DB_SSLMODE', '').strip()
 
     # Get password from configured provider
     # Note: For .pgpass, this returns None (psycopg2 reads .pgpass automatically)
@@ -98,38 +103,74 @@ def _initialize_connection_pool():
 
     logger.info(f"Connecting to PostgreSQL: {db_user}@{db_host}:{db_port}/{db_name}")
 
-    try:
-        # Build connection parameters
-        conn_params = {
-            'minconn': min_connections,
-            'maxconn': max_connections,
-            'host': db_host,
-            'port': db_port,
-            'database': db_name,
-            'user': db_user,
-        }
+    # Build connection parameters
+    conn_params = {
+        'minconn': min_connections,
+        'maxconn': max_connections,
+        'host': db_host,
+        'port': db_port,
+        'database': db_name,
+        'user': db_user,
+        'connect_timeout': connect_timeout,
+        # Improve resilience to stale network links / RDS edge cases.
+        'keepalives': 1,
+        'keepalives_idle': int(os.getenv('DB_KEEPALIVES_IDLE_SECONDS', '30')),
+        'keepalives_interval': int(os.getenv('DB_KEEPALIVES_INTERVAL_SECONDS', '10')),
+        'keepalives_count': int(os.getenv('DB_KEEPALIVES_COUNT', '5')),
+    }
 
-        # Only add password if it's not None (i.e., not using .pgpass)
-        if db_password is not None:
-            conn_params['password'] = db_password
+    # Only add password if it's not None (i.e., not using .pgpass)
+    if db_password is not None:
+        conn_params['password'] = db_password
+    if sslmode:
+        conn_params['sslmode'] = sslmode
 
-        _connection_pool = pool.SimpleConnectionPool(**conn_params)
+    last_error = None
+    for attempt in range(1, connect_retries + 1):
+        try:
+            _connection_pool = pool.SimpleConnectionPool(**conn_params)
 
-        # Test the connection
-        test_conn = _connection_pool.getconn()
-        cursor = test_conn.cursor()
-        cursor.execute("SELECT version();")
-        version = cursor.fetchone()
-        logger.info(f"✅ Connected to PostgreSQL: {version[0][:50]}...")
-        cursor.close()
-        _connection_pool.putconn(test_conn)
+            # Test the connection
+            test_conn = _connection_pool.getconn()
+            cursor = test_conn.cursor()
+            cursor.execute("SELECT version();")
+            version = cursor.fetchone()
+            logger.info(f"✅ Connected to PostgreSQL: {version[0][:50]}...")
+            cursor.close()
+            _connection_pool.putconn(test_conn)
+            return
 
-    except psycopg2.OperationalError as e:
-        logger.error(f"Failed to connect to database: {e}")
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error initializing connection pool: {e}", exc_info=True)
-        raise
+        except psycopg2.OperationalError as e:
+            last_error = e
+            logger.error(
+                "Failed to connect to database (attempt %d/%d): %s",
+                attempt,
+                connect_retries,
+                e,
+            )
+        except Exception as e:
+            last_error = e
+            logger.error(
+                "Unexpected error initializing connection pool (attempt %d/%d): %s",
+                attempt,
+                connect_retries,
+                e,
+                exc_info=True,
+            )
+
+        if _connection_pool is not None:
+            try:
+                _connection_pool.closeall()
+            except Exception:
+                pass
+            _connection_pool = None
+
+        if attempt < connect_retries:
+            delay = retry_base_delay * attempt
+            logger.warning("Retrying database pool initialization in %.1fs...", delay)
+            time.sleep(delay)
+
+    raise last_error
 
 
 def close_connection_pool():
