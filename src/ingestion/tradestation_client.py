@@ -87,9 +87,9 @@ class TradeStationClient:
                 previous_start = self._api_session_window_start
                 previous_end = previous_start + timedelta(minutes=5)
                 logger.info(
-                    "TradeStation HTTPS sessions opened [%s - %s UTC]: %d",
-                    previous_start.isoformat(),
-                    previous_end.isoformat(),
+                    "TradeStation API calls made [%s - %s UTC]: %d",
+                    previous_start.strftime("%H:%M"),
+                    previous_end.strftime("%H:%M"),
                     self._api_session_window_count,
                 )
                 self._api_session_window_start = current_window
@@ -382,9 +382,9 @@ class TradeStationClient:
             window_start = self._api_session_window_start
             window_end = window_start + timedelta(minutes=5)
             logger.info(
-                "TradeStation HTTPS sessions opened [%s - %s UTC]: %d (partial window)",
-                window_start.isoformat(),
-                window_end.isoformat(),
+                "TradeStation API calls made [%s - %s UTC]: %d (partial window)",
+                window_start.strftime("%H:%M"),
+                window_end.strftime("%H:%M"),
                 self._api_session_window_count,
             )
 
