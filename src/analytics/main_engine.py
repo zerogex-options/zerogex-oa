@@ -28,6 +28,7 @@ from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
 from src.config import RISK_FREE_RATE
 from src.symbols import parse_underlyings, get_canonical_symbol
+from src.validation import is_engine_run_window, seconds_until_engine_run_window
 
 logger = get_logger(__name__)
 
@@ -1189,6 +1190,15 @@ class AnalyticsEngine:
 
         try:
             while self.running:
+                if not is_engine_run_window():
+                    sleep_for = seconds_until_engine_run_window()
+                    logger.info(
+                        "AnalyticsEngine [%s] paused outside run window (04:00-20:00 ET weekdays, non-holidays); sleeping %ss",
+                        self.underlying,
+                        sleep_for,
+                    )
+                    time.sleep(max(1, sleep_for))
+                    continue
                 cycle_start = time.time()
 
                 # Run calculation

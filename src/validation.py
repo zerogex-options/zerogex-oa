@@ -2,8 +2,9 @@
 Data validation utilities for API responses and data quality
 """
 
+import os
 from typing import Any, Optional, Union
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import pytz
 from src.utils import get_logger
 
@@ -11,6 +12,24 @@ logger = get_logger(__name__)
 
 # Eastern Time timezone
 ET = pytz.timezone("US/Eastern")
+
+
+def _load_nyse_holidays() -> set[date]:
+    """Load holiday dates from NYSE_HOLIDAYS env var (comma-separated YYYY-MM-DD)."""
+    raw = os.getenv("NYSE_HOLIDAYS", "")
+    holidays: set[date] = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            holidays.add(date.fromisoformat(token))
+        except ValueError:
+            logger.warning("Invalid date in NYSE_HOLIDAYS env var, skipping: %r", token)
+    return holidays
+
+
+NYSE_HOLIDAYS = _load_nyse_holidays()
 
 
 def safe_float(value: Any, default: float = 0.0, field_name: str = "value") -> float:
@@ -248,8 +267,8 @@ def is_market_hours(dt: Optional[datetime] = None, check_extended: bool = False)
         # Convert to ET
         dt = dt.astimezone(ET)
 
-    # Check if weekday (Monday=0, Sunday=6)
-    if dt.weekday() > 4:
+    # Check if weekday (Monday=0, Sunday=6) and not configured market holiday.
+    if dt.weekday() > 4 or dt.date() in NYSE_HOLIDAYS:
         return False
 
     current_time = dt.time()
@@ -283,8 +302,8 @@ def get_market_session(dt: Optional[datetime] = None) -> str:
     else:
         dt = dt.astimezone(ET)
 
-    # Weekend
-    if dt.weekday() > 4:
+    # Weekend / configured holiday
+    if dt.weekday() > 4 or dt.date() in NYSE_HOLIDAYS:
         return "closed"
 
     current_time = dt.time()
@@ -305,3 +324,43 @@ def get_market_session(dt: Optional[datetime] = None) -> str:
         return "after-hours"
     else:
         return "closed"
+
+
+def is_engine_run_window(dt: Optional[datetime] = None) -> bool:
+    """Engines run only 04:00-20:00 ET on weekdays excluding NYSE_HOLIDAYS."""
+    if dt is None:
+        dt = datetime.now(ET)
+    elif dt.tzinfo is None:
+        dt = pytz.UTC.localize(dt).astimezone(ET)
+    else:
+        dt = dt.astimezone(ET)
+
+    if dt.weekday() > 4 or dt.date() in NYSE_HOLIDAYS:
+        return False
+
+    current_time = dt.time()
+    window_open = datetime.strptime("04:00:00", "%H:%M:%S").time()
+    window_close = datetime.strptime("20:00:00", "%H:%M:%S").time()
+    return window_open <= current_time < window_close
+
+
+def seconds_until_engine_run_window(dt: Optional[datetime] = None) -> int:
+    """Seconds until next 04:00 ET run window on a non-holiday weekday."""
+    if dt is None:
+        dt = datetime.now(ET)
+    elif dt.tzinfo is None:
+        dt = pytz.UTC.localize(dt).astimezone(ET)
+    else:
+        dt = dt.astimezone(ET)
+
+    if is_engine_run_window(dt):
+        return 0
+
+    same_day_open = dt.replace(hour=4, minute=0, second=0, microsecond=0)
+    if dt.weekday() <= 4 and dt.date() not in NYSE_HOLIDAYS and dt < same_day_open:
+        return max(int((same_day_open - dt).total_seconds()), 1)
+
+    next_open = (dt + timedelta(days=1)).replace(hour=4, minute=0, second=0, microsecond=0)
+    while next_open.weekday() > 4 or next_open.date() in NYSE_HOLIDAYS:
+        next_open += timedelta(days=1)
+    return max(int((next_open - dt).total_seconds()), 1)

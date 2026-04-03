@@ -15,6 +15,7 @@ from src.config import SIGNALS_UNDERLYINGS
 from src.signals.unified_signal_engine import UnifiedSignalEngine
 from src.symbols import parse_underlyings
 from src.utils import get_logger
+from src.validation import is_engine_run_window, seconds_until_engine_run_window
 
 logger = get_logger(__name__)
 
@@ -49,6 +50,15 @@ class SignalEngineService:
             self.interval_seconds,
         )
         while self.running:
+            if not is_engine_run_window():
+                sleep_for = seconds_until_engine_run_window()
+                logger.info(
+                    "SignalEngineService [%s] paused outside run window (04:00-20:00 ET weekdays, non-holidays); sleeping %ss",
+                    self.underlying,
+                    sleep_for,
+                )
+                time.sleep(max(1, sleep_for))
+                continue
             started = time.time()
             try:
                 self.run_cycle()

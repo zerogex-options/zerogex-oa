@@ -14,6 +14,7 @@ import signal
 import sys
 import hashlib
 import json
+import time
 import time as _time
 from multiprocessing import Process
 from datetime import datetime
@@ -27,7 +28,7 @@ from src.ingestion.stream_manager import StreamManager
 from src.ingestion.greeks_calculator import GreeksCalculator
 from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
-from src.validation import bucket_timestamp
+from src.validation import bucket_timestamp, is_engine_run_window, seconds_until_engine_run_window
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.config import (
     AGGREGATION_BUCKET_SECONDS,
@@ -819,6 +820,9 @@ class IngestionEngine:
 
     def run_streaming(self):
         """Run streaming phase"""
+        if not is_engine_run_window():
+            logger.info("Skipping stream start outside configured run window")
+            return True
         logger.info("="*80)
         logger.info("STREAMING PHASE")
         logger.info("="*80)
@@ -840,9 +844,15 @@ class IngestionEngine:
 
         self.running = True
 
+        window_closed = False
         try:
             for item in stream_manager.stream(max_iterations=None):
                 if not self.running:
+                    break
+                if not is_engine_run_window():
+                    logger.info("Run window closed; stopping active streams until next run window")
+                    window_closed = True
+                    self.running = False
                     break
 
                 if item["type"] == "underlying":
@@ -866,6 +876,7 @@ class IngestionEngine:
             except Exception as e:
                 logger.warning(f"Error closing TradeStation streams: {e}")
             logger.info("Streaming stopped")
+        return window_closed
 
     def run(self):
         """Run forward-only ingestion pipeline"""
@@ -880,9 +891,27 @@ class IngestionEngine:
         logger.info("NOTE: This engine streams forward-looking data.")
         logger.info("="*80 + "\n")
 
+        self.running = True
         try:
-            # Run streaming
-            self.run_streaming()
+            while self.running:
+                if not is_engine_run_window():
+                    sleep_for = seconds_until_engine_run_window()
+                    logger.info(
+                        "IngestionEngine [%s] paused outside run window (04:00-20:00 ET weekdays, non-holidays); sleeping %ss",
+                        self.underlying,
+                        sleep_for,
+                    )
+                    time.sleep(max(1, sleep_for))
+                    continue
+
+                window_closed = self.run_streaming()
+                if not self.running:
+                    if window_closed:
+                        # run_streaming intentionally sets running=False when window closes;
+                        # restore loop sentinel so scheduler can sleep and resume next window.
+                        self.running = True
+                    else:
+                        break
 
         except Exception as e:
             logger.error(f"Fatal error in main engine: {e}", exc_info=True)
