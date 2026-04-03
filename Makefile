@@ -334,7 +334,7 @@ help: ## Show this help message
 	@echo "  make db-tail-trade-signals        - Last 20 rows from trade_signals"
 	@echo "  make db-tail-signals-accuracy      - Last 20 rows from signal_accuracy"
 	@echo "  make db-tail-vol-expansion-signals  - Last 20 rows from volatility_expansion_signals"
-	@echo "  make db-tail-vol-expansion-accuracy - Last 20 rows from vol_expansion_accuracy"
+	@echo "  make db-tail-vol_expansion_signals  - Last 10 rows from volatility_expansion_signals"
 	@echo "  make db-tail-position-optimizer-signals - Last 20 rows from position_optimizer_signals"
 	@echo "  make db-tail-position-optimizer-accuracy - Last 20 rows from position_optimizer_accuracy"
 	@echo "  make db-diagnostics               - DB diagnostics (sessions, locks, waits, slow queries)"
@@ -1696,9 +1696,14 @@ signals-score-history: ## Score history from DB
 	@$(PSQL) -c "SELECT underlying, timestamp AT TIME ZONE 'America/New_York' AS time_et, direction, composite_score, normalized_score FROM signal_scores WHERE underlying='$(FLOW_SYMBOL)' ORDER BY timestamp DESC LIMIT $(LIMIT);"
 
 .PHONY: signals-vol-expansion
-signals-vol-expansion: ## Vol-expansion component from latest score payload
-	@echo "$(BLUE)=== Vol Expansion Component ($(FLOW_SYMBOL)) ===$(NC)"
-	@$(PSQL) -c "SELECT underlying, timestamp AT TIME ZONE 'America/New_York' AS time_et, direction, components->'vol_expansion' AS vol_expansion FROM signal_scores WHERE underlying='$(FLOW_SYMBOL)' ORDER BY timestamp DESC LIMIT 1;"
+signals-vol-expansion: ## Latest volatility-expansion signal summary row
+	@echo "$(BLUE)=== Volatility Expansion Signal ($(FLOW_SYMBOL)) ===$(NC)"
+	@$(PSQL) -c "SELECT underlying, timestamp, normalized_score, move_probability, expected_direction, expected_magnitude_pct, confidence, catalyst_type, time_horizon, strategy_type FROM volatility_expansion_signals WHERE underlying='$(FLOW_SYMBOL)' ORDER BY timestamp DESC LIMIT 1;"
+
+.PHONY: db-tail-vol_expansion_signals
+db-tail-vol_expansion_signals: ## Show 10 most recent rows from volatility_expansion_signals
+	@echo "$(BLUE)=== volatility_expansion_signals (last 10) ===$(NC)"
+	@$(PSQL) -c "SELECT * FROM volatility_expansion_signals ORDER BY timestamp DESC LIMIT 10;"
 
 # =============================================================================
 # Signal Engine — Logs
@@ -1718,10 +1723,10 @@ api-test-signals: ## Test active /api/signals endpoints
 	@echo "$(BLUE)=== Testing /api/signals Endpoints ===$(NC)"
 	@echo ""
 	@echo "$(GREEN)Live Signals/Trades:$(NC)"
-	@curl -s "http://localhost:8000/api/signals/live" | python3 -m json.tool
+	@curl -s "http://localhost:8000/api/signals/trades-live" | python3 -m json.tool
 	@echo ""
 	@echo "$(GREEN)History:$(NC)"
-	@curl -s "http://localhost:8000/api/signals/history?limit=20" | python3 -m json.tool
+	@curl -s "http://localhost:8000/api/signals/trades-history?limit=20" | python3 -m json.tool
 	@echo ""
 	@echo "$(GREEN)Latest Score:$(NC)"
 	@curl -s "http://localhost:8000/api/signals/score?underlying=SPY" | python3 -m json.tool
@@ -1734,8 +1739,8 @@ api-test-vol-signals: ## Test /api/signals/vol-expansion endpoint
 .PHONY: api-test-signals-summary
 api-test-signals-summary: ## Quick one-liner status for trade + history summary
 	@echo "$(BLUE)=== Signals Summary ===$(NC)"
-	@curl -s "http://localhost:8000/api/signals/live" 2>/dev/null 		| python3 -c 'import sys,json; d=json.load(sys.stdin); print(f"open_trades={d.get('count')}")' 		|| echo "(no live data yet)"
-	@curl -s "http://localhost:8000/api/signals/history?limit=50" 2>/dev/null 		| python3 -c 'import sys,json; d=json.load(sys.stdin); s=d.get("summary",{}); print(f"trades={s.get('total_trades')} wins={s.get('wins')} losses={s.get('losses')} total_pnl={s.get('total_pnl')}")' 		|| echo "(no history data yet)"
+	@curl -s "http://localhost:8000/api/signals/trades-live" 2>/dev/null 		| python3 -c 'import sys,json; d=json.load(sys.stdin); print(f"open_trades={d.get('count')}")' 		|| echo "(no live data yet)"
+	@curl -s "http://localhost:8000/api/signals/trades-history?limit=50" 2>/dev/null 		| python3 -c 'import sys,json; d=json.load(sys.stdin); s=d.get("summary",{}); print(f"trades={s.get('total_trades')} wins={s.get('wins')} losses={s.get('losses')} total_pnl={s.get('total_pnl')}")' 		|| echo "(no history data yet)"
 
 # =============================================================================
 # Data Quality
@@ -2194,8 +2199,8 @@ api-test: ## Test ALL API endpoints
 	test_endpoint "/api/volatility/surface?symbol=$$SYMBOL"; \
 	echo ""; \
 	echo "$(YELLOW)Trade signal endpoints$(NC)"; \
-	test_endpoint "/api/signals/live"; \
-	test_endpoint "/api/signals/history?limit=20"; \
+	test_endpoint "/api/signals/trades-live"; \
+	test_endpoint "/api/signals/trades-history?limit=20"; \
 	test_endpoint "/api/signals/score?underlying=$$SYMBOL"; \
 	test_endpoint "/api/signals/score-history?underlying=$$SYMBOL&limit=20"; \
 	test_endpoint "/api/signals/vol-expansion?symbol=$$SYMBOL"; \
