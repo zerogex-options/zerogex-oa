@@ -9,7 +9,7 @@ import argparse
 import json
 import os
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import Optional
 
 import pytz
@@ -109,16 +109,6 @@ class VolExpansionSignal:
 
 
 @dataclass
-class AccuracySnapshot:
-    move_threshold_pct: float
-    actual_move_pct: float
-    actual_direction: str
-    hit_large_move: bool
-    direction_correct: bool
-    magnitude_bucket: str
-
-
-@dataclass
 class VolThresholds:
     smart_money_ratio: float = VOL_SMART_MONEY_DOMINANCE_RATIO
     deep_negative_gex: float = VOL_GAMMA_DEEP_NEGATIVE
@@ -132,7 +122,6 @@ class VolExpansionEngine:
     def __init__(self, underlying: str = "SPY"):
         self.underlying = underlying.upper()
         self.db_symbol = get_canonical_symbol(self.underlying)
-        self._last_accuracy_update: Optional[date] = None
         self.auto_tune_enabled = os.getenv("VOL_AUTO_TUNE_ENABLED", "true").lower() == "true"
         self.auto_tune_lookback_days = max(5, int(os.getenv("VOL_AUTO_TUNE_LOOKBACK_DAYS", "30")))
         self.auto_tune_min_samples = max(50, int(os.getenv("VOL_AUTO_TUNE_MIN_SAMPLES", "250")))
@@ -710,27 +699,6 @@ class VolExpansionEngine:
             components=components,
         )
 
-    def _fetch_calibrated_move_probability(self, confidence: str, lookback_days: int = 60) -> Optional[float]:
-        try:
-            with db_connection() as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    SELECT SUM(total_signals), SUM(large_move_hits)
-                    FROM vol_expansion_accuracy
-                    WHERE underlying = %s
-                      AND confidence = %s
-                      AND trade_date >= CURRENT_DATE - %s
-                    """,
-                    (self.db_symbol, confidence, lookback_days),
-                )
-                row = cur.fetchone()
-                if row and row[0] and row[1] is not None:
-                    return round(float(row[1]) / float(row[0]), 4)
-        except Exception as exc:
-            logger.error("_fetch_calibrated_move_probability failed: %s", exc)
-        return None
-
     def _store_signal(self, signal: VolExpansionSignal) -> None:
         components_json = json.dumps([asdict(component) for component in signal.components])
         try:
@@ -807,126 +775,6 @@ class VolExpansionEngine:
         except Exception as exc:
             logger.error("VolExpansionEngine._store_signal failed: %s", exc, exc_info=True)
 
-    def _snapshot_accuracy(self, signal_ts: datetime, move_threshold_pct: float = 0.5) -> Optional[AccuracySnapshot]:
-        trade_date = signal_ts.astimezone(ET).date() if signal_ts.tzinfo else signal_ts.date()
-        next_date = trade_date + timedelta(days=1)
-        try:
-            with db_connection() as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    WITH day_quotes AS (
-                        SELECT close, high, low, timestamp
-                        FROM underlying_quotes
-                        WHERE symbol = %s
-                          AND DATE(timestamp AT TIME ZONE 'America/New_York') = %s
-                    )
-                    SELECT
-                        (SELECT close FROM day_quotes ORDER BY timestamp ASC LIMIT 1) AS open_px,
-                        (SELECT close FROM day_quotes ORDER BY timestamp DESC LIMIT 1) AS close_px,
-                        (SELECT MAX(high) FROM day_quotes) AS day_high,
-                        (SELECT MIN(low) FROM day_quotes) AS day_low
-                    """,
-                    (self.db_symbol, next_date),
-                )
-                row = cur.fetchone()
-                if not row or row[0] is None or row[1] is None:
-                    return None
-                open_px, close_px, day_high, day_low = map(float, row)
-                close_to_close = ((close_px - open_px) / open_px) * 100.0
-                intraday_range = max(abs(day_high - open_px), abs(day_low - open_px)) / open_px * 100.0
-                actual_move_pct = max(abs(close_to_close), intraday_range)
-                actual_direction = "up" if close_to_close > 0 else ("down" if close_to_close < 0 else "neutral")
-                hit_large_move = actual_move_pct >= move_threshold_pct
-                magnitude_bucket = "large" if actual_move_pct >= 0.5 else "small"
-                return AccuracySnapshot(
-                    move_threshold_pct=move_threshold_pct,
-                    actual_move_pct=round(actual_move_pct, 4),
-                    actual_direction=actual_direction,
-                    hit_large_move=hit_large_move,
-                    direction_correct=False,
-                    magnitude_bucket=magnitude_bucket,
-                )
-        except Exception as exc:
-            logger.error("VolExpansionEngine._snapshot_accuracy failed: %s", exc, exc_info=True)
-            return None
-
-    def _update_accuracy(self) -> None:
-        today = datetime.now(ET).date()
-        if self._last_accuracy_update == today:
-            return
-        eval_date = today - timedelta(days=1)
-        try:
-            with db_connection() as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    SELECT timestamp, confidence, expected_direction, catalyst_type, move_probability
-                    FROM volatility_expansion_signals
-                    WHERE underlying = %s
-                      AND DATE(timestamp AT TIME ZONE 'America/New_York') = %s
-                    """,
-                    (self.db_symbol, eval_date),
-                )
-                rows = cur.fetchall()
-                if not rows:
-                    self._last_accuracy_update = today
-                    return
-
-                buckets: dict[tuple[str, str], dict[str, int]] = {}
-                for signal_ts, confidence, expected_direction, catalyst_type, move_probability in rows:
-                    snapshot = self._snapshot_accuracy(signal_ts)
-                    if snapshot is None:
-                        continue
-                    direction_correct = expected_direction in ("neutral", snapshot.actual_direction) or (
-                        expected_direction == snapshot.actual_direction
-                    )
-                    bucket = buckets.setdefault(
-                        (confidence, catalyst_type),
-                        {"total": 0, "large_move_hits": 0, "direction_correct": 0, "prob_sum": 0.0},
-                    )
-                    bucket["total"] += 1
-                    bucket["large_move_hits"] += int(snapshot.hit_large_move)
-                    bucket["direction_correct"] += int(direction_correct)
-                    bucket["prob_sum"] += float(move_probability)
-
-                for (confidence, catalyst_type), stats in buckets.items():
-                    total = stats["total"]
-                    if total == 0:
-                        continue
-                    cur.execute(
-                        """
-                        INSERT INTO vol_expansion_accuracy (
-                            underlying, trade_date, confidence, catalyst_type,
-                            total_signals, large_move_hits, direction_correct_hits,
-                            empirical_move_pct, avg_predicted_probability
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (underlying, trade_date, confidence, catalyst_type)
-                        DO UPDATE SET
-                            total_signals = EXCLUDED.total_signals,
-                            large_move_hits = EXCLUDED.large_move_hits,
-                            direction_correct_hits = EXCLUDED.direction_correct_hits,
-                            empirical_move_pct = EXCLUDED.empirical_move_pct,
-                            avg_predicted_probability = EXCLUDED.avg_predicted_probability,
-                            updated_at = NOW()
-                        """,
-                        (
-                            self.db_symbol,
-                            eval_date,
-                            confidence,
-                            catalyst_type,
-                            total,
-                            stats["large_move_hits"],
-                            stats["direction_correct"],
-                            round(stats["large_move_hits"] / total, 4),
-                            round(stats["prob_sum"] / total, 4),
-                        ),
-                    )
-                conn.commit()
-                self._last_accuracy_update = today
-        except Exception as exc:
-            logger.error("VolExpansionEngine._update_accuracy failed: %s", exc, exc_info=True)
-
     def run_calculation(self) -> bool:
         self._auto_tune_thresholds()
         ctx = self._fetch_context()
@@ -935,14 +783,9 @@ class VolExpansionEngine:
             return False
 
         signal = self.compute_signal(ctx)
-        calibrated = self._fetch_calibrated_move_probability(signal.confidence)
-        if calibrated is not None:
-            signal.move_probability = calibrated
-        else:
-            signal.move_probability = MOVE_PROBABILITY_DEFAULTS.get(signal.confidence, signal.move_probability)
+        signal.move_probability = MOVE_PROBABILITY_DEFAULTS.get(signal.confidence, signal.move_probability)
 
         self._store_signal(signal)
-        self._update_accuracy()
 
         logger.info(
             "✅ Vol expansion [%s] %s | score=%s/%s (%.0f%%) | move_prob=%.0f%% | catalyst=%s | strategy=%s",

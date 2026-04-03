@@ -12,7 +12,7 @@ def get_db() -> DatabaseManager:
     return db_manager
 
 
-@router.get("/history")
+@router.get("/trades-history")
 async def get_signal_history(
     limit: int = Query(default=500, ge=1, le=5000),
     db: DatabaseManager = Depends(get_db),
@@ -32,7 +32,7 @@ async def get_signal_history(
     }
 
 
-@router.get("/live")
+@router.get("/trades-live")
 async def get_live_signals(db: DatabaseManager = Depends(get_db)):
     rows = await db.get_live_signal_trades()
     return {
@@ -71,7 +71,7 @@ async def get_vol_expansion_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
 ):
-    row = await db.get_vol_expansion_from_scores(symbol.upper())
+    row = await db.get_vol_expansion_signal(symbol.upper())
     if not row:
-        raise HTTPException(status_code=404, detail=f"No score rows found for {symbol.upper()}")
+        raise HTTPException(status_code=404, detail=f"No volatility expansion rows found for {symbol.upper()}")
     return row
