@@ -66,6 +66,7 @@ class UnifiedSignalEngine:
             if not row:
                 return None
             ts, close, net_gex, gamma_flip, pcr, max_pain = row
+            close_f = float(close)
 
             cur.execute(
                 """
@@ -91,9 +92,54 @@ class UnifiedSignalEngine:
             )
             closes = [float(r[0]) for r in cur.fetchall()]
 
+            # IV rank: compare current ATM IV to its 30-day daily range.
+            # Used to dynamically adjust the trigger threshold (high IV = be more selective).
+            iv_rank = None
+            try:
+                cur.execute(
+                    """
+                    WITH current_atm AS (
+                        SELECT AVG(implied_volatility) AS current_iv
+                        FROM option_chains
+                        WHERE underlying = %s
+                          AND ABS(strike - %s) / NULLIF(%s, 0) < 0.01
+                          AND option_type = 'C'
+                          AND implied_volatility IS NOT NULL
+                          AND implied_volatility > 0
+                          AND timestamp >= %s - INTERVAL '2 hours'
+                    ),
+                    daily_iv AS (
+                        SELECT DATE_TRUNC('day', timestamp) AS day,
+                               AVG(implied_volatility) AS avg_iv
+                        FROM option_chains
+                        WHERE underlying = %s
+                          AND ABS(strike - %s) / NULLIF(%s, 0) < 0.01
+                          AND option_type = 'C'
+                          AND implied_volatility IS NOT NULL
+                          AND implied_volatility > 0
+                          AND timestamp >= NOW() - INTERVAL '30 days'
+                        GROUP BY DATE_TRUNC('day', timestamp)
+                    )
+                    SELECT
+                        (SELECT current_iv FROM current_atm),
+                        MIN(avg_iv),
+                        MAX(avg_iv)
+                    FROM daily_iv
+                    """,
+                    (self.db_symbol, close_f, close_f, ts, self.db_symbol, close_f, close_f),
+                )
+                iv_row = cur.fetchone()
+                if iv_row and iv_row[0] is not None and iv_row[1] is not None and iv_row[2] is not None:
+                    current_iv, iv_low, iv_high = float(iv_row[0]), float(iv_row[1]), float(iv_row[2])
+                    iv_range = iv_high - iv_low
+                    if iv_range > 0.001:
+                        iv_rank = round(min(1.0, max(0.0, (current_iv - iv_low) / iv_range)), 4)
+            except Exception:
+                pass  # IV rank is supplemental; do not block signal generation if unavailable
+
             return {
                 "timestamp": ts,
-                "close": float(close),
+                "close": close_f,
                 "net_gex": float(net_gex or 0.0),
                 "gamma_flip": float(gamma_flip) if gamma_flip is not None else None,
                 "put_call_ratio": float(pcr or 1.0),
@@ -101,6 +147,7 @@ class UnifiedSignalEngine:
                 "smart_call": float(sm_call or 0.0),
                 "smart_put": float(sm_put or 0.0),
                 "recent_closes": list(reversed(closes)),
+                "iv_rank": iv_rank,
             }
 
     @staticmethod
@@ -111,42 +158,106 @@ class UnifiedSignalEngine:
             return "bearish"
         return "neutral"
 
+    @staticmethod
+    def _compute_rsi(closes: list[float], period: int = 14) -> Optional[float]:
+        if len(closes) < period + 1:
+            return None
+        gains = losses = 0.0
+        for i in range(-period, 0):
+            delta = closes[i] - closes[i - 1]
+            if delta >= 0:
+                gains += delta
+            else:
+                losses += abs(delta)
+        avg_gain = gains / period
+        avg_loss = losses / period
+        if avg_loss == 0:
+            return 100.0 if avg_gain > 0 else 50.0  # Pure uptrend vs flat market
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
+
     def _compute_exhaustion(self, closes: list[float]) -> tuple[float, str]:
         if len(closes) < 8:
             return 0.0, "insufficient_data"
         short = sum(closes[-5:]) / 5
-        long = sum(closes[-8:]) / 8
-        drift = (short - long) / long if long else 0.0
-        score = min(1.0, abs(drift) * 20)
+        long_ = sum(closes[-8:]) / 8
+        drift = (short - long_) / long_ if long_ else 0.0
+        drift_score = min(1.0, abs(drift) * 20)
+
+        # RSI extreme: overbought (>72) or oversold (<28) signals potential exhaustion
+        rsi_score = 0.0
+        if len(closes) >= 15:
+            rsi = self._compute_rsi(closes, 14)
+            if rsi is not None:
+                if rsi > 72:
+                    rsi_score = min(1.0, (rsi - 72) / 18.0)
+                elif rsi < 28:
+                    rsi_score = min(1.0, (28 - rsi) / 18.0)
+
+        # Price extension beyond 8-bar mean: >1.5% extension signals overextension
+        extension_score = 0.0
+        if long_ > 0:
+            extension = abs(closes[-1] - long_) / long_
+            extension_score = min(1.0, extension / 0.015)
+
+        score = 0.50 * drift_score + 0.30 * rsi_score + 0.20 * extension_score
         label = "exhausting" if score > 0.6 else "controlled"
         return score, label
 
     def _compute_score(self, ctx: dict) -> ScoreSnapshot:
         gex_score = -1.0 if ctx["net_gex"] < 0 else 1.0
+
+        # Gamma flip: neutral near flip (uncertainty zone), directional otherwise
         flip_score = 0.0
         if ctx["gamma_flip"]:
             dist = (ctx["close"] - ctx["gamma_flip"]) / ctx["gamma_flip"]
-            flip_score = -1.0 if abs(dist) < 0.003 else (1.0 if dist > 0 else -1.0)
+            if abs(dist) < 0.003:
+                flip_score = 0.0  # Uncertainty zone — near the regime inflection point
+            elif dist > 0:
+                flip_score = 1.0  # Above flip: negative-GEX territory → momentum amplification
+            else:
+                flip_score = -1.0  # Below flip: positive-GEX territory → mean-reversion dampening
 
         pcr = ctx["put_call_ratio"]
         pcr_score = 1.0 if pcr < 0.8 else (-1.0 if pcr > 1.2 else 0.0)
 
-        sm_ratio = (ctx["smart_call"] + 1.0) / (ctx["smart_put"] + 1.0)
-        sm_score = 1.0 if sm_ratio > 1.2 else (-1.0 if sm_ratio < 0.8 else 0.0)
+        # Smart money: only score if combined premium is meaningful (avoids low-volume noise)
+        sm_total = ctx["smart_call"] + ctx["smart_put"]
+        if sm_total >= 100_000:
+            sm_ratio = (ctx["smart_call"] + 1.0) / (ctx["smart_put"] + 1.0)
+            sm_score = 1.0 if sm_ratio > 1.2 else (-1.0 if sm_ratio < 0.8 else 0.0)
+        else:
+            sm_ratio = 1.0
+            sm_score = 0.0  # Insufficient premium flow — no edge
 
         exhaustion, exhaustion_state = self._compute_exhaustion(ctx["recent_closes"])
         exhaustion_dir = -1.0 if sm_score > 0 else (1.0 if sm_score < 0 else 0.0)
         exhaustion_score = exhaustion_dir * exhaustion
 
+        # Vol expansion: negative GEX amplifies price momentum; positive GEX pins toward flip
         vol_pressure = min(1.0, abs(ctx["net_gex"]) / 5_000_000_000)
-        vol_dir = -1.0 if ctx["net_gex"] < 0 else 0.5
+        closes = ctx["recent_closes"]
+        price_momentum_dir = 0.0
+        if len(closes) >= 5 and closes[-5] > 0:
+            price_momentum_dir = 1.0 if closes[-1] > closes[-5] else -1.0
+        if ctx["net_gex"] < 0:
+            # Negative GEX: dealers amplify moves — directional with price momentum
+            vol_score = price_momentum_dir * vol_pressure
+        else:
+            # Positive GEX: dealers dampen moves — mean-reversion pull toward gamma flip
+            vol_score = 0.0
+            if ctx["gamma_flip"] and ctx["gamma_flip"] > 0:
+                flip_dist_ratio = (ctx["close"] - ctx["gamma_flip"]) / ctx["gamma_flip"]
+                if abs(flip_dist_ratio) > 0.003:
+                    pull = min(abs(flip_dist_ratio) / 0.01, 1.0) * vol_pressure * 0.5
+                    vol_score = pull * (-1.0 if flip_dist_ratio > 0 else 1.0)
 
         weighted = {
             "gex_regime": {"weight": 0.22, "score": gex_score, "value": ctx["net_gex"]},
             "gamma_flip": {"weight": 0.15, "score": flip_score, "value": ctx["gamma_flip"]},
             "put_call_ratio": {"weight": 0.12, "score": pcr_score, "value": pcr},
             "smart_money": {"weight": 0.16, "score": sm_score, "value": sm_ratio},
-            "vol_expansion": {"weight": 0.20, "score": vol_dir * vol_pressure, "value": vol_pressure},
+            "vol_expansion": {"weight": 0.20, "score": vol_score, "value": vol_pressure},
             "exhaustion": {
                 "weight": 0.15,
                 "score": exhaustion_score,
@@ -454,8 +565,61 @@ class UnifiedSignalEngine:
             row = cur.fetchone()
             return float(row[0]) if row and row[0] is not None else None
 
+    def _analytics_confirmation(self, direction: str, as_of: datetime) -> bool:
+        """Check whether the analytics-engine trade_signals table agrees with direction.
+
+        Reads the most recent intraday/swing signals from trade_signals (written by
+        SignalEngine, the analytics-layer engine) and confirms at least half point the
+        same way.  Returns True when there is no disagreement or insufficient data.
+        """
+        try:
+            with db_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT direction, normalized_score
+                    FROM trade_signals
+                    WHERE underlying = %s
+                      AND timestamp >= %s - INTERVAL '15 minutes'
+                      AND timeframe IN ('intraday', 'swing')
+                      AND direction != 'neutral'
+                    ORDER BY timestamp DESC
+                    LIMIT 4
+                    """,
+                    (self.db_symbol, as_of),
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    return True  # No analytics data — don't block the signal
+                matching = sum(1 for r in rows if r[0] == direction)
+                # Require majority agreement; ties go to allowing the trade
+                return matching >= (len(rows) + 1) // 2
+        except Exception:
+            return True  # Do not block on DB errors
+
     def _open_trade(self, score: ScoreSnapshot, market_ctx: dict) -> bool:
-        if score.direction == "neutral" or score.normalized_score < self.trigger_threshold:
+        # Dynamic trigger threshold: raise bar in high-IV environments (>70th percentile)
+        # where options premium is expensive and signals are noisier.
+        iv_rank = market_ctx.get("iv_rank")
+        effective_threshold = self.trigger_threshold
+        if iv_rank is not None:
+            if iv_rank > 0.70:
+                effective_threshold = min(0.72, self.trigger_threshold + 0.07)
+            elif iv_rank < 0.25:
+                effective_threshold = max(0.52, self.trigger_threshold - 0.04)
+
+        if score.direction == "neutral" or score.normalized_score < effective_threshold:
+            return False
+
+        # Multi-timeframe confirmation: the analytics engine's signals must agree with direction.
+        # This cross-validates the unified engine's snapshot against the richer 10-component
+        # analytics model, filtering trades where the two engines contradict each other.
+        if not self._analytics_confirmation(score.direction, score.timestamp):
+            logger.info(
+                "UnifiedSignalEngine [%s]: analytics engine disagrees with direction=%s — skipping trade",
+                self.db_symbol,
+                score.direction,
+            )
             return False
 
         selected = None
@@ -586,23 +750,46 @@ class UnifiedSignalEngine:
         entry = trade["entry_price"]
         realized = trade["realized_pnl"]
 
-        target_trim = entry * 1.25
-        stop = entry * 0.70
+        # Determine pricing mode from the trade metadata for options-appropriate stops/targets.
+        meta = trade.get("components_at_entry") or {}
+        optimizer_meta = meta.get("optimizer") if isinstance(meta, dict) else {}
+        pricing_mode = optimizer_meta.get("pricing_mode") if isinstance(optimizer_meta, dict) else "single_leg"
 
-        # Add size on materially stronger score in same direction.
+        if pricing_mode == "credit":
+            # Credit spreads: stop if mark reaches 2× entry (premium doubled = max pain),
+            # trim when mark drops to 50% of entry credit (half the premium captured).
+            stop = entry * 2.0
+            target_trim = entry * 0.50
+        else:
+            # Debit spreads / single leg: stop at 50% loss of premium paid,
+            # trim at 100% return (doubled the premium paid).
+            stop = entry * 0.50
+            target_trim = entry * 2.0
+
+        # Add size on materially stronger score in same direction only if trade is profitable.
         add_qty = 0
-        if score.direction == trade["direction"] and score.normalized_score >= 0.85 and qty_open == trade["quantity_initial"]:
+        if (
+            score.direction == trade["direction"]
+            and score.normalized_score >= 0.85
+            and qty_open == trade["quantity_initial"]
+            and mark > entry  # Only pyramid when trade is already working
+        ):
             add_qty = 1
             qty_open += 1
 
-        # Cut half if score deteriorates.
+        # Cut half if score deteriorates significantly — signal no longer supports the trade.
         if score.normalized_score < 0.35 and qty_open > 1:
             cut_qty = qty_open // 2
             realized += (mark - entry) * cut_qty * 100
             qty_open -= cut_qty
 
-        # Trim into strength.
-        if mark >= target_trim and qty_open > 1:
+        # Trim into strength at target.
+        if pricing_mode == "credit":
+            trim_condition = mark <= target_trim and qty_open > 1  # Credit: mark fell (profit)
+        else:
+            trim_condition = mark >= target_trim and qty_open > 1  # Debit: mark rose (profit)
+
+        if trim_condition:
             trim_qty = max(1, qty_open // 2)
             realized += (mark - entry) * trim_qty * 100
             qty_open -= trim_qty
@@ -611,7 +798,12 @@ class UnifiedSignalEngine:
         closed_at = None
 
         # Hard stop or opposite signal closes.
-        if mark <= stop or (score.direction != "neutral" and score.direction != trade["direction"] and score.normalized_score >= 0.55):
+        if pricing_mode == "credit":
+            stop_hit = mark >= stop  # Credit: stop when premium doubled (loss)
+        else:
+            stop_hit = mark <= stop  # Debit: stop when premium halved (loss)
+
+        if stop_hit or (score.direction != "neutral" and score.direction != trade["direction"] and score.normalized_score >= 0.55):
             realized += (mark - entry) * qty_open * 100
             qty_open = 0
             status = "closed"

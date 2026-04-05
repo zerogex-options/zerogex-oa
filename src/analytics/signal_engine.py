@@ -132,6 +132,8 @@ class SignalContext:
     charm_exposure: float = 0.0
     recent_closes: list[float] = field(default_factory=list)
     recent_highs: list[float] = field(default_factory=list)
+    recent_up_volumes: list[int] = field(default_factory=list)
+    recent_down_volumes: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -303,7 +305,7 @@ def _compute_rsi(closes: list[float], period: int = 14) -> Optional[float]:
     avg_gain = gains / period
     avg_loss = losses / period
     if avg_loss == 0:
-        return 100.0
+        return 100.0 if avg_gain > 0 else 50.0  # Pure uptrend vs flat market
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
@@ -368,7 +370,7 @@ def _compute_zes(ctx: SignalContext) -> tuple[float, str, bool]:
     ):
         gamma_score = _clamp(gamma_score + 0.1)
 
-    # 5) Structure failure (20%)
+    # 5) Structure failure (15%)
     prior_high = max(highs[-10:-3]) if len(highs) >= 10 else max(highs[:-3], default=0.0)
     recent_push_high = max(highs[-3:])
     failed_breakout = recent_push_high > prior_high and closes[-1] < prior_high
@@ -384,12 +386,33 @@ def _compute_zes(ctx: SignalContext) -> tuple[float, str, bool]:
         structure_score += 0.3
     structure_score = _clamp(structure_score)
 
+    # 6) Volume divergence (10%): rising price on declining up-volume is bearish exhaustion;
+    #    falling price on declining down-volume is bullish exhaustion (sellers drying up).
+    volume_divergence_score = 0.0
+    up_vols = ctx.recent_up_volumes
+    dn_vols = ctx.recent_down_volumes
+    if len(up_vols) >= 10 and len(closes) >= 10:
+        recent_up_avg = sum(up_vols[-5:]) / 5 if up_vols[-5:] else 0.0
+        prior_up_avg = sum(up_vols[-10:-5]) / 5 if up_vols[-10:-5] else 0.0
+        price_advancing = closes[-1] > closes[-5]
+        if price_advancing and prior_up_avg > 0 and recent_up_avg < prior_up_avg * 0.75:
+            # Price going up but up-volume shrinking = exhaustion on up-move
+            volume_divergence_score = _clamp(1.0 - recent_up_avg / prior_up_avg)
+    if len(dn_vols) >= 10 and len(closes) >= 10 and volume_divergence_score == 0.0:
+        recent_dn_avg = sum(dn_vols[-5:]) / 5 if dn_vols[-5:] else 0.0
+        prior_dn_avg = sum(dn_vols[-10:-5]) / 5 if dn_vols[-10:-5] else 0.0
+        price_declining = closes[-1] < closes[-5]
+        if price_declining and prior_dn_avg > 0 and recent_dn_avg < prior_dn_avg * 0.75:
+            # Price going down but down-volume shrinking = exhaustion on down-move (buyers emerging)
+            volume_divergence_score = _clamp(1.0 - recent_dn_avg / prior_dn_avg)
+
     zes = (
         0.25 * max_gamma_score +
         0.20 * divergence_score +
         0.15 * velocity_score +
         0.20 * gamma_score +
-        0.20 * structure_score
+        0.15 * structure_score +
+        0.05 * volume_divergence_score
     ) * 100
 
     trap_triggered = zes >= 85 and structure_score >= 0.7
@@ -783,7 +806,7 @@ class SignalEngine:
 
                 # --- Recent bars for RSI/velocity/structure exhaustion state ---
                 cur.execute("""
-                    SELECT close, high
+                    SELECT close, high, COALESCE(up_volume, 0), COALESCE(down_volume, 0)
                     FROM underlying_quotes
                     WHERE symbol = %s
                     ORDER BY timestamp DESC
@@ -792,6 +815,8 @@ class SignalEngine:
                 history_rows = cur.fetchall()
                 recent_closes = [float(r[0]) for r in reversed(history_rows)] if history_rows else []
                 recent_highs = [float(r[1]) for r in reversed(history_rows)] if history_rows else []
+                recent_up_volumes = [int(r[2]) for r in reversed(history_rows)] if history_rows else []
+                recent_down_volumes = [int(r[3]) for r in reversed(history_rows)] if history_rows else []
 
                 # --- Latest VWAP deviation ---
                 cur.execute("""
@@ -933,6 +958,8 @@ class SignalEngine:
                     charm_exposure=charm,
                     recent_closes=recent_closes,
                     recent_highs=recent_highs,
+                    recent_up_volumes=recent_up_volumes,
+                    recent_down_volumes=recent_down_volumes,
                 )
 
         except Exception as e:
