@@ -46,7 +46,7 @@ async def get_latest_score(
     underlying: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
 ):
-    row = await db.get_latest_signal_score(underlying.upper())
+    row = await db.get_latest_signal_score_enriched(underlying.upper())
     if not row:
         raise HTTPException(status_code=404, detail=f"No score rows found for {underlying.upper()}")
     return row
