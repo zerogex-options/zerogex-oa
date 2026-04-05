@@ -175,18 +175,17 @@ class PositionOptimizerEngine:
                 cur = conn.cursor()
                 anchor_ts = as_of
 
+                # Derive signal context from signal_scores (written by UnifiedSignalEngine).
+                # normalized_score → timeframe/strength; direction comes directly from the score.
+                ts_filter = anchor_ts if anchor_ts is not None else "NOW()"
                 if anchor_ts is None:
                     cur.execute(
                         """
-                        SELECT timestamp, timeframe, direction, strength, trade_type
-                        FROM trade_signals
+                        SELECT timestamp, direction, normalized_score
+                        FROM signal_scores
                         WHERE underlying = %s
-                        ORDER BY timestamp DESC,
-                                 CASE timeframe
-                                   WHEN 'intraday' THEN 1
-                                   WHEN 'swing' THEN 2
-                                   ELSE 3
-                                 END ASC
+                          AND direction != 'neutral'
+                        ORDER BY timestamp DESC
                         LIMIT 1
                         """,
                         (self.db_symbol,),
@@ -194,25 +193,36 @@ class PositionOptimizerEngine:
                 else:
                     cur.execute(
                         """
-                        SELECT timestamp, timeframe, direction, strength, trade_type
-                        FROM trade_signals
+                        SELECT timestamp, direction, normalized_score
+                        FROM signal_scores
                         WHERE underlying = %s
                           AND timestamp <= %s
-                        ORDER BY timestamp DESC,
-                                 CASE timeframe
-                                   WHEN 'intraday' THEN 1
-                                   WHEN 'swing' THEN 2
-                                   ELSE 3
-                                 END ASC
+                          AND direction != 'neutral'
+                        ORDER BY timestamp DESC
                         LIMIT 1
                         """,
                         (self.db_symbol, anchor_ts),
                     )
                 signal_row = cur.fetchone()
                 if not signal_row:
-                    logger.warning("PositionOptimizerEngine: no trade_signals rows found")
+                    logger.warning("PositionOptimizerEngine: no signal_scores rows found")
                     return None
-                signal_ts, signal_timeframe, signal_direction, signal_strength, trade_type = signal_row
+                signal_ts, signal_direction, normalized_score = signal_row
+                normalized_score = float(normalized_score)
+                # Map normalized score → timeframe and strength (mirrors UnifiedSignalEngine thresholds)
+                if normalized_score >= 0.84:
+                    signal_timeframe = "intraday"
+                elif normalized_score >= 0.68:
+                    signal_timeframe = "swing"
+                else:
+                    signal_timeframe = "multi_day"
+                if normalized_score >= 0.82:
+                    signal_strength = "high"
+                elif normalized_score >= 0.64:
+                    signal_strength = "medium"
+                else:
+                    signal_strength = "low"
+                trade_type = "trend_follow"
                 anchor_ts = anchor_ts or signal_ts
 
                 cur.execute(

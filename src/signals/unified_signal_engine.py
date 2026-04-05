@@ -565,23 +565,24 @@ class UnifiedSignalEngine:
             row = cur.fetchone()
             return float(row[0]) if row and row[0] is not None else None
 
-    def _analytics_confirmation(self, direction: str, as_of: datetime) -> bool:
-        """Check whether the analytics-engine trade_signals table agrees with direction.
+    def _score_trend_confirmation(self, direction: str, as_of: datetime) -> bool:
+        """Confirm the current direction is consistent with recent signal_scores history.
 
-        Reads the most recent intraday/swing signals from trade_signals (written by
-        SignalEngine, the analytics-layer engine) and confirms at least half point the
-        same way.  Returns True when there is no disagreement or insufficient data.
+        Looks at the last 4 scored cycles (written by this engine to signal_scores).
+        If the majority pointed a different non-neutral direction, the current bar is
+        likely a flip or noise — skip opening a new trade.
+
+        Returns True when history agrees or there is insufficient history to disagree.
         """
         try:
             with db_connection() as conn:
                 cur = conn.cursor()
                 cur.execute(
                     """
-                    SELECT direction, normalized_score
-                    FROM trade_signals
+                    SELECT direction
+                    FROM signal_scores
                     WHERE underlying = %s
-                      AND timestamp >= %s - INTERVAL '15 minutes'
-                      AND timeframe IN ('intraday', 'swing')
+                      AND timestamp < %s
                       AND direction != 'neutral'
                     ORDER BY timestamp DESC
                     LIMIT 4
@@ -590,9 +591,9 @@ class UnifiedSignalEngine:
                 )
                 rows = cur.fetchall()
                 if not rows:
-                    return True  # No analytics data — don't block the signal
+                    return True  # No history — don't block
                 matching = sum(1 for r in rows if r[0] == direction)
-                # Require majority agreement; ties go to allowing the trade
+                # Require at least half of recent history to agree
                 return matching >= (len(rows) + 1) // 2
         except Exception:
             return True  # Do not block on DB errors
@@ -611,12 +612,12 @@ class UnifiedSignalEngine:
         if score.direction == "neutral" or score.normalized_score < effective_threshold:
             return False
 
-        # Multi-timeframe confirmation: the analytics engine's signals must agree with direction.
-        # This cross-validates the unified engine's snapshot against the richer 10-component
-        # analytics model, filtering trades where the two engines contradict each other.
-        if not self._analytics_confirmation(score.direction, score.timestamp):
+        # Trend consistency check: require that recent signal_scores history agrees with
+        # the current direction.  A sudden flip after sustained opposite scoring is likely
+        # noise rather than a genuine regime change.
+        if not self._score_trend_confirmation(score.direction, score.timestamp):
             logger.info(
-                "UnifiedSignalEngine [%s]: analytics engine disagrees with direction=%s — skipping trade",
+                "UnifiedSignalEngine [%s]: recent score history contradicts direction=%s — skipping trade",
                 self.db_symbol,
                 score.direction,
             )
