@@ -87,7 +87,7 @@ def _initialize_connection_pool():
     db_name = os.getenv('DB_NAME', 'zerogex')
     db_user = os.getenv('DB_USER', 'postgres')
     min_connections = int(os.getenv('DB_POOL_MIN', '1'))
-    max_connections = int(os.getenv('DB_POOL_MAX', '10'))
+    max_connections = int(os.getenv('DB_POOL_MAX', '4'))
     connect_timeout = int(os.getenv('DB_CONNECT_TIMEOUT_SECONDS', '20'))
     connect_retries = int(os.getenv('DB_CONNECT_RETRIES', '5'))
     retry_base_delay = float(os.getenv('DB_CONNECT_RETRY_DELAY_SECONDS', '1.5'))

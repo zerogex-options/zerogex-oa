@@ -41,7 +41,7 @@ DB_USER = os.getenv("DB_USER", "postgres")
 
 # Connection Pool
 DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "1"))
-DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "4"))
 DB_CONNECT_TIMEOUT_SECONDS = float(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "20"))
 
 # Data Retention

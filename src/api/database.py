@@ -132,7 +132,7 @@ class DatabaseManager:
         """Create and return a fresh asyncpg pool instance."""
         connect_timeout = float(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "20"))
         min_size = int(os.getenv("DB_POOL_MIN", "2"))
-        max_size = int(os.getenv("DB_POOL_MAX", "20"))
+        max_size = int(os.getenv("DB_POOL_MAX", "8"))
         statement_timeout_ms = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "30000"))
         ssl_mode = os.getenv("DB_SSLMODE", "").strip().lower()
         ssl = None
