@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
@@ -43,8 +44,18 @@ class UnifiedSignalEngine:
         self.trigger_threshold = 0.58
         self.position_optimizer = PositionOptimizerEngine(self.underlying)
 
-    def _fetch_market_context(self) -> Optional[dict]:
-        with db_connection() as conn:
+    @staticmethod
+    @contextmanager
+    def _use_conn(conn=None):
+        """Yield *conn* if provided, otherwise acquire a fresh one from the pool."""
+        if conn is not None:
+            yield conn
+        else:
+            with db_connection() as new_conn:
+                yield new_conn
+
+    def _fetch_market_context(self, conn=None) -> Optional[dict]:
+        with self._use_conn(conn) as conn:
             cur = conn.cursor()
             cur.execute(
                 """
@@ -283,8 +294,8 @@ class UnifiedSignalEngine:
             components=weighted,
         )
 
-    def _store_score(self, score: ScoreSnapshot) -> None:
-        with db_connection() as conn:
+    def _store_score(self, score: ScoreSnapshot, conn=None) -> None:
+        with self._use_conn(conn) as conn:
             cur = conn.cursor()
             cur.execute(
                 """
@@ -309,9 +320,9 @@ class UnifiedSignalEngine:
             )
             conn.commit()
 
-    def _select_contract(self, as_of: datetime, direction: str, spot: float) -> Optional[dict]:
+    def _select_contract(self, as_of: datetime, direction: str, spot: float, conn=None) -> Optional[dict]:
         opt_type = "C" if direction == "bullish" else "P"
-        with db_connection() as conn:
+        with self._use_conn(conn) as conn:
             cur = conn.cursor()
             cur.execute(
                 """
@@ -361,7 +372,7 @@ class UnifiedSignalEngine:
             return "swing"
         return "multi_day"
 
-    def _fetch_optimizer_snapshot_rows(self, as_of: datetime, timeframe: str) -> tuple[list[dict], int, int]:
+    def _fetch_optimizer_snapshot_rows(self, as_of: datetime, timeframe: str, conn=None) -> tuple[list[dict], int, int]:
         # Keep defaults in sync with optimizer module constants.
         dte_min, dte_max = (1, 7)
         if timeframe == "intraday":
@@ -371,7 +382,7 @@ class UnifiedSignalEngine:
         elif timeframe == "multi_day":
             dte_min, dte_max = (3, 14)
 
-        with db_connection() as conn:
+        with self._use_conn(conn) as conn:
             cur = conn.cursor()
             trade_date = as_of.date()
             cur.execute(
@@ -468,8 +479,8 @@ class UnifiedSignalEngine:
             ]
         return []
 
-    def _resolve_option_symbol_for_leg(self, as_of: datetime, leg: dict) -> Optional[str]:
-        with db_connection() as conn:
+    def _resolve_option_symbol_for_leg(self, as_of: datetime, leg: dict, conn=None) -> Optional[str]:
+        with self._use_conn(conn) as conn:
             cur = conn.cursor()
             cur.execute(
                 """
@@ -488,10 +499,10 @@ class UnifiedSignalEngine:
             row = cur.fetchone()
             return row[0] if row else None
 
-    def _select_optimizer_candidate(self, score: ScoreSnapshot, ctx: dict) -> Optional[dict]:
+    def _select_optimizer_candidate(self, score: ScoreSnapshot, ctx: dict, conn=None) -> Optional[dict]:
         signal_timeframe = self._infer_signal_timeframe(score.normalized_score)
         signal_strength = self._infer_signal_strength(score.normalized_score)
-        option_rows, dte_min, dte_max = self._fetch_optimizer_snapshot_rows(score.timestamp, signal_timeframe)
+        option_rows, dte_min, dte_max = self._fetch_optimizer_snapshot_rows(score.timestamp, signal_timeframe, conn=conn)
         if not option_rows:
             return None
         optimizer_ctx = PositionOptimizerContext(
@@ -523,8 +534,8 @@ class UnifiedSignalEngine:
                 return {"candidate": candidate, "signal_timeframe": signal_timeframe, "signal_strength": signal_strength}
         return None
 
-    def _fetch_open_trades(self) -> list[dict]:
-        with db_connection() as conn:
+    def _fetch_open_trades(self, conn=None) -> list[dict]:
+        with self._use_conn(conn) as conn:
             cur = conn.cursor()
             cur.execute(
                 """
@@ -554,8 +565,8 @@ class UnifiedSignalEngine:
                 for r in rows
             ]
 
-    def _latest_option_mark(self, option_symbol: str, as_of: datetime) -> Optional[float]:
-        with db_connection() as conn:
+    def _latest_option_mark(self, option_symbol: str, as_of: datetime, conn=None) -> Optional[float]:
+        with self._use_conn(conn) as conn:
             cur = conn.cursor()
             cur.execute(
                 """
@@ -571,7 +582,7 @@ class UnifiedSignalEngine:
             row = cur.fetchone()
             return float(row[0]) if row and row[0] is not None else None
 
-    def _score_trend_confirmation(self, direction: str, as_of: datetime) -> bool:
+    def _score_trend_confirmation(self, direction: str, as_of: datetime, conn=None) -> bool:
         """Confirm the current direction is consistent with recent signal_scores history.
 
         Looks at the last 4 scored cycles (written by this engine to signal_scores).
@@ -581,7 +592,7 @@ class UnifiedSignalEngine:
         Returns True when history agrees or there is insufficient history to disagree.
         """
         try:
-            with db_connection() as conn:
+            with self._use_conn(conn) as conn:
                 cur = conn.cursor()
                 cur.execute(
                     """
@@ -608,7 +619,7 @@ class UnifiedSignalEngine:
     # Aggregate portfolio exposure
     # ------------------------------------------------------------------
 
-    def _get_portfolio_exposure(self, open_trades: list[dict]) -> dict:
+    def _get_portfolio_exposure(self, open_trades: list[dict], conn=None) -> dict:
         """Summarise the current aggregate exposure across all open trades.
 
         Returns a dict with:
@@ -645,8 +656,8 @@ class UnifiedSignalEngine:
 
         # Fetch the most recent opened_at timestamp so we can enforce cooldowns.
         try:
-            with db_connection() as conn:
-                cur = conn.cursor()
+            with self._use_conn(conn) as c:
+                cur = c.cursor()
                 cur.execute(
                     """
                     SELECT MAX(opened_at)
@@ -747,7 +758,7 @@ class UnifiedSignalEngine:
     # Trade entry
     # ------------------------------------------------------------------
 
-    def _open_trade(self, score: ScoreSnapshot, market_ctx: dict, exposure: dict) -> bool:
+    def _open_trade(self, score: ScoreSnapshot, market_ctx: dict, exposure: dict, conn=None) -> bool:
         # Dynamic trigger threshold: raise bar in high-IV environments (>70th percentile)
         # where options premium is expensive and signals are noisier.
         iv_rank = market_ctx.get("iv_rank")
@@ -764,7 +775,7 @@ class UnifiedSignalEngine:
         # Trend consistency check: require that recent signal_scores history agrees with
         # the current direction.  A sudden flip after sustained opposite scoring is likely
         # noise rather than a genuine regime change.
-        if not self._score_trend_confirmation(score.direction, score.timestamp):
+        if not self._score_trend_confirmation(score.direction, score.timestamp, conn=conn):
             logger.info(
                 "UnifiedSignalEngine [%s]: recent score history contradicts direction=%s — skipping trade",
                 self.db_symbol,
@@ -786,7 +797,7 @@ class UnifiedSignalEngine:
 
         selected = None
         spot = float(market_ctx["close"])
-        optimizer_pick = self._select_optimizer_candidate(score, market_ctx)
+        optimizer_pick = self._select_optimizer_candidate(score, market_ctx, conn=conn)
         if optimizer_pick:
             candidate = optimizer_pick["candidate"]
             sizing = next((p for p in candidate.sizing_profiles if p.profile == "optimal"), None)
@@ -802,7 +813,7 @@ class UnifiedSignalEngine:
                 )
                 enriched_legs = []
                 for leg in legs:
-                    option_symbol = self._resolve_option_symbol_for_leg(score.timestamp, leg)
+                    option_symbol = self._resolve_option_symbol_for_leg(score.timestamp, leg, conn=conn)
                     enriched_legs.append({**leg, "option_symbol": option_symbol})
                 selected = {
                     "option_symbol": enriched_legs[0]["option_symbol"] if enriched_legs else f"{self.db_symbol}-SYNTHETIC",
@@ -824,7 +835,7 @@ class UnifiedSignalEngine:
                     },
                 }
         if not selected:
-            contract = self._select_contract(score.timestamp, score.direction, spot)
+            contract = self._select_contract(score.timestamp, score.direction, spot, conn=conn)
             if not contract:
                 return False
             selected = {
@@ -844,7 +855,7 @@ class UnifiedSignalEngine:
         quantity = self._scale_size_for_exposure(selected["quantity"], exposure)
         components_at_entry = dict(score.components)
         components_at_entry["optimizer"] = selected["optimizer_payload"]
-        with db_connection() as conn:
+        with self._use_conn(conn) as conn:
             cur = conn.cursor()
             cur.execute(
                 """
@@ -883,7 +894,7 @@ class UnifiedSignalEngine:
             conn.commit()
             return cur.rowcount > 0
 
-    def _latest_trade_mark(self, trade: dict, as_of: datetime) -> Optional[float]:
+    def _latest_trade_mark(self, trade: dict, as_of: datetime, conn=None) -> Optional[float]:
         meta = trade.get("components_at_entry") or {}
         optimizer_meta = meta.get("optimizer") if isinstance(meta, dict) else None
         legs = optimizer_meta.get("legs") if isinstance(optimizer_meta, dict) else None
@@ -893,18 +904,18 @@ class UnifiedSignalEngine:
             for leg in legs:
                 option_symbol = leg.get("option_symbol")
                 if not option_symbol:
-                    return self._latest_option_mark(trade["option_symbol"], as_of)
-                leg_mark = self._latest_option_mark(option_symbol, as_of)
+                    return self._latest_option_mark(trade["option_symbol"], as_of, conn=conn)
+                leg_mark = self._latest_option_mark(option_symbol, as_of, conn=conn)
                 if leg_mark is None:
-                    return self._latest_option_mark(trade["option_symbol"], as_of)
+                    return self._latest_option_mark(trade["option_symbol"], as_of, conn=conn)
                 total += leg_mark if leg.get("side") == "long" else -leg_mark
             if pricing_mode == "credit":
                 total = -total
             return max(total, 0.0)
-        return self._latest_option_mark(trade["option_symbol"], as_of)
+        return self._latest_option_mark(trade["option_symbol"], as_of, conn=conn)
 
-    def _update_open_trade(self, trade: dict, score: ScoreSnapshot, exposure: dict) -> None:
-        mark = self._latest_trade_mark(trade, score.timestamp)
+    def _update_open_trade(self, trade: dict, score: ScoreSnapshot, exposure: dict, conn=None) -> None:
+        mark = self._latest_trade_mark(trade, score.timestamp, conn=conn)
         if mark is None:
             return
 
@@ -989,7 +1000,7 @@ class UnifiedSignalEngine:
         basis_qty = max(trade["quantity_initial"], 1)
         pnl_pct = ((total / (entry * basis_qty * 100)) * 100) if entry > 0 else 0
 
-        with db_connection() as conn:
+        with self._use_conn(conn) as conn:
             cur = conn.cursor()
             cur.execute(
                 """
@@ -1027,30 +1038,31 @@ class UnifiedSignalEngine:
             conn.commit()
 
     def run_cycle(self) -> bool:
-        ctx = self._fetch_market_context()
-        if not ctx:
-            logger.warning("UnifiedSignalEngine: missing market context")
-            return False
+        with db_connection() as conn:
+            ctx = self._fetch_market_context(conn=conn)
+            if not ctx:
+                logger.warning("UnifiedSignalEngine: missing market context")
+                return False
 
-        score = self._compute_score(ctx)
-        self._store_score(score)
+            score = self._compute_score(ctx)
+            self._store_score(score, conn=conn)
 
-        open_trades = self._fetch_open_trades()
-        exposure = self._get_portfolio_exposure(open_trades)
+            open_trades = self._fetch_open_trades(conn=conn)
+            exposure = self._get_portfolio_exposure(open_trades, conn=conn)
 
-        for trade in open_trades:
-            self._update_open_trade(trade, score, exposure)
+            for trade in open_trades:
+                self._update_open_trade(trade, score, exposure, conn=conn)
 
-        opened = self._open_trade(score, ctx, exposure)
-        logger.info(
-            "UnifiedSignalEngine [%s] score=%.3f norm=%.3f dir=%s "
-            "open_trades=%d heat=%.2f%% opened_new=%s",
-            self.db_symbol,
-            score.composite_score,
-            score.normalized_score,
-            score.direction,
-            len(open_trades),
-            exposure["heat_pct"] * 100,
-            opened,
-        )
-        return True
+            opened = self._open_trade(score, ctx, exposure, conn=conn)
+            logger.info(
+                "UnifiedSignalEngine [%s] score=%.3f norm=%.3f dir=%s "
+                "open_trades=%d heat=%.2f%% opened_new=%s",
+                self.db_symbol,
+                score.composite_score,
+                score.normalized_score,
+                score.direction,
+                len(open_trades),
+                exposure["heat_pct"] * 100,
+                opened,
+            )
+            return True
