@@ -9,9 +9,15 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
+from src.config import (
+    SIGNALS_MAX_OPEN_TRADES,
+    SIGNALS_MAX_PORTFOLIO_HEAT_PCT,
+    SIGNALS_PORTFOLIO_SIZE,
+    SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES,
+)
 from src.database import db_connection
 from src.signals.position_optimizer_engine import PositionOptimizerContext, PositionOptimizerEngine
 from src.symbols import get_canonical_symbol
@@ -598,7 +604,150 @@ class UnifiedSignalEngine:
         except Exception:
             return True  # Do not block on DB errors
 
-    def _open_trade(self, score: ScoreSnapshot, market_ctx: dict) -> bool:
+    # ------------------------------------------------------------------
+    # Aggregate portfolio exposure
+    # ------------------------------------------------------------------
+
+    def _get_portfolio_exposure(self, open_trades: list[dict]) -> dict:
+        """Summarise the current aggregate exposure across all open trades.
+
+        Returns a dict with:
+          - open_count: total open trades for this underlying
+          - total_notional: sum(entry_price * quantity_open * 100) across trades
+          - heat_pct: total_notional / portfolio size
+          - net_direction: "bullish", "bearish", or "mixed"
+          - bullish_count / bearish_count
+          - last_opened_at: timestamp of most recently opened trade (or None)
+        """
+        if not open_trades:
+            return {
+                "open_count": 0,
+                "total_notional": 0.0,
+                "heat_pct": 0.0,
+                "net_direction": "neutral",
+                "bullish_count": 0,
+                "bearish_count": 0,
+                "last_opened_at": None,
+            }
+
+        total_notional = 0.0
+        bullish = 0
+        bearish = 0
+        last_opened_at = None
+
+        for t in open_trades:
+            notional = abs(t["entry_price"]) * t["quantity_open"] * 100
+            total_notional += notional
+            if t["direction"] == "bullish":
+                bullish += 1
+            else:
+                bearish += 1
+
+        # Fetch the most recent opened_at timestamp so we can enforce cooldowns.
+        try:
+            with db_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT MAX(opened_at)
+                    FROM signal_trades
+                    WHERE underlying = %s AND status = 'open'
+                    """,
+                    (self.db_symbol,),
+                )
+                row = cur.fetchone()
+                last_opened_at = row[0] if row and row[0] else None
+        except Exception:
+            pass
+
+        portfolio = max(SIGNALS_PORTFOLIO_SIZE, 1.0)
+        if bullish > 0 and bearish > 0:
+            net_dir = "mixed"
+        elif bullish > 0:
+            net_dir = "bullish"
+        elif bearish > 0:
+            net_dir = "bearish"
+        else:
+            net_dir = "neutral"
+
+        return {
+            "open_count": len(open_trades),
+            "total_notional": round(total_notional, 2),
+            "heat_pct": round(total_notional / portfolio, 6),
+            "net_direction": net_dir,
+            "bullish_count": bullish,
+            "bearish_count": bearish,
+            "last_opened_at": last_opened_at,
+        }
+
+    def _check_exposure_allows_entry(
+        self, exposure: dict, direction: str, as_of: datetime
+    ) -> tuple[bool, str]:
+        """Return (allowed, reason) indicating whether a new trade may be opened."""
+
+        # Gate 1: hard cap on concurrent open trades per underlying.
+        if exposure["open_count"] >= SIGNALS_MAX_OPEN_TRADES:
+            return False, (
+                f"max open trades reached ({exposure['open_count']}/{SIGNALS_MAX_OPEN_TRADES})"
+            )
+
+        # Gate 2: total portfolio heat cap.
+        if exposure["heat_pct"] >= SIGNALS_MAX_PORTFOLIO_HEAT_PCT:
+            return False, (
+                f"portfolio heat {exposure['heat_pct']:.2%} exceeds "
+                f"limit {SIGNALS_MAX_PORTFOLIO_HEAT_PCT:.2%}"
+            )
+
+        # Gate 3: cooldown — don't stack another trade in the same direction
+        # within N minutes of the last entry.
+        if (
+            exposure["last_opened_at"] is not None
+            and exposure["net_direction"] == direction
+        ):
+            cooldown = timedelta(minutes=SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES)
+            last = exposure["last_opened_at"]
+            # Handle timezone-naive timestamps from the DB.
+            if last.tzinfo is None and as_of.tzinfo is not None:
+                last = last.replace(tzinfo=as_of.tzinfo)
+            elif last.tzinfo is not None and as_of.tzinfo is None:
+                as_of = as_of.replace(tzinfo=last.tzinfo)
+            if as_of - last < cooldown:
+                remaining = cooldown - (as_of - last)
+                return False, (
+                    f"same-direction cooldown: {remaining.total_seconds():.0f}s remaining"
+                )
+
+        return True, "ok"
+
+    def _scale_size_for_exposure(self, base_qty: int, exposure: dict) -> int:
+        """Reduce position size when existing exposure is already elevated.
+
+        Linearly scales down from full size at 0% heat to minimum 1 contract at
+        the heat cap.
+        """
+        if base_qty <= 1:
+            return base_qty
+
+        heat_cap = max(SIGNALS_MAX_PORTFOLIO_HEAT_PCT, 0.001)
+        current_heat = exposure["heat_pct"]
+        remaining_ratio = max(0.0, 1.0 - (current_heat / heat_cap))
+        scaled = max(1, int(base_qty * remaining_ratio))
+        if scaled != base_qty:
+            logger.info(
+                "UnifiedSignalEngine [%s]: scaled position %d → %d (heat %.2f%%/%.2f%%)",
+                self.db_symbol,
+                base_qty,
+                scaled,
+                current_heat * 100,
+                heat_cap * 100,
+            )
+        return scaled
+
+    # ------------------------------------------------------------------
+    # Trade entry
+    # ------------------------------------------------------------------
+
+    def _open_trade(self, score: ScoreSnapshot, market_ctx: dict, exposure: dict) -> bool:
         # Dynamic trigger threshold: raise bar in high-IV environments (>70th percentile)
         # where options premium is expensive and signals are noisier.
         iv_rank = market_ctx.get("iv_rank")
@@ -620,6 +769,18 @@ class UnifiedSignalEngine:
                 "UnifiedSignalEngine [%s]: recent score history contradicts direction=%s — skipping trade",
                 self.db_symbol,
                 score.direction,
+            )
+            return False
+
+        # Aggregate exposure gate — check portfolio-level limits before sizing.
+        allowed, reason = self._check_exposure_allows_entry(
+            exposure, score.direction, score.timestamp
+        )
+        if not allowed:
+            logger.info(
+                "UnifiedSignalEngine [%s]: entry blocked — %s",
+                self.db_symbol,
+                reason,
             )
             return False
 
@@ -680,7 +841,7 @@ class UnifiedSignalEngine:
                 },
             }
 
-        quantity = selected["quantity"]
+        quantity = self._scale_size_for_exposure(selected["quantity"], exposure)
         components_at_entry = dict(score.components)
         components_at_entry["optimizer"] = selected["optimizer_payload"]
         with db_connection() as conn:
@@ -742,7 +903,7 @@ class UnifiedSignalEngine:
             return max(total, 0.0)
         return self._latest_option_mark(trade["option_symbol"], as_of)
 
-    def _update_open_trade(self, trade: dict, score: ScoreSnapshot) -> None:
+    def _update_open_trade(self, trade: dict, score: ScoreSnapshot, exposure: dict) -> None:
         mark = self._latest_trade_mark(trade, score.timestamp)
         if mark is None:
             return
@@ -767,20 +928,33 @@ class UnifiedSignalEngine:
             stop = entry * 0.50
             target_trim = entry * 2.0
 
-        # Add size on materially stronger score in same direction only if trade is profitable.
+        # --- Portfolio-aware: tighten stops when aggregate heat is excessive ---
+        over_heat = exposure["heat_pct"] > SIGNALS_MAX_PORTFOLIO_HEAT_PCT
+        if over_heat:
+            if pricing_mode == "credit":
+                stop = entry * 1.5   # tighter stop: 1.5× instead of 2×
+            else:
+                stop = entry * 0.65  # tighter stop: 65% instead of 50%
+
+        # Add size on materially stronger score in same direction only if trade is profitable
+        # AND portfolio heat allows it.
         add_qty = 0
         if (
             score.direction == trade["direction"]
             and score.normalized_score >= 0.85
             and qty_open == trade["quantity_initial"]
             and mark > entry  # Only pyramid when trade is already working
+            and not over_heat
         ):
             add_qty = 1
             qty_open += 1
 
         # Cut half if score deteriorates significantly — signal no longer supports the trade.
-        if score.normalized_score < 0.35 and qty_open > 1:
-            cut_qty = qty_open // 2
+        # When portfolio is over heat cap, use a looser trigger so we shed risk faster.
+        panic_threshold = 0.45 if over_heat else 0.35
+        if score.normalized_score < panic_threshold and qty_open > 1:
+            cut_pct = 0.75 if over_heat else 0.50
+            cut_qty = max(1, int(qty_open * cut_pct))
             realized += (mark - entry) * cut_qty * 100
             qty_open -= cut_qty
 
@@ -862,17 +1036,21 @@ class UnifiedSignalEngine:
         self._store_score(score)
 
         open_trades = self._fetch_open_trades()
-        for trade in open_trades:
-            self._update_open_trade(trade, score)
+        exposure = self._get_portfolio_exposure(open_trades)
 
-        opened = self._open_trade(score, ctx)
+        for trade in open_trades:
+            self._update_open_trade(trade, score, exposure)
+
+        opened = self._open_trade(score, ctx, exposure)
         logger.info(
-            "UnifiedSignalEngine [%s] score=%.3f norm=%.3f dir=%s open_trades=%d opened_new=%s",
+            "UnifiedSignalEngine [%s] score=%.3f norm=%.3f dir=%s "
+            "open_trades=%d heat=%.2f%% opened_new=%s",
             self.db_symbol,
             score.composite_score,
             score.normalized_score,
             score.direction,
             len(open_trades),
+            exposure["heat_pct"] * 100,
             opened,
         )
         return True

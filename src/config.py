@@ -168,6 +168,14 @@ VOL_AUTO_TUNE_MIN_SAMPLES = max(
 SIGNALS_UNDERLYINGS = os.getenv("SIGNALS_UNDERLYINGS", "SPY")
 SIGNALS_PORTFOLIO_SIZE = float(os.getenv("SIGNALS_PORTFOLIO_SIZE", "1000000"))
 
+# Aggregate exposure limits — prevent the engine from piling into the same
+# direction without regard for what is already on the books.
+SIGNALS_MAX_OPEN_TRADES = int(os.getenv("SIGNALS_MAX_OPEN_TRADES", "3"))
+SIGNALS_MAX_PORTFOLIO_HEAT_PCT = float(os.getenv("SIGNALS_MAX_PORTFOLIO_HEAT_PCT", "0.06"))
+SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES = int(
+    os.getenv("SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES", "30")
+)
+
 # =============================================================================
 # Ingestion Parity Guard
 # =============================================================================
@@ -218,6 +226,9 @@ def get_all_config() -> Dict[str, Any]:
         "signals": {
             "underlyings": SIGNALS_UNDERLYINGS,
             "portfolio_size": SIGNALS_PORTFOLIO_SIZE,
+            "max_open_trades": SIGNALS_MAX_OPEN_TRADES,
+            "max_portfolio_heat_pct": SIGNALS_MAX_PORTFOLIO_HEAT_PCT,
+            "same_direction_cooldown_minutes": SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES,
         },
     }
 
