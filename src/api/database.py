@@ -1551,11 +1551,14 @@ class DatabaseManager:
                     COALESCE(put_volume, 0)::bigint AS put_volume,
                     COALESCE(put_premium, 0)::numeric AS put_premium,
                     (COALESCE(call_volume, 0) - COALESCE(put_volume, 0))::bigint AS net_volume,
-                    (COALESCE(call_premium, 0) - COALESCE(put_premium, 0))::numeric AS net_premium,
                     -- Net Call Premium (NCP): buy pressure minus sell pressure on calls
                     (COALESCE(call_buy_premium, 0) - COALESCE(call_sell_premium, 0))::numeric AS ncp,
                     -- Net Put Premium (NPP): buy pressure minus sell pressure on puts (negated)
                     (-(COALESCE(put_buy_premium, 0) - COALESCE(put_sell_premium, 0)))::numeric AS npp,
+                    (
+                        (COALESCE(call_buy_premium, 0) - COALESCE(call_sell_premium, 0))
+                        - (COALESCE(put_buy_premium, 0) - COALESCE(put_sell_premium, 0))
+                    )::numeric AS net_premium,
                     underlying_price
                 FROM dense
             )
@@ -1564,8 +1567,10 @@ class DatabaseManager:
                 symbol,
                 call_volume,
                 call_premium,
+                ncp AS net_call_premium,
                 put_volume,
                 put_premium,
+                npp AS net_put_premium,
                 net_volume,
                 net_premium,
                 -- Cumulative NCP: running sum of net call buying (positive = net call buying)

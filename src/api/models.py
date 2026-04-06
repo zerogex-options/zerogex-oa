@@ -165,8 +165,10 @@ class FlowByTypePoint(BaseModel):
     symbol: str
     call_volume: int
     call_premium: Decimal
+    net_call_premium: Decimal
     put_volume: int
     put_premium: Decimal
+    net_put_premium: Decimal
     net_volume: int
     net_premium: Decimal
     cumulative_call_premium: Decimal
