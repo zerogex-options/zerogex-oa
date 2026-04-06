@@ -2433,20 +2433,6 @@ class DatabaseManager:
                 WHERE uq.symbol = $1
                 ORDER BY uq.timestamp DESC
                 LIMIT 1
-            ),
-            intraday_totals AS (
-                SELECT
-                    (COALESCE(uq.up_volume, 0) + COALESCE(uq.down_volume, 0))::bigint AS minute_volume
-                FROM underlying_quotes uq
-                JOIN latest_quote lq ON uq.symbol = lq.symbol
-                WHERE uq.symbol = $1
-                  AND (uq.timestamp AT TIME ZONE 'America/New_York')::date
-                      = (lq.timestamp AT TIME ZONE 'America/New_York')::date
-            ),
-            cumulative AS (
-                SELECT
-                    COALESCE(SUM(minute_volume), 0)::bigint AS cumulative_daily_volume
-                FROM intraday_totals
             )
             SELECT
                 lq.timestamp,
@@ -2455,10 +2441,12 @@ class DatabaseManager:
                 lq.high,
                 lq.low,
                 lq.close,
-                c.cumulative_daily_volume,
+                COALESCE(udv.cumulative_daily_volume, 0)::bigint AS cumulative_daily_volume,
                 s.asset_type
             FROM latest_quote lq
-            CROSS JOIN cumulative c
+            LEFT JOIN underlying_daily_volume udv
+              ON udv.symbol = lq.symbol
+             AND udv.trade_date_et = (lq.timestamp AT TIME ZONE 'America/New_York')::date
             LEFT JOIN symbols s ON s.symbol = lq.symbol
         """
 

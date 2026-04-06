@@ -498,6 +498,15 @@ DROP VIEW IF EXISTS option_flow_smart_money CASCADE;
 -- Flow buying pressure + day-trading views (kept)
 -- =============================================================================
 
+DROP VIEW IF EXISTS underlying_daily_volume CASCADE;
+CREATE VIEW underlying_daily_volume AS
+SELECT
+    symbol,
+    DATE(timestamp AT TIME ZONE 'America/New_York') AS trade_date_et,
+    SUM(COALESCE(up_volume, 0) + COALESCE(down_volume, 0))::bigint AS cumulative_daily_volume
+FROM underlying_quotes
+GROUP BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York');
+
 DROP VIEW IF EXISTS underlying_buying_pressure CASCADE;
 CREATE VIEW underlying_buying_pressure AS
 SELECT
