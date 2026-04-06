@@ -2434,30 +2434,19 @@ class DatabaseManager:
                 ORDER BY uq.timestamp DESC
                 LIMIT 1
             ),
-            intraday_deltas AS (
+            intraday_totals AS (
                 SELECT
-                    CASE
-                        WHEN LAG(uq.up_volume) OVER w IS NULL THEN COALESCE(uq.up_volume, 0)
-                        ELSE GREATEST(COALESCE(uq.up_volume, 0) - COALESCE(LAG(uq.up_volume) OVER w, 0), 0)
-                    END::bigint AS up_volume_delta,
-                    CASE
-                        WHEN LAG(uq.down_volume) OVER w IS NULL THEN COALESCE(uq.down_volume, 0)
-                        ELSE GREATEST(COALESCE(uq.down_volume, 0) - COALESCE(LAG(uq.down_volume) OVER w, 0), 0)
-                    END::bigint AS down_volume_delta
+                    (COALESCE(uq.up_volume, 0) + COALESCE(uq.down_volume, 0))::bigint AS minute_volume
                 FROM underlying_quotes uq
                 JOIN latest_quote lq ON uq.symbol = lq.symbol
                 WHERE uq.symbol = $1
                   AND (uq.timestamp AT TIME ZONE 'America/New_York')::date
                       = (lq.timestamp AT TIME ZONE 'America/New_York')::date
-                WINDOW w AS (
-                    PARTITION BY uq.symbol, (uq.timestamp AT TIME ZONE 'America/New_York')::date
-                    ORDER BY uq.timestamp
-                )
             ),
             cumulative AS (
                 SELECT
-                    COALESCE(SUM(up_volume_delta + down_volume_delta), 0)::bigint AS cumulative_daily_volume
-                FROM intraday_deltas
+                    COALESCE(SUM(minute_volume), 0)::bigint AS cumulative_daily_volume
+                FROM intraday_totals
             )
             SELECT
                 lq.timestamp,

@@ -619,8 +619,8 @@ Stores 1-minute aggregated underlying symbol quotes.
 | `high` | NUMERIC(12,4) | Max price in bucket |
 | `low` | NUMERIC(12,4) | Min price in bucket |
 | `close` | NUMERIC(12,4) | Last price in bucket |
-| `up_volume` | BIGINT | RAW cumulative uptick volume |
-| `down_volume` | BIGINT | RAW cumulative downtick volume |
+| `up_volume` | BIGINT | Per-minute uptick volume from the underlying 1-minute bar |
+| `down_volume` | BIGINT | Per-minute downtick volume from the underlying 1-minute bar |
 
 **Primary Key:** `(symbol, timestamp)`
 
