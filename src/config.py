@@ -176,6 +176,11 @@ SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES = int(
     os.getenv("SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES", "30")
 )
 
+# Stop-loss as a fraction of trade outlay (entry_price * quantity * 100).
+# Default -0.25 means the trade is stopped out when it loses 25% of the
+# initial premium paid (debit trades) or 25% of max-risk (credit trades).
+SIGNALS_STOP_LOSS_PCT = float(os.getenv("SIGNALS_STOP_LOSS_PCT", "-0.25"))
+
 # =============================================================================
 # Ingestion Parity Guard
 # =============================================================================
@@ -229,6 +234,7 @@ def get_all_config() -> Dict[str, Any]:
             "max_open_trades": SIGNALS_MAX_OPEN_TRADES,
             "max_portfolio_heat_pct": SIGNALS_MAX_PORTFOLIO_HEAT_PCT,
             "same_direction_cooldown_minutes": SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES,
+            "stop_loss_pct": SIGNALS_STOP_LOSS_PCT,
         },
     }
 

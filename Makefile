@@ -288,6 +288,8 @@ help: ## Show this help message
 	@echo "  make signals-components       - Consolidated component-group breakdown"
 	@echo "  make signals-exhaustion       - Latest ZeroGEX Exhaustion from consolidated payload"
 	@echo "  make signals-history          - Managed trade history with outcomes + P&L"
+	@echo "  make signals-wipe-open        - Delete all OPEN signal trades (with confirmation)"
+	@echo "  make signals-wipe-all         - Delete ALL signal trades (with confirmation)"
 	@echo "  make signals-trades           - Latest managed trades from signal_engine_trade_ideas"
 	@echo "  make signals-trades-raw       - Raw managed-trade rows from signal_engine_trade_ideas"
 	@echo "  make signals-all-symbols      - Latest consolidated signal for every tracked symbol"
@@ -1677,6 +1679,30 @@ signals-components: ## Show latest component payload keys
 signals-live: ## Open/live signal trades from DB
 	@echo "$(BLUE)=== Live Signal Trades ===$(NC)"
 	@$(PSQL) -c "SELECT underlying, opened_at AT TIME ZONE 'America/New_York' AS opened_et, direction, option_symbol, entry_price, current_price, quantity_open, total_pnl, pnl_percent FROM signal_trades WHERE status='open' ORDER BY opened_at DESC;"
+
+.PHONY: signals-wipe-open
+signals-wipe-open: ## Delete all OPEN signal trades (with confirmation)
+	@echo "$(RED)⚠️  WARNING: This will permanently delete ALL open signal trades!$(NC)"
+	@read -p "Are you sure? Type 'yes' to confirm: " confirm; \
+	if [ "$$confirm" = "yes" ]; then \
+		echo "$(YELLOW)Deleting open signal trades...$(NC)"; \
+		$(PSQL) -c "DELETE FROM signal_trades WHERE status = 'open';"; \
+		echo "$(GREEN)✅ All open signal trades deleted$(NC)"; \
+	else \
+		echo "$(RED)❌ Aborted$(NC)"; \
+	fi
+
+.PHONY: signals-wipe-all
+signals-wipe-all: ## Delete ALL signal trades (open + closed) (with confirmation)
+	@echo "$(RED)⚠️  WARNING: This will permanently delete ALL signal trades (open AND closed)!$(NC)"
+	@read -p "Are you sure? Type 'yes' to confirm: " confirm; \
+	if [ "$$confirm" = "yes" ]; then \
+		echo "$(YELLOW)Deleting all signal trades...$(NC)"; \
+		$(PSQL) -c "DELETE FROM signal_trades;"; \
+		echo "$(GREEN)✅ All signal trades deleted$(NC)"; \
+	else \
+		echo "$(RED)❌ Aborted$(NC)"; \
+	fi
 
 .PHONY: signals-history
 signals-history: ## Closed trade history with outcomes and PnL

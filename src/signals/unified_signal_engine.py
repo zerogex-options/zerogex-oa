@@ -18,6 +18,7 @@ from src.config import (
     SIGNALS_MAX_PORTFOLIO_HEAT_PCT,
     SIGNALS_PORTFOLIO_SIZE,
     SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES,
+    SIGNALS_STOP_LOSS_PCT,
 )
 from src.database import db_connection
 from src.signals.position_optimizer_engine import PositionOptimizerContext, PositionOptimizerEngine
@@ -758,7 +759,43 @@ class UnifiedSignalEngine:
     # Trade entry
     # ------------------------------------------------------------------
 
-    def _open_trade(self, score: ScoreSnapshot, market_ctx: dict, exposure: dict, conn=None) -> bool:
+    def _aggregate_net_direction(self, open_trades: list[dict]) -> tuple[int, int]:
+        """Return (bullish_contracts, bearish_contracts) across all open trades."""
+        bull = sum(t["quantity_open"] for t in open_trades if t["direction"] == "bullish")
+        bear = sum(t["quantity_open"] for t in open_trades if t["direction"] == "bearish")
+        return bull, bear
+
+    def _should_open_for_environment(
+        self, score: ScoreSnapshot, open_trades: list[dict], exposure: dict
+    ) -> tuple[bool, str]:
+        """Decide whether a new trade improves the aggregate position for the current environment.
+
+        Considers the net direction of all live trades.  If the aggregate is
+        already aligned with the score direction, only open if the signal is
+        very strong.  If the aggregate is opposed, a new trade acts as a
+        hedge or rebalance and is allowed at the normal threshold.
+        """
+        bull_qty, bear_qty = self._aggregate_net_direction(open_trades)
+        net_qty = bull_qty - bear_qty  # positive = net bullish
+
+        if score.direction == "bullish" and net_qty > 0:
+            # Already net bullish — only add more if signal is exceptionally strong
+            if score.normalized_score < 0.80:
+                return False, (
+                    f"aggregate already net bullish ({bull_qty}B/{bear_qty}S); "
+                    f"score {score.normalized_score:.3f} < 0.80 threshold to add more"
+                )
+        elif score.direction == "bearish" and net_qty < 0:
+            # Already net bearish — same logic
+            if score.normalized_score < 0.80:
+                return False, (
+                    f"aggregate already net bearish ({bull_qty}B/{bear_qty}S); "
+                    f"score {score.normalized_score:.3f} < 0.80 threshold to add more"
+                )
+
+        return True, "ok"
+
+    def _open_trade(self, score: ScoreSnapshot, market_ctx: dict, exposure: dict, open_trades: list[dict], conn=None) -> bool:
         # Dynamic trigger threshold: raise bar in high-IV environments (>70th percentile)
         # where options premium is expensive and signals are noisier.
         iv_rank = market_ctx.get("iv_rank")
@@ -792,6 +829,17 @@ class UnifiedSignalEngine:
                 "UnifiedSignalEngine [%s]: entry blocked — %s",
                 self.db_symbol,
                 reason,
+            )
+            return False
+
+        # Aggregate net-position optimization: only open when the new trade
+        # improves or rebalances the portfolio for the current environment.
+        env_ok, env_reason = self._should_open_for_environment(score, open_trades, exposure)
+        if not env_ok:
+            logger.info(
+                "UnifiedSignalEngine [%s]: entry blocked — %s",
+                self.db_symbol,
+                env_reason,
             )
             return False
 
@@ -872,7 +920,6 @@ class UnifiedSignalEngine:
                     0, 0, 0, 0,
                     %s::jsonb
                 )
-                ON CONFLICT (underlying, signal_timestamp) DO NOTHING
                 """,
                 (
                     self.db_symbol,
@@ -928,37 +975,25 @@ class UnifiedSignalEngine:
         optimizer_meta = meta.get("optimizer") if isinstance(meta, dict) else {}
         pricing_mode = optimizer_meta.get("pricing_mode") if isinstance(optimizer_meta, dict) else "single_leg"
 
+        # Configurable stop-loss: SIGNALS_STOP_LOSS_PCT is negative (e.g. -0.25 = -25%).
+        stop_loss_frac = abs(SIGNALS_STOP_LOSS_PCT)
         if pricing_mode == "credit":
-            # Credit spreads: stop if mark reaches 2× entry (premium doubled = max pain),
-            # trim when mark drops to 50% of entry credit (half the premium captured).
-            stop = entry * 2.0
+            # Credit: stop when mark rises by stop_loss_frac of entry (e.g. 1.25× entry).
+            stop = entry * (1.0 + stop_loss_frac)
             target_trim = entry * 0.50
         else:
-            # Debit spreads / single leg: stop at 50% loss of premium paid,
-            # trim at 100% return (doubled the premium paid).
-            stop = entry * 0.50
+            # Debit/single-leg: stop when mark drops by stop_loss_frac of entry (e.g. 0.75× entry).
+            stop = entry * (1.0 - stop_loss_frac)
             target_trim = entry * 2.0
 
         # --- Portfolio-aware: tighten stops when aggregate heat is excessive ---
         over_heat = exposure["heat_pct"] > SIGNALS_MAX_PORTFOLIO_HEAT_PCT
         if over_heat:
+            tighter_frac = stop_loss_frac * 0.6  # 60% of normal stop distance
             if pricing_mode == "credit":
-                stop = entry * 1.5   # tighter stop: 1.5× instead of 2×
+                stop = entry * (1.0 + tighter_frac)
             else:
-                stop = entry * 0.65  # tighter stop: 65% instead of 50%
-
-        # Add size on materially stronger score in same direction only if trade is profitable
-        # AND portfolio heat allows it.
-        add_qty = 0
-        if (
-            score.direction == trade["direction"]
-            and score.normalized_score >= 0.85
-            and qty_open == trade["quantity_initial"]
-            and mark > entry  # Only pyramid when trade is already working
-            and not over_heat
-        ):
-            add_qty = 1
-            qty_open += 1
+                stop = entry * (1.0 - tighter_frac)
 
         # Cut half if score deteriorates significantly — signal no longer supports the trade.
         # When portfolio is over heat cap, use a looser trigger so we shed risk faster.
@@ -985,9 +1020,9 @@ class UnifiedSignalEngine:
 
         # Hard stop or opposite signal closes.
         if pricing_mode == "credit":
-            stop_hit = mark >= stop  # Credit: stop when premium doubled (loss)
+            stop_hit = mark >= stop  # Credit: stop when premium rose past threshold (loss)
         else:
-            stop_hit = mark <= stop  # Debit: stop when premium halved (loss)
+            stop_hit = mark <= stop  # Debit: stop when premium fell past threshold (loss)
 
         if stop_hit or (score.direction != "neutral" and score.direction != trade["direction"] and score.normalized_score >= 0.55):
             realized += (mark - entry) * qty_open * 100
@@ -1007,7 +1042,6 @@ class UnifiedSignalEngine:
                 UPDATE signal_trades
                 SET current_price = %s,
                     quantity_open = %s,
-                    quantity_initial = quantity_initial + %s,
                     status = %s,
                     updated_at = NOW(),
                     closed_at = COALESCE(closed_at, %s),
@@ -1023,7 +1057,6 @@ class UnifiedSignalEngine:
                 (
                     mark,
                     qty_open,
-                    add_qty,
                     status,
                     closed_at,
                     round(realized, 4),
@@ -1053,7 +1086,11 @@ class UnifiedSignalEngine:
             for trade in open_trades:
                 self._update_open_trade(trade, score, exposure, conn=conn)
 
-            opened = self._open_trade(score, ctx, exposure, conn=conn)
+            # Re-fetch open trades after updates (some may have been closed).
+            open_trades = self._fetch_open_trades(conn=conn)
+            exposure = self._get_portfolio_exposure(open_trades, conn=conn)
+
+            opened = self._open_trade(score, ctx, exposure, open_trades, conn=conn)
             logger.info(
                 "UnifiedSignalEngine [%s] score=%.3f norm=%.3f dir=%s "
                 "open_trades=%d heat=%.2f%% opened_new=%s",

@@ -1058,7 +1058,6 @@ CREATE TABLE IF NOT EXISTS signal_trades (
     pnl_percent NUMERIC(12,4) NOT NULL DEFAULT 0,
     components_at_entry JSONB NOT NULL DEFAULT '{}'::jsonb,
     components_latest JSONB,
-    CONSTRAINT uq_signal_trades_unique_signal UNIQUE (underlying, signal_timestamp)
 );
 
 -- Ensure existing installations converge to the latest signal_trades shape.
@@ -1121,14 +1120,15 @@ BEGIN
             CHECK (option_type IN ('C','P'));
     END IF;
 
-    IF NOT EXISTS (
+    -- Drop legacy unique constraint: trades are now independent (never add to existing).
+    IF EXISTS (
         SELECT 1
         FROM pg_constraint
         WHERE conname = 'uq_signal_trades_unique_signal'
           AND conrelid = 'signal_trades'::regclass
     ) THEN
         ALTER TABLE signal_trades
-            ADD CONSTRAINT uq_signal_trades_unique_signal UNIQUE (underlying, signal_timestamp);
+            DROP CONSTRAINT uq_signal_trades_unique_signal;
     END IF;
 END $$;
 
