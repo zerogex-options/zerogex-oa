@@ -1737,6 +1737,7 @@ class DatabaseManager:
     ) -> List[Dict[str, Any]]:
         """Get smart-money events from canonical flow_contract_facts."""
         session_start, session_end = _get_session_bounds(session)
+        limit = max(1, min(int(limit), 50))
         query = """
             WITH
             scored AS (
@@ -1806,7 +1807,7 @@ class DatabaseManager:
                 size_class,
                 underlying_price
             FROM scored
-            ORDER BY notional DESC, score DESC, timestamp DESC
+            ORDER BY ABS(notional) DESC, score DESC, timestamp DESC
             LIMIT $4
         """
 

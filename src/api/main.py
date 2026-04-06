@@ -323,12 +323,12 @@ async def get_flow_by_expiration(
 async def get_smart_money_flow(
     symbol: str = Query(default="SPY"),
     session: str = Query(default="current", pattern="^(current|prior)$"),
-    limit: int = Query(default=50, ge=1, le=500)
+    limit: int = Query(default=50, ge=1, le=50)
 ):
     """Get unusual activity / smart money flow — 1-min intervals.
     session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
     try:
-        data = await db_manager.get_smart_money_flow(symbol, session, limit)
+        data = await db_manager.get_smart_money_flow(symbol, session, min(limit, 50))
         return [SmartMoneyFlowPoint(**row) for row in data]
     except HTTPException:
         raise
