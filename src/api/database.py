@@ -2428,7 +2428,7 @@ class DatabaseManager:
                 uq.high,
                 uq.low,
                 uq.close,
-                uq.up_volume + uq.down_volume AS volume,
+                uq.up_volume + uq.down_volume AS cumulative_daily_volume,
                 s.asset_type
             FROM underlying_quotes uq
             LEFT JOIN symbols s ON s.symbol = uq.symbol

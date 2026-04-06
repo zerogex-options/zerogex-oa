@@ -482,7 +482,12 @@ def get_market_session(asset_type: Optional[str], price_is_stable: bool = False)
 # Market Data Endpoints
 # ============================================================================
 
-@app.get("/api/market/quote", response_model=UnderlyingQuote, tags=["Market Data"])
+@app.get(
+    "/api/market/quote",
+    response_model=UnderlyingQuote,
+    response_model_exclude_none=True,
+    tags=["Market Data"],
+)
 async def get_current_quote(symbol: str = Query(default="SPY")):
     """Get current underlying quote"""
     try:
@@ -492,6 +497,8 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
 
         data = dict(data)
         asset_type = data.pop("asset_type", None)
+        if "cumulative_daily_volume" in data:
+            data["volume"] = data.pop("cumulative_daily_volume")
 
         # Update per-symbol soft-close tracker and evaluate stability
         # Evict oldest entries if tracker dict grows too large

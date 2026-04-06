@@ -124,7 +124,10 @@ class TestVolExpansionEndpoint:
         assert resp.status_code == 200
         body = resp.json()
         assert body["underlying"] == "SPY"
-        assert body["composite_score"] == 7.5
+        assert body["composite_score"] == 0.75
+        assert body["max_possible_score"] == 1.0
+        assert body["normalized_score"] == 0.75
+        assert body["components"]["gex_regime"]["value"] == -0.85
         assert body["move_probability"] == 0.82
         assert body["catalyst_type"] == "gamma_squeeze"
         mock_db.get_vol_expansion_signal.assert_awaited_once_with("SPY")
