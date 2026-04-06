@@ -2421,20 +2421,56 @@ class DatabaseManager:
     async def get_latest_quote(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
         """Get latest underlying quote"""
         query = """
+            WITH latest_quote AS (
+                SELECT
+                    uq.timestamp,
+                    uq.symbol,
+                    uq.open,
+                    uq.high,
+                    uq.low,
+                    uq.close
+                FROM underlying_quotes uq
+                WHERE uq.symbol = $1
+                ORDER BY uq.timestamp DESC
+                LIMIT 1
+            ),
+            intraday_deltas AS (
+                SELECT
+                    CASE
+                        WHEN LAG(uq.up_volume) OVER w IS NULL THEN COALESCE(uq.up_volume, 0)
+                        ELSE GREATEST(COALESCE(uq.up_volume, 0) - COALESCE(LAG(uq.up_volume) OVER w, 0), 0)
+                    END::bigint AS up_volume_delta,
+                    CASE
+                        WHEN LAG(uq.down_volume) OVER w IS NULL THEN COALESCE(uq.down_volume, 0)
+                        ELSE GREATEST(COALESCE(uq.down_volume, 0) - COALESCE(LAG(uq.down_volume) OVER w, 0), 0)
+                    END::bigint AS down_volume_delta
+                FROM underlying_quotes uq
+                JOIN latest_quote lq ON uq.symbol = lq.symbol
+                WHERE uq.symbol = $1
+                  AND (uq.timestamp AT TIME ZONE 'America/New_York')::date
+                      = (lq.timestamp AT TIME ZONE 'America/New_York')::date
+                WINDOW w AS (
+                    PARTITION BY uq.symbol, (uq.timestamp AT TIME ZONE 'America/New_York')::date
+                    ORDER BY uq.timestamp
+                )
+            ),
+            cumulative AS (
+                SELECT
+                    COALESCE(SUM(up_volume_delta + down_volume_delta), 0)::bigint AS cumulative_daily_volume
+                FROM intraday_deltas
+            )
             SELECT
-                uq.timestamp,
-                uq.symbol,
-                uq.open,
-                uq.high,
-                uq.low,
-                uq.close,
-                uq.up_volume + uq.down_volume AS cumulative_daily_volume,
+                lq.timestamp,
+                lq.symbol,
+                lq.open,
+                lq.high,
+                lq.low,
+                lq.close,
+                c.cumulative_daily_volume,
                 s.asset_type
-            FROM underlying_quotes uq
-            LEFT JOIN symbols s ON s.symbol = uq.symbol
-            WHERE uq.symbol = $1
-            ORDER BY uq.timestamp DESC
-            LIMIT 1
+            FROM latest_quote lq
+            CROSS JOIN cumulative c
+            LEFT JOIN symbols s ON s.symbol = lq.symbol
         """
 
         try:
