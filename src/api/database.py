@@ -9,7 +9,7 @@ import os
 import time as time_module
 from pathlib import Path
 from typing import List, Dict, Optional, Any
-from datetime import datetime, timedelta, date, time
+from datetime import datetime, timedelta, date, time, timezone
 from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
 import logging
@@ -304,7 +304,7 @@ class DatabaseManager:
         return row
 
     async def _refresh_flow_cache(self, conn: asyncpg.Connection, symbol: str) -> None:
-        """Refresh flow caches for only the latest minute snapshot for a symbol.
+        """Refresh flow caches for the latest snapshot and any recent missing minutes.
 
         Failures here are non-fatal: the endpoint will serve whatever data
         already exists in the cache tables rather than returning a 500.
@@ -342,7 +342,7 @@ class DatabaseManager:
         if latest_ts is None:
             return
 
-        # Fetch underlying price at this timestamp
+        # Fetch underlying price at this timestamp as a fallback.
         underlying_price = await conn.fetchval(
             """
             SELECT close
@@ -354,6 +354,25 @@ class DatabaseManager:
             """,
             symbol,
             latest_ts,
+        )
+
+        last_fact_ts = await conn.fetchval(
+            """
+            SELECT timestamp
+            FROM flow_contract_facts
+            WHERE symbol = $1
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            symbol,
+        )
+
+        # Backfill from the last known canonical flow row, bounded to a recent window
+        # so one request can repair short outages without unbounded scan cost.
+        backfill_start = (
+            latest_ts - timedelta(minutes=90)
+            if last_fact_ts is None
+            else max(last_fact_ts - timedelta(minutes=1), latest_ts - timedelta(minutes=90))
         )
 
         # Canonical per-contract fact table used as the source of truth for flow APIs.
@@ -394,8 +413,8 @@ class DatabaseManager:
                     END::bigint AS bid_vol_delta
                 FROM option_chains oc
                 WHERE oc.underlying = $1
-                  AND oc.timestamp >= $2::timestamptz - INTERVAL '2 minutes'
-                  AND oc.timestamp <= $2
+                  AND oc.timestamp >= $2
+                  AND oc.timestamp <= $3
                 WINDOW w AS (PARTITION BY oc.option_symbol ORDER BY oc.timestamp)
             )
             INSERT INTO flow_contract_facts (
@@ -421,9 +440,19 @@ class DatabaseManager:
                 (bid_vol_delta * trade_price * 100)::numeric,
                 implied_volatility,
                 delta,
-                $3::numeric
+                COALESCE(
+                    (
+                        SELECT uq.close::numeric
+                        FROM underlying_quotes uq
+                        WHERE uq.symbol = $1
+                          AND uq.timestamp <= with_prev.timestamp
+                        ORDER BY uq.timestamp DESC
+                        LIMIT 1
+                    ),
+                    $4::numeric
+                ) AS underlying_price
             FROM with_prev
-            WHERE timestamp = $2
+            WHERE timestamp > $5
               AND volume_delta > 0
             ON CONFLICT (timestamp, symbol, option_symbol)
             DO UPDATE SET
@@ -441,8 +470,10 @@ class DatabaseManager:
                 updated_at = NOW()
             """,
             symbol,
+            backfill_start,
             latest_ts,
             underlying_price,
+            last_fact_ts if last_fact_ts is not None else datetime(1970, 1, 1, tzinfo=timezone.utc),
         )
 
         if not canonical_only:
@@ -1459,9 +1490,16 @@ class DatabaseManager:
         """Get option flow by type from canonical flow_contract_facts."""
         session_start, session_end = _get_session_bounds(session)
         query = """
-            WITH aggregated AS (
+            WITH minutes AS (
+                SELECT generate_series(
+                    date_trunc('minute', $2::timestamptz),
+                    date_trunc('minute', $3::timestamptz),
+                    interval '1 minute'
+                ) AS timestamp
+            ),
+            aggregated AS (
                 SELECT
-                    timestamp,
+                    date_trunc('minute', timestamp) AS timestamp,
                     symbol,
                     SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE 0 END) AS call_volume,
                     SUM(CASE WHEN option_type = 'C' THEN premium_delta ELSE 0 END) AS call_premium,
@@ -1476,7 +1514,33 @@ class DatabaseManager:
                 WHERE symbol = $1
                   AND timestamp >= $2
                   AND timestamp <= $3
-                GROUP BY timestamp, symbol
+                GROUP BY date_trunc('minute', timestamp), symbol
+            ),
+            dense AS (
+                SELECT
+                    m.timestamp,
+                    $1::text AS symbol,
+                    COALESCE(a.call_volume, 0) AS call_volume,
+                    COALESCE(a.call_premium, 0) AS call_premium,
+                    COALESCE(a.put_volume, 0) AS put_volume,
+                    COALESCE(a.put_premium, 0) AS put_premium,
+                    COALESCE(a.call_buy_premium, 0) AS call_buy_premium,
+                    COALESCE(a.call_sell_premium, 0) AS call_sell_premium,
+                    COALESCE(a.put_buy_premium, 0) AS put_buy_premium,
+                    COALESCE(a.put_sell_premium, 0) AS put_sell_premium,
+                    COALESCE(
+                        a.underlying_price,
+                        (
+                            SELECT a_prev.underlying_price
+                            FROM aggregated a_prev
+                            WHERE a_prev.timestamp <= m.timestamp
+                            ORDER BY a_prev.timestamp DESC
+                            LIMIT 1
+                        )
+                    ) AS underlying_price
+                FROM minutes m
+                LEFT JOIN aggregated a
+                    ON a.timestamp = m.timestamp
             ),
             with_net AS (
                 SELECT
@@ -1493,7 +1557,7 @@ class DatabaseManager:
                     -- Net Put Premium (NPP): buy pressure minus sell pressure on puts (negated)
                     (-(COALESCE(put_buy_premium, 0) - COALESCE(put_sell_premium, 0)))::numeric AS npp,
                     underlying_price
-                FROM aggregated
+                FROM dense
             )
             SELECT
                 timestamp,
