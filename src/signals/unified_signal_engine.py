@@ -38,6 +38,8 @@ class ScoreSnapshot:
 
 
 class UnifiedSignalEngine:
+    _iv_rank_cache: Dict[str, tuple[datetime, Optional[float]]] = {}
+
     def __init__(self, underlying: str = "SPY"):
         self.underlying = underlying.upper()
         self.db_symbol = get_canonical_symbol(self.underlying)
@@ -113,44 +115,57 @@ class UnifiedSignalEngine:
             # Used to dynamically adjust the trigger threshold (high IV = be more selective).
             iv_rank = None
             try:
-                cur.execute(
-                    """
-                    WITH current_atm AS (
-                        SELECT AVG(implied_volatility) AS current_iv
-                        FROM option_chains
-                        WHERE underlying = %s
-                          AND ABS(strike - %s) / NULLIF(%s, 0) < 0.01
-                          AND option_type = 'C'
-                          AND implied_volatility IS NOT NULL
-                          AND implied_volatility > 0
-                          AND timestamp >= %s - INTERVAL '2 hours'
-                    ),
-                    daily_iv AS (
-                        SELECT DATE_TRUNC('day', timestamp) AS day,
-                               AVG(implied_volatility) AS avg_iv
-                        FROM option_chains
-                        WHERE underlying = %s
-                          AND ABS(strike - %s) / NULLIF(%s, 0) < 0.01
-                          AND option_type = 'C'
-                          AND implied_volatility IS NOT NULL
-                          AND implied_volatility > 0
-                          AND timestamp >= NOW() - INTERVAL '30 days'
-                        GROUP BY DATE_TRUNC('day', timestamp)
+                cache_key = f"{self.db_symbol}:iv_rank"
+                cached = self._iv_rank_cache.get(cache_key)
+                if cached and (ts - cached[0]) <= timedelta(seconds=60):
+                    iv_rank = cached[1]
+                else:
+                    lower_strike = close_f * 0.99
+                    upper_strike = close_f * 1.01
+                    cur.execute(
+                        """
+                        WITH current_atm AS (
+                            SELECT AVG(implied_volatility) AS current_iv
+                            FROM option_chains
+                            WHERE underlying = %s
+                              AND strike BETWEEN %s AND %s
+                              AND option_type = 'C'
+                              AND implied_volatility IS NOT NULL
+                              AND implied_volatility > 0
+                              AND timestamp >= %s - INTERVAL '2 hours'
+                        ),
+                        daily_iv AS (
+                            SELECT DATE_TRUNC('day', timestamp) AS day,
+                                   AVG(avg_iv) AS avg_iv
+                            FROM flow_by_type
+                            WHERE symbol = %s
+                              AND option_type = 'C'
+                              AND avg_iv IS NOT NULL
+                              AND avg_iv > 0
+                              AND timestamp >= NOW() - INTERVAL '30 days'
+                            GROUP BY DATE_TRUNC('day', timestamp)
+                        )
+                        SELECT
+                            (SELECT current_iv FROM current_atm),
+                            MIN(avg_iv),
+                            MAX(avg_iv)
+                        FROM daily_iv
+                        """,
+                        (
+                            self.db_symbol,
+                            lower_strike,
+                            upper_strike,
+                            ts,
+                            self.db_symbol,
+                        ),
                     )
-                    SELECT
-                        (SELECT current_iv FROM current_atm),
-                        MIN(avg_iv),
-                        MAX(avg_iv)
-                    FROM daily_iv
-                    """,
-                    (self.db_symbol, close_f, close_f, ts, self.db_symbol, close_f, close_f),
-                )
-                iv_row = cur.fetchone()
-                if iv_row and iv_row[0] is not None and iv_row[1] is not None and iv_row[2] is not None:
-                    current_iv, iv_low, iv_high = float(iv_row[0]), float(iv_row[1]), float(iv_row[2])
-                    iv_range = iv_high - iv_low
-                    if iv_range > 0.001:
-                        iv_rank = round(min(1.0, max(0.0, (current_iv - iv_low) / iv_range)), 4)
+                    iv_row = cur.fetchone()
+                    if iv_row and iv_row[0] is not None and iv_row[1] is not None and iv_row[2] is not None:
+                        current_iv, iv_low, iv_high = float(iv_row[0]), float(iv_row[1]), float(iv_row[2])
+                        iv_range = iv_high - iv_low
+                        if iv_range > 0.001:
+                            iv_rank = round(min(1.0, max(0.0, (current_iv - iv_low) / iv_range)), 4)
+                    self._iv_rank_cache[cache_key] = (ts, iv_rank)
             except Exception:
                 pass  # IV rank is supplemental; do not block signal generation if unavailable
 
