@@ -83,6 +83,9 @@ FLOW_CACHE_REFRESH_MIN_SECONDS = float(
     os.getenv("FLOW_CACHE_REFRESH_MIN_SECONDS", "15")
 )
 FLOW_CANONICAL_ONLY = os.getenv("FLOW_CANONICAL_ONLY", "true").lower() == "true"
+ANALYTICS_FLOW_CACHE_REFRESH_ENABLED = (
+    os.getenv("ANALYTICS_FLOW_CACHE_REFRESH_ENABLED", "false").lower() == "true"
+)
 TS_REFRESH_BUFFER_SECONDS = int(os.getenv("TS_REFRESH_BUFFER_SECONDS", "30"))
 TS_MIN_FORCE_REFRESH_INTERVAL_SECONDS = int(
     os.getenv("TS_MIN_FORCE_REFRESH_INTERVAL_SECONDS", "60")
@@ -98,6 +101,10 @@ AGGREGATION_BUCKET_SECONDS = int(os.getenv("AGGREGATION_BUCKET_SECONDS", "60")) 
 # Buffer Flush Settings
 MAX_BUFFER_SIZE = int(os.getenv("MAX_BUFFER_SIZE", "1000"))  # flush if buffer exceeds
 BUFFER_FLUSH_INTERVAL = int(os.getenv("BUFFER_FLUSH_INTERVAL", "60"))  # seconds
+# Throttle in-minute option upserts per contract/bucket to reduce UPDATE churn.
+OPTION_BUCKET_WRITE_MIN_SECONDS = float(
+    os.getenv("OPTION_BUCKET_WRITE_MIN_SECONDS", "5")
+)
 
 # =============================================================================
 # Greeks & IV Calculation Configuration
@@ -218,11 +225,14 @@ def get_all_config() -> Dict[str, Any]:
             "option_volume_coverage_alert_threshold": OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD,
             "option_rest_seed_on_recalc": OPTION_REST_SEED_ON_RECALC,
             "flow_cache_refresh_min_seconds": FLOW_CACHE_REFRESH_MIN_SECONDS,
+            "analytics_flow_cache_refresh_enabled": ANALYTICS_FLOW_CACHE_REFRESH_ENABLED,
+            "option_bucket_write_min_seconds": OPTION_BUCKET_WRITE_MIN_SECONDS,
         },
         "features": {
             "greeks_enabled": GREEKS_ENABLED,
             "ingest_parity_guard_enabled": INGEST_PARITY_GUARD_ENABLED,
             "flow_canonical_only": FLOW_CANONICAL_ONLY,
+            "analytics_flow_cache_refresh_enabled": ANALYTICS_FLOW_CACHE_REFRESH_ENABLED,
         },
         "auth": {
             "refresh_buffer_seconds": TS_REFRESH_BUFFER_SECONDS,
