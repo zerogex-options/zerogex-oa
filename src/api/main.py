@@ -94,7 +94,6 @@ app = FastAPI(
         {"name": "Max Pain", "description": "Max pain analysis"},
         {"name": "Day Trading", "description": "Intraday trading signals: VWAP, ORB, dealer hedging, volume, momentum"},
         {"name": "Trade Signals", "description": "Composite trade signal generation"},
-        {"name": "Volatility", "description": "Volatility gauge, term structure, and implied-volatility surface analytics"},
     ]
 )
 

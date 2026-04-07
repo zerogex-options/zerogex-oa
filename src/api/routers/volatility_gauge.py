@@ -1,7 +1,7 @@
 """
 Volatility Gauge Router
 
-GET /api/volatility/gauge
+GET /api/market/vix
 
 Returns $VIX.X metrics as two scored dimensions:
   - level    (0–10): Current VIX reading expressed on a log scale anchored to
@@ -36,7 +36,7 @@ from src.validation import safe_float
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/volatility", tags=["Volatility"])
+router = APIRouter(prefix="/api/market", tags=["Market Data"])
 
 ET = pytz.timezone("US/Eastern")
 
@@ -360,7 +360,7 @@ class VolatilityGaugeResponse(BaseModel):
 # Endpoint
 # ============================================================================
 
-@router.get("/gauge", response_model=VolatilityGaugeResponse)
+@router.get("/vix", response_model=VolatilityGaugeResponse)
 async def get_volatility_gauge():
     """
     Returns $VIX.X volatility metrics as two scored dimensions.

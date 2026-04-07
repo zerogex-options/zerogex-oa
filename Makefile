@@ -2221,8 +2221,8 @@ api-test: ## Test ALL API endpoints
 	test_endpoint "/api/max-pain/current?symbol=$$SYMBOL&strike_limit=100"; \
 	echo ""; \
 	echo "$(YELLOW)Volatility endpoints$(NC)"; \
-	test_endpoint "/api/volatility/gauge"; \
-	test_endpoint "/api/volatility/surface?symbol=$$SYMBOL"; \
+	test_endpoint "/api/market/vix"; \
+	test_endpoint "/api/gex/vol_surface?symbol=$$SYMBOL"; \
 	echo ""; \
 	echo "$(YELLOW)Trade signal endpoints$(NC)"; \
 	test_endpoint "/api/signals/trades-live"; \

@@ -1,7 +1,7 @@
 """
 Vol Surface Router
 
-GET /api/volatility/surface?symbol=SPY&dte_max=60&strike_count=30
+GET /api/gex/vol_surface?symbol=SPY&dte_max=60&strike_count=30
 
 Returns the implied-volatility surface (strike × expiration), ATM term
 structure, and 25-delta skew for the requested underlying.
@@ -17,7 +17,7 @@ import threading
 from ..database import DatabaseManager
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/volatility/surface", tags=["Volatility"])
+router = APIRouter(prefix="/api/gex/vol_surface", tags=["GEX"])
 
 # ---------------------------------------------------------------------------
 # Response models
