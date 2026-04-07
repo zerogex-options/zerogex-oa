@@ -777,11 +777,10 @@ underlying: ## Last 10 underlying bars
 
 .PHONY: underlying-live
 underlying-live: ## Live latest underlying row (default SPY) refreshed every second in-place
+	@clear
 	@echo "$(BLUE)=== Live Underlying ($(UNDERLYING_LIVE_SYMBOL)) — Ctrl+C to stop ===$(NC)"
 	@while true; do \
-		clear; \
-		echo "$(BLUE)=== Live Underlying ($(UNDERLYING_LIVE_SYMBOL)) — Ctrl+C to stop ===$(NC)"; \
-		$(PSQL) -c "\
+		output="$$( $(PSQL) -c "\
 			SELECT \
 				symbol, \
 				timestamp, \
@@ -796,7 +795,9 @@ underlying-live: ## Live latest underlying row (default SPY) refreshed every sec
 			FROM underlying_quotes \
 			WHERE symbol = '$(UNDERLYING_LIVE_SYMBOL)' \
 			ORDER BY timestamp DESC \
-			LIMIT 1;"; \
+			LIMIT 1;" )"; \
+		printf "\033[H"; \
+		echo "$$output"; \
 		sleep 1; \
 	done
 
