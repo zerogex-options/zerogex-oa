@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import re
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -21,21 +20,20 @@ from src.config import (
     SIGNALS_STOP_LOSS_PCT,
 )
 from src.database import db_connection
-from src.signals.position_optimizer_engine import PositionOptimizerContext, PositionOptimizerEngine
+from src.signals.position_optimizer_engine import PositionOptimizerContext, PositionOptimizerEngine, fetch_option_snapshot
+from src.signals.scoring_engine import ScoringEngine, ScoreSnapshot
+from src.signals.components.gex_regime import GexRegimeComponent
+from src.signals.components.gamma_flip import GammaFlipComponent
+from src.signals.components.put_call_ratio import PutCallRatioComponent
+from src.signals.components.smart_money import SmartMoneyComponent
+from src.signals.components.vol_expansion import VolExpansionComponent
+from src.signals.components.exhaustion import ExhaustionComponent
+from src.signals.components.opportunity_quality import OpportunityQualityComponent
+from src.signals.components.base import MarketContext
 from src.symbols import get_canonical_symbol
 from src.utils import get_logger
 
 logger = get_logger(__name__)
-
-
-@dataclass
-class ScoreSnapshot:
-    timestamp: datetime
-    underlying: str
-    composite_score: float
-    normalized_score: float
-    direction: str
-    components: dict
 
 
 class UnifiedSignalEngine:
@@ -44,6 +42,19 @@ class UnifiedSignalEngine:
         self.db_symbol = get_canonical_symbol(self.underlying)
         self.trigger_threshold = 0.58
         self.position_optimizer = PositionOptimizerEngine(self.underlying)
+
+        self.scoring_engine = ScoringEngine(
+            underlying=self.db_symbol,
+            components=[
+                GexRegimeComponent(),
+                GammaFlipComponent(),
+                PutCallRatioComponent(),
+                SmartMoneyComponent(),
+                VolExpansionComponent(),
+                ExhaustionComponent(),
+                OpportunityQualityComponent(self.underlying),
+            ],
+        )
 
     @staticmethod
     @contextmanager
@@ -168,159 +179,6 @@ class UnifiedSignalEngine:
                 "iv_rank": iv_rank,
             }
 
-    @staticmethod
-    def _direction(score: float) -> str:
-        if score > 0:
-            return "bullish"
-        if score < 0:
-            return "bearish"
-        return "neutral"
-
-    @staticmethod
-    def _compute_rsi(closes: list[float], period: int = 14) -> Optional[float]:
-        if len(closes) < period + 1:
-            return None
-        gains = losses = 0.0
-        for i in range(-period, 0):
-            delta = closes[i] - closes[i - 1]
-            if delta >= 0:
-                gains += delta
-            else:
-                losses += abs(delta)
-        avg_gain = gains / period
-        avg_loss = losses / period
-        if avg_loss == 0:
-            return 100.0 if avg_gain > 0 else 50.0  # Pure uptrend vs flat market
-        rs = avg_gain / avg_loss
-        return 100 - (100 / (1 + rs))
-
-    def _compute_exhaustion(self, closes: list[float]) -> tuple[float, str]:
-        if len(closes) < 8:
-            return 0.0, "insufficient_data"
-        short = sum(closes[-5:]) / 5
-        long_ = sum(closes[-8:]) / 8
-        drift = (short - long_) / long_ if long_ else 0.0
-        drift_score = min(1.0, abs(drift) * 20)
-
-        # RSI extreme: overbought (>72) or oversold (<28) signals potential exhaustion
-        rsi_score = 0.0
-        if len(closes) >= 15:
-            rsi = self._compute_rsi(closes, 14)
-            if rsi is not None:
-                if rsi > 72:
-                    rsi_score = min(1.0, (rsi - 72) / 18.0)
-                elif rsi < 28:
-                    rsi_score = min(1.0, (28 - rsi) / 18.0)
-
-        # Price extension beyond 8-bar mean: >1.5% extension signals overextension
-        extension_score = 0.0
-        if long_ > 0:
-            extension = abs(closes[-1] - long_) / long_
-            extension_score = min(1.0, extension / 0.015)
-
-        score = 0.50 * drift_score + 0.30 * rsi_score + 0.20 * extension_score
-        label = "exhausting" if score > 0.6 else "controlled"
-        return score, label
-
-    def _compute_score(self, ctx: dict) -> ScoreSnapshot:
-        gex_score = -1.0 if ctx["net_gex"] < 0 else 1.0
-
-        # Gamma flip: neutral near flip (uncertainty zone), directional otherwise
-        flip_score = 0.0
-        if ctx["gamma_flip"]:
-            dist = (ctx["close"] - ctx["gamma_flip"]) / ctx["gamma_flip"]
-            if abs(dist) < 0.003:
-                flip_score = 0.0  # Uncertainty zone — near the regime inflection point
-            elif dist > 0:
-                flip_score = 1.0  # Above flip: negative-GEX territory → momentum amplification
-            else:
-                flip_score = -1.0  # Below flip: positive-GEX territory → mean-reversion dampening
-
-        pcr = ctx["put_call_ratio"]
-        pcr_score = 1.0 if pcr < 0.8 else (-1.0 if pcr > 1.2 else 0.0)
-
-        # Smart money: only score if combined premium is meaningful (avoids low-volume noise)
-        sm_total = ctx["smart_call"] + ctx["smart_put"]
-        if sm_total >= 100_000:
-            sm_ratio = (ctx["smart_call"] + 1.0) / (ctx["smart_put"] + 1.0)
-            sm_score = 1.0 if sm_ratio > 1.2 else (-1.0 if sm_ratio < 0.8 else 0.0)
-        else:
-            sm_ratio = 1.0
-            sm_score = 0.0  # Insufficient premium flow — no edge
-
-        exhaustion, exhaustion_state = self._compute_exhaustion(ctx["recent_closes"])
-        exhaustion_dir = -1.0 if sm_score > 0 else (1.0 if sm_score < 0 else 0.0)
-        exhaustion_score = exhaustion_dir * exhaustion
-
-        # Vol expansion: negative GEX amplifies price momentum; positive GEX pins toward flip
-        vol_pressure = min(1.0, abs(ctx["net_gex"]) / 5_000_000_000)
-        closes = ctx["recent_closes"]
-        price_momentum_dir = 0.0
-        if len(closes) >= 5 and closes[-5] > 0:
-            price_momentum_dir = 1.0 if closes[-1] > closes[-5] else -1.0
-        if ctx["net_gex"] < 0:
-            # Negative GEX: dealers amplify moves — directional with price momentum
-            vol_score = price_momentum_dir * vol_pressure
-        else:
-            # Positive GEX: dealers dampen moves — mean-reversion pull toward gamma flip
-            vol_score = 0.0
-            if ctx["gamma_flip"] and ctx["gamma_flip"] > 0:
-                flip_dist_ratio = (ctx["close"] - ctx["gamma_flip"]) / ctx["gamma_flip"]
-                if abs(flip_dist_ratio) > 0.003:
-                    pull = min(abs(flip_dist_ratio) / 0.01, 1.0) * vol_pressure * 0.5
-                    vol_score = pull * (-1.0 if flip_dist_ratio > 0 else 1.0)
-
-        weighted = {
-            "gex_regime": {"weight": 0.22, "score": gex_score, "value": ctx["net_gex"]},
-            "gamma_flip": {"weight": 0.15, "score": flip_score, "value": ctx["gamma_flip"]},
-            "put_call_ratio": {"weight": 0.12, "score": pcr_score, "value": pcr},
-            "smart_money": {"weight": 0.16, "score": sm_score, "value": sm_ratio},
-            "vol_expansion": {"weight": 0.20, "score": vol_score, "value": vol_pressure},
-            "exhaustion": {
-                "weight": 0.15,
-                "score": exhaustion_score,
-                "value": exhaustion,
-                "state": exhaustion_state,
-            },
-        }
-
-        composite = sum(c["weight"] * c["score"] for c in weighted.values())
-        normalized = abs(composite)
-        return ScoreSnapshot(
-            timestamp=ctx["timestamp"],
-            underlying=self.db_symbol,
-            composite_score=round(composite, 6),
-            normalized_score=round(normalized, 6),
-            direction=self._direction(composite),
-            components=weighted,
-        )
-
-    def _store_score(self, score: ScoreSnapshot, conn=None) -> None:
-        with self._use_conn(conn) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO signal_scores (
-                    underlying, timestamp, composite_score, normalized_score, direction, components
-                ) VALUES (%s, %s, %s, %s, %s, %s::jsonb)
-                ON CONFLICT (underlying, timestamp) DO UPDATE SET
-                    composite_score = EXCLUDED.composite_score,
-                    normalized_score = EXCLUDED.normalized_score,
-                    direction = EXCLUDED.direction,
-                    components = EXCLUDED.components,
-                    updated_at = NOW()
-                """,
-                (
-                    score.underlying,
-                    score.timestamp,
-                    score.composite_score,
-                    score.normalized_score,
-                    score.direction,
-                    json.dumps(score.components, default=str),
-                ),
-            )
-            conn.commit()
-
     def _select_contract(self, as_of: datetime, direction: str, spot: float, conn=None) -> Optional[dict]:
         opt_type = "C" if direction == "bullish" else "P"
         with self._use_conn(conn) as conn:
@@ -372,78 +230,6 @@ class UnifiedSignalEngine:
         if normalized_score >= 0.68:
             return "swing"
         return "multi_day"
-
-    def _fetch_optimizer_snapshot_rows(self, as_of: datetime, timeframe: str, conn=None) -> tuple[list[dict], int, int]:
-        # Keep defaults in sync with optimizer module constants.
-        dte_min, dte_max = (1, 7)
-        if timeframe == "intraday":
-            dte_min, dte_max = (0, 2)
-        elif timeframe == "swing":
-            dte_min, dte_max = (1, 7)
-        elif timeframe == "multi_day":
-            dte_min, dte_max = (3, 14)
-
-        with self._use_conn(conn) as conn:
-            cur = conn.cursor()
-            trade_date = as_of.date()
-            cur.execute(
-                """
-                SELECT timestamp
-                FROM option_chains
-                WHERE underlying = %s
-                  AND timestamp <= %s
-                  AND expiration BETWEEN (%s::date + (%s * INTERVAL '1 day'))
-                                      AND (%s::date + (%s * INTERVAL '1 day'))
-                  AND (
-                      (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
-                      OR (last IS NOT NULL AND last > 0)
-                  )
-                ORDER BY timestamp DESC
-                LIMIT 1
-                """,
-                (self.db_symbol, as_of, trade_date, dte_min, trade_date, dte_max),
-            )
-            snapshot_row = cur.fetchone()
-            snapshot_ts = snapshot_row[0] if snapshot_row else None
-            if not snapshot_ts:
-                return [], dte_min, dte_max
-
-            cur.execute(
-                """
-                SELECT expiration, strike, option_type, bid, ask, last, delta, gamma, theta,
-                       implied_volatility, volume, open_interest
-                FROM option_chains
-                WHERE underlying = %s
-                  AND timestamp = %s
-                  AND expiration BETWEEN (%s::date + (%s * INTERVAL '1 day'))
-                                      AND (%s::date + (%s * INTERVAL '1 day'))
-                  AND (
-                      (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
-                      OR (last IS NOT NULL AND last > 0)
-                  )
-                ORDER BY expiration, option_type, strike
-                """,
-                (self.db_symbol, snapshot_ts, trade_date, dte_min, trade_date, dte_max),
-            )
-            rows = cur.fetchall()
-            option_rows = [
-                {
-                    "expiration": row[0],
-                    "strike": float(row[1]),
-                    "option_type": row[2],
-                    "bid": float(row[3] or 0.0),
-                    "ask": float(row[4] or 0.0),
-                    "last": float(row[5] or 0.0),
-                    "delta": float(row[6] or 0.0),
-                    "gamma": float(row[7] or 0.0),
-                    "theta": float(row[8] or 0.0),
-                    "iv": float(row[9] or 0.0),
-                    "volume": int(row[10] or 0),
-                    "open_interest": int(row[11] or 0),
-                }
-                for row in rows
-            ]
-            return option_rows, dte_min, dte_max
 
     @staticmethod
     def _legs_from_candidate(candidate: dict) -> list[dict]:
@@ -503,7 +289,11 @@ class UnifiedSignalEngine:
     def _select_optimizer_candidate(self, score: ScoreSnapshot, ctx: dict, conn=None) -> Optional[dict]:
         signal_timeframe = self._infer_signal_timeframe(score.normalized_score)
         signal_strength = self._infer_signal_strength(score.normalized_score)
-        option_rows, dte_min, dte_max = self._fetch_optimizer_snapshot_rows(score.timestamp, signal_timeframe, conn=conn)
+
+        dte_ranges = {"intraday": (0, 2), "swing": (1, 7), "multi_day": (3, 14)}
+        dte_min, dte_max = dte_ranges.get(signal_timeframe, (1, 7))
+        with self._use_conn(conn) as c:
+            option_rows = fetch_option_snapshot(c, self.db_symbol, score.timestamp, score.timestamp.date(), dte_min, dte_max)
         if not option_rows:
             return None
         optimizer_ctx = PositionOptimizerContext(
@@ -1077,8 +867,20 @@ class UnifiedSignalEngine:
                 logger.warning("UnifiedSignalEngine: missing market context")
                 return False
 
-            score = self._compute_score(ctx)
-            self._store_score(score, conn=conn)
+            market_ctx = MarketContext(
+                timestamp=ctx["timestamp"],
+                underlying=self.db_symbol,
+                close=ctx["close"],
+                net_gex=ctx["net_gex"],
+                gamma_flip=ctx["gamma_flip"],
+                put_call_ratio=ctx["put_call_ratio"],
+                max_pain=ctx["max_pain"],
+                smart_call=ctx["smart_call"],
+                smart_put=ctx["smart_put"],
+                recent_closes=ctx["recent_closes"],
+                iv_rank=ctx.get("iv_rank"),
+            )
+            score = self.scoring_engine.score_and_persist(market_ctx, conn=conn)
 
             open_trades = self._fetch_open_trades(conn=conn)
             exposure = self._get_portfolio_exposure(open_trades, conn=conn)

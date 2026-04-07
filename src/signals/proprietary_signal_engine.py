@@ -1,4 +1,8 @@
-"""Proprietary Signal Engine with lifecycle, sizing, and live-cost tracking."""
+"""
+Deprecated. ProprietarySignalEngine is superseded by UnifiedSignalEngine
+and the PortfolioEngine introduced in the Part 2 refactor. This module is
+retained for import compatibility only. run_cycle() is a no-op.
+"""
 
 from __future__ import annotations
 
@@ -291,26 +295,8 @@ class ProprietarySignalEngine:
             return cur.fetchone() is not None
 
     def run_cycle(self) -> bool:
-        mark = self._fetch_underlying_mark()
-        if mark is None:
-            logger.warning("ProprietarySignalEngine: no underlying mark, skipping")
-            return False
-
-        active_trades = self._fetch_active_trades()
-        updated_any = False
-        for trade in active_trades:
-            updated_any = self._update_active_trade(trade, mark) or updated_any
-
-        optimizer_signal = self._fetch_latest_optimizer_signal()
-        if not optimizer_signal or optimizer_signal["direction"] == "neutral":
-            if not updated_any:
-                logger.info("ProprietarySignalEngine [%s] %s", self.db_symbol, STATUS_READY)
-            return updated_any
-
-        idea = self._build_idea(optimizer_signal, mark)
-        if self._trade_exists_for_signal(idea.signal_timestamp, idea.strategy_type, idea.strikes):
-            return updated_any
-
-        self._store_new_trade(idea)
-        logger.info("ProprietarySignalEngine [%s] launched %s", self.db_symbol, asdict(idea))
-        return True
+        logger.warning(
+            "ProprietarySignalEngine is deprecated and has no effect. "
+            "Use UnifiedSignalEngine instead."
+        )
+        return False

@@ -5,6 +5,9 @@ __all__ = [
     "PositionOptimizerEngine",
     "ProprietarySignalEngine",
     "ConsolidatedSignalEngine",
+    "ScoringEngine",
+    "ComponentBase",
+    "MarketContext",
 ]
 
 
@@ -21,4 +24,13 @@ def __getattr__(name):
     if name == "ConsolidatedSignalEngine":
         from src.signals.consolidated_signal_engine import ConsolidatedSignalEngine
         return ConsolidatedSignalEngine
+    if name == "ScoringEngine":
+        from src.signals.scoring_engine import ScoringEngine
+        return ScoringEngine
+    if name == "ComponentBase":
+        from src.signals.components.base import ComponentBase
+        return ComponentBase
+    if name == "MarketContext":
+        from src.signals.components.base import MarketContext
+        return MarketContext
     raise AttributeError(f"module 'src.signals' has no attribute '{name}'")

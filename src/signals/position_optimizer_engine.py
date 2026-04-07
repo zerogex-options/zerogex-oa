@@ -160,6 +160,171 @@ class PositionOptimizerAccuracySnapshot:
     profitable: bool
 
 
+def fetch_option_snapshot(
+    conn,
+    db_symbol: str,
+    anchor_ts,
+    trade_date,
+    dte_min: int,
+    dte_max: int,
+) -> list[dict]:
+    """Fetch option chain snapshot rows for a given DTE window.
+
+    Contains:
+    1. Snapshot timestamp resolution (find latest option_chains timestamp in the expiry window)
+    2. Primary option rows fetch at that timestamp
+    3. 45-day fallback widening logic if primary returns empty
+
+    Returns normalized list of row dicts.
+    """
+    cur = conn.cursor()
+
+    # Step 1: find the latest snapshot timestamp within the DTE window
+    cur.execute(
+        """
+        SELECT timestamp
+        FROM option_chains
+        WHERE underlying = %s
+          AND timestamp <= %s
+          AND expiration BETWEEN (%s::date + (%s * INTERVAL '1 day'))
+                              AND (%s::date + (%s * INTERVAL '1 day'))
+          AND (
+              (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
+              OR (last IS NOT NULL AND last > 0)
+          )
+        ORDER BY timestamp DESC
+        LIMIT 1
+        """,
+        (db_symbol, anchor_ts, trade_date, dte_min, trade_date, dte_max),
+    )
+    snapshot_row = cur.fetchone()
+    snapshot_ts = snapshot_row[0] if snapshot_row else None
+
+    if not snapshot_ts:
+        # Try the 45-day fallback immediately
+        cur.execute(
+            """
+            SELECT timestamp
+            FROM option_chains
+            WHERE underlying = %s
+              AND timestamp <= %s
+              AND expiration BETWEEN %s::date AND (%s::date + INTERVAL '45 day')
+              AND (
+                  (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
+                  OR (last IS NOT NULL AND last > 0)
+              )
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (db_symbol, anchor_ts, trade_date, trade_date),
+        )
+        snapshot_row = cur.fetchone()
+        snapshot_ts = snapshot_row[0] if snapshot_row else None
+        if not snapshot_ts:
+            return []
+
+        cur.execute(
+            """
+            SELECT expiration, strike, option_type, bid, ask, last, delta, gamma, theta,
+                   implied_volatility, volume, open_interest
+            FROM option_chains
+            WHERE underlying = %s
+              AND timestamp = %s
+              AND expiration BETWEEN %s::date AND (%s::date + INTERVAL '45 day')
+              AND (
+                  (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
+                  OR (last IS NOT NULL AND last > 0)
+              )
+            ORDER BY expiration, option_type, strike
+            """,
+            (db_symbol, snapshot_ts, trade_date, trade_date),
+        )
+    else:
+        # Step 2: fetch primary option rows at the snapshot timestamp
+        cur.execute(
+            """
+            SELECT expiration, strike, option_type, bid, ask, last, delta, gamma, theta,
+                   implied_volatility, volume, open_interest
+            FROM option_chains
+            WHERE underlying = %s
+              AND timestamp = %s
+              AND expiration BETWEEN (%s::date + (%s * INTERVAL '1 day'))
+                                  AND (%s::date + (%s * INTERVAL '1 day'))
+              AND (
+                  (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
+                  OR (last IS NOT NULL AND last > 0)
+              )
+            ORDER BY expiration, option_type, strike
+            """,
+            (db_symbol, snapshot_ts, trade_date, dte_min, trade_date, dte_max),
+        )
+
+    raw_rows = cur.fetchall()
+
+    # Step 3: 45-day fallback widening if primary returned empty
+    if not raw_rows and snapshot_ts:
+        logger.info(
+            "fetch_option_snapshot: no option rows for snapshot "
+            "[underlying=%s, dte_range=%s-%s, trade_date=%s, anchor_ts<=%s]. Widening window.",
+            db_symbol, dte_min, dte_max, trade_date, anchor_ts,
+        )
+        cur.execute(
+            """
+            SELECT timestamp
+            FROM option_chains
+            WHERE underlying = %s
+              AND timestamp <= %s
+              AND expiration BETWEEN %s::date AND (%s::date + INTERVAL '45 day')
+              AND (
+                  (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
+                  OR (last IS NOT NULL AND last > 0)
+              )
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (db_symbol, anchor_ts, trade_date, trade_date),
+        )
+        snapshot_row = cur.fetchone()
+        snapshot_ts = snapshot_row[0] if snapshot_row else None
+        if snapshot_ts:
+            cur.execute(
+                """
+                SELECT expiration, strike, option_type, bid, ask, last, delta, gamma, theta,
+                       implied_volatility, volume, open_interest
+                FROM option_chains
+                WHERE underlying = %s
+                  AND timestamp = %s
+                  AND expiration BETWEEN %s::date AND (%s::date + INTERVAL '45 day')
+                  AND (
+                      (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
+                      OR (last IS NOT NULL AND last > 0)
+                  )
+                ORDER BY expiration, option_type, strike
+                """,
+                (db_symbol, snapshot_ts, trade_date, trade_date),
+            )
+            raw_rows = cur.fetchall()
+
+    # Normalize
+    return [
+        {
+            "expiration": row[0],
+            "strike": float(row[1]),
+            "option_type": row[2],
+            "bid": float(row[3] or 0.0),
+            "ask": float(row[4] or 0.0),
+            "last": float(row[5] or 0.0),
+            "delta": float(row[6] or 0.0),
+            "gamma": float(row[7] or 0.0),
+            "theta": float(row[8] or 0.0),
+            "iv": float(row[9] or 0.0),
+            "volume": int(row[10] or 0),
+            "open_interest": int(row[11] or 0),
+        }
+        for row in raw_rows
+    ]
+
+
 class PositionOptimizerEngine:
     def __init__(self, underlying: str = "SPY"):
         self.underlying = underlying.upper()
@@ -278,6 +443,8 @@ class PositionOptimizerEngine:
 
                 dte_min, dte_max = TARGET_DTE_WINDOWS.get(signal_timeframe, (1, 7))
                 trade_date = anchor_ts.astimezone(ET).date() if anchor_ts.tzinfo else anchor_ts.date()
+
+                # Compute dealer net delta from the latest snapshot
                 cur.execute(
                     """
                     SELECT timestamp
@@ -315,143 +482,7 @@ class PositionOptimizerEngine:
                 else:
                     dealer_net_delta = 0.0
 
-                cur.execute(
-                    """
-                    SELECT
-                        expiration,
-                        strike,
-                        option_type,
-                        bid,
-                        ask,
-                        last,
-                        delta,
-                        gamma,
-                        theta,
-                        implied_volatility,
-                        volume,
-                        open_interest
-                    FROM option_chains
-                    WHERE underlying = %s
-                      AND timestamp = %s
-                      AND expiration BETWEEN (%s::date + (%s * INTERVAL '1 day'))
-                                          AND (%s::date + (%s * INTERVAL '1 day'))
-                      AND (
-                          (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
-                          OR (last IS NOT NULL AND last > 0)
-                      )
-                    ORDER BY expiration, option_type, strike
-                    """,
-                    (self.db_symbol, snapshot_ts, trade_date, dte_min, trade_date, dte_max),
-                )
-                raw_option_rows = cur.fetchall()
-
-                if not raw_option_rows:
-                    logger.info(
-                        "PositionOptimizerEngine: no option rows for snapshot "
-                        "[underlying=%s, timeframe=%s, dte_range=%s-%s, trade_date=%s, anchor_ts<=%s]. "
-                        "Widening window.",
-                        self.db_symbol,
-                        signal_timeframe,
-                        dte_min,
-                        dte_max,
-                        trade_date,
-                        anchor_ts,
-                    )
-                    if self._verbose_no_snapshot_diagnostics:
-                        cur.execute(
-                            """
-                            SELECT
-                                COUNT(*)::bigint AS total_rows,
-                                COUNT(*) FILTER (
-                                    WHERE (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
-                                       OR (last IS NOT NULL AND last > 0)
-                                )::bigint AS quote_eligible_rows,
-                                MAX(timestamp) AS latest_ts_in_window
-                            FROM option_chains
-                            WHERE underlying = %s
-                              AND timestamp <= %s
-                              AND expiration BETWEEN (%s::date + (%s * INTERVAL '1 day'))
-                                                  AND (%s::date + (%s * INTERVAL '1 day'))
-                            """,
-                            (self.db_symbol, anchor_ts, trade_date, dte_min, trade_date, dte_max),
-                        )
-                        diag_row = cur.fetchone()
-                        total_rows = int(diag_row[0] or 0) if diag_row else 0
-                        quote_eligible_rows = int(diag_row[1] or 0) if diag_row else 0
-                        latest_ts_in_window = diag_row[2] if diag_row else None
-                        logger.info(
-                            "PositionOptimizerEngine diagnostics: total_rows=%s quote_eligible_rows=%s "
-                            "latest_ts_in_window=%s selected_snapshot=%s",
-                            total_rows,
-                            quote_eligible_rows,
-                            latest_ts_in_window,
-                            snapshot_ts,
-                        )
-                    cur.execute(
-                        """
-                        SELECT timestamp
-                        FROM option_chains
-                        WHERE underlying = %s
-                          AND timestamp <= %s
-                          AND expiration BETWEEN %s::date AND (%s::date + INTERVAL '45 day')
-                          AND (
-                              (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
-                              OR (last IS NOT NULL AND last > 0)
-                          )
-                        ORDER BY timestamp DESC
-                        LIMIT 1
-                        """,
-                        (self.db_symbol, anchor_ts, trade_date, trade_date),
-                    )
-                    snapshot_row = cur.fetchone()
-                    snapshot_ts = snapshot_row[0] if snapshot_row else None
-                    cur.execute(
-                        """
-                        SELECT
-                            expiration,
-                            strike,
-                            option_type,
-                            bid,
-                            ask,
-                            last,
-                            delta,
-                            gamma,
-                            theta,
-                            implied_volatility,
-                            volume,
-                            open_interest
-                        FROM option_chains
-                        WHERE underlying = %s
-                          AND timestamp = %s
-                          AND expiration BETWEEN %s::date AND (%s::date + INTERVAL '45 day')
-                          AND (
-                              (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
-                              OR (last IS NOT NULL AND last > 0)
-                          )
-                        ORDER BY expiration, option_type, strike
-                        """,
-                        (self.db_symbol, snapshot_ts, trade_date, trade_date),
-                    )
-                    raw_option_rows = cur.fetchall()
-
-                option_rows = []
-                for row in raw_option_rows:
-                    option_rows.append(
-                        {
-                            "expiration": row[0],
-                            "strike": float(row[1]),
-                            "option_type": row[2],
-                            "bid": float(row[3] or 0.0),
-                            "ask": float(row[4] or 0.0),
-                            "last": float(row[5] or 0.0),
-                            "delta": float(row[6] or 0.0),
-                            "gamma": float(row[7] or 0.0),
-                            "theta": float(row[8] or 0.0),
-                            "iv": float(row[9] or 0.0),
-                            "volume": int(row[10] or 0),
-                            "open_interest": int(row[11] or 0),
-                        }
-                    )
+                option_rows = fetch_option_snapshot(conn, self.db_symbol, anchor_ts, trade_date, dte_min, dte_max)
                 if not option_rows:
                     logger.warning(
                         "PositionOptimizerEngine: no option rows in target expiry window for %s "

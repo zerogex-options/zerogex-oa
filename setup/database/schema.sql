@@ -318,7 +318,10 @@ SELECT
         ),
         0
     ) AS volume_delta,
-    COALESCE(open_interest - LAG(open_interest) OVER (PARTITION BY option_symbol ORDER BY timestamp), 0) AS oi_delta,
+    COALESCE(open_interest - LAG(open_interest) OVER (
+        PARTITION BY option_symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+        ORDER BY timestamp
+    ), 0) AS oi_delta,
     implied_volatility,
     delta,
     gamma,
@@ -995,6 +998,7 @@ DROP TABLE IF EXISTS consolidated_trade_signals CASCADE;
 DROP TABLE IF EXISTS consolidated_signal_accuracy CASCADE;
 DROP TABLE IF EXISTS consolidated_position_accuracy CASCADE;
 
+-- Authoritative definition. Column migrations below if needed.
 CREATE TABLE IF NOT EXISTS signal_scores (
     underlying VARCHAR(10) NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
     timestamp TIMESTAMPTZ NOT NULL,
@@ -1006,15 +1010,6 @@ CREATE TABLE IF NOT EXISTS signal_scores (
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (underlying, timestamp)
 );
-
--- Ensure existing installations converge to the latest signal_scores shape.
-ALTER TABLE signal_scores
-    ADD COLUMN IF NOT EXISTS composite_score DOUBLE PRECISION,
-    ADD COLUMN IF NOT EXISTS normalized_score DOUBLE PRECISION,
-    ADD COLUMN IF NOT EXISTS direction VARCHAR(10),
-    ADD COLUMN IF NOT EXISTS components JSONB DEFAULT '{}'::jsonb,
-    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW(),
-    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 
 DO $$
 BEGIN
@@ -1033,6 +1028,7 @@ END $$;
 CREATE INDEX IF NOT EXISTS idx_signal_scores_underlying_ts
     ON signal_scores(underlying, timestamp DESC);
 
+-- Authoritative definition. Column migrations below if needed.
 CREATE TABLE IF NOT EXISTS signal_trades (
     id BIGSERIAL PRIMARY KEY,
     underlying VARCHAR(10) NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
@@ -1057,33 +1053,8 @@ CREATE TABLE IF NOT EXISTS signal_trades (
     total_pnl NUMERIC(14,4) NOT NULL DEFAULT 0,
     pnl_percent NUMERIC(12,4) NOT NULL DEFAULT 0,
     components_at_entry JSONB NOT NULL DEFAULT '{}'::jsonb,
-    components_latest JSONB,
+    components_latest JSONB
 );
-
--- Ensure existing installations converge to the latest signal_trades shape.
-ALTER TABLE signal_trades
-    ADD COLUMN IF NOT EXISTS signal_timestamp TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW(),
-    ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS status VARCHAR(12),
-    ADD COLUMN IF NOT EXISTS direction VARCHAR(10),
-    ADD COLUMN IF NOT EXISTS score_at_entry DOUBLE PRECISION,
-    ADD COLUMN IF NOT EXISTS score_latest DOUBLE PRECISION,
-    ADD COLUMN IF NOT EXISTS option_symbol VARCHAR(50),
-    ADD COLUMN IF NOT EXISTS option_type CHAR(1),
-    ADD COLUMN IF NOT EXISTS expiration DATE,
-    ADD COLUMN IF NOT EXISTS strike NUMERIC(12,4),
-    ADD COLUMN IF NOT EXISTS entry_price NUMERIC(12,6),
-    ADD COLUMN IF NOT EXISTS current_price NUMERIC(12,6),
-    ADD COLUMN IF NOT EXISTS quantity_initial INTEGER,
-    ADD COLUMN IF NOT EXISTS quantity_open INTEGER,
-    ADD COLUMN IF NOT EXISTS realized_pnl NUMERIC(14,4) DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS unrealized_pnl NUMERIC(14,4) DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS total_pnl NUMERIC(14,4) DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS pnl_percent NUMERIC(12,4) DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS components_at_entry JSONB DEFAULT '{}'::jsonb,
-    ADD COLUMN IF NOT EXISTS components_latest JSONB;
 
 DO $$
 BEGIN
@@ -1167,3 +1138,48 @@ CREATE TRIGGER lock_closed_signal_trade
     FOR EACH ROW
     WHEN (OLD.status = 'closed')
     EXECUTE FUNCTION prevent_closed_signal_trade_updates();
+
+-- ---------------------------------------------------------------------------
+-- signal_component_scores
+-- Stores each scoring component's individual score every cycle.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS signal_component_scores (
+    underlying      VARCHAR(10)   NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    timestamp       TIMESTAMPTZ   NOT NULL,
+    component_name  VARCHAR(50)   NOT NULL,
+    raw_score       DOUBLE PRECISION NOT NULL,  -- component output in [-1, +1]
+    weighted_score  DOUBLE PRECISION NOT NULL,  -- raw_score * weight
+    weight          DOUBLE PRECISION NOT NULL,
+    context_values  JSONB         NOT NULL DEFAULT '{}'::jsonb,  -- inputs used
+    created_at      TIMESTAMPTZ   DEFAULT NOW(),
+    PRIMARY KEY (underlying, timestamp, component_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_component_scores_underlying_ts
+    ON signal_component_scores(underlying, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_signal_component_scores_component
+    ON signal_component_scores(component_name, timestamp DESC);
+
+-- ---------------------------------------------------------------------------
+-- portfolio_snapshots (schema only — used in Part 2)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+    underlying          VARCHAR(10)   NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    timestamp           TIMESTAMPTZ   NOT NULL,
+    composite_score     DOUBLE PRECISION NOT NULL,
+    normalized_score    DOUBLE PRECISION NOT NULL,
+    direction           VARCHAR(10)   NOT NULL,
+    target_contracts    INTEGER       NOT NULL DEFAULT 0,
+    target_direction    VARCHAR(10)   NOT NULL DEFAULT 'neutral',
+    target_strategy     VARCHAR(40),
+    actual_contracts    INTEGER       NOT NULL DEFAULT 0,
+    actual_direction    VARCHAR(10)   NOT NULL DEFAULT 'neutral',
+    heat_pct            DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    action_taken        VARCHAR(40),   -- 'opened', 'closed', 'resized', 'held', 'cash'
+    action_detail       JSONB         NOT NULL DEFAULT '{}'::jsonb,
+    created_at          TIMESTAMPTZ   DEFAULT NOW(),
+    PRIMARY KEY (underlying, timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_underlying_ts
+    ON portfolio_snapshots(underlying, timestamp DESC);
