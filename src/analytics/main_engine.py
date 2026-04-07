@@ -201,6 +201,7 @@ class AnalyticsEngine:
                 """, (self.db_symbol, self.db_symbol, self.db_symbol, self.db_symbol, self.snapshot_lookback_minutes))
 
                 rows = cursor.fetchall()
+                conn.commit()
                 if not rows or rows[0][0] is None:
                     return None
 

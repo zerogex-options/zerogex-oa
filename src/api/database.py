@@ -1657,6 +1657,7 @@ class DatabaseManager:
 
         try:
             async with self._acquire_connection() as conn:
+                await self._refresh_flow_cache(conn, symbol)
                 rows = await asyncio.wait_for(
                     conn.fetch(query, symbol, session_start, session_end),
                     timeout=15.0,
@@ -1725,6 +1726,7 @@ class DatabaseManager:
 
         try:
             async with self._acquire_connection() as conn:
+                await self._refresh_flow_cache(conn, symbol)
                 rows = await asyncio.wait_for(
                     conn.fetch(query, symbol, session_start, session_end, limit),
                     timeout=15.0,
@@ -1794,6 +1796,7 @@ class DatabaseManager:
 
         try:
             async with self._acquire_connection() as conn:
+                await self._refresh_flow_cache(conn, symbol)
                 rows = await asyncio.wait_for(
                     conn.fetch(query, symbol, session_start, session_end, limit),
                     timeout=15.0,
@@ -1892,6 +1895,7 @@ class DatabaseManager:
 
         try:
             async with self._acquire_connection() as conn:
+                await self._refresh_flow_cache(conn, symbol)
                 rows = await asyncio.wait_for(
                     conn.fetch(query, symbol, session_start, session_end, limit),
                     timeout=15.0,

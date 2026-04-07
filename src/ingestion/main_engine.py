@@ -836,8 +836,6 @@ class IngestionEngine:
 
     def _flush_option_bucket(self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False):
         """Flush a single option bucket (used by _flush_all_buffers)."""
-        if not self._should_write_option_bucket(option_symbol, bucket, force=True):
-            return
         agg = self._prepare_option_agg(option_symbol, bucket, keep_last_snapshot)
         if agg:
             self._write_option_rows([agg])
