@@ -5,6 +5,7 @@ Database connection management for PostgreSQL
 import os
 import psycopg2
 from psycopg2 import pool
+from psycopg2 import extensions
 import time
 from typing import Optional
 from contextlib import contextmanager
@@ -52,6 +53,15 @@ def close_db_connection(conn):
     global _connection_pool
 
     if _connection_pool and conn:
+        try:
+            tx_status = conn.get_transaction_status()
+            if tx_status != extensions.TRANSACTION_STATUS_IDLE:
+                # Ensure we never return a connection "idle in transaction"
+                # to the pool (this can hold locks and bloat table churn).
+                conn.rollback()
+                logger.warning("Rolled back open transaction before returning DB connection")
+        except Exception:
+            logger.warning("Failed to inspect/reset transaction state before pool return", exc_info=True)
         _connection_pool.putconn(conn)
         logger.debug("Returned connection to pool")
 
@@ -70,6 +80,13 @@ def db_connection():
     try:
         conn = get_db_connection()
         yield conn
+    except Exception:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                logger.warning("Failed to rollback DB connection after error", exc_info=True)
+        raise
     finally:
         if conn:
             close_db_connection(conn)

@@ -58,115 +58,115 @@ class UnifiedSignalEngine:
 
     def _fetch_market_context(self, conn=None) -> Optional[dict]:
         with self._use_conn(conn) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT uq.timestamp,
-                       uq.close,
-                       gs.total_net_gex,
-                       gs.gamma_flip_point,
-                       gs.put_call_ratio,
-                       gs.max_pain
-                FROM underlying_quotes uq
-                LEFT JOIN LATERAL (
-                    SELECT total_net_gex, gamma_flip_point, put_call_ratio, max_pain
-                    FROM gex_summary
-                    WHERE underlying = %s AND timestamp <= uq.timestamp
-                    ORDER BY timestamp DESC
-                    LIMIT 1
-                ) gs ON TRUE
-                WHERE uq.symbol = %s
-                ORDER BY uq.timestamp DESC
-                LIMIT 1
-                """,
-                (self.db_symbol, self.db_symbol),
-            )
-            row = cur.fetchone()
-            if not row:
-                return None
-            ts, close, net_gex, gamma_flip, pcr, max_pain = row
-            close_f = float(close)
-
-            cur.execute(
-                """
-                SELECT COALESCE(SUM(CASE WHEN option_type='C' THEN total_premium ELSE 0 END), 0),
-                       COALESCE(SUM(CASE WHEN option_type='P' THEN total_premium ELSE 0 END), 0)
-                FROM flow_smart_money
-                WHERE symbol = %s
-                  AND timestamp BETWEEN %s - INTERVAL '30 minutes' AND %s
-                """,
-                (self.db_symbol, ts, ts),
-            )
-            sm_call, sm_put = cur.fetchone() or (0.0, 0.0)
-
-            cur.execute(
-                """
-                SELECT close
-                FROM underlying_quotes
-                WHERE symbol = %s
-                ORDER BY timestamp DESC
-                LIMIT 20
-                """,
-                (self.db_symbol,),
-            )
-            closes = [float(r[0]) for r in cur.fetchall()]
-
-            # IV rank: compare current ATM IV to its 30-day daily range.
-            iv_rank = None
-            try:
+            with conn.cursor() as cur:
                 cur.execute(
                     """
-                    WITH current_atm AS (
-                        SELECT AVG(implied_volatility) AS current_iv
-                        FROM option_chains
-                        WHERE underlying = %s
-                          AND ABS(strike - %s) / NULLIF(%s, 0) < 0.01
-                          AND option_type = 'C'
-                          AND implied_volatility IS NOT NULL
-                          AND implied_volatility > 0
-                          AND timestamp >= %s - INTERVAL '2 hours'
-                    ),
-                    daily_iv AS (
-                        SELECT DATE_TRUNC('day', timestamp) AS day,
-                               AVG(implied_volatility) AS avg_iv
-                        FROM option_chains
-                        WHERE underlying = %s
-                          AND ABS(strike - %s) / NULLIF(%s, 0) < 0.01
-                          AND option_type = 'C'
-                          AND implied_volatility IS NOT NULL
-                          AND implied_volatility > 0
-                          AND timestamp >= NOW() - INTERVAL '30 days'
-                        GROUP BY DATE_TRUNC('day', timestamp)
-                    )
-                    SELECT
-                        (SELECT current_iv FROM current_atm),
-                        MIN(avg_iv),
-                        MAX(avg_iv)
-                    FROM daily_iv
+                    SELECT uq.timestamp,
+                           uq.close,
+                           gs.total_net_gex,
+                           gs.gamma_flip_point,
+                           gs.put_call_ratio,
+                           gs.max_pain
+                    FROM underlying_quotes uq
+                    LEFT JOIN LATERAL (
+                        SELECT total_net_gex, gamma_flip_point, put_call_ratio, max_pain
+                        FROM gex_summary
+                        WHERE underlying = %s AND timestamp <= uq.timestamp
+                        ORDER BY timestamp DESC
+                        LIMIT 1
+                    ) gs ON TRUE
+                    WHERE uq.symbol = %s
+                    ORDER BY uq.timestamp DESC
+                    LIMIT 1
                     """,
-                    (self.db_symbol, close_f, close_f, ts, self.db_symbol, close_f, close_f),
+                    (self.db_symbol, self.db_symbol),
                 )
-                iv_row = cur.fetchone()
-                if iv_row and iv_row[0] is not None and iv_row[1] is not None and iv_row[2] is not None:
-                    current_iv, iv_low, iv_high = float(iv_row[0]), float(iv_row[1]), float(iv_row[2])
-                    iv_range = iv_high - iv_low
-                    if iv_range > 0.001:
-                        iv_rank = round(min(1.0, max(0.0, (current_iv - iv_low) / iv_range)), 4)
-            except Exception:
-                pass  # IV rank is supplemental; do not block signal generation if unavailable
+                row = cur.fetchone()
+                if not row:
+                    return None
+                ts, close, net_gex, gamma_flip, pcr, max_pain = row
+                close_f = float(close)
 
-            return {
-                "timestamp": ts,
-                "close": close_f,
-                "net_gex": float(net_gex or 0.0),
-                "gamma_flip": float(gamma_flip) if gamma_flip is not None else None,
-                "put_call_ratio": float(pcr or 1.0),
-                "max_pain": float(max_pain) if max_pain is not None else None,
-                "smart_call": float(sm_call or 0.0),
-                "smart_put": float(sm_put or 0.0),
-                "recent_closes": list(reversed(closes)),
-                "iv_rank": iv_rank,
-            }
+                cur.execute(
+                    """
+                    SELECT COALESCE(SUM(CASE WHEN option_type='C' THEN total_premium ELSE 0 END), 0),
+                           COALESCE(SUM(CASE WHEN option_type='P' THEN total_premium ELSE 0 END), 0)
+                    FROM flow_smart_money
+                    WHERE symbol = %s
+                      AND timestamp BETWEEN %s - INTERVAL '30 minutes' AND %s
+                    """,
+                    (self.db_symbol, ts, ts),
+                )
+                sm_call, sm_put = cur.fetchone() or (0.0, 0.0)
+
+                cur.execute(
+                    """
+                    SELECT close
+                    FROM underlying_quotes
+                    WHERE symbol = %s
+                    ORDER BY timestamp DESC
+                    LIMIT 20
+                    """,
+                    (self.db_symbol,),
+                )
+                closes = [float(r[0]) for r in cur.fetchall()]
+
+                # IV rank: compare current ATM IV to its 30-day daily range.
+                iv_rank = None
+                try:
+                    cur.execute(
+                        """
+                        WITH current_atm AS (
+                            SELECT AVG(implied_volatility) AS current_iv
+                            FROM option_chains
+                            WHERE underlying = %s
+                              AND ABS(strike - %s) / NULLIF(%s, 0) < 0.01
+                              AND option_type = 'C'
+                              AND implied_volatility IS NOT NULL
+                              AND implied_volatility > 0
+                              AND timestamp >= %s - INTERVAL '2 hours'
+                        ),
+                        daily_iv AS (
+                            SELECT DATE_TRUNC('day', timestamp) AS day,
+                                   AVG(implied_volatility) AS avg_iv
+                            FROM option_chains
+                            WHERE underlying = %s
+                              AND ABS(strike - %s) / NULLIF(%s, 0) < 0.01
+                              AND option_type = 'C'
+                              AND implied_volatility IS NOT NULL
+                              AND implied_volatility > 0
+                              AND timestamp >= NOW() - INTERVAL '30 days'
+                            GROUP BY DATE_TRUNC('day', timestamp)
+                        )
+                        SELECT
+                            (SELECT current_iv FROM current_atm),
+                            MIN(avg_iv),
+                            MAX(avg_iv)
+                        FROM daily_iv
+                        """,
+                        (self.db_symbol, close_f, close_f, ts, self.db_symbol, close_f, close_f),
+                    )
+                    iv_row = cur.fetchone()
+                    if iv_row and iv_row[0] is not None and iv_row[1] is not None and iv_row[2] is not None:
+                        current_iv, iv_low, iv_high = float(iv_row[0]), float(iv_row[1]), float(iv_row[2])
+                        iv_range = iv_high - iv_low
+                        if iv_range > 0.001:
+                            iv_rank = round(min(1.0, max(0.0, (current_iv - iv_low) / iv_range)), 4)
+                except Exception:
+                    pass  # IV rank is supplemental; do not block signal generation if unavailable
+
+                return {
+                    "timestamp": ts,
+                    "close": close_f,
+                    "net_gex": float(net_gex or 0.0),
+                    "gamma_flip": float(gamma_flip) if gamma_flip is not None else None,
+                    "put_call_ratio": float(pcr or 1.0),
+                    "max_pain": float(max_pain) if max_pain is not None else None,
+                    "smart_call": float(sm_call or 0.0),
+                    "smart_put": float(sm_put or 0.0),
+                    "recent_closes": list(reversed(closes)),
+                    "iv_rank": iv_rank,
+                }
 
     def _build_market_context(self, ctx: dict) -> MarketContext:
         """Convert the dict returned by _fetch_market_context() into a MarketContext."""
