@@ -155,8 +155,10 @@ class DatabaseManager:
     async def _create_pool(self) -> asyncpg.Pool:
         """Create and return a fresh asyncpg pool instance."""
         connect_timeout = float(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "20"))
-        min_size = int(os.getenv("DB_POOL_MIN", "2"))
-        max_size = int(os.getenv("DB_POOL_MAX", "8"))
+        # Keep defaults conservative to avoid exhausting RDS connections when
+        # multiple services/workers run at once.
+        min_size = int(os.getenv("DB_POOL_MIN", "1"))
+        max_size = int(os.getenv("DB_POOL_MAX", "3"))
         statement_timeout_ms = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "30000"))
         ssl_mode = os.getenv("DB_SSLMODE", "").strip().lower()
         ssl = None
@@ -164,6 +166,12 @@ class DatabaseManager:
             ssl = True
         if min_size > max_size:
             min_size = max_size
+        logger.info(
+            "Creating asyncpg pool (min=%d, max=%d, timeout=%.1fs)",
+            min_size,
+            max_size,
+            connect_timeout,
+        )
         return await asyncpg.create_pool(
             host=self.host,
             port=self.port,

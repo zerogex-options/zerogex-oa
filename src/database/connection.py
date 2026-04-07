@@ -86,8 +86,12 @@ def _initialize_connection_pool():
     db_port = int(os.getenv('DB_PORT', '5432'))
     db_name = os.getenv('DB_NAME', 'zerogex')
     db_user = os.getenv('DB_USER', 'postgres')
+    # Conservative defaults prevent "too many clients" when multiple engines
+    # and API workers are running concurrently against the same DB.
     min_connections = int(os.getenv('DB_POOL_MIN', '1'))
-    max_connections = int(os.getenv('DB_POOL_MAX', '4'))
+    max_connections = int(os.getenv('DB_POOL_MAX', '2'))
+    if min_connections > max_connections:
+        min_connections = max_connections
     connect_timeout = int(os.getenv('DB_CONNECT_TIMEOUT_SECONDS', '20'))
     connect_retries = int(os.getenv('DB_CONNECT_RETRIES', '5'))
     retry_base_delay = float(os.getenv('DB_CONNECT_RETRY_DELAY_SECONDS', '1.5'))
@@ -101,7 +105,15 @@ def _initialize_connection_pool():
         logger.error(f"Failed to retrieve database password: {e}")
         raise
 
-    logger.info(f"Connecting to PostgreSQL: {db_user}@{db_host}:{db_port}/{db_name}")
+    logger.info(
+        "Connecting to PostgreSQL: %s@%s:%s/%s (pool min=%d, max=%d)",
+        db_user,
+        db_host,
+        db_port,
+        db_name,
+        min_connections,
+        max_connections,
+    )
 
     # Build connection parameters
     conn_params = {
