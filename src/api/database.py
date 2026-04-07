@@ -2394,7 +2394,7 @@ class DatabaseManager:
                     return None
                 d = dict(row)
                 raw = d.get("raw_score") or 0.0
-                d["score"] = round(abs(float(raw)) * 100.0, 2)
+                d["score"] = round(float(raw) * 100.0, 2)
                 ctx = d.get("context_values") or {}
                 if isinstance(ctx, str):
                     ctx = json.loads(ctx)

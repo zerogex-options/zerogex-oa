@@ -55,7 +55,7 @@ _VOL_EXPANSION_ROW = {
     "raw_score": 0.735,
     "weighted_score": 0.1176,
     "weight": 0.16,
-    "score": 73.5,
+    "score": 73.5,  # raw_score * 100
     "direction": "bullish",
     "context_values": {
         "net_gex": -1_500_000_000.0,
