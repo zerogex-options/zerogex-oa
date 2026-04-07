@@ -26,7 +26,7 @@ from psycopg2.extras import execute_values
 
 from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
-from src.config import RISK_FREE_RATE
+from src.config import RISK_FREE_RATE, ANALYTICS_FLOW_CACHE_REFRESH_ENABLED
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.validation import is_engine_run_window, seconds_until_engine_run_window
 
@@ -76,10 +76,16 @@ class AnalyticsEngine:
         self._flow_cache_refresh_min_seconds: float = float(
             os.getenv("FLOW_CACHE_REFRESH_MIN_SECONDS", "15")
         )
+        self._analytics_flow_cache_refresh_enabled: bool = ANALYTICS_FLOW_CACHE_REFRESH_ENABLED
 
         logger.info(f"Initialized AnalyticsEngine for {underlying}")
         logger.info(f"Calculation interval: {calculation_interval}s")
         logger.info(f"Risk-free rate: {risk_free_rate:.4f}")
+        if not self._analytics_flow_cache_refresh_enabled:
+            logger.info(
+                "Analytics legacy flow cache refresh is DISABLED "
+                "(ANALYTICS_FLOW_CACHE_REFRESH_ENABLED=false)"
+            )
 
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -838,6 +844,9 @@ class AnalyticsEngine:
 
         Uses LAG() window functions instead of LATERAL joins for O(n) performance.
         """
+        if not self._analytics_flow_cache_refresh_enabled:
+            return
+
         if self._last_flow_cache_ts == timestamp:
             logger.debug("Skipping flow cache refresh (timestamp unchanged)")
             return
