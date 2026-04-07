@@ -689,6 +689,17 @@ class AnalyticsEngine:
                     put_oi = EXCLUDED.put_oi,
                     vanna_exposure = EXCLUDED.vanna_exposure,
                     charm_exposure = EXCLUDED.charm_exposure
+                WHERE
+                    EXCLUDED.total_gamma IS DISTINCT FROM gex_by_strike.total_gamma
+                    OR EXCLUDED.call_gamma IS DISTINCT FROM gex_by_strike.call_gamma
+                    OR EXCLUDED.put_gamma IS DISTINCT FROM gex_by_strike.put_gamma
+                    OR EXCLUDED.net_gex IS DISTINCT FROM gex_by_strike.net_gex
+                    OR EXCLUDED.call_volume IS DISTINCT FROM gex_by_strike.call_volume
+                    OR EXCLUDED.put_volume IS DISTINCT FROM gex_by_strike.put_volume
+                    OR EXCLUDED.call_oi IS DISTINCT FROM gex_by_strike.call_oi
+                    OR EXCLUDED.put_oi IS DISTINCT FROM gex_by_strike.put_oi
+                    OR EXCLUDED.vanna_exposure IS DISTINCT FROM gex_by_strike.vanna_exposure
+                    OR EXCLUDED.charm_exposure IS DISTINCT FROM gex_by_strike.charm_exposure
                 """,
                 rows,
             )
@@ -742,6 +753,17 @@ class AnalyticsEngine:
                     total_call_oi = EXCLUDED.total_call_oi,
                     total_put_oi = EXCLUDED.total_put_oi,
                     total_net_gex = EXCLUDED.total_net_gex
+                WHERE
+                    EXCLUDED.max_gamma_strike IS DISTINCT FROM gex_summary.max_gamma_strike
+                    OR EXCLUDED.max_gamma_value IS DISTINCT FROM gex_summary.max_gamma_value
+                    OR EXCLUDED.gamma_flip_point IS DISTINCT FROM gex_summary.gamma_flip_point
+                    OR EXCLUDED.put_call_ratio IS DISTINCT FROM gex_summary.put_call_ratio
+                    OR EXCLUDED.max_pain IS DISTINCT FROM gex_summary.max_pain
+                    OR EXCLUDED.total_call_volume IS DISTINCT FROM gex_summary.total_call_volume
+                    OR EXCLUDED.total_put_volume IS DISTINCT FROM gex_summary.total_put_volume
+                    OR EXCLUDED.total_call_oi IS DISTINCT FROM gex_summary.total_call_oi
+                    OR EXCLUDED.total_put_oi IS DISTINCT FROM gex_summary.total_put_oi
+                    OR EXCLUDED.total_net_gex IS DISTINCT FROM gex_summary.total_net_gex
             """, (
                 summary['underlying'],
                 summary['timestamp'],
