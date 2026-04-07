@@ -8,7 +8,7 @@ import asyncpg
 import os
 import time as time_module
 from pathlib import Path
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 from datetime import datetime, timedelta, date, time, timezone
 from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
@@ -126,7 +126,31 @@ class DatabaseManager:
         self._flow_refresh_min_seconds: float = float(
             os.getenv("FLOW_CACHE_REFRESH_MIN_SECONDS", "15")
         )
+        self._latest_quote_cache_ttl_seconds: float = float(
+            os.getenv("LATEST_QUOTE_CACHE_TTL_SECONDS", "1.5")
+        )
+        self._latest_gex_summary_cache_ttl_seconds: float = float(
+            os.getenv("LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS", "1.5")
+        )
+        self._read_cache: Dict[str, Tuple[float, Any]] = {}
         self._load_credentials()
+
+    def _cache_get(self, key: str) -> Optional[Any]:
+        """Get a cached value if it has not expired."""
+        cached = self._read_cache.get(key)
+        if not cached:
+            return None
+        expires_at, payload = cached
+        if time_module.monotonic() >= expires_at:
+            self._read_cache.pop(key, None)
+            return None
+        return payload
+
+    def _cache_set(self, key: str, payload: Any, ttl_seconds: float) -> None:
+        """Store a value in the short-lived in-memory read cache."""
+        if ttl_seconds <= 0:
+            return
+        self._read_cache[key] = (time_module.monotonic() + ttl_seconds, payload)
 
     async def _create_pool(self) -> asyncpg.Pool:
         """Create and return a fresh asyncpg pool instance."""
@@ -1113,6 +1137,12 @@ class DatabaseManager:
 
     async def get_latest_gex_summary(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
         """Get latest GEX summary"""
+        symbol = symbol.upper()
+        cache_key = f"latest_gex_summary:{symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         query = """
             WITH latest_summary AS (
                 SELECT
@@ -1195,7 +1225,13 @@ class DatabaseManager:
         try:
             async with self._acquire_connection() as conn:
                 row = await conn.fetchrow(query, symbol)
-                return dict(row) if row else None
+                payload = dict(row) if row else None
+                self._cache_set(
+                    cache_key,
+                    payload,
+                    self._latest_gex_summary_cache_ttl_seconds,
+                )
+                return payload
         except Exception as e:
             logger.error(f"Error fetching GEX summary: {e}", exc_info=True)
             raise
@@ -2421,6 +2457,12 @@ class DatabaseManager:
 
     async def get_latest_quote(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
         """Get latest underlying quote"""
+        symbol = symbol.upper()
+        cache_key = f"latest_quote:{symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         query = """
             WITH latest_quote AS (
                 SELECT
@@ -2454,7 +2496,13 @@ class DatabaseManager:
         try:
             async with self._acquire_connection() as conn:
                 row = await conn.fetchrow(query, symbol)
-                return dict(row) if row else None
+                payload = dict(row) if row else None
+                self._cache_set(
+                    cache_key,
+                    payload,
+                    self._latest_quote_cache_ttl_seconds,
+                )
+                return payload
         except Exception as e:
             logger.error(f"Error fetching latest quote: {e!r}", exc_info=True)
             raise
