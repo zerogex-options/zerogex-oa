@@ -36,6 +36,7 @@ from src.config import (
     BUFFER_FLUSH_INTERVAL,
     GREEKS_ENABLED,
     INGEST_PARITY_GUARD_ENABLED,
+    OPTION_BUCKET_WRITE_MIN_SECONDS,
 )
 
 logger = get_logger(__name__)
@@ -114,6 +115,7 @@ class IngestionEngine:
         self._db_consecutive_failures = 0
         self._db_backoff_until = 0.0  # monotonic timestamp
         self._last_underlying_signature: Optional[str] = None
+        self._option_bucket_last_write: Dict[tuple[str, datetime], float] = {}
 
         logger.info(f"Initialized IngestionEngine for {underlying}")
         logger.info(f"Config: {num_expirations} expirations, {num_strikes} strikes each side")
@@ -387,10 +389,12 @@ class IngestionEngine:
 
             self.options_buffer[option_symbol].append(data)
 
-            # Prepare aggregation for the current bucket.
-            agg = self._prepare_option_agg(option_symbol, bucket, keep_last_snapshot=True)
-            if agg:
-                rows_to_write.append(agg)
+            # Prepare aggregation for the current bucket, but throttle
+            # in-minute writes to reduce UPDATE churn/dead tuples.
+            if self._should_write_option_bucket(option_symbol, bucket):
+                agg = self._prepare_option_agg(option_symbol, bucket, keep_last_snapshot=True)
+                if agg:
+                    rows_to_write.append(agg)
 
         # Write all aggregated rows in a single DB transaction.
         if rows_to_write:
@@ -432,6 +436,28 @@ class IngestionEngine:
             logger.info(f"[PARITY] {stream_name} sig={digest} payload={canonical}")
         except Exception as e:
             logger.warning(f"Failed to emit parity signature for {stream_name}: {e}")
+
+    def _should_write_option_bucket(
+        self,
+        option_symbol: str,
+        bucket: datetime,
+        *,
+        force: bool = False,
+    ) -> bool:
+        """Rate-limit writes for the same option contract and time bucket."""
+        key = (option_symbol, bucket)
+        now_mono = _time.monotonic()
+
+        if force or OPTION_BUCKET_WRITE_MIN_SECONDS <= 0:
+            self._option_bucket_last_write[key] = now_mono
+            return True
+
+        last_write = self._option_bucket_last_write.get(key)
+        if last_write is not None and (now_mono - last_write) < OPTION_BUCKET_WRITE_MIN_SECONDS:
+            return False
+
+        self._option_bucket_last_write[key] = now_mono
+        return True
 
     def _classify_volume_chunk(self, volume_delta: int, last: Optional[float], bid: Optional[float], ask: Optional[float], mid: Optional[float]) -> tuple:
         """
@@ -593,6 +619,12 @@ class IngestionEngine:
                 self.options_buffer[option_symbol] = [buffer[-1]]
             else:
                 self.options_buffer[option_symbol] = []
+                stale_keys = [
+                    key for key in self._option_bucket_last_write
+                    if key[0] == option_symbol and key[1] <= bucket
+                ]
+                for key in stale_keys:
+                    self._option_bucket_last_write.pop(key, None)
 
             return agg
 
@@ -804,6 +836,8 @@ class IngestionEngine:
 
     def _flush_option_bucket(self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False):
         """Flush a single option bucket (used by _flush_all_buffers)."""
+        if not self._should_write_option_bucket(option_symbol, bucket, force=True):
+            return
         agg = self._prepare_option_agg(option_symbol, bucket, keep_last_snapshot)
         if agg:
             self._write_option_rows([agg])
