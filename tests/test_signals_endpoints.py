@@ -59,9 +59,9 @@ _VOL_EXPANSION_ROW = {
     "direction": "bullish",
     "context_values": {
         "net_gex": -1_500_000_000.0,
-        "vol_pressure": 0.3,
-        "price_momentum_dir": 1.0,
         "gex_regime": "negative",
+        "vol_pressure": 0.3,
+        "pct_change_5bar": 0.003,
     },
 }
 
@@ -118,6 +118,7 @@ class TestVolExpansionEndpoint:
         assert body["direction"] == "bullish"
         assert body["raw_score"] == 0.735
         assert body["context_values"]["gex_regime"] == "negative"
+        assert body["context_values"]["pct_change_5bar"] == 0.003
         mock_db.get_vol_expansion_signal.assert_awaited_once_with("SPY")
 
     def test_passes_symbol_param(self, client, mock_db):
