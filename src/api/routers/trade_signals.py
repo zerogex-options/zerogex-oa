@@ -38,20 +38,6 @@ def _scale_signed_100(value: Any) -> Any:
     return round(scaled, 4)
 
 
-def _normalize_vol_expansion_components(value: Any) -> Any:
-    """Recursively normalize vol-expansion component score fields to [-100, 100]."""
-    if isinstance(value, dict):
-        out = {}
-        for key, item in value.items():
-            if key in {"score", "raw_score", "weighted_score", "normalized_score", "composite_score"}:
-                out[key] = _scale_signed_100(item)
-            else:
-                out[key] = _normalize_vol_expansion_components(item)
-        return out
-    if isinstance(value, list):
-        return [_normalize_vol_expansion_components(v) for v in value]
-    return value
-
 
 def _normalize_signal_components(value: Any) -> Any:
     """Scale unified-signal component score fields to [-100, 100]."""
@@ -77,35 +63,6 @@ def _normalize_signal_score_row(row: dict[str, Any]) -> dict[str, Any]:
         out["components"] = _normalize_signal_components(out.get("components"))
     return out
 
-
-def _normalize_vol_expansion_row(row: dict[str, Any]) -> dict[str, Any]:
-    out = dict(row)
-
-    max_score = out.get("max_possible_score")
-    composite = out.get("composite_score")
-    try:
-        max_score_f = float(max_score)
-        composite_f = float(composite)
-        if max_score_f > 0:
-            out["composite_score"] = _scale_signed_100(composite_f / max_score_f)
-            out["max_possible_score"] = 100.0
-        else:
-            out["composite_score"] = _scale_signed_100(composite_f)
-    except (TypeError, ValueError):
-        pass
-
-    try:
-        norm = float(out.get("normalized_score"))
-        direction = str(out.get("expected_direction") or "").lower()
-        sign = -1.0 if direction in {"down", "bearish", "short"} else 1.0 if direction in {"up", "bullish", "long"} else 0.0
-        out["normalized_score"] = _scale_signed_100(abs(norm) * sign if sign else norm)
-    except (TypeError, ValueError):
-        pass
-
-    if "components" in out:
-        out["components"] = _normalize_vol_expansion_components(out.get("components"))
-
-    return out
 
 
 def get_db() -> DatabaseManager:

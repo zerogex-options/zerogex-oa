@@ -335,8 +335,6 @@ help: ## Show this help message
 	@echo "  make db-tail-flow-smart-money     - Last 20 rows from flow_smart_money"
 	@echo "  make db-tail-trade-signals        - Last 20 rows from trade_signals"
 	@echo "  make db-tail-signals-accuracy      - Last 20 rows from signal_accuracy"
-	@echo "  make db-tail-vol-expansion-signals  - Last 20 rows from volatility_expansion_signals"
-	@echo "  make db-tail-vol_expansion_signals  - Last 10 rows from volatility_expansion_signals"
 	@echo "  make db-tail-position-optimizer-signals - Last 20 rows from position_optimizer_signals"
 	@echo "  make db-tail-position-optimizer-accuracy - Last 20 rows from position_optimizer_accuracy"
 	@echo "  make db-diagnostics               - DB diagnostics (sessions, locks, waits, slow queries)"
@@ -1739,11 +1737,6 @@ signals-vol-expansion: ## Latest volatility-expansion score (0-100) from signal_
 		ORDER BY timestamp DESC \
 		LIMIT 1;"
 
-.PHONY: db-tail-vol_expansion_signals
-db-tail-vol_expansion_signals: ## Show 10 most recent rows from volatility_expansion_signals
-	@echo "$(BLUE)=== volatility_expansion_signals (last 10) ===$(NC)"
-	@$(PSQL) -c "SELECT * FROM volatility_expansion_signals ORDER BY timestamp DESC LIMIT 10;"
-
 # =============================================================================
 # Signal Engine — Logs
 # =============================================================================
@@ -1973,7 +1966,7 @@ DATA_RETENTION_DAYS ?= 90
 # Helper: all tables that hold timestamped data and need regular maintenance.
 DB_MAINTAIN_TABLES = option_chains underlying_quotes gex_summary gex_by_strike \
 	flow_contract_facts flow_by_type flow_by_strike flow_by_expiration \
-	flow_smart_money trade_signals volatility_expansion_signals \
+	flow_smart_money trade_signals \
 	position_optimizer_signals
 
 .PHONY: db-prune
@@ -2019,7 +2012,7 @@ size: ## Show table sizes
 			pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename) - pg_relation_size(schemaname||'.'||tablename)) AS index_size \
 		FROM pg_tables \
 		WHERE schemaname = 'public' \
-		AND tablename IN ('underlying_quotes', 'option_chains', 'symbols', 'gex_summary', 'gex_by_strike', 'flow_contract_facts', 'flow_by_type', 'flow_by_strike', 'flow_by_expiration', 'flow_smart_money', 'trade_signals', 'volatility_expansion_signals', 'position_optimizer_signals') \
+		AND tablename IN ('underlying_quotes', 'option_chains', 'symbols', 'gex_summary', 'gex_by_strike', 'flow_contract_facts', 'flow_by_type', 'flow_by_strike', 'flow_by_expiration', 'flow_smart_money', 'trade_signals', 'position_optimizer_signals') \
 		ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;"
 
 .PHONY: db-prune-legacy

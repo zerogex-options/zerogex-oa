@@ -52,27 +52,17 @@ _SCORE_ROW = {
 _VOL_EXPANSION_ROW = {
     "underlying": "SPY",
     "timestamp": datetime(2026, 4, 6, 14, 30, tzinfo=timezone.utc),
-    "composite_score": 7.5,
-    "max_possible_score": 10.0,
-    "normalized_score": 0.75,
-    "move_probability": 0.82,
-    "expected_direction": "up",
-    "expected_magnitude_pct": 1.2,
-    "confidence": 0.68,
-    "catalyst_type": "gamma_squeeze",
-    "time_horizon": "intraday",
-    "strategy_type": "long_call",
-    "entry_window": "next_15m",
-    "current_price": 520.50,
-    "net_gex": -1500000.0,
-    "gamma_flip": 525.0,
-    "max_pain": 518.0,
-    "put_call_ratio": 0.85,
-    "dealer_net_delta": -200000.0,
-    "smart_money_direction": "bullish",
-    "vwap_deviation_pct": -0.3,
-    "hours_to_next_expiry": 4.5,
-    "components": {"gex_regime": {"value": -8.5}},
+    "raw_score": 0.735,
+    "weighted_score": 0.1176,
+    "weight": 0.16,
+    "score": 73.5,
+    "direction": "bullish",
+    "context_values": {
+        "net_gex": -1_500_000_000.0,
+        "vol_pressure": 0.3,
+        "price_momentum_dir": 1.0,
+        "gex_regime": "negative",
+    },
 }
 
 
@@ -124,12 +114,10 @@ class TestVolExpansionEndpoint:
         assert resp.status_code == 200
         body = resp.json()
         assert body["underlying"] == "SPY"
-        assert body["composite_score"] == 0.75
-        assert body["max_possible_score"] == 1.0
-        assert body["normalized_score"] == 0.75
-        assert body["components"]["gex_regime"]["value"] == -0.85
-        assert body["move_probability"] == 0.82
-        assert body["catalyst_type"] == "gamma_squeeze"
+        assert body["score"] == 73.5
+        assert body["direction"] == "bullish"
+        assert body["raw_score"] == 0.735
+        assert body["context_values"]["gex_regime"] == "negative"
         mock_db.get_vol_expansion_signal.assert_awaited_once_with("SPY")
 
     def test_passes_symbol_param(self, client, mock_db):

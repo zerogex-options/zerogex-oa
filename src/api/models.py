@@ -409,51 +409,6 @@ class TradeSignalResponse(BaseModel):
         }
 
 
-class VolExpansionDirection(str, Enum):
-    UP = "up"
-    DOWN = "down"
-    NEUTRAL = "neutral"
-
-
-class VolExpansionComponent(BaseModel):
-    name: str
-    weight: int
-    raw_score: int
-    weighted_score: int
-    description: str
-    value: Optional[float] = None
-
-
-class VolExpansionSignalResponse(BaseModel):
-    symbol: str
-    timestamp: datetime
-    composite_score: int
-    max_possible_score: int
-    normalized_score: float
-    move_probability: float
-    expected_direction: VolExpansionDirection
-    expected_magnitude_pct: float
-    confidence: SignalStrength
-    catalyst_type: str
-    time_horizon: str
-    strategy_type: str
-    entry_window: Optional[str] = None
-    current_price: Optional[float] = None
-    net_gex: Optional[float] = None
-    gamma_flip: Optional[float] = None
-    max_pain: Optional[float] = None
-    put_call_ratio: Optional[float] = None
-    dealer_net_delta: Optional[float] = None
-    smart_money_direction: Optional[VolExpansionDirection] = None
-    vwap_deviation_pct: Optional[float] = None
-    hours_to_next_expiry: Optional[float] = None
-    components: List[VolExpansionComponent]
-
-    class Config:
-        json_encoders = {
-            datetime: lambda v: v.isoformat() if v is not None else None,
-        }
-
 
 class PositionOptimizerDirection(str, Enum):
     BULLISH = "bullish"
