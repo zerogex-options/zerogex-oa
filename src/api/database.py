@@ -132,6 +132,12 @@ class DatabaseManager:
         self._latest_gex_summary_cache_ttl_seconds: float = float(
             os.getenv("LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS", "1.5")
         )
+        # TTL for analytics-derived endpoints (gex_by_strike, gex_walls, etc.)
+        # that only change on the analytics cycle (~60s). A moderate TTL
+        # eliminates redundant DB round-trips from rapid frontend polling.
+        self._analytics_cache_ttl_seconds: float = float(
+            os.getenv("ANALYTICS_CACHE_TTL_SECONDS", "5.0")
+        )
         self._read_cache: Dict[str, Tuple[float, Any]] = {}
         self._load_credentials()
 
@@ -920,14 +926,6 @@ class DatabaseManager:
                 underlying_price,
             )
 
-        # Retention policy: keep only recent smart-money cache rows
-        await conn.execute(
-            """
-            DELETE FROM flow_smart_money
-            WHERE timestamp < NOW() - INTERVAL '7 days'
-            """
-        )
-
     async def _refresh_max_pain_snapshot(self, conn: asyncpg.Connection, symbol: str, strike_limit: int) -> None:
         """Refresh daily max pain OI snapshot for the symbol if latest chain timestamp changed."""
         strike_limit = max(10, min(strike_limit, 1000))
@@ -1169,14 +1167,10 @@ class DatabaseManager:
             ),
             latest_quote AS (
                 SELECT COALESCE(uq.close, 0)::numeric AS spot_price
-                FROM latest_summary ls
-                LEFT JOIN LATERAL (
-                    SELECT close
-                    FROM underlying_quotes uq
-                    WHERE uq.symbol = ls.underlying
-                    ORDER BY (uq.timestamp <= ls.timestamp) DESC, uq.timestamp DESC
-                    LIMIT 1
-                ) uq ON TRUE
+                FROM underlying_quotes uq
+                WHERE uq.symbol = $1
+                ORDER BY uq.timestamp DESC
+                LIMIT 1
             ),
             strike_exposures AS (
                 SELECT
@@ -1258,49 +1252,46 @@ class DatabaseManager:
             limit: Number of strikes to return
             sort_by: 'distance' (closest to spot) or 'impact' (highest absolute net GEX)
         """
+        symbol = symbol.upper()
+        cache_key = f"gex_by_strike:{symbol}:{limit}:{sort_by}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
 
         # Choose sort order
         if sort_by == 'impact':
-            order_clause = "ORDER BY ABS(net_gex) DESC"
+            order_clause = "ORDER BY ABS(g.net_gex) DESC"
         else:
-            order_clause = """ORDER BY ABS(strike - (SELECT close FROM underlying_quotes
-                                       WHERE symbol = $1
-                                       ORDER BY timestamp DESC LIMIT 1)) ASC"""
+            order_clause = "ORDER BY ABS(g.strike - spot.close) ASC"
 
         query = f"""
+            WITH spot AS (
+                SELECT close
+                FROM underlying_quotes
+                WHERE symbol = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
+            )
             SELECT
-                timestamp,
-                underlying as symbol,
-                strike,
-                expiration,
-                call_oi,
-                put_oi,
-                call_volume,
-                put_volume,
-                (call_gamma * 100 * COALESCE(
-                    (SELECT close FROM underlying_quotes
-                     WHERE symbol = $1
-                     ORDER BY timestamp DESC LIMIT 1),
-                    0
-                )) as call_gex,
-                (-1 * put_gamma * 100 * COALESCE(
-                    (SELECT close FROM underlying_quotes
-                     WHERE symbol = $1
-                     ORDER BY timestamp DESC LIMIT 1),
-                    0
-                )) as put_gex,
-                net_gex,
-                vanna_exposure,
-                charm_exposure,
-                (SELECT close FROM underlying_quotes
-                 WHERE symbol = $1
-                 ORDER BY timestamp DESC LIMIT 1) as spot_price,
-                strike - (SELECT close FROM underlying_quotes
-                          WHERE symbol = $1
-                          ORDER BY timestamp DESC LIMIT 1) as distance_from_spot
-            FROM gex_by_strike
-            WHERE underlying = $1
-                AND timestamp = (
+                g.timestamp,
+                g.underlying as symbol,
+                g.strike,
+                g.expiration,
+                g.call_oi,
+                g.put_oi,
+                g.call_volume,
+                g.put_volume,
+                (g.call_gamma * 100 * COALESCE(spot.close, 0)) as call_gex,
+                (-1 * g.put_gamma * 100 * COALESCE(spot.close, 0)) as put_gex,
+                g.net_gex,
+                g.vanna_exposure,
+                g.charm_exposure,
+                spot.close as spot_price,
+                g.strike - spot.close as distance_from_spot
+            FROM gex_by_strike g
+            CROSS JOIN spot
+            WHERE g.underlying = $1
+                AND g.timestamp = (
                     SELECT timestamp
                     FROM gex_by_strike
                     WHERE underlying = $1
@@ -1314,7 +1305,9 @@ class DatabaseManager:
         try:
             async with self._acquire_connection() as conn:
                 rows = await conn.fetch(query, symbol, limit)
-                return [dict(row) for row in rows]
+                result = [dict(row) for row in rows]
+                self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
+                return result
         except Exception as e:
             logger.error(f"Error fetching GEX by strike: {e}", exc_info=True)
             raise
@@ -1329,11 +1322,19 @@ class DatabaseManager:
         Wall levels are determined by the largest absolute directional gamma
         exposure aggregated by strike across expirations.
         """
+        symbol = symbol.upper()
+        cache_key = f"gex_walls:{symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         query = """
             WITH latest AS (
-                SELECT MAX(timestamp) AS ts
+                SELECT timestamp AS ts
                 FROM gex_by_strike
                 WHERE underlying = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
             ),
             spot AS (
                 SELECT close::numeric AS spot_price
@@ -1396,7 +1397,7 @@ class DatabaseManager:
                     return None
 
                 r = dict(row)
-                return {
+                result = {
                     "timestamp": r["timestamp"],
                     "symbol": r["symbol"],
                     "spot_price": r["spot_price"],
@@ -1413,6 +1414,8 @@ class DatabaseManager:
                         "pct_from_spot": r["put_wall_pct_from_spot"],
                     },
                 }
+                self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
+                return result
         except Exception as e:
             logger.error(f"Error fetching GEX walls: {e}", exc_info=True)
             raise
@@ -1442,6 +1445,13 @@ class DatabaseManager:
                     COALESCE($3::timestamptz, max_ts) AS end_ts
                 FROM latest
             ),
+            spot AS (
+                SELECT close::numeric AS spot_price
+                FROM underlying_quotes
+                WHERE symbol = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
             bucketed AS (
                 SELECT
                     gs.timestamp,
@@ -1462,53 +1472,51 @@ class DatabaseManager:
                 SELECT *
                 FROM bucketed
                 WHERE rn = 1
+            ),
+            strike_agg AS (
+                SELECT
+                    gbs.timestamp,
+                    COALESCE(SUM(gbs.call_gamma * 100 * s.spot_price), 0)::numeric AS total_call_gex,
+                    COALESCE(SUM(-1 * gbs.put_gamma * 100 * s.spot_price), 0)::numeric AS total_put_gex
+                FROM gex_by_strike gbs
+                CROSS JOIN spot s
+                WHERE gbs.underlying = $1
+                  AND gbs.timestamp IN (SELECT timestamp FROM base)
+                GROUP BY gbs.timestamp
+            ),
+            walls AS (
+                SELECT DISTINCT ON (gbs.timestamp)
+                    gbs.timestamp,
+                    FIRST_VALUE(gbs.strike) OVER (
+                        PARTITION BY gbs.timestamp
+                        ORDER BY ABS(gbs.call_gamma) DESC, gbs.strike
+                    )::numeric AS call_wall,
+                    FIRST_VALUE(gbs.strike) OVER (
+                        PARTITION BY gbs.timestamp
+                        ORDER BY ABS(gbs.put_gamma) DESC, gbs.strike
+                    )::numeric AS put_wall
+                FROM gex_by_strike gbs
+                WHERE gbs.underlying = $1
+                  AND gbs.timestamp IN (SELECT timestamp FROM base)
             )
             SELECT
                 b.bucket_ts as timestamp,
                 b.symbol,
-                q.spot_price,
-                totals.total_call_gex,
-                totals.total_put_gex,
+                s.spot_price,
+                COALESCE(sa.total_call_gex, 0)::numeric AS total_call_gex,
+                COALESCE(sa.total_put_gex, 0)::numeric AS total_put_gex,
                 b.net_gex,
                 b.gamma_flip,
                 b.max_pain,
-                cw.call_wall,
-                pw.put_wall,
+                w.call_wall,
+                w.put_wall,
                 b.total_call_oi,
                 b.total_put_oi,
                 b.put_call_ratio
             FROM base b
-            LEFT JOIN LATERAL (
-                SELECT COALESCE(uq.close, 0)::numeric AS spot_price
-                FROM underlying_quotes uq
-                WHERE uq.symbol = b.symbol
-                ORDER BY (uq.timestamp <= b.timestamp) DESC, uq.timestamp DESC
-                LIMIT 1
-            ) q ON TRUE
-            JOIN LATERAL (
-                SELECT
-                    COALESCE(SUM(gbs.call_gamma * 100 * q.spot_price), 0)::numeric AS total_call_gex,
-                    COALESCE(SUM(-1 * gbs.put_gamma * 100 * q.spot_price), 0)::numeric AS total_put_gex
-                FROM gex_by_strike gbs
-                WHERE gbs.underlying = b.symbol
-                  AND gbs.timestamp = b.timestamp
-            ) totals ON TRUE
-            LEFT JOIN LATERAL (
-                SELECT gbs.strike::numeric AS call_wall
-                FROM gex_by_strike gbs
-                WHERE gbs.underlying = b.symbol
-                  AND gbs.timestamp = b.timestamp
-                ORDER BY ABS(gbs.call_gamma * 100 * q.spot_price) DESC, gbs.strike
-                LIMIT 1
-            ) cw ON TRUE
-            LEFT JOIN LATERAL (
-                SELECT gbs.strike::numeric AS put_wall
-                FROM gex_by_strike gbs
-                WHERE gbs.underlying = b.symbol
-                  AND gbs.timestamp = b.timestamp
-                ORDER BY ABS(-1 * gbs.put_gamma * 100 * q.spot_price) DESC, gbs.strike
-                LIMIT 1
-            ) pw ON TRUE
+            CROSS JOIN spot s
+            LEFT JOIN strike_agg sa ON sa.timestamp = b.timestamp
+            LEFT JOIN walls w ON w.timestamp = b.timestamp
             ORDER BY timestamp DESC
             LIMIT $4
         """
@@ -1637,7 +1645,6 @@ class DatabaseManager:
 
         try:
             async with self._acquire_connection() as conn:
-                await self._refresh_flow_cache(conn, symbol)
                 rows = await asyncio.wait_for(
                     conn.fetch(query, symbol, session_start, session_end),
                     timeout=15.0,
@@ -1698,7 +1705,6 @@ class DatabaseManager:
 
         try:
             async with self._acquire_connection() as conn:
-                await self._refresh_flow_cache(conn, symbol)
                 rows = await asyncio.wait_for(
                     conn.fetch(query, symbol, session_start, session_end, limit),
                     timeout=15.0,
@@ -1760,7 +1766,6 @@ class DatabaseManager:
 
         try:
             async with self._acquire_connection() as conn:
-                await self._refresh_flow_cache(conn, symbol)
                 rows = await asyncio.wait_for(
                     conn.fetch(query, symbol, session_start, session_end, limit),
                     timeout=15.0,
@@ -2166,6 +2171,7 @@ class DatabaseManager:
                     SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE -total_premium END)::numeric AS net_option_flow
                 FROM flow_by_type
                 WHERE symbol = $1
+                  AND timestamp >= NOW() - INTERVAL '2 days'
                 GROUP BY timestamp, symbol
             ),
             base AS (
@@ -2179,6 +2185,7 @@ class DatabaseManager:
                 FROM underlying_quotes u
                 LEFT JOIN option_flow of ON of.timestamp = u.timestamp AND of.symbol = u.symbol
                 WHERE u.symbol = $1
+                  AND u.timestamp >= NOW() - INTERVAL '2 days'
             )
             SELECT
                 timestamp,
@@ -2784,6 +2791,12 @@ class DatabaseManager:
 
     async def get_max_pain_current(self, symbol: str = 'SPY', strike_limit: int = 200) -> Optional[Dict[str, Any]]:
         """Get current max pain from daily OI snapshot cache."""
+        symbol = symbol.upper()
+        cache_key = f"max_pain_current:{symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         snapshot_query = """
             SELECT
                 symbol,
@@ -2828,7 +2841,7 @@ class DatabaseManager:
                     'strikes': strikes or [],
                 })
 
-            return {
+            result = {
                 'timestamp': snapshot['timestamp'],
                 'symbol': snapshot['symbol'],
                 'underlying_price': snapshot['underlying_price'],
@@ -2836,6 +2849,8 @@ class DatabaseManager:
                 'difference': snapshot['difference'],
                 'expirations': expirations,
             }
+            self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
+            return result
 
     # ========================================================================
     # Chart Data Queries
@@ -2850,7 +2865,12 @@ class DatabaseManager:
         """
         Get GEX data by strike over time for heatmap visualization using interval + window units.
         """
+        symbol = symbol.upper()
         window_units = max(1, min(window_units, 90))
+        cache_key = f"gex_heatmap:{symbol}:{timeframe}:{window_units}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         bucket = _bucket_expr(timeframe)
         step_interval = _interval_expr(timeframe)
         query = f"""
@@ -2908,7 +2928,9 @@ class DatabaseManager:
                     conn.fetch(query, symbol, window_units),
                     timeout=15.0
                 )
-                return [dict(row) for row in rows]
+                result = [dict(row) for row in rows]
+                self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
+                return result
         except asyncio.TimeoutError:
             logger.warning(f"GEX heatmap query timed out for {symbol} timeframe={timeframe} window={window_units}, returning empty")
             return []
