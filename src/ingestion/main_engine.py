@@ -625,6 +625,21 @@ class IngestionEngine:
             theta = EXCLUDED.theta,
             vega = EXCLUDED.vega,
             updated_at = NOW()
+        WHERE
+            COALESCE(EXCLUDED.last, option_chains.last) IS DISTINCT FROM option_chains.last
+            OR COALESCE(EXCLUDED.bid, option_chains.bid) IS DISTINCT FROM option_chains.bid
+            OR COALESCE(EXCLUDED.ask, option_chains.ask) IS DISTINCT FROM option_chains.ask
+            OR COALESCE(EXCLUDED.mid, option_chains.mid) IS DISTINCT FROM option_chains.mid
+            OR GREATEST(option_chains.volume, EXCLUDED.volume) IS DISTINCT FROM option_chains.volume
+            OR GREATEST(option_chains.open_interest, EXCLUDED.open_interest) IS DISTINCT FROM option_chains.open_interest
+            OR COALESCE(EXCLUDED.implied_volatility, option_chains.implied_volatility) IS DISTINCT FROM option_chains.implied_volatility
+            OR (option_chains.ask_volume + EXCLUDED.ask_volume) IS DISTINCT FROM option_chains.ask_volume
+            OR (option_chains.mid_volume + EXCLUDED.mid_volume) IS DISTINCT FROM option_chains.mid_volume
+            OR (option_chains.bid_volume + EXCLUDED.bid_volume) IS DISTINCT FROM option_chains.bid_volume
+            OR EXCLUDED.delta IS DISTINCT FROM option_chains.delta
+            OR EXCLUDED.gamma IS DISTINCT FROM option_chains.gamma
+            OR EXCLUDED.theta IS DISTINCT FROM option_chains.theta
+            OR EXCLUDED.vega IS DISTINCT FROM option_chains.vega
     """
 
     def _coalesce_option_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

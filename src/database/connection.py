@@ -5,6 +5,7 @@ Database connection management for PostgreSQL
 import os
 import psycopg2
 from psycopg2 import pool
+from psycopg2 import extensions
 import time
 from typing import Optional
 from contextlib import contextmanager
@@ -52,6 +53,15 @@ def close_db_connection(conn):
     global _connection_pool
 
     if _connection_pool and conn:
+        try:
+            tx_status = conn.get_transaction_status()
+            if tx_status != extensions.TRANSACTION_STATUS_IDLE:
+                # Ensure we never return a connection "idle in transaction"
+                # to the pool (this can hold locks and bloat table churn).
+                conn.rollback()
+                logger.warning("Rolled back open transaction before returning DB connection")
+        except Exception:
+            logger.warning("Failed to inspect/reset transaction state before pool return", exc_info=True)
         _connection_pool.putconn(conn)
         logger.debug("Returned connection to pool")
 
@@ -70,6 +80,13 @@ def db_connection():
     try:
         conn = get_db_connection()
         yield conn
+    except Exception:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                logger.warning("Failed to rollback DB connection after error", exc_info=True)
+        raise
     finally:
         if conn:
             close_db_connection(conn)
@@ -86,8 +103,12 @@ def _initialize_connection_pool():
     db_port = int(os.getenv('DB_PORT', '5432'))
     db_name = os.getenv('DB_NAME', 'zerogex')
     db_user = os.getenv('DB_USER', 'postgres')
+    # Conservative defaults prevent "too many clients" when multiple engines
+    # and API workers are running concurrently against the same DB.
     min_connections = int(os.getenv('DB_POOL_MIN', '1'))
-    max_connections = int(os.getenv('DB_POOL_MAX', '4'))
+    max_connections = int(os.getenv('DB_POOL_MAX', '2'))
+    if min_connections > max_connections:
+        min_connections = max_connections
     connect_timeout = int(os.getenv('DB_CONNECT_TIMEOUT_SECONDS', '20'))
     connect_retries = int(os.getenv('DB_CONNECT_RETRIES', '5'))
     retry_base_delay = float(os.getenv('DB_CONNECT_RETRY_DELAY_SECONDS', '1.5'))
@@ -101,7 +122,15 @@ def _initialize_connection_pool():
         logger.error(f"Failed to retrieve database password: {e}")
         raise
 
-    logger.info(f"Connecting to PostgreSQL: {db_user}@{db_host}:{db_port}/{db_name}")
+    logger.info(
+        "Connecting to PostgreSQL: %s@%s:%s/%s (pool min=%d, max=%d)",
+        db_user,
+        db_host,
+        db_port,
+        db_name,
+        min_connections,
+        max_connections,
+    )
 
     # Build connection parameters
     conn_params = {
