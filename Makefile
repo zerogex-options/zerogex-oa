@@ -1723,9 +1723,21 @@ signals-score-history: ## Score history from DB
 	@$(PSQL) -c "SELECT underlying, timestamp AT TIME ZONE 'America/New_York' AS time_et, direction, composite_score, normalized_score FROM signal_scores WHERE underlying='$(FLOW_SYMBOL)' ORDER BY timestamp DESC LIMIT $(LIMIT);"
 
 .PHONY: signals-vol-expansion
-signals-vol-expansion: ## Latest volatility-expansion signal summary row
+signals-vol-expansion: ## Latest volatility-expansion score (0-100) from signal_component_scores
 	@echo "$(BLUE)=== Volatility Expansion Signal ($(FLOW_SYMBOL)) ===$(NC)"
-	@$(PSQL) -c "SELECT underlying, timestamp, normalized_score, move_probability, expected_direction, expected_magnitude_pct, confidence, catalyst_type, time_horizon, strategy_type FROM volatility_expansion_signals WHERE underlying='$(FLOW_SYMBOL)' ORDER BY timestamp DESC LIMIT 1;"
+	@$(PSQL) -c "\
+		SELECT \
+			underlying, \
+			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') AS time, \
+			ROUND(ABS(raw_score) * 100, 1) AS score, \
+			CASE WHEN raw_score > 0 THEN 'bullish' WHEN raw_score < 0 THEN 'bearish' ELSE 'neutral' END AS direction, \
+			ROUND(raw_score::numeric, 4) AS raw_score, \
+			context_values \
+		FROM signal_component_scores \
+		WHERE underlying = '$(FLOW_SYMBOL)' \
+		  AND component_name = 'vol_expansion' \
+		ORDER BY timestamp DESC \
+		LIMIT 1;"
 
 .PHONY: db-tail-vol_expansion_signals
 db-tail-vol_expansion_signals: ## Show 10 most recent rows from volatility_expansion_signals

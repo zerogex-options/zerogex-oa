@@ -2363,35 +2363,28 @@ class DatabaseManager:
         self,
         symbol: str = "SPY",
     ) -> Optional[Dict[str, Any]]:
-        """Return the most recent volatility expansion signal for this symbol."""
+        """Return the most recent vol_expansion component score for this symbol.
+
+        Reads from signal_component_scores (populated by VolExpansionComponent
+        via ScoringEngine) and returns the raw score scaled to [0, 100].
+        """
         query = """
             SELECT
-                underlying,
-                timestamp,
-                composite_score,
-                max_possible_score,
-                normalized_score,
-                move_probability,
-                expected_direction,
-                expected_magnitude_pct,
-                confidence,
-                catalyst_type,
-                time_horizon,
-                strategy_type,
-                entry_window,
-                current_price,
-                net_gex,
-                gamma_flip,
-                max_pain,
-                put_call_ratio,
-                dealer_net_delta,
-                smart_money_direction,
-                vwap_deviation_pct,
-                hours_to_next_expiry,
-                components
-            FROM volatility_expansion_signals
-            WHERE underlying = $1
-            ORDER BY timestamp DESC
+                scs.underlying,
+                scs.timestamp,
+                scs.raw_score,
+                scs.weighted_score,
+                scs.weight,
+                scs.context_values,
+                CASE
+                    WHEN scs.raw_score > 0 THEN 'bullish'
+                    WHEN scs.raw_score < 0 THEN 'bearish'
+                    ELSE 'neutral'
+                END AS direction
+            FROM signal_component_scores scs
+            WHERE scs.underlying = $1
+              AND scs.component_name = 'vol_expansion'
+            ORDER BY scs.timestamp DESC
             LIMIT 1
         """
         try:
@@ -2400,8 +2393,12 @@ class DatabaseManager:
                 if not row:
                     return None
                 d = dict(row)
-                if isinstance(d.get("components"), str):
-                    d["components"] = json.loads(d["components"])
+                raw = d.get("raw_score") or 0.0
+                d["score"] = round(abs(float(raw)) * 100.0, 2)
+                ctx = d.get("context_values") or {}
+                if isinstance(ctx, str):
+                    ctx = json.loads(ctx)
+                d["context_values"] = ctx
                 return d
         except Exception as e:
             logger.error(f"get_vol_expansion_signal failed ({symbol}): {e}")

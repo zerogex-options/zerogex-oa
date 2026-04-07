@@ -173,7 +173,8 @@ async def get_vol_expansion_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
 ):
+    """Latest vol-expansion component score (0–100) from the unified signal engine."""
     row = await db.get_vol_expansion_signal(symbol.upper())
     if not row:
-        raise HTTPException(status_code=404, detail=f"No volatility expansion rows found for {symbol.upper()}")
-    return _normalize_vol_expansion_row(row)
+        raise HTTPException(status_code=404, detail=f"No vol-expansion score found for {symbol.upper()}")
+    return row
