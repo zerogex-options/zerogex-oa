@@ -179,13 +179,16 @@ def fetch_option_snapshot(
     """
     cur = conn.cursor()
 
-    # Step 1: find the latest snapshot timestamp within the DTE window
+    # Step 1: find the latest snapshot timestamp within the DTE window.
+    # Bound the scan to a 10-minute lookback from anchor_ts to avoid
+    # scanning the entire option_chains table (can be millions of rows).
     cur.execute(
         """
         SELECT timestamp
         FROM option_chains
         WHERE underlying = %s
           AND timestamp <= %s
+          AND timestamp >= %s - INTERVAL '10 minutes'
           AND expiration BETWEEN (%s::date + (%s * INTERVAL '1 day'))
                               AND (%s::date + (%s * INTERVAL '1 day'))
           AND (
@@ -195,7 +198,7 @@ def fetch_option_snapshot(
         ORDER BY timestamp DESC
         LIMIT 1
         """,
-        (db_symbol, anchor_ts, trade_date, dte_min, trade_date, dte_max),
+        (db_symbol, anchor_ts, anchor_ts, trade_date, dte_min, trade_date, dte_max),
     )
     snapshot_row = cur.fetchone()
     snapshot_ts = snapshot_row[0] if snapshot_row else None
@@ -208,6 +211,7 @@ def fetch_option_snapshot(
             FROM option_chains
             WHERE underlying = %s
               AND timestamp <= %s
+              AND timestamp >= %s - INTERVAL '10 minutes'
               AND expiration BETWEEN %s::date AND (%s::date + INTERVAL '45 day')
               AND (
                   (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
@@ -216,7 +220,7 @@ def fetch_option_snapshot(
             ORDER BY timestamp DESC
             LIMIT 1
             """,
-            (db_symbol, anchor_ts, trade_date, trade_date),
+            (db_symbol, anchor_ts, anchor_ts, trade_date, trade_date),
         )
         snapshot_row = cur.fetchone()
         snapshot_ts = snapshot_row[0] if snapshot_row else None
@@ -274,6 +278,7 @@ def fetch_option_snapshot(
             FROM option_chains
             WHERE underlying = %s
               AND timestamp <= %s
+              AND timestamp >= %s - INTERVAL '10 minutes'
               AND expiration BETWEEN %s::date AND (%s::date + INTERVAL '45 day')
               AND (
                   (bid IS NOT NULL AND ask IS NOT NULL AND ask > 0)
@@ -282,7 +287,7 @@ def fetch_option_snapshot(
             ORDER BY timestamp DESC
             LIMIT 1
             """,
-            (db_symbol, anchor_ts, trade_date, trade_date),
+            (db_symbol, anchor_ts, anchor_ts, trade_date, trade_date),
         )
         snapshot_row = cur.fetchone()
         snapshot_ts = snapshot_row[0] if snapshot_row else None
@@ -451,6 +456,7 @@ class PositionOptimizerEngine:
                     FROM option_chains
                     WHERE underlying = %s
                       AND timestamp <= %s
+                      AND timestamp >= %s - INTERVAL '10 minutes'
                       AND expiration BETWEEN (%s::date + (%s * INTERVAL '1 day'))
                                           AND (%s::date + (%s * INTERVAL '1 day'))
                       AND (
@@ -460,7 +466,7 @@ class PositionOptimizerEngine:
                     ORDER BY timestamp DESC
                     LIMIT 1
                     """,
-                    (self.db_symbol, anchor_ts, trade_date, dte_min, trade_date, dte_max),
+                    (self.db_symbol, anchor_ts, anchor_ts, trade_date, dte_min, trade_date, dte_max),
                 )
                 snapshot_row = cur.fetchone()
                 snapshot_ts = snapshot_row[0] if snapshot_row else None

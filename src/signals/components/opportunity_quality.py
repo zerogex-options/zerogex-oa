@@ -21,6 +21,11 @@ class OpportunityQualityComponent(ComponentBase):
         self.underlying = underlying
         self._optimizer: Optional[object] = None
         self._last_result: Optional[float] = None  # cache last valid score
+        # Cache option rows from the latest cycle so the portfolio engine's
+        # _select_optimizer_candidate can reuse them instead of running the
+        # same expensive fetch_option_snapshot query a second time.
+        self._cached_option_rows: Optional[list] = None
+        self._cached_option_rows_key: Optional[tuple] = None  # (timestamp, dte_min, dte_max)
 
     def _get_optimizer(self):
         if self._optimizer is None:
@@ -47,6 +52,9 @@ class OpportunityQualityComponent(ComponentBase):
                 dte_min, dte_max = dte_ranges[timeframe]
                 trade_date = ctx.timestamp.date()
                 option_rows = fetch_option_snapshot(conn, ctx.underlying, ctx.timestamp, trade_date, dte_min, dte_max)
+                # Cache for reuse by portfolio engine
+                self._cached_option_rows = option_rows
+                self._cached_option_rows_key = (ctx.timestamp, dte_min, dte_max)
                 if not option_rows:
                     return self._last_result if self._last_result is not None else 0.0
 

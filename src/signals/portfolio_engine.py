@@ -108,7 +108,7 @@ class PortfolioEngine:
     # ------------------------------------------------------------------
 
     def compute_target(
-        self, score: ScoreSnapshot, market_ctx: dict, conn=None
+        self, score: ScoreSnapshot, market_ctx: dict, conn=None, cached_option_rows=None
     ) -> PortfolioTarget:
         """Return the optimal portfolio state given the current score.
 
@@ -148,7 +148,9 @@ class PortfolioEngine:
             )
 
         # --- CASE 3: position optimizer candidate ---
-        candidate_result = self._select_optimizer_candidate(score, market_ctx, conn=conn)
+        candidate_result = self._select_optimizer_candidate(
+            score, market_ctx, conn=conn, cached_option_rows=cached_option_rows
+        )
         if not candidate_result:
             return self._cash_target(
                 score,
@@ -622,7 +624,7 @@ class PortfolioEngine:
             return True
 
     def _select_optimizer_candidate(
-        self, score: ScoreSnapshot, ctx: dict, conn=None
+        self, score: ScoreSnapshot, ctx: dict, conn=None, cached_option_rows=None
     ) -> Optional[dict]:
         signal_timeframe = self._infer_signal_timeframe(score.normalized_score)
         signal_strength = self._infer_signal_strength(score.normalized_score)
@@ -630,10 +632,18 @@ class PortfolioEngine:
         dte_ranges = {"intraday": (0, 2), "swing": (1, 7), "multi_day": (3, 14)}
         dte_min, dte_max = dte_ranges.get(signal_timeframe, (1, 7))
 
-        with self._use_conn(conn) as c:
-            option_rows = fetch_option_snapshot(
-                c, self.db_symbol, score.timestamp, score.timestamp.date(), dte_min, dte_max
-            )
+        # Reuse option rows from OpportunityQualityComponent if available
+        # and the DTE window matches, avoiding a duplicate option_chains scan.
+        option_rows = None
+        if cached_option_rows is not None:
+            cache_key, rows = cached_option_rows
+            if cache_key == (score.timestamp, dte_min, dte_max) and rows:
+                option_rows = rows
+        if option_rows is None:
+            with self._use_conn(conn) as c:
+                option_rows = fetch_option_snapshot(
+                    c, self.db_symbol, score.timestamp, score.timestamp.date(), dte_min, dte_max
+                )
         if not option_rows:
             return None
 

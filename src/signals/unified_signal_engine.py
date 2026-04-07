@@ -193,30 +193,41 @@ class UnifiedSignalEngine:
         )
 
     def run_cycle(self) -> bool:
-        with db_connection() as conn:
-            # Layer 1: score
-            ctx = self._fetch_market_context(conn=conn)
-            if not ctx:
-                logger.warning("UnifiedSignalEngine [%s]: missing market context", self.db_symbol)
-                return False
+        # Each phase acquires and releases its own connection to avoid
+        # holding a connection "idle in transaction" during CPU-bound work.
+        # The _use_conn(conn=None) pattern in each callee handles this.
 
-            # NOTE: score_and_persist must run before portfolio reconciliation.
-            # _score_trend_confirmation inside PortfolioEngine.compute_target uses
-            # `timestamp < current` — changing this order would allow the current
-            # score to confirm itself.
-            market_context = self._build_market_context(ctx)
-            score = self.scoring_engine.score_and_persist(market_context, conn=conn)
+        # Phase 1: fetch market context (read-only, releases connection)
+        ctx = self._fetch_market_context()
+        if not ctx:
+            logger.warning("UnifiedSignalEngine [%s]: missing market context", self.db_symbol)
+            return False
 
-            # Layer 2: reconcile portfolio
-            target = self.portfolio_engine.compute_target(score, ctx, conn=conn)
-            action = self.portfolio_engine.reconcile(target, conn=conn)
+        # Phase 2: score and persist (acquires connection, writes, commits, releases)
+        # NOTE: score_and_persist must run before portfolio reconciliation.
+        # _score_trend_confirmation inside PortfolioEngine.compute_target uses
+        # `timestamp < current` — changing this order would allow the current
+        # score to confirm itself.
+        market_context = self._build_market_context(ctx)
+        score = self.scoring_engine.score_and_persist(market_context)
 
-            logger.info(
-                "UnifiedSignalEngine [%s] score=%.3f norm=%.3f dir=%s action=%s",
-                self.db_symbol,
-                score.composite_score,
-                score.normalized_score,
-                score.direction,
-                action,
-            )
-            return True
+        # Phase 3: reconcile portfolio (acquires connection for reads+writes)
+        # Pass cached option rows from OpportunityQualityComponent to avoid
+        # a duplicate fetch_option_snapshot query in _select_optimizer_candidate.
+        cached_option_rows = None
+        for component in self.scoring_engine.components:
+            if hasattr(component, '_cached_option_rows_key') and component._cached_option_rows is not None:
+                cached_option_rows = (component._cached_option_rows_key, component._cached_option_rows)
+                break
+        target = self.portfolio_engine.compute_target(score, ctx, cached_option_rows=cached_option_rows)
+        action = self.portfolio_engine.reconcile(target)
+
+        logger.info(
+            "UnifiedSignalEngine [%s] score=%.3f norm=%.3f dir=%s action=%s",
+            self.db_symbol,
+            score.composite_score,
+            score.normalized_score,
+            score.direction,
+            action,
+        )
+        return True
