@@ -14,6 +14,16 @@ class _FakeConn:
         return self.row
 
 
+class _FakeFlowConn:
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls = 0
+
+    async def fetch(self, *_args):
+        self.calls += 1
+        return self.rows
+
+
 def test_get_latest_quote_uses_short_ttl_cache():
     db = DatabaseManager()
     db._latest_quote_cache_ttl_seconds = 60.0
@@ -49,6 +59,45 @@ def test_get_latest_gex_summary_cache_expires():
     # Allow the cache entry to expire.
     asyncio.run(asyncio.sleep(0.02))
     second = asyncio.run(db.get_latest_gex_summary("SPY"))
+
+    assert second == first
+    assert conn.calls == 2
+
+
+def test_get_flow_by_type_uses_cache():
+    db = DatabaseManager()
+    db._flow_endpoint_cache_ttl_seconds = 60.0
+    conn = _FakeFlowConn([{"timestamp": "2026-01-01T09:30:00Z", "symbol": "SPY"}])
+
+    @asynccontextmanager
+    async def _acquire():
+        yield conn
+
+    db._acquire_connection = _acquire  # type: ignore[method-assign]
+
+    first = asyncio.run(db.get_flow_by_type("spy", "current"))
+    second = asyncio.run(db.get_flow_by_type("SPY", "current"))
+
+    assert first == second
+    assert conn.calls == 1
+
+
+def test_get_flow_by_strike_cache_expires():
+    db = DatabaseManager()
+    db._flow_endpoint_cache_ttl_seconds = 0.01
+    conn = _FakeFlowConn([{"timestamp": "2026-01-01T09:30:00Z", "symbol": "SPY", "strike": 500.0}])
+
+    @asynccontextmanager
+    async def _acquire():
+        yield conn
+
+    db._acquire_connection = _acquire  # type: ignore[method-assign]
+
+    first = asyncio.run(db.get_flow_by_strike("SPY", "current", 20))
+    assert first
+
+    asyncio.run(asyncio.sleep(0.02))
+    second = asyncio.run(db.get_flow_by_strike("SPY", "current", 20))
 
     assert second == first
     assert conn.calls == 2

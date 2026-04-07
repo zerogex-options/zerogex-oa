@@ -138,6 +138,12 @@ class DatabaseManager:
         self._analytics_cache_ttl_seconds: float = float(
             os.getenv("ANALYTICS_CACHE_TTL_SECONDS", "5.0")
         )
+        # Flow endpoints are frequently polled by the frontend. A short TTL
+        # dramatically cuts repeated heavy reads while keeping intraday charts
+        # effectively real-time.
+        self._flow_endpoint_cache_ttl_seconds: float = float(
+            os.getenv("FLOW_ENDPOINT_CACHE_TTL_SECONDS", "3.0")
+        )
         self._read_cache: Dict[str, Tuple[float, Any]] = {}
         self._load_credentials()
 
@@ -1540,6 +1546,12 @@ class DatabaseManager:
         session: str = 'current'
     ) -> List[Dict[str, Any]]:
         """Get option flow by type from canonical flow_contract_facts."""
+        symbol = symbol.upper()
+        cache_key = f"flow_by_type:{symbol}:{session}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         session_start, session_end = _get_session_bounds(session)
         query = """
             WITH minutes AS (
@@ -1649,7 +1661,9 @@ class DatabaseManager:
                     conn.fetch(query, symbol, session_start, session_end),
                     timeout=15.0,
                 )
-                return [dict(row) for row in rows]
+                result = [dict(row) for row in rows]
+                self._cache_set(cache_key, result, self._flow_endpoint_cache_ttl_seconds)
+                return result
         except asyncio.TimeoutError:
             logger.warning(f"Flow by type query timed out for {symbol}, returning empty")
             return []
@@ -1664,6 +1678,12 @@ class DatabaseManager:
         limit: int = 20
     ) -> List[Dict[str, Any]]:
         """Get option flow by strike from canonical flow_contract_facts."""
+        symbol = symbol.upper()
+        cache_key = f"flow_by_strike:{symbol}:{session}:{limit}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         session_start, session_end = _get_session_bounds(session)
         query = """
             WITH agg AS (
@@ -1709,7 +1729,9 @@ class DatabaseManager:
                     conn.fetch(query, symbol, session_start, session_end, limit),
                     timeout=15.0,
                 )
-                return [dict(row) for row in rows]
+                result = [dict(row) for row in rows]
+                self._cache_set(cache_key, result, self._flow_endpoint_cache_ttl_seconds)
+                return result
         except asyncio.TimeoutError:
             logger.warning(f"Flow by strike query timed out for {symbol}, returning empty")
             return []
@@ -1724,6 +1746,12 @@ class DatabaseManager:
         limit: int = 20
     ) -> List[Dict[str, Any]]:
         """Get option flow by expiration from canonical flow_contract_facts."""
+        symbol = symbol.upper()
+        cache_key = f"flow_by_expiration:{symbol}:{session}:{limit}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         session_start, session_end = _get_session_bounds(session)
         query = """
             WITH agg AS (
@@ -1770,7 +1798,9 @@ class DatabaseManager:
                     conn.fetch(query, symbol, session_start, session_end, limit),
                     timeout=15.0,
                 )
-                return [dict(row) for row in rows]
+                result = [dict(row) for row in rows]
+                self._cache_set(cache_key, result, self._flow_endpoint_cache_ttl_seconds)
+                return result
         except asyncio.TimeoutError:
             logger.warning(f"Flow by expiration query timed out for {symbol}, returning empty")
             return []
