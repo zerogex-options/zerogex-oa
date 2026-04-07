@@ -126,6 +126,7 @@ class ProprietarySignalEngine:
                 FROM underlying_quotes
                 WHERE symbol = %s
                 ORDER BY timestamp DESC
+                LIMIT 1
                 """,
                 (self.db_symbol,),
             )

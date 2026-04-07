@@ -6,6 +6,7 @@ __all__ = [
     "ProprietarySignalEngine",
     "ConsolidatedSignalEngine",
     "ScoringEngine",
+    "PortfolioEngine",
     "ComponentBase",
     "MarketContext",
 ]
@@ -27,6 +28,9 @@ def __getattr__(name):
     if name == "ScoringEngine":
         from src.signals.scoring_engine import ScoringEngine
         return ScoringEngine
+    if name == "PortfolioEngine":
+        from src.signals.portfolio_engine import PortfolioEngine
+        return PortfolioEngine
     if name == "ComponentBase":
         from src.signals.components.base import ComponentBase
         return ComponentBase
