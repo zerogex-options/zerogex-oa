@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from typing import Optional
+import os
 
 from src.database import db_connection
 from src.signals.components.base import MarketContext
@@ -45,6 +46,12 @@ class UnifiedSignalEngine:
         )
 
         self.portfolio_engine = PortfolioEngine(self.underlying)
+        self._iv_rank_enabled = os.getenv("SIGNAL_IV_RANK_ENABLED", "false").lower() == "true"
+        if not self._iv_rank_enabled:
+            logger.info(
+                "UnifiedSignalEngine [%s]: IV-rank query disabled (set SIGNAL_IV_RANK_ENABLED=true to enable)",
+                self.db_symbol,
+            )
 
     @staticmethod
     @contextmanager
@@ -111,49 +118,50 @@ class UnifiedSignalEngine:
                 )
                 closes = [float(r[0]) for r in cur.fetchall()]
 
-                # IV rank: compare current ATM IV to its 30-day daily range.
                 iv_rank = None
-                try:
-                    cur.execute(
-                        """
-                        WITH current_atm AS (
-                            SELECT AVG(implied_volatility) AS current_iv
-                            FROM option_chains
-                            WHERE underlying = %s
-                              AND ABS(strike - %s) / NULLIF(%s, 0) < 0.01
-                              AND option_type = 'C'
-                              AND implied_volatility IS NOT NULL
-                              AND implied_volatility > 0
-                              AND timestamp >= %s - INTERVAL '2 hours'
-                        ),
-                        daily_iv AS (
-                            SELECT DATE_TRUNC('day', timestamp) AS day,
-                                   AVG(implied_volatility) AS avg_iv
-                            FROM option_chains
-                            WHERE underlying = %s
-                              AND ABS(strike - %s) / NULLIF(%s, 0) < 0.01
-                              AND option_type = 'C'
-                              AND implied_volatility IS NOT NULL
-                              AND implied_volatility > 0
-                              AND timestamp >= NOW() - INTERVAL '30 days'
-                            GROUP BY DATE_TRUNC('day', timestamp)
+                if self._iv_rank_enabled:
+                    # IV rank: compare current ATM IV to its 30-day daily range.
+                    try:
+                        cur.execute(
+                            """
+                            WITH current_atm AS (
+                                SELECT AVG(implied_volatility) AS current_iv
+                                FROM option_chains
+                                WHERE underlying = %s
+                                  AND ABS(strike - %s) / NULLIF(%s, 0) < 0.01
+                                  AND option_type = 'C'
+                                  AND implied_volatility IS NOT NULL
+                                  AND implied_volatility > 0
+                                  AND timestamp >= %s - INTERVAL '2 hours'
+                            ),
+                            daily_iv AS (
+                                SELECT DATE_TRUNC('day', timestamp) AS day,
+                                       AVG(implied_volatility) AS avg_iv
+                                FROM option_chains
+                                WHERE underlying = %s
+                                  AND ABS(strike - %s) / NULLIF(%s, 0) < 0.01
+                                  AND option_type = 'C'
+                                  AND implied_volatility IS NOT NULL
+                                  AND implied_volatility > 0
+                                  AND timestamp >= NOW() - INTERVAL '30 days'
+                                GROUP BY DATE_TRUNC('day', timestamp)
+                            )
+                            SELECT
+                                (SELECT current_iv FROM current_atm),
+                                MIN(avg_iv),
+                                MAX(avg_iv)
+                            FROM daily_iv
+                            """,
+                            (self.db_symbol, close_f, close_f, ts, self.db_symbol, close_f, close_f),
                         )
-                        SELECT
-                            (SELECT current_iv FROM current_atm),
-                            MIN(avg_iv),
-                            MAX(avg_iv)
-                        FROM daily_iv
-                        """,
-                        (self.db_symbol, close_f, close_f, ts, self.db_symbol, close_f, close_f),
-                    )
-                    iv_row = cur.fetchone()
-                    if iv_row and iv_row[0] is not None and iv_row[1] is not None and iv_row[2] is not None:
-                        current_iv, iv_low, iv_high = float(iv_row[0]), float(iv_row[1]), float(iv_row[2])
-                        iv_range = iv_high - iv_low
-                        if iv_range > 0.001:
-                            iv_rank = round(min(1.0, max(0.0, (current_iv - iv_low) / iv_range)), 4)
-                except Exception:
-                    pass  # IV rank is supplemental; do not block signal generation if unavailable
+                        iv_row = cur.fetchone()
+                        if iv_row and iv_row[0] is not None and iv_row[1] is not None and iv_row[2] is not None:
+                            current_iv, iv_low, iv_high = float(iv_row[0]), float(iv_row[1]), float(iv_row[2])
+                            iv_range = iv_high - iv_low
+                            if iv_range > 0.001:
+                                iv_rank = round(min(1.0, max(0.0, (current_iv - iv_low) / iv_range)), 4)
+                    except Exception:
+                        pass  # IV rank is supplemental; do not block signal generation if unavailable
 
                 return {
                     "timestamp": ts,
