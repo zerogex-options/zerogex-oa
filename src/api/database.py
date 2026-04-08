@@ -1662,6 +1662,11 @@ class DatabaseManager:
                 SUM(call_volume + put_volume) OVER (ORDER BY timestamp)::bigint AS cumulative_volume,
                 SUM(net_volume) OVER (ORDER BY timestamp)::bigint AS cumulative_net_volume,
                 SUM(ncp + npp) OVER (ORDER BY timestamp)::numeric AS cumulative_net_premium,
+                ROUND(
+                    SUM(put_volume) OVER (ORDER BY timestamp)::numeric
+                    / NULLIF(SUM(call_volume) OVER (ORDER BY timestamp), 0),
+                    4
+                ) AS running_put_call_ratio,
                 CASE
                     WHEN net_volume > 500 THEN '🟢 Strong Calls'
                     WHEN net_volume > 0 THEN '✅ Calls'

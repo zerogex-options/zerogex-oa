@@ -176,6 +176,7 @@ class FlowByTypePoint(BaseModel):
     cumulative_volume: int
     cumulative_net_volume: int
     cumulative_net_premium: Decimal
+    running_put_call_ratio: Optional[Decimal] = None
     flow_bias: str
     underlying_price: Optional[Decimal] = None
 
