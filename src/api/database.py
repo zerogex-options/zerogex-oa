@@ -1712,21 +1712,33 @@ class DatabaseManager:
 
         session_start, session_end = _get_session_bounds(session)
         query = """
-            WITH agg AS (
-            SELECT
-                timestamp,
-                symbol,
-                strike,
-                SUM(volume_delta)::bigint AS volume,
-                SUM(premium_delta)::numeric AS premium,
-                SUM(signed_volume)::bigint AS net_volume,
-                SUM(signed_premium)::numeric AS net_premium,
-                MAX(underlying_price) AS underlying_price
-            FROM flow_contract_facts
-            WHERE symbol = $1
-              AND timestamp >= $2
-              AND timestamp <= $3
-            GROUP BY timestamp, symbol, strike
+            WITH bucketed AS (
+                SELECT
+                    $2 + floor(extract(epoch from (timestamp - $2)) / 300) * interval '5 minutes' AS bucket,
+                    symbol,
+                    strike,
+                    volume_delta,
+                    premium_delta,
+                    signed_volume,
+                    signed_premium,
+                    underlying_price
+                FROM flow_contract_facts
+                WHERE symbol = $1
+                  AND timestamp >= $2
+                  AND timestamp <= $3
+            ),
+            agg AS (
+                SELECT
+                    bucket AS timestamp,
+                    symbol,
+                    strike,
+                    SUM(volume_delta)::bigint AS volume,
+                    SUM(premium_delta)::numeric AS premium,
+                    SUM(signed_volume)::bigint AS net_volume,
+                    SUM(signed_premium)::numeric AS net_premium,
+                    MAX(underlying_price) AS underlying_price
+                FROM bucketed
+                GROUP BY bucket, symbol, strike
             )
             SELECT
                 timestamp,
@@ -1783,9 +1795,24 @@ class DatabaseManager:
 
         session_start, session_end = _get_session_bounds(session)
         query = """
-            WITH agg AS (
+            WITH bucketed AS (
                 SELECT
-                    timestamp,
+                    $2 + floor(extract(epoch from (timestamp - $2)) / 300) * interval '5 minutes' AS bucket,
+                    symbol,
+                    expiration,
+                    volume_delta,
+                    premium_delta,
+                    signed_volume,
+                    signed_premium,
+                    underlying_price
+                FROM flow_contract_facts
+                WHERE symbol = $1
+                  AND timestamp >= $2
+                  AND timestamp <= $3
+            ),
+            agg AS (
+                SELECT
+                    bucket AS timestamp,
                     symbol,
                     expiration,
                     SUM(volume_delta)::bigint AS volume,
@@ -1793,11 +1820,8 @@ class DatabaseManager:
                     SUM(signed_volume)::bigint AS net_volume,
                     SUM(signed_premium)::numeric AS net_premium,
                     MAX(underlying_price) AS underlying_price
-                FROM flow_contract_facts
-                WHERE symbol = $1
-                  AND timestamp >= $2
-                  AND timestamp <= $3
-                GROUP BY timestamp, symbol, expiration
+                FROM bucketed
+                GROUP BY bucket, symbol, expiration
             )
             SELECT
                 timestamp,
