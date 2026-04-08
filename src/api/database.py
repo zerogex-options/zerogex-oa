@@ -478,10 +478,28 @@ class DatabaseManager:
                 (volume_delta * trade_price * 100)::numeric AS premium_delta,
                 (CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::bigint AS signed_volume,
                 (CASE WHEN option_type = 'C' THEN 1 ELSE -1 END * volume_delta * trade_price * 100)::numeric AS signed_premium,
-                ask_vol_delta,
-                bid_vol_delta,
-                (ask_vol_delta * trade_price * 100)::numeric,
-                (bid_vol_delta * trade_price * 100)::numeric,
+                -- Scale buy/sell volumes to account for unclassified volume.
+                -- The classified subset (ask + bid) provides the directional
+                -- signal; extrapolate to the full volume_delta assuming the
+                -- unclassified portion has the same buy/sell ratio.
+                CASE WHEN (ask_vol_delta + bid_vol_delta) > 0
+                     THEN (ask_vol_delta::numeric / (ask_vol_delta + bid_vol_delta) * volume_delta)::bigint
+                     ELSE 0
+                END AS buy_volume,
+                CASE WHEN (ask_vol_delta + bid_vol_delta) > 0
+                     THEN (bid_vol_delta::numeric / (ask_vol_delta + bid_vol_delta) * volume_delta)::bigint
+                     ELSE 0
+                END AS sell_volume,
+                CASE WHEN (ask_vol_delta + bid_vol_delta) > 0
+                     THEN (ask_vol_delta::numeric / (ask_vol_delta + bid_vol_delta)
+                           * volume_delta * trade_price * 100)::numeric
+                     ELSE 0
+                END AS buy_premium,
+                CASE WHEN (ask_vol_delta + bid_vol_delta) > 0
+                     THEN (bid_vol_delta::numeric / (ask_vol_delta + bid_vol_delta)
+                           * volume_delta * trade_price * 100)::numeric
+                     ELSE 0
+                END AS sell_premium,
                 implied_volatility,
                 delta,
                 COALESCE(
