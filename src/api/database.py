@@ -1642,6 +1642,7 @@ class DatabaseManager:
                 -- Cumulative NPP: running sum of net put buying (negative = net put buying)
                 SUM(npp) OVER (ORDER BY timestamp)::numeric AS cumulative_put_premium,
                 SUM(call_volume + put_volume) OVER (ORDER BY timestamp)::bigint AS cumulative_volume,
+                SUM(net_volume) OVER (ORDER BY timestamp)::bigint AS cumulative_net_volume,
                 SUM(ncp + npp) OVER (ORDER BY timestamp)::numeric AS cumulative_net_premium,
                 CASE
                     WHEN net_volume > 500 THEN '🟢 Strong Calls'
@@ -1711,6 +1712,10 @@ class DatabaseManager:
                 premium,
                 net_volume,
                 net_premium,
+                SUM(volume) OVER (PARTITION BY strike ORDER BY timestamp)::bigint AS cumulative_volume,
+                SUM(net_volume) OVER (PARTITION BY strike ORDER BY timestamp)::bigint AS cumulative_net_volume,
+                SUM(premium) OVER (PARTITION BY strike ORDER BY timestamp)::numeric AS cumulative_premium,
+                SUM(net_premium) OVER (PARTITION BY strike ORDER BY timestamp)::numeric AS cumulative_net_premium,
                 CASE
                     WHEN net_volume > 100 THEN '🟢 Strong Calls'
                     WHEN net_volume > 0 THEN '✅ Calls'
@@ -1781,6 +1786,10 @@ class DatabaseManager:
                 premium,
                 net_volume,
                 net_premium,
+                SUM(volume) OVER (PARTITION BY expiration ORDER BY timestamp)::bigint AS cumulative_volume,
+                SUM(net_volume) OVER (PARTITION BY expiration ORDER BY timestamp)::bigint AS cumulative_net_volume,
+                SUM(premium) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_premium,
+                SUM(net_premium) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_net_premium,
                 CASE
                     WHEN net_volume > 500 THEN '🟢 Strong Calls'
                     WHEN net_volume > 0 THEN '✅ Calls'

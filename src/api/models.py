@@ -174,6 +174,7 @@ class FlowByTypePoint(BaseModel):
     cumulative_call_premium: Decimal
     cumulative_put_premium: Decimal
     cumulative_volume: int
+    cumulative_net_volume: int
     cumulative_net_premium: Decimal
     flow_bias: str
     underlying_price: Optional[Decimal] = None
@@ -187,6 +188,10 @@ class FlowByStrikePoint(BaseModel):
     premium: Decimal
     net_volume: int
     net_premium: Decimal
+    cumulative_volume: int
+    cumulative_net_volume: int
+    cumulative_premium: Decimal
+    cumulative_net_premium: Decimal
     flow_bias: str
     underlying_price: Optional[Decimal] = None
 
@@ -200,6 +205,10 @@ class FlowByExpirationPoint(BaseModel):
     premium: Decimal
     net_volume: int
     net_premium: Decimal
+    cumulative_volume: int
+    cumulative_net_volume: int
+    cumulative_premium: Decimal
+    cumulative_net_premium: Decimal
     flow_bias: str
     underlying_price: Optional[Decimal] = None
 
