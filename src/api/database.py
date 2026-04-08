@@ -1714,7 +1714,7 @@ class DatabaseManager:
         query = """
             WITH bucketed AS (
                 SELECT
-                    $2 + floor(extract(epoch from (timestamp - $2)) / 300) * interval '5 minutes' AS bucket,
+                    to_timestamp(floor(extract(epoch from timestamp) / 300) * 300) AS bucket,
                     symbol,
                     strike,
                     volume_delta,
@@ -1797,7 +1797,7 @@ class DatabaseManager:
         query = """
             WITH bucketed AS (
                 SELECT
-                    $2 + floor(extract(epoch from (timestamp - $2)) / 300) * interval '5 minutes' AS bucket,
+                    to_timestamp(floor(extract(epoch from timestamp) / 300) * 300) AS bucket,
                     symbol,
                     expiration,
                     volume_delta,
