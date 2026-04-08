@@ -130,8 +130,18 @@ async def get_vol_expansion_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
 ):
-    """Latest vol-expansion component score (0–100) from the unified signal engine."""
+    """Latest vol-expansion component score from the unified signal engine.
+
+    Returns two trader-facing dimensions alongside the composite score:
+      * **expansion** (0–100): How likely is vol to expand? (GEX-driven)
+      * **direction** (-100–+100): If it expands, which way? (momentum-driven)
+      * **score** (-100–+100): Combined composite contribution
+    """
     row = await db.get_vol_expansion_signal(symbol.upper())
     if not row:
         raise HTTPException(status_code=404, detail=f"No vol-expansion score found for {symbol.upper()}")
+    # Surface expansion & direction from context_values as top-level fields
+    ctx = row.get("context_values") or {}
+    row["expansion"] = ctx.get("expansion")
+    row["direction_score"] = ctx.get("direction")
     return row

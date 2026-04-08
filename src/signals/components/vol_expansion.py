@@ -1,14 +1,26 @@
-"""Volatility expansion scoring component — continuous spectrum model."""
+"""Volatility expansion scoring component — continuous spectrum model.
+
+Exposes two trader-facing dimensions:
+  * **expansion** (0–100): How likely is volatility to expand?
+    Driven by the GEX regime.  0 = deeply positive GEX, maximum dealer
+    suppression.  100 = deeply negative GEX, dealers amplifying moves.
+  * **direction** (-100–+100): If vol expands, which way?
+    Driven by recent price momentum.  +100 = strong bullish momentum,
+    -100 = strong bearish momentum, 0 = flat/no bias.
+
+The composite-score contribution (used by ScoringEngine) combines both
+into a single [-1, +1] value: ``expansion * direction / 10000``.
+"""
 from src.signals.components.base import ComponentBase, MarketContext
 
-# 0.5% price change over 5 bars fully shifts the score toward bearish.
+# 0.5% price change over 5 bars fully shifts the direction score.
 _MOMENTUM_NORM = 0.005
 
-# $300M GEX magnitude saturates the readiness scale.
+# $300M GEX magnitude saturates the expansion scale.
 _GEX_NORM = 300_000_000
 
-# Minimum readiness even with deeply positive GEX.  Volatility can always
-# expand — positive GEX suppresses but never eliminates the possibility.
+# Minimum expansion score even with deeply positive GEX.  Volatility can
+# always expand — positive GEX suppresses but never eliminates it.
 _GEX_FLOOR = 0.15
 
 
@@ -16,60 +28,78 @@ class VolExpansionComponent(ComponentBase):
     name = "vol_expansion"
     weight = 0.16
 
-    def compute(self, ctx: MarketContext) -> float:
-        """Score vol expansion readiness in [-1, +1] — continuous spectrum.
+    # ------------------------------------------------------------------
+    # Public two-dimensional scores (0-100 and -100 to +100)
+    # ------------------------------------------------------------------
 
-        GEX modulates readiness on a continuous scale rather than acting as a
-        binary gate:
-          - Deeply negative GEX → readiness approaches 1.0 (dealers amplify)
-          - Zero GEX → moderate readiness (~0.575)
-          - Deeply positive GEX → readiness approaches _GEX_FLOOR (dealers
-            suppress, but some expansion potential always remains)
+    @staticmethod
+    def expansion(ctx: MarketContext) -> float:
+        """How likely is vol to expand?  0 → suppressed, 100 → primed.
 
-        Momentum (5-bar price change) determines direction:
-          - Rising or flat price: positive score (bullish expansion)
-          - Falling price: shifts toward negative (bearish expansion)
-
-        Semantics on the scaled [-100, +100] output:
-          +100  Deep negative GEX, price flat or rising — maximum expansion
-                readiness; dealers amplify any continued upward move.
-           +15  Deep positive GEX, price flat or rising — dealers suppress but
-                vol expansion is not impossible.
-           -15  Deep positive GEX, price falling hard — small bearish signal
-                despite dealer suppression.
-          -100  Deep negative GEX, price falling hard — dealers forced to sell
-                into the drop, amplifying bearish vol expansion.
+        Driven entirely by the GEX regime:
+          - Deeply positive GEX → approaches _GEX_FLOOR * 100  (≈15)
+          - Zero GEX → moderate (~57.5)
+          - Deeply negative GEX → approaches 100
         """
-        gex_readiness = self._gex_readiness(ctx.net_gex)
+        return round(VolExpansionComponent._gex_readiness(ctx.net_gex) * 100.0, 2)
+
+    @staticmethod
+    def direction_score(ctx: MarketContext) -> float:
+        """If vol expands, which way?  -100 bearish … 0 neutral … +100 bullish.
+
+        Driven by 5-bar price momentum.  Returns 0 when insufficient data.
+        """
+        closes = ctx.recent_closes
+        if len(closes) < 5 or closes[-5] <= 0:
+            return 0.0
+        pct_change = (closes[-1] - closes[-5]) / closes[-5]
+        momentum = max(-1.0, min(1.0, pct_change / _MOMENTUM_NORM))
+        return round(momentum * 100.0, 2)
+
+    # ------------------------------------------------------------------
+    # Composite contribution  (ScoringEngine interface)
+    # ------------------------------------------------------------------
+
+    def compute(self, ctx: MarketContext) -> float:
+        """Combined score in [-1, +1] for the weighted composite.
+
+        ``expansion/100 * direction/100`` = readiness * signed_momentum.
+        When direction is 0 or positive, the result equals +readiness
+        (capped at the GEX-determined ceiling).  When direction is
+        negative, it shifts linearly toward -readiness.
+
+        This is mathematically equivalent to the previous formulation but
+        is now expressed in terms of the two trader-facing dimensions.
+        """
+        exp = self._gex_readiness(ctx.net_gex)  # [_GEX_FLOOR, 1.0]
 
         closes = ctx.recent_closes
         if len(closes) < 5 or closes[-5] <= 0:
-            return gex_readiness
+            return exp  # no momentum data → pure readiness (positive)
 
         pct_change = (closes[-1] - closes[-5]) / closes[-5]
         momentum = max(-1.0, min(1.0, pct_change / _MOMENTUM_NORM))
 
         if momentum >= 0:
-            return gex_readiness
+            return exp
 
-        # Falling price: shift linearly from +gex_readiness (momentum=0)
-        # toward -gex_readiness (momentum=-1).
-        return gex_readiness * (1.0 + 2.0 * momentum)
+        # Falling price: shift linearly from +exp (momentum=0)
+        # toward -exp (momentum=-1).
+        return exp * (1.0 + 2.0 * momentum)
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _gex_readiness(net_gex: float) -> float:
-        """Map net_gex to a continuous readiness factor in [_GEX_FLOOR, 1.0].
-
-        Negative GEX → high readiness (approaching 1.0).
-        Positive GEX → low readiness (approaching _GEX_FLOOR).
-        """
-        # Flip sign so negative GEX maps to +1, positive to -1, then clamp.
+        """Map net_gex to a continuous readiness factor in [_GEX_FLOOR, 1.0]."""
         normalized = max(-1.0, min(1.0, -net_gex / _GEX_NORM))
-        # Linear map from [-1, +1] → [_GEX_FLOOR, 1.0]
         return _GEX_FLOOR + (1.0 - _GEX_FLOOR) * (normalized + 1.0) / 2.0
 
     def context_values(self, ctx: MarketContext) -> dict:
-        gex_readiness = self._gex_readiness(ctx.net_gex)
+        exp = self.expansion(ctx)
+        dirn = self.direction_score(ctx)
         closes = ctx.recent_closes
         pct_change_5bar = None
         momentum = None
@@ -79,7 +109,9 @@ class VolExpansionComponent(ComponentBase):
         return {
             "net_gex": ctx.net_gex,
             "gex_regime": "negative" if ctx.net_gex < 0 else "positive",
-            "gex_readiness": round(gex_readiness, 4),
+            "expansion": exp,
+            "direction": dirn,
+            "gex_readiness": round(self._gex_readiness(ctx.net_gex), 4),
             "pct_change_5bar": pct_change_5bar,
             "momentum": momentum,
         }

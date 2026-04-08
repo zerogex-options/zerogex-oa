@@ -60,6 +60,8 @@ _VOL_EXPANSION_ROW = {
     "context_values": {
         "net_gex": -1_500_000_000.0,
         "gex_regime": "negative",
+        "expansion": 85.0,
+        "direction": 60.0,
         "gex_readiness": 0.3,
         "pct_change_5bar": 0.003,
     },
