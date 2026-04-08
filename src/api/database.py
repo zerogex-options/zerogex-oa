@@ -1660,6 +1660,8 @@ class DatabaseManager:
                 -- Cumulative NPP: running sum of net put buying (negative = net put buying)
                 SUM(npp) OVER (ORDER BY timestamp)::numeric AS cumulative_put_premium,
                 SUM(call_volume + put_volume) OVER (ORDER BY timestamp)::bigint AS cumulative_volume,
+                SUM(call_volume) OVER (ORDER BY timestamp)::bigint AS cumulative_call_volume,
+                SUM(put_volume) OVER (ORDER BY timestamp)::bigint AS cumulative_put_volume,
                 SUM(net_volume) OVER (ORDER BY timestamp)::bigint AS cumulative_net_volume,
                 SUM(ncp + npp) OVER (ORDER BY timestamp)::numeric AS cumulative_net_premium,
                 ROUND(
