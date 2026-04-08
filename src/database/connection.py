@@ -80,6 +80,10 @@ def db_connection():
     try:
         conn = get_db_connection()
         yield conn
+        # Success path: commit so the connection is returned to the pool
+        # in IDLE state.  Harmless no-op for read-only queries and for
+        # callers that already committed explicitly.
+        conn.commit()
     except Exception:
         if conn:
             try:
