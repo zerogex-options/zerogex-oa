@@ -1702,11 +1702,10 @@ class DatabaseManager:
         self,
         symbol: str = 'SPY',
         session: str = 'current',
-        limit: int = 20
     ) -> List[Dict[str, Any]]:
         """Get option flow by strike from canonical flow_contract_facts."""
         symbol = symbol.upper()
-        cache_key = f"flow_by_strike:{symbol}:{session}:{limit}"
+        cache_key = f"flow_by_strike:{symbol}:{session}"
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached
@@ -1751,14 +1750,13 @@ class DatabaseManager:
                 underlying_price
             FROM agg
             ORDER BY timestamp DESC, strike
-            LIMIT $4
         """
 
         try:
             async with self._acquire_connection() as conn:
                 await self._refresh_flow_cache(conn, symbol)
                 rows = await asyncio.wait_for(
-                    conn.fetch(query, symbol, session_start, session_end, limit),
+                    conn.fetch(query, symbol, session_start, session_end),
                     timeout=15.0,
                 )
                 result = [dict(row) for row in rows]
@@ -1775,11 +1773,10 @@ class DatabaseManager:
         self,
         symbol: str = 'SPY',
         session: str = 'current',
-        limit: int = 20
     ) -> List[Dict[str, Any]]:
         """Get option flow by expiration from canonical flow_contract_facts."""
         symbol = symbol.upper()
-        cache_key = f"flow_by_expiration:{symbol}:{session}:{limit}"
+        cache_key = f"flow_by_expiration:{symbol}:{session}"
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached
@@ -1825,14 +1822,13 @@ class DatabaseManager:
                 underlying_price
             FROM agg
             ORDER BY timestamp DESC, expiration
-            LIMIT $4
         """
 
         try:
             async with self._acquire_connection() as conn:
                 await self._refresh_flow_cache(conn, symbol)
                 rows = await asyncio.wait_for(
-                    conn.fetch(query, symbol, session_start, session_end, limit),
+                    conn.fetch(query, symbol, session_start, session_end),
                     timeout=15.0,
                 )
                 result = [dict(row) for row in rows]

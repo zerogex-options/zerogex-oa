@@ -287,12 +287,11 @@ async def get_flow_by_type(
 async def get_flow_by_strike(
     symbol: str = Query(default="SPY"),
     session: str = Query(default="current", pattern="^(current|prior)$"),
-    limit: int = Query(default=20, ge=1, le=500)
 ):
     """Get option flow by strike level — 1-min intervals.
     session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
     try:
-        data = await db_manager.get_flow_by_strike(symbol, session, limit)
+        data = await db_manager.get_flow_by_strike(symbol, session)
         return [FlowByStrikePoint(**row) for row in data]
     except HTTPException:
         raise
@@ -305,12 +304,11 @@ async def get_flow_by_strike(
 async def get_flow_by_expiration(
     symbol: str = Query(default="SPY"),
     session: str = Query(default="current", pattern="^(current|prior)$"),
-    limit: int = Query(default=20, ge=1, le=500)
 ):
     """Get option flow by expiration date — 1-min intervals.
     session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
     try:
-        data = await db_manager.get_flow_by_expiration(symbol, session, limit)
+        data = await db_manager.get_flow_by_expiration(symbol, session)
         return [FlowByExpirationPoint(**row) for row in data]
     except HTTPException:
         raise
