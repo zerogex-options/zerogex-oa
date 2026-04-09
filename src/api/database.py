@@ -1837,9 +1837,9 @@ class DatabaseManager:
                 SUM(premium) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_premium,
                 SUM(net_premium) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_net_premium,
                 CASE
-                    WHEN net_volume > 500 THEN '🟢 Strong Calls'
+                    WHEN net_volume > 100 THEN '🟢 Strong Calls'
                     WHEN net_volume > 0 THEN '✅ Calls'
-                    WHEN net_volume < -500 THEN '🔴 Strong Puts'
+                    WHEN net_volume < -100 THEN '🔴 Strong Puts'
                     WHEN net_volume < 0 THEN '❌ Puts'
                     ELSE '⚪ Neutral'
                 END AS flow_bias,
