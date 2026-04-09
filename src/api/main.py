@@ -288,7 +288,7 @@ async def get_flow_by_strike(
     symbol: str = Query(default="SPY"),
     session: str = Query(default="current", pattern="^(current|prior)$"),
 ):
-    """Get option flow by strike level — 1-min intervals.
+    """Get option flow by strike level — 5-min buckets.
     session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
     try:
         data = await db_manager.get_flow_by_strike(symbol, session)
@@ -305,7 +305,7 @@ async def get_flow_by_expiration(
     symbol: str = Query(default="SPY"),
     session: str = Query(default="current", pattern="^(current|prior)$"),
 ):
-    """Get option flow by expiration date — 1-min intervals.
+    """Get option flow by expiration date — 5-min buckets.
     session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
     try:
         data = await db_manager.get_flow_by_expiration(symbol, session)
