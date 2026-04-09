@@ -15,6 +15,13 @@ load_dotenv()
 # API Configuration
 # =============================================================================
 
+# Logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# CORS
+# Comma-separated list consumed by src.api.main._parse_cors_origins().
+CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS")
+
 # Rate Limiting & Delays
 API_REQUEST_TIMEOUT = int(os.getenv("API_REQUEST_TIMEOUT", "30"))  # seconds
 API_RETRY_ATTEMPTS = int(os.getenv("API_RETRY_ATTEMPTS", "3"))
@@ -38,11 +45,22 @@ DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DB_NAME = os.getenv("DB_NAME", "zerogex")
 DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+DB_PASSWORD_PROVIDER = os.getenv("DB_PASSWORD_PROVIDER", "pgpass")
+DB_SECRET_NAME = os.getenv("DB_SECRET_NAME")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+DB_SSLMODE = os.getenv("DB_SSLMODE", "").strip()
 
 # Connection Pool
 DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "1"))
 DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "4"))
 DB_CONNECT_TIMEOUT_SECONDS = float(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "20"))
+DB_CONNECT_RETRIES = int(os.getenv("DB_CONNECT_RETRIES", "5"))
+DB_CONNECT_RETRY_DELAY_SECONDS = float(os.getenv("DB_CONNECT_RETRY_DELAY_SECONDS", "1.5"))
+DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "30000"))
+DB_KEEPALIVES_IDLE_SECONDS = int(os.getenv("DB_KEEPALIVES_IDLE_SECONDS", "30"))
+DB_KEEPALIVES_INTERVAL_SECONDS = int(os.getenv("DB_KEEPALIVES_INTERVAL_SECONDS", "10"))
+DB_KEEPALIVES_COUNT = int(os.getenv("DB_KEEPALIVES_COUNT", "5"))
 
 # Data Retention
 DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", "90"))  # days to keep data
@@ -70,6 +88,11 @@ STRIKE_CLEANUP_INTERVAL = int(os.getenv("STRIKE_CLEANUP_INTERVAL", "100"))  # it
 # Options: "Default" (9:30-16:00), "USEQPre" (4:00-9:30), "USEQ24Hour" (4:00-20:00)
 SESSION_TEMPLATE = os.getenv("SESSION_TEMPLATE", "Default")
 TS_STREAM_READ_TIMEOUT = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
+TS_STREAM_REUSE_CONNECTIONS = (
+    os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").lower() == "true"
+)
+TS_STREAM_REUSE_QUOTES = os.getenv("TS_STREAM_REUSE_QUOTES", "false").lower() == "true"
+TS_WARN_MARKET_HOURS = os.getenv("TS_WARN_MARKET_HOURS", "true").lower() != "false"
 OPTION_OI_COVERAGE_ALERT_THRESHOLD = float(
     os.getenv("OPTION_OI_COVERAGE_ALERT_THRESHOLD", "0.35")
 )
@@ -90,6 +113,12 @@ TS_REFRESH_BUFFER_SECONDS = int(os.getenv("TS_REFRESH_BUFFER_SECONDS", "30"))
 TS_MIN_FORCE_REFRESH_INTERVAL_SECONDS = int(
     os.getenv("TS_MIN_FORCE_REFRESH_INTERVAL_SECONDS", "60")
 )
+LATEST_QUOTE_CACHE_TTL_SECONDS = float(os.getenv("LATEST_QUOTE_CACHE_TTL_SECONDS", "1.5"))
+LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS = float(
+    os.getenv("LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS", "1.5")
+)
+ANALYTICS_CACHE_TTL_SECONDS = float(os.getenv("ANALYTICS_CACHE_TTL_SECONDS", "5.0"))
+FLOW_ENDPOINT_CACHE_TTL_SECONDS = float(os.getenv("FLOW_ENDPOINT_CACHE_TTL_SECONDS", "3.0"))
 
 # =============================================================================
 # Aggregation Configuration
@@ -105,6 +134,14 @@ BUFFER_FLUSH_INTERVAL = int(os.getenv("BUFFER_FLUSH_INTERVAL", "60"))  # seconds
 OPTION_BUCKET_WRITE_MIN_SECONDS = float(
     os.getenv("OPTION_BUCKET_WRITE_MIN_SECONDS", "5")
 )
+
+# =============================================================================
+# Symbol Mapping Configuration
+# =============================================================================
+
+SYMBOL_ALIASES = os.getenv("SYMBOL_ALIASES", "")
+OPTION_ROOT_ALIASES = os.getenv("OPTION_ROOT_ALIASES", "")
+OPTION_WEEKLY_ROOTS = os.getenv("OPTION_WEEKLY_ROOTS", "")
 
 # =============================================================================
 # Greeks & IV Calculation Configuration
@@ -147,6 +184,7 @@ SIGNAL_AUTO_TUNE_LOOKBACK_DAYS = max(
 SIGNAL_AUTO_TUNE_MIN_SAMPLES = max(
     50, int(os.getenv("SIGNAL_AUTO_TUNE_MIN_SAMPLES", "250"))
 )
+SIGNAL_IV_RANK_ENABLED = os.getenv("SIGNAL_IV_RANK_ENABLED", "false").lower() == "true"
 
 # =============================================================================
 # Volatility Expansion Configuration
@@ -174,6 +212,9 @@ VOL_AUTO_TUNE_MIN_SAMPLES = max(
 
 SIGNALS_UNDERLYINGS = os.getenv("SIGNALS_UNDERLYINGS", "SPY")
 SIGNALS_PORTFOLIO_SIZE = float(os.getenv("SIGNALS_PORTFOLIO_SIZE", "1000000"))
+POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS = (
+    os.getenv("POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS", "false").lower() == "true"
+)
 
 # Aggregate exposure limits — prevent the engine from piling into the same
 # direction without regard for what is already on the books.
@@ -187,6 +228,44 @@ SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES = int(
 # Default -0.25 means the trade is stopped out when it loses 25% of the
 # initial premium paid (debit trades) or 25% of max-risk (credit trades).
 SIGNALS_STOP_LOSS_PCT = float(os.getenv("SIGNALS_STOP_LOSS_PCT", "-0.25"))
+
+# =============================================================================
+# Ingestion/Analytics CLI Defaults
+# =============================================================================
+
+INGEST_UNDERLYING = os.getenv("INGEST_UNDERLYING", "SPY")
+INGEST_UNDERLYINGS = os.getenv("INGEST_UNDERLYINGS", "")
+INGEST_EXPIRATIONS = int(os.getenv("INGEST_EXPIRATIONS", "3"))
+INGEST_STRIKE_COUNT = int(os.getenv("INGEST_STRIKE_COUNT", "10"))
+ANALYTICS_UNDERLYING = os.getenv("ANALYTICS_UNDERLYING", "SPY")
+ANALYTICS_UNDERLYINGS = os.getenv("ANALYTICS_UNDERLYINGS", "")
+ANALYTICS_INTERVAL = int(os.getenv("ANALYTICS_INTERVAL", "60"))
+ANALYTICS_SNAPSHOT_LOOKBACK_MINUTES = max(
+    1, int(os.getenv("ANALYTICS_SNAPSHOT_LOOKBACK_MINUTES", "5"))
+)
+ANALYTICS_SNAPSHOT_FRESHNESS_SECONDS = max(
+    30, int(os.getenv("ANALYTICS_SNAPSHOT_FRESHNESS_SECONDS", "180"))
+)
+ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT = float(
+    os.getenv("ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT", "0.35")
+)
+
+# TradeStation credential variables (used by service startup and helper scripts).
+TRADESTATION_CLIENT_ID = os.getenv("TRADESTATION_CLIENT_ID")
+TRADESTATION_CLIENT_SECRET = os.getenv("TRADESTATION_CLIENT_SECRET")
+TRADESTATION_REFRESH_TOKEN = os.getenv("TRADESTATION_REFRESH_TOKEN")
+TRADESTATION_USE_SANDBOX = os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true"
+
+# TradeStation CLI test defaults.
+TS_TEST = os.getenv("TS_TEST", "all")
+TS_SYMBOL = os.getenv("TS_SYMBOL", "SPY")
+TS_BARS_BACK = int(os.getenv("TS_BARS_BACK", "5"))
+TS_INTERVAL = int(os.getenv("TS_INTERVAL", "1"))
+TS_UNIT = os.getenv("TS_UNIT", "Daily")
+TS_QUERY = os.getenv("TS_QUERY", "Apple")
+
+# Calendar overrides.
+NYSE_HOLIDAYS = os.getenv("NYSE_HOLIDAYS", "")
 
 # =============================================================================
 # Ingestion Parity Guard
