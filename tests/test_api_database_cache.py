@@ -1,7 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 
-from src.api.database import DatabaseManager
+from src.api.database import DatabaseManager, _get_session_bounds
 
 
 class _FakeConn:
@@ -121,6 +121,8 @@ def test_get_flow_by_strike_query_uses_dense_buckets():
     assert conn.last_query is not None
     assert "generate_series(" in conn.last_query
     assert "CROSS JOIN strikes" in conn.last_query
+    assert "underlying_by_bucket" in conn.last_query
+    assert "underlying_dense" in conn.last_query
     assert "FROM dense" in conn.last_query
 
 
@@ -139,4 +141,12 @@ def test_get_flow_by_expiration_query_uses_dense_buckets():
     assert conn.last_query is not None
     assert "generate_series(" in conn.last_query
     assert "CROSS JOIN expirations" in conn.last_query
+    assert "underlying_by_bucket" in conn.last_query
+    assert "underlying_dense" in conn.last_query
     assert "FROM dense" in conn.last_query
+
+
+def test_prior_session_bounds_end_at_1615_et():
+    _start, end = _get_session_bounds("prior")
+    assert end.hour == 16
+    assert end.minute == 15

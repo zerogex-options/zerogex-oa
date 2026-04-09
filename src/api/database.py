@@ -26,13 +26,13 @@ _ET = ZoneInfo('America/New_York')
 def _get_session_bounds(session: str = 'current') -> tuple:
     """Return (start_ts, end_ts) as timezone-aware datetimes for the requested trading session.
 
-    'current': today 09:30–now if market is open, else most recent session 09:30–16:00 ET.
+    'current': today 09:30–now if market is open, else most recent session 09:30–16:15 ET.
     'prior':   the full trading session immediately before the current one.
     """
     now_et = datetime.now(_ET)
     today = now_et.date()
     market_open_time = time(9, 30)
-    market_close_time = time(16, 0)
+    market_close_time = time(16, 15)
 
     def prev_trading_day(d):
         d -= timedelta(days=1)
@@ -1759,6 +1759,30 @@ class DatabaseManager:
                 FROM bucketed
                 GROUP BY bucket, symbol, strike
             ),
+            underlying_by_bucket AS (
+                SELECT
+                    bucket AS timestamp,
+                    MAX(underlying_price) AS underlying_price
+                FROM bucketed
+                GROUP BY bucket
+            ),
+            underlying_dense AS (
+                SELECT
+                    b.timestamp,
+                    COALESCE(
+                        ub.underlying_price,
+                        (
+                            SELECT ub_prev.underlying_price
+                            FROM underlying_by_bucket ub_prev
+                            WHERE ub_prev.timestamp <= b.timestamp
+                            ORDER BY ub_prev.timestamp DESC
+                            LIMIT 1
+                        )
+                    ) AS underlying_price
+                FROM buckets b
+                LEFT JOIN underlying_by_bucket ub
+                  ON ub.timestamp = b.timestamp
+            ),
             dense AS (
                 SELECT
                     b.timestamp,
@@ -1770,22 +1794,14 @@ class DatabaseManager:
                     COALESCE(a.npp, 0)::numeric AS npp,
                     COALESCE(a.net_volume, 0)::bigint AS net_volume,
                     COALESCE(a.net_premium, 0)::numeric AS net_premium,
-                    COALESCE(
-                        a.underlying_price,
-                        (
-                            SELECT a_prev.underlying_price
-                            FROM agg a_prev
-                            WHERE a_prev.strike = s.strike
-                              AND a_prev.timestamp <= b.timestamp
-                            ORDER BY a_prev.timestamp DESC
-                            LIMIT 1
-                        )
-                    ) AS underlying_price
+                    ud.underlying_price AS underlying_price
                 FROM buckets b
                 CROSS JOIN strikes s
                 LEFT JOIN agg a
                   ON a.timestamp = b.timestamp
                  AND a.strike = s.strike
+                LEFT JOIN underlying_dense ud
+                  ON ud.timestamp = b.timestamp
             )
             SELECT
                 timestamp,
@@ -1893,6 +1909,30 @@ class DatabaseManager:
                 FROM bucketed
                 GROUP BY bucket, symbol, expiration
             ),
+            underlying_by_bucket AS (
+                SELECT
+                    bucket AS timestamp,
+                    MAX(underlying_price) AS underlying_price
+                FROM bucketed
+                GROUP BY bucket
+            ),
+            underlying_dense AS (
+                SELECT
+                    b.timestamp,
+                    COALESCE(
+                        ub.underlying_price,
+                        (
+                            SELECT ub_prev.underlying_price
+                            FROM underlying_by_bucket ub_prev
+                            WHERE ub_prev.timestamp <= b.timestamp
+                            ORDER BY ub_prev.timestamp DESC
+                            LIMIT 1
+                        )
+                    ) AS underlying_price
+                FROM buckets b
+                LEFT JOIN underlying_by_bucket ub
+                  ON ub.timestamp = b.timestamp
+            ),
             dense AS (
                 SELECT
                     b.timestamp,
@@ -1904,22 +1944,14 @@ class DatabaseManager:
                     COALESCE(a.npp, 0)::numeric AS net_put_premium,
                     COALESCE(a.net_volume, 0)::bigint AS net_volume,
                     COALESCE(a.net_premium, 0)::numeric AS net_premium,
-                    COALESCE(
-                        a.underlying_price,
-                        (
-                            SELECT a_prev.underlying_price
-                            FROM agg a_prev
-                            WHERE a_prev.expiration = e.expiration
-                              AND a_prev.timestamp <= b.timestamp
-                            ORDER BY a_prev.timestamp DESC
-                            LIMIT 1
-                        )
-                    ) AS underlying_price
+                    ud.underlying_price AS underlying_price
                 FROM buckets b
                 CROSS JOIN expirations e
                 LEFT JOIN agg a
                   ON a.timestamp = b.timestamp
                  AND a.expiration = e.expiration
+                LEFT JOIN underlying_dense ud
+                  ON ud.timestamp = b.timestamp
             )
             SELECT
                 timestamp,
