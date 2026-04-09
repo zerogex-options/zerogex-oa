@@ -93,11 +93,11 @@ def test_get_flow_by_strike_cache_expires():
 
     db._acquire_connection = _acquire  # type: ignore[method-assign]
 
-    first = asyncio.run(db.get_flow_by_strike("SPY", "current", 20))
+    first = asyncio.run(db.get_flow_by_strike("SPY", "current"))
     assert first
 
     asyncio.run(asyncio.sleep(0.02))
-    second = asyncio.run(db.get_flow_by_strike("SPY", "current", 20))
+    second = asyncio.run(db.get_flow_by_strike("SPY", "current"))
 
     assert second == first
     assert conn.calls == 2

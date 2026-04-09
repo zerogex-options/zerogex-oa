@@ -1721,6 +1721,9 @@ class DatabaseManager:
                     premium_delta,
                     signed_volume,
                     signed_premium,
+                    buy_premium,
+                    sell_premium,
+                    option_type,
                     underlying_price
                 FROM flow_contract_facts
                 WHERE symbol = $1
@@ -1734,6 +1737,8 @@ class DatabaseManager:
                     strike,
                     SUM(volume_delta)::bigint AS volume,
                     SUM(premium_delta)::numeric AS premium,
+                    SUM(CASE WHEN option_type = 'C' THEN (buy_premium - sell_premium) ELSE 0 END)::numeric AS ncp,
+                    SUM(CASE WHEN option_type = 'P' THEN -(buy_premium - sell_premium) ELSE 0 END)::numeric AS npp,
                     SUM(signed_volume)::bigint AS net_volume,
                     SUM(signed_premium)::numeric AS net_premium,
                     MAX(underlying_price) AS underlying_price
@@ -1746,12 +1751,16 @@ class DatabaseManager:
                 strike,
                 volume,
                 premium,
+                ncp AS net_call_premium,
+                npp AS net_put_premium,
                 net_volume,
-                net_premium,
+                (ncp + npp)::numeric AS net_premium,
                 SUM(volume) OVER (PARTITION BY strike ORDER BY timestamp)::bigint AS cumulative_volume,
                 SUM(net_volume) OVER (PARTITION BY strike ORDER BY timestamp)::bigint AS cumulative_net_volume,
                 SUM(premium) OVER (PARTITION BY strike ORDER BY timestamp)::numeric AS cumulative_premium,
-                SUM(net_premium) OVER (PARTITION BY strike ORDER BY timestamp)::numeric AS cumulative_net_premium,
+                SUM(ncp) OVER (PARTITION BY strike ORDER BY timestamp)::numeric AS cumulative_call_premium,
+                SUM(npp) OVER (PARTITION BY strike ORDER BY timestamp)::numeric AS cumulative_put_premium,
+                SUM(ncp + npp) OVER (PARTITION BY strike ORDER BY timestamp)::numeric AS cumulative_net_premium,
                 CASE
                     WHEN net_volume > 100 THEN '🟢 Strong Calls'
                     WHEN net_volume > 0 THEN '✅ Calls'
@@ -1804,6 +1813,9 @@ class DatabaseManager:
                     premium_delta,
                     signed_volume,
                     signed_premium,
+                    buy_premium,
+                    sell_premium,
+                    option_type,
                     underlying_price
                 FROM flow_contract_facts
                 WHERE symbol = $1
@@ -1817,6 +1829,8 @@ class DatabaseManager:
                     expiration,
                     SUM(volume_delta)::bigint AS volume,
                     SUM(premium_delta)::numeric AS premium,
+                    SUM(CASE WHEN option_type = 'C' THEN (buy_premium - sell_premium) ELSE 0 END)::numeric AS ncp,
+                    SUM(CASE WHEN option_type = 'P' THEN -(buy_premium - sell_premium) ELSE 0 END)::numeric AS npp,
                     SUM(signed_volume)::bigint AS net_volume,
                     SUM(signed_premium)::numeric AS net_premium,
                     MAX(underlying_price) AS underlying_price
@@ -1830,12 +1844,16 @@ class DatabaseManager:
                 (expiration - CURRENT_DATE)::int AS dte,
                 volume,
                 premium,
+                ncp AS net_call_premium,
+                npp AS net_put_premium,
                 net_volume,
-                net_premium,
+                (ncp + npp)::numeric AS net_premium,
                 SUM(volume) OVER (PARTITION BY expiration ORDER BY timestamp)::bigint AS cumulative_volume,
                 SUM(net_volume) OVER (PARTITION BY expiration ORDER BY timestamp)::bigint AS cumulative_net_volume,
                 SUM(premium) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_premium,
-                SUM(net_premium) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_net_premium,
+                SUM(ncp) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_call_premium,
+                SUM(npp) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_put_premium,
+                SUM(ncp + npp) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_net_premium,
                 CASE
                     WHEN net_volume > 100 THEN '🟢 Strong Calls'
                     WHEN net_volume > 0 THEN '✅ Calls'

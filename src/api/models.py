@@ -189,11 +189,15 @@ class FlowByStrikePoint(BaseModel):
     strike: Decimal
     volume: int
     premium: Decimal
+    net_call_premium: Decimal
+    net_put_premium: Decimal
     net_volume: int
     net_premium: Decimal
     cumulative_volume: int
     cumulative_net_volume: int
     cumulative_premium: Decimal
+    cumulative_call_premium: Decimal
+    cumulative_put_premium: Decimal
     cumulative_net_premium: Decimal
     flow_bias: str
     underlying_price: Optional[Decimal] = None
@@ -206,11 +210,15 @@ class FlowByExpirationPoint(BaseModel):
     dte: int
     volume: int
     premium: Decimal
+    net_call_premium: Decimal
+    net_put_premium: Decimal
     net_volume: int
     net_premium: Decimal
     cumulative_volume: int
     cumulative_net_volume: int
     cumulative_premium: Decimal
+    cumulative_call_premium: Decimal
+    cumulative_put_premium: Decimal
     cumulative_net_premium: Decimal
     flow_bias: str
     underlying_price: Optional[Decimal] = None
