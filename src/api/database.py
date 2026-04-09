@@ -929,7 +929,7 @@ class DatabaseManager:
                   AND (
                     volume_delta >= 50
                     OR volume_delta * COALESCE(last, 0) * 100 >= 50000
-                    OR implied_volatility > 0.4
+                    OR (implied_volatility > 0.4 AND volume_delta >= 20)
                     OR (ABS(delta) < 0.15 AND volume_delta >= 20)
                   )
                 ON CONFLICT (timestamp, symbol, option_symbol)
@@ -1896,9 +1896,7 @@ class DatabaseManager:
                     LEAST(10, GREATEST(0,
                         CASE WHEN volume_delta >= 500 THEN 4 WHEN volume_delta >= 200 THEN 3 WHEN volume_delta >= 100 THEN 2 WHEN volume_delta >= 50 THEN 1 ELSE 0 END +
                         CASE WHEN premium_delta >= 500000 THEN 4 WHEN premium_delta >= 250000 THEN 3 WHEN premium_delta >= 100000 THEN 2 WHEN premium_delta >= 50000 THEN 1 ELSE 0 END +
-                        CASE WHEN implied_volatility > 1.0 THEN 2 WHEN implied_volatility > 0.6 THEN 1 ELSE 0 END +
-                        CASE WHEN ABS(delta) < 0.15 THEN 1 ELSE 0 END +
-                        CASE WHEN (expiration - CURRENT_DATE) <= 2 THEN 1 ELSE 0 END
+                        CASE WHEN implied_volatility > 1.0 THEN 2 WHEN implied_volatility > 0.6 THEN 1 ELSE 0 END
                     ))::numeric AS score,
                     CASE
                         WHEN premium_delta >= 500000 THEN '💰 $500K+'
@@ -1922,7 +1920,7 @@ class DatabaseManager:
                   AND (
                     volume_delta >= 50
                     OR premium_delta >= 50000
-                    OR implied_volatility > 0.4
+                    OR (implied_volatility > 0.4 AND volume_delta >= 20)
                     OR (ABS(delta) < 0.15 AND volume_delta >= 20)
                   )
             )
@@ -2023,10 +2021,11 @@ class DatabaseManager:
                 ) AS period_buy_pct,
                 ROUND(close - LAG(close) OVER (PARTITION BY symbol ORDER BY timestamp), 2) AS price_chg,
                 CASE
-                    WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) > 0.7 THEN '🟢 Strong Buying'
-                    WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) > 0.55 THEN '✅ Buying'
-                    WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) >= 0.45 THEN '⚪ Neutral'
-                    WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) >= 0.3 THEN '❌ Selling'
+                    WHEN (up_volume_delta + down_volume_delta) = 0 THEN '⚪ Neutral'
+                    WHEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) > 0.7 THEN '🟢 Strong Buying'
+                    WHEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) > 0.55 THEN '✅ Buying'
+                    WHEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) >= 0.45 THEN '⚪ Neutral'
+                    WHEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) >= 0.3 THEN '❌ Selling'
                     ELSE '🔴 Strong Selling'
                 END AS momentum
             FROM quote_deltas

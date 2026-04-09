@@ -1215,10 +1215,11 @@ flow-buying-pressure: ## Underlying buying/selling pressure
 			ROUND(CASE WHEN (up_volume_delta + down_volume_delta) > 0 THEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) * 100 ELSE 50 END, 2) as period_buy_pct, \
 			ROUND(close - LAG(close) OVER (PARTITION BY symbol ORDER BY timestamp), 2) as price_chg, \
 			CASE \
-				WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) > 0.7 THEN '🟢 Strong Buying' \
-				WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) > 0.55 THEN '✅ Buying' \
-				WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) >= 0.45 THEN '⚪ Neutral' \
-				WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) >= 0.3 THEN '❌ Selling' \
+				WHEN (up_volume_delta + down_volume_delta) = 0 THEN '⚪ Neutral' \
+				WHEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) > 0.7 THEN '🟢 Strong Buying' \
+				WHEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) > 0.55 THEN '✅ Buying' \
+				WHEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) >= 0.45 THEN '⚪ Neutral' \
+				WHEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) >= 0.3 THEN '❌ Selling' \
 				ELSE '🔴 Strong Selling' \
 			END as momentum \
 		FROM quote_deltas \
@@ -1266,10 +1267,11 @@ flow-live: ## Combined real-time flow dashboard
 			(up_volume_delta + down_volume_delta) as vol, \
 			ROUND(CASE WHEN (up_volume_delta + down_volume_delta) > 0 THEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) * 100 ELSE 50 END, 2) as buy_pct, \
 			CASE \
-				WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) > 0.7 THEN '🟢 Strong Buying' \
-				WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) > 0.55 THEN '✅ Buying' \
-				WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) >= 0.45 THEN '⚪ Neutral' \
-				WHEN up_volume_delta::numeric / NULLIF(up_volume_delta + down_volume_delta, 0) >= 0.3 THEN '❌ Selling' \
+				WHEN (up_volume_delta + down_volume_delta) = 0 THEN '⚪ Neutral' \
+				WHEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) > 0.7 THEN '🟢 Strong Buying' \
+				WHEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) > 0.55 THEN '✅ Buying' \
+				WHEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) >= 0.45 THEN '⚪ Neutral' \
+				WHEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) >= 0.3 THEN '❌ Selling' \
 				ELSE '🔴 Strong Selling' \
 			END as momentum \
 		FROM quote_deltas \

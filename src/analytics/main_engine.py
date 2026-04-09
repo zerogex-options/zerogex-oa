@@ -1085,7 +1085,7 @@ class AnalyticsEngine:
                       AND (
                         volume_delta >= 50
                         OR volume_delta * COALESCE(last, 0) * 100 >= 50000
-                        OR implied_volatility > 0.4
+                        OR (implied_volatility > 0.4 AND volume_delta >= 20)
                         OR (ABS(delta) < 0.15 AND volume_delta >= 20)
                       )
                     ON CONFLICT (timestamp, symbol, option_symbol)
