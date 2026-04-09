@@ -26,13 +26,13 @@ _ET = ZoneInfo('America/New_York')
 def _get_session_bounds(session: str = 'current') -> tuple:
     """Return (start_ts, end_ts) as timezone-aware datetimes for the requested trading session.
 
-    'current': today 09:30–now if market is open, else most recent session 09:30–16:00 ET.
+    'current': today 09:30–now if market is open, else most recent session 09:30–16:15 ET.
     'prior':   the full trading session immediately before the current one.
     """
     now_et = datetime.now(_ET)
     today = now_et.date()
     market_open_time = time(9, 30)
-    market_close_time = time(16, 0)
+    market_close_time = time(16, 15)
 
     def prev_trading_day(d):
         d -= timedelta(days=1)
@@ -1712,7 +1712,21 @@ class DatabaseManager:
 
         session_start, session_end = _get_session_bounds(session)
         query = """
-            WITH bucketed AS (
+            WITH buckets AS (
+                SELECT generate_series(
+                    to_timestamp(floor(extract(epoch from $2::timestamptz) / 300) * 300),
+                    to_timestamp(floor(extract(epoch from $3::timestamptz) / 300) * 300),
+                    interval '5 minute'
+                ) AS timestamp
+            ),
+            strikes AS (
+                SELECT DISTINCT strike
+                FROM flow_contract_facts
+                WHERE symbol = $1
+                  AND timestamp >= $2
+                  AND timestamp <= $3
+            ),
+            bucketed AS (
                 SELECT
                     to_timestamp(floor(extract(epoch from timestamp) / 300) * 300) AS bucket,
                     symbol,
@@ -1744,6 +1758,50 @@ class DatabaseManager:
                     MAX(underlying_price) AS underlying_price
                 FROM bucketed
                 GROUP BY bucket, symbol, strike
+            ),
+            underlying_by_bucket AS (
+                SELECT
+                    bucket AS timestamp,
+                    MAX(underlying_price) AS underlying_price
+                FROM bucketed
+                GROUP BY bucket
+            ),
+            underlying_dense AS (
+                SELECT
+                    b.timestamp,
+                    COALESCE(
+                        ub.underlying_price,
+                        (
+                            SELECT ub_prev.underlying_price
+                            FROM underlying_by_bucket ub_prev
+                            WHERE ub_prev.timestamp <= b.timestamp
+                            ORDER BY ub_prev.timestamp DESC
+                            LIMIT 1
+                        )
+                    ) AS underlying_price
+                FROM buckets b
+                LEFT JOIN underlying_by_bucket ub
+                  ON ub.timestamp = b.timestamp
+            ),
+            dense AS (
+                SELECT
+                    b.timestamp,
+                    $1::text AS symbol,
+                    s.strike,
+                    COALESCE(a.volume, 0)::bigint AS volume,
+                    COALESCE(a.premium, 0)::numeric AS premium,
+                    COALESCE(a.ncp, 0)::numeric AS ncp,
+                    COALESCE(a.npp, 0)::numeric AS npp,
+                    COALESCE(a.net_volume, 0)::bigint AS net_volume,
+                    COALESCE(a.net_premium, 0)::numeric AS net_premium,
+                    ud.underlying_price AS underlying_price
+                FROM buckets b
+                CROSS JOIN strikes s
+                LEFT JOIN agg a
+                  ON a.timestamp = b.timestamp
+                 AND a.strike = s.strike
+                LEFT JOIN underlying_dense ud
+                  ON ud.timestamp = b.timestamp
             )
             SELECT
                 timestamp,
@@ -1769,7 +1827,7 @@ class DatabaseManager:
                     ELSE '⚪ Neutral'
                 END AS flow_bias,
                 underlying_price
-            FROM agg
+            FROM dense
             ORDER BY timestamp DESC, strike
         """
 
@@ -1804,7 +1862,21 @@ class DatabaseManager:
 
         session_start, session_end = _get_session_bounds(session)
         query = """
-            WITH bucketed AS (
+            WITH buckets AS (
+                SELECT generate_series(
+                    to_timestamp(floor(extract(epoch from $2::timestamptz) / 300) * 300),
+                    to_timestamp(floor(extract(epoch from $3::timestamptz) / 300) * 300),
+                    interval '5 minute'
+                ) AS timestamp
+            ),
+            expirations AS (
+                SELECT DISTINCT expiration
+                FROM flow_contract_facts
+                WHERE symbol = $1
+                  AND timestamp >= $2
+                  AND timestamp <= $3
+            ),
+            bucketed AS (
                 SELECT
                     to_timestamp(floor(extract(epoch from timestamp) / 300) * 300) AS bucket,
                     symbol,
@@ -1836,6 +1908,50 @@ class DatabaseManager:
                     MAX(underlying_price) AS underlying_price
                 FROM bucketed
                 GROUP BY bucket, symbol, expiration
+            ),
+            underlying_by_bucket AS (
+                SELECT
+                    bucket AS timestamp,
+                    MAX(underlying_price) AS underlying_price
+                FROM bucketed
+                GROUP BY bucket
+            ),
+            underlying_dense AS (
+                SELECT
+                    b.timestamp,
+                    COALESCE(
+                        ub.underlying_price,
+                        (
+                            SELECT ub_prev.underlying_price
+                            FROM underlying_by_bucket ub_prev
+                            WHERE ub_prev.timestamp <= b.timestamp
+                            ORDER BY ub_prev.timestamp DESC
+                            LIMIT 1
+                        )
+                    ) AS underlying_price
+                FROM buckets b
+                LEFT JOIN underlying_by_bucket ub
+                  ON ub.timestamp = b.timestamp
+            ),
+            dense AS (
+                SELECT
+                    b.timestamp,
+                    $1::text AS symbol,
+                    e.expiration,
+                    COALESCE(a.volume, 0)::bigint AS volume,
+                    COALESCE(a.premium, 0)::numeric AS premium,
+                    COALESCE(a.ncp, 0)::numeric AS net_call_premium,
+                    COALESCE(a.npp, 0)::numeric AS net_put_premium,
+                    COALESCE(a.net_volume, 0)::bigint AS net_volume,
+                    COALESCE(a.net_premium, 0)::numeric AS net_premium,
+                    ud.underlying_price AS underlying_price
+                FROM buckets b
+                CROSS JOIN expirations e
+                LEFT JOIN agg a
+                  ON a.timestamp = b.timestamp
+                 AND a.expiration = e.expiration
+                LEFT JOIN underlying_dense ud
+                  ON ud.timestamp = b.timestamp
             )
             SELECT
                 timestamp,
@@ -1844,16 +1960,16 @@ class DatabaseManager:
                 (expiration - CURRENT_DATE)::int AS dte,
                 volume,
                 premium,
-                ncp AS net_call_premium,
-                npp AS net_put_premium,
+                net_call_premium,
+                net_put_premium,
                 net_volume,
-                (ncp + npp)::numeric AS net_premium,
+                (net_call_premium + net_put_premium)::numeric AS net_premium,
                 SUM(volume) OVER (PARTITION BY expiration ORDER BY timestamp)::bigint AS cumulative_volume,
                 SUM(net_volume) OVER (PARTITION BY expiration ORDER BY timestamp)::bigint AS cumulative_net_volume,
                 SUM(premium) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_premium,
-                SUM(ncp) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_call_premium,
-                SUM(npp) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_put_premium,
-                SUM(ncp + npp) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_net_premium,
+                SUM(net_call_premium) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_call_premium,
+                SUM(net_put_premium) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_put_premium,
+                SUM(net_call_premium + net_put_premium) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_net_premium,
                 CASE
                     WHEN net_volume > 100 THEN '🟢 Strong Calls'
                     WHEN net_volume > 0 THEN '✅ Calls'
@@ -1862,7 +1978,7 @@ class DatabaseManager:
                     ELSE '⚪ Neutral'
                 END AS flow_bias,
                 underlying_price
-            FROM agg
+            FROM dense
             ORDER BY timestamp DESC, expiration
         """
 
