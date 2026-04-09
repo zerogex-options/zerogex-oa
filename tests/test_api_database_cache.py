@@ -18,9 +18,12 @@ class _FakeFlowConn:
     def __init__(self, rows):
         self.rows = rows
         self.calls = 0
+        self.last_query = None
 
-    async def fetch(self, *_args):
+    async def fetch(self, *args):
         self.calls += 1
+        if args:
+            self.last_query = args[0]
         return self.rows
 
 
@@ -101,3 +104,39 @@ def test_get_flow_by_strike_cache_expires():
 
     assert second == first
     assert conn.calls == 2
+
+
+def test_get_flow_by_strike_query_uses_dense_buckets():
+    db = DatabaseManager()
+    conn = _FakeFlowConn([])
+
+    @asynccontextmanager
+    async def _acquire():
+        yield conn
+
+    db._acquire_connection = _acquire  # type: ignore[method-assign]
+
+    asyncio.run(db.get_flow_by_strike("SPY", "current"))
+
+    assert conn.last_query is not None
+    assert "generate_series(" in conn.last_query
+    assert "CROSS JOIN strikes" in conn.last_query
+    assert "FROM dense" in conn.last_query
+
+
+def test_get_flow_by_expiration_query_uses_dense_buckets():
+    db = DatabaseManager()
+    conn = _FakeFlowConn([])
+
+    @asynccontextmanager
+    async def _acquire():
+        yield conn
+
+    db._acquire_connection = _acquire  # type: ignore[method-assign]
+
+    asyncio.run(db.get_flow_by_expiration("SPY", "current"))
+
+    assert conn.last_query is not None
+    assert "generate_series(" in conn.last_query
+    assert "CROSS JOIN expirations" in conn.last_query
+    assert "FROM dense" in conn.last_query
