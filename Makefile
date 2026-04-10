@@ -1404,6 +1404,18 @@ flow-reset-session-facts: ## Delete one ET session from flow_contract_facts (def
 flow-rebuild-session: flow-reset-session-facts ## Reset one ET session, restart API, and trigger flow refresh
 	@echo "$(YELLOW)Restarting API service to pick up env (e.g. FLOW_CANONICAL_BACKFILL_MINUTES)...$(NC)"
 	@$(MAKE) api-restart
+	@echo "$(YELLOW)Waiting for API readiness (/api/health)...$(NC)"
+	@for i in $$(seq 1 30); do \
+		if curl -fsS "http://localhost:8000/api/health" > /dev/null; then \
+			echo "$(GREEN)API is ready.$(NC)"; \
+			break; \
+		fi; \
+		if [ $$i -eq 30 ]; then \
+			echo "$(RED)API did not become ready within 30s.$(NC)"; \
+			exit 1; \
+		fi; \
+		sleep 1; \
+	done
 	@echo "$(YELLOW)Triggering /api/flow/by-type refresh for $(FLOW_SYMBOL)...$(NC)"
 	@curl -fsS "http://localhost:8000/api/flow/by-type?symbol=$(FLOW_SYMBOL)&session=current" > /dev/null
 	@echo "$(GREEN)Rebuild trigger sent. Validate with: make flow-by-type FLOW_SYMBOL=$(FLOW_SYMBOL)$(NC)"
