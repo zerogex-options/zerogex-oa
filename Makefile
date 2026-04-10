@@ -27,6 +27,9 @@ VENV_PYTHON = venv/bin/python
 # Override with: make flow-by-type FLOW_SYMBOL=QQQ
 FLOW_SYMBOL ?= SPY
 UNDERLYING_LIVE_SYMBOL ?= SPY
+FLOW_REBUILD_DATE ?= $(shell TZ=America/New_York date +%F)
+FLOW_REBUILD_START_ET ?= 09:30
+FLOW_REBUILD_END_ET ?= 16:15
 
 # Colors for output
 BLUE = \033[0;34m
@@ -267,6 +270,9 @@ help: ## Show this help message
 	@echo "  make flow-smart-money     - Unusual activity detection"
 	@echo "  make flow-buying-pressure - Underlying buying/selling pressure"
 	@echo "  make flow-live            - Combined real-time flow dashboard"
+	@echo "  make flow-reset-session-facts - Delete one ET session from flow_contract_facts"
+	@echo "  make flow-rebuild-session - Reset one ET session, restart API, trigger flow refresh"
+	@echo "    (override: FLOW_SYMBOL=SPX FLOW_REBUILD_DATE=2026-04-10 FLOW_REBUILD_START_ET=09:30 FLOW_REBUILD_END_ET=16:15)"
 	@echo ""
 	@echo "$(GREEN)Day Trading Support:$(NC)"
 	@echo "  make vwap               - VWAP deviation tracker"
@@ -1379,6 +1385,40 @@ flow-live: ## Combined real-time flow dashboard
 # =============================================================================
 # Day Trading Decision Support
 # =============================================================================
+
+.PHONY: flow-reset-session-facts
+flow-reset-session-facts: ## Delete one ET session from flow_contract_facts (defaults to today ET)
+	@echo "$(YELLOW)Deleting flow_contract_facts for $(FLOW_SYMBOL) on $(FLOW_REBUILD_DATE) ET ($(FLOW_REBUILD_START_ET)-$(FLOW_REBUILD_END_ET))...$(NC)"
+	@$(PSQL) -c " \
+		WITH deleted AS ( \
+			DELETE FROM flow_contract_facts \
+			WHERE symbol = '$(FLOW_SYMBOL)' \
+			  AND (timestamp AT TIME ZONE 'America/New_York')::date = DATE '$(FLOW_REBUILD_DATE)' \
+			  AND (timestamp AT TIME ZONE 'America/New_York')::time >= TIME '$(FLOW_REBUILD_START_ET)' \
+			  AND (timestamp AT TIME ZONE 'America/New_York')::time <= TIME '$(FLOW_REBUILD_END_ET)' \
+			RETURNING 1 \
+		) \
+		SELECT COUNT(*) AS deleted_rows FROM deleted;"
+
+.PHONY: flow-rebuild-session
+flow-rebuild-session: flow-reset-session-facts ## Reset one ET session, restart API, and trigger flow refresh
+	@echo "$(YELLOW)Restarting API service to pick up env (e.g. FLOW_CANONICAL_BACKFILL_MINUTES)...$(NC)"
+	@$(MAKE) api-restart
+	@echo "$(YELLOW)Waiting for API readiness (/api/health)...$(NC)"
+	@for i in $$(seq 1 30); do \
+		if curl -fsS "http://localhost:8000/api/health" > /dev/null; then \
+			echo "$(GREEN)API is ready.$(NC)"; \
+			break; \
+		fi; \
+		if [ $$i -eq 30 ]; then \
+			echo "$(RED)API did not become ready within 30s.$(NC)"; \
+			exit 1; \
+		fi; \
+		sleep 1; \
+	done
+	@echo "$(YELLOW)Triggering /api/flow/by-type refresh for $(FLOW_SYMBOL)...$(NC)"
+	@curl -fsS "http://localhost:8000/api/flow/by-type?symbol=$(FLOW_SYMBOL)&session=current" > /dev/null
+	@echo "$(GREEN)Rebuild trigger sent. Validate with: make flow-by-type FLOW_SYMBOL=$(FLOW_SYMBOL)$(NC)"
 
 .PHONY: vwap
 vwap: ## VWAP deviation tracker
