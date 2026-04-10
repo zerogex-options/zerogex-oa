@@ -33,7 +33,10 @@ def test_refresh_flow_cache_seeds_prior_rows_for_lag():
     assert conn.execute_queries
     canonical_query = next((q for q in conn.execute_queries if "INSERT INTO flow_contract_facts" in q), "")
     assert canonical_query
-    assert "WITH seed_rows AS (" in canonical_query
+    assert "WITH window_rows AS (" in canonical_query
+    assert "seed_rows AS (" in canonical_query
+    assert "active_symbols AS (" in canonical_query
+    assert "JOIN LATERAL (" in canonical_query
     assert "source_rows AS (" in canonical_query
     assert "FROM source_rows s" in canonical_query
     assert "WHERE timestamp >= $2" in canonical_query
