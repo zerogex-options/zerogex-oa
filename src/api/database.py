@@ -413,10 +413,21 @@ class DatabaseManager:
 
         # Backfill from the last known canonical flow row, bounded to a recent window
         # so one request can repair short outages without unbounded scan cost.
+        try:
+            canonical_backfill_minutes = max(
+                1,
+                int(os.getenv("FLOW_CANONICAL_BACKFILL_MINUTES", "90")),
+            )
+        except ValueError:
+            canonical_backfill_minutes = 90
+
         backfill_start = (
-            latest_ts - timedelta(minutes=90)
+            latest_ts - timedelta(minutes=canonical_backfill_minutes)
             if last_fact_ts is None
-            else max(last_fact_ts - timedelta(minutes=1), latest_ts - timedelta(minutes=90))
+            else max(
+                last_fact_ts - timedelta(minutes=1),
+                latest_ts - timedelta(minutes=canonical_backfill_minutes),
+            )
         )
 
         # Canonical per-contract fact table used as the source of truth for flow APIs.
