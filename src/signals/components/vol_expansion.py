@@ -64,28 +64,18 @@ class VolExpansionComponent(ComponentBase):
         """Combined score in [-1, +1] for the weighted composite.
 
         ``expansion/100 * direction/100`` = readiness * signed_momentum.
-        When direction is 0 or positive, the result equals +readiness
-        (capped at the GEX-determined ceiling).  When direction is
-        negative, it shifts linearly toward -readiness.
-
-        This is mathematically equivalent to the previous formulation but
-        is now expressed in terms of the two trader-facing dimensions.
+        This keeps the component neutral when momentum is flat while still
+        letting GEX control the *magnitude* of any directional impulse.
         """
         exp = self._gex_readiness(ctx.net_gex)  # [_GEX_FLOOR, 1.0]
 
         closes = ctx.recent_closes
         if len(closes) < 5 or closes[-5] <= 0:
-            return exp  # no momentum data → pure readiness (positive)
+            return 0.0  # no momentum data -> directional score unavailable
 
         pct_change = (closes[-1] - closes[-5]) / closes[-5]
         momentum = max(-1.0, min(1.0, pct_change / _MOMENTUM_NORM))
-
-        if momentum >= 0:
-            return exp
-
-        # Falling price: shift linearly from +exp (momentum=0)
-        # toward -exp (momentum=-1).
-        return exp * (1.0 + 2.0 * momentum)
+        return exp * momentum
 
     # ------------------------------------------------------------------
     # Internals
