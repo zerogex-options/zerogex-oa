@@ -423,7 +423,29 @@ class DatabaseManager:
         # Uses LAG() window function instead of LATERAL join for O(n) vs O(n²) perf.
         await conn.execute(
             """
-            WITH with_prev AS (
+            WITH seed_rows AS (
+                SELECT DISTINCT ON (oc.option_symbol)
+                    oc.timestamp,
+                    oc.underlying AS symbol,
+                    oc.option_symbol,
+                    oc.strike,
+                    oc.expiration,
+                    oc.option_type,
+                    oc.volume,
+                    oc.ask_volume,
+                    oc.bid_volume,
+                    oc.last,
+                    oc.mid,
+                    oc.bid,
+                    oc.ask,
+                    oc.implied_volatility,
+                    oc.delta
+                FROM option_chains oc
+                WHERE oc.underlying = $1
+                  AND oc.timestamp < $2
+                ORDER BY oc.option_symbol, oc.timestamp DESC
+            ),
+            window_rows AS (
                 SELECT
                     oc.timestamp,
                     oc.underlying AS symbol,
@@ -431,35 +453,59 @@ class DatabaseManager:
                     oc.strike,
                     oc.expiration,
                     oc.option_type,
-                    COALESCE(oc.last, oc.mid, (COALESCE(oc.bid, 0) + COALESCE(oc.ask, 0)) / 2.0, 0) AS trade_price,
+                    oc.volume,
+                    oc.ask_volume,
+                    oc.bid_volume,
+                    oc.last,
+                    oc.mid,
+                    oc.bid,
+                    oc.ask,
                     oc.implied_volatility,
-                    oc.delta,
-                    CASE
-                        WHEN LAG(oc.volume) OVER w IS NULL THEN COALESCE(oc.volume, 0)
-                        WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
-                            = (oc.timestamp AT TIME ZONE 'America/New_York')::date
-                            THEN GREATEST(COALESCE(oc.volume, 0) - COALESCE(LAG(oc.volume) OVER w, 0), 0)
-                        ELSE COALESCE(oc.volume, 0)
-                    END::bigint AS volume_delta,
-                    CASE
-                        WHEN LAG(oc.ask_volume) OVER w IS NULL THEN COALESCE(oc.ask_volume, 0)
-                        WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
-                            = (oc.timestamp AT TIME ZONE 'America/New_York')::date
-                            THEN GREATEST(COALESCE(oc.ask_volume, 0) - COALESCE(LAG(oc.ask_volume) OVER w, 0), 0)
-                        ELSE COALESCE(oc.ask_volume, 0)
-                    END::bigint AS ask_vol_delta,
-                    CASE
-                        WHEN LAG(oc.bid_volume) OVER w IS NULL THEN COALESCE(oc.bid_volume, 0)
-                        WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
-                            = (oc.timestamp AT TIME ZONE 'America/New_York')::date
-                            THEN GREATEST(COALESCE(oc.bid_volume, 0) - COALESCE(LAG(oc.bid_volume) OVER w, 0), 0)
-                        ELSE COALESCE(oc.bid_volume, 0)
-                    END::bigint AS bid_vol_delta
+                    oc.delta
                 FROM option_chains oc
                 WHERE oc.underlying = $1
                   AND oc.timestamp >= $2
                   AND oc.timestamp <= $3
-                WINDOW w AS (PARTITION BY oc.option_symbol ORDER BY oc.timestamp)
+            ),
+            source_rows AS (
+                SELECT * FROM seed_rows
+                UNION ALL
+                SELECT * FROM window_rows
+            ),
+            with_prev AS (
+                SELECT
+                    s.timestamp,
+                    s.symbol,
+                    s.option_symbol,
+                    s.strike,
+                    s.expiration,
+                    s.option_type,
+                    COALESCE(s.last, s.mid, (COALESCE(s.bid, 0) + COALESCE(s.ask, 0)) / 2.0, 0) AS trade_price,
+                    s.implied_volatility,
+                    s.delta,
+                    CASE
+                        WHEN LAG(s.volume) OVER w IS NULL THEN COALESCE(s.volume, 0)
+                        WHEN (LAG(s.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
+                            = (s.timestamp AT TIME ZONE 'America/New_York')::date
+                            THEN GREATEST(COALESCE(s.volume, 0) - COALESCE(LAG(s.volume) OVER w, 0), 0)
+                        ELSE COALESCE(s.volume, 0)
+                    END::bigint AS volume_delta,
+                    CASE
+                        WHEN LAG(s.ask_volume) OVER w IS NULL THEN COALESCE(s.ask_volume, 0)
+                        WHEN (LAG(s.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
+                            = (s.timestamp AT TIME ZONE 'America/New_York')::date
+                            THEN GREATEST(COALESCE(s.ask_volume, 0) - COALESCE(LAG(s.ask_volume) OVER w, 0), 0)
+                        ELSE COALESCE(s.ask_volume, 0)
+                    END::bigint AS ask_vol_delta,
+                    CASE
+                        WHEN LAG(s.bid_volume) OVER w IS NULL THEN COALESCE(s.bid_volume, 0)
+                        WHEN (LAG(s.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
+                            = (s.timestamp AT TIME ZONE 'America/New_York')::date
+                            THEN GREATEST(COALESCE(s.bid_volume, 0) - COALESCE(LAG(s.bid_volume) OVER w, 0), 0)
+                        ELSE COALESCE(s.bid_volume, 0)
+                    END::bigint AS bid_vol_delta
+                FROM source_rows s
+                WINDOW w AS (PARTITION BY s.option_symbol ORDER BY s.timestamp)
             )
             INSERT INTO flow_contract_facts (
                 timestamp, symbol, option_symbol, strike, expiration, option_type,
@@ -514,7 +560,8 @@ class DatabaseManager:
                     $4::numeric
                 ) AS underlying_price
             FROM with_prev
-            WHERE timestamp > $5
+            WHERE timestamp >= $2
+              AND timestamp > $5
               AND volume_delta > 0
             ON CONFLICT (timestamp, symbol, option_symbol)
             DO UPDATE SET
