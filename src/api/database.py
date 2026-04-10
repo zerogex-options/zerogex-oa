@@ -423,29 +423,7 @@ class DatabaseManager:
         # Uses LAG() window function instead of LATERAL join for O(n) vs O(n²) perf.
         await conn.execute(
             """
-            WITH seed_rows AS (
-                SELECT DISTINCT ON (oc.option_symbol)
-                    oc.timestamp,
-                    oc.underlying AS symbol,
-                    oc.option_symbol,
-                    oc.strike,
-                    oc.expiration,
-                    oc.option_type,
-                    oc.volume,
-                    oc.ask_volume,
-                    oc.bid_volume,
-                    oc.last,
-                    oc.mid,
-                    oc.bid,
-                    oc.ask,
-                    oc.implied_volatility,
-                    oc.delta
-                FROM option_chains oc
-                WHERE oc.underlying = $1
-                  AND oc.timestamp < $2
-                ORDER BY oc.option_symbol, oc.timestamp DESC
-            ),
-            window_rows AS (
+            WITH window_rows AS (
                 SELECT
                     oc.timestamp,
                     oc.underlying AS symbol,
@@ -466,6 +444,53 @@ class DatabaseManager:
                 WHERE oc.underlying = $1
                   AND oc.timestamp >= $2
                   AND oc.timestamp <= $3
+            ),
+            active_symbols AS (
+                SELECT DISTINCT option_symbol
+                FROM window_rows
+            ),
+            seed_rows AS (
+                SELECT
+                    oc.timestamp,
+                    oc.underlying AS symbol,
+                    oc.option_symbol,
+                    oc.strike,
+                    oc.expiration,
+                    oc.option_type,
+                    oc.volume,
+                    oc.ask_volume,
+                    oc.bid_volume,
+                    oc.last,
+                    oc.mid,
+                    oc.bid,
+                    oc.ask,
+                    oc.implied_volatility,
+                    oc.delta
+                FROM active_symbols s
+                JOIN LATERAL (
+                    SELECT
+                        oc.timestamp,
+                        oc.underlying,
+                        oc.option_symbol,
+                        oc.strike,
+                        oc.expiration,
+                        oc.option_type,
+                        oc.volume,
+                        oc.ask_volume,
+                        oc.bid_volume,
+                        oc.last,
+                        oc.mid,
+                        oc.bid,
+                        oc.ask,
+                        oc.implied_volatility,
+                        oc.delta
+                    FROM option_chains oc
+                    WHERE oc.underlying = $1
+                      AND oc.option_symbol = s.option_symbol
+                      AND oc.timestamp < $2
+                    ORDER BY oc.timestamp DESC
+                    LIMIT 1
+                ) oc ON TRUE
             ),
             source_rows AS (
                 SELECT * FROM seed_rows
