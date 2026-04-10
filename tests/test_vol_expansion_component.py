@@ -125,18 +125,20 @@ def test_direction_insufficient_closes():
 
 def test_compute_full_negative_gex_flat_price():
     ctx = _ctx()
-    assert comp.compute(ctx) == pytest.approx(1.0)
+    assert comp.compute(ctx) == pytest.approx(0.0)
 
 
 def test_compute_positive_gex_flat_price():
     ctx = _ctx(net_gex=_GEX_NORM * 10)
-    assert comp.compute(ctx) == pytest.approx(_GEX_FLOOR)
+    assert comp.compute(ctx) == pytest.approx(0.0)
 
 
-def test_compute_positive_gex_never_zero():
+def test_compute_with_momentum_matches_readiness_scaling():
     for gex in [0, 1e8, 5e8, 1e9, 1e10]:
-        score = comp.compute(_ctx(net_gex=gex))
-        assert score > 0, f"compute() should be > 0 for gex={gex}, got {score}"
+        base = 550.0
+        score = comp.compute(_ctx(net_gex=gex, recent_closes=[base] * 4 + [base * (1 + _MOMENTUM_NORM)]))
+        expected = comp._gex_readiness(gex)
+        assert score == pytest.approx(expected), f"Expected readiness scaling for gex={gex}"
 
 
 def test_compute_negative_gex_bearish_momentum():
@@ -158,18 +160,18 @@ def test_compute_positive_gex_bearish_momentum():
 def test_compute_half_bearish_momentum_returns_zero():
     base = 550.0
     ctx = _ctx(recent_closes=[base] * 4 + [base * (1 - _MOMENTUM_NORM / 2)])
-    assert comp.compute(ctx) == pytest.approx(0.0, abs=1e-6)
+    assert comp.compute(ctx) == pytest.approx(-0.5, abs=1e-6)
 
 
 def test_compute_quarter_bearish_momentum():
     base = 550.0
     ctx = _ctx(recent_closes=[base] * 4 + [base * (1 - _MOMENTUM_NORM / 4)])
-    assert comp.compute(ctx) == pytest.approx(0.5, abs=1e-4)
+    assert comp.compute(ctx) == pytest.approx(-0.25, abs=1e-4)
 
 
 def test_compute_insufficient_closes():
     ctx = _ctx(recent_closes=[549.0, 550.0])
-    assert comp.compute(ctx) == pytest.approx(1.0)
+    assert comp.compute(ctx) == pytest.approx(0.0)
 
 
 def test_compute_always_in_bounds():
