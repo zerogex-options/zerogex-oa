@@ -26,7 +26,7 @@ _GEX_FLOOR = 0.15
 
 class VolExpansionComponent(ComponentBase):
     name = "vol_expansion"
-    weight = 0.16
+    weight = 0.14
 
     # ------------------------------------------------------------------
     # Public two-dimensional scores (0-100 and -100 to +100)

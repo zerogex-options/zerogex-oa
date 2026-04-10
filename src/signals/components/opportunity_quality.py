@@ -15,7 +15,7 @@ from src.signals.components.base import ComponentBase, MarketContext
 
 class OpportunityQualityComponent(ComponentBase):
     name = "opportunity_quality"
-    weight = 0.16
+    weight = 0.12
 
     def __init__(self, underlying: str):
         self.underlying = underlying
