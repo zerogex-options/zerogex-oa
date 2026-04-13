@@ -785,18 +785,19 @@ underlying-live: ## Live latest underlying row (default SPY) refreshed every sec
 	@echo "$(BLUE)=== Live Underlying ($(UNDERLYING_LIVE_SYMBOL)) — Ctrl+C to stop ===$(NC)"
 	@while true; do \
 		output="$$( $(PSQL) -c "\
-			SELECT \
-				symbol, \
-				timestamp, \
-				open, \
-				high, \
-				low, \
-				close, \
-				up_volume, \
-				down_volume, \
-				created_at, \
-				updated_at \
-			FROM underlying_quotes \
+				SELECT \
+					symbol, \
+					timestamp, \
+					open, \
+					high, \
+					low, \
+					close, \
+					ROUND(((close - open) / NULLIF(open, 0) * 100), 2) AS pct_change, \
+					up_volume, \
+					down_volume, \
+					created_at, \
+					updated_at \
+				FROM underlying_quotes \
 			WHERE symbol = '$(UNDERLYING_LIVE_SYMBOL)' \
 			ORDER BY timestamp DESC \
 			LIMIT 1;" )"; \
