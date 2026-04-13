@@ -194,9 +194,11 @@ class FlowByStrikePoint(BaseModel):
     net_call_premium: Decimal
     net_put_premium: Decimal
     net_volume: int
+    net_directional_volume: int
     net_premium: Decimal
     cumulative_volume: int
     cumulative_net_volume: int
+    cumulative_net_directional_volume: int
     cumulative_premium: Decimal
     cumulative_call_premium: Decimal
     cumulative_put_premium: Decimal
@@ -215,9 +217,11 @@ class FlowByExpirationPoint(BaseModel):
     net_call_premium: Decimal
     net_put_premium: Decimal
     net_volume: int
+    net_directional_volume: int
     net_premium: Decimal
     cumulative_volume: int
     cumulative_net_volume: int
+    cumulative_net_directional_volume: int
     cumulative_premium: Decimal
     cumulative_call_premium: Decimal
     cumulative_put_premium: Decimal

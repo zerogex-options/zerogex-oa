@@ -1832,6 +1832,8 @@ class DatabaseManager:
                     premium_delta,
                     signed_volume,
                     signed_premium,
+                    buy_volume,
+                    sell_volume,
                     buy_premium,
                     sell_premium,
                     option_type,
@@ -1851,6 +1853,13 @@ class DatabaseManager:
                     SUM(CASE WHEN option_type = 'C' THEN (buy_premium - sell_premium) ELSE 0 END)::numeric AS ncp,
                     SUM(CASE WHEN option_type = 'P' THEN -(buy_premium - sell_premium) ELSE 0 END)::numeric AS npp,
                     SUM(signed_volume)::bigint AS net_volume,
+                    SUM(
+                        CASE
+                            WHEN option_type = 'C' THEN (buy_volume - sell_volume)
+                            WHEN option_type = 'P' THEN -(buy_volume - sell_volume)
+                            ELSE 0
+                        END
+                    )::bigint AS net_directional_volume,
                     SUM(signed_premium)::numeric AS net_premium,
                     MAX(underlying_price) AS underlying_price
                 FROM bucketed
@@ -1890,6 +1899,7 @@ class DatabaseManager:
                     COALESCE(a.ncp, 0)::numeric AS ncp,
                     COALESCE(a.npp, 0)::numeric AS npp,
                     COALESCE(a.net_volume, 0)::bigint AS net_volume,
+                    COALESCE(a.net_directional_volume, 0)::bigint AS net_directional_volume,
                     COALESCE(a.net_premium, 0)::numeric AS net_premium,
                     ud.underlying_price AS underlying_price
                 FROM buckets b
@@ -1909,9 +1919,11 @@ class DatabaseManager:
                 ncp AS net_call_premium,
                 npp AS net_put_premium,
                 net_volume,
+                net_directional_volume,
                 (ncp + npp)::numeric AS net_premium,
                 SUM(volume) OVER (PARTITION BY strike ORDER BY timestamp)::bigint AS cumulative_volume,
                 SUM(net_volume) OVER (PARTITION BY strike ORDER BY timestamp)::bigint AS cumulative_net_volume,
+                SUM(net_directional_volume) OVER (PARTITION BY strike ORDER BY timestamp)::bigint AS cumulative_net_directional_volume,
                 SUM(premium) OVER (PARTITION BY strike ORDER BY timestamp)::numeric AS cumulative_premium,
                 SUM(ncp) OVER (PARTITION BY strike ORDER BY timestamp)::numeric AS cumulative_call_premium,
                 SUM(npp) OVER (PARTITION BY strike ORDER BY timestamp)::numeric AS cumulative_put_premium,
@@ -1982,6 +1994,8 @@ class DatabaseManager:
                     premium_delta,
                     signed_volume,
                     signed_premium,
+                    buy_volume,
+                    sell_volume,
                     buy_premium,
                     sell_premium,
                     option_type,
@@ -2001,6 +2015,13 @@ class DatabaseManager:
                     SUM(CASE WHEN option_type = 'C' THEN (buy_premium - sell_premium) ELSE 0 END)::numeric AS ncp,
                     SUM(CASE WHEN option_type = 'P' THEN -(buy_premium - sell_premium) ELSE 0 END)::numeric AS npp,
                     SUM(signed_volume)::bigint AS net_volume,
+                    SUM(
+                        CASE
+                            WHEN option_type = 'C' THEN (buy_volume - sell_volume)
+                            WHEN option_type = 'P' THEN -(buy_volume - sell_volume)
+                            ELSE 0
+                        END
+                    )::bigint AS net_directional_volume,
                     SUM(signed_premium)::numeric AS net_premium,
                     MAX(underlying_price) AS underlying_price
                 FROM bucketed
@@ -2040,6 +2061,7 @@ class DatabaseManager:
                     COALESCE(a.ncp, 0)::numeric AS net_call_premium,
                     COALESCE(a.npp, 0)::numeric AS net_put_premium,
                     COALESCE(a.net_volume, 0)::bigint AS net_volume,
+                    COALESCE(a.net_directional_volume, 0)::bigint AS net_directional_volume,
                     COALESCE(a.net_premium, 0)::numeric AS net_premium,
                     ud.underlying_price AS underlying_price
                 FROM buckets b
@@ -2060,9 +2082,11 @@ class DatabaseManager:
                 net_call_premium,
                 net_put_premium,
                 net_volume,
+                net_directional_volume,
                 (net_call_premium + net_put_premium)::numeric AS net_premium,
                 SUM(volume) OVER (PARTITION BY expiration ORDER BY timestamp)::bigint AS cumulative_volume,
                 SUM(net_volume) OVER (PARTITION BY expiration ORDER BY timestamp)::bigint AS cumulative_net_volume,
+                SUM(net_directional_volume) OVER (PARTITION BY expiration ORDER BY timestamp)::bigint AS cumulative_net_directional_volume,
                 SUM(premium) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_premium,
                 SUM(net_call_premium) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_call_premium,
                 SUM(net_put_premium) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_put_premium,
