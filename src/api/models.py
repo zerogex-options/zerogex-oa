@@ -170,6 +170,7 @@ class FlowByTypePoint(BaseModel):
     put_premium: Decimal
     net_put_premium: Decimal
     net_volume: int
+    net_directional_volume: int
     net_premium: Decimal
     cumulative_call_premium: Decimal
     cumulative_put_premium: Decimal
@@ -177,6 +178,7 @@ class FlowByTypePoint(BaseModel):
     cumulative_call_volume: int
     cumulative_put_volume: int
     cumulative_net_volume: int
+    cumulative_net_directional_volume: int
     cumulative_net_premium: Decimal
     running_put_call_ratio: Optional[Decimal] = None
     flow_bias: str

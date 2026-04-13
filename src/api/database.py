@@ -1670,6 +1670,10 @@ class DatabaseManager:
                     SUM(CASE WHEN option_type = 'C' THEN premium_delta ELSE 0 END) AS call_premium,
                     SUM(CASE WHEN option_type = 'P' THEN volume_delta ELSE 0 END) AS put_volume,
                     SUM(CASE WHEN option_type = 'P' THEN premium_delta ELSE 0 END) AS put_premium,
+                    SUM(CASE WHEN option_type = 'C' THEN buy_volume ELSE 0 END) AS call_buy_volume,
+                    SUM(CASE WHEN option_type = 'C' THEN sell_volume ELSE 0 END) AS call_sell_volume,
+                    SUM(CASE WHEN option_type = 'P' THEN buy_volume ELSE 0 END) AS put_buy_volume,
+                    SUM(CASE WHEN option_type = 'P' THEN sell_volume ELSE 0 END) AS put_sell_volume,
                     SUM(CASE WHEN option_type = 'C' THEN buy_premium ELSE 0 END) AS call_buy_premium,
                     SUM(CASE WHEN option_type = 'C' THEN sell_premium ELSE 0 END) AS call_sell_premium,
                     SUM(CASE WHEN option_type = 'P' THEN buy_premium ELSE 0 END) AS put_buy_premium,
@@ -1689,6 +1693,10 @@ class DatabaseManager:
                     COALESCE(a.call_premium, 0) AS call_premium,
                     COALESCE(a.put_volume, 0) AS put_volume,
                     COALESCE(a.put_premium, 0) AS put_premium,
+                    COALESCE(a.call_buy_volume, 0) AS call_buy_volume,
+                    COALESCE(a.call_sell_volume, 0) AS call_sell_volume,
+                    COALESCE(a.put_buy_volume, 0) AS put_buy_volume,
+                    COALESCE(a.put_sell_volume, 0) AS put_sell_volume,
                     COALESCE(a.call_buy_premium, 0) AS call_buy_premium,
                     COALESCE(a.call_sell_premium, 0) AS call_sell_premium,
                     COALESCE(a.put_buy_premium, 0) AS put_buy_premium,
@@ -1716,6 +1724,10 @@ class DatabaseManager:
                     COALESCE(put_volume, 0)::bigint AS put_volume,
                     COALESCE(put_premium, 0)::numeric AS put_premium,
                     (COALESCE(call_volume, 0) - COALESCE(put_volume, 0))::bigint AS net_volume,
+                    (
+                        (COALESCE(call_buy_volume, 0) - COALESCE(call_sell_volume, 0))
+                        - (COALESCE(put_buy_volume, 0) - COALESCE(put_sell_volume, 0))
+                    )::bigint AS net_directional_volume,
                     -- Net Call Premium (NCP): buy pressure minus sell pressure on calls
                     (COALESCE(call_buy_premium, 0) - COALESCE(call_sell_premium, 0))::numeric AS ncp,
                     -- Net Put Premium (NPP): buy pressure minus sell pressure on puts (negated)
@@ -1737,6 +1749,7 @@ class DatabaseManager:
                 put_premium,
                 npp AS net_put_premium,
                 net_volume,
+                net_directional_volume,
                 net_premium,
                 -- Cumulative NCP: running sum of net call buying (positive = net call buying)
                 SUM(ncp) OVER (ORDER BY timestamp)::numeric AS cumulative_call_premium,
@@ -1746,6 +1759,7 @@ class DatabaseManager:
                 SUM(call_volume) OVER (ORDER BY timestamp)::bigint AS cumulative_call_volume,
                 SUM(put_volume) OVER (ORDER BY timestamp)::bigint AS cumulative_put_volume,
                 SUM(net_volume) OVER (ORDER BY timestamp)::bigint AS cumulative_net_volume,
+                SUM(net_directional_volume) OVER (ORDER BY timestamp)::bigint AS cumulative_net_directional_volume,
                 SUM(ncp + npp) OVER (ORDER BY timestamp)::numeric AS cumulative_net_premium,
                 ROUND(
                     SUM(put_volume) OVER (ORDER BY timestamp)::numeric
