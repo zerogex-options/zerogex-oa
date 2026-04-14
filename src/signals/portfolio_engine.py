@@ -23,6 +23,9 @@ from datetime import date, datetime
 from typing import Optional
 
 from src.config import (
+    SIGNALS_DRS_CALL_ENTRY_MIN,
+    SIGNALS_DRS_HARD_GATES_ENABLED,
+    SIGNALS_DRS_PUT_ENTRY_MAX,
     SIGNALS_MAX_OPEN_TRADES,
     SIGNALS_MAX_PORTFOLIO_HEAT_PCT,
     SIGNALS_PORTFOLIO_SIZE,
@@ -94,6 +97,9 @@ class PortfolioEngine:
         self.cooldown_minutes = SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES
         self.trend_confirmation_bars = SIGNALS_TREND_CONFIRMATION_BARS
         self.trend_confirmation_min_match = SIGNALS_TREND_CONFIRMATION_MIN_MATCH
+        self.drs_hard_gates_enabled = SIGNALS_DRS_HARD_GATES_ENABLED
+        self.drs_call_entry_min = SIGNALS_DRS_CALL_ENTRY_MIN
+        self.drs_put_entry_max = SIGNALS_DRS_PUT_ENTRY_MAX
 
     # ------------------------------------------------------------------
     # Connection helper
@@ -151,6 +157,11 @@ class PortfolioEngine:
                 score,
                 f"Trend confirmation failed: recent history contradicts {score.direction}",
             )
+
+        # --- CASE 2B: Dealer Regime hard-entry gates ---
+        passes_drs_gate, drs_reason = self._passes_dealer_regime_gates(score, market_ctx)
+        if not passes_drs_gate:
+            return self._cash_target(score, drs_reason)
 
         # --- CASE 3: position optimizer candidate ---
         candidate_result = self._select_optimizer_candidate(
@@ -632,6 +643,44 @@ class PortfolioEngine:
                 return matching >= min_match
         except Exception:
             return True
+
+    def _passes_dealer_regime_gates(self, score: ScoreSnapshot, market_ctx: dict) -> tuple[bool, str]:
+        if not self.drs_hard_gates_enabled:
+            return True, "DRS hard gates disabled"
+
+        component = score.components.get("dealer_regime", {})
+        drs_norm = float(component.get("score", 0.0))
+        gamma_flip = market_ctx.get("gamma_flip")
+        close = market_ctx.get("close")
+        recent = market_ctx.get("recent_closes") or []
+        prev_close = recent[-2] if len(recent) >= 2 else None
+
+        if gamma_flip is None or close is None:
+            return False, "DRS hard gate blocked: missing gamma flip or close"
+
+        if score.direction == "bullish":
+            holds_above_flip = close > gamma_flip and (prev_close is None or prev_close > gamma_flip)
+            if not holds_above_flip:
+                return False, "DRS hard gate blocked: bullish entry requires hold above gamma flip"
+            if drs_norm <= self.drs_call_entry_min:
+                return (
+                    False,
+                    f"DRS hard gate blocked: bullish entry requires DRS > {self.drs_call_entry_min:.2f}",
+                )
+            return True, "DRS bullish gate passed"
+
+        if score.direction == "bearish":
+            crossed_below_flip = close < gamma_flip and (prev_close is not None and prev_close >= gamma_flip)
+            if not crossed_below_flip:
+                return False, "DRS hard gate blocked: bearish entry requires fresh cross below gamma flip"
+            if drs_norm >= self.drs_put_entry_max:
+                return (
+                    False,
+                    f"DRS hard gate blocked: bearish entry requires DRS < {self.drs_put_entry_max:.2f}",
+                )
+            return True, "DRS bearish gate passed"
+
+        return False, "DRS hard gate blocked: neutral direction"
 
     def _select_optimizer_candidate(
         self, score: ScoreSnapshot, ctx: dict, conn=None, cached_option_rows=None

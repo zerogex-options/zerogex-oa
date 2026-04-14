@@ -4,6 +4,7 @@ from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, patch
 
 from src.signals.portfolio_engine import PortfolioEngine, PortfolioTarget, TargetPosition
+from src.signals.scoring_engine import ScoreSnapshot
 
 
 def _make_engine() -> PortfolioEngine:
@@ -86,3 +87,38 @@ class TestCashTarget:
         assert target.total_target_contracts == 0
         assert target.target_heat_pct == 0.0
         assert target.rationale == "test rationale"
+
+
+class TestDealerRegimeHardGates:
+    def test_bullish_gate_passes_when_holding_above_flip_and_drs_strong(self):
+        engine = _make_engine()
+        score = ScoreSnapshot(
+            timestamp=NOW,
+            underlying="SPY",
+            composite_score=0.65,
+            normalized_score=0.65,
+            direction="bullish",
+            components={"dealer_regime": {"score": 0.55, "weight": 0.12}},
+        )
+        ok, _reason = engine._passes_dealer_regime_gates(
+            score,
+            {"close": 502.0, "gamma_flip": 500.0, "recent_closes": [499.0, 501.0, 502.0]},
+        )
+        assert ok is True
+
+    def test_bearish_gate_requires_fresh_cross_below_flip(self):
+        engine = _make_engine()
+        score = ScoreSnapshot(
+            timestamp=NOW,
+            underlying="SPY",
+            composite_score=-0.7,
+            normalized_score=0.7,
+            direction="bearish",
+            components={"dealer_regime": {"score": -0.35, "weight": 0.12}},
+        )
+        ok, reason = engine._passes_dealer_regime_gates(
+            score,
+            {"close": 498.0, "gamma_flip": 500.0, "recent_closes": [497.0, 498.5, 498.0]},
+        )
+        assert ok is False
+        assert "fresh cross below gamma flip" in reason

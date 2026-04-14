@@ -230,6 +230,11 @@ SIGNALS_TREND_CONFIRMATION_BARS = max(
 SIGNALS_TREND_CONFIRMATION_MIN_MATCH = max(
     0, int(os.getenv("SIGNALS_TREND_CONFIRMATION_MIN_MATCH", "1"))
 )
+SIGNALS_DRS_HARD_GATES_ENABLED = (
+    os.getenv("SIGNALS_DRS_HARD_GATES_ENABLED", "true").lower() == "true"
+)
+SIGNALS_DRS_CALL_ENTRY_MIN = float(os.getenv("SIGNALS_DRS_CALL_ENTRY_MIN", "0.40"))
+SIGNALS_DRS_PUT_ENTRY_MAX = float(os.getenv("SIGNALS_DRS_PUT_ENTRY_MAX", "0.20"))
 
 # Stop-loss as a fraction of trade outlay (entry_price * quantity * 100).
 # Default -0.25 means the trade is stopped out when it loses 25% of the
