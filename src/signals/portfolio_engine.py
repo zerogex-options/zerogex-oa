@@ -433,7 +433,6 @@ class PortfolioEngine:
                 0, 0, 0, 0,
                 %s::jsonb
             )
-            ON CONFLICT (underlying, signal_timestamp) DO NOTHING
             """,
             (
                 self.db_symbol,
