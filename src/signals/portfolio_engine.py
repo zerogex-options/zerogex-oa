@@ -27,6 +27,9 @@ from src.config import (
     SIGNALS_MAX_PORTFOLIO_HEAT_PCT,
     SIGNALS_PORTFOLIO_SIZE,
     SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES,
+    SIGNALS_TREND_CONFIRMATION_BARS,
+    SIGNALS_TREND_CONFIRMATION_MIN_MATCH,
+    SIGNALS_TRIGGER_THRESHOLD,
 )
 from src.database import db_connection
 from src.signals.position_optimizer_engine import (
@@ -85,10 +88,12 @@ class PortfolioEngine:
         self.position_optimizer = PositionOptimizerEngine(self.underlying)
 
         # Config constants
-        self.trigger_threshold = 0.58
+        self.trigger_threshold = SIGNALS_TRIGGER_THRESHOLD
         self.max_open_trades = SIGNALS_MAX_OPEN_TRADES
         self.max_heat_pct = SIGNALS_MAX_PORTFOLIO_HEAT_PCT
         self.cooldown_minutes = SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES
+        self.trend_confirmation_bars = SIGNALS_TREND_CONFIRMATION_BARS
+        self.trend_confirmation_min_match = SIGNALS_TREND_CONFIRMATION_MIN_MATCH
 
     # ------------------------------------------------------------------
     # Connection helper
@@ -603,6 +608,10 @@ class PortfolioEngine:
         try:
             with self._use_conn(conn) as c:
                 cur = c.cursor()
+                lookback = self.trend_confirmation_bars
+                if lookback <= 0:
+                    return True
+
                 cur.execute(
                     """
                     SELECT direction
@@ -611,15 +620,16 @@ class PortfolioEngine:
                       AND timestamp < %s
                       AND direction != 'neutral'
                     ORDER BY timestamp DESC
-                    LIMIT 4
+                    LIMIT %s
                     """,
-                    (self.db_symbol, as_of),
+                    (self.db_symbol, as_of, lookback),
                 )
                 rows = cur.fetchall()
                 if not rows:
                     return True
                 matching = sum(1 for r in rows if r[0] == direction)
-                return matching >= (len(rows) + 1) // 2
+                min_match = min(self.trend_confirmation_min_match, len(rows))
+                return matching >= min_match
         except Exception:
             return True
 

@@ -223,6 +223,13 @@ SIGNALS_MAX_PORTFOLIO_HEAT_PCT = float(os.getenv("SIGNALS_MAX_PORTFOLIO_HEAT_PCT
 SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES = int(
     os.getenv("SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES", "30")
 )
+SIGNALS_TRIGGER_THRESHOLD = float(os.getenv("SIGNALS_TRIGGER_THRESHOLD", "0.52"))
+SIGNALS_TREND_CONFIRMATION_BARS = max(
+    0, int(os.getenv("SIGNALS_TREND_CONFIRMATION_BARS", "3"))
+)
+SIGNALS_TREND_CONFIRMATION_MIN_MATCH = max(
+    0, int(os.getenv("SIGNALS_TREND_CONFIRMATION_MIN_MATCH", "1"))
+)
 
 # Stop-loss as a fraction of trade outlay (entry_price * quantity * 100).
 # Default -0.25 means the trade is stopped out when it loses 25% of the
