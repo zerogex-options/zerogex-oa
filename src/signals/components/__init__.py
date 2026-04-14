@@ -3,6 +3,7 @@
 from src.signals.components.base import ComponentBase, MarketContext
 from src.signals.components.gex_regime import GexRegimeComponent
 from src.signals.components.gamma_flip import GammaFlipComponent
+from src.signals.components.dealer_regime import DealerRegimeComponent
 from src.signals.components.put_call_ratio import PutCallRatioComponent
 from src.signals.components.smart_money import SmartMoneyComponent
 from src.signals.components.positioning_trap import PositioningTrapComponent
@@ -15,6 +16,7 @@ __all__ = [
     "MarketContext",
     "GexRegimeComponent",
     "GammaFlipComponent",
+    "DealerRegimeComponent",
     "PutCallRatioComponent",
     "SmartMoneyComponent",
     "PositioningTrapComponent",

@@ -4,7 +4,7 @@ from src.signals.components.base import ComponentBase, MarketContext
 
 class SmartMoneyComponent(ComponentBase):
     name = "smart_money"
-    weight = 0.14
+    weight = 0.13
 
     def compute(self, ctx: MarketContext) -> float:
         sm_total = ctx.smart_call + ctx.smart_put

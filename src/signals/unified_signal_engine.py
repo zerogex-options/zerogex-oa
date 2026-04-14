@@ -12,6 +12,7 @@ import os
 
 from src.database import db_connection
 from src.signals.components.base import MarketContext
+from src.signals.components.dealer_regime import DealerRegimeComponent
 from src.signals.components.exhaustion import ExhaustionComponent
 from src.signals.components.gamma_flip import GammaFlipComponent
 from src.signals.components.gex_regime import GexRegimeComponent
@@ -38,6 +39,7 @@ class UnifiedSignalEngine:
             components=[
                 GexRegimeComponent(),
                 GammaFlipComponent(),
+                DealerRegimeComponent(),
                 PutCallRatioComponent(),
                 SmartMoneyComponent(),
                 PositioningTrapComponent(),
@@ -95,6 +97,59 @@ class UnifiedSignalEngine:
                     return None
                 ts, close, net_gex, gamma_flip, pcr, max_pain = row
                 close_f = float(close)
+
+                cur.execute(
+                    """
+                    SELECT vwap, vwap_deviation_pct
+                    FROM underlying_vwap_deviation
+                    WHERE symbol = %s
+                      AND timestamp <= %s
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                    """,
+                    (self.db_symbol, ts),
+                )
+                vwap_row = cur.fetchone()
+                vwap = float(vwap_row[0]) if vwap_row and vwap_row[0] is not None else None
+                vwap_deviation_pct = (
+                    float(vwap_row[1]) if vwap_row and vwap_row[1] is not None else None
+                )
+
+                cur.execute(
+                    """
+                    WITH latest AS (
+                        SELECT MAX(timestamp) AS ts
+                        FROM gex_by_strike
+                        WHERE underlying = %s
+                          AND timestamp <= %s
+                    )
+                    SELECT
+                        (
+                            SELECT strike
+                            FROM gex_by_strike g
+                            WHERE g.underlying = %s
+                              AND g.timestamp = latest.ts
+                              AND g.strike >= %s
+                            ORDER BY g.call_oi DESC NULLS LAST, g.strike ASC
+                            LIMIT 1
+                        ) AS call_wall,
+                        (
+                            SELECT strike
+                            FROM gex_by_strike g
+                            WHERE g.underlying = %s
+                              AND g.timestamp = latest.ts
+                            ORDER BY ABS(COALESCE(g.net_gex, 0)) DESC, g.strike ASC
+                            LIMIT 1
+                        ) AS max_gamma_strike
+                    FROM latest
+                    """,
+                    (self.db_symbol, ts, self.db_symbol, close_f, self.db_symbol),
+                )
+                strike_row = cur.fetchone()
+                call_wall = float(strike_row[0]) if strike_row and strike_row[0] is not None else None
+                max_gamma_strike = (
+                    float(strike_row[1]) if strike_row and strike_row[1] is not None else None
+                )
 
                 cur.execute(
                     """
@@ -176,6 +231,10 @@ class UnifiedSignalEngine:
                     "smart_put": float(sm_put or 0.0),
                     "recent_closes": list(reversed(closes)),
                     "iv_rank": iv_rank,
+                    "vwap": vwap,
+                    "vwap_deviation_pct": vwap_deviation_pct,
+                    "call_wall": call_wall,
+                    "max_gamma_strike": max_gamma_strike,
                 }
 
     def _build_market_context(self, ctx: dict) -> MarketContext:
@@ -192,6 +251,12 @@ class UnifiedSignalEngine:
             smart_put=ctx["smart_put"],
             recent_closes=ctx["recent_closes"],
             iv_rank=ctx.get("iv_rank"),
+            vwap=ctx.get("vwap"),
+            vwap_deviation_pct=ctx.get("vwap_deviation_pct"),
+            extra={
+                "call_wall": ctx.get("call_wall"),
+                "max_gamma_strike": ctx.get("max_gamma_strike"),
+            },
         )
 
     def run_cycle(self) -> bool:

@@ -4,7 +4,7 @@ from src.signals.components.base import ComponentBase, MarketContext
 
 class PutCallRatioComponent(ComponentBase):
     name = "put_call_ratio"
-    weight = 0.10
+    weight = 0.09
 
     def compute(self, ctx: MarketContext) -> float:
         pcr = ctx.put_call_ratio

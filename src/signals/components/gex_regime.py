@@ -4,7 +4,7 @@ from src.signals.components.base import ComponentBase, MarketContext
 
 class GexRegimeComponent(ComponentBase):
     name = "gex_regime"
-    weight = 0.18
+    weight = 0.14
 
     def compute(self, ctx: MarketContext) -> float:
         return -1.0 if ctx.net_gex < 0 else 1.0

@@ -12,7 +12,7 @@ from src.signals.components.base import ComponentBase, MarketContext
 
 class GammaFlipComponent(ComponentBase):
     name = "gamma_flip"
-    weight = 0.12
+    weight = 0.10
 
     def compute(self, ctx: MarketContext) -> float:
         if not ctx.gamma_flip:
