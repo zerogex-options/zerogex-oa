@@ -10,7 +10,7 @@ from src.signals.components.base import ComponentBase, MarketContext
 
 class DealerRegimeComponent(ComponentBase):
     name = "dealer_regime"
-    weight = 0.12
+    weight = 0.08
 
     def compute(self, ctx: MarketContext) -> float:
         breakdown = self._breakdown(ctx)

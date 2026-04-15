@@ -12,14 +12,20 @@ import os
 
 from src.database import db_connection
 from src.signals.components.base import MarketContext
+from src.signals.components.dealer_delta_pressure import DealerDeltaPressureComponent
 from src.signals.components.dealer_regime import DealerRegimeComponent
 from src.signals.components.exhaustion import ExhaustionComponent
 from src.signals.components.gamma_flip import GammaFlipComponent
+from src.signals.components.gex_gradient import GexGradientComponent
 from src.signals.components.gex_regime import GexRegimeComponent
+from src.signals.components.intraday_regime import IntradayRegimeComponent
 from src.signals.components.opportunity_quality import OpportunityQualityComponent
 from src.signals.components.positioning_trap import PositioningTrapComponent
 from src.signals.components.put_call_ratio import PutCallRatioComponent
+from src.signals.components.skew_delta import SkewDeltaComponent
 from src.signals.components.smart_money import SmartMoneyComponent
+from src.signals.components.tape_flow_bias import TapeFlowBiasComponent
+from src.signals.components.vanna_charm_flow import VannaCharmFlowComponent
 from src.signals.components.vol_expansion import VolExpansionComponent
 from src.signals.portfolio_engine import PortfolioEngine
 from src.signals.scoring_engine import ScoringEngine
@@ -46,6 +52,12 @@ class UnifiedSignalEngine:
                 VolExpansionComponent(),
                 ExhaustionComponent(),
                 OpportunityQualityComponent(self.underlying),
+                GexGradientComponent(),
+                DealerDeltaPressureComponent(),
+                VannaCharmFlowComponent(),
+                TapeFlowBiasComponent(),
+                SkewDeltaComponent(),
+                IntradayRegimeComponent(),
             ],
         )
 
@@ -77,10 +89,13 @@ class UnifiedSignalEngine:
                            gs.total_net_gex,
                            gs.gamma_flip_point,
                            gs.put_call_ratio,
-                           gs.max_pain
+                           gs.max_pain,
+                           gs.total_call_oi,
+                           gs.total_put_oi
                     FROM underlying_quotes uq
                     LEFT JOIN LATERAL (
-                        SELECT total_net_gex, gamma_flip_point, put_call_ratio, max_pain
+                        SELECT total_net_gex, gamma_flip_point, put_call_ratio, max_pain,
+                               total_call_oi, total_put_oi
                         FROM gex_summary
                         WHERE underlying = %s AND timestamp <= uq.timestamp
                         ORDER BY timestamp DESC
@@ -95,8 +110,22 @@ class UnifiedSignalEngine:
                 row = cur.fetchone()
                 if not row:
                     return None
-                ts, close, net_gex, gamma_flip, pcr, max_pain = row
+                ts, close, net_gex, gamma_flip, pcr, max_pain, total_call_oi, total_put_oi = row
                 close_f = float(close)
+
+                # Open-interest-based PCR is structurally more stable than the
+                # flow-volume ratio (which inverts in vol events). We prefer
+                # the OI ratio when available and fall back to the existing
+                # volume ratio otherwise.
+                oi_pcr = None
+                try:
+                    if total_call_oi and int(total_call_oi) > 0:
+                        oi_pcr = float(total_put_oi or 0) / float(total_call_oi)
+                except (TypeError, ValueError, ZeroDivisionError):
+                    oi_pcr = None
+                effective_pcr = (
+                    oi_pcr if oi_pcr is not None and oi_pcr > 0 else float(pcr or 1.0)
+                )
 
                 cur.execute(
                     """
@@ -150,6 +179,130 @@ class UnifiedSignalEngine:
                 max_gamma_strike = (
                     float(strike_row[1]) if strike_row and strike_row[1] is not None else None
                 )
+
+                # Per-strike gamma exposure window around spot. Used by
+                # gex_gradient, dealer_delta_pressure, and vanna_charm_flow.
+                gex_strike_rows: list[dict] = []
+                try:
+                    cur.execute(
+                        """
+                        WITH latest AS (
+                            SELECT MAX(timestamp) AS ts
+                            FROM gex_by_strike
+                            WHERE underlying = %s AND timestamp <= %s
+                        )
+                        SELECT strike,
+                               SUM(COALESCE(net_gex, 0))         AS net_gex,
+                               SUM(COALESCE(call_oi, 0))         AS call_oi,
+                               SUM(COALESCE(put_oi, 0))          AS put_oi,
+                               SUM(COALESCE(vanna_exposure, 0))  AS vanna_exposure,
+                               SUM(COALESCE(charm_exposure, 0))  AS charm_exposure
+                        FROM gex_by_strike g, latest
+                        WHERE g.underlying = %s
+                          AND g.timestamp = latest.ts
+                          AND g.strike BETWEEN %s AND %s
+                        GROUP BY strike
+                        ORDER BY strike
+                        """,
+                        (
+                            self.db_symbol,
+                            ts,
+                            self.db_symbol,
+                            close_f * 0.90,
+                            close_f * 1.10,
+                        ),
+                    )
+                    for r in cur.fetchall():
+                        gex_strike_rows.append(
+                            {
+                                "strike": float(r[0]),
+                                "net_gex": float(r[1] or 0.0),
+                                "call_oi": int(r[2] or 0),
+                                "put_oi": int(r[3] or 0),
+                                "vanna_exposure": float(r[4] or 0.0),
+                                "charm_exposure": float(r[5] or 0.0),
+                            }
+                        )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "UnifiedSignalEngine [%s]: gex_by_strike fetch failed: %s",
+                        self.db_symbol,
+                        exc,
+                    )
+
+                # Lee-Ready-classified flow per option type for the most recent
+                # 15-minute window. Powers tape_flow_bias.
+                flow_by_type_rows: list[dict] = []
+                try:
+                    cur.execute(
+                        """
+                        SELECT option_type,
+                               SUM(COALESCE(buy_volume, 0))    AS buy_volume,
+                               SUM(COALESCE(sell_volume, 0))   AS sell_volume,
+                               SUM(COALESCE(buy_premium, 0))   AS buy_premium,
+                               SUM(COALESCE(sell_premium, 0))  AS sell_premium
+                        FROM flow_by_type
+                        WHERE symbol = %s
+                          AND timestamp BETWEEN %s - INTERVAL '15 minutes' AND %s
+                        GROUP BY option_type
+                        """,
+                        (self.db_symbol, ts, ts),
+                    )
+                    for r in cur.fetchall():
+                        flow_by_type_rows.append(
+                            {
+                                "option_type": r[0],
+                                "buy_volume": int(r[1] or 0),
+                                "sell_volume": int(r[2] or 0),
+                                "buy_premium": float(r[3] or 0.0),
+                                "sell_premium": float(r[4] or 0.0),
+                            }
+                        )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "UnifiedSignalEngine [%s]: flow_by_type fetch failed: %s",
+                        self.db_symbol,
+                        exc,
+                    )
+
+                # Short-dated OTM put vs OTM call IV for skew_delta.
+                skew_info: dict = {}
+                try:
+                    cur.execute(
+                        """
+                        SELECT option_type,
+                               AVG(implied_volatility) AS iv
+                        FROM option_chains
+                        WHERE underlying = %s
+                          AND implied_volatility IS NOT NULL
+                          AND implied_volatility > 0
+                          AND timestamp >= %s - INTERVAL '30 minutes'
+                          AND (
+                                (option_type = 'P' AND strike BETWEEN %s AND %s)
+                             OR (option_type = 'C' AND strike BETWEEN %s AND %s)
+                          )
+                        GROUP BY option_type
+                        """,
+                        (
+                            self.db_symbol,
+                            ts,
+                            close_f * 0.95,
+                            close_f * 0.98,  # OTM puts: ~2-5% OTM
+                            close_f * 1.02,
+                            close_f * 1.05,  # OTM calls: ~2-5% OTM
+                        ),
+                    )
+                    for r in cur.fetchall():
+                        if r[0] == "P":
+                            skew_info["otm_put_iv"] = float(r[1]) if r[1] is not None else None
+                        elif r[0] == "C":
+                            skew_info["otm_call_iv"] = float(r[1]) if r[1] is not None else None
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "UnifiedSignalEngine [%s]: skew fetch failed: %s",
+                        self.db_symbol,
+                        exc,
+                    )
 
                 cur.execute(
                     """
@@ -225,7 +378,10 @@ class UnifiedSignalEngine:
                     "close": close_f,
                     "net_gex": float(net_gex or 0.0),
                     "gamma_flip": float(gamma_flip) if gamma_flip is not None else None,
-                    "put_call_ratio": float(pcr or 1.0),
+                    "put_call_ratio": effective_pcr,
+                    "put_call_ratio_source": "oi" if oi_pcr is not None and oi_pcr > 0 else "volume",
+                    "put_call_ratio_volume": float(pcr or 1.0),
+                    "put_call_ratio_oi": oi_pcr,
                     "max_pain": float(max_pain) if max_pain is not None else None,
                     "smart_call": float(sm_call or 0.0),
                     "smart_put": float(sm_put or 0.0),
@@ -235,6 +391,9 @@ class UnifiedSignalEngine:
                     "vwap_deviation_pct": vwap_deviation_pct,
                     "call_wall": call_wall,
                     "max_gamma_strike": max_gamma_strike,
+                    "gex_by_strike": gex_strike_rows,
+                    "flow_by_type": flow_by_type_rows,
+                    "skew": skew_info,
                 }
 
     def _build_market_context(self, ctx: dict) -> MarketContext:
@@ -256,6 +415,12 @@ class UnifiedSignalEngine:
             extra={
                 "call_wall": ctx.get("call_wall"),
                 "max_gamma_strike": ctx.get("max_gamma_strike"),
+                "gex_by_strike": ctx.get("gex_by_strike") or [],
+                "flow_by_type": ctx.get("flow_by_type") or [],
+                "skew": ctx.get("skew") or {},
+                "put_call_ratio_source": ctx.get("put_call_ratio_source"),
+                "put_call_ratio_volume": ctx.get("put_call_ratio_volume"),
+                "put_call_ratio_oi": ctx.get("put_call_ratio_oi"),
             },
         )
 

@@ -10,7 +10,7 @@ from src.signals.components.base import ComponentBase, MarketContext
 
 class ExhaustionComponent(ComponentBase):
     name = "exhaustion"
-    weight = 0.09
+    weight = 0.05
 
     @staticmethod
     def _compute_rsi(closes: list[float], period: int = 14) -> Optional[float]:

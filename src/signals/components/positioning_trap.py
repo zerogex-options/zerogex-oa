@@ -11,7 +11,7 @@ from src.signals.components.base import ComponentBase, MarketContext
 
 class PositioningTrapComponent(ComponentBase):
     name = "positioning_trap"
-    weight = 0.09
+    weight = 0.06
 
     @staticmethod
     def _momentum(closes: list[float], bars_back: int) -> float:

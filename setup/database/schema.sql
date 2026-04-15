@@ -1133,3 +1133,40 @@ CREATE TABLE IF NOT EXISTS portfolio_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_underlying_ts
     ON portfolio_snapshots(underlying, timestamp DESC);
+
+-- ---------------------------------------------------------------------------
+-- signal_calibration
+-- Walk-forward component weight & normalization calibration storage.
+-- Rows here are optional — the scoring engine will fall back to env/defaults
+-- when no calibration is present. All additions are idempotent so
+-- redeploys are safe.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS signal_calibration (
+    underlying      VARCHAR(10)   NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    component_name  VARCHAR(50)   NOT NULL,
+    window_start    TIMESTAMPTZ   NOT NULL,
+    window_end      TIMESTAMPTZ   NOT NULL,
+    weight          DOUBLE PRECISION,
+    norm_constant   DOUBLE PRECISION,
+    hit_rate        DOUBLE PRECISION,
+    sharpe          DOUBLE PRECISION,
+    sample_size     INTEGER,
+    metadata        JSONB         NOT NULL DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ   DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ   DEFAULT NOW(),
+    PRIMARY KEY (underlying, component_name, window_start)
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_calibration_underlying_component
+    ON signal_calibration(underlying, component_name, window_end DESC);
+
+DROP TRIGGER IF EXISTS update_signal_calibration_updated_at ON signal_calibration;
+CREATE TRIGGER update_signal_calibration_updated_at
+    BEFORE UPDATE ON signal_calibration
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+-- Supplemental index: speeds up per-component lookback queries used by the
+-- new gex_gradient, dealer_delta_pressure, and vanna_charm_flow components.
+CREATE INDEX IF NOT EXISTS idx_signal_component_scores_component_underlying_ts
+    ON signal_component_scores(component_name, underlying, timestamp DESC);

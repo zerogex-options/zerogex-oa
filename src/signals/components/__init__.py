@@ -10,6 +10,12 @@ from src.signals.components.positioning_trap import PositioningTrapComponent
 from src.signals.components.vol_expansion import VolExpansionComponent
 from src.signals.components.exhaustion import ExhaustionComponent
 from src.signals.components.opportunity_quality import OpportunityQualityComponent
+from src.signals.components.gex_gradient import GexGradientComponent
+from src.signals.components.dealer_delta_pressure import DealerDeltaPressureComponent
+from src.signals.components.vanna_charm_flow import VannaCharmFlowComponent
+from src.signals.components.tape_flow_bias import TapeFlowBiasComponent
+from src.signals.components.skew_delta import SkewDeltaComponent
+from src.signals.components.intraday_regime import IntradayRegimeComponent
 
 __all__ = [
     "ComponentBase",
@@ -23,4 +29,10 @@ __all__ = [
     "VolExpansionComponent",
     "ExhaustionComponent",
     "OpportunityQualityComponent",
+    "GexGradientComponent",
+    "DealerDeltaPressureComponent",
+    "VannaCharmFlowComponent",
+    "TapeFlowBiasComponent",
+    "SkewDeltaComponent",
+    "IntradayRegimeComponent",
 ]
