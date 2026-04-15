@@ -11,10 +11,16 @@ pass it to ScoringEngine's constructor. Nothing else changes.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
+from src.config import (
+    SIGNALS_CONVICTION_ABSTAIN_EPSILON,
+    SIGNALS_CONVICTION_AGGREGATION_ENABLED,
+    SIGNALS_CONVICTION_AGREEMENT_MAX_MULT,
+    SIGNALS_CONVICTION_EXTREMITY_MAX_MULT,
+)
 from src.signals.components.base import ComponentBase, MarketContext
 from src.utils import get_logger
 
@@ -29,6 +35,8 @@ class ScoreSnapshot:
     normalized_score: float
     direction: str
     components: dict
+    # Conviction aggregation diagnostics (populated when enabled)
+    aggregation: dict = field(default_factory=dict)
 
 
 class ScoringEngine:
@@ -67,7 +75,8 @@ class ScoringEngine:
                 "score": clamped,
             }
 
-        composite = sum(c.weight * score for c, score in component_results)
+        raw_composite = sum(c.weight * score for c, score in component_results)
+        composite, aggregation = self._aggregate(component_results, raw_composite)
         normalized = abs(composite)
 
         snapshot = ScoreSnapshot(
@@ -77,8 +86,101 @@ class ScoringEngine:
             normalized_score=round(normalized, 6),
             direction=self._direction(composite),
             components=weighted_components,
+            aggregation=aggregation,
         )
         return snapshot, component_results
+
+    # ------------------------------------------------------------------
+    # Conviction aggregation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _aggregate(
+        component_results: list[tuple[ComponentBase, float]],
+        raw_composite: float,
+    ) -> tuple[float, dict]:
+        """Optionally reweight the composite to fight abstention dilution.
+
+        When SIGNALS_CONVICTION_AGGREGATION_ENABLED:
+          1. Renormalize against the sum of weights of *active* components
+             (|score| >= epsilon) so 6 silent components don't drag the
+             composite toward 0.
+          2. Amplify by an agreement factor -- a strong majority in one
+             direction scales the composite up (up to AGREEMENT_MAX_MULT);
+             a tied signal scales it down.
+          3. Amplify by an extremity factor -- when the loudest active
+             component is near the rails, scale the composite further.
+
+        Always clamped to [-1, 1]. Returns (composite, diagnostics_dict).
+        """
+        # Preserve legacy behavior when the flag is off.
+        if not SIGNALS_CONVICTION_AGGREGATION_ENABLED:
+            return raw_composite, {"mode": "legacy_linear"}
+
+        eps = SIGNALS_CONVICTION_ABSTAIN_EPSILON
+        active = [(c, s) for c, s in component_results if abs(s) >= eps]
+        active_weight = sum(c.weight for c, _ in active)
+
+        if not active or active_weight <= 0:
+            return 0.0, {
+                "mode": "conviction",
+                "active_count": 0,
+                "active_weight": 0.0,
+                "agreement_multiplier": 0.0,
+                "extremity_multiplier": 0.0,
+                "raw_composite": round(raw_composite, 6),
+                "renormalized": 0.0,
+            }
+
+        # Renormalize against active weight only.
+        active_numerator = sum(c.weight * s for c, s in active)
+        renormalized = active_numerator / active_weight  # in [-1, 1]
+
+        # Agreement: weighted mass of the majority direction over total
+        # weighted mass of *all* active components (both signs). 0.5 means
+        # a dead tie; 1.0 means unanimous.
+        pos_mass = sum(c.weight * s for c, s in active if s > 0)
+        neg_mass = sum(c.weight * abs(s) for c, s in active if s < 0)
+        total_mass = pos_mass + neg_mass
+        if total_mass <= 0:
+            agreement = 0.5
+        else:
+            agreement = max(pos_mass, neg_mass) / total_mass
+
+        # Map agreement -> multiplier.
+        #   0.50 (tie)        -> 0.50  (dampen)
+        #   0.70              -> ~1.00 (neutral)
+        #   1.00 (unanimous)  -> AGREEMENT_MAX_MULT
+        max_agree = SIGNALS_CONVICTION_AGREEMENT_MAX_MULT
+        if agreement <= 0.5:
+            agreement_mult = 0.5
+        else:
+            # Linear ramp from (0.5, 0.5) to (1.0, max_agree).
+            agreement_mult = 0.5 + (max_agree - 0.5) * ((agreement - 0.5) / 0.5)
+
+        # Extremity: how loud is the single strongest active component?
+        max_abs = max(abs(s) for _, s in active)
+        max_extreme = SIGNALS_CONVICTION_EXTREMITY_MAX_MULT
+        if max_abs <= 0.70:
+            extremity_mult = 1.0
+        else:
+            extremity_mult = 1.0 + (max_extreme - 1.0) * ((max_abs - 0.70) / 0.30)
+
+        composite = renormalized * agreement_mult * extremity_mult
+        composite = max(-1.0, min(1.0, composite))
+
+        diagnostics = {
+            "mode": "conviction",
+            "active_count": len(active),
+            "active_weight": round(active_weight, 4),
+            "raw_composite": round(raw_composite, 6),
+            "renormalized": round(renormalized, 6),
+            "agreement": round(agreement, 4),
+            "agreement_multiplier": round(agreement_mult, 4),
+            "max_abs_component": round(max_abs, 4),
+            "extremity_multiplier": round(extremity_mult, 4),
+        }
+        return composite, diagnostics
 
     def persist(
         self,
@@ -103,6 +205,12 @@ class ScoringEngine:
         conn,
     ) -> None:
         cur = conn.cursor()
+        # Attach aggregation diagnostics inside the components JSON blob so
+        # ops tooling has a single source of truth for each cycle.
+        components_payload = dict(score.components)
+        if score.aggregation:
+            components_payload["__aggregation__"] = score.aggregation
+
         # Upsert into signal_scores
         cur.execute(
             """
@@ -122,7 +230,7 @@ class ScoringEngine:
                 score.composite_score,
                 score.normalized_score,
                 score.direction,
-                json.dumps(score.components, default=str),
+                json.dumps(components_payload, default=str),
             ),
         )
 

@@ -236,6 +236,62 @@ SIGNALS_DRS_HARD_GATES_ENABLED = (
 SIGNALS_DRS_CALL_ENTRY_MIN = float(os.getenv("SIGNALS_DRS_CALL_ENTRY_MIN", "0.40"))
 SIGNALS_DRS_PUT_ENTRY_MAX = float(os.getenv("SIGNALS_DRS_PUT_ENTRY_MAX", "0.20"))
 
+# -----------------------------------------------------------------------------
+# Conviction aggregation -- fights dilution from abstaining components
+# -----------------------------------------------------------------------------
+# When enabled, the ScoringEngine renormalizes the composite against *only*
+# the active (non-abstaining) components, then applies an agreement and an
+# extremity amplifier so that 8 components all screaming the same direction
+# isn't averaged down to 0.2 by 6 quiet ones.
+SIGNALS_CONVICTION_AGGREGATION_ENABLED = (
+    os.getenv("SIGNALS_CONVICTION_AGGREGATION_ENABLED", "true").lower() == "true"
+)
+# Absolute-score cutoff below which a component is treated as abstaining
+# (removed from the active-weight denominator). 0.02 keeps legitimately
+# near-zero directional reads in the pool while dropping hard zeros.
+SIGNALS_CONVICTION_ABSTAIN_EPSILON = float(
+    os.getenv("SIGNALS_CONVICTION_ABSTAIN_EPSILON", "0.02")
+)
+# Maximum multiplier applied when all active components agree in direction.
+SIGNALS_CONVICTION_AGREEMENT_MAX_MULT = float(
+    os.getenv("SIGNALS_CONVICTION_AGREEMENT_MAX_MULT", "1.75")
+)
+# Extremity amplifier: extra boost when the loudest active component is
+# screaming. Applied multiplicatively on top of agreement.
+SIGNALS_CONVICTION_EXTREMITY_MAX_MULT = float(
+    os.getenv("SIGNALS_CONVICTION_EXTREMITY_MAX_MULT", "1.30")
+)
+
+# -----------------------------------------------------------------------------
+# Scalp-tier trigger -- second, lower threshold for reduced-size trades
+# -----------------------------------------------------------------------------
+# When the composite clears SIGNALS_SCALP_TRIGGER_THRESHOLD but not the main
+# SIGNALS_TRIGGER_THRESHOLD, the engine opens a smaller ("scalp") position.
+# This captures the "split-second technical opportunities" use case without
+# requiring conviction-trade strength.
+SIGNALS_SCALP_TRIGGER_ENABLED = (
+    os.getenv("SIGNALS_SCALP_TRIGGER_ENABLED", "true").lower() == "true"
+)
+SIGNALS_SCALP_TRIGGER_THRESHOLD = float(
+    os.getenv("SIGNALS_SCALP_TRIGGER_THRESHOLD", "0.36")
+)
+# Fraction of normal Kelly-based contracts used for scalp-tier trades.
+SIGNALS_SCALP_SIZE_MULTIPLIER = float(
+    os.getenv("SIGNALS_SCALP_SIZE_MULTIPLIER", "0.40")
+)
+
+# -----------------------------------------------------------------------------
+# Strong-conviction DRS override -- lets high-conviction reversals through
+# even when the DRS hard gates would block them (e.g. bearish entry on a day
+# already below the gamma flip, where the "fresh cross" rule fires once).
+# -----------------------------------------------------------------------------
+SIGNALS_DRS_OVERRIDE_ENABLED = (
+    os.getenv("SIGNALS_DRS_OVERRIDE_ENABLED", "true").lower() == "true"
+)
+SIGNALS_DRS_OVERRIDE_THRESHOLD = float(
+    os.getenv("SIGNALS_DRS_OVERRIDE_THRESHOLD", "0.70")
+)
+
 # Stop-loss as a fraction of trade outlay (entry_price * quantity * 100).
 # Default -0.25 means the trade is stopped out when it loses 25% of the
 # initial premium paid (debit trades) or 25% of max-risk (credit trades).

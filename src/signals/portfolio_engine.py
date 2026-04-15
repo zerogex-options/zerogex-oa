@@ -25,11 +25,16 @@ from typing import Optional
 from src.config import (
     SIGNALS_DRS_CALL_ENTRY_MIN,
     SIGNALS_DRS_HARD_GATES_ENABLED,
+    SIGNALS_DRS_OVERRIDE_ENABLED,
+    SIGNALS_DRS_OVERRIDE_THRESHOLD,
     SIGNALS_DRS_PUT_ENTRY_MAX,
     SIGNALS_MAX_OPEN_TRADES,
     SIGNALS_MAX_PORTFOLIO_HEAT_PCT,
     SIGNALS_PORTFOLIO_SIZE,
     SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES,
+    SIGNALS_SCALP_SIZE_MULTIPLIER,
+    SIGNALS_SCALP_TRIGGER_ENABLED,
+    SIGNALS_SCALP_TRIGGER_THRESHOLD,
     SIGNALS_TREND_CONFIRMATION_BARS,
     SIGNALS_TREND_CONFIRMATION_MIN_MATCH,
     SIGNALS_TRIGGER_THRESHOLD,
@@ -100,6 +105,11 @@ class PortfolioEngine:
         self.drs_hard_gates_enabled = SIGNALS_DRS_HARD_GATES_ENABLED
         self.drs_call_entry_min = SIGNALS_DRS_CALL_ENTRY_MIN
         self.drs_put_entry_max = SIGNALS_DRS_PUT_ENTRY_MAX
+        self.drs_override_enabled = SIGNALS_DRS_OVERRIDE_ENABLED
+        self.drs_override_threshold = SIGNALS_DRS_OVERRIDE_THRESHOLD
+        self.scalp_trigger_enabled = SIGNALS_SCALP_TRIGGER_ENABLED
+        self.scalp_trigger_threshold = SIGNALS_SCALP_TRIGGER_THRESHOLD
+        self.scalp_size_multiplier = SIGNALS_SCALP_SIZE_MULTIPLIER
 
     # ------------------------------------------------------------------
     # Connection helper
@@ -127,15 +137,24 @@ class PortfolioEngine:
         the score and market context.  All trade-awareness lives in reconcile().
         """
         threshold = self.trigger_threshold
+        scalp_threshold = (
+            self.scalp_trigger_threshold if self.scalp_trigger_enabled else threshold
+        )
 
-        # --- CASE 1: neutral or below threshold → 100% cash ---
-        if score.direction == "neutral" or score.normalized_score < threshold:
+        # --- CASE 1: neutral or below *scalp* threshold → 100% cash ---
+        # The scalp threshold is the lowest gate we care about; anything
+        # below it is pure cash.
+        if score.direction == "neutral" or score.normalized_score < scalp_threshold:
             return self._cash_target(
                 score,
-                f"Score {score.normalized_score:.3f} below threshold {threshold} / direction neutral",
+                f"Score {score.normalized_score:.3f} below scalp threshold "
+                f"{scalp_threshold:.3f} / direction {score.direction}",
             )
 
         # --- Dynamic threshold adjustment based on IV rank ---
+        # Note: IV-rank adjustment only affects the *full-size* threshold.
+        # The scalp threshold is a floor and is not tightened in high IV --
+        # scalps are smaller and explicitly meant to be high-frequency.
         iv_rank = market_ctx.get("iv_rank")
         effective_threshold = threshold
         if iv_rank is not None:
@@ -144,28 +163,61 @@ class PortfolioEngine:
             elif iv_rank < 0.25:
                 effective_threshold = max(0.52, threshold - 0.04)
 
-        if score.normalized_score < effective_threshold:
-            return self._cash_target(
-                score,
-                f"Score {score.normalized_score:.3f} below IV-adjusted threshold "
-                f"{effective_threshold:.3f} (iv_rank={iv_rank})",
-            )
+        # Classify the tier. The scalp tier runs with reduced sizing and
+        # skips the DRS hard-entry gates (which otherwise block reversals).
+        is_scalp = (
+            self.scalp_trigger_enabled
+            and score.normalized_score < effective_threshold
+            and score.normalized_score >= scalp_threshold
+        )
+        tier_label = "scalp" if is_scalp else "full"
+        size_multiplier = self.scalp_size_multiplier if is_scalp else 1.0
 
         # --- CASE 2: trend confirmation ---
-        if not self._score_trend_confirmation(score.direction, score.timestamp, conn=conn):
+        # Scalps intentionally skip trend confirmation -- the whole point is
+        # to catch fast reversals and mean-reversion, not to require the
+        # preceding bars to agree.
+        if not is_scalp and not self._score_trend_confirmation(
+            score.direction, score.timestamp, conn=conn
+        ):
             return self._cash_target(
                 score,
                 f"Trend confirmation failed: recent history contradicts {score.direction}",
             )
 
         # --- CASE 2B: Dealer Regime hard-entry gates ---
-        passes_drs_gate, drs_reason = self._passes_dealer_regime_gates(score, market_ctx)
+        # Strong-conviction composite overrides the DRS positional gate so
+        # reversal setups on days already past the flip can still fire.
+        drs_override_active = (
+            self.drs_override_enabled
+            and not is_scalp
+            and score.normalized_score >= self.drs_override_threshold
+        )
+        if is_scalp or drs_override_active:
+            passes_drs_gate, drs_reason = True, (
+                "DRS hard gate bypassed: scalp tier"
+                if is_scalp
+                else f"DRS hard gate bypassed: conviction {score.normalized_score:.3f} "
+                f">= override {self.drs_override_threshold:.2f}"
+            )
+        else:
+            passes_drs_gate, drs_reason = self._passes_dealer_regime_gates(
+                score, market_ctx
+            )
         if not passes_drs_gate:
             return self._cash_target(score, drs_reason)
 
         # --- CASE 3: position optimizer candidate ---
+        # Scalp tier forces the intraday DTE window (0-2) regardless of the
+        # score-band mapping, because the whole point of a scalp is to hold
+        # for minutes-to-hours, not days.
+        forced_timeframe = "intraday" if is_scalp else None
         candidate_result = self._select_optimizer_candidate(
-            score, market_ctx, conn=conn, cached_option_rows=cached_option_rows
+            score,
+            market_ctx,
+            conn=conn,
+            cached_option_rows=cached_option_rows,
+            forced_timeframe=forced_timeframe,
         )
         if not candidate_result:
             return self._cash_target(
@@ -185,7 +237,7 @@ class PortfolioEngine:
 
         # --- CASE 4: compute target contracts via Kelly sizing ---
         base_contracts = sizing.contracts
-        contracts = max(1, int(base_contracts * score.normalized_score))
+        contracts = max(1, int(base_contracts * score.normalized_score * size_multiplier))
         contracts = min(contracts, self.max_open_trades)
 
         entry_price = (candidate.entry_debit or candidate.entry_credit) / 100.0
@@ -223,6 +275,8 @@ class PortfolioEngine:
             "expected_value": candidate.expected_value,
             "signal_timeframe": candidate_result["signal_timeframe"],
             "signal_strength": candidate_result["signal_strength"],
+            "tier": tier_label,
+            "size_multiplier": size_multiplier,
         }
 
         target_heat = (
@@ -245,8 +299,9 @@ class PortfolioEngine:
         )
 
         rationale = (
-            f"Score {score.normalized_score:.3f} {score.direction}, "
+            f"Score {score.normalized_score:.3f} {score.direction} [{tier_label}], "
             f"{candidate.strategy_type} {contracts}c Kelly={candidate.kelly_fraction:.1%}"
+            + (" (DRS override)" if drs_override_active else "")
         )
 
         return PortfolioTarget(
@@ -682,9 +737,16 @@ class PortfolioEngine:
         return False, "DRS hard gate blocked: neutral direction"
 
     def _select_optimizer_candidate(
-        self, score: ScoreSnapshot, ctx: dict, conn=None, cached_option_rows=None
+        self,
+        score: ScoreSnapshot,
+        ctx: dict,
+        conn=None,
+        cached_option_rows=None,
+        forced_timeframe: Optional[str] = None,
     ) -> Optional[dict]:
-        signal_timeframe = self._infer_signal_timeframe(score.normalized_score)
+        signal_timeframe = forced_timeframe or self._infer_signal_timeframe(
+            score.normalized_score
+        )
         signal_strength = self._infer_signal_strength(score.normalized_score)
 
         dte_ranges = {"intraday": (0, 2), "swing": (1, 7), "multi_day": (3, 14)}
