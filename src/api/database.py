@@ -1678,6 +1678,7 @@ class DatabaseManager:
                     SUM(CASE WHEN option_type = 'C' THEN sell_premium ELSE 0 END) AS call_sell_premium,
                     SUM(CASE WHEN option_type = 'P' THEN buy_premium ELSE 0 END) AS put_buy_premium,
                     SUM(CASE WHEN option_type = 'P' THEN sell_premium ELSE 0 END) AS put_sell_premium,
+                    SUM(signed_volume)::bigint AS net_volume,
                     MAX(underlying_price) AS underlying_price
                 FROM flow_contract_facts
                 WHERE symbol = $1
@@ -1701,6 +1702,7 @@ class DatabaseManager:
                     COALESCE(a.call_sell_premium, 0) AS call_sell_premium,
                     COALESCE(a.put_buy_premium, 0) AS put_buy_premium,
                     COALESCE(a.put_sell_premium, 0) AS put_sell_premium,
+                    COALESCE(a.net_volume, 0) AS net_volume,
                     COALESCE(
                         a.underlying_price,
                         (
@@ -1723,7 +1725,7 @@ class DatabaseManager:
                     COALESCE(call_premium, 0)::numeric AS call_premium,
                     COALESCE(put_volume, 0)::bigint AS put_volume,
                     COALESCE(put_premium, 0)::numeric AS put_premium,
-                    (COALESCE(call_volume, 0) - COALESCE(put_volume, 0))::bigint AS net_volume,
+                    net_volume::bigint AS net_volume,
                     (
                         (COALESCE(call_buy_volume, 0) - COALESCE(call_sell_volume, 0))
                         - (COALESCE(put_buy_volume, 0) - COALESCE(put_sell_volume, 0))
