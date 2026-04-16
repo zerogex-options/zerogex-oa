@@ -16,7 +16,8 @@ def _score_direction(score: float) -> int:
 def classify_regime(components: Optional[dict[str, Any]]) -> str:
     """Classify broad regime from component payload.
 
-    Uses net GEX when present in components["gex_regime"]["value"].
+    Uses the gex_regime component score. The scoring engine stores per-component
+    data as ``{"weight": ..., "score": ...}``, so we read ``"score"``.
     """
     if not isinstance(components, dict):
         return "unknown"
@@ -25,7 +26,11 @@ def classify_regime(components: Optional[dict[str, Any]]) -> str:
     if not isinstance(gex_component, dict):
         return "unknown"
 
-    value = gex_component.get("value")
+    # The scoring engine persists "score" (clamped raw output); accept "value"
+    # as a legacy fallback.
+    value = gex_component.get("score")
+    if value is None:
+        value = gex_component.get("value")
     try:
         net_gex = float(value)
     except (TypeError, ValueError):

@@ -37,7 +37,7 @@ _SCORE_ROW = {
     "composite_score": 0.72,
     "normalized_score": 0.74,
     "direction": 1,
-    "components": {"gex_regime": {"value": -8.5}},
+    "components": {"gex_regime": {"weight": 0.15, "score": -0.85}},
     "regime": "short_gamma",
     "analytics": {
         "sample_size": 120,
@@ -81,10 +81,33 @@ class TestScoreEndpoint:
         assert resp.status_code == 200
         body = resp.json()
         assert body["underlying"] == "SPY"
-        assert body["composite_score"] == 0.72
+        assert body["composite_score"] == 72.0
         assert body["regime"] == "short_gamma"
         assert body["analytics"]["action"] == "enter"
         mock_db.get_latest_signal_score_enriched.assert_awaited_once_with("SPY")
+
+    def test_aggregation_extracted_from_components(self, client, mock_db):
+        """__aggregation__ should appear as a top-level 'aggregation' key, not inside components."""
+        row_with_agg = {
+            **_SCORE_ROW,
+            "components": {
+                "gex_regime": {"weight": 0.15, "score": -0.85},
+                "__aggregation__": {
+                    "mode": "conviction",
+                    "agreement": 0.57,
+                    "active_count": 10,
+                },
+            },
+        }
+        mock_db.get_latest_signal_score_enriched = AsyncMock(return_value=row_with_agg)
+
+        resp = client.get("/api/signals/score")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "__aggregation__" not in body.get("components", {})
+        assert body["aggregation"]["mode"] == "conviction"
+        assert body["aggregation"]["agreement"] == 0.57
 
     def test_passes_underlying_param(self, client, mock_db):
         mock_db.get_latest_signal_score_enriched = AsyncMock(return_value={**_SCORE_ROW, "underlying": "QQQ"})

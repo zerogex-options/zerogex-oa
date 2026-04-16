@@ -205,8 +205,8 @@ class ScoringEngine:
         conn,
     ) -> None:
         cur = conn.cursor()
-        # Attach aggregation diagnostics inside the components JSON blob so
-        # ops tooling has a single source of truth for each cycle.
+        # Store aggregation diagnostics inside components JSON for persistence
+        # (no schema change needed). The API layer extracts it to a top-level key.
         components_payload = dict(score.components)
         if score.aggregation:
             components_payload["__aggregation__"] = score.aggregation

@@ -2,9 +2,13 @@ from src.api.signal_metrics import calibrate_signal, classify_regime
 
 
 def test_classify_regime_uses_gex_sign():
+    # Legacy "value" key still works
     assert classify_regime({"gex_regime": {"value": -10}}) == "short_gamma"
     assert classify_regime({"gex_regime": {"value": 10}}) == "long_gamma"
     assert classify_regime({"gex_regime": {"value": 0}}) == "neutral_gamma"
+    # Scoring engine's "score" key (primary path)
+    assert classify_regime({"gex_regime": {"weight": 0.15, "score": -0.6}}) == "short_gamma"
+    assert classify_regime({"gex_regime": {"weight": 0.15, "score": 0.4}}) == "long_gamma"
 
 
 def test_calibrate_signal_returns_enter_for_good_edge():

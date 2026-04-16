@@ -55,12 +55,21 @@ def _normalize_signal_components(value: Any) -> Any:
 
 
 def _normalize_signal_score_row(row: dict[str, Any]) -> dict[str, Any]:
-    """Normalize consolidated signal-score payload to [-100, 100]."""
+    """Normalize consolidated signal-score payload to [-100, 100].
+
+    Also extracts the ``__aggregation__`` block from ``components`` into a
+    top-level ``aggregation`` key so the API response keeps signal components
+    and aggregation diagnostics cleanly separated.
+    """
     out = dict(row)
     out["composite_score"] = _scale_signed_100(out.get("composite_score"))
     out["normalized_score"] = _scale_signed_100(out.get("normalized_score"))
-    if "components" in out:
-        out["components"] = _normalize_signal_components(out.get("components"))
+    if "components" in out and isinstance(out["components"], dict):
+        components = dict(out["components"])
+        aggregation = components.pop("__aggregation__", None)
+        out["components"] = _normalize_signal_components(components)
+        if aggregation is not None:
+            out["aggregation"] = aggregation
     return out
 
 
