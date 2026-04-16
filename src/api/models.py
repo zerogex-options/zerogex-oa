@@ -345,6 +345,24 @@ class OptionQuote(BaseModel):
         }
 
 
+class OpenInterestRecord(BaseModel):
+    timestamp: datetime
+    underlying: str
+    strike: Decimal
+    expiration: date
+    option_type: str
+    open_interest: int
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+        json_encoders = {
+            Decimal: lambda v: float(v) if v is not None else None,
+            datetime: lambda v: v.isoformat() if v is not None else None,
+            date: lambda v: v.isoformat() if v is not None else None,
+        }
+
+
 class HealthStatus(BaseModel):
     status: str = Field(..., description="healthy, degraded, or unhealthy")
     database_connected: bool

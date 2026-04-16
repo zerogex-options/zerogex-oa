@@ -32,6 +32,7 @@ from .models import (
     MaxPainCurrent,
     MaxPainTimeseriesPoint,
     OptionQuote,
+    OpenInterestRecord,
 )
 from .routers.trade_signals import router as trade_signals_router
 from .routers.volatility_gauge import router as volatility_gauge_router
@@ -581,6 +582,27 @@ async def get_option_quote(
         raise HTTPException(status_code=400, detail=f"Invalid parameter: {e}")
     except Exception as e:
         logger.error(f"Error fetching option quote: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/api/market/open-interest", response_model=List[OpenInterestRecord], tags=["Market Data"])
+async def get_open_interest(
+    underlying: str = Query(default="SPY", description="Underlying symbol, e.g. SPY"),
+):
+    """Get current open interest for each option contract for the underlying.
+
+    Returns one record per (strike, expiration, option_type) from the most recent
+    option chain snapshot, ordered by expiration, strike, and option type.
+    """
+    try:
+        data = await db_manager.get_open_interest(underlying)
+        if not data:
+            raise HTTPException(status_code=404, detail="No open interest data available")
+        return [OpenInterestRecord(**row) for row in data]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching open interest for {underlying}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 

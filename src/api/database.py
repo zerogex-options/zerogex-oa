@@ -3328,6 +3328,41 @@ class DatabaseManager:
             logger.error(f"Error fetching option quote: {e}", exc_info=True)
             raise
 
+    async def get_open_interest(self, underlying: str) -> List[Dict[str, Any]]:
+        """Get the most recent open interest for every option contract for the underlying.
+
+        Finds the latest ingested snapshot timestamp in option_chains for the given
+        underlying and returns one row per (strike, expiration, option_type) combination
+        from that snapshot, ordered by expiration then strike then option_type.
+        """
+        query = """
+            WITH latest_ts AS (
+                SELECT MAX(timestamp) AS ts
+                FROM option_chains
+                WHERE underlying = $1
+            )
+            SELECT
+                oc.timestamp,
+                oc.underlying,
+                oc.strike,
+                oc.expiration,
+                oc.option_type,
+                oc.open_interest,
+                oc.updated_at
+            FROM option_chains oc
+            JOIN latest_ts lt ON oc.timestamp = lt.ts
+            WHERE oc.underlying = $1
+              AND oc.open_interest IS NOT NULL
+            ORDER BY oc.expiration, oc.strike, oc.option_type
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, underlying)
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error fetching open interest for {underlying}: {e}", exc_info=True)
+            raise
+
     async def get_option_contract_history(
         self,
         underlying: str,
