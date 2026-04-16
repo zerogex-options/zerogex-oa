@@ -290,7 +290,11 @@ class PortfolioEngine:
             option_symbol=primary_symbol,
             option_type=opt_type,
             expiration=candidate.expiry,
-            strike=round(market_ctx["close"], 4),
+            strike=(
+                round(float(enriched_legs[0]["strike"]), 4)
+                if enriched_legs
+                else round(float(market_ctx["close"]), 4)
+            ),
             entry_mark=entry_price,
             probability_of_profit=candidate.probability_of_profit,
             expected_value=candidate.expected_value,

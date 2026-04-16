@@ -4,6 +4,7 @@ from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, patch
 
 from src.signals.portfolio_engine import PortfolioEngine, PortfolioTarget, TargetPosition
+from src.signals.position_optimizer_engine import SpreadCandidate, SizingProfile
 from src.signals.scoring_engine import ScoreSnapshot
 
 
@@ -202,3 +203,75 @@ class TestScalpTierAndDrsOverride:
         # DRS override should fire; cash rationale should be optimizer-based.
         assert "positive-EV" in target.rationale
         assert "DRS hard gate" not in target.rationale
+
+
+class TestTargetPositionStrike:
+    def test_compute_target_uses_candidate_leg_strike_not_underlying_spot(self):
+        engine = _make_engine()
+        score = ScoreSnapshot(
+            timestamp=NOW,
+            underlying="SPY",
+            composite_score=0.9,
+            normalized_score=0.9,
+            direction="bullish",
+            components={"dealer_regime": {"score": 0.8, "weight": 0.12}},
+        )
+        candidate = SpreadCandidate(
+            rank=1,
+            strategy_type="bull_call_debit",
+            expiry=date(2026, 4, 17),
+            dte=1,
+            strikes="Long 705C / Short 710C",
+            option_type="C",
+            entry_debit=250.0,
+            entry_credit=0.0,
+            width=5.0,
+            max_profit=250.0,
+            max_loss=250.0,
+            risk_reward_ratio=1.0,
+            probability_of_profit=0.55,
+            expected_value=20.0,
+            sharpe_like_ratio=0.08,
+            liquidity_score=0.8,
+            net_delta=20.0,
+            net_gamma=1.0,
+            net_theta=-3.0,
+            premium_efficiency=1.0,
+            market_structure_fit=0.8,
+            greek_alignment_score=0.8,
+            edge_score=0.7,
+            kelly_fraction=0.05,
+            sizing_profiles=[
+                SizingProfile(
+                    profile="optimal",
+                    contracts=3,
+                    max_risk_dollars=750.0,
+                    expected_value_dollars=60.0,
+                    constrained_by="kelly",
+                )
+            ],
+        )
+        market_ctx = {
+            "close": 700.79,
+            "net_gex": -1.0e9,
+            "gamma_flip": 699.0,
+            "put_call_ratio": 1.0,
+            "max_pain": 700.0,
+            "smart_call": 0.0,
+            "smart_put": 0.0,
+            "recent_closes": [699.5, 700.2, 700.79],
+            "iv_rank": 0.3,
+        }
+
+        with patch.object(engine, "_passes_dealer_regime_gates", return_value=(True, "ok")), \
+             patch.object(engine, "_score_trend_confirmation", return_value=True), \
+             patch.object(engine, "_select_optimizer_candidate", return_value={
+                 "candidate": candidate,
+                 "signal_timeframe": "intraday",
+                 "signal_strength": "high",
+             }), \
+             patch.object(engine, "_resolve_option_symbol_for_leg", return_value="SPY 260417C705"):
+            target = engine.compute_target(score, market_ctx, conn=MagicMock())
+
+        assert target.target_positions
+        assert target.target_positions[0].strike == 705.0

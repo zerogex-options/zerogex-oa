@@ -57,34 +57,6 @@ class GEXByStrike(BaseModel):
         }
 
 
-class GEXWallLevel(BaseModel):
-    strike: Decimal
-    exposure: Decimal
-    distance_from_spot: Decimal
-    pct_from_spot: Decimal
-
-    class Config:
-        from_attributes = True
-        json_encoders = {
-            Decimal: lambda v: float(v) if v is not None else None,
-        }
-
-
-class GEXWallsResponse(BaseModel):
-    timestamp: datetime
-    symbol: str
-    spot_price: Decimal
-    call_wall: GEXWallLevel
-    put_wall: GEXWallLevel
-
-    class Config:
-        from_attributes = True
-        json_encoders = {
-            Decimal: lambda v: float(v) if v is not None else None,
-            datetime: lambda v: v.isoformat() if v is not None else None,
-        }
-
-
 class OptionFlow(BaseModel):
     time_window_start: datetime
     time_window_end: datetime
@@ -352,7 +324,22 @@ class OpenInterestRecord(BaseModel):
     expiration: date
     option_type: str
     open_interest: int
+    exposure: Decimal
     updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+        json_encoders = {
+            Decimal: lambda v: float(v) if v is not None else None,
+            datetime: lambda v: v.isoformat() if v is not None else None,
+            date: lambda v: v.isoformat() if v is not None else None,
+        }
+
+
+class OpenInterestResponse(BaseModel):
+    underlying: str
+    spot_price: Decimal
+    contracts: list[OpenInterestRecord]
 
     class Config:
         from_attributes = True

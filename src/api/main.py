@@ -19,7 +19,6 @@ from .database import DatabaseManager
 from .models import (
     GEXSummary,
     GEXByStrike,
-    GEXWallsResponse,
     FlowByTypePoint,
     FlowByStrikePoint,
     FlowByExpirationPoint,
@@ -33,6 +32,7 @@ from .models import (
     MaxPainTimeseriesPoint,
     OptionQuote,
     OpenInterestRecord,
+    OpenInterestResponse,
 )
 from .routers.trade_signals import router as trade_signals_router
 from .routers.volatility_gauge import router as volatility_gauge_router
@@ -242,25 +242,6 @@ async def get_gex_heatmap(
         raise
     except Exception as e:
         logger.error(f"Error fetching GEX heatmap: {e!r}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-
-@app.get("/api/gex/walls", response_model=GEXWallsResponse, tags=["GEX"])
-async def get_gex_walls(symbol: str = Query(default="SPY")):
-    """
-    Get dominant call and put wall levels relative to current spot price.
-
-    Walls are aggregated across expirations using directional gamma notional.
-    """
-    try:
-        data = await db_manager.get_gex_walls(symbol)
-        if not data:
-            raise HTTPException(status_code=404, detail="No GEX wall data available")
-        return GEXWallsResponse(**data)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching GEX walls: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -585,7 +566,7 @@ async def get_option_quote(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@app.get("/api/market/open-interest", response_model=List[OpenInterestRecord], tags=["Market Data"])
+@app.get("/api/market/open-interest", response_model=OpenInterestResponse, tags=["Market Data"])
 async def get_open_interest(
     underlying: str = Query(default="SPY", description="Underlying symbol, e.g. SPY"),
 ):
@@ -596,9 +577,13 @@ async def get_open_interest(
     """
     try:
         data = await db_manager.get_open_interest(underlying)
-        if not data:
+        if not data or not data.get("contracts"):
             raise HTTPException(status_code=404, detail="No open interest data available")
-        return [OpenInterestRecord(**row) for row in data]
+        return OpenInterestResponse(
+            underlying=data["underlying"],
+            spot_price=data["spot_price"],
+            contracts=[OpenInterestRecord(**row) for row in data["contracts"]],
+        )
     except HTTPException:
         raise
     except Exception as e:
