@@ -11,7 +11,7 @@ import signal
 import time
 from multiprocessing import Process
 
-from src.config import SIGNALS_UNDERLYINGS
+from src.config import SIGNALS_INTERVAL, SIGNALS_UNDERLYINGS
 from src.signals.unified_signal_engine import UnifiedSignalEngine
 from src.symbols import parse_underlyings
 from src.utils import get_logger
@@ -76,7 +76,7 @@ def _run_for_symbol(symbol: str, interval: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="ZeroGEX Signal Engine service")
     parser.add_argument("--underlying", default=SIGNALS_UNDERLYINGS)
-    parser.add_argument("--interval", type=int, default=300)
+    parser.add_argument("--interval", type=int, default=SIGNALS_INTERVAL)
     args = parser.parse_args()
 
     symbols = parse_underlyings(args.underlying)

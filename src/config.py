@@ -211,6 +211,7 @@ VOL_AUTO_TUNE_MIN_SAMPLES = max(
 # =============================================================================
 
 SIGNALS_UNDERLYINGS = os.getenv("SIGNALS_UNDERLYINGS", "SPY")
+SIGNALS_INTERVAL = max(30, int(os.getenv("SIGNALS_INTERVAL", "300")))
 SIGNALS_PORTFOLIO_SIZE = float(os.getenv("SIGNALS_PORTFOLIO_SIZE", "1000000"))
 POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS = (
     os.getenv("POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS", "false").lower() == "true"
