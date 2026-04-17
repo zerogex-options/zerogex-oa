@@ -2309,6 +2309,7 @@ api-test: ## Test ALL API endpoints
 	test_endpoint "/api/signals/score?underlying=$$SYMBOL"; \
 	test_endpoint "/api/signals/score-history?underlying=$$SYMBOL&limit=20"; \
 	test_endpoint "/api/signals/vol-expansion?symbol=$$SYMBOL"; \
+	test_endpoint "/api/signals/eod-pressure?symbol=$$SYMBOL"; \
 	echo ""; \
 	echo "$(BLUE)=== API Test Report ===$(NC)"; \
 	echo "$(GREEN)Passed: $$PASSED$(NC)"; \

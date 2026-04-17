@@ -39,7 +39,7 @@ _CHARM_AMP_MAX = 1.5
 
 class VannaCharmFlowComponent(ComponentBase):
     name = "vanna_charm_flow"
-    weight = 0.07
+    weight = 0.04
 
     def compute(self, ctx: MarketContext) -> float:
         agg = self._aggregate(ctx)

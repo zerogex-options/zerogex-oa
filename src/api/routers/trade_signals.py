@@ -157,3 +157,42 @@ async def get_vol_expansion_signal(
     row["expansion"] = ctx.get("expansion")
     row["direction_score"] = ctx.get("direction")
     return row
+
+
+@router.get("/eod-pressure")
+async def get_eod_pressure_signal(
+    symbol: str = Query(default="SPY"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Latest end-of-day pressure score from the unified signal engine.
+
+    Combines charm-at-spot flow, gamma-gated pin gravity, and a calendar
+    amplifier (OpEx, quad-witching) into a single directional forecast
+    for the last ~75 minutes of the cash session.
+
+    The component is gated off before 14:30 ET; outside the window the
+    response returns ``score == 0`` with ``time_ramp == 0``.
+
+    Top-level fields:
+      * **score** (-100..+100): Positive => bullish close, negative => bearish.
+      * **direction**: "bullish" / "bearish" / "neutral".
+      * **charm_at_spot**: Signed charm exposure summed across strikes
+        within ±1% of spot.
+      * **pin_target**: Heavy-GEX strike (or max_pain fallback).
+      * **pin_distance_pct**: (pin - spot) / spot.
+      * **gamma_regime**: "positive" / "negative" (flips pin-gravity sign).
+      * **time_ramp** (0..1): Time-to-close scale (0 before T-90min,
+        1.0 by T-15min).
+      * **calendar_flags**: {opex, quad_witching}.
+    """
+    row = await db.get_eod_pressure_signal(symbol.upper())
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No eod-pressure score found for {symbol.upper()}")
+    ctx = row.get("context_values") or {}
+    row["charm_at_spot"] = ctx.get("charm_at_spot")
+    row["pin_target"] = ctx.get("pin_target")
+    row["pin_distance_pct"] = ctx.get("pin_distance_pct")
+    row["gamma_regime"] = ctx.get("gamma_regime")
+    row["time_ramp"] = ctx.get("time_ramp")
+    row["calendar_flags"] = ctx.get("calendar_flags")
+    return row
