@@ -1,33 +1,39 @@
 """
 VIX Ingester
 
-Polls $VIX.X 5-minute bars from TradeStation on a timer and upserts them
-into the `vix_bars` table.  The /api/market/vix endpoint reads from that
-table instead of calling TradeStation directly, so the endpoint stays
-fast and a single running ingestion process keeps the VIX window fresh.
+Streams $VIX.X 5-minute bars from TradeStation's /stream/barcharts endpoint
+and upserts them into the `vix_bars` table.  The /api/market/vix endpoint
+reads from that table instead of calling TradeStation directly, so the
+endpoint stays fast and a single running ingestion process keeps the VIX
+window fresh.
 
 Design notes:
 - 5-minute bars are used because the endpoint's level + momentum scores
   were tuned against 5-minute bars (see volatility_gauge.py).
-- The ingester polls at the same cadence as the main stream loop
-  (MARKET_HOURS_POLL_INTERVAL during regular hours). 5-min bars don't
-  need sub-second latency so polling is simpler than a persistent stream.
-- Each poll fetches the latest ~3 bars so a partial-bar update and any
-  bar we missed on the previous tick both land.
-- Rows older than VIX_BARS_RETENTION_DAYS are pruned after each write
-  to keep the table bounded.
+- The ingester opens a persistent HTTP streaming connection and reads
+  bar payloads as they arrive.  TradeStation's barchart stream sends
+  partial-bar updates and a final payload at bar close, so intraday
+  state always matches what a polling client would observe.
+- On first connect we request VIX_INITIAL_BARSBACK bars to seed the
+  table.  On reconnect we ask for only VIX_POLL_BARSBACK so a short
+  outage still replays the bars we might have missed.
+- Rows older than VIX_BARS_RETENTION_DAYS are pruned periodically to
+  keep the table bounded.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import pytz
+import requests as _requests
 
 from src.ingestion.tradestation_client import TradeStationClient
 from src.database import db_connection, close_connection_pool
@@ -38,11 +44,7 @@ from src.validation import (
     is_engine_run_window,
     seconds_until_engine_run_window,
 )
-from src.config import (
-    MARKET_HOURS_POLL_INTERVAL,
-    EXTENDED_HOURS_POLL_INTERVAL,
-    CLOSED_HOURS_POLL_INTERVAL,
-)
+from src.config import API_REQUEST_TIMEOUT
 
 
 logger = get_logger(__name__)
@@ -52,11 +54,24 @@ ET = pytz.timezone("US/Eastern")
 VIX_SYMBOL = "$VIX.X"
 VIX_BAR_INTERVAL = 5
 VIX_BAR_UNIT = "Minute"
-# Seed enough bars on first run to cover ~2 trading sessions (≈156 bars).
+# Seed enough bars on first connect to cover ~2 trading sessions (≈156 bars).
 VIX_INITIAL_BARSBACK = int(os.getenv("VIX_INITIAL_BARSBACK", "160"))
-# Incremental polls overlap the last few bars so partial-bar updates land.
+# On reconnect, request just enough history to cover short outages.
 VIX_POLL_BARSBACK = int(os.getenv("VIX_POLL_BARSBACK", "3"))
 VIX_BARS_RETENTION_DAYS = int(os.getenv("VIX_BARS_RETENTION_DAYS", "7"))
+
+# How long the stream reader waits for the next event before timing out.
+# Shared env var with the main stream manager so operators tune one knob.
+_STREAM_READ_TIMEOUT = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
+
+# Session template for the bar stream; "Default" matches the prior REST poll.
+_SESSION_TEMPLATE = "Default"
+
+# Backoff between reconnect attempts when the stream drops.
+_RECONNECT_BACKOFF_SEC = 2
+
+# Prune at startup and then roughly every this many bar upserts.
+_PRUNE_EVERY_N_UPSERTS = 120
 
 
 def _parse_bar(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -76,36 +91,43 @@ def _parse_bar(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def _is_auth_error_payload(payload: Dict[str, Any]) -> bool:
+    """Best-effort detection of auth-expiry messages inside stream payloads."""
+    fields = (
+        str(payload.get("Error", "")),
+        str(payload.get("Message", "")),
+        str(payload.get("Description", "")),
+        str(payload.get("Code", "")),
+    )
+    text = " ".join(fields).lower()
+    return any(token in text for token in ("unauthorized", "401", "token", "forbidden"))
+
+
 class VIXIngester:
-    """Polls VIX 5-min bars and persists them to `vix_bars`."""
+    """Streams VIX 5-min bars and persists them to `vix_bars`."""
 
     def __init__(self, client: TradeStationClient):
         self.client = client
         self.running = False
         self._seeded = False
+        self._upserts_since_prune = 0
+        self._current_response: Optional[_requests.Response] = None
+        self._response_lock = threading.Lock()
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
     def _signal_handler(self, signum, frame):
         logger.info("VIX ingester received signal %s, shutting down...", signum)
         self.running = False
+        # Close any in-flight stream so iter_lines returns promptly.
+        with self._response_lock:
+            if self._current_response is not None:
+                try:
+                    self._current_response.close()
+                except Exception:
+                    pass
 
-    def _fetch_bars(self, barsback: int) -> List[Dict[str, Any]]:
-        try:
-            result = self.client.get_bars(
-                symbol=VIX_SYMBOL,
-                interval=VIX_BAR_INTERVAL,
-                unit=VIX_BAR_UNIT,
-                barsback=barsback,
-                sessiontemplate="Default",
-                warn_if_closed=False,
-            )
-        except Exception as e:
-            logger.warning("VIX bar fetch failed: %s", e)
-            return []
-        raw_bars = result.get("Bars", []) if isinstance(result, dict) else []
-        parsed = [b for b in (_parse_bar(r) for r in raw_bars) if b is not None]
-        return parsed
+    # -- DB helpers --------------------------------------------------------
 
     def _upsert_bars(self, bars: List[Dict[str, Any]]) -> int:
         """Upsert a list of VIX bars. Returns the number of rows written."""
@@ -155,29 +177,149 @@ class VIXIngester:
         except Exception as e:
             logger.warning("VIX bar prune failed: %s", e)
 
-    def _poll_once(self) -> None:
-        if not self._seeded:
-            bars = self._fetch_bars(VIX_INITIAL_BARSBACK)
-            written = self._upsert_bars(bars)
-            if written > 0:
-                self._seeded = True
-                logger.info("VIX cache seeded with %d bars", written)
-                self._prune_old_bars()
-            else:
-                logger.warning("VIX seeding returned no bars, will retry next cycle")
+    # -- stream reader -----------------------------------------------------
+
+    def _extract_bars(self, payload: Any) -> List[Dict[str, Any]]:
+        """Normalize the various bar payload shapes TradeStation emits."""
+        if not isinstance(payload, dict):
+            return []
+        if "Bars" in payload and isinstance(payload["Bars"], list):
+            return payload["Bars"]
+        if "Bar" in payload and isinstance(payload["Bar"], dict):
+            return [payload["Bar"]]
+        if "TimeStamp" in payload:
+            return [payload]
+        return []
+
+    def _handle_payload(self, payload: Any) -> None:
+        if isinstance(payload, dict) and _is_auth_error_payload(payload):
+            logger.warning(
+                "VIX stream reported auth error payload; refreshing token and reconnecting"
+            )
+            self.client.auth.force_refresh_access_token()
+            # Closing the response forces iter_lines to exit so we reconnect.
+            with self._response_lock:
+                if self._current_response is not None:
+                    try:
+                        self._current_response.close()
+                    except Exception:
+                        pass
             return
 
-        bars = self._fetch_bars(VIX_POLL_BARSBACK)
-        written = self._upsert_bars(bars)
-        if written > 0:
-            logger.debug("VIX bars upserted: %d", written)
-        # Prune sparingly so we don't hammer the DB.
-        if datetime.now(timezone.utc).minute % 30 == 0:
+        raw_bars = self._extract_bars(payload)
+        if not raw_bars:
+            return
+
+        parsed = [b for b in (_parse_bar(r) for r in raw_bars) if b is not None]
+        written = self._upsert_bars(parsed)
+        if written <= 0:
+            return
+
+        if not self._seeded:
+            self._seeded = True
+            logger.info("VIX cache seeded with %d bars", written)
             self._prune_old_bars()
+            self._upserts_since_prune = 0
+        else:
+            logger.debug("VIX bars upserted: %d", written)
+            self._upserts_since_prune += written
+            if self._upserts_since_prune >= _PRUNE_EVERY_N_UPSERTS:
+                self._prune_old_bars()
+                self._upserts_since_prune = 0
+
+    def _read_stream(self) -> None:
+        """Open one stream connection and read bar events until it ends."""
+        barsback = VIX_POLL_BARSBACK if self._seeded else VIX_INITIAL_BARSBACK
+        url = f"{self.client.base_url}/marketdata/stream/barcharts/{VIX_SYMBOL}"
+        headers = self.client.auth.get_headers()
+        params = {
+            "interval": str(VIX_BAR_INTERVAL),
+            "unit": VIX_BAR_UNIT,
+            "barsback": str(barsback),
+            "sessiontemplate": _SESSION_TEMPLATE,
+        }
+
+        response = _requests.get(
+            url,
+            headers=headers,
+            params=params,
+            stream=True,
+            timeout=(API_REQUEST_TIMEOUT, _STREAM_READ_TIMEOUT),
+        )
+
+        try:
+            if response.status_code == 401:
+                response.close()
+                logger.warning(
+                    "VIX stream: 401 auth failure, forcing token refresh and retrying"
+                )
+                self.client.auth.force_refresh_access_token()
+                return
+            response.raise_for_status()
+        except Exception:
+            response.close()
+            raise
+
+        logger.info(
+            "VIX stream: connected (HTTP %s, barsback=%d)",
+            response.status_code,
+            barsback,
+        )
+
+        with self._response_lock:
+            self._current_response = response
+
+        heartbeat_count = 0
+        data_line_count = 0
+
+        try:
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if not self.running:
+                    break
+                if not raw_line:
+                    continue
+                line = (
+                    raw_line.strip()
+                    if isinstance(raw_line, str)
+                    else raw_line.decode("utf-8", errors="ignore").strip()
+                )
+                if not line:
+                    continue
+                if line in ("[DONE]", "heartbeat"):
+                    heartbeat_count += 1
+                    if heartbeat_count % 50 == 0:
+                        logger.debug(
+                            "VIX stream: %d heartbeats, %d data lines so far",
+                            heartbeat_count,
+                            data_line_count,
+                        )
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if not line:
+                    continue
+
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "VIX stream: JSON decode failed, skipping line: %s",
+                        line[:200],
+                    )
+                    continue
+
+                data_line_count += 1
+                self._handle_payload(payload)
+        finally:
+            with self._response_lock:
+                self._current_response = None
+            response.close()
+
+    # -- run loop ----------------------------------------------------------
 
     def run(self) -> None:
         logger.info("=" * 80)
-        logger.info("VIX INGESTER — polling %s bars every poll interval", VIX_SYMBOL)
+        logger.info("VIX INGESTER — streaming %s %d-%s bars", VIX_SYMBOL, VIX_BAR_INTERVAL, VIX_BAR_UNIT)
         logger.info("=" * 80)
 
         self.running = True
@@ -189,33 +331,28 @@ class VIXIngester:
                         "VIX ingester paused outside run window; sleeping %ss",
                         sleep_for,
                     )
-                    time.sleep(max(1, sleep_for))
+                    # Sleep in short chunks so shutdown signals stay responsive.
+                    slept = 0
+                    target = max(1, sleep_for)
+                    while slept < target and self.running:
+                        time.sleep(1)
+                        slept += 1
                     continue
 
                 try:
-                    self._poll_once()
+                    self._read_stream()
                 except Exception as e:
-                    logger.error("VIX poll iteration error: %s", e, exc_info=True)
-
-                # Reuse the main engine's poll cadence so the VIX window
-                # stays as fresh as the underlying streams.
-                if self.client.is_market_open(check_extended=False):
-                    wait = MARKET_HOURS_POLL_INTERVAL
-                elif self.client.is_market_open(check_extended=True):
-                    wait = EXTENDED_HOURS_POLL_INTERVAL
-                else:
-                    wait = CLOSED_HOURS_POLL_INTERVAL
-
-                # During regular/extended hours the bar only advances every 5
-                # min, so there's no value in polling faster than ~30s.
-                wait = max(wait, 30)
-
-                # Sleep in short chunks so shutdown signals are responsive.
-                slept = 0
-                while slept < wait and self.running:
-                    chunk = min(1, wait - slept)
-                    time.sleep(chunk)
-                    slept += chunk
+                    if self.running:
+                        logger.warning(
+                            "VIX stream disconnected (%s), reconnecting in %ds...",
+                            e,
+                            _RECONNECT_BACKOFF_SEC,
+                        )
+                        # Responsive sleep so SIGTERM interrupts the backoff.
+                        slept = 0
+                        while slept < _RECONNECT_BACKOFF_SEC and self.running:
+                            time.sleep(1)
+                            slept += 1
 
         except Exception as e:
             logger.error("Fatal error in VIX ingester: %s", e, exc_info=True)
