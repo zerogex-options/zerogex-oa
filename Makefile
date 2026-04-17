@@ -1765,7 +1765,7 @@ signals-fresh-start: ## Clear historic signal-trade state (signal_trades + portf
 	@read -p "Are you sure? Type 'yes' to confirm: " confirm; \
 	if [ "$$confirm" = "yes" ]; then \
 		echo "$(YELLOW)Deleting signal trade history tables...$(NC)"; \
-		$(PSQL) -c "DELETE FROM signal_trades; DELETE FROM portfolio_snapshots; DELETE FROM signal_engine_trade_ideas;"; \
+		$(PSQL) -v ON_ERROR_STOP=1 -c "DELETE FROM signal_trades; DELETE FROM portfolio_snapshots; DO $$$$ BEGIN IF to_regclass('public.signal_engine_trade_ideas') IS NOT NULL THEN EXECUTE 'DELETE FROM signal_engine_trade_ideas'; END IF; END $$$$;"; \
 		echo "$(GREEN)✅ Signal trade history cleared (fresh start).$(NC)"; \
 	else \
 		echo "$(RED)❌ Aborted$(NC)"; \
