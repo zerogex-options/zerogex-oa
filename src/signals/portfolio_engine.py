@@ -486,13 +486,13 @@ class PortfolioEngine:
 
     def _close_trade(self, trade: dict, as_of: datetime, conn) -> float:
         """Close an open trade at current mark. Returns realized PnL."""
-        mark = self._latest_option_mark(trade["option_symbol"], as_of, conn)
+        mark, pricing_mode = self._spread_mark(trade, as_of, conn)
         if mark is None:
             mark = trade["current_price"]
 
         entry = trade["entry_price"]
         qty = trade["quantity_open"]
-        realized_pnl = (mark - entry) * qty * 100
+        realized_pnl = self._spread_pnl(entry, mark, qty, pricing_mode)
 
         cur = conn.cursor()
         cur.execute(
@@ -573,13 +573,13 @@ class PortfolioEngine:
 
     def _update_trade_mark(self, trade: dict, as_of: datetime, conn) -> None:
         """Refresh unrealized PnL for an open trade."""
-        mark = self._latest_option_mark(trade["option_symbol"], as_of, conn)
+        mark, pricing_mode = self._spread_mark(trade, as_of, conn)
         if mark is None:
             return
 
         entry = trade["entry_price"]
         qty = trade["quantity_open"]
-        unrealized = (mark - entry) * qty * 100
+        unrealized = self._spread_pnl(entry, mark, qty, pricing_mode)
         realized = trade["realized_pnl"]
         total = realized + unrealized
         basis_qty = max(trade["quantity_initial"], 1)
@@ -723,6 +723,61 @@ class PortfolioEngine:
         )
         row = cur.fetchone()
         return float(row[0]) if row and row[0] is not None else None
+
+    def _spread_mark(
+        self, trade: dict, as_of: datetime, conn
+    ) -> tuple[Optional[float], str]:
+        """Mark the spread using every leg, matching how entry debit/credit was formed.
+
+        Entry debit (bull_call_debit, bear_put_debit) was computed in the optimizer
+        as ``long_mid - short_mid``. Entry credit (bull_put_credit, bear_call_credit,
+        iron_condor) was computed as ``short_mid - long_mid``. We mirror that here
+        so the current per-share value is directly comparable to ``entry_price``.
+
+        Returns (value_per_share, pricing_mode). ``pricing_mode`` is "debit" or
+        "credit"; on missing/partial chain data returns ``(None, pricing_mode)``.
+        """
+        payload = (trade.get("components_at_entry") or {}).get("optimizer") or {}
+        legs = payload.get("legs") or []
+        pricing_mode = payload.get("pricing_mode") or "debit"
+
+        if not legs:
+            mark = self._latest_option_mark(trade["option_symbol"], as_of, conn)
+            return mark, pricing_mode
+
+        long_sum = 0.0
+        short_sum = 0.0
+        for leg in legs:
+            symbol = leg.get("option_symbol")
+            if not symbol:
+                return None, pricing_mode
+            mid = self._latest_option_mark(symbol, as_of, conn)
+            if mid is None:
+                return None, pricing_mode
+            side = str(leg.get("side") or "").lower()
+            if side == "long":
+                long_sum += mid
+            elif side == "short":
+                short_sum += mid
+            else:
+                return None, pricing_mode
+
+        if pricing_mode == "credit":
+            return short_sum - long_sum, pricing_mode
+        return long_sum - short_sum, pricing_mode
+
+    @staticmethod
+    def _spread_pnl(entry: float, mark: float, qty: int, pricing_mode: str) -> float:
+        """Signed dollar P&L for the spread at ``mark`` vs ``entry`` per-share.
+
+        Debit spreads are held long: value up => profit. Credit spreads are held
+        short: cost-to-close down => profit, so the sign inverts.
+        """
+        if pricing_mode == "credit":
+            per_share = entry - mark
+        else:
+            per_share = mark - entry
+        return per_share * qty * 100
 
     def _score_trend_confirmation(
         self, direction: str, as_of: datetime, conn=None

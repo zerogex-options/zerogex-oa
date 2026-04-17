@@ -2,13 +2,23 @@ from src.api.signal_metrics import calibrate_signal, classify_regime
 
 
 def test_classify_regime_uses_gex_sign():
-    # Legacy "value" key still works
+    # Legacy "value" key held raw net_gex (positive => long_gamma).
     assert classify_regime({"gex_regime": {"value": -10}}) == "short_gamma"
     assert classify_regime({"gex_regime": {"value": 10}}) == "long_gamma"
     assert classify_regime({"gex_regime": {"value": 0}}) == "neutral_gamma"
-    # Scoring engine's "score" key (primary path)
-    assert classify_regime({"gex_regime": {"weight": 0.15, "score": -0.6}}) == "short_gamma"
-    assert classify_regime({"gex_regime": {"weight": 0.15, "score": 0.4}}) == "long_gamma"
+    # Scoring engine's "score" is -tanh(net_gex / norm), so its sign is the
+    # OPPOSITE of net_gex. Positive score => net_gex negative => short_gamma.
+    assert classify_regime({"gex_regime": {"weight": 0.15, "score": 0.6}}) == "short_gamma"
+    assert classify_regime({"gex_regime": {"weight": 0.15, "score": -0.4}}) == "long_gamma"
+    assert classify_regime({"gex_regime": {"weight": 0.15, "score": 0.0}}) == "neutral_gamma"
+
+
+def test_classify_regime_matches_positive_net_gex_as_long_gamma():
+    # Regression: Net GEX = +$1.0B should classify as long_gamma, not short_gamma.
+    # With GEX_NORM = 2.5e8, score = -tanh(1e9 / 2.5e8) ~= -0.9993.
+    import math
+    score = -math.tanh(1.0e9 / 2.5e8)
+    assert classify_regime({"gex_regime": {"score": score}}) == "long_gamma"
 
 
 def test_calibrate_signal_returns_enter_for_good_edge():

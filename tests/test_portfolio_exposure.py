@@ -3,6 +3,8 @@
 from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src.signals.portfolio_engine import PortfolioEngine, PortfolioTarget, TargetPosition
 from src.signals.position_optimizer_engine import SpreadCandidate, SizingProfile
 from src.signals.scoring_engine import ScoreSnapshot
@@ -427,3 +429,76 @@ class TestTradeSlotsAndContractSizing:
         assert action == "held_max_open_trades"
         open_position.assert_not_called()
         snapshot.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# _spread_mark / _spread_pnl
+# ---------------------------------------------------------------------------
+
+
+class TestSpreadPricing:
+    """Spread P&L must price every leg, not just the primary long leg.
+
+    Regression for the bug where a bull_call_debit trade marked at the long
+    call's absolute mid ($5) was compared against the net debit entry ($2.50),
+    producing phantom profits on every update even when the underlying dropped.
+    """
+
+    def _debit_trade(self) -> dict:
+        # Bull call debit: long 500C @ $3.00, short 505C @ $0.50, net debit $2.50
+        trade = _make_trade(entry_price=2.5)
+        trade["components_at_entry"] = {
+            "optimizer": {
+                "pricing_mode": "debit",
+                "legs": [
+                    {"side": "long", "option_symbol": "SPY 260410C500"},
+                    {"side": "short", "option_symbol": "SPY 260410C505"},
+                ],
+            }
+        }
+        return trade
+
+    def test_debit_spread_marks_with_both_legs(self):
+        engine = _make_engine()
+        # Long leg rises to 3.40, short leg rises to 0.70 => net value 2.70 (+$0.20).
+        marks = {"SPY 260410C500": 3.40, "SPY 260410C505": 0.70}
+        with patch.object(engine, "_latest_option_mark", side_effect=lambda sym, *a, **kw: marks[sym]):
+            value, mode = engine._spread_mark(self._debit_trade(), NOW, conn=MagicMock())
+        assert mode == "debit"
+        assert value == pytest.approx(2.70)
+
+    def test_debit_spread_pnl_matches_both_legs(self):
+        # Entry $2.50, current $2.70, 2 contracts => ($2.70 - $2.50) * 2 * 100 = $40.
+        assert PortfolioEngine._spread_pnl(
+            entry=2.5, mark=2.7, qty=2, pricing_mode="debit"
+        ) == pytest.approx(40.0)
+
+    def test_debit_spread_pnl_goes_negative_when_underlying_drops(self):
+        # If the long leg's mid drops faster than the short leg's on a -0.3%
+        # move, the net debit value falls below entry and P&L must be negative.
+        assert PortfolioEngine._spread_pnl(
+            entry=2.5, mark=2.3, qty=10, pricing_mode="debit"
+        ) == pytest.approx(-200.0)
+
+    def test_credit_spread_pnl_inverts_sign(self):
+        # Sold the spread for $1.20 credit; cost to close has fallen to $0.40.
+        # Closing profit = ($1.20 - $0.40) * 5 * 100 = $400.
+        assert PortfolioEngine._spread_pnl(
+            entry=1.2, mark=0.4, qty=5, pricing_mode="credit"
+        ) == pytest.approx(400.0)
+
+    def test_legacy_trade_without_legs_falls_back_to_single_leg(self):
+        engine = _make_engine()
+        trade = _make_trade(entry_price=2.0)
+        trade["components_at_entry"] = {}  # no optimizer payload
+        with patch.object(engine, "_latest_option_mark", return_value=1.75):
+            value, mode = engine._spread_mark(trade, NOW, conn=MagicMock())
+        assert value == 1.75
+        assert mode == "debit"
+
+    def test_missing_leg_mark_returns_none(self):
+        engine = _make_engine()
+        with patch.object(engine, "_latest_option_mark", return_value=None):
+            value, mode = engine._spread_mark(self._debit_trade(), NOW, conn=MagicMock())
+        assert value is None
+        assert mode == "debit"

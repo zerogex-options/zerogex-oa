@@ -3639,8 +3639,8 @@ class DatabaseManager:
                     ss.timestamp,
                     ss.composite_score,
                     CASE
-                        WHEN COALESCE((ss.components -> 'gex_regime' ->> 'value')::double precision, 0.0) < 0 THEN 'short_gamma'
-                        WHEN COALESCE((ss.components -> 'gex_regime' ->> 'value')::double precision, 0.0) > 0 THEN 'long_gamma'
+                        WHEN COALESCE((ss.components -> 'gex_regime' ->> 'score')::double precision, 0.0) > 0 THEN 'short_gamma'
+                        WHEN COALESCE((ss.components -> 'gex_regime' ->> 'score')::double precision, 0.0) < 0 THEN 'long_gamma'
                         ELSE 'neutral_gamma'
                     END AS regime,
                     q0.close AS close_at_signal,
