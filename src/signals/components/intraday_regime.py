@@ -24,7 +24,7 @@ from src.signals.components.base import ComponentBase, MarketContext
 
 class IntradayRegimeComponent(ComponentBase):
     name = "intraday_regime"
-    weight = 0.05
+    weight = 0.02
 
     def compute(self, ctx: MarketContext) -> float:
         phase = self._phase(ctx.timestamp)
