@@ -257,7 +257,6 @@ class PortfolioEngine:
         # --- CASE 4: compute target contracts via Kelly sizing ---
         base_contracts = sizing.contracts
         contracts = max(1, int(base_contracts * score.normalized_score * size_multiplier))
-        contracts = min(contracts, self.max_open_trades)
 
         entry_price = (candidate.entry_debit or candidate.entry_credit) / 100.0
         opt_type = "C" if score.direction == "bullish" else "P"
@@ -352,6 +351,7 @@ class PortfolioEngine:
             open_trades = self._fetch_open_trades(c)
             actual_contracts = sum(t["quantity_open"] for t in open_trades)
             actual_direction = self._majority_direction(open_trades)
+            open_trade_count = len(open_trades)
 
             market_status = self._market_status()
             if market_status != "OPEN":
@@ -413,12 +413,22 @@ class PortfolioEngine:
             elif actual_contracts > 0 and actual_direction == target_direction:
                 contracts_delta = target_contracts - actual_contracts
                 if contracts_delta > 0:
-                    self._open_position(target.target_positions[0], target, c)
-                    action = "added"
-                    action_detail = {
-                        "added_contracts": contracts_delta,
-                        "new_total": target_contracts,
-                    }
+                    if open_trade_count >= self.max_open_trades:
+                        action = "held_max_open_trades"
+                        action_detail = {
+                            "reason": "Max open trade slots reached",
+                            "max_open_trades": self.max_open_trades,
+                            "open_trade_count": open_trade_count,
+                            "target_contracts": target_contracts,
+                            "actual_contracts": actual_contracts,
+                        }
+                    else:
+                        self._open_position(target.target_positions[0], target, c)
+                        action = "added"
+                        action_detail = {
+                            "added_contracts": contracts_delta,
+                            "new_total": target_contracts,
+                        }
                 elif contracts_delta < 0:
                     # Partially close oldest trades first
                     to_close = abs(contracts_delta)
@@ -447,13 +457,22 @@ class PortfolioEngine:
 
             # CASE D: no open trades, target has position
             elif actual_contracts == 0 and target.target_positions:
-                self._open_position(target.target_positions[0], target, c)
-                action = "opened"
-                action_detail = {
-                    "contracts": target_contracts,
-                    "direction": target_direction,
-                    "strategy": target.target_positions[0].strategy_type,
-                }
+                if open_trade_count >= self.max_open_trades:
+                    action = "held_max_open_trades"
+                    action_detail = {
+                        "reason": "Max open trade slots reached",
+                        "max_open_trades": self.max_open_trades,
+                        "open_trade_count": open_trade_count,
+                        "target_contracts": target_contracts,
+                    }
+                else:
+                    self._open_position(target.target_positions[0], target, c)
+                    action = "opened"
+                    action_detail = {
+                        "contracts": target_contracts,
+                        "direction": target_direction,
+                        "strategy": target.target_positions[0].strategy_type,
+                    }
 
             # Re-fetch to get accurate state for snapshot
             open_trades_after = self._fetch_open_trades(c)

@@ -306,6 +306,7 @@ help: ## Show this help message
 	@echo "  make signals-history          - Managed trade history with outcomes + P&L"
 	@echo "  make signals-wipe-open        - Delete all OPEN signal trades (with confirmation)"
 	@echo "  make signals-wipe-all         - Delete ALL signal trades (with confirmation)"
+	@echo "  make signals-fresh-start      - Clear historical signal-trade state for a fresh run"
 	@echo "  make signals-trades           - Latest managed trades from signal_engine_trade_ideas"
 	@echo "  make signals-trades-raw       - Raw managed-trade rows from signal_engine_trade_ideas"
 	@echo "  make signals-all-symbols      - Latest consolidated signal for every tracked symbol"
@@ -1754,6 +1755,18 @@ signals-wipe-all: ## Delete ALL signal trades (open + closed) (with confirmation
 		echo "$(YELLOW)Deleting all signal trades...$(NC)"; \
 		$(PSQL) -c "DELETE FROM signal_trades;"; \
 		echo "$(GREEN)✅ All signal trades deleted$(NC)"; \
+	else \
+		echo "$(RED)❌ Aborted$(NC)"; \
+	fi
+
+.PHONY: signals-fresh-start
+signals-fresh-start: ## Clear historic signal-trade state (signal_trades + portfolio_snapshots + signal_engine_trade_ideas)
+	@echo "$(RED)⚠️  WARNING: This will delete historical signal-trade records for a fresh start.$(NC)"
+	@read -p "Are you sure? Type 'yes' to confirm: " confirm; \
+	if [ "$$confirm" = "yes" ]; then \
+		echo "$(YELLOW)Deleting signal trade history tables...$(NC)"; \
+		$(PSQL) -c "DELETE FROM signal_trades; DELETE FROM portfolio_snapshots; DELETE FROM signal_engine_trade_ideas;"; \
+		echo "$(GREEN)✅ Signal trade history cleared (fresh start).$(NC)"; \
 	else \
 		echo "$(RED)❌ Aborted$(NC)"; \
 	fi
