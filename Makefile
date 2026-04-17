@@ -2274,6 +2274,7 @@ api-test: ## Test ALL API endpoints
 	test_endpoint "/api/option/quote?underlying=$$SYMBOL&type=C"; \
 	test_endpoint "/api/technicals/dealer-hedging?symbol=$$SYMBOL&limit=10"; \
 	test_endpoint "/api/technicals/volume-spikes?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "/api/technicals/eod-pressure?symbol=$$SYMBOL"; \
 	test_endpoint "/docs"; \
 	test_endpoint "/redoc"; \
 	test_endpoint "/openapi.json"; \

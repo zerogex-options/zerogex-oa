@@ -190,6 +190,22 @@ Get momentum divergence signals.
 - `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `1min`
 - `window_units` (optional): max `90`, default `20`
 
+### GET /api/technicals/eod-pressure
+Latest end-of-day pressure score, combining charm-at-spot flow, gamma-gated pin gravity, and a calendar amplifier (OpEx / quad-witching). Gated off before 14:30 ET; returns `score == 0` with `time_ramp == 0` outside the window.
+
+**Parameters:**
+- `symbol` (optional): default `SPY`
+
+**Response (top-level fields):**
+- `score` (-100..+100): composite EOD pressure (positive = bullish close)
+- `direction`: `"bullish"` / `"bearish"` / `"neutral"`
+- `charm_at_spot`: signed charm aggregate within ±1% of spot
+- `pin_target`: heavy-GEX strike (max_pain fallback)
+- `pin_distance_pct`: `(pin - spot) / spot`
+- `gamma_regime`: `"positive"` / `"negative"`
+- `time_ramp` (0..1): time-to-close scale
+- `calendar_flags`: `{opex, quad_witching}`
+
 ---
 
 ## Interactive API Docs
