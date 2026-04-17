@@ -122,28 +122,6 @@ class AnalyticsEngine:
                         ORDER BY uq.timestamp DESC
                         LIMIT 1
                     ),
-                    latest_snapshot AS (
-                        SELECT
-                            oc.option_symbol,
-                            oc.strike,
-                            oc.expiration,
-                            oc.option_type,
-                            oc.last,
-                            oc.bid,
-                            oc.ask,
-                            oc.volume,
-                            oc.open_interest,
-                            oc.delta,
-                            oc.gamma,
-                            oc.theta,
-                            oc.vega,
-                            oc.implied_volatility,
-                            oc.timestamp
-                        FROM option_chains oc, latest_ts lt
-                        WHERE oc.underlying = %s
-                          AND oc.timestamp = lt.ts
-                          AND oc.gamma IS NOT NULL
-                    ),
                     latest_per_contract AS (
                         SELECT DISTINCT ON (oc.option_symbol)
                             oc.option_symbol,
@@ -166,39 +144,33 @@ class AnalyticsEngine:
                           AND oc.timestamp <= lt.ts
                           AND oc.timestamp >= (lt.ts - (%s * INTERVAL '1 minute'))
                           AND oc.gamma IS NOT NULL
-                          AND NOT EXISTS (SELECT 1 FROM latest_snapshot)
                         ORDER BY oc.option_symbol, oc.timestamp DESC
-                    ),
-                    selected_rows AS (
-                        SELECT * FROM latest_snapshot
-                        UNION ALL
-                        SELECT * FROM latest_per_contract
                     )
                     SELECT
                         lt.ts,
                         u.close,
-                        sr.option_symbol,
-                        sr.strike,
-                        sr.expiration,
-                        sr.option_type,
-                        sr.last,
-                        sr.bid,
-                        sr.ask,
-                        sr.volume,
-                        sr.open_interest,
-                        sr.delta,
-                        sr.gamma,
-                        sr.theta,
-                        sr.vega,
-                        sr.implied_volatility,
-                        sr.timestamp
+                        lpc.option_symbol,
+                        lpc.strike,
+                        lpc.expiration,
+                        lpc.option_type,
+                        lpc.last,
+                        lpc.bid,
+                        lpc.ask,
+                        lpc.volume,
+                        lpc.open_interest,
+                        lpc.delta,
+                        lpc.gamma,
+                        lpc.theta,
+                        lpc.vega,
+                        lpc.implied_volatility,
+                        lpc.timestamp
                     FROM latest_ts lt
                     LEFT JOIN underlying u ON TRUE
-                    LEFT JOIN selected_rows sr ON TRUE
+                    LEFT JOIN latest_per_contract lpc ON TRUE
                     WHERE lt.ts IS NOT NULL
-                    ORDER BY sr.expiration, sr.strike
+                    ORDER BY lpc.expiration, lpc.strike
                     LIMIT 2000
-                """, (self.db_symbol, self.db_symbol, self.db_symbol, self.db_symbol, self.snapshot_lookback_minutes))
+                """, (self.db_symbol, self.db_symbol, self.db_symbol, self.snapshot_lookback_minutes))
 
                 rows = cursor.fetchall()
                 conn.commit()
@@ -743,6 +715,29 @@ class AnalyticsEngine:
                 )
             return
         try:
+            gamma_flip_point = summary.get('gamma_flip_point')
+            if gamma_flip_point is None:
+                cursor.execute(
+                    """
+                    SELECT gamma_flip_point
+                    FROM gex_summary
+                    WHERE underlying = %s
+                      AND gamma_flip_point IS NOT NULL
+                      AND timestamp < %s
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                    """,
+                    (summary['underlying'], summary['timestamp']),
+                )
+                prev_row = cursor.fetchone()
+                if prev_row and prev_row[0] is not None:
+                    gamma_flip_point = float(prev_row[0])
+                    logger.info(
+                        "Gamma flip carry-forward applied: using prior value %.4f at %s",
+                        gamma_flip_point,
+                        summary['timestamp'],
+                    )
+
             cursor.execute("""
                 INSERT INTO gex_summary
                 (underlying, timestamp, max_gamma_strike, max_gamma_value,
@@ -776,7 +771,7 @@ class AnalyticsEngine:
                 summary['timestamp'],
                 float(summary['max_gamma_strike']),
                 float(summary['max_gamma_value']),
-                float(summary['gamma_flip_point']) if summary['gamma_flip_point'] else None,
+                gamma_flip_point,
                 float(summary['put_call_ratio']),
                 float(summary['max_pain']),
                 int(summary['total_call_volume']),

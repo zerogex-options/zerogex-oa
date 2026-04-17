@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from unittest.mock import MagicMock
 
 from src.analytics.main_engine import AnalyticsEngine
 
@@ -57,3 +58,59 @@ def test_gamma_flip_interpolates_between_sign_change_strikes():
     ]
     flip = engine._calculate_gamma_flip_point(gex, underlying_price=105.0)
     assert flip == 105.0
+
+
+def test_store_gex_summary_carries_forward_previous_gamma_flip_when_missing():
+    engine = AnalyticsEngine(underlying="SPY")
+    conn = MagicMock()
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (501.25,)
+
+    summary = {
+        "underlying": "SPY",
+        "timestamp": datetime(2026, 4, 17, 14, 30, tzinfo=timezone.utc),
+        "max_gamma_strike": 500.0,
+        "max_gamma_value": 1234.0,
+        "gamma_flip_point": None,
+        "put_call_ratio": 0.9,
+        "max_pain": 505.0,
+        "total_call_volume": 1000,
+        "total_put_volume": 900,
+        "total_call_oi": 2000,
+        "total_put_oi": 1800,
+        "total_net_gex": 555.0,
+    }
+
+    engine._store_gex_summary(summary, conn=conn, cursor=cursor, commit=False)
+
+    # First execute fetches prior non-null gamma flip.
+    assert cursor.execute.call_count >= 2
+    insert_args = cursor.execute.call_args_list[-1][0][1]
+    assert insert_args[4] == 501.25
+
+
+def test_store_gex_summary_keeps_current_gamma_flip_when_present():
+    engine = AnalyticsEngine(underlying="SPY")
+    conn = MagicMock()
+    cursor = MagicMock()
+
+    summary = {
+        "underlying": "SPY",
+        "timestamp": datetime(2026, 4, 17, 14, 31, tzinfo=timezone.utc),
+        "max_gamma_strike": 500.0,
+        "max_gamma_value": 1234.0,
+        "gamma_flip_point": 499.75,
+        "put_call_ratio": 0.9,
+        "max_pain": 505.0,
+        "total_call_volume": 1000,
+        "total_put_volume": 900,
+        "total_call_oi": 2000,
+        "total_put_oi": 1800,
+        "total_net_gex": 555.0,
+    }
+
+    engine._store_gex_summary(summary, conn=conn, cursor=cursor, commit=False)
+
+    # No carry-forward SELECT when current gamma flip exists.
+    insert_args = cursor.execute.call_args_list[-1][0][1]
+    assert insert_args[4] == 499.75
