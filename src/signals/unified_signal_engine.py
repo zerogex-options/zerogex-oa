@@ -14,6 +14,7 @@ from src.database import db_connection
 from src.signals.components.base import MarketContext
 from src.signals.components.dealer_delta_pressure import DealerDeltaPressureComponent
 from src.signals.components.dealer_regime import DealerRegimeComponent
+from src.signals.components.eod_pressure import EODPressureComponent
 from src.signals.components.exhaustion import ExhaustionComponent
 from src.signals.components.gamma_flip import GammaFlipComponent
 from src.signals.components.gex_gradient import GexGradientComponent
@@ -58,6 +59,7 @@ class UnifiedSignalEngine:
                 TapeFlowBiasComponent(),
                 SkewDeltaComponent(),
                 IntradayRegimeComponent(),
+                EODPressureComponent(),
             ],
         )
 

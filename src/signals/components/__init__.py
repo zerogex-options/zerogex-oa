@@ -16,6 +16,7 @@ from src.signals.components.vanna_charm_flow import VannaCharmFlowComponent
 from src.signals.components.tape_flow_bias import TapeFlowBiasComponent
 from src.signals.components.skew_delta import SkewDeltaComponent
 from src.signals.components.intraday_regime import IntradayRegimeComponent
+from src.signals.components.eod_pressure import EODPressureComponent
 
 __all__ = [
     "ComponentBase",
@@ -35,4 +36,5 @@ __all__ = [
     "TapeFlowBiasComponent",
     "SkewDeltaComponent",
     "IntradayRegimeComponent",
+    "EODPressureComponent",
 ]
