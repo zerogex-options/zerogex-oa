@@ -93,7 +93,7 @@ app = FastAPI(
         {"name": "Options Flow", "description": "Options flow and buying pressure data"},
         {"name": "Market Data", "description": "Underlying and option quote data"},
         {"name": "Max Pain", "description": "Max pain analysis"},
-        {"name": "Day Trading", "description": "Intraday trading signals: VWAP, ORB, dealer hedging, volume, momentum"},
+        {"name": "Technicals", "description": "Intraday technical signals: VWAP, ORB, dealer hedging, volume, momentum"},
         {"name": "Trade Signals", "description": "Composite trade signal generation"},
     ]
 )
@@ -629,10 +629,10 @@ async def get_max_pain_current(
 
 
 # ============================================================================
-# Day Trading Endpoints
+# Technicals Endpoints
 # ============================================================================
 
-@app.get("/api/trading/vwap-deviation", tags=["Day Trading"])
+@app.get("/api/technicals/vwap-deviation", tags=["Technicals"])
 async def get_vwap_deviation(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
@@ -650,7 +650,7 @@ async def get_vwap_deviation(
         logger.error(f"Error fetching VWAP deviation: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/trading/opening-range", tags=["Day Trading"])
+@app.get("/api/technicals/opening-range", tags=["Technicals"])
 async def get_opening_range(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
@@ -668,7 +668,7 @@ async def get_opening_range(
         logger.error(f"Error fetching ORB: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/trading/dealer-hedging", tags=["Day Trading"])
+@app.get("/api/technicals/dealer-hedging", tags=["Technicals"])
 async def get_dealer_hedging(
     symbol: str = Query(default="SPY"),
     limit: int = Query(default=20, le=100)
@@ -685,7 +685,7 @@ async def get_dealer_hedging(
         logger.error(f"Error fetching dealer hedging: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/trading/volume-spikes", tags=["Day Trading"])
+@app.get("/api/technicals/volume-spikes", tags=["Technicals"])
 async def get_volume_spikes(
     symbol: str = Query(default="SPY"),
     limit: int = Query(default=20, le=100)
@@ -702,7 +702,7 @@ async def get_volume_spikes(
         logger.error(f"Error fetching volume spikes: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/trading/momentum-divergence", response_model=List[MomentumDivergencePoint], tags=["Day Trading"])
+@app.get("/api/technicals/momentum-divergence", response_model=List[MomentumDivergencePoint], tags=["Technicals"])
 async def get_momentum_divergence(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),

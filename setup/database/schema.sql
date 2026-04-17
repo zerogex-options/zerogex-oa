@@ -540,7 +540,7 @@ DROP VIEW IF EXISTS flow_smart_money_1day CASCADE;
 DROP VIEW IF EXISTS option_flow_smart_money CASCADE;
 
 -- =============================================================================
--- Flow buying pressure + day-trading views (kept)
+-- Flow buying pressure + technicals views (kept)
 -- =============================================================================
 
 DROP VIEW IF EXISTS underlying_daily_volume CASCADE;
@@ -570,7 +570,7 @@ SELECT
 FROM underlying_quotes q;
 
 -- =============================================================================
--- Day-trading views (Makefile + API)
+-- Technicals views (Makefile + API)
 -- =============================================================================
 DROP VIEW IF EXISTS underlying_vwap_deviation CASCADE;
 CREATE VIEW underlying_vwap_deviation AS

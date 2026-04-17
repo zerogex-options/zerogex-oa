@@ -21,7 +21,7 @@ This deployment system automates the complete setup of ZeroGEX-OA including:
 - Provides REST API for frontend with 15+ endpoints
   - GEX metrics (summary, by-strike, historical)
   - Options flow (by type, by strike, smart money)
-  - Day trading signals (VWAP, ORB, gamma levels, dealer hedging, volume spikes, momentum divergence)
+  - Technicals (VWAP, ORB, gamma levels, dealer hedging, volume spikes, momentum divergence)
   - Market data (current quote, historical)
 
 ## Prerequisites
@@ -246,7 +246,7 @@ curl http://localhost:8000/api/gex/summary | jq
 - GEX Summary: `/api/gex/summary`
 - GEX by Strike: `/api/gex/by-strike`
 - Options Flow: `/api/flow/by-type`, `/api/flow/by-strike`, `/api/flow/smart-money`
-- Day Trading: `/api/trading/vwap-deviation`, `/api/trading/opening-range`, `/api/trading/gamma-levels`, etc
+- Technicals: `/api/technicals/vwap-deviation`, `/api/technicals/opening-range`, `/api/technicals/gamma-levels`, etc
 .
 - Market Data: `/api/market/quote`, `/api/market/historical`
 
@@ -705,7 +705,7 @@ The schema uses **regular views** (not materialized) for real-time data access w
 - `option_flow_smart_money` - Unusual activity detection
 - `underlying_buying_pressure` - Directional flow
 
-**Day Trading Views:**
+**Technicals Views:**
 - `underlying_vwap_deviation` - Mean reversion signals
 - `opening_range_breakout` - ORB tracking
 - `gamma_exposure_levels` - Support/resistance from GEX
@@ -743,7 +743,7 @@ The API uses:
 - GEX summary: 20-50ms
 - GEX by strike: 30-80ms
 - Flow views: 40-100ms
-- Day trading views: 50-150ms
+- Technicals views: 50-150ms
 
 **Optimization Tips:**
 - Use appropriate `limit` parameters
