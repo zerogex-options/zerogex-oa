@@ -275,3 +275,42 @@ class TestTargetPositionStrike:
 
         assert target.target_positions
         assert target.target_positions[0].strike == 705.0
+
+
+class TestMarketStatusGate:
+    def test_market_status_open_within_regular_options_window(self):
+        status = PortfolioEngine._market_status(datetime(2026, 4, 6, 14, 0, tzinfo=timezone.utc))
+        assert status == "OPEN"
+
+    def test_market_status_closed_after_1615_et(self):
+        status = PortfolioEngine._market_status(datetime(2026, 4, 6, 20, 16, tzinfo=timezone.utc))
+        assert status == "CLOSED"
+
+    def test_reconcile_holds_when_market_closed(self):
+        engine = _make_engine()
+        target = PortfolioTarget(
+            underlying="SPY",
+            timestamp=NOW,
+            composite_score=0.8,
+            normalized_score=0.8,
+            direction="bullish",
+            target_positions=[],
+            total_target_contracts=0,
+            target_heat_pct=0.0,
+            rationale="test target",
+        )
+        open_trade = _make_trade(quantity_open=1)
+
+        with patch.object(engine, "_market_status", return_value="CLOSED"), \
+             patch.object(engine, "_fetch_open_trades", return_value=[open_trade]), \
+             patch.object(engine, "_update_trade_mark") as update_mark, \
+             patch.object(engine, "snapshot") as snapshot, \
+             patch.object(engine, "_close_trade") as close_trade, \
+             patch.object(engine, "_open_position") as open_position:
+            action = engine.reconcile(target, conn=MagicMock())
+
+        assert action == "held_market_closed"
+        update_mark.assert_called_once()
+        close_trade.assert_not_called()
+        open_position.assert_not_called()
+        snapshot.assert_called_once()

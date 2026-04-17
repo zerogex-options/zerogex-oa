@@ -48,6 +48,7 @@ from src.signals.position_optimizer_engine import (
 from src.signals.scoring_engine import ScoreSnapshot
 from src.symbols import get_canonical_symbol
 from src.utils import get_logger
+from src.validation import ET, NYSE_HOLIDAYS
 
 logger = get_logger(__name__)
 
@@ -110,6 +111,24 @@ class PortfolioEngine:
         self.scalp_trigger_enabled = SIGNALS_SCALP_TRIGGER_ENABLED
         self.scalp_trigger_threshold = SIGNALS_SCALP_TRIGGER_THRESHOLD
         self.scalp_size_multiplier = SIGNALS_SCALP_SIZE_MULTIPLIER
+
+    @staticmethod
+    def _market_status(dt: Optional[datetime] = None) -> str:
+        """Return OPEN only during regular options trading hours (09:30-16:15 ET)."""
+        if dt is None:
+            dt = datetime.now(ET)
+        elif dt.tzinfo is None:
+            dt = ET.localize(dt)
+        else:
+            dt = dt.astimezone(ET)
+
+        if dt.weekday() > 4 or dt.date() in NYSE_HOLIDAYS:
+            return "CLOSED"
+
+        current_time = dt.time()
+        market_open = datetime.strptime("09:30:00", "%H:%M:%S").time()
+        market_close = datetime.strptime("16:15:00", "%H:%M:%S").time()
+        return "OPEN" if market_open <= current_time <= market_close else "CLOSED"
 
     # ------------------------------------------------------------------
     # Connection helper
@@ -333,6 +352,22 @@ class PortfolioEngine:
             open_trades = self._fetch_open_trades(c)
             actual_contracts = sum(t["quantity_open"] for t in open_trades)
             actual_direction = self._majority_direction(open_trades)
+
+            market_status = self._market_status()
+            if market_status != "OPEN":
+                for trade in open_trades:
+                    self._update_trade_mark(trade, target.timestamp, c)
+                action = "held_market_closed"
+                action_detail = {
+                    "market_status": market_status,
+                    "reason": "Signal trades are only allowed during OPEN market status (09:30-16:15 ET).",
+                    "target_direction": target.direction,
+                    "target_contracts": target.total_target_contracts,
+                    "actual_contracts": actual_contracts,
+                    "actual_direction": actual_direction,
+                }
+                self.snapshot(target, action, action_detail, open_trades, c)
+                return action
 
             target_contracts = target.total_target_contracts
             target_direction = target.direction if target.target_positions else "neutral"
