@@ -1780,7 +1780,7 @@ signals-fresh-start: ## Clear historic signal-trade state (signal_trades + portf
 signals-history: ## Closed trade history with outcomes and PnL
 	@$(eval LIMIT ?= 100)
 	@echo "$(BLUE)=== Closed Signal Trades ($(FLOW_SYMBOL), limit=$(LIMIT)) ===$(NC)"
-	@$(PSQL) -c "SELECT underlying, signal_timestamp AT TIME ZONE 'America/New_York' AS signal_time_et, opened_at AT TIME ZONE 'America/New_York' AS opened_et, closed_at AT TIME ZONE 'America/New_York' AS closed_et, direction, option_symbol, entry_price, current_price, quantity_initial, realized_pnl, unrealized_pnl, total_pnl, pnl_percent, CASE WHEN total_pnl > 0 THEN 'win' WHEN total_pnl < 0 THEN 'loss' ELSE 'flat' END AS outcome FROM signal_trades WHERE status='closed' AND underlying='$(FLOW_SYMBOL)' ORDER BY closed_at DESC LIMIT $(LIMIT);"
+	@$(PSQL) -c "SELECT underlying, signal_timestamp AT TIME ZONE 'America/New_York' AS signal_time_et, opened_at AT TIME ZONE 'America/New_York' AS opened_et, closed_at AT TIME ZONE 'America/New_York' AS closed_et, direction, option_symbol, entry_price, current_price, quantity_initial, realized_pnl, unrealized_pnl, total_pnl, pnl_percent, CASE WHEN total_pnl > 0 THEN 'win' WHEN total_pnl < 0 THEN 'loss' ELSE 'flat' END AS outcome FROM signal_trades WHERE status='closed' ORDER BY closed_at DESC LIMIT $(LIMIT);"
 
 .PHONY: signals-score
 signals-score: ## Latest score snapshot from DB
@@ -1791,7 +1791,7 @@ signals-score: ## Latest score snapshot from DB
 signals-score-history: ## Score history from DB
 	@$(eval LIMIT ?= 100)
 	@echo "$(BLUE)=== Signal Score History ($(FLOW_SYMBOL), limit=$(LIMIT)) ===$(NC)"
-	@$(PSQL) -c "SELECT underlying, timestamp AT TIME ZONE 'America/New_York' AS time_et, direction, composite_score, normalized_score FROM signal_scores WHERE underlying='$(FLOW_SYMBOL)' ORDER BY timestamp DESC LIMIT $(LIMIT);"
+	@$(PSQL) -c "SELECT underlying, timestamp AT TIME ZONE 'America/New_York' AS time_et, direction, composite_score, normalized_score FROM signal_scores WHERE ORDER BY timestamp DESC LIMIT $(LIMIT);"
 
 .PHONY: signals-vol-expansion
 signals-vol-expansion: ## Latest volatility-expansion score (0-100) from signal_component_scores
