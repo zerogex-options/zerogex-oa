@@ -187,6 +187,36 @@ BEGIN
     END IF;
 END $$;
 
+-- =============================================================================
+-- VIX rolling window of 5-minute bars — used by /api/market/vix endpoint
+-- (level score uses latest close; momentum score needs a multi-bar window).
+-- Populated by the ingestion engine's VIX poller.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS vix_bars (
+    timestamp TIMESTAMPTZ PRIMARY KEY,
+    open NUMERIC(10, 4),
+    high NUMERIC(10, 4),
+    low NUMERIC(10, 4),
+    close NUMERIC(10, 4) NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_vix_bars_timestamp ON vix_bars(timestamp DESC);
+
+-- =============================================================================
+-- TradeStation API call counts per 5-minute UTC window.
+-- Each ingestion process upserts its window count at window rollover; the
+-- ON CONFLICT clause sums counts across processes that share the same window.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS tradestation_api_calls (
+    window_start TIMESTAMPTZ PRIMARY KEY,
+    call_count BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tradestation_api_calls_window_start
+    ON tradestation_api_calls(window_start DESC);
+
 CREATE TABLE IF NOT EXISTS gex_summary (
     underlying VARCHAR(10) NOT NULL,
     timestamp TIMESTAMPTZ NOT NULL,
@@ -284,6 +314,18 @@ CREATE TRIGGER update_underlying_quotes_updated_at
 DROP TRIGGER IF EXISTS update_option_chains_updated_at ON option_chains;
 CREATE TRIGGER update_option_chains_updated_at
     BEFORE UPDATE ON option_chains
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_vix_bars_updated_at ON vix_bars;
+CREATE TRIGGER update_vix_bars_updated_at
+    BEFORE UPDATE ON vix_bars
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_tradestation_api_calls_updated_at ON tradestation_api_calls;
+CREATE TRIGGER update_tradestation_api_calls_updated_at
+    BEFORE UPDATE ON tradestation_api_calls
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 

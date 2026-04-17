@@ -1021,12 +1021,15 @@ def main():
         sys.exit(1)
 
     def run_for_symbol(symbol: str):
+        from src.ingestion.api_call_tracker import attach_db_writer
+
         client = TradeStationClient(
             os.getenv("TRADESTATION_CLIENT_ID"),
             os.getenv("TRADESTATION_CLIENT_SECRET"),
             os.getenv("TRADESTATION_REFRESH_TOKEN"),
             sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true"
         )
+        attach_db_writer(client)
         engine = IngestionEngine(
             client=client,
             underlying=symbol,
@@ -1035,17 +1038,32 @@ def main():
         )
         engine.run()
 
-    if len(symbols) == 1:
+    def run_vix_ingester():
+        from src.ingestion.vix_ingester import main as vix_main
+        vix_main()
+
+    # Always run the VIX ingester alongside the per-symbol engines so that
+    # /api/market/vix can read from `vix_bars` without hitting TradeStation.
+    vix_enabled = os.getenv("INGEST_VIX_ENABLED", "true").lower() != "false"
+
+    if len(symbols) == 1 and not vix_enabled:
         run_for_symbol(symbols[0])
         return
 
     logger.info(f"Starting ingestion engines for symbols: {', '.join(symbols)}")
+    if vix_enabled:
+        logger.info("Starting VIX ingester alongside symbol engines")
     processes: List[Process] = []
 
     for symbol in symbols:
         process = Process(target=run_for_symbol, args=(symbol,), name=f"ingest-{symbol}")
         process.start()
         processes.append(process)
+
+    if vix_enabled:
+        vix_process = Process(target=run_vix_ingester, name="ingest-vix")
+        vix_process.start()
+        processes.append(vix_process)
 
     def shutdown_children(signum, frame):
         logger.info(f"Received signal {signum}, terminating ingestion workers...")

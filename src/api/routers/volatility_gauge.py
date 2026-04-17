@@ -7,21 +7,20 @@ Returns $VIX.X metrics as two scored dimensions:
   - level    (0–10): Current VIX reading expressed on a log scale anchored to
                      historical percentiles — where VIX sits right now.
   - momentum (0–10): Weighted rate-of-change of VIX across five time scales,
-                     normalised to ±2σ — which direction and how fast VIX is
+                     normalised to ±4σ — which direction and how fast VIX is
                      moving relative to its own recent behaviour.
 
-Cache behaviour
----------------
-* First call after startup: fetches ~2 trading sessions (≈156 bars) of 5-min
-  $VIX.X bars from TradeStation and stores them in memory.
-* Subsequent calls: fetches only the latest 5-min bar and appends it.
-* Cache is trimmed after every update so it never reaches back further than
-  2 regular trading sessions (Mon–Fri, 9:30–16:00 ET).
+Data source
+-----------
+* Reads the rolling window of 5-minute VIX bars from the `vix_bars` table.
+* The table is populated by the ingestion engine (see
+  src/ingestion/vix_ingester.py), so this endpoint never calls TradeStation
+  directly.
+* Only bars within the 2 most-recent regular trading sessions are used for
+  scoring.
 """
 
-import os
 import asyncio
-import threading
 import math
 import logging
 from datetime import datetime, timedelta, date
@@ -31,8 +30,7 @@ import pytz
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from src.ingestion.tradestation_client import TradeStationClient
-from src.validation import safe_float
+from src.database import db_connection
 
 logger = logging.getLogger(__name__)
 
@@ -40,42 +38,9 @@ router = APIRouter(prefix="/api/market", tags=["Market Data"])
 
 ET = pytz.timezone("US/Eastern")
 
-# ============================================================================
-# In-memory cache
-# ============================================================================
-
-_vix_bars: List[Dict[str, Any]] = []   # sorted ascending by "timestamp"
-_cache_initialized: bool = False
-_cache_lock = threading.Lock()          # guards _vix_bars and _cache_initialized
-
-# asyncio-level lock prevents concurrent initial fetches when multiple requests
-# arrive before the cache is warm.  Created lazily on first request so we stay
-# inside the running event loop.
-_async_init_lock: Optional[asyncio.Lock] = None
-
-
-def _get_async_init_lock() -> asyncio.Lock:
-    global _async_init_lock
-    if _async_init_lock is None:
-        _async_init_lock = asyncio.Lock()
-    return _async_init_lock
-
 
 # ============================================================================
-# TradeStation client factory
-# ============================================================================
-
-def _make_ts_client() -> TradeStationClient:
-    return TradeStationClient(
-        client_id=os.getenv("TRADESTATION_CLIENT_ID", ""),
-        client_secret=os.getenv("TRADESTATION_CLIENT_SECRET", ""),
-        refresh_token=os.getenv("TRADESTATION_REFRESH_TOKEN", ""),
-        sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true",
-    )
-
-
-# ============================================================================
-# Cache helpers
+# Session helpers
 # ============================================================================
 
 def _session_start(d: date) -> datetime:
@@ -100,95 +65,42 @@ def _two_session_cutoff() -> datetime:
     return _session_start(d)
 
 
-def _parse_bar(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Convert a raw TradeStation bar dict into our internal format."""
-    ts_str = raw.get("TimeStamp") or raw.get("timestamp")
-    if not ts_str:
-        return None
-    try:
-        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-        ts = ts.astimezone(ET)
-    except (ValueError, TypeError):
-        return None
-
-    close = safe_float(raw.get("Close"), field_name="Close")
-    if close is None:
-        return None
-
-    return {
-        "timestamp": ts,
-        "open":  safe_float(raw.get("Open"),  field_name="Open"),
-        "high":  safe_float(raw.get("High"),  field_name="High"),
-        "low":   safe_float(raw.get("Low"),   field_name="Low"),
-        "close": close,
-    }
-
-
-def _dedup_and_sort() -> None:
-    """Deduplicate by timestamp and sort ascending. Caller must hold _cache_lock."""
-    global _vix_bars
-    by_ts: Dict[datetime, Dict[str, Any]] = {}
-    for b in _vix_bars:
-        by_ts[b["timestamp"]] = b
-    _vix_bars = sorted(by_ts.values(), key=lambda x: x["timestamp"])
-
-
-def _trim_cache() -> None:
-    """Drop bars older than 2 trading sessions. Caller must hold _cache_lock."""
-    global _vix_bars
-    cutoff = _two_session_cutoff()
-    _vix_bars = [b for b in _vix_bars if b["timestamp"] >= cutoff]
-
-
 # ============================================================================
-# Blocking fetch functions (run in executor so they don't stall the loop)
+# DB read
 # ============================================================================
 
-def _do_initial_fetch() -> None:
-    """Fetch ~2 sessions (156 bars) of 5-min $VIX.X bars and populate cache."""
-    global _vix_bars, _cache_initialized
-    client = _make_ts_client()
-    result = client.get_bars(
-        symbol="$VIX.X",
-        interval=5,
-        unit="Minute",
-        barsback=156,
-        sessiontemplate="Default",
-        warn_if_closed=False,
-    )
-    raw_bars = result.get("Bars", [])
-    parsed = [b for b in (_parse_bar(r) for r in raw_bars) if b is not None]
-    with _cache_lock:
-        _vix_bars = parsed
-        _dedup_and_sort()
-        _trim_cache()
-        _cache_initialized = True
-    logger.info("VIX cache initialised with %d bars", len(_vix_bars))
+def _load_bars_from_db(cutoff: datetime) -> List[Dict[str, Any]]:
+    """
+    Load VIX 5-min bars >= *cutoff* from the database, sorted ascending.
 
+    Returned dicts use the same shape as the previous in-memory cache so the
+    scoring functions can stay untouched.
+    """
+    with db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT timestamp, open, high, low, close
+            FROM vix_bars
+            WHERE timestamp >= %s
+            ORDER BY timestamp ASC
+            """,
+            (cutoff,),
+        )
+        rows = cursor.fetchall()
 
-def _do_incremental_fetch() -> None:
-    """Fetch the latest 5-min bar and append it to the cache if it is new."""
-    client = _make_ts_client()
-    result = client.get_bars(
-        symbol="$VIX.X",
-        interval=5,
-        unit="Minute",
-        barsback=2,          # grab 2 to guard against partial-bar edge cases
-        sessiontemplate="Default",
-        warn_if_closed=False,
-    )
-    raw_bars = result.get("Bars", [])
-    parsed = [b for b in (_parse_bar(r) for r in raw_bars) if b is not None]
-    if not parsed:
-        return
-    with _cache_lock:
-        last_ts = _vix_bars[-1]["timestamp"] if _vix_bars else None
-        for bar in parsed:
-            if last_ts is None or bar["timestamp"] > last_ts:
-                _vix_bars.append(bar)
-                last_ts = bar["timestamp"]
-        _trim_cache()
-    logger.debug("VIX cache updated, now %d bars", len(_vix_bars))
+    bars: List[Dict[str, Any]] = []
+    for ts, op, hi, lo, cl in rows:
+        # Postgres TIMESTAMPTZ already carries tz info; normalise to ET.
+        ts_et = ts.astimezone(ET) if ts.tzinfo else ET.localize(ts)
+        bars.append({
+            "timestamp": ts_et,
+            "open": float(op) if op is not None else None,
+            "high": float(hi) if hi is not None else None,
+            "low": float(lo) if lo is not None else None,
+            "close": float(cl),
+        })
+    return bars
 
 
 # ============================================================================
@@ -225,17 +137,16 @@ def _momentum(bars: List[Dict[str, Any]]) -> float:
        windows.  Weights are distributed across short and medium-term horizons
        so that a single noisy bar does not dominate the reading.
     2. Normalise the composite RoC by the rolling 1-bar RoC std derived from
-       the cache itself (realised per-bar volatility of VIX).
+       the window itself (realised per-bar volatility of VIX).
     3. Map the z-score using a ±4σ range so that only truly extreme moves
-       reach the extremes (e.g. market dropping whole percentage points in
-       minutes):
+       reach the extremes:
          z = –4 → 0   (sharply falling)
          z =  0 → 5   (flat / stable)
          z = +4 → 10  (sharply rising)
        Clamped to [0, 10].
 
     Lookback windows (5-min bars) and weights:
-      1 bar  ( 5 min) → 0.15   reduced vs. prior to limit single-bar noise
+      1 bar  ( 5 min) → 0.15
       3 bars (15 min) → 0.20
       6 bars (30 min) → 0.25
       12 bars ( 1 hr) → 0.25
@@ -247,7 +158,6 @@ def _momentum(bars: List[Dict[str, Any]]) -> float:
     closes = [b["close"] for b in bars]
     current = closes[-1]
 
-    # Weights rebalanced: short-term bias removed, medium-term windows dominate
     windows = [(1, 0.15), (3, 0.20), (6, 0.25), (12, 0.25), (26, 0.15)]
     composite_roc = 0.0
     total_weight = 0.0
@@ -265,7 +175,7 @@ def _momentum(bars: List[Dict[str, Any]]) -> float:
     # Re-normalise so weights of available windows sum to 1
     composite_roc /= total_weight
 
-    # Rolling 1-bar RoC standard deviation (from all bars in cache)
+    # Rolling 1-bar RoC standard deviation (from all bars in window)
     one_bar_rocs = []
     for i in range(1, len(closes)):
         prev = closes[i - 1]
@@ -281,7 +191,7 @@ def _momentum(bars: List[Dict[str, Any]]) -> float:
         variance = sum((x - mean) ** 2 for x in one_bar_rocs) / (n - 1)
         sigma = max(math.sqrt(variance) if variance > 0 else 0.001, 0.001)
 
-    # Map ±4σ → 0–10 (widened from ±2σ to reduce sensitivity further)
+    # Map ±4σ → 0–10
     z_score = composite_roc / sigma
     score = 5.0 + 1.25 * z_score
     return round(max(0.0, min(10.0, score)), 2)
@@ -339,15 +249,15 @@ class VolatilityGaugeResponse(BaseModel):
 
     momentum: float = Field(
         description=(
-            "VIX rate-of-change mapped to 0–10 (±2σ range). "
-            "0 = collapsing (–2σ), 5 = stable, 10 = surging (+2σ)."
+            "VIX rate-of-change mapped to 0–10 (±4σ range). "
+            "0 = collapsing, 5 = stable, 10 = surging."
         )
     )
     momentum_label: str = Field(
         description="Human-readable label: Collapsing / Easing / Stable / Rising / Surging"
     )
 
-    cache_bars: int = Field(description="5-min bars currently held in the in-memory cache")
+    cache_bars: int = Field(description="5-min bars used from vix_bars for this response")
     latest_bars: List[VIXBar] = Field(
         description="Most-recent 10 bars for debugging / charting", default_factory=list
     )
@@ -376,63 +286,41 @@ async def get_volatility_gauge():
 
     **Momentum** — *which direction and how fast is VIX moving?*
     Weighted composite rate-of-change across five time scales (5 min through
-    2 hrs), normalised against realised per-bar volatility of VIX.  Scaled so
-    that ±2σ maps to the full 0–10 range, meaning routine intraday moves stay
-    in the middle band and only genuine trend moves reach the extremes:
-    - `0–2`  → Collapsing (fear unwinding sharply, –2σ)
-    - `2–4`  → Easing     (vol declining)
-    - `4–6`  → Stable     (no meaningful directional move)
-    - `6–8`  → Rising     (vol building)
-    - `8–10` → Surging    (fear spiking hard, +2σ)
+    2 hrs), normalised against realised per-bar volatility of VIX.
 
-    **Cache behaviour** — on the first call after startup the endpoint fetches
-    ≈2 full trading sessions of 5-min VIX bars and stores them in memory.
-    Every subsequent call fetches only the latest bar and appends it; bars
-    older than 2 trading sessions are automatically pruned.
+    **Data source** — reads the rolling 5-min VIX bar window maintained by
+    the ingestion engine's VIX poller from the `vix_bars` table.
     """
-    global _cache_initialized
+    cutoff = _two_session_cutoff()
 
     loop = asyncio.get_event_loop()
-    init_lock = _get_async_init_lock()
-
-    if not _cache_initialized:
-        async with init_lock:
-            # Re-check inside the lock — another coroutine may have finished
-            # the initial fetch while we were waiting.
-            if not _cache_initialized:
-                try:
-                    await loop.run_in_executor(None, _do_initial_fetch)
-                except Exception as exc:
-                    logger.error("VIX initial fetch failed: %s", exc)
-                    raise HTTPException(
-                        status_code=503,
-                        detail="Unable to initialise VIX data cache. Check TradeStation credentials."
-                    )
-    else:
-        try:
-            await loop.run_in_executor(None, _do_incremental_fetch)
-        except Exception as exc:
-            # Log but don't fail — serve stale data rather than 503
-            logger.warning("VIX incremental fetch failed (serving cached data): %s", exc)
-
-    with _cache_lock:
-        bars_snapshot = list(_vix_bars)
-
-    if not bars_snapshot:
+    try:
+        bars = await loop.run_in_executor(None, _load_bars_from_db, cutoff)
+    except Exception as exc:
+        logger.error("VIX DB read failed: %s", exc)
         raise HTTPException(
             status_code=503,
-            detail="VIX data unavailable — cache is empty"
+            detail="Unable to read VIX data from database.",
         )
 
-    latest = bars_snapshot[-1]
+    if not bars:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "VIX data unavailable — vix_bars table is empty. "
+                "Check that the ingestion engine's VIX poller is running."
+            ),
+        )
+
+    latest = bars[-1]
     vix_close = latest["close"]
 
-    lvl  = _level(vix_close)
-    mom  = _momentum(bars_snapshot)
+    lvl = _level(vix_close)
+    mom = _momentum(bars)
 
     recent_bars = [
         VIXBar(timestamp=b["timestamp"], close=b["close"])
-        for b in bars_snapshot[-10:]
+        for b in bars[-10:]
     ]
 
     return VolatilityGaugeResponse(
@@ -442,6 +330,6 @@ async def get_volatility_gauge():
         level_label=_level_label(lvl),
         momentum=mom,
         momentum_label=_momentum_label(mom),
-        cache_bars=len(bars_snapshot),
+        cache_bars=len(bars),
         latest_bars=recent_bars,
     )

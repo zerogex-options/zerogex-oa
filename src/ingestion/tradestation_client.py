@@ -9,7 +9,7 @@ import os
 import requests
 import time
 from datetime import datetime, date, timedelta, timezone
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, Callable
 import pytz
 import json
 from requests import Response
@@ -53,6 +53,11 @@ class TradeStationClient:
         self._api_session_counter_lock = Lock()
         self._api_session_window_start = self._floor_to_five_minute_window(datetime.now(timezone.utc))
         self._api_session_window_count = 0
+        # Optional callback invoked (window_start, count) when a 5-min window
+        # rolls over.  Used by the ingestion engine to persist API-call totals
+        # to the tradestation_api_calls table.  Kept optional so this module
+        # stays usable without a database.
+        self._api_call_window_writer: Optional[Callable[[datetime, int], None]] = None
 
         # Check if market hours warnings should be suppressed
         self.warn_market_hours = os.getenv("TS_WARN_MARKET_HOURS", "true").lower() != "false"
@@ -68,6 +73,12 @@ class TradeStationClient:
         floored_minute = (ts.minute // 5) * 5
         return ts.replace(minute=floored_minute, second=0, microsecond=0)
 
+    def set_api_call_window_writer(
+        self, writer: Optional[Callable[[datetime, int], None]]
+    ) -> None:
+        """Install a callback invoked with (window_start, count) on rollover."""
+        self._api_call_window_writer = writer
+
     def _record_api_https_session_open(self):
         """
         Track each new HTTPS session open to api.tradestation.com in 5-min windows.
@@ -82,20 +93,32 @@ class TradeStationClient:
         now_utc = datetime.now(timezone.utc)
         current_window = self._floor_to_five_minute_window(now_utc)
 
+        rolled_window_start: Optional[datetime] = None
+        rolled_window_count: int = 0
+
         with self._api_session_counter_lock:
             if current_window != self._api_session_window_start:
-                previous_start = self._api_session_window_start
-                previous_end = previous_start + timedelta(minutes=5)
+                rolled_window_start = self._api_session_window_start
+                rolled_window_count = self._api_session_window_count
+                previous_end = rolled_window_start + timedelta(minutes=5)
                 logger.info(
                     "TradeStation API calls made [%s - %s UTC]: %d",
-                    previous_start.strftime("%H:%M"),
+                    rolled_window_start.strftime("%H:%M"),
                     previous_end.strftime("%H:%M"),
-                    self._api_session_window_count,
+                    rolled_window_count,
                 )
                 self._api_session_window_start = current_window
                 self._api_session_window_count = 0
 
             self._api_session_window_count += 1
+
+        # Invoke DB writer outside the lock so a slow DB call can't stall
+        # subsequent API requests from other threads.
+        if rolled_window_start is not None and self._api_call_window_writer is not None:
+            try:
+                self._api_call_window_writer(rolled_window_start, rolled_window_count)
+            except Exception as e:
+                logger.warning("API-call window writer raised: %s", e)
 
     def _request(
         self, 
@@ -381,12 +404,22 @@ class TradeStationClient:
         with self._api_session_counter_lock:
             window_start = self._api_session_window_start
             window_end = window_start + timedelta(minutes=5)
+            partial_count = self._api_session_window_count
             logger.info(
                 "TradeStation API calls made [%s - %s UTC]: %d (partial window)",
                 window_start.strftime("%H:%M"),
                 window_end.strftime("%H:%M"),
-                self._api_session_window_count,
+                partial_count,
             )
+            # Zero out so we don't double-count if called again.
+            self._api_session_window_count = 0
+
+        # Persist the partial-window count too, outside the lock.
+        if partial_count > 0 and self._api_call_window_writer is not None:
+            try:
+                self._api_call_window_writer(window_start, partial_count)
+            except Exception as e:
+                logger.warning("Partial-window API-call writer raised: %s", e)
 
     # =========================================================================
     # QUOTE ENDPOINTS

@@ -134,6 +134,16 @@ $(eval $(call DB_TAIL,flow-smart-money,flow_smart_money,symbol,timestamp))
 $(eval $(call DB_TAIL,signal-scores,signal_scores,underlying,timestamp))
 $(eval $(call DB_TAIL,signal-trades,signal_trades,underlying,opened_at))
 
+.PHONY: db-tail-vix-bars
+db-tail-vix-bars: ## Show 20 most recent rows from vix_bars
+	@echo "$(BLUE)=== vix_bars (last 20) ===$(NC)"
+	@$(PSQL) -c "SELECT * FROM vix_bars ORDER BY timestamp DESC LIMIT 20;"
+
+.PHONY: db-tail-api-calls
+db-tail-api-calls: ## Show 50 most recent rows from tradestation_api_calls
+	@echo "$(BLUE)=== tradestation_api_calls (last 50) ===$(NC)"
+	@$(PSQL) -c "SELECT * FROM tradestation_api_calls ORDER BY window_start DESC LIMIT 50;"
+
 .PHONY: db-diagnostics
 db-diagnostics: ## Run DB diagnostics snapshot (sessions, waits, blockers, slow queries, dead tuples)
 	@echo "$(BLUE)=== DB Diagnostics Snapshot ===$(NC)"
@@ -343,6 +353,8 @@ help: ## Show this help message
 	@echo "  make db-tail-signals-accuracy      - Last 20 rows from signal_accuracy"
 	@echo "  make db-tail-position-optimizer-signals - Last 20 rows from position_optimizer_signals"
 	@echo "  make db-tail-position-optimizer-accuracy - Last 20 rows from position_optimizer_accuracy"
+	@echo "  make db-tail-vix-bars             - Last 20 rows from vix_bars"
+	@echo "  make db-tail-api-calls            - Last 50 rows from tradestation_api_calls"
 	@echo "  make db-diagnostics               - DB diagnostics (sessions, locks, waits, slow queries)"
 	@echo ""
 	@echo "$(GREEN)Maintenance:$(NC)"
