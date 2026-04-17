@@ -7,6 +7,8 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from src.config import SIGNALS_PORTFOLIO_SIZE
+
 from ..database import DatabaseManager
 
 router = APIRouter(prefix="/api/signals", tags=["Trade Signals"])
@@ -88,6 +90,7 @@ async def get_signal_history(
     total_pnl = round(sum(float(r.get("total_pnl") or 0) for r in rows), 4)
     wins = sum(1 for r in rows if r.get("outcome") == "win")
     return {
+        "portfolio_size": SIGNALS_PORTFOLIO_SIZE,
         "trades": rows,
         "summary": {
             "total_trades": len(rows),

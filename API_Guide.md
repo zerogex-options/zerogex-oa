@@ -143,9 +143,9 @@ Get current max pain with current underlying price, difference (`max_pain - unde
 
 ---
 
-## Day Trading Signals
+## Technicals
 
-### GET /api/trading/vwap-deviation
+### GET /api/technicals/vwap-deviation
 Get VWAP deviation for mean reversion monitoring.
 
 **Parameters:**
@@ -153,7 +153,7 @@ Get VWAP deviation for mean reversion monitoring.
 - `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `1min`
 - `window_units` (optional): max `90`, default `20`
 
-### GET /api/trading/opening-range
+### GET /api/technicals/opening-range
 Get opening range breakout status.
 
 **Parameters:**
@@ -161,28 +161,28 @@ Get opening range breakout status.
 - `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `1min`
 - `window_units` (optional): max `90`, default `20`
 
-### GET /api/trading/gamma-levels
+### GET /api/technicals/gamma-levels
 Get gamma exposure levels (support/resistance zones).
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
 - `limit` (optional): max `100`, default `20`
 
-### GET /api/trading/dealer-hedging
+### GET /api/technicals/dealer-hedging
 Get dealer hedging pressure signals.
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
 - `limit` (optional): max `100`, default `20`
 
-### GET /api/trading/volume-spikes
+### GET /api/technicals/volume-spikes
 Get unusual volume spike events.
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
 - `limit` (optional): max `100`, default `20`
 
-### GET /api/trading/momentum-divergence
+### GET /api/technicals/momentum-divergence
 Get momentum divergence signals.
 
 **Parameters:**

@@ -284,13 +284,13 @@ help: ## Show this help message
 	@echo "  make flow-rebuild-session - Reset one ET session, restart API, trigger flow refresh"
 	@echo "    (override: FLOW_SYMBOL=SPX FLOW_REBUILD_DATE=2026-04-10 FLOW_REBUILD_START_ET=09:30 FLOW_REBUILD_END_ET=16:15)"
 	@echo ""
-	@echo "$(GREEN)Day Trading Support:$(NC)"
+	@echo "$(GREEN)Technicals Support:$(NC)"
 	@echo "  make vwap               - VWAP deviation tracker"
 	@echo "  make orb                - Opening range breakout status"
 	@echo "  make hedge-pressure     - Dealer hedging pressure"
 	@echo "  make volume-spikes      - Unusual volume detection"
 	@echo "  make divergence         - Momentum divergence signals"
-	@echo "  make day-trading        - Combined day trading dashboard"
+	@echo "  make technicals         - Combined technicals dashboard"
 	@echo ""
 	@echo "$(GREEN)Max Pain:$(NC)"
 	@echo "  make max-pain-current      - Max-pain snapshot"
@@ -1397,7 +1397,7 @@ flow-live: ## Combined real-time flow dashboard
 	@echo "$(BLUE)================================================================================$(NC)"
 
 # =============================================================================
-# Day Trading Decision Support
+# Technicals Decision Support
 # =============================================================================
 
 .PHONY: flow-reset-session-facts
@@ -1541,10 +1541,10 @@ divergence: ## Momentum divergence signals
 		ORDER BY timestamp DESC \
 		LIMIT 20;"
 
-.PHONY: day-trading
-day-trading: ## Combined day trading dashboard
+.PHONY: technicals
+technicals: ## Combined technicals dashboard
 	@echo "$(BLUE)================================================================================$(NC)"
-	@echo "$(BLUE)DAY TRADING DASHBOARD$(NC)"
+	@echo "$(BLUE)TECHNICALS DASHBOARD$(NC)"
 	@echo "$(BLUE)================================================================================$(NC)"
 	@echo ""
 	@echo "$(GREEN)1. VWAP DEVIATION$(NC)"
@@ -2272,21 +2272,21 @@ api-test: ## Test ALL API endpoints
 	test_endpoint "/api/market/quote?symbol=$$SYMBOL"; \
 	test_endpoint "/api/market/session-closes?symbol=$$SYMBOL"; \
 	test_endpoint "/api/option/quote?underlying=$$SYMBOL&type=C"; \
-	test_endpoint "/api/trading/dealer-hedging?symbol=$$SYMBOL&limit=10"; \
-	test_endpoint "/api/trading/volume-spikes?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "/api/technicals/dealer-hedging?symbol=$$SYMBOL&limit=10"; \
+	test_endpoint "/api/technicals/volume-spikes?symbol=$$SYMBOL&limit=10"; \
 	test_endpoint "/docs"; \
 	test_endpoint "/redoc"; \
 	test_endpoint "/openapi.json"; \
 	echo ""; \
-	echo "$(YELLOW)Timeframe endpoints (GEX, market, trading)$(NC)"; \
+	echo "$(YELLOW)Timeframe endpoints (GEX, market, technicals)$(NC)"; \
 	for TF in $$TIMEFRAMES; do \
 		test_endpoint "/api/gex/historical?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; \
 		test_endpoint "/api/gex/heatmap?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; \
 		test_endpoint "/api/max-pain/timeseries?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; \
 		test_endpoint "/api/market/historical?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; \
-		test_endpoint "/api/trading/vwap-deviation?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; \
-		test_endpoint "/api/trading/opening-range?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; \
-		test_endpoint "/api/trading/momentum-divergence?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; \
+		test_endpoint "/api/technicals/vwap-deviation?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; \
+		test_endpoint "/api/technicals/opening-range?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; \
+		test_endpoint "/api/technicals/momentum-divergence?symbol=$$SYMBOL&window_units=10&timeframe=$$TF"; \
 	done; \
 	echo ""; \
 	echo "$(YELLOW)Flow endpoints$(NC)"; \
