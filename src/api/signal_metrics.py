@@ -14,10 +14,20 @@ def _score_direction(score: float) -> int:
 
 
 def classify_regime(components: Optional[dict[str, Any]]) -> str:
-    """Classify broad regime from component payload.
+    """Classify dealer gamma regime from the stored gex_regime component.
 
-    Uses the gex_regime component score. The scoring engine stores per-component
-    data as ``{"weight": ..., "score": ...}``, so we read ``"score"``.
+    Dealer regime depends on the sign of raw Net GEX:
+      net_gex > 0  -> dealers long gamma  -> "long_gamma"
+      net_gex < 0  -> dealers short gamma -> "short_gamma"
+
+    The scoring engine persists the component output as ``{"weight", "score"}``
+    where ``score = -tanh(net_gex / norm)`` (see
+    ``src/signals/components/gex_regime.py``). The negation means the sign of
+    the stored score is the OPPOSITE of the sign of net_gex, so regime must
+    invert when classifying from ``score``.
+
+    The legacy ``value`` key held raw net_gex directly, so it is interpreted
+    with the natural sign convention.
     """
     if not isinstance(components, dict):
         return "unknown"
@@ -26,21 +36,29 @@ def classify_regime(components: Optional[dict[str, Any]]) -> str:
     if not isinstance(gex_component, dict):
         return "unknown"
 
-    # The scoring engine persists "score" (clamped raw output); accept "value"
-    # as a legacy fallback.
-    value = gex_component.get("score")
-    if value is None:
-        value = gex_component.get("value")
-    try:
-        net_gex = float(value)
-    except (TypeError, ValueError):
-        return "unknown"
+    if "score" in gex_component:
+        try:
+            score = float(gex_component["score"])
+        except (TypeError, ValueError):
+            return "unknown"
+        if score < 0:
+            return "long_gamma"
+        if score > 0:
+            return "short_gamma"
+        return "neutral_gamma"
 
-    if net_gex < 0:
-        return "short_gamma"
-    if net_gex > 0:
-        return "long_gamma"
-    return "neutral_gamma"
+    if "value" in gex_component:
+        try:
+            net_gex = float(gex_component["value"])
+        except (TypeError, ValueError):
+            return "unknown"
+        if net_gex > 0:
+            return "long_gamma"
+        if net_gex < 0:
+            return "short_gamma"
+        return "neutral_gamma"
+
+    return "unknown"
 
 
 def calibrate_signal(
