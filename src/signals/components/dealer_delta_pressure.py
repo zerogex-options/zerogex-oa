@@ -122,6 +122,8 @@ class DealerDeltaPressureComponent(ComponentBase):
             distance_pct = (ctx.close - strike_f) / ctx.close
             call_delta = max(0.0, min(1.0, 0.5 - distance_pct * 10))
             put_delta = -max(0.0, min(1.0, 0.5 + distance_pct * 10))
-            # 100 shares per contract, dealer sign flipped.
-            total -= (call_oi_f * call_delta + put_oi_f * put_delta) * 100 * ctx.close
+            # 100 shares per contract, dealer sign flipped. Result is in
+            # shares-equivalent so it is comparable against _DNI_NORM and the
+            # explicit delta_oi branch above.
+            total -= (call_oi_f * call_delta + put_oi_f * put_delta) * 100
         return total
