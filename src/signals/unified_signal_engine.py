@@ -369,9 +369,8 @@ class UnifiedSignalEngine:
                         iv_row = cur.fetchone()
                         if iv_row and iv_row[0] is not None and iv_row[1] is not None and iv_row[2] is not None:
                             current_iv, iv_low, iv_high = float(iv_row[0]), float(iv_row[1]), float(iv_row[2])
-                            iv_range = iv_high - iv_low
-                            if iv_range > 0.001:
-                                iv_rank = round(min(1.0, max(0.0, (current_iv - iv_low) / iv_range)), 4)
+                            iv_range = max(iv_high - iv_low, 0.001)
+                            iv_rank = round(min(1.0, max(0.0, (current_iv - iv_low) / iv_range)), 4)
                     except Exception:
                         pass  # IV rank is supplemental; do not block signal generation if unavailable
 

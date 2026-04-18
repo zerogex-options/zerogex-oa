@@ -1139,13 +1139,34 @@ CREATE TABLE IF NOT EXISTS signal_component_scores (
     underlying      VARCHAR(10)   NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
     timestamp       TIMESTAMPTZ   NOT NULL,
     component_name  VARCHAR(50)   NOT NULL,
-    raw_score       DOUBLE PRECISION NOT NULL,  -- component output in [-1, +1]
-    weighted_score  DOUBLE PRECISION NOT NULL,  -- raw_score * weight
+    -- Component output after clamping to [-1, +1].  Named `clamped_score`
+    -- rather than `raw_score` because the scoring engine clamps before
+    -- persisting; the pre-clamp "raw" value is never stored.
+    clamped_score   DOUBLE PRECISION NOT NULL,
+    weighted_score  DOUBLE PRECISION NOT NULL,  -- clamped_score * weight
     weight          DOUBLE PRECISION NOT NULL,
     context_values  JSONB         NOT NULL DEFAULT '{}'::jsonb,  -- inputs used
     created_at      TIMESTAMPTZ   DEFAULT NOW(),
     PRIMARY KEY (underlying, timestamp, component_name)
 );
+
+-- Migration helper: existing deployments still have the old `raw_score`
+-- column.  Rename in place if we detect it.  Safe to re-run.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'signal_component_scores'
+          AND column_name = 'raw_score'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'signal_component_scores'
+          AND column_name = 'clamped_score'
+    ) THEN
+        ALTER TABLE signal_component_scores RENAME COLUMN raw_score TO clamped_score;
+    END IF;
+END
+$$;
 
 CREATE INDEX IF NOT EXISTS idx_signal_component_scores_underlying_ts
     ON signal_component_scores(underlying, timestamp DESC);

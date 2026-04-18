@@ -52,8 +52,53 @@ ET = pytz.timezone("US/Eastern")
 # event before the socket times out (triggers a reconnect).
 _STREAM_READ_TIMEOUT = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
 
+# JSON decode error budgeting.  Streams sometimes emit partial/garbled
+# lines, and swallowing them silently masks real outages (expired session,
+# proxy truncation, etc).  We log a WARNING every N failures and raise
+# once the per-minute rate exceeds the threshold so the outer reader loop
+# tears down the connection and reconnects with a fresh token.
+_DECODE_WARN_EVERY = int(os.getenv("TS_STREAM_DECODE_WARN_EVERY", "100"))
+_DECODE_MAX_PER_MINUTE = int(os.getenv("TS_STREAM_DECODE_MAX_PER_MINUTE", "50"))
+
 # Possible field names for implied volatility across TradeStation payload variants
 _IV_FIELD_NAMES = ("ImpliedVolatility", "IV", "Volatility", "IVol")
+
+
+class _DecodeErrorTracker:
+    """Counts stream JSON-decode failures and triggers a reconnect when sustained.
+
+    Scoped to a single stream connection: the counters reset each time
+    ``_read_stream`` opens a new response.
+    """
+
+    def __init__(self, name: str):
+        self._name = name
+        self._total = 0
+        self._window_start = time.monotonic()
+        self._in_window = 0
+
+    def record(self, snippet: str) -> None:
+        self._total += 1
+        self._in_window += 1
+        now = time.monotonic()
+        elapsed = now - self._window_start
+        if elapsed >= 60.0:
+            # Reset the rolling window.
+            self._window_start = now
+            self._in_window = 1
+            elapsed = 0.0
+        if self._total % _DECODE_WARN_EVERY == 0:
+            logger.warning(
+                "%s: %d JSON decode failures so far; last snippet: %s",
+                self._name,
+                self._total,
+                (snippet or "")[:200],
+            )
+        if self._in_window >= _DECODE_MAX_PER_MINUTE:
+            raise RuntimeError(
+                f"{self._name}: JSON decode error rate exceeded "
+                f"({self._in_window} in {elapsed:.0f}s) — forcing reconnect"
+            )
 
 
 def _is_auth_error_payload(payload: Dict[str, Any]) -> bool:
@@ -233,6 +278,8 @@ class OptionStreamAccumulator:
 
         self._connected.set()
 
+        decode_tracker = _DecodeErrorTracker("Option stream")
+
         try:
             for raw_line in response.iter_lines(decode_unicode=True):
                 if not self._running:
@@ -254,6 +301,7 @@ class OptionStreamAccumulator:
                 try:
                     payload = json.loads(line)
                 except json.JSONDecodeError:
+                    decode_tracker.record(line)
                     continue
 
                 if isinstance(payload, dict) and _is_auth_error_payload(payload):
@@ -473,6 +521,7 @@ class UnderlyingBarAccumulator:
 
         _heartbeat_count = 0
         _line_count = 0
+        decode_tracker = _DecodeErrorTracker("Underlying bar stream")
 
         try:
             for raw_line in response.iter_lines(decode_unicode=True):
@@ -506,11 +555,7 @@ class UnderlyingBarAccumulator:
                 try:
                     payload = json.loads(line)
                 except json.JSONDecodeError:
-                    logger.warning(
-                        "Underlying bar stream: JSON decode failed, "
-                        "skipping line: %s",
-                        line[:200],
-                    )
+                    decode_tracker.record(line)
                     continue
 
                 if isinstance(payload, dict) and _is_auth_error_payload(payload):

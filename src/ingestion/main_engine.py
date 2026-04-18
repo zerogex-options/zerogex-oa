@@ -84,7 +84,16 @@ class IngestionEngine:
         # Buffering for options only (underlying writes every update)
         self.underlying_buffer: List[Dict[str, Any]] = []
         self.options_buffer: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        self._option_volume_baseline: Dict[str, int] = {}
+        # Per-contract cumulative-volume baseline used to turn TradeStation's
+        # monotonically-increasing Volume field into per-bucket deltas.
+        # Entries are (baseline_value, monotonic_timestamp). The monotonic
+        # timestamp drives a TTL so the cache self-heals after any external
+        # DB write (data-retention sweeps, backfills, failed writes that
+        # left the cache ahead of the DB, etc.).
+        self._option_volume_baseline: Dict[str, tuple[int, float]] = {}
+        self._option_volume_baseline_ttl = float(
+            os.getenv("OPTION_VOLUME_BASELINE_TTL_SECONDS", "1800")
+        )
 
         # Track latest underlying price for Greeks calculation
         self.latest_underlying_price: Optional[float] = None
@@ -495,10 +504,20 @@ class IngestionEngine:
             return (0, volume_delta, 0)
 
     def _get_option_volume_baseline(self, option_symbol: str, bucket: datetime) -> int:
-        """Get latest persisted cumulative volume before current bucket for a contract."""
+        """Get latest persisted cumulative volume before current bucket for a contract.
+
+        Cached in-memory; entries older than
+        ``OPTION_VOLUME_BASELINE_TTL_SECONDS`` are refreshed from the DB
+        so the cache self-heals after any external write (retention
+        sweeps, backfills) or failed write that left the cache ahead of
+        the persisted row.
+        """
+        now = _time.monotonic()
         cached = self._option_volume_baseline.get(option_symbol)
         if cached is not None:
-            return cached
+            value, cached_at = cached
+            if (now - cached_at) < self._option_volume_baseline_ttl:
+                return value
 
         try:
             with db_connection() as conn:
@@ -516,11 +535,19 @@ class IngestionEngine:
                 )
                 row = cursor.fetchone()
                 baseline = int(row[0]) if row and row[0] is not None else 0
-                self._option_volume_baseline[option_symbol] = baseline
+                self._option_volume_baseline[option_symbol] = (baseline, now)
                 return baseline
         except Exception as e:
             logger.warning(f"Failed loading volume baseline for {option_symbol}: {e}")
+            # On DB failure, prefer the stale cached value (if any) over
+            # zero — zero would overcount volume on the next flush.
+            if cached is not None:
+                return cached[0]
             return 0
+
+    def _invalidate_option_volume_baseline(self, option_symbol: str) -> None:
+        """Drop a contract's cached baseline so the next read hits the DB."""
+        self._option_volume_baseline.pop(option_symbol, None)
 
     def _prepare_option_agg(self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False) -> Optional[Dict[str, Any]]:
         """Aggregate a per-symbol option buffer into a single row dict.
@@ -611,8 +638,11 @@ class IngestionEngine:
 
             self._log_parity_signature("option_chains", agg)
 
-            # Update volume baseline cache.
-            self._option_volume_baseline[option_symbol] = int(agg["volume"] or 0)
+            # Update volume baseline cache with the freshly-aggregated value.
+            self._option_volume_baseline[option_symbol] = (
+                int(agg["volume"] or 0),
+                _time.monotonic(),
+            )
 
             # Trim buffer.
             if keep_last_snapshot and buffer:
@@ -821,6 +851,13 @@ class IngestionEngine:
             # Exponential backoff: 2s, 4s, 8s, 16s, 32s, 60s cap
             backoff = min(2 ** self._db_consecutive_failures, 60)
             self._db_backoff_until = _time.monotonic() + backoff
+
+            # The baseline cache was optimistically advanced in
+            # _prepare_option_agg; invalidate entries for failed rows so the
+            # next flush re-queries the DB and computes volume deltas against
+            # what was actually persisted.
+            for row in rows:
+                self._invalidate_option_volume_baseline(row["option_symbol"])
 
             # Include affected symbols and time range for debugging.
             symbols = sorted({r["option_symbol"] for r in rows[:5]})
