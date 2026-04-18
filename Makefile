@@ -362,7 +362,7 @@ help: ## Show this help message
 	@echo "  make vacuum             - Vacuum analyze all tables"
 	@echo "  make db-maintain        - Full maintenance: prune old data, vacuum full, reindex"
 	@echo "  make db-prune           - Delete data older than DATA_RETENTION_DAYS (default 90)"
-	@echo "  make size               - Show table sizes"
+	@echo "  make db-size            - Show table sizes"
 	@echo "  make refresh-views      - Refresh materialized views"
 	@echo "  make db-prune-legacy    - Drop obsolete legacy refresh/materialized-view artifacts"
 	@echo ""
@@ -2047,7 +2047,11 @@ db-prune: ## Delete data older than DATA_RETENTION_DAYS (default 90)
 	@echo "$(YELLOW)Pruning data older than $(DATA_RETENTION_DAYS) days...$(NC)"
 	@for tbl in $(DB_MAINTAIN_TABLES); do \
 		echo "  Pruning $$tbl ..."; \
-		$(PSQL) -c "DELETE FROM $$tbl WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';" || true; \
+		if $(PSQL) -tAc "SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename='$$tbl'" | grep -q 1; then \
+			$(PSQL) -c "DELETE FROM $$tbl WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"; \
+		else \
+			echo "    ⚠️  Table $$tbl does not exist, skipping"; \
+		fi; \
 	done
 	@echo "$(GREEN)✅ Prune complete$(NC)"
 
@@ -2061,32 +2065,34 @@ db-maintain: ## Full maintenance: prune old data, vacuum full, reindex (run with
 	@echo ""
 	@echo "$(YELLOW)Step 2/3: Running VACUUM FULL + REINDEX per table (reclaims disk space)...$(NC)"
 	@for tbl in $(DB_MAINTAIN_TABLES); do \
-		echo "  VACUUM FULL $$tbl ..."; \
-		$(PSQL) -c "VACUUM FULL ANALYZE $$tbl;" || echo "$(RED)  ⚠️  VACUUM FULL failed for $$tbl, continuing...$(NC)"; \
-		echo "  REINDEX $$tbl ..."; \
-		$(PSQL) -c "REINDEX TABLE $$tbl;" || echo "$(RED)  ⚠️  REINDEX failed for $$tbl, continuing...$(NC)"; \
+		if $(PSQL) -tAc "SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename='$$tbl'" | grep -q 1; then \
+			echo "  VACUUM FULL $$tbl ..."; \
+			$(PSQL) -c "VACUUM FULL ANALYZE $$tbl;" || echo "$(RED)  ⚠️  VACUUM FULL failed for $$tbl, continuing...$(NC)"; \
+			echo "  REINDEX $$tbl ..."; \
+			$(PSQL) -c "REINDEX TABLE $$tbl;" || echo "$(RED)  ⚠️  REINDEX failed for $$tbl, continuing...$(NC)"; \
+		else \
+			echo "  ⚠️  Table $$tbl does not exist, skipping"; \
+		fi; \
 	done
 	@echo ""
 	@echo "$(YELLOW)Step 3/3: Updating planner statistics...$(NC)"
 	@$(PSQL) -c "ANALYZE;"
 	@echo ""
 	@echo "$(GREEN)✅ Full maintenance complete$(NC)"
-	@$(MAKE) size
+	@$(MAKE) db-size
 
-.PHONY: size
-size: ## Show table sizes
+.PHONY: db-size
+db-size: ## Show sizes for all tables in the database
 	@echo "$(BLUE)=== Table Sizes ===$(NC)"
 	@$(PSQL) -c "\
 		SELECT \
-			schemaname, \
 			tablename, \
-			pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS size, \
-			pg_size_pretty(pg_relation_size(schemaname||'.'||tablename)) AS table_size, \
-			pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename) - pg_relation_size(schemaname||'.'||tablename)) AS index_size \
+			pg_size_pretty(pg_total_relation_size('public.'||tablename)) AS total_size, \
+			pg_size_pretty(pg_relation_size('public.'||tablename)) AS table_size, \
+			pg_size_pretty(pg_total_relation_size('public.'||tablename) - pg_relation_size('public.'||tablename)) AS index_size \
 		FROM pg_tables \
 		WHERE schemaname = 'public' \
-		AND tablename IN ('underlying_quotes', 'option_chains', 'symbols', 'gex_summary', 'gex_by_strike', 'flow_contract_facts', 'flow_by_type', 'flow_by_strike', 'flow_by_expiration', 'flow_smart_money', 'trade_signals', 'position_optimizer_signals') \
-		ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;"
+		ORDER BY pg_total_relation_size('public.'||tablename) DESC;"
 
 .PHONY: db-prune-legacy
 db-prune-legacy: ## Drop obsolete legacy refresh/materialized-view artifacts
