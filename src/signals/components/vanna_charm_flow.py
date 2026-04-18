@@ -25,13 +25,16 @@ from __future__ import annotations
 import os
 
 from src.signals.components.base import ComponentBase, MarketContext
+from src.signals.components.utils import (
+    SESSION_CLOSE_MIN_UTC,
+    SESSION_OPEN_MIN_UTC,
+    minute_of_day,
+)
 
 # Normalize combined vanna+charm exposure so that a magnitude of this
 # value saturates the score.
 _VC_NORM = float(os.getenv("SIGNAL_VANNA_CHARM_NORM", "5.0e7"))
 
-# Charm flow grows non-linearly into the close. Minutes-since-open scale.
-_SESSION_MINUTES = 390  # US cash session minutes
 # Afternoon charm amplification kicks in after this fraction of session.
 _CHARM_AMP_START = 0.6  # ~2h before close
 _CHARM_AMP_MAX = 1.5
@@ -109,17 +112,12 @@ class VannaCharmFlowComponent(ComponentBase):
         Returns 1.0 for most of the session; ramps to _CHARM_AMP_MAX in
         the final ~2h when charm flow dominates.
         """
-        if ctx.timestamp is None:
+        minute = minute_of_day(ctx.timestamp)
+        if minute is None or minute <= SESSION_OPEN_MIN_UTC:
             return 1.0
-        # UTC-based cash session: 13:30 open, 20:00 close.
-        minute = ctx.timestamp.hour * 60 + ctx.timestamp.minute
-        open_min = 13 * 60 + 30
-        close_min = 20 * 60
-        if minute <= open_min:
-            return 1.0
-        if minute >= close_min:
+        if minute >= SESSION_CLOSE_MIN_UTC:
             return _CHARM_AMP_MAX
-        frac = (minute - open_min) / (close_min - open_min)
+        frac = (minute - SESSION_OPEN_MIN_UTC) / (SESSION_CLOSE_MIN_UTC - SESSION_OPEN_MIN_UTC)
         if frac < _CHARM_AMP_START:
             return 1.0
         ramp = (frac - _CHARM_AMP_START) / (1.0 - _CHARM_AMP_START)
