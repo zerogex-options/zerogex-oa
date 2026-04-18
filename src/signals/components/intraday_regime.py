@@ -20,6 +20,12 @@ from __future__ import annotations
 from datetime import datetime
 
 from src.signals.components.base import ComponentBase, MarketContext
+from src.signals.components.utils import (
+    SESSION_CLOSE_MIN_UTC,
+    SESSION_OPEN_MIN_UTC,
+    minute_of_day,
+    pct_change_n_bar,
+)
 
 
 class IntradayRegimeComponent(ComponentBase):
@@ -59,18 +65,15 @@ class IntradayRegimeComponent(ComponentBase):
 
     @staticmethod
     def _phase(ts: datetime | None) -> str:
-        if ts is None:
+        minute = minute_of_day(ts)
+        if minute is None:
             return "unknown"
-        # Assume UTC timestamps (cash session 13:30–20:00 UTC).
-        minute = ts.hour * 60 + ts.minute
-        open_min = 13 * 60 + 30
-        close_min = 20 * 60
-        if minute < open_min:
+        if minute < SESSION_OPEN_MIN_UTC:
             return "pre_open"
-        if minute >= close_min:
+        if minute >= SESSION_CLOSE_MIN_UTC:
             return "post_close"
-        from_open = minute - open_min
-        to_close = close_min - minute
+        from_open = minute - SESSION_OPEN_MIN_UTC
+        to_close = SESSION_CLOSE_MIN_UTC - minute
         if from_open < 30:
             return "opening_range"
         if to_close <= 15:
@@ -85,10 +88,7 @@ class IntradayRegimeComponent(ComponentBase):
 
     @staticmethod
     def _momentum_sign(ctx: MarketContext) -> float:
-        closes = ctx.recent_closes or []
-        if len(closes) < 5 or closes[-5] <= 0:
-            return 0.0
-        pct = (closes[-1] - closes[-5]) / closes[-5]
+        pct = pct_change_n_bar(ctx.recent_closes or [], 5)
         return max(-1.0, min(1.0, pct / 0.003))  # 0.3% saturates
 
     @staticmethod

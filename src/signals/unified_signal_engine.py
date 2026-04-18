@@ -146,45 +146,13 @@ class UnifiedSignalEngine:
                     float(vwap_row[1]) if vwap_row and vwap_row[1] is not None else None
                 )
 
-                cur.execute(
-                    """
-                    WITH latest AS (
-                        SELECT MAX(timestamp) AS ts
-                        FROM gex_by_strike
-                        WHERE underlying = %s
-                          AND timestamp <= %s
-                    )
-                    SELECT
-                        (
-                            SELECT strike
-                            FROM gex_by_strike g
-                            WHERE g.underlying = %s
-                              AND g.timestamp = latest.ts
-                              AND g.strike >= %s
-                            ORDER BY g.call_oi DESC NULLS LAST, g.strike ASC
-                            LIMIT 1
-                        ) AS call_wall,
-                        (
-                            SELECT strike
-                            FROM gex_by_strike g
-                            WHERE g.underlying = %s
-                              AND g.timestamp = latest.ts
-                            ORDER BY ABS(COALESCE(g.net_gex, 0)) DESC, g.strike ASC
-                            LIMIT 1
-                        ) AS max_gamma_strike
-                    FROM latest
-                    """,
-                    (self.db_symbol, ts, self.db_symbol, close_f, self.db_symbol),
-                )
-                strike_row = cur.fetchone()
-                call_wall = float(strike_row[0]) if strike_row and strike_row[0] is not None else None
-                max_gamma_strike = (
-                    float(strike_row[1]) if strike_row and strike_row[1] is not None else None
-                )
-
-                # Per-strike gamma exposure window around spot. Used by
-                # gex_gradient, dealer_delta_pressure, and vanna_charm_flow.
+                # Single pass over gex_by_strike: fetch the per-strike exposure
+                # window around spot (used by gex_gradient, dealer_delta_pressure,
+                # vanna_charm_flow, eod_pressure) and derive call_wall and
+                # max_gamma_strike in Python from the same rows.
                 gex_strike_rows: list[dict] = []
+                call_wall: Optional[float] = None
+                max_gamma_strike: Optional[float] = None
                 try:
                     cur.execute(
                         """
@@ -225,8 +193,22 @@ class UnifiedSignalEngine:
                                 "charm_exposure": float(r[5] or 0.0),
                             }
                         )
+                    if gex_strike_rows:
+                        above_spot = [r for r in gex_strike_rows if r["strike"] >= close_f]
+                        if above_spot:
+                            # call_wall = highest call_oi strike >= spot, ties broken by
+                            # nearest-to-spot (lowest strike above spot).
+                            call_wall = max(
+                                above_spot,
+                                key=lambda r: (r["call_oi"], -r["strike"]),
+                            )["strike"]
+                        max_gamma_row = max(
+                            gex_strike_rows,
+                            key=lambda r: (abs(r["net_gex"]), -r["strike"]),
+                        )
+                        max_gamma_strike = max_gamma_row["strike"]
                 except Exception as exc:  # pragma: no cover - defensive
-                    logger.debug(
+                    logger.warning(
                         "UnifiedSignalEngine [%s]: gex_by_strike fetch failed: %s",
                         self.db_symbol,
                         exc,
@@ -261,7 +243,7 @@ class UnifiedSignalEngine:
                             }
                         )
                 except Exception as exc:  # pragma: no cover - defensive
-                    logger.debug(
+                    logger.warning(
                         "UnifiedSignalEngine [%s]: flow_by_type fetch failed: %s",
                         self.db_symbol,
                         exc,
@@ -300,7 +282,7 @@ class UnifiedSignalEngine:
                         elif r[0] == "C":
                             skew_info["otm_call_iv"] = float(r[1]) if r[1] is not None else None
                 except Exception as exc:  # pragma: no cover - defensive
-                    logger.debug(
+                    logger.warning(
                         "UnifiedSignalEngine [%s]: skew fetch failed: %s",
                         self.db_symbol,
                         exc,

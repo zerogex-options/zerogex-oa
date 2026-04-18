@@ -7,21 +7,15 @@ starts invalidating crowd direction and can trigger a squeeze / flush.
 -score => downside air-pocket risk
 """
 from src.signals.components.base import ComponentBase, MarketContext
+from src.signals.components.utils import pct_change_n_bar
 
 
 class PositioningTrapComponent(ComponentBase):
     name = "positioning_trap"
     weight = 0.06
 
-    @staticmethod
-    def _momentum(closes: list[float], bars_back: int) -> float:
-        if len(closes) < bars_back or closes[-bars_back] <= 0:
-            return 0.0
-        return (closes[-1] - closes[-bars_back]) / closes[-bars_back]
-
     def compute(self, ctx: MarketContext) -> float:
-        closes = ctx.recent_closes
-        mom5 = self._momentum(closes, 5)
+        mom5 = pct_change_n_bar(ctx.recent_closes, 5)
 
         sm_total = ctx.smart_call + ctx.smart_put
         imbalance = (ctx.smart_call - ctx.smart_put) / sm_total if sm_total >= 100_000 else 0.0
@@ -61,7 +55,7 @@ class PositioningTrapComponent(ComponentBase):
     def context_values(self, ctx: MarketContext) -> dict:
         sm_total = ctx.smart_call + ctx.smart_put
         imbalance = (ctx.smart_call - ctx.smart_put) / sm_total if sm_total > 0 else 0.0
-        mom5 = self._momentum(ctx.recent_closes, 5)
+        mom5 = pct_change_n_bar(ctx.recent_closes, 5)
         return {
             "put_call_ratio": ctx.put_call_ratio,
             "smart_imbalance": round(imbalance, 4),

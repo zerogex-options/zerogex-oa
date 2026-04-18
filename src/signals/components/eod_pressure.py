@@ -28,6 +28,11 @@ import os
 from datetime import datetime
 
 from src.signals.components.base import ComponentBase, MarketContext
+from src.signals.components.utils import (
+    SESSION_CLOSE_MIN_UTC,
+    SESSION_OPEN_MIN_UTC,
+    minute_of_day,
+)
 
 # Charm magnitude (per-session aggregate) at which the score saturates.
 _CHARM_NORM = float(os.getenv("SIGNAL_EOD_CHARM_NORM", "2.0e7"))
@@ -152,15 +157,10 @@ class EODPressureComponent(ComponentBase):
     @staticmethod
     def _time_ramp(ts: datetime | None) -> float:
         """Linear ramp from 0 at T-90min to 1.0 at T-15min, held at 1.0 thereafter."""
-        if ts is None:
+        minute = minute_of_day(ts)
+        if minute is None or minute < SESSION_OPEN_MIN_UTC or minute >= SESSION_CLOSE_MIN_UTC:
             return 0.0
-        # UTC cash session: 13:30 open, 20:00 close.
-        minute = ts.hour * 60 + ts.minute
-        close_min = 20 * 60
-        open_min = 13 * 60 + 30
-        if minute < open_min or minute >= close_min:
-            return 0.0
-        to_close = close_min - minute
+        to_close = SESSION_CLOSE_MIN_UTC - minute
         if to_close > _WINDOW_START_MIN_TO_CLOSE:
             return 0.0
         if to_close <= _WINDOW_RAMP_END_MIN_TO_CLOSE:

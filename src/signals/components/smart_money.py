@@ -1,5 +1,6 @@
 """Smart money flow scoring component."""
 from src.signals.components.base import ComponentBase, MarketContext
+from src.signals.components.utils import pct_change_n_bar
 
 
 class SmartMoneyComponent(ComponentBase):
@@ -26,7 +27,7 @@ class SmartMoneyComponent(ComponentBase):
         # into put buying" and "drip-down into call buying" setups.
         closes = ctx.recent_closes
         if len(closes) >= 5 and closes[-5] > 0:
-            momentum_5bar = (closes[-1] - closes[-5]) / closes[-5]
+            momentum_5bar = pct_change_n_bar(closes, 5)
             if momentum_5bar > 0.001 and imbalance < -0.30:
                 # Up drift + heavy put flow -> bearish crack risk.
                 score -= 0.25
@@ -41,7 +42,7 @@ class SmartMoneyComponent(ComponentBase):
         imbalance = ((ctx.smart_call - ctx.smart_put) / sm_total) if sm_total > 0 else 0.0
         momentum_5bar = None
         if len(ctx.recent_closes) >= 5 and ctx.recent_closes[-5] > 0:
-            momentum_5bar = round((ctx.recent_closes[-1] - ctx.recent_closes[-5]) / ctx.recent_closes[-5], 6)
+            momentum_5bar = round(pct_change_n_bar(ctx.recent_closes, 5), 6)
         return {
             "smart_call": ctx.smart_call,
             "smart_put": ctx.smart_put,

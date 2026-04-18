@@ -1,4 +1,12 @@
-"""Scoring components for the ZeroGEX Signal Engine."""
+"""Scoring components for the ZeroGEX Signal Engine.
+
+Environment variables read by individual components (``SIGNAL_*``) are
+captured as module-level constants at import time. Changing one after
+import has no effect -- the Signal Engine process must be restarted for
+a new value to take effect. The full list is kept alongside each
+component's implementation; grep for ``os.getenv`` under this package
+to enumerate them.
+"""
 
 from src.signals.components.base import ComponentBase, MarketContext
 from src.signals.components.gex_regime import GexRegimeComponent

@@ -12,6 +12,7 @@ The composite-score contribution (used by ScoringEngine) combines both
 into a single [-1, +1] value: ``expansion * direction / 10000``.
 """
 from src.signals.components.base import ComponentBase, MarketContext
+from src.signals.components.utils import pct_change_n_bar
 
 # 0.5% price change over 5 bars fully shifts the direction score.
 _MOMENTUM_NORM = 0.005
@@ -49,10 +50,7 @@ class VolExpansionComponent(ComponentBase):
 
         Driven by 5-bar price momentum.  Returns 0 when insufficient data.
         """
-        closes = ctx.recent_closes
-        if len(closes) < 5 or closes[-5] <= 0:
-            return 0.0
-        pct_change = (closes[-1] - closes[-5]) / closes[-5]
+        pct_change = pct_change_n_bar(ctx.recent_closes, 5)
         momentum = max(-1.0, min(1.0, pct_change / _MOMENTUM_NORM))
         return round(momentum * 100.0, 2)
 
@@ -73,7 +71,7 @@ class VolExpansionComponent(ComponentBase):
         if len(closes) < 5 or closes[-5] <= 0:
             return 0.0  # no momentum data -> directional score unavailable
 
-        pct_change = (closes[-1] - closes[-5]) / closes[-5]
+        pct_change = pct_change_n_bar(closes, 5)
         momentum = max(-1.0, min(1.0, pct_change / _MOMENTUM_NORM))
         return exp * momentum
 
@@ -94,7 +92,7 @@ class VolExpansionComponent(ComponentBase):
         pct_change_5bar = None
         momentum = None
         if len(closes) >= 5 and closes[-5] > 0:
-            pct_change_5bar = round((closes[-1] - closes[-5]) / closes[-5], 6)
+            pct_change_5bar = round(pct_change_n_bar(closes, 5), 6)
             momentum = round(max(-1.0, min(1.0, pct_change_5bar / _MOMENTUM_NORM)), 4)
         return {
             "net_gex": ctx.net_gex,
