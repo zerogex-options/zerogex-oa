@@ -888,8 +888,15 @@ class PortfolioEngine:
                 matching = sum(1 for r in rows if r[0] == direction)
                 min_match = min(self.trend_confirmation_min_match, len(rows))
                 return matching >= min_match
-        except Exception:
-            return True
+        except Exception as exc:
+            # Fail closed: if the trend lookup errors we don't know whether
+            # history agrees, so refuse confirmation and fall back to cash.
+            logger.warning(
+                "PortfolioEngine[%s]: trend confirmation lookup failed (%s); treating as unconfirmed",
+                self.db_symbol,
+                exc,
+            )
+            return False
 
     def _passes_dealer_regime_gates(self, score: ScoreSnapshot, market_ctx: dict) -> tuple[bool, str]:
         if not self.drs_hard_gates_enabled:
