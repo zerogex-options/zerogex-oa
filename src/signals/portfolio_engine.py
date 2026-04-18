@@ -27,6 +27,7 @@ from src.config import (
     SIGNALS_DRS_HARD_GATES_ENABLED,
     SIGNALS_DRS_OVERRIDE_ENABLED,
     SIGNALS_DRS_OVERRIDE_THRESHOLD,
+    SIGNALS_EXECUTION_SLIPPAGE_BPS,
     SIGNALS_DRS_PUT_ENTRY_MAX,
     SIGNALS_MAX_OPEN_TRADES,
     SIGNALS_MAX_PORTFOLIO_HEAT_PCT,
@@ -111,6 +112,7 @@ class PortfolioEngine:
         self.scalp_trigger_enabled = SIGNALS_SCALP_TRIGGER_ENABLED
         self.scalp_trigger_threshold = SIGNALS_SCALP_TRIGGER_THRESHOLD
         self.scalp_size_multiplier = SIGNALS_SCALP_SIZE_MULTIPLIER
+        self.execution_slippage_bps = max(0.0, SIGNALS_EXECUTION_SLIPPAGE_BPS)
 
     @staticmethod
     def _market_status(dt: Optional[datetime] = None) -> str:
@@ -486,7 +488,7 @@ class PortfolioEngine:
 
     def _close_trade(self, trade: dict, as_of: datetime, conn) -> float:
         """Close an open trade at current mark. Returns realized PnL."""
-        mark, pricing_mode = self._spread_mark(trade, as_of, conn)
+        mark, pricing_mode = self._spread_value(trade, as_of, conn, valuation="exit")
         if mark is None:
             mark = trade["current_price"]
 
@@ -529,6 +531,15 @@ class PortfolioEngine:
         """Insert a new row to signal_trades. Returns True if inserted."""
         components_at_entry = dict(target.composite_score if isinstance(target.composite_score, dict) else {})
         components_at_entry = {"optimizer": tp.optimizer_payload}
+        entry_trade = {
+            "option_symbol": tp.option_symbol,
+            "components_at_entry": components_at_entry,
+        }
+        entry_fill, _ = self._spread_value(
+            entry_trade, target.timestamp, conn, valuation="entry"
+        )
+        if entry_fill is None:
+            entry_fill = tp.entry_mark
 
         cur = conn.cursor()
         cur.execute(
@@ -557,8 +568,8 @@ class PortfolioEngine:
                 tp.option_type,
                 tp.expiration,
                 tp.strike,
-                tp.entry_mark,
-                tp.entry_mark,
+                entry_fill,
+                entry_fill,
                 tp.contracts,
                 tp.contracts,
                 json.dumps(components_at_entry, default=str),
@@ -573,7 +584,7 @@ class PortfolioEngine:
 
     def _update_trade_mark(self, trade: dict, as_of: datetime, conn) -> None:
         """Refresh unrealized PnL for an open trade."""
-        mark, pricing_mode = self._spread_mark(trade, as_of, conn)
+        mark, pricing_mode = self._spread_value(trade, as_of, conn, valuation="exit")
         if mark is None:
             return
 
@@ -706,13 +717,13 @@ class PortfolioEngine:
             for r in cur.fetchall()
         ]
 
-    def _latest_option_mark(
+    def _latest_option_quote(
         self, option_symbol: str, as_of: datetime, conn
-    ) -> Optional[float]:
+    ) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT COALESCE(mid, (bid + ask)/2.0, last)
+            SELECT bid, ask, mid, last
             FROM option_chains
             WHERE option_symbol = %s
               AND timestamp <= %s
@@ -722,17 +733,84 @@ class PortfolioEngine:
             (option_symbol, as_of),
         )
         row = cur.fetchone()
-        return float(row[0]) if row and row[0] is not None else None
+        if not row:
+            return None, None, None, None
+        bid = float(row[0]) if row[0] is not None else None
+        ask = float(row[1]) if row[1] is not None else None
+        mid = float(row[2]) if row[2] is not None else None
+        last = float(row[3]) if row[3] is not None else None
+        return bid, ask, mid, last
 
-    def _spread_mark(
-        self, trade: dict, as_of: datetime, conn
+    @staticmethod
+    def _mid_from_quote(
+        bid: Optional[float],
+        ask: Optional[float],
+        mid: Optional[float],
+        last: Optional[float],
+    ) -> Optional[float]:
+        if mid is not None and mid > 0:
+            return mid
+        if bid is not None and ask is not None and bid > 0 and ask > 0:
+            return (bid + ask) / 2.0
+        if last is not None and last > 0:
+            return last
+        if ask is not None and ask > 0:
+            return ask
+        if bid is not None and bid > 0:
+            return bid
+        return None
+
+    def _apply_slippage(self, price: float, action: str) -> float:
+        if self.execution_slippage_bps <= 0:
+            return price
+        slip = self.execution_slippage_bps / 10000.0
+        if action == "buy":
+            return price * (1.0 + slip)
+        if action == "sell":
+            return max(price * (1.0 - slip), 0.0)
+        return price
+
+    def _leg_price(
+        self,
+        bid: Optional[float],
+        ask: Optional[float],
+        mid: Optional[float],
+        last: Optional[float],
+        side: str,
+        valuation: str,
+    ) -> Optional[float]:
+        side = side.lower()
+        if valuation == "mark":
+            return self._mid_from_quote(bid, ask, mid, last)
+
+        if valuation == "entry":
+            if side == "long":
+                if ask is None or ask <= 0:
+                    return None
+                return self._apply_slippage(ask, "buy")
+            if side == "short":
+                if bid is None or bid <= 0:
+                    return None
+                return self._apply_slippage(bid, "sell")
+            return None
+
+        if valuation == "exit":
+            if side == "long":
+                if bid is None or bid <= 0:
+                    return None
+                return self._apply_slippage(bid, "sell")
+            if side == "short":
+                if ask is None or ask <= 0:
+                    return None
+                return self._apply_slippage(ask, "buy")
+            return None
+
+        return None
+
+    def _spread_value(
+        self, trade: dict, as_of: datetime, conn, valuation: str = "mark"
     ) -> tuple[Optional[float], str]:
-        """Mark the spread using every leg, matching how entry debit/credit was formed.
-
-        Entry debit (bull_call_debit, bear_put_debit) was computed in the optimizer
-        as ``long_mid - short_mid``. Entry credit (bull_put_credit, bear_call_credit,
-        iron_condor) was computed as ``short_mid - long_mid``. We mirror that here
-        so the current per-share value is directly comparable to ``entry_price``.
+        """Price the spread using side-aware entry/exit fills or midpoint marks.
 
         Returns (value_per_share, pricing_mode). ``pricing_mode`` is "debit" or
         "credit"; on missing/partial chain data returns ``(None, pricing_mode)``.
@@ -742,8 +820,14 @@ class PortfolioEngine:
         pricing_mode = payload.get("pricing_mode") or "debit"
 
         if not legs:
-            mark = self._latest_option_mark(trade["option_symbol"], as_of, conn)
-            return mark, pricing_mode
+            bid, ask, mid, last = self._latest_option_quote(
+                trade["option_symbol"], as_of, conn
+            )
+            synthetic_side = "long" if pricing_mode == "debit" else "short"
+            value = self._leg_price(
+                bid, ask, mid, last, synthetic_side, valuation
+            )
+            return value, pricing_mode
 
         long_sum = 0.0
         short_sum = 0.0
@@ -751,14 +835,17 @@ class PortfolioEngine:
             symbol = leg.get("option_symbol")
             if not symbol:
                 return None, pricing_mode
-            mid = self._latest_option_mark(symbol, as_of, conn)
-            if mid is None:
-                return None, pricing_mode
+            bid, ask, mid, last = self._latest_option_quote(symbol, as_of, conn)
             side = str(leg.get("side") or "").lower()
+            leg_price = self._leg_price(
+                bid, ask, mid, last, side, valuation
+            )
+            if leg_price is None:
+                return None, pricing_mode
             if side == "long":
-                long_sum += mid
+                long_sum += leg_price
             elif side == "short":
-                short_sum += mid
+                short_sum += leg_price
             else:
                 return None, pricing_mode
 

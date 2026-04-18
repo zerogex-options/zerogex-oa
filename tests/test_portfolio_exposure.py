@@ -432,7 +432,7 @@ class TestTradeSlotsAndContractSizing:
 
 
 # ---------------------------------------------------------------------------
-# _spread_mark / _spread_pnl
+# _spread_value / _spread_pnl
 # ---------------------------------------------------------------------------
 
 
@@ -458,20 +458,43 @@ class TestSpreadPricing:
         }
         return trade
 
-    def test_debit_spread_marks_with_both_legs(self):
+    def test_debit_spread_exit_value_uses_bid_for_long_and_ask_for_short(self):
         engine = _make_engine()
-        # Long leg rises to 3.40, short leg rises to 0.70 => net value 2.70 (+$0.20).
-        marks = {"SPY 260410C500": 3.40, "SPY 260410C505": 0.70}
-        with patch.object(engine, "_latest_option_mark", side_effect=lambda sym, *a, **kw: marks[sym]):
-            value, mode = engine._spread_mark(self._debit_trade(), NOW, conn=MagicMock())
+        quotes = {
+            "SPY 260410C500": (3.20, 3.40, 3.30, 3.30),  # bid, ask, mid, last
+            "SPY 260410C505": (0.60, 0.80, 0.70, 0.70),
+        }
+        with patch.object(engine, "_latest_option_quote", side_effect=lambda sym, *a, **kw: quotes[sym]):
+            value, mode = engine._spread_value(
+                self._debit_trade(), NOW, conn=MagicMock(), valuation="exit"
+            )
         assert mode == "debit"
-        assert value == pytest.approx(2.70)
+        assert value == pytest.approx(2.40)  # long bid - short ask
 
     def test_debit_spread_pnl_matches_both_legs(self):
-        # Entry $2.50, current $2.70, 2 contracts => ($2.70 - $2.50) * 2 * 100 = $40.
+        # Entry $2.50, exit value $2.40, 2 contracts => ($2.40 - $2.50) * 2 * 100 = -$20.
         assert PortfolioEngine._spread_pnl(
-            entry=2.5, mark=2.7, qty=2, pricing_mode="debit"
-        ) == pytest.approx(40.0)
+            entry=2.5, mark=2.4, qty=2, pricing_mode="debit"
+        ) == pytest.approx(-20.0)
+
+    def test_debit_spread_entry_value_uses_ask_for_long_and_bid_for_short(self):
+        engine = _make_engine()
+        quotes = {
+            "SPY 260410C500": (3.20, 3.40, 3.30, 3.30),
+            "SPY 260410C505": (0.60, 0.80, 0.70, 0.70),
+        }
+        with patch.object(engine, "_latest_option_quote", side_effect=lambda sym, *a, **kw: quotes[sym]):
+            value, mode = engine._spread_value(
+                self._debit_trade(), NOW, conn=MagicMock(), valuation="entry"
+            )
+        assert mode == "debit"
+        assert value == pytest.approx(2.80)  # long ask - short bid
+
+    def test_slippage_worsens_fill_prices(self):
+        engine = _make_engine()
+        engine.execution_slippage_bps = 50  # 0.50%
+        assert engine._apply_slippage(2.0, "buy") == pytest.approx(2.01)
+        assert engine._apply_slippage(2.0, "sell") == pytest.approx(1.99)
 
     def test_debit_spread_pnl_goes_negative_when_underlying_drops(self):
         # If the long leg's mid drops faster than the short leg's on a -0.3%
@@ -491,14 +514,18 @@ class TestSpreadPricing:
         engine = _make_engine()
         trade = _make_trade(entry_price=2.0)
         trade["components_at_entry"] = {}  # no optimizer payload
-        with patch.object(engine, "_latest_option_mark", return_value=1.75):
-            value, mode = engine._spread_mark(trade, NOW, conn=MagicMock())
+        with patch.object(engine, "_latest_option_quote", return_value=(1.75, 1.95, 1.85, 1.85)):
+            value, mode = engine._spread_value(
+                trade, NOW, conn=MagicMock(), valuation="exit"
+            )
         assert value == 1.75
         assert mode == "debit"
 
     def test_missing_leg_mark_returns_none(self):
         engine = _make_engine()
-        with patch.object(engine, "_latest_option_mark", return_value=None):
-            value, mode = engine._spread_mark(self._debit_trade(), NOW, conn=MagicMock())
+        with patch.object(engine, "_latest_option_quote", return_value=(None, None, None, None)):
+            value, mode = engine._spread_value(
+                self._debit_trade(), NOW, conn=MagicMock(), valuation="exit"
+            )
         assert value is None
         assert mode == "debit"

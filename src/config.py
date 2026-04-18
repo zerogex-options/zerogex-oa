@@ -298,6 +298,12 @@ SIGNALS_DRS_OVERRIDE_THRESHOLD = float(
 # initial premium paid (debit trades) or 25% of max-risk (credit trades).
 SIGNALS_STOP_LOSS_PCT = float(os.getenv("SIGNALS_STOP_LOSS_PCT", "-0.25"))
 
+# Optional execution slippage in basis points applied adversely to simulated
+# fills. Example: 5 = 0.05% worse than quoted bid/ask on each leg fill.
+SIGNALS_EXECUTION_SLIPPAGE_BPS = float(
+    os.getenv("SIGNALS_EXECUTION_SLIPPAGE_BPS", "0")
+)
+
 # =============================================================================
 # Ingestion/Analytics CLI Defaults
 # =============================================================================
@@ -393,6 +399,7 @@ def get_all_config() -> Dict[str, Any]:
             "max_portfolio_heat_pct": SIGNALS_MAX_PORTFOLIO_HEAT_PCT,
             "same_direction_cooldown_minutes": SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES,
             "stop_loss_pct": SIGNALS_STOP_LOSS_PCT,
+            "execution_slippage_bps": SIGNALS_EXECUTION_SLIPPAGE_BPS,
         },
     }
 
