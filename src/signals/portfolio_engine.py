@@ -436,9 +436,13 @@ class PortfolioEngine:
                     for trade in open_trades:
                         if to_close <= 0:
                             break
-                        pnl = self._close_trade(trade, target.timestamp, c)
+                        open_qty = trade["quantity_open"]
+                        close_qty = min(open_qty, to_close)
+                        pnl = self._close_trade(
+                            trade, target.timestamp, c, partial_qty=close_qty
+                        )
                         closed_pnl += pnl
-                        to_close -= trade["quantity_open"]
+                        to_close -= close_qty
                     action = "trimmed"
                     action_detail = {
                         "trimmed_contracts": abs(contracts_delta),
@@ -484,38 +488,89 @@ class PortfolioEngine:
     # _close_trade
     # ------------------------------------------------------------------
 
-    def _close_trade(self, trade: dict, as_of: datetime, conn) -> float:
-        """Close an open trade at current mark. Returns realized PnL."""
+    def _close_trade(
+        self,
+        trade: dict,
+        as_of: datetime,
+        conn,
+        partial_qty: Optional[int] = None,
+    ) -> float:
+        """Close (fully or partially) an open trade at current mark.
+
+        If ``partial_qty`` is None or >= ``quantity_open``, close the whole
+        trade.  Otherwise decrement ``quantity_open`` by ``partial_qty``,
+        add the proportional realized PnL, and leave ``status = 'open'``.
+        Returns realized PnL for the portion that was closed.
+        """
         mark, pricing_mode = self._spread_mark(trade, as_of, conn)
         if mark is None:
             mark = trade["current_price"]
 
         entry = trade["entry_price"]
-        qty = trade["quantity_open"]
-        realized_pnl = self._spread_pnl(entry, mark, qty, pricing_mode)
+        open_qty = trade["quantity_open"]
+        if open_qty <= 0:
+            return 0.0
+
+        if partial_qty is None or partial_qty >= open_qty:
+            close_qty = open_qty
+            fully_closing = True
+        elif partial_qty <= 0:
+            return 0.0
+        else:
+            close_qty = partial_qty
+            fully_closing = False
+
+        realized_pnl = self._spread_pnl(entry, mark, close_qty, pricing_mode)
 
         cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE signal_trades
-            SET status = 'closed',
-                closed_at = %s,
-                current_price = %s,
-                quantity_open = 0,
-                realized_pnl = realized_pnl + %s,
-                unrealized_pnl = 0,
-                total_pnl = realized_pnl + %s,
-                pnl_percent = CASE
-                    WHEN entry_price > 0
-                    THEN ROUND(((realized_pnl + %s) / (entry_price * quantity_initial * 100)) * 100, 4)
-                    ELSE 0
-                END,
-                updated_at = NOW()
-            WHERE id = %s
-              AND status = 'open'
-            """,
-            (as_of, mark, realized_pnl, realized_pnl, realized_pnl, trade["id"]),
-        )
+        if fully_closing:
+            cur.execute(
+                """
+                UPDATE signal_trades
+                SET status = 'closed',
+                    closed_at = %s,
+                    current_price = %s,
+                    quantity_open = 0,
+                    realized_pnl = realized_pnl + %s,
+                    unrealized_pnl = 0,
+                    total_pnl = realized_pnl + %s,
+                    pnl_percent = CASE
+                        WHEN entry_price > 0
+                        THEN ROUND(((realized_pnl + %s) / (entry_price * quantity_initial * 100)) * 100, 4)
+                        ELSE 0
+                    END,
+                    updated_at = NOW()
+                WHERE id = %s
+                  AND status = 'open'
+                """,
+                (as_of, mark, realized_pnl, realized_pnl, realized_pnl, trade["id"]),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE signal_trades
+                SET current_price = %s,
+                    quantity_open = quantity_open - %s,
+                    realized_pnl = realized_pnl + %s,
+                    total_pnl = (realized_pnl + %s) + unrealized_pnl,
+                    pnl_percent = CASE
+                        WHEN entry_price > 0 AND quantity_initial > 0
+                        THEN ROUND(
+                            (((realized_pnl + %s) + unrealized_pnl)
+                             / (entry_price * quantity_initial * 100)) * 100,
+                            4
+                        )
+                        ELSE 0
+                    END,
+                    updated_at = NOW()
+                WHERE id = %s
+                  AND status = 'open'
+                """,
+                (mark, close_qty, realized_pnl, realized_pnl, realized_pnl, trade["id"]),
+            )
+            # Keep the in-memory dict in sync for callers that iterate over
+            # the same trade list after a partial close.
+            trade["quantity_open"] = open_qty - close_qty
         conn.commit()
         return realized_pnl
 

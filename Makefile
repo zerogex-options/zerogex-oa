@@ -1800,9 +1800,9 @@ signals-vol-expansion: ## Latest volatility-expansion score (0-100) from signal_
 		SELECT \
 			underlying, \
 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') AS time, \
-			ROUND(raw_score::numeric * 100, 1) AS score, \
-			CASE WHEN raw_score > 0 THEN 'bullish' WHEN raw_score < 0 THEN 'bearish' ELSE 'neutral' END AS direction, \
-			ROUND(raw_score::numeric, 4) AS raw_score, \
+			ROUND(clamped_score::numeric * 100, 1) AS score, \
+			CASE WHEN clamped_score > 0 THEN 'bullish' WHEN clamped_score < 0 THEN 'bearish' ELSE 'neutral' END AS direction, \
+			ROUND(clamped_score::numeric, 4) AS clamped_score, \
 			context_values \
 		FROM signal_component_scores \
 		WHERE underlying = '$(FLOW_SYMBOL)' \

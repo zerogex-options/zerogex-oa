@@ -3,8 +3,6 @@
 __all__ = [
     "SignalEngineService",
     "PositionOptimizerEngine",
-    "ProprietarySignalEngine",
-    "ConsolidatedSignalEngine",
     "ScoringEngine",
     "PortfolioEngine",
     "ComponentBase",
@@ -19,12 +17,6 @@ def __getattr__(name):
     if name == "PositionOptimizerEngine":
         from src.signals.position_optimizer_engine import PositionOptimizerEngine
         return PositionOptimizerEngine
-    if name == "ProprietarySignalEngine":
-        from src.signals.proprietary_signal_engine import ProprietarySignalEngine
-        return ProprietarySignalEngine
-    if name == "ConsolidatedSignalEngine":
-        from src.signals.consolidated_signal_engine import ConsolidatedSignalEngine
-        return ConsolidatedSignalEngine
     if name == "ScoringEngine":
         from src.signals.scoring_engine import ScoringEngine
         return ScoringEngine

@@ -2572,13 +2572,13 @@ class DatabaseManager:
             SELECT
                 scs.underlying,
                 scs.timestamp,
-                scs.raw_score,
+                scs.clamped_score,
                 scs.weighted_score,
                 scs.weight,
                 scs.context_values,
                 CASE
-                    WHEN scs.raw_score > 0 THEN 'bullish'
-                    WHEN scs.raw_score < 0 THEN 'bearish'
+                    WHEN scs.clamped_score > 0 THEN 'bullish'
+                    WHEN scs.clamped_score < 0 THEN 'bearish'
                     ELSE 'neutral'
                 END AS direction
             FROM signal_component_scores scs
@@ -2593,7 +2593,7 @@ class DatabaseManager:
                 if not row:
                     return None
                 d = dict(row)
-                raw = d.get("raw_score") or 0.0
+                raw = d.get("clamped_score") or 0.0
                 d["score"] = round(float(raw) * 100.0, 2)
                 ctx = d.get("context_values") or {}
                 if isinstance(ctx, str):
@@ -2619,13 +2619,13 @@ class DatabaseManager:
             SELECT
                 scs.underlying,
                 scs.timestamp,
-                scs.raw_score,
+                scs.clamped_score,
                 scs.weighted_score,
                 scs.weight,
                 scs.context_values,
                 CASE
-                    WHEN scs.raw_score > 0 THEN 'bullish'
-                    WHEN scs.raw_score < 0 THEN 'bearish'
+                    WHEN scs.clamped_score > 0 THEN 'bullish'
+                    WHEN scs.clamped_score < 0 THEN 'bearish'
                     ELSE 'neutral'
                 END AS direction
             FROM signal_component_scores scs
@@ -2640,7 +2640,7 @@ class DatabaseManager:
                 if not row:
                     return None
                 d = dict(row)
-                raw = d.get("raw_score") or 0.0
+                raw = d.get("clamped_score") or 0.0
                 d["score"] = round(float(raw) * 100.0, 2)
                 ctx = d.get("context_values") or {}
                 if isinstance(ctx, str):

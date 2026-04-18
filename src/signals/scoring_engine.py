@@ -240,10 +240,10 @@ class ScoringEngine:
             cur.execute(
                 """
                 INSERT INTO signal_component_scores (
-                    underlying, timestamp, component_name, raw_score, weighted_score, weight, context_values
+                    underlying, timestamp, component_name, clamped_score, weighted_score, weight, context_values
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
                 ON CONFLICT (underlying, timestamp, component_name) DO UPDATE SET
-                    raw_score = EXCLUDED.raw_score,
+                    clamped_score = EXCLUDED.clamped_score,
                     weighted_score = EXCLUDED.weighted_score,
                     weight = EXCLUDED.weight,
                     context_values = EXCLUDED.context_values
