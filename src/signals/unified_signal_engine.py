@@ -371,8 +371,13 @@ class UnifiedSignalEngine:
                             current_iv, iv_low, iv_high = float(iv_row[0]), float(iv_row[1]), float(iv_row[2])
                             iv_range = max(iv_high - iv_low, 0.001)
                             iv_rank = round(min(1.0, max(0.0, (current_iv - iv_low) / iv_range)), 4)
-                    except Exception:
-                        pass  # IV rank is supplemental; do not block signal generation if unavailable
+                    except Exception as exc:
+                        # IV rank is supplemental; do not block signal generation if unavailable.
+                        logger.debug(
+                            "UnifiedSignalEngine [%s]: iv_rank query failed: %s",
+                            self.db_symbol,
+                            exc,
+                        )
 
                 return {
                     "timestamp": ts,

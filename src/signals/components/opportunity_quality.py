@@ -11,6 +11,9 @@ from __future__ import annotations
 from typing import Optional
 
 from src.signals.components.base import ComponentBase, MarketContext
+from src.utils import get_logger
+
+logger = get_logger(__name__)
 
 
 class OpportunityQualityComponent(ComponentBase):
@@ -113,8 +116,7 @@ class OpportunityQualityComponent(ComponentBase):
                 self._last_result = result
                 return result
         except Exception as exc:
-            from src.utils import get_logger
-            get_logger(__name__).warning("OpportunityQualityComponent failed: %s", exc)
+            logger.warning("OpportunityQualityComponent failed: %s", exc)
             return self._last_result if self._last_result is not None else 0.0
 
     def context_values(self, ctx: MarketContext) -> dict:
