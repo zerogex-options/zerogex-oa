@@ -4,6 +4,7 @@ TradeStation Authentication Manager
 Handles OAuth2 authentication with TradeStation API.
 """
 
+import logging
 import os
 import requests
 import time
@@ -97,8 +98,21 @@ class TradeStationAuth:
             "updated_epoch": time.time(),
         }
         tmp_path = self._token_cache_path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(payload))
-        tmp_path.replace(self._token_cache_path)
+        # Write with mode 0o600 so the access token is not world-readable in
+        # the shared tempdir.  os.open lets us set the mode atomically before
+        # writing any bytes.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        fd = os.open(str(tmp_path), flags, 0o600)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(payload))
+        except Exception:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            raise
+        os.replace(str(tmp_path), str(self._token_cache_path))
 
     def get_access_token(self) -> str:
         """
@@ -206,12 +220,22 @@ class TradeStationAuth:
 
                 if response.status_code != 200:
                     logger.error(f"Token refresh failed with status {response.status_code}")
-                    logger.error(f"Response: {response.text}")
+                    # Avoid logging the response body at error level — TradeStation
+                    # may echo back parts of the request payload.  Surface it only
+                    # when DEBUG is enabled and operators have opted in to verbose
+                    # logging.
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"Token refresh response body: {response.text}")
                     response.raise_for_status()
 
                 # Parse JSON response
                 data = response.json()
-                logger.debug(f"Response: {data}")
+                # Never log the raw `data` dict — it contains the bearer access
+                # token.  Log only non-sensitive metadata.
+                logger.debug(
+                    "Token refresh response received (keys=%s)",
+                    sorted(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                )
 
                 # Pull access token from JSON response
                 # Access tokens have a 20-minute lifetime
@@ -235,7 +259,12 @@ class TradeStationAuth:
             raise
         except KeyError as e:
             logger.error(f"Unexpected token response format, missing key: {e}")
-            logger.debug(f"Response data: {data}")
+            # Log only the key set, never the values (which include the bearer token).
+            try:
+                key_summary = sorted(data.keys()) if isinstance(data, dict) else type(data).__name__
+            except Exception:
+                key_summary = "unavailable"
+            logger.debug(f"Response key summary: {key_summary}")
             raise
         except Exception as e:
             logger.critical(f"Unexpected error during token refresh: {e}", exc_info=True)
