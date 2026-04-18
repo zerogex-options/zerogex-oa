@@ -21,9 +21,9 @@ logger = get_logger(__name__)
 
 
 class SignalEngineService:
-    def __init__(self, underlying: str = "SPY", interval_seconds: int = 300):
+    def __init__(self, underlying: str = "SPY", interval_seconds: int = 1):
         self.underlying = underlying.upper()
-        self.interval_seconds = max(30, int(interval_seconds))
+        self.interval_seconds = max(1, int(interval_seconds))
         self.running = False
         self.unified_engine = UnifiedSignalEngine(underlying=self.underlying)
 
