@@ -40,9 +40,11 @@ from src.config import (
     SIGNALS_TRIGGER_THRESHOLD,
 )
 from src.database import db_connection
+from src.signals.execution import leg_fill_price
 from src.signals.position_optimizer_engine import (
     PositionOptimizerContext,
     PositionOptimizerEngine,
+    TARGET_DTE_WINDOWS,
     fetch_option_snapshot,
 )
 from src.signals.scoring_engine import ScoreSnapshot
@@ -582,7 +584,6 @@ class PortfolioEngine:
         self, tp: TargetPosition, target: PortfolioTarget, conn
     ) -> bool:
         """Insert a new row to signal_trades. Returns True if inserted."""
-        components_at_entry = dict(target.composite_score if isinstance(target.composite_score, dict) else {})
         components_at_entry = {"optimizer": tp.optimizer_payload}
 
         cur = conn.cursor()
@@ -764,10 +765,27 @@ class PortfolioEngine:
     def _latest_option_mark(
         self, option_symbol: str, as_of: datetime, conn
     ) -> Optional[float]:
+        """Mid-price for a single option at-or-before ``as_of``.
+
+        Used as the legacy fallback when a trade has no per-leg metadata and we
+        can't apply a side-aware exit fill.
+        """
+        quote = self._latest_option_quote(option_symbol, as_of, conn)
+        if quote is None:
+            return None
+        bid, ask, last = quote
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2.0
+        return max(last, ask, bid, 0.0) or None
+
+    def _latest_option_quote(
+        self, option_symbol: str, as_of: datetime, conn
+    ) -> Optional[tuple[float, float, float]]:
+        """Latest (bid, ask, last) for a single option at-or-before ``as_of``."""
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT COALESCE(mid, (bid + ask)/2.0, last)
+            SELECT bid, ask, last
             FROM option_chains
             WHERE option_symbol = %s
               AND timestamp <= %s
@@ -777,17 +795,19 @@ class PortfolioEngine:
             (option_symbol, as_of),
         )
         row = cur.fetchone()
-        return float(row[0]) if row and row[0] is not None else None
+        if not row:
+            return None
+        bid, ask, last = row
+        return (float(bid or 0.0), float(ask or 0.0), float(last or 0.0))
 
     def _spread_mark(
         self, trade: dict, as_of: datetime, conn
     ) -> tuple[Optional[float], str]:
-        """Mark the spread using every leg, matching how entry debit/credit was formed.
+        """Mark the spread at its realistic *liquidation* price per share.
 
-        Entry debit (bull_call_debit, bear_put_debit) was computed in the optimizer
-        as ``long_mid - short_mid``. Entry credit (bull_put_credit, bear_call_credit,
-        iron_condor) was computed as ``short_mid - long_mid``. We mirror that here
-        so the current per-share value is directly comparable to ``entry_price``.
+        Each leg is priced with a side-aware exit fill: the long leg is sold at
+        the bid, the short leg is bought back at the ask.  The optional
+        slippage knob (SIGNALS_EXECUTION_SLIPPAGE_PCT) widens both sides.
 
         Returns (value_per_share, pricing_mode). ``pricing_mode`` is "debit" or
         "credit"; on missing/partial chain data returns ``(None, pricing_mode)``.
@@ -806,18 +826,23 @@ class PortfolioEngine:
             symbol = leg.get("option_symbol")
             if not symbol:
                 return None, pricing_mode
-            mid = self._latest_option_mark(symbol, as_of, conn)
-            if mid is None:
+            quote = self._latest_option_quote(symbol, as_of, conn)
+            if quote is None:
                 return None, pricing_mode
+            bid, ask, last = quote
             side = str(leg.get("side") or "").lower()
-            if side == "long":
-                long_sum += mid
-            elif side == "short":
-                short_sum += mid
-            else:
+            if side not in {"long", "short"}:
                 return None, pricing_mode
+            fill = leg_fill_price(
+                bid=bid, ask=ask, last=last, side=side, action="close"
+            )
+            if side == "long":
+                long_sum += fill
+            else:
+                short_sum += fill
 
         if pricing_mode == "credit":
+            # Cost-to-close a credit spread: buy shorts back, sell longs out.
             return short_sum - long_sum, pricing_mode
         return long_sum - short_sum, pricing_mode
 
@@ -916,9 +941,7 @@ class PortfolioEngine:
             score.normalized_score
         )
         signal_strength = self._infer_signal_strength(score.normalized_score)
-
-        dte_ranges = {"intraday": (0, 2), "swing": (1, 7), "multi_day": (3, 14)}
-        dte_min, dte_max = dte_ranges.get(signal_timeframe, (1, 7))
+        dte_min, dte_max = TARGET_DTE_WINDOWS.get(signal_timeframe, (1, 7))
 
         # Reuse option rows from OpportunityQualityComponent if available
         # and the DTE window matches, avoiding a duplicate option_chains scan.
