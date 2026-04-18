@@ -461,11 +461,30 @@ class TestSpreadPricing:
     def test_debit_spread_marks_with_both_legs(self):
         engine = _make_engine()
         # Long leg rises to 3.40, short leg rises to 0.70 => net value 2.70 (+$0.20).
-        marks = {"SPY 260410C500": 3.40, "SPY 260410C505": 0.70}
-        with patch.object(engine, "_latest_option_mark", side_effect=lambda sym, *a, **kw: marks[sym]):
+        # Zero-width quotes exercise the happy path: bid == ask, so the
+        # realistic exit fill (sell long at bid, buy short at ask) equals mid.
+        quotes = {
+            "SPY 260410C500": (3.40, 3.40, 3.40),
+            "SPY 260410C505": (0.70, 0.70, 0.70),
+        }
+        with patch.object(engine, "_latest_option_quote", side_effect=lambda sym, *a, **kw: quotes[sym]):
             value, mode = engine._spread_mark(self._debit_trade(), NOW, conn=MagicMock())
         assert mode == "debit"
         assert value == pytest.approx(2.70)
+
+    def test_debit_spread_exit_fill_uses_bid_for_long_and_ask_for_short(self):
+        engine = _make_engine()
+        # Realistic exit of a debit spread: sell long at bid, buy short at ask.
+        # long 500C bid=3.30/ask=3.50; short 505C bid=0.60/ask=0.80
+        # liquidation = 3.30 - 0.80 = 2.50 (tighter than the 2.70 mid).
+        quotes = {
+            "SPY 260410C500": (3.30, 3.50, 3.40),
+            "SPY 260410C505": (0.60, 0.80, 0.70),
+        }
+        with patch.object(engine, "_latest_option_quote", side_effect=lambda sym, *a, **kw: quotes[sym]):
+            value, mode = engine._spread_mark(self._debit_trade(), NOW, conn=MagicMock())
+        assert mode == "debit"
+        assert value == pytest.approx(2.50)
 
     def test_debit_spread_pnl_matches_both_legs(self):
         # Entry $2.50, current $2.70, 2 contracts => ($2.70 - $2.50) * 2 * 100 = $40.
@@ -498,7 +517,7 @@ class TestSpreadPricing:
 
     def test_missing_leg_mark_returns_none(self):
         engine = _make_engine()
-        with patch.object(engine, "_latest_option_mark", return_value=None):
+        with patch.object(engine, "_latest_option_quote", return_value=None):
             value, mode = engine._spread_mark(self._debit_trade(), NOW, conn=MagicMock())
         assert value is None
         assert mode == "debit"

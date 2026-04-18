@@ -12,6 +12,7 @@ import pytz
 
 from src.database import db_connection
 from src.config import SIGNALS_PORTFOLIO_SIZE
+from src.signals.execution import leg_fill_price_from_row
 from src.symbols import get_canonical_symbol
 from src.utils import get_logger
 
@@ -630,9 +631,18 @@ class PositionOptimizerEngine:
         strikes_label = ""
         reasoning = []
 
+        # Realistic entry fills: buy long legs at ask, sell short legs at bid
+        # (plus any configured slippage).  Stored as per-share numbers first and
+        # scaled to per-contract ($ * 100) at the final math step.
+        def buy(row: dict) -> float:
+            return leg_fill_price_from_row(row, side="long", action="open")
+
+        def sell(row: dict) -> float:
+            return leg_fill_price_from_row(row, side="short", action="open")
+
         if strategy_type == "bull_call_debit":
             long_call, short_call = long_leg, short_leg
-            debit = max(self._mid(long_call) - self._mid(short_call), 0.01) * 100.0
+            debit = max(buy(long_call) - sell(short_call), 0.01) * 100.0
             max_profit = max(width * 100.0 - debit, 0.0)
             max_loss = debit
             short_strike, long_strike = short_call["strike"], long_call["strike"]
@@ -643,7 +653,7 @@ class PositionOptimizerEngine:
             strikes_label = f"Long {long_call['strike']:.0f}C / Short {short_call['strike']:.0f}C"
         elif strategy_type == "bear_put_debit":
             long_put, short_put = long_leg, short_leg
-            debit = max(self._mid(long_put) - self._mid(short_put), 0.01) * 100.0
+            debit = max(buy(long_put) - sell(short_put), 0.01) * 100.0
             max_profit = max(width * 100.0 - debit, 0.0)
             max_loss = debit
             short_strike, long_strike = short_put["strike"], long_put["strike"]
@@ -654,7 +664,7 @@ class PositionOptimizerEngine:
             strikes_label = f"Long {long_put['strike']:.0f}P / Short {short_put['strike']:.0f}P"
         elif strategy_type == "bull_put_credit":
             short_put, long_put = short_leg, long_leg
-            credit = max(self._mid(short_put) - self._mid(long_put), 0.01) * 100.0
+            credit = max(sell(short_put) - buy(long_put), 0.01) * 100.0
             max_profit = credit
             max_loss = max(width * 100.0 - credit, 0.01)
             short_strike, long_strike = short_put["strike"], long_put["strike"]
@@ -665,7 +675,7 @@ class PositionOptimizerEngine:
             strikes_label = f"Short {short_put['strike']:.0f}P / Long {long_put['strike']:.0f}P"
         elif strategy_type == "bear_call_credit":
             short_call, long_call = short_leg, long_leg
-            credit = max(self._mid(short_call) - self._mid(long_call), 0.01) * 100.0
+            credit = max(sell(short_call) - buy(long_call), 0.01) * 100.0
             max_profit = credit
             max_loss = max(width * 100.0 - credit, 0.01)
             short_strike, long_strike = short_call["strike"], long_call["strike"]
@@ -677,8 +687,8 @@ class PositionOptimizerEngine:
         elif strategy_type == "iron_condor" and iron_call is not None:
             short_put, long_put = short_leg, long_leg
             short_call, long_call = iron_call
-            put_credit = max(self._mid(short_put) - self._mid(long_put), 0.01)
-            call_credit = max(self._mid(short_call) - self._mid(long_call), 0.01)
+            put_credit = max(sell(short_put) - buy(long_put), 0.01)
+            call_credit = max(sell(short_call) - buy(long_call), 0.01)
             credit = (put_credit + call_credit) * 100.0
             call_width = abs(long_call["strike"] - short_call["strike"])
             put_width = abs(short_put["strike"] - long_put["strike"])

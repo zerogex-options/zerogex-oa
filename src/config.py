@@ -298,6 +298,20 @@ SIGNALS_DRS_OVERRIDE_THRESHOLD = float(
 # initial premium paid (debit trades) or 25% of max-risk (credit trades).
 SIGNALS_STOP_LOSS_PCT = float(os.getenv("SIGNALS_STOP_LOSS_PCT", "-0.25"))
 
+# -----------------------------------------------------------------------------
+# Execution model -- realistic entry/exit fills
+# -----------------------------------------------------------------------------
+# When pricing a candidate spread, long legs fill at ask and short legs fill
+# at bid (the opposite on exit).  This parameter widens each side by the given
+# fraction to model slippage / adverse-selection on top of the quoted spread:
+#   buyer pays  = ask * (1 + slippage)
+#   seller gets = bid * (1 - slippage)
+# Default 0.0 preserves historical behavior (pure bid/ask fill).  Typical
+# live-trading values are 0.01-0.03 (1-3%).
+SIGNALS_EXECUTION_SLIPPAGE_PCT = max(
+    0.0, float(os.getenv("SIGNALS_EXECUTION_SLIPPAGE_PCT", "0.0"))
+)
+
 # =============================================================================
 # Ingestion/Analytics CLI Defaults
 # =============================================================================
