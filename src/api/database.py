@@ -2651,6 +2651,48 @@ class DatabaseManager:
             logger.error(f"get_eod_pressure_signal failed ({symbol}): {e}")
             return None
 
+    async def get_independent_signal(
+        self,
+        symbol: str = "SPY",
+        signal_name: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Return the most recent independent signal from signal_component_scores."""
+        query = """
+            SELECT
+                scs.underlying,
+                scs.timestamp,
+                scs.clamped_score,
+                scs.weighted_score,
+                scs.weight,
+                scs.context_values,
+                CASE
+                    WHEN scs.clamped_score > 0 THEN 'bullish'
+                    WHEN scs.clamped_score < 0 THEN 'bearish'
+                    ELSE 'neutral'
+                END AS direction
+            FROM signal_component_scores scs
+            WHERE scs.underlying = $1
+              AND scs.component_name = $2
+            ORDER BY scs.timestamp DESC
+            LIMIT 1
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(query, symbol, signal_name)
+                if not row:
+                    return None
+                d = dict(row)
+                raw = d.get("clamped_score") or 0.0
+                d["score"] = round(float(raw) * 100.0, 2)
+                ctx = d.get("context_values") or {}
+                if isinstance(ctx, str):
+                    ctx = json.loads(ctx)
+                d["context_values"] = ctx
+                return d
+        except Exception as e:
+            logger.error(f"get_independent_signal failed ({symbol}, {signal_name}): {e}")
+            return None
+
     async def get_position_optimizer_signal(
         self,
         symbol: str = "SPY",

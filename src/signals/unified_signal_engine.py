@@ -9,6 +9,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Optional
 import os
+import json
 
 from src.database import db_connection
 from src.signals.components.base import MarketContext
@@ -28,6 +29,7 @@ from src.signals.components.smart_money import SmartMoneyComponent
 from src.signals.components.tape_flow_bias import TapeFlowBiasComponent
 from src.signals.components.vanna_charm_flow import VannaCharmFlowComponent
 from src.signals.components.vol_expansion import VolExpansionComponent
+from src.signals.independent_signals import IndependentSignalEngine
 from src.signals.portfolio_engine import PortfolioEngine
 from src.signals.scoring_engine import ScoringEngine
 from src.symbols import get_canonical_symbol
@@ -64,6 +66,7 @@ class UnifiedSignalEngine:
         )
 
         self.portfolio_engine = PortfolioEngine(self.underlying)
+        self.independent_signal_engine = IndependentSignalEngine()
         self._iv_rank_enabled = os.getenv("SIGNAL_IV_RANK_ENABLED", "false").lower() == "true"
         if not self._iv_rank_enabled:
             logger.info(
@@ -300,6 +303,69 @@ class UnifiedSignalEngine:
                 )
                 sm_call, sm_put = cur.fetchone() or (0.0, 0.0)
 
+                # Call/put premium flow acceleration over two consecutive windows.
+                # Positive delta means demand is increasing in the latest window.
+                call_flow_delta = 0.0
+                put_flow_delta = 0.0
+                try:
+                    cur.execute(
+                        """
+                        WITH windows AS (
+                            SELECT
+                                CASE
+                                    WHEN timestamp > %s - INTERVAL '15 minutes' THEN 'recent'
+                                    WHEN timestamp > %s - INTERVAL '30 minutes' THEN 'prior'
+                                    ELSE NULL
+                                END AS bucket,
+                                option_type,
+                                SUM(COALESCE(buy_premium, 0) - COALESCE(sell_premium, 0)) AS net_premium
+                            FROM flow_by_type
+                            WHERE symbol = %s
+                              AND timestamp BETWEEN %s - INTERVAL '30 minutes' AND %s
+                            GROUP BY 1, 2
+                        )
+                        SELECT
+                            COALESCE(SUM(CASE WHEN bucket='recent' AND option_type='C' THEN net_premium END), 0)
+                            - COALESCE(SUM(CASE WHEN bucket='prior' AND option_type='C' THEN net_premium END), 0),
+                            COALESCE(SUM(CASE WHEN bucket='recent' AND option_type='P' THEN net_premium END), 0)
+                            - COALESCE(SUM(CASE WHEN bucket='prior' AND option_type='P' THEN net_premium END), 0)
+                        FROM windows
+                        """,
+                        (ts, ts, self.db_symbol, ts, ts),
+                    )
+                    flow_delta_row = cur.fetchone() or (0.0, 0.0)
+                    call_flow_delta = float(flow_delta_row[0] or 0.0)
+                    put_flow_delta = float(flow_delta_row[1] or 0.0)
+                except Exception as exc:
+                    logger.warning(
+                        "UnifiedSignalEngine [%s]: flow acceleration fetch failed: %s",
+                        self.db_symbol,
+                        exc,
+                    )
+
+                prev_net_gex = None
+                try:
+                    cur.execute(
+                        """
+                        SELECT total_net_gex
+                        FROM gex_summary
+                        WHERE underlying = %s
+                          AND timestamp < %s
+                        ORDER BY timestamp DESC
+                        LIMIT 1
+                        """,
+                        (self.db_symbol, ts),
+                    )
+                    prev_row = cur.fetchone()
+                    if prev_row and prev_row[0] is not None:
+                        prev_net_gex = float(prev_row[0])
+                except Exception as exc:
+                    logger.warning(
+                        "UnifiedSignalEngine [%s]: previous net gex fetch failed: %s",
+                        self.db_symbol,
+                        exc,
+                    )
+
                 cur.execute(
                     """
                     SELECT close
@@ -382,6 +448,9 @@ class UnifiedSignalEngine:
                     "gex_by_strike": gex_strike_rows,
                     "flow_by_type": flow_by_type_rows,
                     "skew": skew_info,
+                    "call_flow_delta": call_flow_delta,
+                    "put_flow_delta": put_flow_delta,
+                    "net_gex_delta": float(net_gex or 0.0) - prev_net_gex if prev_net_gex is not None else 0.0,
                 }
 
     def _build_market_context(self, ctx: dict) -> MarketContext:
@@ -409,8 +478,42 @@ class UnifiedSignalEngine:
                 "put_call_ratio_source": ctx.get("put_call_ratio_source"),
                 "put_call_ratio_volume": ctx.get("put_call_ratio_volume"),
                 "put_call_ratio_oi": ctx.get("put_call_ratio_oi"),
+                "call_flow_delta": ctx.get("call_flow_delta"),
+                "put_flow_delta": ctx.get("put_flow_delta"),
+                "net_gex_delta": ctx.get("net_gex_delta"),
             },
         )
+
+    def _persist_independent_signals(self, market_context: MarketContext) -> None:
+        results = self.independent_signal_engine.evaluate(market_context)
+        if not results:
+            return
+
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                for result in results:
+                    cur.execute(
+                        """
+                        INSERT INTO signal_component_scores (
+                            underlying, timestamp, component_name, clamped_score, weighted_score, weight, context_values
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                        ON CONFLICT (underlying, timestamp, component_name) DO UPDATE SET
+                            clamped_score = EXCLUDED.clamped_score,
+                            weighted_score = EXCLUDED.weighted_score,
+                            weight = EXCLUDED.weight,
+                            context_values = EXCLUDED.context_values
+                        """,
+                        (
+                            market_context.underlying,
+                            market_context.timestamp,
+                            result.name,
+                            result.score,
+                            0.0,
+                            0.0,
+                            json.dumps(result.context, default=str),
+                        ),
+                    )
+            conn.commit()
 
     def run_cycle(self) -> bool:
         # Each phase acquires and releases its own connection to avoid
@@ -430,6 +533,7 @@ class UnifiedSignalEngine:
         # score to confirm itself.
         market_context = self._build_market_context(ctx)
         score = self.scoring_engine.score_and_persist(market_context)
+        self._persist_independent_signals(market_context)
 
         # Phase 3: reconcile portfolio (acquires connection for reads+writes)
         # Pass cached option rows from OpportunityQualityComponent to avoid
