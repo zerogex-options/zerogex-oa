@@ -196,3 +196,72 @@ async def get_eod_pressure_signal(
     row["time_ramp"] = ctx.get("time_ramp")
     row["calendar_flags"] = ctx.get("calendar_flags")
     return row
+
+
+@router.get("/squeeze-setup")
+async def get_squeeze_setup_signal(
+    symbol: str = Query(default="SPY"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Latest independent squeeze-setup alert (not part of composite score)."""
+    row = await db.get_independent_signal(symbol.upper(), "squeeze_setup")
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No squeeze-setup signal found for {symbol.upper()}")
+    ctx = row.get("context_values") or {}
+    row["triggered"] = ctx.get("triggered", False)
+    row["signal"] = ctx.get("signal", "none")
+    row["call_flow_delta"] = ctx.get("call_flow_delta")
+    row["put_flow_delta"] = ctx.get("put_flow_delta")
+    return row
+
+
+@router.get("/trap-detection")
+async def get_trap_detection_signal(
+    symbol: str = Query(default="SPY"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Latest independent trap-detection/fade signal (not part of composite score)."""
+    row = await db.get_independent_signal(symbol.upper(), "trap_detection")
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No trap-detection signal found for {symbol.upper()}")
+    ctx = row.get("context_values") or {}
+    row["triggered"] = ctx.get("triggered", False)
+    row["signal"] = ctx.get("signal", "none")
+    row["breakout_up"] = ctx.get("breakout_up", False)
+    row["breakout_down"] = ctx.get("breakout_down", False)
+    row["net_gex_delta"] = ctx.get("net_gex_delta")
+    return row
+
+
+@router.get("/0dte-position-imbalance")
+async def get_zero_dte_position_imbalance_signal(
+    symbol: str = Query(default="SPY"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Latest independent 0DTE position-imbalance indicator."""
+    row = await db.get_independent_signal(symbol.upper(), "zero_dte_position_imbalance")
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No 0DTE position-imbalance signal found for {symbol.upper()}")
+    ctx = row.get("context_values") or {}
+    row["triggered"] = ctx.get("triggered", False)
+    row["signal"] = ctx.get("signal", "balanced")
+    row["flow_imbalance"] = ctx.get("flow_imbalance")
+    row["smart_imbalance"] = ctx.get("smart_imbalance")
+    return row
+
+
+@router.get("/gamma-vwap-confluence")
+async def get_gamma_vwap_confluence_signal(
+    symbol: str = Query(default="SPY"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Latest independent gamma+VWAP confluence indicator."""
+    row = await db.get_independent_signal(symbol.upper(), "gamma_vwap_confluence")
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No gamma+VWAP confluence signal found for {symbol.upper()}")
+    ctx = row.get("context_values") or {}
+    row["triggered"] = ctx.get("triggered", False)
+    row["signal"] = ctx.get("signal", "none")
+    row["confluence_level"] = ctx.get("confluence_level")
+    row["cluster_gap_pct"] = ctx.get("cluster_gap_pct")
+    return row
