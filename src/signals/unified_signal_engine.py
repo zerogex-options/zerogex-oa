@@ -87,10 +87,16 @@ class UnifiedSignalEngine:
     def _fetch_market_context(self, conn=None) -> Optional[dict]:
         with self._use_conn(conn) as conn:
             with conn.cursor() as cur:
+                # Fetch underlying quote + latest gex_summary ROW including
+                # the gex_summary timestamp so the prev-gex lookup below can
+                # use the *gex_summary* ts (not underlying ts).  Fixes C1 —
+                # previously the "prev" query re-selected the same row,
+                # forcing net_gex_delta=0 on every cycle.
                 cur.execute(
                     """
                     SELECT uq.timestamp,
                            uq.close,
+                           gs.timestamp AS gs_ts,
                            gs.total_net_gex,
                            gs.gamma_flip_point,
                            gs.put_call_ratio,
@@ -99,7 +105,7 @@ class UnifiedSignalEngine:
                            gs.total_put_oi
                     FROM underlying_quotes uq
                     LEFT JOIN LATERAL (
-                        SELECT total_net_gex, gamma_flip_point, put_call_ratio, max_pain,
+                        SELECT timestamp, total_net_gex, gamma_flip_point, put_call_ratio, max_pain,
                                total_call_oi, total_put_oi
                         FROM gex_summary
                         WHERE underlying = %s AND timestamp <= uq.timestamp
@@ -115,7 +121,17 @@ class UnifiedSignalEngine:
                 row = cur.fetchone()
                 if not row:
                     return None
-                ts, close, net_gex, gamma_flip, pcr, max_pain, total_call_oi, total_put_oi = row
+                (
+                    ts,
+                    close,
+                    gs_ts,
+                    net_gex,
+                    gamma_flip,
+                    pcr,
+                    max_pain,
+                    total_call_oi,
+                    total_put_oi,
+                ) = row
                 close_f = float(close)
 
                 # Open-interest-based PCR is structurally more stable than the
@@ -152,8 +168,11 @@ class UnifiedSignalEngine:
                 # Single pass over gex_by_strike: fetch the per-strike exposure
                 # window around spot (used by gex_gradient, dealer_delta_pressure,
                 # vanna_charm_flow, eod_pressure) and derive call_wall and
-                # max_gamma_strike in Python from the same rows.
+                # max_gamma_strike in Python from the same rows.  Also fetches
+                # dealer-sign charm/vanna (C3) and expiration_bucket for EOD
+                # pressure expiry-weighting (S2).
                 gex_strike_rows: list[dict] = []
+                gex_strike_by_bucket: dict[str, list[dict]] = {}
                 call_wall: Optional[float] = None
                 max_gamma_strike: Optional[float] = None
                 try:
@@ -165,11 +184,14 @@ class UnifiedSignalEngine:
                             WHERE underlying = %s AND timestamp <= %s
                         )
                         SELECT strike,
-                               SUM(COALESCE(net_gex, 0))         AS net_gex,
-                               SUM(COALESCE(call_oi, 0))         AS call_oi,
-                               SUM(COALESCE(put_oi, 0))          AS put_oi,
-                               SUM(COALESCE(vanna_exposure, 0))  AS vanna_exposure,
-                               SUM(COALESCE(charm_exposure, 0))  AS charm_exposure
+                               SUM(COALESCE(net_gex, 0))                 AS net_gex,
+                               SUM(COALESCE(call_oi, 0))                 AS call_oi,
+                               SUM(COALESCE(put_oi, 0))                  AS put_oi,
+                               SUM(COALESCE(vanna_exposure, 0))          AS vanna_exposure,
+                               SUM(COALESCE(charm_exposure, 0))          AS charm_exposure,
+                               SUM(COALESCE(dealer_vanna_exposure, -vanna_exposure, 0)) AS dealer_vanna,
+                               SUM(COALESCE(dealer_charm_exposure, -charm_exposure, 0)) AS dealer_charm,
+                               COALESCE(MAX(expiration_bucket), 'monthly') AS expiration_bucket
                         FROM gex_by_strike g, latest
                         WHERE g.underlying = %s
                           AND g.timestamp = latest.ts
@@ -194,6 +216,46 @@ class UnifiedSignalEngine:
                                 "put_oi": int(r[3] or 0),
                                 "vanna_exposure": float(r[4] or 0.0),
                                 "charm_exposure": float(r[5] or 0.0),
+                                # Dealer-sign convention (preferred for flow-direction signals)
+                                "dealer_vanna_exposure": float(r[6] or 0.0),
+                                "dealer_charm_exposure": float(r[7] or 0.0),
+                                "expiration_bucket": r[8] or "monthly",
+                            }
+                        )
+                    # Also fetch expiry-bucketed charm for EOD pressure (S2):
+                    # dealer 0DTE charm, weekly, monthly separately.
+                    cur.execute(
+                        """
+                        WITH latest AS (
+                            SELECT MAX(timestamp) AS ts
+                            FROM gex_by_strike
+                            WHERE underlying = %s AND timestamp <= %s
+                        )
+                        SELECT strike,
+                               COALESCE(expiration_bucket, 'monthly') AS bucket,
+                               SUM(COALESCE(dealer_charm_exposure, -charm_exposure, 0)) AS d_charm,
+                               SUM(COALESCE(dealer_vanna_exposure, -vanna_exposure, 0)) AS d_vanna
+                        FROM gex_by_strike g, latest
+                        WHERE g.underlying = %s
+                          AND g.timestamp = latest.ts
+                          AND g.strike BETWEEN %s AND %s
+                        GROUP BY strike, bucket
+                        """,
+                        (
+                            self.db_symbol,
+                            ts,
+                            self.db_symbol,
+                            close_f * 0.90,
+                            close_f * 1.10,
+                        ),
+                    )
+                    for r in cur.fetchall():
+                        bucket = r[1] or "monthly"
+                        gex_strike_by_bucket.setdefault(bucket, []).append(
+                            {
+                                "strike": float(r[0]),
+                                "dealer_charm_exposure": float(r[2] or 0.0),
+                                "dealer_vanna_exposure": float(r[3] or 0.0),
                             }
                         )
                     if gex_strike_rows:
@@ -291,17 +353,98 @@ class UnifiedSignalEngine:
                         exc,
                     )
 
-                cur.execute(
-                    """
-                    SELECT COALESCE(SUM(CASE WHEN option_type='C' THEN total_premium ELSE 0 END), 0),
-                           COALESCE(SUM(CASE WHEN option_type='P' THEN total_premium ELSE 0 END), 0)
-                    FROM flow_smart_money
-                    WHERE symbol = %s
-                      AND timestamp BETWEEN %s - INTERVAL '30 minutes' AND %s
-                    """,
-                    (self.db_symbol, ts, ts),
-                )
-                sm_call, sm_put = cur.fetchone() or (0.0, 0.0)
+                # C7: signed smart-money imbalance.  The previous aggregation
+                # summed ``total_premium`` which is gross notional and doesn't
+                # distinguish buyers from sellers — heavy call-selling + heavy
+                # put-selling shows up as "balanced" when the directional bias
+                # is clearly bearish.  Prefer signed buy-sell flow from
+                # flow_contract_facts (which has Lee-Ready buy/sell splits)
+                # and fall back to flow_smart_money's gross totals only when
+                # signed flow is unavailable.
+                sm_call = 0.0
+                sm_put = 0.0
+                sm_call_gross = 0.0
+                sm_put_gross = 0.0
+                try:
+                    cur.execute(
+                        """
+                        SELECT option_type,
+                               SUM(COALESCE(buy_premium, 0) - COALESCE(sell_premium, 0)) AS net_premium,
+                               SUM(COALESCE(buy_premium, 0) + COALESCE(sell_premium, 0)) AS gross_premium
+                        FROM flow_contract_facts
+                        WHERE symbol = %s
+                          AND timestamp BETWEEN %s - INTERVAL '30 minutes' AND %s
+                        GROUP BY option_type
+                        """,
+                        (self.db_symbol, ts, ts),
+                    )
+                    for r in cur.fetchall():
+                        if r[0] == "C":
+                            sm_call = float(r[1] or 0.0)
+                            sm_call_gross = float(r[2] or 0.0)
+                        elif r[0] == "P":
+                            sm_put = float(r[1] or 0.0)
+                            sm_put_gross = float(r[2] or 0.0)
+                except Exception as exc:
+                    logger.warning(
+                        "UnifiedSignalEngine [%s]: signed smart-money fetch failed: %s",
+                        self.db_symbol,
+                        exc,
+                    )
+                    cur.execute(
+                        """
+                        SELECT COALESCE(SUM(CASE WHEN option_type='C' THEN total_premium ELSE 0 END), 0),
+                               COALESCE(SUM(CASE WHEN option_type='P' THEN total_premium ELSE 0 END), 0)
+                        FROM flow_smart_money
+                        WHERE symbol = %s
+                          AND timestamp BETWEEN %s - INTERVAL '30 minutes' AND %s
+                        """,
+                        (self.db_symbol, ts, ts),
+                    )
+                    sm_call, sm_put = cur.fetchone() or (0.0, 0.0)
+                    sm_call_gross, sm_put_gross = abs(sm_call), abs(sm_put)
+
+                # C6: true 0DTE flow by option_type and moneyness.  Previously
+                # /api/signals/0dte-position-imbalance used flow_by_type which
+                # has no expiration column and therefore aggregated every DTE.
+                # flow_contract_facts exposes expiration + strike so we can
+                # filter to today's expiration and split by OTM/ATM moneyness
+                # for the improved per-signal scoring (S5).
+                zero_dte_flow: list[dict] = []
+                try:
+                    cur.execute(
+                        """
+                        SELECT option_type,
+                               strike,
+                               SUM(COALESCE(buy_premium, 0))  AS buy_premium,
+                               SUM(COALESCE(sell_premium, 0)) AS sell_premium,
+                               SUM(COALESCE(buy_volume, 0))   AS buy_volume,
+                               SUM(COALESCE(sell_volume, 0))  AS sell_volume
+                        FROM flow_contract_facts
+                        WHERE symbol = %s
+                          AND timestamp BETWEEN %s - INTERVAL '30 minutes' AND %s
+                          AND expiration = ((%s AT TIME ZONE 'America/New_York')::date)
+                        GROUP BY option_type, strike
+                        """,
+                        (self.db_symbol, ts, ts, ts),
+                    )
+                    for r in cur.fetchall():
+                        zero_dte_flow.append(
+                            {
+                                "option_type": r[0],
+                                "strike": float(r[1]),
+                                "buy_premium": float(r[2] or 0.0),
+                                "sell_premium": float(r[3] or 0.0),
+                                "buy_volume": int(r[4] or 0),
+                                "sell_volume": int(r[5] or 0),
+                            }
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "UnifiedSignalEngine [%s]: 0dte flow fetch failed: %s",
+                        self.db_symbol,
+                        exc,
+                    )
 
                 # Call/put premium flow acceleration over two consecutive windows.
                 # Positive delta means demand is increasing in the latest window.
@@ -343,40 +486,132 @@ class UnifiedSignalEngine:
                         exc,
                     )
 
+                # C1: use gex_summary's own timestamp for the "previous" row,
+                # not underlying_quotes.timestamp.  Previously this compared
+                # ``timestamp < uq.ts`` — but ``uq.ts`` is almost always
+                # strictly greater than the latest ``gex_summary.ts`` (signals
+                # run 1Hz; analytics writes gex_summary every 60s), so the
+                # LATERAL and the "prev" query both returned the same row and
+                # net_gex_delta was structurally 0 on every cycle.
                 prev_net_gex = None
-                try:
-                    cur.execute(
-                        """
-                        SELECT total_net_gex
-                        FROM gex_summary
-                        WHERE underlying = %s
-                          AND timestamp < %s
-                        ORDER BY timestamp DESC
-                        LIMIT 1
-                        """,
-                        (self.db_symbol, ts),
-                    )
-                    prev_row = cur.fetchone()
-                    if prev_row and prev_row[0] is not None:
-                        prev_net_gex = float(prev_row[0])
-                except Exception as exc:
-                    logger.warning(
-                        "UnifiedSignalEngine [%s]: previous net gex fetch failed: %s",
-                        self.db_symbol,
-                        exc,
-                    )
+                if gs_ts is not None:
+                    try:
+                        cur.execute(
+                            """
+                            SELECT total_net_gex
+                            FROM gex_summary
+                            WHERE underlying = %s
+                              AND timestamp < %s
+                            ORDER BY timestamp DESC
+                            LIMIT 1
+                            """,
+                            (self.db_symbol, gs_ts),
+                        )
+                        prev_row = cur.fetchone()
+                        if prev_row and prev_row[0] is not None:
+                            prev_net_gex = float(prev_row[0])
+                    except Exception as exc:
+                        logger.warning(
+                            "UnifiedSignalEngine [%s]: previous net gex fetch failed: %s",
+                            self.db_symbol,
+                            exc,
+                        )
 
+                # C4: extend the close history to 2h of 1-minute bars so
+                # components can compute realized-sigma normalized momentum.
                 cur.execute(
                     """
                     SELECT close
                     FROM underlying_quotes
                     WHERE symbol = %s
                     ORDER BY timestamp DESC
-                    LIMIT 20
+                    LIMIT 120
                     """,
                     (self.db_symbol,),
                 )
                 closes = [float(r[0]) for r in cur.fetchall()]
+
+                # Latest VIX level for optional term-structure gating.  We only
+                # have spot VIX; vix_9d / vix_3m would need a separate ingest.
+                vix_level: Optional[float] = None
+                try:
+                    cur.execute(
+                        """
+                        SELECT close
+                        FROM vix_bars
+                        ORDER BY timestamp DESC
+                        LIMIT 1
+                        """
+                    )
+                    vix_row = cur.fetchone()
+                    if vix_row and vix_row[0] is not None:
+                        vix_level = float(vix_row[0])
+                except Exception:
+                    vix_level = None
+
+                # Historical call_wall strike (~30min ago) so trap_detection
+                # can detect "wall migration" — the single strongest predictor
+                # of a genuine breakout vs. a failed pop.
+                prior_call_wall: Optional[float] = None
+                try:
+                    cur.execute(
+                        """
+                        WITH window_max AS (
+                            SELECT timestamp
+                            FROM gex_by_strike
+                            WHERE underlying = %s
+                              AND timestamp <= %s - INTERVAL '25 minutes'
+                              AND timestamp >= %s - INTERVAL '60 minutes'
+                            ORDER BY timestamp DESC
+                            LIMIT 1
+                        )
+                        SELECT strike
+                        FROM gex_by_strike g, window_max w
+                        WHERE g.underlying = %s
+                          AND g.timestamp = w.timestamp
+                          AND g.strike >= %s
+                        ORDER BY g.call_oi DESC NULLS LAST, g.strike ASC
+                        LIMIT 1
+                        """,
+                        (self.db_symbol, ts, ts, self.db_symbol, close_f),
+                    )
+                    wrow = cur.fetchone()
+                    if wrow and wrow[0] is not None:
+                        prior_call_wall = float(wrow[0])
+                except Exception as exc:
+                    logger.debug(
+                        "UnifiedSignalEngine [%s]: prior call_wall fetch failed: %s",
+                        self.db_symbol,
+                        exc,
+                    )
+
+                # C5: per-symbol normalization constants from the rolling
+                # cache so GEX/charm/flow scales aren't hardcoded for SPY.
+                normalizers: dict[str, float] = {}
+                try:
+                    cur.execute(
+                        """
+                        SELECT field_name, p05, p50, p95, std
+                        FROM component_normalizer_cache
+                        WHERE underlying = %s
+                        """,
+                        (self.db_symbol,),
+                    )
+                    for r in cur.fetchall():
+                        field = r[0]
+                        p95 = float(r[3]) if r[3] is not None else None
+                        std = float(r[4]) if r[4] is not None else None
+                        p50 = float(r[2]) if r[2] is not None else None
+                        # Conservatively prefer p95 magnitude; fall back to
+                        # std-based scale (roughly 2-sigma).
+                        if p95 is not None and p95 > 0:
+                            normalizers[field] = p95
+                        elif std is not None and std > 0:
+                            normalizers[field] = 2.0 * std
+                        elif p50 is not None and p50 > 0:
+                            normalizers[field] = p50
+                except Exception:
+                    normalizers = {}
 
                 iv_rank = None
                 if self._iv_rank_enabled:
@@ -427,10 +662,25 @@ class UnifiedSignalEngine:
                             exc,
                         )
 
+                net_gex_f = float(net_gex or 0.0)
+                if prev_net_gex is not None:
+                    net_gex_delta_raw = net_gex_f - prev_net_gex
+                    # Normalize by prior magnitude (C1 note): a delta of
+                    # 100M is enormous on a 200M book but trivial on a 5B
+                    # book.  Expose both raw and normalized so components
+                    # can pick the scale they need.
+                    denom = max(abs(prev_net_gex), 1.0e6)
+                    net_gex_delta_pct = net_gex_delta_raw / denom
+                else:
+                    net_gex_delta_raw = 0.0
+                    net_gex_delta_pct = 0.0
+
                 return {
                     "timestamp": ts,
+                    "gex_summary_ts": gs_ts,
                     "close": close_f,
-                    "net_gex": float(net_gex or 0.0),
+                    "net_gex": net_gex_f,
+                    "prev_net_gex": prev_net_gex,
                     "gamma_flip": float(gamma_flip) if gamma_flip is not None else None,
                     "put_call_ratio": effective_pcr,
                     "put_call_ratio_source": "oi" if oi_pcr is not None and oi_pcr > 0 else "volume",
@@ -439,18 +689,26 @@ class UnifiedSignalEngine:
                     "max_pain": float(max_pain) if max_pain is not None else None,
                     "smart_call": float(sm_call or 0.0),
                     "smart_put": float(sm_put or 0.0),
+                    "smart_call_gross": float(sm_call_gross or 0.0),
+                    "smart_put_gross": float(sm_put_gross or 0.0),
                     "recent_closes": list(reversed(closes)),
                     "iv_rank": iv_rank,
                     "vwap": vwap,
                     "vwap_deviation_pct": vwap_deviation_pct,
                     "call_wall": call_wall,
+                    "prior_call_wall": prior_call_wall,
                     "max_gamma_strike": max_gamma_strike,
                     "gex_by_strike": gex_strike_rows,
+                    "gex_by_strike_bucket": gex_strike_by_bucket,
                     "flow_by_type": flow_by_type_rows,
+                    "flow_zero_dte": zero_dte_flow,
                     "skew": skew_info,
                     "call_flow_delta": call_flow_delta,
                     "put_flow_delta": put_flow_delta,
-                    "net_gex_delta": float(net_gex or 0.0) - prev_net_gex if prev_net_gex is not None else 0.0,
+                    "net_gex_delta": net_gex_delta_raw,
+                    "net_gex_delta_pct": net_gex_delta_pct,
+                    "vix_level": vix_level,
+                    "normalizers": normalizers,
                 }
 
     def _build_market_context(self, ctx: dict) -> MarketContext:
@@ -471,9 +729,12 @@ class UnifiedSignalEngine:
             vwap_deviation_pct=ctx.get("vwap_deviation_pct"),
             extra={
                 "call_wall": ctx.get("call_wall"),
+                "prior_call_wall": ctx.get("prior_call_wall"),
                 "max_gamma_strike": ctx.get("max_gamma_strike"),
                 "gex_by_strike": ctx.get("gex_by_strike") or [],
+                "gex_by_strike_bucket": ctx.get("gex_by_strike_bucket") or {},
                 "flow_by_type": ctx.get("flow_by_type") or [],
+                "flow_zero_dte": ctx.get("flow_zero_dte") or [],
                 "skew": ctx.get("skew") or {},
                 "put_call_ratio_source": ctx.get("put_call_ratio_source"),
                 "put_call_ratio_volume": ctx.get("put_call_ratio_volume"),
@@ -481,38 +742,117 @@ class UnifiedSignalEngine:
                 "call_flow_delta": ctx.get("call_flow_delta"),
                 "put_flow_delta": ctx.get("put_flow_delta"),
                 "net_gex_delta": ctx.get("net_gex_delta"),
+                "net_gex_delta_pct": ctx.get("net_gex_delta_pct"),
+                "smart_call_gross": ctx.get("smart_call_gross"),
+                "smart_put_gross": ctx.get("smart_put_gross"),
+                "vix_level": ctx.get("vix_level"),
+                "normalizers": ctx.get("normalizers") or {},
             },
         )
+
+    # Per-signal hysteresis state.  Keyed by component_name, stores the last
+    # triggered-flag and the last score actually persisted.  Used to:
+    #   * Dedupe upserts when the score + trigger flag didn't meaningfully
+    #     change between cycles (C8).
+    #   * Require ``SIGNAL_HYSTERESIS_CYCLES`` consecutive cycles of
+    #     triggered=true before emitting a signal_events row (prevents
+    #     single-bar flickers from firing alerts).
+    _HYSTERESIS_CYCLES = max(1, int(os.getenv("SIGNAL_HYSTERESIS_CYCLES", "2")))
+    _SCORE_DEDUPE_EPSILON = float(os.getenv("SIGNAL_SCORE_DEDUPE_EPSILON", "0.01"))
 
     def _persist_independent_signals(self, market_context: MarketContext) -> None:
         results = self.independent_signal_engine.evaluate(market_context)
         if not results:
             return
 
+        if not hasattr(self, "_ind_state"):
+            self._ind_state: dict[str, dict] = {}
+
         with db_connection() as conn:
             with conn.cursor() as cur:
                 for result in results:
-                    cur.execute(
-                        """
-                        INSERT INTO signal_component_scores (
-                            underlying, timestamp, component_name, clamped_score, weighted_score, weight, context_values
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
-                        ON CONFLICT (underlying, timestamp, component_name) DO UPDATE SET
-                            clamped_score = EXCLUDED.clamped_score,
-                            weighted_score = EXCLUDED.weighted_score,
-                            weight = EXCLUDED.weight,
-                            context_values = EXCLUDED.context_values
-                        """,
-                        (
-                            market_context.underlying,
-                            market_context.timestamp,
-                            result.name,
-                            result.score,
-                            0.0,
-                            0.0,
-                            json.dumps(result.context, default=str),
-                        ),
+                    state = self._ind_state.setdefault(
+                        result.name,
+                        {"last_score": None, "last_triggered": False, "streak": 0, "event_emitted": False},
                     )
+
+                    triggered = bool(result.context.get("triggered", False))
+                    prev_score = state["last_score"]
+                    score_delta = (
+                        abs(result.score - prev_score)
+                        if prev_score is not None
+                        else float("inf")
+                    )
+
+                    should_persist = (
+                        prev_score is None
+                        or score_delta >= self._SCORE_DEDUPE_EPSILON
+                        or triggered != state["last_triggered"]
+                    )
+
+                    if should_persist:
+                        cur.execute(
+                            """
+                            INSERT INTO signal_component_scores (
+                                underlying, timestamp, component_name, clamped_score, weighted_score, weight, context_values
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                            ON CONFLICT (underlying, timestamp, component_name) DO UPDATE SET
+                                clamped_score = EXCLUDED.clamped_score,
+                                weighted_score = EXCLUDED.weighted_score,
+                                weight = EXCLUDED.weight,
+                                context_values = EXCLUDED.context_values
+                            """,
+                            (
+                                market_context.underlying,
+                                market_context.timestamp,
+                                result.name,
+                                result.score,
+                                0.0,
+                                0.0,
+                                json.dumps(result.context, default=str),
+                            ),
+                        )
+                        state["last_score"] = result.score
+                        state["last_triggered"] = triggered
+
+                    # Hysteresis: accumulate streak of consecutive triggered
+                    # cycles; only emit an event on the streak threshold.
+                    if triggered:
+                        state["streak"] += 1
+                    else:
+                        state["streak"] = 0
+                        state["event_emitted"] = False
+
+                    if (
+                        triggered
+                        and state["streak"] >= self._HYSTERESIS_CYCLES
+                        and not state["event_emitted"]
+                    ):
+                        try:
+                            cur.execute(
+                                """
+                                INSERT INTO signal_events (
+                                    underlying, timestamp, signal_name, direction, score,
+                                    context_values, close_at_emit
+                                ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s)
+                                """,
+                                (
+                                    market_context.underlying,
+                                    market_context.timestamp,
+                                    result.name,
+                                    result.context.get("signal", "neutral"),
+                                    result.score,
+                                    json.dumps(result.context, default=str),
+                                    market_context.close,
+                                ),
+                            )
+                            state["event_emitted"] = True
+                        except Exception as exc:
+                            logger.debug(
+                                "signal_events insert failed for %s: %s",
+                                result.name,
+                                exc,
+                            )
             conn.commit()
 
     def run_cycle(self) -> bool:

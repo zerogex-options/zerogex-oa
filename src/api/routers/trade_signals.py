@@ -15,10 +15,16 @@ router = APIRouter(prefix="/api/signals", tags=["Trade Signals"])
 
 
 def _scale_signed_100(value: Any) -> Any:
-    """Scale a signed metric into [-100, 100].
+    """Scale a signed [-1, 1] metric into [-100, 100].
 
-    Leaves non-numeric values unchanged. Supports legacy [-1, 1], [-10, 10],
-    and already-scaled [-100, 100] inputs.
+    All score columns in the signal tables are produced by ComponentBase
+    implementations that contractually return values in [-1, +1].  The
+    API tier multiplies by 100 so the UI gets percentage-style numbers
+    without heuristic "scale guessing" (which silently corrupted any
+    component whose honest output happened to exceed ±1).
+
+    Non-numeric values pass through unchanged.  NaN / inf collapse to 0.
+    Result is clamped to [-100, 100] and rounded to 4 decimals.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return value
@@ -27,16 +33,7 @@ def _scale_signed_100(value: Any) -> Any:
     if math.isnan(raw) or math.isinf(raw):
         return 0.0
 
-    if -1.0 <= raw <= 1.0:
-        scaled = raw * 100.0
-    elif -10.0 <= raw <= 10.0:
-        scaled = raw * 10.0
-    else:
-        scaled = raw
-
-    scaled = max(-100.0, min(100.0, scaled))
-    if scaled == 0.0 and raw != 0.0:
-        scaled = 0.0001 if raw > 0 else -0.0001
+    scaled = max(-100.0, min(100.0, raw * 100.0))
     return round(scaled, 4)
 
 
@@ -152,10 +149,11 @@ async def get_vol_expansion_signal(
     row = await db.get_vol_expansion_signal(symbol.upper())
     if not row:
         raise HTTPException(status_code=404, detail=f"No vol-expansion score found for {symbol.upper()}")
-    # Surface expansion & direction from context_values as top-level fields
     ctx = row.get("context_values") or {}
     row["expansion"] = ctx.get("expansion")
     row["direction_score"] = ctx.get("direction")
+    row["magnitude"] = ctx.get("magnitude")
+    row["expected_5min_move_bps"] = ctx.get("expected_5min_move_bps")
     return row
 
 
@@ -212,6 +210,10 @@ async def get_squeeze_setup_signal(
     row["signal"] = ctx.get("signal", "none")
     row["call_flow_delta"] = ctx.get("call_flow_delta")
     row["put_flow_delta"] = ctx.get("put_flow_delta")
+    row["call_flow_z"] = ctx.get("call_flow_z")
+    row["put_flow_z"] = ctx.get("put_flow_z")
+    row["momentum_z"] = ctx.get("momentum_z")
+    row["vix_regime"] = ctx.get("vix_regime")
     return row
 
 
@@ -230,6 +232,12 @@ async def get_trap_detection_signal(
     row["breakout_up"] = ctx.get("breakout_up", False)
     row["breakout_down"] = ctx.get("breakout_down", False)
     row["net_gex_delta"] = ctx.get("net_gex_delta")
+    row["net_gex_delta_pct"] = ctx.get("net_gex_delta_pct")
+    row["resistance_level"] = ctx.get("resistance_level")
+    row["support_level"] = ctx.get("support_level")
+    row["breakout_buffer_pct"] = ctx.get("breakout_buffer_pct")
+    row["wall_migrated_up"] = ctx.get("wall_migrated_up")
+    row["wall_migrated_down"] = ctx.get("wall_migrated_down")
     return row
 
 
@@ -264,4 +272,124 @@ async def get_gamma_vwap_confluence_signal(
     row["signal"] = ctx.get("signal", "none")
     row["confluence_level"] = ctx.get("confluence_level")
     row["cluster_gap_pct"] = ctx.get("cluster_gap_pct")
+    row["expected_target"] = ctx.get("expected_target")
     return row
+
+
+_VALID_SIGNAL_EVENT_NAMES = {
+    "vol_expansion",
+    "eod_pressure",
+    "squeeze_setup",
+    "trap_detection",
+    "zero_dte_position_imbalance",
+    "gamma_vwap_confluence",
+    "positioning_trap",
+    "vanna_charm_flow",
+}
+
+
+@router.get("/{signal_name}/events")
+async def get_signal_events(
+    signal_name: str,
+    symbol: str = Query(default="SPY"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    horizon: str = Query(default="60m", pattern="^(30m|60m|120m)$"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Recent emitted ``signal_events`` rows with realized outcomes.
+
+    Populated by the unified signal engine when a signal crosses the
+    hysteresis threshold. Each row is annotated with the underlying close
+    at emit time and at 30m/60m/120m horizons so the frontend can display
+    hit-rate and avg realized return.
+    """
+    if signal_name not in _VALID_SIGNAL_EVENT_NAMES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown signal_name '{signal_name}'.",
+        )
+    sym = symbol.upper()
+    rows = await db.get_signal_events(sym, signal_name, limit)
+    hit_rate = await db.get_signal_hit_rate(sym, signal_name, horizon)
+    return {
+        "underlying": sym,
+        "signal_name": signal_name,
+        "horizon": horizon,
+        "rows": rows,
+        "count": len(rows),
+        "summary": hit_rate,
+    }
+
+
+@router.get("/confluence-matrix")
+async def get_confluence_matrix(
+    symbol: str = Query(default="SPY"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Cross-signal conditioning snapshot for a single symbol.
+
+    Returns every independent signal's latest score along with composite
+    "confluence" scores that reward agreement between complementary
+    signals (and flag disagreement).  The aim is to help the trader see
+    when multiple mechanical regimes line up — e.g. a continuous squeeze
+    score of +55 stacked with a vol-expansion direction of +80 is a much
+    higher-confidence entry than either score alone.
+    """
+    bundle = await db.get_latest_independent_signals_bundle(symbol.upper())
+
+    def score(name: str) -> float:
+        row = bundle.get(name)
+        if not row:
+            return 0.0
+        try:
+            return float(row.get("score") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    vx = score("vol_expansion")
+    eod = score("eod_pressure")
+    squeeze = score("squeeze_setup")
+    trap = score("trap_detection")
+    zdpi = score("zero_dte_position_imbalance")
+    gvc = score("gamma_vwap_confluence")
+
+    def _same_sign(a: float, b: float) -> bool:
+        return (a > 0 and b > 0) or (a < 0 and b < 0)
+
+    def _pair_strength(a: float, b: float) -> float:
+        if not _same_sign(a, b):
+            return 0.0
+        return round(min(abs(a), abs(b)) * (1.0 if a > 0 else -1.0), 2)
+
+    confluences = {
+        "squeeze_x_vol_expansion": _pair_strength(squeeze, vx),
+        "trap_x_zero_dte": _pair_strength(trap, zdpi),
+        "confluence_x_eod_pressure": _pair_strength(gvc, eod),
+        "squeeze_x_trap_agreement": _pair_strength(squeeze, trap),
+    }
+
+    contradictions = {
+        "squeeze_vs_trap": squeeze * trap < 0 and min(abs(squeeze), abs(trap)) > 20,
+        "vol_expansion_vs_eod": vx * eod < 0 and min(abs(vx), abs(eod)) > 20,
+    }
+
+    dominant_direction = "bullish" if (vx + squeeze + eod + gvc) > 0 else "bearish"
+    agreement_score = round(
+        sum(confluences.values()) / max(1, len(confluences)), 2
+    )
+
+    return {
+        "underlying": symbol.upper(),
+        "signals": {
+            "vol_expansion": bundle.get("vol_expansion"),
+            "eod_pressure": bundle.get("eod_pressure"),
+            "squeeze_setup": bundle.get("squeeze_setup"),
+            "trap_detection": bundle.get("trap_detection"),
+            "zero_dte_position_imbalance": bundle.get("zero_dte_position_imbalance"),
+            "gamma_vwap_confluence": bundle.get("gamma_vwap_confluence"),
+        },
+        "confluences": confluences,
+        "contradictions": contradictions,
+        "agreement_score": agreement_score,
+        "dominant_direction": dominant_direction,
+    }

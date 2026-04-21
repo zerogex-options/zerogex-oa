@@ -55,7 +55,13 @@ def test_trap_detection_bearish_fade_on_upside_breakout():
     ctx = _ctx(
         close=606.0,
         net_gex=300_000_000.0,
-        extra={"net_gex_delta": 700_000_000.0, "call_wall": 603.0, "max_gamma_strike": 602.0},
+        extra={
+            "net_gex_delta": 700_000_000.0,
+            "net_gex_delta_pct": 0.02,  # +2% of prior book → strengthening
+            "call_wall": 603.0,
+            "prior_call_wall": 603.0,  # wall did not migrate up
+            "max_gamma_strike": 602.0,
+        },
     )
     results = {r.name: r for r in engine.evaluate(ctx)}
     trap = results["trap_detection"]
@@ -68,7 +74,13 @@ def test_trap_detection_neutral_without_strengthening_gamma():
     ctx = _ctx(
         close=606.0,
         net_gex=300_000_000.0,
-        extra={"net_gex_delta": -200_000_000.0, "call_wall": 603.0, "max_gamma_strike": 602.0},
+        extra={
+            "net_gex_delta": -200_000_000.0,
+            "net_gex_delta_pct": -0.01,
+            "call_wall": 603.0,
+            "prior_call_wall": 603.0,
+            "max_gamma_strike": 602.0,
+        },
     )
     results = {r.name: r for r in engine.evaluate(ctx)}
     trap = results["trap_detection"]

@@ -2693,6 +2693,153 @@ class DatabaseManager:
             logger.error(f"get_independent_signal failed ({symbol}, {signal_name}): {e}")
             return None
 
+    async def get_signal_events(
+        self,
+        symbol: str = "SPY",
+        signal_name: str = "",
+        limit: int = 100,
+    ) -> list[Dict[str, Any]]:
+        """Return recent emitted signal_events rows with their realized outcomes."""
+        query = """
+            SELECT
+                id,
+                underlying,
+                signal_name,
+                emitted_at,
+                direction,
+                score,
+                context_values,
+                close_at_emit,
+                close_30m,
+                close_60m,
+                close_120m,
+                outcome_30m,
+                outcome_60m,
+                outcome_120m
+            FROM signal_events
+            WHERE underlying = $1
+              AND ($2 = '' OR signal_name = $2)
+            ORDER BY emitted_at DESC
+            LIMIT $3
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, signal_name, limit)
+                out: list[Dict[str, Any]] = []
+                for row in rows:
+                    d = dict(row)
+                    ctx = d.get("context_values") or {}
+                    if isinstance(ctx, str):
+                        ctx = json.loads(ctx)
+                    d["context_values"] = ctx
+                    out.append(d)
+                return out
+        except Exception as e:
+            logger.error(f"get_signal_events failed ({symbol}, {signal_name}): {e}")
+            return []
+
+    async def get_signal_hit_rate(
+        self,
+        symbol: str = "SPY",
+        signal_name: str = "",
+        horizon: str = "60m",
+    ) -> Optional[Dict[str, Any]]:
+        """Return realized hit-rate of a signal over a given outcome horizon.
+
+        ``horizon`` must be one of "30m", "60m", "120m".
+        """
+        if horizon not in {"30m", "60m", "120m"}:
+            return None
+        col = f"outcome_{horizon}"
+        query = f"""
+            SELECT
+                COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE {col} = 'win')::int AS wins,
+                COUNT(*) FILTER (WHERE {col} = 'loss')::int AS losses,
+                COUNT(*) FILTER (WHERE {col} IS NULL)::int AS pending,
+                AVG(CASE WHEN close_at_emit > 0 AND close_{horizon} IS NOT NULL
+                         THEN (close_{horizon} - close_at_emit) / close_at_emit * direction
+                         ELSE NULL END) AS avg_signed_return
+            FROM signal_events
+            WHERE underlying = $1
+              AND signal_name = $2
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(query, symbol, signal_name)
+                if not row:
+                    return None
+                d = dict(row)
+                total = d.get("total") or 0
+                resolved = total - (d.get("pending") or 0)
+                d["resolved"] = resolved
+                d["hit_rate"] = (
+                    round(d["wins"] / resolved, 4) if resolved > 0 else None
+                )
+                d["horizon"] = horizon
+                d["signal_name"] = signal_name
+                d["underlying"] = symbol
+                d["avg_signed_return"] = (
+                    float(d["avg_signed_return"])
+                    if d.get("avg_signed_return") is not None
+                    else None
+                )
+                return d
+        except Exception as e:
+            logger.error(f"get_signal_hit_rate failed ({symbol}, {signal_name}): {e}")
+            return None
+
+    async def get_latest_independent_signals_bundle(
+        self,
+        symbol: str = "SPY",
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Return the latest row for each independent signal for a symbol.
+
+        Used by the confluence-matrix endpoint to score cross-signal agreement
+        in a single DB round-trip.
+        """
+        query = """
+            SELECT DISTINCT ON (component_name)
+                component_name,
+                timestamp,
+                clamped_score,
+                weighted_score,
+                weight,
+                context_values
+            FROM signal_component_scores
+            WHERE underlying = $1
+              AND component_name IN (
+                'vol_expansion','eod_pressure','squeeze_setup',
+                'trap_detection','zero_dte_position_imbalance',
+                'gamma_vwap_confluence'
+              )
+            ORDER BY component_name, timestamp DESC
+        """
+        out: Dict[str, Optional[Dict[str, Any]]] = {
+            "vol_expansion": None,
+            "eod_pressure": None,
+            "squeeze_setup": None,
+            "trap_detection": None,
+            "zero_dte_position_imbalance": None,
+            "gamma_vwap_confluence": None,
+        }
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol)
+                for row in rows:
+                    d = dict(row)
+                    ctx = d.get("context_values") or {}
+                    if isinstance(ctx, str):
+                        ctx = json.loads(ctx)
+                    d["context_values"] = ctx
+                    raw = d.get("clamped_score") or 0.0
+                    d["score"] = round(float(raw) * 100.0, 2)
+                    out[d["component_name"]] = d
+                return out
+        except Exception as e:
+            logger.error(f"get_latest_independent_signals_bundle failed ({symbol}): {e}")
+            return out
+
     async def get_position_optimizer_signal(
         self,
         symbol: str = "SPY",

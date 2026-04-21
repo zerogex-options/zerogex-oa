@@ -280,6 +280,29 @@ BEGIN
     END IF;
 END $$;
 
+-- Idempotent migration: split per-type call/put greeks AND store the
+-- dealer-sign convention (dealers are net short the book, so dealer
+-- charm/vanna flow is the negative of market-aggregated charm/vanna).
+-- Downstream signals that want a tradable "dealer hedging flow" should
+-- read dealer_charm_exposure / dealer_vanna_exposure; the raw
+-- charm_exposure / vanna_exposure columns remain for backwards compat.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='gex_by_strike' AND column_name='dealer_charm_exposure'
+    ) THEN
+        ALTER TABLE gex_by_strike
+            ADD COLUMN call_charm_exposure DOUBLE PRECISION,
+            ADD COLUMN put_charm_exposure  DOUBLE PRECISION,
+            ADD COLUMN call_vanna_exposure DOUBLE PRECISION,
+            ADD COLUMN put_vanna_exposure  DOUBLE PRECISION,
+            ADD COLUMN dealer_charm_exposure DOUBLE PRECISION,
+            ADD COLUMN dealer_vanna_exposure DOUBLE PRECISION,
+            ADD COLUMN expiration_bucket VARCHAR(16);
+    END IF;
+END $$;
+
 -- =============================================================================
 -- Remove legacy/non-essential objects (safe cleanup during migration)
 -- =============================================================================
@@ -1233,3 +1256,56 @@ CREATE TRIGGER update_signal_calibration_updated_at
 -- new gex_gradient, dealer_delta_pressure, and vanna_charm_flow components.
 CREATE INDEX IF NOT EXISTS idx_signal_component_scores_component_underlying_ts
     ON signal_component_scores(component_name, underlying, timestamp DESC);
+
+-- ---------------------------------------------------------------------------
+-- signal_events
+-- Discrete edge-triggered events emitted when an independent signal's
+-- ``triggered`` flag transitions false -> true (hysteresis-protected).
+-- Consumers poll this table (or subscribe via Postgres LISTEN/NOTIFY or a
+-- Redis mirror) instead of scraping the latest row from signal_component_scores.
+-- Each event also receives a placeholder PNL column that a follow-up job
+-- backfills at +30min / +60min / +120min horizons for hit-rate computation.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS signal_events (
+    id              BIGSERIAL PRIMARY KEY,
+    underlying      VARCHAR(10)   NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    timestamp       TIMESTAMPTZ   NOT NULL,
+    signal_name     VARCHAR(64)   NOT NULL,
+    direction       VARCHAR(16)   NOT NULL,  -- bullish / bearish / neutral / <signal_value>
+    score           DOUBLE PRECISION NOT NULL,
+    context_values  JSONB         NOT NULL DEFAULT '{}'::jsonb,
+    close_at_emit   DOUBLE PRECISION,
+    -- Forward-looking diagnostics populated by an offline job.
+    close_30m       DOUBLE PRECISION,
+    close_60m       DOUBLE PRECISION,
+    close_120m      DOUBLE PRECISION,
+    outcome_30m     VARCHAR(8),   -- 'win' / 'loss' / NULL
+    outcome_60m     VARCHAR(8),
+    outcome_120m    VARCHAR(8),
+    created_at      TIMESTAMPTZ   DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_events_name_ts
+    ON signal_events(signal_name, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_signal_events_underlying_ts
+    ON signal_events(underlying, timestamp DESC);
+
+-- ---------------------------------------------------------------------------
+-- component_normalizer_cache
+-- Per-symbol, per-field rolling normalization constants.  The signal engine
+-- refreshes the rows it consumes roughly every engine cycle (see
+-- src/signals/unified_signal_engine.py).  Falls back to env-var defaults
+-- on cold start or when a row is missing.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS component_normalizer_cache (
+    underlying      VARCHAR(10)   NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    field_name      VARCHAR(64)   NOT NULL,
+    window_days     INTEGER       NOT NULL DEFAULT 20,
+    p05             DOUBLE PRECISION,
+    p50             DOUBLE PRECISION,
+    p95             DOUBLE PRECISION,
+    std             DOUBLE PRECISION,
+    sample_size     INTEGER,
+    updated_at      TIMESTAMPTZ   DEFAULT NOW(),
+    PRIMARY KEY (underlying, field_name)
+);

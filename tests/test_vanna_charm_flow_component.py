@@ -34,30 +34,41 @@ def test_no_data_is_neutral():
     assert comp.compute(_ctx()) == 0.0
 
 
-def test_positive_vanna_is_bullish():
+def test_positive_dealer_vanna_is_bullish():
     ctx = _ctx()
     ctx.extra["gex_by_strike"] = [
-        {"strike": 500.0, "vanna_exposure": _VC_NORM, "charm_exposure": 0.0}
+        {"strike": 500.0, "dealer_vanna_exposure": _VC_NORM, "dealer_charm_exposure": 0.0}
     ]
     assert comp.compute(ctx) > 0.5
 
 
-def test_negative_vanna_is_bearish():
+def test_negative_dealer_vanna_is_bearish():
     ctx = _ctx()
     ctx.extra["gex_by_strike"] = [
-        {"strike": 500.0, "vanna_exposure": -_VC_NORM, "charm_exposure": 0.0}
+        {"strike": 500.0, "dealer_vanna_exposure": -_VC_NORM, "dealer_charm_exposure": 0.0}
     ]
+    assert comp.compute(ctx) < -0.5
+
+
+def test_legacy_market_aggregate_vanna_negated():
+    """Legacy rows (vanna_exposure only) use market-aggregate sign; the
+    component must negate them to get dealer-sign convention."""
+    ctx = _ctx()
+    ctx.extra["gex_by_strike"] = [
+        {"strike": 500.0, "vanna_exposure": _VC_NORM, "charm_exposure": 0.0}
+    ]
+    # Market-aggregate +VC_NORM ⇒ dealer_vanna = -VC_NORM ⇒ bearish score.
     assert comp.compute(ctx) < -0.5
 
 
 def test_charm_amplification_near_close():
     """Charm should count more near the close than in the morning."""
     rows = [
-        {"strike": 500.0, "vanna_exposure": 0.0, "charm_exposure": _VC_NORM / 4}
+        {"strike": 500.0, "dealer_vanna_exposure": 0.0, "dealer_charm_exposure": _VC_NORM / 4}
     ]
-    morning = _ctx(hour=14, minute=0)
+    morning = _ctx(hour=14, minute=0)  # 10:00 ET
     morning.extra["gex_by_strike"] = rows
-    close = _ctx(hour=19, minute=55)
+    close = _ctx(hour=19, minute=55)   # 15:55 ET
     close.extra["gex_by_strike"] = rows
     assert abs(comp.compute(close)) >= abs(comp.compute(morning))
 
@@ -69,7 +80,7 @@ def test_charm_amplification_max_at_close():
 def test_score_bounded():
     ctx = _ctx()
     ctx.extra["gex_by_strike"] = [
-        {"strike": 500.0, "vanna_exposure": 1e20, "charm_exposure": 1e20}
+        {"strike": 500.0, "dealer_vanna_exposure": 1e20, "dealer_charm_exposure": 1e20}
     ]
     assert abs(comp.compute(ctx)) <= 1.0
 

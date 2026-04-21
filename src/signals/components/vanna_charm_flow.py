@@ -12,13 +12,15 @@ alone cannot explain:
     accelerates dramatically — dealers short calls above spot are
     forced to sell into weakness, amplifying afternoon drift.
 
-The analytics layer populates ``vanna_exposure`` and ``charm_exposure``
-per-strike in ``gex_by_strike``. This component aggregates them into a
-single directional score.
+The analytics layer populates ``dealer_vanna_exposure`` and
+``dealer_charm_exposure`` per-strike in ``gex_by_strike`` (positive =
+dealer buying pressure, negative = dealer selling pressure).  Legacy
+rows without the dealer columns fall back to negating the raw
+``vanna_exposure``/``charm_exposure`` (market-aggregate convention).
 
 Sign convention:
-  * Positive aggregate vanna+charm => bullish tailwind (dealer buying pressure)
-  * Negative aggregate vanna+charm => bearish headwind (dealer selling pressure)
+  * Positive aggregate vanna+charm => bullish tailwind (dealer buying)
+  * Negative aggregate vanna+charm => bearish headwind (dealer selling)
 """
 from __future__ import annotations
 
@@ -26,9 +28,9 @@ import os
 
 from src.signals.components.base import ComponentBase, MarketContext
 from src.signals.components.utils import (
-    SESSION_CLOSE_MIN_UTC,
-    SESSION_OPEN_MIN_UTC,
-    minute_of_day,
+    SESSION_CLOSE_MIN_ET,
+    SESSION_OPEN_MIN_ET,
+    minute_of_day_et,
 )
 
 # Normalize combined vanna+charm exposure so that a magnitude of this
@@ -54,9 +56,6 @@ class VannaCharmFlowComponent(ComponentBase):
         charm_weight = self._charm_amplification(ctx)
         combined = vanna + charm * charm_weight
         normalized = max(-1.0, min(1.0, combined / _VC_NORM))
-        # Dealer re-hedging sign: positive aggregate => dealers sell into
-        # weakness / buy into strength (negative gamma is already encoded
-        # in vanna_exposure & charm_exposure upstream).
         return normalized
 
     def context_values(self, ctx: MarketContext) -> dict:
@@ -72,7 +71,7 @@ class VannaCharmFlowComponent(ComponentBase):
             "vanna_total": round(agg["vanna"], 2),
             "charm_total": round(agg["charm"], 2),
             "charm_amplification": round(self._charm_amplification(ctx), 3),
-            "source": "gex_by_strike",
+            "source": agg["source"],
         }
 
     # ------------------------------------------------------------------
@@ -86,38 +85,53 @@ class VannaCharmFlowComponent(ComponentBase):
             return None
         vanna_total = 0.0
         charm_total = 0.0
+        used_dealer = False
         saw_any = False
         for row in rows:
             if not isinstance(row, dict):
                 continue
             try:
-                v = row.get("vanna_exposure")
-                c = row.get("charm_exposure")
-                if v is not None:
-                    vanna_total += float(v)
+                dv = row.get("dealer_vanna_exposure")
+                dc = row.get("dealer_charm_exposure")
+                if dv is not None:
+                    vanna_total += float(dv)
+                    used_dealer = True
                     saw_any = True
-                if c is not None:
-                    charm_total += float(c)
+                elif (v := row.get("vanna_exposure")) is not None:
+                    vanna_total += -float(v)
+                    saw_any = True
+
+                if dc is not None:
+                    charm_total += float(dc)
+                    used_dealer = True
+                    saw_any = True
+                elif (c := row.get("charm_exposure")) is not None:
+                    charm_total += -float(c)
                     saw_any = True
             except (TypeError, ValueError):
                 continue
         if not saw_any:
             return None
-        return {"vanna": vanna_total, "charm": charm_total}
+        return {
+            "vanna": vanna_total,
+            "charm": charm_total,
+            "source": "dealer_exposure" if used_dealer else "market_exposure_negated",
+        }
 
     @staticmethod
     def _charm_amplification(ctx: MarketContext) -> float:
         """Scale charm's contribution upward as we approach the close.
 
         Returns 1.0 for most of the session; ramps to _CHARM_AMP_MAX in
-        the final ~2h when charm flow dominates.
+        the final ~2h when charm flow dominates.  Uses ET-native minute
+        of day so the ramp is DST-correct year-round.
         """
-        minute = minute_of_day(ctx.timestamp)
-        if minute is None or minute <= SESSION_OPEN_MIN_UTC:
+        minute = minute_of_day_et(ctx.timestamp)
+        if minute is None or minute <= SESSION_OPEN_MIN_ET:
             return 1.0
-        if minute >= SESSION_CLOSE_MIN_UTC:
+        if minute >= SESSION_CLOSE_MIN_ET:
             return _CHARM_AMP_MAX
-        frac = (minute - SESSION_OPEN_MIN_UTC) / (SESSION_CLOSE_MIN_UTC - SESSION_OPEN_MIN_UTC)
+        frac = (minute - SESSION_OPEN_MIN_ET) / (SESSION_CLOSE_MIN_ET - SESSION_OPEN_MIN_ET)
         if frac < _CHARM_AMP_START:
             return 1.0
         ramp = (frac - _CHARM_AMP_START) / (1.0 - _CHARM_AMP_START)

@@ -399,9 +399,12 @@ class AnalyticsEngine:
             # Net GEX (call - put, from dealer perspective)
             net_gex = call_gex + put_gex  # put_gex is already negative
 
-            # Calculate Vanna and Charm exposure
-            vanna_exposure = 0.0
-            charm_exposure = 0.0
+            # Calculate Vanna and Charm exposure — split by option type so
+            # downstream signals can apply the correct dealer-sign convention.
+            call_vanna_exposure = 0.0
+            put_vanna_exposure = 0.0
+            call_charm_exposure = 0.0
+            put_charm_exposure = 0.0
 
             # T is the same for all options at this (strike, expiration),
             # so cache it to avoid redundant datetime math.
@@ -428,9 +431,42 @@ class AnalyticsEngine:
                     opt['option_type']
                 )
 
-                # Multiply by OI, contract multiplier, and underlying price for notional exposure
-                vanna_exposure += vanna * opt['open_interest'] * 100 * underlying_price
-                charm_exposure += charm * opt['open_interest'] * 100 * underlying_price
+                notional = opt['open_interest'] * 100 * underlying_price
+                if opt['option_type'] == 'C':
+                    call_vanna_exposure += vanna * notional
+                    call_charm_exposure += charm * notional
+                else:
+                    put_vanna_exposure += vanna * notional
+                    put_charm_exposure += charm * notional
+
+            # Market-level aggregate (legacy columns, keeps schema stable).
+            vanna_exposure = call_vanna_exposure + put_vanna_exposure
+            charm_exposure = call_charm_exposure + put_charm_exposure
+
+            # Dealer-sign convention: dealers are net short the retail book,
+            # so dealer delta-hedging flow is the NEGATIVE of market-aggregate
+            # charm/vanna.  Positive dealer_charm_exposure at a strike => as
+            # time passes dealers must BUY the underlying at that strike
+            # (bullish EOD pressure).  Bug fix (C3): previously signals read
+            # the un-flipped ``charm_exposure`` and had inverted direction
+            # near ATM.  Prefer ``dealer_charm_exposure`` downstream.
+            dealer_vanna_exposure = -vanna_exposure
+            dealer_charm_exposure = -charm_exposure
+
+            # Bucket expirations so EOD pressure can weight 0DTE charm
+            # separately from weeklies/monthlies (S2).
+            try:
+                dte_days = max(0, (expiration - timestamp.date()).days)
+            except Exception:
+                dte_days = 0
+            if dte_days == 0:
+                expiration_bucket = "0dte"
+            elif dte_days <= 7:
+                expiration_bucket = "weekly"
+            elif dte_days <= 45:
+                expiration_bucket = "monthly"
+            else:
+                expiration_bucket = "leaps"
 
             gex_results.append({
                 'underlying': self.db_symbol,
@@ -446,7 +482,14 @@ class AnalyticsEngine:
                 'call_oi': call_oi,
                 'put_oi': put_oi,
                 'vanna_exposure': vanna_exposure,
-                'charm_exposure': charm_exposure
+                'charm_exposure': charm_exposure,
+                'call_vanna_exposure': call_vanna_exposure,
+                'put_vanna_exposure': put_vanna_exposure,
+                'call_charm_exposure': call_charm_exposure,
+                'put_charm_exposure': put_charm_exposure,
+                'dealer_vanna_exposure': dealer_vanna_exposure,
+                'dealer_charm_exposure': dealer_charm_exposure,
+                'expiration_bucket': expiration_bucket,
             })
 
         return gex_results
@@ -646,7 +689,14 @@ class AnalyticsEngine:
                 int(data['call_oi']),
                 int(data['put_oi']),
                 float(data['vanna_exposure']),
-                float(data['charm_exposure'])
+                float(data['charm_exposure']),
+                float(data.get('call_vanna_exposure', 0.0)),
+                float(data.get('put_vanna_exposure', 0.0)),
+                float(data.get('call_charm_exposure', 0.0)),
+                float(data.get('put_charm_exposure', 0.0)),
+                float(data.get('dealer_vanna_exposure', -float(data['vanna_exposure']))),
+                float(data.get('dealer_charm_exposure', -float(data['charm_exposure']))),
+                data.get('expiration_bucket'),
             ) for data in gex_data]
 
             execute_values(
@@ -655,7 +705,11 @@ class AnalyticsEngine:
                 INSERT INTO gex_by_strike
                 (underlying, timestamp, strike, expiration, total_gamma,
                  call_gamma, put_gamma, net_gex, call_volume, put_volume,
-                 call_oi, put_oi, vanna_exposure, charm_exposure)
+                 call_oi, put_oi, vanna_exposure, charm_exposure,
+                 call_vanna_exposure, put_vanna_exposure,
+                 call_charm_exposure, put_charm_exposure,
+                 dealer_vanna_exposure, dealer_charm_exposure,
+                 expiration_bucket)
                 VALUES %s
                 ON CONFLICT (underlying, timestamp, strike, expiration) DO UPDATE SET
                     total_gamma = EXCLUDED.total_gamma,
@@ -667,7 +721,14 @@ class AnalyticsEngine:
                     call_oi = EXCLUDED.call_oi,
                     put_oi = EXCLUDED.put_oi,
                     vanna_exposure = EXCLUDED.vanna_exposure,
-                    charm_exposure = EXCLUDED.charm_exposure
+                    charm_exposure = EXCLUDED.charm_exposure,
+                    call_vanna_exposure = EXCLUDED.call_vanna_exposure,
+                    put_vanna_exposure = EXCLUDED.put_vanna_exposure,
+                    call_charm_exposure = EXCLUDED.call_charm_exposure,
+                    put_charm_exposure = EXCLUDED.put_charm_exposure,
+                    dealer_vanna_exposure = EXCLUDED.dealer_vanna_exposure,
+                    dealer_charm_exposure = EXCLUDED.dealer_charm_exposure,
+                    expiration_bucket = EXCLUDED.expiration_bucket
                 WHERE
                     EXCLUDED.total_gamma IS DISTINCT FROM gex_by_strike.total_gamma
                     OR EXCLUDED.call_gamma IS DISTINCT FROM gex_by_strike.call_gamma
@@ -679,6 +740,8 @@ class AnalyticsEngine:
                     OR EXCLUDED.put_oi IS DISTINCT FROM gex_by_strike.put_oi
                     OR EXCLUDED.vanna_exposure IS DISTINCT FROM gex_by_strike.vanna_exposure
                     OR EXCLUDED.charm_exposure IS DISTINCT FROM gex_by_strike.charm_exposure
+                    OR EXCLUDED.dealer_charm_exposure IS DISTINCT FROM gex_by_strike.dealer_charm_exposure
+                    OR EXCLUDED.dealer_vanna_exposure IS DISTINCT FROM gex_by_strike.dealer_vanna_exposure
                 """,
                 rows,
             )
