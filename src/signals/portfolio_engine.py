@@ -24,6 +24,7 @@ from typing import Optional
 
 from src.config import (
     SIGNALS_DRS_CALL_ENTRY_MIN,
+    SIGNALS_DRS_FRESH_CROSS_BOOST,
     SIGNALS_DRS_HARD_GATES_ENABLED,
     SIGNALS_DRS_OVERRIDE_ENABLED,
     SIGNALS_DRS_OVERRIDE_THRESHOLD,
@@ -110,6 +111,7 @@ class PortfolioEngine:
         self.drs_put_entry_max = SIGNALS_DRS_PUT_ENTRY_MAX
         self.drs_override_enabled = SIGNALS_DRS_OVERRIDE_ENABLED
         self.drs_override_threshold = SIGNALS_DRS_OVERRIDE_THRESHOLD
+        self.drs_fresh_cross_boost = SIGNALS_DRS_FRESH_CROSS_BOOST
         self.scalp_trigger_enabled = SIGNALS_SCALP_TRIGGER_ENABLED
         self.scalp_trigger_threshold = SIGNALS_SCALP_TRIGGER_THRESHOLD
         self.scalp_size_multiplier = SIGNALS_SCALP_SIZE_MULTIPLIER
@@ -257,8 +259,19 @@ class PortfolioEngine:
             )
 
         # --- CASE 4: compute target contracts via Kelly sizing ---
+        # A fresh gamma-flip cross in the signal direction is a momentum
+        # catalyst the base score can under-represent. Now that the DRS gate
+        # is symmetric, we fold fresh-cross energy back in as a sizing boost
+        # applied after the gate passes.
+        fresh_cross = self._fresh_drs_cross(score.direction, market_ctx)
+        cross_multiplier = (
+            1.0 + self.drs_fresh_cross_boost if fresh_cross and self.drs_fresh_cross_boost > 0 else 1.0
+        )
         base_contracts = sizing.contracts
-        contracts = max(1, int(base_contracts * score.normalized_score * size_multiplier))
+        contracts = max(
+            1,
+            int(base_contracts * score.normalized_score * size_multiplier * cross_multiplier),
+        )
 
         entry_price = (candidate.entry_debit or candidate.entry_credit) / 100.0
         opt_type = "C" if score.direction == "bullish" else "P"
@@ -326,6 +339,7 @@ class PortfolioEngine:
             f"Score {score.normalized_score:.3f} {score.direction} [{tier_label}], "
             f"{candidate.strategy_type} {contracts}c Kelly={candidate.kelly_fraction:.1%}"
             + (" (DRS override)" if drs_override_active else "")
+            + (" (fresh-cross boost)" if fresh_cross and cross_multiplier > 1.0 else "")
         )
 
         return PortfolioTarget(
@@ -924,9 +938,12 @@ class PortfolioEngine:
             return True, "DRS bullish gate passed"
 
         if score.direction == "bearish":
-            crossed_below_flip = close < gamma_flip and (prev_close is not None and prev_close >= gamma_flip)
-            if not crossed_below_flip:
-                return False, "DRS hard gate blocked: bearish entry requires fresh cross below gamma flip"
+            # Symmetric with the bullish branch: require a sustained hold below
+            # the flip rather than the exact bar of a fresh cross. A fresh
+            # cross is folded in later as a conviction/sizing boost.
+            holds_below_flip = close < gamma_flip and (prev_close is None or prev_close < gamma_flip)
+            if not holds_below_flip:
+                return False, "DRS hard gate blocked: bearish entry requires hold below gamma flip"
             if drs_norm >= self.drs_put_entry_max:
                 return (
                     False,
@@ -935,6 +952,20 @@ class PortfolioEngine:
             return True, "DRS bearish gate passed"
 
         return False, "DRS hard gate blocked: neutral direction"
+
+    def _fresh_drs_cross(self, direction: str, market_ctx: dict) -> bool:
+        """Detect a gamma-flip cross in the signaled direction on this bar."""
+        gamma_flip = market_ctx.get("gamma_flip")
+        close = market_ctx.get("close")
+        recent = market_ctx.get("recent_closes") or []
+        prev_close = recent[-2] if len(recent) >= 2 else None
+        if gamma_flip is None or close is None or prev_close is None:
+            return False
+        if direction == "bullish":
+            return close > gamma_flip and prev_close <= gamma_flip
+        if direction == "bearish":
+            return close < gamma_flip and prev_close >= gamma_flip
+        return False
 
     def _select_optimizer_candidate(
         self,

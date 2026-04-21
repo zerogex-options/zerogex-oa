@@ -16,6 +16,9 @@ from datetime import datetime
 from typing import Optional
 
 from src.config import (
+    SIGNALS_CONTRARIAN_OVERRIDE_ENABLED,
+    SIGNALS_CONTRARIAN_OVERRIDE_MIN_COMPOSITE,
+    SIGNALS_CONTRARIAN_OVERRIDE_THRESHOLD,
     SIGNALS_CONVICTION_ABSTAIN_EPSILON,
     SIGNALS_CONVICTION_AGGREGATION_ENABLED,
     SIGNALS_CONVICTION_AGREEMENT_MAX_MULT,
@@ -23,6 +26,11 @@ from src.config import (
 )
 from src.signals.components.base import ComponentBase, MarketContext
 from src.utils import get_logger
+
+# Components whose scores express a contra-trend thesis. When their combined
+# weighted score points the opposite way from the composite with enough
+# conviction, the scoring engine flips direction (flush / squeeze setup).
+_CONTRARIAN_COMPONENT_NAMES = frozenset({"exhaustion", "skew_delta", "positioning_trap"})
 
 logger = get_logger(__name__)
 
@@ -77,6 +85,9 @@ class ScoringEngine:
 
         raw_composite = sum(c.weight * score for c, score in component_results)
         composite, aggregation = self._aggregate(component_results, raw_composite)
+        composite, aggregation = self._apply_contrarian_override(
+            composite, component_results, aggregation
+        )
         normalized = abs(composite)
 
         snapshot = ScoreSnapshot(
@@ -181,6 +192,51 @@ class ScoringEngine:
             "extremity_multiplier": round(extremity_mult, 4),
         }
         return composite, diagnostics
+
+    @staticmethod
+    def _apply_contrarian_override(
+        composite: float,
+        component_results: list[tuple[ComponentBase, float]],
+        diagnostics: dict,
+    ) -> tuple[float, dict]:
+        """Flip composite sign when the contrarian consensus strongly opposes it.
+
+        Sizing magnitude is preserved; only the direction changes. This lets
+        mean-reversion setups trade against the trend-driven majority instead
+        of just being dampened by it.
+        """
+        contrarian_total_weight = 0.0
+        contrarian_weighted = 0.0
+        for comp, clamped in component_results:
+            if comp.name in _CONTRARIAN_COMPONENT_NAMES:
+                contrarian_total_weight += comp.weight
+                contrarian_weighted += comp.weight * clamped
+        contrarian_consensus = (
+            contrarian_weighted / contrarian_total_weight
+            if contrarian_total_weight > 0
+            else 0.0
+        )
+        diagnostics = {
+            **diagnostics,
+            "contrarian_consensus": round(contrarian_consensus, 6),
+            "contrarian_override": False,
+        }
+
+        if not SIGNALS_CONTRARIAN_OVERRIDE_ENABLED:
+            return composite, diagnostics
+        if abs(composite) < SIGNALS_CONTRARIAN_OVERRIDE_MIN_COMPOSITE:
+            return composite, diagnostics
+        if abs(contrarian_consensus) < SIGNALS_CONTRARIAN_OVERRIDE_THRESHOLD:
+            return composite, diagnostics
+        # Require opposite signs -- if the contrarians agree with the trend
+        # there is nothing to override.
+        if (contrarian_consensus > 0) == (composite > 0):
+            return composite, diagnostics
+
+        flipped = -composite
+        diagnostics["contrarian_override"] = True
+        diagnostics["pre_override_composite"] = round(composite, 6)
+        return flipped, diagnostics
 
     def persist(
         self,

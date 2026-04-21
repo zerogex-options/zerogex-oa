@@ -293,6 +293,35 @@ SIGNALS_DRS_OVERRIDE_THRESHOLD = float(
     os.getenv("SIGNALS_DRS_OVERRIDE_THRESHOLD", "0.70")
 )
 
+# Conviction uplift for a fresh gamma-flip cross in the signaled direction.
+# Previously "fresh cross" was a hard bearish-entry requirement; symmetrizing
+# the DRS gates moved it to an additive sizing boost applied after the gate
+# passes. 0.0 disables the boost.
+SIGNALS_DRS_FRESH_CROSS_BOOST = max(
+    0.0, float(os.getenv("SIGNALS_DRS_FRESH_CROSS_BOOST", "0.20"))
+)
+
+# -----------------------------------------------------------------------------
+# Contrarian direction override
+# -----------------------------------------------------------------------------
+# A strong consensus from the three contrarian components (exhaustion,
+# skew_delta, positioning_trap) pointing *against* the trend-driven composite
+# is a classic setup for a flush/squeeze. When that consensus is big enough
+# and the composite has enough magnitude to have picked a clear direction,
+# flip the composite sign so the portfolio engine routes a counter-trend
+# trade instead of doubling down on the exhausted move.
+SIGNALS_CONTRARIAN_OVERRIDE_ENABLED = (
+    os.getenv("SIGNALS_CONTRARIAN_OVERRIDE_ENABLED", "true").lower() == "true"
+)
+SIGNALS_CONTRARIAN_OVERRIDE_THRESHOLD = max(
+    0.0, min(1.0, float(os.getenv("SIGNALS_CONTRARIAN_OVERRIDE_THRESHOLD", "0.60")))
+)
+# Minimum composite magnitude before the override can fire. Prevents flipping
+# near-zero composites where the trend signal isn't really pointing anywhere.
+SIGNALS_CONTRARIAN_OVERRIDE_MIN_COMPOSITE = max(
+    0.0, float(os.getenv("SIGNALS_CONTRARIAN_OVERRIDE_MIN_COMPOSITE", "0.20"))
+)
+
 # Stop-loss as a fraction of trade outlay (entry_price * quantity * 100).
 # Default -0.25 means the trade is stopped out when it loses 25% of the
 # initial premium paid (debit trades) or 25% of max-risk (credit trades).
