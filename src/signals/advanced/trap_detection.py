@@ -1,11 +1,11 @@
-"""Independent trap-detection (fade) signal."""
+"""Advanced trap-detection (fade) setup signal."""
 from __future__ import annotations
 
 from src.signals.components.base import MarketContext
 from src.signals.advanced.base import (
     BREAKOUT_BUFFER_MIN,
     BREAKOUT_BUFFER_VOL_MULT,
-    IndependentSignalResult,
+    AdvancedSignalResult,
     flow_flux_norm,
     nearest_above,
     nearest_below,
@@ -16,7 +16,7 @@ from src.signals.advanced.base import (
 class TrapDetectionSignal:
     name = "trap_detection"
 
-    def evaluate(self, ctx: MarketContext) -> IndependentSignalResult:
+    def evaluate(self, ctx: MarketContext) -> AdvancedSignalResult:
         extra = ctx.extra or {}
         call_wall = extra.get("call_wall")
         prior_call_wall = extra.get("prior_call_wall")
@@ -88,7 +88,7 @@ class TrapDetectionSignal:
         score = max(-1.0, min(1.0, score))
         triggered = abs(score) >= 0.25
 
-        return IndependentSignalResult(
+        return AdvancedSignalResult(
             name=self.name,
             score=score,
             context={

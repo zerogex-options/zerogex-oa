@@ -19,7 +19,7 @@ from src.signals.components.net_gex_sign import NetGexSignComponent
 from src.signals.components.price_vs_max_gamma import PriceVsMaxGammaComponent
 from src.signals.components.put_call_ratio_state import PutCallRatioStateComponent
 from src.signals.components.volatility_regime import VolatilityRegimeComponent
-from src.signals.advanced import IndependentSignalEngine
+from src.signals.advanced import AdvancedSignalEngine
 from src.signals.portfolio_engine import PortfolioEngine
 from src.signals.scoring_engine import ScoringEngine
 from src.symbols import get_canonical_symbol
@@ -47,7 +47,7 @@ class UnifiedSignalEngine:
         )
 
         self.portfolio_engine = PortfolioEngine(self.underlying)
-        self.independent_signal_engine = IndependentSignalEngine()
+        self.advanced_signal_engine = AdvancedSignalEngine()
         self._iv_rank_enabled = os.getenv("SIGNAL_IV_RANK_ENABLED", "false").lower() == "true"
         if not self._iv_rank_enabled:
             logger.info(
@@ -778,7 +778,7 @@ class UnifiedSignalEngine:
     _SCORE_DEDUPE_EPSILON = float(os.getenv("SIGNAL_SCORE_DEDUPE_EPSILON", "0.01"))
 
     def _persist_advanced_signals(self, market_context: MarketContext) -> list:
-        results = self.independent_signal_engine.evaluate(market_context)
+        results = self.advanced_signal_engine.evaluate(market_context)
         if not results:
             return []
 
@@ -897,10 +897,10 @@ class UnifiedSignalEngine:
         # Legacy optimizer-cache plumbing is no longer needed because MSI
         # components do not fetch option snapshots.
         cached_option_rows = None
-        target = self.portfolio_engine.compute_target_with_independents(
+        target = self.portfolio_engine.compute_target_with_advanced_signals(
             score,
             ctx,
-            independent_results=advanced_results,
+            advanced_results=advanced_results,
             cached_option_rows=cached_option_rows,
         )
         action = self.portfolio_engine.reconcile(target)

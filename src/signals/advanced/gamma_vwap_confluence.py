@@ -1,17 +1,17 @@
-"""Independent gamma + VWAP confluence detector."""
+"""Advanced gamma + VWAP confluence detector."""
 from __future__ import annotations
 
 from src.signals.components.base import MarketContext
 from src.signals.advanced.base import (
     CONFLUENCE_MAX_GAP_PCT,
-    IndependentSignalResult,
+    AdvancedSignalResult,
 )
 
 
 class GammaVwapConfluenceSignal:
     name = "gamma_vwap_confluence"
 
-    def evaluate(self, ctx: MarketContext) -> IndependentSignalResult:
+    def evaluate(self, ctx: MarketContext) -> AdvancedSignalResult:
         flip = ctx.gamma_flip
         vwap = ctx.vwap
         extra = ctx.extra or {}
@@ -20,7 +20,7 @@ class GammaVwapConfluenceSignal:
         max_gamma = extra.get("max_gamma_strike")
 
         if flip is None or vwap is None or ctx.close <= 0:
-            return IndependentSignalResult(
+            return AdvancedSignalResult(
                 name=self.name,
                 score=0.0,
                 context={"triggered": False, "signal": "none", "reason": "missing_levels"},
@@ -41,7 +41,7 @@ class GammaVwapConfluenceSignal:
         core_gap_pct = abs(flip - vwap) / ctx.close
         cluster_quality = max(0.0, 1.0 - core_gap_pct / CONFLUENCE_MAX_GAP_PCT)
         if cluster_quality <= 0:
-            return IndependentSignalResult(
+            return AdvancedSignalResult(
                 name=self.name,
                 score=0.0,
                 context={
@@ -80,7 +80,7 @@ class GammaVwapConfluenceSignal:
         )
         triggered = abs(score) >= 0.2
 
-        return IndependentSignalResult(
+        return AdvancedSignalResult(
             name=self.name,
             score=score,
             context={

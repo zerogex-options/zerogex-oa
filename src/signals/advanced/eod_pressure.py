@@ -1,4 +1,4 @@
-"""Independent end-of-day pressure detector."""
+"""Advanced end-of-day pressure detector."""
 from __future__ import annotations
 
 import math
@@ -12,7 +12,7 @@ from src.signals.components.utils import (
     minute_of_day_et,
     realized_sigma,
 )
-from src.signals.advanced.base import IndependentSignalResult
+from src.signals.advanced.base import AdvancedSignalResult
 
 # Charm magnitude (per-session aggregate) at which the score saturates.
 _CHARM_NORM = float(os.getenv("SIGNAL_EOD_CHARM_NORM", "2.0e7"))
@@ -64,12 +64,12 @@ class EODPressureSignal:
         combined = (_W_CHARM * charm_score + _W_PIN * pin_score) * amp * ramp
         return max(-1.0, min(1.0, combined))
 
-    def evaluate(self, ctx: MarketContext) -> IndependentSignalResult:
+    def evaluate(self, ctx: MarketContext) -> AdvancedSignalResult:
         score = self.compute(ctx)
         signal = "bullish" if score > 0 else "bearish" if score < 0 else "neutral"
         context = self.context_values(ctx)
         context.update({"triggered": abs(score) >= 0.2, "signal": signal})
-        return IndependentSignalResult(name=self.name, score=score, context=context)
+        return AdvancedSignalResult(name=self.name, score=score, context=context)
 
     def context_values(self, ctx: MarketContext) -> dict:
         band = self._atm_band_pct(ctx)

@@ -1,4 +1,4 @@
-"""Independent 0DTE position-imbalance detector."""
+"""Advanced 0DTE position-imbalance detector."""
 from __future__ import annotations
 
 import math
@@ -9,13 +9,13 @@ from src.signals.components.utils import (
     SESSION_OPEN_MIN_ET,
     minute_of_day_et,
 )
-from src.signals.advanced.base import IndependentSignalResult
+from src.signals.advanced.base import AdvancedSignalResult
 
 
 class ZeroDtePositionImbalanceSignal:
     name = "zero_dte_position_imbalance"
 
-    def evaluate(self, ctx: MarketContext) -> IndependentSignalResult:
+    def evaluate(self, ctx: MarketContext) -> AdvancedSignalResult:
         extra = ctx.extra or {}
         flow_rows = extra.get("flow_zero_dte") or []
         used_zero_dte = bool(flow_rows)
@@ -98,7 +98,7 @@ class ZeroDtePositionImbalanceSignal:
         score = max(-1.0, min(1.0, combined))
         triggered = abs(score) >= 0.25
 
-        return IndependentSignalResult(
+        return AdvancedSignalResult(
             name=self.name,
             score=score,
             context={

@@ -26,29 +26,6 @@ from src.config import (
     SIGNALS_DRS_CALL_ENTRY_MIN,
     SIGNALS_DRS_FRESH_CROSS_BOOST,
     SIGNALS_DRS_HARD_GATES_ENABLED,
-    SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_BY_SYMBOL,
-    SIGNALS_INDEPENDENT_MIN_THRESHOLD_EOD_PRESSURE,
-    SIGNALS_INDEPENDENT_MIN_THRESHOLD_GAMMA_VWAP_CONFLUENCE,
-    SIGNALS_INDEPENDENT_MIN_THRESHOLD_SQUEEZE_SETUP,
-    SIGNALS_INDEPENDENT_MIN_THRESHOLD_TRAP_DETECTION,
-    SIGNALS_INDEPENDENT_MIN_THRESHOLD_VOL_EXPANSION,
-    SIGNALS_INDEPENDENT_MIN_THRESHOLD_ZERO_DTE_POSITION_IMBALANCE,
-    SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE_BY_SYMBOL,
-    SIGNALS_INDEPENDENT_PHASE_THRESHOLD_OVERRIDES,
-    SIGNALS_INDEPENDENT_RISK_MULT_AGGRESSIVE,
-    SIGNALS_INDEPENDENT_RISK_MULT_BALANCED,
-    SIGNALS_INDEPENDENT_RISK_MULT_CONSERVATIVE,
-    SIGNALS_INDEPENDENT_RISK_PROFILE_EOD_PRESSURE,
-    SIGNALS_INDEPENDENT_RISK_PROFILE_GAMMA_VWAP_CONFLUENCE,
-    SIGNALS_INDEPENDENT_RISK_PROFILE_SQUEEZE_SETUP,
-    SIGNALS_INDEPENDENT_RISK_PROFILE_TRAP_DETECTION,
-    SIGNALS_INDEPENDENT_RISK_PROFILE_VOL_EXPANSION,
-    SIGNALS_INDEPENDENT_RISK_PROFILE_ZERO_DTE_POSITION_IMBALANCE,
-    SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN,
-    SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE,
-    SIGNALS_INDEPENDENT_THRESHOLD_INTRADAY,
-    SIGNALS_INDEPENDENT_THRESHOLD_SCALP,
-    SIGNALS_INDEPENDENT_THRESHOLD_SWING,
     SIGNALS_DRS_OVERRIDE_ENABLED,
     SIGNALS_DRS_OVERRIDE_THRESHOLD,
     SIGNALS_DRS_PUT_ENTRY_MAX,
@@ -404,11 +381,11 @@ class PortfolioEngine:
             rationale=rationale,
         )
 
-    def compute_target_with_independents(
+    def compute_target_with_advanced_signals(
         self,
         score: ScoreSnapshot,
         market_ctx: dict,
-        independent_results: list[AdvancedSignalResult],
+        advanced_results: list[AdvancedSignalResult],
         conn=None,
         cached_option_rows=None,
     ) -> PortfolioTarget:
@@ -422,7 +399,7 @@ class PortfolioEngine:
         advanced_target = self._build_advanced_target(
             score,
             market_ctx,
-            independent_results=independent_results,
+            advanced_results=advanced_results,
             conn=conn,
             cached_option_rows=cached_option_rows,
         )
@@ -465,11 +442,11 @@ class PortfolioEngine:
         self,
         score: ScoreSnapshot,
         market_ctx: dict,
-        independent_results: list[AdvancedSignalResult],
+        advanced_results: list[AdvancedSignalResult],
         conn=None,
         cached_option_rows=None,
     ) -> Optional[PortfolioTarget]:
-        strongest = self._strongest_advanced_signal(independent_results)
+        strongest = self._strongest_advanced_signal(advanced_results)
         if strongest is None:
             return None
 
@@ -500,10 +477,10 @@ class PortfolioEngine:
 
     def _strongest_advanced_signal(
         self,
-        independent_results: list[AdvancedSignalResult],
+        advanced_results: list[AdvancedSignalResult],
     ) -> Optional[tuple[AdvancedSignalResult, str]]:
         ranked: list[tuple[AdvancedSignalResult, str]] = []
-        for result in independent_results or []:
+        for result in advanced_results or []:
             direction = self._resolve_advanced_direction(result)
             if direction == "neutral":
                 continue
@@ -522,6 +499,23 @@ class PortfolioEngine:
             reverse=True,
         )
         return ranked[0]
+
+    # Backward compatibility for callers still using legacy naming.
+    def compute_target_with_independents(
+        self,
+        score: ScoreSnapshot,
+        market_ctx: dict,
+        independent_results: list[AdvancedSignalResult],
+        conn=None,
+        cached_option_rows=None,
+    ) -> PortfolioTarget:
+        return self.compute_target_with_advanced_signals(
+            score=score,
+            market_ctx=market_ctx,
+            advanced_results=independent_results,
+            conn=conn,
+            cached_option_rows=cached_option_rows,
+        )
 
     @classmethod
     def _resolve_advanced_direction(cls, result: AdvancedSignalResult) -> str:

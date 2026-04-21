@@ -14,34 +14,29 @@ from ..database import DatabaseManager
 router = APIRouter(prefix="/api/signals", tags=["Trade Signals"])
 
 
-def _scale_signed_100(value: Any) -> Any:
-    """Scale a signed [-1, 1] metric into [-100, 100]."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return value
-
-    raw = float(value)
-    if math.isnan(raw) or math.isinf(raw):
-        return 0.0
-
-    scaled = max(-100.0, min(100.0, raw * 100.0))
-    return round(scaled, 4)
-
-
-
 def _normalize_msi_components(value: Any) -> Any:
     """Normalize MSI component payload while preserving point contributions."""
     if not isinstance(value, dict):
         return value
+
+    expected = {
+        "net_gex_sign",
+        "flip_distance",
+        "local_gamma",
+        "put_call_ratio",
+        "price_vs_max_gamma",
+        "volatility_regime",
+    }
     out: dict[str, Any] = {}
     for name, payload in value.items():
-        if not isinstance(payload, dict):
+        if name not in expected or not isinstance(payload, dict):
             continue
-        points = payload.get("points")
+        points = payload.get("max_points", payload.get("points"))
         contribution = payload.get("contribution")
         score = payload.get("score")
         if isinstance(points, (int, float)) and isinstance(contribution, (int, float)):
             out[name] = {
-                "points": float(points),
+                "max_points": float(points),
                 "contribution": round(float(contribution), 4),
                 "score": round(float(score), 6) if isinstance(score, (int, float)) else score,
             }
@@ -120,11 +115,7 @@ async def get_score_history(
 ):
     rows = await db.get_signal_score_history(underlying.upper(), limit)
     normalized_rows = [_normalize_signal_score_row(row) for row in rows]
-    return {
-        "underlying": underlying.upper(),
-        "rows": normalized_rows,
-        "count": len(normalized_rows),
-    }
+    return normalized_rows
 
 
 @router.get("/vol-expansion")
@@ -196,8 +187,8 @@ async def get_squeeze_setup_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
 ):
-    """Latest independent squeeze-setup alert (not part of composite score)."""
-    row = await db.get_independent_signal(symbol.upper(), "squeeze_setup")
+    """Latest advanced squeeze-setup alert (not part of MSI)."""
+    row = await db.get_advanced_signal(symbol.upper(), "squeeze_setup")
     if not row:
         raise HTTPException(status_code=404, detail=f"No squeeze-setup signal found for {symbol.upper()}")
     ctx = row.get("context_values") or {}
@@ -218,8 +209,8 @@ async def get_trap_detection_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
 ):
-    """Latest independent trap-detection/fade signal (not part of composite score)."""
-    row = await db.get_independent_signal(symbol.upper(), "trap_detection")
+    """Latest advanced trap-detection/fade signal (not part of MSI)."""
+    row = await db.get_advanced_signal(symbol.upper(), "trap_detection")
     if not row:
         raise HTTPException(status_code=404, detail=f"No trap-detection signal found for {symbol.upper()}")
     ctx = row.get("context_values") or {}
@@ -243,8 +234,8 @@ async def get_zero_dte_position_imbalance_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
 ):
-    """Latest independent 0DTE position-imbalance indicator."""
-    row = await db.get_independent_signal(symbol.upper(), "zero_dte_position_imbalance")
+    """Latest advanced 0DTE position-imbalance indicator."""
+    row = await db.get_advanced_signal(symbol.upper(), "zero_dte_position_imbalance")
     if not row:
         raise HTTPException(status_code=404, detail=f"No 0DTE position-imbalance signal found for {symbol.upper()}")
     ctx = row.get("context_values") or {}
@@ -261,8 +252,8 @@ async def get_gamma_vwap_confluence_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
 ):
-    """Latest independent gamma+VWAP confluence indicator."""
-    row = await db.get_independent_signal(symbol.upper(), "gamma_vwap_confluence")
+    """Latest advanced gamma+VWAP confluence indicator."""
+    row = await db.get_advanced_signal(symbol.upper(), "gamma_vwap_confluence")
     if not row:
         raise HTTPException(status_code=404, detail=f"No gamma+VWAP confluence signal found for {symbol.upper()}")
     ctx = row.get("context_values") or {}

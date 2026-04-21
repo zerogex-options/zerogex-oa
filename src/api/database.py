@@ -2697,12 +2697,12 @@ class DatabaseManager:
             logger.error(f"get_eod_pressure_signal failed ({symbol}): {e}")
             return None
 
-    async def get_independent_signal(
+    async def get_advanced_signal(
         self,
         symbol: str = "SPY",
         signal_name: str = "",
     ) -> Optional[Dict[str, Any]]:
-        """Return the most recent independent signal from signal_component_scores."""
+        """Return the most recent advanced signal from signal_component_scores."""
         query = """
             SELECT
                 scs.underlying,
@@ -2742,8 +2742,16 @@ class DatabaseManager:
                 )
                 return d
         except Exception as e:
-            logger.error(f"get_independent_signal failed ({symbol}, {signal_name}): {e}")
+            logger.error(f"get_advanced_signal failed ({symbol}, {signal_name}): {e}")
             return None
+
+    # Backward compatibility while callers migrate naming.
+    async def get_independent_signal(
+        self,
+        symbol: str = "SPY",
+        signal_name: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        return await self.get_advanced_signal(symbol=symbol, signal_name=signal_name)
 
     async def get_signal_events(
         self,
@@ -2841,11 +2849,11 @@ class DatabaseManager:
             logger.error(f"get_signal_hit_rate failed ({symbol}, {signal_name}): {e}")
             return None
 
-    async def get_latest_independent_signals_bundle(
+    async def get_latest_advanced_signals_bundle(
         self,
         symbol: str = "SPY",
     ) -> Dict[str, Optional[Dict[str, Any]]]:
-        """Return the latest row for each independent signal for a symbol.
+        """Return the latest row for each advanced signal for a symbol.
 
         Used by the confluence-matrix endpoint to score cross-signal agreement
         in a single DB round-trip.
@@ -2889,8 +2897,15 @@ class DatabaseManager:
                     out[d["component_name"]] = d
                 return out
         except Exception as e:
-            logger.error(f"get_latest_independent_signals_bundle failed ({symbol}): {e}")
+            logger.error(f"get_latest_advanced_signals_bundle failed ({symbol}): {e}")
             return out
+
+    # Backward compatibility while callers migrate naming.
+    async def get_latest_independent_signals_bundle(
+        self,
+        symbol: str = "SPY",
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        return await self.get_latest_advanced_signals_bundle(symbol=symbol)
 
     async def get_signal_component_events(
         self,

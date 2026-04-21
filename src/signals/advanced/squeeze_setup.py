@@ -1,10 +1,10 @@
-"""Independent squeeze-setup detector."""
+"""Advanced squeeze-setup detector."""
 from __future__ import annotations
 
 from src.signals.components.base import MarketContext
 from src.signals.components.utils import pct_change_n_bar, vol_normalized_momentum
 from src.signals.advanced.base import (
-    IndependentSignalResult,
+    AdvancedSignalResult,
     flow_flux_norm,
     tanh_scaled,
     vix_regime,
@@ -14,7 +14,7 @@ from src.signals.advanced.base import (
 class SqueezeSetupSignal:
     name = "squeeze_setup"
 
-    def evaluate(self, ctx: MarketContext) -> IndependentSignalResult:
+    def evaluate(self, ctx: MarketContext) -> AdvancedSignalResult:
         extra = ctx.extra or {}
         call_flow_delta = float(extra.get("call_flow_delta") or 0.0)
         put_flow_delta = float(extra.get("put_flow_delta") or 0.0)
@@ -64,7 +64,7 @@ class SqueezeSetupSignal:
 
         vix_level = extra.get("vix_level")
         regime = vix_regime(vix_level)
-        return IndependentSignalResult(
+        return AdvancedSignalResult(
             name=self.name,
             score=score,
             context={

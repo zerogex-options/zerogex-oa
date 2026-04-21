@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from src.signals.components.base import MarketContext
-from src.signals.advanced.base import IndependentSignalResult
+from src.signals.advanced.base import AdvancedSignalResult
 from src.signals.advanced.eod_pressure import EODPressureSignal
 from src.signals.advanced.gamma_vwap_confluence import GammaVWAPConfluenceSignal
 from src.signals.advanced.squeeze_setup import SqueezeSetupSignal
@@ -26,9 +26,6 @@ class AdvancedSignalEngine:
             GammaVWAPConfluenceSignal(),
         )
 
-    def evaluate(self, ctx: MarketContext) -> list[IndependentSignalResult]:
+    def evaluate(self, ctx: MarketContext) -> list[AdvancedSignalResult]:
         return [signal.evaluate(ctx) for signal in self._signals]
 
-
-# Backward compatibility alias
-IndependentSignalEngine = AdvancedSignalEngine

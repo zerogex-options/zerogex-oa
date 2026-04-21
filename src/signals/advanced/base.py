@@ -28,10 +28,6 @@ class AdvancedSignalResult:
     context: dict
 
 
-# Backward compatibility while callers migrate naming.
-IndependentSignalResult = AdvancedSignalResult
-
-
 def nearest_above(levels: list[Optional[float]], close: float) -> Optional[float]:
     candidates = [lv for lv in levels if lv is not None and lv > close]
     return min(candidates) if candidates else None

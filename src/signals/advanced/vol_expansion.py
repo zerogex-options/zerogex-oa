@@ -1,4 +1,4 @@
-"""Independent volatility expansion signal — continuous spectrum model."""
+"""Advanced volatility expansion signal — continuous spectrum model."""
 from __future__ import annotations
 
 import math
@@ -9,7 +9,7 @@ from src.signals.components.utils import (
     realized_sigma,
     vol_normalized_momentum,
 )
-from src.signals.advanced.base import IndependentSignalResult
+from src.signals.advanced.base import AdvancedSignalResult
 
 _DIRECTION_Z_NORM = 1.0
 _GEX_NORM = 300_000_000
@@ -89,10 +89,10 @@ class VolExpansionSignal:
             "realized_sigma_bar": round(sigma, 6) if sigma > 0 else None,
         }
 
-    def evaluate(self, ctx: MarketContext) -> IndependentSignalResult:
+    def evaluate(self, ctx: MarketContext) -> AdvancedSignalResult:
         score = max(-1.0, min(1.0, float(self.compute(ctx))))
         triggered = abs(score) >= 0.25
-        return IndependentSignalResult(
+        return AdvancedSignalResult(
             name=self.name,
             score=score,
             context={

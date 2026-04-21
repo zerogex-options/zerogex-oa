@@ -38,7 +38,7 @@ def _engine(scores: dict[str, float]) -> ScoringEngine:
         "net_gex_sign",
         "flip_distance",
         "local_gamma",
-        "put_call_ratio_state",
+        "put_call_ratio",
         "price_vs_max_gamma",
         "volatility_regime",
     ]
@@ -61,7 +61,7 @@ def test_market_state_score_caps_at_100():
             "net_gex_sign": 1.0,
             "flip_distance": 1.0,
             "local_gamma": 1.0,
-            "put_call_ratio_state": 1.0,
+            "put_call_ratio": 1.0,
             "price_vs_max_gamma": 1.0,
             "volatility_regime": 1.0,
         }
@@ -77,7 +77,7 @@ def test_market_state_score_floor_at_zero():
             "net_gex_sign": -1.0,
             "flip_distance": -1.0,
             "local_gamma": -1.0,
-            "put_call_ratio_state": -1.0,
+            "put_call_ratio": -1.0,
             "price_vs_max_gamma": -1.0,
             "volatility_regime": -1.0,
         }
