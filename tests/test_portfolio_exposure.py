@@ -551,6 +551,84 @@ class TestIndependentSignalTriggering:
         assert out.source == "independent:trap_detection"
         assert out.direction == "bearish"
 
+
+class TestIndependentSignalRiskBySessionPhase:
+    def test_phase_classification_early_mid_and_late_session(self):
+        scalp_score = ScoreSnapshot(
+            timestamp=datetime(2026, 4, 6, 14, 0, tzinfo=timezone.utc),  # 10:00 ET
+            underlying="SPY",
+            composite_score=0.2,
+            normalized_score=0.2,
+            direction="bullish",
+            components={},
+        )
+        intraday_score = ScoreSnapshot(
+            timestamp=datetime(2026, 4, 6, 16, 30, tzinfo=timezone.utc),  # 12:30 ET
+            underlying="SPY",
+            composite_score=0.2,
+            normalized_score=0.2,
+            direction="bullish",
+            components={},
+        )
+        swing_score = ScoreSnapshot(
+            timestamp=datetime(2026, 4, 6, 19, 0, tzinfo=timezone.utc),  # 15:00 ET
+            underlying="SPY",
+            composite_score=0.2,
+            normalized_score=0.2,
+            direction="bullish",
+            components={},
+        )
+        assert PortfolioEngine._independent_signal_phase(scalp_score) == "scalp"
+        assert PortfolioEngine._independent_signal_phase(intraday_score) == "intraday"
+        assert PortfolioEngine._independent_signal_phase(swing_score) == "swing"
+
+    def test_conservative_profile_requires_more_conviction_than_balanced(self):
+        score = ScoreSnapshot(
+            timestamp=datetime(2026, 4, 6, 16, 30, tzinfo=timezone.utc),  # intraday
+            underlying="SPY",
+            composite_score=0.2,
+            normalized_score=0.2,
+            direction="bullish",
+            components={},
+        )
+        trap_threshold = PortfolioEngine._independent_signal_threshold("trap_detection", score)
+        eod_threshold = PortfolioEngine._independent_signal_threshold("eod_pressure", score)
+
+        assert trap_threshold > eod_threshold
+        assert trap_threshold == pytest.approx(0.345)
+        assert eod_threshold == pytest.approx(0.30)
+
+    def test_signal_min_threshold_floor_applies_for_aggressive_profile(self):
+        score = ScoreSnapshot(
+            timestamp=datetime(2026, 4, 6, 14, 0, tzinfo=timezone.utc),  # scalp
+            underlying="SPY",
+            composite_score=0.2,
+            normalized_score=0.2,
+            direction="bullish",
+            components={},
+        )
+        with patch.dict(
+            PortfolioEngine._INDEPENDENT_SIGNAL_RISK_PROFILE,
+            {"gamma_vwap_confluence": "aggressive"},
+            clear=False,
+        ), patch.dict(
+            PortfolioEngine._INDEPENDENT_PHASE_BASE_THRESHOLD,
+            {"scalp": 0.20},
+            clear=False,
+        ), patch.dict(
+            PortfolioEngine._INDEPENDENT_RISK_MULTIPLIER,
+            {"aggressive": 0.50},
+            clear=False,
+        ):
+            threshold = PortfolioEngine._independent_signal_threshold(
+                "gamma_vwap_confluence",
+                score,
+            )
+
+        # 0.20 * 0.50 = 0.10, but min floor for gamma_vwap_confluence is 0.20.
+        assert threshold == pytest.approx(0.20)
+
+
 class TestFreshCrossSizingBoost:
     """A fresh gamma-flip cross in the signaled direction should increase
     the contract count. Same setup as TestTargetPositionStrike but we vary

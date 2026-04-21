@@ -302,6 +302,116 @@ SIGNALS_DRS_FRESH_CROSS_BOOST = max(
 )
 
 # -----------------------------------------------------------------------------
+# Independent signal trigger risk controls
+# -----------------------------------------------------------------------------
+_INDEPENDENT_RISK_PROFILE_VALUES = {"conservative", "balanced", "aggressive"}
+
+
+def _independent_risk_profile(name: str, default: str = "balanced") -> str:
+    value = os.getenv(name, default).strip().lower()
+    return value if value in _INDEPENDENT_RISK_PROFILE_VALUES else default
+
+
+# Session-phase segmentation for independent-trigger gating.
+SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN = max(
+    15, int(os.getenv("SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN", "75"))
+)
+SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE = max(
+    15, int(os.getenv("SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE", "90"))
+)
+
+# Base threshold by phase (higher = stricter; all values clamped in [0,1]).
+SIGNALS_INDEPENDENT_THRESHOLD_SCALP = max(
+    0.0, min(1.0, float(os.getenv("SIGNALS_INDEPENDENT_THRESHOLD_SCALP", "0.38")))
+)
+SIGNALS_INDEPENDENT_THRESHOLD_INTRADAY = max(
+    0.0, min(1.0, float(os.getenv("SIGNALS_INDEPENDENT_THRESHOLD_INTRADAY", "0.30")))
+)
+SIGNALS_INDEPENDENT_THRESHOLD_SWING = max(
+    0.0, min(1.0, float(os.getenv("SIGNALS_INDEPENDENT_THRESHOLD_SWING", "0.34")))
+)
+
+# Risk-profile multipliers applied to phase thresholds.
+SIGNALS_INDEPENDENT_RISK_MULT_CONSERVATIVE = max(
+    0.5,
+    min(
+        2.0,
+        float(os.getenv("SIGNALS_INDEPENDENT_RISK_MULT_CONSERVATIVE", "1.15")),
+    ),
+)
+SIGNALS_INDEPENDENT_RISK_MULT_BALANCED = max(
+    0.5,
+    min(2.0, float(os.getenv("SIGNALS_INDEPENDENT_RISK_MULT_BALANCED", "1.00"))),
+)
+SIGNALS_INDEPENDENT_RISK_MULT_AGGRESSIVE = max(
+    0.5,
+    min(2.0, float(os.getenv("SIGNALS_INDEPENDENT_RISK_MULT_AGGRESSIVE", "0.90"))),
+)
+
+# Hard floors to avoid over-loose thresholds even in aggressive profiles.
+SIGNALS_INDEPENDENT_MIN_THRESHOLD_SQUEEZE_SETUP = max(
+    0.0,
+    min(1.0, float(os.getenv("SIGNALS_INDEPENDENT_MIN_THRESHOLD_SQUEEZE_SETUP", "0.25"))),
+)
+SIGNALS_INDEPENDENT_MIN_THRESHOLD_TRAP_DETECTION = max(
+    0.0,
+    min(1.0, float(os.getenv("SIGNALS_INDEPENDENT_MIN_THRESHOLD_TRAP_DETECTION", "0.25"))),
+)
+SIGNALS_INDEPENDENT_MIN_THRESHOLD_ZERO_DTE_POSITION_IMBALANCE = max(
+    0.0,
+    min(
+        1.0,
+        float(
+            os.getenv(
+                "SIGNALS_INDEPENDENT_MIN_THRESHOLD_ZERO_DTE_POSITION_IMBALANCE",
+                "0.25",
+            )
+        ),
+    ),
+)
+SIGNALS_INDEPENDENT_MIN_THRESHOLD_GAMMA_VWAP_CONFLUENCE = max(
+    0.0,
+    min(
+        1.0,
+        float(os.getenv("SIGNALS_INDEPENDENT_MIN_THRESHOLD_GAMMA_VWAP_CONFLUENCE", "0.20")),
+    ),
+)
+SIGNALS_INDEPENDENT_MIN_THRESHOLD_VOL_EXPANSION = max(
+    0.0,
+    min(1.0, float(os.getenv("SIGNALS_INDEPENDENT_MIN_THRESHOLD_VOL_EXPANSION", "0.25"))),
+)
+SIGNALS_INDEPENDENT_MIN_THRESHOLD_EOD_PRESSURE = max(
+    0.0,
+    min(1.0, float(os.getenv("SIGNALS_INDEPENDENT_MIN_THRESHOLD_EOD_PRESSURE", "0.20"))),
+)
+
+# Per-signal risk profile knobs.
+SIGNALS_INDEPENDENT_RISK_PROFILE_SQUEEZE_SETUP = _independent_risk_profile(
+    "SIGNALS_INDEPENDENT_RISK_PROFILE_SQUEEZE_SETUP",
+    "balanced",
+)
+SIGNALS_INDEPENDENT_RISK_PROFILE_TRAP_DETECTION = _independent_risk_profile(
+    "SIGNALS_INDEPENDENT_RISK_PROFILE_TRAP_DETECTION",
+    "conservative",
+)
+SIGNALS_INDEPENDENT_RISK_PROFILE_ZERO_DTE_POSITION_IMBALANCE = _independent_risk_profile(
+    "SIGNALS_INDEPENDENT_RISK_PROFILE_ZERO_DTE_POSITION_IMBALANCE",
+    "balanced",
+)
+SIGNALS_INDEPENDENT_RISK_PROFILE_GAMMA_VWAP_CONFLUENCE = _independent_risk_profile(
+    "SIGNALS_INDEPENDENT_RISK_PROFILE_GAMMA_VWAP_CONFLUENCE",
+    "conservative",
+)
+SIGNALS_INDEPENDENT_RISK_PROFILE_VOL_EXPANSION = _independent_risk_profile(
+    "SIGNALS_INDEPENDENT_RISK_PROFILE_VOL_EXPANSION",
+    "conservative",
+)
+SIGNALS_INDEPENDENT_RISK_PROFILE_EOD_PRESSURE = _independent_risk_profile(
+    "SIGNALS_INDEPENDENT_RISK_PROFILE_EOD_PRESSURE",
+    "balanced",
+)
+
+# -----------------------------------------------------------------------------
 # Contrarian direction override
 # -----------------------------------------------------------------------------
 # A strong consensus from the three contrarian components (exhaustion,

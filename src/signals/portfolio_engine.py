@@ -26,6 +26,26 @@ from src.config import (
     SIGNALS_DRS_CALL_ENTRY_MIN,
     SIGNALS_DRS_FRESH_CROSS_BOOST,
     SIGNALS_DRS_HARD_GATES_ENABLED,
+    SIGNALS_INDEPENDENT_MIN_THRESHOLD_EOD_PRESSURE,
+    SIGNALS_INDEPENDENT_MIN_THRESHOLD_GAMMA_VWAP_CONFLUENCE,
+    SIGNALS_INDEPENDENT_MIN_THRESHOLD_SQUEEZE_SETUP,
+    SIGNALS_INDEPENDENT_MIN_THRESHOLD_TRAP_DETECTION,
+    SIGNALS_INDEPENDENT_MIN_THRESHOLD_VOL_EXPANSION,
+    SIGNALS_INDEPENDENT_MIN_THRESHOLD_ZERO_DTE_POSITION_IMBALANCE,
+    SIGNALS_INDEPENDENT_RISK_MULT_AGGRESSIVE,
+    SIGNALS_INDEPENDENT_RISK_MULT_BALANCED,
+    SIGNALS_INDEPENDENT_RISK_MULT_CONSERVATIVE,
+    SIGNALS_INDEPENDENT_RISK_PROFILE_EOD_PRESSURE,
+    SIGNALS_INDEPENDENT_RISK_PROFILE_GAMMA_VWAP_CONFLUENCE,
+    SIGNALS_INDEPENDENT_RISK_PROFILE_SQUEEZE_SETUP,
+    SIGNALS_INDEPENDENT_RISK_PROFILE_TRAP_DETECTION,
+    SIGNALS_INDEPENDENT_RISK_PROFILE_VOL_EXPANSION,
+    SIGNALS_INDEPENDENT_RISK_PROFILE_ZERO_DTE_POSITION_IMBALANCE,
+    SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN,
+    SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE,
+    SIGNALS_INDEPENDENT_THRESHOLD_INTRADAY,
+    SIGNALS_INDEPENDENT_THRESHOLD_SCALP,
+    SIGNALS_INDEPENDENT_THRESHOLD_SWING,
     SIGNALS_DRS_OVERRIDE_ENABLED,
     SIGNALS_DRS_OVERRIDE_THRESHOLD,
     SIGNALS_DRS_PUT_ENTRY_MAX,
@@ -49,6 +69,11 @@ from src.signals.position_optimizer_engine import (
     fetch_option_snapshot,
 )
 from src.signals.independent import IndependentSignalResult
+from src.signals.components.utils import (
+    SESSION_CLOSE_MIN_ET,
+    SESSION_OPEN_MIN_ET,
+    minute_of_day_et,
+)
 from src.signals.scoring_engine import ScoreSnapshot
 from src.signals.strategy_builder import StrategyBuilder
 from src.symbols import get_canonical_symbol
@@ -147,8 +172,42 @@ class PortfolioEngine:
         },
     }
 
-    _INDEPENDENT_SIGNAL_BASE_THRESHOLD = 0.28
-    _INDEPENDENT_SIGNAL_STRONG_THRESHOLD = 0.45
+    _INDEPENDENT_SIGNAL_RISK_PROFILE = {
+        "squeeze_setup": SIGNALS_INDEPENDENT_RISK_PROFILE_SQUEEZE_SETUP,
+        "trap_detection": SIGNALS_INDEPENDENT_RISK_PROFILE_TRAP_DETECTION,
+        "zero_dte_position_imbalance": SIGNALS_INDEPENDENT_RISK_PROFILE_ZERO_DTE_POSITION_IMBALANCE,
+        "gamma_vwap_confluence": SIGNALS_INDEPENDENT_RISK_PROFILE_GAMMA_VWAP_CONFLUENCE,
+        "vol_expansion": SIGNALS_INDEPENDENT_RISK_PROFILE_VOL_EXPANSION,
+        "eod_pressure": SIGNALS_INDEPENDENT_RISK_PROFILE_EOD_PRESSURE,
+    }
+
+    _INDEPENDENT_SIGNAL_MIN_THRESHOLD = {
+        "squeeze_setup": SIGNALS_INDEPENDENT_MIN_THRESHOLD_SQUEEZE_SETUP,
+        "trap_detection": SIGNALS_INDEPENDENT_MIN_THRESHOLD_TRAP_DETECTION,
+        "zero_dte_position_imbalance": SIGNALS_INDEPENDENT_MIN_THRESHOLD_ZERO_DTE_POSITION_IMBALANCE,
+        "gamma_vwap_confluence": SIGNALS_INDEPENDENT_MIN_THRESHOLD_GAMMA_VWAP_CONFLUENCE,
+        "vol_expansion": SIGNALS_INDEPENDENT_MIN_THRESHOLD_VOL_EXPANSION,
+        "eod_pressure": SIGNALS_INDEPENDENT_MIN_THRESHOLD_EOD_PRESSURE,
+    }
+
+    _INDEPENDENT_PHASE_BASE_THRESHOLD = {
+        "scalp": SIGNALS_INDEPENDENT_THRESHOLD_SCALP,
+        "intraday": SIGNALS_INDEPENDENT_THRESHOLD_INTRADAY,
+        "swing": SIGNALS_INDEPENDENT_THRESHOLD_SWING,
+    }
+
+    _INDEPENDENT_RISK_MULTIPLIER = {
+        "conservative": SIGNALS_INDEPENDENT_RISK_MULT_CONSERVATIVE,
+        "balanced": SIGNALS_INDEPENDENT_RISK_MULT_BALANCED,
+        "aggressive": SIGNALS_INDEPENDENT_RISK_MULT_AGGRESSIVE,
+    }
+
+    _INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN = (
+        SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN
+    )
+    _INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE = (
+        SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE
+    )
 
     @staticmethod
     def _market_status(dt: Optional[datetime] = None) -> str:
@@ -448,11 +507,11 @@ class PortfolioEngine:
         conn=None,
         cached_option_rows=None,
     ) -> Optional[PortfolioTarget]:
-        strongest = self._strongest_independent_signal(independent_results)
+        strongest = self._strongest_independent_signal(independent_results, score)
         if strongest is None:
             return None
 
-        signal_result, signal_direction = strongest
+        signal_result, signal_direction, phase, threshold = strongest
         synthetic_score = self._build_signal_snapshot_for_independent(
             base=score,
             signal_result=signal_result,
@@ -472,7 +531,8 @@ class PortfolioEngine:
 
         target.source = f"independent:{signal_result.name}"
         target.rationale = (
-            f"Independent {signal_result.name} score={signal_result.score:.3f} triggered, "
+            f"Independent {signal_result.name} score={signal_result.score:.3f} "
+            f"phase={phase} threshold={threshold:.3f} triggered, "
             + target.rationale
         )
         return target
@@ -480,22 +540,25 @@ class PortfolioEngine:
     def _strongest_independent_signal(
         self,
         independent_results: list[IndependentSignalResult],
-    ) -> Optional[tuple[IndependentSignalResult, str]]:
-        ranked: list[tuple[IndependentSignalResult, str]] = []
+        score: ScoreSnapshot,
+    ) -> Optional[tuple[IndependentSignalResult, str, str, float]]:
+        ranked: list[tuple[IndependentSignalResult, str, str, float]] = []
         for result in independent_results or []:
             direction = self._resolve_independent_direction(result)
             if direction == "neutral":
                 continue
-            threshold = self._independent_signal_threshold(result.name)
+            phase = self._independent_signal_phase(score)
+            threshold = self._independent_signal_threshold(result.name, score)
             if abs(result.score) < threshold:
                 continue
-            ranked.append((result, direction))
+            ranked.append((result, direction, phase, threshold))
 
         if not ranked:
             return None
 
         ranked.sort(
             key=lambda item: (
+                abs(item[0].score) - item[3],
                 abs(item[0].score),
                 1 if item[0].name in {"vol_expansion", "eod_pressure"} else 0,
             ),
@@ -516,13 +579,41 @@ class PortfolioEngine:
             return "bearish"
         return "neutral"
 
-    @staticmethod
-    def _independent_signal_threshold(signal_name: str) -> float:
-        if signal_name == "gamma_vwap_confluence":
-            return 0.20
-        if signal_name == "eod_pressure":
-            return 0.20
-        return 0.25
+    @classmethod
+    def _independent_signal_phase(cls, score: ScoreSnapshot) -> str:
+        """Classify independent-trigger horizon by session phase."""
+        minute_et = minute_of_day_et(score.timestamp)
+        if minute_et is None:
+            return "intraday"
+        if minute_et < SESSION_OPEN_MIN_ET or minute_et > SESSION_CLOSE_MIN_ET:
+            return "swing"
+
+        scalp_cutoff = SESSION_OPEN_MIN_ET + cls._INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN
+        swing_cutoff = SESSION_CLOSE_MIN_ET - cls._INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE
+        if minute_et <= scalp_cutoff:
+            return "scalp"
+        if minute_et >= swing_cutoff:
+            return "swing"
+        return "intraday"
+
+    @classmethod
+    def _independent_signal_threshold(cls, signal_name: str, score: ScoreSnapshot) -> float:
+        """Phase-aware threshold with per-signal risk profile knobs."""
+        phase = cls._independent_signal_phase(score)
+        phase_base = float(
+            cls._INDEPENDENT_PHASE_BASE_THRESHOLD.get(
+                phase, SIGNALS_INDEPENDENT_THRESHOLD_INTRADAY
+            )
+        )
+        profile = cls._INDEPENDENT_SIGNAL_RISK_PROFILE.get(signal_name, "balanced")
+        risk_mult = float(
+            cls._INDEPENDENT_RISK_MULTIPLIER.get(
+                profile, SIGNALS_INDEPENDENT_RISK_MULT_BALANCED
+            )
+        )
+        min_threshold = float(cls._INDEPENDENT_SIGNAL_MIN_THRESHOLD.get(signal_name, 0.25))
+        threshold = phase_base * float(risk_mult)
+        return max(min_threshold, min(1.0, threshold))
 
     @staticmethod
     def _build_signal_snapshot_for_independent(
