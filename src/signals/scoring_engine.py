@@ -19,6 +19,8 @@ from src.config import (
     SIGNALS_CONTRARIAN_OVERRIDE_ENABLED,
     SIGNALS_CONTRARIAN_OVERRIDE_MIN_COMPOSITE,
     SIGNALS_CONTRARIAN_OVERRIDE_THRESHOLD,
+    SIGNALS_CONTRARIAN_REWEIGHT_ENABLED,
+    SIGNALS_CONTRARIAN_REWEIGHT_MULT,
     SIGNALS_CONVICTION_ABSTAIN_EPSILON,
     SIGNALS_CONVICTION_AGGREGATION_ENABLED,
     SIGNALS_CONVICTION_AGREEMENT_MAX_MULT,
@@ -77,16 +79,28 @@ class ScoringEngine:
         for component in self.components:
             raw = component.compute(ctx)
             clamped = max(-1.0, min(1.0, raw))
+            effective_weight = component.weight
+            if (
+                SIGNALS_CONTRARIAN_REWEIGHT_ENABLED
+                and component.name in _CONTRARIAN_COMPONENT_NAMES
+            ):
+                effective_weight = component.weight * SIGNALS_CONTRARIAN_REWEIGHT_MULT
             component_results.append((component, clamped))
             weighted_components[component.name] = {
                 "weight": component.weight,
+                "effective_weight": round(effective_weight, 6),
                 "score": clamped,
             }
 
-        raw_composite = sum(c.weight * score for c, score in component_results)
-        composite, aggregation = self._aggregate(component_results, raw_composite)
+        raw_composite = sum(
+            weighted_components[c.name]["effective_weight"] * score
+            for c, score in component_results
+        )
+        composite, aggregation = self._aggregate(
+            weighted_components, component_results, raw_composite
+        )
         composite, aggregation = self._apply_contrarian_override(
-            composite, component_results, aggregation
+            composite, component_results, weighted_components, aggregation
         )
         normalized = abs(composite)
 
@@ -107,6 +121,7 @@ class ScoringEngine:
 
     @staticmethod
     def _aggregate(
+        weighted_components: dict,
         component_results: list[tuple[ComponentBase, float]],
         raw_composite: float,
     ) -> tuple[float, dict]:
@@ -130,7 +145,10 @@ class ScoringEngine:
 
         eps = SIGNALS_CONVICTION_ABSTAIN_EPSILON
         active = [(c, s) for c, s in component_results if abs(s) >= eps]
-        active_weight = sum(c.weight for c, _ in active)
+        active_weight = sum(
+            float(weighted_components.get(c.name, {}).get("effective_weight", c.weight))
+            for c, _ in active
+        )
 
         if not active or active_weight <= 0:
             return 0.0, {
@@ -144,14 +162,26 @@ class ScoringEngine:
             }
 
         # Renormalize against active weight only.
-        active_numerator = sum(c.weight * s for c, s in active)
+        active_numerator = sum(
+            float(weighted_components.get(c.name, {}).get("effective_weight", c.weight)) * s
+            for c, s in active
+        )
         renormalized = active_numerator / active_weight  # in [-1, 1]
 
         # Agreement: weighted mass of the majority direction over total
         # weighted mass of *all* active components (both signs). 0.5 means
         # a dead tie; 1.0 means unanimous.
-        pos_mass = sum(c.weight * s for c, s in active if s > 0)
-        neg_mass = sum(c.weight * abs(s) for c, s in active if s < 0)
+        pos_mass = sum(
+            float(weighted_components.get(c.name, {}).get("effective_weight", c.weight)) * s
+            for c, s in active
+            if s > 0
+        )
+        neg_mass = sum(
+            float(weighted_components.get(c.name, {}).get("effective_weight", c.weight))
+            * abs(s)
+            for c, s in active
+            if s < 0
+        )
         total_mass = pos_mass + neg_mass
         if total_mass <= 0:
             agreement = 0.5
@@ -190,6 +220,8 @@ class ScoringEngine:
             "agreement_multiplier": round(agreement_mult, 4),
             "max_abs_component": round(max_abs, 4),
             "extremity_multiplier": round(extremity_mult, 4),
+            "contrarian_reweight_enabled": SIGNALS_CONTRARIAN_REWEIGHT_ENABLED,
+            "contrarian_reweight_mult": SIGNALS_CONTRARIAN_REWEIGHT_MULT,
         }
         return composite, diagnostics
 
@@ -197,6 +229,7 @@ class ScoringEngine:
     def _apply_contrarian_override(
         composite: float,
         component_results: list[tuple[ComponentBase, float]],
+        weighted_components: dict,
         diagnostics: dict,
     ) -> tuple[float, dict]:
         """Flip composite sign when the contrarian consensus strongly opposes it.
@@ -209,8 +242,13 @@ class ScoringEngine:
         contrarian_weighted = 0.0
         for comp, clamped in component_results:
             if comp.name in _CONTRARIAN_COMPONENT_NAMES:
-                contrarian_total_weight += comp.weight
-                contrarian_weighted += comp.weight * clamped
+                eff = float(
+                    weighted_components.get(comp.name, {}).get(
+                        "effective_weight", comp.weight
+                    )
+                )
+                contrarian_total_weight += eff
+                contrarian_weighted += eff * clamped
         contrarian_consensus = (
             contrarian_weighted / contrarian_total_weight
             if contrarian_total_weight > 0
@@ -293,6 +331,9 @@ class ScoringEngine:
         # Insert per-component scores
         for component, clamped_score in component_results:
             context_vals = component.context_values(ctx)
+            effective_weight = float(
+                score.components.get(component.name, {}).get("effective_weight", component.weight)
+            )
             cur.execute(
                 """
                 INSERT INTO signal_component_scores (
@@ -309,8 +350,8 @@ class ScoringEngine:
                     score.timestamp,
                     component.name,
                     clamped_score,
-                    round(component.weight * clamped_score, 6),
-                    component.weight,
+                    round(effective_weight * clamped_score, 6),
+                    effective_weight,
                     json.dumps(context_vals, default=str),
                 ),
             )

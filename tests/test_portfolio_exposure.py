@@ -170,6 +170,62 @@ class TestDealerRegimeHardGates:
         ) is False
 
 
+class TestTrendConfirmationReversalRelaxation:
+    def test_strong_reversal_lowers_required_matches(self):
+        engine = _make_engine()
+        engine.trend_confirmation_bars = 3
+        engine.trend_confirmation_min_match = 2
+        score = ScoreSnapshot(
+            timestamp=NOW,
+            underlying="SPY",
+            composite_score=-0.7,
+            normalized_score=0.72,
+            direction="bearish",
+            components={
+                "exhaustion": {"score": -0.82, "weight": 0.05},
+                "positioning_trap": {"score": -0.2, "weight": 0.06},
+            },
+        )
+        conn = MagicMock()
+        cur = MagicMock()
+        cur.fetchall.return_value = [("bullish",), ("bearish",), ("bullish",)]
+        conn.cursor.return_value = cur
+
+        ok = engine._score_trend_confirmation(
+            score,
+            {"vwap_deviation_pct": 0.0},
+            conn=conn,
+        )
+        assert ok is True
+
+    def test_without_strong_reversal_same_history_fails(self):
+        engine = _make_engine()
+        engine.trend_confirmation_bars = 3
+        engine.trend_confirmation_min_match = 2
+        score = ScoreSnapshot(
+            timestamp=NOW,
+            underlying="SPY",
+            composite_score=-0.55,
+            normalized_score=0.55,
+            direction="bearish",
+            components={
+                "exhaustion": {"score": -0.2, "weight": 0.05},
+                "positioning_trap": {"score": -0.2, "weight": 0.06},
+            },
+        )
+        conn = MagicMock()
+        cur = MagicMock()
+        cur.fetchall.return_value = [("bullish",), ("bearish",), ("bullish",)]
+        conn.cursor.return_value = cur
+
+        ok = engine._score_trend_confirmation(
+            score,
+            {"vwap_deviation_pct": 0.001},
+            conn=conn,
+        )
+        assert ok is False
+
+
 # ---------------------------------------------------------------------------
 # Scalp tier + DRS override (compute_target threshold classification)
 # ---------------------------------------------------------------------------

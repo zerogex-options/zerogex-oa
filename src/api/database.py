@@ -2840,6 +2840,265 @@ class DatabaseManager:
             logger.error(f"get_latest_independent_signals_bundle failed ({symbol}): {e}")
             return out
 
+    async def get_signal_component_events(
+        self,
+        symbol: str = "SPY",
+        component_name: str = "",
+        limit: int = 200,
+        horizon: str = "60m",
+    ) -> list[Dict[str, Any]]:
+        """Return per-component score time series with sign-flip events."""
+        horizon_interval = {"30m": "30 minutes", "60m": "60 minutes", "120m": "120 minutes"}.get(
+            horizon, "60 minutes"
+        )
+        query = """
+            SELECT
+                scs.underlying,
+                scs.timestamp,
+                scs.component_name,
+                scs.clamped_score,
+                scs.weighted_score,
+                scs.weight,
+                scs.context_values,
+                q0.close AS close_at_timestamp,
+                q1.close AS close_at_horizon
+            FROM signal_component_scores scs
+            LEFT JOIN LATERAL (
+                SELECT close
+                FROM underlying_quotes uq
+                WHERE uq.symbol = scs.underlying
+                  AND uq.timestamp <= scs.timestamp
+                ORDER BY uq.timestamp DESC
+                LIMIT 1
+            ) q0 ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT close
+                FROM underlying_quotes uq
+                WHERE uq.symbol = scs.underlying
+                  AND uq.timestamp >= scs.timestamp + INTERVAL '{horizon_interval}'
+                ORDER BY uq.timestamp ASC
+                LIMIT 1
+            ) q1 ON TRUE
+            WHERE scs.underlying = $1
+              AND scs.component_name = $2
+            ORDER BY scs.timestamp DESC
+            LIMIT $3
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, component_name, limit)
+            # Oldest->newest for deterministic sign-flip calculation.
+            ordered = [dict(r) for r in reversed(rows)]
+            out: list[Dict[str, Any]] = []
+            prev_sign = 0
+            flip_count = 0
+            for row in ordered:
+                ctx = row.get("context_values") or {}
+                if isinstance(ctx, str):
+                    ctx = json.loads(ctx)
+                raw = float(row.get("clamped_score") or 0.0)
+                score = round(raw * 100.0, 4)
+                sign = 1 if raw > 0 else (-1 if raw < 0 else 0)
+                sign_flip = prev_sign != 0 and sign != 0 and sign != prev_sign
+                if sign_flip:
+                    flip_count += 1
+                out.append(
+                    {
+                        "underlying": row["underlying"],
+                        "timestamp": row["timestamp"],
+                        "component_name": row["component_name"],
+                        "score": score,
+                        "weighted_score": float(row.get("weighted_score") or 0.0),
+                        "weight": float(row.get("weight") or 0.0),
+                        "direction": (
+                            "bullish" if sign > 0 else "bearish" if sign < 0 else "neutral"
+                        ),
+                        "direction_flip": sign_flip,
+                        "inputs": ctx,
+                        "horizon": horizon,
+                        "close": (
+                            float(row.get("close_at_timestamp"))
+                            if row.get("close_at_timestamp") is not None
+                            else None
+                        ),
+                        "horizon_close": (
+                            float(row.get("close_at_horizon"))
+                            if row.get("close_at_horizon") is not None
+                            else None
+                        ),
+                        "realized_return": (
+                            round(
+                                (
+                                    float(row.get("close_at_horizon"))
+                                    - float(row.get("close_at_timestamp"))
+                                )
+                                / float(row.get("close_at_timestamp")),
+                                6,
+                            )
+                            if row.get("close_at_timestamp")
+                            and row.get("close_at_horizon") is not None
+                            else None
+                        ),
+                    }
+                )
+                if sign != 0:
+                    prev_sign = sign
+            return out
+        except Exception as e:
+            logger.error(
+                f"get_signal_component_events failed ({symbol}, {component_name}): {e}"
+            )
+            return []
+
+    async def get_signal_confluence_matrix(
+        self,
+        symbol: str,
+        component_names: Optional[list[str]] = None,
+        lookback: int = 240,
+        neutral_epsilon: float = 0.02,
+    ) -> Dict[str, Any]:
+        """Return component-by-component agreement/disagreement over lookback."""
+        if component_names is None:
+            component_names = [
+                "gex_regime",
+                "gamma_flip",
+                "dealer_regime",
+                "put_call_ratio",
+                "smart_money",
+                "positioning_trap",
+                "vol_expansion",
+                "exhaustion",
+                "opportunity_quality",
+                "gex_gradient",
+                "dealer_delta_pressure",
+                "vanna_charm_flow",
+                "tape_flow_bias",
+                "skew_delta",
+                "intraday_regime",
+                "eod_pressure",
+            ]
+        if not component_names:
+            return {"component_order": [], "matrix": {}, "rows_analyzed": 0}
+        query = """
+            WITH recent AS (
+                SELECT underlying, timestamp, composite_score
+                FROM signal_scores
+                WHERE underlying = $1
+                ORDER BY timestamp DESC
+                LIMIT $2
+            )
+            SELECT
+                r.timestamp,
+                r.composite_score,
+                scs.component_name,
+                scs.clamped_score
+            FROM recent r
+            LEFT JOIN signal_component_scores scs
+              ON scs.underlying = r.underlying
+             AND scs.timestamp = r.timestamp
+             AND scs.component_name = ANY($3::text[])
+            ORDER BY r.timestamp ASC
+        """
+
+        def _sign(value: float) -> int:
+            if value > neutral_epsilon:
+                return 1
+            if value < -neutral_epsilon:
+                return -1
+            return 0
+
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, lookback, component_names)
+            by_ts: Dict[Any, Dict[str, Any]] = {}
+            for row in rows:
+                ts = row["timestamp"]
+                bucket = by_ts.setdefault(
+                    ts,
+                    {
+                        "composite_score": float(row.get("composite_score") or 0.0),
+                        "components": {},
+                    },
+                )
+                comp = row.get("component_name")
+                if comp is not None:
+                    bucket["components"][comp] = float(row.get("clamped_score") or 0.0)
+
+            component_order = list(component_names)
+            matrix: Dict[str, Dict[str, Any]] = {name: {} for name in component_order}
+            component_vs_regime: Dict[str, Dict[str, Any]] = {}
+
+            for c1 in component_order:
+                for c2 in component_order:
+                    observations = agree = disagree = neutral = 0
+                    for item in by_ts.values():
+                        comps = item["components"]
+                        if c1 not in comps or c2 not in comps:
+                            continue
+                        s1 = _sign(float(comps[c1]))
+                        s2 = _sign(float(comps[c2]))
+                        observations += 1
+                        if s1 == 0 or s2 == 0:
+                            neutral += 1
+                        elif s1 == s2:
+                            agree += 1
+                        else:
+                            disagree += 1
+                    active = agree + disagree
+                    matrix[c1][c2] = {
+                        "observations": observations,
+                        "active_observations": active,
+                        "agreement_count": agree,
+                        "disagreement_count": disagree,
+                        "neutral_count": neutral,
+                        "agreement_ratio": round(agree / active, 4) if active else None,
+                        "disagreement_ratio": round(disagree / active, 4) if active else None,
+                        "net_confluence": round((agree - disagree) / active, 4) if active else 0.0,
+                    }
+
+            for comp in component_order:
+                observations = agree = disagree = neutral = 0
+                for item in by_ts.values():
+                    score = item["components"].get(comp)
+                    if score is None:
+                        continue
+                    comp_sign = _sign(float(score))
+                    regime_sign = _sign(float(item["composite_score"]))
+                    observations += 1
+                    if comp_sign == 0 or regime_sign == 0:
+                        neutral += 1
+                    elif comp_sign == regime_sign:
+                        agree += 1
+                    else:
+                        disagree += 1
+                active = agree + disagree
+                component_vs_regime[comp] = {
+                    "observations": observations,
+                    "active_observations": active,
+                    "agreement_count": agree,
+                    "disagreement_count": disagree,
+                    "neutral_count": neutral,
+                    "agreement_ratio": round(agree / active, 4) if active else None,
+                    "disagreement_ratio": round(disagree / active, 4) if active else None,
+                }
+
+            return {
+                "components": component_order,
+                "matrix": matrix,
+                "component_vs_regime": component_vs_regime,
+                "sample_count": len(by_ts),
+                "latest_timestamp": max(by_ts.keys()) if by_ts else None,
+            }
+        except Exception as e:
+            logger.error(f"get_signal_confluence_matrix failed ({symbol}): {e}")
+            return {
+                "components": list(component_names),
+                "matrix": {},
+                "component_vs_regime": {},
+                "sample_count": 0,
+                "latest_timestamp": None,
+            }
+
     async def get_position_optimizer_signal(
         self,
         symbol: str = "SPY",

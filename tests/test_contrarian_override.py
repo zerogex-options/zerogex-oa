@@ -106,6 +106,14 @@ class TestContrarianOverride:
         pre = snap.aggregation["pre_override_composite"]
         assert snap.composite_score == pytest.approx(-pre, rel=1e-6)
 
+    def test_contrarian_reweight_changes_consensus_strength(self):
+        eng = _engine(trend_score=0.5, contrarian_score=-0.7)
+        snap, _ = eng.score(_ctx())
+        assert snap.aggregation["contrarian_reweight_enabled"] is True
+        assert snap.aggregation["contrarian_reweight_mult"] >= 1.0
+        # Weighted consensus should stay strongly bearish and observable.
+        assert snap.aggregation["contrarian_consensus"] <= -0.7
+
     def test_disabling_flag_restores_legacy_behavior(self, monkeypatch):
         monkeypatch.setattr(
             "src.signals.scoring_engine.SIGNALS_CONTRARIAN_OVERRIDE_ENABLED", False

@@ -49,6 +49,32 @@ def _engine(scores: list[float]) -> ScoringEngine:
 
 
 class TestConvictionAggregation:
+    def test_contrarian_reweight_changes_raw_composite(self):
+        scores = [0.0] * 15
+        scores[0] = 0.6   # non-contrarian trend-like positive
+        scores[1] = -0.8  # maps to contrarian set by name override below
+        scores[2] = -0.8
+        scores[3] = -0.8
+
+        w = 1.0 / len(scores)
+        components = []
+        for i, s in enumerate(scores):
+            name = f"c{i}"
+            if i == 1:
+                name = "exhaustion"
+            elif i == 2:
+                name = "skew_delta"
+            elif i == 3:
+                name = "positioning_trap"
+            components.append(_FakeComponent(name, w, s))
+        eng = ScoringEngine("SPY", components)
+        snap, _ = eng.score(_ctx())
+        # With contrarian reweight enabled by default, diagnostics expose the
+        # multiplier and the composite should be driven bearish.
+        assert snap.aggregation["contrarian_reweight_enabled"] is True
+        assert snap.aggregation["contrarian_reweight_mult"] >= 1.0
+        assert snap.direction == "bearish"
+
     def test_strong_majority_clears_trigger_threshold(self):
         """8 components at +0.7 with 6 abstaining should max out the composite,
         whereas linear averaging would only yield 0.36."""

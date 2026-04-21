@@ -11,6 +11,8 @@ from __future__ import annotations
 from typing import Optional
 
 from src.signals.components.base import ComponentBase, MarketContext
+from src.signals.opportunity_quality import infer_opportunity_direction
+from src.signals.strategy_builder import StrategyBuilder
 from src.utils import get_logger
 
 logger = get_logger(__name__)
@@ -23,6 +25,7 @@ class OpportunityQualityComponent(ComponentBase):
     def __init__(self, underlying: str):
         self.underlying = underlying
         self._optimizer: Optional[object] = None
+        self._strategy_builder = StrategyBuilder(underlying)
         self._last_result: Optional[float] = None  # cache last valid score
         # Cache option rows from the latest cycle so the portfolio engine's
         # _select_optimizer_candidate can reuse them instead of running the
@@ -61,22 +64,34 @@ class OpportunityQualityComponent(ComponentBase):
                 if not option_rows:
                     return self._last_result if self._last_result is not None else 0.0
 
-                # Infer direction from net smart money flow + GEX regime
-                sm_ratio = (ctx.smart_call + 1.0) / (ctx.smart_put + 1.0)
-                if ctx.net_gex >= 0 and sm_ratio >= 1.0:
-                    inferred_direction = "bullish"
-                elif ctx.net_gex < 0 and sm_ratio < 1.0:
-                    inferred_direction = "bearish"
-                else:
-                    inferred_direction = "neutral"
+                inferred_direction, direction_confidence, direction_inputs = (
+                    infer_opportunity_direction(
+                        net_gex=ctx.net_gex,
+                        smart_call=ctx.smart_call,
+                        smart_put=ctx.smart_put,
+                        close=ctx.close,
+                        gamma_flip=ctx.gamma_flip,
+                    )
+                )
+                strategy_decision = self._strategy_builder.decide(
+                    score_direction=inferred_direction,
+                    score_normalized=max(direction_confidence, 0.35),
+                    market_ctx={
+                        "timestamp": ctx.timestamp,
+                        "net_gex": ctx.net_gex,
+                        "iv_rank": ctx.iv_rank,
+                        "recent_closes": ctx.recent_closes,
+                    },
+                    option_rows=option_rows,
+                )
 
                 optimizer_ctx = PositionOptimizerContext(
                     timestamp=ctx.timestamp,
                     signal_timestamp=ctx.timestamp,
                     signal_timeframe=timeframe,
-                    signal_direction=inferred_direction,
+                    signal_direction=strategy_decision.optimizer_direction,
                     signal_strength="medium",
-                    trade_type="trend_follow",
+                    trade_type=strategy_decision.trade_type,
                     current_price=ctx.close,
                     net_gex=ctx.net_gex,
                     gamma_flip=ctx.gamma_flip,
@@ -87,6 +102,14 @@ class OpportunityQualityComponent(ComponentBase):
                     dealer_net_delta=ctx.dealer_net_delta,
                     target_dte_min=dte_min,
                     target_dte_max=dte_max,
+                    iv_rank=ctx.iv_rank,
+                    preferred_strategies=strategy_decision.preferred_strategies,
+                    regime=strategy_decision.regime,
+                    regime_score=strategy_decision.regime_score,
+                    strategy_diagnostics={
+                        **strategy_decision.diagnostics,
+                        "opportunity_direction_inputs": direction_inputs,
+                    },
                     option_rows=option_rows,
                 )
                 optimizer = self._get_optimizer()

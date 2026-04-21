@@ -296,100 +296,54 @@ async def get_signal_events(
     horizon: str = Query(default="60m", pattern="^(30m|60m|120m)$"),
     db: DatabaseManager = Depends(get_db),
 ):
-    """Recent emitted ``signal_events`` rows with realized outcomes.
-
-    Populated by the unified signal engine when a signal crosses the
-    hysteresis threshold. Each row is annotated with the underlying close
-    at emit time and at 30m/60m/120m horizons so the frontend can display
-    hit-rate and avg realized return.
-    """
+    """Component event stream with direction-sign flips and input snapshots."""
     if signal_name not in _VALID_SIGNAL_EVENT_NAMES:
         raise HTTPException(
             status_code=400,
             detail=f"Unknown signal_name '{signal_name}'.",
         )
     sym = symbol.upper()
-    rows = await db.get_signal_events(sym, signal_name, limit)
-    hit_rate = await db.get_signal_hit_rate(sym, signal_name, horizon)
+    rows = await db.get_signal_component_events(
+        sym, signal_name, limit=limit, horizon=horizon
+    )
+
+    flips = [r for r in rows if r.get("direction_flip")]
+    bullish = sum(1 for r in rows if r.get("direction") == "bullish")
+    bearish = sum(1 for r in rows if r.get("direction") == "bearish")
+    neutral = sum(1 for r in rows if r.get("direction") == "neutral")
+
     return {
         "underlying": sym,
         "signal_name": signal_name,
         "horizon": horizon,
         "rows": rows,
         "count": len(rows),
-        "summary": hit_rate,
+        "summary": {
+            "flips": len(flips),
+            "bullish": bullish,
+            "bearish": bearish,
+            "neutral": neutral,
+            "latest_timestamp": rows[0]["timestamp"] if rows else None,
+            "latest_direction": rows[0]["direction"] if rows else "neutral",
+        },
     }
 
 
 @router.get("/confluence-matrix")
 async def get_confluence_matrix(
     symbol: str = Query(default="SPY"),
+    lookback: int = Query(default=120, ge=10, le=2000),
     db: DatabaseManager = Depends(get_db),
 ):
-    """Cross-signal conditioning snapshot for a single symbol.
-
-    Returns every independent signal's latest score along with composite
-    "confluence" scores that reward agreement between complementary
-    signals (and flag disagreement).  The aim is to help the trader see
-    when multiple mechanical regimes line up — e.g. a continuous squeeze
-    score of +55 stacked with a vol-expansion direction of +80 is a much
-    higher-confidence entry than either score alone.
-    """
-    bundle = await db.get_latest_independent_signals_bundle(symbol.upper())
-
-    def score(name: str) -> float:
-        row = bundle.get(name)
-        if not row:
-            return 0.0
-        try:
-            return float(row.get("score") or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    vx = score("vol_expansion")
-    eod = score("eod_pressure")
-    squeeze = score("squeeze_setup")
-    trap = score("trap_detection")
-    zdpi = score("zero_dte_position_imbalance")
-    gvc = score("gamma_vwap_confluence")
-
-    def _same_sign(a: float, b: float) -> bool:
-        return (a > 0 and b > 0) or (a < 0 and b < 0)
-
-    def _pair_strength(a: float, b: float) -> float:
-        if not _same_sign(a, b):
-            return 0.0
-        return round(min(abs(a), abs(b)) * (1.0 if a > 0 else -1.0), 2)
-
-    confluences = {
-        "squeeze_x_vol_expansion": _pair_strength(squeeze, vx),
-        "trap_x_zero_dte": _pair_strength(trap, zdpi),
-        "confluence_x_eod_pressure": _pair_strength(gvc, eod),
-        "squeeze_x_trap_agreement": _pair_strength(squeeze, trap),
-    }
-
-    contradictions = {
-        "squeeze_vs_trap": squeeze * trap < 0 and min(abs(squeeze), abs(trap)) > 20,
-        "vol_expansion_vs_eod": vx * eod < 0 and min(abs(vx), abs(eod)) > 20,
-    }
-
-    dominant_direction = "bullish" if (vx + squeeze + eod + gvc) > 0 else "bearish"
-    agreement_score = round(
-        sum(confluences.values()) / max(1, len(confluences)), 2
-    )
+    """Component-level agreement/disagreement matrix over a rolling lookback."""
+    matrix = await db.get_signal_confluence_matrix(symbol.upper(), lookback=lookback)
 
     return {
         "underlying": symbol.upper(),
-        "signals": {
-            "vol_expansion": bundle.get("vol_expansion"),
-            "eod_pressure": bundle.get("eod_pressure"),
-            "squeeze_setup": bundle.get("squeeze_setup"),
-            "trap_detection": bundle.get("trap_detection"),
-            "zero_dte_position_imbalance": bundle.get("zero_dte_position_imbalance"),
-            "gamma_vwap_confluence": bundle.get("gamma_vwap_confluence"),
-        },
-        "confluences": confluences,
-        "contradictions": contradictions,
-        "agreement_score": agreement_score,
-        "dominant_direction": dominant_direction,
+        "lookback": lookback,
+        "components": matrix.get("components", []),
+        "matrix": matrix.get("matrix", []),
+        "row_order": matrix.get("components", []),
+        "sample_count": matrix.get("sample_count", 0),
+        "latest_timestamp": matrix.get("latest_timestamp"),
     }

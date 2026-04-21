@@ -13,6 +13,7 @@ import pytz
 from src.database import db_connection
 from src.config import SIGNALS_PORTFOLIO_SIZE
 from src.signals.execution import leg_fill_price_from_row
+from src.signals.strategy_builder import StrategyBuilder
 from src.symbols import get_canonical_symbol
 from src.utils import get_logger
 
@@ -97,6 +98,7 @@ class SpreadCandidate:
     greek_alignment_score: float
     edge_score: float
     kelly_fraction: float
+    legs: list[dict] = field(default_factory=list)
     sizing_profiles: list[SizingProfile] = field(default_factory=list)
     components: list[CandidateComponent] = field(default_factory=list)
     reasoning: list[str] = field(default_factory=list)
@@ -120,6 +122,11 @@ class PositionOptimizerContext:
     dealer_net_delta: float
     target_dte_min: int
     target_dte_max: int
+    iv_rank: Optional[float] = None
+    preferred_strategies: list[str] = field(default_factory=list)
+    regime: Optional[str] = None
+    regime_score: float = 0.0
+    strategy_diagnostics: dict = field(default_factory=dict)
     option_rows: list[dict] = field(default_factory=list)
 
 
@@ -335,6 +342,7 @@ class PositionOptimizerEngine:
     def __init__(self, underlying: str = "SPY"):
         self.underlying = underlying.upper()
         self.db_symbol = get_canonical_symbol(self.underlying)
+        self.strategy_builder = StrategyBuilder(self.underlying)
         self._last_accuracy_update: Optional[date] = None
         self._verbose_no_snapshot_diagnostics = (
             os.getenv("POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS", "false").lower() == "true"
@@ -348,7 +356,6 @@ class PositionOptimizerEngine:
 
                 # Derive signal context from signal_scores (written by UnifiedSignalEngine).
                 # normalized_score → timeframe/strength; direction comes directly from the score.
-                ts_filter = anchor_ts if anchor_ts is not None else "NOW()"
                 if anchor_ts is None:
                     cur.execute(
                         """
@@ -393,7 +400,6 @@ class PositionOptimizerEngine:
                     signal_strength = "medium"
                 else:
                     signal_strength = "low"
-                trade_type = "trend_follow"
                 anchor_ts = anchor_ts or signal_ts
 
                 cur.execute(
@@ -446,6 +452,34 @@ class PositionOptimizerEngine:
                         smart_call = float(premium or 0.0)
                     elif option_type == "P":
                         smart_put = float(premium or 0.0)
+
+                cur.execute(
+                    """
+                    SELECT close
+                    FROM underlying_quotes
+                    WHERE symbol = %s
+                      AND timestamp <= %s
+                    ORDER BY timestamp DESC
+                    LIMIT 120
+                    """,
+                    (self.db_symbol, anchor_ts),
+                )
+                recent_closes = [float(r[0]) for r in cur.fetchall()]
+                recent_closes = list(reversed(recent_closes))
+
+                cur.execute(
+                    """
+                    SELECT close
+                    FROM underlying_quotes
+                    WHERE symbol = %s
+                      AND timestamp <= %s
+                    ORDER BY timestamp DESC
+                    LIMIT 120
+                    """,
+                    (self.db_symbol, anchor_ts),
+                )
+                recent_closes = [float(r[0]) for r in cur.fetchall()]
+                recent_closes = list(reversed(recent_closes))
 
                 dte_min, dte_max = TARGET_DTE_WINDOWS.get(signal_timeframe, (1, 7))
                 trade_date = anchor_ts.astimezone(ET).date() if anchor_ts.tzinfo else anchor_ts.date()
@@ -506,13 +540,44 @@ class PositionOptimizerEngine:
                 effective_dte_min = available_dtes[0] if available_dtes else dte_min
                 effective_dte_max = available_dtes[-1] if available_dtes else dte_max
 
+                atm_ivs = [
+                    float(r["iv"])
+                    for r in option_rows
+                    if r["iv"] > 0 and abs((r["strike"] - current_price) / max(current_price, 1e-6)) <= 0.01
+                ]
+                all_ivs = [float(r["iv"]) for r in option_rows if r["iv"] > 0]
+                iv_rank = None
+                if atm_ivs and all_ivs:
+                    atm_iv = sum(atm_ivs) / len(atm_ivs)
+                    iv_low = min(all_ivs)
+                    iv_high = max(all_ivs)
+                    iv_range = max(iv_high - iv_low, 1e-6)
+                    iv_rank = self._clamp((atm_iv - iv_low) / iv_range, 0.0, 1.0)
+
+                score_direction_for_builder = (
+                    signal_direction
+                    if signal_direction in {"bullish", "bearish", "neutral"}
+                    else "neutral"
+                )
+                strategy_decision = self.strategy_builder.decide(
+                    score_direction=score_direction_for_builder,
+                    score_normalized=normalized_score,
+                    market_ctx={
+                        "timestamp": anchor_ts,
+                        "net_gex": float(net_gex or 0.0),
+                        "iv_rank": iv_rank,
+                        "recent_closes": recent_closes,
+                    },
+                    option_rows=option_rows,
+                )
+
                 return PositionOptimizerContext(
                     timestamp=anchor_ts,
                     signal_timestamp=signal_ts,
                     signal_timeframe=signal_timeframe,
-                    signal_direction=signal_direction,
+                    signal_direction=strategy_decision.optimizer_direction,
                     signal_strength=signal_strength,
-                    trade_type=trade_type,
+                    trade_type=strategy_decision.trade_type,
                     current_price=current_price,
                     net_gex=float(net_gex or 0.0),
                     gamma_flip=float(gamma_flip) if gamma_flip is not None else None,
@@ -523,6 +588,11 @@ class PositionOptimizerEngine:
                     dealer_net_delta=dealer_net_delta,
                     target_dte_min=effective_dte_min,
                     target_dte_max=effective_dte_max,
+                    iv_rank=iv_rank,
+                    preferred_strategies=strategy_decision.preferred_strategies,
+                    regime=strategy_decision.regime,
+                    regime_score=strategy_decision.regime_score,
+                    strategy_diagnostics=strategy_decision.diagnostics,
                     option_rows=option_rows,
                 )
         except Exception as exc:
@@ -622,7 +692,12 @@ class PositionOptimizerEngine:
     ) -> Optional[SpreadCandidate]:
         dte = max((expiry - (ctx.timestamp.astimezone(ET).date() if ctx.timestamp.tzinfo else ctx.timestamp.date())).days, 0)
         width = abs(short_leg["strike"] - long_leg["strike"])
-        if width <= 0:
+        if strategy_type not in {
+            "long_straddle",
+            "long_strangle",
+            "short_strangle",
+            "iron_butterfly",
+        } and width <= 0:
             return None
 
         debit = credit = 0.0
@@ -630,6 +705,7 @@ class PositionOptimizerEngine:
         net_delta = net_gamma = net_theta = 0.0
         strikes_label = ""
         reasoning = []
+        legs_payload: list[dict] = []
 
         # Realistic entry fills: buy long legs at ask, sell short legs at bid
         # (plus any configured slippage).  Stored as per-share numbers first and
@@ -704,8 +780,160 @@ class PositionOptimizerEngine:
                 f"Short {short_put['strike']:.0f}P/{short_call['strike']:.0f}C | "
                 f"Long {long_put['strike']:.0f}P/{long_call['strike']:.0f}C"
             )
+            legs_payload = [
+                {"side": "short", "option_type": "P", "strike": short_put["strike"], "expiry": expiry},
+                {"side": "short", "option_type": "C", "strike": short_call["strike"], "expiry": expiry},
+                {"side": "long", "option_type": "P", "strike": long_put["strike"], "expiry": expiry},
+                {"side": "long", "option_type": "C", "strike": long_call["strike"], "expiry": expiry},
+            ]
+        elif strategy_type == "long_straddle":
+            call_leg, put_leg = short_leg, long_leg
+            debit = max(buy(call_leg) + buy(put_leg), 0.01) * 100.0
+            projected_move = max(abs(call_leg["strike"] - put_leg["strike"]), ctx.current_price * 0.025)
+            max_profit = max(projected_move * 100.0 - debit, debit * 0.75)
+            max_loss = debit
+            short_strike, long_strike = put_leg["strike"], call_leg["strike"]
+            net_delta = (call_leg["delta"] + put_leg["delta"]) * 100.0
+            net_gamma = (call_leg["gamma"] + put_leg["gamma"]) * 100.0
+            net_theta = (call_leg["theta"] + put_leg["theta"]) * 100.0
+            base_pop = self._clamp(0.40 + self._clamp(abs(ctx.net_gex) / 300_000_000.0, 0.0, 1.0) * 0.25, 0.2, 0.8)
+            strikes_label = f"Long {call_leg['strike']:.0f}C + {put_leg['strike']:.0f}P"
+            width = abs(call_leg["strike"] - put_leg["strike"])
+            legs_payload = [
+                {"side": "long", "option_type": "C", "strike": call_leg["strike"], "expiry": expiry},
+                {"side": "long", "option_type": "P", "strike": put_leg["strike"], "expiry": expiry},
+            ]
+        elif strategy_type == "long_strangle":
+            call_leg, put_leg = short_leg, long_leg
+            debit = max(buy(call_leg) + buy(put_leg), 0.01) * 100.0
+            projected_move = max(abs(call_leg["strike"] - put_leg["strike"]) * 1.2, ctx.current_price * 0.03)
+            max_profit = max(projected_move * 100.0 - debit, debit * 0.75)
+            max_loss = debit
+            short_strike, long_strike = put_leg["strike"], call_leg["strike"]
+            net_delta = (call_leg["delta"] + put_leg["delta"]) * 100.0
+            net_gamma = (call_leg["gamma"] + put_leg["gamma"]) * 100.0
+            net_theta = (call_leg["theta"] + put_leg["theta"]) * 100.0
+            base_pop = self._clamp(0.35 + self._clamp(abs(ctx.net_gex) / 300_000_000.0, 0.0, 1.0) * 0.30, 0.2, 0.8)
+            strikes_label = f"Long {put_leg['strike']:.0f}P + {call_leg['strike']:.0f}C"
+            width = abs(call_leg["strike"] - put_leg["strike"])
+            legs_payload = [
+                {"side": "long", "option_type": "P", "strike": put_leg["strike"], "expiry": expiry},
+                {"side": "long", "option_type": "C", "strike": call_leg["strike"], "expiry": expiry},
+            ]
+        elif strategy_type == "short_strangle":
+            short_call, short_put = short_leg, long_leg
+            credit = max(sell(short_call) + sell(short_put), 0.01) * 100.0
+            projected_width = max(
+                abs(short_call["strike"] - ctx.current_price),
+                abs(ctx.current_price - short_put["strike"]),
+                abs(short_call["strike"] - short_put["strike"]) / 2.0,
+            )
+            max_profit = credit
+            max_loss = max(projected_width * 200.0 - credit, credit * 2.0, 1.0)
+            short_strike, long_strike = short_put["strike"], short_call["strike"]
+            net_delta = -(short_call["delta"] + short_put["delta"]) * 100.0
+            net_gamma = -(short_call["gamma"] + short_put["gamma"]) * 100.0
+            net_theta = -(short_call["theta"] + short_put["theta"]) * 100.0
+            base_pop = self._clamp(
+                1.0 - ((abs(short_call["delta"]) + abs(short_put["delta"])) / 2.0),
+                0.35,
+                0.92,
+            )
+            strikes_label = f"Short {short_put['strike']:.0f}P + Short {short_call['strike']:.0f}C"
+            width = abs(short_call["strike"] - short_put["strike"])
+            legs_payload = [
+                {"side": "short", "option_type": "P", "strike": short_put["strike"], "expiry": expiry},
+                {"side": "short", "option_type": "C", "strike": short_call["strike"], "expiry": expiry},
+            ]
+        elif strategy_type == "iron_butterfly" and iron_call is not None:
+            short_put, long_put = short_leg, long_leg
+            short_call, long_call = iron_call
+            put_credit = max(sell(short_put) - buy(long_put), 0.01)
+            call_credit = max(sell(short_call) - buy(long_call), 0.01)
+            credit = (put_credit + call_credit) * 100.0
+            left_width = abs(short_put["strike"] - long_put["strike"])
+            right_width = abs(long_call["strike"] - short_call["strike"])
+            width = max(left_width, right_width)
+            max_profit = credit
+            max_loss = max(width * 100.0 - credit, 1.0)
+            short_strike, long_strike = short_put["strike"], short_call["strike"]
+            net_delta = (
+                -(short_put["delta"] - long_put["delta"])
+                - (short_call["delta"] - long_call["delta"])
+            ) * 100.0
+            net_gamma = (
+                -(short_put["gamma"] - long_put["gamma"])
+                - (short_call["gamma"] - long_call["gamma"])
+            ) * 100.0
+            net_theta = (
+                -(short_put["theta"] - long_put["theta"])
+                - (short_call["theta"] - long_call["theta"])
+            ) * 100.0
+            base_pop = self._clamp(
+                1.0 - ((abs(short_put["delta"]) + abs(short_call["delta"])) / 2.0),
+                0.30,
+                0.90,
+            )
+            strikes_label = (
+                f"Long {long_put['strike']:.0f}P / Short {short_put['strike']:.0f}P+"
+                f"{short_call['strike']:.0f}C / Long {long_call['strike']:.0f}C"
+            )
+            legs_payload = [
+                {"side": "long", "option_type": "P", "strike": long_put["strike"], "expiry": expiry},
+                {"side": "short", "option_type": "P", "strike": short_put["strike"], "expiry": expiry},
+                {"side": "short", "option_type": "C", "strike": short_call["strike"], "expiry": expiry},
+                {"side": "long", "option_type": "C", "strike": long_call["strike"], "expiry": expiry},
+            ]
+        elif strategy_type == "calendar":
+            near_leg, far_leg = short_leg, long_leg
+            debit = max(buy(far_leg) - sell(near_leg), 0.01) * 100.0
+            max_profit = max(debit * 1.8, debit + 1.0)
+            max_loss = debit
+            short_strike, long_strike = near_leg["strike"], far_leg["strike"]
+            net_delta = (far_leg["delta"] - near_leg["delta"]) * 100.0
+            net_gamma = (far_leg["gamma"] - near_leg["gamma"]) * 100.0
+            net_theta = (far_leg["theta"] - near_leg["theta"]) * 100.0
+            base_pop = self._clamp(0.50 + self._clamp(ctx.regime_score, 0.0, 1.0) * 0.15, 0.3, 0.8)
+            strikes_label = f"Short {near_leg['strike']:.0f}{option_type} / Long {far_leg['strike']:.0f}{option_type}"
+            width = abs(near_leg["strike"] - far_leg["strike"])
+            legs_payload = [
+                {
+                    "side": "short",
+                    "option_type": option_type,
+                    "strike": near_leg["strike"],
+                    "expiry": near_leg["expiration"],
+                },
+                {
+                    "side": "long",
+                    "option_type": option_type,
+                    "strike": far_leg["strike"],
+                    "expiry": far_leg["expiration"],
+                },
+            ]
         else:
             return None
+
+        if not legs_payload:
+            if strategy_type == "bull_call_debit":
+                legs_payload = [
+                    {"side": "long", "option_type": "C", "strike": long_leg["strike"], "expiry": expiry},
+                    {"side": "short", "option_type": "C", "strike": short_leg["strike"], "expiry": expiry},
+                ]
+            elif strategy_type == "bear_put_debit":
+                legs_payload = [
+                    {"side": "long", "option_type": "P", "strike": long_leg["strike"], "expiry": expiry},
+                    {"side": "short", "option_type": "P", "strike": short_leg["strike"], "expiry": expiry},
+                ]
+            elif strategy_type == "bull_put_credit":
+                legs_payload = [
+                    {"side": "short", "option_type": "P", "strike": short_leg["strike"], "expiry": expiry},
+                    {"side": "long", "option_type": "P", "strike": long_leg["strike"], "expiry": expiry},
+                ]
+            elif strategy_type == "bear_call_credit":
+                legs_payload = [
+                    {"side": "short", "option_type": "C", "strike": short_leg["strike"], "expiry": expiry},
+                    {"side": "long", "option_type": "C", "strike": long_leg["strike"], "expiry": expiry},
+                ]
 
         liquidity_score, liquidity_desc = self._liquidity_score(short_leg, long_leg)
         structure_adj, structure_desc = self._structure_adjustment(ctx, strategy_type, short_strike, long_strike)
@@ -768,6 +996,7 @@ class PositionOptimizerEngine:
             greek_alignment_score=greek_alignment,
             edge_score=edge_score,
             kelly_fraction=kelly_fraction,
+            legs=legs_payload,
             components=components,
             reasoning=reasoning,
         )
@@ -775,44 +1004,65 @@ class PositionOptimizerEngine:
         return candidate
 
     def _generate_candidates(self, ctx: PositionOptimizerContext) -> list[SpreadCandidate]:
-        grouped: dict[tuple[date, str], list[dict]] = {}
+        by_expiry: dict[date, dict[str, list[dict]]] = {}
         for row in ctx.option_rows:
-            grouped.setdefault((row["expiration"], row["option_type"]), []).append(row)
+            expiry = row["expiration"]
+            opt_type = row["option_type"]
+            by_expiry.setdefault(expiry, {"C": [], "P": []})
+            by_expiry[expiry][opt_type].append(row)
+        for expiry in by_expiry:
+            by_expiry[expiry]["C"] = sorted(by_expiry[expiry]["C"], key=lambda x: x["strike"])
+            by_expiry[expiry]["P"] = sorted(by_expiry[expiry]["P"], key=lambda x: x["strike"])
+
+        preferred = set(ctx.preferred_strategies or [])
+        if not preferred:
+            preferred = {
+                "bull_call_debit",
+                "bear_put_debit",
+                "bull_put_credit",
+                "bear_call_credit",
+                "iron_condor",
+            }
 
         candidates: list[SpreadCandidate] = []
+        for expiry, chains in by_expiry.items():
+            calls = chains["C"]
+            puts = chains["P"]
 
-        for (expiry, option_type), rows in grouped.items():
-            rows = sorted(rows, key=lambda x: x["strike"])
-            calls = rows if option_type == "C" else []
-            puts = rows if option_type == "P" else []
-
-            if ctx.signal_direction == "bullish" and option_type == "C":
-                atm_calls = [r for r in calls if r["strike"] >= ctx.current_price * 0.98 and r["strike"] <= ctx.current_price * 1.03]
-                for i in range(min(len(atm_calls), max(len(calls) - 1, 0))):
-                    long_call = atm_calls[i]
+            if "bull_call_debit" in preferred and ctx.signal_direction == "bullish" and calls:
+                atm_calls = [
+                    r for r in calls
+                    if ctx.current_price * 0.98 <= r["strike"] <= ctx.current_price * 1.03
+                ]
+                for long_call in atm_calls[:4]:
                     higher = [r for r in calls if r["strike"] > long_call["strike"]][:3]
                     for short_call in higher:
                         cand = self._score_candidate(ctx, "bull_call_debit", expiry, "C", short_call, long_call)
                         if cand:
                             candidates.append(cand)
-            if ctx.signal_direction == "bullish" and option_type == "P":
+
+            if "bull_put_credit" in preferred and ctx.signal_direction == "bullish" and puts:
                 otm_puts = [r for r in puts if r["strike"] < ctx.current_price]
-                for idx, short_put in enumerate(reversed(otm_puts[-6:])):
+                for short_put in reversed(otm_puts[-6:]):
                     lower = [r for r in otm_puts if r["strike"] < short_put["strike"]][-3:]
                     for long_put in lower:
                         cand = self._score_candidate(ctx, "bull_put_credit", expiry, "P", short_put, long_put)
                         if cand:
                             candidates.append(cand)
-            if ctx.signal_direction == "bearish" and option_type == "P":
-                atm_puts = [r for r in puts if r["strike"] <= ctx.current_price * 1.02 and r["strike"] >= ctx.current_price * 0.97]
-                for i in range(min(len(atm_puts), max(len(puts) - 1, 0))):
-                    long_put = list(reversed(atm_puts))[i]
+
+            if "bear_put_debit" in preferred and ctx.signal_direction == "bearish" and puts:
+                atm_puts = [
+                    r for r in puts
+                    if ctx.current_price * 0.97 <= r["strike"] <= ctx.current_price * 1.02
+                ]
+                for long_put in reversed(atm_puts[:4]):
                     lower = [r for r in puts if r["strike"] < long_put["strike"]][-3:]
                     for short_put in reversed(lower):
                         cand = self._score_candidate(ctx, "bear_put_debit", expiry, "P", short_put, long_put)
                         if cand:
                             candidates.append(cand)
-            if ctx.signal_direction == "bearish" and option_type == "C":
+
+            if "bear_call_credit" in preferred and ctx.signal_direction == "bearish" and calls:
                 otm_calls = [r for r in calls if r["strike"] > ctx.current_price]
                 for short_call in otm_calls[:6]:
                     higher = [r for r in otm_calls if r["strike"] > short_call["strike"]][:3]
@@ -821,22 +1071,96 @@ class PositionOptimizerEngine:
                         if cand:
                             candidates.append(cand)
 
-        if ctx.signal_direction == "neutral":
-            expiries = sorted({row["expiration"] for row in ctx.option_rows})
-            for expiry in expiries:
-                puts = sorted([r for r in ctx.option_rows if r["expiration"] == expiry and r["option_type"] == "P" and r["strike"] < ctx.current_price], key=lambda x: x["strike"])
-                calls = sorted([r for r in ctx.option_rows if r["expiration"] == expiry and r["option_type"] == "C" and r["strike"] > ctx.current_price], key=lambda x: x["strike"])
-                if len(puts) < 2 or len(calls) < 2:
-                    continue
-                for short_put in reversed(puts[-4:]):
+            if "iron_condor" in preferred and len(puts) >= 2 and len(calls) >= 2:
+                for short_put in reversed([r for r in puts if r["strike"] < ctx.current_price][-3:]):
                     long_puts = [r for r in puts if r["strike"] < short_put["strike"]][-2:]
-                    for short_call in calls[:4]:
+                    for short_call in [r for r in calls if r["strike"] > ctx.current_price][:3]:
                         long_calls = [r for r in calls if r["strike"] > short_call["strike"]][:2]
                         for long_put in long_puts:
                             for long_call in long_calls:
-                                cand = self._score_candidate(ctx, "iron_condor", expiry, "IC", short_put, long_put, iron_call=(short_call, long_call))
+                                cand = self._score_candidate(
+                                    ctx,
+                                    "iron_condor",
+                                    expiry,
+                                    "IC",
+                                    short_put,
+                                    long_put,
+                                    iron_call=(short_call, long_call),
+                                )
                                 if cand:
                                     candidates.append(cand)
+
+            if "long_straddle" in preferred and calls and puts:
+                call_leg = min(calls, key=lambda r: abs(r["strike"] - ctx.current_price))
+                put_leg = min(puts, key=lambda r: abs(r["strike"] - ctx.current_price))
+                cand = self._score_candidate(ctx, "long_straddle", expiry, "ST", call_leg, put_leg)
+                if cand:
+                    candidates.append(cand)
+
+            if "long_strangle" in preferred and calls and puts:
+                otm_calls = [r for r in calls if r["strike"] > ctx.current_price]
+                otm_puts = [r for r in puts if r["strike"] < ctx.current_price]
+                if otm_calls and otm_puts:
+                    call_leg = otm_calls[min(1, len(otm_calls) - 1)]
+                    put_leg = otm_puts[max(len(otm_puts) - 2, 0)]
+                    cand = self._score_candidate(ctx, "long_strangle", expiry, "SG", call_leg, put_leg)
+                    if cand:
+                        candidates.append(cand)
+
+            if "short_strangle" in preferred and calls and puts:
+                otm_calls = [r for r in calls if r["strike"] > ctx.current_price][:4]
+                otm_puts = [r for r in puts if r["strike"] < ctx.current_price][-4:]
+                for short_call in otm_calls[:2]:
+                    for short_put in reversed(otm_puts[-2:]):
+                        cand = self._score_candidate(
+                            ctx, "short_strangle", expiry, "SS", short_call, short_put
+                        )
+                        if cand:
+                            candidates.append(cand)
+
+            if "iron_butterfly" in preferred and len(calls) >= 3 and len(puts) >= 3:
+                short_call = min(calls, key=lambda r: abs(r["strike"] - ctx.current_price))
+                short_put = min(puts, key=lambda r: abs(r["strike"] - ctx.current_price))
+                lower_puts = [r for r in puts if r["strike"] < short_put["strike"]]
+                higher_calls = [r for r in calls if r["strike"] > short_call["strike"]]
+                if lower_puts and higher_calls:
+                    long_put = lower_puts[-1]
+                    long_call = higher_calls[0]
+                    cand = self._score_candidate(
+                        ctx,
+                        "iron_butterfly",
+                        expiry,
+                        "IB",
+                        short_put,
+                        long_put,
+                        iron_call=(short_call, long_call),
+                    )
+                    if cand:
+                        candidates.append(cand)
+
+        if "calendar" in preferred and len(by_expiry) >= 2:
+            expiries = sorted(by_expiry.keys())
+            near_expiry = expiries[0]
+            for far_expiry in expiries[1:3]:
+                for opt_type in ("C", "P"):
+                    near_rows = by_expiry[near_expiry][opt_type]
+                    far_rows = by_expiry[far_expiry][opt_type]
+                    if not near_rows or not far_rows:
+                        continue
+                    near_atm = min(near_rows, key=lambda r: abs(r["strike"] - ctx.current_price))
+                    far_match = min(far_rows, key=lambda r: abs(r["strike"] - near_atm["strike"]))
+                    near_leg = {**near_atm, "expiration": near_expiry}
+                    far_leg = {**far_match, "expiration": far_expiry}
+                    cand = self._score_candidate(
+                        ctx,
+                        "calendar",
+                        far_expiry,
+                        opt_type,
+                        near_leg,
+                        far_leg,
+                    )
+                    if cand:
+                        candidates.append(cand)
 
         filtered = [c for c in candidates if c.max_profit > 0 and c.max_loss > 0 and c.probability_of_profit >= 0.25]
         filtered.sort(key=lambda c: (c.edge_score, c.expected_value, c.probability_of_profit, c.liquidity_score), reverse=True)

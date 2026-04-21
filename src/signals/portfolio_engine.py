@@ -49,6 +49,7 @@ from src.signals.position_optimizer_engine import (
     fetch_option_snapshot,
 )
 from src.signals.scoring_engine import ScoreSnapshot
+from src.signals.strategy_builder import StrategyBuilder
 from src.symbols import get_canonical_symbol
 from src.utils import get_logger
 from src.validation import ET, NYSE_HOLIDAYS
@@ -98,6 +99,7 @@ class PortfolioEngine:
         self.underlying = underlying.upper()
         self.db_symbol = get_canonical_symbol(self.underlying)
         self.position_optimizer = PositionOptimizerEngine(self.underlying)
+        self.strategy_builder = StrategyBuilder(self.underlying)
 
         # Config constants
         self.trigger_threshold = SIGNALS_TRIGGER_THRESHOLD
@@ -201,7 +203,9 @@ class PortfolioEngine:
         # to catch fast reversals and mean-reversion, not to require the
         # preceding bars to agree.
         if not is_scalp and not self._score_trend_confirmation(
-            score.direction, score.timestamp, conn=conn
+            score,
+            market_ctx,
+            conn=conn,
         ):
             return self._cash_target(
                 score,
@@ -274,16 +278,16 @@ class PortfolioEngine:
         )
 
         entry_price = (candidate.entry_debit or candidate.entry_credit) / 100.0
-        opt_type = "C" if score.direction == "bullish" else "P"
-
         # Resolve option symbol for the primary leg
-        legs = self._legs_from_candidate(
-            {
-                "strategy_type": candidate.strategy_type,
-                "strikes": candidate.strikes,
-                "expiry": candidate.expiry,
-            }
-        )
+        legs = list(candidate.legs or [])
+        if not legs:
+            legs = self._legs_from_candidate(
+                {
+                    "strategy_type": candidate.strategy_type,
+                    "strikes": candidate.strikes,
+                    "expiry": candidate.expiry,
+                }
+            )
         enriched_legs = []
         with self._use_conn(conn) as c:
             for leg in legs:
@@ -297,6 +301,11 @@ class PortfolioEngine:
             if enriched_legs
             else f"{self.db_symbol}-SYNTHETIC"
         )
+        primary_type = (
+            str(enriched_legs[0].get("option_type", "")).upper()
+            if enriched_legs
+            else ("C" if score.direction == "bullish" else "P")
+        )
 
         optimizer_payload = {
             "strategy_type": candidate.strategy_type,
@@ -308,6 +317,10 @@ class PortfolioEngine:
             "expected_value": candidate.expected_value,
             "signal_timeframe": candidate_result["signal_timeframe"],
             "signal_strength": candidate_result["signal_strength"],
+            "trade_type": candidate_result.get("trade_type"),
+            "strategy_regime": candidate_result.get("strategy_regime"),
+            "strategy_regime_score": candidate_result.get("strategy_regime_score"),
+            "strategy_diagnostics": candidate_result.get("strategy_diagnostics") or {},
             "tier": tier_label,
             "size_multiplier": size_multiplier,
         }
@@ -321,7 +334,7 @@ class PortfolioEngine:
             strategy_type=candidate.strategy_type,
             contracts=contracts,
             option_symbol=primary_symbol,
-            option_type=opt_type,
+            option_type=primary_type,
             expiration=candidate.expiry,
             strike=(
                 round(float(enriched_legs[0]["strike"]), 4)
@@ -338,6 +351,11 @@ class PortfolioEngine:
         rationale = (
             f"Score {score.normalized_score:.3f} {score.direction} [{tier_label}], "
             f"{candidate.strategy_type} {contracts}c Kelly={candidate.kelly_fraction:.1%}"
+            + (
+                f" regime={candidate_result.get('strategy_regime')}:{candidate_result.get('strategy_regime_score', 0):.2f}"
+                if candidate_result.get("strategy_regime")
+                else ""
+            )
             + (" (DRS override)" if drs_override_active else "")
             + (" (fresh-cross boost)" if fresh_cross and cross_multiplier > 1.0 else "")
         )
@@ -874,7 +892,10 @@ class PortfolioEngine:
         return per_share * qty * 100
 
     def _score_trend_confirmation(
-        self, direction: str, as_of: datetime, conn=None
+        self,
+        score: ScoreSnapshot,
+        market_ctx: dict,
+        conn=None,
     ) -> bool:
         """Confirm recent signal_scores history agrees with current direction."""
         try:
@@ -883,6 +904,28 @@ class PortfolioEngine:
                 lookback = self.trend_confirmation_bars
                 if lookback <= 0:
                     return True
+
+                direction = score.direction
+                exhaustion_abs = abs(
+                    float((score.components.get("exhaustion") or {}).get("score", 0.0))
+                )
+                trap_abs = abs(
+                    float((score.components.get("positioning_trap") or {}).get("score", 0.0))
+                )
+                vwap_dev_abs = abs(float(market_ctx.get("vwap_deviation_pct") or 0.0))
+                strong_reversal = (
+                    score.normalized_score >= 0.62
+                    and (
+                        exhaustion_abs >= 0.75
+                        or trap_abs >= 0.75
+                        or vwap_dev_abs >= 0.004
+                    )
+                )
+                min_match_cap = (
+                    max(0, self.trend_confirmation_min_match - 1)
+                    if strong_reversal
+                    else self.trend_confirmation_min_match
+                )
 
                 cur.execute(
                     """
@@ -894,13 +937,13 @@ class PortfolioEngine:
                     ORDER BY timestamp DESC
                     LIMIT %s
                     """,
-                    (self.db_symbol, as_of, lookback),
+                    (self.db_symbol, score.timestamp, lookback),
                 )
                 rows = cur.fetchall()
                 if not rows:
                     return True
                 matching = sum(1 for r in rows if r[0] == direction)
-                min_match = min(self.trend_confirmation_min_match, len(rows))
+                min_match = min(min_match_cap, len(rows))
                 return matching >= min_match
         except Exception as exc:
             # Fail closed: if the trend lookup errors we don't know whether
@@ -996,13 +1039,23 @@ class PortfolioEngine:
         if not option_rows:
             return None
 
+        strategy_decision = self.strategy_builder.decide(
+            score_direction=score.direction,
+            score_normalized=score.normalized_score,
+            market_ctx={
+                **ctx,
+                "timestamp": score.timestamp,
+            },
+            option_rows=option_rows,
+        )
+
         optimizer_ctx = PositionOptimizerContext(
             timestamp=score.timestamp,
             signal_timestamp=score.timestamp,
             signal_timeframe=signal_timeframe,
-            signal_direction=score.direction,
+            signal_direction=strategy_decision.optimizer_direction,
             signal_strength=signal_strength,
-            trade_type="trend_follow" if score.direction != "neutral" else "range",
+            trade_type=strategy_decision.trade_type,
             current_price=ctx["close"],
             net_gex=ctx["net_gex"],
             gamma_flip=ctx["gamma_flip"],
@@ -1013,6 +1066,11 @@ class PortfolioEngine:
             dealer_net_delta=0.0,
             target_dte_min=dte_min,
             target_dte_max=dte_max,
+            iv_rank=ctx.get("iv_rank"),
+            preferred_strategies=strategy_decision.preferred_strategies,
+            regime=strategy_decision.regime,
+            regime_score=strategy_decision.regime_score,
+            strategy_diagnostics=strategy_decision.diagnostics,
             option_rows=option_rows,
         )
         candidates = self.position_optimizer._generate_candidates(optimizer_ctx)
@@ -1027,6 +1085,10 @@ class PortfolioEngine:
                     "candidate": candidate,
                     "signal_timeframe": signal_timeframe,
                     "signal_strength": signal_strength,
+                    "trade_type": strategy_decision.trade_type,
+                    "strategy_regime": strategy_decision.regime,
+                    "strategy_regime_score": strategy_decision.regime_score,
+                    "strategy_diagnostics": strategy_decision.diagnostics,
                 }
         return None
 
@@ -1060,6 +1122,9 @@ class PortfolioEngine:
 
     @staticmethod
     def _legs_from_candidate(candidate: dict) -> list[dict]:
+        payload_legs = candidate.get("legs")
+        if isinstance(payload_legs, list) and payload_legs:
+            return payload_legs
         strikes = candidate.get("strikes", "")
         strategy = candidate.get("strategy_type")
         expiry = candidate.get("expiry")
@@ -1090,6 +1155,34 @@ class PortfolioEngine:
                 {"side": "short", "option_type": "C", "strike": parts[1], "expiry": expiry},
                 {"side": "long", "option_type": "P", "strike": parts[2], "expiry": expiry},
                 {"side": "long", "option_type": "C", "strike": parts[3], "expiry": expiry},
+            ]
+        if strategy == "long_straddle" and len(parts) >= 2:
+            return [
+                {"side": "long", "option_type": "C", "strike": parts[0], "expiry": expiry},
+                {"side": "long", "option_type": "P", "strike": parts[1], "expiry": expiry},
+            ]
+        if strategy == "long_strangle" and len(parts) >= 2:
+            return [
+                {"side": "long", "option_type": "P", "strike": parts[0], "expiry": expiry},
+                {"side": "long", "option_type": "C", "strike": parts[1], "expiry": expiry},
+            ]
+        if strategy == "short_strangle" and len(parts) >= 2:
+            return [
+                {"side": "short", "option_type": "P", "strike": parts[0], "expiry": expiry},
+                {"side": "short", "option_type": "C", "strike": parts[1], "expiry": expiry},
+            ]
+        if strategy == "iron_butterfly" and len(parts) >= 4:
+            return [
+                {"side": "long", "option_type": "P", "strike": parts[0], "expiry": expiry},
+                {"side": "short", "option_type": "P", "strike": parts[1], "expiry": expiry},
+                {"side": "short", "option_type": "C", "strike": parts[2], "expiry": expiry},
+                {"side": "long", "option_type": "C", "strike": parts[3], "expiry": expiry},
+            ]
+        if strategy == "calendar" and len(parts) >= 2:
+            option_type = str(candidate.get("option_type") or "C").upper()
+            return [
+                {"side": "short", "option_type": option_type, "strike": parts[0], "expiry": expiry},
+                {"side": "long", "option_type": option_type, "strike": parts[1], "expiry": expiry},
             ]
         return []
 
