@@ -81,10 +81,11 @@ class TestCashTarget:
         score = ScoreSnapshot(
             timestamp=NOW,
             underlying="SPY",
-            composite_score=0.3,
-            normalized_score=0.3,
-            direction="neutral",
+            composite_score=10.0,
+            normalized_score=0.1,
+            direction="high_risk_reversal",
             components={},
+            aggregation={},
         )
         target = engine._cash_target(score, "test rationale")
         assert target.target_positions == []
@@ -99,10 +100,11 @@ class TestTargetPositionStrike:
         score = ScoreSnapshot(
             timestamp=NOW,
             underlying="SPY",
-            composite_score=0.9,
+            composite_score=90.0,
             normalized_score=0.9,
-            direction="bullish",
+            direction="trend_expansion",
             components={"dealer_regime": {"score": 0.8, "weight": 0.12}},
+            aggregation={},
         )
         candidate = SpreadCandidate(
             rank=1,
@@ -169,10 +171,11 @@ class TestIndependentSignalTriggering:
         base_score = ScoreSnapshot(
             timestamp=NOW,
             underlying="SPY",
-            composite_score=0.1,
+            composite_score=10.0,
             normalized_score=0.1,
-            direction="neutral",
+            direction="high_risk_reversal",
             components={},
+            aggregation={},
         )
         market_ctx = {
             "close": 500.0,
@@ -189,9 +192,9 @@ class TestIndependentSignalTriggering:
         independent_target = PortfolioTarget(
             underlying="SPY",
             timestamp=NOW,
-            composite_score=0.72,
+            composite_score=72.0,
             normalized_score=0.72,
-            direction="bullish",
+            direction="trend_expansion",
             target_positions=[],
             total_target_contracts=0,
             target_heat_pct=0.0,
@@ -222,9 +225,9 @@ class TestIndependentSignalTriggering:
             return_value=PortfolioTarget(
                 underlying="SPY",
                 timestamp=NOW,
-                composite_score=0.1,
-                normalized_score=0.1,
-                direction="neutral",
+                composite_score=10.0,
+            normalized_score=0.1,
+            direction="high_risk_reversal",
                 target_positions=[],
                 total_target_contracts=0,
                 target_heat_pct=0.0,
@@ -248,10 +251,11 @@ class TestIndependentSignalTriggering:
         base_score = ScoreSnapshot(
             timestamp=NOW,
             underlying="SPY",
-            composite_score=0.6,
+            composite_score=60.0,
             normalized_score=0.6,
-            direction="bullish",
+            direction="controlled_trend",
             components={},
+            aggregation={},
         )
         market_ctx = {
             "close": 500.0,
@@ -267,9 +271,9 @@ class TestIndependentSignalTriggering:
         composite_target = PortfolioTarget(
             underlying="SPY",
             timestamp=NOW,
-            composite_score=0.6,
+            composite_score=60.0,
             normalized_score=0.6,
-            direction="bullish",
+            direction="controlled_trend",
             target_positions=[
                 TargetPosition(
                     direction="bullish",
@@ -293,9 +297,9 @@ class TestIndependentSignalTriggering:
         independent_target = PortfolioTarget(
             underlying="SPY",
             timestamp=NOW,
-            composite_score=-0.8,
+            composite_score=80.0,
             normalized_score=0.8,
-            direction="bearish",
+            direction="trend_expansion",
             target_positions=[
                 TargetPosition(
                     direction="bearish",
@@ -328,7 +332,7 @@ class TestIndependentSignalTriggering:
                 independent_results=[],
             )
         assert out.source == "advanced:trap_detection"
-        assert out.direction == "bearish"
+        assert out.direction == "trend_expansion"
 
     def test_do_not_fade_blocks_countertrend_advanced_setup(self):
         engine = _make_engine()
@@ -427,9 +431,7 @@ class TestIndependentSignalTriggering:
 
 
 class TestFreshCrossSizingBoost:
-    """A fresh gamma-flip cross in the signaled direction should increase
-    the contract count. Same setup as TestTargetPositionStrike but we vary
-    the recent_closes fixture to flip the fresh-cross flag on or off."""
+    """Fresh-cross boost is disabled under MSI-first targeting."""
 
     @staticmethod
     def _candidate() -> SpreadCandidate:
@@ -474,10 +476,11 @@ class TestFreshCrossSizingBoost:
         return ScoreSnapshot(
             timestamp=NOW,
             underlying="SPY",
-            composite_score=0.9,
+            composite_score=90.0,
             normalized_score=0.9,
-            direction="bullish",
+            direction="trend_expansion",
             components={"dealer_regime": {"score": 0.8, "weight": 0.12}},
+            aggregation={},
         )
 
     def _compute(self, recent_closes: list[float]) -> int:
@@ -505,18 +508,14 @@ class TestFreshCrossSizingBoost:
         return target.total_target_contracts
 
     def test_no_fresh_cross_uses_base_contracts(self):
-        # Prev close already above flip -- no fresh cross.
         contracts = self._compute([499.0, 500.5, 501.0])
-        # base = 10 * 0.9 = 9
         assert contracts == 9
 
-    def test_fresh_bullish_cross_boosts_contracts(self):
-        # Prev close at/below flip, current above -- fresh cross.
+    def test_fresh_bullish_cross_no_longer_boosts_contracts(self):
         contracts = self._compute([498.0, 499.5, 501.0])
-        # base = 10 * 0.9 = 9; with 20% boost -> 10
-        assert contracts == 10
+        assert contracts == 9
 
-    def test_fresh_cross_reflected_in_rationale(self):
+    def test_fresh_cross_not_reflected_in_rationale(self):
         engine = _make_engine()
         candidate = self._candidate()
         market_ctx = {
@@ -537,7 +536,7 @@ class TestFreshCrossSizingBoost:
              }), \
              patch.object(engine, "_resolve_option_symbol_for_leg", return_value="SPY 260417C500"):
             target = engine.compute_target(self._score(), market_ctx, conn=MagicMock())
-        assert "fresh-cross boost" in target.rationale
+        assert "fresh-cross boost" not in target.rationale
 
 
 class TestMarketStatusGate:
@@ -554,9 +553,9 @@ class TestMarketStatusGate:
         target = PortfolioTarget(
             underlying="SPY",
             timestamp=NOW,
-            composite_score=0.8,
+            composite_score=80.0,
             normalized_score=0.8,
-            direction="bullish",
+            direction="trend_expansion",
             target_positions=[],
             total_target_contracts=0,
             target_heat_pct=0.0,
@@ -585,10 +584,11 @@ class TestIndependentSignalTriggers:
         score = ScoreSnapshot(
             timestamp=NOW,
             underlying="SPY",
-            composite_score=0.72,
+            composite_score=72.0,
             normalized_score=0.72,
-            direction="bullish",
+            direction="trend_expansion",
             components={"dealer_regime": {"score": 0.6, "weight": 0.12}},
+            aggregation={},
         )
         market_ctx = {
             "close": 501.0,
@@ -637,9 +637,9 @@ class TestIndependentSignalTriggers:
         independent_target = PortfolioTarget(
             underlying="SPY",
             timestamp=NOW,
-            composite_score=0.35,
+            composite_score=35.0,
             normalized_score=0.35,
-            direction="bullish",
+            direction="chop_range",
             target_positions=[
                 TargetPosition(
                     direction="bullish",
@@ -673,17 +673,18 @@ class TestIndependentSignalTriggers:
                 conn=MagicMock(),
             )
         assert target.source == "advanced:gamma_vwap_confluence"
-        assert target.rationale.startswith("Advanced gamma_vwap_confluence")
+        assert target.rationale == "independent candidate"
 
     def test_independent_signal_can_trigger_when_composite_is_cash(self):
         engine = _make_engine()
         score = ScoreSnapshot(
             timestamp=NOW,
             underlying="SPY",
-            composite_score=0.0,
+            composite_score=15.0,
             normalized_score=0.15,
-            direction="neutral",
+            direction="high_risk_reversal",
             components={},
+            aggregation={},
         )
         market_ctx = {
             "close": 500.0,
@@ -706,9 +707,9 @@ class TestIndependentSignalTriggers:
         cash_target = PortfolioTarget(
             underlying="SPY",
             timestamp=NOW,
-            composite_score=0.0,
-            normalized_score=0.0,
-            direction="neutral",
+            composite_score=10.0,
+            normalized_score=0.1,
+            direction="high_risk_reversal",
             target_positions=[],
             total_target_contracts=0,
             target_heat_pct=0.0,
@@ -717,9 +718,9 @@ class TestIndependentSignalTriggers:
         independent_target = PortfolioTarget(
             underlying="SPY",
             timestamp=NOW,
-            composite_score=0.62,
+            composite_score=62.0,
             normalized_score=0.62,
-            direction="bullish",
+            direction="controlled_trend",
             target_positions=[
                 TargetPosition(
                     direction="bullish",
@@ -751,7 +752,7 @@ class TestIndependentSignalTriggers:
                 conn=MagicMock(),
             )
         assert target.source == "advanced:vol_expansion"
-        assert target.direction == "bullish"
+        assert target.direction == "controlled_trend"
 
     def test_compute_target_with_independents_stays_cash_without_advanced_setup(self):
         engine = _make_engine()
@@ -772,7 +773,7 @@ class TestIndependentSignalTriggers:
             "max_pain": 500.0,
             "smart_call": 0.0,
             "smart_put": 0.0,
-            "recent_closes": [499.0, 499.5, 500.0],
+            "recent_closes": [500.0, 499.5, 499.0],
             "iv_rank": 0.4,
             "max_gamma_strike": 500.0,
         }
@@ -793,10 +794,11 @@ class TestTradeSlotsAndContractSizing:
         score = ScoreSnapshot(
             timestamp=NOW,
             underlying="SPY",
-            composite_score=0.9,
+            composite_score=90.0,
             normalized_score=0.9,
-            direction="bullish",
+            direction="trend_expansion",
             components={"dealer_regime": {"score": 0.8, "weight": 0.12}},
+            aggregation={},
         )
         candidate = SpreadCandidate(
             rank=1,
@@ -876,7 +878,7 @@ class TestTradeSlotsAndContractSizing:
         target = PortfolioTarget(
             underlying="SPY",
             timestamp=NOW,
-            composite_score=0.8,
+            composite_score=80.0,
             normalized_score=0.8,
             direction="bullish",
             target_positions=[target_position],
@@ -888,6 +890,7 @@ class TestTradeSlotsAndContractSizing:
 
         with patch.object(engine, "_market_status", return_value="OPEN"), \
              patch.object(engine, "_fetch_open_trades", return_value=[open_trade]), \
+             patch.object(engine, "_close_trade", return_value=0.0), \
              patch.object(engine, "snapshot") as snapshot, \
              patch.object(engine, "_open_position") as open_position:
             action = engine.reconcile(target, conn=MagicMock())

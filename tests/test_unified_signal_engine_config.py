@@ -13,14 +13,14 @@ def test_iv_rank_can_be_enabled_via_env(monkeypatch):
     assert engine._iv_rank_enabled is True
 
 
-def test_unified_engine_includes_intraday_regime_component():
+def test_unified_engine_includes_market_state_components():
     engine = UnifiedSignalEngine("SPY")
     names = {c.name for c in engine.scoring_engine.components}
     assert names == {
         "net_gex_sign",
         "flip_distance",
         "local_gamma",
-        "put_call_ratio_state",
+        "put_call_ratio",
         "price_vs_max_gamma",
         "volatility_regime",
     }

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from src.signals.components.base import ComponentBase, MarketContext
@@ -16,7 +16,7 @@ class ScoreSnapshot:
     normalized_score: float  # same as composite_score / 100
     direction: str  # market state regime label
     components: dict
-    aggregation: dict
+    aggregation: dict = field(default_factory=dict)
 
 
 class ScoringEngine:

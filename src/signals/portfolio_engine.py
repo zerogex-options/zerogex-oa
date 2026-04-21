@@ -206,7 +206,8 @@ class PortfolioEngine:
         the score and market context.  All trade-awareness lives in reconcile().
         """
         msi = float(score.composite_score or 0.0)
-        regime = str(score.direction or "high_risk_reversal")
+        regime = self._resolve_regime(score)
+        trade_direction = self._resolve_trade_direction(score, market_ctx, regime)
         # score.normalized_score stores MSI/100 in the new scoring engine.
         conviction = float(score.normalized_score or 0.0)
 
@@ -215,6 +216,12 @@ class PortfolioEngine:
             return self._cash_target(
                 score,
                 f"MSI {msi:.1f} in high-risk reversal regime: wait",
+            )
+
+        if trade_direction not in {"bullish", "bearish"}:
+            return self._cash_target(
+                score,
+                f"MSI {msi:.1f} regime={regime} lacks directional trend signal",
             )
 
         # Determine sizing mode by regime.
@@ -270,6 +277,7 @@ class PortfolioEngine:
         candidate_result = self._select_optimizer_candidate(
             score,
             market_ctx,
+            signal_direction=trade_direction,
             conn=conn,
             cached_option_rows=cached_option_rows,
             forced_timeframe=forced_timeframe,
@@ -291,7 +299,7 @@ class PortfolioEngine:
             )
 
         # --- CASE 4: compute target contracts via Kelly sizing ---
-        fresh_cross = self._fresh_drs_cross(score.direction, market_ctx)
+        fresh_cross = self._fresh_drs_cross(trade_direction, market_ctx)
         cross_multiplier = (
             1.0 + self.drs_fresh_cross_boost if fresh_cross and self.drs_fresh_cross_boost > 0 else 1.0
         )
@@ -328,7 +336,7 @@ class PortfolioEngine:
         primary_type = (
             str(enriched_legs[0].get("option_type", "")).upper()
             if enriched_legs
-            else ("C" if score.direction == "bullish" else "P")
+            else ("C" if trade_direction == "bullish" else "P")
         )
 
         optimizer_payload = {
@@ -354,7 +362,7 @@ class PortfolioEngine:
         )
 
         tp = TargetPosition(
-            direction=score.direction,
+            direction=trade_direction,
             strategy_type=candidate.strategy_type,
             contracts=contracts,
             option_symbol=primary_symbol,
@@ -373,7 +381,7 @@ class PortfolioEngine:
         )
 
         rationale = (
-            f"MSI {msi:.1f} regime={regime} dir={score.direction} [{tier_label}], "
+            f"MSI {msi:.1f} regime={regime} dir={trade_direction} [{tier_label}], "
             f"{candidate.strategy_type} {contracts}c Kelly={candidate.kelly_fraction:.1%}"
             + (
                 f" regime={candidate_result.get('strategy_regime')}:{candidate_result.get('strategy_regime_score', 0):.2f}"
@@ -389,7 +397,7 @@ class PortfolioEngine:
             timestamp=score.timestamp,
             composite_score=score.composite_score,
             normalized_score=score.normalized_score,
-            direction=score.direction,
+            direction=trade_direction,
             target_positions=[tp],
             total_target_contracts=contracts,
             target_heat_pct=round(target_heat, 6),
@@ -1253,6 +1261,33 @@ class PortfolioEngine:
                     "strategy_diagnostics": strategy_decision.diagnostics,
                 }
         return None
+
+    @staticmethod
+    def _resolve_regime(score: ScoreSnapshot) -> str:
+        regime = str(score.direction or "").strip().lower()
+        if regime in {"trend_expansion", "controlled_trend", "chop_range", "high_risk_reversal"}:
+            return regime
+        msi = float(score.composite_score or 0.0)
+        if msi >= 70.0:
+            return "trend_expansion"
+        if msi >= 40.0:
+            return "controlled_trend"
+        if msi >= 20.0:
+            return "chop_range"
+        return "high_risk_reversal"
+
+    @staticmethod
+    def _resolve_trade_direction(score: ScoreSnapshot, market_ctx: dict, regime: str) -> str:
+        if regime == "high_risk_reversal":
+            return "neutral"
+        trend = PortfolioEngine._msi_trend_direction(market_ctx)
+        if trend in {"bullish", "bearish"}:
+            return trend
+        # Fallback for tests/legacy callers that still pass explicit bullish/bearish labels.
+        legacy = str(score.direction or "").strip().lower()
+        if legacy in {"bullish", "bearish"}:
+            return legacy
+        return "neutral"
 
     @staticmethod
     def _majority_direction(trades: list[dict]) -> str:
