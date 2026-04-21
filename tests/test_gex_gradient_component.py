@@ -79,6 +79,7 @@ def test_sign_flips_with_dealer_regime():
     neg = comp.compute(_ctx(rows=rows, net_gex=-3.0e8))
     pos = comp.compute(_ctx(rows=rows, net_gex=3.0e8))
     assert neg * pos < 0  # opposite sign
+    assert abs(pos) < abs(neg)  # long-gamma side is intentionally damped
 
 
 def test_score_bounded():
@@ -94,12 +95,12 @@ def test_context_values_populated_when_available():
     ]
     cv = comp.context_values(_ctx(rows=rows))
     assert cv["source"] == "gex_by_strike"
-    assert cv["above_spot_gamma"] == pytest.approx(2.0e8)
-    assert cv["below_spot_gamma"] == pytest.approx(1.0e8)
+    assert cv["above_spot_gamma_abs"] == pytest.approx(2.0e8)
+    assert cv["below_spot_gamma_abs"] == pytest.approx(1.0e8)
     assert cv["strike_count"] == 2
 
 
 def test_context_values_unavailable_returns_nones():
     cv = comp.context_values(_ctx())
     assert cv["source"] == "unavailable"
-    assert cv["above_spot_gamma"] is None
+    assert cv["above_spot_gamma_abs"] is None

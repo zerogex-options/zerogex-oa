@@ -55,7 +55,10 @@ class VannaCharmFlowComponent(ComponentBase):
 
         charm_weight = self._charm_amplification(ctx)
         combined = vanna + charm * charm_weight
-        normalized = max(-1.0, min(1.0, combined / _VC_NORM))
+        norm = self._vc_norm(ctx)
+        if norm <= 0:
+            return 0.0
+        normalized = max(-1.0, min(1.0, combined / norm))
         return normalized
 
     def context_values(self, ctx: MarketContext) -> dict:
@@ -71,6 +74,7 @@ class VannaCharmFlowComponent(ComponentBase):
             "vanna_total": round(agg["vanna"], 2),
             "charm_total": round(agg["charm"], 2),
             "charm_amplification": round(self._charm_amplification(ctx), 3),
+            "vc_norm": round(self._vc_norm(ctx), 2),
             "source": agg["source"],
         }
 
@@ -136,3 +140,24 @@ class VannaCharmFlowComponent(ComponentBase):
             return 1.0
         ramp = (frac - _CHARM_AMP_START) / (1.0 - _CHARM_AMP_START)
         return 1.0 + (_CHARM_AMP_MAX - 1.0) * ramp
+
+    @staticmethod
+    def _vc_norm(ctx: MarketContext) -> float:
+        """Use dynamic symbol normalizer when available; else fallback constant."""
+        extra = ctx.extra if isinstance(ctx.extra, dict) else {}
+        normalizers = extra.get("normalizers") if isinstance(extra, dict) else None
+        if isinstance(normalizers, dict):
+            v = normalizers.get("dealer_vanna_exposure")
+            c = normalizers.get("dealer_charm_exposure")
+            vals = []
+            for raw in (v, c):
+                try:
+                    fv = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                if fv > 0:
+                    vals.append(fv)
+            if vals:
+                # Combined flow scale; avoid under-normalizing from a single field.
+                return max(_VC_NORM * 0.5, sum(vals))
+        return _VC_NORM

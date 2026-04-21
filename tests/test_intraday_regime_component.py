@@ -39,7 +39,7 @@ def test_phase_opening_range():
 
 
 def test_phase_mid_session():
-    assert comp._phase(_ctx(hour=15, minute=0).timestamp) == "mid_session"
+    assert comp._phase(_ctx(hour=16, minute=0).timestamp) == "mid_session"
 
 
 def test_phase_power_hour():
@@ -61,7 +61,7 @@ def test_opening_range_uses_dampened_momentum():
 def test_mid_session_trend_persistence():
     base = 500.0
     closes = [base] * 4 + [base * 1.006]
-    ctx = _ctx(hour=15, minute=0, recent_closes=closes)
+    ctx = _ctx(hour=16, minute=0, recent_closes=closes)
     score = comp.compute(ctx)
     assert score > 0.5
 

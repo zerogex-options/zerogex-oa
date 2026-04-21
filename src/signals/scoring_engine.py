@@ -97,11 +97,15 @@ class ScoringEngine:
             ):
                 effective_weight = base_weight * SIGNALS_CONTRARIAN_REWEIGHT_MULT
             component_results.append((component, clamped))
+            component_ctx = component.context_values(ctx)
             weighted_components[component.name] = {
                 "weight": round(base_weight, 6),
                 "raw_weight": component.weight,
                 "effective_weight": round(effective_weight, 6),
                 "score": clamped,
+                "regime": component_ctx.get("regime")
+                if isinstance(component_ctx, dict)
+                else None,
             }
 
         raw_composite = sum(
@@ -346,6 +350,14 @@ class ScoringEngine:
             component_meta = score.components.get(component.name, {})
             effective_weight = float(component_meta.get("effective_weight", component.weight))
             persisted_weight = float(component_meta.get("weight", effective_weight))
+            if component.name == "gex_regime" and isinstance(context_vals, dict):
+                regime = str(context_vals.get("regime") or "").strip().lower()
+                if regime == "short_gamma":
+                    component_meta["regime"] = "short_gamma"
+                elif regime == "long_gamma":
+                    component_meta["regime"] = "long_gamma"
+                else:
+                    component_meta["regime"] = "neutral_gamma"
             cur.execute(
                 """
                 INSERT INTO signal_component_scores (

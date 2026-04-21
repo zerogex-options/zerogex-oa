@@ -13,6 +13,12 @@ def test_classify_regime_uses_gex_sign():
     assert classify_regime({"gex_regime": {"weight": 0.15, "score": 0.0}}) == "neutral_gamma"
 
 
+def test_classify_regime_prefers_explicit_regime_field():
+    assert classify_regime({"gex_regime": {"score": 0.9, "regime": "long_gamma"}}) == "long_gamma"
+    assert classify_regime({"gex_regime": {"score": -0.9, "regime": "short_gamma"}}) == "short_gamma"
+    assert classify_regime({"gex_regime": {"score": -0.1, "regime": "neutral_gamma"}}) == "neutral_gamma"
+
+
 def test_classify_regime_matches_positive_net_gex_as_long_gamma():
     # Regression: Net GEX = +$1.0B should classify as long_gamma, not short_gamma.
     # With GEX_NORM = 2.5e8, score = -tanh(1e9 / 2.5e8) ~= -0.9993.

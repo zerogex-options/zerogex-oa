@@ -58,3 +58,9 @@ def test_context_values_include_intraday_fields():
     cv = comp.context_values(_ctx())
     assert "imbalance" in cv
     assert "momentum_5bar" in cv
+
+
+def test_signed_inputs_with_offsetting_flows_stay_neutral():
+    # Large but offsetting signed flow should not force a directional read.
+    ctx = _ctx(smart_call=500_000, smart_put=500_000)
+    assert comp.compute(ctx) == pytest.approx(0.0)

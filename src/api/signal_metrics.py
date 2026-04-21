@@ -21,10 +21,14 @@ def classify_regime(components: Optional[dict[str, Any]]) -> str:
       net_gex < 0  -> dealers short gamma -> "short_gamma"
 
     The scoring engine persists the component output as ``{"weight", "score"}``
-    where ``score = -tanh(net_gex / norm)`` (see
-    ``src/signals/components/gex_regime.py``). The negation means the sign of
-    the stored score is the OPPOSITE of the sign of net_gex, so regime must
-    invert when classifying from ``score``.
+    and now also includes ``context_values`` with a canonical ``regime`` field
+    when available. Prefer that explicit field first.
+
+    Legacy snapshots may only have ``score``. Historically, that score used the
+    opposite sign convention ``-tanh(net_gex / norm)``; current snapshots use a
+    direction-anchored regime score where sign no longer maps directly to GEX
+    sign. For legacy compatibility we still apply the historical inversion when
+    only ``score`` is present.
 
     The legacy ``value`` key held raw net_gex directly, so it is interpreted
     with the natural sign convention.
@@ -35,6 +39,10 @@ def classify_regime(components: Optional[dict[str, Any]]) -> str:
     gex_component = components.get("gex_regime")
     if not isinstance(gex_component, dict):
         return "unknown"
+
+    regime_value = str(gex_component.get("regime") or "").strip().lower()
+    if regime_value in {"long_gamma", "short_gamma", "neutral_gamma"}:
+        return regime_value
 
     if "score" in gex_component:
         try:

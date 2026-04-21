@@ -76,8 +76,11 @@ class PositioningTrapComponent(ComponentBase):
         call_signed = None
         put_signed = None
         if ctx.extra:
-            call_signed = ctx.extra.get("smart_call_gross")
-            put_signed = ctx.extra.get("smart_put_gross")
+            call_signed = ctx.extra.get("smart_call")
+            put_signed = ctx.extra.get("smart_put")
+            if call_signed is None or put_signed is None:
+                call_signed = ctx.extra.get("smart_call_net")
+                put_signed = ctx.extra.get("smart_put_net")
         if call_signed is not None and put_signed is not None:
             try:
                 c = float(call_signed)
@@ -88,14 +91,19 @@ class PositioningTrapComponent(ComponentBase):
             if denom >= 100_000:
                 return (c - p) / denom
             return 0.0
-        # Legacy fallback: unsigned total_premium.
-        total = ctx.smart_call + ctx.smart_put
+        # Fallback to top-level signed smart-call/smart-put fields.
+        c = float(ctx.smart_call or 0.0)
+        p = float(ctx.smart_put or 0.0)
+        total = abs(c) + abs(p)
         if total < 100_000:
             return 0.0
-        return (ctx.smart_call - ctx.smart_put) / total
+        return (c - p) / total
 
     @staticmethod
     def _imbalance_source(ctx: MarketContext) -> str:
-        if ctx.extra and ctx.extra.get("smart_call_gross") is not None:
+        if ctx.extra and (
+            ctx.extra.get("smart_call") is not None
+            or ctx.extra.get("smart_call_net") is not None
+        ):
             return "signed_net_premium"
-        return "total_premium"
+        return "signed_top_level"

@@ -58,3 +58,10 @@ def test_component_in_unified_engine_and_weights_still_valid(monkeypatch):
     monkeypatch.delenv("SIGNAL_IV_RANK_ENABLED", raising=False)
     engine = UnifiedSignalEngine("SPY")
     assert any(c.name == "positioning_trap" for c in engine.scoring_engine.components)
+
+
+def test_signed_imbalance_uses_top_level_signed_fields():
+    ctx = _ctx(smart_call=300_000.0, smart_put=-200_000.0)
+    imbalance = comp._signed_imbalance(ctx)
+    # (300k - (-200k)) / (300k + 200k) = 1.0
+    assert imbalance == 1.0

@@ -88,3 +88,17 @@ def test_score_bounded():
 def test_context_values_unavailable():
     cv = comp.context_values(_ctx())
     assert cv["source"] == "unavailable"
+
+
+def test_dynamic_normalizer_from_context_reduces_score_magnitude():
+    ctx = _ctx()
+    ctx.extra["gex_by_strike"] = [
+        {"strike": 500.0, "dealer_vanna_exposure": _VC_NORM, "dealer_charm_exposure": 0.0}
+    ]
+    base = comp.compute(ctx)
+    ctx.extra["normalizers"] = {
+        "dealer_vanna_exposure": _VC_NORM * 4.0,
+        "dealer_charm_exposure": _VC_NORM * 4.0,
+    }
+    scaled = comp.compute(ctx)
+    assert abs(scaled) < abs(base)

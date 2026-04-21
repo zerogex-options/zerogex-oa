@@ -21,9 +21,9 @@ from datetime import datetime
 
 from src.signals.components.base import ComponentBase, MarketContext
 from src.signals.components.utils import (
-    SESSION_CLOSE_MIN_UTC,
-    SESSION_OPEN_MIN_UTC,
-    minute_of_day,
+    SESSION_CLOSE_MIN_ET,
+    SESSION_OPEN_MIN_ET,
+    minute_of_day_et,
     pct_change_n_bar,
 )
 
@@ -65,15 +65,15 @@ class IntradayRegimeComponent(ComponentBase):
 
     @staticmethod
     def _phase(ts: datetime | None) -> str:
-        minute = minute_of_day(ts)
+        minute = minute_of_day_et(ts)
         if minute is None:
             return "unknown"
-        if minute < SESSION_OPEN_MIN_UTC:
+        if minute < SESSION_OPEN_MIN_ET:
             return "pre_open"
-        if minute >= SESSION_CLOSE_MIN_UTC:
+        if minute >= SESSION_CLOSE_MIN_ET:
             return "post_close"
-        from_open = minute - SESSION_OPEN_MIN_UTC
-        to_close = SESSION_CLOSE_MIN_UTC - minute
+        from_open = minute - SESSION_OPEN_MIN_ET
+        to_close = SESSION_CLOSE_MIN_ET - minute
         if from_open < 30:
             return "opening_range"
         if to_close <= 15:

@@ -32,18 +32,30 @@ def test_zero_gex_is_neutral():
     assert comp.compute(_ctx(net_gex=0.0)) == pytest.approx(0.0, abs=1e-9)
 
 
-def test_negative_gex_is_bullish():
+def test_negative_gex_above_flip_is_bullish():
     assert comp.compute(_ctx(net_gex=-_GEX_NORM)) > 0.5
 
 
-def test_positive_gex_is_bearish():
-    assert comp.compute(_ctx(net_gex=_GEX_NORM)) < -0.5
+def test_negative_gex_below_flip_is_bearish():
+    assert comp.compute(_ctx(net_gex=-_GEX_NORM, close=495.0, gamma_flip=498.0)) < -0.5
 
 
-def test_score_monotonically_decreases_in_gex():
-    vals = [comp.compute(_ctx(net_gex=g)) for g in [-2 * _GEX_NORM, -_GEX_NORM, 0, _GEX_NORM, 2 * _GEX_NORM]]
-    for i in range(len(vals) - 1):
-        assert vals[i] > vals[i + 1]
+def test_positive_gex_above_flip_is_dampened_bullish():
+    score = comp.compute(_ctx(net_gex=_GEX_NORM))
+    assert score > 0
+    assert score < 0.5
+
+
+def test_positive_gex_below_flip_is_dampened_bearish():
+    score = comp.compute(_ctx(net_gex=_GEX_NORM, close=495.0, gamma_flip=498.0))
+    assert score < 0
+    assert score > -0.5
+
+
+def test_magnitude_scales_with_gex_size_in_same_direction_anchor():
+    shallow = abs(comp.compute(_ctx(net_gex=-_GEX_NORM / 4)))
+    deep = abs(comp.compute(_ctx(net_gex=-_GEX_NORM * 2)))
+    assert deep > shallow
 
 
 def test_score_bounded():
@@ -53,11 +65,17 @@ def test_score_bounded():
         assert -1.0 <= s <= 1.0
 
 
-def test_score_magnitude_scales_with_gex_size():
-    """A deeper GEX produces a *larger* absolute score than a shallow one."""
-    shallow = abs(comp.compute(_ctx(net_gex=-_GEX_NORM / 4)))
-    deep = abs(comp.compute(_ctx(net_gex=-_GEX_NORM * 2)))
-    assert deep > shallow
+def test_flip_neutral_band_returns_zero():
+    # Within 0.1% of flip and flat momentum -> neutral anchor.
+    score = comp.compute(
+        _ctx(
+            net_gex=-_GEX_NORM,
+            close=498.04,
+            gamma_flip=498.0,
+            recent_closes=[498.0, 498.0, 498.0, 498.0, 498.01],
+        )
+    )
+    assert score == pytest.approx(0.0, abs=1e-9)
 
 
 def test_context_values_round_trip():
@@ -65,4 +83,5 @@ def test_context_values_round_trip():
     cv = comp.context_values(ctx)
     assert cv["net_gex"] == -_GEX_NORM
     assert cv["gex_norm"] == _GEX_NORM
+    assert cv["regime"] == "short_gamma"
     assert cv["score"] == pytest.approx(comp.compute(ctx))
