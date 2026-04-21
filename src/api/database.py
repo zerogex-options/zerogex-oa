@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 _ET = ZoneInfo('America/New_York')
+SIGNAL_HISTORY_LIMIT = 90  # default running score history length
 
 
 def _get_session_bounds(session: str = 'current') -> tuple:
@@ -2558,6 +2559,34 @@ class DatabaseManager:
             logger.error(f"get_signal_accuracy failed: {e}")
             return {}
 
+    async def _get_component_score_history(
+        self,
+        conn: asyncpg.Connection,
+        symbol: str,
+        component_name: str,
+        limit: int = SIGNAL_HISTORY_LIMIT,
+    ) -> list[Dict[str, Any]]:
+        rows = await conn.fetch(
+            """
+            SELECT timestamp, clamped_score
+            FROM signal_component_scores
+            WHERE underlying = $1
+              AND component_name = $2
+            ORDER BY timestamp DESC
+            LIMIT $3
+            """,
+            symbol,
+            component_name,
+            limit,
+        )
+        return [
+            {
+                "timestamp": row["timestamp"],
+                "score": round(float(row["clamped_score"] or 0.0) * 100.0, 2),
+            }
+            for row in reversed(rows)
+        ]
+
 
     async def get_vol_expansion_signal(
         self,
@@ -2599,6 +2628,12 @@ class DatabaseManager:
                 if isinstance(ctx, str):
                     ctx = json.loads(ctx)
                 d["context_values"] = ctx
+                d["score_history"] = await self._get_component_score_history(
+                    conn,
+                    symbol=symbol,
+                    component_name="vol_expansion",
+                    limit=SIGNAL_HISTORY_LIMIT,
+                )
                 return d
         except Exception as e:
             logger.error(f"get_vol_expansion_signal failed ({symbol}): {e}")
@@ -2646,6 +2681,12 @@ class DatabaseManager:
                 if isinstance(ctx, str):
                     ctx = json.loads(ctx)
                 d["context_values"] = ctx
+                d["score_history"] = await self._get_component_score_history(
+                    conn,
+                    symbol=symbol,
+                    component_name="eod_pressure",
+                    limit=SIGNAL_HISTORY_LIMIT,
+                )
                 return d
         except Exception as e:
             logger.error(f"get_eod_pressure_signal failed ({symbol}): {e}")
@@ -2688,6 +2729,12 @@ class DatabaseManager:
                 if isinstance(ctx, str):
                     ctx = json.loads(ctx)
                 d["context_values"] = ctx
+                d["score_history"] = await self._get_component_score_history(
+                    conn,
+                    symbol=symbol,
+                    component_name=signal_name,
+                    limit=SIGNAL_HISTORY_LIMIT,
+                )
                 return d
         except Exception as e:
             logger.error(f"get_independent_signal failed ({symbol}, {signal_name}): {e}")
@@ -4213,7 +4260,9 @@ class DatabaseManager:
             logger.error(f"get_latest_signal_score_enriched failed ({symbol}): {e}")
             return None
 
-    async def get_signal_score_history(self, symbol: str = "SPY", limit: int = 100) -> list[Dict[str, Any]]:
+    async def get_signal_score_history(
+        self, symbol: str = "SPY", limit: int = SIGNAL_HISTORY_LIMIT
+    ) -> list[Dict[str, Any]]:
         query = """
             SELECT underlying, timestamp, composite_score, normalized_score, direction, components
             FROM signal_scores

@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from src.signals.components.base import MarketContext
-from src.signals.independent_signals import IndependentSignalEngine
+from src.signals.independent.engine import IndependentSignalEngine
 
 
 NOW = datetime(2026, 1, 2, 15, 0, tzinfo=timezone.utc)

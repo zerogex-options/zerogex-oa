@@ -1,6 +1,7 @@
 """Tests for PortfolioEngine portfolio reconciliation logic."""
 
 from datetime import date, datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -383,6 +384,173 @@ class TestTargetPositionStrike:
         assert target.target_positions[0].strike == 705.0
 
 
+class TestIndependentSignalTriggering:
+    def test_independent_signal_can_trigger_when_composite_is_cash(self):
+        engine = _make_engine()
+        base_score = ScoreSnapshot(
+            timestamp=NOW,
+            underlying="SPY",
+            composite_score=0.1,
+            normalized_score=0.1,
+            direction="neutral",
+            components={},
+        )
+        market_ctx = {
+            "close": 500.0,
+            "net_gex": -1.0e9,
+            "gamma_flip": 499.0,
+            "put_call_ratio": 1.0,
+            "max_pain": 500.0,
+            "smart_call": 0.0,
+            "smart_put": 0.0,
+            "recent_closes": [498.5, 499.2, 500.0],
+            "iv_rank": 0.4,
+        }
+
+        independent_target = PortfolioTarget(
+            underlying="SPY",
+            timestamp=NOW,
+            composite_score=0.72,
+            normalized_score=0.72,
+            direction="bullish",
+            target_positions=[],
+            total_target_contracts=0,
+            target_heat_pct=0.0,
+            rationale="independent candidate",
+            source="independent:squeeze_setup",
+        )
+        independent_target.target_positions = [
+            TargetPosition(
+                direction="bullish",
+                strategy_type="long_straddle",
+                contracts=1,
+                option_symbol="SPY 260417C500",
+                option_type="C",
+                expiration=date(2026, 4, 17),
+                strike=500.0,
+                entry_mark=2.5,
+                probability_of_profit=0.55,
+                expected_value=20.0,
+                kelly_fraction=0.05,
+                optimizer_payload={},
+            )
+        ]
+        independent_target.total_target_contracts = 1
+
+        with patch.object(
+            engine,
+            "compute_target",
+            return_value=PortfolioTarget(
+                underlying="SPY",
+                timestamp=NOW,
+                composite_score=0.1,
+                normalized_score=0.1,
+                direction="neutral",
+                target_positions=[],
+                total_target_contracts=0,
+                target_heat_pct=0.0,
+                rationale="composite cash",
+            ),
+        ), patch.object(
+            engine,
+            "_build_independent_target",
+            return_value=independent_target,
+        ):
+            out = engine.compute_target_with_independents(
+                base_score,
+                market_ctx,
+                independent_results=[],
+            )
+        assert out.source.startswith("independent:")
+        assert out.target_positions
+
+    def test_stronger_independent_overrides_composite_position(self):
+        engine = _make_engine()
+        base_score = ScoreSnapshot(
+            timestamp=NOW,
+            underlying="SPY",
+            composite_score=0.6,
+            normalized_score=0.6,
+            direction="bullish",
+            components={},
+        )
+        market_ctx = {
+            "close": 500.0,
+            "net_gex": -1.0e9,
+            "gamma_flip": 499.0,
+            "put_call_ratio": 1.0,
+            "max_pain": 500.0,
+            "smart_call": 0.0,
+            "smart_put": 0.0,
+            "recent_closes": [498.5, 499.2, 500.0],
+            "iv_rank": 0.4,
+        }
+        composite_target = PortfolioTarget(
+            underlying="SPY",
+            timestamp=NOW,
+            composite_score=0.6,
+            normalized_score=0.6,
+            direction="bullish",
+            target_positions=[
+                TargetPosition(
+                    direction="bullish",
+                    strategy_type="bull_call_debit",
+                    contracts=1,
+                    option_symbol="SPY 260417C500",
+                    option_type="C",
+                    expiration=date(2026, 4, 17),
+                    strike=500.0,
+                    entry_mark=2.0,
+                    probability_of_profit=0.54,
+                    expected_value=18.0,
+                    kelly_fraction=0.04,
+                    optimizer_payload={},
+                )
+            ],
+            total_target_contracts=1,
+            target_heat_pct=0.01,
+            rationale="composite entry",
+        )
+        independent_target = PortfolioTarget(
+            underlying="SPY",
+            timestamp=NOW,
+            composite_score=-0.8,
+            normalized_score=0.8,
+            direction="bearish",
+            target_positions=[
+                TargetPosition(
+                    direction="bearish",
+                    strategy_type="bear_put_debit",
+                    contracts=1,
+                    option_symbol="SPY 260417P500",
+                    option_type="P",
+                    expiration=date(2026, 4, 17),
+                    strike=500.0,
+                    entry_mark=2.3,
+                    probability_of_profit=0.56,
+                    expected_value=24.0,
+                    kelly_fraction=0.05,
+                    optimizer_payload={},
+                )
+            ],
+            total_target_contracts=1,
+            target_heat_pct=0.01,
+            rationale="independent trap",
+            source="independent:trap_detection",
+        )
+        with patch.object(engine, "compute_target", return_value=composite_target), patch.object(
+            engine,
+            "_build_independent_target",
+            return_value=independent_target,
+        ):
+            out = engine.compute_target_with_independents(
+                base_score,
+                market_ctx,
+                independent_results=[],
+            )
+        assert out.source == "independent:trap_detection"
+        assert out.direction == "bearish"
+
 class TestFreshCrossSizingBoost:
     """A fresh gamma-flip cross in the signaled direction should increase
     the contract count. Same setup as TestTargetPositionStrike but we vary
@@ -538,6 +706,181 @@ class TestMarketStatusGate:
         close_trade.assert_not_called()
         open_position.assert_not_called()
         snapshot.assert_called_once()
+
+
+class TestIndependentSignalTriggers:
+    def test_composite_primary_when_active(self):
+        engine = _make_engine()
+        score = ScoreSnapshot(
+            timestamp=NOW,
+            underlying="SPY",
+            composite_score=0.72,
+            normalized_score=0.72,
+            direction="bullish",
+            components={"dealer_regime": {"score": 0.6, "weight": 0.12}},
+        )
+        market_ctx = {
+            "close": 501.0,
+            "net_gex": -2.0e8,
+            "gamma_flip": 499.0,
+            "put_call_ratio": 0.95,
+            "max_pain": 500.0,
+            "smart_call": 0.0,
+            "smart_put": 0.0,
+            "recent_closes": [499.0, 500.0, 501.0],
+            "iv_rank": 0.4,
+        }
+        independent_results = [
+            SimpleNamespace(
+                name="gamma_vwap_confluence",
+                score=0.35,
+                context={"signal": "bullish_confluence", "triggered": True},
+            )
+        ]
+        composite_target = PortfolioTarget(
+            underlying="SPY",
+            timestamp=NOW,
+            composite_score=score.composite_score,
+            normalized_score=score.normalized_score,
+            direction="bullish",
+            target_positions=[
+                TargetPosition(
+                    direction="bullish",
+                    strategy_type="bull_call_debit",
+                    contracts=2,
+                    option_symbol="SPY 260417C500",
+                    option_type="C",
+                    expiration=date(2026, 4, 17),
+                    strike=500.0,
+                    entry_mark=2.0,
+                    probability_of_profit=0.55,
+                    expected_value=12.0,
+                    kelly_fraction=0.04,
+                    optimizer_payload={},
+                )
+            ],
+            total_target_contracts=2,
+            target_heat_pct=0.02,
+            rationale="composite rationale",
+        )
+        independent_target = PortfolioTarget(
+            underlying="SPY",
+            timestamp=NOW,
+            composite_score=0.35,
+            normalized_score=0.35,
+            direction="bullish",
+            target_positions=[
+                TargetPosition(
+                    direction="bullish",
+                    strategy_type="long_straddle",
+                    contracts=1,
+                    option_symbol="SPY 260417C500",
+                    option_type="C",
+                    expiration=date(2026, 4, 17),
+                    strike=500.0,
+                    entry_mark=2.8,
+                    probability_of_profit=0.53,
+                    expected_value=8.0,
+                    kelly_fraction=0.02,
+                    optimizer_payload={},
+                )
+            ],
+            total_target_contracts=1,
+            target_heat_pct=0.01,
+            rationale="independent candidate",
+            source="independent:gamma_vwap_confluence",
+        )
+        with patch.object(engine, "compute_target", return_value=composite_target), patch.object(
+            engine,
+            "_build_independent_target",
+            return_value=independent_target,
+        ):
+            target = engine.compute_target_with_independents(
+                score,
+                market_ctx,
+                independent_results=independent_results,
+                conn=MagicMock(),
+            )
+        assert target.source == "composite"
+        assert target.rationale == "composite rationale"
+
+    def test_independent_signal_can_trigger_when_composite_is_cash(self):
+        engine = _make_engine()
+        score = ScoreSnapshot(
+            timestamp=NOW,
+            underlying="SPY",
+            composite_score=0.0,
+            normalized_score=0.15,
+            direction="neutral",
+            components={},
+        )
+        market_ctx = {
+            "close": 500.0,
+            "net_gex": -3.0e8,
+            "gamma_flip": 499.0,
+            "put_call_ratio": 0.9,
+            "max_pain": 500.0,
+            "smart_call": 0.0,
+            "smart_put": 0.0,
+            "recent_closes": [498.0, 499.0, 500.0],
+            "iv_rank": 0.4,
+        }
+        independent_results = [
+            SimpleNamespace(
+                name="vol_expansion",
+                score=0.62,
+                context={"signal": "bullish_expansion", "triggered": True},
+            )
+        ]
+        cash_target = PortfolioTarget(
+            underlying="SPY",
+            timestamp=NOW,
+            composite_score=0.0,
+            normalized_score=0.0,
+            direction="neutral",
+            target_positions=[],
+            total_target_contracts=0,
+            target_heat_pct=0.0,
+            rationale="cash",
+        )
+        independent_target = PortfolioTarget(
+            underlying="SPY",
+            timestamp=NOW,
+            composite_score=0.62,
+            normalized_score=0.62,
+            direction="bullish",
+            target_positions=[
+                TargetPosition(
+                    direction="bullish",
+                    strategy_type="long_straddle",
+                    contracts=1,
+                    option_symbol="SPY 260417C500",
+                    option_type="C",
+                    expiration=date(2026, 4, 17),
+                    strike=500.0,
+                    entry_mark=3.1,
+                    probability_of_profit=0.52,
+                    expected_value=18.0,
+                    kelly_fraction=0.03,
+                    optimizer_payload={},
+                )
+            ],
+            total_target_contracts=1,
+            target_heat_pct=0.01,
+            rationale="independent",
+            source="independent:vol_expansion",
+        )
+        with patch.object(engine, "compute_target", return_value=cash_target), patch.object(
+            engine, "_build_independent_target", return_value=independent_target
+        ):
+            target = engine.compute_target_with_independents(
+                score,
+                market_ctx,
+                independent_results=independent_results,
+                conn=MagicMock(),
+            )
+        assert target.source == "independent:vol_expansion"
+        assert target.direction == "bullish"
 
 
 class TestTradeSlotsAndContractSizing:

@@ -2,10 +2,7 @@
 from datetime import datetime, timezone
 
 from src.signals.components.base import MarketContext
-from src.signals.components.eod_pressure import (
-    EODPressureComponent,
-    _CHARM_NORM,
-)
+from src.signals.independent.eod_pressure import EODPressureSignal, _CHARM_NORM
 
 
 def _ctx(hour=19, minute=50, **overrides) -> MarketContext:
@@ -28,7 +25,7 @@ def _ctx(hour=19, minute=50, **overrides) -> MarketContext:
     return MarketContext(**defaults)
 
 
-comp = EODPressureComponent()
+comp = EODPressureSignal()
 
 
 def test_pre_window_is_neutral():

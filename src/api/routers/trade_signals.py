@@ -122,7 +122,7 @@ async def get_latest_score(
 @router.get("/score-history")
 async def get_score_history(
     underlying: str = Query(default="SPY"),
-    limit: int = Query(default=100, ge=1, le=5000),
+    limit: int = Query(default=90, ge=1, le=5000),
     db: DatabaseManager = Depends(get_db),
 ):
     rows = await db.get_signal_score_history(underlying.upper(), limit)
@@ -150,6 +150,7 @@ async def get_vol_expansion_signal(
     if not row:
         raise HTTPException(status_code=404, detail=f"No vol-expansion score found for {symbol.upper()}")
     ctx = row.get("context_values") or {}
+    row["score_history"] = row.get("score_history") or []
     row["expansion"] = ctx.get("expansion")
     row["direction_score"] = ctx.get("direction")
     row["magnitude"] = ctx.get("magnitude")
@@ -187,6 +188,7 @@ async def get_eod_pressure_signal(
     if not row:
         raise HTTPException(status_code=404, detail=f"No eod-pressure score found for {symbol.upper()}")
     ctx = row.get("context_values") or {}
+    row["score_history"] = row.get("score_history") or []
     row["charm_at_spot"] = ctx.get("charm_at_spot")
     row["pin_target"] = ctx.get("pin_target")
     row["pin_distance_pct"] = ctx.get("pin_distance_pct")
@@ -206,6 +208,7 @@ async def get_squeeze_setup_signal(
     if not row:
         raise HTTPException(status_code=404, detail=f"No squeeze-setup signal found for {symbol.upper()}")
     ctx = row.get("context_values") or {}
+    row["score_history"] = row.get("score_history") or []
     row["triggered"] = ctx.get("triggered", False)
     row["signal"] = ctx.get("signal", "none")
     row["call_flow_delta"] = ctx.get("call_flow_delta")
@@ -227,6 +230,7 @@ async def get_trap_detection_signal(
     if not row:
         raise HTTPException(status_code=404, detail=f"No trap-detection signal found for {symbol.upper()}")
     ctx = row.get("context_values") or {}
+    row["score_history"] = row.get("score_history") or []
     row["triggered"] = ctx.get("triggered", False)
     row["signal"] = ctx.get("signal", "none")
     row["breakout_up"] = ctx.get("breakout_up", False)
@@ -251,6 +255,7 @@ async def get_zero_dte_position_imbalance_signal(
     if not row:
         raise HTTPException(status_code=404, detail=f"No 0DTE position-imbalance signal found for {symbol.upper()}")
     ctx = row.get("context_values") or {}
+    row["score_history"] = row.get("score_history") or []
     row["triggered"] = ctx.get("triggered", False)
     row["signal"] = ctx.get("signal", "balanced")
     row["flow_imbalance"] = ctx.get("flow_imbalance")
@@ -268,6 +273,7 @@ async def get_gamma_vwap_confluence_signal(
     if not row:
         raise HTTPException(status_code=404, detail=f"No gamma+VWAP confluence signal found for {symbol.upper()}")
     ctx = row.get("context_values") or {}
+    row["score_history"] = row.get("score_history") or []
     row["triggered"] = ctx.get("triggered", False)
     row["signal"] = ctx.get("signal", "none")
     row["confluence_level"] = ctx.get("confluence_level")

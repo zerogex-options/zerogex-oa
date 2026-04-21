@@ -15,7 +15,6 @@ from src.database import db_connection
 from src.signals.components.base import MarketContext
 from src.signals.components.dealer_delta_pressure import DealerDeltaPressureComponent
 from src.signals.components.dealer_regime import DealerRegimeComponent
-from src.signals.components.eod_pressure import EODPressureComponent
 from src.signals.components.exhaustion import ExhaustionComponent
 from src.signals.components.gamma_flip import GammaFlipComponent
 from src.signals.components.gex_gradient import GexGradientComponent
@@ -28,8 +27,7 @@ from src.signals.components.skew_delta import SkewDeltaComponent
 from src.signals.components.smart_money import SmartMoneyComponent
 from src.signals.components.tape_flow_bias import TapeFlowBiasComponent
 from src.signals.components.vanna_charm_flow import VannaCharmFlowComponent
-from src.signals.components.vol_expansion import VolExpansionComponent
-from src.signals.independent_signals import IndependentSignalEngine
+from src.signals.independent import IndependentSignalEngine
 from src.signals.portfolio_engine import PortfolioEngine
 from src.signals.scoring_engine import ScoringEngine
 from src.symbols import get_canonical_symbol
@@ -42,27 +40,37 @@ class UnifiedSignalEngine:
     def __init__(self, underlying: str = "SPY"):
         self.underlying = underlying.upper()
         self.db_symbol = get_canonical_symbol(self.underlying)
+        components = [
+            GexRegimeComponent(),
+            GammaFlipComponent(),
+            DealerRegimeComponent(),
+            PutCallRatioComponent(),
+            SmartMoneyComponent(),
+            PositioningTrapComponent(),
+            ExhaustionComponent(),
+            OpportunityQualityComponent(self.underlying),
+            GexGradientComponent(),
+            DealerDeltaPressureComponent(),
+            VannaCharmFlowComponent(),
+            TapeFlowBiasComponent(),
+            SkewDeltaComponent(),
+            IntradayRegimeComponent(),
+        ]
+        weight_sum = sum(float(component.weight) for component in components)
+        if weight_sum > 0 and abs(weight_sum - 1.0) > 1e-6:
+            # vol_expansion + eod_pressure moved to independent signals; normalize
+            # remaining component weights so ScoringEngine can keep strict checks.
+            for component in components:
+                component.weight = float(component.weight) / weight_sum
+            logger.info(
+                "UnifiedSignalEngine [%s]: normalized composite component weights after independent split (sum=%.4f)",
+                self.db_symbol,
+                weight_sum,
+            )
 
         self.scoring_engine = ScoringEngine(
             underlying=self.db_symbol,
-            components=[
-                GexRegimeComponent(),
-                GammaFlipComponent(),
-                DealerRegimeComponent(),
-                PutCallRatioComponent(),
-                SmartMoneyComponent(),
-                PositioningTrapComponent(),
-                VolExpansionComponent(),
-                ExhaustionComponent(),
-                OpportunityQualityComponent(self.underlying),
-                GexGradientComponent(),
-                DealerDeltaPressureComponent(),
-                VannaCharmFlowComponent(),
-                TapeFlowBiasComponent(),
-                SkewDeltaComponent(),
-                IntradayRegimeComponent(),
-                EODPressureComponent(),
-            ],
+            components=components,
         )
 
         self.portfolio_engine = PortfolioEngine(self.underlying)
@@ -760,10 +768,10 @@ class UnifiedSignalEngine:
     _HYSTERESIS_CYCLES = max(1, int(os.getenv("SIGNAL_HYSTERESIS_CYCLES", "2")))
     _SCORE_DEDUPE_EPSILON = float(os.getenv("SIGNAL_SCORE_DEDUPE_EPSILON", "0.01"))
 
-    def _persist_independent_signals(self, market_context: MarketContext) -> None:
+    def _persist_independent_signals(self, market_context: MarketContext) -> list:
         results = self.independent_signal_engine.evaluate(market_context)
         if not results:
-            return
+            return []
 
         if not hasattr(self, "_ind_state"):
             self._ind_state: dict[str, dict] = {}
@@ -854,6 +862,7 @@ class UnifiedSignalEngine:
                                 exc,
                             )
             conn.commit()
+        return results
 
     def run_cycle(self) -> bool:
         # Each phase acquires and releases its own connection to avoid
@@ -873,7 +882,7 @@ class UnifiedSignalEngine:
         # score to confirm itself.
         market_context = self._build_market_context(ctx)
         score = self.scoring_engine.score_and_persist(market_context)
-        self._persist_independent_signals(market_context)
+        independent_results = self._persist_independent_signals(market_context)
 
         # Phase 3: reconcile portfolio (acquires connection for reads+writes)
         # Pass cached option rows from OpportunityQualityComponent to avoid
@@ -883,7 +892,12 @@ class UnifiedSignalEngine:
             if hasattr(component, '_cached_option_rows_key') and component._cached_option_rows is not None:
                 cached_option_rows = (component._cached_option_rows_key, component._cached_option_rows)
                 break
-        target = self.portfolio_engine.compute_target(score, ctx, cached_option_rows=cached_option_rows)
+        target = self.portfolio_engine.compute_target_with_independents(
+            score,
+            ctx,
+            independent_results=independent_results,
+            cached_option_rows=cached_option_rows,
+        )
         action = self.portfolio_engine.reconcile(target)
 
         logger.info(

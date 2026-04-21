@@ -54,9 +54,19 @@ class ScoringEngine:
         self.underlying = underlying
         self.components = components
         self._weight_sum = sum(c.weight for c in components)
-        if abs(self._weight_sum - 1.0) > 0.001:
+        if self._weight_sum <= 0:
             raise ValueError(
-                f"Component weights must sum to 1.0 (got {self._weight_sum:.6f})"
+                f"Component weights must be positive (got {self._weight_sum:.6f})"
+            )
+        # Allow excluding components from the composite without forcing
+        # per-component weight rewrites. We normalize at runtime so the
+        # active composite set still sums to 1.0.
+        self._base_weight_scale = 1.0 / self._weight_sum
+        if abs(self._weight_sum - 1.0) > 0.001:
+            logger.info(
+                "ScoringEngine[%s]: normalizing component weights from %.6f to 1.0",
+                self.underlying,
+                self._weight_sum,
             )
 
     @staticmethod
@@ -79,15 +89,17 @@ class ScoringEngine:
         for component in self.components:
             raw = component.compute(ctx)
             clamped = max(-1.0, min(1.0, raw))
-            effective_weight = component.weight
+            base_weight = component.weight * self._base_weight_scale
+            effective_weight = base_weight
             if (
                 SIGNALS_CONTRARIAN_REWEIGHT_ENABLED
                 and component.name in _CONTRARIAN_COMPONENT_NAMES
             ):
-                effective_weight = component.weight * SIGNALS_CONTRARIAN_REWEIGHT_MULT
+                effective_weight = base_weight * SIGNALS_CONTRARIAN_REWEIGHT_MULT
             component_results.append((component, clamped))
             weighted_components[component.name] = {
-                "weight": component.weight,
+                "weight": round(base_weight, 6),
+                "raw_weight": component.weight,
                 "effective_weight": round(effective_weight, 6),
                 "score": clamped,
             }
@@ -331,9 +343,9 @@ class ScoringEngine:
         # Insert per-component scores
         for component, clamped_score in component_results:
             context_vals = component.context_values(ctx)
-            effective_weight = float(
-                score.components.get(component.name, {}).get("effective_weight", component.weight)
-            )
+            component_meta = score.components.get(component.name, {})
+            effective_weight = float(component_meta.get("effective_weight", component.weight))
+            persisted_weight = float(component_meta.get("weight", effective_weight))
             cur.execute(
                 """
                 INSERT INTO signal_component_scores (
@@ -351,7 +363,7 @@ class ScoringEngine:
                     component.name,
                     clamped_score,
                     round(effective_weight * clamped_score, 6),
-                    effective_weight,
+                    persisted_weight,
                     json.dumps(context_vals, default=str),
                 ),
             )

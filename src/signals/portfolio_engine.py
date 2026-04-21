@@ -48,6 +48,7 @@ from src.signals.position_optimizer_engine import (
     TARGET_DTE_WINDOWS,
     fetch_option_snapshot,
 )
+from src.signals.independent import IndependentSignalResult
 from src.signals.scoring_engine import ScoreSnapshot
 from src.signals.strategy_builder import StrategyBuilder
 from src.symbols import get_canonical_symbol
@@ -88,6 +89,7 @@ class PortfolioTarget:
     total_target_contracts: int
     target_heat_pct: float
     rationale: str  # human-readable explanation of why this target was chosen
+    source: str = "composite"  # composite or independent:<signal_name>
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +119,36 @@ class PortfolioEngine:
         self.scalp_trigger_enabled = SIGNALS_SCALP_TRIGGER_ENABLED
         self.scalp_trigger_threshold = SIGNALS_SCALP_TRIGGER_THRESHOLD
         self.scalp_size_multiplier = SIGNALS_SCALP_SIZE_MULTIPLIER
+
+    _INDEPENDENT_SIGNAL_DIRECTION_MAP = {
+        "squeeze_setup": {
+            "bullish_squeeze": "bullish",
+            "bearish_squeeze": "bearish",
+        },
+        "trap_detection": {
+            "bullish_fade": "bullish",
+            "bearish_fade": "bearish",
+        },
+        "zero_dte_position_imbalance": {
+            "call_heavy": "bullish",
+            "put_heavy": "bearish",
+        },
+        "gamma_vwap_confluence": {
+            "bullish_confluence": "bullish",
+            "bearish_confluence": "bearish",
+        },
+        "vol_expansion": {
+            "bullish_expansion": "bullish",
+            "bearish_expansion": "bearish",
+        },
+        "eod_pressure": {
+            "bullish": "bullish",
+            "bearish": "bearish",
+        },
+    }
+
+    _INDEPENDENT_SIGNAL_BASE_THRESHOLD = 0.28
+    _INDEPENDENT_SIGNAL_STRONG_THRESHOLD = 0.45
 
     @staticmethod
     def _market_status(dt: Optional[datetime] = None) -> str:
@@ -370,6 +402,155 @@ class PortfolioEngine:
             total_target_contracts=contracts,
             target_heat_pct=round(target_heat, 6),
             rationale=rationale,
+        )
+
+    def compute_target_with_independents(
+        self,
+        score: ScoreSnapshot,
+        market_ctx: dict,
+        independent_results: list[IndependentSignalResult],
+        conn=None,
+        cached_option_rows=None,
+    ) -> PortfolioTarget:
+        """Primary composite target with independent-signal opportunistic overrides."""
+        composite_target = self.compute_target(
+            score,
+            market_ctx,
+            conn=conn,
+            cached_option_rows=cached_option_rows,
+        )
+        independent_target = self._build_independent_target(
+            score,
+            market_ctx,
+            independent_results=independent_results,
+            conn=conn,
+            cached_option_rows=cached_option_rows,
+        )
+        if independent_target is None:
+            return composite_target
+
+        # Composite is primary; independent opportunities only override when:
+        # 1) composite is neutral/cash, or
+        # 2) independent conviction materially exceeds composite conviction.
+        if not composite_target.target_positions:
+            return independent_target
+
+        if independent_target.normalized_score > score.normalized_score + 0.08:
+            return independent_target
+
+        return composite_target
+
+    def _build_independent_target(
+        self,
+        score: ScoreSnapshot,
+        market_ctx: dict,
+        independent_results: list[IndependentSignalResult],
+        conn=None,
+        cached_option_rows=None,
+    ) -> Optional[PortfolioTarget]:
+        strongest = self._strongest_independent_signal(independent_results)
+        if strongest is None:
+            return None
+
+        signal_result, signal_direction = strongest
+        synthetic_score = self._build_signal_snapshot_for_independent(
+            base=score,
+            signal_result=signal_result,
+            direction=signal_direction,
+        )
+        if synthetic_score.direction == "neutral":
+            return None
+
+        target = self.compute_target(
+            synthetic_score,
+            market_ctx,
+            conn=conn,
+            cached_option_rows=cached_option_rows,
+        )
+        if not target.target_positions:
+            return None
+
+        target.source = f"independent:{signal_result.name}"
+        target.rationale = (
+            f"Independent {signal_result.name} score={signal_result.score:.3f} triggered, "
+            + target.rationale
+        )
+        return target
+
+    def _strongest_independent_signal(
+        self,
+        independent_results: list[IndependentSignalResult],
+    ) -> Optional[tuple[IndependentSignalResult, str]]:
+        ranked: list[tuple[IndependentSignalResult, str]] = []
+        for result in independent_results or []:
+            direction = self._resolve_independent_direction(result)
+            if direction == "neutral":
+                continue
+            threshold = self._independent_signal_threshold(result.name)
+            if abs(result.score) < threshold:
+                continue
+            ranked.append((result, direction))
+
+        if not ranked:
+            return None
+
+        ranked.sort(
+            key=lambda item: (
+                abs(item[0].score),
+                1 if item[0].name in {"vol_expansion", "eod_pressure"} else 0,
+            ),
+            reverse=True,
+        )
+        return ranked[0]
+
+    @classmethod
+    def _resolve_independent_direction(cls, result: IndependentSignalResult) -> str:
+        signal_name = result.name
+        signal_value = str((result.context or {}).get("signal", "")).lower()
+        mapping = cls._INDEPENDENT_SIGNAL_DIRECTION_MAP.get(signal_name, {})
+        if signal_value in mapping:
+            return mapping[signal_value]
+        if result.score > 0:
+            return "bullish"
+        if result.score < 0:
+            return "bearish"
+        return "neutral"
+
+    @staticmethod
+    def _independent_signal_threshold(signal_name: str) -> float:
+        if signal_name == "gamma_vwap_confluence":
+            return 0.20
+        if signal_name == "eod_pressure":
+            return 0.20
+        return 0.25
+
+    @staticmethod
+    def _build_signal_snapshot_for_independent(
+        base: ScoreSnapshot,
+        signal_result: IndependentSignalResult,
+        direction: str,
+    ) -> ScoreSnapshot:
+        magnitude = max(0.0, min(1.0, abs(float(signal_result.score))))
+        signed = magnitude if direction == "bullish" else -magnitude if direction == "bearish" else 0.0
+        components = dict(base.components or {})
+        components[f"independent:{signal_result.name}"] = {
+            "weight": 0.0,
+            "effective_weight": 0.0,
+            "score": float(signal_result.score),
+        }
+        return ScoreSnapshot(
+            timestamp=base.timestamp,
+            underlying=base.underlying,
+            composite_score=round(signed, 6),
+            normalized_score=round(magnitude, 6),
+            direction=direction,
+            components=components,
+            aggregation={
+                **(base.aggregation or {}),
+                "independent_trigger": signal_result.name,
+                "independent_score": round(float(signal_result.score), 6),
+                "independent_direction": direction,
+            },
         )
 
     # ------------------------------------------------------------------
