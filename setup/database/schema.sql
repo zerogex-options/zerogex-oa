@@ -1050,15 +1050,38 @@ CREATE TABLE IF NOT EXISTS signal_scores (
     timestamp TIMESTAMPTZ NOT NULL,
     composite_score DOUBLE PRECISION NOT NULL,
     normalized_score DOUBLE PRECISION NOT NULL,
-    direction VARCHAR(10) NOT NULL CHECK (direction IN ('bullish', 'bearish', 'neutral')),
+    direction VARCHAR(25) NOT NULL CHECK (direction IN ('trend_expansion', 'controlled_trend', 'chop_range', 'high_risk_reversal')),
     components JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (underlying, timestamp)
 );
 
+-- Migration: widen direction column and replace CHECK constraint to match MSI regime labels.
 DO $$
 BEGIN
+    -- Drop old constraint (may contain stale bullish/bearish/neutral values).
+    IF EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'signal_scores_direction_check'
+          AND conrelid = 'signal_scores'::regclass
+    ) THEN
+        ALTER TABLE signal_scores DROP CONSTRAINT signal_scores_direction_check;
+    END IF;
+
+    -- Widen the column if it is still VARCHAR(10).
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_name = 'signal_scores'
+          AND column_name = 'direction'
+          AND character_maximum_length <= 10
+    ) THEN
+        ALTER TABLE signal_scores ALTER COLUMN direction TYPE VARCHAR(25);
+    END IF;
+
+    -- Add updated constraint.
     IF NOT EXISTS (
         SELECT 1
         FROM pg_constraint
@@ -1067,7 +1090,7 @@ BEGIN
     ) THEN
         ALTER TABLE signal_scores
             ADD CONSTRAINT signal_scores_direction_check
-            CHECK (direction IN ('bullish', 'bearish', 'neutral'));
+            CHECK (direction IN ('trend_expansion', 'controlled_trend', 'chop_range', 'high_risk_reversal'));
     END IF;
 END $$;
 
