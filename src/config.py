@@ -552,6 +552,19 @@ def get_all_config() -> Dict[str, Any]:
             "max_portfolio_heat_pct": SIGNALS_MAX_PORTFOLIO_HEAT_PCT,
             "same_direction_cooldown_minutes": SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES,
             "stop_loss_pct": SIGNALS_STOP_LOSS_PCT,
+            "independent_phase_scalp_minutes_from_open": SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN,
+            "independent_phase_swing_minutes_to_close": SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE,
+            "independent_threshold_scalp": SIGNALS_INDEPENDENT_THRESHOLD_SCALP,
+            "independent_threshold_intraday": SIGNALS_INDEPENDENT_THRESHOLD_INTRADAY,
+            "independent_threshold_swing": SIGNALS_INDEPENDENT_THRESHOLD_SWING,
+            "independent_risk_profiles": {
+                "squeeze_setup": SIGNALS_INDEPENDENT_RISK_PROFILE_SQUEEZE_SETUP,
+                "trap_detection": SIGNALS_INDEPENDENT_RISK_PROFILE_TRAP_DETECTION,
+                "zero_dte_position_imbalance": SIGNALS_INDEPENDENT_RISK_PROFILE_ZERO_DTE_POSITION_IMBALANCE,
+                "gamma_vwap_confluence": SIGNALS_INDEPENDENT_RISK_PROFILE_GAMMA_VWAP_CONFLUENCE,
+                "vol_expansion": SIGNALS_INDEPENDENT_RISK_PROFILE_VOL_EXPANSION,
+                "eod_pressure": SIGNALS_INDEPENDENT_RISK_PROFILE_EOD_PRESSURE,
+            },
         },
     }
 
