@@ -93,225 +93,6 @@ class TestCashTarget:
         assert target.rationale == "test rationale"
 
 
-class TestDealerRegimeHardGates:
-    def test_bullish_gate_passes_when_holding_above_flip_and_drs_strong(self):
-        engine = _make_engine()
-        score = ScoreSnapshot(
-            timestamp=NOW,
-            underlying="SPY",
-            composite_score=0.65,
-            normalized_score=0.65,
-            direction="bullish",
-            components={"dealer_regime": {"score": 0.55, "weight": 0.12}},
-        )
-        ok, _reason = engine._passes_dealer_regime_gates(
-            score,
-            {"close": 502.0, "gamma_flip": 500.0, "recent_closes": [499.0, 501.0, 502.0]},
-        )
-        assert ok is True
-
-    def test_bearish_gate_passes_when_holding_below_flip(self):
-        """Symmetric with the bullish branch: a bearish entry no longer needs
-        the exact bar of a fresh cross; a sustained hold below is enough."""
-        engine = _make_engine()
-        score = ScoreSnapshot(
-            timestamp=NOW,
-            underlying="SPY",
-            composite_score=-0.7,
-            normalized_score=0.7,
-            direction="bearish",
-            components={"dealer_regime": {"score": -0.35, "weight": 0.12}},
-        )
-        ok, _reason = engine._passes_dealer_regime_gates(
-            score,
-            {"close": 498.0, "gamma_flip": 500.0, "recent_closes": [497.0, 498.5, 498.0]},
-        )
-        assert ok is True
-
-    def test_bearish_gate_rejects_when_previous_bar_above_flip(self):
-        """Prev bar above flip means price hasn't sustained below -- reject."""
-        engine = _make_engine()
-        score = ScoreSnapshot(
-            timestamp=NOW,
-            underlying="SPY",
-            composite_score=-0.7,
-            normalized_score=0.7,
-            direction="bearish",
-            components={"dealer_regime": {"score": -0.35, "weight": 0.12}},
-        )
-        ok, reason = engine._passes_dealer_regime_gates(
-            score,
-            {"close": 498.0, "gamma_flip": 500.0, "recent_closes": [499.0, 500.5, 498.0]},
-        )
-        assert ok is False
-        assert "hold below gamma flip" in reason
-
-    def test_fresh_cross_detection_bullish(self):
-        engine = _make_engine()
-        # prev 499 (<=500), current 501 -> fresh cross up
-        assert engine._fresh_drs_cross(
-            "bullish",
-            {"close": 501.0, "gamma_flip": 500.0, "recent_closes": [498.0, 499.0, 501.0]},
-        ) is True
-
-    def test_fresh_cross_detection_bearish(self):
-        engine = _make_engine()
-        # prev 500.5 (>=500), current 499 -> fresh cross down
-        assert engine._fresh_drs_cross(
-            "bearish",
-            {"close": 499.0, "gamma_flip": 500.0, "recent_closes": [501.0, 500.5, 499.0]},
-        ) is True
-
-    def test_fresh_cross_false_when_already_sustained(self):
-        engine = _make_engine()
-        # prev 501 (>500), current 502 -> already above, not a cross
-        assert engine._fresh_drs_cross(
-            "bullish",
-            {"close": 502.0, "gamma_flip": 500.0, "recent_closes": [500.5, 501.0, 502.0]},
-        ) is False
-
-
-class TestTrendConfirmationReversalRelaxation:
-    def test_strong_reversal_lowers_required_matches(self):
-        engine = _make_engine()
-        engine.trend_confirmation_bars = 3
-        engine.trend_confirmation_min_match = 2
-        score = ScoreSnapshot(
-            timestamp=NOW,
-            underlying="SPY",
-            composite_score=-0.7,
-            normalized_score=0.72,
-            direction="bearish",
-            components={
-                "exhaustion": {"score": -0.82, "weight": 0.05},
-                "positioning_trap": {"score": -0.2, "weight": 0.06},
-            },
-        )
-        conn = MagicMock()
-        cur = MagicMock()
-        cur.fetchall.return_value = [("bullish",), ("bearish",), ("bullish",)]
-        conn.cursor.return_value = cur
-
-        ok = engine._score_trend_confirmation(
-            score,
-            {"vwap_deviation_pct": 0.0},
-            conn=conn,
-        )
-        assert ok is True
-
-    def test_without_strong_reversal_same_history_fails(self):
-        engine = _make_engine()
-        engine.trend_confirmation_bars = 3
-        engine.trend_confirmation_min_match = 2
-        score = ScoreSnapshot(
-            timestamp=NOW,
-            underlying="SPY",
-            composite_score=-0.55,
-            normalized_score=0.55,
-            direction="bearish",
-            components={
-                "exhaustion": {"score": -0.2, "weight": 0.05},
-                "positioning_trap": {"score": -0.2, "weight": 0.06},
-            },
-        )
-        conn = MagicMock()
-        cur = MagicMock()
-        cur.fetchall.return_value = [("bullish",), ("bearish",), ("bullish",)]
-        conn.cursor.return_value = cur
-
-        ok = engine._score_trend_confirmation(
-            score,
-            {"vwap_deviation_pct": 0.001},
-            conn=conn,
-        )
-        assert ok is False
-
-
-# ---------------------------------------------------------------------------
-# Scalp tier + DRS override (compute_target threshold classification)
-# ---------------------------------------------------------------------------
-
-class TestScalpTierAndDrsOverride:
-    """These tests exercise the pre-optimizer gating logic of compute_target
-    by forcing the optimizer lookup to return None -- the interesting behavior
-    is what ``reason`` ends up on the cash target."""
-
-    @staticmethod
-    def _ctx() -> dict:
-        # Gate-failing bearish context: current close is below flip but the
-        # previous bar was above, so the symmetric "hold below" gate rejects.
-        # (Under the old asymmetric gate this was framed as "no fresh cross";
-        # under the new one it simply fails the hold-below test.)
-        return {
-            "close": 498.0,
-            "net_gex": -1.0e9,
-            "gamma_flip": 500.0,
-            "put_call_ratio": 1.1,
-            "max_pain": 500.0,
-            "smart_call": 0.0,
-            "smart_put": 0.0,
-            "recent_closes": [499.0, 500.5, 498.0],
-            "iv_rank": 0.5,
-        }
-
-    @staticmethod
-    def _score(normalized: float, direction: str = "bearish") -> ScoreSnapshot:
-        return ScoreSnapshot(
-            timestamp=NOW,
-            underlying="SPY",
-            composite_score=-normalized if direction == "bearish" else normalized,
-            normalized_score=normalized,
-            direction=direction,
-            components={"dealer_regime": {"score": -0.3, "weight": 0.12}},
-        )
-
-    def test_below_scalp_threshold_goes_to_cash(self):
-        engine = _make_engine()
-        score = self._score(0.25)
-        with patch.object(engine, "_select_optimizer_candidate", return_value=None):
-            target = engine.compute_target(score, self._ctx())
-        assert target.target_positions == []
-        assert "below scalp threshold" in target.rationale
-
-    def test_scalp_band_bypasses_drs_and_tries_optimizer(self):
-        """Score in the scalp band (0.36 <= n < effective) should skip the DRS
-        gate and attempt an optimizer lookup -- we prove this by verifying the
-        cash rationale is "no positive-EV structure" rather than "DRS blocked"."""
-        engine = _make_engine()
-        score = self._score(0.40)  # above 0.36 scalp, below 0.52 full
-        with patch.object(engine, "_select_optimizer_candidate", return_value=None):
-            target = engine.compute_target(score, self._ctx())
-        assert target.target_positions == []
-        # The DRS gate would reject this bearish context (prev bar above flip),
-        # but scalp tier bypasses the gate entirely -- we should fail at the
-        # optimizer step.
-        assert "positive-EV" in target.rationale
-        assert "DRS" not in target.rationale
-
-    def test_full_tier_below_override_still_hits_drs_gate(self):
-        """A bearish signal at 0.55 (full tier, below override threshold 0.70)
-        should still be blocked by the DRS gate when price hasn't sustained
-        below the flip."""
-        engine = _make_engine()
-        score = self._score(0.55)
-        with patch.object(engine, "_score_trend_confirmation", return_value=True), \
-             patch.object(engine, "_select_optimizer_candidate", return_value=None):
-            target = engine.compute_target(score, self._ctx())
-        assert target.target_positions == []
-        assert "DRS hard gate" in target.rationale
-
-    def test_strong_conviction_overrides_drs_gate(self):
-        """Score at/above the 0.70 override threshold should bypass DRS."""
-        engine = _make_engine()
-        score = self._score(0.75)
-        with patch.object(engine, "_score_trend_confirmation", return_value=True), \
-             patch.object(engine, "_select_optimizer_candidate", return_value=None):
-            target = engine.compute_target(score, self._ctx())
-        # DRS override should fire; cash rationale should be optimizer-based.
-        assert "positive-EV" in target.rationale
-        assert "DRS hard gate" not in target.rationale
-
-
 class TestTargetPositionStrike:
     def test_compute_target_uses_candidate_leg_strike_not_underlying_spot(self):
         engine = _make_engine()
@@ -370,9 +151,7 @@ class TestTargetPositionStrike:
             "iv_rank": 0.3,
         }
 
-        with patch.object(engine, "_passes_dealer_regime_gates", return_value=(True, "ok")), \
-             patch.object(engine, "_score_trend_confirmation", return_value=True), \
-             patch.object(engine, "_select_optimizer_candidate", return_value={
+        with patch.object(engine, "_select_optimizer_candidate", return_value={
                  "candidate": candidate,
                  "signal_timeframe": "intraday",
                  "signal_strength": "high",
@@ -417,7 +196,7 @@ class TestIndependentSignalTriggering:
             total_target_contracts=0,
             target_heat_pct=0.0,
             rationale="independent candidate",
-            source="independent:squeeze_setup",
+            source="advanced:squeeze_setup",
         )
         independent_target.target_positions = [
             TargetPosition(
@@ -453,7 +232,7 @@ class TestIndependentSignalTriggering:
             ),
         ), patch.object(
             engine,
-            "_build_independent_target",
+            "_build_advanced_target",
             return_value=independent_target,
         ):
             out = engine.compute_target_with_independents(
@@ -461,7 +240,7 @@ class TestIndependentSignalTriggering:
                 market_ctx,
                 independent_results=[],
             )
-        assert out.source.startswith("independent:")
+        assert out.source.startswith("advanced:")
         assert out.target_positions
 
     def test_stronger_independent_overrides_composite_position(self):
@@ -536,11 +315,11 @@ class TestIndependentSignalTriggering:
             total_target_contracts=1,
             target_heat_pct=0.01,
             rationale="independent trap",
-            source="independent:trap_detection",
+            source="advanced:trap_detection",
         )
         with patch.object(engine, "compute_target", return_value=composite_target), patch.object(
             engine,
-            "_build_independent_target",
+            "_build_advanced_target",
             return_value=independent_target,
         ):
             out = engine.compute_target_with_independents(
@@ -548,124 +327,103 @@ class TestIndependentSignalTriggering:
                 market_ctx,
                 independent_results=[],
             )
-        assert out.source == "independent:trap_detection"
+        assert out.source == "advanced:trap_detection"
         assert out.direction == "bearish"
 
-
-class TestIndependentSignalRiskBySessionPhase:
-    def test_phase_classification_early_mid_and_late_session(self):
-        scalp_score = ScoreSnapshot(
-            timestamp=datetime(2026, 4, 6, 14, 0, tzinfo=timezone.utc),  # 10:00 ET
+    def test_do_not_fade_blocks_countertrend_advanced_setup(self):
+        engine = _make_engine()
+        base_score = ScoreSnapshot(
+            timestamp=NOW,
             underlying="SPY",
-            composite_score=0.2,
-            normalized_score=0.2,
-            direction="bullish",
+            composite_score=85.0,
+            normalized_score=0.85,
+            direction="trend_expansion",
             components={},
+            aggregation={},
         )
-        intraday_score = ScoreSnapshot(
-            timestamp=datetime(2026, 4, 6, 16, 30, tzinfo=timezone.utc),  # 12:30 ET
+        market_ctx = {
+            "close": 500.0,
+            "net_gex": -1.5e9,
+            "gamma_flip": 495.0,  # far (>= 0.6%)
+            "max_gamma_strike": 493.0,  # far (>= 1.2%)
+            "put_call_ratio": 1.0,
+            "max_pain": 500.0,
+            "smart_call": 0.0,
+            "smart_put": 0.0,
+            "recent_closes": [497.5, 499.0, 500.0],  # bullish trend dir
+            "iv_rank": 0.4,
+        }
+        advanced_target = PortfolioTarget(
             underlying="SPY",
-            composite_score=0.2,
-            normalized_score=0.2,
-            direction="bullish",
-            components={},
+            timestamp=NOW,
+            composite_score=85.0,
+            normalized_score=0.5,
+            direction="bearish",  # counter-trend fade
+            target_positions=[
+                TargetPosition(
+                    direction="bearish",
+                    strategy_type="bear_put_debit",
+                    contracts=1,
+                    option_symbol="SPY 260417P500",
+                    option_type="P",
+                    expiration=date(2026, 4, 17),
+                    strike=500.0,
+                    entry_mark=2.4,
+                    probability_of_profit=0.55,
+                    expected_value=12.0,
+                    kelly_fraction=0.03,
+                    optimizer_payload={},
+                )
+            ],
+            total_target_contracts=1,
+            target_heat_pct=0.01,
+            rationale="advanced fade",
+            source="advanced:trap_detection",
         )
-        swing_score = ScoreSnapshot(
-            timestamp=datetime(2026, 4, 6, 19, 0, tzinfo=timezone.utc),  # 15:00 ET
-            underlying="SPY",
-            composite_score=0.2,
-            normalized_score=0.2,
-            direction="bullish",
-            components={},
-        )
-        assert PortfolioEngine._independent_signal_phase(scalp_score) == "scalp"
-        assert PortfolioEngine._independent_signal_phase(intraday_score) == "intraday"
-        assert PortfolioEngine._independent_signal_phase(swing_score) == "swing"
-
-    def test_conservative_profile_requires_more_conviction_than_balanced(self):
-        score = ScoreSnapshot(
-            timestamp=datetime(2026, 4, 6, 16, 30, tzinfo=timezone.utc),  # intraday
-            underlying="SPY",
-            composite_score=0.2,
-            normalized_score=0.2,
-            direction="bullish",
-            components={},
-        )
-        trap_threshold = PortfolioEngine._independent_signal_threshold("trap_detection", score)
-        eod_threshold = PortfolioEngine._independent_signal_threshold("eod_pressure", score)
-
-        assert trap_threshold > eod_threshold
-        assert trap_threshold == pytest.approx(0.345)
-        assert eod_threshold == pytest.approx(0.30)
-
-    def test_signal_min_threshold_floor_applies_for_aggressive_profile(self):
-        score = ScoreSnapshot(
-            timestamp=datetime(2026, 4, 6, 14, 0, tzinfo=timezone.utc),  # scalp
-            underlying="SPY",
-            composite_score=0.2,
-            normalized_score=0.2,
-            direction="bullish",
-            components={},
-        )
-        with patch.dict(
-            PortfolioEngine._INDEPENDENT_SIGNAL_RISK_PROFILE,
-            {"gamma_vwap_confluence": "aggressive"},
-            clear=False,
-        ), patch.dict(
-            PortfolioEngine._INDEPENDENT_PHASE_BASE_THRESHOLD,
-            {"scalp": 0.20},
-            clear=False,
-        ), patch.dict(
-            PortfolioEngine._INDEPENDENT_RISK_MULTIPLIER,
-            {"aggressive": 0.50},
-            clear=False,
-        ):
-            threshold = PortfolioEngine._independent_signal_threshold(
-                "gamma_vwap_confluence",
-                score,
+        with patch.object(engine, "_build_advanced_target", return_value=advanced_target):
+            out = engine.compute_target_with_independents(
+                base_score,
+                market_ctx,
+                independent_results=[],
             )
+        assert out.target_positions == []
+        assert "Do-not-fade policy active" in out.rationale
 
-        # 0.20 * 0.50 = 0.10, but min floor for gamma_vwap_confluence is 0.20.
-        assert threshold == pytest.approx(0.20)
-
-    def test_symbol_specific_phase_windows_override_default_session_cutoffs(self):
-        qqq_score = ScoreSnapshot(
-            timestamp=datetime(2026, 4, 6, 15, 0, tzinfo=timezone.utc),  # 11:00 ET
-            underlying="QQQ",
-            composite_score=0.2,
-            normalized_score=0.2,
-            direction="bullish",
-            components={},
-        )
-        with patch.dict(
-            PortfolioEngine._INDEPENDENT_PHASE_SCALP_MINUTES_BY_SYMBOL,
-            {"QQQ": 120},
-            clear=False,
-        ), patch.dict(
-            PortfolioEngine._INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE_BY_SYMBOL,
-            {"QQQ": 45},
-            clear=False,
-        ):
-            phase = PortfolioEngine._independent_signal_phase(qqq_score)
-        assert phase == "scalp"
-
-    def test_signal_phase_threshold_override_applies_before_risk_multiplier(self):
-        score = ScoreSnapshot(
-            timestamp=datetime(2026, 4, 6, 16, 30, tzinfo=timezone.utc),  # 12:30 ET -> intraday
+    def test_without_advanced_setup_engine_stays_cash(self):
+        engine = _make_engine()
+        base_score = ScoreSnapshot(
+            timestamp=NOW,
             underlying="SPY",
-            composite_score=0.2,
-            normalized_score=0.2,
-            direction="bullish",
+            composite_score=75.0,
+            normalized_score=0.75,
+            direction="trend_expansion",
             components={},
+            aggregation={},
         )
-        with patch.dict(
-            PortfolioEngine._INDEPENDENT_PHASE_THRESHOLD_OVERRIDES,
-            {"eod_pressure": {"intraday": 0.44}},
-            clear=False,
+        market_ctx = {
+            "close": 500.0,
+            "net_gex": -1.0e9,
+            "gamma_flip": 499.5,
+            "max_gamma_strike": 500.0,
+            "put_call_ratio": 1.0,
+            "max_pain": 500.0,
+            "smart_call": 0.0,
+            "smart_put": 0.0,
+            "recent_closes": [498.0, 499.0, 500.0],
+            "iv_rank": 0.4,
+        }
+        with patch.object(
+            engine,
+            "_build_advanced_target",
+            return_value=None,
         ):
-            threshold = PortfolioEngine._independent_signal_threshold("eod_pressure", score)
-        # eod_pressure is balanced (1.0 multiplier), so override should flow through directly.
-        assert threshold == pytest.approx(0.44)
+            out = engine.compute_target_with_independents(
+                base_score,
+                market_ctx,
+                independent_results=[],
+            )
+        assert out.target_positions == []
+        assert "No advanced signal setup confirmed" in out.rationale
 
 
 class TestFreshCrossSizingBoost:
@@ -736,9 +494,7 @@ class TestFreshCrossSizingBoost:
             "recent_closes": recent_closes,
             "iv_rank": 0.3,
         }
-        with patch.object(engine, "_passes_dealer_regime_gates", return_value=(True, "ok")), \
-             patch.object(engine, "_score_trend_confirmation", return_value=True), \
-             patch.object(engine, "_select_optimizer_candidate", return_value={
+        with patch.object(engine, "_select_optimizer_candidate", return_value={
                  "candidate": candidate,
                  "signal_timeframe": "intraday",
                  "signal_strength": "high",
@@ -774,9 +530,7 @@ class TestFreshCrossSizingBoost:
             "recent_closes": [498.0, 499.5, 501.0],
             "iv_rank": 0.3,
         }
-        with patch.object(engine, "_passes_dealer_regime_gates", return_value=(True, "ok")), \
-             patch.object(engine, "_score_trend_confirmation", return_value=True), \
-             patch.object(engine, "_select_optimizer_candidate", return_value={
+        with patch.object(engine, "_select_optimizer_candidate", return_value={
                  "candidate": candidate,
                  "signal_timeframe": "intraday",
                  "signal_strength": "high",
@@ -905,11 +659,11 @@ class TestIndependentSignalTriggers:
             total_target_contracts=1,
             target_heat_pct=0.01,
             rationale="independent candidate",
-            source="independent:gamma_vwap_confluence",
+            source="advanced:gamma_vwap_confluence",
         )
         with patch.object(engine, "compute_target", return_value=composite_target), patch.object(
             engine,
-            "_build_independent_target",
+            "_build_advanced_target",
             return_value=independent_target,
         ):
             target = engine.compute_target_with_independents(
@@ -918,8 +672,8 @@ class TestIndependentSignalTriggers:
                 independent_results=independent_results,
                 conn=MagicMock(),
             )
-        assert target.source == "composite"
-        assert target.rationale == "composite rationale"
+        assert target.source == "advanced:gamma_vwap_confluence"
+        assert target.rationale.startswith("Advanced gamma_vwap_confluence")
 
     def test_independent_signal_can_trigger_when_composite_is_cash(self):
         engine = _make_engine()
@@ -985,10 +739,10 @@ class TestIndependentSignalTriggers:
             total_target_contracts=1,
             target_heat_pct=0.01,
             rationale="independent",
-            source="independent:vol_expansion",
+            source="advanced:vol_expansion",
         )
         with patch.object(engine, "compute_target", return_value=cash_target), patch.object(
-            engine, "_build_independent_target", return_value=independent_target
+            engine, "_build_advanced_target", return_value=independent_target
         ):
             target = engine.compute_target_with_independents(
                 score,
@@ -996,8 +750,40 @@ class TestIndependentSignalTriggers:
                 independent_results=independent_results,
                 conn=MagicMock(),
             )
-        assert target.source == "independent:vol_expansion"
+        assert target.source == "advanced:vol_expansion"
         assert target.direction == "bullish"
+
+    def test_compute_target_with_independents_stays_cash_without_advanced_setup(self):
+        engine = _make_engine()
+        score = ScoreSnapshot(
+            timestamp=NOW,
+            underlying="SPY",
+            composite_score=62.0,
+            normalized_score=0.62,
+            direction="controlled_trend",
+            components={},
+            aggregation={},
+        )
+        market_ctx = {
+            "close": 500.0,
+            "net_gex": -1.0e8,
+            "gamma_flip": 499.0,
+            "put_call_ratio": 1.0,
+            "max_pain": 500.0,
+            "smart_call": 0.0,
+            "smart_put": 0.0,
+            "recent_closes": [499.0, 499.5, 500.0],
+            "iv_rank": 0.4,
+            "max_gamma_strike": 500.0,
+        }
+        with patch.object(engine, "_build_advanced_target", return_value=None):
+            target = engine.compute_target_with_independents(
+                score,
+                market_ctx,
+                independent_results=[],
+            )
+        assert target.target_positions == []
+        assert "No advanced signal setup confirmed" in target.rationale
 
 
 class TestTradeSlotsAndContractSizing:
@@ -1059,9 +845,7 @@ class TestTradeSlotsAndContractSizing:
             "iv_rank": 0.3,
         }
 
-        with patch.object(engine, "_passes_dealer_regime_gates", return_value=(True, "ok")), \
-             patch.object(engine, "_score_trend_confirmation", return_value=True), \
-             patch.object(engine, "_select_optimizer_candidate", return_value={
+        with patch.object(engine, "_select_optimizer_candidate", return_value={
                  "candidate": candidate,
                  "signal_timeframe": "intraday",
                  "signal_strength": "high",

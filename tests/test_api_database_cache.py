@@ -71,17 +71,14 @@ def test_get_latest_gex_summary_cache_expires():
     assert conn.calls == 2
 
 
-def test_get_latest_signal_score_enriched_includes_intraday_score():
+def test_get_latest_signal_score_enriched_includes_msi_payload():
     db = DatabaseManager()
     conn = _FakeConn(
         {
             "underlying": "SPY",
             "timestamp": "2026-01-01T15:30:00Z",
-            "composite_score": 0.2,
-            "normalized_score": 0.2,
-            "direction": "bullish",
-            "components": {},
-            "intraday_score": 72.5,
+            "composite_score": 72.5,
+            "components": {"net_gex_sign": {"points": 20.0, "score": 1.0, "contribution": 20.0}},
         }
     )
 
@@ -98,20 +95,17 @@ def test_get_latest_signal_score_enriched_includes_intraday_score():
 
     row = asyncio.run(db.get_latest_signal_score_enriched("SPY"))
     assert row is not None
-    assert row["intraday_score"] == 72.5
+    assert row["composite_score"] == 72.5
 
 
-def test_get_signal_score_history_includes_intraday_score():
+def test_get_signal_score_history_includes_msi_payload():
     db = DatabaseManager()
     conn = _FakeConn(
         {
             "underlying": "SPY",
             "timestamp": "2026-01-01T15:30:00Z",
-            "composite_score": 0.2,
-            "normalized_score": 0.2,
-            "direction": "bullish",
-            "components": {},
-            "intraday_score": 68.0,
+            "composite_score": 68.0,
+            "components": {"flip_distance": {"points": 25.0, "score": 0.5, "contribution": 12.5}},
         }
     )
 
@@ -122,7 +116,7 @@ def test_get_signal_score_history_includes_intraday_score():
     db._acquire_connection = _acquire  # type: ignore[method-assign]
     rows = asyncio.run(db.get_signal_score_history("SPY", 5))
     assert len(rows) == 1
-    assert rows[0]["intraday_score"] == 68.0
+    assert rows[0]["composite_score"] == 68.0
 
 
 def test_get_flow_by_type_uses_cache():

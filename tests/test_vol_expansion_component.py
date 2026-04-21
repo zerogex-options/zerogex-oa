@@ -12,7 +12,7 @@ import math
 
 import pytest
 
-from src.signals.independent.vol_expansion import (
+from src.signals.advanced.vol_expansion import (
     VolExpansionComponent,
     _GEX_NORM,
     _GEX_FLOOR,

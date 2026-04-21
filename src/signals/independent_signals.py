@@ -1,4 +1,13 @@
-"""Backward-compatible import shim for independent signal engine."""
-from src.signals.independent import IndependentSignalEngine, IndependentSignalResult
+"""Backward-compatible import shim for advanced signal engine."""
+from src.signals.advanced import AdvancedSignalEngine, AdvancedSignalResult
 
-__all__ = ["IndependentSignalEngine", "IndependentSignalResult"]
+# Legacy aliases retained for import compatibility.
+IndependentSignalEngine = AdvancedSignalEngine
+IndependentSignalResult = AdvancedSignalResult
+
+__all__ = [
+    "AdvancedSignalEngine",
+    "AdvancedSignalResult",
+    "IndependentSignalEngine",
+    "IndependentSignalResult",
+]

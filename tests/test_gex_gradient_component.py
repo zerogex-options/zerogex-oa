@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import pytest
 
 from src.signals.components.base import MarketContext
-from src.signals.components.gex_gradient import GexGradientComponent
+from src.signals.basic.gex_gradient import GexGradientComponent
 
 
 def _ctx(rows=None, net_gex=-2.0e8, **overrides) -> MarketContext:

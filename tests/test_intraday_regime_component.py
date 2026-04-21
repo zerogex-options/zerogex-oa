@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 
 from src.signals.components.base import MarketContext
-from src.signals.components.intraday_regime import IntradayRegimeComponent
+from src.signals.basic.intraday_regime import IntradayRegimeComponent
 
 
 def _ctx(hour=15, minute=0, **overrides) -> MarketContext:

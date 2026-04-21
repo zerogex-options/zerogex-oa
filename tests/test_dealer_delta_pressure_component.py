@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import pytest
 
 from src.signals.components.base import MarketContext
-from src.signals.components.dealer_delta_pressure import (
+from src.signals.basic.dealer_delta_pressure import (
     DealerDeltaPressureComponent,
     _DNI_NORM,
 )

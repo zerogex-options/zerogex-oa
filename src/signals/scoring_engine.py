@@ -1,296 +1,84 @@
-"""
-Layer 1 of the ZeroGEX Signal Engine.
-
-ScoringEngine maintains a registry of ComponentBase instances, calls each
-every cycle with the current MarketContext, computes a weighted composite
-score, and persists both the composite and individual component scores.
-
-Adding a new signal source = instantiate its ComponentBase subclass and
-pass it to ScoringEngine's constructor. Nothing else changes.
-"""
+"""Market State Index scoring engine (0-100)."""
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
 
-from src.config import (
-    SIGNALS_CONTRARIAN_OVERRIDE_ENABLED,
-    SIGNALS_CONTRARIAN_OVERRIDE_MIN_COMPOSITE,
-    SIGNALS_CONTRARIAN_OVERRIDE_THRESHOLD,
-    SIGNALS_CONTRARIAN_REWEIGHT_ENABLED,
-    SIGNALS_CONTRARIAN_REWEIGHT_MULT,
-    SIGNALS_CONVICTION_ABSTAIN_EPSILON,
-    SIGNALS_CONVICTION_AGGREGATION_ENABLED,
-    SIGNALS_CONVICTION_AGREEMENT_MAX_MULT,
-    SIGNALS_CONVICTION_EXTREMITY_MAX_MULT,
-)
 from src.signals.components.base import ComponentBase, MarketContext
-from src.utils import get_logger
-
-# Components whose scores express a contra-trend thesis. When their combined
-# weighted score points the opposite way from the composite with enough
-# conviction, the scoring engine flips direction (flush / squeeze setup).
-_CONTRARIAN_COMPONENT_NAMES = frozenset({"exhaustion", "skew_delta", "positioning_trap"})
-
-logger = get_logger(__name__)
 
 
 @dataclass
 class ScoreSnapshot:
     timestamp: datetime
     underlying: str
-    composite_score: float
-    normalized_score: float
-    direction: str
+    composite_score: float  # Market State Index [0, 100]
+    normalized_score: float  # same as composite_score / 100
+    direction: str  # market state regime label
     components: dict
-    # Conviction aggregation diagnostics (populated when enabled)
-    aggregation: dict = field(default_factory=dict)
+    aggregation: dict
 
 
 class ScoringEngine:
+    """Compute and persist the 0-100 Market State Index."""
+
+    COMPONENT_POINTS: dict[str, float] = {
+        "net_gex_sign": 20.0,
+        "flip_distance": 25.0,
+        "local_gamma": 20.0,
+        "put_call_ratio": 15.0,
+        "price_vs_max_gamma": 10.0,
+        "volatility_regime": 10.0,
+    }
+
     def __init__(self, underlying: str, components: list[ComponentBase]):
         self.underlying = underlying
         self.components = components
-        self._weight_sum = sum(c.weight for c in components)
-        if self._weight_sum <= 0:
-            raise ValueError(
-                f"Component weights must be positive (got {self._weight_sum:.6f})"
-            )
-        # Allow excluding components from the composite without forcing
-        # per-component weight rewrites. We normalize at runtime so the
-        # active composite set still sums to 1.0.
-        self._base_weight_scale = 1.0 / self._weight_sum
-        if abs(self._weight_sum - 1.0) > 0.001:
-            logger.info(
-                "ScoringEngine[%s]: normalizing component weights from %.6f to 1.0",
-                self.underlying,
-                self._weight_sum,
-            )
 
     @staticmethod
-    def _direction(score: float) -> str:
-        if score > 0:
-            return "bullish"
-        if score < 0:
-            return "bearish"
-        return "neutral"
+    def _regime_label(msi: float) -> str:
+        if msi >= 70.0:
+            return "trend_expansion"
+        if msi >= 40.0:
+            return "controlled_trend"
+        if msi >= 20.0:
+            return "chop_range"
+        return "high_risk_reversal"
 
-    def score(self, ctx: MarketContext, conn=None) -> tuple[ScoreSnapshot, list[tuple[ComponentBase, float]]]:
-        """Compute composite score from all components.
-
-        Returns (ScoreSnapshot, component_results) where component_results is
-        a list of (component, clamped_score) tuples.
-        """
+    def score(
+        self, ctx: MarketContext, conn=None
+    ) -> tuple[ScoreSnapshot, list[tuple[ComponentBase, float]]]:
         component_results: list[tuple[ComponentBase, float]] = []
-        weighted_components: dict = {}
+        payload: dict[str, dict] = {}
 
+        total_points = 50.0
         for component in self.components:
             raw = component.compute(ctx)
-            clamped = max(-1.0, min(1.0, raw))
-            base_weight = component.weight * self._base_weight_scale
-            effective_weight = base_weight
-            if (
-                SIGNALS_CONTRARIAN_REWEIGHT_ENABLED
-                and component.name in _CONTRARIAN_COMPONENT_NAMES
-            ):
-                effective_weight = base_weight * SIGNALS_CONTRARIAN_REWEIGHT_MULT
+            clamped = max(-1.0, min(1.0, float(raw)))
+            points = self.COMPONENT_POINTS.get(component.name, float(component.weight) * 100.0)
+            contribution = points * clamped
+            total_points += contribution
             component_results.append((component, clamped))
-            component_ctx = component.context_values(ctx)
-            weighted_components[component.name] = {
-                "weight": round(base_weight, 6),
-                "raw_weight": component.weight,
-                "effective_weight": round(effective_weight, 6),
-                "score": clamped,
-                "regime": component_ctx.get("regime")
-                if isinstance(component_ctx, dict)
-                else None,
+            payload[component.name] = {
+                "score": round(clamped, 6),
+                "max_points": round(points, 2),
+                "contribution": round(contribution, 6),
             }
 
-        raw_composite = sum(
-            weighted_components[c.name]["effective_weight"] * score
-            for c, score in component_results
-        )
-        composite, aggregation = self._aggregate(
-            weighted_components, component_results, raw_composite
-        )
-        composite, aggregation = self._apply_contrarian_override(
-            composite, component_results, weighted_components, aggregation
-        )
-        normalized = abs(composite)
+        composite = max(0.0, min(100.0, total_points))
+        normalized = composite / 100.0
+        direction = self._regime_label(composite)
 
         snapshot = ScoreSnapshot(
             timestamp=ctx.timestamp,
             underlying=ctx.underlying,
             composite_score=round(composite, 6),
             normalized_score=round(normalized, 6),
-            direction=self._direction(composite),
-            components=weighted_components,
-            aggregation=aggregation,
+            direction=direction,
+            components=payload,
+            aggregation={"mode": "market_state_index"},
         )
         return snapshot, component_results
-
-    # ------------------------------------------------------------------
-    # Conviction aggregation
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _aggregate(
-        weighted_components: dict,
-        component_results: list[tuple[ComponentBase, float]],
-        raw_composite: float,
-    ) -> tuple[float, dict]:
-        """Optionally reweight the composite to fight abstention dilution.
-
-        When SIGNALS_CONVICTION_AGGREGATION_ENABLED:
-          1. Renormalize against the sum of weights of *active* components
-             (|score| >= epsilon) so 6 silent components don't drag the
-             composite toward 0.
-          2. Amplify by an agreement factor -- a strong majority in one
-             direction scales the composite up (up to AGREEMENT_MAX_MULT);
-             a tied signal scales it down.
-          3. Amplify by an extremity factor -- when the loudest active
-             component is near the rails, scale the composite further.
-
-        Always clamped to [-1, 1]. Returns (composite, diagnostics_dict).
-        """
-        # Preserve legacy behavior when the flag is off.
-        if not SIGNALS_CONVICTION_AGGREGATION_ENABLED:
-            return raw_composite, {"mode": "legacy_linear"}
-
-        eps = SIGNALS_CONVICTION_ABSTAIN_EPSILON
-        active = [(c, s) for c, s in component_results if abs(s) >= eps]
-        active_weight = sum(
-            float(weighted_components.get(c.name, {}).get("effective_weight", c.weight))
-            for c, _ in active
-        )
-
-        if not active or active_weight <= 0:
-            return 0.0, {
-                "mode": "conviction",
-                "active_count": 0,
-                "active_weight": 0.0,
-                "agreement_multiplier": 0.0,
-                "extremity_multiplier": 0.0,
-                "raw_composite": round(raw_composite, 6),
-                "renormalized": 0.0,
-            }
-
-        # Renormalize against active weight only.
-        active_numerator = sum(
-            float(weighted_components.get(c.name, {}).get("effective_weight", c.weight)) * s
-            for c, s in active
-        )
-        renormalized = active_numerator / active_weight  # in [-1, 1]
-
-        # Agreement: weighted mass of the majority direction over total
-        # weighted mass of *all* active components (both signs). 0.5 means
-        # a dead tie; 1.0 means unanimous.
-        pos_mass = sum(
-            float(weighted_components.get(c.name, {}).get("effective_weight", c.weight)) * s
-            for c, s in active
-            if s > 0
-        )
-        neg_mass = sum(
-            float(weighted_components.get(c.name, {}).get("effective_weight", c.weight))
-            * abs(s)
-            for c, s in active
-            if s < 0
-        )
-        total_mass = pos_mass + neg_mass
-        if total_mass <= 0:
-            agreement = 0.5
-        else:
-            agreement = max(pos_mass, neg_mass) / total_mass
-
-        # Map agreement -> multiplier.
-        #   0.50 (tie)        -> 0.50  (dampen)
-        #   0.70              -> ~1.00 (neutral)
-        #   1.00 (unanimous)  -> AGREEMENT_MAX_MULT
-        max_agree = SIGNALS_CONVICTION_AGREEMENT_MAX_MULT
-        if agreement <= 0.5:
-            agreement_mult = 0.5
-        else:
-            # Linear ramp from (0.5, 0.5) to (1.0, max_agree).
-            agreement_mult = 0.5 + (max_agree - 0.5) * ((agreement - 0.5) / 0.5)
-
-        # Extremity: how loud is the single strongest active component?
-        max_abs = max(abs(s) for _, s in active)
-        max_extreme = SIGNALS_CONVICTION_EXTREMITY_MAX_MULT
-        if max_abs <= 0.70:
-            extremity_mult = 1.0
-        else:
-            extremity_mult = 1.0 + (max_extreme - 1.0) * ((max_abs - 0.70) / 0.30)
-
-        composite = renormalized * agreement_mult * extremity_mult
-        composite = max(-1.0, min(1.0, composite))
-
-        diagnostics = {
-            "mode": "conviction",
-            "active_count": len(active),
-            "active_weight": round(active_weight, 4),
-            "raw_composite": round(raw_composite, 6),
-            "renormalized": round(renormalized, 6),
-            "agreement": round(agreement, 4),
-            "agreement_multiplier": round(agreement_mult, 4),
-            "max_abs_component": round(max_abs, 4),
-            "extremity_multiplier": round(extremity_mult, 4),
-            "contrarian_reweight_enabled": SIGNALS_CONTRARIAN_REWEIGHT_ENABLED,
-            "contrarian_reweight_mult": SIGNALS_CONTRARIAN_REWEIGHT_MULT,
-        }
-        return composite, diagnostics
-
-    @staticmethod
-    def _apply_contrarian_override(
-        composite: float,
-        component_results: list[tuple[ComponentBase, float]],
-        weighted_components: dict,
-        diagnostics: dict,
-    ) -> tuple[float, dict]:
-        """Flip composite sign when the contrarian consensus strongly opposes it.
-
-        Sizing magnitude is preserved; only the direction changes. This lets
-        mean-reversion setups trade against the trend-driven majority instead
-        of just being dampened by it.
-        """
-        contrarian_total_weight = 0.0
-        contrarian_weighted = 0.0
-        for comp, clamped in component_results:
-            if comp.name in _CONTRARIAN_COMPONENT_NAMES:
-                eff = float(
-                    weighted_components.get(comp.name, {}).get(
-                        "effective_weight", comp.weight
-                    )
-                )
-                contrarian_total_weight += eff
-                contrarian_weighted += eff * clamped
-        contrarian_consensus = (
-            contrarian_weighted / contrarian_total_weight
-            if contrarian_total_weight > 0
-            else 0.0
-        )
-        diagnostics = {
-            **diagnostics,
-            "contrarian_consensus": round(contrarian_consensus, 6),
-            "contrarian_override": False,
-        }
-
-        if not SIGNALS_CONTRARIAN_OVERRIDE_ENABLED:
-            return composite, diagnostics
-        if abs(composite) < SIGNALS_CONTRARIAN_OVERRIDE_MIN_COMPOSITE:
-            return composite, diagnostics
-        if abs(contrarian_consensus) < SIGNALS_CONTRARIAN_OVERRIDE_THRESHOLD:
-            return composite, diagnostics
-        # Require opposite signs -- if the contrarians agree with the trend
-        # there is nothing to override.
-        if (contrarian_consensus > 0) == (composite > 0):
-            return composite, diagnostics
-
-        flipped = -composite
-        diagnostics["contrarian_override"] = True
-        diagnostics["pre_override_composite"] = round(composite, 6)
-        return flipped, diagnostics
 
     def persist(
         self,
@@ -299,11 +87,11 @@ class ScoringEngine:
         ctx: MarketContext,
         conn=None,
     ) -> None:
-        """Write composite score to signal_scores and per-component scores to signal_component_scores."""
         if conn is None:
             from src.database import db_connection
-            with db_connection() as conn:
-                self._persist_inner(score, component_results, ctx, conn)
+
+            with db_connection() as local_conn:
+                self._persist_inner(score, component_results, ctx, local_conn)
         else:
             self._persist_inner(score, component_results, ctx, conn)
 
@@ -315,13 +103,8 @@ class ScoringEngine:
         conn,
     ) -> None:
         cur = conn.cursor()
-        # Store aggregation diagnostics inside components JSON for persistence
-        # (no schema change needed). The API layer extracts it to a top-level key.
         components_payload = dict(score.components)
-        if score.aggregation:
-            components_payload["__aggregation__"] = score.aggregation
-
-        # Upsert into signal_scores
+        components_payload["__aggregation__"] = dict(score.aggregation)
         cur.execute(
             """
             INSERT INTO signal_scores (
@@ -344,20 +127,10 @@ class ScoringEngine:
             ),
         )
 
-        # Insert per-component scores
         for component, clamped_score in component_results:
+            points = float(self.COMPONENT_POINTS.get(component.name, float(component.weight) * 100.0))
             context_vals = component.context_values(ctx)
-            component_meta = score.components.get(component.name, {})
-            effective_weight = float(component_meta.get("effective_weight", component.weight))
-            persisted_weight = float(component_meta.get("weight", effective_weight))
-            if component.name == "gex_regime" and isinstance(context_vals, dict):
-                regime = str(context_vals.get("regime") or "").strip().lower()
-                if regime == "short_gamma":
-                    component_meta["regime"] = "short_gamma"
-                elif regime == "long_gamma":
-                    component_meta["regime"] = "long_gamma"
-                else:
-                    component_meta["regime"] = "neutral_gamma"
+            weighted = round(points * clamped_score, 6)
             cur.execute(
                 """
                 INSERT INTO signal_component_scores (
@@ -374,16 +147,14 @@ class ScoringEngine:
                     score.timestamp,
                     component.name,
                     clamped_score,
-                    round(effective_weight * clamped_score, 6),
-                    persisted_weight,
+                    weighted,
+                    points,
                     json.dumps(context_vals, default=str),
                 ),
             )
-
         conn.commit()
 
     def score_and_persist(self, ctx: MarketContext, conn=None) -> ScoreSnapshot:
-        """Convenience method: compute score, persist, and return snapshot."""
         snapshot, component_results = self.score(ctx, conn=conn)
         self.persist(snapshot, component_results, ctx, conn=conn)
         return snapshot

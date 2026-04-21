@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 
 from src.signals.components.base import MarketContext
-from src.signals.independent.eod_pressure import EODPressureSignal, _CHARM_NORM
+from src.signals.advanced.eod_pressure import EODPressureSignal, _CHARM_NORM
 
 
 def _ctx(hour=19, minute=50, **overrides) -> MarketContext:

@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 
 from src.signals.components.base import MarketContext
-from src.signals.components.vanna_charm_flow import (
+from src.signals.basic.vanna_charm_flow import (
     VannaCharmFlowComponent,
     _VC_NORM,
     _CHARM_AMP_MAX,

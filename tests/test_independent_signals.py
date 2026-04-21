@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from src.signals.components.base import MarketContext
-from src.signals.independent.engine import IndependentSignalEngine
+from src.signals.advanced.engine import AdvancedSignalEngine
 
 
 NOW = datetime(2026, 1, 2, 15, 0, tzinfo=timezone.utc)
@@ -37,7 +37,7 @@ def _ctx(**extra) -> MarketContext:
 
 
 def test_squeeze_setup_bullish_triggers():
-    engine = IndependentSignalEngine()
+    engine = AdvancedSignalEngine()
     ctx = _ctx(
         close=601.0,
         net_gex=-250_000_000.0,
@@ -51,7 +51,7 @@ def test_squeeze_setup_bullish_triggers():
 
 
 def test_trap_detection_bearish_fade_on_upside_breakout():
-    engine = IndependentSignalEngine()
+    engine = AdvancedSignalEngine()
     ctx = _ctx(
         close=606.0,
         net_gex=300_000_000.0,
@@ -70,7 +70,7 @@ def test_trap_detection_bearish_fade_on_upside_breakout():
 
 
 def test_trap_detection_neutral_without_strengthening_gamma():
-    engine = IndependentSignalEngine()
+    engine = AdvancedSignalEngine()
     ctx = _ctx(
         close=606.0,
         net_gex=300_000_000.0,
@@ -89,7 +89,7 @@ def test_trap_detection_neutral_without_strengthening_gamma():
 
 
 def test_zero_dte_position_imbalance_call_heavy():
-    engine = IndependentSignalEngine()
+    engine = AdvancedSignalEngine()
     ctx = _ctx(
         put_call_ratio=0.82,
         smart_call=800_000.0,
@@ -108,7 +108,7 @@ def test_zero_dte_position_imbalance_call_heavy():
 
 
 def test_gamma_vwap_confluence_bullish_when_levels_cluster_and_price_above():
-    engine = IndependentSignalEngine()
+    engine = AdvancedSignalEngine()
     ctx = _ctx(
         close=600.8,
         gamma_flip=600.0,

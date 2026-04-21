@@ -1,4 +1,2 @@
-"""Compatibility shim for moved independent signal module."""
-from src.signals.independent.vol_expansion import VolExpansionSignal as VolExpansionComponent
-
-__all__ = ["VolExpansionComponent"]
+"""Compatibility wrapper for moved basic signal module."""
+from src.signals.basic.vol_expansion import *  # noqa: F401,F403

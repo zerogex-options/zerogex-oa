@@ -15,7 +15,6 @@ from zoneinfo import ZoneInfo
 import logging
 import json
 
-from .signal_metrics import calibrate_signal, classify_regime
 
 logger = logging.getLogger(__name__)
 
@@ -4173,62 +4172,6 @@ class DatabaseManager:
             logger.error(f"get_latest_signal_score failed ({symbol}): {e}")
             return None
 
-    async def _get_signal_calibration_history(
-        self,
-        conn: asyncpg.Connection,
-        symbol: str,
-        as_of: datetime,
-        limit: int = 2000,
-        horizon_minutes: int = 60,
-    ) -> list[Dict[str, Any]]:
-        query = """
-            WITH raw AS (
-                SELECT
-                    ss.timestamp,
-                    ss.composite_score,
-                    CASE
-                        WHEN COALESCE((ss.components -> 'gex_regime' ->> 'score')::double precision, 0.0) > 0 THEN 'short_gamma'
-                        WHEN COALESCE((ss.components -> 'gex_regime' ->> 'score')::double precision, 0.0) < 0 THEN 'long_gamma'
-                        ELSE 'neutral_gamma'
-                    END AS regime,
-                    q0.close AS close_at_signal,
-                    q1.close AS close_forward
-                FROM signal_scores ss
-                JOIN LATERAL (
-                    SELECT close
-                    FROM underlying_quotes q
-                    WHERE q.symbol = ss.underlying
-                      AND q.timestamp <= ss.timestamp
-                    ORDER BY q.timestamp DESC
-                    LIMIT 1
-                ) q0 ON TRUE
-                JOIN LATERAL (
-                    SELECT close
-                    FROM underlying_quotes q
-                    WHERE q.symbol = ss.underlying
-                      AND q.timestamp >= ss.timestamp + make_interval(mins => $4::int)
-                    ORDER BY q.timestamp ASC
-                    LIMIT 1
-                ) q1 ON TRUE
-                WHERE ss.underlying = $1
-                  AND ss.timestamp < $2
-                ORDER BY ss.timestamp DESC
-                LIMIT $3
-            )
-            SELECT
-                composite_score,
-                regime,
-                CASE
-                    WHEN close_at_signal > 0 THEN (close_forward / close_at_signal) - 1.0
-                    ELSE NULL
-                END AS fwd_return
-            FROM raw
-            WHERE close_at_signal > 0
-              AND close_forward IS NOT NULL
-        """
-        rows = await conn.fetch(query, symbol, as_of, limit, horizon_minutes)
-        return [dict(r) for r in rows]
-
     async def get_latest_signal_score_enriched(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
         try:
             async with self._acquire_connection() as conn:
@@ -4238,19 +4181,8 @@ class DatabaseManager:
                         ss.underlying,
                         ss.timestamp,
                         ss.composite_score,
-                        ss.normalized_score,
-                        ss.direction,
-                        ss.components,
-                        (ir.context_values->>'market_state_index')::double precision AS intraday_score
+                        ss.components
                     FROM signal_scores ss
-                    LEFT JOIN LATERAL (
-                        SELECT context_values
-                        FROM signal_component_scores
-                        WHERE underlying = ss.underlying
-                          AND timestamp = ss.timestamp
-                          AND component_name = 'intraday_regime'
-                        LIMIT 1
-                    ) ir ON TRUE
                     WHERE ss.underlying = $1
                     ORDER BY timestamp DESC
                     LIMIT 1
@@ -4263,19 +4195,6 @@ class DatabaseManager:
                 row = dict(row)
                 if isinstance(row.get("components"), str):
                     row["components"] = json.loads(row["components"])
-                regime = classify_regime(row.get("components"))
-                row["regime"] = regime
-                calibration_history = await self._get_signal_calibration_history(
-                    conn,
-                    symbol=symbol,
-                    as_of=row["timestamp"],
-                )
-                row["analytics"] = calibrate_signal(
-                    current_composite=float(row.get("composite_score") or 0.0),
-                    current_normalized=float(row.get("normalized_score") or 0.0),
-                    current_regime=regime,
-                    history_rows=calibration_history,
-                )
                 return row
         except Exception as e:
             logger.error(f"get_latest_signal_score_enriched failed ({symbol}): {e}")
@@ -4289,19 +4208,8 @@ class DatabaseManager:
                 ss.underlying,
                 ss.timestamp,
                 ss.composite_score,
-                ss.normalized_score,
-                ss.direction,
-                ss.components,
-                (ir.context_values->>'market_state_index')::double precision AS intraday_score
+                ss.components
             FROM signal_scores ss
-            LEFT JOIN LATERAL (
-                SELECT context_values
-                FROM signal_component_scores
-                WHERE underlying = ss.underlying
-                  AND timestamp = ss.timestamp
-                  AND component_name = 'intraday_regime'
-                LIMIT 1
-            ) ir ON TRUE
             WHERE ss.underlying = $1
             ORDER BY ss.timestamp DESC
             LIMIT $2

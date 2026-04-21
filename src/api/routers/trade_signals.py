@@ -15,17 +15,7 @@ router = APIRouter(prefix="/api/signals", tags=["Trade Signals"])
 
 
 def _scale_signed_100(value: Any) -> Any:
-    """Scale a signed [-1, 1] metric into [-100, 100].
-
-    All score columns in the signal tables are produced by ComponentBase
-    implementations that contractually return values in [-1, +1].  The
-    API tier multiplies by 100 so the UI gets percentage-style numbers
-    without heuristic "scale guessing" (which silently corrupted any
-    component whose honest output happened to exceed ±1).
-
-    Non-numeric values pass through unchanged.  NaN / inf collapse to 0.
-    Result is clamped to [-100, 100] and rounded to 4 decimals.
-    """
+    """Scale a signed [-1, 1] metric into [-100, 100]."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return value
 
@@ -38,44 +28,41 @@ def _scale_signed_100(value: Any) -> Any:
 
 
 
-def _normalize_signal_components(value: Any) -> Any:
-    """Scale unified-signal component score fields to [-100, 100]."""
-    if isinstance(value, dict):
-        out = {}
-        for key, item in value.items():
-            if key == "score":
-                out[key] = _scale_signed_100(item)
-            else:
-                out[key] = _normalize_signal_components(item)
-        return out
-    if isinstance(value, list):
-        return [_normalize_signal_components(v) for v in value]
-    return value
+def _normalize_msi_components(value: Any) -> Any:
+    """Normalize MSI component payload while preserving point contributions."""
+    if not isinstance(value, dict):
+        return value
+    out: dict[str, Any] = {}
+    for name, payload in value.items():
+        if not isinstance(payload, dict):
+            continue
+        points = payload.get("points")
+        contribution = payload.get("contribution")
+        score = payload.get("score")
+        if isinstance(points, (int, float)) and isinstance(contribution, (int, float)):
+            out[name] = {
+                "points": float(points),
+                "contribution": round(float(contribution), 4),
+                "score": round(float(score), 6) if isinstance(score, (int, float)) else score,
+            }
+    return out
 
 
 def _normalize_signal_score_row(row: dict[str, Any]) -> dict[str, Any]:
-    """Normalize consolidated signal-score payload to [-100, 100].
-
-    Also extracts the ``__aggregation__`` block from ``components`` into a
-    top-level ``aggregation`` key so the API response keeps signal components
-    and aggregation diagnostics cleanly separated.
-    """
+    """Return compact MSI payload for /api/signals/score endpoints."""
     out = dict(row)
-    out["composite_score"] = _scale_signed_100(out.get("composite_score"))
-    out["normalized_score"] = _scale_signed_100(out.get("normalized_score"))
-    intraday_score = out.get("intraday_score")
-    if isinstance(intraday_score, (int, float)) and not isinstance(intraday_score, bool):
-        if math.isnan(float(intraday_score)) or math.isinf(float(intraday_score)):
-            out["intraday_score"] = 50.0
-        else:
-            out["intraday_score"] = round(max(0.0, min(100.0, float(intraday_score))), 2)
-    if "components" in out and isinstance(out["components"], dict):
-        components = dict(out["components"])
-        aggregation = components.pop("__aggregation__", None)
-        out["components"] = _normalize_signal_components(components)
-        if aggregation is not None:
-            out["aggregation"] = aggregation
-    return out
+    composite_score = out.get("composite_score")
+    if not isinstance(composite_score, (int, float)) or isinstance(composite_score, bool):
+        composite_score = 50.0
+    composite_score = float(composite_score)
+    if math.isnan(composite_score) or math.isinf(composite_score):
+        composite_score = 50.0
+
+    components = _normalize_msi_components(out.get("components") or {})
+    return {
+        "composite_score": round(max(0.0, min(100.0, composite_score)), 2),
+        "components": components,
+    }
 
 
 

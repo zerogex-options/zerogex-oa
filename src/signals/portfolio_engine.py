@@ -57,11 +57,6 @@ from src.config import (
     SIGNALS_PORTFOLIO_SIZE,
     SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES,
     SIGNALS_SCALP_SIZE_MULTIPLIER,
-    SIGNALS_SCALP_TRIGGER_ENABLED,
-    SIGNALS_SCALP_TRIGGER_THRESHOLD,
-    SIGNALS_TREND_CONFIRMATION_BARS,
-    SIGNALS_TREND_CONFIRMATION_MIN_MATCH,
-    SIGNALS_TRIGGER_THRESHOLD,
 )
 from src.database import db_connection
 from src.signals.execution import leg_fill_price
@@ -71,12 +66,7 @@ from src.signals.position_optimizer_engine import (
     TARGET_DTE_WINDOWS,
     fetch_option_snapshot,
 )
-from src.signals.independent import IndependentSignalResult
-from src.signals.components.utils import (
-    SESSION_CLOSE_MIN_ET,
-    SESSION_OPEN_MIN_ET,
-    minute_of_day_et,
-)
+from src.signals.advanced import AdvancedSignalResult
 from src.signals.scoring_engine import ScoreSnapshot
 from src.signals.strategy_builder import StrategyBuilder
 from src.symbols import get_canonical_symbol
@@ -117,7 +107,7 @@ class PortfolioTarget:
     total_target_contracts: int
     target_heat_pct: float
     rationale: str  # human-readable explanation of why this target was chosen
-    source: str = "composite"  # composite or independent:<signal_name>
+    source: str = "composite"  # composite or advanced:<signal_name>
 
 
 # ---------------------------------------------------------------------------
@@ -132,23 +122,18 @@ class PortfolioEngine:
         self.strategy_builder = StrategyBuilder(self.underlying)
 
         # Config constants
-        self.trigger_threshold = SIGNALS_TRIGGER_THRESHOLD
         self.max_open_trades = SIGNALS_MAX_OPEN_TRADES
         self.max_heat_pct = SIGNALS_MAX_PORTFOLIO_HEAT_PCT
         self.cooldown_minutes = SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES
-        self.trend_confirmation_bars = SIGNALS_TREND_CONFIRMATION_BARS
-        self.trend_confirmation_min_match = SIGNALS_TREND_CONFIRMATION_MIN_MATCH
         self.drs_hard_gates_enabled = SIGNALS_DRS_HARD_GATES_ENABLED
         self.drs_call_entry_min = SIGNALS_DRS_CALL_ENTRY_MIN
         self.drs_put_entry_max = SIGNALS_DRS_PUT_ENTRY_MAX
         self.drs_override_enabled = SIGNALS_DRS_OVERRIDE_ENABLED
         self.drs_override_threshold = SIGNALS_DRS_OVERRIDE_THRESHOLD
         self.drs_fresh_cross_boost = SIGNALS_DRS_FRESH_CROSS_BOOST
-        self.scalp_trigger_enabled = SIGNALS_SCALP_TRIGGER_ENABLED
-        self.scalp_trigger_threshold = SIGNALS_SCALP_TRIGGER_THRESHOLD
         self.scalp_size_multiplier = SIGNALS_SCALP_SIZE_MULTIPLIER
 
-    _INDEPENDENT_SIGNAL_DIRECTION_MAP = {
+    _ADVANCED_SIGNAL_DIRECTION_MAP = {
         "squeeze_setup": {
             "bullish_squeeze": "bullish",
             "bearish_squeeze": "bearish",
@@ -175,51 +160,7 @@ class PortfolioEngine:
         },
     }
 
-    _INDEPENDENT_SIGNAL_RISK_PROFILE = {
-        "squeeze_setup": SIGNALS_INDEPENDENT_RISK_PROFILE_SQUEEZE_SETUP,
-        "trap_detection": SIGNALS_INDEPENDENT_RISK_PROFILE_TRAP_DETECTION,
-        "zero_dte_position_imbalance": SIGNALS_INDEPENDENT_RISK_PROFILE_ZERO_DTE_POSITION_IMBALANCE,
-        "gamma_vwap_confluence": SIGNALS_INDEPENDENT_RISK_PROFILE_GAMMA_VWAP_CONFLUENCE,
-        "vol_expansion": SIGNALS_INDEPENDENT_RISK_PROFILE_VOL_EXPANSION,
-        "eod_pressure": SIGNALS_INDEPENDENT_RISK_PROFILE_EOD_PRESSURE,
-    }
-
-    _INDEPENDENT_SIGNAL_MIN_THRESHOLD = {
-        "squeeze_setup": SIGNALS_INDEPENDENT_MIN_THRESHOLD_SQUEEZE_SETUP,
-        "trap_detection": SIGNALS_INDEPENDENT_MIN_THRESHOLD_TRAP_DETECTION,
-        "zero_dte_position_imbalance": SIGNALS_INDEPENDENT_MIN_THRESHOLD_ZERO_DTE_POSITION_IMBALANCE,
-        "gamma_vwap_confluence": SIGNALS_INDEPENDENT_MIN_THRESHOLD_GAMMA_VWAP_CONFLUENCE,
-        "vol_expansion": SIGNALS_INDEPENDENT_MIN_THRESHOLD_VOL_EXPANSION,
-        "eod_pressure": SIGNALS_INDEPENDENT_MIN_THRESHOLD_EOD_PRESSURE,
-    }
-
-    _INDEPENDENT_PHASE_BASE_THRESHOLD = {
-        "scalp": SIGNALS_INDEPENDENT_THRESHOLD_SCALP,
-        "intraday": SIGNALS_INDEPENDENT_THRESHOLD_INTRADAY,
-        "swing": SIGNALS_INDEPENDENT_THRESHOLD_SWING,
-    }
-
-    _INDEPENDENT_RISK_MULTIPLIER = {
-        "conservative": SIGNALS_INDEPENDENT_RISK_MULT_CONSERVATIVE,
-        "balanced": SIGNALS_INDEPENDENT_RISK_MULT_BALANCED,
-        "aggressive": SIGNALS_INDEPENDENT_RISK_MULT_AGGRESSIVE,
-    }
-
-    _INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN = (
-        SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN
-    )
-    _INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE = (
-        SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE
-    )
-    _INDEPENDENT_PHASE_SCALP_MINUTES_BY_SYMBOL = (
-        SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_BY_SYMBOL
-    )
-    _INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE_BY_SYMBOL = (
-        SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE_BY_SYMBOL
-    )
-    _INDEPENDENT_PHASE_THRESHOLD_OVERRIDES = (
-        SIGNALS_INDEPENDENT_PHASE_THRESHOLD_OVERRIDES
-    )
+    _ADVANCED_MIN_ABS_SCORE = 0.25
 
     @staticmethod
     def _market_status(dt: Optional[datetime] = None) -> str:
@@ -264,70 +205,52 @@ class PortfolioEngine:
         This method never reads signal_trades — it is purely a function of
         the score and market context.  All trade-awareness lives in reconcile().
         """
-        threshold = self.trigger_threshold
-        scalp_threshold = (
-            self.scalp_trigger_threshold if self.scalp_trigger_enabled else threshold
-        )
+        msi = float(score.composite_score or 0.0)
+        regime = str(score.direction or "high_risk_reversal")
+        # score.normalized_score stores MSI/100 in the new scoring engine.
+        conviction = float(score.normalized_score or 0.0)
 
-        # --- CASE 1: neutral or below *scalp* threshold → 100% cash ---
-        # The scalp threshold is the lowest gate we care about; anything
-        # below it is pure cash.
-        if score.direction == "neutral" or score.normalized_score < scalp_threshold:
+        # Hard wait regime.
+        if regime == "high_risk_reversal":
             return self._cash_target(
                 score,
-                f"Score {score.normalized_score:.3f} below scalp threshold "
-                f"{scalp_threshold:.3f} / direction {score.direction}",
+                f"MSI {msi:.1f} in high-risk reversal regime: wait",
             )
 
-        # --- Dynamic threshold adjustment based on IV rank ---
-        # Note: IV-rank adjustment only affects the *full-size* threshold.
-        # The scalp threshold is a floor and is not tightened in high IV --
-        # scalps are smaller and explicitly meant to be high-frequency.
-        iv_rank = market_ctx.get("iv_rank")
-        effective_threshold = threshold
-        if iv_rank is not None:
-            if iv_rank > 0.70:
-                effective_threshold = min(0.72, threshold + 0.07)
-            elif iv_rank < 0.25:
-                effective_threshold = max(0.52, threshold - 0.04)
-
-        # Classify the tier. The scalp tier runs with reduced sizing and
-        # skips the DRS hard-entry gates (which otherwise block reversals).
-        is_scalp = (
-            self.scalp_trigger_enabled
-            and score.normalized_score < effective_threshold
-            and score.normalized_score >= scalp_threshold
-        )
-        tier_label = "scalp" if is_scalp else "full"
-        size_multiplier = self.scalp_size_multiplier if is_scalp else 1.0
+        # Determine sizing mode by regime.
+        if regime == "trend_expansion":
+            tier_label = "ride"
+            size_multiplier = 1.0
+        elif regime == "controlled_trend":
+            tier_label = "intraday"
+            size_multiplier = 0.75
+        else:  # chop_range
+            tier_label = "scalp"
+            size_multiplier = min(self.scalp_size_multiplier, 0.6)
+        is_scalp = tier_label == "scalp"
 
         # --- CASE 2: trend confirmation ---
-        # Scalps intentionally skip trend confirmation -- the whole point is
-        # to catch fast reversals and mean-reversion, not to require the
-        # preceding bars to agree.
-        if not is_scalp and not self._score_trend_confirmation(
+        if regime in {"trend_expansion", "controlled_trend"} and not self._score_trend_confirmation(
             score,
             market_ctx,
             conn=conn,
         ):
             return self._cash_target(
                 score,
-                f"Trend confirmation failed: recent history contradicts {score.direction}",
+                f"Trend confirmation failed for regime={regime}",
             )
 
-        # --- CASE 2B: Dealer Regime hard-entry gates ---
-        # Strong-conviction composite overrides the DRS positional gate so
-        # reversal setups on days already past the flip can still fire.
+        # Keep DRS gates for directional entries.
         drs_override_active = (
             self.drs_override_enabled
             and not is_scalp
-            and score.normalized_score >= self.drs_override_threshold
+            and conviction >= self.drs_override_threshold
         )
         if is_scalp or drs_override_active:
             passes_drs_gate, drs_reason = True, (
                 "DRS hard gate bypassed: scalp tier"
                 if is_scalp
-                else f"DRS hard gate bypassed: conviction {score.normalized_score:.3f} "
+                else f"DRS hard gate bypassed: conviction {conviction:.3f} "
                 f">= override {self.drs_override_threshold:.2f}"
             )
         else:
@@ -337,11 +260,13 @@ class PortfolioEngine:
         if not passes_drs_gate:
             return self._cash_target(score, drs_reason)
 
-        # --- CASE 3: position optimizer candidate ---
-        # Scalp tier forces the intraday DTE window (0-2) regardless of the
-        # score-band mapping, because the whole point of a scalp is to hold
-        # for minutes-to-hours, not days.
-        forced_timeframe = "intraday" if is_scalp else None
+        # Regime-aware timeframe selection.
+        if regime == "trend_expansion":
+            forced_timeframe = "swing"
+        elif regime == "controlled_trend":
+            forced_timeframe = "intraday"
+        else:
+            forced_timeframe = "intraday"
         candidate_result = self._select_optimizer_candidate(
             score,
             market_ctx,
@@ -366,10 +291,6 @@ class PortfolioEngine:
             )
 
         # --- CASE 4: compute target contracts via Kelly sizing ---
-        # A fresh gamma-flip cross in the signal direction is a momentum
-        # catalyst the base score can under-represent. Now that the DRS gate
-        # is symmetric, we fold fresh-cross energy back in as a sizing boost
-        # applied after the gate passes.
         fresh_cross = self._fresh_drs_cross(score.direction, market_ctx)
         cross_multiplier = (
             1.0 + self.drs_fresh_cross_boost if fresh_cross and self.drs_fresh_cross_boost > 0 else 1.0
@@ -377,7 +298,7 @@ class PortfolioEngine:
         base_contracts = sizing.contracts
         contracts = max(
             1,
-            int(base_contracts * score.normalized_score * size_multiplier * cross_multiplier),
+            int(base_contracts * conviction * size_multiplier * cross_multiplier),
         )
 
         entry_price = (candidate.entry_debit or candidate.entry_credit) / 100.0
@@ -452,7 +373,7 @@ class PortfolioEngine:
         )
 
         rationale = (
-            f"Score {score.normalized_score:.3f} {score.direction} [{tier_label}], "
+            f"MSI {msi:.1f} regime={regime} dir={score.direction} [{tier_label}], "
             f"{candidate.strategy_type} {contracts}c Kelly={candidate.kelly_fraction:.1%}"
             + (
                 f" regime={candidate_result.get('strategy_regime')}:{candidate_result.get('strategy_regime_score', 0):.2f}"
@@ -479,52 +400,73 @@ class PortfolioEngine:
         self,
         score: ScoreSnapshot,
         market_ctx: dict,
-        independent_results: list[IndependentSignalResult],
+        independent_results: list[AdvancedSignalResult],
         conn=None,
         cached_option_rows=None,
     ) -> PortfolioTarget:
-        """Primary composite target with independent-signal opportunistic overrides."""
+        """Primary MSI target with advanced-signal opportunity gating."""
         composite_target = self.compute_target(
             score,
             market_ctx,
             conn=conn,
             cached_option_rows=cached_option_rows,
         )
-        independent_target = self._build_independent_target(
+        advanced_target = self._build_advanced_target(
             score,
             market_ctx,
             independent_results=independent_results,
             conn=conn,
             cached_option_rows=cached_option_rows,
         )
-        if independent_target is None:
-            return composite_target
+        # Always require an advanced setup before entering.
+        if advanced_target is None:
+            return self._cash_target(
+                score,
+                "No advanced signal setup confirmed; stay in cash",
+            )
 
-        # Composite is primary; independent opportunities only override when:
-        # 1) composite is neutral/cash, or
-        # 2) independent conviction materially exceeds composite conviction.
-        if not composite_target.target_positions:
-            return independent_target
+        # Hard do-not-fade policy in destabilizing, no-anchor conditions.
+        if self._do_not_fade(market_ctx):
+            trend_dir = self._msi_trend_direction(market_ctx)
+            if (
+                trend_dir in {"bullish", "bearish"}
+                and advanced_target.direction in {"bullish", "bearish"}
+                and trend_dir != advanced_target.direction
+            ):
+                return self._cash_target(
+                    score,
+                    "Do-not-fade policy active; skipping counter-trend setup",
+                )
 
-        if independent_target.normalized_score > score.normalized_score + 0.08:
-            return independent_target
+        # In expansion regime, prefer ride-move alignment with MSI trend.
+        if score.composite_score >= 70.0:
+            trend_dir = self._msi_trend_direction(market_ctx)
+            if (
+                trend_dir in {"bullish", "bearish"}
+                and advanced_target.direction in {"bullish", "bearish"}
+                and trend_dir != advanced_target.direction
+            ):
+                return self._cash_target(
+                    score,
+                    "Expansion regime: advanced setup opposes prevailing trend",
+                )
 
-        return composite_target
+        return advanced_target
 
-    def _build_independent_target(
+    def _build_advanced_target(
         self,
         score: ScoreSnapshot,
         market_ctx: dict,
-        independent_results: list[IndependentSignalResult],
+        independent_results: list[AdvancedSignalResult],
         conn=None,
         cached_option_rows=None,
     ) -> Optional[PortfolioTarget]:
-        strongest = self._strongest_independent_signal(independent_results, score)
+        strongest = self._strongest_advanced_signal(independent_results)
         if strongest is None:
             return None
 
-        signal_result, signal_direction, phase, threshold = strongest
-        synthetic_score = self._build_signal_snapshot_for_independent(
+        signal_result, signal_direction = strongest
+        synthetic_score = self._build_signal_snapshot_for_advanced(
             base=score,
             signal_result=signal_result,
             direction=signal_direction,
@@ -541,48 +483,43 @@ class PortfolioEngine:
         if not target.target_positions:
             return None
 
-        target.source = f"independent:{signal_result.name}"
+        target.source = f"advanced:{signal_result.name}"
         target.rationale = (
-            f"Independent {signal_result.name} score={signal_result.score:.3f} "
-            f"phase={phase} threshold={threshold:.3f} triggered, "
+            f"Advanced {signal_result.name} score={signal_result.score:.3f} triggered, "
             + target.rationale
         )
         return target
 
-    def _strongest_independent_signal(
+    def _strongest_advanced_signal(
         self,
-        independent_results: list[IndependentSignalResult],
-        score: ScoreSnapshot,
-    ) -> Optional[tuple[IndependentSignalResult, str, str, float]]:
-        ranked: list[tuple[IndependentSignalResult, str, str, float]] = []
+        independent_results: list[AdvancedSignalResult],
+    ) -> Optional[tuple[AdvancedSignalResult, str]]:
+        ranked: list[tuple[AdvancedSignalResult, str]] = []
         for result in independent_results or []:
-            direction = self._resolve_independent_direction(result)
+            direction = self._resolve_advanced_direction(result)
             if direction == "neutral":
                 continue
-            phase = self._independent_signal_phase(score)
-            threshold = self._independent_signal_threshold(result.name, score)
-            if abs(result.score) < threshold:
+            triggered = bool((result.context or {}).get("triggered", False))
+            if not triggered:
                 continue
-            ranked.append((result, direction, phase, threshold))
+            if abs(float(result.score)) < 0.25:
+                continue
+            ranked.append((result, direction))
 
         if not ranked:
             return None
 
         ranked.sort(
-            key=lambda item: (
-                abs(item[0].score) - item[3],
-                abs(item[0].score),
-                1 if item[0].name in {"vol_expansion", "eod_pressure"} else 0,
-            ),
+            key=lambda item: abs(item[0].score),
             reverse=True,
         )
         return ranked[0]
 
     @classmethod
-    def _resolve_independent_direction(cls, result: IndependentSignalResult) -> str:
+    def _resolve_advanced_direction(cls, result: AdvancedSignalResult) -> str:
         signal_name = result.name
         signal_value = str((result.context or {}).get("signal", "")).lower()
-        mapping = cls._INDEPENDENT_SIGNAL_DIRECTION_MAP.get(signal_name, {})
+        mapping = cls._ADVANCED_SIGNAL_DIRECTION_MAP.get(signal_name, {})
         if signal_value in mapping:
             return mapping[signal_value]
         if result.score > 0:
@@ -591,78 +528,15 @@ class PortfolioEngine:
             return "bearish"
         return "neutral"
 
-    @classmethod
-    def _independent_signal_phase(cls, score: ScoreSnapshot) -> str:
-        """Classify independent-trigger horizon by session phase."""
-        minute_et = minute_of_day_et(score.timestamp)
-        if minute_et is None:
-            return "intraday"
-        if minute_et < SESSION_OPEN_MIN_ET or minute_et > SESSION_CLOSE_MIN_ET:
-            return "swing"
-
-        symbol = str(score.underlying or "").strip().upper()
-        scalp_minutes = int(
-            cls._INDEPENDENT_PHASE_SCALP_MINUTES_BY_SYMBOL.get(
-                symbol,
-                cls._INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN,
-            )
-        )
-        swing_minutes = int(
-            cls._INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE_BY_SYMBOL.get(
-                symbol,
-                cls._INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE,
-            )
-        )
-        scalp_cutoff = SESSION_OPEN_MIN_ET + max(15, min(390, scalp_minutes))
-        swing_cutoff = SESSION_CLOSE_MIN_ET - max(15, min(390, swing_minutes))
-        if minute_et <= scalp_cutoff:
-            return "scalp"
-        if minute_et >= swing_cutoff:
-            return "swing"
-        return "intraday"
-
-    @classmethod
-    def _independent_signal_threshold(cls, signal_name: str, score: ScoreSnapshot) -> float:
-        """Phase-aware threshold with per-signal risk profile knobs."""
-        signal_key = str(signal_name or "").strip().lower()
-        phase = cls._independent_signal_phase(score)
-        signal_phase_override = (
-            cls._INDEPENDENT_PHASE_THRESHOLD_OVERRIDES.get(signal_key, {})
-            if isinstance(cls._INDEPENDENT_PHASE_THRESHOLD_OVERRIDES, dict)
-            else {}
-        )
-        override_phase_base = (
-            float(signal_phase_override[phase])
-            if isinstance(signal_phase_override, dict) and phase in signal_phase_override
-            else None
-        )
-        phase_base = float(
-            override_phase_base
-            if override_phase_base is not None
-            else cls._INDEPENDENT_PHASE_BASE_THRESHOLD.get(
-                phase, SIGNALS_INDEPENDENT_THRESHOLD_INTRADAY
-            )
-        )
-        profile = cls._INDEPENDENT_SIGNAL_RISK_PROFILE.get(signal_key, "balanced")
-        risk_mult = float(
-            cls._INDEPENDENT_RISK_MULTIPLIER.get(
-                profile, SIGNALS_INDEPENDENT_RISK_MULT_BALANCED
-            )
-        )
-        min_threshold = float(cls._INDEPENDENT_SIGNAL_MIN_THRESHOLD.get(signal_key, 0.25))
-        threshold = phase_base * float(risk_mult)
-        return max(min_threshold, min(1.0, threshold))
-
     @staticmethod
-    def _build_signal_snapshot_for_independent(
+    def _build_signal_snapshot_for_advanced(
         base: ScoreSnapshot,
-        signal_result: IndependentSignalResult,
+        signal_result: AdvancedSignalResult,
         direction: str,
     ) -> ScoreSnapshot:
         magnitude = max(0.0, min(1.0, abs(float(signal_result.score))))
-        signed = magnitude if direction == "bullish" else -magnitude if direction == "bearish" else 0.0
         components = dict(base.components or {})
-        components[f"independent:{signal_result.name}"] = {
+        components[f"advanced:{signal_result.name}"] = {
             "weight": 0.0,
             "effective_weight": 0.0,
             "score": float(signal_result.score),
@@ -670,17 +544,63 @@ class PortfolioEngine:
         return ScoreSnapshot(
             timestamp=base.timestamp,
             underlying=base.underlying,
-            composite_score=round(signed, 6),
+            composite_score=round(base.composite_score, 6),
             normalized_score=round(magnitude, 6),
             direction=direction,
             components=components,
             aggregation={
                 **(base.aggregation or {}),
-                "independent_trigger": signal_result.name,
-                "independent_score": round(float(signal_result.score), 6),
-                "independent_direction": direction,
+                "advanced_trigger": signal_result.name,
+                "advanced_score": round(float(signal_result.score), 6),
+                "advanced_direction": direction,
             },
         )
+
+    @staticmethod
+    def _do_not_fade(market_ctx: dict) -> bool:
+        net_gex = float(market_ctx.get("net_gex") or 0.0)
+        close = float(market_ctx.get("close") or 0.0)
+        gamma_flip = market_ctx.get("gamma_flip")
+        max_gamma = market_ctx.get("max_gamma_strike")
+        if close <= 0:
+            return False
+        if net_gex >= 0:
+            return False
+
+        far_from_max = False
+        if max_gamma is not None:
+            try:
+                far_from_max = abs((close - float(max_gamma)) / close) >= 0.012
+            except (TypeError, ValueError, ZeroDivisionError):
+                far_from_max = False
+
+        flip_not_near = True
+        if gamma_flip is not None:
+            try:
+                flip_not_near = abs((close - float(gamma_flip)) / close) >= 0.006
+            except (TypeError, ValueError, ZeroDivisionError):
+                flip_not_near = True
+
+        return bool(far_from_max and flip_not_near)
+
+    @staticmethod
+    def _msi_trend_direction(market_ctx: dict) -> str:
+        closes = market_ctx.get("recent_closes") or []
+        if len(closes) < 3:
+            return "neutral"
+        try:
+            start = float(closes[-3])
+            end = float(closes[-1])
+        except (TypeError, ValueError):
+            return "neutral"
+        if start <= 0:
+            return "neutral"
+        move = (end - start) / start
+        if move > 0.0005:
+            return "bullish"
+        if move < -0.0005:
+            return "bearish"
+        return "neutral"
 
     # ------------------------------------------------------------------
     # reconcile — reads actual state, computes delta, executes
@@ -1211,39 +1131,19 @@ class PortfolioEngine:
         try:
             with self._use_conn(conn) as c:
                 cur = c.cursor()
-                lookback = self.trend_confirmation_bars
+                lookback = 6
                 if lookback <= 0:
                     return True
 
                 direction = score.direction
-                exhaustion_abs = abs(
-                    float((score.components.get("exhaustion") or {}).get("score", 0.0))
-                )
-                trap_abs = abs(
-                    float((score.components.get("positioning_trap") or {}).get("score", 0.0))
-                )
-                vwap_dev_abs = abs(float(market_ctx.get("vwap_deviation_pct") or 0.0))
-                strong_reversal = (
-                    score.normalized_score >= 0.62
-                    and (
-                        exhaustion_abs >= 0.75
-                        or trap_abs >= 0.75
-                        or vwap_dev_abs >= 0.004
-                    )
-                )
-                min_match_cap = (
-                    max(0, self.trend_confirmation_min_match - 1)
-                    if strong_reversal
-                    else self.trend_confirmation_min_match
-                )
-
+                min_match = 3
                 cur.execute(
                     """
                     SELECT direction
                     FROM signal_scores
                     WHERE underlying = %s
                       AND timestamp < %s
-                      AND direction != 'neutral'
+                      AND direction != 'high_risk_reversal'
                     ORDER BY timestamp DESC
                     LIMIT %s
                     """,
@@ -1253,11 +1153,9 @@ class PortfolioEngine:
                 if not rows:
                     return True
                 matching = sum(1 for r in rows if r[0] == direction)
-                min_match = min(min_match_cap, len(rows))
-                return matching >= min_match
+                required = min(min_match, len(rows))
+                return matching >= required
         except Exception as exc:
-            # Fail closed: if the trend lookup errors we don't know whether
-            # history agrees, so refuse confirmation and fall back to cash.
             logger.warning(
                 "PortfolioEngine[%s]: trend confirmation lookup failed (%s); treating as unconfirmed",
                 self.db_symbol,
@@ -1266,58 +1164,12 @@ class PortfolioEngine:
             return False
 
     def _passes_dealer_regime_gates(self, score: ScoreSnapshot, market_ctx: dict) -> tuple[bool, str]:
-        if not self.drs_hard_gates_enabled:
-            return True, "DRS hard gates disabled"
-
-        component = score.components.get("dealer_regime", {})
-        drs_norm = float(component.get("score", 0.0))
-        gamma_flip = market_ctx.get("gamma_flip")
-        close = market_ctx.get("close")
-        recent = market_ctx.get("recent_closes") or []
-        prev_close = recent[-2] if len(recent) >= 2 else None
-
-        if gamma_flip is None or close is None:
-            return False, "DRS hard gate blocked: missing gamma flip or close"
-
-        if score.direction == "bullish":
-            holds_above_flip = close > gamma_flip and (prev_close is None or prev_close > gamma_flip)
-            if not holds_above_flip:
-                return False, "DRS hard gate blocked: bullish entry requires hold above gamma flip"
-            if drs_norm <= self.drs_call_entry_min:
-                return (
-                    False,
-                    f"DRS hard gate blocked: bullish entry requires DRS > {self.drs_call_entry_min:.2f}",
-                )
-            return True, "DRS bullish gate passed"
-
-        if score.direction == "bearish":
-            # Symmetric with the bullish branch: require a sustained hold below
-            # the flip rather than the exact bar of a fresh cross. A fresh
-            # cross is folded in later as a conviction/sizing boost.
-            holds_below_flip = close < gamma_flip and (prev_close is None or prev_close < gamma_flip)
-            if not holds_below_flip:
-                return False, "DRS hard gate blocked: bearish entry requires hold below gamma flip"
-            if drs_norm >= self.drs_put_entry_max:
-                return (
-                    False,
-                    f"DRS hard gate blocked: bearish entry requires DRS < {self.drs_put_entry_max:.2f}",
-                )
-            return True, "DRS bearish gate passed"
-
-        return False, "DRS hard gate blocked: neutral direction"
+        # Under MSI architecture, direction validity is handled by regime +
+        # do-not-fade + advanced-signal gating. Keep this hook as pass-through.
+        return True, "MSI regime gate passed"
 
     def _fresh_drs_cross(self, direction: str, market_ctx: dict) -> bool:
-        """Detect a gamma-flip cross in the signaled direction on this bar."""
-        gamma_flip = market_ctx.get("gamma_flip")
-        close = market_ctx.get("close")
-        recent = market_ctx.get("recent_closes") or []
-        prev_close = recent[-2] if len(recent) >= 2 else None
-        if gamma_flip is None or close is None or prev_close is None:
-            return False
-        if direction == "bullish":
-            return close > gamma_flip and prev_close <= gamma_flip
-        if direction == "bearish":
-            return close < gamma_flip and prev_close >= gamma_flip
+        # Legacy DRS cross boost disabled under MSI-first logic.
         return False
 
     def _select_optimizer_candidate(
@@ -1329,9 +1181,9 @@ class PortfolioEngine:
         forced_timeframe: Optional[str] = None,
     ) -> Optional[dict]:
         signal_timeframe = forced_timeframe or self._infer_signal_timeframe(
-            score.normalized_score
+            score.composite_score
         )
-        signal_strength = self._infer_signal_strength(score.normalized_score)
+        signal_strength = self._infer_signal_strength(score.composite_score)
         dte_min, dte_max = TARGET_DTE_WINDOWS.get(signal_timeframe, (1, 7))
 
         # Reuse option rows from OpportunityQualityComponent if available
@@ -1415,20 +1267,20 @@ class PortfolioEngine:
         return "neutral"
 
     @staticmethod
-    def _infer_signal_strength(normalized_score: float) -> str:
-        if normalized_score >= 0.82:
+    def _infer_signal_strength(msi_score: float) -> str:
+        if msi_score >= 80.0:
             return "high"
-        if normalized_score >= 0.64:
+        if msi_score >= 55.0:
             return "medium"
         return "low"
 
     @staticmethod
-    def _infer_signal_timeframe(normalized_score: float) -> str:
-        if normalized_score >= 0.84:
-            return "intraday"
-        if normalized_score >= 0.68:
+    def _infer_signal_timeframe(msi_score: float) -> str:
+        if msi_score >= 70.0:
             return "swing"
-        return "multi_day"
+        if msi_score >= 40.0:
+            return "intraday"
+        return "intraday"
 
     @staticmethod
     def _legs_from_candidate(candidate: dict) -> list[dict]:

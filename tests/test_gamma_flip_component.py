@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import pytest
 
 from src.signals.components.base import MarketContext
-from src.signals.components.gamma_flip import GammaFlipComponent, _DIST_NORM
+from src.signals.basic.gamma_flip import GammaFlipComponent, _DIST_NORM
 
 
 def _ctx(**overrides) -> MarketContext:

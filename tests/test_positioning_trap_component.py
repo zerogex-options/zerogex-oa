@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from src.signals.components.base import MarketContext
-from src.signals.components.positioning_trap import PositioningTrapComponent
+from src.signals.basic.positioning_trap import PositioningTrapComponent
 from src.signals.unified_signal_engine import UnifiedSignalEngine
 
 
@@ -57,7 +57,7 @@ def test_flush_setup_scores_bearish():
 def test_component_in_unified_engine_and_weights_still_valid(monkeypatch):
     monkeypatch.delenv("SIGNAL_IV_RANK_ENABLED", raising=False)
     engine = UnifiedSignalEngine("SPY")
-    assert any(c.name == "positioning_trap" for c in engine.scoring_engine.components)
+    assert any(c.name == "net_gex_sign" for c in engine.scoring_engine.components)
 
 
 def test_signed_imbalance_uses_top_level_signed_fields():

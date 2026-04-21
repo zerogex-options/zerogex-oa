@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 
 from src.signals.components.base import MarketContext
-from src.signals.components.dealer_regime import DealerRegimeComponent
+from src.signals.basic.dealer_regime import DealerRegimeComponent
 
 
 def _ctx(**overrides) -> MarketContext:

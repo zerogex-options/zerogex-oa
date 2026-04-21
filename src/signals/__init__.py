@@ -29,4 +29,10 @@ def __getattr__(name):
     if name == "MarketContext":
         from src.signals.components.base import MarketContext
         return MarketContext
+    if name == "BasicSignalModule":
+        from src.signals import basic as BasicSignalModule
+        return BasicSignalModule
+    if name == "AdvancedSignalEngine":
+        from src.signals.advanced import AdvancedSignalEngine
+        return AdvancedSignalEngine
     raise AttributeError(f"module 'src.signals' has no attribute '{name}'")

@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 
 from src.signals.components.base import MarketContext
-from src.signals.components.skew_delta import (
+from src.signals.basic.skew_delta import (
     SkewDeltaComponent,
     _SKEW_BASELINE,
     _SKEW_SATURATION,

@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 
 from src.signals.components.base import MarketContext
-from src.signals.components.tape_flow_bias import TapeFlowBiasComponent
+from src.signals.basic.tape_flow_bias import TapeFlowBiasComponent
 
 
 def _ctx(**overrides) -> MarketContext:

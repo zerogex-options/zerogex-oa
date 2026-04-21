@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import pytest
 
 from src.signals.components.base import MarketContext
-from src.signals.components.gex_regime import GexRegimeComponent, _GEX_NORM
+from src.signals.basic.gex_regime import GexRegimeComponent, _GEX_NORM
 
 
 def _ctx(**overrides) -> MarketContext:

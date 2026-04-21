@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import pytest
 
 from src.signals.components.base import MarketContext
-from src.signals.components.smart_money import SmartMoneyComponent
+from src.signals.basic.smart_money import SmartMoneyComponent
 
 
 comp = SmartMoneyComponent()
