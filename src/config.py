@@ -4,8 +4,9 @@ Centralized configuration constants for ZeroGEX platform
 All configurable constants in one place for easy tuning.
 """
 
+import json
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 
 # CRITICAL: Load environment variables FIRST before any config is read
@@ -312,12 +313,90 @@ def _independent_risk_profile(name: str, default: str = "balanced") -> str:
     return value if value in _INDEPENDENT_RISK_PROFILE_VALUES else default
 
 
+def _clamped_threshold(raw: float) -> float:
+    return max(0.0, min(1.0, float(raw)))
+
+
+def _parse_symbol_minutes_map(name: str) -> Dict[str, int]:
+    """Parse symbol->minutes map from JSON env var."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+
+    out: Dict[str, int] = {}
+    for k, v in parsed.items():
+        symbol = str(k or "").strip().upper()
+        if not symbol:
+            continue
+        try:
+            minutes = int(v)
+        except (TypeError, ValueError):
+            continue
+        out[symbol] = max(15, min(390, minutes))
+    return out
+
+
+def _parse_signal_phase_threshold_overrides(name: str) -> Dict[str, Dict[str, float]]:
+    """Parse nested {signal: {phase: threshold}} override map from JSON env var."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+
+    out: Dict[str, Dict[str, float]] = {}
+    valid_phases = {"scalp", "intraday", "swing"}
+    for signal_name, phase_map in parsed.items():
+        signal_key = str(signal_name or "").strip().lower()
+        if not signal_key or not isinstance(phase_map, dict):
+            continue
+        clean_phase_map: Dict[str, float] = {}
+        for phase, threshold in phase_map.items():
+            phase_key = str(phase or "").strip().lower()
+            if phase_key not in valid_phases:
+                continue
+            try:
+                clean_phase_map[phase_key] = _clamped_threshold(float(threshold))
+            except (TypeError, ValueError):
+                continue
+        if clean_phase_map:
+            out[signal_key] = clean_phase_map
+    return out
+
+
+def _jsonable_copy(value):
+    """Return a JSON-safe representation for config debug output."""
+    if isinstance(value, dict):
+        return {str(k): _jsonable_copy(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_jsonable_copy(v) for v in value]
+    return value
+
+
 # Session-phase segmentation for independent-trigger gating.
 SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN = max(
     15, int(os.getenv("SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN", "75"))
 )
 SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE = max(
     15, int(os.getenv("SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE", "90"))
+)
+# Optional per-symbol overrides:
+#   {"SPY": 60, "QQQ": 45}
+SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_BY_SYMBOL = _parse_symbol_minutes_map(
+    "SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_BY_SYMBOL"
+)
+SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE_BY_SYMBOL = _parse_symbol_minutes_map(
+    "SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE_BY_SYMBOL"
 )
 
 # Base threshold by phase (higher = stricter; all values clamped in [0,1]).
@@ -329,6 +408,11 @@ SIGNALS_INDEPENDENT_THRESHOLD_INTRADAY = max(
 )
 SIGNALS_INDEPENDENT_THRESHOLD_SWING = max(
     0.0, min(1.0, float(os.getenv("SIGNALS_INDEPENDENT_THRESHOLD_SWING", "0.34")))
+)
+# Optional per-signal/per-phase overrides:
+# {"squeeze_setup":{"scalp":0.40,"intraday":0.33},"eod_pressure":{"swing":0.42}}
+SIGNALS_INDEPENDENT_PHASE_THRESHOLD_OVERRIDES = _parse_signal_phase_threshold_overrides(
+    "SIGNALS_INDEPENDENT_PHASE_THRESHOLD_OVERRIDES"
 )
 
 # Risk-profile multipliers applied to phase thresholds.
@@ -554,9 +638,18 @@ def get_all_config() -> Dict[str, Any]:
             "stop_loss_pct": SIGNALS_STOP_LOSS_PCT,
             "independent_phase_scalp_minutes_from_open": SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN,
             "independent_phase_swing_minutes_to_close": SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE,
+            "independent_phase_scalp_minutes_by_symbol": _jsonable_copy(
+                SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_BY_SYMBOL
+            ),
+            "independent_phase_swing_minutes_to_close_by_symbol": _jsonable_copy(
+                SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE_BY_SYMBOL
+            ),
             "independent_threshold_scalp": SIGNALS_INDEPENDENT_THRESHOLD_SCALP,
             "independent_threshold_intraday": SIGNALS_INDEPENDENT_THRESHOLD_INTRADAY,
             "independent_threshold_swing": SIGNALS_INDEPENDENT_THRESHOLD_SWING,
+            "independent_phase_threshold_overrides": _jsonable_copy(
+                SIGNALS_INDEPENDENT_PHASE_THRESHOLD_OVERRIDES
+            ),
             "independent_risk_profiles": {
                 "squeeze_setup": SIGNALS_INDEPENDENT_RISK_PROFILE_SQUEEZE_SETUP,
                 "trap_detection": SIGNALS_INDEPENDENT_RISK_PROFILE_TRAP_DETECTION,

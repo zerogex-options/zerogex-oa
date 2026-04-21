@@ -628,6 +628,45 @@ class TestIndependentSignalRiskBySessionPhase:
         # 0.20 * 0.50 = 0.10, but min floor for gamma_vwap_confluence is 0.20.
         assert threshold == pytest.approx(0.20)
 
+    def test_symbol_specific_phase_windows_override_default_session_cutoffs(self):
+        qqq_score = ScoreSnapshot(
+            timestamp=datetime(2026, 4, 6, 15, 0, tzinfo=timezone.utc),  # 11:00 ET
+            underlying="QQQ",
+            composite_score=0.2,
+            normalized_score=0.2,
+            direction="bullish",
+            components={},
+        )
+        with patch.dict(
+            PortfolioEngine._INDEPENDENT_PHASE_SCALP_MINUTES_BY_SYMBOL,
+            {"QQQ": 120},
+            clear=False,
+        ), patch.dict(
+            PortfolioEngine._INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE_BY_SYMBOL,
+            {"QQQ": 45},
+            clear=False,
+        ):
+            phase = PortfolioEngine._independent_signal_phase(qqq_score)
+        assert phase == "scalp"
+
+    def test_signal_phase_threshold_override_applies_before_risk_multiplier(self):
+        score = ScoreSnapshot(
+            timestamp=datetime(2026, 4, 6, 16, 30, tzinfo=timezone.utc),  # 12:30 ET -> intraday
+            underlying="SPY",
+            composite_score=0.2,
+            normalized_score=0.2,
+            direction="bullish",
+            components={},
+        )
+        with patch.dict(
+            PortfolioEngine._INDEPENDENT_PHASE_THRESHOLD_OVERRIDES,
+            {"eod_pressure": {"intraday": 0.44}},
+            clear=False,
+        ):
+            threshold = PortfolioEngine._independent_signal_threshold("eod_pressure", score)
+        # eod_pressure is balanced (1.0 multiplier), so override should flow through directly.
+        assert threshold == pytest.approx(0.44)
+
 
 class TestFreshCrossSizingBoost:
     """A fresh gamma-flip cross in the signaled direction should increase

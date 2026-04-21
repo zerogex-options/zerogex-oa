@@ -26,12 +26,15 @@ from src.config import (
     SIGNALS_DRS_CALL_ENTRY_MIN,
     SIGNALS_DRS_FRESH_CROSS_BOOST,
     SIGNALS_DRS_HARD_GATES_ENABLED,
+    SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_BY_SYMBOL,
     SIGNALS_INDEPENDENT_MIN_THRESHOLD_EOD_PRESSURE,
     SIGNALS_INDEPENDENT_MIN_THRESHOLD_GAMMA_VWAP_CONFLUENCE,
     SIGNALS_INDEPENDENT_MIN_THRESHOLD_SQUEEZE_SETUP,
     SIGNALS_INDEPENDENT_MIN_THRESHOLD_TRAP_DETECTION,
     SIGNALS_INDEPENDENT_MIN_THRESHOLD_VOL_EXPANSION,
     SIGNALS_INDEPENDENT_MIN_THRESHOLD_ZERO_DTE_POSITION_IMBALANCE,
+    SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE_BY_SYMBOL,
+    SIGNALS_INDEPENDENT_PHASE_THRESHOLD_OVERRIDES,
     SIGNALS_INDEPENDENT_RISK_MULT_AGGRESSIVE,
     SIGNALS_INDEPENDENT_RISK_MULT_BALANCED,
     SIGNALS_INDEPENDENT_RISK_MULT_CONSERVATIVE,
@@ -207,6 +210,15 @@ class PortfolioEngine:
     )
     _INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE = (
         SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE
+    )
+    _INDEPENDENT_PHASE_SCALP_MINUTES_BY_SYMBOL = (
+        SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_BY_SYMBOL
+    )
+    _INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE_BY_SYMBOL = (
+        SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE_BY_SYMBOL
+    )
+    _INDEPENDENT_PHASE_THRESHOLD_OVERRIDES = (
+        SIGNALS_INDEPENDENT_PHASE_THRESHOLD_OVERRIDES
     )
 
     @staticmethod
@@ -588,8 +600,21 @@ class PortfolioEngine:
         if minute_et < SESSION_OPEN_MIN_ET or minute_et > SESSION_CLOSE_MIN_ET:
             return "swing"
 
-        scalp_cutoff = SESSION_OPEN_MIN_ET + cls._INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN
-        swing_cutoff = SESSION_CLOSE_MIN_ET - cls._INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE
+        symbol = str(score.underlying or "").strip().upper()
+        scalp_minutes = int(
+            cls._INDEPENDENT_PHASE_SCALP_MINUTES_BY_SYMBOL.get(
+                symbol,
+                cls._INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN,
+            )
+        )
+        swing_minutes = int(
+            cls._INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE_BY_SYMBOL.get(
+                symbol,
+                cls._INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE,
+            )
+        )
+        scalp_cutoff = SESSION_OPEN_MIN_ET + max(15, min(390, scalp_minutes))
+        swing_cutoff = SESSION_CLOSE_MIN_ET - max(15, min(390, swing_minutes))
         if minute_et <= scalp_cutoff:
             return "scalp"
         if minute_et >= swing_cutoff:
@@ -599,19 +624,32 @@ class PortfolioEngine:
     @classmethod
     def _independent_signal_threshold(cls, signal_name: str, score: ScoreSnapshot) -> float:
         """Phase-aware threshold with per-signal risk profile knobs."""
+        signal_key = str(signal_name or "").strip().lower()
         phase = cls._independent_signal_phase(score)
+        signal_phase_override = (
+            cls._INDEPENDENT_PHASE_THRESHOLD_OVERRIDES.get(signal_key, {})
+            if isinstance(cls._INDEPENDENT_PHASE_THRESHOLD_OVERRIDES, dict)
+            else {}
+        )
+        override_phase_base = (
+            float(signal_phase_override[phase])
+            if isinstance(signal_phase_override, dict) and phase in signal_phase_override
+            else None
+        )
         phase_base = float(
-            cls._INDEPENDENT_PHASE_BASE_THRESHOLD.get(
+            override_phase_base
+            if override_phase_base is not None
+            else cls._INDEPENDENT_PHASE_BASE_THRESHOLD.get(
                 phase, SIGNALS_INDEPENDENT_THRESHOLD_INTRADAY
             )
         )
-        profile = cls._INDEPENDENT_SIGNAL_RISK_PROFILE.get(signal_name, "balanced")
+        profile = cls._INDEPENDENT_SIGNAL_RISK_PROFILE.get(signal_key, "balanced")
         risk_mult = float(
             cls._INDEPENDENT_RISK_MULTIPLIER.get(
                 profile, SIGNALS_INDEPENDENT_RISK_MULT_BALANCED
             )
         )
-        min_threshold = float(cls._INDEPENDENT_SIGNAL_MIN_THRESHOLD.get(signal_name, 0.25))
+        min_threshold = float(cls._INDEPENDENT_SIGNAL_MIN_THRESHOLD.get(signal_key, 0.25))
         threshold = phase_base * float(risk_mult)
         return max(min_threshold, min(1.0, threshold))
 
