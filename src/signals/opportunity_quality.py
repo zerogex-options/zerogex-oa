@@ -31,7 +31,10 @@ def infer_opportunity_direction(
     elif sm_ratio < 1.0:
         flow_bias = -min((1.0 - sm_ratio) / 0.75, 1.0)
 
-    gex_bias = 1.0 if float(net_gex) >= 0 else -1.0
+    # GEX sign controls stability/amplification, not direction. Keep this as a
+    # non-directional modifier that scales confidence elsewhere; directional
+    # anchor comes from flow + price structure.
+    gex_stability = 1.0 if float(net_gex) >= 0 else -1.0
     flip_bias = 0.0
     if gamma_flip is not None and close > 0:
         if close > gamma_flip:
@@ -39,7 +42,7 @@ def infer_opportunity_direction(
         elif close < gamma_flip:
             flip_bias = -0.35
 
-    aggregate = (0.55 * flow_bias) + (0.30 * gex_bias) + (0.15 * flip_bias)
+    aggregate = (0.70 * flow_bias) + (0.30 * flip_bias)
     confidence = min(abs(aggregate), 1.0)
     if aggregate >= 0.15:
         direction = "bullish"
@@ -51,7 +54,7 @@ def infer_opportunity_direction(
     diagnostics = {
         "sm_ratio": round(sm_ratio, 6),
         "flow_bias": round(flow_bias, 6),
-        "gex_bias": gex_bias,
+        "gex_stability": gex_stability,
         "flip_bias": round(flip_bias, 6),
         "aggregate": round(aggregate, 6),
     }

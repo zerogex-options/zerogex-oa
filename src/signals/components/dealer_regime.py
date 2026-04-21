@@ -1,5 +1,11 @@
 """Dealer Regime Score (DRS) component.
 
+DRS should not infer direction from GEX sign itself.  Direction comes from
+flow + positioning + structure (vs gamma flip / walls); GEX sign controls
+stability:
+  * net_gex > 0 => stabilizing / mean-reverting
+  * net_gex < 0 => destabilizing / trend-amplifying
+
 Raw score range: [-100, +100]
 Normalized contribution to composite: raw / 100 -> [-1, +1]
 """
@@ -31,7 +37,7 @@ class DealerRegimeComponent(ComponentBase):
 
     def _breakdown(self, ctx: MarketContext) -> dict[str, float]:
         return {
-            "net_gex": self._net_gex_score(ctx.net_gex),
+            "stability_regime": self._stability_regime_score(ctx.net_gex),
             "vs_gamma_flip": self._gamma_flip_score(ctx.close, ctx.gamma_flip),
             "call_wall_pressure": self._call_wall_pressure_score(
                 ctx.close, ctx.extra.get("call_wall")
@@ -39,15 +45,16 @@ class DealerRegimeComponent(ComponentBase):
             "distance_to_max_gamma": self._distance_to_max_gamma_score(
                 ctx.close, ctx.extra.get("max_gamma_strike")
             ),
-            "momentum_confirmation": self._momentum_confirmation_score(ctx),
+            "flow_positioning": self._flow_positioning_score(ctx),
         }
 
     @staticmethod
-    def _net_gex_score(net_gex: float) -> float:
+    def _stability_regime_score(net_gex: float) -> float:
+        # Non-directional contribution: positive = stabilizing, negative = destabilizing.
         if net_gex > 0:
-            return 30.0
+            return 15.0
         if net_gex < 0:
-            return -30.0
+            return -15.0
         return 0.0
 
     @staticmethod
@@ -76,10 +83,25 @@ class DealerRegimeComponent(ComponentBase):
         return 15.0 if close > max_gamma_strike else -15.0
 
     @staticmethod
-    def _momentum_confirmation_score(ctx: MarketContext) -> float:
+    def _flow_positioning_score(ctx: MarketContext) -> float:
+        call_net = float(ctx.smart_call or 0.0)
+        put_net = float(ctx.smart_put or 0.0)
+        participation = abs(call_net) + abs(put_net)
+        flow_bias = 0.0
+        if participation >= 100_000:
+            flow_bias = max(-1.0, min(1.0, (call_net - put_net) / participation))
+
+        pcr = float(ctx.put_call_ratio or 1.0)
+        # pcr < 1 bullish positioning, >1 bearish positioning.
+        positioning_bias = max(-1.0, min(1.0, (1.0 - pcr) / 0.35))
+
+        vwap_bias = 0.0
         if ctx.vwap is not None and ctx.vwap > 0:
-            return 10.0 if ctx.close > ctx.vwap else -10.0
-        closes = ctx.recent_closes
-        if len(closes) >= 5 and closes[-5] > 0:
-            return 10.0 if closes[-1] > closes[-5] else -10.0
-        return 0.0
+            vwap_dist = (ctx.close - ctx.vwap) / ctx.vwap
+            vwap_bias = max(-1.0, min(1.0, vwap_dist / 0.004))
+        elif len(ctx.recent_closes) >= 5 and ctx.recent_closes[-5] > 0:
+            mom = (ctx.recent_closes[-1] - ctx.recent_closes[-5]) / ctx.recent_closes[-5]
+            vwap_bias = max(-1.0, min(1.0, mom / 0.004))
+
+        composite = (0.55 * flow_bias) + (0.25 * positioning_bias) + (0.20 * vwap_bias)
+        return max(-25.0, min(25.0, composite * 25.0))
