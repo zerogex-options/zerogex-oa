@@ -90,7 +90,11 @@ def test_get_latest_signal_score_enriched_includes_intraday_score():
         yield conn
 
     db._acquire_connection = _acquire  # type: ignore[method-assign]
-    db._get_signal_calibration_history = lambda *_args, **_kwargs: []  # type: ignore[method-assign]
+
+    async def _empty_calibration_history(*_args, **_kwargs):
+        return []
+
+    db._get_signal_calibration_history = _empty_calibration_history  # type: ignore[method-assign]
 
     row = asyncio.run(db.get_latest_signal_score_enriched("SPY"))
     assert row is not None
