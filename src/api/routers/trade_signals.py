@@ -63,6 +63,12 @@ def _normalize_signal_score_row(row: dict[str, Any]) -> dict[str, Any]:
     out = dict(row)
     out["composite_score"] = _scale_signed_100(out.get("composite_score"))
     out["normalized_score"] = _scale_signed_100(out.get("normalized_score"))
+    intraday_score = out.get("intraday_score")
+    if isinstance(intraday_score, (int, float)) and not isinstance(intraday_score, bool):
+        if math.isnan(float(intraday_score)) or math.isinf(float(intraday_score)):
+            out["intraday_score"] = 50.0
+        else:
+            out["intraday_score"] = round(max(0.0, min(100.0, float(intraday_score))), 2)
     if "components" in out and isinstance(out["components"], dict):
         components = dict(out["components"])
         aggregation = components.pop("__aggregation__", None)

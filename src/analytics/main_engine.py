@@ -637,12 +637,41 @@ class AnalyticsEngine:
         # Total net GEX
         total_net_gex = sum(strike['net_gex'] for strike in gex_by_strike)
 
+        # Distance from spot to flip (normalized by spot).
+        # Close-to-zero means price is sitting near a regime boundary where
+        # dealer hedging behavior can change abruptly.
+        flip_distance = None
+        distance_to_flip = None
+        if gamma_flip_point is not None and underlying_price > 0:
+            flip_distance = (underlying_price - gamma_flip_point) / underlying_price
+            distance_to_flip = abs(flip_distance)
+
+        # Local gamma density around spot (±1%). This uses absolute exposure so
+        # dense nearby gamma does not cancel out due to opposing signs.
+        local_band = underlying_price * 0.01
+        local_gex = sum(
+            abs(row['net_gex'])
+            for row in gex_by_strike
+            if abs(row['strike'] - underlying_price) <= local_band
+        )
+
+        # Convexity risk proxy:
+        # large GEX imbalance while sitting near the flip implies higher
+        # acceleration risk if the regime boundary breaks.
+        convexity_risk = None
+        if distance_to_flip is not None:
+            convexity_risk = abs(total_net_gex) / max(distance_to_flip, 1e-6)
+
         summary = {
             'underlying': self.db_symbol,
             'timestamp': timestamp,
+            'underlying_price': underlying_price,
             'max_gamma_strike': max_gamma_strike['strike'],
             'max_gamma_value': max_gamma_strike['net_gex'],
             'gamma_flip_point': gamma_flip_point,
+            'flip_distance': flip_distance,
+            'local_gex': local_gex,
+            'convexity_risk': convexity_risk,
             'put_call_ratio': put_call_ratio,
             'max_pain': max_pain,
             'total_call_volume': total_call_volume,
@@ -801,12 +830,22 @@ class AnalyticsEngine:
                         summary['timestamp'],
                     )
 
+            flip_distance = summary.get('flip_distance')
+            convexity_risk = summary.get('convexity_risk')
+            spot_price = float(summary.get('underlying_price') or 0.0)
+            total_net_gex = float(summary.get('total_net_gex') or 0.0)
+            if flip_distance is None and gamma_flip_point is not None and spot_price > 0:
+                flip_distance = (spot_price - gamma_flip_point) / spot_price
+            if convexity_risk is None and flip_distance is not None:
+                convexity_risk = abs(total_net_gex) / max(abs(flip_distance), 1e-6)
+
             cursor.execute("""
                 INSERT INTO gex_summary
                 (underlying, timestamp, max_gamma_strike, max_gamma_value,
                  gamma_flip_point, put_call_ratio, max_pain, total_call_volume,
-                 total_put_volume, total_call_oi, total_put_oi, total_net_gex)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 total_put_volume, total_call_oi, total_put_oi, total_net_gex,
+                 flip_distance, local_gex, convexity_risk)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (underlying, timestamp) DO UPDATE SET
                     max_gamma_strike = EXCLUDED.max_gamma_strike,
                     max_gamma_value = EXCLUDED.max_gamma_value,
@@ -817,7 +856,10 @@ class AnalyticsEngine:
                     total_put_volume = EXCLUDED.total_put_volume,
                     total_call_oi = EXCLUDED.total_call_oi,
                     total_put_oi = EXCLUDED.total_put_oi,
-                    total_net_gex = EXCLUDED.total_net_gex
+                    total_net_gex = EXCLUDED.total_net_gex,
+                    flip_distance = EXCLUDED.flip_distance,
+                    local_gex = EXCLUDED.local_gex,
+                    convexity_risk = EXCLUDED.convexity_risk
                 WHERE
                     EXCLUDED.max_gamma_strike IS DISTINCT FROM gex_summary.max_gamma_strike
                     OR EXCLUDED.max_gamma_value IS DISTINCT FROM gex_summary.max_gamma_value
@@ -829,6 +871,9 @@ class AnalyticsEngine:
                     OR EXCLUDED.total_call_oi IS DISTINCT FROM gex_summary.total_call_oi
                     OR EXCLUDED.total_put_oi IS DISTINCT FROM gex_summary.total_put_oi
                     OR EXCLUDED.total_net_gex IS DISTINCT FROM gex_summary.total_net_gex
+                    OR EXCLUDED.flip_distance IS DISTINCT FROM gex_summary.flip_distance
+                    OR EXCLUDED.local_gex IS DISTINCT FROM gex_summary.local_gex
+                    OR EXCLUDED.convexity_risk IS DISTINCT FROM gex_summary.convexity_risk
             """, (
                 summary['underlying'],
                 summary['timestamp'],
@@ -841,7 +886,10 @@ class AnalyticsEngine:
                 int(summary['total_put_volume']),
                 int(summary['total_call_oi']),
                 int(summary['total_put_oi']),
-                float(summary['total_net_gex'])
+                float(summary['total_net_gex']),
+                float(flip_distance) if flip_distance is not None else None,
+                float(summary.get('local_gex', 0.0)),
+                float(convexity_risk) if convexity_risk is not None else None,
             ))
             if commit:
                 conn.commit()
@@ -1247,6 +1295,17 @@ class AnalyticsEngine:
             logger.info(f"Max Gamma Strike: ${gex_summary['max_gamma_strike']:.2f}")
             logger.info(f"Max Gamma Value: {gex_summary['max_gamma_value']:,.0f}")
             logger.info(f"Gamma Flip Point: ${gex_summary['gamma_flip_point']:.2f}" if gex_summary['gamma_flip_point'] else "Gamma Flip Point: N/A")
+            logger.info(
+                f"Flip Distance: {gex_summary['flip_distance']:.4f}"
+                if gex_summary.get('flip_distance') is not None
+                else "Flip Distance: N/A"
+            )
+            logger.info(f"Local GEX (±1%): {gex_summary.get('local_gex', 0.0):,.0f}")
+            logger.info(
+                f"Convexity Risk: {gex_summary['convexity_risk']:,.0f}"
+                if gex_summary.get('convexity_risk') is not None
+                else "Convexity Risk: N/A"
+            )
             logger.info(f"Max Pain: ${gex_summary['max_pain']:.2f}")
             logger.info(f"Put/Call Ratio: {gex_summary['put_call_ratio']:.2f}")
             logger.info(f"Total Net GEX: {gex_summary['total_net_gex']:,.0f}")

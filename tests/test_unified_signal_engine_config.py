@@ -11,3 +11,8 @@ def test_iv_rank_can_be_enabled_via_env(monkeypatch):
     monkeypatch.setenv("SIGNAL_IV_RANK_ENABLED", "true")
     engine = UnifiedSignalEngine("SPY")
     assert engine._iv_rank_enabled is True
+
+
+def test_unified_engine_includes_intraday_regime_component():
+    engine = UnifiedSignalEngine("SPY")
+    assert any(c.name == "intraday_regime" for c in engine.scoring_engine.components)

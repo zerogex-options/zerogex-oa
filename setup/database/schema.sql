@@ -230,6 +230,9 @@ CREATE TABLE IF NOT EXISTS gex_summary (
     total_call_oi BIGINT DEFAULT 0,
     total_put_oi BIGINT DEFAULT 0,
     total_net_gex DOUBLE PRECISION,
+    flip_distance DOUBLE PRECISION,
+    local_gex DOUBLE PRECISION,
+    convexity_risk DOUBLE PRECISION,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (underlying, timestamp)
 );
@@ -244,6 +247,34 @@ BEGIN
         ALTER TABLE gex_summary
         ADD CONSTRAINT fk_gex_summary_underlying
         FOREIGN KEY (underlying) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+END $$;
+
+-- Idempotent migration: intraday risk fields for enriched GEX summary.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='gex_summary' AND column_name='flip_distance'
+    ) THEN
+        ALTER TABLE gex_summary
+            ADD COLUMN flip_distance DOUBLE PRECISION;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='gex_summary' AND column_name='local_gex'
+    ) THEN
+        ALTER TABLE gex_summary
+            ADD COLUMN local_gex DOUBLE PRECISION;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='gex_summary' AND column_name='convexity_risk'
+    ) THEN
+        ALTER TABLE gex_summary
+            ADD COLUMN convexity_risk DOUBLE PRECISION;
     END IF;
 END $$;
 

@@ -107,13 +107,17 @@ class UnifiedSignalEngine:
                            gs.timestamp AS gs_ts,
                            gs.total_net_gex,
                            gs.gamma_flip_point,
+                           gs.flip_distance,
+                           gs.local_gex,
+                           gs.convexity_risk,
                            gs.put_call_ratio,
                            gs.max_pain,
                            gs.total_call_oi,
                            gs.total_put_oi
                     FROM underlying_quotes uq
                     LEFT JOIN LATERAL (
-                        SELECT timestamp, total_net_gex, gamma_flip_point, put_call_ratio, max_pain,
+                        SELECT timestamp, total_net_gex, gamma_flip_point, flip_distance, local_gex, convexity_risk,
+                               put_call_ratio, max_pain,
                                total_call_oi, total_put_oi
                         FROM gex_summary
                         WHERE underlying = %s AND timestamp <= uq.timestamp
@@ -135,6 +139,9 @@ class UnifiedSignalEngine:
                     gs_ts,
                     net_gex,
                     gamma_flip,
+                    flip_distance,
+                    local_gex,
+                    convexity_risk,
                     pcr,
                     max_pain,
                     total_call_oi,
@@ -671,6 +678,25 @@ class UnifiedSignalEngine:
                         )
 
                 net_gex_f = float(net_gex or 0.0)
+                flip_distance_f = (
+                    float(flip_distance)
+                    if flip_distance is not None
+                    else (
+                        ((close_f - float(gamma_flip)) / close_f)
+                        if (gamma_flip is not None and close_f > 0)
+                        else None
+                    )
+                )
+                local_gex_f = float(local_gex or 0.0)
+                convexity_risk_f = (
+                    float(convexity_risk)
+                    if convexity_risk is not None
+                    else (
+                        abs(net_gex_f) / max(abs(flip_distance_f), 1e-6)
+                        if flip_distance_f is not None
+                        else None
+                    )
+                )
                 if prev_net_gex is not None:
                     net_gex_delta_raw = net_gex_f - prev_net_gex
                     # Normalize by prior magnitude (C1 note): a delta of
@@ -690,6 +716,9 @@ class UnifiedSignalEngine:
                     "net_gex": net_gex_f,
                     "prev_net_gex": prev_net_gex,
                     "gamma_flip": float(gamma_flip) if gamma_flip is not None else None,
+                    "flip_distance": flip_distance_f,
+                    "local_gex": local_gex_f,
+                    "convexity_risk": convexity_risk_f,
                     "put_call_ratio": effective_pcr,
                     "put_call_ratio_source": "oi" if oi_pcr is not None and oi_pcr > 0 else "volume",
                     "put_call_ratio_volume": float(pcr or 1.0),
@@ -749,6 +778,9 @@ class UnifiedSignalEngine:
                 "put_call_ratio_source": ctx.get("put_call_ratio_source"),
                 "put_call_ratio_volume": ctx.get("put_call_ratio_volume"),
                 "put_call_ratio_oi": ctx.get("put_call_ratio_oi"),
+                "flip_distance": ctx.get("flip_distance"),
+                "local_gex": ctx.get("local_gex"),
+                "convexity_risk": ctx.get("convexity_risk"),
                 "call_flow_delta": ctx.get("call_flow_delta"),
                 "put_flow_delta": ctx.get("put_flow_delta"),
                 "net_gex_delta": ctx.get("net_gex_delta"),

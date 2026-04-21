@@ -16,6 +16,9 @@ class GEXSummary(BaseModel):
     total_put_gex: Decimal
     net_gex: Decimal
     gamma_flip: Optional[Decimal] = None
+    flip_distance: Optional[Decimal] = None
+    local_gex: Optional[Decimal] = None
+    convexity_risk: Optional[Decimal] = None
     max_pain: Optional[Decimal] = None
     call_wall: Optional[Decimal] = None
     put_wall: Optional[Decimal] = None

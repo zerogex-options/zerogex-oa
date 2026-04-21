@@ -1263,6 +1263,9 @@ class DatabaseManager:
                     gs.timestamp,
                     gs.underlying,
                     gs.gamma_flip_point,
+                    gs.flip_distance,
+                    gs.local_gex,
+                    gs.convexity_risk,
                     gs.max_pain,
                     gs.total_call_oi,
                     gs.total_put_oi,
@@ -1319,6 +1322,9 @@ class DatabaseManager:
                 st.total_put_gex,
                 ls.total_net_gex AS net_gex,
                 ls.gamma_flip_point AS gamma_flip,
+                ls.flip_distance,
+                ls.local_gex,
+                ls.convexity_risk,
                 ls.max_pain,
                 cw.call_wall,
                 pw.put_wall,
@@ -4228,9 +4234,24 @@ class DatabaseManager:
             async with self._acquire_connection() as conn:
                 row = await conn.fetchrow(
                     """
-                    SELECT underlying, timestamp, composite_score, normalized_score, direction, components
-                    FROM signal_scores
-                    WHERE underlying = $1
+                    SELECT
+                        ss.underlying,
+                        ss.timestamp,
+                        ss.composite_score,
+                        ss.normalized_score,
+                        ss.direction,
+                        ss.components,
+                        (ir.context_values->>'market_state_index')::double precision AS intraday_score
+                    FROM signal_scores ss
+                    LEFT JOIN LATERAL (
+                        SELECT context_values
+                        FROM signal_component_scores
+                        WHERE underlying = ss.underlying
+                          AND timestamp = ss.timestamp
+                          AND component_name = 'intraday_regime'
+                        LIMIT 1
+                    ) ir ON TRUE
+                    WHERE ss.underlying = $1
                     ORDER BY timestamp DESC
                     LIMIT 1
                     """,
@@ -4264,10 +4285,25 @@ class DatabaseManager:
         self, symbol: str = "SPY", limit: int = SIGNAL_HISTORY_LIMIT
     ) -> list[Dict[str, Any]]:
         query = """
-            SELECT underlying, timestamp, composite_score, normalized_score, direction, components
-            FROM signal_scores
-            WHERE underlying = $1
-            ORDER BY timestamp DESC
+            SELECT
+                ss.underlying,
+                ss.timestamp,
+                ss.composite_score,
+                ss.normalized_score,
+                ss.direction,
+                ss.components,
+                (ir.context_values->>'market_state_index')::double precision AS intraday_score
+            FROM signal_scores ss
+            LEFT JOIN LATERAL (
+                SELECT context_values
+                FROM signal_component_scores
+                WHERE underlying = ss.underlying
+                  AND timestamp = ss.timestamp
+                  AND component_name = 'intraday_regime'
+                LIMIT 1
+            ) ir ON TRUE
+            WHERE ss.underlying = $1
+            ORDER BY ss.timestamp DESC
             LIMIT $2
         """
         try:

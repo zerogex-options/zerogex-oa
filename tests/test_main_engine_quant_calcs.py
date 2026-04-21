@@ -114,3 +114,41 @@ def test_store_gex_summary_keeps_current_gamma_flip_when_present():
     # No carry-forward SELECT when current gamma flip exists.
     insert_args = cursor.execute.call_args_list[-1][0][1]
     assert insert_args[4] == 499.75
+
+
+def test_gex_summary_includes_flip_distance_local_gex_and_convexity():
+    engine = AnalyticsEngine(underlying="SPY")
+    ts = datetime(2026, 4, 21, 14, 30, tzinfo=timezone.utc)
+    spot = 500.0
+    options = [
+        {
+            "strike": 500.0,
+            "expiration": ts.date(),
+            "option_type": "C",
+            "gamma": 0.02,
+            "open_interest": 10,
+            "volume": 1,
+            "implied_volatility": 0.2,
+        }
+    ]
+    gex_by_strike = [
+        {"strike": 495.0, "net_gex": -2_000_000.0},
+        {"strike": 500.0, "net_gex": 3_000_000.0},
+        {"strike": 505.0, "net_gex": 1_000_000.0},
+    ]
+
+    summary = engine._calculate_gex_summary(
+        gex_by_strike=gex_by_strike,
+        options=options,
+        underlying_price=spot,
+        timestamp=ts,
+    )
+
+    # Crossing between 495 (-2M) and 500 (+3M):
+    # flip = 495 + 5*(2/5) = 497.
+    assert summary["gamma_flip_point"] == 497.0
+    assert summary["flip_distance"] == (spot - 497.0) / spot
+    # ±1% band around spot includes strikes [495, 505].
+    assert summary["local_gex"] == abs(-2_000_000.0) + abs(3_000_000.0) + abs(1_000_000.0)
+    expected_convexity = abs(summary["total_net_gex"]) / abs(summary["flip_distance"])
+    assert summary["convexity_risk"] == expected_convexity
