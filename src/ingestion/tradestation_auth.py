@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta
 from threading import Lock
+from typing import Optional
 import fcntl
 from src.utils import get_logger
 
@@ -53,11 +54,13 @@ class TradeStationAuth:
         self.token_expiry = None
         self._token_lock = Lock()
         self._last_refresh_epoch: float = 0.0
+        # Monotonic counter bumped on every successful refresh.  Callers can
+        # pass their observed token (or its generation) to force_refresh so we
+        # can detect whether the token was already rotated by another thread
+        # while they were making a failing request.
+        self._token_generation: int = 0
         self.refresh_buffer_seconds = int(
             os.getenv("TS_REFRESH_BUFFER_SECONDS", "30")
-        )
-        self.min_force_refresh_interval_seconds = int(
-            os.getenv("TS_MIN_FORCE_REFRESH_INTERVAL_SECONDS", "60")
         )
         token_cache_name = "tradestation_token_cache_sandbox.json" if sandbox else "tradestation_token_cache.json"
         lock_cache_name = "tradestation_token_cache_sandbox.lock" if sandbox else "tradestation_token_cache.lock"
@@ -148,19 +151,25 @@ class TradeStationAuth:
 
             return self._refresh_access_token()
 
-    def force_refresh_access_token(self) -> str:
-        """Force-refresh access token (used when API returns 401)."""
+    def force_refresh_access_token(self, failed_token: Optional[str] = None) -> str:
+        """Force-refresh access token (used when API returns 401).
+
+        If ``failed_token`` is supplied and the cached token has already been
+        rotated since that value was issued (another thread refreshed while we
+        were making the failing request), we return the fresh cached token
+        without making an extra token request.  Otherwise we always refresh so
+        a single caller never gets the same stale token back.
+        """
         with self._token_lock:
-            now_epoch = time.time()
             if (
-                self.access_token
+                failed_token is not None
+                and self.access_token
+                and self.access_token != failed_token
                 and self.token_expiry
                 and (self.token_expiry - datetime.now()).total_seconds() > self.refresh_buffer_seconds
-                and (now_epoch - self._last_refresh_epoch) < self.min_force_refresh_interval_seconds
             ):
-                logger.warning(
-                    "Skipping force-refresh: last refresh %.1fs ago and token still valid",
-                    now_epoch - self._last_refresh_epoch,
+                logger.info(
+                    "Skipping force-refresh: cached token already rotated since 401"
                 )
                 return self.access_token
             logger.warning("Forcing TradeStation access token refresh after auth failure")
@@ -245,6 +254,7 @@ class TradeStationAuth:
                 expires_in = data.get('expires_in', 1200)
                 self.token_expiry = datetime.now() + timedelta(seconds=expires_in)
                 self._last_refresh_epoch = time.time()
+                self._token_generation += 1
                 self._persist_cached_token_to_disk(expires_in)
                 logger.info(f"✅ Access token refreshed successfully (expires in {expires_in}s)")
                 logger.debug(f"Token expiry set to: {self.token_expiry}")

@@ -179,16 +179,18 @@ class IngestionEngine:
 
     def _signal_handler(self, signum, frame):
         """
-        Handle shutdown signals gracefully
+        Handle shutdown signals gracefully.
 
-        Args:
-            signum: Signal number
-            frame: Current stack frame
+        Signal handlers run on the main thread between bytecodes, so we must
+        not touch the ingestion buffers or DB pool here — the main loop may be
+        mid-append/mid-iterate, which would corrupt state or raise
+        ``RuntimeError: dictionary changed size during iteration``.
+
+        Just flip ``running`` so the main loop exits cleanly; its ``finally``
+        block handles the flush and pool close.
         """
         logger.info(f"\n⚠️  Received signal {signum}, shutting down gracefully...")
         self.running = False
-        self._flush_all_buffers()
-        close_connection_pool()
 
     def _initialize_database(self):
         """Initialize database tables if needed"""
@@ -859,15 +861,30 @@ class IngestionEngine:
             for row in rows:
                 self._invalidate_option_volume_baseline(row["option_symbol"])
 
-            # Include affected symbols and time range for debugging.
-            symbols = sorted({r["option_symbol"] for r in rows[:5]})
-            ts_range = [r.get("timestamp") for r in (rows[0:1] + rows[-1:])]
+            # Include affected-symbol counts, unique underlyings, and the full
+            # timestamp range. Without this, root cause analysis is impossible
+            # when a single bad row triggers a whole batch rollback — a
+            # 5-symbol sample buries the outlier that caused the failure.
+            unique_symbols = {r["option_symbol"] for r in rows}
+            unique_underlyings = sorted({r.get("underlying") for r in rows if r.get("underlying")})
+            timestamps = [r.get("timestamp") for r in rows if r.get("timestamp") is not None]
+            ts_min = min(timestamps) if timestamps else None
+            ts_max = max(timestamps) if timestamps else None
             logger.error(
-                f"[CIRCUIT-BREAKER] DB write failed ({len(rows)} rows, "
-                f"attempt #{self._db_consecutive_failures}, "
-                f"backoff {backoff}s): {e}\n"
-                f"  affected symbols (sample): {symbols}\n"
-                f"  timestamp range: {ts_range}",
+                "[CIRCUIT-BREAKER] DB write failed (%d rows, %d unique symbols, "
+                "underlyings=%s, attempt #%d, backoff %ds): %s\n"
+                "  first_symbol=%s last_symbol=%s\n"
+                "  timestamp range: %s .. %s",
+                len(rows),
+                len(unique_symbols),
+                unique_underlyings,
+                self._db_consecutive_failures,
+                backoff,
+                e,
+                rows[0].get("option_symbol") if rows else None,
+                rows[-1].get("option_symbol") if rows else None,
+                ts_min,
+                ts_max,
                 exc_info=True,
             )
 

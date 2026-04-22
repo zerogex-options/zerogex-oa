@@ -6,6 +6,7 @@ import os
 import psycopg2
 from psycopg2 import pool
 from psycopg2 import extensions
+import threading
 import time
 from typing import Optional
 from contextlib import contextmanager
@@ -16,6 +17,7 @@ logger = get_logger(__name__)
 
 # Connection pool
 _connection_pool: Optional[pool.SimpleConnectionPool] = None
+_pool_init_lock = threading.Lock()
 
 
 def get_db_connection():
@@ -30,9 +32,13 @@ def get_db_connection():
     """
     global _connection_pool
 
-    # Initialize pool if not already done
+    # Initialize pool if not already done. Double-checked locking so the
+    # common hot-path stays allocation-free after startup; the lock only
+    # guards first-time pool creation across threads.
     if _connection_pool is None:
-        _initialize_connection_pool()
+        with _pool_init_lock:
+            if _connection_pool is None:
+                _initialize_connection_pool()
 
     try:
         conn = _connection_pool.getconn()

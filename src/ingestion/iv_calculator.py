@@ -9,6 +9,8 @@ Dependencies:
     - scipy (for stats.norm)
 """
 
+import math
+
 import numpy as np
 from scipy import stats
 from datetime import datetime, date
@@ -213,6 +215,9 @@ class IVCalculator:
 
             # Calculate price difference
             price_diff = bs_price - option_price
+            if not math.isfinite(price_diff):
+                logger.debug("Non-finite price_diff; aborting IV solve")
+                return None
 
             # Check convergence
             if abs(price_diff) < self.tolerance:
@@ -222,12 +227,27 @@ class IVCalculator:
             # Calculate vega (derivative)
             vega = self._vega(underlying_price, strike, T, risk_free_rate, sigma)
 
-            if abs(vega) < 1e-10:
-                logger.debug(f"Vega too small, cannot continue iteration")
+            if not math.isfinite(vega) or abs(vega) < 1e-10:
+                logger.debug("Vega too small or non-finite, cannot continue iteration")
                 return None
 
-            # Newton-Raphson update
-            sigma = sigma - price_diff / vega
+            # Newton-Raphson update, clamping the step so a tiny vega can't
+            # produce a pathological jump (which would then break the
+            # max/min bounds below when the result is NaN or +/-inf).
+            step = price_diff / vega
+            if not math.isfinite(step):
+                logger.debug("Non-finite Newton step; aborting IV solve")
+                return None
+            max_step = max(self.max_iv - self.min_iv, 1.0)
+            if step > max_step:
+                step = max_step
+            elif step < -max_step:
+                step = -max_step
+            sigma = sigma - step
+
+            if not math.isfinite(sigma):
+                logger.debug("Sigma became non-finite during iteration; aborting")
+                return None
 
             # Constrain to valid range
             sigma = max(self.min_iv, min(sigma, self.max_iv))

@@ -188,7 +188,8 @@ class TradeStationClient:
             if response.status_code == 401:
                 if retry_count < API_RETRY_ATTEMPTS - 1:
                     logger.warning("TradeStation returned 401; forcing token refresh and retrying")
-                    self.auth.force_refresh_access_token()
+                    failed_token = headers.get("Authorization", "").removeprefix("Bearer ")
+                    self.auth.force_refresh_access_token(failed_token=failed_token)
                     return self._request(method, endpoint, params, data, retry_count + 1)
                 logger.error("TradeStation returned 401 after retries")
                 response.raise_for_status()
@@ -355,7 +356,8 @@ class TradeStationClient:
 
             if response.status_code == 401:
                 response.close()
-                self.auth.force_refresh_access_token()
+                failed_token = headers.get("Authorization", "").removeprefix("Bearer ")
+                self.auth.force_refresh_access_token(failed_token=failed_token)
                 headers = self.auth.get_headers()
                 self._record_api_https_session_open()
                 response = requests.get(
