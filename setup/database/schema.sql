@@ -1083,6 +1083,16 @@ BEGIN
         ALTER TABLE signal_scores ALTER COLUMN direction TYPE VARCHAR(25);
     END IF;
 
+    -- Remap any rows written with the old bullish/bearish/neutral labels.
+    UPDATE signal_scores
+    SET direction = CASE direction
+        WHEN 'bullish'  THEN 'trend_expansion'
+        WHEN 'bearish'  THEN 'high_risk_reversal'
+        WHEN 'neutral'  THEN 'chop_range'
+        ELSE 'chop_range'
+    END
+    WHERE direction NOT IN ('trend_expansion', 'controlled_trend', 'chop_range', 'high_risk_reversal');
+
     -- Add updated constraint.
     IF NOT EXISTS (
         SELECT 1
