@@ -1270,12 +1270,12 @@ CREATE TABLE IF NOT EXISTS portfolio_snapshots (
     timestamp           TIMESTAMPTZ   NOT NULL,
     composite_score     DOUBLE PRECISION NOT NULL,
     normalized_score    DOUBLE PRECISION NOT NULL,
-    direction           VARCHAR(10)   NOT NULL,
+    direction           VARCHAR(25)   NOT NULL,
     target_contracts    INTEGER       NOT NULL DEFAULT 0,
-    target_direction    VARCHAR(10)   NOT NULL DEFAULT 'neutral',
+    target_direction    VARCHAR(25)   NOT NULL DEFAULT 'neutral',
     target_strategy     VARCHAR(40),
     actual_contracts    INTEGER       NOT NULL DEFAULT 0,
-    actual_direction    VARCHAR(10)   NOT NULL DEFAULT 'neutral',
+    actual_direction    VARCHAR(25)   NOT NULL DEFAULT 'neutral',
     heat_pct            DOUBLE PRECISION NOT NULL DEFAULT 0.0,
     action_taken        VARCHAR(40),   -- 'opened', 'closed', 'resized', 'held', 'cash'
     action_detail       JSONB         NOT NULL DEFAULT '{}'::jsonb,
@@ -1285,6 +1285,26 @@ CREATE TABLE IF NOT EXISTS portfolio_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_underlying_ts
     ON portfolio_snapshots(underlying, timestamp DESC);
+
+-- Migration: widen direction columns to hold MSI regime labels (up to 18 chars).
+DO $$
+DECLARE
+    col TEXT;
+BEGIN
+    FOREACH col IN ARRAY ARRAY['direction', 'target_direction', 'actual_direction'] LOOP
+        IF EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'portfolio_snapshots'
+              AND column_name = col
+              AND character_maximum_length IS NOT NULL
+              AND character_maximum_length < 25
+        ) THEN
+            EXECUTE format('ALTER TABLE portfolio_snapshots ALTER COLUMN %I TYPE VARCHAR(25)', col);
+        END IF;
+    END LOOP;
+END $$;
 
 -- ---------------------------------------------------------------------------
 -- signal_calibration
