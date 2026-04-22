@@ -327,7 +327,7 @@ def get_market_session(dt: Optional[datetime] = None) -> str:
 
 
 def is_engine_run_window(dt: Optional[datetime] = None) -> bool:
-    """Engines run only 04:00-20:00 ET on weekdays excluding NYSE_HOLIDAYS."""
+    """Engines run 24x5: all hours on weekdays excluding NYSE_HOLIDAYS."""
     if dt is None:
         dt = datetime.now(ET)
     elif dt.tzinfo is None:
@@ -335,17 +335,11 @@ def is_engine_run_window(dt: Optional[datetime] = None) -> bool:
     else:
         dt = dt.astimezone(ET)
 
-    if dt.weekday() > 4 or dt.date() in NYSE_HOLIDAYS:
-        return False
-
-    current_time = dt.time()
-    window_open = datetime.strptime("04:00:00", "%H:%M:%S").time()
-    window_close = datetime.strptime("20:00:00", "%H:%M:%S").time()
-    return window_open <= current_time < window_close
+    return dt.weekday() <= 4 and dt.date() not in NYSE_HOLIDAYS
 
 
 def seconds_until_engine_run_window(dt: Optional[datetime] = None) -> int:
-    """Seconds until next 04:00 ET run window on a non-holiday weekday."""
+    """Seconds until midnight ET of the next non-holiday weekday (24x5 schedule)."""
     if dt is None:
         dt = datetime.now(ET)
     elif dt.tzinfo is None:
@@ -356,11 +350,7 @@ def seconds_until_engine_run_window(dt: Optional[datetime] = None) -> int:
     if is_engine_run_window(dt):
         return 0
 
-    same_day_open = dt.replace(hour=4, minute=0, second=0, microsecond=0)
-    if dt.weekday() <= 4 and dt.date() not in NYSE_HOLIDAYS and dt < same_day_open:
-        return max(int((same_day_open - dt).total_seconds()), 1)
-
-    next_open = (dt + timedelta(days=1)).replace(hour=4, minute=0, second=0, microsecond=0)
+    next_open = (dt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     while next_open.weekday() > 4 or next_open.date() in NYSE_HOLIDAYS:
         next_open += timedelta(days=1)
     return max(int((next_open - dt).total_seconds()), 1)

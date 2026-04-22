@@ -1342,7 +1342,7 @@ class AnalyticsEngine:
                 if not is_engine_run_window():
                     sleep_for = seconds_until_engine_run_window()
                     logger.info(
-                        "AnalyticsEngine [%s] paused outside run window (04:00-20:00 ET weekdays, non-holidays); sleeping %ss",
+                        "AnalyticsEngine [%s] paused outside run window (24x5: weekdays, non-holidays); sleeping %ss",
                         self.underlying,
                         sleep_for,
                     )
