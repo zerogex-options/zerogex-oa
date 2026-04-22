@@ -2636,8 +2636,8 @@ class DatabaseManager:
     ) -> Optional[Dict[str, Any]]:
         """Return the most recent vol_expansion component score for this symbol.
 
-        Reads from signal_component_scores (populated by VolExpansionComponent
-        via ScoringEngine) and returns the raw score scaled to [0, 100].
+        Reads from signal_component_scores (populated by VolExpansionSignal
+        via AdvancedSignalEngine) and returns the raw score scaled to [0, 100].
         """
         query = """
             SELECT
@@ -2687,9 +2687,9 @@ class DatabaseManager:
     ) -> Optional[Dict[str, Any]]:
         """Return the most recent eod_pressure component score for this symbol.
 
-        Reads from signal_component_scores (populated by EODPressureComponent
-        via ScoringEngine). The component is gated off before 14:30 ET, so a
-        score of 0.0 with context_values.time_ramp == 0 means "outside
+        Reads from signal_component_scores (populated by EODPressureSignal
+        via AdvancedSignalEngine). The signal is gated off before 14:30 ET, so
+        a score of 0.0 with context_values.time_ramp == 0 means "outside
         window" rather than "no data".
         """
         query = """
@@ -2937,13 +2937,6 @@ class DatabaseManager:
             logger.error(f"get_latest_advanced_signals_bundle failed ({symbol}): {e}")
             return out
 
-    # Backward compatibility while callers migrate naming.
-    async def get_latest_independent_signals_bundle(
-        self,
-        symbol: str = "SPY",
-    ) -> Dict[str, Optional[Dict[str, Any]]]:
-        return await self.get_latest_advanced_signals_bundle(symbol=symbol)
-
     async def get_signal_component_events(
         self,
         symbol: str = "SPY",
@@ -3061,25 +3054,15 @@ class DatabaseManager:
         lookback: int = 240,
         neutral_epsilon: float = 0.02,
     ) -> Dict[str, Any]:
-        """Return component-by-component agreement/disagreement over lookback."""
+        """Return signal-by-signal agreement/disagreement over lookback (advanced signals only)."""
         if component_names is None:
             component_names = [
-                "gex_regime",
-                "gamma_flip",
-                "dealer_regime",
-                "put_call_ratio",
-                "smart_money",
-                "positioning_trap",
                 "vol_expansion",
-                "exhaustion",
-                "opportunity_quality",
-                "gex_gradient",
-                "dealer_delta_pressure",
-                "vanna_charm_flow",
-                "tape_flow_bias",
-                "skew_delta",
-                "intraday_regime",
                 "eod_pressure",
+                "squeeze_setup",
+                "trap_detection",
+                "zero_dte_position_imbalance",
+                "gamma_vwap_confluence",
             ]
         if not component_names:
             return {"component_order": [], "matrix": {}, "rows_analyzed": 0}

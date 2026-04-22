@@ -791,14 +791,15 @@ async def get_confluence_matrix(
     lookback: int = Query(default=120, ge=10, le=2000),
     db: DatabaseManager = Depends(get_db),
 ):
-    """16×16 component agreement matrix — pairwise directional confluence over a rolling window.
+    """6×6 advanced-signal agreement matrix — pairwise directional confluence over a rolling window.
 
-    Shows how often each pair of components points the same direction over the
+    Shows how often each pair of Advanced Signals points the same direction over the
     last N snapshots. Useful for spotting persistent divergences and unusual
     breakdowns in normally-correlated signals.
 
-    **Logic** (`src/api/database.py:3057`): Joins `signal_scores` and
-    `signal_component_scores` for the last `lookback` timestamps. Signs are
+    **Logic** (`src/api/database.py`): Joins `signal_scores` and
+    `signal_component_scores` for the last `lookback` timestamps, filtering to
+    the six Advanced Signals persisted by `AdvancedSignalEngine`. Signs are
     bucketed with `neutral_epsilon = 0.02` (±0.02 counts as neutral).
     Agreement = same non-zero sign; disagreement = opposite non-zero signs.
 
@@ -806,21 +807,19 @@ async def get_confluence_matrix(
     - `symbol` (default `SPY`).
     - `lookback` — 10–2000, default 120.
 
-    **Components (16, fixed order):** `gex_regime`, `gamma_flip`, `dealer_regime`,
-    `put_call_ratio`, `smart_money`, `positioning_trap`, `vol_expansion`,
-    `exhaustion`, `opportunity_quality`, `gex_gradient`, `dealer_delta_pressure`,
-    `vanna_charm_flow`, `tape_flow_bias`, `skew_delta`, `intraday_regime`, `eod_pressure`.
+    **Signals (6, fixed order):** `vol_expansion`, `eod_pressure`, `squeeze_setup`,
+    `trap_detection`, `zero_dte_position_imbalance`, `gamma_vwap_confluence`.
 
     **Returns:**
     ```json
     {
       "underlying": "SPY",
       "lookback": 120,
-      "components": ["gex_regime", "gamma_flip", "...14 more..."],
-      "row_order": ["gex_regime", "gamma_flip", "...14 more..."],
+      "components": ["vol_expansion", "eod_pressure", "...4 more..."],
+      "row_order": ["vol_expansion", "eod_pressure", "...4 more..."],
       "matrix": {
-        "gex_regime": {
-          "gamma_flip": {
+        "vol_expansion": {
+          "eod_pressure": {
             "observations": 118,
             "active_observations": 92,
             "agreement_count": 74,
@@ -841,17 +840,13 @@ async def get_confluence_matrix(
     - `disagreement_ratio` — disagree / active_observations; `null` when active == 0.
     - `net_confluence` — (agree − disagree) / active_observations; [-1, +1].
 
-    **Note:** The database layer also computes a `component_vs_regime` dict (agreement
-    of each component vs the composite MSI sign). It is not currently surfaced by the
-    router; extend `src/api/routers/trade_signals.py:322` to pass it through if needed.
-
     **Trader interpretation:**
-    - `net_confluence > 0.5` — components that routinely agree; unexpected divergence is a flag.
+    - `net_confluence > 0.5` — signals that routinely agree; unexpected divergence is a flag.
     - `net_confluence < -0.3` — persistent disagreement pairs; useful early-warning divergences.
 
-    **Page design.** 16×16 heatmap. Color = `net_confluence` (green +1 → red -1, white neutral).
+    **Page design.** 6×6 heatmap. Color = `net_confluence` (green +1 → red -1, white neutral).
     Cell tooltip: agreement_ratio / disagreement_ratio / observations. Sort rows by average
-    agreement to surface consensus components at top, outliers at bottom.
+    agreement to surface consensus signals at top, outliers at bottom.
     """
     matrix = await db.get_signal_confluence_matrix(symbol.upper(), lookback=lookback)
 
