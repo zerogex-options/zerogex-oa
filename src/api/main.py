@@ -94,7 +94,14 @@ app = FastAPI(
         {"name": "Market Data", "description": "Underlying and option quote data"},
         {"name": "Max Pain", "description": "Max pain analysis"},
         {"name": "Technicals", "description": "Intraday technical signals: VWAP, ORB, dealer hedging, volume, momentum"},
-        {"name": "Trade Signals", "description": "Composite trade signal generation"},
+        {"name": "Trade Signals", "description": (
+            "Options-structure signal engine: composite Market State Index (MSI) gauge, "
+            "six advanced signal components (vol-expansion, eod-pressure, squeeze-setup, "
+            "trap-detection, 0dte-position-imbalance, gamma-vwap-confluence), "
+            "per-component event history with realized returns, "
+            "a 16×16 pairwise confluence matrix, and live/historical trade records. "
+            "Default symbol is SPY; pass ?symbol= or ?underlying= to override."
+        )},
     ]
 )
 
