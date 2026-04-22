@@ -1070,13 +1070,15 @@ BEGIN
         ALTER TABLE signal_scores DROP CONSTRAINT signal_scores_direction_check;
     END IF;
 
-    -- Widen the column if it is still VARCHAR(10).
+    -- Widen to VARCHAR(25) if currently narrower (covers any partially-migrated state).
     IF EXISTS (
         SELECT 1
         FROM information_schema.columns
-        WHERE table_name = 'signal_scores'
+        WHERE table_schema = 'public'
+          AND table_name = 'signal_scores'
           AND column_name = 'direction'
-          AND character_maximum_length <= 10
+          AND character_maximum_length IS NOT NULL
+          AND character_maximum_length < 25
     ) THEN
         ALTER TABLE signal_scores ALTER COLUMN direction TYPE VARCHAR(25);
     END IF;

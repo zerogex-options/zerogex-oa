@@ -1979,7 +1979,7 @@ symbol-add: ## Upsert into symbols table (required: SYMBOL; optional: NAME, ASSE
 schema-apply: ## Apply/update database schema (idempotent)
 	@echo "$(BLUE)=== Applying Database Schema ===$(NC)"
 	@echo "$(YELLOW)Running schema.sql on $(DB_HOST)...$(NC)"
-	@PGPASSFILE=~/.pgpass psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) -d $(DB_NAME) -f setup/database/schema.sql
+	@PGPASSFILE=~/.pgpass psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) -d $(DB_NAME) -v ON_ERROR_STOP=1 -f setup/database/schema.sql
 	@echo ""
 	@echo "$(GREEN)✅ Schema applied successfully$(NC)"
 	@echo ""
