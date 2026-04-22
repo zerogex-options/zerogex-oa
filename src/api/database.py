@@ -61,6 +61,43 @@ def _get_session_bounds(session: str = 'current') -> tuple:
     return start, end
 
 
+def _get_flow_session_bounds(session: str = 'current') -> tuple:
+    """Return (start_ts, end_ts) for flow endpoints, which run 07:15–16:15 ET.
+
+    'current': today 07:15–now if session is open, else most recent session 07:15–16:15 ET.
+    'prior':   the full session immediately before the current one.
+    """
+    now_et = datetime.now(_ET)
+    today = now_et.date()
+    session_open_time = time(7, 15)
+    session_close_time = time(16, 15)
+
+    def prev_trading_day(d):
+        d -= timedelta(days=1)
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        return d
+
+    def make_ts(d, t):
+        return datetime(d.year, d.month, d.day, t.hour, t.minute, tzinfo=_ET)
+
+    is_weekday = today.weekday() < 5
+    past_open = now_et.time() >= session_open_time
+    current_session_date = today if (is_weekday and past_open) else prev_trading_day(today)
+
+    session_is_open = (current_session_date == today and now_et.time() < session_close_time)
+
+    if session == 'current':
+        start = make_ts(current_session_date, session_open_time)
+        end = now_et if session_is_open else make_ts(current_session_date, session_close_time)
+    else:  # 'prior'
+        prior_date = prev_trading_day(current_session_date)
+        start = make_ts(prior_date, session_open_time)
+        end = make_ts(prior_date, session_close_time)
+
+    return start, end
+
+
 def _normalize_timeframe(timeframe: str) -> str:
     normalized = (timeframe or '1min').lower()
     if normalized == '1hour':
@@ -1551,7 +1588,7 @@ class DatabaseManager:
         if cached is not None:
             return cached
 
-        session_start, session_end = _get_session_bounds(session)
+        session_start, session_end = _get_flow_session_bounds(session)
         query = """
             WITH minutes AS (
                 SELECT generate_series(
@@ -1705,7 +1742,7 @@ class DatabaseManager:
         if cached is not None:
             return cached
 
-        session_start, session_end = _get_session_bounds(session)
+        session_start, session_end = _get_flow_session_bounds(session)
         query = """
             WITH buckets AS (
                 SELECT generate_series(
@@ -1867,7 +1904,7 @@ class DatabaseManager:
         if cached is not None:
             return cached
 
-        session_start, session_end = _get_session_bounds(session)
+        session_start, session_end = _get_flow_session_bounds(session)
         query = """
             WITH buckets AS (
                 SELECT generate_series(

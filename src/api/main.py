@@ -255,7 +255,7 @@ async def get_flow_by_type(
     session: str = Query(default="current", pattern="^(current|prior)$")
 ):
     """Get option flow by type (calls vs puts) — 1-min intervals.
-    session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
+    Session runs 07:15–16:15 ET. session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
     try:
         data = await db_manager.get_flow_by_type(symbol, session)
         return [FlowByTypePoint(**row) for row in data]
@@ -271,7 +271,7 @@ async def get_flow_by_strike(
     session: str = Query(default="current", pattern="^(current|prior)$"),
 ):
     """Get option flow by strike level — 5-min buckets.
-    session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
+    Session runs 07:15–16:15 ET. session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
     try:
         data = await db_manager.get_flow_by_strike(symbol, session)
         return [FlowByStrikePoint(**row) for row in data]
@@ -288,7 +288,7 @@ async def get_flow_by_expiration(
     session: str = Query(default="current", pattern="^(current|prior)$"),
 ):
     """Get option flow by expiration date — 5-min buckets.
-    session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
+    Session runs 07:15–16:15 ET. session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
     try:
         data = await db_manager.get_flow_by_expiration(symbol, session)
         return [FlowByExpirationPoint(**row) for row in data]
