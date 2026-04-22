@@ -662,9 +662,9 @@ class StreamManager:
     ):
         """Initialize stream manager"""
         self.client = client
-        self.underlying = underlying.upper()           # TradeStation API symbol for underlying (e.g. "$SPX.X")
+        self.underlying = underlying.upper()           # TradeStation API symbol for underlying (e.g. "$SPXW.X")
         self.db_underlying = (db_underlying or underlying).upper()  # canonical alias for DB (e.g. "SPX")
-        self.option_root = resolve_option_root(self.underlying)  # option root for expirations/chains (e.g. "SPXW")
+        self.option_root = resolve_option_root(self.underlying)  # option root for quotes (e.g. "SPXW")
         self.num_expirations = num_expirations
         self.num_strikes = num_strikes  # number of strikes to track on each side of current price
 
@@ -868,10 +868,14 @@ class StreamManager:
     def _get_target_expirations(self) -> List[date]:
         """Get target expiration dates.
 
-        Always queries get_option_expirations(self.underlying) — e.g. "$SPX.X" — since
+        Always queries get_option_expirations(self.underlying) — e.g. "$SPXW.X" — since
         that is the symbol TradeStation uses for expiration/strike structure lookups.
         self.option_root (e.g. "SPXW") is only used later inside build_option_symbol()
         when constructing the actual option chain symbols for get_option_quotes().
+
+        For SPX weekly options: use SYMBOL_ALIASES=SPX=$SPXW.X (not $SPX.X) so that
+        expirations and strikes are fetched under $SPXW.X, then set
+        OPTION_ROOT_ALIASES=$SPXW.X=SPXW so quotes are built as "SPXW 260320C6630".
 
         If self.option_root is listed in OPTION_WEEKLY_ROOTS, the returned dates are
         filtered to Mon/Wed/Fri only, because building a "SPXW ..." symbol for a
