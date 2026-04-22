@@ -32,6 +32,9 @@ def __getattr__(name):
     if name == "BasicSignalModule":
         from src.signals import basic as BasicSignalModule
         return BasicSignalModule
+    if name == "BasicSignalEngine":
+        from src.signals.basic import BasicSignalEngine
+        return BasicSignalEngine
     if name == "AdvancedSignalEngine":
         from src.signals.advanced import AdvancedSignalEngine
         return AdvancedSignalEngine

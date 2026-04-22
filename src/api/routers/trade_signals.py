@@ -673,15 +673,287 @@ async def get_gamma_vwap_confluence_signal(
     return row
 
 
+_BASIC_SIGNAL_NAMES: tuple[str, ...] = (
+    "tape_flow_bias",
+    "skew_delta",
+    "vanna_charm_flow",
+    "dealer_delta_pressure",
+    "gex_gradient",
+    "positioning_trap",
+)
+
+
+@router.get("/basic")
+async def get_basic_signals_bundle(
+    symbol: str = Query(default="SPY"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Latest snapshot of all six Basic Signals in a single response.
+
+    Basic Signals are continuous directional reads ([-1, +1], scaled to
+    [-100, +100]) that complement the 6 MSI components and 6 Advanced
+    Signals. They do not contribute to the composite MSI (weight=0). Each
+    entry is the most recent row persisted to `signal_component_scores`.
+
+    **Signals (6):** `tape_flow_bias`, `skew_delta`, `vanna_charm_flow`,
+    `dealer_delta_pressure`, `gex_gradient`, `positioning_trap`.
+
+    **Params:** `symbol` (default `SPY`).
+
+    **Returns:**
+    ```json
+    {
+      "underlying": "SPY",
+      "signals": {
+        "tape_flow_bias":        {"score": 28.4,  "direction": "bullish", "timestamp": "...", "context_values": {...}},
+        "skew_delta":            {"score": -12.7, "direction": "bearish", "timestamp": "...", "context_values": {...}},
+        "vanna_charm_flow":      {"score": 0.0,   "direction": "neutral", "timestamp": "...", "context_values": {...}},
+        "dealer_delta_pressure": {"score": 45.1,  "direction": "bullish", "timestamp": "...", "context_values": {...}},
+        "gex_gradient":          {"score": -8.3,  "direction": "bearish", "timestamp": "...", "context_values": {...}},
+        "positioning_trap":      {"score": 0.0,   "direction": "neutral", "timestamp": "...", "context_values": {...}}
+      }
+    }
+    ```
+
+    - `score` — clamped_score × 100; [-100, +100]. `null` if the signal has never
+      persisted a row for this symbol.
+    - `direction` — `"bullish"` | `"bearish"` | `"neutral"`.
+    """
+    bundle = await db.get_latest_basic_signals_bundle(symbol.upper())
+    signals: dict[str, Any] = {}
+    for name in _BASIC_SIGNAL_NAMES:
+        row = bundle.get(name)
+        if not row:
+            signals[name] = None
+            continue
+        raw = float(row.get("clamped_score") or 0.0)
+        direction = "bullish" if raw > 0 else ("bearish" if raw < 0 else "neutral")
+        signals[name] = {
+            "score": row.get("score"),
+            "clamped_score": raw,
+            "direction": direction,
+            "timestamp": row.get("timestamp"),
+            "context_values": row.get("context_values") or {},
+        }
+    return {"underlying": symbol.upper(), "signals": signals}
+
+
+@router.get("/tape-flow-bias")
+async def get_tape_flow_bias_signal(
+    symbol: str = Query(default="SPY"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Signed option-tape premium imbalance — continuous order-flow bias.
+
+    Reads the Lee-Ready-classified `flow_by_type` aggregates to measure
+    aggressive call buying vs put buying (minus their sell sides) over
+    the short window. Unlike `smart_money` (discrete "smart" events), this
+    watches the continuous tape for directional conviction.
+
+    **Logic** (`src/signals/basic/tape_flow_bias.py`):
+    - `call_net = buy_premium − sell_premium` for option_type=C; put_net analogously.
+    - `directional = call_net − put_net`; `ratio = directional / (|call_net|+|put_net|)`.
+    - `score = clip(ratio / SATURATION, [-1, 1])`.
+    - Abstains (score=0) if total premium below `SIGNAL_TAPE_FLOW_MIN_PREMIUM`.
+
+    **Params:** `symbol` (default `SPY`). Returns 404 if no data exists.
+
+    **Returns:** `score`, `direction`, `context_values` with per-side premium
+    breakdown (`call_net_premium`, `put_net_premium`, `call_buy_premium`, etc.),
+    and `score_history`.
+    """
+    row = await db.get_basic_signal(symbol.upper(), "tape_flow_bias")
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No tape-flow-bias score found for {symbol.upper()}")
+    ctx = row.get("context_values") or {}
+    row["score_history"] = row.get("score_history") or []
+    row["call_net_premium"] = ctx.get("call_net_premium")
+    row["put_net_premium"] = ctx.get("put_net_premium")
+    row["source"] = ctx.get("source")
+    return row
+
+
+@router.get("/skew-delta")
+async def get_skew_delta_signal(
+    symbol: str = Query(default="SPY"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Short-dated OTM skew deviation — real-time fear gauge.
+
+    OTM-put vs OTM-call implied-vol spread measured against a configurable
+    baseline (index skew is structurally positive, so we score the
+    *deviation from normal*, not the raw spread).
+
+    **Logic** (`src/signals/basic/skew_delta.py`):
+    - `spread = otm_put_iv − otm_call_iv` from `ctx.extra['skew']`.
+    - `deviation = spread − SIGNAL_SKEW_BASELINE`.
+    - `score = −clip(deviation / SIGNAL_SKEW_SATURATION, [-1, 1])` (elevated put skew → bearish).
+
+    **Params:** `symbol` (default `SPY`). Returns 404 if no data exists.
+
+    **Returns:** `score`, `direction`, `context_values` with `otm_put_iv`,
+    `otm_call_iv`, `spread`, `baseline`, `deviation`, and `score_history`.
+    """
+    row = await db.get_basic_signal(symbol.upper(), "skew_delta")
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No skew-delta score found for {symbol.upper()}")
+    ctx = row.get("context_values") or {}
+    row["score_history"] = row.get("score_history") or []
+    row["otm_put_iv"] = ctx.get("otm_put_iv")
+    row["otm_call_iv"] = ctx.get("otm_call_iv")
+    row["spread"] = ctx.get("spread")
+    row["deviation"] = ctx.get("deviation")
+    return row
+
+
+@router.get("/vanna-charm-flow")
+async def get_vanna_charm_flow_signal(
+    symbol: str = Query(default="SPY"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Second-order greek pressure (vanna + charm) — dealer re-hedging bias.
+
+    Aggregates dealer vanna (dVega/dSpot) and charm (dDelta/dTime) exposure
+    across strikes. Positive = dealer buying pressure, negative = dealer
+    selling pressure. Charm contribution is amplified in the afternoon
+    session as expiry-day hedging accelerates.
+
+    **Logic** (`src/signals/basic/vanna_charm_flow.py`):
+    - Sum `dealer_vanna_exposure` + `dealer_charm_exposure × charm_amplification`.
+    - `score = clip(combined / SIGNAL_VANNA_CHARM_NORM, [-1, 1])`.
+    - Legacy rows (no dealer columns) fall back to negated market-aggregate values.
+
+    **Params:** `symbol` (default `SPY`). Returns 404 if no data exists.
+
+    **Returns:** `score`, `direction`, `context_values` with `vanna_total`,
+    `charm_total`, `charm_amplification`, `vc_norm`, `source`, and `score_history`.
+    """
+    row = await db.get_basic_signal(symbol.upper(), "vanna_charm_flow")
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No vanna-charm-flow score found for {symbol.upper()}")
+    ctx = row.get("context_values") or {}
+    row["score_history"] = row.get("score_history") or []
+    row["vanna_total"] = ctx.get("vanna_total")
+    row["charm_total"] = ctx.get("charm_total")
+    row["charm_amplification"] = ctx.get("charm_amplification")
+    row["source"] = ctx.get("source")
+    return row
+
+
+@router.get("/dealer-delta-pressure")
+async def get_dealer_delta_pressure_signal(
+    symbol: str = Query(default="SPY"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Dealer net-delta imbalance (DNI) — intraday leading indicator.
+
+    Estimates dealer net delta from per-strike OI × delta. Dealer short
+    delta → forced buying into rallies → bullish for price. Flow leads
+    gamma exposure intraday; this is the closest thing to a leading
+    indicator for 0DTE regimes.
+
+    **Logic** (`src/signals/basic/dealer_delta_pressure.py`):
+    - Prefer `ctx.dealer_net_delta` → `gex_by_strike.call_delta_oi/put_delta_oi`
+      → distance-from-spot proxy (ordered by precision).
+    - `score = −clip(dni / SIGNAL_DNI_NORM, [-1, 1])` (inverted: dealer short
+      delta is bullish for price).
+
+    **Params:** `symbol` (default `SPY`). Returns 404 if no data exists.
+
+    **Returns:** `score`, `direction`, `context_values` with
+    `dealer_net_delta_estimated`, `dni_normalized`, `source`, and `score_history`.
+    """
+    row = await db.get_basic_signal(symbol.upper(), "dealer_delta_pressure")
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No dealer-delta-pressure score found for {symbol.upper()}")
+    ctx = row.get("context_values") or {}
+    row["score_history"] = row.get("score_history") or []
+    row["dealer_net_delta_estimated"] = ctx.get("dealer_net_delta_estimated")
+    row["dni_normalized"] = ctx.get("dni_normalized")
+    row["source"] = ctx.get("source")
+    return row
+
+
+@router.get("/gex-gradient")
+async def get_gex_gradient_signal(
+    symbol: str = Query(default="SPY"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Gamma asymmetry around spot — above- vs below-spot dealer gamma skew.
+
+    Decomposes per-strike gamma exposure into above-spot / below-spot /
+    ATM / wing buckets. A heavy "above spot" skew signals dealer short
+    gamma into a rally — any up-move unwinds (bullish). Below-spot
+    dominance is the bearish mirror.
+
+    **Logic** (`src/signals/basic/gex_gradient.py`):
+    - Score = asymmetry of |gamma above| vs |gamma below|, weighted by total notional.
+    - Abstains below `SIGNAL_GEX_GRADIENT_MIN_GAMMA` (thin OI protection).
+    - Long-gamma regimes dampened by `SIGNAL_GEX_GRADIENT_LONG_GAMMA_DAMPING`.
+
+    **Params:** `symbol` (default `SPY`). Returns 404 if no data exists.
+
+    **Returns:** `score`, `direction`, `context_values` with per-bucket gamma
+    breakdown (`above_spot_gamma_abs`, `below_spot_gamma_abs`, `atm_gamma_abs`,
+    `wing_gamma_abs`, `asymmetry`, `strike_count`), and `score_history`.
+    """
+    row = await db.get_basic_signal(symbol.upper(), "gex_gradient")
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No gex-gradient score found for {symbol.upper()}")
+    ctx = row.get("context_values") or {}
+    row["score_history"] = row.get("score_history") or []
+    row["above_spot_gamma_abs"] = ctx.get("above_spot_gamma_abs")
+    row["below_spot_gamma_abs"] = ctx.get("below_spot_gamma_abs")
+    row["asymmetry"] = ctx.get("asymmetry")
+    row["wing_fraction"] = ctx.get("wing_fraction")
+    return row
+
+
+@router.get("/positioning-trap")
+async def get_positioning_trap_signal(
+    symbol: str = Query(default="SPY"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Crowd-positioning trap — squeeze/flush risk from one-way crowding.
+
+    Flags setups where tape behavior starts invalidating crowd direction:
+    heavy put-buying into a rally (short-squeeze risk), or heavy call-buying
+    into a drop (long-flush risk). Uses signed net premium from
+    `flow_contract_facts` when available — more informative than raw total
+    premium because opposite-side buying nets out.
+
+    **Logic** (`src/signals/basic/positioning_trap.py`):
+    - `squeeze = short_crowding + put_skew + above_flip + neg_gex` (bullish side).
+    - `flush  = long_crowding + call_skew + below_flip + neg_gex` (bearish side).
+    - `score = clip(squeeze − flush, [-1, 1])`.
+
+    **Params:** `symbol` (default `SPY`). Returns 404 if no data exists.
+
+    **Returns:** `score`, `direction`, `context_values` with `put_call_ratio`,
+    `smart_imbalance`, `smart_imbalance_source`, `momentum_5bar`, `close`,
+    `gamma_flip`, `net_gex`, and `score_history`.
+    """
+    row = await db.get_basic_signal(symbol.upper(), "positioning_trap")
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No positioning-trap score found for {symbol.upper()}")
+    ctx = row.get("context_values") or {}
+    row["score_history"] = row.get("score_history") or []
+    row["smart_imbalance"] = ctx.get("smart_imbalance")
+    row["smart_imbalance_source"] = ctx.get("smart_imbalance_source")
+    row["momentum_5bar"] = ctx.get("momentum_5bar")
+    return row
+
+
 _VALID_SIGNAL_EVENT_NAMES = {
+    # Advanced Signals
     "vol_expansion",
     "eod_pressure",
     "squeeze_setup",
     "trap_detection",
     "zero_dte_position_imbalance",
     "gamma_vwap_confluence",
-    "positioning_trap",
-    "vanna_charm_flow",
+    # Basic Signals
+    *_BASIC_SIGNAL_NAMES,
 }
 
 

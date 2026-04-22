@@ -2782,12 +2782,16 @@ class DatabaseManager:
             logger.error(f"get_advanced_signal failed ({symbol}, {signal_name}): {e}")
             return None
 
-    # Backward compatibility while callers migrate naming.
-    async def get_independent_signal(
+    async def get_basic_signal(
         self,
         symbol: str = "SPY",
         signal_name: str = "",
     ) -> Optional[Dict[str, Any]]:
+        """Return the most recent basic signal from signal_component_scores.
+
+        Mirrors :meth:`get_advanced_signal` — the two groups share the same
+        table, distinguished only by ``component_name``.
+        """
         return await self.get_advanced_signal(symbol=symbol, signal_name=signal_name)
 
     async def get_signal_events(
@@ -2935,6 +2939,56 @@ class DatabaseManager:
                 return out
         except Exception as e:
             logger.error(f"get_latest_advanced_signals_bundle failed ({symbol}): {e}")
+            return out
+
+    async def get_latest_basic_signals_bundle(
+        self,
+        symbol: str = "SPY",
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Return the latest row for each basic signal for a symbol.
+
+        Basic signals share ``signal_component_scores`` with the MSI
+        components and Advanced Signals, distinguished by ``component_name``.
+        """
+        query = """
+            SELECT DISTINCT ON (component_name)
+                component_name,
+                timestamp,
+                clamped_score,
+                weighted_score,
+                weight,
+                context_values
+            FROM signal_component_scores
+            WHERE underlying = $1
+              AND component_name IN (
+                'tape_flow_bias','skew_delta','vanna_charm_flow',
+                'dealer_delta_pressure','gex_gradient','positioning_trap'
+              )
+            ORDER BY component_name, timestamp DESC
+        """
+        out: Dict[str, Optional[Dict[str, Any]]] = {
+            "tape_flow_bias": None,
+            "skew_delta": None,
+            "vanna_charm_flow": None,
+            "dealer_delta_pressure": None,
+            "gex_gradient": None,
+            "positioning_trap": None,
+        }
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol)
+                for row in rows:
+                    d = dict(row)
+                    ctx = d.get("context_values") or {}
+                    if isinstance(ctx, str):
+                        ctx = json.loads(ctx)
+                    d["context_values"] = ctx
+                    raw = d.get("clamped_score") or 0.0
+                    d["score"] = round(float(raw) * 100.0, 2)
+                    out[d["component_name"]] = d
+                return out
+        except Exception as e:
+            logger.error(f"get_latest_basic_signals_bundle failed ({symbol}): {e}")
             return out
 
     async def get_signal_component_events(

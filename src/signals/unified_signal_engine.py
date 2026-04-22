@@ -20,6 +20,7 @@ from src.signals.components.price_vs_max_gamma import PriceVsMaxGammaComponent
 from src.signals.components.put_call_ratio_state import PutCallRatioStateComponent
 from src.signals.components.volatility_regime import VolatilityRegimeComponent
 from src.signals.advanced import AdvancedSignalEngine
+from src.signals.basic import BasicSignalEngine
 from src.signals.portfolio_engine import PortfolioEngine
 from src.signals.scoring_engine import ScoringEngine
 from src.symbols import get_canonical_symbol
@@ -48,6 +49,7 @@ class UnifiedSignalEngine:
 
         self.portfolio_engine = PortfolioEngine(self.underlying)
         self.advanced_signal_engine = AdvancedSignalEngine()
+        self.basic_signal_engine = BasicSignalEngine()
         self._iv_rank_enabled = os.getenv("SIGNAL_IV_RANK_ENABLED", "false").lower() == "true"
         if not self._iv_rank_enabled:
             logger.info(
@@ -873,6 +875,58 @@ class UnifiedSignalEngine:
             conn.commit()
         return results
 
+    def _persist_basic_signals(self, market_context: MarketContext) -> list:
+        """Evaluate and persist the continuous basic signals.
+
+        These share ``signal_component_scores`` with the MSI components and
+        Advanced Signals but carry weight=0 (they do not contribute to the
+        composite MSI). No ``signal_events`` emission — they are continuous
+        directional reads, not discrete triggers.
+        """
+        results = self.basic_signal_engine.evaluate(market_context)
+        if not results:
+            return []
+
+        if not hasattr(self, "_basic_state"):
+            self._basic_state: dict[str, dict] = {}
+
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                for result in results:
+                    state = self._basic_state.setdefault(result.name, {"last_score": None})
+                    prev_score = state["last_score"]
+                    score_delta = (
+                        abs(result.score - prev_score)
+                        if prev_score is not None
+                        else float("inf")
+                    )
+                    if prev_score is not None and score_delta < self._SCORE_DEDUPE_EPSILON:
+                        continue
+                    cur.execute(
+                        """
+                        INSERT INTO signal_component_scores (
+                            underlying, timestamp, component_name, clamped_score, weighted_score, weight, context_values
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                        ON CONFLICT (underlying, timestamp, component_name) DO UPDATE SET
+                            clamped_score = EXCLUDED.clamped_score,
+                            weighted_score = EXCLUDED.weighted_score,
+                            weight = EXCLUDED.weight,
+                            context_values = EXCLUDED.context_values
+                        """,
+                        (
+                            market_context.underlying,
+                            market_context.timestamp,
+                            result.name,
+                            result.score,
+                            0.0,
+                            0.0,
+                            json.dumps(result.context, default=str),
+                        ),
+                    )
+                    state["last_score"] = result.score
+            conn.commit()
+        return results
+
     def run_cycle(self) -> bool:
         # Each phase acquires and releases its own connection to avoid
         # holding a connection "idle in transaction" during CPU-bound work.
@@ -892,6 +946,7 @@ class UnifiedSignalEngine:
         market_context = self._build_market_context(ctx)
         score = self.scoring_engine.score_and_persist(market_context)
         advanced_results = self._persist_advanced_signals(market_context)
+        self._persist_basic_signals(market_context)
 
         # Phase 3: reconcile portfolio (acquires connection for reads+writes)
         # Legacy optimizer-cache plumbing is no longer needed because MSI
