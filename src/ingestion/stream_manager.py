@@ -341,13 +341,24 @@ class OptionStreamAccumulator:
 
             # Always-overwrite fields
             for key in (
-                "Last", "Bid", "Ask", "Mid", "Volume", "TimeStamp",
+                "Last", "Bid", "Ask", "Mid", "TimeStamp",
                 "High", "Low", "Open", "Close", "NetChange",
                 "NetChangePct", "BidSize", "AskSize",
             ):
                 val = q.get(key)
                 if val is not None:
                     merged[key] = val
+
+            # Volume: only overwrite when > 0 — streaming deltas frequently
+            # send Volume=0 between trades, which would erase the accumulated
+            # cumulative daily volume (same pattern as OI/IV below).
+            vol_val = q.get("Volume")
+            if vol_val is not None:
+                try:
+                    if int(vol_val) > 0:
+                        merged["Volume"] = vol_val
+                except (ValueError, TypeError):
+                    pass
 
             # OI: only overwrite when new value > 0
             for oi_key in ("DailyOpenInterest", "OpenInterest"):
