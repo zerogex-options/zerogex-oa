@@ -30,7 +30,7 @@ from src.validation import (
     safe_float, safe_int, safe_datetime,
     validate_bar_data, get_market_session
 )
-from src.symbols import resolve_option_root, get_weekly_option_roots
+from src.symbols import resolve_option_root
 from src.config import (
     OPTION_BATCH_SIZE,
     DELAY_BETWEEN_BATCHES,
@@ -876,10 +876,6 @@ class StreamManager:
         For SPX weekly options: use SYMBOL_ALIASES=SPX=$SPXW.X (not $SPX.X) so that
         expirations and strikes are fetched under $SPXW.X, then set
         OPTION_ROOT_ALIASES=$SPXW.X=SPXW so quotes are built as "SPXW 260320C6630".
-
-        If self.option_root is listed in OPTION_WEEKLY_ROOTS, the returned dates are
-        filtered to Mon/Wed/Fri only, because building a "SPXW ..." symbol for a
-        non-weekly expiration would be rejected by the TradeStation API.
         """
         try:
             all_expirations = self.client.get_option_expirations(self.underlying)
@@ -895,11 +891,6 @@ class StreamManager:
             if not future_expirations:
                 logger.warning("No future expirations available")
                 return []
-
-            # If the option root is weekly-only (e.g. SPXW), keep only Mon/Wed/Fri dates
-            if self.option_root in get_weekly_option_roots():
-                future_expirations = [exp for exp in future_expirations if exp.weekday() in (0, 2, 4)]
-                logger.info(f"Filtered to weekly expirations for {self.option_root} (Mon/Wed/Fri)")
 
             # Take first N
             target_exps = future_expirations[:self.num_expirations]

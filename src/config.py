@@ -142,7 +142,6 @@ OPTION_BUCKET_WRITE_MIN_SECONDS = float(
 
 SYMBOL_ALIASES = os.getenv("SYMBOL_ALIASES", "")
 OPTION_ROOT_ALIASES = os.getenv("OPTION_ROOT_ALIASES", "")
-OPTION_WEEKLY_ROOTS = os.getenv("OPTION_WEEKLY_ROOTS", "")
 
 # =============================================================================
 # Greeks & IV Calculation Configuration

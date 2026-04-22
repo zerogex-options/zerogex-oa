@@ -75,17 +75,6 @@ def get_canonical_symbol(ts_symbol: str) -> str:
     return reverse.get(normalized, normalized)
 
 
-def get_weekly_option_roots() -> set:
-    """Return the set of option roots that only have weekly (Mon/Wed/Fri) expirations.
-
-    Configured via OPTION_WEEKLY_ROOTS (comma-separated), e.g. OPTION_WEEKLY_ROOTS=SPXW.
-    When a root is listed here, _get_target_expirations() filters the dates returned by
-    get_option_expirations(underlying) to Mon/Wed/Fri only, since building a "SPXW" symbol
-    for a non-weekly expiration date would be rejected by the TradeStation API.
-    """
-    raw = os.getenv("OPTION_WEEKLY_ROOTS", "")
-    return {r.strip().upper() for r in raw.split(",") if r.strip()}
-
 
 def resolve_option_root(underlying: str) -> str:
     """Resolve option root for a given underlying, defaulting to underlying itself."""
