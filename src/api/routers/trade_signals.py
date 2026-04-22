@@ -268,7 +268,7 @@ async def get_score_history(
     return normalized_rows
 
 
-@router.get("/vol-expansion")
+@router.get("/advanced/vol-expansion")
 async def get_vol_expansion_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
@@ -332,7 +332,7 @@ async def get_vol_expansion_signal(
     return row
 
 
-@router.get("/eod-pressure")
+@router.get("/advanced/eod-pressure")
 async def get_eod_pressure_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
@@ -403,7 +403,7 @@ async def get_eod_pressure_signal(
     return row
 
 
-@router.get("/squeeze-setup")
+@router.get("/advanced/squeeze-setup")
 async def get_squeeze_setup_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
@@ -470,7 +470,7 @@ async def get_squeeze_setup_signal(
     return row
 
 
-@router.get("/trap-detection")
+@router.get("/advanced/trap-detection")
 async def get_trap_detection_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
@@ -542,7 +542,7 @@ async def get_trap_detection_signal(
     return row
 
 
-@router.get("/0dte-position-imbalance")
+@router.get("/advanced/0dte-position-imbalance")
 async def get_zero_dte_position_imbalance_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
@@ -606,7 +606,7 @@ async def get_zero_dte_position_imbalance_signal(
     return row
 
 
-@router.get("/gamma-vwap-confluence")
+@router.get("/advanced/gamma-vwap-confluence")
 async def get_gamma_vwap_confluence_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
@@ -738,7 +738,7 @@ async def get_basic_signals_bundle(
     return {"underlying": symbol.upper(), "signals": signals}
 
 
-@router.get("/tape-flow-bias")
+@router.get("/basic/tape-flow-bias")
 async def get_tape_flow_bias_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
@@ -773,7 +773,7 @@ async def get_tape_flow_bias_signal(
     return row
 
 
-@router.get("/skew-delta")
+@router.get("/basic/skew-delta")
 async def get_skew_delta_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
@@ -806,7 +806,7 @@ async def get_skew_delta_signal(
     return row
 
 
-@router.get("/vanna-charm-flow")
+@router.get("/basic/vanna-charm-flow")
 async def get_vanna_charm_flow_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
@@ -840,7 +840,7 @@ async def get_vanna_charm_flow_signal(
     return row
 
 
-@router.get("/dealer-delta-pressure")
+@router.get("/basic/dealer-delta-pressure")
 async def get_dealer_delta_pressure_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
@@ -874,7 +874,7 @@ async def get_dealer_delta_pressure_signal(
     return row
 
 
-@router.get("/gex-gradient")
+@router.get("/basic/gex-gradient")
 async def get_gex_gradient_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
@@ -909,7 +909,7 @@ async def get_gex_gradient_signal(
     return row
 
 
-@router.get("/positioning-trap")
+@router.get("/basic/positioning-trap")
 async def get_positioning_trap_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
@@ -1057,8 +1057,40 @@ async def get_signal_events(
     }
 
 
-@router.get("/confluence-matrix")
-async def get_confluence_matrix(
+_ADVANCED_SIGNAL_NAMES: tuple[str, ...] = (
+    "vol_expansion",
+    "eod_pressure",
+    "squeeze_setup",
+    "trap_detection",
+    "zero_dte_position_imbalance",
+    "gamma_vwap_confluence",
+)
+
+
+async def _confluence_matrix_response(
+    db: DatabaseManager,
+    symbol: str,
+    lookback: int,
+    component_names: list[str],
+) -> dict[str, Any]:
+    matrix = await db.get_signal_confluence_matrix(
+        symbol.upper(),
+        component_names=component_names,
+        lookback=lookback,
+    )
+    return {
+        "underlying": symbol.upper(),
+        "lookback": lookback,
+        "components": matrix.get("components", []),
+        "matrix": matrix.get("matrix", []),
+        "row_order": matrix.get("components", []),
+        "sample_count": matrix.get("sample_count", 0),
+        "latest_timestamp": matrix.get("latest_timestamp"),
+    }
+
+
+@router.get("/advanced/confluence-matrix")
+async def get_advanced_confluence_matrix(
     symbol: str = Query(default="SPY"),
     lookback: int = Query(default=120, ge=10, le=2000),
     db: DatabaseManager = Depends(get_db),
@@ -1120,14 +1152,34 @@ async def get_confluence_matrix(
     Cell tooltip: agreement_ratio / disagreement_ratio / observations. Sort rows by average
     agreement to surface consensus signals at top, outliers at bottom.
     """
-    matrix = await db.get_signal_confluence_matrix(symbol.upper(), lookback=lookback)
+    return await _confluence_matrix_response(
+        db, symbol, lookback, list(_ADVANCED_SIGNAL_NAMES)
+    )
 
-    return {
-        "underlying": symbol.upper(),
-        "lookback": lookback,
-        "components": matrix.get("components", []),
-        "matrix": matrix.get("matrix", []),
-        "row_order": matrix.get("components", []),
-        "sample_count": matrix.get("sample_count", 0),
-        "latest_timestamp": matrix.get("latest_timestamp"),
-    }
+
+@router.get("/basic/confluence-matrix")
+async def get_basic_confluence_matrix(
+    symbol: str = Query(default="SPY"),
+    lookback: int = Query(default=120, ge=10, le=2000),
+    db: DatabaseManager = Depends(get_db),
+):
+    """6×6 basic-signal agreement matrix — pairwise directional confluence over a rolling window.
+
+    Parallel to `/api/signals/advanced/confluence-matrix`, but scoped to the six
+    Basic Signals persisted by `BasicSignalEngine`. These are continuous
+    directional reads (no triggered events) so every non-zero snapshot
+    contributes to agreement/disagreement counts.
+
+    **Params:**
+    - `symbol` (default `SPY`).
+    - `lookback` — 10–2000, default 120.
+
+    **Signals (6, fixed order):** `tape_flow_bias`, `skew_delta`, `vanna_charm_flow`,
+    `dealer_delta_pressure`, `gex_gradient`, `positioning_trap`.
+
+    **Returns:** identical schema to the advanced variant — see
+    `/api/signals/advanced/confluence-matrix` for field docs.
+    """
+    return await _confluence_matrix_response(
+        db, symbol, lookback, list(_BASIC_SIGNAL_NAMES)
+    )

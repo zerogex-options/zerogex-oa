@@ -1188,8 +1188,6 @@ class PortfolioEngine:
         signal_strength = self._infer_signal_strength(score.composite_score)
         dte_min, dte_max = TARGET_DTE_WINDOWS.get(signal_timeframe, (1, 7))
 
-        # Reuse option rows from OpportunityQualityComponent if available
-        # and the DTE window matches, avoiding a duplicate option_chains scan.
         option_rows = None
         if cached_option_rows is not None:
             cache_key, rows = cached_option_rows

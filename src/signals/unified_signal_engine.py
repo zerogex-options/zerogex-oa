@@ -395,7 +395,7 @@ class UnifiedSignalEngine:
                     sm_call_gross, sm_put_gross = abs(sm_call), abs(sm_put)
 
                 # C6: true 0DTE flow by option_type and moneyness.  Previously
-                # /api/signals/0dte-position-imbalance used flow_by_type which
+                # /api/signals/advanced/0dte-position-imbalance used flow_by_type which
                 # has no expiration column and therefore aggregated every DTE.
                 # flow_contract_facts exposes expiration + strike so we can
                 # filter to today's expiration and split by OTM/ATM moneyness

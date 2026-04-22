@@ -315,7 +315,7 @@ help: ## Show this help message
 	@echo "  make signals-accuracy-all     - Full consolidated accuracy table"
 	@echo "  make vol-signals              - Latest volatility-expansion signal"
 	@echo "  make vol-signals-components   - Vol-expansion component breakdown"
-	@echo "  make api-test-vol-signals     - Test /api/signals/vol-expansion endpoint"
+	@echo "  make api-test-vol-signals     - Test /api/signals/advanced/vol-expansion endpoint"
 	@echo "  make signals-logs             - Watch Signals service logs live"
 	@echo "  make signals-logs-tail        - Last 100 Signals log lines"
 	@echo "  make signals-logs-errors      - Show recent Signals service errors"
@@ -1837,9 +1837,9 @@ api-test-signals: ## Test active /api/signals endpoints
 	@curl -s "http://localhost:8000/api/signals/score?underlying=SPY" | python3 -m json.tool
 
 .PHONY: api-test-vol-signals
-api-test-vol-signals: ## Test /api/signals/vol-expansion endpoint
-	@echo "$(BLUE)=== Testing /api/signals/vol-expansion ===$(NC)"
-	@curl -s "http://localhost:8000/api/signals/vol-expansion?symbol=SPY" | python3 -m json.tool
+api-test-vol-signals: ## Test /api/signals/advanced/vol-expansion endpoint
+	@echo "$(BLUE)=== Testing /api/signals/advanced/vol-expansion ===$(NC)"
+	@curl -s "http://localhost:8000/api/signals/advanced/vol-expansion?symbol=SPY" | python3 -m json.tool
 
 .PHONY: api-test-signals-summary
 api-test-signals-summary: ## Quick one-liner status for trade + history summary
@@ -2314,8 +2314,8 @@ api-test: ## Test ALL API endpoints
 	test_endpoint "/api/signals/trades-history?limit=20"; \
 	test_endpoint "/api/signals/score?underlying=$$SYMBOL"; \
 	test_endpoint "/api/signals/score-history?underlying=$$SYMBOL&limit=20"; \
-	test_endpoint "/api/signals/vol-expansion?symbol=$$SYMBOL"; \
-	test_endpoint "/api/signals/eod-pressure?symbol=$$SYMBOL"; \
+	test_endpoint "/api/signals/advanced/vol-expansion?symbol=$$SYMBOL"; \
+	test_endpoint "/api/signals/advanced/eod-pressure?symbol=$$SYMBOL"; \
 	echo ""; \
 	echo "$(BLUE)=== API Test Report ===$(NC)"; \
 	echo "$(GREEN)Passed: $$PASSED$(NC)"; \
