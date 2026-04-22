@@ -3002,7 +3002,7 @@ class DatabaseManager:
         horizon_interval = {"30m": "30 minutes", "60m": "60 minutes", "120m": "120 minutes"}.get(
             horizon, "60 minutes"
         )
-        query = """
+        query = f"""
             SELECT
                 scs.underlying,
                 scs.timestamp,
