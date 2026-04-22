@@ -237,15 +237,15 @@ async def get_score_history(
 
     **Params:** `underlying` (default `SPY`), `limit` (default 90, max 5000).
 
-    **Returns.** An array of objects identical to `/score` — each with
-    `composite_score` and `components`. Rows are ordered by `timestamp DESC`
-    so index 0 is the most recent. No timestamp is included in the normalized
-    payload; use `/score` for current and `/{signal_name}/events` for historical
-    component series.
+    **Returns.** An array of objects with `timestamp`, `composite_score`, and
+    `components` (same shape as `/score`). Rows are ordered by `timestamp DESC`
+    so index 0 is the most recent. `timestamp` is ISO-8601 UTC of the engine
+    cycle that produced the row.
 
     ```json
     [
       {
+        "timestamp": "2026-04-22T18:55:00Z",
         "composite_score": 63.42,
         "components": {
           "net_gex_sign":       {"max_points": 20, "contribution":  12.00, "score":  0.6},
@@ -259,12 +259,16 @@ async def get_score_history(
     ]
     ```
 
-    **Page design.** Line chart of `composite_score` with shaded regime bands at
-    20/40/70. Stacked-area chart of component `contribution` values underneath
-    shows which component flipped the regime.
+    **Page design.** Line chart of `composite_score` over `timestamp` with shaded
+    regime bands at 20/40/70. Stacked-area chart of component `contribution`
+    values underneath shows which component flipped the regime.
     """
     rows = await db.get_signal_score_history(underlying.upper(), limit)
-    normalized_rows = [_normalize_signal_score_row(row) for row in rows]
+    normalized_rows = []
+    for row in rows:
+        normalized = _normalize_signal_score_row(row)
+        normalized["timestamp"] = row.get("timestamp")
+        normalized_rows.append(normalized)
     return normalized_rows
 
 
@@ -620,7 +624,7 @@ async def get_gamma_vwap_confluence_signal(
     **Logic highlights** (`src/signals/advanced/gamma_vwap_confluence.py`):
     - Requires flip + VWAP within 0.15% of midpoint; adds max_pain / max_gamma /
       call_wall if also within 0.15%.
-    - `cluster_quality = max(0, 1 − core_gap_pct / 0.5%)`;
+    - `cluster_quality = max(0, 1 − cluster_gap_pct / 0.5%)`;
       multi-member bonus `1.0 + 0.15 × extra_members`.
     - `net_gex < 0` → continuation (bullish if price above, bearish below);
       long gamma → mean reversion (`−0.7 × directional`).
@@ -636,8 +640,10 @@ async def get_gamma_vwap_confluence_signal(
       "signal": "bullish_confluence",
       "confluence_level": 678.25,
       "cluster_gap_pct": 0.0009,
+      "gamma_flip": 677.82, "vwap": 678.10,
+      "max_pain": 678.0, "max_gamma": 678.5, "call_wall": 681.0,
       "expected_target": 680.5,
-      "context_values": {"...gamma_flip, vwap, cluster_members, cluster_quality, distance_from_level_pct, regime_direction, net_gex..."},
+      "context_values": {"...gamma_flip, vwap, max_pain, max_gamma, call_wall, cluster_gap_pct, cluster_members, cluster_quality, distance_from_level_pct, regime_direction, net_gex..."},
       "score_history": [{"score": 22.0, "timestamp": "..."}, "...up to 90"]
     }
     ```
@@ -647,6 +653,9 @@ async def get_gamma_vwap_confluence_signal(
     - `triggered` — `true` when `|score| ≥ 20`.
     - `confluence_level` — price of the cluster midpoint.
     - `cluster_gap_pct` — |flip − vwap| / close; [0, ~0.005].
+    - `gamma_flip`, `vwap`, `max_pain`, `max_gamma`, `call_wall` — raw input
+      levels used in the computation; `null` when unavailable. Always present
+      regardless of whether the level ended up in `cluster_members`.
     - `expected_target` — reversion target (mean-reversion) or extrapolated (continuation).
     - `regime_direction` (in `context_values`) — `"mean_reversion"` | `"continuation"`.
 
@@ -669,6 +678,11 @@ async def get_gamma_vwap_confluence_signal(
     row["signal"] = ctx.get("signal", "none")
     row["confluence_level"] = ctx.get("confluence_level")
     row["cluster_gap_pct"] = ctx.get("cluster_gap_pct")
+    row["gamma_flip"] = ctx.get("gamma_flip")
+    row["vwap"] = ctx.get("vwap")
+    row["max_pain"] = ctx.get("max_pain")
+    row["max_gamma"] = ctx.get("max_gamma")
+    row["call_wall"] = ctx.get("call_wall")
     row["expected_target"] = ctx.get("expected_target")
     return row
 

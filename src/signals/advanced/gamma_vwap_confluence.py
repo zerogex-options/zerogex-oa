@@ -19,11 +19,28 @@ class GammaVwapConfluenceSignal:
         call_wall = extra.get("call_wall")
         max_gamma = extra.get("max_gamma_strike")
 
+        def _round(value: float | None, ndigits: int = 4) -> float | None:
+            return round(value, ndigits) if isinstance(value, (int, float)) else None
+
+        input_levels = {
+            "gamma_flip": _round(flip),
+            "vwap": _round(vwap),
+            "max_pain": _round(max_pain),
+            "max_gamma": _round(max_gamma),
+            "call_wall": _round(call_wall),
+        }
+
         if flip is None or vwap is None or ctx.close <= 0:
             return AdvancedSignalResult(
                 name=self.name,
                 score=0.0,
-                context={"triggered": False, "signal": "none", "reason": "missing_levels"},
+                context={
+                    "triggered": False,
+                    "signal": "none",
+                    "reason": "missing_levels",
+                    "cluster_gap_pct": None,
+                    **input_levels,
+                },
             )
 
         core_mid = 0.5 * (flip + vwap)
@@ -38,8 +55,8 @@ class GammaVwapConfluenceSignal:
             if abs(level - core_mid) / ctx.close <= 0.0015:
                 cluster_candidates[name] = level
 
-        core_gap_pct = abs(flip - vwap) / ctx.close
-        cluster_quality = max(0.0, 1.0 - core_gap_pct / CONFLUENCE_MAX_GAP_PCT)
+        cluster_gap_pct = abs(flip - vwap) / ctx.close
+        cluster_quality = max(0.0, 1.0 - cluster_gap_pct / CONFLUENCE_MAX_GAP_PCT)
         if cluster_quality <= 0:
             return AdvancedSignalResult(
                 name=self.name,
@@ -47,10 +64,9 @@ class GammaVwapConfluenceSignal:
                 context={
                     "triggered": False,
                     "signal": "none",
-                    "gamma_flip": flip,
-                    "vwap": vwap,
-                    "core_gap_pct": round(core_gap_pct, 6),
+                    "cluster_gap_pct": round(cluster_gap_pct, 6),
                     "cluster_quality": 0.0,
+                    **input_levels,
                 },
             )
 
@@ -91,11 +107,10 @@ class GammaVwapConfluenceSignal:
                     else ("bearish_confluence" if score < -0.2 else "neutral")
                 ),
                 "regime_direction": regime_direction,
-                "gamma_flip": round(flip, 4),
-                "vwap": round(vwap, 4),
+                **input_levels,
                 "confluence_level": round(confluence_level, 4),
                 "cluster_members": list(cluster_candidates.keys()),
-                "core_gap_pct": round(core_gap_pct, 6),
+                "cluster_gap_pct": round(cluster_gap_pct, 6),
                 "cluster_quality": round(cluster_quality, 4),
                 "distance_from_level_pct": round(dist_from_level, 6),
                 "expected_target": round(expected_target, 4),
