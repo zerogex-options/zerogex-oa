@@ -688,36 +688,60 @@ async def get_basic_signals_bundle(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
 ):
-    """Latest snapshot of all six Basic Signals in a single response.
+    """Latest snapshot of all six Basic Signals in a single round-trip.
 
-    Basic Signals are continuous directional reads ([-1, +1], scaled to
-    [-100, +100]) that complement the 6 MSI components and 6 Advanced
-    Signals. They do not contribute to the composite MSI (weight=0). Each
-    entry is the most recent row persisted to `signal_component_scores`.
+    Basic Signals are continuous directional reads (clamped to `[-1, +1]`,
+    scaled to `[-100, +100]`) that complement the 6 MSI components and 6
+    Advanced Signals. They do **not** contribute to the composite MSI
+    (weight=0). Each entry is the most recent row persisted to
+    `signal_component_scores` by `BasicSignalEngine` each cycle.
 
-    **Signals (6):** `tape_flow_bias`, `skew_delta`, `vanna_charm_flow`,
-    `dealer_delta_pressure`, `gex_gradient`, `positioning_trap`.
+    Use this to populate a dashboard overview without firing six separate
+    requests. Click-through to the individual `/api/signals/basic/{name}`
+    endpoint for signal-specific decomposition and history.
 
-    **Params:** `symbol` (default `SPY`).
+    **Signals (6, fixed order):** `tape_flow_bias`, `skew_delta`,
+    `vanna_charm_flow`, `dealer_delta_pressure`, `gex_gradient`,
+    `positioning_trap`.
+
+    **Params:**
+    - `symbol` (default `SPY`).
 
     **Returns:**
     ```json
     {
       "underlying": "SPY",
       "signals": {
-        "tape_flow_bias":        {"score": 28.4,  "direction": "bullish", "timestamp": "...", "context_values": {...}},
-        "skew_delta":            {"score": -12.7, "direction": "bearish", "timestamp": "...", "context_values": {...}},
-        "vanna_charm_flow":      {"score": 0.0,   "direction": "neutral", "timestamp": "...", "context_values": {...}},
-        "dealer_delta_pressure": {"score": 45.1,  "direction": "bullish", "timestamp": "...", "context_values": {...}},
-        "gex_gradient":          {"score": -8.3,  "direction": "bearish", "timestamp": "...", "context_values": {...}},
-        "positioning_trap":      {"score": 0.0,   "direction": "neutral", "timestamp": "...", "context_values": {...}}
+        "tape_flow_bias":        {"score": 28.4,  "clamped_score": 0.284,  "direction": "bullish", "timestamp": "2026-04-22T18:55:00Z", "context_values": {...}},
+        "skew_delta":            {"score": -12.7, "clamped_score": -0.127, "direction": "bearish", "timestamp": "...", "context_values": {...}},
+        "vanna_charm_flow":      {"score": 0.0,   "clamped_score": 0.0,    "direction": "neutral", "timestamp": "...", "context_values": {...}},
+        "dealer_delta_pressure": {"score": 45.1,  "clamped_score": 0.451,  "direction": "bullish", "timestamp": "...", "context_values": {...}},
+        "gex_gradient":          {"score": -8.3,  "clamped_score": -0.083, "direction": "bearish", "timestamp": "...", "context_values": {...}},
+        "positioning_trap":      null
       }
     }
     ```
 
-    - `score` — clamped_score × 100; [-100, +100]. `null` if the signal has never
-      persisted a row for this symbol.
-    - `direction` — `"bullish"` | `"bearish"` | `"neutral"`.
+    - `signals[name]` — `null` when the signal has never persisted a row
+      for this symbol (first-deployment case). Render `"—"` in the UI, not `0`.
+    - `signals[name].score` — `clamped_score × 100`; `[-100, +100]`; 2 decimals.
+    - `signals[name].clamped_score` — raw `[-1, +1]`.
+    - `signals[name].direction` — `"bullish"` | `"bearish"` | `"neutral"` (sign of score).
+    - `signals[name].timestamp` — ISO-8601 UTC of the engine cycle.
+    - `signals[name].context_values` — signal-specific inputs/derived fields;
+      same keys as the per-signal endpoint.
+
+    **Trader interpretation.**
+    - **All six aligned** (same sign) → high-conviction regime; follow the direction.
+    - **Flow side** (`tape_flow_bias`, `positioning_trap`) **diverging from structure**
+      (`gex_gradient`, `vanna_charm_flow`) → potential reversal; flow leads structure intraday.
+    - **`0.0` during market hours** → signal *abstained* (below its data threshold),
+      not "neutral conviction." Don't treat as a bearish read.
+
+    **Page design.** Six KPI tiles in a 3×2 grid. Each tile: direction chip
+    (green/red/gray), large `score` number, signal label. Click-through to
+    the `/api/signals/basic/{name}` detail view. Null tiles render as `"—"`.
+    Poll this endpoint together with `/basic/confluence-matrix` at cycle cadence.
     """
     bundle = await db.get_latest_basic_signals_bundle(symbol.upper())
     signals: dict[str, Any] = {}
@@ -745,22 +769,62 @@ async def get_tape_flow_bias_signal(
 ):
     """Signed option-tape premium imbalance — continuous order-flow bias.
 
-    Reads the Lee-Ready-classified `flow_by_type` aggregates to measure
-    aggressive call buying vs put buying (minus their sell sides) over
-    the short window. Unlike `smart_money` (discrete "smart" events), this
-    watches the continuous tape for directional conviction.
+    Answers: *right now, is the tape aggressively buying calls and selling
+    puts (bullish) or the reverse (bearish)?* The ingestion layer
+    Lee-Ready-classifies every print into `buy_premium` / `sell_premium`;
+    this signal nets them and scores the per-side imbalance. Unlike
+    `smart_money` (discrete "large premium" events), this watches the
+    continuous tape — gives an earlier read on directional conviction.
 
-    **Logic** (`src/signals/basic/tape_flow_bias.py`):
-    - `call_net = buy_premium − sell_premium` for option_type=C; put_net analogously.
-    - `directional = call_net − put_net`; `ratio = directional / (|call_net|+|put_net|)`.
-    - `score = clip(ratio / SATURATION, [-1, 1])`.
-    - Abstains (score=0) if total premium below `SIGNAL_TAPE_FLOW_MIN_PREMIUM`.
+    **Logic highlights** (`src/signals/basic/tape_flow_bias.py`):
+    - `call_net = call_buy_premium − call_sell_premium` (aggressor side).
+    - `put_net  = put_buy_premium  − put_sell_premium`.
+    - `directional = call_net − put_net` (call buying = bullish; put buying = bearish).
+    - `ratio = directional / (|call_net| + |put_net|)` in `[-1, +1]`.
+    - `score = clip(ratio / SIGNAL_TAPE_FLOW_SATURATION, [-1, 1])` (default saturation 0.6).
+    - **Abstains (score=0)** if `|call_net| + |put_net| < SIGNAL_TAPE_FLOW_MIN_PREMIUM`
+      (default $250K). Treat abstention as "no data," not neutral conviction.
 
-    **Params:** `symbol` (default `SPY`). Returns 404 if no data exists.
+    **Params:**
+    - `symbol` (default `SPY`). Returns 404 if no row exists yet.
 
-    **Returns:** `score`, `direction`, `context_values` with per-side premium
-    breakdown (`call_net_premium`, `put_net_premium`, `call_buy_premium`, etc.),
-    and `score_history`.
+    **Returns:**
+    ```json
+    {
+      "underlying": "SPY",
+      "timestamp": "2026-04-22T18:55:00Z",
+      "clamped_score": 0.28, "score": 28.0, "direction": "bullish",
+      "weighted_score": 0.0, "weight": 0.0,
+      "call_net_premium": 312000.0,
+      "put_net_premium": -85000.0,
+      "source": "flow_by_type",
+      "context_values": {
+        "call_net_premium": 312000.0, "put_net_premium": -85000.0,
+        "call_buy_premium": 450000.0, "call_sell_premium": 138000.0,
+        "put_buy_premium": 120000.0, "put_sell_premium": 205000.0,
+        "source": "flow_by_type"
+      },
+      "score_history": [{"score": 12.4, "timestamp": "..."}, "...up to 90"]
+    }
+    ```
+
+    - `score` / `clamped_score` — `[-100, +100]` / `[-1, +1]`. `+` = calls bought / puts sold.
+    - `direction` — `"bullish"` | `"bearish"` | `"neutral"` (sign of score).
+    - `call_net_premium` / `put_net_premium` — USD, signed. `+` = net aggressor buying.
+    - `source` — `"flow_by_type"` (data present) | `"unavailable"` (abstained).
+    - `context_values` — the four per-side premium totals plus `source`.
+    - `score_history` — up to 90 recent `{score, timestamp}` points, oldest→newest.
+
+    **Trader interpretation.**
+    - `score > +50` with flat price → early bullish accumulation; potential breakout.
+    - `score < −50` with flat price → early distribution; watch for breakdown.
+    - Score **sign-flips** while price keeps trending → exhaustion warning.
+    - Score ≈ 0 during market hours with `source="unavailable"` → thin tape, not neutral.
+
+    **Page design.** Horizontal bidirectional bar (−100 → +100) with center
+    needle, green right / red left. Below: stacked bar of the four premium
+    components so the trader sees *which side* drives the imbalance.
+    Sparkline of `score_history` (90 pts) beneath. Footer chip shows `source`.
     """
     row = await db.get_basic_signal(symbol.upper(), "tape_flow_bias")
     if not row:
@@ -778,21 +842,61 @@ async def get_skew_delta_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
 ):
-    """Short-dated OTM skew deviation — real-time fear gauge.
+    """Short-dated OTM put-vs-call IV deviation — real-time fear gauge.
 
-    OTM-put vs OTM-call implied-vol spread measured against a configurable
-    baseline (index skew is structurally positive, so we score the
-    *deviation from normal*, not the raw spread).
+    Answers: *are traders paying an unusual premium for downside protection
+    right now?* Equity-index skew is structurally positive (OTM puts always
+    trade richer than OTM calls), so this signal scores the **deviation
+    from normal**, not the raw spread. Bid-up put skew typically moves
+    *before* the tape confirms bearishness — useful leading-indicator.
 
-    **Logic** (`src/signals/basic/skew_delta.py`):
-    - `spread = otm_put_iv − otm_call_iv` from `ctx.extra['skew']`.
-    - `deviation = spread − SIGNAL_SKEW_BASELINE`.
-    - `score = −clip(deviation / SIGNAL_SKEW_SATURATION, [-1, 1])` (elevated put skew → bearish).
+    **Logic highlights** (`src/signals/basic/skew_delta.py`):
+    - `spread = otm_put_iv − otm_call_iv` from `ctx.extra['skew']`
+      (populated by the unified engine from `option_chains` near ATM).
+    - `deviation = spread − SIGNAL_SKEW_BASELINE` (default baseline 0.02).
+    - `score = −clip(deviation / SIGNAL_SKEW_SATURATION, [-1, 1])`
+      (default saturation 0.04). Negative sign: elevated put skew → bearish.
+    - **Abstains (score=0)** if `otm_put_iv` or `otm_call_iv` is missing.
 
-    **Params:** `symbol` (default `SPY`). Returns 404 if no data exists.
+    **Params:**
+    - `symbol` (default `SPY`). Returns 404 if no row exists yet.
 
-    **Returns:** `score`, `direction`, `context_values` with `otm_put_iv`,
-    `otm_call_iv`, `spread`, `baseline`, `deviation`, and `score_history`.
+    **Returns:**
+    ```json
+    {
+      "underlying": "SPY", "timestamp": "...",
+      "clamped_score": -0.35, "score": -35.0, "direction": "bearish",
+      "weighted_score": 0.0, "weight": 0.0,
+      "otm_put_iv": 0.192,
+      "otm_call_iv": 0.147,
+      "spread": 0.045,
+      "deviation": 0.025,
+      "context_values": {
+        "otm_put_iv": 0.192, "otm_call_iv": 0.147,
+        "spread": 0.045, "baseline": 0.02, "deviation": 0.025
+      },
+      "score_history": [{"score": -14.1, "timestamp": "..."}, "...up to 90"]
+    }
+    ```
+
+    - `score` / `clamped_score` — `[-100, +100]` / `[-1, +1]`; negative = fear bid.
+    - `otm_put_iv` / `otm_call_iv` — IV as a fraction (e.g. `0.18` = 18%). `null` if missing.
+    - `spread` — `otm_put_iv − otm_call_iv`; typically `[0, 0.10]` for SPY. `null` if missing.
+    - `deviation` — `spread − baseline`; sign drives the score (positive → bearish score).
+    - `context_values` — the above plus `baseline` (the neutral-skew reference).
+    - `score_history` — up to 90 recent points.
+
+    **Trader interpretation.**
+    - `score < −40` → meaningful fear bid; tighten longs, consider downside hedges.
+    - `score > +30` (rare, call skew) → potential upside squeeze / short-covering setup.
+    - Steady negative drift while price rallies → distribution / bull-trap warning.
+    - `otm_put_iv == null` → no short-dated data this cycle; not the same as neutral.
+
+    **Page design.** Bidirectional ±100 gauge labeled "fear" (left) / "euphoria"
+    (right). Below, a two-line mini-chart of `otm_put_iv` and `otm_call_iv` as
+    % IV over `score_history` length, with a horizontal reference line at
+    `baseline` (the "normal skew" line). Color the gauge card red when
+    `score ≤ -40`, green when `score ≥ +30`.
     """
     row = await db.get_basic_signal(symbol.upper(), "skew_delta")
     if not row:
@@ -811,22 +915,73 @@ async def get_vanna_charm_flow_signal(
     symbol: str = Query(default="SPY"),
     db: DatabaseManager = Depends(get_db),
 ):
-    """Second-order greek pressure (vanna + charm) — dealer re-hedging bias.
+    """Second-order greek dealer-hedging pressure (vanna + charm).
 
-    Aggregates dealer vanna (dVega/dSpot) and charm (dDelta/dTime) exposure
-    across strikes. Positive = dealer buying pressure, negative = dealer
-    selling pressure. Charm contribution is amplified in the afternoon
-    session as expiry-day hedging accelerates.
+    Answers: *which way are dealers being forced to trade right now from IV
+    moves and time decay, independently of spot moves?*
 
-    **Logic** (`src/signals/basic/vanna_charm_flow.py`):
-    - Sum `dealer_vanna_exposure` + `dealer_charm_exposure × charm_amplification`.
-    - `score = clip(combined / SIGNAL_VANNA_CHARM_NORM, [-1, 1])`.
-    - Legacy rows (no dealer columns) fall back to negated market-aggregate values.
+    - **Vanna** (dVega/dSpot) — dealer delta changes when IV moves. Morning
+      IV crush forces vanna-short dealers to buy underlying (the classic
+      "vol-crush rally" that kills naked put sellers).
+    - **Charm** (dDelta/dTime) — decay of short-dated deltas toward expiry.
+      In the final ~2h, charm-short dealers short calls above spot are
+      forced to sell into weakness — accelerates afternoon drift.
 
-    **Params:** `symbol` (default `SPY`). Returns 404 if no data exists.
+    **Logic highlights** (`src/signals/basic/vanna_charm_flow.py`):
+    - Sum `dealer_vanna_exposure` + `dealer_charm_exposure × charm_amplification`
+      across all strikes in `gex_by_strike`.
+    - `charm_amplification` — 1.0 most of the day, ramps to 1.5 in the final
+      ~40% of the session (charm flow dominates into the close).
+    - `score = clip(combined / vc_norm, [-1, 1])`; `vc_norm` defaults to 5e7
+      (may be scaled per symbol via `normalizers`).
+    - **Abstains (score=0)** if `gex_by_strike` is empty.
+    - Legacy rows (no dealer columns) fall back to negated market-aggregate
+      exposures — signal still valid, less precise.
 
-    **Returns:** `score`, `direction`, `context_values` with `vanna_total`,
-    `charm_total`, `charm_amplification`, `vc_norm`, `source`, and `score_history`.
+    **Sign convention:** `+` score = dealer buying pressure (bullish tailwind);
+    `−` score = dealer selling pressure (bearish headwind).
+
+    **Params:**
+    - `symbol` (default `SPY`). Returns 404 if no row exists yet.
+
+    **Returns:**
+    ```json
+    {
+      "underlying": "SPY", "timestamp": "...",
+      "clamped_score": 0.42, "score": 42.0, "direction": "bullish",
+      "weighted_score": 0.0, "weight": 0.0,
+      "vanna_total": 18500000.0,
+      "charm_total": 9200000.0,
+      "charm_amplification": 1.18,
+      "source": "dealer_exposure",
+      "context_values": {
+        "vanna_total": 18500000.0, "charm_total": 9200000.0,
+        "charm_amplification": 1.18, "vc_norm": 50000000.0,
+        "source": "dealer_exposure"
+      },
+      "score_history": [{"score": 31.2, "timestamp": "..."}, "...up to 90"]
+    }
+    ```
+
+    - `score` / `clamped_score` — `[-100, +100]` / `[-1, +1]`; `+` = bullish.
+    - `vanna_total` — sum of dealer vanna exposure; `+` = dealer delta grows with spot ↑.
+    - `charm_total` — sum of dealer charm exposure; `+` = dealer delta grows with time.
+    - `charm_amplification` — `[1.0, 1.5]`; session-time multiplier. `1.5` = final 40%.
+    - `source` — `"dealer_exposure"` | `"market_exposure_negated"` (legacy fallback) | `"unavailable"`.
+    - `context_values` — the above plus `vc_norm` (saturation denominator).
+    - `score_history` — up to 90 recent points.
+
+    **Trader interpretation.**
+    - `score > +40` in the morning → vanna-driven melt-up; trend-follow upside.
+    - `score < −40` in the final 90 minutes → charm-driven afternoon fade; momentum shorts.
+    - Crosses zero into the afternoon → pressure reversal; trim directional size.
+    - `charm_amplification = 1.5` means we're in the EOD acceleration window.
+    - `source = "market_exposure_negated"` → lower-precision fallback; widen thresholds.
+
+    **Page design.** Two stacked horizontal bars: `vanna_total` and
+    `charm_total × charm_amplification`, colored by sign. A small clock gauge
+    shows `charm_amplification` on a 1.0→1.5 scale as "time pressure."
+    Composite `score` as a big number + direction chip on top. Source chip in footer.
     """
     row = await db.get_basic_signal(symbol.upper(), "vanna_charm_flow")
     if not row:
@@ -847,21 +1002,71 @@ async def get_dealer_delta_pressure_signal(
 ):
     """Dealer net-delta imbalance (DNI) — intraday leading indicator.
 
-    Estimates dealer net delta from per-strike OI × delta. Dealer short
-    delta → forced buying into rallies → bullish for price. Flow leads
-    gamma exposure intraday; this is the closest thing to a leading
-    indicator for 0DTE regimes.
+    Answers: *are dealers net-short delta (forced to buy rallies, bullish)
+    or net-long (forced to sell rallies, bearish)?* Delta flow leads gamma
+    exposure by minutes intraday — closest thing to a leading indicator
+    for 0DTE regimes. Gamma tells you *where* dealers will hedge; delta
+    tells you *how much they already are*.
 
-    **Logic** (`src/signals/basic/dealer_delta_pressure.py`):
-    - Prefer `ctx.dealer_net_delta` → `gex_by_strike.call_delta_oi/put_delta_oi`
-      → distance-from-spot proxy (ordered by precision).
-    - `score = −clip(dni / SIGNAL_DNI_NORM, [-1, 1])` (inverted: dealer short
-      delta is bullish for price).
+    **Logic highlights** (`src/signals/basic/dealer_delta_pressure.py`).
+    Three data paths in priority order:
+    1. `ctx.dealer_net_delta` — if populated upstream, used directly.
+    2. `gex_by_strike.{call_delta_oi, put_delta_oi}` — sum
+       `−(call_delta_oi + put_delta_oi)` across strikes (dealer sign is
+       flipped from customer OI; customers are typically long calls & puts).
+    3. Distance-proxy fallback — use `call_oi` / `put_oi` with a linear
+       delta proxy (0.5 at ATM, decaying to 0 at ±5% OTM), ×100 shares/contract.
 
-    **Params:** `symbol` (default `SPY`). Returns 404 if no data exists.
+    - `score = −clip(dni / SIGNAL_DNI_NORM, [-1, 1])` (default norm ~$3e8
+      shares-equivalent). **Inverted**: dealer short delta (negative DNI)
+      scores bullish, because they must buy into strength.
+    - **Abstains (score=0)** if no data path yields an estimate.
 
-    **Returns:** `score`, `direction`, `context_values` with
-    `dealer_net_delta_estimated`, `dni_normalized`, `source`, and `score_history`.
+    **Params:**
+    - `symbol` (default `SPY`). Returns 404 if no row exists yet.
+
+    **Returns:**
+    ```json
+    {
+      "underlying": "SPY", "timestamp": "...",
+      "clamped_score": 0.45, "score": 45.1, "direction": "bullish",
+      "weighted_score": 0.0, "weight": 0.0,
+      "dealer_net_delta_estimated": -135000000.0,
+      "dni_normalized": -0.45,
+      "source": "gex_by_strike.delta_oi",
+      "context_values": {
+        "dealer_net_delta_estimated": -135000000.0,
+        "dni_normalized": -0.45,
+        "source": "gex_by_strike.delta_oi"
+      },
+      "score_history": [{"score": 28.1, "timestamp": "..."}, "...up to 90"]
+    }
+    ```
+
+    - `score` / `clamped_score` — `[-100, +100]` / `[-1, +1]`; `+` = bullish.
+    - `dealer_net_delta_estimated` — shares-equivalent, signed.
+      Negative = dealer net **short** delta (bullish for price after inversion).
+    - `dni_normalized` — `dni / DNI_NORM` clipped to `[-1, +1]`.
+      **Sign is opposite the score** (signal is inverted).
+    - `source` — data-path quality:
+      `"dealer_net_delta_field"` (best) | `"gex_by_strike.delta_oi"` |
+      `"gex_by_strike.distance_proxy"` (weakest) | `"unavailable"`.
+    - `score_history` — up to 90 recent points.
+
+    **Trader interpretation.**
+    - `score > +60` → dealers deeply short delta; any up-move likely accelerated
+      (chase risk). Favor long-delta plays (calls, long futures).
+    - `score < −60` → dealers net long; rallies will be sold into. Favor
+      mean-reversion or short-delta debit spreads.
+    - `source = "gex_by_strike.distance_proxy"` → fallback-quality estimate;
+      widen conviction threshold before acting.
+    - **Cross-signal:** when this disagrees with `gex_gradient` (structural
+      view), trust `dealer_delta_pressure` on a ≤ 30m horizon.
+
+    **Page design.** Single horizontal ±100 bar labeled "Dealer Delta Pressure."
+    Subtext: `"Dealers short delta → bullish"` on `+` side;
+    `"Dealers long delta → bearish"` on `−` side. Data-quality chip shows
+    the `source` value. Sparkline of `score_history` beneath.
     """
     row = await db.get_basic_signal(symbol.upper(), "dealer_delta_pressure")
     if not row:
@@ -881,21 +1086,76 @@ async def get_gex_gradient_signal(
 ):
     """Gamma asymmetry around spot — above- vs below-spot dealer gamma skew.
 
-    Decomposes per-strike gamma exposure into above-spot / below-spot /
-    ATM / wing buckets. A heavy "above spot" skew signals dealer short
-    gamma into a rally — any up-move unwinds (bullish). Below-spot
-    dominance is the bearish mirror.
+    Answers: *is dealer gamma stacked above or below current price, and
+    how does that bias the next move?* Decomposes per-strike gamma
+    exposure into four zones (above / below spot, ATM, wings) and scores
+    the asymmetry, flipping sign and damping under long-gamma regimes.
 
-    **Logic** (`src/signals/basic/gex_gradient.py`):
-    - Score = asymmetry of |gamma above| vs |gamma below|, weighted by total notional.
-    - Abstains below `SIGNAL_GEX_GRADIENT_MIN_GAMMA` (thin OI protection).
-    - Long-gamma regimes dampened by `SIGNAL_GEX_GRADIENT_LONG_GAMMA_DAMPING`.
+    - Heavy **above-spot** concentration + short gamma → any up-move
+      unwinds → **bullish**. Below-spot mirror is **bearish**.
+    - Under **long-gamma** the same concentration acts as resistance
+      instead of fuel, so the signal is inverted and damped.
 
-    **Params:** `symbol` (default `SPY`). Returns 404 if no data exists.
+    **Logic highlights** (`src/signals/basic/gex_gradient.py`):
+    - Classify each strike in `gex_by_strike` by `(strike − spot) / spot`:
+      above/below, plus ATM (`≤ ±1.5%`) and wing (`≥ ±4%`) tags.
+    - `asymmetry = (above_abs − below_abs) / (above_abs + below_abs)` ∈ `[-1, +1]`.
+    - `raw = asymmetry` if `net_gex < 0`, else `−asymmetry × 0.40`
+      (`SIGNAL_GEX_GRADIENT_LONG_GAMMA_DAMPING`).
+    - `confidence = max(0.25, 1 − wing_fraction)` — wings pin, kill directional edge.
+    - `score = clip(raw × confidence, [-1, 1])`.
+    - **Abstains (score=0)** if total gamma `< SIGNAL_GEX_GRADIENT_MIN_GAMMA`
+      (default 5e7 — thin-OI guard).
 
-    **Returns:** `score`, `direction`, `context_values` with per-bucket gamma
-    breakdown (`above_spot_gamma_abs`, `below_spot_gamma_abs`, `atm_gamma_abs`,
-    `wing_gamma_abs`, `asymmetry`, `strike_count`), and `score_history`.
+    **Params:**
+    - `symbol` (default `SPY`). Returns 404 if no row exists yet.
+
+    **Returns:**
+    ```json
+    {
+      "underlying": "SPY", "timestamp": "...",
+      "clamped_score": 0.38, "score": 38.0, "direction": "bullish",
+      "weighted_score": 0.0, "weight": 0.0,
+      "above_spot_gamma_abs": 72500000.0,
+      "below_spot_gamma_abs": 31200000.0,
+      "asymmetry": 0.3986,
+      "wing_fraction": 0.21,
+      "context_values": {
+        "source": "gex_by_strike",
+        "above_spot_gamma_abs": 72500000.0, "below_spot_gamma_abs": 31200000.0,
+        "atm_gamma_abs": 45800000.0, "wing_gamma_abs": 21900000.0,
+        "above_spot_gamma_signed": 54300000.0, "below_spot_gamma_signed": -18700000.0,
+        "wing_fraction": 0.21, "asymmetry": 0.3986, "strike_count": 42
+      },
+      "score_history": [{"score": 22.0, "timestamp": "..."}, "...up to 90"]
+    }
+    ```
+
+    - `score` / `clamped_score` — `[-100, +100]` / `[-1, +1]`.
+    - `above_spot_gamma_abs` / `below_spot_gamma_abs` — `|Σ gamma|` for each side; USD-scaled. `null` if `source="unavailable"`.
+    - `asymmetry` — `[-1, +1]`; pre-regime adjustment. Matches score sign under `net_gex < 0`, flipped under `net_gex > 0`.
+    - `wing_fraction` — `[0, 1]`; share of total `|gamma|` at wing strikes (`> ±4%` OTM).
+    - `context_values.atm_gamma_abs` / `wing_gamma_abs` — absolute gamma in each bucket.
+    - `context_values.above_spot_gamma_signed` / `below_spot_gamma_signed` — signed sums.
+    - `context_values.strike_count` — int; strikes surveyed. Thin data → widen thresholds.
+    - `context_values.source` — `"gex_by_strike"` | `"unavailable"`.
+
+    **Trader interpretation.**
+    - `score > +50` with `net_gex < 0` → classic short-gamma upside setup;
+      dealers will chase. Favor calls.
+    - `score < −50` with `net_gex < 0` → short-gamma downside setup; dealers
+      accelerate flush.
+    - **Strong score with `net_gex > 0`** → structural resistance in that
+      direction; fade instead of follow.
+    - `wing_fraction > 0.5` → confidence already reduced by code; treat score
+      as weak even if magnitude is high.
+    - `strike_count < 10` → sparse data; widen threshold.
+
+    **Page design.** Four-zone horizontal strike map centered on spot: above-
+    and below-spot buckets as mirrored bars, intensity by `|signed gamma|`.
+    Separate ATM / wing donut slices showing concentration share. `asymmetry`
+    gauge (−1 → +1). Regime chip (`net_gex > 0` vs `< 0`) since the same
+    asymmetry has opposite implications in each regime.
     """
     row = await db.get_basic_signal(symbol.upper(), "gex_gradient")
     if not row:
@@ -916,22 +1176,85 @@ async def get_positioning_trap_signal(
 ):
     """Crowd-positioning trap — squeeze/flush risk from one-way crowding.
 
-    Flags setups where tape behavior starts invalidating crowd direction:
-    heavy put-buying into a rally (short-squeeze risk), or heavy call-buying
-    into a drop (long-flush risk). Uses signed net premium from
-    `flow_contract_facts` when available — more informative than raw total
-    premium because opposite-side buying nets out.
+    Flags setups where tape behavior is starting to invalidate crowd
+    direction — the classic squeeze/flush patterns.
 
-    **Logic** (`src/signals/basic/positioning_trap.py`):
-    - `squeeze = short_crowding + put_skew + above_flip + neg_gex` (bullish side).
-    - `flush  = long_crowding + call_skew + below_flip + neg_gex` (bearish side).
-    - `score = clip(squeeze − flush, [-1, 1])`.
+    - **`+score` (squeeze risk):** puts crowded + aggressive put-buying +
+      up-momentum + price above gamma flip + short-gamma regime →
+      upside squeeze fuel.
+    - **`−score` (flush risk):** calls crowded + aggressive call-buying +
+      down-momentum + price below gamma flip + short-gamma → downside
+      air-pocket.
 
-    **Params:** `symbol` (default `SPY`). Returns 404 if no data exists.
+    Uses **signed** net smart-money premium (`buy − sell`) from
+    `flow_contract_facts` when available — more informative than legacy
+    total_premium because opposite-side buying nets out (a big put-buy
+    + big put-sell should *not* count as crowd skew).
 
-    **Returns:** `score`, `direction`, `context_values` with `put_call_ratio`,
-    `smart_imbalance`, `smart_imbalance_source`, `momentum_5bar`, `close`,
-    `gamma_flip`, `net_gex`, and `score_history`.
+    **Logic highlights** (`src/signals/basic/positioning_trap.py`):
+    ```
+    short_crowding = clip((put_call_ratio − 1.05) / 0.35, [0, 1])
+    long_crowding  = clip((0.95 − put_call_ratio) / 0.35, [0, 1])
+    put_skew       = max(0, −smart_imbalance)
+    call_skew      = max(0, +smart_imbalance)
+
+    squeeze = 0.45·short_crowding + 0.25·put_skew
+            + 0.15·clip(momentum_5bar / 0.004, [0,1])
+            + 0.10·above_flip + 0.05·neg_gex
+    flush   = 0.45·long_crowding  + 0.25·call_skew
+            + 0.15·clip(−momentum_5bar / 0.004, [0,1])
+            + 0.10·below_flip + 0.05·neg_gex
+    score   = clip(squeeze − flush, [-1, 1])
+    ```
+    - `smart_imbalance = (smart_call_net − smart_put_net) / (|call_net| + |put_net|)`,
+      abstaining when denominator `< $100K`.
+
+    **Params:**
+    - `symbol` (default `SPY`). Returns 404 if no row exists yet.
+
+    **Returns:**
+    ```json
+    {
+      "underlying": "SPY", "timestamp": "...",
+      "clamped_score": 0.52, "score": 52.0, "direction": "bullish",
+      "weighted_score": 0.0, "weight": 0.0,
+      "smart_imbalance": -0.41,
+      "smart_imbalance_source": "signed_net_premium",
+      "momentum_5bar": 0.0025,
+      "context_values": {
+        "put_call_ratio": 1.28, "smart_imbalance": -0.41,
+        "smart_imbalance_source": "signed_net_premium",
+        "momentum_5bar": 0.0025, "close": 577.24,
+        "gamma_flip": 574.5, "net_gex": -2.1e8
+      },
+      "score_history": [{"score": 31.0, "timestamp": "..."}, "...up to 90"]
+    }
+    ```
+
+    - `score` / `clamped_score` — `[-100, +100]` / `[-1, +1]`. `+` = squeeze risk, `−` = flush risk.
+    - `smart_imbalance` — `[-1, +1]`; `+` = call-buy heavy, `−` = put-buy heavy.
+      Counter-intuitively, *put-heavy imbalance* drives `+score` (squeeze fuel).
+    - `smart_imbalance_source` — `"signed_net_premium"` (best) | `"signed_top_level"` (older fields).
+    - `momentum_5bar` — 5-bar price %, e.g. `0.0035` = +0.35%.
+    - `context_values.put_call_ratio` — float, typically `[0.5, 2.0]`.
+    - `context_values.close` / `gamma_flip` — used to derive `above_flip`/`below_flip`.
+    - `context_values.net_gex` — signed; `< 0` amplifies both sides.
+    - `score_history` — up to 90 recent points.
+
+    **Trader interpretation.**
+    - `score > +50` → upside squeeze setup. Long-delta; size up if
+      `close > gamma_flip` AND `net_gex < 0`.
+    - `score < −50` → downside flush setup. Put debit spreads; trim longs.
+    - Moderate magnitude (±25–50) **plus contradictory `tape_flow_bias`**
+      → the trap may already be unwinding; wait.
+    - `smart_imbalance_source = "signed_top_level"` → lower-precision fields;
+      signal still valid.
+
+    **Page design.** Horizontal ±100 "trap meter" with "Flush Risk" (left)
+    and "Squeeze Risk" (right). Decomposition panel showing the five input
+    factors as mini-bars (short/long_crowding, put/call_skew, momentum,
+    above/below_flip, neg_gex) so the trader sees *why*. Contextual footer
+    with `put_call_ratio`, `momentum_5bar %`, `close vs gamma_flip`, `net_gex` sign.
     """
     row = await db.get_basic_signal(symbol.upper(), "positioning_trap")
     if not row:
@@ -1163,22 +1486,81 @@ async def get_basic_confluence_matrix(
     lookback: int = Query(default=120, ge=10, le=2000),
     db: DatabaseManager = Depends(get_db),
 ):
-    """6×6 basic-signal agreement matrix — pairwise directional confluence over a rolling window.
+    """6×6 basic-signal agreement matrix — pairwise directional confluence.
 
-    Parallel to `/api/signals/advanced/confluence-matrix`, but scoped to the six
-    Basic Signals persisted by `BasicSignalEngine`. These are continuous
-    directional reads (no triggered events) so every non-zero snapshot
-    contributes to agreement/disagreement counts.
+    Parallel to `/api/signals/advanced/confluence-matrix`, scoped to the six
+    Basic Signals persisted by `BasicSignalEngine`. Answers: *which of my
+    basic signals normally agree, and where is an unusual divergence right now?*
+    Continuous directional reads (no triggered events) — every non-zero
+    snapshot contributes to agreement/disagreement counts.
+
+    **Logic** (`src/api/database.py`): Joins `signal_scores` ×
+    `signal_component_scores` for the last `lookback` timestamps, filtered
+    to the six basic signal names. Each score is bucketed `+1 / 0 / −1`
+    with `neutral_epsilon = 0.02`. For each ordered pair `(c1, c2)`:
+    - `observations` = cycles where both signals have data.
+    - `active_observations` = cycles where both signs are non-zero.
+    - `agreement` = same non-zero sign; `disagreement` = opposite non-zero signs.
 
     **Params:**
     - `symbol` (default `SPY`).
-    - `lookback` — 10–2000, default 120.
+    - `lookback` — 10–2000, default 120. Number of recent timestamps.
 
-    **Signals (6, fixed order):** `tape_flow_bias`, `skew_delta`, `vanna_charm_flow`,
-    `dealer_delta_pressure`, `gex_gradient`, `positioning_trap`.
+    **Signals (6, fixed order):** `tape_flow_bias`, `skew_delta`,
+    `vanna_charm_flow`, `dealer_delta_pressure`, `gex_gradient`, `positioning_trap`.
 
-    **Returns:** identical schema to the advanced variant — see
-    `/api/signals/advanced/confluence-matrix` for field docs.
+    **Returns:**
+    ```json
+    {
+      "underlying": "SPY",
+      "lookback": 120,
+      "components": ["tape_flow_bias", "skew_delta", "vanna_charm_flow",
+                     "dealer_delta_pressure", "gex_gradient", "positioning_trap"],
+      "row_order":  ["tape_flow_bias", "skew_delta", "...4 more..."],
+      "matrix": {
+        "tape_flow_bias": {
+          "skew_delta": {
+            "observations": 118,
+            "active_observations": 92,
+            "agreement_count": 74,
+            "disagreement_count": 18,
+            "neutral_count": 26,
+            "agreement_ratio": 0.8043,
+            "disagreement_ratio": 0.1957,
+            "net_confluence": 0.6087
+          }
+        }
+      },
+      "sample_count": 118,
+      "latest_timestamp": "2026-04-22T18:55:00Z"
+    }
+    ```
+
+    - `components` / `row_order` — length-6 string array; axis labels.
+    - `matrix[c1][c2].observations` — int, `[0, lookback]`; cycles where both had data.
+    - `matrix[c1][c2].active_observations` — int, `[0, observations]`; both non-zero.
+    - `matrix[c1][c2].agreement_count` — int, `[0, active_observations]`.
+    - `matrix[c1][c2].disagreement_count` — int, `[0, active_observations]`.
+    - `matrix[c1][c2].neutral_count` — int, `[0, observations]`; at least one side was 0.
+    - `matrix[c1][c2].agreement_ratio` — `[0, 1]` | `null` if `active == 0`; 4 decimals.
+    - `matrix[c1][c2].disagreement_ratio` — `[0, 1]` | `null`.
+    - `matrix[c1][c2].net_confluence` — `[-1, +1]`; `0.0` if `active == 0`. Heatmap value.
+    - `sample_count` — int; distinct timestamps aggregated.
+    - `latest_timestamp` — ISO-8601 UTC | `null` if empty.
+
+    **Trader interpretation.**
+    - `net_confluence > +0.5` — pair agrees > 75% of active cycles. Live
+      **disagreement** from such a pair is a flag.
+    - `net_confluence < −0.3` — pair structurally disagrees. Live
+      **agreement** = unusual consensus.
+    - `active_observations < ~20` — weak sample; discount.
+    - Diagonal cells always `net_confluence = 1.0`; sanity check only.
+
+    **Page design.** 6×6 heatmap with diverging color scale (green = +1
+    agree, white = 0, red = −1 disagree). Cell tooltip shows
+    `agreement_ratio / disagreement_ratio / observations`. Sort rows by
+    average `agreement_ratio` to surface consensus signals at top, outliers
+    at bottom. Symmetric — render only the upper triangle if space-constrained.
     """
     return await _confluence_matrix_response(
         db, symbol, lookback, list(_BASIC_SIGNAL_NAMES)

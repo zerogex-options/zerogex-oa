@@ -192,6 +192,59 @@ Get momentum divergence signals.
 
 ---
 
+## Signals
+
+Signal endpoints surface the Market State Index composite, Advanced Signals
+(triggered events with hysteresis), and Basic Signals (continuous
+directional reads). Full per-endpoint field semantics, ranges, trader
+interpretation, and page-design notes live in Swagger (`/docs`) — this
+section is a path quick-reference.
+
+### Composite & trades
+
+- `GET /api/signals/score` — latest MSI composite score, regime label, component breakdown.
+- `GET /api/signals/score-history` — time series of composite scores + contributions.
+- `GET /api/signals/trades-live` — open trade ideas derived from current signal state.
+- `GET /api/signals/trades-history` — realized trade ideas with P&L / hit rate.
+
+### Advanced Signals (6, triggered + hysteresis)
+
+- `GET /api/signals/advanced/vol-expansion`
+- `GET /api/signals/advanced/eod-pressure`
+- `GET /api/signals/advanced/squeeze-setup`
+- `GET /api/signals/advanced/trap-detection`
+- `GET /api/signals/advanced/0dte-position-imbalance`
+- `GET /api/signals/advanced/gamma-vwap-confluence`
+- `GET /api/signals/advanced/confluence-matrix` — 6×6 pairwise agreement over rolling lookback.
+
+### Basic Signals (6, continuous directional reads, weight=0)
+
+- `GET /api/signals/basic` — bundle: latest snapshot of all six in one response.
+- `GET /api/signals/basic/tape-flow-bias` — signed option-tape premium imbalance.
+- `GET /api/signals/basic/skew-delta` — short-dated OTM put-vs-call IV deviation (fear gauge).
+- `GET /api/signals/basic/vanna-charm-flow` — second-order greek dealer-hedging pressure.
+- `GET /api/signals/basic/dealer-delta-pressure` — estimated dealer net-delta imbalance (DNI).
+- `GET /api/signals/basic/gex-gradient` — dealer gamma asymmetry above vs below spot.
+- `GET /api/signals/basic/positioning-trap` — squeeze/flush risk from one-way crowding.
+- `GET /api/signals/basic/confluence-matrix` — 6×6 pairwise agreement over rolling lookback.
+
+### Cross-cutting
+
+- `GET /api/signals/{signal_name}/events` — per-signal time-series with direction-flip
+  detection and forward realized returns. Accepts any of the 12 advanced/basic names.
+
+**Common response shape (per-signal):**
+- `underlying`, `timestamp` (ISO-8601 UTC).
+- `clamped_score` ∈ `[-1, +1]`; `score` = `clamped_score × 100` ∈ `[-100, +100]`.
+- `direction` ∈ `"bullish" | "bearish" | "neutral"`.
+- `context_values` — signal-specific inputs/derived fields.
+- `score_history` — up to 90 recent `{score, timestamp}` points, oldest→newest.
+
+Returns `404` when a signal has no row yet for the symbol. Weight is `0.0`
+for all Advanced and Basic Signals (they do not contribute to the MSI).
+
+---
+
 ## Interactive API Docs
 
 ### GET /docs
