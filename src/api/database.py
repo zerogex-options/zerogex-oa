@@ -2062,7 +2062,7 @@ class DatabaseManager:
         limit: int = 50
     ) -> List[Dict[str, Any]]:
         """Get smart-money events from canonical flow_contract_facts."""
-        session_start, session_end = _get_session_bounds(session)
+        session_start, session_end = _get_flow_session_bounds(session)
         limit = max(1, min(int(limit), 50))
         query = """
             WITH

@@ -305,7 +305,7 @@ async def get_smart_money_flow(
     limit: int = Query(default=50, ge=1, le=50)
 ):
     """Get unusual activity / smart money flow — 1-min intervals.
-    session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
+    Session runs 07:15–16:15 ET. session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
     try:
         data = await db_manager.get_smart_money_flow(symbol, session, min(limit, 50))
         return [SmartMoneyFlowPoint(**row) for row in data]
