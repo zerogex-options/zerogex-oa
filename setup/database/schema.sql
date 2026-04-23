@@ -460,41 +460,30 @@ CREATE INDEX IF NOT EXISTS idx_flow_contract_facts_symbol_ts_exp
 CREATE INDEX IF NOT EXISTS idx_flow_contract_facts_symbol_ts_type
     ON flow_contract_facts(symbol, timestamp DESC, option_type);
 
-CREATE TABLE IF NOT EXISTS flow_by_type (
+-- Unified 5-minute-bucketed flow rollup keyed by (type, strike, expiration).
+-- Replaces the legacy flow_by_type / flow_by_strike / flow_by_expiration
+-- cache tables, which have been consolidated into a single source of truth.
+DROP TABLE IF EXISTS flow_by_type CASCADE;
+DROP TABLE IF EXISTS flow_by_strike CASCADE;
+DROP TABLE IF EXISTS flow_by_expiration CASCADE;
+
+CREATE TABLE IF NOT EXISTS flow_by_contract (
     timestamp TIMESTAMPTZ NOT NULL,
     symbol VARCHAR(10) NOT NULL,
     option_type CHAR(1) NOT NULL CHECK (option_type IN ('C', 'P')),
-    total_volume BIGINT NOT NULL,
-    total_premium NUMERIC(18, 2) NOT NULL,
-    avg_iv NUMERIC(10, 6),
-    net_delta NUMERIC(18, 4),
-    underlying_price NUMERIC(12, 4),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (timestamp, symbol, option_type)
-);
-
-CREATE TABLE IF NOT EXISTS flow_by_strike (
-    timestamp TIMESTAMPTZ NOT NULL,
-    symbol VARCHAR(10) NOT NULL,
     strike NUMERIC(12, 4) NOT NULL,
-    total_volume BIGINT NOT NULL,
-    total_premium NUMERIC(18, 2) NOT NULL,
-    avg_iv NUMERIC(10, 6),
-    net_delta NUMERIC(18, 4),
-    underlying_price NUMERIC(12, 4),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (timestamp, symbol, strike)
-);
-
-CREATE TABLE IF NOT EXISTS flow_by_expiration (
-    timestamp TIMESTAMPTZ NOT NULL,
-    symbol VARCHAR(10) NOT NULL,
     expiration DATE NOT NULL,
-    total_volume BIGINT NOT NULL,
-    total_premium NUMERIC(18, 2) NOT NULL,
+    total_volume BIGINT NOT NULL DEFAULT 0,
+    total_premium NUMERIC(18, 2) NOT NULL DEFAULT 0,
+    buy_volume BIGINT NOT NULL DEFAULT 0,
+    sell_volume BIGINT NOT NULL DEFAULT 0,
+    buy_premium NUMERIC(18, 2) NOT NULL DEFAULT 0,
+    sell_premium NUMERIC(18, 2) NOT NULL DEFAULT 0,
+    avg_iv NUMERIC(10, 6),
+    avg_delta NUMERIC(10, 6),
     underlying_price NUMERIC(12, 4),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (timestamp, symbol, expiration)
+    PRIMARY KEY (timestamp, symbol, option_type, strike, expiration)
 );
 
 CREATE TABLE IF NOT EXISTS flow_smart_money (
@@ -514,51 +503,14 @@ CREATE TABLE IF NOT EXISTS flow_smart_money (
     PRIMARY KEY (timestamp, symbol, option_symbol)
 );
 
--- Idempotent migration: add buy/sell volume & premium columns for Lee-Ready
--- trade direction classification.
-DO $$
-BEGIN
-    -- flow_by_type
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='flow_by_type' AND column_name='buy_volume'
-    ) THEN
-        ALTER TABLE flow_by_type
-            ADD COLUMN buy_volume BIGINT DEFAULT 0,
-            ADD COLUMN sell_volume BIGINT DEFAULT 0,
-            ADD COLUMN buy_premium NUMERIC(18, 2) DEFAULT 0,
-            ADD COLUMN sell_premium NUMERIC(18, 2) DEFAULT 0;
-    END IF;
-    -- flow_by_strike
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='flow_by_strike' AND column_name='buy_volume'
-    ) THEN
-        ALTER TABLE flow_by_strike
-            ADD COLUMN buy_volume BIGINT DEFAULT 0,
-            ADD COLUMN sell_volume BIGINT DEFAULT 0,
-            ADD COLUMN buy_premium NUMERIC(18, 2) DEFAULT 0,
-            ADD COLUMN sell_premium NUMERIC(18, 2) DEFAULT 0;
-    END IF;
-    -- flow_by_expiration
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='flow_by_expiration' AND column_name='buy_volume'
-    ) THEN
-        ALTER TABLE flow_by_expiration
-            ADD COLUMN buy_volume BIGINT DEFAULT 0,
-            ADD COLUMN sell_volume BIGINT DEFAULT 0,
-            ADD COLUMN buy_premium NUMERIC(18, 2) DEFAULT 0,
-            ADD COLUMN sell_premium NUMERIC(18, 2) DEFAULT 0;
-    END IF;
-END $$;
-
-CREATE INDEX IF NOT EXISTS idx_flow_by_type_symbol_ts
-    ON flow_by_type(symbol, timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_flow_by_strike_symbol_ts
-    ON flow_by_strike(symbol, timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_flow_by_expiration_symbol_ts
-    ON flow_by_expiration(symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts
+    ON flow_by_contract(symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts_strike
+    ON flow_by_contract(symbol, timestamp DESC, strike);
+CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts_exp
+    ON flow_by_contract(symbol, timestamp DESC, expiration);
+CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts_type
+    ON flow_by_contract(symbol, timestamp DESC, option_type);
 CREATE INDEX IF NOT EXISTS idx_flow_smart_money_symbol_ts
     ON flow_smart_money(symbol, timestamp DESC);
 

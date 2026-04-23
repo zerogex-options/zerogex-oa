@@ -270,7 +270,10 @@ class UnifiedSignalEngine:
                     )
 
                 # Lee-Ready-classified flow per option type for the most recent
-                # 15-minute window. Powers tape_flow_bias.
+                # 15-minute window. Powers tape_flow_bias. Sources from
+                # flow_contract_facts now that the per-minute flow_by_type
+                # cache has been merged into the unified flow_by_contract
+                # rollup.
                 flow_by_type_rows: list[dict] = []
                 try:
                     cur.execute(
@@ -280,7 +283,7 @@ class UnifiedSignalEngine:
                                SUM(COALESCE(sell_volume, 0))   AS sell_volume,
                                SUM(COALESCE(buy_premium, 0))   AS buy_premium,
                                SUM(COALESCE(sell_premium, 0))  AS sell_premium
-                        FROM flow_by_type
+                        FROM flow_contract_facts
                         WHERE symbol = %s
                           AND timestamp BETWEEN %s - INTERVAL '15 minutes' AND %s
                         GROUP BY option_type
@@ -299,7 +302,7 @@ class UnifiedSignalEngine:
                         )
                 except Exception as exc:  # pragma: no cover - defensive
                     logger.warning(
-                        "UnifiedSignalEngine [%s]: flow_by_type fetch failed: %s",
+                        "UnifiedSignalEngine [%s]: per-type flow fetch failed: %s",
                         self.db_symbol,
                         exc,
                     )
@@ -394,12 +397,10 @@ class UnifiedSignalEngine:
                     sm_call, sm_put = cur.fetchone() or (0.0, 0.0)
                     sm_call_gross, sm_put_gross = abs(sm_call), abs(sm_put)
 
-                # C6: true 0DTE flow by option_type and moneyness.  Previously
-                # /api/signals/advanced/0dte-position-imbalance used flow_by_type which
-                # has no expiration column and therefore aggregated every DTE.
-                # flow_contract_facts exposes expiration + strike so we can
-                # filter to today's expiration and split by OTM/ATM moneyness
-                # for the improved per-signal scoring (S5).
+                # C6: true 0DTE flow by option_type and moneyness. Filters
+                # flow_contract_facts to today's expiration and splits by
+                # strike so the advanced 0dte-position-imbalance signal can
+                # weight OTM/ATM moneyness independently (S5 scoring).
                 zero_dte_flow: list[dict] = []
                 try:
                     cur.execute(
@@ -452,7 +453,7 @@ class UnifiedSignalEngine:
                                 END AS bucket,
                                 option_type,
                                 SUM(COALESCE(buy_premium, 0) - COALESCE(sell_premium, 0)) AS net_premium
-                            FROM flow_by_type
+                            FROM flow_contract_facts
                             WHERE symbol = %s
                               AND timestamp BETWEEN %s - INTERVAL '30 minutes' AND %s
                             GROUP BY 1, 2

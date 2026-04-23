@@ -407,7 +407,6 @@ class DatabaseManager:
 
     async def _do_refresh_flow_cache(self, conn: asyncpg.Connection, symbol: str) -> None:
         """Inner implementation of flow cache refresh."""
-        canonical_only = os.getenv("FLOW_CANONICAL_ONLY", "true").lower() == "true"
         # Use ORDER BY + LIMIT 1 instead of MAX() to exploit the
         # (underlying, timestamp DESC) index as an index-only scan.
         latest_ts = await conn.fetchval(
@@ -657,325 +656,6 @@ class DatabaseManager:
             underlying_price,
             last_fact_ts if last_fact_ts is not None else datetime(1970, 1, 1, tzinfo=timezone.utc),
         )
-
-        if not canonical_only:
-            # One-time bootstrap for the new expiration cache table so endpoint
-            # can serve historical buckets immediately after deployment.
-            expiration_seeded = await conn.fetchval(
-                """
-                SELECT 1
-                FROM flow_by_expiration
-                WHERE symbol = $1
-                LIMIT 1
-                """,
-                symbol,
-            )
-            if not expiration_seeded:
-                await conn.execute(
-                    """
-                    INSERT INTO flow_by_expiration (
-                        timestamp,
-                        symbol,
-                        expiration,
-                        total_volume,
-                        total_premium
-                    )
-                    SELECT
-                        timestamp,
-                        underlying,
-                        expiration,
-                        SUM(volume_delta)::bigint,
-                        SUM(volume_delta * COALESCE(last, 0) * 100)::numeric
-                    FROM option_chains_with_deltas
-                    WHERE underlying = $1
-                      AND timestamp >= NOW() - INTERVAL '90 minutes'
-                      AND volume_delta > 0
-                    GROUP BY timestamp, underlying, expiration
-                    ON CONFLICT (timestamp, symbol, expiration)
-                    DO NOTHING
-                    """,
-                    symbol,
-                )
-
-        type_exists = True if canonical_only else await conn.fetchval(
-            """
-            SELECT 1 FROM flow_by_type
-            WHERE symbol = $1 AND timestamp = $2
-            LIMIT 1
-            """,
-            symbol,
-            latest_ts,
-        )
-        if not type_exists:
-            await conn.execute(
-                """
-                WITH with_prev AS (
-                    SELECT
-                        oc.timestamp,
-                        oc.option_symbol,
-                        oc.option_type,
-                        oc.strike,
-                        oc.expiration,
-                        oc.last,
-                        oc.implied_volatility,
-                        oc.delta,
-                        CASE
-                            WHEN LAG(oc.volume) OVER w IS NULL THEN COALESCE(oc.volume, 0)
-                            WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
-                                = (oc.timestamp AT TIME ZONE 'America/New_York')::date
-                                THEN GREATEST(COALESCE(oc.volume, 0) - COALESCE(LAG(oc.volume) OVER w, 0), 0)
-                            ELSE COALESCE(oc.volume, 0)
-                        END::bigint AS volume_delta,
-                        CASE
-                            WHEN LAG(oc.ask_volume) OVER w IS NULL THEN COALESCE(oc.ask_volume, 0)
-                            WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
-                                = (oc.timestamp AT TIME ZONE 'America/New_York')::date
-                                THEN GREATEST(COALESCE(oc.ask_volume, 0) - COALESCE(LAG(oc.ask_volume) OVER w, 0), 0)
-                            ELSE COALESCE(oc.ask_volume, 0)
-                        END::bigint AS ask_vol_delta,
-                        CASE
-                            WHEN LAG(oc.bid_volume) OVER w IS NULL THEN COALESCE(oc.bid_volume, 0)
-                            WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
-                                = (oc.timestamp AT TIME ZONE 'America/New_York')::date
-                                THEN GREATEST(COALESCE(oc.bid_volume, 0) - COALESCE(LAG(oc.bid_volume) OVER w, 0), 0)
-                            ELSE COALESCE(oc.bid_volume, 0)
-                        END::bigint AS bid_vol_delta
-                    FROM option_chains oc
-                    WHERE oc.underlying = $1
-                      AND oc.timestamp >= $2::timestamptz - INTERVAL '2 minutes'
-                      AND oc.timestamp <= $2
-                    WINDOW w AS (PARTITION BY oc.option_symbol ORDER BY oc.timestamp)
-                )
-                INSERT INTO flow_by_type (
-                    timestamp,
-                    symbol,
-                    option_type,
-                    total_volume,
-                    total_premium,
-                    avg_iv,
-                    net_delta,
-                    buy_volume,
-                    sell_volume,
-                    buy_premium,
-                    sell_premium,
-                    underlying_price
-                )
-                SELECT
-                    timestamp,
-                    $1::varchar,
-                    option_type,
-                    SUM(volume_delta)::bigint,
-                    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
-                    AVG(implied_volatility)::numeric,
-                    SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric,
-                    SUM(ask_vol_delta)::bigint,
-                    SUM(bid_vol_delta)::bigint,
-                    SUM(ask_vol_delta * COALESCE(last, 0) * 100)::numeric,
-                    SUM(bid_vol_delta * COALESCE(last, 0) * 100)::numeric,
-                    $3::numeric
-                FROM with_prev
-                WHERE timestamp = $2
-                  AND volume_delta > 0
-                GROUP BY timestamp, option_type
-                ON CONFLICT (timestamp, symbol, option_type)
-                DO UPDATE SET
-                    total_volume = EXCLUDED.total_volume,
-                    total_premium = EXCLUDED.total_premium,
-                    avg_iv = EXCLUDED.avg_iv,
-                    net_delta = EXCLUDED.net_delta,
-                    buy_volume = EXCLUDED.buy_volume,
-                    sell_volume = EXCLUDED.sell_volume,
-                    buy_premium = EXCLUDED.buy_premium,
-                    sell_premium = EXCLUDED.sell_premium,
-                    underlying_price = EXCLUDED.underlying_price,
-                    updated_at = NOW()
-                """,
-                symbol,
-                latest_ts,
-                underlying_price,
-            )
-
-        strike_exists = True if canonical_only else await conn.fetchval(
-            """
-            SELECT 1 FROM flow_by_strike
-            WHERE symbol = $1 AND timestamp = $2
-            LIMIT 1
-            """,
-            symbol,
-            latest_ts,
-        )
-        if not strike_exists:
-            await conn.execute(
-                """
-                WITH with_prev AS (
-                    SELECT
-                        oc.timestamp,
-                        oc.option_type,
-                        oc.strike,
-                        oc.last,
-                        oc.implied_volatility,
-                        CASE
-                            WHEN LAG(oc.volume) OVER w IS NULL THEN COALESCE(oc.volume, 0)
-                            WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
-                                = (oc.timestamp AT TIME ZONE 'America/New_York')::date
-                                THEN GREATEST(COALESCE(oc.volume, 0) - COALESCE(LAG(oc.volume) OVER w, 0), 0)
-                            ELSE COALESCE(oc.volume, 0)
-                        END::bigint AS volume_delta,
-                        CASE
-                            WHEN LAG(oc.ask_volume) OVER w IS NULL THEN COALESCE(oc.ask_volume, 0)
-                            WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
-                                = (oc.timestamp AT TIME ZONE 'America/New_York')::date
-                                THEN GREATEST(COALESCE(oc.ask_volume, 0) - COALESCE(LAG(oc.ask_volume) OVER w, 0), 0)
-                            ELSE COALESCE(oc.ask_volume, 0)
-                        END::bigint AS ask_vol_delta,
-                        CASE
-                            WHEN LAG(oc.bid_volume) OVER w IS NULL THEN COALESCE(oc.bid_volume, 0)
-                            WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
-                                = (oc.timestamp AT TIME ZONE 'America/New_York')::date
-                                THEN GREATEST(COALESCE(oc.bid_volume, 0) - COALESCE(LAG(oc.bid_volume) OVER w, 0), 0)
-                            ELSE COALESCE(oc.bid_volume, 0)
-                        END::bigint AS bid_vol_delta
-                    FROM option_chains oc
-                    WHERE oc.underlying = $1
-                      AND oc.timestamp >= $2::timestamptz - INTERVAL '2 minutes'
-                      AND oc.timestamp <= $2
-                    WINDOW w AS (PARTITION BY oc.option_symbol ORDER BY oc.timestamp)
-                )
-                INSERT INTO flow_by_strike (
-                    timestamp,
-                    symbol,
-                    strike,
-                    total_volume,
-                    total_premium,
-                    avg_iv,
-                    net_delta,
-                    buy_volume,
-                    sell_volume,
-                    buy_premium,
-                    sell_premium,
-                    underlying_price
-                )
-                SELECT
-                    timestamp,
-                    $1::varchar,
-                    strike,
-                    SUM(volume_delta)::bigint,
-                    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
-                    AVG(implied_volatility)::numeric,
-                    SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric,
-                    SUM(ask_vol_delta)::bigint,
-                    SUM(bid_vol_delta)::bigint,
-                    SUM(ask_vol_delta * COALESCE(last, 0) * 100)::numeric,
-                    SUM(bid_vol_delta * COALESCE(last, 0) * 100)::numeric,
-                    $3::numeric
-                FROM with_prev
-                WHERE timestamp = $2
-                  AND volume_delta > 0
-                GROUP BY timestamp, strike
-                ON CONFLICT (timestamp, symbol, strike)
-                DO UPDATE SET
-                    total_volume = EXCLUDED.total_volume,
-                    total_premium = EXCLUDED.total_premium,
-                    avg_iv = EXCLUDED.avg_iv,
-                    net_delta = EXCLUDED.net_delta,
-                    buy_volume = EXCLUDED.buy_volume,
-                    sell_volume = EXCLUDED.sell_volume,
-                    buy_premium = EXCLUDED.buy_premium,
-                    sell_premium = EXCLUDED.sell_premium,
-                    underlying_price = EXCLUDED.underlying_price,
-                    updated_at = NOW()
-                """,
-                symbol,
-                latest_ts,
-                underlying_price,
-            )
-
-        expiration_exists = True if canonical_only else await conn.fetchval(
-            """
-            SELECT 1 FROM flow_by_expiration
-            WHERE symbol = $1 AND timestamp = $2
-            LIMIT 1
-            """,
-            symbol,
-            latest_ts,
-        )
-        if not expiration_exists:
-            await conn.execute(
-                """
-                WITH with_prev AS (
-                    SELECT
-                        oc.timestamp,
-                        oc.expiration,
-                        oc.last,
-                        CASE
-                            WHEN LAG(oc.volume) OVER w IS NULL THEN COALESCE(oc.volume, 0)
-                            WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
-                                = (oc.timestamp AT TIME ZONE 'America/New_York')::date
-                                THEN GREATEST(COALESCE(oc.volume, 0) - COALESCE(LAG(oc.volume) OVER w, 0), 0)
-                            ELSE COALESCE(oc.volume, 0)
-                        END::bigint AS volume_delta,
-                        CASE
-                            WHEN LAG(oc.ask_volume) OVER w IS NULL THEN COALESCE(oc.ask_volume, 0)
-                            WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
-                                = (oc.timestamp AT TIME ZONE 'America/New_York')::date
-                                THEN GREATEST(COALESCE(oc.ask_volume, 0) - COALESCE(LAG(oc.ask_volume) OVER w, 0), 0)
-                            ELSE COALESCE(oc.ask_volume, 0)
-                        END::bigint AS ask_vol_delta,
-                        CASE
-                            WHEN LAG(oc.bid_volume) OVER w IS NULL THEN COALESCE(oc.bid_volume, 0)
-                            WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
-                                = (oc.timestamp AT TIME ZONE 'America/New_York')::date
-                                THEN GREATEST(COALESCE(oc.bid_volume, 0) - COALESCE(LAG(oc.bid_volume) OVER w, 0), 0)
-                            ELSE COALESCE(oc.bid_volume, 0)
-                        END::bigint AS bid_vol_delta
-                    FROM option_chains oc
-                    WHERE oc.underlying = $1
-                      AND oc.timestamp >= $2::timestamptz - INTERVAL '2 minutes'
-                      AND oc.timestamp <= $2
-                    WINDOW w AS (PARTITION BY oc.option_symbol ORDER BY oc.timestamp)
-                )
-                INSERT INTO flow_by_expiration (
-                    timestamp,
-                    symbol,
-                    expiration,
-                    total_volume,
-                    total_premium,
-                    buy_volume,
-                    sell_volume,
-                    buy_premium,
-                    sell_premium,
-                    underlying_price
-                )
-                SELECT
-                    timestamp,
-                    $1::varchar,
-                    expiration,
-                    SUM(volume_delta)::bigint,
-                    SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
-                    SUM(ask_vol_delta)::bigint,
-                    SUM(bid_vol_delta)::bigint,
-                    SUM(ask_vol_delta * COALESCE(last, 0) * 100)::numeric,
-                    SUM(bid_vol_delta * COALESCE(last, 0) * 100)::numeric,
-                    $3::numeric
-                FROM with_prev
-                WHERE timestamp = $2
-                  AND volume_delta > 0
-                GROUP BY timestamp, expiration
-                ON CONFLICT (timestamp, symbol, expiration)
-                DO UPDATE SET
-                    total_volume = EXCLUDED.total_volume,
-                    total_premium = EXCLUDED.total_premium,
-                    buy_volume = EXCLUDED.buy_volume,
-                    sell_volume = EXCLUDED.sell_volume,
-                    buy_premium = EXCLUDED.buy_premium,
-                    sell_premium = EXCLUDED.sell_premium,
-                    underlying_price = EXCLUDED.underlying_price,
-                    updated_at = NOW()
-                """,
-                symbol,
-                latest_ts,
-                underlying_price,
-            )
 
         smart_exists = await conn.fetchval(
             """
@@ -1576,107 +1256,84 @@ class DatabaseManager:
     # Options Flow Queries (from views)
     # ========================================================================
 
-    async def get_flow_by_type(
+    async def get_flow(
         self,
         symbol: str = 'SPY',
-        session: str = 'current'
+        session: str = 'current',
     ) -> List[Dict[str, Any]]:
-        """Get option flow by type from canonical flow_contract_facts."""
+        """Get unified option flow keyed by (type, strike, expiration) in 5-min buckets.
+
+        Reads from the flow_by_contract rollup populated by the analytics
+        engine and decorates each row with running cumulative totals plus a
+        per (strike, expiration) running put/call ratio.
+        """
         symbol = symbol.upper()
-        cache_key = f"flow_by_type:{symbol}:{session}"
+        cache_key = f"flow:{symbol}:{session}"
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached
 
         session_start, session_end = _get_flow_session_bounds(session)
         query = """
-            WITH minutes AS (
-                SELECT generate_series(
-                    date_trunc('minute', $2::timestamptz),
-                    date_trunc('minute', $3::timestamptz),
-                    interval '1 minute'
-                ) AS timestamp
-            ),
-            aggregated AS (
-                SELECT
-                    date_trunc('minute', timestamp) AS timestamp,
-                    symbol,
-                    SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE 0 END) AS call_volume,
-                    SUM(CASE WHEN option_type = 'C' THEN premium_delta ELSE 0 END) AS call_premium,
-                    SUM(CASE WHEN option_type = 'P' THEN volume_delta ELSE 0 END) AS put_volume,
-                    SUM(CASE WHEN option_type = 'P' THEN premium_delta ELSE 0 END) AS put_premium,
-                    SUM(CASE WHEN option_type = 'C' THEN buy_volume ELSE 0 END) AS call_buy_volume,
-                    SUM(CASE WHEN option_type = 'C' THEN sell_volume ELSE 0 END) AS call_sell_volume,
-                    SUM(CASE WHEN option_type = 'P' THEN buy_volume ELSE 0 END) AS put_buy_volume,
-                    SUM(CASE WHEN option_type = 'P' THEN sell_volume ELSE 0 END) AS put_sell_volume,
-                    SUM(CASE WHEN option_type = 'C' THEN buy_premium ELSE 0 END) AS call_buy_premium,
-                    SUM(CASE WHEN option_type = 'C' THEN sell_premium ELSE 0 END) AS call_sell_premium,
-                    SUM(CASE WHEN option_type = 'P' THEN buy_premium ELSE 0 END) AS put_buy_premium,
-                    SUM(CASE WHEN option_type = 'P' THEN sell_premium ELSE 0 END) AS put_sell_premium,
-                    MAX(underlying_price) AS underlying_price
-                FROM flow_contract_facts
-                WHERE symbol = $1
-                  AND timestamp >= $2
-                  AND timestamp <= $3
-                GROUP BY date_trunc('minute', timestamp), symbol
-            ),
-            dense AS (
-                SELECT
-                    m.timestamp,
-                    $1::text AS symbol,
-                    COALESCE(a.call_volume, 0) AS call_volume,
-                    COALESCE(a.call_premium, 0) AS call_premium,
-                    COALESCE(a.put_volume, 0) AS put_volume,
-                    COALESCE(a.put_premium, 0) AS put_premium,
-                    COALESCE(a.call_buy_volume, 0) AS call_buy_volume,
-                    COALESCE(a.call_sell_volume, 0) AS call_sell_volume,
-                    COALESCE(a.put_buy_volume, 0) AS put_buy_volume,
-                    COALESCE(a.put_sell_volume, 0) AS put_sell_volume,
-                    COALESCE(a.call_buy_premium, 0) AS call_buy_premium,
-                    COALESCE(a.call_sell_premium, 0) AS call_sell_premium,
-                    COALESCE(a.put_buy_premium, 0) AS put_buy_premium,
-                    COALESCE(a.put_sell_premium, 0) AS put_sell_premium,
-                    COALESCE(
-                        a.underlying_price,
-                        (
-                            SELECT a_prev.underlying_price
-                            FROM aggregated a_prev
-                            WHERE a_prev.timestamp <= m.timestamp
-                            ORDER BY a_prev.timestamp DESC
-                            LIMIT 1
-                        )
-                    ) AS underlying_price
-                FROM minutes m
-                LEFT JOIN aggregated a
-                    ON a.timestamp = m.timestamp
-            ),
-            with_net AS (
+            WITH rows AS (
                 SELECT
                     timestamp,
                     symbol,
-                    COALESCE(call_volume, 0)::bigint AS call_volume,
-                    COALESCE(call_premium, 0)::numeric AS call_premium,
-                    COALESCE(put_volume, 0)::bigint AS put_volume,
-                    COALESCE(put_premium, 0)::numeric AS put_premium,
-                    (COALESCE(call_volume, 0) - COALESCE(put_volume, 0))::bigint AS net_volume,
-                    (
-                        (COALESCE(call_buy_volume, 0) - COALESCE(call_sell_volume, 0))
-                        - (COALESCE(put_buy_volume, 0) - COALESCE(put_sell_volume, 0))
-                    )::bigint AS net_directional_volume,
-                    -- Net Call Premium (NCP): buy pressure minus sell pressure on calls
-                    (COALESCE(call_buy_premium, 0) - COALESCE(call_sell_premium, 0))::numeric AS ncp,
-                    -- Net Put Premium (NPP): buy pressure minus sell pressure on puts (negated)
-                    (-(COALESCE(put_buy_premium, 0) - COALESCE(put_sell_premium, 0)))::numeric AS npp,
-                    (
-                        (COALESCE(call_buy_premium, 0) - COALESCE(call_sell_premium, 0))
-                        - (COALESCE(put_buy_premium, 0) - COALESCE(put_sell_premium, 0))
-                    )::numeric AS net_premium,
+                    option_type,
+                    strike,
+                    expiration,
+                    total_volume,
+                    total_premium,
+                    buy_volume,
+                    sell_volume,
+                    buy_premium,
+                    sell_premium,
                     underlying_price
-                FROM dense
+                FROM flow_by_contract
+                WHERE symbol = $1
+                  AND timestamp >= to_timestamp(
+                        floor(extract(epoch from $2::timestamptz) / 300) * 300
+                      )
+                  AND timestamp <= to_timestamp(
+                        floor(extract(epoch from $3::timestamptz) / 300) * 300
+                      )
+            ),
+            decorated AS (
+                SELECT
+                    timestamp,
+                    symbol,
+                    option_type,
+                    strike,
+                    expiration,
+                    (expiration - CURRENT_DATE)::int AS dte,
+                    (CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END)::bigint AS call_volume,
+                    (CASE WHEN option_type = 'C' THEN total_premium ELSE 0 END)::numeric AS call_premium,
+                    (CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END)::bigint AS put_volume,
+                    (CASE WHEN option_type = 'P' THEN total_premium ELSE 0 END)::numeric AS put_premium,
+                    -- Net Call Premium: buy pressure minus sell pressure on calls.
+                    (CASE WHEN option_type = 'C'
+                          THEN (buy_premium - sell_premium) ELSE 0 END)::numeric AS ncp,
+                    -- Net Put Premium: negated buy-minus-sell on puts so that
+                    -- bearish put buying shows as a negative contribution to
+                    -- overall net_premium.
+                    (CASE WHEN option_type = 'P'
+                          THEN -(buy_premium - sell_premium) ELSE 0 END)::numeric AS npp,
+                    -- Signed volume: calls add, puts subtract.
+                    (CASE WHEN option_type = 'C' THEN total_volume ELSE -total_volume END)::bigint AS net_volume,
+                    -- Directional volume: Lee-Ready buy-sell with call/put sign.
+                    (CASE WHEN option_type = 'C'
+                          THEN (buy_volume - sell_volume)
+                          ELSE -(buy_volume - sell_volume) END)::bigint AS net_directional_volume,
+                    underlying_price
+                FROM rows
             )
             SELECT
                 timestamp,
                 symbol,
+                option_type,
+                strike,
+                expiration,
+                dte,
                 call_volume,
                 call_premium,
                 ncp AS net_call_premium,
@@ -1685,185 +1342,21 @@ class DatabaseManager:
                 npp AS net_put_premium,
                 net_volume,
                 net_directional_volume,
-                net_premium,
-                -- Cumulative NCP: running sum of net call buying (positive = net call buying)
-                SUM(ncp) OVER (ORDER BY timestamp)::numeric AS cumulative_call_premium,
-                -- Cumulative NPP: running sum of net put buying (negative = net put buying)
-                SUM(npp) OVER (ORDER BY timestamp)::numeric AS cumulative_put_premium,
-                SUM(call_volume + put_volume) OVER (ORDER BY timestamp)::bigint AS cumulative_volume,
-                SUM(call_volume) OVER (ORDER BY timestamp)::bigint AS cumulative_call_volume,
-                SUM(put_volume) OVER (ORDER BY timestamp)::bigint AS cumulative_put_volume,
-                SUM(net_volume) OVER (ORDER BY timestamp)::bigint AS cumulative_net_volume,
-                SUM(net_directional_volume) OVER (ORDER BY timestamp)::bigint AS cumulative_net_directional_volume,
-                SUM(ncp + npp) OVER (ORDER BY timestamp)::numeric AS cumulative_net_premium,
+                (ncp + npp)::numeric AS net_premium,
+                (SUM(ncp) OVER w_pair)::numeric AS cumulative_call_premium,
+                (SUM(npp) OVER w_pair)::numeric AS cumulative_put_premium,
+                (SUM(call_volume + put_volume) OVER w_pair)::bigint AS cumulative_volume,
+                (SUM(call_volume) OVER w_pair)::bigint AS cumulative_call_volume,
+                (SUM(put_volume) OVER w_pair)::bigint AS cumulative_put_volume,
+                (SUM(net_volume) OVER w_pair)::bigint AS cumulative_net_volume,
+                (SUM(net_directional_volume) OVER w_pair)::bigint AS cumulative_net_directional_volume,
+                (SUM(ncp + npp) OVER w_pair)::numeric AS cumulative_net_premium,
                 ROUND(
-                    SUM(put_volume) OVER (ORDER BY timestamp)::numeric
-                    / NULLIF(SUM(call_volume) OVER (ORDER BY timestamp), 0),
+                    (SUM(put_volume) OVER w_pair)::numeric
+                    / NULLIF(SUM(call_volume) OVER w_pair, 0),
                     4
                 ) AS running_put_call_ratio,
                 CASE
-                    WHEN net_volume > 500 THEN '🟢 Strong Calls'
-                    WHEN net_volume > 0 THEN '✅ Calls'
-                    WHEN net_volume < -500 THEN '🔴 Strong Puts'
-                    WHEN net_volume < 0 THEN '❌ Puts'
-                    ELSE '⚪ Neutral'
-                END AS flow_bias,
-                underlying_price
-            FROM with_net
-            ORDER BY timestamp DESC
-        """
-
-        try:
-            async with self._acquire_connection() as conn:
-                await self._refresh_flow_cache(conn, symbol)
-                rows = await asyncio.wait_for(
-                    conn.fetch(query, symbol, session_start, session_end),
-                    timeout=15.0,
-                )
-                result = [dict(row) for row in rows]
-                self._cache_set(cache_key, result, self._flow_endpoint_cache_ttl_seconds)
-                return result
-        except asyncio.TimeoutError:
-            logger.warning(f"Flow by type query timed out for {symbol}, returning empty")
-            return []
-        except Exception as e:
-            logger.warning(f"Flow by type query failed for {symbol} (returning empty): {e!r}")
-            return []
-
-    async def get_flow_by_strike(
-        self,
-        symbol: str = 'SPY',
-        session: str = 'current',
-    ) -> List[Dict[str, Any]]:
-        """Get option flow by strike from canonical flow_contract_facts."""
-        symbol = symbol.upper()
-        cache_key = f"flow_by_strike:{symbol}:{session}"
-        cached = self._cache_get(cache_key)
-        if cached is not None:
-            return cached
-
-        session_start, session_end = _get_flow_session_bounds(session)
-        query = """
-            WITH buckets AS (
-                SELECT generate_series(
-                    to_timestamp(floor(extract(epoch from $2::timestamptz) / 300) * 300),
-                    to_timestamp(floor(extract(epoch from $3::timestamptz) / 300) * 300),
-                    interval '5 minute'
-                ) AS timestamp
-            ),
-            strikes AS (
-                SELECT DISTINCT strike
-                FROM flow_contract_facts
-                WHERE symbol = $1
-                  AND timestamp >= $2
-                  AND timestamp <= $3
-            ),
-            bucketed AS (
-                SELECT
-                    to_timestamp(floor(extract(epoch from timestamp) / 300) * 300) AS bucket,
-                    symbol,
-                    strike,
-                    volume_delta,
-                    premium_delta,
-                    signed_volume,
-                    signed_premium,
-                    buy_volume,
-                    sell_volume,
-                    buy_premium,
-                    sell_premium,
-                    option_type,
-                    underlying_price
-                FROM flow_contract_facts
-                WHERE symbol = $1
-                  AND timestamp >= $2
-                  AND timestamp <= $3
-            ),
-            agg AS (
-                SELECT
-                    bucket AS timestamp,
-                    symbol,
-                    strike,
-                    SUM(volume_delta)::bigint AS volume,
-                    SUM(premium_delta)::numeric AS premium,
-                    SUM(CASE WHEN option_type = 'C' THEN (buy_premium - sell_premium) ELSE 0 END)::numeric AS ncp,
-                    SUM(CASE WHEN option_type = 'P' THEN -(buy_premium - sell_premium) ELSE 0 END)::numeric AS npp,
-                    (SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE 0 END) - SUM(CASE WHEN option_type = 'P' THEN volume_delta ELSE 0 END))::bigint AS net_volume,
-                    SUM(
-                        CASE
-                            WHEN option_type = 'C' THEN (buy_volume - sell_volume)
-                            WHEN option_type = 'P' THEN -(buy_volume - sell_volume)
-                            ELSE 0
-                        END
-                    )::bigint AS net_directional_volume,
-                    SUM(signed_premium)::numeric AS net_premium,
-                    MAX(underlying_price) AS underlying_price
-                FROM bucketed
-                GROUP BY bucket, symbol, strike
-            ),
-            underlying_by_bucket AS (
-                SELECT
-                    bucket AS timestamp,
-                    MAX(underlying_price) AS underlying_price
-                FROM bucketed
-                GROUP BY bucket
-            ),
-            underlying_dense AS (
-                SELECT
-                    b.timestamp,
-                    COALESCE(
-                        ub.underlying_price,
-                        (
-                            SELECT ub_prev.underlying_price
-                            FROM underlying_by_bucket ub_prev
-                            WHERE ub_prev.timestamp <= b.timestamp
-                            ORDER BY ub_prev.timestamp DESC
-                            LIMIT 1
-                        )
-                    ) AS underlying_price
-                FROM buckets b
-                LEFT JOIN underlying_by_bucket ub
-                  ON ub.timestamp = b.timestamp
-            ),
-            dense AS (
-                SELECT
-                    b.timestamp,
-                    $1::text AS symbol,
-                    s.strike,
-                    COALESCE(a.volume, 0)::bigint AS volume,
-                    COALESCE(a.premium, 0)::numeric AS premium,
-                    COALESCE(a.ncp, 0)::numeric AS ncp,
-                    COALESCE(a.npp, 0)::numeric AS npp,
-                    COALESCE(a.net_volume, 0)::bigint AS net_volume,
-                    COALESCE(a.net_directional_volume, 0)::bigint AS net_directional_volume,
-                    COALESCE(a.net_premium, 0)::numeric AS net_premium,
-                    ud.underlying_price AS underlying_price
-                FROM buckets b
-                CROSS JOIN strikes s
-                LEFT JOIN agg a
-                  ON a.timestamp = b.timestamp
-                 AND a.strike = s.strike
-                LEFT JOIN underlying_dense ud
-                  ON ud.timestamp = b.timestamp
-            )
-            SELECT
-                timestamp,
-                symbol,
-                strike,
-                volume,
-                premium,
-                ncp AS net_call_premium,
-                npp AS net_put_premium,
-                net_volume,
-                net_directional_volume,
-                (ncp + npp)::numeric AS net_premium,
-                SUM(volume) OVER (PARTITION BY strike ORDER BY timestamp)::bigint AS cumulative_volume,
-                SUM(net_volume) OVER (PARTITION BY strike ORDER BY timestamp)::bigint AS cumulative_net_volume,
-                SUM(net_directional_volume) OVER (PARTITION BY strike ORDER BY timestamp)::bigint AS cumulative_net_directional_volume,
-                SUM(premium) OVER (PARTITION BY strike ORDER BY timestamp)::numeric AS cumulative_premium,
-                SUM(ncp) OVER (PARTITION BY strike ORDER BY timestamp)::numeric AS cumulative_call_premium,
-                SUM(npp) OVER (PARTITION BY strike ORDER BY timestamp)::numeric AS cumulative_put_premium,
-                SUM(ncp + npp) OVER (PARTITION BY strike ORDER BY timestamp)::numeric AS cumulative_net_premium,
-                CASE
                     WHEN net_volume > 100 THEN '🟢 Strong Calls'
                     WHEN net_volume > 0 THEN '✅ Calls'
                     WHEN net_volume < -100 THEN '🔴 Strong Puts'
@@ -1871,8 +1364,10 @@ class DatabaseManager:
                     ELSE '⚪ Neutral'
                 END AS flow_bias,
                 underlying_price
-            FROM dense
-            ORDER BY timestamp DESC, strike
+            FROM decorated
+            WINDOW
+                w_pair AS (PARTITION BY strike, expiration ORDER BY timestamp)
+            ORDER BY timestamp DESC, option_type, strike, expiration
         """
 
         try:
@@ -1886,173 +1381,10 @@ class DatabaseManager:
                 self._cache_set(cache_key, result, self._flow_endpoint_cache_ttl_seconds)
                 return result
         except asyncio.TimeoutError:
-            logger.warning(f"Flow by strike query timed out for {symbol}, returning empty")
+            logger.warning(f"Flow query timed out for {symbol}, returning empty")
             return []
         except Exception as e:
-            logger.warning(f"Flow by strike query failed for {symbol} (returning empty): {e!r}")
-            return []
-
-    async def get_flow_by_expiration(
-        self,
-        symbol: str = 'SPY',
-        session: str = 'current',
-    ) -> List[Dict[str, Any]]:
-        """Get option flow by expiration from canonical flow_contract_facts."""
-        symbol = symbol.upper()
-        cache_key = f"flow_by_expiration:{symbol}:{session}"
-        cached = self._cache_get(cache_key)
-        if cached is not None:
-            return cached
-
-        session_start, session_end = _get_flow_session_bounds(session)
-        query = """
-            WITH buckets AS (
-                SELECT generate_series(
-                    to_timestamp(floor(extract(epoch from $2::timestamptz) / 300) * 300),
-                    to_timestamp(floor(extract(epoch from $3::timestamptz) / 300) * 300),
-                    interval '5 minute'
-                ) AS timestamp
-            ),
-            expirations AS (
-                SELECT DISTINCT expiration
-                FROM flow_contract_facts
-                WHERE symbol = $1
-                  AND timestamp >= $2
-                  AND timestamp <= $3
-            ),
-            bucketed AS (
-                SELECT
-                    to_timestamp(floor(extract(epoch from timestamp) / 300) * 300) AS bucket,
-                    symbol,
-                    expiration,
-                    volume_delta,
-                    premium_delta,
-                    signed_volume,
-                    signed_premium,
-                    buy_volume,
-                    sell_volume,
-                    buy_premium,
-                    sell_premium,
-                    option_type,
-                    underlying_price
-                FROM flow_contract_facts
-                WHERE symbol = $1
-                  AND timestamp >= $2
-                  AND timestamp <= $3
-            ),
-            agg AS (
-                SELECT
-                    bucket AS timestamp,
-                    symbol,
-                    expiration,
-                    SUM(volume_delta)::bigint AS volume,
-                    SUM(premium_delta)::numeric AS premium,
-                    SUM(CASE WHEN option_type = 'C' THEN (buy_premium - sell_premium) ELSE 0 END)::numeric AS ncp,
-                    SUM(CASE WHEN option_type = 'P' THEN -(buy_premium - sell_premium) ELSE 0 END)::numeric AS npp,
-                    (SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE 0 END) - SUM(CASE WHEN option_type = 'P' THEN volume_delta ELSE 0 END))::bigint AS net_volume,
-                    SUM(
-                        CASE
-                            WHEN option_type = 'C' THEN (buy_volume - sell_volume)
-                            WHEN option_type = 'P' THEN -(buy_volume - sell_volume)
-                            ELSE 0
-                        END
-                    )::bigint AS net_directional_volume,
-                    SUM(signed_premium)::numeric AS net_premium,
-                    MAX(underlying_price) AS underlying_price
-                FROM bucketed
-                GROUP BY bucket, symbol, expiration
-            ),
-            underlying_by_bucket AS (
-                SELECT
-                    bucket AS timestamp,
-                    MAX(underlying_price) AS underlying_price
-                FROM bucketed
-                GROUP BY bucket
-            ),
-            underlying_dense AS (
-                SELECT
-                    b.timestamp,
-                    COALESCE(
-                        ub.underlying_price,
-                        (
-                            SELECT ub_prev.underlying_price
-                            FROM underlying_by_bucket ub_prev
-                            WHERE ub_prev.timestamp <= b.timestamp
-                            ORDER BY ub_prev.timestamp DESC
-                            LIMIT 1
-                        )
-                    ) AS underlying_price
-                FROM buckets b
-                LEFT JOIN underlying_by_bucket ub
-                  ON ub.timestamp = b.timestamp
-            ),
-            dense AS (
-                SELECT
-                    b.timestamp,
-                    $1::text AS symbol,
-                    e.expiration,
-                    COALESCE(a.volume, 0)::bigint AS volume,
-                    COALESCE(a.premium, 0)::numeric AS premium,
-                    COALESCE(a.ncp, 0)::numeric AS net_call_premium,
-                    COALESCE(a.npp, 0)::numeric AS net_put_premium,
-                    COALESCE(a.net_volume, 0)::bigint AS net_volume,
-                    COALESCE(a.net_directional_volume, 0)::bigint AS net_directional_volume,
-                    COALESCE(a.net_premium, 0)::numeric AS net_premium,
-                    ud.underlying_price AS underlying_price
-                FROM buckets b
-                CROSS JOIN expirations e
-                LEFT JOIN agg a
-                  ON a.timestamp = b.timestamp
-                 AND a.expiration = e.expiration
-                LEFT JOIN underlying_dense ud
-                  ON ud.timestamp = b.timestamp
-            )
-            SELECT
-                timestamp,
-                symbol,
-                expiration,
-                (expiration - CURRENT_DATE)::int AS dte,
-                volume,
-                premium,
-                net_call_premium,
-                net_put_premium,
-                net_volume,
-                net_directional_volume,
-                (net_call_premium + net_put_premium)::numeric AS net_premium,
-                SUM(volume) OVER (PARTITION BY expiration ORDER BY timestamp)::bigint AS cumulative_volume,
-                SUM(net_volume) OVER (PARTITION BY expiration ORDER BY timestamp)::bigint AS cumulative_net_volume,
-                SUM(net_directional_volume) OVER (PARTITION BY expiration ORDER BY timestamp)::bigint AS cumulative_net_directional_volume,
-                SUM(premium) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_premium,
-                SUM(net_call_premium) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_call_premium,
-                SUM(net_put_premium) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_put_premium,
-                SUM(net_call_premium + net_put_premium) OVER (PARTITION BY expiration ORDER BY timestamp)::numeric AS cumulative_net_premium,
-                CASE
-                    WHEN net_volume > 100 THEN '🟢 Strong Calls'
-                    WHEN net_volume > 0 THEN '✅ Calls'
-                    WHEN net_volume < -100 THEN '🔴 Strong Puts'
-                    WHEN net_volume < 0 THEN '❌ Puts'
-                    ELSE '⚪ Neutral'
-                END AS flow_bias,
-                underlying_price
-            FROM dense
-            ORDER BY timestamp DESC, expiration
-        """
-
-        try:
-            async with self._acquire_connection() as conn:
-                await self._refresh_flow_cache(conn, symbol)
-                rows = await asyncio.wait_for(
-                    conn.fetch(query, symbol, session_start, session_end),
-                    timeout=15.0,
-                )
-                result = [dict(row) for row in rows]
-                self._cache_set(cache_key, result, self._flow_endpoint_cache_ttl_seconds)
-                return result
-        except asyncio.TimeoutError:
-            logger.warning(f"Flow by expiration query timed out for {symbol}, returning empty")
-            return []
-        except Exception as e:
-            logger.warning(f"Flow by expiration query failed for {symbol} (returning empty): {e!r}")
+            logger.warning(f"Flow query failed for {symbol} (returning empty): {e!r}")
             return []
 
     async def get_smart_money_flow(
@@ -2445,8 +1777,8 @@ class DatabaseManager:
                 SELECT
                     timestamp,
                     symbol,
-                    SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE -total_premium END)::numeric AS net_option_flow
-                FROM flow_by_type
+                    SUM(CASE WHEN option_type = 'C' THEN premium_delta ELSE -premium_delta END)::numeric AS net_option_flow
+                FROM flow_contract_facts
                 WHERE symbol = $1
                   AND timestamp >= NOW() - INTERVAL '2 days'
                 GROUP BY timestamp, symbol

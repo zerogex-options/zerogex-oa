@@ -119,7 +119,7 @@ def test_get_signal_score_history_includes_msi_payload():
     assert rows[0]["composite_score"] == 68.0
 
 
-def test_get_flow_by_type_uses_cache():
+def test_get_flow_uses_cache():
     db = DatabaseManager()
     db._flow_endpoint_cache_ttl_seconds = 60.0
     conn = _FakeFlowConn([{"timestamp": "2026-01-01T09:30:00Z", "symbol": "SPY"}])
@@ -130,17 +130,27 @@ def test_get_flow_by_type_uses_cache():
 
     db._acquire_connection = _acquire  # type: ignore[method-assign]
 
-    first = asyncio.run(db.get_flow_by_type("spy", "current"))
-    second = asyncio.run(db.get_flow_by_type("SPY", "current"))
+    first = asyncio.run(db.get_flow("spy", "current"))
+    second = asyncio.run(db.get_flow("SPY", "current"))
 
     assert first == second
     assert conn.calls == 1
 
 
-def test_get_flow_by_strike_cache_expires():
+def test_get_flow_cache_expires():
     db = DatabaseManager()
     db._flow_endpoint_cache_ttl_seconds = 0.01
-    conn = _FakeFlowConn([{"timestamp": "2026-01-01T09:30:00Z", "symbol": "SPY", "strike": 500.0}])
+    conn = _FakeFlowConn(
+        [
+            {
+                "timestamp": "2026-01-01T09:30:00Z",
+                "symbol": "SPY",
+                "option_type": "C",
+                "strike": 500.0,
+                "expiration": "2026-01-02",
+            }
+        ]
+    )
 
     @asynccontextmanager
     async def _acquire():
@@ -148,17 +158,17 @@ def test_get_flow_by_strike_cache_expires():
 
     db._acquire_connection = _acquire  # type: ignore[method-assign]
 
-    first = asyncio.run(db.get_flow_by_strike("SPY", "current"))
+    first = asyncio.run(db.get_flow("SPY", "current"))
     assert first
 
     asyncio.run(asyncio.sleep(0.02))
-    second = asyncio.run(db.get_flow_by_strike("SPY", "current"))
+    second = asyncio.run(db.get_flow("SPY", "current"))
 
     assert second == first
     assert conn.calls == 2
 
 
-def test_get_flow_by_strike_query_uses_dense_buckets():
+def test_get_flow_query_targets_unified_rollup():
     db = DatabaseManager()
     conn = _FakeFlowConn([])
 
@@ -168,34 +178,13 @@ def test_get_flow_by_strike_query_uses_dense_buckets():
 
     db._acquire_connection = _acquire  # type: ignore[method-assign]
 
-    asyncio.run(db.get_flow_by_strike("SPY", "current"))
+    asyncio.run(db.get_flow("SPY", "current"))
 
     assert conn.last_query is not None
-    assert "generate_series(" in conn.last_query
-    assert "CROSS JOIN strikes" in conn.last_query
-    assert "underlying_by_bucket" in conn.last_query
-    assert "underlying_dense" in conn.last_query
-    assert "FROM dense" in conn.last_query
-
-
-def test_get_flow_by_expiration_query_uses_dense_buckets():
-    db = DatabaseManager()
-    conn = _FakeFlowConn([])
-
-    @asynccontextmanager
-    async def _acquire():
-        yield conn
-
-    db._acquire_connection = _acquire  # type: ignore[method-assign]
-
-    asyncio.run(db.get_flow_by_expiration("SPY", "current"))
-
-    assert conn.last_query is not None
-    assert "generate_series(" in conn.last_query
-    assert "CROSS JOIN expirations" in conn.last_query
-    assert "underlying_by_bucket" in conn.last_query
-    assert "underlying_dense" in conn.last_query
-    assert "FROM dense" in conn.last_query
+    assert "flow_by_contract" in conn.last_query
+    assert "PARTITION BY strike, expiration" in conn.last_query
+    assert "running_put_call_ratio" in conn.last_query
+    assert "flow_bias" in conn.last_query
 
 
 def test_prior_session_bounds_end_at_1615_et():

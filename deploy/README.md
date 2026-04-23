@@ -698,11 +698,10 @@ The schema uses **regular views** (not materialized) for real-time data access w
 - `underlying_quotes_with_deltas` - Volume deltas for underlying
 - `option_chains_with_deltas` - Volume and OI deltas for options
 
-**Option Flow Views:**
-- `option_flow_by_type` - Puts vs Calls aggregated
-- `option_flow_by_strike` - Flow by strike level
-- `option_flow_by_expiration` - Flow by expiration
-- `option_flow_smart_money` - Unusual activity detection
+**Option Flow Tables/Views:**
+- `flow_contract_facts` - Canonical per-contract per-timestamp flow facts
+- `flow_by_contract` - Unified 5-min rollup keyed by (type, strike, expiration)
+- `flow_smart_money` - Unusual activity detection
 - `underlying_buying_pressure` - Directional flow
 
 **Technicals Views:**

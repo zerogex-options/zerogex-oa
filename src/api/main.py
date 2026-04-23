@@ -19,9 +19,7 @@ from .database import DatabaseManager
 from .models import (
     GEXSummary,
     GEXByStrike,
-    FlowByTypePoint,
-    FlowByStrikePoint,
-    FlowByExpirationPoint,
+    FlowPoint,
     SmartMoneyFlowPoint,
     MomentumDivergencePoint,
     FlowBuyingPressurePoint,
@@ -256,53 +254,29 @@ async def get_gex_heatmap(
 # Options Flow Endpoints
 # ============================================================================
 
-@app.get("/api/flow/by-type", response_model=List[FlowByTypePoint], tags=["Options Flow"])
-async def get_flow_by_type(
-    symbol: str = Query(default="SPY"),
-    session: str = Query(default="current", pattern="^(current|prior)$")
-):
-    """Get option flow by type (calls vs puts) — 1-min intervals.
-    Session runs 07:15–16:15 ET. session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
-    try:
-        data = await db_manager.get_flow_by_type(symbol, session)
-        return [FlowByTypePoint(**row) for row in data]
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching flow by type: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.get("/api/flow/by-strike", response_model=List[FlowByStrikePoint], tags=["Options Flow"])
-async def get_flow_by_strike(
+@app.get("/api/flow", response_model=List[FlowPoint], tags=["Options Flow"])
+async def get_flow(
     symbol: str = Query(default="SPY"),
     session: str = Query(default="current", pattern="^(current|prior)$"),
 ):
-    """Get option flow by strike level — 5-min buckets.
-    Session runs 07:15–16:15 ET. session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
+    """Get unified option flow keyed by (type, strike, expiration) — 5-min buckets.
+
+    Replaces the former /api/flow/by-type, /api/flow/by-strike, and
+    /api/flow/by-expiration endpoints. Returns one row per 5-min bucket per
+    (option_type, strike, expiration) for the given symbol and session, with
+    cumulative totals running per (strike, expiration) across both types.
+
+    Session runs 07:15–16:15 ET. session=current returns today's open session
+    (or most recent if closed); session=prior returns the previous full
+    session.
+    """
     try:
-        data = await db_manager.get_flow_by_strike(symbol, session)
-        return [FlowByStrikePoint(**row) for row in data]
+        data = await db_manager.get_flow(symbol, session)
+        return [FlowPoint(**row) for row in data]
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching flow by strike: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-
-@app.get("/api/flow/by-expiration", response_model=List[FlowByExpirationPoint], tags=["Options Flow"])
-async def get_flow_by_expiration(
-    symbol: str = Query(default="SPY"),
-    session: str = Query(default="current", pattern="^(current|prior)$"),
-):
-    """Get option flow by expiration date — 5-min buckets.
-    Session runs 07:15–16:15 ET. session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
-    try:
-        data = await db_manager.get_flow_by_expiration(symbol, session)
-        return [FlowByExpirationPoint(**row) for row in data]
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching flow by expiration: {e}", exc_info=True)
+        logger.error(f"Error fetching flow: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/flow/smart-money", response_model=List[SmartMoneyFlowPoint], tags=["Options Flow"])

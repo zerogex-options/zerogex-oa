@@ -135,9 +135,19 @@ class FlowMapBucketResponse(BaseModel):
         }
 
 
-class FlowByTypePoint(BaseModel):
+class FlowPoint(BaseModel):
+    """Unified 5-min-bucketed flow row keyed by (type, strike, expiration).
+
+    Replaces the former FlowByType / FlowByStrike / FlowByExpiration models.
+    Cumulative fields run per (option_type, strike, expiration) group; the
+    running put/call ratio runs per (strike, expiration) across both types.
+    """
     timestamp: datetime
     symbol: str
+    option_type: str
+    strike: Decimal
+    expiration: date
+    dte: int
     call_volume: int
     call_premium: Decimal
     net_call_premium: Decimal
@@ -156,51 +166,6 @@ class FlowByTypePoint(BaseModel):
     cumulative_net_directional_volume: int
     cumulative_net_premium: Decimal
     running_put_call_ratio: Optional[Decimal] = None
-    flow_bias: str
-    underlying_price: Optional[Decimal] = None
-
-
-class FlowByStrikePoint(BaseModel):
-    timestamp: datetime
-    symbol: str
-    strike: Decimal
-    volume: int
-    premium: Decimal
-    net_call_premium: Decimal
-    net_put_premium: Decimal
-    net_volume: int
-    net_directional_volume: int
-    net_premium: Decimal
-    cumulative_volume: int
-    cumulative_net_volume: int
-    cumulative_net_directional_volume: int
-    cumulative_premium: Decimal
-    cumulative_call_premium: Decimal
-    cumulative_put_premium: Decimal
-    cumulative_net_premium: Decimal
-    flow_bias: str
-    underlying_price: Optional[Decimal] = None
-
-
-class FlowByExpirationPoint(BaseModel):
-    timestamp: datetime
-    symbol: str
-    expiration: date
-    dte: int
-    volume: int
-    premium: Decimal
-    net_call_premium: Decimal
-    net_put_premium: Decimal
-    net_volume: int
-    net_directional_volume: int
-    net_premium: Decimal
-    cumulative_volume: int
-    cumulative_net_volume: int
-    cumulative_net_directional_volume: int
-    cumulative_premium: Decimal
-    cumulative_call_premium: Decimal
-    cumulative_put_premium: Decimal
-    cumulative_net_premium: Decimal
     flow_bias: str
     underlying_price: Optional[Decimal] = None
 

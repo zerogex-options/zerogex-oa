@@ -967,14 +967,24 @@ class AnalyticsEngine:
             with db_connection() as conn:
                 cursor = conn.cursor()
 
-                # 1. Refresh flow_by_type
-                logger.debug("Refreshing flow_by_type...")
+                # Refresh flow_by_contract: unified 5-minute-bucketed rollup
+                # keyed by (timestamp, symbol, option_type, strike, expiration).
+                # The current bucket is re-aggregated on every call; once a
+                # bucket rolls over, its row is effectively frozen.
+                logger.debug("Refreshing flow_by_contract...")
                 cursor.execute("""
-                    WITH with_prev AS (
+                    WITH bounds AS (
+                        SELECT to_timestamp(
+                            floor(extract(epoch from %s::timestamptz) / 300) * 300
+                        ) AS bucket_start
+                    ),
+                    with_prev AS (
                         SELECT
                             oc.timestamp,
                             oc.option_symbol,
                             oc.option_type,
+                            oc.strike,
+                            oc.expiration,
                             oc.last,
                             oc.implied_volatility,
                             oc.delta,
@@ -984,151 +994,105 @@ class AnalyticsEngine:
                                     = (oc.timestamp AT TIME ZONE 'America/New_York')::date
                                     THEN GREATEST(COALESCE(oc.volume, 0) - COALESCE(LAG(oc.volume) OVER w, 0), 0)
                                 ELSE COALESCE(oc.volume, 0)
-                            END::bigint AS volume_delta
-                        FROM option_chains oc
+                            END::bigint AS volume_delta,
+                            CASE
+                                WHEN LAG(oc.ask_volume) OVER w IS NULL THEN COALESCE(oc.ask_volume, 0)
+                                WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
+                                    = (oc.timestamp AT TIME ZONE 'America/New_York')::date
+                                    THEN GREATEST(COALESCE(oc.ask_volume, 0) - COALESCE(LAG(oc.ask_volume) OVER w, 0), 0)
+                                ELSE COALESCE(oc.ask_volume, 0)
+                            END::bigint AS ask_vol_delta,
+                            CASE
+                                WHEN LAG(oc.bid_volume) OVER w IS NULL THEN COALESCE(oc.bid_volume, 0)
+                                WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
+                                    = (oc.timestamp AT TIME ZONE 'America/New_York')::date
+                                    THEN GREATEST(COALESCE(oc.bid_volume, 0) - COALESCE(LAG(oc.bid_volume) OVER w, 0), 0)
+                                ELSE COALESCE(oc.bid_volume, 0)
+                            END::bigint AS bid_vol_delta
+                        FROM option_chains oc, bounds b
                         WHERE oc.underlying = %s
-                          AND oc.timestamp >= %s - INTERVAL '2 minutes'
+                          AND oc.timestamp >= b.bucket_start - INTERVAL '2 minutes'
                           AND oc.timestamp <= %s
                         WINDOW w AS (PARTITION BY oc.option_symbol ORDER BY oc.timestamp)
                     )
-                    INSERT INTO flow_by_type (
+                    INSERT INTO flow_by_contract (
                         timestamp,
                         symbol,
                         option_type,
-                        total_volume,
-                        total_premium,
-                        avg_iv,
-                        net_delta,
-                        underlying_price
-                    )
-                    SELECT
-                        timestamp,
-                        %s::varchar,
-                        option_type,
-                        SUM(volume_delta)::bigint,
-                        SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
-                        AVG(implied_volatility)::numeric,
-                        SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric,
-                        %s::numeric
-                    FROM with_prev
-                    WHERE timestamp = %s
-                      AND volume_delta > 0
-                    GROUP BY timestamp, option_type
-                    ON CONFLICT (timestamp, symbol, option_type)
-                    DO UPDATE SET
-                        total_volume = EXCLUDED.total_volume,
-                        total_premium = EXCLUDED.total_premium,
-                        avg_iv = EXCLUDED.avg_iv,
-                        net_delta = EXCLUDED.net_delta,
-                        underlying_price = EXCLUDED.underlying_price,
-                        updated_at = NOW()
-                """, (self.db_symbol, timestamp, timestamp, self.db_symbol, underlying_price, timestamp))
-
-                # 2. Refresh flow_by_strike
-                logger.debug("Refreshing flow_by_strike...")
-                cursor.execute("""
-                    WITH with_prev AS (
-                        SELECT
-                            oc.timestamp,
-                            oc.strike,
-                            oc.last,
-                            oc.implied_volatility,
-                            oc.option_type,
-                            CASE
-                                WHEN LAG(oc.volume) OVER w IS NULL THEN COALESCE(oc.volume, 0)
-                                WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
-                                    = (oc.timestamp AT TIME ZONE 'America/New_York')::date
-                                    THEN GREATEST(COALESCE(oc.volume, 0) - COALESCE(LAG(oc.volume) OVER w, 0), 0)
-                                ELSE COALESCE(oc.volume, 0)
-                            END::bigint AS volume_delta
-                        FROM option_chains oc
-                        WHERE oc.underlying = %s
-                          AND oc.timestamp >= %s - INTERVAL '2 minutes'
-                          AND oc.timestamp <= %s
-                        WINDOW w AS (PARTITION BY oc.option_symbol ORDER BY oc.timestamp)
-                    )
-                    INSERT INTO flow_by_strike (
-                        timestamp,
-                        symbol,
                         strike,
-                        total_volume,
-                        total_premium,
-                        avg_iv,
-                        net_delta,
-                        underlying_price
-                    )
-                    SELECT
-                        timestamp,
-                        %s::varchar,
-                        strike,
-                        SUM(volume_delta)::bigint,
-                        SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
-                        AVG(implied_volatility)::numeric,
-                        SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::numeric,
-                        %s::numeric
-                    FROM with_prev
-                    WHERE timestamp = %s
-                      AND volume_delta > 0
-                    GROUP BY timestamp, strike
-                    ON CONFLICT (timestamp, symbol, strike)
-                    DO UPDATE SET
-                        total_volume = EXCLUDED.total_volume,
-                        total_premium = EXCLUDED.total_premium,
-                        avg_iv = EXCLUDED.avg_iv,
-                        net_delta = EXCLUDED.net_delta,
-                        underlying_price = EXCLUDED.underlying_price,
-                        updated_at = NOW()
-                """, (self.db_symbol, timestamp, timestamp, self.db_symbol, underlying_price, timestamp))
-
-                # 3. Refresh flow_by_expiration
-                logger.debug("Refreshing flow_by_expiration...")
-                cursor.execute("""
-                    WITH with_prev AS (
-                        SELECT
-                            oc.timestamp,
-                            oc.expiration,
-                            oc.last,
-                            CASE
-                                WHEN LAG(oc.volume) OVER w IS NULL THEN COALESCE(oc.volume, 0)
-                                WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
-                                    = (oc.timestamp AT TIME ZONE 'America/New_York')::date
-                                    THEN GREATEST(COALESCE(oc.volume, 0) - COALESCE(LAG(oc.volume) OVER w, 0), 0)
-                                ELSE COALESCE(oc.volume, 0)
-                            END::bigint AS volume_delta
-                        FROM option_chains oc
-                        WHERE oc.underlying = %s
-                          AND oc.timestamp >= %s - INTERVAL '2 minutes'
-                          AND oc.timestamp <= %s
-                        WINDOW w AS (PARTITION BY oc.option_symbol ORDER BY oc.timestamp)
-                    )
-                    INSERT INTO flow_by_expiration (
-                        timestamp,
-                        symbol,
                         expiration,
                         total_volume,
                         total_premium,
+                        buy_volume,
+                        sell_volume,
+                        buy_premium,
+                        sell_premium,
+                        avg_iv,
+                        avg_delta,
                         underlying_price
                     )
                     SELECT
-                        timestamp,
+                        b.bucket_start,
                         %s::varchar,
-                        expiration,
-                        SUM(volume_delta)::bigint,
-                        SUM(volume_delta * COALESCE(last, 0) * 100)::numeric,
+                        wp.option_type,
+                        wp.strike,
+                        wp.expiration,
+                        SUM(wp.volume_delta)::bigint,
+                        SUM(wp.volume_delta * COALESCE(wp.last, 0) * 100)::numeric,
+                        SUM(
+                            CASE WHEN (wp.ask_vol_delta + wp.bid_vol_delta) > 0
+                                 THEN (wp.ask_vol_delta::numeric
+                                       / (wp.ask_vol_delta + wp.bid_vol_delta)
+                                       * wp.volume_delta)::bigint
+                                 ELSE 0
+                            END
+                        )::bigint,
+                        SUM(
+                            CASE WHEN (wp.ask_vol_delta + wp.bid_vol_delta) > 0
+                                 THEN (wp.bid_vol_delta::numeric
+                                       / (wp.ask_vol_delta + wp.bid_vol_delta)
+                                       * wp.volume_delta)::bigint
+                                 ELSE 0
+                            END
+                        )::bigint,
+                        SUM(
+                            CASE WHEN (wp.ask_vol_delta + wp.bid_vol_delta) > 0
+                                 THEN (wp.ask_vol_delta::numeric
+                                       / (wp.ask_vol_delta + wp.bid_vol_delta)
+                                       * wp.volume_delta * COALESCE(wp.last, 0) * 100)::numeric
+                                 ELSE 0
+                            END
+                        )::numeric,
+                        SUM(
+                            CASE WHEN (wp.ask_vol_delta + wp.bid_vol_delta) > 0
+                                 THEN (wp.bid_vol_delta::numeric
+                                       / (wp.ask_vol_delta + wp.bid_vol_delta)
+                                       * wp.volume_delta * COALESCE(wp.last, 0) * 100)::numeric
+                                 ELSE 0
+                            END
+                        )::numeric,
+                        AVG(wp.implied_volatility)::numeric,
+                        AVG(wp.delta)::numeric,
                         %s::numeric
-                    FROM with_prev
-                    WHERE timestamp = %s
-                      AND volume_delta > 0
-                    GROUP BY timestamp, expiration
-                    ON CONFLICT (timestamp, symbol, expiration)
+                    FROM with_prev wp, bounds b
+                    WHERE wp.timestamp >= b.bucket_start
+                      AND wp.volume_delta > 0
+                    GROUP BY b.bucket_start, wp.option_type, wp.strike, wp.expiration
+                    ON CONFLICT (timestamp, symbol, option_type, strike, expiration)
                     DO UPDATE SET
                         total_volume = EXCLUDED.total_volume,
                         total_premium = EXCLUDED.total_premium,
+                        buy_volume = EXCLUDED.buy_volume,
+                        sell_volume = EXCLUDED.sell_volume,
+                        buy_premium = EXCLUDED.buy_premium,
+                        sell_premium = EXCLUDED.sell_premium,
+                        avg_iv = EXCLUDED.avg_iv,
+                        avg_delta = EXCLUDED.avg_delta,
                         underlying_price = EXCLUDED.underlying_price,
                         updated_at = NOW()
-                """, (self.db_symbol, timestamp, timestamp, self.db_symbol, underlying_price, timestamp))
+                """, (timestamp, self.db_symbol, timestamp, self.db_symbol, underlying_price))
 
-                # 4. Refresh flow_smart_money
+                # Refresh flow_smart_money
                 logger.debug("Refreshing flow_smart_money...")
                 cursor.execute("""
                     WITH with_prev AS (
