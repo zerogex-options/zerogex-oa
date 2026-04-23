@@ -3244,97 +3244,97 @@ class DatabaseManager:
             and _time(9, 30) <= now_et.time() < _time(16, 0)
         )
 
-        if session_is_open:
-            target_date = today
-        else:
-            # MAX(timestamp) — not MAX(DATE(timestamp AT TIME ZONE ...)) —
-            # so the planner can satisfy this via a reverse scan of the
-            # (underlying, timestamp DESC) index instead of evaluating the
-            # timezone-shifted date function on every row.
-            date_query = """
-                SELECT MAX(timestamp) AS latest_ts
-                FROM option_chains
-                WHERE underlying = $1
-                  AND strike = $2
-                  AND expiration = $3
-                  AND option_type = $4
-            """
-            try:
-                async with self._acquire_connection() as conn:
-                    row = await conn.fetchrow(
-                        date_query, underlying, float(strike), expiration_date, option_type
-                    )
-                    if not row or row["latest_ts"] is None:
-                        return []
-                    target_date = row["latest_ts"].astimezone(_ET).date()
-            except Exception as e:
-                logger.error(f"Error finding most recent date for option contract: {e}")
-                raise
-
-        # Convert the ET calendar day into an explicit UTC timestamp range.
-        # A non-sargable predicate like DATE(timestamp AT TIME ZONE 'America/New_York') = $5
-        # forces a full scan of every row matching `underlying=$1`; an
-        # inclusive/exclusive timestamp range lets the (underlying, timestamp DESC)
-        # index narrow straight to the session's rows.
-        day_start_et = datetime.combine(target_date, _time(0, 0), tzinfo=_ET)
-        day_end_et = day_start_et + timedelta(days=1)
-
-        query = """
-            WITH ranked AS (
-                SELECT
-                    *,
-                    DATE_TRUNC('minute', timestamp)                          AS bar_ts,
-                    MAX(volume)      OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_volume,
-                    MAX(open_interest) OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_oi,
-                    MAX(updated_at)  OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_updated_at,
-                    ROW_NUMBER()     OVER (
-                        PARTITION BY DATE_TRUNC('minute', timestamp)
-                        ORDER BY timestamp DESC
-                    ) AS rn
-                FROM option_chains
-                WHERE underlying = $1
-                  AND strike = $2
-                  AND expiration = $3
-                  AND option_type = $4
-                  AND timestamp >= $5
-                  AND timestamp < $6
-            )
-            SELECT
-                bar_ts             AS timestamp,
-                underlying,
-                strike,
-                expiration,
-                option_type,
-                last,
-                bid,
-                ask,
-                mid,
-                bar_volume         AS volume,
-                bar_oi             AS open_interest,
-                ask_volume,
-                mid_volume,
-                bid_volume,
-                implied_volatility,
-                delta,
-                gamma,
-                theta,
-                vega,
-                bar_updated_at     AS updated_at,
-                GREATEST(
-                    COALESCE(bar_volume, 0)
-                        - COALESCE(LAG(bar_volume) OVER (ORDER BY bar_ts), 0),
-                    0
-                )::bigint          AS volume_delta
-            FROM ranked
-            WHERE rn = 1
-            ORDER BY timestamp ASC
+        # Resolve option_symbol once, then drive everything else off the
+        # (option_symbol, timestamp) primary key. Filtering option_chains by
+        # (underlying, strike, expiration, option_type) directly forces the
+        # planner onto (underlying, timestamp DESC) and re-checks the other
+        # three columns against every row for that underlying in the window —
+        # millions of rows for SPX, which trips the 30s statement_timeout.
+        #
+        # With ORDER BY timestamp DESC LIMIT 1 and the timestamp lower bound,
+        # the planner walks the (underlying, timestamp DESC) index backward
+        # and stops at the first row whose strike/expiration/option_type match
+        # — cheap for any contract that's been quoted recently. The 14-day
+        # floor bounds the worst case where the contract doesn't exist.
+        resolve_query = """
+            SELECT option_symbol, timestamp AS latest_ts
+            FROM option_chains
+            WHERE underlying = $1
+              AND strike = $2
+              AND expiration = $3
+              AND option_type = $4
+              AND timestamp >= NOW() - INTERVAL '14 days'
+            ORDER BY timestamp DESC
+            LIMIT 1
         """
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(
-                    query, underlying, float(strike), expiration_date, option_type,
-                    day_start_et, day_end_et
+                resolved = await conn.fetchrow(
+                    resolve_query, underlying, float(strike), expiration_date, option_type
                 )
+                if not resolved or resolved["option_symbol"] is None:
+                    return []
+                option_symbol = resolved["option_symbol"]
+                latest_ts = resolved["latest_ts"]
+
+                target_date = today if session_is_open else latest_ts.astimezone(_ET).date()
+
+                # Compute the ET calendar day as an explicit UTC timestamptz
+                # range. Computing day_end_et from (target_date + 1 day) rather
+                # than +timedelta(days=1) keeps it correct across DST shifts.
+                day_start_et = datetime.combine(target_date, _time(0, 0), tzinfo=_ET)
+                day_end_et = datetime.combine(
+                    target_date + timedelta(days=1), _time(0, 0), tzinfo=_ET
+                )
+
+                query = """
+                    WITH ranked AS (
+                        SELECT
+                            *,
+                            DATE_TRUNC('minute', timestamp)                          AS bar_ts,
+                            MAX(volume)      OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_volume,
+                            MAX(open_interest) OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_oi,
+                            MAX(updated_at)  OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_updated_at,
+                            ROW_NUMBER()     OVER (
+                                PARTITION BY DATE_TRUNC('minute', timestamp)
+                                ORDER BY timestamp DESC
+                            ) AS rn
+                        FROM option_chains
+                        WHERE option_symbol = $1
+                          AND timestamp >= $2
+                          AND timestamp < $3
+                    )
+                    SELECT
+                        bar_ts             AS timestamp,
+                        underlying,
+                        strike,
+                        expiration,
+                        option_type,
+                        last,
+                        bid,
+                        ask,
+                        mid,
+                        bar_volume         AS volume,
+                        bar_oi             AS open_interest,
+                        ask_volume,
+                        mid_volume,
+                        bid_volume,
+                        implied_volatility,
+                        delta,
+                        gamma,
+                        theta,
+                        vega,
+                        bar_updated_at     AS updated_at,
+                        GREATEST(
+                            COALESCE(bar_volume, 0)
+                                - COALESCE(LAG(bar_volume) OVER (ORDER BY bar_ts), 0),
+                            0
+                        )::bigint          AS volume_delta
+                    FROM ranked
+                    WHERE rn = 1
+                    ORDER BY timestamp ASC
+                """
+                rows = await conn.fetch(query, option_symbol, day_start_et, day_end_et)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching option contract history: {e}", exc_info=True)
