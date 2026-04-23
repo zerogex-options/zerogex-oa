@@ -1181,6 +1181,7 @@ class PortfolioEngine:
         conn=None,
         cached_option_rows=None,
         forced_timeframe: Optional[str] = None,
+        signal_direction: Optional[str] = None,
     ) -> Optional[dict]:
         signal_timeframe = forced_timeframe or self._infer_signal_timeframe(
             score.composite_score
@@ -1201,8 +1202,13 @@ class PortfolioEngine:
         if not option_rows:
             return None
 
+        # signal_direction (when provided by the regime-aware MSI path) takes
+        # precedence over score.direction so the strategy builder + optimizer
+        # follow the resolved trade_direction rather than the raw MSI sign.
+        effective_direction = signal_direction or score.direction
+
         strategy_decision = self.strategy_builder.decide(
-            score_direction=score.direction,
+            score_direction=effective_direction,
             score_normalized=score.normalized_score,
             market_ctx={
                 **ctx,

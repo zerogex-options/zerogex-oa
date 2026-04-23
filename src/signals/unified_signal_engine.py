@@ -882,7 +882,11 @@ class UnifiedSignalEngine:
                                     market_context.underlying,
                                     market_context.timestamp,
                                     result.name,
-                                    result.context.get("signal", "neutral"),
+                                    # signal_events.direction is VARCHAR(16);
+                                    # truncate so longer signal labels (e.g.
+                                    # "trend_expansion") don't blow up the
+                                    # INSERT.
+                                    str(result.context.get("signal", "neutral"))[:16],
                                     result.score,
                                     json.dumps(result.context, default=str),
                                     market_context.close,
