@@ -1085,6 +1085,7 @@ gex-preview: ## Preview GEX calculation data
 .PHONY: flow-by-contract
 flow-by-contract: ## Unified 5-min flow by (type, strike, expiration) (default: SPY, override: make flow-by-contract FLOW_SYMBOL=QQQ)
 	@echo "$(BLUE)=== Option Flow by Contract ($(FLOW_SYMBOL), Most Recent 20 Rows) ===$(NC)"
+	@echo "$(BLUE)Values are session day-to-date cumulative per contract (reset at 09:30 ET).$(NC)"
 	@$(PSQL) -c "\
 		SET statement_timeout = '10s'; \
 		SELECT \
@@ -1094,19 +1095,10 @@ flow-by-contract: ## Unified 5-min flow by (type, strike, expiration) (default: 
 			strike, \
 			expiration, \
 			(expiration - CURRENT_DATE) as dte, \
-			total_volume AS volume, \
-			TO_CHAR(total_premium, 'FM999,999,999') as premium, \
-			buy_volume, \
-			sell_volume, \
-			(buy_volume - sell_volume)::bigint AS net_dir_vol, \
-			TO_CHAR(buy_premium - sell_premium, 'FM999,999,999') as net_premium, \
-			CASE \
-				WHEN option_type = 'C' AND (buy_volume - sell_volume) > 100 THEN '🟢 Calls bought' \
-				WHEN option_type = 'C' AND (buy_volume - sell_volume) < -100 THEN '🔴 Calls sold' \
-				WHEN option_type = 'P' AND (buy_volume - sell_volume) > 100 THEN '🔴 Puts bought' \
-				WHEN option_type = 'P' AND (buy_volume - sell_volume) < -100 THEN '🟢 Puts sold' \
-				ELSE '⚪ Neutral' \
-			END as flow_bias, \
+			raw_volume, \
+			TO_CHAR(raw_premium, 'FM999,999,999') as raw_premium, \
+			net_volume, \
+			TO_CHAR(net_premium, 'FM999,999,999') as net_premium, \
 			TO_CHAR(underlying_price, 'FM999,990.99') as underlying_price \
 		FROM flow_by_contract \
 		WHERE symbol = '$(FLOW_SYMBOL)' \
@@ -1220,24 +1212,30 @@ flow-live: ## Combined real-time flow dashboard
 		ORDER BY timestamp DESC \
 		LIMIT 10;"
 	@echo ""
-	@echo "$(GREEN)2. PUTS VS CALLS FLOW (Last 10 Minutes)$(NC)"
+	@echo "$(GREEN)2. PUTS VS CALLS FLOW (Last 30 Minutes, per 5-min bucket)$(NC)"
 	@echo "--------------------------------------------------------------------------------"
 	@$(PSQL) -c "\
 		SET statement_timeout = '10s'; \
 		SELECT \
-			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
-			SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END) as calls, \
-			SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END) as puts, \
-			SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE -total_volume END) as net, \
+			TO_CHAR(bucket_ts AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
+			SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE 0 END)::bigint as calls, \
+			SUM(CASE WHEN option_type = 'P' THEN volume_delta ELSE 0 END)::bigint as puts, \
+			SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE -volume_delta END)::bigint as net, \
 			ROUND( \
-				SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END)::numeric \
-				/ NULLIF(SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END), 0), 2 \
+				SUM(CASE WHEN option_type = 'P' THEN volume_delta ELSE 0 END)::numeric \
+				/ NULLIF(SUM(CASE WHEN option_type = 'C' THEN volume_delta ELSE 0 END), 0), 2 \
 			) as pc_ratio \
-		FROM flow_by_contract \
-		WHERE symbol = '$(FLOW_SYMBOL)' \
-			AND timestamp > NOW() - INTERVAL '30 minutes' \
-		GROUP BY timestamp \
-		ORDER BY timestamp DESC \
+		FROM ( \
+			SELECT \
+				to_timestamp(floor(extract(epoch FROM timestamp) / 300) * 300) AS bucket_ts, \
+				option_type, \
+				volume_delta \
+			FROM flow_contract_facts \
+			WHERE symbol = '$(FLOW_SYMBOL)' \
+			  AND timestamp > NOW() - INTERVAL '30 minutes' \
+		) b \
+		GROUP BY bucket_ts \
+		ORDER BY bucket_ts DESC \
 		LIMIT 10;"
 	@echo ""
 	@echo "$(GREEN)3. SMART MONEY / UNUSUAL ACTIVITY (Top 10)$(NC)"
@@ -1296,11 +1294,11 @@ flow-live: ## Combined real-time flow dashboard
 		WITH strike_window AS ( \
 			SELECT \
 				strike, \
-				SUM(total_volume)::bigint AS total_flow, \
+				SUM(volume_delta)::bigint AS total_flow, \
 				SUM(CASE WHEN option_type = 'C' \
-				         THEN total_volume \
-				         ELSE -total_volume END)::bigint AS net_flow \
-			FROM flow_by_contract \
+				         THEN volume_delta \
+				         ELSE -volume_delta END)::bigint AS net_flow \
+			FROM flow_contract_facts \
 			WHERE symbol = '$(FLOW_SYMBOL)' \
 				AND timestamp > NOW() - INTERVAL '30 minutes' \
 			GROUP BY strike \
@@ -1428,11 +1426,13 @@ divergence: ## Momentum divergence signals
 	@$(PSQL) -c "\
 		SET statement_timeout = '10s'; \
 		WITH option_flow AS ( \
-			SELECT timestamp, symbol, \
-				SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE -total_premium END)::numeric AS net_option_flow \
-			FROM flow_by_contract \
+			SELECT \
+				to_timestamp(floor(extract(epoch FROM timestamp) / 300) * 300) AS timestamp, \
+				symbol, \
+				SUM(CASE WHEN option_type = 'C' THEN premium_delta ELSE -premium_delta END)::numeric AS net_option_flow \
+			FROM flow_contract_facts \
 			WHERE symbol = '$(FLOW_SYMBOL)' \
-			GROUP BY timestamp, symbol \
+			GROUP BY 1, 2 \
 		), base AS ( \
 			SELECT \
 				u.timestamp, \
@@ -1516,12 +1516,14 @@ technicals: ## Combined technicals dashboard
 	@$(PSQL) -c "\
 		SET statement_timeout = '10s'; \
 		WITH option_flow AS ( \
-			SELECT timestamp, symbol, \
-				SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE -total_premium END)::numeric AS net_option_flow \
-			FROM flow_by_contract \
+			SELECT \
+				to_timestamp(floor(extract(epoch FROM timestamp) / 300) * 300) AS timestamp, \
+				symbol, \
+				SUM(CASE WHEN option_type = 'C' THEN premium_delta ELSE -premium_delta END)::numeric AS net_option_flow \
+			FROM flow_contract_facts \
 			WHERE symbol = '$(FLOW_SYMBOL)' \
 				AND timestamp > NOW() - INTERVAL '70 minutes' \
-			GROUP BY timestamp, symbol \
+			GROUP BY 1, 2 \
 		), base AS ( \
 			SELECT \
 				u.timestamp, \
