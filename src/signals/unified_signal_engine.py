@@ -67,6 +67,16 @@ class UnifiedSignalEngine:
             with db_connection() as new_conn:
                 yield new_conn
 
+    @staticmethod
+    def _reset_tx(conn) -> None:
+        """Rollback any aborted transaction so later queries on the same
+        connection can proceed. Safe for read-only work paths because no
+        successful write state is lost on rollback."""
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
     def _fetch_market_context(self, conn=None) -> Optional[dict]:
         with self._use_conn(conn) as conn:
             with conn.cursor() as cur:
@@ -507,6 +517,12 @@ class UnifiedSignalEngine:
                             self.db_symbol,
                             exc,
                         )
+
+                # Any of the try/except-wrapped queries above may have failed
+                # and left the transaction in an aborted state. Reset it so
+                # the unguarded queries that follow can run cleanly. Safe for
+                # this entirely read-only context fetch.
+                self._reset_tx(conn)
 
                 # C4: extend the close history to 2h of 1-minute bars so
                 # components can compute realized-sigma normalized momentum.

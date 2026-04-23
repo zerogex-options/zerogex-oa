@@ -1275,7 +1275,7 @@ class DatabaseManager:
 
         session_start, session_end = _get_flow_session_bounds(session)
         query = """
-            WITH rows AS (
+            WITH src AS (
                 SELECT
                     timestamp,
                     symbol,
@@ -1325,7 +1325,7 @@ class DatabaseManager:
                           THEN (buy_volume - sell_volume)
                           ELSE -(buy_volume - sell_volume) END)::bigint AS net_directional_volume,
                     underlying_price
-                FROM rows
+                FROM src
             )
             SELECT
                 timestamp,
