@@ -3247,8 +3247,12 @@ class DatabaseManager:
         if session_is_open:
             target_date = today
         else:
+            # MAX(timestamp) — not MAX(DATE(timestamp AT TIME ZONE ...)) —
+            # so the planner can satisfy this via a reverse scan of the
+            # (underlying, timestamp DESC) index instead of evaluating the
+            # timezone-shifted date function on every row.
             date_query = """
-                SELECT MAX(DATE(timestamp AT TIME ZONE 'America/New_York')) AS latest_date
+                SELECT MAX(timestamp) AS latest_ts
                 FROM option_chains
                 WHERE underlying = $1
                   AND strike = $2
@@ -3260,12 +3264,20 @@ class DatabaseManager:
                     row = await conn.fetchrow(
                         date_query, underlying, float(strike), expiration_date, option_type
                     )
-                    if not row or row["latest_date"] is None:
+                    if not row or row["latest_ts"] is None:
                         return []
-                    target_date = row["latest_date"]
+                    target_date = row["latest_ts"].astimezone(_ET).date()
             except Exception as e:
                 logger.error(f"Error finding most recent date for option contract: {e}")
                 raise
+
+        # Convert the ET calendar day into an explicit UTC timestamp range.
+        # A non-sargable predicate like DATE(timestamp AT TIME ZONE 'America/New_York') = $5
+        # forces a full scan of every row matching `underlying=$1`; an
+        # inclusive/exclusive timestamp range lets the (underlying, timestamp DESC)
+        # index narrow straight to the session's rows.
+        day_start_et = datetime.combine(target_date, _time(0, 0), tzinfo=_ET)
+        day_end_et = day_start_et + timedelta(days=1)
 
         query = """
             WITH ranked AS (
@@ -3284,7 +3296,8 @@ class DatabaseManager:
                   AND strike = $2
                   AND expiration = $3
                   AND option_type = $4
-                  AND DATE(timestamp AT TIME ZONE 'America/New_York') = $5
+                  AND timestamp >= $5
+                  AND timestamp < $6
             )
             SELECT
                 bar_ts             AS timestamp,
@@ -3319,7 +3332,8 @@ class DatabaseManager:
         try:
             async with self._acquire_connection() as conn:
                 rows = await conn.fetch(
-                    query, underlying, float(strike), expiration_date, option_type, target_date
+                    query, underlying, float(strike), expiration_date, option_type,
+                    day_start_et, day_end_et
                 )
                 return [dict(row) for row in rows]
         except Exception as e:
