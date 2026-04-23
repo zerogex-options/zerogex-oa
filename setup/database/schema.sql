@@ -463,6 +463,9 @@ CREATE INDEX IF NOT EXISTS idx_flow_contract_facts_symbol_ts_type
 -- Unified 5-minute-bucketed flow rollup keyed by (type, strike, expiration).
 -- Replaces the legacy flow_by_type / flow_by_strike / flow_by_expiration
 -- cache tables, which have been consolidated into a single source of truth.
+-- Each row stores DAY-TO-DATE cumulative values for one contract as of the
+-- end of its 5-minute bucket. The session is aligned to TradeStation's RTH
+-- window (09:30–16:15 ET), so cumulative counters reset at 09:30 ET.
 DROP TABLE IF EXISTS flow_by_type CASCADE;
 DROP TABLE IF EXISTS flow_by_strike CASCADE;
 DROP TABLE IF EXISTS flow_by_expiration CASCADE;
@@ -473,18 +476,29 @@ CREATE TABLE IF NOT EXISTS flow_by_contract (
     option_type CHAR(1) NOT NULL CHECK (option_type IN ('C', 'P')),
     strike NUMERIC(12, 4) NOT NULL,
     expiration DATE NOT NULL,
-    total_volume BIGINT NOT NULL DEFAULT 0,
-    total_premium NUMERIC(18, 2) NOT NULL DEFAULT 0,
-    buy_volume BIGINT NOT NULL DEFAULT 0,
-    sell_volume BIGINT NOT NULL DEFAULT 0,
-    buy_premium NUMERIC(18, 2) NOT NULL DEFAULT 0,
-    sell_premium NUMERIC(18, 2) NOT NULL DEFAULT 0,
-    avg_iv NUMERIC(10, 6),
-    avg_delta NUMERIC(10, 6),
+    raw_volume BIGINT NOT NULL DEFAULT 0,
+    raw_premium NUMERIC(18, 2) NOT NULL DEFAULT 0,
+    net_volume BIGINT NOT NULL DEFAULT 0,
+    net_premium NUMERIC(18, 2) NOT NULL DEFAULT 0,
     underlying_price NUMERIC(12, 4),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (timestamp, symbol, option_type, strike, expiration)
 );
+
+-- Idempotent migration: add the new cumulative columns and drop legacy
+-- bucket-sum columns on existing installations. Safe to run repeatedly.
+ALTER TABLE flow_by_contract ADD COLUMN IF NOT EXISTS raw_volume BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE flow_by_contract ADD COLUMN IF NOT EXISTS raw_premium NUMERIC(18, 2) NOT NULL DEFAULT 0;
+ALTER TABLE flow_by_contract ADD COLUMN IF NOT EXISTS net_volume BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE flow_by_contract ADD COLUMN IF NOT EXISTS net_premium NUMERIC(18, 2) NOT NULL DEFAULT 0;
+ALTER TABLE flow_by_contract DROP COLUMN IF EXISTS total_volume;
+ALTER TABLE flow_by_contract DROP COLUMN IF EXISTS total_premium;
+ALTER TABLE flow_by_contract DROP COLUMN IF EXISTS buy_volume;
+ALTER TABLE flow_by_contract DROP COLUMN IF EXISTS sell_volume;
+ALTER TABLE flow_by_contract DROP COLUMN IF EXISTS buy_premium;
+ALTER TABLE flow_by_contract DROP COLUMN IF EXISTS sell_premium;
+ALTER TABLE flow_by_contract DROP COLUMN IF EXISTS avg_iv;
+ALTER TABLE flow_by_contract DROP COLUMN IF EXISTS avg_delta;
 
 CREATE TABLE IF NOT EXISTS flow_smart_money (
     timestamp TIMESTAMPTZ NOT NULL,

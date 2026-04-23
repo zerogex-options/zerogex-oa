@@ -187,15 +187,28 @@ def test_get_flow_query_targets_unified_rollup():
 
     assert conn.last_query is not None
     assert "flow_by_contract" in conn.last_query
-    assert "PARTITION BY strike, expiration" in conn.last_query
-    assert "running_put_call_ratio" in conn.last_query
-    assert "flow_bias" in conn.last_query
+    # New per-contract cumulative schema — no cross-type window aggregation.
+    assert "raw_volume" in conn.last_query
+    assert "raw_premium" in conn.last_query
+    assert "net_volume" in conn.last_query
+    assert "net_premium" in conn.last_query
+    assert "PARTITION BY" not in conn.last_query
 
 
 def test_prior_session_bounds_end_at_1615_et():
     _start, end = _get_session_bounds("prior")
     assert end.hour == 16
     assert end.minute == 15
+
+
+def test_flow_session_bounds_open_at_0930_et():
+    # Flow endpoints use RTH (09:30–16:15 ET), aligned to TradeStation's
+    # volume-reset boundary so per-contract cumulatives make sense.
+    from src.api.database import _get_flow_session_bounds
+
+    start, end = _get_flow_session_bounds("prior")
+    assert (start.hour, start.minute) == (9, 30)
+    assert (end.hour, end.minute) == (16, 15)
 
 
 def _with_fixed_session_bounds(monkey_bounds):
@@ -230,7 +243,7 @@ def test_get_flow_intervals_one_returns_single_bucket_when_session_open():
     # Session is open and 'now' falls mid-bucket at 14:42:17 ET. The most
     # recent queryable bucket is 14:40 (covering 14:40–14:45). intervals=1
     # must request that single bucket — both query bounds equal 14:40 UTC.
-    session_start = datetime(2026, 4, 23, 7, 15, tzinfo=et)
+    session_start = datetime(2026, 4, 23, 9, 30, tzinfo=et)
     session_end = datetime(2026, 4, 23, 14, 42, 17, tzinfo=et)
 
     conn = _run_get_flow_with_bounds((session_start, session_end), intervals=1)
@@ -245,7 +258,7 @@ def test_get_flow_intervals_one_handles_session_close_boundary():
     # Session closed exactly at 16:15 — there is no bucket starting at 16:15
     # (that bucket would span 16:15–16:20, outside the session). The most
     # recent valid bucket is 16:10.
-    session_start = datetime(2026, 4, 22, 7, 15, tzinfo=et)
+    session_start = datetime(2026, 4, 22, 9, 30, tzinfo=et)
     session_end = datetime(2026, 4, 22, 16, 15, tzinfo=et)
 
     conn = _run_get_flow_with_bounds((session_start, session_end), intervals=1)
@@ -258,7 +271,7 @@ def test_get_flow_intervals_one_handles_session_close_boundary():
 
 def test_get_flow_intervals_n_spans_exactly_n_buckets():
     et = ZoneInfo("America/New_York")
-    session_start = datetime(2026, 4, 23, 7, 15, tzinfo=et)
+    session_start = datetime(2026, 4, 23, 9, 30, tzinfo=et)
     session_end = datetime(2026, 4, 23, 14, 42, 17, tzinfo=et)
 
     conn = _run_get_flow_with_bounds((session_start, session_end), intervals=5)
@@ -272,7 +285,7 @@ def test_get_flow_intervals_n_spans_exactly_n_buckets():
 
 def test_get_flow_full_session_clamped_to_session_start():
     et = ZoneInfo("America/New_York")
-    session_start = datetime(2026, 4, 23, 7, 15, tzinfo=et)
+    session_start = datetime(2026, 4, 23, 9, 30, tzinfo=et)
     session_end = datetime(2026, 4, 23, 14, 42, 17, tzinfo=et)
 
     # intervals larger than the session window clamps to session_start bucket.

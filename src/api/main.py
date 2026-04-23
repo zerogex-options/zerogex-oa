@@ -269,21 +269,20 @@ async def get_flow_by_contract(
         ge=1,
         description=(
             "Number of trailing 5-minute buckets to return. Defaults to the "
-            "entire session (07:15–16:15 ET)."
+            "entire session (09:30–16:15 ET)."
         ),
     ),
 ):
-    """Get unified option flow keyed by (type, strike, expiration) — 5-min buckets.
+    """Per-contract option flow in 5-min buckets with session-cumulative values.
 
-    Replaces the former /api/flow/by-type, /api/flow/by-strike, and
-    /api/flow/by-expiration endpoints. Returns one row per 5-min bucket per
-    (option_type, strike, expiration) for the given symbol and session, with
-    cumulative totals running per (strike, expiration) across both types.
+    Returns one row per (option_type, strike, expiration) per 5-min bucket.
+    raw_volume, raw_premium, net_volume and net_premium are day-to-date
+    cumulative for each contract as of the end of its bucket; counters reset
+    at 09:30 ET (TradeStation RTH open).
 
-    Session runs 07:15–16:15 ET. session=current returns today's open session
-    (or most recent if closed); session=prior returns the previous full
-    session. Pass intervals=N to limit the response to the most recent N
-    5-minute buckets within the session.
+    session=current returns today's open session (or most recent if closed);
+    session=prior returns the previous full session. Pass intervals=N to
+    limit the response to the most recent N 5-minute buckets.
     """
     try:
         data = await db_manager.get_flow(symbol, session, intervals=intervals)

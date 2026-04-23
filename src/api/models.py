@@ -136,11 +136,17 @@ class FlowMapBucketResponse(BaseModel):
 
 
 class FlowPoint(BaseModel):
-    """Unified 5-min-bucketed flow row keyed by (type, strike, expiration).
+    """Per-contract 5-min-bucketed flow row with session-cumulative values.
 
-    Replaces the former FlowByType / FlowByStrike / FlowByExpiration models.
-    Cumulative fields run per (option_type, strike, expiration) group; the
-    running put/call ratio runs per (strike, expiration) across both types.
+    One row per (option_type, strike, expiration) per 5-min bucket. Values
+    are day-to-date cumulative for THIS contract as of the end of the
+    bucket, with the session resetting at 09:30 ET (TradeStation RTH open).
+
+    raw_volume / raw_premium: total session volume and flow-weighted premium
+    regardless of buy/sell direction.
+    net_volume / net_premium: session buys minus sells (classified via the
+    ask/bid volume ratio from each tick), scaled so unclassified volume is
+    attributed proportionally.
     """
     timestamp: datetime
     symbol: str
@@ -148,25 +154,10 @@ class FlowPoint(BaseModel):
     strike: Decimal
     expiration: date
     dte: int
-    call_volume: int
-    call_premium: Decimal
-    net_call_premium: Decimal
-    put_volume: int
-    put_premium: Decimal
-    net_put_premium: Decimal
+    raw_volume: int
+    raw_premium: Decimal
     net_volume: int
-    net_directional_volume: int
     net_premium: Decimal
-    cumulative_call_premium: Decimal
-    cumulative_put_premium: Decimal
-    cumulative_volume: int
-    cumulative_call_volume: int
-    cumulative_put_volume: int
-    cumulative_net_volume: int
-    cumulative_net_directional_volume: int
-    cumulative_net_premium: Decimal
-    running_put_call_ratio: Optional[Decimal] = None
-    flow_bias: str
     underlying_price: Optional[Decimal] = None
 
 

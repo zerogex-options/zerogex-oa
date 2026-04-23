@@ -62,14 +62,18 @@ def _get_session_bounds(session: str = 'current') -> tuple:
 
 
 def _get_flow_session_bounds(session: str = 'current') -> tuple:
-    """Return (start_ts, end_ts) for flow endpoints, which run 07:15–16:15 ET.
+    """Return (start_ts, end_ts) for flow endpoints, which run 09:30–16:15 ET.
 
-    'current': today 07:15–now if session is open, else most recent session 07:15–16:15 ET.
+    Aligned to TradeStation's regular trading hours so the per-contract
+    cumulative counters in flow_by_contract reset at 09:30 ET with the
+    underlying volume field.
+
+    'current': today 09:30–now if session is open, else most recent session 09:30–16:15 ET.
     'prior':   the full session immediately before the current one.
     """
     now_et = datetime.now(_ET)
     today = now_et.date()
-    session_open_time = time(7, 15)
+    session_open_time = time(9, 30)
     session_close_time = time(16, 15)
 
     def prev_trading_day(d):
@@ -1308,94 +1312,22 @@ class DatabaseManager:
         effective_end = datetime.fromtimestamp(end_bucket_epoch, tz=timezone.utc)
 
         query = """
-            WITH src AS (
-                SELECT
-                    timestamp,
-                    symbol,
-                    option_type,
-                    strike,
-                    expiration,
-                    total_volume,
-                    total_premium,
-                    buy_volume,
-                    sell_volume,
-                    buy_premium,
-                    sell_premium,
-                    underlying_price
-                FROM flow_by_contract
-                WHERE symbol = $1
-                  AND timestamp >= $2
-                  AND timestamp <= $3
-            ),
-            decorated AS (
-                SELECT
-                    timestamp,
-                    symbol,
-                    option_type,
-                    strike,
-                    expiration,
-                    (expiration - CURRENT_DATE)::int AS dte,
-                    (CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END)::bigint AS call_volume,
-                    (CASE WHEN option_type = 'C' THEN total_premium ELSE 0 END)::numeric AS call_premium,
-                    (CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END)::bigint AS put_volume,
-                    (CASE WHEN option_type = 'P' THEN total_premium ELSE 0 END)::numeric AS put_premium,
-                    -- Net Call Premium: buy pressure minus sell pressure on calls.
-                    (CASE WHEN option_type = 'C'
-                          THEN (buy_premium - sell_premium) ELSE 0 END)::numeric AS ncp,
-                    -- Net Put Premium: negated buy-minus-sell on puts so that
-                    -- bearish put buying shows as a negative contribution to
-                    -- overall net_premium.
-                    (CASE WHEN option_type = 'P'
-                          THEN -(buy_premium - sell_premium) ELSE 0 END)::numeric AS npp,
-                    -- Signed volume: calls add, puts subtract.
-                    (CASE WHEN option_type = 'C' THEN total_volume ELSE -total_volume END)::bigint AS net_volume,
-                    -- Directional volume: Lee-Ready buy-sell with call/put sign.
-                    (CASE WHEN option_type = 'C'
-                          THEN (buy_volume - sell_volume)
-                          ELSE -(buy_volume - sell_volume) END)::bigint AS net_directional_volume,
-                    underlying_price
-                FROM src
-            )
             SELECT
                 timestamp,
                 symbol,
                 option_type,
                 strike,
                 expiration,
-                dte,
-                call_volume,
-                call_premium,
-                ncp AS net_call_premium,
-                put_volume,
-                put_premium,
-                npp AS net_put_premium,
+                (expiration - CURRENT_DATE)::int AS dte,
+                raw_volume,
+                raw_premium,
                 net_volume,
-                net_directional_volume,
-                (ncp + npp)::numeric AS net_premium,
-                (SUM(ncp) OVER w_pair)::numeric AS cumulative_call_premium,
-                (SUM(npp) OVER w_pair)::numeric AS cumulative_put_premium,
-                (SUM(call_volume + put_volume) OVER w_pair)::bigint AS cumulative_volume,
-                (SUM(call_volume) OVER w_pair)::bigint AS cumulative_call_volume,
-                (SUM(put_volume) OVER w_pair)::bigint AS cumulative_put_volume,
-                (SUM(net_volume) OVER w_pair)::bigint AS cumulative_net_volume,
-                (SUM(net_directional_volume) OVER w_pair)::bigint AS cumulative_net_directional_volume,
-                (SUM(ncp + npp) OVER w_pair)::numeric AS cumulative_net_premium,
-                ROUND(
-                    (SUM(put_volume) OVER w_pair)::numeric
-                    / NULLIF(SUM(call_volume) OVER w_pair, 0),
-                    4
-                ) AS running_put_call_ratio,
-                CASE
-                    WHEN net_volume > 100 THEN '🟢 Strong Calls'
-                    WHEN net_volume > 0 THEN '✅ Calls'
-                    WHEN net_volume < -100 THEN '🔴 Strong Puts'
-                    WHEN net_volume < 0 THEN '❌ Puts'
-                    ELSE '⚪ Neutral'
-                END AS flow_bias,
+                net_premium,
                 underlying_price
-            FROM decorated
-            WINDOW
-                w_pair AS (PARTITION BY strike, expiration ORDER BY timestamp)
+            FROM flow_by_contract
+            WHERE symbol = $1
+              AND timestamp >= $2
+              AND timestamp <= $3
             ORDER BY timestamp DESC, option_type, strike, expiration
         """
 

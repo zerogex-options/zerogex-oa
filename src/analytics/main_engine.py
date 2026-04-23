@@ -967,84 +967,96 @@ class AnalyticsEngine:
             with db_connection() as conn:
                 cursor = conn.cursor()
 
-                # Refresh flow_by_contract: unified 5-minute-bucketed rollup
+                # Refresh flow_by_contract: unified 5-min-bucketed rollup
                 # keyed by (timestamp, symbol, option_type, strike, expiration).
-                # Aggregates straight off flow_contract_facts (already
-                # populated with Lee-Ready buy/sell splits by the API's
-                # _refresh_flow_cache); the previous option_chains+LAG
-                # variant was hanging in production because of plan
-                # regressions on the wide window. The current bucket is
-                # re-upserted on every call until it rolls over.
+                # Each row stores DAY-TO-DATE cumulative values for one
+                # contract as of the end of its bucket. The session resets
+                # at 09:30 ET (TradeStation RTH open), so cumulative counters
+                # zero at open. We upsert both the current bucket and the
+                # previous one on every refresh: refreshing the previous
+                # bucket after rollover captures any trailing facts that
+                # landed between its last refresh and its bucket boundary.
                 bucket_epoch = int(timestamp.timestamp() // 300) * 300
-                bucket_start = datetime.fromtimestamp(bucket_epoch, tz=timezone.utc)
-                bucket_end = bucket_start + timedelta(minutes=5)
-                logger.info(
-                    "Refreshing flow_by_contract for %s bucket=%s",
-                    self.db_symbol,
-                    bucket_start.isoformat(),
+                curr_bucket_start = datetime.fromtimestamp(bucket_epoch, tz=timezone.utc)
+                curr_bucket_end = curr_bucket_start + timedelta(minutes=5)
+                prev_bucket_start = curr_bucket_start - timedelta(minutes=5)
+
+                # Session open: 09:30 ET of the day containing `timestamp`.
+                ts_et = timestamp.astimezone(ET)
+                session_open_et = ET.localize(
+                    datetime(ts_et.year, ts_et.month, ts_et.day, 9, 30)
                 )
+                session_open = session_open_et.astimezone(timezone.utc)
+
+                logger.info(
+                    "Refreshing flow_by_contract for %s buckets=[%s, %s]",
+                    self.db_symbol,
+                    prev_bucket_start.isoformat(),
+                    curr_bucket_start.isoformat(),
+                )
+                # Single statement covers both bucket rows via a values table.
+                # Each bucket aggregates facts from [session_open, bucket_end),
+                # giving cumulative values keyed at bucket_start.
                 cursor.execute("""
+                    WITH bucket_targets AS (
+                        SELECT * FROM (VALUES
+                            (%s::timestamptz, %s::timestamptz),
+                            (%s::timestamptz, %s::timestamptz)
+                        ) AS t(bucket_start, bucket_end)
+                        WHERE bucket_start >= %s::timestamptz
+                    )
                     INSERT INTO flow_by_contract (
                         timestamp,
                         symbol,
                         option_type,
                         strike,
                         expiration,
-                        total_volume,
-                        total_premium,
-                        buy_volume,
-                        sell_volume,
-                        buy_premium,
-                        sell_premium,
-                        avg_iv,
-                        avg_delta,
+                        raw_volume,
+                        raw_premium,
+                        net_volume,
+                        net_premium,
                         underlying_price
                     )
                     SELECT
-                        %s::timestamptz                           AS timestamp,
-                        symbol,
-                        option_type,
-                        strike,
-                        expiration,
-                        SUM(volume_delta)::bigint                 AS total_volume,
-                        SUM(premium_delta)::numeric               AS total_premium,
-                        SUM(buy_volume)::bigint                   AS buy_volume,
-                        SUM(sell_volume)::bigint                  AS sell_volume,
-                        SUM(buy_premium)::numeric                 AS buy_premium,
-                        SUM(sell_premium)::numeric                AS sell_premium,
-                        AVG(implied_volatility)::numeric          AS avg_iv,
-                        AVG(delta)::numeric                       AS avg_delta,
-                        COALESCE(MAX(underlying_price), %s)::numeric AS underlying_price
-                    FROM flow_contract_facts
-                    WHERE symbol = %s
-                      AND timestamp >= %s
-                      AND timestamp <  %s
-                    GROUP BY symbol, option_type, strike, expiration
-                    HAVING SUM(volume_delta) > 0
+                        bt.bucket_start                              AS timestamp,
+                        f.symbol,
+                        f.option_type,
+                        f.strike,
+                        f.expiration,
+                        SUM(f.volume_delta)::bigint                  AS raw_volume,
+                        SUM(f.premium_delta)::numeric                AS raw_premium,
+                        SUM(f.buy_volume - f.sell_volume)::bigint    AS net_volume,
+                        SUM(f.buy_premium - f.sell_premium)::numeric AS net_premium,
+                        COALESCE(MAX(f.underlying_price), %s)::numeric AS underlying_price
+                    FROM flow_contract_facts f
+                    CROSS JOIN bucket_targets bt
+                    WHERE f.symbol = %s
+                      AND f.timestamp >= %s::timestamptz
+                      AND f.timestamp <  bt.bucket_end
+                    GROUP BY bt.bucket_start, f.symbol, f.option_type, f.strike, f.expiration
+                    HAVING SUM(f.volume_delta) > 0
                     ON CONFLICT (timestamp, symbol, option_type, strike, expiration)
                     DO UPDATE SET
-                        total_volume = EXCLUDED.total_volume,
-                        total_premium = EXCLUDED.total_premium,
-                        buy_volume = EXCLUDED.buy_volume,
-                        sell_volume = EXCLUDED.sell_volume,
-                        buy_premium = EXCLUDED.buy_premium,
-                        sell_premium = EXCLUDED.sell_premium,
-                        avg_iv = EXCLUDED.avg_iv,
-                        avg_delta = EXCLUDED.avg_delta,
+                        raw_volume = EXCLUDED.raw_volume,
+                        raw_premium = EXCLUDED.raw_premium,
+                        net_volume = EXCLUDED.net_volume,
+                        net_premium = EXCLUDED.net_premium,
                         underlying_price = EXCLUDED.underlying_price,
                         updated_at = NOW()
                 """, (
-                    bucket_start,
-                    underlying_price,
-                    self.db_symbol,
-                    bucket_start,
-                    bucket_end,
+                    prev_bucket_start, curr_bucket_start,      # row 1: (prev_start, prev_end)
+                    curr_bucket_start, curr_bucket_end,        # row 2: (curr_start, curr_end)
+                    session_open,                              # bucket_start >= session_open
+                    underlying_price,                          # underlying_price fallback
+                    self.db_symbol,                            # f.symbol filter
+                    session_open,                              # f.timestamp >= session_open
                 ))
                 logger.info(
-                    "flow_by_contract refresh upserted %d rows for %s (bucket %s)",
+                    "flow_by_contract refresh upserted %d rows for %s (buckets [%s, %s])",
                     cursor.rowcount,
                     self.db_symbol,
-                    bucket_start.isoformat(),
+                    prev_bucket_start.isoformat(),
+                    curr_bucket_start.isoformat(),
                 )
 
                 # Refresh flow_smart_money
