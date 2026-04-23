@@ -24,7 +24,7 @@ UNDERLYING ?=
 VENV_PYTHON = venv/bin/python
 
 # Underlying symbol filter — used by flow, signal, and max-pain queries
-# Override with: make flow-by-type FLOW_SYMBOL=QQQ
+# Override with: make flow-by-contract FLOW_SYMBOL=QQQ
 FLOW_SYMBOL ?= SPY
 UNDERLYING_LIVE_SYMBOL ?= SPY
 FLOW_REBUILD_DATE ?= $(shell TZ=America/New_York date +%F)
@@ -127,9 +127,7 @@ $(eval $(call DB_TAIL,underlying-quotes,underlying_quotes,symbol,timestamp))
 $(eval $(call DB_TAIL,option-chains,option_chains,underlying,timestamp))
 $(eval $(call DB_TAIL,gex-summary,gex_summary,underlying,timestamp))
 $(eval $(call DB_TAIL,gex-by-strike,gex_by_strike,underlying,timestamp))
-$(eval $(call DB_TAIL,flow-by-type,flow_by_type,symbol,timestamp))
-$(eval $(call DB_TAIL,flow-by-strike,flow_by_strike,symbol,timestamp))
-$(eval $(call DB_TAIL,flow-by-expiration,flow_by_expiration,symbol,timestamp))
+$(eval $(call DB_TAIL,flow-by-contract,flow_by_contract,symbol,timestamp))
 $(eval $(call DB_TAIL,flow-smart-money,flow_smart_money,symbol,timestamp))
 $(eval $(call DB_TAIL,signal-scores,signal_scores,underlying,timestamp))
 $(eval $(call DB_TAIL,signal-trades,signal_trades,underlying,opened_at))
@@ -273,9 +271,7 @@ help: ## Show this help message
 	@echo "  make gex-preview        - Preview GEX calculation data"
 	@echo ""
 	@echo "$(GREEN)Real-Time Flow Analysis:$(NC)"
-	@echo "  make flow-by-type         - Puts vs calls flow (all strikes/expirations)"
-	@echo "  make flow-by-strike       - Flow by strike level"
-	@echo "  make flow-by-expiration   - Flow by expiration date"
+	@echo "  make flow-by-contract     - Unified 5-min flow by (type, strike, expiration)"
 	@echo "    (override underlying: FLOW_SYMBOL=QQQ)"
 	@echo "  make flow-smart-money     - Unusual activity detection"
 	@echo "  make flow-buying-pressure - Underlying buying/selling pressure"
@@ -346,9 +342,7 @@ help: ## Show this help message
 	@echo "  make db-tail-option-chains        - Last 20 rows from option_chains"
 	@echo "  make db-tail-gex-summary          - Last 20 rows from gex_summary"
 	@echo "  make db-tail-gex-by-strike        - Last 20 rows from gex_by_strike"
-	@echo "  make db-tail-flow-by-type         - Last 20 rows from flow_by_type"
-	@echo "  make db-tail-flow-by-strike       - Last 20 rows from flow_by_strike"
-	@echo "  make db-tail-flow-by-expiration   - Last 20 rows from flow_by_expiration"
+	@echo "  make db-tail-flow-by-contract     - Last 20 rows from flow_by_contract"
 	@echo "  make db-tail-flow-smart-money     - Last 20 rows from flow_smart_money"
 	@echo "  make db-tail-trade-signals        - Last 20 rows from trade_signals"
 	@echo "  make db-tail-signals-accuracy      - Last 20 rows from signal_accuracy"
@@ -1088,107 +1082,35 @@ gex-preview: ## Preview GEX calculation data
 # Real-Time Flow Analysis
 # =============================================================================
 
-.PHONY: flow-by-type
-flow-by-type: ## Puts vs calls flow — 1-min intervals (default: SPY, override: make flow-by-type FLOW_SYMBOL=QQQ)
-	@echo "$(BLUE)=== Option Flow by Type ($(FLOW_SYMBOL), Most Recent 20 Rows) ===$(NC)"
-	@$(PSQL) -c "\
-		SET statement_timeout = '10s'; \
-		WITH aggregated AS ( \
-			SELECT \
-				timestamp, \
-				symbol, \
-				MAX(CASE WHEN option_type = 'C' THEN total_volume END) as call_volume, \
-				MAX(CASE WHEN option_type = 'C' THEN total_premium END) as call_premium, \
-				MAX(CASE WHEN option_type = 'P' THEN total_volume END) as put_volume, \
-				MAX(CASE WHEN option_type = 'P' THEN total_premium END) as put_premium, \
-				MAX(underlying_price) as underlying_price \
-			FROM flow_by_type \
-			WHERE symbol = '$(FLOW_SYMBOL)' \
-			GROUP BY timestamp, symbol \
-		) \
-		SELECT \
-			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
-			symbol, \
-			COALESCE(call_volume, 0) as call_volume, \
-			TO_CHAR(COALESCE(call_premium, 0), 'FM999,999,999') as call_premium, \
-			COALESCE(put_volume, 0) as put_volume, \
-			TO_CHAR(COALESCE(put_premium, 0), 'FM999,999,999') as put_premium, \
-			COALESCE(call_volume, 0) - COALESCE(put_volume, 0) as net_volume, \
-			TO_CHAR(COALESCE(call_premium, 0) - COALESCE(put_premium, 0), 'FM999,999,999') as net_premium, \
-			CASE \
-				WHEN COALESCE(call_volume, 0) - COALESCE(put_volume, 0) > 500 THEN '🟢 Strong Calls' \
-				WHEN COALESCE(call_volume, 0) - COALESCE(put_volume, 0) > 0 THEN '✅ Calls' \
-				WHEN COALESCE(call_volume, 0) - COALESCE(put_volume, 0) < -500 THEN '🔴 Strong Puts' \
-				WHEN COALESCE(call_volume, 0) - COALESCE(put_volume, 0) < 0 THEN '❌ Puts' \
-				ELSE '⚪ Neutral' \
-			END as flow_bias, \
-			TO_CHAR(underlying_price, 'FM999,990.99') as underlying_price \
-		FROM aggregated \
-		ORDER BY timestamp DESC \
-		LIMIT 20;"
-
-.PHONY: flow-by-strike
-flow-by-strike: ## Flow by strike level — 1-min intervals (default: SPY, override: make flow-by-strike FLOW_SYMBOL=QQQ)
-	@echo "$(BLUE)=== Option Flow by Strike ($(FLOW_SYMBOL), Most Recent 20 Rows) ===$(NC)"
+.PHONY: flow-by-contract
+flow-by-contract: ## Unified 5-min flow by (type, strike, expiration) (default: SPY, override: make flow-by-contract FLOW_SYMBOL=QQQ)
+	@echo "$(BLUE)=== Option Flow by Contract ($(FLOW_SYMBOL), Most Recent 20 Rows) ===$(NC)"
 	@$(PSQL) -c "\
 		SET statement_timeout = '10s'; \
 		SELECT \
 			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
 			symbol, \
+			option_type AS typ, \
 			strike, \
+			expiration, \
+			(expiration - CURRENT_DATE) as dte, \
 			total_volume AS volume, \
 			TO_CHAR(total_premium, 'FM999,999,999') as premium, \
-			net_delta::bigint AS net_volume, \
-			TO_CHAR((net_delta * (total_premium::numeric / NULLIF(total_volume, 0))), 'FM999,999,999') as net_premium, \
+			buy_volume, \
+			sell_volume, \
+			(buy_volume - sell_volume)::bigint AS net_dir_vol, \
+			TO_CHAR(buy_premium - sell_premium, 'FM999,999,999') as net_premium, \
 			CASE \
-				WHEN net_delta > 100 THEN '🟢 Strong Calls' \
-				WHEN net_delta > 0 THEN '✅ Calls' \
-				WHEN net_delta < -100 THEN '🔴 Strong Puts' \
-				WHEN net_delta < 0 THEN '❌ Puts' \
+				WHEN option_type = 'C' AND (buy_volume - sell_volume) > 100 THEN '🟢 Calls bought' \
+				WHEN option_type = 'C' AND (buy_volume - sell_volume) < -100 THEN '🔴 Calls sold' \
+				WHEN option_type = 'P' AND (buy_volume - sell_volume) > 100 THEN '🔴 Puts bought' \
+				WHEN option_type = 'P' AND (buy_volume - sell_volume) < -100 THEN '🟢 Puts sold' \
 				ELSE '⚪ Neutral' \
 			END as flow_bias, \
 			TO_CHAR(underlying_price, 'FM999,990.99') as underlying_price \
-		FROM flow_by_strike \
+		FROM flow_by_contract \
 		WHERE symbol = '$(FLOW_SYMBOL)' \
-		ORDER BY timestamp DESC, strike \
-		LIMIT 20;"
-
-.PHONY: flow-by-expiration
-flow-by-expiration: ## Flow by expiration date — 1-min intervals (default: SPY, override: make flow-by-expiration FLOW_SYMBOL=QQQ)
-	@echo "$(BLUE)=== Option Flow by Expiration ($(FLOW_SYMBOL), Most Recent 20 Rows) ===$(NC)"
-	@$(PSQL) -c "\
-		SET statement_timeout = '10s'; \
-		SELECT \
-			TO_CHAR(e.timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
-			e.symbol, \
-			e.expiration, \
-			(e.expiration - CURRENT_DATE) as dte, \
-			e.total_volume AS volume, \
-			TO_CHAR(e.total_premium, 'FM999,999,999') as premium, \
-			(COALESCE(t.call_vol, 0) - COALESCE(t.put_vol, 0))::bigint AS net_volume, \
-			TO_CHAR(COALESCE(t.call_prem, 0) - COALESCE(t.put_prem, 0), 'FM999,999,999') as net_premium, \
-			CASE \
-				WHEN (COALESCE(t.call_vol, 0) - COALESCE(t.put_vol, 0)) > 500 THEN '🟢 Strong Calls' \
-				WHEN (COALESCE(t.call_vol, 0) - COALESCE(t.put_vol, 0)) > 0 THEN '✅ Calls' \
-				WHEN (COALESCE(t.call_vol, 0) - COALESCE(t.put_vol, 0)) < -500 THEN '🔴 Strong Puts' \
-				WHEN (COALESCE(t.call_vol, 0) - COALESCE(t.put_vol, 0)) < 0 THEN '❌ Puts' \
-				ELSE '⚪ Neutral' \
-			END as flow_bias, \
-			TO_CHAR(e.underlying_price, 'FM999,990.99') as underlying_price \
-		FROM flow_by_expiration e \
-		LEFT JOIN ( \
-			SELECT \
-				timestamp, symbol, \
-				MAX(CASE WHEN option_type = 'C' THEN total_volume END) AS call_vol, \
-				MAX(CASE WHEN option_type = 'P' THEN total_volume END) AS put_vol, \
-				MAX(CASE WHEN option_type = 'C' THEN total_premium END) AS call_prem, \
-				MAX(CASE WHEN option_type = 'P' THEN total_premium END) AS put_prem \
-			FROM flow_by_type \
-			WHERE symbol = '$(FLOW_SYMBOL)' \
-			GROUP BY timestamp, symbol \
-		) t ON t.timestamp = e.timestamp AND t.symbol = e.symbol \
-		WHERE e.symbol = '$(FLOW_SYMBOL)' \
-		ORDER BY e.timestamp DESC, e.expiration \
+		ORDER BY timestamp DESC, option_type, strike, expiration \
 		LIMIT 20;"
 
 .PHONY: flow-smart-money
@@ -1311,7 +1233,7 @@ flow-live: ## Combined real-time flow dashboard
 				SUM(CASE WHEN option_type = 'P' THEN total_volume ELSE 0 END)::numeric \
 				/ NULLIF(SUM(CASE WHEN option_type = 'C' THEN total_volume ELSE 0 END), 0), 2 \
 			) as pc_ratio \
-		FROM flow_by_type \
+		FROM flow_by_contract \
 		WHERE symbol = '$(FLOW_SYMBOL)' \
 			AND timestamp > NOW() - INTERVAL '30 minutes' \
 		GROUP BY timestamp \
@@ -1375,8 +1297,10 @@ flow-live: ## Combined real-time flow dashboard
 			SELECT \
 				strike, \
 				SUM(total_volume)::bigint AS total_flow, \
-				SUM(net_delta)::bigint AS net_flow \
-			FROM flow_by_strike \
+				SUM(CASE WHEN option_type = 'C' \
+				         THEN total_volume \
+				         ELSE -total_volume END)::bigint AS net_flow \
+			FROM flow_by_contract \
 			WHERE symbol = '$(FLOW_SYMBOL)' \
 				AND timestamp > NOW() - INTERVAL '30 minutes' \
 			GROUP BY strike \
@@ -1430,9 +1354,9 @@ flow-rebuild-session: flow-reset-session-facts ## Reset one ET session, restart 
 		fi; \
 		sleep 1; \
 	done
-	@echo "$(YELLOW)Triggering /api/flow/by-type refresh for $(FLOW_SYMBOL)...$(NC)"
-	@curl -fsS "http://localhost:8000/api/flow/by-type?symbol=$(FLOW_SYMBOL)&session=current" > /dev/null
-	@echo "$(GREEN)Rebuild trigger sent. Validate with: make flow-by-type FLOW_SYMBOL=$(FLOW_SYMBOL)$(NC)"
+	@echo "$(YELLOW)Triggering /api/flow/by-contract refresh for $(FLOW_SYMBOL)...$(NC)"
+	@curl -fsS "http://localhost:8000/api/flow/by-contract?symbol=$(FLOW_SYMBOL)&session=current" > /dev/null
+	@echo "$(GREEN)Rebuild trigger sent. Validate with: make flow-by-contract FLOW_SYMBOL=$(FLOW_SYMBOL)$(NC)"
 
 .PHONY: vwap
 vwap: ## VWAP deviation tracker
@@ -1506,7 +1430,7 @@ divergence: ## Momentum divergence signals
 		WITH option_flow AS ( \
 			SELECT timestamp, symbol, \
 				SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE -total_premium END)::numeric AS net_option_flow \
-			FROM flow_by_type \
+			FROM flow_by_contract \
 			WHERE symbol = '$(FLOW_SYMBOL)' \
 			GROUP BY timestamp, symbol \
 		), base AS ( \
@@ -1594,7 +1518,7 @@ technicals: ## Combined technicals dashboard
 		WITH option_flow AS ( \
 			SELECT timestamp, symbol, \
 				SUM(CASE WHEN option_type = 'C' THEN total_premium ELSE -total_premium END)::numeric AS net_option_flow \
-			FROM flow_by_type \
+			FROM flow_by_contract \
 			WHERE symbol = '$(FLOW_SYMBOL)' \
 				AND timestamp > NOW() - INTERVAL '70 minutes' \
 			GROUP BY timestamp, symbol \
@@ -1924,7 +1848,7 @@ clear-data: ## Clear all data from tables (keeps schema)
 	@read -p "Are you sure? Type 'yes' to confirm: " confirm; \
 	if [ "$$confirm" = "yes" ]; then \
 		echo "$(YELLOW)Clearing all data...$(NC)"; \
-		$(PSQL) -c "TRUNCATE TABLE underlying_quotes, option_chains, gex_summary, gex_by_strike, flow_by_type, flow_by_strike, flow_by_expiration, flow_smart_money, max_pain_oi_snapshot, max_pain_oi_snapshot_expiration RESTART IDENTITY CASCADE;"; \
+		$(PSQL) -c "TRUNCATE TABLE underlying_quotes, option_chains, gex_summary, gex_by_strike, flow_contract_facts, flow_by_contract, flow_smart_money, max_pain_oi_snapshot, max_pain_oi_snapshot_expiration RESTART IDENTITY CASCADE;"; \
 		echo "$(GREEN)✅ All data cleared$(NC)"; \
 	else \
 		echo "$(RED)❌ Aborted$(NC)"; \
@@ -2038,7 +1962,7 @@ DATA_RETENTION_DAYS ?= 90
 
 # Helper: all tables that hold timestamped data and need regular maintenance.
 DB_MAINTAIN_TABLES = option_chains underlying_quotes gex_summary gex_by_strike \
-	flow_contract_facts flow_by_type flow_by_strike flow_by_expiration \
+	flow_contract_facts flow_by_contract \
 	flow_smart_money trade_signals \
 	position_optimizer_signals
 
@@ -2296,9 +2220,8 @@ api-test: ## Test ALL API endpoints
 	done; \
 	echo ""; \
 	echo "$(YELLOW)Flow endpoints$(NC)"; \
-	test_endpoint "/api/flow/by-type?symbol=$$SYMBOL&window_minutes=60"; \
-	test_endpoint "/api/flow/by-strike?symbol=$$SYMBOL&window_minutes=60&limit=10"; \
-	test_endpoint "/api/flow/by-expiration?symbol=$$SYMBOL&window_minutes=60&limit=10"; \
+	test_endpoint "/api/flow/by-contract?symbol=$$SYMBOL"; \
+	test_endpoint "/api/flow/by-contract?symbol=$$SYMBOL&intervals=12"; \
 	test_endpoint "/api/flow/smart-money?symbol=$$SYMBOL&window_minutes=60&limit=10"; \
 	test_endpoint "/api/flow/buying-pressure?symbol=$$SYMBOL"; \
 	echo ""; \
@@ -2334,7 +2257,7 @@ staging-smoke: ## Run post-deploy staging smoke checklist
 	@curl -fsS "http://localhost:8000/api/health" > /dev/null && echo "$(GREEN)✅ /api/health$(NC)" || (echo "$(RED)❌ /api/health$(NC)" && exit 1)
 	@curl -fsS "http://localhost:8000/api/gex/summary?symbol=SPY" > /dev/null && echo "$(GREEN)✅ /api/gex/summary$(NC)" || (echo "$(RED)❌ /api/gex/summary$(NC)" && exit 1)
 	@curl -fsS "http://localhost:8000/api/market/quote?symbol=SPY" > /dev/null && echo "$(GREEN)✅ /api/market/quote$(NC)" || (echo "$(RED)❌ /api/market/quote$(NC)" && exit 1)
-	@curl -fsS "http://localhost:8000/api/flow/by-type?symbol=SPY&window_minutes=60" > /dev/null && echo "$(GREEN)✅ /api/flow/by-type$(NC)" || (echo "$(RED)❌ /api/flow/by-type$(NC)" && exit 1)
+	@curl -fsS "http://localhost:8000/api/flow/by-contract?symbol=SPY" > /dev/null && echo "$(GREEN)✅ /api/flow/by-contract$(NC)" || (echo "$(RED)❌ /api/flow/by-contract$(NC)" && exit 1)
 	@echo ""
 	@echo "$(GREEN)✅ Staging smoke checklist passed$(NC)"
 

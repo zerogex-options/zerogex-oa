@@ -254,10 +254,18 @@ async def get_gex_heatmap(
 # Options Flow Endpoints
 # ============================================================================
 
-@app.get("/api/flow", response_model=List[FlowPoint], tags=["Options Flow"])
-async def get_flow(
+@app.get("/api/flow/by-contract", response_model=List[FlowPoint], tags=["Options Flow"])
+async def get_flow_by_contract(
     symbol: str = Query(default="SPY"),
     session: str = Query(default="current", pattern="^(current|prior)$"),
+    intervals: Optional[int] = Query(
+        default=None,
+        ge=1,
+        description=(
+            "Number of trailing 5-minute buckets to return. Defaults to the "
+            "entire session (07:15–16:15 ET)."
+        ),
+    ),
 ):
     """Get unified option flow keyed by (type, strike, expiration) — 5-min buckets.
 
@@ -268,10 +276,11 @@ async def get_flow(
 
     Session runs 07:15–16:15 ET. session=current returns today's open session
     (or most recent if closed); session=prior returns the previous full
-    session.
+    session. Pass intervals=N to limit the response to the most recent N
+    5-minute buckets within the session.
     """
     try:
-        data = await db_manager.get_flow(symbol, session)
+        data = await db_manager.get_flow(symbol, session, intervals=intervals)
         return [FlowPoint(**row) for row in data]
     except HTTPException:
         raise

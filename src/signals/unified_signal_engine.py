@@ -864,6 +864,12 @@ class UnifiedSignalEngine:
                         and state["streak"] >= self._HYSTERESIS_CYCLES
                         and not state["event_emitted"]
                     ):
+                        # SAVEPOINT-wrap the events INSERT so a failure (e.g.
+                        # a too-long direction string, FK violation) doesn't
+                        # poison the transaction and cascade
+                        # InFailedSqlTransaction into the next iteration's
+                        # signal_component_scores INSERT.
+                        cur.execute("SAVEPOINT sig_event")
                         try:
                             cur.execute(
                                 """
@@ -882,9 +888,12 @@ class UnifiedSignalEngine:
                                     market_context.close,
                                 ),
                             )
+                            cur.execute("RELEASE SAVEPOINT sig_event")
                             state["event_emitted"] = True
                         except Exception as exc:
-                            logger.debug(
+                            cur.execute("ROLLBACK TO SAVEPOINT sig_event")
+                            cur.execute("RELEASE SAVEPOINT sig_event")
+                            logger.warning(
                                 "signal_events insert failed for %s: %s",
                                 result.name,
                                 exc,

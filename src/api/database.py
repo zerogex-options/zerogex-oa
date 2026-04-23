@@ -1260,20 +1260,30 @@ class DatabaseManager:
         self,
         symbol: str = 'SPY',
         session: str = 'current',
+        intervals: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Get unified option flow keyed by (type, strike, expiration) in 5-min buckets.
 
         Reads from the flow_by_contract rollup populated by the analytics
         engine and decorates each row with running cumulative totals plus a
-        per (strike, expiration) running put/call ratio.
+        per (strike, expiration) running put/call ratio. When *intervals* is
+        set, the query window is narrowed to the most recent N 5-minute
+        buckets within the session; cumulative totals are then partial sums
+        from the start of that window rather than session opens.
         """
         symbol = symbol.upper()
-        cache_key = f"flow:{symbol}:{session}"
+        intervals_key = intervals if intervals and intervals > 0 else 'all'
+        cache_key = f"flow:{symbol}:{session}:{intervals_key}"
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached
 
         session_start, session_end = _get_flow_session_bounds(session)
+        if intervals and intervals > 0:
+            # Narrow to the most recent N 5-minute buckets ending at session_end.
+            window_start = session_end - timedelta(minutes=5 * intervals)
+            if window_start > session_start:
+                session_start = window_start
         query = """
             WITH src AS (
                 SELECT

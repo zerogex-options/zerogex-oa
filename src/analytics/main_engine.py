@@ -971,7 +971,7 @@ class AnalyticsEngine:
                 # keyed by (timestamp, symbol, option_type, strike, expiration).
                 # The current bucket is re-aggregated on every call; once a
                 # bucket rolls over, its row is effectively frozen.
-                logger.debug("Refreshing flow_by_contract...")
+                logger.info("Refreshing flow_by_contract...")
                 cursor.execute("""
                     WITH bounds AS (
                         SELECT to_timestamp(
@@ -1091,6 +1091,12 @@ class AnalyticsEngine:
                         underlying_price = EXCLUDED.underlying_price,
                         updated_at = NOW()
                 """, (timestamp, self.db_symbol, timestamp, self.db_symbol, underlying_price))
+                logger.info(
+                    "flow_by_contract refresh upserted %d rows for %s (bucket of %s)",
+                    cursor.rowcount,
+                    self.db_symbol,
+                    timestamp,
+                )
 
                 # Refresh flow_smart_money
                 logger.debug("Refreshing flow_smart_money...")
