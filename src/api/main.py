@@ -6,6 +6,7 @@ FastAPI backend for serving analytics data to the frontend
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from collections import deque
 from contextlib import asynccontextmanager
@@ -118,6 +119,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Compress responses so that large JSON payloads from endpoints like
+# /api/flow/by-contract (which can return hundreds of thousands of rows for a
+# full session) don't get bottlenecked on transfer.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 app.include_router(trade_signals_router)
 app.include_router(volatility_gauge_router)

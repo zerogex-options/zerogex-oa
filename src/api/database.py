@@ -1279,11 +1279,34 @@ class DatabaseManager:
             return cached
 
         session_start, session_end = _get_flow_session_bounds(session)
+
+        # Align the query window to 5-minute bucket boundaries. Rows in
+        # flow_by_contract are keyed by the bucket-start timestamp (e.g. 14:40
+        # covers [14:40, 14:45)), so the most recent queryable bucket is the
+        # one strictly before session_end. The (session_end − 1µs) floor makes
+        # an exact boundary (e.g. 16:15:00 at session close) land on the
+        # previous bucket rather than a bucket that would fall outside the
+        # session window.
+        bucket_seconds = 300
+        end_bucket_epoch = (
+            int((session_end.timestamp() - 1e-6) // bucket_seconds) * bucket_seconds
+        )
+        start_bucket_epoch = (
+            int(session_start.timestamp() // bucket_seconds) * bucket_seconds
+        )
+
         if intervals and intervals > 0:
-            # Narrow to the most recent N 5-minute buckets ending at session_end.
-            window_start = session_end - timedelta(minutes=5 * intervals)
-            if window_start > session_start:
-                session_start = window_start
+            window_start_epoch = end_bucket_epoch - (intervals - 1) * bucket_seconds
+            if window_start_epoch > start_bucket_epoch:
+                start_bucket_epoch = window_start_epoch
+
+        if end_bucket_epoch < start_bucket_epoch:
+            self._cache_set(cache_key, [], self._flow_endpoint_cache_ttl_seconds)
+            return []
+
+        effective_start = datetime.fromtimestamp(start_bucket_epoch, tz=timezone.utc)
+        effective_end = datetime.fromtimestamp(end_bucket_epoch, tz=timezone.utc)
+
         query = """
             WITH src AS (
                 SELECT
@@ -1301,12 +1324,8 @@ class DatabaseManager:
                     underlying_price
                 FROM flow_by_contract
                 WHERE symbol = $1
-                  AND timestamp >= to_timestamp(
-                        floor(extract(epoch from $2::timestamptz) / 300) * 300
-                      )
-                  AND timestamp <= to_timestamp(
-                        floor(extract(epoch from $3::timestamptz) / 300) * 300
-                      )
+                  AND timestamp >= $2
+                  AND timestamp <= $3
             ),
             decorated AS (
                 SELECT
@@ -1384,7 +1403,7 @@ class DatabaseManager:
             async with self._acquire_connection() as conn:
                 await self._refresh_flow_cache(conn, symbol)
                 rows = await asyncio.wait_for(
-                    conn.fetch(query, symbol, session_start, session_end),
+                    conn.fetch(query, symbol, effective_start, effective_end),
                     timeout=15.0,
                 )
                 result = [dict(row) for row in rows]

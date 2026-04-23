@@ -1,6 +1,9 @@
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
+from src.api import database as database_module
 from src.api.database import DatabaseManager, _get_session_bounds
 
 
@@ -23,11 +26,13 @@ class _FakeFlowConn:
         self.rows = rows
         self.calls = 0
         self.last_query = None
+        self.last_args = None
 
     async def fetch(self, *args):
         self.calls += 1
         if args:
             self.last_query = args[0]
+            self.last_args = args[1:]
         return self.rows
 
 
@@ -191,3 +196,88 @@ def test_prior_session_bounds_end_at_1615_et():
     _start, end = _get_session_bounds("prior")
     assert end.hour == 16
     assert end.minute == 15
+
+
+def _with_fixed_session_bounds(monkey_bounds):
+    """Install a fake _get_flow_session_bounds for a single get_flow call."""
+    original = database_module._get_flow_session_bounds
+    database_module._get_flow_session_bounds = lambda session='current': monkey_bounds
+    return original
+
+
+def _run_get_flow_with_bounds(bounds, intervals):
+    db = DatabaseManager()
+    db._flow_endpoint_cache_ttl_seconds = 0.0  # disable caching between invocations
+    conn = _FakeFlowConn([])
+
+    @asynccontextmanager
+    async def _acquire():
+        yield conn
+
+    db._acquire_connection = _acquire  # type: ignore[method-assign]
+
+    original = _with_fixed_session_bounds(bounds)
+    try:
+        asyncio.run(db.get_flow("SPY", "current", intervals=intervals))
+    finally:
+        database_module._get_flow_session_bounds = original
+
+    return conn
+
+
+def test_get_flow_intervals_one_returns_single_bucket_when_session_open():
+    et = ZoneInfo("America/New_York")
+    # Session is open and 'now' falls mid-bucket at 14:42:17 ET. The most
+    # recent queryable bucket is 14:40 (covering 14:40–14:45). intervals=1
+    # must request that single bucket — both query bounds equal 14:40 UTC.
+    session_start = datetime(2026, 4, 23, 7, 15, tzinfo=et)
+    session_end = datetime(2026, 4, 23, 14, 42, 17, tzinfo=et)
+
+    conn = _run_get_flow_with_bounds((session_start, session_end), intervals=1)
+
+    _symbol, lo, hi = conn.last_args
+    assert lo == hi, f"intervals=1 should request a single bucket, got [{lo}, {hi}]"
+    assert lo == datetime(2026, 4, 23, 14, 40, tzinfo=et).astimezone(timezone.utc)
+
+
+def test_get_flow_intervals_one_handles_session_close_boundary():
+    et = ZoneInfo("America/New_York")
+    # Session closed exactly at 16:15 — there is no bucket starting at 16:15
+    # (that bucket would span 16:15–16:20, outside the session). The most
+    # recent valid bucket is 16:10.
+    session_start = datetime(2026, 4, 22, 7, 15, tzinfo=et)
+    session_end = datetime(2026, 4, 22, 16, 15, tzinfo=et)
+
+    conn = _run_get_flow_with_bounds((session_start, session_end), intervals=1)
+
+    _symbol, lo, hi = conn.last_args
+    expected = datetime(2026, 4, 22, 16, 10, tzinfo=et).astimezone(timezone.utc)
+    assert lo == expected
+    assert hi == expected
+
+
+def test_get_flow_intervals_n_spans_exactly_n_buckets():
+    et = ZoneInfo("America/New_York")
+    session_start = datetime(2026, 4, 23, 7, 15, tzinfo=et)
+    session_end = datetime(2026, 4, 23, 14, 42, 17, tzinfo=et)
+
+    conn = _run_get_flow_with_bounds((session_start, session_end), intervals=5)
+
+    _symbol, lo, hi = conn.last_args
+    # 5 buckets ending at 14:40 → [14:20, 14:40] inclusive.
+    assert (hi - lo).total_seconds() == 4 * 300
+    assert hi == datetime(2026, 4, 23, 14, 40, tzinfo=et).astimezone(timezone.utc)
+    assert lo == datetime(2026, 4, 23, 14, 20, tzinfo=et).astimezone(timezone.utc)
+
+
+def test_get_flow_full_session_clamped_to_session_start():
+    et = ZoneInfo("America/New_York")
+    session_start = datetime(2026, 4, 23, 7, 15, tzinfo=et)
+    session_end = datetime(2026, 4, 23, 14, 42, 17, tzinfo=et)
+
+    # intervals larger than the session window clamps to session_start bucket.
+    conn = _run_get_flow_with_bounds((session_start, session_end), intervals=10_000)
+
+    _symbol, lo, hi = conn.last_args
+    assert lo == session_start.astimezone(timezone.utc)
+    assert hi == datetime(2026, 4, 23, 14, 40, tzinfo=et).astimezone(timezone.utc)
