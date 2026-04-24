@@ -171,23 +171,27 @@ analytics-snapshot-diagnose: ## Diagnose slow _get_snapshot: runs EXPLAIN ANALYZ
 	LOOKBACK=$${LOOKBACK_MINUTES:-5}; \
 	echo "$(YELLOW)Underlying=$$UNDERLYING  Lookback=$$LOOKBACK min$(NC)"; \
 	printf "%s\n" \
-		"\\echo [1/6] Table size + approximate row count" \
+		"\\echo [1/7] Table size + approximate row count" \
 		"SELECT pg_size_pretty(pg_total_relation_size('option_chains')) AS total_size, pg_size_pretty(pg_relation_size('option_chains')) AS table_size, pg_size_pretty(pg_total_relation_size('option_chains') - pg_relation_size('option_chains')) AS index_and_toast, (SELECT reltuples::bigint FROM pg_class WHERE relname = 'option_chains') AS approx_rows;" \
-		"\\echo [2/6] Dead tuples + last autovacuum (bloat check)" \
+		"\\echo [2/7] Dead tuples + last autovacuum (bloat check)" \
 		"SELECT relname, n_live_tup, n_dead_tup, ROUND(n_dead_tup::numeric / NULLIF(n_live_tup,0) * 100, 1) AS dead_pct, last_autovacuum, last_autoanalyze FROM pg_stat_user_tables WHERE relname = 'option_chains';" \
-		"\\echo [3/6] TimescaleDB chunks in window (if applicable)" \
+		"\\echo [3/7] TimescaleDB chunks in window (if applicable)" \
 		"SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'timescaledb') AS has_tsdb \\gset" \
 		"\\if :has_tsdb" \
 		"SELECT count(*) AS chunks_total, count(*) FILTER (WHERE range_end > NOW() - INTERVAL '1 hour') AS chunks_recent FROM timescaledb_information.chunks WHERE hypertable_name = 'option_chains';" \
 		"\\else" \
 		"\\echo (timescaledb not installed; skipping chunk inventory)" \
 		"\\endif" \
-		"\\echo [4/6] Indexes defined on option_chains" \
+		"\\echo [4/7] Indexes defined on option_chains" \
 		"SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'option_chains' ORDER BY indexname;" \
-		"\\echo [5/6] Index usage stats (zero reads = unused / planner not picking it)" \
+		"\\echo [5/7] Index usage stats (zero reads = unused / planner not picking it)" \
 		"SELECT indexrelname, idx_scan, idx_tup_read, pg_size_pretty(pg_relation_size(indexrelid)) AS size FROM pg_stat_user_indexes WHERE relname = 'option_chains' ORDER BY idx_scan DESC;" \
-		"\\echo [6/6] EXPLAIN (ANALYZE, BUFFERS) for the actual snapshot query" \
-		"EXPLAIN (ANALYZE, BUFFERS, VERBOSE) WITH latest_ts AS (SELECT timestamp AS ts FROM option_chains WHERE underlying = '$$UNDERLYING' ORDER BY timestamp DESC LIMIT 1), underlying AS (SELECT uq.close FROM underlying_quotes uq, latest_ts lt WHERE uq.symbol = '$$UNDERLYING' AND uq.timestamp <= lt.ts ORDER BY uq.timestamp DESC LIMIT 1), latest_per_contract AS (SELECT DISTINCT ON (oc.option_symbol) oc.option_symbol, oc.strike, oc.expiration, oc.option_type, oc.gamma, oc.timestamp FROM option_chains oc, latest_ts lt WHERE oc.underlying = '$$UNDERLYING' AND oc.timestamp <= lt.ts AND oc.timestamp >= (lt.ts - ($$LOOKBACK * INTERVAL '1 minute')) AND oc.gamma IS NOT NULL ORDER BY oc.option_symbol, oc.timestamp DESC) SELECT lt.ts, u.close, lpc.option_symbol FROM latest_ts lt LEFT JOIN underlying u ON TRUE LEFT JOIN latest_per_contract lpc ON TRUE WHERE lt.ts IS NOT NULL ORDER BY lpc.expiration, lpc.strike LIMIT 2000;" \
+		"\\echo [6/7] EXPLAIN: step 1 of new 3-query path — latest timestamp" \
+		"EXPLAIN (ANALYZE, BUFFERS) SELECT timestamp FROM option_chains WHERE underlying = '$$UNDERLYING' ORDER BY timestamp DESC LIMIT 1;" \
+		"\\echo [7/7] EXPLAIN: step 3 of new path — DISTINCT ON with literal timestamps via \\\\gset" \
+		"SELECT timestamp AS ts FROM option_chains WHERE underlying = '$$UNDERLYING' ORDER BY timestamp DESC LIMIT 1 \\gset" \
+		"\\echo Using latest ts = :ts  lookback_minutes = $$LOOKBACK" \
+		"EXPLAIN (ANALYZE, BUFFERS) SELECT DISTINCT ON (oc.option_symbol) oc.option_symbol, oc.strike, oc.expiration, oc.timestamp FROM option_chains oc WHERE oc.underlying = '$$UNDERLYING' AND oc.timestamp <= :'ts'::timestamptz AND oc.timestamp >= :'ts'::timestamptz - ($$LOOKBACK * INTERVAL '1 minute') AND oc.gamma IS NOT NULL ORDER BY oc.option_symbol, oc.timestamp DESC LIMIT 2000;" \
 		| $(PSQL) -v ON_ERROR_STOP=0
 
 .PHONY: analytics-snapshot-explain
