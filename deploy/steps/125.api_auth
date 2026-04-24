@@ -108,8 +108,41 @@ EOF
     sudo chown root:www-data "$NGINX_INCLUDE"
     log "     ✓ $NGINX_INCLUDE written (mode 640, root:www-data)"
 
-    # Reload nginx if the config is valid.  The include is picked up by
-    # the `include ...*;` directive in the site config (steps 120/130).
+    # 4a. Patch every enabled site that proxies to the API so it carries
+    # the include directive on its proxy_pass blocks.  Idempotent: blocks
+    # that already have it are left alone.  Each patched file gets a
+    # timestamped .bak alongside.
+    INJECTOR="$APP_DIR/deploy/lib/nginx_inject_api_key.py"
+    if [ -f "$INJECTOR" ] && [ -d /etc/nginx/sites-enabled ]; then
+        # Resolve symlinks so we modify the real files in sites-available.
+        targets=()
+        while IFS= read -r -d '' f; do
+            targets+=("$(readlink -f "$f")")
+        done < <(find /etc/nginx/sites-enabled -mindepth 1 -maxdepth 1 -print0)
+
+        if [ "${#targets[@]}" -gt 0 ]; then
+            log "  → Auditing/patching enabled nginx sites for API auth include..."
+            sudo python3 "$INJECTOR" "${targets[@]}" || {
+                log "     ✗ injector failed; aborting before nginx reload"
+                exit 1
+            }
+        fi
+    fi
+
+    # 4b. Disable the legacy port-80 catch-all if it's still enabled.
+    # /etc/nginx/sites-available/zerogex was the very first nginx config
+    # the deploy script shipped before api.zerogex.io existed.  It listens
+    # on port 80 with ``server_name _;`` and proxies /api/ to the upstream
+    # — that's a TLS+auth bypass on the public internet.  Steps 120/130
+    # supersede it with the proper api.zerogex.io site, so this can go.
+    LEGACY_SITE="/etc/nginx/sites-enabled/zerogex"
+    if [ -L "$LEGACY_SITE" ] || [ -f "$LEGACY_SITE" ]; then
+        log "  → Disabling legacy catch-all $LEGACY_SITE (TLS+auth bypass on :80)..."
+        sudo rm -f "$LEGACY_SITE"
+        log "     ✓ removed from sites-enabled (file kept in sites-available for reference)"
+    fi
+
+    # 4c. Reload nginx if the config is valid.
     if sudo nginx -t >/dev/null 2>&1; then
         sudo systemctl reload nginx || true
         log "     ✓ nginx reloaded"

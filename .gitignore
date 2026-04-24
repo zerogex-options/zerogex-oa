@@ -16,6 +16,10 @@ eggs/
 .eggs/
 lib/
 lib64/
+# `lib/` above is from the standard Python template (build artefacts).
+# Our deploy helpers live under deploy/lib/ — keep those tracked.
+!deploy/lib/
+!deploy/lib/**
 parts/
 sdist/
 var/
