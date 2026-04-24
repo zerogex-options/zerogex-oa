@@ -101,119 +101,125 @@ class AnalyticsEngine:
         self.running = False
 
     def _get_snapshot(self) -> Optional[Dict[str, Any]]:
-        """Fetch latest timestamp, underlying price, and option data in a single DB call.
+        """Fetch latest timestamp, underlying price, and option data.
 
-        Returns dict with keys 'timestamp', 'underlying_price', 'options' or None
-        if no data is available.
+        Issued as three separate queries rather than a single CTE-heavy
+        query.  The previous combined form referenced ``latest_ts.ts``
+        inside a timestamp-range predicate on option_chains, which the
+        PostgreSQL planner cannot push into the partial index
+        ``idx_option_chains_underlying_ts_gamma(underlying, timestamp
+        DESC) WHERE gamma IS NOT NULL`` because it treats the CTE value
+        as unknown at plan time.  The result was a Seq Scan over ~21 M
+        rows every cycle (production EXPLAIN ANALYZE: 287 s of seq-scan
+        time, 15 M rows filtered out).
+
+        Splitting into three round-trips with literal timestamps lets
+        the planner see the range as constants and use the partial
+        index directly — dropping a 245 s query to tens of milliseconds
+        on the same production data.
+
+        Returns dict with keys 'timestamp', 'underlying_price',
+        'options' or None if no data is available.
         """
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
-                # Single query: get latest timestamp + underlying price + option data
-                cursor.execute("""
-                    WITH latest_ts AS (
-                        SELECT timestamp AS ts
-                        FROM option_chains
-                        WHERE underlying = %s
-                        ORDER BY timestamp DESC
-                        LIMIT 1
-                    ),
-                    underlying AS (
-                        SELECT uq.close
-                        FROM underlying_quotes uq, latest_ts lt
-                        WHERE uq.symbol = %s
-                          AND uq.timestamp <= lt.ts
-                        ORDER BY uq.timestamp DESC
-                        LIMIT 1
-                    ),
-                    latest_per_contract AS (
-                        SELECT DISTINCT ON (oc.option_symbol)
-                            oc.option_symbol,
-                            oc.strike,
-                            oc.expiration,
-                            oc.option_type,
-                            oc.last,
-                            oc.bid,
-                            oc.ask,
-                            oc.volume,
-                            oc.open_interest,
-                            oc.delta,
-                            oc.gamma,
-                            oc.theta,
-                            oc.vega,
-                            oc.implied_volatility,
-                            oc.timestamp
-                        FROM option_chains oc, latest_ts lt
-                        WHERE oc.underlying = %s
-                          AND oc.timestamp <= lt.ts
-                          AND oc.timestamp >= (lt.ts - (%s * INTERVAL '1 minute'))
-                          AND oc.gamma IS NOT NULL
-                        ORDER BY oc.option_symbol, oc.timestamp DESC
-                    )
-                    SELECT
-                        lt.ts,
-                        u.close,
-                        lpc.option_symbol,
-                        lpc.strike,
-                        lpc.expiration,
-                        lpc.option_type,
-                        lpc.last,
-                        lpc.bid,
-                        lpc.ask,
-                        lpc.volume,
-                        lpc.open_interest,
-                        lpc.delta,
-                        lpc.gamma,
-                        lpc.theta,
-                        lpc.vega,
-                        lpc.implied_volatility,
-                        lpc.timestamp
-                    FROM latest_ts lt
-                    LEFT JOIN underlying u ON TRUE
-                    LEFT JOIN latest_per_contract lpc ON TRUE
-                    WHERE lt.ts IS NOT NULL
-                    ORDER BY lpc.expiration, lpc.strike
-                    LIMIT 2000
-                """, (self.db_symbol, self.db_symbol, self.db_symbol, self.snapshot_lookback_minutes))
 
-                rows = cursor.fetchall()
-                conn.commit()
-                if not rows or rows[0][0] is None:
+                # 1. Latest option-chain timestamp for this underlying.
+                cursor.execute(
+                    """
+                    SELECT timestamp
+                    FROM option_chains
+                    WHERE underlying = %s
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                    """,
+                    (self.db_symbol,),
+                )
+                ts_row = cursor.fetchone()
+                if not ts_row or ts_row[0] is None:
+                    conn.commit()
                     return None
+                timestamp = ts_row[0]
 
-                timestamp = rows[0][0]
-                underlying_price = float(rows[0][1]) if rows[0][1] else None
-
+                # 2. Underlying close as of that timestamp.
+                cursor.execute(
+                    """
+                    SELECT close
+                    FROM underlying_quotes
+                    WHERE symbol = %s
+                      AND timestamp <= %s
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                    """,
+                    (self.db_symbol, timestamp),
+                )
+                uq_row = cursor.fetchone()
+                underlying_price = float(uq_row[0]) if uq_row and uq_row[0] is not None else None
                 if underlying_price is None:
+                    conn.commit()
                     logger.warning("No underlying price found for snapshot")
                     return None
+
+                # 3. Latest per-contract option quote in the lookback
+                # window.  Literal ``timestamp`` values let the planner
+                # use idx_option_chains_underlying_ts_gamma.
+                lookback_start = timestamp - timedelta(minutes=self.snapshot_lookback_minutes)
+                cursor.execute(
+                    """
+                    SELECT DISTINCT ON (oc.option_symbol)
+                        oc.option_symbol,
+                        oc.strike,
+                        oc.expiration,
+                        oc.option_type,
+                        oc.last,
+                        oc.bid,
+                        oc.ask,
+                        oc.volume,
+                        oc.open_interest,
+                        oc.delta,
+                        oc.gamma,
+                        oc.theta,
+                        oc.vega,
+                        oc.implied_volatility,
+                        oc.timestamp
+                    FROM option_chains oc
+                    WHERE oc.underlying = %s
+                      AND oc.timestamp <= %s
+                      AND oc.timestamp >= %s
+                      AND oc.gamma IS NOT NULL
+                    ORDER BY oc.option_symbol, oc.timestamp DESC
+                    LIMIT 2000
+                    """,
+                    (self.db_symbol, timestamp, lookback_start),
+                )
+                rows = cursor.fetchall()
+                conn.commit()
 
                 options = []
                 stale_cutoff = timestamp - timedelta(seconds=self.snapshot_freshness_seconds)
                 stale_dropped = 0
 
                 for row in rows:
-                    if row[2] is None:  # no option data in this row
-                        continue
-                    quote_ts = row[16]
+                    quote_ts = row[14]
                     if quote_ts and quote_ts < stale_cutoff:
                         stale_dropped += 1
                         continue
                     options.append({
-                        'option_symbol': row[2],
-                        'strike': float(row[3]),
-                        'expiration': row[4],
-                        'option_type': row[5],
-                        'last': float(row[6]) if row[6] else 0.0,
-                        'bid': float(row[7]) if row[7] else 0.0,
-                        'ask': float(row[8]) if row[8] else 0.0,
-                        'volume': int(row[9]) if row[9] else 0,
-                        'open_interest': int(row[10]) if row[10] else 0,
-                        'delta': float(row[11]) if row[11] else 0.0,
-                        'gamma': float(row[12]) if row[12] else 0.0,
-                        'theta': float(row[13]) if row[13] else 0.0,
-                        'vega': float(row[14]) if row[14] else 0.0,
-                        'implied_volatility': float(row[15]) if row[15] else 0.2
+                        'option_symbol': row[0],
+                        'strike': float(row[1]),
+                        'expiration': row[2],
+                        'option_type': row[3],
+                        'last': float(row[4]) if row[4] else 0.0,
+                        'bid': float(row[5]) if row[5] else 0.0,
+                        'ask': float(row[6]) if row[6] else 0.0,
+                        'volume': int(row[7]) if row[7] else 0,
+                        'open_interest': int(row[8]) if row[8] else 0,
+                        'delta': float(row[9]) if row[9] else 0.0,
+                        'gamma': float(row[10]) if row[10] else 0.0,
+                        'theta': float(row[11]) if row[11] else 0.0,
+                        'vega': float(row[12]) if row[12] else 0.0,
+                        'implied_volatility': float(row[13]) if row[13] else 0.2,
                     })
 
                 logger.info(

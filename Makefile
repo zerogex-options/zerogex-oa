@@ -190,6 +190,35 @@ analytics-snapshot-diagnose: ## Diagnose slow _get_snapshot: runs EXPLAIN ANALYZ
 		"EXPLAIN (ANALYZE, BUFFERS, VERBOSE) WITH latest_ts AS (SELECT timestamp AS ts FROM option_chains WHERE underlying = '$$UNDERLYING' ORDER BY timestamp DESC LIMIT 1), underlying AS (SELECT uq.close FROM underlying_quotes uq, latest_ts lt WHERE uq.symbol = '$$UNDERLYING' AND uq.timestamp <= lt.ts ORDER BY uq.timestamp DESC LIMIT 1), latest_per_contract AS (SELECT DISTINCT ON (oc.option_symbol) oc.option_symbol, oc.strike, oc.expiration, oc.option_type, oc.gamma, oc.timestamp FROM option_chains oc, latest_ts lt WHERE oc.underlying = '$$UNDERLYING' AND oc.timestamp <= lt.ts AND oc.timestamp >= (lt.ts - ($$LOOKBACK * INTERVAL '1 minute')) AND oc.gamma IS NOT NULL ORDER BY oc.option_symbol, oc.timestamp DESC) SELECT lt.ts, u.close, lpc.option_symbol FROM latest_ts lt LEFT JOIN underlying u ON TRUE LEFT JOIN latest_per_contract lpc ON TRUE WHERE lt.ts IS NOT NULL ORDER BY lpc.expiration, lpc.strike LIMIT 2000;" \
 		| $(PSQL) -v ON_ERROR_STOP=0
 
+.PHONY: analytics-snapshot-explain
+analytics-snapshot-explain: ## EXPLAIN (no ANALYZE) of the _get_snapshot query — returns in ms
+	@UNDERLYING=$${UNDERLYING:-SPX}; \
+	LOOKBACK=$${LOOKBACK_MINUTES:-5}; \
+	echo "$(BLUE)=== EXPLAIN ($$UNDERLYING, $$LOOKBACK min) ===$(NC)"; \
+	printf "%s\n" \
+		"EXPLAIN (VERBOSE) WITH latest_ts AS (SELECT timestamp AS ts FROM option_chains WHERE underlying = '$$UNDERLYING' ORDER BY timestamp DESC LIMIT 1), latest_per_contract AS (SELECT DISTINCT ON (oc.option_symbol) oc.option_symbol, oc.timestamp FROM option_chains oc, latest_ts lt WHERE oc.underlying = '$$UNDERLYING' AND oc.timestamp <= lt.ts AND oc.timestamp >= (lt.ts - ($$LOOKBACK * INTERVAL '1 minute')) AND oc.gamma IS NOT NULL ORDER BY oc.option_symbol, oc.timestamp DESC) SELECT lt.ts, lpc.option_symbol FROM latest_ts lt LEFT JOIN latest_per_contract lpc ON TRUE;" \
+		| $(PSQL) -v ON_ERROR_STOP=0
+
+.PHONY: db-drop-unused-indexes
+db-drop-unused-indexes: ## Drop 4 indexes with idx_scan=0 (~2.8 GB reclaimed). Review output first; pass CONFIRM=yes to execute.
+	@echo "$(BLUE)=== Dropping unused option_chains indexes ===$(NC)"
+	@echo "$(YELLOW)Based on pg_stat_user_indexes idx_scan=0 over the life of these stats.$(NC)"
+	@echo "$(YELLOW)  idx_option_chains_gamma_oi             (1560 MB)$(NC)"
+	@echo "$(YELLOW)  idx_option_chains_iv_volume            (694 MB)$(NC)"
+	@echo "$(YELLOW)  idx_option_chains_expiration_range     (386 MB)$(NC)"
+	@echo "$(YELLOW)  idx_option_chains_timestamp_volfilter  (190 MB)$(NC)"
+	@if [ "$${CONFIRM}" != "yes" ]; then \
+		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to actually drop.$(NC)"; \
+		exit 0; \
+	fi
+	@printf "%s\n" \
+		"DROP INDEX CONCURRENTLY IF EXISTS idx_option_chains_gamma_oi;" \
+		"DROP INDEX CONCURRENTLY IF EXISTS idx_option_chains_iv_volume;" \
+		"DROP INDEX CONCURRENTLY IF EXISTS idx_option_chains_expiration_range;" \
+		"DROP INDEX CONCURRENTLY IF EXISTS idx_option_chains_timestamp_volfilter;" \
+		| $(PSQL) -v ON_ERROR_STOP=1
+	@echo "$(GREEN)✓ Unused indexes dropped. Run 'make analytics-snapshot-diagnose' to re-check.$(NC)"
+
 .PHONY: help
 help: ## Show this help message
 	@echo "=========================================="
