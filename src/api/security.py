@@ -21,12 +21,24 @@ from fastapi import Header, HTTPException, status
 logger = logging.getLogger(__name__)
 
 _API_KEY: Optional[str] = (os.getenv("API_KEY") or "").strip() or None
+_ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development").strip().lower()
 
 if _API_KEY is None:
-    logger.warning(
-        "API_KEY is not set — API endpoints are unauthenticated. "
-        "Set API_KEY in production to enable auth."
-    )
+    if _ENVIRONMENT == "production":
+        # In production this is almost certainly a misconfiguration.  Make
+        # it impossible to miss in the logs.
+        logger.error(
+            "API_KEY is not set but ENVIRONMENT=production; API endpoints "
+            "are exposed without authentication.  Set API_KEY to enable auth."
+        )
+    else:
+        # Dev/CI: a single INFO line at startup is plenty.  Previously this
+        # was a WARNING and fired on every process start, which was noisy
+        # in non-prod logs where auth is intentionally disabled.
+        logger.info(
+            "API authentication is disabled (API_KEY not set).  Set API_KEY "
+            "and ENVIRONMENT=production to enable."
+        )
 
 
 def _matches(provided: Optional[str]) -> bool:

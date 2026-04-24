@@ -1161,9 +1161,13 @@ class AnalyticsEngine:
         Returns:
             True if successful, False otherwise
         """
+        stage_timings: Dict[str, float] = {}
+
         try:
             # Single DB call: get timestamp, underlying price, and option data
+            t0 = _time.monotonic()
             snapshot = self._get_snapshot()
+            stage_timings["snapshot"] = _time.monotonic() - t0
 
             if not snapshot:
                 logger.warning("No option data available in database")
@@ -1182,11 +1186,13 @@ class AnalyticsEngine:
 
             # Calculate GEX by strike
             logger.info("Calculating GEX by strike...")
+            t0 = _time.monotonic()
             gex_by_strike = self._calculate_gex_by_strike(
                 options,
                 underlying_price,
                 latest_timestamp
             )
+            stage_timings["gex_by_strike"] = _time.monotonic() - t0
 
             if not gex_by_strike:
                 logger.warning("No GEX data calculated")
@@ -1196,12 +1202,14 @@ class AnalyticsEngine:
 
             # Calculate GEX summary
             logger.info("Calculating GEX summary metrics...")
+            t0 = _time.monotonic()
             gex_summary = self._calculate_gex_summary(
                 gex_by_strike,
                 options,
                 underlying_price,
                 latest_timestamp
             )
+            stage_timings["gex_summary"] = _time.monotonic() - t0
 
             if not gex_summary:
                 logger.warning("Failed to calculate GEX summary")
@@ -1212,11 +1220,15 @@ class AnalyticsEngine:
 
             # Store results
             logger.info("Storing results to database...")
+            t0 = _time.monotonic()
             self._store_calculation_results(gex_by_strike, gex_summary)
+            stage_timings["store_results"] = _time.monotonic() - t0
 
             # Refresh flow cache tables
             logger.info("Refreshing flow cache tables...")
+            t0 = _time.monotonic()
             self._refresh_flow_caches(latest_timestamp, underlying_price)
+            stage_timings["refresh_flow_caches"] = _time.monotonic() - t0
 
             # Log summary
             logger.info("")
@@ -1246,11 +1258,25 @@ class AnalyticsEngine:
             self.calculations_completed += 1
             self.last_calculation_time = datetime.now(ET)
 
+            # Emit per-stage timings so cycle-overrun warnings can be
+            # diagnosed without guessing which step is slow.
+            self._last_stage_timings = stage_timings
+            total_stage_time = sum(stage_timings.values())
+            timings_str = ", ".join(
+                f"{label}={secs:.2f}s" for label, secs in stage_timings.items()
+            )
+            logger.info(
+                "Stage timings (total %.2fs): %s",
+                total_stage_time,
+                timings_str,
+            )
+
             return True
 
         except Exception as e:
             logger.error(f"Error in calculation cycle: {e}", exc_info=True)
             self.errors_count += 1
+            self._last_stage_timings = stage_timings
             return False
 
     def run(self):
@@ -1297,8 +1323,26 @@ class AnalyticsEngine:
                     logger.info(f"Sleeping for {sleep_time:.1f}s until next calculation...\n")
                     time.sleep(sleep_time)
                 else:
-                    logger.warning(f"Calculation took {cycle_duration:.1f}s, "
-                                  f"longer than interval ({self.calculation_interval}s)\n")
+                    stage_breakdown = getattr(self, "_last_stage_timings", None) or {}
+                    breakdown_str = (
+                        ", ".join(
+                            f"{label}={secs:.1f}s"
+                            for label, secs in sorted(
+                                stage_breakdown.items(),
+                                key=lambda kv: kv[1],
+                                reverse=True,
+                            )
+                        )
+                        if stage_breakdown
+                        else "n/a"
+                    )
+                    logger.warning(
+                        "Calculation took %.1fs, longer than interval (%ds). "
+                        "Stage timings: %s\n",
+                        cycle_duration,
+                        self.calculation_interval,
+                        breakdown_str,
+                    )
 
         except KeyboardInterrupt:
             logger.info("\n⚠️  Interrupted by user")
