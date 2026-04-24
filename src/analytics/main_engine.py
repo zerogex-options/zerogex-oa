@@ -28,7 +28,11 @@ from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
 from src.config import RISK_FREE_RATE, ANALYTICS_FLOW_CACHE_REFRESH_ENABLED
 from src.symbols import parse_underlyings, get_canonical_symbol
-from src.validation import is_engine_run_window, seconds_until_engine_run_window
+from src.market_calendar import (
+    calculate_time_to_expiration,
+    is_engine_run_window,
+    seconds_until_engine_run_window,
+)
 
 logger = get_logger(__name__)
 
@@ -249,35 +253,13 @@ class AnalyticsEngine:
             logger.error(f"Error fetching analytics snapshot: {e}", exc_info=True)
             return None
 
-    def _calculate_time_to_expiration(
-        self, 
-        current_date: datetime, 
-        expiration_date
-    ) -> float:
-        """Calculate time to expiration in years"""
-        # Ensure current_date is timezone-aware
-        if current_date.tzinfo is None:
-            current_date = pytz.UTC.localize(current_date).astimezone(ET)
-        else:
-            current_date = current_date.astimezone(ET)
-
-        # Convert expiration to datetime at market close
-        expiration_dt = datetime.combine(
-            expiration_date,
-            datetime.strptime("16:00:00", "%H:%M:%S").time()
-        )
-        expiration_dt = ET.localize(expiration_dt)
-
-        # Calculate years
-        time_diff = expiration_dt - current_date
-        days_to_expiration = time_diff.total_seconds() / 86400
-        years_to_expiration = days_to_expiration / 365.0
-
-        # Minimum 1 minute
-        if years_to_expiration < (1 / 525600):
-            years_to_expiration = 1 / 525600
-
-        return years_to_expiration
+    # Time-to-expiration math lives in src.market_calendar — see the
+    # canonical ``calculate_time_to_expiration`` function imported at
+    # the top of this module.  Kept as a method-style accessor so
+    # existing ``self._calculate_time_to_expiration(...)`` call sites
+    # keep working without touching dozens of lines of calc code.
+    def _calculate_time_to_expiration(self, current_date: datetime, expiration_date) -> float:
+        return calculate_time_to_expiration(current_date, expiration_date)
 
     def _calculate_vanna(
         self,

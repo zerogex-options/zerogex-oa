@@ -330,41 +330,12 @@ async def get_flow_buying_pressure(
 # Market Session Helper
 # ============================================================================
 
-_ET = pytz.timezone("US/Eastern")
+from src.market_calendar import ET as _ET, NYSE_HOLIDAYS as _NYSE_HOLIDAYS
+
 _SOFT_CLOSE_WINDOW = timedelta(seconds=30)
 
-
-def _load_nyse_holidays() -> set[date_type]:
-    """Load NYSE holiday dates from the NYSE_HOLIDAYS env var (comma-separated YYYY-MM-DD).
-
-    Set ``NYSE_HOLIDAYS_STRICT=true`` to raise on any invalid token so the
-    API refuses to start with a corrupt calendar rather than silently
-    mis-classifying a holiday as an open session.
-    """
-    raw = os.getenv("NYSE_HOLIDAYS", "")
-    strict = os.getenv("NYSE_HOLIDAYS_STRICT", "false").strip().lower() == "true"
-    holidays: set[date_type] = set()
-    invalid: list[str] = []
-    for token in raw.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        try:
-            holidays.add(date_type.fromisoformat(token))
-        except ValueError:
-            invalid.append(token)
-            logger.error(f"Invalid date in NYSE_HOLIDAYS env var: {token!r}")
-    if invalid and strict:
-        raise ValueError(
-            f"NYSE_HOLIDAYS contains {len(invalid)} invalid token(s): {invalid!r}. "
-            "Fix the env var or set NYSE_HOLIDAYS_STRICT=false to tolerate."
-        )
-    if not holidays:
-        logger.warning("NYSE_HOLIDAYS env var is empty — no holiday filtering will occur")
-    return holidays
-
-
-_NYSE_HOLIDAYS: set[date_type] = _load_nyse_holidays()
+if not _NYSE_HOLIDAYS:
+    logger.warning("NYSE_HOLIDAYS env var is empty — no holiday filtering will occur")
 
 
 class _SoftCloseTracker:

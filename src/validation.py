@@ -1,49 +1,33 @@
 """
-Data validation utilities for API responses and data quality
+Data validation utilities for API responses and data quality.
+
+Market-calendar helpers (``ET``, ``NYSE_HOLIDAYS``, ``is_market_hours``,
+``get_market_session``, ``is_engine_run_window``,
+``seconds_until_engine_run_window``) live in ``src.market_calendar`` and
+are re-exported here for backwards compatibility with existing call
+sites.  New code should import them from ``src.market_calendar``
+directly.
 """
 
-import os
-from typing import Any, Optional, Union
-from datetime import datetime, date, timedelta
+from typing import Any, Optional
+from datetime import datetime
 import pytz
 from src.utils import get_logger
 
+# Re-export the calendar helpers so ``from src.validation import ...``
+# keeps working for callers that predate the split.
+from src.market_calendar import (  # noqa: F401 — re-exported for back-compat
+    ET,
+    NYSE_HOLIDAYS,
+    calculate_time_to_expiration,
+    get_market_session,
+    is_engine_run_window,
+    is_market_hours,
+    load_nyse_holidays as _load_nyse_holidays,
+    seconds_until_engine_run_window,
+)
+
 logger = get_logger(__name__)
-
-# Eastern Time timezone
-ET = pytz.timezone("US/Eastern")
-
-
-def _load_nyse_holidays() -> set[date]:
-    """Load holiday dates from NYSE_HOLIDAYS env var (comma-separated YYYY-MM-DD).
-
-    Misconfigured holidays silently classify a closed session as "open", which
-    produces incorrect market-state signals downstream. Set
-    ``NYSE_HOLIDAYS_STRICT=true`` (recommended for production) to raise on any
-    invalid token so the process refuses to start with a corrupt calendar.
-    """
-    raw = os.getenv("NYSE_HOLIDAYS", "")
-    strict = os.getenv("NYSE_HOLIDAYS_STRICT", "false").strip().lower() == "true"
-    holidays: set[date] = set()
-    invalid: list[str] = []
-    for token in raw.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        try:
-            holidays.add(date.fromisoformat(token))
-        except ValueError:
-            invalid.append(token)
-            logger.error("Invalid date in NYSE_HOLIDAYS env var: %r", token)
-    if invalid and strict:
-        raise ValueError(
-            f"NYSE_HOLIDAYS contains {len(invalid)} invalid token(s): {invalid!r}. "
-            "Fix the env var or set NYSE_HOLIDAYS_STRICT=false to tolerate."
-        )
-    return holidays
-
-
-NYSE_HOLIDAYS = _load_nyse_holidays()
 
 
 def safe_float(value: Any, default: float = 0.0, field_name: str = "value") -> float:
@@ -200,7 +184,7 @@ def validate_bar_data(bar: dict) -> bool:
     low_price = safe_float(bar.get("Low"), field_name="Low")
     close_price = safe_float(bar.get("Close"), field_name="Close")
 
-    if not (low_price <= open_price <= high_price and 
+    if not (low_price <= open_price <= high_price and
             low_price <= close_price <= high_price):
         logger.warning(f"Invalid OHLC relationship: O={open_price} H={high_price} L={low_price} C={close_price}")
         return False
@@ -260,111 +244,3 @@ def bucket_timestamp(dt: datetime, bucket_seconds: int = 60) -> datetime:
     # Convert back to datetime, preserving timezone
     return datetime.fromtimestamp(bucketed_timestamp, tz=dt.tzinfo)
 
-
-def is_market_hours(dt: Optional[datetime] = None, check_extended: bool = False) -> bool:
-    """
-    Check if given datetime is during market hours
-
-    Args:
-        dt: Datetime to check (default: now)
-        check_extended: Include extended hours (default: regular only)
-
-    Returns:
-        True if during market hours, False otherwise
-    """
-    if dt is None:
-        dt = datetime.now(ET)
-    elif dt.tzinfo is None:
-        # Assume UTC, convert to ET
-        dt = pytz.UTC.localize(dt).astimezone(ET)
-    else:
-        # Convert to ET
-        dt = dt.astimezone(ET)
-
-    # Check if weekday (Monday=0, Sunday=6) and not configured market holiday.
-    if dt.weekday() > 4 or dt.date() in NYSE_HOLIDAYS:
-        return False
-
-    current_time = dt.time()
-
-    if check_extended:
-        # Extended hours: 4:00 AM - 8:00 PM ET
-        market_open = datetime.strptime("04:00:00", "%H:%M:%S").time()
-        market_close = datetime.strptime("20:00:00", "%H:%M:%S").time()
-    else:
-        # Regular hours: 9:30 AM - 4:00 PM ET
-        market_open = datetime.strptime("09:30:00", "%H:%M:%S").time()
-        market_close = datetime.strptime("16:00:00", "%H:%M:%S").time()
-
-    return market_open <= current_time <= market_close
-
-
-def get_market_session(dt: Optional[datetime] = None) -> str:
-    """
-    Get current market session
-
-    Args:
-        dt: Datetime to check (default: now)
-
-    Returns:
-        Session string: 'pre-market', 'regular', 'after-hours', 'closed'
-    """
-    if dt is None:
-        dt = datetime.now(ET)
-    elif dt.tzinfo is None:
-        dt = pytz.UTC.localize(dt).astimezone(ET)
-    else:
-        dt = dt.astimezone(ET)
-
-    # Weekend / configured holiday
-    if dt.weekday() > 4 or dt.date() in NYSE_HOLIDAYS:
-        return "closed"
-
-    current_time = dt.time()
-
-    # Define market hours
-    pre_market_start = datetime.strptime("04:00:00", "%H:%M:%S").time()
-    regular_open = datetime.strptime("09:30:00", "%H:%M:%S").time()
-    regular_close = datetime.strptime("16:00:00", "%H:%M:%S").time()
-    after_hours_end = datetime.strptime("20:00:00", "%H:%M:%S").time()
-
-    if current_time < pre_market_start:
-        return "closed"
-    elif current_time < regular_open:
-        return "pre-market"
-    elif current_time < regular_close:
-        return "regular"
-    elif current_time < after_hours_end:
-        return "after-hours"
-    else:
-        return "closed"
-
-
-def is_engine_run_window(dt: Optional[datetime] = None) -> bool:
-    """Engines run 24x5: all hours on weekdays excluding NYSE_HOLIDAYS."""
-    if dt is None:
-        dt = datetime.now(ET)
-    elif dt.tzinfo is None:
-        dt = pytz.UTC.localize(dt).astimezone(ET)
-    else:
-        dt = dt.astimezone(ET)
-
-    return dt.weekday() <= 4 and dt.date() not in NYSE_HOLIDAYS
-
-
-def seconds_until_engine_run_window(dt: Optional[datetime] = None) -> int:
-    """Seconds until midnight ET of the next non-holiday weekday (24x5 schedule)."""
-    if dt is None:
-        dt = datetime.now(ET)
-    elif dt.tzinfo is None:
-        dt = pytz.UTC.localize(dt).astimezone(ET)
-    else:
-        dt = dt.astimezone(ET)
-
-    if is_engine_run_window(dt):
-        return 0
-
-    next_open = (dt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    while next_open.weekday() > 4 or next_open.date() in NYSE_HOLIDAYS:
-        next_open += timedelta(days=1)
-    return max(int((next_open - dt).total_seconds()), 1)

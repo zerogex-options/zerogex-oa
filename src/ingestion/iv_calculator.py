@@ -15,8 +15,8 @@ import numpy as np
 from scipy import stats
 from datetime import datetime, date
 from typing import Optional
-import pytz
 
+from src.market_calendar import ET, calculate_time_to_expiration
 from src.utils import get_logger
 from src.config import (
     IV_CALCULATION_ENABLED,
@@ -27,9 +27,6 @@ from src.config import (
 )
 
 logger = get_logger(__name__)
-
-# Eastern Time timezone
-ET = pytz.timezone("US/Eastern")
 
 
 class IVCalculator:
@@ -65,35 +62,9 @@ class IVCalculator:
         logger.info(f"Initialized IVCalculator: max_iter={self.max_iterations}, "
                     f"tol={self.tolerance}, range=[{self.min_iv}, {self.max_iv}]")
 
-    def _calculate_time_to_expiration(
-        self, 
-        current_date: datetime, 
-        expiration_date: date
-    ) -> float:
-        """
-        Calculate time to expiration in years
-        (Same logic as GreeksCalculator)
-        """
-        if current_date.tzinfo is None:
-            current_date = pytz.UTC.localize(current_date).astimezone(ET)
-        else:
-            current_date = current_date.astimezone(ET)
-
-        expiration_dt = datetime.combine(
-            expiration_date, 
-            datetime.strptime("16:00:00", "%H:%M:%S").time()
-        )
-        expiration_dt = ET.localize(expiration_dt)
-
-        time_diff = expiration_dt - current_date
-        days_to_expiration = time_diff.total_seconds() / 86400
-        years_to_expiration = days_to_expiration / 365.0
-
-        # Minimum 1 minute
-        if years_to_expiration < (1 / 525600):
-            years_to_expiration = 1 / 525600
-
-        return years_to_expiration
+    def _calculate_time_to_expiration(self, current_date: datetime, expiration_date: date) -> float:
+        """Time-to-expiration in years (delegates to src.market_calendar)."""
+        return calculate_time_to_expiration(current_date, expiration_date)
 
     def _black_scholes_price(
         self,

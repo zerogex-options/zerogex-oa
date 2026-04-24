@@ -13,17 +13,14 @@ import numpy as np
 from scipy import stats
 from datetime import datetime, date
 from typing import Dict, Any, Optional
-import pytz
 
+from src.market_calendar import ET, calculate_time_to_expiration
 from src.utils import get_logger
 from src.config import RISK_FREE_RATE, IMPLIED_VOLATILITY_DEFAULT
 from src.ingestion.iv_calculator import IVCalculator
 from src.config import IV_CALCULATION_ENABLED
 
 logger = get_logger(__name__)
-
-# Eastern Time timezone
-ET = pytz.timezone("US/Eastern")
 
 
 class GreeksCalculator:
@@ -62,47 +59,9 @@ class GreeksCalculator:
             self.iv_calculator = None
             logger.info("⚠️  IV calculation DISABLED - will only use API-provided IV or default")
 
-    def _calculate_time_to_expiration(
-        self, 
-        current_date: datetime, 
-        expiration_date: date
-    ) -> float:
-        """
-        Calculate time to expiration in years
-
-        Args:
-            current_date: Current datetime (timezone-aware)
-            expiration_date: Option expiration date
-
-        Returns:
-            Time to expiration in years
-        """
-        # Ensure current_date is timezone-aware
-        if current_date.tzinfo is None:
-            current_date = pytz.UTC.localize(current_date).astimezone(ET)
-        else:
-            current_date = current_date.astimezone(ET)
-
-        # Convert expiration_date to datetime at market close (4:00 PM ET)
-        expiration_dt = datetime.combine(
-            expiration_date, 
-            datetime.strptime("16:00:00", "%H:%M:%S").time()
-        )
-        expiration_dt = ET.localize(expiration_dt)
-
-        # Calculate time difference
-        time_diff = expiration_dt - current_date
-
-        # Convert to years
-        days_to_expiration = time_diff.total_seconds() / 86400
-        years_to_expiration = days_to_expiration / 365.0
-
-        # Minimum time to expiration (avoid division by zero)
-        # Set to 1 minute for options expiring very soon
-        if years_to_expiration < (1 / 525600):  # 1 minute in years
-            years_to_expiration = 1 / 525600
-
-        return years_to_expiration
+    def _calculate_time_to_expiration(self, current_date: datetime, expiration_date: date) -> float:
+        """Time-to-expiration in years (delegates to src.market_calendar)."""
+        return calculate_time_to_expiration(current_date, expiration_date)
 
     def _calculate_d1_d2(
         self, 
