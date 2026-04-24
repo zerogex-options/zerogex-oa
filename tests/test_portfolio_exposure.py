@@ -427,7 +427,7 @@ class TestIndependentSignalTriggering:
                 independent_results=[],
             )
         assert out.target_positions == []
-        assert "No advanced signal setup confirmed" in out.rationale
+        assert "No advanced signal setup or confluence confirmed" in out.rationale
 
 
 class TestFreshCrossSizingBoost:
@@ -784,7 +784,210 @@ class TestIndependentSignalTriggers:
                 independent_results=[],
             )
         assert target.target_positions == []
-        assert "No advanced signal setup confirmed" in target.rationale
+        assert "No advanced signal setup or confluence confirmed" in target.rationale
+
+
+class TestSignalConfluenceTriggers:
+    """Confluence-based entry path: Basic + Advanced signals agreeing on
+    direction should trigger a trade even when no single advanced signal
+    individually crosses its trigger threshold."""
+
+    @staticmethod
+    def _basic(name: str, score: float) -> SimpleNamespace:
+        return SimpleNamespace(name=name, score=score, context={})
+
+    @staticmethod
+    def _advanced(name: str, signal: str, score: float, triggered: bool = False) -> SimpleNamespace:
+        return SimpleNamespace(
+            name=name,
+            score=score,
+            context={"signal": signal, "triggered": triggered},
+        )
+
+    @staticmethod
+    def _score() -> ScoreSnapshot:
+        return ScoreSnapshot(
+            timestamp=NOW,
+            underlying="SPY",
+            composite_score=30.0,
+            normalized_score=0.3,
+            direction="chop_range",
+            components={},
+            aggregation={},
+        )
+
+    @staticmethod
+    def _market_ctx() -> dict:
+        return {
+            "close": 500.0,
+            "net_gex": -2.0e8,
+            "gamma_flip": 499.0,
+            "put_call_ratio": 0.95,
+            "max_pain": 500.0,
+            "smart_call": 0.0,
+            "smart_put": 0.0,
+            "recent_closes": [499.0, 499.5, 500.0],
+            "iv_rank": 0.4,
+        }
+
+    def test_confluence_returns_none_when_no_signals_opinionated(self):
+        basic = [self._basic("tape_flow_bias", 0.05), self._basic("skew_delta", -0.03)]
+        advanced = [self._advanced("squeeze_setup", "neutral", 0.1)]
+        assert PortfolioEngine._signal_confluence(advanced, basic) is None
+
+    def test_confluence_fires_on_multi_signal_bullish_agreement(self):
+        basic = [
+            self._basic("tape_flow_bias", 0.40),
+            self._basic("vanna_charm_flow", 0.35),
+            self._basic("dealer_delta_pressure", 0.30),
+        ]
+        advanced = [
+            self._advanced("gamma_vwap_confluence", "bullish_confluence", 0.18),
+        ]
+        result = PortfolioEngine._signal_confluence(advanced, basic)
+        assert result is not None
+        assert result["direction"] == "bullish"
+        assert result["agree"] == 4
+        assert result["disagree"] == 0
+        assert "tape_flow_bias" in result["contributors"]
+        assert "gamma_vwap_confluence" in result["contributors"]
+
+    def test_confluence_rejects_near_split(self):
+        basic = [
+            self._basic("tape_flow_bias", 0.40),
+            self._basic("skew_delta", 0.30),
+            self._basic("vanna_charm_flow", -0.35),
+            self._basic("dealer_delta_pressure", -0.30),
+        ]
+        advanced = [
+            self._advanced("squeeze_setup", "bullish_squeeze", 0.22),
+            self._advanced("trap_detection", "bearish_fade", 0.20),
+        ]
+        result = PortfolioEngine._signal_confluence(advanced, basic)
+        assert result is None
+
+    def test_confluence_ignores_weak_opinions(self):
+        basic = [
+            self._basic("tape_flow_bias", 0.05),
+            self._basic("skew_delta", 0.08),
+            self._basic("vanna_charm_flow", 0.10),
+        ]
+        advanced = [self._advanced("squeeze_setup", "bullish_squeeze", 0.10)]
+        assert PortfolioEngine._signal_confluence(advanced, basic) is None
+
+    def test_confluence_triggers_trade_when_advanced_path_misses(self):
+        engine = _make_engine()
+        score = self._score()
+        market_ctx = self._market_ctx()
+        basic_results = [
+            self._basic("tape_flow_bias", 0.45),
+            self._basic("vanna_charm_flow", 0.40),
+            self._basic("dealer_delta_pressure", 0.35),
+            self._basic("gex_gradient", 0.30),
+        ]
+        # Advanced signal below the 0.25 per-signal trigger: strongest-signal
+        # path returns None, so only confluence can fire.
+        advanced_results = [
+            self._advanced(
+                "gamma_vwap_confluence",
+                "bullish_confluence",
+                0.20,
+                triggered=False,
+            )
+        ]
+        confluence_target = PortfolioTarget(
+            underlying="SPY",
+            timestamp=NOW,
+            composite_score=score.composite_score,
+            normalized_score=0.4,
+            direction="bullish",
+            target_positions=[
+                TargetPosition(
+                    direction="bullish",
+                    strategy_type="bull_call_debit",
+                    contracts=1,
+                    option_symbol="SPY 260417C500",
+                    option_type="C",
+                    expiration=date(2026, 4, 17),
+                    strike=500.0,
+                    entry_mark=2.1,
+                    probability_of_profit=0.54,
+                    expected_value=10.0,
+                    kelly_fraction=0.03,
+                    optimizer_payload={},
+                )
+            ],
+            total_target_contracts=1,
+            target_heat_pct=0.01,
+            rationale="optimizer filled",
+        )
+        with patch.object(engine, "compute_target", return_value=confluence_target):
+            target = engine.compute_target_with_advanced_signals(
+                score,
+                market_ctx,
+                advanced_results=advanced_results,
+                basic_results=basic_results,
+                conn=MagicMock(),
+            )
+        assert target.source == "confluence"
+        assert target.direction == "bullish"
+        assert target.target_positions
+        assert "Confluence bullish" in target.rationale
+
+    def test_confluence_skipped_when_advanced_path_already_fires(self):
+        engine = _make_engine()
+        score = self._score()
+        market_ctx = self._market_ctx()
+        advanced_results = [
+            self._advanced(
+                "squeeze_setup",
+                "bullish_squeeze",
+                0.50,
+                triggered=True,
+            )
+        ]
+        basic_results = [
+            self._basic("tape_flow_bias", 0.35),
+            self._basic("vanna_charm_flow", 0.30),
+        ]
+        advanced_target = PortfolioTarget(
+            underlying="SPY",
+            timestamp=NOW,
+            composite_score=score.composite_score,
+            normalized_score=0.5,
+            direction="bullish",
+            target_positions=[
+                TargetPosition(
+                    direction="bullish",
+                    strategy_type="long_straddle",
+                    contracts=1,
+                    option_symbol="SPY 260417C500",
+                    option_type="C",
+                    expiration=date(2026, 4, 17),
+                    strike=500.0,
+                    entry_mark=2.5,
+                    probability_of_profit=0.55,
+                    expected_value=20.0,
+                    kelly_fraction=0.04,
+                    optimizer_payload={},
+                )
+            ],
+            total_target_contracts=1,
+            target_heat_pct=0.01,
+            rationale="advanced fired",
+            source="advanced:squeeze_setup",
+        )
+        with patch.object(engine, "_build_advanced_target", return_value=advanced_target), \
+             patch.object(engine, "_build_confluence_target") as conf_mock:
+            target = engine.compute_target_with_advanced_signals(
+                score,
+                market_ctx,
+                advanced_results=advanced_results,
+                basic_results=basic_results,
+                conn=MagicMock(),
+            )
+        conf_mock.assert_not_called()
+        assert target.source == "advanced:squeeze_setup"
 
 
 class TestTradeSlotsAndContractSizing:

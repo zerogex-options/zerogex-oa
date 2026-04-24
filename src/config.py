@@ -611,6 +611,43 @@ SIGNALS_CONTRARIAN_OVERRIDE_MIN_COMPOSITE = max(
     0.0, float(os.getenv("SIGNALS_CONTRARIAN_OVERRIDE_MIN_COMPOSITE", "0.20"))
 )
 
+# -----------------------------------------------------------------------------
+# Signal confluence trade trigger
+# -----------------------------------------------------------------------------
+# Cross-signal agreement across Basic + Advanced signal families.  When a
+# single advanced signal doesn't clear its individual trigger threshold but
+# several signals still agree on direction, a strong confluence is its own
+# entry signal.  These knobs gate when that fallback fires.
+#
+# SIGNALS_CONFLUENCE_ENABLED: master switch.  When false, the only signal
+#   entry path is the strongest-single-advanced-signal logic.
+# SIGNALS_CONFLUENCE_MIN_OPINIONATED: a signal only counts if |score| is at
+#   least this cut-off (weaker reads are treated as abstaining).
+# SIGNALS_CONFLUENCE_MIN_AGREE: minimum number of signals that must agree on
+#   direction before confluence can trigger.
+# SIGNALS_CONFLUENCE_MIN_NET_RATIO: (agree - disagree) / opinionated must be
+#   at least this much.  Filters out 3-vs-2 near-splits.
+# SIGNALS_CONFLUENCE_MIN_STRENGTH: sum of |score| of agreeing signals.  Makes
+#   sure we don't fire on a crowd of whispers.
+# SIGNALS_CONFLUENCE_ADVANCED_WEIGHT: multiplier applied to advanced-signal
+#   |score| contributions in the agreement sum (basic signals are weight 1.0).
+SIGNALS_CONFLUENCE_ENABLED = _getenv_bool("SIGNALS_CONFLUENCE_ENABLED", True)
+SIGNALS_CONFLUENCE_MIN_OPINIONATED = _getenv_float(
+    "SIGNALS_CONFLUENCE_MIN_OPINIONATED", 0.15, min=0.0, max=1.0
+)
+SIGNALS_CONFLUENCE_MIN_AGREE = _getenv_int(
+    "SIGNALS_CONFLUENCE_MIN_AGREE", 3, min=2, max=20
+)
+SIGNALS_CONFLUENCE_MIN_NET_RATIO = _getenv_float(
+    "SIGNALS_CONFLUENCE_MIN_NET_RATIO", 0.50, min=0.0, max=1.0
+)
+SIGNALS_CONFLUENCE_MIN_STRENGTH = _getenv_float(
+    "SIGNALS_CONFLUENCE_MIN_STRENGTH", 1.00, min=0.0
+)
+SIGNALS_CONFLUENCE_ADVANCED_WEIGHT = _getenv_float(
+    "SIGNALS_CONFLUENCE_ADVANCED_WEIGHT", 1.25, min=0.0
+)
+
 # Stop-loss as a fraction of trade outlay (entry_price * quantity * 100).
 # Default -0.25 means the trade is stopped out when it loses 25% of the
 # initial premium paid (debit trades) or 25% of max-risk (credit trades).

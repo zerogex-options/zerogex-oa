@@ -980,7 +980,7 @@ class UnifiedSignalEngine:
         market_context = self._build_market_context(ctx)
         score = self.scoring_engine.score_and_persist(market_context)
         advanced_results = self._persist_advanced_signals(market_context)
-        self._persist_basic_signals(market_context)
+        basic_results = self._persist_basic_signals(market_context)
 
         # Phase 3: reconcile portfolio (acquires connection for reads+writes)
         # Legacy optimizer-cache plumbing is no longer needed because MSI
@@ -990,6 +990,7 @@ class UnifiedSignalEngine:
             score,
             ctx,
             advanced_results=advanced_results,
+            basic_results=basic_results,
             cached_option_rows=cached_option_rows,
         )
         action = self.portfolio_engine.reconcile(target)

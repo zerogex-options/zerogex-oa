@@ -23,6 +23,12 @@ from datetime import date, datetime
 from typing import Optional
 
 from src.config import (
+    SIGNALS_CONFLUENCE_ADVANCED_WEIGHT,
+    SIGNALS_CONFLUENCE_ENABLED,
+    SIGNALS_CONFLUENCE_MIN_AGREE,
+    SIGNALS_CONFLUENCE_MIN_NET_RATIO,
+    SIGNALS_CONFLUENCE_MIN_OPINIONATED,
+    SIGNALS_CONFLUENCE_MIN_STRENGTH,
     SIGNALS_DRS_CALL_ENTRY_MIN,
     SIGNALS_DRS_FRESH_CROSS_BOOST,
     SIGNALS_DRS_HARD_GATES_ENABLED,
@@ -390,28 +396,47 @@ class PortfolioEngine:
         score: ScoreSnapshot,
         market_ctx: dict,
         advanced_results: list[AdvancedSignalResult],
+        basic_results: Optional[list[AdvancedSignalResult]] = None,
         conn=None,
         cached_option_rows=None,
     ) -> PortfolioTarget:
-        """Primary MSI target with advanced-signal opportunity gating."""
+        """Primary MSI target with signal-based opportunity gating.
+
+        Entry paths, in priority order:
+          1. Strongest individual advanced signal (discrete trigger fires).
+          2. Cross-signal confluence across Basic + Advanced families: if
+             enough signals agree on direction with sufficient aggregated
+             strength, that consensus is itself an entry signal.
+        """
         composite_target = self.compute_target(
             score,
             market_ctx,
             conn=conn,
             cached_option_rows=cached_option_rows,
         )
-        advanced_target = self._build_advanced_target(
+        entry_target = self._build_advanced_target(
             score,
             market_ctx,
             advanced_results=advanced_results,
             conn=conn,
             cached_option_rows=cached_option_rows,
         )
-        # Always require an advanced setup before entering.
-        if advanced_target is None:
+
+        if entry_target is None:
+            entry_target = self._build_confluence_target(
+                score,
+                market_ctx,
+                advanced_results=advanced_results,
+                basic_results=basic_results or [],
+                conn=conn,
+                cached_option_rows=cached_option_rows,
+            )
+
+        # Require either a triggered advanced signal or a strong confluence.
+        if entry_target is None:
             return self._cash_target(
                 score,
-                "No advanced signal setup confirmed; stay in cash",
+                "No advanced signal setup or confluence confirmed; stay in cash",
             )
 
         # Hard do-not-fade policy in destabilizing, no-anchor conditions.
@@ -419,8 +444,8 @@ class PortfolioEngine:
             trend_dir = self._msi_trend_direction(market_ctx)
             if (
                 trend_dir in {"bullish", "bearish"}
-                and advanced_target.direction in {"bullish", "bearish"}
-                and trend_dir != advanced_target.direction
+                and entry_target.direction in {"bullish", "bearish"}
+                and trend_dir != entry_target.direction
             ):
                 return self._cash_target(
                     score,
@@ -432,15 +457,15 @@ class PortfolioEngine:
             trend_dir = self._msi_trend_direction(market_ctx)
             if (
                 trend_dir in {"bullish", "bearish"}
-                and advanced_target.direction in {"bullish", "bearish"}
-                and trend_dir != advanced_target.direction
+                and entry_target.direction in {"bullish", "bearish"}
+                and trend_dir != entry_target.direction
             ):
                 return self._cash_target(
                     score,
                     "Expansion regime: advanced setup opposes prevailing trend",
                 )
 
-        return advanced_target
+        return entry_target
 
     def _build_advanced_target(
         self,
@@ -504,12 +529,150 @@ class PortfolioEngine:
         )
         return ranked[0]
 
+    def _build_confluence_target(
+        self,
+        score: ScoreSnapshot,
+        market_ctx: dict,
+        advanced_results: list[AdvancedSignalResult],
+        basic_results: list[AdvancedSignalResult],
+        conn=None,
+        cached_option_rows=None,
+    ) -> Optional[PortfolioTarget]:
+        """Build an entry target from cross-signal confluence.
+
+        Fires when enough Basic + Advanced signals agree on direction with
+        sufficient aggregated strength, even if no single advanced signal
+        individually triggered.  Uses advanced signals' explicit direction
+        map and basic signals' score sign to vote.
+        """
+        confluence = self._signal_confluence(advanced_results, basic_results)
+        if confluence is None:
+            return None
+
+        direction = confluence["direction"]
+        magnitude = confluence["magnitude"]
+        synthetic_score = ScoreSnapshot(
+            timestamp=score.timestamp,
+            underlying=score.underlying,
+            composite_score=round(score.composite_score, 6),
+            normalized_score=round(magnitude, 6),
+            direction=direction,
+            components=dict(score.components or {}),
+            aggregation={
+                **(score.aggregation or {}),
+                "confluence_trigger": True,
+                "confluence_direction": direction,
+                "confluence_agree": confluence["agree"],
+                "confluence_disagree": confluence["disagree"],
+                "confluence_strength": round(confluence["strength"], 6),
+                "confluence_net_ratio": round(confluence["net_ratio"], 6),
+                "confluence_contributors": confluence["contributors"],
+            },
+        )
+
+        target = self.compute_target(
+            synthetic_score,
+            market_ctx,
+            conn=conn,
+            cached_option_rows=cached_option_rows,
+        )
+        if not target.target_positions:
+            return None
+
+        target.source = "confluence"
+        contributors = ",".join(confluence["contributors"])
+        target.rationale = (
+            f"Confluence {direction} agree={confluence['agree']}/"
+            f"{confluence['opinionated']} net={confluence['net_ratio']:.2f} "
+            f"strength={confluence['strength']:.2f} [{contributors}], "
+            + target.rationale
+        )
+        return target
+
+    @classmethod
+    def _signal_confluence(
+        cls,
+        advanced_results: list[AdvancedSignalResult],
+        basic_results: list[AdvancedSignalResult],
+    ) -> Optional[dict]:
+        """Compute direction/strength agreement across Basic + Advanced signals.
+
+        Returns ``None`` when confluence is disabled, no signals are
+        opinionated, or the agreement doesn't clear the configured thresholds.
+        """
+        if not SIGNALS_CONFLUENCE_ENABLED:
+            return None
+
+        min_opinion = float(SIGNALS_CONFLUENCE_MIN_OPINIONATED)
+        adv_weight = float(SIGNALS_CONFLUENCE_ADVANCED_WEIGHT)
+
+        votes: dict[str, dict] = {
+            "bullish": {"count": 0, "strength": 0.0, "names": []},
+            "bearish": {"count": 0, "strength": 0.0, "names": []},
+        }
+        opinionated = 0
+
+        def _ingest(result, direction_resolver, weight: float) -> None:
+            nonlocal opinionated
+            score_abs = abs(float(result.score))
+            if score_abs < min_opinion:
+                return
+            direction = direction_resolver(result)
+            if direction not in {"bullish", "bearish"}:
+                return
+            opinionated += 1
+            bucket = votes[direction]
+            bucket["count"] += 1
+            bucket["strength"] += score_abs * weight
+            bucket["names"].append(result.name)
+
+        for result in advanced_results or []:
+            _ingest(result, cls._resolve_advanced_direction, adv_weight)
+        for result in basic_results or []:
+            _ingest(result, cls._resolve_basic_direction, 1.0)
+
+        if opinionated == 0:
+            return None
+
+        bull = votes["bullish"]
+        bear = votes["bearish"]
+        if bull["count"] >= bear["count"]:
+            winner, direction = bull, "bullish"
+            disagree = int(bear["count"])
+        else:
+            winner, direction = bear, "bearish"
+            disagree = int(bull["count"])
+
+        agree = int(winner["count"])
+        strength = float(winner["strength"])
+        net_ratio = (agree - disagree) / opinionated if opinionated > 0 else 0.0
+
+        if agree < SIGNALS_CONFLUENCE_MIN_AGREE:
+            return None
+        if net_ratio < SIGNALS_CONFLUENCE_MIN_NET_RATIO:
+            return None
+        if strength < SIGNALS_CONFLUENCE_MIN_STRENGTH:
+            return None
+
+        magnitude = max(0.0, min(1.0, strength / max(float(agree), 1.0)))
+        return {
+            "direction": direction,
+            "agree": agree,
+            "disagree": disagree,
+            "opinionated": opinionated,
+            "strength": strength,
+            "net_ratio": net_ratio,
+            "magnitude": magnitude,
+            "contributors": list(winner["names"]),
+        }
+
     # Backward compatibility for callers still using legacy naming.
     def compute_target_with_independents(
         self,
         score: ScoreSnapshot,
         market_ctx: dict,
         independent_results: list[AdvancedSignalResult],
+        basic_results: Optional[list[AdvancedSignalResult]] = None,
         conn=None,
         cached_option_rows=None,
     ) -> PortfolioTarget:
@@ -517,6 +680,7 @@ class PortfolioEngine:
             score=score,
             market_ctx=market_ctx,
             advanced_results=independent_results,
+            basic_results=basic_results,
             conn=conn,
             cached_option_rows=cached_option_rows,
         )
@@ -531,6 +695,16 @@ class PortfolioEngine:
         if result.score > 0:
             return "bullish"
         if result.score < 0:
+            return "bearish"
+        return "neutral"
+
+    @staticmethod
+    def _resolve_basic_direction(result: AdvancedSignalResult) -> str:
+        """Basic signals are continuous: direction = sign of score."""
+        score = float(result.score or 0.0)
+        if score > 0:
+            return "bullish"
+        if score < 0:
             return "bearish"
         return "neutral"
 
