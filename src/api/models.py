@@ -161,6 +161,37 @@ class FlowPoint(BaseModel):
     underlying_price: Optional[Decimal] = None
 
 
+class FlowSeriesPoint(BaseModel):
+    """Server-accumulated 5-minute flow bar from /api/flow/series.
+
+    One row per bar from 09:30 ET through the latest bar covered by the
+    resolved session. Carry-forward synthetic rows fill quiet bars so the
+    series is contiguous — the ``is_synthetic`` flag distinguishes them.
+    """
+    timestamp: str
+    bar_start: str
+    bar_end: str
+    call_premium_cum: float
+    put_premium_cum: float
+    call_volume_cum: int
+    put_volume_cum: int
+    net_volume_cum: int
+    raw_volume_cum: int
+    call_position_cum: int
+    put_position_cum: int
+    net_premium_cum: float
+    put_call_ratio: Optional[float] = None
+    underlying_price: Optional[float] = None
+    contract_count: int
+    is_synthetic: bool
+
+
+class FlowContractsResponse(BaseModel):
+    """Distinct strikes and expirations that traded in the resolved session."""
+    strikes: list[float]
+    expirations: list[str]
+
+
 class SmartMoneyFlowPoint(BaseModel):
     timestamp: datetime
     symbol: str

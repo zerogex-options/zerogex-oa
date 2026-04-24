@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, date as date_type
 import logging
 import os
+import re
 from typing import List, Optional, Literal
 import pytz
 
@@ -23,6 +24,8 @@ from .models import (
     GEXSummary,
     GEXByStrike,
     FlowPoint,
+    FlowSeriesPoint,
+    FlowContractsResponse,
     SmartMoneyFlowPoint,
     MomentumDivergencePoint,
     FlowBuyingPressurePoint,
@@ -309,6 +312,197 @@ async def get_flow_by_contract(
     """
     data = await db_manager.get_flow(symbol, session, intervals=intervals)
     return [FlowPoint(**row) for row in data]
+
+
+_FLOW_SYMBOL_PATTERN = re.compile(r"^[A-Z.]{1,10}$")
+
+
+def _parse_flow_strikes(raw: Optional[str]) -> Optional[List[float]]:
+    """Parse the ?strikes= CSV into a list of floats.
+
+    Silently drops unparseable entries. Returns ``None`` for missing or
+    empty input (meaning "no strike filter"). Raises ``HTTPException(400)``
+    only when every supplied entry is unparseable — an all-bad filter is a
+    client error, not an accidental no-op.
+    """
+    if raw is None:
+        return None
+    trimmed = raw.strip()
+    if not trimmed:
+        return None
+    parts = [p.strip() for p in trimmed.split(",") if p.strip()]
+    if not parts:
+        return None
+    parsed: List[float] = []
+    for part in parts:
+        try:
+            value = float(part)
+        except ValueError:
+            continue
+        if value != value or value in (float("inf"), float("-inf")):  # NaN / inf
+            continue
+        parsed.append(value)
+    if not parsed:
+        raise HTTPException(status_code=400, detail="strikes must contain at least one finite number")
+    return parsed
+
+
+_FLOW_EXPIRATION_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _parse_flow_expirations(raw: Optional[str]) -> Optional[List[date_type]]:
+    """Parse the ?expirations= CSV into a list of dates.
+
+    Silently drops entries that don't match ``YYYY-MM-DD`` or aren't real
+    calendar dates. Returns ``None`` for missing/empty input. Raises 400
+    only when every entry is unparseable.
+    """
+    if raw is None:
+        return None
+    trimmed = raw.strip()
+    if not trimmed:
+        return None
+    parts = [p.strip() for p in trimmed.split(",") if p.strip()]
+    if not parts:
+        return None
+    parsed: List[date_type] = []
+    for part in parts:
+        if not _FLOW_EXPIRATION_PATTERN.match(part):
+            continue
+        try:
+            parsed.append(date_type.fromisoformat(part))
+        except ValueError:
+            continue
+    if not parsed:
+        raise HTTPException(
+            status_code=400,
+            detail="expirations must contain at least one valid YYYY-MM-DD date",
+        )
+    return parsed
+
+
+def _format_flow_series_row(row: dict) -> dict:
+    """Coerce a raw DB row into the JSON shape documented in the spec.
+
+    The timestamp fields are emitted as ``...Z`` (trailing-Z UTC) — spec
+    requirement. Decimal/Numeric columns are cast to float so JSON callers
+    don't have to care about asyncpg's native Decimal output.
+    """
+    bar_start: datetime = row["bar_start"]
+    if bar_start.tzinfo is None:
+        bar_start = bar_start.replace(tzinfo=pytz.UTC)
+    else:
+        bar_start = bar_start.astimezone(pytz.UTC)
+    bar_end = bar_start + timedelta(minutes=5)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+
+    def _to_float(v):
+        return float(v) if v is not None else None
+
+    def _to_int(v):
+        return int(v) if v is not None else 0
+
+    return {
+        "timestamp": bar_start.strftime(fmt),
+        "bar_start": bar_start.strftime(fmt),
+        "bar_end": bar_end.strftime(fmt),
+        "call_premium_cum": _to_float(row.get("call_premium_cum")) or 0.0,
+        "put_premium_cum": _to_float(row.get("put_premium_cum")) or 0.0,
+        "call_volume_cum": _to_int(row.get("call_volume_cum")),
+        "put_volume_cum": _to_int(row.get("put_volume_cum")),
+        "net_volume_cum": _to_int(row.get("net_volume_cum")),
+        "raw_volume_cum": _to_int(row.get("raw_volume_cum")),
+        "call_position_cum": _to_int(row.get("call_position_cum")),
+        "put_position_cum": _to_int(row.get("put_position_cum")),
+        "net_premium_cum": _to_float(row.get("net_premium_cum")) or 0.0,
+        "put_call_ratio": _to_float(row.get("put_call_ratio")),
+        "underlying_price": _to_float(row.get("underlying_price")),
+        "contract_count": _to_int(row.get("contract_count")),
+        "is_synthetic": bool(row.get("is_synthetic")),
+    }
+
+
+@app.get("/api/flow/series", response_model=List[FlowSeriesPoint], tags=["Options Flow"])
+@handle_api_errors("GET /api/flow/series")
+async def get_flow_series(
+    symbol: str = Query(..., min_length=1, max_length=10),
+    session: Literal["current", "prior"] = Query(default="current"),
+    strikes: Optional[str] = Query(
+        default=None,
+        description="Comma-separated strikes to include. Empty/missing = all strikes.",
+    ),
+    expirations: Optional[str] = Query(
+        default=None,
+        description="Comma-separated YYYY-MM-DD expirations to include. Empty/missing = all.",
+    ),
+    intervals: Optional[int] = Query(
+        default=None,
+        ge=1,
+        le=390,
+        description=(
+            "If provided, return only the last N 5-minute bars (tail window) "
+            "for cheap incremental polling. A full regular session is 81 bars."
+        ),
+    ),
+):
+    """Server-accumulated flow series — one row per 5-minute bar.
+
+    Returns cumulative call/put premium, volume, position, net volume, and
+    put/call ratio per bar across all contracts matching the optional
+    ``strikes``/``expirations`` filters. Rows are contiguous (quiet bars
+    carry forward as synthetic rows flagged by ``is_synthetic``). Frontend
+    renders this series directly — no client-side accumulators.
+
+    ``session=current`` is the most recent ET trading day that has any data
+    for the symbol; ``session=prior`` is the ET day immediately before that.
+    Unknown symbols return 404; symbols that exist but have no data for the
+    requested session return 200 with ``[]``.
+    """
+    normalized = symbol.strip().upper()
+    if not _FLOW_SYMBOL_PATTERN.match(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
+        )
+
+    strikes_list = _parse_flow_strikes(strikes)
+    expirations_list = _parse_flow_expirations(expirations)
+
+    rows = await db_manager.get_flow_series(
+        symbol=normalized,
+        session=session,
+        strikes=strikes_list,
+        expirations=expirations_list,
+        intervals=intervals,
+    )
+    if rows is None:
+        raise HTTPException(status_code=404, detail="symbol not found")
+    return JSONResponse(content=[_format_flow_series_row(r) for r in rows])
+
+
+@app.get("/api/flow/contracts", response_model=FlowContractsResponse, tags=["Options Flow"])
+@handle_api_errors("GET /api/flow/contracts")
+async def get_flow_contracts(
+    symbol: str = Query(..., min_length=1, max_length=10),
+    session: Literal["current", "prior"] = Query(default="current"),
+):
+    """Distinct strikes and expirations that traded in the resolved session.
+
+    Powers the Strike / Expiration filter chips on the Flow Analysis page.
+    Companion to ``/api/flow/series``: same session resolution, same 404
+    semantics for unknown symbols.
+    """
+    normalized = symbol.strip().upper()
+    if not _FLOW_SYMBOL_PATTERN.match(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
+        )
+
+    result = await db_manager.get_flow_contracts(symbol=normalized, session=session)
+    if result is None:
+        raise HTTPException(status_code=404, detail="symbol not found")
+    return FlowContractsResponse(**result)
 
 
 @app.get("/api/flow/smart-money", response_model=List[SmartMoneyFlowPoint], tags=["Options Flow"])

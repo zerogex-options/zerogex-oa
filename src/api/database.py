@@ -1400,6 +1400,337 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.warning(f"Flow query failed for {symbol} (returning empty): {e!r}")
             return []
 
+    async def _resolve_flow_series_session(
+        self,
+        conn: asyncpg.Connection,
+        symbol: str,
+        session: str,
+    ) -> Optional[Tuple[datetime, datetime, bool]]:
+        """Resolve (session_start_utc, session_end_utc, symbol_has_any_data) for
+        the data-driven session model used by /api/flow/series.
+
+        Returns ``None`` when the symbol has no rows in flow_by_contract at
+        all (spec: 404 unknown symbol). Returns ``(_, _, False)`` when the
+        symbol exists but the requested session has no data — the endpoint
+        surfaces this as ``200 + []`` (see T4 / "session=prior but no prior
+        data"). Normal resolution returns ``(start, end, True)``.
+        """
+        exists = await conn.fetchval(
+            "SELECT 1 FROM flow_by_contract WHERE symbol = $1 LIMIT 1",
+            symbol,
+        )
+        if not exists:
+            return None
+
+        if session == 'prior':
+            # Resolve in two steps so the absence of a prior day is
+            # distinguishable from the absence of any data at all.
+            current_date = await conn.fetchval(
+                """
+                SELECT (MAX(timestamp) AT TIME ZONE 'America/New_York')::date
+                FROM flow_by_contract
+                WHERE symbol = $1
+                """,
+                symbol,
+            )
+            prior_date = await conn.fetchval(
+                """
+                SELECT (MAX(timestamp) AT TIME ZONE 'America/New_York')::date
+                FROM flow_by_contract
+                WHERE symbol = $1
+                  AND (timestamp AT TIME ZONE 'America/New_York')::date < $2::date
+                """,
+                symbol,
+                current_date,
+            )
+            if prior_date is None:
+                # Symbol exists but has no prior session → 200 + [].
+                return datetime.now(timezone.utc), datetime.now(timezone.utc), False
+            session_start_et = datetime(
+                prior_date.year, prior_date.month, prior_date.day, 9, 30, tzinfo=_ET
+            )
+            session_start_utc = session_start_et.astimezone(timezone.utc)
+            # Prior session is always closed — cap at 16:15 ET (09:30 + 6h45m).
+            session_end_utc = session_start_utc + timedelta(hours=6, minutes=45)
+            return session_start_utc, session_end_utc, True
+
+        # session == 'current': most recent ET day with data.
+        current_date = await conn.fetchval(
+            """
+            SELECT (MAX(timestamp) AT TIME ZONE 'America/New_York')::date
+            FROM flow_by_contract
+            WHERE symbol = $1
+            """,
+            symbol,
+        )
+        session_start_et = datetime(
+            current_date.year, current_date.month, current_date.day, 9, 30, tzinfo=_ET
+        )
+        session_start_utc = session_start_et.astimezone(timezone.utc)
+        session_close_utc = session_start_utc + timedelta(hours=6, minutes=45)
+        # Floor now() to the 5-minute bucket boundary so generate_series
+        # lands on clean bar_start values (and stops before any
+        # partially-populated bucket on the client's clock).
+        now_utc = datetime.now(timezone.utc)
+        now_floor_epoch = int(now_utc.timestamp() // 300) * 300
+        now_floored = datetime.fromtimestamp(now_floor_epoch, tz=timezone.utc)
+        session_end_utc = min(now_floored, session_close_utc)
+        if session_end_utc < session_start_utc:
+            # Shouldn't happen in practice — MAX(bar_start) >= session_start
+            # implies now() is past open. Clamp defensively.
+            session_end_utc = session_start_utc
+        return session_start_utc, session_end_utc, True
+
+    async def get_flow_series(
+        self,
+        symbol: str = 'SPY',
+        session: str = 'current',
+        strikes: Optional[List[float]] = None,
+        expirations: Optional[List[date]] = None,
+        intervals: Optional[int] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Return pre-accumulated 5-minute flow series rows for a session.
+
+        Returns ``None`` when the symbol has never appeared in
+        flow_by_contract (caller surfaces 404). Otherwise returns a list of
+        dicts — possibly empty — with one entry per 5-minute bar from 09:30 ET
+        through the latest bar covered by the resolved session window.
+        Carry-forward synthetic rows fill quiet bars; bars that haven't
+        happened yet are excluded.
+        """
+        symbol = symbol.upper()
+
+        # Cache only full-series fetches. Incremental (intervals=N) polls
+        # bypass the cache so the tail row reflects the newest DB state.
+        use_cache = intervals is None
+        cache_key = None
+        if use_cache:
+            strikes_key = ','.join(f"{s:g}" for s in sorted(strikes)) if strikes else ''
+            exps_key = ','.join(e.isoformat() for e in sorted(expirations)) if expirations else ''
+            cache_key = f"flow_series:{symbol}:{session}:{strikes_key}:{exps_key}"
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                return cached
+
+        strikes_arg = [float(s) for s in strikes] if strikes else None
+        expirations_arg = list(expirations) if expirations else None
+
+        try:
+            async with self._acquire_connection() as conn:
+                await self._refresh_flow_cache(conn, symbol)
+                resolved = await self._resolve_flow_series_session(conn, symbol, session)
+                if resolved is None:
+                    return None
+                session_start, session_end, has_session_data = resolved
+                if not has_session_data:
+                    if use_cache:
+                        self._cache_set(cache_key, [], self._flow_endpoint_cache_ttl_seconds)
+                    return []
+
+                query = """
+                    WITH filtered AS (
+                        SELECT
+                            timestamp AS bar_start,
+                            option_type,
+                            strike,
+                            expiration,
+                            raw_volume,
+                            net_volume,
+                            net_premium,
+                            underlying_price
+                        FROM flow_by_contract
+                        WHERE symbol = $1
+                          AND timestamp >= $2
+                          AND timestamp <= $3
+                          AND ($4::numeric[] IS NULL OR strike = ANY($4::numeric[]))
+                          AND ($5::date[]    IS NULL OR expiration = ANY($5::date[]))
+                    ),
+                    contract_deltas AS (
+                        SELECT
+                            bar_start,
+                            option_type,
+                            strike,
+                            expiration,
+                            (raw_volume  - COALESCE(LAG(raw_volume)  OVER w, 0))::bigint  AS raw_volume_delta,
+                            (net_volume  - COALESCE(LAG(net_volume)  OVER w, 0))::bigint  AS net_volume_delta,
+                            (net_premium - COALESCE(LAG(net_premium) OVER w, 0))::numeric AS net_premium_delta,
+                            underlying_price
+                        FROM filtered
+                        WINDOW w AS (PARTITION BY option_type, strike, expiration ORDER BY bar_start)
+                    ),
+                    per_bar AS (
+                        SELECT
+                            bar_start,
+                            SUM(CASE WHEN option_type='C' THEN net_premium_delta ELSE 0 END)::numeric AS call_premium_delta,
+                            SUM(CASE WHEN option_type='P' THEN net_premium_delta ELSE 0 END)::numeric AS put_premium_delta,
+                            SUM(CASE WHEN option_type='C' THEN raw_volume_delta  ELSE 0 END)::bigint  AS call_volume_delta,
+                            SUM(CASE WHEN option_type='P' THEN raw_volume_delta  ELSE 0 END)::bigint  AS put_volume_delta,
+                            SUM(net_volume_delta)::bigint                                             AS net_volume_delta,
+                            SUM(raw_volume_delta)::bigint                                             AS raw_volume_delta,
+                            SUM(CASE WHEN option_type='C' THEN net_volume_delta  ELSE 0 END)::bigint  AS call_position_delta,
+                            SUM(CASE WHEN option_type='P' THEN net_volume_delta  ELSE 0 END)::bigint  AS put_position_delta,
+                            (ARRAY_AGG(underlying_price) FILTER (WHERE underlying_price IS NOT NULL))[1] AS underlying_price,
+                            COUNT(*)::int AS contract_count
+                        FROM contract_deltas
+                        GROUP BY bar_start
+                    ),
+                    timeline AS (
+                        -- Gate the timeline on filtered having rows. An empty
+                        -- filter match (T5) returns zero rows rather than 81
+                        -- synthetic zero-cumulative bars.
+                        SELECT g.bar_start
+                        FROM generate_series($2::timestamptz, $3::timestamptz, INTERVAL '5 minutes') AS g(bar_start)
+                        WHERE EXISTS (SELECT 1 FROM filtered)
+                    ),
+                    joined AS (
+                        SELECT
+                            t.bar_start,
+                            COALESCE(pb.call_premium_delta, 0) AS call_premium_delta,
+                            COALESCE(pb.put_premium_delta, 0)  AS put_premium_delta,
+                            COALESCE(pb.call_volume_delta, 0)  AS call_volume_delta,
+                            COALESCE(pb.put_volume_delta, 0)   AS put_volume_delta,
+                            COALESCE(pb.net_volume_delta, 0)   AS net_volume_delta,
+                            COALESCE(pb.raw_volume_delta, 0)   AS raw_volume_delta,
+                            COALESCE(pb.call_position_delta, 0) AS call_position_delta,
+                            COALESCE(pb.put_position_delta, 0)  AS put_position_delta,
+                            pb.underlying_price,
+                            COALESCE(pb.contract_count, 0) AS contract_count,
+                            (pb.bar_start IS NULL) AS is_synthetic
+                        FROM timeline t
+                        LEFT JOIN per_bar pb USING (bar_start)
+                    ),
+                    carry AS (
+                        -- FIRST_VALUE + partition-by-running-count emulates
+                        -- LAST_VALUE(... IGNORE NULLS) portably (Postgres < 16
+                        -- doesn't support IGNORE NULLS in LAST_VALUE).
+                        SELECT
+                            j.*,
+                            COUNT(underlying_price) OVER (ORDER BY bar_start ROWS UNBOUNDED PRECEDING) AS up_grp
+                        FROM joined j
+                    )
+                    SELECT
+                        bar_start,
+                        SUM(call_premium_delta)  OVER w_cum AS call_premium_cum,
+                        SUM(put_premium_delta)   OVER w_cum AS put_premium_cum,
+                        SUM(call_volume_delta)   OVER w_cum AS call_volume_cum,
+                        SUM(put_volume_delta)    OVER w_cum AS put_volume_cum,
+                        SUM(net_volume_delta)    OVER w_cum AS net_volume_cum,
+                        SUM(raw_volume_delta)    OVER w_cum AS raw_volume_cum,
+                        SUM(call_position_delta) OVER w_cum AS call_position_cum,
+                        SUM(put_position_delta)  OVER w_cum AS put_position_cum,
+                        (SUM(call_premium_delta) OVER w_cum
+                         + SUM(put_premium_delta) OVER w_cum) AS net_premium_cum,
+                        CASE
+                            WHEN SUM(call_volume_delta) OVER w_cum > 0
+                            THEN (SUM(put_volume_delta) OVER w_cum)::float8
+                               / (SUM(call_volume_delta) OVER w_cum)::float8
+                            ELSE NULL
+                        END AS put_call_ratio,
+                        FIRST_VALUE(underlying_price) OVER (
+                            PARTITION BY up_grp ORDER BY bar_start
+                        ) AS underlying_price,
+                        contract_count,
+                        is_synthetic
+                    FROM carry
+                    WINDOW w_cum AS (ORDER BY bar_start ROWS UNBOUNDED PRECEDING)
+                    ORDER BY bar_start
+                """
+
+                rows = await asyncio.wait_for(
+                    conn.fetch(
+                        query,
+                        symbol,
+                        session_start,
+                        session_end,
+                        strikes_arg,
+                        expirations_arg,
+                    ),
+                    timeout=15.0,
+                )
+                result = [dict(row) for row in rows]
+                if intervals is not None and intervals > 0 and len(result) > intervals:
+                    result = result[-intervals:]
+                if use_cache:
+                    self._cache_set(cache_key, result, self._flow_endpoint_cache_ttl_seconds)
+                return result
+        except asyncio.TimeoutError:
+            logger.warning(f"Flow series query timed out for {symbol}, returning empty")
+            return []
+        except Exception as e:
+            logger.warning(f"Flow series query failed for {symbol} (returning empty): {e!r}")
+            return []
+
+    async def get_flow_contracts(
+        self,
+        symbol: str = 'SPY',
+        session: str = 'current',
+    ) -> Optional[Dict[str, List[Any]]]:
+        """Return the distinct strikes and expirations that traded in a session.
+
+        Returns ``None`` when the symbol has never appeared in flow_by_contract
+        (caller surfaces 404). Otherwise a dict with ``strikes`` (ascending
+        floats) and ``expirations`` (ascending ISO dates). Empty lists are
+        returned when the resolved session has no data.
+        """
+        symbol = symbol.upper()
+        cache_key = f"flow_contracts:{symbol}:{session}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            async with self._acquire_connection() as conn:
+                await self._refresh_flow_cache(conn, symbol)
+                resolved = await self._resolve_flow_series_session(conn, symbol, session)
+                if resolved is None:
+                    return None
+                session_start, session_end, has_session_data = resolved
+                if not has_session_data:
+                    payload = {"strikes": [], "expirations": []}
+                    self._cache_set(cache_key, payload, self._flow_endpoint_cache_ttl_seconds)
+                    return payload
+
+                query = """
+                    SELECT
+                        COALESCE(
+                            ARRAY(
+                                SELECT DISTINCT strike
+                                FROM flow_by_contract
+                                WHERE symbol = $1
+                                  AND timestamp >= $2
+                                  AND timestamp <= $3
+                                ORDER BY strike
+                            ),
+                            ARRAY[]::numeric[]
+                        ) AS strikes,
+                        COALESCE(
+                            ARRAY(
+                                SELECT DISTINCT expiration
+                                FROM flow_by_contract
+                                WHERE symbol = $1
+                                  AND timestamp >= $2
+                                  AND timestamp <= $3
+                                ORDER BY expiration
+                            ),
+                            ARRAY[]::date[]
+                        ) AS expirations
+                """
+                row = await asyncio.wait_for(
+                    conn.fetchrow(query, symbol, session_start, session_end),
+                    timeout=10.0,
+                )
+                strikes = [float(s) for s in (row["strikes"] or [])]
+                expirations = [d.isoformat() for d in (row["expirations"] or [])]
+                payload = {"strikes": strikes, "expirations": expirations}
+                self._cache_set(cache_key, payload, self._flow_endpoint_cache_ttl_seconds)
+                return payload
+        except asyncio.TimeoutError:
+            logger.warning(f"Flow contracts query timed out for {symbol}, returning empty")
+            return {"strikes": [], "expirations": []}
+        except Exception as e:
+            logger.warning(f"Flow contracts query failed for {symbol} (returning empty): {e!r}")
+            return {"strikes": [], "expirations": []}
+
     async def get_smart_money_flow(
         self,
         symbol: str = 'SPY',
