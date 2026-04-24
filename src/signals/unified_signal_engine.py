@@ -179,6 +179,10 @@ class UnifiedSignalEngine:
                 call_wall: Optional[float] = None
                 max_gamma_strike: Optional[float] = None
                 try:
+                    # Single query at (strike, bucket) granularity.  We build
+                    # both the strike-level aggregate view (gex_strike_rows)
+                    # and the per-bucket view (gex_strike_by_bucket) from the
+                    # same result set — halves DB roundtrips per cycle.
                     cur.execute(
                         """
                         WITH latest AS (
@@ -187,19 +191,19 @@ class UnifiedSignalEngine:
                             WHERE underlying = %s AND timestamp <= %s
                         )
                         SELECT strike,
+                               COALESCE(expiration_bucket, 'monthly') AS bucket,
                                SUM(COALESCE(net_gex, 0))                 AS net_gex,
                                SUM(COALESCE(call_oi, 0))                 AS call_oi,
                                SUM(COALESCE(put_oi, 0))                  AS put_oi,
                                SUM(COALESCE(vanna_exposure, 0))          AS vanna_exposure,
                                SUM(COALESCE(charm_exposure, 0))          AS charm_exposure,
                                SUM(COALESCE(dealer_vanna_exposure, -vanna_exposure, 0)) AS dealer_vanna,
-                               SUM(COALESCE(dealer_charm_exposure, -charm_exposure, 0)) AS dealer_charm,
-                               COALESCE(MAX(expiration_bucket), 'monthly') AS expiration_bucket
+                               SUM(COALESCE(dealer_charm_exposure, -charm_exposure, 0)) AS dealer_charm
                         FROM gex_by_strike g, latest
                         WHERE g.underlying = %s
                           AND g.timestamp = latest.ts
                           AND g.strike BETWEEN %s AND %s
-                        GROUP BY strike
+                        GROUP BY strike, bucket
                         ORDER BY strike
                         """,
                         (
@@ -210,57 +214,57 @@ class UnifiedSignalEngine:
                             close_f * 1.10,
                         ),
                     )
+                    per_strike: dict[float, dict] = {}
                     for r in cur.fetchall():
-                        gex_strike_rows.append(
-                            {
-                                "strike": float(r[0]),
-                                "net_gex": float(r[1] or 0.0),
-                                "call_oi": int(r[2] or 0),
-                                "put_oi": int(r[3] or 0),
-                                "vanna_exposure": float(r[4] or 0.0),
-                                "charm_exposure": float(r[5] or 0.0),
-                                # Dealer-sign convention (preferred for flow-direction signals)
-                                "dealer_vanna_exposure": float(r[6] or 0.0),
-                                "dealer_charm_exposure": float(r[7] or 0.0),
-                                "expiration_bucket": r[8] or "monthly",
-                            }
-                        )
-                    # Also fetch expiry-bucketed charm for EOD pressure (S2):
-                    # dealer 0DTE charm, weekly, monthly separately.
-                    cur.execute(
-                        """
-                        WITH latest AS (
-                            SELECT MAX(timestamp) AS ts
-                            FROM gex_by_strike
-                            WHERE underlying = %s AND timestamp <= %s
-                        )
-                        SELECT strike,
-                               COALESCE(expiration_bucket, 'monthly') AS bucket,
-                               SUM(COALESCE(dealer_charm_exposure, -charm_exposure, 0)) AS d_charm,
-                               SUM(COALESCE(dealer_vanna_exposure, -vanna_exposure, 0)) AS d_vanna
-                        FROM gex_by_strike g, latest
-                        WHERE g.underlying = %s
-                          AND g.timestamp = latest.ts
-                          AND g.strike BETWEEN %s AND %s
-                        GROUP BY strike, bucket
-                        """,
-                        (
-                            self.db_symbol,
-                            ts,
-                            self.db_symbol,
-                            close_f * 0.90,
-                            close_f * 1.10,
-                        ),
-                    )
-                    for r in cur.fetchall():
+                        strike = float(r[0])
                         bucket = r[1] or "monthly"
+                        net_gex_b = float(r[2] or 0.0)
+                        call_oi_b = int(r[3] or 0)
+                        put_oi_b = int(r[4] or 0)
+                        vanna_b = float(r[5] or 0.0)
+                        charm_b = float(r[6] or 0.0)
+                        dealer_vanna_b = float(r[7] or 0.0)
+                        dealer_charm_b = float(r[8] or 0.0)
+
                         gex_strike_by_bucket.setdefault(bucket, []).append(
                             {
-                                "strike": float(r[0]),
-                                "dealer_charm_exposure": float(r[2] or 0.0),
-                                "dealer_vanna_exposure": float(r[3] or 0.0),
+                                "strike": strike,
+                                "dealer_charm_exposure": dealer_charm_b,
+                                "dealer_vanna_exposure": dealer_vanna_b,
                             }
                         )
+
+                        agg = per_strike.setdefault(
+                            strike,
+                            {
+                                "strike": strike,
+                                "net_gex": 0.0,
+                                "call_oi": 0,
+                                "put_oi": 0,
+                                "vanna_exposure": 0.0,
+                                "charm_exposure": 0.0,
+                                "dealer_vanna_exposure": 0.0,
+                                "dealer_charm_exposure": 0.0,
+                                "expiration_bucket": "monthly",
+                            },
+                        )
+                        agg["net_gex"] += net_gex_b
+                        agg["call_oi"] += call_oi_b
+                        agg["put_oi"] += put_oi_b
+                        agg["vanna_exposure"] += vanna_b
+                        agg["charm_exposure"] += charm_b
+                        agg["dealer_vanna_exposure"] += dealer_vanna_b
+                        agg["dealer_charm_exposure"] += dealer_charm_b
+                        # Preserve the old "COALESCE(MAX(bucket))" semantic:
+                        # pick the alphabetically-greatest bucket label.  The
+                        # field is stored but not consumed downstream; this
+                        # just matches prior behavior for any external reader.
+                        if bucket > agg["expiration_bucket"]:
+                            agg["expiration_bucket"] = bucket
+
+                    gex_strike_rows = sorted(
+                        per_strike.values(), key=lambda row: row["strike"]
+                    )
                     if gex_strike_rows:
                         above_spot = [r for r in gex_strike_rows if r["strike"] >= close_f]
                         if above_spot:

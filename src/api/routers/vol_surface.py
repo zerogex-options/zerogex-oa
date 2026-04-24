@@ -11,8 +11,9 @@ from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
 from datetime import datetime, date, timezone
 from typing import Dict, List, Optional, Any
+from collections import OrderedDict
+import asyncio
 import logging
-import threading
 
 from ..database import DatabaseManager
 
@@ -63,37 +64,38 @@ class VolSurfaceResponse(BaseModel):
 
 # ---------------------------------------------------------------------------
 # Cache (30-second TTL, keyed by query params)
+#
+# FastAPI endpoints are async, so we use asyncio.Lock rather than
+# threading.Lock to avoid blocking the event loop.  OrderedDict gives O(1)
+# FIFO eviction when the size cap is reached (no sort needed).
 # ---------------------------------------------------------------------------
 
-_cache: Dict[tuple, Dict[str, Any]] = {}
-_cache_lock = threading.Lock()
+_cache: "OrderedDict[tuple, Dict[str, Any]]" = OrderedDict()
+_cache_lock = asyncio.Lock()
 _CACHE_TTL = 30  # seconds
 _CACHE_MAX_SIZE = 64  # max number of cached entries
 
 
-def _get_cached(key: tuple) -> Optional[VolSurfaceResponse]:
-    with _cache_lock:
+async def _get_cached(key: tuple) -> Optional[VolSurfaceResponse]:
+    async with _cache_lock:
         entry = _cache.get(key)
         if entry and (datetime.now(timezone.utc) - entry["ts"]).total_seconds() < _CACHE_TTL:
             return entry["data"]
+        if entry is not None:
+            # Stale — drop it so it doesn't linger in the oldest slot.
+            del _cache[key]
     return None
 
 
-def _set_cached(key: tuple, data: VolSurfaceResponse) -> None:
-    with _cache_lock:
-        # Evict expired entries when approaching max size
-        if len(_cache) >= _CACHE_MAX_SIZE:
-            now = datetime.now(timezone.utc)
-            expired = [k for k, v in _cache.items()
-                       if (now - v["ts"]).total_seconds() >= _CACHE_TTL]
-            for k in expired:
-                del _cache[k]
-            # If still over limit after evicting expired, drop oldest entries
-            if len(_cache) >= _CACHE_MAX_SIZE:
-                oldest = sorted(_cache.items(), key=lambda x: x[1]["ts"])
-                for k, _ in oldest[:len(_cache) - _CACHE_MAX_SIZE + 1]:
-                    del _cache[k]
+async def _set_cached(key: tuple, data: VolSurfaceResponse) -> None:
+    async with _cache_lock:
+        # Refresh key position so it counts as newest.
+        if key in _cache:
+            del _cache[key]
         _cache[key] = {"data": data, "ts": datetime.now(timezone.utc)}
+        # Drop oldest entries until under the size cap (O(1) each).
+        while len(_cache) > _CACHE_MAX_SIZE:
+            _cache.popitem(last=False)
 
 # ---------------------------------------------------------------------------
 # Dependency
@@ -193,7 +195,7 @@ async def get_vol_surface(
     """Return the implied-volatility surface, ATM term structure, and 25-delta skew."""
 
     cache_key = (symbol.upper(), dte_max, strike_count)
-    cached = _get_cached(cache_key)
+    cached = await _get_cached(cache_key)
     if cached is not None:
         return cached
 
@@ -278,5 +280,5 @@ async def get_vol_surface(
         skew_25d=skew_25d,
     )
 
-    _set_cached(cache_key, response)
+    await _set_cached(cache_key, response)
     return response

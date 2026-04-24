@@ -183,6 +183,11 @@ class OptionStreamAccumulator:
                     pass
         if self._thread is not None:
             self._thread.join(timeout=10)
+            if self._thread.is_alive():
+                logger.warning(
+                    "Option stream reader thread did not exit within 10s after stop(); "
+                    "abandoning reference (thread will continue consuming memory until it unblocks)"
+                )
             self._thread = None
 
     @property
@@ -451,6 +456,11 @@ class UnderlyingBarAccumulator:
                     pass
         if self._thread is not None:
             self._thread.join(timeout=10)
+            if self._thread.is_alive():
+                logger.warning(
+                    "Underlying bar stream reader thread did not exit within 10s after stop(); "
+                    "abandoning reference (thread will continue consuming memory until it unblocks)"
+                )
             self._thread = None
 
     @property
