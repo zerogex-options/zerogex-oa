@@ -295,6 +295,14 @@ VOL_AUTO_TUNE_MIN_SAMPLES = max(
 SIGNALS_UNDERLYINGS = os.getenv("SIGNALS_UNDERLYINGS", "SPY")
 SIGNALS_INTERVAL = max(1, int(os.getenv("SIGNALS_INTERVAL", "1")))
 SIGNALS_PORTFOLIO_SIZE = float(os.getenv("SIGNALS_PORTFOLIO_SIZE", "1000000"))
+
+# GEX normalization scale used to map net_gex into [-1, 1] for multiple
+# signal components (vol_expansion, strategy_builder, position optimizer).
+# Previously hard-coded as 300_000_000.0 in three places.  Override via
+# env var if your universe's typical GEX magnitude differs.
+SIGNAL_GEX_NORMALIZATION = _getenv_float(
+    "SIGNAL_GEX_NORMALIZATION", 300_000_000.0, min=1.0
+)
 POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS = (
     os.getenv("POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS", "false").lower() == "true"
 )

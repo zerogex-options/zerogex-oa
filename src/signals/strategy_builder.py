@@ -13,6 +13,8 @@ from datetime import datetime
 import math
 from typing import Optional
 
+from src.config import SIGNAL_GEX_NORMALIZATION
+
 
 @dataclass(frozen=True)
 class StrategyDecision:
@@ -37,7 +39,7 @@ class StrategyBuilder:
     @staticmethod
     def _vol_expansion_readiness(net_gex: float) -> float:
         # Mirrors VolExpansionComponent._gex_readiness in lightweight form.
-        normalized = max(-1.0, min(1.0, -float(net_gex or 0.0) / 300_000_000.0))
+        normalized = max(-1.0, min(1.0, -float(net_gex or 0.0) / SIGNAL_GEX_NORMALIZATION))
         return 0.15 + (1.0 - 0.15) * ((normalized + 1.0) / 2.0)
 
     @staticmethod

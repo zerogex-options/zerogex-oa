@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 
+from src.config import SIGNAL_GEX_NORMALIZATION
 from src.signals.components.base import MarketContext
 from src.signals.components.utils import (
     pct_change_n_bar,
@@ -12,7 +13,7 @@ from src.signals.components.utils import (
 from src.signals.advanced.base import AdvancedSignalResult
 
 _DIRECTION_Z_NORM = 1.0
-_GEX_NORM = 300_000_000
+_GEX_NORM = SIGNAL_GEX_NORMALIZATION
 _GEX_FLOOR = 0.15
 
 

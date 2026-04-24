@@ -11,7 +11,7 @@ from typing import Optional
 import pytz
 
 from src.database import db_connection
-from src.config import SIGNALS_PORTFOLIO_SIZE
+from src.config import SIGNAL_GEX_NORMALIZATION, SIGNALS_PORTFOLIO_SIZE
 from src.signals.execution import leg_fill_price_from_row
 from src.signals.strategy_builder import StrategyBuilder
 from src.symbols import get_canonical_symbol
@@ -788,7 +788,7 @@ class PositionOptimizerEngine:
             net_delta = (call_leg["delta"] + put_leg["delta"]) * 100.0
             net_gamma = (call_leg["gamma"] + put_leg["gamma"]) * 100.0
             net_theta = (call_leg["theta"] + put_leg["theta"]) * 100.0
-            base_pop = self._clamp(0.40 + self._clamp(abs(ctx.net_gex) / 300_000_000.0, 0.0, 1.0) * 0.25, 0.2, 0.8)
+            base_pop = self._clamp(0.40 + self._clamp(abs(ctx.net_gex) / SIGNAL_GEX_NORMALIZATION, 0.0, 1.0) * 0.25, 0.2, 0.8)
             strikes_label = f"Long {call_leg['strike']:.0f}C + {put_leg['strike']:.0f}P"
             width = abs(call_leg["strike"] - put_leg["strike"])
             legs_payload = [
@@ -805,7 +805,7 @@ class PositionOptimizerEngine:
             net_delta = (call_leg["delta"] + put_leg["delta"]) * 100.0
             net_gamma = (call_leg["gamma"] + put_leg["gamma"]) * 100.0
             net_theta = (call_leg["theta"] + put_leg["theta"]) * 100.0
-            base_pop = self._clamp(0.35 + self._clamp(abs(ctx.net_gex) / 300_000_000.0, 0.0, 1.0) * 0.30, 0.2, 0.8)
+            base_pop = self._clamp(0.35 + self._clamp(abs(ctx.net_gex) / SIGNAL_GEX_NORMALIZATION, 0.0, 1.0) * 0.30, 0.2, 0.8)
             strikes_label = f"Long {put_leg['strike']:.0f}P + {call_leg['strike']:.0f}C"
             width = abs(call_leg["strike"] - put_leg["strike"])
             legs_payload = [
