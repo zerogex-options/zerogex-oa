@@ -2272,6 +2272,44 @@ api-install-service: ## Install API as systemd service
 	@echo "$(GREEN)✅ API service installed$(NC)"
 	@echo "$(YELLOW)Start with: make api-start$(NC)"
 
+.PHONY: api-rotate-key
+api-rotate-key: ## Rotate API_KEY in .env and re-sync nginx include (idempotent)
+	@echo "$(BLUE)=== Rotating API_KEY ===$(NC)"
+	@test -f .env || (echo "$(RED)✗ .env not found$(NC)" && exit 1)
+	@NEW_KEY=$$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))'); \
+	if grep -qE '^API_KEY=' .env; then \
+		sed -i "s|^API_KEY=.*|API_KEY=$$NEW_KEY|" .env; \
+	else \
+		printf 'API_KEY=%s\n' "$$NEW_KEY" >> .env; \
+	fi; \
+	chmod 600 .env; \
+	echo "$(GREEN)✓ New key written to .env$(NC)"
+	@echo "$(YELLOW)→ Re-running deploy/steps/125.api_auth to sync nginx + restart API...$(NC)"
+	@bash deploy/steps/125.api_auth
+	@echo "$(GREEN)✅ Rotation complete$(NC)"
+
+.PHONY: api-show-key
+api-show-key: ## Print the current API_KEY from .env (for debugging nginx mismatch)
+	@test -f .env || (echo "$(RED)✗ .env not found$(NC)" && exit 1)
+	@KEY=$$(grep -E '^API_KEY=' .env | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'"); \
+	if [ -z "$$KEY" ]; then \
+		echo "$(YELLOW)⚠ API_KEY is empty — auth is disabled$(NC)"; \
+	else \
+		echo "API_KEY length: $${#KEY}"; \
+		echo "First 8 chars:  $${KEY:0:8}..."; \
+		echo "Last 4 chars:   ...$${KEY: -4}"; \
+	fi
+	@NGINX_FILE=/etc/nginx/conf.d/zerogex-api-key.conf; \
+	if sudo test -f $$NGINX_FILE; then \
+		NGINX_KEY=$$(sudo grep -oE '"[^"]+"' $$NGINX_FILE | tr -d '"'); \
+		echo "nginx file:     $$NGINX_FILE"; \
+		echo "nginx key len:  $${#NGINX_KEY}"; \
+		echo "nginx first 8:  $${NGINX_KEY:0:8}..."; \
+		echo "nginx last 4:   ...$${NGINX_KEY: -4}"; \
+	else \
+		echo "$(YELLOW)⚠ $$NGINX_FILE not present (step 125 hasn't run)$(NC)"; \
+	fi
+
 .PHONY: db-maintain-install
 db-maintain-install: ## Install daily DB maintenance timer (prune old data + vacuum)
 	@echo "$(BLUE)=== Installing DB Maintenance Timer ===$(NC)"
