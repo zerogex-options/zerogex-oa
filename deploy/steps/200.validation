@@ -240,25 +240,83 @@ for config_file in "${CONFIG_FILES[@]}"; do
 done
 log ""
 
-# Section 9: API Health Check
+# Section 9: API Health Check & Auth
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-log "9. API Health Check"
+log "9. API Health Check & Authentication"
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
+# Pull the API key from .env so we can exercise the auth path.
+API_KEY_VAL=$(grep -E '^API_KEY=' "$APP_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs || echo "")
+ENVIRONMENT_VAL=$(grep -E '^ENVIRONMENT=' "$APP_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs || echo "")
+
+# 9a: direct health — should succeed with the key (or without if auth disabled).
 TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
-if curl -s -f http://localhost:8000/api/health > /dev/null 2>&1; then
-    log "  ✓ API health endpoint accessible"
-    PASSED_CHECKS=$((PASSED_CHECKS + 1))
-
-    # Show API response
-    log ""
-    log "  API Health Response:"
-    curl -s http://localhost:8000/api/health | python3 -m json.tool 2>/dev/null | head -20 || log "     (could not parse JSON)"
-    log ""
+if [ -n "$API_KEY_VAL" ]; then
+    DIRECT_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "X-API-Key: $API_KEY_VAL" http://localhost:8000/api/health)
 else
-    log "  ✗ API health endpoint not accessible"
-    log "     API may not be running or still starting"
+    DIRECT_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/api/health)
+fi
+if [ "$DIRECT_CODE" = "200" ]; then
+    log "  ✓ API health endpoint accessible (direct, with key if configured)"
+    PASSED_CHECKS=$((PASSED_CHECKS + 1))
+else
+    log "  ✗ API direct health returned $DIRECT_CODE (expected 200)"
+    log "     API may not be running, still starting, or API_KEY mismatch"
     FAILED_CHECKS=$((FAILED_CHECKS + 1))
+fi
+
+# 9b: if auth is configured, a keyless request MUST be rejected with 401.
+if [ -n "$API_KEY_VAL" ]; then
+    TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+    NOAUTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/api/health)
+    if [ "$NOAUTH_CODE" = "401" ]; then
+        log "  ✓ API rejects keyless requests (401)"
+        PASSED_CHECKS=$((PASSED_CHECKS + 1))
+    else
+        log "  ✗ API accepted keyless request with code $NOAUTH_CODE (expected 401)"
+        log "     API_KEY may not be picked up by the running process"
+        FAILED_CHECKS=$((FAILED_CHECKS + 1))
+    fi
+
+    # 9c: nginx should inject the key on its upstream request.
+    # Only meaningful if nginx is installed and resolvable on localhost.
+    if command -v nginx >/dev/null 2>&1; then
+        TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+        # Use --resolve to hit nginx locally without depending on public DNS.
+        DOMAIN="${OA_API_DOMAIN:-api.zerogex.io}"
+        NGINX_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
+            --resolve "$DOMAIN:443:127.0.0.1" \
+            "https://$DOMAIN/api/health" 2>/dev/null || echo "000")
+        if [ "$NGINX_CODE" = "200" ]; then
+            log "  ✓ nginx injects X-API-Key on upstream (HTTPS returns 200)"
+            PASSED_CHECKS=$((PASSED_CHECKS + 1))
+        elif [ "$NGINX_CODE" = "000" ]; then
+            log "  ⚠ Could not reach nginx for $DOMAIN (cert or SSL step may not have run)"
+            WARNING_CHECKS=$((WARNING_CHECKS + 1))
+        else
+            log "  ✗ nginx-proxied /api/health returned $NGINX_CODE (expected 200)"
+            log "     Check /etc/nginx/conf.d/zerogex-api-key.conf and include directive in site config"
+            FAILED_CHECKS=$((FAILED_CHECKS + 1))
+        fi
+    fi
+else
+    TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+    if [ "$ENVIRONMENT_VAL" = "production" ]; then
+        log "  ✗ API_KEY is empty but ENVIRONMENT=production — auth is disabled in prod!"
+        FAILED_CHECKS=$((FAILED_CHECKS + 1))
+    else
+        log "  ⚠ API auth disabled (API_KEY empty, ENVIRONMENT=$ENVIRONMENT_VAL)"
+        WARNING_CHECKS=$((WARNING_CHECKS + 1))
+    fi
+fi
+
+# Show API response for operator visibility.
+log ""
+log "  API Health Response:"
+if [ -n "$API_KEY_VAL" ]; then
+    curl -s -H "X-API-Key: $API_KEY_VAL" http://localhost:8000/api/health | python3 -m json.tool 2>/dev/null | head -20 || log "     (could not parse JSON)"
+else
+    curl -s http://localhost:8000/api/health | python3 -m json.tool 2>/dev/null | head -20 || log "     (could not parse JSON)"
 fi
 log ""
 

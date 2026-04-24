@@ -104,6 +104,12 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
 
+        # Optional include: populated by deploy/steps/125.api_auth with
+        # ``proxy_set_header X-API-Key "...";`` so nginx can authenticate
+        # on behalf of the frontend on this host.  Wildcard suffix means
+        # nginx silently skips this if the file doesn't exist yet.
+        include /etc/nginx/conf.d/zerogex-api-key.conf*;
+
         proxy_connect_timeout 15s;
         proxy_send_timeout 60s;
         proxy_read_timeout 60s;
