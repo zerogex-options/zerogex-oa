@@ -186,9 +186,9 @@ analytics-snapshot-diagnose: ## Diagnose slow _get_snapshot: runs EXPLAIN ANALYZ
 		"SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'option_chains' ORDER BY indexname;" \
 		"\\echo [5/7] Index usage stats (zero reads = unused / planner not picking it)" \
 		"SELECT indexrelname, idx_scan, idx_tup_read, pg_size_pretty(pg_relation_size(indexrelid)) AS size FROM pg_stat_user_indexes WHERE relname = 'option_chains' ORDER BY idx_scan DESC;" \
-		"\\echo [6/7] EXPLAIN: step 1 of new 3-query path — latest timestamp" \
+		"\\echo [6/7] EXPLAIN: step 1 of new 3-query path (latest timestamp)" \
 		"EXPLAIN (ANALYZE, BUFFERS) SELECT timestamp FROM option_chains WHERE underlying = '$$UNDERLYING' ORDER BY timestamp DESC LIMIT 1;" \
-		"\\echo [7/7] EXPLAIN: step 3 of new path — DISTINCT ON with literal timestamps via \\\\gset" \
+		"\\echo [7/7] EXPLAIN: step 3 of new path (latest-per-contract with literal timestamps)" \
 		"SELECT timestamp AS ts FROM option_chains WHERE underlying = '$$UNDERLYING' ORDER BY timestamp DESC LIMIT 1 \\gset" \
 		"\\echo Using latest ts = :ts  lookback_minutes = $$LOOKBACK" \
 		"EXPLAIN (ANALYZE, BUFFERS) SELECT DISTINCT ON (oc.option_symbol) oc.option_symbol, oc.strike, oc.expiration, oc.timestamp FROM option_chains oc WHERE oc.underlying = '$$UNDERLYING' AND oc.timestamp <= :'ts'::timestamptz AND oc.timestamp >= :'ts'::timestamptz - ($$LOOKBACK * INTERVAL '1 minute') AND oc.gamma IS NOT NULL ORDER BY oc.option_symbol, oc.timestamp DESC LIMIT 2000;" \
