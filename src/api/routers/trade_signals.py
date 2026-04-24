@@ -687,6 +687,87 @@ async def get_gamma_vwap_confluence_signal(
     return row
 
 
+@router.get("/advanced/range-break-imminence")
+async def get_range_break_imminence_signal(
+    symbol: str = Query(default="SPY"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Range-break imminence — regime-switch detector between chop and breakout.
+
+    Fuses four orthogonal inputs into a 0–100 imminence score so the
+    dashboard can flip between *fade the range* and *follow the break*
+    without the operator reading four panels at once. Standalone detector,
+    not part of the MSI composite.
+
+    **Logic highlights** (`src/signals/advanced/range_break_imminence.py`):
+    - Skew extreme (30%): OTM-put vs OTM-call IV deviation vs baseline.
+    - Dealer delta pressure (25%): signed dealer net delta (explicit or
+      rolled up from `gex_by_strike` delta-OI columns).
+    - Trap detection (25%): price pinned within ¼ of a 20-bar range
+      extreme while flow accelerates *against* that extreme's fade.
+    - Volatility compression (20%): 10-bar / 60-bar realized sigma ratio.
+    - Directional bias = weighted avg of the three directional inputs;
+      compression is directionless (adds magnitude only).
+    - Imminence = weighted sum of absolute sub-scores; `score` = signed
+      direction × (imminence / 100).
+    - **Triggered when `imminence ≥ 65` (entering the Break Watch band).**
+
+    **Params:** `symbol` (default `SPY`). Returns 404 when no data exists.
+
+    **Returns:**
+    ```json
+    {
+      "score": -62.0, "clamped_score": -0.62, "direction": "bearish",
+      "triggered": true,
+      "signal": "bearish_break_imminent",
+      "imminence": 72.4,
+      "label": "Break Watch",
+      "playbook": "Stop blindly fading lows. Only fade after failed breakouts/reclaims; start preparing continuation entries.",
+      "bias": -0.58,
+      "context_values": {"...skew, dealer, trap, compression, weights..."},
+      "score_history": [{"score": -62.0, "timestamp": "..."}, "...up to 90"]
+    }
+    ```
+
+    - `score` — [-100, +100]; sign = break direction, magnitude = imminence.
+    - `signal` — `"range_fade"` | `"bearish_break_imminent"` |
+      `"bullish_break_imminent"` | `"break_watch_neutral"`.
+    - `imminence` — [0, 100]; composite break risk magnitude.
+    - `label` — `"Range Fade"` (0–39) | `"Weak Range"` (40–64) |
+      `"Break Watch"` (65–79) | `"Breakout Mode"` (80–100).
+    - `playbook` — trader-facing guidance string matching the label.
+    - `triggered` — `true` when `imminence ≥ 65`.
+
+    **Trader interpretation:**
+    - `label == "Range Fade"` → fade extremes normally.
+    - `label == "Weak Range"` → still fade, but smaller size / faster targets.
+    - `label == "Break Watch"` → stop blindly fading; prepare retest trades.
+    - `label == "Breakout Mode"` + direction set → trade the retest of the
+      broken level rather than fading back into the range.
+
+    **Page design.** Half-circle gauge (0–100) colored by direction with the
+    label badge below. Four-bar stack chart of sub-score contributions
+    (skew / dealer / trap / compression). Playbook text under the gauge.
+    Flip the card's accent color between "fade" (neutral) and "follow"
+    (break) colors at the 65-imminence threshold.
+    """
+    row = await db.get_advanced_signal(symbol.upper(), "range_break_imminence")
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No range-break-imminence signal found for {symbol.upper()}",
+        )
+    ctx = row.get("context_values") or {}
+    row["score_history"] = row.get("score_history") or []
+    row["triggered"] = ctx.get("triggered", False)
+    row["signal"] = ctx.get("signal", "range_fade")
+    row["imminence"] = ctx.get("imminence")
+    row["label"] = ctx.get("label")
+    row["playbook"] = ctx.get("playbook")
+    row["bias"] = ctx.get("bias")
+    return row
+
+
 _BASIC_SIGNAL_NAMES: tuple[str, ...] = (
     "tape_flow_bias",
     "skew_delta",
@@ -1289,6 +1370,7 @@ _VALID_SIGNAL_EVENT_NAMES = {
     "trap_detection",
     "zero_dte_position_imbalance",
     "gamma_vwap_confluence",
+    "range_break_imminence",
     # Basic Signals
     *_BASIC_SIGNAL_NAMES,
 }
@@ -1310,7 +1392,8 @@ async def get_signal_events(
     **Params:**
     - `signal_name` — one of: `vol_expansion`, `eod_pressure`, `squeeze_setup`,
       `trap_detection`, `zero_dte_position_imbalance`, `gamma_vwap_confluence`,
-      `positioning_trap`, `vanna_charm_flow`. Returns 400 for unknown names.
+      `range_break_imminence`, `positioning_trap`, `vanna_charm_flow`.
+      Returns 400 for unknown names.
     - `symbol` (default `SPY`).
     - `limit` — 1–1000, default 100.
     - `horizon` — `"30m"` | `"60m"` | `"120m"` (default `"60m"`); forward window for realized return.
@@ -1401,6 +1484,7 @@ _ADVANCED_SIGNAL_NAMES: tuple[str, ...] = (
     "trap_detection",
     "zero_dte_position_imbalance",
     "gamma_vwap_confluence",
+    "range_break_imminence",
 )
 
 
@@ -1432,15 +1516,16 @@ async def get_advanced_confluence_matrix(
     lookback: int = Query(default=120, ge=10, le=2000),
     db: DatabaseManager = Depends(get_db),
 ):
-    """6×6 advanced-signal agreement matrix — pairwise directional confluence over a rolling window.
+    """N×N advanced-signal agreement matrix — pairwise directional confluence over a rolling window.
 
     Shows how often each pair of Advanced Signals points the same direction over the
     last N snapshots. Useful for spotting persistent divergences and unusual
-    breakdowns in normally-correlated signals.
+    breakdowns in normally-correlated signals. Matrix size follows
+    `_ADVANCED_SIGNAL_NAMES`.
 
     **Logic** (`src/api/database.py`): Joins `signal_scores` and
     `signal_component_scores` for the last `lookback` timestamps, filtering to
-    the six Advanced Signals persisted by `AdvancedSignalEngine`. Signs are
+    the Advanced Signals persisted by `AdvancedSignalEngine`. Signs are
     bucketed with `neutral_epsilon = 0.02` (±0.02 counts as neutral).
     Agreement = same non-zero sign; disagreement = opposite non-zero signs.
 
@@ -1448,8 +1533,9 @@ async def get_advanced_confluence_matrix(
     - `symbol` (default `SPY`).
     - `lookback` — 10–2000, default 120.
 
-    **Signals (6, fixed order):** `vol_expansion`, `eod_pressure`, `squeeze_setup`,
-    `trap_detection`, `zero_dte_position_imbalance`, `gamma_vwap_confluence`.
+    **Signals (fixed order):** `vol_expansion`, `eod_pressure`, `squeeze_setup`,
+    `trap_detection`, `zero_dte_position_imbalance`, `gamma_vwap_confluence`,
+    `range_break_imminence`.
 
     **Returns:**
     ```json
@@ -1485,8 +1571,9 @@ async def get_advanced_confluence_matrix(
     - `net_confluence > 0.5` — signals that routinely agree; unexpected divergence is a flag.
     - `net_confluence < -0.3` — persistent disagreement pairs; useful early-warning divergences.
 
-    **Page design.** 6×6 heatmap. Color = `net_confluence` (green +1 → red -1, white neutral).
-    Cell tooltip: agreement_ratio / disagreement_ratio / observations. Sort rows by average
+    **Page design.** N×N heatmap sized to `_ADVANCED_SIGNAL_NAMES`. Color =
+    `net_confluence` (green +1 → red -1, white neutral). Cell tooltip:
+    agreement_ratio / disagreement_ratio / observations. Sort rows by average
     agreement to surface consensus signals at top, outliers at bottom.
     """
     return await _confluence_matrix_response(

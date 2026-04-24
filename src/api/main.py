@@ -118,6 +118,13 @@ app = FastAPI(
     openapi_url="/openapi.json",
     lifespan=lifespan,
     dependencies=[Depends(api_key_auth)],
+    # Alphabetize endpoints within each tag in the Swagger UI. Operations
+    # (HTTP methods) are also sorted so per-path groups render in a stable
+    # order. `tagsSorter` keeps the tag list itself alphabetical.
+    swagger_ui_parameters={
+        "operationsSorter": "alpha",
+        "tagsSorter": "alpha",
+    },
     openapi_tags=[
         {"name": "Health", "description": "API and database health checks"},
         {"name": "GEX", "description": "Gamma Exposure (GEX) analytics"},
@@ -127,10 +134,10 @@ app = FastAPI(
         {"name": "Technicals", "description": "Intraday technical signals: VWAP, ORB, dealer hedging, volume, momentum"},
         {"name": "Trade Signals", "description": (
             "Options-structure signal engine: composite Market State Index (MSI) gauge, "
-            "six advanced signal components (vol-expansion, eod-pressure, squeeze-setup, "
-            "trap-detection, 0dte-position-imbalance, gamma-vwap-confluence), "
-            "per-component event history with realized returns, "
-            "a 16×16 pairwise confluence matrix, and live/historical trade records. "
+            "advanced signal components (vol-expansion, eod-pressure, squeeze-setup, "
+            "trap-detection, 0dte-position-imbalance, gamma-vwap-confluence, "
+            "range-break-imminence), per-component event history with realized returns, "
+            "a pairwise confluence matrix, and live/historical trade records. "
             "Default symbol is SPY; pass ?symbol= or ?underlying= to override."
         )},
     ]

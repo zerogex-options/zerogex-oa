@@ -135,6 +135,10 @@ class PortfolioEngine:
             "bullish": "bullish",
             "bearish": "bearish",
         },
+        "range_break_imminence": {
+            "bullish_break_imminent": "bullish",
+            "bearish_break_imminent": "bearish",
+        },
     }
 
     _ADVANCED_MIN_ABS_SCORE = 0.25
