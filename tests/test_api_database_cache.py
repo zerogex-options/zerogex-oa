@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from src.api import database as database_module
@@ -55,8 +56,12 @@ def test_get_latest_quote_uses_short_ttl_cache():
 
 
 def test_get_latest_gex_summary_cache_expires():
+    # TTL-expiration used to sleep 20ms between calls, which flaked on
+    # slow CI boxes. Patch time_module.monotonic instead: the first call
+    # sees "now"=0 and stores an entry expiring at 0 + ttl; the second
+    # call sees "now" well past the expiry and forces a refetch.
     db = DatabaseManager()
-    db._latest_gex_summary_cache_ttl_seconds = 0.01
+    db._latest_gex_summary_cache_ttl_seconds = 1.0
     conn = _FakeConn({"symbol": "SPY", "net_gex": 123.0})
 
     @asynccontextmanager
@@ -65,12 +70,12 @@ def test_get_latest_gex_summary_cache_expires():
 
     db._acquire_connection = _acquire  # type: ignore[method-assign]
 
-    first = asyncio.run(db.get_latest_gex_summary("SPY"))
-    assert first is not None
-
-    # Allow the cache entry to expire.
-    asyncio.run(asyncio.sleep(0.02))
-    second = asyncio.run(db.get_latest_gex_summary("SPY"))
+    fake_time = [0.0]
+    with patch.object(database_module.time_module, "monotonic", lambda: fake_time[0]):
+        first = asyncio.run(db.get_latest_gex_summary("SPY"))
+        assert first is not None
+        fake_time[0] = 100.0  # well past the 1s TTL
+        second = asyncio.run(db.get_latest_gex_summary("SPY"))
 
     assert second == first
     assert conn.calls == 2
@@ -143,8 +148,10 @@ def test_get_flow_uses_cache():
 
 
 def test_get_flow_cache_expires():
+    # See test_get_latest_gex_summary_cache_expires for why we patch
+    # time_module.monotonic rather than sleeping.
     db = DatabaseManager()
-    db._flow_endpoint_cache_ttl_seconds = 0.01
+    db._flow_endpoint_cache_ttl_seconds = 1.0
     conn = _FakeFlowConn(
         [
             {
@@ -163,11 +170,12 @@ def test_get_flow_cache_expires():
 
     db._acquire_connection = _acquire  # type: ignore[method-assign]
 
-    first = asyncio.run(db.get_flow("SPY", "current"))
-    assert first
-
-    asyncio.run(asyncio.sleep(0.02))
-    second = asyncio.run(db.get_flow("SPY", "current"))
+    fake_time = [0.0]
+    with patch.object(database_module.time_module, "monotonic", lambda: fake_time[0]):
+        first = asyncio.run(db.get_flow("SPY", "current"))
+        assert first
+        fake_time[0] = 100.0
+        second = asyncio.run(db.get_flow("SPY", "current"))
 
     assert second == first
     assert conn.calls == 2
