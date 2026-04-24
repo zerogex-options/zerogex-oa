@@ -50,6 +50,9 @@ class UnifiedSignalEngine:
         self.portfolio_engine = PortfolioEngine(self.underlying)
         self.advanced_signal_engine = AdvancedSignalEngine()
         self.basic_signal_engine = BasicSignalEngine()
+        # Per-signal hysteresis/dedupe state, keyed by advanced signal name.
+        # Initialized eagerly so helper methods can assume the dict exists.
+        self._advanced_state: dict[str, dict] = {}
         self._iv_rank_enabled = os.getenv("SIGNAL_IV_RANK_ENABLED", "false").lower() == "true"
         if not self._iv_rank_enabled:
             logger.info(
@@ -800,9 +803,6 @@ class UnifiedSignalEngine:
         results = self.advanced_signal_engine.evaluate(market_context)
         if not results:
             return []
-
-        if not hasattr(self, "_advanced_state"):
-            self._advanced_state: dict[str, dict] = {}
 
         with db_connection() as conn:
             with conn.cursor() as cur:

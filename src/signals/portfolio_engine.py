@@ -611,6 +611,12 @@ class PortfolioEngine:
     def reconcile(self, target: PortfolioTarget, conn=None) -> str:
         """Compare target portfolio to actual holdings and execute the delta.
 
+        All writes (close/open/mark/snapshot) are issued without intermediate
+        commits so the entire reconciliation is atomic.  When this function
+        opens its own connection, ``db_connection()`` commits once on success
+        and rolls back on exception.  When a caller supplies ``conn``, the
+        caller owns the transaction boundary.
+
         Returns an action string for logging.
         """
         with self._use_conn(conn) as c:
@@ -837,7 +843,7 @@ class PortfolioEngine:
             # Keep the in-memory dict in sync for callers that iterate over
             # the same trade list after a partial close.
             trade["quantity_open"] = open_qty - close_qty
-        conn.commit()
+        # Commit is deferred to reconcile() so the entire cycle is atomic.
         return realized_pnl
 
     # ------------------------------------------------------------------
@@ -884,7 +890,7 @@ class PortfolioEngine:
                 json.dumps(components_at_entry, default=str),
             ),
         )
-        conn.commit()
+        # Commit is deferred to reconcile() so the entire cycle is atomic.
         return cur.rowcount > 0
 
     # ------------------------------------------------------------------
@@ -919,7 +925,7 @@ class PortfolioEngine:
             """,
             (mark, round(unrealized, 4), round(total, 4), round(pnl_pct, 4), trade["id"]),
         )
-        conn.commit()
+        # Commit is deferred to reconcile() so the entire cycle is atomic.
 
     # ------------------------------------------------------------------
     # snapshot — written every cycle regardless of action
@@ -991,7 +997,7 @@ class PortfolioEngine:
                 json.dumps(action_detail, default=str),
             ),
         )
-        conn.commit()
+        # Commit is deferred to reconcile() so the entire cycle is atomic.
 
     # ------------------------------------------------------------------
     # Internal helpers (ported from UnifiedSignalEngine)

@@ -651,9 +651,15 @@ class PositionOptimizerEngine:
         for profile, heat_pct in RISK_PROFILE_BUDGETS.items():
             budget = ASSUMED_ACCOUNT_EQUITY * heat_pct
             kelly_adjusted_budget = max(budget * max(candidate.kelly_fraction, 0.10), min(budget, effective_risk))
-            contracts = max(1, int(kelly_adjusted_budget // effective_risk)) if candidate.expected_value > 0 else 0
+            # Floor at 0 so a trade whose per-contract risk exceeds the profile
+            # budget returns 0 contracts (no position) rather than being
+            # force-sized to 1 and blowing the heat cap.  Callers treat
+            # ``contracts == 0`` as "reject this candidate".
+            contracts = max(0, int(kelly_adjusted_budget // effective_risk)) if candidate.expected_value > 0 else 0
             constrained_by = "edge filter" if candidate.expected_value <= 0 else (
-                "kelly fraction" if kelly_adjusted_budget < budget else "portfolio heat cap"
+                "kelly fraction" if kelly_adjusted_budget < budget else (
+                    "budget too small" if contracts == 0 else "portfolio heat cap"
+                )
             )
             sizing.append(
                 SizingProfile(
