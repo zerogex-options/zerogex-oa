@@ -1536,8 +1536,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             expiration,
                             raw_volume,
                             net_volume,
-                            net_premium,
-                            underlying_price
+                            net_premium
                         FROM flow_by_contract
                         WHERE symbol = $1
                           AND timestamp >= $2
@@ -1553,8 +1552,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             expiration,
                             (raw_volume  - COALESCE(LAG(raw_volume)  OVER w, 0))::bigint  AS raw_volume_delta,
                             (net_volume  - COALESCE(LAG(net_volume)  OVER w, 0))::bigint  AS net_volume_delta,
-                            (net_premium - COALESCE(LAG(net_premium) OVER w, 0))::numeric AS net_premium_delta,
-                            underlying_price
+                            (net_premium - COALESCE(LAG(net_premium) OVER w, 0))::numeric AS net_premium_delta
                         FROM filtered
                         WINDOW w AS (PARTITION BY option_type, strike, expiration ORDER BY bar_start)
                     ),
@@ -1569,10 +1567,31 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             SUM(raw_volume_delta)::bigint                                             AS raw_volume_delta,
                             SUM(CASE WHEN option_type='C' THEN net_volume_delta  ELSE 0 END)::bigint  AS call_position_delta,
                             SUM(CASE WHEN option_type='P' THEN net_volume_delta  ELSE 0 END)::bigint  AS put_position_delta,
-                            (ARRAY_AGG(underlying_price) FILTER (WHERE underlying_price IS NOT NULL))[1] AS underlying_price,
                             COUNT(*)::int AS contract_count
                         FROM contract_deltas
                         GROUP BY bar_start
+                    ),
+                    -- Underlying price comes from the tape (underlying_quotes
+                    -- OHLC), NOT from flow_by_contract.underlying_price. The
+                    -- per-contract column captures each contract's last-trade
+                    -- price, which is stale for contracts that didn't trade
+                    -- in a given bar — aggregating it produces the stair-step
+                    -- artifact where the price sticks for 20–30 minutes and
+                    -- then jumps. Critically, this subquery does NOT see the
+                    -- strike/expiration filters, so underlying_price stays
+                    -- invariant across different filter combinations for the
+                    -- same (symbol, bar_start).
+                    underlying_by_bar AS (
+                        SELECT
+                            (date_trunc('hour', timestamp)
+                             + FLOOR(EXTRACT(MINUTE FROM timestamp)::int / 5)
+                               * INTERVAL '5 minutes') AS bar_start,
+                            (ARRAY_AGG(close ORDER BY timestamp DESC))[1] AS underlying_price
+                        FROM underlying_quotes
+                        WHERE symbol = $1
+                          AND timestamp >= $2
+                          AND timestamp <  $3::timestamptz + INTERVAL '5 minutes'
+                        GROUP BY 1
                     ),
                     timeline AS (
                         -- Gate the timeline on filtered having rows. An empty
@@ -1593,11 +1612,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             COALESCE(pb.raw_volume_delta, 0)   AS raw_volume_delta,
                             COALESCE(pb.call_position_delta, 0) AS call_position_delta,
                             COALESCE(pb.put_position_delta, 0)  AS put_position_delta,
-                            pb.underlying_price,
+                            ub.underlying_price,
                             COALESCE(pb.contract_count, 0) AS contract_count,
                             (pb.bar_start IS NULL) AS is_synthetic
                         FROM timeline t
-                        LEFT JOIN per_bar pb USING (bar_start)
+                        LEFT JOIN per_bar           pb USING (bar_start)
+                        LEFT JOIN underlying_by_bar ub USING (bar_start)
                     ),
                     carry AS (
                         -- FIRST_VALUE + partition-by-running-count emulates

@@ -606,3 +606,91 @@ def test_http_contracts_unknown_symbol_returns_404(monkeypatch: pytest.MonkeyPat
         response = client.get("/api/flow/contracts?symbol=NOPE")
 
     assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# SQL-shape regression: underlying_price must come from the tape, not the
+# per-contract flow_by_contract.underlying_price column, and must be
+# invariant under strike/expiration filters.
+# ---------------------------------------------------------------------------
+
+def test_series_sql_pulls_underlying_from_tape_not_per_contract_column():
+    """Observed in prod: 20–30 minutes of flat underlying_price followed by
+    a sudden jump, because the SQL was aggregating
+    flow_by_contract.underlying_price (per-contract last-trade price). The
+    fix pulls the bar's underlying from underlying_quotes (the tape). This
+    test pins the SQL shape so a future refactor can't silently regress."""
+    conn = _CannedConn(
+        fetchval_sequence=_mock_session_resolution_rows(),
+        fetch_rows=[],
+    )
+    db = _make_db(conn)
+    db._flow_endpoint_cache_ttl_seconds = 0.0
+
+    asyncio.run(db.get_flow_series(symbol="SPY", session="current"))
+
+    assert conn.fetch_calls, "main query should have run"
+    main_query = conn.fetch_calls[0][0]
+    # The tape source is joined in.
+    assert "underlying_quotes" in main_query
+    # Neither the per-contract CTE nor the per-bar aggregate may carry the
+    # flow_by_contract.underlying_price column — that was the bug.
+    # "ARRAY_AGG(underlying_price" was the stair-step aggregation; it
+    # must not appear.
+    assert "ARRAY_AGG(underlying_price" not in main_query
+    # Per-bar CTE pulls underlying_price from the tape join, not from
+    # flow_by_contract.
+    assert "pb.underlying_price" not in main_query
+    assert "ub.underlying_price" in main_query
+
+
+def test_series_sql_underlying_cte_ignores_strike_expiration_filters():
+    """Filter invariance: underlying_price is a property of the tape, not of
+    the filtered options. The underlying_by_bar CTE must read purely from
+    underlying_quotes without applying the strikes/expirations filters, so
+    two requests for the same (symbol, bar_start) with different filters
+    return identical underlying values."""
+    conn = _CannedConn(
+        fetchval_sequence=_mock_session_resolution_rows(),
+        fetch_rows=[],
+    )
+    db = _make_db(conn)
+    db._flow_endpoint_cache_ttl_seconds = 0.0
+
+    asyncio.run(
+        db.get_flow_series(
+            symbol="SPY",
+            session="current",
+            strikes=[700.0, 705.0],
+            expirations=[date(2026, 4, 24)],
+        )
+    )
+
+    main_query = conn.fetch_calls[0][0]
+    # Isolate the underlying_by_bar block and assert it does not reference
+    # the strike/expiration filter parameters ($4, $5).
+    start = main_query.find("underlying_by_bar AS")
+    assert start != -1, "underlying_by_bar CTE must exist"
+    end = main_query.find(")", start)
+    # Find the matching closing paren by counting depth instead of string
+    # search (the CTE contains parens in ARRAY_AGG/INTERVAL etc.).
+    depth = 0
+    i = main_query.find("(", start)
+    assert i != -1
+    for j in range(i, len(main_query)):
+        ch = main_query[j]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                end = j
+                break
+    cte_body = main_query[start:end + 1]
+    # The strikes/expirations params ($4, $5) must NOT appear inside the
+    # underlying CTE — only $1 (symbol), $2 (ts_start), $3 (ts_end).
+    assert "$4" not in cte_body
+    assert "$5" not in cte_body
+    # And it reads from underlying_quotes, not flow_by_contract.
+    assert "underlying_quotes" in cte_body
+    assert "flow_by_contract" not in cte_body
