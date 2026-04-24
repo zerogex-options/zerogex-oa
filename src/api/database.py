@@ -160,6 +160,55 @@ def _timeframe_view_suffix(timeframe: str) -> str:
         raise ValueError(f'Unsupported timeframe: {timeframe}')
     return mapping[timeframe]
 
+
+# option_chains rows are UPSERTed in 60-second buckets: every contract that
+# ticks within a minute is rewritten to the same `timestamp`, and each write
+# bumps `updated_at` to NOW(). The bucket for the current minute is therefore
+# partially populated at any given moment, so `SELECT MAX(timestamp)` while
+# ingestion is live can return a snapshot missing contracts that haven't had
+# a tick yet — producing the sparse responses historically seen on
+# /api/market/open-interest and /api/gex/vol_surface.
+#
+# STABLE_SNAPSHOT_CTE defines a `latest_ts(ts)` CTE that picks a snapshot
+# guaranteed to be complete: if the most recent bucket has quiesced (no
+# writes for at least STABLE_SNAPSHOT_QUIESCENCE_SECONDS) use it, otherwise
+# fall back to the prior bucket, which must be complete since ingestion has
+# already rolled over to a newer one. If only one bucket exists, use it.
+# The only bound parameter referenced is `$1 = underlying`.
+_STABLE_SNAPSHOT_QUIESCENCE_SECONDS = float(
+    os.getenv("STABLE_SNAPSHOT_QUIESCENCE_SECONDS", "15")
+)
+
+_STABLE_SNAPSHOT_CTE = f"""
+    recent_ts AS (
+        SELECT DISTINCT timestamp
+        FROM option_chains
+        WHERE underlying = $1
+        ORDER BY timestamp DESC
+        LIMIT 2
+    ),
+    snapshot_stats AS (
+        SELECT rt.timestamp, MAX(oc.updated_at) AS last_write
+        FROM recent_ts rt
+        JOIN option_chains oc
+          ON oc.underlying = $1 AND oc.timestamp = rt.timestamp
+        GROUP BY rt.timestamp
+    ),
+    latest_ts AS (
+        SELECT CASE
+            WHEN (SELECT COUNT(*) FROM snapshot_stats) < 2
+                 OR (SELECT last_write FROM snapshot_stats
+                     ORDER BY timestamp DESC LIMIT 1)
+                     < NOW() - make_interval(secs => {_STABLE_SNAPSHOT_QUIESCENCE_SECONDS})
+            THEN (SELECT timestamp FROM snapshot_stats
+                  ORDER BY timestamp DESC LIMIT 1)
+            ELSE (SELECT timestamp FROM snapshot_stats
+                  ORDER BY timestamp DESC OFFSET 1 LIMIT 1)
+        END AS ts
+    )
+"""
+
+
 class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     """Manages database connections and queries"""
 
@@ -2059,17 +2108,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     async def get_open_interest(self, underlying: str) -> Optional[Dict[str, Any]]:
         """Get the most recent OI snapshot + per-contract directional dollar exposure.
 
-        Finds the latest ingested snapshot timestamp in option_chains for the given
-        underlying and returns one row per (strike, expiration, option_type) combination
-        from that snapshot, ordered by expiration then strike then option_type.
+        Uses the stable-snapshot CTE to avoid returning an in-flight minute bucket
+        that ingestion is still populating; see STABLE_SNAPSHOT_CTE for details.
+        Returns one row per (strike, expiration, option_type) combination from the
+        chosen snapshot, ordered by expiration then strike then option_type.
         """
         underlying = underlying.upper()
-        query = """
-            WITH latest_ts AS (
-                SELECT MAX(timestamp) AS ts
-                FROM option_chains
-                WHERE underlying = $1
-            ),
+        query = f"""
+            WITH {_STABLE_SNAPSHOT_CTE},
             latest_spot AS (
                 SELECT close::numeric AS spot_price
                 FROM underlying_quotes
@@ -2272,14 +2318,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             LIMIT 1
         """
 
-        chain_query = """
-            WITH latest_ts AS (
-                SELECT timestamp AS ts
-                FROM option_chains
-                WHERE underlying = $1
-                ORDER BY timestamp DESC
-                LIMIT 1
-            ),
+        chain_query = f"""
+            WITH {_STABLE_SNAPSHOT_CTE},
             eligible_strikes AS (
                 SELECT strike
                 FROM (
