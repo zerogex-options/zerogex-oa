@@ -4,7 +4,7 @@ ZeroGEX API Server
 FastAPI backend for serving analytics data to the frontend
 """
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
@@ -17,6 +17,8 @@ from typing import List, Optional, Literal
 import pytz
 
 from .database import DatabaseManager
+from .errors import handle_api_errors
+from .security import api_key_auth
 from .models import (
     GEXSummary,
     GEXByStrike,
@@ -54,12 +56,33 @@ db_manager: Optional[DatabaseManager] = None
 
 
 def _parse_cors_origins(raw_origins: Optional[str]) -> List[str]:
-    """Parse comma-separated origins from env var into a normalized list."""
-    if not raw_origins:
+    """Parse comma-separated origins from env var into a normalized list.
+
+    When ``ENVIRONMENT=production`` the wildcard ``"*"`` is refused — any
+    production deployment must explicitly list its allowed origins so an
+    accidentally-empty env var can't open the API to every cross-origin
+    caller on the internet.
+    """
+    origins: List[str] = []
+    if raw_origins:
+        origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+
+    environment = os.getenv("ENVIRONMENT", "development").strip().lower()
+    if not origins:
+        if environment == "production":
+            raise RuntimeError(
+                "CORS_ALLOW_ORIGINS is unset and ENVIRONMENT=production; "
+                "refusing to start with wildcard CORS.  Set CORS_ALLOW_ORIGINS "
+                "to an explicit comma-separated list of allowed origins."
+            )
         return ["*"]
 
-    origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
-    return origins or ["*"]
+    if "*" in origins and environment == "production":
+        raise RuntimeError(
+            "CORS_ALLOW_ORIGINS contains '*' and ENVIRONMENT=production; "
+            "wildcard CORS is not permitted in production."
+        )
+    return origins
 
 
 @asynccontextmanager
@@ -81,7 +104,11 @@ async def lifespan(app: FastAPI):
         await db_manager.disconnect()
     logger.info("Shutdown complete")
 
-# Create FastAPI app
+# Create FastAPI app.
+#
+# The global dependency enforces API-key auth when API_KEY is set in the
+# environment; when unset, the dependency is a no-op so local development
+# and CI continue to work without credentials.
 app = FastAPI(
     title="ZeroGEX API",
     description="Real-time options analytics API",
@@ -90,6 +117,7 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_url="/openapi.json",
     lifespan=lifespan,
+    dependencies=[Depends(api_key_auth)],
     openapi_tags=[
         {"name": "Health", "description": "API and database health checks"},
         {"name": "GEX", "description": "Gamma Exposure (GEX) analytics"},
@@ -172,21 +200,16 @@ async def health_check():
 # ============================================================================
 
 @app.get("/api/gex/summary", response_model=GEXSummary, tags=["GEX"])
+@handle_api_errors("GET /api/gex/summary")
 async def get_gex_summary(symbol: str = Query(default="SPY")):
     """Get latest GEX summary"""
-    try:
-        data = await db_manager.get_latest_gex_summary(symbol)
-        if not data:
-            raise HTTPException(status_code=404, detail="No GEX data available")
-
-        return GEXSummary(**data)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching GEX summary: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+    data = await db_manager.get_latest_gex_summary(symbol)
+    if not data:
+        raise HTTPException(status_code=404, detail="No GEX data available")
+    return GEXSummary(**data)
 
 @app.get("/api/gex/by-strike", response_model=List[GEXByStrike], tags=["GEX"])
+@handle_api_errors("GET /api/gex/by-strike")
 async def get_gex_by_strike(
     symbol: str = Query(default="SPY"),
     limit: int = Query(default=50, le=200),
@@ -204,17 +227,10 @@ async def get_gex_by_strike(
     - sort_by=distance: Returns strikes closest to current spot price (default)
     - sort_by=impact: Returns strikes with highest absolute net GEX (like 'make gex-strikes')
     """
-    try:
-        data = await db_manager.get_gex_by_strike(symbol, limit, sort_by)
-        if not data:
-            raise HTTPException(status_code=404, detail="No GEX data available")
-
-        return [GEXByStrike(**row) for row in data]
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching GEX by strike: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+    data = await db_manager.get_gex_by_strike(symbol, limit, sort_by)
+    if not data:
+        raise HTTPException(status_code=404, detail="No GEX data available")
+    return [GEXByStrike(**row) for row in data]
 
 @app.get("/api/gex/historical", response_model=List[GEXSummary], tags=["GEX"])
 async def get_historical_gex(
@@ -244,20 +260,15 @@ async def get_historical_gex(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/gex/heatmap", tags=["GEX"])
+@handle_api_errors("GET /api/gex/heatmap")
 async def get_gex_heatmap(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="5min"),
     window_units: int = Query(default=60, ge=1, le=90)
 ):
     """Get GEX heatmap data (strike x time)"""
-    try:
-        data = await db_manager.get_gex_heatmap(symbol, timeframe, window_units)
-        return data or []
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching GEX heatmap: {e!r}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+    data = await db_manager.get_gex_heatmap(symbol, timeframe, window_units)
+    return data or []
 
 
 # ============================================================================
@@ -265,6 +276,7 @@ async def get_gex_heatmap(
 # ============================================================================
 
 @app.get("/api/flow/by-contract", response_model=List[FlowPoint], tags=["Options Flow"])
+@handle_api_errors("GET /api/flow/by-contract")
 async def get_flow_by_contract(
     symbol: str = Query(default="SPY"),
     session: str = Query(default="current", pattern="^(current|prior)$"),
@@ -288,16 +300,12 @@ async def get_flow_by_contract(
     session=prior returns the previous full session. Pass intervals=N to
     limit the response to the most recent N 5-minute buckets.
     """
-    try:
-        data = await db_manager.get_flow(symbol, session, intervals=intervals)
-        return [FlowPoint(**row) for row in data]
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching flow: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+    data = await db_manager.get_flow(symbol, session, intervals=intervals)
+    return [FlowPoint(**row) for row in data]
+
 
 @app.get("/api/flow/smart-money", response_model=List[SmartMoneyFlowPoint], tags=["Options Flow"])
+@handle_api_errors("GET /api/flow/smart-money")
 async def get_smart_money_flow(
     symbol: str = Query(default="SPY"),
     session: str = Query(default="current", pattern="^(current|prior)$"),
@@ -305,29 +313,18 @@ async def get_smart_money_flow(
 ):
     """Get unusual activity / smart money flow — 1-min intervals.
     Session runs 07:15–16:15 ET. session=current returns today's open session (or most recent if closed); session=prior returns the previous full session."""
-    try:
-        data = await db_manager.get_smart_money_flow(symbol, session, min(limit, 50))
-        return [SmartMoneyFlowPoint(**row) for row in data]
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching smart money flow: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+    data = await db_manager.get_smart_money_flow(symbol, session, min(limit, 50))
+    return [SmartMoneyFlowPoint(**row) for row in data]
 
 @app.get("/api/flow/buying-pressure", response_model=List[FlowBuyingPressurePoint], tags=["Options Flow"])
+@handle_api_errors("GET /api/flow/buying-pressure")
 async def get_flow_buying_pressure(
     symbol: str = Query(default="SPY"),
     limit: int = Query(default=20, ge=1, le=500)
 ):
     """Get underlying buying/selling pressure"""
-    try:
-        data = await db_manager.get_flow_buying_pressure(symbol, limit)
-        return [FlowBuyingPressurePoint(**row) for row in data] if data else []
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching buying pressure: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+    data = await db_manager.get_flow_buying_pressure(symbol, limit)
+    return [FlowBuyingPressurePoint(**row) for row in data] if data else []
 
 # ============================================================================
 # Market Session Helper
@@ -508,6 +505,7 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/market/session-closes", response_model=SessionCloses, tags=["Market Data"])
+@handle_api_errors("GET /api/market/session-closes")
 async def get_session_closes(symbol: str = Query(default="SPY")):
     """
     Get the two most recently completed regular session closes.
@@ -516,17 +514,10 @@ async def get_session_closes(symbol: str = Query(default="SPY")):
       on the most recent completed trading day).
     - prior_session_close: the session close immediately before current.
     """
-    try:
-        data = await db_manager.get_session_closes(symbol)
-        if not data:
-            raise HTTPException(status_code=404, detail="No session close data available")
-
-        return SessionCloses(**data)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching session closes: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+    data = await db_manager.get_session_closes(symbol)
+    if not data:
+        raise HTTPException(status_code=404, detail="No session close data available")
+    return SessionCloses(**data)
 
 
 @app.get("/api/market/historical", response_model=List[UnderlyingQuote], tags=["Market Data"])
@@ -579,6 +570,7 @@ async def get_option_quote(
 
 
 @app.get("/api/market/open-interest", response_model=OpenInterestResponse, tags=["Market Data"])
+@handle_api_errors("GET /api/market/open-interest")
 async def get_open_interest(
     underlying: str = Query(default="SPY", description="Underlying symbol, e.g. SPY"),
 ):
@@ -587,57 +579,41 @@ async def get_open_interest(
     Returns one record per (strike, expiration, option_type) from the most recent
     option chain snapshot, ordered by expiration, strike, and option type.
     """
-    try:
-        data = await db_manager.get_open_interest(underlying)
-        if not data or not data.get("contracts"):
-            raise HTTPException(status_code=404, detail="No open interest data available")
-        return OpenInterestResponse(
-            underlying=data["underlying"],
-            spot_price=data["spot_price"],
-            contracts=[OpenInterestRecord(**row) for row in data["contracts"]],
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching open interest for {underlying}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+    data = await db_manager.get_open_interest(underlying)
+    if not data or not data.get("contracts"):
+        raise HTTPException(status_code=404, detail="No open interest data available")
+    return OpenInterestResponse(
+        underlying=data["underlying"],
+        spot_price=data["spot_price"],
+        contracts=[OpenInterestRecord(**row) for row in data["contracts"]],
+    )
 
 
 @app.get("/api/max-pain/timeseries", response_model=List[MaxPainTimeseriesPoint], tags=["Max Pain"])
+@handle_api_errors("GET /api/max-pain/timeseries")
 async def get_max_pain_timeseries(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="5min"),
     window_units: int = Query(default=90, ge=1, le=90)
 ):
     """Get max pain over time aggregated by timeframe."""
-    try:
-        data = await db_manager.get_max_pain_timeseries(symbol, timeframe, window_units)
-        if not data:
-            raise HTTPException(status_code=404, detail="No max pain data available")
-        return [MaxPainTimeseriesPoint(**row) for row in data]
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching max pain timeseries: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+    data = await db_manager.get_max_pain_timeseries(symbol, timeframe, window_units)
+    if not data:
+        raise HTTPException(status_code=404, detail="No max pain data available")
+    return [MaxPainTimeseriesPoint(**row) for row in data]
 
 
 @app.get("/api/max-pain/current", response_model=MaxPainCurrent, tags=["Max Pain"])
+@handle_api_errors("GET /api/max-pain/current")
 async def get_max_pain_current(
     symbol: str = Query(default="SPY"),
     strike_limit: int = Query(default=200, ge=10, le=1000)
 ):
     """Get current max pain and strike-by-strike call/put payout notional."""
-    try:
-        data = await db_manager.get_max_pain_current(symbol, strike_limit)
-        if not data:
-            raise HTTPException(status_code=404, detail="No max pain data available")
-        return MaxPainCurrent(**data)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching current max pain: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+    data = await db_manager.get_max_pain_current(symbol, strike_limit)
+    if not data:
+        raise HTTPException(status_code=404, detail="No max pain data available")
+    return MaxPainCurrent(**data)
 
 
 # ============================================================================
@@ -645,92 +621,67 @@ async def get_max_pain_current(
 # ============================================================================
 
 @app.get("/api/technicals/vwap-deviation", tags=["Technicals"])
+@handle_api_errors("GET /api/technicals/vwap-deviation")
 async def get_vwap_deviation(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
     window_units: int = Query(default=20, ge=1, le=90)
 ):
     """Get VWAP deviation for mean reversion signals"""
-    try:
-        data = await db_manager.get_vwap_deviation(symbol, timeframe, window_units)
-        if not data:
-            raise HTTPException(status_code=404, detail="No VWAP data available")
-        return data
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching VWAP deviation: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+    data = await db_manager.get_vwap_deviation(symbol, timeframe, window_units)
+    if not data:
+        raise HTTPException(status_code=404, detail="No VWAP data available")
+    return data
 
 @app.get("/api/technicals/opening-range", tags=["Technicals"])
+@handle_api_errors("GET /api/technicals/opening-range")
 async def get_opening_range(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
     window_units: int = Query(default=20, ge=1, le=90)
 ):
     """Get opening range breakout status"""
-    try:
-        data = await db_manager.get_opening_range_breakout(symbol, timeframe, window_units)
-        if not data:
-            raise HTTPException(status_code=404, detail="No ORB data available")
-        return data
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching ORB: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+    data = await db_manager.get_opening_range_breakout(symbol, timeframe, window_units)
+    if not data:
+        raise HTTPException(status_code=404, detail="No ORB data available")
+    return data
 
 @app.get("/api/technicals/dealer-hedging", tags=["Technicals"])
+@handle_api_errors("GET /api/technicals/dealer-hedging")
 async def get_dealer_hedging(
     symbol: str = Query(default="SPY"),
     limit: int = Query(default=20, le=100)
 ):
     """Get dealer hedging pressure"""
-    try:
-        data = await db_manager.get_dealer_hedging_pressure(symbol, limit)
-        if not data:
-            raise HTTPException(status_code=404, detail="No hedging data available")
-        return data
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching dealer hedging: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+    data = await db_manager.get_dealer_hedging_pressure(symbol, limit)
+    if not data:
+        raise HTTPException(status_code=404, detail="No hedging data available")
+    return data
 
 @app.get("/api/technicals/volume-spikes", tags=["Technicals"])
+@handle_api_errors("GET /api/technicals/volume-spikes")
 async def get_volume_spikes(
     symbol: str = Query(default="SPY"),
     limit: int = Query(default=20, le=100)
 ):
     """Get unusual volume spikes"""
-    try:
-        data = await db_manager.get_unusual_volume_spikes(symbol, limit)
-        if not data:
-            raise HTTPException(status_code=404, detail="No volume data available")
-        return data
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching volume spikes: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+    data = await db_manager.get_unusual_volume_spikes(symbol, limit)
+    if not data:
+        raise HTTPException(status_code=404, detail="No volume data available")
+    return data
 
 @app.get("/api/technicals/momentum-divergence", response_model=List[MomentumDivergencePoint], tags=["Technicals"])
+@handle_api_errors("GET /api/technicals/momentum-divergence")
 async def get_momentum_divergence(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
     window_units: int = Query(default=20, ge=1, le=90)
 ):
     """Get momentum divergence signals"""
-    try:
-        data = await db_manager.get_momentum_divergence(symbol, timeframe, window_units)
-        if not data:
-            raise HTTPException(status_code=404, detail="No divergence data available")
-        return [MomentumDivergencePoint(**row) for row in data]
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching momentum divergence: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+    data = await db_manager.get_momentum_divergence(symbol, timeframe, window_units)
+    if not data:
+        raise HTTPException(status_code=404, detail="No divergence data available")
+    return [MomentumDivergencePoint(**row) for row in data]
 
 
 

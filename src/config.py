@@ -5,12 +5,90 @@ All configurable constants in one place for easy tuning.
 """
 
 import json
+import logging
 import os
 from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 
 # CRITICAL: Load environment variables FIRST before any config is read
 load_dotenv()
+
+_cfg_logger = logging.getLogger(__name__)
+
+
+def _getenv_int(name: str, default: int, *, min: Optional[int] = None, max: Optional[int] = None) -> int:
+    """Fetch an int env var with a clear error on parse failure and optional clamping.
+
+    ``min`` and ``max`` are inclusive bounds.  Values outside the bounds are
+    clamped and logged at WARNING so a misconfigured env var can't silently
+    drive an unreasonable parameter.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        value = default
+    else:
+        try:
+            value = int(raw.strip())
+        except (TypeError, ValueError):
+            _cfg_logger.error(
+                "Invalid int for env var %s=%r — falling back to default %d",
+                name,
+                raw,
+                default,
+            )
+            value = default
+    if min is not None and value < min:
+        _cfg_logger.warning("%s=%d below minimum %d; clamping", name, value, min)
+        value = min
+    if max is not None and value > max:
+        _cfg_logger.warning("%s=%d above maximum %d; clamping", name, value, max)
+        value = max
+    return value
+
+
+def _getenv_float(name: str, default: float, *, min: Optional[float] = None, max: Optional[float] = None) -> float:
+    """Fetch a float env var with a clear error on parse failure and optional clamping."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        value = default
+    else:
+        try:
+            value = float(raw.strip())
+        except (TypeError, ValueError):
+            _cfg_logger.error(
+                "Invalid float for env var %s=%r — falling back to default %s",
+                name,
+                raw,
+                default,
+            )
+            value = default
+    if min is not None and value < min:
+        _cfg_logger.warning("%s=%s below minimum %s; clamping", name, value, min)
+        value = min
+    if max is not None and value > max:
+        _cfg_logger.warning("%s=%s above maximum %s; clamping", name, value, max)
+        value = max
+    return value
+
+
+def _getenv_bool(name: str, default: bool) -> bool:
+    """Fetch a boolean env var.  Accepts (case-insensitive) true/false/1/0/yes/no."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off", ""}:
+        return False
+    _cfg_logger.error(
+        "Invalid bool for env var %s=%r — falling back to default %s",
+        name,
+        raw,
+        default,
+    )
+    return default
+
 
 # =============================================================================
 # API Configuration
@@ -23,11 +101,15 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 # Comma-separated list consumed by src.api.main._parse_cors_origins().
 CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS")
 
+# Deployment environment name.  Enables prod-only guardrails
+# (e.g. refuse to start with CORS "*" when ENVIRONMENT=production).
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development").strip().lower()
+
 # Rate Limiting & Delays
-API_REQUEST_TIMEOUT = int(os.getenv("API_REQUEST_TIMEOUT", "30"))  # seconds
-API_RETRY_ATTEMPTS = int(os.getenv("API_RETRY_ATTEMPTS", "3"))
-API_RETRY_DELAY = float(os.getenv("API_RETRY_DELAY", "1.0"))  # seconds
-API_RETRY_BACKOFF = float(os.getenv("API_RETRY_BACKOFF", "2.0"))  # multiplier
+API_REQUEST_TIMEOUT = _getenv_int("API_REQUEST_TIMEOUT", 30, min=1, max=600)   # seconds
+API_RETRY_ATTEMPTS = _getenv_int("API_RETRY_ATTEMPTS", 3, min=0, max=20)
+API_RETRY_DELAY = _getenv_float("API_RETRY_DELAY", 1.0, min=0.0, max=60.0)     # seconds
+API_RETRY_BACKOFF = _getenv_float("API_RETRY_BACKOFF", 2.0, min=1.0, max=10.0)  # multiplier
 
 # Batch Sizes
 QUOTE_BATCH_SIZE = int(os.getenv("QUOTE_BATCH_SIZE", "100"))  # TradeStation supports up to 500
