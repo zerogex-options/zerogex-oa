@@ -38,11 +38,15 @@ from .routers.volatility_gauge import router as volatility_gauge_router
 from .routers.option_contract import router as option_contract_router
 from .routers.vol_surface import router as vol_surface_router
 
-# Configure logging
+# Configure logging — honor LOG_LEVEL env var (default INFO).
+_log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+_log_level = getattr(logging, _log_level_name, logging.INFO)
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=_log_level,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    force=True,
 )
+logging.getLogger().setLevel(_log_level)
 logger = logging.getLogger(__name__)
 
 # Database manager
@@ -334,9 +338,16 @@ _SOFT_CLOSE_WINDOW = timedelta(seconds=30)
 
 
 def _load_nyse_holidays() -> set[date_type]:
-    """Load NYSE holiday dates from the NYSE_HOLIDAYS env var (comma-separated YYYY-MM-DD)."""
+    """Load NYSE holiday dates from the NYSE_HOLIDAYS env var (comma-separated YYYY-MM-DD).
+
+    Set ``NYSE_HOLIDAYS_STRICT=true`` to raise on any invalid token so the
+    API refuses to start with a corrupt calendar rather than silently
+    mis-classifying a holiday as an open session.
+    """
     raw = os.getenv("NYSE_HOLIDAYS", "")
+    strict = os.getenv("NYSE_HOLIDAYS_STRICT", "false").strip().lower() == "true"
     holidays: set[date_type] = set()
+    invalid: list[str] = []
     for token in raw.split(","):
         token = token.strip()
         if not token:
@@ -344,7 +355,13 @@ def _load_nyse_holidays() -> set[date_type]:
         try:
             holidays.add(date_type.fromisoformat(token))
         except ValueError:
-            logger.warning(f"Invalid date in NYSE_HOLIDAYS env var, skipping: {token!r}")
+            invalid.append(token)
+            logger.error(f"Invalid date in NYSE_HOLIDAYS env var: {token!r}")
+    if invalid and strict:
+        raise ValueError(
+            f"NYSE_HOLIDAYS contains {len(invalid)} invalid token(s): {invalid!r}. "
+            "Fix the env var or set NYSE_HOLIDAYS_STRICT=false to tolerate."
+        )
     if not holidays:
         logger.warning("NYSE_HOLIDAYS env var is empty — no holiday filtering will occur")
     return holidays

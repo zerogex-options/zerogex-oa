@@ -113,10 +113,12 @@ def _initialize_connection_pool():
     db_port = int(os.getenv('DB_PORT', '5432'))
     db_name = os.getenv('DB_NAME', 'zerogex')
     db_user = os.getenv('DB_USER', 'postgres')
-    # Conservative defaults prevent "too many clients" when multiple engines
-    # and API workers are running concurrently against the same DB.
-    min_connections = int(os.getenv('DB_POOL_MIN', '1'))
-    max_connections = int(os.getenv('DB_POOL_MAX', '2'))
+    # Defaults sized for concurrent ingestion + analytics + API workers.
+    # A single-process default of 2 starved writers during aggregation flushes
+    # and analytics cycles; 2/8 gives headroom without risking "too many
+    # clients" on shared DBs. Override via DB_POOL_MIN/DB_POOL_MAX.
+    min_connections = int(os.getenv('DB_POOL_MIN', '2'))
+    max_connections = int(os.getenv('DB_POOL_MAX', '8'))
     if min_connections > max_connections:
         min_connections = max_connections
     connect_timeout = int(os.getenv('DB_CONNECT_TIMEOUT_SECONDS', '20'))

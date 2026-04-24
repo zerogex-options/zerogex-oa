@@ -15,9 +15,17 @@ ET = pytz.timezone("US/Eastern")
 
 
 def _load_nyse_holidays() -> set[date]:
-    """Load holiday dates from NYSE_HOLIDAYS env var (comma-separated YYYY-MM-DD)."""
+    """Load holiday dates from NYSE_HOLIDAYS env var (comma-separated YYYY-MM-DD).
+
+    Misconfigured holidays silently classify a closed session as "open", which
+    produces incorrect market-state signals downstream. Set
+    ``NYSE_HOLIDAYS_STRICT=true`` (recommended for production) to raise on any
+    invalid token so the process refuses to start with a corrupt calendar.
+    """
     raw = os.getenv("NYSE_HOLIDAYS", "")
+    strict = os.getenv("NYSE_HOLIDAYS_STRICT", "false").strip().lower() == "true"
     holidays: set[date] = set()
+    invalid: list[str] = []
     for token in raw.split(","):
         token = token.strip()
         if not token:
@@ -25,7 +33,13 @@ def _load_nyse_holidays() -> set[date]:
         try:
             holidays.add(date.fromisoformat(token))
         except ValueError:
-            logger.warning("Invalid date in NYSE_HOLIDAYS env var, skipping: %r", token)
+            invalid.append(token)
+            logger.error("Invalid date in NYSE_HOLIDAYS env var: %r", token)
+    if invalid and strict:
+        raise ValueError(
+            f"NYSE_HOLIDAYS contains {len(invalid)} invalid token(s): {invalid!r}. "
+            "Fix the env var or set NYSE_HOLIDAYS_STRICT=false to tolerate."
+        )
     return holidays
 
 

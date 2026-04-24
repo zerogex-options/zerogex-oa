@@ -211,7 +211,7 @@ class TradeStationClient:
                             return {"Strikes": []}
                         else:
                             return {}
-                except:
+                except Exception:
                     pass
 
                 # For other 404s, log and raise

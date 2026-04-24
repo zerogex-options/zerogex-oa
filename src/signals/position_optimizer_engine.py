@@ -467,20 +467,6 @@ class PositionOptimizerEngine:
                 recent_closes = [float(r[0]) for r in cur.fetchall()]
                 recent_closes = list(reversed(recent_closes))
 
-                cur.execute(
-                    """
-                    SELECT close
-                    FROM underlying_quotes
-                    WHERE symbol = %s
-                      AND timestamp <= %s
-                    ORDER BY timestamp DESC
-                    LIMIT 120
-                    """,
-                    (self.db_symbol, anchor_ts),
-                )
-                recent_closes = [float(r[0]) for r in cur.fetchall()]
-                recent_closes = list(reversed(recent_closes))
-
                 dte_min, dte_max = TARGET_DTE_WINDOWS.get(signal_timeframe, (1, 7))
                 trade_date = anchor_ts.astimezone(ET).date() if anchor_ts.tzinfo else anchor_ts.date()
 

@@ -14,6 +14,7 @@ import signal
 import sys
 import hashlib
 import json
+import threading
 import time
 import time as _time
 from multiprocessing import Process
@@ -91,6 +92,7 @@ class IngestionEngine:
         # DB write (data-retention sweeps, backfills, failed writes that
         # left the cache ahead of the DB, etc.).
         self._option_volume_baseline: Dict[str, tuple[int, float]] = {}
+        self._option_volume_baseline_lock = threading.Lock()
         self._option_volume_baseline_ttl = float(
             os.getenv("OPTION_VOLUME_BASELINE_TTL_SECONDS", "1800")
         )
@@ -368,8 +370,13 @@ class IngestionEngine:
             if data is None:
                 continue
 
+            pre_symbol = data.get("option_symbol", "unknown")
             data = self._enrich_with_greeks(data)
             if data is None:
+                logger.warning(
+                    "Dropping option quote after Greeks enrichment returned None: %s",
+                    pre_symbol,
+                )
                 continue
 
             timestamp = data.get("timestamp")
@@ -515,7 +522,8 @@ class IngestionEngine:
         the persisted row.
         """
         now = _time.monotonic()
-        cached = self._option_volume_baseline.get(option_symbol)
+        with self._option_volume_baseline_lock:
+            cached = self._option_volume_baseline.get(option_symbol)
         if cached is not None:
             value, cached_at = cached
             if (now - cached_at) < self._option_volume_baseline_ttl:
@@ -537,7 +545,8 @@ class IngestionEngine:
                 )
                 row = cursor.fetchone()
                 baseline = int(row[0]) if row and row[0] is not None else 0
-                self._option_volume_baseline[option_symbol] = (baseline, now)
+                with self._option_volume_baseline_lock:
+                    self._option_volume_baseline[option_symbol] = (baseline, now)
                 return baseline
         except Exception as e:
             logger.warning(f"Failed loading volume baseline for {option_symbol}: {e}")
@@ -549,7 +558,8 @@ class IngestionEngine:
 
     def _invalidate_option_volume_baseline(self, option_symbol: str) -> None:
         """Drop a contract's cached baseline so the next read hits the DB."""
-        self._option_volume_baseline.pop(option_symbol, None)
+        with self._option_volume_baseline_lock:
+            self._option_volume_baseline.pop(option_symbol, None)
 
     def _prepare_option_agg(self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False) -> Optional[Dict[str, Any]]:
         """Aggregate a per-symbol option buffer into a single row dict.
@@ -641,10 +651,11 @@ class IngestionEngine:
             self._log_parity_signature("option_chains", agg)
 
             # Update volume baseline cache with the freshly-aggregated value.
-            self._option_volume_baseline[option_symbol] = (
-                int(agg["volume"] or 0),
-                _time.monotonic(),
-            )
+            with self._option_volume_baseline_lock:
+                self._option_volume_baseline[option_symbol] = (
+                    int(agg["volume"] or 0),
+                    _time.monotonic(),
+                )
 
             # Trim buffer.
             if keep_last_snapshot and buffer:
