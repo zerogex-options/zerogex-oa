@@ -232,28 +232,34 @@ flow-explain: ## Diagnose /api/flow/series query planner choice on flow_by_contr
 	EXPS_DAYS=$${FLOW_DIAG_EXPIRATION_DAYS:-30,60}; \
 	echo "$(YELLOW)Symbol=$$SYMBOL  Window=$$HOURS h  Strikes=[$$STRIKES]  Expirations=CURRENT_DATE+[$$EXPS_DAYS] days$(NC)"; \
 	echo "$(YELLOW)Override with: FLOW_SYMBOL FLOW_DIAG_HOURS FLOW_DIAG_STRIKES FLOW_DIAG_EXPIRATION_DAYS$(NC)"; \
+	echo "$(YELLOW)Tip: get realistic strikes via 'make psql' →$(NC)"; \
+	echo "$(YELLOW)  SELECT strike FROM flow_by_contract WHERE symbol = '$$SYMBOL' GROUP BY strike ORDER BY COUNT(*) DESC LIMIT 5;$(NC)"; \
 	printf "%s\n" \
-		"\\echo [1/6] Table size + approximate row count" \
+		"\\echo [1/7] Table size + approximate row count" \
 		"SELECT pg_size_pretty(pg_total_relation_size('flow_by_contract')) AS total_size, pg_size_pretty(pg_relation_size('flow_by_contract')) AS table_size, pg_size_pretty(pg_total_relation_size('flow_by_contract') - pg_relation_size('flow_by_contract')) AS index_and_toast, (SELECT reltuples::bigint FROM pg_class WHERE relname = 'flow_by_contract') AS approx_rows;" \
-		"\\echo [2/6] Indexes defined on flow_by_contract" \
+		"\\echo [2/7] Dead tuples + last vacuum/analyze (high dead_pct = bloat)" \
+		"SELECT relname, n_live_tup, n_dead_tup, ROUND(n_dead_tup::numeric / NULLIF(n_live_tup,0) * 100, 1) AS dead_pct, last_autovacuum, last_autoanalyze FROM pg_stat_user_tables WHERE relname = 'flow_by_contract';" \
+		"\\echo [3/7] Indexes defined on flow_by_contract" \
 		"SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'flow_by_contract' ORDER BY indexname;" \
-		"\\echo [3/6] Index usage stats (zero scans = unused; planner not picking it)" \
+		"\\echo [4/7] Index usage stats (low idx_scan + large size = bloat candidate)" \
 		"SELECT indexrelname, idx_scan, idx_tup_read, idx_tup_fetch, pg_size_pretty(pg_relation_size(indexrelid)) AS size FROM pg_stat_user_indexes WHERE relname = 'flow_by_contract' ORDER BY idx_scan DESC;" \
-		"\\echo [4/6] EXPLAIN ANALYZE: baseline (symbol, timestamp) — the most common shape" \
+		"\\echo [5/7] EXPLAIN ANALYZE: baseline (symbol, timestamp) — the most common shape" \
 		"EXPLAIN (ANALYZE, BUFFERS) SELECT timestamp, option_type, strike, expiration, raw_volume, net_volume, net_premium FROM flow_by_contract WHERE symbol = '$$SYMBOL' AND timestamp >= NOW() - ($$HOURS * INTERVAL '1 hour') AND timestamp <= NOW();" \
-		"\\echo [5/6] EXPLAIN ANALYZE: + strike filter only" \
+		"\\echo [6/7] EXPLAIN ANALYZE: + strike filter only" \
 		"EXPLAIN (ANALYZE, BUFFERS) SELECT timestamp, option_type, strike, expiration, raw_volume, net_volume, net_premium FROM flow_by_contract WHERE symbol = '$$SYMBOL' AND timestamp >= NOW() - ($$HOURS * INTERVAL '1 hour') AND timestamp <= NOW() AND strike = ANY(ARRAY[$$STRIKES]::numeric[]);" \
-		"\\echo [6/6] EXPLAIN ANALYZE: + strike AND expiration filter (the case the 4-col composite would help)" \
-		"EXPLAIN (ANALYZE, BUFFERS) SELECT timestamp, option_type, strike, expiration, raw_volume, net_volume, net_premium FROM flow_by_contract WHERE symbol = '$$SYMBOL' AND timestamp >= NOW() - ($$HOURS * INTERVAL '1 hour') AND timestamp <= NOW() AND strike = ANY(ARRAY[$$STRIKES]::numeric[]) AND expiration = ANY(ARRAY(SELECT (CURRENT_DATE + (d || ' days')::interval)::date FROM unnest(string_to_array('$$EXPS_DAYS', ','))::int[] AS d));" \
+		"\\echo [7/7] EXPLAIN ANALYZE: + strike AND expiration filter (the case the 4-col composite would help)" \
+		"EXPLAIN (ANALYZE, BUFFERS) SELECT timestamp, option_type, strike, expiration, raw_volume, net_volume, net_premium FROM flow_by_contract WHERE symbol = '$$SYMBOL' AND timestamp >= NOW() - ($$HOURS * INTERVAL '1 hour') AND timestamp <= NOW() AND strike = ANY(ARRAY[$$STRIKES]::numeric[]) AND expiration = ANY(ARRAY(SELECT (CURRENT_DATE + (d || ' days')::interval)::date FROM unnest(string_to_array('$$EXPS_DAYS', ',')::int[]) AS d));" \
 		| $(PSQL) -v ON_ERROR_STOP=0
 	@echo ""
-	@echo "$(GREEN)What to look for in [4]–[6]:$(NC)"
+	@echo "$(GREEN)What to look for:$(NC)"
 	@echo "  • $(GREEN)Index Scan on idx_flow_by_contract_*$(NC) → planner picked an existing index. Good."
 	@echo "  • $(YELLOW)Bitmap Heap Scan with BitmapAnd$(NC) → planner combined two existing indexes. Usually still fast."
 	@echo "  • $(RED)Seq Scan$(NC) on a multi-million-row table → existing indexes can't help; new index may be justified."
-	@echo "  • Compare 'actual time' between [4] and [6]. If [6] is >10× slower AND [3] shows the existing"
+	@echo "  • Compare 'actual time' between [5] and [7]. If [7] is >10× slower AND [4] shows the existing"
 	@echo "    strike/expiration indexes have low idx_scan counts, a 4-col composite is worth proposing."
-	@echo "  • If [4]–[6] are all sub-100ms with Index Scan, the existing index set is fine — don't add more."
+	@echo "  • If [5]–[7] are all sub-100ms with Index Scan, the existing index set is fine — don't add more."
+	@echo "  • $(RED)Index size >> table size$(NC) in [1] AND $(RED)low idx_scan$(NC) in [4] → consider DROP."
+	@echo "  • $(RED)High dead_pct$(NC) in [2] AND large idx size in [4] → REINDEX CONCURRENTLY may shrink the index."
 
 .PHONY: help
 help: ## Show this help message
