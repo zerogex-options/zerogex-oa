@@ -363,6 +363,12 @@ def _attach_series_mock(mainmod, returns):
     return mainmod.db_manager
 
 
+def _attach_by_contract_mock(mainmod, returns):
+    mainmod.db_manager = mainmod.db_manager or mainmod.DatabaseManager()
+    mainmod.db_manager.get_flow = AsyncMock(return_value=returns)  # type: ignore[method-assign]
+    return mainmod.db_manager
+
+
 def _attach_contracts_mock(mainmod, returns):
     mainmod.db_manager = mainmod.db_manager or mainmod.DatabaseManager()
     mainmod.db_manager.get_flow_contracts = AsyncMock(return_value=returns)  # type: ignore[method-assign]
@@ -583,6 +589,33 @@ def test_http_series_intervals_lower_bound(monkeypatch: pytest.MonkeyPatch):
         response = client.get("/api/flow/series?symbol=SPY&intervals=0")
 
     assert response.status_code in (400, 422)
+
+
+def test_http_by_contract_intervals_upper_bound(monkeypatch: pytest.MonkeyPatch):
+    """/api/flow/by-contract must cap intervals at 390 to bound DB load.
+
+    Without the cap, a client could request millions of buckets and force
+    a query that scans the full retention window. 390 is one trading day
+    at 1-minute resolution — generous for any legitimate use.
+    """
+    app, mainmod = _build_app_with_mock_db(monkeypatch)
+    _attach_by_contract_mock(mainmod, [])
+
+    with TestClient(app) as client:
+        response = client.get("/api/flow/by-contract?symbol=SPY&intervals=10000")
+
+    assert response.status_code in (400, 422)
+
+
+def test_http_by_contract_intervals_at_cap_accepted(monkeypatch: pytest.MonkeyPatch):
+    """intervals=390 (the cap itself) must be accepted, not rejected."""
+    app, mainmod = _build_app_with_mock_db(monkeypatch)
+    _attach_by_contract_mock(mainmod, [])
+
+    with TestClient(app) as client:
+        response = client.get("/api/flow/by-contract?symbol=SPY&intervals=390")
+
+    assert response.status_code == 200, response.text
 
 
 def test_http_series_bad_session_enum(monkeypatch: pytest.MonkeyPatch):

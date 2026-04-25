@@ -309,9 +309,11 @@ async def get_flow_by_contract(
     intervals: Optional[int] = Query(
         default=None,
         ge=1,
+        le=390,
         description=(
             "Number of trailing 5-minute buckets to return. Defaults to the "
-            "entire session (09:30–16:15 ET)."
+            "entire session (09:30–16:15 ET, ~81 buckets). Capped at 390 "
+            "(one trading day at 1-minute resolution) to bound DB load."
         ),
     ),
 ):
