@@ -223,6 +223,38 @@ db-drop-unused-indexes: ## Drop 4 indexes with idx_scan=0 (~2.8 GB reclaimed). R
 		| $(PSQL) -v ON_ERROR_STOP=1
 	@echo "$(GREEN)✓ Unused indexes dropped. Run 'make analytics-snapshot-diagnose' to re-check.$(NC)"
 
+.PHONY: flow-explain
+flow-explain: ## Diagnose /api/flow/series query planner choice on flow_by_contract (FLOW_SYMBOL=SPY)
+	@echo "$(BLUE)=== flow_by_contract Query Planner Diagnosis ===$(NC)"
+	@SYMBOL=$${FLOW_SYMBOL:-SPY}; \
+	HOURS=$${FLOW_DIAG_HOURS:-24}; \
+	STRIKES=$${FLOW_DIAG_STRIKES:-600,605,610}; \
+	EXPS_DAYS=$${FLOW_DIAG_EXPIRATION_DAYS:-30,60}; \
+	echo "$(YELLOW)Symbol=$$SYMBOL  Window=$$HOURS h  Strikes=[$$STRIKES]  Expirations=CURRENT_DATE+[$$EXPS_DAYS] days$(NC)"; \
+	echo "$(YELLOW)Override with: FLOW_SYMBOL FLOW_DIAG_HOURS FLOW_DIAG_STRIKES FLOW_DIAG_EXPIRATION_DAYS$(NC)"; \
+	printf "%s\n" \
+		"\\echo [1/6] Table size + approximate row count" \
+		"SELECT pg_size_pretty(pg_total_relation_size('flow_by_contract')) AS total_size, pg_size_pretty(pg_relation_size('flow_by_contract')) AS table_size, pg_size_pretty(pg_total_relation_size('flow_by_contract') - pg_relation_size('flow_by_contract')) AS index_and_toast, (SELECT reltuples::bigint FROM pg_class WHERE relname = 'flow_by_contract') AS approx_rows;" \
+		"\\echo [2/6] Indexes defined on flow_by_contract" \
+		"SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'flow_by_contract' ORDER BY indexname;" \
+		"\\echo [3/6] Index usage stats (zero scans = unused; planner not picking it)" \
+		"SELECT indexrelname, idx_scan, idx_tup_read, idx_tup_fetch, pg_size_pretty(pg_relation_size(indexrelid)) AS size FROM pg_stat_user_indexes WHERE relname = 'flow_by_contract' ORDER BY idx_scan DESC;" \
+		"\\echo [4/6] EXPLAIN ANALYZE: baseline (symbol, timestamp) — the most common shape" \
+		"EXPLAIN (ANALYZE, BUFFERS) SELECT timestamp, option_type, strike, expiration, raw_volume, net_volume, net_premium FROM flow_by_contract WHERE symbol = '$$SYMBOL' AND timestamp >= NOW() - ($$HOURS * INTERVAL '1 hour') AND timestamp <= NOW();" \
+		"\\echo [5/6] EXPLAIN ANALYZE: + strike filter only" \
+		"EXPLAIN (ANALYZE, BUFFERS) SELECT timestamp, option_type, strike, expiration, raw_volume, net_volume, net_premium FROM flow_by_contract WHERE symbol = '$$SYMBOL' AND timestamp >= NOW() - ($$HOURS * INTERVAL '1 hour') AND timestamp <= NOW() AND strike = ANY(ARRAY[$$STRIKES]::numeric[]);" \
+		"\\echo [6/6] EXPLAIN ANALYZE: + strike AND expiration filter (the case the 4-col composite would help)" \
+		"EXPLAIN (ANALYZE, BUFFERS) SELECT timestamp, option_type, strike, expiration, raw_volume, net_volume, net_premium FROM flow_by_contract WHERE symbol = '$$SYMBOL' AND timestamp >= NOW() - ($$HOURS * INTERVAL '1 hour') AND timestamp <= NOW() AND strike = ANY(ARRAY[$$STRIKES]::numeric[]) AND expiration = ANY(ARRAY(SELECT (CURRENT_DATE + (d || ' days')::interval)::date FROM unnest(string_to_array('$$EXPS_DAYS', ','))::int[] AS d));" \
+		| $(PSQL) -v ON_ERROR_STOP=0
+	@echo ""
+	@echo "$(GREEN)What to look for in [4]–[6]:$(NC)"
+	@echo "  • $(GREEN)Index Scan on idx_flow_by_contract_*$(NC) → planner picked an existing index. Good."
+	@echo "  • $(YELLOW)Bitmap Heap Scan with BitmapAnd$(NC) → planner combined two existing indexes. Usually still fast."
+	@echo "  • $(RED)Seq Scan$(NC) on a multi-million-row table → existing indexes can't help; new index may be justified."
+	@echo "  • Compare 'actual time' between [4] and [6]. If [6] is >10× slower AND [3] shows the existing"
+	@echo "    strike/expiration indexes have low idx_scan counts, a 4-col composite is worth proposing."
+	@echo "  • If [4]–[6] are all sub-100ms with Index Scan, the existing index set is fine — don't add more."
+
 .PHONY: help
 help: ## Show this help message
 	@echo "=========================================="
@@ -410,6 +442,7 @@ help: ## Show this help message
 	@echo "  make db-tail-vix-bars             - Last 20 rows from vix_bars"
 	@echo "  make db-tail-api-calls            - Last 50 rows from tradestation_api_calls"
 	@echo "  make db-diagnostics               - DB diagnostics (sessions, locks, waits, slow queries)"
+	@echo "  make flow-explain                 - EXPLAIN ANALYZE flow_by_contract queries (FLOW_SYMBOL=SPY)"
 	@echo ""
 	@echo "$(GREEN)Maintenance:$(NC)"
 	@echo "  make vacuum             - Vacuum analyze all tables"
