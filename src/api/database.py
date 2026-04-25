@@ -104,60 +104,16 @@ def _get_flow_session_bounds(session: str = "current") -> tuple:
     return start, end
 
 
-def _normalize_timeframe(timeframe: str) -> str:
-    normalized = (timeframe or "1min").lower()
-    if normalized == "1hour":
-        return "1hr"
-    return normalized
-
-
-def _bucket_expr(timeframe: str, column: str = "timestamp") -> str:
-    timeframe = _normalize_timeframe(timeframe)
-    if timeframe == "1min":
-        return f"date_trunc('minute', {column})"
-    if timeframe == "5min":
-        return (
-            f"date_trunc('hour', {column}) + "
-            f"FLOOR(EXTRACT(MINUTE FROM {column}) / 5) * INTERVAL '5 minutes'"
-        )
-    if timeframe == "15min":
-        return (
-            f"date_trunc('hour', {column}) + "
-            f"FLOOR(EXTRACT(MINUTE FROM {column}) / 15) * INTERVAL '15 minutes'"
-        )
-    if timeframe == "1hr":
-        return f"date_trunc('hour', {column})"
-    if timeframe == "1day":
-        return f"date_trunc('day', {column})"
-    raise ValueError(f"Unsupported timeframe: {timeframe}")
-
-
-def _interval_expr(timeframe: str) -> str:
-    timeframe = _normalize_timeframe(timeframe)
-    mapping = {
-        "1min": "INTERVAL '1 minute'",
-        "5min": "INTERVAL '5 minutes'",
-        "15min": "INTERVAL '15 minutes'",
-        "1hr": "INTERVAL '1 hour'",
-        "1day": "INTERVAL '1 day'",
-    }
-    if timeframe not in mapping:
-        raise ValueError(f"Unsupported timeframe: {timeframe}")
-    return mapping[timeframe]
-
-
-def _timeframe_view_suffix(timeframe: str) -> str:
-    timeframe = _normalize_timeframe(timeframe)
-    mapping = {
-        "1min": "1min",
-        "5min": "5min",
-        "15min": "15min",
-        "1hr": "1hr",
-        "1day": "1day",
-    }
-    if timeframe not in mapping:
-        raise ValueError(f"Unsupported timeframe: {timeframe}")
-    return mapping[timeframe]
+# SQL fragment allowlists live in `_sql_helpers` so that both
+# DatabaseManager and the query mixins it composes can import them
+# without a circular import.
+from src.api.queries._sql_helpers import (
+    _bucket_expr,
+    _gex_by_strike_order_clause,
+    _interval_expr,
+    _normalize_timeframe,
+    _timeframe_view_suffix,
+)
 
 
 # option_chains rows are UPSERTed in 60-second buckets: every contract that
@@ -1146,12 +1102,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         if cached is not None:
             return cached
 
-        # Choose sort order
-        if sort_by == "impact":
-            order_clause = "ORDER BY ABS(g.net_gex) DESC"
-        else:
-            order_clause = "ORDER BY ABS(g.strike - spot.close) ASC"
-
+        # `order_clause` is a validated literal from the allowlist; raises
+        # ValueError on unknown sort_by. Runtime values use $1..$N.
+        order_clause = _gex_by_strike_order_clause(sort_by)
         query = f"""
             WITH spot AS (
                 SELECT close
@@ -1211,6 +1164,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         """Get historical GEX summary data aggregated by timeframe."""
         bucket = _bucket_expr(timeframe)
         step_interval = _interval_expr(timeframe)
+        # `bucket` and `step_interval` are validated allowlist literals.
         query = f"""
             WITH latest AS (
                 SELECT timestamp AS max_ts
@@ -2149,6 +2103,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         """Get historical quotes aggregated by timeframe."""
         bucket = _bucket_expr(timeframe)
         step_interval = _interval_expr(timeframe)
+        # `bucket` and `step_interval` are validated allowlist literals.
         query = f"""
             WITH latest AS (
                 SELECT timestamp AS max_ts
@@ -2212,6 +2167,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         window_units = max(1, min(window_units, 90))
         bucket = _bucket_expr(timeframe)
         step_interval = _interval_expr(timeframe)
+        # `bucket` and `step_interval` are validated allowlist literals.
         query = f"""
             WITH latest AS (
                 SELECT timestamp AS max_ts
@@ -2331,6 +2287,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             return cached
         bucket = _bucket_expr(timeframe)
         step_interval = _interval_expr(timeframe)
+        # `bucket` and `step_interval` are validated allowlist literals.
         query = f"""
             WITH latest_price_timestamp AS (
                 SELECT timestamp as max_ts
