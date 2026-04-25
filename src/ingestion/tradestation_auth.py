@@ -316,10 +316,12 @@ def main():
         token = auth.get_access_token()
         headers = auth.get_headers()
 
-        print(f"\n✅ Access token obtained")
-        print(f"   Token: {token[:50]}...")
+        # Never print token bytes — `make run-auth` output ends up in
+        # terminal scrollback, journald, and shell history. Print just
+        # enough metadata to confirm a successful refresh.
+        print(f"\n✅ Access token obtained (length={len(token)})")
         print(f"\n✅ Headers generated")
-        print(f"   Authorization: Bearer {headers['Authorization'][7:50]}...")
+        print(f"   Authorization header set: {'Authorization' in headers}")
 
     except Exception as e:
         print(f"❌ Authentication failed: {e}")

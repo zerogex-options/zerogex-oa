@@ -532,6 +532,28 @@ CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts_type
 CREATE INDEX IF NOT EXISTS idx_flow_smart_money_symbol_ts
     ON flow_smart_money(symbol, timestamp DESC);
 
+-- Symbol FKs on the flow tables. Mirrors the pattern other tables use
+-- (option_chains, gex_summary, gex_by_strike) so deleting a symbol
+-- cascades through the flow rollups instead of leaving dangling rows.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_flow_contract_facts_symbol') THEN
+        ALTER TABLE flow_contract_facts
+        ADD CONSTRAINT fk_flow_contract_facts_symbol
+        FOREIGN KEY (symbol) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_flow_by_contract_symbol') THEN
+        ALTER TABLE flow_by_contract
+        ADD CONSTRAINT fk_flow_by_contract_symbol
+        FOREIGN KEY (symbol) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_flow_smart_money_symbol') THEN
+        ALTER TABLE flow_smart_money
+        ADD CONSTRAINT fk_flow_smart_money_symbol
+        FOREIGN KEY (symbol) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+END $$;
+
 -- =============================================================================
 -- Interval flow views removed — queries go directly to the 1-min cache tables.
 -- Drop any existing views from prior installations.
