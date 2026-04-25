@@ -15,10 +15,18 @@ Usage:
     set_log_level('DEBUG')
 """
 
-from src.utils.logging import get_logger, set_log_level, logger
+from src.utils.logging import (
+    get_logger,
+    logger,
+    new_request_id,
+    request_id_var,
+    set_log_level,
+)
 
 __all__ = [
     "get_logger",
-    "set_log_level",
     "logger",
+    "new_request_id",
+    "request_id_var",
+    "set_log_level",
 ]

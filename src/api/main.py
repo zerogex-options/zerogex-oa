@@ -11,7 +11,6 @@ from fastapi.responses import JSONResponse
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, date as date_type
-import logging
 import os
 import re
 from typing import List, Optional, Literal
@@ -19,6 +18,7 @@ import pytz
 
 from .database import DatabaseManager
 from .errors import handle_api_errors
+from .middleware import RequestIdMiddleware
 from .security import api_key_auth
 from .models import (
     GEXSummary,
@@ -43,16 +43,14 @@ from .routers.volatility_gauge import router as volatility_gauge_router
 from .routers.option_contract import router as option_contract_router
 from .routers.vol_surface import router as vol_surface_router
 
-# Configure logging — honor LOG_LEVEL env var (default INFO).
-_log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
-_log_level = getattr(logging, _log_level_name, logging.INFO)
-logging.basicConfig(
-    level=_log_level,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    force=True,
-)
-logging.getLogger().setLevel(_log_level)
-logger = logging.getLogger(__name__)
+# Logging is configured centrally in src.utils.logging; importing
+# get_logger triggers _configure_logging which honors LOG_LEVEL and
+# LOG_FORMAT and installs the request-id filter. We must NOT call
+# logging.basicConfig() here — it would wipe the centralized handler
+# and the structured/request-id format would silently revert to plain.
+from src.utils import get_logger  # noqa: E402
+
+logger = get_logger(__name__)
 
 # Database manager
 db_manager: Optional[DatabaseManager] = None
@@ -173,6 +171,11 @@ app.add_middleware(
 # /api/flow/by-contract (which can return hundreds of thousands of rows for a
 # full session) don't get bottlenecked on transfer.
 app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+# Request-ID propagation: every log line emitted while handling a request
+# carries the id, and the same id is echoed back via X-Request-Id so
+# clients (and server logs) can correlate.
+app.add_middleware(RequestIdMiddleware)
 
 app.include_router(trade_signals_router)
 app.include_router(volatility_gauge_router)
