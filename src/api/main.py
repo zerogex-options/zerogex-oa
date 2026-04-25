@@ -249,8 +249,6 @@ async def get_gex_by_strike(
     - sort_by=impact: Returns strikes with highest absolute net GEX (like 'make gex-strikes')
     """
     data = await db_manager.get_gex_by_strike(symbol, limit, sort_by)
-    if not data:
-        raise HTTPException(status_code=404, detail="No GEX data available")
     return [GEXByStrike(**row) for row in data]
 
 
@@ -271,9 +269,6 @@ async def get_historical_gex(
         data = await db_manager.get_historical_gex(
             symbol, start_dt, end_dt, window_units, timeframe
         )
-        if not data:
-            raise HTTPException(status_code=404, detail="No historical data available")
-
         return [GEXSummary(**row) for row in data]
     except HTTPException:
         raise
@@ -738,9 +733,6 @@ async def get_historical_quotes(
         data = await db_manager.get_historical_quotes(
             symbol, start_dt, end_dt, window_units, timeframe
         )
-        if not data:
-            raise HTTPException(status_code=404, detail="No historical data available")
-
         return [UnderlyingQuote(**row) for row in data]
     except HTTPException:
         raise
@@ -804,8 +796,6 @@ async def get_max_pain_timeseries(
 ):
     """Get max pain over time aggregated by timeframe."""
     data = await db_manager.get_max_pain_timeseries(symbol, timeframe, window_units)
-    if not data:
-        raise HTTPException(status_code=404, detail="No max pain data available")
     return [MaxPainTimeseriesPoint(**row) for row in data]
 
 
@@ -834,10 +824,7 @@ async def get_vwap_deviation(
     window_units: int = Query(default=20, ge=1, le=90),
 ):
     """Get VWAP deviation for mean reversion signals"""
-    data = await db_manager.get_vwap_deviation(symbol, timeframe, window_units)
-    if not data:
-        raise HTTPException(status_code=404, detail="No VWAP data available")
-    return data
+    return await db_manager.get_vwap_deviation(symbol, timeframe, window_units)
 
 
 @app.get("/api/technicals/opening-range", tags=["Technicals"])
@@ -848,10 +835,7 @@ async def get_opening_range(
     window_units: int = Query(default=20, ge=1, le=90),
 ):
     """Get opening range breakout status"""
-    data = await db_manager.get_opening_range_breakout(symbol, timeframe, window_units)
-    if not data:
-        raise HTTPException(status_code=404, detail="No ORB data available")
-    return data
+    return await db_manager.get_opening_range_breakout(symbol, timeframe, window_units)
 
 
 @app.get("/api/technicals/dealer-hedging", tags=["Technicals"])
@@ -860,10 +844,7 @@ async def get_dealer_hedging(
     symbol: str = Query(default="SPY"), limit: int = Query(default=20, le=100)
 ):
     """Get dealer hedging pressure"""
-    data = await db_manager.get_dealer_hedging_pressure(symbol, limit)
-    if not data:
-        raise HTTPException(status_code=404, detail="No hedging data available")
-    return data
+    return await db_manager.get_dealer_hedging_pressure(symbol, limit)
 
 
 @app.get("/api/technicals/volume-spikes", tags=["Technicals"])
@@ -872,10 +853,7 @@ async def get_volume_spikes(
     symbol: str = Query(default="SPY"), limit: int = Query(default=20, le=100)
 ):
     """Get unusual volume spikes"""
-    data = await db_manager.get_unusual_volume_spikes(symbol, limit)
-    if not data:
-        raise HTTPException(status_code=404, detail="No volume data available")
-    return data
+    return await db_manager.get_unusual_volume_spikes(symbol, limit)
 
 
 @app.get(
@@ -891,8 +869,6 @@ async def get_momentum_divergence(
 ):
     """Get momentum divergence signals"""
     data = await db_manager.get_momentum_divergence(symbol, timeframe, window_units)
-    if not data:
-        raise HTTPException(status_code=404, detail="No divergence data available")
     return [MomentumDivergencePoint(**row) for row in data]
 
 
