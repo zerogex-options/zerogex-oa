@@ -2353,10 +2353,22 @@ api-test: ## Test ALL API endpoints
 	SIGNAL_TIMEFRAMES="intraday swing multi_day"; \
 	PASSED=0; \
 	FAILED=0; \
+	KEY=$$(grep -E '^API_KEY=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'"); \
+	if [ -n "$$KEY" ]; then \
+		echo "$(YELLOW)Auth: sending X-API-Key from .env (length=$${#KEY})$(NC)"; \
+	else \
+		echo "$(YELLOW)Auth: no API_KEY in .env (calls run unauthenticated)$(NC)"; \
+	fi; \
+	do_curl() { \
+		if [ -n "$$KEY" ]; then \
+			curl -fsS -H "X-API-Key: $$KEY" "$$1" > /dev/null; \
+		else \
+			curl -fsS "$$1" > /dev/null; \
+		fi; \
+	}; \
 	test_endpoint() { \
 		path="$$1"; \
-		url="$$BASE_URL$$path"; \
-		if curl -fsS "$$url" > /dev/null; then \
+		if do_curl "$$BASE_URL$$path"; then \
 			echo "$(GREEN)✅ $$path$(NC)"; PASSED=$$((PASSED+1)); \
 		else \
 			echo "$(RED)❌ $$path$(NC)"; FAILED=$$((FAILED+1)); \
@@ -2422,10 +2434,13 @@ staging-smoke: ## Run post-deploy staging smoke checklist
 	@systemctl is-active --quiet $(API_SERVICE) && echo "$(GREEN)✅ API service active$(NC)" || (echo "$(RED)❌ API service inactive$(NC)" && exit 1)
 	@echo ""
 	@echo "$(YELLOW)Checking core API endpoints...$(NC)"
-	@curl -fsS "http://localhost:8000/api/health" > /dev/null && echo "$(GREEN)✅ /api/health$(NC)" || (echo "$(RED)❌ /api/health$(NC)" && exit 1)
-	@curl -fsS "http://localhost:8000/api/gex/summary?symbol=SPY" > /dev/null && echo "$(GREEN)✅ /api/gex/summary$(NC)" || (echo "$(RED)❌ /api/gex/summary$(NC)" && exit 1)
-	@curl -fsS "http://localhost:8000/api/market/quote?symbol=SPY" > /dev/null && echo "$(GREEN)✅ /api/market/quote$(NC)" || (echo "$(RED)❌ /api/market/quote$(NC)" && exit 1)
-	@curl -fsS "http://localhost:8000/api/flow/by-contract?symbol=SPY" > /dev/null && echo "$(GREEN)✅ /api/flow/by-contract$(NC)" || (echo "$(RED)❌ /api/flow/by-contract$(NC)" && exit 1)
+	@KEY=$$(grep -E '^API_KEY=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'"); \
+	AUTH=""; \
+	if [ -n "$$KEY" ]; then AUTH="-H X-API-Key:$$KEY"; fi; \
+	curl -fsS $$AUTH "http://localhost:8000/api/health" > /dev/null && echo "$(GREEN)✅ /api/health$(NC)" || (echo "$(RED)❌ /api/health$(NC)" && exit 1); \
+	curl -fsS $$AUTH "http://localhost:8000/api/gex/summary?symbol=SPY" > /dev/null && echo "$(GREEN)✅ /api/gex/summary$(NC)" || (echo "$(RED)❌ /api/gex/summary$(NC)" && exit 1); \
+	curl -fsS $$AUTH "http://localhost:8000/api/market/quote?symbol=SPY" > /dev/null && echo "$(GREEN)✅ /api/market/quote$(NC)" || (echo "$(RED)❌ /api/market/quote$(NC)" && exit 1); \
+	curl -fsS $$AUTH "http://localhost:8000/api/flow/by-contract?symbol=SPY" > /dev/null && echo "$(GREEN)✅ /api/flow/by-contract$(NC)" || (echo "$(RED)❌ /api/flow/by-contract$(NC)" && exit 1)
 	@echo ""
 	@echo "$(GREEN)✅ Staging smoke checklist passed$(NC)"
 
