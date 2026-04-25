@@ -10,6 +10,7 @@ This engine:
 """
 
 import os
+import random
 import signal
 import sys
 import hashlib
@@ -44,6 +45,19 @@ logger = get_logger(__name__)
 
 # Eastern Time timezone
 ET = pytz.timezone("US/Eastern")
+
+
+def _compute_db_backoff_seconds(consecutive_failures: int) -> float:
+    """Exponential backoff in seconds with 0–10% jitter.
+
+    Lives at module scope so both upsert call sites share a single
+    backoff policy and so the policy is unit-testable without booting
+    the engine. Base is `2^N` capped at 60s; jitter is uniform on
+    [0, base * 0.1) so concurrent workers hitting the same DB blip
+    don't retry in lockstep.
+    """
+    base = min(2**consecutive_failures, 60)
+    return base + random.uniform(0, base * 0.1)
 
 
 def _to_db_float(value: Any) -> Optional[float]:
@@ -310,11 +324,11 @@ class IngestionEngine:
         except Exception as e:
             self._db_consecutive_failures += 1
             self.errors_count += 1
-            backoff = min(2**self._db_consecutive_failures, 60)
+            backoff = _compute_db_backoff_seconds(self._db_consecutive_failures)
             self._db_backoff_until = _time.monotonic() + backoff
             logger.error(
                 f"[CIRCUIT-BREAKER] Underlying upsert failed "
-                f"(attempt #{self._db_consecutive_failures}, backoff {backoff}s): {e}",
+                f"(attempt #{self._db_consecutive_failures}, backoff {backoff:.2f}s): {e}",
                 exc_info=True,
             )
 
@@ -917,8 +931,7 @@ class IngestionEngine:
         except Exception as e:
             self._db_consecutive_failures += 1
             self.errors_count += 1
-            # Exponential backoff: 2s, 4s, 8s, 16s, 32s, 60s cap
-            backoff = min(2**self._db_consecutive_failures, 60)
+            backoff = _compute_db_backoff_seconds(self._db_consecutive_failures)
             self._db_backoff_until = _time.monotonic() + backoff
 
             # The baseline cache was optimistically advanced in
@@ -939,7 +952,7 @@ class IngestionEngine:
             ts_max = max(timestamps) if timestamps else None
             logger.error(
                 "[CIRCUIT-BREAKER] DB write failed (%d rows, %d unique symbols, "
-                "underlyings=%s, attempt #%d, backoff %ds): %s\n"
+                "underlyings=%s, attempt #%d, backoff %.2fs): %s\n"
                 "  first_symbol=%s last_symbol=%s\n"
                 "  timestamp range: %s .. %s",
                 len(rows),
