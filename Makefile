@@ -213,15 +213,15 @@ db-drop-unused-indexes: ## Drop 4 indexes with idx_scan=0 (~2.8 GB reclaimed). R
 	@echo "$(YELLOW)  idx_option_chains_timestamp_volfilter  (190 MB)$(NC)"
 	@if [ "$${CONFIRM}" != "yes" ]; then \
 		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to actually drop.$(NC)"; \
-		exit 0; \
+	else \
+		printf "%s\n" \
+			"DROP INDEX CONCURRENTLY IF EXISTS idx_option_chains_gamma_oi;" \
+			"DROP INDEX CONCURRENTLY IF EXISTS idx_option_chains_iv_volume;" \
+			"DROP INDEX CONCURRENTLY IF EXISTS idx_option_chains_expiration_range;" \
+			"DROP INDEX CONCURRENTLY IF EXISTS idx_option_chains_timestamp_volfilter;" \
+			| $(PSQL) -v ON_ERROR_STOP=1; \
+		echo "$(GREEN)✓ Unused indexes dropped. Run 'make analytics-snapshot-diagnose' to re-check.$(NC)"; \
 	fi
-	@printf "%s\n" \
-		"DROP INDEX CONCURRENTLY IF EXISTS idx_option_chains_gamma_oi;" \
-		"DROP INDEX CONCURRENTLY IF EXISTS idx_option_chains_iv_volume;" \
-		"DROP INDEX CONCURRENTLY IF EXISTS idx_option_chains_expiration_range;" \
-		"DROP INDEX CONCURRENTLY IF EXISTS idx_option_chains_timestamp_volfilter;" \
-		| $(PSQL) -v ON_ERROR_STOP=1
-	@echo "$(GREEN)✓ Unused indexes dropped. Run 'make analytics-snapshot-diagnose' to re-check.$(NC)"
 
 .PHONY: flow-explain
 flow-explain: ## Diagnose /api/flow/series query planner choice on flow_by_contract (FLOW_SYMBOL=SPY)
@@ -271,12 +271,12 @@ flow-index-prune: ## Drop idx_flow_by_contract_symbol_ts_strike (~55 MB; planner
 	@echo "$(YELLOW)Re-run 'make flow-explain' afterwards to confirm fallback latency stays acceptable.$(NC)"
 	@if [ "$${CONFIRM}" != "yes" ]; then \
 		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to actually drop.$(NC)"; \
-		exit 0; \
+	else \
+		printf "%s\n" \
+			"DROP INDEX CONCURRENTLY IF EXISTS idx_flow_by_contract_symbol_ts_strike;" \
+			| $(PSQL) -v ON_ERROR_STOP=1; \
+		echo "$(GREEN)✓ Index dropped. Run 'make flow-explain' to confirm planner fallback.$(NC)"; \
 	fi
-	@printf "%s\n" \
-		"DROP INDEX CONCURRENTLY IF EXISTS idx_flow_by_contract_symbol_ts_strike;" \
-		| $(PSQL) -v ON_ERROR_STOP=1
-	@echo "$(GREEN)✓ Index dropped. Run 'make flow-explain' to confirm planner fallback.$(NC)"
 
 .PHONY: help
 help: ## Show this help message
