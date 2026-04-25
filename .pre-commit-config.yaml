@@ -1,0 +1,42 @@
+# Pre-commit hooks for ZeroGEX-OA.
+#
+# Install once with:   pre-commit install
+# Run on demand with:  pre-commit run --all-files
+#
+# Versions are pinned so contributors get identical results locally and in CI.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: detect-private-key
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+
+  - repo: https://github.com/psf/black
+    rev: 24.8.0
+    hooks:
+      - id: black
+        args: ["--config=pyproject.toml"]
+
+  - repo: https://github.com/pycqa/flake8
+    rev: 7.1.1
+    hooks:
+      - id: flake8
+        # Match Makefile / CI scope.
+        files: ^(src|tests)/
+
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        # `.env.example` uses placeholder values (e.g. xxxxxxxxxx) that scan clean.
+        # Real `.env` files are .gitignored and never reach pre-commit anyway.
+        exclude: ^\.env\.example$

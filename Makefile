@@ -422,6 +422,56 @@ help: ## Show this help message
 	@echo "$(GREEN)Interactive:$(NC)"
 	@echo "  make psql             - Open PostgreSQL shell"
 	@echo "  make query SQL=\"...\"  - Run custom query"
+	@echo ""
+	@echo "$(GREEN)Quality / CI:$(NC)"
+	@echo "  make test               - Run pytest with coverage"
+	@echo "  make test-fast          - Run pytest without coverage (faster)"
+	@echo "  make lint               - Run flake8 on src + tests"
+	@echo "  make fmt                - Run black on src + tests (writes changes)"
+	@echo "  make fmt-check          - Run black --check (no writes; CI-style)"
+	@echo "  make type-check         - Run mypy on src"
+	@echo "  make ci                 - fmt-check + lint + type-check + test"
+	@echo "  make install-dev        - Install package + dev extras into active env"
+
+
+# =============================================================================
+# Quality / CI
+# =============================================================================
+# Use the venv Python if it exists; otherwise fall back to the active interpreter.
+PY ?= $(shell test -x venv/bin/python && echo venv/bin/python || command -v python3 || echo python)
+
+.PHONY: install-dev
+install-dev: ## Install package + dev/metrics/greeks/api extras into the active env
+	$(PY) -m pip install --upgrade pip
+	$(PY) -m pip install -e ".[dev,metrics,greeks,api]"
+
+.PHONY: test
+test: ## Run pytest with coverage (per pyproject addopts)
+	$(PY) -m pytest
+
+.PHONY: test-fast
+test-fast: ## Run pytest without coverage (faster local iteration)
+	$(PY) -m pytest --no-cov -q
+
+.PHONY: lint
+lint: ## Run flake8 on src + tests
+	$(PY) -m flake8 src tests
+
+.PHONY: fmt
+fmt: ## Run black on src + tests (writes changes)
+	$(PY) -m black src tests
+
+.PHONY: fmt-check
+fmt-check: ## Run black --check on src + tests (CI-style; no writes)
+	$(PY) -m black --check src tests
+
+.PHONY: type-check
+type-check: ## Run mypy on src
+	$(PY) -m mypy src
+
+.PHONY: ci
+ci: fmt-check lint type-check test ## Run the full local CI suite (fmt-check, lint, type-check, test)
+	@echo "$(GREEN)✓ CI checks passed$(NC)"
 
 
 # =============================================================================
