@@ -30,12 +30,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install black flake8 mypy
 
-      # The format/lint/type jobs are advisory until a dedicated cleanup PR
+      # The lint/type jobs are advisory until a dedicated cleanup PR
       # brings the existing tree into compliance. Drop `continue-on-error`
       # one-by-one as each tool reaches zero findings.
-      - name: black --check (advisory)
+      - name: black --check
         run: black --check src tests
-        continue-on-error: true
 
       - name: flake8 (advisory)
         run: flake8 src tests

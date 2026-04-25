@@ -545,12 +545,14 @@ class UnifiedSignalEngine:
                 # have spot VIX; vix_9d / vix_3m would need a separate ingest.
                 vix_level: Optional[float] = None
                 try:
-                    cur.execute("""
+                    cur.execute(
+                        """
                         SELECT close
                         FROM vix_bars
                         ORDER BY timestamp DESC
                         LIMIT 1
-                        """)
+                        """
+                    )
                     vix_row = cur.fetchone()
                     if vix_row and vix_row[0] is not None:
                         vix_level = float(vix_row[0])
