@@ -261,6 +261,23 @@ flow-explain: ## Diagnose /api/flow/series query planner choice on flow_by_contr
 	@echo "  • $(RED)Index size >> table size$(NC) in [1] AND $(RED)low idx_scan$(NC) in [4] → consider DROP."
 	@echo "  • $(RED)High dead_pct$(NC) in [2] AND large idx size in [4] → REINDEX CONCURRENTLY may shrink the index."
 
+.PHONY: flow-index-prune
+flow-index-prune: ## Drop idx_flow_by_contract_symbol_ts_strike (~55 MB; planner doesn't use it). Pass CONFIRM=yes to execute.
+	@echo "$(BLUE)=== Pruning idx_flow_by_contract_symbol_ts_strike ===$(NC)"
+	@echo "$(YELLOW)Production EXPLAIN ANALYZE confirmed the planner picks$(NC)"
+	@echo "$(YELLOW)idx_flow_by_contract_symbol_ts_type for strike-only filters$(NC)"
+	@echo "$(YELLOW)and idx_flow_by_contract_symbol_ts_exp for strike+expiration.$(NC)"
+	@echo "$(YELLOW)idx_flow_by_contract_symbol_ts_strike: 55 MB, ~0.001%% of total scans.$(NC)"
+	@echo "$(YELLOW)Re-run 'make flow-explain' afterwards to confirm fallback latency stays acceptable.$(NC)"
+	@if [ "$${CONFIRM}" != "yes" ]; then \
+		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to actually drop.$(NC)"; \
+		exit 0; \
+	fi
+	@printf "%s\n" \
+		"DROP INDEX CONCURRENTLY IF EXISTS idx_flow_by_contract_symbol_ts_strike;" \
+		| $(PSQL) -v ON_ERROR_STOP=1
+	@echo "$(GREEN)✓ Index dropped. Run 'make flow-explain' to confirm planner fallback.$(NC)"
+
 .PHONY: help
 help: ## Show this help message
 	@echo "=========================================="
@@ -449,6 +466,7 @@ help: ## Show this help message
 	@echo "  make db-tail-api-calls            - Last 50 rows from tradestation_api_calls"
 	@echo "  make db-diagnostics               - DB diagnostics (sessions, locks, waits, slow queries)"
 	@echo "  make flow-explain                 - EXPLAIN ANALYZE flow_by_contract queries (FLOW_SYMBOL=SPY)"
+	@echo "  make flow-index-prune             - Drop idx_flow_by_contract_symbol_ts_strike (CONFIRM=yes)"
 	@echo ""
 	@echo "$(GREEN)Maintenance:$(NC)"
 	@echo "  make vacuum             - Vacuum analyze all tables"

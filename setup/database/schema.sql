@@ -519,8 +519,12 @@ CREATE TABLE IF NOT EXISTS flow_smart_money (
 
 CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts
     ON flow_by_contract(symbol, timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts_strike
-    ON flow_by_contract(symbol, timestamp DESC, strike);
+-- idx_flow_by_contract_symbol_ts_strike intentionally omitted.
+-- See `make flow-index-prune`: planner consistently prefers
+-- idx_flow_by_contract_symbol_ts_type + heap recheck for strike
+-- filters; the strike index was 55 MB (50% of all flow index storage)
+-- for 0.001% of total scans. Existing deployments can drop it via
+-- `make flow-index-prune CONFIRM=yes`.
 CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts_exp
     ON flow_by_contract(symbol, timestamp DESC, expiration);
 CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts_type
