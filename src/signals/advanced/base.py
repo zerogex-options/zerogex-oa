@@ -1,4 +1,5 @@
 """Shared primitives for advanced (non-composite) signals."""
+
 from __future__ import annotations
 
 import math

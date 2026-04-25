@@ -75,8 +75,10 @@ class IngestionEngine:
     ):
         """Initialize main ingestion engine"""
         self.client = client
-        self.underlying = underlying.upper()         # TradeStation API symbol (e.g. "$SPX.X")
-        self.db_symbol = get_canonical_symbol(self.underlying)  # canonical alias for DB (e.g. "SPX")
+        self.underlying = underlying.upper()  # TradeStation API symbol (e.g. "$SPX.X")
+        self.db_symbol = get_canonical_symbol(
+            self.underlying
+        )  # canonical alias for DB (e.g. "SPX")
         self.num_expirations = num_expirations
         self.num_strikes = num_strikes
 
@@ -255,7 +257,9 @@ class IngestionEngine:
 
             # Log when we first get underlying price (important for Greeks)
             if old_price is None:
-                logger.info(f"🎯 First underlying price received: ${self.latest_underlying_price:.2f}")
+                logger.info(
+                    f"🎯 First underlying price received: ${self.latest_underlying_price:.2f}"
+                )
                 logger.info("   Greeks calculation can now proceed for options")
             elif self.underlying_bars_stored % 10 == 0:  # Log every 10 bars
                 logger.debug(f"Underlying price updated: ${self.latest_underlying_price:.2f}")
@@ -268,7 +272,8 @@ class IngestionEngine:
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("""
+                cursor.execute(
+                    """
                     INSERT INTO underlying_quotes
                     (symbol, timestamp, open, high, low, close, up_volume, down_volume)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -280,16 +285,18 @@ class IngestionEngine:
                         up_volume = EXCLUDED.up_volume,
                         down_volume = EXCLUDED.down_volume,
                         updated_at = NOW()
-                """, (
-                    quote["symbol"],
-                    quote["timestamp"],
-                    quote["open"],
-                    quote["high"],
-                    quote["low"],
-                    quote["close"],
-                    quote["up_volume"],
-                    quote["down_volume"],
-                ))
+                """,
+                    (
+                        quote["symbol"],
+                        quote["timestamp"],
+                        quote["open"],
+                        quote["high"],
+                        quote["low"],
+                        quote["close"],
+                        quote["up_volume"],
+                        quote["down_volume"],
+                    ),
+                )
                 conn.commit()
                 # Reset breaker on success (underlying writes confirm DB is alive).
                 self._db_consecutive_failures = 0
@@ -301,7 +308,7 @@ class IngestionEngine:
         except Exception as e:
             self._db_consecutive_failures += 1
             self.errors_count += 1
-            backoff = min(2 ** self._db_consecutive_failures, 60)
+            backoff = min(2**self._db_consecutive_failures, 60)
             self._db_backoff_until = _time.monotonic() + backoff
             logger.error(
                 f"[CIRCUIT-BREAKER] Underlying upsert failed "
@@ -317,16 +324,19 @@ class IngestionEngine:
         if self.greeks_calculator and self.latest_underlying_price:
             try:
                 if self.greeks_calculated == 0:
-                    logger.info(f"Starting Greeks calculation with underlying price: ${self.latest_underlying_price:.2f}")
+                    logger.info(
+                        f"Starting Greeks calculation with underlying price: ${self.latest_underlying_price:.2f}"
+                    )
                     logger.debug(f"Sample option data before Greeks: {data}")
 
                 enriched_data = self.greeks_calculator.enrich_option_data(
-                    data,
-                    self.latest_underlying_price
+                    data, self.latest_underlying_price
                 )
 
                 if enriched_data is None:
-                    logger.error(f"Greeks calculator returned None for {data.get('option_symbol', 'unknown')}, using original data")
+                    logger.error(
+                        f"Greeks calculator returned None for {data.get('option_symbol', 'unknown')}, using original data"
+                    )
                     data["delta"] = data["gamma"] = data["theta"] = data["vega"] = None
                 else:
                     data = enriched_data
@@ -334,14 +344,21 @@ class IngestionEngine:
                     if self.greeks_calculated % 100 == 0:
                         logger.info(f"Calculated Greeks for {self.greeks_calculated} options")
                     if self.greeks_calculated == 1:
-                        logger.info(f"✅ First Greek calculated successfully: delta={data.get('delta')}, gamma={data.get('gamma')}")
+                        logger.info(
+                            f"✅ First Greek calculated successfully: delta={data.get('delta')}, gamma={data.get('gamma')}"
+                        )
 
             except Exception as e:
-                logger.error(f"Error calculating Greeks for {data.get('option_symbol', 'unknown')}: {e}", exc_info=True)
+                logger.error(
+                    f"Error calculating Greeks for {data.get('option_symbol', 'unknown')}: {e}",
+                    exc_info=True,
+                )
                 data["delta"] = data["gamma"] = data["theta"] = data["vega"] = None
         elif self.greeks_calculator and not self.latest_underlying_price:
             if self.greeks_calculated == 0:
-                logger.warning("⚠️  Skipping Greeks calculation - no underlying price available yet")
+                logger.warning(
+                    "⚠️  Skipping Greeks calculation - no underlying price available yet"
+                )
             data["delta"] = data["gamma"] = data["theta"] = data["vega"] = None
         else:
             data["delta"] = data["gamma"] = data["theta"] = data["vega"] = None
@@ -381,7 +398,9 @@ class IngestionEngine:
 
             timestamp = data.get("timestamp")
             if timestamp is None:
-                logger.error(f"Option data missing timestamp: {data.get('option_symbol', 'unknown')}")
+                logger.error(
+                    f"Option data missing timestamp: {data.get('option_symbol', 'unknown')}"
+                )
                 continue
 
             bucket = bucket_timestamp(timestamp, AGGREGATION_BUCKET_SECONDS)
@@ -399,7 +418,9 @@ class IngestionEngine:
                     prev_bucket = bucket_timestamp(prev_timestamp, AGGREGATION_BUCKET_SECONDS)
                     if prev_bucket != bucket:
                         prev_snapshot = existing[-1]
-                        agg = self._prepare_option_agg(option_symbol, prev_bucket, keep_last_snapshot=False)
+                        agg = self._prepare_option_agg(
+                            option_symbol, prev_bucket, keep_last_snapshot=False
+                        )
                         if agg:
                             rows_to_write.append(agg)
                         # Seed the new bucket with the previous snapshot for volume delta.
@@ -423,7 +444,9 @@ class IngestionEngine:
         # correct time bucket (not forced into "now").
         total_buffered = sum(len(v) for v in self.options_buffer.values())
         if total_buffered >= MAX_BUFFER_SIZE:
-            logger.warning(f"Option buffer limit reached ({total_buffered} items), flushing all option buffers")
+            logger.warning(
+                f"Option buffer limit reached ({total_buffered} items), flushing all option buffers"
+            )
             overflow_rows = []
             for sym in list(self.options_buffer.keys()):
                 buf = self.options_buffer.get(sym)
@@ -477,7 +500,14 @@ class IngestionEngine:
         self._option_bucket_last_write[key] = now_mono
         return True
 
-    def _classify_volume_chunk(self, volume_delta: int, last: Optional[float], bid: Optional[float], ask: Optional[float], mid: Optional[float]) -> tuple:
+    def _classify_volume_chunk(
+        self,
+        volume_delta: int,
+        last: Optional[float],
+        bid: Optional[float],
+        ask: Optional[float],
+        mid: Optional[float],
+    ) -> tuple:
         """
         Classify a volume chunk into ask_volume, mid_volume, or bid_volume
         based on how close the last traded price is to each level.
@@ -561,7 +591,9 @@ class IngestionEngine:
         with self._option_volume_baseline_lock:
             self._option_volume_baseline.pop(option_symbol, None)
 
-    def _prepare_option_agg(self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False) -> Optional[Dict[str, Any]]:
+    def _prepare_option_agg(
+        self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False
+    ) -> Optional[Dict[str, Any]]:
         """Aggregate a per-symbol option buffer into a single row dict.
 
         Handles volume delta classification and buffer cleanup.
@@ -593,8 +625,10 @@ class IngestionEngine:
                 if vol_delta > 0:
                     av, mv, bv = self._classify_volume_chunk(
                         vol_delta,
-                        curr.get("last"), curr.get("bid"),
-                        curr.get("ask"), curr.get("mid"),
+                        curr.get("last"),
+                        curr.get("bid"),
+                        curr.get("ask"),
+                        curr.get("mid"),
                     )
                     ask_volume += av
                     mid_volume += mv
@@ -608,8 +642,10 @@ class IngestionEngine:
                     if vol_delta > 0:
                         av, mv, bv = self._classify_volume_chunk(
                             vol_delta,
-                            curr.get("last"), curr.get("bid"),
-                            curr.get("ask"), curr.get("mid"),
+                            curr.get("last"),
+                            curr.get("bid"),
+                            curr.get("ask"),
+                            curr.get("mid"),
                         )
                         ask_volume += av
                         mid_volume += mv
@@ -618,7 +654,9 @@ class IngestionEngine:
             # Use the best available bid/ask/last from any snapshot in
             # the buffer — fall back through the buffer so a single delta
             # that omits price fields doesn't wipe previously-seen values.
-            best_last = next((b["last"] for b in reversed(buffer) if b.get("last") is not None), None)
+            best_last = next(
+                (b["last"] for b in reversed(buffer) if b.get("last") is not None), None
+            )
             best_bid = next((b["bid"] for b in reversed(buffer) if b.get("bid") is not None), None)
             best_ask = next((b["ask"] for b in reversed(buffer) if b.get("ask") is not None), None)
             best_mid = next((b["mid"] for b in reversed(buffer) if b.get("mid") is not None), None)
@@ -663,7 +701,8 @@ class IngestionEngine:
             else:
                 self.options_buffer[option_symbol] = []
                 stale_keys = [
-                    key for key in self._option_bucket_last_write
+                    key
+                    for key in self._option_bucket_last_write
                     if key[0] == option_symbol and key[1] <= bucket
                 ]
                 for key in stale_keys:
@@ -729,18 +768,36 @@ class IngestionEngine:
                 continue
 
             # Preserve latest non-null quote fields.
-            for field in ("last", "bid", "ask", "mid", "implied_volatility", "delta", "gamma", "theta", "vega"):
+            for field in (
+                "last",
+                "bid",
+                "ask",
+                "mid",
+                "implied_volatility",
+                "delta",
+                "gamma",
+                "theta",
+                "vega",
+            ):
                 if row.get(field) is not None:
                     existing[field] = row[field]
 
             # Preserve monotonic fields.
             existing["volume"] = max(existing.get("volume") or 0, row.get("volume") or 0)
-            existing["open_interest"] = max(existing.get("open_interest") or 0, row.get("open_interest") or 0)
+            existing["open_interest"] = max(
+                existing.get("open_interest") or 0, row.get("open_interest") or 0
+            )
 
             # Preserve additive flow fields.
-            existing["ask_volume"] = (existing.get("ask_volume") or 0) + (row.get("ask_volume") or 0)
-            existing["mid_volume"] = (existing.get("mid_volume") or 0) + (row.get("mid_volume") or 0)
-            existing["bid_volume"] = (existing.get("bid_volume") or 0) + (row.get("bid_volume") or 0)
+            existing["ask_volume"] = (existing.get("ask_volume") or 0) + (
+                row.get("ask_volume") or 0
+            )
+            existing["mid_volume"] = (existing.get("mid_volume") or 0) + (
+                row.get("mid_volume") or 0
+            )
+            existing["bid_volume"] = (existing.get("bid_volume") or 0) + (
+                row.get("bid_volume") or 0
+            )
 
         return list(coalesced.values())
 
@@ -833,8 +890,7 @@ class IngestionEngine:
                         )
 
             logger.debug(
-                f"Wrote {len(rows)} option rows in single transaction "
-                f"({elapsed_ms:.1f}ms)"
+                f"Wrote {len(rows)} option rows in single transaction " f"({elapsed_ms:.1f}ms)"
             )
 
             # Periodic observability summary (every 60s).
@@ -862,7 +918,7 @@ class IngestionEngine:
             self._db_consecutive_failures += 1
             self.errors_count += 1
             # Exponential backoff: 2s, 4s, 8s, 16s, 32s, 60s cap
-            backoff = min(2 ** self._db_consecutive_failures, 60)
+            backoff = min(2**self._db_consecutive_failures, 60)
             self._db_backoff_until = _time.monotonic() + backoff
 
             # The baseline cache was optimistically advanced in
@@ -899,7 +955,9 @@ class IngestionEngine:
                 exc_info=True,
             )
 
-    def _flush_option_bucket(self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False):
+    def _flush_option_bucket(
+        self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False
+    ):
         """Flush a single option bucket (used by _flush_all_buffers)."""
         agg = self._prepare_option_agg(option_symbol, bucket, keep_last_snapshot)
         if agg:
@@ -907,7 +965,9 @@ class IngestionEngine:
 
     def _flush_all_buffers(self):
         """Flush all pending buffers"""
-        logger.info(f"Flushing all buffers... (Underlying: {len(self.underlying_buffer)}, Options: {sum(len(v) for v in self.options_buffer.values())} across {len(self.options_buffer)} symbols)")
+        logger.info(
+            f"Flushing all buffers... (Underlying: {len(self.underlying_buffer)}, Options: {sum(len(v) for v in self.options_buffer.values())} across {len(self.options_buffer)} symbols)"
+        )
 
         # Flush all options
         current_time = datetime.now(ET)
@@ -935,9 +995,9 @@ class IngestionEngine:
         if not is_engine_run_window():
             logger.info("Skipping stream start outside configured run window")
             return True
-        logger.info("="*80)
+        logger.info("=" * 80)
         logger.info("STREAMING PHASE")
-        logger.info("="*80)
+        logger.info("=" * 80)
 
         stream_manager = StreamManager(
             client=self.client,
@@ -992,16 +1052,16 @@ class IngestionEngine:
 
     def run(self):
         """Run forward-only ingestion pipeline"""
-        logger.info("\n" + "="*80)
+        logger.info("\n" + "=" * 80)
         logger.info("ZEROGEX MAIN INGESTION ENGINE - FORWARD ONLY")
-        logger.info("="*80)
+        logger.info("=" * 80)
         logger.info(f"Underlying: {self.underlying}")
         logger.info(f"Expirations: {self.num_expirations}")
         logger.info(f"Strikes Each Side: {self.num_strikes}")
         logger.info(f"Greeks: {'ENABLED' if GREEKS_ENABLED else 'DISABLED'}")
         logger.info("")
         logger.info("NOTE: This engine streams forward-looking data.")
-        logger.info("="*80 + "\n")
+        logger.info("=" * 80 + "\n")
 
         self.running = True
         try:
@@ -1030,15 +1090,15 @@ class IngestionEngine:
             sys.exit(1)
         finally:
             # Print final stats
-            logger.info("\n" + "="*80)
+            logger.info("\n" + "=" * 80)
             logger.info("SESSION SUMMARY")
-            logger.info("="*80)
+            logger.info("=" * 80)
             logger.info(f"Underlying bars stored: {self.underlying_bars_stored}")
             logger.info(f"Option quotes stored: {self.option_quotes_stored}")
             if GREEKS_ENABLED:
                 logger.info(f"Greeks calculated: {self.greeks_calculated}")
             logger.info(f"Errors encountered: {self.errors_count}")
-            logger.info("="*80 + "\n")
+            logger.info("=" * 80 + "\n")
 
             close_connection_pool()
 
@@ -1051,31 +1111,40 @@ def main():
     load_dotenv()
 
     parser = argparse.ArgumentParser(description="ZeroGEX Main Ingestion Engine")
-    parser.add_argument("--underlying", default=None,
-                       help="Single underlying symbol (backward compatible)")
+    parser.add_argument(
+        "--underlying", default=None, help="Single underlying symbol (backward compatible)"
+    )
     parser.add_argument(
         "--underlyings",
         default=os.getenv("INGEST_UNDERLYINGS", os.getenv("INGEST_UNDERLYING", "SPY")),
         help="Comma-separated underlying symbols or aliases (default: SPY)",
     )
-    parser.add_argument("--expirations", type=int,
-                       default=int(os.getenv("INGEST_EXPIRATIONS", "3")),
-                       help="Number of expirations (default: 3)")
-    parser.add_argument("--num-strikes", type=int,
-                       default=int(os.getenv("INGEST_STRIKE_COUNT", "10")),
-                       help="Number of strikes to track on each side of current price (default: 10)")
-    parser.add_argument("--session-template", 
-                       default=os.getenv("SESSION_TEMPLATE", "Default"),
-                       choices=["Default", "USEQPre", "USEQ24Hour"],
-                       help="Session template (default: Default)")
-    parser.add_argument("--debug", action="store_true",
-                       help="Enable debug logging")
+    parser.add_argument(
+        "--expirations",
+        type=int,
+        default=int(os.getenv("INGEST_EXPIRATIONS", "3")),
+        help="Number of expirations (default: 3)",
+    )
+    parser.add_argument(
+        "--num-strikes",
+        type=int,
+        default=int(os.getenv("INGEST_STRIKE_COUNT", "10")),
+        help="Number of strikes to track on each side of current price (default: 10)",
+    )
+    parser.add_argument(
+        "--session-template",
+        default=os.getenv("SESSION_TEMPLATE", "Default"),
+        choices=["Default", "USEQPre", "USEQ24Hour"],
+        help="Session template (default: Default)",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
     args = parser.parse_args()
 
     # Set logging level
     if args.debug:
         from src.utils import set_log_level
+
         set_log_level("DEBUG")
 
     raw_underlyings = args.underlying if args.underlying else args.underlyings
@@ -1092,7 +1161,7 @@ def main():
             os.getenv("TRADESTATION_CLIENT_ID"),
             os.getenv("TRADESTATION_CLIENT_SECRET"),
             os.getenv("TRADESTATION_REFRESH_TOKEN"),
-            sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true"
+            sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true",
         )
         attach_db_writer(client)
         engine = IngestionEngine(
@@ -1105,6 +1174,7 @@ def main():
 
     def run_vix_ingester():
         from src.ingestion.vix_ingester import main as vix_main
+
         vix_main()
 
     # Always run the VIX ingester alongside the per-symbol engines so that

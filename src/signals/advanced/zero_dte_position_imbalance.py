@@ -1,4 +1,5 @@
 """Advanced 0DTE position-imbalance detector."""
+
 from __future__ import annotations
 
 import math
@@ -104,9 +105,7 @@ class ZeroDtePositionImbalanceSignal:
             context={
                 "triggered": triggered,
                 "signal": (
-                    "call_heavy"
-                    if score > 0.25
-                    else ("put_heavy" if score < -0.25 else "balanced")
+                    "call_heavy" if score > 0.25 else ("put_heavy" if score < -0.25 else "balanced")
                 ),
                 "call_net_premium": round(call_net_total, 2),
                 "put_net_premium": round(put_net_total, 2),

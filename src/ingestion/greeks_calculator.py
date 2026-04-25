@@ -35,9 +35,7 @@ class GreeksCalculator:
     """
 
     def __init__(
-        self, 
-        risk_free_rate: float = RISK_FREE_RATE,
-        default_iv: float = IMPLIED_VOLATILITY_DEFAULT
+        self, risk_free_rate: float = RISK_FREE_RATE, default_iv: float = IMPLIED_VOLATILITY_DEFAULT
     ):
         """
         Initialize Greeks calculator
@@ -49,12 +47,16 @@ class GreeksCalculator:
         self.risk_free_rate = risk_free_rate
         self.default_iv = default_iv
 
-        logger.info(f"Initialized GreeksCalculator: r={risk_free_rate:.4f}, default_iv={default_iv:.4f}")
+        logger.info(
+            f"Initialized GreeksCalculator: r={risk_free_rate:.4f}, default_iv={default_iv:.4f}"
+        )
 
         # Add IV calculator if enabled
         if IV_CALCULATION_ENABLED:
             self.iv_calculator = IVCalculator()
-            logger.info("✅ IV calculation ENABLED - will calculate from option prices when API doesn't provide it")
+            logger.info(
+                "✅ IV calculation ENABLED - will calculate from option prices when API doesn't provide it"
+            )
         else:
             self.iv_calculator = None
             logger.info("⚠️  IV calculation DISABLED - will only use API-provided IV or default")
@@ -63,14 +65,7 @@ class GreeksCalculator:
         """Time-to-expiration in years (delegates to src.market_calendar)."""
         return calculate_time_to_expiration(current_date, expiration_date)
 
-    def _calculate_d1_d2(
-        self, 
-        S: float, 
-        K: float, 
-        T: float, 
-        r: float, 
-        sigma: float
-    ) -> tuple:
+    def _calculate_d1_d2(self, S: float, K: float, T: float, r: float, sigma: float) -> tuple:
         """
         Calculate d1 and d2 for Black-Scholes formula
 
@@ -88,24 +83,18 @@ class GreeksCalculator:
         if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
             return (0.0, 0.0)
 
-        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+        d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
         d2 = d1 - sigma * np.sqrt(T)
 
         return (d1, d2)
 
     def calculate_delta(
-        self, 
-        S: float, 
-        K: float, 
-        T: float, 
-        r: float, 
-        sigma: float, 
-        option_type: str
+        self, S: float, K: float, T: float, r: float, sigma: float, option_type: str
     ) -> float:
         """
         Calculate option delta
 
-        Delta represents the rate of change of option price with respect to 
+        Delta represents the rate of change of option price with respect to
         underlying price. Range: [0, 1] for calls, [-1, 0] for puts.
 
         Args:
@@ -121,21 +110,14 @@ class GreeksCalculator:
         """
         d1, _ = self._calculate_d1_d2(S, K, T, r, sigma)
 
-        if option_type == 'C':
+        if option_type == "C":
             delta = stats.norm.cdf(d1)
         else:  # Put
             delta = stats.norm.cdf(d1) - 1
 
         return delta
 
-    def calculate_gamma(
-        self, 
-        S: float, 
-        K: float, 
-        T: float, 
-        r: float, 
-        sigma: float
-    ) -> float:
+    def calculate_gamma(self, S: float, K: float, T: float, r: float, sigma: float) -> float:
         """
         Calculate option gamma
 
@@ -162,13 +144,7 @@ class GreeksCalculator:
         return gamma
 
     def calculate_theta(
-        self, 
-        S: float, 
-        K: float, 
-        T: float, 
-        r: float, 
-        sigma: float, 
-        option_type: str
+        self, S: float, K: float, T: float, r: float, sigma: float, option_type: str
     ) -> float:
         """
         Calculate option theta (per day)
@@ -193,34 +169,25 @@ class GreeksCalculator:
 
         d1, d2 = self._calculate_d1_d2(S, K, T, r, sigma)
 
-        if option_type == 'C':
-            theta = (
-                -S * stats.norm.pdf(d1) * sigma / (2 * np.sqrt(T))
-                - r * K * np.exp(-r * T) * stats.norm.cdf(d2)
-            )
+        if option_type == "C":
+            theta = -S * stats.norm.pdf(d1) * sigma / (2 * np.sqrt(T)) - r * K * np.exp(
+                -r * T
+            ) * stats.norm.cdf(d2)
         else:  # Put
-            theta = (
-                -S * stats.norm.pdf(d1) * sigma / (2 * np.sqrt(T))
-                + r * K * np.exp(-r * T) * stats.norm.cdf(-d2)
-            )
+            theta = -S * stats.norm.pdf(d1) * sigma / (2 * np.sqrt(T)) + r * K * np.exp(
+                -r * T
+            ) * stats.norm.cdf(-d2)
 
         # Convert from per year to per day
         theta_per_day = theta / 365.0
 
         return theta_per_day
 
-    def calculate_vega(
-        self, 
-        S: float, 
-        K: float, 
-        T: float, 
-        r: float, 
-        sigma: float
-    ) -> float:
+    def calculate_vega(self, S: float, K: float, T: float, r: float, sigma: float) -> float:
         """
         Calculate option vega
 
-        Vega represents the rate of change of option price with respect to 
+        Vega represents the rate of change of option price with respect to
         implied volatility. Returned per 1% change in IV.
         Vega is the same for calls and puts.
 
@@ -252,7 +219,7 @@ class GreeksCalculator:
         option_type: str,
         current_time: datetime,
         implied_volatility: Optional[float] = None,
-        risk_free_rate: Optional[float] = None
+        risk_free_rate: Optional[float] = None,
     ) -> Dict[str, float]:
         """
         Calculate all Greeks for an option
@@ -283,21 +250,11 @@ class GreeksCalculator:
         # Validate inputs
         if underlying_price <= 0:
             logger.warning(f"Invalid underlying price: {underlying_price}")
-            return {
-                "delta": 0.0,
-                "gamma": 0.0,
-                "theta": 0.0,
-                "vega": 0.0
-            }
+            return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
 
         if strike <= 0:
             logger.warning(f"Invalid strike: {strike}")
-            return {
-                "delta": 0.0,
-                "gamma": 0.0,
-                "theta": 0.0,
-                "vega": 0.0
-            }
+            return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
 
         # Calculate Greeks
         try:
@@ -318,7 +275,7 @@ class GreeksCalculator:
                 "delta": round(delta, 6),
                 "gamma": round(gamma, 8),
                 "theta": round(theta, 6),
-                "vega": round(vega, 6)
+                "vega": round(vega, 6),
             }
 
             logger.debug(f"Calculated Greeks for {option_type} {strike}: {greeks}")
@@ -327,17 +284,10 @@ class GreeksCalculator:
 
         except Exception as e:
             logger.error(f"Error calculating Greeks: {e}", exc_info=True)
-            return {
-                "delta": 0.0,
-                "gamma": 0.0,
-                "theta": 0.0,
-                "vega": 0.0
-            }
+            return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
 
     def enrich_option_data(
-        self,
-        option_data: Dict[str, Any],
-        underlying_price: float
+        self, option_data: Dict[str, Any], underlying_price: float
     ) -> Dict[str, Any]:
         """
         Enrich option data dictionary with IV (calculated if needed) and Greeks
@@ -345,7 +295,7 @@ class GreeksCalculator:
         This is the main integration point with the ingestion pipeline.
 
         Args:
-            option_data: Option data dict from ingestion (must have: strike, 
+            option_data: Option data dict from ingestion (must have: strike,
                         expiration, option_type, timestamp)
             underlying_price: Current underlying price
 
@@ -359,7 +309,9 @@ class GreeksCalculator:
 
         # Defensive check: ensure underlying_price is valid
         if underlying_price is None or underlying_price <= 0:
-            logger.warning(f"Invalid underlying_price: {underlying_price}, cannot calculate IV/Greeks")
+            logger.warning(
+                f"Invalid underlying_price: {underlying_price}, cannot calculate IV/Greeks"
+            )
             option_data["implied_volatility"] = None
             option_data["delta"] = None
             option_data["gamma"] = None
@@ -371,9 +323,7 @@ class GreeksCalculator:
         if self.iv_calculator:
             try:
                 enriched_data = self.iv_calculator.enrich_option_data_with_iv(
-                    option_data,
-                    underlying_price,
-                    self.risk_free_rate
+                    option_data, underlying_price, self.risk_free_rate
                 )
 
                 # Defensive check: ensure IV calculator didn't return None
@@ -403,8 +353,10 @@ class GreeksCalculator:
 
         # Validate required fields
         if not all([strike, expiration, option_type, timestamp]):
-            logger.warning(f"Missing required fields for Greeks calculation: "
-                          f"strike={strike}, exp={expiration}, type={option_type}, ts={timestamp}")
+            logger.warning(
+                f"Missing required fields for Greeks calculation: "
+                f"strike={strike}, exp={expiration}, type={option_type}, ts={timestamp}"
+            )
             # Add None Greeks
             option_data["delta"] = None
             option_data["gamma"] = None
@@ -420,7 +372,7 @@ class GreeksCalculator:
                 expiration=expiration,
                 option_type=option_type,
                 current_time=timestamp,
-                implied_volatility=implied_volatility
+                implied_volatility=implied_volatility,
             )
 
             # Defensive check: ensure calculate_all_greeks returned a dict
@@ -449,9 +401,9 @@ def main():
     """Test Greeks calculator"""
     from datetime import timedelta
 
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("GREEKS CALCULATOR TEST")
-    print("="*80 + "\n")
+    print("=" * 80 + "\n")
 
     # Initialize calculator
     calc = GreeksCalculator()
@@ -479,8 +431,8 @@ def main():
         underlying_price=underlying_price,
         strike=strike,
         expiration=expiration,
-        option_type='C',
-        current_time=current_time
+        option_type="C",
+        current_time=current_time,
     )
 
     print(f"  Delta: {call_greeks['delta']:8.6f}  (Δ)")
@@ -496,8 +448,8 @@ def main():
         underlying_price=underlying_price,
         strike=strike,
         expiration=expiration,
-        option_type='P',
-        current_time=current_time
+        option_type="P",
+        current_time=current_time,
     )
 
     print(f"  Delta: {put_greeks['delta']:8.6f}  (Δ)")
@@ -522,7 +474,7 @@ def main():
         "ask": 5.30,
         "volume": 1000,
         "open_interest": 5000,
-        "implied_volatility": 0.18
+        "implied_volatility": 0.18,
     }
 
     enriched = calc.enrich_option_data(option_data, underlying_price)
@@ -537,9 +489,9 @@ def main():
     print(f"    Theta: {enriched['theta']:8.6f}")
     print(f"    Vega:  {enriched['vega']:8.6f}")
 
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("✅ Greeks calculator test complete!")
-    print("="*80 + "\n")
+    print("=" * 80 + "\n")
 
 
 if __name__ == "__main__":

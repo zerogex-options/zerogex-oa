@@ -43,8 +43,24 @@ def test_gex_by_strike_weights_gamma_by_open_interest():
 def test_max_pain_minimizes_total_intrinsic_payout():
     engine = AnalyticsEngine(underlying="SPY")
     options = [
-        {"strike": 100.0, "option_type": "C", "open_interest": 100, "volume": 0, "gamma": 0, "expiration": datetime(2026, 3, 27).date(), "implied_volatility": 0.2},
-        {"strike": 110.0, "option_type": "P", "open_interest": 100, "volume": 0, "gamma": 0, "expiration": datetime(2026, 3, 27).date(), "implied_volatility": 0.2},
+        {
+            "strike": 100.0,
+            "option_type": "C",
+            "open_interest": 100,
+            "volume": 0,
+            "gamma": 0,
+            "expiration": datetime(2026, 3, 27).date(),
+            "implied_volatility": 0.2,
+        },
+        {
+            "strike": 110.0,
+            "option_type": "P",
+            "open_interest": 100,
+            "volume": 0,
+            "gamma": 0,
+            "expiration": datetime(2026, 3, 27).date(),
+            "implied_volatility": 0.2,
+        },
     ]
     # At settlement 100 => put payout 1000; at 110 => call payout 1000; tie picks lower strike due sort.
     assert engine._calculate_max_pain(options) == 100.0

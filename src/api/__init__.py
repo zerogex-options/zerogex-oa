@@ -14,11 +14,11 @@ from .models import (
 from .database import DatabaseManager
 
 __all__ = [
-    'app',
-    'GEXSummary',
-    'GEXByStrike',
-    'OptionFlow',
-    'UnderlyingQuote',
-    'HealthStatus',
-    'DatabaseManager',
+    "app",
+    "GEXSummary",
+    "GEXByStrike",
+    "OptionFlow",
+    "UnderlyingQuote",
+    "HealthStatus",
+    "DatabaseManager",
 ]

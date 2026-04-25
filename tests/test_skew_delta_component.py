@@ -1,4 +1,5 @@
 """Tests for skew_delta component."""
+
 from datetime import datetime, timezone
 
 from src.signals.components.base import MarketContext

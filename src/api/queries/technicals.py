@@ -23,10 +23,7 @@ class TechnicalsQueriesMixin:
     """
 
     async def get_vwap_deviation(
-        self,
-        symbol: str = 'SPY',
-        timeframe: str = '1min',
-        window_units: int = 20
+        self, symbol: str = "SPY", timeframe: str = "1min", window_units: int = 20
     ) -> List[Dict[str, Any]]:
         """Get VWAP deviation for mean reversion signals by interval/window."""
         window_units = max(1, min(window_units, 90))
@@ -86,10 +83,7 @@ class TechnicalsQueriesMixin:
             raise
 
     async def get_opening_range_breakout(
-        self,
-        symbol: str = 'SPY',
-        timeframe: str = '1min',
-        window_units: int = 20
+        self, symbol: str = "SPY", timeframe: str = "1min", window_units: int = 20
     ) -> List[Dict[str, Any]]:
         """Get opening range breakout status by interval/window."""
         window_units = max(1, min(window_units, 90))
@@ -157,9 +151,7 @@ class TechnicalsQueriesMixin:
             raise
 
     async def get_dealer_hedging_pressure(
-        self,
-        symbol: str = 'SPY',
-        limit: int = 20
+        self, symbol: str = "SPY", limit: int = 20
     ) -> List[Dict[str, Any]]:
         """Get dealer hedging pressure"""
         query = """
@@ -186,9 +178,7 @@ class TechnicalsQueriesMixin:
             raise
 
     async def get_unusual_volume_spikes(
-        self,
-        symbol: str = 'SPY',
-        limit: int = 20
+        self, symbol: str = "SPY", limit: int = 20
     ) -> List[Dict[str, Any]]:
         """Get unusual volume spikes"""
         query = """
@@ -218,10 +208,7 @@ class TechnicalsQueriesMixin:
             raise
 
     async def get_momentum_divergence(
-        self,
-        symbol: str = 'SPY',
-        timeframe: str = '1min',
-        window_units: int = 20
+        self, symbol: str = "SPY", timeframe: str = "1min", window_units: int = 20
     ) -> List[Dict[str, Any]]:
         """Get momentum divergence signals matching Makefile divergence shortcut semantics."""
         window_units = max(1, min(window_units, 90))
@@ -277,4 +264,3 @@ class TechnicalsQueriesMixin:
         except Exception as e:
             logger.error(f"Error fetching momentum divergence: {e}", exc_info=True)
             raise
-

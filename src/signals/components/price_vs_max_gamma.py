@@ -3,6 +3,7 @@
 Close to max gamma implies pinning (lower move potential).
 Far from max gamma implies freer movement (higher potential).
 """
+
 from __future__ import annotations
 
 from src.signals.components.base import ComponentBase, MarketContext

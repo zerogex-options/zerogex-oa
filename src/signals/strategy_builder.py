@@ -67,7 +67,9 @@ class StrategyBuilder:
         return max(-1.0, min(1.0, z))
 
     @staticmethod
-    def _term_structure_iv(option_rows: Optional[list[dict]]) -> tuple[Optional[float], Optional[float]]:
+    def _term_structure_iv(
+        option_rows: Optional[list[dict]],
+    ) -> tuple[Optional[float], Optional[float]]:
         if not option_rows:
             return None, None
         by_expiry: dict = {}
@@ -104,7 +106,8 @@ class StrategyBuilder:
             term_contango = max(0.0, far_iv - near_iv)
 
         trend_score = self._clamp(
-            max(score_normalized, momentum_mag) * (0.75 if (iv_rank > 0.7 and momentum_dead) else 1.0),
+            max(score_normalized, momentum_mag)
+            * (0.75 if (iv_rank > 0.7 and momentum_dead) else 1.0),
             0.0,
             1.0,
         )
@@ -114,9 +117,7 @@ class StrategyBuilder:
             else 0.0
         )
         premium_sell_score = (
-            iv_rank * self._clamp(1.0 - (momentum_mag / 0.25), 0.0, 1.0)
-            if iv_rank >= 0.55
-            else 0.0
+            iv_rank * self._clamp(1.0 - (momentum_mag / 0.25), 0.0, 1.0) if iv_rank >= 0.55 else 0.0
         )
         calendar_score = self._clamp(term_contango / 0.08, 0.0, 1.0)
 
@@ -141,7 +142,9 @@ class StrategyBuilder:
             preferred = ["short_strangle", "iron_butterfly", "iron_condor"]
         elif regime == "calendar" and regime_score >= 0.30:
             optimizer_direction = (
-                score_direction if momentum_mag >= 0.35 and score_direction != "neutral" else "neutral"
+                score_direction
+                if momentum_mag >= 0.35 and score_direction != "neutral"
+                else "neutral"
             )
             preferred = ["calendar", "iron_condor"]
         else:

@@ -75,7 +75,6 @@ def get_canonical_symbol(ts_symbol: str) -> str:
     return reverse.get(normalized, normalized)
 
 
-
 def resolve_option_root(underlying: str) -> str:
     """Resolve option root for a given underlying, defaulting to underlying itself."""
     normalized = underlying.strip().upper()

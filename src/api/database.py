@@ -18,15 +18,14 @@ import json
 from src.api.queries.signals import SignalsQueriesMixin
 from src.api.queries.technicals import TechnicalsQueriesMixin
 
-
 logger = logging.getLogger(__name__)
 
 
-_ET = ZoneInfo('America/New_York')
+_ET = ZoneInfo("America/New_York")
 SIGNAL_HISTORY_LIMIT = 90  # default running score history length
 
 
-def _get_session_bounds(session: str = 'current') -> tuple:
+def _get_session_bounds(session: str = "current") -> tuple:
     """Return (start_ts, end_ts) as timezone-aware datetimes for the requested trading session.
 
     'current': today 09:30–now if market is open, else most recent session 09:30–16:15 ET.
@@ -51,9 +50,9 @@ def _get_session_bounds(session: str = 'current') -> tuple:
     past_open = now_et.time() >= market_open_time
     current_session_date = today if (is_weekday and past_open) else prev_trading_day(today)
 
-    market_is_open = (current_session_date == today and now_et.time() < market_close_time)
+    market_is_open = current_session_date == today and now_et.time() < market_close_time
 
-    if session == 'current':
+    if session == "current":
         start = make_ts(current_session_date, market_open_time)
         end = now_et if market_is_open else make_ts(current_session_date, market_close_time)
     else:  # 'prior'
@@ -64,7 +63,7 @@ def _get_session_bounds(session: str = 'current') -> tuple:
     return start, end
 
 
-def _get_flow_session_bounds(session: str = 'current') -> tuple:
+def _get_flow_session_bounds(session: str = "current") -> tuple:
     """Return (start_ts, end_ts) for flow endpoints, which run 09:30–16:15 ET.
 
     Aligned to TradeStation's regular trading hours so the per-contract
@@ -92,9 +91,9 @@ def _get_flow_session_bounds(session: str = 'current') -> tuple:
     past_open = now_et.time() >= session_open_time
     current_session_date = today if (is_weekday and past_open) else prev_trading_day(today)
 
-    session_is_open = (current_session_date == today and now_et.time() < session_close_time)
+    session_is_open = current_session_date == today and now_et.time() < session_close_time
 
-    if session == 'current':
+    if session == "current":
         start = make_ts(current_session_date, session_open_time)
         end = now_et if session_is_open else make_ts(current_session_date, session_close_time)
     else:  # 'prior'
@@ -106,58 +105,58 @@ def _get_flow_session_bounds(session: str = 'current') -> tuple:
 
 
 def _normalize_timeframe(timeframe: str) -> str:
-    normalized = (timeframe or '1min').lower()
-    if normalized == '1hour':
-        return '1hr'
+    normalized = (timeframe or "1min").lower()
+    if normalized == "1hour":
+        return "1hr"
     return normalized
 
 
-def _bucket_expr(timeframe: str, column: str = 'timestamp') -> str:
+def _bucket_expr(timeframe: str, column: str = "timestamp") -> str:
     timeframe = _normalize_timeframe(timeframe)
-    if timeframe == '1min':
+    if timeframe == "1min":
         return f"date_trunc('minute', {column})"
-    if timeframe == '5min':
+    if timeframe == "5min":
         return (
             f"date_trunc('hour', {column}) + "
             f"FLOOR(EXTRACT(MINUTE FROM {column}) / 5) * INTERVAL '5 minutes'"
         )
-    if timeframe == '15min':
+    if timeframe == "15min":
         return (
             f"date_trunc('hour', {column}) + "
             f"FLOOR(EXTRACT(MINUTE FROM {column}) / 15) * INTERVAL '15 minutes'"
         )
-    if timeframe == '1hr':
+    if timeframe == "1hr":
         return f"date_trunc('hour', {column})"
-    if timeframe == '1day':
+    if timeframe == "1day":
         return f"date_trunc('day', {column})"
-    raise ValueError(f'Unsupported timeframe: {timeframe}')
+    raise ValueError(f"Unsupported timeframe: {timeframe}")
 
 
 def _interval_expr(timeframe: str) -> str:
     timeframe = _normalize_timeframe(timeframe)
     mapping = {
-        '1min': "INTERVAL '1 minute'",
-        '5min': "INTERVAL '5 minutes'",
-        '15min': "INTERVAL '15 minutes'",
-        '1hr': "INTERVAL '1 hour'",
-        '1day': "INTERVAL '1 day'",
+        "1min": "INTERVAL '1 minute'",
+        "5min": "INTERVAL '5 minutes'",
+        "15min": "INTERVAL '15 minutes'",
+        "1hr": "INTERVAL '1 hour'",
+        "1day": "INTERVAL '1 day'",
     }
     if timeframe not in mapping:
-        raise ValueError(f'Unsupported timeframe: {timeframe}')
+        raise ValueError(f"Unsupported timeframe: {timeframe}")
     return mapping[timeframe]
 
 
 def _timeframe_view_suffix(timeframe: str) -> str:
     timeframe = _normalize_timeframe(timeframe)
     mapping = {
-        '1min': '1min',
-        '5min': '5min',
-        '15min': '15min',
-        '1hr': '1hr',
-        '1day': '1day',
+        "1min": "1min",
+        "5min": "5min",
+        "15min": "15min",
+        "1hr": "1hr",
+        "1day": "1day",
     }
     if timeframe not in mapping:
-        raise ValueError(f'Unsupported timeframe: {timeframe}')
+        raise ValueError(f"Unsupported timeframe: {timeframe}")
     return mapping[timeframe]
 
 
@@ -175,9 +174,7 @@ def _timeframe_view_suffix(timeframe: str) -> str:
 # fall back to the prior bucket, which must be complete since ingestion has
 # already rolled over to a newer one. If only one bucket exists, use it.
 # The only bound parameter referenced is `$1 = underlying`.
-_STABLE_SNAPSHOT_QUIESCENCE_SECONDS = float(
-    os.getenv("STABLE_SNAPSHOT_QUIESCENCE_SECONDS", "15")
-)
+_STABLE_SNAPSHOT_QUIESCENCE_SECONDS = float(os.getenv("STABLE_SNAPSHOT_QUIESCENCE_SECONDS", "15"))
 
 _STABLE_SNAPSHOT_CTE = f"""
     recent_ts AS (
@@ -297,13 +294,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     def _load_credentials(self):
         """Load database credentials from .pgpass or environment"""
         # Try .pgpass first (production)
-        pgpass_file = Path.home() / '.pgpass'
+        pgpass_file = Path.home() / ".pgpass"
         if pgpass_file.exists():
             with open(pgpass_file) as f:
                 for line in f:
                     line = line.strip()
-                    if line and not line.startswith('#'):
-                        parts = line.split(':')
+                    if line and not line.startswith("#"):
+                        parts = line.split(":")
                         if len(parts) >= 5:
                             self.host = parts[0]
                             self.port = parts[1]
@@ -313,11 +310,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             return
 
         # Fallback to environment variables
-        self.host = os.getenv('DB_HOST', 'localhost')
-        self.port = os.getenv('DB_PORT', '5432')
-        self.database = os.getenv('DB_NAME', 'zerogex')
-        self.user = os.getenv('DB_USER', 'postgres')
-        self.password = os.getenv('DB_PASSWORD', '')
+        self.host = os.getenv("DB_HOST", "localhost")
+        self.port = os.getenv("DB_PORT", "5432")
+        self.database = os.getenv("DB_NAME", "zerogex")
+        self.user = os.getenv("DB_USER", "postgres")
+        self.password = os.getenv("DB_PASSWORD", "")
 
     async def connect(self):
         """Create connection pool"""
@@ -411,7 +408,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     return
             except Exception as e:
                 if attempt == 0 and self._is_transient_db_error(e):
-                    logger.warning("Transient DB acquire error; reconnecting pool and retrying once", exc_info=True)
+                    logger.warning(
+                        "Transient DB acquire error; reconnecting pool and retrying once",
+                        exc_info=True,
+                    )
                     await self._reconnect_pool()
                     continue
                 raise
@@ -436,8 +436,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         return value
 
     def _normalize_flow_payload(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        row['total_volume'] = self._decode_json_field(row.get('total_volume'))
-        row['total_premium'] = self._decode_json_field(row.get('total_premium'))
+        row["total_volume"] = self._decode_json_field(row.get("total_volume"))
+        row["total_premium"] = self._decode_json_field(row.get("total_premium"))
         return row
 
     async def _refresh_flow_cache(self, conn: asyncpg.Connection, symbol: str) -> None:
@@ -806,7 +806,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 underlying_price,
             )
 
-    async def _refresh_max_pain_snapshot(self, conn: asyncpg.Connection, symbol: str, strike_limit: int) -> None:
+    async def _refresh_max_pain_snapshot(
+        self, conn: asyncpg.Connection, symbol: str, strike_limit: int
+    ) -> None:
         """Refresh daily max pain OI snapshot for the symbol if latest chain timestamp changed."""
         strike_limit = max(10, min(strike_limit, 1000))
         query = """
@@ -1021,7 +1023,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     # GEX Queries
     # ========================================================================
 
-    async def get_latest_gex_summary(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
+    async def get_latest_gex_summary(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
         """Get latest GEX summary"""
         symbol = symbol.upper()
         cache_key = f"latest_gex_summary:{symbol}"
@@ -1126,9 +1128,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
     async def get_gex_by_strike(
         self,
-        symbol: str = 'SPY',
+        symbol: str = "SPY",
         limit: int = 50,
-        sort_by: str = 'distance'  # 'distance' or 'impact'
+        sort_by: str = "distance",  # 'distance' or 'impact'
     ) -> List[Dict[str, Any]]:
         """
         Get latest GEX breakdown by strike
@@ -1145,7 +1147,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             return cached
 
         # Choose sort order
-        if sort_by == 'impact':
+        if sort_by == "impact":
             order_clause = "ORDER BY ABS(g.net_gex) DESC"
         else:
             order_clause = "ORDER BY ABS(g.strike - spot.close) ASC"
@@ -1200,11 +1202,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
     async def get_historical_gex(
         self,
-        symbol: str = 'SPY',
+        symbol: str = "SPY",
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
         window_units: int = 90,
-        timeframe: str = '1min'
+        timeframe: str = "1min",
     ) -> List[Dict[str, Any]]:
         """Get historical GEX summary data aggregated by timeframe."""
         bucket = _bucket_expr(timeframe)
@@ -1314,8 +1316,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
     async def get_flow(
         self,
-        symbol: str = 'SPY',
-        session: str = 'current',
+        symbol: str = "SPY",
+        session: str = "current",
         intervals: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Get unified option flow keyed by (type, strike, expiration) in 5-min buckets.
@@ -1328,7 +1330,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         from the start of that window rather than session opens.
         """
         symbol = symbol.upper()
-        intervals_key = intervals if intervals and intervals > 0 else 'all'
+        intervals_key = intervals if intervals and intervals > 0 else "all"
         cache_key = f"flow:{symbol}:{session}:{intervals_key}"
         cached = self._cache_get(cache_key)
         if cached is not None:
@@ -1344,12 +1346,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # previous bucket rather than a bucket that would fall outside the
         # session window.
         bucket_seconds = 300
-        end_bucket_epoch = (
-            int((session_end.timestamp() - 1e-6) // bucket_seconds) * bucket_seconds
-        )
-        start_bucket_epoch = (
-            int(session_start.timestamp() // bucket_seconds) * bucket_seconds
-        )
+        end_bucket_epoch = int((session_end.timestamp() - 1e-6) // bucket_seconds) * bucket_seconds
+        start_bucket_epoch = int(session_start.timestamp() // bucket_seconds) * bucket_seconds
 
         if intervals and intervals > 0:
             window_start_epoch = end_bucket_epoch - (intervals - 1) * bucket_seconds
@@ -1422,7 +1420,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         if not exists:
             return None
 
-        if session == 'prior':
+        if session == "prior":
             # Resolve in two steps so the absence of a prior day is
             # distinguishable from the absence of any data at all.
             current_date = await conn.fetchval(
@@ -1483,8 +1481,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
     async def get_flow_series(
         self,
-        symbol: str = 'SPY',
-        session: str = 'current',
+        symbol: str = "SPY",
+        session: str = "current",
         strikes: Optional[List[float]] = None,
         expirations: Optional[List[date]] = None,
         intervals: Optional[int] = None,
@@ -1505,8 +1503,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         use_cache = intervals is None
         cache_key = None
         if use_cache:
-            strikes_key = ','.join(f"{s:g}" for s in sorted(strikes)) if strikes else ''
-            exps_key = ','.join(e.isoformat() for e in sorted(expirations)) if expirations else ''
+            strikes_key = ",".join(f"{s:g}" for s in sorted(strikes)) if strikes else ""
+            exps_key = ",".join(e.isoformat() for e in sorted(expirations)) if expirations else ""
             cache_key = f"flow_series:{symbol}:{session}:{strikes_key}:{exps_key}"
             cached = self._cache_get(cache_key)
             if cached is not None:
@@ -1682,8 +1680,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
     async def get_flow_contracts(
         self,
-        symbol: str = 'SPY',
-        session: str = 'current',
+        symbol: str = "SPY",
+        session: str = "current",
     ) -> Optional[Dict[str, List[Any]]]:
         """Return the distinct strikes and expirations that traded in a session.
 
@@ -1752,10 +1750,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             return {"strikes": [], "expirations": []}
 
     async def get_smart_money_flow(
-        self,
-        symbol: str = 'SPY',
-        session: str = 'current',
-        limit: int = 50
+        self, symbol: str = "SPY", session: str = "current", limit: int = 50
     ) -> List[Dict[str, Any]]:
         """Get smart-money events from canonical flow_contract_facts."""
         session_start, session_end = _get_flow_session_bounds(session)
@@ -1847,9 +1842,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             return []
 
     async def get_flow_buying_pressure(
-        self,
-        symbol: str = 'SPY',
-        limit: int = 20
+        self, symbol: str = "SPY", limit: int = 20
     ) -> List[Dict[str, Any]]:
         """Get underlying buying/selling pressure matching Makefile flow-buying-pressure."""
         query = """
@@ -1937,7 +1930,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     # Trade Signal Queries
     # ========================================================================
 
-    async def get_latest_quote(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
+    async def get_latest_quote(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
         """Get latest underlying quote"""
         symbol = symbol.upper()
         cache_key = f"latest_quote:{symbol}"
@@ -1989,7 +1982,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching latest quote: {e!r}", exc_info=True)
             raise
 
-    async def get_previous_close(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
+    async def get_previous_close(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
         """
         Get the most recent 4:00 PM ET close price (previous trading day's close).
         Works on any day including weekends and holidays.
@@ -2056,7 +2049,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching previous close: {e}", exc_info=True)
             raise
 
-    async def get_session_closes(self, symbol: str = 'SPY') -> Optional[Dict[str, Any]]:
+    async def get_session_closes(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
         """
         Get the two most recently completed regular session closes.
 
@@ -2103,10 +2096,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             async with self._acquire_connection() as conn:
                 row = await conn.fetchrow(query, symbol)
 
-                current_close = row['current_session_close'] if row else None
-                current_ts = row['current_session_close_ts'] if row else None
-                prior_close = row['prior_session_close'] if row else None
-                prior_ts = row['prior_session_close_ts'] if row else None
+                current_close = row["current_session_close"] if row else None
+                current_ts = row["current_session_close_ts"] if row else None
+                prior_close = row["prior_session_close"] if row else None
+                prior_ts = row["prior_session_close_ts"] if row else None
 
                 # Fall back to the most recent quote price if a session close is missing
                 if current_close is None or prior_close is None:
@@ -2120,8 +2113,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         """,
                         symbol,
                     )
-                    fallback_price = fallback['close'] if fallback else None
-                    fallback_ts = fallback['timestamp'] if fallback else None
+                    fallback_price = fallback["close"] if fallback else None
+                    fallback_ts = fallback["timestamp"] if fallback else None
 
                     if current_close is None:
                         current_close = fallback_price
@@ -2135,11 +2128,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     return None
 
                 return {
-                    'symbol': symbol,
-                    'current_session_close': current_close,
-                    'current_session_close_ts': current_ts,
-                    'prior_session_close': prior_close,
-                    'prior_session_close_ts': prior_ts,
+                    "symbol": symbol,
+                    "current_session_close": current_close,
+                    "current_session_close_ts": current_ts,
+                    "prior_session_close": prior_close,
+                    "prior_session_close_ts": prior_ts,
                 }
         except Exception as e:
             logger.error(f"Error fetching session closes: {e}", exc_info=True)
@@ -2147,11 +2140,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
     async def get_historical_quotes(
         self,
-        symbol: str = 'SPY',
+        symbol: str = "SPY",
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
         window_units: int = 90,
-        timeframe: str = '1min'
+        timeframe: str = "1min",
     ) -> List[Dict[str, Any]]:
         """Get historical quotes aggregated by timeframe."""
         bucket = _bucket_expr(timeframe)
@@ -2213,10 +2206,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             raise
 
     async def get_max_pain_timeseries(
-        self,
-        symbol: str = 'SPY',
-        timeframe: str = '5min',
-        window_units: int = 90
+        self, symbol: str = "SPY", timeframe: str = "5min", window_units: int = 90
     ) -> List[Dict[str, Any]]:
         """Get max pain timeseries aggregated to timeframe over window units."""
         window_units = max(1, min(window_units, 90))
@@ -2256,7 +2246,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             rows = await conn.fetch(query, symbol, window_units)
             return [dict(row) for row in rows]
 
-    async def get_max_pain_current(self, symbol: str = 'SPY', strike_limit: int = 200) -> Optional[Dict[str, Any]]:
+    async def get_max_pain_current(
+        self, symbol: str = "SPY", strike_limit: int = 200
+    ) -> Optional[Dict[str, Any]]:
         """Get current max pain from daily OI snapshot cache."""
         symbol = symbol.upper()
         cache_key = f"max_pain_current:{symbol}"
@@ -2295,26 +2287,28 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             if not snapshot:
                 return None
 
-            expiration_rows = await conn.fetch(expiration_query, symbol, snapshot['as_of_date'])
+            expiration_rows = await conn.fetch(expiration_query, symbol, snapshot["as_of_date"])
             expirations: List[Dict[str, Any]] = []
             for row in expiration_rows:
-                strikes = row['strikes']
+                strikes = row["strikes"]
                 if isinstance(strikes, str):
                     strikes = json.loads(strikes)
-                expirations.append({
-                    'expiration': row['expiration'],
-                    'max_pain': row['max_pain'],
-                    'difference_from_underlying': row['difference_from_underlying'],
-                    'strikes': strikes or [],
-                })
+                expirations.append(
+                    {
+                        "expiration": row["expiration"],
+                        "max_pain": row["max_pain"],
+                        "difference_from_underlying": row["difference_from_underlying"],
+                        "strikes": strikes or [],
+                    }
+                )
 
             result = {
-                'timestamp': snapshot['timestamp'],
-                'symbol': snapshot['symbol'],
-                'underlying_price': snapshot['underlying_price'],
-                'max_pain': snapshot['max_pain'],
-                'difference': snapshot['difference'],
-                'expirations': expirations,
+                "timestamp": snapshot["timestamp"],
+                "symbol": snapshot["symbol"],
+                "underlying_price": snapshot["underlying_price"],
+                "max_pain": snapshot["max_pain"],
+                "difference": snapshot["difference"],
+                "expirations": expirations,
             }
             self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
             return result
@@ -2324,10 +2318,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     # ========================================================================
 
     async def get_gex_heatmap(
-        self,
-        symbol: str = 'SPY',
-        timeframe: str = '5min',
-        window_units: int = 60
+        self, symbol: str = "SPY", timeframe: str = "5min", window_units: int = 60
     ) -> List[Dict[str, Any]]:
         """
         Get GEX data by strike over time for heatmap visualization using interval + window units.
@@ -2391,15 +2382,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         try:
             async with self._acquire_connection() as conn:
-                rows = await asyncio.wait_for(
-                    conn.fetch(query, symbol, window_units),
-                    timeout=15.0
-                )
+                rows = await asyncio.wait_for(conn.fetch(query, symbol, window_units), timeout=15.0)
                 result = [dict(row) for row in rows]
                 self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
                 return result
         except asyncio.TimeoutError:
-            logger.warning(f"GEX heatmap query timed out for {symbol} timeframe={timeframe} window={window_units}, returning empty")
+            logger.warning(
+                f"GEX heatmap query timed out for {symbol} timeframe={timeframe} window={window_units}, returning empty"
+            )
             return []
         except Exception as e:
             logger.warning(f"GEX heatmap query failed for {symbol} (returning empty): {e!r}")
@@ -2539,14 +2529,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         that has rows for this contract in the database.
         """
         from datetime import time as _time
+
         expiration_date = datetime.strptime(expiration, "%Y-%m-%d").date()
 
         now_et = datetime.now(_ET)
         today = now_et.date()
-        session_is_open = (
-            today.weekday() < 5
-            and _time(9, 30) <= now_et.time() < _time(16, 0)
-        )
+        session_is_open = today.weekday() < 5 and _time(9, 30) <= now_et.time() < _time(16, 0)
 
         # Resolve option_symbol once, then drive everything else off the
         # (option_symbol, timestamp) primary key. Filtering option_chains by
@@ -2708,9 +2696,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 spot_price = float(spot_row["close"])
                 timestamp = spot_row["timestamp"]
 
-                rows = await conn.fetch(
-                    chain_query, symbol, dte_max, spot_price, strike_count
-                )
+                rows = await conn.fetch(chain_query, symbol, dte_max, spot_price, strike_count)
                 return {
                     "spot_price": spot_price,
                     "timestamp": timestamp,
@@ -2719,4 +2705,3 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         except Exception as e:
             logger.error(f"Error fetching vol surface data: {e}", exc_info=True)
             raise
-

@@ -278,7 +278,11 @@ def fetch_option_snapshot(
         logger.info(
             "fetch_option_snapshot: no option rows for snapshot "
             "[underlying=%s, dte_range=%s-%s, trade_date=%s, anchor_ts<=%s]. Widening window.",
-            db_symbol, dte_min, dte_max, trade_date, anchor_ts,
+            db_symbol,
+            dte_min,
+            dte_max,
+            trade_date,
+            anchor_ts,
         )
         cur.execute(
             """
@@ -348,7 +352,9 @@ class PositionOptimizerEngine:
             os.getenv("POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS", "false").lower() == "true"
         )
 
-    def _fetch_context(self, as_of: Optional[datetime] = None) -> Optional[PositionOptimizerContext]:
+    def _fetch_context(
+        self, as_of: Optional[datetime] = None
+    ) -> Optional[PositionOptimizerContext]:
         try:
             with db_connection() as conn:
                 cur = conn.cursor()
@@ -468,7 +474,9 @@ class PositionOptimizerEngine:
                 recent_closes = list(reversed(recent_closes))
 
                 dte_min, dte_max = TARGET_DTE_WINDOWS.get(signal_timeframe, (1, 7))
-                trade_date = anchor_ts.astimezone(ET).date() if anchor_ts.tzinfo else anchor_ts.date()
+                trade_date = (
+                    anchor_ts.astimezone(ET).date() if anchor_ts.tzinfo else anchor_ts.date()
+                )
 
                 # Compute dealer net delta from the latest snapshot
                 cur.execute(
@@ -487,7 +495,15 @@ class PositionOptimizerEngine:
                     ORDER BY timestamp DESC
                     LIMIT 1
                     """,
-                    (self.db_symbol, anchor_ts, anchor_ts, trade_date, dte_min, trade_date, dte_max),
+                    (
+                        self.db_symbol,
+                        anchor_ts,
+                        anchor_ts,
+                        trade_date,
+                        dte_min,
+                        trade_date,
+                        dte_max,
+                    ),
                 )
                 snapshot_row = cur.fetchone()
                 snapshot_ts = snapshot_row[0] if snapshot_row else None
@@ -509,7 +525,9 @@ class PositionOptimizerEngine:
                 else:
                     dealer_net_delta = 0.0
 
-                option_rows = fetch_option_snapshot(conn, self.db_symbol, anchor_ts, trade_date, dte_min, dte_max)
+                option_rows = fetch_option_snapshot(
+                    conn, self.db_symbol, anchor_ts, trade_date, dte_min, dte_max
+                )
                 if not option_rows:
                     logger.warning(
                         "PositionOptimizerEngine: no option rows in target expiry window for %s "
@@ -522,14 +540,17 @@ class PositionOptimizerEngine:
                     )
                     return None
 
-                available_dtes = sorted({max((row["expiration"] - trade_date).days, 0) for row in option_rows})
+                available_dtes = sorted(
+                    {max((row["expiration"] - trade_date).days, 0) for row in option_rows}
+                )
                 effective_dte_min = available_dtes[0] if available_dtes else dte_min
                 effective_dte_max = available_dtes[-1] if available_dtes else dte_max
 
                 atm_ivs = [
                     float(r["iv"])
                     for r in option_rows
-                    if r["iv"] > 0 and abs((r["strike"] - current_price) / max(current_price, 1e-6)) <= 0.01
+                    if r["iv"] > 0
+                    and abs((r["strike"] - current_price) / max(current_price, 1e-6)) <= 0.01
                 ]
                 all_ivs = [float(r["iv"]) for r in option_rows if r["iv"] > 0]
                 iv_rank = None
@@ -599,16 +620,30 @@ class PositionOptimizerEngine:
 
     def _liquidity_score(self, short_leg: dict, long_leg: dict) -> tuple[float, str]:
         mids = [max(self._mid(short_leg), 0.01), max(self._mid(long_leg), 0.01)]
-        widths = [(short_leg["ask"] - short_leg["bid"]) / mids[0], (long_leg["ask"] - long_leg["bid"]) / mids[1]]
+        widths = [
+            (short_leg["ask"] - short_leg["bid"]) / mids[0],
+            (long_leg["ask"] - long_leg["bid"]) / mids[1],
+        ]
         avg_width = sum(max(w, 0.0) for w in widths) / len(widths)
-        volume_oi = short_leg["volume"] + long_leg["volume"] + short_leg["open_interest"] + long_leg["open_interest"]
+        volume_oi = (
+            short_leg["volume"]
+            + long_leg["volume"]
+            + short_leg["open_interest"]
+            + long_leg["open_interest"]
+        )
         width_score = self._clamp(1.0 - avg_width, 0.0, 1.0)
         depth_bonus = self._clamp(math.log10(max(volume_oi, 1)) / 4.0, 0.0, 1.0)
         score = round((width_score * 0.7 + depth_bonus * 0.3), 4)
         desc = f"Average relative bid/ask width is {avg_width:.2%}; combined vol+OI {volume_oi}."
         return score, desc
 
-    def _structure_adjustment(self, ctx: PositionOptimizerContext, strategy_type: str, short_strike: float, long_strike: float) -> tuple[float, str]:
+    def _structure_adjustment(
+        self,
+        ctx: PositionOptimizerContext,
+        strategy_type: str,
+        short_strike: float,
+        long_strike: float,
+    ) -> tuple[float, str]:
         adjustments = 0.0
         reasons = []
         if ctx.gamma_flip:
@@ -650,15 +685,25 @@ class PositionOptimizerEngine:
         sizing = []
         for profile, heat_pct in RISK_PROFILE_BUDGETS.items():
             budget = ASSUMED_ACCOUNT_EQUITY * heat_pct
-            kelly_adjusted_budget = max(budget * max(candidate.kelly_fraction, 0.10), min(budget, effective_risk))
+            kelly_adjusted_budget = max(
+                budget * max(candidate.kelly_fraction, 0.10), min(budget, effective_risk)
+            )
             # Floor at 0 so a trade whose per-contract risk exceeds the profile
             # budget returns 0 contracts (no position) rather than being
             # force-sized to 1 and blowing the heat cap.  Callers treat
             # ``contracts == 0`` as "reject this candidate".
-            contracts = max(0, int(kelly_adjusted_budget // effective_risk)) if candidate.expected_value > 0 else 0
-            constrained_by = "edge filter" if candidate.expected_value <= 0 else (
-                "kelly fraction" if kelly_adjusted_budget < budget else (
-                    "budget too small" if contracts == 0 else "portfolio heat cap"
+            contracts = (
+                max(0, int(kelly_adjusted_budget // effective_risk))
+                if candidate.expected_value > 0
+                else 0
+            )
+            constrained_by = (
+                "edge filter"
+                if candidate.expected_value <= 0
+                else (
+                    "kelly fraction"
+                    if kelly_adjusted_budget < budget
+                    else ("budget too small" if contracts == 0 else "portfolio heat cap")
                 )
             )
             sizing.append(
@@ -682,14 +727,28 @@ class PositionOptimizerEngine:
         long_leg: dict,
         iron_call: Optional[tuple[dict, dict]] = None,
     ) -> Optional[SpreadCandidate]:
-        dte = max((expiry - (ctx.timestamp.astimezone(ET).date() if ctx.timestamp.tzinfo else ctx.timestamp.date())).days, 0)
+        dte = max(
+            (
+                expiry
+                - (
+                    ctx.timestamp.astimezone(ET).date()
+                    if ctx.timestamp.tzinfo
+                    else ctx.timestamp.date()
+                )
+            ).days,
+            0,
+        )
         width = abs(short_leg["strike"] - long_leg["strike"])
-        if strategy_type not in {
-            "long_straddle",
-            "long_strangle",
-            "short_strangle",
-            "iron_butterfly",
-        } and width <= 0:
+        if (
+            strategy_type
+            not in {
+                "long_straddle",
+                "long_strangle",
+                "short_strangle",
+                "iron_butterfly",
+            }
+            and width <= 0
+        ):
             return None
 
         debit = credit = 0.0
@@ -763,54 +822,107 @@ class PositionOptimizerEngine:
             width = max(call_width, put_width)
             max_profit = credit
             max_loss = max(width * 100.0 - credit, 0.01)
-            net_delta = (-(short_put["delta"] - long_put["delta"]) - (short_call["delta"] - long_call["delta"])) * 100.0
-            net_gamma = (-(short_put["gamma"] - long_put["gamma"]) - (short_call["gamma"] - long_call["gamma"])) * 100.0
-            net_theta = (-(short_put["theta"] - long_put["theta"]) - (short_call["theta"] - long_call["theta"])) * 100.0
-            base_pop = self._clamp(1.0 - (abs(short_put["delta"]) + abs(short_call["delta"])) / 2.0, 0.2, 0.93)
+            net_delta = (
+                -(short_put["delta"] - long_put["delta"])
+                - (short_call["delta"] - long_call["delta"])
+            ) * 100.0
+            net_gamma = (
+                -(short_put["gamma"] - long_put["gamma"])
+                - (short_call["gamma"] - long_call["gamma"])
+            ) * 100.0
+            net_theta = (
+                -(short_put["theta"] - long_put["theta"])
+                - (short_call["theta"] - long_call["theta"])
+            ) * 100.0
+            base_pop = self._clamp(
+                1.0 - (abs(short_put["delta"]) + abs(short_call["delta"])) / 2.0, 0.2, 0.93
+            )
             short_strike, long_strike = short_put["strike"], short_call["strike"]
             strikes_label = (
                 f"Short {short_put['strike']:.0f}P/{short_call['strike']:.0f}C | "
                 f"Long {long_put['strike']:.0f}P/{long_call['strike']:.0f}C"
             )
             legs_payload = [
-                {"side": "short", "option_type": "P", "strike": short_put["strike"], "expiry": expiry},
-                {"side": "short", "option_type": "C", "strike": short_call["strike"], "expiry": expiry},
-                {"side": "long", "option_type": "P", "strike": long_put["strike"], "expiry": expiry},
-                {"side": "long", "option_type": "C", "strike": long_call["strike"], "expiry": expiry},
+                {
+                    "side": "short",
+                    "option_type": "P",
+                    "strike": short_put["strike"],
+                    "expiry": expiry,
+                },
+                {
+                    "side": "short",
+                    "option_type": "C",
+                    "strike": short_call["strike"],
+                    "expiry": expiry,
+                },
+                {
+                    "side": "long",
+                    "option_type": "P",
+                    "strike": long_put["strike"],
+                    "expiry": expiry,
+                },
+                {
+                    "side": "long",
+                    "option_type": "C",
+                    "strike": long_call["strike"],
+                    "expiry": expiry,
+                },
             ]
         elif strategy_type == "long_straddle":
             call_leg, put_leg = short_leg, long_leg
             debit = max(buy(call_leg) + buy(put_leg), 0.01) * 100.0
-            projected_move = max(abs(call_leg["strike"] - put_leg["strike"]), ctx.current_price * 0.025)
+            projected_move = max(
+                abs(call_leg["strike"] - put_leg["strike"]), ctx.current_price * 0.025
+            )
             max_profit = max(projected_move * 100.0 - debit, debit * 0.75)
             max_loss = debit
             short_strike, long_strike = put_leg["strike"], call_leg["strike"]
             net_delta = (call_leg["delta"] + put_leg["delta"]) * 100.0
             net_gamma = (call_leg["gamma"] + put_leg["gamma"]) * 100.0
             net_theta = (call_leg["theta"] + put_leg["theta"]) * 100.0
-            base_pop = self._clamp(0.40 + self._clamp(abs(ctx.net_gex) / SIGNAL_GEX_NORMALIZATION, 0.0, 1.0) * 0.25, 0.2, 0.8)
+            base_pop = self._clamp(
+                0.40 + self._clamp(abs(ctx.net_gex) / SIGNAL_GEX_NORMALIZATION, 0.0, 1.0) * 0.25,
+                0.2,
+                0.8,
+            )
             strikes_label = f"Long {call_leg['strike']:.0f}C + {put_leg['strike']:.0f}P"
             width = abs(call_leg["strike"] - put_leg["strike"])
             legs_payload = [
-                {"side": "long", "option_type": "C", "strike": call_leg["strike"], "expiry": expiry},
+                {
+                    "side": "long",
+                    "option_type": "C",
+                    "strike": call_leg["strike"],
+                    "expiry": expiry,
+                },
                 {"side": "long", "option_type": "P", "strike": put_leg["strike"], "expiry": expiry},
             ]
         elif strategy_type == "long_strangle":
             call_leg, put_leg = short_leg, long_leg
             debit = max(buy(call_leg) + buy(put_leg), 0.01) * 100.0
-            projected_move = max(abs(call_leg["strike"] - put_leg["strike"]) * 1.2, ctx.current_price * 0.03)
+            projected_move = max(
+                abs(call_leg["strike"] - put_leg["strike"]) * 1.2, ctx.current_price * 0.03
+            )
             max_profit = max(projected_move * 100.0 - debit, debit * 0.75)
             max_loss = debit
             short_strike, long_strike = put_leg["strike"], call_leg["strike"]
             net_delta = (call_leg["delta"] + put_leg["delta"]) * 100.0
             net_gamma = (call_leg["gamma"] + put_leg["gamma"]) * 100.0
             net_theta = (call_leg["theta"] + put_leg["theta"]) * 100.0
-            base_pop = self._clamp(0.35 + self._clamp(abs(ctx.net_gex) / SIGNAL_GEX_NORMALIZATION, 0.0, 1.0) * 0.30, 0.2, 0.8)
+            base_pop = self._clamp(
+                0.35 + self._clamp(abs(ctx.net_gex) / SIGNAL_GEX_NORMALIZATION, 0.0, 1.0) * 0.30,
+                0.2,
+                0.8,
+            )
             strikes_label = f"Long {put_leg['strike']:.0f}P + {call_leg['strike']:.0f}C"
             width = abs(call_leg["strike"] - put_leg["strike"])
             legs_payload = [
                 {"side": "long", "option_type": "P", "strike": put_leg["strike"], "expiry": expiry},
-                {"side": "long", "option_type": "C", "strike": call_leg["strike"], "expiry": expiry},
+                {
+                    "side": "long",
+                    "option_type": "C",
+                    "strike": call_leg["strike"],
+                    "expiry": expiry,
+                },
             ]
         elif strategy_type == "short_strangle":
             short_call, short_put = short_leg, long_leg
@@ -834,8 +946,18 @@ class PositionOptimizerEngine:
             strikes_label = f"Short {short_put['strike']:.0f}P + Short {short_call['strike']:.0f}C"
             width = abs(short_call["strike"] - short_put["strike"])
             legs_payload = [
-                {"side": "short", "option_type": "P", "strike": short_put["strike"], "expiry": expiry},
-                {"side": "short", "option_type": "C", "strike": short_call["strike"], "expiry": expiry},
+                {
+                    "side": "short",
+                    "option_type": "P",
+                    "strike": short_put["strike"],
+                    "expiry": expiry,
+                },
+                {
+                    "side": "short",
+                    "option_type": "C",
+                    "strike": short_call["strike"],
+                    "expiry": expiry,
+                },
             ]
         elif strategy_type == "iron_butterfly" and iron_call is not None:
             short_put, long_put = short_leg, long_leg
@@ -871,10 +993,30 @@ class PositionOptimizerEngine:
                 f"{short_call['strike']:.0f}C / Long {long_call['strike']:.0f}C"
             )
             legs_payload = [
-                {"side": "long", "option_type": "P", "strike": long_put["strike"], "expiry": expiry},
-                {"side": "short", "option_type": "P", "strike": short_put["strike"], "expiry": expiry},
-                {"side": "short", "option_type": "C", "strike": short_call["strike"], "expiry": expiry},
-                {"side": "long", "option_type": "C", "strike": long_call["strike"], "expiry": expiry},
+                {
+                    "side": "long",
+                    "option_type": "P",
+                    "strike": long_put["strike"],
+                    "expiry": expiry,
+                },
+                {
+                    "side": "short",
+                    "option_type": "P",
+                    "strike": short_put["strike"],
+                    "expiry": expiry,
+                },
+                {
+                    "side": "short",
+                    "option_type": "C",
+                    "strike": short_call["strike"],
+                    "expiry": expiry,
+                },
+                {
+                    "side": "long",
+                    "option_type": "C",
+                    "strike": long_call["strike"],
+                    "expiry": expiry,
+                },
             ]
         elif strategy_type == "calendar":
             near_leg, far_leg = short_leg, long_leg
@@ -908,61 +1050,137 @@ class PositionOptimizerEngine:
         if not legs_payload:
             if strategy_type == "bull_call_debit":
                 legs_payload = [
-                    {"side": "long", "option_type": "C", "strike": long_leg["strike"], "expiry": expiry},
-                    {"side": "short", "option_type": "C", "strike": short_leg["strike"], "expiry": expiry},
+                    {
+                        "side": "long",
+                        "option_type": "C",
+                        "strike": long_leg["strike"],
+                        "expiry": expiry,
+                    },
+                    {
+                        "side": "short",
+                        "option_type": "C",
+                        "strike": short_leg["strike"],
+                        "expiry": expiry,
+                    },
                 ]
             elif strategy_type == "bear_put_debit":
                 legs_payload = [
-                    {"side": "long", "option_type": "P", "strike": long_leg["strike"], "expiry": expiry},
-                    {"side": "short", "option_type": "P", "strike": short_leg["strike"], "expiry": expiry},
+                    {
+                        "side": "long",
+                        "option_type": "P",
+                        "strike": long_leg["strike"],
+                        "expiry": expiry,
+                    },
+                    {
+                        "side": "short",
+                        "option_type": "P",
+                        "strike": short_leg["strike"],
+                        "expiry": expiry,
+                    },
                 ]
             elif strategy_type == "bull_put_credit":
                 legs_payload = [
-                    {"side": "short", "option_type": "P", "strike": short_leg["strike"], "expiry": expiry},
-                    {"side": "long", "option_type": "P", "strike": long_leg["strike"], "expiry": expiry},
+                    {
+                        "side": "short",
+                        "option_type": "P",
+                        "strike": short_leg["strike"],
+                        "expiry": expiry,
+                    },
+                    {
+                        "side": "long",
+                        "option_type": "P",
+                        "strike": long_leg["strike"],
+                        "expiry": expiry,
+                    },
                 ]
             elif strategy_type == "bear_call_credit":
                 legs_payload = [
-                    {"side": "short", "option_type": "C", "strike": short_leg["strike"], "expiry": expiry},
-                    {"side": "long", "option_type": "C", "strike": long_leg["strike"], "expiry": expiry},
+                    {
+                        "side": "short",
+                        "option_type": "C",
+                        "strike": short_leg["strike"],
+                        "expiry": expiry,
+                    },
+                    {
+                        "side": "long",
+                        "option_type": "C",
+                        "strike": long_leg["strike"],
+                        "expiry": expiry,
+                    },
                 ]
 
         liquidity_score, liquidity_desc = self._liquidity_score(short_leg, long_leg)
-        structure_adj, structure_desc = self._structure_adjustment(ctx, strategy_type, short_strike, long_strike)
+        structure_adj, structure_desc = self._structure_adjustment(
+            ctx, strategy_type, short_strike, long_strike
+        )
         probability = self._clamp(base_pop + structure_adj, 0.05, 0.95)
         expected_value = round(probability * max_profit - (1.0 - probability) * max_loss, 2)
         rr_ratio = round(max_profit / max_loss, 4) if max_loss > 0 else 0.0
         premium_efficiency = round(max_profit / max(debit or credit, 1.0), 4)
         market_structure_fit = round(self._clamp(0.5 + structure_adj * 5.0, 0.0, 1.0), 4)
-        greek_alignment = round(self._clamp(1.0 - abs(net_theta) / 100.0, 0.0, 1.0) * 0.4 + self._clamp(abs(net_delta) / 50.0, 0.0, 1.0) * (0.6 if ctx.signal_direction != "neutral" else 0.1), 4)
-        edge_score = round(self._clamp((expected_value / max(max_loss, 1.0) + probability) / 2.0, 0.0, 1.0), 4)
+        greek_alignment = round(
+            self._clamp(1.0 - abs(net_theta) / 100.0, 0.0, 1.0) * 0.4
+            + self._clamp(abs(net_delta) / 50.0, 0.0, 1.0)
+            * (0.6 if ctx.signal_direction != "neutral" else 0.1),
+            4,
+        )
+        edge_score = round(
+            self._clamp((expected_value / max(max_loss, 1.0) + probability) / 2.0, 0.0, 1.0), 4
+        )
         sharpe_like = round(expected_value / max(max_loss, 1.0), 4)
         kelly_fraction = self._kelly_fraction(probability, max_profit, max_loss)
 
         component_values = {
-            "cost_efficiency": (premium_efficiency, f"Premium efficiency is {premium_efficiency:.2f}x max-profit per net premium."),
-            "probability_of_profit": (probability, f"Estimated POP is {probability:.1%} after market-structure adjustments."),
+            "cost_efficiency": (
+                premium_efficiency,
+                f"Premium efficiency is {premium_efficiency:.2f}x max-profit per net premium.",
+            ),
+            "probability_of_profit": (
+                probability,
+                f"Estimated POP is {probability:.1%} after market-structure adjustments.",
+            ),
             "risk_reward": (rr_ratio, f"Max profit / max loss is {rr_ratio:.2f}."),
-            "greek_alignment": (greek_alignment, f"Net delta {net_delta:+.1f}, gamma {net_gamma:+.3f}, theta {net_theta:+.2f}."),
+            "greek_alignment": (
+                greek_alignment,
+                f"Net delta {net_delta:+.1f}, gamma {net_gamma:+.3f}, theta {net_theta:+.2f}.",
+            ),
             "liquidity": (liquidity_score, liquidity_desc),
             "market_structure": (market_structure_fit, f"Structure fit reflects {structure_desc}."),
-            "edge_quality": (edge_score, f"Expected value is ${expected_value:,.2f} per spread with Kelly {kelly_fraction:.2%}."),
+            "edge_quality": (
+                edge_score,
+                f"Expected value is ${expected_value:,.2f} per spread with Kelly {kelly_fraction:.2%}.",
+            ),
         }
         components = []
         total = 0
         for key, (value, desc) in component_values.items():
-            normalized = value if key not in {"cost_efficiency", "risk_reward"} else self._clamp(value / 3.0, 0.0, 1.0)
+            normalized = (
+                value
+                if key not in {"cost_efficiency", "risk_reward"}
+                else self._clamp(value / 3.0, 0.0, 1.0)
+            )
             raw = int(round(self._clamp(normalized, 0.0, 1.0) * 10))
             weight = POSITION_OPTIMIZER_WEIGHTS[key]
             weighted = raw * weight
             total += weighted
-            components.append(CandidateComponent(key.replace("_", " ").title(), weight, raw, weighted, desc, round(value, 4) if isinstance(value, float) else value))
+            components.append(
+                CandidateComponent(
+                    key.replace("_", " ").title(),
+                    weight,
+                    raw,
+                    weighted,
+                    desc,
+                    round(value, 4) if isinstance(value, float) else value,
+                )
+            )
 
-        reasoning.extend([
-            f"{strategy_type} targets the {ctx.signal_direction} {ctx.signal_timeframe} signal from {ctx.signal_timestamp.isoformat()}.",
-            f"POP {probability:.1%} with EV ${expected_value:,.2f} and max loss ${max_loss:,.2f}.",
-            f"Liquidity {liquidity_score:.2f}; market structure fit {market_structure_fit:.2f}; premium efficiency {premium_efficiency:.2f}.",
-        ])
+        reasoning.extend(
+            [
+                f"{strategy_type} targets the {ctx.signal_direction} {ctx.signal_timeframe} signal from {ctx.signal_timestamp.isoformat()}.",
+                f"POP {probability:.1%} with EV ${expected_value:,.2f} and max loss ${max_loss:,.2f}.",
+                f"Liquidity {liquidity_score:.2f}; market structure fit {market_structure_fit:.2f}; premium efficiency {premium_efficiency:.2f}.",
+            ]
+        )
         candidate = SpreadCandidate(
             rank=0,
             strategy_type=strategy_type,
@@ -1023,13 +1241,16 @@ class PositionOptimizerEngine:
 
             if "bull_call_debit" in preferred and ctx.signal_direction == "bullish" and calls:
                 atm_calls = [
-                    r for r in calls
+                    r
+                    for r in calls
                     if ctx.current_price * 0.98 <= r["strike"] <= ctx.current_price * 1.03
                 ]
                 for long_call in atm_calls[:4]:
                     higher = [r for r in calls if r["strike"] > long_call["strike"]][:3]
                     for short_call in higher:
-                        cand = self._score_candidate(ctx, "bull_call_debit", expiry, "C", short_call, long_call)
+                        cand = self._score_candidate(
+                            ctx, "bull_call_debit", expiry, "C", short_call, long_call
+                        )
                         if cand:
                             candidates.append(cand)
 
@@ -1038,19 +1259,24 @@ class PositionOptimizerEngine:
                 for short_put in reversed(otm_puts[-6:]):
                     lower = [r for r in otm_puts if r["strike"] < short_put["strike"]][-3:]
                     for long_put in lower:
-                        cand = self._score_candidate(ctx, "bull_put_credit", expiry, "P", short_put, long_put)
+                        cand = self._score_candidate(
+                            ctx, "bull_put_credit", expiry, "P", short_put, long_put
+                        )
                         if cand:
                             candidates.append(cand)
 
             if "bear_put_debit" in preferred and ctx.signal_direction == "bearish" and puts:
                 atm_puts = [
-                    r for r in puts
+                    r
+                    for r in puts
                     if ctx.current_price * 0.97 <= r["strike"] <= ctx.current_price * 1.02
                 ]
                 for long_put in reversed(atm_puts[:4]):
                     lower = [r for r in puts if r["strike"] < long_put["strike"]][-3:]
                     for short_put in reversed(lower):
-                        cand = self._score_candidate(ctx, "bear_put_debit", expiry, "P", short_put, long_put)
+                        cand = self._score_candidate(
+                            ctx, "bear_put_debit", expiry, "P", short_put, long_put
+                        )
                         if cand:
                             candidates.append(cand)
 
@@ -1059,12 +1285,16 @@ class PositionOptimizerEngine:
                 for short_call in otm_calls[:6]:
                     higher = [r for r in otm_calls if r["strike"] > short_call["strike"]][:3]
                     for long_call in higher:
-                        cand = self._score_candidate(ctx, "bear_call_credit", expiry, "C", short_call, long_call)
+                        cand = self._score_candidate(
+                            ctx, "bear_call_credit", expiry, "C", short_call, long_call
+                        )
                         if cand:
                             candidates.append(cand)
 
             if "iron_condor" in preferred and len(puts) >= 2 and len(calls) >= 2:
-                for short_put in reversed([r for r in puts if r["strike"] < ctx.current_price][-3:]):
+                for short_put in reversed(
+                    [r for r in puts if r["strike"] < ctx.current_price][-3:]
+                ):
                     long_puts = [r for r in puts if r["strike"] < short_put["strike"]][-2:]
                     for short_call in [r for r in calls if r["strike"] > ctx.current_price][:3]:
                         long_calls = [r for r in calls if r["strike"] > short_call["strike"]][:2]
@@ -1095,7 +1325,9 @@ class PositionOptimizerEngine:
                 if otm_calls and otm_puts:
                     call_leg = otm_calls[min(1, len(otm_calls) - 1)]
                     put_leg = otm_puts[max(len(otm_puts) - 2, 0)]
-                    cand = self._score_candidate(ctx, "long_strangle", expiry, "SG", call_leg, put_leg)
+                    cand = self._score_candidate(
+                        ctx, "long_strangle", expiry, "SG", call_leg, put_leg
+                    )
                     if cand:
                         candidates.append(cand)
 
@@ -1154,8 +1386,20 @@ class PositionOptimizerEngine:
                     if cand:
                         candidates.append(cand)
 
-        filtered = [c for c in candidates if c.max_profit > 0 and c.max_loss > 0 and c.probability_of_profit >= 0.25]
-        filtered.sort(key=lambda c: (c.edge_score, c.expected_value, c.probability_of_profit, c.liquidity_score), reverse=True)
+        filtered = [
+            c
+            for c in candidates
+            if c.max_profit > 0 and c.max_loss > 0 and c.probability_of_profit >= 0.25
+        ]
+        filtered.sort(
+            key=lambda c: (
+                c.edge_score,
+                c.expected_value,
+                c.probability_of_profit,
+                c.liquidity_score,
+            ),
+            reverse=True,
+        )
         top = filtered[:MAX_CANDIDATES]
         for idx, candidate in enumerate(top, start=1):
             candidate.rank = idx
@@ -1198,7 +1442,9 @@ class PositionOptimizerEngine:
         )
 
     def _store_signal(self, signal: PositionOptimizerSignal) -> None:
-        candidates_json = json.dumps([asdict(candidate) for candidate in signal.candidates], default=str)
+        candidates_json = json.dumps(
+            [asdict(candidate) for candidate in signal.candidates], default=str
+        )
         top_reasoning_json = json.dumps(signal.top_reasoning)
         try:
             with db_connection() as conn:
@@ -1281,7 +1527,10 @@ class PositionOptimizerEngine:
     @staticmethod
     def _extract_strikes(candidate: dict) -> list[float]:
         import re
-        return [float(match) for match in re.findall(r"(\d+(?:\.\d+)?)", candidate.get("strikes", ""))]
+
+        return [
+            float(match) for match in re.findall(r"(\d+(?:\.\d+)?)", candidate.get("strikes", ""))
+        ]
 
     def _proxy_realized_return(self, candidate: dict, close_px: float) -> float:
         strategy = candidate.get("strategy_type")
@@ -1317,7 +1566,9 @@ class PositionOptimizerEngine:
             return round((pnl / max_loss) * 100.0, 2)
         return 0.0
 
-    def _snapshot_accuracy(self, signal_ts: datetime, candidate: dict) -> Optional[PositionOptimizerAccuracySnapshot]:
+    def _snapshot_accuracy(
+        self, signal_ts: datetime, candidate: dict
+    ) -> Optional[PositionOptimizerAccuracySnapshot]:
         trade_date = signal_ts.astimezone(ET).date() if signal_ts.tzinfo else signal_ts.date()
         next_date = trade_date + timedelta(days=1)
         try:
@@ -1343,8 +1594,16 @@ class PositionOptimizerEngine:
                 if not row or row[0] is None or row[1] is None:
                     return None
                 open_px, close_px, high_px, low_px = map(float, row)
-                realized_move_pct = max(abs(high_px - open_px), abs(low_px - open_px), abs(close_px - open_px)) / open_px * 100.0
-                realized_direction = "bullish" if close_px > open_px else ("bearish" if close_px < open_px else "neutral")
+                realized_move_pct = (
+                    max(abs(high_px - open_px), abs(low_px - open_px), abs(close_px - open_px))
+                    / open_px
+                    * 100.0
+                )
+                realized_direction = (
+                    "bullish"
+                    if close_px > open_px
+                    else ("bearish" if close_px < open_px else "neutral")
+                )
                 proxy_return = self._proxy_realized_return(candidate, close_px)
                 return PositionOptimizerAccuracySnapshot(
                     realized_move_pct=round(realized_move_pct, 4),
@@ -1354,7 +1613,9 @@ class PositionOptimizerEngine:
                     profitable=proxy_return > 0,
                 )
         except Exception as exc:
-            logger.error("PositionOptimizerEngine._snapshot_accuracy failed: %s", exc, exc_info=True)
+            logger.error(
+                "PositionOptimizerEngine._snapshot_accuracy failed: %s", exc, exc_info=True
+            )
             return None
 
     def _update_accuracy(self) -> None:
@@ -1379,21 +1640,44 @@ class PositionOptimizerEngine:
                     self._last_accuracy_update = today
                     return
                 buckets: dict[tuple[str, str], dict[str, float]] = {}
-                for signal_ts, direction, strength, strategy_type, top_pop, top_ev, candidates in rows:
-                    candidate_list = json.loads(candidates) if isinstance(candidates, str) else (candidates or [])
-                    best_candidate = candidate_list[0] if candidate_list else {"strategy_type": strategy_type}
+                for (
+                    signal_ts,
+                    direction,
+                    strength,
+                    strategy_type,
+                    top_pop,
+                    top_ev,
+                    candidates,
+                ) in rows:
+                    candidate_list = (
+                        json.loads(candidates)
+                        if isinstance(candidates, str)
+                        else (candidates or [])
+                    )
+                    best_candidate = (
+                        candidate_list[0] if candidate_list else {"strategy_type": strategy_type}
+                    )
                     snapshot = self._snapshot_accuracy(signal_ts, best_candidate)
                     if snapshot is None:
                         continue
                     key = (direction, strategy_type)
                     bucket = buckets.setdefault(
                         key,
-                        {"total": 0, "profitable": 0, "realized_sum": 0.0, "predicted_pop_sum": 0.0, "expected_ev_sum": 0.0, "realized_move_sum": 0.0},
+                        {
+                            "total": 0,
+                            "profitable": 0,
+                            "realized_sum": 0.0,
+                            "predicted_pop_sum": 0.0,
+                            "expected_ev_sum": 0.0,
+                            "realized_move_sum": 0.0,
+                        },
                     )
                     bucket["total"] += 1
                     bucket["profitable"] += int(snapshot.profitable)
                     bucket["realized_sum"] += snapshot.proxy_return_pct
-                    bucket["predicted_pop_sum"] += float(top_pop or CADENCE_POP_DEFAULTS.get(strength, 0.5))
+                    bucket["predicted_pop_sum"] += float(
+                        top_pop or CADENCE_POP_DEFAULTS.get(strength, 0.5)
+                    )
                     bucket["expected_ev_sum"] += float(top_ev or 0.0)
                     bucket["realized_move_sum"] += snapshot.realized_move_pct
 

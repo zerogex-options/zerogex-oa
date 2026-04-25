@@ -27,8 +27,11 @@ import requests as _requests
 from src.ingestion.tradestation_client import TradeStationClient
 from src.utils import get_logger
 from src.validation import (
-    safe_float, safe_int, safe_datetime,
-    validate_bar_data, get_market_session
+    safe_float,
+    safe_int,
+    safe_datetime,
+    validate_bar_data,
+    get_market_session,
 )
 from src.symbols import resolve_option_root
 from src.config import (
@@ -117,6 +120,7 @@ def _is_auth_error_payload(payload: Dict[str, Any]) -> bool:
 # OptionStreamAccumulator — background thread for persistent quote streaming
 # ---------------------------------------------------------------------------
 
+
 class OptionStreamAccumulator:
     """
     Persistent background reader for TradeStation streaming option quotes.
@@ -165,7 +169,9 @@ class OptionStreamAccumulator:
             self._seed_from_rest()
         self._running = True
         self._thread = threading.Thread(
-            target=self._reader_loop, daemon=True, name="option-stream",
+            target=self._reader_loop,
+            daemon=True,
+            name="option-stream",
         )
         self._thread.start()
         # Give the stream a moment to connect before returning.
@@ -223,9 +229,7 @@ class OptionStreamAccumulator:
 
     def _seed_from_rest(self):
         """Fetch one full REST snapshot to populate OI, IV, and prices."""
-        logger.info(
-            f"Seeding option state from REST ({len(self._symbols)} symbols)..."
-        )
+        logger.info(f"Seeding option state from REST ({len(self._symbols)} symbols)...")
         seeded = 0
         for i in range(0, len(self._symbols), OPTION_BATCH_SIZE):
             batch = self._symbols[i : i + OPTION_BATCH_SIZE]
@@ -247,17 +251,13 @@ class OptionStreamAccumulator:
                 self._read_stream()
             except Exception as e:
                 if self._running:
-                    logger.warning(
-                        f"Option stream disconnected ({e}), reconnecting in 2s..."
-                    )
+                    logger.warning(f"Option stream disconnected ({e}), reconnecting in 2s...")
                     time.sleep(2)
 
     def _read_stream(self):
         """Open one stream connection and read events until it ends."""
         symbols_str = ",".join(self._symbols)
-        url = (
-            f"{self._client.base_url}/marketdata/stream/quotes/{symbols_str}"
-        )
+        url = f"{self._client.base_url}/marketdata/stream/quotes/{symbols_str}"
         headers = self._client.auth.get_headers()
 
         response = _requests.get(
@@ -346,9 +346,19 @@ class OptionStreamAccumulator:
 
             # Always-overwrite fields
             for key in (
-                "Last", "Bid", "Ask", "Mid", "TimeStamp",
-                "High", "Low", "Open", "Close", "NetChange",
-                "NetChangePct", "BidSize", "AskSize",
+                "Last",
+                "Bid",
+                "Ask",
+                "Mid",
+                "TimeStamp",
+                "High",
+                "Low",
+                "Open",
+                "Close",
+                "NetChange",
+                "NetChangePct",
+                "BidSize",
+                "AskSize",
             ):
                 val = q.get(key)
                 if val is not None:
@@ -399,6 +409,7 @@ class OptionStreamAccumulator:
 # UnderlyingBarAccumulator — persistent stream for underlying OHLCV bars
 # ---------------------------------------------------------------------------
 
+
 class UnderlyingBarAccumulator:
     """
     Persistent background reader for TradeStation streaming bar data.
@@ -440,7 +451,9 @@ class UnderlyingBarAccumulator:
         """Begin background bar stream reading."""
         self._running = True
         self._thread = threading.Thread(
-            target=self._reader_loop, daemon=True, name="underlying-stream",
+            target=self._reader_loop,
+            daemon=True,
+            name="underlying-stream",
         )
         self._thread.start()
         self._connected.wait(timeout=10)
@@ -497,9 +510,7 @@ class UnderlyingBarAccumulator:
 
     def _read_stream(self):
         """Open one stream connection and read bar events until it ends."""
-        url = (
-            f"{self._client.base_url}/marketdata/stream/barcharts/{self._symbol}"
-        )
+        url = f"{self._client.base_url}/marketdata/stream/barcharts/{self._symbol}"
         headers = self._client.auth.get_headers()
         params = {
             "interval": "1",
@@ -520,8 +531,7 @@ class UnderlyingBarAccumulator:
             if response.status_code == 401:
                 response.close()
                 logger.warning(
-                    "Underlying bar stream: 401 auth failure, "
-                    "forcing token refresh and retrying"
+                    "Underlying bar stream: 401 auth failure, " "forcing token refresh and retrying"
                 )
                 self._client.auth.force_refresh_access_token()
                 return
@@ -531,9 +541,7 @@ class UnderlyingBarAccumulator:
             response.close()
             raise
 
-        logger.debug(
-            "Underlying bar stream: connected (HTTP %s)", response.status_code
-        )
+        logger.debug("Underlying bar stream: connected (HTTP %s)", response.status_code)
 
         with self._response_lock:
             self._current_response = response
@@ -561,8 +569,7 @@ class UnderlyingBarAccumulator:
                     _heartbeat_count += 1
                     if _heartbeat_count % 50 == 0:
                         logger.debug(
-                            "Underlying bar stream: %d heartbeats, "
-                            "%d data lines so far",
+                            "Underlying bar stream: %d heartbeats, " "%d data lines so far",
                             _heartbeat_count,
                             _line_count,
                         )
@@ -590,16 +597,23 @@ class UnderlyingBarAccumulator:
                 bars: list = []
                 if isinstance(payload, dict) and "Bars" in payload:
                     bars = payload["Bars"]
-                elif isinstance(payload, dict) and "Bar" in payload and isinstance(payload["Bar"], dict):
+                elif (
+                    isinstance(payload, dict)
+                    and "Bar" in payload
+                    and isinstance(payload["Bar"], dict)
+                ):
                     bars = [payload["Bar"]]
                 elif isinstance(payload, dict) and "TimeStamp" in payload:
                     bars = [payload]
 
                 if not bars:
                     logger.debug(
-                        "Underlying bar stream: received payload with "
-                        "no bar data: keys=%s",
-                        list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__,
+                        "Underlying bar stream: received payload with " "no bar data: keys=%s",
+                        (
+                            list(payload.keys())
+                            if isinstance(payload, dict)
+                            else type(payload).__name__
+                        ),
                     )
 
                 for bar in bars:
@@ -683,9 +697,15 @@ class StreamManager:
     ):
         """Initialize stream manager"""
         self.client = client
-        self.underlying = underlying.upper()           # TradeStation API symbol for underlying (e.g. "$SPXW.X")
-        self.db_underlying = (db_underlying or underlying).upper()  # canonical alias for DB (e.g. "SPX")
-        self.option_root = resolve_option_root(self.underlying)  # option root for quotes (e.g. "SPXW")
+        self.underlying = (
+            underlying.upper()
+        )  # TradeStation API symbol for underlying (e.g. "$SPXW.X")
+        self.db_underlying = (
+            db_underlying or underlying
+        ).upper()  # canonical alias for DB (e.g. "SPX")
+        self.option_root = resolve_option_root(
+            self.underlying
+        )  # option root for quotes (e.g. "SPXW")
         self.num_expirations = num_expirations
         self.num_strikes = num_strikes  # number of strikes to track on each side of current price
 
@@ -769,8 +789,7 @@ class StreamManager:
             }
 
             logger.debug(
-                f"Bar (REST): {self.underlying} @ {timestamp} "
-                f"C=${underlying_data['close']:.2f}"
+                f"Bar (REST): {self.underlying} @ {timestamp} " f"C=${underlying_data['close']:.2f}"
             )
             return underlying_data
 
@@ -832,10 +851,11 @@ class StreamManager:
         market_close_time = datetime.strptime("16:00:00", "%H:%M:%S").time()
 
         # If last refresh was before today's 4:00 PM and now is after 4:00 PM
-        if (last_refresh_et.date() < now_et.date() or 
-            (last_refresh_et.date() == now_et.date() and 
-             last_refresh_et.time() < market_close_time and 
-             now_et.time() >= market_close_time)):
+        if last_refresh_et.date() < now_et.date() or (
+            last_refresh_et.date() == now_et.date()
+            and last_refresh_et.time() < market_close_time
+            and now_et.time() >= market_close_time
+        ):
             logger.info("Market close occurred since last refresh, expirations may need update")
             return True
 
@@ -875,7 +895,9 @@ class StreamManager:
             # Rebuild option symbols with new expirations
             if self.current_price:
                 self.tracked_option_symbols = self._build_option_symbols()
-                logger.info(f"Rebuilt {len(self.tracked_option_symbols)} option symbols with new expirations")
+                logger.info(
+                    f"Rebuilt {len(self.tracked_option_symbols)} option symbols with new expirations"
+                )
 
             # Update refresh timestamp
             self.last_expiration_refresh = datetime.now(ET)
@@ -914,7 +936,7 @@ class StreamManager:
                 return []
 
             # Take first N
-            target_exps = future_expirations[:self.num_expirations]
+            target_exps = future_expirations[: self.num_expirations]
 
             logger.info(f"Target expirations: {[str(exp) for exp in target_exps]}")
             return target_exps
@@ -933,12 +955,16 @@ class StreamManager:
                 logger.warning(f"No strikes found for exp {exp_str}")
                 return []
 
-            below = sorted([s for s in all_strikes if s <= current_price], reverse=True)[:self.num_strikes]
-            above = sorted([s for s in all_strikes if s > current_price])[:self.num_strikes]
+            below = sorted([s for s in all_strikes if s <= current_price], reverse=True)[
+                : self.num_strikes
+            ]
+            above = sorted([s for s in all_strikes if s > current_price])[: self.num_strikes]
             nearby_strikes = sorted(below + above)
 
-            logger.debug(f"Exp {exp_str}: {len(nearby_strikes)} strikes "
-                        f"({len(below)} below, {len(above)} above ${current_price:.2f})")
+            logger.debug(
+                f"Exp {exp_str}: {len(nearby_strikes)} strikes "
+                f"({len(below)} below, {len(above)} above ${current_price:.2f})"
+            )
 
             return nearby_strikes
 
@@ -1113,9 +1139,7 @@ class StreamManager:
             if mid is None and bid is not None and ask is not None:
                 mid = (bid + ask) / 2.0
 
-            volume = safe_int(
-                raw.get("Volume"), default=None, field_name="Volume"
-            )
+            volume = safe_int(raw.get("Volume"), default=None, field_name="Volume")
 
             open_interest = safe_int(
                 raw.get("DailyOpenInterest"),
@@ -1136,28 +1160,27 @@ class StreamManager:
                     implied_volatility = iv_val
                     break
 
-            results.append({
-                "option_symbol": option_symbol,
-                "timestamp": timestamp,
-                "underlying": self.db_underlying,
-                "strike": meta["strike"],
-                "expiration": meta["expiration"],
-                "option_type": meta["option_type"],
-                "last": last,
-                "bid": bid,
-                "ask": ask,
-                "mid": mid,
-                "volume": volume,
-                "open_interest": open_interest,
-                "implied_volatility": implied_volatility,
-            })
+            results.append(
+                {
+                    "option_symbol": option_symbol,
+                    "timestamp": timestamp,
+                    "underlying": self.db_underlying,
+                    "strike": meta["strike"],
+                    "expiration": meta["expiration"],
+                    "option_type": meta["option_type"],
+                    "last": last,
+                    "bid": bid,
+                    "ask": ask,
+                    "mid": mid,
+                    "volume": volume,
+                    "open_interest": open_interest,
+                    "implied_volatility": implied_volatility,
+                }
+            )
 
         return results
 
-    def stream(
-        self,
-        max_iterations: Optional[int] = None
-    ) -> Generator[Dict[str, Any], None, None]:
+    def stream(self, max_iterations: Optional[int] = None) -> Generator[Dict[str, Any], None, None]:
         """
         Stream real-time data and yield to caller.
 
@@ -1240,16 +1263,14 @@ class StreamManager:
                         self._start_accumulators()
                     else:
                         logger.warning(
-                            "⚠️  Expiration refresh failed, continuing "
-                            "with current expirations"
+                            "⚠️  Expiration refresh failed, continuing " "with current expirations"
                         )
 
                 try:
                     # --- underlying stream health checks ---
                     if not self._underlying_accumulator.is_alive:
                         logger.error(
-                            "Underlying bar stream thread is DEAD — "
-                            "restarting accumulators"
+                            "Underlying bar stream thread is DEAD — " "restarting accumulators"
                         )
                         self._start_accumulators()
 
@@ -1262,13 +1283,8 @@ class StreamManager:
                         _consecutive_empty_underlying = 0
                     else:
                         _consecutive_empty_underlying += 1
-                        if (
-                            _consecutive_empty_underlying
-                            == _STALE_UNDERLYING_THRESHOLD
-                        ):
-                            cur_updates = (
-                                self._underlying_accumulator.updates_received
-                            )
+                        if _consecutive_empty_underlying == _STALE_UNDERLYING_THRESHOLD:
+                            cur_updates = self._underlying_accumulator.updates_received
                             logger.warning(
                                 "Underlying bar stream appears STALE: "
                                 "%d consecutive empty drains, "
@@ -1280,13 +1296,11 @@ class StreamManager:
                                 self._underlying_accumulator.is_alive,
                             )
                         elif (
-                            _consecutive_empty_underlying
-                            > _STALE_UNDERLYING_THRESHOLD
+                            _consecutive_empty_underlying > _STALE_UNDERLYING_THRESHOLD
                             and _consecutive_empty_underlying % 50 == 0
                         ):
                             logger.warning(
-                                "Underlying bar stream still stale: "
-                                "%d consecutive empty drains",
+                                "Underlying bar stream still stale: " "%d consecutive empty drains",
                                 _consecutive_empty_underlying,
                             )
 
@@ -1301,12 +1315,10 @@ class StreamManager:
                             _total_options_yielded += option_count
 
                             option_with_oi = sum(
-                                1 for o in option_results
-                                if (o.get("open_interest") or 0) > 0
+                                1 for o in option_results if (o.get("open_interest") or 0) > 0
                             )
                             option_with_volume = sum(
-                                1 for o in option_results
-                                if (o.get("volume") or 0) > 0
+                                1 for o in option_results if (o.get("volume") or 0) > 0
                             )
 
                             tracked_total = len(self.tracked_option_symbols)
@@ -1353,9 +1365,7 @@ class StreamManager:
                             f"bar_stream_updates={self._underlying_accumulator.updates_received} "
                             f"cycle_ms={cycle_ms:.1f}"
                         )
-                        _last_bar_updates = (
-                            self._underlying_accumulator.updates_received
-                        )
+                        _last_bar_updates = self._underlying_accumulator.updates_received
                         _total_option_batches = 0
                         _total_options_yielded = 0
                         _total_underlying_yields = 0
@@ -1368,12 +1378,8 @@ class StreamManager:
                             new_price = self._get_underlying_price()
                             if new_price:
                                 self.current_price = new_price
-                                self.tracked_option_symbols = (
-                                    self._build_option_symbols()
-                                )
-                                self._start_accumulators(
-                                    seed_option_rest=self.seed_rest_on_recalc
-                                )
+                                self.tracked_option_symbols = self._build_option_symbols()
+                                self._start_accumulators(seed_option_rest=self.seed_rest_on_recalc)
                                 logger.info(
                                     f"Recalibrated strikes around "
                                     f"${self.current_price:.2f} "
@@ -1386,15 +1392,11 @@ class StreamManager:
 
                     # Check max iterations
                     if max_iterations and iteration >= max_iterations:
-                        logger.info(
-                            f"Reached max iterations ({max_iterations})"
-                        )
+                        logger.info(f"Reached max iterations ({max_iterations})")
                         break
 
                 except Exception as e:
-                    logger.error(
-                        f"Stream iteration error: {e}", exc_info=True
-                    )
+                    logger.error(f"Stream iteration error: {e}", exc_info=True)
                     time.sleep(max_wait)
         finally:
             # Always clean up the background stream threads.
@@ -1416,29 +1418,39 @@ def main():
     load_dotenv()
 
     parser = argparse.ArgumentParser(description="Stream real-time options data")
-    parser.add_argument("--underlying", default=os.getenv("INGEST_UNDERLYING", "SPY"),
-                       help="Underlying symbol or alias (default: SPY)")
-    parser.add_argument("--expirations", type=int,
-                       default=int(os.getenv("INGEST_EXPIRATIONS", "3")),
-                       help="Number of expirations to track (default: 3)")
-    parser.add_argument("--num-strikes", type=int,
-                       default=int(os.getenv("INGEST_STRIKE_COUNT", "10")),
-                       help="Number of strikes to track on each side of current price (default: 10)")
-    parser.add_argument("--max-iterations", type=int,
-                       help="Maximum iterations (default: unlimited)")
-    parser.add_argument("--debug", action="store_true",
-                       help="Enable debug logging")
+    parser.add_argument(
+        "--underlying",
+        default=os.getenv("INGEST_UNDERLYING", "SPY"),
+        help="Underlying symbol or alias (default: SPY)",
+    )
+    parser.add_argument(
+        "--expirations",
+        type=int,
+        default=int(os.getenv("INGEST_EXPIRATIONS", "3")),
+        help="Number of expirations to track (default: 3)",
+    )
+    parser.add_argument(
+        "--num-strikes",
+        type=int,
+        default=int(os.getenv("INGEST_STRIKE_COUNT", "10")),
+        help="Number of strikes to track on each side of current price (default: 10)",
+    )
+    parser.add_argument(
+        "--max-iterations", type=int, help="Maximum iterations (default: unlimited)"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
     args = parser.parse_args()
 
     # Set logging level
     if args.debug:
         from src.utils import set_log_level
+
         set_log_level("DEBUG")
 
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("STREAM MANAGER - STANDALONE TEST")
-    print("="*80)
+    print("=" * 80)
     print(f"Underlying: {args.underlying}")
     print(f"Expirations: {args.expirations}")
     print(f"Strikes Each Side: {args.num_strikes}")
@@ -1446,14 +1458,14 @@ def main():
         print(f"Max Iterations: {args.max_iterations}")
     else:
         print("Max Iterations: Unlimited (press Ctrl+C to stop)")
-    print("="*80 + "\n")
+    print("=" * 80 + "\n")
 
     # Initialize client
     client = TradeStationClient(
         os.getenv("TRADESTATION_CLIENT_ID"),
         os.getenv("TRADESTATION_CLIENT_SECRET"),
         os.getenv("TRADESTATION_REFRESH_TOKEN"),
-        sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true"
+        sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true",
     )
 
     # Initialize stream manager
@@ -1468,6 +1480,7 @@ def main():
     if not manager.initialize():
         print("❌ Failed to initialize stream manager")
         import sys
+
         sys.exit(1)
 
     print()
@@ -1483,20 +1496,22 @@ def main():
                 underlying_count += 1
                 if underlying_count % 10 == 0:
                     data = item["data"]
-                    print(f"Underlying bars: {underlying_count} - Latest: "
-                          f"${data['close']:.2f} "
-                          f"(Up: {data['up_volume']:,}, Down: {data['down_volume']:,})")
+                    print(
+                        f"Underlying bars: {underlying_count} - Latest: "
+                        f"${data['close']:.2f} "
+                        f"(Up: {data['up_volume']:,}, Down: {data['down_volume']:,})"
+                    )
             elif item["type"] == "option_batch":
                 option_count += len(item["data"])
                 if option_count % 100 < len(item["data"]):
                     print(f"Option quotes: {option_count}")
 
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("STREAM COMPLETE")
-        print("="*80)
+        print("=" * 80)
         print(f"✅ Underlying bars yielded: {underlying_count}")
         print(f"✅ Option quotes yielded: {option_count}")
-        print("="*80 + "\n")
+        print("=" * 80 + "\n")
         print("NOTE: This standalone test only YIELDS data, it does NOT store it.")
         print("Use 'python run.py ingest' to stream AND store data in database.")
         print()
@@ -1508,6 +1523,7 @@ def main():
         print(f"\n❌ Error: {e}")
         logger.error(f"Stream failed: {e}", exc_info=True)
         import sys
+
         sys.exit(1)
 
 

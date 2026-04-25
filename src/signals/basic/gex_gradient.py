@@ -19,6 +19,7 @@ Input is drawn from ``ctx.extra['gex_by_strike']`` — a list of dicts
 populated by ``UnifiedSignalEngine._fetch_market_context``. The component
 degrades gracefully when the data isn't present.
 """
+
 from __future__ import annotations
 
 import os

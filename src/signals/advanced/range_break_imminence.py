@@ -22,6 +22,7 @@ Output convention on :class:`AdvancedSignalResult`:
   * ``context['label']`` — one of ``Range Fade`` / ``Weak Range`` /
     ``Break Watch`` / ``Breakout Mode`` so the playbook flip is direct.
 """
+
 from __future__ import annotations
 
 import os
@@ -60,10 +61,10 @@ _COMPRESSION_FULL = float(os.getenv("SIGNAL_RBI_COMPRESSION_FULL", "0.5"))
 _COMPRESSION_NONE = float(os.getenv("SIGNAL_RBI_COMPRESSION_NONE", "1.0"))
 
 # Label thresholds per the published playbook map.
-_LABEL_FADE_MAX = 40.0       # 0–39: Range Fade
-_LABEL_WEAK_MAX = 65.0       # 40–64: Weak Range
-_LABEL_WATCH_MAX = 80.0      # 65–79: Break Watch
-                             # 80–100: Breakout Mode
+_LABEL_FADE_MAX = 40.0  # 0–39: Range Fade
+_LABEL_WEAK_MAX = 65.0  # 40–64: Weak Range
+_LABEL_WATCH_MAX = 80.0  # 65–79: Break Watch
+# 80–100: Breakout Mode
 
 # Trigger cutoff for the triggered flag (matches "Break Watch" onset).
 _TRIGGER_IMMINENCE = _LABEL_WEAK_MAX
@@ -84,9 +85,7 @@ class RangeBreakImminenceSignal:
         # inputs (compression is directionless). Each signed value is in
         # [-1, 1] so bias stays in [-1, 1].
         directional_num = (
-            skew["signed"] * _W_SKEW
-            + dealer["signed"] * _W_DEALER
-            + trap["signed"] * _W_TRAP
+            skew["signed"] * _W_SKEW + dealer["signed"] * _W_DEALER + trap["signed"] * _W_TRAP
         )
         directional_den = _W_SKEW + _W_DEALER + _W_TRAP
         bias = directional_num / directional_den
@@ -114,9 +113,7 @@ class RangeBreakImminenceSignal:
                 "imminence": round(imminence, 2),
                 "bias": round(bias, 4),
                 "direction": (
-                    "bullish" if direction > 0
-                    else "bearish" if direction < 0
-                    else "neutral"
+                    "bullish" if direction > 0 else "bearish" if direction < 0 else "neutral"
                 ),
                 "label": label,
                 "playbook": playbook,
@@ -305,7 +302,7 @@ class RangeBreakImminenceSignal:
                 put_d = float(row.get("put_delta_oi") or 0.0)
             except (TypeError, ValueError):
                 continue
-            total -= (call_d + put_d)
+            total -= call_d + put_d
         return total if saw_delta else None
 
     @staticmethod

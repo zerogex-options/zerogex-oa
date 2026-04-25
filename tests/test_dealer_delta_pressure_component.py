@@ -1,4 +1,5 @@
 """Tests for dealer_delta_pressure component."""
+
 from datetime import datetime, timezone
 
 import pytest
@@ -78,8 +79,6 @@ def test_context_values_reports_source_unavailable():
 
 def test_context_values_reports_source_delta_oi():
     ctx = _ctx()
-    ctx.extra["gex_by_strike"] = [
-        {"strike": 500.0, "call_delta_oi": 1e7, "put_delta_oi": -1e7}
-    ]
+    ctx.extra["gex_by_strike"] = [{"strike": 500.0, "call_delta_oi": 1e7, "put_delta_oi": -1e7}]
     cv = comp.context_values(ctx)
     assert cv["source"] == "gex_by_strike.delta_oi"

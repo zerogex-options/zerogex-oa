@@ -1,4 +1,5 @@
 """Advanced gamma + VWAP confluence detector."""
+
 from __future__ import annotations
 
 from src.signals.components.base import MarketContext

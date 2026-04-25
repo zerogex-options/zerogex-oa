@@ -1,4 +1,5 @@
 """Base interface for all scoring components."""
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -10,6 +11,7 @@ from typing import Optional
 @dataclass
 class MarketContext:
     """All market data available to scoring components each cycle."""
+
     timestamp: datetime
     underlying: str
     close: float
@@ -41,12 +43,12 @@ class ComponentBase(ABC):
     context_values() should return a dict of the key inputs used,
     for storage in signal_component_scores.context_values.
     """
+
     name: str  # must be defined on each subclass as a class attribute
     weight: float  # must be defined on each subclass as a class attribute
 
     @abstractmethod
-    def compute(self, ctx: MarketContext) -> float:
-        ...
+    def compute(self, ctx: MarketContext) -> float: ...
 
     def context_values(self, ctx: MarketContext) -> dict:
         """Override to store relevant inputs alongside the score."""

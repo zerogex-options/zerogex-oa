@@ -1,4 +1,5 @@
 """Market State component: distance to gamma flip (±25 bucket)."""
+
 from __future__ import annotations
 
 from src.signals.components.base import ComponentBase, MarketContext

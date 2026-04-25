@@ -3,7 +3,6 @@ from zoneinfo import ZoneInfo
 
 from src.api.database import DatabaseManager
 
-
 HEADERS = [
     "time",
     "contract",
@@ -75,4 +74,3 @@ async def _run() -> None:
 
 if __name__ == "__main__":
     asyncio.run(_run())
-

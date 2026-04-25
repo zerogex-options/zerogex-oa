@@ -22,6 +22,7 @@ Sign convention:
   * Positive aggregate vanna+charm => bullish tailwind (dealer buying)
   * Negative aggregate vanna+charm => bearish headwind (dealer selling)
 """
+
 from __future__ import annotations
 
 import os

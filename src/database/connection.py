@@ -67,7 +67,9 @@ def close_db_connection(conn):
                 conn.rollback()
                 logger.warning("Rolled back open transaction before returning DB connection")
         except Exception:
-            logger.warning("Failed to inspect/reset transaction state before pool return", exc_info=True)
+            logger.warning(
+                "Failed to inspect/reset transaction state before pool return", exc_info=True
+            )
         _connection_pool.putconn(conn)
         logger.debug("Returned connection to pool")
 
@@ -109,22 +111,22 @@ def _initialize_connection_pool():
     logger.info("Initializing database connection pool...")
 
     # Get database configuration from environment
-    db_host = os.getenv('DB_HOST', 'localhost')
-    db_port = int(os.getenv('DB_PORT', '5432'))
-    db_name = os.getenv('DB_NAME', 'zerogex')
-    db_user = os.getenv('DB_USER', 'postgres')
+    db_host = os.getenv("DB_HOST", "localhost")
+    db_port = int(os.getenv("DB_PORT", "5432"))
+    db_name = os.getenv("DB_NAME", "zerogex")
+    db_user = os.getenv("DB_USER", "postgres")
     # Defaults sized for concurrent ingestion + analytics + API workers.
     # A single-process default of 2 starved writers during aggregation flushes
     # and analytics cycles; 2/8 gives headroom without risking "too many
     # clients" on shared DBs. Override via DB_POOL_MIN/DB_POOL_MAX.
-    min_connections = int(os.getenv('DB_POOL_MIN', '2'))
-    max_connections = int(os.getenv('DB_POOL_MAX', '8'))
+    min_connections = int(os.getenv("DB_POOL_MIN", "2"))
+    max_connections = int(os.getenv("DB_POOL_MAX", "8"))
     if min_connections > max_connections:
         min_connections = max_connections
-    connect_timeout = int(os.getenv('DB_CONNECT_TIMEOUT_SECONDS', '20'))
-    connect_retries = int(os.getenv('DB_CONNECT_RETRIES', '5'))
-    retry_base_delay = float(os.getenv('DB_CONNECT_RETRY_DELAY_SECONDS', '1.5'))
-    sslmode = os.getenv('DB_SSLMODE', '').strip()
+    connect_timeout = int(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "20"))
+    connect_retries = int(os.getenv("DB_CONNECT_RETRIES", "5"))
+    retry_base_delay = float(os.getenv("DB_CONNECT_RETRY_DELAY_SECONDS", "1.5"))
+    sslmode = os.getenv("DB_SSLMODE", "").strip()
 
     # Get password from configured provider
     # Note: For .pgpass, this returns None (psycopg2 reads .pgpass automatically)
@@ -146,25 +148,25 @@ def _initialize_connection_pool():
 
     # Build connection parameters
     conn_params = {
-        'minconn': min_connections,
-        'maxconn': max_connections,
-        'host': db_host,
-        'port': db_port,
-        'database': db_name,
-        'user': db_user,
-        'connect_timeout': connect_timeout,
+        "minconn": min_connections,
+        "maxconn": max_connections,
+        "host": db_host,
+        "port": db_port,
+        "database": db_name,
+        "user": db_user,
+        "connect_timeout": connect_timeout,
         # Improve resilience to stale network links / RDS edge cases.
-        'keepalives': 1,
-        'keepalives_idle': int(os.getenv('DB_KEEPALIVES_IDLE_SECONDS', '30')),
-        'keepalives_interval': int(os.getenv('DB_KEEPALIVES_INTERVAL_SECONDS', '10')),
-        'keepalives_count': int(os.getenv('DB_KEEPALIVES_COUNT', '5')),
+        "keepalives": 1,
+        "keepalives_idle": int(os.getenv("DB_KEEPALIVES_IDLE_SECONDS", "30")),
+        "keepalives_interval": int(os.getenv("DB_KEEPALIVES_INTERVAL_SECONDS", "10")),
+        "keepalives_count": int(os.getenv("DB_KEEPALIVES_COUNT", "5")),
     }
 
     # Only add password if it's not None (i.e., not using .pgpass)
     if db_password is not None:
-        conn_params['password'] = db_password
+        conn_params["password"] = db_password
     if sslmode:
-        conn_params['sslmode'] = sslmode
+        conn_params["sslmode"] = sslmode
 
     last_error = None
     for attempt in range(1, connect_retries + 1):

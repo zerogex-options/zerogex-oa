@@ -3,7 +3,6 @@ from datetime import datetime, timezone
 from src.signals.components.base import MarketContext
 from src.signals.advanced.engine import AdvancedSignalEngine
 
-
 NOW = datetime(2026, 1, 2, 15, 0, tzinfo=timezone.utc)
 
 

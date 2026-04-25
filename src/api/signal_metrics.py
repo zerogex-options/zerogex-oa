@@ -112,7 +112,9 @@ def calibrate_signal(
             }
         )
 
-    def _filter(rows: list[dict[str, float | str]], *, by_regime: bool, by_norm: bool) -> list[dict[str, float | str]]:
+    def _filter(
+        rows: list[dict[str, float | str]], *, by_regime: bool, by_norm: bool
+    ) -> list[dict[str, float | str]]:
         out = [r for r in rows if int(r["dir"]) == direction]
         if by_regime:
             out = [r for r in out if str(r["regime"]) == current_regime]

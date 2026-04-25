@@ -6,6 +6,7 @@ return over per-bar realized sigma, scaled by sqrt(5)).  To exercise
 deterministic clipping we build a price series whose last return
 dominates realized sigma, so the z-score clips at ±_DIRECTION_Z_NORM.
 """
+
 from datetime import datetime, timezone
 
 import math
@@ -26,13 +27,13 @@ def _ctx(**kwargs) -> MarketContext:
         timestamp=datetime(2026, 4, 7, 10, 0, tzinfo=timezone.utc),
         underlying="SPY",
         close=550.0,
-        net_gex=-_GEX_NORM,          # full readiness = 1.0
+        net_gex=-_GEX_NORM,  # full readiness = 1.0
         gamma_flip=545.0,
         put_call_ratio=1.0,
         max_pain=548.0,
         smart_call=0.0,
         smart_put=0.0,
-        recent_closes=[550.0] * 5,   # flat price by default
+        recent_closes=[550.0] * 5,  # flat price by default
         iv_rank=None,
     )
     defaults.update(kwargs)
@@ -51,6 +52,7 @@ comp = VolExpansionComponent()
 # ===========================================================================
 # expansion()  — 0 to 100, GEX-driven
 # ===========================================================================
+
 
 def test_expansion_deeply_negative_gex():
     ctx = _ctx(net_gex=-_GEX_NORM)
@@ -90,6 +92,7 @@ def test_expansion_independent_of_momentum():
 # ===========================================================================
 # direction_score()  — -100 to +100, vol-normalized momentum
 # ===========================================================================
+
 
 def test_direction_flat_price():
     ctx = _ctx()
@@ -134,6 +137,7 @@ def test_direction_zero_when_sigma_is_zero():
 # magnitude()  — unsigned impulse amplitude
 # ===========================================================================
 
+
 def test_magnitude_zero_on_flat_price():
     assert comp.magnitude(_ctx()) == pytest.approx(0.0)
 
@@ -154,6 +158,7 @@ def test_magnitude_is_unsigned():
 # expected_5min_move_bps()
 # ===========================================================================
 
+
 def test_expected_move_none_when_no_history():
     ctx = _ctx(recent_closes=[550.0])
     assert comp.expected_5min_move_bps(ctx) is None
@@ -172,6 +177,7 @@ def test_expected_move_sign_matches_direction():
 # compute()  — composite [-1, +1] for ScoringEngine
 # ===========================================================================
 
+
 def test_compute_full_negative_gex_flat_price():
     assert comp.compute(_ctx()) == pytest.approx(0.0)
 
@@ -185,7 +191,9 @@ def test_compute_with_momentum_matches_readiness_scaling():
         ctx = _ctx(net_gex=gex, recent_closes=_closes_with_final_move(550.0, 0.005))
         score = comp.compute(ctx)
         expected = comp._gex_readiness(gex)
-        assert score == pytest.approx(expected, abs=1e-6), f"Expected readiness scaling for gex={gex}"
+        assert score == pytest.approx(
+            expected, abs=1e-6
+        ), f"Expected readiness scaling for gex={gex}"
 
 
 def test_compute_negative_gex_bearish_momentum():
@@ -220,6 +228,7 @@ def test_compute_always_in_bounds():
 # ===========================================================================
 # context_values
 # ===========================================================================
+
 
 def test_context_values_keys():
     ctx = _ctx()

@@ -25,7 +25,6 @@ from zoneinfo import ZoneInfo
 
 from src.database import db_connection
 
-
 logger = logging.getLogger(__name__)
 
 _ET = ZoneInfo("America/New_York")
@@ -235,7 +234,9 @@ def main() -> int:
     if effective_end <= session_open:
         logger.warning(
             "Session %s has no elapsed time (open=%s, end=%s); nothing to backfill.",
-            session_date, session_open, effective_end,
+            session_date,
+            session_open,
+            effective_end,
         )
         return 0
 

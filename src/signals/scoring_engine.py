@@ -1,4 +1,5 @@
 """Market State Index scoring engine (0-100)."""
+
 from __future__ import annotations
 
 import json
@@ -128,7 +129,9 @@ class ScoringEngine:
         )
 
         for component, clamped_score in component_results:
-            points = float(self.COMPONENT_POINTS.get(component.name, float(component.weight) * 100.0))
+            points = float(
+                self.COMPONENT_POINTS.get(component.name, float(component.weight) * 100.0)
+            )
             context_vals = component.context_values(ctx)
             weighted = round(points * clamped_score, 6)
             cur.execute(

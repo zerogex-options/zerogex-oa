@@ -1,4 +1,5 @@
 """Advanced squeeze-setup detector."""
+
 from __future__ import annotations
 
 from src.signals.components.base import MarketContext
@@ -70,9 +71,7 @@ class SqueezeSetupSignal:
             context={
                 "triggered": triggered,
                 "signal": (
-                    "bullish_squeeze"
-                    if score > 0
-                    else ("bearish_squeeze" if score < 0 else "none")
+                    "bullish_squeeze" if score > 0 else ("bearish_squeeze" if score < 0 else "none")
                 ),
                 "net_gex": ctx.net_gex,
                 "gamma_flip": flip,

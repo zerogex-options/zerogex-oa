@@ -1,4 +1,5 @@
 """Advanced volatility expansion signal — continuous spectrum model."""
+
 from __future__ import annotations
 
 import math

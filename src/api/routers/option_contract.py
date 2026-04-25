@@ -54,6 +54,7 @@ class OptionContractRow(BaseModel):
 
 def get_db() -> DatabaseManager:
     from ..main import db_manager
+
     return db_manager
 
 

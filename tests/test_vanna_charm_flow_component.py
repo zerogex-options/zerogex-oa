@@ -1,4 +1,5 @@
 """Tests for vanna_charm_flow component."""
+
 from datetime import datetime, timezone
 
 from src.signals.components.base import MarketContext
@@ -63,12 +64,10 @@ def test_legacy_market_aggregate_vanna_negated():
 
 def test_charm_amplification_near_close():
     """Charm should count more near the close than in the morning."""
-    rows = [
-        {"strike": 500.0, "dealer_vanna_exposure": 0.0, "dealer_charm_exposure": _VC_NORM / 4}
-    ]
+    rows = [{"strike": 500.0, "dealer_vanna_exposure": 0.0, "dealer_charm_exposure": _VC_NORM / 4}]
     morning = _ctx(hour=14, minute=0)  # 10:00 ET
     morning.extra["gex_by_strike"] = rows
-    close = _ctx(hour=19, minute=55)   # 15:55 ET
+    close = _ctx(hour=19, minute=55)  # 15:55 ET
     close.extra["gex_by_strike"] = rows
     assert abs(comp.compute(close)) >= abs(comp.compute(morning))
 

@@ -13,7 +13,6 @@ from src.signals.position_optimizer_engine import (
     PositionOptimizerEngine,
 )
 
-
 NOW = datetime(2026, 4, 6, 14, 0, tzinfo=timezone.utc)
 
 
@@ -27,13 +26,19 @@ class TestLegFillPrice:
         assert leg_fill_price(bid=1.00, ask=1.10, side="long", action="open") == pytest.approx(1.10)
 
     def test_short_open_receives_bid(self):
-        assert leg_fill_price(bid=1.00, ask=1.10, side="short", action="open") == pytest.approx(1.00)
+        assert leg_fill_price(bid=1.00, ask=1.10, side="short", action="open") == pytest.approx(
+            1.00
+        )
 
     def test_long_close_sells_at_bid(self):
-        assert leg_fill_price(bid=1.00, ask=1.10, side="long", action="close") == pytest.approx(1.00)
+        assert leg_fill_price(bid=1.00, ask=1.10, side="long", action="close") == pytest.approx(
+            1.00
+        )
 
     def test_short_close_buys_at_ask(self):
-        assert leg_fill_price(bid=1.00, ask=1.10, side="short", action="close") == pytest.approx(1.10)
+        assert leg_fill_price(bid=1.00, ask=1.10, side="short", action="close") == pytest.approx(
+            1.10
+        )
 
     def test_slippage_widens_buyer_and_seller(self):
         # 2% slippage: buyer pays 1.10 * 1.02; seller gets 1.00 * 0.98.
@@ -77,8 +82,9 @@ class TestLegFillPriceFromRow:
 # ---------------------------------------------------------------------------
 
 
-def _make_row(strike, opt, bid, ask, delta=0.30, gamma=0.01, theta=-0.02,
-              iv=0.25, volume=500, oi=1000):
+def _make_row(
+    strike, opt, bid, ask, delta=0.30, gamma=0.01, theta=-0.02, iv=0.25, volume=500, oi=1000
+):
     return {
         "expiration": date(2026, 4, 17),
         "strike": float(strike),
@@ -226,7 +232,9 @@ class TestSpreadMarkRealisticExit:
             "SPY 260410C500": (3.00, 3.20, 3.10),  # long -> sell at 3.00
             "SPY 260410C505": (0.50, 0.70, 0.60),  # short -> buy at 0.70
         }
-        with patch.object(engine, "_latest_option_quote", side_effect=lambda sym, *a, **kw: quotes[sym]):
+        with patch.object(
+            engine, "_latest_option_quote", side_effect=lambda sym, *a, **kw: quotes[sym]
+        ):
             value, mode = engine._spread_mark(_debit_trade(), NOW, conn=MagicMock())
         assert mode == "debit"
         # liquidation = 3.00 - 0.70 = 2.30
@@ -239,7 +247,9 @@ class TestSpreadMarkRealisticExit:
             "SPY 260410P495": (1.60, 1.80, 1.70),  # short -> buy back at 1.80
             "SPY 260410P490": (0.50, 0.70, 0.60),  # long -> sell at 0.50
         }
-        with patch.object(engine, "_latest_option_quote", side_effect=lambda sym, *a, **kw: quotes[sym]):
+        with patch.object(
+            engine, "_latest_option_quote", side_effect=lambda sym, *a, **kw: quotes[sym]
+        ):
             value, mode = engine._spread_mark(_credit_trade(), NOW, conn=MagicMock())
         assert mode == "credit"
         # cost-to-close = 1.80 - 0.50 = 1.30
@@ -252,7 +262,9 @@ class TestSpreadMarkRealisticExit:
             "SPY 260410C500": (3.00, 3.20, 3.10),
             "SPY 260410C505": (0.50, 0.70, 0.60),
         }
-        with patch.object(engine, "_latest_option_quote", side_effect=lambda sym, *a, **kw: quotes[sym]):
+        with patch.object(
+            engine, "_latest_option_quote", side_effect=lambda sym, *a, **kw: quotes[sym]
+        ):
             value, _ = engine._spread_mark(_debit_trade(), NOW, conn=MagicMock())
         # sell long = 3.00 * 0.95 = 2.85; buy short = 0.70 * 1.05 = 0.735
         # liquidation = 2.85 - 0.735 = 2.115

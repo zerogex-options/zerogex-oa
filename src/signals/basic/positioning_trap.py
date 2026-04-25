@@ -12,6 +12,7 @@ put-sell net out, which should not count as crowd skew.
 +score => upside squeeze risk
 -score => downside air-pocket risk
 """
+
 from src.signals.components.base import ComponentBase, MarketContext
 from src.signals.components.utils import pct_change_n_bar
 
@@ -102,8 +103,7 @@ class PositioningTrapComponent(ComponentBase):
     @staticmethod
     def _imbalance_source(ctx: MarketContext) -> str:
         if ctx.extra and (
-            ctx.extra.get("smart_call") is not None
-            or ctx.extra.get("smart_call_net") is not None
+            ctx.extra.get("smart_call") is not None or ctx.extra.get("smart_call_net") is not None
         ):
             return "signed_net_premium"
         return "signed_top_level"

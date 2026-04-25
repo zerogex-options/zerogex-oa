@@ -47,6 +47,7 @@ NOW = datetime(2026, 4, 6, 14, 0, tzinfo=timezone.utc)
 # _majority_direction
 # ---------------------------------------------------------------------------
 
+
 class TestMajorityDirection:
     def test_empty_trades_returns_neutral(self):
         assert PortfolioEngine._majority_direction([]) == "neutral"
@@ -74,10 +75,12 @@ class TestMajorityDirection:
 # Cash target helper
 # ---------------------------------------------------------------------------
 
+
 class TestCashTarget:
     def test_cash_target_has_no_positions(self):
         engine = _make_engine()
         from src.signals.scoring_engine import ScoreSnapshot
+
         score = ScoreSnapshot(
             timestamp=NOW,
             underlying="SPY",
@@ -153,12 +156,18 @@ class TestTargetPositionStrike:
             "iv_rank": 0.3,
         }
 
-        with patch.object(engine, "_select_optimizer_candidate", return_value={
-                 "candidate": candidate,
-                 "signal_timeframe": "intraday",
-                 "signal_strength": "high",
-             }), \
-             patch.object(engine, "_resolve_option_symbol_for_leg", return_value="SPY 260417C705"):
+        with (
+            patch.object(
+                engine,
+                "_select_optimizer_candidate",
+                return_value={
+                    "candidate": candidate,
+                    "signal_timeframe": "intraday",
+                    "signal_strength": "high",
+                },
+            ),
+            patch.object(engine, "_resolve_option_symbol_for_leg", return_value="SPY 260417C705"),
+        ):
             target = engine.compute_target(score, market_ctx, conn=MagicMock())
 
         assert target.target_positions
@@ -219,24 +228,27 @@ class TestIndependentSignalTriggering:
         ]
         independent_target.total_target_contracts = 1
 
-        with patch.object(
-            engine,
-            "compute_target",
-            return_value=PortfolioTarget(
-                underlying="SPY",
-                timestamp=NOW,
-                composite_score=10.0,
-            normalized_score=0.1,
-            direction="high_risk_reversal",
-                target_positions=[],
-                total_target_contracts=0,
-                target_heat_pct=0.0,
-                rationale="composite cash",
+        with (
+            patch.object(
+                engine,
+                "compute_target",
+                return_value=PortfolioTarget(
+                    underlying="SPY",
+                    timestamp=NOW,
+                    composite_score=10.0,
+                    normalized_score=0.1,
+                    direction="high_risk_reversal",
+                    target_positions=[],
+                    total_target_contracts=0,
+                    target_heat_pct=0.0,
+                    rationale="composite cash",
+                ),
             ),
-        ), patch.object(
-            engine,
-            "_build_advanced_target",
-            return_value=independent_target,
+            patch.object(
+                engine,
+                "_build_advanced_target",
+                return_value=independent_target,
+            ),
         ):
             out = engine.compute_target_with_independents(
                 base_score,
@@ -321,10 +333,13 @@ class TestIndependentSignalTriggering:
             rationale="independent trap",
             source="advanced:trap_detection",
         )
-        with patch.object(engine, "compute_target", return_value=composite_target), patch.object(
-            engine,
-            "_build_advanced_target",
-            return_value=independent_target,
+        with (
+            patch.object(engine, "compute_target", return_value=composite_target),
+            patch.object(
+                engine,
+                "_build_advanced_target",
+                return_value=independent_target,
+            ),
         ):
             out = engine.compute_target_with_independents(
                 base_score,
@@ -497,12 +512,18 @@ class TestFreshCrossSizingBoost:
             "recent_closes": recent_closes,
             "iv_rank": 0.3,
         }
-        with patch.object(engine, "_select_optimizer_candidate", return_value={
-                 "candidate": candidate,
-                 "signal_timeframe": "intraday",
-                 "signal_strength": "high",
-             }), \
-             patch.object(engine, "_resolve_option_symbol_for_leg", return_value="SPY 260417C500"):
+        with (
+            patch.object(
+                engine,
+                "_select_optimizer_candidate",
+                return_value={
+                    "candidate": candidate,
+                    "signal_timeframe": "intraday",
+                    "signal_strength": "high",
+                },
+            ),
+            patch.object(engine, "_resolve_option_symbol_for_leg", return_value="SPY 260417C500"),
+        ):
             target = engine.compute_target(self._score(), market_ctx, conn=MagicMock())
         assert target.target_positions
         return target.total_target_contracts
@@ -529,12 +550,18 @@ class TestFreshCrossSizingBoost:
             "recent_closes": [498.0, 499.5, 501.0],
             "iv_rank": 0.3,
         }
-        with patch.object(engine, "_select_optimizer_candidate", return_value={
-                 "candidate": candidate,
-                 "signal_timeframe": "intraday",
-                 "signal_strength": "high",
-             }), \
-             patch.object(engine, "_resolve_option_symbol_for_leg", return_value="SPY 260417C500"):
+        with (
+            patch.object(
+                engine,
+                "_select_optimizer_candidate",
+                return_value={
+                    "candidate": candidate,
+                    "signal_timeframe": "intraday",
+                    "signal_strength": "high",
+                },
+            ),
+            patch.object(engine, "_resolve_option_symbol_for_leg", return_value="SPY 260417C500"),
+        ):
             target = engine.compute_target(self._score(), market_ctx, conn=MagicMock())
         assert "fresh-cross boost" not in target.rationale
 
@@ -563,12 +590,14 @@ class TestMarketStatusGate:
         )
         open_trade = _make_trade(quantity_open=1)
 
-        with patch.object(engine, "_market_status", return_value="CLOSED"), \
-             patch.object(engine, "_fetch_open_trades", return_value=[open_trade]), \
-             patch.object(engine, "_update_trade_mark") as update_mark, \
-             patch.object(engine, "snapshot") as snapshot, \
-             patch.object(engine, "_close_trade") as close_trade, \
-             patch.object(engine, "_open_position") as open_position:
+        with (
+            patch.object(engine, "_market_status", return_value="CLOSED"),
+            patch.object(engine, "_fetch_open_trades", return_value=[open_trade]),
+            patch.object(engine, "_update_trade_mark") as update_mark,
+            patch.object(engine, "snapshot") as snapshot,
+            patch.object(engine, "_close_trade") as close_trade,
+            patch.object(engine, "_open_position") as open_position,
+        ):
             action = engine.reconcile(target, conn=MagicMock())
 
         assert action == "held_market_closed"
@@ -661,10 +690,13 @@ class TestIndependentSignalTriggers:
             rationale="independent candidate",
             source="advanced:gamma_vwap_confluence",
         )
-        with patch.object(engine, "compute_target", return_value=composite_target), patch.object(
-            engine,
-            "_build_advanced_target",
-            return_value=independent_target,
+        with (
+            patch.object(engine, "compute_target", return_value=composite_target),
+            patch.object(
+                engine,
+                "_build_advanced_target",
+                return_value=independent_target,
+            ),
         ):
             target = engine.compute_target_with_independents(
                 score,
@@ -742,8 +774,9 @@ class TestIndependentSignalTriggers:
             rationale="independent",
             source="advanced:vol_expansion",
         )
-        with patch.object(engine, "compute_target", return_value=cash_target), patch.object(
-            engine, "_build_advanced_target", return_value=independent_target
+        with (
+            patch.object(engine, "compute_target", return_value=cash_target),
+            patch.object(engine, "_build_advanced_target", return_value=independent_target),
         ):
             target = engine.compute_target_with_independents(
                 score,
@@ -977,8 +1010,10 @@ class TestSignalConfluenceTriggers:
             rationale="advanced fired",
             source="advanced:squeeze_setup",
         )
-        with patch.object(engine, "_build_advanced_target", return_value=advanced_target), \
-             patch.object(engine, "_build_confluence_target") as conf_mock:
+        with (
+            patch.object(engine, "_build_advanced_target", return_value=advanced_target),
+            patch.object(engine, "_build_confluence_target") as conf_mock,
+        ):
             target = engine.compute_target_with_advanced_signals(
                 score,
                 market_ctx,
@@ -1050,12 +1085,18 @@ class TestTradeSlotsAndContractSizing:
             "iv_rank": 0.3,
         }
 
-        with patch.object(engine, "_select_optimizer_candidate", return_value={
-                 "candidate": candidate,
-                 "signal_timeframe": "intraday",
-                 "signal_strength": "high",
-             }), \
-             patch.object(engine, "_resolve_option_symbol_for_leg", return_value="SPY 260417C705"):
+        with (
+            patch.object(
+                engine,
+                "_select_optimizer_candidate",
+                return_value={
+                    "candidate": candidate,
+                    "signal_timeframe": "intraday",
+                    "signal_strength": "high",
+                },
+            ),
+            patch.object(engine, "_resolve_option_symbol_for_leg", return_value="SPY 260417C705"),
+        ):
             target = engine.compute_target(score, market_ctx, conn=MagicMock())
 
         assert target.target_positions
@@ -1091,11 +1132,13 @@ class TestTradeSlotsAndContractSizing:
         )
         open_trade = _make_trade(quantity_open=2, direction="bullish")
 
-        with patch.object(engine, "_market_status", return_value="OPEN"), \
-             patch.object(engine, "_fetch_open_trades", return_value=[open_trade]), \
-             patch.object(engine, "_close_trade", return_value=0.0), \
-             patch.object(engine, "snapshot") as snapshot, \
-             patch.object(engine, "_open_position") as open_position:
+        with (
+            patch.object(engine, "_market_status", return_value="OPEN"),
+            patch.object(engine, "_fetch_open_trades", return_value=[open_trade]),
+            patch.object(engine, "_close_trade", return_value=0.0),
+            patch.object(engine, "snapshot") as snapshot,
+            patch.object(engine, "_open_position") as open_position,
+        ):
             action = engine.reconcile(target, conn=MagicMock())
 
         assert action == "held_max_open_trades"
@@ -1139,7 +1182,9 @@ class TestSpreadPricing:
             "SPY 260410C500": (3.40, 3.40, 3.40),
             "SPY 260410C505": (0.70, 0.70, 0.70),
         }
-        with patch.object(engine, "_latest_option_quote", side_effect=lambda sym, *a, **kw: quotes[sym]):
+        with patch.object(
+            engine, "_latest_option_quote", side_effect=lambda sym, *a, **kw: quotes[sym]
+        ):
             value, mode = engine._spread_mark(self._debit_trade(), NOW, conn=MagicMock())
         assert mode == "debit"
         assert value == pytest.approx(2.70)
@@ -1153,7 +1198,9 @@ class TestSpreadPricing:
             "SPY 260410C500": (3.30, 3.50, 3.40),
             "SPY 260410C505": (0.60, 0.80, 0.70),
         }
-        with patch.object(engine, "_latest_option_quote", side_effect=lambda sym, *a, **kw: quotes[sym]):
+        with patch.object(
+            engine, "_latest_option_quote", side_effect=lambda sym, *a, **kw: quotes[sym]
+        ):
             value, mode = engine._spread_mark(self._debit_trade(), NOW, conn=MagicMock())
         assert mode == "debit"
         assert value == pytest.approx(2.50)

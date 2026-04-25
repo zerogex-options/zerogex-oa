@@ -42,7 +42,7 @@ class IVCalculator:
         max_iterations: Optional[int] = None,
         tolerance: Optional[float] = None,
         min_iv: Optional[float] = None,
-        max_iv: Optional[float] = None
+        max_iv: Optional[float] = None,
     ):
         """
         Initialize IV calculator
@@ -59,21 +59,17 @@ class IVCalculator:
         self.min_iv = min_iv if min_iv is not None else IV_MIN
         self.max_iv = max_iv if max_iv is not None else IV_MAX
 
-        logger.info(f"Initialized IVCalculator: max_iter={self.max_iterations}, "
-                    f"tol={self.tolerance}, range=[{self.min_iv}, {self.max_iv}]")
+        logger.info(
+            f"Initialized IVCalculator: max_iter={self.max_iterations}, "
+            f"tol={self.tolerance}, range=[{self.min_iv}, {self.max_iv}]"
+        )
 
     def _calculate_time_to_expiration(self, current_date: datetime, expiration_date: date) -> float:
         """Time-to-expiration in years (delegates to src.market_calendar)."""
         return calculate_time_to_expiration(current_date, expiration_date)
 
     def _black_scholes_price(
-        self,
-        S: float,
-        K: float,
-        T: float,
-        r: float,
-        sigma: float,
-        option_type: str
+        self, S: float, K: float, T: float, r: float, sigma: float, option_type: str
     ) -> float:
         """
         Calculate Black-Scholes option price
@@ -92,24 +88,17 @@ class IVCalculator:
         if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
             return 0.0
 
-        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+        d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
         d2 = d1 - sigma * np.sqrt(T)
 
-        if option_type == 'C':
+        if option_type == "C":
             price = S * stats.norm.cdf(d1) - K * np.exp(-r * T) * stats.norm.cdf(d2)
         else:  # Put
             price = K * np.exp(-r * T) * stats.norm.cdf(-d2) - S * stats.norm.cdf(-d1)
 
         return price
 
-    def _vega(
-        self,
-        S: float,
-        K: float,
-        T: float,
-        r: float,
-        sigma: float
-    ) -> float:
+    def _vega(self, S: float, K: float, T: float, r: float, sigma: float) -> float:
         """
         Calculate vega for Newton-Raphson iteration
         (Derivative of price with respect to volatility)
@@ -117,7 +106,7 @@ class IVCalculator:
         if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
             return 0.0
 
-        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+        d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
         vega = S * stats.norm.pdf(d1) * np.sqrt(T)
 
         return vega
@@ -131,7 +120,7 @@ class IVCalculator:
         option_type: str,
         current_time: datetime,
         risk_free_rate: float = 0.05,
-        initial_guess: float = 0.25
+        initial_guess: float = 0.25,
     ) -> Optional[float]:
         """
         Calculate implied volatility using Newton-Raphson method
@@ -166,7 +155,7 @@ class IVCalculator:
             return None
 
         # Check for intrinsic value violations
-        if option_type == 'C':
+        if option_type == "C":
             intrinsic = max(0, underlying_price - strike)
         else:
             intrinsic = max(0, strike - underlying_price)
@@ -235,7 +224,7 @@ class IVCalculator:
         expiration: date,
         option_type: str,
         current_time: datetime,
-        risk_free_rate: float = 0.05
+        risk_free_rate: float = 0.05,
     ) -> Optional[float]:
         """
         Calculate IV using mid-price between bid and ask
@@ -263,14 +252,11 @@ class IVCalculator:
             expiration,
             option_type,
             current_time,
-            risk_free_rate
+            risk_free_rate,
         )
 
     def enrich_option_data_with_iv(
-        self,
-        option_data: dict,
-        underlying_price: float,
-        risk_free_rate: float = 0.05
+        self, option_data: dict, underlying_price: float, risk_free_rate: float = 0.05
     ) -> dict:
         """
         Add calculated IV to option data dictionary
@@ -319,20 +305,27 @@ class IVCalculator:
         # Priority 1: Use bid/ask mid-price (most reliable)
         if bid and ask and bid > 0 and ask > 0:
             calculated_iv = self.calculate_iv_from_bid_ask(
-                bid, ask, underlying_price, strike, expiration,
-                option_type, timestamp, risk_free_rate
+                bid,
+                ask,
+                underlying_price,
+                strike,
+                expiration,
+                option_type,
+                timestamp,
+                risk_free_rate,
             )
 
         # Priority 2: Use last price
         if not calculated_iv and last and last > 0:
             calculated_iv = self.calculate_iv(
-                last, underlying_price, strike, expiration,
-                option_type, timestamp, risk_free_rate
+                last, underlying_price, strike, expiration, option_type, timestamp, risk_free_rate
             )
 
         if calculated_iv:
             option_data["implied_volatility"] = calculated_iv
-            logger.debug(f"Calculated IV for {option_data.get('option_symbol')}: {calculated_iv:.4f}")
+            logger.debug(
+                f"Calculated IV for {option_data.get('option_symbol')}: {calculated_iv:.4f}"
+            )
         else:
             option_data["implied_volatility"] = None
             logger.debug(f"Could not calculate IV for {option_data.get('option_symbol')}")
@@ -344,9 +337,9 @@ def main():
     """Test IV calculator"""
     from datetime import timedelta
 
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("IMPLIED VOLATILITY CALCULATOR TEST")
-    print("="*80 + "\n")
+    print("=" * 80 + "\n")
 
     # Initialize calculator
     calc = IVCalculator()
@@ -356,7 +349,7 @@ def main():
     strike = 455.0
     current_time = datetime.now(ET)
     expiration = (current_time + timedelta(days=30)).date()
-    option_type = 'C'
+    option_type = "C"
     risk_free_rate = 0.05
 
     # Simulate option prices at different IVs
@@ -375,18 +368,25 @@ def main():
 
         # Now solve for IV from that price
         calculated_iv = calc.calculate_iv(
-            test_price, underlying_price, strike, expiration,
-            option_type, current_time, risk_free_rate
+            test_price,
+            underlying_price,
+            strike,
+            expiration,
+            option_type,
+            current_time,
+            risk_free_rate,
         )
 
         error = abs(calculated_iv - true_iv) if calculated_iv else 999
         status = "✅" if error < 0.0001 else "❌"
 
-        print(f"{status} True IV: {true_iv:.4f} | Price: ${test_price:.2f} | "
-              f"Calculated IV: {calculated_iv:.4f if calculated_iv else 'FAIL'} | "
-              f"Error: {error:.6f}")
+        print(
+            f"{status} True IV: {true_iv:.4f} | Price: ${test_price:.2f} | "
+            f"Calculated IV: {calculated_iv:.4f if calculated_iv else 'FAIL'} | "
+            f"Error: {error:.6f}"
+        )
 
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("Test 2: Calculate IV from bid/ask spread")
     print("-" * 80)
 
@@ -395,16 +395,17 @@ def main():
     mid = (bid + ask) / 2
 
     calculated_iv = calc.calculate_iv_from_bid_ask(
-        bid, ask, underlying_price, strike, expiration,
-        option_type, current_time, risk_free_rate
+        bid, ask, underlying_price, strike, expiration, option_type, current_time, risk_free_rate
     )
 
     print(f"Bid: ${bid:.2f}")
     print(f"Ask: ${ask:.2f}")
     print(f"Mid: ${mid:.2f}")
-    print(f"Calculated IV: {calculated_iv:.4f if calculated_iv else 'FAIL'} ({calculated_iv*100:.2f}%)")
+    print(
+        f"Calculated IV: {calculated_iv:.4f if calculated_iv else 'FAIL'} ({calculated_iv*100:.2f}%)"
+    )
 
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("Test 3: Enrich option data (integration test)")
     print("-" * 80)
 
@@ -420,7 +421,7 @@ def main():
         "ask": 5.30,
         "volume": 1000,
         "open_interest": 5000,
-        "implied_volatility": None  # Not provided by API
+        "implied_volatility": None,  # Not provided by API
     }
 
     enriched = calc.enrich_option_data_with_iv(option_data, underlying_price, risk_free_rate)
@@ -429,13 +430,15 @@ def main():
     print(f"Strike: ${enriched['strike']:.2f}")
     print(f"Last: ${enriched['last']:.2f}")
     print(f"Bid/Ask: ${enriched['bid']:.2f} / ${enriched['ask']:.2f}")
-    print(f"\nCalculated IV: {enriched.get('implied_volatility'):.4f if enriched.get('implied_volatility') else 'None'}")
-    if enriched.get('implied_volatility'):
+    print(
+        f"\nCalculated IV: {enriched.get('implied_volatility'):.4f if enriched.get('implied_volatility') else 'None'}"
+    )
+    if enriched.get("implied_volatility"):
         print(f"IV Percentage: {enriched['implied_volatility']*100:.2f}%")
 
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("✅ IV calculator test complete!")
-    print("="*80 + "\n")
+    print("=" * 80 + "\n")
 
 
 if __name__ == "__main__":

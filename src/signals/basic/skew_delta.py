@@ -14,6 +14,7 @@ Inputs come from ``ctx.extra['skew']`` — a dict with
 engine from the ``option_chains`` table. When the data isn't available
 the component returns 0 (abstain).
 """
+
 from __future__ import annotations
 
 import os

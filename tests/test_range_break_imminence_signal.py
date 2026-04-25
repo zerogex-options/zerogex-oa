@@ -1,4 +1,5 @@
 """Tests for the Range Break Imminence advanced signal."""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -6,7 +7,6 @@ from datetime import datetime, timezone
 from src.signals.advanced.engine import AdvancedSignalEngine
 from src.signals.advanced.range_break_imminence import RangeBreakImminenceSignal
 from src.signals.components.base import MarketContext
-
 
 NOW = datetime(2026, 4, 24, 15, 0, tzinfo=timezone.utc)
 
@@ -28,9 +28,26 @@ def _ctx(**overrides) -> MarketContext:
     # Default: a 20-bar chop-y window centered near 600 (no compression,
     # no directional trend).
     default_closes = [
-        600.0, 600.4, 599.6, 600.2, 599.8, 600.1, 599.9,
-        600.3, 599.7, 600.0, 600.2, 599.8, 600.1, 599.9,
-        600.4, 599.6, 600.2, 599.8, 600.1, 600.0,
+        600.0,
+        600.4,
+        599.6,
+        600.2,
+        599.8,
+        600.1,
+        599.9,
+        600.3,
+        599.7,
+        600.0,
+        600.2,
+        599.8,
+        600.1,
+        599.9,
+        600.4,
+        599.6,
+        600.2,
+        599.8,
+        600.1,
+        600.0,
     ]
 
     payload = dict(
@@ -55,6 +72,7 @@ def _ctx(**overrides) -> MarketContext:
 # ---------------------------------------------------------------------------
 # Baseline / neutral behavior
 # ---------------------------------------------------------------------------
+
 
 def test_registered_in_advanced_engine():
     engine = AdvancedSignalEngine()
@@ -87,6 +105,7 @@ def test_missing_optional_inputs_do_not_raise():
 # ---------------------------------------------------------------------------
 # Sub-component sanity
 # ---------------------------------------------------------------------------
+
 
 def test_skew_component_extreme_put_skew_is_bearish():
     signal = RangeBreakImminenceSignal()
@@ -124,6 +143,7 @@ def test_compression_component_detects_contraction():
 # Full fusion — bearish break imminent
 # ---------------------------------------------------------------------------
 
+
 def test_bearish_break_imminent_aligned_inputs():
     """All four inputs scream bearish: extreme put skew, dealers long,
     price pinned at range-low with put flow accelerating, and realized
@@ -142,8 +162,8 @@ def test_bearish_break_imminent_aligned_inputs():
         dealer_net_delta=2.5e8,  # dealers long delta ⇒ bearish
         extra={
             "skew": {"otm_put_iv": 0.32, "otm_call_iv": 0.20},  # extreme
-            "put_flow_delta": 400_000.0,                         # puts chased
-            "call_flow_delta": -150_000.0,                       # calls sold
+            "put_flow_delta": 400_000.0,  # puts chased
+            "call_flow_delta": -150_000.0,  # calls sold
         },
     )
     result = RangeBreakImminenceSignal().evaluate(ctx)
@@ -186,14 +206,14 @@ def test_bullish_break_imminent_aligned_inputs():
 # Label boundary behavior
 # ---------------------------------------------------------------------------
 
+
 def test_weak_range_label_between_fade_and_break_watch():
     """Mild bearish skew + mild dealer pressure + compression but no trap
     should land in the 40–64 'Weak Range' band."""
     # Quietly contracting tape — compression ~70–100%, no trap.
-    closes = (
-        [600.0 + (0.5 if i % 2 else -0.5) for i in range(50)]
-        + [600.0 + (0.02 if i % 2 else -0.02) for i in range(10)]
-    )
+    closes = [600.0 + (0.5 if i % 2 else -0.5) for i in range(50)] + [
+        600.0 + (0.02 if i % 2 else -0.02) for i in range(10)
+    ]
     ctx = _ctx(
         close=600.0,
         recent_closes=closes,

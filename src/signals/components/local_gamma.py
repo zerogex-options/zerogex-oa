@@ -1,4 +1,5 @@
 """Local gamma density component for Market State Index."""
+
 from __future__ import annotations
 
 from src.signals.components.base import ComponentBase, MarketContext

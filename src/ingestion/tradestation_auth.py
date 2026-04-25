@@ -20,13 +20,16 @@ from src.utils import get_logger
 # Initialize logger
 logger = get_logger(__name__)
 
+
 class TradeStationAuth:
     """Manage TradeStation API authentication"""
 
     TOKEN_URL = "https://signin.tradestation.com/oauth/token"
     SANDBOX_TOKEN_URL = "https://sim-signin.tradestation.com/oauth/token"
 
-    def __init__(self, client_id: str, client_secret: str, refresh_token: str, sandbox: bool = False):
+    def __init__(
+        self, client_id: str, client_secret: str, refresh_token: str, sandbox: bool = False
+    ):
         """
         Initialize auth manager
 
@@ -59,11 +62,13 @@ class TradeStationAuth:
         # can detect whether the token was already rotated by another thread
         # while they were making a failing request.
         self._token_generation: int = 0
-        self.refresh_buffer_seconds = int(
-            os.getenv("TS_REFRESH_BUFFER_SECONDS", "30")
+        self.refresh_buffer_seconds = int(os.getenv("TS_REFRESH_BUFFER_SECONDS", "30"))
+        token_cache_name = (
+            "tradestation_token_cache_sandbox.json" if sandbox else "tradestation_token_cache.json"
         )
-        token_cache_name = "tradestation_token_cache_sandbox.json" if sandbox else "tradestation_token_cache.json"
-        lock_cache_name = "tradestation_token_cache_sandbox.lock" if sandbox else "tradestation_token_cache.lock"
+        lock_cache_name = (
+            "tradestation_token_cache_sandbox.lock" if sandbox else "tradestation_token_cache.lock"
+        )
         self._token_cache_path = Path(tempfile.gettempdir()) / token_cache_name
         self._token_cache_lock_path = Path(tempfile.gettempdir()) / lock_cache_name
 
@@ -166,11 +171,10 @@ class TradeStationAuth:
                 and self.access_token
                 and self.access_token != failed_token
                 and self.token_expiry
-                and (self.token_expiry - datetime.now()).total_seconds() > self.refresh_buffer_seconds
+                and (self.token_expiry - datetime.now()).total_seconds()
+                > self.refresh_buffer_seconds
             ):
-                logger.info(
-                    "Skipping force-refresh: cached token already rotated since 401"
-                )
+                logger.info("Skipping force-refresh: cached token already rotated since 401")
                 return self.access_token
             logger.warning("Forcing TradeStation access token refresh after auth failure")
             return self._refresh_access_token()
@@ -207,10 +211,10 @@ class TradeStationAuth:
         # client_secret: client secrect from .env
         # refresh_token: refresh token from .env
         payload = {
-            'grant_type': 'refresh_token',
-            'client_id': self.client_id,
-            'client_secret': self.client_secret,
-            'refresh_token': self.refresh_token
+            "grant_type": "refresh_token",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "refresh_token": self.refresh_token,
         }
 
         try:
@@ -250,8 +254,8 @@ class TradeStationAuth:
                 # Access tokens have a 20-minute lifetime
                 # For more details, see:
                 # https://api.tradestation.com/docs/fundamentals/authentication/refresh-tokens
-                self.access_token = data['access_token']
-                expires_in = data.get('expires_in', 1200)
+                self.access_token = data["access_token"]
+                expires_in = data.get("expires_in", 1200)
                 self.token_expiry = datetime.now() + timedelta(seconds=expires_in)
                 self._last_refresh_epoch = time.time()
                 self._token_generation += 1
@@ -289,22 +293,22 @@ class TradeStationAuth:
             containing the access token
         """
         token = self.get_access_token()
-        headers = {'Authorization': f'Bearer {token}'}
+        headers = {"Authorization": f"Bearer {token}"}
         logger.debug("Generated authorization headers")
         return headers
 
 
 def main():
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("TradeStation API Authentication...")
-    print("="*60 + "\n")
+    print("=" * 60 + "\n")
 
     auth = TradeStationAuth(
-        os.getenv('TRADESTATION_CLIENT_ID'),
-        os.getenv('TRADESTATION_CLIENT_SECRET'),
-        os.getenv('TRADESTATION_REFRESH_TOKEN'),
-        sandbox=os.getenv('TRADESTATION_USE_SANDBOX', 'false').lower() == 'true'
+        os.getenv("TRADESTATION_CLIENT_ID"),
+        os.getenv("TRADESTATION_CLIENT_SECRET"),
+        os.getenv("TRADESTATION_REFRESH_TOKEN"),
+        sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true",
     )
 
     try:
@@ -320,7 +324,7 @@ def main():
     except Exception as e:
         print(f"❌ Authentication failed: {e}")
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
 
 
 if __name__ == "__main__":

@@ -16,7 +16,9 @@ load_dotenv()
 _cfg_logger = logging.getLogger(__name__)
 
 
-def _getenv_int(name: str, default: int, *, min: Optional[int] = None, max: Optional[int] = None) -> int:
+def _getenv_int(
+    name: str, default: int, *, min: Optional[int] = None, max: Optional[int] = None
+) -> int:
     """Fetch an int env var with a clear error on parse failure and optional clamping.
 
     ``min`` and ``max`` are inclusive bounds.  Values outside the bounds are
@@ -46,7 +48,9 @@ def _getenv_int(name: str, default: int, *, min: Optional[int] = None, max: Opti
     return value
 
 
-def _getenv_float(name: str, default: float, *, min: Optional[float] = None, max: Optional[float] = None) -> float:
+def _getenv_float(
+    name: str, default: float, *, min: Optional[float] = None, max: Optional[float] = None
+) -> float:
     """Fetch a float env var with a clear error on parse failure and optional clamping."""
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -106,9 +110,9 @@ CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development").strip().lower()
 
 # Rate Limiting & Delays
-API_REQUEST_TIMEOUT = _getenv_int("API_REQUEST_TIMEOUT", 30, min=1, max=600)   # seconds
+API_REQUEST_TIMEOUT = _getenv_int("API_REQUEST_TIMEOUT", 30, min=1, max=600)  # seconds
 API_RETRY_ATTEMPTS = _getenv_int("API_RETRY_ATTEMPTS", 3, min=0, max=20)
-API_RETRY_DELAY = _getenv_float("API_RETRY_DELAY", 1.0, min=0.0, max=60.0)     # seconds
+API_RETRY_DELAY = _getenv_float("API_RETRY_DELAY", 1.0, min=0.0, max=60.0)  # seconds
 API_RETRY_BACKOFF = _getenv_float("API_RETRY_BACKOFF", 2.0, min=1.0, max=10.0)  # multiplier
 
 # Batch Sizes
@@ -171,23 +175,15 @@ STRIKE_CLEANUP_INTERVAL = int(os.getenv("STRIKE_CLEANUP_INTERVAL", "100"))  # it
 # Options: "Default" (9:30-16:00), "USEQPre" (4:00-9:30), "USEQ24Hour" (4:00-20:00)
 SESSION_TEMPLATE = os.getenv("SESSION_TEMPLATE", "Default")
 TS_STREAM_READ_TIMEOUT = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
-TS_STREAM_REUSE_CONNECTIONS = (
-    os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").lower() == "true"
-)
+TS_STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").lower() == "true"
 TS_STREAM_REUSE_QUOTES = os.getenv("TS_STREAM_REUSE_QUOTES", "false").lower() == "true"
 TS_WARN_MARKET_HOURS = os.getenv("TS_WARN_MARKET_HOURS", "true").lower() != "false"
-OPTION_OI_COVERAGE_ALERT_THRESHOLD = float(
-    os.getenv("OPTION_OI_COVERAGE_ALERT_THRESHOLD", "0.35")
-)
+OPTION_OI_COVERAGE_ALERT_THRESHOLD = float(os.getenv("OPTION_OI_COVERAGE_ALERT_THRESHOLD", "0.35"))
 OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD = float(
     os.getenv("OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD", "0.35")
 )
-OPTION_REST_SEED_ON_RECALC = (
-    os.getenv("OPTION_REST_SEED_ON_RECALC", "false").lower() == "true"
-)
-FLOW_CACHE_REFRESH_MIN_SECONDS = float(
-    os.getenv("FLOW_CACHE_REFRESH_MIN_SECONDS", "15")
-)
+OPTION_REST_SEED_ON_RECALC = os.getenv("OPTION_REST_SEED_ON_RECALC", "false").lower() == "true"
+FLOW_CACHE_REFRESH_MIN_SECONDS = float(os.getenv("FLOW_CACHE_REFRESH_MIN_SECONDS", "15"))
 FLOW_CANONICAL_ONLY = os.getenv("FLOW_CANONICAL_ONLY", "true").lower() == "true"
 ANALYTICS_FLOW_CACHE_REFRESH_ENABLED = (
     os.getenv("ANALYTICS_FLOW_CACHE_REFRESH_ENABLED", "true").lower() == "true"
@@ -214,9 +210,7 @@ AGGREGATION_BUCKET_SECONDS = int(os.getenv("AGGREGATION_BUCKET_SECONDS", "60")) 
 MAX_BUFFER_SIZE = int(os.getenv("MAX_BUFFER_SIZE", "1000"))  # flush if buffer exceeds
 BUFFER_FLUSH_INTERVAL = int(os.getenv("BUFFER_FLUSH_INTERVAL", "60"))  # seconds
 # Throttle in-minute option upserts per contract/bucket to reduce UPDATE churn.
-OPTION_BUCKET_WRITE_MIN_SECONDS = float(
-    os.getenv("OPTION_BUCKET_WRITE_MIN_SECONDS", "5")
-)
+OPTION_BUCKET_WRITE_MIN_SECONDS = float(os.getenv("OPTION_BUCKET_WRITE_MIN_SECONDS", "5"))
 
 # =============================================================================
 # Symbol Mapping Configuration
@@ -244,48 +238,28 @@ IV_MAX = float(os.getenv("IV_MAX", "5.0"))
 # =============================================================================
 # Analytics Signal Configuration
 # =============================================================================
-SIGNAL_SMART_MONEY_DOMINANCE_RATIO = float(
-    os.getenv("SIGNAL_SMART_MONEY_DOMINANCE_RATIO", "1.2")
-)
-SIGNAL_VWAP_DEV_BULL_THRESHOLD_PCT = float(
-    os.getenv("SIGNAL_VWAP_DEV_BULL_THRESHOLD_PCT", "0.2")
-)
-SIGNAL_VWAP_DEV_BEAR_THRESHOLD_PCT = float(
-    os.getenv("SIGNAL_VWAP_DEV_BEAR_THRESHOLD_PCT", "-0.2")
-)
-SIGNAL_PCR_BULLISH_THRESHOLD = float(
-    os.getenv("SIGNAL_PCR_BULLISH_THRESHOLD", "0.7")
-)
-SIGNAL_PCR_BEARISH_THRESHOLD = float(
-    os.getenv("SIGNAL_PCR_BEARISH_THRESHOLD", "1.3")
-)
+SIGNAL_SMART_MONEY_DOMINANCE_RATIO = float(os.getenv("SIGNAL_SMART_MONEY_DOMINANCE_RATIO", "1.2"))
+SIGNAL_VWAP_DEV_BULL_THRESHOLD_PCT = float(os.getenv("SIGNAL_VWAP_DEV_BULL_THRESHOLD_PCT", "0.2"))
+SIGNAL_VWAP_DEV_BEAR_THRESHOLD_PCT = float(os.getenv("SIGNAL_VWAP_DEV_BEAR_THRESHOLD_PCT", "-0.2"))
+SIGNAL_PCR_BULLISH_THRESHOLD = float(os.getenv("SIGNAL_PCR_BULLISH_THRESHOLD", "0.7"))
+SIGNAL_PCR_BEARISH_THRESHOLD = float(os.getenv("SIGNAL_PCR_BEARISH_THRESHOLD", "1.3"))
 SIGNAL_AUTO_TUNE_ENABLED = os.getenv("SIGNAL_AUTO_TUNE_ENABLED", "true").lower() == "true"
-SIGNAL_AUTO_TUNE_LOOKBACK_DAYS = max(
-    5, int(os.getenv("SIGNAL_AUTO_TUNE_LOOKBACK_DAYS", "20"))
-)
-SIGNAL_AUTO_TUNE_MIN_SAMPLES = max(
-    50, int(os.getenv("SIGNAL_AUTO_TUNE_MIN_SAMPLES", "250"))
-)
+SIGNAL_AUTO_TUNE_LOOKBACK_DAYS = max(5, int(os.getenv("SIGNAL_AUTO_TUNE_LOOKBACK_DAYS", "20")))
+SIGNAL_AUTO_TUNE_MIN_SAMPLES = max(50, int(os.getenv("SIGNAL_AUTO_TUNE_MIN_SAMPLES", "250")))
 SIGNAL_IV_RANK_ENABLED = os.getenv("SIGNAL_IV_RANK_ENABLED", "false").lower() == "true"
 
 # =============================================================================
 # Volatility Expansion Configuration
 # =============================================================================
-VOL_SMART_MONEY_DOMINANCE_RATIO = float(
-    os.getenv("VOL_SMART_MONEY_DOMINANCE_RATIO", "1.2")
-)
+VOL_SMART_MONEY_DOMINANCE_RATIO = float(os.getenv("VOL_SMART_MONEY_DOMINANCE_RATIO", "1.2"))
 VOL_GAMMA_DEEP_NEGATIVE = float(os.getenv("VOL_GAMMA_DEEP_NEGATIVE", "-5000000000"))
 VOL_GAMMA_NEGATIVE = float(os.getenv("VOL_GAMMA_NEGATIVE", "-3000000000"))
 VOL_GAMMA_FLIP_NEAR_PCT = float(os.getenv("VOL_GAMMA_FLIP_NEAR_PCT", "0.003"))
 VOL_PCR_HIGH = float(os.getenv("VOL_PCR_HIGH", "1.8"))
 VOL_PCR_LOW = float(os.getenv("VOL_PCR_LOW", "0.4"))
 VOL_AUTO_TUNE_ENABLED = os.getenv("VOL_AUTO_TUNE_ENABLED", "true").lower() == "true"
-VOL_AUTO_TUNE_LOOKBACK_DAYS = max(
-    5, int(os.getenv("VOL_AUTO_TUNE_LOOKBACK_DAYS", "30"))
-)
-VOL_AUTO_TUNE_MIN_SAMPLES = max(
-    50, int(os.getenv("VOL_AUTO_TUNE_MIN_SAMPLES", "250"))
-)
+VOL_AUTO_TUNE_LOOKBACK_DAYS = max(5, int(os.getenv("VOL_AUTO_TUNE_LOOKBACK_DAYS", "30")))
+VOL_AUTO_TUNE_MIN_SAMPLES = max(50, int(os.getenv("VOL_AUTO_TUNE_MIN_SAMPLES", "250")))
 
 
 # =============================================================================
@@ -300,9 +274,7 @@ SIGNALS_PORTFOLIO_SIZE = float(os.getenv("SIGNALS_PORTFOLIO_SIZE", "1000000"))
 # signal components (vol_expansion, strategy_builder, position optimizer).
 # Previously hard-coded as 300_000_000.0 in three places.  Override via
 # env var if your universe's typical GEX magnitude differs.
-SIGNAL_GEX_NORMALIZATION = _getenv_float(
-    "SIGNAL_GEX_NORMALIZATION", 300_000_000.0, min=1.0
-)
+SIGNAL_GEX_NORMALIZATION = _getenv_float("SIGNAL_GEX_NORMALIZATION", 300_000_000.0, min=1.0)
 POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS = (
     os.getenv("POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS", "false").lower() == "true"
 )
@@ -315,9 +287,7 @@ SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES = int(
     os.getenv("SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES", "30")
 )
 SIGNALS_TRIGGER_THRESHOLD = float(os.getenv("SIGNALS_TRIGGER_THRESHOLD", "0.52"))
-SIGNALS_TREND_CONFIRMATION_BARS = max(
-    0, int(os.getenv("SIGNALS_TREND_CONFIRMATION_BARS", "3"))
-)
+SIGNALS_TREND_CONFIRMATION_BARS = max(0, int(os.getenv("SIGNALS_TREND_CONFIRMATION_BARS", "3")))
 SIGNALS_TREND_CONFIRMATION_MIN_MATCH = max(
     0, int(os.getenv("SIGNALS_TREND_CONFIRMATION_MIN_MATCH", "1"))
 )
@@ -340,9 +310,7 @@ SIGNALS_CONVICTION_AGGREGATION_ENABLED = (
 # Absolute-score cutoff below which a component is treated as abstaining
 # (removed from the active-weight denominator). 0.02 keeps legitimately
 # near-zero directional reads in the pool while dropping hard zeros.
-SIGNALS_CONVICTION_ABSTAIN_EPSILON = float(
-    os.getenv("SIGNALS_CONVICTION_ABSTAIN_EPSILON", "0.02")
-)
+SIGNALS_CONVICTION_ABSTAIN_EPSILON = float(os.getenv("SIGNALS_CONVICTION_ABSTAIN_EPSILON", "0.02"))
 # Maximum multiplier applied when all active components agree in direction.
 SIGNALS_CONVICTION_AGREEMENT_MAX_MULT = float(
     os.getenv("SIGNALS_CONVICTION_AGREEMENT_MAX_MULT", "1.75")
@@ -360,36 +328,24 @@ SIGNALS_CONVICTION_EXTREMITY_MAX_MULT = float(
 # SIGNALS_TRIGGER_THRESHOLD, the engine opens a smaller ("scalp") position.
 # This captures the "split-second technical opportunities" use case without
 # requiring conviction-trade strength.
-SIGNALS_SCALP_TRIGGER_ENABLED = (
-    os.getenv("SIGNALS_SCALP_TRIGGER_ENABLED", "true").lower() == "true"
-)
-SIGNALS_SCALP_TRIGGER_THRESHOLD = float(
-    os.getenv("SIGNALS_SCALP_TRIGGER_THRESHOLD", "0.36")
-)
+SIGNALS_SCALP_TRIGGER_ENABLED = os.getenv("SIGNALS_SCALP_TRIGGER_ENABLED", "true").lower() == "true"
+SIGNALS_SCALP_TRIGGER_THRESHOLD = float(os.getenv("SIGNALS_SCALP_TRIGGER_THRESHOLD", "0.36"))
 # Fraction of normal Kelly-based contracts used for scalp-tier trades.
-SIGNALS_SCALP_SIZE_MULTIPLIER = float(
-    os.getenv("SIGNALS_SCALP_SIZE_MULTIPLIER", "0.40")
-)
+SIGNALS_SCALP_SIZE_MULTIPLIER = float(os.getenv("SIGNALS_SCALP_SIZE_MULTIPLIER", "0.40"))
 
 # -----------------------------------------------------------------------------
 # Strong-conviction DRS override -- lets high-conviction reversals through
 # even when the DRS hard gates would block them (e.g. bearish entry on a day
 # already below the gamma flip, where the "fresh cross" rule fires once).
 # -----------------------------------------------------------------------------
-SIGNALS_DRS_OVERRIDE_ENABLED = (
-    os.getenv("SIGNALS_DRS_OVERRIDE_ENABLED", "true").lower() == "true"
-)
-SIGNALS_DRS_OVERRIDE_THRESHOLD = float(
-    os.getenv("SIGNALS_DRS_OVERRIDE_THRESHOLD", "0.70")
-)
+SIGNALS_DRS_OVERRIDE_ENABLED = os.getenv("SIGNALS_DRS_OVERRIDE_ENABLED", "true").lower() == "true"
+SIGNALS_DRS_OVERRIDE_THRESHOLD = float(os.getenv("SIGNALS_DRS_OVERRIDE_THRESHOLD", "0.70"))
 
 # Conviction uplift for a fresh gamma-flip cross in the signaled direction.
 # Previously "fresh cross" was a hard bearish-entry requirement; symmetrizing
 # the DRS gates moved it to an additive sizing boost applied after the gate
 # passes. 0.0 disables the boost.
-SIGNALS_DRS_FRESH_CROSS_BOOST = max(
-    0.0, float(os.getenv("SIGNALS_DRS_FRESH_CROSS_BOOST", "0.20"))
-)
+SIGNALS_DRS_FRESH_CROSS_BOOST = max(0.0, float(os.getenv("SIGNALS_DRS_FRESH_CROSS_BOOST", "0.20")))
 
 # -----------------------------------------------------------------------------
 # Independent signal trigger risk controls
@@ -635,15 +591,11 @@ SIGNALS_CONFLUENCE_ENABLED = _getenv_bool("SIGNALS_CONFLUENCE_ENABLED", True)
 SIGNALS_CONFLUENCE_MIN_OPINIONATED = _getenv_float(
     "SIGNALS_CONFLUENCE_MIN_OPINIONATED", 0.15, min=0.0, max=1.0
 )
-SIGNALS_CONFLUENCE_MIN_AGREE = _getenv_int(
-    "SIGNALS_CONFLUENCE_MIN_AGREE", 3, min=2, max=20
-)
+SIGNALS_CONFLUENCE_MIN_AGREE = _getenv_int("SIGNALS_CONFLUENCE_MIN_AGREE", 3, min=2, max=20)
 SIGNALS_CONFLUENCE_MIN_NET_RATIO = _getenv_float(
     "SIGNALS_CONFLUENCE_MIN_NET_RATIO", 0.50, min=0.0, max=1.0
 )
-SIGNALS_CONFLUENCE_MIN_STRENGTH = _getenv_float(
-    "SIGNALS_CONFLUENCE_MIN_STRENGTH", 1.00, min=0.0
-)
+SIGNALS_CONFLUENCE_MIN_STRENGTH = _getenv_float("SIGNALS_CONFLUENCE_MIN_STRENGTH", 1.00, min=0.0)
 SIGNALS_CONFLUENCE_ADVANCED_WEIGHT = _getenv_float(
     "SIGNALS_CONFLUENCE_ADVANCED_WEIGHT", 1.25, min=0.0
 )
@@ -663,9 +615,7 @@ SIGNALS_STOP_LOSS_PCT = float(os.getenv("SIGNALS_STOP_LOSS_PCT", "-0.25"))
 #   seller gets = bid * (1 - slippage)
 # Default 0.0 preserves historical behavior (pure bid/ask fill).  Typical
 # live-trading values are 0.01-0.03 (1-3%).
-SIGNALS_EXECUTION_SLIPPAGE_PCT = max(
-    0.0, float(os.getenv("SIGNALS_EXECUTION_SLIPPAGE_PCT", "0.0"))
-)
+SIGNALS_EXECUTION_SLIPPAGE_PCT = max(0.0, float(os.getenv("SIGNALS_EXECUTION_SLIPPAGE_PCT", "0.0")))
 
 # =============================================================================
 # Ingestion/Analytics CLI Defaults
@@ -716,6 +666,7 @@ INGEST_PARITY_GUARD_ENABLED = os.getenv("INGEST_PARITY_GUARD_ENABLED", "false").
 # =============================================================================
 # Helper Functions
 # =============================================================================
+
 
 def get_all_config() -> Dict[str, Any]:
     """Get all configuration as dictionary for logging/debugging"""

@@ -8,13 +8,13 @@ Components:
 
 Usage:
     from src.database import db_connection
-    
+
     # Context manager (recommended)
     with db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM underlying_quotes LIMIT 1")
         result = cursor.fetchone()
-    
+
     # Manual connection management
     conn = get_db_connection()
     try:

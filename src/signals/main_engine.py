@@ -86,7 +86,9 @@ def main() -> None:
 
     processes: list[Process] = []
     for symbol in symbols:
-        process = Process(target=_run_for_symbol, args=(symbol, args.interval), name=f"signals-{symbol}")
+        process = Process(
+            target=_run_for_symbol, args=(symbol, args.interval), name=f"signals-{symbol}"
+        )
         process.start()
         processes.append(process)
 

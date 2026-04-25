@@ -37,6 +37,7 @@ ET = pytz.timezone("US/Eastern")
 # NYSE holidays
 # ---------------------------------------------------------------------------
 
+
 def load_nyse_holidays() -> set[date]:
     """Load holiday dates from the ``NYSE_HOLIDAYS`` env var.
 
@@ -109,6 +110,7 @@ def calculate_time_to_expiration(
 # Session helpers
 # ---------------------------------------------------------------------------
 
+
 def _to_et(dt: Optional[datetime]) -> datetime:
     if dt is None:
         return datetime.now(ET)
@@ -171,6 +173,7 @@ def get_market_session(dt: Optional[datetime] = None) -> str:
 # ---------------------------------------------------------------------------
 # Engine run window (24x5 weekdays minus NYSE holidays)
 # ---------------------------------------------------------------------------
+
 
 def is_engine_run_window(dt: Optional[datetime] = None) -> bool:
     """Engines run 24x5: all hours on weekdays excluding NYSE holidays."""

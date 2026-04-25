@@ -4,7 +4,6 @@ from src.signals.components.base import MarketContext
 from src.signals.basic.positioning_trap import PositioningTrapComponent
 from src.signals.unified_signal_engine import UnifiedSignalEngine
 
-
 comp = PositioningTrapComponent()
 
 

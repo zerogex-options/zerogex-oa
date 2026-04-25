@@ -1,4 +1,5 @@
 """Advanced trap-detection (fade) setup signal."""
+
 from __future__ import annotations
 
 from src.signals.components.base import MarketContext
@@ -30,7 +31,7 @@ class TrapDetectionSignal:
         support = nearest_above(dn_levels, ctx.close)
 
         sigma = realized_pct_sigma(ctx)
-        buffer_pct = max(BREAKOUT_BUFFER_MIN, BREAKOUT_BUFFER_VOL_MULT * sigma * (5 ** 0.5))
+        buffer_pct = max(BREAKOUT_BUFFER_MIN, BREAKOUT_BUFFER_VOL_MULT * sigma * (5**0.5))
 
         breakout_up = bool(resistance is not None and ctx.close > resistance * (1.0 + buffer_pct))
         breakout_down = bool(support is not None and ctx.close < support * (1.0 - buffer_pct))
@@ -58,7 +59,9 @@ class TrapDetectionSignal:
         put_decelerating = put_flow_delta < 0
 
         upside_fail = breakout_up and long_gamma and gamma_strengthening and not wall_migrated_up
-        downside_fail = breakout_down and long_gamma and gamma_strengthening and not wall_migrated_down
+        downside_fail = (
+            breakout_down and long_gamma and gamma_strengthening and not wall_migrated_down
+        )
 
         def _magnitude(dist_pct: float) -> float:
             dist_strength = min(1.0, abs(dist_pct) / max(buffer_pct * 3.0, 0.003))
@@ -70,18 +73,14 @@ class TrapDetectionSignal:
             dist_pct = (ctx.close - resistance) / ctx.close
             mag = _magnitude(dist_pct)
             flow_mult = (
-                1.1
-                if call_decelerating
-                else max(0.3, 1.0 - call_flow_delta / max(flow_norm, 1.0))
+                1.1 if call_decelerating else max(0.3, 1.0 - call_flow_delta / max(flow_norm, 1.0))
             )
             score = -min(1.0, mag * flow_mult)
         elif downside_fail and support:
             dist_pct = (ctx.close - support) / ctx.close
             mag = _magnitude(dist_pct)
             flow_mult = (
-                1.1
-                if put_decelerating
-                else max(0.3, 1.0 - put_flow_delta / max(flow_norm, 1.0))
+                1.1 if put_decelerating else max(0.3, 1.0 - put_flow_delta / max(flow_norm, 1.0))
             )
             score = min(1.0, mag * flow_mult)
 
@@ -93,7 +92,9 @@ class TrapDetectionSignal:
             score=score,
             context={
                 "triggered": triggered,
-                "signal": "bearish_fade" if score < 0 else ("bullish_fade" if score > 0 else "none"),
+                "signal": (
+                    "bearish_fade" if score < 0 else ("bullish_fade" if score > 0 else "none")
+                ),
                 "close": ctx.close,
                 "resistance_level": resistance,
                 "support_level": support,

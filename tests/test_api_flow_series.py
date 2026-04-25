@@ -25,7 +25,6 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi.testclient import TestClient
 
-
 # ---------------------------------------------------------------------------
 # Shared fixtures / helpers
 # ---------------------------------------------------------------------------
@@ -83,6 +82,7 @@ class _CannedConn:
         @asynccontextmanager
         async def _cm():
             yield
+
         return _cm()
 
 
@@ -110,6 +110,7 @@ def _make_db(conn: _CannedConn):
 # ---------------------------------------------------------------------------
 # DatabaseManager.get_flow_series — covers T1, T3 (tail), T4 (unknown), T5
 # ---------------------------------------------------------------------------
+
 
 def _mock_session_resolution_rows(current_date: date = date(2026, 4, 24)):
     """Return a fetchval sequence that makes _resolve_flow_series_session
@@ -158,7 +159,7 @@ def test_get_flow_series_t5_filter_matches_nothing_returns_empty():
     _query, args = conn.fetch_calls[0]
     assert args[0] == "SPY"
     assert args[3] == [999.0]  # strikes_arg
-    assert args[4] is None     # expirations_arg
+    assert args[4] is None  # expirations_arg
 
 
 def test_get_flow_series_t1_happy_path_passes_through_rows():
@@ -215,8 +216,8 @@ def test_get_flow_series_t3_intervals_one_returns_only_tail():
     # Build a 3-row session; intervals=1 must return just the last row
     # with its true session-cumulative values — not a per-bar delta.
     rows = [
-        {"bar_start": _bar_ts(0),  "call_premium_cum": 50000.0, "is_synthetic": False},
-        {"bar_start": _bar_ts(5),  "call_premium_cum": 50000.0, "is_synthetic": True},
+        {"bar_start": _bar_ts(0), "call_premium_cum": 50000.0, "is_synthetic": False},
+        {"bar_start": _bar_ts(5), "call_premium_cum": 50000.0, "is_synthetic": True},
         {"bar_start": _bar_ts(10), "call_premium_cum": 55000.0, "is_synthetic": False},
     ]
     conn = _CannedConn(
@@ -285,6 +286,7 @@ def test_get_flow_series_session_prior_no_prior_returns_empty():
 # DatabaseManager.get_flow_contracts — companion endpoint semantics
 # ---------------------------------------------------------------------------
 
+
 def test_get_flow_contracts_happy_path():
     conn = _CannedConn(
         fetchval_sequence=_mock_session_resolution_rows(),
@@ -327,6 +329,7 @@ def test_get_flow_contracts_session_prior_no_prior_returns_empty_lists():
 # HTTP surface — validation, response shape, error codes
 # ---------------------------------------------------------------------------
 
+
 def _build_app_with_mock_db(monkeypatch: pytest.MonkeyPatch):
     """Reload src.api.main with an AsyncMock DatabaseManager.
 
@@ -342,6 +345,7 @@ def _build_app_with_mock_db(monkeypatch: pytest.MonkeyPatch):
             sys.modules.pop(mod, None)
 
     from src.api import database as dbmod
+
     dbmod.DatabaseManager.connect = AsyncMock(return_value=None)
     dbmod.DatabaseManager.disconnect = AsyncMock(return_value=None)
     dbmod.DatabaseManager.check_health = AsyncMock(return_value=True)
@@ -349,6 +353,7 @@ def _build_app_with_mock_db(monkeypatch: pytest.MonkeyPatch):
 
     from src.api.main import app
     from src.api import main as mainmod
+
     return app, mainmod
 
 
@@ -403,12 +408,19 @@ def test_http_series_response_shape_matches_spec(monkeypatch: pytest.MonkeyPatch
     assert row["bar_end"] == "2026-04-24T13:35:00Z"
     # Every documented field is present.
     for field in (
-        "call_premium_cum", "put_premium_cum",
-        "call_volume_cum", "put_volume_cum",
-        "net_volume_cum", "raw_volume_cum",
-        "call_position_cum", "put_position_cum",
-        "net_premium_cum", "put_call_ratio",
-        "underlying_price", "contract_count", "is_synthetic",
+        "call_premium_cum",
+        "put_premium_cum",
+        "call_volume_cum",
+        "put_volume_cum",
+        "net_volume_cum",
+        "raw_volume_cum",
+        "call_position_cum",
+        "put_position_cum",
+        "net_premium_cum",
+        "put_call_ratio",
+        "underlying_price",
+        "contract_count",
+        "is_synthetic",
     ):
         assert field in row
 
@@ -420,14 +432,19 @@ def test_http_series_t6_put_call_ratio_null(monkeypatch: pytest.MonkeyPatch):
     canned = [
         {
             "bar_start": _bar_ts(0),
-            "call_premium_cum": 1.0, "put_premium_cum": 0.0,
-            "call_volume_cum": 100, "put_volume_cum": 0,
-            "net_volume_cum": 10, "raw_volume_cum": 100,
-            "call_position_cum": 10, "put_position_cum": 0,
+            "call_premium_cum": 1.0,
+            "put_premium_cum": 0.0,
+            "call_volume_cum": 100,
+            "put_volume_cum": 0,
+            "net_volume_cum": 10,
+            "raw_volume_cum": 100,
+            "call_position_cum": 10,
+            "put_position_cum": 0,
             "net_premium_cum": 1.0,
             "put_call_ratio": None,
             "underlying_price": 710.0,
-            "contract_count": 1, "is_synthetic": False,
+            "contract_count": 1,
+            "is_synthetic": False,
         },
     ]
     with TestClient(app) as client:
@@ -582,6 +599,7 @@ def test_http_series_bad_session_enum(monkeypatch: pytest.MonkeyPatch):
 # /api/flow/contracts HTTP surface
 # ---------------------------------------------------------------------------
 
+
 def test_http_contracts_happy_path(monkeypatch: pytest.MonkeyPatch):
     app, mainmod = _build_app_with_mock_db(monkeypatch)
 
@@ -613,6 +631,7 @@ def test_http_contracts_unknown_symbol_returns_404(monkeypatch: pytest.MonkeyPat
 # per-contract flow_by_contract.underlying_price column, and must be
 # invariant under strike/expiration filters.
 # ---------------------------------------------------------------------------
+
 
 def test_series_sql_pulls_underlying_from_tape_not_per_contract_column():
     """Observed in prod: 20–30 minutes of flat underlying_price followed by
@@ -686,7 +705,7 @@ def test_series_sql_underlying_cte_ignores_strike_expiration_filters():
             if depth == 0:
                 end = j
                 break
-    cte_body = main_query[start:end + 1]
+    cte_body = main_query[start : end + 1]
     # The strikes/expirations params ($4, $5) must NOT appear inside the
     # underlying CTE — only $1 (symbol), $2 (ts_start), $3 (ts_end).
     assert "$4" not in cte_body

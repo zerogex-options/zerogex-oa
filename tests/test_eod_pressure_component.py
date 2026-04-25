@@ -1,4 +1,5 @@
 """Tests for eod_pressure component."""
+
 from datetime import datetime, timezone
 
 from src.signals.components.base import MarketContext
@@ -31,26 +32,20 @@ comp = EODPressureSignal()
 def test_pre_window_is_neutral():
     # 13:00 UTC = 09:00 ET; before open. Must return 0 regardless of inputs.
     ctx = _ctx(hour=13, minute=0)
-    ctx.extra["gex_by_strike"] = [
-        {"strike": 500.0, "dealer_charm_exposure": _CHARM_NORM}
-    ]
+    ctx.extra["gex_by_strike"] = [{"strike": 500.0, "dealer_charm_exposure": _CHARM_NORM}]
     assert comp.compute(ctx) == 0.0
 
 
 def test_morning_is_neutral():
     # 17:00 UTC = 13:00 ET, T-180min. Still before EOD window.
     ctx = _ctx(hour=17, minute=0)
-    ctx.extra["gex_by_strike"] = [
-        {"strike": 500.0, "dealer_charm_exposure": _CHARM_NORM}
-    ]
+    ctx.extra["gex_by_strike"] = [{"strike": 500.0, "dealer_charm_exposure": _CHARM_NORM}]
     assert comp.compute(ctx) == 0.0
 
 
 def test_post_close_is_neutral():
     ctx = _ctx(hour=20, minute=30)
-    ctx.extra["gex_by_strike"] = [
-        {"strike": 500.0, "dealer_charm_exposure": _CHARM_NORM}
-    ]
+    ctx.extra["gex_by_strike"] = [{"strike": 500.0, "dealer_charm_exposure": _CHARM_NORM}]
     assert comp.compute(ctx) == 0.0
 
 
@@ -68,9 +63,7 @@ def test_positive_dealer_charm_at_spot_is_bullish():
 
 def test_negative_dealer_charm_at_spot_is_bearish():
     ctx = _ctx()
-    ctx.extra["gex_by_strike"] = [
-        {"strike": 500.0, "dealer_charm_exposure": -_CHARM_NORM}
-    ]
+    ctx.extra["gex_by_strike"] = [{"strike": 500.0, "dealer_charm_exposure": -_CHARM_NORM}]
     ctx.max_pain = ctx.close
     ctx.extra["max_gamma_strike"] = ctx.close
     assert comp.compute(ctx) < -0.3
@@ -138,18 +131,32 @@ def test_opex_amplifier():
     base_rows = [{"strike": 500.0, "dealer_charm_exposure": _CHARM_NORM * 0.3}]
     non_opex = MarketContext(
         timestamp=datetime(2026, 4, 14, 19, 50, tzinfo=timezone.utc),
-        underlying="SPY", close=500.0, net_gex=2.0e8, gamma_flip=500.0,
-        put_call_ratio=1.0, max_pain=500.0, smart_call=0.0, smart_put=0.0,
-        recent_closes=[500.0] * 5, iv_rank=None,
+        underlying="SPY",
+        close=500.0,
+        net_gex=2.0e8,
+        gamma_flip=500.0,
+        put_call_ratio=1.0,
+        max_pain=500.0,
+        smart_call=0.0,
+        smart_put=0.0,
+        recent_closes=[500.0] * 5,
+        iv_rank=None,
     )
     non_opex.extra["gex_by_strike"] = base_rows
     non_opex.extra["max_gamma_strike"] = 500.0
 
     opex = MarketContext(
         timestamp=datetime(2026, 4, 17, 19, 50, tzinfo=timezone.utc),
-        underlying="SPY", close=500.0, net_gex=2.0e8, gamma_flip=500.0,
-        put_call_ratio=1.0, max_pain=500.0, smart_call=0.0, smart_put=0.0,
-        recent_closes=[500.0] * 5, iv_rank=None,
+        underlying="SPY",
+        close=500.0,
+        net_gex=2.0e8,
+        gamma_flip=500.0,
+        put_call_ratio=1.0,
+        max_pain=500.0,
+        smart_call=0.0,
+        smart_put=0.0,
+        recent_closes=[500.0] * 5,
+        iv_rank=None,
     )
     opex.extra["gex_by_strike"] = base_rows
     opex.extra["max_gamma_strike"] = 500.0
@@ -167,9 +174,7 @@ def test_quad_witching_flag():
 
 def test_score_bounded():
     ctx = _ctx()
-    ctx.extra["gex_by_strike"] = [
-        {"strike": 500.0, "dealer_charm_exposure": 1e20}
-    ]
+    ctx.extra["gex_by_strike"] = [{"strike": 500.0, "dealer_charm_exposure": 1e20}]
     ctx.close = 400.0
     ctx.max_pain = 500.0
     ctx.extra["max_gamma_strike"] = 500.0
@@ -178,9 +183,7 @@ def test_score_bounded():
 
 def test_context_values_shape():
     ctx = _ctx()
-    ctx.extra["gex_by_strike"] = [
-        {"strike": 500.0, "dealer_charm_exposure": _CHARM_NORM * 0.2}
-    ]
+    ctx.extra["gex_by_strike"] = [{"strike": 500.0, "dealer_charm_exposure": _CHARM_NORM * 0.2}]
     cv = comp.context_values(ctx)
     assert "time_ramp" in cv
     assert "charm_at_spot" in cv

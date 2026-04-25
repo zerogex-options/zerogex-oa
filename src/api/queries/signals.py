@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
-_ET = ZoneInfo('America/New_York')
+_ET = ZoneInfo("America/New_York")
 # Must match the module constant in src/api/database.py; duplicated here
 # so these methods remain self-contained.  Keep the two in sync.
 SIGNAL_HISTORY_LIMIT = 90
@@ -127,12 +127,12 @@ class SignalsQueriesMixin:
                 rows = await conn.fetch(query, symbol, lookback_days)
             result: Dict[str, Any] = {}
             for row in rows:
-                tf  = row["timeframe"]
-                sb  = row["strength_bucket"]
+                tf = row["timeframe"]
+                sb = row["strength_bucket"]
                 tot = row["total"] or 0
                 cor = row["correct"] or 0
                 result.setdefault(tf, {})[sb] = {
-                    "total":   tot,
+                    "total": tot,
                     "correct": cor,
                     "win_pct": round(cor / tot, 4) if tot > 0 else None,
                 }
@@ -168,7 +168,6 @@ class SignalsQueriesMixin:
             }
             for row in reversed(rows)
         ]
-
 
     async def get_vol_expansion_signal(
         self,
@@ -414,9 +413,7 @@ class SignalsQueriesMixin:
                 total = d.get("total") or 0
                 resolved = total - (d.get("pending") or 0)
                 d["resolved"] = resolved
-                d["hit_rate"] = (
-                    round(d["wins"] / resolved, 4) if resolved > 0 else None
-                )
+                d["hit_rate"] = round(d["wins"] / resolved, 4) if resolved > 0 else None
                 d["horizon"] = horizon
                 d["signal_name"] = signal_name
                 d["underlying"] = symbol
@@ -636,9 +633,7 @@ class SignalsQueriesMixin:
                     prev_sign = sign
             return out
         except Exception as e:
-            logger.error(
-                f"get_signal_component_events failed ({symbol}, {component_name}): {e}"
-            )
+            logger.error(f"get_signal_component_events failed ({symbol}, {component_name}): {e}")
             return []
 
     async def get_signal_confluence_matrix(
@@ -866,19 +861,35 @@ class SignalsQueriesMixin:
                     "total": total,
                     "profitable_signals": profitable,
                     "profitability_rate": round(profitable / total, 4) if total > 0 else None,
-                    "avg_realized_return_pct": round(float(row["avg_realized_return_pct"]), 4) if row["avg_realized_return_pct"] is not None else None,
-                    "avg_expected_value": round(float(row["avg_expected_value"]), 4) if row["avg_expected_value"] is not None else None,
-                    "avg_predicted_pop": round(float(row["avg_predicted_pop"]), 4) if row["avg_predicted_pop"] is not None else None,
-                    "avg_realized_move_pct": round(float(row["avg_realized_move_pct"]), 4) if row["avg_realized_move_pct"] is not None else None,
+                    "avg_realized_return_pct": (
+                        round(float(row["avg_realized_return_pct"]), 4)
+                        if row["avg_realized_return_pct"] is not None
+                        else None
+                    ),
+                    "avg_expected_value": (
+                        round(float(row["avg_expected_value"]), 4)
+                        if row["avg_expected_value"] is not None
+                        else None
+                    ),
+                    "avg_predicted_pop": (
+                        round(float(row["avg_predicted_pop"]), 4)
+                        if row["avg_predicted_pop"] is not None
+                        else None
+                    ),
+                    "avg_realized_move_pct": (
+                        round(float(row["avg_realized_move_pct"]), 4)
+                        if row["avg_realized_move_pct"] is not None
+                        else None
+                    ),
                 }
             return result
         except Exception as e:
             logger.error(f"get_position_optimizer_accuracy failed: {e}")
             return {}
 
-
-
-    async def get_signal_history(self, symbol: str = "SPY", limit: int = 100) -> list[Dict[str, Any]]:
+    async def get_signal_history(
+        self, symbol: str = "SPY", limit: int = 100
+    ) -> list[Dict[str, Any]]:
         """Return recent managed trade history with win/loss and realized P&L."""
         query = """
             SELECT
@@ -916,7 +927,9 @@ class SignalsQueriesMixin:
             logger.error(f"get_signal_history failed ({symbol}): {e}")
             return []
 
-    async def get_current_signal_with_trades(self, symbol: str = "SPY", timeframe: str = "intraday") -> Optional[Dict[str, Any]]:
+    async def get_current_signal_with_trades(
+        self, symbol: str = "SPY", timeframe: str = "intraday"
+    ) -> Optional[Dict[str, Any]]:
         """Return current consolidated signal plus active trade statuses."""
         signal_row = await self.get_trade_signal(symbol=symbol, timeframe=timeframe)
         if not signal_row:
@@ -1024,7 +1037,9 @@ class SignalsQueriesMixin:
             logger.error(f"get_latest_signal_score failed ({symbol}): {e}")
             return None
 
-    async def get_latest_signal_score_enriched(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
+    async def get_latest_signal_score_enriched(
+        self, symbol: str = "SPY"
+    ) -> Optional[Dict[str, Any]]:
         try:
             async with self._acquire_connection() as conn:
                 row = await conn.fetchrow(

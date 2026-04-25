@@ -19,14 +19,20 @@ def test_classify_regime_uses_gex_sign():
 
 def test_classify_regime_prefers_explicit_regime_field():
     assert classify_regime({"gex_regime": {"score": 0.9, "regime": "long_gamma"}}) == "long_gamma"
-    assert classify_regime({"gex_regime": {"score": -0.9, "regime": "short_gamma"}}) == "short_gamma"
-    assert classify_regime({"gex_regime": {"score": -0.1, "regime": "neutral_gamma"}}) == "neutral_gamma"
+    assert (
+        classify_regime({"gex_regime": {"score": -0.9, "regime": "short_gamma"}}) == "short_gamma"
+    )
+    assert (
+        classify_regime({"gex_regime": {"score": -0.1, "regime": "neutral_gamma"}})
+        == "neutral_gamma"
+    )
 
 
 def test_classify_regime_matches_positive_net_gex_as_long_gamma():
     # Regression: Net GEX = +$1.0B should classify as long_gamma, not short_gamma.
     # With GEX_NORM = 2.5e8, score = -tanh(1e9 / 2.5e8) ~= -0.9993.
     import math
+
     score = -math.tanh(1.0e9 / 2.5e8)
     assert classify_regime({"gex_regime": {"score": score}}) == "long_gamma"
 
@@ -66,6 +72,7 @@ def test_calibrate_signal_handles_neutral_signal():
 # Edge cases: classify_regime with malformed / missing / NaN inputs
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize(
     "components",
     [
@@ -73,12 +80,12 @@ def test_calibrate_signal_handles_neutral_signal():
         {},
         {"gex_regime": None},
         {"gex_regime": "not-a-dict"},
-        {"gex_regime": {}},                                         # no known keys
+        {"gex_regime": {}},  # no known keys
         {"gex_regime": {"score": "not-a-float"}},
         {"gex_regime": {"score": None}},
         {"gex_regime": {"value": "N/A"}},
-        {"gex_regime": {"regime": ""}},                              # empty regime string
-        {"other_component": {"score": 0.5}},                         # wrong top-level key
+        {"gex_regime": {"regime": ""}},  # empty regime string
+        {"other_component": {"score": 0.5}},  # wrong top-level key
     ],
     ids=[
         "none",
@@ -116,6 +123,7 @@ def test_classify_regime_infinity_score_classified_by_sign():
 # Edge cases: calibrate_signal with degenerate history
 # ---------------------------------------------------------------------------
 
+
 def test_calibrate_signal_skips_history_rows_with_bad_fields():
     # Rows with missing/non-numeric composite_score or fwd_return must
     # be silently skipped, not crash the calibration.
@@ -145,8 +153,7 @@ def test_calibrate_signal_nan_composite_treated_as_neutral():
         current_normalized=0.0,
         current_regime="long_gamma",
         history_rows=[
-            {"composite_score": 0.7, "fwd_return": 0.001, "regime": "long_gamma"}
-            for _ in range(50)
+            {"composite_score": 0.7, "fwd_return": 0.001, "regime": "long_gamma"} for _ in range(50)
         ],
     )
     assert metrics["action"] == "wait"
@@ -170,11 +177,10 @@ def test_calibrate_signal_empty_history_with_strong_signal():
 def test_calibrate_signal_zero_sample_after_filtering():
     # Historical rows exist, but none match the direction (all opposite-signed).
     history = [
-        {"composite_score": -0.7, "fwd_return": 0.001, "regime": "long_gamma"}
-        for _ in range(100)
+        {"composite_score": -0.7, "fwd_return": 0.001, "regime": "long_gamma"} for _ in range(100)
     ]
     metrics = calibrate_signal(
-        current_composite=0.7,                 # positive direction
+        current_composite=0.7,  # positive direction
         current_normalized=0.7,
         current_regime="long_gamma",
         history_rows=history,

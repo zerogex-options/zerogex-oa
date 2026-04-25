@@ -63,11 +63,12 @@ logger = get_logger(__name__)
 # Dataclasses
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class TargetPosition:
-    direction: str              # 'bullish', 'bearish', 'neutral'
-    strategy_type: str          # from optimizer, or 'cash' if no position
-    contracts: int              # 0 = full cash
+    direction: str  # 'bullish', 'bearish', 'neutral'
+    strategy_type: str  # from optimizer, or 'cash' if no position
+    contracts: int  # 0 = full cash
     option_symbol: str
     option_type: str
     expiration: date
@@ -96,6 +97,7 @@ class PortfolioTarget:
 # ---------------------------------------------------------------------------
 # PortfolioEngine
 # ---------------------------------------------------------------------------
+
 
 class PortfolioEngine:
     def __init__(self, underlying: str):
@@ -236,9 +238,7 @@ class PortfolioEngine:
 
         # Keep DRS gates for directional entries.
         drs_override_active = (
-            self.drs_override_enabled
-            and not is_scalp
-            and conviction >= self.drs_override_threshold
+            self.drs_override_enabled and not is_scalp and conviction >= self.drs_override_threshold
         )
         if is_scalp or drs_override_active:
             passes_drs_gate, drs_reason = True, (
@@ -248,9 +248,7 @@ class PortfolioEngine:
                 f">= override {self.drs_override_threshold:.2f}"
             )
         else:
-            passes_drs_gate, drs_reason = self._passes_dealer_regime_gates(
-                score, market_ctx
-            )
+            passes_drs_gate, drs_reason = self._passes_dealer_regime_gates(score, market_ctx)
         if not passes_drs_gate:
             return self._cash_target(score, drs_reason)
 
@@ -276,9 +274,7 @@ class PortfolioEngine:
             )
 
         candidate = candidate_result["candidate"]
-        sizing = next(
-            (p for p in candidate.sizing_profiles if p.profile == "optimal"), None
-        )
+        sizing = next((p for p in candidate.sizing_profiles if p.profile == "optimal"), None)
         if not sizing or sizing.contracts <= 0:
             return self._cash_target(
                 score,
@@ -288,7 +284,9 @@ class PortfolioEngine:
         # --- CASE 4: compute target contracts via Kelly sizing ---
         fresh_cross = self._fresh_drs_cross(trade_direction, market_ctx)
         cross_multiplier = (
-            1.0 + self.drs_fresh_cross_boost if fresh_cross and self.drs_fresh_cross_boost > 0 else 1.0
+            1.0 + self.drs_fresh_cross_boost
+            if fresh_cross and self.drs_fresh_cross_boost > 0
+            else 1.0
         )
         base_contracts = sizing.contracts
         contracts = max(
@@ -310,15 +308,11 @@ class PortfolioEngine:
         enriched_legs = []
         with self._use_conn(conn) as c:
             for leg in legs:
-                option_symbol = self._resolve_option_symbol_for_leg(
-                    score.timestamp, leg, conn=c
-                )
+                option_symbol = self._resolve_option_symbol_for_leg(score.timestamp, leg, conn=c)
                 enriched_legs.append({**leg, "option_symbol": option_symbol})
 
         primary_symbol = (
-            enriched_legs[0]["option_symbol"]
-            if enriched_legs
-            else f"{self.db_symbol}-SYNTHETIC"
+            enriched_legs[0]["option_symbol"] if enriched_legs else f"{self.db_symbol}-SYNTHETIC"
         )
         primary_type = (
             str(enriched_legs[0].get("option_type", "")).upper()
@@ -344,9 +338,7 @@ class PortfolioEngine:
             "size_multiplier": size_multiplier,
         }
 
-        target_heat = (
-            abs(entry_price) * contracts * 100 / max(SIGNALS_PORTFOLIO_SIZE, 1.0)
-        )
+        target_heat = abs(entry_price) * contracts * 100 / max(SIGNALS_PORTFOLIO_SIZE, 1.0)
 
         tp = TargetPosition(
             direction=trade_direction,
@@ -367,16 +359,14 @@ class PortfolioEngine:
             optimizer_payload=optimizer_payload,
         )
 
-        rationale = (
-            f"MSI {msi:.1f} regime={regime} dir={trade_direction} [{tier_label}], "
-            f"{candidate.strategy_type} {contracts}c Kelly={candidate.kelly_fraction:.1%}"
-            + (
-                f" regime={candidate_result.get('strategy_regime')}:{candidate_result.get('strategy_regime_score', 0):.2f}"
-                if candidate_result.get("strategy_regime")
-                else ""
-            )
-            + (" (DRS override)" if drs_override_active else "")
-            + (" (fresh-cross boost)" if fresh_cross and cross_multiplier > 1.0 else "")
+        rationale = f"MSI {msi:.1f} regime={regime} dir={trade_direction} [{tier_label}], " f"{candidate.strategy_type} {contracts}c Kelly={candidate.kelly_fraction:.1%}" + (
+            f" regime={candidate_result.get('strategy_regime')}:{candidate_result.get('strategy_regime_score', 0):.2f}"
+            if candidate_result.get("strategy_regime")
+            else ""
+        ) + (
+            " (DRS override)" if drs_override_active else ""
+        ) + (
+            " (fresh-cross boost)" if fresh_cross and cross_multiplier > 1.0 else ""
         )
 
         return PortfolioTarget(
@@ -584,8 +574,7 @@ class PortfolioEngine:
         target.rationale = (
             f"Confluence {direction} agree={confluence['agree']}/"
             f"{confluence['opinionated']} net={confluence['net_ratio']:.2f} "
-            f"strength={confluence['strength']:.2f} [{contributors}], "
-            + target.rationale
+            f"strength={confluence['strength']:.2f} [{contributors}], " + target.rationale
         )
         return target
 
@@ -888,9 +877,7 @@ class PortfolioEngine:
                             break
                         open_qty = trade["quantity_open"]
                         close_qty = min(open_qty, to_close)
-                        pnl = self._close_trade(
-                            trade, target.timestamp, c, partial_qty=close_qty
-                        )
+                        pnl = self._close_trade(trade, target.timestamp, c, partial_qty=close_qty)
                         closed_pnl += pnl
                         to_close -= close_qty
                     action = "trimmed"
@@ -1028,9 +1015,7 @@ class PortfolioEngine:
     # _open_position
     # ------------------------------------------------------------------
 
-    def _open_position(
-        self, tp: TargetPosition, target: PortfolioTarget, conn
-    ) -> bool:
+    def _open_position(self, tp: TargetPosition, target: PortfolioTarget, conn) -> bool:
         """Insert a new row to signal_trades. Returns True if inserted."""
         components_at_entry = {"optimizer": tp.optimizer_payload}
 
@@ -1121,13 +1106,10 @@ class PortfolioEngine:
         actual_contracts = sum(t["quantity_open"] for t in open_trades)
         actual_direction = self._majority_direction(open_trades) if open_trades else "neutral"
         target_strategy = (
-            target.target_positions[0].strategy_type
-            if target.target_positions
-            else None
+            target.target_positions[0].strategy_type if target.target_positions else None
         )
-        heat = (
-            sum(abs(t["entry_price"]) * t["quantity_open"] * 100 for t in open_trades)
-            / max(SIGNALS_PORTFOLIO_SIZE, 1.0)
+        heat = sum(abs(t["entry_price"]) * t["quantity_open"] * 100 for t in open_trades) / max(
+            SIGNALS_PORTFOLIO_SIZE, 1.0
         )
 
         cur = conn.cursor()
@@ -1210,9 +1192,7 @@ class PortfolioEngine:
             for r in cur.fetchall()
         ]
 
-    def _latest_option_mark(
-        self, option_symbol: str, as_of: datetime, conn
-    ) -> Optional[float]:
+    def _latest_option_mark(self, option_symbol: str, as_of: datetime, conn) -> Optional[float]:
         """Mid-price for a single option at-or-before ``as_of``.
 
         Used as the legacy fallback when a trade has no per-leg metadata and we
@@ -1248,9 +1228,7 @@ class PortfolioEngine:
         bid, ask, last = row
         return (float(bid or 0.0), float(ask or 0.0), float(last or 0.0))
 
-    def _spread_mark(
-        self, trade: dict, as_of: datetime, conn
-    ) -> tuple[Optional[float], str]:
+    def _spread_mark(self, trade: dict, as_of: datetime, conn) -> tuple[Optional[float], str]:
         """Mark the spread at its realistic *liquidation* price per share.
 
         Each leg is priced with a side-aware exit fill: the long leg is sold at
@@ -1281,9 +1259,7 @@ class PortfolioEngine:
             side = str(leg.get("side") or "").lower()
             if side not in {"long", "short"}:
                 return None, pricing_mode
-            fill = leg_fill_price(
-                bid=bid, ask=ask, last=last, side=side, action="close"
-            )
+            fill = leg_fill_price(bid=bid, ask=ask, last=last, side=side, action="close")
             if side == "long":
                 long_sum += fill
             else:
@@ -1349,7 +1325,9 @@ class PortfolioEngine:
             )
             return False
 
-    def _passes_dealer_regime_gates(self, score: ScoreSnapshot, market_ctx: dict) -> tuple[bool, str]:
+    def _passes_dealer_regime_gates(
+        self, score: ScoreSnapshot, market_ctx: dict
+    ) -> tuple[bool, str]:
         # Under MSI architecture, direction validity is handled by regime +
         # do-not-fade + advanced-signal gating. Keep this hook as pass-through.
         return True, "MSI regime gate passed"
@@ -1367,9 +1345,7 @@ class PortfolioEngine:
         forced_timeframe: Optional[str] = None,
         signal_direction: Optional[str] = None,
     ) -> Optional[dict]:
-        signal_timeframe = forced_timeframe or self._infer_signal_timeframe(
-            score.composite_score
-        )
+        signal_timeframe = forced_timeframe or self._infer_signal_timeframe(score.composite_score)
         signal_strength = self._infer_signal_strength(score.composite_score)
         dte_min, dte_max = TARGET_DTE_WINDOWS.get(signal_timeframe, (1, 7))
 

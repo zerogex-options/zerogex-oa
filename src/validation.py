@@ -56,7 +56,9 @@ def safe_float(value: Any, default: float = 0.0, field_name: str = "value") -> f
         return result
 
     except (ValueError, TypeError) as e:
-        logger.warning(f"Failed to convert {field_name}='{value}' to float: {e}, using default {default}")
+        logger.warning(
+            f"Failed to convert {field_name}='{value}' to float: {e}, using default {default}"
+        )
         return default
 
 
@@ -86,11 +88,15 @@ def safe_int(value: Any, default: int = 0, field_name: str = "value") -> int:
         return result
 
     except (ValueError, TypeError) as e:
-        logger.warning(f"Failed to convert {field_name}='{value}' to int: {e}, using default {default}")
+        logger.warning(
+            f"Failed to convert {field_name}='{value}' to int: {e}, using default {default}"
+        )
         return default
 
 
-def safe_datetime(value: str, default: Optional[datetime] = None, field_name: str = "timestamp") -> Optional[datetime]:
+def safe_datetime(
+    value: str, default: Optional[datetime] = None, field_name: str = "timestamp"
+) -> Optional[datetime]:
     """
     Safely parse ISO datetime string to timezone-aware datetime
 
@@ -184,9 +190,10 @@ def validate_bar_data(bar: dict) -> bool:
     low_price = safe_float(bar.get("Low"), field_name="Low")
     close_price = safe_float(bar.get("Close"), field_name="Close")
 
-    if not (low_price <= open_price <= high_price and
-            low_price <= close_price <= high_price):
-        logger.warning(f"Invalid OHLC relationship: O={open_price} H={high_price} L={low_price} C={close_price}")
+    if not (low_price <= open_price <= high_price and low_price <= close_price <= high_price):
+        logger.warning(
+            f"Invalid OHLC relationship: O={open_price} H={high_price} L={low_price} C={close_price}"
+        )
         return False
 
     return True
@@ -243,4 +250,3 @@ def bucket_timestamp(dt: datetime, bucket_seconds: int = 60) -> datetime:
 
     # Convert back to datetime, preserving timezone
     return datetime.fromtimestamp(bucketed_timestamp, tz=dt.tzinfo)
-

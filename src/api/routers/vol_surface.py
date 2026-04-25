@@ -24,6 +24,7 @@ router = APIRouter(prefix="/api/gex/vol_surface", tags=["GEX"])
 # Response models
 # ---------------------------------------------------------------------------
 
+
 class StrikeIV(BaseModel):
     strike: float
     call_iv: Optional[float] = None
@@ -62,6 +63,7 @@ class VolSurfaceResponse(BaseModel):
             date: lambda v: v.isoformat() if v is not None else None,
         }
 
+
 # ---------------------------------------------------------------------------
 # Cache (30-second TTL, keyed by query params)
 #
@@ -97,17 +99,22 @@ async def _set_cached(key: tuple, data: VolSurfaceResponse) -> None:
         while len(_cache) > _CACHE_MAX_SIZE:
             _cache.popitem(last=False)
 
+
 # ---------------------------------------------------------------------------
 # Dependency
 # ---------------------------------------------------------------------------
 
+
 def get_db() -> DatabaseManager:
     from ..main import db_manager
+
     return db_manager
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _iv_or_null(row: dict) -> Optional[float]:
     """Return IV as float, or None if IV is missing/non-positive."""
@@ -159,7 +166,8 @@ def _compute_25d_skew(rows_for_exp: List[dict]) -> Optional[float]:
         if r["option_type"] == "C"
         and r["delta"] is not None
         and r["implied_volatility"] is not None
-        and r.get("open_interest") and r["open_interest"] > 0
+        and r.get("open_interest")
+        and r["open_interest"] > 0
     ]
     puts = [
         (float(r["delta"]), float(r["implied_volatility"]))
@@ -167,7 +175,8 @@ def _compute_25d_skew(rows_for_exp: List[dict]) -> Optional[float]:
         if r["option_type"] == "P"
         and r["delta"] is not None
         and r["implied_volatility"] is not None
-        and r.get("open_interest") and r["open_interest"] > 0
+        and r.get("open_interest")
+        and r["open_interest"] > 0
     ]
     if not calls or not puts:
         return None
@@ -181,15 +190,19 @@ def _compute_25d_skew(rows_for_exp: List[dict]) -> Optional[float]:
 
     return round(put_25d[1] - call_25d[1], 6)
 
+
 # ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
+
 
 @router.get("", response_model=VolSurfaceResponse)
 async def get_vol_surface(
     symbol: str = Query(default="SPY", description="Underlying symbol (e.g. SPY)"),
     dte_max: int = Query(default=60, ge=1, le=365, description="Max days to expiration to include"),
-    strike_count: int = Query(default=30, ge=5, le=100, description="Number of strikes centered on spot"),
+    strike_count: int = Query(
+        default=30, ge=5, le=100, description="Number of strikes centered on spot"
+    ),
     db: DatabaseManager = Depends(get_db),
 ):
     """Return the implied-volatility surface, ATM term structure, and 25-delta skew."""

@@ -222,7 +222,7 @@ def test_flow_session_bounds_open_at_0930_et():
 def _with_fixed_session_bounds(monkey_bounds):
     """Install a fake _get_flow_session_bounds for a single get_flow call."""
     original = database_module._get_flow_session_bounds
-    database_module._get_flow_session_bounds = lambda session='current': monkey_bounds
+    database_module._get_flow_session_bounds = lambda session="current": monkey_bounds
     return original
 
 

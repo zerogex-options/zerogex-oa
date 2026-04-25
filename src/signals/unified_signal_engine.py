@@ -147,9 +147,7 @@ class UnifiedSignalEngine:
                         oi_pcr = float(total_put_oi or 0) / float(total_call_oi)
                 except (TypeError, ValueError, ZeroDivisionError):
                     oi_pcr = None
-                effective_pcr = (
-                    oi_pcr if oi_pcr is not None and oi_pcr > 0 else float(pcr or 1.0)
-                )
+                effective_pcr = oi_pcr if oi_pcr is not None and oi_pcr > 0 else float(pcr or 1.0)
 
                 cur.execute(
                     """
@@ -262,9 +260,7 @@ class UnifiedSignalEngine:
                         if bucket > agg["expiration_bucket"]:
                             agg["expiration_bucket"] = bucket
 
-                    gex_strike_rows = sorted(
-                        per_strike.values(), key=lambda row: row["strike"]
-                    )
+                    gex_strike_rows = sorted(per_strike.values(), key=lambda row: row["strike"])
                     if gex_strike_rows:
                         above_spot = [r for r in gex_strike_rows if r["strike"] >= close_f]
                         if above_spot:
@@ -549,14 +545,12 @@ class UnifiedSignalEngine:
                 # have spot VIX; vix_9d / vix_3m would need a separate ingest.
                 vix_level: Optional[float] = None
                 try:
-                    cur.execute(
-                        """
+                    cur.execute("""
                         SELECT close
                         FROM vix_bars
                         ORDER BY timestamp DESC
                         LIMIT 1
-                        """
-                    )
+                        """)
                     vix_row = cur.fetchone()
                     if vix_row and vix_row[0] is not None:
                         vix_level = float(vix_row[0])
@@ -661,11 +655,28 @@ class UnifiedSignalEngine:
                                 MAX(avg_iv)
                             FROM daily_iv
                             """,
-                            (self.db_symbol, close_f, close_f, ts, self.db_symbol, close_f, close_f),
+                            (
+                                self.db_symbol,
+                                close_f,
+                                close_f,
+                                ts,
+                                self.db_symbol,
+                                close_f,
+                                close_f,
+                            ),
                         )
                         iv_row = cur.fetchone()
-                        if iv_row and iv_row[0] is not None and iv_row[1] is not None and iv_row[2] is not None:
-                            current_iv, iv_low, iv_high = float(iv_row[0]), float(iv_row[1]), float(iv_row[2])
+                        if (
+                            iv_row
+                            and iv_row[0] is not None
+                            and iv_row[1] is not None
+                            and iv_row[2] is not None
+                        ):
+                            current_iv, iv_low, iv_high = (
+                                float(iv_row[0]),
+                                float(iv_row[1]),
+                                float(iv_row[2]),
+                            )
                             iv_range = max(iv_high - iv_low, 0.001)
                             iv_rank = round(min(1.0, max(0.0, (current_iv - iv_low) / iv_range)), 4)
                     except Exception as exc:
@@ -719,7 +730,9 @@ class UnifiedSignalEngine:
                     "local_gex": local_gex_f,
                     "convexity_risk": convexity_risk_f,
                     "put_call_ratio": effective_pcr,
-                    "put_call_ratio_source": "oi" if oi_pcr is not None and oi_pcr > 0 else "volume",
+                    "put_call_ratio_source": (
+                        "oi" if oi_pcr is not None and oi_pcr > 0 else "volume"
+                    ),
                     "put_call_ratio_volume": float(pcr or 1.0),
                     "put_call_ratio_oi": oi_pcr,
                     "max_pain": float(max_pain) if max_pain is not None else None,
@@ -813,15 +826,18 @@ class UnifiedSignalEngine:
                 for result in results:
                     state = self._advanced_state.setdefault(
                         result.name,
-                        {"last_score": None, "last_triggered": False, "streak": 0, "event_emitted": False},
+                        {
+                            "last_score": None,
+                            "last_triggered": False,
+                            "streak": 0,
+                            "event_emitted": False,
+                        },
                     )
 
                     triggered = bool(result.context.get("triggered", False))
                     prev_score = state["last_score"]
                     score_delta = (
-                        abs(result.score - prev_score)
-                        if prev_score is not None
-                        else float("inf")
+                        abs(result.score - prev_score) if prev_score is not None else float("inf")
                     )
 
                     should_persist = (
@@ -930,9 +946,7 @@ class UnifiedSignalEngine:
                     state = self._basic_state.setdefault(result.name, {"last_score": None})
                     prev_score = state["last_score"]
                     score_delta = (
-                        abs(result.score - prev_score)
-                        if prev_score is not None
-                        else float("inf")
+                        abs(result.score - prev_score) if prev_score is not None else float("inf")
                     )
                     if prev_score is not None and score_delta < self._SCORE_DEDUPE_EPSILON:
                         continue

@@ -148,6 +148,7 @@ class FlowPoint(BaseModel):
     ask/bid volume ratio from each tick), scaled so unclassified volume is
     attributed proportionally.
     """
+
     timestamp: datetime
     symbol: str
     option_type: str
@@ -168,6 +169,7 @@ class FlowSeriesPoint(BaseModel):
     resolved session. Carry-forward synthetic rows fill quiet bars so the
     series is contiguous — the ``is_synthetic`` flag distinguishes them.
     """
+
     timestamp: str
     bar_start: str
     bar_end: str
@@ -188,6 +190,7 @@ class FlowSeriesPoint(BaseModel):
 
 class FlowContractsResponse(BaseModel):
     """Distinct strikes and expirations that traded in the resolved session."""
+
     strikes: list[float]
     expirations: list[str]
 
@@ -428,7 +431,6 @@ class TradeSignalResponse(BaseModel):
         json_encoders = {
             datetime: lambda v: v.isoformat() if v is not None else None,
         }
-
 
 
 class PositionOptimizerDirection(str, Enum):

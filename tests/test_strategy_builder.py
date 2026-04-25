@@ -56,4 +56,3 @@ def test_calendar_regime_when_far_iv_exceeds_near_iv():
     )
     assert decision.trade_type == "calendar"
     assert "calendar" in decision.preferred_strategies
-

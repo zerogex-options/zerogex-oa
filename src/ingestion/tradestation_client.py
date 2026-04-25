@@ -41,7 +41,9 @@ class TradeStationClient:
     BASE_URL = "https://api.tradestation.com/v3"
     SANDBOX_URL = "https://sim-api.tradestation.com/v3"
 
-    def __init__(self, client_id: str, client_secret: str, refresh_token: str, sandbox: bool = False):
+    def __init__(
+        self, client_id: str, client_secret: str, refresh_token: str, sandbox: bool = False
+    ):
         """Initialize TradeStation client"""
         logger.debug("Initializing TradeStationClient...")
 
@@ -51,7 +53,9 @@ class TradeStationClient:
         self._stream_lock = Lock()
         self._stream_state: Dict[str, Dict[str, Any]] = {}
         self._api_session_counter_lock = Lock()
-        self._api_session_window_start = self._floor_to_five_minute_window(datetime.now(timezone.utc))
+        self._api_session_window_start = self._floor_to_five_minute_window(
+            datetime.now(timezone.utc)
+        )
         self._api_session_window_count = 0
         # Running total already handed to the writer for the current window.
         # Used so close_all_streams + natural rollover never double-count or
@@ -77,9 +81,7 @@ class TradeStationClient:
         floored_minute = (ts.minute // 5) * 5
         return ts.replace(minute=floored_minute, second=0, microsecond=0)
 
-    def set_api_call_window_writer(
-        self, writer: Optional[Callable[[datetime, int], None]]
-    ) -> None:
+    def set_api_call_window_writer(self, writer: Optional[Callable[[datetime, int], None]]) -> None:
         """Install a callback invoked with (window_start, count) on rollover."""
         self._api_call_window_writer = writer
 
@@ -135,12 +137,12 @@ class TradeStationClient:
                 logger.warning("API-call window writer raised: %s", e)
 
     def _request(
-        self, 
-        method: str, 
-        endpoint: str, 
+        self,
+        method: str,
+        endpoint: str,
         params: Optional[Dict] = None,
         data: Optional[Dict] = None,
-        retry_count: int = 0
+        retry_count: int = 0,
     ) -> Dict[str, Any]:
         """
         Make HTTP request with retry logic
@@ -167,7 +169,9 @@ class TradeStationClient:
             if response.status_code in [200, 201]:
                 # Check if response has content
                 if not response.content or len(response.content) == 0:
-                    logger.warning(f"API returned 200 but empty response - likely market closed or no data available")
+                    logger.warning(
+                        f"API returned 200 but empty response - likely market closed or no data available"
+                    )
                     # Return empty structure based on endpoint
                     if "barcharts" in endpoint or "stream/barcharts" in endpoint:
                         return {"Bars": []}
@@ -199,7 +203,9 @@ class TradeStationClient:
                 try:
                     error_data = response.json()
                     if error_data.get("Message") == "No data available.":
-                        logger.warning(f"No data available for request (404) - this is normal for weekends/holidays")
+                        logger.warning(
+                            f"No data available for request (404) - this is normal for weekends/holidays"
+                        )
                         # Return empty but valid response structure based on endpoint
                         if "barcharts" in endpoint or "stream/barcharts" in endpoint:
                             return {"Bars": []}
@@ -239,7 +245,7 @@ class TradeStationClient:
             # Handle rate limiting with exponential backoff
             if response.status_code == 429:
                 if retry_count < API_RETRY_ATTEMPTS - 1:
-                    retry_delay = API_RETRY_DELAY * (API_RETRY_BACKOFF ** retry_count)
+                    retry_delay = API_RETRY_DELAY * (API_RETRY_BACKOFF**retry_count)
                     logger.warning(f"Rate limited (429), retrying in {retry_delay}s...")
                     time.sleep(retry_delay)
                     return self._request(method, endpoint, params, data, retry_count + 1)
@@ -247,8 +253,10 @@ class TradeStationClient:
             # Handle server errors with retry
             if response.status_code >= 500:
                 if retry_count < API_RETRY_ATTEMPTS - 1:
-                    retry_delay = API_RETRY_DELAY * (API_RETRY_BACKOFF ** retry_count)
-                    logger.warning(f"Server error ({response.status_code}), retrying in {retry_delay}s...")
+                    retry_delay = API_RETRY_DELAY * (API_RETRY_BACKOFF**retry_count)
+                    logger.warning(
+                        f"Server error ({response.status_code}), retrying in {retry_delay}s..."
+                    )
                     time.sleep(retry_delay)
                     return self._request(method, endpoint, params, data, retry_count + 1)
 
@@ -259,7 +267,7 @@ class TradeStationClient:
 
         except requests.exceptions.Timeout:
             if retry_count < API_RETRY_ATTEMPTS - 1:
-                retry_delay = API_RETRY_DELAY * (API_RETRY_BACKOFF ** retry_count)
+                retry_delay = API_RETRY_DELAY * (API_RETRY_BACKOFF**retry_count)
                 logger.warning(f"Request timeout, retrying in {retry_delay}s...")
                 time.sleep(retry_delay)
                 return self._request(method, endpoint, params, data, retry_count + 1)
@@ -272,7 +280,7 @@ class TradeStationClient:
         url: str,
         headers: Dict[str, str],
         params: Optional[Dict],
-        data: Optional[Dict]
+        data: Optional[Dict],
     ) -> Response:
         """Build and execute a standard JSON API request."""
         self._record_api_https_session_open()
@@ -282,14 +290,11 @@ class TradeStationClient:
             headers=headers,
             params=params,
             json=data,
-            timeout=API_REQUEST_TIMEOUT
+            timeout=API_REQUEST_TIMEOUT,
         )
 
     def _request_stream_snapshot(
-        self,
-        endpoint: str,
-        params: Optional[Dict] = None,
-        retry_count: int = 0
+        self, endpoint: str, params: Optional[Dict] = None, retry_count: int = 0
     ) -> Dict[str, Any]:
         """
         Read a single JSON payload from a TradeStation stream endpoint.
@@ -316,7 +321,7 @@ class TradeStationClient:
         except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
             self._close_stream(stream_key)
             if retry_count < API_RETRY_ATTEMPTS - 1:
-                retry_delay = API_RETRY_DELAY * (API_RETRY_BACKOFF ** retry_count)
+                retry_delay = API_RETRY_DELAY * (API_RETRY_BACKOFF**retry_count)
                 logger.warning(f"Stream request failed: {e}, retrying in {retry_delay}s...")
                 time.sleep(retry_delay)
                 return self._request_stream_snapshot(endpoint, params, retry_count + 1)
@@ -337,7 +342,9 @@ class TradeStationClient:
         params_key = json.dumps(params or {}, sort_keys=True)
         return f"{endpoint}?{params_key}"
 
-    def _get_or_open_stream(self, stream_key: str, endpoint: str, params: Optional[Dict]) -> Dict[str, Any]:
+    def _get_or_open_stream(
+        self, stream_key: str, endpoint: str, params: Optional[Dict]
+    ) -> Dict[str, Any]:
         with self._stream_lock:
             existing = self._stream_state.get(stream_key)
             if existing:
@@ -446,35 +453,37 @@ class TradeStationClient:
     # QUOTE ENDPOINTS
     # =========================================================================
 
-    def get_quote(self, symbols: Union[str, List[str]], warn_if_closed: bool = True) -> Dict[str, Any]:
+    def get_quote(
+        self, symbols: Union[str, List[str]], warn_if_closed: bool = True
+    ) -> Dict[str, Any]:
         """Get current quote snapshots"""
         if isinstance(symbols, list):
             symbols = ",".join(symbols)
 
         logger.info(f"Fetching quotes for: {symbols}")
 
-        if warn_if_closed and self.warn_market_hours and not self.is_market_open(check_extended=True):
+        if (
+            warn_if_closed
+            and self.warn_market_hours
+            and not self.is_market_open(check_extended=True)
+        ):
             logger.warning("⚠️  Market is currently closed - quotes may be delayed or stale")
 
         return self._request("GET", f"marketdata/quotes/{symbols}")
 
     def get_bars(
-        self, 
-        symbol: str, 
-        interval: int, 
+        self,
+        symbol: str,
+        interval: int,
         unit: str,
         barsback: Optional[int] = None,
         firstdate: Optional[str] = None,
         lastdate: Optional[str] = None,
         sessiontemplate: str = "Default",
-        warn_if_closed: bool = True
+        warn_if_closed: bool = True,
     ) -> Dict[str, Any]:
         """Get historical bar data (OHLCV)"""
-        params = {
-            "interval": interval,
-            "unit": unit,
-            "sessiontemplate": sessiontemplate
-        }
+        params = {"interval": interval, "unit": unit, "sessiontemplate": sessiontemplate}
 
         if barsback:
             params["barsback"] = barsback
@@ -501,7 +510,7 @@ class TradeStationClient:
         firstdate: Optional[str] = None,
         lastdate: Optional[str] = None,
         sessiontemplate: str = "Default",
-        warn_if_closed: bool = True
+        warn_if_closed: bool = True,
     ) -> Dict[str, Any]:
         """
         Get streaming bars with volume breakdown (UpVolume/DownVolume)
@@ -547,11 +556,7 @@ class TradeStationClient:
                 lastdate="2026-02-21T16:00:00Z"
             )
         """
-        params = {
-            "interval": interval,
-            "unit": unit,
-            "sessiontemplate": sessiontemplate
-        }
+        params = {"interval": interval, "unit": unit, "sessiontemplate": sessiontemplate}
 
         # Only add parameters that are explicitly set
         if barsback is not None:
@@ -573,7 +578,9 @@ class TradeStationClient:
                 if not self.is_market_open(check_extended=True):
                     logger.warning("⚠️  Market is closed - intraday bars may be delayed")
 
-        result = self._request_stream_snapshot(f"marketdata/stream/barcharts/{symbol}", params=params)
+        result = self._request_stream_snapshot(
+            f"marketdata/stream/barcharts/{symbol}", params=params
+        )
 
         if isinstance(result, dict) and "Bars" in result:
             return result
@@ -587,7 +594,9 @@ class TradeStationClient:
     # OPTIONS ENDPOINTS
     # =========================================================================
 
-    def get_option_expirations(self, underlying: str, strike_price: Optional[float] = None) -> List[date]:
+    def get_option_expirations(
+        self, underlying: str, strike_price: Optional[float] = None
+    ) -> List[date]:
         """Get available option expiration dates"""
         params = {}
         if strike_price:
@@ -680,7 +689,9 @@ class TradeStationClient:
     # HELPER METHODS
     # =========================================================================
 
-    def build_option_symbol(self, underlying: str, expiration: date, option_type: str, strike: float) -> str:
+    def build_option_symbol(
+        self, underlying: str, expiration: date, option_type: str, strike: float
+    ) -> str:
         """
         Build TradeStation option symbol with proper formatting
 
@@ -753,7 +764,7 @@ class TradeStationClient:
             "current_time_et": now_et.strftime("%Y-%m-%d %H:%M:%S ET"),
             "day_of_week": now_et.strftime("%A"),
             "regular_hours": "9:30 AM - 4:00 PM ET",
-            "extended_hours": "4:00 AM - 8:00 PM ET"
+            "extended_hours": "4:00 AM - 8:00 PM ET",
         }
 
 
@@ -782,40 +793,69 @@ Examples:
 
   # Enable debug logging
   python -m src.ingestion.tradestation_client --debug
-        """
+        """,
     )
 
-    parser.add_argument("--test", 
-                       choices=["all", "quote", "bars", "stream-bars", "options", "options-expirations", "options-strikes", "option-quote", "search", "market-hours", "depth"],
-                       help="Which test to run (default: all, env: TS_TEST)")
+    parser.add_argument(
+        "--test",
+        choices=[
+            "all",
+            "quote",
+            "bars",
+            "stream-bars",
+            "options",
+            "options-expirations",
+            "options-strikes",
+            "option-quote",
+            "search",
+            "market-hours",
+            "depth",
+        ],
+        help="Which test to run (default: all, env: TS_TEST)",
+    )
 
-    parser.add_argument("--symbol", type=str,
-                       help="Symbol(s) to test with, comma-separated (default: SPY, env: TS_SYMBOL)")
+    parser.add_argument(
+        "--symbol",
+        type=str,
+        help="Symbol(s) to test with, comma-separated (default: SPY, env: TS_SYMBOL)",
+    )
 
-    parser.add_argument("--option-symbol", type=str,
-                       help="Direct option contract symbol for option-quote test (e.g., 'SPXW 260320C6630')")
+    parser.add_argument(
+        "--option-symbol",
+        type=str,
+        help="Direct option contract symbol for option-quote test (e.g., 'SPXW 260320C6630')",
+    )
 
-    parser.add_argument("--expiration", type=str,
-                       help="Expiration for options-strikes test (MM-DD-YYYY)")
+    parser.add_argument(
+        "--expiration", type=str, help="Expiration for options-strikes test (MM-DD-YYYY)"
+    )
 
-    parser.add_argument("--bars-back", type=int,
-                       help="Number of bars to retrieve (default: 5, env: TS_BARS_BACK)")
+    parser.add_argument(
+        "--bars-back", type=int, help="Number of bars to retrieve (default: 5, env: TS_BARS_BACK)"
+    )
 
-    parser.add_argument("--interval", type=int,
-                       help="Bar interval (default: 1, env: TS_INTERVAL)")
+    parser.add_argument("--interval", type=int, help="Bar interval (default: 1, env: TS_INTERVAL)")
 
-    parser.add_argument("--unit", type=str,
-                       choices=["Minute", "Daily", "Weekly", "Monthly"],
-                       help="Bar time unit (default: Daily, env: TS_UNIT)")
+    parser.add_argument(
+        "--unit",
+        type=str,
+        choices=["Minute", "Daily", "Weekly", "Monthly"],
+        help="Bar time unit (default: Daily, env: TS_UNIT)",
+    )
 
-    parser.add_argument("--query", type=str,
-                       help="Search query for symbol search (default: Apple, env: TS_QUERY)")
+    parser.add_argument(
+        "--query", type=str, help="Search query for symbol search (default: Apple, env: TS_QUERY)"
+    )
 
-    parser.add_argument("--debug", action="store_true",
-                       help="Enable debug logging (env: LOG_LEVEL=DEBUG)")
+    parser.add_argument(
+        "--debug", action="store_true", help="Enable debug logging (env: LOG_LEVEL=DEBUG)"
+    )
 
-    parser.add_argument("--test-historical", action="store_true",
-                       help="For stream-bars test, use historical date range (last Friday)")
+    parser.add_argument(
+        "--test-historical",
+        action="store_true",
+        help="For stream-bars test, use historical date range (last Friday)",
+    )
 
     args = parser.parse_args()
 
@@ -833,19 +873,20 @@ Examples:
     # Set logging level
     if debug:
         from src.utils import set_log_level
+
         set_log_level("DEBUG")
         print("🐛 Debug logging enabled\n")
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("TradeStation Market Data Client")
-    print("="*60 + "\n")
+    print("=" * 60 + "\n")
 
     # Initialize client
     client = TradeStationClient(
         os.getenv("TRADESTATION_CLIENT_ID"),
         os.getenv("TRADESTATION_CLIENT_SECRET"),
         os.getenv("TRADESTATION_REFRESH_TOKEN"),
-        sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true"
+        sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true",
     )
 
     try:
@@ -888,8 +929,10 @@ Examples:
                     close_price = safe_float(bar.get("Close"), field_name="Close")
                     total_vol = safe_int(bar.get("TotalVolume"), field_name="TotalVolume")
 
-                    print(f"   {bar['TimeStamp']}: O=${open_price:.2f} H=${high_price:.2f} "
-                          f"L=${low_price:.2f} C=${close_price:.2f} V={total_vol:,}")
+                    print(
+                        f"   {bar['TimeStamp']}: O=${open_price:.2f} H=${high_price:.2f} "
+                        f"L=${low_price:.2f} C=${close_price:.2f} V={total_vol:,}"
+                    )
             print()
 
         # Test 2.5: Get stream bars (NEW)
@@ -902,6 +945,7 @@ Examples:
             if args.test_historical:
                 from datetime import datetime, timedelta
                 import pytz
+
                 ET = pytz.timezone("US/Eastern")
                 now = datetime.now(ET)
 
@@ -916,13 +960,17 @@ Examples:
                 start_time = last_friday.replace(hour=14, minute=0, second=0, microsecond=0)
                 end_time = start_time + timedelta(minutes=5)
 
-                print(f"Testing with historical data from {start_time.strftime('%Y-%m-%d %H:%M ET')}")
+                print(
+                    f"Testing with historical data from {start_time.strftime('%Y-%m-%d %H:%M ET')}"
+                )
 
                 bars = client.get_stream_bars(
-                    sym, 1, "Minute",
+                    sym,
+                    1,
+                    "Minute",
                     firstdate=start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     lastdate=end_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    sessiontemplate="USEQ24Hour"
+                    sessiontemplate="USEQ24Hour",
                 )
             else:
                 # For real-time during market hours, don't use barsback
@@ -941,8 +989,10 @@ Examples:
                     up_vol = safe_int(bar.get("UpVolume"), field_name="UpVolume")
                     down_vol = safe_int(bar.get("DownVolume"), field_name="DownVolume")
 
-                    print(f"   {bar['TimeStamp']}: O=${open_price:.2f} H=${high_price:.2f} "
-                          f"L=${low_price:.2f} C=${close_price:.2f}")
+                    print(
+                        f"   {bar['TimeStamp']}: O=${open_price:.2f} H=${high_price:.2f} "
+                        f"L=${low_price:.2f} C=${close_price:.2f}"
+                    )
                     print(f"      Volume: {total_vol:,} (Up: {up_vol:,}, Down: {down_vol:,})")
 
                     # Show volume breakdown percentage
@@ -1018,7 +1068,9 @@ Examples:
                     else:
                         sample_strike = strikes[len(strikes) // 2]
                         exp_date = datetime.strptime(exp_str, "%m-%d-%Y").date()
-                        sample_option = client.build_option_symbol(sym, exp_date, "C", sample_strike)
+                        sample_option = client.build_option_symbol(
+                            sym, exp_date, "C", sample_strike
+                        )
 
             if sample_option:
                 print(f"   Quote test option: {sample_option}")
@@ -1074,9 +1126,9 @@ Examples:
             print()
 
         if test == "all":
-            print("="*60)
+            print("=" * 60)
             print("✅ All tests completed successfully!")
-            print("="*60)
+            print("=" * 60)
         else:
             print(f"✅ Test '{test}' completed successfully!")
 

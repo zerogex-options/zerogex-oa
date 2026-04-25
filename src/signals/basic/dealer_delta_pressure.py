@@ -20,6 +20,7 @@ Score convention:
 We invert so that the composite-score contribution is aligned with
 "bullish for SPY" semantics downstream.
 """
+
 from __future__ import annotations
 
 import os
@@ -47,9 +48,9 @@ class DealerDeltaPressureComponent(ComponentBase):
         dni = self._estimate_dni(ctx)
         return {
             "dealer_net_delta_estimated": round(dni, 2) if dni is not None else None,
-            "dni_normalized": round(max(-1.0, min(1.0, dni / _DNI_NORM)), 4)
-            if dni is not None
-            else None,
+            "dni_normalized": (
+                round(max(-1.0, min(1.0, dni / _DNI_NORM)), 4) if dni is not None else None
+            ),
             "source": self._source_used(ctx),
         }
 
@@ -65,9 +66,7 @@ class DealerDeltaPressureComponent(ComponentBase):
         if not rows:
             return "unavailable"
         sample = rows[0] if rows else {}
-        if isinstance(sample, dict) and (
-            "call_delta_oi" in sample or "put_delta_oi" in sample
-        ):
+        if isinstance(sample, dict) and ("call_delta_oi" in sample or "put_delta_oi" in sample):
             return "gex_by_strike.delta_oi"
         return "gex_by_strike.distance_proxy"
 
@@ -83,8 +82,7 @@ class DealerDeltaPressureComponent(ComponentBase):
 
         # 2. Use delta-weighted OI columns if the analytics layer provided them.
         have_delta_oi = any(
-            isinstance(r, dict) and ("call_delta_oi" in r or "put_delta_oi" in r)
-            for r in rows
+            isinstance(r, dict) and ("call_delta_oi" in r or "put_delta_oi" in r) for r in rows
         )
         if have_delta_oi:
             total = 0.0
@@ -99,7 +97,7 @@ class DealerDeltaPressureComponent(ComponentBase):
                 # Dealers are on the opposite side of customer OI; customers
                 # are typically long calls and long puts. Dealer delta is
                 # therefore approximately -(call_delta_oi + put_delta_oi).
-                total -= (call_d + put_d)
+                total -= call_d + put_d
             return total
 
         # 3. Fallback: use call_oi/put_oi with a linear-distance delta proxy.

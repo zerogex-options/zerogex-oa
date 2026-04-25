@@ -6,6 +6,7 @@ the ``ComponentBase`` interface; the engine adapts ``compute()`` +
 ``context_values()`` into :class:`AdvancedSignalResult` so persistence and
 read-side plumbing stay identical.
 """
+
 from __future__ import annotations
 
 from src.signals.components.base import ComponentBase, MarketContext

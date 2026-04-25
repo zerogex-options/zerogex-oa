@@ -46,7 +46,6 @@ from src.validation import (
 )
 from src.config import API_REQUEST_TIMEOUT
 
-
 logger = get_logger(__name__)
 
 ET = pytz.timezone("US/Eastern")
@@ -250,9 +249,7 @@ class VIXIngester:
         try:
             if response.status_code == 401:
                 response.close()
-                logger.warning(
-                    "VIX stream: 401 auth failure, forcing token refresh and retrying"
-                )
+                logger.warning("VIX stream: 401 auth failure, forcing token refresh and retrying")
                 self.client.auth.force_refresh_access_token()
                 return
             response.raise_for_status()
@@ -319,7 +316,9 @@ class VIXIngester:
 
     def run(self) -> None:
         logger.info("=" * 80)
-        logger.info("VIX INGESTER — streaming %s %d-%s bars", VIX_SYMBOL, VIX_BAR_INTERVAL, VIX_BAR_UNIT)
+        logger.info(
+            "VIX INGESTER — streaming %s %d-%s bars", VIX_SYMBOL, VIX_BAR_INTERVAL, VIX_BAR_UNIT
+        )
         logger.info("=" * 80)
 
         self.running = True
@@ -379,6 +378,7 @@ def main() -> None:
     # its API usage to the tradestation_api_calls table.
     try:
         from src.ingestion.api_call_tracker import attach_db_writer
+
         attach_db_writer(client)
     except Exception as e:
         logger.warning("Failed to attach API-call DB writer: %s", e)

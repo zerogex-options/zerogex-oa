@@ -43,6 +43,7 @@ ET = pytz.timezone("US/Eastern")
 # Session helpers
 # ============================================================================
 
+
 def _session_start(d: date) -> datetime:
     """ET-localized 9:30 AM open for date *d*."""
     return ET.localize(datetime(d.year, d.month, d.day, 9, 30, 0))
@@ -69,6 +70,7 @@ def _two_session_cutoff() -> datetime:
 # DB read
 # ============================================================================
 
+
 def _load_bars_from_db(cutoff: datetime) -> List[Dict[str, Any]]:
     """
     Load VIX 5-min bars >= *cutoff* from the database, sorted ascending.
@@ -93,19 +95,22 @@ def _load_bars_from_db(cutoff: datetime) -> List[Dict[str, Any]]:
     for ts, op, hi, lo, cl in rows:
         # Postgres TIMESTAMPTZ already carries tz info; normalise to ET.
         ts_et = ts.astimezone(ET) if ts.tzinfo else ET.localize(ts)
-        bars.append({
-            "timestamp": ts_et,
-            "open": float(op) if op is not None else None,
-            "high": float(hi) if hi is not None else None,
-            "low": float(lo) if lo is not None else None,
-            "close": float(cl),
-        })
+        bars.append(
+            {
+                "timestamp": ts_et,
+                "open": float(op) if op is not None else None,
+                "high": float(hi) if hi is not None else None,
+                "low": float(lo) if lo is not None else None,
+                "close": float(cl),
+            }
+        )
     return bars
 
 
 # ============================================================================
 # Scoring
 # ============================================================================
+
 
 def _level(vix_close: float) -> float:
     """
@@ -122,8 +127,8 @@ def _level(vix_close: float) -> float:
     """
     if vix_close <= 0:
         return 0.0
-    lo = math.log(10.0)   # VIX floor  → score 0
-    hi = math.log(50.0)   # VIX ceiling → score 10
+    lo = math.log(10.0)  # VIX floor  → score 0
+    hi = math.log(50.0)  # VIX ceiling → score 10
     score = 10.0 * (math.log(vix_close) - lo) / (hi - lo)
     return round(max(0.0, min(10.0, score)), 2)
 
@@ -153,7 +158,7 @@ def _momentum(bars: List[Dict[str, Any]]) -> float:
       26 bars ( 2 hr) → 0.15
     """
     if len(bars) < 2:
-        return 5.0   # neutral — not enough data
+        return 5.0  # neutral — not enough data
 
     closes = [b["close"] for b in bars]
     current = closes[-1]
@@ -225,6 +230,7 @@ def _momentum_label(score: float) -> str:
 # Response models
 # ============================================================================
 
+
 class VIXBar(BaseModel):
     timestamp: datetime
     close: float
@@ -269,6 +275,7 @@ class VolatilityGaugeResponse(BaseModel):
 # ============================================================================
 # Endpoint
 # ============================================================================
+
 
 @router.get("/vix", response_model=VolatilityGaugeResponse)
 async def get_volatility_gauge():
@@ -318,10 +325,7 @@ async def get_volatility_gauge():
     lvl = _level(vix_close)
     mom = _momentum(bars)
 
-    recent_bars = [
-        VIXBar(timestamp=b["timestamp"], close=b["close"])
-        for b in bars[-10:]
-    ]
+    recent_bars = [VIXBar(timestamp=b["timestamp"], close=b["close"]) for b in bars[-10:]]
 
     return VolatilityGaugeResponse(
         timestamp=latest["timestamp"],

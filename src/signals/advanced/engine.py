@@ -1,4 +1,5 @@
 """Advanced signal orchestrator (signals outside Market State Index)."""
+
 from __future__ import annotations
 
 from src.signals.components.base import MarketContext
@@ -30,4 +31,3 @@ class AdvancedSignalEngine:
 
     def evaluate(self, ctx: MarketContext) -> list[AdvancedSignalResult]:
         return [signal.evaluate(ctx) for signal in self._signals]
-

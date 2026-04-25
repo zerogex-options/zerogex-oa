@@ -51,7 +51,7 @@ class AnalyticsEngine:
         self,
         underlying: str = "SPY",
         calculation_interval: int = 60,
-        risk_free_rate: float = RISK_FREE_RATE
+        risk_free_rate: float = RISK_FREE_RATE,
     ):
         """
         Initialize analytics engine
@@ -62,13 +62,21 @@ class AnalyticsEngine:
             risk_free_rate: Risk-free rate for Greeks
         """
         self.underlying = underlying.upper()
-        self.db_symbol = get_canonical_symbol(self.underlying)  # canonical alias for DB queries (e.g. "SPX")
+        self.db_symbol = get_canonical_symbol(
+            self.underlying
+        )  # canonical alias for DB queries (e.g. "SPX")
         self.calculation_interval = calculation_interval
         self.risk_free_rate = risk_free_rate
         self.running = False
-        self.snapshot_lookback_minutes = max(1, int(os.getenv("ANALYTICS_SNAPSHOT_LOOKBACK_MINUTES", "5")))
-        self.snapshot_freshness_seconds = max(30, int(os.getenv("ANALYTICS_SNAPSHOT_FRESHNESS_SECONDS", "180")))
-        self.min_oi_coverage_pct_alert = float(os.getenv("ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT", "0.35"))
+        self.snapshot_lookback_minutes = max(
+            1, int(os.getenv("ANALYTICS_SNAPSHOT_LOOKBACK_MINUTES", "5"))
+        )
+        self.snapshot_freshness_seconds = max(
+            30, int(os.getenv("ANALYTICS_SNAPSHOT_FRESHNESS_SECONDS", "180"))
+        )
+        self.min_oi_coverage_pct_alert = float(
+            os.getenv("ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT", "0.35")
+        )
 
         # Metrics
         self.calculations_completed = 0
@@ -205,22 +213,24 @@ class AnalyticsEngine:
                     if quote_ts and quote_ts < stale_cutoff:
                         stale_dropped += 1
                         continue
-                    options.append({
-                        'option_symbol': row[0],
-                        'strike': float(row[1]),
-                        'expiration': row[2],
-                        'option_type': row[3],
-                        'last': float(row[4]) if row[4] else 0.0,
-                        'bid': float(row[5]) if row[5] else 0.0,
-                        'ask': float(row[6]) if row[6] else 0.0,
-                        'volume': int(row[7]) if row[7] else 0,
-                        'open_interest': int(row[8]) if row[8] else 0,
-                        'delta': float(row[9]) if row[9] else 0.0,
-                        'gamma': float(row[10]) if row[10] else 0.0,
-                        'theta': float(row[11]) if row[11] else 0.0,
-                        'vega': float(row[12]) if row[12] else 0.0,
-                        'implied_volatility': float(row[13]) if row[13] else 0.2,
-                    })
+                    options.append(
+                        {
+                            "option_symbol": row[0],
+                            "strike": float(row[1]),
+                            "expiration": row[2],
+                            "option_type": row[3],
+                            "last": float(row[4]) if row[4] else 0.0,
+                            "bid": float(row[5]) if row[5] else 0.0,
+                            "ask": float(row[6]) if row[6] else 0.0,
+                            "volume": int(row[7]) if row[7] else 0,
+                            "open_interest": int(row[8]) if row[8] else 0,
+                            "delta": float(row[9]) if row[9] else 0.0,
+                            "gamma": float(row[10]) if row[10] else 0.0,
+                            "theta": float(row[11]) if row[11] else 0.0,
+                            "vega": float(row[12]) if row[12] else 0.0,
+                            "implied_volatility": float(row[13]) if row[13] else 0.2,
+                        }
+                    )
 
                 logger.info(
                     f"Fetched {len(options)} options with Greeks "
@@ -233,7 +243,7 @@ class AnalyticsEngine:
                     )
 
                 # Count how many have OI > 0 for informational purposes
-                options_with_oi = sum(1 for opt in options if opt['open_interest'] > 0)
+                options_with_oi = sum(1 for opt in options if opt["open_interest"] > 0)
                 oi_coverage = (options_with_oi / len(options)) if options else 0.0
                 if options_with_oi > 0:
                     logger.info(
@@ -250,9 +260,9 @@ class AnalyticsEngine:
                     )
 
                 return {
-                    'timestamp': timestamp,
-                    'underlying_price': underlying_price,
-                    'options': options
+                    "timestamp": timestamp,
+                    "underlying_price": underlying_price,
+                    "options": options,
                 }
 
         except Exception as e:
@@ -267,14 +277,7 @@ class AnalyticsEngine:
     def _calculate_time_to_expiration(self, current_date: datetime, expiration_date) -> float:
         return calculate_time_to_expiration(current_date, expiration_date)
 
-    def _calculate_vanna(
-        self,
-        S: float,
-        K: float,
-        T: float,
-        r: float,
-        sigma: float
-    ) -> float:
+    def _calculate_vanna(self, S: float, K: float, T: float, r: float, sigma: float) -> float:
         """
         Calculate Vanna (∂²V/∂S∂σ)
 
@@ -283,7 +286,7 @@ class AnalyticsEngine:
         if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
             return 0.0
 
-        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+        d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
         d2 = d1 - sigma * np.sqrt(T)
 
         vanna = -stats.norm.pdf(d1) * d2 / sigma
@@ -291,13 +294,7 @@ class AnalyticsEngine:
         return vanna
 
     def _calculate_charm(
-        self,
-        S: float,
-        K: float,
-        T: float,
-        r: float,
-        sigma: float,
-        option_type: str
+        self, S: float, K: float, T: float, r: float, sigma: float, option_type: str
     ) -> float:
         """
         Calculate Charm (∂²V/∂S∂T)
@@ -307,16 +304,18 @@ class AnalyticsEngine:
         if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
             return 0.0
 
-        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+        d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
         d2 = d1 - sigma * np.sqrt(T)
 
         # Call charm: -N'(d1) * [2rT - d2*sigma*sqrt(T)] / [2T*sigma*sqrt(T)]
         # Put charm adds the risk-free drift term: call_charm + r*e^{-rT}
-        call_charm = -stats.norm.pdf(d1) * (
-            2 * r * T - d2 * sigma * np.sqrt(T)
-        ) / (2 * T * sigma * np.sqrt(T))
+        call_charm = (
+            -stats.norm.pdf(d1)
+            * (2 * r * T - d2 * sigma * np.sqrt(T))
+            / (2 * T * sigma * np.sqrt(T))
+        )
 
-        if option_type == 'C':
+        if option_type == "C":
             charm = call_charm
         else:  # Put
             charm = call_charm + r * np.exp(-r * T)
@@ -327,10 +326,7 @@ class AnalyticsEngine:
         return charm_per_day
 
     def _calculate_gex_by_strike(
-        self,
-        options: List[Dict[str, Any]],
-        underlying_price: float,
-        timestamp: datetime
+        self, options: List[Dict[str, Any]], underlying_price: float, timestamp: datetime
     ) -> List[Dict[str, Any]]:
         """
         Calculate gamma exposure by strike
@@ -350,17 +346,14 @@ class AnalyticsEngine:
         _tte_cache: Dict = {}
 
         # Group by strike and expiration
-        strike_data = defaultdict(lambda: {
-            'calls': [],
-            'puts': []
-        })
+        strike_data = defaultdict(lambda: {"calls": [], "puts": []})
 
         for opt in options:
-            key = (opt['strike'], opt['expiration'])
-            if opt['option_type'] == 'C':
-                strike_data[key]['calls'].append(opt)
+            key = (opt["strike"], opt["expiration"])
+            if opt["option_type"] == "C":
+                strike_data[key]["calls"].append(opt)
             else:
-                strike_data[key]['puts'].append(opt)
+                strike_data[key]["puts"].append(opt)
 
         # Calculate GEX for each strike
         gex_results = []
@@ -370,15 +363,15 @@ class AnalyticsEngine:
             # Note: there is typically one call/put contract per strike+expiration,
             # but we still compute this as a true weighted sum so the math remains
             # correct if upstream snapshots ever include multiple rows.
-            call_gamma = sum(opt['gamma'] * opt['open_interest'] for opt in data['calls'])
-            call_oi = sum(opt['open_interest'] for opt in data['calls'])
-            call_volume = sum(opt['volume'] for opt in data['calls'])
+            call_gamma = sum(opt["gamma"] * opt["open_interest"] for opt in data["calls"])
+            call_oi = sum(opt["open_interest"] for opt in data["calls"])
+            call_volume = sum(opt["volume"] for opt in data["calls"])
             call_gex = call_gamma * 100 * underlying_price
 
             # Calculate put GEX (negative for dealers)
-            put_gamma = sum(opt['gamma'] * opt['open_interest'] for opt in data['puts'])
-            put_oi = sum(opt['open_interest'] for opt in data['puts'])
-            put_volume = sum(opt['volume'] for opt in data['puts'])
+            put_gamma = sum(opt["gamma"] * opt["open_interest"] for opt in data["puts"])
+            put_oi = sum(opt["open_interest"] for opt in data["puts"])
+            put_volume = sum(opt["volume"] for opt in data["puts"])
             put_gex = -1 * put_gamma * 100 * underlying_price
 
             # Total gamma (absolute)
@@ -401,13 +394,9 @@ class AnalyticsEngine:
                 T = self._calculate_time_to_expiration(timestamp, expiration)
                 _tte_cache[expiration] = T
 
-            for opt in data['calls'] + data['puts']:
+            for opt in data["calls"] + data["puts"]:
                 vanna = self._calculate_vanna(
-                    underlying_price,
-                    strike,
-                    T,
-                    self.risk_free_rate,
-                    opt['implied_volatility']
+                    underlying_price, strike, T, self.risk_free_rate, opt["implied_volatility"]
                 )
 
                 charm = self._calculate_charm(
@@ -415,12 +404,12 @@ class AnalyticsEngine:
                     strike,
                     T,
                     self.risk_free_rate,
-                    opt['implied_volatility'],
-                    opt['option_type']
+                    opt["implied_volatility"],
+                    opt["option_type"],
                 )
 
-                notional = opt['open_interest'] * 100 * underlying_price
-                if opt['option_type'] == 'C':
+                notional = opt["open_interest"] * 100 * underlying_price
+                if opt["option_type"] == "C":
                     call_vanna_exposure += vanna * notional
                     call_charm_exposure += charm * notional
                 else:
@@ -456,36 +445,36 @@ class AnalyticsEngine:
             else:
                 expiration_bucket = "leaps"
 
-            gex_results.append({
-                'underlying': self.db_symbol,
-                'timestamp': timestamp,
-                'strike': strike,
-                'expiration': expiration,
-                'total_gamma': total_gamma,
-                'call_gamma': call_gamma,
-                'put_gamma': put_gamma,
-                'net_gex': net_gex,
-                'call_volume': call_volume,
-                'put_volume': put_volume,
-                'call_oi': call_oi,
-                'put_oi': put_oi,
-                'vanna_exposure': vanna_exposure,
-                'charm_exposure': charm_exposure,
-                'call_vanna_exposure': call_vanna_exposure,
-                'put_vanna_exposure': put_vanna_exposure,
-                'call_charm_exposure': call_charm_exposure,
-                'put_charm_exposure': put_charm_exposure,
-                'dealer_vanna_exposure': dealer_vanna_exposure,
-                'dealer_charm_exposure': dealer_charm_exposure,
-                'expiration_bucket': expiration_bucket,
-            })
+            gex_results.append(
+                {
+                    "underlying": self.db_symbol,
+                    "timestamp": timestamp,
+                    "strike": strike,
+                    "expiration": expiration,
+                    "total_gamma": total_gamma,
+                    "call_gamma": call_gamma,
+                    "put_gamma": put_gamma,
+                    "net_gex": net_gex,
+                    "call_volume": call_volume,
+                    "put_volume": put_volume,
+                    "call_oi": call_oi,
+                    "put_oi": put_oi,
+                    "vanna_exposure": vanna_exposure,
+                    "charm_exposure": charm_exposure,
+                    "call_vanna_exposure": call_vanna_exposure,
+                    "put_vanna_exposure": put_vanna_exposure,
+                    "call_charm_exposure": call_charm_exposure,
+                    "put_charm_exposure": put_charm_exposure,
+                    "dealer_vanna_exposure": dealer_vanna_exposure,
+                    "dealer_charm_exposure": dealer_charm_exposure,
+                    "expiration_bucket": expiration_bucket,
+                }
+            )
 
         return gex_results
 
     def _calculate_max_pain(
-        self,
-        options: List[Dict[str, Any]],
-        strike_range: Optional[Tuple[float, float]] = None
+        self, options: List[Dict[str, Any]], strike_range: Optional[Tuple[float, float]] = None
     ) -> float:
         """
         Calculate Max Pain as the strike that minimizes total intrinsic payout.
@@ -503,7 +492,7 @@ class AnalyticsEngine:
             Max pain strike price
         """
         # Get unique strikes
-        strikes = sorted(set(opt['strike'] for opt in options))
+        strikes = sorted(set(opt["strike"] for opt in options))
 
         if strike_range:
             strikes = [s for s in strikes if strike_range[0] <= s <= strike_range[1]]
@@ -518,13 +507,13 @@ class AnalyticsEngine:
             total_payout = 0.0
 
             for opt in options:
-                if opt['open_interest'] == 0:
+                if opt["open_interest"] == 0:
                     continue
 
-                strike = opt['strike']
-                oi = opt['open_interest']
+                strike = opt["strike"]
+                oi = opt["open_interest"]
 
-                if opt['option_type'] == 'C':
+                if opt["option_type"] == "C":
                     # Call intrinsic payoff at settlement: max(0, S - K)
                     if test_strike > strike:
                         total_payout += (test_strike - strike) * oi * 100
@@ -543,9 +532,7 @@ class AnalyticsEngine:
         return max_pain_strike
 
     def _calculate_gamma_flip_point(
-        self,
-        gex_by_strike: List[Dict[str, Any]],
-        underlying_price: float
+        self, gex_by_strike: List[Dict[str, Any]], underlying_price: float
     ) -> Optional[float]:
         """
         Calculate gamma flip point (zero gamma level)
@@ -562,7 +549,7 @@ class AnalyticsEngine:
         # so we must sum before looking for zero crossings.
         agg: Dict[float, float] = defaultdict(float)
         for entry in gex_by_strike:
-            agg[entry['strike']] += entry['net_gex']
+            agg[entry["strike"]] += entry["net_gex"]
 
         strikes_sorted = sorted(agg.items())  # list of (strike, net_gex)
         if len(strikes_sorted) < 2:
@@ -572,7 +559,7 @@ class AnalyticsEngine:
         # There can be multiple crossings; the one nearest spot is the
         # most meaningful "flip point".
         best_flip = None
-        best_dist = float('inf')
+        best_dist = float("inf")
 
         for i in range(len(strikes_sorted) - 1):
             s1, gex1 = strikes_sorted[i]
@@ -586,8 +573,9 @@ class AnalyticsEngine:
                     best_flip = flip
 
         if best_flip is not None:
-            logger.info(f"Gamma flip point: ${best_flip:.2f} "
-                       f"(nearest to spot ${underlying_price:.2f})")
+            logger.info(
+                f"Gamma flip point: ${best_flip:.2f} " f"(nearest to spot ${underlying_price:.2f})"
+            )
 
         return best_flip
 
@@ -596,7 +584,7 @@ class AnalyticsEngine:
         gex_by_strike: List[Dict[str, Any]],
         options: List[Dict[str, Any]],
         underlying_price: float,
-        timestamp: datetime
+        timestamp: datetime,
     ) -> Dict[str, Any]:
         """Calculate summary GEX metrics"""
 
@@ -605,7 +593,7 @@ class AnalyticsEngine:
             return None
 
         # Find max gamma strike
-        max_gamma_strike = max(gex_by_strike, key=lambda x: abs(x['net_gex']))
+        max_gamma_strike = max(gex_by_strike, key=lambda x: abs(x["net_gex"]))
 
         # Calculate gamma flip point
         gamma_flip_point = self._calculate_gamma_flip_point(gex_by_strike, underlying_price)
@@ -614,16 +602,16 @@ class AnalyticsEngine:
         max_pain = self._calculate_max_pain(options)
 
         # Total volumes and OI
-        total_call_volume = sum(opt['volume'] for opt in options if opt['option_type'] == 'C')
-        total_put_volume = sum(opt['volume'] for opt in options if opt['option_type'] == 'P')
-        total_call_oi = sum(opt['open_interest'] for opt in options if opt['option_type'] == 'C')
-        total_put_oi = sum(opt['open_interest'] for opt in options if opt['option_type'] == 'P')
+        total_call_volume = sum(opt["volume"] for opt in options if opt["option_type"] == "C")
+        total_put_volume = sum(opt["volume"] for opt in options if opt["option_type"] == "P")
+        total_call_oi = sum(opt["open_interest"] for opt in options if opt["option_type"] == "C")
+        total_put_oi = sum(opt["open_interest"] for opt in options if opt["option_type"] == "P")
 
         # Put/call ratio
         put_call_ratio = total_put_volume / total_call_volume if total_call_volume > 0 else 0
 
         # Total net GEX
-        total_net_gex = sum(strike['net_gex'] for strike in gex_by_strike)
+        total_net_gex = sum(strike["net_gex"] for strike in gex_by_strike)
 
         # Distance from spot to flip (normalized by spot).
         # Close-to-zero means price is sitting near a regime boundary where
@@ -638,9 +626,9 @@ class AnalyticsEngine:
         # dense nearby gamma does not cancel out due to opposing signs.
         local_band = underlying_price * 0.01
         local_gex = sum(
-            abs(row['net_gex'])
+            abs(row["net_gex"])
             for row in gex_by_strike
-            if abs(row['strike'] - underlying_price) <= local_band
+            if abs(row["strike"] - underlying_price) <= local_band
         )
 
         # Convexity risk proxy:
@@ -651,22 +639,22 @@ class AnalyticsEngine:
             convexity_risk = abs(total_net_gex) / max(distance_to_flip, 1e-6)
 
         summary = {
-            'underlying': self.db_symbol,
-            'timestamp': timestamp,
-            'underlying_price': underlying_price,
-            'max_gamma_strike': max_gamma_strike['strike'],
-            'max_gamma_value': max_gamma_strike['net_gex'],
-            'gamma_flip_point': gamma_flip_point,
-            'flip_distance': flip_distance,
-            'local_gex': local_gex,
-            'convexity_risk': convexity_risk,
-            'put_call_ratio': put_call_ratio,
-            'max_pain': max_pain,
-            'total_call_volume': total_call_volume,
-            'total_put_volume': total_put_volume,
-            'total_call_oi': total_call_oi,
-            'total_put_oi': total_put_oi,
-            'total_net_gex': total_net_gex
+            "underlying": self.db_symbol,
+            "timestamp": timestamp,
+            "underlying_price": underlying_price,
+            "max_gamma_strike": max_gamma_strike["strike"],
+            "max_gamma_value": max_gamma_strike["net_gex"],
+            "gamma_flip_point": gamma_flip_point,
+            "flip_distance": flip_distance,
+            "local_gex": local_gex,
+            "convexity_risk": convexity_risk,
+            "put_call_ratio": put_call_ratio,
+            "max_pain": max_pain,
+            "total_call_volume": total_call_volume,
+            "total_put_volume": total_put_volume,
+            "total_call_oi": total_call_oi,
+            "total_put_oi": total_put_oi,
+            "total_net_gex": total_net_gex,
         }
 
         return summary
@@ -692,29 +680,32 @@ class AnalyticsEngine:
                 )
             return
         try:
-            rows = [(
-                data['underlying'],
-                data['timestamp'],
-                float(data['strike']),
-                data['expiration'],
-                float(data['total_gamma']),
-                float(data['call_gamma']),
-                float(data['put_gamma']),
-                float(data['net_gex']),
-                int(data['call_volume']),
-                int(data['put_volume']),
-                int(data['call_oi']),
-                int(data['put_oi']),
-                float(data['vanna_exposure']),
-                float(data['charm_exposure']),
-                float(data.get('call_vanna_exposure', 0.0)),
-                float(data.get('put_vanna_exposure', 0.0)),
-                float(data.get('call_charm_exposure', 0.0)),
-                float(data.get('put_charm_exposure', 0.0)),
-                float(data.get('dealer_vanna_exposure', -float(data['vanna_exposure']))),
-                float(data.get('dealer_charm_exposure', -float(data['charm_exposure']))),
-                data.get('expiration_bucket'),
-            ) for data in gex_data]
+            rows = [
+                (
+                    data["underlying"],
+                    data["timestamp"],
+                    float(data["strike"]),
+                    data["expiration"],
+                    float(data["total_gamma"]),
+                    float(data["call_gamma"]),
+                    float(data["put_gamma"]),
+                    float(data["net_gex"]),
+                    int(data["call_volume"]),
+                    int(data["put_volume"]),
+                    int(data["call_oi"]),
+                    int(data["put_oi"]),
+                    float(data["vanna_exposure"]),
+                    float(data["charm_exposure"]),
+                    float(data.get("call_vanna_exposure", 0.0)),
+                    float(data.get("put_vanna_exposure", 0.0)),
+                    float(data.get("call_charm_exposure", 0.0)),
+                    float(data.get("put_charm_exposure", 0.0)),
+                    float(data.get("dealer_vanna_exposure", -float(data["vanna_exposure"]))),
+                    float(data.get("dealer_charm_exposure", -float(data["charm_exposure"]))),
+                    data.get("expiration_bucket"),
+                )
+                for data in gex_data
+            ]
 
             execute_values(
                 cursor,
@@ -795,7 +786,7 @@ class AnalyticsEngine:
                 )
             return
         try:
-            gamma_flip_point = summary.get('gamma_flip_point')
+            gamma_flip_point = summary.get("gamma_flip_point")
             if gamma_flip_point is None:
                 cursor.execute(
                     """
@@ -807,7 +798,7 @@ class AnalyticsEngine:
                     ORDER BY timestamp DESC
                     LIMIT 1
                     """,
-                    (summary['underlying'], summary['timestamp']),
+                    (summary["underlying"], summary["timestamp"]),
                 )
                 prev_row = cursor.fetchone()
                 if prev_row and prev_row[0] is not None:
@@ -815,19 +806,20 @@ class AnalyticsEngine:
                     logger.info(
                         "Gamma flip carry-forward applied: using prior value %.4f at %s",
                         gamma_flip_point,
-                        summary['timestamp'],
+                        summary["timestamp"],
                     )
 
-            flip_distance = summary.get('flip_distance')
-            convexity_risk = summary.get('convexity_risk')
-            spot_price = float(summary.get('underlying_price') or 0.0)
-            total_net_gex = float(summary.get('total_net_gex') or 0.0)
+            flip_distance = summary.get("flip_distance")
+            convexity_risk = summary.get("convexity_risk")
+            spot_price = float(summary.get("underlying_price") or 0.0)
+            total_net_gex = float(summary.get("total_net_gex") or 0.0)
             if flip_distance is None and gamma_flip_point is not None and spot_price > 0:
                 flip_distance = (spot_price - gamma_flip_point) / spot_price
             if convexity_risk is None and flip_distance is not None:
                 convexity_risk = abs(total_net_gex) / max(abs(flip_distance), 1e-6)
 
-            cursor.execute("""
+            cursor.execute(
+                """
                 INSERT INTO gex_summary
                 (underlying, timestamp, max_gamma_strike, max_gamma_value,
                  gamma_flip_point, put_call_ratio, max_pain, total_call_volume,
@@ -862,23 +854,25 @@ class AnalyticsEngine:
                     OR EXCLUDED.flip_distance IS DISTINCT FROM gex_summary.flip_distance
                     OR EXCLUDED.local_gex IS DISTINCT FROM gex_summary.local_gex
                     OR EXCLUDED.convexity_risk IS DISTINCT FROM gex_summary.convexity_risk
-            """, (
-                summary['underlying'],
-                summary['timestamp'],
-                float(summary['max_gamma_strike']),
-                float(summary['max_gamma_value']),
-                gamma_flip_point,
-                float(summary['put_call_ratio']),
-                float(summary['max_pain']),
-                int(summary['total_call_volume']),
-                int(summary['total_put_volume']),
-                int(summary['total_call_oi']),
-                int(summary['total_put_oi']),
-                float(summary['total_net_gex']),
-                float(flip_distance) if flip_distance is not None else None,
-                float(summary.get('local_gex', 0.0)),
-                float(convexity_risk) if convexity_risk is not None else None,
-            ))
+            """,
+                (
+                    summary["underlying"],
+                    summary["timestamp"],
+                    float(summary["max_gamma_strike"]),
+                    float(summary["max_gamma_value"]),
+                    gamma_flip_point,
+                    float(summary["put_call_ratio"]),
+                    float(summary["max_pain"]),
+                    int(summary["total_call_volume"]),
+                    int(summary["total_put_volume"]),
+                    int(summary["total_call_oi"]),
+                    int(summary["total_put_oi"]),
+                    float(summary["total_net_gex"]),
+                    float(flip_distance) if flip_distance is not None else None,
+                    float(summary.get("local_gex", 0.0)),
+                    float(convexity_risk) if convexity_risk is not None else None,
+                ),
+            )
             if commit:
                 conn.commit()
             logger.info("✅ Stored GEX summary")
@@ -924,9 +918,14 @@ class AnalyticsEngine:
             mismatches += 1
 
         if mismatches:
-            logger.warning("GEX validation: detected %d by-strike arithmetic mismatches", mismatches)
+            logger.warning(
+                "GEX validation: detected %d by-strike arithmetic mismatches", mismatches
+            )
         if sign_anomalies:
-            logger.warning("GEX validation: detected %d sign anomalies (negative aggregated gamma)", sign_anomalies)
+            logger.warning(
+                "GEX validation: detected %d sign anomalies (negative aggregated gamma)",
+                sign_anomalies,
+            )
         if not mismatches and not sign_anomalies:
             logger.info("GEX validation: all by-strike calculations passed")
 
@@ -971,9 +970,7 @@ class AnalyticsEngine:
 
                 # Session open: 09:30 ET of the day containing `timestamp`.
                 ts_et = timestamp.astimezone(ET)
-                session_open_et = ET.localize(
-                    datetime(ts_et.year, ts_et.month, ts_et.day, 9, 30)
-                )
+                session_open_et = ET.localize(datetime(ts_et.year, ts_et.month, ts_et.day, 9, 30))
                 session_open = session_open_et.astimezone(timezone.utc)
 
                 logger.info(
@@ -985,7 +982,8 @@ class AnalyticsEngine:
                 # Single statement covers both bucket rows via a values table.
                 # Each bucket aggregates facts from [session_open, bucket_end),
                 # giving cumulative values keyed at bucket_start.
-                cursor.execute("""
+                cursor.execute(
+                    """
                     WITH bucket_targets AS (
                         SELECT * FROM (VALUES
                             (%s::timestamptz, %s::timestamptz),
@@ -1031,14 +1029,18 @@ class AnalyticsEngine:
                         net_premium = EXCLUDED.net_premium,
                         underlying_price = EXCLUDED.underlying_price,
                         updated_at = NOW()
-                """, (
-                    prev_bucket_start, curr_bucket_start,      # row 1: (prev_start, prev_end)
-                    curr_bucket_start, curr_bucket_end,        # row 2: (curr_start, curr_end)
-                    session_open,                              # bucket_start >= session_open
-                    underlying_price,                          # underlying_price fallback
-                    self.db_symbol,                            # f.symbol filter
-                    session_open,                              # f.timestamp >= session_open
-                ))
+                """,
+                    (
+                        prev_bucket_start,
+                        curr_bucket_start,  # row 1: (prev_start, prev_end)
+                        curr_bucket_start,
+                        curr_bucket_end,  # row 2: (curr_start, curr_end)
+                        session_open,  # bucket_start >= session_open
+                        underlying_price,  # underlying_price fallback
+                        self.db_symbol,  # f.symbol filter
+                        session_open,  # f.timestamp >= session_open
+                    ),
+                )
                 logger.info(
                     "flow_by_contract refresh upserted %d rows for %s (buckets [%s, %s])",
                     cursor.rowcount,
@@ -1049,7 +1051,8 @@ class AnalyticsEngine:
 
                 # Refresh flow_smart_money
                 logger.debug("Refreshing flow_smart_money...")
-                cursor.execute("""
+                cursor.execute(
+                    """
                     WITH with_prev AS (
                         SELECT
                             oc.timestamp,
@@ -1125,7 +1128,16 @@ class AnalyticsEngine:
                         unusual_activity_score = EXCLUDED.unusual_activity_score,
                         underlying_price = EXCLUDED.underlying_price,
                         updated_at = NOW()
-                """, (self.db_symbol, timestamp, timestamp, self.db_symbol, underlying_price, timestamp))
+                """,
+                    (
+                        self.db_symbol,
+                        timestamp,
+                        timestamp,
+                        self.db_symbol,
+                        underlying_price,
+                        timestamp,
+                    ),
+                )
 
                 # Retention policy: keep only recent smart-money cache rows
                 cursor.execute("""
@@ -1140,7 +1152,6 @@ class AnalyticsEngine:
 
         except Exception as e:
             logger.error(f"Error refreshing flow caches: {e}", exc_info=True)
-
 
     def run_calculation(self) -> bool:
         """
@@ -1161,9 +1172,9 @@ class AnalyticsEngine:
                 logger.warning("No option data available in database")
                 return False
 
-            latest_timestamp = snapshot['timestamp']
-            underlying_price = snapshot['underlying_price']
-            options = snapshot['options']
+            latest_timestamp = snapshot["timestamp"]
+            underlying_price = snapshot["underlying_price"]
+            options = snapshot["options"]
 
             logger.info(f"Running calculation for timestamp: {latest_timestamp}")
             logger.info(f"Underlying price: ${underlying_price:.2f}")
@@ -1176,9 +1187,7 @@ class AnalyticsEngine:
             logger.info("Calculating GEX by strike...")
             t0 = _time.monotonic()
             gex_by_strike = self._calculate_gex_by_strike(
-                options,
-                underlying_price,
-                latest_timestamp
+                options, underlying_price, latest_timestamp
             )
             stage_timings["gex_by_strike"] = _time.monotonic() - t0
 
@@ -1192,10 +1201,7 @@ class AnalyticsEngine:
             logger.info("Calculating GEX summary metrics...")
             t0 = _time.monotonic()
             gex_summary = self._calculate_gex_summary(
-                gex_by_strike,
-                options,
-                underlying_price,
-                latest_timestamp
+                gex_by_strike, options, underlying_price, latest_timestamp
             )
             stage_timings["gex_summary"] = _time.monotonic() - t0
 
@@ -1225,16 +1231,20 @@ class AnalyticsEngine:
             logger.info("=" * 80)
             logger.info(f"Max Gamma Strike: ${gex_summary['max_gamma_strike']:.2f}")
             logger.info(f"Max Gamma Value: {gex_summary['max_gamma_value']:,.0f}")
-            logger.info(f"Gamma Flip Point: ${gex_summary['gamma_flip_point']:.2f}" if gex_summary['gamma_flip_point'] else "Gamma Flip Point: N/A")
+            logger.info(
+                f"Gamma Flip Point: ${gex_summary['gamma_flip_point']:.2f}"
+                if gex_summary["gamma_flip_point"]
+                else "Gamma Flip Point: N/A"
+            )
             logger.info(
                 f"Flip Distance: {gex_summary['flip_distance']:.4f}"
-                if gex_summary.get('flip_distance') is not None
+                if gex_summary.get("flip_distance") is not None
                 else "Flip Distance: N/A"
             )
             logger.info(f"Local GEX (±1%): {gex_summary.get('local_gex', 0.0):,.0f}")
             logger.info(
                 f"Convexity Risk: {gex_summary['convexity_risk']:,.0f}"
-                if gex_summary.get('convexity_risk') is not None
+                if gex_summary.get("convexity_risk") is not None
                 else "Convexity Risk: N/A"
             )
             logger.info(f"Max Pain: ${gex_summary['max_pain']:.2f}")
@@ -1250,9 +1260,7 @@ class AnalyticsEngine:
             # diagnosed without guessing which step is slow.
             self._last_stage_timings = stage_timings
             total_stage_time = sum(stage_timings.values())
-            timings_str = ", ".join(
-                f"{label}={secs:.2f}s" for label, secs in stage_timings.items()
-            )
+            timings_str = ", ".join(f"{label}={secs:.2f}s" for label, secs in stage_timings.items())
             logger.info(
                 "Stage timings (total %.2fs): %s",
                 total_stage_time,
@@ -1344,7 +1352,9 @@ class AnalyticsEngine:
             logger.info(f"Calculations completed: {self.calculations_completed}")
             logger.info(f"Errors encountered: {self.errors_count}")
             if self.last_calculation_time:
-                logger.info(f"Last calculation: {self.last_calculation_time.strftime('%Y-%m-%d %H:%M:%S ET')}")
+                logger.info(
+                    f"Last calculation: {self.last_calculation_time.strftime('%Y-%m-%d %H:%M:%S ET')}"
+                )
             logger.info("=" * 80 + "\n")
 
             close_connection_pool()
@@ -1358,29 +1368,35 @@ def main():
     load_dotenv()
 
     parser = argparse.ArgumentParser(description="ZeroGEX Analytics Engine")
-    parser.add_argument("--underlying", default=None,
-                       help="Single underlying symbol (backward compatible)")
+    parser.add_argument(
+        "--underlying", default=None, help="Single underlying symbol (backward compatible)"
+    )
     parser.add_argument(
         "--underlyings",
         default=os.getenv("ANALYTICS_UNDERLYINGS", os.getenv("ANALYTICS_UNDERLYING", "SPY")),
         help="Comma-separated underlying symbols or aliases (default: SPY)",
     )
-    parser.add_argument("--interval", type=int,
-                       default=int(os.getenv("ANALYTICS_INTERVAL", "60")),
-                       help="Calculation interval in seconds (default: 60)")
-    parser.add_argument("--risk-free-rate", type=float,
-                       default=float(os.getenv("RISK_FREE_RATE", "0.05")),
-                       help="Risk-free rate (default: 0.05)")
-    parser.add_argument("--once", action="store_true",
-                       help="Run once and exit (for testing)")
-    parser.add_argument("--debug", action="store_true",
-                       help="Enable debug logging")
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=int(os.getenv("ANALYTICS_INTERVAL", "60")),
+        help="Calculation interval in seconds (default: 60)",
+    )
+    parser.add_argument(
+        "--risk-free-rate",
+        type=float,
+        default=float(os.getenv("RISK_FREE_RATE", "0.05")),
+        help="Risk-free rate (default: 0.05)",
+    )
+    parser.add_argument("--once", action="store_true", help="Run once and exit (for testing)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
     args = parser.parse_args()
 
     # Set logging level
     if args.debug:
         from src.utils import set_log_level
+
         set_log_level("DEBUG")
 
     raw_underlyings = args.underlying if args.underlying else args.underlyings
@@ -1394,7 +1410,7 @@ def main():
         engine = AnalyticsEngine(
             underlying=symbol,
             calculation_interval=args.interval,
-            risk_free_rate=args.risk_free_rate
+            risk_free_rate=args.risk_free_rate,
         )
 
         if args.once:

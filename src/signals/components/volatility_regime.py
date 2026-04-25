@@ -1,4 +1,5 @@
 """Market State component: volatility regime (+/-10)."""
+
 from __future__ import annotations
 
 import math

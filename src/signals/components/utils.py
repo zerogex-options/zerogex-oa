@@ -4,6 +4,7 @@ Extracted to remove near-identical copies of 5-bar momentum math and
 session time math across components.  Also centralizes ET-aware session
 windowing (DST correct) and a couple of reusable numeric helpers.
 """
+
 from __future__ import annotations
 
 import math
@@ -14,13 +15,13 @@ import pytz
 
 # US cash session in UTC minutes. Kept for legacy call sites that still pass
 # UTC minutes; prefer the ET-native helpers below for new code.
-SESSION_OPEN_MIN_UTC = 13 * 60 + 30   # 13:30 UTC (EDT open only)
-SESSION_CLOSE_MIN_UTC = 20 * 60       # 20:00 UTC (EDT close only)
+SESSION_OPEN_MIN_UTC = 13 * 60 + 30  # 13:30 UTC (EDT open only)
+SESSION_CLOSE_MIN_UTC = 20 * 60  # 20:00 UTC (EDT close only)
 SESSION_LENGTH_MIN = SESSION_CLOSE_MIN_UTC - SESSION_OPEN_MIN_UTC
 
 # ET-native session minutes (DST-correct).
-SESSION_OPEN_MIN_ET = 9 * 60 + 30     # 09:30 ET
-SESSION_CLOSE_MIN_ET = 16 * 60        # 16:00 ET
+SESSION_OPEN_MIN_ET = 9 * 60 + 30  # 09:30 ET
+SESSION_CLOSE_MIN_ET = 16 * 60  # 16:00 ET
 SESSION_LENGTH_MIN_ET = SESSION_CLOSE_MIN_ET - SESSION_OPEN_MIN_ET
 
 ET = pytz.timezone("US/Eastern")

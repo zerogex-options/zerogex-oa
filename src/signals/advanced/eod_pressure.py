@@ -1,4 +1,5 @@
 """Advanced end-of-day pressure detector."""
+
 from __future__ import annotations
 
 import math

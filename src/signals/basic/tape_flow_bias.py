@@ -16,6 +16,7 @@ Inputs live in ``ctx.extra['flow_by_type']`` — a list with at most two
 rows (one per option_type) holding ``buy_volume``, ``sell_volume``,
 ``buy_premium``, ``sell_premium`` aggregated over the last window.
 """
+
 from __future__ import annotations
 
 import os

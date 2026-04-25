@@ -60,9 +60,9 @@ def _normalize_signal_score_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-
 def get_db() -> DatabaseManager:
     from ..main import db_manager
+
     return db_manager
 
 
@@ -326,7 +326,9 @@ async def get_vol_expansion_signal(
     """
     row = await db.get_vol_expansion_signal(symbol.upper())
     if not row:
-        raise HTTPException(status_code=404, detail=f"No vol-expansion score found for {symbol.upper()}")
+        raise HTTPException(
+            status_code=404, detail=f"No vol-expansion score found for {symbol.upper()}"
+        )
     ctx = row.get("context_values") or {}
     row["score_history"] = row.get("score_history") or []
     row["expansion"] = ctx.get("expansion")
@@ -395,7 +397,9 @@ async def get_eod_pressure_signal(
     """
     row = await db.get_eod_pressure_signal(symbol.upper())
     if not row:
-        raise HTTPException(status_code=404, detail=f"No eod-pressure score found for {symbol.upper()}")
+        raise HTTPException(
+            status_code=404, detail=f"No eod-pressure score found for {symbol.upper()}"
+        )
     ctx = row.get("context_values") or {}
     row["score_history"] = row.get("score_history") or []
     row["charm_at_spot"] = ctx.get("charm_at_spot")
@@ -460,7 +464,9 @@ async def get_squeeze_setup_signal(
     """
     row = await db.get_advanced_signal(symbol.upper(), "squeeze_setup")
     if not row:
-        raise HTTPException(status_code=404, detail=f"No squeeze-setup signal found for {symbol.upper()}")
+        raise HTTPException(
+            status_code=404, detail=f"No squeeze-setup signal found for {symbol.upper()}"
+        )
     ctx = row.get("context_values") or {}
     row["score_history"] = row.get("score_history") or []
     row["triggered"] = ctx.get("triggered", False)
@@ -529,7 +535,9 @@ async def get_trap_detection_signal(
     """
     row = await db.get_advanced_signal(symbol.upper(), "trap_detection")
     if not row:
-        raise HTTPException(status_code=404, detail=f"No trap-detection signal found for {symbol.upper()}")
+        raise HTTPException(
+            status_code=404, detail=f"No trap-detection signal found for {symbol.upper()}"
+        )
     ctx = row.get("context_values") or {}
     row["score_history"] = row.get("score_history") or []
     row["triggered"] = ctx.get("triggered", False)
@@ -600,7 +608,9 @@ async def get_zero_dte_position_imbalance_signal(
     """
     row = await db.get_advanced_signal(symbol.upper(), "zero_dte_position_imbalance")
     if not row:
-        raise HTTPException(status_code=404, detail=f"No 0DTE position-imbalance signal found for {symbol.upper()}")
+        raise HTTPException(
+            status_code=404, detail=f"No 0DTE position-imbalance signal found for {symbol.upper()}"
+        )
     ctx = row.get("context_values") or {}
     row["score_history"] = row.get("score_history") or []
     row["triggered"] = ctx.get("triggered", False)
@@ -671,7 +681,9 @@ async def get_gamma_vwap_confluence_signal(
     """
     row = await db.get_advanced_signal(symbol.upper(), "gamma_vwap_confluence")
     if not row:
-        raise HTTPException(status_code=404, detail=f"No gamma+VWAP confluence signal found for {symbol.upper()}")
+        raise HTTPException(
+            status_code=404, detail=f"No gamma+VWAP confluence signal found for {symbol.upper()}"
+        )
     ctx = row.get("context_values") or {}
     row["score_history"] = row.get("score_history") or []
     row["triggered"] = ctx.get("triggered", False)
@@ -923,7 +935,9 @@ async def get_tape_flow_bias_signal(
     """
     row = await db.get_basic_signal(symbol.upper(), "tape_flow_bias")
     if not row:
-        raise HTTPException(status_code=404, detail=f"No tape-flow-bias score found for {symbol.upper()}")
+        raise HTTPException(
+            status_code=404, detail=f"No tape-flow-bias score found for {symbol.upper()}"
+        )
     ctx = row.get("context_values") or {}
     row["score_history"] = row.get("score_history") or []
     row["call_net_premium"] = ctx.get("call_net_premium")
@@ -995,7 +1009,9 @@ async def get_skew_delta_signal(
     """
     row = await db.get_basic_signal(symbol.upper(), "skew_delta")
     if not row:
-        raise HTTPException(status_code=404, detail=f"No skew-delta score found for {symbol.upper()}")
+        raise HTTPException(
+            status_code=404, detail=f"No skew-delta score found for {symbol.upper()}"
+        )
     ctx = row.get("context_values") or {}
     row["score_history"] = row.get("score_history") or []
     row["otm_put_iv"] = ctx.get("otm_put_iv")
@@ -1080,7 +1096,9 @@ async def get_vanna_charm_flow_signal(
     """
     row = await db.get_basic_signal(symbol.upper(), "vanna_charm_flow")
     if not row:
-        raise HTTPException(status_code=404, detail=f"No vanna-charm-flow score found for {symbol.upper()}")
+        raise HTTPException(
+            status_code=404, detail=f"No vanna-charm-flow score found for {symbol.upper()}"
+        )
     ctx = row.get("context_values") or {}
     row["score_history"] = row.get("score_history") or []
     row["vanna_total"] = ctx.get("vanna_total")
@@ -1165,7 +1183,9 @@ async def get_dealer_delta_pressure_signal(
     """
     row = await db.get_basic_signal(symbol.upper(), "dealer_delta_pressure")
     if not row:
-        raise HTTPException(status_code=404, detail=f"No dealer-delta-pressure score found for {symbol.upper()}")
+        raise HTTPException(
+            status_code=404, detail=f"No dealer-delta-pressure score found for {symbol.upper()}"
+        )
     ctx = row.get("context_values") or {}
     row["score_history"] = row.get("score_history") or []
     row["dealer_net_delta_estimated"] = ctx.get("dealer_net_delta_estimated")
@@ -1254,7 +1274,9 @@ async def get_gex_gradient_signal(
     """
     row = await db.get_basic_signal(symbol.upper(), "gex_gradient")
     if not row:
-        raise HTTPException(status_code=404, detail=f"No gex-gradient score found for {symbol.upper()}")
+        raise HTTPException(
+            status_code=404, detail=f"No gex-gradient score found for {symbol.upper()}"
+        )
     ctx = row.get("context_values") or {}
     row["score_history"] = row.get("score_history") or []
     row["above_spot_gamma_abs"] = ctx.get("above_spot_gamma_abs")
@@ -1353,7 +1375,9 @@ async def get_positioning_trap_signal(
     """
     row = await db.get_basic_signal(symbol.upper(), "positioning_trap")
     if not row:
-        raise HTTPException(status_code=404, detail=f"No positioning-trap score found for {symbol.upper()}")
+        raise HTTPException(
+            status_code=404, detail=f"No positioning-trap score found for {symbol.upper()}"
+        )
     ctx = row.get("context_values") or {}
     row["score_history"] = row.get("score_history") or []
     row["smart_imbalance"] = ctx.get("smart_imbalance")
@@ -1451,9 +1475,7 @@ async def get_signal_events(
             detail=f"Unknown signal_name '{signal_name}'.",
         )
     sym = symbol.upper()
-    rows = await db.get_signal_component_events(
-        sym, signal_name, limit=limit, horizon=horizon
-    )
+    rows = await db.get_signal_component_events(sym, signal_name, limit=limit, horizon=horizon)
 
     flips = [r for r in rows if r.get("direction_flip")]
     bullish = sum(1 for r in rows if r.get("direction") == "bullish")
@@ -1576,9 +1598,7 @@ async def get_advanced_confluence_matrix(
     agreement_ratio / disagreement_ratio / observations. Sort rows by average
     agreement to surface consensus signals at top, outliers at bottom.
     """
-    return await _confluence_matrix_response(
-        db, symbol, lookback, list(_ADVANCED_SIGNAL_NAMES)
-    )
+    return await _confluence_matrix_response(db, symbol, lookback, list(_ADVANCED_SIGNAL_NAMES))
 
 
 @router.get("/basic/confluence-matrix")
@@ -1663,6 +1683,4 @@ async def get_basic_confluence_matrix(
     average `agreement_ratio` to surface consensus signals at top, outliers
     at bottom. Symmetric — render only the upper triangle if space-constrained.
     """
-    return await _confluence_matrix_response(
-        db, symbol, lookback, list(_BASIC_SIGNAL_NAMES)
-    )
+    return await _confluence_matrix_response(db, symbol, lookback, list(_BASIC_SIGNAL_NAMES))

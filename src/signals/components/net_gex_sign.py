@@ -1,4 +1,5 @@
 """Market State component: net GEX sign contribution."""
+
 from __future__ import annotations
 
 from src.signals.components.base import ComponentBase, MarketContext

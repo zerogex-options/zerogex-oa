@@ -1,4 +1,5 @@
 """Tests for the gex_gradient scoring component."""
+
 from datetime import datetime, timezone
 
 import pytest

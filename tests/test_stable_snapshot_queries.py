@@ -121,6 +121,7 @@ def test_stable_snapshot_quiescence_env_override(monkeypatch):
     """The quiescence threshold is tunable via env var; confirm it's plumbed."""
     # Re-import to pick up a new env value; the constant is evaluated at import.
     import importlib
+
     monkeypatch.setenv("STABLE_SNAPSHOT_QUIESCENCE_SECONDS", "42")
     reloaded = importlib.reload(database_module)
     try:

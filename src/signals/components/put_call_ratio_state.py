@@ -1,4 +1,5 @@
 """Market-state put/call ratio component."""
+
 from __future__ import annotations
 
 from src.signals.components.base import ComponentBase, MarketContext

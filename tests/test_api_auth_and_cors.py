@@ -47,18 +47,21 @@ def _build_app(
     # Stub out the async DB connection so lifespan startup doesn't need
     # a live Postgres.
     from src.api import database as dbmod  # noqa: E402
+
     dbmod.DatabaseManager.connect = AsyncMock(return_value=None)
     dbmod.DatabaseManager.disconnect = AsyncMock(return_value=None)
     dbmod.DatabaseManager.check_health = AsyncMock(return_value=True)
     dbmod.DatabaseManager.get_latest_quote = AsyncMock(return_value=None)
 
     from src.api.main import app  # noqa: E402
+
     return app
 
 
 # --------------------------------------------------------------------------
 # Auth dependency
 # --------------------------------------------------------------------------
+
 
 def test_api_without_key_allows_unauth_when_API_KEY_unset(monkeypatch: pytest.MonkeyPatch):
     """Dev mode: API_KEY unset ⇒ every request succeeds without auth."""
@@ -128,6 +131,7 @@ def test_api_auth_is_timing_safe(monkeypatch: pytest.MonkeyPatch):
 # CORS production guard
 # --------------------------------------------------------------------------
 
+
 def test_cors_production_refuses_wildcard(monkeypatch: pytest.MonkeyPatch):
     """ENVIRONMENT=production + empty CORS ⇒ RuntimeError at app creation."""
     with pytest.raises(RuntimeError, match="CORS_ALLOW_ORIGINS"):
@@ -168,12 +172,14 @@ def test_cors_development_allows_wildcard_by_default(monkeypatch: pytest.MonkeyP
 # Error-handling decorator
 # --------------------------------------------------------------------------
 
+
 def test_500_response_does_not_leak_exception_details(monkeypatch: pytest.MonkeyPatch):
     """Any exception raised inside a @handle_api_errors route must surface
     to the client as a generic 500 — never the original exception message."""
     app = _build_app(monkeypatch, api_key=None)
 
     from src.api import database as dbmod
+
     dbmod.DatabaseManager.get_latest_gex_summary = AsyncMock(
         side_effect=RuntimeError("database on fire: secret_user_id=42"),
     )
@@ -192,6 +198,7 @@ def test_404_from_empty_result_passes_through(monkeypatch: pytest.MonkeyPatch):
     into 500 by the decorator."""
     app = _build_app(monkeypatch, api_key=None)
     from src.api import database as dbmod
+
     dbmod.DatabaseManager.get_latest_gex_summary = AsyncMock(return_value=None)
 
     with TestClient(app) as client:
