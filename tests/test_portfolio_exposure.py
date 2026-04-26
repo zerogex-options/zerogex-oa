@@ -1240,3 +1240,236 @@ class TestSpreadPricing:
             value, mode = engine._spread_mark(self._debit_trade(), NOW, conn=MagicMock())
         assert value is None
         assert mode == "debit"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.3: multi-source confirmation gate for advanced-signal entries
+# ---------------------------------------------------------------------------
+
+
+class TestAdvancedConfirmationGate:
+    """A single advanced trigger isn't enough — at least one independent
+    confirmation (basic same-direction, MSI same-direction, or another
+    triggered advanced) is required before the entry path can size a trade."""
+
+    @staticmethod
+    def _adv(name: str, signal: str, score: float, triggered: bool = True):
+        return SimpleNamespace(
+            name=name,
+            score=score,
+            context={"signal": signal, "triggered": triggered},
+        )
+
+    @staticmethod
+    def _basic(name: str, score: float):
+        return SimpleNamespace(name=name, score=score, context={})
+
+    @staticmethod
+    def _score(composite: float = 30.0):
+        normalized = composite / 100.0
+        return ScoreSnapshot(
+            timestamp=NOW,
+            underlying="SPY",
+            composite_score=composite,
+            normalized_score=normalized,
+            direction="chop_range",
+            components={},
+            aggregation={},
+        )
+
+    @staticmethod
+    def _market_ctx(closes=None):
+        return {
+            "close": 500.0,
+            "net_gex": -2.0e8,
+            "gamma_flip": 499.0,
+            "put_call_ratio": 1.0,
+            "max_pain": 500.0,
+            "smart_call": 0.0,
+            "smart_put": 0.0,
+            "recent_closes": closes or [499.0, 499.5, 500.0],
+            "iv_rank": 0.4,
+        }
+
+    def test_lone_advanced_signal_rejected_when_no_confirmation(self):
+        primary = self._adv("squeeze_setup", "bullish_squeeze", 0.45)
+        result = PortfolioEngine._evaluate_advanced_confirmation(
+            primary=primary,
+            primary_direction="bullish",
+            advanced_results=[primary],
+            basic_results=[],
+            score=self._score(composite=30.0),  # MSI conviction 0.30 < 0.50 cutoff
+            market_ctx=self._market_ctx(closes=[500.0, 500.0, 500.0]),  # neutral trend
+        )
+        assert result["passed"] is False
+        assert result["label"] == "no-confirmation"
+
+    def test_basic_signal_provides_confirmation(self):
+        primary = self._adv("squeeze_setup", "bullish_squeeze", 0.45)
+        result = PortfolioEngine._evaluate_advanced_confirmation(
+            primary=primary,
+            primary_direction="bullish",
+            advanced_results=[primary],
+            basic_results=[
+                self._basic("tape_flow_bias", 0.40),  # > 0.30 cutoff, bullish
+            ],
+            score=self._score(composite=30.0),
+            market_ctx=self._market_ctx(closes=[500.0, 500.0, 500.0]),
+        )
+        assert result["passed"] is True
+        assert "basic:tape_flow_bias" in result["label"]
+
+    def test_basic_signal_in_wrong_direction_does_not_confirm(self):
+        primary = self._adv("squeeze_setup", "bullish_squeeze", 0.45)
+        result = PortfolioEngine._evaluate_advanced_confirmation(
+            primary=primary,
+            primary_direction="bullish",
+            advanced_results=[primary],
+            basic_results=[
+                self._basic("tape_flow_bias", -0.40),  # bearish, opposes primary
+            ],
+            score=self._score(composite=30.0),
+            market_ctx=self._market_ctx(closes=[500.0, 500.0, 500.0]),
+        )
+        assert result["passed"] is False
+
+    def test_msi_trend_confirms_when_aligned_and_above_cutoff(self):
+        primary = self._adv("squeeze_setup", "bullish_squeeze", 0.45)
+        result = PortfolioEngine._evaluate_advanced_confirmation(
+            primary=primary,
+            primary_direction="bullish",
+            advanced_results=[primary],
+            basic_results=[],
+            score=self._score(composite=60.0),  # 0.60 conviction > 0.50 cutoff
+            market_ctx=self._market_ctx(closes=[498.0, 499.0, 500.0]),  # bullish trend
+        )
+        assert result["passed"] is True
+        assert "msi:" in result["label"]
+
+    def test_second_advanced_signal_provides_confirmation(self):
+        primary = self._adv("squeeze_setup", "bullish_squeeze", 0.45)
+        secondary = self._adv("vol_expansion", "bullish_expansion", 0.32)
+        result = PortfolioEngine._evaluate_advanced_confirmation(
+            primary=primary,
+            primary_direction="bullish",
+            advanced_results=[primary, secondary],
+            basic_results=[],
+            score=self._score(composite=30.0),
+            market_ctx=self._market_ctx(closes=[500.0, 500.0, 500.0]),
+        )
+        assert result["passed"] is True
+        assert "adv:vol_expansion" in result["label"]
+
+
+class TestRegimeFilterIntegration:
+    """compute_target_with_advanced_signals should ask the regime filter
+    whether to suppress *new* entries (no held position OR opposite direction).
+    """
+
+    @staticmethod
+    def _score(composite: float = 50.0):
+        return ScoreSnapshot(
+            timestamp=NOW,  # 14:00 UTC = 10:00 ET, normal window by default
+            underlying="SPY",
+            composite_score=composite,
+            normalized_score=composite / 100.0,
+            direction="controlled_trend",
+            components={},
+            aggregation={},
+        )
+
+    @staticmethod
+    def _build_target(direction: str = "bullish") -> PortfolioTarget:
+        return PortfolioTarget(
+            underlying="SPY",
+            timestamp=NOW,
+            composite_score=50.0,
+            normalized_score=0.5,
+            direction=direction,
+            target_positions=[
+                TargetPosition(
+                    direction=direction,
+                    strategy_type="bull_call_debit",
+                    contracts=2,
+                    option_symbol="SPY 260417C500",
+                    option_type="C",
+                    expiration=date(2026, 4, 17),
+                    strike=500.0,
+                    entry_mark=2.5,
+                    probability_of_profit=0.55,
+                    expected_value=20.0,
+                    kelly_fraction=0.10,
+                    optimizer_payload={},
+                )
+            ],
+            total_target_contracts=2,
+            target_heat_pct=0.01,
+            rationale="advanced fired",
+            source="advanced:squeeze_setup",
+        )
+
+    def test_filter_skip_returns_cash_when_no_held_position(self):
+        engine = _make_engine()
+        target = self._build_target()
+        from src.signals import regime_filter as rf
+
+        with (
+            patch.object(engine, "compute_target", return_value=PortfolioTarget(
+                underlying="SPY", timestamp=NOW, composite_score=50.0,
+                normalized_score=0.5, direction="controlled_trend",
+                target_positions=[], total_target_contracts=0,
+                target_heat_pct=0.0, rationale="composite cash",
+            )),
+            patch.object(engine, "_build_advanced_target", return_value=target),
+            patch.object(engine, "_current_position_direction", return_value="neutral"),
+            patch.object(rf, "evaluate", return_value=rf.FilterDecision(
+                skip=True, reason="Lunch chop test")),
+        ):
+            out = engine.compute_target_with_advanced_signals(
+                self._score(),
+                {
+                    "close": 500.0, "net_gex": -1e8, "gamma_flip": 499.0,
+                    "max_gamma_strike": 500.0,
+                    "put_call_ratio": 1.0, "max_pain": 500.0,
+                    "smart_call": 0.0, "smart_put": 0.0,
+                    "recent_closes": [499.0, 499.5, 500.0], "iv_rank": 0.4,
+                },
+                advanced_results=[],
+                basic_results=[],
+                conn=MagicMock(),
+            )
+        assert out.target_positions == []
+        assert "Regime filter" in out.rationale
+        assert "Lunch chop test" in out.rationale
+
+    def test_filter_does_not_block_same_direction_hold(self):
+        engine = _make_engine()
+        target = self._build_target(direction="bullish")
+        from src.signals import regime_filter as rf
+
+        with (
+            patch.object(engine, "compute_target", return_value=PortfolioTarget(
+                underlying="SPY", timestamp=NOW, composite_score=50.0,
+                normalized_score=0.5, direction="controlled_trend",
+                target_positions=[], total_target_contracts=0,
+                target_heat_pct=0.0, rationale="composite cash",
+            )),
+            patch.object(engine, "_build_advanced_target", return_value=target),
+            patch.object(engine, "_current_position_direction", return_value="bullish"),
+            patch.object(rf, "evaluate") as eval_mock,
+        ):
+            out = engine.compute_target_with_advanced_signals(
+                self._score(),
+                {
+                    "close": 500.0, "net_gex": -1e8, "gamma_flip": 499.0,
+                    "max_gamma_strike": 500.0,
+                    "put_call_ratio": 1.0, "max_pain": 500.0,
+                    "smart_call": 0.0, "smart_put": 0.0,
+                    "recent_closes": [499.0, 499.5, 500.0], "iv_rank": 0.4,
+                },
+                advanced_results=[],
+                basic_results=[],
+                conn=MagicMock(),
+            )
+        eval_mock.assert_not_called()
+        assert out.target_positions  # held position retained

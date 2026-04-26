@@ -330,6 +330,57 @@ SIGNALS_TIME_STOP_MINUTES = _getenv_int(
 SIGNALS_KELLY_FRACTION = _getenv_float(
     "SIGNALS_KELLY_FRACTION", 0.50, min=0.0, max=1.0
 )
+
+# -----------------------------------------------------------------------------
+# Regime filter (Phase 2: time-of-day + event suppression)
+# -----------------------------------------------------------------------------
+# Skip *new* entries during low-edge windows: lunch chop, last-N-minutes
+# before close, and a ±buffer around scheduled macro events.  Same-direction
+# holds and stop-driven exits are unaffected.
+SIGNALS_TIME_FILTER_ENABLED = _getenv_bool("SIGNALS_TIME_FILTER_ENABLED", True)
+SIGNALS_LUNCH_START_ET = os.getenv("SIGNALS_LUNCH_START_ET", "11:30").strip()
+SIGNALS_LUNCH_END_ET = os.getenv("SIGNALS_LUNCH_END_ET", "13:30").strip()
+# Conviction (normalized MSI 0..1) required to trade *through* the lunch
+# chop window.  A genuine trend-day breakout can clear this; routine chop
+# can't.  Set to 1.0 to make the lunch block hard.
+SIGNALS_LUNCH_MSI_OVERRIDE = _getenv_float(
+    "SIGNALS_LUNCH_MSI_OVERRIDE", 0.75, min=0.0, max=1.0
+)
+# Last-N-minutes before close: only eod_pressure-sourced entries are allowed
+# (close-pinning + dealer-flow plays). 0 disables.
+SIGNALS_LATE_CLOSE_LOCKDOWN_MINUTES = _getenv_int(
+    "SIGNALS_LATE_CLOSE_LOCKDOWN_MINUTES", 10, min=0, max=120
+)
+# Buffer (minutes) around each scheduled event below.  0 disables event filter.
+SIGNALS_EVENT_BUFFER_MINUTES = _getenv_int(
+    "SIGNALS_EVENT_BUFFER_MINUTES", 15, min=0, max=240
+)
+# Comma-separated list of ISO ET timestamps for FOMC/CPI/NFP/etc.
+# Example: "2026-05-07T08:30,2026-05-21T14:00"  (ET, no offset implied).
+# When a timestamp has no offset it is interpreted in America/New_York.
+SIGNALS_EVENT_CALENDAR = [
+    item.strip()
+    for item in os.getenv("SIGNALS_EVENT_CALENDAR", "").split(",")
+    if item.strip()
+]
+
+# -----------------------------------------------------------------------------
+# Multi-source confirmation for advanced-signal entries (Phase 2.3)
+# -----------------------------------------------------------------------------
+# When a single advanced signal triggers, require at least one independent
+# confirmation in the same direction before opening a position.  Confirmations
+# are: another advanced signal triggered, a basic signal score above the
+# basic-confirmation cutoff, or the MSI conviction above the MSI-confirmation
+# cutoff.
+SIGNALS_ADVANCED_REQUIRE_CONFIRMATION = _getenv_bool(
+    "SIGNALS_ADVANCED_REQUIRE_CONFIRMATION", True
+)
+SIGNALS_ADVANCED_MIN_BASIC_CONFIRM = _getenv_float(
+    "SIGNALS_ADVANCED_MIN_BASIC_CONFIRM", 0.30, min=0.0, max=1.0
+)
+SIGNALS_ADVANCED_MIN_MSI_CONFIRM = _getenv_float(
+    "SIGNALS_ADVANCED_MIN_MSI_CONFIRM", 0.50, min=0.0, max=1.0
+)
 SIGNALS_DRS_HARD_GATES_ENABLED = (
     os.getenv("SIGNALS_DRS_HARD_GATES_ENABLED", "true").lower() == "true"
 )

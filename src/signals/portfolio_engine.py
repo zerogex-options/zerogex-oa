@@ -23,6 +23,9 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from src.config import (
+    SIGNALS_ADVANCED_MIN_BASIC_CONFIRM,
+    SIGNALS_ADVANCED_MIN_MSI_CONFIRM,
+    SIGNALS_ADVANCED_REQUIRE_CONFIRMATION,
     SIGNALS_CONFLUENCE_ADVANCED_WEIGHT,
     SIGNALS_CONFLUENCE_ENABLED,
     SIGNALS_CONFLUENCE_MIN_AGREE,
@@ -48,6 +51,7 @@ from src.config import (
     SIGNALS_TIME_STOP_MINUTES,
     SIGNALS_TRIGGER_THRESHOLD,
 )
+from src.signals import regime_filter
 from src.database import db_connection
 from src.signals.execution import leg_fill_price
 from src.signals.position_optimizer_engine import (
@@ -464,6 +468,7 @@ class PortfolioEngine:
             score,
             market_ctx,
             advanced_results=advanced_results,
+            basic_results=basic_results or [],
             conn=conn,
             cached_option_rows=cached_option_rows,
         )
@@ -484,6 +489,23 @@ class PortfolioEngine:
                 score,
                 "No advanced signal setup or confluence confirmed; stay in cash",
             )
+
+        # Phase 2.4: regime/event filter on *new* entries. Same-direction
+        # holds bypass — only fresh entries (no held position OR opposite
+        # direction) are subject to lunch chop / late-close / event windows.
+        held_direction = self._current_position_direction(conn)
+        is_fresh_entry = held_direction != entry_target.direction
+        if is_fresh_entry:
+            decision = regime_filter.evaluate(
+                timestamp=score.timestamp,
+                msi_conviction=float(score.normalized_score or 0.0),
+                signal_source=entry_target.source,
+            )
+            if decision.skip:
+                return self._cash_target(
+                    score,
+                    f"Regime filter: {decision.reason}",
+                )
 
         # Hard do-not-fade policy in destabilizing, no-anchor conditions.
         if self._do_not_fade(market_ctx):
@@ -518,6 +540,7 @@ class PortfolioEngine:
         score: ScoreSnapshot,
         market_ctx: dict,
         advanced_results: list[AdvancedSignalResult],
+        basic_results: Optional[list[AdvancedSignalResult]] = None,
         conn=None,
         cached_option_rows=None,
     ) -> Optional[PortfolioTarget]:
@@ -526,6 +549,23 @@ class PortfolioEngine:
             return None
 
         signal_result, signal_direction = strongest
+
+        # Phase 2.3: a single advanced trigger isn't enough. Require at least
+        # one independent confirmation (another triggered advanced, a basic
+        # above the basic cutoff, or MSI conviction above the MSI cutoff)
+        # in the same direction before sizing a position.  Confluence-driven
+        # entries already self-gate via SIGNALS_CONFLUENCE_MIN_AGREE.
+        confirmation = self._evaluate_advanced_confirmation(
+            primary=signal_result,
+            primary_direction=signal_direction,
+            advanced_results=advanced_results,
+            basic_results=basic_results or [],
+            score=score,
+            market_ctx=market_ctx,
+        )
+        if not confirmation["passed"]:
+            return None
+
         synthetic_score = self._build_signal_snapshot_for_advanced(
             base=score,
             signal_result=signal_result,
@@ -544,11 +584,70 @@ class PortfolioEngine:
             return None
 
         target.source = f"advanced:{signal_result.name}"
+        confirm_label = confirmation.get("label") or "no-confirm-required"
         target.rationale = (
-            f"Advanced {signal_result.name} score={signal_result.score:.3f} triggered, "
-            + target.rationale
+            f"Advanced {signal_result.name} score={signal_result.score:.3f} triggered "
+            f"[{confirm_label}], " + target.rationale
         )
         return target
+
+    @classmethod
+    def _evaluate_advanced_confirmation(
+        cls,
+        *,
+        primary: AdvancedSignalResult,
+        primary_direction: str,
+        advanced_results: list[AdvancedSignalResult],
+        basic_results: list[AdvancedSignalResult],
+        score: ScoreSnapshot,
+        market_ctx: dict,
+    ) -> dict:
+        """Decide whether the primary advanced signal has independent backing.
+
+        Returns ``{"passed": bool, "label": str}``.  When confirmation isn't
+        required (env knob off) the gate auto-passes with label="disabled".
+        """
+        if not SIGNALS_ADVANCED_REQUIRE_CONFIRMATION:
+            return {"passed": True, "label": "confirm-disabled"}
+
+        confirmations: list[str] = []
+
+        # Another advanced signal triggered in the same direction.
+        for result in advanced_results or []:
+            if result is primary:
+                continue
+            triggered = bool((result.context or {}).get("triggered", False))
+            if not triggered:
+                continue
+            if cls._resolve_advanced_direction(result) != primary_direction:
+                continue
+            if abs(float(result.score)) < 0.25:
+                continue
+            confirmations.append(f"adv:{result.name}")
+            break
+
+        # Basic signal score in same direction above the basic cutoff.
+        basic_cutoff = float(SIGNALS_ADVANCED_MIN_BASIC_CONFIRM)
+        for result in basic_results or []:
+            score_val = float(result.score or 0.0)
+            if abs(score_val) < basic_cutoff:
+                continue
+            direction = cls._resolve_basic_direction(result)
+            if direction != primary_direction:
+                continue
+            confirmations.append(f"basic:{result.name}")
+            break
+
+        # MSI trend agrees and conviction clears the MSI cutoff.
+        msi_cutoff = float(SIGNALS_ADVANCED_MIN_MSI_CONFIRM)
+        msi_conviction = float(score.normalized_score or 0.0)
+        msi_direction = cls._msi_trend_direction(market_ctx)
+        if msi_conviction >= msi_cutoff and msi_direction == primary_direction:
+            confirmations.append(f"msi:{msi_conviction:.2f}")
+
+        if not confirmations:
+            return {"passed": False, "label": "no-confirmation"}
+        return {"passed": True, "label": "confirm=" + "+".join(confirmations)}
 
     def _strongest_advanced_signal(
         self,
