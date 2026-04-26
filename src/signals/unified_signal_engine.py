@@ -10,7 +10,9 @@ from contextlib import contextmanager
 from typing import Optional
 import os
 import json
+from datetime import timedelta
 
+from src.config import SIGNALS_GEX_STALE_BUFFER_SECONDS
 from src.database import db_connection
 from src.signals.basic.dealer_delta_pressure import DealerDeltaPressureComponent
 from src.signals.components.base import MarketContext
@@ -86,6 +88,17 @@ class UnifiedSignalEngine:
             pass
 
     def _fetch_market_context(self, conn=None) -> Optional[dict]:
+        # Phase 2.5: defensive look-ahead guard.  Option quotes are aggregated
+        # into 1-minute buckets stamped with the bucket start time, so a
+        # gex_summary row stamped 14:00 was actually computed from quotes
+        # arriving up to 14:00:59.  In live trading this is invisible — every
+        # cycle naturally consumes the most recent data — but a backtest
+        # replay at second-resolution would observe values computed up to
+        # ~60s in the future relative to replay time.  Subtracting
+        # SIGNALS_GEX_STALE_BUFFER_SECONDS from the anchor lets a backtest
+        # operator set the buffer to one bucket width (60s) without code
+        # changes; default 0 is a no-op for live.
+        gex_buffer_seconds = int(SIGNALS_GEX_STALE_BUFFER_SECONDS)
         with self._use_conn(conn) as conn:
             with conn.cursor() as cur:
                 # Fetch underlying quote + latest gex_summary ROW including
@@ -113,7 +126,8 @@ class UnifiedSignalEngine:
                                put_call_ratio, max_pain,
                                total_call_oi, total_put_oi
                         FROM gex_summary
-                        WHERE underlying = %s AND timestamp <= uq.timestamp
+                        WHERE underlying = %s
+                          AND timestamp <= uq.timestamp - (%s * INTERVAL '1 second')
                         ORDER BY timestamp DESC
                         LIMIT 1
                     ) gs ON TRUE
@@ -121,7 +135,7 @@ class UnifiedSignalEngine:
                     ORDER BY uq.timestamp DESC
                     LIMIT 1
                     """,
-                    (self.db_symbol, self.db_symbol),
+                    (self.db_symbol, gex_buffer_seconds, self.db_symbol),
                 )
                 row = cur.fetchone()
                 if not row:
@@ -211,7 +225,11 @@ class UnifiedSignalEngine:
                         """,
                         (
                             self.db_symbol,
-                            ts,
+                            # Phase 2.5 stale-buffer: see _fetch_market_context
+                            # docstring for rationale.  Default 0 is a no-op.
+                            ts - timedelta(seconds=gex_buffer_seconds)
+                            if gex_buffer_seconds
+                            else ts,
                             self.db_symbol,
                             close_f * 0.90,
                             close_f * 1.10,

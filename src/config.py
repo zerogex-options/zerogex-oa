@@ -443,6 +443,24 @@ SIGNALS_DRAWDOWN_TRIGGER_PCT = _getenv_float(
 SIGNALS_DRAWDOWN_SIZE_MULTIPLIER = _getenv_float(
     "SIGNALS_DRAWDOWN_SIZE_MULTIPLIER", 0.50, min=0.0, max=1.0
 )
+
+# -----------------------------------------------------------------------------
+# Look-ahead audit: GEX stale-buffer (Phase 2.5)
+# -----------------------------------------------------------------------------
+# The analytics engine aggregates option quotes into 1-minute buckets stamped
+# with the bucket's start time.  A row stamped 14:00 was therefore computed
+# from quotes that arrived up to 14:00:59 — a bounded but real look-ahead
+# window for any backtest replay at second-resolution.  Live trading is
+# unaffected (each cycle naturally consumes the most recent data).
+#
+# When set > 0, this buffer is subtracted from the underlying-quote anchor
+# timestamp in both the gex_summary lateral join and the gex_by_strike read,
+# effectively saying "only consider GEX rows whose aggregation window
+# closed at least N seconds ago".  Default 0 preserves live behavior; set
+# to ~60 (one bucket width) when running backtests.
+SIGNALS_GEX_STALE_BUFFER_SECONDS = _getenv_int(
+    "SIGNALS_GEX_STALE_BUFFER_SECONDS", 0, min=0, max=3600
+)
 SIGNALS_DRS_HARD_GATES_ENABLED = (
     os.getenv("SIGNALS_DRS_HARD_GATES_ENABLED", "true").lower() == "true"
 )
