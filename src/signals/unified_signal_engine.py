@@ -40,15 +40,14 @@ class UnifiedSignalEngine:
         self.db_symbol = get_canonical_symbol(self.underlying)
         components = [
             NetGexSignComponent(),
-            # Phase 2.1: gamma_anchor blends the three originals into one
-            # composite-contributing component.  flip_distance / local_gamma
-            # / price_vs_max_gamma stay registered below as zero-weight
-            # stubs so their scores still appear in the API components
-            # dict for front-end back-compat.
+            # Phase 2.1: gamma_anchor blends flip_distance + local_gamma +
+            # price_vs_max_gamma into one composite-contributing component.
+            # The three sub-component classes are still importable (and
+            # used internally as delegates by GammaAnchorComponent), they
+            # are just no longer registered as standalone MSI components.
+            # Their per-cycle subscores surface in the API via
+            # gamma_anchor's `context` field.
             GammaAnchorComponent(),
-            FlipDistanceComponent(),
-            LocalGammaComponent(),
-            PriceVsMaxGammaComponent(),
             PutCallRatioStateComponent(),
             VolatilityRegimeComponent(),
             # Phase 3.1: leading-indicator components added to MSI.

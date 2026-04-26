@@ -2,18 +2,18 @@
 
 Active (non-zero weight) components contributing to the 0-100 composite:
   - net_gex_sign           (16 pts)
-  - gamma_anchor           (30 pts)  [Phase 2.1, blends the three originals]
+  - gamma_anchor           (30 pts)  [Phase 2.1, blends three sub-signals]
   - put_call_ratio         (12 pts)
   - volatility_regime      (6  pts)
   - order_flow_imbalance   (19 pts)  [Phase 3.1; bumped +6 in Phase 2.1]
   - dealer_delta_pressure  (17 pts)  [Phase 3.1; bumped +5 in Phase 2.1]
 
-Deprecated zero-weight stubs (kept registered so their scores still
-appear in the API ``components`` dict for back-compat — see Phase 2.1
-notes in the PR / issue):
-  - flip_distance          (was 19 pts; logic now lives inside gamma_anchor)
-  - local_gamma            (was 15 pts; ditto)
-  - price_vs_max_gamma     (was  7 pts; ditto)
+The three former gamma-cluster classes (``FlipDistanceComponent``,
+``LocalGammaComponent``, ``PriceVsMaxGammaComponent``) remain importable
+because ``GammaAnchorComponent`` instantiates them internally as
+delegates to compute its blended score.  They are NOT registered as
+standalone MSI components anymore — their per-cycle subscores surface
+in the API via ``gamma_anchor``'s nested ``context`` field.
 
 Total active weight: 100 pts.  See ``ScoringEngine.COMPONENT_POINTS``
 for the authoritative table.

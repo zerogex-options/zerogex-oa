@@ -132,21 +132,12 @@ class TestGammaAnchorBlend:
 class TestGammaAnchorIntegrationWithScoringEngine:
     def test_gamma_anchor_drives_composite_when_strongly_anchored(self):
         """End-to-end: a strongly-anchored gamma_anchor reading shifts the
-        composite below 50 while the deprecated stubs contribute nothing."""
-        from src.signals.components.flip_distance import FlipDistanceComponent
-        from src.signals.components.local_gamma import LocalGammaComponent
-        from src.signals.components.price_vs_max_gamma import PriceVsMaxGammaComponent
+        composite below 50.  The three sub-signals are NOT registered as
+        standalone components anymore — their values appear nested in
+        gamma_anchor's `context` field instead."""
         from src.signals.scoring_engine import ScoringEngine
 
-        eng = ScoringEngine(
-            "SPY",
-            [
-                GammaAnchorComponent(),
-                FlipDistanceComponent(),       # zero-weight stub
-                LocalGammaComponent(),         # zero-weight stub
-                PriceVsMaxGammaComponent(),    # zero-weight stub
-            ],
-        )
+        eng = ScoringEngine("SPY", [GammaAnchorComponent()])
         ctx = _ctx(
             close=500.0,
             gamma_flip=480.0,           # anchored
@@ -157,7 +148,16 @@ class TestGammaAnchorIntegrationWithScoringEngine:
         snap, _ = eng.score(ctx)
         # gamma_anchor pulls strongly negative -> composite well below 50.
         assert snap.composite_score < 50.0
-        # The three deprecated stubs appear in the dict with 0 max_points.
+        # The former-cluster keys must NOT be standalone entries anymore.
         for name in ("flip_distance", "local_gamma", "price_vs_max_gamma"):
-            assert name in snap.components
-            assert snap.components[name]["max_points"] == 0.0
+            assert name not in snap.components
+        # But their subscores must surface inside gamma_anchor's context.
+        assert "gamma_anchor" in snap.components
+        ga_context = snap.components["gamma_anchor"]["context"]
+        for sub in (
+            "flip_distance_subscore",
+            "local_gamma_subscore",
+            "price_vs_max_gamma_subscore",
+            "blend_weights",
+        ):
+            assert sub in ga_context

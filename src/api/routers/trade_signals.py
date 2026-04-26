@@ -19,13 +19,17 @@ def _normalize_msi_components(value: Any) -> Any:
     if not isinstance(value, dict):
         return value
 
+    # Active MSI components after Phase 2.1: gamma_anchor replaces the three
+    # old gamma-cluster components (flip_distance / local_gamma /
+    # price_vs_max_gamma); their per-cycle scores remain visible nested
+    # inside gamma_anchor's `context` field.
     expected = {
         "net_gex_sign",
-        "flip_distance",
-        "local_gamma",
+        "gamma_anchor",
         "put_call_ratio",
-        "price_vs_max_gamma",
         "volatility_regime",
+        "order_flow_imbalance",
+        "dealer_delta_pressure",
     }
     out: dict[str, Any] = {}
     for name, payload in value.items():
@@ -35,11 +39,19 @@ def _normalize_msi_components(value: Any) -> Any:
         contribution = payload.get("contribution")
         score = payload.get("score")
         if isinstance(points, (int, float)) and isinstance(contribution, (int, float)):
-            out[name] = {
+            entry: dict[str, Any] = {
                 "max_points": float(points),
                 "contribution": round(float(contribution), 4),
                 "score": round(float(score), 6) if isinstance(score, (int, float)) else score,
             }
+            # Pass the per-component context dict through when the engine
+            # populates one — this is where gamma_anchor exposes its three
+            # subscores (flip_distance_subscore, local_gamma_subscore,
+            # price_vs_max_gamma_subscore) plus the blend weights.
+            context = payload.get("context")
+            if isinstance(context, dict) and context:
+                entry["context"] = context
+            out[name] = entry
     return out
 
 
@@ -185,24 +197,40 @@ async def get_latest_score(
 
     | Component | Max pts | What it measures |
     |---|---|---|
-    | `net_gex_sign` | 20 | Sign of dealer net gamma |
-    | `flip_distance` | 25 | Proximity to gamma-flip strike |
-    | `local_gamma` | 20 | Gamma density near spot |
-    | `put_call_ratio` | 15 | OI-weighted P/C tilt |
-    | `price_vs_max_gamma` | 10 | Distance from max-gamma strike |
-    | `volatility_regime` | 10 | Realized/VIX regime |
+    | `net_gex_sign` | 16 | Sign of dealer net gamma |
+    | `gamma_anchor` | 30 | Blended proximity to gamma flip / local gamma density / max-gamma strike |
+    | `put_call_ratio` | 12 | OI-weighted P/C tilt |
+    | `volatility_regime` | 6 | Realized/VIX regime |
+    | `order_flow_imbalance` | 19 | Smart-money premium-weighted call vs put flow |
+    | `dealer_delta_pressure` | 17 | Dealer net delta forced-hedge direction |
+
+    `gamma_anchor` exposes its three sub-signals nested under `context`:
+    `flip_distance_subscore`, `local_gamma_subscore`, `price_vs_max_gamma_subscore`,
+    plus the active `blend_weights`. Use those for the per-sub-signal breakdown
+    that previously appeared as standalone components.
 
     **Returns:**
     ```json
     {
       "composite_score": 63.42,
       "components": {
-        "net_gex_sign":       {"max_points": 20, "contribution":  12.00, "score":  0.6},
-        "flip_distance":      {"max_points": 25, "contribution":   5.25, "score":  0.21},
-        "local_gamma":        {"max_points": 20, "contribution":  -8.40, "score": -0.42},
-        "put_call_ratio":     {"max_points": 15, "contribution":   3.00, "score":  0.2},
-        "price_vs_max_gamma": {"max_points": 10, "contribution":   1.70, "score":  0.17},
-        "volatility_regime":  {"max_points": 10, "contribution":  -0.13, "score": -0.013}
+        "net_gex_sign":          {"max_points": 16, "contribution":  9.60, "score":  0.6},
+        "gamma_anchor":          {
+          "max_points": 30,
+          "contribution":  -2.10,
+          "score": -0.07,
+          "context": {
+            "score": -0.07,
+            "flip_distance_subscore":  0.21,
+            "local_gamma_subscore":   -0.42,
+            "price_vs_max_gamma_subscore": 0.17,
+            "blend_weights": {"flip_distance": 0.45, "local_gamma": 0.35, "price_vs_max_gamma": 0.20}
+          }
+        },
+        "put_call_ratio":        {"max_points": 12, "contribution":  2.40, "score":  0.2},
+        "volatility_regime":     {"max_points":  6, "contribution": -0.08, "score": -0.013},
+        "order_flow_imbalance":  {"max_points": 19, "contribution":  6.65, "score":  0.35},
+        "dealer_delta_pressure": {"max_points": 17, "contribution":  3.40, "score":  0.2}
       }
     }
     ```
@@ -211,6 +239,8 @@ async def get_latest_score(
     - `components[*].max_points` — the component's weight ceiling.
     - `components[*].contribution` — signed points added to the baseline, rounded to 4 decimals.
     - `components[*].score` — raw component score [-1, +1], 6-decimal precision.
+    - `components[*].context` — optional, present when the component emits diagnostic
+      sub-fields (e.g. `gamma_anchor` exposes its three subscores here).
 
     **Regime interpretation:**
     - **≥ 70** — trend/expansion; favor directional trades in the prevailing bias.
@@ -220,6 +250,9 @@ async def get_latest_score(
 
     **Page design.** Big radial gauge (0–100). Horizontal bar stack below showing
     each component's signed contribution. Hover for `score` and `max_points`.
+    For `gamma_anchor` specifically, render a smaller secondary breakdown of the
+    three subscores from `context` so operators retain visibility into which
+    sub-signal is driving the blended reading.
     """
     row = await db.get_latest_signal_score_enriched(underlying.upper())
     if not row:
@@ -248,12 +281,15 @@ async def get_score_history(
         "timestamp": "2026-04-22T18:55:00Z",
         "composite_score": 63.42,
         "components": {
-          "net_gex_sign":       {"max_points": 20, "contribution":  12.00, "score":  0.6},
-          "flip_distance":      {"max_points": 25, "contribution":   5.25, "score":  0.21},
-          "local_gamma":        {"max_points": 20, "contribution":  -8.40, "score": -0.42},
-          "put_call_ratio":     {"max_points": 15, "contribution":   3.00, "score":  0.2},
-          "price_vs_max_gamma": {"max_points": 10, "contribution":   1.70, "score":  0.17},
-          "volatility_regime":  {"max_points": 10, "contribution":  -0.13, "score": -0.013}
+          "net_gex_sign":          {"max_points": 16, "contribution":  9.60, "score":  0.6},
+          "gamma_anchor":          {"max_points": 30, "contribution": -2.10, "score": -0.07,
+                                    "context": {"flip_distance_subscore": 0.21,
+                                                "local_gamma_subscore": -0.42,
+                                                "price_vs_max_gamma_subscore": 0.17}},
+          "put_call_ratio":        {"max_points": 12, "contribution":  2.40, "score":  0.2},
+          "volatility_regime":     {"max_points":  6, "contribution": -0.08, "score": -0.013},
+          "order_flow_imbalance":  {"max_points": 19, "contribution":  6.65, "score":  0.35},
+          "dealer_delta_pressure": {"max_points": 17, "contribution":  3.40, "score":  0.2}
         }
       }
     ]

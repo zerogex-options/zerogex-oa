@@ -77,16 +77,11 @@ def test_market_state_score_floor_at_zero():
     assert snap.direction == "high_risk_reversal"
 
 
-def test_deprecated_stubs_do_not_move_composite():
-    """Phase 2.1 invariant: flip_distance / local_gamma / price_vs_max_gamma
-    are kept registered with weight 0 so their per-cycle scores still appear
-    in the components dict but cannot move composite_score."""
-    deprecated = ["flip_distance", "local_gamma", "price_vs_max_gamma"]
-    eng = _engine({name: 1.0 for name in deprecated}, names=deprecated)
+def test_unregistered_components_yield_default_max_points():
+    """Components without a COMPONENT_POINTS entry fall back to ``weight * 100``.
+    The fake components used here have ``weight = 0.0``, so an unregistered name
+    contributes 0 to the composite — exercises the fallback path."""
+    eng = _engine({"unknown_component": 1.0}, names=["unknown_component"])
     snap, _ = eng.score(_ctx())
-    assert snap.composite_score == 50.0  # base only — stubs contributed 0
-    # But they should still appear in the components payload with score=1.0.
-    for name in deprecated:
-        assert name in snap.components
-        assert snap.components[name]["score"] == 1.0
-        assert snap.components[name]["max_points"] == 0.0
+    assert snap.composite_score == 50.0
+    assert snap.components["unknown_component"]["max_points"] == 0.0

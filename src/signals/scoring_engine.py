@@ -28,13 +28,11 @@ class ScoringEngine:
     #
     # Phase 2.1 collapsed the three correlated gamma-anchor components
     # (flip_distance / local_gamma / price_vs_max_gamma) into a single
-    # 30-pt ``gamma_anchor`` that internally blends them.  The originals
-    # remain registered in unified_signal_engine.py with weight 0 so
-    # their per-cycle scores still appear in the API ``components`` dict
-    # (front-end visualizations relying on those keys keep working) but
-    # they no longer move composite_score.  The 11 pts freed by the
-    # collapse went to the two leading-indicator components added in
-    # Phase 3.1 (order_flow_imbalance + dealer_delta_pressure).
+    # 30-pt ``gamma_anchor`` that internally blends them.  Their three
+    # sub-scores remain visible nested inside gamma_anchor's `context`
+    # field in the API response.  The 11 pts freed by the collapse went
+    # to the two leading-indicator components added in Phase 3.1
+    # (order_flow_imbalance + dealer_delta_pressure).
     COMPONENT_POINTS: dict[str, float] = {
         "net_gex_sign": 16.0,
         "gamma_anchor": 30.0,
@@ -42,10 +40,6 @@ class ScoringEngine:
         "volatility_regime": 6.0,
         "order_flow_imbalance": 19.0,  # Phase 3.1 13 -> 19 (+6)
         "dealer_delta_pressure": 17.0,  # Phase 3.1 12 -> 17 (+5)
-        # Deprecated zero-weight stubs — kept for API back-compat (Phase 2.1).
-        "flip_distance": 0.0,
-        "local_gamma": 0.0,
-        "price_vs_max_gamma": 0.0,
     }
 
     def __init__(self, underlying: str, components: list[ComponentBase]):
@@ -76,11 +70,23 @@ class ScoringEngine:
             contribution = points * clamped
             total_points += contribution
             component_results.append((component, clamped))
-            payload[component.name] = {
+            entry: dict = {
                 "score": round(clamped, 6),
                 "max_points": round(points, 2),
                 "contribution": round(contribution, 6),
             }
+            # Components may emit diagnostic sub-fields via context_values()
+            # (e.g. gamma_anchor exposes its three subscores + blend weights).
+            # Surface them under `context` so the API can render the same
+            # detail without separate component entries.  Failures here are
+            # non-fatal — the score itself is the contract.
+            try:
+                ctx_payload = component.context_values(ctx) or {}
+            except Exception:
+                ctx_payload = {}
+            if ctx_payload:
+                entry["context"] = ctx_payload
+            payload[component.name] = entry
 
         composite = max(0.0, min(100.0, total_points))
         normalized = composite / 100.0
