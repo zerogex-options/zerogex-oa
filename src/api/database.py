@@ -115,7 +115,6 @@ from src.api.queries._sql_helpers import (
     _timeframe_view_suffix,
 )
 
-
 # option_chains rows are UPSERTed in 60-second buckets: every contract that
 # ticks within a minute is rewritten to the same `timestamp`, and each write
 # bumps `updated_at` to NOW(). The bucket for the current minute is therefore

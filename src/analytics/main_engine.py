@@ -1140,12 +1140,10 @@ class AnalyticsEngine:
                 )
 
                 # Retention policy: keep only recent smart-money cache rows
-                cursor.execute(
-                    """
+                cursor.execute("""
                     DELETE FROM flow_smart_money
                     WHERE timestamp < NOW() - INTERVAL '7 days'
-                """
-                )
+                """)
 
                 conn.commit()
                 self._last_flow_cache_ts = timestamp

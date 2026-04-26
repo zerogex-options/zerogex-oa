@@ -217,14 +217,12 @@ class IngestionEngine:
                 cursor = conn.cursor()
 
                 # Check if tables exist
-                cursor.execute(
-                    """
+                cursor.execute("""
                     SELECT table_name 
                     FROM information_schema.tables 
                     WHERE table_schema = 'public' 
                     AND table_name IN ('underlying_quotes', 'option_chains')
-                """
-                )
+                """)
 
                 existing_tables = [row[0] for row in cursor.fetchall()]
 
@@ -372,7 +370,9 @@ class IngestionEngine:
                 data["delta"] = data["gamma"] = data["theta"] = data["vega"] = None
         elif self.greeks_calculator and not self.latest_underlying_price:
             if self.greeks_calculated == 0:
-                logger.warning("⚠️  Skipping Greeks calculation - no underlying price available yet")
+                logger.warning(
+                    "⚠️  Skipping Greeks calculation - no underlying price available yet"
+                )
             data["delta"] = data["gamma"] = data["theta"] = data["vega"] = None
         else:
             data["delta"] = data["gamma"] = data["theta"] = data["vega"] = None
