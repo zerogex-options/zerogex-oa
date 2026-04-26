@@ -381,6 +381,42 @@ SIGNALS_ADVANCED_MIN_BASIC_CONFIRM = _getenv_float(
 SIGNALS_ADVANCED_MIN_MSI_CONFIRM = _getenv_float(
     "SIGNALS_ADVANCED_MIN_MSI_CONFIRM", 0.50, min=0.0, max=1.0
 )
+
+# -----------------------------------------------------------------------------
+# Adaptive expiry selection (Phase 3.3)
+# -----------------------------------------------------------------------------
+# In the first N minutes after the open, 0DTE pricing is dominated by
+# overnight risk-premium repricing and gamma flips around dealer hedging
+# orders — a coin-flip window.  Bump optimizer dte_min from 0 to 1 inside
+# this window so we reach for 1-2 DTE structures with theta protection.
+# Set to 0 to disable.
+SIGNALS_NO_0DTE_MORNING_MINUTES = _getenv_int(
+    "SIGNALS_NO_0DTE_MORNING_MINUTES", 90, min=0, max=390
+)
+
+# -----------------------------------------------------------------------------
+# Inflection-point sizing boost (Phase 3.2)
+# -----------------------------------------------------------------------------
+# When the entry source is a "directional expansion" advanced signal
+# (range_break_imminence, squeeze_setup), apply a sizing multiplier and
+# widen the take-profit target relative to the standard SIGNALS_TARGET_PCT.
+# These signals predict directional expansion, so they deserve more risk
+# capital and more room to run before the take-profit fires.
+SIGNALS_BREAKOUT_SIZE_MULTIPLIER = _getenv_float(
+    "SIGNALS_BREAKOUT_SIZE_MULTIPLIER", 1.50, min=0.0, max=4.0
+)
+SIGNALS_BREAKOUT_TARGET_PCT = _getenv_float(
+    "SIGNALS_BREAKOUT_TARGET_PCT", 1.00, min=0.0
+)
+# Comma-separated list of advanced-signal names eligible for the boost.
+SIGNALS_BREAKOUT_SIGNAL_SOURCES = [
+    item.strip().lower()
+    for item in os.getenv(
+        "SIGNALS_BREAKOUT_SIGNAL_SOURCES",
+        "range_break_imminence,squeeze_setup",
+    ).split(",")
+    if item.strip()
+]
 SIGNALS_DRS_HARD_GATES_ENABLED = (
     os.getenv("SIGNALS_DRS_HARD_GATES_ENABLED", "true").lower() == "true"
 )

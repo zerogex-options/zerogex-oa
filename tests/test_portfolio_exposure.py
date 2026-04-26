@@ -1361,6 +1361,97 @@ class TestAdvancedConfirmationGate:
         assert "adv:vol_expansion" in result["label"]
 
 
+class TestAdaptiveExpirySelection:
+    """Phase 3.3: 0DTE is suppressed in the first N minutes after the open."""
+
+    def test_dte_min_bumped_to_one_in_morning_window(self):
+        # 09:50 ET (= 13:50 UTC), 20 minutes into the session — inside default
+        # 90-minute no-0DTE window.
+        ts = datetime(2026, 4, 28, 13, 50, tzinfo=timezone.utc)
+        dte_min, dte_max = PortfolioEngine._resolve_dte_window("intraday", ts)
+        assert dte_min == 1
+        assert dte_max >= 1
+
+    def test_dte_window_unchanged_after_morning_cutoff(self):
+        # 11:30 ET — past the default 90-minute window.
+        ts = datetime(2026, 4, 28, 15, 30, tzinfo=timezone.utc)
+        dte_min, dte_max = PortfolioEngine._resolve_dte_window("intraday", ts)
+        # intraday window is (0, 2) per TARGET_DTE_WINDOWS — 0DTE re-enabled.
+        assert dte_min == 0
+
+    def test_swing_window_never_includes_0dte(self):
+        # Swing fetches 1-7 DTE regardless of time-of-day; the no-0DTE filter
+        # should be a no-op since base_min already > 0.
+        ts = datetime(2026, 4, 28, 13, 35, tzinfo=timezone.utc)
+        dte_min, dte_max = PortfolioEngine._resolve_dte_window("swing", ts)
+        assert dte_min == 1
+        assert dte_max == 7
+
+
+class TestBreakoutBoost:
+    """Phase 3.2: breakout-eligible advanced signals get bigger size and a
+    wider take-profit target via per-trade overrides."""
+
+    @staticmethod
+    def _target(direction: str = "bullish", contracts: int = 4) -> PortfolioTarget:
+        return PortfolioTarget(
+            underlying="SPY",
+            timestamp=NOW,
+            composite_score=60.0,
+            normalized_score=0.6,
+            direction=direction,
+            target_positions=[
+                TargetPosition(
+                    direction=direction,
+                    strategy_type="bull_call_debit",
+                    contracts=contracts,
+                    option_symbol="SPY 260417C500",
+                    option_type="C",
+                    expiration=date(2026, 4, 17),
+                    strike=500.0,
+                    entry_mark=2.50,
+                    probability_of_profit=0.55,
+                    expected_value=20.0,
+                    kelly_fraction=0.10,
+                    optimizer_payload={"pricing_mode": "debit"},
+                )
+            ],
+            total_target_contracts=contracts,
+            target_heat_pct=0.005,
+            rationale="optimizer base",
+        )
+
+    def test_breakout_signal_scales_contracts_and_stamps_override(self):
+        target = self._target(contracts=4)
+        label = PortfolioEngine._apply_breakout_boost(target, "range_break_imminence")
+        assert label is not None and "breakout-boost" in label
+        # 4 * 1.50 = 6 contracts.
+        assert target.target_positions[0].contracts == 6
+        assert target.total_target_contracts == 6
+        # Per-trade target_pct override now lives on the optimizer payload.
+        risk_overrides = target.target_positions[0].optimizer_payload["risk_overrides"]
+        assert risk_overrides["target_pct"] == 1.00
+        assert risk_overrides["breakout_boost"]["signal"] == "range_break_imminence"
+
+    def test_non_breakout_signal_leaves_target_unchanged(self):
+        target = self._target(contracts=4)
+        label = PortfolioEngine._apply_breakout_boost(target, "vol_expansion")
+        assert label is None
+        assert target.target_positions[0].contracts == 4
+        assert "risk_overrides" not in target.target_positions[0].optimizer_payload
+
+    def test_risk_plan_uses_overridden_target_pct(self):
+        engine = _make_engine()
+        target = self._target(contracts=4)
+        PortfolioEngine._apply_breakout_boost(target, "squeeze_setup")
+        tp = target.target_positions[0]
+        risk = engine._build_risk_plan(tp, NOW)
+        # Default target_pct=0.50 would put target at 2.50 * 1.50 = 3.75.
+        # Boost target_pct=1.00 widens to 2.50 * 2.00 = 5.00.
+        assert risk["target_price"] == pytest.approx(5.00)
+        assert risk["target_pct"] == 1.00
+
+
 class TestRegimeFilterIntegration:
     """compute_target_with_advanced_signals should ask the regime filter
     whether to suppress *new* entries (no held position OR opposite direction).

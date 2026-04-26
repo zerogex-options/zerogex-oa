@@ -26,6 +26,9 @@ from src.config import (
     SIGNALS_ADVANCED_MIN_BASIC_CONFIRM,
     SIGNALS_ADVANCED_MIN_MSI_CONFIRM,
     SIGNALS_ADVANCED_REQUIRE_CONFIRMATION,
+    SIGNALS_BREAKOUT_SIGNAL_SOURCES,
+    SIGNALS_BREAKOUT_SIZE_MULTIPLIER,
+    SIGNALS_BREAKOUT_TARGET_PCT,
     SIGNALS_CONFLUENCE_ADVANCED_WEIGHT,
     SIGNALS_CONFLUENCE_ENABLED,
     SIGNALS_CONFLUENCE_MIN_AGREE,
@@ -43,6 +46,7 @@ from src.config import (
     SIGNALS_MAX_OPEN_TRADES,
     SIGNALS_MAX_PORTFOLIO_HEAT_PCT,
     SIGNALS_MIN_HOLD_SECONDS,
+    SIGNALS_NO_0DTE_MORNING_MINUTES,
     SIGNALS_PORTFOLIO_SIZE,
     SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES,
     SIGNALS_SCALP_SIZE_MULTIPLIER,
@@ -585,11 +589,65 @@ class PortfolioEngine:
 
         target.source = f"advanced:{signal_result.name}"
         confirm_label = confirmation.get("label") or "no-confirm-required"
+
+        boost_label = self._apply_breakout_boost(target, signal_result.name)
+
         target.rationale = (
             f"Advanced {signal_result.name} score={signal_result.score:.3f} triggered "
-            f"[{confirm_label}], " + target.rationale
+            f"[{confirm_label}]"
+            + (f" [{boost_label}]" if boost_label else "")
+            + ", "
+            + target.rationale
         )
         return target
+
+    @staticmethod
+    def _apply_breakout_boost(
+        target: PortfolioTarget, signal_name: str
+    ) -> Optional[str]:
+        """Apply Phase 3.2 sizing/target boost when the trigger is a directional-
+        expansion advanced signal (range_break_imminence, squeeze_setup, etc.).
+
+        Mutates ``target`` in place: scales contracts and stamps a per-trade
+        target_pct override into the optimizer payload so the risk plan widens
+        the take-profit on this specific trade.  Returns a short human-readable
+        label for the rationale, or ``None`` when no boost was applied.
+        """
+        eligible = {name.lower() for name in SIGNALS_BREAKOUT_SIGNAL_SOURCES}
+        if signal_name.lower() not in eligible:
+            return None
+        if not target.target_positions:
+            return None
+
+        size_mult = float(SIGNALS_BREAKOUT_SIZE_MULTIPLIER)
+        widen_target_pct = float(SIGNALS_BREAKOUT_TARGET_PCT)
+
+        boosted_total = 0
+        for tp in target.target_positions:
+            scaled = max(int(round(tp.contracts * size_mult)), tp.contracts)
+            tp.contracts = scaled
+            payload = dict(tp.optimizer_payload or {})
+            risk_overrides = dict(payload.get("risk_overrides") or {})
+            if widen_target_pct > 0:
+                risk_overrides["target_pct"] = widen_target_pct
+            risk_overrides["breakout_boost"] = {
+                "signal": signal_name,
+                "size_multiplier": size_mult,
+                "target_pct": widen_target_pct,
+            }
+            payload["risk_overrides"] = risk_overrides
+            tp.optimizer_payload = payload
+            boosted_total += scaled
+
+        target.total_target_contracts = boosted_total
+        if target.target_positions:
+            primary = target.target_positions[0]
+            target.target_heat_pct = round(
+                abs(primary.entry_mark) * boosted_total * 100
+                / max(SIGNALS_PORTFOLIO_SIZE, 1.0),
+                6,
+            )
+        return f"breakout-boost x{size_mult:.2f} target={widen_target_pct:.0%}"
 
     @classmethod
     def _evaluate_advanced_confirmation(
@@ -1551,15 +1609,22 @@ class PortfolioEngine:
         (cost-to-close drops below entry on a winner).
         """
         entry = float(tp.entry_mark or 0.0)
+        payload = tp.optimizer_payload or {}
         pricing_mode = (
-            (tp.optimizer_payload or {}).get("pricing_mode")
+            payload.get("pricing_mode")
             or ("credit" if "credit" in (tp.strategy_type or "") else "debit")
         )
 
         # SIGNALS_STOP_LOSS_PCT is signed negative (-0.25 = 25% loss tolerance);
         # SIGNALS_TARGET_PCT is unsigned (+0.50 = +50% profit target).
+        # Per-trade target_pct override (Phase 3.2 breakout-boost) wins over
+        # the default when present.
         stop_drift = float(self.stop_loss_pct or 0.0)
-        target_drift = float(self.target_pct or 0.0)
+        risk_overrides = payload.get("risk_overrides") or {}
+        if "target_pct" in risk_overrides:
+            target_drift = float(risk_overrides.get("target_pct") or 0.0)
+        else:
+            target_drift = float(self.target_pct or 0.0)
         if pricing_mode == "credit":
             # Credit: winner = mark falls; loser = mark rises.
             stop_price = entry * (1.0 + abs(stop_drift)) if entry > 0 else 0.0
@@ -1743,7 +1808,7 @@ class PortfolioEngine:
     ) -> Optional[dict]:
         signal_timeframe = forced_timeframe or self._infer_signal_timeframe(score.composite_score)
         signal_strength = self._infer_signal_strength(score.composite_score)
-        dte_min, dte_max = TARGET_DTE_WINDOWS.get(signal_timeframe, (1, 7))
+        dte_min, dte_max = self._resolve_dte_window(signal_timeframe, score.timestamp)
 
         option_rows = None
         if cached_option_rows is not None:
@@ -1870,6 +1935,38 @@ class PortfolioEngine:
         if msi_score >= 40.0:
             return "intraday"
         return "intraday"
+
+    @staticmethod
+    def _resolve_dte_window(
+        signal_timeframe: str, timestamp: datetime
+    ) -> tuple[int, int]:
+        """Return the (dte_min, dte_max) window for the optimizer fetch.
+
+        Phase 3.3: prevent 0DTE fills early in the session.  In the first
+        ``SIGNALS_NO_0DTE_MORNING_MINUTES`` minutes after the open, gamma is
+        non-stationary and 0DTE prices are dominated by overnight risk
+        premium repricing — a coin-flip window.  Bump dte_min from 0 to 1
+        in that window so the optimizer reaches for 1-2 DTE structures
+        with theta protection.
+        """
+        base_min, base_max = TARGET_DTE_WINDOWS.get(signal_timeframe, (1, 7))
+        no_zero_minutes = int(SIGNALS_NO_0DTE_MORNING_MINUTES)
+        if no_zero_minutes <= 0 or base_min > 0:
+            return base_min, base_max
+
+        if timestamp.tzinfo is None:
+            ts_et = ET.localize(timestamp)
+        else:
+            ts_et = timestamp.astimezone(ET)
+
+        market_open_dt = datetime.combine(
+            ts_et.date(), datetime.strptime("09:30", "%H:%M").time(), tzinfo=ts_et.tzinfo,
+        )
+        cutoff_dt = market_open_dt + timedelta(minutes=no_zero_minutes)
+        if market_open_dt <= ts_et < cutoff_dt:
+            # Bump dte_min to 1 but keep dte_max so we still get 1-2 DTE.
+            return max(base_min, 1), max(base_max, 1)
+        return base_min, base_max
 
     @staticmethod
     def _legs_from_candidate(candidate: dict) -> list[dict]:
