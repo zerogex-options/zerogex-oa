@@ -1452,6 +1452,171 @@ class TestBreakoutBoost:
         assert risk["target_pct"] == 1.00
 
 
+class TestAttributionMetadata:
+    """Phase 4.1: every opened trade carries source/regime/composite/time
+    bucket metadata in components_at_entry["attribution"]."""
+
+    def _target(
+        self,
+        *,
+        composite: float = 65.0,
+        direction: str = "bullish",
+        source: str = "advanced:squeeze_setup",
+        rationale: str = "test rationale",
+    ) -> PortfolioTarget:
+        return PortfolioTarget(
+            underlying="SPY",
+            timestamp=datetime(2026, 4, 28, 14, 0, tzinfo=timezone.utc),  # 10:00 ET
+            composite_score=composite,
+            normalized_score=composite / 100.0,
+            direction=direction,
+            target_positions=[
+                TargetPosition(
+                    direction=direction,
+                    strategy_type="bull_call_debit",
+                    contracts=4,
+                    option_symbol="SPY 260417C500",
+                    option_type="C",
+                    expiration=date(2026, 4, 17),
+                    strike=500.0,
+                    entry_mark=2.5,
+                    probability_of_profit=0.55,
+                    expected_value=20.0,
+                    kelly_fraction=0.10,
+                    optimizer_payload={
+                        "pricing_mode": "debit",
+                        "drawdown_multiplier": 1.0,
+                    },
+                )
+            ],
+            total_target_contracts=4,
+            target_heat_pct=0.005,
+            rationale=rationale,
+            source=source,
+        )
+
+    def test_attribution_captures_source_and_regime(self):
+        engine = _make_engine()
+        target = self._target(composite=65.0)
+        attribution = engine._build_attribution(target, target.target_positions[0])
+        assert attribution["source"] == "advanced:squeeze_setup"
+        assert attribution["regime"] == "controlled_trend"  # 40 <= 65 < 70
+        assert attribution["composite_score"] == 65.0
+        assert attribution["direction"] == "bullish"
+
+    def test_attribution_classifies_open_morning_lunch_afternoon_close(self):
+        engine = _make_engine()
+        cases = [
+            (datetime(2026, 4, 28, 13, 45, tzinfo=timezone.utc), "open"),       # 09:45 ET
+            (datetime(2026, 4, 28, 15, 0, tzinfo=timezone.utc), "morning"),     # 11:00 ET
+            (datetime(2026, 4, 28, 16, 30, tzinfo=timezone.utc), "lunch"),      # 12:30 ET
+            (datetime(2026, 4, 28, 18, 30, tzinfo=timezone.utc), "afternoon"),  # 14:30 ET
+            (datetime(2026, 4, 28, 19, 45, tzinfo=timezone.utc), "close"),      # 15:45 ET
+        ]
+        for ts, expected in cases:
+            target = self._target()
+            target.timestamp = ts
+            attribution = engine._build_attribution(target, target.target_positions[0])
+            assert attribution["time_bucket"] == expected, f"{ts} -> {attribution['time_bucket']}"
+
+    def test_attribution_records_breakout_boost_when_present(self):
+        engine = _make_engine()
+        target = self._target(source="advanced:squeeze_setup")
+        # Simulate that _apply_breakout_boost has stamped overrides.
+        target.target_positions[0].optimizer_payload["risk_overrides"] = {
+            "target_pct": 1.0,
+            "breakout_boost": {
+                "signal": "squeeze_setup",
+                "size_multiplier": 1.5,
+                "target_pct": 1.0,
+            },
+        }
+        attribution = engine._build_attribution(target, target.target_positions[0])
+        assert attribution["breakout_boost_applied"] is True
+        assert attribution["boost_size_multiplier"] == 1.5
+        assert attribution["boost_target_pct"] == 1.0
+
+    def test_attribution_persisted_when_opening_position(self):
+        """End-to-end: _open_position writes the attribution sub-block."""
+        engine = _make_engine()
+        target = self._target()
+        captured = {}
+
+        class _RecordingCursor:
+            def execute(self_, sql, params):
+                captured["params"] = params
+
+        class _RecordingConn:
+            def cursor(self_):
+                cur = _RecordingCursor()
+                cur.rowcount = 1
+                return cur
+
+        engine._open_position(target.target_positions[0], target, _RecordingConn())
+        # components_at_entry is the last positional parameter (json-encoded).
+        components_json = captured["params"][-1]
+        assert "attribution" in components_json
+        assert "source" in components_json
+        assert "regime" in components_json
+        assert "time_bucket" in components_json
+
+
+class TestDrawdownAwareSizing:
+    """Phase 4.3: rolling-PnL circuit breaker pulls size back after losses."""
+
+    def _conn_with_pnl(self, pnl_rows: list[float]):
+        cur = MagicMock()
+        cur.fetchall.return_value = [(p,) for p in pnl_rows]
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        return conn
+
+    def test_no_drawdown_engaged_when_rolling_pnl_positive(self):
+        engine = _make_engine()
+        # 10 winners summing to +$5,000 — no breaker.
+        conn = self._conn_with_pnl([500.0] * 10)
+        state = engine._drawdown_sizing_state(conn=conn)
+        assert state["engaged"] is False
+        assert state["multiplier"] == 1.0
+
+    def test_drawdown_engaged_when_rolling_pnl_below_trigger(self):
+        engine = _make_engine()
+        # Default trigger: -2% of $1M = -$20,000.  Sum of -$25,000 trips it.
+        conn = self._conn_with_pnl([-2500.0] * 10)
+        state = engine._drawdown_sizing_state(conn=conn)
+        assert state["engaged"] is True
+        assert state["multiplier"] == 0.50  # default SIGNALS_DRAWDOWN_SIZE_MULTIPLIER
+        assert state["rolling_pnl"] <= -20000.0
+
+    def test_drawdown_state_safe_under_db_failure(self):
+        engine = _make_engine()
+        conn = MagicMock()
+        conn.cursor.side_effect = RuntimeError("db down")
+        state = engine._drawdown_sizing_state(conn=conn)
+        assert state["multiplier"] == 1.0
+        assert state["engaged"] is False
+
+    def test_drawdown_disabled_when_env_off(self, monkeypatch):
+        monkeypatch.setenv("SIGNALS_DRAWDOWN_AWARE_SIZING_ENABLED", "false")
+        # Reload config + module so the disabled flag takes effect.
+        import importlib
+        import src.config as config
+        import src.signals.portfolio_engine as pe
+
+        importlib.reload(config)
+        importlib.reload(pe)
+        with patch("src.signals.portfolio_engine.get_canonical_symbol", return_value="SPY"):
+            engine = pe.PortfolioEngine("SPY")
+        conn = self._conn_with_pnl([-9_999_999.0])  # extreme loss
+        state = engine._drawdown_sizing_state(conn=conn)
+        assert state["engaged"] is False
+        assert state["multiplier"] == 1.0
+        # Restore default state for downstream tests.
+        monkeypatch.delenv("SIGNALS_DRAWDOWN_AWARE_SIZING_ENABLED", raising=False)
+        importlib.reload(config)
+        importlib.reload(pe)
+
+
 class TestRegimeFilterIntegration:
     """compute_target_with_advanced_signals should ask the regime filter
     whether to suppress *new* entries (no held position OR opposite direction).

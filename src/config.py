@@ -417,6 +417,32 @@ SIGNALS_BREAKOUT_SIGNAL_SOURCES = [
     ).split(",")
     if item.strip()
 ]
+
+# -----------------------------------------------------------------------------
+# Drawdown-aware sizing (Phase 4.3)
+# -----------------------------------------------------------------------------
+# Rolling-PnL circuit breaker.  After every cycle the engine sums the
+# realized PnL of the last SIGNALS_DRAWDOWN_LOOKBACK_TRADES closed trades
+# (per symbol).  If that sum drops below
+# -SIGNALS_DRAWDOWN_TRIGGER_PCT × SIGNALS_PORTFOLIO_SIZE the new-entry
+# sizing is multiplied by SIGNALS_DRAWDOWN_SIZE_MULTIPLIER until the
+# rolling sum recovers.  Standard Kelly assumes independent trials; this
+# accounts for the fact that consecutive losses usually mean we're in a
+# regime the model is reading wrong.
+SIGNALS_DRAWDOWN_AWARE_SIZING_ENABLED = _getenv_bool(
+    "SIGNALS_DRAWDOWN_AWARE_SIZING_ENABLED", True
+)
+SIGNALS_DRAWDOWN_LOOKBACK_TRADES = _getenv_int(
+    "SIGNALS_DRAWDOWN_LOOKBACK_TRADES", 20, min=1, max=500
+)
+# Trigger as a fraction of portfolio size.  0.02 = 2% of equity.
+SIGNALS_DRAWDOWN_TRIGGER_PCT = _getenv_float(
+    "SIGNALS_DRAWDOWN_TRIGGER_PCT", 0.02, min=0.0, max=1.0
+)
+# Sizing multiplier applied while the breaker is engaged.  0.50 = half-size.
+SIGNALS_DRAWDOWN_SIZE_MULTIPLIER = _getenv_float(
+    "SIGNALS_DRAWDOWN_SIZE_MULTIPLIER", 0.50, min=0.0, max=1.0
+)
 SIGNALS_DRS_HARD_GATES_ENABLED = (
     os.getenv("SIGNALS_DRS_HARD_GATES_ENABLED", "true").lower() == "true"
 )

@@ -29,6 +29,10 @@ from src.config import (
     SIGNALS_BREAKOUT_SIGNAL_SOURCES,
     SIGNALS_BREAKOUT_SIZE_MULTIPLIER,
     SIGNALS_BREAKOUT_TARGET_PCT,
+    SIGNALS_DRAWDOWN_AWARE_SIZING_ENABLED,
+    SIGNALS_DRAWDOWN_LOOKBACK_TRADES,
+    SIGNALS_DRAWDOWN_SIZE_MULTIPLIER,
+    SIGNALS_DRAWDOWN_TRIGGER_PCT,
     SIGNALS_CONFLUENCE_ADVANCED_WEIGHT,
     SIGNALS_CONFLUENCE_ENABLED,
     SIGNALS_CONFLUENCE_MIN_AGREE,
@@ -352,10 +356,18 @@ class PortfolioEngine:
             if fresh_cross and self.drs_fresh_cross_boost > 0
             else 1.0
         )
+        drawdown_state = self._drawdown_sizing_state(conn)
+        drawdown_multiplier = float(drawdown_state.get("multiplier", 1.0))
         base_contracts = sizing.contracts
         contracts = max(
             1,
-            int(base_contracts * conviction * size_multiplier * cross_multiplier),
+            int(
+                base_contracts
+                * conviction
+                * size_multiplier
+                * cross_multiplier
+                * drawdown_multiplier
+            ),
         )
 
         entry_price = (candidate.entry_debit or candidate.entry_credit) / 100.0
@@ -400,6 +412,9 @@ class PortfolioEngine:
             "strategy_diagnostics": candidate_result.get("strategy_diagnostics") or {},
             "tier": tier_label,
             "size_multiplier": size_multiplier,
+            "drawdown_multiplier": drawdown_multiplier,
+            "drawdown_engaged": bool(drawdown_state.get("engaged", False)),
+            "drawdown_rolling_pnl": round(float(drawdown_state.get("rolling_pnl", 0.0)), 2),
         }
 
         target_heat = abs(entry_price) * contracts * 100 / max(SIGNALS_PORTFOLIO_SIZE, 1.0)
@@ -431,6 +446,10 @@ class PortfolioEngine:
             " (DRS override)" if drs_override_active else ""
         ) + (
             " (fresh-cross boost)" if fresh_cross and cross_multiplier > 1.0 else ""
+        ) + (
+            f" (drawdown x{drawdown_multiplier:.2f}, rolling=${drawdown_state.get('rolling_pnl', 0.0):.0f})"
+            if drawdown_state.get("engaged")
+            else ""
         )
 
         return PortfolioTarget(
@@ -1282,6 +1301,7 @@ class PortfolioEngine:
         components_at_entry = {
             "optimizer": tp.optimizer_payload,
             "risk": self._build_risk_plan(tp, target.timestamp),
+            "attribution": self._build_attribution(target, tp),
         }
 
         cur = conn.cursor()
@@ -1597,6 +1617,88 @@ class PortfolioEngine:
         # do-not-fade + advanced-signal gating. Keep this hook as pass-through.
         return True, "MSI regime gate passed"
 
+    @staticmethod
+    def _classify_time_bucket(opened_at: datetime) -> str:
+        """Bucket entry timestamp into a coarse session phase for attribution.
+
+        Buckets:
+          • open:      9:30-10:30 ET (opening volatility / dealer rebalance)
+          • morning:   10:30-11:30 ET (post-open trend window)
+          • lunch:     11:30-13:30 ET (chop)
+          • afternoon: 13:30-15:30 ET (post-lunch trend window)
+          • close:     15:30-16:00 ET (EOD pin / charm decay)
+          • outside:   anything else (extended-hours, etc.)
+        """
+        if opened_at.tzinfo is None:
+            ts_et = ET.localize(opened_at)
+        else:
+            ts_et = opened_at.astimezone(ET)
+        t = ts_et.time()
+        if t >= datetime.strptime("15:30", "%H:%M").time() and t < datetime.strptime(
+            "16:00", "%H:%M"
+        ).time():
+            return "close"
+        if t >= datetime.strptime("13:30", "%H:%M").time() and t < datetime.strptime(
+            "15:30", "%H:%M"
+        ).time():
+            return "afternoon"
+        if t >= datetime.strptime("11:30", "%H:%M").time() and t < datetime.strptime(
+            "13:30", "%H:%M"
+        ).time():
+            return "lunch"
+        if t >= datetime.strptime("10:30", "%H:%M").time() and t < datetime.strptime(
+            "11:30", "%H:%M"
+        ).time():
+            return "morning"
+        if t >= datetime.strptime("09:30", "%H:%M").time() and t < datetime.strptime(
+            "10:30", "%H:%M"
+        ).time():
+            return "open"
+        return "outside"
+
+    @staticmethod
+    def _classify_regime(composite_score: float) -> str:
+        msi = float(composite_score or 0.0)
+        if msi >= 70.0:
+            return "trend_expansion"
+        if msi >= 40.0:
+            return "controlled_trend"
+        if msi >= 20.0:
+            return "chop_range"
+        return "high_risk_reversal"
+
+    def _build_attribution(self, target: PortfolioTarget, tp: TargetPosition) -> dict:
+        """Stamp per-trade attribution metadata onto components_at_entry.
+
+        Persisted alongside the optimizer + risk plan so a later batch job can
+        slice win-rate × R-multiple by source × regime × time-bucket without
+        re-deriving from logs.  The signal_trades schema is unchanged — this
+        rides inside the existing components_at_entry JSONB column.
+        """
+        size_mult = None
+        target_pct_override = None
+        risk_overrides = (tp.optimizer_payload or {}).get("risk_overrides") or {}
+        boost = risk_overrides.get("breakout_boost") if isinstance(risk_overrides, dict) else None
+        if isinstance(boost, dict):
+            size_mult = boost.get("size_multiplier")
+            target_pct_override = boost.get("target_pct")
+
+        return {
+            "source": target.source,
+            "regime": self._classify_regime(target.composite_score),
+            "composite_score": round(float(target.composite_score or 0.0), 4),
+            "normalized_score": round(float(target.normalized_score or 0.0), 4),
+            "direction": target.direction,
+            "time_bucket": self._classify_time_bucket(target.timestamp),
+            "rationale": target.rationale,
+            "breakout_boost_applied": size_mult is not None,
+            "boost_size_multiplier": size_mult,
+            "boost_target_pct": target_pct_override,
+            "drawdown_multiplier": float(
+                (tp.optimizer_payload or {}).get("drawdown_multiplier") or 1.0
+            ),
+        }
+
     def _build_risk_plan(self, tp: TargetPosition, opened_at: datetime) -> dict:
         """Compute and serialize the per-trade stop/target/time-stop/min-hold plan.
 
@@ -1792,6 +1894,56 @@ class PortfolioEngine:
             return self._majority_direction(trades)
         except Exception:
             return "neutral"
+
+    def _drawdown_sizing_state(self, conn=None) -> dict:
+        """Return drawdown circuit-breaker state: {"multiplier", "rolling_pnl"}.
+
+        Sums realized PnL of the last N closed trades for this symbol.  When
+        the rolling sum drops below -trigger_pct × portfolio, returns the
+        configured multiplier; otherwise 1.0.  Failure (DB error, MagicMock
+        conn) returns the no-op state so compute_target stays well-behaved
+        under unit tests.
+        """
+        if not SIGNALS_DRAWDOWN_AWARE_SIZING_ENABLED:
+            return {"multiplier": 1.0, "rolling_pnl": 0.0, "engaged": False}
+
+        lookback = int(SIGNALS_DRAWDOWN_LOOKBACK_TRADES)
+        if lookback <= 0:
+            return {"multiplier": 1.0, "rolling_pnl": 0.0, "engaged": False}
+
+        try:
+            with self._use_conn(conn) as c:
+                cur = c.cursor()
+                cur.execute(
+                    """
+                    SELECT total_pnl
+                    FROM signal_trades
+                    WHERE underlying = %s
+                      AND status = 'closed'
+                      AND closed_at IS NOT NULL
+                    ORDER BY closed_at DESC
+                    LIMIT %s
+                    """,
+                    (self.db_symbol, lookback),
+                )
+                rolling_pnl = sum(float(r[0] or 0.0) for r in cur.fetchall())
+        except Exception:
+            return {"multiplier": 1.0, "rolling_pnl": 0.0, "engaged": False}
+
+        trigger_dollars = (
+            -float(SIGNALS_DRAWDOWN_TRIGGER_PCT) * float(SIGNALS_PORTFOLIO_SIZE)
+        )
+        if rolling_pnl <= trigger_dollars:
+            return {
+                "multiplier": float(SIGNALS_DRAWDOWN_SIZE_MULTIPLIER),
+                "rolling_pnl": rolling_pnl,
+                "engaged": True,
+            }
+        return {
+            "multiplier": 1.0,
+            "rolling_pnl": rolling_pnl,
+            "engaged": False,
+        }
 
     def _fresh_drs_cross(self, direction: str, market_ctx: dict) -> bool:
         # Legacy DRS cross boost disabled under MSI-first logic.
