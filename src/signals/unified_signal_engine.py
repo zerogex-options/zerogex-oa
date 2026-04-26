@@ -12,10 +12,12 @@ import os
 import json
 
 from src.database import db_connection
+from src.signals.basic.dealer_delta_pressure import DealerDeltaPressureComponent
 from src.signals.components.base import MarketContext
 from src.signals.components.flip_distance import FlipDistanceComponent
 from src.signals.components.local_gamma import LocalGammaComponent
 from src.signals.components.net_gex_sign import NetGexSignComponent
+from src.signals.components.order_flow_imbalance import OrderFlowImbalanceComponent
 from src.signals.components.price_vs_max_gamma import PriceVsMaxGammaComponent
 from src.signals.components.put_call_ratio_state import PutCallRatioStateComponent
 from src.signals.components.volatility_regime import VolatilityRegimeComponent
@@ -40,6 +42,9 @@ class UnifiedSignalEngine:
             PutCallRatioStateComponent(),
             PriceVsMaxGammaComponent(),
             VolatilityRegimeComponent(),
+            # Phase 3.1: leading-indicator components added to MSI.
+            OrderFlowImbalanceComponent(),
+            DealerDeltaPressureComponent(),
         ]
 
         self.scoring_engine = ScoringEngine(

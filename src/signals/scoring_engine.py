@@ -23,13 +23,21 @@ class ScoreSnapshot:
 class ScoringEngine:
     """Compute and persist the 0-100 Market State Index."""
 
+    # Weights total 100 pts; composite_score = 50 + sum(weight * score)
+    # clamped to [0, 100].  The two trailing components are Phase 3.1
+    # additions (order-flow imbalance + dealer-delta pressure promoted
+    # from a basic signal); the existing six were rebalanced down
+    # proportionally to absorb the new 25 pts without breaking the
+    # composite range.
     COMPONENT_POINTS: dict[str, float] = {
-        "net_gex_sign": 20.0,
-        "flip_distance": 25.0,
-        "local_gamma": 20.0,
-        "put_call_ratio": 15.0,
-        "price_vs_max_gamma": 10.0,
-        "volatility_regime": 10.0,
+        "net_gex_sign": 16.0,
+        "flip_distance": 19.0,
+        "local_gamma": 15.0,
+        "put_call_ratio": 12.0,
+        "price_vs_max_gamma": 7.0,
+        "volatility_regime": 6.0,
+        "order_flow_imbalance": 13.0,
+        "dealer_delta_pressure": 12.0,
     }
 
     def __init__(self, underlying: str, components: list[ComponentBase]):
