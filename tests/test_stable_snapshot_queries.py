@@ -122,12 +122,17 @@ def test_stable_snapshot_quiescence_env_override(monkeypatch):
     # Re-import to pick up a new env value; the constant is evaluated at import.
     import importlib
 
+    # Other test modules pop `src.api.*` from sys.modules during their fixtures,
+    # so importlib.reload(database_module) would fail if we relied on the
+    # module-level alias. Resolve it freshly here so it's in sys.modules.
+    import src.api.database as fresh_database_module
+
     monkeypatch.setenv("STABLE_SNAPSHOT_QUIESCENCE_SECONDS", "42")
-    reloaded = importlib.reload(database_module)
+    reloaded = importlib.reload(fresh_database_module)
     try:
         assert reloaded._STABLE_SNAPSHOT_QUIESCENCE_SECONDS == 42.0
         assert "make_interval(secs => 42" in reloaded._STABLE_SNAPSHOT_CTE
     finally:
         # Restore default so later tests see the stable value.
         monkeypatch.delenv("STABLE_SNAPSHOT_QUIESCENCE_SECONDS", raising=False)
-        importlib.reload(database_module)
+        importlib.reload(fresh_database_module)
