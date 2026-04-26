@@ -33,18 +33,26 @@ def _ctx() -> MarketContext:
     )
 
 
-def _engine(scores: dict[str, float]) -> ScoringEngine:
-    names = [
-        "net_gex_sign",
-        "flip_distance",
-        "local_gamma",
-        "put_call_ratio",
-        "price_vs_max_gamma",
-        "volatility_regime",
-    ]
+# Active (non-zero-weight) component names in the post-Phase-2.1 layout.
+# flip_distance / local_gamma / price_vs_max_gamma are intentionally
+# omitted from this list — they remain registered in production with
+# weight 0 (deprecated stubs for API back-compat), so injecting fake
+# scores for them under the same names contributes nothing to composite.
+_ACTIVE_COMPONENT_NAMES = [
+    "net_gex_sign",
+    "gamma_anchor",
+    "put_call_ratio",
+    "volatility_regime",
+    "order_flow_imbalance",
+    "dealer_delta_pressure",
+]
+
+
+def _engine(scores: dict[str, float], names=None) -> ScoringEngine:
+    component_names = names if names is not None else _ACTIVE_COMPONENT_NAMES
     return ScoringEngine(
         "SPY",
-        [_FakeComponent(name, scores.get(name, 0.0)) for name in names],
+        [_FakeComponent(name, scores.get(name, 0.0)) for name in component_names],
     )
 
 
@@ -56,32 +64,29 @@ def test_market_state_score_is_centered_at_50_when_all_zero():
 
 
 def test_market_state_score_caps_at_100():
-    eng = _engine(
-        {
-            "net_gex_sign": 1.0,
-            "flip_distance": 1.0,
-            "local_gamma": 1.0,
-            "put_call_ratio": 1.0,
-            "price_vs_max_gamma": 1.0,
-            "volatility_regime": 1.0,
-        }
-    )
+    eng = _engine({name: 1.0 for name in _ACTIVE_COMPONENT_NAMES})
     snap, _ = eng.score(_ctx())
     assert snap.composite_score == 100.0
     assert snap.direction == "trend_expansion"
 
 
 def test_market_state_score_floor_at_zero():
-    eng = _engine(
-        {
-            "net_gex_sign": -1.0,
-            "flip_distance": -1.0,
-            "local_gamma": -1.0,
-            "put_call_ratio": -1.0,
-            "price_vs_max_gamma": -1.0,
-            "volatility_regime": -1.0,
-        }
-    )
+    eng = _engine({name: -1.0 for name in _ACTIVE_COMPONENT_NAMES})
     snap, _ = eng.score(_ctx())
     assert snap.composite_score == 0.0
     assert snap.direction == "high_risk_reversal"
+
+
+def test_deprecated_stubs_do_not_move_composite():
+    """Phase 2.1 invariant: flip_distance / local_gamma / price_vs_max_gamma
+    are kept registered with weight 0 so their per-cycle scores still appear
+    in the components dict but cannot move composite_score."""
+    deprecated = ["flip_distance", "local_gamma", "price_vs_max_gamma"]
+    eng = _engine({name: 1.0 for name in deprecated}, names=deprecated)
+    snap, _ = eng.score(_ctx())
+    assert snap.composite_score == 50.0  # base only — stubs contributed 0
+    # But they should still appear in the components payload with score=1.0.
+    for name in deprecated:
+        assert name in snap.components
+        assert snap.components[name]["score"] == 1.0
+        assert snap.components[name]["max_points"] == 0.0

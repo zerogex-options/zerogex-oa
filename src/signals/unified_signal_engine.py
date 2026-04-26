@@ -17,6 +17,7 @@ from src.database import db_connection
 from src.signals.basic.dealer_delta_pressure import DealerDeltaPressureComponent
 from src.signals.components.base import MarketContext
 from src.signals.components.flip_distance import FlipDistanceComponent
+from src.signals.components.gamma_anchor import GammaAnchorComponent
 from src.signals.components.local_gamma import LocalGammaComponent
 from src.signals.components.net_gex_sign import NetGexSignComponent
 from src.signals.components.order_flow_imbalance import OrderFlowImbalanceComponent
@@ -39,10 +40,16 @@ class UnifiedSignalEngine:
         self.db_symbol = get_canonical_symbol(self.underlying)
         components = [
             NetGexSignComponent(),
+            # Phase 2.1: gamma_anchor blends the three originals into one
+            # composite-contributing component.  flip_distance / local_gamma
+            # / price_vs_max_gamma stay registered below as zero-weight
+            # stubs so their scores still appear in the API components
+            # dict for front-end back-compat.
+            GammaAnchorComponent(),
             FlipDistanceComponent(),
             LocalGammaComponent(),
-            PutCallRatioStateComponent(),
             PriceVsMaxGammaComponent(),
+            PutCallRatioStateComponent(),
             VolatilityRegimeComponent(),
             # Phase 3.1: leading-indicator components added to MSI.
             OrderFlowImbalanceComponent(),

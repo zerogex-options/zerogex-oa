@@ -1,23 +1,28 @@
 """Primary Market State Index components.
 
-This package contains the directional MSI components that contribute to
-the composite Market State Index (0-100) along with their weights:
-  - net_gex_sign         (16 pts)
-  - flip_distance        (19 pts)
-  - local_gamma          (15 pts)
-  - put_call_ratio       (12 pts)
-  - price_vs_max_gamma   (7 pts)
-  - volatility_regime    (6 pts)
-  - order_flow_imbalance (13 pts)  [Phase 3.1, additive]
-  - dealer_delta_pressure (12 pts) [Phase 3.1, promoted from basic signal]
+Active (non-zero weight) components contributing to the 0-100 composite:
+  - net_gex_sign           (16 pts)
+  - gamma_anchor           (30 pts)  [Phase 2.1, blends the three originals]
+  - put_call_ratio         (12 pts)
+  - volatility_regime      (6  pts)
+  - order_flow_imbalance   (19 pts)  [Phase 3.1; bumped +6 in Phase 2.1]
+  - dealer_delta_pressure  (17 pts)  [Phase 3.1; bumped +5 in Phase 2.1]
 
-Total: 100 pts.  See ``ScoringEngine.COMPONENT_POINTS`` for the
-authoritative weight table.
+Deprecated zero-weight stubs (kept registered so their scores still
+appear in the API ``components`` dict for back-compat — see Phase 2.1
+notes in the PR / issue):
+  - flip_distance          (was 19 pts; logic now lives inside gamma_anchor)
+  - local_gamma            (was 15 pts; ditto)
+  - price_vs_max_gamma     (was  7 pts; ditto)
+
+Total active weight: 100 pts.  See ``ScoringEngine.COMPONENT_POINTS``
+for the authoritative table.
 """
 
 from src.signals.basic.dealer_delta_pressure import DealerDeltaPressureComponent
 from src.signals.components.base import ComponentBase, MarketContext
 from src.signals.components.flip_distance import FlipDistanceComponent
+from src.signals.components.gamma_anchor import GammaAnchorComponent
 from src.signals.components.local_gamma import LocalGammaComponent
 from src.signals.components.net_gex_sign import NetGexSignComponent
 from src.signals.components.order_flow_imbalance import OrderFlowImbalanceComponent
@@ -29,6 +34,7 @@ __all__ = [
     "ComponentBase",
     "MarketContext",
     "NetGexSignComponent",
+    "GammaAnchorComponent",
     "FlipDistanceComponent",
     "LocalGammaComponent",
     "PutCallRatioStateComponent",
