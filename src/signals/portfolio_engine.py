@@ -19,7 +19,7 @@ import json
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from src.config import (
@@ -29,17 +29,24 @@ from src.config import (
     SIGNALS_CONFLUENCE_MIN_NET_RATIO,
     SIGNALS_CONFLUENCE_MIN_OPINIONATED,
     SIGNALS_CONFLUENCE_MIN_STRENGTH,
+    SIGNALS_CONVICTION_FLOOR,
     SIGNALS_DRS_CALL_ENTRY_MIN,
     SIGNALS_DRS_FRESH_CROSS_BOOST,
     SIGNALS_DRS_HARD_GATES_ENABLED,
     SIGNALS_DRS_OVERRIDE_ENABLED,
     SIGNALS_DRS_OVERRIDE_THRESHOLD,
     SIGNALS_DRS_PUT_ENTRY_MAX,
+    SIGNALS_EXIT_THRESHOLD,
     SIGNALS_MAX_OPEN_TRADES,
     SIGNALS_MAX_PORTFOLIO_HEAT_PCT,
+    SIGNALS_MIN_HOLD_SECONDS,
     SIGNALS_PORTFOLIO_SIZE,
     SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES,
     SIGNALS_SCALP_SIZE_MULTIPLIER,
+    SIGNALS_STOP_LOSS_PCT,
+    SIGNALS_TARGET_PCT,
+    SIGNALS_TIME_STOP_MINUTES,
+    SIGNALS_TRIGGER_THRESHOLD,
 )
 from src.database import db_connection
 from src.signals.execution import leg_fill_price
@@ -117,6 +124,13 @@ class PortfolioEngine:
         self.drs_override_threshold = SIGNALS_DRS_OVERRIDE_THRESHOLD
         self.drs_fresh_cross_boost = SIGNALS_DRS_FRESH_CROSS_BOOST
         self.scalp_size_multiplier = SIGNALS_SCALP_SIZE_MULTIPLIER
+        self.entry_threshold = SIGNALS_TRIGGER_THRESHOLD
+        self.exit_threshold = SIGNALS_EXIT_THRESHOLD
+        self.conviction_floor = SIGNALS_CONVICTION_FLOOR
+        self.min_hold_seconds = SIGNALS_MIN_HOLD_SECONDS
+        self.target_pct = SIGNALS_TARGET_PCT
+        self.time_stop_minutes = SIGNALS_TIME_STOP_MINUTES
+        self.stop_loss_pct = SIGNALS_STOP_LOSS_PCT
 
     _ADVANCED_SIGNAL_DIRECTION_MAP = {
         "squeeze_setup": {
@@ -213,6 +227,34 @@ class PortfolioEngine:
                 f"MSI {msi:.1f} regime={regime} lacks directional trend signal",
             )
 
+        # Asymmetric trigger / hysteresis: require strict entry threshold to
+        # open a fresh position; once we already hold the same direction, fall
+        # back to the looser exit threshold so a 1-2 point MSI dip doesn't
+        # whipsaw us out. Implementation tolerates MagicMock conns (tests) by
+        # treating any failure as "no open position".
+        #
+        # Advanced-signal and confluence entry paths bypass this gate — they
+        # are independent triggers that self-gate via min-score and confluence
+        # ratio filters before reaching compute_target.
+        agg = score.aggregation or {}
+        is_signal_driven = bool(
+            agg.get("advanced_trigger") or agg.get("confluence_trigger")
+        )
+        if not is_signal_driven:
+            held_direction = self._current_position_direction(conn)
+            if held_direction == trade_direction:
+                effective_threshold = self.exit_threshold
+                threshold_label = "exit"
+            else:
+                effective_threshold = self.entry_threshold
+                threshold_label = "entry"
+            if conviction < effective_threshold:
+                return self._cash_target(
+                    score,
+                    f"Conviction {conviction:.2f} below {threshold_label} threshold "
+                    f"{effective_threshold:.2f} (held={held_direction})",
+                )
+
         # Determine sizing mode by regime.
         if regime == "trend_expansion":
             tier_label = "ride"
@@ -280,6 +322,20 @@ class PortfolioEngine:
                 score,
                 "No positive-EV structure available",
             )
+
+        # Combined kelly × conviction floor: rejects technically-positive-EV
+        # candidates whose effective sizing edge is microscopic. Without this
+        # we fire on every weak signal and pay slippage for ~zero edge.
+        # Advanced/confluence-driven scores carry their own gating upstream;
+        # don't double-block them here.
+        if not is_signal_driven:
+            edge_proxy = float(candidate.kelly_fraction or 0.0) * conviction
+            if edge_proxy < self.conviction_floor:
+                return self._cash_target(
+                    score,
+                    f"Edge proxy kelly*conviction {edge_proxy:.3f} below floor "
+                    f"{self.conviction_floor:.3f}",
+                )
 
         # --- CASE 4: compute target contracts via Kelly sizing ---
         fresh_cross = self._fresh_drs_cross(trade_direction, market_ctx)
@@ -808,6 +864,18 @@ class PortfolioEngine:
                 self.snapshot(target, action, action_detail, open_trades, c)
                 return action
 
+            # Phase 1.2: per-trade stop/target/time-stop sweep.  Plan exits
+            # ALWAYS fire — they precede the target-driven CASE ladder so a
+            # mid-cycle target flip can't pre-empt a hit stop or take-profit.
+            plan_closed = self._sweep_plan_exits(open_trades, target.timestamp, c)
+            if plan_closed:
+                # Refresh state so direction-reversal/trim logic operates on
+                # what's actually still open after plan exits.
+                open_trades = self._fetch_open_trades(c)
+                actual_contracts = sum(t["quantity_open"] for t in open_trades)
+                actual_direction = self._majority_direction(open_trades)
+                open_trade_count = len(open_trades)
+
             target_contracts = target.total_target_contracts
             target_direction = target.direction if target.target_positions else "neutral"
 
@@ -817,13 +885,26 @@ class PortfolioEngine:
             # CASE A: target is 100% cash
             if not target.target_positions:
                 if open_trades:
+                    closed_count = 0
+                    held_min_hold = 0
                     closed_pnl = 0.0
                     for trade in open_trades:
+                        if self._min_hold_active(trade, target.timestamp):
+                            self._update_trade_mark(trade, target.timestamp, c)
+                            held_min_hold += 1
+                            continue
                         pnl = self._close_trade(trade, target.timestamp, c)
                         closed_pnl += pnl
-                    action = "closed_all"
+                        closed_count += 1
+                    if closed_count == 0:
+                        action = "held_min_hold"
+                    elif held_min_hold > 0:
+                        action = "closed_partial_min_hold"
+                    else:
+                        action = "closed_all"
                     action_detail = {
-                        "closed_count": len(open_trades),
+                        "closed_count": closed_count,
+                        "min_hold_protected": held_min_hold,
                         "realized_pnl": round(closed_pnl, 4),
                         "reason": target.rationale,
                     }
@@ -833,20 +914,34 @@ class PortfolioEngine:
 
             # CASE B: direction reversal
             elif actual_contracts > 0 and actual_direction != target_direction:
-                closed_pnl = 0.0
-                for trade in open_trades:
-                    pnl = self._close_trade(trade, target.timestamp, c)
-                    closed_pnl += pnl
-                if target_contracts > 0:
-                    self._open_position(target.target_positions[0], target, c)
-                action = "reversed"
-                action_detail = {
-                    "old_direction": actual_direction,
-                    "new_direction": target_direction,
-                    "closed_contracts": actual_contracts,
-                    "opened_contracts": target_contracts,
-                    "closed_pnl": round(closed_pnl, 4),
-                }
+                # Min-hold blocks the entire reversal — half-flipping the book
+                # creates conflicting net deltas.  We hold until protected
+                # trades age out, then reverse on the next cycle.
+                if any(self._min_hold_active(t, target.timestamp) for t in open_trades):
+                    for trade in open_trades:
+                        self._update_trade_mark(trade, target.timestamp, c)
+                    action = "held_min_hold_reversal"
+                    action_detail = {
+                        "current_direction": actual_direction,
+                        "target_direction": target_direction,
+                        "current_contracts": actual_contracts,
+                        "target_contracts": target_contracts,
+                    }
+                else:
+                    closed_pnl = 0.0
+                    for trade in open_trades:
+                        pnl = self._close_trade(trade, target.timestamp, c)
+                        closed_pnl += pnl
+                    if target_contracts > 0:
+                        self._open_position(target.target_positions[0], target, c)
+                    action = "reversed"
+                    action_detail = {
+                        "old_direction": actual_direction,
+                        "new_direction": target_direction,
+                        "closed_contracts": actual_contracts,
+                        "opened_contracts": target_contracts,
+                        "closed_pnl": round(closed_pnl, 4),
+                    }
 
             # CASE C: same direction, adjust size
             elif actual_contracts > 0 and actual_direction == target_direction:
@@ -869,21 +964,31 @@ class PortfolioEngine:
                             "new_total": target_contracts,
                         }
                 elif contracts_delta < 0:
-                    # Partially close oldest trades first
+                    # Partially close oldest trades first; skip those still
+                    # inside their min-hold window so reconcile churn can't
+                    # round-trip a freshly-opened position.
                     to_close = abs(contracts_delta)
+                    requested = to_close
                     closed_pnl = 0.0
+                    skipped_min_hold = 0
                     for trade in open_trades:
                         if to_close <= 0:
                             break
+                        if self._min_hold_active(trade, target.timestamp):
+                            skipped_min_hold += trade["quantity_open"]
+                            continue
                         open_qty = trade["quantity_open"]
                         close_qty = min(open_qty, to_close)
                         pnl = self._close_trade(trade, target.timestamp, c, partial_qty=close_qty)
                         closed_pnl += pnl
                         to_close -= close_qty
-                    action = "trimmed"
+                    actually_trimmed = requested - to_close
+                    action = "trimmed" if actually_trimmed > 0 else "held_min_hold_trim"
                     action_detail = {
-                        "trimmed_contracts": abs(contracts_delta),
-                        "new_total": target_contracts,
+                        "trimmed_contracts": actually_trimmed,
+                        "deferred_contracts": to_close,
+                        "min_hold_protected": skipped_min_hold,
+                        "new_total": target_contracts + to_close,
                         "realized_pnl": round(closed_pnl, 4),
                     }
                 else:
@@ -1017,7 +1122,10 @@ class PortfolioEngine:
 
     def _open_position(self, tp: TargetPosition, target: PortfolioTarget, conn) -> bool:
         """Insert a new row to signal_trades. Returns True if inserted."""
-        components_at_entry = {"optimizer": tp.optimizer_payload}
+        components_at_entry = {
+            "optimizer": tp.optimizer_payload,
+            "risk": self._build_risk_plan(tp, target.timestamp),
+        }
 
         cur = conn.cursor()
         cur.execute(
@@ -1331,6 +1439,195 @@ class PortfolioEngine:
         # Under MSI architecture, direction validity is handled by regime +
         # do-not-fade + advanced-signal gating. Keep this hook as pass-through.
         return True, "MSI regime gate passed"
+
+    def _build_risk_plan(self, tp: TargetPosition, opened_at: datetime) -> dict:
+        """Compute and serialize the per-trade stop/target/time-stop/min-hold plan.
+
+        Stop and target are expressed as **per-share spread prices** (matching
+        ``signal_trades.entry_price`` and the value returned by ``_spread_mark``)
+        so the reconcile loop can compare directly without rebuilding fills.
+
+        For debit spreads, profit accrues as mark > entry; stop fires below
+        entry, target fires above. For credit spreads the inequalities invert
+        (cost-to-close drops below entry on a winner).
+        """
+        entry = float(tp.entry_mark or 0.0)
+        pricing_mode = (
+            (tp.optimizer_payload or {}).get("pricing_mode")
+            or ("credit" if "credit" in (tp.strategy_type or "") else "debit")
+        )
+
+        # SIGNALS_STOP_LOSS_PCT is signed negative (-0.25 = 25% loss tolerance);
+        # SIGNALS_TARGET_PCT is unsigned (+0.50 = +50% profit target).
+        stop_drift = float(self.stop_loss_pct or 0.0)
+        target_drift = float(self.target_pct or 0.0)
+        if pricing_mode == "credit":
+            # Credit: winner = mark falls; loser = mark rises.
+            stop_price = entry * (1.0 + abs(stop_drift)) if entry > 0 else 0.0
+            target_price = entry * max(1.0 - target_drift, 0.0) if entry > 0 else 0.0
+        else:
+            stop_price = entry * (1.0 + stop_drift) if entry > 0 else 0.0
+            target_price = entry * (1.0 + target_drift) if entry > 0 else 0.0
+
+        # Normalize opened_at to UTC iso for downstream string comparison.
+        if opened_at.tzinfo is None:
+            opened_at_utc = opened_at.replace(tzinfo=timezone.utc)
+        else:
+            opened_at_utc = opened_at.astimezone(timezone.utc)
+
+        time_stop = (
+            opened_at_utc + timedelta(minutes=self.time_stop_minutes)
+            if self.time_stop_minutes > 0
+            else None
+        )
+        min_hold_until = (
+            opened_at_utc + timedelta(seconds=self.min_hold_seconds)
+            if self.min_hold_seconds > 0
+            else None
+        )
+
+        return {
+            "pricing_mode": pricing_mode,
+            "entry_price": round(entry, 6),
+            "stop_loss_pct": stop_drift,
+            "target_pct": target_drift,
+            "stop_price": round(stop_price, 6) if stop_price else None,
+            "target_price": round(target_price, 6) if target_price else None,
+            "min_hold_seconds": int(self.min_hold_seconds),
+            "min_hold_until": min_hold_until.isoformat() if min_hold_until else None,
+            "time_stop_minutes": int(self.time_stop_minutes),
+            "time_stop_at": time_stop.isoformat() if time_stop else None,
+        }
+
+    @staticmethod
+    def _parse_iso(value) -> Optional[datetime]:
+        """Best-effort ISO timestamp parse; returns None on any failure."""
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+    def _evaluate_exit_plan(
+        self, trade: dict, as_of: datetime, conn
+    ) -> Optional[tuple[str, float, str]]:
+        """Check the per-trade stop/target/time-stop. Returns (kind, mark, reason)
+        when an exit fires, else None.
+
+        ``kind`` is one of {"stop_loss", "take_profit", "time_stop"} so callers
+        can label the resulting reconcile action distinctly.
+        """
+        risk = (trade.get("components_at_entry") or {}).get("risk") or {}
+        if not risk:
+            return None
+
+        time_stop_at = self._parse_iso(risk.get("time_stop_at"))
+        if as_of.tzinfo is None:
+            as_of_utc = as_of.replace(tzinfo=timezone.utc)
+        else:
+            as_of_utc = as_of.astimezone(timezone.utc)
+
+        if time_stop_at and as_of_utc >= time_stop_at:
+            mark, _ = self._spread_mark(trade, as_of, conn)
+            return ("time_stop", mark or 0.0, f"time stop at {time_stop_at.isoformat()}")
+
+        stop_price = risk.get("stop_price")
+        target_price = risk.get("target_price")
+        if stop_price is None and target_price is None:
+            return None
+
+        mark, _ = self._spread_mark(trade, as_of, conn)
+        if mark is None:
+            return None
+
+        pricing_mode = risk.get("pricing_mode") or "debit"
+        if pricing_mode == "credit":
+            # Credit: stop above entry (cost-to-close ballooned), target below.
+            if stop_price is not None and mark >= float(stop_price):
+                return ("stop_loss", mark, f"credit stop {mark:.4f} >= {stop_price:.4f}")
+            if target_price is not None and mark <= float(target_price):
+                return ("take_profit", mark, f"credit target {mark:.4f} <= {target_price:.4f}")
+        else:
+            if stop_price is not None and mark <= float(stop_price):
+                return ("stop_loss", mark, f"debit stop {mark:.4f} <= {stop_price:.4f}")
+            if target_price is not None and mark >= float(target_price):
+                return ("take_profit", mark, f"debit target {mark:.4f} >= {target_price:.4f}")
+        return None
+
+    def _sweep_plan_exits(self, open_trades: list[dict], as_of: datetime, conn) -> int:
+        """Close every open trade whose stored risk plan fired (stop/target/time).
+
+        Returns the count of trades that were closed.  Plan exits ignore the
+        min-hold window — a stop hit at second 30 is still a stop.
+        """
+        if not open_trades:
+            return 0
+        closed = 0
+        for trade in open_trades:
+            try:
+                exit_decision = self._evaluate_exit_plan(trade, as_of, conn)
+            except Exception as exc:
+                logger.warning(
+                    "PortfolioEngine[%s]: plan-exit evaluation failed for trade %s (%s)",
+                    self.db_symbol,
+                    trade.get("id"),
+                    exc,
+                )
+                continue
+            if exit_decision is None:
+                continue
+            kind, _mark, reason = exit_decision
+            try:
+                self._close_trade(trade, as_of, conn)
+                closed += 1
+                logger.info(
+                    "PortfolioEngine[%s]: plan-exit %s on trade %s (%s)",
+                    self.db_symbol,
+                    kind,
+                    trade.get("id"),
+                    reason,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "PortfolioEngine[%s]: plan-exit close failed for trade %s (%s)",
+                    self.db_symbol,
+                    trade.get("id"),
+                    exc,
+                )
+        return closed
+
+    def _min_hold_active(self, trade: dict, as_of: datetime) -> bool:
+        """True if the trade is inside its protected min-hold window."""
+        risk = (trade.get("components_at_entry") or {}).get("risk") or {}
+        min_hold_until = self._parse_iso(risk.get("min_hold_until"))
+        if not min_hold_until:
+            return False
+        if as_of.tzinfo is None:
+            as_of_utc = as_of.replace(tzinfo=timezone.utc)
+        else:
+            as_of_utc = as_of.astimezone(timezone.utc)
+        return as_of_utc < min_hold_until
+
+    def _current_position_direction(self, conn=None) -> str:
+        """Return the majority direction of currently-open trades.
+
+        Used by compute_target to apply asymmetric entry/exit thresholds
+        (hysteresis). Returns "neutral" when no positions are open OR when the
+        underlying lookup fails — that conservative fallback forces the strict
+        entry threshold and is safe under MagicMock conns in unit tests.
+        """
+        try:
+            with self._use_conn(conn) as c:
+                trades = self._fetch_open_trades(c)
+            if not trades:
+                return "neutral"
+            return self._majority_direction(trades)
+        except Exception:
+            return "neutral"
 
     def _fresh_drs_cross(self, direction: str, market_ctx: dict) -> bool:
         # Legacy DRS cross boost disabled under MSI-first logic.

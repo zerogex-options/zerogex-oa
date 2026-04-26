@@ -286,10 +286,49 @@ SIGNALS_MAX_PORTFOLIO_HEAT_PCT = float(os.getenv("SIGNALS_MAX_PORTFOLIO_HEAT_PCT
 SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES = int(
     os.getenv("SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES", "30")
 )
-SIGNALS_TRIGGER_THRESHOLD = float(os.getenv("SIGNALS_TRIGGER_THRESHOLD", "0.52"))
+SIGNALS_TRIGGER_THRESHOLD = _getenv_float(
+    "SIGNALS_TRIGGER_THRESHOLD", 0.60, min=0.0, max=1.0
+)
+# Asymmetric exit: once a position is open in a direction, conviction must
+# decay below this floor (lower than the entry trigger) before we close.
+# Entry-vs-exit hysteresis cuts whipsaws when MSI oscillates around the trigger.
+SIGNALS_EXIT_THRESHOLD = _getenv_float(
+    "SIGNALS_EXIT_THRESHOLD", 0.45, min=0.0, max=1.0
+)
+# Combined gate: kelly_fraction × conviction must clear this floor or the
+# trade is rejected before sizing. Kills "fire on technically-positive but
+# microscopic edge" cases that produce 50/50 scalps.
+SIGNALS_CONVICTION_FLOOR = _getenv_float(
+    "SIGNALS_CONVICTION_FLOOR", 0.05, min=0.0, max=1.0
+)
 SIGNALS_TREND_CONFIRMATION_BARS = max(0, int(os.getenv("SIGNALS_TREND_CONFIRMATION_BARS", "3")))
 SIGNALS_TREND_CONFIRMATION_MIN_MATCH = max(
     0, int(os.getenv("SIGNALS_TREND_CONFIRMATION_MIN_MATCH", "1"))
+)
+
+# -----------------------------------------------------------------------------
+# Position lifecycle controls (Phase 1: stops/targets + min-hold)
+# -----------------------------------------------------------------------------
+# Minimum seconds a freshly-opened position is protected from reconcile-driven
+# closes. Stops/targets/time-stops still fire inside this window; this only
+# blocks close-because-the-target-portfolio-flipped churn.
+SIGNALS_MIN_HOLD_SECONDS = _getenv_int("SIGNALS_MIN_HOLD_SECONDS", 90, min=0, max=86400)
+# Per-trade profit target as a fraction of entry premium. 0.50 = +50% on
+# entry debit (a 1.5R take-profit). Set to 0 to disable target-driven exits.
+SIGNALS_TARGET_PCT = _getenv_float("SIGNALS_TARGET_PCT", 0.50, min=0.0)
+# Time stop: close any open trade older than this many minutes. Prevents
+# stale positions from drifting through the close on a quiet afternoon.
+# Set to 0 to disable.
+SIGNALS_TIME_STOP_MINUTES = _getenv_int(
+    "SIGNALS_TIME_STOP_MINUTES", 60, min=0, max=1440
+)
+
+# Kelly damping factor (multiplier on the raw kelly fraction).  0.50 = half
+# Kelly, the practitioner standard.  Was hard-coded at 0.25 (quarter-Kelly)
+# in position_optimizer_engine.py which combined with conviction + tier %
+# damping produced microscopic position sizes.
+SIGNALS_KELLY_FRACTION = _getenv_float(
+    "SIGNALS_KELLY_FRACTION", 0.50, min=0.0, max=1.0
 )
 SIGNALS_DRS_HARD_GATES_ENABLED = (
     os.getenv("SIGNALS_DRS_HARD_GATES_ENABLED", "true").lower() == "true"

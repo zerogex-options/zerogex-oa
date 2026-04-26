@@ -11,7 +11,11 @@ from typing import Optional
 import pytz
 
 from src.database import db_connection
-from src.config import SIGNAL_GEX_NORMALIZATION, SIGNALS_PORTFOLIO_SIZE
+from src.config import (
+    SIGNAL_GEX_NORMALIZATION,
+    SIGNALS_KELLY_FRACTION,
+    SIGNALS_PORTFOLIO_SIZE,
+)
 from src.signals.execution import leg_fill_price_from_row
 from src.signals.strategy_builder import StrategyBuilder
 from src.symbols import get_canonical_symbol
@@ -49,7 +53,7 @@ RISK_PROFILE_BUDGETS = {
 }
 
 ASSUMED_ACCOUNT_EQUITY = SIGNALS_PORTFOLIO_SIZE
-KELLY_FRACTION = 0.25
+KELLY_FRACTION = SIGNALS_KELLY_FRACTION
 MAX_CANDIDATES = 3
 
 

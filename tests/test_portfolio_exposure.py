@@ -133,7 +133,7 @@ class TestTargetPositionStrike:
             market_structure_fit=0.8,
             greek_alignment_score=0.8,
             edge_score=0.7,
-            kelly_fraction=0.05,
+            kelly_fraction=0.10,
             sizing_profiles=[
                 SizingProfile(
                     profile="optimal",
@@ -474,7 +474,7 @@ class TestFreshCrossSizingBoost:
             market_structure_fit=0.8,
             greek_alignment_score=0.8,
             edge_score=0.7,
-            kelly_fraction=0.05,
+            kelly_fraction=0.10,
             sizing_profiles=[
                 SizingProfile(
                     profile="optimal",
@@ -1062,7 +1062,7 @@ class TestTradeSlotsAndContractSizing:
             market_structure_fit=0.8,
             greek_alignment_score=0.8,
             edge_score=0.7,
-            kelly_fraction=0.05,
+            kelly_fraction=0.10,
             sizing_profiles=[
                 SizingProfile(
                     profile="optimal",
