@@ -458,9 +458,6 @@ class IngestionEngine:
         # correct time bucket (not forced into "now").
         total_buffered = sum(len(v) for v in self.options_buffer.values())
         if total_buffered >= MAX_BUFFER_SIZE:
-            logger.warning(
-                f"Option buffer limit reached ({total_buffered} items), flushing all option buffers"
-            )
             overflow_rows = []
             for sym in list(self.options_buffer.keys()):
                 buf = self.options_buffer.get(sym)
