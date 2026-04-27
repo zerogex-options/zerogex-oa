@@ -252,8 +252,12 @@ SIGNAL_IV_RANK_ENABLED = os.getenv("SIGNAL_IV_RANK_ENABLED", "false").lower() ==
 # Volatility Expansion Configuration
 # =============================================================================
 VOL_SMART_MONEY_DOMINANCE_RATIO = float(os.getenv("VOL_SMART_MONEY_DOMINANCE_RATIO", "1.2"))
-VOL_GAMMA_DEEP_NEGATIVE = float(os.getenv("VOL_GAMMA_DEEP_NEGATIVE", "-5000000000"))
-VOL_GAMMA_NEGATIVE = float(os.getenv("VOL_GAMMA_NEGATIVE", "-3000000000"))
+# Calibrated for the industry-standard "dollar gamma per 1% move" GEX
+# convention (γ × OI × 100 × S² × 0.01).  Pre-fix values (-5e9 / -3e9) were
+# in the share-equivalent share scale; multiplied by ≈7 for SPY-magnitude
+# underlyings to keep the same regime classification.
+VOL_GAMMA_DEEP_NEGATIVE = float(os.getenv("VOL_GAMMA_DEEP_NEGATIVE", "-35000000000"))
+VOL_GAMMA_NEGATIVE = float(os.getenv("VOL_GAMMA_NEGATIVE", "-21000000000"))
 VOL_GAMMA_FLIP_NEAR_PCT = float(os.getenv("VOL_GAMMA_FLIP_NEAR_PCT", "0.003"))
 VOL_PCR_HIGH = float(os.getenv("VOL_PCR_HIGH", "1.8"))
 VOL_PCR_LOW = float(os.getenv("VOL_PCR_LOW", "0.4"))
@@ -272,9 +276,12 @@ SIGNALS_PORTFOLIO_SIZE = float(os.getenv("SIGNALS_PORTFOLIO_SIZE", "1000000"))
 
 # GEX normalization scale used to map net_gex into [-1, 1] for multiple
 # signal components (vol_expansion, strategy_builder, position optimizer).
-# Previously hard-coded as 300_000_000.0 in three places.  Override via
-# env var if your universe's typical GEX magnitude differs.
-SIGNAL_GEX_NORMALIZATION = _getenv_float("SIGNAL_GEX_NORMALIZATION", 300_000_000.0, min=1.0)
+# Calibrated for the industry-standard "dollar gamma per 1% move" GEX
+# convention (γ × OI × 100 × S² × 0.01); the prior 300M default was on the
+# share-equivalent scale and is multiplied by ≈7 for SPY-magnitude
+# underlyings.  Override via env var if your universe's typical GEX
+# magnitude differs.
+SIGNAL_GEX_NORMALIZATION = _getenv_float("SIGNAL_GEX_NORMALIZATION", 2_100_000_000.0, min=1.0)
 POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS = (
     os.getenv("POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS", "false").lower() == "true"
 )

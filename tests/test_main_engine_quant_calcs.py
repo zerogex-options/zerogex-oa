@@ -34,7 +34,8 @@ def test_gex_by_strike_weights_gamma_by_open_interest():
     row = result[0]
 
     expected_weighted_gamma = (0.01 * 10) + (0.02 * 20)
-    expected_call_gex = expected_weighted_gamma * 100 * 500.0
+    # Industry-standard dollar GEX per 1% move: γ × OI × 100 × S² × 0.01.
+    expected_call_gex = expected_weighted_gamma * 100 * 500.0 * 500.0 * 0.01
 
     assert row["call_gamma"] == expected_weighted_gamma
     assert row["net_gex"] == expected_call_gex

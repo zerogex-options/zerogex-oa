@@ -1017,8 +1017,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     gbs.strike,
                     -- call_gamma / put_gamma are already OI-weighted in analytics
                     -- (gamma * open_interest). Do NOT multiply by OI again here.
-                    (gbs.call_gamma * 100 * lq.spot_price)::numeric AS call_exposure,
-                    (-1 * gbs.put_gamma * 100 * lq.spot_price)::numeric AS put_exposure
+                    -- Industry-standard dollar GEX per 1% move: γ × OI × 100 × S² × 0.01.
+                    (gbs.call_gamma * 100 * lq.spot_price * lq.spot_price * 0.01)::numeric AS call_exposure,
+                    (-1 * gbs.put_gamma * 100 * lq.spot_price * lq.spot_price * 0.01)::numeric AS put_exposure
                 FROM gex_by_strike gbs
                 JOIN latest_summary ls
                   ON gbs.underlying = ls.underlying
@@ -1049,7 +1050,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 lq.spot_price,
                 st.total_call_gex,
                 st.total_put_gex,
-                ls.total_net_gex AS net_gex,
+                -- Re-derive net_gex from strike sums so the API output stays
+                -- internally consistent (net_gex == call_gex + put_gex) and
+                -- always uses the current formula, even when the stored
+                -- summary row was written under an older convention.
+                (st.total_call_gex + st.total_put_gex) AS net_gex,
                 ls.gamma_flip_point AS gamma_flip,
                 ls.flip_distance,
                 ls.local_gex,
@@ -1121,9 +1126,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 g.put_oi,
                 g.call_volume,
                 g.put_volume,
-                (g.call_gamma * 100 * COALESCE(spot.close, 0)) as call_gex,
-                (-1 * g.put_gamma * 100 * COALESCE(spot.close, 0)) as put_gex,
-                g.net_gex,
+                -- Industry-standard dollar GEX per 1% move: γ × OI × 100 × S² × 0.01.
+                (g.call_gamma * 100 * COALESCE(spot.close, 0) * COALESCE(spot.close, 0) * 0.01) as call_gex,
+                (-1 * g.put_gamma * 100 * COALESCE(spot.close, 0) * COALESCE(spot.close, 0) * 0.01) as put_gex,
+                -- Re-derive net_gex from gamma using the current formula so the
+                -- API output stays consistent regardless of when the row was
+                -- written.  net_gex == call_gex + put_gex by construction.
+                ((g.call_gamma - g.put_gamma) * 100 * COALESCE(spot.close, 0) * COALESCE(spot.close, 0) * 0.01) as net_gex,
                 g.vanna_exposure,
                 g.charm_exposure,
                 spot.close as spot_price,
@@ -1209,8 +1218,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             strike_agg AS (
                 SELECT
                     gbs.timestamp,
-                    COALESCE(SUM(gbs.call_gamma * 100 * s.spot_price), 0)::numeric AS total_call_gex,
-                    COALESCE(SUM(-1 * gbs.put_gamma * 100 * s.spot_price), 0)::numeric AS total_put_gex
+                    -- Industry-standard dollar GEX per 1% move: γ × OI × 100 × S² × 0.01.
+                    COALESCE(SUM(gbs.call_gamma * 100 * s.spot_price * s.spot_price * 0.01), 0)::numeric AS total_call_gex,
+                    COALESCE(SUM(-1 * gbs.put_gamma * 100 * s.spot_price * s.spot_price * 0.01), 0)::numeric AS total_put_gex
                 FROM gex_by_strike gbs
                 CROSS JOIN spot s
                 WHERE gbs.underlying = $1
@@ -1238,7 +1248,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 s.spot_price,
                 COALESCE(sa.total_call_gex, 0)::numeric AS total_call_gex,
                 COALESCE(sa.total_put_gex, 0)::numeric AS total_put_gex,
-                b.net_gex,
+                -- Re-derive net_gex from strike sums so historical buckets
+                -- always reflect the current formula and stay consistent with
+                -- (total_call_gex + total_put_gex), even for rows persisted
+                -- under an older convention.
+                (COALESCE(sa.total_call_gex, 0) + COALESCE(sa.total_put_gex, 0))::numeric AS net_gex,
                 b.gamma_flip,
                 b.max_pain,
                 w.call_wall,

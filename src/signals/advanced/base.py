@@ -12,7 +12,11 @@ from src.signals.components.utils import realized_sigma
 
 # Default normalizers (fallback when per-symbol cache is unavailable).
 DEFAULT_FLOW_FLUX_NORM = float(os.getenv("SIGNAL_FLOW_FLUX_NORM", "250000"))
-DEFAULT_NET_GEX_DELTA_NORM = float(os.getenv("SIGNAL_NET_GEX_DELTA_NORM", "500000000"))
+# Calibrated for the industry-standard "dollar gamma per 1% move" GEX
+# convention (γ × OI × 100 × S² × 0.01).  The prior 500M default was on the
+# share-equivalent scale and is multiplied by ≈7 for SPY-magnitude
+# underlyings.  Per-symbol normalizers in ctx still override at runtime.
+DEFAULT_NET_GEX_DELTA_NORM = float(os.getenv("SIGNAL_NET_GEX_DELTA_NORM", "3500000000"))
 
 # Confluence quality cutoff: >= this fraction counts as clustered enough.
 CONFLUENCE_MAX_GAP_PCT = float(os.getenv("SIGNAL_CONFLUENCE_MAX_GAP_PCT", "0.005"))

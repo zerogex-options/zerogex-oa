@@ -8,7 +8,7 @@ from src.signals.components.base import MarketContext
 from src.signals.basic.gex_gradient import GexGradientComponent
 
 
-def _ctx(rows=None, net_gex=-2.0e8, **overrides) -> MarketContext:
+def _ctx(rows=None, net_gex=-1.4e9, **overrides) -> MarketContext:
     defaults = dict(
         timestamp=datetime(2026, 4, 14, 14, 0, tzinfo=timezone.utc),
         underlying="SPY",
@@ -52,33 +52,33 @@ def test_thin_rows_below_min_total_are_neutral():
 def test_above_heavy_in_negative_gex_is_bullish():
     """Dealers short above-spot gamma (negative net_gex) must buy into a rally."""
     rows = [
-        {"strike": 502.0, "net_gex": 2.0e8},
-        {"strike": 504.0, "net_gex": 1.0e8},
-        {"strike": 498.0, "net_gex": 1.0e7},
+        {"strike": 502.0, "net_gex": 1.4e9},
+        {"strike": 504.0, "net_gex": 7.0e8},
+        {"strike": 498.0, "net_gex": 7.0e7},
     ]
-    score = comp.compute(_ctx(rows=rows, net_gex=-3.0e8))
+    score = comp.compute(_ctx(rows=rows, net_gex=-2.1e9))
     assert score > 0
 
 
 def test_below_heavy_in_negative_gex_is_bearish():
     rows = [
-        {"strike": 498.0, "net_gex": 2.0e8},
-        {"strike": 496.0, "net_gex": 1.0e8},
-        {"strike": 502.0, "net_gex": 1.0e7},
+        {"strike": 498.0, "net_gex": 1.4e9},
+        {"strike": 496.0, "net_gex": 7.0e8},
+        {"strike": 502.0, "net_gex": 7.0e7},
     ]
-    score = comp.compute(_ctx(rows=rows, net_gex=-3.0e8))
+    score = comp.compute(_ctx(rows=rows, net_gex=-2.1e9))
     assert score < 0
 
 
 def test_sign_flips_with_dealer_regime():
     """Same asymmetry should score opposite in positive vs negative net_gex."""
     rows = [
-        {"strike": 502.0, "net_gex": 2.0e8},
-        {"strike": 504.0, "net_gex": 1.0e8},
-        {"strike": 498.0, "net_gex": 1.0e7},
+        {"strike": 502.0, "net_gex": 1.4e9},
+        {"strike": 504.0, "net_gex": 7.0e8},
+        {"strike": 498.0, "net_gex": 7.0e7},
     ]
-    neg = comp.compute(_ctx(rows=rows, net_gex=-3.0e8))
-    pos = comp.compute(_ctx(rows=rows, net_gex=3.0e8))
+    neg = comp.compute(_ctx(rows=rows, net_gex=-2.1e9))
+    pos = comp.compute(_ctx(rows=rows, net_gex=2.1e9))
     assert neg * pos < 0  # opposite sign
     assert abs(pos) < abs(neg)  # long-gamma side is intentionally damped
 
@@ -91,13 +91,13 @@ def test_score_bounded():
 
 def test_context_values_populated_when_available():
     rows = [
-        {"strike": 502.0, "net_gex": 2.0e8},
-        {"strike": 498.0, "net_gex": 1.0e8},
+        {"strike": 502.0, "net_gex": 1.4e9},
+        {"strike": 498.0, "net_gex": 7.0e8},
     ]
     cv = comp.context_values(_ctx(rows=rows))
     assert cv["source"] == "gex_by_strike"
-    assert cv["above_spot_gamma_abs"] == pytest.approx(2.0e8)
-    assert cv["below_spot_gamma_abs"] == pytest.approx(1.0e8)
+    assert cv["above_spot_gamma_abs"] == pytest.approx(1.4e9)
+    assert cv["below_spot_gamma_abs"] == pytest.approx(7.0e8)
     assert cv["strike_count"] == 2
 
 

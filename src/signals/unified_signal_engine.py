@@ -739,10 +739,11 @@ class UnifiedSignalEngine:
                 if prev_net_gex is not None:
                     net_gex_delta_raw = net_gex_f - prev_net_gex
                     # Normalize by prior magnitude (C1 note): a delta of
-                    # 100M is enormous on a 200M book but trivial on a 5B
+                    # 700M is enormous on a 1.4B book but trivial on a 35B
                     # book.  Expose both raw and normalized so components
-                    # can pick the scale they need.
-                    denom = max(abs(prev_net_gex), 1.0e6)
+                    # can pick the scale they need.  (Magnitudes here are on
+                    # the industry-standard "$ gamma per 1% move" scale.)
+                    denom = max(abs(prev_net_gex), 1.0e7)
                     net_gex_delta_pct = net_gex_delta_raw / denom
                 else:
                     net_gex_delta_raw = 0.0

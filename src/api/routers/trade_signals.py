@@ -543,7 +543,7 @@ async def get_trap_detection_signal(
       "triggered": true,
       "signal": "bearish_fade",
       "breakout_up": true, "breakout_down": false,
-      "net_gex_delta": 120000000.0,
+      "net_gex_delta": 840000000.0,
       "net_gex_delta_pct": 0.018,
       "resistance_level": 680.0,
       "support_level": 678.0,
@@ -1378,7 +1378,7 @@ async def get_positioning_trap_signal(
         "put_call_ratio": 1.28, "smart_imbalance": -0.41,
         "smart_imbalance_source": "signed_net_premium",
         "momentum_5bar": 0.0025, "close": 577.24,
-        "gamma_flip": 574.5, "net_gex": -2.1e8
+        "gamma_flip": 574.5, "net_gex": -1.4e9
       },
       "score_history": [{"score": 31.0, "timestamp": "..."}, "...up to 90"]
     }

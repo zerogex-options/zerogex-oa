@@ -329,11 +329,14 @@ class AnalyticsEngine:
         self, options: List[Dict[str, Any]], underlying_price: float, timestamp: datetime
     ) -> List[Dict[str, Any]]:
         """
-        Calculate gamma exposure by strike
+        Calculate gamma exposure by strike.
 
-        GEX = Gamma × Open Interest × 100 × Underlying Price
+        GEX = Gamma × Open Interest × 100 × Underlying Price² × 0.01
 
-        This represents the notional dollar value of dealer gamma exposure.
+        This is the industry-standard "dollar gamma per 1% move" convention
+        used by Cheddar Flow, SpotGamma, and SqueezeMetrics.  The trailing
+        ``S × 0.01`` factor converts share-equivalent dealer exposure into
+        the notional dollar value of the delta change for a 1% move in spot.
 
         For dealers (who are typically short options):
         - Call GEX is POSITIVE (dealers are short gamma on calls)
@@ -366,13 +369,14 @@ class AnalyticsEngine:
             call_gamma = sum(opt["gamma"] * opt["open_interest"] for opt in data["calls"])
             call_oi = sum(opt["open_interest"] for opt in data["calls"])
             call_volume = sum(opt["volume"] for opt in data["calls"])
-            call_gex = call_gamma * 100 * underlying_price
+            # Industry-standard dollar GEX per 1% move: γ × OI × 100 × S² × 0.01.
+            call_gex = call_gamma * 100 * underlying_price * underlying_price * 0.01
 
             # Calculate put GEX (negative for dealers)
             put_gamma = sum(opt["gamma"] * opt["open_interest"] for opt in data["puts"])
             put_oi = sum(opt["open_interest"] for opt in data["puts"])
             put_volume = sum(opt["volume"] for opt in data["puts"])
-            put_gex = -1 * put_gamma * 100 * underlying_price
+            put_gex = -1 * put_gamma * 100 * underlying_price * underlying_price * 0.01
 
             # Total gamma (absolute)
             total_gamma = call_gamma + put_gamma
@@ -906,8 +910,11 @@ class AnalyticsEngine:
         mismatches = 0
         sign_anomalies = 0
         for row in gex_by_strike:
-            call_gex = row["call_gamma"] * 100 * underlying_price
-            put_gex = -1 * row["put_gamma"] * 100 * underlying_price
+            # Recompute with the same convention as ``_calculate_gex_by_strike``
+            # (γ × OI × 100 × S² × 0.01).  Mismatches here mean by-strike rows
+            # were derived with a different formula than ``net_gex``.
+            call_gex = row["call_gamma"] * 100 * underlying_price * underlying_price * 0.01
+            put_gex = -1 * row["put_gamma"] * 100 * underlying_price * underlying_price * 0.01
             if abs((call_gex + put_gex) - row["net_gex"]) > 1e-6:
                 mismatches += 1
             if row["call_gamma"] < 0 or row["put_gamma"] < 0:

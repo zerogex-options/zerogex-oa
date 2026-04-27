@@ -33,8 +33,12 @@ _ATM_WINDOW_PCT = float(os.getenv("SIGNAL_GEX_GRADIENT_ATM_PCT", "0.015"))
 _WING_WINDOW_PCT = float(os.getenv("SIGNAL_GEX_GRADIENT_WING_PCT", "0.04"))
 
 # Minimum total notional gamma (absolute sum across surveyed strikes) to
-# emit a non-zero score. Prevents over-reaction when OI is thin.
-_MIN_TOTAL_GAMMA = float(os.getenv("SIGNAL_GEX_GRADIENT_MIN_GAMMA", "5.0e7"))
+# emit a non-zero score. Prevents over-reaction when OI is thin.  Calibrated
+# for the industry-standard "dollar gamma per 1% move" GEX convention
+# (γ × OI × 100 × S² × 0.01); the prior 5.0e7 default was on the
+# share-equivalent scale and is multiplied by ≈7 for SPY-magnitude
+# underlyings.
+_MIN_TOTAL_GAMMA = float(os.getenv("SIGNAL_GEX_GRADIENT_MIN_GAMMA", "3.5e8"))
 _LONG_GAMMA_DAMPING = max(
     0.0,
     min(1.0, float(os.getenv("SIGNAL_GEX_GRADIENT_LONG_GAMMA_DAMPING", "0.40"))),
