@@ -330,6 +330,36 @@ SIGNALS_TIME_STOP_MINUTES = _getenv_int(
     "SIGNALS_TIME_STOP_MINUTES", 60, min=0, max=1440
 )
 
+# Optional timeframe-specific lifecycle overrides (fallback to global values above):
+# - scalp: fast turnover
+# - intraday: same-session holds
+# - swing: multi-hour/multi-session intent
+SIGNALS_SCALP_MIN_HOLD_SECONDS = _getenv_int(
+    "SIGNALS_SCALP_MIN_HOLD_SECONDS", SIGNALS_MIN_HOLD_SECONDS, min=0, max=86400
+)
+SIGNALS_INTRADAY_MIN_HOLD_SECONDS = _getenv_int(
+    "SIGNALS_INTRADAY_MIN_HOLD_SECONDS", SIGNALS_MIN_HOLD_SECONDS, min=0, max=86400
+)
+SIGNALS_SWING_MIN_HOLD_SECONDS = _getenv_int(
+    "SIGNALS_SWING_MIN_HOLD_SECONDS", SIGNALS_MIN_HOLD_SECONDS, min=0, max=86400 * 14
+)
+
+SIGNALS_SCALP_TIME_STOP_MINUTES = _getenv_int(
+    "SIGNALS_SCALP_TIME_STOP_MINUTES", SIGNALS_TIME_STOP_MINUTES, min=0, max=1440
+)
+SIGNALS_INTRADAY_TIME_STOP_MINUTES = _getenv_int(
+    "SIGNALS_INTRADAY_TIME_STOP_MINUTES", SIGNALS_TIME_STOP_MINUTES, min=0, max=1440
+)
+SIGNALS_SWING_TIME_STOP_MINUTES = _getenv_int(
+    "SIGNALS_SWING_TIME_STOP_MINUTES", SIGNALS_TIME_STOP_MINUTES, min=0, max=1440 * 14
+)
+
+# Entry dedupe + reconcile writer lock controls.
+SIGNALS_ENTRY_DEDUPE_WINDOW_SECONDS = _getenv_int(
+    "SIGNALS_ENTRY_DEDUPE_WINDOW_SECONDS", 60, min=0, max=3600
+)
+SIGNALS_RECONCILE_LOCK_ENABLED = _getenv_bool("SIGNALS_RECONCILE_LOCK_ENABLED", True)
+
 # Kelly damping factor (multiplier on the raw kelly fraction).  0.50 = half
 # Kelly, the practitioner standard.  Was hard-coded at 0.25 (quarter-Kelly)
 # in position_optimizer_engine.py which combined with conviction + tier %
@@ -781,6 +811,19 @@ SIGNALS_CONFLUENCE_ADVANCED_WEIGHT = _getenv_float(
 # Default -0.25 means the trade is stopped out when it loses 25% of the
 # initial premium paid (debit trades) or 25% of max-risk (credit trades).
 SIGNALS_STOP_LOSS_PCT = float(os.getenv("SIGNALS_STOP_LOSS_PCT", "-0.25"))
+
+# Optional timeframe-specific stop/target overrides (fallback: global stop/target).
+SIGNALS_SCALP_STOP_LOSS_PCT = _getenv_float("SIGNALS_SCALP_STOP_LOSS_PCT", SIGNALS_STOP_LOSS_PCT)
+SIGNALS_INTRADAY_STOP_LOSS_PCT = _getenv_float(
+    "SIGNALS_INTRADAY_STOP_LOSS_PCT", SIGNALS_STOP_LOSS_PCT
+)
+SIGNALS_SWING_STOP_LOSS_PCT = _getenv_float("SIGNALS_SWING_STOP_LOSS_PCT", SIGNALS_STOP_LOSS_PCT)
+
+SIGNALS_SCALP_TARGET_PCT = _getenv_float("SIGNALS_SCALP_TARGET_PCT", SIGNALS_TARGET_PCT, min=0.0)
+SIGNALS_INTRADAY_TARGET_PCT = _getenv_float(
+    "SIGNALS_INTRADAY_TARGET_PCT", SIGNALS_TARGET_PCT, min=0.0
+)
+SIGNALS_SWING_TARGET_PCT = _getenv_float("SIGNALS_SWING_TARGET_PCT", SIGNALS_TARGET_PCT, min=0.0)
 
 # -----------------------------------------------------------------------------
 # Execution model -- realistic entry/exit fills

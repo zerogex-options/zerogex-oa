@@ -47,14 +47,28 @@ from src.config import (
     SIGNALS_DRS_OVERRIDE_THRESHOLD,
     SIGNALS_DRS_PUT_ENTRY_MAX,
     SIGNALS_EXIT_THRESHOLD,
+    SIGNALS_ENTRY_DEDUPE_WINDOW_SECONDS,
     SIGNALS_MAX_OPEN_TRADES,
     SIGNALS_MAX_PORTFOLIO_HEAT_PCT,
+    SIGNALS_RECONCILE_LOCK_ENABLED,
+    SIGNALS_INTRADAY_MIN_HOLD_SECONDS,
+    SIGNALS_INTRADAY_STOP_LOSS_PCT,
+    SIGNALS_INTRADAY_TARGET_PCT,
+    SIGNALS_INTRADAY_TIME_STOP_MINUTES,
     SIGNALS_MIN_HOLD_SECONDS,
     SIGNALS_NO_0DTE_MORNING_MINUTES,
     SIGNALS_PORTFOLIO_SIZE,
     SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES,
+    SIGNALS_SCALP_MIN_HOLD_SECONDS,
+    SIGNALS_SCALP_STOP_LOSS_PCT,
+    SIGNALS_SCALP_TARGET_PCT,
+    SIGNALS_SCALP_TIME_STOP_MINUTES,
     SIGNALS_SCALP_SIZE_MULTIPLIER,
     SIGNALS_STOP_LOSS_PCT,
+    SIGNALS_SWING_MIN_HOLD_SECONDS,
+    SIGNALS_SWING_STOP_LOSS_PCT,
+    SIGNALS_SWING_TARGET_PCT,
+    SIGNALS_SWING_TIME_STOP_MINUTES,
     SIGNALS_TARGET_PCT,
     SIGNALS_TIME_STOP_MINUTES,
     SIGNALS_TRIGGER_THRESHOLD,
@@ -194,6 +208,55 @@ class PortfolioEngine:
         market_open = datetime.strptime("09:30:00", "%H:%M:%S").time()
         market_close = datetime.strptime("16:15:00", "%H:%M:%S").time()
         return "OPEN" if market_open <= current_time <= market_close else "CLOSED"
+
+    @staticmethod
+    def _risk_profile_for_timeframe(signal_timeframe: Optional[str]) -> dict:
+        timeframe = str(signal_timeframe or "intraday").strip().lower()
+        if timeframe == "scalp":
+            return {
+                "min_hold_seconds": int(SIGNALS_SCALP_MIN_HOLD_SECONDS),
+                "time_stop_minutes": int(SIGNALS_SCALP_TIME_STOP_MINUTES),
+                "stop_loss_pct": float(SIGNALS_SCALP_STOP_LOSS_PCT),
+                "target_pct": float(SIGNALS_SCALP_TARGET_PCT),
+            }
+        if timeframe == "swing":
+            return {
+                "min_hold_seconds": int(SIGNALS_SWING_MIN_HOLD_SECONDS),
+                "time_stop_minutes": int(SIGNALS_SWING_TIME_STOP_MINUTES),
+                "stop_loss_pct": float(SIGNALS_SWING_STOP_LOSS_PCT),
+                "target_pct": float(SIGNALS_SWING_TARGET_PCT),
+            }
+        return {
+            "min_hold_seconds": int(SIGNALS_INTRADAY_MIN_HOLD_SECONDS),
+            "time_stop_minutes": int(SIGNALS_INTRADAY_TIME_STOP_MINUTES),
+            "stop_loss_pct": float(SIGNALS_INTRADAY_STOP_LOSS_PCT),
+            "target_pct": float(SIGNALS_INTRADAY_TARGET_PCT),
+        }
+
+    def _acquire_reconcile_lock(self, conn) -> bool:
+        """Try to acquire an advisory xact lock for this underlying.
+
+        Prevents duplicate opens/closes when multiple service instances run
+        simultaneously for the same symbol.
+        """
+        if not SIGNALS_RECONCILE_LOCK_ENABLED:
+            return True
+        try:
+            cur = conn.cursor()
+            # hashtextextended is deterministic per-key; lock is transaction-scoped.
+            cur.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0));",
+                (f"signal_reconcile:{self.db_symbol}",),
+            )
+            row = cur.fetchone()
+            return bool(row and row[0])
+        except Exception as exc:
+            logger.warning(
+                "PortfolioEngine[%s]: reconcile lock acquisition failed (%s); skipping cycle",
+                self.db_symbol,
+                exc,
+            )
+            return False
 
     # ------------------------------------------------------------------
     # Connection helper
@@ -1019,6 +1082,8 @@ class PortfolioEngine:
         Returns an action string for logging.
         """
         with self._use_conn(conn) as c:
+            if not self._acquire_reconcile_lock(c):
+                return "skipped_lock_busy"
             open_trades = self._fetch_open_trades(c)
             actual_contracts = sum(t["quantity_open"] for t in open_trades)
             actual_direction = self._majority_direction(open_trades)
@@ -1108,14 +1173,16 @@ class PortfolioEngine:
                     for trade in open_trades:
                         pnl = self._close_trade(trade, target.timestamp, c)
                         closed_pnl += pnl
+                    opened = False
                     if target_contracts > 0:
-                        self._open_position(target.target_positions[0], target, c)
+                        opened = self._open_position(target.target_positions[0], target, c)
                     action = "reversed"
                     action_detail = {
                         "old_direction": actual_direction,
                         "new_direction": target_direction,
                         "closed_contracts": actual_contracts,
-                        "opened_contracts": target_contracts,
+                        "opened_contracts": target_contracts if opened else 0,
+                        "opened_after_reversal": opened,
                         "closed_pnl": round(closed_pnl, 4),
                     }
 
@@ -1133,12 +1200,19 @@ class PortfolioEngine:
                             "actual_contracts": actual_contracts,
                         }
                     else:
-                        self._open_position(target.target_positions[0], target, c)
-                        action = "added"
-                        action_detail = {
-                            "added_contracts": contracts_delta,
-                            "new_total": target_contracts,
-                        }
+                        inserted = self._open_position(target.target_positions[0], target, c)
+                        if inserted:
+                            action = "added"
+                            action_detail = {
+                                "added_contracts": contracts_delta,
+                                "new_total": target_contracts,
+                            }
+                        else:
+                            action = "held_dedupe"
+                            action_detail = {
+                                "reason": "Duplicate-entry guard rejected add",
+                                "requested_contract_delta": contracts_delta,
+                            }
                 elif contracts_delta < 0:
                     # Partially close oldest trades first; skip those still
                     # inside their min-hold window so reconcile churn can't
@@ -1188,13 +1262,21 @@ class PortfolioEngine:
                         "target_contracts": target_contracts,
                     }
                 else:
-                    self._open_position(target.target_positions[0], target, c)
-                    action = "opened"
-                    action_detail = {
-                        "contracts": target_contracts,
-                        "direction": target_direction,
-                        "strategy": target.target_positions[0].strategy_type,
-                    }
+                    inserted = self._open_position(target.target_positions[0], target, c)
+                    if inserted:
+                        action = "opened"
+                        action_detail = {
+                            "contracts": target_contracts,
+                            "direction": target_direction,
+                            "strategy": target.target_positions[0].strategy_type,
+                        }
+                    else:
+                        action = "held_dedupe"
+                        action_detail = {
+                            "reason": "Duplicate-entry guard rejected open",
+                            "direction": target_direction,
+                            "strategy": target.target_positions[0].strategy_type,
+                        }
 
             # Re-fetch to get accurate state for snapshot
             open_trades_after = self._fetch_open_trades(c)
@@ -1298,6 +1380,53 @@ class PortfolioEngine:
 
     def _open_position(self, tp: TargetPosition, target: PortfolioTarget, conn) -> bool:
         """Insert a new row to signal_trades. Returns True if inserted."""
+        dedupe_window_seconds = int(SIGNALS_ENTRY_DEDUPE_WINDOW_SECONDS or 0)
+        if dedupe_window_seconds > 0:
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM signal_trades
+                    WHERE underlying = %s
+                      AND status = 'open'
+                      AND direction = %s
+                      AND option_type = %s
+                      AND expiration = %s
+                      AND strike = %s
+                      AND opened_at >= %s - (%s * INTERVAL '1 second')
+                      AND COALESCE(components_at_entry->'optimizer'->>'strategy_type', '') = %s
+                    LIMIT 1
+                    """,
+                    (
+                        self.db_symbol,
+                        tp.direction,
+                        tp.option_type,
+                        tp.expiration,
+                        tp.strike,
+                        target.timestamp,
+                        dedupe_window_seconds,
+                        str(tp.strategy_type or ""),
+                    ),
+                )
+                if cur.fetchone():
+                    logger.info(
+                        "PortfolioEngine[%s]: skipped duplicate entry within %ss window (%s %s %.2f @ %s)",
+                        self.db_symbol,
+                        dedupe_window_seconds,
+                        tp.direction,
+                        tp.option_type,
+                        float(tp.strike or 0.0),
+                        tp.expiration,
+                    )
+                    return False
+            except Exception as exc:
+                logger.warning(
+                    "PortfolioEngine[%s]: dedupe pre-check failed (%s); proceeding with insert",
+                    self.db_symbol,
+                    exc,
+                )
+
         components_at_entry = {
             "optimizer": tp.optimizer_payload,
             "risk": self._build_risk_plan(tp, target.timestamp),
@@ -1712,6 +1841,8 @@ class PortfolioEngine:
         """
         entry = float(tp.entry_mark or 0.0)
         payload = tp.optimizer_payload or {}
+        signal_timeframe = str(payload.get("signal_timeframe") or "intraday").strip().lower()
+        risk_profile = self._risk_profile_for_timeframe(signal_timeframe)
         pricing_mode = (
             payload.get("pricing_mode")
             or ("credit" if "credit" in (tp.strategy_type or "") else "debit")
@@ -1721,12 +1852,12 @@ class PortfolioEngine:
         # SIGNALS_TARGET_PCT is unsigned (+0.50 = +50% profit target).
         # Per-trade target_pct override (Phase 3.2 breakout-boost) wins over
         # the default when present.
-        stop_drift = float(self.stop_loss_pct or 0.0)
+        stop_drift = float(risk_profile.get("stop_loss_pct", self.stop_loss_pct) or 0.0)
         risk_overrides = payload.get("risk_overrides") or {}
         if "target_pct" in risk_overrides:
             target_drift = float(risk_overrides.get("target_pct") or 0.0)
         else:
-            target_drift = float(self.target_pct or 0.0)
+            target_drift = float(risk_profile.get("target_pct", self.target_pct) or 0.0)
         if pricing_mode == "credit":
             # Credit: winner = mark falls; loser = mark rises.
             stop_price = entry * (1.0 + abs(stop_drift)) if entry > 0 else 0.0
@@ -1741,27 +1872,24 @@ class PortfolioEngine:
         else:
             opened_at_utc = opened_at.astimezone(timezone.utc)
 
-        time_stop = (
-            opened_at_utc + timedelta(minutes=self.time_stop_minutes)
-            if self.time_stop_minutes > 0
-            else None
-        )
+        time_stop_minutes = int(risk_profile.get("time_stop_minutes", self.time_stop_minutes) or 0)
+        min_hold_seconds = int(risk_profile.get("min_hold_seconds", self.min_hold_seconds) or 0)
+        time_stop = opened_at_utc + timedelta(minutes=time_stop_minutes) if time_stop_minutes > 0 else None
         min_hold_until = (
-            opened_at_utc + timedelta(seconds=self.min_hold_seconds)
-            if self.min_hold_seconds > 0
-            else None
+            opened_at_utc + timedelta(seconds=min_hold_seconds) if min_hold_seconds > 0 else None
         )
 
         return {
+            "signal_timeframe": signal_timeframe,
             "pricing_mode": pricing_mode,
             "entry_price": round(entry, 6),
             "stop_loss_pct": stop_drift,
             "target_pct": target_drift,
             "stop_price": round(stop_price, 6) if stop_price else None,
             "target_price": round(target_price, 6) if target_price else None,
-            "min_hold_seconds": int(self.min_hold_seconds),
+            "min_hold_seconds": min_hold_seconds,
             "min_hold_until": min_hold_until.isoformat() if min_hold_until else None,
-            "time_stop_minutes": int(self.time_stop_minutes),
+            "time_stop_minutes": time_stop_minutes,
             "time_stop_at": time_stop.isoformat() if time_stop else None,
         }
 
