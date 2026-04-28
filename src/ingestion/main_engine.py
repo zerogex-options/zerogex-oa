@@ -39,6 +39,8 @@ from src.config import (
     GREEKS_ENABLED,
     INGEST_PARITY_GUARD_ENABLED,
     OPTION_BUCKET_WRITE_MIN_SECONDS,
+    FLOW_CLASSIFY_MID_BAND_PCT,
+    FLOW_CLASSIFY_SKIP_OPEN_AUCTION,
 )
 
 logger = get_logger(__name__)
@@ -112,6 +114,12 @@ class IngestionEngine:
         self._option_volume_baseline_ttl = float(
             os.getenv("OPTION_VOLUME_BASELINE_TTL_SECONDS", "1800")
         )
+        # Last-known (bid, ask, mid) per contract used as the "prior tick"
+        # when a bucket only has a single buffered snapshot — without this,
+        # the only quote available is the post-trade snapshot, which defeats
+        # the prior-tick rule for borderline fills.
+        self._option_last_quote: Dict[str, Dict[str, Optional[float]]] = {}
+        self._option_last_quote_lock = threading.Lock()
 
         # Track latest underlying price for Greeks calculation
         self.latest_underlying_price: Optional[float] = None
@@ -521,40 +529,83 @@ class IngestionEngine:
         bid: Optional[float],
         ask: Optional[float],
         mid: Optional[float],
+        band_pct: float = FLOW_CLASSIFY_MID_BAND_PCT,
     ) -> tuple:
         """
         Classify a volume chunk into ask_volume, mid_volume, or bid_volume
-        based on how close the last traded price is to each level.
+        using the Lee-Ready convention: trade price near ask =>
+        buyer-initiated (ask_volume), near bid => seller-initiated
+        (bid_volume), otherwise mid_volume.
+
+        Callers should pass the *prior-tick* bid/ask/mid (the quote that
+        was prevailing before the trade), not the post-trade quote.
+
+        ``band_pct`` is the fraction of each half-spread that counts as
+        mid_volume:
+          * ``0.0`` = pure Lee-Ready: anything above mid is ask, below mid is bid
+          * ``0.5`` ≈ nearest-neighbor: matches the legacy classification
+          * ``1.0`` = everything between bid and ask is mid (only at-or-beyond
+            quotes count as ask/bid)
+        Default ``0.70`` gives a wider mid zone than nearest-neighbor so
+        borderline fills (like a 5.57 print between mid 5.555 and ask 5.58)
+        land in mid rather than getting full ask credit.
 
         Returns (ask_vol, mid_vol, bid_vol) tuple where exactly one is non-zero.
         """
         if volume_delta <= 0:
             return (0, 0, 0)
 
-        # Need last price and at least bid/ask to classify
         if last is None or last <= 0:
-            return (0, volume_delta, 0)  # Default to mid if we can't determine
+            return (0, volume_delta, 0)
 
-        # Compute mid if not provided
         effective_mid = mid
         if effective_mid is None:
             if bid is not None and ask is not None:
                 effective_mid = (bid + ask) / 2.0
             else:
-                return (0, volume_delta, 0)  # Can't classify without bid/ask
+                return (0, volume_delta, 0)
 
-        dist_to_ask = abs(last - ask) if ask is not None else float("inf")
-        dist_to_mid = abs(last - effective_mid)
-        dist_to_bid = abs(last - bid) if bid is not None else float("inf")
-
-        min_dist = min(dist_to_ask, dist_to_mid, dist_to_bid)
-
-        if dist_to_ask == min_dist:
-            return (volume_delta, 0, 0)
-        elif dist_to_bid == min_dist:
-            return (0, 0, volume_delta)
-        else:
+        # Without both quote sides we can't define the band; fall back to
+        # nearest-neighbor against whatever sides we do have.
+        if bid is None or ask is None or ask <= bid:
+            dist_to_ask = abs(last - ask) if ask is not None else float("inf")
+            dist_to_mid = abs(last - effective_mid)
+            dist_to_bid = abs(last - bid) if bid is not None else float("inf")
+            min_dist = min(dist_to_ask, dist_to_mid, dist_to_bid)
+            if dist_to_ask == min_dist:
+                return (volume_delta, 0, 0)
+            if dist_to_bid == min_dist:
+                return (0, 0, volume_delta)
             return (0, volume_delta, 0)
+
+        half_spread = (ask - bid) / 2.0
+        # Clamp band to [0, 1] so misconfiguration can't invert the zones.
+        band = max(0.0, min(1.0, band_pct))
+        ask_threshold = effective_mid + band * half_spread
+        bid_threshold = effective_mid - band * half_spread
+
+        if last > ask_threshold:
+            return (volume_delta, 0, 0)
+        if last < bid_threshold:
+            return (0, 0, volume_delta)
+        return (0, volume_delta, 0)
+
+    @staticmethod
+    def _is_opening_auction_bucket(bucket: datetime) -> bool:
+        """True when ``bucket`` is the 09:30 ET cash-equity opening bucket.
+
+        The opening cross is a single auction print whose price is set by
+        the auction itself; running Lee-Ready against the post-open NBBO
+        misclassifies it. We carve this bucket out and route its volume
+        to mid_volume instead.
+        """
+        if bucket is None:
+            return False
+        try:
+            local = bucket.astimezone(ET) if bucket.tzinfo else ET.localize(bucket)
+        except Exception:
+            return False
+        return local.hour == 9 and local.minute == 30
 
     def _get_option_volume_baseline(self, option_symbol: str, bucket: datetime) -> int:
         """Get latest persisted cumulative volume before current bucket for a contract.
@@ -605,6 +656,23 @@ class IngestionEngine:
         with self._option_volume_baseline_lock:
             self._option_volume_baseline.pop(option_symbol, None)
 
+    def _get_cached_last_quote(self, option_symbol: str) -> Optional[Dict[str, Optional[float]]]:
+        with self._option_last_quote_lock:
+            cached = self._option_last_quote.get(option_symbol)
+            return dict(cached) if cached is not None else None
+
+    def _update_cached_last_quote(
+        self,
+        option_symbol: str,
+        bid: Optional[float],
+        ask: Optional[float],
+        mid: Optional[float],
+    ) -> None:
+        if bid is None and ask is None and mid is None:
+            return
+        with self._option_last_quote_lock:
+            self._option_last_quote[option_symbol] = {"bid": bid, "ask": ask, "mid": mid}
+
     def _prepare_option_agg(
         self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False
     ) -> Optional[Dict[str, Any]]:
@@ -627,39 +695,52 @@ class IngestionEngine:
             vega = _to_db_float(last.get("vega"))
             implied_volatility = _to_db_float(last.get("implied_volatility"))
 
-            # Volume delta classification
+            # Volume delta classification using Lee-Ready prior-tick rule:
+            # the bid/ask used to classify a print is the quote that was
+            # prevailing BEFORE the trade, not the post-trade snapshot.
             ask_volume = 0
             mid_volume = 0
             bid_volume = 0
+            skip_classification = (
+                FLOW_CLASSIFY_SKIP_OPEN_AUCTION and self._is_opening_auction_bucket(bucket)
+            )
             if len(buffer) == 1:
                 curr = buffer[0]
                 curr_vol = curr.get("volume") or 0
                 baseline = self._get_option_volume_baseline(option_symbol, bucket)
                 vol_delta = max(curr_vol - baseline, 0)
                 if vol_delta > 0:
-                    av, mv, bv = self._classify_volume_chunk(
-                        vol_delta,
-                        curr.get("last"),
-                        curr.get("bid"),
-                        curr.get("ask"),
-                        curr.get("mid"),
-                    )
-                    ask_volume += av
-                    mid_volume += mv
-                    bid_volume += bv
+                    if skip_classification:
+                        mid_volume += vol_delta
+                    else:
+                        prior = self._get_cached_last_quote(option_symbol)
+                        av, mv, bv = self._classify_volume_chunk(
+                            vol_delta,
+                            curr.get("last"),
+                            (prior or curr).get("bid"),
+                            (prior or curr).get("ask"),
+                            (prior or curr).get("mid"),
+                        )
+                        ask_volume += av
+                        mid_volume += mv
+                        bid_volume += bv
             else:
                 for i in range(1, len(buffer)):
-                    prev_vol = buffer[i - 1].get("volume") or 0
+                    prev_snap = buffer[i - 1]
+                    prev_vol = prev_snap.get("volume") or 0
                     curr = buffer[i]
                     curr_vol = curr.get("volume") or 0
                     vol_delta = max(curr_vol - prev_vol, 0)
                     if vol_delta > 0:
+                        if skip_classification:
+                            mid_volume += vol_delta
+                            continue
                         av, mv, bv = self._classify_volume_chunk(
                             vol_delta,
                             curr.get("last"),
-                            curr.get("bid"),
-                            curr.get("ask"),
-                            curr.get("mid"),
+                            prev_snap.get("bid"),
+                            prev_snap.get("ask"),
+                            prev_snap.get("mid"),
                         )
                         ask_volume += av
                         mid_volume += mv
@@ -708,6 +789,11 @@ class IngestionEngine:
                     int(agg["volume"] or 0),
                     _time.monotonic(),
                 )
+
+            # Cache the latest quote so the next bucket's first classification
+            # has a real prior tick instead of having to reuse the post-trade
+            # snapshot.
+            self._update_cached_last_quote(option_symbol, best_bid, best_ask, best_mid)
 
             # Trim buffer.
             if keep_last_snapshot and buffer:

@@ -213,6 +213,24 @@ BUFFER_FLUSH_INTERVAL = int(os.getenv("BUFFER_FLUSH_INTERVAL", "60"))  # seconds
 OPTION_BUCKET_WRITE_MIN_SECONDS = float(os.getenv("OPTION_BUCKET_WRITE_MIN_SECONDS", "5"))
 
 # =============================================================================
+# Flow Classification Configuration
+# =============================================================================
+# Fraction of each half-spread that's classified as mid_volume:
+#   0.0  = pure Lee-Ready (any print above mid is ask, below is bid)
+#   0.5  ≈ legacy nearest-neighbor behavior
+#   1.0  = only at-or-beyond-quote prints count as ask/bid; everything in
+#          between is mid
+# Default 0.70 widens the mid zone past nearest-neighbor so borderline
+# fills (e.g. a print at 5.57 with bid 5.53 / ask 5.58) land in mid_volume
+# rather than being credited as full ask volume.
+FLOW_CLASSIFY_MID_BAND_PCT = float(os.getenv("FLOW_CLASSIFY_MID_BAND_PCT", "0.70"))
+# Route the opening-auction bucket (09:30 ET) to mid_volume instead of running
+# Lee-Ready against post-open quotes that don't reflect the auction cross.
+FLOW_CLASSIFY_SKIP_OPEN_AUCTION = (
+    os.getenv("FLOW_CLASSIFY_SKIP_OPEN_AUCTION", "true").lower() == "true"
+)
+
+# =============================================================================
 # Symbol Mapping Configuration
 # =============================================================================
 
