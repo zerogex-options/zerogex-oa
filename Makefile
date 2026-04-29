@@ -337,7 +337,7 @@ help: ## Show this help message
 	@echo "  make {service}-logs-errors      - Show recent errors"
 	@echo "  (service = ingestion | analytics | signals | api)"
 	@echo "  make logs-grep PATTERN=\"text\" - Search all service logs for pattern"
-	@echo "  make logs-clear                 - Clear all journalctl logs for services"
+	@echo "  make logs-clear                 - Clear journals + system/nginx/etc. logs (rotated + gzipped)"
 	@echo ""
 	@echo "$(GREEN)Run Components:$(NC)"
 	@echo "  make run-auth           - Test TradeStation authentication"
@@ -677,20 +677,57 @@ logs-grep: ## Grep logs for specific pattern (use: make logs-grep PATTERN="Greek
 	@sudo journalctl -u $(ANALYTICS_SERVICE) -n 1000 --no-pager | grep "$(PATTERN)" || echo "No matches in analytics logs"
 
 .PHONY: logs-clear
-logs-clear: ## Clear all journalctl logs for the services
-	@echo "$(RED)⚠️  WARNING: This will permanently delete ALL logs for ZeroGEX services!$(NC)"
-	@read -p "Are you sure? Type 'yes' to confirm: " confirm; \
-	if [ "$$confirm" = "yes" ]; then \
-		echo "$(YELLOW)Clearing logs...$(NC)"; \
-		sudo journalctl --rotate; \
-		sudo journalctl --vacuum-time=1s -u $(INGESTION_SERVICE); \
-		sudo journalctl --vacuum-time=1s -u $(ANALYTICS_SERVICE); \
-		echo "$(YELLOW)Truncating /var/log/syslog...$(NC)"; \
-		sudo truncate -s 0 /var/log/syslog; \
-		echo "$(GREEN)✅ Logs cleared for ZeroGEX services$(NC)"; \
-	else \
-		echo "$(RED)❌ Aborted$(NC)"; \
-	fi
+logs-clear: ## Clear journals, syslog/nginx/auth/etc. + remove rotated/gzipped log files
+	@echo "$(RED)⚠️  WARNING: This permanently deletes service journals AND system logs.$(NC)"
+	@echo "$(YELLOW)Targets:$(NC)"
+	@echo "  • journalctl: $(INGESTION_SERVICE), $(ANALYTICS_SERVICE), $(API_SERVICE), $(SIGNALS_SERVICE)"
+	@echo "  • journalctl: cap total to 100M"
+	@echo "  • /var/log/syslog, auth.log, kern.log, dpkg.log, ufw.log, fail2ban.log (active + rotated)"
+	@echo "  • /var/log/nginx/{access,error}.log (active + rotated, reload nginx)"
+	@echo "  • /var/log/letsencrypt/, /var/log/zerogex/ (active + rotated)"
+	@echo "  • /var/log/apt/, /var/log/unattended-upgrades/ (active + rotated)"
+	@read -p "Type 'yes' to confirm: " confirm; \
+	if [ "$$confirm" != "yes" ]; then \
+		echo "$(RED)❌ Aborted$(NC)"; exit 0; \
+	fi; \
+	echo "$(BLUE)Disk usage BEFORE:$(NC)"; df -h / | tail -1; echo ""; \
+	echo "$(YELLOW)→ journalctl: rotate + vacuum service journals + cap total to 100M...$(NC)"; \
+	sudo journalctl --rotate; \
+	sudo journalctl --vacuum-time=1s \
+		-u $(INGESTION_SERVICE) -u $(ANALYTICS_SERVICE) \
+		-u $(API_SERVICE) -u $(SIGNALS_SERVICE); \
+	sudo journalctl --vacuum-size=100M; \
+	echo "$(YELLOW)→ Truncating active syslog-group files...$(NC)"; \
+	for f in /var/log/syslog /var/log/auth.log /var/log/kern.log \
+	         /var/log/dpkg.log /var/log/ufw.log /var/log/fail2ban.log \
+	         /var/log/letsencrypt/letsencrypt.log \
+	         /var/log/apt/term.log /var/log/apt/history.log; do \
+		[ -f "$$f" ] && sudo truncate -s 0 "$$f" && echo "    cleared $$f"; \
+	done; true; \
+	echo "$(YELLOW)→ Truncating /var/log/zerogex/*.log...$(NC)"; \
+	sudo find /var/log/zerogex -maxdepth 2 -type f -name '*.log' \
+		-exec truncate -s 0 {} \; 2>/dev/null || true; \
+	echo "$(YELLOW)→ Truncating /var/log/unattended-upgrades/*.log...$(NC)"; \
+	sudo find /var/log/unattended-upgrades -maxdepth 2 -type f -name '*.log' \
+		-exec truncate -s 0 {} \; 2>/dev/null || true; \
+	echo "$(YELLOW)→ Truncating nginx access/error logs...$(NC)"; \
+	for f in /var/log/nginx/access.log /var/log/nginx/error.log; do \
+		[ -f "$$f" ] && sudo truncate -s 0 "$$f" && echo "    cleared $$f"; \
+	done; true; \
+	echo "$(YELLOW)→ Removing rotated + gzipped log files under /var/log/...$(NC)"; \
+	sudo find /var/log -maxdepth 3 -type f \( \
+		-name '*.gz' -o \
+		-name '*.xz' -o \
+		-name '*.old' -o \
+		-regex '.*\.[0-9]+\(\.log\)?$$' -o \
+		-regex '.*\.log\.[0-9]+$$' \
+	\) -delete -print 2>/dev/null | sed 's/^/    deleted /' || true; \
+	echo "$(YELLOW)→ Reopening file handles (rsyslog HUP, nginx reload)...$(NC)"; \
+	sudo systemctl kill -s HUP rsyslog 2>/dev/null || true; \
+	sudo systemctl reload nginx 2>/dev/null || true; \
+	echo ""; \
+	echo "$(BLUE)Disk usage AFTER:$(NC)"; df -h / | tail -1; \
+	echo "$(GREEN)✅ Logs cleared$(NC)"
 
 # =============================================================================
 # Run Components (from run.py)
