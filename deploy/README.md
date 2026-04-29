@@ -64,6 +64,8 @@ chmod 600 .env
 
 `deploy.sh` sources `.env` once at startup and exports its values to every step, so there are no further prompts. If it stops with a missing-variable error, edit `.env` and re-run — steps are idempotent.
 
+> **Replacing an existing instance behind a live Elastic IP?** This Quick Start describes a *first-ever* provisioning, where DNS already points at the box you're deploying to. For a hot-replacement (cut traffic over to a new instance via EIP swap), see [`RUNBOOK.md`](RUNBOOK.md) — the cutover requires `./deploy/deploy.sh --start-from 130` after the EIP swap rather than a single end-to-end run.
+
 ## Deployment Steps
 
 The deployment process runs these steps in order:

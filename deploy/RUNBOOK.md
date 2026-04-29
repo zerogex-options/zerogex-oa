@@ -101,6 +101,19 @@ aws ec2 wait instance-status-ok --instance-ids $NEW_INSTANCE_ID
 NEW_TEMP_IP=$(aws ec2 describe-instances --instance-ids $NEW_INSTANCE_ID \
   --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
 echo "ssh to: ubuntu@$NEW_TEMP_IP"
+
+# Sanity check.  If the launch template's network interface block does
+# not set AssociatePublicIpAddress=true (and the subnet's
+# MapPublicIpOnLaunch is false), the new instance comes up with no
+# public IP and we can't SSH to it.  Fix the launch template before
+# proceeding — relying on the EIP cutover to grant SSH access creates
+# a chicken-and-egg with Phase 1.2.
+if [ "$NEW_TEMP_IP" = "None" ] || [ -z "$NEW_TEMP_IP" ]; then
+    echo "✗ new instance has no public IP — cannot SSH"
+    echo "  Update the launch template's network interface to set"
+    echo "  AssociatePublicIpAddress=true, then re-launch."
+    exit 1
+fi
 ```
 
 ### 1.2 Deploy on the new instance — everything except SSL
@@ -193,14 +206,19 @@ aws ec2 describe-addresses --allocation-ids $EIP_ALLOC \
 ```
 
 Note: your existing SSH session to the new instance via `$NEW_TEMP_IP`
-may drop within ~30 s. Reconnect via the EIP / DNS:
+will drop within ~30 s — that auto-assigned IP is released the moment
+the EIP attaches. Reconnect via the EIP / DNS:
 
 ```bash
 ssh ubuntu@$DOMAIN
 ```
 
-(If DNS hasn't caught up yet, ssh directly to the EIP:
-`ssh ubuntu@$(aws ec2 describe-addresses --allocation-ids $EIP_ALLOC --query 'Addresses[0].PublicIp' --output text)`)
+DNS doesn't change during the cutover (the EIP itself moves between
+instances), so resolver caches don't matter here. The actual lag is
+**IMDS** on the new instance reflecting the freshly-attached EIP — the
+public-ipv4 metadata endpoint can take ~30 s to update. If step 130's
+DNS preflight reports a mismatch immediately after the swap, wait 30 s
+and re-run.
 
 ### 2.3 Finish SSL on the new instance
 
@@ -232,9 +250,12 @@ curl -fsS -o /dev/null -w 'HTTP %{http_code} — TLS %{ssl_verify_result}\n' \
 API_KEY="<your key>"
 curl -fsS -H "X-API-Key: $API_KEY" "https://$DOMAIN/api/gex/summary?symbol=SPX" | jq .
 
-# Cert expiry
-echo | openssl s_client -servername $DOMAIN -connect $DOMAIN:443 2>/dev/null \
-  | openssl x509 -noout -dates
+# Cert chain verifies (returns non-zero on any chain or hostname error,
+# unlike `openssl x509 -noout -dates` which just prints fields without
+# checking anything)
+openssl s_client -verify_return_error -servername $DOMAIN \
+  -connect $DOMAIN:443 -CApath /etc/ssl/certs </dev/null >/dev/null 2>&1 \
+  && echo "TLS chain verifies" || echo "TLS chain FAILED"
 ```
 
 On the new instance:
@@ -304,6 +325,13 @@ aws ec2 terminate-instances --instance-ids $NEW_INSTANCE_ID
 Move the EIP back to the old instance:
 
 ```bash
+# If you've already moved to Phase 4 (old instance stopped), start it
+# first — a stopped instance has no networking and the EIP can't
+# reach it.
+aws ec2 start-instances --instance-ids $OLD_INSTANCE_ID
+aws ec2 wait instance-running --instance-ids $OLD_INSTANCE_ID
+aws ec2 wait instance-status-ok --instance-ids $OLD_INSTANCE_ID
+
 # Disassociate from new
 aws ec2 disassociate-address --association-id $NEW_ASSOC
 
