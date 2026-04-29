@@ -26,71 +26,80 @@ This deployment system automates the complete setup of ZeroGEX-OA including:
 
 ## Prerequisites
 
-- Ubuntu 20.04 or 22.04 LTS server (EC2 instance)
-- Sudo access
-- At least 4GB RAM (8GB+ recommended)
-- 50GB+ storage (100GB+ recommended for production)
-- **AWS RDS PostgreSQL instance** (already provisioned)
-  - PostgreSQL 13+ recommended
-  - Endpoint, port, database name, and master credentials
-  - Security group allowing EC2 instance to connect
-- TradeStation API credentials (Client ID, Secret, and Refresh Token)
+Before running `deploy.sh` the operator is responsible for:
+
+- **EC2 instance**: Ubuntu 22.04 LTS, m5.large or larger, sudo, 4 GiB+ RAM, 50 GiB+ root volume.
+- **AWS RDS PostgreSQL**: already provisioned, security group allows inbound 5432 from this EC2 instance, master credentials known.
+- **DNS A record**: pointed at the instance's public IP for the domain you'll set as `OA_API_DOMAIN`. Use an Elastic IP so the address is stable across stop/start cycles. Step 130 fails fast if DNS doesn't resolve to this instance.
+- **TradeStation API access**: Client ID, Client Secret, and a **bootstrapped refresh token**. The refresh token must be obtained once on a workstation with a browser by running `python setup/app/get_tradestation_tokens.py` — the OAuth flow cannot run unattended on the server.
+- **Let's Encrypt notification email**: any address you control.
 
 ## Quick Start
 
+The intended flow is five manual steps; everything else is automated by `deploy.sh`.
+
 ```bash
-# 1. Clone the repository
-cd ~
-git clone <your-repo-url> zerogex-oa
-cd zerogex-oa
+# (a) From your workstation: launch the EC2 instance from your launch
+#     template, attach an Elastic IP, point DNS at it.
 
-# 2. Make deployment script executable
-chmod +x deploy/deploy.sh
-chmod +x deploy/steps/*
+# (b) SSH in and clone the repo.
+git clone <your-repo-url> ~/zerogex-oa
+cd ~/zerogex-oa
+chmod +x deploy/deploy.sh deploy/steps/*
 
-# 3. Run full deployment
+# (c) Copy the env template.
+cp .env.example .env
+
+# (d) Fill in the required values (and review the rest):
+#       OA_API_DOMAIN, LETSENCRYPT_EMAIL
+#       DB_HOST, DB_PASSWORD (DB_PORT/DB_NAME/DB_USER default OK)
+#       TRADESTATION_CLIENT_ID, TRADESTATION_CLIENT_SECRET, TRADESTATION_REFRESH_TOKEN
+#       CORS_ALLOW_ORIGINS  (must be explicit; '*' is rejected in production)
+$EDITOR .env
+chmod 600 .env
+
+# (e) Run the deploy.  Step 005 fails fast if anything is missing.
 ./deploy/deploy.sh
 ```
+
+`deploy.sh` sources `.env` once at startup and exports its values to every step, so there are no further prompts. If it stops with a missing-variable error, edit `.env` and re-run — steps are idempotent.
 
 ## Deployment Steps
 
 The deployment process runs these steps in order:
 
+### Step 005: Pre-flight Configuration Check
+- Verifies every required variable in `.env` is set to a real (non-placeholder) value.
+- Lists *all* missing values at once and exits before touching the system, so you don't end up half-deployed.
+- Required: `OA_API_DOMAIN`, `LETSENCRYPT_EMAIL`, `DB_HOST`, `DB_PASSWORD`, `TRADESTATION_CLIENT_ID/SECRET/REFRESH_TOKEN`, `CORS_ALLOW_ORIGINS`.
+
 ### Step 010: System Setup
-- Updates system packages
-- Installs essential tools (git, curl, python3, postgresql-client, etc.)
-- Configures timezone to America/New_York
-- Sets up .bashrc with ZeroGEX environment
+- Updates system packages.
+- Installs essential tools (git, curl, dnsutils, python3-venv, jq, etc.). PostgreSQL is **not** installed locally; the deploy uses RDS.
+- Sets timezone to `America/New_York`.
+- Adds a ZeroGEX section to `.bashrc`.
 
 ### Step 015: Data Volume Setup
-- Detects and mounts secondary storage volumes (if available)
-- Creates `/data` mount point for monitoring and backups
-- Falls back to root volume if no secondary volume available
-- Creates `/data/monitoring` and `/data/backups` directories
+- Detects and mounts a secondary EBS volume at `/data` if attached (idempotent).
+- Falls back to the root volume.
+- Creates `/data/monitoring` and `/data/backups`.
 
 ### Step 020: Database Setup (AWS RDS)
-- Installs PostgreSQL client tools for psql
-- Prompts for AWS RDS connection details (endpoint, port, database, credentials)
-- Tests database connection
-- Creates `.pgpass` file for passwordless access
-- Checks for TimescaleDB extension (optional)
-- Applies database schema from `setup/database/schema.sql`
-- Verifies core tables are created
-- **Sets up data retention cron job** (runs daily at 2:00 AM ET)
-  - Cleans up data older than retention policy (90 days)
-  - Logs to `/var/log/zerogex/cleanup.log`
+- Installs `postgresql-client` for `psql`.
+- Reads `DB_HOST` / `DB_PORT` / `DB_NAME` / `DB_USER` / `DB_PASSWORD` from `.env` (no prompts).
+- Tests connectivity, refuses to proceed on failure (with a hint about the RDS security group).
+- (Re)writes `~/.pgpass` from `.env` so admin `psql`/`pg_dump` invocations work passwordless.
+- Enables the TimescaleDB extension if available on the RDS parameter group.
+- Applies `setup/database/schema.sql` and verifies the core tables exist.
+- Installs a daily retention cron job (`SELECT cleanup_old_data()`) at 02:00 ET, logging to `/var/log/zerogex/cleanup.log`.
 
 ### Step 030: Application Setup
-- Creates Python virtual environment
-- Installs zerogex package in editable mode
-- Installs all dependencies (core + optional)
-- Creates `.env` file from template
-- Prompts for TradeStation API credentials (Client ID and Secret)
+- Creates the Python venv and installs the package with all extras (`pip install -e ".[all]"`).
+- Locks `.env` to mode 600 (the user supplies the file content; this step does not modify it).
 
 ### Step 040: TradeStation Auth
-- Interactive script to obtain TradeStation OAuth tokens
-- Guides through authorization code flow
-- Saves refresh token to `.env` file
+- Confirms `TRADESTATION_REFRESH_TOKEN` is present in `.env`.
+- Refresh tokens cannot be minted unattended — if missing, the step prints the one-time bootstrap command (`python setup/app/get_tradestation_tokens.py`) and exits. Run it on a workstation with a browser, copy the resulting refresh token into `.env`, and re-run the deploy.
 
 ### Step 050: Security Hardening
 - Configures UFW firewall (SSH only by default)
@@ -113,16 +122,17 @@ The deployment process runs these steps in order:
 - Interactive API docs at /docs
 
 ### Step 120: Nginx Reverse Proxy (HTTP Bootstrap)
-- Installs and configures Nginx for `api.zerogex.io`
-- Proxies API/docs traffic to `http://127.0.0.1:8000` over HTTP only
-- Prepares ACME challenge path for certificate issuance
-- Enables HTTP/HTTPS firewall rules and removes public 8000 exposure
+- Installs and configures Nginx for `$OA_API_DOMAIN` (read from `.env`).
+- Proxies API/docs traffic to `http://127.0.0.1:8000` over HTTP only.
+- Prepares ACME challenge path for certificate issuance.
+- Enables HTTP/HTTPS firewall rules and removes public 8000 exposure.
 
 ### Step 130: SSL/HTTPS + Auto-Renew (Hardened)
-- Automatically issues/renews Let's Encrypt cert for `api.zerogex.io`
-- Rewrites nginx site to hardened HTTPS config with HTTP→HTTPS redirect
-- Installs systemd renewal units (`zerogex-cert-renew.service/.timer`) scoped to `api.zerogex.io`
-- Validates renewal flow with a dry-run
+- **DNS preflight**: resolves `$OA_API_DOMAIN` and compares to this instance's public IP. Fails with an actionable error before invoking certbot if DNS isn't pointed correctly (avoids burning Let's Encrypt rate limit on a misconfig).
+- Issues/renews Let's Encrypt cert for `$OA_API_DOMAIN` using `$LETSENCRYPT_EMAIL`.
+- Rewrites nginx to hardened HTTPS with HTTP→HTTPS redirect, HSTS, OCSP stapling.
+- Installs systemd renewal units (`zerogex-cert-renew.service/.timer`).
+- Validates renewal with a dry-run.
 
 ### Step 200: Validation
 - Comprehensive deployment validation with RDS connection
