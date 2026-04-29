@@ -31,6 +31,10 @@ KillSignal=SIGTERM
 TimeoutStopSec=30
 SendSIGKILL=yes
 
+# Resource limits
+MemoryMax=1G
+CPUQuota=100%
+
 # Security
 NoNewPrivileges=true
 PrivateTmp=true
