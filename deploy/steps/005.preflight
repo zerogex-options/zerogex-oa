@@ -1,0 +1,91 @@
+#!/bin/bash
+
+# ==============================================
+# Step 005: Pre-flight Configuration Check
+# ==============================================
+#
+# Validates that .env contains every value the rest of the deploy needs,
+# before we install packages or modify the system.  Fail-fast here is
+# preferable to crashing halfway through with a half-configured box.
+#
+# .env is sourced by deploy.sh, so all variables are already exported.
+
+set -e
+
+log "Pre-flight Configuration Check"
+
+MISSING=()
+
+# A value is considered "set" when it is non-empty AND not one of the
+# placeholder values shipped in .env.example.  Keep this list in sync
+# with .env.example so both files describe the same defaults.
+is_placeholder() {
+    case "$1" in
+        ""|"xxxxxxxxxx"|"api.example.com"|"ops@example.com"|\
+        "your_api_key_here"|"your_api_secret_here"|"your_refresh_token_here"|\
+        "your_client_id_here"|"your_client_secret_here"|"changeme"|"REPLACE_ME")
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+require_var() {
+    local name="$1"
+    local value="${!name-}"
+    if is_placeholder "$value"; then
+        MISSING+=("$name")
+    fi
+}
+
+# Database — RDS connection settings
+require_var DB_HOST
+require_var DB_PASSWORD
+
+# TradeStation API — credentials + bootstrapped refresh token
+# (token must be obtained once via setup/app/get_tradestation_tokens.py
+# before the first deploy; see deploy/README.md)
+require_var TRADESTATION_CLIENT_ID
+require_var TRADESTATION_CLIENT_SECRET
+require_var TRADESTATION_REFRESH_TOKEN
+
+# API auth + frontend access
+require_var CORS_ALLOW_ORIGINS
+if [ "${CORS_ALLOW_ORIGINS:-}" = "*" ]; then
+    log "  ✗ CORS_ALLOW_ORIGINS=* is rejected in production."
+    log "     Set it to a comma-separated list of explicit origins, e.g."
+    log "     CORS_ALLOW_ORIGINS=https://app.example.com,https://admin.example.com"
+    exit 1
+fi
+
+# Public domain + Let's Encrypt notification email (used by 120/130)
+require_var OA_API_DOMAIN
+require_var LETSENCRYPT_EMAIL
+
+if [ "${#MISSING[@]}" -gt 0 ]; then
+    log "  ✗ The following required variables are unset or still set to"
+    log "     their .env.example placeholder values:"
+    log ""
+    for v in "${MISSING[@]}"; do
+        log "       - $v"
+    done
+    log ""
+    log "     Edit $ENV_FILE and set real values, then re-run ./deploy/deploy.sh."
+    exit 1
+fi
+
+# Sensible defaults for optional connection vars — applied here so every
+# downstream step sees the same value.
+: "${DB_PORT:=5432}"
+: "${DB_NAME:=zerogex}"
+: "${DB_USER:=postgres}"
+export DB_PORT DB_NAME DB_USER
+
+log "  ✓ DB_HOST=$DB_HOST  DB_PORT=$DB_PORT  DB_NAME=$DB_NAME  DB_USER=$DB_USER"
+log "  ✓ TradeStation credentials present (refresh token bootstrapped)"
+log "  ✓ CORS_ALLOW_ORIGINS=$CORS_ALLOW_ORIGINS"
+log "  ✓ OA_API_DOMAIN=$OA_API_DOMAIN"
+log "  ✓ LETSENCRYPT_EMAIL=$LETSENCRYPT_EMAIL"
+
+log ""
+log "Pre-flight check passed."
+log ""

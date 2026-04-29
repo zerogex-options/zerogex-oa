@@ -58,64 +58,10 @@ print('✓ Core packages verified')
     log "  ⚠ Some packages may not have installed correctly"
 }
 
-# Create .env file if it doesn't exist
-ENV_FILE="$APP_DIR/.env"
-if [ ! -f "$ENV_FILE" ]; then
-    log "  → Creating .env file from template..."
-    cp "$APP_DIR/.env.example" "$ENV_FILE"
-    chmod 600 "$ENV_FILE"
-    
-    log "  → Configuring TradeStation API credentials..."
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  TradeStation API Setup"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo ""
-    echo "  Please provide your TradeStation API credentials."
-    echo "  You can find these in the API welcome packet you received from TradeStation."
-    echo ""
-
-    # Prompt for API client ID
-    read -p "  TradeStation Client ID (aka API Key): " TS_API_KEY
-    while [ -z "$TS_API_KEY" ]; do
-        echo "     ✗ Client ID cannot be empty"
-        read -p "  TradeStation Client ID: " TS_API_KEY
-    done
-
-    # Prompt for API secret
-    read -s -p "  TradeStation API Secret: " TS_API_SECRET
-    echo ""
-    while [ -z "$TS_API_SECRET" ]; do
-        echo "     ✗ API Secret cannot be empty"
-        read -s -p "  TradeStation API Secret: " TS_API_SECRET
-        echo ""
-    done
-
-    # Update TradeStation credentials in .env file
-    log ""
-    log "  → Updating .env file with TradeStation credentials..."
-    sed -i "s/^TRADESTATION_CLIENT_ID=.*/TRADESTATION_CLIENT_ID=${TS_API_KEY}/" "$ENV_FILE"
-    sed -i "s/^TRADESTATION_CLIENT_SECRET=.*/TRADESTATION_CLIENT_SECRET=${TS_API_SECRET}/" "$ENV_FILE"
-    log "     ✓ .env file created at: $ENV_FILE"
-    log "     ✓ TradeStation credentials securely stored"
-
-    # Update Database settings in .env file
-    log ""
-    log "  → Updating .env file with database connectivity settings from ~/.pgpass"
-    DB_HOST=`cat ~/.pgpass | awk -F\: '{print $1}'`
-    DB_PORT=`cat ~/.pgpass | awk -F\: '{print $2}'`
-    DB_NAME=`cat ~/.pgpass | awk -F\: '{print $3}'`
-    DB_USER=`cat ~/.pgpass | awk -F\: '{print $4}'`
-    sed -i "s/^DB_HOST=.*/DB_HOST=${DB_HOST}/" "$ENV_FILE"
-    sed -i "s/^DB_PORT=.*/DB_PORT=${DB_PORT}/" "$ENV_FILE"
-    sed -i "s/^DB_NAME=.*/DB_NAME=${DB_NAME}/" "$ENV_FILE"
-    sed -i "s/^DB_USER=.*/DB_USER=${DB_USER}/" "$ENV_FILE"
-    log "     ✓ Database connectivity settings copied from ~/.pgpass"
-
-else
-    log "     ℹ .env file already exists, skipping configuration..."
-    log "     If you need to update TradeStation credentials, edit: $ENV_FILE"
-fi
+# .env is sourced by deploy.sh and validated by step 005.preflight, so
+# we just lock its perms here in case the user copied .env.example with
+# a permissive umask.
+chmod 600 "$APP_DIR/.env"
 
 # Deactivate virtual environment
 deactivate

@@ -57,23 +57,16 @@ log "     ✓ ENVIRONMENT=production"
 
 # -- 2. CORS_ALLOW_ORIGINS ------------------------------------------
 # Required in production: the API refuses to start with empty or '*'.
+# 005.preflight already enforced this; we just confirm it's still
+# present (in case someone hand-edits .env between steps).
 CURRENT_CORS=$(get_env_var CORS_ALLOW_ORIGINS | xargs)
 if [ -z "$CURRENT_CORS" ] || [ "$CURRENT_CORS" = "*" ]; then
-    echo ""
-    echo "  CORS_ALLOW_ORIGINS must list the origins allowed to call the API."
-    echo "  Example: https://app.example.com,https://admin.example.com"
-    echo "  In production the API will refuse to start with '*' or empty."
-    echo ""
-    read -r -p "  Enter comma-separated allowed origins: " CORS_INPUT
-    while [ -z "$CORS_INPUT" ] || [ "$CORS_INPUT" = "*" ]; do
-        echo "     ✗ Must be a non-empty, non-wildcard value."
-        read -r -p "  Enter comma-separated allowed origins: " CORS_INPUT
-    done
-    set_env_var CORS_ALLOW_ORIGINS "$CORS_INPUT"
-    log "     ✓ CORS_ALLOW_ORIGINS set"
-else
-    log "     ℹ CORS_ALLOW_ORIGINS already set (leaving as-is)"
+    log "  ✗ CORS_ALLOW_ORIGINS must be a non-empty, non-wildcard list."
+    log "     Set it in $ENV_FILE, e.g.:"
+    log "       CORS_ALLOW_ORIGINS=https://app.example.com,https://admin.example.com"
+    exit 1
 fi
+log "     ✓ CORS_ALLOW_ORIGINS=$CURRENT_CORS"
 
 # -- 3. API_KEY ------------------------------------------------------
 EXISTING_KEY=$(get_env_var API_KEY | xargs)

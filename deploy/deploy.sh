@@ -11,6 +11,8 @@ set -e  # Exit on any error
 
 # Variables
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+ENV_FILE="$APP_DIR/.env"
 STEPS_DIR="$SCRIPT_DIR/steps"
 LOG_DIR="${HOME}/logs"
 LOG_FILE="${LOG_DIR}/deployment_$(date +%Y%m%d_%H%M%S).log"
@@ -85,6 +87,24 @@ if [ -n "$START_FROM" ]; then
     log "Starting from step: $START_FROM"
 fi
 log "=========================================="
+
+# Source .env so every step inherits configuration without prompting.
+# `set -a` auto-exports every variable defined while sourcing.
+if [ ! -f "$ENV_FILE" ]; then
+    log "✗ .env not found at $ENV_FILE"
+    log ""
+    log "  Copy the template and fill in your values before re-running:"
+    log "    cp $APP_DIR/.env.example $ENV_FILE"
+    log "    \$EDITOR $ENV_FILE"
+    log ""
+    exit 1
+fi
+log "Sourcing configuration from $ENV_FILE"
+set -a
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+set +a
+export APP_DIR ENV_FILE
 
 # Flag to track if we should start executing
 SHOULD_EXECUTE=false

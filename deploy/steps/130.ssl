@@ -10,9 +10,9 @@ log "SSL/HTTPS Setup + Auto-Renew (Hardened)"
 
 APP_DIR="$HOME/zerogex-oa"
 SYSTEMD_SOURCE="$APP_DIR/setup/systemd"
-DOMAIN_NAME="${OA_API_DOMAIN:-api.zerogex.io}"
+DOMAIN_NAME="${OA_API_DOMAIN}"
 SITE_CONF="/etc/nginx/sites-available/zerogex-oa-api"
-LE_EMAIL="${LETSENCRYPT_EMAIL:-}"
+LE_EMAIL="${LETSENCRYPT_EMAIL}"
 
 if [ ! -f "$SITE_CONF" ]; then
     log "  ✗ Nginx site config not found: $SITE_CONF"
@@ -20,14 +20,38 @@ if [ ! -f "$SITE_CONF" ]; then
     exit 1
 fi
 
-if [ -z "$LE_EMAIL" ]; then
-    read -p "  Enter email for Let's Encrypt notifications: " LE_EMAIL
+# DNS preflight: certbot's HTTP-01 challenge requires DOMAIN_NAME to
+# resolve to this instance's public IP.  Catch the misconfiguration
+# here with a clear message rather than letting certbot fail the
+# challenge with a generic error.
+log "  → DNS preflight: confirming $DOMAIN_NAME points to this instance..."
+TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+INSTANCE_IP=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" \
+    http://169.254.169.254/latest/meta-data/public-ipv4 || true)
+RESOLVED_IP=$(dig +short "$DOMAIN_NAME" A | tail -n1)
+
+if [ -z "$RESOLVED_IP" ]; then
+    log "  ✗ $DOMAIN_NAME does not resolve to any A record."
+    log "     Add an A record pointing $DOMAIN_NAME → $INSTANCE_IP and"
+    log "     wait for propagation (typically 1–5 min for short TTLs),"
+    log "     then re-run: ./deploy/deploy.sh --start-from 130"
+    exit 1
 fi
 
-while [ -z "$LE_EMAIL" ]; do
-    echo "     ✗ Email cannot be empty"
-    read -p "  Enter email: " LE_EMAIL
-done
+if [ -n "$INSTANCE_IP" ] && [ "$RESOLVED_IP" != "$INSTANCE_IP" ]; then
+    log "  ✗ DNS mismatch."
+    log "     $DOMAIN_NAME resolves to $RESOLVED_IP"
+    log "     this instance is at      $INSTANCE_IP"
+    log ""
+    log "     Update the A record to $INSTANCE_IP, wait for propagation,"
+    log "     then re-run: ./deploy/deploy.sh --start-from 130"
+    log ""
+    log "     Tip: associate an Elastic IP so the address is stable across"
+    log "     stop/start cycles and DNS doesn't drift."
+    exit 1
+fi
+log "     ✓ $DOMAIN_NAME → $RESOLVED_IP (matches this instance)"
 
 log "  → Installing certbot nginx plugin..."
 sudo apt install -y certbot python3-certbot-nginx
