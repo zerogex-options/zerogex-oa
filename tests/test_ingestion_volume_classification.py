@@ -136,9 +136,12 @@ def test_opening_auction_helper_naive_datetime_treated_as_et():
 
 
 def test_cached_last_quote_roundtrip():
+    from collections import OrderedDict
+
     engine = _engine()
-    engine._option_last_quote = {}
+    engine._option_last_quote = OrderedDict()
     engine._option_last_quote_lock = threading.Lock()
+    engine._option_last_quote_max = 10000
 
     assert engine._get_cached_last_quote("XYZ") is None
 
@@ -149,3 +152,37 @@ def test_cached_last_quote_roundtrip():
     # All-None update is a no-op (don't wipe a known quote with empty data).
     engine._update_cached_last_quote("XYZ", bid=None, ask=None, mid=None)
     assert engine._get_cached_last_quote("XYZ") == {"bid": 1.0, "ask": 1.1, "mid": 1.05}
+
+
+def test_cached_last_quote_lru_eviction():
+    from collections import OrderedDict
+
+    engine = _engine()
+    engine._option_last_quote = OrderedDict()
+    engine._option_last_quote_lock = threading.Lock()
+    engine._option_last_quote_max = 3
+
+    for sym in ("A", "B", "C"):
+        engine._update_cached_last_quote(sym, bid=1.0, ask=1.1, mid=1.05)
+    assert list(engine._option_last_quote) == ["A", "B", "C"]
+
+    # Reading A promotes it to most-recently-used; inserting D should evict B.
+    engine._get_cached_last_quote("A")
+    engine._update_cached_last_quote("D", bid=2.0, ask=2.1, mid=2.05)
+    assert list(engine._option_last_quote) == ["C", "A", "D"]
+    assert engine._get_cached_last_quote("B") is None
+
+
+def test_invalidate_baseline_also_drops_last_quote():
+    from collections import OrderedDict
+
+    engine = _engine()
+    engine._option_volume_baseline = {"XYZ": (100, 0.0)}
+    engine._option_volume_baseline_lock = threading.Lock()
+    engine._option_last_quote = OrderedDict()
+    engine._option_last_quote_lock = threading.Lock()
+    engine._option_last_quote_max = 10000
+
+    engine._update_cached_last_quote("XYZ", bid=1.0, ask=1.1, mid=1.05)
+    engine._invalidate_option_volume_baseline("XYZ")
+    assert engine._get_cached_last_quote("XYZ") is None

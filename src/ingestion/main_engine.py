@@ -21,7 +21,7 @@ import time as _time
 from multiprocessing import Process
 from datetime import datetime
 from typing import Dict, Any, List, Optional
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import pytz
 from psycopg2.extras import execute_values
 
@@ -118,8 +118,16 @@ class IngestionEngine:
         # when a bucket only has a single buffered snapshot — without this,
         # the only quote available is the post-trade snapshot, which defeats
         # the prior-tick rule for borderline fills.
-        self._option_last_quote: Dict[str, Dict[str, Optional[float]]] = {}
+        #
+        # LRU-bounded so multi-day sessions can't accumulate stale entries as
+        # the tracked-strike set drifts. Cap is generous relative to the
+        # realistic active-contract set (strikes × expirations × call/put ×
+        # underlyings) so live contracts are never evicted in practice.
+        self._option_last_quote: "OrderedDict[str, Dict[str, Optional[float]]]" = OrderedDict()
         self._option_last_quote_lock = threading.Lock()
+        self._option_last_quote_max = int(
+            os.getenv("OPTION_LAST_QUOTE_CACHE_MAX", "10000")
+        )
 
         # Track latest underlying price for Greeks calculation
         self.latest_underlying_price: Optional[float] = None
@@ -655,11 +663,19 @@ class IngestionEngine:
         """Drop a contract's cached baseline so the next read hits the DB."""
         with self._option_volume_baseline_lock:
             self._option_volume_baseline.pop(option_symbol, None)
+        self._invalidate_option_last_quote(option_symbol)
+
+    def _invalidate_option_last_quote(self, option_symbol: str) -> None:
+        with self._option_last_quote_lock:
+            self._option_last_quote.pop(option_symbol, None)
 
     def _get_cached_last_quote(self, option_symbol: str) -> Optional[Dict[str, Optional[float]]]:
         with self._option_last_quote_lock:
             cached = self._option_last_quote.get(option_symbol)
-            return dict(cached) if cached is not None else None
+            if cached is None:
+                return None
+            self._option_last_quote.move_to_end(option_symbol)
+            return dict(cached)
 
     def _update_cached_last_quote(
         self,
@@ -672,6 +688,9 @@ class IngestionEngine:
             return
         with self._option_last_quote_lock:
             self._option_last_quote[option_symbol] = {"bid": bid, "ask": ask, "mid": mid}
+            self._option_last_quote.move_to_end(option_symbol)
+            while len(self._option_last_quote) > self._option_last_quote_max:
+                self._option_last_quote.popitem(last=False)
 
     def _prepare_option_agg(
         self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False
