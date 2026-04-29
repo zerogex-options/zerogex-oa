@@ -1,0 +1,16 @@
+[Unit]
+Description=Nightly trigger for ZeroGEX log cleanup (03:30 ET)
+
+[Timer]
+# Run daily at 03:30 server time (timezone is America/New_York, set
+# by deploy/steps/010.setup).  This is well outside market and pre-
+# market hours, so any brief nginx reload / rsyslog HUP doesn't drop
+# real traffic.
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=10m
+# Run on next boot if the box was off when the timer was supposed to
+# fire (don't accumulate untriggered runs).
+Persistent=true
+
+[Install]
+WantedBy=timers.target

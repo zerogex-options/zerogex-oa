@@ -84,6 +84,43 @@ done
 # Wait a moment for services to initialize
 sleep 3
 
+# -- Timer-based maintenance units -----------------------------------
+# Oneshot services driven by .timer units (run nightly).  Installed
+# separately from the always-on services above because they don't
+# need the start/stop dance — `enable --now <timer>` is enough.
+TIMER_UNITS=(
+    "zerogex-oa-db-maintain"
+    "zerogex-oa-logs-clear"
+)
+
+log "  → Installing timer-based maintenance units..."
+TIMER_INSTALLED=()
+for unit in "${TIMER_UNITS[@]}"; do
+    SVC="$SYSTEMD_SOURCE/${unit}.service"
+    TMR="$SYSTEMD_SOURCE/${unit}.timer"
+    if [ -f "$SVC" ] && [ -f "$TMR" ]; then
+        sudo cp "$SVC" "$SYSTEMD_TARGET/"
+        sudo cp "$TMR" "$SYSTEMD_TARGET/"
+        TIMER_INSTALLED+=("$unit")
+        log "     ✓ ${unit}.{service,timer}"
+    else
+        log "     ⚠ ${unit}: service or timer file missing — skipping"
+    fi
+done
+
+if [ "${#TIMER_INSTALLED[@]}" -gt 0 ]; then
+    sudo systemctl daemon-reload
+    log "  → Enabling and starting timer-based maintenance units..."
+    for unit in "${TIMER_INSTALLED[@]}"; do
+        if sudo systemctl enable --now "${unit}.timer" 2>/dev/null; then
+            NEXT=$(systemctl list-timers --no-pager --no-legend "${unit}.timer" 2>/dev/null | awk '{print $1, $2}')
+            log "     ✓ ${unit}.timer enabled (next: ${NEXT:-unknown})"
+        else
+            log "     ✗ ${unit}.timer failed to enable"
+        fi
+    done
+fi
+
 # Check status of each service
 log ""
 log "  → Service Status Check:"

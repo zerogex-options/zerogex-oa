@@ -1,0 +1,25 @@
+[Unit]
+Description=ZeroGEX nightly log cleanup (journals + system + nginx + rotated)
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+# Cleanup logic lives in the Makefile's logs-clear-noconfirm target so
+# operators can invoke it identically by hand (`make logs-clear`) and via
+# this timer.  Running as root makes the `sudo` calls inside the recipe
+# no-ops, which is fine — we want the elevated privs anyway to truncate
+# files in /var/log and reload nginx/rsyslog.
+ExecStart=/usr/bin/make logs-clear-noconfirm
+
+# Safety: don't hold the system in degraded state if cleanup hangs (e.g.
+# journalctl --rotate stuck on a corrupt journal).
+TimeoutStartSec=600
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-logs-clear
