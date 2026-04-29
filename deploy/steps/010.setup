@@ -19,11 +19,10 @@ sudo apt install -y \
     git \
     curl \
     wget \
+    dnsutils \
     build-essential \
     python3-pip \
     python3-venv \
-    postgresql \
-    postgresql-contrib \
     jq \
     htop \
     vim
@@ -70,7 +69,6 @@ log ""
 log "Summary:"
 log "  ✓ System packages updated"
 log "  ✓ Essential tools installed"
-log "  ✓ PostgreSQL installed"
 log "  ✓ Timezone set to America/New_York"
 log "  ✓ Logs directory created"
 log "  ✓ .bashrc configured"

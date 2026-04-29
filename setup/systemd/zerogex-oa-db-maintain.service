@@ -1,8 +1,8 @@
 [Unit]
 Description=ZeroGEX daily database maintenance (prune + vacuum + reindex)
 Documentation=https://github.com/zerogex-options/zerogex-oa
-After=postgresql.service
-Requires=postgresql.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot

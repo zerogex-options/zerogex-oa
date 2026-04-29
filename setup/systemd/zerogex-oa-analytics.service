@@ -1,9 +1,8 @@
 [Unit]
 Description=ZeroGEX Options Analytics Engine
 Documentation=https://github.com/zerogex-options/zerogex-oa
-After=network-online.target postgresql.service zerogex-oa-ingestion.service
+After=network-online.target zerogex-oa-ingestion.service
 Wants=network-online.target
-Requires=postgresql.service
 
 [Service]
 Type=simple

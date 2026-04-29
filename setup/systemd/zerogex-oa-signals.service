@@ -1,9 +1,8 @@
 [Unit]
 Description=ZeroGEX Signal Engine
 Documentation=https://github.com/zerogex-options/zerogex-oa
-After=network-online.target postgresql.service zerogex-oa-analytics.service
+After=network-online.target zerogex-oa-analytics.service
 Wants=network-online.target
-Requires=postgresql.service
 
 [Service]
 Type=simple
