@@ -6,6 +6,17 @@
 
 set -e  # Exit on any error
 
+# Refuse to run as root.  Several files (.env, ~/.pgpass, ~/.bashrc,
+# the venv) are created during deploy with the running user's ownership;
+# if that user is root, systemd's User=ubuntu services later fail to
+# read them with no obvious error.  Steps that need privilege call
+# `sudo` themselves.
+if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+    echo "✗ Do not run deploy.sh as root or with sudo."
+    echo "  Run as the 'ubuntu' user; individual steps will sudo when needed."
+    exit 1
+fi
+
 # Export HOME
 [ -z "$HOME" ] && export HOME="/home/ubuntu"
 
@@ -100,6 +111,15 @@ if [ ! -f "$ENV_FILE" ]; then
     exit 1
 fi
 log "Sourcing configuration from $ENV_FILE"
+# Syntactic check first — a malformed line otherwise aborts deploy.sh
+# under `set -e` with no clear log line written.
+if ! bash -n "$ENV_FILE" 2>/tmp/deploy-env-syntax.log; then
+    log "✗ .env has shell syntax errors:"
+    while IFS= read -r line; do log "    $line"; done < /tmp/deploy-env-syntax.log
+    log ""
+    log "    Fix the file and re-run."
+    exit 1
+fi
 set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"

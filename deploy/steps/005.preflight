@@ -73,6 +73,41 @@ if [ "${#MISSING[@]}" -gt 0 ]; then
     exit 1
 fi
 
+# DB_HOST=localhost is the literal default in .env.example but cannot
+# work in this deploy: step 010 no longer installs a local PostgreSQL
+# server (we target AWS RDS).  Catching it here gives a much clearer
+# error than the "psql: connection refused" the user would see in 020.
+case "$DB_HOST" in
+    localhost|127.0.0.1|::1)
+        log "  ✗ DB_HOST=$DB_HOST is the .env.example default and cannot be"
+        log "     used: this deploy connects to AWS RDS, not a local PG server."
+        log "     Set DB_HOST in .env to your RDS endpoint, e.g."
+        log "       DB_HOST=mydb.abc123.us-east-2.rds.amazonaws.com"
+        exit 1 ;;
+esac
+
+# Bash's `source .env` (used by deploy.sh) expands $VAR and `cmd`,
+# while systemd's EnvironmentFile= passes the same line literally.
+# A value like  DB_PASSWORD=foo$bar  silently corrupts to  foo  in
+# bash and stays  foo$bar  in systemd — a subtle, dangerous divergence.
+# Flag any line whose value contains an unquoted $ or backtick.  Lines
+# wrapped in single quotes are safe in both parsers.
+SUSPICIOUS=$(grep -nE "^[A-Z][A-Z0-9_]*=([^\"'#]*[\$\`])" "$ENV_FILE" || true)
+if [ -n "$SUSPICIOUS" ]; then
+    log "  ✗ Lines in .env contain an unquoted '\$' or backtick:"
+    log ""
+    while IFS= read -r line; do
+        log "       $line"
+    done <<< "$SUSPICIOUS"
+    log ""
+    log "     bash will expand these on source; systemd will pass them"
+    log "     literally — the two parsers disagree on the same file."
+    log "     Wrap such values in single quotes, e.g.:"
+    log "       DB_PASSWORD='my\$ecret'"
+    log "       SYMBOL_ALIASES='SPX=\$SPXW.X'"
+    exit 1
+fi
+
 # Sensible defaults for optional connection vars — applied here so every
 # downstream step sees the same value.
 : "${DB_PORT:=5432}"
