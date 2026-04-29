@@ -86,30 +86,19 @@ else
     log "     ⚠ Warning: Expected 5 core tables, found $TABLE_COUNT"
 fi
 
-# Setup data retention cron job
-log "  → Setting up data retention cron job..."
-
-# Ensure log directory exists
+# Ensure the log directory exists for systemd-driven maintenance jobs
+# (zerogex-oa-db-maintain runs `make db-prune` + `make vacuum` daily;
+# zerogex-oa-logs-clear truncates files under here too).
 sudo mkdir -p /var/log/zerogex
 sudo chown $(whoami):$(whoami) /var/log/zerogex
 
-# Define cron job
-CRON_JOB="0 2 * * * psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} -d ${DB_NAME} -c \"SELECT * FROM cleanup_old_data();\" >> /var/log/zerogex/cleanup.log 2>&1"
-
-# Check if cron job already exists
-if crontab -l 2>/dev/null | grep -q "cleanup_old_data"; then
-    log "     ℹ Data retention cron job already exists, skipping..."
-else
-    (crontab -l 2>/dev/null; echo "$CRON_JOB") | crontab -
-    log "     ✓ Data retention cron job added (runs daily at 2:00 AM)"
-fi
-
-# Verify cron job installation
-if crontab -l 2>/dev/null | grep -q "cleanup_old_data"; then
-    log "     ✓ Cron job verified successfully"
-else
-    log "     ⚠ Warning: Cron job verification failed"
-fi
+# NOTE: an earlier version of this step installed a per-user cron
+# entry that ran  SELECT * FROM cleanup_old_data();  nightly.  That
+# function does not exist in schema.sql (only its DROP) so the cron
+# silently failed every night.  Retention is now driven by
+# zerogex-oa-db-maintain.timer (installed in step 100), which runs
+# `make db-prune` against the tables in DB_MAINTAIN_TABLES — the
+# real, working prune mechanism.
 
 log ""
 log "Database setup complete!"
@@ -119,7 +108,7 @@ log "  ✓ PostgreSQL client tools installed"
 log "  ✓ Connection to AWS RDS verified"
 log "  ✓ Database schema applied"
 log "  ✓ .pgpass file created for passwordless access"
-log "  ✓ Data retention cron job scheduled"
+log "  ✓ /var/log/zerogex created for maintenance job output"
 log ""
 log "Connection Details:"
 log "  Host: $DB_HOST"
@@ -129,9 +118,10 @@ log "  User: $DB_USER"
 log "  Password: (stored in ~/.pgpass)"
 log ""
 log "Data Retention:"
-log "  Cleanup Job: Daily at 2:00 AM ET"
-log "  Retention: 90 days for data tables"
-log "  Logs: /var/log/zerogex/cleanup.log"
+log "  Driven by: zerogex-oa-db-maintain.timer (installed in step 100)"
+log "  Schedule:  Daily at 02:00 ET"
+log "  Action:    make db-prune  +  make vacuum"
+log "  Window:    DATA_RETENTION_DAYS=\${DATA_RETENTION_DAYS:-90} (override in .env)"
 log ""
 log "Next Steps:"
 log "  1. Ensure your .env file has DB_PASSWORD_PROVIDER=pgpass"
