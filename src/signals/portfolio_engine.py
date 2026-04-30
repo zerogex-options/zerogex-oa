@@ -29,6 +29,9 @@ from src.config import (
     SIGNALS_BREAKOUT_SIGNAL_SOURCES,
     SIGNALS_BREAKOUT_SIZE_MULTIPLIER,
     SIGNALS_BREAKOUT_TARGET_PCT,
+    SIGNALS_CHOP_DIRECTIONAL_MIN_CONVICTION,
+    SIGNALS_DAILY_LOSS_KILL_ENABLED,
+    SIGNALS_DAILY_LOSS_KILL_PCT,
     SIGNALS_DRAWDOWN_AWARE_SIZING_ENABLED,
     SIGNALS_DRAWDOWN_LOOKBACK_TRADES,
     SIGNALS_DRAWDOWN_SIZE_MULTIPLIER,
@@ -56,6 +59,7 @@ from src.config import (
     SIGNALS_INTRADAY_TARGET_PCT,
     SIGNALS_INTRADAY_TIME_STOP_MINUTES,
     SIGNALS_MIN_HOLD_SECONDS,
+    SIGNALS_NO_0DTE_AFTERNOON_MINUTES,
     SIGNALS_NO_0DTE_MORNING_MINUTES,
     SIGNALS_PORTFOLIO_SIZE,
     SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES,
@@ -71,6 +75,8 @@ from src.config import (
     SIGNALS_SWING_TIME_STOP_MINUTES,
     SIGNALS_TARGET_PCT,
     SIGNALS_TIME_STOP_MINUTES,
+    SIGNALS_TREND_LOOKBACK_BARS,
+    SIGNALS_TREND_THRESHOLD_BPS,
     SIGNALS_TRIGGER_THRESHOLD,
 )
 from src.signals import regime_filter
@@ -193,7 +199,14 @@ class PortfolioEngine:
 
     @staticmethod
     def _market_status(dt: Optional[datetime] = None) -> str:
-        """Return OPEN only during regular options trading hours (09:30-16:15 ET)."""
+        """Return OPEN only during regular cash-equity trading hours (09:30-16:00 ET).
+
+        The previous 16:15 cutoff allowed entries in the 16:00-16:15 window where
+        the underlying has stopped trading but option chains still report stale
+        quotes — every trade opened in that window is effectively a write-off
+        because there is no live hedge for the dealer and nothing to mark
+        against. Tightening to 16:00 kills that systematic loss.
+        """
         if dt is None:
             dt = datetime.now(ET)
         elif dt.tzinfo is None:
@@ -206,8 +219,8 @@ class PortfolioEngine:
 
         current_time = dt.time()
         market_open = datetime.strptime("09:30:00", "%H:%M:%S").time()
-        market_close = datetime.strptime("16:15:00", "%H:%M:%S").time()
-        return "OPEN" if market_open <= current_time <= market_close else "CLOSED"
+        market_close = datetime.strptime("16:00:00", "%H:%M:%S").time()
+        return "OPEN" if market_open <= current_time < market_close else "CLOSED"
 
     @staticmethod
     def _risk_profile_for_timeframe(signal_timeframe: Optional[str]) -> dict:
@@ -302,6 +315,32 @@ class PortfolioEngine:
                 f"MSI {msi:.1f} regime={regime} lacks directional trend signal",
             )
 
+        # Chop-regime gate: directional debits in MSI 20-40 chop are
+        # statistically a coin flip minus spread + theta.  Even when an
+        # advanced signal triggers, require conviction at least the
+        # configured floor before sizing capital into a directional play.
+        chop_floor = float(SIGNALS_CHOP_DIRECTIONAL_MIN_CONVICTION)
+        if regime == "chop_range" and conviction < chop_floor:
+            return self._cash_target(
+                score,
+                f"Chop regime conviction {conviction:.2f} below directional "
+                f"floor {chop_floor:.2f}",
+            )
+
+        # Daily-loss kill switch: once today's realized losses exceed the
+        # configured fraction of portfolio, halt all new entries until the
+        # session rolls over.  Existing positions are still managed by their
+        # stored stop/target plans inside reconcile().
+        if SIGNALS_DAILY_LOSS_KILL_ENABLED:
+            daily_state = self._daily_loss_state(score.timestamp, conn)
+            if daily_state.get("kill"):
+                rolling = float(daily_state.get("realized_today", 0.0))
+                limit = float(daily_state.get("limit", 0.0))
+                return self._cash_target(
+                    score,
+                    f"Daily loss kill engaged: realized=${rolling:.0f} " f"<= -${limit:.0f}",
+                )
+
         # Asymmetric trigger / hysteresis: require strict entry threshold to
         # open a fresh position; once we already hold the same direction, fall
         # back to the looser exit threshold so a 1-2 point MSI dip doesn't
@@ -312,9 +351,7 @@ class PortfolioEngine:
         # are independent triggers that self-gate via min-score and confluence
         # ratio filters before reaching compute_target.
         agg = score.aggregation or {}
-        is_signal_driven = bool(
-            agg.get("advanced_trigger") or agg.get("confluence_trigger")
-        )
+        is_signal_driven = bool(agg.get("advanced_trigger") or agg.get("confluence_trigger"))
         if not is_signal_driven:
             held_direction = self._current_position_direction(conn)
             if held_direction == trade_direction:
@@ -684,9 +721,7 @@ class PortfolioEngine:
         return target
 
     @staticmethod
-    def _apply_breakout_boost(
-        target: PortfolioTarget, signal_name: str
-    ) -> Optional[str]:
+    def _apply_breakout_boost(target: PortfolioTarget, signal_name: str) -> Optional[str]:
         """Apply Phase 3.2 sizing/target boost when the trigger is a directional-
         expansion advanced signal (range_break_imminence, squeeze_setup, etc.).
 
@@ -725,8 +760,7 @@ class PortfolioEngine:
         if target.target_positions:
             primary = target.target_positions[0]
             target.target_heat_pct = round(
-                abs(primary.entry_mark) * boosted_total * 100
-                / max(SIGNALS_PORTFOLIO_SIZE, 1.0),
+                abs(primary.entry_mark) * boosted_total * 100 / max(SIGNALS_PORTFOLIO_SIZE, 1.0),
                 6,
             )
         return f"breakout-boost x{size_mult:.2f} target={widen_target_pct:.0%}"
@@ -1049,20 +1083,29 @@ class PortfolioEngine:
 
     @staticmethod
     def _msi_trend_direction(market_ctx: dict) -> str:
+        """Resolve trade direction from recent close path.
+
+        Uses the longest available lookback up to 5 bars and a percentage
+        threshold (default 15bps) so single-tick noise can't flip direction
+        bar-to-bar. The legacy 5bps / 3-bar trigger fired on $0.33 of QQQ
+        movement and produced the bull→bear→bull whipsaw seen in trade history.
+        """
         closes = market_ctx.get("recent_closes") or []
         if len(closes) < 3:
             return "neutral"
+        lookback = min(SIGNALS_TREND_LOOKBACK_BARS, len(closes))
         try:
-            start = float(closes[-3])
+            start = float(closes[-lookback])
             end = float(closes[-1])
         except (TypeError, ValueError):
             return "neutral"
         if start <= 0:
             return "neutral"
+        threshold = max(0.0, float(SIGNALS_TREND_THRESHOLD_BPS)) / 10_000.0
         move = (end - start) / start
-        if move > 0.0005:
+        if move > threshold:
             return "bullish"
-        if move < -0.0005:
+        if move < -threshold:
             return "bearish"
         return "neutral"
 
@@ -1763,25 +1806,30 @@ class PortfolioEngine:
         else:
             ts_et = opened_at.astimezone(ET)
         t = ts_et.time()
-        if t >= datetime.strptime("15:30", "%H:%M").time() and t < datetime.strptime(
-            "16:00", "%H:%M"
-        ).time():
+        if (
+            t >= datetime.strptime("15:30", "%H:%M").time()
+            and t < datetime.strptime("16:00", "%H:%M").time()
+        ):
             return "close"
-        if t >= datetime.strptime("13:30", "%H:%M").time() and t < datetime.strptime(
-            "15:30", "%H:%M"
-        ).time():
+        if (
+            t >= datetime.strptime("13:30", "%H:%M").time()
+            and t < datetime.strptime("15:30", "%H:%M").time()
+        ):
             return "afternoon"
-        if t >= datetime.strptime("11:30", "%H:%M").time() and t < datetime.strptime(
-            "13:30", "%H:%M"
-        ).time():
+        if (
+            t >= datetime.strptime("11:30", "%H:%M").time()
+            and t < datetime.strptime("13:30", "%H:%M").time()
+        ):
             return "lunch"
-        if t >= datetime.strptime("10:30", "%H:%M").time() and t < datetime.strptime(
-            "11:30", "%H:%M"
-        ).time():
+        if (
+            t >= datetime.strptime("10:30", "%H:%M").time()
+            and t < datetime.strptime("11:30", "%H:%M").time()
+        ):
             return "morning"
-        if t >= datetime.strptime("09:30", "%H:%M").time() and t < datetime.strptime(
-            "10:30", "%H:%M"
-        ).time():
+        if (
+            t >= datetime.strptime("09:30", "%H:%M").time()
+            and t < datetime.strptime("10:30", "%H:%M").time()
+        ):
             return "open"
         return "outside"
 
@@ -1843,9 +1891,8 @@ class PortfolioEngine:
         payload = tp.optimizer_payload or {}
         signal_timeframe = str(payload.get("signal_timeframe") or "intraday").strip().lower()
         risk_profile = self._risk_profile_for_timeframe(signal_timeframe)
-        pricing_mode = (
-            payload.get("pricing_mode")
-            or ("credit" if "credit" in (tp.strategy_type or "") else "debit")
+        pricing_mode = payload.get("pricing_mode") or (
+            "credit" if "credit" in (tp.strategy_type or "") else "debit"
         )
 
         # SIGNALS_STOP_LOSS_PCT is signed negative (-0.25 = 25% loss tolerance);
@@ -1874,7 +1921,9 @@ class PortfolioEngine:
 
         time_stop_minutes = int(risk_profile.get("time_stop_minutes", self.time_stop_minutes) or 0)
         min_hold_seconds = int(risk_profile.get("min_hold_seconds", self.min_hold_seconds) or 0)
-        time_stop = opened_at_utc + timedelta(minutes=time_stop_minutes) if time_stop_minutes > 0 else None
+        time_stop = (
+            opened_at_utc + timedelta(minutes=time_stop_minutes) if time_stop_minutes > 0 else None
+        )
         min_hold_until = (
             opened_at_utc + timedelta(seconds=min_hold_seconds) if min_hold_seconds > 0 else None
         )
@@ -2023,6 +2072,55 @@ class PortfolioEngine:
         except Exception:
             return "neutral"
 
+    def _daily_loss_state(self, as_of: datetime, conn=None) -> dict:
+        """Return today's realized PnL and whether the kill switch should fire.
+
+        Sums total_pnl across signal_trades for this symbol that closed today
+        (ET).  When the running sum drops below
+        ``-SIGNALS_DAILY_LOSS_KILL_PCT × SIGNALS_PORTFOLIO_SIZE`` the
+        ``kill`` flag is set and compute_target returns a cash target.  DB or
+        mock failures fall back to a no-op state so unit tests stay clean.
+        """
+        if not SIGNALS_DAILY_LOSS_KILL_ENABLED:
+            return {"kill": False, "realized_today": 0.0, "limit": 0.0}
+
+        kill_pct = float(SIGNALS_DAILY_LOSS_KILL_PCT)
+        portfolio = float(SIGNALS_PORTFOLIO_SIZE)
+        if kill_pct <= 0 or portfolio <= 0:
+            return {"kill": False, "realized_today": 0.0, "limit": 0.0}
+
+        if as_of.tzinfo is None:
+            as_of_et = ET.localize(as_of)
+        else:
+            as_of_et = as_of.astimezone(ET)
+        session_date = as_of_et.date()
+
+        try:
+            with self._use_conn(conn) as c:
+                cur = c.cursor()
+                cur.execute(
+                    """
+                    SELECT COALESCE(SUM(total_pnl), 0)
+                    FROM signal_trades
+                    WHERE underlying = %s
+                      AND status = 'closed'
+                      AND closed_at IS NOT NULL
+                      AND (closed_at AT TIME ZONE 'US/Eastern')::date = %s
+                    """,
+                    (self.db_symbol, session_date),
+                )
+                row = cur.fetchone()
+                realized_today = float(row[0]) if row and row[0] is not None else 0.0
+        except Exception:
+            return {"kill": False, "realized_today": 0.0, "limit": 0.0}
+
+        limit_dollars = kill_pct * portfolio
+        return {
+            "kill": realized_today <= -limit_dollars,
+            "realized_today": realized_today,
+            "limit": limit_dollars,
+        }
+
     def _drawdown_sizing_state(self, conn=None) -> dict:
         """Return drawdown circuit-breaker state: {"multiplier", "rolling_pnl"}.
 
@@ -2058,9 +2156,7 @@ class PortfolioEngine:
         except Exception:
             return {"multiplier": 1.0, "rolling_pnl": 0.0, "engaged": False}
 
-        trigger_dollars = (
-            -float(SIGNALS_DRAWDOWN_TRIGGER_PCT) * float(SIGNALS_PORTFOLIO_SIZE)
-        )
+        trigger_dollars = -float(SIGNALS_DRAWDOWN_TRIGGER_PCT) * float(SIGNALS_PORTFOLIO_SIZE)
         if rolling_pnl <= trigger_dollars:
             return {
                 "multiplier": float(SIGNALS_DRAWDOWN_SIZE_MULTIPLIER),
@@ -2217,9 +2313,7 @@ class PortfolioEngine:
         return "intraday"
 
     @staticmethod
-    def _resolve_dte_window(
-        signal_timeframe: str, timestamp: datetime
-    ) -> tuple[int, int]:
+    def _resolve_dte_window(signal_timeframe: str, timestamp: datetime) -> tuple[int, int]:
         """Return the (dte_min, dte_max) window for the optimizer fetch.
 
         Phase 3.3: prevent 0DTE fills early in the session.  In the first
@@ -2228,10 +2322,20 @@ class PortfolioEngine:
         premium repricing — a coin-flip window.  Bump dte_min from 0 to 1
         in that window so the optimizer reaches for 1-2 DTE structures
         with theta protection.
+
+        Phase 4.4: symmetric afternoon block.  In the last
+        ``SIGNALS_NO_0DTE_AFTERNOON_MINUTES`` minutes of the session, 0DTE
+        pricing is dominated by gamma pin compression + charm decay, and
+        directional debits race the clock against fading delta.  Apply the
+        same bump so a late-day signal opens 1-2 DTE instead of expiring
+        worthless overnight.
         """
         base_min, base_max = TARGET_DTE_WINDOWS.get(signal_timeframe, (1, 7))
-        no_zero_minutes = int(SIGNALS_NO_0DTE_MORNING_MINUTES)
-        if no_zero_minutes <= 0 or base_min > 0:
+        if base_min > 0:
+            return base_min, base_max
+        no_zero_morning = int(SIGNALS_NO_0DTE_MORNING_MINUTES)
+        no_zero_afternoon = int(SIGNALS_NO_0DTE_AFTERNOON_MINUTES)
+        if no_zero_morning <= 0 and no_zero_afternoon <= 0:
             return base_min, base_max
 
         if timestamp.tzinfo is None:
@@ -2240,10 +2344,24 @@ class PortfolioEngine:
             ts_et = timestamp.astimezone(ET)
 
         market_open_dt = datetime.combine(
-            ts_et.date(), datetime.strptime("09:30", "%H:%M").time(), tzinfo=ts_et.tzinfo,
+            ts_et.date(),
+            datetime.strptime("09:30", "%H:%M").time(),
+            tzinfo=ts_et.tzinfo,
         )
-        cutoff_dt = market_open_dt + timedelta(minutes=no_zero_minutes)
-        if market_open_dt <= ts_et < cutoff_dt:
+        market_close_dt = datetime.combine(
+            ts_et.date(),
+            datetime.strptime("16:00", "%H:%M").time(),
+            tzinfo=ts_et.tzinfo,
+        )
+        morning_cutoff_dt = market_open_dt + timedelta(minutes=no_zero_morning)
+        afternoon_cutoff_dt = market_close_dt - timedelta(minutes=no_zero_afternoon)
+
+        in_morning_block = no_zero_morning > 0 and market_open_dt <= ts_et < morning_cutoff_dt
+        in_afternoon_block = (
+            no_zero_afternoon > 0 and afternoon_cutoff_dt <= ts_et < market_close_dt
+        )
+
+        if in_morning_block or in_afternoon_block:
             # Bump dte_min to 1 but keep dte_max so we still get 1-2 DTE.
             return max(base_min, 1), max(base_max, 1)
         return base_min, base_max

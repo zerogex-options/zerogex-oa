@@ -311,21 +311,24 @@ SIGNALS_MAX_PORTFOLIO_HEAT_PCT = float(os.getenv("SIGNALS_MAX_PORTFOLIO_HEAT_PCT
 SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES = int(
     os.getenv("SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES", "30")
 )
-SIGNALS_TRIGGER_THRESHOLD = _getenv_float(
-    "SIGNALS_TRIGGER_THRESHOLD", 0.60, min=0.0, max=1.0
-)
+SIGNALS_TRIGGER_THRESHOLD = _getenv_float("SIGNALS_TRIGGER_THRESHOLD", 0.60, min=0.0, max=1.0)
 # Asymmetric exit: once a position is open in a direction, conviction must
 # decay below this floor (lower than the entry trigger) before we close.
 # Entry-vs-exit hysteresis cuts whipsaws when MSI oscillates around the trigger.
-SIGNALS_EXIT_THRESHOLD = _getenv_float(
-    "SIGNALS_EXIT_THRESHOLD", 0.45, min=0.0, max=1.0
-)
+SIGNALS_EXIT_THRESHOLD = _getenv_float("SIGNALS_EXIT_THRESHOLD", 0.45, min=0.0, max=1.0)
 # Combined gate: kelly_fraction × conviction must clear this floor or the
 # trade is rejected before sizing. Kills "fire on technically-positive but
 # microscopic edge" cases that produce 50/50 scalps.
-SIGNALS_CONVICTION_FLOOR = _getenv_float(
-    "SIGNALS_CONVICTION_FLOOR", 0.05, min=0.0, max=1.0
+SIGNALS_CONVICTION_FLOOR = _getenv_float("SIGNALS_CONVICTION_FLOOR", 0.05, min=0.0, max=1.0)
+# Trend-direction guard: how big a multi-bar move (in basis points of price)
+# is required before _msi_trend_direction commits to bullish/bearish.  The
+# previous implicit 5bps threshold flipped on single-tick noise on QQQ/SPY,
+# producing the bull→bear→bull whipsaws in trade history.  15bps requires a
+# real, measurable trend before a directional debit fires.
+SIGNALS_TREND_THRESHOLD_BPS = _getenv_float(
+    "SIGNALS_TREND_THRESHOLD_BPS", 15.0, min=0.0, max=10000.0
 )
+SIGNALS_TREND_LOOKBACK_BARS = _getenv_int("SIGNALS_TREND_LOOKBACK_BARS", 5, min=2, max=120)
 SIGNALS_TREND_CONFIRMATION_BARS = max(0, int(os.getenv("SIGNALS_TREND_CONFIRMATION_BARS", "3")))
 SIGNALS_TREND_CONFIRMATION_MIN_MATCH = max(
     0, int(os.getenv("SIGNALS_TREND_CONFIRMATION_MIN_MATCH", "1"))
@@ -344,9 +347,7 @@ SIGNALS_TARGET_PCT = _getenv_float("SIGNALS_TARGET_PCT", 0.50, min=0.0)
 # Time stop: close any open trade older than this many minutes. Prevents
 # stale positions from drifting through the close on a quiet afternoon.
 # Set to 0 to disable.
-SIGNALS_TIME_STOP_MINUTES = _getenv_int(
-    "SIGNALS_TIME_STOP_MINUTES", 60, min=0, max=1440
-)
+SIGNALS_TIME_STOP_MINUTES = _getenv_int("SIGNALS_TIME_STOP_MINUTES", 60, min=0, max=1440)
 
 # Optional timeframe-specific lifecycle overrides (fallback to global values above):
 # - scalp: fast turnover
@@ -382,9 +383,7 @@ SIGNALS_RECONCILE_LOCK_ENABLED = _getenv_bool("SIGNALS_RECONCILE_LOCK_ENABLED", 
 # Kelly, the practitioner standard.  Was hard-coded at 0.25 (quarter-Kelly)
 # in position_optimizer_engine.py which combined with conviction + tier %
 # damping produced microscopic position sizes.
-SIGNALS_KELLY_FRACTION = _getenv_float(
-    "SIGNALS_KELLY_FRACTION", 0.50, min=0.0, max=1.0
-)
+SIGNALS_KELLY_FRACTION = _getenv_float("SIGNALS_KELLY_FRACTION", 0.50, min=0.0, max=1.0)
 
 # -----------------------------------------------------------------------------
 # Regime filter (Phase 2: time-of-day + event suppression)
@@ -398,25 +397,22 @@ SIGNALS_LUNCH_END_ET = os.getenv("SIGNALS_LUNCH_END_ET", "13:30").strip()
 # Conviction (normalized MSI 0..1) required to trade *through* the lunch
 # chop window.  A genuine trend-day breakout can clear this; routine chop
 # can't.  Set to 1.0 to make the lunch block hard.
-SIGNALS_LUNCH_MSI_OVERRIDE = _getenv_float(
-    "SIGNALS_LUNCH_MSI_OVERRIDE", 0.75, min=0.0, max=1.0
-)
+SIGNALS_LUNCH_MSI_OVERRIDE = _getenv_float("SIGNALS_LUNCH_MSI_OVERRIDE", 0.75, min=0.0, max=1.0)
 # Last-N-minutes before close: only eod_pressure-sourced entries are allowed
-# (close-pinning + dealer-flow plays). 0 disables.
+# (close-pinning + dealer-flow plays). 0 disables.  The previous 10-minute
+# default left 15:50-16:00 covered but 15:30-15:50 wide open for noise-driven
+# scalps that systematically lose on theta + spread.  30 minutes pushes the
+# lockdown to 15:30, the empirical edge cliff for late-day directional debits.
 SIGNALS_LATE_CLOSE_LOCKDOWN_MINUTES = _getenv_int(
-    "SIGNALS_LATE_CLOSE_LOCKDOWN_MINUTES", 10, min=0, max=120
+    "SIGNALS_LATE_CLOSE_LOCKDOWN_MINUTES", 30, min=0, max=120
 )
 # Buffer (minutes) around each scheduled event below.  0 disables event filter.
-SIGNALS_EVENT_BUFFER_MINUTES = _getenv_int(
-    "SIGNALS_EVENT_BUFFER_MINUTES", 15, min=0, max=240
-)
+SIGNALS_EVENT_BUFFER_MINUTES = _getenv_int("SIGNALS_EVENT_BUFFER_MINUTES", 15, min=0, max=240)
 # Comma-separated list of ISO ET timestamps for FOMC/CPI/NFP/etc.
 # Example: "2026-05-07T08:30,2026-05-21T14:00"  (ET, no offset implied).
 # When a timestamp has no offset it is interpreted in America/New_York.
 SIGNALS_EVENT_CALENDAR = [
-    item.strip()
-    for item in os.getenv("SIGNALS_EVENT_CALENDAR", "").split(",")
-    if item.strip()
+    item.strip() for item in os.getenv("SIGNALS_EVENT_CALENDAR", "").split(",") if item.strip()
 ]
 
 # -----------------------------------------------------------------------------
@@ -427,9 +423,7 @@ SIGNALS_EVENT_CALENDAR = [
 # are: another advanced signal triggered, a basic signal score above the
 # basic-confirmation cutoff, or the MSI conviction above the MSI-confirmation
 # cutoff.
-SIGNALS_ADVANCED_REQUIRE_CONFIRMATION = _getenv_bool(
-    "SIGNALS_ADVANCED_REQUIRE_CONFIRMATION", True
-)
+SIGNALS_ADVANCED_REQUIRE_CONFIRMATION = _getenv_bool("SIGNALS_ADVANCED_REQUIRE_CONFIRMATION", True)
 SIGNALS_ADVANCED_MIN_BASIC_CONFIRM = _getenv_float(
     "SIGNALS_ADVANCED_MIN_BASIC_CONFIRM", 0.30, min=0.0, max=1.0
 )
@@ -445,9 +439,39 @@ SIGNALS_ADVANCED_MIN_MSI_CONFIRM = _getenv_float(
 # orders — a coin-flip window.  Bump optimizer dte_min from 0 to 1 inside
 # this window so we reach for 1-2 DTE structures with theta protection.
 # Set to 0 to disable.
-SIGNALS_NO_0DTE_MORNING_MINUTES = _getenv_int(
-    "SIGNALS_NO_0DTE_MORNING_MINUTES", 90, min=0, max=390
+SIGNALS_NO_0DTE_MORNING_MINUTES = _getenv_int("SIGNALS_NO_0DTE_MORNING_MINUTES", 90, min=0, max=390)
+# Symmetric afternoon guard: in the last N minutes of the session 0DTE pricing
+# is dominated by gamma pin compression + charm decay, and any directional
+# debit is racing the clock against fading delta.  Bumping dte_min from 0 to 1
+# in this window forces the optimizer to reach for 1-2 DTE structures with
+# theta protection.  Set to 0 to disable.
+SIGNALS_NO_0DTE_AFTERNOON_MINUTES = _getenv_int(
+    "SIGNALS_NO_0DTE_AFTERNOON_MINUTES", 90, min=0, max=390
 )
+
+# -----------------------------------------------------------------------------
+# Chop-regime directional gate (Phase 4.4)
+# -----------------------------------------------------------------------------
+# When MSI is in the chop_range band (20-40), directional debits are
+# statistically a coin flip minus spread + theta.  Even when an advanced
+# signal triggers, require conviction at least this high before allowing a
+# directional bull/bear debit to fire from chop.  Below this threshold the
+# engine stays in cash regardless of signal_driven flags.
+SIGNALS_CHOP_DIRECTIONAL_MIN_CONVICTION = _getenv_float(
+    "SIGNALS_CHOP_DIRECTIONAL_MIN_CONVICTION", 0.30, min=0.0, max=1.0
+)
+
+# -----------------------------------------------------------------------------
+# Daily-loss kill switch (Phase 4.4)
+# -----------------------------------------------------------------------------
+# Hard ceiling on a single trading day's realized loss.  Once today's summed
+# realized PnL drops below -SIGNALS_DAILY_LOSS_KILL_PCT × SIGNALS_PORTFOLIO_SIZE,
+# every subsequent compute_target returns a cash target and existing positions
+# are managed by their own stop/target plans.  Trading resumes the next session.
+# Set to 0 to disable.  Independent from the rolling-N-trade drawdown breaker
+# (which only down-sizes); this fully halts new entries.
+SIGNALS_DAILY_LOSS_KILL_ENABLED = _getenv_bool("SIGNALS_DAILY_LOSS_KILL_ENABLED", True)
+SIGNALS_DAILY_LOSS_KILL_PCT = _getenv_float("SIGNALS_DAILY_LOSS_KILL_PCT", 0.01, min=0.0, max=1.0)
 
 # -----------------------------------------------------------------------------
 # Inflection-point sizing boost (Phase 3.2)
@@ -460,9 +484,7 @@ SIGNALS_NO_0DTE_MORNING_MINUTES = _getenv_int(
 SIGNALS_BREAKOUT_SIZE_MULTIPLIER = _getenv_float(
     "SIGNALS_BREAKOUT_SIZE_MULTIPLIER", 1.50, min=0.0, max=4.0
 )
-SIGNALS_BREAKOUT_TARGET_PCT = _getenv_float(
-    "SIGNALS_BREAKOUT_TARGET_PCT", 1.00, min=0.0
-)
+SIGNALS_BREAKOUT_TARGET_PCT = _getenv_float("SIGNALS_BREAKOUT_TARGET_PCT", 1.00, min=0.0)
 # Comma-separated list of advanced-signal names eligible for the boost.
 SIGNALS_BREAKOUT_SIGNAL_SOURCES = [
     item.strip().lower()
@@ -484,16 +506,12 @@ SIGNALS_BREAKOUT_SIGNAL_SOURCES = [
 # rolling sum recovers.  Standard Kelly assumes independent trials; this
 # accounts for the fact that consecutive losses usually mean we're in a
 # regime the model is reading wrong.
-SIGNALS_DRAWDOWN_AWARE_SIZING_ENABLED = _getenv_bool(
-    "SIGNALS_DRAWDOWN_AWARE_SIZING_ENABLED", True
-)
+SIGNALS_DRAWDOWN_AWARE_SIZING_ENABLED = _getenv_bool("SIGNALS_DRAWDOWN_AWARE_SIZING_ENABLED", True)
 SIGNALS_DRAWDOWN_LOOKBACK_TRADES = _getenv_int(
     "SIGNALS_DRAWDOWN_LOOKBACK_TRADES", 20, min=1, max=500
 )
 # Trigger as a fraction of portfolio size.  0.02 = 2% of equity.
-SIGNALS_DRAWDOWN_TRIGGER_PCT = _getenv_float(
-    "SIGNALS_DRAWDOWN_TRIGGER_PCT", 0.02, min=0.0, max=1.0
-)
+SIGNALS_DRAWDOWN_TRIGGER_PCT = _getenv_float("SIGNALS_DRAWDOWN_TRIGGER_PCT", 0.02, min=0.0, max=1.0)
 # Sizing multiplier applied while the breaker is engaged.  0.50 = half-size.
 SIGNALS_DRAWDOWN_SIZE_MULTIPLIER = _getenv_float(
     "SIGNALS_DRAWDOWN_SIZE_MULTIPLIER", 0.50, min=0.0, max=1.0

@@ -571,6 +571,19 @@ class TestMarketStatusGate:
         status = PortfolioEngine._market_status(datetime(2026, 4, 6, 14, 0, tzinfo=timezone.utc))
         assert status == "OPEN"
 
+    def test_market_status_closed_after_1600_et(self):
+        # 20:01 UTC = 16:01 ET, one minute past the cash-equity close.
+        # Trades opened in this window were the smoking gun in the trade
+        # history — the underlying has stopped, but option chains still report
+        # stale quotes that the engine was happy to fill against.
+        status = PortfolioEngine._market_status(datetime(2026, 4, 6, 20, 1, tzinfo=timezone.utc))
+        assert status == "CLOSED"
+
+    def test_market_status_closed_at_exact_1600_et(self):
+        # 20:00 UTC = 16:00 ET; treat the bell tick itself as CLOSED.
+        status = PortfolioEngine._market_status(datetime(2026, 4, 6, 20, 0, tzinfo=timezone.utc))
+        assert status == "CLOSED"
+
     def test_market_status_closed_after_1615_et(self):
         status = PortfolioEngine._market_status(datetime(2026, 4, 6, 20, 16, tzinfo=timezone.utc))
         assert status == "CLOSED"
@@ -1379,6 +1392,22 @@ class TestAdaptiveExpirySelection:
         # intraday window is (0, 2) per TARGET_DTE_WINDOWS — 0DTE re-enabled.
         assert dte_min == 0
 
+    def test_dte_min_bumped_to_one_in_afternoon_window(self):
+        # 14:35 ET (= 18:35 UTC), 5 minutes into the last-90 lockout.
+        # Phase 4.4: late-day 0DTE pricing is dominated by pin compression
+        # and charm decay — bump dte_min to keep theta on our side.
+        ts = datetime(2026, 4, 28, 18, 35, tzinfo=timezone.utc)
+        dte_min, dte_max = PortfolioEngine._resolve_dte_window("intraday", ts)
+        assert dte_min == 1
+        assert dte_max >= 1
+
+    def test_dte_window_open_in_midday(self):
+        # 13:00 ET (= 17:00 UTC) — outside both the morning block and the
+        # afternoon lockout.  0DTE is allowed.
+        ts = datetime(2026, 4, 28, 17, 0, tzinfo=timezone.utc)
+        dte_min, _ = PortfolioEngine._resolve_dte_window("intraday", ts)
+        assert dte_min == 0
+
     def test_swing_window_never_includes_0dte(self):
         # Swing fetches 1-7 DTE regardless of time-of-day; the no-0DTE filter
         # should be a no-op since base_min already > 0.
@@ -1507,11 +1536,11 @@ class TestAttributionMetadata:
     def test_attribution_classifies_open_morning_lunch_afternoon_close(self):
         engine = _make_engine()
         cases = [
-            (datetime(2026, 4, 28, 13, 45, tzinfo=timezone.utc), "open"),       # 09:45 ET
-            (datetime(2026, 4, 28, 15, 0, tzinfo=timezone.utc), "morning"),     # 11:00 ET
-            (datetime(2026, 4, 28, 16, 30, tzinfo=timezone.utc), "lunch"),      # 12:30 ET
+            (datetime(2026, 4, 28, 13, 45, tzinfo=timezone.utc), "open"),  # 09:45 ET
+            (datetime(2026, 4, 28, 15, 0, tzinfo=timezone.utc), "morning"),  # 11:00 ET
+            (datetime(2026, 4, 28, 16, 30, tzinfo=timezone.utc), "lunch"),  # 12:30 ET
             (datetime(2026, 4, 28, 18, 30, tzinfo=timezone.utc), "afternoon"),  # 14:30 ET
-            (datetime(2026, 4, 28, 19, 45, tzinfo=timezone.utc), "close"),      # 15:45 ET
+            (datetime(2026, 4, 28, 19, 45, tzinfo=timezone.utc), "close"),  # 15:45 ET
         ]
         for ts, expected in cases:
             target = self._target()
@@ -1670,25 +1699,40 @@ class TestRegimeFilterIntegration:
         from src.signals import regime_filter as rf
 
         with (
-            patch.object(engine, "compute_target", return_value=PortfolioTarget(
-                underlying="SPY", timestamp=NOW, composite_score=50.0,
-                normalized_score=0.5, direction="controlled_trend",
-                target_positions=[], total_target_contracts=0,
-                target_heat_pct=0.0, rationale="composite cash",
-            )),
+            patch.object(
+                engine,
+                "compute_target",
+                return_value=PortfolioTarget(
+                    underlying="SPY",
+                    timestamp=NOW,
+                    composite_score=50.0,
+                    normalized_score=0.5,
+                    direction="controlled_trend",
+                    target_positions=[],
+                    total_target_contracts=0,
+                    target_heat_pct=0.0,
+                    rationale="composite cash",
+                ),
+            ),
             patch.object(engine, "_build_advanced_target", return_value=target),
             patch.object(engine, "_current_position_direction", return_value="neutral"),
-            patch.object(rf, "evaluate", return_value=rf.FilterDecision(
-                skip=True, reason="Lunch chop test")),
+            patch.object(
+                rf, "evaluate", return_value=rf.FilterDecision(skip=True, reason="Lunch chop test")
+            ),
         ):
             out = engine.compute_target_with_advanced_signals(
                 self._score(),
                 {
-                    "close": 500.0, "net_gex": -1e8, "gamma_flip": 499.0,
+                    "close": 500.0,
+                    "net_gex": -1e8,
+                    "gamma_flip": 499.0,
                     "max_gamma_strike": 500.0,
-                    "put_call_ratio": 1.0, "max_pain": 500.0,
-                    "smart_call": 0.0, "smart_put": 0.0,
-                    "recent_closes": [499.0, 499.5, 500.0], "iv_rank": 0.4,
+                    "put_call_ratio": 1.0,
+                    "max_pain": 500.0,
+                    "smart_call": 0.0,
+                    "smart_put": 0.0,
+                    "recent_closes": [499.0, 499.5, 500.0],
+                    "iv_rank": 0.4,
                 },
                 advanced_results=[],
                 basic_results=[],
@@ -1704,12 +1748,21 @@ class TestRegimeFilterIntegration:
         from src.signals import regime_filter as rf
 
         with (
-            patch.object(engine, "compute_target", return_value=PortfolioTarget(
-                underlying="SPY", timestamp=NOW, composite_score=50.0,
-                normalized_score=0.5, direction="controlled_trend",
-                target_positions=[], total_target_contracts=0,
-                target_heat_pct=0.0, rationale="composite cash",
-            )),
+            patch.object(
+                engine,
+                "compute_target",
+                return_value=PortfolioTarget(
+                    underlying="SPY",
+                    timestamp=NOW,
+                    composite_score=50.0,
+                    normalized_score=0.5,
+                    direction="controlled_trend",
+                    target_positions=[],
+                    total_target_contracts=0,
+                    target_heat_pct=0.0,
+                    rationale="composite cash",
+                ),
+            ),
             patch.object(engine, "_build_advanced_target", return_value=target),
             patch.object(engine, "_current_position_direction", return_value="bullish"),
             patch.object(rf, "evaluate") as eval_mock,
@@ -1717,11 +1770,16 @@ class TestRegimeFilterIntegration:
             out = engine.compute_target_with_advanced_signals(
                 self._score(),
                 {
-                    "close": 500.0, "net_gex": -1e8, "gamma_flip": 499.0,
+                    "close": 500.0,
+                    "net_gex": -1e8,
+                    "gamma_flip": 499.0,
                     "max_gamma_strike": 500.0,
-                    "put_call_ratio": 1.0, "max_pain": 500.0,
-                    "smart_call": 0.0, "smart_put": 0.0,
-                    "recent_closes": [499.0, 499.5, 500.0], "iv_rank": 0.4,
+                    "put_call_ratio": 1.0,
+                    "max_pain": 500.0,
+                    "smart_call": 0.0,
+                    "smart_put": 0.0,
+                    "recent_closes": [499.0, 499.5, 500.0],
+                    "iv_rank": 0.4,
                 },
                 advanced_results=[],
                 basic_results=[],
@@ -1729,3 +1787,147 @@ class TestRegimeFilterIntegration:
             )
         eval_mock.assert_not_called()
         assert out.target_positions  # held position retained
+
+
+class TestTrendDirectionThreshold:
+    """Phase 4.4: a 0.05% threshold flipped on single-tick noise; require a
+    real multi-bar move (15bps default) before _msi_trend_direction commits."""
+
+    def test_micro_noise_returns_neutral(self):
+        # 0.10% over 5 bars — under the 15bps default threshold.  The legacy
+        # 5bps trigger fired bullish here and produced the bull→bear→bull
+        # whipsaws seen in QQQ trade history.
+        closes = [500.0, 500.1, 500.2, 500.3, 500.5]
+        assert PortfolioEngine._msi_trend_direction({"recent_closes": closes}) == "neutral"
+
+    def test_real_uptrend_returns_bullish(self):
+        # 0.40% over 5 bars — clears the 15bps floor.
+        closes = [500.0, 500.4, 500.8, 501.5, 502.0]
+        assert PortfolioEngine._msi_trend_direction({"recent_closes": closes}) == "bullish"
+
+    def test_real_downtrend_returns_bearish(self):
+        closes = [500.0, 499.5, 499.0, 498.5, 498.0]
+        assert PortfolioEngine._msi_trend_direction({"recent_closes": closes}) == "bearish"
+
+    def test_short_history_falls_back_to_3_bar(self):
+        # Only 3 bars available — use full history rather than returning
+        # neutral. 0.30% over 3 bars > 15bps → bullish.
+        closes = [498.5, 499.2, 500.0]
+        assert PortfolioEngine._msi_trend_direction({"recent_closes": closes}) == "bullish"
+
+
+class TestChopRangeConvictionGate:
+    """Phase 4.4: directional debits in chop_range with weak conviction are
+    blocked even when an advanced/confluence trigger fires."""
+
+    @staticmethod
+    def _score(composite: float) -> ScoreSnapshot:
+        return ScoreSnapshot(
+            timestamp=NOW,
+            underlying="SPY",
+            composite_score=composite,
+            normalized_score=composite / 100.0,
+            direction="chop_range",
+            components={},
+            aggregation={"advanced_trigger": True},  # signal-driven path
+        )
+
+    @staticmethod
+    def _market_ctx() -> dict:
+        return {
+            "close": 500.0,
+            "net_gex": -1.0e9,
+            "gamma_flip": 499.0,
+            "put_call_ratio": 1.0,
+            "max_pain": 500.0,
+            "smart_call": 0.0,
+            "smart_put": 0.0,
+            "recent_closes": [498.5, 499.2, 500.0],
+            "iv_rank": 0.4,
+        }
+
+    def test_low_conviction_chop_returns_cash_even_with_advanced_trigger(self):
+        engine = _make_engine()
+        # MSI 25 → conviction 0.25 < 0.30 default chop floor.
+        out = engine.compute_target(
+            self._score(composite=25.0), self._market_ctx(), conn=MagicMock()
+        )
+        assert out.target_positions == []
+        assert "Chop regime conviction" in out.rationale
+
+    def test_chop_with_conviction_at_floor_passes_gate(self):
+        """At conviction == floor the gate uses strict <, so this proceeds.
+
+        We patch the optimizer so the test exercises the gate, not the full
+        sizing pipeline.
+        """
+        engine = _make_engine()
+        score = self._score(composite=30.0)  # conviction 0.30 == floor (not <)
+        with (patch.object(engine, "_select_optimizer_candidate", return_value=None),):
+            out = engine.compute_target(score, self._market_ctx(), conn=MagicMock())
+        # Optimizer returned None, so we still end in cash — but for a
+        # different reason (no positive-EV structure), not the chop gate.
+        assert "Chop regime conviction" not in out.rationale
+
+
+class TestDailyLossKillSwitch:
+    """Phase 4.4: once today's realized losses exceed the kill threshold,
+    every subsequent compute_target returns a cash target."""
+
+    @staticmethod
+    def _conn_with_today_pnl(realized: float):
+        cur = MagicMock()
+        cur.fetchone.return_value = (realized,)
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        return conn
+
+    @staticmethod
+    def _score() -> ScoreSnapshot:
+        return ScoreSnapshot(
+            timestamp=NOW,
+            underlying="SPY",
+            composite_score=80.0,
+            normalized_score=0.8,
+            direction="trend_expansion",
+            components={},
+            aggregation={},
+        )
+
+    @staticmethod
+    def _market_ctx() -> dict:
+        return {
+            "close": 500.0,
+            "net_gex": -1.0e9,
+            "gamma_flip": 499.0,
+            "put_call_ratio": 1.0,
+            "max_pain": 500.0,
+            "smart_call": 0.0,
+            "smart_put": 0.0,
+            "recent_closes": [498.0, 499.0, 500.0],
+            "iv_rank": 0.4,
+        }
+
+    def test_kill_engaged_when_today_realized_breaches_threshold(self):
+        engine = _make_engine()
+        # Default kill: -1% of $1M = -$10,000.  -$15K trips it.
+        conn = self._conn_with_today_pnl(-15_000.0)
+        out = engine.compute_target(self._score(), self._market_ctx(), conn=conn)
+        assert out.target_positions == []
+        assert "Daily loss kill" in out.rationale
+
+    def test_kill_disengaged_when_today_pnl_within_limit(self):
+        engine = _make_engine()
+        # -$5K well above the -$10K floor — engine continues normally.
+        conn = self._conn_with_today_pnl(-5_000.0)
+        with (patch.object(engine, "_select_optimizer_candidate", return_value=None),):
+            out = engine.compute_target(self._score(), self._market_ctx(), conn=conn)
+        assert "Daily loss kill" not in out.rationale
+
+    def test_daily_loss_state_safe_under_db_failure(self):
+        engine = _make_engine()
+        conn = MagicMock()
+        conn.cursor.side_effect = RuntimeError("db down")
+        state = engine._daily_loss_state(NOW, conn=conn)
+        assert state["kill"] is False
+        assert state["realized_today"] == 0.0
