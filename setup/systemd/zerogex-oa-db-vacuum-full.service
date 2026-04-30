@@ -1,0 +1,25 @@
+[Unit]
+Description=ZeroGEX weekly full DB maintenance (VACUUM FULL + REINDEX)
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+# `db-maintain-managed` stops the four zerogex services, runs
+# `make db-maintain` (prune + VACUUM FULL + REINDEX + ANALYZE), and
+# restarts services on exit (via shell trap, so services come back up
+# even if maintenance fails halfway through).  Running as root makes
+# the `sudo` calls inside the recipe no-ops.
+ExecStart=/usr/bin/make db-maintain-managed
+
+# VACUUM FULL on a 20+ GB table can take a while.  Allow up to 90 min
+# before systemd kills the unit.
+TimeoutStartSec=5400
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-db-vacuum-full

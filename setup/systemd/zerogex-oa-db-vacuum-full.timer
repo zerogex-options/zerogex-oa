@@ -1,0 +1,16 @@
+[Unit]
+Description=Weekly trigger for full ZeroGEX DB maintenance (Sunday 02:30 ET)
+
+[Timer]
+# Sunday at 02:30 server time (timezone is America/New_York, set by
+# deploy/steps/010.setup).  Offset 30 min from the daily db-maintain
+# timer at 02:00 so they don't fire concurrently — the daily one
+# (prune + plain VACUUM) finishes long before this one starts.
+OnCalendar=Sun *-*-* 02:30:00
+RandomizedDelaySec=5m
+# Run on next boot if the box was off when the timer was supposed to
+# fire (avoids skipping a week).
+Persistent=true
+
+[Install]
+WantedBy=timers.target

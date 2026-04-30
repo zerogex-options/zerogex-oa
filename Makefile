@@ -2214,6 +2214,15 @@ db-maintain: ## Full maintenance: prune old data, vacuum full, reindex (run with
 	@echo "$(GREEN)✅ Full maintenance complete$(NC)"
 	@$(MAKE) db-size
 
+.PHONY: db-maintain-managed
+db-maintain-managed: ## Stop services → run db-maintain → restart services (used by zerogex-oa-db-vacuum-full.timer)
+	@echo "$(BLUE)=== Managed Full DB Maintenance ===$(NC)"
+	@trap 'echo "$(YELLOW)→ Restarting services...$(NC)"; sudo systemctl start zerogex-oa-ingestion zerogex-oa-analytics zerogex-oa-signals zerogex-oa-api' EXIT; \
+	echo "$(YELLOW)→ Stopping services for VACUUM FULL...$(NC)"; \
+	sudo systemctl stop zerogex-oa-api zerogex-oa-signals zerogex-oa-analytics zerogex-oa-ingestion; \
+	$(MAKE) db-maintain
+	@echo "$(GREEN)✅ Managed maintenance complete$(NC)"
+
 .PHONY: db-size
 db-size: ## Show sizes for all tables in the database
 	@echo "$(BLUE)=== Table Sizes ===$(NC)"

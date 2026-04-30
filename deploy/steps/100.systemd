@@ -90,6 +90,7 @@ sleep 3
 # need the start/stop dance — `enable --now <timer>` is enough.
 TIMER_UNITS=(
     "zerogex-oa-db-maintain"
+    "zerogex-oa-db-vacuum-full"
     "zerogex-oa-logs-clear"
 )
 
