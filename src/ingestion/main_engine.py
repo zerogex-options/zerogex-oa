@@ -125,9 +125,7 @@ class IngestionEngine:
         # underlyings) so live contracts are never evicted in practice.
         self._option_last_quote: "OrderedDict[str, Dict[str, Optional[float]]]" = OrderedDict()
         self._option_last_quote_lock = threading.Lock()
-        self._option_last_quote_max = int(
-            os.getenv("OPTION_LAST_QUOTE_CACHE_MAX", "10000")
-        )
+        self._option_last_quote_max = int(os.getenv("OPTION_LAST_QUOTE_CACHE_MAX", "10000"))
 
         # Track latest underlying price for Greeks calculation
         self.latest_underlying_price: Optional[float] = None

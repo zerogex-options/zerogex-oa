@@ -27,7 +27,6 @@ import os
 
 from src.signals.components.base import ComponentBase, MarketContext
 
-
 # Minimum total premium (in $ / window) before the component will return
 # a non-zero score.  Below this we treat the read as noise and abstain.
 _MIN_TOTAL_PREMIUM = float(os.getenv("SIGNAL_ORDER_FLOW_MIN_PREMIUM", "100000"))

@@ -47,20 +47,22 @@ def _stub_cursor(now_ts):
     # 12 columns matching the order in unified_signal_engine.py:100-111
     cursor.fetchone.side_effect = [
         (
-            now_ts,        # uq.timestamp
-            500.0,         # uq.close
-            now_ts,        # gs.timestamp
-            -1.0e9,        # gs.total_net_gex
-            499.0,         # gs.gamma_flip_point
-            0.002,         # gs.flip_distance
-            5.0e8,         # gs.local_gex
-            0.05,          # gs.convexity_risk
-            1.0,           # gs.put_call_ratio
-            500.0,         # gs.max_pain
-            10000,         # gs.total_call_oi
-            10000,         # gs.total_put_oi
+            now_ts,  # uq.timestamp
+            500.0,  # uq.close
+            now_ts,  # gs.timestamp
+            -1.0e9,  # gs.total_net_gex
+            499.0,  # gs.gamma_flip_point
+            0.002,  # gs.flip_distance
+            5.0e8,  # gs.local_gex
+            0.05,  # gs.convexity_risk
+            1.0,  # gs.put_call_ratio
+            500.0,  # gs.max_pain
+            10000,  # gs.total_call_oi
+            10000,  # gs.total_put_oi
         ),
-    ] + [None] * 50  # subsequent fetchones return None → empty paths
+    ] + [
+        None
+    ] * 50  # subsequent fetchones return None → empty paths
     cursor.fetchall.return_value = []
     cursor.__enter__ = MagicMock(return_value=cursor)
     cursor.__exit__ = MagicMock(return_value=False)
@@ -83,9 +85,11 @@ class TestStaleBufferDefault:
         cursor = _stub_cursor(now)
         conn = _stub_conn(cursor)
 
-        with patch.object(use_module, "db_connection", return_value=MagicMock(
-            __enter__=lambda self: conn, __exit__=lambda *a: False
-        )):
+        with patch.object(
+            use_module,
+            "db_connection",
+            return_value=MagicMock(__enter__=lambda self: conn, __exit__=lambda *a: False),
+        ):
             eng._fetch_market_context(conn=conn)
 
         first_call = cursor.execute.call_args_list[0]
@@ -103,9 +107,11 @@ class TestStaleBufferDefault:
         cursor = _stub_cursor(now)
         conn = _stub_conn(cursor)
 
-        with patch.object(use_module, "db_connection", return_value=MagicMock(
-            __enter__=lambda self: conn, __exit__=lambda *a: False
-        )):
+        with patch.object(
+            use_module,
+            "db_connection",
+            return_value=MagicMock(__enter__=lambda self: conn, __exit__=lambda *a: False),
+        ):
             try:
                 eng._fetch_market_context(conn=conn)
             except Exception:
@@ -133,9 +139,11 @@ class TestStaleBufferPositive:
         cursor = _stub_cursor(now)
         conn = _stub_conn(cursor)
 
-        with patch.object(use_module, "db_connection", return_value=MagicMock(
-            __enter__=lambda self: conn, __exit__=lambda *a: False
-        )):
+        with patch.object(
+            use_module,
+            "db_connection",
+            return_value=MagicMock(__enter__=lambda self: conn, __exit__=lambda *a: False),
+        ):
             eng._fetch_market_context(conn=conn)
 
         first_call = cursor.execute.call_args_list[0]
@@ -149,9 +157,11 @@ class TestStaleBufferPositive:
         cursor = _stub_cursor(now)
         conn = _stub_conn(cursor)
 
-        with patch.object(use_module, "db_connection", return_value=MagicMock(
-            __enter__=lambda self: conn, __exit__=lambda *a: False
-        )):
+        with patch.object(
+            use_module,
+            "db_connection",
+            return_value=MagicMock(__enter__=lambda self: conn, __exit__=lambda *a: False),
+        ):
             try:
                 eng._fetch_market_context(conn=conn)
             except Exception:
@@ -168,8 +178,10 @@ class TestStaleBufferPositive:
 def teardown_module(_module):
     """Restore default config so downstream tests aren't poisoned."""
     import os
+
     os.environ.pop("SIGNALS_GEX_STALE_BUFFER_SECONDS", None)
     import src.config as config
     import src.signals.unified_signal_engine as use
+
     importlib.reload(config)
     importlib.reload(use)

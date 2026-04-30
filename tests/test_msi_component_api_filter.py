@@ -12,12 +12,12 @@ from src.api.routers.trade_signals import _normalize_msi_components
 
 def test_active_components_pass_through():
     raw = {
-        "net_gex_sign":          {"max_points": 16, "contribution":  9.6,  "score":  0.6},
-        "gamma_anchor":          {"max_points": 30, "contribution": -2.1,  "score": -0.07},
-        "put_call_ratio":        {"max_points": 12, "contribution":  2.4,  "score":  0.2},
-        "volatility_regime":     {"max_points":  6, "contribution": -0.08, "score": -0.013},
-        "order_flow_imbalance":  {"max_points": 19, "contribution":  6.65, "score":  0.35},
-        "dealer_delta_pressure": {"max_points": 17, "contribution":  3.4,  "score":  0.2},
+        "net_gex_sign": {"max_points": 16, "contribution": 9.6, "score": 0.6},
+        "gamma_anchor": {"max_points": 30, "contribution": -2.1, "score": -0.07},
+        "put_call_ratio": {"max_points": 12, "contribution": 2.4, "score": 0.2},
+        "volatility_regime": {"max_points": 6, "contribution": -0.08, "score": -0.013},
+        "order_flow_imbalance": {"max_points": 19, "contribution": 6.65, "score": 0.35},
+        "dealer_delta_pressure": {"max_points": 17, "contribution": 3.4, "score": 0.2},
     }
     out = _normalize_msi_components(raw)
     assert set(out.keys()) == set(raw.keys())
@@ -31,10 +31,10 @@ def test_former_gamma_cluster_keys_are_filtered_out():
     """The three former gamma-cluster keys must not appear in the API
     response — they were collapsed into gamma_anchor in Phase 2.1."""
     raw = {
-        "flip_distance":      {"max_points": 19, "contribution":  3.0, "score":  0.16},
-        "local_gamma":        {"max_points": 15, "contribution": -2.0, "score": -0.13},
-        "price_vs_max_gamma": {"max_points":  7, "contribution":  1.0, "score":  0.14},
-        "gamma_anchor":       {"max_points": 30, "contribution":  6.0, "score":  0.20},
+        "flip_distance": {"max_points": 19, "contribution": 3.0, "score": 0.16},
+        "local_gamma": {"max_points": 15, "contribution": -2.0, "score": -0.13},
+        "price_vs_max_gamma": {"max_points": 7, "contribution": 1.0, "score": 0.14},
+        "gamma_anchor": {"max_points": 30, "contribution": 6.0, "score": 0.20},
     }
     out = _normalize_msi_components(raw)
     assert "flip_distance" not in out
@@ -84,7 +84,7 @@ def test_empty_context_omitted():
 def test_unknown_component_keys_are_filtered():
     """Defensive check: keys not in the allowlist never reach the response."""
     raw = {
-        "gamma_anchor":     {"max_points": 30, "contribution": 0.0, "score": 0.0},
+        "gamma_anchor": {"max_points": 30, "contribution": 0.0, "score": 0.0},
         "made_up_component": {"max_points": 10, "contribution": 5.0, "score": 0.5},
     }
     out = _normalize_msi_components(raw)

@@ -44,6 +44,6 @@ def test_former_gamma_cluster_components_no_longer_registered():
     from src.signals.scoring_engine import ScoringEngine
 
     for name in ("flip_distance", "local_gamma", "price_vs_max_gamma"):
-        assert name not in ScoringEngine.COMPONENT_POINTS, (
-            f"{name} must not be registered post-Phase-2.1 (logic lives in gamma_anchor)"
-        )
+        assert (
+            name not in ScoringEngine.COMPONENT_POINTS
+        ), f"{name} must not be registered post-Phase-2.1 (logic lives in gamma_anchor)"

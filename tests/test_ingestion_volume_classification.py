@@ -12,7 +12,6 @@ import pytz
 
 from src.ingestion.main_engine import IngestionEngine
 
-
 ET = pytz.timezone("US/Eastern")
 
 
@@ -21,16 +20,12 @@ def _engine() -> IngestionEngine:
 
 
 def test_classify_at_ask_is_ask_volume():
-    av, mv, bv = _engine()._classify_volume_chunk(
-        100, last=5.58, bid=5.53, ask=5.58, mid=5.555
-    )
+    av, mv, bv = _engine()._classify_volume_chunk(100, last=5.58, bid=5.53, ask=5.58, mid=5.555)
     assert (av, mv, bv) == (100, 0, 0)
 
 
 def test_classify_at_bid_is_bid_volume():
-    av, mv, bv = _engine()._classify_volume_chunk(
-        100, last=5.53, bid=5.53, ask=5.58, mid=5.555
-    )
+    av, mv, bv = _engine()._classify_volume_chunk(100, last=5.53, bid=5.53, ask=5.58, mid=5.555)
     assert (av, mv, bv) == (0, 0, 100)
 
 
@@ -40,17 +35,13 @@ def test_classify_user_5_57_case_routes_to_mid_with_default_band():
     # the ask threshold at mid + 0.70*0.025 = 5.5725, so a 5.57 fill is
     # below the threshold and is routed to mid_volume rather than getting
     # full ask credit.
-    av, mv, bv = _engine()._classify_volume_chunk(
-        250, last=5.57, bid=5.53, ask=5.58, mid=5.555
-    )
+    av, mv, bv = _engine()._classify_volume_chunk(250, last=5.57, bid=5.53, ask=5.58, mid=5.555)
     assert (av, mv, bv) == (0, 250, 0)
 
 
 def test_classify_clear_ask_print_outside_band():
     # 5.578 is well above the 5.5700 threshold -> still ask_volume.
-    av, mv, bv = _engine()._classify_volume_chunk(
-        100, last=5.578, bid=5.53, ask=5.58, mid=5.555
-    )
+    av, mv, bv = _engine()._classify_volume_chunk(100, last=5.578, bid=5.53, ask=5.58, mid=5.555)
     assert (av, mv, bv) == (100, 0, 0)
 
 
@@ -94,24 +85,18 @@ def test_classify_zero_volume_returns_zeros():
 
 
 def test_classify_missing_last_defaults_to_mid():
-    av, mv, bv = _engine()._classify_volume_chunk(
-        50, last=None, bid=4.95, ask=5.05, mid=5.0
-    )
+    av, mv, bv = _engine()._classify_volume_chunk(50, last=None, bid=4.95, ask=5.05, mid=5.0)
     assert (av, mv, bv) == (0, 50, 0)
 
 
 def test_classify_missing_bid_and_ask_defaults_to_mid():
-    av, mv, bv = _engine()._classify_volume_chunk(
-        50, last=5.0, bid=None, ask=None, mid=None
-    )
+    av, mv, bv = _engine()._classify_volume_chunk(50, last=5.0, bid=None, ask=None, mid=None)
     assert (av, mv, bv) == (0, 50, 0)
 
 
 def test_classify_falls_back_to_nearest_neighbor_when_only_one_side_known():
     # Only ask known, last very close to it -> still classifies as ask.
-    av, mv, bv = _engine()._classify_volume_chunk(
-        50, last=5.05, bid=None, ask=5.05, mid=5.0
-    )
+    av, mv, bv = _engine()._classify_volume_chunk(50, last=5.05, bid=None, ask=5.05, mid=5.0)
     assert (av, mv, bv) == (50, 0, 0)
 
 

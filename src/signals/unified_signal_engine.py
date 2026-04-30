@@ -233,9 +233,11 @@ class UnifiedSignalEngine:
                             self.db_symbol,
                             # Phase 2.5 stale-buffer: see _fetch_market_context
                             # docstring for rationale.  Default 0 is a no-op.
-                            ts - timedelta(seconds=gex_buffer_seconds)
-                            if gex_buffer_seconds
-                            else ts,
+                            (
+                                ts - timedelta(seconds=gex_buffer_seconds)
+                                if gex_buffer_seconds
+                                else ts
+                            ),
                             self.db_symbol,
                             close_f * 0.90,
                             close_f * 1.10,

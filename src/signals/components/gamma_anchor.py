@@ -38,7 +38,6 @@ from src.signals.components.flip_distance import FlipDistanceComponent
 from src.signals.components.local_gamma import LocalGammaComponent
 from src.signals.components.price_vs_max_gamma import PriceVsMaxGammaComponent
 
-
 # Internal blend weights.  Re-normalized at module load so operators can
 # override one without having to recompute the others.
 _W_FLIP = max(0.0, float(os.getenv("SIGNAL_GAMMA_ANCHOR_W_FLIP", "0.45")))
@@ -74,11 +73,7 @@ class GammaAnchorComponent(ComponentBase):
         flip_score = float(self._flip.compute(ctx))
         local_score = float(self._local.compute(ctx))
         maxg_score = float(self._maxg.compute(ctx))
-        blended = (
-            _W_FLIP * flip_score
-            + _W_LOCAL * local_score
-            + _W_MAXG * maxg_score
-        )
+        blended = _W_FLIP * flip_score + _W_LOCAL * local_score + _W_MAXG * maxg_score
         return max(-1.0, min(1.0, blended))
 
     def context_values(self, ctx: MarketContext) -> dict:
@@ -89,9 +84,7 @@ class GammaAnchorComponent(ComponentBase):
             -1.0,
             min(
                 1.0,
-                _W_FLIP * flip_score
-                + _W_LOCAL * local_score
-                + _W_MAXG * maxg_score,
+                _W_FLIP * flip_score + _W_LOCAL * local_score + _W_MAXG * maxg_score,
             ),
         )
         return {

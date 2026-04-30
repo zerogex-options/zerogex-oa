@@ -25,7 +25,6 @@ import os
 from src.signals.components.base import ComponentBase, MarketContext
 from src.signals.components.utils import realized_sigma
 
-
 # Master switch — set to "false" to fall back to the original fixed 2%.
 _VOL_ADAPTIVE_ENABLED = os.getenv("SIGNAL_VOL_ADAPTIVE_ENABLED", "true").lower() == "true"
 

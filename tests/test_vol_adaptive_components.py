@@ -130,8 +130,6 @@ class TestPriceVsMaxGammaVolAdaptive:
     def test_score_clamped_to_unit_interval(self):
         cmp = PriceVsMaxGammaComponent()
         # Price 10% from max gamma strike (well past saturation under any vol).
-        ctx = _ctx(
-            close=550.0, max_gamma_strike=500.0, recent_closes=_quiet_closes()
-        )
+        ctx = _ctx(close=550.0, max_gamma_strike=500.0, recent_closes=_quiet_closes())
         score = cmp.compute(ctx)
         assert score == 1.0  # max "free" score

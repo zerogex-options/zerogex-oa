@@ -55,9 +55,9 @@ class TestGammaAnchorBlend:
         # All inputs configured to produce extreme bullish/anchored scores.
         ctx = _ctx(
             close=500.0,
-            gamma_flip=500.0,         # at flip
-            max_gamma_strike=500.0,   # at max-gamma
-            local_gex=1.0e12,         # huge local gamma
+            gamma_flip=500.0,  # at flip
+            max_gamma_strike=500.0,  # at max-gamma
+            local_gex=1.0e12,  # huge local gamma
             recent_closes=[500.0] * 30,
         )
         score = cmp.compute(ctx)
@@ -68,9 +68,9 @@ class TestGammaAnchorBlend:
         cmp = GammaAnchorComponent()
         ctx = _ctx(
             close=500.0,
-            gamma_flip=480.0,          # far from flip → -1 sub-score
-            max_gamma_strike=500.0,    # at strike → -1 sub-score
-            local_gex=1.0e12,          # high local gamma → -1 sub-score
+            gamma_flip=480.0,  # far from flip → -1 sub-score
+            max_gamma_strike=500.0,  # at strike → -1 sub-score
+            local_gex=1.0e12,  # high local gamma → -1 sub-score
             recent_closes=[500.0] * 30,
         )
         score = cmp.compute(ctx)
@@ -82,9 +82,9 @@ class TestGammaAnchorBlend:
         cmp = GammaAnchorComponent()
         ctx = _ctx(
             close=500.0,
-            gamma_flip=500.0,          # at flip → +1 sub-score
-            max_gamma_strike=480.0,    # 4% away → +1 sub-score
-            local_gex=0.0,             # no local gamma → +1 sub-score
+            gamma_flip=500.0,  # at flip → +1 sub-score
+            max_gamma_strike=480.0,  # 4% away → +1 sub-score
+            local_gex=0.0,  # no local gamma → +1 sub-score
             recent_closes=[500.0] * 30,
         )
         score = cmp.compute(ctx)
@@ -96,9 +96,9 @@ class TestGammaAnchorBlend:
         cmp = GammaAnchorComponent()
         ctx = _ctx(
             close=500.0,
-            gamma_flip=500.0,          # at flip → +1 (free)
-            max_gamma_strike=500.0,    # at strike → -1 (anchored)
-            local_gex=1.0e12,          # high local gamma → -1 (anchored)
+            gamma_flip=500.0,  # at flip → +1 (free)
+            max_gamma_strike=500.0,  # at strike → -1 (anchored)
+            local_gex=1.0e12,  # high local gamma → -1 (anchored)
             recent_closes=[500.0] * 30,
         )
         score = cmp.compute(ctx)
@@ -140,9 +140,9 @@ class TestGammaAnchorIntegrationWithScoringEngine:
         eng = ScoringEngine("SPY", [GammaAnchorComponent()])
         ctx = _ctx(
             close=500.0,
-            gamma_flip=480.0,           # anchored
-            max_gamma_strike=500.0,     # at strike
-            local_gex=1.0e12,           # very dense
+            gamma_flip=480.0,  # anchored
+            max_gamma_strike=500.0,  # at strike
+            local_gex=1.0e12,  # very dense
             recent_closes=[500.0] * 30,
         )
         snap, _ = eng.score(ctx)

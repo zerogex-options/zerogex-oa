@@ -15,7 +15,6 @@ import os
 from src.signals.components.base import ComponentBase, MarketContext
 from src.signals.components.utils import realized_sigma
 
-
 _VOL_ADAPTIVE_ENABLED = os.getenv("SIGNAL_VOL_ADAPTIVE_ENABLED", "true").lower() == "true"
 _VOL_LOOKBACK_BARS = max(5, int(os.getenv("SIGNAL_VOL_LOOKBACK_BARS", "30")))
 _VOL_MIN_BARS = max(5, int(os.getenv("SIGNAL_VOL_MIN_BARS", "10")))
