@@ -260,6 +260,105 @@ async def get_latest_score(
     return _normalize_signal_score_row(row)
 
 
+_PLAYBOOK_ENGINE: "PlaybookEngine | None" = None
+
+
+def _get_playbook_engine() -> "PlaybookEngine":
+    """Lazily instantiate the engine so pattern discovery only runs once."""
+    global _PLAYBOOK_ENGINE
+    if _PLAYBOOK_ENGINE is None:
+        from src.signals.playbook import PlaybookEngine
+
+        _PLAYBOOK_ENGINE = PlaybookEngine()
+    return _PLAYBOOK_ENGINE
+
+
+@router.get("/action")
+async def get_action_card(
+    underlying: str = Query(default="SPY"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Latest **Action Card** — single, decisive trade instruction.
+
+    The Playbook Engine fuses Market Posture (the MSI regime), advanced
+    + basic signals, and live structural levels into one Card per cycle.
+    A Card is either a specific trade (`BUY_PUT_DEBIT`, `SELL_CALL_SPREAD`,
+    `BUY_IRON_CONDOR`, etc.), a position-management directive, or
+    `STAND_DOWN` when no pattern matches current structure.
+
+    `STAND_DOWN` is an **earned** outcome, not equivocation — it ships
+    with a `near_misses[]` list naming the closest patterns and the
+    specific trigger conditions they failed.
+
+    **Params:** `underlying` (default `SPY`).
+    Returns 404 when no signal_score row exists for the symbol yet.
+
+    **Returns:** see `docs/playbook_catalog.md` §2 for the full schema.
+    Trade Card example:
+    ```json
+    {
+      "underlying": "SPY",
+      "timestamp": "2026-05-01T18:42:13Z",
+      "action": "SELL_CALL_SPREAD",
+      "pattern": "call_wall_fade",
+      "tier": "0DTE",
+      "direction": "bearish",
+      "confidence": 0.68,
+      "size_multiplier": 0.6,
+      "max_hold_minutes": 90,
+      "legs": [
+        {"expiry": "2026-05-01", "strike": 678.0, "right": "C", "side": "SELL", "qty": 1},
+        {"expiry": "2026-05-01", "strike": 683.0, "right": "C", "side": "BUY",  "qty": 1}
+      ],
+      "entry":  {"ref_price": 678.40, "trigger": "at_touch"},
+      "target": {"ref_price": 675.00, "kind": "level", "level_name": "max_pain"},
+      "stop":   {"ref_price": 680.03, "kind": "premium_pct", "level_name": "call_wall_break"},
+      "rationale": "Price $678.40 pinned at call wall $678.00, net GEX $7.1B, confirmed by trap_detection → call credit spread at the wall.",
+      "context": {"...regime, msi, levels, signals_aligned..."},
+      "alternatives_considered": []
+    }
+    ```
+
+    STAND_DOWN example:
+    ```json
+    {
+      "underlying": "SPY",
+      "timestamp": "...",
+      "action": "STAND_DOWN",
+      "pattern": "stand_down",
+      "tier": "n/a",
+      "direction": "non_directional",
+      "confidence": 0.0,
+      "rationale": "No tradable structure. Closest patterns: call_wall_fade.",
+      "near_misses": [
+        {"pattern": "call_wall_fade",
+         "missing": ["price 0.45% from call_wall (needs <= 0.20%)"]}
+      ],
+      "context": {"msi": 32.5, "regime": "chop_range"}
+    }
+    ```
+
+    **Notes for PR-2.** The engine is computed on-demand each request from
+    the latest persisted signal state — no Action Card persistence yet.
+    Hysteresis (re-trigger suppression across cycles) is a no-op until
+    PR-3 wires Card persistence and the cycle loop. Open-position
+    awareness is also disabled until PR-3, so management Cards
+    (`TAKE_PROFIT`, etc.) won't fire in PR-2.
+    """
+    from src.signals.playbook.context_builder import build_playbook_context
+
+    sym = underlying.upper()
+    ctx = await build_playbook_context(db=db, underlying=sym)
+    if ctx is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No signal_score rows found for {sym}; cannot build playbook context",
+        )
+    engine = _get_playbook_engine()
+    card = engine.evaluate(ctx)
+    return card.to_dict()
+
+
 @router.get("/score-history")
 async def get_score_history(
     underlying: str = Query(default="SPY"),

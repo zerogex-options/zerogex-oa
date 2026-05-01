@@ -208,6 +208,11 @@ purpose.
 
 - `GET /api/signals/score` — latest MSI composite score, regime label, component breakdown.
 - `GET /api/signals/score-history` — time series of composite scores + contributions.
+- `GET /api/signals/action` — Playbook Engine Action Card: single decisive trade
+  instruction (or `STAND_DOWN`) fusing MSI regime + advanced/basic signals + live
+  levels. See `docs/playbook_catalog.md` for the pattern catalog and Action Card
+  schema. PR-2 ships the engine plus one canonical pattern (`call_wall_fade`);
+  remaining patterns land in PR-3+.
 - `GET /api/signals/trades-history` — realized trade ideas with P&L / hit rate.
 - `GET /api/signals/trades-live` — open trade ideas derived from current signal state.
 
