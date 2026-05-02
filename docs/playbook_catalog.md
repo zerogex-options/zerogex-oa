@@ -648,7 +648,7 @@ Mirror of `call_wall_fade` with reversed signs.
 | PR-1 | This spec document | ✅ Shipped |
 | PR-2 | Engine scaffold + types + `/api/signals/action` + `call_wall_fade` | ✅ Shipped |
 | PR-3 | `put_wall_bounce` + Action Card persistence (`signal_action_cards` table) + real hysteresis | ✅ Shipped |
-| PR-4 | `gamma_flip_break` (next 0DTE pattern) | ⏳ |
+| PR-4 | `gamma_flip_break` (context-dependent direction; first non-mirror pattern) | ✅ Shipped |
 | PR-5 | `eod_pressure_drift` | ⏳ |
 | PR-6 | `zero_dte_imbalance_drift` | ⏳ |
 | PR-7 | Tier 2 patterns: `pin_risk_premium_sell`, `overnight_trap_continuation` | ⏳ |
