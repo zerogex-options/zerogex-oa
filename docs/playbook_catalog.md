@@ -650,7 +650,7 @@ Mirror of `call_wall_fade` with reversed signs.
 | PR-3 | `put_wall_bounce` + Action Card persistence (`signal_action_cards` table) + real hysteresis | ✅ Shipped |
 | PR-4 | `gamma_flip_break` (context-dependent direction; first non-mirror pattern) | ✅ Shipped |
 | PR-5 | `eod_pressure_drift` (last-hour VWAP-anchored drift; first all-regime pattern) | ✅ Shipped |
-| PR-6 | `zero_dte_imbalance_drift` | ⏳ |
+| PR-6 | `zero_dte_imbalance_drift` (midday smart-money flow; trap-conflict gate; ATR-proxy target/stop) | ✅ Shipped |
 | PR-7 | Tier 2 patterns: `pin_risk_premium_sell`, `overnight_trap_continuation` | ⏳ |
 | PR-8–11 | Tier 3 swing patterns | ⏳ |
 | Final | Backtest validation per pattern, then strip `advanced_trigger` / `confluence_trigger` bypass from `portfolio_engine.py` | ⏳ |
