@@ -1255,6 +1255,30 @@ CREATE INDEX IF NOT EXISTS idx_signal_component_scores_component
     ON signal_component_scores(component_name, timestamp DESC);
 
 -- ---------------------------------------------------------------------------
+-- signal_action_cards
+-- Persists Action Cards emitted by the Playbook Engine.  One row per
+-- non-STAND_DOWN Card.  Used for hysteresis (suppress re-emission of the
+-- same pattern within its dwell window) and audit / backtesting.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS signal_action_cards (
+    id                BIGSERIAL PRIMARY KEY,
+    underlying        VARCHAR(10) NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    timestamp         TIMESTAMPTZ NOT NULL,
+    pattern           VARCHAR(64) NOT NULL,
+    action            VARCHAR(32) NOT NULL,
+    tier              VARCHAR(8)  NOT NULL,
+    direction         VARCHAR(20) NOT NULL,
+    confidence        DOUBLE PRECISION NOT NULL,
+    payload           JSONB       NOT NULL,
+    created_at        TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_action_cards_underlying_ts
+    ON signal_action_cards(underlying, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_signal_action_cards_underlying_pattern_ts
+    ON signal_action_cards(underlying, pattern, timestamp DESC);
+
+-- ---------------------------------------------------------------------------
 -- portfolio_snapshots (schema only — used in Part 2)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS portfolio_snapshots (

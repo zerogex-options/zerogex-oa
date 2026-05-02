@@ -638,3 +638,24 @@ Mirror of `call_wall_fade` with reversed signs.
 - No backtesting work. Pattern priors in §7 are intuition, not data; PR-3 onward replaces them.
 
 **PR-1 deliverable:** this document, reviewed and approved.
+
+---
+
+## 10. Implementation status
+
+| PR | Scope | Status |
+|---|---|---|
+| PR-1 | This spec document | ✅ Shipped |
+| PR-2 | Engine scaffold + types + `/api/signals/action` + `call_wall_fade` | ✅ Shipped |
+| PR-3 | `put_wall_bounce` + Action Card persistence (`signal_action_cards` table) + real hysteresis | ✅ Shipped |
+| PR-4 | `gamma_flip_break` (next 0DTE pattern) | ⏳ |
+| PR-5 | `eod_pressure_drift` | ⏳ |
+| PR-6 | `zero_dte_imbalance_drift` | ⏳ |
+| PR-7 | Tier 2 patterns: `pin_risk_premium_sell`, `overnight_trap_continuation` | ⏳ |
+| PR-8–11 | Tier 3 swing patterns | ⏳ |
+| Final | Backtest validation per pattern, then strip `advanced_trigger` / `confluence_trigger` bypass from `portfolio_engine.py` | ⏳ |
+
+After PR-3 the Playbook is feature-complete enough to drive trade
+selection — the engine produces persistable Cards, hysteresis works,
+and two opposite-direction patterns are wired in.  Subsequent PRs add
+breadth (more patterns) and validation (backtests).

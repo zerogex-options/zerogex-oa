@@ -303,7 +303,31 @@ async def build_playbook_context(
     composite = score_row.get("composite_score")
     regime = score_row.get("direction")
 
-    open_positions: list[OpenPosition] = []  # PR-3 will populate from portfolio_engine state.
+    open_positions: list[OpenPosition] = []  # PR-4+ will populate from portfolio_engine state.
+
+    # Hysteresis input: pull last-emit timestamp per pattern from recent
+    # signal_action_cards rows.  90 minutes of lookback covers swing dwells.
+    recently_emitted: dict[str, datetime] = {}
+    try:
+        recent_cards = await db.get_recent_action_cards(underlying, since_minutes=90)
+    except Exception as exc:
+        logger.warning("get_recent_action_cards unavailable (%s): %s", underlying, exc)
+        recent_cards = []
+    for row in recent_cards or []:
+        pat_id = row.get("pattern")
+        emit_ts = row.get("timestamp")
+        if not pat_id or emit_ts is None:
+            continue
+        if isinstance(emit_ts, str):
+            try:
+                emit_ts = datetime.fromisoformat(emit_ts.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+        if emit_ts.tzinfo is None:
+            emit_ts = pytz.UTC.localize(emit_ts)
+        prior = recently_emitted.get(pat_id)
+        if prior is None or emit_ts > prior:
+            recently_emitted[pat_id] = emit_ts
 
     return PlaybookContext(
         market=market,
@@ -314,5 +338,5 @@ async def build_playbook_context(
         basic_signals=basic,
         levels=levels,
         open_positions=open_positions,
-        recently_emitted={},  # No persistence in PR-2; hysteresis is a no-op
+        recently_emitted=recently_emitted,
     )

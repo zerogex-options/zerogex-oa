@@ -1094,3 +1094,74 @@ class SignalsQueriesMixin:
         except Exception as e:
             logger.error(f"get_signal_score_history failed ({symbol}): {e}")
             return []
+
+    # ------------------------------------------------------------------
+    # Playbook Action Cards (PR-3+)
+    # ------------------------------------------------------------------
+
+    async def insert_action_card(self, card: Dict[str, Any]) -> None:
+        """Persist a non-STAND_DOWN Action Card.
+
+        Caller passes ``card.to_dict()`` from the Playbook engine.  Failures
+        are logged but never raised — persistence is best-effort and should
+        not break the API response path.
+        """
+        if not card or card.get("action") == "STAND_DOWN":
+            return
+        ts = card.get("timestamp")
+        if isinstance(ts, str):
+            try:
+                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except ValueError:
+                logger.warning("insert_action_card: bad timestamp %r", ts)
+                return
+        if ts is None:
+            return
+        try:
+            async with self._acquire_connection() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO signal_action_cards
+                        (underlying, timestamp, pattern, action, tier,
+                         direction, confidence, payload)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+                    """,
+                    card.get("underlying"),
+                    ts,
+                    card.get("pattern"),
+                    card.get("action"),
+                    card.get("tier") or "n/a",
+                    card.get("direction") or "non_directional",
+                    float(card.get("confidence") or 0.0),
+                    json.dumps(card, default=str),
+                )
+        except Exception as exc:
+            # Best-effort — don't surface persistence errors to API callers.
+            logger.warning("insert_action_card failed (%s): %s", card.get("pattern"), exc)
+
+    async def get_recent_action_cards(
+        self, underlying: str, since_minutes: int = 90
+    ) -> List[Dict[str, Any]]:
+        """Return non-STAND_DOWN Cards emitted within the last ``since_minutes``.
+
+        Used by the Playbook context-builder to populate ``recently_emitted``
+        for hysteresis.  Returns the most recent row per pattern, newest first.
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT DISTINCT ON (pattern)
+                        pattern, timestamp, action, tier, direction, confidence
+                    FROM signal_action_cards
+                    WHERE underlying = $1
+                      AND timestamp > NOW() - ($2::int * INTERVAL '1 minute')
+                    ORDER BY pattern, timestamp DESC
+                    """,
+                    underlying,
+                    int(since_minutes),
+                )
+                return [dict(r) for r in rows]
+        except Exception as exc:
+            logger.warning("get_recent_action_cards failed (%s): %s", underlying, exc)
+            return []

@@ -22,7 +22,7 @@ def _build_app(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("API_KEY", raising=False)
     monkeypatch.setenv("ENVIRONMENT", "development")
     for mod in list(sys.modules):
-        if mod.startswith("src.api"):
+        if mod.startswith("src.api") or mod.startswith("src.signals.playbook"):
             sys.modules.pop(mod, None)
     from src.api import database as dbmod  # noqa: E402
 
@@ -30,6 +30,9 @@ def _build_app(monkeypatch: pytest.MonkeyPatch):
     dbmod.DatabaseManager.disconnect = AsyncMock(return_value=None)
     dbmod.DatabaseManager.check_health = AsyncMock(return_value=True)
     dbmod.DatabaseManager.get_latest_quote = AsyncMock(return_value=None)
+    # PR-3 persistence: stub by default; tests override per-case.
+    dbmod.DatabaseManager.insert_action_card = AsyncMock(return_value=None)
+    dbmod.DatabaseManager.get_recent_action_cards = AsyncMock(return_value=[])
     from src.api.main import app  # noqa: E402
 
     return app, dbmod
@@ -201,3 +204,86 @@ def test_action_endpoint_returns_trade_card_when_call_wall_fade_triggers(
     assert body["target"]["level_name"] in ("max_pain", "gamma_flip")
     assert body["context"]["call_wall"] == 678.0
     assert "trap_detection" in body["context"]["advanced_signals_aligned"]
+    # Trade Card persistence (PR-3): the endpoint must call insert_action_card.
+    dbmod.DatabaseManager.insert_action_card.assert_called_once()
+    persisted_payload = dbmod.DatabaseManager.insert_action_card.call_args.args[0]
+    assert persisted_payload["pattern"] == "call_wall_fade"
+    assert persisted_payload["action"] != "STAND_DOWN"
+
+
+# --------------------------------------------------------------------------
+# PR-3 persistence + hysteresis
+# --------------------------------------------------------------------------
+
+
+def test_stand_down_card_is_not_persisted(monkeypatch: pytest.MonkeyPatch):
+    """STAND_DOWN must not pollute signal_action_cards."""
+    app, dbmod = _build_app(monkeypatch)
+    dbmod.DatabaseManager.get_latest_signal_score = AsyncMock(return_value=_score_row())
+    dbmod.DatabaseManager.get_advanced_signal = AsyncMock(return_value=None)
+    dbmod.DatabaseManager.get_basic_signal = AsyncMock(return_value=None)
+
+    with TestClient(app) as client:
+        r = client.get("/api/signals/action?underlying=SPY")
+    assert r.status_code == 200
+    assert r.json()["action"] == "STAND_DOWN"
+    # insert_action_card is called, but it short-circuits internally for
+    # STAND_DOWN — assert the impl-level guard via the payload it received.
+    assert dbmod.DatabaseManager.insert_action_card.call_count == 1
+    payload = dbmod.DatabaseManager.insert_action_card.call_args.args[0]
+    assert payload["action"] == "STAND_DOWN"
+
+
+def test_recently_emitted_blocks_re_emission_via_hysteresis(monkeypatch: pytest.MonkeyPatch):
+    """If get_recent_action_cards returns a recent emission, hysteresis suppresses re-fire."""
+    from datetime import datetime, timedelta, timezone
+
+    app, dbmod = _build_app(monkeypatch)
+    dbmod.DatabaseManager.get_latest_signal_score = AsyncMock(return_value=_score_row())
+
+    async def _adv(symbol, name):
+        if name == "trap_detection":
+            return _trap_signal_row()
+        if name == "gamma_vwap_confluence":
+            return _gvc_signal_row()
+        if name == "range_break_imminence":
+            return {
+                "clamped_score": 0.10,
+                "score": 10.0,
+                "context_values": {"label": "Range Fade"},
+            }
+        return None
+
+    async def _basic(symbol, name):
+        if name == "tape_flow_bias":
+            return _tape_signal_row(-50.0)
+        if name == "positioning_trap":
+            return {"clamped_score": -0.30, "score": -30.0, "context_values": {}}
+        return None
+
+    dbmod.DatabaseManager.get_advanced_signal = AsyncMock(side_effect=_adv)
+    dbmod.DatabaseManager.get_basic_signal = AsyncMock(side_effect=_basic)
+
+    # Simulate call_wall_fade having fired 2 minutes ago — well inside the
+    # 5-minute 0DTE dwell window.  The score row's timestamp is 2026-05-01
+    # 18:30 UTC; recent emission is at 18:28 UTC.
+    score_ts = _score_row()["timestamp"]
+    recent_emit = score_ts - timedelta(minutes=2)
+    dbmod.DatabaseManager.get_recent_action_cards = AsyncMock(
+        return_value=[
+            {
+                "pattern": "call_wall_fade",
+                "timestamp": recent_emit,
+                "action": "SELL_CALL_SPREAD",
+            }
+        ]
+    )
+
+    with TestClient(app) as client:
+        r = client.get("/api/signals/action?underlying=SPY")
+    body = r.json()
+    assert body["action"] == "STAND_DOWN", body
+    assert any(
+        nm["pattern"] == "call_wall_fade" and any("hysteresis" in m for m in nm["missing"])
+        for nm in body["near_misses"]
+    )

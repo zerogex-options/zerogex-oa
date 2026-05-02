@@ -356,7 +356,11 @@ async def get_action_card(
         )
     engine = _get_playbook_engine()
     card = engine.evaluate(ctx)
-    return card.to_dict()
+    payload = card.to_dict()
+    # Persist trade Cards (not STAND_DOWNs) so the next cycle can apply
+    # hysteresis.  Best-effort — DB failure must not break the response.
+    await db.insert_action_card(payload)
+    return payload
 
 
 @router.get("/score-history")
