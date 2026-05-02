@@ -652,7 +652,8 @@ Mirror of `call_wall_fade` with reversed signs.
 | PR-5 | `eod_pressure_drift` (last-hour VWAP-anchored drift; first all-regime pattern) | ✅ Shipped |
 | PR-6 | `zero_dte_imbalance_drift` (midday smart-money flow; trap-conflict gate; ATR-proxy target/stop) | ✅ Shipped |
 | PR-7 | Tier 2 patterns: `pin_risk_premium_sell`, `overnight_trap_continuation` (1DTE; iron condor pin + overnight trap-fade) | ✅ Shipped |
-| PR-8–11 | Tier 3 swing patterns | ⏳ |
+| PR-8 | `squeeze_breakout` (first Tier 3 swing; vol-compression + gradient-driven direction; envelope-relative stop) | ✅ Shipped |
+| PR-9–11 | Remaining Tier 3 swing patterns: `skew_inversion_reversal`, `vanna_charm_glide`, `positioning_trap_squeeze`, `gex_gradient_trend` | ⏳ |
 | Final | Backtest validation per pattern, then strip `advanced_trigger` / `confluence_trigger` bypass from `portfolio_engine.py` | ⏳ |
 
 After PR-3 the Playbook is feature-complete enough to drive trade
