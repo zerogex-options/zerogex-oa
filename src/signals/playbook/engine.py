@@ -274,9 +274,26 @@ class PlaybookEngine:
             return TIER_END_OF_DAY
         return TIER_INTRADAY
 
+    # Hint terms that mark a NearMiss as "almost matched" — patterns that
+    # reached a downstream gate (regime, position, hysteresis) rather than
+    # failing in the initial trigger check.  We surface these first because
+    # they're more informative for an operator reading STAND_DOWN.
+    _GATE_MISS_HINTS = (
+        "hysteresis",
+        "valid_regimes",
+        "open position",
+        "hold window",
+        "regime",
+    )
+
     def _stand_down(self, ctx: PlaybookContext, miss_diagnostics: list[NearMiss]) -> ActionCard:
-        # Cap diagnostics to keep payload size sane.
-        capped = miss_diagnostics[:5]
+        # Sort gate-blocked misses (almost-matched) ahead of trigger-failure
+        # misses; cap at 10 to keep the payload bounded.
+        def _is_gate_miss(nm: NearMiss) -> bool:
+            return any(hint in m for m in nm.missing for hint in self._GATE_MISS_HINTS)
+
+        ordered = sorted(miss_diagnostics, key=lambda nm: (0 if _is_gate_miss(nm) else 1))
+        capped = ordered[:10]
         if not capped:
             rationale = "No tradable structure: no patterns produced a candidate this cycle."
         else:

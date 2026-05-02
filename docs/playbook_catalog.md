@@ -424,7 +424,7 @@ Mirror of `call_wall_fade` with reversed signs.
 - `range_break_imminence.label in ["Range Fade", "Weak Range"]`
 - No major economic event scheduled before next regular open (see §8 dependency #1)
 
-**Instrument:** `BUY_IRON_CONDOR` centered on `max_pain`. Wings at `max_pain ± 2 × realized_sigma(30min) × close`. 1DTE.
+**Instrument:** `SELL_IRON_CONDOR` centered on `max_pain` (collect credit by being short the inner strikes; long the outer wings to cap risk). Inner wings at `max_pain ± 2 × realized_sigma(30min) × close`; outer protective wings `+5 pts` further out. 1DTE.
 
 **Entry:** `at_close` window 15:35–15:50 ET.
 
@@ -651,7 +651,7 @@ Mirror of `call_wall_fade` with reversed signs.
 | PR-4 | `gamma_flip_break` (context-dependent direction; first non-mirror pattern) | ✅ Shipped |
 | PR-5 | `eod_pressure_drift` (last-hour VWAP-anchored drift; first all-regime pattern) | ✅ Shipped |
 | PR-6 | `zero_dte_imbalance_drift` (midday smart-money flow; trap-conflict gate; ATR-proxy target/stop) | ✅ Shipped |
-| PR-7 | Tier 2 patterns: `pin_risk_premium_sell`, `overnight_trap_continuation` | ⏳ |
+| PR-7 | Tier 2 patterns: `pin_risk_premium_sell`, `overnight_trap_continuation` (1DTE; iron condor pin + overnight trap-fade) | ✅ Shipped |
 | PR-8–11 | Tier 3 swing patterns | ⏳ |
 | Final | Backtest validation per pattern, then strip `advanced_trigger` / `confluence_trigger` bypass from `portfolio_engine.py` | ⏳ |
 
