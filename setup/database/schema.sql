@@ -1279,6 +1279,36 @@ CREATE INDEX IF NOT EXISTS idx_signal_action_cards_underlying_pattern_ts
     ON signal_action_cards(underlying, pattern, timestamp DESC);
 
 -- ---------------------------------------------------------------------------
+-- playbook_pattern_stats
+-- Read-only output of the Playbook backtest harness (PR-14).  Each row
+-- summarizes one (pattern, underlying, window) — hit rate, sample size,
+-- MFE/MAE, and a proposed pattern_base derived from the empirical hit
+-- rate.  Live patterns continue to use their hard-coded priors until a
+-- follow-up PR explicitly promotes these numbers.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS playbook_pattern_stats (
+    pattern           VARCHAR(64)   NOT NULL,
+    underlying        VARCHAR(10)   NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    window_start      DATE          NOT NULL,
+    window_end        DATE          NOT NULL,
+    n_emitted         INTEGER       NOT NULL DEFAULT 0,
+    n_resolved        INTEGER       NOT NULL DEFAULT 0,
+    n_target_hit      INTEGER       NOT NULL DEFAULT 0,
+    n_stop_hit        INTEGER       NOT NULL DEFAULT 0,
+    n_time_exit       INTEGER       NOT NULL DEFAULT 0,
+    hit_rate          DOUBLE PRECISION,
+    avg_confidence    DOUBLE PRECISION,
+    avg_mfe_pct       DOUBLE PRECISION,
+    avg_mae_pct       DOUBLE PRECISION,
+    proposed_base     DOUBLE PRECISION,
+    computed_at       TIMESTAMPTZ   DEFAULT NOW(),
+    PRIMARY KEY (pattern, underlying, window_start, window_end)
+);
+
+CREATE INDEX IF NOT EXISTS idx_playbook_pattern_stats_underlying_window
+    ON playbook_pattern_stats(underlying, window_end DESC);
+
+-- ---------------------------------------------------------------------------
 -- portfolio_snapshots (schema only — used in Part 2)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS portfolio_snapshots (
