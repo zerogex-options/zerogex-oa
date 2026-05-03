@@ -1018,15 +1018,20 @@ class UnifiedSignalEngine:
         score,
         advanced_results,
         basic_results,
-    ) -> None:
+    ):
         """Compute + persist an Action Card from this cycle's state.
+
+        Returns the emitted ``ActionCard`` (or ``None`` on failure /
+        disabled).  PR-15a uses the return value for the
+        ``PLAYBOOK_CARD_DRIVEN_ENTRIES`` path so portfolio_engine can
+        consume the Card via ``compute_target_with_action_card``.
 
         Wrapped to swallow all exceptions so a Playbook problem never
         breaks the cycle.  Disabled when ``PLAYBOOK_DISABLE_CYCLE_EMIT=true``
         for op rollback without code changes.
         """
         if os.getenv("PLAYBOOK_DISABLE_CYCLE_EMIT", "").lower() == "true":
-            return
+            return None
         try:
             from src.signals.playbook import PlaybookEngine
             from src.signals.playbook.cycle import evaluate_and_persist
@@ -1049,12 +1054,14 @@ class UnifiedSignalEngine:
                 card.pattern,
                 card.confidence,
             )
+            return card
         except Exception as exc:
             logger.warning(
                 "Playbook cycle integration failed for %s: %s",
                 self.db_symbol,
                 exc,
             )
+            return None
 
     def run_cycle(self) -> bool:
         # Each phase acquires and releases its own connection to avoid
@@ -1079,21 +1086,43 @@ class UnifiedSignalEngine:
 
         # Phase 2.5: Playbook — compute and persist Action Card from the
         # state we just produced.  Best-effort: persistence errors are
-        # logged but never break the cycle.  Trade selection is still
-        # driven by the score path until PR-15.
-        self._evaluate_playbook(market_context, score, advanced_results, basic_results)
+        # logged but never break the cycle.  Card-driven trade selection
+        # is gated by PLAYBOOK_CARD_DRIVEN_ENTRIES (PR-15a additive
+        # path); when that flag is unset we keep the legacy
+        # advanced/confluence path unchanged.
+        playbook_card = self._evaluate_playbook(
+            market_context, score, advanced_results, basic_results
+        )
+        card_payload = (
+            playbook_card.to_dict()
+            if (
+                playbook_card is not None
+                and os.getenv("PLAYBOOK_CARD_DRIVEN_ENTRIES", "").lower() == "true"
+            )
+            else None
+        )
 
         # Phase 3: reconcile portfolio (acquires connection for reads+writes)
         # Legacy optimizer-cache plumbing is no longer needed because MSI
         # components do not fetch option snapshots.
         cached_option_rows = None
-        target = self.portfolio_engine.compute_target_with_advanced_signals(
-            score,
-            ctx,
-            advanced_results=advanced_results,
-            basic_results=basic_results,
-            cached_option_rows=cached_option_rows,
-        )
+        if card_payload is not None:
+            target = self.portfolio_engine.compute_target_with_action_card(
+                score,
+                ctx,
+                action_card=card_payload,
+                advanced_results=advanced_results,
+                basic_results=basic_results,
+                cached_option_rows=cached_option_rows,
+            )
+        else:
+            target = self.portfolio_engine.compute_target_with_advanced_signals(
+                score,
+                ctx,
+                advanced_results=advanced_results,
+                basic_results=basic_results,
+                cached_option_rows=cached_option_rows,
+            )
         action = self.portfolio_engine.reconcile(target)
 
         logger.info(

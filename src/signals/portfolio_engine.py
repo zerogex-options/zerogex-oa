@@ -1110,6 +1110,121 @@ class PortfolioEngine:
         return "neutral"
 
     # ------------------------------------------------------------------
+    # PR-15a: Action Card consumption (additive; gated off by default)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _synthesize_score_from_action_card(
+        base: ScoreSnapshot,
+        card: dict,
+    ) -> ScoreSnapshot:
+        """Project a Playbook Action Card onto a ScoreSnapshot.
+
+        Mirrors ``_synthesize_score_from_advanced_signal`` so the
+        downstream sizing path can use the same machinery.  The
+        aggregation marker is ``card_trigger`` (distinct from
+        ``advanced_trigger`` / ``confluence_trigger``) so the existing
+        bypass logic is unaffected — that's the whole point of the
+        additive PR-15a path.
+
+        ``card`` is expected to be the dict shape produced by
+        ``ActionCard.to_dict()`` (or the ``payload`` column of
+        ``signal_action_cards``).
+        """
+        if not isinstance(card, dict) or card.get("action") == "STAND_DOWN":
+            return base
+
+        confidence = float(card.get("confidence") or 0.0)
+        confidence = max(0.0, min(1.0, confidence))
+        direction = card.get("direction") or "neutral"
+        # context_dependent Cards are emitted with concrete
+        # bullish/bearish on the dict, but be defensive.
+        if direction not in {"bullish", "bearish"}:
+            direction = "neutral"
+
+        components = dict(base.components or {})
+        pattern = card.get("pattern") or "playbook"
+        components[f"playbook:{pattern}"] = {
+            "weight": 0.0,
+            "effective_weight": 0.0,
+            "score": confidence,
+        }
+
+        return ScoreSnapshot(
+            timestamp=base.timestamp,
+            underlying=base.underlying,
+            composite_score=round(base.composite_score, 6),
+            normalized_score=round(confidence, 6),
+            direction=direction,
+            components=components,
+            aggregation={
+                **(base.aggregation or {}),
+                "card_trigger": pattern,
+                "card_action": card.get("action"),
+                "card_tier": card.get("tier"),
+                "card_confidence": round(confidence, 6),
+                "card_direction": direction,
+            },
+        )
+
+    def compute_target_with_action_card(
+        self,
+        score: ScoreSnapshot,
+        market_ctx: dict,
+        action_card: Optional[dict],
+        advanced_results: list[AdvancedSignalResult],
+        basic_results: Optional[list[AdvancedSignalResult]] = None,
+        conn=None,
+        cached_option_rows=None,
+        confidence_floor: float = 0.50,
+    ) -> PortfolioTarget:
+        """Card-aware variant of ``compute_target_with_advanced_signals``.
+
+        When ``action_card`` is a non-STAND_DOWN trade Card with
+        ``confidence >= confidence_floor``, project it onto the score
+        and run the standard pipeline against the projected version.
+        Otherwise fall through to the existing advanced/confluence path
+        — preserving today's behavior bit-for-bit.
+
+        PR-15a wiring intentionally keeps this method *off* by default
+        (the unified signal engine only calls it when
+        ``PLAYBOOK_CARD_DRIVEN_ENTRIES=true``).  PR-15b will strip the
+        legacy bypass and make this the only entry path.
+        """
+        if not action_card or action_card.get("action") == "STAND_DOWN":
+            return self.compute_target_with_advanced_signals(
+                score,
+                market_ctx,
+                advanced_results=advanced_results,
+                basic_results=basic_results,
+                conn=conn,
+                cached_option_rows=cached_option_rows,
+            )
+        try:
+            card_confidence = float(action_card.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            card_confidence = 0.0
+        if card_confidence < confidence_floor:
+            return self.compute_target_with_advanced_signals(
+                score,
+                market_ctx,
+                advanced_results=advanced_results,
+                basic_results=basic_results,
+                conn=conn,
+                cached_option_rows=cached_option_rows,
+            )
+
+        projected = self._synthesize_score_from_action_card(score, action_card)
+        return self.compute_target_with_advanced_signals(
+            projected,
+            market_ctx,
+            advanced_results=advanced_results,
+            basic_results=basic_results,
+            conn=conn,
+            cached_option_rows=cached_option_rows,
+        )
+
+    # ------------------------------------------------------------------
     # reconcile — reads actual state, computes delta, executes
     # ------------------------------------------------------------------
 
