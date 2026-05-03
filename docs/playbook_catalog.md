@@ -655,10 +655,30 @@ Mirror of `call_wall_fade` with reversed signs.
 | PR-8 | `squeeze_breakout` (first Tier 3 swing; vol-compression + gradient-driven direction; envelope-relative stop) | ✅ Shipped |
 | PR-9 | `skew_inversion_reversal` (contrarian fear-spike fade; uses skew_delta + MSI volatility_regime + ATR-daily proxy) | ✅ Shipped |
 | PR-10 | `vanna_charm_glide` (Friday-targeted drift; day-of-week gated; positioning-alignment check; Friday expiry routing) | ✅ Shipped |
-| PR-11 | Remaining Tier 3 swing patterns: `positioning_trap_squeeze`, `gex_gradient_trend` | ⏳ |
+| PR-11 | `positioning_trap_squeeze` + `gex_gradient_trend` — completes Tier 3 (12 patterns total live) | ✅ Shipped |
 | Final | Backtest validation per pattern, then strip `advanced_trigger` / `confluence_trigger` bypass from `portfolio_engine.py` | ⏳ |
 
 After PR-3 the Playbook is feature-complete enough to drive trade
 selection — the engine produces persistable Cards, hysteresis works,
 and two opposite-direction patterns are wired in.  Subsequent PRs add
 breadth (more patterns) and validation (backtests).
+
+After PR-11 every named pattern in §7 is implemented (12 total: 5
+Tier 1 + 2 Tier 2 + 5 Tier 3).  The remaining work is:
+
+- **Backtest validation per pattern**: replace each pattern's prior
+  `pattern_base` (intuition) with empirical hit rate from a
+  >= 90-day backtest window.  Patterns that fail to clear 0.40 hit
+  rate get dropped from the catalog (per §5).
+- **Multi-day signal history**: the rolling-history loader that
+  unblocks the deferred persistence checks (squeeze_setup 2-day
+  trigger, vanna_charm_flow 2-day trigger, skew_delta 20-day mean
+  target / new-low stop) — flagged in each pattern's docstring as
+  a PR-N simplification.
+- **Cycle-loop integration**: today the Action Card is computed
+  on-demand by `/api/signals/action`.  The next step is to compute
+  it on every signal cycle and persist via `signal_action_cards`,
+  which makes the engine drive `portfolio_engine` directly.
+- **Bypass removal**: once Playbook drives trade entries, strip the
+  `advanced_trigger` / `confluence_trigger` bypass from
+  `portfolio_engine.py` so all entries flow through one channel.
