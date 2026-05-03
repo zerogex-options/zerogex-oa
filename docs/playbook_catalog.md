@@ -657,7 +657,7 @@ Mirror of `call_wall_fade` with reversed signs.
 | PR-10 | `vanna_charm_glide` (Friday-targeted drift; day-of-week gated; positioning-alignment check; Friday expiry routing) | ✅ Shipped |
 | PR-11 | `positioning_trap_squeeze` + `gex_gradient_trend` — completes Tier 3 (12 patterns total live) | ✅ Shipped |
 | PR-12 | Multi-day signal history loader — `get_signal_history` query, `SignalSnapshot.score_history` + `daily_max_abs` / `daily_signed_max` helpers, removes "PR-N simplification" caveats from squeeze_breakout / vanna_charm_glide / skew_inversion_reversal | ✅ Shipped |
-| PR-13 | Cycle-loop integration: Playbook computes on every signal cycle, persists Cards, becomes the input to `portfolio_engine` | ⏳ |
+| PR-13 | Cycle-loop integration: Playbook computes on every signal cycle and persists Cards via sync `cycle.evaluate_and_persist`. Wiring Cards into `portfolio_engine` consumption is deferred to PR-15 alongside the bypass removal. | ✅ Shipped |
 | PR-14 | Backtest harness + per-pattern hit-rate validation; replaces priors with empirical numbers | ⏳ |
 | PR-15 | Strip `advanced_trigger` / `confluence_trigger` bypass from `portfolio_engine.py` (depends on PR-14) | ⏳ |
 

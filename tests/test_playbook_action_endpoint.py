@@ -21,8 +21,18 @@ from fastapi.testclient import TestClient
 def _build_app(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("API_KEY", raising=False)
     monkeypatch.setenv("ENVIRONMENT", "development")
+    # Pop both the API surface and the entire playbook subtree.  Pattern
+    # modules cache their PATTERN instances against the *currently loaded*
+    # PatternBase class; if we reload PatternBase but leave pattern modules
+    # cached, the post-reload isinstance() check fails and the engine
+    # silently drops every pattern.  Popping the patterns submodules forces
+    # a clean re-import on the next PlaybookEngine() call.
     for mod in list(sys.modules):
-        if mod.startswith("src.api") or mod.startswith("src.signals.playbook"):
+        if (
+            mod.startswith("src.api")
+            or mod.startswith("src.signals.playbook")
+            or mod == "src.signals.playbook"
+        ):
             sys.modules.pop(mod, None)
     from src.api import database as dbmod  # noqa: E402
 

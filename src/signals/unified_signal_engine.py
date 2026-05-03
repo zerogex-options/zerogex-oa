@@ -63,6 +63,11 @@ class UnifiedSignalEngine:
         self.portfolio_engine = PortfolioEngine(self.underlying)
         self.advanced_signal_engine = AdvancedSignalEngine()
         self.basic_signal_engine = BasicSignalEngine()
+
+        # Playbook is lazily instantiated so pattern discovery happens once
+        # per process.  Disabled when PLAYBOOK_DISABLE_CYCLE_EMIT=true so
+        # operators can roll back without code changes.
+        self._playbook_engine = None
         # Per-signal hysteresis/dedupe state, keyed by advanced signal name.
         # Initialized eagerly so helper methods can assume the dict exists.
         self._advanced_state: dict[str, dict] = {}
@@ -1007,6 +1012,50 @@ class UnifiedSignalEngine:
             conn.commit()
         return results
 
+    def _evaluate_playbook(
+        self,
+        market_context,
+        score,
+        advanced_results,
+        basic_results,
+    ) -> None:
+        """Compute + persist an Action Card from this cycle's state.
+
+        Wrapped to swallow all exceptions so a Playbook problem never
+        breaks the cycle.  Disabled when ``PLAYBOOK_DISABLE_CYCLE_EMIT=true``
+        for op rollback without code changes.
+        """
+        if os.getenv("PLAYBOOK_DISABLE_CYCLE_EMIT", "").lower() == "true":
+            return
+        try:
+            from src.signals.playbook import PlaybookEngine
+            from src.signals.playbook.cycle import evaluate_and_persist
+
+            if self._playbook_engine is None:
+                self._playbook_engine = PlaybookEngine()
+            with db_connection() as conn:
+                card = evaluate_and_persist(
+                    engine=self._playbook_engine,
+                    market_context=market_context,
+                    score=score,
+                    advanced_results=advanced_results,
+                    basic_results=basic_results,
+                    conn=conn,
+                )
+            logger.info(
+                "Playbook [%s] action=%s pattern=%s confidence=%.2f",
+                self.db_symbol,
+                card.action.value,
+                card.pattern,
+                card.confidence,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Playbook cycle integration failed for %s: %s",
+                self.db_symbol,
+                exc,
+            )
+
     def run_cycle(self) -> bool:
         # Each phase acquires and releases its own connection to avoid
         # holding a connection "idle in transaction" during CPU-bound work.
@@ -1027,6 +1076,12 @@ class UnifiedSignalEngine:
         score = self.scoring_engine.score_and_persist(market_context)
         advanced_results = self._persist_advanced_signals(market_context)
         basic_results = self._persist_basic_signals(market_context)
+
+        # Phase 2.5: Playbook — compute and persist Action Card from the
+        # state we just produced.  Best-effort: persistence errors are
+        # logged but never break the cycle.  Trade selection is still
+        # driven by the score path until PR-15.
+        self._evaluate_playbook(market_context, score, advanced_results, basic_results)
 
         # Phase 3: reconcile portfolio (acquires connection for reads+writes)
         # Legacy optimizer-cache plumbing is no longer needed because MSI
