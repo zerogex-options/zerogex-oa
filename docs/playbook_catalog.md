@@ -656,7 +656,10 @@ Mirror of `call_wall_fade` with reversed signs.
 | PR-9 | `skew_inversion_reversal` (contrarian fear-spike fade; uses skew_delta + MSI volatility_regime + ATR-daily proxy) | ✅ Shipped |
 | PR-10 | `vanna_charm_glide` (Friday-targeted drift; day-of-week gated; positioning-alignment check; Friday expiry routing) | ✅ Shipped |
 | PR-11 | `positioning_trap_squeeze` + `gex_gradient_trend` — completes Tier 3 (12 patterns total live) | ✅ Shipped |
-| Final | Backtest validation per pattern, then strip `advanced_trigger` / `confluence_trigger` bypass from `portfolio_engine.py` | ⏳ |
+| PR-12 | Multi-day signal history loader — `get_signal_history` query, `SignalSnapshot.score_history` + `daily_max_abs` / `daily_signed_max` helpers, removes "PR-N simplification" caveats from squeeze_breakout / vanna_charm_glide / skew_inversion_reversal | ✅ Shipped |
+| PR-13 | Cycle-loop integration: Playbook computes on every signal cycle, persists Cards, becomes the input to `portfolio_engine` | ⏳ |
+| PR-14 | Backtest harness + per-pattern hit-rate validation; replaces priors with empirical numbers | ⏳ |
+| PR-15 | Strip `advanced_trigger` / `confluence_trigger` bypass from `portfolio_engine.py` (depends on PR-14) | ⏳ |
 
 After PR-3 the Playbook is feature-complete enough to drive trade
 selection — the engine produces persistable Cards, hysteresis works,

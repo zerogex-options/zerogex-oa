@@ -6,10 +6,11 @@ We hold a Friday-expiry ATM debit in the drift direction.
 
 Per ``docs/playbook_catalog.md`` §7.3.3.
 
-PR-10 simplification: spec calls for ``|vanna_charm_flow.score| >= 40``
-sustained 2+ consecutive days.  Without per-day signal history we
-accept a current trigger; multi-day persistence will land with the
-rolling-history loader.
+The 2-day-sustained, same-sign requirement on
+``vanna_charm_flow.score`` is enforced via ``daily_signed_max`` from
+the PR-12 history loader: at least ``_SUSTAINED_DAYS_MIN`` distinct
+ET trading days within the loaded window must show a same-sign extreme
+above ``_VCF_SCORE_MIN``.
 """
 
 from __future__ import annotations
@@ -33,6 +34,9 @@ from src.signals.playbook.types import (
 )
 
 _VCF_SCORE_MIN = float(os.getenv("PLAYBOOK_VCG_SCORE_MIN", "40"))
+_SUSTAINED_DAYS_MIN = int(os.getenv("PLAYBOOK_VCG_SUSTAINED_DAYS_MIN", "2"))
+# History entries are clamped to [-1, +1].  Threshold expressed on that scale.
+_SUSTAINED_DAILY_THRESHOLD = float(os.getenv("PLAYBOOK_VCG_SUSTAINED_DAILY_THRESHOLD", "0.40"))
 _TARGET_ATR_MULT = float(os.getenv("PLAYBOOK_VCG_TARGET_ATR_MULT", "2.0"))
 _FRIDAY_CLOSE_BUFFER_HOURS = int(os.getenv("PLAYBOOK_VCG_FRIDAY_CLOSE_HOUR", "14"))
 _DAILY_SIGMA_SCALAR = math.sqrt(390.0)
@@ -188,6 +192,15 @@ class VannaCharmGlidePattern(PatternBase):
             missing.append("vanna_charm_flow signal unavailable")
         elif abs(vcf.score) < _VCF_SCORE_MIN:
             missing.append(f"vanna_charm_flow |score| {abs(vcf.score):.1f} < {_VCF_SCORE_MIN:.0f}")
+        else:
+            # 2-day-sustained, same-sign requirement.  Falls back to "accept
+            # current trigger" when no history is loaded.
+            sustained_days = self._count_sustained_same_sign_days(vcf)
+            if sustained_days is not None and sustained_days < _SUSTAINED_DAYS_MIN:
+                missing.append(
+                    f"vanna_charm_flow same-sign extreme on only {sustained_days} ET "
+                    f"trading day(s) (need >= {_SUSTAINED_DAYS_MIN})"
+                )
 
         # positioning_trap must align (same sign) with drift, or be near-zero.
         if vcf is not None and abs(vcf.score) >= _VCF_SCORE_MIN:
@@ -210,6 +223,24 @@ class VannaCharmGlidePattern(PatternBase):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _count_sustained_same_sign_days(snap) -> Optional[int]:
+        """Days where vcf same-sign extreme exceeds the threshold.
+
+        Uses ``daily_signed_max`` so direction is preserved.  Counts only
+        the days whose extreme is on the same side as the current snapshot.
+        Returns None when no history is loaded (fall back to current trigger).
+        """
+        if not getattr(snap, "score_history", None):
+            return None
+        current_sign = 1.0 if snap.score > 0 else -1.0
+        signed_extremes = snap.daily_signed_max()
+        return sum(
+            1
+            for _day, ext in signed_extremes
+            if (ext * current_sign) > 0 and abs(ext) >= _SUSTAINED_DAILY_THRESHOLD
+        )
 
     @staticmethod
     def _minutes_until_friday_close(ctx: PlaybookContext) -> int:

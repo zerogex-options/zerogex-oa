@@ -6,14 +6,15 @@ overpriced — a contrarian bullish reversal trade.
 
 Per ``docs/playbook_catalog.md`` §7.3.2.
 
-PR-9 simplifications:
-- Spec target uses "mean of skew_delta.score over prior 20 days × ATR".
-  Without per-day signal history we approximate with the *current*
-  skew_delta magnitude — same directional intent, will be replaced
-  when the rolling-history loader lands.
-- Spec MA check is "daily close within 0.5% of 20-day MA".  We use the
-  mean of available 1-min ``recent_closes`` as a proxy; real
-  implementation will pull daily closes from a longer history.
+The 20-day skew aggregations now use the PR-12 history loader:
+- Target intensity = |20-day-mean skew| / 100, replacing the prior
+  current-magnitude approximation.
+- A new-20-day-low stop predicate is computed from the same history and
+  surfaced in the Card's context for downstream stop monitoring.
+
+The MA-proximity gate still uses the mean of available 1-min
+``recent_closes`` as a proxy for the 20-day MA.  Wiring daily closes
+through is a separate (smaller) follow-up.
 """
 
 from __future__ import annotations
@@ -99,11 +100,22 @@ class SkewInversionReversalPattern(PatternBase):
         expiry = self._dte_expiry(ctx, _DTE_DAYS)
         legs = [Leg(expiry=expiry, strike=strike, right="C", side="BUY", qty=1)]
 
-        # Target: |skew_delta| / 100 × ATR_daily × close added to close.
-        # Greater fear → larger expected mean-revert pop.
-        skew_intensity = abs(skew.score) / 100.0
+        # Target: |20-day-mean skew| / 100 × ATR_daily × close added to close.
+        # Falls back to current magnitude when no history is loaded.
+        mean_clamped = self._mean_clamped_skew(skew)
+        if mean_clamped is None:
+            skew_intensity = abs(skew.score) / 100.0
+            intensity_source = "current_skew"
+        else:
+            skew_intensity = abs(mean_clamped)
+            intensity_source = "history_20d_mean"
         target_offset = skew_intensity * atr_daily_proxy * close
         target_ref = close + target_offset
+
+        # Whether the current snapshot is a new 20-day low — surfaced for
+        # downstream stop monitoring (the actual exit happens in the
+        # portfolio engine, this is just the predicate).
+        new_20d_low = self._is_new_20d_low(skew)
 
         confidence = self.compute_confidence(ctx, bias="bullish")
 
@@ -150,6 +162,8 @@ class SkewInversionReversalPattern(PatternBase):
                 "otm_offset": round(otm_offset, 4),
                 "strike": strike,
                 "skew_intensity": round(skew_intensity, 4),
+                "skew_intensity_source": intensity_source,
+                "skew_is_new_20d_low": new_20d_low,
                 "target_offset": round(target_offset, 4),
             },
         )
@@ -210,6 +224,30 @@ class SkewInversionReversalPattern(PatternBase):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mean_clamped_skew(snap) -> Optional[float]:
+        """Mean clamped score over loaded history.  None when empty."""
+        if not getattr(snap, "score_history", None):
+            return None
+        scores = [s for _ts, s in snap.score_history]
+        if not scores:
+            return None
+        return sum(scores) / len(scores)
+
+    @staticmethod
+    def _is_new_20d_low(snap) -> bool:
+        """True when the current clamped score is below the prior history min.
+
+        Uses the loaded score_history; returns False when no history is
+        available (no signal that the thesis has broken).
+        """
+        if not getattr(snap, "score_history", None):
+            return False
+        prior = [s for _ts, s in snap.score_history[:-1]]  # exclude latest
+        if not prior:
+            return False
+        return snap.clamped_score < min(prior)
 
     @staticmethod
     def _volatility_regime_score(ctx: PlaybookContext) -> Optional[float]:

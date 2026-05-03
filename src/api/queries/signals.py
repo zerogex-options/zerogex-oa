@@ -1099,6 +1099,45 @@ class SignalsQueriesMixin:
     # Playbook Action Cards (PR-3+)
     # ------------------------------------------------------------------
 
+    async def get_signal_history(
+        self,
+        symbol: str,
+        component_name: str,
+        days_back: int = 21,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        """Return recent ``signal_component_scores`` rows for one signal.
+
+        Used by the Playbook context-builder to populate
+        ``SignalSnapshot.score_history`` for patterns that need multi-day
+        aggregations (squeeze_setup 2-day sustained, vanna_charm_flow
+        2-day sustained, skew_delta 20-day mean / new-low).
+
+        Returns rows ordered oldest → newest with ``timestamp`` and
+        ``clamped_score``.  Capped at ``limit`` rows to bound payload.
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT timestamp, clamped_score
+                    FROM signal_component_scores
+                    WHERE underlying = $1
+                      AND component_name = $2
+                      AND timestamp > NOW() - ($3::int * INTERVAL '1 day')
+                    ORDER BY timestamp ASC
+                    LIMIT $4
+                    """,
+                    symbol,
+                    component_name,
+                    int(days_back),
+                    int(limit),
+                )
+                return [dict(r) for r in rows]
+        except Exception as exc:
+            logger.warning("get_signal_history failed (%s, %s): %s", symbol, component_name, exc)
+            return []
+
     async def insert_action_card(self, card: Dict[str, Any]) -> None:
         """Persist a non-STAND_DOWN Action Card.
 

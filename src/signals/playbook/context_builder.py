@@ -65,6 +65,38 @@ _LEVEL_FIELDS_BY_SIGNAL = {
 }
 
 
+# Signals whose patterns need multi-day score history.  Loading history is a
+# separate DB call per name, so we only fetch for signals actually used.
+_HISTORY_LOAD_FOR: dict[str, int] = {
+    # Pattern → days_back (covers the longest aggregation that uses each).
+    "squeeze_setup": 4,  # squeeze_breakout: 2-day sustained
+    "vanna_charm_flow": 4,  # vanna_charm_glide: 2-day sustained
+    "skew_delta": 21,  # skew_inversion_reversal: 20-day mean / new-low
+}
+
+
+def _normalize_history(rows: list[dict]) -> list[tuple[datetime, float]]:
+    """Convert raw history rows into (timestamp, clamped_score) tuples."""
+    out: list[tuple[datetime, float]] = []
+    for r in rows or []:
+        ts = r.get("timestamp")
+        score = r.get("clamped_score")
+        if ts is None or score is None:
+            continue
+        if isinstance(ts, str):
+            try:
+                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+        if ts.tzinfo is None:
+            ts = pytz.UTC.localize(ts)
+        try:
+            out.append((ts, float(score)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _snapshot_from_row(name: str, row: Optional[dict]) -> Optional[SignalSnapshot]:
     if not row:
         return None
@@ -291,6 +323,19 @@ async def build_playbook_context(
             snap = _msi_component_snapshot(name, components)
             if snap:
                 basic[name] = snap
+
+    # Backfill score_history for the signals that patterns aggregate over time.
+    # Done after the snapshot loops so we attach to whatever snapshot exists.
+    for hist_name, days_back in _HISTORY_LOAD_FOR.items():
+        snap = advanced.get(hist_name) or basic.get(hist_name)
+        if snap is None:
+            continue
+        try:
+            rows = await db.get_signal_history(underlying, hist_name, days_back=days_back)
+        except Exception as exc:
+            logger.warning("get_signal_history(%s, %s) failed: %s", underlying, hist_name, exc)
+            rows = []
+        snap.score_history = _normalize_history(rows)
 
     market = _build_market_context(
         underlying=underlying,

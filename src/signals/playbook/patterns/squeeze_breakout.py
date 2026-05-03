@@ -7,11 +7,11 @@ dealer regime isn't entrenched, so the move can run.
 
 Per ``docs/playbook_catalog.md`` §7.3.1.
 
-PR-8 simplification: the spec calls for ``squeeze_setup.triggered``
-sustained for >= 2 consecutive trading days.  Without per-day signal
-persistence wired into PlaybookContext, we accept a *current*
-trigger and corroborate via ``squeeze_setup.signal`` direction.  A
-later PR will add multi-day signal history.
+The 2-day-sustained ``squeeze_setup.triggered`` requirement is enforced
+via ``SignalSnapshot.daily_max_abs`` (PR-12 history loader): we count
+the number of distinct ET trading days within the configured window in
+which |squeeze score| has reached the trigger threshold and require at
+least ``_SUSTAINED_DAYS_MIN``.
 """
 
 from __future__ import annotations
@@ -42,6 +42,10 @@ _TARGET_RANGE_MULT = float(os.getenv("PLAYBOOK_SQB_TARGET_RANGE_MULT", "2.0"))
 _WALL_BUFFER_PCT = float(os.getenv("PLAYBOOK_SQB_WALL_BUFFER_PCT", "0.005"))  # 0.5%
 _ENVELOPE_LOOKBACK_BARS = int(os.getenv("PLAYBOOK_SQB_ENVELOPE_LOOKBACK_BARS", "30"))
 _ET_START_HOUR = int(os.getenv("PLAYBOOK_SQB_START_HOUR_ET", "10"))
+# Number of distinct ET trading days within squeeze_setup history that must
+# reach the triggered threshold (clamped >= 0.25, i.e. score >= 25).
+_SUSTAINED_DAYS_MIN = int(os.getenv("PLAYBOOK_SQB_SUSTAINED_DAYS_MIN", "2"))
+_SUSTAINED_DAILY_THRESHOLD = float(os.getenv("PLAYBOOK_SQB_SUSTAINED_DAILY_THRESHOLD", "0.25"))
 
 
 BreakoutDirection = Literal["bullish", "bearish"]
@@ -201,6 +205,17 @@ class SqueezeBreakoutPattern(PatternBase):
             missing.append("squeeze_setup signal unavailable")
         elif not squeeze.triggered:
             missing.append("squeeze_setup not triggered")
+        else:
+            # 2-day-sustained gate: count distinct ET trading days where
+            # squeeze_setup reached the trigger threshold.  Falls back to
+            # accepting the current trigger when no history is loaded
+            # (e.g. early bootstrap or test contexts without history wired).
+            sustained_days = self._count_sustained_days(squeeze)
+            if sustained_days is not None and sustained_days < _SUSTAINED_DAYS_MIN:
+                missing.append(
+                    f"squeeze_setup triggered on only {sustained_days} ET trading "
+                    f"day(s) of recent history (need >= {_SUSTAINED_DAYS_MIN})"
+                )
 
         vol_x = ctx.signal("vol_expansion")
         if vol_x is None:
@@ -261,6 +276,19 @@ class SqueezeBreakoutPattern(PatternBase):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _count_sustained_days(snap) -> Optional[int]:
+        """Distinct ET trading days where |squeeze score| >= threshold.
+
+        Returns None when ``score_history`` is empty (no history loaded) so
+        callers can fall back to "accept current trigger".  Returns 0 when
+        history is loaded but no day clears the bar.
+        """
+        if not getattr(snap, "score_history", None):
+            return None
+        daily = snap.daily_max_abs()
+        return sum(1 for _day, max_abs in daily if max_abs >= _SUSTAINED_DAILY_THRESHOLD)
 
     @staticmethod
     def _pick_target(

@@ -36,6 +36,42 @@ class SignalSnapshot:
     signal: Optional[str] = None  # signal-specific label, e.g. "bearish_fade"
     direction: Optional[str] = None  # bullish | bearish | neutral
     context_values: dict[str, Any] = field(default_factory=dict)
+    # Trailing time-series, oldest → newest, populated by context_builder for
+    # signals that patterns query for multi-day aggregations (squeeze_setup,
+    # vanna_charm_flow, skew_delta).  Empty for signals not in the
+    # _HISTORY_LOAD_FOR set.
+    score_history: list[tuple[datetime, float]] = field(default_factory=list)
+
+    # ------------------------------------------------------------------
+    # Aggregation helpers used by patterns
+    # ------------------------------------------------------------------
+
+    def history_by_day(self) -> dict[str, list[float]]:
+        """Group score_history into per-ET-date buckets of clamped scores."""
+        out: dict[str, list[float]] = {}
+        for ts, score in self.score_history:
+            if ts.tzinfo is None:
+                ts = pytz.UTC.localize(ts)
+            day_key = ts.astimezone(_ET).date().isoformat()
+            out.setdefault(day_key, []).append(float(score))
+        return out
+
+    def daily_max_abs(self) -> list[tuple[str, float]]:
+        """Per-day max(|clamped_score|), oldest → newest."""
+        buckets = self.history_by_day()
+        return [(day, max(abs(s) for s in scores)) for day, scores in sorted(buckets.items())]
+
+    def daily_signed_max(self) -> list[tuple[str, float]]:
+        """Per-day signed score with the largest absolute value, oldest → newest.
+
+        Useful for "sign-sustained" checks where direction matters.
+        """
+        buckets = self.history_by_day()
+        out: list[tuple[str, float]] = []
+        for day, scores in sorted(buckets.items()):
+            extreme = max(scores, key=abs)
+            out.append((day, float(extreme)))
+        return out
 
 
 @dataclass
