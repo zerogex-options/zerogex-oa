@@ -233,3 +233,45 @@ def test_card_projection_preserves_market_ctx_and_signal_lists():
     assert args[1] == {"id": "marker"}
     assert kwargs["advanced_results"] is advanced_marker
     assert kwargs["basic_results"] is basic_marker
+
+
+# ----------------------------------------------------------------------
+# PR-15b: bypass removal regressions
+#
+# The legacy ``advanced_trigger`` / ``confluence_trigger`` keys in the
+# ScoreSnapshot's aggregation dict no longer cause portfolio_engine to
+# skip the conviction floor or the kelly×conviction edge floor.  These
+# tests pin that behavior so a future change can't silently re-add the
+# bypass.
+# ----------------------------------------------------------------------
+
+
+def test_bypass_keys_no_longer_skip_conviction_threshold():
+    """A weak-conviction score with advanced_trigger=True must NOT bypass
+    the entry threshold.  Pre-PR-15b this would have entered a position;
+    post-strip it must return cash."""
+    import inspect
+
+    from src.signals.portfolio_engine import PortfolioEngine
+
+    src = inspect.getsource(PortfolioEngine.compute_target)
+    # The is_signal_driven flag is gone.
+    assert "is_signal_driven" not in src, "PR-15b: advanced/confluence bypass must be removed"
+    # No remaining reads of the bypass aggregation keys inside compute_target.
+    assert 'agg.get("advanced_trigger")' not in src
+    assert 'agg.get("confluence_trigger")' not in src
+
+
+def test_bypass_keys_no_longer_skip_kelly_floor():
+    """The kelly × conviction edge floor must apply uniformly; the prior
+    carve-out for advanced/confluence-driven scores is gone."""
+    import inspect
+
+    from src.signals.portfolio_engine import PortfolioEngine
+
+    src = inspect.getsource(PortfolioEngine.compute_target)
+    # The string used to live inside the edge-proxy block.
+    assert "if not is_signal_driven" not in src
+    # And the floor check itself still exists.
+    assert "edge_proxy" in src
+    assert "self.conviction_floor" in src

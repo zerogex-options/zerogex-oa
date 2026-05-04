@@ -660,7 +660,7 @@ Mirror of `call_wall_fade` with reversed signs.
 | PR-13 | Cycle-loop integration: Playbook computes on every signal cycle and persists Cards via sync `cycle.evaluate_and_persist`. Wiring Cards into `portfolio_engine` consumption is deferred to PR-15 alongside the bypass removal. | ✅ Shipped |
 | PR-14 | Backtest harness — `signal_action_cards` replay → outcome (target/stop/time) → per-pattern stats persisted to `playbook_pattern_stats`. Read-only: live `pattern_base` priors unchanged; promoting empirical numbers to live confidence is a follow-up | ✅ Shipped |
 | PR-15a | Additive Card consumption in `portfolio_engine`: `_synthesize_score_from_action_card` + `compute_target_with_action_card`. Wired into the cycle behind `PLAYBOOK_CARD_DRIVEN_ENTRIES=true` (off by default). Production behavior unchanged until the flag flips. | ✅ Shipped |
-| PR-15b | Strip the legacy `advanced_trigger` / `confluence_trigger` bypass from `portfolio_engine.py` once empirical Card-driven trade selection is validated | ⏳ |
+| PR-15b | Strip the legacy `advanced_trigger` / `confluence_trigger` bypass from `portfolio_engine.py`. Synthesized scores from `_build_advanced_target` / `_signal_confluence` still set the aggregation keys for diagnostics, but those keys no longer skip the conviction floor or kelly×conviction edge floor. Card-driven entries continue to flow through `compute_target_with_action_card` (PR-15a) gated by env flag. | ✅ Shipped |
 
 After PR-3 the Playbook is feature-complete enough to drive trade
 selection — the engine produces persistable Cards, hysteresis works,

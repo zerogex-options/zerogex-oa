@@ -347,25 +347,28 @@ class PortfolioEngine:
         # whipsaw us out. Implementation tolerates MagicMock conns (tests) by
         # treating any failure as "no open position".
         #
-        # Advanced-signal and confluence entry paths bypass this gate — they
-        # are independent triggers that self-gate via min-score and confluence
-        # ratio filters before reaching compute_target.
-        agg = score.aggregation or {}
-        is_signal_driven = bool(agg.get("advanced_trigger") or agg.get("confluence_trigger"))
-        if not is_signal_driven:
-            held_direction = self._current_position_direction(conn)
-            if held_direction == trade_direction:
-                effective_threshold = self.exit_threshold
-                threshold_label = "exit"
-            else:
-                effective_threshold = self.entry_threshold
-                threshold_label = "entry"
-            if conviction < effective_threshold:
-                return self._cash_target(
-                    score,
-                    f"Conviction {conviction:.2f} below {threshold_label} threshold "
-                    f"{effective_threshold:.2f} (held={held_direction})",
-                )
+        # PR-15b: the legacy advanced/confluence bypass that let signal-driven
+        # scores skip this gate has been removed.  Synthesized scores from
+        # _build_advanced_target / _signal_confluence still set
+        # ``aggregation["advanced_trigger"]`` / ``["confluence_trigger"]`` for
+        # diagnostics, but those keys no longer change behavior — they must
+        # clear the same conviction threshold as MSI-driven scores.  Card-driven
+        # entries are routed through ``compute_target_with_action_card`` (see
+        # PR-15a) and are gated by the env flag rather than the aggregation
+        # keys.
+        held_direction = self._current_position_direction(conn)
+        if held_direction == trade_direction:
+            effective_threshold = self.exit_threshold
+            threshold_label = "exit"
+        else:
+            effective_threshold = self.entry_threshold
+            threshold_label = "entry"
+        if conviction < effective_threshold:
+            return self._cash_target(
+                score,
+                f"Conviction {conviction:.2f} below {threshold_label} threshold "
+                f"{effective_threshold:.2f} (held={held_direction})",
+            )
 
         # Determine sizing mode by regime.
         if regime == "trend_expansion":
@@ -438,16 +441,16 @@ class PortfolioEngine:
         # Combined kelly × conviction floor: rejects technically-positive-EV
         # candidates whose effective sizing edge is microscopic. Without this
         # we fire on every weak signal and pay slippage for ~zero edge.
-        # Advanced/confluence-driven scores carry their own gating upstream;
-        # don't double-block them here.
-        if not is_signal_driven:
-            edge_proxy = float(candidate.kelly_fraction or 0.0) * conviction
-            if edge_proxy < self.conviction_floor:
-                return self._cash_target(
-                    score,
-                    f"Edge proxy kelly*conviction {edge_proxy:.3f} below floor "
-                    f"{self.conviction_floor:.3f}",
-                )
+        # PR-15b: this floor now applies uniformly — the prior carve-out for
+        # advanced/confluence-driven scores has been removed alongside the
+        # conviction-threshold bypass above.
+        edge_proxy = float(candidate.kelly_fraction or 0.0) * conviction
+        if edge_proxy < self.conviction_floor:
+            return self._cash_target(
+                score,
+                f"Edge proxy kelly*conviction {edge_proxy:.3f} below floor "
+                f"{self.conviction_floor:.3f}",
+            )
 
         # --- CASE 4: compute target contracts via Kelly sizing ---
         fresh_cross = self._fresh_drs_cross(trade_direction, market_ctx)
