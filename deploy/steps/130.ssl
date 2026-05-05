@@ -154,11 +154,29 @@ server {
         # nginx silently skips this if the file doesn't exist yet.
         include /etc/nginx/conf.d/zerogex-api-key.conf*;
 
-        proxy_connect_timeout 15s;
-        proxy_send_timeout 60s;
-        proxy_read_timeout 60s;
+        # Sized for heavy historical/heatmap queries (window_units=90) on
+        # the current 2-vCPU box; can be tightened after a CPU upgrade.
+        proxy_connect_timeout 30s;
+        proxy_send_timeout 120s;
+        proxy_read_timeout 120s;
 
-        limit_req zone=zerogex_api_per_ip burst=40 nodelay;
+        # Response cache. Zone defined in step 120 (zerogex-cache-zone.conf).
+        # proxy_cache_lock collapses simultaneous identical requests; use_stale
+        # + background_update keep users on cached values when upstream is slow.
+        # MUST stay in sync with step 120's HTTP block and zerogex-web's
+        # location /api/ block (see RUNBOOK "Sibling repo" section).
+        proxy_cache zerogex_cache;
+        proxy_cache_methods GET;
+        proxy_cache_valid 200 5s;
+        proxy_cache_valid 404 1s;
+        proxy_cache_key "\$request_method\$request_uri";
+        proxy_cache_lock on;
+        proxy_cache_lock_timeout 90s;
+        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+        proxy_cache_background_update on;
+        add_header X-Cache-Status \$upstream_cache_status always;
+
+        limit_req zone=zerogex_api_per_ip burst=1000 nodelay;
     }
 }
 EOF
