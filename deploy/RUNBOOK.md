@@ -43,6 +43,42 @@ if unsure.
 
 ---
 
+## Sibling repo: `zerogex-web`
+
+The Next.js frontend at `https://zerogex.io` and its nginx config live in
+a separate repo (`zerogex-web`). That repo owns
+`/etc/nginx/sites-available/zerogex-web`, which contains the
+`location /api/` block proxying user-facing API traffic to FastAPI on
+port 8000. **Most production API traffic flows through `zerogex-web`'s
+nginx config, not the `api.zerogex.io` config in this repo.**
+
+This creates a cross-repo nginx dependency:
+
+- **This repo** (`zerogex-oa`, `deploy/steps/120.nginx_api`) defines the
+  shared cache zone `zerogex_cache` at
+  `/etc/nginx/conf.d/zerogex-cache-zone.conf`, and bumps
+  `worker_connections`, `LimitNOFILE`, the per-IP rate limit, and proxy
+  timeouts in `nginx.conf`.
+- **`zerogex-web`** must reference that zone in its `location /api/`
+  block (`proxy_cache zerogex_cache;` plus the matching `proxy_cache_*`
+  directives, the looser `burst=1000` rate limit, and the 30s/120s/120s
+  proxy timeouts).
+
+**Both halves must be deployed for the API to survive peak trading
+load.** Without `zerogex-web`'s cache directives, all frontend `/api/*`
+calls bypass the cache, hammer FastAPI directly, and the box CPU-saturates
+within minutes of the afternoon session opening (this caused a real
+incident on 2026-05-05).
+
+When replacing the instance, after this repo's `deploy.sh` finishes:
+
+1. Clone and deploy `zerogex-web` on the new instance — its nginx config
+   must include the cache directives referenced above.
+2. `sudo nginx -t && sudo systemctl reload nginx`.
+3. Confirm the cache is actually populating (see Phase 3).
+
+---
+
 ## Phase 0 — Decide and prepare (5 min)
 
 ```bash
@@ -274,6 +310,11 @@ sudo journalctl -u zerogex-oa-ingestion --since "5 minutes ago" --no-pager | tai
 
 # Cert renewal timer is enabled
 systemctl status zerogex-cert-renew.timer --no-pager
+
+# Response cache is populating (proves the zerogex-web /api/ block was
+# also deployed with cache directives — see "Sibling repo" section).
+# Should be > 0 within seconds of real traffic.
+sudo find /var/cache/nginx/zerogex -type f | wc -l
 ```
 
 If any of those look wrong, **roll back** (see below) before terminating
