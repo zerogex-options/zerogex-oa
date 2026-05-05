@@ -122,6 +122,10 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+# Repo root on sys.path so cross-test helper imports (e.g. ``from
+# tests.test_playbook_squeeze_breakout import _ctx``) resolve regardless
+# of whether pytest was invoked as ``pytest`` or ``python -m pytest``.
+pythonpath = ["."]
 addopts = [
     "--verbose",
     "--strict-markers",
