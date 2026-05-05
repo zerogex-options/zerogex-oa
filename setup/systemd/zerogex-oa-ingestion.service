@@ -33,6 +33,7 @@ SendSIGKILL=yes
 # Resource limits
 MemoryMax=2G
 CPUQuota=150%
+CPUWeight=100
 
 # Security
 NoNewPrivileges=true

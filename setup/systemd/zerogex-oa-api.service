@@ -54,6 +54,8 @@ SendSIGKILL=yes
 # Resource limits
 MemoryMax=1G
 CPUQuota=100%
+# API wins contended cycles over background workers (ingestion=100, analytics/signals=80)
+CPUWeight=400
 
 # Security
 NoNewPrivileges=true
