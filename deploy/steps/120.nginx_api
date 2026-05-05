@@ -10,11 +10,33 @@ log "Nginx Reverse Proxy (HTTP bootstrap)"
 
 DOMAIN_NAME="${OA_API_DOMAIN:-api.zerogex.io}"
 NGINX_SITE="/etc/nginx/sites-available/zerogex-oa-api"
+NGINX_CACHE_DIR="/var/cache/nginx/zerogex"
 
 log "  → Installing nginx..."
 sudo apt install -y nginx
 
-log "  → Writing shared nginx snippets (upgrade map + rate limit zone)..."
+log "  → Tuning nginx event-loop limits (worker_connections + FD ceiling)..."
+# Default 768 is too low when slow upstream calls hold worker slots during peak.
+sudo sed -i 's/worker_connections [0-9]*;/worker_connections 4096;/' /etc/nginx/nginx.conf
+# worker_rlimit_nofile must allow ~2× worker_connections (client + upstream FD per request).
+if ! grep -q '^worker_rlimit_nofile' /etc/nginx/nginx.conf; then
+    sudo sed -i '/^events {/i worker_rlimit_nofile 16384;\n' /etc/nginx/nginx.conf
+fi
+
+log "  → Configuring systemd LimitNOFILE override for nginx..."
+# nginx workers can only honor worker_rlimit_nofile up to the systemd-imposed ceiling.
+sudo mkdir -p /etc/systemd/system/nginx.service.d
+sudo tee /etc/systemd/system/nginx.service.d/override.conf > /dev/null <<'NGINXOVERRIDE'
+[Service]
+LimitNOFILE=65536
+NGINXOVERRIDE
+sudo systemctl daemon-reload
+
+log "  → Creating proxy cache directory..."
+sudo mkdir -p "$NGINX_CACHE_DIR"
+sudo chown www-data:www-data "$NGINX_CACHE_DIR"
+
+log "  → Writing shared nginx snippets (upgrade map + rate limit zone + cache zone)..."
 sudo tee /etc/nginx/conf.d/zerogex-upgrade-map.conf > /dev/null <<'MAPEOF'
 map $http_upgrade $connection_upgrade {
     default upgrade;
@@ -23,9 +45,17 @@ map $http_upgrade $connection_upgrade {
 MAPEOF
 
 sudo tee /etc/nginx/conf.d/zerogex-rate-limit.conf > /dev/null <<'LIMITEOF'
-# Per-IP rate limiting for API and docs endpoints
-limit_req_zone $binary_remote_addr zone=zerogex_api_per_ip:10m rate=20r/s;
+# Generous limit; the response cache (zerogex_cache) absorbs upstream load and
+# fail2ban handles real abuse — this is just a guardrail against runaway loops.
+limit_req_zone $binary_remote_addr zone=zerogex_api_per_ip:10m rate=500r/s;
 LIMITEOF
+
+sudo tee /etc/nginx/conf.d/zerogex-cache-zone.conf > /dev/null <<'CACHEEOF'
+# Response cache for idempotent GETs. 5s TTL + use_stale + background_update
+# keeps users on slightly-stale data when the upstream is slow or briefly down.
+proxy_cache_path /var/cache/nginx/zerogex levels=1:2 keys_zone=zerogex_cache:10m
+                 max_size=200m inactive=30s use_temp_path=off;
+CACHEEOF
 
 log "  → Creating HTTP-only nginx bootstrap configuration for ${DOMAIN_NAME}..."
 sudo tee "$NGINX_SITE" > /dev/null <<EOF
@@ -55,11 +85,28 @@ server {
         # nginx silently skips this if the file doesn't exist yet.
         include /etc/nginx/conf.d/zerogex-api-key.conf*;
 
-        proxy_connect_timeout 15s;
-        proxy_send_timeout 60s;
-        proxy_read_timeout 60s;
+        # Sized for heavy historical/heatmap queries (window_units=90) on the
+        # current 2-vCPU box; can be tightened after a CPU upgrade.
+        proxy_connect_timeout 30s;
+        proxy_send_timeout 120s;
+        proxy_read_timeout 120s;
 
-        limit_req zone=zerogex_api_per_ip burst=40 nodelay;
+        # Response cache. proxy_cache_lock collapses simultaneous identical
+        # requests into one upstream call; lock_timeout matches the slowest
+        # expected upstream so the herd waits for the cache fill instead of
+        # bypassing into a thundering retry storm.
+        proxy_cache zerogex_cache;
+        proxy_cache_methods GET;
+        proxy_cache_valid 200 5s;
+        proxy_cache_valid 404 1s;
+        proxy_cache_key "\$request_method\$request_uri";
+        proxy_cache_lock on;
+        proxy_cache_lock_timeout 90s;
+        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+        proxy_cache_background_update on;
+        add_header X-Cache-Status \$upstream_cache_status always;
+
+        limit_req zone=zerogex_api_per_ip burst=1000 nodelay;
     }
 }
 EOF
@@ -89,6 +136,8 @@ log ""
 log "Summary:"
 log "  ✓ Nginx configured for domain: ${DOMAIN_NAME}"
 log "  ✓ HTTP reverse proxy active: http://${DOMAIN_NAME} -> http://127.0.0.1:8000"
+log "  ✓ Response cache enabled (5s TTL, 200 MB) with stale-while-revalidate"
+log "  ✓ worker_connections=4096, LimitNOFILE=65536, rate=500r/s burst=1000"
 log "  ✓ ACME challenge path ready for certbot"
 log "  ✓ Firewall updated (80/443 allowed, 8000 removed)"
 log ""
