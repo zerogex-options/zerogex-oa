@@ -182,9 +182,16 @@ class TechnicalsQueriesMixin:
     async def get_unusual_volume_spikes(
         self, symbol: str = "SPY", limit: int = 20
     ) -> List[Dict[str, Any]]:
-        """Get unusual volume spikes"""
+        """Get unusual volume spikes — filtered to Moderate Spike or above.
+
+        The ``unusual_volume_spikes`` view classifies each row by sigma of
+        the rolling-window volume distribution; the conventional labels are
+        ``Mild Spike`` (≥2σ), ``Moderate Spike`` (≥3σ), ``Strong Spike``
+        (≥4σ), ``Extreme Spike`` (≥5σ).  We surface only Moderate or
+        stronger so consumers don't have to filter out routine noise.
+        """
         query = """
-            SELECT 
+            SELECT
                 time_et,
                 timestamp,
                 symbol,
@@ -197,6 +204,10 @@ class TechnicalsQueriesMixin:
                 volume_class
             FROM unusual_volume_spikes
             WHERE symbol = $1
+              AND (
+                  volume_class IN ('Moderate Spike', 'Strong Spike', 'Extreme Spike')
+                  OR volume_sigma >= 3.0
+              )
             ORDER BY timestamp DESC
             LIMIT $2
         """
