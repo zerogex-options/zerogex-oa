@@ -35,6 +35,41 @@ def get_option_root_aliases() -> Dict[str, str]:
     return _parse_alias_mapping(os.getenv("OPTION_ROOT_ALIASES", ""))
 
 
+# Cash indices (SPX, NDX, RUT, DJX) have no transactional volume of their
+# own — only the constituent stocks and the index options trade.  When we
+# need a "volume" series for VWAP-style calculations on an index, we fall
+# back to a tracking ETF whose intraday volume profile is essentially
+# identical to the index's price action.  Override the default mapping
+# with the ``INDEX_VOLUME_PROXIES`` env var (same KEY=VALUE,KEY2=VALUE2
+# format as ``SYMBOL_ALIASES``).
+_DEFAULT_INDEX_VOLUME_PROXIES: Dict[str, str] = {
+    "SPX": "SPY",
+    "NDX": "QQQ",
+    "RUT": "IWM",
+    "DJX": "DIA",
+}
+
+
+def get_index_volume_proxies() -> Dict[str, str]:
+    """Return the index → ETF volume-proxy mapping (env-overridable)."""
+    overrides = _parse_alias_mapping(os.getenv("INDEX_VOLUME_PROXIES", ""))
+    merged = dict(_DEFAULT_INDEX_VOLUME_PROXIES)
+    merged.update(overrides)
+    return merged
+
+
+def resolve_volume_proxy(symbol: str) -> str | None:
+    """Return the ETF whose volume profile should stand in for ``symbol``.
+
+    Returns None when ``symbol`` already has its own volume (equities/ETFs)
+    or is not in the proxy map.
+    """
+    normalized = (symbol or "").strip().upper()
+    if not normalized:
+        return None
+    return get_index_volume_proxies().get(normalized)
+
+
 def resolve_symbol(symbol_or_alias: str) -> str:
     """Resolve a symbol or alias (case-insensitive) to TradeStation symbol."""
     normalized = symbol_or_alias.strip().upper()

@@ -13,6 +13,7 @@ import logging
 from typing import Any, Dict, List
 
 from src.api.queries._sql_helpers import _bucket_expr, _interval_expr
+from src.symbols import resolve_volume_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +28,21 @@ class TechnicalsQueriesMixin:
     async def get_vwap_deviation(
         self, symbol: str = "SPY", timeframe: str = "1min", window_units: int = 20
     ) -> List[Dict[str, Any]]:
-        """Get VWAP deviation for mean reversion signals by interval/window."""
+        """Get VWAP deviation for mean reversion signals by interval/window.
+
+        Cash indices (SPX, NDX, RUT, DJX) carry no transactional volume of
+        their own, so the standard ``underlying_vwap_deviation`` view
+        returns NULL VWAP for them.  When a proxy ETF is configured for
+        the symbol we route through ``_get_vwap_deviation_with_proxy``
+        which applies the ETF's per-bar volume profile to the index's
+        prices.  Equities/ETFs continue to use the canonical view.
+        """
         window_units = max(1, min(window_units, 90))
+        proxy = resolve_volume_proxy(symbol)
+        if proxy:
+            return await self._get_vwap_deviation_with_proxy(
+                symbol, proxy, timeframe, window_units
+            )
         step_interval = _interval_expr(timeframe)
         bucket = _bucket_expr(timeframe)
         query = f"""
@@ -82,6 +96,147 @@ class TechnicalsQueriesMixin:
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching VWAP deviation: {e}", exc_info=True)
+            raise
+
+    async def _get_vwap_deviation_with_proxy(
+        self,
+        symbol: str,
+        proxy: str,
+        timeframe: str,
+        window_units: int,
+    ) -> List[Dict[str, Any]]:
+        """VWAP deviation using a proxy ETF's per-bar volume.
+
+        Joins the index's per-minute close to the proxy's per-minute
+        ``up_volume + down_volume`` on the same timestamp, then runs the
+        canonical session-cumulative VWAP formula over the joined series.
+        Buckets/windows match the non-proxy path so the response shape is
+        identical.
+        """
+        step_interval = _interval_expr(timeframe)
+        bucket = _bucket_expr(timeframe)
+        query = f"""
+            WITH index_quotes AS (
+                SELECT
+                    timestamp,
+                    symbol,
+                    close AS price
+                FROM underlying_quotes
+                WHERE symbol = $1
+            ),
+            proxy_volume AS (
+                SELECT
+                    timestamp,
+                    (up_volume + down_volume) AS volume
+                FROM underlying_quotes
+                WHERE symbol = $3
+            ),
+            joined AS (
+                SELECT
+                    iq.timestamp,
+                    iq.symbol,
+                    iq.price,
+                    COALESCE(pv.volume, 0) AS volume
+                FROM index_quotes iq
+                LEFT JOIN proxy_volume pv ON pv.timestamp = iq.timestamp
+            ),
+            vwap_calc AS (
+                SELECT
+                    timestamp,
+                    symbol,
+                    price,
+                    volume,
+                    SUM(price * volume) OVER (
+                        PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+                        ORDER BY timestamp
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS cum_pv,
+                    SUM(volume) OVER (
+                        PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+                        ORDER BY timestamp
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS cum_vol
+                FROM joined
+            ),
+            with_vwap AS (
+                SELECT
+                    timestamp AT TIME ZONE 'America/New_York' AS time_et,
+                    timestamp,
+                    symbol,
+                    price,
+                    (cum_pv / NULLIF(cum_vol, 0))::numeric(12,4) AS vwap,
+                    ROUND(
+                        ((price - (cum_pv / NULLIF(cum_vol, 0)))
+                         / NULLIF((cum_pv / NULLIF(cum_vol, 0)), 0) * 100)::numeric,
+                        3
+                    ) AS vwap_deviation_pct,
+                    volume,
+                    CASE
+                        WHEN NULLIF(cum_vol, 0) IS NULL THEN NULL
+                        WHEN price > (cum_pv / NULLIF(cum_vol, 0)) * 1.002 THEN '🔥 Extended Above VWAP'
+                        WHEN price > (cum_pv / NULLIF(cum_vol, 0)) THEN '✅ Above VWAP'
+                        WHEN price < (cum_pv / NULLIF(cum_vol, 0)) * 0.998 THEN '🔥 Extended Below VWAP'
+                        ELSE '❌ Below VWAP'
+                    END AS vwap_position
+                FROM vwap_calc
+            ),
+            latest AS (
+                SELECT timestamp AS max_ts
+                FROM with_vwap
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            bounds AS (
+                SELECT
+                    max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
+                    max_ts AS end_ts
+                FROM latest
+            ),
+            windowed AS (
+                SELECT
+                    time_et,
+                    timestamp,
+                    symbol,
+                    price,
+                    vwap,
+                    vwap_deviation_pct,
+                    volume,
+                    vwap_position,
+                    {bucket} AS bucket_ts,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY {bucket} ORDER BY timestamp DESC
+                    ) AS rn
+                FROM with_vwap
+                WHERE timestamp BETWEEN
+                    (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+            )
+            SELECT
+                time_et,
+                bucket_ts AS timestamp,
+                symbol,
+                price,
+                vwap,
+                vwap_deviation_pct,
+                volume,
+                vwap_position
+            FROM windowed
+            WHERE rn = 1
+            ORDER BY timestamp DESC
+            LIMIT $2
+        """
+
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, window_units, proxy)
+                results = [dict(row) for row in rows]
+                for row in results:
+                    row["volume_proxy"] = proxy
+                return results
+        except Exception as e:
+            logger.error(
+                f"Error fetching VWAP deviation for {symbol} via proxy {proxy}: {e}",
+                exc_info=True,
+            )
             raise
 
     async def get_opening_range_breakout(
