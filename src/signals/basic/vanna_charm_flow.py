@@ -35,8 +35,16 @@ from src.signals.components.utils import (
 )
 
 # Normalize combined vanna+charm exposure so that a magnitude of this
-# value saturates the score.
-_VC_NORM = float(os.getenv("SIGNAL_VANNA_CHARM_NORM", "5.0e7"))
+# value saturates the score.  Calibrated for the dollar-scale dealer
+# exposure convention (vanna × OI × 100 × S, summed across strikes &
+# expirations).  For SPY-magnitude underlyings the typical NET dealer
+# vanna+charm sum runs in the hundreds of millions to low billions —
+# the prior 5e7 default saturated almost permanently and made the
+# score flip between ±1 with every sign-change in the underlying
+# (visible as a +100/−100 sawtooth in score history).  Per-symbol
+# normalizers from ``component_normalizer_cache`` still override at
+# runtime when populated.
+_VC_NORM = float(os.getenv("SIGNAL_VANNA_CHARM_NORM", "1.0e9"))
 
 # Afternoon charm amplification kicks in after this fraction of session.
 _CHARM_AMP_START = 0.6  # ~2h before close
