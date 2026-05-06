@@ -113,7 +113,13 @@ The deployment process runs these steps in order:
 - Installs systemd service files:
   - `zerogex-oa-ingestion.service` - Data ingestion engine
   - `zerogex-oa-analytics.service` - GEX analytics engine
-- Enables services to start on boot
+  - `zerogex-oa-signals.service` - Signal evaluation engine
+- Installs nightly maintenance timers (oneshot units triggered by `.timer`):
+  - `zerogex-oa-db-maintain` - prune + vacuum, daily 02:00 ET
+  - `zerogex-oa-db-vacuum-full` - VACUUM FULL + REINDEX, Sundays 02:30 ET
+  - `zerogex-oa-logs-clear` - log cleanup, daily 03:30 ET
+  - `zerogex-oa-normalizer-refresh` - per-symbol normalizer cache, daily 04:30 ET
+- Enables services + timers to start on boot
 - Starts services and verifies status
 
 ### Step 110: API Server Setup

@@ -330,6 +330,8 @@ help: ## Show this help message
 	@echo "  make api-test            - Test API endpoints"
 	@echo "  make api-install-service - Install API as systemd service"
 	@echo "  make db-maintain-install - Install daily DB maintenance timer (prune + vacuum)"
+	@echo "  make normalizer-cache-install - Install nightly normalizer-refresh timer (04:30 ET)"
+	@echo "  make normalizer-cache-status  - Show normalizer-refresh timer status + recent log"
 	@echo ""
 	@echo "$(GREEN)Logs (all services):$(NC)"
 	@echo "  make {service}-logs             - Show live logs (Ctrl+C to exit)"
@@ -2571,3 +2573,26 @@ db-maintain-install: ## Install daily DB maintenance timer (prune old data + vac
 	@echo "$(GREEN)✅ DB maintenance timer installed and started$(NC)"
 	@echo "$(YELLOW)Runs daily at 2:00 AM. Check status: systemctl status zerogex-oa-db-maintain.timer$(NC)"
 	@echo "$(YELLOW)View logs: journalctl -u zerogex-oa-db-maintain$(NC)"
+
+.PHONY: normalizer-cache-install
+normalizer-cache-install: ## Install nightly normalizer cache refresh timer (04:30 ET)
+	@echo "$(BLUE)=== Installing Normalizer Cache Refresh Timer ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-normalizer-refresh.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-normalizer-refresh.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-normalizer-refresh.timer
+	@echo "$(GREEN)✅ Normalizer-refresh timer installed and started$(NC)"
+	@echo "$(YELLOW)Runs daily at 04:30 ET. Check status: systemctl status zerogex-oa-normalizer-refresh.timer$(NC)"
+	@echo "$(YELLOW)View logs: journalctl -u zerogex-oa-normalizer-refresh$(NC)"
+	@echo "$(YELLOW)Trigger now (one-shot): sudo systemctl start zerogex-oa-normalizer-refresh.service$(NC)"
+
+.PHONY: normalizer-cache-status
+normalizer-cache-status: ## Show normalizer-refresh timer status + last/next fire + recent log
+	@echo "$(BLUE)=== Normalizer Cache Refresh Timer ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-normalizer-refresh.timer' || true
+	@echo ""
+	@echo "$(BLUE)Last service run:$(NC)"
+	@systemctl status zerogex-oa-normalizer-refresh.service --no-pager -l || true
+	@echo ""
+	@echo "$(BLUE)Recent log lines:$(NC)"
+	@sudo journalctl -u zerogex-oa-normalizer-refresh -n 30 --no-pager || true
