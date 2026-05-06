@@ -19,7 +19,9 @@ DEFAULT_FLOW_FLUX_NORM = float(os.getenv("SIGNAL_FLOW_FLUX_NORM", "250000"))
 DEFAULT_NET_GEX_DELTA_NORM = float(os.getenv("SIGNAL_NET_GEX_DELTA_NORM", "3500000000"))
 
 # Confluence quality cutoff: >= this fraction counts as clustered enough.
-CONFLUENCE_MAX_GAP_PCT = float(os.getenv("SIGNAL_CONFLUENCE_MAX_GAP_PCT", "0.005"))
+# 1% lets the signal surface during typical SPY sessions where flip/VWAP
+# routinely sit 0.5–1% apart; tighten via env var if too noisy.
+CONFLUENCE_MAX_GAP_PCT = float(os.getenv("SIGNAL_CONFLUENCE_MAX_GAP_PCT", "0.01"))
 
 # Vol-scaled breakout buffer controls trap-detection noise floor.
 BREAKOUT_BUFFER_MIN = float(os.getenv("SIGNAL_BREAKOUT_BUFFER_MIN", "0.001"))

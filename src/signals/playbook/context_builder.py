@@ -61,7 +61,7 @@ _LEVEL_FIELDS_BY_SIGNAL = {
         "gamma_flip",
         "vwap",
     ),
-    "trap_detection": ("resistance_level", "support_level"),
+    "trap_detection": ("broken_resistance_level", "broken_support_level"),
 }
 
 

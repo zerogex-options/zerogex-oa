@@ -27,14 +27,24 @@ class TrapDetectionSignal:
 
         up_levels = [call_wall, max_gamma, vwap, flip]
         dn_levels = [max_gamma, vwap, flip]
-        resistance = nearest_below(up_levels, ctx.close)
-        support = nearest_above(dn_levels, ctx.close)
+        # These are the *broken* levels — the resistance that price has just
+        # poked above (now sits below close) and the support that price has
+        # just slipped beneath (now sits above close). Naming reflects the
+        # post-breakout perspective the trap setup keys off.
+        broken_resistance = nearest_below(up_levels, ctx.close)
+        broken_support = nearest_above(dn_levels, ctx.close)
 
         sigma = realized_pct_sigma(ctx)
         buffer_pct = max(BREAKOUT_BUFFER_MIN, BREAKOUT_BUFFER_VOL_MULT * sigma * (5**0.5))
 
-        breakout_up = bool(resistance is not None and ctx.close > resistance * (1.0 + buffer_pct))
-        breakout_down = bool(support is not None and ctx.close < support * (1.0 - buffer_pct))
+        breakout_up = bool(
+            broken_resistance is not None
+            and ctx.close > broken_resistance * (1.0 + buffer_pct)
+        )
+        breakout_down = bool(
+            broken_support is not None
+            and ctx.close < broken_support * (1.0 - buffer_pct)
+        )
 
         long_gamma = ctx.net_gex > 0
         net_gex_delta = float(extra.get("net_gex_delta") or 0.0)
@@ -69,15 +79,15 @@ class TrapDetectionSignal:
             return 0.4 + 0.4 * dist_strength + 0.2 * gex_boost
 
         score = 0.0
-        if upside_fail and resistance:
-            dist_pct = (ctx.close - resistance) / ctx.close
+        if upside_fail and broken_resistance:
+            dist_pct = (ctx.close - broken_resistance) / ctx.close
             mag = _magnitude(dist_pct)
             flow_mult = (
                 1.1 if call_decelerating else max(0.3, 1.0 - call_flow_delta / max(flow_norm, 1.0))
             )
             score = -min(1.0, mag * flow_mult)
-        elif downside_fail and support:
-            dist_pct = (ctx.close - support) / ctx.close
+        elif downside_fail and broken_support:
+            dist_pct = (ctx.close - broken_support) / ctx.close
             mag = _magnitude(dist_pct)
             flow_mult = (
                 1.1 if put_decelerating else max(0.3, 1.0 - put_flow_delta / max(flow_norm, 1.0))
@@ -96,8 +106,8 @@ class TrapDetectionSignal:
                     "bearish_fade" if score < 0 else ("bullish_fade" if score > 0 else "none")
                 ),
                 "close": ctx.close,
-                "resistance_level": resistance,
-                "support_level": support,
+                "broken_resistance_level": broken_resistance,
+                "broken_support_level": broken_support,
                 "breakout_buffer_pct": round(buffer_pct, 6),
                 "realized_sigma": round(sigma, 6),
                 "breakout_up": breakout_up,

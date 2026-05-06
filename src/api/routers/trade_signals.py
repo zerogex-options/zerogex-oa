@@ -648,8 +648,8 @@ async def get_trap_detection_signal(
       "breakout_up": true, "breakout_down": false,
       "net_gex_delta": 840000000.0,
       "net_gex_delta_pct": 0.018,
-      "resistance_level": 680.0,
-      "support_level": 678.0,
+      "broken_resistance_level": 680.0,
+      "broken_support_level": null,
       "breakout_buffer_pct": 0.0008,
       "wall_migrated_up": false, "wall_migrated_down": false,
       "context_values": {"...close, realized_sigma, long_gamma, gamma_strengthening, call_wall, prior_call_wall, call_flow_decelerating, put_flow_decelerating..."},
@@ -664,13 +664,22 @@ async def get_trap_detection_signal(
     - `wall_migrated_up` / `wall_migrated_down` — invalidates the setup when `true`.
 
     **Trader interpretation:**
-    - `signal == "bearish_fade"` + `breakout_up == true` → price poked above resistance
-      but dealers are long gamma and call wall hasn't migrated; short-call-spread / put-debit.
-    - `signal == "bullish_fade"` → mirror play at support.
+    - `signal == "bearish_fade"` + `breakout_up == true` → price poked above the
+      `broken_resistance_level` (now sitting *below* close) but dealers are long
+      gamma and the call wall hasn't migrated; short-call-spread / put-debit.
+    - `signal == "bullish_fade"` → mirror play; price slipped beneath
+      `broken_support_level` (now sitting *above* close) and is set up for a reclaim.
     - `wall_migrated_up == true` → setup invalidated; dealers repositioning with price.
 
-    **Page design.** Price ladder showing support / close / resistance with breakout-buffer bands.
-    Red/green "TRAP" badge when triggered. Two chips: `gamma_strengthening` and `wall_migrated_*`.
+    **Note on field naming.** `broken_resistance_level` and `broken_support_level`
+    refer to the level *price has just breached* — so on an upside breakout the
+    "broken resistance" sits below close, and on a downside breakdown the
+    "broken support" sits above close. This is intentional: the trap setup keys
+    off the recently-breached level, not the next unbroken one above/below.
+
+    **Page design.** Price ladder showing broken_support / close / broken_resistance
+    with breakout-buffer bands. Red/green "TRAP" badge when triggered. Two chips:
+    `gamma_strengthening` and `wall_migrated_*`.
     """
     row = await db.get_advanced_signal(symbol.upper(), "trap_detection")
     if not row:
@@ -685,8 +694,8 @@ async def get_trap_detection_signal(
     row["breakout_down"] = ctx.get("breakout_down", False)
     row["net_gex_delta"] = ctx.get("net_gex_delta")
     row["net_gex_delta_pct"] = ctx.get("net_gex_delta_pct")
-    row["resistance_level"] = ctx.get("resistance_level")
-    row["support_level"] = ctx.get("support_level")
+    row["broken_resistance_level"] = ctx.get("broken_resistance_level")
+    row["broken_support_level"] = ctx.get("broken_support_level")
     row["breakout_buffer_pct"] = ctx.get("breakout_buffer_pct")
     row["wall_migrated_up"] = ctx.get("wall_migrated_up")
     row["wall_migrated_down"] = ctx.get("wall_migrated_down")
