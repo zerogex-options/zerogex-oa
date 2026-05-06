@@ -13,6 +13,8 @@ put-sell net out, which should not count as crowd skew.
 -score => downside air-pocket risk
 """
 
+import math
+
 from src.signals.components.base import ComponentBase, MarketContext
 from src.signals.components.utils import pct_change_n_bar
 
@@ -32,9 +34,11 @@ class PositioningTrapComponent(ComponentBase):
         put_skew = max(0.0, -imbalance)
         call_skew = max(0.0, imbalance)
 
-        above_flip = 1.0 if (ctx.gamma_flip and ctx.close > ctx.gamma_flip) else 0.0
-        below_flip = 1.0 if (ctx.gamma_flip and ctx.close < ctx.gamma_flip) else 0.0
-        neg_gex = 1.0 if ctx.net_gex < 0 else 0.0
+        # Smooth flip-position and gex-regime gauges instead of binary
+        # 1/0 flags so the score stays continuous near transition points.
+        above_flip = self._flip_lean(ctx, side="above")
+        below_flip = self._flip_lean(ctx, side="below")
+        neg_gex = self._neg_gex_lean(ctx)
 
         squeeze = (
             0.45 * short_crowding
@@ -53,6 +57,28 @@ class PositioningTrapComponent(ComponentBase):
         )
 
         return max(-1.0, min(1.0, squeeze - flush))
+
+    @staticmethod
+    def _flip_lean(ctx: MarketContext, side: str) -> float:
+        flip = ctx.gamma_flip
+        if not flip or ctx.close <= 0:
+            return 0.0
+        try:
+            distance = (ctx.close - float(flip)) / ctx.close
+        except (TypeError, ValueError, ZeroDivisionError):
+            return 0.0
+        # Saturates by ~0.5% from flip; preserves a continuous read instead
+        # of a binary 0/1 jump at the flip strike.
+        leaning = max(-1.0, min(1.0, distance / 0.005))
+        return max(0.0, leaning) if side == "above" else max(0.0, -leaning)
+
+    @staticmethod
+    def _neg_gex_lean(ctx: MarketContext) -> float:
+        net_gex = float(ctx.net_gex or 0.0)
+        # Smooth tanh transition centered on zero so the regime tilt
+        # contribution is graded rather than a 1/0 flip at sign change.
+        scale = 5.0e8
+        return max(0.0, min(1.0, 0.5 * (1.0 - math.tanh(net_gex / scale))))
 
     def context_values(self, ctx: MarketContext) -> dict:
         imbalance = self._signed_imbalance(ctx)
@@ -89,16 +115,20 @@ class PositioningTrapComponent(ComponentBase):
             except (TypeError, ValueError):
                 c = p = 0.0
             denom = abs(c) + abs(p)
-            if denom >= 100_000:
-                return (c - p) / denom
-            return 0.0
+            if denom <= 0:
+                return 0.0
+            ratio = (c - p) / denom
+            confidence = min(1.0, denom / 100_000.0)
+            return ratio * confidence
         # Fallback to top-level signed smart-call/smart-put fields.
         c = float(ctx.smart_call or 0.0)
         p = float(ctx.smart_put or 0.0)
         total = abs(c) + abs(p)
-        if total < 100_000:
+        if total <= 0:
             return 0.0
-        return (c - p) / total
+        ratio = (c - p) / total
+        confidence = min(1.0, total / 100_000.0)
+        return ratio * confidence
 
     @staticmethod
     def _imbalance_source(ctx: MarketContext) -> str:

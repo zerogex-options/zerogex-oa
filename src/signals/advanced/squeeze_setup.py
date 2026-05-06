@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from src.signals.components.base import MarketContext
 from src.signals.components.utils import pct_change_n_bar, vol_normalized_momentum
 from src.signals.advanced.base import (
@@ -33,7 +35,12 @@ class SqueezeSetupSignal:
         flip = ctx.gamma_flip
         above_flip = bool(flip is not None and ctx.close > flip)
         below_flip = bool(flip is not None and ctx.close < flip)
-        gex_readiness = 1.0 if ctx.net_gex < 0 else 0.5
+        # Continuous gex_readiness: smooth tanh response so the regime tilt
+        # contribution is graded rather than a discrete 0.5/1.0 jump at the
+        # net-GEX zero crossing.
+        gex_readiness = 0.5 + 0.5 * max(
+            0.0, min(1.0, 0.5 * (1.0 - math.tanh(float(ctx.net_gex or 0.0) / 5.0e8)))
+        )
 
         dir_strength_up = max(0.0, min(1.0, mom_z))
         dir_strength_dn = max(0.0, min(1.0, -mom_z))
@@ -55,12 +62,12 @@ class SqueezeSetupSignal:
             * (1.0 if below_flip else 0.6)
         )
 
-        score = 0.0
-        if bull > 0 and call_flow_z > 0:
-            score = bull
-        elif bear > 0 and put_flow_z > 0:
-            score = -bear
-        score = max(-1.0, min(1.0, score))
+        # Net the two sides instead of branching on which one wins so that
+        # mixed-sign reads taper through zero rather than being forced to
+        # exactly 0.0 by the disqualifying conditions.
+        bull_side = bull if call_flow_z > 0 else 0.0
+        bear_side = bear if put_flow_z > 0 else 0.0
+        score = max(-1.0, min(1.0, bull_side - bear_side))
         triggered = abs(score) >= 0.25
 
         vix_level = extra.get("vix_level")

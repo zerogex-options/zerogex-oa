@@ -41,10 +41,15 @@ def test_put_dominant_flow_yields_negative_score():
     assert score == -1.0
 
 
-def test_below_min_premium_returns_zero():
-    """Sub-noise flow ($50k total < $100k min premium) abstains."""
+def test_below_min_premium_dampens_score():
+    """Sub-noise flow tapers the score by a confidence ramp instead of hard-zeroing.
+
+    With ``$50k`` gross / ``$100k`` min premium the confidence is 0.5; the
+    ratio is ``+0.20`` saturated to ``+0.40``, scaled to ``+0.20``.
+    """
     cmp = OrderFlowImbalanceComponent()
-    assert cmp.compute(_ctx(smart_call=30_000.0, smart_put=20_000.0)) == 0.0
+    score = cmp.compute(_ctx(smart_call=30_000.0, smart_put=20_000.0))
+    assert abs(score - 0.20) < 1e-9
 
 
 def test_score_saturates_at_plus_one_on_extreme_imbalance():

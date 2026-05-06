@@ -31,12 +31,15 @@ def test_no_data_is_neutral():
     assert comp.compute(_ctx()) == 0.0
 
 
-def test_thin_premium_ignored():
+def test_thin_premium_dampened():
+    """Thin flow tapers via a confidence ramp instead of hard-zeroing."""
     ctx = _ctx()
     ctx.extra["flow_by_type"] = [
         {"option_type": "C", "buy_premium": 1000, "sell_premium": 0},
     ]
-    assert comp.compute(ctx) == 0.0
+    score = comp.compute(ctx)
+    # Dampened toward zero (confidence ~ 1000/250000 ≈ 0.004) but non-zero.
+    assert 0.0 < score < 0.05
 
 
 def test_heavy_call_buying_is_bullish():

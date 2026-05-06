@@ -41,7 +41,7 @@ class TapeFlowBiasComponent(ComponentBase):
         call_flow = agg["call_net_premium"]
         put_flow = agg["put_net_premium"]
         total_abs = abs(call_flow) + abs(put_flow)
-        if total_abs < _MIN_TOTAL_PREMIUM:
+        if total_abs <= 0:
             return 0.0
 
         # Call buying = bullish; put buying = bearish. Net of the two.
@@ -49,7 +49,12 @@ class TapeFlowBiasComponent(ComponentBase):
         ratio = directional / total_abs  # [-1, +1] roughly
         # Saturate before clamping so mild imbalances don't dominate.
         score = max(-1.0, min(1.0, ratio / _IMBALANCE_SATURATION))
-        return score
+        # Confidence damping rather than a hard cutoff — thin-flow reads
+        # taper toward zero smoothly so the score occupies the full range.
+        confidence = (
+            min(1.0, total_abs / _MIN_TOTAL_PREMIUM) if _MIN_TOTAL_PREMIUM > 0 else 1.0
+        )
+        return score * confidence
 
     def context_values(self, ctx: MarketContext) -> dict:
         agg = self._aggregate(ctx)

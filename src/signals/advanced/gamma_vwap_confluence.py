@@ -57,19 +57,11 @@ class GammaVwapConfluenceSignal:
                 cluster_candidates[name] = level
 
         cluster_gap_pct = abs(flip - vwap) / ctx.close
-        cluster_quality = max(0.0, 1.0 - cluster_gap_pct / CONFLUENCE_MAX_GAP_PCT)
-        if cluster_quality <= 0:
-            return AdvancedSignalResult(
-                name=self.name,
-                score=0.0,
-                context={
-                    "triggered": False,
-                    "signal": "none",
-                    "cluster_gap_pct": round(cluster_gap_pct, 6),
-                    "cluster_quality": 0.0,
-                    **input_levels,
-                },
-            )
+        # Soft confidence floor (not a hard cutoff): even when flip and VWAP
+        # are far apart we keep a fractional read instead of forcing a 0.0
+        # — matches the spec that 0 should be a rare extreme.
+        raw_quality = 1.0 - cluster_gap_pct / max(CONFLUENCE_MAX_GAP_PCT, 1e-9)
+        cluster_quality = max(0.05, min(1.0, raw_quality))
 
         extra_levels = max(0, len(cluster_candidates) - 2)
         multi_mult = 1.0 + 0.15 * extra_levels
@@ -77,10 +69,10 @@ class GammaVwapConfluenceSignal:
         levels = list(cluster_candidates.values())
         confluence_level = sum(levels) / len(levels)
         dist_from_level = (ctx.close - confluence_level) / ctx.close
-        dir_sign = 1.0 if dist_from_level > 0 else -1.0 if dist_from_level < 0 else 0.0
-        distance_strength = min(1.0, abs(dist_from_level) / 0.003)
-
-        raw = dir_sign * distance_strength
+        # Continuous direction-magnitude product instead of a binary sign
+        # times strength: ``dist_from_level / 0.003`` is already signed
+        # and clamped, which keeps the score smooth around the level.
+        raw = max(-1.0, min(1.0, dist_from_level / 0.003))
         if ctx.net_gex < 0:
             directional = raw
             regime_direction = "continuation"
@@ -90,6 +82,7 @@ class GammaVwapConfluenceSignal:
 
         score = directional * cluster_quality * multi_mult
         score = max(-1.0, min(1.0, score))
+        dir_sign = 1.0 if dist_from_level > 0 else -1.0 if dist_from_level < 0 else 0.0
         expected_target = (
             confluence_level
             if regime_direction == "mean_reversion"

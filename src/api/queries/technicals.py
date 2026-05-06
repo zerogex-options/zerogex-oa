@@ -197,7 +197,7 @@ class TechnicalsQueriesMixin:
                 volume_class
             FROM unusual_volume_spikes
             WHERE symbol = $1
-            ORDER BY volume_sigma DESC
+            ORDER BY timestamp DESC
             LIMIT $2
         """
 

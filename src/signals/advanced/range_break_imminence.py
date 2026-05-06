@@ -100,8 +100,10 @@ class RangeBreakImminenceSignal:
         ) / 100.0
         imminence = max(0.0, min(100.0, imminence))
 
+        # Use the continuous bias directly so the score grades smoothly
+        # rather than snapping to ±(imminence/100) at any non-zero bias.
         direction = self._direction_flag(bias)
-        score = max(-1.0, min(1.0, direction * (imminence / 100.0)))
+        score = max(-1.0, min(1.0, bias * (imminence / 100.0)))
 
         label, playbook = self._label_and_playbook(imminence, direction)
         signal = self._signal_label(score, imminence)

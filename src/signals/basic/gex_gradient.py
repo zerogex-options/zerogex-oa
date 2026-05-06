@@ -57,7 +57,7 @@ class GexGradientComponent(ComponentBase):
         above = buckets["above_abs_gamma"]
         below = buckets["below_abs_gamma"]
         total = above + below
-        if total < _MIN_TOTAL_GAMMA:
+        if total <= 0:
             return 0.0
 
         # Positive value = more gamma concentration above spot than below.
@@ -73,9 +73,16 @@ class GexGradientComponent(ComponentBase):
         # the wings. Heavy wing concentration = structural pinning, which
         # dampens directional edge.
         wing_fraction = buckets["wing_fraction"]
-        confidence = max(0.25, 1.0 - wing_fraction)  # never fully dampen
+        wing_confidence = max(0.25, 1.0 - wing_fraction)  # never fully dampen
 
-        return max(-1.0, min(1.0, score * confidence))
+        # Replace the previous hard cutoff at _MIN_TOTAL_GAMMA with a soft
+        # confidence ramp so thin-OI snapshots taper toward zero rather
+        # than snapping to it.
+        magnitude_confidence = (
+            min(1.0, total / _MIN_TOTAL_GAMMA) if _MIN_TOTAL_GAMMA > 0 else 1.0
+        )
+
+        return max(-1.0, min(1.0, score * wing_confidence * magnitude_confidence))
 
     def context_values(self, ctx: MarketContext) -> dict:
         buckets = self._buckets(ctx)

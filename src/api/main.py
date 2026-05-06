@@ -41,6 +41,7 @@ from .models import (
 from .routers.trade_signals import router as trade_signals_router
 from .routers.volatility_gauge import router as volatility_gauge_router
 from .routers.option_contract import router as option_contract_router
+from .routers.option_calculator import router as option_calculator_router
 from .routers.vol_surface import router as vol_surface_router
 
 # Logging is configured centrally in src.utils.logging; importing
@@ -138,6 +139,14 @@ app = FastAPI(
             "description": "Intraday technical signals: VWAP, ORB, dealer hedging, volume, momentum",
         },
         {
+            "name": "Tools",
+            "description": (
+                "Trader-facing calculators and what-if utilities. "
+                "Includes the option-calculator (intrinsic-value P&L fan across "
+                "underlying-price moves)."
+            ),
+        },
+        {
             "name": "Trade Signals",
             "description": (
                 "Options-structure signal engine: composite Market State Index (MSI) gauge, "
@@ -180,6 +189,7 @@ app.add_middleware(RequestIdMiddleware)
 app.include_router(trade_signals_router)
 app.include_router(volatility_gauge_router)
 app.include_router(option_contract_router)
+app.include_router(option_calculator_router)
 app.include_router(vol_surface_router)
 
 # ============================================================================

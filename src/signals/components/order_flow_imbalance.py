@@ -44,14 +44,22 @@ class OrderFlowImbalanceComponent(ComponentBase):
         call_flow = float(ctx.smart_call or 0.0)
         put_flow = float(ctx.smart_put or 0.0)
         gross = abs(call_flow) + abs(put_flow)
-        if gross < _MIN_TOTAL_PREMIUM:
+        if gross <= 0:
             return 0.0
         # Net premium divided by gross gives the directional skew of
         # *paid-for* flow.  + = call-side aggression, - = put-side.
-        ratio = (call_flow - put_flow) / gross if gross > 0 else 0.0
+        ratio = (call_flow - put_flow) / gross
         if _SATURATION_RATIO <= 0:
-            return max(-1.0, min(1.0, ratio))
-        return max(-1.0, min(1.0, ratio / _SATURATION_RATIO))
+            score = max(-1.0, min(1.0, ratio))
+        else:
+            score = max(-1.0, min(1.0, ratio / _SATURATION_RATIO))
+        # Soft confidence ramp instead of a hard cutoff: thin-flow reads
+        # damp toward zero rather than snapping to it, so the score keeps
+        # information content across the full intraday spectrum.
+        confidence = (
+            min(1.0, gross / _MIN_TOTAL_PREMIUM) if _MIN_TOTAL_PREMIUM > 0 else 1.0
+        )
+        return score * confidence
 
     def context_values(self, ctx: MarketContext) -> dict:
         call_flow = float(ctx.smart_call or 0.0)
