@@ -174,9 +174,7 @@ def _summarize(samples: Sequence[float]) -> Distribution | None:
 
 
 def _active_symbols(cur) -> list[str]:
-    cur.execute(
-        "SELECT symbol FROM symbols WHERE COALESCE(is_active, TRUE) = TRUE ORDER BY symbol"
-    )
+    cur.execute("SELECT symbol FROM symbols WHERE COALESCE(is_active, TRUE) = TRUE ORDER BY symbol")
     return [r[0] for r in cur.fetchall()]
 
 
@@ -291,9 +289,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     with db_connection() as conn:
         with conn.cursor() as cur:
-            symbols = (
-                [s.upper() for s in args.symbols] if args.symbols else _active_symbols(cur)
-            )
+            symbols = [s.upper() for s in args.symbols] if args.symbols else _active_symbols(cur)
         if not symbols:
             logger.warning("No symbols to refresh")
             return 0

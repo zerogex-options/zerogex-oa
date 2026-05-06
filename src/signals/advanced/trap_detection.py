@@ -38,12 +38,10 @@ class TrapDetectionSignal:
         buffer_pct = max(BREAKOUT_BUFFER_MIN, BREAKOUT_BUFFER_VOL_MULT * sigma * (5**0.5))
 
         breakout_up = bool(
-            broken_resistance is not None
-            and ctx.close > broken_resistance * (1.0 + buffer_pct)
+            broken_resistance is not None and ctx.close > broken_resistance * (1.0 + buffer_pct)
         )
         breakout_down = bool(
-            broken_support is not None
-            and ctx.close < broken_support * (1.0 - buffer_pct)
+            broken_support is not None and ctx.close < broken_support * (1.0 - buffer_pct)
         )
 
         long_gamma = ctx.net_gex > 0

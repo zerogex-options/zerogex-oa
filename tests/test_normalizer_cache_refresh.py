@@ -72,8 +72,7 @@ def test_field_specs_have_two_query_placeholders():
     for spec in FIELD_SPECS:
         # Two placeholders the runner will bind: symbol + window_days.
         assert spec.query.count("%s") == 2, (
-            f"{spec.name}: expected 2 %s placeholders, "
-            f"got {spec.query.count('%s')}"
+            f"{spec.name}: expected 2 %s placeholders, " f"got {spec.query.count('%s')}"
         )
 
 

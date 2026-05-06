@@ -101,9 +101,7 @@ def _evaluate(
 
 
 def _active_symbols(cur) -> list[str]:
-    cur.execute(
-        "SELECT symbol FROM symbols WHERE COALESCE(is_active, TRUE) = TRUE ORDER BY symbol"
-    )
+    cur.execute("SELECT symbol FROM symbols WHERE COALESCE(is_active, TRUE) = TRUE ORDER BY symbol")
     return [r[0] for r in cur.fetchall()]
 
 
@@ -152,17 +150,10 @@ def _print_human(statuses: list[FieldStatus], max_age_hours: float, strict: bool
     n_stale = sum(1 for s in statuses if s.status == "stale")
     n_missing = sum(1 for s in statuses if s.status == "missing")
 
-    print(
-        f"Normalizer cache healthcheck "
-        f"(max-age={max_age_hours:g}h, strict={strict})"
-    )
+    print(f"Normalizer cache healthcheck " f"(max-age={max_age_hours:g}h, strict={strict})")
     print(f"  fresh: {n_fresh}, stale: {n_stale}, missing: {n_missing}")
 
-    issues = [
-        s
-        for s in statuses
-        if s.status == "stale" or (strict and s.status == "missing")
-    ]
+    issues = [s for s in statuses if s.status == "stale" or (strict and s.status == "missing")]
     if issues:
         print()
         print("Issues:")
@@ -173,10 +164,7 @@ def _print_human(statuses: list[FieldStatus], max_age_hours: float, strict: bool
                     f"age={s.age_hours:.1f}h updated_at={s.updated_at}"
                 )
             else:
-                print(
-                    f"  MISSING {s.underlying:<8s} {s.field_name:<24s} "
-                    f"(no cache row at all)"
-                )
+                print(f"  MISSING {s.underlying:<8s} {s.field_name:<24s} " f"(no cache row at all)")
 
     if not issues:
         print("STATUS: OK")

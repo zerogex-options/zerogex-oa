@@ -72,13 +72,15 @@ def test_boundary_exactly_at_max_age_is_fresh():
 
 
 def test_one_microsecond_past_max_age_is_stale():
-    rows = [(
-        "SPY",
-        "dealer_vanna_exposure",
-        NOW - MAX_AGE - timedelta(microseconds=1),
-        500,
-        1e9,
-    )]
+    rows = [
+        (
+            "SPY",
+            "dealer_vanna_exposure",
+            NOW - MAX_AGE - timedelta(microseconds=1),
+            500,
+            1e9,
+        )
+    ]
     out = _evaluate(rows, [("SPY", "dealer_vanna_exposure")], MAX_AGE, NOW)
     assert out[0].status == "stale"
 
