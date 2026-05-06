@@ -332,6 +332,7 @@ help: ## Show this help message
 	@echo "  make db-maintain-install - Install daily DB maintenance timer (prune + vacuum)"
 	@echo "  make normalizer-cache-install - Install nightly normalizer-refresh timer (04:30 ET)"
 	@echo "  make normalizer-cache-status  - Show normalizer-refresh timer status + recent log"
+	@echo "  make normalizer-cache-healthcheck - Flag stale cache rows (exit 1 = stale, for monitoring)"
 	@echo ""
 	@echo "$(GREEN)Logs (all services):$(NC)"
 	@echo "  make {service}-logs             - Show live logs (Ctrl+C to exit)"
@@ -2596,3 +2597,23 @@ normalizer-cache-status: ## Show normalizer-refresh timer status + last/next fir
 	@echo ""
 	@echo "$(BLUE)Recent log lines:$(NC)"
 	@sudo journalctl -u zerogex-oa-normalizer-refresh -n 30 --no-pager || true
+
+# Default freshness threshold for the healthcheck.  The timer fires at
+# 04:30 ET nightly with up to 5 min jitter; 36 h leaves room for a
+# single missed cycle (e.g. a planned reboot) without alerting.
+NORMALIZER_MAX_AGE_HOURS ?= 36
+
+.PHONY: normalizer-cache-healthcheck
+normalizer-cache-healthcheck: ## Verify cache rows are fresh (exit 0=ok, 1=stale, 2=db error)
+	@$(PY) -m src.tools.normalizer_cache_healthcheck \
+		--max-age-hours $(NORMALIZER_MAX_AGE_HOURS)
+
+.PHONY: normalizer-cache-healthcheck-strict
+normalizer-cache-healthcheck-strict: ## Healthcheck that also fails on missing rows
+	@$(PY) -m src.tools.normalizer_cache_healthcheck \
+		--max-age-hours $(NORMALIZER_MAX_AGE_HOURS) --strict
+
+.PHONY: normalizer-cache-healthcheck-json
+normalizer-cache-healthcheck-json: ## Healthcheck output as JSON (for monitoring scrapers)
+	@$(PY) -m src.tools.normalizer_cache_healthcheck \
+		--max-age-hours $(NORMALIZER_MAX_AGE_HOURS) --json
