@@ -1249,6 +1249,32 @@ BEGIN
 END
 $$;
 
+-- Migration helper: trap_detection used to label its level fields
+-- `resistance_level` / `support_level`, but the values it stores are
+-- the *recently broken* levels (broken resistance sits below close,
+-- broken support sits above).  Rename the JSON keys to make the
+-- post-breakout convention explicit.  Idempotent: skips rows already
+-- carrying the new keys.
+UPDATE signal_component_scores
+SET context_values = jsonb_set(
+        context_values - 'resistance_level',
+        '{broken_resistance_level}',
+        context_values -> 'resistance_level',
+        true
+    )
+WHERE component_name = 'trap_detection'
+  AND context_values ? 'resistance_level';
+
+UPDATE signal_component_scores
+SET context_values = jsonb_set(
+        context_values - 'support_level',
+        '{broken_support_level}',
+        context_values -> 'support_level',
+        true
+    )
+WHERE component_name = 'trap_detection'
+  AND context_values ? 'support_level';
+
 CREATE INDEX IF NOT EXISTS idx_signal_component_scores_underlying_ts
     ON signal_component_scores(underlying, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_signal_component_scores_component
