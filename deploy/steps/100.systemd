@@ -93,6 +93,7 @@ TIMER_UNITS=(
     "zerogex-oa-db-vacuum-full"
     "zerogex-oa-logs-clear"
     "zerogex-oa-normalizer-refresh"
+    "zerogex-oa-normalizer-healthcheck"
 )
 
 log "  → Installing timer-based maintenance units..."

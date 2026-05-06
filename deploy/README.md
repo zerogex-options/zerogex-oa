@@ -119,6 +119,13 @@ The deployment process runs these steps in order:
   - `zerogex-oa-db-vacuum-full` - VACUUM FULL + REINDEX, Sundays 02:30 ET
   - `zerogex-oa-logs-clear` - log cleanup, daily 03:30 ET
   - `zerogex-oa-normalizer-refresh` - per-symbol normalizer cache, daily 04:30 ET
+    (validates itself via `ExecStartPost=` so the unit fails atomically
+    if the refresh process exits 0 without producing fresh rows)
+  - `zerogex-oa-normalizer-healthcheck` - drift detector for the
+    refresh, daily 12:00 ET; fails the unit if any active-symbol cache
+    row is older than 36 h, surfacing in `systemctl --failed` during
+    business hours.  Wire active alerting by uncommenting the
+    `OnFailure=` line in the unit file.
 - Enables services + timers to start on boot
 - Starts services and verifies status
 

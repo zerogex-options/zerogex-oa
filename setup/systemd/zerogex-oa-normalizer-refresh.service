@@ -21,9 +21,18 @@ EnvironmentFile=/home/ubuntu/zerogex-oa/.env
 # tend to saturate the score for non-SPY underlyings.
 ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa normalizer-cache-refresh
 
-# Refresh runs in seconds for typical sample sizes; cap well below
-# the 1800s the db-maintain unit uses so a stuck DB doesn't sit
-# overnight.
+# Atomic post-refresh validation: run the same healthcheck the noon
+# drift-detector timer uses.  This catches the silent failure where
+# the refresh process exits 0 but didn't actually update any rows
+# (e.g. all symbols below MIN_SAMPLES because of a data outage).
+# Non-zero from the healthcheck marks the unit failed, which surfaces
+# in `systemctl --failed` and fires any OnFailure= hook on the
+# .healthcheck companion unit below.
+ExecStartPost=/usr/bin/make -C /home/ubuntu/zerogex-oa normalizer-cache-healthcheck
+
+# Refresh + post-validation runs in seconds for typical sample sizes;
+# cap well below the 1800s the db-maintain unit uses so a stuck DB
+# doesn't sit overnight.
 TimeoutStartSec=600
 
 # Security

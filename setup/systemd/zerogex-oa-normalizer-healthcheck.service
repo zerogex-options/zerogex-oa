@@ -1,0 +1,47 @@
+[Unit]
+Description=ZeroGEX normalizer cache freshness check (alerts on stale rows)
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target
+Wants=network-online.target
+
+# Operator hook for active alerting (e.g. PagerDuty, Slack, email).
+# Drop a unit at /etc/systemd/system/zerogex-alert@.service that takes
+# the failed unit name as %i and uncomment the OnFailure= line below,
+# OR symlink an existing alert handler.  Left commented so the default
+# install doesn't depend on infra the operator may not run.  This is
+# also where to wire pagers if you keep a generic alert template.
+#OnFailure=zerogex-alert@%n.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+# Environment
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Exits 0 on healthy, 1 if any active-symbol × tracked-field cache row
+# is older than NORMALIZER_MAX_AGE_HOURS, 2 on DB error.  A non-zero
+# exit marks this unit failed in systemd, which:
+#   - makes `systemctl --failed` flag the issue,
+#   - shows up in journalctl with the offending rows logged, and
+#   - fires any OnFailure= hooks the operator wires up in [Unit] above.
+ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa normalizer-cache-healthcheck
+
+# Cap shorter than the refresh service — the healthcheck is a single
+# JOIN over a tiny table, no excuse for it to run for minutes.
+TimeoutStartSec=120
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-normalizer-healthcheck

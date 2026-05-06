@@ -2576,27 +2576,40 @@ db-maintain-install: ## Install daily DB maintenance timer (prune old data + vac
 	@echo "$(YELLOW)View logs: journalctl -u zerogex-oa-db-maintain$(NC)"
 
 .PHONY: normalizer-cache-install
-normalizer-cache-install: ## Install nightly normalizer cache refresh timer (04:30 ET)
-	@echo "$(BLUE)=== Installing Normalizer Cache Refresh Timer ===$(NC)"
+normalizer-cache-install: ## Install nightly refresh + drift-detect healthcheck timers
+	@echo "$(BLUE)=== Installing Normalizer Cache Refresh + Healthcheck Timers ===$(NC)"
 	@sudo cp setup/systemd/zerogex-oa-normalizer-refresh.service /etc/systemd/system/
 	@sudo cp setup/systemd/zerogex-oa-normalizer-refresh.timer /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-normalizer-healthcheck.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-normalizer-healthcheck.timer /etc/systemd/system/
 	@sudo systemctl daemon-reload
 	@sudo systemctl enable --now zerogex-oa-normalizer-refresh.timer
-	@echo "$(GREEN)✅ Normalizer-refresh timer installed and started$(NC)"
-	@echo "$(YELLOW)Runs daily at 04:30 ET. Check status: systemctl status zerogex-oa-normalizer-refresh.timer$(NC)"
-	@echo "$(YELLOW)View logs: journalctl -u zerogex-oa-normalizer-refresh$(NC)"
-	@echo "$(YELLOW)Trigger now (one-shot): sudo systemctl start zerogex-oa-normalizer-refresh.service$(NC)"
+	@sudo systemctl enable --now zerogex-oa-normalizer-healthcheck.timer
+	@echo "$(GREEN)✅ Normalizer-refresh timer (04:30 ET) installed and started$(NC)"
+	@echo "$(GREEN)✅ Normalizer-healthcheck timer (12:00 ET drift-detect) installed and started$(NC)"
+	@echo "$(YELLOW)Refresh status:     systemctl status zerogex-oa-normalizer-refresh.timer$(NC)"
+	@echo "$(YELLOW)Healthcheck status: systemctl status zerogex-oa-normalizer-healthcheck.timer$(NC)"
+	@echo "$(YELLOW)Logs:               journalctl -u zerogex-oa-normalizer-refresh -u zerogex-oa-normalizer-healthcheck$(NC)"
+	@echo "$(YELLOW)Trigger now:        sudo systemctl start zerogex-oa-normalizer-refresh.service$(NC)"
 
 .PHONY: normalizer-cache-status
-normalizer-cache-status: ## Show normalizer-refresh timer status + last/next fire + recent log
-	@echo "$(BLUE)=== Normalizer Cache Refresh Timer ===$(NC)"
-	@systemctl list-timers --all --no-pager 'zerogex-oa-normalizer-refresh.timer' || true
+normalizer-cache-status: ## Show refresh + healthcheck timer status + last/next fire + recent log
+	@echo "$(BLUE)=== Normalizer Cache Timers ===$(NC)"
+	@systemctl list-timers --all --no-pager \
+		'zerogex-oa-normalizer-refresh.timer' \
+		'zerogex-oa-normalizer-healthcheck.timer' || true
 	@echo ""
-	@echo "$(BLUE)Last service run:$(NC)"
+	@echo "$(BLUE)Refresh service — last run:$(NC)"
 	@systemctl status zerogex-oa-normalizer-refresh.service --no-pager -l || true
 	@echo ""
-	@echo "$(BLUE)Recent log lines:$(NC)"
-	@sudo journalctl -u zerogex-oa-normalizer-refresh -n 30 --no-pager || true
+	@echo "$(BLUE)Healthcheck service — last run:$(NC)"
+	@systemctl status zerogex-oa-normalizer-healthcheck.service --no-pager -l || true
+	@echo ""
+	@echo "$(BLUE)Recent log lines (both units):$(NC)"
+	@sudo journalctl \
+		-u zerogex-oa-normalizer-refresh \
+		-u zerogex-oa-normalizer-healthcheck \
+		-n 30 --no-pager || true
 
 # Default freshness threshold for the healthcheck.  The timer fires at
 # 04:30 ET nightly with up to 5 min jitter; 36 h leaves room for a

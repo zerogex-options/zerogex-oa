@@ -1,0 +1,27 @@
+[Unit]
+Description=Periodic ZeroGEX normalizer cache freshness check (12:00 ET)
+
+[Timer]
+# Run daily at 12:00 server time (timezone is America/New_York, set by
+# deploy/steps/010.setup).  Schedule rationale:
+#   • The companion timer runs the refresh nightly at 04:30 ET; the
+#     refresh unit's own ExecStartPost re-runs the healthcheck so any
+#     refresh that "succeeds" without producing fresh rows fails the
+#     unit immediately.
+#   • This timer is the *drift* detector — it catches the case where
+#     the refresh timer itself has stopped firing (host paused, systemd
+#     issue, .timer accidentally disabled) so the failure surfaces in
+#     working hours when it can be acted on, rather than silently
+#     persisting until someone happens to run `make` by hand.
+# 12:00 ET sits well after the refresh window (giving stale results
+# 7.5 h to bake at the 36 h default threshold before triggering), and
+# inside business hours so any OnFailure= alert lands somewhere
+# someone is watching.  ±5 min jitter avoids the top-of-hour rush.
+OnCalendar=*-*-* 12:00:00
+RandomizedDelaySec=5m
+# Run on next boot if the box was off when the timer was supposed to
+# fire so a planned reboot at noon doesn't skip a day's check.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
