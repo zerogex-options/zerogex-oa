@@ -2154,6 +2154,26 @@ schema-backup: ## Backup current schema to file
 	PGPASSFILE=~/.pgpass pg_dump -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) -d $(DB_NAME) --schema-only -f $$BACKUP_FILE; \
 	echo "$(GREEN)✅ Schema backed up to $$BACKUP_FILE$(NC)"
 
+# Refresh per-symbol normalizer rows so signal saturation tracks real
+# magnitude distributions instead of falling back to env-var defaults.
+# Override SYMBOLS / WINDOW_DAYS to scope the refresh.
+NORMALIZER_SYMBOLS ?=
+NORMALIZER_WINDOW_DAYS ?= 20
+
+.PHONY: normalizer-cache-refresh
+normalizer-cache-refresh: ## Recompute component_normalizer_cache p05/p50/p95/std (run nightly)
+	@echo "$(BLUE)=== Refreshing component_normalizer_cache ===$(NC)"
+	@$(PY) -m src.tools.normalizer_cache_refresh \
+		$(if $(NORMALIZER_SYMBOLS),--symbols $(NORMALIZER_SYMBOLS)) \
+		--window-days $(NORMALIZER_WINDOW_DAYS)
+
+.PHONY: normalizer-cache-dry-run
+normalizer-cache-dry-run: ## Compute distributions without writing (preview only)
+	@echo "$(BLUE)=== Normalizer Cache (dry-run) ===$(NC)"
+	@$(PY) -m src.tools.normalizer_cache_refresh \
+		$(if $(NORMALIZER_SYMBOLS),--symbols $(NORMALIZER_SYMBOLS)) \
+		--window-days $(NORMALIZER_WINDOW_DAYS) --dry-run
+
 # =============================================================================
 # Maintenance
 # =============================================================================
