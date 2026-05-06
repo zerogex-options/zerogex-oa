@@ -83,7 +83,10 @@ def test_trap_detection_neutral_without_strengthening_gamma():
     )
     results = {r.name: r for r in engine.evaluate(ctx)}
     trap = results["trap_detection"]
-    assert trap.score == 0.0
+    # The signal still abstains (no trap setup), but the engine wraps the
+    # zero with a small regime_tilt so the score lands on a continuous
+    # spectrum rather than literal 0.0.
+    assert abs(trap.score) < 0.15
     assert trap.context["triggered"] is False
 
 

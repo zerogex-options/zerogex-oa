@@ -10,6 +10,7 @@ read-side plumbing stay identical.
 from __future__ import annotations
 
 from src.signals.components.base import ComponentBase, MarketContext
+from src.signals.components.spectrum import ensure_non_zero
 from src.signals.advanced.base import AdvancedSignalResult
 from src.signals.basic.dealer_delta_pressure import DealerDeltaPressureComponent
 from src.signals.basic.gex_gradient import GexGradientComponent
@@ -41,6 +42,9 @@ class BasicSignalEngine:
         for signal in self._signals:
             raw = signal.compute(ctx)
             score = max(-1.0, min(1.0, float(raw)))
+            # Replace abstain-zero scores with a regime-derived tilt so
+            # every signal lands on a continuous spectrum.
+            score = ensure_non_zero(score, ctx)
             context = signal.context_values(ctx) or {}
             results.append(
                 AdvancedSignalResult(name=signal.name, score=score, context=dict(context))

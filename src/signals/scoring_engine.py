@@ -3,10 +3,20 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from src.signals.components.base import ComponentBase, MarketContext
+from src.signals.components.spectrum import ensure_non_zero
+
+# Soft-saturation scale for the composite.  ``composite = 50 + 50 *
+# tanh(sum_offset / _COMPOSITE_SAT_SCALE)`` so the index asymptotically
+# approaches 0 and 100 instead of clamping to them.  At SCALE=50 the
+# regime-label boundaries (40 / 70) line up with the same component-sum
+# offsets the previous linear formula required, so existing thresholds
+# carry over cleanly.
+_COMPOSITE_SAT_SCALE = 50.0
 
 
 @dataclass
@@ -62,13 +72,16 @@ class ScoringEngine:
         component_results: list[tuple[ComponentBase, float]] = []
         payload: dict[str, dict] = {}
 
-        total_points = 50.0
+        sum_offset = 0.0
         for component in self.components:
             raw = component.compute(ctx)
             clamped = max(-1.0, min(1.0, float(raw)))
+            # Replace abstain-zero scores with a regime-derived tilt so
+            # the component contribution lands on a continuous spectrum.
+            clamped = ensure_non_zero(clamped, ctx)
             points = self.COMPONENT_POINTS.get(component.name, float(component.weight) * 100.0)
             contribution = points * clamped
-            total_points += contribution
+            sum_offset += contribution
             component_results.append((component, clamped))
             entry: dict = {
                 "score": round(clamped, 6),
@@ -88,7 +101,13 @@ class ScoringEngine:
                 entry["context"] = ctx_payload
             payload[component.name] = entry
 
-        composite = max(0.0, min(100.0, total_points))
+        # Soft tanh saturation in place of a hard [0, 100] clamp.  Sum of
+        # weighted component contributions can mathematically run from
+        # -100 to +100; mapping through tanh keeps the composite in
+        # (0, 100) open-interval — exact 0 / 100 become asymptotic
+        # extremes instead of common saturation points.
+        composite = 50.0 + 50.0 * math.tanh(sum_offset / _COMPOSITE_SAT_SCALE)
+        composite = max(0.0, min(100.0, composite))
         normalized = composite / 100.0
         direction = self._regime_label(composite)
 

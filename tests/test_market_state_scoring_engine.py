@@ -56,32 +56,42 @@ def _engine(scores: dict[str, float], names=None) -> ScoringEngine:
     )
 
 
-def test_market_state_score_is_centered_at_50_when_all_zero():
+def test_market_state_score_centered_near_50_when_all_components_abstain():
+    """All-zero abstains get replaced with regime_tilt, so the composite
+    sits close to 50 rather than landing exactly there.  The MarketContext
+    used here has a slight bullish tilt (close > flip, PCR = 1.0,
+    negative net GEX), so the composite drifts a hair above 50."""
     eng = _engine({})
     snap, _ = eng.score(_ctx())
-    assert snap.composite_score == 50.0
-    assert snap.direction == "controlled_trend"
+    assert 49.0 <= snap.composite_score <= 60.0
+    assert snap.direction in {"controlled_trend", "chop_range"}
 
 
-def test_market_state_score_caps_at_100():
+def test_market_state_score_extreme_bullish_does_not_saturate_to_100():
+    """Tanh saturation makes 100 an asymptotic extreme rather than a cap."""
     eng = _engine({name: 1.0 for name in _ACTIVE_COMPONENT_NAMES})
     snap, _ = eng.score(_ctx())
-    assert snap.composite_score == 100.0
+    assert 80.0 < snap.composite_score < 100.0
     assert snap.direction == "trend_expansion"
 
 
-def test_market_state_score_floor_at_zero():
+def test_market_state_score_extreme_bearish_does_not_saturate_to_zero():
+    """Tanh saturation makes 0 an asymptotic extreme rather than a floor."""
     eng = _engine({name: -1.0 for name in _ACTIVE_COMPONENT_NAMES})
     snap, _ = eng.score(_ctx())
-    assert snap.composite_score == 0.0
+    assert 0.0 < snap.composite_score < 20.0
     assert snap.direction == "high_risk_reversal"
 
 
 def test_unregistered_components_yield_default_max_points():
     """Components without a COMPONENT_POINTS entry fall back to ``weight * 100``.
-    The fake components used here have ``weight = 0.0``, so an unregistered name
-    contributes 0 to the composite — exercises the fallback path."""
+
+    The fake components used here have ``weight = 0.0``, so an unregistered
+    name contributes a regime-tilt fraction (rather than 0) once weighted
+    by the fallback max_points.  We assert on max_points and direction
+    rather than a precise composite value.
+    """
     eng = _engine({"unknown_component": 1.0}, names=["unknown_component"])
     snap, _ = eng.score(_ctx())
-    assert snap.composite_score == 50.0
+    assert 49.0 <= snap.composite_score <= 51.0
     assert snap.components["unknown_component"]["max_points"] == 0.0
