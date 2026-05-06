@@ -333,6 +333,8 @@ help: ## Show this help message
 	@echo "  make normalizer-cache-install - Install nightly normalizer-refresh timer (04:30 ET)"
 	@echo "  make normalizer-cache-status  - Show normalizer-refresh timer status + recent log"
 	@echo "  make normalizer-cache-healthcheck - Flag stale cache rows (exit 1 = stale, for monitoring)"
+	@echo "  make alert-template-install   - Install zerogex-alert@.service + sample env (slack/sns/pagerduty/webhook)"
+	@echo "  make alert-template-test      - Fire a synthetic alert through the template"
 	@echo ""
 	@echo "$(GREEN)Logs (all services):$(NC)"
 	@echo "  make {service}-logs             - Show live logs (Ctrl+C to exit)"
@@ -2630,3 +2632,39 @@ normalizer-cache-healthcheck-strict: ## Healthcheck that also fails on missing r
 normalizer-cache-healthcheck-json: ## Healthcheck output as JSON (for monitoring scrapers)
 	@$(PY) -m src.tools.normalizer_cache_healthcheck \
 		--max-age-hours $(NORMALIZER_MAX_AGE_HOURS) --json
+
+.PHONY: alert-template-install
+alert-template-install: ## Install zerogex-alert@.service template + sample env (does NOT enable OnFailure= hooks)
+	@echo "$(BLUE)=== Installing failure-alert template ===$(NC)"
+	@command -v jq >/dev/null 2>&1 || { \
+		echo "$(YELLOW)Note: jq is required for slack/pagerduty/webhook backends; installing...$(NC)"; \
+		sudo apt-get install -y jq; \
+	}
+	@sudo cp setup/systemd/zerogex-alert@.service /etc/systemd/system/
+	@sudo install -d -o root -g ubuntu -m 0750 /etc/zerogex
+	@if [ ! -f /etc/zerogex/alert.env ]; then \
+		sudo install -o root -g ubuntu -m 0640 setup/systemd/zerogex-alert.env.example /etc/zerogex/alert.env; \
+		echo "$(GREEN)✅ Sample config written to /etc/zerogex/alert.env (backend = stderr by default)$(NC)"; \
+	else \
+		echo "$(YELLOW)⚠ /etc/zerogex/alert.env already exists — leaving in place; reference setup/systemd/zerogex-alert.env.example for new options$(NC)"; \
+	fi
+	@sudo systemctl daemon-reload
+	@echo "$(GREEN)✅ zerogex-alert@.service template installed$(NC)"
+	@echo ""
+	@echo "$(YELLOW)Next steps:$(NC)"
+	@echo "  1. Edit /etc/zerogex/alert.env, choose ALERT_BACKEND, fill in secret(s)."
+	@echo "  2. Smoke-test: make alert-template-test"
+	@echo "  3. Enable wiring on the peer units (uncomment OnFailure= line):"
+	@echo "       sudo systemctl edit zerogex-oa-normalizer-refresh.service"
+	@echo "       sudo systemctl edit zerogex-oa-normalizer-healthcheck.service"
+	@echo "     Add:"
+	@echo "       [Unit]"
+	@echo "       OnFailure=zerogex-alert@%n.service"
+	@echo "     (or uncomment the existing line in setup/systemd/<unit>.service and re-run normalizer-cache-install)"
+
+.PHONY: alert-template-test
+alert-template-test: ## Fire one synthetic alert through the template (verifies dispatcher + backend)
+	@echo "$(BLUE)=== Sending synthetic alert via current ALERT_BACKEND ===$(NC)"
+	@sudo systemctl start 'zerogex-alert@zerogex-oa-normalizer-healthcheck.service'
+	@echo "$(GREEN)✅ Triggered. View result:$(NC)"
+	@echo "  journalctl -u 'zerogex-alert@zerogex-oa-normalizer-healthcheck.service' -n 30 --no-pager"

@@ -125,9 +125,25 @@ The deployment process runs these steps in order:
     refresh, daily 12:00 ET; fails the unit if any active-symbol cache
     row is older than 36 h, surfacing in `systemctl --failed` during
     business hours.  Wire active alerting by uncommenting the
-    `OnFailure=` line in the unit file.
+    `OnFailure=` line in the unit file (see "Active alerting" below).
 - Enables services + timers to start on boot
 - Starts services and verifies status
+
+**Active alerting (optional).**  A reusable template unit
+(`zerogex-alert@.service`) ships in `setup/systemd/` and dispatches to
+Slack / SNS / PagerDuty / a generic webhook, picked via
+`/etc/zerogex/alert.env`.  Default backend is `stderr` — alerts go to
+the unit's own journal so you can verify wiring without secrets.  To
+enable:
+
+```
+make alert-template-install         # installs template + sample config
+sudo $EDITOR /etc/zerogex/alert.env # pick ALERT_BACKEND, set secret(s)
+make alert-template-test            # fire a synthetic alert end-to-end
+# Uncomment OnFailure= in setup/systemd/zerogex-oa-normalizer-{refresh,healthcheck}.service
+sudo cp setup/systemd/zerogex-oa-normalizer-*.service /etc/systemd/system/
+sudo systemctl daemon-reload
+```
 
 ### Step 110: API Server Setup
 - Installs API dependencies
