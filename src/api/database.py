@@ -2132,7 +2132,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         symbol: str = "SPY",
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
-        window_units: int = 90,
+        window_units: int = 192,
         timeframe: str = "1min",
     ) -> List[Dict[str, Any]]:
         """Get historical quotes aggregated by timeframe."""
@@ -2188,7 +2188,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         try:
             async with self._acquire_connection() as conn:
-                window_units = max(1, min(window_units, 90))
+                window_units = max(1, min(window_units, 192))
                 rows = await conn.fetch(query, symbol, start_date, end_date, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:

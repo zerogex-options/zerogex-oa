@@ -734,7 +734,7 @@ async def get_historical_quotes(
     symbol: str = Query(default="SPY"),
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    window_units: int = Query(default=90, ge=1, le=90),
+    window_units: int = Query(default=192, ge=1, le=192),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
 ):
     """Get historical quotes"""
