@@ -344,7 +344,19 @@ class TechnicalsQueriesMixin:
         ``Mild Spike`` (≥2σ), ``Moderate Spike`` (≥3σ), ``Strong Spike``
         (≥4σ), ``Extreme Spike`` (≥5σ).  We surface only Moderate or
         stronger so consumers don't have to filter out routine noise.
+
+        Cash indices (SPX, NDX, RUT, DJX) carry no transactional volume of
+        their own, so the canonical view stops emitting fresh rows for them
+        once TradeStation's synthetic index volume drops to zero.  When a
+        proxy ETF is configured for the symbol we route through
+        ``_get_unusual_volume_spikes_with_proxy`` which applies the ETF's
+        per-bar volume profile to the index's prices.  Equities/ETFs
+        continue to use the canonical view.
         """
+        proxy = resolve_volume_proxy(symbol)
+        if proxy:
+            return await self._get_unusual_volume_spikes_with_proxy(symbol, proxy, limit)
+
         query = """
             SELECT
                 time_et,
@@ -373,6 +385,136 @@ class TechnicalsQueriesMixin:
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching volume spikes: {e}", exc_info=True)
+            raise
+
+    async def _get_unusual_volume_spikes_with_proxy(
+        self, symbol: str, proxy: str, limit: int
+    ) -> List[Dict[str, Any]]:
+        """Volume-spike detection using a proxy ETF's per-bar volume.
+
+        Joins the index's per-minute close to the proxy ETF's per-minute
+        ``up_volume + down_volume`` on the same timestamp, then computes
+        rolling-window mean and sample sigma over the joined volume
+        series so spike classification mirrors the canonical
+        ``unusual_volume_spikes`` view (Moderate ≥3σ / Strong ≥4σ /
+        Extreme ≥5σ).  Buying pressure uses the proxy's directional
+        volume split.  The response includes a ``volume_proxy`` field so
+        callers can see which ETF's volume profile was substituted.
+        """
+        query = """
+            WITH index_quotes AS (
+                SELECT timestamp, symbol, close AS price
+                FROM underlying_quotes
+                WHERE symbol = $1
+            ),
+            proxy_volume AS (
+                SELECT
+                    timestamp,
+                    up_volume,
+                    down_volume,
+                    (up_volume + down_volume) AS volume
+                FROM underlying_quotes
+                WHERE symbol = $2
+            ),
+            joined AS (
+                SELECT
+                    iq.timestamp,
+                    iq.symbol,
+                    iq.price,
+                    COALESCE(pv.volume, 0) AS volume,
+                    COALESCE(pv.up_volume, 0) AS up_volume,
+                    COALESCE(pv.down_volume, 0) AS down_volume
+                FROM index_quotes iq
+                LEFT JOIN proxy_volume pv ON pv.timestamp = iq.timestamp
+            ),
+            with_stats AS (
+                SELECT
+                    timestamp,
+                    symbol,
+                    price,
+                    volume,
+                    up_volume,
+                    down_volume,
+                    AVG(volume) OVER (
+                        PARTITION BY symbol
+                        ORDER BY timestamp
+                        ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
+                    ) AS avg_volume,
+                    STDDEV_SAMP(volume) OVER (
+                        PARTITION BY symbol
+                        ORDER BY timestamp
+                        ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
+                    ) AS stddev_volume
+                FROM joined
+            ),
+            scored AS (
+                SELECT
+                    timestamp AT TIME ZONE 'America/New_York' AS time_et,
+                    timestamp,
+                    symbol,
+                    price,
+                    volume AS current_volume,
+                    ROUND(avg_volume::numeric, 2) AS avg_volume,
+                    ROUND(
+                        ((volume - avg_volume) / NULLIF(stddev_volume, 0))::numeric,
+                        2
+                    ) AS volume_sigma,
+                    ROUND(
+                        (volume::numeric / NULLIF(avg_volume::numeric, 0)),
+                        2
+                    ) AS volume_ratio,
+                    ROUND(
+                        (COALESCE(
+                            up_volume::numeric / NULLIF((up_volume + down_volume), 0),
+                            0.5
+                        ) * 100)::numeric,
+                        2
+                    ) AS buying_pressure_pct,
+                    CASE
+                        WHEN ((volume - avg_volume) / NULLIF(stddev_volume, 0)) >= 5
+                            THEN '🚨 Extreme Spike'
+                        WHEN ((volume - avg_volume) / NULLIF(stddev_volume, 0)) >= 4
+                            THEN '🔥 Strong Spike'
+                        WHEN ((volume - avg_volume) / NULLIF(stddev_volume, 0)) >= 3
+                            THEN '⚠️ Moderate Spike'
+                        WHEN ((volume - avg_volume) / NULLIF(stddev_volume, 0)) >= 2
+                            THEN '⚡ Mild Spike'
+                        ELSE NULL
+                    END AS volume_class
+                FROM with_stats
+                WHERE avg_volume IS NOT NULL
+                  AND stddev_volume IS NOT NULL
+                  AND stddev_volume > 0
+            )
+            SELECT
+                time_et,
+                timestamp,
+                symbol,
+                price,
+                current_volume,
+                avg_volume,
+                volume_sigma,
+                volume_ratio,
+                buying_pressure_pct,
+                volume_class
+            FROM scored
+            WHERE volume_sigma >= 3.0
+            ORDER BY timestamp DESC
+            LIMIT $3
+        """
+
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, proxy, limit)
+                results = [dict(row) for row in rows]
+                for row in results:
+                    row["volume_proxy"] = proxy
+                return results
+        except Exception as e:
+            logger.error(
+                f"Error fetching volume spikes for {symbol} via proxy {proxy}: {e}",
+                exc_info=True,
+            )
             raise
 
     async def get_momentum_divergence(
