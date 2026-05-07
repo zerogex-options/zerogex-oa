@@ -288,24 +288,44 @@ class RangeBreakImminenceSignal:
         rows = (ctx.extra or {}).get("gex_by_strike") if ctx.extra else None
         if not rows or ctx.close <= 0:
             return None
-        # Only use delta-weighted OI when the analytics layer provided it;
-        # the distance-proxy branch lives in DealerDeltaPressureComponent
-        # and is too coarse for a regime-switch decision.
+        # Prefer delta-weighted OI when the analytics layer provided it.
+        # Until that lands, fall back to the linear-distance delta proxy
+        # used by DealerDeltaPressureComponent so the dealer sub-score
+        # contributes something rather than being structurally zero.
+        have_delta_oi = any(
+            isinstance(r, dict) and ("call_delta_oi" in r or "put_delta_oi" in r) for r in rows
+        )
+        if have_delta_oi:
+            total = 0.0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    call_d = float(row.get("call_delta_oi") or 0.0)
+                    put_d = float(row.get("put_delta_oi") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                total -= call_d + put_d
+            return total
+
         total = 0.0
-        saw_delta = False
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            if "call_delta_oi" not in row and "put_delta_oi" not in row:
+            strike = row.get("strike")
+            if strike is None:
                 continue
-            saw_delta = True
             try:
-                call_d = float(row.get("call_delta_oi") or 0.0)
-                put_d = float(row.get("put_delta_oi") or 0.0)
+                strike_f = float(strike)
+                call_oi_f = float(row.get("call_oi") or 0)
+                put_oi_f = float(row.get("put_oi") or 0)
             except (TypeError, ValueError):
                 continue
-            total -= call_d + put_d
-        return total if saw_delta else None
+            distance_pct = (ctx.close - strike_f) / ctx.close
+            call_delta = max(0.0, min(1.0, 0.5 - distance_pct * 10))
+            put_delta = -max(0.0, min(1.0, 0.5 + distance_pct * 10))
+            total -= (call_oi_f * call_delta + put_oi_f * put_delta) * 100
+        return total
 
     @staticmethod
     def _direction_flag(bias: float) -> float:

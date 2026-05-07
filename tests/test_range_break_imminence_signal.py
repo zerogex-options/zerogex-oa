@@ -126,6 +126,53 @@ def test_dealer_component_reads_explicit_net_delta():
     assert dealer["magnitude"] > 0.0
 
 
+def test_dealer_component_uses_delta_oi_when_available():
+    """Explicit call_delta_oi/put_delta_oi columns short-circuit the proxy."""
+    signal = RangeBreakImminenceSignal()
+    rows = [
+        {"strike": 600.0, "call_delta_oi": 1.0e8, "put_delta_oi": -0.5e8},
+        {"strike": 605.0, "call_delta_oi": 0.5e8, "put_delta_oi": -0.2e8},
+    ]
+    ctx = _ctx(extra={"gex_by_strike": rows})
+    result = signal.evaluate(ctx)
+    dealer = result.context["dealer"]
+    # Dealer = -(call_d + put_d) summed = -(1.5e8 + -0.7e8) = -0.8e8
+    assert dealer["dealer_net_delta"] is not None
+    assert dealer["dealer_net_delta"] == -0.8e8
+
+
+def test_dealer_component_falls_back_to_distance_proxy():
+    """When delta_oi columns are absent, derive a coarse dealer estimate
+    from call_oi/put_oi using the linear-distance delta proxy.
+
+    Prior to this fallback the dealer sub-score was structurally zero in
+    production because the analytics layer never emits delta-weighted OI.
+    """
+    signal = RangeBreakImminenceSignal()
+    # Heavy call OI just OTM and minimal put OI: dealers (short customers)
+    # are net short calls → net negative delta → bullish bias.
+    rows = [
+        {"strike": 600.0, "call_oi": 50_000, "put_oi": 5_000},
+        {"strike": 602.0, "call_oi": 80_000, "put_oi": 2_000},
+    ]
+    ctx = _ctx(extra={"gex_by_strike": rows})
+    result = signal.evaluate(ctx)
+    dealer = result.context["dealer"]
+    assert dealer["dealer_net_delta"] is not None
+    # Dealers net short call-heavy book ⇒ negative DNI ⇒ bullish (signed > 0).
+    assert dealer["dealer_net_delta"] < 0
+    assert dealer["signed"] > 0
+    assert dealer["magnitude"] > 0.0
+
+
+def test_dealer_component_returns_none_when_no_strikes():
+    signal = RangeBreakImminenceSignal()
+    ctx = _ctx(extra={"gex_by_strike": []})
+    result = signal.evaluate(ctx)
+    assert result.context["dealer"]["dealer_net_delta"] is None
+    assert result.context["dealer"]["signed"] == 0.0
+
+
 def test_compression_component_detects_contraction():
     signal = RangeBreakImminenceSignal()
     # Last 10 bars are quasi-flat (tiny sigma); earlier 50 bars are noisy.
