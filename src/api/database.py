@@ -797,25 +797,41 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 ORDER BY timestamp DESC
                 LIMIT 1
             ),
-            -- Latest known OI per contract within a 7-day window of max_ts.
-            -- OI is published once per day at settlement, so off-hours minute
-            -- buckets contain only the contracts that happened to stream in
-            -- that minute. Pinning to oc.timestamp = max_ts (the prior
-            -- behavior) collapsed the chain to a handful of strikes off-hours.
-            latest_per_contract AS (
-                SELECT DISTINCT ON (oc.option_symbol)
-                    oc.option_symbol,
-                    oc.expiration,
-                    oc.strike,
-                    oc.option_type,
-                    oc.open_interest
+            -- Find option_symbols that streamed any update in the last day.
+            -- The (underlying, timestamp DESC, option_symbol) index covers
+            -- this scan, which DISTINCTs ~3K symbols out of ~1M rows for SPY.
+            active_symbols AS (
+                SELECT DISTINCT oc.option_symbol
                 FROM option_chains oc
                 CROSS JOIN should_refresh r
                 WHERE oc.underlying = $1
-                  AND oc.timestamp >= r.max_ts - INTERVAL '7 days'
+                  AND oc.timestamp >= r.max_ts - INTERVAL '1 day'
                   AND oc.timestamp <= r.max_ts
-                  AND oc.expiration >= (r.max_ts AT TIME ZONE 'America/New_York')::date
-                ORDER BY oc.option_symbol, oc.timestamp DESC
+            ),
+            -- For each active symbol, fetch its latest row via the
+            -- (option_symbol, timestamp DESC) primary key. OI is published
+            -- once per day at settlement, so the latest row's OI is correct
+            -- regardless of how recently the contract streamed. This avoids
+            -- the original WHERE oc.timestamp = max_ts which collapsed the
+            -- chain off-hours when only a handful of contracts streamed in
+            -- the most-recent minute bucket.
+            latest_per_contract AS (
+                SELECT
+                    latest.expiration,
+                    latest.strike,
+                    latest.option_type,
+                    latest.open_interest
+                FROM active_symbols s
+                CROSS JOIN should_refresh r
+                CROSS JOIN LATERAL (
+                    SELECT expiration, strike, option_type, open_interest
+                    FROM option_chains
+                    WHERE option_symbol = s.option_symbol
+                      AND timestamp <= r.max_ts
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                ) latest
+                WHERE latest.expiration >= (r.max_ts AT TIME ZONE 'America/New_York')::date
             ),
             contracts AS (
                 SELECT

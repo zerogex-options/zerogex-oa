@@ -27,18 +27,22 @@ def test_refresh_max_pain_snapshot_uses_latest_oi_per_contract():
     )
     assert snapshot_query, "snapshot upsert query was not executed"
 
-    # Latest-per-contract pattern instead of `oc.timestamp = r.max_ts`.
-    assert "DISTINCT ON (oc.option_symbol)" in snapshot_query
+    # Two-step pattern: discover active symbols in a small window, then
+    # LATERAL fetch the latest row per symbol via the PK index. The original
+    # `oc.timestamp = r.max_ts` constraint must be gone.
+    assert "active_symbols AS" in snapshot_query
+    assert "CROSS JOIN LATERAL" in snapshot_query
+    assert "ORDER BY timestamp DESC" in snapshot_query
     assert "oc.timestamp = r.max_ts" not in snapshot_query
 
-    # Bounded backward scan so the query still uses the per-symbol index.
-    assert "INTERVAL '7 days'" in snapshot_query
-    assert "oc.timestamp >= r.max_ts - INTERVAL '7 days'" in snapshot_query
-    assert "oc.timestamp <= r.max_ts" in snapshot_query
+    # Discovery window must be bounded so the active-symbols scan stays cheap
+    # enough to fit under the statement_timeout.
+    assert "INTERVAL '1 day'" in snapshot_query
+    assert "oc.timestamp >= r.max_ts - INTERVAL '1 day'" in snapshot_query
 
     # Already-expired contracts must not leak into the snapshot now that we
     # look back across multiple sessions.
-    assert "oc.expiration >= (r.max_ts AT TIME ZONE 'America/New_York')::date" in snapshot_query
+    assert "latest.expiration >= (r.max_ts AT TIME ZONE 'America/New_York')::date" in snapshot_query
 
     # Candidate settlements should be ranked by proximity to spot, not by the
     # bottom-N strikes (otherwise a fully-populated chain would truncate to
