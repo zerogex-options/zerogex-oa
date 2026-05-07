@@ -337,21 +337,22 @@ class TechnicalsQueriesMixin:
     async def get_unusual_volume_spikes(
         self, symbol: str = "SPY", limit: int = 20
     ) -> List[Dict[str, Any]]:
-        """Get unusual volume spikes — filtered to Moderate Spike or above.
+        """Get unusual volume spikes — filtered to Extreme (≥3σ) only.
 
-        The ``unusual_volume_spikes`` view classifies each row by sigma of
-        the rolling-window volume distribution; the conventional labels are
-        ``Mild Spike`` (≥2σ), ``Moderate Spike`` (≥3σ), ``Strong Spike``
-        (≥4σ), ``Extreme Spike`` (≥5σ).  We surface only Moderate or
-        stronger so consumers don't have to filter out routine noise.
+        The ``unusual_volume_spikes`` view labels each row by sigma of
+        the rolling 30-bar volume distribution: ``📈 Moderate Spike``
+        (≥1σ), ``⚡ High Spike`` (≥2σ), ``🚨 Extreme Spike`` (≥3σ),
+        ``⚪ Normal`` (<1σ).  We surface only Extreme readings — ≥1σ
+        and ≥2σ fire on a large fraction of bars during the open and
+        close auctions, so anything looser becomes routine noise.
 
-        Cash indices (SPX, NDX, RUT, DJX) carry no transactional volume of
-        their own, so the canonical view stops emitting fresh rows for them
-        once TradeStation's synthetic index volume drops to zero.  When a
-        proxy ETF is configured for the symbol we route through
-        ``_get_unusual_volume_spikes_with_proxy`` which applies the ETF's
-        per-bar volume profile to the index's prices.  Equities/ETFs
-        continue to use the canonical view.
+        Cash indices (SPX, NDX, RUT, DJX) carry no transactional volume
+        of their own, so the canonical view stops emitting fresh rows
+        for them once TradeStation's synthetic index volume drops to
+        zero.  When a proxy ETF is configured for the symbol we route
+        through ``_get_unusual_volume_spikes_with_proxy`` which applies
+        the ETF's per-bar volume profile to the index's prices.
+        Equities/ETFs continue to use the canonical view.
         """
         proxy = resolve_volume_proxy(symbol)
         if proxy:
@@ -371,10 +372,7 @@ class TechnicalsQueriesMixin:
                 volume_class
             FROM unusual_volume_spikes
             WHERE symbol = $1
-              AND (
-                  volume_class IN ('Moderate Spike', 'Strong Spike', 'Extreme Spike')
-                  OR volume_sigma >= 3.0
-              )
+              AND volume_sigma >= 3.0
             ORDER BY timestamp DESC
             LIMIT $2
         """
