@@ -393,13 +393,13 @@ class TechnicalsQueriesMixin:
         """Volume-spike detection using a proxy ETF's per-bar volume.
 
         Joins the index's per-minute close to the proxy ETF's per-minute
-        ``up_volume + down_volume`` on the same timestamp, then computes
-        rolling-window mean and sample sigma over the joined volume
-        series so spike classification mirrors the canonical
-        ``unusual_volume_spikes`` view (Moderate ≥3σ / Strong ≥4σ /
-        Extreme ≥5σ).  Buying pressure uses the proxy's directional
-        volume split.  The response includes a ``volume_proxy`` field so
-        callers can see which ETF's volume profile was substituted.
+        ``up_volume + down_volume`` on the same timestamp, then runs the
+        canonical ``unusual_volume_spikes`` rolling-window stats over the
+        joined series — same 30-bar window, same sample sigma, same
+        Moderate ≥1σ / High ≥2σ / Extreme ≥3σ labels.  Buying pressure
+        uses the proxy's directional volume split.  The response
+        includes a ``volume_proxy`` field so callers can see which ETF's
+        volume profile was substituted.
         """
         query = """
             WITH index_quotes AS (
@@ -418,73 +418,34 @@ class TechnicalsQueriesMixin:
             ),
             joined AS (
                 SELECT
+                    iq.timestamp AT TIME ZONE 'America/New_York' AS time_et,
                     iq.timestamp,
                     iq.symbol,
                     iq.price,
-                    COALESCE(pv.volume, 0) AS volume,
-                    COALESCE(pv.up_volume, 0) AS up_volume,
-                    COALESCE(pv.down_volume, 0) AS down_volume
-                FROM index_quotes iq
-                LEFT JOIN proxy_volume pv ON pv.timestamp = iq.timestamp
-            ),
-            with_stats AS (
-                SELECT
-                    timestamp,
-                    symbol,
-                    price,
-                    volume,
-                    up_volume,
-                    down_volume,
-                    AVG(volume) OVER (
-                        PARTITION BY symbol
-                        ORDER BY timestamp
+                    COALESCE(pv.volume, 0) AS current_volume,
+                    AVG(COALESCE(pv.volume, 0)) OVER (
+                        PARTITION BY iq.symbol
+                        ORDER BY iq.timestamp
                         ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
                     ) AS avg_volume,
-                    STDDEV_SAMP(volume) OVER (
-                        PARTITION BY symbol
-                        ORDER BY timestamp
+                    STDDEV_SAMP(COALESCE(pv.volume, 0)) OVER (
+                        PARTITION BY iq.symbol
+                        ORDER BY iq.timestamp
                         ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
-                    ) AS stddev_volume
-                FROM joined
-            ),
-            scored AS (
-                SELECT
-                    timestamp AT TIME ZONE 'America/New_York' AS time_et,
-                    timestamp,
-                    symbol,
-                    price,
-                    volume AS current_volume,
-                    ROUND(avg_volume::numeric, 2) AS avg_volume,
+                    ) AS volume_stddev,
                     ROUND(
-                        ((volume - avg_volume) / NULLIF(stddev_volume, 0))::numeric,
+                        COALESCE(
+                            COALESCE(pv.up_volume, 0)::numeric
+                            / NULLIF(
+                                (COALESCE(pv.up_volume, 0) + COALESCE(pv.down_volume, 0))::numeric,
+                                0
+                            ) * 100,
+                            50
+                        ),
                         2
-                    ) AS volume_sigma,
-                    ROUND(
-                        (volume::numeric / NULLIF(avg_volume::numeric, 0)),
-                        2
-                    ) AS volume_ratio,
-                    ROUND(
-                        (COALESCE(
-                            up_volume::numeric / NULLIF((up_volume + down_volume), 0),
-                            0.5
-                        ) * 100)::numeric,
-                        2
-                    ) AS buying_pressure_pct,
-                    CASE
-                        WHEN ((volume - avg_volume) / NULLIF(stddev_volume, 0)) >= 5
-                            THEN '🚨 Extreme Spike'
-                        WHEN ((volume - avg_volume) / NULLIF(stddev_volume, 0)) >= 4
-                            THEN '🔥 Strong Spike'
-                        WHEN ((volume - avg_volume) / NULLIF(stddev_volume, 0)) >= 3
-                            THEN '⚠️ Moderate Spike'
-                        WHEN ((volume - avg_volume) / NULLIF(stddev_volume, 0)) >= 2
-                            THEN '⚡ Mild Spike'
-                        ELSE NULL
-                    END AS volume_class
-                FROM with_stats
-                WHERE avg_volume IS NOT NULL
-                  AND stddev_volume IS NOT NULL
-                  AND stddev_volume > 0
+                    ) AS buying_pressure_pct
+                FROM index_quotes iq
+                LEFT JOIN proxy_volume pv ON pv.timestamp = iq.timestamp
             )
             SELECT
                 time_et,
@@ -492,13 +453,39 @@ class TechnicalsQueriesMixin:
                 symbol,
                 price,
                 current_volume,
-                avg_volume,
-                volume_sigma,
-                volume_ratio,
+                COALESCE(avg_volume, 0)::numeric(18,2) AS avg_volume,
+                ROUND(
+                    COALESCE(
+                        (current_volume::numeric - avg_volume) / NULLIF(volume_stddev, 0),
+                        0
+                    ),
+                    2
+                ) AS volume_sigma,
+                ROUND(
+                    COALESCE(current_volume::numeric / NULLIF(avg_volume, 0), 1),
+                    2
+                ) AS volume_ratio,
                 buying_pressure_pct,
-                volume_class
-            FROM scored
-            WHERE volume_sigma >= 3.0
+                CASE
+                    WHEN COALESCE(
+                        (current_volume::numeric - avg_volume) / NULLIF(volume_stddev, 0),
+                        0
+                    ) >= 3 THEN '🚨 Extreme Spike'
+                    WHEN COALESCE(
+                        (current_volume::numeric - avg_volume) / NULLIF(volume_stddev, 0),
+                        0
+                    ) >= 2 THEN '⚡ High Spike'
+                    WHEN COALESCE(
+                        (current_volume::numeric - avg_volume) / NULLIF(volume_stddev, 0),
+                        0
+                    ) >= 1 THEN '📈 Moderate Spike'
+                    ELSE '⚪ Normal'
+                END AS volume_class
+            FROM joined
+            WHERE COALESCE(
+                (current_volume::numeric - avg_volume) / NULLIF(volume_stddev, 0),
+                0
+            ) >= 3
             ORDER BY timestamp DESC
             LIMIT $3
         """

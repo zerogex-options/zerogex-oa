@@ -692,6 +692,156 @@ JOIN first_30min orb
   ON q.symbol = orb.symbol
  AND DATE(q.timestamp AT TIME ZONE 'America/New_York') = orb.trade_date;
 
+DROP VIEW IF EXISTS unusual_volume_spikes CASCADE;
+CREATE VIEW unusual_volume_spikes AS
+WITH base AS (
+    SELECT
+        timestamp AT TIME ZONE 'America/New_York' AS time_et,
+        timestamp,
+        symbol,
+        close AS price,
+        (up_volume + down_volume) AS current_volume,
+        AVG(up_volume + down_volume) OVER (
+            PARTITION BY symbol
+            ORDER BY timestamp
+            ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
+        ) AS avg_volume,
+        STDDEV_SAMP(up_volume + down_volume) OVER (
+            PARTITION BY symbol
+            ORDER BY timestamp
+            ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
+        ) AS volume_stddev,
+        ROUND(
+            COALESCE(
+                up_volume::numeric / NULLIF((up_volume + down_volume)::numeric, 0) * 100,
+                50
+            ),
+            2
+        ) AS buying_pressure_pct
+    FROM underlying_quotes
+)
+SELECT
+    time_et,
+    timestamp,
+    symbol,
+    price,
+    current_volume,
+    COALESCE(avg_volume, 0)::numeric(18,2) AS avg_volume,
+    ROUND(
+        COALESCE((current_volume::numeric - avg_volume) / NULLIF(volume_stddev, 0), 0),
+        2
+    ) AS volume_sigma,
+    ROUND(
+        COALESCE(current_volume::numeric / NULLIF(avg_volume, 0), 1),
+        2
+    ) AS volume_ratio,
+    buying_pressure_pct,
+    CASE
+        WHEN COALESCE((current_volume::numeric - avg_volume) / NULLIF(volume_stddev, 0), 0) >= 3
+            THEN '🚨 Extreme Spike'
+        WHEN COALESCE((current_volume::numeric - avg_volume) / NULLIF(volume_stddev, 0), 0) >= 2
+            THEN '⚡ High Spike'
+        WHEN COALESCE((current_volume::numeric - avg_volume) / NULLIF(volume_stddev, 0), 0) >= 1
+            THEN '📈 Moderate Spike'
+        ELSE '⚪ Normal'
+    END AS volume_class
+FROM base;
+
+DROP VIEW IF EXISTS dealer_hedging_pressure CASCADE;
+CREATE VIEW dealer_hedging_pressure AS
+WITH latest_price AS (
+    SELECT DISTINCT ON (symbol)
+        symbol,
+        timestamp,
+        close AS current_price,
+        close - LAG(close) OVER (PARTITION BY symbol ORDER BY timestamp) AS price_change
+    FROM underlying_quotes
+    ORDER BY symbol, timestamp DESC
+),
+latest_delta AS (
+    SELECT
+        underlying AS symbol,
+        SUM(delta * open_interest::numeric * 100) AS expected_hedge_shares
+    FROM (
+        SELECT DISTINCT ON (option_symbol)
+            option_symbol,
+            underlying,
+            delta,
+            open_interest,
+            timestamp
+        FROM option_chains
+        WHERE timestamp >= NOW() - INTERVAL '10 minutes'
+          AND delta IS NOT NULL
+          AND open_interest > 0
+        ORDER BY option_symbol, timestamp DESC
+    ) t
+    GROUP BY underlying
+)
+SELECT
+    p.timestamp AT TIME ZONE 'America/New_York' AS time_et,
+    p.timestamp,
+    p.symbol,
+    p.current_price,
+    p.price_change,
+    COALESCE(d.expected_hedge_shares, 0) AS expected_hedge_shares,
+    CASE
+        WHEN COALESCE(d.expected_hedge_shares, 0) > 1000000
+            THEN '🔴 Heavy Sell-Hedging Risk'
+        WHEN COALESCE(d.expected_hedge_shares, 0) < -1000000
+            THEN '🟢 Heavy Buy-Hedging Risk'
+        ELSE '⚪ Balanced Hedging'
+    END AS hedge_pressure
+FROM latest_price p
+LEFT JOIN latest_delta d ON d.symbol::text = p.symbol::text;
+
+DROP VIEW IF EXISTS gamma_exposure_levels CASCADE;
+CREATE VIEW gamma_exposure_levels AS
+WITH latest_options AS (
+    SELECT DISTINCT ON (option_symbol)
+        option_symbol,
+        underlying,
+        strike,
+        option_type,
+        gamma,
+        open_interest
+    FROM option_chains
+    WHERE timestamp >= NOW() - INTERVAL '10 minutes'
+      AND gamma IS NOT NULL
+      AND open_interest > 0
+    ORDER BY option_symbol, timestamp DESC
+)
+SELECT
+    underlying,
+    strike,
+    SUM(
+        CASE
+            WHEN option_type = 'C' THEN gamma * open_interest::numeric * 100
+            ELSE -gamma * open_interest::numeric * 100
+        END
+    ) AS net_gex,
+    SUM(ABS(gamma * open_interest::numeric * 100)) AS total_gex,
+    SUM(gamma * open_interest::numeric * 100) FILTER (WHERE option_type = 'C') AS call_gex,
+    SUM(gamma * open_interest::numeric * 100) FILTER (WHERE option_type = 'P') AS put_gex,
+    COUNT(*) AS num_contracts,
+    SUM(open_interest) AS total_oi,
+    CASE
+        WHEN SUM(
+            CASE
+                WHEN option_type = 'C' THEN gamma * open_interest::numeric * 100
+                ELSE -gamma * open_interest::numeric * 100
+            END
+        ) > 1000000 THEN '🟢 Strong +GEX'
+        WHEN SUM(
+            CASE
+                WHEN option_type = 'C' THEN gamma * open_interest::numeric * 100
+                ELSE -gamma * open_interest::numeric * 100
+            END
+        ) < -1000000 THEN '🔴 Strong -GEX'
+        ELSE '⚪ Neutral GEX'
+    END AS gex_level
+FROM latest_options
+GROUP BY underlying, strike;
+
 -- =============================================================================
 -- Trade Signals Tables
 -- Append to the bottom of setup/database/schema.sql

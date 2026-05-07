@@ -113,7 +113,6 @@ log "4. Database Views (Real-Time)"
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 VIEWS=(
-    "underlying_quotes_with_deltas"
     "option_chains_with_deltas"
     "option_flow_by_type"
     "option_flow_by_strike"
@@ -125,7 +124,6 @@ VIEWS=(
     "gamma_exposure_levels"
     "dealer_hedging_pressure"
     "unusual_volume_spikes"
-    "momentum_divergence"
 )
 
 for view in "${VIEWS[@]}"; do
