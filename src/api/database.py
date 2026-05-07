@@ -2204,7 +2204,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         try:
             async with self._acquire_connection() as conn:
-                window_units = max(1, min(window_units, 192))
+                window_units = max(1, min(window_units, 576))
                 rows = await conn.fetch(query, symbol, start_date, end_date, window_units)
                 return [dict(row) for row in rows]
         except Exception as e:
