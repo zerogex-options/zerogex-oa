@@ -797,24 +797,46 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 ORDER BY timestamp DESC
                 LIMIT 1
             ),
-            contracts AS (
-                SELECT
+            -- Latest known OI per contract within a 7-day window of max_ts.
+            -- OI is published once per day at settlement, so off-hours minute
+            -- buckets contain only the contracts that happened to stream in
+            -- that minute. Pinning to oc.timestamp = max_ts (the prior
+            -- behavior) collapsed the chain to a handful of strikes off-hours.
+            latest_per_contract AS (
+                SELECT DISTINCT ON (oc.option_symbol)
+                    oc.option_symbol,
                     oc.expiration,
                     oc.strike,
                     oc.option_type,
-                    SUM(oc.open_interest)::numeric AS oi
+                    oc.open_interest
                 FROM option_chains oc
-                JOIN should_refresh r ON oc.timestamp = r.max_ts
+                CROSS JOIN should_refresh r
                 WHERE oc.underlying = $1
-                  AND oc.open_interest > 0
-                GROUP BY oc.expiration, oc.strike, oc.option_type
+                  AND oc.timestamp >= r.max_ts - INTERVAL '7 days'
+                  AND oc.timestamp <= r.max_ts
+                  AND oc.expiration >= (r.max_ts AT TIME ZONE 'America/New_York')::date
+                ORDER BY oc.option_symbol, oc.timestamp DESC
             ),
-            ranked_strikes AS (
+            contracts AS (
                 SELECT
                     expiration,
                     strike,
-                    ROW_NUMBER() OVER (PARTITION BY expiration ORDER BY strike) AS rn
+                    option_type,
+                    SUM(open_interest)::numeric AS oi
+                FROM latest_per_contract
+                WHERE open_interest > 0
+                GROUP BY expiration, strike, option_type
+            ),
+            ranked_strikes AS (
+                SELECT
+                    s.expiration,
+                    s.strike,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY s.expiration
+                        ORDER BY ABS(s.strike - u.underlying_price), s.strike
+                    ) AS rn
                 FROM (SELECT DISTINCT expiration, strike FROM contracts) s
+                CROSS JOIN underlying u
             ),
             settlement_candidates AS (
                 SELECT expiration, strike AS settlement_price
