@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from src.signals.components.base import MarketContext
-from src.signals.components.spectrum import ensure_non_zero
 from src.signals.advanced.base import AdvancedSignalResult
 from src.signals.advanced.eod_pressure import EODPressureSignal
 from src.signals.advanced.gamma_vwap_confluence import GammaVWAPConfluenceSignal
@@ -31,11 +30,4 @@ class AdvancedSignalEngine:
         )
 
     def evaluate(self, ctx: MarketContext) -> list[AdvancedSignalResult]:
-        results: list[AdvancedSignalResult] = []
-        for signal in self._signals:
-            result = signal.evaluate(ctx)
-            # Replace abstain-zero scores with a regime-derived tilt so
-            # every signal lands on a continuous spectrum.
-            result.score = ensure_non_zero(result.score, ctx)
-            results.append(result)
-        return results
+        return [signal.evaluate(ctx) for signal in self._signals]
