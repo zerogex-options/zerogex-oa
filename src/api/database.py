@@ -2215,7 +2215,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self, symbol: str = "SPY", timeframe: str = "5min", window_units: int = 90
     ) -> List[Dict[str, Any]]:
         """Get max pain timeseries aggregated to timeframe over window units."""
-        window_units = max(1, min(window_units, 90))
+        window_units = max(1, min(window_units, 300))
         bucket = _bucket_expr(timeframe)
         step_interval = _interval_expr(timeframe)
         # `bucket` and `step_interval` are validated allowlist literals.
@@ -2331,7 +2331,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         Get GEX data by strike over time for heatmap visualization using interval + window units.
         """
         symbol = symbol.upper()
-        window_units = max(1, min(window_units, 90))
+        window_units = max(1, min(window_units, 300))
         cache_key = f"gex_heatmap:{symbol}:{timeframe}:{window_units}"
         cached = self._cache_get(cache_key)
         if cached is not None:

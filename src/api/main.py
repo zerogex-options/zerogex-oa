@@ -297,7 +297,7 @@ async def get_historical_gex(
 async def get_gex_heatmap(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="5min"),
-    window_units: int = Query(default=60, ge=1, le=90),
+    window_units: int = Query(default=60, ge=1, le=300),
 ):
     """Get GEX heatmap data (strike x time)"""
     data = await db_manager.get_gex_heatmap(symbol, timeframe, window_units)
@@ -805,7 +805,7 @@ async def get_open_interest(
 async def get_max_pain_timeseries(
     symbol: str = Query(default="SPY"),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="5min"),
-    window_units: int = Query(default=90, ge=1, le=90),
+    window_units: int = Query(default=90, ge=1, le=300),
 ):
     """Get max pain over time aggregated by timeframe."""
     data = await db_manager.get_max_pain_timeseries(symbol, timeframe, window_units)
