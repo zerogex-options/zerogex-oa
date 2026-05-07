@@ -28,7 +28,7 @@ from src.signals.advanced import AdvancedSignalEngine
 from src.signals.basic import BasicSignalEngine
 from src.signals.portfolio_engine import PortfolioEngine
 from src.signals.scoring_engine import ScoringEngine
-from src.symbols import get_canonical_symbol
+from src.symbols import get_canonical_symbol, resolve_volume_proxy
 from src.utils import get_logger
 
 logger = get_logger(__name__)
@@ -179,17 +179,77 @@ class UnifiedSignalEngine:
                     oi_pcr = None
                 effective_pcr = oi_pcr if oi_pcr is not None and oi_pcr > 0 else float(pcr or 1.0)
 
-                cur.execute(
-                    """
-                    SELECT vwap, vwap_deviation_pct
-                    FROM underlying_vwap_deviation
-                    WHERE symbol = %s
-                      AND timestamp <= %s
-                    ORDER BY timestamp DESC
-                    LIMIT 1
-                    """,
-                    (self.db_symbol, ts),
-                )
+                # Cash indices (SPX, NDX, RUT, DJX) carry no transactional
+                # volume of their own, so the underlying_vwap_deviation view
+                # returns NULL VWAP for them.  Mirror the proxy substitution
+                # used by the /api/technicals/vwap-deviation endpoint: when
+                # an ETF proxy is configured we compute session-cumulative
+                # VWAP from the index's prices joined with the proxy's
+                # per-bar volume.
+                vwap_proxy = resolve_volume_proxy(self.db_symbol)
+                if vwap_proxy:
+                    cur.execute(
+                        """
+                        WITH session_start AS (
+                            SELECT (DATE(%s AT TIME ZONE 'America/New_York'))::timestamp
+                                   AT TIME ZONE 'America/New_York' AS day_start
+                        ),
+                        index_quotes AS (
+                            SELECT timestamp, close AS price
+                            FROM underlying_quotes
+                            WHERE symbol = %s
+                              AND timestamp >= (SELECT day_start FROM session_start)
+                              AND timestamp <= %s
+                        ),
+                        proxy_volume AS (
+                            SELECT timestamp, (up_volume + down_volume) AS volume
+                            FROM underlying_quotes
+                            WHERE symbol = %s
+                              AND timestamp >= (SELECT day_start FROM session_start)
+                              AND timestamp <= %s
+                        ),
+                        joined AS (
+                            SELECT iq.timestamp, iq.price, COALESCE(pv.volume, 0) AS volume
+                            FROM index_quotes iq
+                            LEFT JOIN proxy_volume pv ON pv.timestamp = iq.timestamp
+                        ),
+                        cumulative AS (
+                            SELECT timestamp,
+                                   price,
+                                   SUM(price * volume) OVER (
+                                       ORDER BY timestamp
+                                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                                   ) AS cum_pv,
+                                   SUM(volume) OVER (
+                                       ORDER BY timestamp
+                                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                                   ) AS cum_vol
+                            FROM joined
+                        )
+                        SELECT (cum_pv / NULLIF(cum_vol, 0))::double precision AS vwap,
+                               CASE
+                                   WHEN NULLIF(cum_vol, 0) IS NULL THEN NULL
+                                   ELSE ((price - (cum_pv / NULLIF(cum_vol, 0)))
+                                         / NULLIF((cum_pv / NULLIF(cum_vol, 0)), 0)) * 100
+                               END AS vwap_deviation_pct
+                        FROM cumulative
+                        ORDER BY timestamp DESC
+                        LIMIT 1
+                        """,
+                        (ts, self.db_symbol, ts, vwap_proxy, ts),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT vwap, vwap_deviation_pct
+                        FROM underlying_vwap_deviation
+                        WHERE symbol = %s
+                          AND timestamp <= %s
+                        ORDER BY timestamp DESC
+                        LIMIT 1
+                        """,
+                        (self.db_symbol, ts),
+                    )
                 vwap_row = cur.fetchone()
                 vwap = float(vwap_row[0]) if vwap_row and vwap_row[0] is not None else None
                 vwap_deviation_pct = (
