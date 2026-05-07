@@ -265,6 +265,7 @@ class UnifiedSignalEngine:
                 gex_strike_rows: list[dict] = []
                 gex_strike_by_bucket: dict[str, list[dict]] = {}
                 call_wall: Optional[float] = None
+                put_wall: Optional[float] = None
                 max_gamma_strike: Optional[float] = None
                 try:
                     # Single query at (strike, bucket) granularity.  We build
@@ -365,6 +366,14 @@ class UnifiedSignalEngine:
                             call_wall = max(
                                 above_spot,
                                 key=lambda r: (r["call_oi"], -r["strike"]),
+                            )["strike"]
+                        below_spot = [r for r in gex_strike_rows if r["strike"] <= close_f]
+                        if below_spot:
+                            # put_wall = highest put_oi strike <= spot, ties broken by
+                            # nearest-to-spot (highest strike below spot).
+                            put_wall = max(
+                                below_spot,
+                                key=lambda r: (r["put_oi"], r["strike"]),
                             )["strike"]
                         max_gamma_row = max(
                             gex_strike_rows,
@@ -653,10 +662,13 @@ class UnifiedSignalEngine:
                 except Exception:
                     vix_level = None
 
-                # Historical call_wall strike (~30min ago) so trap_detection
-                # can detect "wall migration" — the single strongest predictor
-                # of a genuine breakout vs. a failed pop.
+                # Historical call_wall / put_wall strikes (~30min ago) so
+                # trap_detection can detect "wall migration" — the single
+                # strongest predictor of a genuine breakout vs. a failed pop.
+                # Bear traps key off call wall migration; bull traps key off
+                # put wall migration.
                 prior_call_wall: Optional[float] = None
+                prior_put_wall: Optional[float] = None
                 try:
                     cur.execute(
                         """
@@ -669,22 +681,41 @@ class UnifiedSignalEngine:
                             ORDER BY timestamp DESC
                             LIMIT 1
                         )
-                        SELECT strike
-                        FROM gex_by_strike g, window_max w
-                        WHERE g.underlying = %s
-                          AND g.timestamp = w.timestamp
-                          AND g.strike >= %s
-                        ORDER BY g.call_oi DESC NULLS LAST, g.strike ASC
-                        LIMIT 1
+                        SELECT
+                            (
+                                SELECT g.strike
+                                FROM gex_by_strike g, window_max w
+                                WHERE g.underlying = %s
+                                  AND g.timestamp = w.timestamp
+                                  AND g.strike >= %s
+                                ORDER BY g.call_oi DESC NULLS LAST, g.strike ASC
+                                LIMIT 1
+                            ) AS call_wall_strike,
+                            (
+                                SELECT g.strike
+                                FROM gex_by_strike g, window_max w
+                                WHERE g.underlying = %s
+                                  AND g.timestamp = w.timestamp
+                                  AND g.strike <= %s
+                                ORDER BY g.put_oi DESC NULLS LAST, g.strike DESC
+                                LIMIT 1
+                            ) AS put_wall_strike
                         """,
-                        (self.db_symbol, ts, ts, self.db_symbol, close_f),
+                        (
+                            self.db_symbol, ts, ts,
+                            self.db_symbol, close_f,
+                            self.db_symbol, close_f,
+                        ),
                     )
                     wrow = cur.fetchone()
-                    if wrow and wrow[0] is not None:
-                        prior_call_wall = float(wrow[0])
+                    if wrow:
+                        if wrow[0] is not None:
+                            prior_call_wall = float(wrow[0])
+                        if wrow[1] is not None:
+                            prior_put_wall = float(wrow[1])
                 except Exception as exc:
                     logger.debug(
-                        "UnifiedSignalEngine [%s]: prior call_wall fetch failed: %s",
+                        "UnifiedSignalEngine [%s]: prior wall fetch failed: %s",
                         self.db_symbol,
                         exc,
                     )
@@ -845,6 +876,8 @@ class UnifiedSignalEngine:
                     "vwap_deviation_pct": vwap_deviation_pct,
                     "call_wall": call_wall,
                     "prior_call_wall": prior_call_wall,
+                    "put_wall": put_wall,
+                    "prior_put_wall": prior_put_wall,
                     "max_gamma_strike": max_gamma_strike,
                     "gex_by_strike": gex_strike_rows,
                     "gex_by_strike_bucket": gex_strike_by_bucket,
@@ -878,6 +911,8 @@ class UnifiedSignalEngine:
             extra={
                 "call_wall": ctx.get("call_wall"),
                 "prior_call_wall": ctx.get("prior_call_wall"),
+                "put_wall": ctx.get("put_wall"),
+                "prior_put_wall": ctx.get("prior_put_wall"),
                 "max_gamma_strike": ctx.get("max_gamma_strike"),
                 "gex_by_strike": ctx.get("gex_by_strike") or [],
                 "gex_by_strike_bucket": ctx.get("gex_by_strike_bucket") or {},

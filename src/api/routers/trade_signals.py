@@ -633,7 +633,8 @@ async def get_trap_detection_signal(
     **Logic highlights** (`src/signals/advanced/trap_detection.py`):
     - `breakout_buffer_pct = min(0.1%, 0.15 × realized_sigma × √5)` — vol-scaled noise floor.
     - Upside-fail (bear fade): `close > resistance + buffer` AND `net_gex > 0`
-      AND gamma strengthening AND wall NOT migrating up.
+      AND gamma strengthening AND call wall NOT migrating up.
+    - Downside-fail (bull fade): mirror, with put wall NOT migrating down.
     - Score = `0.4 + 0.4 × distance_strength + 0.2 × gex_boost`, then flow multiplier.
     - **Triggered when `|score| ≥ 25` (clamped 0.25).**
 
@@ -651,8 +652,10 @@ async def get_trap_detection_signal(
       "broken_resistance_level": 680.0,
       "broken_support_level": null,
       "breakout_buffer_pct": 0.0008,
-      "wall_migrated_up": false, "wall_migrated_down": false,
-      "context_values": {"...close, realized_sigma, long_gamma, gamma_strengthening, call_wall, prior_call_wall, call_flow_decelerating, put_flow_decelerating..."},
+      "call_wall": 680.0, "prior_call_wall": 680.0,
+      "put_wall": 670.0, "prior_put_wall": 670.0,
+      "call_wall_migrated_up": false, "put_wall_migrated_down": false,
+      "context_values": {"...close, realized_sigma, long_gamma, gamma_strengthening, call_flow_decelerating, put_flow_decelerating..."},
       "score_history": [{"score": -35.0, "timestamp": "..."}, "...up to 90"]
     }
     ```
@@ -661,15 +664,20 @@ async def get_trap_detection_signal(
     - `signal` — `"bullish_fade"` | `"bearish_fade"` | `"none"`.
     - `triggered` — `true` when `|score| ≥ 25`.
     - `breakout_up` / `breakout_down` — whether price has crossed the buffer.
-    - `wall_migrated_up` / `wall_migrated_down` — invalidates the setup when `true`.
+    - `call_wall` / `prior_call_wall` — current and ~30min-ago resistance level.
+    - `put_wall` / `prior_put_wall` — current and ~30min-ago support level.
+    - `call_wall_migrated_up` — invalidates a bear fade when `true`.
+    - `put_wall_migrated_down` — invalidates a bull fade when `true`.
 
     **Trader interpretation:**
     - `signal == "bearish_fade"` + `breakout_up == true` → price poked above the
       `broken_resistance_level` (now sitting *below* close) but dealers are long
       gamma and the call wall hasn't migrated; short-call-spread / put-debit.
     - `signal == "bullish_fade"` → mirror play; price slipped beneath
-      `broken_support_level` (now sitting *above* close) and is set up for a reclaim.
-    - `wall_migrated_up == true` → setup invalidated; dealers repositioning with price.
+      `broken_support_level` (now sitting *above* close), put wall hasn't
+      migrated, and is set up for a reclaim.
+    - `call_wall_migrated_up == true` (bear fade) or `put_wall_migrated_down == true`
+      (bull fade) → setup invalidated; dealers repositioning with price.
 
     **Note on field naming.** `broken_resistance_level` and `broken_support_level`
     refer to the level *price has just breached* — so on an upside breakout the
@@ -678,8 +686,8 @@ async def get_trap_detection_signal(
     off the recently-breached level, not the next unbroken one above/below.
 
     **Page design.** Price ladder showing broken_support / close / broken_resistance
-    with breakout-buffer bands. Red/green "TRAP" badge when triggered. Two chips:
-    `gamma_strengthening` and `wall_migrated_*`.
+    with breakout-buffer bands. Red/green "TRAP" badge when triggered. Chips for
+    `gamma_strengthening`, `call_wall_migrated_up`, `put_wall_migrated_down`.
     """
     row = await db.get_advanced_signal(symbol.upper(), "trap_detection")
     if not row:
@@ -697,8 +705,12 @@ async def get_trap_detection_signal(
     row["broken_resistance_level"] = ctx.get("broken_resistance_level")
     row["broken_support_level"] = ctx.get("broken_support_level")
     row["breakout_buffer_pct"] = ctx.get("breakout_buffer_pct")
-    row["wall_migrated_up"] = ctx.get("wall_migrated_up")
-    row["wall_migrated_down"] = ctx.get("wall_migrated_down")
+    row["call_wall"] = ctx.get("call_wall")
+    row["prior_call_wall"] = ctx.get("prior_call_wall")
+    row["put_wall"] = ctx.get("put_wall")
+    row["prior_put_wall"] = ctx.get("prior_put_wall")
+    row["call_wall_migrated_up"] = ctx.get("call_wall_migrated_up")
+    row["put_wall_migrated_down"] = ctx.get("put_wall_migrated_down")
     return row
 
 

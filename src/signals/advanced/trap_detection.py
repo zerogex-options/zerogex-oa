@@ -21,12 +21,14 @@ class TrapDetectionSignal:
         extra = ctx.extra or {}
         call_wall = extra.get("call_wall")
         prior_call_wall = extra.get("prior_call_wall")
+        put_wall = extra.get("put_wall")
+        prior_put_wall = extra.get("prior_put_wall")
         max_gamma = extra.get("max_gamma_strike")
         vwap = ctx.vwap
         flip = ctx.gamma_flip
 
         up_levels = [call_wall, max_gamma, vwap, flip]
-        dn_levels = [max_gamma, vwap, flip]
+        dn_levels = [put_wall, max_gamma, vwap, flip]
         # These are the *broken* levels — the resistance that price has just
         # poked above (now sits below close) and the support that price has
         # just slipped beneath (now sits above close). Naming reflects the
@@ -49,15 +51,20 @@ class TrapDetectionSignal:
         net_gex_delta_pct = float(extra.get("net_gex_delta_pct") or 0.0)
         gamma_strengthening = net_gex_delta_pct > 0.005
 
-        wall_migrated_up = (
+        # Bear-trap (upside fade) is invalidated when the call wall migrates
+        # higher — the resistance moved out of the way, signalling a real
+        # breakout.  Mirror logic for the bull-trap (downside fade) keys off
+        # the put wall: if it migrates lower, the support moved out of the
+        # way and the breakdown is real.
+        call_wall_migrated_up = (
             prior_call_wall is not None
             and call_wall is not None
             and call_wall > prior_call_wall * 1.0005
         )
-        wall_migrated_down = (
-            prior_call_wall is not None
-            and call_wall is not None
-            and call_wall < prior_call_wall * 0.9995
+        put_wall_migrated_down = (
+            prior_put_wall is not None
+            and put_wall is not None
+            and put_wall < prior_put_wall * 0.9995
         )
 
         call_flow_delta = float(extra.get("call_flow_delta") or 0.0)
@@ -76,8 +83,8 @@ class TrapDetectionSignal:
         downside_breakout_strength = self._breakout_strength(
             broken_support, ctx.close, buffer_pct
         ) if broken_support is not None else 0.0
-        wall_up_factor = 0.3 if wall_migrated_up else 1.0
-        wall_dn_factor = 0.3 if wall_migrated_down else 1.0
+        wall_up_factor = 0.3 if call_wall_migrated_up else 1.0
+        wall_dn_factor = 0.3 if put_wall_migrated_down else 1.0
 
         upside_strength = (
             upside_breakout_strength * long_gamma_factor * strengthening_factor * wall_up_factor
@@ -135,8 +142,10 @@ class TrapDetectionSignal:
                 "gamma_strengthening": gamma_strengthening,
                 "call_wall": call_wall,
                 "prior_call_wall": prior_call_wall,
-                "wall_migrated_up": wall_migrated_up,
-                "wall_migrated_down": wall_migrated_down,
+                "put_wall": put_wall,
+                "prior_put_wall": prior_put_wall,
+                "call_wall_migrated_up": call_wall_migrated_up,
+                "put_wall_migrated_down": put_wall_migrated_down,
                 "call_flow_decelerating": call_decelerating,
                 "put_flow_decelerating": put_decelerating,
             },

@@ -87,6 +87,63 @@ def test_trap_detection_neutral_without_strengthening_gamma():
     assert trap.context["triggered"] is False
 
 
+def test_trap_detection_bullish_fade_on_downside_breakdown():
+    engine = AdvancedSignalEngine()
+    ctx = _ctx(
+        close=594.0,
+        net_gex=300_000_000.0,
+        gamma_flip=598.0,
+        vwap=599.0,
+        extra={
+            "net_gex_delta": 700_000_000.0,
+            "net_gex_delta_pct": 0.02,
+            "put_wall": 597.0,
+            "prior_put_wall": 597.0,  # put wall did not migrate down
+            "max_gamma_strike": 598.0,
+        },
+    )
+    results = {r.name: r for r in engine.evaluate(ctx)}
+    trap = results["trap_detection"]
+    assert trap.score > 0
+    assert trap.context["signal"] == "bullish_fade"
+    assert trap.context["put_wall"] == 597.0
+    assert trap.context["put_wall_migrated_down"] is False
+
+
+def test_trap_detection_bullish_fade_invalidated_when_put_wall_migrates_down():
+    engine = AdvancedSignalEngine()
+    base = dict(
+        close=594.0,
+        net_gex=300_000_000.0,
+        gamma_flip=598.0,
+        vwap=599.0,
+    )
+    held = _ctx(
+        **base,
+        extra={
+            "net_gex_delta": 700_000_000.0,
+            "net_gex_delta_pct": 0.02,
+            "put_wall": 597.0,
+            "prior_put_wall": 597.0,
+            "max_gamma_strike": 598.0,
+        },
+    )
+    migrated = _ctx(
+        **base,
+        extra={
+            "net_gex_delta": 700_000_000.0,
+            "net_gex_delta_pct": 0.02,
+            "put_wall": 593.0,  # support shifted down by ~0.7%
+            "prior_put_wall": 597.0,
+            "max_gamma_strike": 598.0,
+        },
+    )
+    held_trap = {r.name: r for r in engine.evaluate(held)}["trap_detection"]
+    migrated_trap = {r.name: r for r in engine.evaluate(migrated)}["trap_detection"]
+    assert migrated_trap.context["put_wall_migrated_down"] is True
+    assert migrated_trap.score < held_trap.score
+
+
 def test_zero_dte_position_imbalance_call_heavy():
     engine = AdvancedSignalEngine()
     ctx = _ctx(
