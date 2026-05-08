@@ -27,13 +27,19 @@ def _reload_filter(monkeypatch, **env):
 
 @pytest.fixture
 def filter_module(monkeypatch):
-    """Default filter with all gates enabled and no events on the calendar."""
+    """Default filter with all gates enabled and no events on the calendar.
+
+    ``SIGNALS_LUNCH_BYPASS_SOURCES`` is cleared so the lunch-conviction
+    override remains the gate under test; carve-out behavior is covered
+    in dedicated tests below.
+    """
     return _reload_filter(
         monkeypatch,
         SIGNALS_TIME_FILTER_ENABLED="true",
         SIGNALS_LUNCH_START_ET="11:30",
         SIGNALS_LUNCH_END_ET="13:30",
         SIGNALS_LUNCH_MSI_OVERRIDE="0.75",
+        SIGNALS_LUNCH_BYPASS_SOURCES="",
         SIGNALS_LATE_CLOSE_LOCKDOWN_MINUTES="10",
         SIGNALS_EVENT_BUFFER_MINUTES="15",
         SIGNALS_EVENT_CALENDAR="",
@@ -69,6 +75,73 @@ class TestLunchChop:
             signal_source="advanced:squeeze_setup",
         )
         assert d.skip is False
+
+
+class TestLunchBypassSources:
+    """When ``SIGNALS_LUNCH_BYPASS_SOURCES`` matches the entry source the
+    lunch chop conviction override is skipped — the advanced signal /
+    Action Card already vetted the setup-specific filters."""
+
+    def test_advanced_source_bypasses_lunch_override(self, monkeypatch):
+        rf = _reload_filter(
+            monkeypatch,
+            SIGNALS_TIME_FILTER_ENABLED="true",
+            SIGNALS_LUNCH_START_ET="11:30",
+            SIGNALS_LUNCH_END_ET="13:30",
+            SIGNALS_LUNCH_MSI_OVERRIDE="0.75",
+            SIGNALS_LUNCH_BYPASS_SOURCES="advanced:,card:",
+        )
+        # Conviction well below the 0.75 override would normally block.
+        d = rf.evaluate(
+            timestamp=_at(12, 15),
+            msi_conviction=0.40,
+            signal_source="advanced:trap_detection",
+        )
+        assert d.skip is False
+
+    def test_card_source_bypasses_lunch_override(self, monkeypatch):
+        rf = _reload_filter(
+            monkeypatch,
+            SIGNALS_TIME_FILTER_ENABLED="true",
+            SIGNALS_LUNCH_BYPASS_SOURCES="advanced:,card:",
+        )
+        d = rf.evaluate(
+            timestamp=_at(12, 15),
+            msi_conviction=0.20,
+            signal_source="card:gamma_flip_break",
+        )
+        assert d.skip is False
+
+    def test_composite_source_still_subject_to_override(self, monkeypatch):
+        rf = _reload_filter(
+            monkeypatch,
+            SIGNALS_TIME_FILTER_ENABLED="true",
+            SIGNALS_LUNCH_MSI_OVERRIDE="0.75",
+            SIGNALS_LUNCH_BYPASS_SOURCES="advanced:,card:",
+        )
+        # Plain MSI-driven entries do not match the carve-out and still
+        # have to clear the conviction override during lunch.
+        d = rf.evaluate(
+            timestamp=_at(12, 15),
+            msi_conviction=0.50,
+            signal_source="composite",
+        )
+        assert d.skip is True
+        assert "Lunch chop" in d.reason
+
+    def test_empty_bypass_list_disables_carve_out(self, monkeypatch):
+        rf = _reload_filter(
+            monkeypatch,
+            SIGNALS_TIME_FILTER_ENABLED="true",
+            SIGNALS_LUNCH_MSI_OVERRIDE="0.75",
+            SIGNALS_LUNCH_BYPASS_SOURCES="",
+        )
+        d = rf.evaluate(
+            timestamp=_at(12, 15),
+            msi_conviction=0.40,
+            signal_source="advanced:trap_detection",
+        )
+        assert d.skip is True
 
 
 class TestLateCloseLockdown:

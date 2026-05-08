@@ -1196,7 +1196,7 @@ class UnifiedSignalEngine:
             playbook_card.to_dict()
             if (
                 playbook_card is not None
-                and os.getenv("PLAYBOOK_CARD_DRIVEN_ENTRIES", "").lower() == "true"
+                and os.getenv("PLAYBOOK_CARD_DRIVEN_ENTRIES", "true").lower() == "true"
             )
             else None
         )

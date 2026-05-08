@@ -311,11 +311,11 @@ SIGNALS_MAX_PORTFOLIO_HEAT_PCT = float(os.getenv("SIGNALS_MAX_PORTFOLIO_HEAT_PCT
 SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES = int(
     os.getenv("SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES", "30")
 )
-SIGNALS_TRIGGER_THRESHOLD = _getenv_float("SIGNALS_TRIGGER_THRESHOLD", 0.60, min=0.0, max=1.0)
+SIGNALS_TRIGGER_THRESHOLD = _getenv_float("SIGNALS_TRIGGER_THRESHOLD", 0.50, min=0.0, max=1.0)
 # Asymmetric exit: once a position is open in a direction, conviction must
 # decay below this floor (lower than the entry trigger) before we close.
 # Entry-vs-exit hysteresis cuts whipsaws when MSI oscillates around the trigger.
-SIGNALS_EXIT_THRESHOLD = _getenv_float("SIGNALS_EXIT_THRESHOLD", 0.45, min=0.0, max=1.0)
+SIGNALS_EXIT_THRESHOLD = _getenv_float("SIGNALS_EXIT_THRESHOLD", 0.40, min=0.0, max=1.0)
 # Combined gate: kelly_fraction × conviction must clear this floor or the
 # trade is rejected before sizing. Kills "fire on technically-positive but
 # microscopic edge" cases that produce 50/50 scalps.
@@ -394,10 +394,27 @@ SIGNALS_KELLY_FRACTION = _getenv_float("SIGNALS_KELLY_FRACTION", 0.50, min=0.0, 
 SIGNALS_TIME_FILTER_ENABLED = _getenv_bool("SIGNALS_TIME_FILTER_ENABLED", True)
 SIGNALS_LUNCH_START_ET = os.getenv("SIGNALS_LUNCH_START_ET", "11:30").strip()
 SIGNALS_LUNCH_END_ET = os.getenv("SIGNALS_LUNCH_END_ET", "13:30").strip()
-# Conviction (normalized MSI 0..1) required to trade *through* the lunch
-# chop window.  A genuine trend-day breakout can clear this; routine chop
-# can't.  Set to 1.0 to make the lunch block hard.
-SIGNALS_LUNCH_MSI_OVERRIDE = _getenv_float("SIGNALS_LUNCH_MSI_OVERRIDE", 0.75, min=0.0, max=1.0)
+# Conviction (direction-aware MSI 0..1) required to trade *through* the
+# lunch chop window.  A genuine reversal or trend-day breakout can clear
+# this; routine chop can't.  Lowered from 0.75 so the conviction at the
+# kink of an intraday reversal — typically 0.55-0.70 — can still fire
+# instead of being held off until the lunch window closes.  Set to 1.0
+# to make the lunch block hard.
+SIGNALS_LUNCH_MSI_OVERRIDE = _getenv_float("SIGNALS_LUNCH_MSI_OVERRIDE", 0.60, min=0.0, max=1.0)
+# Comma-separated signal_source prefixes that bypass the lunch chop
+# block entirely.  Advanced signals and Playbook Action Cards each run
+# their own setup-specific filters before reaching the regime gate, so
+# the time-of-day chop suppressor would otherwise double-gate already
+# vetted entries.  Empty string disables the carve-out and reverts to
+# the conviction-only override.
+SIGNALS_LUNCH_BYPASS_SOURCES = [
+    item.strip().lower()
+    for item in os.getenv(
+        "SIGNALS_LUNCH_BYPASS_SOURCES",
+        "advanced:,card:",
+    ).split(",")
+    if item.strip()
+]
 # Last-N-minutes before close: only eod_pressure-sourced entries are allowed
 # (close-pinning + dealer-flow plays). 0 disables.  The previous 10-minute
 # default left 15:50-16:00 covered but 15:30-15:50 wide open for noise-driven
@@ -423,7 +440,12 @@ SIGNALS_EVENT_CALENDAR = [
 # are: another advanced signal triggered, a basic signal score above the
 # basic-confirmation cutoff, or the MSI conviction above the MSI-confirmation
 # cutoff.
-SIGNALS_ADVANCED_REQUIRE_CONFIRMATION = _getenv_bool("SIGNALS_ADVANCED_REQUIRE_CONFIRMATION", True)
+# Default loosened so a single strong advanced trigger can fire on its
+# own.  At the kink of an intraday reversal a second confirming source
+# rarely arrives in the same minute, and the prior True default
+# systematically suppressed the trades the user most wants to catch.
+# Set back to True to restore the conservative two-source policy.
+SIGNALS_ADVANCED_REQUIRE_CONFIRMATION = _getenv_bool("SIGNALS_ADVANCED_REQUIRE_CONFIRMATION", False)
 SIGNALS_ADVANCED_MIN_BASIC_CONFIRM = _getenv_float(
     "SIGNALS_ADVANCED_MIN_BASIC_CONFIRM", 0.30, min=0.0, max=1.0
 )
@@ -459,6 +481,17 @@ SIGNALS_NO_0DTE_AFTERNOON_MINUTES = _getenv_int(
 # engine stays in cash regardless of signal_driven flags.
 SIGNALS_CHOP_DIRECTIONAL_MIN_CONVICTION = _getenv_float(
     "SIGNALS_CHOP_DIRECTIONAL_MIN_CONVICTION", 0.30, min=0.0, max=1.0
+)
+# When chop-regime conviction (direction-aware MSI) clears this floor,
+# the scalp-tier size cap lifts from the conservative 0.6× to
+# ``SIGNALS_CHOP_HIGH_CONVICTION_SIZE``.  This keeps routine chop trades
+# small while letting a genuine reversal entry that happens to land in
+# chop_range (low MSI + clear directional close path) size up.
+SIGNALS_CHOP_HIGH_CONVICTION_THRESHOLD = _getenv_float(
+    "SIGNALS_CHOP_HIGH_CONVICTION_THRESHOLD", 0.55, min=0.0, max=1.0
+)
+SIGNALS_CHOP_HIGH_CONVICTION_SIZE = _getenv_float(
+    "SIGNALS_CHOP_HIGH_CONVICTION_SIZE", 0.85, min=0.0, max=1.0
 )
 
 # -----------------------------------------------------------------------------

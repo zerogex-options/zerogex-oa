@@ -21,6 +21,7 @@ from src.config import (
     SIGNALS_EVENT_BUFFER_MINUTES,
     SIGNALS_EVENT_CALENDAR,
     SIGNALS_LATE_CLOSE_LOCKDOWN_MINUTES,
+    SIGNALS_LUNCH_BYPASS_SOURCES,
     SIGNALS_LUNCH_END_ET,
     SIGNALS_LUNCH_MSI_OVERRIDE,
     SIGNALS_LUNCH_START_ET,
@@ -147,6 +148,16 @@ def evaluate(
         )
 
     if _within_lunch_window(ts_et):
+        # Source-based carve-out: advanced signals and Playbook Action
+        # Cards each run setup-specific filters before reaching the
+        # regime gate (e.g. trap_detection requires structural break +
+        # decelerating flow), so the time-of-day chop suppressor would
+        # double-gate.  When the entry source matches any configured
+        # prefix, bypass the lunch override entirely.
+        source_lower = (signal_source or "").lower()
+        for prefix in SIGNALS_LUNCH_BYPASS_SOURCES:
+            if source_lower.startswith(prefix):
+                return FilterDecision(skip=False)
         # Override allows truly strong conviction (e.g., trend-day breakout)
         # to trade through the chop window.
         threshold = float(SIGNALS_LUNCH_MSI_OVERRIDE)

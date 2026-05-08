@@ -30,6 +30,8 @@ from src.config import (
     SIGNALS_BREAKOUT_SIZE_MULTIPLIER,
     SIGNALS_BREAKOUT_TARGET_PCT,
     SIGNALS_CHOP_DIRECTIONAL_MIN_CONVICTION,
+    SIGNALS_CHOP_HIGH_CONVICTION_SIZE,
+    SIGNALS_CHOP_HIGH_CONVICTION_THRESHOLD,
     SIGNALS_DAILY_LOSS_KILL_ENABLED,
     SIGNALS_DAILY_LOSS_KILL_PCT,
     SIGNALS_DRAWDOWN_AWARE_SIZING_ENABLED,
@@ -156,6 +158,8 @@ class PortfolioEngine:
         self.drs_override_threshold = SIGNALS_DRS_OVERRIDE_THRESHOLD
         self.drs_fresh_cross_boost = SIGNALS_DRS_FRESH_CROSS_BOOST
         self.scalp_size_multiplier = SIGNALS_SCALP_SIZE_MULTIPLIER
+        self.chop_high_conviction_threshold = SIGNALS_CHOP_HIGH_CONVICTION_THRESHOLD
+        self.chop_high_conviction_size = SIGNALS_CHOP_HIGH_CONVICTION_SIZE
         self.entry_threshold = SIGNALS_TRIGGER_THRESHOLD
         self.exit_threshold = SIGNALS_EXIT_THRESHOLD
         self.conviction_floor = SIGNALS_CONVICTION_FLOOR
@@ -300,7 +304,19 @@ class PortfolioEngine:
         regime = self._resolve_regime(score)
         trade_direction = self._resolve_trade_direction(score, market_ctx, regime)
         # score.normalized_score stores MSI/100 in the new scoring engine.
-        conviction = float(score.normalized_score or 0.0)
+        # MSI is bidirectional around 0.5 (low MSI = bearish-leaning, high =
+        # bullish-leaning), so a strong bearish read shows up as a *low*
+        # normalized_score.  Without the directional mirror below, bearish
+        # trades would have to clear the entry threshold from the wrong end of
+        # the scale, which is why bearish reversal entries kept getting
+        # blocked.  Synthesized scores from the advanced/card/confluence path
+        # already encode magnitude as a positive 0..1 value (see
+        # ``_build_signal_snapshot_for_advanced`` /
+        # ``_synthesize_score_from_action_card``); use that as conviction
+        # directly without mirroring.  The conviction threshold itself is
+        # applied uniformly for both pure-MSI and synthesized scores below —
+        # PR-15b's no-bypass invariant is preserved.
+        conviction = self._directional_conviction(score, trade_direction)
 
         # Hard wait regime.
         if regime == "high_risk_reversal":
@@ -379,7 +395,17 @@ class PortfolioEngine:
             size_multiplier = 0.75
         else:  # chop_range
             tier_label = "scalp"
-            size_multiplier = min(self.scalp_size_multiplier, 0.6)
+            # Chop-tier hard-caps size at 0.6× by default to keep range-bound
+            # entries small.  But after the directional-conviction fix a
+            # genuine bear-reversal in chop_range (low MSI, falling closes)
+            # produces conviction ≥ 0.55; capping those at 0.6× gives up
+            # the size on exactly the entries we most want to catch.  Lift
+            # the cap to ``self.chop_high_conviction_size`` once conviction
+            # clears ``self.chop_high_conviction_threshold``.
+            cap = float(self.scalp_size_multiplier)
+            if conviction >= self.chop_high_conviction_threshold:
+                cap = max(cap, self.chop_high_conviction_size)
+            size_multiplier = min(cap, 1.0)
         is_scalp = tier_label == "scalp"
 
         # --- CASE 2: trend confirmation ---
@@ -624,7 +650,7 @@ class PortfolioEngine:
         if is_fresh_entry:
             decision = regime_filter.evaluate(
                 timestamp=score.timestamp,
-                msi_conviction=float(score.normalized_score or 0.0),
+                msi_conviction=self._directional_conviction(score, entry_target.direction),
                 signal_source=entry_target.source,
             )
             if decision.skip:
@@ -816,9 +842,12 @@ class PortfolioEngine:
             break
 
         # MSI trend agrees and conviction clears the MSI cutoff.
+        # Conviction here must be direction-aware: a strong bearish MSI
+        # (low normalized_score) used to fail the cutoff even when its
+        # trend direction agreed with a bearish primary signal.
         msi_cutoff = float(SIGNALS_ADVANCED_MIN_MSI_CONFIRM)
-        msi_conviction = float(score.normalized_score or 0.0)
         msi_direction = cls._msi_trend_direction(market_ctx)
+        msi_conviction = cls._directional_conviction(score, msi_direction)
         if msi_conviction >= msi_cutoff and msi_direction == primary_direction:
             confirmations.append(f"msi:{msi_conviction:.2f}")
 
@@ -1083,6 +1112,36 @@ class PortfolioEngine:
                 flip_not_near = True
 
         return bool(far_from_max and flip_not_near)
+
+    @staticmethod
+    def _directional_conviction(score: ScoreSnapshot, trade_direction: str) -> float:
+        """Conviction in [0, 1] for the resolved trade direction.
+
+        Pure-MSI scores encode bullish/bearish symmetrically around 0.5
+        (low MSI = bearish-leaning, high = bullish-leaning).  Reading
+        ``normalized_score`` directly as conviction worked for bullish
+        trades but inverted the meaning for bearish ones — a strong bear
+        regime (e.g. MSI 0.25) produced conviction 0.25, far below any
+        entry threshold, so bearish reversal entries were systematically
+        blocked.  This helper mirrors the score for bearish directions so
+        a strong bear MSI produces high conviction.
+
+        Synthesized scores from the advanced / card / confluence
+        synthesizers already store ``normalized_score`` as a magnitude
+        (always 0..1, direction encoded separately); they pass through
+        unmirrored.  The conviction *threshold* applies uniformly in
+        ``compute_target`` regardless of which branch was taken — there
+        is no bypass.
+        """
+        n = float(score.normalized_score or 0.0)
+        n = max(0.0, min(1.0, n))
+        signal_aggregation = score.aggregation if isinstance(score.aggregation, dict) else {}
+        synth_keys = ("advanced_trigger", "card_trigger", "confluence_trigger")
+        if any(signal_aggregation.get(k) for k in synth_keys):
+            return n
+        if trade_direction == "bearish":
+            return max(0.0, min(1.0, 1.0 - n))
+        return n
 
     @staticmethod
     def _msi_trend_direction(market_ctx: dict) -> str:

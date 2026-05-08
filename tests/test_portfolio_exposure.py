@@ -1263,7 +1263,19 @@ class TestSpreadPricing:
 class TestAdvancedConfirmationGate:
     """A single advanced trigger isn't enough — at least one independent
     confirmation (basic same-direction, MSI same-direction, or another
-    triggered advanced) is required before the entry path can size a trade."""
+    triggered advanced) is required before the entry path can size a trade.
+
+    The default for ``SIGNALS_ADVANCED_REQUIRE_CONFIRMATION`` was flipped
+    to False so reversal entries fire on a single trigger; these tests
+    pin the constant to True via the autouse fixture so the gate's
+    behavior when *enabled* is still covered.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _force_confirmation_required(self, monkeypatch):
+        from src.signals import portfolio_engine as pe
+
+        monkeypatch.setattr(pe, "SIGNALS_ADVANCED_REQUIRE_CONFIRMATION", True)
 
     @staticmethod
     def _adv(name: str, signal: str, score: float, triggered: bool = True):
@@ -1816,6 +1828,84 @@ class TestTrendDirectionThreshold:
         assert PortfolioEngine._msi_trend_direction({"recent_closes": closes}) == "bullish"
 
 
+class TestDirectionalConviction:
+    """``_directional_conviction`` mirrors normalized_score for bearish
+    trades so a strong bear MSI (low normalized_score) yields a high
+    conviction.  Synthesized scores from the advanced / card / confluence
+    path already encode magnitude positively and pass through unmirrored.
+    """
+
+    @staticmethod
+    def _msi(normalized: float) -> ScoreSnapshot:
+        return ScoreSnapshot(
+            timestamp=NOW,
+            underlying="SPY",
+            composite_score=normalized * 100.0,
+            normalized_score=normalized,
+            direction="controlled_trend",
+            components={},
+            aggregation={},
+        )
+
+    @staticmethod
+    def _synth(normalized: float, key: str) -> ScoreSnapshot:
+        return ScoreSnapshot(
+            timestamp=NOW,
+            underlying="SPY",
+            composite_score=normalized * 100.0,
+            normalized_score=normalized,
+            direction="controlled_trend",
+            components={},
+            aggregation={key: True},
+        )
+
+    def test_bullish_msi_is_unchanged(self):
+        score = self._msi(0.65)
+        assert PortfolioEngine._directional_conviction(score, "bullish") == pytest.approx(0.65)
+
+    def test_bearish_msi_is_mirrored(self):
+        # Strong bear regime: low MSI should produce high conviction.
+        score = self._msi(0.25)
+        assert PortfolioEngine._directional_conviction(score, "bearish") == pytest.approx(0.75)
+
+    def test_neutral_direction_falls_back_to_raw(self):
+        score = self._msi(0.40)
+        assert PortfolioEngine._directional_conviction(score, "neutral") == pytest.approx(0.40)
+
+    def test_advanced_synth_passes_through_unmirrored(self):
+        # Advanced synth stores |score| in normalized_score and encodes
+        # direction separately; mirroring would invert it for bearish.
+        score = self._synth(0.55, "advanced_trigger")
+        assert PortfolioEngine._directional_conviction(score, "bearish") == pytest.approx(0.55)
+        assert PortfolioEngine._directional_conviction(score, "bullish") == pytest.approx(0.55)
+
+    def test_card_synth_passes_through_unmirrored(self):
+        score = self._synth(0.72, "card_trigger")
+        assert PortfolioEngine._directional_conviction(score, "bearish") == pytest.approx(0.72)
+
+    def test_confluence_synth_passes_through_unmirrored(self):
+        score = self._synth(0.50, "confluence_trigger")
+        assert PortfolioEngine._directional_conviction(score, "bearish") == pytest.approx(0.50)
+
+    def test_clamps_outside_unit_interval(self):
+        score = self._msi(1.20)  # bogus high
+        assert PortfolioEngine._directional_conviction(score, "bullish") == pytest.approx(1.0)
+        assert PortfolioEngine._directional_conviction(score, "bearish") == pytest.approx(0.0)
+
+    def test_none_normalized_score_is_safe(self):
+        score = ScoreSnapshot(
+            timestamp=NOW,
+            underlying="SPY",
+            composite_score=0.0,
+            normalized_score=None,
+            direction="chop_range",
+            components={},
+            aggregation={},
+        )
+        assert PortfolioEngine._directional_conviction(score, "bullish") == 0.0
+        assert PortfolioEngine._directional_conviction(score, "bearish") == pytest.approx(1.0)
+
+
 class TestChopRangeConvictionGate:
     """Phase 4.4: directional debits in chop_range with weak conviction are
     blocked even when an advanced/confluence trigger fires."""
@@ -1868,6 +1958,126 @@ class TestChopRangeConvictionGate:
         # Optimizer returned None, so we still end in cash — but for a
         # different reason (no positive-EV structure), not the chop gate.
         assert "Chop regime conviction" not in out.rationale
+
+
+class TestChopHighConvictionSizeLift:
+    """When a chop-range entry has high directional conviction (e.g. an
+    advanced signal with magnitude >= 0.55), the scalp-tier size cap
+    lifts from the conservative 0.6× to ``SIGNALS_CHOP_HIGH_CONVICTION_SIZE``.
+    """
+
+    @staticmethod
+    def _candidate() -> SpreadCandidate:
+        return SpreadCandidate(
+            rank=1,
+            strategy_type="long_put",
+            expiry=date(2026, 4, 17),
+            dte=1,
+            strikes="Long 500P",
+            option_type="P",
+            entry_debit=200.0,
+            entry_credit=0.0,
+            width=0.0,
+            max_profit=200.0,
+            max_loss=200.0,
+            risk_reward_ratio=1.0,
+            probability_of_profit=0.55,
+            expected_value=20.0,
+            sharpe_like_ratio=0.08,
+            liquidity_score=0.8,
+            net_delta=-20.0,
+            net_gamma=1.0,
+            net_theta=-3.0,
+            premium_efficiency=1.0,
+            market_structure_fit=0.8,
+            greek_alignment_score=0.8,
+            edge_score=0.7,
+            kelly_fraction=0.10,
+            sizing_profiles=[
+                SizingProfile(
+                    profile="optimal",
+                    contracts=10,
+                    max_risk_dollars=2000.0,
+                    expected_value_dollars=200.0,
+                    constrained_by="kelly",
+                )
+            ],
+        )
+
+    @staticmethod
+    def _score(magnitude: float) -> ScoreSnapshot:
+        return ScoreSnapshot(
+            timestamp=NOW,
+            underlying="SPY",
+            composite_score=25.0,  # chop_range
+            normalized_score=magnitude,  # synthesized: magnitude, not MSI
+            direction="bearish",
+            components={},
+            aggregation={"advanced_trigger": "trap_detection"},
+        )
+
+    @staticmethod
+    def _market_ctx() -> dict:
+        return {
+            "close": 500.0,
+            "net_gex": 1.0e9,
+            "gamma_flip": 502.0,
+            "put_call_ratio": 1.0,
+            "max_pain": 500.0,
+            "smart_call": 0.0,
+            "smart_put": 0.0,
+            "recent_closes": [502.0, 501.0, 500.0, 499.0, 498.0],  # bearish trend
+            "iv_rank": 0.4,
+        }
+
+    def test_high_conviction_chop_lifts_size_cap(self):
+        engine = _make_engine()
+        candidate = self._candidate()
+        score = self._score(magnitude=0.65)  # >= 0.55 high-conviction threshold
+        with (
+            patch.object(
+                engine,
+                "_select_optimizer_candidate",
+                return_value={
+                    "candidate": candidate,
+                    "signal_timeframe": "intraday",
+                    "signal_strength": "high",
+                },
+            ),
+            patch.object(engine, "_resolve_option_symbol_for_leg", return_value="SPY 260417P500"),
+        ):
+            target = engine.compute_target(score, self._market_ctx(), conn=MagicMock())
+        assert target.target_positions
+        size_mult = target.target_positions[0].optimizer_payload["size_multiplier"]
+        # Pre-fix: capped at 0.6.  Post-fix: lifts to 0.85 default for
+        # high-conviction chop.
+        assert size_mult >= 0.85 - 1e-6
+
+    def test_low_conviction_chop_keeps_conservative_cap(self):
+        engine = _make_engine()
+        candidate = self._candidate()
+        # Conviction above the 0.50 entry threshold but below the 0.55
+        # high-conviction floor — cap should stay at the configured
+        # scalp_size_multiplier (default 0.40).
+        score = self._score(magnitude=0.52)
+        with (
+            patch.object(
+                engine,
+                "_select_optimizer_candidate",
+                return_value={
+                    "candidate": candidate,
+                    "signal_timeframe": "intraday",
+                    "signal_strength": "high",
+                },
+            ),
+            patch.object(engine, "_resolve_option_symbol_for_leg", return_value="SPY 260417P500"),
+        ):
+            target = engine.compute_target(score, self._market_ctx(), conn=MagicMock())
+        assert target.target_positions
+        size_mult = target.target_positions[0].optimizer_payload["size_multiplier"]
+        # Should be the scalp_size_multiplier default (0.40) — not the
+        # 0.85 high-conviction lift.
+        assert size_mult < 0.85
 
 
 class TestDailyLossKillSwitch:
