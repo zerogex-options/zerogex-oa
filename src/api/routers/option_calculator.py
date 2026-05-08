@@ -46,7 +46,8 @@ class OptionCalculatorScenario(BaseModel):
         ..., description="Intrinsic value of the whole position (per_contract × contracts × 100)."
     )
     pnl: float = Field(
-        ..., description="P&L assuming intrinsic value at expiration (intrinsic_position − total_cost)."
+        ...,
+        description="P&L assuming intrinsic value at expiration (intrinsic_position − total_cost).",
     )
 
 
@@ -62,7 +63,8 @@ class OptionCalculatorResponse(BaseModel):
     spot_price: float
     entry_price: float
     entry_price_source: str = Field(
-        ..., description="Which option-chain field was used as the entry price (mid/last/bid_ask_avg)."
+        ...,
+        description="Which option-chain field was used as the entry price (mid/last/bid_ask_avg).",
     )
     quote_timestamp: Optional[datetime] = None
     total_cost: float = Field(
@@ -143,15 +145,11 @@ async def option_calculator(
 ):
     """Project intrinsic-value P&L across a fan of underlying-price moves."""
     underlying_sym = underlying.upper()
-    rows = await db.get_option_contract_history(
-        underlying_sym, strike, expiration, option_type
-    )
+    rows = await db.get_option_contract_history(underlying_sym, strike, expiration, option_type)
     if not rows:
         raise HTTPException(
             status_code=404,
-            detail=(
-                f"No data found for {underlying_sym} {strike} {expiration} {option_type}"
-            ),
+            detail=(f"No data found for {underlying_sym} {strike} {expiration} {option_type}"),
         )
 
     # Latest minute bar wins — the contract history is already sorted ASC.
@@ -189,9 +187,7 @@ async def option_calculator(
 
     # Strike-relative formulation: matches the user's spec ("-5 / 730 => -0.68%").
     # Equivalent to ±entry_price / strike with the sign tracking option_type.
-    pct_move_to_breakeven = (
-        (breakeven_price - strike) / strike if strike > 0 else 0.0
-    )
+    pct_move_to_breakeven = (breakeven_price - strike) / strike if strike > 0 else 0.0
 
     scenarios: List[OptionCalculatorScenario] = []
     for i in range(1, steps + 1):

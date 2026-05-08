@@ -78,9 +78,7 @@ class GexGradientComponent(ComponentBase):
         # Replace the previous hard cutoff at _MIN_TOTAL_GAMMA with a soft
         # confidence ramp so thin-OI snapshots taper toward zero rather
         # than snapping to it.
-        magnitude_confidence = (
-            min(1.0, total / _MIN_TOTAL_GAMMA) if _MIN_TOTAL_GAMMA > 0 else 1.0
-        )
+        magnitude_confidence = min(1.0, total / _MIN_TOTAL_GAMMA) if _MIN_TOTAL_GAMMA > 0 else 1.0
 
         return max(-1.0, min(1.0, score * wing_confidence * magnitude_confidence))
 

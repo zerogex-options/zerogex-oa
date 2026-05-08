@@ -80,9 +80,11 @@ class TrapDetectionSignal:
         long_gamma_factor = max(0.0, min(1.0, ctx.net_gex / 1.0e9)) if ctx.net_gex > 0 else 0.0
         strengthening_factor = max(0.0, min(1.0, net_gex_delta_pct / 0.02))
         upside_breakout_strength = self._breakout_strength(ctx.close, broken_resistance, buffer_pct)
-        downside_breakout_strength = self._breakout_strength(
-            broken_support, ctx.close, buffer_pct
-        ) if broken_support is not None else 0.0
+        downside_breakout_strength = (
+            self._breakout_strength(broken_support, ctx.close, buffer_pct)
+            if broken_support is not None
+            else 0.0
+        )
         wall_up_factor = 0.3 if call_wall_migrated_up else 1.0
         wall_dn_factor = 0.3 if put_wall_migrated_down else 1.0
 

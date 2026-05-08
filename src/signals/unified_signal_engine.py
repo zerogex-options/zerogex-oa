@@ -702,9 +702,13 @@ class UnifiedSignalEngine:
                             ) AS put_wall_strike
                         """,
                         (
-                            self.db_symbol, ts, ts,
-                            self.db_symbol, close_f,
-                            self.db_symbol, close_f,
+                            self.db_symbol,
+                            ts,
+                            ts,
+                            self.db_symbol,
+                            close_f,
+                            self.db_symbol,
+                            close_f,
                         ),
                     )
                     wrow = cur.fetchone()

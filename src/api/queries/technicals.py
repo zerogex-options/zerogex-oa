@@ -40,9 +40,7 @@ class TechnicalsQueriesMixin:
         window_units = max(1, min(window_units, 90))
         proxy = resolve_volume_proxy(symbol)
         if proxy:
-            return await self._get_vwap_deviation_with_proxy(
-                symbol, proxy, timeframe, window_units
-            )
+            return await self._get_vwap_deviation_with_proxy(symbol, proxy, timeframe, window_units)
         step_interval = _interval_expr(timeframe)
         bucket = _bucket_expr(timeframe)
         query = f"""

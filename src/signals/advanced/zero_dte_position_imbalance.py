@@ -87,7 +87,9 @@ class ZeroDtePositionImbalanceSignal:
             extra.get("smart_put_gross") or 0.0
         )
         smart_confidence = min(1.0, sm_gross / 100_000.0) if sm_gross > 0 else 0.0
-        smart_imbalance = ((sm_call - sm_put) / sm_gross) * smart_confidence if sm_gross > 0 else 0.0
+        smart_imbalance = (
+            ((sm_call - sm_put) / sm_gross) * smart_confidence if sm_gross > 0 else 0.0
+        )
 
         pcr_tilt = max(-1.0, min(1.0, (1.0 - ctx.put_call_ratio) / 0.35))
         combined = 0.55 * flow_imbalance + 0.30 * smart_imbalance + 0.15 * pcr_tilt

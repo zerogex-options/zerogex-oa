@@ -51,9 +51,7 @@ class TapeFlowBiasComponent(ComponentBase):
         score = max(-1.0, min(1.0, ratio / _IMBALANCE_SATURATION))
         # Confidence damping rather than a hard cutoff — thin-flow reads
         # taper toward zero smoothly so the score occupies the full range.
-        confidence = (
-            min(1.0, total_abs / _MIN_TOTAL_PREMIUM) if _MIN_TOTAL_PREMIUM > 0 else 1.0
-        )
+        confidence = min(1.0, total_abs / _MIN_TOTAL_PREMIUM) if _MIN_TOTAL_PREMIUM > 0 else 1.0
         return score * confidence
 
     def context_values(self, ctx: MarketContext) -> dict:

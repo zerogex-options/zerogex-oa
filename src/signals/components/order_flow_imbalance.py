@@ -56,9 +56,7 @@ class OrderFlowImbalanceComponent(ComponentBase):
         # Soft confidence ramp instead of a hard cutoff: thin-flow reads
         # damp toward zero rather than snapping to it, so the score keeps
         # information content across the full intraday spectrum.
-        confidence = (
-            min(1.0, gross / _MIN_TOTAL_PREMIUM) if _MIN_TOTAL_PREMIUM > 0 else 1.0
-        )
+        confidence = min(1.0, gross / _MIN_TOTAL_PREMIUM) if _MIN_TOTAL_PREMIUM > 0 else 1.0
         return score * confidence
 
     def context_values(self, ctx: MarketContext) -> dict:
