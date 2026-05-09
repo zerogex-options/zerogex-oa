@@ -587,6 +587,9 @@ class TechnicalsQueriesMixin:
         active the bar updates as new 1-minute bars arrive; once the
         5-minute window closes the bar becomes immutable.
 
+        ``bars`` is ordered newest → oldest so ``bars[0]`` is the most
+        recent 5-minute bucket.
+
         ``intervals``: optional tail-window size in 5-minute bars (max
         192 = 16 hours). When provided, only the trailing N buckets are
         returned and the rolling-stats lookback shrinks from a full
@@ -882,7 +885,7 @@ class TechnicalsQueriesMixin:
                 CROSS JOIN orb_window ow
                 LEFT JOIN option_flow of ON of.bucket_ts = c.timestamp
                 WHERE c.timestamp BETWEEN $4 AND $5
-                ORDER BY c.timestamp ASC
+                ORDER BY c.timestamp DESC
             """
 
             try:

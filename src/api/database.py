@@ -1500,6 +1500,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         through the latest bar covered by the resolved session window.
         Carry-forward synthetic rows fill quiet bars; bars that haven't
         happened yet are excluded.
+
+        Rows are returned newest-first so ``rows[0]`` is the most recent
+        bar; ``intervals=N`` returns the leading N rows.
         """
         symbol = symbol.upper()
 
@@ -1656,7 +1659,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         is_synthetic
                     FROM carry
                     WINDOW w_cum AS (ORDER BY bar_start ROWS UNBOUNDED PRECEDING)
-                    ORDER BY bar_start
+                    ORDER BY bar_start DESC
                 """
 
                 rows = await asyncio.wait_for(
@@ -1672,7 +1675,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 )
                 result = [dict(row) for row in rows]
                 if intervals is not None and intervals > 0 and len(result) > intervals:
-                    result = result[-intervals:]
+                    # Result is newest-first; take the leading N rows for the
+                    # most-recent N 5-minute buckets.
+                    result = result[:intervals]
                 if use_cache:
                     self._cache_set(cache_key, result, self._flow_endpoint_cache_ttl_seconds)
                 return result
@@ -2245,7 +2250,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             SELECT bucket_ts AS timestamp, symbol, max_pain
             FROM ranked
             WHERE rn = 1
-            ORDER BY timestamp ASC
+            ORDER BY timestamp DESC
             LIMIT $2
         """
 
@@ -2329,6 +2334,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     ) -> List[Dict[str, Any]]:
         """
         Get GEX data by strike over time for heatmap visualization using interval + window units.
+
+        Rows are ordered newest → oldest by ``timestamp`` (and ascending by
+        ``strike`` within each timestamp), so ``rows[0]`` is from the most
+        recent bucket.
         """
         symbol = symbol.upper()
         window_units = max(1, min(window_units, 300))
@@ -2385,7 +2394,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 strike,
                 net_gex
             FROM filtered_data
-            ORDER BY timestamp ASC, strike ASC
+            ORDER BY timestamp DESC, strike ASC
         """
 
         try:
@@ -2535,6 +2544,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         If the regular market session is currently open (weekday 09:30–16:00 ET)
         returns today's data; otherwise returns data for the most recent date
         that has rows for this contract in the database.
+
+        Rows are ordered newest → oldest so ``rows[0]`` is the most recent
+        1-minute bar.
         """
         from datetime import time as _time
 
@@ -2625,6 +2637,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         theta,
                         vega,
                         bar_updated_at     AS updated_at,
+                        -- volume_delta uses an explicit chronological window
+                        -- (ORDER BY bar_ts ASC) so each bar's delta is the
+                        -- increment over the prior bar regardless of how the
+                        -- outer SELECT orders the result set.
                         GREATEST(
                             COALESCE(bar_volume, 0)
                                 - COALESCE(LAG(bar_volume) OVER (ORDER BY bar_ts), 0),
@@ -2632,7 +2648,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         )::bigint          AS volume_delta
                     FROM ranked
                     WHERE rn = 1
-                    ORDER BY timestamp ASC
+                    ORDER BY timestamp DESC
                 """
                 rows = await conn.fetch(query, option_symbol, day_start_et, day_end_et)
                 return [dict(row) for row in rows]

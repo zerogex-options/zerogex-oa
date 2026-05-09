@@ -70,6 +70,9 @@ async def get_option_contract(
     Returns all rows for the specified option contract for today's trading
     session if the market is currently open, otherwise for the most recent
     date that has data for this contract.
+
+    Rows are returned newest-first so ``response[0]`` is the most recent
+    1-minute bar.
     """
     try:
         rows = await db.get_option_contract_history(underlying, strike, expiration, option_type)

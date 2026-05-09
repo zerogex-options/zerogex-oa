@@ -163,23 +163,9 @@ def test_get_flow_series_t5_filter_matches_nothing_returns_empty():
 
 
 def test_get_flow_series_t1_happy_path_passes_through_rows():
+    # Production SQL returns rows newest-first; mock reflects that so the
+    # assertions document the wire-level ordering callers actually see.
     happy_rows = [
-        {
-            "bar_start": _bar_ts(0),
-            "call_premium_cum": 50000.0,
-            "put_premium_cum": -30000.0,
-            "call_volume_cum": 100,
-            "put_volume_cum": 80,
-            "net_volume_cum": 20,
-            "raw_volume_cum": 180,
-            "call_position_cum": 40,
-            "put_position_cum": -20,
-            "net_premium_cum": 20000.0,
-            "put_call_ratio": 0.8,
-            "underlying_price": 710.00,
-            "contract_count": 2,
-            "is_synthetic": False,
-        },
         {
             "bar_start": _bar_ts(5),
             "call_premium_cum": 62000.0,
@@ -196,6 +182,22 @@ def test_get_flow_series_t1_happy_path_passes_through_rows():
             "contract_count": 2,
             "is_synthetic": False,
         },
+        {
+            "bar_start": _bar_ts(0),
+            "call_premium_cum": 50000.0,
+            "put_premium_cum": -30000.0,
+            "call_volume_cum": 100,
+            "put_volume_cum": 80,
+            "net_volume_cum": 20,
+            "raw_volume_cum": 180,
+            "call_position_cum": 40,
+            "put_position_cum": -20,
+            "net_premium_cum": 20000.0,
+            "put_call_ratio": 0.8,
+            "underlying_price": 710.00,
+            "contract_count": 2,
+            "is_synthetic": False,
+        },
     ]
     conn = _CannedConn(
         fetchval_sequence=_mock_session_resolution_rows(),
@@ -207,18 +209,19 @@ def test_get_flow_series_t1_happy_path_passes_through_rows():
     result = asyncio.run(db.get_flow_series(symbol="SPY", session="current"))
 
     assert result is not None and len(result) == 2
-    assert result[0]["bar_start"] == _bar_ts(0)
-    assert result[0]["call_premium_cum"] == 50000.0
-    assert result[1]["call_premium_cum"] == 62000.0
+    assert result[0]["bar_start"] == _bar_ts(5)
+    assert result[0]["call_premium_cum"] == 62000.0
+    assert result[1]["call_premium_cum"] == 50000.0
 
 
 def test_get_flow_series_t3_intervals_one_returns_only_tail():
-    # Build a 3-row session; intervals=1 must return just the last row
+    # Build a 3-row session; intervals=1 must return just the latest row
     # with its true session-cumulative values — not a per-bar delta.
+    # Mock rows are newest-first to match the production SQL contract.
     rows = [
-        {"bar_start": _bar_ts(0), "call_premium_cum": 50000.0, "is_synthetic": False},
-        {"bar_start": _bar_ts(5), "call_premium_cum": 50000.0, "is_synthetic": True},
         {"bar_start": _bar_ts(10), "call_premium_cum": 55000.0, "is_synthetic": False},
+        {"bar_start": _bar_ts(5), "call_premium_cum": 50000.0, "is_synthetic": True},
+        {"bar_start": _bar_ts(0), "call_premium_cum": 50000.0, "is_synthetic": False},
     ]
     conn = _CannedConn(
         fetchval_sequence=_mock_session_resolution_rows(),

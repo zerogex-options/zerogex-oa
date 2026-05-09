@@ -481,6 +481,10 @@ async def get_flow_series(
     carry forward as synthetic rows flagged by ``is_synthetic``). Frontend
     renders this series directly — no client-side accumulators.
 
+    Rows are ordered newest → oldest so ``rows[0]`` is the most recent bar.
+    With ``intervals=N`` you get the leading N rows (the trailing-N most
+    recent bars).
+
     ``session=current`` is the most recent ET trading day that has any data
     for the symbol; ``session=prior`` is the ET day immediately before that.
     Unknown symbols return 404; symbols that exist but have no data for the
@@ -863,6 +867,10 @@ async def get_technicals(
     ``high`` / ``low`` use max / min. While the 5-minute window is
     still active the bar updates as new 1-minute bars arrive; once the
     window closes the bar becomes immutable.
+
+    ``bars`` is returned newest-first (``bars[0]`` is the most recent
+    5-minute bucket), matching the convention used by the other
+    timeseries endpoints.
 
     Cash indices have no native volume; VWAP and volume-spike rolling
     stats are computed against a proxy ETF's per-bar volume when one

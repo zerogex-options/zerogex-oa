@@ -148,6 +148,9 @@ class SignalsQueriesMixin:
         component_name: str,
         limit: int = SIGNAL_HISTORY_LIMIT,
     ) -> list[Dict[str, Any]]:
+        # Returns newest-first to match the convention used by the rest
+        # of the timeseries APIs (sparkline clients should sort by
+        # timestamp explicitly if a chronological draw order is needed).
         rows = await conn.fetch(
             """
             SELECT timestamp, clamped_score
@@ -166,7 +169,7 @@ class SignalsQueriesMixin:
                 "timestamp": row["timestamp"],
                 "score": round(float(row["clamped_score"] or 0.0) * 100.0, 2),
             }
-            for row in reversed(rows)
+            for row in rows
         ]
 
     async def get_vol_expansion_signal(
@@ -575,7 +578,9 @@ class SignalsQueriesMixin:
         try:
             async with self._acquire_connection() as conn:
                 rows = await conn.fetch(query, symbol, component_name, limit)
-            # Oldest->newest for deterministic sign-flip calculation.
+            # Compute sign-flips chronologically (oldest → newest), but
+            # return newest → oldest to match the convention used by the
+            # rest of the timeseries APIs.
             ordered = [dict(r) for r in reversed(rows)]
             out: list[Dict[str, Any]] = []
             prev_sign = 0
@@ -631,6 +636,7 @@ class SignalsQueriesMixin:
                 )
                 if sign != 0:
                     prev_sign = sign
+            out.reverse()
             return out
         except Exception as e:
             logger.error(f"get_signal_component_events failed ({symbol}, {component_name}): {e}")

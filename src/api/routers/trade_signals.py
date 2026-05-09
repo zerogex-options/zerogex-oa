@@ -451,7 +451,7 @@ async def get_vol_expansion_signal(
     - `magnitude` — [0, 100]; absolute size of the combined signal.
     - `expected_5min_move_bps` — forecasted 5-minute move in basis points.
     - `direction` — `"bullish"` | `"bearish"` | `"neutral"`.
-    - `score_history` — up to 90 recent scores; sort client-side by `timestamp`.
+    - `score_history` — up to 90 recent `{score, timestamp}` points, newest→oldest.
 
     **Trader interpretation:**
     - `expansion > 60` + `|direction_score| > 50` → high-conviction expansion;
@@ -1080,7 +1080,7 @@ async def get_tape_flow_bias_signal(
     - `call_net_premium` / `put_net_premium` — USD, signed. `+` = net aggressor buying.
     - `source` — `"flow_by_type"` (data present) | `"unavailable"` (abstained).
     - `context_values` — the four per-side premium totals plus `source`.
-    - `score_history` — up to 90 recent `{score, timestamp}` points, oldest→newest.
+    - `score_history` — up to 90 recent `{score, timestamp}` points, newest→oldest.
 
     **Trader interpretation.**
     - `score > +50` with flat price → early bullish accumulation; potential breakout.

@@ -304,7 +304,7 @@ purpose.
 - `clamped_score` ∈ `[-1, +1]`; `score` = `clamped_score × 100` ∈ `[-100, +100]`.
 - `direction` ∈ `"bullish" | "bearish" | "neutral"`.
 - `context_values` — signal-specific inputs/derived fields.
-- `score_history` — up to 90 recent `{score, timestamp}` points, oldest→newest.
+- `score_history` — up to 90 recent `{score, timestamp}` points, newest→oldest.
 
 Returns `404` when a signal has no row yet for the symbol. Weight is `0.0`
 for all Advanced and Basic Signals (they do not contribute to the MSI).
