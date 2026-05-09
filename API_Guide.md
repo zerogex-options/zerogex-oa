@@ -145,6 +145,50 @@ Get current max pain with current underlying price, difference (`max_pain - unde
 
 ## Technicals
 
+### GET /api/technicals
+Combined per-minute timeseries of VWAP deviation, opening-range breakout,
+unusual volume spikes (all classifications), and momentum divergence —
+plus the underlying close — for the most recent session.
+
+Session window depends on `symbols.asset_type`:
+- `INDEX` → 09:30–16:00 ET (cash session only)
+- otherwise (ETF, EQUITY) → 04:00–20:00 ET (extended hours)
+
+Cash indices use a proxy ETF's volume for VWAP and volume-spike stats
+(SPX→SPY, NDX→QQQ, RUT→IWM, DJX→DIA); the active proxy is reported in
+the response's `volume_proxy` field. Bars before 09:30 ET return null
+opening-range fields (the ORB hasn't been established yet).
+
+Dealer hedging is intentionally excluded — its underlying view is a
+point-in-time snapshot, not a timeseries.
+
+**Parameters:**
+- `symbol` (optional): default `SPY`
+
+**Response shape:**
+```json
+{
+  "symbol": "SPY",
+  "asset_type": "ETF",
+  "session_date": "2026-05-08",
+  "session_start_et": "2026-05-08T04:00:00-04:00",
+  "session_end_et": "2026-05-08T20:00:00-04:00",
+  "volume_proxy": null,
+  "bars": [
+    {
+      "time_et": "2026-05-08T04:00:00-04:00",
+      "timestamp": "2026-05-08T08:00:00+00:00",
+      "close": 737.62,
+      "volume": 12500,
+      "vwap_deviation": { "vwap": ..., "vwap_deviation_pct": ..., "vwap_position": ... },
+      "opening_range": { "orb_high": null, "orb_low": null, ... },
+      "volume_spike": { "current_volume": ..., "volume_sigma": ..., "volume_class": ... },
+      "momentum_divergence": { "chg_5m": ..., "opt_flow": ..., "divergence_signal": ... }
+    }
+  ]
+}
+```
+
 ### GET /api/technicals/vwap-deviation
 Get VWAP deviation for mean reversion monitoring.
 
@@ -169,11 +213,11 @@ Get gamma exposure levels (support/resistance zones).
 - `limit` (optional): max `100`, default `20`
 
 ### GET /api/technicals/dealer-hedging
-Get dealer hedging pressure signals.
+Get current dealer hedging pressure (point-in-time snapshot).
+Returns at most one row per symbol — this is not a timeseries.
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
-- `limit` (optional): max `100`, default `20`
 
 ### GET /api/technicals/volume-spikes
 Get unusual volume spike events.

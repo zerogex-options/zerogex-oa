@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List
+from datetime import datetime, time, timedelta
+from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from src.api.queries._sql_helpers import _bucket_expr, _interval_expr
 from src.symbols import resolve_volume_proxy
 
 logger = logging.getLogger(__name__)
+
+_ET = ZoneInfo("America/New_York")
 
 
 class TechnicalsQueriesMixin:
@@ -305,12 +309,15 @@ class TechnicalsQueriesMixin:
             logger.error(f"Error fetching ORB: {e}", exc_info=True)
             raise
 
-    async def get_dealer_hedging_pressure(
-        self, symbol: str = "SPY", limit: int = 20
-    ) -> List[Dict[str, Any]]:
-        """Get dealer hedging pressure"""
+    async def get_dealer_hedging_pressure(self, symbol: str = "SPY") -> List[Dict[str, Any]]:
+        """Get dealer hedging pressure (point-in-time snapshot).
+
+        The ``dealer_hedging_pressure`` view emits exactly one row per
+        symbol — the current state aggregated across all option contracts —
+        so this is intentionally not a timeseries.
+        """
         query = """
-            SELECT 
+            SELECT
                 time_et,
                 timestamp,
                 symbol,
@@ -320,13 +327,11 @@ class TechnicalsQueriesMixin:
                 hedge_pressure
             FROM dealer_hedging_pressure
             WHERE symbol = $1
-            ORDER BY timestamp DESC
-            LIMIT $2
         """
 
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, symbol, limit)
+                rows = await conn.fetch(query, symbol)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching dealer hedging: {e}", exc_info=True)
@@ -557,3 +562,355 @@ class TechnicalsQueriesMixin:
         except Exception as e:
             logger.error(f"Error fetching momentum divergence: {e}", exc_info=True)
             raise
+
+    async def get_technicals_timeseries(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Per-minute timeseries combining VWAP deviation, opening-range
+        breakout, unusual volume spikes (all classes), and momentum
+        divergence — plus the underlying close — for the most recent
+        session.
+
+        Session window is decided by ``symbols.asset_type``:
+            INDEX → 09:30–16:00 ET (cash session only)
+            otherwise (ETF / EQUITY / unknown) → 04:00–20:00 ET (extended)
+
+        Cash indices have no native volume, so VWAP and volume-spike
+        rolling stats are computed against a proxy ETF's per-bar volume
+        when one is configured (SPX→SPY, NDX→QQQ, RUT→IWM, DJX→DIA).
+
+        Returns ``None`` when ``symbol`` isn't in the symbols table; an
+        empty ``bars`` list when the symbol exists but has no data for
+        the most recent session.
+        """
+        async with self._acquire_connection() as conn:
+            asset_type = await conn.fetchval(
+                "SELECT asset_type FROM symbols WHERE symbol = $1",
+                symbol,
+            )
+            symbol_exists = await conn.fetchval(
+                "SELECT 1 FROM symbols WHERE symbol = $1",
+                symbol,
+            )
+            if not symbol_exists:
+                return None
+
+            latest_ts = await conn.fetchval(
+                "SELECT MAX(timestamp) FROM underlying_quotes WHERE symbol = $1",
+                symbol,
+            )
+            if latest_ts is None:
+                return {
+                    "symbol": symbol,
+                    "asset_type": asset_type,
+                    "session_date": None,
+                    "session_start_et": None,
+                    "session_end_et": None,
+                    "volume_proxy": resolve_volume_proxy(symbol),
+                    "bars": [],
+                }
+
+            session_date = latest_ts.astimezone(_ET).date()
+            if asset_type == "INDEX":
+                start_t, end_t = time(9, 30), time(16, 0)
+            else:
+                start_t, end_t = time(4, 0), time(20, 0)
+
+            session_start = datetime.combine(session_date, start_t, tzinfo=_ET)
+            session_end = datetime.combine(session_date, end_t, tzinfo=_ET)
+            orb_start = datetime.combine(session_date, time(9, 30), tzinfo=_ET)
+            orb_end = datetime.combine(session_date, time(9, 59, 59), tzinfo=_ET)
+            # Lookback covers the previous trading day so that rolling-30
+            # window stats (volume sigma) and the 5-bar LAG used for
+            # momentum divergence have stable input from bar one of the
+            # session.
+            lookback_start = session_start - timedelta(days=1)
+
+            proxy = resolve_volume_proxy(symbol)
+            volume_source = proxy or symbol
+
+            query = """
+                WITH underlying_target AS (
+                    SELECT timestamp, close, high, low, up_volume, down_volume
+                    FROM underlying_quotes
+                    WHERE symbol = $1
+                      AND timestamp BETWEEN $3 AND $5
+                ),
+                volume_source AS (
+                    SELECT
+                        timestamp,
+                        up_volume,
+                        down_volume,
+                        (up_volume + down_volume) AS volume
+                    FROM underlying_quotes
+                    WHERE symbol = $2
+                      AND timestamp BETWEEN $3 AND $5
+                ),
+                joined AS (
+                    SELECT
+                        ut.timestamp,
+                        ut.close,
+                        ut.high,
+                        ut.low,
+                        ut.up_volume AS native_up_volume,
+                        ut.down_volume AS native_down_volume,
+                        COALESCE(vs.up_volume, 0) AS up_volume,
+                        COALESCE(vs.down_volume, 0) AS down_volume,
+                        COALESCE(vs.volume, 0) AS volume
+                    FROM underlying_target ut
+                    LEFT JOIN volume_source vs ON vs.timestamp = ut.timestamp
+                ),
+                vwap_calc AS (
+                    SELECT
+                        timestamp,
+                        close,
+                        volume,
+                        SUM(close * volume) OVER (
+                            PARTITION BY DATE(timestamp AT TIME ZONE 'America/New_York')
+                            ORDER BY timestamp
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                        ) AS cum_pv,
+                        SUM(volume) OVER (
+                            PARTITION BY DATE(timestamp AT TIME ZONE 'America/New_York')
+                            ORDER BY timestamp
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                        ) AS cum_vol
+                    FROM joined
+                ),
+                vwap AS (
+                    SELECT
+                        timestamp,
+                        (cum_pv / NULLIF(cum_vol, 0))::numeric(12,4) AS vwap,
+                        ROUND(
+                            ((close - (cum_pv / NULLIF(cum_vol, 0)))
+                             / NULLIF((cum_pv / NULLIF(cum_vol, 0)), 0) * 100)::numeric,
+                            3
+                        ) AS vwap_deviation_pct,
+                        CASE
+                            WHEN NULLIF(cum_vol, 0) IS NULL THEN NULL
+                            WHEN close > (cum_pv / NULLIF(cum_vol, 0)) * 1.002 THEN '🔥 Extended Above VWAP'
+                            WHEN close > (cum_pv / NULLIF(cum_vol, 0)) THEN '✅ Above VWAP'
+                            WHEN close < (cum_pv / NULLIF(cum_vol, 0)) * 0.998 THEN '🔥 Extended Below VWAP'
+                            ELSE '❌ Below VWAP'
+                        END AS vwap_position
+                    FROM vwap_calc
+                ),
+                orb_window AS (
+                    SELECT
+                        MAX(high) AS orb_high,
+                        MIN(low) AS orb_low
+                    FROM underlying_target
+                    WHERE timestamp BETWEEN $6 AND $7
+                ),
+                vol_stats AS (
+                    SELECT
+                        timestamp,
+                        volume AS current_volume,
+                        up_volume,
+                        down_volume,
+                        AVG(volume) OVER (
+                            ORDER BY timestamp
+                            ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
+                        ) AS avg_volume,
+                        STDDEV_SAMP(volume) OVER (
+                            ORDER BY timestamp
+                            ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
+                        ) AS volume_stddev
+                    FROM joined
+                ),
+                option_flow AS (
+                    SELECT
+                        timestamp,
+                        SUM(
+                            CASE
+                                WHEN option_type = 'C' THEN premium_delta
+                                ELSE -premium_delta
+                            END
+                        )::numeric AS net_option_flow
+                    FROM flow_contract_facts
+                    WHERE symbol = $1
+                      AND timestamp BETWEEN $3 AND $5
+                    GROUP BY timestamp
+                ),
+                divergence AS (
+                    SELECT
+                        j.timestamp,
+                        j.close - LAG(j.close, 5) OVER (ORDER BY j.timestamp)
+                            AS price_change_5min,
+                        COALESCE(of.net_option_flow, 0) AS opt_flow,
+                        (j.native_up_volume - j.native_down_volume)::bigint
+                            AS native_net_volume
+                    FROM joined j
+                    LEFT JOIN option_flow of ON of.timestamp = j.timestamp
+                )
+                SELECT
+                    j.timestamp AT TIME ZONE 'America/New_York' AS time_et,
+                    j.timestamp,
+                    j.close,
+                    j.volume,
+                    v.vwap,
+                    v.vwap_deviation_pct,
+                    v.vwap_position,
+                    CASE WHEN j.timestamp >= $6 THEN ow.orb_high END AS orb_high,
+                    CASE WHEN j.timestamp >= $6 THEN ow.orb_low END AS orb_low,
+                    CASE WHEN j.timestamp >= $6
+                         THEN (ow.orb_high - ow.orb_low) END AS orb_range,
+                    CASE WHEN j.timestamp >= $6
+                         THEN ROUND(j.close - ow.orb_high, 2) END
+                        AS distance_above_orb_high,
+                    CASE WHEN j.timestamp >= $6
+                         THEN ROUND(ow.orb_low - j.close, 2) END
+                        AS distance_below_orb_low,
+                    CASE WHEN j.timestamp >= $6
+                         THEN ROUND((j.close - ow.orb_low)
+                                    / NULLIF(ow.orb_high - ow.orb_low, 0)
+                                    * 100, 1) END AS orb_pct,
+                    CASE
+                        WHEN j.timestamp < $6 THEN NULL
+                        WHEN j.close > ow.orb_high THEN '🚀 ORB Breakout (Long)'
+                        WHEN j.close < ow.orb_low THEN '💥 ORB Breakdown (Short)'
+                        WHEN j.close >= ow.orb_high * 0.998 THEN '⚡ Near ORB High'
+                        WHEN j.close <= ow.orb_low * 1.002 THEN '⚡ Near ORB Low'
+                        ELSE '⏸️ Inside ORB'
+                    END AS orb_status,
+                    vs.current_volume,
+                    COALESCE(vs.avg_volume, 0)::numeric(18,2) AS avg_volume,
+                    ROUND(
+                        COALESCE(
+                            (vs.current_volume::numeric - vs.avg_volume)
+                            / NULLIF(vs.volume_stddev, 0),
+                            0
+                        ),
+                        2
+                    ) AS volume_sigma,
+                    ROUND(
+                        COALESCE(
+                            vs.current_volume::numeric / NULLIF(vs.avg_volume, 0),
+                            1
+                        ),
+                        2
+                    ) AS volume_ratio,
+                    ROUND(
+                        COALESCE(
+                            vs.up_volume::numeric
+                            / NULLIF((vs.up_volume + vs.down_volume)::numeric, 0)
+                            * 100,
+                            50
+                        ),
+                        2
+                    ) AS buying_pressure_pct,
+                    CASE
+                        WHEN COALESCE(
+                            (vs.current_volume::numeric - vs.avg_volume)
+                            / NULLIF(vs.volume_stddev, 0),
+                            0
+                        ) >= 3 THEN '🚨 Extreme Spike'
+                        WHEN COALESCE(
+                            (vs.current_volume::numeric - vs.avg_volume)
+                            / NULLIF(vs.volume_stddev, 0),
+                            0
+                        ) >= 2 THEN '⚡ High Spike'
+                        WHEN COALESCE(
+                            (vs.current_volume::numeric - vs.avg_volume)
+                            / NULLIF(vs.volume_stddev, 0),
+                            0
+                        ) >= 1 THEN '📈 Moderate Spike'
+                        ELSE '⚪ Normal'
+                    END AS volume_class,
+                    ROUND(d.price_change_5min, 2) AS chg_5m,
+                    d.opt_flow,
+                    CASE
+                        WHEN d.price_change_5min IS NULL THEN NULL
+                        WHEN d.price_change_5min > 0 AND d.opt_flow < -50000
+                            THEN '🚨 Bearish Divergence (Price Up, Puts Buying)'
+                        WHEN d.price_change_5min < 0 AND d.opt_flow > 50000
+                            THEN '🚨 Bullish Divergence (Price Down, Calls Buying)'
+                        WHEN d.price_change_5min > 0 AND d.opt_flow > 50000
+                            THEN '🟢 Bullish Confirmation'
+                        WHEN d.price_change_5min < 0 AND d.opt_flow < -50000
+                            THEN '🔴 Bearish Confirmation'
+                        WHEN d.price_change_5min > 0 AND d.native_net_volume < 0
+                            THEN '⚠️ Weak Rally (Selling Volume)'
+                        WHEN d.price_change_5min < 0 AND d.native_net_volume > 0
+                            THEN '⚠️ Weak Selloff (Buying Volume)'
+                        ELSE '⚪ Neutral'
+                    END AS divergence_signal
+                FROM joined j
+                LEFT JOIN vwap v ON v.timestamp = j.timestamp
+                CROSS JOIN orb_window ow
+                LEFT JOIN vol_stats vs ON vs.timestamp = j.timestamp
+                LEFT JOIN divergence d ON d.timestamp = j.timestamp
+                WHERE j.timestamp BETWEEN $4 AND $5
+                ORDER BY j.timestamp ASC
+            """
+
+            try:
+                rows = await conn.fetch(
+                    query,
+                    symbol,
+                    volume_source,
+                    lookback_start,
+                    session_start,
+                    session_end,
+                    orb_start,
+                    orb_end,
+                )
+            except Exception as e:
+                logger.error(
+                    f"Error fetching technicals timeseries for {symbol}: {e}",
+                    exc_info=True,
+                )
+                raise
+
+        bars = [_format_technicals_bar(r) for r in rows]
+        return {
+            "symbol": symbol,
+            "asset_type": asset_type,
+            "session_date": session_date.isoformat(),
+            "session_start_et": session_start.isoformat(),
+            "session_end_et": session_end.isoformat(),
+            "volume_proxy": proxy,
+            "bars": bars,
+        }
+
+
+def _format_technicals_bar(row: Any) -> Dict[str, Any]:
+    """Coerce a raw asyncpg row into a JSON-friendly nested bar dict."""
+
+    def f(value: Any) -> Optional[float]:
+        return float(value) if value is not None else None
+
+    def i(value: Any) -> Optional[int]:
+        return int(value) if value is not None else None
+
+    return {
+        "time_et": row["time_et"].isoformat() if row["time_et"] else None,
+        "timestamp": row["timestamp"].isoformat() if row["timestamp"] else None,
+        "close": f(row["close"]),
+        "volume": i(row["volume"]),
+        "vwap_deviation": {
+            "vwap": f(row["vwap"]),
+            "vwap_deviation_pct": f(row["vwap_deviation_pct"]),
+            "vwap_position": row["vwap_position"],
+        },
+        "opening_range": {
+            "orb_high": f(row["orb_high"]),
+            "orb_low": f(row["orb_low"]),
+            "orb_range": f(row["orb_range"]),
+            "distance_above_orb_high": f(row["distance_above_orb_high"]),
+            "distance_below_orb_low": f(row["distance_below_orb_low"]),
+            "orb_pct": f(row["orb_pct"]),
+            "orb_status": row["orb_status"],
+        },
+        "volume_spike": {
+            "current_volume": i(row["current_volume"]),
+            "avg_volume": f(row["avg_volume"]),
+            "volume_sigma": f(row["volume_sigma"]),
+            "volume_ratio": f(row["volume_ratio"]),
+            "buying_pressure_pct": f(row["buying_pressure_pct"]),
+            "volume_class": row["volume_class"],
+        },
+        "momentum_divergence": {
+            "chg_5m": f(row["chg_5m"]),
+            "opt_flow": f(row["opt_flow"]),
+            "divergence_signal": row["divergence_signal"],
+        },
+    }

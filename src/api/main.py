@@ -829,6 +829,52 @@ async def get_max_pain_current(
 # ============================================================================
 
 
+_TECHNICALS_SYMBOL_PATTERN = re.compile(r"^[A-Z.]{1,10}$")
+
+
+@app.get("/api/technicals", tags=["Technicals"])
+@handle_api_errors("GET /api/technicals")
+async def get_technicals(symbol: str = Query(default="SPY", min_length=1, max_length=10)):
+    """Combined per-minute timeseries of VWAP deviation, opening-range
+    breakout, unusual volume spikes (all classes), and momentum divergence —
+    plus the underlying close — for the most recent session.
+
+    Session window depends on ``symbols.asset_type``:
+      - ``INDEX`` → 09:30–16:00 ET (cash session only)
+      - otherwise (ETF, EQUITY) → 04:00–20:00 ET (extended hours)
+
+    Cash indices have no native volume; VWAP and volume-spike rolling
+    stats are computed against a proxy ETF's per-bar volume when one is
+    configured (SPX→SPY, NDX→QQQ, RUT→IWM, DJX→DIA). The active proxy
+    is reported in the top-level ``volume_proxy`` field; ``null`` for
+    equities/ETFs.
+
+    The "most recent session" is the trading day of the latest bar in
+    ``underlying_quotes`` for the symbol — i.e. the live session if it's
+    in progress, otherwise the most recent completed session. Bars
+    before 09:30 ET have ``opening_range`` fields nulled out (the ORB
+    window is 09:30–09:59 ET, so it doesn't exist yet).
+
+    404 when ``symbol`` isn't in the ``symbols`` table; 200 with an
+    empty ``bars`` list when the symbol exists but has no quote data.
+
+    Dealer hedging is intentionally excluded — its underlying view is a
+    point-in-time snapshot, not a timeseries. Use
+    ``/api/technicals/dealer-hedging`` for the current-state read.
+    """
+    normalized = symbol.strip().upper()
+    if not _TECHNICALS_SYMBOL_PATTERN.match(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
+        )
+
+    result = await db_manager.get_technicals_timeseries(normalized)
+    if result is None:
+        raise HTTPException(status_code=404, detail="symbol not found")
+    return result
+
+
 @app.get("/api/technicals/vwap-deviation", tags=["Technicals"])
 @handle_api_errors("GET /api/technicals/vwap-deviation")
 async def get_vwap_deviation(
@@ -853,11 +899,20 @@ async def get_opening_range(
 
 @app.get("/api/technicals/dealer-hedging", tags=["Technicals"])
 @handle_api_errors("GET /api/technicals/dealer-hedging")
-async def get_dealer_hedging(
-    symbol: str = Query(default="SPY"), limit: int = Query(default=20, le=100)
-):
-    """Get dealer hedging pressure"""
-    return await db_manager.get_dealer_hedging_pressure(symbol, limit)
+async def get_dealer_hedging(symbol: str = Query(default="SPY")):
+    """Get current dealer hedging pressure (point-in-time snapshot).
+
+    The underlying view aggregates the latest snapshot of every option
+    contract (delta × open interest × 100) on the symbol to produce a
+    single ``expected_hedge_shares`` figure — the net share position
+    market makers would have to be long to be delta-neutral against
+    current option open interest. ``hedge_pressure`` classifies that
+    figure as 🟢 Heavy Buy-Hedging Risk (< -1M), 🔴 Heavy Sell-Hedging
+    Risk (> +1M), or ⚪ Balanced Hedging.
+
+    Returns at most one row per symbol — this is not a timeseries.
+    """
+    return await db_manager.get_dealer_hedging_pressure(symbol)
 
 
 @app.get("/api/technicals/volume-spikes", tags=["Technicals"])

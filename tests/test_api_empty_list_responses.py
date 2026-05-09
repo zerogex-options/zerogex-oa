@@ -95,3 +95,36 @@ def test_single_object_endpoint_empty_still_returns_404(monkeypatch: pytest.Monk
         response = client.get("/api/gex/summary?symbol=SPY")
 
     assert response.status_code == 404
+
+
+def test_technicals_aggregator_unknown_symbol_returns_404(monkeypatch: pytest.MonkeyPatch):
+    """``/api/technicals`` is a wrapper object, not a list; it 404s for unknown
+    symbols (returns ``None`` from the query method) and 200s for known
+    symbols with no data."""
+    app = _build_app_with_mocked_method(monkeypatch, "get_technicals_timeseries", returns=None)
+
+    with TestClient(app) as client:
+        response = client.get("/api/technicals?symbol=NOPE")
+
+    assert response.status_code == 404
+
+
+def test_technicals_aggregator_known_symbol_no_data_returns_200(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    payload = {
+        "symbol": "SPY",
+        "asset_type": "ETF",
+        "session_date": None,
+        "session_start_et": None,
+        "session_end_et": None,
+        "volume_proxy": None,
+        "bars": [],
+    }
+    app = _build_app_with_mocked_method(monkeypatch, "get_technicals_timeseries", returns=payload)
+
+    with TestClient(app) as client:
+        response = client.get("/api/technicals?symbol=SPY")
+
+    assert response.status_code == 200
+    assert response.json() == payload
