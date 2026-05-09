@@ -884,6 +884,14 @@ async def get_technicals(
     Bars before 09:30 ET have ``opening_range`` fields nulled out (the
     ORB window is 09:30–09:59 ET, so it doesn't exist yet).
 
+    ORB anchor: ``orb_high`` / ``orb_low`` come from the most recent
+    ET date that has cash-session data (>= 09:30 ET), which can differ
+    from ``session_date`` for ETFs in pre-market. While in pre-market
+    of a new trading day, the response shows the previous session's
+    ORB through every pre-market bar; once today's 09:30 ET data
+    arrives, ORB switches to today's values. INDEX symbols never carry
+    pre-market data, so ORB and session always agree for them.
+
     Pass ``intervals=N`` to get only the last N 5-minute buckets
     (trailing from the most recent existing bar). The response
     metadata (``session_start_et`` / ``session_end_et``) still reports

@@ -595,6 +595,17 @@ class TechnicalsQueriesMixin:
         returned and the rolling-stats lookback shrinks from a full
         day to ~160 minutes — much faster for live polling.
 
+        ORB anchor: opening-range high/low is computed from the most
+        recent ET date that has cash-session data (>= 09:30 ET), not
+        strictly ``session_date``. For ETFs this matters during pre-
+        market — ``latest_ts`` (and therefore ``session_date``) advances
+        to the new trading day at 04:00 ET, but the new day's ORB
+        window doesn't start until 09:30 ET. Anchoring ORB on the most
+        recent cash-session-active date surfaces the previous session's
+        ORB through pre-market instead of returning NULL on every bar.
+        INDEX symbols never carry pre-market data, so for them ORB and
+        session always agree.
+
         Returns ``None`` when ``symbol`` isn't in the symbols table; an
         empty ``bars`` list when the symbol exists but has no data for
         the most recent session.
@@ -641,8 +652,32 @@ class TechnicalsQueriesMixin:
 
             session_start = datetime.combine(session_date, start_t, tzinfo=_ET)
             session_end = datetime.combine(session_date, end_t, tzinfo=_ET)
-            orb_start = datetime.combine(session_date, time(9, 30), tzinfo=_ET)
-            orb_end = datetime.combine(session_date, time(9, 59, 59), tzinfo=_ET)
+
+            # ORB anchor: most recent ET date that has at least one bar
+            # at/after 09:30 ET. For ETFs in pre-market this differs from
+            # ``session_date`` — ``latest_ts`` has advanced to the new
+            # trading day but its 09:30 ET ORB window hasn't started yet,
+            # so anchoring ORB on session_date returns NULL for every bar.
+            # Falling back to the most recent cash-session-active date
+            # surfaces the previous session's ORB until today's ORB
+            # actually has data. INDEX symbols never carry pre-market data
+            # so orb_date == session_date for them.
+            orb_date = await conn.fetchval(
+                """
+                SELECT (MAX(timestamp) AT TIME ZONE 'America/New_York')::date
+                FROM underlying_quotes
+                WHERE symbol = $1
+                  AND (timestamp AT TIME ZONE 'America/New_York')::time >= '09:30'
+                """,
+                symbol,
+            )
+            if orb_date is None:
+                # Symbol exists but has never had cash-session data.
+                # Fall back to session_date so the query is well-formed;
+                # orb_window will return NULL/NULL as expected.
+                orb_date = session_date
+            orb_start = datetime.combine(orb_date, time(9, 30), tzinfo=_ET)
+            orb_end = datetime.combine(orb_date, time(9, 59, 59), tzinfo=_ET)
 
             # Bar window: full session by default, or the trailing
             # ``intervals`` 5-minute buckets when the caller asks for a
@@ -751,11 +786,18 @@ class TechnicalsQueriesMixin:
                     FROM joined
                 ),
                 orb_window AS (
+                    -- Query underlying_quotes directly so ORB lookup is
+                    -- independent of ``lookback_start``. Anchored on
+                    -- ``orb_date`` ($6/$7) which is the most recent date
+                    -- that has cash-session data — see Python side for
+                    -- the rationale (handles ETFs in pre-market).
                     SELECT
                         MAX(high) AS orb_high,
                         MIN(low) AS orb_low
-                    FROM bucketed_target
-                    WHERE bucket_ts BETWEEN $6 AND $7
+                    FROM underlying_quotes
+                    WHERE symbol = $1
+                      AND timestamp >= $6
+                      AND timestamp <= $7
                 ),
                 option_flow AS (
                     SELECT
