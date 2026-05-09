@@ -6,6 +6,53 @@ Base URL: `http://your-server:8000`
 
 ---
 
+## Authentication
+
+Every endpoint accepts the API key in either header — pick one:
+
+```
+X-API-Key: <your-key>
+Authorization: Bearer <your-key>
+```
+
+The same key works in both headers; sending both is fine but only one is
+required. Requests with an invalid or missing key return `401 Unauthorized`
+with `WWW-Authenticate: Bearer`.
+
+Two key types are supported:
+
+- **Shared static key** — set via the `API_KEY` env var on the server.
+  One value, no per-user attribution. Useful for service-to-service calls.
+- **Per-user keys** — long-lived keys issued via the admin CLI and stored
+  hashed (SHA-256) in the `api_keys` table. Each request authenticates as
+  a specific `user_id`, and individual keys can be revoked without
+  affecting others.
+
+### Provisioning per-user keys
+
+Run the admin CLI from the server (uses the same DB credentials as the
+API). The raw key is printed exactly once — copy it then.
+
+```bash
+# Issue a key
+python -m src.api.admin_keys create alice@example.com --name "alice-laptop"
+
+# List keys (all, or for one user)
+python -m src.api.admin_keys list
+python -m src.api.admin_keys list --user-id alice@example.com
+
+# Revoke a key by its numeric id
+python -m src.api.admin_keys revoke 7
+```
+
+Revocations take effect within the cache TTL (default 60s, controlled by
+`API_KEY_CACHE_TTL_SECONDS`). Restart the API to invalidate immediately.
+
+When neither `API_KEY` is set nor any keys exist in the `api_keys` table,
+authentication is disabled — appropriate only for local development/CI.
+
+---
+
 ## Health & Status
 
 ### GET /api/health

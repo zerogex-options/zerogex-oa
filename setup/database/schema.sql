@@ -1617,3 +1617,33 @@ CREATE TABLE IF NOT EXISTS component_normalizer_cache (
     updated_at      TIMESTAMPTZ   DEFAULT NOW(),
     PRIMARY KEY (underlying, field_name)
 );
+
+-- =============================================================================
+-- Per-user API keys
+-- =============================================================================
+-- Long-lived API keys for individual users.  Keys are stored as SHA-256
+-- hashes (the raw secret is shown to the operator exactly once at issuance
+-- time); the short ``prefix`` is kept in clear so a key can be referenced in
+-- logs and the admin CLI without exposing the secret.
+--
+-- ``user_id`` is a free-form identifier owned by the operator (email,
+-- username, integration name, ...).  No FK; we deliberately don't model a
+-- ``users`` table here — the keys table *is* the source of truth.
+--
+-- Provision keys with: ``python -m src.api.admin_keys create <user_id> --name <label>``
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS api_keys (
+    id              BIGSERIAL     PRIMARY KEY,
+    user_id         VARCHAR(128)  NOT NULL,
+    name            VARCHAR(128)  NOT NULL,
+    key_hash        CHAR(64)      NOT NULL UNIQUE,
+    prefix          VARCHAR(16)   NOT NULL,
+    scopes          TEXT[]        NOT NULL DEFAULT ARRAY[]::TEXT[],
+    created_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    last_used_at    TIMESTAMPTZ,
+    revoked_at      TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_active_hash
+    ON api_keys(key_hash) WHERE revoked_at IS NULL;

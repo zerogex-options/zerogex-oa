@@ -19,7 +19,7 @@ import pytz
 from .database import DatabaseManager
 from .errors import handle_api_errors
 from .middleware import RequestIdMiddleware
-from .security import api_key_auth
+from .security import api_key_auth, key_store
 from .models import (
     GEXSummary,
     GEXByStrike,
@@ -98,10 +98,16 @@ async def lifespan(app: FastAPI):
     await db_manager.connect()
     logger.info("Database connected successfully")
 
+    # Wire the per-user API-key store to the live DB pool so api_key_auth()
+    # can validate keys against the api_keys table.  Static API_KEY env-var
+    # auth (if set) keeps working alongside this.
+    key_store.configure(db_manager.pool)
+
     yield
 
     # Shutdown
     logger.info("Shutting down ZeroGEX API Server...")
+    key_store.configure(None)
     if db_manager:
         await db_manager.disconnect()
     logger.info("Shutdown complete")
