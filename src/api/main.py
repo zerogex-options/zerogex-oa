@@ -834,7 +834,20 @@ _TECHNICALS_SYMBOL_PATTERN = re.compile(r"^[A-Z.]{1,10}$")
 
 @app.get("/api/technicals", tags=["Technicals"])
 @handle_api_errors("GET /api/technicals")
-async def get_technicals(symbol: str = Query(default="SPY", min_length=1, max_length=10)):
+async def get_technicals(
+    symbol: str = Query(default="SPY", min_length=1, max_length=10),
+    intervals: Optional[int] = Query(
+        default=None,
+        ge=1,
+        le=960,
+        description=(
+            "If provided, return only the trailing N 1-minute bars (max "
+            "960 = 16h, the full extended ETF session). Use this for "
+            "cheap incremental polling — the full-session response can "
+            "exceed 900 bars × 4 metrics each."
+        ),
+    ),
+):
     """Combined per-minute timeseries of VWAP deviation, opening-range
     breakout, unusual volume spikes (all classes), and momentum divergence —
     plus the underlying close — for the most recent session.
@@ -855,6 +868,11 @@ async def get_technicals(symbol: str = Query(default="SPY", min_length=1, max_le
     before 09:30 ET have ``opening_range`` fields nulled out (the ORB
     window is 09:30–09:59 ET, so it doesn't exist yet).
 
+    Pass ``intervals=N`` to get only the last N 1-minute bars. The
+    response metadata (``session_start_et`` / ``session_end_et``) still
+    reports the canonical session boundaries; ``bars`` is the trimmed
+    tail.
+
     404 when ``symbol`` isn't in the ``symbols`` table; 200 with an
     empty ``bars`` list when the symbol exists but has no quote data.
 
@@ -869,7 +887,7 @@ async def get_technicals(symbol: str = Query(default="SPY", min_length=1, max_le
             detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
         )
 
-    result = await db_manager.get_technicals_timeseries(normalized)
+    result = await db_manager.get_technicals_timeseries(normalized, intervals=intervals)
     if result is None:
         raise HTTPException(status_code=404, detail="symbol not found")
     return result

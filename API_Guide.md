@@ -164,6 +164,9 @@ point-in-time snapshot, not a timeseries.
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
+- `intervals` (optional): trailing N 1-minute bars (1–960). Omit for the
+  full session. Use this for cheap incremental polling — the full-session
+  response can exceed 900 bars × 4 metric subobjects.
 
 **Response shape:**
 ```json

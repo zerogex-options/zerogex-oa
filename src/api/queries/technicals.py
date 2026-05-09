@@ -563,7 +563,9 @@ class TechnicalsQueriesMixin:
             logger.error(f"Error fetching momentum divergence: {e}", exc_info=True)
             raise
 
-    async def get_technicals_timeseries(self, symbol: str) -> Optional[Dict[str, Any]]:
+    async def get_technicals_timeseries(
+        self, symbol: str, intervals: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
         """Per-minute timeseries combining VWAP deviation, opening-range
         breakout, unusual volume spikes (all classes), and momentum
         divergence — plus the underlying close — for the most recent
@@ -577,28 +579,38 @@ class TechnicalsQueriesMixin:
         rolling stats are computed against a proxy ETF's per-bar volume
         when one is configured (SPX→SPY, NDX→QQQ, RUT→IWM, DJX→DIA).
 
+        ``intervals``: optional tail-window size in 1-minute bars (max
+        960). When provided, only the last ``intervals`` bars of the
+        session are returned and the rolling-stats lookback shrinks
+        from a full day to ~35 minutes — much faster for live polling.
+
         Returns ``None`` when ``symbol`` isn't in the symbols table; an
         empty ``bars`` list when the symbol exists but has no data for
         the most recent session.
         """
+        if intervals is not None:
+            intervals = max(1, min(int(intervals), 960))
+
+        cache_key = f"technicals_ts:{symbol}:{intervals}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         async with self._acquire_connection() as conn:
-            asset_type = await conn.fetchval(
+            row = await conn.fetchrow(
                 "SELECT asset_type FROM symbols WHERE symbol = $1",
                 symbol,
             )
-            symbol_exists = await conn.fetchval(
-                "SELECT 1 FROM symbols WHERE symbol = $1",
-                symbol,
-            )
-            if not symbol_exists:
+            if row is None:
                 return None
+            asset_type = row["asset_type"]
 
             latest_ts = await conn.fetchval(
                 "SELECT MAX(timestamp) FROM underlying_quotes WHERE symbol = $1",
                 symbol,
             )
             if latest_ts is None:
-                return {
+                empty = {
                     "symbol": symbol,
                     "asset_type": asset_type,
                     "session_date": None,
@@ -607,6 +619,8 @@ class TechnicalsQueriesMixin:
                     "volume_proxy": resolve_volume_proxy(symbol),
                     "bars": [],
                 }
+                self._cache_set(cache_key, empty, self._analytics_cache_ttl_seconds)
+                return empty
 
             session_date = latest_ts.astimezone(_ET).date()
             if asset_type == "INDEX":
@@ -618,11 +632,26 @@ class TechnicalsQueriesMixin:
             session_end = datetime.combine(session_date, end_t, tzinfo=_ET)
             orb_start = datetime.combine(session_date, time(9, 30), tzinfo=_ET)
             orb_end = datetime.combine(session_date, time(9, 59, 59), tzinfo=_ET)
-            # Lookback covers the previous trading day so that rolling-30
-            # window stats (volume sigma) and the 5-bar LAG used for
-            # momentum divergence have stable input from bar one of the
-            # session.
-            lookback_start = session_start - timedelta(days=1)
+
+            # Bar window: full session by default, or the trailing
+            # ``intervals`` 1-minute bars when the caller asks for a tail.
+            if intervals is not None:
+                bar_window_start = max(
+                    session_start,
+                    session_end - timedelta(minutes=intervals - 1),
+                )
+            else:
+                bar_window_start = session_start
+
+            # Lookback only needs to span 30 prior bars (vol-sigma rolling
+            # window) plus 5 (LAG-5 in divergence). When the bar window
+            # starts mid-session a 35-minute pad is plenty; when it
+            # starts at session open we need to span the overnight gap
+            # to pick up the previous session's tail.
+            if bar_window_start > session_start + timedelta(minutes=35):
+                lookback_start = bar_window_start - timedelta(minutes=35)
+            else:
+                lookback_start = session_start - timedelta(days=1)
 
             proxy = resolve_volume_proxy(symbol)
             volume_source = proxy or symbol
@@ -658,11 +687,15 @@ class TechnicalsQueriesMixin:
                     FROM underlying_target ut
                     LEFT JOIN volume_source vs ON vs.timestamp = ut.timestamp
                 ),
-                vwap_calc AS (
+                combined AS (
                     SELECT
                         timestamp,
                         close,
                         volume,
+                        up_volume,
+                        down_volume,
+                        native_up_volume,
+                        native_down_volume,
                         SUM(close * volume) OVER (
                             PARTITION BY DATE(timestamp AT TIME ZONE 'America/New_York')
                             ORDER BY timestamp
@@ -672,40 +705,7 @@ class TechnicalsQueriesMixin:
                             PARTITION BY DATE(timestamp AT TIME ZONE 'America/New_York')
                             ORDER BY timestamp
                             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                        ) AS cum_vol
-                    FROM joined
-                ),
-                vwap AS (
-                    SELECT
-                        timestamp,
-                        (cum_pv / NULLIF(cum_vol, 0))::numeric(12,4) AS vwap,
-                        ROUND(
-                            ((close - (cum_pv / NULLIF(cum_vol, 0)))
-                             / NULLIF((cum_pv / NULLIF(cum_vol, 0)), 0) * 100)::numeric,
-                            3
-                        ) AS vwap_deviation_pct,
-                        CASE
-                            WHEN NULLIF(cum_vol, 0) IS NULL THEN NULL
-                            WHEN close > (cum_pv / NULLIF(cum_vol, 0)) * 1.002 THEN '🔥 Extended Above VWAP'
-                            WHEN close > (cum_pv / NULLIF(cum_vol, 0)) THEN '✅ Above VWAP'
-                            WHEN close < (cum_pv / NULLIF(cum_vol, 0)) * 0.998 THEN '🔥 Extended Below VWAP'
-                            ELSE '❌ Below VWAP'
-                        END AS vwap_position
-                    FROM vwap_calc
-                ),
-                orb_window AS (
-                    SELECT
-                        MAX(high) AS orb_high,
-                        MIN(low) AS orb_low
-                    FROM underlying_target
-                    WHERE timestamp BETWEEN $6 AND $7
-                ),
-                vol_stats AS (
-                    SELECT
-                        timestamp,
-                        volume AS current_volume,
-                        up_volume,
-                        down_volume,
+                        ) AS cum_vol,
                         AVG(volume) OVER (
                             ORDER BY timestamp
                             ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
@@ -713,8 +713,17 @@ class TechnicalsQueriesMixin:
                         STDDEV_SAMP(volume) OVER (
                             ORDER BY timestamp
                             ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
-                        ) AS volume_stddev
+                        ) AS volume_stddev,
+                        close - LAG(close, 5) OVER (ORDER BY timestamp)
+                            AS price_change_5min
                     FROM joined
+                ),
+                orb_window AS (
+                    SELECT
+                        MAX(high) AS orb_high,
+                        MIN(low) AS orb_low
+                    FROM underlying_target
+                    WHERE timestamp BETWEEN $6 AND $7
                 ),
                 option_flow AS (
                     SELECT
@@ -727,71 +736,70 @@ class TechnicalsQueriesMixin:
                         )::numeric AS net_option_flow
                     FROM flow_contract_facts
                     WHERE symbol = $1
-                      AND timestamp BETWEEN $3 AND $5
+                      AND timestamp BETWEEN $4 AND $5
                     GROUP BY timestamp
-                ),
-                divergence AS (
-                    SELECT
-                        j.timestamp,
-                        j.close - LAG(j.close, 5) OVER (ORDER BY j.timestamp)
-                            AS price_change_5min,
-                        COALESCE(of.net_option_flow, 0) AS opt_flow,
-                        (j.native_up_volume - j.native_down_volume)::bigint
-                            AS native_net_volume
-                    FROM joined j
-                    LEFT JOIN option_flow of ON of.timestamp = j.timestamp
                 )
                 SELECT
-                    j.timestamp AT TIME ZONE 'America/New_York' AS time_et,
-                    j.timestamp,
-                    j.close,
-                    j.volume,
-                    v.vwap,
-                    v.vwap_deviation_pct,
-                    v.vwap_position,
-                    CASE WHEN j.timestamp >= $6 THEN ow.orb_high END AS orb_high,
-                    CASE WHEN j.timestamp >= $6 THEN ow.orb_low END AS orb_low,
-                    CASE WHEN j.timestamp >= $6
+                    c.timestamp AT TIME ZONE 'America/New_York' AS time_et,
+                    c.timestamp,
+                    c.close,
+                    c.volume,
+                    (c.cum_pv / NULLIF(c.cum_vol, 0))::numeric(12,4) AS vwap,
+                    ROUND(
+                        ((c.close - (c.cum_pv / NULLIF(c.cum_vol, 0)))
+                         / NULLIF((c.cum_pv / NULLIF(c.cum_vol, 0)), 0) * 100)::numeric,
+                        3
+                    ) AS vwap_deviation_pct,
+                    CASE
+                        WHEN NULLIF(c.cum_vol, 0) IS NULL THEN NULL
+                        WHEN c.close > (c.cum_pv / NULLIF(c.cum_vol, 0)) * 1.002 THEN '🔥 Extended Above VWAP'
+                        WHEN c.close > (c.cum_pv / NULLIF(c.cum_vol, 0)) THEN '✅ Above VWAP'
+                        WHEN c.close < (c.cum_pv / NULLIF(c.cum_vol, 0)) * 0.998 THEN '🔥 Extended Below VWAP'
+                        ELSE '❌ Below VWAP'
+                    END AS vwap_position,
+                    CASE WHEN c.timestamp >= $6 THEN ow.orb_high END AS orb_high,
+                    CASE WHEN c.timestamp >= $6 THEN ow.orb_low END AS orb_low,
+                    CASE WHEN c.timestamp >= $6
                          THEN (ow.orb_high - ow.orb_low) END AS orb_range,
-                    CASE WHEN j.timestamp >= $6
-                         THEN ROUND(j.close - ow.orb_high, 2) END
+                    CASE WHEN c.timestamp >= $6
+                         THEN ROUND(c.close - ow.orb_high, 2) END
                         AS distance_above_orb_high,
-                    CASE WHEN j.timestamp >= $6
-                         THEN ROUND(ow.orb_low - j.close, 2) END
+                    CASE WHEN c.timestamp >= $6
+                         THEN ROUND(ow.orb_low - c.close, 2) END
                         AS distance_below_orb_low,
-                    CASE WHEN j.timestamp >= $6
-                         THEN ROUND((j.close - ow.orb_low)
+                    CASE WHEN c.timestamp >= $6
+                         THEN ROUND((c.close - ow.orb_low)
                                     / NULLIF(ow.orb_high - ow.orb_low, 0)
                                     * 100, 1) END AS orb_pct,
                     CASE
-                        WHEN j.timestamp < $6 THEN NULL
-                        WHEN j.close > ow.orb_high THEN '🚀 ORB Breakout (Long)'
-                        WHEN j.close < ow.orb_low THEN '💥 ORB Breakdown (Short)'
-                        WHEN j.close >= ow.orb_high * 0.998 THEN '⚡ Near ORB High'
-                        WHEN j.close <= ow.orb_low * 1.002 THEN '⚡ Near ORB Low'
+                        WHEN c.timestamp < $6 THEN NULL
+                        WHEN c.close > ow.orb_high THEN '🚀 ORB Breakout (Long)'
+                        WHEN c.close < ow.orb_low THEN '💥 ORB Breakdown (Short)'
+                        WHEN c.close >= ow.orb_high * 0.998 THEN '⚡ Near ORB High'
+                        WHEN c.close <= ow.orb_low * 1.002 THEN '⚡ Near ORB Low'
                         ELSE '⏸️ Inside ORB'
                     END AS orb_status,
-                    vs.current_volume,
-                    COALESCE(vs.avg_volume, 0)::numeric(18,2) AS avg_volume,
+                    c.volume AS current_volume,
+                    COALESCE(c.avg_volume, 0)::numeric(18,2) AS avg_volume,
                     ROUND(
                         COALESCE(
-                            (vs.current_volume::numeric - vs.avg_volume)
-                            / NULLIF(vs.volume_stddev, 0),
+                            (c.volume::numeric - c.avg_volume)
+                            / NULLIF(c.volume_stddev, 0),
                             0
                         ),
                         2
                     ) AS volume_sigma,
                     ROUND(
                         COALESCE(
-                            vs.current_volume::numeric / NULLIF(vs.avg_volume, 0),
+                            c.volume::numeric / NULLIF(c.avg_volume, 0),
                             1
                         ),
                         2
                     ) AS volume_ratio,
                     ROUND(
                         COALESCE(
-                            vs.up_volume::numeric
-                            / NULLIF((vs.up_volume + vs.down_volume)::numeric, 0)
+                            c.up_volume::numeric
+                            / NULLIF((c.up_volume + c.down_volume)::numeric, 0)
                             * 100,
                             50
                         ),
@@ -799,47 +807,51 @@ class TechnicalsQueriesMixin:
                     ) AS buying_pressure_pct,
                     CASE
                         WHEN COALESCE(
-                            (vs.current_volume::numeric - vs.avg_volume)
-                            / NULLIF(vs.volume_stddev, 0),
+                            (c.volume::numeric - c.avg_volume)
+                            / NULLIF(c.volume_stddev, 0),
                             0
                         ) >= 3 THEN '🚨 Extreme Spike'
                         WHEN COALESCE(
-                            (vs.current_volume::numeric - vs.avg_volume)
-                            / NULLIF(vs.volume_stddev, 0),
+                            (c.volume::numeric - c.avg_volume)
+                            / NULLIF(c.volume_stddev, 0),
                             0
                         ) >= 2 THEN '⚡ High Spike'
                         WHEN COALESCE(
-                            (vs.current_volume::numeric - vs.avg_volume)
-                            / NULLIF(vs.volume_stddev, 0),
+                            (c.volume::numeric - c.avg_volume)
+                            / NULLIF(c.volume_stddev, 0),
                             0
                         ) >= 1 THEN '📈 Moderate Spike'
                         ELSE '⚪ Normal'
                     END AS volume_class,
-                    ROUND(d.price_change_5min, 2) AS chg_5m,
-                    d.opt_flow,
+                    ROUND(c.price_change_5min, 2) AS chg_5m,
+                    COALESCE(of.net_option_flow, 0)::numeric AS opt_flow,
                     CASE
-                        WHEN d.price_change_5min IS NULL THEN NULL
-                        WHEN d.price_change_5min > 0 AND d.opt_flow < -50000
+                        WHEN c.price_change_5min IS NULL THEN NULL
+                        WHEN c.price_change_5min > 0
+                             AND COALESCE(of.net_option_flow, 0) < -50000
                             THEN '🚨 Bearish Divergence (Price Up, Puts Buying)'
-                        WHEN d.price_change_5min < 0 AND d.opt_flow > 50000
+                        WHEN c.price_change_5min < 0
+                             AND COALESCE(of.net_option_flow, 0) > 50000
                             THEN '🚨 Bullish Divergence (Price Down, Calls Buying)'
-                        WHEN d.price_change_5min > 0 AND d.opt_flow > 50000
+                        WHEN c.price_change_5min > 0
+                             AND COALESCE(of.net_option_flow, 0) > 50000
                             THEN '🟢 Bullish Confirmation'
-                        WHEN d.price_change_5min < 0 AND d.opt_flow < -50000
+                        WHEN c.price_change_5min < 0
+                             AND COALESCE(of.net_option_flow, 0) < -50000
                             THEN '🔴 Bearish Confirmation'
-                        WHEN d.price_change_5min > 0 AND d.native_net_volume < 0
+                        WHEN c.price_change_5min > 0
+                             AND (c.native_up_volume - c.native_down_volume) < 0
                             THEN '⚠️ Weak Rally (Selling Volume)'
-                        WHEN d.price_change_5min < 0 AND d.native_net_volume > 0
+                        WHEN c.price_change_5min < 0
+                             AND (c.native_up_volume - c.native_down_volume) > 0
                             THEN '⚠️ Weak Selloff (Buying Volume)'
                         ELSE '⚪ Neutral'
                     END AS divergence_signal
-                FROM joined j
-                LEFT JOIN vwap v ON v.timestamp = j.timestamp
+                FROM combined c
                 CROSS JOIN orb_window ow
-                LEFT JOIN vol_stats vs ON vs.timestamp = j.timestamp
-                LEFT JOIN divergence d ON d.timestamp = j.timestamp
-                WHERE j.timestamp BETWEEN $4 AND $5
-                ORDER BY j.timestamp ASC
+                LEFT JOIN option_flow of ON of.timestamp = c.timestamp
+                WHERE c.timestamp BETWEEN $4 AND $5
+                ORDER BY c.timestamp ASC
             """
 
             try:
@@ -848,7 +860,7 @@ class TechnicalsQueriesMixin:
                     symbol,
                     volume_source,
                     lookback_start,
-                    session_start,
+                    bar_window_start,
                     session_end,
                     orb_start,
                     orb_end,
@@ -861,7 +873,7 @@ class TechnicalsQueriesMixin:
                 raise
 
         bars = [_format_technicals_bar(r) for r in rows]
-        return {
+        payload = {
             "symbol": symbol,
             "asset_type": asset_type,
             "session_date": session_date.isoformat(),
@@ -870,6 +882,8 @@ class TechnicalsQueriesMixin:
             "volume_proxy": proxy,
             "bars": bars,
         }
+        self._cache_set(cache_key, payload, self._analytics_cache_ttl_seconds)
+        return payload
 
 
 def _format_technicals_bar(row: Any) -> Dict[str, Any]:
