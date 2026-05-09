@@ -566,10 +566,10 @@ class TechnicalsQueriesMixin:
     async def get_technicals_timeseries(
         self, symbol: str, intervals: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
-        """Per-minute timeseries combining VWAP deviation, opening-range
-        breakout, unusual volume spikes (all classes), and momentum
-        divergence — plus the underlying close — for the most recent
-        session.
+        """Per 5-minute bar timeseries combining VWAP deviation,
+        opening-range breakout, unusual volume spikes (all classes),
+        and momentum divergence — plus the underlying close — for the
+        most recent session.
 
         Session window is decided by ``symbols.asset_type``:
             INDEX → 09:30–16:00 ET (cash session only)
@@ -579,17 +579,25 @@ class TechnicalsQueriesMixin:
         rolling stats are computed against a proxy ETF's per-bar volume
         when one is configured (SPX→SPY, NDX→QQQ, RUT→IWM, DJX→DIA).
 
-        ``intervals``: optional tail-window size in 1-minute bars (max
-        960). When provided, only the last ``intervals`` bars of the
-        session are returned and the rolling-stats lookback shrinks
-        from a full day to ~35 minutes — much faster for live polling.
+        Each bar represents a 5-minute bucket; ``timestamp`` is the
+        START of the bucket (e.g. 10:30 → 10:30:00–10:34:59). The bar
+        aggregates whichever 1-minute underlying bars have landed in
+        the bucket: ``close`` is the latest 1-minute close, ``volume``
+        is summed, ``high``/``low`` use max/min. While the bucket is
+        active the bar updates as new 1-minute bars arrive; once the
+        5-minute window closes the bar becomes immutable.
+
+        ``intervals``: optional tail-window size in 5-minute bars (max
+        192 = 16 hours). When provided, only the trailing N buckets are
+        returned and the rolling-stats lookback shrinks from a full
+        day to ~160 minutes — much faster for live polling.
 
         Returns ``None`` when ``symbol`` isn't in the symbols table; an
         empty ``bars`` list when the symbol exists but has no data for
         the most recent session.
         """
         if intervals is not None:
-            intervals = max(1, min(int(intervals), 960))
+            intervals = max(1, min(int(intervals), 192))
 
         cache_key = f"technicals_ts:{symbol}:{intervals}"
         cached = self._cache_get(cache_key)
@@ -634,22 +642,28 @@ class TechnicalsQueriesMixin:
             orb_end = datetime.combine(session_date, time(9, 59, 59), tzinfo=_ET)
 
             # Bar window: full session by default, or the trailing
-            # ``intervals`` 1-minute bars when the caller asks for a tail.
+            # ``intervals`` 5-minute buckets when the caller asks for a
+            # tail. Anchor on the most recent existing bar (clamped to
+            # session_end) so live mid-session polls actually return
+            # the trailing buckets — anchoring on session_end would put
+            # the window in the future during a live session.
             if intervals is not None:
+                anchor = min(latest_ts.astimezone(_ET), session_end)
                 bar_window_start = max(
                     session_start,
-                    session_end - timedelta(minutes=intervals - 1),
+                    anchor - timedelta(minutes=intervals * 5),
                 )
             else:
                 bar_window_start = session_start
 
-            # Lookback only needs to span 30 prior bars (vol-sigma rolling
-            # window) plus 5 (LAG-5 in divergence). When the bar window
-            # starts mid-session a 35-minute pad is plenty; when it
-            # starts at session open we need to span the overnight gap
-            # to pick up the previous session's tail.
-            if bar_window_start > session_start + timedelta(minutes=35):
-                lookback_start = bar_window_start - timedelta(minutes=35)
+            # Lookback needs to span 30 prior 5-minute buckets (vol-sigma
+            # rolling window) plus 1 prior bucket (LAG-1 used for the
+            # 5-minute price-change in divergence) — 31 × 5 = 155 minutes,
+            # rounded up to 160. When the bar window starts at session
+            # open we span the overnight gap with a 1-day lookback so
+            # bar one of the session has stable rolling input.
+            if bar_window_start > session_start + timedelta(minutes=160):
+                lookback_start = bar_window_start - timedelta(minutes=160)
             else:
                 lookback_start = session_start - timedelta(days=1)
 
@@ -657,35 +671,49 @@ class TechnicalsQueriesMixin:
             volume_source = proxy or symbol
 
             query = """
-                WITH underlying_target AS (
-                    SELECT timestamp, close, high, low, up_volume, down_volume
+                WITH bucketed_target AS (
+                    SELECT
+                        date_trunc('hour', timestamp)
+                          + FLOOR(EXTRACT(MINUTE FROM timestamp) / 5)
+                            * INTERVAL '5 minutes' AS bucket_ts,
+                        MAX(high) AS high,
+                        MIN(low) AS low,
+                        -- close = latest 1-minute close in the bucket
+                        (array_agg(close ORDER BY timestamp DESC))[1] AS close,
+                        SUM(up_volume) AS native_up_volume,
+                        SUM(down_volume) AS native_down_volume
                     FROM underlying_quotes
                     WHERE symbol = $1
                       AND timestamp BETWEEN $3 AND $5
+                    GROUP BY 1
                 ),
-                volume_source AS (
+                bucketed_volume_source AS (
                     SELECT
-                        timestamp,
-                        up_volume,
-                        down_volume,
-                        (up_volume + down_volume) AS volume
+                        date_trunc('hour', timestamp)
+                          + FLOOR(EXTRACT(MINUTE FROM timestamp) / 5)
+                            * INTERVAL '5 minutes' AS bucket_ts,
+                        SUM(up_volume) AS up_volume,
+                        SUM(down_volume) AS down_volume,
+                        SUM(up_volume + down_volume) AS volume
                     FROM underlying_quotes
                     WHERE symbol = $2
                       AND timestamp BETWEEN $3 AND $5
+                    GROUP BY 1
                 ),
                 joined AS (
                     SELECT
-                        ut.timestamp,
-                        ut.close,
-                        ut.high,
-                        ut.low,
-                        ut.up_volume AS native_up_volume,
-                        ut.down_volume AS native_down_volume,
-                        COALESCE(vs.up_volume, 0) AS up_volume,
-                        COALESCE(vs.down_volume, 0) AS down_volume,
-                        COALESCE(vs.volume, 0) AS volume
-                    FROM underlying_target ut
-                    LEFT JOIN volume_source vs ON vs.timestamp = ut.timestamp
+                        bt.bucket_ts AS timestamp,
+                        bt.close,
+                        bt.high,
+                        bt.low,
+                        bt.native_up_volume,
+                        bt.native_down_volume,
+                        COALESCE(bvs.up_volume, 0) AS up_volume,
+                        COALESCE(bvs.down_volume, 0) AS down_volume,
+                        COALESCE(bvs.volume, 0) AS volume
+                    FROM bucketed_target bt
+                    LEFT JOIN bucketed_volume_source bvs
+                      ON bvs.bucket_ts = bt.bucket_ts
                 ),
                 combined AS (
                     SELECT
@@ -714,7 +742,8 @@ class TechnicalsQueriesMixin:
                             ORDER BY timestamp
                             ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
                         ) AS volume_stddev,
-                        close - LAG(close, 5) OVER (ORDER BY timestamp)
+                        -- 5-minute price change = LAG-1 over 5-min bars
+                        close - LAG(close, 1) OVER (ORDER BY timestamp)
                             AS price_change_5min
                     FROM joined
                 ),
@@ -722,12 +751,14 @@ class TechnicalsQueriesMixin:
                     SELECT
                         MAX(high) AS orb_high,
                         MIN(low) AS orb_low
-                    FROM underlying_target
-                    WHERE timestamp BETWEEN $6 AND $7
+                    FROM bucketed_target
+                    WHERE bucket_ts BETWEEN $6 AND $7
                 ),
                 option_flow AS (
                     SELECT
-                        timestamp,
+                        date_trunc('hour', timestamp)
+                          + FLOOR(EXTRACT(MINUTE FROM timestamp) / 5)
+                            * INTERVAL '5 minutes' AS bucket_ts,
                         SUM(
                             CASE
                                 WHEN option_type = 'C' THEN premium_delta
@@ -737,7 +768,7 @@ class TechnicalsQueriesMixin:
                     FROM flow_contract_facts
                     WHERE symbol = $1
                       AND timestamp BETWEEN $4 AND $5
-                    GROUP BY timestamp
+                    GROUP BY 1
                 )
                 SELECT
                     c.timestamp AT TIME ZONE 'America/New_York' AS time_et,
@@ -849,7 +880,7 @@ class TechnicalsQueriesMixin:
                     END AS divergence_signal
                 FROM combined c
                 CROSS JOIN orb_window ow
-                LEFT JOIN option_flow of ON of.timestamp = c.timestamp
+                LEFT JOIN option_flow of ON of.bucket_ts = c.timestamp
                 WHERE c.timestamp BETWEEN $4 AND $5
                 ORDER BY c.timestamp ASC
             """

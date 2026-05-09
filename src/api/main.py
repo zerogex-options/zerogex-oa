@@ -839,45 +839,53 @@ async def get_technicals(
     intervals: Optional[int] = Query(
         default=None,
         ge=1,
-        le=960,
+        le=192,
         description=(
-            "If provided, return only the trailing N 1-minute bars (max "
-            "960 = 16h, the full extended ETF session). Use this for "
-            "cheap incremental polling — the full-session response can "
-            "exceed 900 bars × 4 metrics each."
+            "If provided, return only the trailing N 5-minute bars (max "
+            "192 = 16h, the full extended ETF session). Use this for "
+            "cheap incremental polling."
         ),
     ),
 ):
-    """Combined per-minute timeseries of VWAP deviation, opening-range
-    breakout, unusual volume spikes (all classes), and momentum divergence —
-    plus the underlying close — for the most recent session.
+    """Combined per 5-minute bar timeseries of VWAP deviation,
+    opening-range breakout, unusual volume spikes (all classes), and
+    momentum divergence — plus the underlying close — for the most
+    recent session.
 
     Session window depends on ``symbols.asset_type``:
       - ``INDEX`` → 09:30–16:00 ET (cash session only)
       - otherwise (ETF, EQUITY) → 04:00–20:00 ET (extended hours)
 
+    Each bar represents a 5-minute bucket; ``timestamp`` is the START
+    of the bucket (e.g. 10:30 → 10:30:00–10:34:59). The bar aggregates
+    whichever 1-minute underlying bars have landed in the bucket:
+    ``close`` is the latest 1-minute close, volumes are summed,
+    ``high`` / ``low`` use max / min. While the 5-minute window is
+    still active the bar updates as new 1-minute bars arrive; once the
+    window closes the bar becomes immutable.
+
     Cash indices have no native volume; VWAP and volume-spike rolling
-    stats are computed against a proxy ETF's per-bar volume when one is
-    configured (SPX→SPY, NDX→QQQ, RUT→IWM, DJX→DIA). The active proxy
-    is reported in the top-level ``volume_proxy`` field; ``null`` for
-    equities/ETFs.
+    stats are computed against a proxy ETF's per-bar volume when one
+    is configured (SPX→SPY, NDX→QQQ, RUT→IWM, DJX→DIA). The active
+    proxy is reported in the top-level ``volume_proxy`` field;
+    ``null`` for equities/ETFs.
 
     The "most recent session" is the trading day of the latest bar in
-    ``underlying_quotes`` for the symbol — i.e. the live session if it's
-    in progress, otherwise the most recent completed session. Bars
-    before 09:30 ET have ``opening_range`` fields nulled out (the ORB
-    window is 09:30–09:59 ET, so it doesn't exist yet).
+    ``underlying_quotes`` for the symbol — i.e. the live session if
+    it's in progress, otherwise the most recent completed session.
+    Bars before 09:30 ET have ``opening_range`` fields nulled out (the
+    ORB window is 09:30–09:59 ET, so it doesn't exist yet).
 
-    Pass ``intervals=N`` to get only the last N 1-minute bars. The
-    response metadata (``session_start_et`` / ``session_end_et``) still
-    reports the canonical session boundaries; ``bars`` is the trimmed
-    tail.
+    Pass ``intervals=N`` to get only the last N 5-minute buckets
+    (trailing from the most recent existing bar). The response
+    metadata (``session_start_et`` / ``session_end_et``) still reports
+    the canonical session boundaries; ``bars`` is the trimmed tail.
 
     404 when ``symbol`` isn't in the ``symbols`` table; 200 with an
     empty ``bars`` list when the symbol exists but has no quote data.
 
-    Dealer hedging is intentionally excluded — its underlying view is a
-    point-in-time snapshot, not a timeseries. Use
+    Dealer hedging is intentionally excluded — its underlying view is
+    a point-in-time snapshot, not a timeseries. Use
     ``/api/technicals/dealer-hedging`` for the current-state read.
     """
     normalized = symbol.strip().upper()

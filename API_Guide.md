@@ -146,13 +146,21 @@ Get current max pain with current underlying price, difference (`max_pain - unde
 ## Technicals
 
 ### GET /api/technicals
-Combined per-minute timeseries of VWAP deviation, opening-range breakout,
-unusual volume spikes (all classifications), and momentum divergence —
-plus the underlying close — for the most recent session.
+Combined per 5-minute bar timeseries of VWAP deviation, opening-range
+breakout, unusual volume spikes (all classifications), and momentum
+divergence — plus the underlying close — for the most recent session.
 
 Session window depends on `symbols.asset_type`:
 - `INDEX` → 09:30–16:00 ET (cash session only)
 - otherwise (ETF, EQUITY) → 04:00–20:00 ET (extended hours)
+
+Each bar is a 5-minute bucket; `timestamp` is the start of the bucket
+(e.g. `10:30` → `10:30:00–10:34:59`). The bar aggregates whichever
+1-minute underlying bars have landed in the bucket: `close` is the
+latest 1-minute close, volumes are summed, `high`/`low` use max/min.
+While the 5-minute window is still active the bar updates as new
+1-minute bars arrive; once the window closes the bar becomes
+immutable.
 
 Cash indices use a proxy ETF's volume for VWAP and volume-spike stats
 (SPX→SPY, NDX→QQQ, RUT→IWM, DJX→DIA); the active proxy is reported in
@@ -164,9 +172,10 @@ point-in-time snapshot, not a timeseries.
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
-- `intervals` (optional): trailing N 1-minute bars (1–960). Omit for the
-  full session. Use this for cheap incremental polling — the full-session
-  response can exceed 900 bars × 4 metric subobjects.
+- `intervals` (optional): trailing N 5-minute bars (1–192, where 192
+  bars × 5 min = 16h covers the full extended ETF session). Omit for
+  the full session. Tail anchors on the most recent existing bar —
+  safe for live mid-session polling.
 
 **Response shape:**
 ```json
