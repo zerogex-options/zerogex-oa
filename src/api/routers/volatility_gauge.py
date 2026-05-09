@@ -327,9 +327,7 @@ async def get_volatility_gauge():
 
     # Newest-first to match the convention used by the rest of the
     # timeseries APIs.
-    recent_bars = [
-        VIXBar(timestamp=b["timestamp"], close=b["close"]) for b in reversed(bars[-10:])
-    ]
+    recent_bars = [VIXBar(timestamp=b["timestamp"], close=b["close"]) for b in reversed(bars[-10:])]
 
     return VolatilityGaugeResponse(
         timestamp=latest["timestamp"],
