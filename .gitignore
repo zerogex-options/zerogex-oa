@@ -20,6 +20,9 @@ lib64/
 # Our deploy helpers live under deploy/lib/ — keep those tracked.
 !deploy/lib/
 !deploy/lib/**
+# ...but the wildcard above also un-ignores bytecode caches that show
+# up when the helpers are imported/tested.  Re-ignore them.
+deploy/lib/__pycache__/
 parts/
 sdist/
 var/
