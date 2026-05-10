@@ -29,9 +29,17 @@ import os
 import time as _time
 from typing import Any, Dict, Optional, Tuple
 
-from fastapi import Header, HTTPException, status
+from fastapi import Header, HTTPException, Security, status
+from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 
 logger = logging.getLogger(__name__)
+
+# Declared as security schemes so Swagger UI / ReDoc surface an
+# "Authorize" button.  ``auto_error=False`` lets us combine the two
+# schemes inside one dependency function without FastAPI raising
+# 403 on its own when a header is absent.
+_api_key_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
+_bearer_scheme = HTTPBearer(auto_error=False, bearerFormat="API-Key")
 
 _API_KEY: Optional[str] = (os.getenv("API_KEY") or "").strip() or None
 _ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development").strip().lower()
@@ -149,9 +157,18 @@ def _matches_static(provided: Optional[str]) -> bool:
     return hmac.compare_digest(provided, _API_KEY)
 
 
-def _extract_candidate(x_api_key: Optional[str], authorization: Optional[str]) -> Optional[str]:
+def _extract_candidate(
+    x_api_key: Optional[str],
+    bearer: Optional[HTTPAuthorizationCredentials],
+    authorization: Optional[str],
+) -> Optional[str]:
     if x_api_key:
         return x_api_key
+    if bearer and bearer.credentials:
+        return bearer.credentials
+    # Final fallback for callers that send a non-"Bearer" Authorization
+    # header that HTTPBearer ignores (rare, but preserves the original
+    # behavior of api_key_auth from before the security-scheme migration).
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
         return token or None
@@ -159,7 +176,8 @@ def _extract_candidate(x_api_key: Optional[str], authorization: Optional[str]) -
 
 
 async def api_key_auth(
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    x_api_key: Optional[str] = Security(_api_key_scheme),
+    bearer: Optional[HTTPAuthorizationCredentials] = Security(_bearer_scheme),
     authorization: Optional[str] = Header(default=None),
 ) -> Optional[Dict[str, Any]]:
     """FastAPI dependency that enforces the configured API-key scheme."""
@@ -168,7 +186,7 @@ async def api_key_auth(
     if not static_enabled and not db_enabled:
         return None  # auth fully disabled (dev/CI)
 
-    candidate = _extract_candidate(x_api_key, authorization)
+    candidate = _extract_candidate(x_api_key, bearer, authorization)
     if candidate:
         if static_enabled and _matches_static(candidate):
             return None

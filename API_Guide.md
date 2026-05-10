@@ -8,25 +8,38 @@ Base URL: `http://your-server:8000`
 
 ## Authentication
 
-Every endpoint accepts the API key in either header — pick one:
+**Every caller must send its own key.** Nginx no longer injects auth
+headers on anyone's behalf — there is no domain-wide bypass. Pick one
+header per request:
 
 ```
 X-API-Key: <your-key>
 Authorization: Bearer <your-key>
 ```
 
-The same key works in both headers; sending both is fine but only one is
-required. Requests with an invalid or missing key return `401 Unauthorized`
-with `WWW-Authenticate: Bearer`.
+Sending both is fine but only one is required. Requests with an invalid
+or missing key return `401 Unauthorized` with `WWW-Authenticate: Bearer`.
 
-Two key types are supported:
+Two key types are supported, validated against the same headers:
 
-- **Shared static key** — set via the `API_KEY` env var on the server.
-  One value, no per-user attribution. Useful for service-to-service calls.
-- **Per-user keys** — long-lived keys issued via the admin CLI and stored
-  hashed (SHA-256) in the `api_keys` table. Each request authenticates as
-  a specific `user_id`, and individual keys can be revoked without
-  affecting others.
+- **Per-user keys** *(primary)* — long-lived keys issued via the admin
+  CLI and stored hashed (SHA-256) in the `api_keys` table. Each request
+  authenticates as a specific `user_id`, and individual keys can be
+  revoked without affecting others. Every human or integration that
+  hits the API directly should have its own key. The website's
+  Next.js server holds its own key (`user_id=website-prod`) and sends
+  it on every API call.
+- **Shared static key** *(break-glass)* — set via the `API_KEY` env
+  var on the server. No per-user attribution. Kept for ops emergencies
+  and bootstrap; remove from `.env` once every caller has its own
+  per-user key.
+
+### Swagger UI
+
+Open `https://api.zerogex.io/docs`, click **Authorize** in the top right,
+paste your per-user key into either the `APIKeyHeader` or `HTTPBearer`
+field, click Authorize, then "Try it out" any endpoint. The key is sent
+on every subsequent request from that browser tab.
 
 ### Provisioning per-user keys
 
@@ -34,14 +47,15 @@ Run the admin CLI from the server (uses the same DB credentials as the
 API). The raw key is printed exactly once — copy it then.
 
 ```bash
-# Issue a key
+# Easiest: via Make
+make api-keys-create USER=alice@example.com NAME=alice-laptop
+make api-keys-list
+make api-keys-list USER=alice@example.com
+make api-keys-revoke ID=7
+
+# Or directly
 python -m src.api.admin_keys create alice@example.com --name "alice-laptop"
-
-# List keys (all, or for one user)
-python -m src.api.admin_keys list
-python -m src.api.admin_keys list --user-id alice@example.com
-
-# Revoke a key by its numeric id
+python -m src.api.admin_keys list [--user-id alice@example.com]
 python -m src.api.admin_keys revoke 7
 ```
 
