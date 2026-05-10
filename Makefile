@@ -329,6 +329,9 @@ help: ## Show this help message
 	@echo "  make api-health          - Show API service health and recent errors"
 	@echo "  make api-test            - Test API endpoints"
 	@echo "  make api-install-service - Install API as systemd service"
+	@echo "  make api-keys-create USER=<id> NAME=<label> - Issue a per-user API key"
+	@echo "  make api-keys-list [USER=<id>] - List per-user API keys"
+	@echo "  make api-keys-revoke ID=<n>    - Revoke a per-user API key"
 	@echo "  make db-maintain-install - Install daily DB maintenance timer (prune + vacuum)"
 	@echo "  make normalizer-cache-install - Install nightly normalizer-refresh timer (04:30 ET)"
 	@echo "  make normalizer-cache-status  - Show normalizer-refresh timer status + recent log"
@@ -2565,6 +2568,33 @@ api-show-key: ## Print the current API_KEY from .env (for debugging nginx mismat
 	else \
 		echo "$(YELLOW)⚠ $$NGINX_FILE not present (step 125 hasn't run)$(NC)"; \
 	fi
+
+# -----------------------------------------------------------------------------
+# Per-user API keys (api_keys table — see src/api/admin_keys.py)
+# -----------------------------------------------------------------------------
+.PHONY: api-keys-create
+api-keys-create: ## Create a per-user API key (USER=<id> NAME=<label> [SCOPE=<s>])
+	@if [ -z "$(USER)" ] || [ -z "$(NAME)" ]; then \
+		echo "$(RED)✗ Usage: make api-keys-create USER=<user_id> NAME=<label> [SCOPE=<scope>]$(NC)"; \
+		echo "  Example: make api-keys-create USER=alice@example.com NAME=alice-laptop"; \
+		exit 1; \
+	fi
+	@$(VENV_PYTHON) -m src.api.admin_keys create "$(USER)" --name "$(NAME)" \
+		$(if $(SCOPE),--scope "$(SCOPE)",)
+
+.PHONY: api-keys-list
+api-keys-list: ## List per-user API keys (optionally USER=<id> to filter)
+	@$(VENV_PYTHON) -m src.api.admin_keys list \
+		$(if $(USER),--user-id "$(USER)",)
+
+.PHONY: api-keys-revoke
+api-keys-revoke: ## Revoke a per-user API key (ID=<numeric id from api-keys-list>)
+	@if [ -z "$(ID)" ]; then \
+		echo "$(RED)✗ Usage: make api-keys-revoke ID=<numeric id>$(NC)"; \
+		echo "  Find the id with: make api-keys-list"; \
+		exit 1; \
+	fi
+	@$(VENV_PYTHON) -m src.api.admin_keys revoke "$(ID)"
 
 .PHONY: db-maintain-install
 db-maintain-install: ## Install daily DB maintenance timer (prune old data + vacuum)
