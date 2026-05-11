@@ -199,6 +199,39 @@ LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS = float(
 ANALYTICS_CACHE_TTL_SECONDS = float(os.getenv("ANALYTICS_CACHE_TTL_SECONDS", "5.0"))
 FLOW_ENDPOINT_CACHE_TTL_SECONDS = float(os.getenv("FLOW_ENDPOINT_CACHE_TTL_SECONDS", "3.0"))
 
+# /api/max-pain/current background refresh.
+#
+# The max-pain snapshot is computed by a heavy multi-CTE recompute over
+# option_chains that exceeds the per-statement timeout (~30s) for our active
+# underlyings during market hours.  Running it inline on every request triggers
+# 500s and (pre-PR-#77) cascaded into pool-reconnect storms.  Instead, refresh
+# the snapshot off the request path on a fixed cadence; the endpoint then
+# becomes a pure cache read of max_pain_oi_snapshot.
+#
+# Symbols not in MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS fall back to the original
+# on-demand recompute (still vulnerable to the 30s timeout, but only if anyone
+# polls for them).
+MAX_PAIN_BACKGROUND_REFRESH_ENABLED = (
+    os.getenv("MAX_PAIN_BACKGROUND_REFRESH_ENABLED", "true").lower() == "true"
+)
+MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS = [
+    s.strip().upper()
+    for s in os.getenv("MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS", "SPY,SPX,QQQ").split(",")
+    if s.strip()
+]
+MAX_PAIN_BACKGROUND_REFRESH_INTERVAL_SECONDS = max(
+    30, int(os.getenv("MAX_PAIN_BACKGROUND_REFRESH_INTERVAL_SECONDS", "300"))
+)
+MAX_PAIN_BACKGROUND_REFRESH_STRIKE_LIMIT = max(
+    10, min(1000, int(os.getenv("MAX_PAIN_BACKGROUND_REFRESH_STRIKE_LIMIT", "500")))
+)
+# Per-statement timeout override applied to the background refresh only,
+# allowing the heavy recompute to run beyond the pool's default
+# DB_STATEMENT_TIMEOUT_MS (~30s).  Applied via SET LOCAL inside a transaction.
+MAX_PAIN_BACKGROUND_REFRESH_STATEMENT_TIMEOUT_MS = max(
+    1000, int(os.getenv("MAX_PAIN_BACKGROUND_REFRESH_STATEMENT_TIMEOUT_MS", "120000"))
+)
+
 # =============================================================================
 # Aggregation Configuration
 # =============================================================================

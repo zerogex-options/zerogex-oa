@@ -9,12 +9,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from collections import deque
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, date as date_type
+import asyncio
 import os
 import re
 from typing import List, Optional, Literal
 import pytz
+
+from src import config
 
 from .database import DatabaseManager
 from .errors import handle_api_errors
@@ -87,6 +90,43 @@ def _parse_cors_origins(raw_origins: Optional[str]) -> List[str]:
     return origins
 
 
+async def _max_pain_refresh_loop() -> None:
+    """Periodically refresh max_pain_oi_snapshot rows off the request path.
+
+    The per-symbol recompute is heavy (>30s for SPY/SPX/QQQ) and previously
+    ran inline on every /api/max-pain/current request, which triggered
+    pool-reconnect storms.  This task moves the work into a fixed-cadence
+    background loop so the endpoint becomes a pure cache read.
+
+    Errors per-cycle are caught and logged; the loop keeps running.
+    """
+    interval = config.MAX_PAIN_BACKGROUND_REFRESH_INTERVAL_SECONDS
+    symbols = config.MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS
+    strike_limit = config.MAX_PAIN_BACKGROUND_REFRESH_STRIKE_LIMIT
+    statement_timeout_ms = config.MAX_PAIN_BACKGROUND_REFRESH_STATEMENT_TIMEOUT_MS
+    logger.info(
+        "max-pain background refresh loop starting: symbols=%s interval=%ds "
+        "strike_limit=%d statement_timeout=%dms",
+        symbols,
+        interval,
+        strike_limit,
+        statement_timeout_ms,
+    )
+    while True:
+        # Sleep first so we don't block startup with an immediate heavy refresh.
+        # The endpoint serves whatever is already in max_pain_oi_snapshot until
+        # the first tick completes.
+        await asyncio.sleep(interval)
+        try:
+            await db_manager.refresh_max_pain_snapshots(
+                symbols, strike_limit, statement_timeout_ms
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("max-pain background refresh cycle failed; will retry")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
@@ -107,10 +147,20 @@ async def lifespan(app: FastAPI):
     # on the next lookup instead of holding a stale, closed reference.
     key_store.configure(lambda: db_manager.pool)
 
+    max_pain_task: Optional[asyncio.Task] = None
+    if config.MAX_PAIN_BACKGROUND_REFRESH_ENABLED and config.MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS:
+        max_pain_task = asyncio.create_task(
+            _max_pain_refresh_loop(), name="max_pain_refresh_loop"
+        )
+
     yield
 
     # Shutdown
     logger.info("Shutting down ZeroGEX API Server...")
+    if max_pain_task is not None:
+        max_pain_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await max_pain_task
     key_store.configure(None)
     if db_manager:
         await db_manager.disconnect()

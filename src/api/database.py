@@ -190,6 +190,21 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._flow_endpoint_cache_ttl_seconds: float = float(
             os.getenv("FLOW_ENDPOINT_CACHE_TTL_SECONDS", "3.0")
         )
+        # Symbols whose max-pain snapshot is refreshed by a background task in
+        # the FastAPI lifespan; for these, get_max_pain_current skips the heavy
+        # inline _refresh_max_pain_snapshot call and just reads from the
+        # snapshot tables.  Symbols not listed here keep the original
+        # on-demand-recompute behavior.
+        self._max_pain_background_refresh_enabled: bool = (
+            os.getenv("MAX_PAIN_BACKGROUND_REFRESH_ENABLED", "true").lower() == "true"
+        )
+        self._max_pain_background_refresh_symbols: frozenset = frozenset(
+            s.strip().upper()
+            for s in os.getenv(
+                "MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS", "SPY,SPX,QQQ"
+            ).split(",")
+            if s.strip()
+        )
         self._read_cache: Dict[str, Tuple[float, Any]] = {}
         self._load_credentials()
 
@@ -1027,6 +1042,47 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 updated_at = NOW()
         """
         await conn.execute(sync_expirations_query, symbol)
+
+    async def refresh_max_pain_snapshots(
+        self,
+        symbols: List[str],
+        strike_limit: int,
+        statement_timeout_ms: int,
+    ) -> None:
+        """Refresh the max_pain_oi_snapshot table for the given symbols.
+
+        Designed to run from a background task — not the request path — so the
+        per-symbol recompute can take longer than the pool's default
+        ``DB_STATEMENT_TIMEOUT_MS``.  Errors per symbol are logged but do not
+        abort the loop.
+
+        :param symbols: list of underlyings to refresh, e.g. ``["SPY", "SPX"]``.
+        :param strike_limit: settlement-candidate cap (forwarded to
+            :meth:`_refresh_max_pain_snapshot`).
+        :param statement_timeout_ms: per-statement timeout override applied via
+            ``SET LOCAL`` inside a transaction so the heavy CTE chain can run
+            to completion.
+        """
+        for symbol in symbols:
+            symbol_upper = symbol.upper()
+            try:
+                async with self._acquire_connection() as conn:
+                    async with conn.transaction():
+                        await conn.execute(
+                            f"SET LOCAL statement_timeout = {int(statement_timeout_ms)}"
+                        )
+                        await self._refresh_max_pain_snapshot(conn, symbol_upper, strike_limit)
+                logger.info(
+                    "max-pain background refresh: %s OK (strike_limit=%d)",
+                    symbol_upper,
+                    strike_limit,
+                )
+            except Exception:
+                logger.warning(
+                    "max-pain background refresh failed for %s (non-fatal, will retry)",
+                    symbol_upper,
+                    exc_info=True,
+                )
 
     # ========================================================================
     # GEX Queries
@@ -2309,8 +2365,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ORDER BY expiration
         """
 
+        skip_inline_refresh = (
+            self._max_pain_background_refresh_enabled
+            and symbol in self._max_pain_background_refresh_symbols
+        )
         async with self._acquire_connection() as conn:
-            await self._refresh_max_pain_snapshot(conn, symbol, strike_limit)
+            if not skip_inline_refresh:
+                await self._refresh_max_pain_snapshot(conn, symbol, strike_limit)
             snapshot = await conn.fetchrow(snapshot_query, symbol)
             if not snapshot:
                 return None
