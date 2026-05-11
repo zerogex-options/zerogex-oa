@@ -2572,20 +2572,28 @@ api-show-key: ## Print the current API_KEY from .env (for debugging nginx mismat
 # -----------------------------------------------------------------------------
 # Per-user API keys (api_keys table — see src/api/admin_keys.py)
 # -----------------------------------------------------------------------------
+# $(USER) is a built-in make variable that defaults to $LOGNAME (e.g.
+# "ubuntu"), so `$(if $(USER),...)` is always truthy and `[ -z "$(USER)" ]`
+# is never empty. Only treat USER as the API key's user_id when it was
+# explicitly set on the make command line — otherwise these targets would
+# silently filter `api-keys-list` by user_id="ubuntu" (returning "(no keys)")
+# and let `api-keys-create NAME=foo` mint a key for user_id="ubuntu".
+KEY_USER := $(if $(filter command line,$(origin USER)),$(USER),)
+
 .PHONY: api-keys-create
 api-keys-create: ## Create a per-user API key (USER=<id> NAME=<label> [SCOPE=<s>])
-	@if [ -z "$(USER)" ] || [ -z "$(NAME)" ]; then \
+	@if [ -z "$(KEY_USER)" ] || [ -z "$(NAME)" ]; then \
 		echo "$(RED)✗ Usage: make api-keys-create USER=<user_id> NAME=<label> [SCOPE=<scope>]$(NC)"; \
 		echo "  Example: make api-keys-create USER=alice@example.com NAME=alice-laptop"; \
 		exit 1; \
 	fi
-	@$(VENV_PYTHON) -m src.api.admin_keys create "$(USER)" --name "$(NAME)" \
+	@$(VENV_PYTHON) -m src.api.admin_keys create "$(KEY_USER)" --name "$(NAME)" \
 		$(if $(SCOPE),--scope "$(SCOPE)",)
 
 .PHONY: api-keys-list
 api-keys-list: ## List per-user API keys (optionally USER=<id> to filter)
 	@$(VENV_PYTHON) -m src.api.admin_keys list \
-		$(if $(USER),--user-id "$(USER)",)
+		$(if $(KEY_USER),--user-id "$(KEY_USER)",)
 
 .PHONY: api-keys-revoke
 api-keys-revoke: ## Revoke a per-user API key (ID=<numeric id from api-keys-list>)
