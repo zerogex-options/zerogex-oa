@@ -376,22 +376,22 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             except Exception:
                 logger.warning("Failed to close old pool during reconnect", exc_info=True)
 
-    @asynccontextmanager
-    async def _acquire_connection(self):
-        """
-        Acquire a DB connection from the existing pool.
+    async def _acquire_with_retry(self) -> Tuple[asyncpg.Connection, asyncpg.Pool]:
+        """Acquire one connection with retry-once on transient acquire-time errors.
 
-        Fail fast when pool is unavailable/closing to avoid hidden retries and
-        request-level latency amplification.
+        Returns ``(connection, pool)``.  The caller must release the
+        connection back to the **same pool** it was acquired from rather
+        than ``self.pool``: a concurrent ``_reconnect_pool`` could swap
+        ``self.pool`` between acquire and release, and releasing to the
+        wrong pool corrupts pool accounting.
         """
         for attempt in range(2):
             pool = self.pool
             if not self._pool_is_usable(pool):
                 raise RuntimeError("Database pool is unavailable or closing")
             try:
-                async with pool.acquire() as conn:
-                    yield conn
-                    return
+                conn = await pool.acquire()
+                return conn, pool
             except Exception as e:
                 if attempt == 0 and self._is_transient_db_error(e):
                     logger.warning(
@@ -401,6 +401,33 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     await self._reconnect_pool()
                     continue
                 raise
+        raise RuntimeError("unreachable")  # for type checker; loop always returns or raises
+
+    @asynccontextmanager
+    async def _acquire_connection(self):
+        """
+        Acquire a DB connection from the existing pool.
+
+        Retries once on *transient acquire-time* errors (e.g., a pooled
+        connection that went stale across an RDS idle timeout): the pool
+        is reconnected and the acquire is retried.  Errors raised inside
+        the ``async with`` body are **not** retried — that would require
+        re-yielding through the asynccontextmanager, which ``contextlib``
+        does not support and which previously surfaced as the cryptic
+        ``RuntimeError: generator didn't stop after athrow()`` on top of
+        the original exception.  Callers that want their *use-time*
+        errors retried should implement that at their own level.
+
+        Fail fast when the pool is unavailable/closing.
+        """
+        conn, pool = await self._acquire_with_retry()
+        try:
+            yield conn
+        finally:
+            try:
+                await pool.release(conn)
+            except Exception:
+                logger.warning("Failed to release DB connection", exc_info=True)
 
     async def check_health(self) -> bool:
         """Check database connection health"""
