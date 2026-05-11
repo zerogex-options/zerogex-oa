@@ -323,6 +323,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
     @staticmethod
     def _is_transient_db_error(error: Exception) -> bool:
+        # Only classify true *connection/pool*-level failures as transient.
+        # In particular, do NOT match asyncpg's per-statement command_timeout
+        # (a bare TimeoutError raised from inside conn.execute): that means a
+        # specific query was slow, not that the pool is unhealthy. Treating
+        # statement timeouts as transient triggered pool-wide reconnects on
+        # every slow request and produced concurrent reconnect storms when
+        # several heavy queries (e.g. /api/max-pain/current) timed out in
+        # parallel. See the 2026-05-11 incident logs.
         text = str(error).lower()
         return any(
             token in text
@@ -335,9 +343,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 "connection is closed",
                 "pool is closed",
                 "pool is closing",
-                "timeout",
             )
-        ) or isinstance(error, (TimeoutError, ConnectionError, OSError))
+        ) or isinstance(error, (ConnectionError, OSError))
 
     async def _reconnect_pool(self) -> None:
         """Reconnect DB pool once under lock."""
