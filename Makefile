@@ -3,6 +3,30 @@
 # Usage: make <target>
 #
 # Common queries for monitoring and debugging the ZeroGEX platform
+#
+# ------------------------------------------------------------------------
+# Variable naming convention (READ BEFORE ADDING NEW TARGETS / VARIABLES)
+# ------------------------------------------------------------------------
+# GNU make pre-binds several variables from the environment and from its
+# own built-ins. They are ALWAYS set, regardless of whether the caller
+# passes them on the command line — so `$(if $(VAR),...)` is always
+# truthy and `[ -z "$(VAR)" ]` is never empty if VAR is one of these.
+#
+# Do NOT reuse these names as project-specific make variables:
+#
+#   USER         (Unix login name, e.g. "ubuntu")
+#   SHELL        (the shell make uses for recipes)
+#   MAKE, MAKEFLAGS, MAKEFILES, MAKEFILE_LIST, MAKE_HOST, MFLAGS,
+#   MAKECMDGOALS, MAKELEVEL, MAKEOVERRIDES
+#   CURDIR, PWD
+#   .DEFAULT_GOAL, .RECIPEPREFIX, .SUFFIXES, .VARIABLES
+#
+# Convention: prefix project-specific make-passable variables to avoid
+# collisions, e.g. KEY_USER (the api_keys CLI user_id, see ec6670a),
+# WEB_*, ZEROGEX_*, FLOW_SYMBOL, UNDERLYING_LIVE_SYMBOL, etc. If you must
+# accept a value via a name that overlaps a built-in, guard with
+# `$(filter command line,$(origin VAR))` so only explicit command-line
+# assignments are honored.
 
 # Load database connection from .env
 -include .env
