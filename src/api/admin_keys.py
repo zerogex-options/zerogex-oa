@@ -28,6 +28,7 @@ import hashlib
 import os
 import secrets
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -134,19 +135,24 @@ async def _list(user_id: Optional[str]) -> int:
         print("(no keys)")
         return 0
 
+    def _fmt_utc(dt: Optional[datetime]) -> str:
+        if dt is None:
+            return "-"
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
     header = (
         f"{'id':>5}  {'user_id':<32}  {'name':<24}  "
-        f"{'prefix':<10}  {'state':<8}  {'created_at':<26}  last_used_at"
+        f"{'prefix':<10}  {'state':<8}  "
+        f"{'created_at (UTC)':<19}  {'last_used_at (UTC)'}"
     )
     print(header)
     print("-" * len(header))
     for r in rows:
         state = "revoked" if r["revoked_at"] else "active"
-        last_used = r["last_used_at"].isoformat() if r["last_used_at"] else "-"
         print(
             f"{r['id']:>5}  {r['user_id']:<32}  {r['name']:<24}  "
             f"{r['prefix']:<10}  {state:<8}  "
-            f"{r['created_at'].isoformat():<26}  {last_used}"
+            f"{_fmt_utc(r['created_at']):<19}  {_fmt_utc(r['last_used_at'])}"
         )
     return 0
 
