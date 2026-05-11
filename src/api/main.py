@@ -101,7 +101,11 @@ async def lifespan(app: FastAPI):
     # Wire the per-user API-key store to the live DB pool so api_key_auth()
     # can validate keys against the api_keys table.  Static API_KEY env-var
     # auth (if set) keeps working alongside this.
-    key_store.configure(db_manager.pool)
+    #
+    # Pass a *getter* rather than the pool itself: if DatabaseManager later
+    # reconnects (replacing self.pool), the key store picks up the new pool
+    # on the next lookup instead of holding a stale, closed reference.
+    key_store.configure(lambda: db_manager.pool)
 
     yield
 

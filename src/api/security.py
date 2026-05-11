@@ -27,7 +27,7 @@ import hmac
 import logging
 import os
 import time as _time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import asyncpg
 
@@ -53,28 +53,40 @@ def _hash_key(raw: str) -> str:
 
 
 class _KeyStore:
-    """In-process cache + DB pool reference for per-user API keys.
+    """In-process cache + DB pool getter for per-user API keys.
 
-    The DB pool is registered at app startup via :meth:`configure`; if no
-    pool is registered the store reports ``is_enabled() == False`` and the
-    auth dependency falls back to static-key-only behavior.
+    The DB pool is registered at app startup via :meth:`configure` with a
+    callable that returns the current pool.  Looking it up lazily on every
+    request means a reconnect inside ``DatabaseManager`` (which replaces
+    ``DatabaseManager.pool`` with a fresh pool and closes the old one) is
+    transparent to the key store — the next ``lookup`` picks up the new
+    pool instead of holding a stale reference to the closed one.
+
+    If no getter is registered, or the getter returns ``None``, the store
+    reports ``is_enabled() == False`` and the auth dependency falls back
+    to static-key-only behavior.
     """
 
     def __init__(self) -> None:
-        self._pool: Any = None  # asyncpg.Pool, untyped to avoid hard import
+        self._get_pool: Optional[Callable[[], Any]] = None
         self._cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
         self._cache_ttl: float = float(os.getenv("API_KEY_CACHE_TTL_SECONDS", "60"))
         self._touch_throttle_seconds: float = 60.0
         self._last_touch: Dict[str, float] = {}
 
-    def configure(self, pool: Any) -> None:
-        """Register (or clear) the DB pool used for key lookups."""
-        self._pool = pool
+    def configure(self, get_pool: Optional[Callable[[], Any]]) -> None:
+        """Register (or clear) a callable that returns the current DB pool.
+
+        Pass ``lambda: db_manager.pool`` so that any future reconnect in
+        ``DatabaseManager`` is picked up on the next lookup.  Pass ``None``
+        to disable DB-backed auth (e.g. during shutdown).
+        """
+        self._get_pool = get_pool
         self._cache.clear()
         self._last_touch.clear()
 
     def is_enabled(self) -> bool:
-        return self._pool is not None
+        return self._get_pool is not None
 
     def invalidate(self) -> None:
         """Drop the lookup cache — call after CLI mutations to api_keys."""
@@ -82,7 +94,10 @@ class _KeyStore:
 
     async def lookup(self, raw_key: str) -> Optional[Dict[str, Any]]:
         """Return user info dict for an active key, or ``None``."""
-        if self._pool is None:
+        if self._get_pool is None:
+            return None
+        pool = self._get_pool()
+        if pool is None:
             return None
         key_hash = _hash_key(raw_key)
         now = _time.monotonic()
@@ -90,7 +105,7 @@ class _KeyStore:
         if cached and cached[0] > now:
             return cached[1]
         try:
-            async with self._pool.acquire() as conn:
+            async with pool.acquire() as conn:
                 row = await conn.fetchrow(
                     """
                     SELECT id, user_id, name, scopes
@@ -104,11 +119,10 @@ class _KeyStore:
             if "pool is closed" in str(e).lower():
                 logger.error(
                     "POOL_CLOSED: key_store lookup hit asyncpg "
-                    "InterfaceError('pool is closed'). DatabaseManager "
-                    "pool was torn down but key_store still holds the "
-                    "reference. FastAPI needs a restart to recover. "
-                    "See DatabaseManager.disconnect() stack log for "
-                    "the closing call site.",
+                    "InterfaceError('pool is closed') despite using "
+                    "a lazy pool getter. The getter returned a closed "
+                    "pool reference — investigate the DatabaseManager "
+                    "lifecycle.",
                     exc_info=True,
                 )
             else:
@@ -140,10 +154,13 @@ class _KeyStore:
             pass
 
     async def _touch(self, key_hash: str) -> None:
-        if self._pool is None:
+        if self._get_pool is None:
+            return
+        pool = self._get_pool()
+        if pool is None:
             return
         try:
-            async with self._pool.acquire() as conn:
+            async with pool.acquire() as conn:
                 await conn.execute(
                     "UPDATE api_keys SET last_used_at = NOW() WHERE key_hash = $1",
                     key_hash,

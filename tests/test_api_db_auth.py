@@ -12,6 +12,7 @@ import sys
 from typing import Any, Dict, Optional
 from unittest.mock import AsyncMock, MagicMock
 
+import asyncpg
 import pytest
 from fastapi.testclient import TestClient
 
@@ -19,11 +20,11 @@ from fastapi.testclient import TestClient
 def _reload_app(monkeypatch: pytest.MonkeyPatch, *, api_key: Optional[str] = None):
     """Reload src.api.main with a clean security module.
 
-    The real lifespan calls ``key_store.configure(db_manager.pool)`` at
-    startup; in tests we don't want it clobbering the fake pool we install
+    The real lifespan calls ``key_store.configure(lambda: db_manager.pool)``
+    at startup; in tests we don't want it clobbering the fake pool we install
     per-test, so we replace ``key_store.configure`` with a no-op for the
-    duration of the test.  Tests then call ``security.key_store._pool = ...``
-    (or use ``_install_pool`` below) to plug in their stub.
+    duration of the test.  Tests then use ``_install_pool`` below to plug in
+    their stub, which assigns a getter to ``security.key_store._get_pool``.
     """
     for name in ("API_KEY", "ENVIRONMENT", "CORS_ALLOW_ORIGINS"):
         monkeypatch.delenv(name, raising=False)
@@ -46,14 +47,21 @@ def _reload_app(monkeypatch: pytest.MonkeyPatch, *, api_key: Optional[str] = Non
     from src.api import security  # noqa: E402
 
     # Neutralize the lifespan's configure() so it can't overwrite our pool.
-    monkeypatch.setattr(security.key_store, "configure", lambda pool: None)
+    monkeypatch.setattr(security.key_store, "configure", lambda get_pool: None)
 
     return app, security
 
 
 def _install_pool(security_module, pool: Optional[Any]) -> None:
-    """Plug a fake pool directly into the key store, bypassing configure()."""
-    security_module.key_store._pool = pool
+    """Plug a fake pool directly into the key store, bypassing configure().
+
+    Passing ``pool=None`` leaves the key store disabled (``is_enabled() ==
+    False``), matching the production "no DB pool registered" state.
+    """
+    if pool is None:
+        security_module.key_store._get_pool = None
+    else:
+        security_module.key_store._get_pool = lambda: pool
     security_module.key_store._cache.clear()
     security_module.key_store._last_touch.clear()
 
@@ -202,3 +210,54 @@ def test_disabled_when_neither_static_nor_db_configured(monkeypatch: pytest.Monk
     with TestClient(app) as client:
         response = client.get("/api/health")
     assert response.status_code == 200, response.text
+
+
+def test_lookup_picks_up_reconnected_pool(monkeypatch: pytest.MonkeyPatch):
+    """After DatabaseManager._reconnect_pool swaps in a fresh pool (and
+    closes the old one), the next key_store lookup must use the new pool
+    instead of holding a stale, closed reference.
+
+    Regression for the 2026-05-11 prod incident: a transient DB acquire
+    error triggered _reconnect_pool, but pre-fix _KeyStore cached the
+    pool reference at configure-time and silently 401'd every request
+    until the service was restarted.
+    """
+    app, security = _reload_app(monkeypatch, api_key=None)
+
+    class _ClosedPool:
+        """Simulates the old pool after _reconnect_pool tears it down."""
+
+        def acquire(self):
+            class _CM:
+                async def __aenter__(self_inner):
+                    raise asyncpg.exceptions.InterfaceError("pool is closed")
+
+                async def __aexit__(self_inner, *exc):
+                    return False
+
+            return _CM()
+
+    pool_new = _FakePool({"id": 9, "user_id": "eve", "name": "eve-laptop", "scopes": []})
+
+    # Install a getter that returns the current pool — mirrors the
+    # lifespan's `lambda: db_manager.pool`.
+    current = {"pool": _ClosedPool()}
+    security.key_store._get_pool = lambda: current["pool"]
+    security.key_store._cache.clear()
+    security.key_store._last_touch.clear()
+
+    with TestClient(app) as client:
+        # First request lands on the closed pool — must 401, not 500.
+        r1 = client.get("/api/health", headers={"X-API-Key": "eve-key"})
+        assert r1.status_code == 401
+
+        # Simulate _reconnect_pool replacing db_manager.pool.
+        current["pool"] = pool_new
+
+        # Same raw key. The exception path doesn't populate the cache,
+        # so the second lookup re-consults the getter and reaches pool_new.
+        r2 = client.get("/api/health", headers={"X-API-Key": "eve-key"})
+        assert r2.status_code == 200, r2.text
+
+    # The new pool — not the closed one — served the second lookup.
+    assert len(pool_new.fetchrow_calls) == 1
