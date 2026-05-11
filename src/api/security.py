@@ -29,6 +29,8 @@ import os
 import time as _time
 from typing import Any, Dict, Optional, Tuple
 
+import asyncpg
+
 from fastapi import Header, HTTPException, Security, status
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 
@@ -98,6 +100,23 @@ class _KeyStore:
                     """,
                     key_hash,
                 )
+        except asyncpg.exceptions.InterfaceError as e:
+            if "pool is closed" in str(e).lower():
+                logger.error(
+                    "POOL_CLOSED: key_store lookup hit asyncpg "
+                    "InterfaceError('pool is closed'). DatabaseManager "
+                    "pool was torn down but key_store still holds the "
+                    "reference. FastAPI needs a restart to recover. "
+                    "See DatabaseManager.disconnect() stack log for "
+                    "the closing call site.",
+                    exc_info=True,
+                )
+            else:
+                logger.warning(
+                    "API-key DB lookup failed; treating as miss",
+                    exc_info=True,
+                )
+            return None
         except Exception:
             # DB errors must not 500 the request: log + cache miss briefly.
             logger.warning("API-key DB lookup failed; treating as miss", exc_info=True)

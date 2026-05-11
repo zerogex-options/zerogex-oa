@@ -7,6 +7,7 @@ import asyncio
 import asyncpg
 import os
 import time as time_module
+import traceback
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Tuple
 from datetime import datetime, timedelta, date, time, timezone
@@ -302,6 +303,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
     async def disconnect(self):
         """Close connection pool"""
+        logger.warning(
+            "DatabaseManager.disconnect() called — stack:\n%s",
+            "".join(traceback.format_stack()),
+        )
         if self.pool:
             await self.pool.close()
             logger.info("Database pool closed")
@@ -340,6 +345,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             old_pool = self.pool
             self.pool = await self._create_pool()
         if old_pool is not None:
+            logger.warning(
+                "DatabaseManager._reconnect_pool() closing old pool — stack:\n%s",
+                "".join(traceback.format_stack()),
+            )
             try:
                 await old_pool.close()
             except Exception:
