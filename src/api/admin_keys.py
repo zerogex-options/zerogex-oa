@@ -103,7 +103,6 @@ async def _create(user_id: str, name: str, scopes: Optional[List[str]]) -> int:
     print(f"  {raw}")
     print()
     print("Send the key in either header on every request:")
-    print(f"  X-API-Key: {raw}")
     print(f"  Authorization: Bearer {raw}")
     return 0
 
