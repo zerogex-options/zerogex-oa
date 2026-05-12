@@ -8,17 +8,22 @@ Base URL: `http://your-server:8000`
 
 ## Authentication
 
-**Every caller must send its own key.** Nginx no longer injects auth
-headers on anyone's behalf — there is no domain-wide bypass. Pick one
-header per request:
+**Every caller must send its own key.** Use the Bearer scheme on every
+request:
 
 ```
-X-API-Key: <your-key>
 Authorization: Bearer <your-key>
 ```
 
-Sending both is fine but only one is required. Requests with an invalid
-or missing key return `401 Unauthorized` with `WWW-Authenticate: Bearer`.
+`X-API-Key: <your-key>` is also accepted (read directly from request
+headers) for backward compatibility with callers that haven't migrated
+to Bearer yet. New integrations should use Bearer — it is the only
+scheme advertised in the OpenAPI spec, the only one shown in Swagger's
+Authorize modal, and the only one not subject to reverse-proxy header
+rewrites at any layer.
+
+Requests with an invalid or missing key return `401 Unauthorized` with
+`WWW-Authenticate: Bearer`.
 
 Two key types are supported, validated against the same headers:
 
@@ -27,19 +32,20 @@ Two key types are supported, validated against the same headers:
   authenticates as a specific `user_id`, and individual keys can be
   revoked without affecting others. Every human or integration that
   hits the API directly should have its own key. The website's
-  Next.js server holds its own key (`user_id=website-prod`) and sends
+  Next.js server holds its own key (`user_id=zerogex-web`) and sends
   it on every API call.
 - **Shared static key** *(break-glass)* — set via the `API_KEY` env
-  var on the server. No per-user attribution. Kept for ops emergencies
-  and bootstrap; remove from `.env` once every caller has its own
-  per-user key.
+  var on the server. No per-user attribution. Every successful match
+  is logged at WARNING with the caller's IP so stragglers can be
+  identified. Kept only for ops emergencies and bootstrap; will be
+  removed from `.env` once every caller has its own per-user key.
 
 ### Swagger UI
 
 Open `https://api.zerogex.io/docs`, click **Authorize** in the top right,
-paste your per-user key into either the `APIKeyHeader` or `HTTPBearer`
-field, click Authorize, then "Try it out" any endpoint. The key is sent
-on every subsequent request from that browser tab.
+paste your per-user key into the `HTTPBearer` field, click Authorize,
+then "Try it out" any endpoint. The key is sent on every subsequent
+request from that browser tab.
 
 ### Provisioning per-user keys
 
