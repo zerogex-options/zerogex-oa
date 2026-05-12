@@ -217,7 +217,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="append",
         default=None,
         dest="scopes",
-        help="Optional scope tag; repeat for multiple (currently advisory)",
+        # Stored in api_keys.scopes (text[]); not enforced anywhere in the
+        # request path today. Useful as an audit record of intended scope.
+        # Real enforcement would require a per-endpoint "required scopes"
+        # declaration and a check in api_key_auth after the DB lookup.
+        help="Optional scope tag, repeat for multiple. Advisory only — stored but not enforced.",
     )
 
     p_list = sub.add_parser("list", help="List API keys")

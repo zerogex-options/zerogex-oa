@@ -108,6 +108,11 @@ class _KeyStore:
             return cached[1]
         try:
             async with pool.acquire() as conn:
+                # `scopes` is selected for the audit/info dict but not
+                # enforced by the auth dependency. To enforce, callers
+                # would need a per-endpoint required-scope declaration
+                # (e.g. `Depends(require_scope("signals:read"))`) that
+                # inspects the info dict this lookup returns.
                 row = await conn.fetchrow(
                     """
                     SELECT id, user_id, name, scopes
