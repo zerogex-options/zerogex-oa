@@ -2593,25 +2593,15 @@ api-rotate-key: ## Regenerate break-glass static API_KEY in .env (CONFIRM=yes re
 # Recipe uses bash ${var:offset:len} substring syntax — Ubuntu's /bin/sh
 # (dash) doesn't support it.
 api-show-key: SHELL := /bin/bash
-api-show-key: ## Print the current API_KEY from .env (for debugging nginx mismatch)
+api-show-key: ## Print a fingerprint of the static API_KEY from .env (length + first 8 / last 4 chars)
 	@test -f .env || (echo "$(RED)✗ .env not found$(NC)" && exit 1)
 	@KEY=$$(grep -E '^API_KEY=' .env | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'"); \
 	if [ -z "$$KEY" ]; then \
-		echo "$(YELLOW)⚠ API_KEY is empty — auth is disabled$(NC)"; \
+		echo "$(YELLOW)⚠ API_KEY is empty — static-key auth is disabled (per-user keys still work).$(NC)"; \
 	else \
 		echo "API_KEY length: $${#KEY}"; \
 		echo "First 8 chars:  $${KEY:0:8}..."; \
 		echo "Last 4 chars:   ...$${KEY: -4}"; \
-	fi
-	@NGINX_FILE=/etc/nginx/conf.d/zerogex-api-key.conf; \
-	if sudo test -f $$NGINX_FILE; then \
-		NGINX_KEY=$$(sudo grep -oE '"[^"]+"' $$NGINX_FILE | tr -d '"'); \
-		echo "nginx file:     $$NGINX_FILE"; \
-		echo "nginx key len:  $${#NGINX_KEY}"; \
-		echo "nginx first 8:  $${NGINX_KEY:0:8}..."; \
-		echo "nginx last 4:   ...$${NGINX_KEY: -4}"; \
-	else \
-		echo "$(YELLOW)⚠ $$NGINX_FILE not present (step 125 hasn't run)$(NC)"; \
 	fi
 
 # -----------------------------------------------------------------------------
