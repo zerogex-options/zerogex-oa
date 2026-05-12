@@ -36,13 +36,9 @@ def test_refresh_max_pain_snapshot_uses_latest_oi_per_contract():
     assert "oc.timestamp = r.max_ts" not in snapshot_query
 
     # Discovery window must be bounded so the active-symbols scan stays cheap
-    # enough to fit under the statement_timeout. Widened from 1 day to 7 days
-    # so that on weekends and short holiday breaks the window still spans the
-    # most recent cash session — otherwise the snapshot collapses to whatever
-    # handful of contracts streamed sporadically off-hours and Max Pain comes
-    # back with only a few strikes.
-    assert "INTERVAL '7 days'" in snapshot_query
-    assert "oc.timestamp >= r.max_ts - INTERVAL '7 days'" in snapshot_query
+    # enough to fit under the statement_timeout.
+    assert "INTERVAL '1 day'" in snapshot_query
+    assert "oc.timestamp >= r.max_ts - INTERVAL '1 day'" in snapshot_query
 
     # Already-expired contracts must not leak into the snapshot now that we
     # look back across multiple sessions.
