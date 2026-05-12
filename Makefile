@@ -2572,6 +2572,9 @@ api-rotate-key: ## Rotate API_KEY in .env and re-sync nginx include (idempotent)
 	@echo "$(GREEN)✅ Rotation complete$(NC)"
 
 .PHONY: api-show-key
+# Recipe uses bash ${var:offset:len} substring syntax — Ubuntu's /bin/sh
+# (dash) doesn't support it.
+api-show-key: SHELL := /bin/bash
 api-show-key: ## Print the current API_KEY from .env (for debugging nginx mismatch)
 	@test -f .env || (echo "$(RED)✗ .env not found$(NC)" && exit 1)
 	@KEY=$$(grep -E '^API_KEY=' .env | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'"); \
