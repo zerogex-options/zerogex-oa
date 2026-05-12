@@ -44,6 +44,15 @@ logger = logging.getLogger(__name__)
 # unambiguous. ``auto_error=False`` lets the dependency raise its own 401.
 _bearer_scheme = HTTPBearer(auto_error=False, bearerFormat="API-Key")
 
+# Endpoints intentionally exposed without authentication. Entries here are
+# checked before any auth logic runs, so they bypass every credential check.
+# Used by external probes (ELB / ALB health targets, systemd ExecStartPost,
+# uptime monitors) that need a liveness signal without credential plumbing
+# — critical for Phase 7 when API_KEY is removed from .env: the systemd
+# unit's ExecStartPost curl /api/health would otherwise 401 and trip the
+# service into a restart loop.
+_PUBLIC_PATHS: Set[str] = {"/api/health"}
+
 _API_KEY: Optional[str] = (os.getenv("API_KEY") or "").strip() or None
 _ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development").strip().lower()
 
@@ -227,6 +236,11 @@ async def api_key_auth(
     bearer: Optional[HTTPAuthorizationCredentials] = Security(_bearer_scheme),
 ) -> Optional[Dict[str, Any]]:
     """FastAPI dependency that enforces the configured API-key scheme."""
+    # Public endpoints bypass auth entirely (see _PUBLIC_PATHS module
+    # docstring). Checked first so health probes never hit the DB.
+    if request.url.path in _PUBLIC_PATHS:
+        return None
+
     static_enabled = _API_KEY is not None
     db_enabled = key_store.is_enabled()
     if not static_enabled and not db_enabled:

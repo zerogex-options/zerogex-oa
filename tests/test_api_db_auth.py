@@ -17,7 +17,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 
-def _reload_app(monkeypatch: pytest.MonkeyPatch, *, api_key: Optional[str] = None):
+def _reload_app(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    api_key: Optional[str] = None,
+    public_paths: Optional[Any] = None,
+):
     """Reload src.api.main with a clean security module.
 
     The real lifespan calls ``key_store.configure(lambda: db_manager.pool)``
@@ -25,6 +30,13 @@ def _reload_app(monkeypatch: pytest.MonkeyPatch, *, api_key: Optional[str] = Non
     per-test, so we replace ``key_store.configure`` with a no-op for the
     duration of the test.  Tests then use ``_install_pool`` below to plug in
     their stub, which assigns a getter to ``security.key_store._get_pool``.
+
+    ``public_paths`` overrides ``security._PUBLIC_PATHS`` for the test. The
+    default ``None`` clears the set so every endpoint is auth-gated, which
+    is what the bulk of these tests want: they probe the auth dependency
+    via ``/api/health`` and expect a 401 on missing credentials. Pass an
+    explicit set (e.g. ``{"/api/health"}``) to validate the production
+    public-path behavior.
     """
     for name in ("API_KEY", "ENVIRONMENT", "CORS_ALLOW_ORIGINS"):
         monkeypatch.delenv(name, raising=False)
@@ -48,6 +60,12 @@ def _reload_app(monkeypatch: pytest.MonkeyPatch, *, api_key: Optional[str] = Non
 
     # Neutralize the lifespan's configure() so it can't overwrite our pool.
     monkeypatch.setattr(security.key_store, "configure", lambda get_pool: None)
+
+    monkeypatch.setattr(
+        security,
+        "_PUBLIC_PATHS",
+        set() if public_paths is None else set(public_paths),
+    )
 
     return app, security
 
@@ -152,6 +170,28 @@ def test_db_keyless_request_rejected(monkeypatch: pytest.MonkeyPatch):
     with TestClient(app) as client:
         response = client.get("/api/health")
     assert response.status_code == 401
+
+
+def test_health_endpoint_is_public(monkeypatch: pytest.MonkeyPatch):
+    """`/api/health` bypasses authentication entirely so external probes
+    (ELB/ALB health targets, the systemd ExecStartPost curl, uptime
+    monitors) can verify liveness without credentials. Production sets
+    ``_PUBLIC_PATHS = {"/api/health"}`` at module import time; this test
+    reinstates that default explicitly via ``_reload_app``."""
+    app, security = _reload_app(
+        monkeypatch, api_key=None, public_paths={"/api/health"}
+    )
+    pool = _FakePool(None)
+    _install_pool(security, pool)
+
+    with TestClient(app) as client:
+        response = client.get("/api/health")
+    assert response.status_code == 200, response.text
+    # The DB must not be consulted on the public-probe path — health
+    # probes fire constantly and must not contribute to api_keys load.
+    assert pool.fetchrow_calls == [], (
+        "/api/health should short-circuit before key_store.lookup"
+    )
 
 
 def test_static_key_still_works_alongside_db(monkeypatch: pytest.MonkeyPatch):
