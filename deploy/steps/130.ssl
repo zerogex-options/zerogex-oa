@@ -165,11 +165,17 @@ server {
         # + background_update keep users on cached values when upstream is slow.
         # MUST stay in sync with step 120's HTTP block and zerogex-web's
         # location /api/ block (see RUNBOOK "Sibling repo" section).
+        #
+        # The cache key includes the caller's auth headers so a cached 200
+        # from one credential is never served to a different credential
+        # (or to an anonymous request). Without this, any successful auth'd
+        # response opens a 5s window in which other callers can fetch the
+        # body without authenticating.
         proxy_cache zerogex_cache;
         proxy_cache_methods GET;
         proxy_cache_valid 200 5s;
         proxy_cache_valid 404 1s;
-        proxy_cache_key "\$request_method\$request_uri";
+        proxy_cache_key "\$request_method\$request_uri\$http_authorization\$http_x_api_key";
         proxy_cache_lock on;
         proxy_cache_lock_timeout 90s;
         proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
