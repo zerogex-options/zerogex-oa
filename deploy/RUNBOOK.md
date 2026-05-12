@@ -63,6 +63,18 @@ This creates a cross-repo nginx dependency:
   block (`proxy_cache zerogex_cache;` plus the matching `proxy_cache_*`
   directives, the looser `burst=1000` rate limit, and the 30s/120s/120s
   proxy timeouts).
+- **`proxy_cache_key` MUST include auth headers** in both repos. The
+  canonical value is:
+
+      proxy_cache_key "$request_method$request_uri$http_authorization$http_x_api_key";
+
+  Without `$http_authorization` / `$http_x_api_key` in the key, a 200
+  response cached for one caller is returned to any other caller
+  (authenticated or not) hitting the same URI within the 5s TTL,
+  which after `deploy/steps/125.api_auth` strips the nginx X-API-Key
+  injection becomes a 5-second-wide anonymous bypass for any URI a
+  real caller just warmed up. See zerogex-oa `ef63422` and
+  zerogex-web `06969c8` for the patch landing.
 
 **Both halves must be deployed for the API to survive peak trading
 load.** Without `zerogex-web`'s cache directives, all frontend `/api/*`
