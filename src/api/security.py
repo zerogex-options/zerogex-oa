@@ -27,7 +27,7 @@ import hmac
 import logging
 import os
 import time as _time
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 import asyncpg
 
@@ -73,6 +73,7 @@ class _KeyStore:
         self._cache_ttl: float = float(os.getenv("API_KEY_CACHE_TTL_SECONDS", "60"))
         self._touch_throttle_seconds: float = 60.0
         self._last_touch: Dict[str, float] = {}
+        self._touch_tasks: Set[asyncio.Task] = set()
 
     def configure(self, get_pool: Optional[Callable[[], Any]]) -> None:
         """Register (or clear) a callable that returns the current DB pool.
@@ -148,10 +149,14 @@ class _KeyStore:
             return
         self._last_touch[key_hash] = now
         try:
-            asyncio.create_task(self._touch(key_hash))
+            task = asyncio.create_task(self._touch(key_hash))
         except RuntimeError:
             # No running loop — nothing to schedule (e.g. during a sync test).
-            pass
+            return
+        # Strong-ref: asyncio loop only weak-refs tasks; without this, low-traffic
+        # touches can be GC'd mid-flight before the UPDATE lands.
+        self._touch_tasks.add(task)
+        task.add_done_callback(self._touch_tasks.discard)
 
     async def _touch(self, key_hash: str) -> None:
         if self._get_pool is None:
@@ -166,7 +171,7 @@ class _KeyStore:
                     key_hash,
                 )
         except Exception:
-            logger.debug("last_used_at touch failed", exc_info=True)
+            logger.warning("last_used_at touch failed", exc_info=True)
 
 
 key_store = _KeyStore()

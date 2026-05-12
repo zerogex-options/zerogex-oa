@@ -64,6 +64,7 @@ def _install_pool(security_module, pool: Optional[Any]) -> None:
         security_module.key_store._get_pool = lambda: pool
     security_module.key_store._cache.clear()
     security_module.key_store._last_touch.clear()
+    security_module.key_store._touch_tasks.clear()
 
 
 class _FakePool:
