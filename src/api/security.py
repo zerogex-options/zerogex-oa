@@ -72,7 +72,9 @@ class _KeyStore:
         self._get_pool: Optional[Callable[[], Any]] = None
         self._cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
         self._cache_ttl: float = float(os.getenv("API_KEY_CACHE_TTL_SECONDS", "60"))
-        self._touch_throttle_seconds: float = 60.0
+        self._touch_throttle_seconds: float = float(
+            os.getenv("API_KEY_TOUCH_THROTTLE_SECONDS", "60")
+        )
         self._last_touch: Dict[str, float] = {}
         self._touch_tasks: Set[asyncio.Task] = set()
 
