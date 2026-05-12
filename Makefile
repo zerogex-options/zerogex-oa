@@ -2556,8 +2556,26 @@ api-install-service: ## Install API as systemd service
 	@echo "$(YELLOW)Start with: make api-start$(NC)"
 
 .PHONY: api-rotate-key
-api-rotate-key: ## Rotate API_KEY in .env and re-sync nginx include (idempotent)
-	@echo "$(BLUE)=== Rotating API_KEY ===$(NC)"
+# `api-rotate-key` predates the per-user-key system. Since 5c7b6df,
+# deploy/steps/125.api_auth removes the legacy nginx X-API-Key injection
+# rather than refreshing it — so this target's only effect is to mint a
+# new static API_KEY in .env and restart the API. After Phase 7 (API_KEY
+# commented out), the target is meaningless and should not be run.
+#
+# Surviving use case: regenerate the break-glass static credential
+# in a hypothetical emergency (e.g. you must temporarily disable
+# per-user auth and force every caller onto a single shared secret).
+# That should be rare enough to gate on CONFIRM=yes.
+api-rotate-key: ## Regenerate break-glass static API_KEY in .env (CONFIRM=yes required). Rare; per-user keys are primary.
+	@if [ "$(CONFIRM)" != "yes" ]; then \
+		echo "$(RED)✗ Refusing to rotate the static API_KEY without CONFIRM=yes.$(NC)"; \
+		echo "  This is the break-glass shared secret, not a per-user key."; \
+		echo "  For per-user keys, use:  make api-keys-create USER=<id> NAME=<label>"; \
+		echo "  If you really mean to rotate the static credential, re-run with:"; \
+		echo "      make api-rotate-key CONFIRM=yes"; \
+		exit 1; \
+	fi
+	@echo "$(BLUE)=== Rotating break-glass API_KEY ===$(NC)"
 	@test -f .env || (echo "$(RED)✗ .env not found$(NC)" && exit 1)
 	@NEW_KEY=$$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))'); \
 	if grep -qE '^API_KEY=' .env; then \
@@ -2566,10 +2584,10 @@ api-rotate-key: ## Rotate API_KEY in .env and re-sync nginx include (idempotent)
 		printf 'API_KEY=%s\n' "$$NEW_KEY" >> .env; \
 	fi; \
 	chmod 600 .env; \
-	echo "$(GREEN)✓ New key written to .env$(NC)"
-	@echo "$(YELLOW)→ Re-running deploy/steps/125.api_auth to sync nginx + restart API...$(NC)"
+	echo "$(GREEN)✓ New static key written to .env$(NC)"
+	@echo "$(YELLOW)→ Re-running deploy/steps/125.api_auth (removes legacy nginx include if still present, then restarts the API)...$(NC)"
 	@bash deploy/steps/125.api_auth
-	@echo "$(GREEN)✅ Rotation complete$(NC)"
+	@echo "$(GREEN)✅ Rotation complete. Note: the new static key is NOT distributed to any caller — only api_key_auth's static-match path will accept it.$(NC)"
 
 .PHONY: api-show-key
 # Recipe uses bash ${var:offset:len} substring syntax — Ubuntu's /bin/sh
