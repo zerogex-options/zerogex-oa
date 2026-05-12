@@ -951,6 +951,13 @@ class UnifiedSignalEngine:
     #     single-bar flickers from firing alerts).
     _HYSTERESIS_CYCLES = max(1, int(os.getenv("SIGNAL_HYSTERESIS_CYCLES", "2")))
     _SCORE_DEDUPE_EPSILON = float(os.getenv("SIGNAL_SCORE_DEDUPE_EPSILON", "0.01"))
+    # Heartbeat: persist at least one row per signal per
+    # ``SIGNAL_HEARTBEAT_SECONDS`` window even when the score doesn't change.
+    # Without this, signals that genuinely sit near zero (e.g. trap_detection
+    # outside a breakout) produce sparse history — sometimes a single row for
+    # hours — and the score-history sparkline collapses.  300s = one row per
+    # 5-minute bucket, lining up with the bar cadence consumers expect.
+    _HEARTBEAT_SECONDS = max(0, int(os.getenv("SIGNAL_HEARTBEAT_SECONDS", "300")))
 
     def _persist_advanced_signals(self, market_context: MarketContext) -> list:
         results = self.advanced_signal_engine.evaluate(market_context)
@@ -965,6 +972,7 @@ class UnifiedSignalEngine:
                         {
                             "last_score": None,
                             "last_triggered": False,
+                            "last_persist_ts": None,
                             "streak": 0,
                             "event_emitted": False,
                         },
@@ -975,11 +983,15 @@ class UnifiedSignalEngine:
                     score_delta = (
                         abs(result.score - prev_score) if prev_score is not None else float("inf")
                     )
+                    heartbeat_due = self._heartbeat_due(
+                        state.get("last_persist_ts"), market_context.timestamp
+                    )
 
                     should_persist = (
                         prev_score is None
                         or score_delta >= self._SCORE_DEDUPE_EPSILON
                         or triggered != state["last_triggered"]
+                        or heartbeat_due
                     )
 
                     if should_persist:
@@ -1006,6 +1018,7 @@ class UnifiedSignalEngine:
                         )
                         state["last_score"] = result.score
                         state["last_triggered"] = triggered
+                        state["last_persist_ts"] = market_context.timestamp
 
                     # Hysteresis: accumulate streak of consecutive triggered
                     # cycles; only emit an event on the streak threshold.
@@ -1079,12 +1092,21 @@ class UnifiedSignalEngine:
         with db_connection() as conn:
             with conn.cursor() as cur:
                 for result in results:
-                    state = self._basic_state.setdefault(result.name, {"last_score": None})
+                    state = self._basic_state.setdefault(
+                        result.name, {"last_score": None, "last_persist_ts": None}
+                    )
                     prev_score = state["last_score"]
                     score_delta = (
                         abs(result.score - prev_score) if prev_score is not None else float("inf")
                     )
-                    if prev_score is not None and score_delta < self._SCORE_DEDUPE_EPSILON:
+                    heartbeat_due = self._heartbeat_due(
+                        state.get("last_persist_ts"), market_context.timestamp
+                    )
+                    if (
+                        prev_score is not None
+                        and score_delta < self._SCORE_DEDUPE_EPSILON
+                        and not heartbeat_due
+                    ):
                         continue
                     cur.execute(
                         """
@@ -1108,8 +1130,28 @@ class UnifiedSignalEngine:
                         ),
                     )
                     state["last_score"] = result.score
+                    state["last_persist_ts"] = market_context.timestamp
             conn.commit()
         return results
+
+    @classmethod
+    def _heartbeat_due(cls, last_persist_ts, current_ts) -> bool:
+        """Return True when the heartbeat window since the last persist has elapsed.
+
+        Forces an UPSERT of the latest score even when the value is identical
+        to the previous one, so signals that genuinely sit near zero (e.g.
+        trap_detection outside a breakout) still produce continuous history.
+        Off by default when ``SIGNAL_HEARTBEAT_SECONDS=0``.
+        """
+        if cls._HEARTBEAT_SECONDS <= 0:
+            return False
+        if last_persist_ts is None or current_ts is None:
+            return True
+        try:
+            elapsed = (current_ts - last_persist_ts).total_seconds()
+        except (TypeError, AttributeError):
+            return True
+        return elapsed >= cls._HEARTBEAT_SECONDS
 
     def _evaluate_playbook(
         self,

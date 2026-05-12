@@ -479,7 +479,7 @@ class AnalyticsEngine:
 
     def _calculate_max_pain(
         self, options: List[Dict[str, Any]], strike_range: Optional[Tuple[float, float]] = None
-    ) -> float:
+    ) -> Optional[float]:
         """
         Calculate Max Pain as the strike that minimizes total intrinsic payout.
 
@@ -493,7 +493,10 @@ class AnalyticsEngine:
             strike_range: Optional (min_strike, max_strike) to limit search
 
         Returns:
-            Max pain strike price
+            Max pain strike price, or ``None`` when there's no usable data.
+            (Returning ``0.0`` was a footgun — downstream consumers like
+            ``EODPressureSignal._pin_target`` would treat zero as a valid
+            pin anchor and saturate the pin-gravity score.)
         """
         # Get unique strikes
         strikes = sorted(set(opt["strike"] for opt in options))
@@ -502,7 +505,7 @@ class AnalyticsEngine:
             strikes = [s for s in strikes if strike_range[0] <= s <= strike_range[1]]
 
         if not strikes:
-            return 0.0
+            return None
 
         # Calculate total intrinsic payout at each candidate settlement strike.
         strike_payouts = {}
@@ -530,7 +533,7 @@ class AnalyticsEngine:
 
         # Max pain is where aggregate payout to holders is minimized
         if not strike_payouts:
-            return 0.0
+            return None
         max_pain_strike = min(strike_payouts.items(), key=lambda x: x[1])[0]
 
         return max_pain_strike
@@ -866,7 +869,11 @@ class AnalyticsEngine:
                     float(summary["max_gamma_value"]),
                     gamma_flip_point,
                     float(summary["put_call_ratio"]),
-                    float(summary["max_pain"]),
+                    (
+                        float(summary["max_pain"])
+                        if summary.get("max_pain") is not None
+                        else None
+                    ),
                     int(summary["total_call_volume"]),
                     int(summary["total_put_volume"]),
                     int(summary["total_call_oi"]),
@@ -1254,7 +1261,11 @@ class AnalyticsEngine:
                 if gex_summary.get("convexity_risk") is not None
                 else "Convexity Risk: N/A"
             )
-            logger.info(f"Max Pain: ${gex_summary['max_pain']:.2f}")
+            logger.info(
+                f"Max Pain: ${gex_summary['max_pain']:.2f}"
+                if gex_summary.get("max_pain") is not None
+                else "Max Pain: N/A"
+            )
             logger.info(f"Put/Call Ratio: {gex_summary['put_call_ratio']:.2f}")
             logger.info(f"Total Net GEX: {gex_summary['total_net_gex']:,.0f}")
             logger.info("=" * 80)

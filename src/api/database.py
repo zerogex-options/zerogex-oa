@@ -23,7 +23,17 @@ logger = logging.getLogger(__name__)
 
 
 _ET = ZoneInfo("America/New_York")
-SIGNAL_HISTORY_LIMIT = 90  # default running score history length
+# Default history depth for component score endpoints. Sized to span the two
+# most recent trading sessions at the engine's heartbeat cadence (~one row
+# per 5-min bucket, 24/5 engine = 12 * 24 hours per session * 2 sessions =
+# ~576 rows; round up for headroom across long weekends and signals that
+# flip more often than the heartbeat).
+SIGNAL_HISTORY_LIMIT = 600
+# Calendar lookback in days used as the time bound on score history reads.
+# 4 days covers two sessions across a normal weekend (Mon@now ↦ Fri full
+# session) and most US-holiday breaks; the row limit above caps the
+# result-set size on dense signals.
+SIGNAL_HISTORY_LOOKBACK_DAYS = 4
 
 
 def _get_session_bounds(session: str = "current") -> tuple:

@@ -366,12 +366,15 @@ async def get_action_card(
 @router.get("/score-history")
 async def get_score_history(
     underlying: str = Query(default="SPY"),
-    limit: int = Query(default=90, ge=1, le=5000),
+    limit: int = Query(default=600, ge=1, le=5000),
     db: DatabaseManager = Depends(get_db),
 ):
     """Time series of the composite MSI, newest-first.
 
-    **Params:** `underlying` (default `SPY`), `limit` (default 90, max 5000).
+    **Params:** `underlying` (default `SPY`), `limit` (default 600, max 5000).
+    The DB read also caps results to roughly two trading sessions back (the
+    four most recent calendar days) so the default response covers the
+    current and previous sessions without truncation across weekends.
 
     **Returns.** An array of objects with `timestamp`, `composite_score`, and
     `components` (same shape as `/score`). Rows are ordered by `timestamp DESC`

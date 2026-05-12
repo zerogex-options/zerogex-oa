@@ -24,9 +24,10 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger(__name__)
 
 _ET = ZoneInfo("America/New_York")
-# Must match the module constant in src/api/database.py; duplicated here
+# Must match the module constants in src/api/database.py; duplicated here
 # so these methods remain self-contained.  Keep the two in sync.
-SIGNAL_HISTORY_LIMIT = 90
+SIGNAL_HISTORY_LIMIT = 600
+SIGNAL_HISTORY_LOOKBACK_DAYS = 4
 
 
 class SignalsQueriesMixin:
@@ -147,22 +148,30 @@ class SignalsQueriesMixin:
         symbol: str,
         component_name: str,
         limit: int = SIGNAL_HISTORY_LIMIT,
+        lookback_days: int = SIGNAL_HISTORY_LOOKBACK_DAYS,
     ) -> list[Dict[str, Any]]:
         # Returns newest-first to match the convention used by the rest
         # of the timeseries APIs (sparkline clients should sort by
         # timestamp explicitly if a chronological draw order is needed).
+        # Bounded by both a row LIMIT and a calendar-day lookback: the
+        # lookback guarantees the response spans the previous trading
+        # session even on Monday morning (when ``two sessions back``
+        # straddles the weekend), and the LIMIT caps dense signals so a
+        # signal that flips on every cycle doesn't return a runaway list.
         rows = await conn.fetch(
             """
             SELECT timestamp, clamped_score
             FROM signal_component_scores
             WHERE underlying = $1
               AND component_name = $2
+              AND timestamp >= NOW() - make_interval(days => $4)
             ORDER BY timestamp DESC
             LIMIT $3
             """,
             symbol,
             component_name,
             limit,
+            lookback_days,
         )
         return [
             {
@@ -1076,6 +1085,9 @@ class SignalsQueriesMixin:
     async def get_signal_score_history(
         self, symbol: str = "SPY", limit: int = SIGNAL_HISTORY_LIMIT
     ) -> list[Dict[str, Any]]:
+        # Two-session lookback by calendar days plus a row cap. The composite
+        # MSI is persisted every cycle so dense underlyings can produce many
+        # thousands of rows over four days — LIMIT keeps the payload bounded.
         query = """
             SELECT
                 ss.underlying,
@@ -1084,12 +1096,13 @@ class SignalsQueriesMixin:
                 ss.components
             FROM signal_scores ss
             WHERE ss.underlying = $1
+              AND ss.timestamp >= NOW() - make_interval(days => $3)
             ORDER BY ss.timestamp DESC
             LIMIT $2
         """
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, symbol, limit)
+                rows = await conn.fetch(query, symbol, limit, SIGNAL_HISTORY_LOOKBACK_DAYS)
                 out = []
                 for row in rows:
                     d = dict(row)

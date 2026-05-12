@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from datetime import datetime
@@ -14,6 +15,8 @@ from src.signals.components.utils import (
     realized_sigma,
 )
 from src.signals.advanced.base import AdvancedSignalResult
+
+logger = logging.getLogger(__name__)
 
 # Charm magnitude (per-session aggregate) at which the score saturates.
 _CHARM_NORM = float(os.getenv("SIGNAL_EOD_CHARM_NORM", "2.0e7"))
@@ -62,8 +65,79 @@ class EODPressureSignal:
         pin_score = self._pin_gravity_score(ctx)
         amp = self._calendar_amplifier(ctx.timestamp)
 
+        # Inside the 14:30–15:45 ET active window the score should normally
+        # carry a non-trivial reading. When both sub-scores collapse to zero
+        # it's almost always an input-data problem (missing pin anchor, no
+        # dealer charm in the ATM band) rather than a genuinely flat market,
+        # so log the cause so it's visible in the engine log.
+        if charm_score == 0.0 and pin_score == 0.0:
+            self._log_zero_score_cause(ctx)
+
         combined = (_W_CHARM * charm_score + _W_PIN * pin_score) * amp * ramp
         return max(-1.0, min(1.0, combined))
+
+    def _log_zero_score_cause(self, ctx: MarketContext) -> None:
+        symbol = getattr(ctx, "underlying", "?")
+        timestamp = getattr(ctx, "timestamp", None)
+        pin_target = self._pin_target(ctx)
+        pin_source = self._pin_source(ctx)
+        band_pct = self._atm_band_pct(ctx)
+        extra = ctx.extra or {}
+        gex_rows = extra.get("gex_by_strike") or []
+        bucketed = extra.get("gex_by_strike_bucket") or {}
+
+        reasons: list[str] = []
+        if pin_target is None:
+            reasons.append("no pin anchor (max_pain and max_gamma_strike both unavailable)")
+        if ctx.close <= 0:
+            reasons.append("close <= 0 (no underlying quote)")
+        if not gex_rows and not bucketed:
+            reasons.append("no gex_by_strike rows in context")
+        else:
+            band_lo = ctx.close * (1 - band_pct) if ctx.close > 0 else 0.0
+            band_hi = ctx.close * (1 + band_pct) if ctx.close > 0 else 0.0
+            in_band = [
+                row for row in (gex_rows or [])
+                if isinstance(row, dict)
+                and row.get("strike") is not None
+                and band_lo <= float(row.get("strike", 0)) <= band_hi
+            ]
+            if not in_band:
+                reasons.append(
+                    f"no strikes in ATM band [{band_lo:.2f}, {band_hi:.2f}] "
+                    f"(band_pct={band_pct:.4f}); {len(gex_rows)} rows available"
+                )
+            else:
+                # Strikes are in band but their dealer-charm sums to zero.
+                # Could mean the column is unpopulated for those rows.
+                with_charm = [
+                    r for r in in_band
+                    if r.get("dealer_charm_exposure") not in (None, 0, 0.0)
+                    or r.get("charm_exposure") not in (None, 0, 0.0)
+                ]
+                if not with_charm:
+                    reasons.append(
+                        f"dealer/charm exposure is zero or missing on all "
+                        f"{len(in_band)} in-band strikes"
+                    )
+
+        if not reasons:
+            reasons.append(
+                "both sub-scores zero despite available inputs "
+                "(unexpected — investigate)"
+            )
+
+        logger.warning(
+            "eod_pressure score=0 [%s @ %s] pin_target=%s pin_source=%s "
+            "atm_band_pct=%.4f net_gex=%s: %s",
+            symbol,
+            timestamp.isoformat() if timestamp is not None else "?",
+            pin_target,
+            pin_source,
+            band_pct,
+            ctx.net_gex,
+            "; ".join(reasons),
+        )
 
     def evaluate(self, ctx: MarketContext) -> AdvancedSignalResult:
         score = self.compute(ctx)
@@ -167,17 +241,33 @@ class EODPressureSignal:
             if candidate is None:
                 continue
             try:
-                return float(candidate)
+                value = float(candidate)
             except (TypeError, ValueError):
                 continue
+            # Treat 0 / negative as "no anchor" — a real pin can't sit at the
+            # origin, and ``_calculate_max_pain`` historically returned 0.0
+            # when the option set had no OI. Without this guard the pin
+            # gravity score saturates to ±1.0 instead of dropping out.
+            if value > 0:
+                return value
         return None
 
     @staticmethod
     def _pin_source(ctx: MarketContext) -> str | None:
-        if ctx.max_pain is not None:
+        try:
+            mp = float(ctx.max_pain) if ctx.max_pain is not None else None
+        except (TypeError, ValueError):
+            mp = None
+        if mp is not None and mp > 0:
             return "max_pain"
-        if ctx.extra and ctx.extra.get("max_gamma_strike") is not None:
-            return "max_gamma_strike"
+        if ctx.extra:
+            try:
+                mg = ctx.extra.get("max_gamma_strike")
+                mgf = float(mg) if mg is not None else None
+            except (TypeError, ValueError):
+                mgf = None
+            if mgf is not None and mgf > 0:
+                return "max_gamma_strike"
         return None
 
     @staticmethod

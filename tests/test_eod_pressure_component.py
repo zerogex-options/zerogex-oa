@@ -191,3 +191,52 @@ def test_context_values_shape():
     assert "gamma_regime" in cv
     assert cv["gamma_regime"] == "positive"
     assert "calendar_flags" in cv
+
+
+def test_zero_pin_anchor_does_not_saturate_pin_gravity():
+    """``_calculate_max_pain`` historically returned 0.0 on empty option
+    sets and the signal then treated 0.0 as a legitimate pin, saturating
+    ``_pin_gravity_score`` to ±1.0. After the fix the signal must drop
+    out (score 0) instead of swinging hard with no anchor.
+    """
+    ctx = _ctx(max_pain=0.0)
+    # No max_gamma_strike fallback either — signal should fall through
+    # to "no pin anchor".
+    ctx.extra.pop("max_gamma_strike", None)
+    # No charm data either, so the only possible contribution would have
+    # been the (broken) pin-gravity saturation.
+    ctx.extra.pop("gex_by_strike", None)
+    assert comp.compute(ctx) == 0.0
+
+
+def test_zero_score_in_window_logs_warning(caplog):
+    """Active-window readings of exactly zero point to missing inputs;
+    surface the diagnosis in the engine log so on-call can see why."""
+    import logging
+
+    ctx = _ctx(max_pain=None)
+    ctx.extra.pop("max_gamma_strike", None)
+    ctx.extra.pop("gex_by_strike", None)
+    caplog.set_level(logging.WARNING, logger="src.signals.advanced.eod_pressure")
+    score = comp.compute(ctx)
+    assert score == 0.0
+    assert any(
+        "eod_pressure score=0" in record.getMessage()
+        for record in caplog.records
+    ), "expected a WARN-level diagnostic when the signal collapses in the window"
+
+
+def test_zero_score_outside_window_is_silent(caplog):
+    """Pre-window zeros are by design (ramp == 0). Don't spam the log."""
+    import logging
+
+    ctx = _ctx(hour=13, minute=0, max_pain=None)
+    ctx.extra.pop("max_gamma_strike", None)
+    ctx.extra.pop("gex_by_strike", None)
+    caplog.set_level(logging.WARNING, logger="src.signals.advanced.eod_pressure")
+    score = comp.compute(ctx)
+    assert score == 0.0
+    assert not any(
+        "eod_pressure score=0" in record.getMessage()
+        for record in caplog.records
+    ), "ramp-gated zero score should not trip the diagnostic warning"
