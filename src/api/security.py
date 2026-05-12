@@ -203,16 +203,21 @@ def _extract_candidate(
     bearer: Optional[HTTPAuthorizationCredentials],
     authorization: Optional[str],
 ) -> Optional[str]:
-    if x_api_key:
-        return x_api_key
+    # Bearer wins over X-API-Key when both are present: nginx may still
+    # `proxy_set_header X-API-Key "<static>"` during the migration window
+    # (legacy include in /etc/nginx/conf.d/), which overwrites the caller's
+    # X-API-Key but leaves Authorization untouched. Preferring Bearer lets a
+    # caller-supplied per-user key authenticate through that path.
     if bearer and bearer.credentials:
         return bearer.credentials
-    # Final fallback for callers that send a non-"Bearer" Authorization
-    # header that HTTPBearer ignores (rare, but preserves the original
-    # behavior of api_key_auth from before the security-scheme migration).
+    # Fall back to a raw Authorization header that HTTPBearer didn't parse
+    # (case-variant scheme name, extra whitespace, etc.).
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
-        return token or None
+        if token:
+            return token
+    if x_api_key:
+        return x_api_key
     return None
 
 

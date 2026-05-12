@@ -166,6 +166,32 @@ def test_static_key_still_works_alongside_db(monkeypatch: pytest.MonkeyPatch):
     assert response.status_code == 200, response.text
 
 
+def test_bearer_wins_when_xapikey_is_nginx_injected_static(monkeypatch: pytest.MonkeyPatch):
+    """Migration scenario: nginx injects X-API-Key=<static> regardless of what
+    the caller sent. Caller's per-user key arrives in Authorization: Bearer.
+    Bearer must win so the caller's key authenticates and last_used_at ticks
+    — otherwise the static path short-circuits and every migrating caller
+    appears anonymous."""
+    app, security = _reload_app(monkeypatch, api_key="nginx-injected-static")
+    alice_row = {"id": 42, "user_id": "alice", "name": "alice-prod", "scopes": []}
+    pool = _FakePool(alice_row)
+    _install_pool(security, pool)
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/health",
+            headers={
+                "X-API-Key": "nginx-injected-static",  # nginx clobbering layer
+                "Authorization": "Bearer alice-raw-key",  # caller's actual key
+            },
+        )
+    assert response.status_code == 200, response.text
+    # Critical: the DB lookup must have used the Bearer value, not the static.
+    assert pool.fetchrow_calls, "Bearer credential must trigger DB lookup"
+    _query, args = pool.fetchrow_calls[0]
+    assert args[0] == security._hash_key("alice-raw-key")
+
+
 def test_db_lookup_failure_returns_401_not_500(monkeypatch: pytest.MonkeyPatch):
     """A DB outage during lookup must surface as 401 (key invalid), not 500."""
     app, security = _reload_app(monkeypatch, api_key=None)
