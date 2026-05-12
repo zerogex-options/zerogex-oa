@@ -31,16 +31,17 @@ from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 import asyncpg
 
-from fastapi import Header, HTTPException, Security, status
-from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import HTTPException, Request, Security, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 logger = logging.getLogger(__name__)
 
-# Declared as security schemes so Swagger UI / ReDoc surface an
-# "Authorize" button.  ``auto_error=False`` lets us combine the two
-# schemes inside one dependency function without FastAPI raising
-# 403 on its own when a header is absent.
-_api_key_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
+# HTTPBearer is the only declared security scheme so Swagger UI surfaces a
+# single "Authorize" entry. X-API-Key is still accepted (read directly from
+# request headers in api_key_auth below) for the colocated BFF and any
+# legacy caller that hasn't moved to Authorization: Bearer yet, but it's
+# no longer advertised in the OpenAPI spec to keep the Authorize modal
+# unambiguous. ``auto_error=False`` lets the dependency raise its own 401.
 _bearer_scheme = HTTPBearer(auto_error=False, bearerFormat="API-Key")
 
 _API_KEY: Optional[str] = (os.getenv("API_KEY") or "").strip() or None
@@ -201,7 +202,6 @@ def _matches_static(provided: Optional[str]) -> bool:
 def _extract_candidate(
     x_api_key: Optional[str],
     bearer: Optional[HTTPAuthorizationCredentials],
-    authorization: Optional[str],
 ) -> Optional[str]:
     # Bearer wins over X-API-Key when both are present: nginx may still
     # `proxy_set_header X-API-Key "<static>"` during the migration window
@@ -210,21 +210,14 @@ def _extract_candidate(
     # caller-supplied per-user key authenticate through that path.
     if bearer and bearer.credentials:
         return bearer.credentials
-    # Fall back to a raw Authorization header that HTTPBearer didn't parse
-    # (case-variant scheme name, extra whitespace, etc.).
-    if authorization and authorization.lower().startswith("bearer "):
-        token = authorization[7:].strip()
-        if token:
-            return token
     if x_api_key:
         return x_api_key
     return None
 
 
 async def api_key_auth(
-    x_api_key: Optional[str] = Security(_api_key_scheme),
+    request: Request,
     bearer: Optional[HTTPAuthorizationCredentials] = Security(_bearer_scheme),
-    authorization: Optional[str] = Header(default=None),
 ) -> Optional[Dict[str, Any]]:
     """FastAPI dependency that enforces the configured API-key scheme."""
     static_enabled = _API_KEY is not None
@@ -232,7 +225,11 @@ async def api_key_auth(
     if not static_enabled and not db_enabled:
         return None  # auth fully disabled (dev/CI)
 
-    candidate = _extract_candidate(x_api_key, bearer, authorization)
+    # Read X-API-Key from raw request headers rather than declaring it via
+    # Security() so it doesn't surface as a separate Swagger Authorize entry
+    # or a per-endpoint parameter.
+    x_api_key = request.headers.get("X-API-Key")
+    candidate = _extract_candidate(x_api_key, bearer)
     if candidate:
         if static_enabled and _matches_static(candidate):
             return None
