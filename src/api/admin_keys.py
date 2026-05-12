@@ -12,9 +12,10 @@ Usage
     # Create a key for a user.  The raw secret is printed once — copy it now.
     python -m src.api.admin_keys create alice@example.com --name "alice-laptop"
 
-    # List all keys (or filter to one user).
+    # List all keys (or filter to one user, or hide revoked ones).
     python -m src.api.admin_keys list
     python -m src.api.admin_keys list --user-id alice@example.com
+    python -m src.api.admin_keys list --active
 
     # Revoke a key by its numeric id (active keys only).
     python -m src.api.admin_keys revoke 7
@@ -107,27 +108,28 @@ async def _create(user_id: str, name: str, scopes: Optional[List[str]]) -> int:
     return 0
 
 
-async def _list(user_id: Optional[str]) -> int:
+async def _list(user_id: Optional[str], active_only: bool) -> int:
+    filters: List[str] = []
+    params: List[Any] = []
+    if user_id:
+        params.append(user_id)
+        filters.append(f"user_id = ${len(params)}")
+    if active_only:
+        filters.append("revoked_at IS NULL")
+    where = f"WHERE {' AND '.join(filters)}" if filters else ""
+
     conn = await _connect()
     try:
-        if user_id:
-            rows = await conn.fetch(
-                """
-                SELECT id, user_id, name, prefix, scopes,
-                       created_at, last_used_at, revoked_at
-                FROM api_keys
-                WHERE user_id = $1
-                ORDER BY id
-                """,
-                user_id,
-            )
-        else:
-            rows = await conn.fetch("""
-                SELECT id, user_id, name, prefix, scopes,
-                       created_at, last_used_at, revoked_at
-                FROM api_keys
-                ORDER BY id
-                """)
+        rows = await conn.fetch(
+            f"""
+            SELECT id, user_id, name, prefix, scopes,
+                   created_at, last_used_at, revoked_at
+            FROM api_keys
+            {where}
+            ORDER BY id
+            """,
+            *params,
+        )
     finally:
         await conn.close()
 
@@ -140,20 +142,33 @@ async def _list(user_id: Optional[str]) -> int:
             return "-"
         return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-    header = (
-        f"{'id':>5}  {'user_id':<32}  {'name':<24}  "
-        f"{'prefix':<10}  {'state':<8}  "
-        f"{'created_at (UTC)':<19}  {'last_used_at (UTC)'}"
+    headers = (
+        "id", "user_id", "name", "prefix", "state",
+        "created_at (UTC)", "last_used_at (UTC)",
     )
-    print(header)
-    print("-" * len(header))
-    for r in rows:
-        state = "revoked" if r["revoked_at"] else "active"
-        print(
-            f"{r['id']:>5}  {r['user_id']:<32}  {r['name']:<24}  "
-            f"{r['prefix']:<10}  {state:<8}  "
-            f"{_fmt_utc(r['created_at']):<19}  {_fmt_utc(r['last_used_at'])}"
+    aligns = (">", "<", "<", "<", "<", "<", "<")
+    cells = [
+        (
+            str(r["id"]),
+            r["user_id"],
+            r["name"],
+            r["prefix"],
+            "revoked" if r["revoked_at"] else "active",
+            _fmt_utc(r["created_at"]),
+            _fmt_utc(r["last_used_at"]),
         )
+        for r in rows
+    ]
+    widths = [
+        max(len(h), *(len(row[i]) for row in cells))
+        for i, h in enumerate(headers)
+    ]
+    fmt = "  ".join(f"{{:{a}{w}}}" for a, w in zip(aligns, widths))
+    total_width = sum(widths) + 2 * (len(widths) - 1)
+    print(fmt.format(*headers).rstrip())
+    print("-" * total_width)
+    for row in cells:
+        print(fmt.format(*row).rstrip())
     return 0
 
 
@@ -208,6 +223,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_list = sub.add_parser("list", help="List API keys")
     p_list.add_argument("--user-id", default=None, help="Filter by user_id")
+    p_list.add_argument(
+        "--active",
+        action="store_true",
+        help="Show only active keys (omit revoked)",
+    )
 
     p_revoke = sub.add_parser("revoke", help="Revoke an API key by id")
     p_revoke.add_argument("key_id", type=int)
@@ -222,7 +242,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "create":
         return asyncio.run(_create(args.user_id, args.name, args.scopes))
     if args.cmd == "list":
-        return asyncio.run(_list(args.user_id))
+        return asyncio.run(_list(args.user_id, args.active))
     if args.cmd == "revoke":
         return asyncio.run(_revoke(args.key_id))
     parser.print_help()

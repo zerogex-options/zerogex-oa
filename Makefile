@@ -354,7 +354,7 @@ help: ## Show this help message
 	@echo "  make api-test            - Test API endpoints"
 	@echo "  make api-install-service - Install API as systemd service"
 	@echo "  make api-keys-create USER=<id> NAME=<label> - Issue a per-user API key"
-	@echo "  make api-keys-list [USER=<id>] - List per-user API keys"
+	@echo "  make api-keys-list [USER=<id>] [ACTIVE=yes] - List per-user API keys"
 	@echo "  make api-keys-revoke ID=<n>    - Revoke a per-user API key"
 	@echo "  make db-maintain-install - Install daily DB maintenance timer (prune + vacuum)"
 	@echo "  make normalizer-cache-install - Install nightly normalizer-refresh timer (04:30 ET)"
@@ -2615,9 +2615,10 @@ api-keys-create: ## Create a per-user API key (USER=<id> NAME=<label> [SCOPE=<s>
 		$(if $(SCOPE),--scope "$(SCOPE)",)
 
 .PHONY: api-keys-list
-api-keys-list: ## List per-user API keys (optionally USER=<id> to filter)
+api-keys-list: ## List per-user API keys (USER=<id> filters by user; ACTIVE=yes hides revoked)
 	@$(VENV_PYTHON) -m src.api.admin_keys list \
-		$(if $(KEY_USER),--user-id "$(KEY_USER)",)
+		$(if $(KEY_USER),--user-id "$(KEY_USER)",) \
+		$(if $(ACTIVE),--active,)
 
 .PHONY: api-keys-revoke
 api-keys-revoke: ## Revoke a per-user API key (ID=<numeric id from api-keys-list>)
