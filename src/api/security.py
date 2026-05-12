@@ -232,6 +232,18 @@ async def api_key_auth(
     candidate = _extract_candidate(x_api_key, bearer)
     if candidate:
         if static_enabled and _matches_static(candidate):
+            # Log WARNING so we can identify callers still using the static
+            # break-glass credential ahead of removing API_KEY from .env. The
+            # static path has no per-user attribution, so the source IP is the
+            # only signal we get here. Lives at WARNING (visible at the default
+            # journal level) so it surfaces in any periodic log review.
+            client_host = request.client.host if request.client else "unknown"
+            logger.warning(
+                "STATIC_KEY auth used from %s on %s %s",
+                client_host,
+                request.method,
+                request.url.path,
+            )
             return None
         if db_enabled:
             info = await key_store.lookup(candidate)
