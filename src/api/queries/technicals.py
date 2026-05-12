@@ -367,6 +367,8 @@ class TechnicalsQueriesMixin:
                 timestamp,
                 symbol,
                 price,
+                up_volume,
+                down_volume,
                 current_volume,
                 avg_volume,
                 volume_sigma,
@@ -423,6 +425,8 @@ class TechnicalsQueriesMixin:
                     iq.timestamp,
                     iq.symbol,
                     iq.price,
+                    COALESCE(pv.up_volume, 0) AS up_volume,
+                    COALESCE(pv.down_volume, 0) AS down_volume,
                     COALESCE(pv.volume, 0) AS current_volume,
                     AVG(COALESCE(pv.volume, 0)) OVER (
                         PARTITION BY iq.symbol
@@ -453,6 +457,8 @@ class TechnicalsQueriesMixin:
                 timestamp,
                 symbol,
                 price,
+                up_volume,
+                down_volume,
                 current_volume,
                 COALESCE(avg_volume, 0)::numeric(18,2) AS avg_volume,
                 ROUND(
@@ -820,6 +826,8 @@ class TechnicalsQueriesMixin:
                     c.timestamp,
                     c.close,
                     c.volume,
+                    c.up_volume,
+                    c.down_volume,
                     (c.cum_pv / NULLIF(c.cum_vol, 0))::numeric(12,4) AS vwap,
                     ROUND(
                         ((c.close - (c.cum_pv / NULLIF(c.cum_vol, 0)))
@@ -992,6 +1000,8 @@ def _format_technicals_bar(row: Any) -> Dict[str, Any]:
         },
         "volume_spike": {
             "current_volume": i(row["current_volume"]),
+            "up_volume": i(row["up_volume"]),
+            "down_volume": i(row["down_volume"]),
             "avg_volume": f(row["avg_volume"]),
             "volume_sigma": f(row["volume_sigma"]),
             "volume_ratio": f(row["volume_ratio"]),

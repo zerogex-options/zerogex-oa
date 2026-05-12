@@ -855,15 +855,23 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 ORDER BY timestamp DESC
                 LIMIT 1
             ),
-            -- Find option_symbols that streamed any update in the last day.
+            -- Find option_symbols that streamed any update in the last 7 days.
             -- The (underlying, timestamp DESC, option_symbol) index covers
             -- this scan, which DISTINCTs ~3K symbols out of ~1M rows for SPY.
+            -- The 7-day window (vs 1 day) keeps non-expired contracts in the
+            -- snapshot through weekends and short holiday breaks: if max_ts
+            -- shifts to a stray weekend quote, a 1-day window would drop most
+            -- of Friday's chain (last cash close) and produce a Max Pain
+            -- response with only a handful of strikes. 7 days covers the
+            -- longest typical gap (Friday close → Monday open across a
+            -- Mon-holiday) while staying small enough for the index scan to
+            -- complete well under the statement_timeout.
             active_symbols AS (
                 SELECT DISTINCT oc.option_symbol
                 FROM option_chains oc
                 CROSS JOIN should_refresh r
                 WHERE oc.underlying = $1
-                  AND oc.timestamp >= r.max_ts - INTERVAL '1 day'
+                  AND oc.timestamp >= r.max_ts - INTERVAL '7 days'
                   AND oc.timestamp <= r.max_ts
             ),
             -- For each active symbol, fetch its latest row via the
@@ -2570,10 +2578,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     async def get_open_interest(self, underlying: str) -> Optional[Dict[str, Any]]:
         """Get the most recent OI snapshot + per-contract directional dollar exposure.
 
-        Uses the stable-snapshot CTE to avoid returning an in-flight minute bucket
-        that ingestion is still populating; see STABLE_SNAPSHOT_CTE for details.
-        Returns one row per (strike, expiration, option_type) combination from the
-        chosen snapshot, ordered by expiration then strike then option_type.
+        Uses the stable-snapshot CTE to pick a quiesced reference timestamp,
+        then collapses to the latest row per non-expired contract (rather
+        than only contracts that streamed in the latest minute bucket).
+        This retains the last quote for contracts that stop streaming over
+        weekends/holidays — without it, the response shrinks to whatever
+        handful of contracts updated in the latest bucket. Active-symbol
+        discovery is bounded to the last 7 days to keep the scan cheap
+        enough to fit under the statement_timeout.
         """
         underlying = underlying.upper()
         query = f"""
@@ -2584,6 +2596,36 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 WHERE symbol = $1
                 ORDER BY timestamp DESC
                 LIMIT 1
+            ),
+            active_symbols AS (
+                SELECT DISTINCT oc.option_symbol
+                FROM option_chains oc, latest_ts lt
+                WHERE oc.underlying = $1
+                  AND oc.timestamp <= lt.ts
+                  AND oc.timestamp >= lt.ts - INTERVAL '7 days'
+            ),
+            latest_per_contract AS (
+                SELECT
+                    latest.timestamp,
+                    latest.underlying,
+                    latest.strike,
+                    latest.expiration,
+                    latest.option_type,
+                    latest.open_interest,
+                    latest.gamma,
+                    latest.updated_at
+                FROM active_symbols s
+                CROSS JOIN latest_ts lt
+                CROSS JOIN LATERAL (
+                    SELECT timestamp, underlying, strike, expiration,
+                           option_type, open_interest, gamma, updated_at
+                    FROM option_chains
+                    WHERE option_symbol = s.option_symbol
+                      AND timestamp <= lt.ts
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                ) latest
+                WHERE latest.expiration >= (lt.ts AT TIME ZONE 'America/New_York')::date
             )
             SELECT
                 oc.timestamp,
@@ -2603,11 +2645,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     * COALESCE(ls.spot_price, 0)
                 )::numeric AS exposure,
                 oc.updated_at
-            FROM option_chains oc
-            JOIN latest_ts lt ON oc.timestamp = lt.ts
+            FROM latest_per_contract oc
             CROSS JOIN latest_spot ls
-            WHERE oc.underlying = $1
-              AND oc.open_interest IS NOT NULL
+            WHERE oc.open_interest IS NOT NULL
             ORDER BY oc.expiration, oc.strike, oc.option_type
         """
         try:
@@ -2785,16 +2825,50 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             LIMIT 1
         """
 
+        # Collapse to one row per non-expired contract (latest row at or
+        # before the stable reference timestamp) rather than only contracts
+        # that streamed in the latest minute. Without this the surface
+        # collapses to a handful of strikes on weekends/holidays when only
+        # a few contracts stream sporadically; the new pattern retains the
+        # last quote for every still-active contract until fresh data
+        # arrives. Active-symbol discovery is bounded to 7 days to keep the
+        # scan within the statement_timeout.
         chain_query = f"""
             WITH {_STABLE_SNAPSHOT_CTE},
+            active_symbols AS (
+                SELECT DISTINCT oc.option_symbol
+                FROM option_chains oc, latest_ts lt
+                WHERE oc.underlying = $1
+                  AND oc.timestamp <= lt.ts
+                  AND oc.timestamp >= lt.ts - INTERVAL '7 days'
+            ),
+            latest_per_contract AS (
+                SELECT
+                    latest.strike,
+                    latest.expiration,
+                    latest.option_type,
+                    latest.implied_volatility,
+                    latest.delta,
+                    latest.open_interest
+                FROM active_symbols s
+                CROSS JOIN latest_ts lt
+                CROSS JOIN LATERAL (
+                    SELECT strike, expiration, option_type,
+                           implied_volatility, delta, open_interest
+                    FROM option_chains
+                    WHERE option_symbol = s.option_symbol
+                      AND timestamp <= lt.ts
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                ) latest
+                WHERE latest.expiration >= (lt.ts AT TIME ZONE 'America/New_York')::date
+                  AND latest.expiration <= CURRENT_DATE + make_interval(days => $2)
+            ),
             eligible_strikes AS (
                 SELECT strike
                 FROM (
                     SELECT DISTINCT strike
-                    FROM option_chains, latest_ts
-                    WHERE underlying = $1
-                      AND timestamp = latest_ts.ts
-                      AND expiration <= CURRENT_DATE + make_interval(days => $2)
+                    FROM latest_per_contract
                 ) sub
                 ORDER BY ABS(sub.strike - $3::numeric)
                 LIMIT $4
@@ -2806,12 +2880,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 oc.implied_volatility,
                 oc.delta,
                 oc.open_interest
-            FROM option_chains oc
-            CROSS JOIN latest_ts lt
+            FROM latest_per_contract oc
             JOIN eligible_strikes es ON es.strike = oc.strike
-            WHERE oc.underlying = $1
-              AND oc.timestamp = lt.ts
-              AND oc.expiration <= CURRENT_DATE + make_interval(days => $2)
             ORDER BY oc.expiration, oc.strike, oc.option_type
         """
 

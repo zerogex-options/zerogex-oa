@@ -700,6 +700,8 @@ WITH base AS (
         timestamp,
         symbol,
         close AS price,
+        up_volume,
+        down_volume,
         (up_volume + down_volume) AS current_volume,
         AVG(up_volume + down_volume) OVER (
             PARTITION BY symbol
@@ -725,6 +727,8 @@ SELECT
     timestamp,
     symbol,
     price,
+    up_volume,
+    down_volume,
     current_volume,
     COALESCE(avg_volume, 0)::numeric(18,2) AS avg_volume,
     ROUND(
