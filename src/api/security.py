@@ -72,7 +72,9 @@ class _KeyStore:
         self._get_pool: Optional[Callable[[], Any]] = None
         self._cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
         self._cache_ttl: float = float(os.getenv("API_KEY_CACHE_TTL_SECONDS", "60"))
-        self._touch_throttle_seconds: float = 60.0
+        self._touch_throttle_seconds: float = float(
+            os.getenv("API_KEY_TOUCH_THROTTLE_SECONDS", "60")
+        )
         self._last_touch: Dict[str, float] = {}
         self._touch_tasks: Set[asyncio.Task] = set()
 
@@ -108,6 +110,11 @@ class _KeyStore:
             return cached[1]
         try:
             async with pool.acquire() as conn:
+                # `scopes` is selected for the audit/info dict but not
+                # enforced by the auth dependency. To enforce, callers
+                # would need a per-endpoint required-scope declaration
+                # (e.g. `Depends(require_scope("signals:read"))`) that
+                # inspects the info dict this lookup returns.
                 row = await conn.fetchrow(
                     """
                     SELECT id, user_id, name, scopes
@@ -232,6 +239,18 @@ async def api_key_auth(
     candidate = _extract_candidate(x_api_key, bearer)
     if candidate:
         if static_enabled and _matches_static(candidate):
+            # Log WARNING so we can identify callers still using the static
+            # break-glass credential ahead of removing API_KEY from .env. The
+            # static path has no per-user attribution, so the source IP is the
+            # only signal we get here. Lives at WARNING (visible at the default
+            # journal level) so it surfaces in any periodic log review.
+            client_host = request.client.host if request.client else "unknown"
+            logger.warning(
+                "STATIC_KEY auth used from %s on %s %s",
+                client_host,
+                request.method,
+                request.url.path,
+            )
             return None
         if db_enabled:
             info = await key_store.lookup(candidate)
