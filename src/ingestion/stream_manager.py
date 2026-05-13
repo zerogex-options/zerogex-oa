@@ -1281,7 +1281,7 @@ class StreamManager:
                         yield {"type": "underlying", "data": underlying_data}
                         _total_underlying_yields += 1
                         _consecutive_empty_underlying = 0
-                    else:
+                    elif session == "regular":
                         _consecutive_empty_underlying += 1
                         if _consecutive_empty_underlying == _STALE_UNDERLYING_THRESHOLD:
                             cur_updates = self._underlying_accumulator.updates_received
@@ -1303,6 +1303,8 @@ class StreamManager:
                                 "Underlying bar stream still stale: " "%d consecutive empty drains",
                                 _consecutive_empty_underlying,
                             )
+                    else:
+                        _consecutive_empty_underlying = 0
 
                     # Drain only option contracts that changed since last cycle.
                     changed = self._accumulator.drain()
@@ -1339,7 +1341,10 @@ class StreamManager:
                                     f"(threshold "
                                     f"{self.option_oi_coverage_alert_threshold:.1%})"
                                 )
-                            if volume_coverage < self.option_volume_coverage_alert_threshold:
+                            if (
+                                session == "regular"
+                                and volume_coverage < self.option_volume_coverage_alert_threshold
+                            ):
                                 logger.warning(
                                     f"⚠️ Low option volume coverage: "
                                     f"{volume_coverage:.1%} "
