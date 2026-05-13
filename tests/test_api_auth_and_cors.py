@@ -54,6 +54,13 @@ def _build_app(
     dbmod.DatabaseManager.get_latest_quote = AsyncMock(return_value=None)
 
     from src.api.main import app  # noqa: E402
+    from src.api import security  # noqa: E402
+
+    # /api/health is exposed publicly in production so health probes don't
+    # need credentials, but these tests use it as their auth-dependency
+    # canary — clear the public-path set so every request reaches
+    # api_key_auth and 401s when credentials are missing or wrong.
+    monkeypatch.setattr(security, "_PUBLIC_PATHS", set())
 
     return app
 
