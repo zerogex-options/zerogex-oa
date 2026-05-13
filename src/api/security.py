@@ -99,7 +99,12 @@ class _KeyStore:
         self._last_touch.clear()
 
     def is_enabled(self) -> bool:
-        return self._get_pool is not None
+        if self._get_pool is None:
+            return False
+        try:
+            return self._get_pool() is not None
+        except Exception:
+            return False
 
     def invalidate(self) -> None:
         """Drop the lookup cache — call after CLI mutations to api_keys."""
