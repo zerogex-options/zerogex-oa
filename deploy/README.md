@@ -87,7 +87,7 @@ The deployment process runs these steps in order:
 - Creates `/data/monitoring` and `/data/backups`.
 
 ### Step 020: Database Setup (AWS RDS)
-- Installs `postgresql-client` for `psql`.
+- Installs `postgresql-client-17` from the apt.postgresql.org repo so the client major matches our RDS 17 server (avoids the `psql major version 16, server major version 17` warning that ships with Ubuntu 24.04's default `postgresql-client`).
 - Reads `DB_HOST` / `DB_PORT` / `DB_NAME` / `DB_USER` / `DB_PASSWORD` from `.env` (no prompts).
 - Tests connectivity, refuses to proceed on failure (with a hint about the RDS security group).
 - (Re)writes `~/.pgpass` from `.env` so admin `psql`/`pg_dump` invocations work passwordless.

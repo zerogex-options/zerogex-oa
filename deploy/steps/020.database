@@ -12,8 +12,31 @@ log "Database Setup (AWS RDS)"
 # DB_PORT/DB_NAME/DB_USER are also exported by 005.  Nothing to prompt here.
 PGPASS_FILE="$HOME/.pgpass"
 
-log "  → Installing PostgreSQL client tools..."
-sudo apt install -y postgresql-client
+# Ubuntu's default `postgresql-client` meta-package tracks the version
+# that shipped with the distro (16 on 24.04), so a stock install talks
+# to our RDS 17 server with a major-mismatch warning on every connect:
+#     WARNING: psql major version 16, server major version 17.
+# Pull in the PostgreSQL APT repo (apt.postgresql.org) and install the
+# matching major to silence the warning and pick up 17-aware psql
+# features (e.g. \conninfo extras, \drg, MERGE in \ef).  Idempotent —
+# skips the repo add and re-install if postgresql-client-17 is already
+# present.
+log "  → Installing PostgreSQL 17 client tools..."
+if ! dpkg -s postgresql-client-17 >/dev/null 2>&1; then
+    if [ ! -f /etc/apt/sources.list.d/pgdg.list ]; then
+        log "     → Adding apt.postgresql.org repository..."
+        sudo install -d /usr/share/postgresql-common/pgdg
+        sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        . /etc/os-release
+        echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+        sudo apt update
+    fi
+    sudo apt install -y postgresql-client-17
+else
+    log "     ✓ postgresql-client-17 already installed"
+fi
 
 log "  → Testing database connection to $DB_HOST:$DB_PORT/$DB_NAME as $DB_USER..."
 export PGPASSWORD="$DB_PASSWORD"
@@ -104,7 +127,7 @@ log ""
 log "Database setup complete!"
 log ""
 log "Summary:"
-log "  ✓ PostgreSQL client tools installed"
+log "  ✓ PostgreSQL 17 client tools installed (matches RDS major)"
 log "  ✓ Connection to AWS RDS verified"
 log "  ✓ Database schema applied"
 log "  ✓ .pgpass file created for passwordless access"

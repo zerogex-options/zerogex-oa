@@ -2455,11 +2455,18 @@ api-test: ## Test ALL API endpoints
 	SIGNAL_TIMEFRAMES="intraday swing multi_day"; \
 	PASSED=0; \
 	FAILED=0; \
-	KEY=$$(grep -E '^API_KEY=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'"); \
+	KEY=$$(grep -E '^OPS_API_KEY=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'"); \
+	KEY_SRC="OPS_API_KEY"; \
+	if [ -z "$$KEY" ]; then \
+		KEY=$$(grep -E '^API_KEY=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'"); \
+		KEY_SRC="API_KEY (break-glass)"; \
+	fi; \
 	if [ -n "$$KEY" ]; then \
-		echo "$(YELLOW)Auth: sending X-API-Key from .env (length=$${#KEY})$(NC)"; \
+		echo "$(YELLOW)Auth: sending X-API-Key from $$KEY_SRC (length=$${#KEY})$(NC)"; \
 	else \
-		echo "$(YELLOW)Auth: no API_KEY in .env (calls run unauthenticated)$(NC)"; \
+		echo "$(RED)✗ No OPS_API_KEY (or API_KEY) in .env — every protected endpoint will 401.$(NC)"; \
+		echo "$(YELLOW)  Mint one with:  make api-keys-create USER=ops NAME=ops-make-tests$(NC)"; \
+		echo "$(YELLOW)  then paste it as OPS_API_KEY=... in .env and re-run.$(NC)"; \
 	fi; \
 	do_curl() { \
 		if [ -n "$$KEY" ]; then \
@@ -2536,7 +2543,10 @@ staging-smoke: ## Run post-deploy staging smoke checklist
 	@systemctl is-active --quiet $(API_SERVICE) && echo "$(GREEN)✅ API service active$(NC)" || (echo "$(RED)❌ API service inactive$(NC)" && exit 1)
 	@echo ""
 	@echo "$(YELLOW)Checking core API endpoints...$(NC)"
-	@KEY=$$(grep -E '^API_KEY=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'"); \
+	@KEY=$$(grep -E '^OPS_API_KEY=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'"); \
+	if [ -z "$$KEY" ]; then \
+		KEY=$$(grep -E '^API_KEY=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'"); \
+	fi; \
 	AUTH=""; \
 	if [ -n "$$KEY" ]; then AUTH="-H X-API-Key:$$KEY"; fi; \
 	curl -fsS $$AUTH "http://localhost:8000/api/health" > /dev/null && echo "$(GREEN)✅ /api/health$(NC)" || (echo "$(RED)❌ /api/health$(NC)" && exit 1); \
