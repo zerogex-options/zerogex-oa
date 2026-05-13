@@ -16,7 +16,7 @@ import sys
 import time
 import time as _time
 from multiprocessing import Process
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from collections import defaultdict
 import pytz
@@ -68,11 +68,8 @@ class AnalyticsEngine:
         self.calculation_interval = calculation_interval
         self.risk_free_rate = risk_free_rate
         self.running = False
-        self.snapshot_lookback_minutes = max(
-            1, int(os.getenv("ANALYTICS_SNAPSHOT_LOOKBACK_MINUTES", "5"))
-        )
-        self.snapshot_freshness_seconds = max(
-            30, int(os.getenv("ANALYTICS_SNAPSHOT_FRESHNESS_SECONDS", "180"))
+        self.snapshot_lookback_hours = max(
+            1, int(os.getenv("ANALYTICS_SNAPSHOT_LOOKBACK_HOURS", "96"))
         )
         self.min_oi_coverage_pct_alert = float(
             os.getenv("ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT", "0.35")
@@ -169,10 +166,22 @@ class AnalyticsEngine:
                     logger.warning("No underlying price found for snapshot")
                     return None
 
-                # 3. Latest per-contract option quote in the lookback
-                # window.  Literal ``timestamp`` values let the planner
-                # use idx_option_chains_underlying_ts_gamma.
-                lookback_start = timestamp - timedelta(minutes=self.snapshot_lookback_minutes)
+                # 3. Latest per-contract option quote, scoped to the
+                # lookback window plus the contract-expiration roll-off.
+                # Literal ``timestamp`` values let the planner use
+                # idx_option_chains_underlying_ts_gamma; the wide default
+                # window (96 hours) covers long-weekend / holiday gaps
+                # so the first analytics cycle after a break still sees
+                # the prior session's closing quotes for every contract.
+                # ``min_expiration`` removes contracts that have already
+                # cleared their 16:15 ET settlement cutoff at the snapshot
+                # wall-clock time.
+                lookback_start = timestamp - timedelta(hours=self.snapshot_lookback_hours)
+                ts_et = timestamp.astimezone(ET)
+                if ts_et.time() < dt_time(16, 15):
+                    min_expiration = ts_et.date() - timedelta(days=1)
+                else:
+                    min_expiration = ts_et.date()
                 cursor.execute(
                     """
                     SELECT DISTINCT ON (oc.option_symbol)
@@ -195,52 +204,43 @@ class AnalyticsEngine:
                     WHERE oc.underlying = %s
                       AND oc.timestamp <= %s
                       AND oc.timestamp >= %s
+                      AND oc.expiration > %s
                       AND oc.gamma IS NOT NULL
                     ORDER BY oc.option_symbol, oc.timestamp DESC
                     LIMIT 2000
                     """,
-                    (self.db_symbol, timestamp, lookback_start),
+                    (self.db_symbol, timestamp, lookback_start, min_expiration),
                 )
                 rows = cursor.fetchall()
                 conn.commit()
 
-                options = []
-                stale_cutoff = timestamp - timedelta(seconds=self.snapshot_freshness_seconds)
-                stale_dropped = 0
-
-                for row in rows:
-                    quote_ts = row[14]
-                    if quote_ts and quote_ts < stale_cutoff:
-                        stale_dropped += 1
-                        continue
-                    options.append(
-                        {
-                            "option_symbol": row[0],
-                            "strike": float(row[1]),
-                            "expiration": row[2],
-                            "option_type": row[3],
-                            "last": float(row[4]) if row[4] else 0.0,
-                            "bid": float(row[5]) if row[5] else 0.0,
-                            "ask": float(row[6]) if row[6] else 0.0,
-                            "volume": int(row[7]) if row[7] else 0,
-                            "open_interest": int(row[8]) if row[8] else 0,
-                            "delta": float(row[9]) if row[9] else 0.0,
-                            "gamma": float(row[10]) if row[10] else 0.0,
-                            "theta": float(row[11]) if row[11] else 0.0,
-                            "vega": float(row[12]) if row[12] else 0.0,
-                            "implied_volatility": float(row[13]) if row[13] else 0.2,
-                        }
-                    )
+                options = [
+                    {
+                        "option_symbol": row[0],
+                        "strike": float(row[1]),
+                        "expiration": row[2],
+                        "option_type": row[3],
+                        "last": float(row[4]) if row[4] else 0.0,
+                        "bid": float(row[5]) if row[5] else 0.0,
+                        "ask": float(row[6]) if row[6] else 0.0,
+                        "volume": int(row[7]) if row[7] else 0,
+                        "open_interest": int(row[8]) if row[8] else 0,
+                        "delta": float(row[9]) if row[9] else 0.0,
+                        "gamma": float(row[10]) if row[10] else 0.0,
+                        "theta": float(row[11]) if row[11] else 0.0,
+                        "vega": float(row[12]) if row[12] else 0.0,
+                        "implied_volatility": float(row[13]) if row[13] else 0.2,
+                    }
+                    for row in rows
+                ]
 
                 logger.info(
-                    f"Fetched {len(options)} options with Greeks "
-                    f"(latest-per-contract over {self.snapshot_lookback_minutes}m lookback)"
+                    "Fetched %d options with Greeks "
+                    "(latest-per-contract; lookback=%dh, min_expiration>%s)",
+                    len(options),
+                    self.snapshot_lookback_hours,
+                    min_expiration,
                 )
-                if stale_dropped > 0:
-                    logger.info(
-                        f"Dropped {stale_dropped} stale contracts older than "
-                        f"{self.snapshot_freshness_seconds}s freshness limit"
-                    )
 
                 # Count how many have OI > 0 for informational purposes
                 options_with_oi = sum(1 for opt in options if opt["open_interest"] > 0)
@@ -869,11 +869,7 @@ class AnalyticsEngine:
                     float(summary["max_gamma_value"]),
                     gamma_flip_point,
                     float(summary["put_call_ratio"]),
-                    (
-                        float(summary["max_pain"])
-                        if summary.get("max_pain") is not None
-                        else None
-                    ),
+                    (float(summary["max_pain"]) if summary.get("max_pain") is not None else None),
                     int(summary["total_call_volume"]),
                     int(summary["total_put_volume"]),
                     int(summary["total_call_oi"]),
