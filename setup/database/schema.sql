@@ -562,6 +562,18 @@ CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts_exp
     ON flow_by_contract(symbol, timestamp DESC, expiration);
 CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts_type
     ON flow_by_contract(symbol, timestamp DESC, option_type);
+-- Covering index for /api/flow/series. Carries the columns the
+-- filtered CTE selects so the planner can satisfy
+-- "WHERE symbol = $1 AND timestamp BETWEEN $2 AND $3" as an
+-- index-only scan and skip the ~3,000 heap-page bitmap-heap-scan that
+-- dominates execution time on a cache miss (see database.py
+-- get_flow_series, the `filtered` CTE). Stays useful even after the
+-- planned flow_series_5min snapshot table lands — at that point the
+-- /api/flow/series read path bypasses flow_by_contract entirely and
+-- this index can be DROP'd CONCURRENTLY to reclaim ~200 MB.
+CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts_series_covering
+    ON flow_by_contract(symbol, timestamp DESC)
+    INCLUDE (option_type, strike, expiration, raw_volume, net_volume, net_premium);
 CREATE INDEX IF NOT EXISTS idx_flow_smart_money_symbol_ts
     ON flow_smart_money(symbol, timestamp DESC);
 
