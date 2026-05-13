@@ -118,9 +118,7 @@ async def _max_pain_refresh_loop() -> None:
         # the first tick completes.
         await asyncio.sleep(interval)
         try:
-            await db_manager.refresh_max_pain_snapshots(
-                symbols, strike_limit, statement_timeout_ms
-            )
+            await db_manager.refresh_max_pain_snapshots(symbols, strike_limit, statement_timeout_ms)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -149,9 +147,7 @@ async def lifespan(app: FastAPI):
 
     max_pain_task: Optional[asyncio.Task] = None
     if config.MAX_PAIN_BACKGROUND_REFRESH_ENABLED and config.MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS:
-        max_pain_task = asyncio.create_task(
-            _max_pain_refresh_loop(), name="max_pain_refresh_loop"
-        )
+        max_pain_task = asyncio.create_task(_max_pain_refresh_loop(), name="max_pain_refresh_loop")
 
     yield
 

@@ -221,8 +221,7 @@ def test_zero_score_in_window_logs_warning(caplog):
     score = comp.compute(ctx)
     assert score == 0.0
     assert any(
-        "eod_pressure score=0" in record.getMessage()
-        for record in caplog.records
+        "eod_pressure score=0" in record.getMessage() for record in caplog.records
     ), "expected a WARN-level diagnostic when the signal collapses in the window"
 
 
@@ -237,6 +236,5 @@ def test_zero_score_outside_window_is_silent(caplog):
     score = comp.compute(ctx)
     assert score == 0.0
     assert not any(
-        "eod_pressure score=0" in record.getMessage()
-        for record in caplog.records
+        "eod_pressure score=0" in record.getMessage() for record in caplog.records
     ), "ramp-gated zero score should not trip the diagnostic warning"

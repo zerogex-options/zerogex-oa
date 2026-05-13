@@ -178,9 +178,7 @@ def test_health_endpoint_is_public(monkeypatch: pytest.MonkeyPatch):
     monitors) can verify liveness without credentials. Production sets
     ``_PUBLIC_PATHS = {"/api/health"}`` at module import time; this test
     reinstates that default explicitly via ``_reload_app``."""
-    app, security = _reload_app(
-        monkeypatch, api_key=None, public_paths={"/api/health"}
-    )
+    app, security = _reload_app(monkeypatch, api_key=None, public_paths={"/api/health"})
     pool = _FakePool(None)
     _install_pool(security, pool)
 
@@ -189,9 +187,7 @@ def test_health_endpoint_is_public(monkeypatch: pytest.MonkeyPatch):
     assert response.status_code == 200, response.text
     # The DB must not be consulted on the public-probe path — health
     # probes fire constantly and must not contribute to api_keys load.
-    assert pool.fetchrow_calls == [], (
-        "/api/health should short-circuit before key_store.lookup"
-    )
+    assert pool.fetchrow_calls == [], "/api/health should short-circuit before key_store.lookup"
 
 
 def test_static_key_still_works_alongside_db(monkeypatch: pytest.MonkeyPatch):

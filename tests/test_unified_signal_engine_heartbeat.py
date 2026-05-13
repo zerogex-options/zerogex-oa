@@ -13,6 +13,7 @@ def test_heartbeat_disabled_when_window_zero(monkeypatch: pytest.MonkeyPatch):
     behaviour (skip persist when score hasn't changed)."""
     monkeypatch.setenv("SIGNAL_HEARTBEAT_SECONDS", "0")
     import src.signals.unified_signal_engine as mod
+
     importlib.reload(mod)
     now = datetime(2026, 5, 12, 18, 0, tzinfo=timezone.utc)
     cls = mod.UnifiedSignalEngine
@@ -29,6 +30,7 @@ def test_heartbeat_fires_when_window_elapsed(monkeypatch: pytest.MonkeyPatch):
     history at a single row when they sit near zero."""
     monkeypatch.setenv("SIGNAL_HEARTBEAT_SECONDS", "300")
     import src.signals.unified_signal_engine as mod
+
     importlib.reload(mod)
     now = datetime(2026, 5, 12, 18, 0, tzinfo=timezone.utc)
     cls = mod.UnifiedSignalEngine
@@ -53,6 +55,7 @@ def test_heartbeat_handles_missing_timestamps(monkeypatch: pytest.MonkeyPatch):
     the cycle."""
     monkeypatch.setenv("SIGNAL_HEARTBEAT_SECONDS", "60")
     import src.signals.unified_signal_engine as mod
+
     importlib.reload(mod)
     cls = mod.UnifiedSignalEngine
     assert cls._heartbeat_due(None, None) is True

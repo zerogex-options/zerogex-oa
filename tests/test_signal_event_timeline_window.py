@@ -21,7 +21,6 @@ from zoneinfo import ZoneInfo
 from src.api.database import DatabaseManager
 from src.api.queries.signals import _two_session_cutoff
 
-
 _ET = ZoneInfo("America/New_York")
 
 

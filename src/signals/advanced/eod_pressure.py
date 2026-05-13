@@ -97,7 +97,8 @@ class EODPressureSignal:
             band_lo = ctx.close * (1 - band_pct) if ctx.close > 0 else 0.0
             band_hi = ctx.close * (1 + band_pct) if ctx.close > 0 else 0.0
             in_band = [
-                row for row in (gex_rows or [])
+                row
+                for row in (gex_rows or [])
                 if isinstance(row, dict)
                 and row.get("strike") is not None
                 and band_lo <= float(row.get("strike", 0)) <= band_hi
@@ -111,7 +112,8 @@ class EODPressureSignal:
                 # Strikes are in band but their dealer-charm sums to zero.
                 # Could mean the column is unpopulated for those rows.
                 with_charm = [
-                    r for r in in_band
+                    r
+                    for r in in_band
                     if r.get("dealer_charm_exposure") not in (None, 0, 0.0)
                     or r.get("charm_exposure") not in (None, 0, 0.0)
                 ]
@@ -123,8 +125,7 @@ class EODPressureSignal:
 
         if not reasons:
             reasons.append(
-                "both sub-scores zero despite available inputs "
-                "(unexpected — investigate)"
+                "both sub-scores zero despite available inputs " "(unexpected — investigate)"
             )
 
         logger.warning(

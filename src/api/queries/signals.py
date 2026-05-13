@@ -57,9 +57,7 @@ def _two_session_cutoff(now: Optional[datetime] = None) -> datetime:
     past_open = now_et.time() >= market_open
     current_session_date = today if (is_weekday and past_open) else prev_trading_day(today)
     prior_date = prev_trading_day(current_session_date)
-    return datetime(
-        prior_date.year, prior_date.month, prior_date.day, 9, 30, tzinfo=_ET
-    )
+    return datetime(prior_date.year, prior_date.month, prior_date.day, 9, 30, tzinfo=_ET)
 
 
 class SignalsQueriesMixin:

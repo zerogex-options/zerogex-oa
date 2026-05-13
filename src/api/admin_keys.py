@@ -142,8 +142,13 @@ async def _list(user_id: Optional[str], active_only: bool) -> int:
         return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     headers = (
-        "id", "user_id", "name", "prefix", "state",
-        "created_at (UTC)", "last_used_at (UTC)",
+        "id",
+        "user_id",
+        "name",
+        "prefix",
+        "state",
+        "created_at (UTC)",
+        "last_used_at (UTC)",
     )
     aligns = (">", "<", "<", "<", "<", "<", "<")
     cells = [
@@ -158,10 +163,7 @@ async def _list(user_id: Optional[str], active_only: bool) -> int:
         )
         for r in rows
     ]
-    widths = [
-        max(len(h), *(len(row[i]) for row in cells))
-        for i, h in enumerate(headers)
-    ]
+    widths = [max(len(h), *(len(row[i]) for row in cells)) for i, h in enumerate(headers)]
     fmt = "  ".join(f"{{:{a}{w}}}" for a, w in zip(aligns, widths))
     total_width = sum(widths) + 2 * (len(widths) - 1)
     print(fmt.format(*headers).rstrip())
