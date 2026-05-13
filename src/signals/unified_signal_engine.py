@@ -258,10 +258,16 @@ class UnifiedSignalEngine:
 
                 # Single pass over gex_by_strike: fetch the per-strike exposure
                 # window around spot (used by gex_gradient, dealer_delta_pressure,
-                # vanna_charm_flow, eod_pressure) and derive call_wall and
-                # max_gamma_strike in Python from the same rows.  Also fetches
-                # dealer-sign charm/vanna (C3) and expiration_bucket for EOD
-                # pressure expiry-weighting (S2).
+                # vanna_charm_flow, eod_pressure) and derive max_gamma_strike in
+                # Python from the same rows.  Also fetches dealer-sign
+                # charm/vanna (C3) and expiration_bucket for EOD pressure
+                # expiry-weighting (S2).
+                #
+                # call_wall / put_wall are NOT derived here — they are read
+                # from the canonical ``gex_summary`` row written by the
+                # Analytics Engine (see src/analytics/walls.py), so every
+                # consumer (REST endpoints, signals, playbook patterns) sees
+                # the same values.
                 gex_strike_rows: list[dict] = []
                 gex_strike_by_bucket: dict[str, list[dict]] = {}
                 call_wall: Optional[float] = None
@@ -359,22 +365,6 @@ class UnifiedSignalEngine:
 
                     gex_strike_rows = sorted(per_strike.values(), key=lambda row: row["strike"])
                     if gex_strike_rows:
-                        above_spot = [r for r in gex_strike_rows if r["strike"] >= close_f]
-                        if above_spot:
-                            # call_wall = highest call_oi strike >= spot, ties broken by
-                            # nearest-to-spot (lowest strike above spot).
-                            call_wall = max(
-                                above_spot,
-                                key=lambda r: (r["call_oi"], -r["strike"]),
-                            )["strike"]
-                        below_spot = [r for r in gex_strike_rows if r["strike"] <= close_f]
-                        if below_spot:
-                            # put_wall = highest put_oi strike <= spot, ties broken by
-                            # nearest-to-spot (highest strike below spot).
-                            put_wall = max(
-                                below_spot,
-                                key=lambda r: (r["put_oi"], r["strike"]),
-                            )["strike"]
                         max_gamma_row = max(
                             gex_strike_rows,
                             key=lambda r: (abs(r["net_gex"]), -r["strike"]),
@@ -383,6 +373,71 @@ class UnifiedSignalEngine:
                 except Exception as exc:  # pragma: no cover - defensive
                     logger.warning(
                         "UnifiedSignalEngine [%s]: gex_by_strike fetch failed: %s",
+                        self.db_symbol,
+                        exc,
+                    )
+
+                # Read canonical Call/Put Wall from the latest gex_summary row
+                # (written by the Analytics Engine using
+                # ``src.analytics.compute_call_put_walls``).  Falls back to the
+                # canonical per-strike SQL when the row pre-dates the column
+                # backfill, so signal output remains stable during the
+                # transition.
+                try:
+                    cur.execute(
+                        """
+                        WITH latest_summary AS (
+                            SELECT timestamp, call_wall, put_wall
+                            FROM gex_summary
+                            WHERE underlying = %s AND timestamp <= %s
+                            ORDER BY timestamp DESC
+                            LIMIT 1
+                        ),
+                        fallback_call AS (
+                            SELECT g.strike::numeric AS strike
+                            FROM gex_by_strike g, latest_summary ls
+                            WHERE g.underlying = %s
+                              AND g.timestamp = ls.timestamp
+                              AND g.strike >= %s
+                              AND COALESCE(g.call_gamma, 0) > 0
+                            ORDER BY g.call_gamma DESC, g.strike ASC
+                            LIMIT 1
+                        ),
+                        fallback_put AS (
+                            SELECT g.strike::numeric AS strike
+                            FROM gex_by_strike g, latest_summary ls
+                            WHERE g.underlying = %s
+                              AND g.timestamp = ls.timestamp
+                              AND g.strike <= %s
+                              AND COALESCE(g.put_gamma, 0) > 0
+                            ORDER BY g.put_gamma DESC, g.strike DESC
+                            LIMIT 1
+                        )
+                        SELECT
+                            COALESCE(ls.call_wall, fc.strike) AS call_wall,
+                            COALESCE(ls.put_wall,  fp.strike) AS put_wall
+                        FROM latest_summary ls
+                        LEFT JOIN fallback_call fc ON TRUE
+                        LEFT JOIN fallback_put  fp ON TRUE
+                        """,
+                        (
+                            self.db_symbol,
+                            ts,
+                            self.db_symbol,
+                            close_f,
+                            self.db_symbol,
+                            close_f,
+                        ),
+                    )
+                    wall_row = cur.fetchone()
+                    if wall_row:
+                        if wall_row[0] is not None:
+                            call_wall = float(wall_row[0])
+                        if wall_row[1] is not None:
+                            put_wall = float(wall_row[1])
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "UnifiedSignalEngine [%s]: canonical wall fetch failed: %s",
                         self.db_symbol,
                         exc,
                     )
@@ -667,6 +722,12 @@ class UnifiedSignalEngine:
                 # strongest predictor of a genuine breakout vs. a failed pop.
                 # Bear traps key off call wall migration; bull traps key off
                 # put wall migration.
+                #
+                # Source of truth: the canonical ``gex_summary.call_wall`` /
+                # ``put_wall`` column written by the Analytics Engine.  The
+                # fallback CTE recomputes the same canonical formula
+                # (src/analytics/walls.py) against ``gex_by_strike`` for rows
+                # that pre-date the column backfill.
                 prior_call_wall: Optional[float] = None
                 prior_put_wall: Optional[float] = None
                 try:
@@ -674,37 +735,50 @@ class UnifiedSignalEngine:
                         """
                         WITH window_max AS (
                             SELECT timestamp
-                            FROM gex_by_strike
+                            FROM gex_summary
                             WHERE underlying = %s
                               AND timestamp <= %s - INTERVAL '25 minutes'
                               AND timestamp >= %s - INTERVAL '60 minutes'
                             ORDER BY timestamp DESC
                             LIMIT 1
+                        ),
+                        prior AS (
+                            SELECT gs.timestamp, gs.call_wall, gs.put_wall
+                            FROM gex_summary gs, window_max w
+                            WHERE gs.underlying = %s AND gs.timestamp = w.timestamp
+                        ),
+                        fallback_call AS (
+                            SELECT g.strike::numeric AS strike
+                            FROM gex_by_strike g, prior p
+                            WHERE g.underlying = %s
+                              AND g.timestamp = p.timestamp
+                              AND g.strike >= %s
+                              AND COALESCE(g.call_gamma, 0) > 0
+                            ORDER BY g.call_gamma DESC, g.strike ASC
+                            LIMIT 1
+                        ),
+                        fallback_put AS (
+                            SELECT g.strike::numeric AS strike
+                            FROM gex_by_strike g, prior p
+                            WHERE g.underlying = %s
+                              AND g.timestamp = p.timestamp
+                              AND g.strike <= %s
+                              AND COALESCE(g.put_gamma, 0) > 0
+                            ORDER BY g.put_gamma DESC, g.strike DESC
+                            LIMIT 1
                         )
                         SELECT
-                            (
-                                SELECT g.strike
-                                FROM gex_by_strike g, window_max w
-                                WHERE g.underlying = %s
-                                  AND g.timestamp = w.timestamp
-                                  AND g.strike >= %s
-                                ORDER BY g.call_oi DESC NULLS LAST, g.strike ASC
-                                LIMIT 1
-                            ) AS call_wall_strike,
-                            (
-                                SELECT g.strike
-                                FROM gex_by_strike g, window_max w
-                                WHERE g.underlying = %s
-                                  AND g.timestamp = w.timestamp
-                                  AND g.strike <= %s
-                                ORDER BY g.put_oi DESC NULLS LAST, g.strike DESC
-                                LIMIT 1
-                            ) AS put_wall_strike
+                            COALESCE(p.call_wall, fc.strike) AS call_wall_strike,
+                            COALESCE(p.put_wall,  fp.strike) AS put_wall_strike
+                        FROM prior p
+                        LEFT JOIN fallback_call fc ON TRUE
+                        LEFT JOIN fallback_put  fp ON TRUE
                         """,
                         (
                             self.db_symbol,
                             ts,
                             ts,
+                            self.db_symbol,
                             self.db_symbol,
                             close_f,
                             self.db_symbol,

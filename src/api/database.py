@@ -1145,6 +1145,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         if cached is not None:
             return cached
 
+        # Call/Put Walls are persisted to ``gex_summary`` by the Analytics
+        # Engine using the canonical definition in
+        # :mod:`src.analytics.walls` — strike with maximum dollar gamma
+        # exposure on the appropriate side of spot.  We read those columns
+        # directly so this endpoint, ``/api/gex/history``, the unified signal
+        # engine, and every playbook pattern all agree on the same values.
+        #
+        # ``gex_summary.call_wall`` / ``put_wall`` can be NULL on rows written
+        # before the column backfill; the fallback CTE recomputes them via the
+        # same canonical formula straight from ``gex_by_strike`` so historical
+        # latest-summary lookups never lose the wall.
         query = """
             WITH latest_summary AS (
                 SELECT
@@ -1158,7 +1169,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     gs.total_call_oi,
                     gs.total_put_oi,
                     gs.put_call_ratio,
-                    gs.total_net_gex
+                    gs.total_net_gex,
+                    gs.call_wall AS stored_call_wall,
+                    gs.put_wall  AS stored_put_wall
                 FROM gex_summary gs
                 WHERE gs.underlying = $1
                 ORDER BY gs.timestamp DESC
@@ -1171,36 +1184,46 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 ORDER BY uq.timestamp DESC
                 LIMIT 1
             ),
-            strike_exposures AS (
+            strike_totals AS (
                 SELECT
-                    gbs.strike,
-                    -- call_gamma / put_gamma are already OI-weighted in analytics
-                    -- (gamma * open_interest). Do NOT multiply by OI again here.
-                    -- Industry-standard dollar GEX per 1% move: γ × OI × 100 × S² × 0.01.
-                    (gbs.call_gamma * 100 * lq.spot_price * lq.spot_price * 0.01)::numeric AS call_exposure,
-                    (-1 * gbs.put_gamma * 100 * lq.spot_price * lq.spot_price * 0.01)::numeric AS put_exposure
+                    -- Industry-standard dollar GEX per 1% move:
+                    -- γ × OI × 100 × S² × 0.01.  Call/put gamma are already
+                    -- OI-weighted in the analytics writer.
+                    COALESCE(SUM(gbs.call_gamma * 100 * lq.spot_price * lq.spot_price * 0.01), 0)::numeric AS total_call_gex,
+                    COALESCE(SUM(-1 * gbs.put_gamma * 100 * lq.spot_price * lq.spot_price * 0.01), 0)::numeric AS total_put_gex
                 FROM gex_by_strike gbs
                 JOIN latest_summary ls
                   ON gbs.underlying = ls.underlying
                  AND gbs.timestamp = ls.timestamp
                 JOIN latest_quote lq ON TRUE
             ),
-            strike_totals AS (
-                SELECT
-                    COALESCE(SUM(se.call_exposure), 0)::numeric AS total_call_gex,
-                    COALESCE(SUM(se.put_exposure), 0)::numeric AS total_put_gex
-                FROM strike_exposures se
-            ),
-            call_wall AS (
-                SELECT se.strike::numeric AS call_wall
-                FROM strike_exposures se
-                ORDER BY ABS(se.call_exposure) DESC, se.strike
+            -- Canonical Call Wall fallback: max call-gamma strike at-or-above
+            -- spot, tiebreaker nearest-to-spot (lowest strike above spot).
+            -- Only used when gex_summary.call_wall is NULL.
+            fallback_call_wall AS (
+                SELECT gbs.strike::numeric AS call_wall
+                FROM gex_by_strike gbs
+                JOIN latest_summary ls
+                  ON gbs.underlying = ls.underlying
+                 AND gbs.timestamp = ls.timestamp
+                JOIN latest_quote lq ON TRUE
+                WHERE gbs.strike >= lq.spot_price
+                  AND COALESCE(gbs.call_gamma, 0) > 0
+                ORDER BY gbs.call_gamma DESC, gbs.strike ASC
                 LIMIT 1
             ),
-            put_wall AS (
-                SELECT se.strike::numeric AS put_wall
-                FROM strike_exposures se
-                ORDER BY ABS(se.put_exposure) DESC, se.strike
+            -- Canonical Put Wall fallback: max put-gamma strike at-or-below
+            -- spot, tiebreaker nearest-to-spot (highest strike below spot).
+            fallback_put_wall AS (
+                SELECT gbs.strike::numeric AS put_wall
+                FROM gex_by_strike gbs
+                JOIN latest_summary ls
+                  ON gbs.underlying = ls.underlying
+                 AND gbs.timestamp = ls.timestamp
+                JOIN latest_quote lq ON TRUE
+                WHERE gbs.strike <= lq.spot_price
+                  AND COALESCE(gbs.put_gamma, 0) > 0
+                ORDER BY gbs.put_gamma DESC, gbs.strike DESC
                 LIMIT 1
             )
             SELECT
@@ -1219,16 +1242,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 ls.local_gex,
                 ls.convexity_risk,
                 ls.max_pain,
-                cw.call_wall,
-                pw.put_wall,
+                COALESCE(ls.stored_call_wall, fcw.call_wall) AS call_wall,
+                COALESCE(ls.stored_put_wall,  fpw.put_wall)  AS put_wall,
                 ls.total_call_oi,
                 ls.total_put_oi,
                 ls.put_call_ratio
             FROM latest_summary ls
             JOIN latest_quote lq ON TRUE
             JOIN strike_totals st ON TRUE
-            LEFT JOIN call_wall cw ON TRUE
-            LEFT JOIN put_wall pw ON TRUE
+            LEFT JOIN fallback_call_wall fcw ON TRUE
+            LEFT JOIN fallback_put_wall  fpw ON TRUE
         """
 
         try:
@@ -1363,6 +1386,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     gs.total_call_oi,
                     gs.total_put_oi,
                     gs.put_call_ratio,
+                    gs.call_wall AS stored_call_wall,
+                    gs.put_wall  AS stored_put_wall,
                     {bucket} as bucket_ts,
                     ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY gs.timestamp DESC) as rn
                 FROM gex_summary gs
@@ -1386,20 +1411,36 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                   AND gbs.timestamp IN (SELECT timestamp FROM base)
                 GROUP BY gbs.timestamp
             ),
-            walls AS (
+            -- Canonical Call/Put Wall fallback (matches src/analytics/walls.py):
+            -- Call Wall = strike >= spot with max call_gamma, ties → lowest strike.
+            -- Put  Wall = strike <= spot with max put_gamma,  ties → highest strike.
+            -- Only used for buckets where ``gex_summary.call_wall`` /
+            -- ``put_wall`` is NULL (i.e., rows persisted before the column
+            -- backfill).  All new analytics runs write the canonical value
+            -- straight into ``gex_summary``.
+            call_walls AS (
                 SELECT DISTINCT ON (gbs.timestamp)
                     gbs.timestamp,
-                    FIRST_VALUE(gbs.strike) OVER (
-                        PARTITION BY gbs.timestamp
-                        ORDER BY ABS(gbs.call_gamma) DESC, gbs.strike
-                    )::numeric AS call_wall,
-                    FIRST_VALUE(gbs.strike) OVER (
-                        PARTITION BY gbs.timestamp
-                        ORDER BY ABS(gbs.put_gamma) DESC, gbs.strike
-                    )::numeric AS put_wall
+                    gbs.strike::numeric AS call_wall
                 FROM gex_by_strike gbs
+                CROSS JOIN spot s
                 WHERE gbs.underlying = $1
                   AND gbs.timestamp IN (SELECT timestamp FROM base)
+                  AND gbs.strike >= s.spot_price
+                  AND COALESCE(gbs.call_gamma, 0) > 0
+                ORDER BY gbs.timestamp, gbs.call_gamma DESC, gbs.strike ASC
+            ),
+            put_walls AS (
+                SELECT DISTINCT ON (gbs.timestamp)
+                    gbs.timestamp,
+                    gbs.strike::numeric AS put_wall
+                FROM gex_by_strike gbs
+                CROSS JOIN spot s
+                WHERE gbs.underlying = $1
+                  AND gbs.timestamp IN (SELECT timestamp FROM base)
+                  AND gbs.strike <= s.spot_price
+                  AND COALESCE(gbs.put_gamma, 0) > 0
+                ORDER BY gbs.timestamp, gbs.put_gamma DESC, gbs.strike DESC
             )
             SELECT
                 b.bucket_ts as timestamp,
@@ -1414,15 +1455,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 (COALESCE(sa.total_call_gex, 0) + COALESCE(sa.total_put_gex, 0))::numeric AS net_gex,
                 b.gamma_flip,
                 b.max_pain,
-                w.call_wall,
-                w.put_wall,
+                COALESCE(b.stored_call_wall, cw.call_wall) AS call_wall,
+                COALESCE(b.stored_put_wall,  pw.put_wall)  AS put_wall,
                 b.total_call_oi,
                 b.total_put_oi,
                 b.put_call_ratio
             FROM base b
             CROSS JOIN spot s
             LEFT JOIN strike_agg sa ON sa.timestamp = b.timestamp
-            LEFT JOIN walls w ON w.timestamp = b.timestamp
+            LEFT JOIN call_walls cw ON cw.timestamp = b.timestamp
+            LEFT JOIN put_walls  pw ON pw.timestamp = b.timestamp
             ORDER BY timestamp DESC
             LIMIT $4
         """

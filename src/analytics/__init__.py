@@ -4,7 +4,9 @@ Avoid eager import of `main_engine` so `python -m src.analytics.main_engine`
 does not trigger runpy warnings.
 """
 
-__all__ = ["AnalyticsEngine"]
+from src.analytics.walls import compute_call_put_walls
+
+__all__ = ["AnalyticsEngine", "compute_call_put_walls"]
 
 
 def __getattr__(name):

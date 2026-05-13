@@ -28,6 +28,7 @@ from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
 from src.config import RISK_FREE_RATE, ANALYTICS_FLOW_CACHE_REFRESH_ENABLED
 from src.symbols import parse_underlyings, get_canonical_symbol
+from src.analytics.walls import compute_call_put_walls
 from src.market_calendar import (
     calculate_time_to_expiration,
     is_engine_run_window,
@@ -645,6 +646,11 @@ class AnalyticsEngine:
         if distance_to_flip is not None:
             convexity_risk = abs(total_net_gex) / max(distance_to_flip, 1e-6)
 
+        # Canonical Call/Put Wall strikes — single source of truth for every
+        # downstream consumer (REST endpoints, unified signal engine, playbook
+        # patterns).  Defined in src/analytics/walls.py.
+        call_wall, put_wall = compute_call_put_walls(gex_by_strike, underlying_price)
+
         summary = {
             "underlying": self.db_symbol,
             "timestamp": timestamp,
@@ -662,6 +668,8 @@ class AnalyticsEngine:
             "total_call_oi": total_call_oi,
             "total_put_oi": total_put_oi,
             "total_net_gex": total_net_gex,
+            "call_wall": call_wall,
+            "put_wall": put_wall,
         }
 
         return summary
@@ -825,14 +833,16 @@ class AnalyticsEngine:
             if convexity_risk is None and flip_distance is not None:
                 convexity_risk = abs(total_net_gex) / max(abs(flip_distance), 1e-6)
 
+            call_wall_val = summary.get("call_wall")
+            put_wall_val = summary.get("put_wall")
             cursor.execute(
                 """
                 INSERT INTO gex_summary
                 (underlying, timestamp, max_gamma_strike, max_gamma_value,
                  gamma_flip_point, put_call_ratio, max_pain, total_call_volume,
                  total_put_volume, total_call_oi, total_put_oi, total_net_gex,
-                 flip_distance, local_gex, convexity_risk)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 flip_distance, local_gex, convexity_risk, call_wall, put_wall)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (underlying, timestamp) DO UPDATE SET
                     max_gamma_strike = EXCLUDED.max_gamma_strike,
                     max_gamma_value = EXCLUDED.max_gamma_value,
@@ -846,7 +856,9 @@ class AnalyticsEngine:
                     total_net_gex = EXCLUDED.total_net_gex,
                     flip_distance = EXCLUDED.flip_distance,
                     local_gex = EXCLUDED.local_gex,
-                    convexity_risk = EXCLUDED.convexity_risk
+                    convexity_risk = EXCLUDED.convexity_risk,
+                    call_wall = EXCLUDED.call_wall,
+                    put_wall = EXCLUDED.put_wall
                 WHERE
                     EXCLUDED.max_gamma_strike IS DISTINCT FROM gex_summary.max_gamma_strike
                     OR EXCLUDED.max_gamma_value IS DISTINCT FROM gex_summary.max_gamma_value
@@ -861,6 +873,8 @@ class AnalyticsEngine:
                     OR EXCLUDED.flip_distance IS DISTINCT FROM gex_summary.flip_distance
                     OR EXCLUDED.local_gex IS DISTINCT FROM gex_summary.local_gex
                     OR EXCLUDED.convexity_risk IS DISTINCT FROM gex_summary.convexity_risk
+                    OR EXCLUDED.call_wall IS DISTINCT FROM gex_summary.call_wall
+                    OR EXCLUDED.put_wall IS DISTINCT FROM gex_summary.put_wall
             """,
                 (
                     summary["underlying"],
@@ -878,6 +892,8 @@ class AnalyticsEngine:
                     float(flip_distance) if flip_distance is not None else None,
                     float(summary.get("local_gex", 0.0)),
                     float(convexity_risk) if convexity_risk is not None else None,
+                    float(call_wall_val) if call_wall_val is not None else None,
+                    float(put_wall_val) if put_wall_val is not None else None,
                 ),
             )
             if commit:

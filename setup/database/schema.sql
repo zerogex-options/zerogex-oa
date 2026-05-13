@@ -233,6 +233,13 @@ CREATE TABLE IF NOT EXISTS gex_summary (
     flip_distance DOUBLE PRECISION,
     local_gex DOUBLE PRECISION,
     convexity_risk DOUBLE PRECISION,
+    -- Canonical Call/Put Wall strikes (industry-standard: maximum dollar
+    -- gamma exposure on each side of spot, with nearest-to-spot tiebreaker).
+    -- Computed by the Analytics Engine and consumed by all downstream
+    -- endpoints / signals as the single source of record.  See
+    -- src/analytics/walls.py.
+    call_wall NUMERIC(12, 4),
+    put_wall  NUMERIC(12, 4),
     created_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (underlying, timestamp)
 );
@@ -275,6 +282,25 @@ BEGIN
     ) THEN
         ALTER TABLE gex_summary
             ADD COLUMN convexity_risk DOUBLE PRECISION;
+    END IF;
+
+    -- Canonical Call/Put Wall strikes.  Backfilled NULL for historical rows;
+    -- the Analytics Engine populates them on each new run.  See
+    -- src/analytics/walls.py for the canonical definition.
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='gex_summary' AND column_name='call_wall'
+    ) THEN
+        ALTER TABLE gex_summary
+            ADD COLUMN call_wall NUMERIC(12, 4);
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='gex_summary' AND column_name='put_wall'
+    ) THEN
+        ALTER TABLE gex_summary
+            ADD COLUMN put_wall NUMERIC(12, 4);
     END IF;
 END $$;
 
