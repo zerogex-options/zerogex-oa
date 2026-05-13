@@ -30,6 +30,38 @@ SIGNAL_HISTORY_LIMIT = 600
 SIGNAL_HISTORY_LOOKBACK_DAYS = 4
 
 
+def _two_session_cutoff(now: Optional[datetime] = None) -> datetime:
+    """Return the ET timestamp marking the start of the older of the two
+    most-recent regular trading sessions (09:30 ET).
+
+    Used as the lower bound for Event Timeline queries so each Signal's
+    response covers a consistent window — the current session plus the
+    immediately preceding one when live in an open session, or the two
+    most-recent fully-elapsed sessions otherwise — regardless of how
+    often each signal emits scores.
+
+    Weekday-only; does not consult a US holiday calendar (matches the
+    convention used by ``_get_session_bounds`` in ``src/api/database.py``).
+    """
+    now_et = (now or datetime.now(_ET)).astimezone(_ET)
+    today = now_et.date()
+    market_open = time(9, 30)
+
+    def prev_trading_day(d: date) -> date:
+        d -= timedelta(days=1)
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        return d
+
+    is_weekday = today.weekday() < 5
+    past_open = now_et.time() >= market_open
+    current_session_date = today if (is_weekday and past_open) else prev_trading_day(today)
+    prior_date = prev_trading_day(current_session_date)
+    return datetime(
+        prior_date.year, prior_date.month, prior_date.day, 9, 30, tzinfo=_ET
+    )
+
+
 class SignalsQueriesMixin:
     """Read-side methods for the signals feature.
 
@@ -544,13 +576,23 @@ class SignalsQueriesMixin:
         self,
         symbol: str = "SPY",
         component_name: str = "",
-        limit: int = 200,
+        limit: int = 1000,
         horizon: str = "60m",
     ) -> list[Dict[str, Any]]:
-        """Return per-component score time series with sign-flip events."""
+        """Return per-component score time series with sign-flip events.
+
+        Time range is bounded to the start of the older of the two most-recent
+        trading sessions so every signal's Event Timeline covers a consistent
+        window — the current session plus the previous one when live, or the
+        two most-recent fully-elapsed sessions otherwise — regardless of how
+        often each signal emits scores. ``limit`` is a safety cap on result
+        size for unusually dense signals; the session cutoff is the primary
+        bound.
+        """
         horizon_interval = {"30m": "30 minutes", "60m": "60 minutes", "120m": "120 minutes"}.get(
             horizon, "60 minutes"
         )
+        cutoff = _two_session_cutoff()
         query = f"""
             SELECT
                 scs.underlying,
@@ -581,12 +623,13 @@ class SignalsQueriesMixin:
             ) q1 ON TRUE
             WHERE scs.underlying = $1
               AND scs.component_name = $2
+              AND scs.timestamp >= $4
             ORDER BY scs.timestamp DESC
             LIMIT $3
         """
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, symbol, component_name, limit)
+                rows = await conn.fetch(query, symbol, component_name, limit, cutoff)
             # Compute sign-flips chronologically (oldest → newest), but
             # return newest → oldest to match the convention used by the
             # rest of the timeseries APIs.

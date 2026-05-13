@@ -1567,7 +1567,7 @@ _VALID_SIGNAL_EVENT_NAMES = {
 async def get_signal_events(
     signal_name: str,
     symbol: str = Query(default="SPY"),
-    limit: int = Query(default=100, ge=1, le=1000),
+    limit: int = Query(default=1000, ge=1, le=1000),
     horizon: str = Query(default="60m", pattern="^(30m|60m|120m)$"),
     db: DatabaseManager = Depends(get_db),
 ):
@@ -1576,13 +1576,18 @@ async def get_signal_events(
     Provides per-bar snapshots of a component's score, direction, and input context,
     plus *forward* realized returns for backtesting and diagnostic overlays.
 
+    The returned window always spans the two most-recent regular trading
+    sessions: the current session plus the previous one when the market is
+    live, or the two most-recent fully-elapsed sessions otherwise. ``limit``
+    acts as a safety cap on result size for unusually dense signals.
+
     **Params:**
     - `signal_name` — one of: `vol_expansion`, `eod_pressure`, `squeeze_setup`,
       `trap_detection`, `zero_dte_position_imbalance`, `gamma_vwap_confluence`,
       `range_break_imminence`, `positioning_trap`, `vanna_charm_flow`.
       Returns 400 for unknown names.
     - `symbol` (default `SPY`).
-    - `limit` — 1–1000, default 100.
+    - `limit` — 1–1000, default 1000 (cap on row count within the session window).
     - `horizon` — `"30m"` | `"60m"` | `"120m"` (default `"60m"`); forward window for realized return.
 
     **Returns:**
