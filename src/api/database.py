@@ -210,9 +210,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         )
         self._max_pain_background_refresh_symbols: frozenset = frozenset(
             s.strip().upper()
-            for s in os.getenv(
-                "MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS", "SPY,SPX,QQQ"
-            ).split(",")
+            for s in os.getenv("MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS", "SPY,SPX,QQQ").split(",")
             if s.strip()
         )
         self._read_cache: Dict[str, Tuple[float, Any]] = {}
@@ -356,6 +354,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # every slow request and produced concurrent reconnect storms when
         # several heavy queries (e.g. /api/max-pain/current) timed out in
         # parallel. See the 2026-05-11 incident logs.
+        #
+        # TimeoutError is a subclass of OSError on Python 3.10+, so the
+        # OSError fallback below has to explicitly exclude it — otherwise
+        # the bare-TimeoutError case from a statement timeout would be
+        # reclassified as transient and trigger exactly the storm above.
+        if isinstance(error, TimeoutError):
+            return False
         text = str(error).lower()
         return any(
             token in text
