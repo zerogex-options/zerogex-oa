@@ -2141,8 +2141,26 @@ symbol-add: ## Upsert into symbols table (required: SYMBOL; optional: NAME, ASSE
 	echo "$(GREEN)✅ Upserted symbol $$SYMBOL_UPPER$(NC)"
 
 .PHONY: schema-apply
-schema-apply: ## Apply/update database schema (idempotent)
+schema-apply: ## Apply schema (idempotent; aborts on DB contention — pass FORCE=yes to override)
 	@echo "$(BLUE)=== Applying Database Schema ===$(NC)"
+	@echo "$(YELLOW)Pre-flight: checking for long-running queries / lock waits...$(NC)"
+	@BUSY_COUNT=$$($(PSQL) -tA -c "SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND ((state = 'active' AND now() - query_start > interval '5 seconds') OR (wait_event_type = 'Lock' AND now() - query_start > interval '1 second'))" | tr -d '[:space:]'); \
+	if [ -z "$$BUSY_COUNT" ]; then \
+		echo "$(RED)❌ Pre-flight check could not query pg_stat_activity (DB unreachable?). Aborting.$(NC)"; \
+		exit 1; \
+	fi; \
+	if [ "$$BUSY_COUNT" -gt 0 ]; then \
+		echo "$(RED)❌ $$BUSY_COUNT query/queries are active >5s or waiting on locks >1s:$(NC)"; \
+		$(PSQL) -c "SELECT pid, now() - query_start AS duration, state, wait_event_type, substr(query, 1, 100) AS query FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND ((state = 'active' AND now() - query_start > interval '5 seconds') OR (wait_event_type = 'Lock' AND now() - query_start > interval '1 second')) ORDER BY query_start;"; \
+		if [ "$$FORCE" = "yes" ]; then \
+			echo "$(YELLOW)⚠️  Proceeding anyway because FORCE=yes was passed.$(NC)"; \
+		else \
+			echo "$(YELLOW)Wait for the queries above to drain, or rerun with: make schema-apply FORCE=yes$(NC)"; \
+			exit 1; \
+		fi; \
+	else \
+		echo "$(GREEN)✓ No long-running queries or lock waits — proceeding.$(NC)"; \
+	fi
 	@echo "$(YELLOW)Running schema.sql on $(DB_HOST)...$(NC)"
 	@PGPASSFILE=~/.pgpass psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) -d $(DB_NAME) -v ON_ERROR_STOP=1 -f setup/database/schema.sql
 	@echo ""
