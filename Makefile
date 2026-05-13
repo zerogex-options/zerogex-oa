@@ -478,6 +478,7 @@ help: ## Show this help message
 	@echo "$(GREEN)Database Schema:$(NC)"
 	@echo "  make symbol-add        - Upsert one row into required symbols table"
 	@echo "    SYMBOL=<sym> NAME=<name> ASSET_TYPE=<EQUITY|INDEX|ETF> IS_ACTIVE=<true|false>"
+	@echo "  make pull               - git pull --ff-only + schema-apply (use after updating)"
 	@echo "  make schema-apply       - Apply/update setup/database/schema.sql"
 	@echo "  make schema-verify      - Verify schema components exist"
 	@echo "  make schema-backup      - Backup current schema to file"
@@ -2155,6 +2156,24 @@ schema-apply: ## Apply/update database schema (idempotent)
 		SELECT 'Views:', COUNT(*) FROM pg_views WHERE schemaname = 'public' \
 		UNION ALL \
 		SELECT 'Indexes:', COUNT(*) FROM pg_indexes WHERE schemaname = 'public';"
+
+# `make pull` exists because a bare `git pull` skips the database side of
+# the deploy — schema.sql lives in version control but no git hook re-runs
+# it on update.  That's how a stale `unusual_volume_spikes` view shipped
+# without `up_volume`/`down_volume` (commit 2a69be1) silently broke
+# /api/technicals/volume-spikes for canonical symbols until someone re-ran
+# `make schema-apply` by hand.  This target wraps pull + schema-apply so
+# the schema can't drift again, and reminds the operator to restart
+# services when Python code changes too.
+.PHONY: pull
+pull: ## git pull --ff-only + make schema-apply (use after pulling new commits)
+	@echo "$(BLUE)=== Pulling latest from origin ===$(NC)"
+	@git pull --ff-only
+	@echo ""
+	@$(MAKE) --no-print-directory schema-apply
+	@echo ""
+	@echo "$(YELLOW)Note: if files under src/ changed in this pull, restart the affected services:$(NC)"
+	@echo "  sudo systemctl restart $(API_SERVICE) $(INGESTION_SERVICE) $(ANALYTICS_SERVICE) $(SIGNALS_SERVICE)"
 
 .PHONY: schema-verify
 schema-verify: ## Verify schema components exist
