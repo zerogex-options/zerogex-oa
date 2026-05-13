@@ -165,6 +165,13 @@ CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_timestamp_option_symbol
     ON option_chains(underlying, timestamp DESC, option_symbol);
 CREATE INDEX IF NOT EXISTS idx_option_chains_option_symbol_timestamp
     ON option_chains(option_symbol, timestamp DESC);
+-- Covering index for /api/option/quote: lets the planner satisfy
+-- "WHERE underlying = $1 [optional filters] ORDER BY timestamp DESC LIMIT 1"
+-- as an index-only scan when only `underlying` is supplied (the hot path)
+-- and avoids heap fetches for the full SELECT list.
+CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_ts_quote_covering
+    ON option_chains(underlying, timestamp DESC)
+    INCLUDE (bid, ask, volume, open_interest, strike, expiration, option_type);
 
 DO $$
 BEGIN

@@ -2715,6 +2715,21 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         Rows are ordered newest → oldest so ``rows[0]`` is the most recent
         1-minute bar.
+
+        Caching strategy: the two-stage (resolve symbol + fetch bars) design
+        is intentional, so the remaining win is caching the immutable parts.
+        Closed minute bars never change once their minute boundary passes, and
+        whole-day bar lists for any past session are immutable until ingestion
+        rewrites them (which doesn't happen). We therefore cache:
+
+        1. The (underlying, strike, expiration, option_type) → option_symbol
+           mapping, which is stable for the life of the contract.
+        2. For non-live targets (after-hours or prior session): the entire
+           bar list, keyed by (option_symbol, target_date), with a long TTL.
+        3. For the live session: only the bars strictly before the current
+           minute. Each call re-fetches just the window starting at the last
+           cached minute (kept as a LAG seed so volume_delta stays correct
+           on the first newly-fetched bar) and merges with cached closed bars.
         """
         from datetime import time as _time
 
@@ -2724,101 +2739,199 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         today = now_et.date()
         session_is_open = today.weekday() < 5 and _time(9, 30) <= now_et.time() < _time(16, 0)
 
-        # Resolve option_symbol once, then drive everything else off the
-        # (option_symbol, timestamp) primary key. Filtering option_chains by
-        # (underlying, strike, expiration, option_type) directly forces the
-        # planner onto (underlying, timestamp DESC) and re-checks the other
-        # three columns against every row for that underlying in the window —
-        # millions of rows for SPX, which trips the 30s statement_timeout.
-        #
-        # With ORDER BY timestamp DESC LIMIT 1 and the timestamp lower bound,
-        # the planner walks the (underlying, timestamp DESC) index backward
-        # and stops at the first row whose strike/expiration/option_type match
-        # — cheap for any contract that's been quoted recently. The 14-day
-        # floor bounds the worst case where the contract doesn't exist.
-        resolve_query = """
-            SELECT option_symbol, timestamp AS latest_ts
-            FROM option_chains
-            WHERE underlying = $1
-              AND strike = $2
-              AND expiration = $3
-              AND option_type = $4
-              AND timestamp >= NOW() - INTERVAL '14 days'
+        # Stage 1 — resolve option_symbol (cached). The mapping
+        # (underlying, strike, expiration, option_type) → option_symbol is
+        # deterministic per OCC contract spec, so a long TTL is safe.
+        # Negative results (no contract quoted in the last 14 days) are NOT
+        # cached so a contract that starts trading mid-session resolves on the
+        # next call.
+        symbol_cache_key = (
+            f"option_symbol:{underlying}:{float(strike):.4f}"
+            f":{expiration_date.isoformat()}:{option_type}"
+        )
+        resolved_cached = self._cache_get(symbol_cache_key)
+        if resolved_cached is not None:
+            option_symbol, latest_ts = resolved_cached
+        else:
+            # Resolve option_symbol once, then drive everything else off the
+            # (option_symbol, timestamp) primary key. Filtering option_chains
+            # by (underlying, strike, expiration, option_type) directly forces
+            # the planner onto (underlying, timestamp DESC) and re-checks the
+            # other three columns against every row for that underlying in
+            # the window — millions of rows for SPX, which trips the 30s
+            # statement_timeout.
+            #
+            # With ORDER BY timestamp DESC LIMIT 1 and the timestamp lower
+            # bound, the planner walks the (underlying, timestamp DESC)
+            # index backward and stops at the first row whose
+            # strike/expiration/option_type match — cheap for any contract
+            # that's been quoted recently. The 14-day floor bounds the worst
+            # case where the contract doesn't exist.
+            resolve_query = """
+                SELECT option_symbol, timestamp AS latest_ts
+                FROM option_chains
+                WHERE underlying = $1
+                  AND strike = $2
+                  AND expiration = $3
+                  AND option_type = $4
+                  AND timestamp >= NOW() - INTERVAL '14 days'
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """
+            try:
+                async with self._acquire_connection() as conn:
+                    resolved = await conn.fetchrow(
+                        resolve_query,
+                        underlying,
+                        float(strike),
+                        expiration_date,
+                        option_type,
+                    )
+            except Exception as e:
+                logger.error(f"Error fetching option contract history: {e}", exc_info=True)
+                raise
+
+            if not resolved or resolved["option_symbol"] is None:
+                return []
+            option_symbol = resolved["option_symbol"]
+            latest_ts = resolved["latest_ts"]
+            self._cache_set(symbol_cache_key, (option_symbol, latest_ts), 3600.0)
+
+        target_date = today if session_is_open else latest_ts.astimezone(_ET).date()
+
+        # Compute the ET calendar day as an explicit UTC timestamptz range.
+        # Computing day_end_et from (target_date + 1 day) rather than
+        # +timedelta(days=1) keeps it correct across DST shifts.
+        day_start_et = datetime.combine(target_date, _time(0, 0), tzinfo=_ET)
+        day_end_et = datetime.combine(target_date + timedelta(days=1), _time(0, 0), tzinfo=_ET)
+
+        is_live = session_is_open and target_date == today
+
+        # Non-live path: the whole bar list is immutable for the duration of
+        # the cache entry, so cache it wholesale.
+        if not is_live:
+            full_cache_key = f"option_contract_full:{option_symbol}:{target_date.isoformat()}"
+            cached_full = self._cache_get(full_cache_key)
+            if cached_full is not None:
+                return cached_full
+            rows = await self._fetch_option_contract_bars(option_symbol, day_start_et, day_end_et)
+            self._cache_set(full_cache_key, rows, 3600.0)
+            return rows
+
+        # Live path: cache closed bars and only re-fetch from the last cached
+        # minute forward.
+        closed_cache_key = f"option_contract_closed:{option_symbol}:{target_date.isoformat()}"
+        cached_closed = self._cache_get(closed_cache_key)
+        if cached_closed is not None:
+            cached_bars_asc = cached_closed["bars"]
+            last_cached_minute = cached_closed["last_minute"]
+        else:
+            cached_bars_asc = []
+            last_cached_minute = None
+
+        # Lower bound: include last_cached_minute so the SQL LAG() has the
+        # prior bar's volume when computing volume_delta for the first
+        # newly-fetched bar. The seed row is then dropped from the response.
+        live_lower_bound = last_cached_minute if last_cached_minute is not None else day_start_et
+        fetched = await self._fetch_option_contract_bars(
+            option_symbol, live_lower_bound, day_end_et
+        )
+
+        if last_cached_minute is not None:
+            fresh = [b for b in fetched if b["timestamp"] > last_cached_minute]
+        else:
+            fresh = fetched
+
+        # Promote bars whose minute has already closed into the cache. Use
+        # the current UTC minute boundary; bar timestamps come back as
+        # tz-aware UTC datetimes from asyncpg.
+        current_minute_floor = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        newly_closed_asc = sorted(
+            (b for b in fresh if b["timestamp"] < current_minute_floor),
+            key=lambda b: b["timestamp"],
+        )
+        if newly_closed_asc:
+            updated_bars_asc = cached_bars_asc + newly_closed_asc
+            self._cache_set(
+                closed_cache_key,
+                {
+                    "bars": updated_bars_asc,
+                    "last_minute": updated_bars_asc[-1]["timestamp"],
+                },
+                3600.0,
+            )
+
+        # Response is newest-first: freshly-fetched window (already DESC)
+        # followed by the cached closed bars in reverse (oldest stored asc).
+        return fresh + list(reversed(cached_bars_asc))
+
+    async def _fetch_option_contract_bars(
+        self,
+        option_symbol: str,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> List[Dict[str, Any]]:
+        """Run the 1-minute bar aggregation CTE for a single option contract.
+
+        Returned rows are newest-first. ``volume_delta`` is computed via
+        SQL LAG() over ``bar_ts ASC`` within the supplied window, so callers
+        that wish to incrementally extend a prior result must include the
+        last already-known bar as the lower bound to seed LAG correctly.
+        """
+        query = """
+            WITH ranked AS (
+                SELECT
+                    *,
+                    DATE_TRUNC('minute', timestamp)                          AS bar_ts,
+                    MAX(volume)      OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_volume,
+                    MAX(open_interest) OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_oi,
+                    MAX(updated_at)  OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_updated_at,
+                    ROW_NUMBER()     OVER (
+                        PARTITION BY DATE_TRUNC('minute', timestamp)
+                        ORDER BY timestamp DESC
+                    ) AS rn
+                FROM option_chains
+                WHERE option_symbol = $1
+                  AND timestamp >= $2
+                  AND timestamp < $3
+            )
+            SELECT
+                bar_ts             AS timestamp,
+                underlying,
+                strike,
+                expiration,
+                option_type,
+                last,
+                bid,
+                ask,
+                mid,
+                bar_volume         AS volume,
+                bar_oi             AS open_interest,
+                ask_volume,
+                mid_volume,
+                bid_volume,
+                implied_volatility,
+                delta,
+                gamma,
+                theta,
+                vega,
+                bar_updated_at     AS updated_at,
+                -- volume_delta uses an explicit chronological window
+                -- (ORDER BY bar_ts ASC) so each bar's delta is the
+                -- increment over the prior bar regardless of how the
+                -- outer SELECT orders the result set.
+                GREATEST(
+                    COALESCE(bar_volume, 0)
+                        - COALESCE(LAG(bar_volume) OVER (ORDER BY bar_ts), 0),
+                    0
+                )::bigint          AS volume_delta
+            FROM ranked
+            WHERE rn = 1
             ORDER BY timestamp DESC
-            LIMIT 1
         """
         try:
             async with self._acquire_connection() as conn:
-                resolved = await conn.fetchrow(
-                    resolve_query, underlying, float(strike), expiration_date, option_type
-                )
-                if not resolved or resolved["option_symbol"] is None:
-                    return []
-                option_symbol = resolved["option_symbol"]
-                latest_ts = resolved["latest_ts"]
-
-                target_date = today if session_is_open else latest_ts.astimezone(_ET).date()
-
-                # Compute the ET calendar day as an explicit UTC timestamptz
-                # range. Computing day_end_et from (target_date + 1 day) rather
-                # than +timedelta(days=1) keeps it correct across DST shifts.
-                day_start_et = datetime.combine(target_date, _time(0, 0), tzinfo=_ET)
-                day_end_et = datetime.combine(
-                    target_date + timedelta(days=1), _time(0, 0), tzinfo=_ET
-                )
-
-                query = """
-                    WITH ranked AS (
-                        SELECT
-                            *,
-                            DATE_TRUNC('minute', timestamp)                          AS bar_ts,
-                            MAX(volume)      OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_volume,
-                            MAX(open_interest) OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_oi,
-                            MAX(updated_at)  OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_updated_at,
-                            ROW_NUMBER()     OVER (
-                                PARTITION BY DATE_TRUNC('minute', timestamp)
-                                ORDER BY timestamp DESC
-                            ) AS rn
-                        FROM option_chains
-                        WHERE option_symbol = $1
-                          AND timestamp >= $2
-                          AND timestamp < $3
-                    )
-                    SELECT
-                        bar_ts             AS timestamp,
-                        underlying,
-                        strike,
-                        expiration,
-                        option_type,
-                        last,
-                        bid,
-                        ask,
-                        mid,
-                        bar_volume         AS volume,
-                        bar_oi             AS open_interest,
-                        ask_volume,
-                        mid_volume,
-                        bid_volume,
-                        implied_volatility,
-                        delta,
-                        gamma,
-                        theta,
-                        vega,
-                        bar_updated_at     AS updated_at,
-                        -- volume_delta uses an explicit chronological window
-                        -- (ORDER BY bar_ts ASC) so each bar's delta is the
-                        -- increment over the prior bar regardless of how the
-                        -- outer SELECT orders the result set.
-                        GREATEST(
-                            COALESCE(bar_volume, 0)
-                                - COALESCE(LAG(bar_volume) OVER (ORDER BY bar_ts), 0),
-                            0
-                        )::bigint          AS volume_delta
-                    FROM ranked
-                    WHERE rn = 1
-                    ORDER BY timestamp DESC
-                """
-                rows = await conn.fetch(query, option_symbol, day_start_et, day_end_et)
+                rows = await conn.fetch(query, option_symbol, window_start, window_end)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching option contract history: {e}", exc_info=True)
