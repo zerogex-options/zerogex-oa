@@ -195,18 +195,16 @@ key_store = _KeyStore()
 
 
 if _API_KEY is None:
-    if _ENVIRONMENT == "production":
-        # In production this is almost certainly a misconfiguration.  Make
-        # it impossible to miss in the logs.
-        logger.error(
-            "API_KEY is not set but ENVIRONMENT=production; static-key auth "
-            "is disabled.  Per-user DB-backed keys may still be configured."
-        )
-    else:
-        logger.info(
-            "Static API_KEY auth disabled (API_KEY not set).  Per-user "
-            "DB-backed keys will be checked when configured."
-        )
+    # Phase 7 (2026-05-13) intentionally removed the static API_KEY
+    # break-glass from production .env. Per-user DB-backed keys are now
+    # the primary auth mechanism, so an unset API_KEY is the expected
+    # steady state — not a misconfiguration. Logging at INFO so module
+    # imports (CLI invocations, lifespan startup) don't spam the journal
+    # with ERROR lines for a deliberately-chosen state.
+    logger.info(
+        "Static API_KEY auth disabled (API_KEY not set).  Per-user "
+        "DB-backed keys will be checked when configured."
+    )
 
 
 def _matches_static(provided: Optional[str]) -> bool:
