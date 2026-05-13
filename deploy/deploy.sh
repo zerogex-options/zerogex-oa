@@ -126,6 +126,27 @@ source "$ENV_FILE"
 set +a
 export APP_DIR ENV_FILE
 
+# Always run 005.preflight, regardless of --start-from. It only validates
+# .env (require_var on OA_API_DOMAIN, LETSENCRYPT_EMAIL, DB_HOST, etc.)
+# and makes no system changes, so re-running it is free. Doing it here —
+# before the start-from logic — means a `make deploy-from STEP=125`
+# invocation gets the same config-correctness guarantees as a full
+# deploy. Without this, a missing var surfaces several steps later as
+# a cryptic error (e.g. an empty OA_API_DOMAIN crashing 130.ssl's DNS
+# preflight with `dig: '' is not a legal name`).
+PREFLIGHT_SCRIPT="$STEPS_DIR/005.preflight"
+if [ -x "$PREFLIGHT_SCRIPT" ]; then
+    log "=========================================="
+    log "Executing: 005.preflight ..."
+    if bash "$PREFLIGHT_SCRIPT"; then
+        log "✓ 005.preflight completed successfully"
+    else
+        log "✗ 005.preflight failed — fix .env and re-run."
+        exit 1
+    fi
+    log ""
+fi
+
 # Flag to track if we should start executing
 SHOULD_EXECUTE=false
 if [ -z "$START_FROM" ]; then
@@ -141,6 +162,14 @@ for step_script in "$STEPS_DIR"/*.* ; do
         if [ -n "$START_FROM" ] && [[ "$step_name" == *"$START_FROM"* ]]; then
             SHOULD_EXECUTE=true
             log "Found start step: $step_name"
+        fi
+
+        # 005.preflight was already run unconditionally above; skip it
+        # here so a full deploy doesn't validate twice. The start-from
+        # check above still fires for --start-from 005 so subsequent
+        # steps run normally.
+        if [[ "$step_name" == 005.* ]]; then
+            continue
         fi
 
         # Skip steps before the start-from step
