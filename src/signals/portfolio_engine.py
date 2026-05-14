@@ -45,6 +45,8 @@ from src.config import (
     SIGNALS_CONFLUENCE_MIN_OPINIONATED,
     SIGNALS_CONFLUENCE_MIN_STRENGTH,
     SIGNALS_CONVICTION_FLOOR,
+    SIGNALS_HIGH_CONFIDENCE_PATTERN_SIZE,
+    SIGNALS_HIGH_CONFIDENCE_PATTERN_THRESHOLD,
     SIGNALS_DRS_CALL_ENTRY_MIN,
     SIGNALS_DRS_FRESH_CROSS_BOOST,
     SIGNALS_DRS_HARD_GATES_ENABLED,
@@ -160,6 +162,8 @@ class PortfolioEngine:
         self.scalp_size_multiplier = SIGNALS_SCALP_SIZE_MULTIPLIER
         self.chop_high_conviction_threshold = SIGNALS_CHOP_HIGH_CONVICTION_THRESHOLD
         self.chop_high_conviction_size = SIGNALS_CHOP_HIGH_CONVICTION_SIZE
+        self.high_confidence_pattern_threshold = SIGNALS_HIGH_CONFIDENCE_PATTERN_THRESHOLD
+        self.high_confidence_pattern_size = SIGNALS_HIGH_CONFIDENCE_PATTERN_SIZE
         self.entry_threshold = SIGNALS_TRIGGER_THRESHOLD
         self.exit_threshold = SIGNALS_EXIT_THRESHOLD
         self.conviction_floor = SIGNALS_CONVICTION_FLOOR
@@ -406,6 +410,27 @@ class PortfolioEngine:
             if conviction >= self.chop_high_conviction_threshold:
                 cap = max(cap, self.chop_high_conviction_size)
             size_multiplier = min(cap, 1.0)
+
+        # High-confidence Playbook pattern override.  When a card-driven
+        # entry carries confidence above the threshold (e.g. a
+        # gamma_flip_bounce or put_wall_bounce in its preferred regime),
+        # lift the regime cap so structural specialty setups aren't
+        # trimmed by the blanket chop scalp multiplier.  Pure MSI-driven
+        # scores have no card_trigger and are unaffected.
+        aggregation = score.aggregation or {}
+        card_pattern = aggregation.get("card_trigger")
+        try:
+            card_confidence = float(aggregation.get("card_confidence") or 0.0)
+        except (TypeError, ValueError):
+            card_confidence = 0.0
+        if (
+            card_pattern
+            and card_confidence >= self.high_confidence_pattern_threshold
+        ):
+            size_multiplier = min(
+                max(size_multiplier, float(self.high_confidence_pattern_size)),
+                1.0,
+            )
         is_scalp = tier_label == "scalp"
 
         # --- CASE 2: trend confirmation ---

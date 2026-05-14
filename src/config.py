@@ -526,6 +526,19 @@ SIGNALS_CHOP_HIGH_CONVICTION_THRESHOLD = _getenv_float(
 SIGNALS_CHOP_HIGH_CONVICTION_SIZE = _getenv_float(
     "SIGNALS_CHOP_HIGH_CONVICTION_SIZE", 0.85, min=0.0, max=1.0
 )
+# High-confidence Playbook pattern override.  When a card-driven entry
+# arrives with confidence above the threshold, lift the regime size cap
+# to the configured size — bypassing chop's blanket 0.4× scalp multiplier
+# for structural setups like gamma_flip_bounce / put_wall_bounce in their
+# preferred regimes.  Threshold default 0.65 matches the pattern_base of
+# the highest-conviction structural patterns; tune lower to broaden the
+# override, higher to restrict it.
+SIGNALS_HIGH_CONFIDENCE_PATTERN_THRESHOLD = _getenv_float(
+    "SIGNALS_HIGH_CONFIDENCE_PATTERN_THRESHOLD", 0.65, min=0.0, max=1.0
+)
+SIGNALS_HIGH_CONFIDENCE_PATTERN_SIZE = _getenv_float(
+    "SIGNALS_HIGH_CONFIDENCE_PATTERN_SIZE", 1.0, min=0.0, max=1.0
+)
 
 # -----------------------------------------------------------------------------
 # Daily-loss kill switch (Phase 4.4)
