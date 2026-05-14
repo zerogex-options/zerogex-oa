@@ -286,6 +286,38 @@ db-explain-confluence-matrix: ## EXPLAIN (ANALYZE, BUFFERS) the confluence-matri
 		"$(or $(UNDERLYING),SPY)" "$(or $(LOOKBACK),120)" "$(or $(UNDERLYING),SPY)" \
 		| $(PSQL) -v ON_ERROR_STOP=1
 
+.PHONY: db-add-signal-scores-composite-index
+db-add-signal-scores-composite-index: ## Build idx_signal_scores_underlying_ts_composite_covering CONCURRENTLY. Pass CONFIRM=yes to execute.
+	@echo "$(BLUE)=== Building idx_signal_scores_underlying_ts_composite_covering CONCURRENTLY ===$(NC)"
+	@echo "$(YELLOW)Covering index for the OUTER read in /api/signals/{basic,advanced}/confluence-matrix.$(NC)"
+	@echo "$(YELLOW)Key: (underlying, timestamp DESC); INCLUDE (composite_score).$(NC)"
+	@echo "$(YELLOW)signal_scores rows carry a fat 'components' JSONB column — only ~4 tuples$(NC)"
+	@echo "$(YELLOW)per heap page — so LIMIT N scans pay ~N cold heap reads at remote-disk$(NC)"
+	@echo "$(YELLOW)latencies (~50 ms/block).  With composite_score in INCLUDE the planner$(NC)"
+	@echo "$(YELLOW)can satisfy the read from a tight Index Only Scan and skip the JSONB$(NC)"
+	@echo "$(YELLOW)heap entirely.$(NC)"
+	@if [ "$${CONFIRM}" != "yes" ]; then \
+		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to actually build.$(NC)"; \
+	else \
+		printf "%s\n" \
+			"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_signal_scores_underlying_ts_composite_covering ON signal_scores(underlying, timestamp DESC) INCLUDE (composite_score);" \
+			| $(PSQL) -v ON_ERROR_STOP=1; \
+		echo "$(GREEN)✓ Index built. Re-run 'make db-explain-confluence-matrix' — the outer Limit should now use the new index.$(NC)"; \
+	fi
+
+.PHONY: db-tune-signal-tables-autovacuum
+db-tune-signal-tables-autovacuum: ## ALTER TABLE signal_scores + signal_component_scores to trigger autovacuum aggressively (keeps VM current for IOS).
+	@echo "$(BLUE)=== Applying aggressive autovacuum settings to signal_scores + signal_component_scores ===$(NC)"
+	@echo "$(YELLOW)Both tables are appended every scoring cycle.  Default autovacuum$(NC)"
+	@echo "$(YELLOW)(scale_factor=0.2) waits until 20% of the table is dead/dirty before$(NC)"
+	@echo "$(YELLOW)running — far too late for the visibility map to stay current on the$(NC)"
+	@echo "$(YELLOW)latest tuples, which is exactly what /api/signals/.../confluence-matrix$(NC)"
+	@echo "$(YELLOW)reads.  Lower to 2% + a small absolute threshold.$(NC)"
+	@$(PSQL) -c "ALTER TABLE signal_scores SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_vacuum_threshold = 500, autovacuum_analyze_scale_factor = 0.02, autovacuum_analyze_threshold = 500);"
+	@$(PSQL) -c "ALTER TABLE signal_component_scores SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_vacuum_threshold = 1000, autovacuum_analyze_scale_factor = 0.02, autovacuum_analyze_threshold = 1000);"
+	@$(PSQL) -c "SELECT relname, reloptions FROM pg_class WHERE relname IN ('signal_scores','signal_component_scores');"
+	@echo "$(GREEN)✓ Autovacuum tuned. Settings take effect on the next autovacuum cycle.$(NC)"
+
 .PHONY: db-vacuum-confluence-matrix-tables
 db-vacuum-confluence-matrix-tables: ## VACUUM (ANALYZE) signal_scores + signal_component_scores. Needed for Index Only Scan (refreshes visibility map) and planner stats.
 	@echo "$(BLUE)=== VACUUM ANALYZE signal_scores, signal_component_scores ===$(NC)"
