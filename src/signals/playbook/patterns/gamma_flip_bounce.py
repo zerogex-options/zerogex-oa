@@ -86,21 +86,28 @@ def _detect_bounce(
     closes: list[float],
     flip: float,
     *,
+    lows: Optional[list[float]] = None,
+    highs: Optional[list[float]] = None,
     prior_bars: int = _PRIOR_MODE_BARS,
     recent_bars: int = _RECENT_BARS,
     prior_threshold: float = _PRIOR_MODE_THRESHOLD,
     touch_tol_pct: float = _TOUCH_TOLERANCE_PCT,
     reject_buffer_pct: float = _REJECT_BUFFER_PCT,
 ) -> Optional[BounceDirection]:
-    """Detect a flip-tag-and-reject from trailing closes.
+    """Detect a flip-tag-and-reject from trailing bars.
 
-    Bullish: prior window mostly *above* flip, recent window touched
-    (close <= flip * (1 + touch_tol_pct)), and the last close is back
-    above flip by reject_buffer_pct.
+    Uses ``lows`` for bullish-touch detection and ``highs`` for
+    bearish-touch detection when available — that's the real wick
+    rejection signal.  Falls back to ``closes`` for both touch and
+    rejection when the OHL arrays are empty or misaligned (older test
+    fixtures, async API path that doesn't fetch bar data).
 
-    Bearish: mirror — prior window mostly *below* flip, recent window
-    touched (close >= flip * (1 - touch_tol_pct)), last close back below
-    by buffer.
+    Bullish: prior window mostly *above* flip, recent window's lowest
+    low pierced flip (low <= flip * (1 + touch_tol_pct)), and the most
+    recent close is back above flip by reject_buffer_pct.
+
+    Bearish: mirror — prior mostly below, recent window's highest high
+    pierced flip from below, latest close back below by buffer.
 
     Returns None if neither pattern holds (e.g., clean cross-through,
     no test, or insufficient data).
@@ -119,18 +126,31 @@ def _detect_bounce(
     if len(prior_window) < 5:
         return None
 
+    # Pull the same window from lows/highs if available and aligned.
+    def _aligned_tail(series: Optional[list[float]]) -> Optional[list[float]]:
+        if not series or len(series) != len(closes):
+            return None
+        return series[-recent_bars:]
+
+    recent_lows = _aligned_tail(lows)
+    recent_highs = _aligned_tail(highs)
+
     above_prior = sum(1 for c in prior_window if c > flip)
     above_share = above_prior / len(prior_window)
     below_share = 1.0 - above_share
 
     last_close = recent_window[-1]
-    touch_low_band = flip * (1.0 + touch_tol_pct)  # bullish touch: any close <= this
-    touch_high_band = flip * (1.0 - touch_tol_pct)  # bearish touch: any close >= this
+    touch_low_band = flip * (1.0 + touch_tol_pct)
+    touch_high_band = flip * (1.0 - touch_tol_pct)
     reject_above = flip * (1.0 + reject_buffer_pct)
     reject_below = flip * (1.0 - reject_buffer_pct)
 
-    bullish_touch = any(c <= touch_low_band for c in recent_window)
-    bearish_touch = any(c >= touch_high_band for c in recent_window)
+    # True wick check when lows/highs are present; otherwise fall back
+    # to closes (close at/below band approximates a touch).
+    bullish_touch_source = recent_lows if recent_lows is not None else recent_window
+    bearish_touch_source = recent_highs if recent_highs is not None else recent_window
+    bullish_touch = any(v <= touch_low_band for v in bullish_touch_source)
+    bearish_touch = any(v >= touch_high_band for v in bearish_touch_source)
 
     if (
         above_share >= prior_threshold
@@ -179,7 +199,12 @@ class GammaFlipBouncePattern(PatternBase):
 
         flip = ctx.market.gamma_flip
         close = ctx.close
-        bounce = _detect_bounce(ctx.market.recent_closes, flip)
+        bounce = _detect_bounce(
+            ctx.market.recent_closes,
+            flip,
+            lows=ctx.market.recent_lows or None,
+            highs=ctx.market.recent_highs or None,
+        )
         if bounce is None:
             return None  # defensive; trigger check already covers this
 
@@ -316,9 +341,14 @@ class GammaFlipBouncePattern(PatternBase):
                 f"too early ({ctx.et_time} ET); needs >= {_OPEN_GATE.strftime('%H:%M')} ET"
             )
 
-        # Bounce detection on trailing closes.
+        # Bounce detection on trailing bars.
         if flip is not None and flip > 0:
-            bounce = _detect_bounce(ctx.market.recent_closes, flip)
+            bounce = _detect_bounce(
+                ctx.market.recent_closes,
+                flip,
+                lows=ctx.market.recent_lows or None,
+                highs=ctx.market.recent_highs or None,
+            )
             if bounce is None:
                 missing.append(
                     "no flip tag-and-reject detected: last "

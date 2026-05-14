@@ -28,6 +28,12 @@ class MarketContext:
     vwap: Optional[float] = None
     vwap_deviation_pct: Optional[float] = None
     orb_status: Optional[str] = None
+    # Trailing bar lows / highs aligned to ``recent_closes`` (oldest -> newest).
+    # Populated alongside closes by the live data fetcher; patterns that need
+    # wick info (e.g. gamma_flip_bounce) read these and fall back to closes
+    # when empty (older test fixtures, async API path).
+    recent_lows: list[float] = field(default_factory=list)
+    recent_highs: list[float] = field(default_factory=list)
     extra: dict = field(default_factory=dict)  # escape hatch for future fields
 
 

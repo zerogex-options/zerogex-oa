@@ -689,9 +689,12 @@ class UnifiedSignalEngine:
 
                 # C4: extend the close history to 2h of 1-minute bars so
                 # components can compute realized-sigma normalized momentum.
+                # We also pull low/high alongside close so patterns that need
+                # wick info (e.g. gamma_flip_bounce) can do true rejection
+                # detection rather than approximating from closes alone.
                 cur.execute(
                     """
-                    SELECT close
+                    SELECT low, high, close
                     FROM underlying_quotes
                     WHERE symbol = %s
                     ORDER BY timestamp DESC
@@ -699,7 +702,19 @@ class UnifiedSignalEngine:
                     """,
                     (self.db_symbol,),
                 )
-                closes = [float(r[0]) for r in cur.fetchall()]
+                bar_rows = cur.fetchall()
+                closes = [float(r[2]) for r in bar_rows]
+                # For pre-backfill rows missing low/high, fall back to the
+                # close so the lists stay aligned and typed.  Worst case a
+                # pattern's wick check becomes a close check on those bars.
+                lows = [
+                    float(r[0]) if r[0] is not None else float(r[2])
+                    for r in bar_rows
+                ]
+                highs = [
+                    float(r[1]) if r[1] is not None else float(r[2])
+                    for r in bar_rows
+                ]
 
                 # Latest VIX level for optional term-structure gating.  We only
                 # have spot VIX; vix_9d / vix_3m would need a separate ingest.
@@ -949,6 +964,8 @@ class UnifiedSignalEngine:
                     "smart_call_gross": float(sm_call_gross or 0.0),
                     "smart_put_gross": float(sm_put_gross or 0.0),
                     "recent_closes": list(reversed(closes)),
+                    "recent_lows": list(reversed(lows)),
+                    "recent_highs": list(reversed(highs)),
                     "iv_rank": iv_rank,
                     "vwap": vwap,
                     "vwap_deviation_pct": vwap_deviation_pct,
@@ -983,6 +1000,8 @@ class UnifiedSignalEngine:
             smart_call=ctx["smart_call"],
             smart_put=ctx["smart_put"],
             recent_closes=ctx["recent_closes"],
+            recent_lows=ctx.get("recent_lows") or [],
+            recent_highs=ctx.get("recent_highs") or [],
             iv_rank=ctx.get("iv_rank"),
             vwap=ctx.get("vwap"),
             vwap_deviation_pct=ctx.get("vwap_deviation_pct"),

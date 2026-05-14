@@ -46,6 +46,8 @@ def _no_test_closes(flip: float = 736.0) -> list[float]:
 def _ctx(
     *,
     closes: Optional[list[float]] = None,
+    lows: Optional[list[float]] = None,
+    highs: Optional[list[float]] = None,
     flip: float = 736.0,
     close: Optional[float] = None,
     net_gex: float = 3.0e9,
@@ -81,6 +83,8 @@ def _ctx(
         smart_call=200000.0,
         smart_put=100000.0,
         recent_closes=closes,
+        recent_lows=lows or [],
+        recent_highs=highs or [],
         iv_rank=None,
         extra={"call_wall": call_wall, "put_wall": put_wall},
     )
@@ -310,6 +314,90 @@ def test_does_not_co_fire_with_gamma_flip_break():
     # gamma_flip_break needs vol_expansion triggered + rbi label in
     # break/breakout modes — our bounce ctx has neither, so it must stand down.
     assert break_card is None
+
+
+def test_wick_pierces_flip_with_close_above_detects_bullish():
+    """The user's 9:45 ET chart scenario: candle low went BELOW the flip
+    (735.47 < 736.07) but the close stayed ABOVE it (736.87 > 736.07).
+
+    The close-only fallback misses this — the wick low is what matters.
+    With recent_lows populated, the pattern fires.
+    """
+    flip = 736.07
+    prior_closes = [flip + 5.0 + (i % 3) * 0.10 for i in range(30)]
+    prior_lows = [c - 0.40 for c in prior_closes]
+    prior_highs = [c + 0.30 for c in prior_closes]
+    # Recent 3 bars: closes stay well above the touch band (flip * 1.001
+    # = ~736.81), but the middle bar's wick low punches below the flip.
+    # This is the exact wick-rejection footprint from the user's 9:45 chart.
+    recent_closes = [flip + 1.40, flip + 1.00, flip + 1.80]
+    recent_lows = [flip + 1.10, flip - 0.60, flip + 1.45]  # middle wicks through
+    recent_highs = [flip + 1.70, flip + 1.30, flip + 2.00]
+
+    closes = prior_closes + recent_closes
+    lows = prior_lows + recent_lows
+    highs = prior_highs + recent_highs
+
+    # Sanity: close-only detection must NOT fire (no recent close <= touch_band).
+    ctx_closes_only = _ctx(flip=flip, closes=closes, close=recent_closes[-1])
+    assert GAMMA_FLIP_BOUNCE.match(ctx_closes_only) is None
+
+    # With recent_lows populated, the wick-pierce is visible -> fires bullish.
+    ctx_with_lows = _ctx(
+        flip=flip,
+        closes=closes,
+        lows=lows,
+        highs=highs,
+        close=recent_closes[-1],
+    )
+    card = GAMMA_FLIP_BOUNCE.match(ctx_with_lows)
+    assert card is not None
+    assert card.direction == "bullish"
+    assert card.context["bounce_direction"] == "bullish"
+
+
+def test_bearish_wick_pierces_flip_from_below_detects_bearish():
+    """Mirror: prior closes below flip, recent highs wick above flip,
+    but recent closes stay below.  Real wick rejection from below."""
+    flip = 736.0
+    prior_closes = [flip - 5.0 - (i % 3) * 0.10 for i in range(30)]
+    prior_lows = [c - 0.30 for c in prior_closes]
+    prior_highs = [c + 0.40 for c in prior_closes]
+    recent_closes = [flip - 1.40, flip - 1.00, flip - 1.80]
+    recent_lows = [flip - 1.80, flip - 1.30, flip - 2.10]
+    recent_highs = [flip - 1.10, flip + 0.60, flip - 1.45]  # middle wicks through
+
+    closes = prior_closes + recent_closes
+    lows = prior_lows + recent_lows
+    highs = prior_highs + recent_highs
+
+    card = GAMMA_FLIP_BOUNCE.match(
+        _ctx(
+            flip=flip,
+            closes=closes,
+            lows=lows,
+            highs=highs,
+            close=recent_closes[-1],
+            tape_score=-45.0,
+            ofi_score=-30.0,
+        )
+    )
+    assert card is not None
+    assert card.direction == "bearish"
+
+
+def test_misaligned_lows_array_falls_back_to_closes():
+    """Defensive: if lows/highs lengths don't match closes, ignore them."""
+    flip = 736.0
+    # Build a closes-only-detectable bounce.
+    closes = _bullish_bounce_closes(flip)
+    # Supply lows with wrong length — should be ignored, closes path used.
+    bogus_lows = [flip - 5.0] * 5  # length 5, closes is 33
+    ctx = _ctx(flip=flip, closes=closes, lows=bogus_lows, close=closes[-1])
+    card = GAMMA_FLIP_BOUNCE.match(ctx)
+    # Still fires via closes-only fallback.
+    assert card is not None
+    assert card.direction == "bullish"
 
 
 def test_pattern_is_discovered_by_engine():
