@@ -711,26 +711,15 @@ class SignalsQueriesMixin:
             ]
         if not component_names:
             return {"component_order": [], "matrix": {}, "rows_analyzed": 0}
-        query = """
-            WITH recent AS (
-                SELECT underlying, timestamp, composite_score
-                FROM signal_scores
-                WHERE underlying = $1
-                ORDER BY timestamp DESC
-                LIMIT $2
-            )
-            SELECT
-                r.timestamp,
-                r.composite_score,
-                scs.component_name,
-                scs.clamped_score
-            FROM recent r
-            LEFT JOIN signal_component_scores scs
-              ON scs.underlying = r.underlying
-             AND scs.timestamp = r.timestamp
-             AND scs.component_name = ANY($3::text[])
-            ORDER BY r.timestamp ASC
-        """
+
+        cache_key = (
+            "signal_confluence_matrix:"
+            f"{symbol}:{lookback}:{neutral_epsilon}:"
+            + ",".join(sorted(component_names))
+        )
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
 
         def _sign(value: float) -> int:
             if value > neutral_epsilon:
@@ -740,21 +729,55 @@ class SignalsQueriesMixin:
             return 0
 
         try:
+            # Two-query split avoids a JOIN with no time bound on
+            # signal_component_scores — without the explicit timestamp
+            # filter below, the planner sometimes hash-joins large slices
+            # of that table.  Fetching scores first gives us the earliest
+            # timestamp in the window so the component-scores read uses
+            # ``idx_signal_component_scores_underlying_ts`` cleanly.
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, symbol, lookback, component_names)
-            by_ts: Dict[Any, Dict[str, Any]] = {}
-            for row in rows:
-                ts = row["timestamp"]
-                bucket = by_ts.setdefault(
-                    ts,
-                    {
-                        "composite_score": float(row.get("composite_score") or 0.0),
-                        "components": {},
-                    },
+                score_rows = await conn.fetch(
+                    """
+                    SELECT timestamp, composite_score
+                    FROM signal_scores
+                    WHERE underlying = $1
+                    ORDER BY timestamp DESC
+                    LIMIT $2
+                    """,
+                    symbol,
+                    lookback,
                 )
-                comp = row.get("component_name")
-                if comp is not None:
-                    bucket["components"][comp] = float(row.get("clamped_score") or 0.0)
+                if score_rows:
+                    min_ts = score_rows[-1]["timestamp"]
+                    comp_rows = await conn.fetch(
+                        """
+                        SELECT timestamp, component_name, clamped_score
+                        FROM signal_component_scores
+                        WHERE underlying = $1
+                          AND component_name = ANY($2::text[])
+                          AND timestamp >= $3
+                        """,
+                        symbol,
+                        component_names,
+                        min_ts,
+                    )
+                else:
+                    comp_rows = []
+
+            by_ts: Dict[Any, Dict[str, Any]] = {
+                row["timestamp"]: {
+                    "composite_score": float(row["composite_score"] or 0.0),
+                    "components": {},
+                }
+                for row in score_rows
+            }
+            for row in comp_rows:
+                bucket = by_ts.get(row["timestamp"])
+                if bucket is None:
+                    continue
+                bucket["components"][row["component_name"]] = float(
+                    row["clamped_score"] or 0.0
+                )
 
             component_order = list(component_names)
             matrix: Dict[str, Dict[str, Any]] = {name: {} for name in component_order}
@@ -814,13 +837,15 @@ class SignalsQueriesMixin:
                     "disagreement_ratio": round(disagree / active, 4) if active else None,
                 }
 
-            return {
+            result = {
                 "components": component_order,
                 "matrix": matrix,
                 "component_vs_regime": component_vs_regime,
                 "sample_count": len(by_ts),
                 "latest_timestamp": max(by_ts.keys()) if by_ts else None,
             }
+            self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
+            return result
         except Exception as e:
             logger.error(f"get_signal_confluence_matrix failed ({symbol}): {e}")
             return {
