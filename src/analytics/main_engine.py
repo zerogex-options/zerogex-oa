@@ -124,6 +124,22 @@ class AnalyticsEngine:
         index directly — dropping a 245 s query to tens of milliseconds
         on the same production data.
 
+        Latest-per-contract step (query #3): the wide 96-hour lookback is
+        kept on purpose so Monday-morning's first cycle still reaches the
+        prior Friday's closing quotes for every contract.  At that width
+        the planner's natural choice — picking
+        ``idx_option_chains_underlying_option_symbol_timestamp`` to satisfy
+        the ORDER BY without a Sort — used to heap-fetch every candidate
+        row to evaluate ``gamma IS NOT NULL`` (600 k random reads → 23 min
+        wallclock on 2026-05-13).  The fix is the partial covering index
+        ``idx_option_chains_underlying_option_symbol_ts_gamma WHERE gamma
+        IS NOT NULL INCLUDE (expiration)`` declared in
+        setup/database/schema.sql, which lets that loose-index scan
+        evaluate both ``gamma IS NOT NULL`` and ``expiration > $4`` from
+        the index leaf with no heap fetch for the filter.  The pool-level
+        statement_timeout in src/database/connection.py is the backstop
+        if anything ever regresses the plan again.
+
         Returns dict with keys 'timestamp', 'underlying_price',
         'options' or None if no data is available.
         """
@@ -169,14 +185,19 @@ class AnalyticsEngine:
 
                 # 3. Latest per-contract option quote, scoped to the
                 # lookback window plus the contract-expiration roll-off.
-                # Literal ``timestamp`` values let the planner use
-                # idx_option_chains_underlying_ts_gamma; the wide default
-                # window (96 hours) covers long-weekend / holiday gaps
-                # so the first analytics cycle after a break still sees
-                # the prior session's closing quotes for every contract.
-                # ``min_expiration`` removes contracts that have already
-                # cleared their 16:15 ET settlement cutoff at the snapshot
-                # wall-clock time.
+                # Returns one row per option_symbol — the most recent
+                # quote at or before ``timestamp`` whose contract has not
+                # yet cleared its 16:15 ET settlement cutoff and whose
+                # gamma has been populated by ingestion.  Feeds the GEX
+                # and max-pain calculations in run_calculation().
+                #
+                # Plan: the partial covering index
+                # idx_option_chains_underlying_option_symbol_ts_gamma
+                # WHERE gamma IS NOT NULL INCLUDE (expiration) supports
+                # this query as a loose index scan with no Sort and no
+                # heap fetches for the filter predicates.  The wide 96-h
+                # default window is what makes that index necessary —
+                # see the function docstring for the May 13 incident.
                 lookback_start = timestamp - timedelta(hours=self.snapshot_lookback_hours)
                 ts_et = timestamp.astimezone(ET)
                 if ts_et.time() < dt_time(16, 15):

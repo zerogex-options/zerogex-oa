@@ -127,6 +127,12 @@ def _initialize_connection_pool():
     connect_retries = int(os.getenv("DB_CONNECT_RETRIES", "5"))
     retry_base_delay = float(os.getenv("DB_CONNECT_RETRY_DELAY_SECONDS", "1.5"))
     sslmode = os.getenv("DB_SSLMODE", "").strip()
+    # Defense-in-depth: cap any single statement server-side so a
+    # pathological query (e.g. an analytics _get_snapshot that picks the
+    # wrong plan) can't wedge a backend for hours.  Mirrors the asyncpg
+    # pool's server_settings={"statement_timeout": ...} in
+    # src/api/database.py:243-271.  Set to 0 to disable.
+    statement_timeout_ms = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "30000"))
 
     # Get password from configured provider
     # Note: For .pgpass, this returns None (psycopg2 reads .pgpass automatically)
@@ -137,13 +143,14 @@ def _initialize_connection_pool():
         raise
 
     logger.info(
-        "Connecting to PostgreSQL: %s@%s:%s/%s (pool min=%d, max=%d)",
+        "Connecting to PostgreSQL: %s@%s:%s/%s (pool min=%d, max=%d, statement_timeout=%dms)",
         db_user,
         db_host,
         db_port,
         db_name,
         min_connections,
         max_connections,
+        statement_timeout_ms,
     )
 
     # Build connection parameters
@@ -161,6 +168,10 @@ def _initialize_connection_pool():
         "keepalives_interval": int(os.getenv("DB_KEEPALIVES_INTERVAL_SECONDS", "10")),
         "keepalives_count": int(os.getenv("DB_KEEPALIVES_COUNT", "5")),
     }
+
+    if statement_timeout_ms > 0:
+        # libpq forwards "-c key=value" tokens as SET-on-connect.
+        conn_params["options"] = f"-c statement_timeout={statement_timeout_ms}"
 
     # Only add password if it's not None (i.e., not using .pgpass)
     if db_password is not None:

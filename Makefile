@@ -227,6 +227,27 @@ analytics-snapshot-explain: ## EXPLAIN (no ANALYZE) of the _get_snapshot query â
 		"EXPLAIN (VERBOSE) WITH latest_ts AS (SELECT timestamp AS ts FROM option_chains WHERE underlying = '$$UNDERLYING' ORDER BY timestamp DESC LIMIT 1), latest_per_contract AS (SELECT DISTINCT ON (oc.option_symbol) oc.option_symbol, oc.timestamp FROM option_chains oc, latest_ts lt WHERE oc.underlying = '$$UNDERLYING' AND oc.timestamp <= lt.ts AND oc.timestamp >= (lt.ts - ($$LOOKBACK * INTERVAL '1 minute')) AND oc.gamma IS NOT NULL ORDER BY oc.option_symbol, oc.timestamp DESC) SELECT lt.ts, lpc.option_symbol FROM latest_ts lt LEFT JOIN latest_per_contract lpc ON TRUE;" \
 		| $(PSQL) -v ON_ERROR_STOP=0
 
+.PHONY: db-add-distinct-on-index
+db-add-distinct-on-index: ## Build idx_option_chains_underlying_option_symbol_ts_gamma CONCURRENTLY (~1.3 GB). Pass CONFIRM=yes to execute.
+	@echo "$(BLUE)=== Building idx_option_chains_underlying_option_symbol_ts_gamma CONCURRENTLY ===$(NC)"
+	@echo "$(YELLOW)Partial covering index for AnalyticsEngine._get_snapshot()'s$(NC)"
+	@echo "$(YELLOW)DISTINCT ON (option_symbol) query. Restores sub-second execution$(NC)"
+	@echo "$(YELLOW)at the 96-hour lookback (replaces 23-minute pathological plan).$(NC)"
+	@echo "$(YELLOW)Definition:$(NC)"
+	@echo "$(YELLOW)  ON option_chains(underlying, option_symbol, timestamp DESC)$(NC)"
+	@echo "$(YELLOW)  INCLUDE (expiration) WHERE gamma IS NOT NULL$(NC)"
+	@echo "$(YELLOW)Estimated size: ~1.3 GB on a 6.4 GB table (28 GB existing index footprint).$(NC)"
+	@echo "$(YELLOW)Build is non-blocking (CREATE INDEX CONCURRENTLY) but holds a session;$(NC)"
+	@echo "$(YELLOW)allow ~5-15 minutes on the production table size.$(NC)"
+	@if [ "$${CONFIRM}" != "yes" ]; then \
+		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to actually build.$(NC)"; \
+	else \
+		printf "%s\n" \
+			"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_option_chains_underlying_option_symbol_ts_gamma ON option_chains(underlying, option_symbol, timestamp DESC) INCLUDE (expiration) WHERE gamma IS NOT NULL;" \
+			| $(PSQL) -v ON_ERROR_STOP=1; \
+		echo "$(GREEN)âœ“ Index built. Run 'make analytics-snapshot-diagnose LOOKBACK_MINUTES=5760' to confirm sub-second plan.$(NC)"; \
+	fi
+
 .PHONY: db-drop-unused-indexes
 db-drop-unused-indexes: ## Drop 4 indexes with idx_scan=0 (~2.8 GB reclaimed). Review output first; pass CONFIRM=yes to execute.
 	@echo "$(BLUE)=== Dropping unused option_chains indexes ===$(NC)"

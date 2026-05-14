@@ -172,6 +172,23 @@ CREATE INDEX IF NOT EXISTS idx_option_chains_option_symbol_timestamp
 CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_ts_quote_covering
     ON option_chains(underlying, timestamp DESC)
     INCLUDE (bid, ask, volume, open_interest, strike, expiration, option_type);
+-- Partial covering index for AnalyticsEngine._get_snapshot()'s
+-- DISTINCT ON (option_symbol) ... ORDER BY option_symbol, timestamp DESC query.
+-- Matches the ORDER BY natively (no Sort step), restricts the index to rows
+-- with Greeks populated (no heap fetch to evaluate gamma IS NOT NULL), and
+-- carries expiration in INCLUDE so the expiration > min_expiration filter
+-- can also be evaluated from the index leaf.  Without this index the planner
+-- falls back to idx_option_chains_underlying_option_symbol_timestamp and
+-- heap-fetches every candidate row to evaluate gamma IS NOT NULL, which on
+-- a 96-hour lookback wedges the query for tens of minutes (see commit
+-- history / PR description for the May 13 incident EXPLAIN plans).  Build
+-- with CREATE INDEX CONCURRENTLY in production via
+-- ``make db-add-distinct-on-index`` to avoid blocking the option_chains
+-- writers; this schema entry serves fresh installs and idempotent retries.
+CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_option_symbol_ts_gamma
+    ON option_chains(underlying, option_symbol, timestamp DESC)
+    INCLUDE (expiration)
+    WHERE gamma IS NOT NULL;
 
 DO $$
 BEGIN
