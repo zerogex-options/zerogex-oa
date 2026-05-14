@@ -270,8 +270,21 @@ db-add-confluence-matrix-index: ## Build idx_signal_component_scores_underlying_
 		printf "%s\n" \
 			"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_signal_component_scores_underlying_ts_comp_clamped_covering ON signal_component_scores(underlying, timestamp DESC, component_name) INCLUDE (clamped_score);" \
 			| $(PSQL) -v ON_ERROR_STOP=1; \
-		echo "$(GREEN)✓ Index built. Verify via EXPLAIN ANALYZE that confluence-matrix reads use it.$(NC)"; \
+		echo "$(GREEN)✓ Index built. Verify via 'make db-verify-confluence-matrix-index' and 'make db-explain-confluence-matrix UNDERLYING=SPY'.$(NC)"; \
 	fi
+
+.PHONY: db-verify-confluence-matrix-index
+db-verify-confluence-matrix-index: ## Confirm the confluence-matrix covering index exists and is VALID.
+	@echo "$(BLUE)=== Verifying idx_signal_component_scores_underlying_ts_comp_clamped_covering ===$(NC)"
+	@$(PSQL) -c "SELECT indexrelid::regclass AS index, pg_size_pretty(pg_relation_size(indexrelid)) AS size, indisvalid, indisready FROM pg_index WHERE indexrelid = 'idx_signal_component_scores_underlying_ts_comp_clamped_covering'::regclass;"
+
+.PHONY: db-explain-confluence-matrix
+db-explain-confluence-matrix: ## EXPLAIN (ANALYZE, BUFFERS) the confluence-matrix inner read (UNDERLYING=SPY LOOKBACK=120). Confirms Index Only Scan + Heap Fetches: 0.
+	@echo "$(BLUE)=== EXPLAIN ANALYZE confluence-matrix inner read (UNDERLYING=$(or $(UNDERLYING),SPY), LOOKBACK=$(or $(LOOKBACK),120)) ===$(NC)"
+	@echo "$(YELLOW)Look for: 'Index Only Scan using idx_signal_component_scores_underlying_ts_comp_clamped_covering' + 'Heap Fetches: 0'.$(NC)"
+	@printf "EXPLAIN (ANALYZE, BUFFERS) WITH recent AS (SELECT timestamp, composite_score FROM signal_scores WHERE underlying = '%s' ORDER BY timestamp DESC LIMIT %s) SELECT scs.timestamp, scs.component_name, scs.clamped_score FROM recent r JOIN signal_component_scores scs ON scs.underlying = '%s' AND scs.timestamp = r.timestamp WHERE scs.component_name = ANY(ARRAY['tape_flow_bias','skew_delta','vanna_charm_flow','dealer_delta_pressure','gex_gradient','positioning_trap']);\n" \
+		"$(or $(UNDERLYING),SPY)" "$(or $(LOOKBACK),120)" "$(or $(UNDERLYING),SPY)" \
+		| $(PSQL) -v ON_ERROR_STOP=1
 
 .PHONY: db-drop-narrow-partial-index
 db-drop-narrow-partial-index: ## DROP CONCURRENTLY the narrow idx_option_chains_underlying_option_symbol_ts_gamma (~1.6 GB; subsumed by _covering). Pass CONFIRM=yes to execute.
