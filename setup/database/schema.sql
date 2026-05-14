@@ -181,11 +181,15 @@ CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_ts_quote_covering
 -- planner falls back to idx_option_chains_underlying_option_symbol_timestamp
 -- and heap-fetches every candidate row to evaluate gamma IS NOT NULL plus
 -- collect the SELECT-list columns; on a 96-hour lookback that produced the
--- 23-minute wedge incident of May 13, 2026.  With this index, the same query
--- runs in ~45 seconds under production load (a 20-25x improvement; not
--- sub-second because DISTINCT ON still walks every tuple in the window --
--- PostgreSQL has no skip-scan optimization for this shape).  See PR for the
--- before/after EXPLAIN plans.
+-- 23-minute wedge incident of May 13, 2026.
+--
+-- Runtime cost is dominated by the lookback width since PostgreSQL has no
+-- skip-scan; the index still has to emit every (option_symbol, timestamp)
+-- tuple in the window before Unique deduplicates.  Steady-state cycles
+-- therefore use a narrow ANALYTICS_SNAPSHOT_LOOKBACK_HOURS (default 2h,
+-- ~20 k tuples, ~1 sec wallclock under concurrent autovacuum IO); the
+-- first cycle per worker uses ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS
+-- (default 96h) to reach across a weekend gap.
 --
 -- Build with CREATE INDEX CONCURRENTLY in production via
 -- ``make db-add-distinct-on-index`` to avoid blocking the option_chains

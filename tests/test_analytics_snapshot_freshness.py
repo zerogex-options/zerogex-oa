@@ -112,6 +112,8 @@ def test_expiration_filter_rolls_off_today_after_1615():
 def test_lookback_uses_configured_hours_not_minutes():
     engine = AnalyticsEngine(underlying="SPY")
     engine.snapshot_lookback_hours = 48
+    # Skip the one-shot cold-start window so this test exercises steady-state.
+    engine._snapshot_cold_start_consumed = True
     snapshot_ts = ET.localize(datetime(2026, 5, 13, 10, 0)).astimezone(timezone.utc)
     cm, cursor = _mock_db_connection(snapshot_ts, 500.0, [])
 
@@ -146,10 +148,12 @@ def test_engine_no_longer_carries_freshness_attribute():
     assert not hasattr(engine, "snapshot_lookback_minutes")
 
 
-def test_default_lookback_hours_covers_long_weekend():
-    """96h default must reach across a 3-day weekend (Memorial Day, etc.)."""
+def test_default_cold_start_lookback_hours_covers_long_weekend():
+    """The first-cycle cold-start window must reach across a 3-day weekend
+    (Memorial Day, etc.) so the very first snapshot of the week still finds
+    every contract's prior close.  Steady-state cycles use a narrow window."""
     engine = AnalyticsEngine(underlying="SPY")
-    assert engine.snapshot_lookback_hours >= 72
+    assert engine.snapshot_cold_start_lookback_hours >= 72
 
 
 def test_lookback_hours_env_var_overrides_default(monkeypatch):

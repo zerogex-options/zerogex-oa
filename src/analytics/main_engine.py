@@ -70,8 +70,13 @@ class AnalyticsEngine:
         self.risk_free_rate = risk_free_rate
         self.running = False
         self.snapshot_lookback_hours = max(
-            1, int(os.getenv("ANALYTICS_SNAPSHOT_LOOKBACK_HOURS", "96"))
+            1, int(os.getenv("ANALYTICS_SNAPSHOT_LOOKBACK_HOURS", "2"))
         )
+        self.snapshot_cold_start_lookback_hours = max(
+            self.snapshot_lookback_hours,
+            int(os.getenv("ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS", "96")),
+        )
+        self._snapshot_cold_start_consumed = False
         self.min_oi_coverage_pct_alert = float(
             os.getenv("ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT", "0.35")
         )
@@ -112,44 +117,41 @@ class AnalyticsEngine:
         Issued as three separate queries rather than a single CTE-heavy
         query.  The previous combined form referenced ``latest_ts.ts``
         inside a timestamp-range predicate on option_chains, which the
-        PostgreSQL planner cannot push into the partial index
-        ``idx_option_chains_underlying_ts_gamma(underlying, timestamp
-        DESC) WHERE gamma IS NOT NULL`` because it treats the CTE value
-        as unknown at plan time.  The result was a Seq Scan over ~21 M
-        rows every cycle (production EXPLAIN ANALYZE: 287 s of seq-scan
-        time, 15 M rows filtered out).
-
-        Splitting into three round-trips with literal timestamps lets
-        the planner see the range as constants and use the partial
-        index directly — dropping a 245 s query to tens of milliseconds
-        on the same production data.
-
-        Latest-per-contract step (query #3): the wide 96-hour lookback is
-        kept on purpose so Monday-morning's first cycle still reaches the
-        prior Friday's closing quotes for every contract.  At that width
-        the planner's natural choice — picking
-        ``idx_option_chains_underlying_option_symbol_timestamp`` to satisfy
-        the ORDER BY without a Sort — used to heap-fetch every candidate
-        row to evaluate ``gamma IS NOT NULL`` plus every column in the
-        SELECT list (~600k random reads → 23-min wallclock on the May 13,
-        2026 incident).  The fix is the partial covering index
+        planner cannot push into the partial covering index because it
+        treats the CTE value as unknown at plan time -- forcing a Seq
+        Scan over the table.  Splitting into three round-trips with
+        literal timestamps lets the planner see the range as constants
+        and use the partial covering index
         ``idx_option_chains_underlying_option_symbol_ts_gamma_covering``
-        declared in setup/database/schema.sql, which carries every column
-        the SELECT list reads in its INCLUDE list and restricts to rows
-        with Greeks populated via its WHERE predicate.  Net: the planner
-        chooses an Index Only Scan that satisfies the entire query from
-        the index leaves, with zero heap fetches for filter evaluation.
-        Production wallclock dropped from ~23 min to ~45 sec — a 20-25x
-        improvement, not sub-second.  The residual cost is the DISTINCT
-        ON walk itself: PostgreSQL has no skip-scan optimization, so the
-        scan still emits every (option_symbol, timestamp) tuple in the
-        window (~400k for a typical SPX 96-hour window) before Unique
-        deduplicates them down to ~600.  Further improvement would
-        require a query rewrite (enumerate distinct option_symbols then
-        LATERAL-lookup latest quote per symbol), which is out of scope
-        for this fix and tracked as a follow-up.  The pool-level
-        statement_timeout in src/database/connection.py (default 90s) is
-        the backstop against any future regression.
+        for an Index Only Scan.
+
+        Latest-per-contract step (query #3): the DISTINCT ON walk's cost
+        is dominated by the lookback width, since PostgreSQL has no
+        skip-scan and must emit every (option_symbol, timestamp) tuple
+        in the window before Unique deduplicates.  Steady-state cycles
+        therefore use ``ANALYTICS_SNAPSHOT_LOOKBACK_HOURS`` (default 2),
+        which keeps the walk to ~20 k tuples and runs in ~1 sec under
+        concurrent VACUUM IO.  This is operationally safe during/around
+        RTH because every active contract is requoted within minutes;
+        the latest quote per contract is virtually always present in
+        the last hour.
+
+        The first cycle after process start instead uses
+        ``ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS`` (default 96) so
+        a worker booting on Monday morning still reaches the prior
+        Friday's closing quotes for every contract.  After one
+        cold-start cycle (success or failure) the engine drops to the
+        steady-state lookback; cold-start failures are not retried so
+        a slow first cycle can never wedge the cycle loop indefinitely.
+
+        Background -- the May 13, 2026 incident wedged production with
+        a 23-minute snapshot wallclock when the planner fell back to
+        ``idx_option_chains_underlying_option_symbol_timestamp`` and
+        heap-fetched every candidate row to evaluate ``gamma IS NOT
+        NULL`` plus collect the SELECT list.  Adding the partial
+        covering index (and bumping the pool-level statement_timeout
+        to 90 s as a backstop) cut that to ~45 sec under load, and
+        the narrower steady-state lookback cuts it further to ~1 sec.
 
         Returns dict with keys 'timestamp', 'underlying_price',
         'options' or None if no data is available.
@@ -211,12 +213,27 @@ class AnalyticsEngine:
                 # load (the DISTINCT ON walk over ~400k tuples is the
                 # remaining cost; see the function docstring for full
                 # background and the May 13 incident analysis).
-                lookback_start = timestamp - timedelta(hours=self.snapshot_lookback_hours)
+                # First cycle after process start gets a wider window so we
+                # reach the prior session's closing quotes; every subsequent
+                # cycle uses the narrow steady-state window.  The "consumed"
+                # flag flips after the query runs regardless of outcome, so a
+                # slow cold-start cycle can't loop and wedge ingestion.
+                if self._snapshot_cold_start_consumed:
+                    effective_lookback_hours = self.snapshot_lookback_hours
+                else:
+                    effective_lookback_hours = self.snapshot_cold_start_lookback_hours
+                    logger.info(
+                        "Cold-start snapshot: using %dh lookback (steady-state is %dh)",
+                        effective_lookback_hours,
+                        self.snapshot_lookback_hours,
+                    )
+                lookback_start = timestamp - timedelta(hours=effective_lookback_hours)
                 ts_et = timestamp.astimezone(ET)
                 if ts_et.time() < dt_time(16, 15):
                     min_expiration = ts_et.date() - timedelta(days=1)
                 else:
                     min_expiration = ts_et.date()
+                self._snapshot_cold_start_consumed = True
                 cursor.execute(
                     """
                     SELECT DISTINCT ON (oc.option_symbol)
