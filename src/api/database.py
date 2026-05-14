@@ -200,6 +200,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._flow_endpoint_cache_ttl_seconds: float = float(
             os.getenv("FLOW_ENDPOINT_CACHE_TTL_SECONDS", "3.0")
         )
+        # Confluence-matrix is structurally an aggregate over the rolling
+        # ``lookback`` window of signal_scores × signal_component_scores; the
+        # underlying values only change on the scoring cycle.  The per-worker
+        # in-memory cache is the only thing that keeps a multi-worker
+        # uvicorn from re-hitting the DB on every poll, so a longer TTL is
+        # worth the staleness — and 5 s (the analytics default) frequently
+        # expires inside a single cold call's wall-clock and gives no benefit.
+        self._confluence_matrix_cache_ttl_seconds: float = float(
+            os.getenv("CONFLUENCE_MATRIX_CACHE_TTL_SECONDS", "60.0")
+        )
         # Symbols whose max-pain snapshot is refreshed by a background task in
         # the FastAPI lifespan; for these, get_max_pain_current skips the heavy
         # inline _refresh_max_pain_snapshot call and just reads from the

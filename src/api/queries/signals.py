@@ -915,7 +915,7 @@ class SignalsQueriesMixin:
                 "sample_count": sample_count,
                 "latest_timestamp": latest_timestamp,
             }
-            self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
+            self._cache_set(cache_key, result, self._confluence_matrix_cache_ttl_seconds)
             return result
         except Exception as e:
             logger.error(f"get_signal_confluence_matrix failed ({symbol}): {e}")

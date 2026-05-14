@@ -1330,6 +1330,32 @@ END $$;
 CREATE INDEX IF NOT EXISTS idx_signal_scores_underlying_ts
     ON signal_scores(underlying, timestamp DESC);
 
+-- Covering index for the confluence-matrix outer read and any other
+-- "latest N signal_scores rows" query.  signal_scores rows carry a fat
+-- ``components`` JSONB column and only fit ~4 tuples per heap page; with
+-- ``composite_score`` carried in the INCLUDE list the planner can
+-- satisfy LIMIT-N scans with an Index Only Scan that never touches the
+-- JSONB heap pages.  Build with ``CREATE INDEX CONCURRENTLY`` in
+-- production via ``make db-add-signal-scores-composite-index``.
+CREATE INDEX IF NOT EXISTS idx_signal_scores_underlying_ts_composite_covering
+    ON signal_scores(underlying, timestamp DESC)
+    INCLUDE (composite_score);
+
+-- Aggressive autovacuum settings on the two confluence-matrix-feeding
+-- tables: both are appended every scoring cycle, so the visibility map
+-- ages out of date quickly and Index Only Scans degrade into heap
+-- fetches on the newest rows (exactly the rows we read).  Lowering the
+-- vacuum/analyze scale_factors keeps the VM current enough for IOS to
+-- skip the heap and the planner's stats fresh enough that LIMIT
+-- estimates are accurate.  Applied here for fresh installs; existing
+-- deployments should apply via ``make db-tune-signal-tables-autovacuum``.
+ALTER TABLE signal_scores SET (
+    autovacuum_vacuum_scale_factor   = 0.02,
+    autovacuum_vacuum_threshold      = 500,
+    autovacuum_analyze_scale_factor  = 0.02,
+    autovacuum_analyze_threshold     = 500
+);
+
 -- Authoritative definition. Column migrations below if needed.
 CREATE TABLE IF NOT EXISTS signal_trades (
     id BIGSERIAL PRIMARY KEY,
@@ -1524,6 +1550,15 @@ CREATE INDEX IF NOT EXISTS idx_signal_component_scores_component
 CREATE INDEX IF NOT EXISTS idx_signal_component_scores_underlying_ts_comp_clamped_covering
     ON signal_component_scores(underlying, timestamp DESC, component_name)
     INCLUDE (clamped_score);
+
+-- Match the autovacuum tuning on signal_scores — same write profile,
+-- same need to keep the visibility map current for IOS.
+ALTER TABLE signal_component_scores SET (
+    autovacuum_vacuum_scale_factor   = 0.02,
+    autovacuum_vacuum_threshold      = 1000,
+    autovacuum_analyze_scale_factor  = 0.02,
+    autovacuum_analyze_threshold     = 1000
+);
 
 -- ---------------------------------------------------------------------------
 -- signal_action_cards
