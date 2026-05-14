@@ -699,7 +699,19 @@ class SignalsQueriesMixin:
         lookback: int = 240,
         neutral_epsilon: float = 0.02,
     ) -> Dict[str, Any]:
-        """Return signal-by-signal agreement/disagreement over lookback (advanced signals only)."""
+        """Return signal-by-signal agreement/disagreement over lookback (advanced signals only).
+
+        Aggregates the agreement matrix entirely in SQL (rather than fetching
+        every row and counting in Python) so only ~N²+N rows cross the wire
+        per call.  Combined with the covering index
+        ``idx_signal_component_scores_underlying_ts_comp_clamped_covering``
+        defined in ``setup/database/schema.sql`` the read is an Index Only
+        Scan with no heap fetches — the original CTE+LEFT-JOIN form pulled
+        ``lookback × N`` rows back and re-counted them in Python, dwarfing
+        the actual aggregation cost.  Result is also briefly cached
+        (``_analytics_cache_ttl_seconds``) since the matrix only changes per
+        scoring cycle.
+        """
         if component_names is None:
             component_names = [
                 "vol_expansion",
@@ -721,128 +733,187 @@ class SignalsQueriesMixin:
         if cached is not None:
             return cached
 
-        def _sign(value: float) -> int:
-            if value > neutral_epsilon:
-                return 1
-            if value < -neutral_epsilon:
-                return -1
-            return 0
+        component_order = list(component_names)
+
+        def _empty_pair() -> Dict[str, Any]:
+            # Pre-filled zero cell — every (c1, c2) must appear in the output
+            # even when no rows match, matching the prior behavior.
+            return {
+                "observations": 0,
+                "active_observations": 0,
+                "agreement_count": 0,
+                "disagreement_count": 0,
+                "neutral_count": 0,
+                "agreement_ratio": None,
+                "disagreement_ratio": None,
+                "net_confluence": 0.0,
+            }
+
+        def _empty_regime() -> Dict[str, Any]:
+            return {
+                "observations": 0,
+                "active_observations": 0,
+                "agreement_count": 0,
+                "disagreement_count": 0,
+                "neutral_count": 0,
+                "agreement_ratio": None,
+                "disagreement_ratio": None,
+            }
+
+        matrix: Dict[str, Dict[str, Any]] = {
+            c1: {c2: _empty_pair() for c2 in component_order} for c1 in component_order
+        }
+        component_vs_regime: Dict[str, Dict[str, Any]] = {
+            c: _empty_regime() for c in component_order
+        }
+
+        # Single round-trip that does sign-bucketing + agreement counting
+        # entirely in SQL.  Returns at most N² pair rows + N regime rows
+        # + 1 meta row.
+        #
+        # ``recent`` drives a nested-loop join into ``signal_component_scores``
+        # via the (underlying, timestamp, component_name) PK plus the new
+        # ``INCLUDE (clamped_score)`` covering index — each of the ~lookback
+        # outer rows becomes one Index Only Scan with no heap fetches.  The
+        # old form returned every joined row to Python and re-counted them,
+        # so the wire payload alone was orders of magnitude larger than the
+        # final ~N²+N matrix needs.
+        query = """
+            WITH recent AS (
+                SELECT timestamp, composite_score
+                FROM signal_scores
+                WHERE underlying = $1
+                ORDER BY timestamp DESC
+                LIMIT $2
+            ),
+            comp AS (
+                SELECT
+                    scs.timestamp,
+                    scs.component_name,
+                    CASE
+                        WHEN scs.clamped_score >  $4 THEN 1
+                        WHEN scs.clamped_score < -$4 THEN -1
+                        ELSE 0
+                    END AS sign
+                FROM recent r
+                JOIN signal_component_scores scs
+                  ON scs.underlying = $1
+                 AND scs.timestamp  = r.timestamp
+                WHERE scs.component_name = ANY($3::text[])
+            ),
+            regime AS (
+                SELECT
+                    timestamp,
+                    CASE
+                        WHEN composite_score >  $4 THEN 1
+                        WHEN composite_score < -$4 THEN -1
+                        ELSE 0
+                    END AS sign
+                FROM recent
+            ),
+            pair_counts AS (
+                SELECT
+                    a.component_name AS c1,
+                    b.component_name AS c2,
+                    COUNT(*)::int                                                        AS observations,
+                    COUNT(*) FILTER (WHERE a.sign = 0 OR b.sign = 0)::int                AS neutral_count,
+                    COUNT(*) FILTER (WHERE a.sign <> 0 AND b.sign <> 0 AND a.sign  = b.sign)::int AS agreement_count,
+                    COUNT(*) FILTER (WHERE a.sign <> 0 AND b.sign <> 0 AND a.sign <> b.sign)::int AS disagreement_count
+                FROM comp a
+                JOIN comp b USING (timestamp)
+                GROUP BY a.component_name, b.component_name
+            ),
+            regime_counts AS (
+                SELECT
+                    c.component_name AS comp_name,
+                    COUNT(*)::int                                                        AS observations,
+                    COUNT(*) FILTER (WHERE c.sign = 0 OR r.sign = 0)::int                AS neutral_count,
+                    COUNT(*) FILTER (WHERE c.sign <> 0 AND r.sign <> 0 AND c.sign  = r.sign)::int AS agreement_count,
+                    COUNT(*) FILTER (WHERE c.sign <> 0 AND r.sign <> 0 AND c.sign <> r.sign)::int AS disagreement_count
+                FROM comp c
+                JOIN regime r USING (timestamp)
+                GROUP BY c.component_name
+            ),
+            meta AS (
+                SELECT MAX(timestamp) AS latest_ts, COUNT(*)::int AS sample_count
+                FROM recent
+            )
+            SELECT 'pair' AS kind, c1 AS a, c2 AS b,
+                   observations, neutral_count, agreement_count, disagreement_count,
+                   NULL::timestamptz AS latest_ts, NULL::int AS sample_count
+            FROM pair_counts
+            UNION ALL
+            SELECT 'regime', comp_name, NULL,
+                   observations, neutral_count, agreement_count, disagreement_count,
+                   NULL::timestamptz, NULL::int
+            FROM regime_counts
+            UNION ALL
+            SELECT 'meta', NULL, NULL, NULL, NULL, NULL, NULL,
+                   meta.latest_ts, meta.sample_count
+            FROM meta
+        """
 
         try:
-            # Two-query split avoids a JOIN with no time bound on
-            # signal_component_scores — without the explicit timestamp
-            # filter below, the planner sometimes hash-joins large slices
-            # of that table.  Fetching scores first gives us the earliest
-            # timestamp in the window so the component-scores read uses
-            # ``idx_signal_component_scores_underlying_ts`` cleanly.
             async with self._acquire_connection() as conn:
-                score_rows = await conn.fetch(
-                    """
-                    SELECT timestamp, composite_score
-                    FROM signal_scores
-                    WHERE underlying = $1
-                    ORDER BY timestamp DESC
-                    LIMIT $2
-                    """,
-                    symbol,
-                    lookback,
-                )
-                if score_rows:
-                    min_ts = score_rows[-1]["timestamp"]
-                    comp_rows = await conn.fetch(
-                        """
-                        SELECT timestamp, component_name, clamped_score
-                        FROM signal_component_scores
-                        WHERE underlying = $1
-                          AND component_name = ANY($2::text[])
-                          AND timestamp >= $3
-                        """,
-                        symbol,
-                        component_names,
-                        min_ts,
-                    )
-                else:
-                    comp_rows = []
-
-            by_ts: Dict[Any, Dict[str, Any]] = {
-                row["timestamp"]: {
-                    "composite_score": float(row["composite_score"] or 0.0),
-                    "components": {},
-                }
-                for row in score_rows
-            }
-            for row in comp_rows:
-                bucket = by_ts.get(row["timestamp"])
-                if bucket is None:
-                    continue
-                bucket["components"][row["component_name"]] = float(
-                    row["clamped_score"] or 0.0
+                rows = await conn.fetch(
+                    query, symbol, lookback, component_names, neutral_epsilon
                 )
 
-            component_order = list(component_names)
-            matrix: Dict[str, Dict[str, Any]] = {name: {} for name in component_order}
-            component_vs_regime: Dict[str, Dict[str, Any]] = {}
-
-            for c1 in component_order:
-                for c2 in component_order:
-                    observations = agree = disagree = neutral = 0
-                    for item in by_ts.values():
-                        comps = item["components"]
-                        if c1 not in comps or c2 not in comps:
-                            continue
-                        s1 = _sign(float(comps[c1]))
-                        s2 = _sign(float(comps[c2]))
-                        observations += 1
-                        if s1 == 0 or s2 == 0:
-                            neutral += 1
-                        elif s1 == s2:
-                            agree += 1
-                        else:
-                            disagree += 1
-                    active = agree + disagree
-                    matrix[c1][c2] = {
-                        "observations": observations,
-                        "active_observations": active,
-                        "agreement_count": agree,
-                        "disagreement_count": disagree,
-                        "neutral_count": neutral,
-                        "agreement_ratio": round(agree / active, 4) if active else None,
-                        "disagreement_ratio": round(disagree / active, 4) if active else None,
-                        "net_confluence": round((agree - disagree) / active, 4) if active else 0.0,
-                    }
-
-            for comp in component_order:
-                observations = agree = disagree = neutral = 0
-                for item in by_ts.values():
-                    score = item["components"].get(comp)
-                    if score is None:
-                        continue
-                    comp_sign = _sign(float(score))
-                    regime_sign = _sign(float(item["composite_score"]))
-                    observations += 1
-                    if comp_sign == 0 or regime_sign == 0:
-                        neutral += 1
-                    elif comp_sign == regime_sign:
-                        agree += 1
-                    else:
-                        disagree += 1
-                active = agree + disagree
-                component_vs_regime[comp] = {
-                    "observations": observations,
-                    "active_observations": active,
-                    "agreement_count": agree,
-                    "disagreement_count": disagree,
-                    "neutral_count": neutral,
-                    "agreement_ratio": round(agree / active, 4) if active else None,
-                    "disagreement_ratio": round(disagree / active, 4) if active else None,
-                }
+            sample_count = 0
+            latest_timestamp = None
+            for row in rows:
+                kind = row["kind"]
+                if kind == "pair":
+                    c1, c2 = row["a"], row["b"]
+                    if c1 in matrix and c2 in matrix[c1]:
+                        agree = row["agreement_count"] or 0
+                        disagree = row["disagreement_count"] or 0
+                        active = agree + disagree
+                        matrix[c1][c2] = {
+                            "observations": row["observations"] or 0,
+                            "active_observations": active,
+                            "agreement_count": agree,
+                            "disagreement_count": disagree,
+                            "neutral_count": row["neutral_count"] or 0,
+                            "agreement_ratio": (
+                                round(agree / active, 4) if active else None
+                            ),
+                            "disagreement_ratio": (
+                                round(disagree / active, 4) if active else None
+                            ),
+                            "net_confluence": (
+                                round((agree - disagree) / active, 4) if active else 0.0
+                            ),
+                        }
+                elif kind == "regime":
+                    comp = row["a"]
+                    if comp in component_vs_regime:
+                        agree = row["agreement_count"] or 0
+                        disagree = row["disagreement_count"] or 0
+                        active = agree + disagree
+                        component_vs_regime[comp] = {
+                            "observations": row["observations"] or 0,
+                            "active_observations": active,
+                            "agreement_count": agree,
+                            "disagreement_count": disagree,
+                            "neutral_count": row["neutral_count"] or 0,
+                            "agreement_ratio": (
+                                round(agree / active, 4) if active else None
+                            ),
+                            "disagreement_ratio": (
+                                round(disagree / active, 4) if active else None
+                            ),
+                        }
+                elif kind == "meta":
+                    sample_count = row["sample_count"] or 0
+                    latest_timestamp = row["latest_ts"]
 
             result = {
                 "components": component_order,
                 "matrix": matrix,
                 "component_vs_regime": component_vs_regime,
-                "sample_count": len(by_ts),
-                "latest_timestamp": max(by_ts.keys()) if by_ts else None,
+                "sample_count": sample_count,
+                "latest_timestamp": latest_timestamp,
             }
             self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
             return result
