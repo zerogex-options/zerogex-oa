@@ -132,7 +132,15 @@ def _initialize_connection_pool():
     # wrong plan) can't wedge a backend for hours.  Mirrors the asyncpg
     # pool's server_settings={"statement_timeout": ...} in
     # src/api/database.py:243-271.  Set to 0 to disable.
-    statement_timeout_ms = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "30000"))
+    #
+    # Default 90s is sized for AnalyticsEngine._get_snapshot, which on
+    # production runs ~40-45 sec under concurrent load even with the
+    # covering partial index in place (DISTINCT ON over a 96-hour window
+    # walks 400k tuples; PostgreSQL has no skip-scan to avoid this).
+    # 90s gives ~2x headroom over typical execution.  API-path queries
+    # are sub-second; the higher ceiling does not affect their latency,
+    # only the worst-case wedge bound.
+    statement_timeout_ms = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "90000"))
 
     # Get password from configured provider
     # Note: For .pgpass, this returns None (psycopg2 reads .pgpass automatically)

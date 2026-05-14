@@ -62,7 +62,7 @@ def _capture_pool_kwargs(monkeypatch, module):
 
 
 def test_default_statement_timeout_applied(monkeypatch, reload_connection_module):
-    """Default 30 s timeout is forwarded to libpq via the options token."""
+    """Default 90 s timeout is forwarded to libpq via the options token."""
     for env_key in (
         "DB_STATEMENT_TIMEOUT_MS",
         "DB_POOL_MIN",
@@ -75,7 +75,7 @@ def test_default_statement_timeout_applied(monkeypatch, reload_connection_module
     captured = _capture_pool_kwargs(monkeypatch, module)
     module._initialize_connection_pool()
 
-    assert captured["kwargs"].get("options") == "-c statement_timeout=30000"
+    assert captured["kwargs"].get("options") == "-c statement_timeout=90000"
 
 
 def test_statement_timeout_env_override(monkeypatch, reload_connection_module):

@@ -228,24 +228,49 @@ analytics-snapshot-explain: ## EXPLAIN (no ANALYZE) of the _get_snapshot query �
 		| $(PSQL) -v ON_ERROR_STOP=0
 
 .PHONY: db-add-distinct-on-index
-db-add-distinct-on-index: ## Build idx_option_chains_underlying_option_symbol_ts_gamma CONCURRENTLY (~1.3 GB). Pass CONFIRM=yes to execute.
-	@echo "$(BLUE)=== Building idx_option_chains_underlying_option_symbol_ts_gamma CONCURRENTLY ===$(NC)"
+db-add-distinct-on-index: ## Build idx_option_chains_underlying_option_symbol_ts_gamma_covering CONCURRENTLY (~4.4 GB). Pass CONFIRM=yes to execute.
+	@echo "$(BLUE)=== Building idx_option_chains_underlying_option_symbol_ts_gamma_covering CONCURRENTLY ===$(NC)"
 	@echo "$(YELLOW)Partial covering index for AnalyticsEngine._get_snapshot()'s$(NC)"
-	@echo "$(YELLOW)DISTINCT ON (option_symbol) query. Restores sub-second execution$(NC)"
-	@echo "$(YELLOW)at the 96-hour lookback (replaces 23-minute pathological plan).$(NC)"
+	@echo "$(YELLOW)DISTINCT ON (option_symbol) query. Cuts the 96-hour-lookback$(NC)"
+	@echo "$(YELLOW)production query from ~23 min to ~45 sec by enabling Index Only$(NC)"
+	@echo "$(YELLOW)Scan (all SELECT-list columns satisfied from the index leaf).$(NC)"
 	@echo "$(YELLOW)Definition:$(NC)"
 	@echo "$(YELLOW)  ON option_chains(underlying, option_symbol, timestamp DESC)$(NC)"
-	@echo "$(YELLOW)  INCLUDE (expiration) WHERE gamma IS NOT NULL$(NC)"
-	@echo "$(YELLOW)Estimated size: ~1.3 GB on a 6.4 GB table (28 GB existing index footprint).$(NC)"
+	@echo "$(YELLOW)  INCLUDE (strike, option_type, expiration, last, bid, ask,$(NC)"
+	@echo "$(YELLOW)           volume, open_interest, delta, gamma, theta, vega,$(NC)"
+	@echo "$(YELLOW)           implied_volatility)$(NC)"
+	@echo "$(YELLOW)  WHERE gamma IS NOT NULL$(NC)"
+	@echo "$(YELLOW)Measured size: ~4.4 GB on a 6.4 GB table (29 GB existing index footprint).$(NC)"
 	@echo "$(YELLOW)Build is non-blocking (CREATE INDEX CONCURRENTLY) but holds a session;$(NC)"
-	@echo "$(YELLOW)allow ~5-15 minutes on the production table size.$(NC)"
+	@echo "$(YELLOW)allow ~15-30 minutes on the production table size.  Run inside tmux:$(NC)"
+	@echo "$(YELLOW)  tmux new -s indexbuild  &&  make db-add-distinct-on-index CONFIRM=yes$(NC)"
 	@if [ "$${CONFIRM}" != "yes" ]; then \
 		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to actually build.$(NC)"; \
 	else \
 		printf "%s\n" \
-			"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_option_chains_underlying_option_symbol_ts_gamma ON option_chains(underlying, option_symbol, timestamp DESC) INCLUDE (expiration) WHERE gamma IS NOT NULL;" \
+			"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_option_chains_underlying_option_symbol_ts_gamma_covering ON option_chains(underlying, option_symbol, timestamp DESC) INCLUDE (strike, option_type, expiration, last, bid, ask, volume, open_interest, delta, gamma, theta, vega, implied_volatility) WHERE gamma IS NOT NULL;" \
 			| $(PSQL) -v ON_ERROR_STOP=1; \
-		echo "$(GREEN)✓ Index built. Run 'make analytics-snapshot-diagnose LOOKBACK_MINUTES=5760' to confirm sub-second plan.$(NC)"; \
+		echo "$(GREEN)✓ Index built. Run 'make analytics-snapshot-diagnose UNDERLYING=SPX LOOKBACK_MINUTES=5760' to verify the plan picks the new index.$(NC)"; \
+		echo "$(YELLOW)Then run 'make db-drop-narrow-partial-index CONFIRM=yes' to reclaim the 1.6 GB narrow variant.$(NC)"; \
+	fi
+
+.PHONY: db-drop-narrow-partial-index
+db-drop-narrow-partial-index: ## DROP CONCURRENTLY the narrow idx_option_chains_underlying_option_symbol_ts_gamma (~1.6 GB; subsumed by _covering). Pass CONFIRM=yes to execute.
+	@echo "$(BLUE)=== Dropping idx_option_chains_underlying_option_symbol_ts_gamma CONCURRENTLY ===$(NC)"
+	@echo "$(YELLOW)The narrow partial index INCLUDE (expiration) is strictly subsumed by$(NC)"
+	@echo "$(YELLOW)idx_option_chains_underlying_option_symbol_ts_gamma_covering (same key,$(NC)"
+	@echo "$(YELLOW)same WHERE predicate, fuller INCLUDE list).  Once the covering index is$(NC)"
+	@echo "$(YELLOW)in place and the planner is using it, the narrow one is dead weight$(NC)"
+	@echo "$(YELLOW)(~1.6 GB on disk + per-insert write overhead on every ingestion row).$(NC)"
+	@echo "$(YELLOW)DROP CONCURRENTLY can park waiting for old snapshots from in-flight$(NC)"
+	@echo "$(YELLOW)analytics queries; allow several minutes, run inside tmux to be safe.$(NC)"
+	@if [ "$${CONFIRM}" != "yes" ]; then \
+		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to actually drop.$(NC)"; \
+	else \
+		printf "%s\n" \
+			"DROP INDEX CONCURRENTLY IF EXISTS idx_option_chains_underlying_option_symbol_ts_gamma;" \
+			| $(PSQL) -v ON_ERROR_STOP=1; \
+		echo "$(GREEN)✓ Narrow partial index dropped.$(NC)"; \
 	fi
 
 .PHONY: db-drop-unused-indexes

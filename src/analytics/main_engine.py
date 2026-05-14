@@ -130,15 +130,26 @@ class AnalyticsEngine:
         the planner's natural choice — picking
         ``idx_option_chains_underlying_option_symbol_timestamp`` to satisfy
         the ORDER BY without a Sort — used to heap-fetch every candidate
-        row to evaluate ``gamma IS NOT NULL`` (600 k random reads → 23 min
-        wallclock on 2026-05-13).  The fix is the partial covering index
-        ``idx_option_chains_underlying_option_symbol_ts_gamma WHERE gamma
-        IS NOT NULL INCLUDE (expiration)`` declared in
-        setup/database/schema.sql, which lets that loose-index scan
-        evaluate both ``gamma IS NOT NULL`` and ``expiration > $4`` from
-        the index leaf with no heap fetch for the filter.  The pool-level
-        statement_timeout in src/database/connection.py is the backstop
-        if anything ever regresses the plan again.
+        row to evaluate ``gamma IS NOT NULL`` plus every column in the
+        SELECT list (~600k random reads → 23-min wallclock on the May 13,
+        2026 incident).  The fix is the partial covering index
+        ``idx_option_chains_underlying_option_symbol_ts_gamma_covering``
+        declared in setup/database/schema.sql, which carries every column
+        the SELECT list reads in its INCLUDE list and restricts to rows
+        with Greeks populated via its WHERE predicate.  Net: the planner
+        chooses an Index Only Scan that satisfies the entire query from
+        the index leaves, with zero heap fetches for filter evaluation.
+        Production wallclock dropped from ~23 min to ~45 sec — a 20-25x
+        improvement, not sub-second.  The residual cost is the DISTINCT
+        ON walk itself: PostgreSQL has no skip-scan optimization, so the
+        scan still emits every (option_symbol, timestamp) tuple in the
+        window (~400k for a typical SPX 96-hour window) before Unique
+        deduplicates them down to ~600.  Further improvement would
+        require a query rewrite (enumerate distinct option_symbols then
+        LATERAL-lookup latest quote per symbol), which is out of scope
+        for this fix and tracked as a follow-up.  The pool-level
+        statement_timeout in src/database/connection.py (default 90s) is
+        the backstop against any future regression.
 
         Returns dict with keys 'timestamp', 'underlying_price',
         'options' or None if no data is available.
@@ -192,12 +203,14 @@ class AnalyticsEngine:
                 # and max-pain calculations in run_calculation().
                 #
                 # Plan: the partial covering index
-                # idx_option_chains_underlying_option_symbol_ts_gamma
-                # WHERE gamma IS NOT NULL INCLUDE (expiration) supports
-                # this query as a loose index scan with no Sort and no
-                # heap fetches for the filter predicates.  The wide 96-h
-                # default window is what makes that index necessary —
-                # see the function docstring for the May 13 incident.
+                # idx_option_chains_underlying_option_symbol_ts_gamma_covering
+                # WHERE gamma IS NOT NULL INCLUDE (every SELECT-list col)
+                # supports this query as an Index Only Scan with no Sort
+                # and no heap fetches for the filter predicates or output
+                # columns.  Production wallclock: ~45s under concurrent
+                # load (the DISTINCT ON walk over ~400k tuples is the
+                # remaining cost; see the function docstring for full
+                # background and the May 13 incident analysis).
                 lookback_start = timestamp - timedelta(hours=self.snapshot_lookback_hours)
                 ts_et = timestamp.astimezone(ET)
                 if ts_et.time() < dt_time(16, 15):
