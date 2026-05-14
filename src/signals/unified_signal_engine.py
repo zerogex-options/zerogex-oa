@@ -707,14 +707,8 @@ class UnifiedSignalEngine:
                 # For pre-backfill rows missing low/high, fall back to the
                 # close so the lists stay aligned and typed.  Worst case a
                 # pattern's wick check becomes a close check on those bars.
-                lows = [
-                    float(r[0]) if r[0] is not None else float(r[2])
-                    for r in bar_rows
-                ]
-                highs = [
-                    float(r[1]) if r[1] is not None else float(r[2])
-                    for r in bar_rows
-                ]
+                lows = [float(r[0]) if r[0] is not None else float(r[2]) for r in bar_rows]
+                highs = [float(r[1]) if r[1] is not None else float(r[2]) for r in bar_rows]
 
                 # Latest VIX level for optional term-structure gating.  We only
                 # have spot VIX; vix_9d / vix_3m would need a separate ingest.

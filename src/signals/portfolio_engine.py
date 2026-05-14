@@ -423,10 +423,7 @@ class PortfolioEngine:
             card_confidence = float(aggregation.get("card_confidence") or 0.0)
         except (TypeError, ValueError):
             card_confidence = 0.0
-        if (
-            card_pattern
-            and card_confidence >= self.high_confidence_pattern_threshold
-        ):
+        if card_pattern and card_confidence >= self.high_confidence_pattern_threshold:
             size_multiplier = min(
                 max(size_multiplier, float(self.high_confidence_pattern_size)),
                 1.0,

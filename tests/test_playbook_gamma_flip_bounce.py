@@ -127,9 +127,7 @@ def _ctx(
         msi_score=50.0,
         msi_regime=regime,
         msi_components={
-            "gamma_anchor": {
-                "context": {"flip_distance_subscore": flip_distance_subscore}
-            },
+            "gamma_anchor": {"context": {"flip_distance_subscore": flip_distance_subscore}},
         },
         advanced_signals=advanced,
         basic_signals=basic,
@@ -272,9 +270,7 @@ def test_instrument_switches_with_vol():
     """High realized sigma -> BUY_CALL_DEBIT; low sigma -> SELL_PUT_SPREAD."""
     # Build high-vol closes by oscillating widely.
     flip = 736.0
-    high_vol_prior = [
-        flip + 7.0 + ((-1) ** i) * (flip * 0.004) for i in range(30)
-    ]
+    high_vol_prior = [flip + 7.0 + ((-1) ** i) * (flip * 0.004) for i in range(30)]
     high_vol_recent = [flip + 0.30, flip - 0.05, flip + 1.00]
     card = GAMMA_FLIP_BOUNCE.match(_ctx(closes=high_vol_prior + high_vol_recent))
     assert card is not None

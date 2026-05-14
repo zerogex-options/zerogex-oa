@@ -17,7 +17,6 @@ from src.signals.portfolio_engine import PortfolioEngine
 from src.signals.position_optimizer_engine import SizingProfile, SpreadCandidate
 from src.signals.scoring_engine import ScoreSnapshot
 
-
 NOW = datetime(2026, 4, 6, 14, 0, tzinfo=timezone.utc)
 
 

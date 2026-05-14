@@ -46,7 +46,6 @@ from src.signals.playbook.types import (
     Target,
 )
 
-
 # Env-overridable thresholds.
 _NET_GEX_FLOOR = float(os.getenv("PLAYBOOK_GFBO_NET_GEX_FLOOR", "1.5e9"))
 _FLIP_DISTANCE_MIN = float(os.getenv("PLAYBOOK_GFBO_FLIP_DISTANCE_MIN", "0.6"))
@@ -152,17 +151,9 @@ def _detect_bounce(
     bullish_touch = any(v <= touch_low_band for v in bullish_touch_source)
     bearish_touch = any(v >= touch_high_band for v in bearish_touch_source)
 
-    if (
-        above_share >= prior_threshold
-        and bullish_touch
-        and last_close > reject_above
-    ):
+    if above_share >= prior_threshold and bullish_touch and last_close > reject_above:
         return "bullish"
-    if (
-        below_share >= prior_threshold
-        and bearish_touch
-        and last_close < reject_below
-    ):
+    if below_share >= prior_threshold and bearish_touch and last_close < reject_below:
         return "bearish"
     return None
 
@@ -360,9 +351,7 @@ class GammaFlipBouncePattern(PatternBase):
             rbi = ctx.signal("range_break_imminence")
             rbi_label = rbi.context_values.get("label") if rbi else None
             if rbi_label == "Breakout Mode":
-                missing.append(
-                    "range_break_imminence in 'Breakout Mode' — trend overrides bounce"
-                )
+                missing.append("range_break_imminence in 'Breakout Mode' — trend overrides bounce")
 
             vol_x = ctx.signal("vol_expansion")
             if vol_x and vol_x.triggered:
@@ -373,9 +362,9 @@ class GammaFlipBouncePattern(PatternBase):
                 tape = ctx.signal("tape_flow_bias")
                 ofi = ctx.signal("order_flow_imbalance")
                 sign = 1.0 if bounce == "bullish" else -1.0
-                flow_ok = (
-                    tape and (tape.score * sign) >= _FLOW_THRESHOLD
-                ) or (ofi and (ofi.score * sign) >= _FLOW_THRESHOLD)
+                flow_ok = (tape and (tape.score * sign) >= _FLOW_THRESHOLD) or (
+                    ofi and (ofi.score * sign) >= _FLOW_THRESHOLD
+                )
                 if not flow_ok:
                     missing.append(
                         f"no {bounce} flow signal: "
