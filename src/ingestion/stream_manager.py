@@ -736,6 +736,10 @@ class StreamManager:
         self.option_volume_coverage_alert_threshold = float(
             os.getenv("OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD", "0.35")
         )
+        # Volume is cumulative for the day; the first ~30 min after open
+        # are a natural ramp where most contracts haven't traded yet, so
+        # gate the warning on a warmup window past 09:30 ET.
+        self.option_volume_warmup_minutes = int(os.getenv("OPTION_VOLUME_WARMUP_MINUTES", "30"))
         self.seed_rest_on_recalc = (
             os.getenv("OPTION_REST_SEED_ON_RECALC", "false").lower() == "true"
         )
@@ -1319,13 +1323,21 @@ class StreamManager:
                             option_with_oi = sum(
                                 1 for o in option_results if (o.get("open_interest") or 0) > 0
                             )
-                            option_with_volume = sum(
-                                1 for o in option_results if (o.get("volume") or 0) > 0
-                            )
 
                             tracked_total = len(self.tracked_option_symbols)
                             oi_coverage = option_with_oi / option_count
-                            volume_coverage = option_with_volume / option_count
+
+                            # Volume coverage is computed against the full accumulator
+                            # state (cumulative across the day), not the drained subset.
+                            # Volume is cumulative daily and the accumulator only
+                            # overwrites it with positive values, so once a contract
+                            # trades it stays counted.  A per-drain ratio is misleading
+                            # because most batches are quote updates without trades.
+                            full_state = self._accumulator.snapshot()
+                            session_with_volume = sum(
+                                1 for raw in full_state.values() if int(raw.get("Volume") or 0) > 0
+                            )
+                            volume_coverage = session_with_volume / max(tracked_total, 1)
 
                             logger.info(
                                 f"Option batch: {option_count} updated, "
@@ -1341,16 +1353,21 @@ class StreamManager:
                                     f"(threshold "
                                     f"{self.option_oi_coverage_alert_threshold:.1%})"
                                 )
-                            if (
-                                session == "regular"
-                                and volume_coverage < self.option_volume_coverage_alert_threshold
-                            ):
-                                logger.warning(
-                                    f"⚠️ Low option volume coverage: "
-                                    f"{volume_coverage:.1%} "
-                                    f"(threshold "
-                                    f"{self.option_volume_coverage_alert_threshold:.1%})"
-                                )
+                            if session == "regular":
+                                now_et = datetime.now(ET)
+                                minutes_since_open = (now_et.hour - 9) * 60 + (now_et.minute - 30)
+                                if (
+                                    minutes_since_open >= self.option_volume_warmup_minutes
+                                    and volume_coverage
+                                    < self.option_volume_coverage_alert_threshold
+                                ):
+                                    logger.warning(
+                                        f"⚠️ Low option volume coverage: "
+                                        f"{volume_coverage:.1%} "
+                                        f"(threshold "
+                                        f"{self.option_volume_coverage_alert_threshold:.1%}, "
+                                        f"{minutes_since_open}min into session)"
+                                    )
 
                             yield {"type": "option_batch", "data": option_results}
                     else:

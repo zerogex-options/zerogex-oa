@@ -182,6 +182,7 @@ OPTION_OI_COVERAGE_ALERT_THRESHOLD = float(os.getenv("OPTION_OI_COVERAGE_ALERT_T
 OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD = float(
     os.getenv("OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD", "0.35")
 )
+OPTION_VOLUME_WARMUP_MINUTES = int(os.getenv("OPTION_VOLUME_WARMUP_MINUTES", "30"))
 OPTION_REST_SEED_ON_RECALC = os.getenv("OPTION_REST_SEED_ON_RECALC", "false").lower() == "true"
 FLOW_CACHE_REFRESH_MIN_SECONDS = float(os.getenv("FLOW_CACHE_REFRESH_MIN_SECONDS", "15"))
 FLOW_CANONICAL_ONLY = os.getenv("FLOW_CANONICAL_ONLY", "true").lower() == "true"
@@ -1013,6 +1014,7 @@ def get_all_config() -> Dict[str, Any]:
             "stream_read_timeout": TS_STREAM_READ_TIMEOUT,
             "option_oi_coverage_alert_threshold": OPTION_OI_COVERAGE_ALERT_THRESHOLD,
             "option_volume_coverage_alert_threshold": OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD,
+            "option_volume_warmup_minutes": OPTION_VOLUME_WARMUP_MINUTES,
             "option_rest_seed_on_recalc": OPTION_REST_SEED_ON_RECALC,
             "flow_cache_refresh_min_seconds": FLOW_CACHE_REFRESH_MIN_SECONDS,
             "analytics_flow_cache_refresh_enabled": ANALYTICS_FLOW_CACHE_REFRESH_ENABLED,
