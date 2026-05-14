@@ -286,6 +286,54 @@ db-explain-confluence-matrix: ## EXPLAIN (ANALYZE, BUFFERS) the confluence-matri
 		"$(or $(UNDERLYING),SPY)" "$(or $(LOOKBACK),120)" "$(or $(UNDERLYING),SPY)" \
 		| $(PSQL) -v ON_ERROR_STOP=1
 
+.PHONY: db-vacuum-confluence-matrix-tables
+db-vacuum-confluence-matrix-tables: ## VACUUM (ANALYZE) signal_scores + signal_component_scores. Needed for Index Only Scan (refreshes visibility map) and planner stats.
+	@echo "$(BLUE)=== VACUUM ANALYZE signal_scores, signal_component_scores ===$(NC)"
+	@echo "$(YELLOW)Refreshes the visibility map (so IOS can skip heap fetches) and$(NC)"
+	@echo "$(YELLOW)planner statistics.  Non-blocking — concurrent readers/writers proceed.$(NC)"
+	@$(PSQL) -c "VACUUM (ANALYZE, VERBOSE) signal_scores;"
+	@$(PSQL) -c "VACUUM (ANALYZE, VERBOSE) signal_component_scores;"
+	@echo "$(GREEN)✓ Done. Re-run 'make db-explain-confluence-matrix' — Heap Fetches should be 0.$(NC)"
+
+.PHONY: api-time-confluence-matrix
+api-time-confluence-matrix: ## Time /api/signals/{basic,advanced}/confluence-matrix end-to-end (uses OPS_API_KEY / API_KEY from .env).
+	@echo "$(BLUE)=== Timing /api/signals/{basic,advanced}/confluence-matrix ===$(NC)"
+	@BASE_URL="http://localhost:8000"; \
+	SYMBOL="$(or $(SYMBOL),SPY)"; \
+	KEY=$$(grep -E '^OPS_API_KEY=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'"); \
+	KEY_SRC="OPS_API_KEY"; \
+	if [ -z "$$KEY" ]; then \
+		KEY=$$(grep -E '^API_KEY=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'"); \
+		KEY_SRC="API_KEY (break-glass)"; \
+	fi; \
+	if [ -z "$$KEY" ]; then \
+		echo "$(RED)✗ No OPS_API_KEY (or API_KEY) in .env — every protected endpoint will 401.$(NC)"; \
+		exit 1; \
+	fi; \
+	echo "$(YELLOW)Auth: sending X-API-Key from $$KEY_SRC (length=$${#KEY})$(NC)"; \
+	timed_curl() { \
+		url="$$1"; label="$$2"; \
+		out=$$(curl -s -o /tmp/cm.json -w "%{http_code} %{time_total}s" \
+			-H "X-API-Key: $$KEY" "$$url"); \
+		code=$$(echo "$$out" | awk '{print $$1}'); \
+		t=$$(echo "$$out" | awk '{print $$2}'); \
+		if [ "$$code" = "200" ]; then \
+			sample=$$(python3 -c 'import json,sys; d=json.load(open("/tmp/cm.json")); print("sample_count="+str(d.get("sample_count","?")))' 2>/dev/null); \
+			echo "$(GREEN)✅ $$label  HTTP $$code  $$t  $$sample$(NC)"; \
+		else \
+			echo "$(RED)❌ $$label  HTTP $$code  $$t$(NC)"; \
+			head -c 200 /tmp/cm.json; echo; \
+		fi; \
+	}; \
+	echo "$(YELLOW)-- cold (first call after restart hits DB)$(NC)"; \
+	timed_curl "$$BASE_URL/api/signals/basic/confluence-matrix?symbol=$$SYMBOL&lookback=120"     "basic    lookback=120 "; \
+	echo "$(YELLOW)-- warm (should hit the _analytics_cache_ttl_seconds cache)$(NC)"; \
+	timed_curl "$$BASE_URL/api/signals/basic/confluence-matrix?symbol=$$SYMBOL&lookback=120"     "basic    lookback=120 "; \
+	echo "$(YELLOW)-- stress with max lookback$(NC)"; \
+	timed_curl "$$BASE_URL/api/signals/basic/confluence-matrix?symbol=$$SYMBOL&lookback=2000"    "basic    lookback=2000"; \
+	echo "$(YELLOW)-- companion advanced endpoint (same code path)$(NC)"; \
+	timed_curl "$$BASE_URL/api/signals/advanced/confluence-matrix?symbol=$$SYMBOL&lookback=120"  "advanced lookback=120 "
+
 .PHONY: db-drop-narrow-partial-index
 db-drop-narrow-partial-index: ## DROP CONCURRENTLY the narrow idx_option_chains_underlying_option_symbol_ts_gamma (~1.6 GB; subsumed by _covering). Pass CONFIRM=yes to execute.
 	@echo "$(BLUE)=== Dropping idx_option_chains_underlying_option_symbol_ts_gamma CONCURRENTLY ===$(NC)"
