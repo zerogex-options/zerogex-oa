@@ -60,21 +60,24 @@ def _install_fake_acquire(db: DatabaseManager, conn: _FakeBackgroundConn) -> Non
 
 def test_refresh_iterates_symbols_with_set_local_timeout():
     """Each symbol gets _refresh_max_pain_snapshot called inside a transaction
-    with the configured statement_timeout applied via SET LOCAL."""
+    with the configured statement_timeout applied via SET LOCAL, and that same
+    budget is also forwarded as a per-call ``timeout=`` so asyncpg's
+    client-side ``command_timeout`` (default 30s on this pool) doesn't fire
+    before the server-side cancel."""
     db = DatabaseManager()
     conn = _FakeBackgroundConn()
     _install_fake_acquire(db, conn)
 
     refresh_calls: List[tuple] = []
 
-    async def fake_refresh(c, symbol, strike_limit):
-        refresh_calls.append((symbol, strike_limit))
+    async def fake_refresh(c, symbol, strike_limit, timeout=None):
+        refresh_calls.append((symbol, strike_limit, timeout))
 
     db._refresh_max_pain_snapshot = fake_refresh  # type: ignore[assignment]
 
     asyncio.run(db.refresh_max_pain_snapshots(["spy", "spx"], 500, 120_000))
 
-    assert refresh_calls == [("SPY", 500), ("SPX", 500)]
+    assert refresh_calls == [("SPY", 500, 120.0), ("SPX", 500, 120.0)]
 
     set_local = [q for (q, _) in conn.execute_calls if "SET LOCAL statement_timeout" in q]
     assert len(set_local) == 2, "expected one SET LOCAL per symbol"
@@ -91,7 +94,7 @@ def test_refresh_continues_after_per_symbol_failure():
 
     attempts: List[str] = []
 
-    async def fake_refresh(c, symbol, strike_limit):
+    async def fake_refresh(c, symbol, strike_limit, timeout=None):
         attempts.append(symbol)
         if symbol == "SPY":
             raise RuntimeError("simulated DB error")

@@ -835,9 +835,22 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             )
 
     async def _refresh_max_pain_snapshot(
-        self, conn: asyncpg.Connection, symbol: str, strike_limit: int
+        self,
+        conn: asyncpg.Connection,
+        symbol: str,
+        strike_limit: int,
+        timeout: Optional[float] = None,
     ) -> None:
-        """Refresh daily max pain OI snapshot for the symbol if latest chain timestamp changed."""
+        """Refresh daily max pain OI snapshot for the symbol if latest chain timestamp changed.
+
+        ``timeout`` (seconds) overrides the asyncpg pool's default
+        ``command_timeout`` for this refresh.  Required for the background
+        path where the heavy multi-CTE recompute legitimately exceeds the
+        pool's default 30 s client-side timeout — without an override the
+        ``SET LOCAL statement_timeout`` set by the caller is masked by
+        asyncpg cancelling the call client-side first.  ``None`` keeps
+        the pool default (used on the inline / on-demand path).
+        """
         strike_limit = max(10, min(strike_limit, 1000))
         query = """
             WITH latest AS (
@@ -1042,7 +1055,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 expirations = EXCLUDED.expirations,
                 updated_at = NOW()
         """
-        await conn.execute(query, symbol, strike_limit)
+        await conn.execute(query, symbol, strike_limit, timeout=timeout)
 
         sync_expirations_query = """
             WITH snap AS (
@@ -1090,7 +1103,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 strikes = EXCLUDED.strikes,
                 updated_at = NOW()
         """
-        await conn.execute(sync_expirations_query, symbol)
+        await conn.execute(sync_expirations_query, symbol, timeout=timeout)
 
     async def refresh_max_pain_snapshots(
         self,
@@ -1112,6 +1125,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ``SET LOCAL`` inside a transaction so the heavy CTE chain can run
             to completion.
         """
+        # asyncpg enforces a *client-side* command_timeout (default 30 s on
+        # this pool — see _create_pool).  ``SET LOCAL statement_timeout``
+        # only relaxes the server-side cancel, so without a matching
+        # per-call ``timeout=`` argument asyncpg would still abort the
+        # recompute at 30 s and the background refresh would fail for any
+        # symbol whose CTE chain runs longer (e.g. SPX / QQQ during cash
+        # session).  Pass the same budget down to both layers so they
+        # agree.
+        statement_timeout_s = max(1.0, statement_timeout_ms / 1000.0)
         for symbol in symbols:
             symbol_upper = symbol.upper()
             try:
@@ -1120,7 +1142,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         await conn.execute(
                             f"SET LOCAL statement_timeout = {int(statement_timeout_ms)}"
                         )
-                        await self._refresh_max_pain_snapshot(conn, symbol_upper, strike_limit)
+                        await self._refresh_max_pain_snapshot(
+                            conn,
+                            symbol_upper,
+                            strike_limit,
+                            timeout=statement_timeout_s,
+                        )
                 logger.info(
                     "max-pain background refresh: %s OK (strike_limit=%d)",
                     symbol_upper,

@@ -7,8 +7,8 @@ class _FakeMaxPainConn:
     def __init__(self):
         self.execute_calls = []
 
-    async def execute(self, query, *args):
-        self.execute_calls.append((query, args))
+    async def execute(self, query, *args, timeout=None):
+        self.execute_calls.append((query, args, timeout))
         return "INSERT 0 1"
 
 
@@ -22,7 +22,11 @@ def test_refresh_max_pain_snapshot_uses_latest_oi_per_contract():
 
     assert conn.execute_calls
     snapshot_query = next(
-        (q for (q, _args) in conn.execute_calls if "INSERT INTO max_pain_oi_snapshot " in q),
+        (
+            q
+            for (q, _args, _timeout) in conn.execute_calls
+            if "INSERT INTO max_pain_oi_snapshot " in q
+        ),
         "",
     )
     assert snapshot_query, "snapshot upsert query was not executed"
