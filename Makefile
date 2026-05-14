@@ -254,6 +254,25 @@ db-add-distinct-on-index: ## Build idx_option_chains_underlying_option_symbol_ts
 		echo "$(YELLOW)Then run 'make db-drop-narrow-partial-index CONFIRM=yes' to reclaim the 1.6 GB narrow variant.$(NC)"; \
 	fi
 
+.PHONY: db-add-confluence-matrix-index
+db-add-confluence-matrix-index: ## Build idx_signal_component_scores_underlying_ts_comp_clamped_covering CONCURRENTLY. Pass CONFIRM=yes to execute.
+	@echo "$(BLUE)=== Building idx_signal_component_scores_underlying_ts_comp_clamped_covering CONCURRENTLY ===$(NC)"
+	@echo "$(YELLOW)Covering index for /api/signals/{basic,advanced}/confluence-matrix.$(NC)"
+	@echo "$(YELLOW)Key: (underlying, timestamp DESC, component_name); INCLUDE (clamped_score).$(NC)"
+	@echo "$(YELLOW)The endpoint reads N component scores across the recent lookback window,$(NC)"
+	@echo "$(YELLOW)and the heap rows carry a JSONB context_values column that makes random$(NC)"
+	@echo "$(YELLOW)heap fetches disproportionately expensive.  With every filter column in$(NC)"
+	@echo "$(YELLOW)the key and clamped_score in INCLUDE, the planner can satisfy the read$(NC)"
+	@echo "$(YELLOW)with an Index Only Scan and zero heap fetches.$(NC)"
+	@if [ "$${CONFIRM}" != "yes" ]; then \
+		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to actually build.$(NC)"; \
+	else \
+		printf "%s\n" \
+			"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_signal_component_scores_underlying_ts_comp_clamped_covering ON signal_component_scores(underlying, timestamp DESC, component_name) INCLUDE (clamped_score);" \
+			| $(PSQL) -v ON_ERROR_STOP=1; \
+		echo "$(GREEN)✓ Index built. Verify via EXPLAIN ANALYZE that confluence-matrix reads use it.$(NC)"; \
+	fi
+
 .PHONY: db-drop-narrow-partial-index
 db-drop-narrow-partial-index: ## DROP CONCURRENTLY the narrow idx_option_chains_underlying_option_symbol_ts_gamma (~1.6 GB; subsumed by _covering). Pass CONFIRM=yes to execute.
 	@echo "$(BLUE)=== Dropping idx_option_chains_underlying_option_symbol_ts_gamma CONCURRENTLY ===$(NC)"

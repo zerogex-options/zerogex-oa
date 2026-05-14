@@ -1509,6 +1509,22 @@ CREATE INDEX IF NOT EXISTS idx_signal_component_scores_underlying_ts
 CREATE INDEX IF NOT EXISTS idx_signal_component_scores_component
     ON signal_component_scores(component_name, timestamp DESC);
 
+-- Covering index for the confluence-matrix read path.  The /api/signals/
+-- {basic,advanced}/confluence-matrix endpoints scan recent rows for a
+-- specific underlying, filter to N component names, and only need
+-- ``clamped_score``.  With ``clamped_score`` carried in the INCLUDE list
+-- and the filter columns in the key, the planner can satisfy the read
+-- with an Index Only Scan and zero heap fetches — the JSONB
+-- ``context_values`` column on the heap rows makes those fetches
+-- disproportionately expensive otherwise.
+--
+-- Build with ``CREATE INDEX CONCURRENTLY`` in production to avoid locking
+-- the writers; this schema entry serves fresh installs and idempotent
+-- retries.
+CREATE INDEX IF NOT EXISTS idx_signal_component_scores_underlying_ts_comp_clamped_covering
+    ON signal_component_scores(underlying, timestamp DESC, component_name)
+    INCLUDE (clamped_score);
+
 -- ---------------------------------------------------------------------------
 -- signal_action_cards
 -- Persists Action Cards emitted by the Playbook Engine.  One row per
