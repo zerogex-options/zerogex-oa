@@ -228,9 +228,19 @@ MAX_PAIN_BACKGROUND_REFRESH_STRIKE_LIMIT = max(
 )
 # Per-statement timeout override applied to the background refresh only,
 # allowing the heavy recompute to run beyond the pool's default
-# DB_STATEMENT_TIMEOUT_MS (~30s).  Applied via SET LOCAL inside a transaction.
+# DB_STATEMENT_TIMEOUT_MS (~30s).  Applied via SET LOCAL on the server and
+# forwarded as ``timeout=`` to each asyncpg conn.execute() so the
+# client-side command_timeout doesn't fire first.
+#
+# 300s sized for SPX during cash session, where the active_symbols + LATERAL
+# latest-per-contract + cross-join-over-settlement-candidates CTE chain
+# legitimately exceeds 120s on a 2026-05-14 production observation.  Sized
+# to match MAX_PAIN_BACKGROUND_REFRESH_INTERVAL_SECONDS so a single SPX
+# attempt can use the full inter-cycle budget.  If this still trips,
+# optimize the query (start by dropping MAX_PAIN_BACKGROUND_REFRESH_STRIKE_LIMIT
+# from 500) — don't bump the timeout further.
 MAX_PAIN_BACKGROUND_REFRESH_STATEMENT_TIMEOUT_MS = max(
-    1000, int(os.getenv("MAX_PAIN_BACKGROUND_REFRESH_STATEMENT_TIMEOUT_MS", "120000"))
+    1000, int(os.getenv("MAX_PAIN_BACKGROUND_REFRESH_STATEMENT_TIMEOUT_MS", "300000"))
 )
 
 # =============================================================================
