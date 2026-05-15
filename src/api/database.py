@@ -2487,18 +2487,27 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         step_interval = _interval_expr(timeframe)
         # `bucket` and `step_interval` are validated allowlist literals.
         #
-        # Perf: the spot±50 strike band is filtered INSIDE recent_data,
-        # before the GROUP BY, not after it.  The result is identical
-        # (AVG is per (bucket, strike), so pre- vs post-aggregation
-        # strike filtering yields the same per-cell value), but the
-        # aggregate now only touches the ~100 strikes near spot instead
-        # of the entire option chain for every snapshot in the window.
-        # For wide windows (notably timeframe=1day, where window_units=N
-        # spans N days of the highest-cardinality table) this is the
-        # difference between scanning/aggregating millions of discarded
-        # rows and only the ones that survive to the response.  The two
-        # "latest underlying_quotes row" lookups (window anchor + spot
-        # price) are also folded into a single CTE/scan.
+        # Perf: a true per-bucket AVG over raw gex_by_strike requires
+        # reading every snapshot in the window.  gex_by_strike is the
+        # highest-cardinality table (the analytics engine writes one row
+        # per strike×expiration every ~60s), so for timeframe=1day,
+        # window_units=N (an N-DAY window) that scan is tens of millions
+        # of rows -> ~14s, regardless of how few strikes survive a
+        # post-scan filter.
+        #
+        # Instead, pick ONE representative (latest) snapshot per bucket
+        # from the lightweight gex_summary (one row per analytics cycle,
+        # written in the SAME transaction as gex_by_strike), then read
+        # gex_by_strike only AT those ~window_units timestamps.  This is
+        # the same pattern get_historical_gex uses; it bounds the
+        # expensive per-strike read to a handful of timestamps instead of
+        # the whole window.  Heatmap cells are therefore the GEX-by-strike
+        # surface at each bucket's close (point-in-time) rather than an
+        # average across every snapshot in the bucket -- consistent with
+        # the historical/summary endpoints.  Only the TIME aggregation
+        # changed: the cross-expiration combination per (bucket, strike)
+        # is still AVG, and the spot±50 band filter is unchanged, so cell
+        # magnitudes stay comparable to before.
         query = f"""
             WITH latest_quote AS (
                 SELECT timestamp AS max_ts, close AS spot_close
@@ -2513,24 +2522,27 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     max_ts as end_time
                 FROM latest_quote
             ),
-            recent_data AS (
-                SELECT
-                    {bucket} as timestamp,
-                    strike,
-                    AVG(net_gex) as net_gex
-                FROM gex_by_strike
+            bucket_reps AS (
+                SELECT DISTINCT ON ({bucket})
+                    {bucket} AS bucket_ts,
+                    timestamp AS rep_ts
+                FROM gex_summary
                 WHERE underlying = $1
                     AND timestamp >= (SELECT start_time FROM time_window)
                     AND timestamp <= (SELECT end_time FROM time_window)
-                    AND ABS(strike - (SELECT spot_close FROM latest_quote)) <= 50
-                GROUP BY 1, strike
+                ORDER BY {bucket}, timestamp DESC
             )
             SELECT
-                timestamp,
-                strike,
-                net_gex
-            FROM recent_data
-            ORDER BY timestamp DESC, strike ASC
+                br.bucket_ts AS timestamp,
+                g.strike,
+                AVG(g.net_gex) AS net_gex
+            FROM bucket_reps br
+            JOIN gex_by_strike g
+                ON g.underlying = $1
+               AND g.timestamp = br.rep_ts
+            WHERE ABS(g.strike - (SELECT spot_close FROM latest_quote)) <= 50
+            GROUP BY br.bucket_ts, g.strike
+            ORDER BY br.bucket_ts DESC, g.strike ASC
         """
 
         try:
