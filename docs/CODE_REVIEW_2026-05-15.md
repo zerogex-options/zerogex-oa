@@ -935,3 +935,113 @@ consolidated None-Greeks path.
   Friday = May 15); caught and fixed a `str.rstrip(".X")`
   character-set bug that turned `"SPX"` into `"SP"`.
 - Import smoke tests succeed for all modified modules.
+
+---
+
+## Third pass — independent re-review (2026-05-15, branch `claude/code-database-review-4kGEl`)
+
+Fresh full-repo pass. The core financial math (Black-Scholes Greeks, IV
+Newton-Raphson, GEX `γ·OI·100·S²·0.01`, vanna `-φ(d1)·d2/σ`, charm,
+per-expiration max-pain, gamma-flip aggregation, walls) was independently
+re-derived and confirmed **correct** as left by passes 1–2. The findings
+below are NEW (not covered by F1–F10 / D1–D8 / C1–C5).
+
+### Fixed this pass
+
+**N1 🔴 `get_signal_hit_rate` multiplied a numeric by the `direction`
+TEXT column** — `src/api/queries/signals.py`. `signal_events.direction`
+is `VARCHAR(16)` ('bullish'/'bearish'/...). `... / close_at_emit *
+direction` made Postgres cast `'bullish'`→`double precision` and throw
+`invalid input syntax`. The whole query was caught by the `except` and
+returned `None`, so the signal hit-rate endpoint was **permanently
+dead** whenever any resolved event existed. Replaced with
+`CASE direction WHEN 'bullish' THEN 1 WHEN 'bearish' THEN -1 ELSE 0 END`.
+Also fixed the hit-rate denominator (was `wins / resolved`, diluting the
+rate with any non-win/non-loss outcome label → now `wins / (wins+losses)`).
+
+**N2 🔴 Trading-day-boundary contamination in four SQL windows** — same
+class as the prior timezone fixes but in spots they missed. Each blends
+the prior session / overnight gap into the first ~30 bars of a session,
+producing **false signals every single market open**:
+- `schema.sql` `unusual_volume_spikes` — 30-bar `AVG`/`STDDEV` had no
+  ET-day partition (the sibling `underlying_vwap_deviation` one line
+  above does). Fired "🚨 Extreme Spike" on routine opens daily.
+- `schema.sql` `dealer_hedging_pressure` — `LAG(close)` for
+  `price_change` had no day partition → overnight gap reported as a
+  per-minute change at the open.
+- `schema.sql` `underlying_vwap_deviation` — a zero-volume bar makes
+  VWAP `NULL`; all `CASE` comparisons go `NULL` and fell through to a
+  spurious "❌ Below VWAP". Added a leading "⚪ No Volume" branch.
+- `api/queries/technicals.py` — `avg_volume`, `volume_stddev`,
+  `price_change_5min` weren't day-partitioned (sibling `cum_pv`/`cum_vol`
+  in the same CTE are) → false volume-spike / price-divergence labels at
+  the open.
+
+**N3 🔴 `regime_tilt` last-resort fabricated a price-quantized
+direction** — `src/signals/components/spectrum.py`. With no directional
+cues it returned a *signed* tilt from `close % 7.0` — SPX at 5103.5 →
+strongly bearish, 5104.5 → less bearish — feeding spurious, price-level-
+dependent votes into the MSI composite via `ensure_non_zero`. Replaced
+with a fixed, sign-neutral `_LAST_RESORT_MIN` floor (still satisfies the
+"never exactly 0" contract without inventing a market read).
+
+**N4 🟡→fixed `get_signal_confluence_matrix` self-join double-counted**
+— `src/api/queries/signals.py`. `comp a JOIN comp b USING(timestamp)`
+had no `a.component_name < b.component_name`, so it emitted the c1=c2
+diagonal (a component always agrees with itself → fake 100% confluence)
+and both (X,Y) and (Y,X). Added the predicate; the Python consumer now
+mirrors each unordered pair into both off-diagonal cells and leaves the
+diagonal as the honest empty cell.
+
+**N5 🔴 `_merge_bar` fabricated `now()` for an unparseable bar
+timestamp** — `src/ingestion/stream_manager.py`. A bar whose `TimeStamp`
+failed `safe_datetime` was stamped with wall-clock `now()`, bucketed
+into the *current* minute, and the unconditional underlying-OHLC upsert
+overwrote that minute's real bar — corrupting the spot price Greeks are
+computed against. Now the malformed bar is dropped with a warning.
+
+Verification: full suite **869 passed, 1 skipped**; `black` clean; no
+new `flake8` findings vs HEAD on the five touched files.
+
+### Identified, intentionally NOT auto-fixed (need a decision / larger change)
+
+- **🔴/🟡 Ingestion bucket-boundary flow accounting** (`ingestion/
+  main_engine.py` `_prepare_option_agg`/baseline-cache advance): the
+  per-bucket classified-flow delta math is correct only under a fragile,
+  undocumented "every additive write is preceded by a buffer trim"
+  invariant; a DB write failure at a bucket boundary can permanently
+  drop that bucket's classified flow. Needs careful tracing + a
+  commit-confirmed trim; too risky for an in-place edit.
+- **🟡 `option_chains.volume` stores cumulative daily volume**, while
+  `ask/mid/bid_volume` are per-bucket deltas. Any consumer reconciling
+  them is wrong. Decide: dedicated period-volume column vs. loud doc.
+- **🟡 Underlying OHLC upsert uses `high=EXCLUDED.high` (overwrite)**
+  not `GREATEST/LEAST`. Safe only if TradeStation always sends
+  authoritative final bars; if partials, intra-minute H/L can regress.
+  Confirm feed semantics before changing a shared write path.
+- **🟡 `playbook/backtest.py` resolves on bar *close* only** (no
+  OHLC) and lets target win same-bar ties. MAE/MFE understated; bias
+  direction ambiguous. Needs OHLC plumbing into `quotes`.
+- **🟡 `scoring_engine` abstain-replacement** substitutes a regime
+  tilt for every abstaining component; the tilts share inputs (not
+  orthogonal) so several can push the composite the same way →
+  over-confident regime labels on sparse data. Design refactor.
+- **🟡 `signal_events` / `signal_action_cards` have no business
+  UNIQUE key** (`(underlying, signal_name, timestamp)` /
+  `(underlying, pattern, timestamp)`); an idempotent engine re-run
+  double-inserts events and double-emits. Needs constraint + writer
+  `ON CONFLICT DO NOTHING` together.
+- **🟡 gamma-flip uses per-strike net-GEX zero crossing**, not the
+  cumulative-GEX or recomputed-GEX(S) convention (SpotGamma-style).
+  Legitimate simplification but differs from industry; flag for product
+  decision.
+- **🟡 vanna/charm exposure normalize by `OI·100·S`** while GEX uses
+  `OI·100·S²·0.01`. Internally consistent but a different unit basis;
+  document the convention.
+- **🟢 Not a bug (verified):** `flow_smart_money.unusual_activity_score
+  NUMERIC(5,2)` is fine — the score is hard-capped at 10 by
+  `LEAST(10, …)`, so no overflow is possible.
+- Minor/low-confidence: `/api/health` exact-match vs trailing slash,
+  holiday-unaware session cutoffs, `minutes_since_open` clock
+  arithmetic (formula is actually correct for ≥09:30), VIX `_seeded`
+  on first partial payload, stream-snapshot reuse semantics.

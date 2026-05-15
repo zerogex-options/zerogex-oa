@@ -336,7 +336,12 @@ class SignalsQueriesMixin:
                 COUNT(*) FILTER (WHERE {col} = 'loss')::int AS losses,
                 COUNT(*) FILTER (WHERE {col} IS NULL)::int AS pending,
                 AVG(CASE WHEN close_at_emit > 0 AND close_{horizon} IS NOT NULL
-                         THEN (close_{horizon} - close_at_emit) / close_at_emit * direction
+                         THEN (close_{horizon} - close_at_emit) / close_at_emit
+                              * CASE direction
+                                    WHEN 'bullish' THEN 1
+                                    WHEN 'bearish' THEN -1
+                                    ELSE 0
+                                END
                          ELSE NULL END) AS avg_signed_return
             FROM signal_events
             WHERE underlying = $1
@@ -351,7 +356,13 @@ class SignalsQueriesMixin:
                 total = d.get("total") or 0
                 resolved = total - (d.get("pending") or 0)
                 d["resolved"] = resolved
-                d["hit_rate"] = round(d["wins"] / resolved, 4) if resolved > 0 else None
+                # Hit rate is win share of *decided* events (win or loss).
+                # Dividing by ``resolved`` would dilute the rate with any
+                # non-win/non-loss outcome label (e.g. a flat/tie bucket).
+                wins = d.get("wins") or 0
+                losses = d.get("losses") or 0
+                decided = wins + losses
+                d["hit_rate"] = round(wins / decided, 4) if decided > 0 else None
                 d["horizon"] = horizon
                 d["signal_name"] = signal_name
                 d["underlying"] = symbol
@@ -746,6 +757,11 @@ class SignalsQueriesMixin:
                     COUNT(*) FILTER (WHERE a.sign <> 0 AND b.sign <> 0 AND a.sign <> b.sign)::int AS disagreement_count
                 FROM comp a
                 JOIN comp b USING (timestamp)
+                -- Unordered distinct pairs only. Without this predicate the
+                -- self-join also emits c1=c2 (a component always agrees
+                -- with itself -> a fake 100% diagonal) and BOTH (X,Y) and
+                -- (Y,X), so any aggregate over the matrix double-counts.
+                WHERE a.component_name < b.component_name
                 GROUP BY a.component_name, b.component_name
             ),
             regime_counts AS (
@@ -788,22 +804,30 @@ class SignalsQueriesMixin:
                 kind = row["kind"]
                 if kind == "pair":
                     c1, c2 = row["a"], row["b"]
+                    agree = row["agreement_count"] or 0
+                    disagree = row["disagreement_count"] or 0
+                    active = agree + disagree
+                    cell = {
+                        "observations": row["observations"] or 0,
+                        "active_observations": active,
+                        "agreement_count": agree,
+                        "disagreement_count": disagree,
+                        "neutral_count": row["neutral_count"] or 0,
+                        "agreement_ratio": (round(agree / active, 4) if active else None),
+                        "disagreement_ratio": (round(disagree / active, 4) if active else None),
+                        "net_confluence": (
+                            round((agree - disagree) / active, 4) if active else 0.0
+                        ),
+                    }
+                    # SQL now returns each unordered pair once (c1 < c2).
+                    # Confluence is symmetric, so mirror the cell into both
+                    # off-diagonal positions. The diagonal stays at the
+                    # pre-filled empty cell -- self-confluence is undefined,
+                    # not a (misleading) perfect 100%.
                     if c1 in matrix and c2 in matrix[c1]:
-                        agree = row["agreement_count"] or 0
-                        disagree = row["disagreement_count"] or 0
-                        active = agree + disagree
-                        matrix[c1][c2] = {
-                            "observations": row["observations"] or 0,
-                            "active_observations": active,
-                            "agreement_count": agree,
-                            "disagreement_count": disagree,
-                            "neutral_count": row["neutral_count"] or 0,
-                            "agreement_ratio": (round(agree / active, 4) if active else None),
-                            "disagreement_ratio": (round(disagree / active, 4) if active else None),
-                            "net_confluence": (
-                                round((agree - disagree) / active, 4) if active else 0.0
-                            ),
-                        }
+                        matrix[c1][c2] = cell
+                    if c2 in matrix and c1 in matrix[c2]:
+                        matrix[c2][c1] = dict(cell)
                 elif kind == "regime":
                     comp = row["a"]
                     if comp in component_vs_regime:

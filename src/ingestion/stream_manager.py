@@ -634,7 +634,16 @@ class UnderlyingBarAccumulator:
         timestamp_str = bar.get("TimeStamp", "")
         timestamp = safe_datetime(timestamp_str, field_name="TimeStamp")
         if not timestamp:
-            timestamp = datetime.now(ET)
+            # A bar with an unparseable timestamp has no reliable place in
+            # the time series. Stamping it with wall-clock now() buckets it
+            # into the *current* minute and the unconditional OHLC upsert
+            # then overwrites that minute's real bar with a misdated one --
+            # corrupting the underlying price Greeks are computed against.
+            # Dropping the bar is strictly safer than fabricating a time.
+            logger.warning(
+                "Dropping underlying bar with unparseable TimeStamp=%r", timestamp_str
+            )
+            return
 
         minute_bucket = timestamp.replace(second=0, microsecond=0)
         prior = self._bar_state.get(minute_bucket, {})

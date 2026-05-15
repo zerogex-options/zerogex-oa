@@ -696,6 +696,10 @@ SELECT
     ROUND(((price - (cum_pv / NULLIF(cum_vol, 0))) / NULLIF((cum_pv / NULLIF(cum_vol, 0)), 0) * 100)::numeric, 3) AS vwap_deviation_pct,
     volume,
     CASE
+        -- No volume yet today (pre-open / halt): VWAP is undefined, so
+        -- every price comparison below is NULL and would otherwise fall
+        -- through to the ELSE and report a spurious bearish "Below VWAP".
+        WHEN cum_vol IS NULL OR cum_vol = 0 THEN '⚪ No Volume'
         WHEN price > (cum_pv / NULLIF(cum_vol, 0)) * 1.002 THEN '🔥 Extended Above VWAP'
         WHEN price > (cum_pv / NULLIF(cum_vol, 0)) THEN '✅ Above VWAP'
         WHEN price < (cum_pv / NULLIF(cum_vol, 0)) * 0.998 THEN '🔥 Extended Below VWAP'
@@ -752,13 +756,19 @@ WITH base AS (
         up_volume,
         down_volume,
         (up_volume + down_volume) AS current_volume,
+        -- Rolling baseline must NOT span the trading-day boundary: the
+        -- opening 30 minutes are structurally 5-20x midday volume, so a
+        -- window that reaches back into the prior session's close/after-
+        -- hours bars makes volume_sigma fire "Extreme Spike" on every
+        -- routine open. Partition by ET trading day (same convention as
+        -- the cumulative VWAP window in underlying_vwap_deviation).
         AVG(up_volume + down_volume) OVER (
-            PARTITION BY symbol
+            PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
             ORDER BY timestamp
             ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
         ) AS avg_volume,
         STDDEV_SAMP(up_volume + down_volume) OVER (
-            PARTITION BY symbol
+            PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
             ORDER BY timestamp
             ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
         ) AS volume_stddev,
@@ -807,7 +817,14 @@ WITH latest_price AS (
         symbol,
         timestamp,
         close AS current_price,
-        close - LAG(close) OVER (PARTITION BY symbol ORDER BY timestamp) AS price_change
+        -- Partition the LAG by ET trading day so the first bar of a
+        -- session yields NULL (no prior intraday bar) instead of
+        -- "today's open minus the prior session's close" -- an overnight
+        -- gap mislabeled as a per-minute price change.
+        close - LAG(close) OVER (
+            PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York')
+            ORDER BY timestamp
+        ) AS price_change
     FROM underlying_quotes
     ORDER BY symbol, timestamp DESC
 ),

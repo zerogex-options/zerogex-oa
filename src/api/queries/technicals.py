@@ -778,17 +778,27 @@ class TechnicalsQueriesMixin:
                             ORDER BY timestamp
                             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                         ) AS cum_vol,
+                        -- These rolling/lagged windows MUST be partitioned
+                        -- by ET trading day (same as cum_pv/cum_vol above).
+                        -- Without it the first ~30 bars of a session blend
+                        -- in the prior session's bars and the overnight
+                        -- gap, producing false volume-spike and
+                        -- price-divergence labels every open.
                         AVG(volume) OVER (
+                            PARTITION BY DATE(timestamp AT TIME ZONE 'America/New_York')
                             ORDER BY timestamp
                             ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
                         ) AS avg_volume,
                         STDDEV_SAMP(volume) OVER (
+                            PARTITION BY DATE(timestamp AT TIME ZONE 'America/New_York')
                             ORDER BY timestamp
                             ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
                         ) AS volume_stddev,
                         -- 5-minute price change = LAG-1 over 5-min bars
-                        close - LAG(close, 1) OVER (ORDER BY timestamp)
-                            AS price_change_5min
+                        close - LAG(close, 1) OVER (
+                            PARTITION BY DATE(timestamp AT TIME ZONE 'America/New_York')
+                            ORDER BY timestamp
+                        ) AS price_change_5min
                     FROM joined
                 ),
                 orb_window AS (

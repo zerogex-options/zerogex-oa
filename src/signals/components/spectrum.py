@@ -38,8 +38,9 @@ _DEFAULT_TILT_MAGNITUDE = 0.10
 _NET_GEX_SCALE = 2.0e9
 
 # Minimum non-zero magnitude returned even when no primary cues are
-# available.  Anchored to a deterministic-but-tiny derivation from
-# ``close`` so a stuck regime never lands at literal zero.
+# available.  A fixed, sign-neutral floor (NOT derived from price) so a
+# stuck regime never lands at literal zero yet also never fabricates a
+# price-level-dependent direction.
 _LAST_RESORT_MIN = 0.01
 
 
@@ -56,8 +57,9 @@ def regime_tilt(
       * Put-call ratio (PCR > 1 = bearish)
       * Net GEX sign (negative GEX = bullish-vol regime)
 
-    Falls back to a deterministic tiny dither derived from ``close`` if
-    none of the cues are populated, so the result is never exactly zero.
+    Falls back to a fixed, sign-neutral tiny floor if none of the cues
+    are populated, so the result is never exactly zero without inventing
+    a price-derived direction.
     """
     parts: list[float] = []
 
@@ -87,11 +89,15 @@ def regime_tilt(
             pass
 
     if not parts:
-        seed = float(close or 1.0)
-        # Deterministic tiny dither in [-_LAST_RESORT_MIN, +_LAST_RESORT_MIN]
-        # so the score is always non-zero even when the context is empty.
-        dither = ((seed % 7.0) - 3.5) / 3.5  # in [-1, +1]
-        return max(-magnitude, min(magnitude, dither * _LAST_RESORT_MIN))
+        # No directional cues at all. The previous implementation derived
+        # a *signed* tilt from ``close % 7.0`` -- that fabricates a
+        # direction that swings with the absolute price level (SPX 5103.5
+        # -> strongly bearish, 5104.5 -> less bearish) and feeds spurious,
+        # price-quantized votes into the MSI composite. With genuinely no
+        # information the only honest output is a sign-neutral, constant,
+        # negligible floor that satisfies the "never exactly zero" contract
+        # without encoding a fake market read.
+        return min(_LAST_RESORT_MIN, magnitude)
 
     avg = sum(parts) / len(parts)
     tilt = avg * magnitude
