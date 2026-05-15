@@ -115,6 +115,16 @@ API_RETRY_ATTEMPTS = _getenv_int("API_RETRY_ATTEMPTS", 3, min=0, max=20)
 API_RETRY_DELAY = _getenv_float("API_RETRY_DELAY", 1.0, min=0.0, max=60.0)  # seconds
 API_RETRY_BACKOFF = _getenv_float("API_RETRY_BACKOFF", 2.0, min=1.0, max=10.0)  # multiplier
 
+# /api/gex/heatmap scopes returned strikes to spot ± this fraction of
+# spot, for every underlying. Sized to the frontend's maximum y-axis
+# margin (0.02 base × 4.0 max zoom-out = 0.08) so the colored surface
+# fills the price-cropped chart at every zoom level regardless of the
+# underlying's price level — a high-priced index (SPX ≈ $7400) and an
+# ETF (SPY ≈ $585) now get proportionally equivalent coverage. Replaces
+# a hard-coded ±50 absolute band that was ≈±8.5% of SPY but only
+# ≈±0.7% of SPX, collapsing the index heatmap into a thin strip.
+GEX_HEATMAP_STRIKE_BAND_PCT = _getenv_float("GEX_HEATMAP_STRIKE_BAND_PCT", 0.08, min=0.005, max=0.5)
+
 # Batch Sizes
 QUOTE_BATCH_SIZE = int(os.getenv("QUOTE_BATCH_SIZE", "100"))  # TradeStation supports up to 500
 OPTION_BATCH_SIZE = int(os.getenv("OPTION_BATCH_SIZE", "100"))
@@ -1023,6 +1033,7 @@ def get_all_config() -> Dict[str, Any]:
             "retry_delay": API_RETRY_DELAY,
             "quote_batch_size": QUOTE_BATCH_SIZE,
             "option_batch_size": OPTION_BATCH_SIZE,
+            "gex_heatmap_strike_band_pct": GEX_HEATMAP_STRIKE_BAND_PCT,
         },
         "database": {
             "pool_min": DB_POOL_MIN,

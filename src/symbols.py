@@ -70,6 +70,19 @@ def resolve_volume_proxy(symbol: str) -> str | None:
     return get_index_volume_proxies().get(normalized)
 
 
+def is_cash_index(symbol: str) -> bool:
+    """True when ``symbol`` is a cash index (SPX, NDX, RUT, DJX, …).
+
+    A cash index has no transactional volume of its own and — unlike a
+    tracking ETF — has underlying price data only during the regular cash
+    session (09:30–16:00 ET), even though its options trade extended /
+    global hours.  The volume-proxy map is the single source of truth for
+    "this symbol is a cash index", so callers stay consistent with the
+    rest of the codebase (and any ``INDEX_VOLUME_PROXIES`` override).
+    """
+    return resolve_volume_proxy(symbol) is not None
+
+
 def resolve_symbol(symbol_or_alias: str) -> str:
     """Resolve a symbol or alias (case-insensitive) to TradeStation symbol."""
     normalized = symbol_or_alias.strip().upper()

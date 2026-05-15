@@ -18,8 +18,10 @@ import json
 
 from src.api.queries.signals import SignalsQueriesMixin
 from src.api.queries.technicals import TechnicalsQueriesMixin
+from src.config import GEX_HEATMAP_STRIKE_BAND_PCT
 from src.flow_series_sql import FLOW_SERIES_CTE_ASYNCPG, SNAPSHOT_SELECT_ASYNCPG
 from src.market_calendar import NYSE_HOLIDAYS
+from src.symbols import is_cash_index
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +209,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._analytics_cache_ttl_seconds: float = float(
             os.getenv("ANALYTICS_CACHE_TTL_SECONDS", "5.0")
         )
+        # Fraction of spot used as the /api/gex/heatmap strike half-band
+        # (validated + bounded in config). Proportional so the heatmap
+        # fills the frontend's price-cropped y-axis for any underlying.
+        self._gex_heatmap_strike_band_pct: float = GEX_HEATMAP_STRIKE_BAND_PCT
         # Flow endpoints are frequently polled by the frontend. A short TTL
         # dramatically cuts repeated heavy reads while keeping intraday charts
         # effectively real-time.
@@ -2486,6 +2492,39 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             return cached
         bucket = _bucket_expr(timeframe)
         step_interval = _interval_expr(timeframe)
+
+        # Cash indices (SPX, NDX, RUT, …) have no underlying price/volume of
+        # their own outside the regular cash session, yet their options
+        # trade extended / global hours so the analytics engine writes
+        # gex_summary / gex_by_strike around the clock.  Returning those
+        # extended-hours and overnight buckets makes the heatmap plot
+        # nonsensical 17:00–19:00 ET cells for an index and misaligns the
+        # surface with the RTH-only candlesticks.  For cash indices,
+        # restrict the per-bucket representatives to the regular session
+        # (weekdays, 09:30–16:00 ET, excluding NYSE holidays) — the same
+        # session definition get_session_closes uses.  ETFs / equities
+        # (SPY, QQQ, …) genuinely trade extended hours, so they keep the
+        # original query and params unchanged.
+        session_filter = ""
+        params: list = [symbol, window_units]
+        if is_cash_index(symbol):
+            session_filter = """
+                    AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
+                    AND (timestamp AT TIME ZONE 'America/New_York')::time
+                        BETWEEN TIME '09:30' AND TIME '16:00'
+                    AND (timestamp AT TIME ZONE 'America/New_York')::date <> ALL($3::date[])
+            """
+            params.append(sorted(NYSE_HOLIDAYS))
+        # Strike half-band around spot, proportional for every underlying
+        # so the colored surface fills the frontend's price-cropped y-axis
+        # at any price level. A fixed ±50 was ≈±8.5% of a ~$585 SPY but
+        # only ≈±0.7% of a ~$7400 index, which collapsed the index heatmap
+        # into a thin strip. band_pct is a config-validated float bounded
+        # to [0.005, 0.5] (GEX_HEATMAP_STRIKE_BAND_PCT) and formatted as a
+        # plain decimal literal — no user input — so it is safe to
+        # interpolate alongside the other validated fragments below.
+        band_pct = self._gex_heatmap_strike_band_pct
+        strike_band = f"(SELECT spot_close FROM latest_quote) * {band_pct:g}"
         # `bucket` and `step_interval` are validated allowlist literals.
         #
         # Perf: a true per-bucket AVG over raw gex_by_strike requires
@@ -2526,29 +2565,45 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             bucket_reps AS (
                 SELECT DISTINCT ON ({bucket})
                     {bucket} AS bucket_ts,
-                    timestamp AS rep_ts
+                    timestamp AS rep_ts,
+                    gamma_flip_point AS gamma_flip
                 FROM gex_summary
                 WHERE underlying = $1
                     AND timestamp >= (SELECT start_time FROM time_window)
-                    AND timestamp <= (SELECT end_time FROM time_window)
+                    AND timestamp <= (SELECT end_time FROM time_window){session_filter}
                 ORDER BY {bucket}, timestamp DESC
             )
             SELECT
                 br.bucket_ts AS timestamp,
                 g.strike,
-                AVG(g.net_gex) AS net_gex
+                AVG(g.net_gex) AS net_gex,
+                -- gamma_flip is one value per bucket (the bucket's
+                -- representative gex_summary row), but rows here are
+                -- per-strike.  MAX() collapses that constant, and the
+                -- CASE emits it on only the lowest-strike row of each
+                -- bucket (NULL elsewhere) so it isn't repeated across
+                -- every strike.  The frontend keys the gamma-flip line
+                -- by timestamp and skips NULLs, so one row per bucket is
+                -- enough — and because it now rides the heatmap's own
+                -- (RTH-filtered, over-fetched) timestamps the line spans
+                -- the full surface instead of the short /api/gex/historical
+                -- fallback window.
+                CASE
+                    WHEN g.strike = MIN(g.strike) OVER (PARTITION BY br.bucket_ts)
+                    THEN MAX(br.gamma_flip)
+                END AS gamma_flip
             FROM bucket_reps br
             JOIN gex_by_strike g
                 ON g.underlying = $1
                AND g.timestamp = br.rep_ts
-            WHERE ABS(g.strike - (SELECT spot_close FROM latest_quote)) <= 50
+            WHERE ABS(g.strike - (SELECT spot_close FROM latest_quote)) <= {strike_band}
             GROUP BY br.bucket_ts, g.strike
             ORDER BY br.bucket_ts DESC, g.strike ASC
         """
 
         try:
             async with self._acquire_connection() as conn:
-                rows = await asyncio.wait_for(conn.fetch(query, symbol, window_units), timeout=15.0)
+                rows = await asyncio.wait_for(conn.fetch(query, *params), timeout=15.0)
                 result = [dict(row) for row in rows]
                 self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
                 return result
