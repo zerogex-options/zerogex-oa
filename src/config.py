@@ -306,6 +306,14 @@ IV_MAX_ITERATIONS = int(os.getenv("IV_MAX_ITERATIONS", "100"))
 IV_TOLERANCE = float(os.getenv("IV_TOLERANCE", "0.00001"))
 IV_MIN = float(os.getenv("IV_MIN", "0.01"))
 IV_MAX = float(os.getenv("IV_MAX", "5.0"))
+# Windowed clamp telemetry for the IV solver. Every Newton iterate is
+# clamped into [IV_MIN, IV_MAX]; deep-OTM / near-expiry strikes saturate
+# the bounds as a matter of course, so a raw per-hit count is noise.
+# Instead the solver reports the *fraction of solves* that saturated over
+# a rolling window: INFO normally, WARNING only when that fraction is high
+# enough to suggest IV_MIN/IV_MAX are miscalibrated for the regime.
+IV_CLAMP_REPORT_INTERVAL_SECONDS = float(os.getenv("IV_CLAMP_REPORT_INTERVAL_SECONDS", "300"))
+IV_CLAMP_WARN_FRACTION = float(os.getenv("IV_CLAMP_WARN_FRACTION", "0.25"))
 
 # =============================================================================
 # Analytics Signal Configuration
