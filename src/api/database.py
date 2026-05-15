@@ -19,6 +19,7 @@ import json
 from src.api.queries.signals import SignalsQueriesMixin
 from src.api.queries.technicals import TechnicalsQueriesMixin
 from src.flow_series_sql import FLOW_SERIES_CTE_ASYNCPG, SNAPSHOT_SELECT_ASYNCPG
+from src.market_calendar import NYSE_HOLIDAYS
 
 logger = logging.getLogger(__name__)
 
@@ -2689,9 +2690,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     ) -> List[Dict[str, Any]]:
         """Get all rows for a specific option contract.
 
-        If the regular market session is currently open (weekday 09:30–16:00 ET)
-        returns today's data; otherwise returns data for the most recent date
-        that has rows for this contract in the database.
+        On a trading day at or after 09:30 ET (a weekday that is not a
+        configured NYSE holiday) returns the current day's session data.
+        Otherwise — before the 09:30 ET open, or on a non-trading day
+        (weekend / NYSE holiday) — returns data for the most recent cash
+        session prior to now (the nearest earlier trading day, by the
+        calendar — not the latest timestamp in the DB, which during 24x5
+        ingestion would be the current day's thin pre-market rows).
 
         Rows are ordered newest → oldest so ``rows[0]`` is the most recent
         1-minute bar.
@@ -2717,7 +2722,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         now_et = datetime.now(_ET)
         today = now_et.date()
-        session_is_open = today.weekday() < 5 and _time(9, 30) <= now_et.time() < _time(16, 0)
+        # A trading day is a weekday that is not a configured NYSE holiday.
+        is_trading_day = today.weekday() < 5 and today not in NYSE_HOLIDAYS
+        # Serve the current session once it has opened (09:30 ET) and for
+        # the rest of that calendar day. Before the open, or on a
+        # non-trading day, fall back to the most recent cash session prior
+        # to now (resolved from the calendar below).
+        use_current_session = is_trading_day and now_et.time() >= _time(9, 30)
+        # Bars are only still being written while the regular session is
+        # live; after 16:00 ET the day's data is immutable and can use the
+        # whole-day cache path below.
+        market_live = is_trading_day and _time(9, 30) <= now_et.time() < _time(16, 0)
 
         # Stage 1 — resolve option_symbol (cached). The mapping
         # (underlying, strike, expiration, option_type) → option_symbol is
@@ -2731,7 +2746,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         )
         resolved_cached = self._cache_get(symbol_cache_key)
         if resolved_cached is not None:
-            option_symbol, latest_ts = resolved_cached
+            option_symbol = resolved_cached
         else:
             # Resolve option_symbol once, then drive everything else off the
             # (option_symbol, timestamp) primary key. Filtering option_chains
@@ -2748,7 +2763,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             # that's been quoted recently. The 14-day floor bounds the worst
             # case where the contract doesn't exist.
             resolve_query = """
-                SELECT option_symbol, timestamp AS latest_ts
+                SELECT option_symbol
                 FROM option_chains
                 WHERE underlying = $1
                   AND strike = $2
@@ -2774,10 +2789,20 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             if not resolved or resolved["option_symbol"] is None:
                 return []
             option_symbol = resolved["option_symbol"]
-            latest_ts = resolved["latest_ts"]
-            self._cache_set(symbol_cache_key, (option_symbol, latest_ts), 3600.0)
+            self._cache_set(symbol_cache_key, option_symbol, 3600.0)
 
-        target_date = today if session_is_open else latest_ts.astimezone(_ET).date()
+        if use_current_session:
+            target_date = today
+        else:
+            # Most recent cash session prior to now: walk back from today
+            # to the nearest earlier weekday that isn't a configured NYSE
+            # holiday. This branch is only reached before the 09:30 ET open
+            # or on a non-trading day, so today's own session is never the
+            # answer — the prior trading day always is.
+            prior = today - timedelta(days=1)
+            while prior.weekday() >= 5 or prior in NYSE_HOLIDAYS:
+                prior -= timedelta(days=1)
+            target_date = prior
 
         # Compute the ET calendar day as an explicit UTC timestamptz range.
         # Computing day_end_et from (target_date + 1 day) rather than
@@ -2785,7 +2810,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         day_start_et = datetime.combine(target_date, _time(0, 0), tzinfo=_ET)
         day_end_et = datetime.combine(target_date + timedelta(days=1), _time(0, 0), tzinfo=_ET)
 
-        is_live = session_is_open and target_date == today
+        is_live = market_live and target_date == today
 
         # Non-live path: the whole bar list is immutable for the duration of
         # the cache entry, so cache it wholesale.
