@@ -1796,13 +1796,25 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         timeout=15.0,
                     )
                     expected = _expected_flow_series_bars(session_start, session_end)
-                    if 0 < len(rows) < expected:
-                        # Trust the snapshot but surface the shortfall: a
-                        # partial window means the Analytics Engine missed
+                    # The API sizes `expected` off the wall clock
+                    # (session_end = floor(now()/5min)), but the snapshot
+                    # is only as fresh as the last Analytics Engine cycle
+                    # (ANALYTICS_INTERVAL, ~60s). For up to one cycle after
+                    # every 5-min boundary a live session is structurally
+                    # one bar ahead of any snapshot the engine could have
+                    # written — a guaranteed, self-healing 1-bar shortfall
+                    # that is NOT an engine fault. Tolerate exactly that
+                    # lag for live ('current') sessions; closed ('prior')
+                    # sessions have no such race and stay strict so a real
+                    # gap still alerts.
+                    lag_tolerance = 1 if session == "current" else 0
+                    if 0 < len(rows) < expected - lag_tolerance:
+                        # A shortfall beyond the structural cadence lag
+                        # means the Analytics Engine actually missed
                         # cycles or backfill hasn't run for this session.
-                        # This is an engine-health alert, not an API
-                        # fallback — a CTE fallback would reintroduce the
-                        # heavy scan exactly when the system is degraded.
+                        # Engine-health alert, not an API fallback — a CTE
+                        # fallback would reintroduce the heavy scan exactly
+                        # when the system is degraded.
                         logger.warning(
                             "flow_series_5min shortfall for %s %s: %d rows, "
                             "expected up to %d for window [%s, %s]",

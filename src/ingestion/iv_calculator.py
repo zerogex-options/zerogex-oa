@@ -10,6 +10,7 @@ Dependencies:
 """
 
 import math
+import time
 
 import numpy as np
 from scipy import stats
@@ -24,6 +25,8 @@ from src.config import (
     IV_TOLERANCE,
     IV_MIN,
     IV_MAX,
+    IV_CLAMP_REPORT_INTERVAL_SECONDS,
+    IV_CLAMP_WARN_FRACTION,
 )
 
 logger = get_logger(__name__)
@@ -59,18 +62,84 @@ class IVCalculator:
         self.min_iv = min_iv if min_iv is not None else IV_MIN
         self.max_iv = max_iv if max_iv is not None else IV_MAX
 
-        # Clamp telemetry: incremented when the Newton step lands outside
-        # [min_iv, max_iv] and we have to floor/ceiling the result.
-        # Frequent hits indicate IV_MIN/IV_MAX may be miscalibrated for
-        # the current market regime (e.g. deep-OTM strikes near 0 gamma
-        # routinely saturate the floor).
-        self._iv_clamp_floor_hits = 0
-        self._iv_clamp_ceiling_hits = 0
+        # Windowed clamp telemetry. The Newton loop clamps every iterate
+        # into [min_iv, max_iv]; deep-OTM and near-expiry strikes saturate
+        # the bounds routinely, so a per-iteration count is pure noise.
+        # We instead track, per rolling window, the fraction of *solves*
+        # that saturated and report it (INFO normally, WARNING only when
+        # that fraction is high enough to suggest IV_MIN/IV_MAX are
+        # miscalibrated for the current regime). Counters reset each
+        # window so the figure reflects the current rate, not lifetime
+        # accumulation.
+        self._iv_solve_count = 0
+        self._iv_clamp_floor_solves = 0
+        self._iv_clamp_ceiling_solves = 0
+        self._iv_clamp_window_start = time.monotonic()
+        self._iv_clamp_report_interval_s = IV_CLAMP_REPORT_INTERVAL_SECONDS
+        self._iv_clamp_warn_fraction = IV_CLAMP_WARN_FRACTION
 
         logger.info(
             f"Initialized IVCalculator: max_iter={self.max_iterations}, "
             f"tol={self.tolerance}, range=[{self.min_iv}, {self.max_iv}]"
         )
+
+    def _maybe_report_iv_clamp_telemetry(self) -> None:
+        """Emit a windowed clamp-rate line at most once per report interval.
+
+        The solver clamps deep-OTM / near-expiry strikes to the IV bounds
+        as a matter of course, so this is INFO by default and only
+        escalates to WARNING when the *fraction* of solves that saturated
+        is high enough to suggest IV_MIN/IV_MAX are miscalibrated for the
+        current regime. Window counters reset each interval so the number
+        reflects the current rate, not lifetime accumulation.
+        """
+        now = time.monotonic()
+        elapsed = now - self._iv_clamp_window_start
+        if elapsed < self._iv_clamp_report_interval_s:
+            return
+
+        solves = self._iv_solve_count
+        floor_solves = self._iv_clamp_floor_solves
+        ceiling_solves = self._iv_clamp_ceiling_solves
+        # Reset the window before logging so a logging failure can't
+        # wedge the telemetry permanently.
+        self._iv_solve_count = 0
+        self._iv_clamp_floor_solves = 0
+        self._iv_clamp_ceiling_solves = 0
+        self._iv_clamp_window_start = now
+
+        clamped = floor_solves + ceiling_solves
+        if solves == 0 or clamped == 0:
+            return
+
+        fraction = clamped / solves
+        if fraction >= self._iv_clamp_warn_fraction:
+            logger.warning(
+                "IV clamp telemetry: %d/%d solves (%.1f%%) saturated bounds "
+                "over %.0fs [floor=%d @%.4f, ceiling=%d @%.4f] — "
+                "IV_MIN/IV_MAX may be miscalibrated for the current regime",
+                clamped,
+                solves,
+                fraction * 100.0,
+                elapsed,
+                floor_solves,
+                self.min_iv,
+                ceiling_solves,
+                self.max_iv,
+            )
+        else:
+            logger.info(
+                "IV clamp telemetry: %d/%d solves (%.1f%%) saturated bounds "
+                "over %.0fs [floor=%d @%.4f, ceiling=%d @%.4f]",
+                clamped,
+                solves,
+                fraction * 100.0,
+                elapsed,
+                floor_solves,
+                self.min_iv,
+                ceiling_solves,
+                self.max_iv,
+            )
 
     def _calculate_time_to_expiration(self, current_date: datetime, expiration_date: date) -> float:
         """Time-to-expiration in years (delegates to src.market_calendar)."""
@@ -175,6 +244,14 @@ class IVCalculator:
         # Newton-Raphson iteration
         sigma = max(self.min_iv, min(initial_guess, self.max_iv))
 
+        # One solve; flag it at most once each for floor/ceiling no
+        # matter how many iterations clamp. Telemetry is time-windowed,
+        # so calling the (cheap, gated) reporter per solve is fine.
+        self._iv_solve_count += 1
+        self._maybe_report_iv_clamp_telemetry()
+        solve_hit_floor = False
+        solve_hit_ceiling = False
+
         for iteration in range(self.max_iterations):
             # Calculate BS price with current sigma
             bs_price = self._black_scholes_price(
@@ -217,27 +294,19 @@ class IVCalculator:
                 logger.debug("Sigma became non-finite during iteration; aborting")
                 return None
 
-            # Constrain to valid range and count clamp hits so operators
-            # can tell when IV_MIN/IV_MAX are too tight for current
-            # market conditions (deep-OTM strikes near zero gamma
-            # frequently saturate the floor).
+            # Constrain to valid range. Flag the solve (at most once per
+            # bound) so windowed telemetry can report the fraction of
+            # solves that saturated — deep-OTM / near-expiry strikes do
+            # this routinely, so it is tracked, not warned per hit.
             if sigma < self.min_iv:
-                self._iv_clamp_floor_hits += 1
-                if (self._iv_clamp_floor_hits % 1000) == 1:
-                    logger.warning(
-                        "IV solver hit min_iv=%.4f floor (cumulative=%d)",
-                        self.min_iv,
-                        self._iv_clamp_floor_hits,
-                    )
+                if not solve_hit_floor:
+                    solve_hit_floor = True
+                    self._iv_clamp_floor_solves += 1
                 sigma = self.min_iv
             elif sigma > self.max_iv:
-                self._iv_clamp_ceiling_hits += 1
-                if (self._iv_clamp_ceiling_hits % 1000) == 1:
-                    logger.warning(
-                        "IV solver hit max_iv=%.4f ceiling (cumulative=%d)",
-                        self.max_iv,
-                        self._iv_clamp_ceiling_hits,
-                    )
+                if not solve_hit_ceiling:
+                    solve_hit_ceiling = True
+                    self._iv_clamp_ceiling_solves += 1
                 sigma = self.max_iv
 
         logger.debug(f"IV did not converge after {self.max_iterations} iterations")
