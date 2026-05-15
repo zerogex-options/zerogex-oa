@@ -76,9 +76,32 @@ class AnalyticsEngine:
             self.snapshot_lookback_hours,
             int(os.getenv("ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS", "96")),
         )
+        # The wide cold-start scan can legitimately run longer than the
+        # pool-wide DB_STATEMENT_TIMEOUT_MS (default 90s) when the buffer
+        # pool is cold.  Give just that one query a higher per-statement
+        # ceiling via SET LOCAL so a cold first cycle isn't killed at 90s.
+        self.snapshot_cold_start_statement_timeout_ms = max(
+            0, int(os.getenv("ANALYTICS_SNAPSHOT_COLD_START_STATEMENT_TIMEOUT_MS", "180000"))
+        )
         self._snapshot_cold_start_consumed = False
         self.min_oi_coverage_pct_alert = float(
             os.getenv("ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT", "0.35")
+        )
+
+        # Off-hours mode: keep cycling on weekends / NYSE holidays instead
+        # of sleeping until the next run window.  The snapshot is anchored
+        # to the latest option_chains row (not wall-clock NOW()), so an
+        # off-hours cycle recomputes against the most recent available data
+        # (e.g. Friday's close on a Saturday) rather than reporting nothing.
+        # A longer interval is used off-hours since the underlying data is
+        # static until the next session.
+        self.off_hours_enabled = (
+            os.getenv("ANALYTICS_OFF_HOURS_ENABLED", "true").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        self.off_hours_interval = max(
+            self.calculation_interval,
+            int(os.getenv("ANALYTICS_OFF_HOURS_INTERVAL_SECONDS", "300")),
         )
 
         # Metrics
@@ -110,6 +133,65 @@ class AnalyticsEngine:
         """Handle shutdown signals gracefully"""
         logger.info(f"\n⚠️  Received signal {signum}, shutting down...")
         self.running = False
+
+    # SQL for the latest-per-contract snapshot (query #3 in _get_snapshot).
+    # Kept as a class attribute so the cold-start and steady-state /
+    # fallback paths execute byte-identical SQL (same plan shape).
+    _SNAPSHOT_QUERY = """
+        SELECT DISTINCT ON (oc.option_symbol)
+            oc.option_symbol,
+            oc.strike,
+            oc.expiration,
+            oc.option_type,
+            oc.last,
+            oc.bid,
+            oc.ask,
+            oc.volume,
+            oc.open_interest,
+            oc.delta,
+            oc.gamma,
+            oc.theta,
+            oc.vega,
+            oc.implied_volatility,
+            oc.timestamp
+        FROM option_chains oc
+        WHERE oc.underlying = %s
+          AND oc.timestamp <= %s
+          AND oc.timestamp >= %s
+          AND oc.expiration > %s
+          AND oc.gamma IS NOT NULL
+        ORDER BY oc.option_symbol, oc.timestamp DESC
+        LIMIT %s
+        """
+
+    def _run_snapshot_query(
+        self,
+        cursor,
+        timestamp: datetime,
+        lookback_hours: int,
+        min_expiration,
+        row_cap: int,
+        statement_timeout_ms: int = 0,
+    ) -> list:
+        """Execute the latest-per-contract snapshot query and return rows.
+
+        When ``statement_timeout_ms`` > 0 a ``SET LOCAL statement_timeout``
+        is issued first so this single query gets a higher per-statement
+        ceiling than the pool-wide default (used for the wide cold-start
+        scan, which can outlast the 90s pool timeout on a cold buffer
+        pool).  ``SET LOCAL`` is scoped to the current transaction and
+        reverts on commit/rollback, so it never leaks to other queries.
+        """
+        if statement_timeout_ms and statement_timeout_ms > 0:
+            cursor.execute(
+                "SET LOCAL statement_timeout = %s", (str(int(statement_timeout_ms)),)
+            )
+        lookback_start = timestamp - timedelta(hours=lookback_hours)
+        cursor.execute(
+            self._SNAPSHOT_QUERY,
+            (self.db_symbol, timestamp, lookback_start, min_expiration, row_cap),
+        )
+        return cursor.fetchall()
 
     def _get_snapshot(self) -> Optional[Dict[str, Any]]:
         """Fetch latest timestamp, underlying price, and option data.
@@ -145,13 +227,26 @@ class AnalyticsEngine:
         contract is requoted within minutes -- the latest quote per
         contract is virtually always present in the last hour.
 
-        The first cycle after process start instead uses
+        The first cycle after process start MAY use
         ``ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS`` (default 96) so
         a worker booting on Monday morning still reaches the prior
-        Friday's closing quotes for every contract.  After one
-        cold-start cycle (success or failure) the engine drops to the
-        steady-state lookback; cold-start failures are not retried so
-        a slow first cycle can never wedge the cycle loop indefinitely.
+        Friday's closing quotes for every contract.  This is gated:
+        the wide window is used only when the newest option_chains row
+        is older than the steady-state lookback (data is stale).  A
+        mid-session restart with live ingestion sees a fresh newest
+        row, so it skips straight to the cheap steady-state window even
+        on cycle 1 -- the slow first cycle simply doesn't happen there.
+
+        When the wide window IS used it runs under
+        ``ANALYTICS_SNAPSHOT_COLD_START_STATEMENT_TIMEOUT_MS`` (default
+        180000) applied via ``SET LOCAL`` so it isn't killed by the
+        lower pool-wide ceiling on a cold buffer pool.  If it still
+        fails (timeout or otherwise) the engine rolls back and retries
+        the SAME cycle with the cheap steady-state window, so the first
+        cycle yields a narrower-but-non-empty result instead of a hard
+        error + a stalled interval.  The "consumed" flag flips
+        regardless of outcome so a slow/failed cold-start can never
+        loop or wedge the cycle loop.
 
         Background -- the May 13, 2026 incident wedged production with
         a 23-minute snapshot wallclock at the historical 96-hour default
@@ -163,10 +258,12 @@ class AnalyticsEngine:
         the planner picks bitmap-heap-scan regardless (verified both
         with the index present and with it dropped inside a rolled-back
         transaction -- identical plans).  The actual remedies were the
-        narrower steady-state lookback above and the 90 s pool-level
-        statement_timeout backstop.  The covering index remains in
-        place because it serves other queries (notably the LATERAL
-        flow-cache backfill at src/api/database.py:_do_refresh_flow_cache).
+        narrower steady-state lookback above, the cold-start gating +
+        in-cycle steady-state fallback, and the dedicated (higher)
+        cold-start statement_timeout backstop.  The covering index
+        remains in place because it serves other queries (notably the
+        LATERAL flow-cache backfill at
+        src/api/database.py:_do_refresh_flow_cache).
 
         Returns dict with keys 'timestamp', 'underlying_price',
         'options' or None if no data is available.
@@ -225,29 +322,26 @@ class AnalyticsEngine:
                 # planner picks a single Index Scan + in-memory sort
                 # (~70 ms warm); at the 96h cold-start width it picks a
                 # Parallel Bitmap Heap Scan + external merge sort
-                # (~40 sec warm, bounded by the 90 s pool statement
+                # (~40 sec warm, bounded by the cold-start statement
                 # timeout when the buffer pool is cold).
-                # First cycle after process start gets a wider window so we
-                # reach the prior session's closing quotes; every subsequent
-                # cycle uses the narrow steady-state window.  The "consumed"
-                # flag flips after the query runs regardless of outcome, so a
-                # slow cold-start cycle can't loop and wedge ingestion.
-                if self._snapshot_cold_start_consumed:
-                    effective_lookback_hours = self.snapshot_lookback_hours
-                else:
-                    effective_lookback_hours = self.snapshot_cold_start_lookback_hours
-                    logger.info(
-                        "Cold-start snapshot: using %dh lookback (steady-state is %dh)",
-                        effective_lookback_hours,
-                        self.snapshot_lookback_hours,
-                    )
-                lookback_start = timestamp - timedelta(hours=effective_lookback_hours)
+                #
+                # Cold-start gating (first cycle after process start):
+                # the wide window only earns its cost when the newest
+                # option_chains row is itself stale -- e.g. a Monday boot
+                # whose latest data is the prior Friday's close, where a
+                # 2h window off that timestamp would miss most of the
+                # session's contracts.  When ingestion is live and the
+                # newest row is within the steady-state window, the
+                # narrow lookback already covers the active universe, so
+                # the expensive wide scan is skipped even on cycle 1
+                # (this is what keeps a mid-session restart fast).  The
+                # "consumed" flag flips regardless of outcome so a
+                # slow/failed cold-start can never loop.
                 ts_et = timestamp.astimezone(ET)
                 if ts_et.time() < dt_time(16, 15):
                     min_expiration = ts_et.date() - timedelta(days=1)
                 else:
                     min_expiration = ts_et.date()
-                self._snapshot_cold_start_consumed = True
                 # Hard cap on rows returned.  The previous value of 2000 was
                 # below the contract count for SPX (~7k–14k unique option
                 # symbols during an active session) and was silently
@@ -257,43 +351,73 @@ class AnalyticsEngine:
                 # The new cap is well above any realistic chain size; if
                 # we hit it we log a warning rather than silently dropping.
                 snapshot_row_cap = int(os.getenv("ANALYTICS_SNAPSHOT_MAX_ROWS", "50000"))
-                cursor.execute(
-                    """
-                    SELECT DISTINCT ON (oc.option_symbol)
-                        oc.option_symbol,
-                        oc.strike,
-                        oc.expiration,
-                        oc.option_type,
-                        oc.last,
-                        oc.bid,
-                        oc.ask,
-                        oc.volume,
-                        oc.open_interest,
-                        oc.delta,
-                        oc.gamma,
-                        oc.theta,
-                        oc.vega,
-                        oc.implied_volatility,
-                        oc.timestamp
-                    FROM option_chains oc
-                    WHERE oc.underlying = %s
-                      AND oc.timestamp <= %s
-                      AND oc.timestamp >= %s
-                      AND oc.expiration > %s
-                      AND oc.gamma IS NOT NULL
-                    ORDER BY oc.option_symbol, oc.timestamp DESC
-                    LIMIT %s
-                    """,
-                    (
-                        self.db_symbol,
+
+                data_age = datetime.now(timezone.utc) - timestamp
+                want_cold_start = (
+                    not self._snapshot_cold_start_consumed
+                    and data_age > timedelta(hours=self.snapshot_lookback_hours)
+                )
+                self._snapshot_cold_start_consumed = True
+
+                if want_cold_start:
+                    logger.info(
+                        "Cold-start snapshot: latest data is %.1fh old; using "
+                        "%dh lookback (steady-state %dh) with %dms statement_timeout",
+                        data_age.total_seconds() / 3600.0,
+                        self.snapshot_cold_start_lookback_hours,
+                        self.snapshot_lookback_hours,
+                        self.snapshot_cold_start_statement_timeout_ms,
+                    )
+                    try:
+                        rows = self._run_snapshot_query(
+                            cursor,
+                            timestamp,
+                            self.snapshot_cold_start_lookback_hours,
+                            min_expiration,
+                            snapshot_row_cap,
+                            statement_timeout_ms=self.snapshot_cold_start_statement_timeout_ms,
+                        )
+                        conn.commit()
+                    except Exception as cold_err:
+                        # Most commonly a statement-timeout QueryCanceled
+                        # on a cold buffer pool.  Roll back the aborted
+                        # transaction and immediately retry this SAME
+                        # cycle with the cheap steady-state window so the
+                        # first cycle still produces a (narrower but
+                        # non-empty) result instead of stalling a whole
+                        # interval and emitting a hard error.
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            logger.warning(
+                                "Rollback after cold-start failure also failed",
+                                exc_info=True,
+                            )
+                        logger.warning(
+                            "Cold-start snapshot failed (%s); retrying this "
+                            "cycle with the %dh steady-state lookback",
+                            cold_err.__class__.__name__,
+                            self.snapshot_lookback_hours,
+                            exc_info=True,
+                        )
+                        rows = self._run_snapshot_query(
+                            cursor,
+                            timestamp,
+                            self.snapshot_lookback_hours,
+                            min_expiration,
+                            snapshot_row_cap,
+                        )
+                        conn.commit()
+                else:
+                    rows = self._run_snapshot_query(
+                        cursor,
                         timestamp,
-                        lookback_start,
+                        self.snapshot_lookback_hours,
                         min_expiration,
                         snapshot_row_cap,
-                    ),
-                )
-                rows = cursor.fetchall()
-                conn.commit()
+                    )
+                    conn.commit()
+
                 if len(rows) >= snapshot_row_cap:
                     logger.warning(
                         "Analytics snapshot hit row cap (%d). GEX/max-pain "
@@ -1457,6 +1581,14 @@ class AnalyticsEngine:
         logger.info(f"Underlying: {self.underlying}")
         logger.info(f"Calculation Interval: {self.calculation_interval}s")
         logger.info(f"Risk-free Rate: {self.risk_free_rate:.4f}")
+        if self.off_hours_enabled:
+            logger.info(
+                "Off-hours mode: ENABLED (weekends/holidays keep cycling at "
+                "%ss against the latest available data)",
+                self.off_hours_interval,
+            )
+        else:
+            logger.info("Off-hours mode: DISABLED (paused outside the 24x5 run window)")
         logger.info("=" * 80 + "\n")
 
         self.running = True
@@ -1466,7 +1598,11 @@ class AnalyticsEngine:
 
         try:
             while self.running:
-                if not is_engine_run_window():
+                in_run_window = is_engine_run_window()
+
+                # Outside the 24x5 window with off-hours mode off: sleep
+                # until the next session opens (legacy behavior).
+                if not in_run_window and not self.off_hours_enabled:
                     sleep_for = seconds_until_engine_run_window()
                     logger.info(
                         "AnalyticsEngine [%s] paused outside run window (24x5: weekdays, non-holidays); sleeping %ss",
@@ -1475,6 +1611,24 @@ class AnalyticsEngine:
                     )
                     time.sleep(max(1, sleep_for))
                     continue
+
+                # Off-hours: keep cycling, but at the slower off-hours
+                # interval since the underlying data is static until the
+                # next session.  The snapshot is anchored to the latest
+                # option_chains row (not NOW()), so the cycle recomputes
+                # against the most recent available data (e.g. Friday's
+                # close on a Saturday) rather than reporting nothing.
+                effective_interval = (
+                    self.calculation_interval if in_run_window else self.off_hours_interval
+                )
+                if not in_run_window:
+                    logger.info(
+                        "AnalyticsEngine [%s] off-hours: recomputing against the "
+                        "latest available data (interval=%ss)",
+                        self.underlying,
+                        effective_interval,
+                    )
+
                 cycle_start = time.time()
 
                 # Run calculation
@@ -1487,7 +1641,7 @@ class AnalyticsEngine:
 
                 # Calculate sleep time
                 cycle_duration = time.time() - cycle_start
-                sleep_time = max(0, self.calculation_interval - cycle_duration)
+                sleep_time = max(0, effective_interval - cycle_duration)
 
                 if sleep_time > 0:
                     logger.info(f"Sleeping for {sleep_time:.1f}s until next calculation...\n")
@@ -1510,7 +1664,7 @@ class AnalyticsEngine:
                         "Calculation took %.1fs, longer than interval (%ds). "
                         "Stage timings: %s\n",
                         cycle_duration,
-                        self.calculation_interval,
+                        effective_interval,
                         breakdown_str,
                     )
 
