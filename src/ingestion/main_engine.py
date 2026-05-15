@@ -30,7 +30,12 @@ from src.ingestion.stream_manager import StreamManager
 from src.ingestion.greeks_calculator import GreeksCalculator
 from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
-from src.validation import bucket_timestamp, is_engine_run_window, seconds_until_engine_run_window
+from src.validation import (
+    bucket_timestamp,
+    is_engine_run_window,
+    is_market_hours,
+    seconds_until_engine_run_window,
+)
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.config import (
     AGGREGATION_BUCKET_SECONDS,
@@ -389,10 +394,27 @@ class IngestionEngine:
                     age = 0.0
                 if age > self.greeks_max_underlying_age_seconds:
                     self.greeks_stale_underlying_rejects += 1
-                    if self.greeks_stale_underlying_rejects % 100 == 1:
-                        logger.warning(
+                    # Staleness during (extended) market hours is a real
+                    # problem worth a WARNING — the underlying feed
+                    # should be live.  Outside extended hours the feed
+                    # legitimately stops, so refusing Greeks is expected;
+                    # log at DEBUG and far less often so overnight runs
+                    # don't flood the journal with a known-benign state.
+                    if is_market_hours(option_ts, check_extended=True):
+                        if self.greeks_stale_underlying_rejects % 100 == 1:
+                            logger.warning(
+                                "Refusing Greeks: underlying price is %.0fs stale "
+                                "(threshold %.0fs) during market hours. "
+                                "Total rejects this run: %d",
+                                age,
+                                self.greeks_max_underlying_age_seconds,
+                                self.greeks_stale_underlying_rejects,
+                            )
+                    elif self.greeks_stale_underlying_rejects % 5000 == 1:
+                        logger.debug(
                             "Refusing Greeks: underlying price is %.0fs stale "
-                            "(threshold %.0fs). Total rejects this run: %d",
+                            "(threshold %.0fs); market closed, this is expected. "
+                            "Total rejects this run: %d",
                             age,
                             self.greeks_max_underlying_age_seconds,
                             self.greeks_stale_underlying_rejects,
