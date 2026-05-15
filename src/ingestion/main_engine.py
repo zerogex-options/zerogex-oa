@@ -351,15 +351,23 @@ class IngestionEngine:
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
+                # The stream re-sends the in-progress minute bar repeatedly;
+                # on a reconnect or out-of-order delivery a later partial can
+                # carry a High below / Low above what an earlier partial of
+                # the same minute already reported. _merge_bar only carries
+                # volume forward, not running H/L, so an unconditional
+                # overwrite would regress the stored extremes. Take the
+                # period-correct aggregate in the conflict clause: first-seen
+                # open, max high, min low; close stays last-tick-wins.
                 cursor.execute(
                     """
                     INSERT INTO underlying_quotes
                     (symbol, timestamp, open, high, low, close, up_volume, down_volume)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (symbol, timestamp) DO UPDATE SET
-                        open = EXCLUDED.open,
-                        high = EXCLUDED.high,
-                        low = EXCLUDED.low,
+                        open = COALESCE(underlying_quotes.open, EXCLUDED.open),
+                        high = GREATEST(underlying_quotes.high, EXCLUDED.high),
+                        low = LEAST(underlying_quotes.low, EXCLUDED.low),
                         close = EXCLUDED.close,
                         up_volume = EXCLUDED.up_volume,
                         down_volume = EXCLUDED.down_volume,

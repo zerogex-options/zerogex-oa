@@ -1132,7 +1132,14 @@ class UnifiedSignalEngine:
                                 INSERT INTO signal_events (
                                     underlying, timestamp, signal_name, direction, score,
                                     context_values, close_at_emit
-                                ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s)
+                                )
+                                SELECT %s, %s, %s, %s, %s, %s::jsonb, %s
+                                WHERE NOT EXISTS (
+                                    SELECT 1 FROM signal_events
+                                    WHERE underlying = %s
+                                      AND signal_name = %s
+                                      AND timestamp = %s
+                                )
                                 """,
                                 (
                                     market_context.underlying,
@@ -1146,6 +1153,16 @@ class UnifiedSignalEngine:
                                     result.score,
                                     json.dumps(result.context, default=str),
                                     market_context.close,
+                                    # Idempotency guard: there is no UNIQUE on
+                                    # (underlying, signal_name, timestamp), so a
+                                    # process restart / re-run mid-streak (the
+                                    # in-memory hysteresis only dedups within a
+                                    # single process) would otherwise double-
+                                    # insert the same event and double-count
+                                    # the realized hit-rate.
+                                    market_context.underlying,
+                                    result.name,
+                                    market_context.timestamp,
                                 ),
                             )
                             cur.execute("RELEASE SAVEPOINT sig_event")

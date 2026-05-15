@@ -1059,7 +1059,16 @@ class SignalsQueriesMixin:
                     INSERT INTO signal_action_cards
                         (underlying, timestamp, pattern, action, tier,
                          direction, confidence, payload)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+                    SELECT $1, $2, $3, $4, $5, $6, $7, $8::jsonb
+                    WHERE NOT EXISTS (
+                        -- Idempotency guard (no UNIQUE on the logical key):
+                        -- skip an exact (underlying, pattern, timestamp)
+                        -- duplicate from a restart / overlapping cycle that
+                        -- defeats the dwell-window dedup. asyncpg allows
+                        -- positional-parameter reuse, so no new args.
+                        SELECT 1 FROM signal_action_cards
+                        WHERE underlying = $1 AND pattern = $3 AND timestamp = $2
+                    )
                     """,
                     card.get("underlying"),
                     ts,

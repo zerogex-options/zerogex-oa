@@ -183,7 +183,11 @@ def insert_action_card_sync(conn, card: dict[str, Any]) -> None:
             INSERT INTO signal_action_cards
                 (underlying, timestamp, pattern, action, tier,
                  direction, confidence, payload)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            SELECT %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+            WHERE NOT EXISTS (
+                SELECT 1 FROM signal_action_cards
+                WHERE underlying = %s AND pattern = %s AND timestamp = %s
+            )
             """,
             (
                 underlying,
@@ -194,6 +198,13 @@ def insert_action_card_sync(conn, card: dict[str, Any]) -> None:
                 card.get("direction") or "non_directional",
                 float(card.get("confidence") or 0.0),
                 json.dumps(card, default=str),
+                # Idempotency guard: no UNIQUE on (underlying, pattern,
+                # timestamp); a restart / overlapping cycle re-emitting the
+                # same card defeats the dwell-window dedup, so skip an exact
+                # duplicate rather than insert a second row.
+                underlying,
+                card.get("pattern"),
+                ts,
             ),
         )
         conn.commit()

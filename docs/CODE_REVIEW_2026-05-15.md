@@ -1034,14 +1034,54 @@ dropped, bounded-drops-oldest, and an end-to-end rollover-residual repro
 driving the real `_prepare_option_agg`. Full suite: 875 passed, 1
 skipped; `black` clean; no new `flake8` vs HEAD.
 
+### N7 🔴 Fixed — Underlying OHLC upsert regressed intra-minute high/low
+
+**File:** `src/ingestion/main_engine.py` (`_upsert_underlying_quote`)
+
+Investigated the feed path before touching it. `_merge_bar`
+(`stream_manager.py`) carries forward **volume only** — it does *not*
+maintain a running max-high / min-low. The stream re-sends the
+in-progress minute bar repeatedly; on a reconnect or out-of-order
+delivery a later partial can report a High below / Low above an earlier
+partial of the same minute. The `ON CONFLICT … high = EXCLUDED.high`
+unconditional overwrite then regressed the stored extreme — directly
+wrong for range/volatility/strike-selection logic that reads these bars.
+
+**Fix (conflict-clause only, single writer, NULL-safe):**
+`open = COALESCE(underlying_quotes.open, EXCLUDED.open)` (first-seen),
+`high = GREATEST(…)`, `low = LEAST(…)`; `close = EXCLUDED.close`
+(last-tick-wins, already correct) and volumes unchanged. Safe even if
+TradeStation sends an authoritative final bar — its H/L bound all
+partials, so `GREATEST/LEAST` returns the final values anyway. The
+INSERT column/param contract is unchanged. Pinned by
+`tests/test_idempotent_writes_and_ohlc_merge.py`.
+
+### N8 🔴 Fixed — Duplicate signal_events / signal_action_cards on restart
+
+**Files:** `src/signals/unified_signal_engine.py`,
+`src/signals/playbook/cycle.py`, `src/api/queries/signals.py`
+
+`signal_events` and `signal_action_cards` have no UNIQUE on their
+logical key; the in-memory hysteresis only dedups within one process.
+A restart / overlapping cycle re-emitting the same
+`(underlying, signal_name, timestamp)` / `(underlying, pattern,
+timestamp)` double-inserts — double-counting realized hit-rate and
+double-firing downstream. Rather than add a UNIQUE constraint (a
+deployment-time risk if duplicates already exist), all three writers
+now use an idempotent `INSERT … SELECT … WHERE NOT EXISTS` guard on the
+logical key — **no schema change, no migration/dedup risk**, only an
+exact-duplicate is suppressed. asyncpg path reuses positional params
+($1/$3/$2) so its arg count is unchanged. Pinned by
+`tests/test_idempotent_writes_and_ohlc_merge.py` (sync, async, and the
+real `_persist_advanced_signals` path); the existing
+`test_playbook_cycle_integration.py` still passes (param contract
+preserved). Full suite: **880 passed, 1 skipped**; `black` clean; no
+new `flake8` vs HEAD.
+
 ### Identified, intentionally NOT auto-fixed (need a decision / larger change)
 - **🟡 `option_chains.volume` stores cumulative daily volume**, while
   `ask/mid/bid_volume` are per-bucket deltas. Any consumer reconciling
   them is wrong. Decide: dedicated period-volume column vs. loud doc.
-- **🟡 Underlying OHLC upsert uses `high=EXCLUDED.high` (overwrite)**
-  not `GREATEST/LEAST`. Safe only if TradeStation always sends
-  authoritative final bars; if partials, intra-minute H/L can regress.
-  Confirm feed semantics before changing a shared write path.
 - **🟡 `playbook/backtest.py` resolves on bar *close* only** (no
   OHLC) and lets target win same-bar ties. MAE/MFE understated; bias
   direction ambiguous. Needs OHLC plumbing into `quotes`.
@@ -1049,11 +1089,6 @@ skipped; `black` clean; no new `flake8` vs HEAD.
   tilt for every abstaining component; the tilts share inputs (not
   orthogonal) so several can push the composite the same way →
   over-confident regime labels on sparse data. Design refactor.
-- **🟡 `signal_events` / `signal_action_cards` have no business
-  UNIQUE key** (`(underlying, signal_name, timestamp)` /
-  `(underlying, pattern, timestamp)`); an idempotent engine re-run
-  double-inserts events and double-emits. Needs constraint + writer
-  `ON CONFLICT DO NOTHING` together.
 - **🟡 gamma-flip uses per-strike net-GEX zero crossing**, not the
   cumulative-GEX or recomputed-GEX(S) convention (SpotGamma-style).
   Legitimate simplification but differs from industry; flag for product
