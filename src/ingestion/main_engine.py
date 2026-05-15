@@ -1269,15 +1269,26 @@ class IngestionEngine:
             f"Flushing all buffers... (Underlying: {len(self.underlying_buffer)}, Options: {sum(len(v) for v in self.options_buffer.values())} across {len(self.options_buffer)} symbols)"
         )
 
-        # Flush all options
+        # Flush all options. Derive each symbol's bucket from its latest
+        # buffered tick timestamp (mirroring the buffer-overflow path) so a
+        # timeout/shutdown flush lands volume in the minute it actually
+        # traded — not whatever wall-clock minute the flush happens to fire
+        # in, which would mis-bucket any ticks that haven't crossed a minute
+        # boundary yet.
         current_time = datetime.now(ET)
-        bucket = bucket_timestamp(current_time, AGGREGATION_BUCKET_SECONDS)
 
         options_flushed = 0
         for option_symbol in list(self.options_buffer.keys()):
-            if self.options_buffer[option_symbol]:  # Only flush if buffer has data
-                self._flush_option_bucket(option_symbol, bucket)
-                options_flushed += 1
+            buf = self.options_buffer.get(option_symbol)
+            if not buf:  # Only flush if buffer has data
+                continue
+            last_ts = buf[-1].get("timestamp")
+            sym_bucket = bucket_timestamp(
+                last_ts if last_ts else current_time,
+                AGGREGATION_BUCKET_SECONDS,
+            )
+            self._flush_option_bucket(option_symbol, sym_bucket)
+            options_flushed += 1
 
         logger.info(f"✅ Flushed buffers: {options_flushed} option symbols")
         self.last_flush_time = current_time

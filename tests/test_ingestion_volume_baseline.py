@@ -175,3 +175,32 @@ def test_no_sawtooth_across_buckets_with_stale_baseline():
     # REGRESSION: b2 == true per-minute delta (1130 - 1100 = 30), NOT the
     # stale-baseline-relative 1130 - 100 = 1030 that drove the sawtooth.
     assert _classified(a2) == 30
+
+
+def test_flush_all_buffers_buckets_by_buffered_timestamp_not_wallclock():
+    """The timeout/shutdown safety flush must attribute volume to the
+    minute the ticks actually traded, not the wall-clock minute the flush
+    fires in (mirrors the buffer-overflow path)."""
+    e = _agg_engine()
+    e.underlying_buffer = []
+    e.last_flush_time = datetime.now(ET)
+    written: list = []
+    e._write_option_rows = lambda rows: written.extend(rows)  # no DB
+
+    # Buffered ticks traded at 10:15 ET; the flush "fires" whenever the
+    # test runs (definitely not 2026-05-15 10:15 ET).
+    ts_a = ET.localize(datetime(2026, 5, 15, 10, 15, 10))
+    ts_b = ET.localize(datetime(2026, 5, 15, 10, 15, 50))
+    minute_1015 = bucket_timestamp(ts_a, 60)
+    seed = _snap(SYM, ts_a, volume=1000)
+    seed[_SEED_FLAG] = True  # carried seed from a prior flush
+    e.options_buffer[SYM] = [seed, _snap(SYM, ts_b, volume=1080)]
+
+    e._flush_all_buffers()
+
+    assert len(written) == 1
+    agg = written[0]
+    # Bucketed to the minute the ticks traded, NOT datetime.now().
+    assert agg["timestamp"] == minute_1015
+    # Multi-snapshot: 1080 - 1000 = 80 classified for that minute.
+    assert _classified(agg) == 80
