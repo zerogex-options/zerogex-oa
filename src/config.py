@@ -186,6 +186,25 @@ STRIKE_CLEANUP_INTERVAL = int(os.getenv("STRIKE_CLEANUP_INTERVAL", "100"))  # it
 SESSION_TEMPLATE = os.getenv("SESSION_TEMPLATE", "Default")
 TS_STREAM_READ_TIMEOUT = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
 TS_STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").lower() == "true"
+
+# Underlying-stream data-staleness watchdog. The TradeStation bar stream
+# can stay socket-alive (heartbeats flowing) while delivering zero bars —
+# a "connected but data-starved" gap that the socket read timeout and the
+# thread-liveness check both structurally miss. When no underlying bar has
+# arrived for this many seconds during (extended) market hours, the
+# supervisor force-reconnects the underlying accumulator (only — the
+# options stream is left untouched). Cooldown prevents thrash; after the
+# max consecutive ineffective reconnects it is treated as an upstream
+# outage (ERROR, backed-off) rather than restarted in a tight loop.
+UNDERLYING_STREAM_STALE_RESTART_SECONDS = int(
+    os.getenv("UNDERLYING_STREAM_STALE_RESTART_SECONDS", "120")
+)
+UNDERLYING_STREAM_RESTART_COOLDOWN_SECONDS = int(
+    os.getenv("UNDERLYING_STREAM_RESTART_COOLDOWN_SECONDS", "90")
+)
+UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS = int(
+    os.getenv("UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS", "5")
+)
 TS_STREAM_REUSE_QUOTES = os.getenv("TS_STREAM_REUSE_QUOTES", "false").lower() == "true"
 TS_WARN_MARKET_HOURS = os.getenv("TS_WARN_MARKET_HOURS", "true").lower() != "false"
 OPTION_OI_COVERAGE_ALERT_THRESHOLD = float(os.getenv("OPTION_OI_COVERAGE_ALERT_THRESHOLD", "0.35"))

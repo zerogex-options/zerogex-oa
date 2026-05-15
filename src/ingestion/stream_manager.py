@@ -44,6 +44,9 @@ from src.config import (
     STRIKE_CLEANUP_INTERVAL,
     SESSION_TEMPLATE,
     API_REQUEST_TIMEOUT,
+    UNDERLYING_STREAM_STALE_RESTART_SECONDS,
+    UNDERLYING_STREAM_RESTART_COOLDOWN_SECONDS,
+    UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS,
 )
 
 logger = get_logger(__name__)
@@ -1114,6 +1117,27 @@ class StreamManager:
         self._accumulator.start(seed_from_rest=seed_option_rest)
         self._underlying_accumulator.start()
 
+    def _restart_underlying_accumulator(self, reason: str):
+        """Tear down and recreate ONLY the underlying bar stream.
+
+        Used to recover from a stalled underlying feed (dead thread, or
+        socket-alive-but-data-starved) without disturbing the healthy
+        options stream — restarting that would force an expensive REST
+        re-seed and gap option ingestion for no reason. Cheap: the
+        accumulator is just a reader thread, no REST seed.
+        """
+        logger.error("Restarting underlying bar stream: %s", reason)
+        if self._underlying_accumulator is not None:
+            self._underlying_accumulator.stop()
+        self._underlying_accumulator = UnderlyingBarAccumulator(
+            client=self.client,
+            symbol=self.underlying,
+            db_symbol=self.db_underlying,
+            session_template=SESSION_TEMPLATE,
+            wakeup=self._wakeup,
+        )
+        self._underlying_accumulator.start()
+
     def _yield_option_snapshot(self, state: Dict[str, Dict[str, Any]]):
         """
         Convert raw accumulator state into yielded option data dicts.
@@ -1222,10 +1246,18 @@ class StreamManager:
         _total_underlying_yields = 0
         _total_empty_cycles = 0
         _last_metrics_time = time.monotonic()
-        # Stale stream detection: consecutive cycles with no underlying data.
+        # Underlying-stream staleness watchdog. Measured in wall-clock
+        # seconds since the last bar (drain-count proxies are coupled to
+        # loop wake cadence — options wake the loop sub-second — so they
+        # don't track real time). `None` until the first bar arrives so a
+        # slow feed open isn't mistaken for a stall.
         _consecutive_empty_underlying = 0
         _STALE_UNDERLYING_THRESHOLD = 10  # warn after this many empty drains
         _last_bar_updates = 0  # track updates_received delta
+        _last_underlying_bar_mono: Optional[float] = None
+        _last_forced_restart_mono = 0.0
+        _underlying_restart_attempts = 0
+        _underlying_restart_backed_off = False
 
         try:
             while True:
@@ -1272,11 +1304,12 @@ class StreamManager:
 
                 try:
                     # --- underlying stream health checks ---
+                    # Dead reader thread: recover the underlying stream
+                    # only. The options stream is independent and may be
+                    # healthy; restarting it would force an expensive REST
+                    # re-seed and gap option ingestion for no reason.
                     if not self._underlying_accumulator.is_alive:
-                        logger.error(
-                            "Underlying bar stream thread is DEAD — " "restarting accumulators"
-                        )
-                        self._start_accumulators()
+                        self._restart_underlying_accumulator("reader thread is DEAD")
 
                     # Drain underlying bar from persistent stream.
                     underlying_data = self._underlying_accumulator.drain()
@@ -1284,27 +1317,93 @@ class StreamManager:
                         self.current_price = underlying_data["close"]
                         yield {"type": "underlying", "data": underlying_data}
                         _total_underlying_yields += 1
+                        if _consecutive_empty_underlying >= _STALE_UNDERLYING_THRESHOLD:
+                            logger.info(
+                                "Underlying bar stream RECOVERED after %.0fs / " "%d empty drains",
+                                (
+                                    time.monotonic() - _last_underlying_bar_mono
+                                    if _last_underlying_bar_mono is not None
+                                    else 0.0
+                                ),
+                                _consecutive_empty_underlying,
+                            )
                         _consecutive_empty_underlying = 0
-                    elif session == "regular":
+                        _last_underlying_bar_mono = time.monotonic()
+                        _underlying_restart_attempts = 0
+                        _underlying_restart_backed_off = False
+                    elif session in ("regular", "pre-market", "after-hours"):
+                        # No bar this cycle while the feed should be live
+                        # (the Greeks freshness check is likewise extended-
+                        # hours-aware). Measure staleness in wall-clock
+                        # seconds: drain counts are coupled to loop wake
+                        # cadence (options wake the loop sub-second) and do
+                        # not measure elapsed time.
                         _consecutive_empty_underlying += 1
+                        if _last_underlying_bar_mono is None:
+                            # Feed hasn't produced its first bar yet (slow
+                            # open). Don't count warm-up as a stall — arm
+                            # the clock from the first expectant cycle.
+                            _last_underlying_bar_mono = time.monotonic()
+                        stale_seconds = time.monotonic() - _last_underlying_bar_mono
+
                         if _consecutive_empty_underlying == _STALE_UNDERLYING_THRESHOLD:
                             cur_updates = self._underlying_accumulator.updates_received
                             logger.warning(
                                 "Underlying bar stream appears STALE: "
-                                "%d consecutive empty drains, "
+                                "%.0fs without a bar, %d empty drains, "
                                 "bar_stream_updates=%d (delta=%d), "
                                 "thread_alive=%s",
+                                stale_seconds,
                                 _consecutive_empty_underlying,
                                 cur_updates,
                                 cur_updates - _last_bar_updates,
                                 self._underlying_accumulator.is_alive,
                             )
+
+                        # Active recovery. A socket-alive-but-data-starved
+                        # feed never trips the socket read timeout or the
+                        # dead-thread check, so force a reconnect once it
+                        # has been stale long enough — rate-limited by a
+                        # cooldown, then escalated to a backed-off
+                        # upstream-outage state rather than tight-looping.
+                        now_mono = time.monotonic()
+                        if (
+                            stale_seconds >= UNDERLYING_STREAM_STALE_RESTART_SECONDS
+                            and not _underlying_restart_backed_off
+                            and now_mono - _last_forced_restart_mono
+                            >= UNDERLYING_STREAM_RESTART_COOLDOWN_SECONDS
+                        ):
+                            _underlying_restart_attempts += 1
+                            if (
+                                _underlying_restart_attempts
+                                > UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS
+                            ):
+                                _underlying_restart_backed_off = True
+                                logger.error(
+                                    "Underlying bar stream still dead after %d "
+                                    "forced reconnects (%.0fs stale) — treating "
+                                    "as an upstream TradeStation outage. Options "
+                                    "ingestion is unaffected; reconnecting "
+                                    "resumes automatically once a bar arrives.",
+                                    _underlying_restart_attempts - 1,
+                                    stale_seconds,
+                                )
+                            else:
+                                self._restart_underlying_accumulator(
+                                    f"data-starved {stale_seconds:.0f}s during "
+                                    f"{session} (attempt "
+                                    f"{_underlying_restart_attempts}/"
+                                    f"{UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS})"
+                                )
+                                _last_forced_restart_mono = now_mono
                         elif (
                             _consecutive_empty_underlying > _STALE_UNDERLYING_THRESHOLD
                             and _consecutive_empty_underlying % 50 == 0
                         ):
                             logger.warning(
-                                "Underlying bar stream still stale: " "%d consecutive empty drains",
+                                "Underlying bar stream still stale: "
+                                "%.0fs without a bar (%d empty drains)",
+                                stale_seconds,
                                 _consecutive_empty_underlying,
                             )
                     else:
