@@ -53,6 +53,14 @@ logger = get_logger(__name__)
 # Eastern Time timezone
 ET = pytz.timezone("US/Eastern")
 
+# Marks a buffered snapshot whose cumulative volume has already been
+# classified and persisted for its bucket (a retained / carried-over seed).
+# When such a snapshot is the *only* element in a buffer at flush time it
+# must NOT have its volume re-derived from the baseline: the accumulating
+# upsert (``ask_volume = option_chains.ask_volume + EXCLUDED.ask_volume``)
+# would add it a second time. See _prepare_option_agg.
+_SEED_FLAG = "_seed_classified"
+
 
 def _compute_db_backoff_seconds(consecutive_failures: int) -> float:
     """Exponential backoff in seconds with 0–10% jitter.
@@ -523,7 +531,13 @@ class IngestionEngine:
                         )
                         if agg:
                             rows_to_write.append(agg)
-                        # Seed the new bucket with the previous snapshot for volume delta.
+                        # Seed the new bucket with the previous snapshot for
+                        # volume delta. Tag it: its cumulative volume was
+                        # already classified in prev_bucket's flushes, so if
+                        # it ends up the lone buffered snapshot it must not be
+                        # re-counted (multi-snapshot still uses it only as the
+                        # prior for the first real delta, which is correct).
+                        prev_snapshot[_SEED_FLAG] = True
                         self.options_buffer[option_symbol] = [prev_snapshot]
 
             self.options_buffer[option_symbol].append(data)
@@ -704,6 +718,31 @@ class IngestionEngine:
             return False
         return local.hour == 9 and local.minute == 30
 
+    @staticmethod
+    def _baseline_session_date(bucket: datetime):
+        """ET session date for ``bucket`` (a tz-naive bucket is treated as UTC).
+
+        TradeStation resets option cumulative volume to 0 at session open,
+        so the baseline cache is scoped per ET session date.
+        """
+        if bucket.tzinfo is None:
+            bucket_et = pytz.UTC.localize(bucket).astimezone(ET)
+        else:
+            bucket_et = bucket.astimezone(ET)
+        return bucket_et.date()
+
+    def _baseline_cache_key(self, option_symbol: str, bucket: datetime) -> tuple:
+        """Key for the per-contract volume-baseline cache.
+
+        MUST be used by both the read path (``_get_option_volume_baseline``)
+        and the optimistic advance written in ``_prepare_option_agg``. A
+        divergence here (the advance previously used a bare ``option_symbol``
+        string while the reader used this tuple) made the advance a silent
+        no-op, leaving the TTL as the only refresh path and producing a
+        ~30-minute volume sawtooth in option_chains.ask/mid/bid_volume.
+        """
+        return (option_symbol, self._baseline_session_date(bucket))
+
     def _get_option_volume_baseline(self, option_symbol: str, bucket: datetime) -> int:
         """Get latest persisted cumulative volume before current bucket for a contract.
 
@@ -723,15 +762,11 @@ class IngestionEngine:
         now = _time.monotonic()
         # Derive the ET session date for the bucket so we can scope both
         # the cache and the DB lookup to today's session.
-        if bucket.tzinfo is None:
-            bucket_et = pytz.UTC.localize(bucket).astimezone(ET)
-        else:
-            bucket_et = bucket.astimezone(ET)
-        session_date = bucket_et.date()
+        session_date = self._baseline_session_date(bucket)
         session_start_et = ET.localize(datetime.combine(session_date, dt_time(0, 0)))
         session_start_utc = session_start_et.astimezone(timezone.utc)
 
-        cache_key = (option_symbol, session_date)
+        cache_key = self._baseline_cache_key(option_symbol, bucket)
         with self._option_volume_baseline_lock:
             cached = self._option_volume_baseline.get(cache_key)
         if cached is not None:
@@ -843,24 +878,41 @@ class IngestionEngine:
             )
             if len(buffer) == 1:
                 curr = buffer[0]
-                curr_vol = curr.get("volume") or 0
-                baseline = self._get_option_volume_baseline(option_symbol, bucket)
-                vol_delta = max(curr_vol - baseline, 0)
-                if vol_delta > 0:
-                    if skip_classification:
-                        mid_volume += vol_delta
-                    else:
-                        prior = self._get_cached_last_quote(option_symbol)
-                        av, mv, bv = self._classify_volume_chunk(
-                            vol_delta,
-                            curr.get("last"),
-                            (prior or curr).get("bid"),
-                            (prior or curr).get("ask"),
-                            (prior or curr).get("mid"),
-                        )
-                        ask_volume += av
-                        mid_volume += mv
-                        bid_volume += bv
+                if curr.get(_SEED_FLAG):
+                    # The lone snapshot is a seed carried over from a prior
+                    # flush — its cumulative volume was already classified and
+                    # persisted for its own bucket. Re-deriving a delta from
+                    # the baseline here and letting the accumulating upsert
+                    # (ask_volume = option_chains.ask_volume +
+                    # EXCLUDED.ask_volume) add it again double-counts the
+                    # bucket, and with a TTL-stale baseline inflated it into a
+                    # ~30-minute sawtooth. Contribute zero volume; the quote /
+                    # Greek fields below still refresh.
+                    pass
+                else:
+                    # Genuine first observation for this contract in the
+                    # buffer: there is no prior snapshot to diff against, so
+                    # fall back to the last persisted cumulative volume. Fix
+                    # (a) (the correctly-keyed optimistic advance) keeps this
+                    # baseline fresh instead of up to one TTL stale.
+                    curr_vol = curr.get("volume") or 0
+                    baseline = self._get_option_volume_baseline(option_symbol, bucket)
+                    vol_delta = max(curr_vol - baseline, 0)
+                    if vol_delta > 0:
+                        if skip_classification:
+                            mid_volume += vol_delta
+                        else:
+                            prior = self._get_cached_last_quote(option_symbol)
+                            av, mv, bv = self._classify_volume_chunk(
+                                vol_delta,
+                                curr.get("last"),
+                                (prior or curr).get("bid"),
+                                (prior or curr).get("ask"),
+                                (prior or curr).get("mid"),
+                            )
+                            ask_volume += av
+                            mid_volume += mv
+                            bid_volume += bv
             else:
                 for i in range(1, len(buffer)):
                     prev_snap = buffer[i - 1]
@@ -920,9 +972,15 @@ class IngestionEngine:
 
             self._log_parity_signature("option_chains", agg)
 
-            # Update volume baseline cache with the freshly-aggregated value.
+            # Advance the volume-baseline cache to what we just aggregated so
+            # the *next* bucket's first snapshot deltas against this value
+            # rather than one that can be up to
+            # OPTION_VOLUME_BASELINE_TTL_SECONDS (default 1800s = 30 min)
+            # stale. This MUST use the same key the read path uses — keying
+            # it by a bare option_symbol string was a silent no-op that left
+            # the TTL as the only refresh and produced a ~30-minute sawtooth.
             with self._option_volume_baseline_lock:
-                self._option_volume_baseline[option_symbol] = (
+                self._option_volume_baseline[self._baseline_cache_key(option_symbol, bucket)] = (
                     int(agg["volume"] or 0),
                     _time.monotonic(),
                 )
@@ -934,7 +992,13 @@ class IngestionEngine:
 
             # Trim buffer.
             if keep_last_snapshot and buffer:
-                self.options_buffer[option_symbol] = [buffer[-1]]
+                # The retained snapshot becomes the seed for the next flush.
+                # Tag it so that, if it is later the lone buffered snapshot,
+                # its already-classified volume is not re-derived and
+                # re-accumulated by the upsert.
+                seed = buffer[-1]
+                seed[_SEED_FLAG] = True
+                self.options_buffer[option_symbol] = [seed]
             else:
                 self.options_buffer[option_symbol] = []
                 stale_keys = [
