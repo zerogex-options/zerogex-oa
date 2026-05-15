@@ -18,7 +18,9 @@ window of gex_by_strike again.
 """
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
+from unittest.mock import patch
 
 from src.api.database import DatabaseManager
 
@@ -88,7 +90,13 @@ def test_heatmap_keeps_strike_band_and_single_latest_quote_cte():
     sql = conn.queries[0]
 
     assert "latest_quote AS" in sql
-    assert "ABS(g.strike - (SELECT spot_close FROM latest_quote)) <= 50" in sql
+    # Strike band is proportional to spot for every underlying (the old
+    # fixed ±50 absolute band is gone).
+    assert (
+        "ABS(g.strike - (SELECT spot_close FROM latest_quote)) "
+        "<= (SELECT spot_close FROM latest_quote) * 0.08" in sql
+    )
+    assert "<= 50" not in sql
     # Newest-first, strike ascending — the documented row order.
     assert "ORDER BY br.bucket_ts DESC, g.strike ASC" in sql
 
@@ -176,26 +184,48 @@ def test_cash_index_heatmap_restricts_to_regular_session():
     assert isinstance(captured["args"][2], list)
 
 
-def test_etf_keeps_fixed_strike_band():
-    """The historical fixed ±50 band must stay byte-for-byte for ETFs so
-    SPY/QQQ rendering is unaffected."""
-    sql = _run_and_capture("SPY")["query"]
-    assert "ABS(g.strike - (SELECT spot_close FROM latest_quote)) <= 50" in sql
-    # No proportional band leaked onto the ETF path.
+def test_strike_band_is_proportional_for_every_underlying():
+    """A fixed ±50 was ≈±8.5% of SPY but only ≈±0.7% of a ~$7400 index,
+    collapsing the index heatmap into a thin strip inside the frontend's
+    price-cropped y-axis. Strikes are now scoped proportionally to spot
+    for ETFs and cash indices alike — no bare fixed-50 band anywhere."""
+    for sym in ("SPY", "QQQ", "SPX", "NDX", "AAPL"):
+        sql = _run_and_capture(sym)["query"]
+        assert (
+            "ABS(g.strike - (SELECT spot_close FROM latest_quote)) "
+            "<= (SELECT spot_close FROM latest_quote) * 0.08" in sql
+        ), sym
+        assert "<= 50" not in sql, sym
+
+
+def test_strike_band_pct_config_default_and_bounds():
+    """GEX_HEATMAP_STRIKE_BAND_PCT defaults to 0.08 and is clamped to
+    [0.005, 0.5] so a misconfigured env var can't return zero strikes or
+    scan the whole chain."""
+    from src.config import _getenv_float
+
+    def band(env):
+        with patch.dict(os.environ, env, clear=False):
+            return _getenv_float("GEX_HEATMAP_STRIKE_BAND_PCT", 0.08, min=0.005, max=0.5)
+
+    assert band({}) == 0.08
+    assert band({"GEX_HEATMAP_STRIKE_BAND_PCT": "0.03"}) == 0.03
+    assert band({"GEX_HEATMAP_STRIKE_BAND_PCT": "0"}) == 0.005  # clamped up
+    assert band({"GEX_HEATMAP_STRIKE_BAND_PCT": "9"}) == 0.5  # clamped down
+
+
+def test_strike_band_pct_is_config_driven():
+    """The band fraction comes from GEX_HEATMAP_STRIKE_BAND_PCT (bounded
+    in config), not a hard-coded literal — overriding the instance
+    attribute changes the rendered predicate."""
+    db = DatabaseManager()
+    db._gex_heatmap_strike_band_pct = 0.05
+    conn = _RecordingConn(fetch_rows=[])
+    _install_conn(db, conn)
+    asyncio.run(db.get_gex_heatmap("SPY", "5min", 60))
+    sql = conn.queries[0]
+    assert "(SELECT spot_close FROM latest_quote) * 0.05" in sql
     assert "* 0.08" not in sql
-
-
-def test_cash_index_uses_proportional_strike_band():
-    """A fixed ±50 is only ≈±0.7% of a ~$7400 index, collapsing the
-    heatmap into a thin band inside the frontend's price-cropped y-axis.
-    Cash indices must scope strikes proportionally to spot instead."""
-    sql = _run_and_capture("SPX")["query"]
-    assert (
-        "ABS(g.strike - (SELECT spot_close FROM latest_quote)) "
-        "<= (SELECT spot_close FROM latest_quote) * 0.08" in sql
-    )
-    # The bare fixed-50 predicate must be gone on the index path.
-    assert "<= 50" not in sql
 
 
 def test_cash_index_detection_is_case_insensitive():

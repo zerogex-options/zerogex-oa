@@ -18,6 +18,7 @@ import json
 
 from src.api.queries.signals import SignalsQueriesMixin
 from src.api.queries.technicals import TechnicalsQueriesMixin
+from src.config import GEX_HEATMAP_STRIKE_BAND_PCT
 from src.flow_series_sql import FLOW_SERIES_CTE_ASYNCPG, SNAPSHOT_SELECT_ASYNCPG
 from src.market_calendar import NYSE_HOLIDAYS
 from src.symbols import is_cash_index
@@ -208,6 +209,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._analytics_cache_ttl_seconds: float = float(
             os.getenv("ANALYTICS_CACHE_TTL_SECONDS", "5.0")
         )
+        # Fraction of spot used as the /api/gex/heatmap strike half-band
+        # (validated + bounded in config). Proportional so the heatmap
+        # fills the frontend's price-cropped y-axis for any underlying.
+        self._gex_heatmap_strike_band_pct: float = GEX_HEATMAP_STRIKE_BAND_PCT
         # Flow endpoints are frequently polled by the frontend. A short TTL
         # dramatically cuts repeated heavy reads while keeping intraday charts
         # effectively real-time.
@@ -2502,16 +2507,6 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # original query and params unchanged.
         session_filter = ""
         params: list = [symbol, window_units]
-        # Strike band around spot. ETFs/equities keep the historical fixed
-        # ±50 (≈±8.5% of a ~$585 SPY — comfortably wider than the
-        # frontend's price-cropped y-axis, so the heatmap fills the chart).
-        # For a cash index that same ±50 is only ≈±0.7% of a ~$7400 level,
-        # so the colored surface collapsed into a thin band far inside the
-        # frontend's ±2%-of-price y-axis (which the zoom-out control widens
-        # up to ±8%). Use a proportional band for cash indices so the
-        # surface fills the cropped view at every zoom level, exactly as
-        # the fixed ±50 already does for ETFs.
-        strike_band = "50"
         if is_cash_index(symbol):
             session_filter = """
                     AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
@@ -2520,10 +2515,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     AND (timestamp AT TIME ZONE 'America/New_York')::date <> ALL($3::date[])
             """
             params.append(sorted(NYSE_HOLIDAYS))
-            # 0.08 == the frontend's max y-axis margin (0.02 base × 4.0
-            # max zoom-out), so the returned strikes always span the
-            # widest view the chart can show.
-            strike_band = "(SELECT spot_close FROM latest_quote) * 0.08"
+        # Strike half-band around spot, proportional for every underlying
+        # so the colored surface fills the frontend's price-cropped y-axis
+        # at any price level. A fixed ±50 was ≈±8.5% of a ~$585 SPY but
+        # only ≈±0.7% of a ~$7400 index, which collapsed the index heatmap
+        # into a thin strip. band_pct is a config-validated float bounded
+        # to [0.005, 0.5] (GEX_HEATMAP_STRIKE_BAND_PCT) and formatted as a
+        # plain decimal literal — no user input — so it is safe to
+        # interpolate alongside the other validated fragments below.
+        band_pct = self._gex_heatmap_strike_band_pct
+        strike_band = f"(SELECT spot_close FROM latest_quote) * {band_pct:g}"
         # `bucket` and `step_interval` are validated allowlist literals.
         #
         # Perf: a true per-bucket AVG over raw gex_by_strike requires
