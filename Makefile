@@ -46,8 +46,10 @@ SIGNALS_SERVICE = zerogex-oa-signals
 SERVICES_START_ORDER = $(INGESTION_SERVICE) $(ANALYTICS_SERVICE) $(SIGNALS_SERVICE) $(API_SERVICE)
 SERVICES_STOP_ORDER  = $(API_SERVICE) $(SIGNALS_SERVICE) $(ANALYTICS_SERVICE) $(INGESTION_SERVICE)
 
-# Seconds to wait before scanning logs in `make services-watch` (override: WAIT=120)
-WAIT ?= 60
+# Window + level for `make services-check` (override: SINCE="2 hours ago" LEVEL=errors)
+# SINCE accepts any journalctl --since value; LEVEL ∈ {errors, warnings, both}.
+SINCE ?= 1 hour ago
+LEVEL ?= both
 
 # Optional filter for db-tail targets (e.g. make db-tail-option-chains UNDERLYING=SPY)
 UNDERLYING ?=
@@ -573,8 +575,8 @@ help: ## Show this help message
 	@echo "  make services-restart   - Restart all (stop reverse, then start in order)"
 	@echo "  make services-status    - One-line active/inactive status for all 4"
 	@echo "  make services-health    - Full health check for all 4 services"
-	@echo "  make services-watch [WAIT=<s>] - Wait WAIT secs (default 60), then report"
-	@echo "                            any warnings/errors for all 4 (exit 1 if errors)"
+	@echo "  make services-check [SINCE=\"1 hour ago\"] [LEVEL=errors|warnings|both]"
+	@echo "                            - Scan all 4 logs since a past time (exit 1 if errors)"
 	@echo ""
 	@echo "$(GREEN)API Server:$(NC)"
 	@echo "  make api-dev             - Run API in development mode (hot reload)"
@@ -994,36 +996,48 @@ services-health: ## Full health check (status, uptime, memory, errors, warnings)
 	@echo ""
 	@$(MAKE) --no-print-directory api-health
 
-.PHONY: services-watch
-services-watch: ## Wait WAIT secs (default 60), then report any WARNING/ERROR for all 4 services since the wait began (exit 1 if errors)
-	@SINCE="$$(date '+%Y-%m-%d %H:%M:%S')"; \
-	echo "$(BLUE)=== Watching all services for $(WAIT)s ===$(NC)"; \
-	echo "Window start: $$SINCE  (override delay with WAIT=<seconds>)"; \
-	sleep $(WAIT); \
+.PHONY: services-check
+services-check: ## Scan all 4 services for warnings/errors since a time. SINCE="1 hour ago" LEVEL=errors|warnings|both
+	@case "$(LEVEL)" in \
+		err|error|errors)        want_err=1; want_warn=0; lbl="errors";; \
+		warn|warning|warnings)   want_err=0; want_warn=1; lbl="warnings";; \
+		both|all)                want_err=1; want_warn=1; lbl="errors + warnings";; \
+		*) echo "$(RED)Invalid LEVEL='$(LEVEL)' — use errors | warnings | both$(NC)"; exit 2;; \
+	esac; \
+	echo "$(BLUE)=== Scanning all services for $$lbl since '$(SINCE)' ===$(NC)"; \
 	echo ""; \
 	rc=0; \
 	for svc in $(SERVICES_START_ORDER); do \
 		echo "$(BLUE)--- $$svc ---$(NC)"; \
-		ERR="$$(sudo journalctl -u $$svc --since "$$SINCE" --no-pager 2>/dev/null | grep ' - ERROR - ' || true)"; \
-		WARN="$$(sudo journalctl -u $$svc --since "$$SINCE" --no-pager 2>/dev/null | grep ' - WARNING - ' || true)"; \
-		if [ -n "$$ERR" ]; then \
-			EC="$$(printf '%s\n' "$$ERR" | grep -c . || true)"; \
-			echo "$(RED)Errors ($$EC):$(NC)"; echo "$$ERR"; rc=1; \
-		else \
-			echo "$(GREEN)No errors$(NC)"; \
+		LOG="$$(sudo journalctl -u $$svc --since "$(SINCE)" --no-pager 2>/dev/null)"; \
+		if [ "$$want_err" -eq 1 ]; then \
+			ERR="$$(printf '%s\n' "$$LOG" | grep ' - ERROR - ' || true)"; \
+			if [ -n "$$ERR" ]; then \
+				EC="$$(printf '%s\n' "$$ERR" | grep -c . || true)"; \
+				echo "$(RED)Errors ($$EC):$(NC)"; echo "$$ERR"; rc=1; \
+			else \
+				echo "$(GREEN)No errors$(NC)"; \
+			fi; \
 		fi; \
-		if [ -n "$$WARN" ]; then \
-			WC="$$(printf '%s\n' "$$WARN" | grep -c . || true)"; \
-			echo "$(YELLOW)Warnings ($$WC):$(NC)"; echo "$$WARN"; \
-		else \
-			echo "$(GREEN)No warnings$(NC)"; \
+		if [ "$$want_warn" -eq 1 ]; then \
+			WARN="$$(printf '%s\n' "$$LOG" | grep ' - WARNING - ' || true)"; \
+			if [ -n "$$WARN" ]; then \
+				WC="$$(printf '%s\n' "$$WARN" | grep -c . || true)"; \
+				echo "$(YELLOW)Warnings ($$WC):$(NC)"; echo "$$WARN"; \
+			else \
+				echo "$(GREEN)No warnings$(NC)"; \
+			fi; \
 		fi; \
 		echo ""; \
 	done; \
-	if [ $$rc -ne 0 ]; then \
-		echo "$(RED)❌ Errors detected in the watch window$(NC)"; \
+	if [ "$$want_err" -eq 1 ]; then \
+		if [ $$rc -ne 0 ]; then \
+			echo "$(RED)❌ Errors found since '$(SINCE)'$(NC)"; \
+		else \
+			echo "$(GREEN)✅ No errors since '$(SINCE)'$(NC)"; \
+		fi; \
 	else \
-		echo "$(GREEN)✅ No errors in the watch window$(NC)"; \
+		echo "$(BLUE)ℹ️  Warning-only scan complete (since '$(SINCE)')$(NC)"; \
 	fi; \
 	exit $$rc
 
