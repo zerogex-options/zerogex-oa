@@ -495,6 +495,31 @@ flow-index-prune: ## Drop idx_flow_by_contract_symbol_ts_strike (~55 MB; planner
 		echo "$(GREEN)✓ Index dropped. Run 'make flow-explain' to confirm planner fallback.$(NC)"; \
 	fi
 
+.PHONY: flow-series-drop-covering-index
+flow-series-drop-covering-index: ## Drop idx_flow_by_contract_symbol_ts_series_covering (~200 MB) — ONLY after the snapshot gate. Pass CONFIRM=yes.
+	@echo "$(BLUE)=== Decommission idx_flow_by_contract_symbol_ts_series_covering ===$(NC)"
+	@echo "$(YELLOW)Superseded by flow_series_5min: unfiltered /api/flow/series no$(NC)"
+	@echo "$(YELLOW)longer scans flow_by_contract; filtered reads use the pkey +$(NC)"
+	@echo "$(YELLOW)idx_flow_by_contract_symbol_ts{,_exp,_type}. Reclaims ~200 MB.$(NC)"
+	@echo "$(YELLOW)"
+	@echo "$(YELLOW)GATE — confirm ALL before CONFIRM=yes:$(NC)"
+	@echo "$(YELLOW)  1. FLOW_SERIES_USE_SNAPSHOT=true for >=2-3 live sessions$(NC)"
+	@echo "$(YELLOW)  2. No 'flow_series_5min shortfall' warnings in API logs$(NC)"
+	@echo "$(YELLOW)  3. analytics 'flow_series_snapshot' stage timing steady (~100ms)$(NC)"
+	@echo "$(YELLOW)  4. pg_stat_user_indexes idx_scan for this index flat/near-zero$(NC)"
+	@echo "$(YELLOW)     since the flip (proves nothing depends on it):$(NC)"
+	@echo "$(YELLOW)     SELECT indexrelname, idx_scan FROM pg_stat_user_indexes$(NC)"
+	@echo "$(YELLOW)     WHERE indexrelname='idx_flow_by_contract_symbol_ts_series_covering';$(NC)"
+	@if [ "$${CONFIRM}" != "yes" ]; then \
+		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes once the gate is met.$(NC)"; \
+	else \
+		printf "%s\n" \
+			"DROP INDEX CONCURRENTLY IF EXISTS idx_flow_by_contract_symbol_ts_series_covering;" \
+			| $(PSQL) -v ON_ERROR_STOP=1; \
+		echo "$(GREEN)✓ Covering index dropped. schema.sql no longer creates it, so$(NC)"; \
+		echo "$(GREEN)  'make schema-apply' will not resurrect it.$(NC)"; \
+	fi
+
 .PHONY: help
 help: ## Show this help message
 	@echo "=========================================="
@@ -693,6 +718,7 @@ help: ## Show this help message
 	@echo "  make db-diagnostics               - DB diagnostics (sessions, locks, waits, slow queries)"
 	@echo "  make flow-explain                 - EXPLAIN ANALYZE flow_by_contract queries (FLOW_SYMBOL=SPY)"
 	@echo "  make flow-index-prune             - Drop idx_flow_by_contract_symbol_ts_strike (CONFIRM=yes)"
+	@echo "  make flow-series-drop-covering-index - Drop the series covering index post-snapshot (CONFIRM=yes)"
 	@echo ""
 	@echo "$(GREEN)Maintenance:$(NC)"
 	@echo "  make vacuum             - Vacuum analyze all tables"

@@ -493,25 +493,23 @@ CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts_exp
     ON flow_by_contract(symbol, timestamp DESC, expiration);
 CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts_type
     ON flow_by_contract(symbol, timestamp DESC, option_type);
--- Covering index for /api/flow/series. Carries the columns the
--- filtered CTE selects so the planner can satisfy
--- "WHERE symbol = $1 AND timestamp BETWEEN $2 AND $3" as an
--- index-only scan and skip the ~3,000 heap-page bitmap-heap-scan that
--- dominates execution time on a cache miss (see database.py
--- get_flow_series, the `filtered` CTE).
+-- DECOMMISSIONED: idx_flow_by_contract_symbol_ts_series_covering.
 --
--- TODO(flow-series-snapshot): NOT dropped in this PR. The
--- flow_series_5min snapshot table below makes the unfiltered
--- /api/flow/series read bypass flow_by_contract entirely, at which
--- point this index serves only the strike/expiration-filtered path
--- (already fast via flow_by_contract_pkey). Once the snapshot has been
--- verified in production for a few sessions (engine writes + backfill
--- match the live CTE), drop this with DROP INDEX CONCURRENTLY
--- idx_flow_by_contract_symbol_ts_series_covering to reclaim ~200 MB —
--- as a separate cleanup commit, not here.
-CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts_series_covering
-    ON flow_by_contract(symbol, timestamp DESC)
-    INCLUDE (option_type, strike, expiration, raw_volume, net_volume, net_premium);
+-- This covering index was the tactical fix for the unfiltered
+-- /api/flow/series heap scan (carried the `filtered` CTE columns so the
+-- planner could do an index-only scan instead of a ~3,000-page
+-- bitmap-heap-scan). It is superseded by the flow_series_5min snapshot
+-- below: unfiltered reads now bypass flow_by_contract entirely, and
+-- strike/expiration-filtered reads are served by flow_by_contract_pkey
+-- + idx_flow_by_contract_symbol_ts{,_exp,_type}.
+--
+-- Intentionally NOT (re)created: a fresh database never builds it. On an
+-- existing database the ~200 MB index is physically removed, once and
+-- after the production verification gate, via:
+--     make flow-series-drop-covering-index CONFIRM=yes
+-- (DROP INDEX CONCURRENTLY — see the Makefile target for the gate
+-- checklist). Keeping schema.sql free of the CREATE is what stops
+-- `make schema-apply` from resurrecting it on the next deploy.
 CREATE INDEX IF NOT EXISTS idx_flow_smart_money_symbol_ts
     ON flow_smart_money(symbol, timestamp DESC);
 
