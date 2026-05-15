@@ -41,6 +41,14 @@ ANALYTICS_SERVICE = zerogex-oa-analytics
 API_SERVICE = zerogex-oa-api
 SIGNALS_SERVICE = zerogex-oa-signals
 
+# Bulk-service ordering. Data flows ingestion → analytics → signals → api,
+# so start in that order and stop in reverse (matches db-maintain-managed).
+SERVICES_START_ORDER = $(INGESTION_SERVICE) $(ANALYTICS_SERVICE) $(SIGNALS_SERVICE) $(API_SERVICE)
+SERVICES_STOP_ORDER  = $(API_SERVICE) $(SIGNALS_SERVICE) $(ANALYTICS_SERVICE) $(INGESTION_SERVICE)
+
+# Seconds to wait before scanning logs in `make services-watch` (override: WAIT=120)
+WAIT ?= 60
+
 # Optional filter for db-tail targets (e.g. make db-tail-option-chains UNDERLYING=SPY)
 UNDERLYING ?=
 
@@ -559,6 +567,15 @@ help: ## Show this help message
 	@echo "  make signals-disable    - Disable signals service from starting on boot"
 	@echo "  make signals-health     - Show signals service health and recent errors"
 	@echo ""
+	@echo "$(GREEN)All Services (bulk — all 4 at once):$(NC)"
+	@echo "  make services-start     - Start all (ingestion → analytics → signals → api)"
+	@echo "  make services-stop      - Stop all (api → signals → analytics → ingestion)"
+	@echo "  make services-restart   - Restart all (stop reverse, then start in order)"
+	@echo "  make services-status    - One-line active/inactive status for all 4"
+	@echo "  make services-health    - Full health check for all 4 services"
+	@echo "  make services-watch [WAIT=<s>] - Wait WAIT secs (default 60), then report"
+	@echo "                            any warnings/errors for all 4 (exit 1 if errors)"
+	@echo ""
 	@echo "$(GREEN)API Server:$(NC)"
 	@echo "  make api-dev             - Run API in development mode (hot reload)"
 	@echo "  make api-prod            - Run API in production mode (4 workers)"
@@ -915,6 +932,100 @@ api-health: ## Check API service health and recent errors
 	@echo "Recent Warnings (last 5):"
 	@echo "-------------------------"
 	@sudo journalctl -u $(API_SERVICE) -n 500 --no-pager | grep " - WARNING - " | tail -5 || echo "No recent warnings"
+
+# =============================================================================
+# All-Service (bulk) Management — operate on all 4 services at once
+# =============================================================================
+# Order matters: data flows ingestion → analytics → signals → api, so start
+# in that order and stop in reverse (same ordering as db-maintain-managed).
+
+.PHONY: services-start
+services-start: ## Start all 4 services (ingestion → analytics → signals → api)
+	@echo "$(GREEN)=== Starting all services ===$(NC)"
+	@for svc in $(SERVICES_START_ORDER); do \
+		echo "$(GREEN)→ Starting $$svc...$(NC)"; \
+		sudo systemctl start $$svc; \
+	done
+	@sleep 2
+	@$(MAKE) --no-print-directory services-status
+
+.PHONY: services-stop
+services-stop: ## Stop all 4 services (api → signals → analytics → ingestion)
+	@echo "$(YELLOW)=== Stopping all services ===$(NC)"
+	@for svc in $(SERVICES_STOP_ORDER); do \
+		echo "$(YELLOW)→ Stopping $$svc...$(NC)"; \
+		sudo systemctl stop $$svc; \
+	done
+	@echo "$(GREEN)All services stopped$(NC)"
+
+.PHONY: services-restart
+services-restart: ## Restart all 4 services (stop api→…→ingestion, then start ingestion→…→api)
+	@echo "$(YELLOW)=== Restarting all services ===$(NC)"
+	@for svc in $(SERVICES_STOP_ORDER); do \
+		echo "$(YELLOW)→ Stopping $$svc...$(NC)"; \
+		sudo systemctl stop $$svc; \
+	done
+	@sleep 1
+	@for svc in $(SERVICES_START_ORDER); do \
+		echo "$(GREEN)→ Starting $$svc...$(NC)"; \
+		sudo systemctl start $$svc; \
+	done
+	@sleep 2
+	@$(MAKE) --no-print-directory services-status
+
+.PHONY: services-status
+services-status: ## One-line active/inactive status for all 4 services
+	@echo "$(BLUE)=== Service Status ===$(NC)"
+	@for svc in $(SERVICES_START_ORDER); do \
+		if systemctl is-active --quiet $$svc; then \
+			echo "  $$svc: $(GREEN)ACTIVE$(NC)"; \
+		else \
+			echo "  $$svc: $(RED)INACTIVE$(NC)"; \
+		fi; \
+	done
+
+.PHONY: services-health
+services-health: ## Full health check (status, uptime, memory, errors, warnings) for all 4 services
+	@$(MAKE) --no-print-directory ingestion-health
+	@echo ""
+	@$(MAKE) --no-print-directory analytics-health
+	@echo ""
+	@$(MAKE) --no-print-directory signals-health
+	@echo ""
+	@$(MAKE) --no-print-directory api-health
+
+.PHONY: services-watch
+services-watch: ## Wait WAIT secs (default 60), then report any WARNING/ERROR for all 4 services since the wait began (exit 1 if errors)
+	@SINCE="$$(date '+%Y-%m-%d %H:%M:%S')"; \
+	echo "$(BLUE)=== Watching all services for $(WAIT)s ===$(NC)"; \
+	echo "Window start: $$SINCE  (override delay with WAIT=<seconds>)"; \
+	sleep $(WAIT); \
+	echo ""; \
+	rc=0; \
+	for svc in $(SERVICES_START_ORDER); do \
+		echo "$(BLUE)--- $$svc ---$(NC)"; \
+		ERR="$$(sudo journalctl -u $$svc --since "$$SINCE" --no-pager 2>/dev/null | grep ' - ERROR - ' || true)"; \
+		WARN="$$(sudo journalctl -u $$svc --since "$$SINCE" --no-pager 2>/dev/null | grep ' - WARNING - ' || true)"; \
+		if [ -n "$$ERR" ]; then \
+			EC="$$(printf '%s\n' "$$ERR" | grep -c . || true)"; \
+			echo "$(RED)Errors ($$EC):$(NC)"; echo "$$ERR"; rc=1; \
+		else \
+			echo "$(GREEN)No errors$(NC)"; \
+		fi; \
+		if [ -n "$$WARN" ]; then \
+			WC="$$(printf '%s\n' "$$WARN" | grep -c . || true)"; \
+			echo "$(YELLOW)Warnings ($$WC):$(NC)"; echo "$$WARN"; \
+		else \
+			echo "$(GREEN)No warnings$(NC)"; \
+		fi; \
+		echo ""; \
+	done; \
+	if [ $$rc -ne 0 ]; then \
+		echo "$(RED)❌ Errors detected in the watch window$(NC)"; \
+	else \
+		echo "$(GREEN)✅ No errors in the watch window$(NC)"; \
+	fi; \
+	exit $$rc
 
 # =============================================================================
 # Cross-Service Log Utilities
