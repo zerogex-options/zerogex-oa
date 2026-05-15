@@ -424,22 +424,52 @@ class SignalsQueriesMixin:
 
         Basic signals share ``signal_component_scores`` with the MSI
         components and Advanced Signals, distinguished by ``component_name``.
+
+        Perf: this is 6 LATERAL single-row lookups (one per component
+        name), not a ``DISTINCT ON (component_name) ... ORDER BY
+        component_name, timestamp DESC`` over the whole table.  The
+        ``signal_component_scores`` table is written every signal-engine
+        cycle (~1 row/s/component), so ``DISTINCT ON`` had to scan and
+        sort every historical row for these 6 components and dedupe to
+        6 — cost grew with the table all session (observed 0.6s → 6s →
+        12s within one trading day).  Each LATERAL leg instead resolves
+        to the same indexed ``component_name=… AND underlying=… ORDER BY
+        timestamp DESC LIMIT 1`` lookup the per-signal endpoints use
+        (idx_signal_component_scores_component_underlying_ts), so the
+        bundle is constant-time regardless of table size.  A component
+        with no rows yields no LATERAL row (CROSS JOIN drops it), which
+        matches the old DISTINCT ON behavior — the caller pre-seeds all
+        six keys to ``None``.
         """
         query = """
-            SELECT DISTINCT ON (component_name)
-                component_name,
-                timestamp,
-                clamped_score,
-                weighted_score,
-                weight,
-                context_values
-            FROM signal_component_scores
-            WHERE underlying = $1
-              AND component_name IN (
-                'tape_flow_bias','skew_delta','vanna_charm_flow',
-                'dealer_delta_pressure','gex_gradient','positioning_trap'
-              )
-            ORDER BY component_name, timestamp DESC
+            SELECT
+                c.component_name,
+                s.timestamp,
+                s.clamped_score,
+                s.weighted_score,
+                s.weight,
+                s.context_values
+            FROM (VALUES
+                ('tape_flow_bias'),
+                ('skew_delta'),
+                ('vanna_charm_flow'),
+                ('dealer_delta_pressure'),
+                ('gex_gradient'),
+                ('positioning_trap')
+            ) AS c(component_name)
+            CROSS JOIN LATERAL (
+                SELECT
+                    scs.timestamp,
+                    scs.clamped_score,
+                    scs.weighted_score,
+                    scs.weight,
+                    scs.context_values
+                FROM signal_component_scores scs
+                WHERE scs.underlying = $1
+                  AND scs.component_name = c.component_name
+                ORDER BY scs.timestamp DESC
+                LIMIT 1
+            ) s
         """
         out: Dict[str, Optional[Dict[str, Any]]] = {
             "tape_flow_bias": None,
