@@ -2446,15 +2446,23 @@ flow-series-backfill: ## Backfill flow_series_5min (current + prior session) bef
 	@$(PY) -m src.tools.flow_series_5min_backfill --symbols $(FLOW_SERIES_SYMBOLS)
 
 # Verification gate for phase-1 -> phase-2: diff the snapshot against the
-# live CTE row-for-row. Requires a real DB; pass FLOW_SERIES_PARITY_DSN.
+# live CTE row-for-row. DSN is auto-derived from the same DB_* vars
+# schema-apply uses (.env), authenticating via ~/.pgpass exactly like the
+# PSQL target. Override with FLOW_SERIES_PARITY_DSN=... for an ad-hoc DB.
 FLOW_SERIES_PARITY_DSN ?=
 FLOW_SERIES_PARITY_SYMBOL ?= SPY
 FLOW_SERIES_PARITY_SESSION ?= prior
 
 .PHONY: flow-series-parity
-flow-series-parity: ## Diff flow_series_5min vs the live CTE (FLOW_SERIES_PARITY_DSN=postgres://...)
+flow-series-parity: ## Diff flow_series_5min vs the live CTE (auto-uses DB_* from .env; override FLOW_SERIES_PARITY_DSN=...)
 	@echo "$(BLUE)=== flow_series_5min parity vs live CTE ===$(NC)"
-	@FLOW_SERIES_PARITY_DSN="$(FLOW_SERIES_PARITY_DSN)" \
+	@DSN="$(FLOW_SERIES_PARITY_DSN)"; \
+	if [ -z "$$DSN" ]; then \
+		DSN="postgresql://$(DB_USER)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)?sslmode=require"; \
+		echo "$(YELLOW)Auto-derived DSN from .env DB_*: $$DSN$(NC)"; \
+	fi; \
+	PGPASSFILE="$${PGPASSFILE:-$$HOME/.pgpass}" \
+		FLOW_SERIES_PARITY_DSN="$$DSN" \
 		FLOW_SERIES_PARITY_SYMBOL="$(FLOW_SERIES_PARITY_SYMBOL)" \
 		FLOW_SERIES_PARITY_SESSION="$(FLOW_SERIES_PARITY_SESSION)" \
 		$(PY) -m pytest tests/test_flow_series_parity.py -m integration --no-cov -q
