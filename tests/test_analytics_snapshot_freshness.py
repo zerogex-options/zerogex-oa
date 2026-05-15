@@ -18,6 +18,20 @@ from src.analytics.main_engine import AnalyticsEngine
 ET = pytz.timezone("US/Eastern")
 
 
+def _snapshot_query_call(cursor):
+    """Return the cursor.execute call_args for the per-contract snapshot query.
+
+    Located by SQL content ("DISTINCT ON") rather than a fixed positional
+    index, so the cold-start path's extra ``SET LOCAL statement_timeout``
+    execute doesn't shift the assertion onto the wrong call.
+    """
+    for call in cursor.execute.call_args_list:
+        sql = call[0][0]
+        if "DISTINCT ON" in sql:
+            return call
+    raise AssertionError("snapshot query (DISTINCT ON ...) was never executed")
+
+
 def _row(option_symbol, strike, expiration, option_type, quote_ts, *, gamma=0.01, oi=100):
     """Construct a 15-tuple matching the SELECT column order in ``_get_snapshot``."""
     return (
@@ -86,7 +100,7 @@ def test_expiration_filter_excludes_yesterday_expirations_when_before_1615():
         engine._get_snapshot()
 
     # The third execute() carries the min_expiration arg.
-    options_call = cursor.execute.call_args_list[2]
+    options_call = _snapshot_query_call(cursor)
     params = options_call[0][1]
     min_expiration = params[3]
     # Before 16:15 ET: min_expiration = yesterday => today's expirations still pass.
@@ -102,7 +116,7 @@ def test_expiration_filter_rolls_off_today_after_1615():
     with patch.object(main_engine, "db_connection", return_value=cm):
         engine._get_snapshot()
 
-    options_call = cursor.execute.call_args_list[2]
+    options_call = _snapshot_query_call(cursor)
     params = options_call[0][1]
     min_expiration = params[3]
     # After 16:15 ET: min_expiration = today => today's expirations are excluded.
@@ -120,7 +134,7 @@ def test_lookback_uses_configured_hours_not_minutes():
     with patch.object(main_engine, "db_connection", return_value=cm):
         engine._get_snapshot()
 
-    options_call = cursor.execute.call_args_list[2]
+    options_call = _snapshot_query_call(cursor)
     params = options_call[0][1]
     lookback_start = params[2]
     expected = snapshot_ts - timedelta(hours=48)
@@ -137,7 +151,7 @@ def test_snapshot_query_includes_expiration_clause():
     with patch.object(main_engine, "db_connection", return_value=cm):
         engine._get_snapshot()
 
-    options_sql = cursor.execute.call_args_list[2][0][0]
+    options_sql = _snapshot_query_call(cursor)[0][0]
     assert "oc.expiration >" in options_sql
 
 
@@ -171,7 +185,7 @@ def test_expiration_boundary_at_exactly_1615_rolls_off():
     with patch.object(main_engine, "db_connection", return_value=cm):
         engine._get_snapshot()
 
-    options_call = cursor.execute.call_args_list[2]
+    options_call = _snapshot_query_call(cursor)
     min_expiration = options_call[0][1][3]
     # 16:15 is the boundary; per the rule (ts.time() < 16:15) is False, so roll off today.
     assert min_expiration == ET.localize(datetime(2026, 5, 13)).date()
