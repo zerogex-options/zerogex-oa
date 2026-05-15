@@ -101,6 +101,29 @@ def test_heatmap_keeps_strike_band_and_single_latest_quote_cte():
     assert "ORDER BY br.bucket_ts DESC, g.strike ASC" in sql
 
 
+def test_heatmap_surfaces_gamma_flip_from_its_own_buckets():
+    """gamma_flip must ride the heatmap's own (RTH-filtered, over-fetched)
+    bucket timestamps so the frontend's primary path uses it instead of
+    falling back to the short, separately-windowed /api/gex/historical
+    call. Pin: the representative gex_summary row carries gamma_flip_point
+    and it's projected once per bucket (lowest-strike row, NULL elsewhere)
+    so the payload doesn't repeat it across every strike."""
+    db = DatabaseManager()
+    conn = _RecordingConn(fetch_rows=[])
+    _install_conn(db, conn)
+    asyncio.run(db.get_gex_heatmap("SPX", "5min", 60))
+    sql = conn.queries[0]
+
+    # Pulled from the representative gex_summary snapshot in bucket_reps.
+    reps = sql[sql.index("bucket_reps AS") : sql.index("FROM gex_summary")]
+    assert "gamma_flip_point AS gamma_flip" in reps
+
+    # Emitted once per bucket (lowest strike), NULL on the other strikes.
+    assert "MIN(g.strike) OVER (PARTITION BY br.bucket_ts)" in sql
+    assert "THEN MAX(br.gamma_flip)" in sql
+    assert "END AS gamma_flip" in sql
+
+
 def test_heatmap_returns_mapped_rows():
     db = DatabaseManager()
     rows = [

@@ -2565,7 +2565,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             bucket_reps AS (
                 SELECT DISTINCT ON ({bucket})
                     {bucket} AS bucket_ts,
-                    timestamp AS rep_ts
+                    timestamp AS rep_ts,
+                    gamma_flip_point AS gamma_flip
                 FROM gex_summary
                 WHERE underlying = $1
                     AND timestamp >= (SELECT start_time FROM time_window)
@@ -2575,7 +2576,22 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             SELECT
                 br.bucket_ts AS timestamp,
                 g.strike,
-                AVG(g.net_gex) AS net_gex
+                AVG(g.net_gex) AS net_gex,
+                -- gamma_flip is one value per bucket (the bucket's
+                -- representative gex_summary row), but rows here are
+                -- per-strike.  MAX() collapses that constant, and the
+                -- CASE emits it on only the lowest-strike row of each
+                -- bucket (NULL elsewhere) so it isn't repeated across
+                -- every strike.  The frontend keys the gamma-flip line
+                -- by timestamp and skips NULLs, so one row per bucket is
+                -- enough — and because it now rides the heatmap's own
+                -- (RTH-filtered, over-fetched) timestamps the line spans
+                -- the full surface instead of the short /api/gex/historical
+                -- fallback window.
+                CASE
+                    WHEN g.strike = MIN(g.strike) OVER (PARTITION BY br.bucket_ts)
+                    THEN MAX(br.gamma_flip)
+                END AS gamma_flip
             FROM bucket_reps br
             JOIN gex_by_strike g
                 ON g.underlying = $1
