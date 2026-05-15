@@ -176,6 +176,28 @@ def test_cash_index_heatmap_restricts_to_regular_session():
     assert isinstance(captured["args"][2], list)
 
 
+def test_etf_keeps_fixed_strike_band():
+    """The historical fixed ±50 band must stay byte-for-byte for ETFs so
+    SPY/QQQ rendering is unaffected."""
+    sql = _run_and_capture("SPY")["query"]
+    assert "ABS(g.strike - (SELECT spot_close FROM latest_quote)) <= 50" in sql
+    # No proportional band leaked onto the ETF path.
+    assert "* 0.08" not in sql
+
+
+def test_cash_index_uses_proportional_strike_band():
+    """A fixed ±50 is only ≈±0.7% of a ~$7400 index, collapsing the
+    heatmap into a thin band inside the frontend's price-cropped y-axis.
+    Cash indices must scope strikes proportionally to spot instead."""
+    sql = _run_and_capture("SPX")["query"]
+    assert (
+        "ABS(g.strike - (SELECT spot_close FROM latest_quote)) "
+        "<= (SELECT spot_close FROM latest_quote) * 0.08" in sql
+    )
+    # The bare fixed-50 predicate must be gone on the index path.
+    assert "<= 50" not in sql
+
+
 def test_cash_index_detection_is_case_insensitive():
     """Lowercased index symbols still get the session filter (symbol is
     upper-cased before the cash-index check)."""

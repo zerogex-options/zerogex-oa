@@ -2502,6 +2502,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # original query and params unchanged.
         session_filter = ""
         params: list = [symbol, window_units]
+        # Strike band around spot. ETFs/equities keep the historical fixed
+        # ±50 (≈±8.5% of a ~$585 SPY — comfortably wider than the
+        # frontend's price-cropped y-axis, so the heatmap fills the chart).
+        # For a cash index that same ±50 is only ≈±0.7% of a ~$7400 level,
+        # so the colored surface collapsed into a thin band far inside the
+        # frontend's ±2%-of-price y-axis (which the zoom-out control widens
+        # up to ±8%). Use a proportional band for cash indices so the
+        # surface fills the cropped view at every zoom level, exactly as
+        # the fixed ±50 already does for ETFs.
+        strike_band = "50"
         if is_cash_index(symbol):
             session_filter = """
                     AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
@@ -2510,6 +2520,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     AND (timestamp AT TIME ZONE 'America/New_York')::date <> ALL($3::date[])
             """
             params.append(sorted(NYSE_HOLIDAYS))
+            # 0.08 == the frontend's max y-axis margin (0.02 base × 4.0
+            # max zoom-out), so the returned strikes always span the
+            # widest view the chart can show.
+            strike_band = "(SELECT spot_close FROM latest_quote) * 0.08"
         # `bucket` and `step_interval` are validated allowlist literals.
         #
         # Perf: a true per-bucket AVG over raw gex_by_strike requires
@@ -2565,7 +2579,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             JOIN gex_by_strike g
                 ON g.underlying = $1
                AND g.timestamp = br.rep_ts
-            WHERE ABS(g.strike - (SELECT spot_close FROM latest_quote)) <= 50
+            WHERE ABS(g.strike - (SELECT spot_close FROM latest_quote)) <= {strike_band}
             GROUP BY br.bucket_ts, g.strike
             ORDER BY br.bucket_ts DESC, g.strike ASC
         """
