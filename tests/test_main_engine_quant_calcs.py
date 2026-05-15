@@ -1,6 +1,10 @@
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
+import pytest
+
+from src.analytics import main_engine
 from src.analytics.main_engine import AnalyticsEngine
 
 
@@ -79,7 +83,6 @@ def test_gamma_flip_interpolates_between_sign_change_strikes():
 
 def test_store_gex_summary_carries_forward_previous_gamma_flip_when_missing():
     engine = AnalyticsEngine(underlying="SPY")
-    conn = MagicMock()
     cursor = MagicMock()
     cursor.fetchone.return_value = (501.25,)
 
@@ -98,7 +101,7 @@ def test_store_gex_summary_carries_forward_previous_gamma_flip_when_missing():
         "total_net_gex": 555.0,
     }
 
-    engine._store_gex_summary(summary, conn=conn, cursor=cursor, commit=False)
+    engine._store_gex_summary(summary, cursor)
 
     # First execute fetches prior non-null gamma flip.
     assert cursor.execute.call_count >= 2
@@ -108,7 +111,6 @@ def test_store_gex_summary_carries_forward_previous_gamma_flip_when_missing():
 
 def test_store_gex_summary_keeps_current_gamma_flip_when_present():
     engine = AnalyticsEngine(underlying="SPY")
-    conn = MagicMock()
     cursor = MagicMock()
 
     summary = {
@@ -126,7 +128,7 @@ def test_store_gex_summary_keeps_current_gamma_flip_when_present():
         "total_net_gex": 555.0,
     }
 
-    engine._store_gex_summary(summary, conn=conn, cursor=cursor, commit=False)
+    engine._store_gex_summary(summary, cursor)
 
     # No carry-forward SELECT when current gamma flip exists.
     insert_args = cursor.execute.call_args_list[-1][0][1]
@@ -169,3 +171,139 @@ def test_gex_summary_includes_flip_distance_local_gex_and_convexity():
     assert summary["local_gex"] == abs(-2_000_000.0) + abs(3_000_000.0) + abs(1_000_000.0)
     expected_convexity = abs(summary["total_net_gex"]) / abs(summary["flip_distance"])
     assert summary["convexity_risk"] == expected_convexity
+
+
+def _full_gex_row(ts):
+    return {
+        "underlying": "SPY",
+        "timestamp": ts,
+        "strike": 500.0,
+        "expiration": ts.date(),
+        "total_gamma": 0.3,
+        "call_gamma": 0.2,
+        "put_gamma": 0.1,
+        "net_gex": 1_000_000.0,
+        "call_volume": 10,
+        "put_volume": 5,
+        "call_oi": 100,
+        "put_oi": 50,
+        "vanna_exposure": 1.0,
+        "charm_exposure": 2.0,
+        "call_vanna_exposure": 0.5,
+        "put_vanna_exposure": 0.5,
+        "call_charm_exposure": 1.0,
+        "put_charm_exposure": 1.0,
+        "dealer_vanna_exposure": -1.0,
+        "dealer_charm_exposure": -2.0,
+        "expiration_bucket": "0dte",
+    }
+
+
+def _full_summary(ts):
+    return {
+        "underlying": "SPY",
+        "timestamp": ts,
+        "max_gamma_strike": 500.0,
+        "max_gamma_value": 1_000_000.0,
+        # Provide a non-None gamma_flip so _store_gex_summary skips the
+        # carry-forward SELECT and the very first cursor.execute() is the
+        # summary INSERT — i.e. the failure lands mid-transaction, AFTER
+        # the by-strike write has already been issued.
+        "gamma_flip_point": 499.0,
+        "put_call_ratio": 0.9,
+        "max_pain": 505.0,
+        "total_call_volume": 1000,
+        "total_put_volume": 900,
+        "total_call_oi": 2000,
+        "total_put_oi": 1800,
+        "total_net_gex": 1_000_000.0,
+    }
+
+
+def test_store_calculation_results_is_atomic_on_mid_transaction_failure(monkeypatch):
+    """C1: by-strike + summary must commit together (all rows land or none).
+
+    Simulate the summary write blowing up AFTER the by-strike rows were
+    already issued on the shared cursor.  The whole transaction must roll
+    back (never commit), so the by-strike rows do not persist — proving
+    the single-transaction grouping survived the conn/cursor refactor.
+    """
+    engine = AnalyticsEngine(underlying="SPY")
+    ts = datetime(2026, 4, 17, 14, 30, tzinfo=timezone.utc)
+
+    cursor = MagicMock()
+    # Every cursor.execute() raises; with gamma_flip_point set the first
+    # (and only) execute in _store_gex_summary is the summary INSERT.
+    cursor.execute.side_effect = RuntimeError("summary insert blew up")
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+
+    by_strike_writes = []
+
+    def fake_execute_values(cur, sql, rows):
+        # _store_gex_by_strike succeeds: record that the by-strike INSERT
+        # was issued into this (soon-to-be-rolled-back) transaction.
+        assert cur is cursor
+        by_strike_writes.append(rows)
+
+    monkeypatch.setattr(main_engine, "execute_values", fake_execute_values)
+
+    @contextmanager
+    def fake_db_connection():
+        # Mirror src/database/connection.py: commit on clean exit,
+        # rollback on any exception.
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    monkeypatch.setattr(main_engine, "db_connection", fake_db_connection)
+
+    with pytest.raises(RuntimeError, match="summary insert blew up"):
+        engine._store_calculation_results([_full_gex_row(ts)], _full_summary(ts))
+
+    # The by-strike INSERT WAS issued (it ran before the summary failure)…
+    assert len(by_strike_writes) == 1
+    # …but exactly one connection/transaction was used…
+    conn.cursor.assert_called_once()
+    # …and it was rolled back, never committed: the by-strike rows that
+    # were written in this transaction do NOT persist. All-or-nothing.
+    conn.rollback.assert_called_once()
+    conn.commit.assert_not_called()
+    assert engine.errors_count == 1
+
+
+def test_store_calculation_results_commits_once_on_success(monkeypatch):
+    """Happy path: both writes land in a single committed transaction."""
+    engine = AnalyticsEngine(underlying="SPY")
+    ts = datetime(2026, 4, 17, 14, 31, tzinfo=timezone.utc)
+
+    cursor = MagicMock()
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+
+    monkeypatch.setattr(main_engine, "execute_values", lambda cur, sql, rows: None)
+
+    committed = []
+
+    @contextmanager
+    def fake_db_connection():
+        try:
+            yield conn
+            conn.commit()
+            committed.append(True)
+        except Exception:
+            conn.rollback()
+            raise
+
+    monkeypatch.setattr(main_engine, "db_connection", fake_db_connection)
+
+    engine._store_calculation_results([_full_gex_row(ts)], _full_summary(ts))
+
+    conn.cursor.assert_called_once()  # one connection => one transaction
+    conn.rollback.assert_not_called()
+    assert conn.commit.called  # committed (explicit + CM are harmless dups)
+    assert committed == [True]
+    assert engine.errors_count == 0

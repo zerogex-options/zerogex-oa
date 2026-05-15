@@ -143,6 +143,36 @@ FIELD_SPECS: tuple[FieldSpec, ...] = (
         """,
         notes="15-min-window-over-window change in put net premium.",
     ),
+    # Smart-money calibration (D6 follow-up).  These two are NOT consumed
+    # via ctx.extra['normalizers'] like the specs above — they are read
+    # directly by AnalyticsEngine._refresh_flow_caches to replace the
+    # static smart-money tier thresholds with the per-symbol upper
+    # percentile of recent per-contract flow ("unusual = upper pct").
+    # Sampled from the canonical flow_contract_facts so the distribution
+    # matches what the smart-money SQL scores (volume_delta and the
+    # volume_delta*price*100 premium).
+    FieldSpec(
+        name="smart_money_volume_delta",
+        query="""
+            SELECT volume_delta::double precision
+            FROM flow_contract_facts
+            WHERE symbol = %s
+              AND timestamp >= NOW() - (%s || ' days')::interval
+              AND volume_delta > 0
+        """,
+        notes="Per-contract per-cycle volume_delta; p95 calibrates smart-money volume tiers.",
+    ),
+    FieldSpec(
+        name="smart_money_premium",
+        query="""
+            SELECT premium_delta::double precision
+            FROM flow_contract_facts
+            WHERE symbol = %s
+              AND timestamp >= NOW() - (%s || ' days')::interval
+              AND volume_delta > 0
+        """,
+        notes="Per-contract per-cycle premium (volume_delta*price*100); p95 calibrates smart-money premium tiers.",
+    ),
 )
 
 

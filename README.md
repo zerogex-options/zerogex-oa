@@ -546,7 +546,13 @@ make analytics-health
    - Below: Dealers are short gamma (destabilizing market)
 
 3. **Max Pain** - Strike where option holders lose most value
-   - Calculated by minimizing total option value across all strikes
+   - Computed **per expiration** (the strike that minimizes total
+     option-writer payout *at that expiration's settlement*), not by
+     pooling all expirations into one synthetic payout
+   - The scalar `gex_summary.max_pain` column is the **front-month**
+     value (nearest non-expired expiration) for backward compatibility
+   - The full `{expiration → strike}` breakdown is persisted in the
+     `gex_summary.max_pain_by_expiration` JSONB column
    - Useful for understanding potential pinning behavior
 
 4. **Second-Order Greeks** - Vanna and Charm
@@ -650,17 +656,27 @@ Stores 1-minute aggregated option contract data with IV and Greeks.
 
 ### Helper Views
 
-#### `underlying_quotes_with_deltas`
-Automatically calculates volume deltas using `LAG()` window function.
+#### `flow_contract_facts` (canonical option flow)
+Per-contract, per-cycle option flow facts (volume/premium deltas plus
+Lee-Ready buy/sell classification).  This table — not a view — is the
+single source of truth for option flow; the `option_chains_with_deltas`
+view below is kept only for backward-compatible delta reads.
 
 ```sql
-SELECT * FROM underlying_quotes_with_deltas 
-WHERE symbol = 'SPY' 
+SELECT timestamp, option_symbol, volume_delta, premium_delta,
+       buy_volume, sell_volume
+FROM flow_contract_facts
+WHERE symbol = 'SPY'
 ORDER BY timestamp DESC LIMIT 10;
 ```
 
+> Note: the old `underlying_quotes_with_deltas` view no longer exists.
+> For underlying uptick/downtick volume see the `underlying_buying_pressure`
+> view (documented below); for option flow use `flow_contract_facts`.
+
 #### `option_chains_with_deltas`
 Automatically calculates volume and OI deltas using `LAG()` window function.
+Backward-compat only — new code should read `flow_contract_facts`.
 
 ```sql
 SELECT * FROM option_chains_with_deltas 
@@ -975,14 +991,24 @@ Filters for unusual activity indicating informed trading:
 
 **Use case:** Spotting potential edge, following smart money, finding asymmetric setups
 
-#### 5. Underlying Buying Pressure (`make flow-buying-pressure`)
-Time series of buying vs selling pressure in the underlying:
-- Buying pressure percentage
-- Up/down volume breakdown
-- Price momentum classification
+#### 5. Underlying Uptick/Downtick Bias (`make flow-buying-pressure`)
+Time series of tape-classified uptick vs downtick volume in the
+underlying (TradeStation Lee-Ready-style classification on consolidated
+NBBO — a tick-test, **not** true trade-side attribution).  The
+`underlying_buying_pressure` view exposes canonical columns with the
+prior names kept as backward-compat aliases:
+
+| Canonical column           | Back-compat alias | Meaning                                  |
+|----------------------------|-------------------|------------------------------------------|
+| `uptick_minus_downtick_vol`| `vol`             | up_volume − down_volume                   |
+| `uptick_vol_pct`           | `buy_pct`         | up_volume share of (up+down) volume, %    |
+| `tick_bias`                | `momentum`        | Uptick/Downtick-bias label                |
+
+- Uptick/downtick volume breakdown
 - Period-over-period flow changes
 
-**Use case:** Confirming directional bias, spotting divergences with options flow
+**Use case:** Confirming directional bias, spotting divergences with
+options flow (read it as tape bias, not literal buying/selling)
 
 #### Combined Dashboard (`make flow-live`)
 Real-time dashboard showing all 5 views in one command:
