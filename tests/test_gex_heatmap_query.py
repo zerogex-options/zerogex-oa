@@ -120,3 +120,64 @@ def test_heatmap_window_units_clamped_to_300():
     asyncio.run(db.get_gex_heatmap("SPY", "1day", 99999))
     # (symbol, window_units) — window_units clamped to 300.
     assert captured["args"] == ("SPY", 300)
+
+
+def _run_and_capture(symbol, timeframe="5min", window_units=60):
+    db = DatabaseManager()
+    captured = {}
+
+    class _Conn(_RecordingConn):
+        async def fetch(self, query, *args):
+            captured["query"] = query
+            captured["args"] = args
+            return []
+
+    conn = _Conn()
+    _install_conn(db, conn)
+    asyncio.run(db.get_gex_heatmap(symbol, timeframe, window_units))
+    return captured
+
+
+def test_etf_heatmap_has_no_cash_session_filter():
+    """ETFs / equities genuinely trade extended hours — the query and its
+    params must stay exactly as before (no session predicate, two args)."""
+    captured = _run_and_capture("SPY")
+    sql = captured["query"]
+
+    assert "America/New_York" not in sql
+    assert "EXTRACT(DOW" not in sql
+    assert "$3" not in sql
+    # Unchanged param shape: (symbol, window_units) only.
+    assert captured["args"] == ("SPY", 60)
+
+
+def test_cash_index_heatmap_restricts_to_regular_session():
+    """SPX (a cash index) must restrict the per-bucket representatives to
+    the regular cash session so extended-hours / overnight buckets never
+    reach the heatmap. The NYSE-holiday list is bound as the 3rd param."""
+    captured = _run_and_capture("SPX")
+    sql = captured["query"]
+
+    # Weekday + 09:30–16:00 ET band, mirroring get_session_closes.
+    assert "EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5" in sql
+    assert "BETWEEN TIME '09:30' AND TIME '16:00'" in sql
+    # NYSE holidays excluded via a bound date[] param.
+    assert "<> ALL($3::date[])" in sql
+
+    # The session predicate is attached to the gex_summary scan (the
+    # per-bucket representative selection), not the gex_by_strike join.
+    summary_idx = sql.index("FROM gex_summary")
+    join_idx = sql.index("JOIN gex_by_strike g")
+    assert summary_idx < sql.index("EXTRACT(DOW") < join_idx
+
+    # symbol, window_units, then the holiday list.
+    assert captured["args"][0] == "SPX"
+    assert captured["args"][1] == 60
+    assert isinstance(captured["args"][2], list)
+
+
+def test_cash_index_detection_is_case_insensitive():
+    """Lowercased index symbols still get the session filter (symbol is
+    upper-cased before the cash-index check)."""
+    sql = _run_and_capture("spx")["query"]
+    assert "America/New_York" in sql

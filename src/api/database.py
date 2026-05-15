@@ -20,6 +20,7 @@ from src.api.queries.signals import SignalsQueriesMixin
 from src.api.queries.technicals import TechnicalsQueriesMixin
 from src.flow_series_sql import FLOW_SERIES_CTE_ASYNCPG, SNAPSHOT_SELECT_ASYNCPG
 from src.market_calendar import NYSE_HOLIDAYS
+from src.symbols import is_cash_index
 
 logger = logging.getLogger(__name__)
 
@@ -2486,6 +2487,29 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             return cached
         bucket = _bucket_expr(timeframe)
         step_interval = _interval_expr(timeframe)
+
+        # Cash indices (SPX, NDX, RUT, …) have no underlying price/volume of
+        # their own outside the regular cash session, yet their options
+        # trade extended / global hours so the analytics engine writes
+        # gex_summary / gex_by_strike around the clock.  Returning those
+        # extended-hours and overnight buckets makes the heatmap plot
+        # nonsensical 17:00–19:00 ET cells for an index and misaligns the
+        # surface with the RTH-only candlesticks.  For cash indices,
+        # restrict the per-bucket representatives to the regular session
+        # (weekdays, 09:30–16:00 ET, excluding NYSE holidays) — the same
+        # session definition get_session_closes uses.  ETFs / equities
+        # (SPY, QQQ, …) genuinely trade extended hours, so they keep the
+        # original query and params unchanged.
+        session_filter = ""
+        params: list = [symbol, window_units]
+        if is_cash_index(symbol):
+            session_filter = """
+                    AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
+                    AND (timestamp AT TIME ZONE 'America/New_York')::time
+                        BETWEEN TIME '09:30' AND TIME '16:00'
+                    AND (timestamp AT TIME ZONE 'America/New_York')::date <> ALL($3::date[])
+            """
+            params.append(sorted(NYSE_HOLIDAYS))
         # `bucket` and `step_interval` are validated allowlist literals.
         #
         # Perf: a true per-bucket AVG over raw gex_by_strike requires
@@ -2530,7 +2554,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 FROM gex_summary
                 WHERE underlying = $1
                     AND timestamp >= (SELECT start_time FROM time_window)
-                    AND timestamp <= (SELECT end_time FROM time_window)
+                    AND timestamp <= (SELECT end_time FROM time_window){session_filter}
                 ORDER BY {bucket}, timestamp DESC
             )
             SELECT
@@ -2548,7 +2572,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         try:
             async with self._acquire_connection() as conn:
-                rows = await asyncio.wait_for(conn.fetch(query, symbol, window_units), timeout=15.0)
+                rows = await asyncio.wait_for(conn.fetch(query, *params), timeout=15.0)
                 result = [dict(row) for row in rows]
                 self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
                 return result
