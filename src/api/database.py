@@ -2553,9 +2553,22 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         bucket = _bucket_expr(timeframe)
         step_interval = _interval_expr(timeframe)
         # `bucket` and `step_interval` are validated allowlist literals.
+        #
+        # Perf: the spot±50 strike band is filtered INSIDE recent_data,
+        # before the GROUP BY, not after it.  The result is identical
+        # (AVG is per (bucket, strike), so pre- vs post-aggregation
+        # strike filtering yields the same per-cell value), but the
+        # aggregate now only touches the ~100 strikes near spot instead
+        # of the entire option chain for every snapshot in the window.
+        # For wide windows (notably timeframe=1day, where window_units=N
+        # spans N days of the highest-cardinality table) this is the
+        # difference between scanning/aggregating millions of discarded
+        # rows and only the ones that survive to the response.  The two
+        # "latest underlying_quotes row" lookups (window anchor + spot
+        # price) are also folded into a single CTE/scan.
         query = f"""
-            WITH latest_price_timestamp AS (
-                SELECT timestamp as max_ts
+            WITH latest_quote AS (
+                SELECT timestamp AS max_ts, close AS spot_close
                 FROM underlying_quotes
                 WHERE symbol = $1
                 ORDER BY timestamp DESC
@@ -2565,14 +2578,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 SELECT
                     max_ts - ({step_interval} * ($2 - 1)) as start_time,
                     max_ts as end_time
-                FROM latest_price_timestamp
-            ),
-            latest_price AS (
-                SELECT close
-                FROM underlying_quotes
-                WHERE symbol = $1
-                ORDER BY timestamp DESC
-                LIMIT 1
+                FROM latest_quote
             ),
             recent_data AS (
                 SELECT
@@ -2583,22 +2589,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 WHERE underlying = $1
                     AND timestamp >= (SELECT start_time FROM time_window)
                     AND timestamp <= (SELECT end_time FROM time_window)
+                    AND ABS(strike - (SELECT spot_close FROM latest_quote)) <= 50
                 GROUP BY 1, strike
-            ),
-            filtered_data AS (
-                SELECT
-                    r.timestamp,
-                    r.strike,
-                    r.net_gex
-                FROM recent_data r
-                CROSS JOIN latest_price l
-                WHERE ABS(r.strike - l.close) <= 50
             )
             SELECT
                 timestamp,
                 strike,
                 net_gex
-            FROM filtered_data
+            FROM recent_data
             ORDER BY timestamp DESC, strike ASC
         """
 
