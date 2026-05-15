@@ -133,6 +133,9 @@ addopts = [
     "--cov-report=term-missing",
     "--cov-report=html",
 ]
+markers = [
+    "integration: requires a live Postgres; skipped in CI. Run via `make flow-series-parity`.",
+]
 
 [tool.mypy]
 python_version = "3.10"

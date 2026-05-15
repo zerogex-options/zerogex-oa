@@ -18,6 +18,7 @@ import json
 
 from src.api.queries.signals import SignalsQueriesMixin
 from src.api.queries.technicals import TechnicalsQueriesMixin
+from src.flow_series_sql import FLOW_SERIES_CTE_ASYNCPG, SNAPSHOT_SELECT_ASYNCPG
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +173,17 @@ _STABLE_SNAPSHOT_CTE = f"""
 """
 
 
+def _expected_flow_series_bars(session_start: datetime, session_end: datetime) -> int:
+    """Number of 5-minute bars the CTE's generate_series would emit for a
+    resolved window — inclusive of both ends (the window is always a 5-min
+    multiple). Used only to size the snapshot shortfall warning; it is not
+    a hard gate (an empty session legitimately yields zero rows)."""
+    span = (session_end - session_start).total_seconds()
+    if span < 0:
+        return 0
+    return int(span // 300) + 1
+
+
 class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     """Manages database connections and queries"""
 
@@ -200,6 +212,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._flow_endpoint_cache_ttl_seconds: float = float(
             os.getenv("FLOW_ENDPOINT_CACHE_TTL_SECONDS", "3.0")
         )
+        # Phase-2 read switch for the flow_series_5min snapshot. When true,
+        # unfiltered /api/flow/series reads the pre-aggregated snapshot
+        # instead of running the 8-CTE pipeline; filtered calls always use
+        # the CTE (the snapshot is keyed (symbol, bar_start) only). Default
+        # off: ship schema + write path + backfill, verify a session's
+        # rows match the live CTE, only then flip this on.
+        self._flow_series_use_snapshot: bool = os.getenv(
+            "FLOW_SERIES_USE_SNAPSHOT", "false"
+        ).strip().lower() in {"true", "1", "yes", "on"}
         # Confluence-matrix is structurally an aggregate over the rolling
         # ``lookback`` window of signal_scores × signal_component_scores; the
         # underlying values only change on the scoring cycle.  The per-worker
@@ -1733,146 +1754,58 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         self._cache_set(cache_key, [], self._flow_endpoint_cache_ttl_seconds)
                     return []
 
-                query = """
-                    WITH filtered AS (
-                        SELECT
-                            timestamp AS bar_start,
-                            option_type,
-                            strike,
-                            expiration,
-                            raw_volume,
-                            net_volume,
-                            net_premium
-                        FROM flow_by_contract
-                        WHERE symbol = $1
-                          AND timestamp >= $2
-                          AND timestamp <= $3
-                          AND ($4::numeric[] IS NULL OR strike = ANY($4::numeric[]))
-                          AND ($5::date[]    IS NULL OR expiration = ANY($5::date[]))
-                    ),
-                    contract_deltas AS (
-                        SELECT
-                            bar_start,
-                            option_type,
-                            strike,
-                            expiration,
-                            (raw_volume  - COALESCE(LAG(raw_volume)  OVER w, 0))::bigint  AS raw_volume_delta,
-                            (net_volume  - COALESCE(LAG(net_volume)  OVER w, 0))::bigint  AS net_volume_delta,
-                            (net_premium - COALESCE(LAG(net_premium) OVER w, 0))::numeric AS net_premium_delta
-                        FROM filtered
-                        WINDOW w AS (PARTITION BY option_type, strike, expiration ORDER BY bar_start)
-                    ),
-                    per_bar AS (
-                        SELECT
-                            bar_start,
-                            SUM(CASE WHEN option_type='C' THEN net_premium_delta ELSE 0 END)::numeric AS call_premium_delta,
-                            SUM(CASE WHEN option_type='P' THEN net_premium_delta ELSE 0 END)::numeric AS put_premium_delta,
-                            SUM(CASE WHEN option_type='C' THEN raw_volume_delta  ELSE 0 END)::bigint  AS call_volume_delta,
-                            SUM(CASE WHEN option_type='P' THEN raw_volume_delta  ELSE 0 END)::bigint  AS put_volume_delta,
-                            SUM(net_volume_delta)::bigint                                             AS net_volume_delta,
-                            SUM(raw_volume_delta)::bigint                                             AS raw_volume_delta,
-                            SUM(CASE WHEN option_type='C' THEN net_volume_delta  ELSE 0 END)::bigint  AS call_position_delta,
-                            SUM(CASE WHEN option_type='P' THEN net_volume_delta  ELSE 0 END)::bigint  AS put_position_delta,
-                            COUNT(*)::int AS contract_count
-                        FROM contract_deltas
-                        GROUP BY bar_start
-                    ),
-                    -- Underlying price comes from the tape (underlying_quotes
-                    -- OHLC), NOT from flow_by_contract.underlying_price. The
-                    -- per-contract column captures each contract's last-trade
-                    -- price, which is stale for contracts that didn't trade
-                    -- in a given bar — aggregating it produces the stair-step
-                    -- artifact where the price sticks for 20–30 minutes and
-                    -- then jumps. Critically, this subquery does NOT see the
-                    -- strike/expiration filters, so underlying_price stays
-                    -- invariant across different filter combinations for the
-                    -- same (symbol, bar_start).
-                    underlying_by_bar AS (
-                        SELECT
-                            (date_trunc('hour', timestamp)
-                             + FLOOR(EXTRACT(MINUTE FROM timestamp)::int / 5)
-                               * INTERVAL '5 minutes') AS bar_start,
-                            (ARRAY_AGG(close ORDER BY timestamp DESC))[1] AS underlying_price
-                        FROM underlying_quotes
-                        WHERE symbol = $1
-                          AND timestamp >= $2
-                          AND timestamp <  $3::timestamptz + INTERVAL '5 minutes'
-                        GROUP BY 1
-                    ),
-                    timeline AS (
-                        -- Gate the timeline on filtered having rows. An empty
-                        -- filter match (T5) returns zero rows rather than 81
-                        -- synthetic zero-cumulative bars.
-                        SELECT g.bar_start
-                        FROM generate_series($2::timestamptz, $3::timestamptz, INTERVAL '5 minutes') AS g(bar_start)
-                        WHERE EXISTS (SELECT 1 FROM filtered)
-                    ),
-                    joined AS (
-                        SELECT
-                            t.bar_start,
-                            COALESCE(pb.call_premium_delta, 0) AS call_premium_delta,
-                            COALESCE(pb.put_premium_delta, 0)  AS put_premium_delta,
-                            COALESCE(pb.call_volume_delta, 0)  AS call_volume_delta,
-                            COALESCE(pb.put_volume_delta, 0)   AS put_volume_delta,
-                            COALESCE(pb.net_volume_delta, 0)   AS net_volume_delta,
-                            COALESCE(pb.raw_volume_delta, 0)   AS raw_volume_delta,
-                            COALESCE(pb.call_position_delta, 0) AS call_position_delta,
-                            COALESCE(pb.put_position_delta, 0)  AS put_position_delta,
-                            ub.underlying_price,
-                            COALESCE(pb.contract_count, 0) AS contract_count,
-                            (pb.bar_start IS NULL) AS is_synthetic
-                        FROM timeline t
-                        LEFT JOIN per_bar           pb USING (bar_start)
-                        LEFT JOIN underlying_by_bar ub USING (bar_start)
-                    ),
-                    carry AS (
-                        -- FIRST_VALUE + partition-by-running-count emulates
-                        -- LAST_VALUE(... IGNORE NULLS) portably (Postgres < 16
-                        -- doesn't support IGNORE NULLS in LAST_VALUE).
-                        SELECT
-                            j.*,
-                            COUNT(underlying_price) OVER (ORDER BY bar_start ROWS UNBOUNDED PRECEDING) AS up_grp
-                        FROM joined j
+                if (
+                    self._flow_series_use_snapshot
+                    and strikes_arg is None
+                    and expirations_arg is None
+                ):
+                    # Phase-2 snapshot read. The 8-CTE pipeline has been
+                    # pre-materialised per (symbol, bar_start) by the
+                    # Analytics Engine; closed bars are window-invariant
+                    # (outer window is ROWS UNBOUNDED PRECEDING ORDER BY
+                    # bar_start) so this is byte-identical to the CTE for
+                    # the same resolved window. Filtered calls never reach
+                    # here — the snapshot is keyed (symbol, bar_start) only
+                    # and can't answer per-strike/expiration questions.
+                    rows = await asyncio.wait_for(
+                        conn.fetch(
+                            SNAPSHOT_SELECT_ASYNCPG,
+                            symbol,
+                            session_start,
+                            session_end,
+                        ),
+                        timeout=15.0,
                     )
-                    SELECT
-                        bar_start,
-                        SUM(call_premium_delta)  OVER w_cum AS call_premium_cum,
-                        SUM(put_premium_delta)   OVER w_cum AS put_premium_cum,
-                        SUM(call_volume_delta)   OVER w_cum AS call_volume_cum,
-                        SUM(put_volume_delta)    OVER w_cum AS put_volume_cum,
-                        SUM(net_volume_delta)    OVER w_cum AS net_volume_cum,
-                        SUM(raw_volume_delta)    OVER w_cum AS raw_volume_cum,
-                        SUM(call_position_delta) OVER w_cum AS call_position_cum,
-                        SUM(put_position_delta)  OVER w_cum AS put_position_cum,
-                        (SUM(call_premium_delta) OVER w_cum
-                         + SUM(put_premium_delta) OVER w_cum) AS net_premium_cum,
-                        CASE
-                            WHEN SUM(call_volume_delta) OVER w_cum > 0
-                            THEN (SUM(put_volume_delta) OVER w_cum)::float8
-                               / (SUM(call_volume_delta) OVER w_cum)::float8
-                            ELSE NULL
-                        END AS put_call_ratio,
-                        FIRST_VALUE(underlying_price) OVER (
-                            PARTITION BY up_grp ORDER BY bar_start
-                        ) AS underlying_price,
-                        contract_count,
-                        is_synthetic
-                    FROM carry
-                    WINDOW w_cum AS (ORDER BY bar_start ROWS UNBOUNDED PRECEDING)
-                    ORDER BY bar_start DESC
-                """
-
-                rows = await asyncio.wait_for(
-                    conn.fetch(
-                        query,
-                        symbol,
-                        session_start,
-                        session_end,
-                        strikes_arg,
-                        expirations_arg,
-                    ),
-                    timeout=15.0,
-                )
+                    expected = _expected_flow_series_bars(session_start, session_end)
+                    if 0 < len(rows) < expected:
+                        # Trust the snapshot but surface the shortfall: a
+                        # partial window means the Analytics Engine missed
+                        # cycles or backfill hasn't run for this session.
+                        # This is an engine-health alert, not an API
+                        # fallback — a CTE fallback would reintroduce the
+                        # heavy scan exactly when the system is degraded.
+                        logger.warning(
+                            "flow_series_5min shortfall for %s %s: %d rows, "
+                            "expected up to %d for window [%s, %s]",
+                            symbol,
+                            session,
+                            len(rows),
+                            expected,
+                            session_start.isoformat(),
+                            session_end.isoformat(),
+                        )
+                else:
+                    rows = await asyncio.wait_for(
+                        conn.fetch(
+                            FLOW_SERIES_CTE_ASYNCPG,
+                            symbol,
+                            session_start,
+                            session_end,
+                            strikes_arg,
+                            expirations_arg,
+                        ),
+                        timeout=15.0,
+                    )
                 result = [dict(row) for row in rows]
                 if intervals is not None and intervals > 0 and len(result) > intervals:
                     # Result is newest-first; take the leading N rows for the

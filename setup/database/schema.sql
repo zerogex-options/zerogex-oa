@@ -627,15 +627,56 @@ CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts_type
 -- "WHERE symbol = $1 AND timestamp BETWEEN $2 AND $3" as an
 -- index-only scan and skip the ~3,000 heap-page bitmap-heap-scan that
 -- dominates execution time on a cache miss (see database.py
--- get_flow_series, the `filtered` CTE). Stays useful even after the
--- planned flow_series_5min snapshot table lands — at that point the
--- /api/flow/series read path bypasses flow_by_contract entirely and
--- this index can be DROP'd CONCURRENTLY to reclaim ~200 MB.
+-- get_flow_series, the `filtered` CTE).
+--
+-- TODO(flow-series-snapshot): NOT dropped in this PR. The
+-- flow_series_5min snapshot table below makes the unfiltered
+-- /api/flow/series read bypass flow_by_contract entirely, at which
+-- point this index serves only the strike/expiration-filtered path
+-- (already fast via flow_by_contract_pkey). Once the snapshot has been
+-- verified in production for a few sessions (engine writes + backfill
+-- match the live CTE), drop this with DROP INDEX CONCURRENTLY
+-- idx_flow_by_contract_symbol_ts_series_covering to reclaim ~200 MB —
+-- as a separate cleanup commit, not here.
 CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts_series_covering
     ON flow_by_contract(symbol, timestamp DESC)
     INCLUDE (option_type, strike, expiration, raw_volume, net_volume, net_premium);
 CREATE INDEX IF NOT EXISTS idx_flow_smart_money_symbol_ts
     ON flow_smart_money(symbol, timestamp DESC);
+
+-- Pre-aggregated /api/flow/series snapshot. One row per (symbol,
+-- bar_start) 5-minute bucket holding exactly what the get_flow_series
+-- outer SELECT produces. The Analytics Engine UPSERTs the current
+-- session's rows every cycle (mirrors how gex_summary is written) and
+-- src/tools/flow_series_5min_backfill.py bootstraps history; the
+-- unfiltered /api/flow/series read then SELECTs straight from here
+-- instead of running the 8-CTE pipeline. Column types match the CTE's
+-- emitted types so asyncpg decodes them identically (NUMERIC -> Decimal,
+-- BIGINT -> int, float8 -> float). underlying_price mirrors
+-- underlying_quotes.close (NUMERIC(12,4)); it is NULL-able because the
+-- CTE's carry-forward yields NULL for bars before the first quote of a
+-- session. is_synthetic flags carry-forward (no-flow) bars.
+CREATE TABLE IF NOT EXISTS flow_series_5min (
+    symbol            VARCHAR(10)  NOT NULL,
+    bar_start         TIMESTAMPTZ  NOT NULL,
+    call_premium_cum  NUMERIC,
+    put_premium_cum   NUMERIC,
+    call_volume_cum   BIGINT,
+    put_volume_cum    BIGINT,
+    net_volume_cum    BIGINT,
+    raw_volume_cum    BIGINT,
+    call_position_cum BIGINT,
+    put_position_cum  BIGINT,
+    net_premium_cum   NUMERIC,
+    put_call_ratio    DOUBLE PRECISION,
+    underlying_price  NUMERIC(12, 4),
+    contract_count    INTEGER,
+    is_synthetic      BOOLEAN,
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (symbol, bar_start)
+);
+CREATE INDEX IF NOT EXISTS idx_flow_series_5min_symbol_bar
+    ON flow_series_5min(symbol, bar_start DESC);
 
 -- Symbol FKs on the flow tables. Mirrors the pattern other tables use
 -- (option_chains, gex_summary, gex_by_strike) so deleting a symbol
@@ -655,6 +696,11 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_flow_smart_money_symbol') THEN
         ALTER TABLE flow_smart_money
         ADD CONSTRAINT fk_flow_smart_money_symbol
+        FOREIGN KEY (symbol) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_flow_series_5min_symbol') THEN
+        ALTER TABLE flow_series_5min
+        ADD CONSTRAINT fk_flow_series_5min_symbol
         FOREIGN KEY (symbol) REFERENCES symbols(symbol) ON DELETE CASCADE;
     END IF;
 END $$;

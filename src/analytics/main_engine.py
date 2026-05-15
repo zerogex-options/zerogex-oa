@@ -29,6 +29,7 @@ from src.utils import get_logger
 from src.config import RISK_FREE_RATE, ANALYTICS_FLOW_CACHE_REFRESH_ENABLED
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.analytics.walls import compute_call_put_walls
+from src.flow_series_sql import SNAPSHOT_UPSERT_PSYCOPG2
 from src.market_calendar import (
     calculate_time_to_expiration,
     is_engine_run_window,
@@ -626,9 +627,7 @@ class AnalyticsEngine:
 
         return max_pain_strike
 
-    def _calculate_max_pain_by_expiration(
-        self, options: List[Dict[str, Any]]
-    ) -> Dict[Any, float]:
+    def _calculate_max_pain_by_expiration(self, options: List[Dict[str, Any]]) -> Dict[Any, float]:
         """Return ``{expiration: max_pain_strike}`` for every expiration.
 
         Each expiration's max pain is computed independently — that's the
@@ -969,12 +968,17 @@ class AnalyticsEngine:
             # Serialize {date -> strike} into a JSON-shaped dict with
             # iso-date keys.  psycopg2 will adapt the dict to JSONB.
             import json as _json
-            mp_by_exp_json = _json.dumps(
-                {
-                    (exp.isoformat() if hasattr(exp, "isoformat") else str(exp)): float(v)
-                    for exp, v in mp_by_exp_raw.items()
-                }
-            ) if mp_by_exp_raw else None
+
+            mp_by_exp_json = (
+                _json.dumps(
+                    {
+                        (exp.isoformat() if hasattr(exp, "isoformat") else str(exp)): float(v)
+                        for exp, v in mp_by_exp_raw.items()
+                    }
+                )
+                if mp_by_exp_raw
+                else None
+            )
             cursor.execute(
                 """
                 INSERT INTO gex_summary
@@ -1323,6 +1327,68 @@ class AnalyticsEngine:
         except Exception as e:
             logger.error(f"Error refreshing flow caches: {e}", exc_info=True)
 
+    def _refresh_flow_series_snapshot(self, timestamp: datetime):
+        """Materialise flow_series_5min for the current session.
+
+        Runs the *exact* /api/flow/series CTE (unfiltered) for this symbol
+        over the resolved current-session window and UPSERTs every row.
+        The stored rows therefore equal what the API CTE would compute by
+        construction — parity is not re-implemented. The outer window is
+        ROWS UNBOUNDED PRECEDING ORDER BY bar_start, so a closed bar's
+        cumulative values are window-invariant: once its 5-min boundary
+        passes, the row is final and the IS DISTINCT FROM guard turns
+        subsequent cycles into no-ops. Only the open bar (and any quiet
+        carry-forward tail) churns cycle-to-cycle, which is also how the
+        prior bucket gets "finalised" — the next cycle recomputes it to
+        its closed value and writes it once.
+
+        Best-effort and gated by the same flag as the flow-cache refresh:
+        the snapshot is downstream of flow_by_contract, and a failure here
+        must never break the analytics cycle or the GEX path. Mirrors
+        _refresh_flow_caches' error handling (log, do not raise).
+        """
+        if not self._analytics_flow_cache_refresh_enabled:
+            return
+
+        try:
+            # Resolve the current-session window exactly as the API's
+            # _resolve_flow_series_session does for session='current', so
+            # engine-written rows match the window the API will read.
+            ts_et = timestamp.astimezone(ET)
+            session_open_et = ET.localize(datetime(ts_et.year, ts_et.month, ts_et.day, 9, 30))
+            session_start = session_open_et.astimezone(timezone.utc)
+            session_close = session_start + timedelta(hours=6, minutes=45)
+            now_utc = datetime.now(timezone.utc)
+            now_floor_epoch = int(now_utc.timestamp() // 300) * 300
+            now_floored = datetime.fromtimestamp(now_floor_epoch, tz=timezone.utc)
+            session_end = min(now_floored, session_close)
+            if session_end < session_start:
+                session_end = session_start
+
+            with db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    SNAPSHOT_UPSERT_PSYCOPG2,
+                    {
+                        "symbol": self.db_symbol,
+                        "session_start": session_start,
+                        "session_end": session_end,
+                        "strikes": None,
+                        "expirations": None,
+                    },
+                )
+                conn.commit()
+                logger.info(
+                    "flow_series_5min snapshot upserted %d rows for %s " "(window [%s, %s])",
+                    cursor.rowcount,
+                    self.db_symbol,
+                    session_start.isoformat(),
+                    session_end.isoformat(),
+                )
+
+        except Exception as e:
+            logger.error(f"Error refreshing flow_series_5min snapshot: {e}", exc_info=True)
+
     def run_calculation(self) -> bool:
         """
         Run one complete analytics calculation cycle
@@ -1393,6 +1459,13 @@ class AnalyticsEngine:
             t0 = _time.monotonic()
             self._refresh_flow_caches(latest_timestamp, underlying_price)
             stage_timings["refresh_flow_caches"] = _time.monotonic() - t0
+
+            # Materialise the flow_series_5min snapshot off the same
+            # timestamp (downstream of the flow_by_contract refresh above).
+            logger.info("Refreshing flow series snapshot...")
+            t0 = _time.monotonic()
+            self._refresh_flow_series_snapshot(latest_timestamp)
+            stage_timings["flow_series_snapshot"] = _time.monotonic() - t0
 
             # Log summary
             logger.info("")
