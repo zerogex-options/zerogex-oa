@@ -652,8 +652,7 @@ class SignalsQueriesMixin:
 
         cache_key = (
             "signal_confluence_matrix:"
-            f"{symbol}:{lookback}:{neutral_epsilon}:"
-            + ",".join(sorted(component_names))
+            f"{symbol}:{lookback}:{neutral_epsilon}:" + ",".join(sorted(component_names))
         )
         cached = self._cache_get(cache_key)
         if cached is not None:
@@ -781,9 +780,7 @@ class SignalsQueriesMixin:
 
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(
-                    query, symbol, lookback, component_names, neutral_epsilon
-                )
+                rows = await conn.fetch(query, symbol, lookback, component_names, neutral_epsilon)
 
             sample_count = 0
             latest_timestamp = None
@@ -801,12 +798,8 @@ class SignalsQueriesMixin:
                             "agreement_count": agree,
                             "disagreement_count": disagree,
                             "neutral_count": row["neutral_count"] or 0,
-                            "agreement_ratio": (
-                                round(agree / active, 4) if active else None
-                            ),
-                            "disagreement_ratio": (
-                                round(disagree / active, 4) if active else None
-                            ),
+                            "agreement_ratio": (round(agree / active, 4) if active else None),
+                            "disagreement_ratio": (round(disagree / active, 4) if active else None),
                             "net_confluence": (
                                 round((agree - disagree) / active, 4) if active else 0.0
                             ),
@@ -823,12 +816,8 @@ class SignalsQueriesMixin:
                             "agreement_count": agree,
                             "disagreement_count": disagree,
                             "neutral_count": row["neutral_count"] or 0,
-                            "agreement_ratio": (
-                                round(agree / active, 4) if active else None
-                            ),
-                            "disagreement_ratio": (
-                                round(disagree / active, 4) if active else None
-                            ),
+                            "agreement_ratio": (round(agree / active, 4) if active else None),
+                            "disagreement_ratio": (round(disagree / active, 4) if active else None),
                         }
                 elif kind == "meta":
                     sample_count = row["sample_count"] or 0

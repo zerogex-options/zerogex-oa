@@ -98,10 +98,9 @@ class AnalyticsEngine:
         # (e.g. Friday's close on a Saturday) rather than reporting nothing.
         # A longer interval is used off-hours since the underlying data is
         # static until the next session.
-        self.off_hours_enabled = (
-            os.getenv("ANALYTICS_OFF_HOURS_ENABLED", "true").strip().lower()
-            in ("1", "true", "yes", "on")
-        )
+        self.off_hours_enabled = os.getenv(
+            "ANALYTICS_OFF_HOURS_ENABLED", "true"
+        ).strip().lower() in ("1", "true", "yes", "on")
         self.off_hours_interval = max(
             self.calculation_interval,
             int(os.getenv("ANALYTICS_OFF_HOURS_INTERVAL_SECONDS", "300")),
@@ -186,9 +185,7 @@ class AnalyticsEngine:
         reverts on commit/rollback, so it never leaks to other queries.
         """
         if statement_timeout_ms and statement_timeout_ms > 0:
-            cursor.execute(
-                "SET LOCAL statement_timeout = %s", (str(int(statement_timeout_ms)),)
-            )
+            cursor.execute("SET LOCAL statement_timeout = %s", (str(int(statement_timeout_ms)),))
         lookback_start = timestamp - timedelta(hours=lookback_hours)
         cursor.execute(
             self._SNAPSHOT_QUERY,
@@ -356,9 +353,8 @@ class AnalyticsEngine:
                 snapshot_row_cap = int(os.getenv("ANALYTICS_SNAPSHOT_MAX_ROWS", "50000"))
 
                 data_age = datetime.now(timezone.utc) - timestamp
-                want_cold_start = (
-                    not self._snapshot_cold_start_consumed
-                    and data_age > timedelta(hours=self.snapshot_lookback_hours)
+                want_cold_start = not self._snapshot_cold_start_consumed and data_age > timedelta(
+                    hours=self.snapshot_lookback_hours
                 )
                 self._snapshot_cold_start_consumed = True
 
@@ -518,7 +514,9 @@ class AnalyticsEngine:
     # time value into Greeks downstream.
     def _calculate_time_to_expiration(self, current_date: datetime, expiration_date) -> float:
         close_t = expiration_close_time_et(self.db_symbol, expiration_date)
-        return calculate_time_to_expiration(current_date, expiration_date, market_close_time=close_t)
+        return calculate_time_to_expiration(
+            current_date, expiration_date, market_close_time=close_t
+        )
 
     def _calculate_vanna(self, S: float, K: float, T: float, r: float, sigma: float) -> float:
         """
@@ -1392,10 +1390,22 @@ class AnalyticsEngine:
                 # in docs/runbooks/smart_money_calibration.md.
                 notional_per_contract = max(float(underlying_price or 0.0) * 100.0, 1.0)
                 # Tier 1..4 premium thresholds = N x notional_per_contract.
-                prem_t1 = float(os.getenv("SMART_MONEY_PREM_T1_NOTIONAL_X", "1.0")) * notional_per_contract
-                prem_t2 = float(os.getenv("SMART_MONEY_PREM_T2_NOTIONAL_X", "2.0")) * notional_per_contract
-                prem_t3 = float(os.getenv("SMART_MONEY_PREM_T3_NOTIONAL_X", "5.0")) * notional_per_contract
-                prem_t4 = float(os.getenv("SMART_MONEY_PREM_T4_NOTIONAL_X", "10.0")) * notional_per_contract
+                prem_t1 = (
+                    float(os.getenv("SMART_MONEY_PREM_T1_NOTIONAL_X", "1.0"))
+                    * notional_per_contract
+                )
+                prem_t2 = (
+                    float(os.getenv("SMART_MONEY_PREM_T2_NOTIONAL_X", "2.0"))
+                    * notional_per_contract
+                )
+                prem_t3 = (
+                    float(os.getenv("SMART_MONEY_PREM_T3_NOTIONAL_X", "5.0"))
+                    * notional_per_contract
+                )
+                prem_t4 = (
+                    float(os.getenv("SMART_MONEY_PREM_T4_NOTIONAL_X", "10.0"))
+                    * notional_per_contract
+                )
                 # Volume tiers in contract counts.
                 vol_t1 = int(os.getenv("SMART_MONEY_VOL_T1", "50"))
                 vol_t2 = int(os.getenv("SMART_MONEY_VOL_T2", "100"))
@@ -1487,9 +1497,15 @@ class AnalyticsEngine:
                         timestamp,
                         self.db_symbol,
                         # Volume score tiers (descending so the highest matches first)
-                        vol_t4, vol_t3, vol_t2, vol_t1,
+                        vol_t4,
+                        vol_t3,
+                        vol_t2,
+                        vol_t1,
                         # Premium score tiers (descending)
-                        prem_t4, prem_t3, prem_t2, prem_t1,
+                        prem_t4,
+                        prem_t3,
+                        prem_t2,
+                        prem_t1,
                         underlying_price,
                         timestamp,
                         # Inclusion filter: floor matches t1

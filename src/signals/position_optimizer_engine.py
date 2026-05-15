@@ -1426,4 +1426,3 @@ class PositionOptimizerEngine:
             top_reasoning=best.reasoning,
             candidates=candidates,
         )
-

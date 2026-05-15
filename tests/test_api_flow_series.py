@@ -372,6 +372,7 @@ def _attach_by_contract_mock(mainmod, returns):
     # Instance-level patching alone was a no-op once the lifespan ran;
     # the previous silent ``except Exception`` in get_flow masked that.
     from src.api import database as dbmod
+
     dbmod.DatabaseManager.get_flow = AsyncMock(return_value=returns)  # type: ignore[method-assign]
     mainmod.db_manager = mainmod.db_manager or mainmod.DatabaseManager()
     mainmod.db_manager.get_flow = AsyncMock(return_value=returns)  # type: ignore[method-assign]

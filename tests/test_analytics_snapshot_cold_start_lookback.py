@@ -66,9 +66,7 @@ def _mock_db_connection(latest_ts, underlying_price, option_rows, fail_cold_star
         if "DISTINCT ON" in sql:
             state["snapshot_calls"] += 1
             if fail_cold_start and state["snapshot_calls"] == 1:
-                raise psycopg2.errors.QueryCanceled(
-                    "canceling statement due to statement timeout"
-                )
+                raise psycopg2.errors.QueryCanceled("canceling statement due to statement timeout")
         return None
 
     cursor.execute.side_effect = execute_side_effect

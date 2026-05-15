@@ -728,9 +728,7 @@ class IngestionEngine:
         else:
             bucket_et = bucket.astimezone(ET)
         session_date = bucket_et.date()
-        session_start_et = ET.localize(
-            datetime.combine(session_date, dt_time(0, 0))
-        )
+        session_start_et = ET.localize(datetime.combine(session_date, dt_time(0, 0)))
         session_start_utc = session_start_et.astimezone(timezone.utc)
 
         cache_key = (option_symbol, session_date)
@@ -777,7 +775,8 @@ class IngestionEngine:
         """
         with self._option_volume_baseline_lock:
             stale_keys = [
-                key for key in self._option_volume_baseline
+                key
+                for key in self._option_volume_baseline
                 if isinstance(key, tuple) and key[0] == option_symbol
             ]
             for key in stale_keys:

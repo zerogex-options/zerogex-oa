@@ -6,7 +6,6 @@ import os
 
 from src.signals.components.base import ComponentBase, MarketContext
 
-
 # Per-symbol PCR distributions differ enough that a single saturation
 # scale (formerly hardcoded ``0.4``) over-confidently maps moderate SPX
 # PCR into the same -1/+1 buckets as extreme SPY PCR.  Calibration is

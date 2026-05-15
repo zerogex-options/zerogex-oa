@@ -43,9 +43,7 @@ def test_off_hours_disabled_sleeps_until_next_window(monkeypatch):
     engine = AnalyticsEngine(underlying="SPY")
 
     monkeypatch.setattr(main_engine, "is_engine_run_window", lambda: False)
-    monkeypatch.setattr(
-        main_engine, "seconds_until_engine_run_window", lambda: 123
-    )
+    monkeypatch.setattr(main_engine, "seconds_until_engine_run_window", lambda: 123)
     run_calc = MagicMock(return_value=True)
     engine.run_calculation = run_calc
 
