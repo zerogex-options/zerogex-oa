@@ -248,6 +248,15 @@ class AnalyticsEngine:
                 else:
                     min_expiration = ts_et.date()
                 self._snapshot_cold_start_consumed = True
+                # Hard cap on rows returned.  The previous value of 2000 was
+                # below the contract count for SPX (~7k–14k unique option
+                # symbols during an active session) and was silently
+                # truncating the lexicographic tail of the DISTINCT ON
+                # walk -- producing a deterministic bias in GEX/max-pain
+                # against contracts whose option_symbol sorts last.
+                # The new cap is well above any realistic chain size; if
+                # we hit it we log a warning rather than silently dropping.
+                snapshot_row_cap = int(os.getenv("ANALYTICS_SNAPSHOT_MAX_ROWS", "50000"))
                 cursor.execute(
                     """
                     SELECT DISTINCT ON (oc.option_symbol)
@@ -273,12 +282,24 @@ class AnalyticsEngine:
                       AND oc.expiration > %s
                       AND oc.gamma IS NOT NULL
                     ORDER BY oc.option_symbol, oc.timestamp DESC
-                    LIMIT 2000
+                    LIMIT %s
                     """,
-                    (self.db_symbol, timestamp, lookback_start, min_expiration),
+                    (
+                        self.db_symbol,
+                        timestamp,
+                        lookback_start,
+                        min_expiration,
+                        snapshot_row_cap,
+                    ),
                 )
                 rows = cursor.fetchall()
                 conn.commit()
+                if len(rows) >= snapshot_row_cap:
+                    logger.warning(
+                        "Analytics snapshot hit row cap (%d). GEX/max-pain "
+                        "may be incomplete; raise ANALYTICS_SNAPSHOT_MAX_ROWS.",
+                        snapshot_row_cap,
+                    )
 
                 options = [
                     {
@@ -374,17 +395,16 @@ class AnalyticsEngine:
         d2 = d1 - sigma * np.sqrt(T)
 
         # Call charm: -N'(d1) * [2rT - d2*sigma*sqrt(T)] / [2T*sigma*sqrt(T)]
-        # Put charm adds the risk-free drift term: call_charm + r*e^{-rT}
-        call_charm = (
+        # With q=0 (no dividend yield, the model used everywhere else in
+        # this codebase), put charm equals call charm:
+        #   Δ_put = Δ_call − 1 (put-call parity), so ∂Δ_put/∂t = ∂Δ_call/∂t.
+        # The previous version added r·e^(−rT) for puts; that's a theta
+        # adjustment, not a charm one, and is incorrect at q=0.
+        charm = (
             -stats.norm.pdf(d1)
             * (2 * r * T - d2 * sigma * np.sqrt(T))
             / (2 * T * sigma * np.sqrt(T))
         )
-
-        if option_type == "C":
-            charm = call_charm
-        else:  # Put
-            charm = call_charm + r * np.exp(-r * T)
 
         # Convert to per day
         charm_per_day = charm / 365.0
@@ -547,16 +567,18 @@ class AnalyticsEngine:
         self, options: List[Dict[str, Any]], strike_range: Optional[Tuple[float, float]] = None
     ) -> Optional[float]:
         """
-        Calculate Max Pain as the strike that minimizes total intrinsic payout.
+        Calculate Max Pain for a SINGLE-expiration option set.
 
-        Convention used here:
+        Callers must filter ``options`` to one expiration; the function does
+        not partition internally.  Pooling across expirations conflates
+        contracts that settle at different times and produces a synthetic
+        value that doesn't correspond to any real settlement event.  Use
+        ``_calculate_max_pain_by_expiration`` for multi-expiration data.
+
+        Convention:
         - We compute intrinsic payout to option holders at each candidate strike.
         - "Max pain" is the strike where this aggregate payout is lowest
           (i.e., minimum liability for option writers).
-
-        Args:
-            options: List of option data
-            strike_range: Optional (min_strike, max_strike) to limit search
 
         Returns:
             Max pain strike price, or ``None`` when there's no usable data.
@@ -603,6 +625,26 @@ class AnalyticsEngine:
         max_pain_strike = min(strike_payouts.items(), key=lambda x: x[1])[0]
 
         return max_pain_strike
+
+    def _calculate_max_pain_by_expiration(
+        self, options: List[Dict[str, Any]]
+    ) -> Dict[Any, float]:
+        """Return ``{expiration: max_pain_strike}`` for every expiration.
+
+        Each expiration's max pain is computed independently — that's the
+        actual definition of max pain (the settlement strike that
+        minimizes writer liability at *that* expiration's settlement).
+        """
+        by_exp: Dict[Any, List[Dict[str, Any]]] = defaultdict(list)
+        for opt in options:
+            by_exp[opt["expiration"]].append(opt)
+
+        result: Dict[Any, float] = {}
+        for exp, exp_options in by_exp.items():
+            mp = self._calculate_max_pain(exp_options)
+            if mp is not None:
+                result[exp] = mp
+        return result
 
     def _calculate_gamma_flip_point(
         self, gex_by_strike: List[Dict[str, Any]], underlying_price: float
@@ -665,14 +707,36 @@ class AnalyticsEngine:
             logger.warning("No GEX data to summarize")
             return None
 
-        # Find max gamma strike
-        max_gamma_strike = max(gex_by_strike, key=lambda x: abs(x["net_gex"]))
+        # Find max gamma strike.  Each gex_by_strike row is one
+        # (strike, expiration) pair; aggregate net_gex by strike across
+        # expirations first so a strike that's moderate at each
+        # expiration but dominant in aggregate isn't passed over in
+        # favor of a single-expiration outlier.  Matches the industry
+        # convention used by SpotGamma / SqueezeMetrics.
+        _agg_by_strike: Dict[float, float] = defaultdict(float)
+        for _row in gex_by_strike:
+            _agg_by_strike[_row["strike"]] += _row["net_gex"]
+        _mgs_strike, _mgs_value = max(_agg_by_strike.items(), key=lambda kv: abs(kv[1]))
+        max_gamma_strike = {"strike": _mgs_strike, "net_gex": _mgs_value}
 
         # Calculate gamma flip point
         gamma_flip_point = self._calculate_gamma_flip_point(gex_by_strike, underlying_price)
 
-        # Calculate max pain
-        max_pain = self._calculate_max_pain(options)
+        # Calculate max pain per expiration, then pick the front month
+        # (nearest non-expired settlement) for the headline scalar.  The
+        # full per-expiration dict is persisted in gex_summary.max_pain_by_expiration
+        # for callers that want the breakdown.  Pooling all expirations
+        # into a single max-pain (the previous behavior) produced a
+        # synthetic blended number that didn't correspond to any actual
+        # settlement event.
+        max_pain_by_exp = self._calculate_max_pain_by_expiration(options)
+        if max_pain_by_exp:
+            today = timestamp.astimezone(ET).date()
+            future = sorted(e for e in max_pain_by_exp.keys() if e >= today)
+            front_exp = future[0] if future else min(max_pain_by_exp.keys())
+            max_pain = max_pain_by_exp[front_exp]
+        else:
+            max_pain = None
 
         # Total volumes and OI
         total_call_volume = sum(opt["volume"] for opt in options if opt["option_type"] == "C")
@@ -735,6 +799,7 @@ class AnalyticsEngine:
             "total_net_gex": total_net_gex,
             "call_wall": call_wall,
             "put_wall": put_wall,
+            "max_pain_by_expiration": max_pain_by_exp,
         }
 
         return summary
@@ -900,14 +965,25 @@ class AnalyticsEngine:
 
             call_wall_val = summary.get("call_wall")
             put_wall_val = summary.get("put_wall")
+            mp_by_exp_raw = summary.get("max_pain_by_expiration") or {}
+            # Serialize {date -> strike} into a JSON-shaped dict with
+            # iso-date keys.  psycopg2 will adapt the dict to JSONB.
+            import json as _json
+            mp_by_exp_json = _json.dumps(
+                {
+                    (exp.isoformat() if hasattr(exp, "isoformat") else str(exp)): float(v)
+                    for exp, v in mp_by_exp_raw.items()
+                }
+            ) if mp_by_exp_raw else None
             cursor.execute(
                 """
                 INSERT INTO gex_summary
                 (underlying, timestamp, max_gamma_strike, max_gamma_value,
                  gamma_flip_point, put_call_ratio, max_pain, total_call_volume,
                  total_put_volume, total_call_oi, total_put_oi, total_net_gex,
-                 flip_distance, local_gex, convexity_risk, call_wall, put_wall)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 flip_distance, local_gex, convexity_risk, call_wall, put_wall,
+                 max_pain_by_expiration)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (underlying, timestamp) DO UPDATE SET
                     max_gamma_strike = EXCLUDED.max_gamma_strike,
                     max_gamma_value = EXCLUDED.max_gamma_value,
@@ -923,7 +999,8 @@ class AnalyticsEngine:
                     local_gex = EXCLUDED.local_gex,
                     convexity_risk = EXCLUDED.convexity_risk,
                     call_wall = EXCLUDED.call_wall,
-                    put_wall = EXCLUDED.put_wall
+                    put_wall = EXCLUDED.put_wall,
+                    max_pain_by_expiration = EXCLUDED.max_pain_by_expiration
                 WHERE
                     EXCLUDED.max_gamma_strike IS DISTINCT FROM gex_summary.max_gamma_strike
                     OR EXCLUDED.max_gamma_value IS DISTINCT FROM gex_summary.max_gamma_value
@@ -940,6 +1017,7 @@ class AnalyticsEngine:
                     OR EXCLUDED.convexity_risk IS DISTINCT FROM gex_summary.convexity_risk
                     OR EXCLUDED.call_wall IS DISTINCT FROM gex_summary.call_wall
                     OR EXCLUDED.put_wall IS DISTINCT FROM gex_summary.put_wall
+                    OR EXCLUDED.max_pain_by_expiration IS DISTINCT FROM gex_summary.max_pain_by_expiration
             """,
                 (
                     summary["underlying"],
@@ -959,6 +1037,7 @@ class AnalyticsEngine:
                     float(convexity_risk) if convexity_risk is not None else None,
                     float(call_wall_val) if call_wall_val is not None else None,
                     float(put_wall_val) if put_wall_val is not None else None,
+                    mp_by_exp_json,
                 ),
             )
             if commit:

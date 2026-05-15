@@ -19,7 +19,7 @@ import threading
 import time
 import time as _time
 from multiprocessing import Process
-from datetime import datetime
+from datetime import datetime, time as dt_time, timezone
 from typing import Dict, Any, List, Optional
 from collections import defaultdict, OrderedDict
 import pytz
@@ -109,7 +109,11 @@ class IngestionEngine:
         # timestamp drives a TTL so the cache self-heals after any external
         # DB write (data-retention sweeps, backfills, failed writes that
         # left the cache ahead of the DB, etc.).
-        self._option_volume_baseline: Dict[str, tuple[int, float]] = {}
+        # Cache key is (option_symbol, session_date_ET) so a baseline from
+        # a prior session can't survive into a new session — TradeStation
+        # resets cumulative volume to 0 at session open.  See
+        # _get_option_volume_baseline for the read path.
+        self._option_volume_baseline: Dict[tuple, tuple[int, float]] = {}
         self._option_volume_baseline_lock = threading.Lock()
         self._option_volume_baseline_ttl = float(
             os.getenv("OPTION_VOLUME_BASELINE_TTL_SECONDS", "1800")
@@ -127,8 +131,20 @@ class IngestionEngine:
         self._option_last_quote_lock = threading.Lock()
         self._option_last_quote_max = int(os.getenv("OPTION_LAST_QUOTE_CACHE_MAX", "10000"))
 
-        # Track latest underlying price for Greeks calculation
+        # Track latest underlying price for Greeks calculation.  Pair it
+        # with the timestamp of the underlying bar so we can refuse to
+        # compute Greeks against a price that's drifted: delta and gamma
+        # are highly sensitive to S near strike, and a 5-minute-stale
+        # price across a 10bp move would produce nonsense Greeks that
+        # then get persisted to option_chains and propagate through every
+        # downstream calculation.
         self.latest_underlying_price: Optional[float] = None
+        self.latest_underlying_timestamp: Optional[datetime] = None
+        self.greeks_max_underlying_age_seconds = float(
+            os.getenv("GREEKS_MAX_UNDERLYING_AGE_SECONDS", "90")
+        )
+        # Counter so operators can see how often staleness rejects fire.
+        self.greeks_stale_underlying_rejects = 0
 
         # Greeks calculator (initialize if enabled)
         self.greeks_calculator = None
@@ -278,10 +294,16 @@ class IngestionEngine:
         self._upsert_underlying_quote(payload)
         self._last_underlying_signature = payload_sig
 
-        # Track latest underlying price for Greeks calculation
+        # Track latest underlying price for Greeks calculation.  Paired
+        # with the bar timestamp so _enrich_with_greeks can refuse stale
+        # prices — delta/gamma are highly sensitive to S near strike and
+        # silently using a 10-minute-old price would corrupt the
+        # persisted Greeks for any option that quotes faster than the
+        # underlying bar feed updates.
         old_price = self.latest_underlying_price
         if "close" in data and data["close"] > 0:
             self.latest_underlying_price = data["close"]
+            self.latest_underlying_timestamp = data.get("timestamp") or datetime.now(ET)
 
             # Log when we first get underlying price (important for Greeks)
             if old_price is None:
@@ -350,6 +372,32 @@ class IngestionEngine:
             return None
 
         if self.greeks_calculator and self.latest_underlying_price:
+            # Refuse to compute Greeks against a stale underlying price.
+            # The threshold is configurable; 90s is conservative enough to
+            # let pre-market low-frequency underlying bars through while
+            # still rejecting outright stale prices (halts, feed gaps).
+            if self.latest_underlying_timestamp is not None:
+                option_ts = data.get("timestamp") or datetime.now(ET)
+                try:
+                    age = (option_ts - self.latest_underlying_timestamp).total_seconds()
+                except TypeError:
+                    # Mismatched naive/aware datetimes — treat as fresh
+                    # rather than rejecting; the underlying writer just
+                    # set the timestamp, this can only happen mid-test.
+                    age = 0.0
+                if age > self.greeks_max_underlying_age_seconds:
+                    self.greeks_stale_underlying_rejects += 1
+                    if self.greeks_stale_underlying_rejects % 100 == 1:
+                        logger.warning(
+                            "Refusing Greeks: underlying price is %.0fs stale "
+                            "(threshold %.0fs). Total rejects this run: %d",
+                            age,
+                            self.greeks_max_underlying_age_seconds,
+                            self.greeks_stale_underlying_rejects,
+                        )
+                    data["delta"] = data["gamma"] = data["theta"] = data["vega"] = None
+                    data["implied_volatility"] = data.get("implied_volatility")
+                    return data
             try:
                 if self.greeks_calculated == 0:
                     logger.info(
@@ -616,6 +664,13 @@ class IngestionEngine:
     def _get_option_volume_baseline(self, option_symbol: str, bucket: datetime) -> int:
         """Get latest persisted cumulative volume before current bucket for a contract.
 
+        Scoped to the bucket's ET session date: TradeStation's option
+        cumulative volume resets to 0 at session start, so a baseline from
+        a prior session would produce ``current - prior_close`` clamped at
+        0 by the consumer — silently zeroing the entire opening-minute
+        volume.  The cache key includes the session date so a stale
+        prior-session entry can't outlive the rollover.
+
         Cached in-memory; entries older than
         ``OPTION_VOLUME_BASELINE_TTL_SECONDS`` are refreshed from the DB
         so the cache self-heals after any external write (retention
@@ -623,8 +678,21 @@ class IngestionEngine:
         the persisted row.
         """
         now = _time.monotonic()
+        # Derive the ET session date for the bucket so we can scope both
+        # the cache and the DB lookup to today's session.
+        if bucket.tzinfo is None:
+            bucket_et = pytz.UTC.localize(bucket).astimezone(ET)
+        else:
+            bucket_et = bucket.astimezone(ET)
+        session_date = bucket_et.date()
+        session_start_et = ET.localize(
+            datetime.combine(session_date, dt_time(0, 0))
+        )
+        session_start_utc = session_start_et.astimezone(timezone.utc)
+
+        cache_key = (option_symbol, session_date)
         with self._option_volume_baseline_lock:
-            cached = self._option_volume_baseline.get(option_symbol)
+            cached = self._option_volume_baseline.get(cache_key)
         if cached is not None:
             value, cached_at = cached
             if (now - cached_at) < self._option_volume_baseline_ttl:
@@ -639,15 +707,16 @@ class IngestionEngine:
                     FROM option_chains
                     WHERE option_symbol = %s
                       AND timestamp < %s
+                      AND timestamp >= %s
                     ORDER BY timestamp DESC
                     LIMIT 1
                     """,
-                    (option_symbol, bucket),
+                    (option_symbol, bucket, session_start_utc),
                 )
                 row = cursor.fetchone()
                 baseline = int(row[0]) if row and row[0] is not None else 0
                 with self._option_volume_baseline_lock:
-                    self._option_volume_baseline[option_symbol] = (baseline, now)
+                    self._option_volume_baseline[cache_key] = (baseline, now)
                 return baseline
         except Exception as e:
             logger.warning(f"Failed loading volume baseline for {option_symbol}: {e}")
@@ -658,9 +727,18 @@ class IngestionEngine:
             return 0
 
     def _invalidate_option_volume_baseline(self, option_symbol: str) -> None:
-        """Drop a contract's cached baseline so the next read hits the DB."""
+        """Drop a contract's cached baseline so the next read hits the DB.
+
+        The cache key is ``(option_symbol, session_date)`` — invalidating
+        the contract removes all session-date variants.
+        """
         with self._option_volume_baseline_lock:
-            self._option_volume_baseline.pop(option_symbol, None)
+            stale_keys = [
+                key for key in self._option_volume_baseline
+                if isinstance(key, tuple) and key[0] == option_symbol
+            ]
+            for key in stale_keys:
+                self._option_volume_baseline.pop(key, None)
         self._invalidate_option_last_quote(option_symbol)
 
     def _invalidate_option_last_quote(self, option_symbol: str) -> None:
