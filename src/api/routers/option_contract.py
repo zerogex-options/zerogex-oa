@@ -6,7 +6,7 @@ GET /api/option/contract?underlying=SPY&strike=500&expiration=2025-01-17&option_
 Returns all intraday rows for the specified option contract. On a trading
 day at or after 09:30 ET this is the current day's session; before the
 09:30 ET open or on a non-trading day (weekend / NYSE holiday) it is the
-most recent date with data for this contract.
+most recent cash session prior to now.
 """
 
 from fastapi import APIRouter, HTTPException, Query, Depends
@@ -71,7 +71,7 @@ async def get_option_contract(
     Returns all rows for the specified option contract. On a trading day at
     or after 09:30 ET, returns the current day's session; before the 09:30 ET
     open, or on a non-trading day (weekend / NYSE holiday), returns the most
-    recent date that has data for this contract.
+    recent cash session prior to now.
 
     Rows are returned newest-first so ``response[0]`` is the most recent
     1-minute bar.
