@@ -19,11 +19,12 @@ same symbols.  New code should import directly from
 from __future__ import annotations
 
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Optional
 
 import pytz
 
+from src.symbols import is_cash_index
 from src.utils import get_logger
 
 logger = get_logger(__name__)
@@ -211,6 +212,48 @@ def get_market_session(dt: Optional[datetime] = None) -> str:
     if current_time < after_hours_end:
         return "after-hours"
     return "closed"
+
+
+def _feed_session_window(session_template: Optional[str]) -> tuple[time, time]:
+    """ET window the TradeStation bar feed delivers data in for a given
+    session template. Unknown/custom templates fail safe to the widest
+    window so a genuine stall is never silenced."""
+    st = (session_template or "").strip().lower()
+    if st == "default":
+        return time(9, 30), time(16, 0)
+    if st == "useqpre":
+        return time(4, 0), time(9, 30)
+    # "useq24hour" and any unrecognised template -> widest (fail safe).
+    return time(4, 0), time(20, 0)
+
+
+def underlying_feed_expected(
+    dt: Optional[datetime],
+    session_template: str = "Default",
+    symbol: Optional[str] = None,
+) -> bool:
+    """True when the underlying bar feed should be producing bars now.
+
+    The window is the TradeStation ``session_template``'s delivery
+    window, EXCEPT cash indices (SPX, NDX, …): their underlying level
+    prints only during the regular cash session (09:30–16:00 ET)
+    regardless of template — the *options* trade extended hours but the
+    index itself does not. Weekends/holidays are always False.
+
+    When this returns False, underlying silence is EXPECTED (post-close
+    / pre-open): refuse Greeks quietly at DEBUG and do NOT warn or
+    attempt a stream reconnect. When True, staleness is a real anomaly.
+    """
+    dt = _to_et(dt)
+    if dt.weekday() > 4 or dt.date() in NYSE_HOLIDAYS:
+        return False
+    open_t, close_t = _feed_session_window(session_template)
+    if symbol and is_cash_index(symbol):
+        # A cash index has no pre/after-hours print even under a 24h
+        # template — clamp to the regular cash session.
+        open_t = max(open_t, time(9, 30))
+        close_t = min(close_t, time(16, 0))
+    return open_t <= dt.time() <= close_t
 
 
 # ---------------------------------------------------------------------------

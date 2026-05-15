@@ -32,6 +32,7 @@ from src.validation import (
     safe_datetime,
     validate_bar_data,
     get_market_session,
+    underlying_feed_expected,
 )
 from src.symbols import resolve_option_root
 from src.config import (
@@ -1304,11 +1305,22 @@ class StreamManager:
 
                 try:
                     # --- underlying stream health checks ---
-                    # Dead reader thread: recover the underlying stream
-                    # only. The options stream is independent and may be
-                    # healthy; restarting it would force an expensive REST
-                    # re-seed and gap option ingestion for no reason.
-                    if not self._underlying_accumulator.is_alive:
+                    # Only treat underlying silence as a fault inside the
+                    # window the feed actually delivers bars: the
+                    # SESSION_TEMPLATE window, clamped to the regular cash
+                    # session for cash indices (SPX has no pre/after-hours
+                    # print). Outside it, silence is expected — don't warn,
+                    # reconnect, or restart a (cleanly-ended) reader.
+                    feed_expected = underlying_feed_expected(
+                        datetime.now(ET), SESSION_TEMPLATE, self.db_underlying
+                    )
+
+                    # Dead reader thread during the live window: recover
+                    # the underlying stream only. The options stream is
+                    # independent and may be healthy; restarting it would
+                    # force an expensive REST re-seed and gap option
+                    # ingestion for no reason.
+                    if feed_expected and not self._underlying_accumulator.is_alive:
                         self._restart_underlying_accumulator("reader thread is DEAD")
 
                     # Drain underlying bar from persistent stream.
@@ -1331,13 +1343,12 @@ class StreamManager:
                         _last_underlying_bar_mono = time.monotonic()
                         _underlying_restart_attempts = 0
                         _underlying_restart_backed_off = False
-                    elif session in ("regular", "pre-market", "after-hours"):
-                        # No bar this cycle while the feed should be live
-                        # (the Greeks freshness check is likewise extended-
-                        # hours-aware). Measure staleness in wall-clock
-                        # seconds: drain counts are coupled to loop wake
-                        # cadence (options wake the loop sub-second) and do
-                        # not measure elapsed time.
+                    elif feed_expected:
+                        # No bar this cycle while the feed should be live.
+                        # Measure staleness in wall-clock seconds: drain
+                        # counts are coupled to loop wake cadence (options
+                        # wake the loop sub-second) and do not measure
+                        # elapsed time.
                         _consecutive_empty_underlying += 1
                         if _last_underlying_bar_mono is None:
                             # Feed hasn't produced its first bar yet (slow

@@ -25,6 +25,7 @@ from src.market_calendar import (  # noqa: F401 — re-exported for back-compat
     is_market_hours,
     load_nyse_holidays as _load_nyse_holidays,
     seconds_until_engine_run_window,
+    underlying_feed_expected,
 )
 
 logger = get_logger(__name__)
