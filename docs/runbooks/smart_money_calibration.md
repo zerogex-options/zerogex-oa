@@ -39,24 +39,60 @@ asymmetric markets:
 | 3    | `SMART_MONEY_VOL_T3=200`                 |
 | 4    | `SMART_MONEY_VOL_T4=500`                 |
 
+## Distribution-based calibration (preferred)
+
+The tiers above are the **cold-start fallback**.  When a positive
+per-symbol rolling p95 of `volume_delta` / `premium` is present in
+`component_normalizer_cache`, the tier breakpoints are instead derived
+from that distribution — the defensible "unusual = upper percentile of
+recent per-contract flow" definition.  Calibration is **per field**:
+volume can be distribution-based while premium falls back to tiers (or
+vice-versa) depending on which p95 rows are populated.
+
+Populate the p95 rows with the existing nightly job:
+
+```
+python -m src.tools.normalizer_cache_refresh           # all active symbols
+python -m src.tools.normalizer_cache_refresh --symbols SPY SPX
+```
+
+It samples per-contract-per-cycle `volume_delta` and `premium_delta`
+from the canonical `flow_contract_facts` (so the distribution matches
+exactly what the smart-money SQL scores) and writes
+`smart_money_volume_delta` / `smart_money_premium` rows.
+
+Distribution tier breakpoints are env-tunable multiples of p95
+(tier 2 sits AT p95 = "unusual"):
+
+| Tier | Volume env var (×p95)               | Premium env var (×p95)               | Default |
+|------|-------------------------------------|--------------------------------------|---------|
+| 1    | `SMART_MONEY_VOL_DIST_T1_P95_X`     | `SMART_MONEY_PREM_DIST_T1_P95_X`     | 0.5     |
+| 2    | `SMART_MONEY_VOL_DIST_T2_P95_X`     | `SMART_MONEY_PREM_DIST_T2_P95_X`     | 1.0     |
+| 3    | `SMART_MONEY_VOL_DIST_T3_P95_X`     | `SMART_MONEY_PREM_DIST_T3_P95_X`     | 2.0     |
+| 4    | `SMART_MONEY_VOL_DIST_T4_P95_X`     | `SMART_MONEY_PREM_DIST_T4_P95_X`     | 4.0     |
+
+A volume tier is floored at 1 so a tiny p95 can never produce a 0
+threshold (which would admit every contract).  Each refresh logs the
+resolved mode (`vol=dist,prem=tier`, etc.) and the p95 inputs at DEBUG.
+
 ## Inclusion filter
 
 A row enters `flow_smart_money` only if at least one of these holds:
 
-- `volume_delta >= SMART_MONEY_VOL_T1`
-- `premium >= SMART_MONEY_PREM_T1_NOTIONAL_X * notional_per_contract`
-- `implied_volatility > 0.4 AND volume_delta >= 20` (high-IV plays)
-- `ABS(delta) < 0.15 AND volume_delta >= 20` (deep-OTM plays)
+- `volume_delta >= vol_tier_1` (distribution- or tier-based)
+- `premium >= prem_tier_1` (distribution- or tier-based)
+- `implied_volatility > iv_incl AND volume_delta >= 20` (high-IV plays)
+- `ABS(delta) < deep_otm_delta AND volume_delta >= 20` (deep-OTM plays)
 
-The IV/deep-OTM thresholds are not yet symbol-aware — they may need
-tuning when extended to symbols beyond SPX/SPY.
+`iv_incl` and `deep_otm_delta` are per-symbol env-tunable (previously
+hardcoded 0.4 / 0.15), same precedence convention as the PCR
+saturation knob:
+
+1. `SMART_MONEY_IV_INCL_<SYMBOL>` / `SMART_MONEY_DEEP_OTM_DELTA_<SYMBOL>`
+2. `SMART_MONEY_IV_INCL_DEFAULT` / `SMART_MONEY_DEEP_OTM_DELTA_DEFAULT`
+3. `0.4` / `0.15` (legacy hardcoded defaults)
 
 ## Future work
 
-The score is still tier-based, not distribution-based.  A more
-defensible "unusual" definition is the upper percentile of recent
-flow distribution per symbol.  The `component_normalizer_cache`
-table already stores per-symbol percentiles for several other
-fields; extending it to cover `volume_delta` and `premium` per
-symbol would let us replace the static tiers with rolling
-calibration.
+The IV *score* sub-tiers (`> 0.6` -> 1, `> 1.0` -> 2) remain absolute
+and could likewise move to a per-symbol IV-rank distribution.

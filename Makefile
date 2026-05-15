@@ -1484,22 +1484,9 @@ greeks-summary: ## Greeks summary statistics
 		GROUP BY option_type;"
 
 .PHONY: gex-summary
-gex-summary: ## Show latest GEX summary
-	@echo "$(BLUE)=== Latest GEX Summary ===$(NC)"
-	@$(PSQL) -c "\
-		SELECT \
-			underlying, \
-			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI') as time_et, \
-			max_gamma_strike, \
-			TO_CHAR(max_gamma_value, 'FM999,999,999') as max_gamma, \
-			gamma_flip_point, \
-			put_call_ratio, \
-			max_pain, \
-			TO_CHAR(total_net_gex, 'FM999,999,999') as net_gex, \
-			TO_CHAR(created_at AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI:SS') as calculated_at \
-		FROM gex_summary \
-		ORDER BY timestamp DESC \
-		LIMIT 10;"
+gex-summary: ## Latest GEX summary via canonical query layer (default: SPY, override: make gex-summary FLOW_SYMBOL=QQQ). For raw table tail use: make db-tail-gex-summary
+	@echo "$(BLUE)=== Latest GEX Summary ($(FLOW_SYMBOL)) ===$(NC)"
+	@$(VENV_PYTHON) -m src.tools.db_query_cli gex-summary $(FLOW_SYMBOL)
 
 .PHONY: gex-strikes
 gex-strikes: ## Show GEX by strike (top 20)
@@ -1570,54 +1557,9 @@ flow-smart-money: ## Unusual activity detection
 	@$(VENV_PYTHON) -m src.tools.flow_smart_money_cli
 
 .PHONY: flow-buying-pressure
-flow-buying-pressure: ## Underlying buying/selling pressure
-	@echo "$(BLUE)=== Underlying Buying Pressure (Most Recent 20 Rows) ===$(NC)"
-	@$(PSQL) -c "\
-		WITH quote_deltas AS ( \
-			SELECT \
-				timestamp, symbol, close, up_volume, down_volume, \
-				COALESCE( \
-					GREATEST( \
-						up_volume - LAG(up_volume) OVER ( \
-							PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York') \
-							ORDER BY timestamp \
-						), \
-						0 \
-					), \
-					0 \
-				) AS up_volume_delta, \
-				COALESCE( \
-					GREATEST( \
-						down_volume - LAG(down_volume) OVER ( \
-							PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York') \
-							ORDER BY timestamp \
-						), \
-						0 \
-					), \
-					0 \
-				) AS down_volume_delta \
-			FROM underlying_quotes \
-			WHERE symbol = '$(FLOW_SYMBOL)' \
-		) \
-		SELECT \
-			TO_CHAR(timestamp AT TIME ZONE 'America/New_York', 'HH24:MI') as time, \
-			symbol, \
-			ROUND(close, 2) as price, \
-			(up_volume_delta + down_volume_delta) as volume, \
-			ROUND(CASE WHEN (up_volume + down_volume) > 0 THEN up_volume::numeric / (up_volume + down_volume) * 100 ELSE 50 END, 2) as buy_pct, \
-			ROUND(CASE WHEN (up_volume_delta + down_volume_delta) > 0 THEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) * 100 ELSE 50 END, 2) as period_buy_pct, \
-			ROUND(close - LAG(close) OVER (PARTITION BY symbol ORDER BY timestamp), 2) as price_chg, \
-			CASE \
-				WHEN (up_volume_delta + down_volume_delta) = 0 THEN '⚪ Neutral' \
-				WHEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) > 0.7 THEN '🟢 Strong Buying' \
-				WHEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) > 0.55 THEN '✅ Buying' \
-				WHEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) >= 0.45 THEN '⚪ Neutral' \
-				WHEN up_volume_delta::numeric / (up_volume_delta + down_volume_delta) >= 0.3 THEN '❌ Selling' \
-				ELSE '🔴 Strong Selling' \
-			END as momentum \
-		FROM quote_deltas \
-		ORDER BY timestamp DESC \
-		LIMIT 20;"
+flow-buying-pressure: ## Underlying buying/selling pressure via canonical query layer (default: SPY, override: make flow-buying-pressure FLOW_SYMBOL=QQQ)
+	@echo "$(BLUE)=== Underlying Buying Pressure ($(FLOW_SYMBOL), Most Recent 20 Rows) ===$(NC)"
+	@$(VENV_PYTHON) -m src.tools.db_query_cli flow-buying-pressure $(FLOW_SYMBOL) 20
 
 .PHONY: flow-live
 flow-live: ## Combined real-time flow dashboard
@@ -2027,72 +1969,23 @@ technicals: ## Combined technicals dashboard
 # Max Pain
 # =============================================================================
 
+# max-pain-* route through DatabaseManager.get_max_pain_current so the
+# snapshot-selection + per-expiration breakdown logic lives in one place
+# (was hand-rolled SQL here that reproduced the query-layer read).
 .PHONY: max-pain-current
-max-pain-current: ## Latest max pain snapshot (default: SPY, override: make max-pain-current FLOW_SYMBOL=QQQ)
+max-pain-current: ## Latest max pain snapshot via canonical query layer (default: SPY, override: make max-pain-current FLOW_SYMBOL=QQQ)
 	@echo "=== Max Pain Current ($(FLOW_SYMBOL), Latest OI Snapshot) ==="
-	@$(PSQL) -c "\
-		SELECT \
-			symbol, \
-			as_of_date, \
-			TO_CHAR(source_timestamp AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI:SS TZ') AS source_timestamp_et, \
-			underlying_price, \
-			max_pain, \
-			difference, \
-			jsonb_array_length(expirations) AS num_expirations \
-		FROM max_pain_oi_snapshot \
-		WHERE symbol = '$(FLOW_SYMBOL)' \
-		ORDER BY as_of_date DESC \
-		LIMIT 1;"
+	@$(VENV_PYTHON) -m src.tools.db_query_cli max-pain-current $(FLOW_SYMBOL)
 
 .PHONY: max-pain-expirations
-max-pain-expirations: ## Max pain by expiration (default: SPY, override: make max-pain-expirations FLOW_SYMBOL=QQQ)
+max-pain-expirations: ## Max pain by expiration via canonical query layer (default: SPY, override: make max-pain-expirations FLOW_SYMBOL=QQQ)
 	@echo "=== Max Pain by Expiration ($(FLOW_SYMBOL), Latest Snapshot) ==="
-	@$(PSQL) -c "\
-		WITH latest_snapshot AS ( \
-			SELECT as_of_date \
-			FROM max_pain_oi_snapshot \
-			WHERE symbol = '$(FLOW_SYMBOL)' \
-			ORDER BY as_of_date DESC \
-			LIMIT 1 \
-		) \
-		SELECT \
-			e.expiration, \
-			e.max_pain, \
-			e.difference_from_underlying, \
-			jsonb_array_length(e.strikes) AS num_strikes \
-		FROM max_pain_oi_snapshot_expiration e \
-		WHERE e.symbol = '$(FLOW_SYMBOL)' \
-			AND e.as_of_date = (SELECT as_of_date FROM latest_snapshot) \
-		ORDER BY e.expiration;"
+	@$(VENV_PYTHON) -m src.tools.db_query_cli max-pain-expirations $(FLOW_SYMBOL)
 
 .PHONY: max-pain-strikes
-max-pain-strikes: ## Max pain strikes for nearest expiration (default: SPY, override: make max-pain-strikes FLOW_SYMBOL=QQQ)
+max-pain-strikes: ## Max pain strikes for nearest expiration via canonical query layer (default: SPY, override: make max-pain-strikes FLOW_SYMBOL=QQQ)
 	@echo "=== Max Pain Strikes for Nearest Expiration ($(FLOW_SYMBOL)) ==="
-	@$(PSQL) -c "\
-		WITH latest_snapshot AS ( \
-			SELECT as_of_date \
-			FROM max_pain_oi_snapshot \
-			WHERE symbol = '$(FLOW_SYMBOL)' \
-			ORDER BY as_of_date DESC \
-			LIMIT 1 \
-		), \
-		nearest_exp AS ( \
-			SELECT expiration, strikes \
-			FROM max_pain_oi_snapshot_expiration \
-			WHERE symbol = '$(FLOW_SYMBOL)' \
-				AND as_of_date = (SELECT as_of_date FROM latest_snapshot) \
-			ORDER BY expiration \
-			LIMIT 1 \
-		) \
-		SELECT \
-			(strike->>'settlement_price')::numeric AS settlement_price, \
-			(strike->>'call_notional')::numeric AS call_notional, \
-			(strike->>'put_notional')::numeric AS put_notional, \
-			(strike->>'total_notional')::numeric AS total_notional \
-		FROM nearest_exp, \
-			jsonb_array_elements(strikes) AS strike \
-		ORDER BY (strike->>'settlement_price')::numeric \
-		LIMIT 20;"
+	@$(VENV_PYTHON) -m src.tools.db_query_cli max-pain-strikes $(FLOW_SYMBOL) 20
 
 # =============================================================================
 # Signal Engine — DB Queries

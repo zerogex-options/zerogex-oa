@@ -111,6 +111,15 @@ class AnalyticsEngine:
         self.errors_count = 0
         self.last_calculation_time: Optional[datetime] = None
 
+        # Timestamp of the last SUCCESSFULLY processed snapshot.  Used to
+        # skip a full recompute when _get_snapshot returns the same
+        # option_chains timestamp as the last good cycle (off-hours, the
+        # snapshot is frozen on the latest row until the next session, so
+        # every interval would otherwise recompute identical input ->
+        # identical output -> already a no-op upsert).  Only a truly
+        # unchanged timestamp skips; an RTH bar advances the timestamp
+        # every minute so legitimate intraday recompute is unaffected.
+        self._last_processed_snapshot_ts: Optional[datetime] = None
         self._last_flow_cache_ts: Optional[datetime] = None
         self._last_flow_cache_refresh_mono: float = 0.0
         self._flow_cache_refresh_min_seconds: float = float(
@@ -183,8 +192,32 @@ class AnalyticsEngine:
         scan, which can outlast the 90s pool timeout on a cold buffer
         pool).  ``SET LOCAL`` is scoped to the current transaction and
         reverts on commit/rollback, so it never leaks to other queries.
+
+        Caveat: ``SET LOCAL`` is a silent no-op outside a transaction.
+        Today the pool is non-autocommit and query #1 in ``_get_snapshot``
+        has already opened the enclosing transaction, so this is correct.
+        But if the pool is ever switched to autocommit, ``SET LOCAL``
+        would silently drop the cold-start ceiling and reintroduce the
+        May-13-style snapshot wedge with zero signal.  Guard against that
+        by emitting a WARNING (not a hard failure) when the connection is
+        in autocommit mode so the regression is at least observable.
         """
         if statement_timeout_ms and statement_timeout_ms > 0:
+            # psycopg2 connections expose a real bool ``autocommit``.  Use
+            # ``is True`` so a MagicMock cursor in unit tests (whose
+            # auto-attributed ``.connection.autocommit`` is a truthy mock)
+            # doesn't spuriously trip the warning.
+            autocommit = getattr(getattr(cursor, "connection", None), "autocommit", False)
+            if autocommit is True:
+                logger.warning(
+                    "Cold-start statement_timeout (%dms) requested but the "
+                    "connection is in AUTOCOMMIT mode; SET LOCAL is a no-op "
+                    "outside a transaction, so the cold-start timeout is being "
+                    "SKIPPED. A wide cold-start snapshot scan can now run "
+                    "unbounded by the pool-wide ceiling (May-13-style wedge "
+                    "risk). Investigate the connection-pool autocommit setting.",
+                    statement_timeout_ms,
+                )
             cursor.execute("SET LOCAL statement_timeout = %s", (str(int(statement_timeout_ms)),))
         lookback_start = timestamp - timedelta(hours=lookback_hours)
         cursor.execute(
@@ -534,13 +567,17 @@ class AnalyticsEngine:
 
         return vanna
 
-    def _calculate_charm(
-        self, S: float, K: float, T: float, r: float, sigma: float, option_type: str
-    ) -> float:
+    def _calculate_charm(self, S: float, K: float, T: float, r: float, sigma: float) -> float:
         """
         Calculate Charm (∂²V/∂S∂T)
 
         Charm measures how delta changes with time (delta decay).
+
+        No ``option_type`` parameter: with q=0 (the dividend-free model used
+        everywhere else in this codebase) put charm equals call charm by
+        put-call parity, so charm is option-type independent.  The F1 fix
+        pass kept an unused ``option_type`` arg for caller compatibility;
+        it's now removed since this is the only call site.
         """
         if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
             return 0.0
@@ -649,7 +686,6 @@ class AnalyticsEngine:
                     T,
                     self.risk_free_rate,
                     opt["implied_volatility"],
-                    opt["option_type"],
                 )
 
                 notional = opt["open_interest"] * 100 * underlying_price
@@ -956,269 +992,245 @@ class AnalyticsEngine:
 
         return summary
 
-    def _store_gex_by_strike(
-        self,
-        gex_data: List[Dict[str, Any]],
-        conn=None,
-        cursor=None,
-        commit: bool = True,
-    ):
-        """Store GEX by strike data in database"""
-        if (conn is None) != (cursor is None):
-            raise ValueError("conn and cursor must be provided together")
-        if conn is None:
-            with db_connection() as local_conn:
-                local_cursor = local_conn.cursor()
-                self._store_gex_by_strike(
-                    gex_data,
-                    conn=local_conn,
-                    cursor=local_cursor,
-                    commit=True,
-                )
-            return
-        try:
-            rows = [
-                (
-                    data["underlying"],
-                    data["timestamp"],
-                    float(data["strike"]),
-                    data["expiration"],
-                    float(data["total_gamma"]),
-                    float(data["call_gamma"]),
-                    float(data["put_gamma"]),
-                    float(data["net_gex"]),
-                    int(data["call_volume"]),
-                    int(data["put_volume"]),
-                    int(data["call_oi"]),
-                    int(data["put_oi"]),
-                    float(data["vanna_exposure"]),
-                    float(data["charm_exposure"]),
-                    float(data.get("call_vanna_exposure", 0.0)),
-                    float(data.get("put_vanna_exposure", 0.0)),
-                    float(data.get("call_charm_exposure", 0.0)),
-                    float(data.get("put_charm_exposure", 0.0)),
-                    float(data.get("dealer_vanna_exposure", -float(data["vanna_exposure"]))),
-                    float(data.get("dealer_charm_exposure", -float(data["charm_exposure"]))),
-                    data.get("expiration_bucket"),
-                )
-                for data in gex_data
-            ]
+    def _store_gex_by_strike(self, gex_data: List[Dict[str, Any]], cursor) -> None:
+        """Write GEX-by-strike rows on ``cursor``.
 
-            execute_values(
-                cursor,
-                """
-                INSERT INTO gex_by_strike
-                (underlying, timestamp, strike, expiration, total_gamma,
-                 call_gamma, put_gamma, net_gex, call_volume, put_volume,
-                 call_oi, put_oi, vanna_exposure, charm_exposure,
-                 call_vanna_exposure, put_vanna_exposure,
-                 call_charm_exposure, put_charm_exposure,
-                 dealer_vanna_exposure, dealer_charm_exposure,
-                 expiration_bucket)
-                VALUES %s
-                ON CONFLICT (underlying, timestamp, strike, expiration) DO UPDATE SET
-                    total_gamma = EXCLUDED.total_gamma,
-                    call_gamma = EXCLUDED.call_gamma,
-                    put_gamma = EXCLUDED.put_gamma,
-                    net_gex = EXCLUDED.net_gex,
-                    call_volume = EXCLUDED.call_volume,
-                    put_volume = EXCLUDED.put_volume,
-                    call_oi = EXCLUDED.call_oi,
-                    put_oi = EXCLUDED.put_oi,
-                    vanna_exposure = EXCLUDED.vanna_exposure,
-                    charm_exposure = EXCLUDED.charm_exposure,
-                    call_vanna_exposure = EXCLUDED.call_vanna_exposure,
-                    put_vanna_exposure = EXCLUDED.put_vanna_exposure,
-                    call_charm_exposure = EXCLUDED.call_charm_exposure,
-                    put_charm_exposure = EXCLUDED.put_charm_exposure,
-                    dealer_vanna_exposure = EXCLUDED.dealer_vanna_exposure,
-                    dealer_charm_exposure = EXCLUDED.dealer_charm_exposure,
-                    expiration_bucket = EXCLUDED.expiration_bucket
-                WHERE
-                    EXCLUDED.total_gamma IS DISTINCT FROM gex_by_strike.total_gamma
-                    OR EXCLUDED.call_gamma IS DISTINCT FROM gex_by_strike.call_gamma
-                    OR EXCLUDED.put_gamma IS DISTINCT FROM gex_by_strike.put_gamma
-                    OR EXCLUDED.net_gex IS DISTINCT FROM gex_by_strike.net_gex
-                    OR EXCLUDED.call_volume IS DISTINCT FROM gex_by_strike.call_volume
-                    OR EXCLUDED.put_volume IS DISTINCT FROM gex_by_strike.put_volume
-                    OR EXCLUDED.call_oi IS DISTINCT FROM gex_by_strike.call_oi
-                    OR EXCLUDED.put_oi IS DISTINCT FROM gex_by_strike.put_oi
-                    OR EXCLUDED.vanna_exposure IS DISTINCT FROM gex_by_strike.vanna_exposure
-                    OR EXCLUDED.charm_exposure IS DISTINCT FROM gex_by_strike.charm_exposure
-                    OR EXCLUDED.dealer_charm_exposure IS DISTINCT FROM gex_by_strike.dealer_charm_exposure
-                    OR EXCLUDED.dealer_vanna_exposure IS DISTINCT FROM gex_by_strike.dealer_vanna_exposure
-                """,
-                rows,
+        Pure unit of work: it issues the bulk upsert and nothing else.
+        The transaction boundary (open connection, commit-on-success,
+        rollback-on-error) is owned by the caller's ``db_connection()``
+        scope -- see ``_store_calculation_results``.  Keeping commit/
+        rollback out of here is what lets the by-strike and summary
+        writes share one atomic transaction.
+        """
+        rows = [
+            (
+                data["underlying"],
+                data["timestamp"],
+                float(data["strike"]),
+                data["expiration"],
+                float(data["total_gamma"]),
+                float(data["call_gamma"]),
+                float(data["put_gamma"]),
+                float(data["net_gex"]),
+                int(data["call_volume"]),
+                int(data["put_volume"]),
+                int(data["call_oi"]),
+                int(data["put_oi"]),
+                float(data["vanna_exposure"]),
+                float(data["charm_exposure"]),
+                float(data.get("call_vanna_exposure", 0.0)),
+                float(data.get("put_vanna_exposure", 0.0)),
+                float(data.get("call_charm_exposure", 0.0)),
+                float(data.get("put_charm_exposure", 0.0)),
+                float(data.get("dealer_vanna_exposure", -float(data["vanna_exposure"]))),
+                float(data.get("dealer_charm_exposure", -float(data["charm_exposure"]))),
+                data.get("expiration_bucket"),
             )
+            for data in gex_data
+        ]
 
-            if commit:
-                conn.commit()
-            logger.info(f"✅ Stored {len(gex_data)} GEX by strike records")
+        execute_values(
+            cursor,
+            """
+            INSERT INTO gex_by_strike
+            (underlying, timestamp, strike, expiration, total_gamma,
+             call_gamma, put_gamma, net_gex, call_volume, put_volume,
+             call_oi, put_oi, vanna_exposure, charm_exposure,
+             call_vanna_exposure, put_vanna_exposure,
+             call_charm_exposure, put_charm_exposure,
+             dealer_vanna_exposure, dealer_charm_exposure,
+             expiration_bucket)
+            VALUES %s
+            ON CONFLICT (underlying, timestamp, strike, expiration) DO UPDATE SET
+                total_gamma = EXCLUDED.total_gamma,
+                call_gamma = EXCLUDED.call_gamma,
+                put_gamma = EXCLUDED.put_gamma,
+                net_gex = EXCLUDED.net_gex,
+                call_volume = EXCLUDED.call_volume,
+                put_volume = EXCLUDED.put_volume,
+                call_oi = EXCLUDED.call_oi,
+                put_oi = EXCLUDED.put_oi,
+                vanna_exposure = EXCLUDED.vanna_exposure,
+                charm_exposure = EXCLUDED.charm_exposure,
+                call_vanna_exposure = EXCLUDED.call_vanna_exposure,
+                put_vanna_exposure = EXCLUDED.put_vanna_exposure,
+                call_charm_exposure = EXCLUDED.call_charm_exposure,
+                put_charm_exposure = EXCLUDED.put_charm_exposure,
+                dealer_vanna_exposure = EXCLUDED.dealer_vanna_exposure,
+                dealer_charm_exposure = EXCLUDED.dealer_charm_exposure,
+                expiration_bucket = EXCLUDED.expiration_bucket
+            WHERE
+                EXCLUDED.total_gamma IS DISTINCT FROM gex_by_strike.total_gamma
+                OR EXCLUDED.call_gamma IS DISTINCT FROM gex_by_strike.call_gamma
+                OR EXCLUDED.put_gamma IS DISTINCT FROM gex_by_strike.put_gamma
+                OR EXCLUDED.net_gex IS DISTINCT FROM gex_by_strike.net_gex
+                OR EXCLUDED.call_volume IS DISTINCT FROM gex_by_strike.call_volume
+                OR EXCLUDED.put_volume IS DISTINCT FROM gex_by_strike.put_volume
+                OR EXCLUDED.call_oi IS DISTINCT FROM gex_by_strike.call_oi
+                OR EXCLUDED.put_oi IS DISTINCT FROM gex_by_strike.put_oi
+                OR EXCLUDED.vanna_exposure IS DISTINCT FROM gex_by_strike.vanna_exposure
+                OR EXCLUDED.charm_exposure IS DISTINCT FROM gex_by_strike.charm_exposure
+                OR EXCLUDED.dealer_charm_exposure IS DISTINCT FROM gex_by_strike.dealer_charm_exposure
+                OR EXCLUDED.dealer_vanna_exposure IS DISTINCT FROM gex_by_strike.dealer_vanna_exposure
+            """,
+            rows,
+        )
 
-        except Exception as e:
-            logger.error(f"Error storing GEX by strike: {e}", exc_info=True)
-            self.errors_count += 1
-            if conn is not None:
-                conn.rollback()
-            raise
+        logger.info(f"✅ Stored {len(gex_data)} GEX by strike records")
 
-    def _store_gex_summary(
-        self,
-        summary: Dict[str, Any],
-        conn=None,
-        cursor=None,
-        commit: bool = True,
-    ):
-        """Store GEX summary in database"""
-        if (conn is None) != (cursor is None):
-            raise ValueError("conn and cursor must be provided together")
-        if conn is None:
-            with db_connection() as local_conn:
-                local_cursor = local_conn.cursor()
-                self._store_gex_summary(
-                    summary,
-                    conn=local_conn,
-                    cursor=local_cursor,
-                    commit=True,
-                )
-            return
-        try:
-            gamma_flip_point = summary.get("gamma_flip_point")
-            if gamma_flip_point is None:
-                cursor.execute(
-                    """
-                    SELECT gamma_flip_point
-                    FROM gex_summary
-                    WHERE underlying = %s
-                      AND gamma_flip_point IS NOT NULL
-                      AND timestamp < %s
-                    ORDER BY timestamp DESC
-                    LIMIT 1
-                    """,
-                    (summary["underlying"], summary["timestamp"]),
-                )
-                prev_row = cursor.fetchone()
-                if prev_row and prev_row[0] is not None:
-                    gamma_flip_point = float(prev_row[0])
-                    logger.info(
-                        "Gamma flip carry-forward applied: using prior value %.4f at %s",
-                        gamma_flip_point,
-                        summary["timestamp"],
-                    )
+    def _store_gex_summary(self, summary: Dict[str, Any], cursor) -> None:
+        """Write the GEX summary row on ``cursor``.
 
-            flip_distance = summary.get("flip_distance")
-            convexity_risk = summary.get("convexity_risk")
-            spot_price = float(summary.get("underlying_price") or 0.0)
-            total_net_gex = float(summary.get("total_net_gex") or 0.0)
-            if flip_distance is None and gamma_flip_point is not None and spot_price > 0:
-                flip_distance = (spot_price - gamma_flip_point) / spot_price
-            if convexity_risk is None and flip_distance is not None:
-                convexity_risk = abs(total_net_gex) / max(abs(flip_distance), 1e-6)
-
-            call_wall_val = summary.get("call_wall")
-            put_wall_val = summary.get("put_wall")
-            mp_by_exp_raw = summary.get("max_pain_by_expiration") or {}
-            # Serialize {date -> strike} into a JSON-shaped dict with
-            # iso-date keys.  psycopg2 will adapt the dict to JSONB.
-            import json as _json
-
-            mp_by_exp_json = (
-                _json.dumps(
-                    {
-                        (exp.isoformat() if hasattr(exp, "isoformat") else str(exp)): float(v)
-                        for exp, v in mp_by_exp_raw.items()
-                    }
-                )
-                if mp_by_exp_raw
-                else None
-            )
+        Pure unit of work (gamma-flip carry-forward SELECT + the summary
+        upsert).  Like ``_store_gex_by_strike`` it owns no transaction
+        boundary; the caller's ``db_connection()`` scope commits/rolls
+        back so this write stays in the same atomic transaction as the
+        by-strike write.
+        """
+        gamma_flip_point = summary.get("gamma_flip_point")
+        if gamma_flip_point is None:
             cursor.execute(
                 """
-                INSERT INTO gex_summary
-                (underlying, timestamp, max_gamma_strike, max_gamma_value,
-                 gamma_flip_point, put_call_ratio, max_pain, total_call_volume,
-                 total_put_volume, total_call_oi, total_put_oi, total_net_gex,
-                 flip_distance, local_gex, convexity_risk, call_wall, put_wall,
-                 max_pain_by_expiration)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (underlying, timestamp) DO UPDATE SET
-                    max_gamma_strike = EXCLUDED.max_gamma_strike,
-                    max_gamma_value = EXCLUDED.max_gamma_value,
-                    gamma_flip_point = EXCLUDED.gamma_flip_point,
-                    put_call_ratio = EXCLUDED.put_call_ratio,
-                    max_pain = EXCLUDED.max_pain,
-                    total_call_volume = EXCLUDED.total_call_volume,
-                    total_put_volume = EXCLUDED.total_put_volume,
-                    total_call_oi = EXCLUDED.total_call_oi,
-                    total_put_oi = EXCLUDED.total_put_oi,
-                    total_net_gex = EXCLUDED.total_net_gex,
-                    flip_distance = EXCLUDED.flip_distance,
-                    local_gex = EXCLUDED.local_gex,
-                    convexity_risk = EXCLUDED.convexity_risk,
-                    call_wall = EXCLUDED.call_wall,
-                    put_wall = EXCLUDED.put_wall,
-                    max_pain_by_expiration = EXCLUDED.max_pain_by_expiration
-                WHERE
-                    EXCLUDED.max_gamma_strike IS DISTINCT FROM gex_summary.max_gamma_strike
-                    OR EXCLUDED.max_gamma_value IS DISTINCT FROM gex_summary.max_gamma_value
-                    OR EXCLUDED.gamma_flip_point IS DISTINCT FROM gex_summary.gamma_flip_point
-                    OR EXCLUDED.put_call_ratio IS DISTINCT FROM gex_summary.put_call_ratio
-                    OR EXCLUDED.max_pain IS DISTINCT FROM gex_summary.max_pain
-                    OR EXCLUDED.total_call_volume IS DISTINCT FROM gex_summary.total_call_volume
-                    OR EXCLUDED.total_put_volume IS DISTINCT FROM gex_summary.total_put_volume
-                    OR EXCLUDED.total_call_oi IS DISTINCT FROM gex_summary.total_call_oi
-                    OR EXCLUDED.total_put_oi IS DISTINCT FROM gex_summary.total_put_oi
-                    OR EXCLUDED.total_net_gex IS DISTINCT FROM gex_summary.total_net_gex
-                    OR EXCLUDED.flip_distance IS DISTINCT FROM gex_summary.flip_distance
-                    OR EXCLUDED.local_gex IS DISTINCT FROM gex_summary.local_gex
-                    OR EXCLUDED.convexity_risk IS DISTINCT FROM gex_summary.convexity_risk
-                    OR EXCLUDED.call_wall IS DISTINCT FROM gex_summary.call_wall
-                    OR EXCLUDED.put_wall IS DISTINCT FROM gex_summary.put_wall
-                    OR EXCLUDED.max_pain_by_expiration IS DISTINCT FROM gex_summary.max_pain_by_expiration
-            """,
-                (
-                    summary["underlying"],
-                    summary["timestamp"],
-                    float(summary["max_gamma_strike"]),
-                    float(summary["max_gamma_value"]),
-                    gamma_flip_point,
-                    float(summary["put_call_ratio"]),
-                    (float(summary["max_pain"]) if summary.get("max_pain") is not None else None),
-                    int(summary["total_call_volume"]),
-                    int(summary["total_put_volume"]),
-                    int(summary["total_call_oi"]),
-                    int(summary["total_put_oi"]),
-                    float(summary["total_net_gex"]),
-                    float(flip_distance) if flip_distance is not None else None,
-                    float(summary.get("local_gex", 0.0)),
-                    float(convexity_risk) if convexity_risk is not None else None,
-                    float(call_wall_val) if call_wall_val is not None else None,
-                    float(put_wall_val) if put_wall_val is not None else None,
-                    mp_by_exp_json,
-                ),
+                SELECT gamma_flip_point
+                FROM gex_summary
+                WHERE underlying = %s
+                  AND gamma_flip_point IS NOT NULL
+                  AND timestamp < %s
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                (summary["underlying"], summary["timestamp"]),
             )
-            if commit:
-                conn.commit()
-            logger.info("✅ Stored GEX summary")
+            prev_row = cursor.fetchone()
+            if prev_row and prev_row[0] is not None:
+                gamma_flip_point = float(prev_row[0])
+                logger.info(
+                    "Gamma flip carry-forward applied: using prior value %.4f at %s",
+                    gamma_flip_point,
+                    summary["timestamp"],
+                )
 
-        except Exception as e:
-            logger.error(f"Error storing GEX summary: {e}", exc_info=True)
-            self.errors_count += 1
-            if conn is not None:
-                conn.rollback()
-            raise
+        flip_distance = summary.get("flip_distance")
+        convexity_risk = summary.get("convexity_risk")
+        spot_price = float(summary.get("underlying_price") or 0.0)
+        total_net_gex = float(summary.get("total_net_gex") or 0.0)
+        if flip_distance is None and gamma_flip_point is not None and spot_price > 0:
+            flip_distance = (spot_price - gamma_flip_point) / spot_price
+        if convexity_risk is None and flip_distance is not None:
+            convexity_risk = abs(total_net_gex) / max(abs(flip_distance), 1e-6)
+
+        call_wall_val = summary.get("call_wall")
+        put_wall_val = summary.get("put_wall")
+        mp_by_exp_raw = summary.get("max_pain_by_expiration") or {}
+        # Serialize {date -> strike} into a JSON-shaped dict with
+        # iso-date keys.  psycopg2 will adapt the dict to JSONB.
+        import json as _json
+
+        mp_by_exp_json = (
+            _json.dumps(
+                {
+                    (exp.isoformat() if hasattr(exp, "isoformat") else str(exp)): float(v)
+                    for exp, v in mp_by_exp_raw.items()
+                }
+            )
+            if mp_by_exp_raw
+            else None
+        )
+        cursor.execute(
+            """
+            INSERT INTO gex_summary
+            (underlying, timestamp, max_gamma_strike, max_gamma_value,
+             gamma_flip_point, put_call_ratio, max_pain, total_call_volume,
+             total_put_volume, total_call_oi, total_put_oi, total_net_gex,
+             flip_distance, local_gex, convexity_risk, call_wall, put_wall,
+             max_pain_by_expiration)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (underlying, timestamp) DO UPDATE SET
+                max_gamma_strike = EXCLUDED.max_gamma_strike,
+                max_gamma_value = EXCLUDED.max_gamma_value,
+                gamma_flip_point = EXCLUDED.gamma_flip_point,
+                put_call_ratio = EXCLUDED.put_call_ratio,
+                max_pain = EXCLUDED.max_pain,
+                total_call_volume = EXCLUDED.total_call_volume,
+                total_put_volume = EXCLUDED.total_put_volume,
+                total_call_oi = EXCLUDED.total_call_oi,
+                total_put_oi = EXCLUDED.total_put_oi,
+                total_net_gex = EXCLUDED.total_net_gex,
+                flip_distance = EXCLUDED.flip_distance,
+                local_gex = EXCLUDED.local_gex,
+                convexity_risk = EXCLUDED.convexity_risk,
+                call_wall = EXCLUDED.call_wall,
+                put_wall = EXCLUDED.put_wall,
+                max_pain_by_expiration = EXCLUDED.max_pain_by_expiration
+            WHERE
+                EXCLUDED.max_gamma_strike IS DISTINCT FROM gex_summary.max_gamma_strike
+                OR EXCLUDED.max_gamma_value IS DISTINCT FROM gex_summary.max_gamma_value
+                OR EXCLUDED.gamma_flip_point IS DISTINCT FROM gex_summary.gamma_flip_point
+                OR EXCLUDED.put_call_ratio IS DISTINCT FROM gex_summary.put_call_ratio
+                OR EXCLUDED.max_pain IS DISTINCT FROM gex_summary.max_pain
+                OR EXCLUDED.total_call_volume IS DISTINCT FROM gex_summary.total_call_volume
+                OR EXCLUDED.total_put_volume IS DISTINCT FROM gex_summary.total_put_volume
+                OR EXCLUDED.total_call_oi IS DISTINCT FROM gex_summary.total_call_oi
+                OR EXCLUDED.total_put_oi IS DISTINCT FROM gex_summary.total_put_oi
+                OR EXCLUDED.total_net_gex IS DISTINCT FROM gex_summary.total_net_gex
+                OR EXCLUDED.flip_distance IS DISTINCT FROM gex_summary.flip_distance
+                OR EXCLUDED.local_gex IS DISTINCT FROM gex_summary.local_gex
+                OR EXCLUDED.convexity_risk IS DISTINCT FROM gex_summary.convexity_risk
+                OR EXCLUDED.call_wall IS DISTINCT FROM gex_summary.call_wall
+                OR EXCLUDED.put_wall IS DISTINCT FROM gex_summary.put_wall
+                OR EXCLUDED.max_pain_by_expiration IS DISTINCT FROM gex_summary.max_pain_by_expiration
+        """,
+            (
+                summary["underlying"],
+                summary["timestamp"],
+                float(summary["max_gamma_strike"]),
+                float(summary["max_gamma_value"]),
+                gamma_flip_point,
+                float(summary["put_call_ratio"]),
+                (float(summary["max_pain"]) if summary.get("max_pain") is not None else None),
+                int(summary["total_call_volume"]),
+                int(summary["total_put_volume"]),
+                int(summary["total_call_oi"]),
+                int(summary["total_put_oi"]),
+                float(summary["total_net_gex"]),
+                float(flip_distance) if flip_distance is not None else None,
+                float(summary.get("local_gex", 0.0)),
+                float(convexity_risk) if convexity_risk is not None else None,
+                float(call_wall_val) if call_wall_val is not None else None,
+                float(put_wall_val) if put_wall_val is not None else None,
+                mp_by_exp_json,
+            ),
+        )
+        logger.info("✅ Stored GEX summary")
 
     def _store_calculation_results(
         self,
         gex_data: List[Dict[str, Any]],
         summary: Dict[str, Any],
-    ):
-        """Store by-strike + summary metrics in a single transaction."""
-        with db_connection() as conn:
-            cursor = conn.cursor()
-            self._store_gex_by_strike(gex_data, conn=conn, cursor=cursor, commit=False)
-            self._store_gex_summary(summary, conn=conn, cursor=cursor, commit=False)
-            conn.commit()
+    ) -> None:
+        """Persist by-strike + summary in ONE transaction (all rows land or none).
+
+        Both writes run on the same connection inside a single
+        ``db_connection()`` scope.  That context manager commits exactly
+        once on a clean exit and rolls back on ANY exception, so a failure
+        in the summary write discards the by-strike rows written earlier
+        in the same transaction.  This atomicity ("both stores commit
+        together") is the invariant downstream consumers rely on, so the
+        grouping must not be split into two independent transactions.
+        """
+        try:
+            with db_connection() as conn:
+                cursor = conn.cursor()
+                self._store_gex_by_strike(gex_data, cursor)
+                self._store_gex_summary(summary, cursor)
+                # db_connection() commits on a clean __exit__; the explicit
+                # commit makes the single-transaction boundary unambiguous
+                # and is a harmless no-op when the CM commits again.
+                conn.commit()
+        except Exception as e:
+            logger.error("Error storing calculation results: %s", e, exc_info=True)
+            self.errors_count += 1
+            raise
 
     def _validate_gex_calculations(
         self,
@@ -1255,6 +1267,121 @@ class AnalyticsEngine:
             )
         if not mismatches and not sign_anomalies:
             logger.info("GEX validation: all by-strike calculations passed")
+
+    def _symbol_tuned_float(self, base: str, default: float) -> float:
+        """Resolve a per-symbol env-tunable float.
+
+        Precedence (matches put_call_ratio_state's convention):
+          1. ``<BASE>_<SYMBOL>``  (e.g. SMART_MONEY_IV_INCL_SPX)
+          2. ``<BASE>_DEFAULT``
+          3. the hardcoded ``default``
+        Non-positive / unparseable overrides are ignored.
+        """
+        sym = (self.db_symbol or "").upper()
+        for key in (f"{base}_{sym}" if sym else None, f"{base}_DEFAULT"):
+            if not key:
+                continue
+            raw = os.getenv(key)
+            if raw:
+                try:
+                    v = float(raw)
+                    if v > 0:
+                        return v
+                except ValueError:
+                    pass
+        return default
+
+    def _smart_money_calibration(
+        self,
+        vol_p95: Optional[float],
+        prem_p95: Optional[float],
+        underlying_price: Optional[float],
+    ) -> Tuple[Tuple[int, int, int, int], Tuple[float, float, float, float], str]:
+        """Resolve smart-money score tier thresholds (D6 follow-up).
+
+        Distribution-based when a positive per-symbol rolling p95 of
+        volume_delta / premium is available in component_normalizer_cache
+        (the defensible "unusual = upper percentile of recent flow"
+        definition): tier breakpoints are env-tunable multiples of p95,
+        with tier 2 sitting AT p95.  Falls back PER FIELD to the existing
+        env-tunable tiers on cold start (missing/non-positive p95) -- the
+        volume tiers stay raw contract counts, the premium tiers stay
+        ``N x notional_per_contract``.  Returns
+        ``(vol_tiers, prem_tiers, mode)`` where ``mode`` is logged.
+        """
+        notional_per_contract = max(float(underlying_price or 0.0) * 100.0, 1.0)
+
+        vol_mult = (
+            float(os.getenv("SMART_MONEY_VOL_DIST_T1_P95_X", "0.5")),
+            float(os.getenv("SMART_MONEY_VOL_DIST_T2_P95_X", "1.0")),
+            float(os.getenv("SMART_MONEY_VOL_DIST_T3_P95_X", "2.0")),
+            float(os.getenv("SMART_MONEY_VOL_DIST_T4_P95_X", "4.0")),
+        )
+        prem_mult = (
+            float(os.getenv("SMART_MONEY_PREM_DIST_T1_P95_X", "0.5")),
+            float(os.getenv("SMART_MONEY_PREM_DIST_T2_P95_X", "1.0")),
+            float(os.getenv("SMART_MONEY_PREM_DIST_T3_P95_X", "2.0")),
+            float(os.getenv("SMART_MONEY_PREM_DIST_T4_P95_X", "4.0")),
+        )
+
+        if vol_p95 is not None and vol_p95 > 0:
+            # max(1, ...) so a tiny p95 can't yield a 0 threshold (which
+            # would make the inclusion floor admit every contract).
+            vol_tiers = tuple(max(1, int(round(m * vol_p95))) for m in vol_mult)
+            vol_mode = "dist"
+        else:
+            vol_tiers = (
+                int(os.getenv("SMART_MONEY_VOL_T1", "50")),
+                int(os.getenv("SMART_MONEY_VOL_T2", "100")),
+                int(os.getenv("SMART_MONEY_VOL_T3", "200")),
+                int(os.getenv("SMART_MONEY_VOL_T4", "500")),
+            )
+            vol_mode = "tier"
+
+        if prem_p95 is not None and prem_p95 > 0:
+            prem_tiers = tuple(m * prem_p95 for m in prem_mult)
+            prem_mode = "dist"
+        else:
+            prem_tiers = (
+                float(os.getenv("SMART_MONEY_PREM_T1_NOTIONAL_X", "1.0")) * notional_per_contract,
+                float(os.getenv("SMART_MONEY_PREM_T2_NOTIONAL_X", "2.0")) * notional_per_contract,
+                float(os.getenv("SMART_MONEY_PREM_T3_NOTIONAL_X", "5.0")) * notional_per_contract,
+                float(os.getenv("SMART_MONEY_PREM_T4_NOTIONAL_X", "10.0")) * notional_per_contract,
+            )
+            prem_mode = "tier"
+
+        return vol_tiers, prem_tiers, f"vol={vol_mode},prem={prem_mode}"
+
+    def _fetch_smart_money_p95(self, cursor) -> Tuple[Optional[float], Optional[float]]:
+        """Read rolling p95(volume_delta) / p95(premium) for this symbol
+        from component_normalizer_cache.  Returns (None, None) on a cold
+        cache or any read error so the caller falls back to static tiers."""
+        try:
+            cursor.execute(
+                """
+                SELECT field_name, p95
+                FROM component_normalizer_cache
+                WHERE underlying = %s
+                  AND field_name IN ('smart_money_volume_delta', 'smart_money_premium')
+                """,
+                (self.db_symbol,),
+            )
+            vol_p95: Optional[float] = None
+            prem_p95: Optional[float] = None
+            for field_name, p95 in cursor.fetchall():
+                if p95 is None:
+                    continue
+                if field_name == "smart_money_volume_delta":
+                    vol_p95 = float(p95)
+                elif field_name == "smart_money_premium":
+                    prem_p95 = float(p95)
+            return vol_p95, prem_p95
+        except Exception:
+            logger.warning(
+                "smart-money p95 lookup failed; falling back to static tiers",
+                exc_info=True,
+            )
+            return None, None
 
     def _refresh_flow_caches(self, timestamp: datetime, underlying_price: Optional[float] = None):
         """
@@ -1378,41 +1505,40 @@ class AnalyticsEngine:
 
                 # Refresh flow_smart_money.
                 #
-                # Thresholds are symbol-aware: premium tiers scale with
-                # ``notional_per_contract = spot * 100`` so the same
-                # economic significance applies on SPX (~$550k/contract
-                # at $5500) and SPY (~$45k/contract at $450).  Volume
-                # tiers stay in contract counts but are tunable via env
-                # vars per symbol prefix (``SMART_MONEY_VOL_TIER_*``).
-                # The previous SQL embedded $50k/$100k/$250k/$500k
-                # premium absolutes that saturated immediately on SPX
-                # and rarely fired on SPY.  Calibration discussion lives
-                # in docs/runbooks/smart_money_calibration.md.
-                notional_per_contract = max(float(underlying_price or 0.0) * 100.0, 1.0)
-                # Tier 1..4 premium thresholds = N x notional_per_contract.
-                prem_t1 = (
-                    float(os.getenv("SMART_MONEY_PREM_T1_NOTIONAL_X", "1.0"))
-                    * notional_per_contract
+                # Scoring is distribution-based when the per-symbol rolling
+                # p95 of volume_delta / premium is in
+                # component_normalizer_cache ("unusual" = upper percentile
+                # of recent per-contract flow); it falls back per field to
+                # the env-tunable static tiers on a cold cache (volume =
+                # raw contract counts, premium = N x notional_per_contract
+                # so SPX ~$550k/contract and SPY ~$45k/contract stay
+                # comparable).  The IV / deep-OTM inclusion thresholds are
+                # per-symbol env-tunable.  Calibration discussion lives in
+                # docs/runbooks/smart_money_calibration.md.
+                vol_p95, prem_p95 = self._fetch_smart_money_p95(cursor)
+                (
+                    (vol_t1, vol_t2, vol_t3, vol_t4),
+                    (
+                        prem_t1,
+                        prem_t2,
+                        prem_t3,
+                        prem_t4,
+                    ),
+                    calib_mode,
+                ) = self._smart_money_calibration(vol_p95, prem_p95, underlying_price)
+                # IV / deep-OTM inclusion thresholds (D6 follow-up:
+                # previously hardcoded 0.4 IV / 0.15 |delta|).
+                iv_incl = self._symbol_tuned_float("SMART_MONEY_IV_INCL", 0.4)
+                deep_otm_delta = self._symbol_tuned_float("SMART_MONEY_DEEP_OTM_DELTA", 0.15)
+                logger.debug(
+                    "Refreshing flow_smart_money (%s, vol_p95=%s, prem_p95=%s, "
+                    "iv_incl=%.3f, deep_otm_delta=%.3f)...",
+                    calib_mode,
+                    vol_p95,
+                    prem_p95,
+                    iv_incl,
+                    deep_otm_delta,
                 )
-                prem_t2 = (
-                    float(os.getenv("SMART_MONEY_PREM_T2_NOTIONAL_X", "2.0"))
-                    * notional_per_contract
-                )
-                prem_t3 = (
-                    float(os.getenv("SMART_MONEY_PREM_T3_NOTIONAL_X", "5.0"))
-                    * notional_per_contract
-                )
-                prem_t4 = (
-                    float(os.getenv("SMART_MONEY_PREM_T4_NOTIONAL_X", "10.0"))
-                    * notional_per_contract
-                )
-                # Volume tiers in contract counts.
-                vol_t1 = int(os.getenv("SMART_MONEY_VOL_T1", "50"))
-                vol_t2 = int(os.getenv("SMART_MONEY_VOL_T2", "100"))
-                vol_t3 = int(os.getenv("SMART_MONEY_VOL_T3", "200"))
-                vol_t4 = int(os.getenv("SMART_MONEY_VOL_T4", "500"))
-                # Inclusion-filter: smaller of (vol_t1, prem_t1).
-                logger.debug("Refreshing flow_smart_money...")
                 cursor.execute(
                     """
                     WITH with_prev AS (
@@ -1475,8 +1601,8 @@ class AnalyticsEngine:
                       AND (
                         volume_delta >= %s
                         OR volume_delta * COALESCE(last, 0) * 100 >= %s
-                        OR (implied_volatility > 0.4 AND volume_delta >= 20)
-                        OR (ABS(delta) < 0.15 AND volume_delta >= 20)
+                        OR (implied_volatility > %s AND volume_delta >= 20)
+                        OR (ABS(delta) < %s AND volume_delta >= 20)
                       )
                     ON CONFLICT (timestamp, symbol, option_symbol)
                     DO UPDATE SET
@@ -1508,9 +1634,12 @@ class AnalyticsEngine:
                         prem_t1,
                         underlying_price,
                         timestamp,
-                        # Inclusion filter: floor matches t1
+                        # Inclusion filter: floor matches t1, then the
+                        # per-symbol IV / deep-OTM thresholds.
                         vol_t1,
                         prem_t1,
+                        iv_incl,
+                        deep_otm_delta,
                     ),
                 )
 
@@ -1613,6 +1742,33 @@ class AnalyticsEngine:
             underlying_price = snapshot["underlying_price"]
             options = snapshot["options"]
 
+            # Skip the recompute when the snapshot timestamp is unchanged
+            # since the last successful cycle.  Off-hours the latest
+            # option_chains row is frozen until the next session, so every
+            # off_hours_interval would otherwise recompute the full
+            # GEX-by-strike / vanna-charm / per-expiration max-pain / walls
+            # pipeline for the SAME (underlying, timestamp) -- identical
+            # input -> identical output -> an already no-op
+            # `IS DISTINCT FROM`-guarded upsert.  We still sleep the
+            # interval in run(); we just don't burn CPU recomputing.
+            #
+            # Scoped to an EXACT timestamp match so it never suppresses
+            # legitimate intraday recompute: during RTH a new bar advances
+            # the timestamp every minute, so latest_timestamp moves and the
+            # guard falls through.  Only set on SUCCESS (see end of method)
+            # so a failed/partial cycle re-attempts the same timestamp.
+            if (
+                self._last_processed_snapshot_ts is not None
+                and latest_timestamp == self._last_processed_snapshot_ts
+            ):
+                logger.info(
+                    "Snapshot timestamp %s unchanged since last successful "
+                    "cycle; skipping recompute (identical input -> identical "
+                    "output -> no-op upsert). Sleeping the interval.",
+                    latest_timestamp,
+                )
+                return True
+
             logger.info(f"Running calculation for timestamp: {latest_timestamp}")
             logger.info(f"Underlying price: ${underlying_price:.2f}")
 
@@ -1703,6 +1859,9 @@ class AnalyticsEngine:
 
             self.calculations_completed += 1
             self.last_calculation_time = datetime.now(ET)
+            # Record only after a fully successful cycle so a transient
+            # mid-cycle failure re-attempts the same timestamp next round.
+            self._last_processed_snapshot_ts = latest_timestamp
 
             # Emit per-stage timings so cycle-overrun warnings can be
             # diagnosed without guessing which step is slow.

@@ -112,18 +112,20 @@ log "━━━━━━━━━━━━━━━━━━━━━━━━━
 log "4. Database Views (Real-Time)"
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
+# Current view set (setup/database/schema.sql).  The legacy
+# option_flow_by_type / _by_strike / _by_expiration / _smart_money
+# views were consolidated into the flow_contract_facts / flow_by_contract
+# tables and no longer exist — listing them here emitted harmless but
+# misleading "not found" warnings on every deploy.
 VIEWS=(
     "option_chains_with_deltas"
-    "option_flow_by_type"
-    "option_flow_by_strike"
-    "option_flow_by_expiration"
-    "option_flow_smart_money"
+    "underlying_daily_volume"
     "underlying_buying_pressure"
     "underlying_vwap_deviation"
     "opening_range_breakout"
-    "gamma_exposure_levels"
-    "dealer_hedging_pressure"
     "unusual_volume_spikes"
+    "dealer_hedging_pressure"
+    "gamma_exposure_levels"
 )
 
 for view in "${VIEWS[@]}"; do

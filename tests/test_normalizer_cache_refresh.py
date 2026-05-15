@@ -54,8 +54,13 @@ def test_summarize_zero_only_yields_zero_distribution():
 def test_field_specs_cover_all_normalizer_consumers():
     """Every name read from ``ctx.extra['normalizers']`` in the signal code
     should have a matching FieldSpec — otherwise the populator silently
-    leaves that field unscaled."""
-    expected = {
+    leaves that field unscaled.
+
+    The smart-money specs are NOT consumed via ctx.extra['normalizers'];
+    they are read directly by AnalyticsEngine._refresh_flow_caches for
+    distribution-based smart-money calibration.  They are allowed extras
+    here but pinned explicitly so an accidental rename is still caught."""
+    signal_consumers = {
         "dealer_vanna_exposure",
         "dealer_charm_exposure",
         "local_gex",
@@ -63,8 +68,17 @@ def test_field_specs_cover_all_normalizer_consumers():
         "call_flow_delta",
         "put_flow_delta",
     }
+    smart_money_consumers = {
+        "smart_money_volume_delta",
+        "smart_money_premium",
+    }
     actual = {spec.name for spec in FIELD_SPECS}
-    assert expected == actual, f"missing: {expected - actual}, extra: {actual - expected}"
+    missing = signal_consumers - actual
+    assert not missing, f"signal normalizer consumers missing a FieldSpec: {missing}"
+    assert actual == signal_consumers | smart_money_consumers, (
+        f"unexpected FieldSpec set: extra={actual - signal_consumers - smart_money_consumers}, "
+        f"missing={(signal_consumers | smart_money_consumers) - actual}"
+    )
 
 
 def test_field_specs_have_two_query_placeholders():
