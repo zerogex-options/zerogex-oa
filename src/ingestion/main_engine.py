@@ -186,6 +186,20 @@ class IngestionEngine:
         # Circuit breaker: stop hammering a dead database.
         self._db_consecutive_failures = 0
         self._db_backoff_until = 0.0  # monotonic timestamp
+        # Computed-but-unpersisted option aggregates are retained here and
+        # re-submitted on the next write attempt. Without this, a DB write
+        # failure (or a circuit-breaker skip) at/after a bucket rollover
+        # permanently loses that bucket's classified flow: _prepare_option_agg
+        # has already cleared/seeded the buffer and advanced the baseline, and
+        # the post-rollover seed path never re-consults the (invalidated)
+        # baseline. Re-submitting the same agg dicts is safe and exact: a
+        # rolled-back transaction applied nothing and the upsert sums flow
+        # fields additively, so each agg's volume is added once when it
+        # finally commits. Bounded so a prolonged outage can't grow unbounded.
+        self._pending_failed_option_rows: List[Dict[str, Any]] = []
+        self._pending_failed_option_rows_max = int(
+            os.getenv("OPTION_FAILED_ROWS_RETAIN_MAX", "20000")
+        )
         self._last_underlying_signature: Optional[str] = None
         self._option_bucket_last_write: Dict[tuple[str, datetime], float] = {}
 
@@ -1102,6 +1116,36 @@ class IngestionEngine:
 
         return list(coalesced.values())
 
+    def _retain_failed_option_rows(self, rows: List[Dict[str, Any]]) -> None:
+        """Hold computed aggregates that did not persist, for re-submission.
+
+        Re-submitting is exact: the failed/skipped transaction committed
+        nothing and the upsert sums flow fields additively, so each agg's
+        classified volume is applied once when it eventually succeeds.
+        Bounded — under a prolonged outage we drop the OLDEST rows and log
+        an error rather than grow without limit or (as before) lose every
+        row silently. ``getattr``/``setattr`` so ``__new__``-built test
+        stubs don't need the attribute.
+        """
+        if not rows:
+            return
+        pending = getattr(self, "_pending_failed_option_rows", None)
+        if pending is None:
+            pending = []
+        pending.extend(rows)
+        cap = getattr(self, "_pending_failed_option_rows_max", 20000)
+        if cap > 0 and len(pending) > cap:
+            dropped = len(pending) - cap
+            pending = pending[dropped:]
+            logger.error(
+                "[CIRCUIT-BREAKER] Pending failed-write buffer exceeded %d rows; "
+                "dropped %d oldest aggregates (classified flow for those "
+                "buckets is lost). DB outage longer than the retain budget.",
+                cap,
+                dropped,
+            )
+        self._pending_failed_option_rows = pending
+
     def _write_option_rows(self, rows: List[Dict[str, Any]]):
         """Write multiple aggregated option rows in a single DB transaction.
 
@@ -1109,6 +1153,15 @@ class IngestionEngine:
         backs off exponentially (2s, 4s, 8s … capped at 60s) so we don't
         hammer a dead database.  On recovery the breaker resets immediately.
         """
+        # Re-submit aggregates a prior attempt failed to persist (or
+        # skipped during backoff). Prepend so they coalesce additively
+        # with any new same-(option_symbol, timestamp) rows; the prior
+        # transaction applied nothing, so this adds each agg exactly once.
+        pending = getattr(self, "_pending_failed_option_rows", None)
+        if pending:
+            rows = pending + list(rows)
+            self._pending_failed_option_rows = []
+
         if not rows:
             return
 
@@ -1123,6 +1176,7 @@ class IngestionEngine:
                 f"[CIRCUIT-BREAKER] Skipping write of {len(rows)} rows — "
                 f"DB backoff for {self._db_backoff_until - now_mono:.1f}s more"
             )
+            self._retain_failed_option_rows(rows)
             return
 
         t0 = _time.monotonic()
@@ -1227,6 +1281,13 @@ class IngestionEngine:
             # what was actually persisted.
             for row in rows:
                 self._invalidate_option_volume_baseline(row["option_symbol"])
+
+            # Retain the computed aggregates so the next attempt re-writes
+            # them. _prepare_option_agg has already cleared/seeded the
+            # buffer and the post-rollover seed path won't reconsult the
+            # invalidated baseline, so without this the classified flow in
+            # these rows is lost for good.
+            self._retain_failed_option_rows(rows)
 
             # Include affected-symbol counts, unique underlyings, and the full
             # timestamp range. Without this, root cause analysis is impossible

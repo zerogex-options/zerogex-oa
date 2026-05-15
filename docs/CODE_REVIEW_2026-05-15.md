@@ -1003,15 +1003,38 @@ computed against. Now the malformed bar is dropped with a warning.
 Verification: full suite **869 passed, 1 skipped**; `black` clean; no
 new `flake8` findings vs HEAD on the five touched files.
 
-### Identified, intentionally NOT auto-fixed (need a decision / larger change)
+### N6 🔴 Fixed — Ingestion lost classified flow on DB write failure / backoff skip
 
-- **🔴/🟡 Ingestion bucket-boundary flow accounting** (`ingestion/
-  main_engine.py` `_prepare_option_agg`/baseline-cache advance): the
-  per-bucket classified-flow delta math is correct only under a fragile,
-  undocumented "every additive write is preceded by a buffer trim"
-  invariant; a DB write failure at a bucket boundary can permanently
-  drop that bucket's classified flow. Needs careful tracing + a
-  commit-confirmed trim; too risky for an in-place edit.
+**File:** `src/ingestion/main_engine.py` (`_write_option_rows`)
+
+Traced in full. The per-bucket delta math in `_prepare_option_agg` is
+correct, but it clears/seeds the buffer and advances the volume baseline
+*before* the write is attempted. On a DB write failure (or a
+circuit-breaker backoff skip — which previously dropped `rows`
+outright), the computed aggregates were lost permanently: the only
+"recovery" was invalidating the baseline cache, but after a bucket
+rollover the buffer holds a `_SEED_FLAG` snapshot whose path never
+reconsults the baseline, and the genuine-first-obs path (the only one
+that does) is unreachable post-rollover. Net: a transient DB blip at a
+minute boundary silently zeroed that minute's `ask/mid/bid_volume`.
+
+**Fix (surgical, write-path-only — the delta/seed/baseline math is
+untouched):** `_write_option_rows` now retains the exact agg dicts it
+failed to persist (or skipped during backoff) in a bounded buffer and
+prepends them to the next attempt. This is *exact*: a rolled-back /
+skipped transaction commits nothing, and the upsert sums flow fields
+additively, so `_coalesce_option_rows` + the additive upsert apply each
+agg's volume exactly once when it finally commits. The buffer is bounded
+(`OPTION_FAILED_ROWS_RETAIN_MAX`, default 20000); on overflow it drops
+the oldest with an ERROR log — strictly better than the prior silent,
+unbounded loss. New suite `tests/test_ingestion_failed_write_retention.py`
+(6 tests) pins: loss repaired, no double-count across repeated retries,
+happy path neither retains nor re-writes, backoff-skip retained not
+dropped, bounded-drops-oldest, and an end-to-end rollover-residual repro
+driving the real `_prepare_option_agg`. Full suite: 875 passed, 1
+skipped; `black` clean; no new `flake8` vs HEAD.
+
+### Identified, intentionally NOT auto-fixed (need a decision / larger change)
 - **🟡 `option_chains.volume` stores cumulative daily volume**, while
   `ask/mid/bid_volume` are per-bucket deltas. Any consumer reconciling
   them is wrong. Decide: dedicated period-volume column vs. loud doc.
