@@ -172,40 +172,34 @@ CREATE INDEX IF NOT EXISTS idx_option_chains_option_symbol_timestamp
 CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_ts_quote_covering
     ON option_chains(underlying, timestamp DESC)
     INCLUDE (bid, ask, volume, open_interest, strike, expiration, option_type);
--- Partial covering index for AnalyticsEngine._get_snapshot()'s
--- DISTINCT ON (option_symbol) ... ORDER BY option_symbol, timestamp DESC query.
--- Matches the ORDER BY natively (no Sort step), restricts the index to rows
--- with Greeks populated (no heap fetch to evaluate gamma IS NOT NULL), and
--- INCLUDEs every column the production SELECT list reads so the planner can
--- satisfy the whole query as an Index Only Scan.  Without this index the
--- planner falls back to idx_option_chains_underlying_option_symbol_timestamp
--- and heap-fetches every candidate row to evaluate gamma IS NOT NULL plus
--- collect the SELECT-list columns; on a 96-hour lookback that produced the
--- 23-minute wedge incident of May 13, 2026.
+-- NOTE: idx_option_chains_underlying_option_symbol_ts_gamma_covering
+-- (a ~6 GB partial covering index keyed on
+-- (underlying, option_symbol, timestamp DESC) with the full SELECT list in
+-- INCLUDE, WHERE gamma IS NOT NULL) was attempted as a fix for the May 13,
+-- 2026 _get_snapshot() wedge but found to be DEAD WEIGHT.  Under fresh
+-- planner stats the optimizer refuses to use it: scanning by
+-- (option_symbol, timestamp DESC) within a single underlying still has to
+-- walk every per-symbol entry across all of history (no skip-scan in
+-- PostgreSQL), which costs more than the bitmap-heap-scan plan that the
+-- planner actually chooses (~38 sec warm at 96h lookback, ~70 ms warm at
+-- the 2h steady-state lookback).
 --
--- Runtime cost is dominated by the lookback width since PostgreSQL has no
--- skip-scan; the index still has to emit every (option_symbol, timestamp)
--- tuple in the window before Unique deduplicates.  Steady-state cycles
--- therefore use a narrow ANALYTICS_SNAPSHOT_LOOKBACK_HOURS (default 2h,
--- ~20 k tuples, ~1 sec wallclock under concurrent autovacuum IO); the
--- first cycle per worker uses ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS
--- (default 96h) to reach across a weekend gap.
+-- A LATERAL rewrite that DID exercise this covering index was prototyped
+-- and rejected: it would have made the 2h steady-state path 5x slower
+-- (354 ms vs 70 ms) for a single 25% improvement on the once-per-restart
+-- 96h cold-start (29 sec vs 38 sec).  Net negative.
 --
--- Build with CREATE INDEX CONCURRENTLY in production via
--- ``make db-add-distinct-on-index`` to avoid blocking the option_chains
--- writers; this schema entry serves fresh installs and idempotent retries.
--- The earlier, narrower variant ``idx_option_chains_underlying_option_symbol_ts_gamma``
--- (no SELECT-list INCLUDE columns) is strictly subsumed by this one and should
--- be dropped on existing deployments via ``make db-drop-narrow-partial-index``.
-CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_option_symbol_ts_gamma_covering
-    ON option_chains(underlying, option_symbol, timestamp DESC)
-    INCLUDE (
-        strike, option_type, expiration,
-        last, bid, ask,
-        volume, open_interest,
-        delta, gamma, theta, vega, implied_volatility
-    )
-    WHERE gamma IS NOT NULL;
+-- The real fix for the wedge was tightening the steady-state lookback
+-- (ANALYTICS_SNAPSHOT_LOOKBACK_HOURS=2) with a one-shot
+-- ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS=96 first cycle, plus the
+-- pool-level DB_STATEMENT_TIMEOUT_MS=90000 backstop.  See
+-- src/analytics/main_engine.py:_get_snapshot() for details.
+--
+-- On existing deployments the dead index can be reclaimed via
+-- ``make db-drop-distinct-on-index CONFIRM=yes`` (DROP CONCURRENTLY, frees
+-- ~6 GB plus per-insert write amplification).  Do NOT recreate it without
+-- first solving the visibility-map-coverage problem that prevents the
+-- LATERAL rewrite from beating bitmap-heap-scan today.
 
 DO $$
 BEGIN

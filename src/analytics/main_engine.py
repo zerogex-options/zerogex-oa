@@ -117,24 +117,33 @@ class AnalyticsEngine:
         Issued as three separate queries rather than a single CTE-heavy
         query.  The previous combined form referenced ``latest_ts.ts``
         inside a timestamp-range predicate on option_chains, which the
-        planner cannot push into the partial covering index because it
+        planner cannot push into a timestamp-keyed index because it
         treats the CTE value as unknown at plan time -- forcing a Seq
-        Scan over the table.  Splitting into three round-trips with
-        literal timestamps lets the planner see the range as constants
-        and use the partial covering index
-        ``idx_option_chains_underlying_option_symbol_ts_gamma_covering``
-        for an Index Only Scan.
+        Scan.  Splitting into three round-trips with literal timestamps
+        lets the planner see the range as constants and choose a
+        timestamp-range index plan.
 
-        Latest-per-contract step (query #3): the DISTINCT ON walk's cost
-        is dominated by the lookback width, since PostgreSQL has no
-        skip-scan and must emit every (option_symbol, timestamp) tuple
-        in the window before Unique deduplicates.  Steady-state cycles
-        therefore use ``ANALYTICS_SNAPSHOT_LOOKBACK_HOURS`` (default 2),
-        which keeps the walk to ~20 k tuples and runs in ~1 sec under
-        concurrent VACUUM IO.  This is operationally safe during/around
-        RTH because every active contract is requoted within minutes;
-        the latest quote per contract is virtually always present in
-        the last hour.
+        Plan choice for the latest-per-contract step (query #3) depends
+        on the lookback width and is left to the optimizer:
+
+          * Narrow lookback (2h steady-state): the planner picks a
+            single Index Scan on ``idx_option_chains_timestamp_expiration``,
+            does an in-memory quicksort of the few thousand candidates,
+            and dedupes to ~700-1000 contracts in ~70 ms warm.
+
+          * Wide lookback (96h cold-start): the planner picks a Parallel
+            Bitmap Heap Scan that BitmapAnd's ``underlying_timestamp``
+            against ``expiration``, sorts ~500 k candidates via external
+            merge, then dedupes.  Runs in ~40 sec warm; can blow past
+            the pool-level 90 s statement_timeout when the buffer pool
+            is cold (e.g. just after VACUUM evicts).
+
+        The DISTINCT ON walk's cost is dominated by the lookback width
+        since PostgreSQL has no skip-scan.  Steady-state cycles therefore
+        use ``ANALYTICS_SNAPSHOT_LOOKBACK_HOURS`` (default 2), which is
+        operationally safe during/around RTH because every active
+        contract is requoted within minutes -- the latest quote per
+        contract is virtually always present in the last hour.
 
         The first cycle after process start instead uses
         ``ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS`` (default 96) so
@@ -145,13 +154,16 @@ class AnalyticsEngine:
         a slow first cycle can never wedge the cycle loop indefinitely.
 
         Background -- the May 13, 2026 incident wedged production with
-        a 23-minute snapshot wallclock when the planner fell back to
-        ``idx_option_chains_underlying_option_symbol_timestamp`` and
-        heap-fetched every candidate row to evaluate ``gamma IS NOT
-        NULL`` plus collect the SELECT list.  Adding the partial
-        covering index (and bumping the pool-level statement_timeout
-        to 90 s as a backstop) cut that to ~45 sec under load, and
-        the narrower steady-state lookback cuts it further to ~1 sec.
+        a 23-minute snapshot wallclock at the historical 96-hour default
+        lookback when concurrent autovacuum IO + a saturated buffer pool
+        pushed the bitmap-heap-scan past every retry boundary.  A
+        partial covering index keyed on (underlying, option_symbol,
+        timestamp DESC) was built to convert the query into an Index
+        Only Scan, but the planner refused to use it (per-symbol walks
+        across all-of-history beat the bitmap plan in the cost model
+        only when visibility-map coverage is near-perfect, which a
+        write-heavy table never sustains).  See setup/database/schema.sql
+        for the post-mortem and the drop path.
 
         Returns dict with keys 'timestamp', 'underlying_price',
         'options' or None if no data is available.
@@ -204,15 +216,14 @@ class AnalyticsEngine:
                 # gamma has been populated by ingestion.  Feeds the GEX
                 # and max-pain calculations in run_calculation().
                 #
-                # Plan: the partial covering index
-                # idx_option_chains_underlying_option_symbol_ts_gamma_covering
-                # WHERE gamma IS NOT NULL INCLUDE (every SELECT-list col)
-                # supports this query as an Index Only Scan with no Sort
-                # and no heap fetches for the filter predicates or output
-                # columns.  Production wallclock: ~45s under concurrent
-                # load (the DISTINCT ON walk over ~400k tuples is the
-                # remaining cost; see the function docstring for full
-                # background and the May 13 incident analysis).
+                # Plan choice is left to the optimizer and varies with
+                # the lookback width (see the function docstring for the
+                # full breakdown).  At the 2h steady-state width the
+                # planner picks a single Index Scan + in-memory sort
+                # (~70 ms warm); at the 96h cold-start width it picks a
+                # Parallel Bitmap Heap Scan + external merge sort
+                # (~40 sec warm, bounded by the 90 s pool statement
+                # timeout when the buffer pool is cold).
                 # First cycle after process start gets a wider window so we
                 # reach the prior session's closing quotes; every subsequent
                 # cycle uses the narrow steady-state window.  The "consumed"

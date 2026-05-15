@@ -228,31 +228,21 @@ analytics-snapshot-explain: ## EXPLAIN (no ANALYZE) of the _get_snapshot query �
 		| $(PSQL) -v ON_ERROR_STOP=0
 
 .PHONY: db-add-distinct-on-index
-db-add-distinct-on-index: ## Build idx_option_chains_underlying_option_symbol_ts_gamma_covering CONCURRENTLY (~4.4 GB). Pass CONFIRM=yes to execute.
-	@echo "$(BLUE)=== Building idx_option_chains_underlying_option_symbol_ts_gamma_covering CONCURRENTLY ===$(NC)"
-	@echo "$(YELLOW)Partial covering index for AnalyticsEngine._get_snapshot()'s$(NC)"
-	@echo "$(YELLOW)DISTINCT ON (option_symbol) query. Cuts the 96-hour-lookback$(NC)"
-	@echo "$(YELLOW)production query from ~23 min to ~45 sec by enabling Index Only$(NC)"
-	@echo "$(YELLOW)Scan (all SELECT-list columns satisfied from the index leaf).$(NC)"
-	@echo "$(YELLOW)Definition:$(NC)"
-	@echo "$(YELLOW)  ON option_chains(underlying, option_symbol, timestamp DESC)$(NC)"
-	@echo "$(YELLOW)  INCLUDE (strike, option_type, expiration, last, bid, ask,$(NC)"
-	@echo "$(YELLOW)           volume, open_interest, delta, gamma, theta, vega,$(NC)"
-	@echo "$(YELLOW)           implied_volatility)$(NC)"
-	@echo "$(YELLOW)  WHERE gamma IS NOT NULL$(NC)"
-	@echo "$(YELLOW)Measured size: ~4.4 GB on a 6.4 GB table (29 GB existing index footprint).$(NC)"
-	@echo "$(YELLOW)Build is non-blocking (CREATE INDEX CONCURRENTLY) but holds a session;$(NC)"
-	@echo "$(YELLOW)allow ~15-30 minutes on the production table size.  Run inside tmux:$(NC)"
-	@echo "$(YELLOW)  tmux new -s indexbuild  &&  make db-add-distinct-on-index CONFIRM=yes$(NC)"
-	@if [ "$${CONFIRM}" != "yes" ]; then \
-		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to actually build.$(NC)"; \
-	else \
-		printf "%s\n" \
-			"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_option_chains_underlying_option_symbol_ts_gamma_covering ON option_chains(underlying, option_symbol, timestamp DESC) INCLUDE (strike, option_type, expiration, last, bid, ask, volume, open_interest, delta, gamma, theta, vega, implied_volatility) WHERE gamma IS NOT NULL;" \
-			| $(PSQL) -v ON_ERROR_STOP=1; \
-		echo "$(GREEN)✓ Index built. Run 'make analytics-snapshot-diagnose UNDERLYING=SPX LOOKBACK_MINUTES=5760' to verify the plan picks the new index.$(NC)"; \
-		echo "$(YELLOW)Then run 'make db-drop-narrow-partial-index CONFIRM=yes' to reclaim the 1.6 GB narrow variant.$(NC)"; \
-	fi
+db-add-distinct-on-index: ## [DEPRECATED] Don't build this -- planner won't use it. See db-drop-distinct-on-index.
+	@echo "$(RED)=== REFUSING to build idx_option_chains_underlying_option_symbol_ts_gamma_covering ===$(NC)"
+	@echo "$(RED)This index was found to be DEAD WEIGHT after construction:$(NC)"
+	@echo "$(RED)  * Planner refuses to use it for _get_snapshot() (proven via$(NC)"
+	@echo "$(RED)    EXPLAIN ANALYZE with enable_bitmapscan=off).$(NC)"
+	@echo "$(RED)  * LATERAL rewrite that would have exercised it makes the 2h$(NC)"
+	@echo "$(RED)    steady-state path 5x slower (354ms vs 70ms) for a single$(NC)"
+	@echo "$(RED)    25% improvement on the 96h cold-start (29s vs 38s).$(NC)"
+	@echo "$(RED)  * Costs ~6 GB on disk + per-insert write amplification on a$(NC)"
+	@echo "$(RED)    13-column INCLUDE list for every gamma-non-null INSERT.$(NC)"
+	@echo "$(RED)If you actually need this index, the visibility-map-coverage$(NC)"
+	@echo "$(RED)problem that blocks the LATERAL rewrite must be solved first --$(NC)"
+	@echo "$(RED)otherwise you're rebuilding dead weight.  See$(NC)"
+	@echo "$(RED)setup/database/schema.sql for the full post-mortem.$(NC)"
+	@exit 1
 
 .PHONY: db-add-confluence-matrix-index
 db-add-confluence-matrix-index: ## Build idx_signal_component_scores_underlying_ts_comp_clamped_covering CONCURRENTLY. Pass CONFIRM=yes to execute.
@@ -365,6 +355,33 @@ api-time-confluence-matrix: ## Time /api/signals/{basic,advanced}/confluence-mat
 	timed_curl "$$BASE_URL/api/signals/basic/confluence-matrix?symbol=$$SYMBOL&lookback=2000"    "basic    lookback=2000"; \
 	echo "$(YELLOW)-- companion advanced endpoint (same code path)$(NC)"; \
 	timed_curl "$$BASE_URL/api/signals/advanced/confluence-matrix?symbol=$$SYMBOL&lookback=120"  "advanced lookback=120 "
+
+.PHONY: db-drop-distinct-on-index
+db-drop-distinct-on-index: ## DROP CONCURRENTLY the unused idx_option_chains_underlying_option_symbol_ts_gamma_covering (~6 GB; planner refuses to use it). Pass CONFIRM=yes to execute.
+	@echo "$(BLUE)=== Dropping idx_option_chains_underlying_option_symbol_ts_gamma_covering CONCURRENTLY ===$(NC)"
+	@echo "$(YELLOW)Built as the fix for the May 13 _get_snapshot() wedge but never$(NC)"
+	@echo "$(YELLOW)actually used by the planner.  Verified via EXPLAIN ANALYZE under$(NC)"
+	@echo "$(YELLOW)both natural plans and SET enable_bitmapscan = off; bitmap-heap-scan$(NC)"
+	@echo "$(YELLOW)wins the cost model at every lookback width.  The LATERAL rewrite$(NC)"
+	@echo "$(YELLOW)that would have exercised this index regresses the 2h steady-state$(NC)"
+	@echo "$(YELLOW)path 5x (354ms vs 70ms) for a single 25% improvement at 96h.$(NC)"
+	@echo "$(YELLOW)Reclaiming this index frees ~6 GB plus per-insert write amplification$(NC)"
+	@echo "$(YELLOW)on a 13-column INCLUDE list for every gamma-non-null INSERT batch.$(NC)"
+	@echo "$(YELLOW)DROP CONCURRENTLY can park waiting for old snapshots from in-flight$(NC)"
+	@echo "$(YELLOW)analytics queries; allow several minutes, run inside tmux to be safe.$(NC)"
+	@echo "$(YELLOW)Before running, sanity-check with pg_stat_user_indexes:$(NC)"
+	@echo "$(YELLOW)  SELECT idx_scan FROM pg_stat_user_indexes WHERE indexrelname =$(NC)"
+	@echo "$(YELLOW)    'idx_option_chains_underlying_option_symbol_ts_gamma_covering';$(NC)"
+	@echo "$(YELLOW)Expected: a small / zero scan count.  See setup/database/schema.sql$(NC)"
+	@echo "$(YELLOW)for the full post-mortem of the rejected Path B rewrite.$(NC)"
+	@if [ "$${CONFIRM}" != "yes" ]; then \
+		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to actually drop.$(NC)"; \
+	else \
+		printf "%s\n" \
+			"DROP INDEX CONCURRENTLY IF EXISTS idx_option_chains_underlying_option_symbol_ts_gamma_covering;" \
+			| $(PSQL) -v ON_ERROR_STOP=1; \
+		echo "$(GREEN)✓ Covering index dropped. Reclaimed ~6 GB.$(NC)"; \
+	fi
 
 .PHONY: db-drop-narrow-partial-index
 db-drop-narrow-partial-index: ## DROP CONCURRENTLY the narrow idx_option_chains_underlying_option_symbol_ts_gamma (~1.6 GB; subsumed by _covering). Pass CONFIRM=yes to execute.
