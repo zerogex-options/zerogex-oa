@@ -81,6 +81,50 @@ NYSE_HOLIDAYS: set[date] = load_nyse_holidays()
 _MIN_YEARS_TO_EXPIRATION = 1.0 / 525_600  # one minute, in years
 
 
+def is_spx_am_settled_expiration(symbol: str, expiration_date: date) -> bool:
+    """True for SPX/SPXpm AM-settled monthly expirations.
+
+    SPX monthly options expire on the third Friday of the month and
+    settle AM at the Special Opening Quotation (~09:30 ET).  The
+    weekly SPX series (SPXW) and end-of-month series settle PM at
+    16:00 ET, like SPY/QQQ/etc.
+
+    We can't always tell the series from just (underlying, expiration)
+    because TradeStation lists both SPX and SPXW under the same
+    ``$SPX.X`` underlying.  Best heuristic without an option-symbol
+    prefix is: ``$SPX.X`` (or canonical ``SPX``) on a 3rd-Friday is
+    AM-settled.  SPXW on a 3rd-Friday is rare in production data;
+    callers with ``option_symbol`` available should branch on the
+    ``SPXW`` prefix and skip this helper for those rows.
+    """
+    # Normalize "$SPX.X" / "SPX" / "$SPX" -> "SPX".  Use explicit
+    # prefix/suffix strips, NOT str.rstrip(".X") -- rstrip treats its
+    # argument as a character set and would turn "SPX" into "SP".
+    sym = (symbol or "").upper()
+    if sym.startswith("$"):
+        sym = sym[1:]
+    if sym.endswith(".X"):
+        sym = sym[:-2]
+    if sym != "SPX":
+        return False
+    # Third-Friday rule: weekday() == 4 (Fri) and day-of-month in [15, 21].
+    return expiration_date.weekday() == 4 and 15 <= expiration_date.day <= 21
+
+
+def expiration_close_time_et(symbol: str, expiration_date: date) -> str:
+    """Wall-clock time in ET at which the contract settles.
+
+    Returns ``"09:30:00"`` for SPX AM-settled monthlies and
+    ``"16:00:00"`` for everything else.  Pass to
+    ``calculate_time_to_expiration`` so AM-settled contracts don't
+    accumulate ~6.5 hours of phantom time value on the morning of
+    expiration.
+    """
+    if is_spx_am_settled_expiration(symbol, expiration_date):
+        return "09:30:00"
+    return "16:00:00"
+
+
 def calculate_time_to_expiration(
     current_date: datetime,
     expiration_date: date,
@@ -88,11 +132,10 @@ def calculate_time_to_expiration(
 ) -> float:
     """Return time-to-expiration in years, floored at one minute.
 
-    The expiration date is anchored at the US equity market close in ET.
-    Naive ``current_date`` values are treated as UTC and converted to
-    ET.  This is the single canonical implementation used by the Greeks
-    calculator, IV calculator, and analytics engine (previously three
-    independent copies, all slightly different in their edge handling).
+    The expiration date is anchored at the US equity market close in ET
+    by default; pass ``market_close_time="09:30:00"`` for AM-settled
+    contracts (or use ``expiration_close_time_et`` to derive it).  Naive
+    ``current_date`` values are treated as UTC and converted to ET.
     """
     if current_date.tzinfo is None:
         current_date = pytz.UTC.localize(current_date).astimezone(ET)

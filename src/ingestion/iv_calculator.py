@@ -59,6 +59,14 @@ class IVCalculator:
         self.min_iv = min_iv if min_iv is not None else IV_MIN
         self.max_iv = max_iv if max_iv is not None else IV_MAX
 
+        # Clamp telemetry: incremented when the Newton step lands outside
+        # [min_iv, max_iv] and we have to floor/ceiling the result.
+        # Frequent hits indicate IV_MIN/IV_MAX may be miscalibrated for
+        # the current market regime (e.g. deep-OTM strikes near 0 gamma
+        # routinely saturate the floor).
+        self._iv_clamp_floor_hits = 0
+        self._iv_clamp_ceiling_hits = 0
+
         logger.info(
             f"Initialized IVCalculator: max_iter={self.max_iterations}, "
             f"tol={self.tolerance}, range=[{self.min_iv}, {self.max_iv}]"
@@ -209,8 +217,28 @@ class IVCalculator:
                 logger.debug("Sigma became non-finite during iteration; aborting")
                 return None
 
-            # Constrain to valid range
-            sigma = max(self.min_iv, min(sigma, self.max_iv))
+            # Constrain to valid range and count clamp hits so operators
+            # can tell when IV_MIN/IV_MAX are too tight for current
+            # market conditions (deep-OTM strikes near zero gamma
+            # frequently saturate the floor).
+            if sigma < self.min_iv:
+                self._iv_clamp_floor_hits += 1
+                if (self._iv_clamp_floor_hits % 1000) == 1:
+                    logger.warning(
+                        "IV solver hit min_iv=%.4f floor (cumulative=%d)",
+                        self.min_iv,
+                        self._iv_clamp_floor_hits,
+                    )
+                sigma = self.min_iv
+            elif sigma > self.max_iv:
+                self._iv_clamp_ceiling_hits += 1
+                if (self._iv_clamp_ceiling_hits % 1000) == 1:
+                    logger.warning(
+                        "IV solver hit max_iv=%.4f ceiling (cumulative=%d)",
+                        self.max_iv,
+                        self._iv_clamp_ceiling_hits,
+                    )
+                sigma = self.max_iv
 
         logger.debug(f"IV did not converge after {self.max_iterations} iterations")
         return None

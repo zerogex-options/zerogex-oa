@@ -81,73 +81,21 @@ CREATE TABLE IF NOT EXISTS option_chains (
     PRIMARY KEY (option_symbol, timestamp)
 );
 
--- Idempotent migration: add new columns if they don't exist yet (for existing databases)
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='option_chains' AND column_name='mid'
-    ) THEN
-        ALTER TABLE option_chains ADD COLUMN mid NUMERIC(12, 4);
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='option_chains' AND column_name='ask_volume'
-    ) THEN
-        ALTER TABLE option_chains ADD COLUMN ask_volume BIGINT DEFAULT 0;
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='option_chains' AND column_name='mid_volume'
-    ) THEN
-        ALTER TABLE option_chains ADD COLUMN mid_volume BIGINT DEFAULT 0;
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='option_chains' AND column_name='bid_volume'
-    ) THEN
-        ALTER TABLE option_chains ADD COLUMN bid_volume BIGINT DEFAULT 0;
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='option_chains' AND column_name='implied_volatility'
-    ) THEN
-        ALTER TABLE option_chains ADD COLUMN implied_volatility NUMERIC(8, 6);
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='option_chains' AND column_name='delta'
-    ) THEN
-        ALTER TABLE option_chains ADD COLUMN delta NUMERIC(8, 6);
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='option_chains' AND column_name='gamma'
-    ) THEN
-        ALTER TABLE option_chains ADD COLUMN gamma NUMERIC(10, 8);
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='option_chains' AND column_name='theta'
-    ) THEN
-        ALTER TABLE option_chains ADD COLUMN theta NUMERIC(10, 6);
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='option_chains' AND column_name='vega'
-    ) THEN
-        ALTER TABLE option_chains ADD COLUMN vega NUMERIC(10, 6);
-    END IF;
-END $$;
+-- Backfill columns for option_chains tables that pre-date them.  Fresh
+-- installs already get all columns from the CREATE TABLE above; this
+-- block only runs ALTER on existing deployments.  ``ADD COLUMN IF NOT
+-- EXISTS`` (PostgreSQL >= 9.6) collapses the previous nine separate
+-- ``IF NOT EXISTS (SELECT ... information_schema.columns ...)`` DO
+-- blocks into a single statement per column.
+ALTER TABLE option_chains ADD COLUMN IF NOT EXISTS mid NUMERIC(12, 4);
+ALTER TABLE option_chains ADD COLUMN IF NOT EXISTS ask_volume BIGINT DEFAULT 0;
+ALTER TABLE option_chains ADD COLUMN IF NOT EXISTS mid_volume BIGINT DEFAULT 0;
+ALTER TABLE option_chains ADD COLUMN IF NOT EXISTS bid_volume BIGINT DEFAULT 0;
+ALTER TABLE option_chains ADD COLUMN IF NOT EXISTS implied_volatility NUMERIC(8, 6);
+ALTER TABLE option_chains ADD COLUMN IF NOT EXISTS delta NUMERIC(8, 6);
+ALTER TABLE option_chains ADD COLUMN IF NOT EXISTS gamma NUMERIC(10, 8);
+ALTER TABLE option_chains ADD COLUMN IF NOT EXISTS theta NUMERIC(10, 6);
+ALTER TABLE option_chains ADD COLUMN IF NOT EXISTS vega NUMERIC(10, 6);
 
 CREATE INDEX IF NOT EXISTS idx_option_chains_timestamp ON option_chains(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_option_chains_underlying ON option_chains(underlying);
@@ -172,42 +120,14 @@ CREATE INDEX IF NOT EXISTS idx_option_chains_option_symbol_timestamp
 CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_ts_quote_covering
     ON option_chains(underlying, timestamp DESC)
     INCLUDE (bid, ask, volume, open_interest, strike, expiration, option_type);
--- Partial covering index keyed on (underlying, option_symbol, timestamp DESC)
--- WHERE gamma IS NOT NULL, INCLUDE-ing the full Greeks/quote SELECT list.
---
--- IMPORTANT context, per the May 14-15, 2026 investigation: this index was
--- originally built as a fix for the May 13 _get_snapshot() wedge incident,
--- but the planner does NOT pick it for that query at any lookback width --
--- bitmap-heap-scan (BitmapAnd of idx_option_chains_underlying_timestamp +
--- idx_option_chains_expiration) wins the cost model.  Verified via
--- EXPLAIN ANALYZE both with the index present and after DROP INDEX
--- inside a transaction: identical plans, ~55 sec warm at 96h lookback.
--- The actual wedge fix was tightening the steady-state lookback
--- (ANALYTICS_SNAPSHOT_LOOKBACK_HOURS=2) with a one-shot
--- ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS=96 first cycle, plus the
--- pool-level DB_STATEMENT_TIMEOUT_MS=90000 backstop.  See
--- src/analytics/main_engine.py:_get_snapshot() for details.
---
--- The index IS, however, the canonical access path for queries that
--- filter by both ``underlying`` AND a specific ``option_symbol`` (LATERAL
--- joins, per-contract snapshot lookups) with ORDER BY timestamp DESC.
--- Known live user as of this writing:
---   * src/api/database.py:_do_refresh_flow_cache() LATERAL backfill
---     (~15s cadence under /api/gex/contract_flow polling).  pg_stat_user_indexes
---     attributed ~2.4k scans / ~115M tuples-read to this query alone.
--- Before dropping the index, audit pg_stat_user_indexes for fresh scan
--- activity and migrate any active users to an alternative plan first --
--- otherwise per-contract lookups regress to seq-scan or bitmap-heap-scan
--- of the whole window, which is orders of magnitude slower.
---
--- A LATERAL rewrite of _get_snapshot() that would have exercised this
--- index was prototyped and rejected: it regressed the 2h steady-state
--- path 5x (354 ms vs 70 ms) for a single 25% improvement on the 96h
--- cold-start (29 sec vs 38 sec).  Net negative.
---
--- Build with CREATE INDEX CONCURRENTLY in production via
--- ``make db-add-distinct-on-index`` to avoid blocking the option_chains
--- writers; this schema entry serves fresh installs and idempotent retries.
+-- Partial covering index for per-contract snapshot lookups (LATERAL
+-- joins, src/api/database.py:_do_refresh_flow_cache).  NOT picked by
+-- the planner for analytics _get_snapshot() despite being designed
+-- for it -- bitmap-heap-scan wins at every lookback width.  Don't
+-- drop without first migrating per-contract lookups to an alternate
+-- plan.  Build in production via ``make db-add-distinct-on-index``
+-- (CREATE INDEX CONCURRENTLY).  Full incident history in
+-- docs/runbooks/option_chains_indexing.md.
 CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_option_symbol_ts_gamma_covering
     ON option_chains(underlying, option_symbol, timestamp DESC)
     INCLUDE (
@@ -309,67 +229,20 @@ BEGIN
     END IF;
 END $$;
 
--- Idempotent migration: intraday risk fields for enriched GEX summary.
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='gex_summary' AND column_name='flip_distance'
-    ) THEN
-        ALTER TABLE gex_summary
-            ADD COLUMN flip_distance DOUBLE PRECISION;
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='gex_summary' AND column_name='local_gex'
-    ) THEN
-        ALTER TABLE gex_summary
-            ADD COLUMN local_gex DOUBLE PRECISION;
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='gex_summary' AND column_name='convexity_risk'
-    ) THEN
-        ALTER TABLE gex_summary
-            ADD COLUMN convexity_risk DOUBLE PRECISION;
-    END IF;
-
-    -- Canonical Call/Put Wall strikes.  Backfilled NULL for historical rows;
-    -- the Analytics Engine populates them on each new run.  See
-    -- src/analytics/walls.py for the canonical definition.
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='gex_summary' AND column_name='call_wall'
-    ) THEN
-        ALTER TABLE gex_summary
-            ADD COLUMN call_wall NUMERIC(12, 4);
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='gex_summary' AND column_name='put_wall'
-    ) THEN
-        ALTER TABLE gex_summary
-            ADD COLUMN put_wall NUMERIC(12, 4);
-    END IF;
-
-    -- Per-expiration max pain breakdown, written alongside the scalar
-    -- max_pain column.  The scalar is the front-month value (nearest
-    -- non-expired settlement); this JSONB gives the full
-    -- {expiration_iso: strike} dict.  Pooling all expirations into a
-    -- single scalar (the previous behavior of _calculate_max_pain) was
-    -- a synthetic value that didn't correspond to any real settlement
-    -- event.  See src/analytics/main_engine.py:_calculate_max_pain.
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='gex_summary' AND column_name='max_pain_by_expiration'
-    ) THEN
-        ALTER TABLE gex_summary
-            ADD COLUMN max_pain_by_expiration JSONB;
-    END IF;
-END $$;
+-- Backfill columns for gex_summary tables that pre-date them.  The
+-- canonical schema is the CREATE TABLE above; these statements only
+-- run ALTER on existing deployments.  ``call_wall`` / ``put_wall`` are
+-- populated by the Analytics Engine on each cycle (see
+-- src/analytics/walls.py).  ``max_pain_by_expiration`` carries the
+-- per-expiration breakdown that pairs with the scalar ``max_pain``
+-- column (front-month value); see
+-- src/analytics/main_engine.py:_calculate_max_pain.
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS flip_distance DOUBLE PRECISION;
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS local_gex DOUBLE PRECISION;
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS convexity_risk DOUBLE PRECISION;
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS call_wall NUMERIC(12, 4);
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS put_wall NUMERIC(12, 4);
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS max_pain_by_expiration JSONB;
 
 CREATE TABLE IF NOT EXISTS gex_by_strike (
     underlying VARCHAR(10) NOT NULL,
@@ -404,28 +277,19 @@ BEGIN
     END IF;
 END $$;
 
--- Idempotent migration: split per-type call/put greeks AND store the
--- dealer-sign convention (dealers are net short the book, so dealer
--- charm/vanna flow is the negative of market-aggregated charm/vanna).
--- Downstream signals that want a tradable "dealer hedging flow" should
--- read dealer_charm_exposure / dealer_vanna_exposure; the raw
--- charm_exposure / vanna_exposure columns remain for backwards compat.
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='gex_by_strike' AND column_name='dealer_charm_exposure'
-    ) THEN
-        ALTER TABLE gex_by_strike
-            ADD COLUMN call_charm_exposure DOUBLE PRECISION,
-            ADD COLUMN put_charm_exposure  DOUBLE PRECISION,
-            ADD COLUMN call_vanna_exposure DOUBLE PRECISION,
-            ADD COLUMN put_vanna_exposure  DOUBLE PRECISION,
-            ADD COLUMN dealer_charm_exposure DOUBLE PRECISION,
-            ADD COLUMN dealer_vanna_exposure DOUBLE PRECISION,
-            ADD COLUMN expiration_bucket VARCHAR(16);
-    END IF;
-END $$;
+-- Backfill split-by-type and dealer-sign columns on existing
+-- gex_by_strike deployments.  Dealers are net short the book, so
+-- dealer_charm_exposure / dealer_vanna_exposure are the negative of
+-- the market-aggregate charm_exposure / vanna_exposure columns.
+-- Downstream signals that want tradable "dealer hedging flow" should
+-- read the dealer_* columns.
+ALTER TABLE gex_by_strike ADD COLUMN IF NOT EXISTS call_charm_exposure DOUBLE PRECISION;
+ALTER TABLE gex_by_strike ADD COLUMN IF NOT EXISTS put_charm_exposure DOUBLE PRECISION;
+ALTER TABLE gex_by_strike ADD COLUMN IF NOT EXISTS call_vanna_exposure DOUBLE PRECISION;
+ALTER TABLE gex_by_strike ADD COLUMN IF NOT EXISTS put_vanna_exposure DOUBLE PRECISION;
+ALTER TABLE gex_by_strike ADD COLUMN IF NOT EXISTS dealer_charm_exposure DOUBLE PRECISION;
+ALTER TABLE gex_by_strike ADD COLUMN IF NOT EXISTS dealer_vanna_exposure DOUBLE PRECISION;
+ALTER TABLE gex_by_strike ADD COLUMN IF NOT EXISTS expiration_bucket VARCHAR(16);
 
 -- =============================================================================
 -- Remove legacy/non-essential objects (safe cleanup during migration)
@@ -479,6 +343,13 @@ CREATE TRIGGER update_tradestation_api_calls_updated_at
 -- =============================================================================
 -- Base deltas
 -- =============================================================================
+-- ``option_chains_with_deltas`` is retained as a backward-compat view for
+-- ad-hoc queries / dashboards.  ``volume_delta`` here is recomputed on
+-- read via LAG() and is not the canonical flow value -- the engine writes
+-- the buy/sell-classified flow facts to ``flow_contract_facts`` (defined
+-- below).  New queries should read flow numbers from ``flow_contract_facts``
+-- and only fall back to this view for raw OI delta or per-row enrichment
+-- not stored elsewhere.
 DROP VIEW IF EXISTS option_chains_with_deltas CASCADE;
 CREATE VIEW option_chains_with_deltas AS
 SELECT
@@ -704,18 +575,36 @@ FROM underlying_quotes
 GROUP BY symbol, DATE(timestamp AT TIME ZONE 'America/New_York');
 
 DROP VIEW IF EXISTS underlying_buying_pressure CASCADE;
+-- Tape-classified uptick/downtick volume from TradeStation's bar
+-- stream (Lee-Ready-style classification on consolidated NBBO).
+-- This is a TICK-TEST CLASSIFICATION, not actual trade-side
+-- attribution: a 1k-share print between exchanges with NBBO churn
+-- can land on either side depending on the order of bookkeeping
+-- events.  Column and label naming reflects what's actually
+-- measured -- the previous "Buying" / "Selling" labels overstated
+-- the precision of the underlying TS feed.
 CREATE VIEW underlying_buying_pressure AS
 SELECT
     q.timestamp AT TIME ZONE 'America/New_York' AS time_et,
     q.timestamp,
     q.symbol,
     q.close AS price,
+    (q.up_volume - q.down_volume)::bigint AS uptick_minus_downtick_vol,
+    ROUND(COALESCE((q.up_volume::numeric / NULLIF((q.up_volume + q.down_volume), 0)) * 100, 50), 2) AS uptick_vol_pct,
+    CASE
+        WHEN (q.up_volume - q.down_volume) >= 50000 THEN '🟢 Strong Uptick Bias'
+        WHEN (q.up_volume - q.down_volume) > 0 THEN '✅ Uptick Bias'
+        WHEN (q.up_volume - q.down_volume) <= -50000 THEN '❌ Downtick Bias'
+        ELSE '⚪ Neutral'
+    END AS tick_bias,
+    -- Backwards-compat aliases so existing Makefile / dashboard SQL
+    -- keeps working.  New code should read the canonical names above.
     (q.up_volume - q.down_volume)::bigint AS vol,
     ROUND(COALESCE((q.up_volume::numeric / NULLIF((q.up_volume + q.down_volume), 0)) * 100, 50), 2) AS buy_pct,
     CASE
-        WHEN (q.up_volume - q.down_volume) >= 50000 THEN '🟢 Strong Buying'
-        WHEN (q.up_volume - q.down_volume) > 0 THEN '✅ Buying'
-        WHEN (q.up_volume - q.down_volume) <= -50000 THEN '❌ Selling'
+        WHEN (q.up_volume - q.down_volume) >= 50000 THEN '🟢 Strong Uptick Bias'
+        WHEN (q.up_volume - q.down_volume) > 0 THEN '✅ Uptick Bias'
+        WHEN (q.up_volume - q.down_volume) <= -50000 THEN '❌ Downtick Bias'
         ELSE '⚪ Neutral'
     END AS momentum
 FROM underlying_quotes q;
@@ -868,6 +757,14 @@ WITH latest_price AS (
     ORDER BY symbol, timestamp DESC
 ),
 latest_delta AS (
+    -- ``expected_hedge_shares`` is the dealer's required delta-hedge
+    -- position in shares: dealers are short the customer book, so dealer
+    -- option delta = -SUM(customer_delta * OI * 100), and the share-hedge
+    -- that flattens that delta is +SUM(customer_delta * OI * 100).
+    -- A POSITIVE value => dealer is currently long shares as a hedge.
+    -- A NEGATIVE value => dealer is currently short shares as a hedge.
+    -- This is the static position level.  The dynamic hedge flow on a
+    -- price move is governed by gamma, not delta -- see gex_summary.
     SELECT
         underlying AS symbol,
         SUM(delta * open_interest::numeric * 100) AS expected_hedge_shares
@@ -885,6 +782,16 @@ latest_delta AS (
         ORDER BY option_symbol, timestamp DESC
     ) t
     GROUP BY underlying
+),
+notional_scale AS (
+    -- Per-symbol "what counts as a meaningful share count" baseline:
+    -- ``current_price * 100`` is the dollar value of one share-hedge
+    -- contract.  Using 10000 contracts ($1M notional on SPY at $100,
+    -- $5.5M on SPX at $5500) as the meaningful threshold makes the
+    -- label calibration scale across underlyings instead of
+    -- saturating SPX while undercounting SPY.
+    SELECT symbol, current_price * 100 * 10000 AS hedge_notional_threshold
+    FROM latest_price
 )
 SELECT
     p.timestamp AT TIME ZONE 'America/New_York' AS time_et,
@@ -893,19 +800,41 @@ SELECT
     p.current_price,
     p.price_change,
     COALESCE(d.expected_hedge_shares, 0) AS expected_hedge_shares,
+    -- Honest labeling: this column reports the dealer's CURRENT static
+    -- hedge position direction, not "risk of forced hedging" (that's a
+    -- function of gamma, not delta).  Threshold is symbol-aware via
+    -- notional_scale so SPX/SPY use comparable bars.
     CASE
-        WHEN COALESCE(d.expected_hedge_shares, 0) > 1000000
-            THEN '🔴 Heavy Sell-Hedging Risk'
-        WHEN COALESCE(d.expected_hedge_shares, 0) < -1000000
-            THEN '🟢 Heavy Buy-Hedging Risk'
-        ELSE '⚪ Balanced Hedging'
+        WHEN COALESCE(d.expected_hedge_shares, 0) > ns.hedge_notional_threshold / NULLIF(p.current_price, 0)
+            THEN '🟢 Dealer Long Hedge'
+        WHEN COALESCE(d.expected_hedge_shares, 0) < -ns.hedge_notional_threshold / NULLIF(p.current_price, 0)
+            THEN '🔴 Dealer Short Hedge'
+        ELSE '⚪ Dealer Balanced Hedge'
     END AS hedge_pressure
 FROM latest_price p
-LEFT JOIN latest_delta d ON d.symbol::text = p.symbol::text;
+LEFT JOIN latest_delta d ON d.symbol::text = p.symbol::text
+LEFT JOIN notional_scale ns ON ns.symbol::text = p.symbol::text;
 
 DROP VIEW IF EXISTS gamma_exposure_levels CASCADE;
+-- Per-strike dealer GEX in industry-standard "dollar gamma per 1% move"
+-- units: γ × OI × 100 × S² × 0.01.  This matches the canonical formula
+-- used by the analytics engine (src/analytics/main_engine.py:439) and
+-- src/analytics/walls.py.  The previous version of this view used the
+-- per-share-equivalent ``γ × OI × 100`` form, which differs from the
+-- canonical persisted ``gex_by_strike.net_gex`` by a factor of S²/100
+-- (~2,000x on SPY at $450, ~300,000x on SPX at $5500), and combined
+-- that with a hardcoded ±$1M threshold that was uncalibrated for either
+-- form.  This rewrite makes the view consistent with the rest of the
+-- codebase and uses a per-symbol threshold derived from spot.
 CREATE VIEW gamma_exposure_levels AS
-WITH latest_options AS (
+WITH latest_spot AS (
+    SELECT DISTINCT ON (symbol)
+        symbol,
+        close::numeric AS spot
+    FROM underlying_quotes
+    ORDER BY symbol, timestamp DESC
+),
+latest_options AS (
     SELECT DISTINCT ON (option_symbol)
         option_symbol,
         underlying,
@@ -920,36 +849,45 @@ WITH latest_options AS (
     ORDER BY option_symbol, timestamp DESC
 )
 SELECT
-    underlying,
-    strike,
+    o.underlying,
+    o.strike,
+    -- Canonical formula: γ × OI × 100 × S² × 0.01.  Calls contribute
+    -- positively, puts contribute negatively (dealer convention: dealers
+    -- are short calls, long puts).
     SUM(
         CASE
-            WHEN option_type = 'C' THEN gamma * open_interest::numeric * 100
-            ELSE -gamma * open_interest::numeric * 100
+            WHEN o.option_type = 'C' THEN o.gamma * o.open_interest::numeric * 100 * s.spot * s.spot * 0.01
+            ELSE -o.gamma * o.open_interest::numeric * 100 * s.spot * s.spot * 0.01
         END
     ) AS net_gex,
-    SUM(ABS(gamma * open_interest::numeric * 100)) AS total_gex,
-    SUM(gamma * open_interest::numeric * 100) FILTER (WHERE option_type = 'C') AS call_gex,
-    SUM(gamma * open_interest::numeric * 100) FILTER (WHERE option_type = 'P') AS put_gex,
+    SUM(ABS(o.gamma * o.open_interest::numeric * 100 * s.spot * s.spot * 0.01)) AS total_gex,
+    SUM(o.gamma * o.open_interest::numeric * 100 * s.spot * s.spot * 0.01) FILTER (WHERE o.option_type = 'C') AS call_gex,
+    SUM(o.gamma * o.open_interest::numeric * 100 * s.spot * s.spot * 0.01) FILTER (WHERE o.option_type = 'P') AS put_gex,
     COUNT(*) AS num_contracts,
-    SUM(open_interest) AS total_oi,
+    SUM(o.open_interest) AS total_oi,
+    -- Per-symbol threshold: 0.1% of spot's notional × 1M-share scale.
+    -- For SPY at $450, threshold is ~$2M GEX.  For SPX at $5500,
+    -- threshold is ~$300M GEX.  Both correspond to "meaningful at this
+    -- underlying's typical OI scale" rather than a single dollar number
+    -- that saturates SPX and undercounts SPY.
     CASE
         WHEN SUM(
             CASE
-                WHEN option_type = 'C' THEN gamma * open_interest::numeric * 100
-                ELSE -gamma * open_interest::numeric * 100
+                WHEN o.option_type = 'C' THEN o.gamma * o.open_interest::numeric * 100 * s.spot * s.spot * 0.01
+                ELSE -o.gamma * o.open_interest::numeric * 100 * s.spot * s.spot * 0.01
             END
-        ) > 1000000 THEN '🟢 Strong +GEX'
+        ) > s.spot * s.spot * 0.1 THEN '🟢 Strong +GEX'
         WHEN SUM(
             CASE
-                WHEN option_type = 'C' THEN gamma * open_interest::numeric * 100
-                ELSE -gamma * open_interest::numeric * 100
+                WHEN o.option_type = 'C' THEN o.gamma * o.open_interest::numeric * 100 * s.spot * s.spot * 0.01
+                ELSE -o.gamma * o.open_interest::numeric * 100 * s.spot * s.spot * 0.01
             END
-        ) < -1000000 THEN '🔴 Strong -GEX'
+        ) < -(s.spot * s.spot * 0.1) THEN '🔴 Strong -GEX'
         ELSE '⚪ Neutral GEX'
     END AS gex_level
-FROM latest_options
-GROUP BY underlying, strike;
+FROM latest_options o
+JOIN latest_spot s ON s.symbol::text = o.underlying::text
+GROUP BY o.underlying, o.strike, s.spot;
 
 -- =============================================================================
 -- Unified signal engine (v2)

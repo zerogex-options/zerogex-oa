@@ -797,3 +797,141 @@ matching industry convention.
 - F10 — `_classify_volume_chunk` silent crossed-quote fallback
 - All 🟡 design items (D2–D8)
 - All 🟢 cleanup items (C1–C5)
+
+---
+
+## Second fix pass (2026-05-15, follow-up commit)
+
+Everything above's "open items" addressed except C1/C2 (see note).
+
+### F7 — narrowed flow-endpoint excepts
+
+`src/api/database.py` — removed the five
+``except Exception: return []`` blocks in `get_flow`,
+`get_flow_series`, `get_flow_contracts`, `get_smart_money_flow`,
+`get_flow_buying_pressure`.  Only `asyncio.TimeoutError` still maps
+to the empty fallback; any other DB error now propagates to the
+framework's 5xx handler so monitoring sees it.  Exposed a latent
+test-setup bug in `test_api_flow_series.py` (instance-level mock
+wiped by the lifespan's `db_manager = DatabaseManager()`); fixed by
+class-level patching in `_attach_by_contract_mock`.
+
+### F8 — `dealer_hedging_pressure` honest labels
+
+`setup/database/schema.sql` — documented that
+`expected_hedge_shares` is the dealer's static hedge position
+(positive = dealer long shares), added a per-symbol
+`notional_scale` CTE so the label threshold scales across SPX/SPY,
+and relabeled to "Dealer Long/Short/Balanced Hedge" (the old
+"Sell-Hedging Risk" conflated position level with hedge flow,
+which is a gamma property not a delta one).
+
+### F9 — `gamma_exposure_levels` canonical formula
+
+`setup/database/schema.sql` — rewritten to use the canonical
+`γ × OI × 100 × S² × 0.01` formula (joining `latest_spot`),
+consistent with `gex_by_strike.net_gex` and `walls.py`.  Threshold
+is now spot-derived instead of a hardcoded ±$1M.
+
+### F10 — crossed-quote telemetry
+
+`src/ingestion/main_engine.py` — `_classify_volume_chunk` now
+increments `_classify_fallback_count` and warns every 1000th
+fallback (getattr-guarded so `__new__`-built test fixtures don't
+AttributeError).
+
+### D2 — AM-settled SPX expirations
+
+`src/market_calendar.py` — added `is_spx_am_settled_expiration`
+(3rd-Friday rule) and `expiration_close_time_et`.  The analytics
+engine's `_calculate_time_to_expiration` now anchors at 09:30 ET
+for AM-settled SPX monthlies, and `_get_snapshot` drops AM-settled
+SPX rows once their 09:30 SOQ has passed (SPXW weeklies on the
+same `$SPX.X` underlying are excluded from the filter via the
+`SPXW` symbol prefix).
+
+### D3 — symbol-aware PCR saturation
+
+`src/signals/components/put_call_ratio_state.py` — the hardcoded
+`/ 0.4` saturation is now resolved per-symbol from
+`ctx.extra["normalizers"]`, a `PCR_SATURATION_<SYMBOL>` env var,
+`PCR_SATURATION_DEFAULT`, or the legacy 0.4 default in that order.
+
+### D4 — schema migration consolidation
+
+`setup/database/schema.sql` — collapsed the 9 `option_chains`,
+6 `gex_summary`, and 7 `gex_by_strike` per-column `DO $$ … IF NOT
+EXISTS (SELECT information_schema) …` blocks into single
+`ALTER TABLE … ADD COLUMN IF NOT EXISTS` statements.  ~150 lines
+removed; behavior identical for fresh installs and existing
+deployments.
+
+### D5 — canonical volume_delta source
+
+`setup/database/schema.sql` — `option_chains_with_deltas` carries
+a header comment marking it backward-compat-only and pointing
+flow consumers at the canonical `flow_contract_facts`.
+
+### D6 — symbol-aware smart-money score
+
+`src/analytics/main_engine.py` — `flow_smart_money` premium tiers
+now scale with `notional_per_contract = spot * 100`; volume tiers
+and premium multiples are env-tunable
+(`SMART_MONEY_{VOL_T1..4,PREM_T1..4_NOTIONAL_X}`).  Calibration
+notes in `docs/runbooks/smart_money_calibration.md`.
+
+### D7 — flow-cache ownership documented
+
+`src/api/database.py` — `_refresh_flow_cache` docstring now states
+the analytics engine is the steady-state writer and the API path
+is an idempotent per-request backstop, with the
+`ANALYTICS_FLOW_CACHE_REFRESH_ENABLED=false` lever called out.
+
+### D8 — honest tape-bias labels
+
+`setup/database/schema.sql` — `underlying_buying_pressure`
+relabeled to uptick/downtick-bias terminology with canonical
+column names (`uptick_minus_downtick_vol`, `uptick_vol_pct`,
+`tick_bias`).  `vol` / `buy_pct` / `momentum` retained as
+backward-compat aliases.
+
+### C3 — index runbook
+
+`setup/database/schema.sql` — the 36-line incident narrative on
+`idx_option_chains_underlying_option_symbol_ts_gamma_covering`
+condensed to 8 lines; full history moved to
+`docs/runbooks/option_chains_indexing.md`.
+
+### C4 — IV clamp telemetry
+
+`src/ingestion/iv_calculator.py` — counts floor/ceiling clamp
+hits (`_iv_clamp_floor_hits` / `_iv_clamp_ceiling_hits`) and warns
+every 1000th so operators can tell when IV_MIN/IV_MAX are
+miscalibrated.
+
+### C5 — `enrich_option_data` simplified
+
+`src/ingestion/greeks_calculator.py` — removed the dead
+None/non-dict defensive branches (the IV calculator and
+`calculate_all_greeks` never return those); 109 lines → ~55, single
+consolidated None-Greeks path.
+
+### Not done: C1, C2
+
+- **C1** (verbose conn/cursor pattern in the analytics store
+  methods) — left as-is.  The branching is intentional for the
+  single-transaction `_store_calculation_results` grouping;
+  refactoring risks changing commit semantics for no correctness
+  gain.
+- **C2** (Makefile ↔ API query duplication) — out of scope for an
+  in-place edit pass; it's a structural refactor (move embedded
+  SQL into a read-only CLI) better done as its own change.
+
+### Verification (second pass)
+
+- 789 unit tests pass (2 new vs. first pass — the previously
+  silent flow-error path is now exercised).
+- AM-settled date logic unit-checked against May 2026 (3rd
+  Friday = May 15); caught and fixed a `str.rstrip(".X")`
+  character-set bug that turned `"SPX"` into `"SP"`.
+- Import smoke tests succeed for all modified modules.

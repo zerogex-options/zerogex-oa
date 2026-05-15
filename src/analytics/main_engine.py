@@ -31,7 +31,9 @@ from src.symbols import parse_underlyings, get_canonical_symbol
 from src.analytics.walls import compute_call_put_walls
 from src.market_calendar import (
     calculate_time_to_expiration,
+    expiration_close_time_et,
     is_engine_run_window,
+    is_spx_am_settled_expiration,
     seconds_until_engine_run_window,
 )
 
@@ -321,12 +323,36 @@ class AnalyticsEngine:
                     for row in rows
                 ]
 
+                # Drop AM-settled SPX expirations whose 09:30 ET SOQ has
+                # already happened.  Their option_chains rows can linger
+                # for hours after settlement, but Greeks against an
+                # unsettled-but-actually-expired strike are nonsense.
+                # SPXW (weekly, PM-settled) shares the $SPX.X underlying
+                # and should NOT be filtered, so we branch on the option
+                # symbol prefix when available.
+                today_et = ts_et.date()
+                am_dropped = 0
+                if ts_et.time() >= dt_time(9, 30):
+                    filtered: List[Dict[str, Any]] = []
+                    for opt in options:
+                        is_spxw = (opt["option_symbol"] or "").upper().startswith("SPXW")
+                        if (
+                            opt["expiration"] == today_et
+                            and not is_spxw
+                            and is_spx_am_settled_expiration(self.db_symbol, opt["expiration"])
+                        ):
+                            am_dropped += 1
+                            continue
+                        filtered.append(opt)
+                    options = filtered
+
                 logger.info(
                     "Fetched %d options with Greeks "
-                    "(latest-per-contract; lookback=%dh, min_expiration>%s)",
+                    "(latest-per-contract; lookback=%dh, min_expiration>%s%s)",
                     len(options),
                     self.snapshot_lookback_hours,
                     min_expiration,
+                    f"; dropped {am_dropped} AM-settled" if am_dropped else "",
                 )
 
                 # Count how many have OI > 0 for informational purposes
@@ -361,8 +387,13 @@ class AnalyticsEngine:
     # the top of this module.  Kept as a method-style accessor so
     # existing ``self._calculate_time_to_expiration(...)`` call sites
     # keep working without touching dozens of lines of calc code.
+    # Anchors at the per-symbol settlement time (09:30 ET for SPX
+    # AM-settled monthlies, 16:00 ET for everything else) so the
+    # morning of an SPX 3rd-Friday doesn't carry ~6.5 hours of phantom
+    # time value into Greeks downstream.
     def _calculate_time_to_expiration(self, current_date: datetime, expiration_date) -> float:
-        return calculate_time_to_expiration(current_date, expiration_date)
+        close_t = expiration_close_time_et(self.db_symbol, expiration_date)
+        return calculate_time_to_expiration(current_date, expiration_date, market_close_time=close_t)
 
     def _calculate_vanna(self, S: float, K: float, T: float, r: float, sigma: float) -> float:
         """
@@ -1219,7 +1250,30 @@ class AnalyticsEngine:
                     curr_bucket_start.isoformat(),
                 )
 
-                # Refresh flow_smart_money
+                # Refresh flow_smart_money.
+                #
+                # Thresholds are symbol-aware: premium tiers scale with
+                # ``notional_per_contract = spot * 100`` so the same
+                # economic significance applies on SPX (~$550k/contract
+                # at $5500) and SPY (~$45k/contract at $450).  Volume
+                # tiers stay in contract counts but are tunable via env
+                # vars per symbol prefix (``SMART_MONEY_VOL_TIER_*``).
+                # The previous SQL embedded $50k/$100k/$250k/$500k
+                # premium absolutes that saturated immediately on SPX
+                # and rarely fired on SPY.  Calibration discussion lives
+                # in docs/runbooks/smart_money_calibration.md.
+                notional_per_contract = max(float(underlying_price or 0.0) * 100.0, 1.0)
+                # Tier 1..4 premium thresholds = N x notional_per_contract.
+                prem_t1 = float(os.getenv("SMART_MONEY_PREM_T1_NOTIONAL_X", "1.0")) * notional_per_contract
+                prem_t2 = float(os.getenv("SMART_MONEY_PREM_T2_NOTIONAL_X", "2.0")) * notional_per_contract
+                prem_t3 = float(os.getenv("SMART_MONEY_PREM_T3_NOTIONAL_X", "5.0")) * notional_per_contract
+                prem_t4 = float(os.getenv("SMART_MONEY_PREM_T4_NOTIONAL_X", "10.0")) * notional_per_contract
+                # Volume tiers in contract counts.
+                vol_t1 = int(os.getenv("SMART_MONEY_VOL_T1", "50"))
+                vol_t2 = int(os.getenv("SMART_MONEY_VOL_T2", "100"))
+                vol_t3 = int(os.getenv("SMART_MONEY_VOL_T3", "200"))
+                vol_t4 = int(os.getenv("SMART_MONEY_VOL_T4", "500"))
+                # Inclusion-filter: smaller of (vol_t1, prem_t1).
                 logger.debug("Refreshing flow_smart_money...")
                 cursor.execute(
                     """
@@ -1272,8 +1326,8 @@ class AnalyticsEngine:
                         implied_volatility::numeric,
                         delta::numeric,
                         LEAST(10, GREATEST(0,
-                            CASE WHEN volume_delta >= 500 THEN 4 WHEN volume_delta >= 200 THEN 3 WHEN volume_delta >= 100 THEN 2 WHEN volume_delta >= 50 THEN 1 ELSE 0 END +
-                            CASE WHEN volume_delta * COALESCE(last, 0) * 100 >= 500000 THEN 4 WHEN volume_delta * COALESCE(last, 0) * 100 >= 250000 THEN 3 WHEN volume_delta * COALESCE(last, 0) * 100 >= 100000 THEN 2 WHEN volume_delta * COALESCE(last, 0) * 100 >= 50000 THEN 1 ELSE 0 END +
+                            CASE WHEN volume_delta >= %s THEN 4 WHEN volume_delta >= %s THEN 3 WHEN volume_delta >= %s THEN 2 WHEN volume_delta >= %s THEN 1 ELSE 0 END +
+                            CASE WHEN volume_delta * COALESCE(last, 0) * 100 >= %s THEN 4 WHEN volume_delta * COALESCE(last, 0) * 100 >= %s THEN 3 WHEN volume_delta * COALESCE(last, 0) * 100 >= %s THEN 2 WHEN volume_delta * COALESCE(last, 0) * 100 >= %s THEN 1 ELSE 0 END +
                             CASE WHEN implied_volatility > 1.0 THEN 2 WHEN implied_volatility > 0.6 THEN 1 ELSE 0 END
                         ))::numeric,
                         %s::numeric
@@ -1281,8 +1335,8 @@ class AnalyticsEngine:
                     WHERE timestamp = %s
                       AND volume_delta > 0
                       AND (
-                        volume_delta >= 50
-                        OR volume_delta * COALESCE(last, 0) * 100 >= 50000
+                        volume_delta >= %s
+                        OR volume_delta * COALESCE(last, 0) * 100 >= %s
                         OR (implied_volatility > 0.4 AND volume_delta >= 20)
                         OR (ABS(delta) < 0.15 AND volume_delta >= 20)
                       )
@@ -1304,8 +1358,15 @@ class AnalyticsEngine:
                         timestamp,
                         timestamp,
                         self.db_symbol,
+                        # Volume score tiers (descending so the highest matches first)
+                        vol_t4, vol_t3, vol_t2, vol_t1,
+                        # Premium score tiers (descending)
+                        prem_t4, prem_t3, prem_t2, prem_t1,
                         underlying_price,
                         timestamp,
+                        # Inclusion filter: floor matches t1
+                        vol_t1,
+                        prem_t1,
                     ),
                 )
 

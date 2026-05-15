@@ -483,6 +483,21 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         Failures here are non-fatal: the endpoint will serve whatever data
         already exists in the cache tables rather than returning a 500.
+
+        Cache ownership: ``flow_by_contract`` and ``flow_smart_money`` are
+        normally written by the analytics engine
+        (``src/analytics/main_engine.py:_refresh_flow_caches``) on its
+        cycle interval (default 60s).  This API-side path is a per-request
+        backstop that fills in gaps when the analytics engine is
+        catching up after a restart, or when a hot symbol is polled
+        between analytics cycles.  The two refreshes are idempotent
+        upserts on the same primary key, so concurrent runs are safe;
+        the analytics engine remains the steady-state writer.
+
+        Set ``ANALYTICS_FLOW_CACHE_REFRESH_ENABLED=false`` to disable
+        the analytics-side write and let this path handle 100% of
+        cache freshness (useful when a single API process serves all
+        flow reads and the analytics engine doesn't need the cache).
         """
         now = time_module.monotonic()
         last_refresh = self._last_flow_refresh_by_symbol.get(symbol, 0.0)
@@ -1599,9 +1614,6 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         except asyncio.TimeoutError:
             logger.warning(f"Flow query timed out for {symbol}, returning empty")
             return []
-        except Exception as e:
-            logger.warning(f"Flow query failed for {symbol} (returning empty): {e!r}")
-            return []
 
     async def _resolve_flow_series_session(
         self,
@@ -1884,9 +1896,6 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         except asyncio.TimeoutError:
             logger.warning(f"Flow series query timed out for {symbol}, returning empty")
             return []
-        except Exception as e:
-            logger.warning(f"Flow series query failed for {symbol} (returning empty): {e!r}")
-            return []
 
     async def get_flow_contracts(
         self,
@@ -1954,9 +1963,6 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 return payload
         except asyncio.TimeoutError:
             logger.warning(f"Flow contracts query timed out for {symbol}, returning empty")
-            return {"strikes": [], "expirations": []}
-        except Exception as e:
-            logger.warning(f"Flow contracts query failed for {symbol} (returning empty): {e!r}")
             return {"strikes": [], "expirations": []}
 
     async def get_smart_money_flow(
@@ -2047,9 +2053,6 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         except asyncio.TimeoutError:
             logger.warning(f"Smart money flow query timed out for {symbol}, returning empty")
             return []
-        except Exception as e:
-            logger.warning(f"Smart money flow query failed for {symbol} (returning empty): {e!r}")
-            return []
 
     async def get_flow_buying_pressure(
         self, symbol: str = "SPY", limit: int = 20
@@ -2131,9 +2134,6 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 return [dict(row) for row in rows]
         except asyncio.TimeoutError:
             logger.warning(f"Buying pressure query timed out for {symbol}, returning empty")
-            return []
-        except Exception as e:
-            logger.warning(f"Buying pressure query failed for {symbol} (returning empty): {e!r}")
             return []
 
     # ========================================================================

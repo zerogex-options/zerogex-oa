@@ -145,6 +145,8 @@ class IngestionEngine:
         )
         # Counter so operators can see how often staleness rejects fire.
         self.greeks_stale_underlying_rejects = 0
+        # Counter for crossed/missing-quote fallbacks in _classify_volume_chunk.
+        self._classify_fallback_count: int = 0
 
         # Greeks calculator (initialize if enabled)
         self.greeks_calculator = None
@@ -620,8 +622,27 @@ class IngestionEngine:
                 return (0, volume_delta, 0)
 
         # Without both quote sides we can't define the band; fall back to
-        # nearest-neighbor against whatever sides we do have.
+        # nearest-neighbor against whatever sides we do have.  Increment
+        # a counter and log periodically so persistent bad quotes
+        # (data-feed glitches, halted contracts, malformed snapshots) are
+        # visible to operators -- the previous silent fallback let
+        # entire contracts route their flow through nearest-neighbor
+        # classification with no telemetry.
         if bid is None or ask is None or ask <= bid:
+            # Use getattr/setattr so test fixtures that build the engine
+            # via ``IngestionEngine.__new__(...)`` (skipping __init__)
+            # don't AttributeError on the counter access.
+            count = getattr(self, "_classify_fallback_count", 0) + 1
+            self._classify_fallback_count = count
+            if (count % 1000) == 1:
+                logger.warning(
+                    "_classify_volume_chunk fallback fired (cumulative=%d) "
+                    "bid=%s ask=%s last=%s -- nearest-neighbor classification used",
+                    count,
+                    bid,
+                    ask,
+                    last,
+                )
             dist_to_ask = abs(last - ask) if ask is not None else float("inf")
             dist_to_mid = abs(last - effective_mid)
             dist_to_bid = abs(last - bid) if bid is not None else float("inf")
