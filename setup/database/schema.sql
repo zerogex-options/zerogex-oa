@@ -565,6 +565,17 @@ DROP VIEW IF EXISTS option_flow_smart_money CASCADE;
 -- Flow buying pressure + technicals views (kept)
 -- =============================================================================
 
+-- Rebuild the technicals/flow views atomically.  Each view is a
+-- DROP + CREATE pair; without a surrounding transaction there is a
+-- sub-second window during `make schema-apply` where the view does
+-- not exist, and any concurrent reader (signals/API service mid-cycle)
+-- gets `relation "..." does not exist`.  PostgreSQL has transactional
+-- DDL, so wrapping the whole block makes the swap atomic: readers see
+-- either the old or the new view, never a missing one.  ON_ERROR_STOP
+-- semantics are preserved -- an error inside the block aborts the
+-- transaction and psql still exits non-zero.
+BEGIN;
+
 DROP VIEW IF EXISTS underlying_daily_volume CASCADE;
 CREATE VIEW underlying_daily_volume AS
 SELECT
@@ -888,6 +899,9 @@ SELECT
 FROM latest_options o
 JOIN latest_spot s ON s.symbol::text = o.underlying::text
 GROUP BY o.underlying, o.strike, s.spot;
+
+-- End of the atomic technicals/flow view rebuild (see BEGIN above).
+COMMIT;
 
 -- =============================================================================
 -- Unified signal engine (v2)
