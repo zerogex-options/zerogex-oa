@@ -2436,6 +2436,29 @@ normalizer-cache-dry-run: ## Compute distributions without writing (preview only
 		$(if $(NORMALIZER_SYMBOLS),--symbols $(NORMALIZER_SYMBOLS)) \
 		--window-days $(NORMALIZER_WINDOW_DAYS) --dry-run
 
+# Override SYMBOLS to scope; the snapshot covers current + prior session
+# (everything /api/flow/series can request).
+FLOW_SERIES_SYMBOLS ?= SPY
+
+.PHONY: flow-series-backfill
+flow-series-backfill: ## Backfill flow_series_5min (current + prior session) before flipping FLOW_SERIES_USE_SNAPSHOT
+	@echo "$(BLUE)=== Backfilling flow_series_5min ===$(NC)"
+	@$(PY) -m src.tools.flow_series_5min_backfill --symbols $(FLOW_SERIES_SYMBOLS)
+
+# Verification gate for phase-1 -> phase-2: diff the snapshot against the
+# live CTE row-for-row. Requires a real DB; pass FLOW_SERIES_PARITY_DSN.
+FLOW_SERIES_PARITY_DSN ?=
+FLOW_SERIES_PARITY_SYMBOL ?= SPY
+FLOW_SERIES_PARITY_SESSION ?= prior
+
+.PHONY: flow-series-parity
+flow-series-parity: ## Diff flow_series_5min vs the live CTE (FLOW_SERIES_PARITY_DSN=postgres://...)
+	@echo "$(BLUE)=== flow_series_5min parity vs live CTE ===$(NC)"
+	@FLOW_SERIES_PARITY_DSN="$(FLOW_SERIES_PARITY_DSN)" \
+		FLOW_SERIES_PARITY_SYMBOL="$(FLOW_SERIES_PARITY_SYMBOL)" \
+		FLOW_SERIES_PARITY_SESSION="$(FLOW_SERIES_PARITY_SESSION)" \
+		$(PY) -m pytest tests/test_flow_series_parity.py -m integration --no-cov -q
+
 # =============================================================================
 # Maintenance
 # =============================================================================
