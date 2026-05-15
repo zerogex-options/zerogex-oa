@@ -156,14 +156,17 @@ class AnalyticsEngine:
         Background -- the May 13, 2026 incident wedged production with
         a 23-minute snapshot wallclock at the historical 96-hour default
         lookback when concurrent autovacuum IO + a saturated buffer pool
-        pushed the bitmap-heap-scan past every retry boundary.  A
+        pushed the bitmap-heap-scan past every retry boundary.  The
         partial covering index keyed on (underlying, option_symbol,
-        timestamp DESC) was built to convert the query into an Index
-        Only Scan, but the planner refused to use it (per-symbol walks
-        across all-of-history beat the bitmap plan in the cost model
-        only when visibility-map coverage is near-perfect, which a
-        write-heavy table never sustains).  See setup/database/schema.sql
-        for the post-mortem and the drop path.
+        timestamp DESC) was built hoping to convert the query into an
+        Index Only Scan, but EXPLAIN ANALYZE on production data showed
+        the planner picks bitmap-heap-scan regardless (verified both
+        with the index present and with it dropped inside a rolled-back
+        transaction -- identical plans).  The actual remedies were the
+        narrower steady-state lookback above and the 90 s pool-level
+        statement_timeout backstop.  The covering index remains in
+        place because it serves other queries (notably the LATERAL
+        flow-cache backfill at src/api/database.py:_do_refresh_flow_cache).
 
         Returns dict with keys 'timestamp', 'underlying_price',
         'options' or None if no data is available.

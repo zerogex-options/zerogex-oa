@@ -228,21 +228,33 @@ analytics-snapshot-explain: ## EXPLAIN (no ANALYZE) of the _get_snapshot query â
 		| $(PSQL) -v ON_ERROR_STOP=0
 
 .PHONY: db-add-distinct-on-index
-db-add-distinct-on-index: ## [DEPRECATED] Don't build this -- planner won't use it. See db-drop-distinct-on-index.
-	@echo "$(RED)=== REFUSING to build idx_option_chains_underlying_option_symbol_ts_gamma_covering ===$(NC)"
-	@echo "$(RED)This index was found to be DEAD WEIGHT after construction:$(NC)"
-	@echo "$(RED)  * Planner refuses to use it for _get_snapshot() (proven via$(NC)"
-	@echo "$(RED)    EXPLAIN ANALYZE with enable_bitmapscan=off).$(NC)"
-	@echo "$(RED)  * LATERAL rewrite that would have exercised it makes the 2h$(NC)"
-	@echo "$(RED)    steady-state path 5x slower (354ms vs 70ms) for a single$(NC)"
-	@echo "$(RED)    25% improvement on the 96h cold-start (29s vs 38s).$(NC)"
-	@echo "$(RED)  * Costs ~6 GB on disk + per-insert write amplification on a$(NC)"
-	@echo "$(RED)    13-column INCLUDE list for every gamma-non-null INSERT.$(NC)"
-	@echo "$(RED)If you actually need this index, the visibility-map-coverage$(NC)"
-	@echo "$(RED)problem that blocks the LATERAL rewrite must be solved first --$(NC)"
-	@echo "$(RED)otherwise you're rebuilding dead weight.  See$(NC)"
-	@echo "$(RED)setup/database/schema.sql for the full post-mortem.$(NC)"
-	@exit 1
+db-add-distinct-on-index: ## Build idx_option_chains_underlying_option_symbol_ts_gamma_covering CONCURRENTLY (~6 GB). Pass CONFIRM=yes to execute.
+	@echo "$(BLUE)=== Building idx_option_chains_underlying_option_symbol_ts_gamma_covering CONCURRENTLY ===$(NC)"
+	@echo "$(YELLOW)Partial covering index keyed on (underlying, option_symbol, timestamp DESC)$(NC)"
+	@echo "$(YELLOW)WHERE gamma IS NOT NULL, with the full Greeks/quote SELECT list in INCLUDE.$(NC)"
+	@echo "$(YELLOW)Serves queries that filter by both underlying AND a specific option_symbol$(NC)"
+	@echo "$(YELLOW)with ORDER BY timestamp DESC -- notably _do_refresh_flow_cache()'s LATERAL$(NC)"
+	@echo "$(YELLOW)backfill in src/api/database.py:628 (the dominant pg_stat_user_indexes user).$(NC)"
+	@echo "$(YELLOW)Definition:$(NC)"
+	@echo "$(YELLOW)  ON option_chains(underlying, option_symbol, timestamp DESC)$(NC)"
+	@echo "$(YELLOW)  INCLUDE (strike, option_type, expiration, last, bid, ask,$(NC)"
+	@echo "$(YELLOW)           volume, open_interest, delta, gamma, theta, vega,$(NC)"
+	@echo "$(YELLOW)           implied_volatility)$(NC)"
+	@echo "$(YELLOW)  WHERE gamma IS NOT NULL$(NC)"
+	@echo "$(YELLOW)Measured size: ~6 GB on the production table (after bloat from initial build).$(NC)"
+	@echo "$(YELLOW)NOTE: this index does NOT speed up _get_snapshot() -- the planner picks$(NC)"
+	@echo "$(YELLOW)bitmap-heap-scan there.  See setup/database/schema.sql for the full context.$(NC)"
+	@echo "$(YELLOW)Build is non-blocking (CREATE INDEX CONCURRENTLY) but holds a session;$(NC)"
+	@echo "$(YELLOW)allow ~15-30 minutes on the production table size.  Run inside tmux:$(NC)"
+	@echo "$(YELLOW)  tmux new -s indexbuild  &&  make db-add-distinct-on-index CONFIRM=yes$(NC)"
+	@if [ "$${CONFIRM}" != "yes" ]; then \
+		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to actually build.$(NC)"; \
+	else \
+		printf "%s\n" \
+			"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_option_chains_underlying_option_symbol_ts_gamma_covering ON option_chains(underlying, option_symbol, timestamp DESC) INCLUDE (strike, option_type, expiration, last, bid, ask, volume, open_interest, delta, gamma, theta, vega, implied_volatility) WHERE gamma IS NOT NULL;" \
+			| $(PSQL) -v ON_ERROR_STOP=1; \
+		echo "$(GREEN)âœ“ Index built.$(NC)"; \
+	fi
 
 .PHONY: db-add-confluence-matrix-index
 db-add-confluence-matrix-index: ## Build idx_signal_component_scores_underlying_ts_comp_clamped_covering CONCURRENTLY. Pass CONFIRM=yes to execute.
@@ -357,25 +369,31 @@ api-time-confluence-matrix: ## Time /api/signals/{basic,advanced}/confluence-mat
 	timed_curl "$$BASE_URL/api/signals/advanced/confluence-matrix?symbol=$$SYMBOL&lookback=120"  "advanced lookback=120 "
 
 .PHONY: db-drop-distinct-on-index
-db-drop-distinct-on-index: ## DROP CONCURRENTLY the unused idx_option_chains_underlying_option_symbol_ts_gamma_covering (~6 GB; planner refuses to use it). Pass CONFIRM=yes to execute.
+db-drop-distinct-on-index: ## DROP CONCURRENTLY idx_option_chains_underlying_option_symbol_ts_gamma_covering (~6 GB). PRECONDITION: migrate flow-cache backfill first. Pass CONFIRM=yes to execute.
 	@echo "$(BLUE)=== Dropping idx_option_chains_underlying_option_symbol_ts_gamma_covering CONCURRENTLY ===$(NC)"
-	@echo "$(YELLOW)Built as the fix for the May 13 _get_snapshot() wedge but never$(NC)"
-	@echo "$(YELLOW)actually used by the planner.  Verified via EXPLAIN ANALYZE under$(NC)"
-	@echo "$(YELLOW)both natural plans and SET enable_bitmapscan = off; bitmap-heap-scan$(NC)"
-	@echo "$(YELLOW)wins the cost model at every lookback width.  The LATERAL rewrite$(NC)"
-	@echo "$(YELLOW)that would have exercised this index regresses the 2h steady-state$(NC)"
-	@echo "$(YELLOW)path 5x (354ms vs 70ms) for a single 25% improvement at 96h.$(NC)"
-	@echo "$(YELLOW)Reclaiming this index frees ~6 GB plus per-insert write amplification$(NC)"
-	@echo "$(YELLOW)on a 13-column INCLUDE list for every gamma-non-null INSERT batch.$(NC)"
-	@echo "$(YELLOW)DROP CONCURRENTLY can park waiting for old snapshots from in-flight$(NC)"
-	@echo "$(YELLOW)analytics queries; allow several minutes, run inside tmux to be safe.$(NC)"
-	@echo "$(YELLOW)Before running, sanity-check with pg_stat_user_indexes:$(NC)"
-	@echo "$(YELLOW)  SELECT idx_scan FROM pg_stat_user_indexes WHERE indexrelname =$(NC)"
-	@echo "$(YELLOW)    'idx_option_chains_underlying_option_symbol_ts_gamma_covering';$(NC)"
-	@echo "$(YELLOW)Expected: a small / zero scan count.  See setup/database/schema.sql$(NC)"
-	@echo "$(YELLOW)for the full post-mortem of the rejected Path B rewrite.$(NC)"
+	@echo "$(RED)PRECONDITION CHECK -- this index has known live users.  Per the$(NC)"
+	@echo "$(RED)May 14-15, 2026 investigation:$(NC)"
+	@echo "$(RED)  * src/api/database.py:_do_refresh_flow_cache() LATERAL backfill$(NC)"
+	@echo "$(RED)    uses this index at ~15s cadence under /api/gex/contract_flow$(NC)"
+	@echo "$(RED)    polling.  Dropping without migrating that query first regresses$(NC)"
+	@echo "$(RED)    flow-cache refresh latency by orders of magnitude.$(NC)"
+	@echo "$(RED)BEFORE running this drop, do all of the following:$(NC)"
+	@echo "$(RED)  1. Confirm flow-cache backfill has been migrated to an alternative$(NC)"
+	@echo "$(RED)     plan (e.g. materialized latest-per-contract view, or a narrower$(NC)"
+	@echo "$(RED)     index that covers the LATERAL).$(NC)"
+	@echo "$(RED)  2. Verify idx_scan stopped accruing on this index via$(NC)"
+	@echo "$(RED)     pg_stat_user_indexes (wait at least one trading session).$(NC)"
+	@echo "$(RED)  3. Audit pg_stat_statements for any other queries hitting it.$(NC)"
+	@echo "$(YELLOW)Note: this index does NOT speed up _get_snapshot() -- bitmap-heap-scan$(NC)"
+	@echo "$(YELLOW)wins that plan choice -- so dropping it has no effect there.  But the$(NC)"
+	@echo "$(YELLOW)other queries pay the cost.  See setup/database/schema.sql.$(NC)"
+	@echo "$(YELLOW)Sanity-check current scan activity:$(NC)"
+	@echo "$(YELLOW)  SELECT idx_scan, last_idx_scan FROM pg_stat_user_indexes$(NC)"
+	@echo "$(YELLOW)    WHERE indexrelname = 'idx_option_chains_underlying_option_symbol_ts_gamma_covering';$(NC)"
+	@echo "$(YELLOW)DROP CONCURRENTLY can park waiting for in-flight snapshots; run inside tmux.$(NC)"
 	@if [ "$${CONFIRM}" != "yes" ]; then \
-		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to actually drop.$(NC)"; \
+		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to actually drop$(NC)"; \
+		echo "$(YELLOW)(only do so after the preconditions above are met).$(NC)"; \
 	else \
 		printf "%s\n" \
 			"DROP INDEX CONCURRENTLY IF EXISTS idx_option_chains_underlying_option_symbol_ts_gamma_covering;" \

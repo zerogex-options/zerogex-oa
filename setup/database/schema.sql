@@ -172,34 +172,51 @@ CREATE INDEX IF NOT EXISTS idx_option_chains_option_symbol_timestamp
 CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_ts_quote_covering
     ON option_chains(underlying, timestamp DESC)
     INCLUDE (bid, ask, volume, open_interest, strike, expiration, option_type);
--- NOTE: idx_option_chains_underlying_option_symbol_ts_gamma_covering
--- (a ~6 GB partial covering index keyed on
--- (underlying, option_symbol, timestamp DESC) with the full SELECT list in
--- INCLUDE, WHERE gamma IS NOT NULL) was attempted as a fix for the May 13,
--- 2026 _get_snapshot() wedge but found to be DEAD WEIGHT.  Under fresh
--- planner stats the optimizer refuses to use it: scanning by
--- (option_symbol, timestamp DESC) within a single underlying still has to
--- walk every per-symbol entry across all of history (no skip-scan in
--- PostgreSQL), which costs more than the bitmap-heap-scan plan that the
--- planner actually chooses (~38 sec warm at 96h lookback, ~70 ms warm at
--- the 2h steady-state lookback).
+-- Partial covering index keyed on (underlying, option_symbol, timestamp DESC)
+-- WHERE gamma IS NOT NULL, INCLUDE-ing the full Greeks/quote SELECT list.
 --
--- A LATERAL rewrite that DID exercise this covering index was prototyped
--- and rejected: it would have made the 2h steady-state path 5x slower
--- (354 ms vs 70 ms) for a single 25% improvement on the once-per-restart
--- 96h cold-start (29 sec vs 38 sec).  Net negative.
---
--- The real fix for the wedge was tightening the steady-state lookback
+-- IMPORTANT context, per the May 14-15, 2026 investigation: this index was
+-- originally built as a fix for the May 13 _get_snapshot() wedge incident,
+-- but the planner does NOT pick it for that query at any lookback width --
+-- bitmap-heap-scan (BitmapAnd of idx_option_chains_underlying_timestamp +
+-- idx_option_chains_expiration) wins the cost model.  Verified via
+-- EXPLAIN ANALYZE both with the index present and after DROP INDEX
+-- inside a transaction: identical plans, ~55 sec warm at 96h lookback.
+-- The actual wedge fix was tightening the steady-state lookback
 -- (ANALYTICS_SNAPSHOT_LOOKBACK_HOURS=2) with a one-shot
 -- ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS=96 first cycle, plus the
 -- pool-level DB_STATEMENT_TIMEOUT_MS=90000 backstop.  See
 -- src/analytics/main_engine.py:_get_snapshot() for details.
 --
--- On existing deployments the dead index can be reclaimed via
--- ``make db-drop-distinct-on-index CONFIRM=yes`` (DROP CONCURRENTLY, frees
--- ~6 GB plus per-insert write amplification).  Do NOT recreate it without
--- first solving the visibility-map-coverage problem that prevents the
--- LATERAL rewrite from beating bitmap-heap-scan today.
+-- The index IS, however, the canonical access path for queries that
+-- filter by both ``underlying`` AND a specific ``option_symbol`` (LATERAL
+-- joins, per-contract snapshot lookups) with ORDER BY timestamp DESC.
+-- Known live user as of this writing:
+--   * src/api/database.py:_do_refresh_flow_cache() LATERAL backfill
+--     (~15s cadence under /api/gex/contract_flow polling).  pg_stat_user_indexes
+--     attributed ~2.4k scans / ~115M tuples-read to this query alone.
+-- Before dropping the index, audit pg_stat_user_indexes for fresh scan
+-- activity and migrate any active users to an alternative plan first --
+-- otherwise per-contract lookups regress to seq-scan or bitmap-heap-scan
+-- of the whole window, which is orders of magnitude slower.
+--
+-- A LATERAL rewrite of _get_snapshot() that would have exercised this
+-- index was prototyped and rejected: it regressed the 2h steady-state
+-- path 5x (354 ms vs 70 ms) for a single 25% improvement on the 96h
+-- cold-start (29 sec vs 38 sec).  Net negative.
+--
+-- Build with CREATE INDEX CONCURRENTLY in production via
+-- ``make db-add-distinct-on-index`` to avoid blocking the option_chains
+-- writers; this schema entry serves fresh installs and idempotent retries.
+CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_option_symbol_ts_gamma_covering
+    ON option_chains(underlying, option_symbol, timestamp DESC)
+    INCLUDE (
+        strike, option_type, expiration,
+        last, bid, ask,
+        volume, open_interest,
+        delta, gamma, theta, vega, implied_volatility
+    )
+    WHERE gamma IS NOT NULL;
 
 DO $$
 BEGIN
