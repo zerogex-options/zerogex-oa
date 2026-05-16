@@ -855,46 +855,70 @@ class AnalyticsEngine:
         self, gex_by_strike: List[Dict[str, Any]], underlying_price: float
     ) -> Optional[float]:
         """
-        Calculate gamma flip point (zero gamma level)
+        Calculate the gamma flip / "zero gamma" level.
 
-        This is the strike where net GEX crosses zero.
-        Above this level, dealers are long gamma (stabilizing).
-        Below this level, dealers are short gamma (destabilizing).
+        Industry convention (SpotGamma / SqueezeMetrics): the spot level
+        at which *cumulative* dealer gamma exposure crosses zero — i.e.
+        run the strikes low→high, accumulate net GEX, and find where the
+        running total changes sign.  Above the level dealers are net long
+        gamma (stabilizing); below, net short (destabilizing).
+
+        Previously this used the *per-strike* net-GEX adjacent sign
+        change, which finds where calls start out-weighting puts
+        strike-by-strike — a different, non-standard level that can sit a
+        long way from the cumulative zero-gamma level on lumpy OI.
         """
         if not gex_by_strike:
             return None
 
         # Aggregate net_gex by strike across all expirations.
         # The raw gex_by_strike has one entry per (strike, expiration),
-        # so we must sum before looking for zero crossings.
+        # so we must sum before accumulating.
         agg: Dict[float, float] = defaultdict(float)
         for entry in gex_by_strike:
             agg[entry["strike"]] += entry["net_gex"]
 
-        strikes_sorted = sorted(agg.items())  # list of (strike, net_gex)
+        strikes_sorted = sorted(agg.items())  # ascending by strike
         if len(strikes_sorted) < 2:
             return None
 
-        # Find the zero crossing closest to the current underlying price.
-        # There can be multiple crossings; the one nearest spot is the
-        # most meaningful "flip point".
+        # Running cumulative GEX from the lowest strike upward.
+        cumulative: List[Tuple[float, float]] = []
+        running = 0.0
+        for strike, net_gex in strikes_sorted:
+            running += net_gex
+            cumulative.append((strike, running))
+
+        # Zero crossing(s) of the cumulative curve. There can be more
+        # than one on lumpy books; keep the one nearest spot (the
+        # established tie-break in this codebase / the actionable level).
         best_flip = None
         best_dist = float("inf")
 
-        for i in range(len(strikes_sorted) - 1):
-            s1, gex1 = strikes_sorted[i]
-            s2, gex2 = strikes_sorted[i + 1]
+        def _consider(candidate: float) -> None:
+            nonlocal best_flip, best_dist
+            dist = abs(candidate - underlying_price)
+            if dist < best_dist:
+                best_dist = dist
+                best_flip = candidate
 
-            if gex1 * gex2 < 0:
-                flip = s1 + (s2 - s1) * (-gex1) / (gex2 - gex1)
-                dist = abs(flip - underlying_price)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_flip = flip
+        for i in range(len(cumulative) - 1):
+            s1, c1 = cumulative[i]
+            s2, c2 = cumulative[i + 1]
+            if c1 == 0.0:
+                _consider(s1)
+            elif c1 * c2 < 0.0:
+                _consider(s1 + (s2 - s1) * (-c1) / (c2 - c1))
+        # Whole book nets flat by the top strike => flip at that strike.
+        last_strike, last_cum = cumulative[-1]
+        if last_cum == 0.0:
+            _consider(last_strike)
 
         if best_flip is not None:
             logger.info(
-                f"Gamma flip point: ${best_flip:.2f} " f"(nearest to spot ${underlying_price:.2f})"
+                "Gamma flip point (cumulative zero-gamma): $%.2f " "(nearest to spot $%.2f)",
+                best_flip,
+                underlying_price,
             )
 
         return best_flip

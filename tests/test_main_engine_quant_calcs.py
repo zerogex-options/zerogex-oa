@@ -67,18 +67,47 @@ def test_max_pain_minimizes_total_intrinsic_payout():
             "implied_volatility": 0.2,
         },
     ]
-    # At settlement 100 => put payout 1000; at 110 => call payout 1000; tie picks lower strike due sort.
+    # Settlement @100 => put payout 1000; @110 => call payout 1000;
+    # tie picks the lower strike via the sort.
     assert engine._calculate_max_pain(options) == 100.0
 
 
-def test_gamma_flip_interpolates_between_sign_change_strikes():
+def test_gamma_flip_uses_cumulative_zero_crossing():
+    """Zero-gamma = where the CUMULATIVE GEX (low→high) crosses zero
+    (SpotGamma/SqueezeMetrics), not the per-strike adjacent sign flip."""
     engine = AnalyticsEngine(underlying="SPY")
     gex = [
-        {"strike": 100.0, "net_gex": -10.0},
-        {"strike": 110.0, "net_gex": 10.0},
+        {"strike": 100.0, "net_gex": -10.0},  # cum -10
+        {"strike": 105.0, "net_gex": -4.0},  # cum -14
+        {"strike": 110.0, "net_gex": 20.0},  # cum  +6
+    ]
+    # Cumulative straddles zero between 105 (-14) and 110 (+6):
+    #   flip = 105 + 5 * 14 / (6 - (-14)) = 105 + 5*0.7 = 108.5
+    flip = engine._calculate_gamma_flip_point(gex, underlying_price=107.0)
+    assert abs(flip - 108.5) < 1e-9
+    # Per-strike (old) convention would have flipped at 105.83 between
+    # the only adjacent net-GEX sign change (105:-4 -> 110:+20).
+    assert abs(flip - 105.833333) > 0.1
+
+
+def test_gamma_flip_returns_top_strike_when_book_nets_flat():
+    """Cumulative ending exactly at zero => flip at the top strike."""
+    engine = AnalyticsEngine(underlying="SPY")
+    gex = [
+        {"strike": 100.0, "net_gex": -10.0},  # cum -10
+        {"strike": 110.0, "net_gex": 10.0},  # cum   0
     ]
     flip = engine._calculate_gamma_flip_point(gex, underlying_price=105.0)
-    assert flip == 105.0
+    assert flip == 110.0
+
+
+def test_gamma_flip_none_when_cumulative_never_crosses():
+    engine = AnalyticsEngine(underlying="SPY")
+    gex = [
+        {"strike": 100.0, "net_gex": 5.0},  # cum 5
+        {"strike": 110.0, "net_gex": 7.0},  # cum 12 (never <= 0)
+    ]
+    assert engine._calculate_gamma_flip_point(gex, underlying_price=105.0) is None
 
 
 def test_store_gex_summary_carries_forward_previous_gamma_flip_when_missing():
@@ -163,10 +192,11 @@ def test_gex_summary_includes_flip_distance_local_gex_and_convexity():
         timestamp=ts,
     )
 
-    # Crossing between 495 (-2M) and 500 (+3M):
-    # flip = 495 + 5*(2/5) = 497.
-    assert summary["gamma_flip_point"] == 497.0
-    assert summary["flip_distance"] == (spot - 497.0) / spot
+    # Cumulative GEX: 495 -> -2M, 500 -> +1M (crosses zero here),
+    # 505 -> +2M.  flip = 495 + 5 * 2M / (1M - (-2M)) = 495 + 10/3.
+    expected_flip = 495.0 + 5.0 * (2_000_000.0 / 3_000_000.0)
+    assert abs(summary["gamma_flip_point"] - expected_flip) < 1e-9
+    assert abs(summary["flip_distance"] - (spot - expected_flip) / spot) < 1e-12
     # ±1% band around spot includes strikes [495, 505].
     assert summary["local_gex"] == abs(-2_000_000.0) + abs(3_000_000.0) + abs(1_000_000.0)
     expected_convexity = abs(summary["total_net_gex"]) / abs(summary["flip_distance"])
