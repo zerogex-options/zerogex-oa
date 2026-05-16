@@ -1058,7 +1058,7 @@ logs-clear: ## Interactive log cleanup (prompts; calls logs-clear-noconfirm)
 	@echo "$(RED)⚠️  WARNING: This permanently deletes service journals AND system logs.$(NC)"
 	@echo "$(YELLOW)Targets:$(NC)"
 	@echo "  • journalctl: $(INGESTION_SERVICE), $(ANALYTICS_SERVICE), $(API_SERVICE), $(SIGNALS_SERVICE)"
-	@echo "  • journalctl: cap total to 100M"
+	@echo "  • journalctl: keep last 7d, then cap total to 100M"
 	@echo "  • /var/log/syslog, auth.log, kern.log, dpkg.log, ufw.log, fail2ban.log (active + rotated)"
 	@echo "  • /var/log/nginx/{access,error}.log (active + rotated, reload nginx)"
 	@echo "  • /var/log/letsencrypt/, /var/log/zerogex/ (active + rotated)"
@@ -1072,9 +1072,10 @@ logs-clear: ## Interactive log cleanup (prompts; calls logs-clear-noconfirm)
 .PHONY: logs-clear-noconfirm
 logs-clear-noconfirm: ## Non-interactive log cleanup (driven by zerogex-oa-logs-clear.timer)
 	@echo "$(BLUE)Disk usage BEFORE:$(NC)"; df -h / | tail -1; echo ""
-	@echo "$(YELLOW)→ journalctl: rotate + vacuum service journals + cap total to 100M...$(NC)"
+	@echo "$(YELLOW)→ journalctl: rotate + vacuum journals older than 7d + cap total to 100M...$(NC)"
 	@sudo journalctl --rotate
-	@sudo journalctl --vacuum-time=1s \
+# Retain 7d, not 1s: the flow-series covering-index decommission gate verifies "no shortfall warnings / steady stage timings" from zerogex-oa-{api,analytics} across >=2-3 sessions; disk stays bounded by the --vacuum-size cap below.
+	@sudo journalctl --vacuum-time=7d \
 		-u $(INGESTION_SERVICE) -u $(ANALYTICS_SERVICE) \
 		-u $(API_SERVICE) -u $(SIGNALS_SERVICE)
 	@sudo journalctl --vacuum-size=100M
