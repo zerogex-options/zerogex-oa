@@ -251,6 +251,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             for s in os.getenv("MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS", "SPY,SPX,QQQ").split(",")
             if s.strip()
         )
+        # /api/max-pain/current returns a daily OI snapshot that only
+        # changes every MAX_PAIN_BACKGROUND_REFRESH_INTERVAL_SECONDS (the
+        # background loop for listed symbols; the heavy inline recompute
+        # for non-listed ones).  Sharing the 5 s analytics TTL forced a
+        # DB round-trip ~every 5 s for data that moves ~every 5 min, and
+        # each of those reads competes for the small pool with the heavy
+        # background recompute — the head-of-line stall behind that
+        # recompute is what made the endpoint take ~9 s.  A dedicated,
+        # longer TTL keeps the request path a pure in-process cache hit
+        # between snapshot refreshes.  <= 0 disables endpoint caching.
+        self._max_pain_current_cache_ttl_seconds: float = float(
+            os.getenv("MAX_PAIN_CURRENT_CACHE_TTL_SECONDS", "120.0")
+        )
         self._read_cache: Dict[str, Tuple[float, Any]] = {}
         self._load_credentials()
 
@@ -2479,7 +2492,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 "difference": snapshot["difference"],
                 "expirations": expirations,
             }
-            self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
+            self._cache_set(cache_key, result, self._max_pain_current_cache_ttl_seconds)
             return result
 
     # ========================================================================

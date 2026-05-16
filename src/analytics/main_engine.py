@@ -120,6 +120,14 @@ class AnalyticsEngine:
         # unchanged timestamp skips; an RTH bar advances the timestamp
         # every minute so legitimate intraday recompute is unaffected.
         self._last_processed_snapshot_ts: Optional[datetime] = None
+        # Latch for the "snapshot has no Greek-bearing options" state.
+        # A weekday night is inside the 24x5 run window, so the engine
+        # keeps cycling after the close; once the underlying feed stops
+        # the snapshot legitimately has no gamma-populated options.  This
+        # latches True on the first such cycle so the benign state is
+        # logged once (INFO) per closed period instead of a WARNING every
+        # interval, and is cleared the moment Greek-bearing data resumes.
+        self._empty_snapshot_state: bool = False
         self._last_flow_cache_ts: Optional[datetime] = None
         self._last_flow_cache_refresh_mono: float = 0.0
         self._flow_cache_refresh_min_seconds: float = float(
@@ -1814,8 +1822,41 @@ class AnalyticsEngine:
             logger.info(f"Underlying price: ${underlying_price:.2f}")
 
             if not options:
-                logger.warning("No options with Greeks available for calculation")
-                return False
+                # Expected closed-market state, NOT an error.  After the
+                # session the underlying feed stops; ingestion still runs
+                # 24x5 and keeps writing option_chains rows, but with NULL
+                # Greeks once the underlying price is stale
+                # (src/ingestion/main_engine.py).  Those NULL-gamma rows
+                # keep advancing max(option_chains.timestamp) while no row
+                # inside the ANALYTICS_SNAPSHOT_LOOKBACK_HOURS window has
+                # gamma, so the snapshot query returns zero options.
+                #
+                # A weekday night is inside the 24x5 run window, so the
+                # off-hours path never engages and this cycle re-runs every
+                # interval.  Previously it logged a WARNING and returned
+                # False, so run() then logged "Calculation cycle had
+                # issues" every 60s all evening/overnight, and the
+                # unchanged-snapshot dedupe never armed (it only records on
+                # success).  Treat it as a benign no-op instead: log once
+                # per closed period at INFO, latch the state so repeats are
+                # silent even if max(timestamp) keeps advancing, and record
+                # the snapshot timestamp so a frozen timestamp hits the
+                # unchanged-snapshot skip on the next cycle.
+                if not self._empty_snapshot_state:
+                    logger.info(
+                        "No options with Greeks for snapshot %s — expected "
+                        "while the market is closed / underlying feed is "
+                        "stale; skipping calculation and suppressing repeat "
+                        "logs until Greek-bearing data resumes",
+                        latest_timestamp,
+                    )
+                    self._empty_snapshot_state = True
+                self._last_processed_snapshot_ts = latest_timestamp
+                return True
+
+            # Greek-bearing data is back — clear the closed-market latch so
+            # the next genuine empty period logs once again.
+            self._empty_snapshot_state = False
 
             # Calculate GEX by strike
             logger.info("Calculating GEX by strike...")
