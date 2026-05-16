@@ -506,29 +506,18 @@ flow-index-prune: ## Drop idx_flow_by_contract_symbol_ts_strike (~55 MB; planner
 	fi
 
 .PHONY: flow-series-drop-covering-index
-flow-series-drop-covering-index: ## Drop idx_flow_by_contract_symbol_ts_series_covering (~200 MB) — ONLY after the snapshot gate. Pass CONFIRM=yes.
-	@echo "$(BLUE)=== Decommission idx_flow_by_contract_symbol_ts_series_covering ===$(NC)"
-	@echo "$(YELLOW)Superseded by flow_series_5min: unfiltered /api/flow/series no$(NC)"
-	@echo "$(YELLOW)longer scans flow_by_contract; filtered reads use the pkey +$(NC)"
-	@echo "$(YELLOW)idx_flow_by_contract_symbol_ts{,_exp,_type}. Reclaims ~200 MB.$(NC)"
-	@echo "$(YELLOW)"
-	@echo "$(YELLOW)GATE — confirm ALL before CONFIRM=yes:$(NC)"
-	@echo "$(YELLOW)  1. FLOW_SERIES_USE_SNAPSHOT=true for >=2-3 live sessions$(NC)"
-	@echo "$(YELLOW)  2. No 'flow_series_5min shortfall' warnings in API logs$(NC)"
-	@echo "$(YELLOW)  3. analytics 'flow_series_snapshot' stage timing steady (~100ms)$(NC)"
-	@echo "$(YELLOW)  4. pg_stat_user_indexes idx_scan for this index flat/near-zero$(NC)"
-	@echo "$(YELLOW)     since the flip (proves nothing depends on it):$(NC)"
-	@echo "$(YELLOW)     SELECT indexrelname, idx_scan FROM pg_stat_user_indexes$(NC)"
-	@echo "$(YELLOW)     WHERE indexrelname='idx_flow_by_contract_symbol_ts_series_covering';$(NC)"
-	@if [ "$${CONFIRM}" != "yes" ]; then \
-		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes once the gate is met.$(NC)"; \
-	else \
-		printf "%s\n" \
-			"DROP INDEX CONCURRENTLY IF EXISTS idx_flow_by_contract_symbol_ts_series_covering;" \
-			| $(PSQL) -v ON_ERROR_STOP=1; \
-		echo "$(GREEN)✓ Covering index dropped. schema.sql no longer creates it, so$(NC)"; \
-		echo "$(GREEN)  'make schema-apply' will not resurrect it.$(NC)"; \
-	fi
+flow-series-drop-covering-index: ## DISABLED — idx_flow_by_contract_symbol_ts_series_covering is still required for filtered /api/flow/series reads
+	@echo "$(RED)=== flow-series-drop-covering-index is permanently disabled ===$(NC)"
+	@echo "$(YELLOW)idx_flow_by_contract_symbol_ts_series_covering is NOT dead weight.$(NC)"
+	@echo "$(YELLOW)flow_series_5min superseded only the UNFILTERED /api/flow/series$(NC)"
+	@echo "$(YELLOW)read. Strike/expiration-filtered reads still run the CTE and the$(NC)"
+	@echo "$(YELLOW)planner's best plan is this index-only scan. A 2026-05-16$(NC)"
+	@echo "$(YELLOW)EXPLAIN (ANALYZE) of the without-index fallbacks measured ~6x$(NC)"
+	@echo "$(YELLOW)slower strike-filtered and ~26x slower expiration-filtered reads$(NC)"
+	@echo "$(YELLOW)(27 ms -> ~700 ms). The idx_scan-flat gate was also$(NC)"
+	@echo "$(YELLOW)unsatisfiable: filtered reads keep the index warm by design.$(NC)"
+	@echo "$(YELLOW)schema.sql (re)creates the index. Do NOT drop it.$(NC)"
+	@exit 1
 
 .PHONY: help
 help: ## Show this help message
@@ -737,7 +726,7 @@ help: ## Show this help message
 	@echo "  make db-diagnostics               - DB diagnostics (sessions, locks, waits, slow queries)"
 	@echo "  make flow-explain                 - EXPLAIN ANALYZE flow_by_contract queries (FLOW_SYMBOL=SPY)"
 	@echo "  make flow-index-prune             - Drop idx_flow_by_contract_symbol_ts_strike (CONFIRM=yes)"
-	@echo "  make flow-series-drop-covering-index - Drop the series covering index post-snapshot (CONFIRM=yes)"
+	@echo "  make flow-series-drop-covering-index - DISABLED (index retained; see target)"
 	@echo ""
 	@echo "$(GREEN)Maintenance:$(NC)"
 	@echo "  make vacuum             - Vacuum analyze all tables"

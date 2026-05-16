@@ -529,23 +529,26 @@ CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts_exp
     ON flow_by_contract(symbol, timestamp DESC, expiration);
 CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts_type
     ON flow_by_contract(symbol, timestamp DESC, option_type);
--- DECOMMISSIONED: idx_flow_by_contract_symbol_ts_series_covering.
+-- Covering index for the /api/flow/series `filtered` CTE: carries the
+-- columns that CTE selects so a symbol + timestamp-range scan is
+-- index-only and skips the ~3,000-page bitmap-heap-scan on
+-- flow_by_contract (see database.py get_flow_series).
 --
--- This covering index was the tactical fix for the unfiltered
--- /api/flow/series heap scan (carried the `filtered` CTE columns so the
--- planner could do an index-only scan instead of a ~3,000-page
--- bitmap-heap-scan). It is superseded by the flow_series_5min snapshot
--- below: unfiltered reads now bypass flow_by_contract entirely, and
--- strike/expiration-filtered reads are served by flow_by_contract_pkey
--- + idx_flow_by_contract_symbol_ts{,_exp,_type}.
---
--- Intentionally NOT (re)created: a fresh database never builds it. On an
--- existing database the ~200 MB index is physically removed, once and
--- after the production verification gate, via:
---     make flow-series-drop-covering-index CONFIRM=yes
--- (DROP INDEX CONCURRENTLY — see the Makefile target for the gate
--- checklist). Keeping schema.sql free of the CREATE is what stops
--- `make schema-apply` from resurrecting it on the next deploy.
+-- RETAINED post-snapshot. flow_series_5min superseded ONLY the
+-- unfiltered read (it bypasses flow_by_contract entirely). Strike/
+-- expiration-filtered reads still run the CTE, and the planner's best
+-- plan for them is this index-only scan. A 2026-05-16 EXPLAIN (ANALYZE)
+-- of the without-index fallbacks (flow_by_contract_pkey,
+-- idx_flow_by_contract_symbol_ts{,_exp}) measured ~6x slower
+-- strike-filtered and ~26x slower expiration-filtered reads
+-- (27 ms -> ~700 ms), so the earlier gated decommission was abandoned
+-- and this CREATE restored. The ~200 MB + write-amplification is the
+-- deliberate price of keeping filtered reads fast; the
+-- `flow-series-drop-covering-index` Makefile target is neutered so it
+-- can't be re-dropped on the (disproven) "it's dead" premise.
+CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts_series_covering
+    ON flow_by_contract(symbol, timestamp DESC)
+    INCLUDE (option_type, strike, expiration, raw_volume, net_volume, net_premium);
 CREATE INDEX IF NOT EXISTS idx_flow_smart_money_symbol_ts
     ON flow_smart_money(symbol, timestamp DESC);
 
