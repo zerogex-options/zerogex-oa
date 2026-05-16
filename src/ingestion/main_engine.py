@@ -33,8 +33,8 @@ from src.utils import get_logger
 from src.validation import (
     bucket_timestamp,
     is_engine_run_window,
-    is_market_hours,
     seconds_until_engine_run_window,
+    underlying_feed_expected,
 )
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.config import (
@@ -46,6 +46,7 @@ from src.config import (
     OPTION_BUCKET_WRITE_MIN_SECONDS,
     FLOW_CLASSIFY_MID_BAND_PCT,
     FLOW_CLASSIFY_SKIP_OPEN_AUCTION,
+    SESSION_TEMPLATE,
 )
 
 logger = get_logger(__name__)
@@ -424,17 +425,20 @@ class IngestionEngine:
                     age = 0.0
                 if age > self.greeks_max_underlying_age_seconds:
                     self.greeks_stale_underlying_rejects += 1
-                    # Staleness during (extended) market hours is a real
-                    # problem worth a WARNING — the underlying feed
-                    # should be live.  Outside extended hours the feed
-                    # legitimately stops, so refusing Greeks is expected;
-                    # log at DEBUG and far less often so overnight runs
+                    # Staleness is only a real problem while the feed
+                    # should be delivering bars — its SESSION_TEMPLATE
+                    # window, clamped to the regular cash session for cash
+                    # indices (SPX has no pre/after-hours print even under
+                    # a 24h template, though its options trade then). In
+                    # that window it's a WARNING; outside it the feed
+                    # legitimately stops, so refusing Greeks is expected —
+                    # log at DEBUG and far less often so off-window runs
                     # don't flood the journal with a known-benign state.
-                    if is_market_hours(option_ts, check_extended=True):
+                    if underlying_feed_expected(option_ts, SESSION_TEMPLATE, self.db_symbol):
                         if self.greeks_stale_underlying_rejects % 100 == 1:
                             logger.warning(
                                 "Refusing Greeks: underlying price is %.0fs stale "
-                                "(threshold %.0fs) during market hours. "
+                                "(threshold %.0fs) while the feed should be live. "
                                 "Total rejects this run: %d",
                                 age,
                                 self.greeks_max_underlying_age_seconds,
@@ -443,7 +447,8 @@ class IngestionEngine:
                     elif self.greeks_stale_underlying_rejects % 5000 == 1:
                         logger.debug(
                             "Refusing Greeks: underlying price is %.0fs stale "
-                            "(threshold %.0fs); market closed, this is expected. "
+                            "(threshold %.0fs); outside the feed's session "
+                            "window, this is expected. "
                             "Total rejects this run: %d",
                             age,
                             self.greeks_max_underlying_age_seconds,
