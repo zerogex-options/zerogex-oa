@@ -90,6 +90,11 @@ def test_get_open_interest_uses_stable_snapshot_cte():
     assert "exposure_ts AS" in oi_query
     assert "oc.gamma IS NOT NULL" in oi_query
     assert "JOIN exposure_ts et ON oc.timestamp = et.ts" in oi_query
+    # Safety net: if gamma is NULL across all of history the fallback must
+    # degrade to the stable latest_ts (OI still renders, exposure 0) rather
+    # than returning nothing — never less than the pre-fix behavior.
+    assert "COALESCE(" in oi_query
+    assert "SELECT ts FROM latest_ts" in oi_query
 
 
 def test_get_vol_surface_data_uses_stable_snapshot_cte():
@@ -128,6 +133,12 @@ def test_get_vol_surface_data_uses_stable_snapshot_cte():
     assert "iv_ts AS" in chain_query
     assert "oc.implied_volatility IS NOT NULL" in chain_query
     assert "timestamp = iv_ts.ts" in chain_query
+    # Safety net: if implied_volatility is NULL across all of history the
+    # fallback must degrade to the stable latest_ts so the endpoint still
+    # returns strikes (frontend's "all IV null" notice) instead of a hard
+    # 404 — never less than the pre-fix behavior.
+    assert "COALESCE(" in chain_query
+    assert "SELECT ts FROM latest_ts" in chain_query
 
 
 def test_stable_snapshot_quiescence_env_override(monkeypatch):
