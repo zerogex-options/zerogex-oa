@@ -97,6 +97,25 @@ ALTER TABLE option_chains ADD COLUMN IF NOT EXISTS gamma NUMERIC(10, 8);
 ALTER TABLE option_chains ADD COLUMN IF NOT EXISTS theta NUMERIC(10, 6);
 ALTER TABLE option_chains ADD COLUMN IF NOT EXISTS vega NUMERIC(10, 6);
 
+-- Column semantics (COMMENT ON is idempotent; safe to re-run).
+-- ``volume`` is the vendor's SESSION-CUMULATIVE contract volume (resets
+-- to 0 at the cash open and only ever increases intraday) — it is NOT a
+-- per-minute figure. Period (per-bucket) volume must be derived from
+-- ``flow_contract_facts`` (canonical: day-partitioned LAG deltas with
+-- buy/sell classification), never by reading this column as if it were
+-- the minute's traded volume. ``ask_volume`` / ``mid_volume`` /
+-- ``bid_volume`` are the OPPOSITE: per-bucket classified deltas the
+-- ingestion upsert ACCUMULATES additively, so they do not reconcile
+-- against ``volume`` directly.
+COMMENT ON COLUMN option_chains.volume IS
+    'Session-cumulative raw contract volume (resets at cash open, monotonic intraday). NOT per-minute. Use flow_contract_facts for period volume.';
+COMMENT ON COLUMN option_chains.ask_volume IS
+    'Per-bucket Lee-Ready ask-side (buyer-initiated) classified volume; upsert-accumulated. Does not reconcile against the cumulative volume column.';
+COMMENT ON COLUMN option_chains.mid_volume IS
+    'Per-bucket mid/indeterminate classified volume; upsert-accumulated.';
+COMMENT ON COLUMN option_chains.bid_volume IS
+    'Per-bucket Lee-Ready bid-side (seller-initiated) classified volume; upsert-accumulated.';
+
 CREATE INDEX IF NOT EXISTS idx_option_chains_timestamp ON option_chains(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_option_chains_underlying ON option_chains(underlying);
 CREATE INDEX IF NOT EXISTS idx_option_chains_expiration ON option_chains(expiration);
