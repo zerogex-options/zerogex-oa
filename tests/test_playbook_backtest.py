@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 from src.signals.playbook.backtest import (
     CardOutcome,
@@ -162,13 +162,53 @@ def test_non_directional_card_returns_no_data():
     assert outcome.outcome == "no_data"
 
 
-def test_target_wins_ties_with_stop():
-    """If target and stop both fire on the same bar, target wins."""
+def test_single_close_at_target_resolves_target_hit():
+    """Legacy 2-tuple close exactly at target (stop not touched at that
+    scalar price) still resolves target_hit — back-compat preserved."""
     card = _card(direction="bearish", entry=678.0, target=675.0, stop=680.0)
-    # Single bar that satisfies both conditions (gap-through scenario).
     quotes = [(card.timestamp + timedelta(minutes=1), 675.0)]
     outcome = compute_outcome(card, quotes)
     assert outcome.outcome == "target_hit"
+
+
+def test_intrabar_target_touch_counts_even_if_bar_closes_inside():
+    """The bug: close-only resolution missed a target the bar traded
+    through but closed back above. Bearish target 675; bar wicks to
+    674.5 (low) but closes 677 — must be target_hit, not time_exit."""
+    card = _card(direction="bearish", entry=678.0, target=675.0, stop=685.0, max_hold_minutes=5)
+    quotes = [
+        # ts, o, h, l, c — low pierces 675, close back at 677.
+        (card.timestamp + timedelta(minutes=1), 678.0, 678.2, 674.5, 677.0),
+    ]
+    outcome = compute_outcome(card, quotes)
+    assert outcome.outcome == "target_hit"
+    assert outcome.target_hit_at is not None
+
+
+def test_intrabar_stop_wick_counts_and_mae_uses_low():
+    """Close-only missed a stop the bar wicked through, and understated
+    MAE. Bullish stop 676; bar wicks to 675 then closes 678."""
+    card = _card(direction="bullish", entry=678.0, target=690.0, stop=676.0, max_hold_minutes=5)
+    quotes = [
+        (card.timestamp + timedelta(minutes=1), 678.0, 678.5, 675.0, 678.0),
+    ]
+    outcome = compute_outcome(card, quotes)
+    assert outcome.outcome == "stop_hit"
+    # MAE reflects the true intrabar low (675), not the 678 close → ~ -0.44%.
+    assert outcome.mae_pct < -0.004
+
+
+def test_same_bar_both_touch_resolves_conservatively_to_stop():
+    """When one bar's range spans BOTH target and stop, intrabar order
+    is unknowable — must resolve to stop_hit (never inflate edge)."""
+    card = _card(direction="bearish", entry=678.0, target=675.0, stop=680.0)
+    quotes = [
+        # high 681 (>= stop 680) AND low 674 (<= target 675) in one bar.
+        (card.timestamp + timedelta(minutes=1), 678.0, 681.0, 674.0, 678.0),
+    ]
+    outcome = compute_outcome(card, quotes)
+    assert outcome.outcome == "stop_hit"
+    assert outcome.stop_hit_at is not None
 
 
 # ----------------------------------------------------------------------
@@ -320,16 +360,20 @@ def test_fetch_action_cards_normalizes_payload_string():
     assert cards[0].payload["max_hold_minutes"] == 90
 
 
-def test_fetch_quotes_filters_nulls():
+def test_fetch_quotes_filters_nulls_and_returns_ohlc():
     base_ts = datetime(2026, 5, 1, 14, 0, tzinfo=timezone.utc)
     rows = [
-        (base_ts, 678.0),
-        (base_ts + timedelta(minutes=1), None),  # nulls dropped
-        (base_ts + timedelta(minutes=2), 678.5),
+        # ts, open, high, low, close
+        (base_ts, 678.0, 678.4, 677.6, 678.2),
+        (base_ts + timedelta(minutes=1), None, None, None, None),  # null close → dropped
+        (base_ts + timedelta(minutes=2), None, None, None, 678.5),  # O/H/L→close fallback
     ]
     conn = _StubConn(fetch_returns=[rows])
     quotes = fetch_quotes(conn, "SPY", base_ts, base_ts + timedelta(hours=1))
     assert len(quotes) == 2
+    assert quotes[0] == (base_ts, 678.0, 678.4, 677.6, 678.2)
+    # NULL O/H/L coalesce to the close.
+    assert quotes[1] == (base_ts + timedelta(minutes=2), 678.5, 678.5, 678.5, 678.5)
 
 
 def test_upsert_executes_one_query_per_pattern_and_commits():
@@ -397,12 +441,12 @@ def test_run_end_to_end_writes_stats_when_cards_present():
     card_rows = [
         ("SPY", base_ts, "call_wall_fade", "SELL_CALL_SPREAD", "0DTE", "bearish", 0.65, payload)
     ]
-    # Quotes: drop to 675 in 5 min → target hit.
+    # Quotes (OHLC): drop to 675 in 4 min → target hit.
     quote_rows = [
-        (base_ts + timedelta(minutes=1), 678.0),
-        (base_ts + timedelta(minutes=2), 677.0),
-        (base_ts + timedelta(minutes=3), 676.0),
-        (base_ts + timedelta(minutes=4), 675.0),
+        (base_ts + timedelta(minutes=1), 678.0, 678.1, 677.9, 678.0),
+        (base_ts + timedelta(minutes=2), 678.0, 678.0, 677.0, 677.0),
+        (base_ts + timedelta(minutes=3), 677.0, 677.0, 676.0, 676.0),
+        (base_ts + timedelta(minutes=4), 676.0, 676.0, 675.0, 675.0),
     ]
     conn = _run_stub_conn(card_rows, quote_rows)
     stats = run(underlying="SPY", days=2, conn=conn, write=True)
@@ -429,7 +473,8 @@ def test_run_no_write_skips_persistence():
     }
     card_rows = [("SPY", base_ts, "cwf", "SELL_CALL_SPREAD", "0DTE", "bearish", 0.65, payload)]
     quote_rows = [
-        (base_ts + timedelta(minutes=1), 675.0),  # immediate target hit
+        # OHLC bar whose low reaches 675 → immediate target hit (bearish).
+        (base_ts + timedelta(minutes=1), 678.0, 678.0, 675.0, 676.0),
     ]
     conn = _run_stub_conn(card_rows, quote_rows)
     stats = run(underlying="SPY", days=2, conn=conn, write=False)

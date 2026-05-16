@@ -150,6 +150,38 @@ def _signed_excursion(direction: str, entry: float, price: float) -> float:
     return delta
 
 
+def _normalize_quote(q: tuple) -> tuple:
+    """Accept either ``(ts, close)`` or ``(ts, open, high, low, close)``.
+
+    A 2-tuple is treated as a degenerate bar (O=H=L=C) so callers/tests
+    that only have closes get exactly the old close-only semantics; a
+    5-tuple uses the true intrabar range.
+    """
+    if len(q) == 5:
+        ts, o, h, low, c = q
+        return ts, float(o), float(h), float(low), float(c)
+    ts, c = q[0], float(q[1])
+    return ts, c, c, c, c
+
+
+def _hit_target(direction: str, target: Optional[float], high: float, low: float) -> bool:
+    """True if the bar's range reached the (directional) target."""
+    if target is None:
+        return False
+    if direction == "bullish":
+        return high >= target
+    return low <= target
+
+
+def _hit_stop(direction: str, stop: Optional[float], high: float, low: float) -> bool:
+    """True if the bar's range reached the (directional) stop."""
+    if stop is None:
+        return False
+    if direction == "bullish":
+        return low <= stop
+    return high >= stop
+
+
 def _level_or_none(level: Optional[dict]) -> Optional[float]:
     if not isinstance(level, dict):
         return None
@@ -163,9 +195,17 @@ def _level_or_none(level: Optional[dict]) -> Optional[float]:
 
 def compute_outcome(
     card: CardRow,
-    quotes: Iterable[tuple[datetime, float]],
+    quotes: Iterable[tuple],
 ) -> CardOutcome:
     """Decide the outcome of ``card`` from the trailing price series.
+
+    Each quote is ``(ts, open, high, low, close)`` (preferred) or the
+    legacy ``(ts, close)``.  Resolution uses the bar's intrabar range:
+    a bar that traded *through* the stop or target counts as a touch
+    even if it closed back inside (close-only resolution silently
+    under-counted both stops and targets and understated MAE).  When a
+    single bar's range spans BOTH the target and the stop the intrabar
+    sequence is unknown, so it resolves conservatively to ``stop_hit``.
 
     ``quotes`` must be ordered oldest → newest and span the Card's hold
     window (``card.timestamp`` to ``card.timestamp + max_hold_minutes``).
@@ -203,29 +243,41 @@ def compute_outcome(
     stop_hit_at: Optional[datetime] = None
     n_quotes = 0
 
-    for ts, price in quotes:
+    for raw in quotes:
+        ts, o, high, low, c = _normalize_quote(raw)
         if ts < card.timestamp:
             continue
         if ts > deadline:
             break
         n_quotes += 1
-        excursion = _signed_excursion(direction, float(entry), float(price))
-        if excursion > mfe_pct:
-            mfe_pct = excursion
-        if excursion < mae_pct:
-            mae_pct = excursion
 
-        # Did this quote hit a level?  We check both — whichever fires
-        # first in time wins, with target winning ties (favorable bias).
-        hit_target = _hit_target(direction, target_price, float(price))
-        hit_stop = _hit_stop(direction, stop_price, float(price))
+        # Intrabar extremes in the Card's signed direction: the most
+        # favorable price is the high (bullish) / low (bearish); the
+        # most adverse is the opposite extreme.
+        if direction == "bullish":
+            favorable, adverse = high, low
+        else:
+            favorable, adverse = low, high
+        fav_exc = _signed_excursion(direction, float(entry), favorable)
+        adv_exc = _signed_excursion(direction, float(entry), adverse)
+        if fav_exc > mfe_pct:
+            mfe_pct = fav_exc
+        if adv_exc < mae_pct:
+            mae_pct = adv_exc
 
-        if hit_target and target_hit_at is None:
-            target_hit_at = ts
-        if hit_stop and stop_hit_at is None:
+        hit_target = _hit_target(direction, target_price, high, low)
+        hit_stop = _hit_stop(direction, stop_price, high, low)
+
+        # Same-bar both-touch: intrabar order is unknowable from OHLC,
+        # so resolve conservatively to the stop (never inflate edge).
+        if hit_target and hit_stop:
             stop_hit_at = ts
-
-        if target_hit_at is not None or stop_hit_at is not None:
+            break
+        if hit_target:
+            target_hit_at = ts
+            break
+        if hit_stop:
+            stop_hit_at = ts
             break
 
     if n_quotes == 0:
@@ -260,22 +312,6 @@ def compute_outcome(
         expired_at=deadline,
         note="neither level reached" if (target_price and stop_price) else "non-level resolver",
     )
-
-
-def _hit_target(direction: str, target: Optional[float], price: float) -> bool:
-    if target is None:
-        return False
-    if direction == "bullish":
-        return price >= target
-    return price <= target
-
-
-def _hit_stop(direction: str, stop: Optional[float], price: float) -> bool:
-    if stop is None:
-        return False
-    if direction == "bullish":
-        return price <= stop
-    return price >= stop
 
 
 # ---------------------------------------------------------------------------
@@ -323,12 +359,17 @@ def fetch_action_cards(conn, underlying: str, start: datetime, end: datetime) ->
 
 def fetch_quotes(
     conn, underlying: str, start: datetime, end: datetime
-) -> list[tuple[datetime, float]]:
-    """Trailing 1-min underlying quotes inside [start, end]."""
+) -> list[tuple[datetime, float, float, float, float]]:
+    """Trailing 1-min underlying OHLC bars inside [start, end].
+
+    Returns ``(ts, open, high, low, close)`` so outcome resolution can
+    see the intrabar range, not just the close.  O/H/L fall back to
+    close when NULL (older rows); rows with a NULL close are dropped.
+    """
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT timestamp, close
+        SELECT timestamp, open, high, low, close
         FROM underlying_quotes
         WHERE symbol = %s
           AND timestamp BETWEEN %s AND %s
@@ -336,7 +377,21 @@ def fetch_quotes(
         """,
         (underlying, start, end),
     )
-    return [(r[0], float(r[1])) for r in cur.fetchall() if r[1] is not None]
+    out: list[tuple[datetime, float, float, float, float]] = []
+    for r in cur.fetchall():
+        if r[4] is None:
+            continue
+        c = float(r[4])
+        out.append(
+            (
+                r[0],
+                float(r[1]) if r[1] is not None else c,
+                float(r[2]) if r[2] is not None else c,
+                float(r[3]) if r[3] is not None else c,
+                c,
+            )
+        )
+    return out
 
 
 def upsert_pattern_stats(conn, stats: Iterable[PatternStats]) -> None:
