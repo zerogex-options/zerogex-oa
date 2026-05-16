@@ -774,12 +774,12 @@ install-dev: ## Install package + dev/metrics/greeks/api extras into the active 
 	$(PY) -m pip install -e ".[dev,metrics,greeks,api]"
 
 .PHONY: test
-test: ## Run pytest with coverage (per pyproject addopts)
-	$(PY) -m pytest
+test: ## Run pytest with coverage (per pyproject addopts); integration excluded (see flow-series-parity)
+	$(PY) -m pytest -m "not integration"
 
 .PHONY: test-fast
-test-fast: ## Run pytest without coverage (faster local iteration)
-	$(PY) -m pytest --no-cov -q
+test-fast: ## Run pytest without coverage (faster local iteration); integration excluded
+	$(PY) -m pytest --no-cov -q -m "not integration"
 
 .PHONY: lint
 lint: ## Run flake8 on src + tests
