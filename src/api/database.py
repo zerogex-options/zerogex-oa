@@ -2711,18 +2711,26 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # back to the last gamma-bearing snapshot is an index-only probe of
         # idx_option_chains_underlying_ts_gamma (partial, gamma IS NOT NULL),
         # so it stays O(1) and cannot reintroduce the statement_timeout that
-        # the reverted 7-day-DISTINCT retention rewrite caused.
+        # the reverted 7-day-DISTINCT retention rewrite caused. If gamma is
+        # NULL across *all* of history the COALESCE degrades to the stable
+        # `latest_ts` so open interest still renders (exposure 0) — never
+        # less than the pre-fix behavior.
         query = f"""
             WITH {_STABLE_SNAPSHOT_CTE},
             exposure_ts AS (
-                SELECT oc.timestamp AS ts
-                FROM option_chains oc
-                CROSS JOIN latest_ts lt
-                WHERE oc.underlying = $1
-                  AND oc.timestamp <= lt.ts
-                  AND oc.gamma IS NOT NULL
-                ORDER BY oc.timestamp DESC
-                LIMIT 1
+                SELECT COALESCE(
+                    (
+                        SELECT oc.timestamp
+                        FROM option_chains oc
+                        CROSS JOIN latest_ts lt
+                        WHERE oc.underlying = $1
+                          AND oc.timestamp <= lt.ts
+                          AND oc.gamma IS NOT NULL
+                        ORDER BY oc.timestamp DESC
+                        LIMIT 1
+                    ),
+                    (SELECT ts FROM latest_ts)
+                ) AS ts
             ),
             latest_spot AS (
                 SELECT close::numeric AS spot_price
@@ -3080,18 +3088,27 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # over only the few degraded trailing buckets via
         # idx_option_chains_underlying_timestamp, so it stays bounded and
         # cannot reintroduce the statement_timeout that the reverted
-        # 7-day-DISTINCT retention rewrite caused.
+        # 7-day-DISTINCT retention rewrite caused. If implied_volatility is
+        # NULL across *all* of history the COALESCE degrades to the stable
+        # `latest_ts` so the endpoint still returns strikes (the frontend's
+        # "all IV null" notice) instead of a hard 404 — never less than the
+        # pre-fix behavior.
         chain_query = f"""
             WITH {_STABLE_SNAPSHOT_CTE},
             iv_ts AS (
-                SELECT oc.timestamp AS ts
-                FROM option_chains oc
-                CROSS JOIN latest_ts lt
-                WHERE oc.underlying = $1
-                  AND oc.timestamp <= lt.ts
-                  AND oc.implied_volatility IS NOT NULL
-                ORDER BY oc.timestamp DESC
-                LIMIT 1
+                SELECT COALESCE(
+                    (
+                        SELECT oc.timestamp
+                        FROM option_chains oc
+                        CROSS JOIN latest_ts lt
+                        WHERE oc.underlying = $1
+                          AND oc.timestamp <= lt.ts
+                          AND oc.implied_volatility IS NOT NULL
+                        ORDER BY oc.timestamp DESC
+                        LIMIT 1
+                    ),
+                    (SELECT ts FROM latest_ts)
+                ) AS ts
             ),
             eligible_strikes AS (
                 SELECT strike
