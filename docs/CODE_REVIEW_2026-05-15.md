@@ -1078,24 +1078,45 @@ real `_persist_advanced_signals` path); the existing
 preserved). Full suite: **880 passed, 1 skipped**; `black` clean; no
 new `flake8` vs HEAD.
 
-### Identified, intentionally NOT auto-fixed (need a decision / larger change)
-- **🟡 `option_chains.volume` stores cumulative daily volume**, while
-  `ask/mid/bid_volume` are per-bucket deltas. Any consumer reconciling
-  them is wrong. Decide: dedicated period-volume column vs. loud doc.
-- **🟡 `playbook/backtest.py` resolves on bar *close* only** (no
-  OHLC) and lets target win same-bar ties. MAE/MFE understated; bias
-  direction ambiguous. Needs OHLC plumbing into `quotes`.
-- **🟡 `scoring_engine` abstain-replacement** substitutes a regime
-  tilt for every abstaining component; the tilts share inputs (not
-  orthogonal) so several can push the composite the same way →
-  over-confident regime labels on sparse data. Design refactor.
-- **🟡 gamma-flip uses per-strike net-GEX zero crossing**, not the
-  cumulative-GEX or recomputed-GEX(S) convention (SpotGamma-style).
-  Legitimate simplification but differs from industry; flag for product
-  decision.
-- **🟡 vanna/charm exposure normalize by `OI·100·S`** while GEX uses
-  `OI·100·S²·0.01`. Internally consistent but a different unit basis;
-  document the convention.
+### N9–N13 — Fixed (the previously-deferred design items)
+
+All five remaining deferred items were implemented as five separate
+commits (work done off-hours, behavior-changing items accepted by the
+owner). Each: investigated against live code first, then a contained
+fix + tight tests + full-suite-green, with the design choices recorded.
+
+- **N9 🟡→fixed `backtest.py` close-only resolution.** `fetch_quotes`
+  now pulls O/H/L/C; `compute_outcome` resolves a touch from the
+  intrabar range and accepts both `(ts,close)` (degenerate bar = exact
+  old semantics, so all prior tests pass unchanged) and
+  `(ts,o,h,l,c)`. Same-bar both-touch resolves conservatively to
+  `stop_hit`. Not live-consumed (`proposed_base` read by nothing in
+  `src/`) — corrects backtest reporting before anything wires it in.
+- **N10 🟡→fixed `option_chains.volume` semantics.** Idempotent
+  `COMMENT ON COLUMN` documenting cumulative-vs-period (+ the
+  per-bucket additive ask/mid/bid_volume). No new column (would
+  duplicate `flow_contract_facts`); no live consumer mis-uses it.
+- **N11 🟡→fixed vanna/charm unit basis (real rescale, not doc-only).**
+  Storage now `vanna·OI·100·S·0.01` ($/vol-point, the per-perturbation
+  analog of GEX) and `charm_per_day·OI·100·S` ($/day). The consumer
+  (`vanna_charm_flow`) was restructured to normalize **each field
+  independently** (the data-derived per-symbol cache already samples
+  them separately), making it scale-invariant — pinned by a test that
+  applies the exact 0.01 rescale and asserts the score is unchanged.
+  Operational note: run `normalizer_cache_refresh` post-deploy.
+- **N12 🟡→fixed `scoring_engine` abstain bias.** Abstaining
+  components are excluded from the composite and the surviving weight
+  is renormalized to the full point scale — **bit-identical to the old
+  formula when no component abstains** (pinned), exact neutral 50 on
+  all-abstain, no correlated synthetic votes. Per-component spectrum
+  display unchanged.
+- **N13 🟡→fixed gamma-flip convention.** Now the cumulative-GEX
+  zero-gamma level (SpotGamma/SqueezeMetrics) instead of the
+  per-strike adjacent sign flip. Deliberate metric redefinition;
+  flip_distance consumers read the new standard level (relative usage
+  dominates; absolute thresholds to re-review when live).
+
+### Still open (verified low-risk / not bugs)
 - **🟢 Not a bug (verified):** `flow_smart_money.unusual_activity_score
   NUMERIC(5,2)` is fine — the score is hard-capped at 10 by
   `LEAST(10, …)`, so no overflow is possible.
