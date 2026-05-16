@@ -71,6 +71,70 @@ Revocations take effect within the cache TTL (default 60s, controlled by
 When neither `API_KEY` is set nor any keys exist in the `api_keys` table,
 authentication is disabled — appropriate only for local development/CI.
 
+### End-user attribution (website-proxied requests)
+
+The two key types above identify the **caller**. When the caller is the
+website's Next.js backend it authenticates with a single key
+(`user_id=zerogex-web`) on behalf of *every* logged-in human, so the key
+alone can't say *which* end-user a request is for.
+
+To attribute a request to a specific website end-user, the website mints
+a short-lived signed token and sends it **alongside** its normal Bearer
+key:
+
+```
+Authorization: Bearer <zerogex-web key>
+X-End-User-Token: <signed token>
+```
+
+The token is a minimal JWT (HS256) whose `sub` is the website's user id,
+signed with a shared secret (`END_USER_TOKEN_SECRET`, held by both the
+website and the API). The website-side mint is a one-liner, e.g. Node
+`jsonwebtoken`:
+
+```js
+jwt.sign({ sub: userId }, process.env.END_USER_TOKEN_SECRET,
+         { algorithm: "HS256", expiresIn: "5m" });
+```
+
+Behavior is **purely additive and fail-open for attribution**:
+
+- No token, no `END_USER_TOKEN_SECRET`, or an invalid/expired/forged
+  token → the request still authenticates as the caller; it simply
+  carries no end-user. A bad token never turns a 200 into a 401.
+- Verification is pure crypto with **no database** — it cannot turn a DB
+  outage into a 500, and adds no DB load.
+- Tokens are rejected if expired, issued in the future, signed with the
+  wrong key, using any `alg` other than `HS256`, or older than
+  `END_USER_TOKEN_MAX_AGE_SECONDS` (default 900s) regardless of `exp`.
+  A small `END_USER_TOKEN_LEEWAY_SECONDS` (default 60s) absorbs clock
+  skew. Because tokens are short-lived, "revocation" is just expiry —
+  there is no denylist.
+
+Resolved identity is exposed to route handlers via a typed model:
+
+```python
+from src.api.identity import RequestIdentity, current_identity
+
+@app.get("/api/example")
+async def example(identity: RequestIdentity = Depends(current_identity)):
+    identity.caller_user_id   # e.g. "zerogex-web"
+    identity.end_user_id      # the website user, or None
+```
+
+It is also written to `request.state.identity` and emitted on every
+request as a structured **audit** log line (`src.api.audit` logger:
+method, path, status, caller, end-user, latency).
+
+**Rate limiting** is keyed on the resolved identity (end-user → caller →
+client IP, see `rate_limit_key`). It ships **disabled**, and when enabled
+defaults to **log-only** (`END_USER_RATE_LIMIT_ENABLED=1`): it logs
+"would-block" lines so you can size limits against real per-user traffic
+before flipping `END_USER_RATE_LIMIT_ENFORCE=1`. The backend is an
+in-memory fixed window **per worker**; for multi-worker enforcement with
+a shared view, swap it for `slowapi` backed by Redis — `rate_limit_key`
+ports over unchanged.
+
 ---
 
 ## Health & Status

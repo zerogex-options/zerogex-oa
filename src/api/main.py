@@ -21,7 +21,8 @@ from src import config
 
 from .database import DatabaseManager
 from .errors import handle_api_errors
-from .middleware import RequestIdMiddleware
+from .middleware import AuditLogMiddleware, RequestIdMiddleware
+from .ratelimit import rate_limit
 from .security import api_key_auth, key_store
 from .models import (
     GEXSummary,
@@ -176,7 +177,10 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_url="/openapi.json",
     lifespan=lifespan,
-    dependencies=[Depends(api_key_auth)],
+    # api_key_auth first: it authenticates the caller, resolves the
+    # optional end-user token, and stashes the identity on request.state.
+    # rate_limit runs next and reads that identity for its key.
+    dependencies=[Depends(api_key_auth), Depends(rate_limit)],
     # Alphabetize endpoints within each tag in the Swagger UI. Operations
     # (HTTP methods) are also sorted so per-path groups render in a stable
     # order. `tagsSorter` keeps the tag list itself alphabetical.
@@ -236,6 +240,14 @@ app.add_middleware(
 # /api/flow/by-contract (which can return hundreds of thousands of rows for a
 # full session) don't get bottlenecked on transfer.
 app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+# Audit logging: one structured line per request with the resolved
+# caller/end-user identity. Added before RequestIdMiddleware so the
+# request-id middleware stays outermost — the request-id contextvar is
+# therefore still set when the audit line is emitted, and the audit
+# middleware still wraps routing so it sees the identity that
+# api_key_auth stashed on request.state.
+app.add_middleware(AuditLogMiddleware)
 
 # Request-ID propagation: every log line emitted while handling a request
 # carries the id, and the same id is echoed back via X-Request-Id so

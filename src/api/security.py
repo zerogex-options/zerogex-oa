@@ -34,6 +34,8 @@ import asyncpg
 from fastapi import HTTPException, Request, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from .identity import ANONYMOUS, RequestIdentity, resolve_end_user
+
 logger = logging.getLogger(__name__)
 
 # HTTPBearer is the only declared security scheme so Swagger UI surfaces a
@@ -234,6 +236,16 @@ def _extract_candidate(
     return None
 
 
+def _set_identity(request: Request, identity: RequestIdentity) -> None:
+    """Stash the resolved identity on request.state for downstream use.
+
+    Read by the ``current_identity`` dependency (route handlers) and by
+    the audit-logging middleware.  Always set — even on the anonymous /
+    rejected paths — so consumers never have to guard against its absence.
+    """
+    request.state.identity = identity
+
+
 async def api_key_auth(
     request: Request,
     bearer: Optional[HTTPAuthorizationCredentials] = Security(_bearer_scheme),
@@ -242,11 +254,13 @@ async def api_key_auth(
     # Public endpoints bypass auth entirely (see _PUBLIC_PATHS module
     # docstring). Checked first so health probes never hit the DB.
     if request.url.path in _PUBLIC_PATHS:
+        _set_identity(request, ANONYMOUS)
         return None
 
     static_enabled = _API_KEY is not None
     db_enabled = key_store.is_enabled()
     if not static_enabled and not db_enabled:
+        _set_identity(request, ANONYMOUS)
         return None  # auth fully disabled (dev/CI)
 
     # Read X-API-Key from raw request headers rather than declaring it via
@@ -268,12 +282,36 @@ async def api_key_auth(
                 request.method,
                 request.url.path,
             )
+            end_user_id, end_user_source = resolve_end_user(request)
+            _set_identity(
+                request,
+                RequestIdentity(
+                    caller_kind="static",
+                    caller_user_id="static",
+                    end_user_id=end_user_id,
+                    end_user_source=end_user_source,
+                ),
+            )
             return None
         if db_enabled:
             info = await key_store.lookup(candidate)
             if info is not None:
+                end_user_id, end_user_source = resolve_end_user(request)
+                _set_identity(
+                    request,
+                    RequestIdentity(
+                        caller_kind="db",
+                        caller_user_id=info.get("user_id"),
+                        caller_key_id=info.get("id"),
+                        caller_name=info.get("name"),
+                        caller_scopes=tuple(info.get("scopes") or ()),
+                        end_user_id=end_user_id,
+                        end_user_source=end_user_source,
+                    ),
+                )
                 return info
 
+    _set_identity(request, ANONYMOUS)
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid or missing API key",
