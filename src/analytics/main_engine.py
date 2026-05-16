@@ -688,13 +688,30 @@ class AnalyticsEngine:
                     opt["implied_volatility"],
                 )
 
-                notional = opt["open_interest"] * 100 * underlying_price
+                share_notional = opt["open_interest"] * 100 * underlying_price
+                # Put vanna/charm on dimensionally-honest dollar bases,
+                # each the per-unit-perturbation analog of GEX's
+                # "$ per 1% spot move" (γ·OI·100·S²·0.01):
+                #   vanna_$  = ∂Δ/∂σ · share_notional · 0.01
+                #              -> $ change in the dealer delta-hedge
+                #                 notional per ONE volatility point (Δσ=1%).
+                #              (one S only: the vol perturbation is an
+                #               absolute 0.01, not proportional to S, so
+                #               there is no second S like gamma's.)
+                #   charm_$  = ∂Δ/∂t(per day) · share_notional
+                #              -> $ delta-hedge notional drift per DAY
+                #                 (_calculate_charm already returns /day).
+                # The two are different axes (vol vs time) BY NATURE;
+                # downstream consumers must normalize each independently
+                # (see vanna_charm_flow) rather than summing raw dollars.
+                vanna_dollars = vanna * share_notional * 0.01
+                charm_dollars = charm * share_notional
                 if opt["option_type"] == "C":
-                    call_vanna_exposure += vanna * notional
-                    call_charm_exposure += charm * notional
+                    call_vanna_exposure += vanna_dollars
+                    call_charm_exposure += charm_dollars
                 else:
-                    put_vanna_exposure += vanna * notional
-                    put_charm_exposure += charm * notional
+                    put_vanna_exposure += vanna_dollars
+                    put_charm_exposure += charm_dollars
 
             # Market-level aggregate (legacy columns, keeps schema stable).
             vanna_exposure = call_vanna_exposure + put_vanna_exposure

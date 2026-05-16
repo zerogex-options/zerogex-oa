@@ -34,17 +34,21 @@ from src.signals.components.utils import (
     minute_of_day_et,
 )
 
-# Normalize combined vanna+charm exposure so that a magnitude of this
-# value saturates the score.  Calibrated for the dollar-scale dealer
-# exposure convention (vanna × OI × 100 × S, summed across strikes &
-# expirations).  For SPY-magnitude underlyings the typical NET dealer
-# vanna+charm sum runs in the hundreds of millions to low billions —
-# the prior 5e7 default saturated almost permanently and made the
-# score flip between ±1 with every sign-change in the underlying
-# (visible as a +100/−100 sawtooth in score history).  Per-symbol
-# normalizers from ``component_normalizer_cache`` still override at
-# runtime when populated.
-_VC_NORM = float(os.getenv("SIGNAL_VANNA_CHARM_NORM", "1.0e9"))
+# Vanna and charm are different-axis dollar exposures ($/vol-point vs
+# $/day — see _calculate_gex_by_strike), so they are normalized
+# INDEPENDENTLY, each by its own scale, before being blended.  This
+# makes the component scale-invariant: the authoritative normalizers are
+# the data-derived per-symbol p95 magnitudes in ``component_normalizer_cache``
+# (``normalizer_cache_refresh`` samples SUM(dealer_vanna_exposure) and
+# SUM(dealer_charm_exposure) separately), so any change to the stored
+# unit is absorbed by the next cache refresh and the score is unchanged.
+# The constants below are only coarse pre-cache / no-cache fallbacks.
+#
+# Back-compat: ``_VC_NORM`` is retained as an alias (= the vanna
+# fallback) for callers/tests that imported it.
+_VANNA_NORM = float(os.getenv("SIGNAL_VANNA_NORM", "1.0e7"))
+_CHARM_NORM = float(os.getenv("SIGNAL_CHARM_NORM", "1.0e9"))
+_VC_NORM = _VANNA_NORM
 
 # Afternoon charm amplification kicks in after this fraction of session.
 _CHARM_AMP_START = 0.6  # ~2h before close
@@ -63,12 +67,16 @@ class VannaCharmFlowComponent(ComponentBase):
         charm = agg["charm"]
 
         charm_weight = self._charm_amplification(ctx)
-        combined = vanna + charm * charm_weight
-        norm = self._vc_norm(ctx)
-        if norm <= 0:
+        norm_v, norm_c = self._field_norms(ctx)
+        if norm_v <= 0 or norm_c <= 0:
             return 0.0
-        normalized = max(-1.0, min(1.0, combined / norm))
-        return normalized
+        # Normalize each field by ITS OWN scale (raw $/vol-point and
+        # $/day are not addable), then blend the two dimensionless
+        # [-1, 1] terms.  Sum-then-clamp keeps the prior behavior that
+        # either field reaching its own scale can drive the score.
+        v_term = max(-1.0, min(1.0, vanna / norm_v))
+        c_term = max(-1.0, min(1.0, (charm * charm_weight) / norm_c))
+        return max(-1.0, min(1.0, v_term + c_term))
 
     def context_values(self, ctx: MarketContext) -> dict:
         agg = self._aggregate(ctx)
@@ -79,11 +87,16 @@ class VannaCharmFlowComponent(ComponentBase):
                 "charm_amplification": round(self._charm_amplification(ctx), 3),
                 "source": "unavailable",
             }
+        norm_v, norm_c = self._field_norms(ctx)
         return {
             "vanna_total": round(agg["vanna"], 2),
             "charm_total": round(agg["charm"], 2),
             "charm_amplification": round(self._charm_amplification(ctx), 3),
-            "vc_norm": round(self._vc_norm(ctx), 2),
+            "vanna_norm": round(norm_v, 2),
+            "charm_norm": round(norm_c, 2),
+            # Back-compat key (was a single combined scale); now the
+            # vanna scale so existing dashboards keep rendering.
+            "vc_norm": round(norm_v, 2),
             "source": agg["source"],
         }
 
@@ -151,22 +164,31 @@ class VannaCharmFlowComponent(ComponentBase):
         return 1.0 + (_CHARM_AMP_MAX - 1.0) * ramp
 
     @staticmethod
-    def _vc_norm(ctx: MarketContext) -> float:
-        """Use dynamic symbol normalizer when available; else fallback constant."""
+    def _field_norms(ctx: MarketContext) -> tuple[float, float]:
+        """Per-field (vanna, charm) saturation scales.
+
+        Prefers the data-derived per-symbol magnitudes in
+        ``component_normalizer_cache`` (exposed via
+        ``ctx.extra['normalizers']`` keyed by ``dealer_vanna_exposure`` /
+        ``dealer_charm_exposure``) so the component is scale-invariant —
+        a change to the stored unit is absorbed by the next cache
+        refresh.  Falls back to the coarse module constants per field.
+        """
+        norm_v = _VANNA_NORM
+        norm_c = _CHARM_NORM
         extra = ctx.extra if isinstance(ctx.extra, dict) else {}
         normalizers = extra.get("normalizers") if isinstance(extra, dict) else None
         if isinstance(normalizers, dict):
-            v = normalizers.get("dealer_vanna_exposure")
-            c = normalizers.get("dealer_charm_exposure")
-            vals = []
-            for raw in (v, c):
-                try:
-                    fv = float(raw)
-                except (TypeError, ValueError):
-                    continue
+            try:
+                fv = float(normalizers.get("dealer_vanna_exposure"))
                 if fv > 0:
-                    vals.append(fv)
-            if vals:
-                # Combined flow scale; avoid under-normalizing from a single field.
-                return max(_VC_NORM * 0.5, sum(vals))
-        return _VC_NORM
+                    norm_v = fv
+            except (TypeError, ValueError):
+                pass
+            try:
+                fc = float(normalizers.get("dealer_charm_exposure"))
+                if fc > 0:
+                    norm_c = fc
+            except (TypeError, ValueError):
+                pass
+        return norm_v, norm_c

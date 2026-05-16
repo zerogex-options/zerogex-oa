@@ -310,6 +310,23 @@ ALTER TABLE gex_by_strike ADD COLUMN IF NOT EXISTS dealer_charm_exposure DOUBLE 
 ALTER TABLE gex_by_strike ADD COLUMN IF NOT EXISTS dealer_vanna_exposure DOUBLE PRECISION;
 ALTER TABLE gex_by_strike ADD COLUMN IF NOT EXISTS expiration_bucket VARCHAR(16);
 
+-- Vanna/charm exposure unit bases (COMMENT ON is idempotent). Each is
+-- the per-unit-perturbation dollar analog of GEX (γ·OI·100·S²·0.01,
+-- "$ per 1% spot move"): vanna is "$ delta-hedge notional per 1
+-- volatility point" (∂Δ/∂σ·OI·100·S·0.01 — one S only, since the vol
+-- bump is an absolute 0.01, not ∝S), charm is "$ delta-hedge notional
+-- drift per day" (∂Δ/∂t_perday·OI·100·S). They are DIFFERENT axes
+-- (vol vs time) and must NOT be summed as raw dollars — consumers
+-- normalize each field independently (see vanna_charm_flow).
+COMMENT ON COLUMN gex_by_strike.vanna_exposure IS
+    'Market-aggregate vanna: $ dealer delta-hedge notional change per 1 volatility point (vanna*OI*100*S*0.01). Different axis from charm; normalize per-field.';
+COMMENT ON COLUMN gex_by_strike.charm_exposure IS
+    'Market-aggregate charm: $ dealer delta-hedge notional drift per DAY (charm_per_day*OI*100*S). Different axis from vanna; normalize per-field.';
+COMMENT ON COLUMN gex_by_strike.dealer_vanna_exposure IS
+    'Dealer-sign vanna ($/vol-point), = -vanna_exposure. + => dealers buy underlying as IV rises.';
+COMMENT ON COLUMN gex_by_strike.dealer_charm_exposure IS
+    'Dealer-sign charm ($/day), = -charm_exposure. + => dealers buy underlying as time passes.';
+
 -- =============================================================================
 -- Remove legacy/non-essential objects (safe cleanup during migration)
 -- =============================================================================
