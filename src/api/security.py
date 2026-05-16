@@ -56,6 +56,18 @@ _PUBLIC_PATHS: Set[str] = {"/api/health"}
 _API_KEY: Optional[str] = (os.getenv("API_KEY") or "").strip() or None
 _ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development").strip().lower()
 
+# Per-endpoint scope enforcement. The `api_keys.scopes` column exists but
+# every key provisioned to date defaults to `[]` (no key→tier mapping has
+# ever been backfilled — tier gating currently lives in the web proxy
+# layer). Enforcing scopes unconditionally would therefore 403 every
+# existing paying caller. Enforcement is opt-in via env so it can be
+# switched on *after* keys are backfilled with scopes, with no outage in
+# the meantime. A key carrying the wildcard scope "*" always passes.
+_SCOPE_ENFORCEMENT: bool = (
+    os.getenv("API_SCOPE_ENFORCEMENT", "0").strip().lower() in {"1", "true", "yes"}
+)
+_WILDCARD_SCOPE = "*"
+
 
 def _hash_key(raw: str) -> str:
     """SHA-256 hex digest of the raw key — what the DB stores."""
@@ -247,7 +259,26 @@ async def api_key_auth(
     static_enabled = _API_KEY is not None
     db_enabled = key_store.is_enabled()
     if not static_enabled and not db_enabled:
-        return None  # auth fully disabled (dev/CI)
+        if _ENVIRONMENT == "production":
+            # Fail CLOSED in production. Previously this returned None
+            # (allow), so a transient DB-pool outage — which makes
+            # key_store.is_enabled() return False — silently turned the
+            # entire paid API into an open, unauthenticated endpoint.
+            # A missing auth backend is an availability fault, not an
+            # authorization grant: surface it as 503, never as "allow".
+            logger.error(
+                "AUTH_UNAVAILABLE: no auth backend configured/reachable "
+                "in production (static_enabled=%s db_enabled=%s); "
+                "refusing request fail-closed",
+                static_enabled,
+                db_enabled,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Authentication backend temporarily unavailable",
+                headers={"Retry-After": "5"},
+            )
+        return None  # auth fully disabled (dev/CI only)
 
     # Read X-API-Key from raw request headers rather than declaring it via
     # Security() so it doesn't surface as a separate Swagger Authorize entry
@@ -279,3 +310,61 @@ async def api_key_auth(
         detail="Invalid or missing API key",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+
+def require_scopes(*required: str) -> Callable:
+    """Build a dependency that enforces ``required`` scopes on a key.
+
+    Layered on top of :func:`api_key_auth` (it is the only authentication
+    gate; this adds *authorization*). Behavior:
+
+    * ``info is None`` — the request authenticated via the static
+      break-glass key, hit a public path, or auth is disabled (dev/CI).
+      These are service/admin contexts with no per-user scope list, so
+      they are granted (unchanged from the pre-existing semantics where
+      ``None`` meant "authorized").
+    * Scope list contains ``"*"`` — full-access key, granted.
+    * ``API_SCOPE_ENFORCEMENT`` is off (default) — granted, but the
+      decision is logged at DEBUG so a dry-run can be observed before
+      flipping enforcement on.
+    * Enforcement on and no required scope present — ``403``.
+
+    Wire premium routers with e.g.
+    ``APIRouter(..., dependencies=[Depends(require_scopes("signals"))])``.
+    Enforcement stays a no-op until keys are backfilled with scopes and
+    ``API_SCOPE_ENFORCEMENT=1`` is set, so adding it cannot cause an
+    outage for the currently-scopeless key population.
+    """
+    required_set = set(required)
+
+    async def _dependency(
+        info: Optional[Dict[str, Any]] = Security(api_key_auth),
+    ) -> Optional[Dict[str, Any]]:
+        if info is None:
+            return info
+        scopes = info.get("scopes") or []
+        try:
+            scope_set = set(scopes)
+        except TypeError:
+            scope_set = set()
+        if _WILDCARD_SCOPE in scope_set:
+            return info
+        satisfied = required_set.issubset(scope_set)
+        if not _SCOPE_ENFORCEMENT:
+            if not satisfied:
+                logger.debug(
+                    "SCOPE_DRYRUN: key user_id=%s missing %s (has %s); "
+                    "would 403 if API_SCOPE_ENFORCEMENT were on",
+                    info.get("user_id"),
+                    sorted(required_set - scope_set),
+                    sorted(scope_set),
+                )
+            return info
+        if not satisfied:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="API key lacks the required scope for this endpoint",
+            )
+        return info
+
+    return _dependency

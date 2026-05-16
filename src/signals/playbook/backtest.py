@@ -19,15 +19,27 @@ Methodology:
   max_hold_minutes].
 - Compute MFE (max favorable) and MAE (max adverse) excursions in the
   Card's signed direction.
+- Entry-trigger enforcement: for a touch/break entry the trade is not
+  considered filled until the underlying actually reaches
+  ``entry.ref_price``; MFE/MAE and target/stop are measured only from the
+  fill bar onward. Cards whose trigger never fills are ``no_fill`` and are
+  excluded from resolved stats (counting never-filled Cards as filled
+  inflated the hit rate).
 - Outcome:
     * ``target_hit`` — favorable price reached the target before adverse
       reached the stop.
     * ``stop_hit`` — adverse touched stop first.
     * ``time_exit`` — neither resolved within max_hold.
     * ``no_data`` — too few quotes to decide.
-- Cards with non-level target/stop kinds (signal_event, premium_pct) are
-  best-effort: the price-only resolver only fires for the level branches;
-  unresolvable Cards fall through to ``time_exit``.
+    * ``no_fill`` — entry trigger never reached inside the hold window.
+    * ``unresolved`` — neither target nor stop is a price level
+      (premium_pct / signal_event short-premium structures); not
+      resolvable from the underlying series, excluded from stats.
+- Cost: an optional round-trip cost/slippage haircut
+  (``BACKTEST_ROUND_TRIP_COST_PCT``, default 0.0) shifts the target/stop
+  and nets MFE/MAE so ``proposed_base`` can reflect net-of-cost edge. The
+  gross underlying-touch hit rate materially overstates realized 0DTE
+  edge; enable a cost before wiring proposed_base into live sizing.
 """
 
 from __future__ import annotations
@@ -35,6 +47,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Iterable, Optional
@@ -44,7 +57,41 @@ import pytz
 logger = logging.getLogger(__name__)
 
 
-_OUTCOME_LABELS = ("target_hit", "stop_hit", "time_exit", "no_data")
+_OUTCOME_LABELS = (
+    "target_hit",
+    "stop_hit",
+    "time_exit",
+    "no_data",
+    # The Card's entry trigger never filled inside the hold window. Scoring
+    # such Cards as if filled (the old behavior) inflated hit rate, because
+    # the forward window was selected *because the pattern fired*.
+    "no_fill",
+    # Neither target nor stop is a price level (e.g. iron-condor
+    # premium_pct / signal_event exits). These cannot be resolved from the
+    # underlying series. The old code labeled them ``time_exit``, which
+    # counted them as resolved-but-not-a-loss and hid short-premium tail
+    # risk. They are now excluded from resolved stats entirely.
+    "unresolved",
+)
+
+# Entry triggers that fill immediately at the Card timestamp (no separate
+# touch/break confirmation). Anything else (at_touch / on_break / at_limit /
+# at_level …) requires the underlying to reach entry.ref_price before the
+# trade is considered filled.
+_IMMEDIATE_TRIGGERS = {"at_market", "at_close", "market", "immediate", "now", ""}
+
+# Optional round-trip cost/slippage haircut as a fraction of entry price,
+# applied to both the target/stop levels and the MFE/MAE excursions so the
+# empirical base reflects net-of-cost edge rather than a frictionless
+# underlying touch. Default 0.0 keeps measurements identical to the
+# pre-existing gross numbers; set BACKTEST_ROUND_TRIP_COST_PCT (e.g. 0.0015)
+# to enable. 0DTE option round-trips frequently cost 5-15% of *premium*,
+# so the gross underlying-touch hit rate overstates realized edge — operators
+# should enable this before wiring proposed_base into live sizing.
+try:
+    _ROUND_TRIP_COST_PCT = max(0.0, float(os.getenv("BACKTEST_ROUND_TRIP_COST_PCT", "0")))
+except (TypeError, ValueError):
+    _ROUND_TRIP_COST_PCT = 0.0
 _DEFAULT_DAYS = 60
 # Smoothing prior: empirical_base = (target_hits + alpha) / (resolved + alpha + beta).
 # Defaults pull untested patterns toward 0.50 so a single lucky/unlucky
@@ -236,12 +283,31 @@ def compute_outcome(
     target_price = _level_or_none(target_payload)
     stop_price = _level_or_none(stop_payload)
 
+    # Neither exit is a price level (premium_pct / signal_event short-premium
+    # structures). These are not resolvable from the underlying series. The
+    # old code fell through to ``time_exit``, which counted them as
+    # resolved-and-not-a-loss and made iron-condor/fear-fade tail risk
+    # invisible. Classify as ``unresolved`` so they are excluded from
+    # n_resolved / hit_rate / proposed_base instead of flattering the stats.
+    if target_price is None and stop_price is None:
+        return CardOutcome(
+            card=card,
+            outcome="unresolved",
+            note="non-level target and stop; not price-resolvable",
+        )
+
+    trigger = str(entry_payload.get("trigger") or "").strip().lower()
+    fills_immediately = trigger in _IMMEDIATE_TRIGGERS
+    cost = _ROUND_TRIP_COST_PCT
+    entry_f = float(entry)
+
     deadline = card.timestamp + timedelta(minutes=max_hold)
     mfe_pct = 0.0
     mae_pct = 0.0
     target_hit_at: Optional[datetime] = None
     stop_hit_at: Optional[datetime] = None
     n_quotes = 0
+    filled = fills_immediately
 
     for raw in quotes:
         ts, o, high, low, c = _normalize_quote(raw)
@@ -251,6 +317,17 @@ def compute_outcome(
             break
         n_quotes += 1
 
+        # Entry-trigger enforcement: for a touch/break entry the trade is
+        # not live until the underlying actually reaches entry.ref_price.
+        # MFE/MAE and target/stop are measured ONLY from the fill bar
+        # onward — scoring the favorable excursion of a fill that never
+        # happened was a systematic upward bias in hit rate.
+        if not filled:
+            if low <= entry_f <= high:
+                filled = True
+            else:
+                continue
+
         # Intrabar extremes in the Card's signed direction: the most
         # favorable price is the high (bullish) / low (bearish); the
         # most adverse is the opposite extreme.
@@ -258,15 +335,36 @@ def compute_outcome(
             favorable, adverse = high, low
         else:
             favorable, adverse = low, high
-        fav_exc = _signed_excursion(direction, float(entry), favorable)
-        adv_exc = _signed_excursion(direction, float(entry), adverse)
+        fav_exc = _signed_excursion(direction, entry_f, favorable)
+        adv_exc = _signed_excursion(direction, entry_f, adverse)
         if fav_exc > mfe_pct:
             mfe_pct = fav_exc
         if adv_exc < mae_pct:
             mae_pct = adv_exc
 
-        hit_target = _hit_target(direction, target_price, high, low)
-        hit_stop = _hit_stop(direction, stop_price, high, low)
+        # Optional round-trip cost: move the target further away and the
+        # stop closer (both by entry*cost) so resolution reflects
+        # net-of-cost edge. Fully inert at the default cost=0.0 — the
+        # original frictionless levels are used unchanged.
+        if cost and target_price is not None:
+            eff_target = (
+                target_price + entry_f * cost
+                if direction == "bullish"
+                else target_price - entry_f * cost
+            )
+        else:
+            eff_target = target_price
+        if cost and stop_price is not None:
+            eff_stop = (
+                stop_price + entry_f * cost
+                if direction == "bullish"
+                else stop_price - entry_f * cost
+            )
+        else:
+            eff_stop = stop_price
+
+        hit_target = _hit_target(direction, eff_target, high, low)
+        hit_stop = _hit_stop(direction, eff_stop, high, low)
 
         # Same-bar both-touch: intrabar order is unknowable from OHLC,
         # so resolve conservatively to the stop (never inflate edge).
@@ -287,30 +385,41 @@ def compute_outcome(
             note="no underlying quotes inside hold window",
         )
 
+    if not filled:
+        return CardOutcome(
+            card=card,
+            outcome="no_fill",
+            note=f"entry trigger {trigger!r} never reached entry={entry_f}",
+        )
+
+    # Net the reported excursions by the round-trip cost (inert at cost=0).
+    net_mfe = mfe_pct - cost
+    net_mae = mae_pct - cost
+
     if target_hit_at is not None and (stop_hit_at is None or target_hit_at <= stop_hit_at):
         return CardOutcome(
             card=card,
             outcome="target_hit",
-            mfe_pct=round(mfe_pct, 6),
-            mae_pct=round(mae_pct, 6),
+            mfe_pct=round(net_mfe, 6),
+            mae_pct=round(net_mae, 6),
             target_hit_at=target_hit_at,
         )
     if stop_hit_at is not None:
         return CardOutcome(
             card=card,
             outcome="stop_hit",
-            mfe_pct=round(mfe_pct, 6),
-            mae_pct=round(mae_pct, 6),
+            mfe_pct=round(net_mfe, 6),
+            mae_pct=round(net_mae, 6),
             stop_hit_at=stop_hit_at,
         )
 
     return CardOutcome(
         card=card,
         outcome="time_exit",
-        mfe_pct=round(mfe_pct, 6),
-        mae_pct=round(mae_pct, 6),
+        mfe_pct=round(net_mfe, 6),
+        mae_pct=round(net_mae, 6),
         expired_at=deadline,
-        note="neither level reached" if (target_price and stop_price) else "non-level resolver",
+        note="neither level reached",
     )
 
 
@@ -478,7 +587,9 @@ def aggregate(
             ps.n_resolved += 1
             ps.mfe_total += oc.mfe_pct
             ps.mae_total += oc.mae_pct
-        # no_data is counted in n_emitted but not n_resolved.
+        # no_data / no_fill / unresolved are counted in n_emitted but NOT
+        # n_resolved, so hit_rate and proposed_base are computed only over
+        # genuinely filled, price-resolvable trades.
     return list(by_pattern.values())
 
 

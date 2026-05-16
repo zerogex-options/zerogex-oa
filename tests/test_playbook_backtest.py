@@ -147,12 +147,17 @@ def test_quotes_outside_hold_window_are_ignored():
     assert outcome.outcome == "time_exit"
 
 
-def test_non_level_target_falls_through_to_time_exit():
+def test_non_level_target_and_stop_are_unresolved_not_time_exit():
+    """Non-level exits (premium_pct / signal_event short-premium structures)
+    cannot be resolved from the underlying series. They must NOT be scored
+    as ``time_exit`` (which counted them as resolved-and-not-a-loss and hid
+    short-premium tail risk) — they are ``unresolved`` and excluded from
+    resolved stats."""
     card = _card(target_kind="signal_event", stop_kind="signal_event")
     quotes = _quotes(card.timestamp + timedelta(minutes=1), [678.0, 678.1, 678.2, 678.0])
     outcome = compute_outcome(card, quotes)
-    assert outcome.outcome == "time_exit"
-    assert "non-level" in outcome.note
+    assert outcome.outcome == "unresolved"
+    assert "not price-resolvable" in outcome.note
 
 
 def test_non_directional_card_returns_no_data():

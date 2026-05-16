@@ -22,7 +22,7 @@ from src import config
 from .database import DatabaseManager
 from .errors import handle_api_errors
 from .middleware import RequestIdMiddleware
-from .security import api_key_auth, key_store
+from .security import api_key_auth, key_store, require_scopes
 from .models import (
     GEXSummary,
     GEXByStrike,
@@ -242,7 +242,14 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 # clients (and server logs) can correlate.
 app.add_middleware(RequestIdMiddleware)
 
-app.include_router(trade_signals_router)
+# The /api/signals surface is the premium (basic/pro) tier. Wire scope
+# enforcement here. It is a no-op until keys carry scopes AND
+# API_SCOPE_ENFORCEMENT=1 (see security.require_scopes), so this closes
+# the server-side tier gap without 403ing today's scopeless keys.
+app.include_router(
+    trade_signals_router,
+    dependencies=[Depends(require_scopes("signals"))],
+)
 app.include_router(volatility_gauge_router)
 app.include_router(option_contract_router)
 app.include_router(option_calculator_router)
