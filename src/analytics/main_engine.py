@@ -128,6 +128,14 @@ class AnalyticsEngine:
         # logged once (INFO) per closed period instead of a WARNING every
         # interval, and is cleared the moment Greek-bearing data resumes.
         self._empty_snapshot_state: bool = False
+        # Distinct frozen snapshot timestamp for which the unchanged-
+        # snapshot skip has already been logged at INFO.  Off-hours the
+        # timestamp is frozen for hours, so the skip guard would otherwise
+        # emit one INFO per worker per interval all weekend/overnight.
+        # Log the skip once per distinct frozen timestamp; demote the
+        # identical repeats to DEBUG.  Self-resets: a new timestamp
+        # advances past this value, and the next freeze logs once again.
+        self._last_skip_logged_ts: Optional[datetime] = None
         self._last_flow_cache_ts: Optional[datetime] = None
         self._last_flow_cache_refresh_mono: float = 0.0
         self._flow_cache_refresh_min_seconds: float = float(
@@ -1769,12 +1777,28 @@ class AnalyticsEngine:
                 self._last_processed_snapshot_ts is not None
                 and latest_timestamp == self._last_processed_snapshot_ts
             ):
-                logger.info(
-                    "Snapshot timestamp %s unchanged since last successful "
-                    "cycle; skipping recompute (identical input -> identical "
-                    "output -> no-op upsert). Sleeping the interval.",
-                    latest_timestamp,
-                )
+                # Off-hours the snapshot timestamp is frozen until the
+                # next session, so this guard fires every interval for
+                # hours.  Log the skip once per distinct frozen timestamp
+                # at INFO; demote the identical repeats to DEBUG so a
+                # weekend/overnight doesn't emit one INFO per worker per
+                # interval.  RTH is unaffected: a new bar advances the
+                # timestamp every minute so this branch isn't taken.
+                if latest_timestamp != self._last_skip_logged_ts:
+                    logger.info(
+                        "Snapshot timestamp %s unchanged since last successful "
+                        "cycle; skipping recompute (identical input -> identical "
+                        "output -> no-op upsert). Suppressing identical repeats "
+                        "at DEBUG until the timestamp advances.",
+                        latest_timestamp,
+                    )
+                    self._last_skip_logged_ts = latest_timestamp
+                else:
+                    logger.debug(
+                        "Snapshot timestamp %s still unchanged; skipping "
+                        "recompute (suppressed repeat).",
+                        latest_timestamp,
+                    )
                 return True
 
             logger.info(f"Running calculation for timestamp: {latest_timestamp}")
