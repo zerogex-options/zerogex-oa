@@ -14,10 +14,13 @@ advances the timestamp every minute, so only a *truly unchanged*
 timestamp skips.
 """
 
+import logging
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 from src.analytics.main_engine import AnalyticsEngine
+
+_SKIP_MARKER = "skipping recompute"
 
 
 def _summary():
@@ -114,3 +117,65 @@ def test_first_cycle_computes_then_subsequent_identical_cycle_skips():
     assert engine.run_calculation() is True
     assert engine.calculations_completed == 1  # unchanged
     engine._store_calculation_results.assert_called_once()  # still just once
+
+
+def test_unchanged_snapshot_skip_logs_once_then_debug(caplog):
+    """Off-hours the timestamp is frozen for hours; the skip must be logged
+    once at INFO per distinct frozen timestamp, with identical repeats
+    demoted to DEBUG so a weekend doesn't emit one INFO per interval."""
+    engine = AnalyticsEngine(underlying="SPY")
+    ts = datetime(2026, 5, 16, 21, 0, tzinfo=timezone.utc)  # a Saturday
+    engine._get_snapshot = MagicMock(
+        return_value={"timestamp": ts, "underlying_price": 500.0, "options": [{"x": 1}]}
+    )
+    _stub_pipeline(engine)
+
+    with caplog.at_level(logging.INFO):
+        assert engine.run_calculation() is True  # cycle 1: computes
+        # Cycles 2..6: identical frozen snapshot -> skip every time.
+        for _ in range(5):
+            assert engine.run_calculation() is True
+
+    # The skip line is logged exactly once at INFO despite 5 skipped cycles.
+    info_skips = [
+        r for r in caplog.records if _SKIP_MARKER in r.message and r.levelno == logging.INFO
+    ]
+    assert len(info_skips) == 1
+    assert engine._last_skip_logged_ts == ts
+
+    # The repeats are emitted at DEBUG (visible only with debug logging on).
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        assert engine.run_calculation() is True
+    debug_skips = [
+        r for r in caplog.records if _SKIP_MARKER in r.message and r.levelno == logging.DEBUG
+    ]
+    assert len(debug_skips) == 1
+    assert not any(_SKIP_MARKER in r.message and r.levelno == logging.INFO for r in caplog.records)
+
+
+def test_skip_log_resets_when_frozen_timestamp_changes(caplog):
+    """A new frozen episode (different timestamp) logs once again at INFO."""
+    engine = AnalyticsEngine(underlying="SPY")
+    ts1 = datetime(2026, 5, 15, 22, 0, tzinfo=timezone.utc)
+    ts2 = datetime(2026, 5, 18, 22, 0, tzinfo=timezone.utc)  # next session's freeze
+    _stub_pipeline(engine)
+
+    with caplog.at_level(logging.INFO):
+        engine._get_snapshot = MagicMock(
+            return_value={"timestamp": ts1, "underlying_price": 500.0, "options": [{"x": 1}]}
+        )
+        assert engine.run_calculation() is True  # compute ts1
+        assert engine.run_calculation() is True  # skip ts1 (INFO once)
+
+        engine._get_snapshot = MagicMock(
+            return_value={"timestamp": ts2, "underlying_price": 500.0, "options": [{"x": 1}]}
+        )
+        assert engine.run_calculation() is True  # ts advanced -> compute ts2
+        assert engine.run_calculation() is True  # skip ts2 (INFO once again)
+
+    info_skips = [
+        r for r in caplog.records if _SKIP_MARKER in r.message and r.levelno == logging.INFO
+    ]
+    assert len(info_skips) == 2
+    assert engine._last_skip_logged_ts == ts2
