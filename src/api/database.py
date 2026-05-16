@@ -219,6 +219,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._flow_endpoint_cache_ttl_seconds: float = float(
             os.getenv("FLOW_ENDPOINT_CACHE_TTL_SECONDS", "3.0")
         )
+        # /api/flow/series gets its own, longer TTL. Its unfiltered read
+        # is a flow_series_5min snapshot the Analytics Engine only
+        # rewrites ~once per cycle (~60s), so the shared 3s flow TTL just
+        # forces redundant snapshot reads; and the live tail is polled
+        # via intervals=N, which bypasses this cache entirely (see
+        # use_cache in get_flow_series), so a longer full-series TTL
+        # never stales the updating number. It also amortises the
+        # strike/expiration-filtered CTE (measured 6-26x the snapshot).
+        # by-contract/contracts deliberately keep the shared TTL above.
+        # <= 0 disables endpoint caching.
+        self._flow_series_endpoint_cache_ttl_seconds: float = float(
+            os.getenv("FLOW_SERIES_ENDPOINT_CACHE_TTL_SECONDS", "30.0")
+        )
         # Phase-2 read switch for the flow_series_5min snapshot. When true,
         # unfiltered /api/flow/series reads the pre-aggregated snapshot
         # instead of running the 8-CTE pipeline; filtered calls always use
@@ -1783,7 +1796,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 session_start, session_end, has_session_data = resolved
                 if not has_session_data:
                     if use_cache:
-                        self._cache_set(cache_key, [], self._flow_endpoint_cache_ttl_seconds)
+                        self._cache_set(cache_key, [], self._flow_series_endpoint_cache_ttl_seconds)
                     return []
 
                 if (
@@ -1856,7 +1869,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     # most-recent N 5-minute buckets.
                     result = result[:intervals]
                 if use_cache:
-                    self._cache_set(cache_key, result, self._flow_endpoint_cache_ttl_seconds)
+                    self._cache_set(cache_key, result, self._flow_series_endpoint_cache_ttl_seconds)
                 return result
         except asyncio.TimeoutError:
             logger.warning(f"Flow series query timed out for {symbol}, returning empty")
