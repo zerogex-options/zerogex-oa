@@ -2701,8 +2701,29 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         chosen snapshot, ordered by expiration then strike then option_type.
         """
         underlying = underlying.upper()
+        # exposure_ts: the most recent snapshot at or before the stable
+        # `latest_ts` that actually has Greeks populated (gamma IS NOT NULL).
+        # The stable CTE picks the absolute latest minute-bucket; over
+        # weekends/holidays the feed winds down and the *terminal* bucket
+        # carries strikes + open_interest but NULL gamma (the underlying
+        # price aged out, so Greeks were skipped). Anchoring on that bucket
+        # makes COALESCE(gamma, 0) zero every contract's exposure. Falling
+        # back to the last gamma-bearing snapshot is an index-only probe of
+        # idx_option_chains_underlying_ts_gamma (partial, gamma IS NOT NULL),
+        # so it stays O(1) and cannot reintroduce the statement_timeout that
+        # the reverted 7-day-DISTINCT retention rewrite caused.
         query = f"""
             WITH {_STABLE_SNAPSHOT_CTE},
+            exposure_ts AS (
+                SELECT oc.timestamp AS ts
+                FROM option_chains oc
+                CROSS JOIN latest_ts lt
+                WHERE oc.underlying = $1
+                  AND oc.timestamp <= lt.ts
+                  AND oc.gamma IS NOT NULL
+                ORDER BY oc.timestamp DESC
+                LIMIT 1
+            ),
             latest_spot AS (
                 SELECT close::numeric AS spot_price
                 FROM underlying_quotes
@@ -2729,7 +2750,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 )::numeric AS exposure,
                 oc.updated_at
             FROM option_chains oc
-            JOIN latest_ts lt ON oc.timestamp = lt.ts
+            JOIN exposure_ts et ON oc.timestamp = et.ts
             CROSS JOIN latest_spot ls
             WHERE oc.underlying = $1
               AND oc.open_interest IS NOT NULL
@@ -3047,15 +3068,38 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             LIMIT 1
         """
 
+        # iv_ts: the most recent snapshot at or before the stable
+        # `latest_ts` that actually has implied_volatility populated. The
+        # stable CTE picks the absolute latest minute-bucket; over
+        # weekends/holidays the feed winds down and the *terminal* bucket
+        # carries strikes + open_interest but NULL implied_volatility
+        # (closing quotes collapse, so the IV solver has no bid/ask/last to
+        # work from). Anchoring on that bucket yields an all-NULL surface
+        # ("API returned strikes, but all IV values are null"). Falling
+        # back to the last IV-bearing snapshot walks `latest_ts` backwards
+        # over only the few degraded trailing buckets via
+        # idx_option_chains_underlying_timestamp, so it stays bounded and
+        # cannot reintroduce the statement_timeout that the reverted
+        # 7-day-DISTINCT retention rewrite caused.
         chain_query = f"""
             WITH {_STABLE_SNAPSHOT_CTE},
+            iv_ts AS (
+                SELECT oc.timestamp AS ts
+                FROM option_chains oc
+                CROSS JOIN latest_ts lt
+                WHERE oc.underlying = $1
+                  AND oc.timestamp <= lt.ts
+                  AND oc.implied_volatility IS NOT NULL
+                ORDER BY oc.timestamp DESC
+                LIMIT 1
+            ),
             eligible_strikes AS (
                 SELECT strike
                 FROM (
                     SELECT DISTINCT strike
-                    FROM option_chains, latest_ts
+                    FROM option_chains, iv_ts
                     WHERE underlying = $1
-                      AND timestamp = latest_ts.ts
+                      AND timestamp = iv_ts.ts
                       AND expiration <= CURRENT_DATE + make_interval(days => $2)
                 ) sub
                 ORDER BY ABS(sub.strike - $3::numeric)
@@ -3069,10 +3113,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 oc.delta,
                 oc.open_interest
             FROM option_chains oc
-            CROSS JOIN latest_ts lt
+            CROSS JOIN iv_ts
             JOIN eligible_strikes es ON es.strike = oc.strike
             WHERE oc.underlying = $1
-              AND oc.timestamp = lt.ts
+              AND oc.timestamp = iv_ts.ts
               AND oc.expiration <= CURRENT_DATE + make_interval(days => $2)
             ORDER BY oc.expiration, oc.strike, oc.option_type
         """

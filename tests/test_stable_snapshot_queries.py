@@ -84,6 +84,12 @@ def test_get_open_interest_uses_stable_snapshot_cte():
     assert "latest_ts AS" in oi_query
     # Must not fall back to the sparse-prone `MAX(timestamp)` pattern.
     assert "MAX(timestamp)" not in oi_query
+    # Weekend/after-hours fallback: exposure must be anchored on the most
+    # recent snapshot whose Greeks are populated, not the terminal bucket
+    # whose gamma is NULL (which would zero every contract's exposure).
+    assert "exposure_ts AS" in oi_query
+    assert "oc.gamma IS NOT NULL" in oi_query
+    assert "JOIN exposure_ts et ON oc.timestamp = et.ts" in oi_query
 
 
 def test_get_vol_surface_data_uses_stable_snapshot_cte():
@@ -115,6 +121,13 @@ def test_get_vol_surface_data_uses_stable_snapshot_cte():
     assert "latest_ts AS" in chain_query
     # Older naive pattern picked the bare topmost timestamp; regression-guard it.
     assert "ORDER BY timestamp DESC\n                LIMIT 1" not in chain_query
+    # Weekend/after-hours fallback: the surface must be anchored on the most
+    # recent snapshot whose IV is populated, not the terminal bucket whose
+    # implied_volatility is all NULL ("API returned strikes, but all IV
+    # values are null for the selected tenors").
+    assert "iv_ts AS" in chain_query
+    assert "oc.implied_volatility IS NOT NULL" in chain_query
+    assert "timestamp = iv_ts.ts" in chain_query
 
 
 def test_stable_snapshot_quiescence_env_override(monkeypatch):
