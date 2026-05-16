@@ -56,15 +56,57 @@ def _engine(scores: dict[str, float], names=None) -> ScoringEngine:
     )
 
 
-def test_market_state_score_centered_near_50_when_all_components_abstain():
-    """All-zero abstains get replaced with regime_tilt, so the composite
-    sits close to 50 rather than landing exactly there.  The MarketContext
-    used here has a slight bullish tilt (close > flip, PCR = 1.0,
-    negative net GEX), so the composite drifts a hair above 50."""
+def test_market_state_score_is_exactly_neutral_when_all_components_abstain():
+    """All components abstaining = genuinely no information => the
+    composite must be EXACTLY neutral 50.0, not a synthetic drift.
+
+    (Pre-fix, every abstainer was replaced by the same-signed regime
+    tilt and summed in, biasing the composite off-neutral on sparse
+    data — over-confident regime labels exactly when inputs are
+    thinnest.  Per-component DISPLAY scores still carry the spectrum
+    tilt; only the composite excludes abstainers.)"""
     eng = _engine({})
+    snap, results = eng.score(_ctx())
+    assert snap.composite_score == 50.0
+    assert snap.direction == "controlled_trend"  # _regime_label(50.0)
+    # Spectrum guarantee preserved for the per-component display.
+    for _component, display in results:
+        assert display != 0.0
+
+
+def test_abstaining_components_excluded_and_surviving_weight_renormalized():
+    """One real bullish component + the rest abstaining must read like a
+    bullish consensus of the data we DO have (renormalized to full
+    scale), not be diluted toward 50 by the abstainers, and not be
+    pushed by correlated synthetic tilts."""
+    eng = _engine({"net_gex_sign": 1.0})  # all others abstain (0.0)
     snap, _ = eng.score(_ctx())
-    assert 49.0 <= snap.composite_score <= 60.0
-    assert snap.direction in {"controlled_trend", "chop_range"}
+    # Single active component saturated bullish -> renormalized to the
+    # full scale -> strongly bullish (tanh(100/50) ≈ 0.964 -> ~98).
+    assert snap.composite_score > 90.0
+    assert snap.direction == "trend_expansion"
+
+
+def test_no_abstainers_is_identical_to_prior_formula():
+    """Safety: when every component has data the renormalization is a
+    no-op (active_points == total_points), so the composite equals the
+    plain 50 + 50*tanh(sum(points*score)/50)."""
+    import math
+
+    scores = {
+        "net_gex_sign": 0.5,
+        "gamma_anchor": -0.3,
+        "put_call_ratio": 0.2,
+        "volatility_regime": -0.6,
+        "order_flow_imbalance": 0.4,
+        "dealer_delta_pressure": -0.1,
+    }
+    eng = _engine(scores)
+    snap, _ = eng.score(_ctx())
+    pts = ScoringEngine.COMPONENT_POINTS
+    expected_offset = sum(pts[name] * scores[name] for name in scores)
+    expected = 50.0 + 50.0 * math.tanh(expected_offset / 50.0)
+    assert abs(snap.composite_score - round(expected, 6)) < 1e-6
 
 
 def test_market_state_score_extreme_bullish_does_not_saturate_to_100():

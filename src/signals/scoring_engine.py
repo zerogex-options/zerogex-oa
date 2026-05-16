@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from src.signals.components.base import ComponentBase, MarketContext
-from src.signals.components.spectrum import ensure_non_zero
+from src.signals.components.spectrum import _ABSTAIN_THRESHOLD, ensure_non_zero
 
 # Soft-saturation scale for the composite.  ``composite = 50 + 50 *
 # tanh(sum_offset / _COMPOSITE_SAT_SCALE)`` so the index asymptotically
@@ -72,20 +72,43 @@ class ScoringEngine:
         component_results: list[tuple[ComponentBase, float]] = []
         payload: dict[str, dict] = {}
 
+        # Composite is built ONLY from components that actually had data.
+        # Abstaining components are excluded and the surviving weights are
+        # renormalized back onto the full point scale (below).  The prior
+        # code substituted a regime-derived tilt for every abstainer and
+        # summed those in — but the tilt is a pure function of shared
+        # context (close-vs-flip, PCR, net-GEX sign), so several
+        # abstainers all received the SAME-signed synthetic vote and
+        # pushed the composite off-neutral on sparse data (over-confident
+        # regime labels exactly when inputs are thinnest).  Note: when no
+        # component abstains, active_points == total_points and this is
+        # bit-identical to the previous behavior.
         sum_offset = 0.0
+        active_points = 0.0
+        total_points = 0.0
         for component in self.components:
             raw = component.compute(ctx)
-            clamped = max(-1.0, min(1.0, float(raw)))
-            # Replace abstain-zero scores with a regime-derived tilt so
-            # the component contribution lands on a continuous spectrum.
-            clamped = ensure_non_zero(clamped, ctx)
+            clamped_raw = max(-1.0, min(1.0, float(raw)))
             points = self.COMPONENT_POINTS.get(component.name, float(component.weight) * 100.0)
-            contribution = points * clamped
-            sum_offset += contribution
-            component_results.append((component, clamped))
+            total_points += points
+
+            abstained = abs(clamped_raw) < _ABSTAIN_THRESHOLD
+            if not abstained:
+                sum_offset += points * clamped_raw
+                active_points += points
+
+            # Per-component DISPLAY score keeps the spectrum guarantee
+            # ("0 is near-impossible" — see spectrum.py): abstainers still
+            # render a small regime-flavored tilt in the API /
+            # signal_component_scores.  This is presentation only; it does
+            # NOT feed the composite (that was the over-confidence bug).
+            display = ensure_non_zero(clamped_raw, ctx)
+            points_for_display = points
+            contribution = points_for_display * display
+            component_results.append((component, display))
             entry: dict = {
-                "score": round(clamped, 6),
-                "max_points": round(points, 2),
+                "score": round(display, 6),
+                "max_points": round(points_for_display, 2),
                 "contribution": round(contribution, 6),
             }
             # Components may emit diagnostic sub-fields via context_values()
@@ -101,12 +124,24 @@ class ScoringEngine:
                 entry["context"] = ctx_payload
             payload[component.name] = entry
 
+        # Renormalize the active components' contribution back onto the
+        # full point scale so the regime-label boundaries (40 / 70) stay
+        # meaningful when some components abstain (otherwise a half-data
+        # cycle would be diluted toward neutral).  When nothing abstains
+        # active_points == total_points and this is a no-op (identical to
+        # the prior formula).  All components abstaining => genuinely no
+        # information => exact neutral 50, not a synthetic drift.
+        if active_points > 0.0:
+            sum_offset_full = sum_offset * (total_points / active_points)
+        else:
+            sum_offset_full = 0.0
+
         # Soft tanh saturation in place of a hard [0, 100] clamp.  Sum of
         # weighted component contributions can mathematically run from
         # -100 to +100; mapping through tanh keeps the composite in
         # (0, 100) open-interval — exact 0 / 100 become asymptotic
         # extremes instead of common saturation points.
-        composite = 50.0 + 50.0 * math.tanh(sum_offset / _COMPOSITE_SAT_SCALE)
+        composite = 50.0 + 50.0 * math.tanh(sum_offset_full / _COMPOSITE_SAT_SCALE)
         composite = max(0.0, min(100.0, composite))
         normalized = composite / 100.0
         direction = self._regime_label(composite)
