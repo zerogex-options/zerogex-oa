@@ -231,11 +231,17 @@ class IVCalculator:
             logger.debug(f"Option already expired")
             return None
 
-        # Check for intrinsic value violations
+        # Check for intrinsic value violations. Use the discounted European
+        # lower bound (S - K*e^{-rT} for calls, K*e^{-rT} - S for puts), not
+        # the undiscounted S-K / K-S. A legitimate deep-ITM European put
+        # trades below its undiscounted intrinsic (down to K*e^{-rT} - S),
+        # so the old undiscounted gate wrongly rejected valid quotes and
+        # forced them onto the hardcoded default IV.
+        discounted_strike = strike * math.exp(-risk_free_rate * T)
         if option_type == "C":
-            intrinsic = max(0, underlying_price - strike)
+            intrinsic = max(0, underlying_price - discounted_strike)
         else:
-            intrinsic = max(0, strike - underlying_price)
+            intrinsic = max(0, discounted_strike - underlying_price)
 
         if option_price < intrinsic * 0.99:  # Allow small discrepancy
             logger.debug(f"Option price ({option_price}) < intrinsic value ({intrinsic})")

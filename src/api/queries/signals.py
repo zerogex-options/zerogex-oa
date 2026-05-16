@@ -326,17 +326,28 @@ class SignalsQueriesMixin:
 
         ``horizon`` must be one of "30m", "60m", "120m".
         """
-        if horizon not in {"30m", "60m", "120m"}:
+        # Map the validated horizon to fixed, hard-coded column identifiers.
+        # Keeping the guard and the column names in one structure (rather than
+        # interpolating f"outcome_{horizon}" 18 lines from the membership
+        # check) means a future edit that adds a horizon cannot accidentally
+        # introduce an injection path — the columns are literals here.
+        _HORIZON_COLUMNS = {
+            "30m": ("outcome_30m", "close_30m"),
+            "60m": ("outcome_60m", "close_60m"),
+            "120m": ("outcome_120m", "close_120m"),
+        }
+        cols = _HORIZON_COLUMNS.get(horizon)
+        if cols is None:
             return None
-        col = f"outcome_{horizon}"
+        col, close_col = cols
         query = f"""
             SELECT
                 COUNT(*)::int AS total,
                 COUNT(*) FILTER (WHERE {col} = 'win')::int AS wins,
                 COUNT(*) FILTER (WHERE {col} = 'loss')::int AS losses,
                 COUNT(*) FILTER (WHERE {col} IS NULL)::int AS pending,
-                AVG(CASE WHEN close_at_emit > 0 AND close_{horizon} IS NOT NULL
-                         THEN (close_{horizon} - close_at_emit) / close_at_emit
+                AVG(CASE WHEN close_at_emit > 0 AND {close_col} IS NOT NULL
+                         THEN ({close_col} - close_at_emit) / close_at_emit
                               * CASE direction
                                     WHEN 'bullish' THEN 1
                                     WHEN 'bearish' THEN -1

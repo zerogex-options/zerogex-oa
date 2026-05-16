@@ -8,6 +8,7 @@ import asyncpg
 import os
 import time as time_module
 import traceback
+from collections import OrderedDict
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Tuple
 from datetime import datetime, timedelta, date, time, timezone
@@ -277,7 +278,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._max_pain_current_cache_ttl_seconds: float = float(
             os.getenv("MAX_PAIN_CURRENT_CACHE_TTL_SECONDS", "120.0")
         )
-        self._read_cache: Dict[str, Tuple[float, Any]] = {}
+        # Bounded LRU + TTL. Keys like option_symbol:* / flow_series:* have an
+        # effectively unbounded keyspace (per strike-set/expiration-set query
+        # string); a plain dict only evicted a key when that exact key was
+        # re-requested after expiry, so cold keys accumulated forever and the
+        # worker RSS grew without bound over a trading session. Capping size
+        # and evicting oldest/expired keeps memory bounded — the cache is a
+        # pure latency optimization so eviction can never affect correctness.
+        self._read_cache_maxsize: int = max(
+            64, int(os.getenv("READ_CACHE_MAXSIZE", "2048"))
+        )
+        self._read_cache: "OrderedDict[str, Tuple[float, Any]]" = OrderedDict()
         self._load_credentials()
 
     def _cache_get(self, key: str) -> Optional[Any]:
@@ -289,13 +300,25 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         if time_module.monotonic() >= expires_at:
             self._read_cache.pop(key, None)
             return None
+        # Mark as most-recently-used for LRU eviction.
+        self._read_cache.move_to_end(key)
         return payload
 
     def _cache_set(self, key: str, payload: Any, ttl_seconds: float) -> None:
-        """Store a value in the short-lived in-memory read cache."""
+        """Store a value in the short-lived, bounded in-memory read cache."""
         if ttl_seconds <= 0:
             return
-        self._read_cache[key] = (time_module.monotonic() + ttl_seconds, payload)
+        now = time_module.monotonic()
+        self._read_cache[key] = (now + ttl_seconds, payload)
+        self._read_cache.move_to_end(key)
+        if len(self._read_cache) > self._read_cache_maxsize:
+            # Opportunistically drop already-expired entries first; if still
+            # over capacity, evict least-recently-used until within bound.
+            for k in list(self._read_cache.keys()):
+                if self._read_cache[k][0] <= now:
+                    self._read_cache.pop(k, None)
+            while len(self._read_cache) > self._read_cache_maxsize:
+                self._read_cache.popitem(last=False)
 
     async def _create_pool(self) -> asyncpg.Pool:
         """Create and return a fresh asyncpg pool instance."""
