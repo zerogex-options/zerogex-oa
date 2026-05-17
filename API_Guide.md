@@ -71,6 +71,79 @@ Revocations take effect within the cache TTL (default 60s, controlled by
 When neither `API_KEY` is set nor any keys exist in the `api_keys` table,
 authentication is disabled — appropriate only for local development/CI.
 
+### End-user attribution (website-proxied requests)
+
+The website's Next.js server calls this API with a single shared per-user
+key (`user_id=zerogex-web`) on behalf of every logged-in human, so the
+caller identity alone can't say *which* end-user a request is for. An
+optional second factor closes that gap: the website mints a short-lived
+signed token naming the end-user and sends it in an extra header
+**in addition to** (never replacing) the existing `Authorization: Bearer`:
+
+```
+X-End-User-Token: <JWT>
+```
+
+**Token contract (the verifier is strict):**
+
+- Standard JWT, **`alg=HS256` only**. Any other algorithm — including
+  `none` — is rejected (algorithm-confusion guard).
+- Header: `{"alg":"HS256","typ":"JWT"}`.
+- Claims: `sub` (required) — the website's stable, opaque internal
+  account id, non-empty after trimming, ≤ 256 chars (it lands in audit
+  logs, so it must not be email/PII); `exp` (required, epoch seconds —
+  a missing `exp` is rejected); `iat` (recommended, epoch seconds).
+- Signature: HMAC-SHA256 over `base64url(header).base64url(payload)`
+  using the raw secret string's UTF-8 bytes as the key (the secret is
+  **not** base64-decoded first), base64url without padding — exactly
+  what any standard JWT library produces by default.
+
+**Secret & tunables (server env):**
+
+- `END_USER_TOKEN_SECRET` — shared high-entropy string, byte-identical
+  to the website's `ZEROGEX_END_USER_TOKEN_SECRET`. **Unset ⇒ attribution
+  disabled ⇒ callers authenticate exactly as before.** Generate with
+  `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'`.
+- `END_USER_TOKEN_LEEWAY_SECONDS` (default 60) — clock-skew tolerance.
+- `END_USER_TOKEN_MAX_AGE_SECONDS` (default 900) — the honored lifetime
+  is hard-capped at this many seconds from `iat`, regardless of `exp`.
+
+**Fail-open / purely additive.** Verification is pure crypto: it never
+touches the DB and never raises into the request path. No token, no
+secret configured, or any invalid/expired/forged token simply means
+"no end-user" — the request still authenticates as the caller and
+returns its normal `200`. A bad token never turns a `200` into a `4xx`.
+
+**Consuming the identity.** Handlers can depend on the resolved identity:
+
+```python
+from src.api.identity import RequestIdentity, current_identity
+from fastapi import Depends
+
+@app.get("/api/example")
+async def example(identity: RequestIdentity = Depends(current_identity)):
+    # identity.caller_kind in {"static","db","anonymous"}
+    # identity.caller_user_id, identity.end_user_id, identity.end_user_source
+    # identity.subject -> "end_user:<id>" | "caller:<id>" | "caller_kind:<k>"
+    ...
+```
+
+Every request also emits one structured line on the `src.api.audit`
+logger: `api_request method=… path=… status=… caller_kind=…
+caller_user_id=… end_user_id=… duration_ms=…`.
+
+**Identity-keyed rate limiting.** A global dependency (`src.api.ratelimit`)
+can throttle per end-user (falling back to caller, then client IP — see
+`rate_limit_key`). It is **off** by default; `END_USER_RATE_LIMIT_ENABLED=1`
+turns on **log-only** mode (counts and logs `WOULD-BLOCK`, never rejects),
+and additionally `END_USER_RATE_LIMIT_ENFORCE=1` returns `429` with
+`Retry-After` over the limit (`END_USER_RATE_LIMIT_REQUESTS`,
+`END_USER_RATE_LIMIT_WINDOW_SECONDS`). The counter is an in-memory
+fixed-window map, so the limit is **per worker** — adequate for a
+smoke/observability rollout; the multi-worker scale-out path is
+`slowapi` + Redis with the same `rate_limit_key` derivation ported
+unchanged.
+
 ---
 
 ## Health & Status

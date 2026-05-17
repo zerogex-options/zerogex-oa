@@ -21,7 +21,8 @@ from src import config
 
 from .database import DatabaseManager
 from .errors import handle_api_errors
-from .middleware import RequestIdMiddleware
+from .middleware import AuditLogMiddleware, RequestIdMiddleware
+from .ratelimit import rate_limit
 from .security import api_key_auth, key_store, require_scopes
 from .models import (
     GEXSummary,
@@ -176,7 +177,10 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_url="/openapi.json",
     lifespan=lifespan,
-    dependencies=[Depends(api_key_auth)],
+    # rate_limit runs after api_key_auth so request.state.identity (set by
+    # the auth dependency) is available for the rate-limit key. No-op
+    # unless END_USER_RATE_LIMIT_ENABLED is set.
+    dependencies=[Depends(api_key_auth), Depends(rate_limit)],
     # Alphabetize endpoints within each tag in the Swagger UI. Operations
     # (HTTP methods) are also sorted so per-path groups render in a stable
     # order. `tagsSorter` keeps the tag list itself alphabetical.
@@ -236,6 +240,17 @@ app.add_middleware(
 # /api/flow/by-contract (which can return hundreds of thousands of rows for a
 # full session) don't get bottlenecked on transfer.
 app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+# Audit logging. Added immediately BEFORE RequestIdMiddleware so the
+# resulting nesting is (outer→inner): RequestId → Audit → GZip → CORS →
+# routing. Starlette's add_middleware() inserts at index 0 and
+# build_middleware_stack() wraps in reverse, so the *last* add_middleware
+# call is outermost. Keeping RequestId outermost means the request-id
+# contextvar is still set when AuditLogMiddleware emits its line in its
+# finally (RequestId's reset runs after Audit returns); having Audit wrap
+# routing means it observes the identity the auth dependency set during
+# dependency resolution.
+app.add_middleware(AuditLogMiddleware)
 
 # Request-ID propagation: every log line emitted while handling a request
 # carries the id, and the same id is echoed back via X-Request-Id so
