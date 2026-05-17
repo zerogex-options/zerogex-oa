@@ -1159,6 +1159,51 @@ class IngestionEngine:
             )
         self._pending_failed_option_rows = pending
 
+    def _handle_ambiguous_option_commit(
+        self,
+        rows: List[Dict[str, Any]],
+        err: Exception,
+        *,
+        phase: str = "commit",
+    ) -> None:
+        """Handle a commit-phase failure whose persistence is unknowable.
+
+        Unlike a pre-commit failure (transaction rolled back → exact-once
+        retain is correct), a failure at/after COMMIT may have been applied
+        server-side. Because the option upsert is additive, re-submitting
+        would double-count classified flow. So we deliberately do NOT
+        retain these rows; instead we invalidate the per-contract volume
+        baselines so the next snapshot delta recomputes against whatever
+        actually persisted, and trip the circuit breaker so we back off
+        the (evidently unhealthy) DB.
+        """
+        self._db_consecutive_failures += 1
+        self.errors_count += 1
+        backoff = _compute_db_backoff_seconds(self._db_consecutive_failures)
+        self._db_backoff_until = _time.monotonic() + backoff
+
+        for row in rows:
+            self._invalidate_option_volume_baseline(row["option_symbol"])
+
+        unique_symbols = {r["option_symbol"] for r in rows}
+        timestamps = [r.get("timestamp") for r in rows if r.get("timestamp") is not None]
+        logger.warning(
+            "[CIRCUIT-BREAKER] Ambiguous option write (%s phase): %d rows / "
+            "%d symbols may or may not have persisted. NOT retained (the "
+            "additive upsert would double-count); baselines invalidated so "
+            "the next delta re-syncs. attempt #%d, backoff %.2fs: %s\n"
+            "  timestamp range: %s .. %s",
+            phase,
+            len(rows),
+            len(unique_symbols),
+            self._db_consecutive_failures,
+            backoff,
+            err,
+            min(timestamps) if timestamps else None,
+            max(timestamps) if timestamps else None,
+            exc_info=True,
+        )
+
     def _write_option_rows(self, rows: List[Dict[str, Any]]):
         """Write multiple aggregated option rows in a single DB transaction.
 
@@ -1193,6 +1238,7 @@ class IngestionEngine:
             return
 
         t0 = _time.monotonic()
+        committed = False
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
@@ -1227,7 +1273,26 @@ class IngestionEngine:
                     values,
                     page_size=500,
                 )
-                conn.commit()
+                try:
+                    conn.commit()
+                    committed = True
+                except Exception as commit_err:
+                    # AMBIGUOUS: the COMMIT may already have been applied
+                    # server-side before the failure surfaced (client-side
+                    # statement timeout / connection reset after the server
+                    # committed). The option upsert is additive
+                    # (ask_volume = option_chains.ask_volume +
+                    # EXCLUDED.ask_volume), so re-submitting these rows on
+                    # the next attempt would DOUBLE-COUNT classified flow —
+                    # an overstated buy/sell-pressure data-integrity bug
+                    # (M3). A pre-commit failure rolls back and is safe to
+                    # retain; a commit-phase failure is NOT. Do not retain
+                    # for additive re-application — invalidate the volume
+                    # baselines so the next snapshot delta re-syncs to
+                    # whatever actually persisted (a one-bucket under-count
+                    # is acceptable; silent inflation is not).
+                    self._handle_ambiguous_option_commit(rows, commit_err)
+                    return
 
             elapsed_ms = (_time.monotonic() - t0) * 1000
             self.option_quotes_stored += len(rows)
@@ -1283,6 +1348,16 @@ class IngestionEngine:
                 self._obs_last_log = now
 
         except Exception as e:
+            if committed:
+                # The explicit COMMIT already succeeded; this exception
+                # came from the context manager's redundant post-commit
+                # COMMIT or connection cleanup. The rows ARE persisted, so
+                # an additive re-write would double-count (M3). Treat as
+                # already-applied, not as a retryable pre-commit failure.
+                self._handle_ambiguous_option_commit(
+                    rows, e, phase="post-commit cleanup"
+                )
+                return
             self._db_consecutive_failures += 1
             self.errors_count += 1
             backoff = _compute_db_backoff_seconds(self._db_consecutive_failures)
@@ -1418,6 +1493,15 @@ class IngestionEngine:
                     self._store_option_batch(item["data"])
                 elif item["type"] == "option":
                     self._store_option(item["data"])
+                elif item["type"] == "flush_options":
+                    # C3: the stream is about to swap the tracked option
+                    # symbol set (strike recalc / expiration refresh).
+                    # Contracts dropped from the new set never tick again,
+                    # so flush their pending partial buckets NOW or their
+                    # last bucket's classified flow is lost (the periodic
+                    # flush-timeout backstop runs at ~= recalc cadence and
+                    # may never fire for a just-dropped symbol).
+                    self._flush_all_buffers()
 
                 # Check for flush timeout
                 self._check_buffer_flush_timeout()

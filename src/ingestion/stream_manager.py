@@ -1306,6 +1306,10 @@ class StreamManager:
                     logger.info("Refreshing expirations...")
                     if self._refresh_expirations():
                         logger.info("✅ Expirations refreshed successfully")
+                        # C3: drain the consumer's pending option buckets
+                        # before swapping accumulators — symbols dropped by
+                        # the refreshed expiration set never tick again.
+                        yield {"type": "flush_options", "reason": "expiration_refresh"}
                         self._start_accumulators()
                     else:
                         logger.warning(
@@ -1520,6 +1524,13 @@ class StreamManager:
                             if new_price:
                                 self.current_price = new_price
                                 self.tracked_option_symbols = self._build_option_symbols()
+                                # C3: flush the consumer's pending option
+                                # buckets BEFORE swapping accumulators —
+                                # contracts dropped from the recalibrated
+                                # tracked set never tick again, so their
+                                # last partial bucket's classified flow is
+                                # otherwise lost.
+                                yield {"type": "flush_options", "reason": "strike_recalc"}
                                 self._start_accumulators(seed_option_rest=self.seed_rest_on_recalc)
                                 logger.info(
                                     f"Recalibrated strikes around "

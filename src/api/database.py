@@ -555,6 +555,24 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         row["total_premium"] = self._decode_json_field(row.get("total_premium"))
         return row
 
+    @staticmethod
+    async def _fetch_timed(conn, query, *args, timeout: float, fetchrow: bool = False):
+        """fetch/fetchrow with asyncpg's server-side ``timeout``.
+
+        asyncpg's own ``timeout=`` cancels the SERVER-side query and resets
+        the connection; ``asyncio.wait_for`` alone only cancels the
+        coroutine while the query keeps running server-side (up to
+        command_timeout), holding 1 of only ~3 pool connections — a few
+        slow calls then starve the pool (H2). Test/stub connections may not
+        accept the kwarg; fall back transparently so behavior is unchanged
+        for them.
+        """
+        method = conn.fetchrow if fetchrow else conn.fetch
+        try:
+            return await method(query, *args, timeout=timeout)
+        except TypeError:
+            return await method(query, *args)
+
     async def _refresh_flow_cache(self, conn: asyncpg.Connection, symbol: str) -> None:
         """Refresh flow caches for the latest snapshot and any recent missing minutes.
 
@@ -581,15 +599,48 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         if (now - last_refresh) < self._flow_refresh_min_seconds:
             return
 
+        # H4: do NOT run the heavy multi-CTE flow_contract_facts /
+        # flow_smart_money upsert on the request's pooled connection. With
+        # only ~3 pool connections, holding one for the duration of that
+        # write (the first request after each 15s throttle window paid the
+        # full write cost inline) was a primary pool-starvation / tail-
+        # latency source. The analytics engine is the steady-state writer;
+        # this API-side path is only a backstop, so schedule it off the hot
+        # path on its own connection and let the current request serve
+        # whatever is already in the cache tables.
+        #
+        # Advance the throttle BEFORE scheduling so concurrent requests in
+        # the same window don't all spawn a refresh (stampede guard).
+        self._last_flow_refresh_by_symbol[symbol] = now
+
         try:
-            async with conn.transaction():
-                await self._do_refresh_flow_cache(conn, symbol)
-        except Exception as e:
-            logger.warning(f"Flow cache refresh failed for {symbol} (non-fatal): {e}")
-        finally:
-            # Always update the throttle timestamp so we don't retry
-            # a failing refresh on every request.
-            self._last_flow_refresh_by_symbol[symbol] = time_module.monotonic()
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop (e.g. a sync unit test calling directly) —
+            # nothing to schedule; the analytics engine remains the writer.
+            return
+
+        tasks = getattr(self, "_flow_refresh_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._flow_refresh_tasks = tasks
+
+        async def _bg_refresh() -> None:
+            try:
+                async with self._acquire_connection() as bg_conn:
+                    async with bg_conn.transaction():
+                        await self._do_refresh_flow_cache(bg_conn, symbol)
+            except Exception as e:
+                logger.warning(
+                    f"Background flow cache refresh failed for {symbol} "
+                    f"(non-fatal): {e}"
+                )
+
+        task = loop.create_task(_bg_refresh())
+        # Strong ref: the loop only weak-refs tasks; without this a
+        # low-traffic refresh can be GC'd mid-flight before it commits.
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
     async def _do_refresh_flow_cache(self, conn: asyncpg.Connection, symbol: str) -> None:
         """Inner implementation of flow cache refresh."""
@@ -1682,7 +1733,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             async with self._acquire_connection() as conn:
                 await self._refresh_flow_cache(conn, symbol)
                 rows = await asyncio.wait_for(
-                    conn.fetch(query, symbol, effective_start, effective_end),
+                    self._fetch_timed(
+                        conn, query, symbol, effective_start, effective_end,
+                        timeout=15.0,
+                    ),
                     timeout=15.0,
                 )
                 result = [dict(row) for row in rows]
@@ -1836,11 +1890,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     # here — the snapshot is keyed (symbol, bar_start) only
                     # and can't answer per-strike/expiration questions.
                     rows = await asyncio.wait_for(
-                        conn.fetch(
+                        self._fetch_timed(
+                            conn,
                             SNAPSHOT_SELECT_ASYNCPG,
                             symbol,
                             session_start,
                             session_end,
+                            timeout=15.0,
                         ),
                         timeout=15.0,
                     )
@@ -1876,13 +1932,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         )
                 else:
                     rows = await asyncio.wait_for(
-                        conn.fetch(
+                        self._fetch_timed(
+                            conn,
                             FLOW_SERIES_CTE_ASYNCPG,
                             symbol,
                             session_start,
                             session_end,
                             strikes_arg,
                             expirations_arg,
+                            timeout=15.0,
                         ),
                         timeout=15.0,
                     )
@@ -1954,7 +2012,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         ) AS expirations
                 """
                 row = await asyncio.wait_for(
-                    conn.fetchrow(query, symbol, session_start, session_end),
+                    self._fetch_timed(
+                        conn, query, symbol, session_start, session_end,
+                        timeout=10.0, fetchrow=True,
+                    ),
                     timeout=10.0,
                 )
                 strikes = [float(s) for s in (row["strikes"] or [])]
@@ -2047,7 +2108,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             async with self._acquire_connection() as conn:
                 await self._refresh_flow_cache(conn, symbol)
                 rows = await asyncio.wait_for(
-                    conn.fetch(query, symbol, session_start, session_end, limit),
+                    self._fetch_timed(
+                        conn, query, symbol, session_start, session_end, limit,
+                        timeout=15.0,
+                    ),
                     timeout=15.0,
                 )
                 return [dict(row) for row in rows]
@@ -2129,7 +2193,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         try:
             async with self._acquire_connection() as conn:
                 rows = await asyncio.wait_for(
-                    conn.fetch(query, symbol, limit),
+                    self._fetch_timed(conn, query, symbol, limit, timeout=15.0),
                     timeout=15.0,
                 )
                 return [dict(row) for row in rows]
@@ -2664,7 +2728,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         try:
             async with self._acquire_connection() as conn:
-                rows = await asyncio.wait_for(conn.fetch(query, *params), timeout=15.0)
+                rows = await asyncio.wait_for(
+                    self._fetch_timed(conn, query, *params, timeout=15.0),
+                    timeout=15.0,
+                )
                 result = [dict(row) for row in rows]
                 self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
                 return result
