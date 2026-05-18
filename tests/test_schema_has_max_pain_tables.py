@@ -28,11 +28,12 @@ from pathlib import Path
 
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "setup" / "database" / "schema.sql"
 
-# Columns referenced by src/api/database.py.  max_pain_oi_snapshot: the
-# _refresh_max_pain_snapshot INSERT column list + updated_at (set in the
-# DO UPDATE branch / supplied by DEFAULT on first insert) + the
-# get_max_pain_current SELECT list.  *_expiration: the sync-expirations
-# INSERT column list + updated_at + the endpoint's expiration SELECT.
+# Columns the production table has carried since 2026-03-04 and that
+# src/api/database.py reads/writes.  max_pain_oi_snapshot: the
+# _refresh_max_pain_snapshot INSERT column list + the get_max_pain_current
+# SELECT list + created_at/updated_at (never in the INSERT column list, so
+# both depend on the column DEFAULT).  *_expiration: the sync-expirations
+# INSERT column list + the endpoint's expiration SELECT + the timestamps.
 _SNAPSHOT_COLUMNS = {
     "symbol",
     "as_of_date",
@@ -41,6 +42,7 @@ _SNAPSHOT_COLUMNS = {
     "max_pain",
     "difference",
     "expirations",
+    "created_at",
     "updated_at",
 }
 _EXPIRATION_COLUMNS = {
@@ -51,6 +53,7 @@ _EXPIRATION_COLUMNS = {
     "max_pain",
     "difference_from_underlying",
     "strikes",
+    "created_at",
     "updated_at",
 }
 

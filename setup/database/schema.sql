@@ -1525,24 +1525,31 @@ CREATE TABLE IF NOT EXISTS component_normalizer_cache (
 -- max_pain_oi_snapshot holds one row per (symbol, as_of_date) with the
 -- chain-wide max pain plus a JSON rollup of every expiration.  The
 -- ON CONFLICT (symbol, as_of_date) upsert in _refresh_max_pain_snapshot
--- relies on the primary key below.  ``updated_at`` is only set explicitly
--- in the DO UPDATE branch, so the column DEFAULT supplies it on first
--- insert.  Column types mirror option_chains.strike / gex_summary
--- (NUMERIC(12,4)); they are left nullable to match gex_summary — the
--- writer's ``WHERE max_pain IS NOT NULL`` filter and the endpoint's
--- Pydantic model already enforce presence at the boundaries.
+-- relies on the primary key below.  ``created_at`` / ``updated_at`` are
+-- never named in the writer's INSERT column list (``updated_at`` is set
+-- only in the DO UPDATE branch), so both rely on the column DEFAULT.
+-- Column shape mirrors the table that has run in production since
+-- 2026-03-04 (created out-of-band before this file tracked it): all
+-- payload columns NOT NULL — the writer's ``WHERE max_pain IS NOT NULL``
+-- filter and the ``underlying`` CROSS JOIN guarantee presence — plus the
+-- (symbol, as_of_date DESC) index backing the endpoint's
+-- ``ORDER BY as_of_date DESC LIMIT 1`` read.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS max_pain_oi_snapshot (
     symbol            VARCHAR(10)   NOT NULL,
     as_of_date        DATE          NOT NULL,
     source_timestamp  TIMESTAMPTZ   NOT NULL,
-    underlying_price  NUMERIC(12, 4),
-    max_pain          NUMERIC(12, 4),
-    difference        NUMERIC(12, 4),
+    underlying_price  NUMERIC(12, 4) NOT NULL,
+    max_pain          NUMERIC(12, 4) NOT NULL,
+    difference        NUMERIC(12, 4) NOT NULL,
     expirations       JSONB         NOT NULL DEFAULT '[]'::jsonb,
-    updated_at        TIMESTAMPTZ   DEFAULT NOW(),
+    created_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
     PRIMARY KEY (symbol, as_of_date)
 );
+
+CREATE INDEX IF NOT EXISTS idx_max_pain_oi_snapshot_symbol_date
+    ON max_pain_oi_snapshot(symbol, as_of_date DESC);
 
 -- max_pain_oi_snapshot_expiration is the same data flattened
 -- one-row-per-expiration so get_max_pain_current can read it back without
@@ -1556,12 +1563,16 @@ CREATE TABLE IF NOT EXISTS max_pain_oi_snapshot_expiration (
     as_of_date                  DATE          NOT NULL,
     source_timestamp            TIMESTAMPTZ   NOT NULL,
     expiration                  DATE          NOT NULL,
-    max_pain                    NUMERIC(12, 4),
-    difference_from_underlying  NUMERIC(12, 4),
+    max_pain                    NUMERIC(12, 4) NOT NULL,
+    difference_from_underlying  NUMERIC(12, 4) NOT NULL,
     strikes                     JSONB         NOT NULL DEFAULT '[]'::jsonb,
-    updated_at                  TIMESTAMPTZ   DEFAULT NOW(),
+    created_at                  TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    updated_at                  TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
     PRIMARY KEY (symbol, as_of_date, expiration)
 );
+
+CREATE INDEX IF NOT EXISTS idx_max_pain_oi_snapshot_exp_symbol_exp
+    ON max_pain_oi_snapshot_expiration(symbol, as_of_date DESC, expiration);
 
 -- =============================================================================
 -- Per-user API keys
