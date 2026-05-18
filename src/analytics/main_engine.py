@@ -920,6 +920,16 @@ class AnalyticsEngine:
         change, which finds where calls start out-weighting puts
         strike-by-strike — a different, non-standard level that can sit a
         long way from the cumulative zero-gamma level on lumpy OI.
+
+        When the cumulative curve is one-signed across the whole scanned
+        range (no crossing), the zero-gamma level sits *outside* the
+        scanned strikes, so the flip is clamped to the boundary strike on
+        that side (lowest strike if the curve is all-positive, highest if
+        all-negative) rather than returned as ``None``.  Returning a
+        tracking boundary instead of ``None`` keeps the persisted flip
+        from being silently frozen by the carry-forward — the same
+        endpoint-clamp convention ``_net_gex_at_spot`` already uses on the
+        identical curve, so the two stay sign-consistent.
         """
         cumulative = self._cumulative_net_gex_curve(gex_by_strike)
         if not cumulative:
@@ -946,13 +956,27 @@ class AnalyticsEngine:
             elif c1 * c2 < 0.0:
                 _consider(s1 + (s2 - s1) * (-c1) / (c2 - c1))
         # Whole book nets flat by the top strike => flip at that strike.
+        first_strike, _first_cum = cumulative[0]
         last_strike, last_cum = cumulative[-1]
         if last_cum == 0.0:
             _consider(last_strike)
 
+        clamped = False
+        if best_flip is None:
+            # No interior zero, no sign change, and last_cum != 0 => the
+            # cumulative curve is strictly one-signed everywhere, so the
+            # zero-gamma level lies beyond the scanned strikes. Clamp to
+            # the boundary on that side (all-positive => crossing is at/
+            # below the lowest strike; all-negative => at/above the
+            # highest) instead of returning None and letting the
+            # carry-forward freeze a stale level.
+            best_flip = first_strike if last_cum > 0.0 else last_strike
+            clamped = True
+
         if best_flip is not None:
             logger.info(
-                "Gamma flip point (cumulative zero-gamma): $%.2f " "(nearest to spot $%.2f)",
+                "Gamma flip point (cumulative zero-gamma%s): $%.2f (nearest to spot $%.2f)",
+                " — clamped to scanned-range boundary" if clamped else "",
                 best_flip,
                 underlying_price,
             )

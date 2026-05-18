@@ -101,13 +101,41 @@ def test_gamma_flip_returns_top_strike_when_book_nets_flat():
     assert flip == 110.0
 
 
-def test_gamma_flip_none_when_cumulative_never_crosses():
+def test_gamma_flip_clamps_to_boundary_when_cumulative_never_crosses():
+    """One-signed cumulative curve => zero-gamma level is outside the
+    scanned strikes, so the flip clamps to the boundary on that side
+    rather than returning None (which would let the carry-forward freeze
+    a stale level).  Same endpoint-clamp convention as _net_gex_at_spot."""
     engine = AnalyticsEngine(underlying="SPY")
-    gex = [
-        {"strike": 100.0, "net_gex": 5.0},  # cum 5
-        {"strike": 110.0, "net_gex": 7.0},  # cum 12 (never <= 0)
+    all_positive = [
+        {"strike": 100.0, "net_gex": 5.0},  # cum  5
+        {"strike": 110.0, "net_gex": 7.0},  # cum 12 (never crosses 0)
     ]
-    assert engine._calculate_gamma_flip_point(gex, underlying_price=105.0) is None
+    # Curve is positive everywhere => crossing is at/below the lowest
+    # scanned strike => clamp to the first strike.
+    assert engine._calculate_gamma_flip_point(all_positive, underlying_price=105.0) == 100.0
+
+    all_negative = [
+        {"strike": 100.0, "net_gex": -5.0},  # cum  -5
+        {"strike": 110.0, "net_gex": -7.0},  # cum -12 (never crosses 0)
+    ]
+    # Negative everywhere => crossing is at/above the highest scanned
+    # strike => clamp to the last strike.
+    assert engine._calculate_gamma_flip_point(all_negative, underlying_price=105.0) == 110.0
+
+
+def test_gamma_flip_none_when_no_curve():
+    """Genuine no-curve (fewer than 2 distinct strikes / empty) still
+    returns None — the clamp only applies when a real curve exists but is
+    one-signed."""
+    engine = AnalyticsEngine(underlying="SPY")
+    assert engine._calculate_gamma_flip_point([], underlying_price=105.0) is None
+    assert (
+        engine._calculate_gamma_flip_point(
+            [{"strike": 100.0, "net_gex": 5.0}], underlying_price=105.0
+        )
+        is None
+    )
 
 
 def test_net_gex_at_spot_interpolates_same_curve_as_flip():
