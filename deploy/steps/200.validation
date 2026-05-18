@@ -398,6 +398,24 @@ else
 fi
 log ""
 
+# Section 12: Scheduled Refresh Timers
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "12. Scheduled Refresh Timers"
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# /api/max-pain/current is a pure cache read; if this timer isn't enabled
+# the snapshot silently goes stale (no inline fallback anymore).  Surface
+# a not-installed timer at deploy time — parity with the cert-renew check.
+TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+if sudo systemctl is-enabled --quiet zerogex-oa-max-pain-refresh.timer 2>/dev/null; then
+    log "  ✓ Max-pain refresh timer enabled"
+    PASSED_CHECKS=$((PASSED_CHECKS + 1))
+else
+    log "  ⚠ Max-pain refresh timer not enabled (run: make max-pain-refresh-install)"
+    WARNING_CHECKS=$((WARNING_CHECKS + 1))
+fi
+log ""
+
 # Final Summary
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log "VALIDATION SUMMARY"
