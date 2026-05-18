@@ -125,6 +125,16 @@ API_RETRY_BACKOFF = _getenv_float("API_RETRY_BACKOFF", 2.0, min=1.0, max=10.0)  
 # ≈±0.7% of SPX, collapsing the index heatmap into a thin strip.
 GEX_HEATMAP_STRIKE_BAND_PCT = _getenv_float("GEX_HEATMAP_STRIKE_BAND_PCT", 0.08, min=0.005, max=0.5)
 
+# Gamma-flip / net-GEX-at-spot are derived from the SpotGamma-style
+# spot-shift dealer gamma-exposure profile: option gammas are re-priced
+# across a grid of hypothetical spots spanning spot ± SPAN_PCT, stepped
+# by STEP_PCT of spot. The span must comfortably exceed how far the
+# zero-gamma level realistically sits from spot (it is routinely several
+# percent away, well outside the ingested strike band) or the profile is
+# one-signed and the flip clamps to the grid edge instead of resolving.
+GAMMA_PROFILE_SPAN_PCT = _getenv_float("GAMMA_PROFILE_SPAN_PCT", 0.20, min=0.02, max=1.0)
+GAMMA_PROFILE_STEP_PCT = _getenv_float("GAMMA_PROFILE_STEP_PCT", 0.0025, min=0.0001, max=0.05)
+
 # Batch Sizes
 QUOTE_BATCH_SIZE = int(os.getenv("QUOTE_BATCH_SIZE", "100"))  # TradeStation supports up to 500
 OPTION_BATCH_SIZE = int(os.getenv("OPTION_BATCH_SIZE", "100"))

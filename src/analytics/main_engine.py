@@ -26,7 +26,12 @@ from psycopg2.extras import execute_values
 
 from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
-from src.config import RISK_FREE_RATE, ANALYTICS_FLOW_CACHE_REFRESH_ENABLED
+from src.config import (
+    RISK_FREE_RATE,
+    ANALYTICS_FLOW_CACHE_REFRESH_ENABLED,
+    GAMMA_PROFILE_SPAN_PCT,
+    GAMMA_PROFILE_STEP_PCT,
+)
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.analytics.walls import compute_call_put_walls
 from src.flow_series_sql import SNAPSHOT_UPSERT_PSYCOPG2
@@ -618,6 +623,31 @@ class AnalyticsEngine:
 
         return charm_per_day
 
+    def _calculate_bs_gamma(self, S, K: float, T: float, r: float, sigma: float):
+        """Black-Scholes gamma (q=0; identical for calls and puts).
+
+        ``γ = N'(d1) / (S·σ·√T)`` using the same dividend-free model and
+        ``d1`` form as :meth:`_calculate_vanna` / :meth:`_calculate_charm`.
+
+        Accepts ``S`` as a scalar or a NumPy array of underlying prices —
+        the array form so the spot-shift gamma profile can re-price a
+        whole price grid in one vectorised call.  Snapshot gamma is gamma
+        at the *current* spot only; the zero-gamma level is where exposure
+        flips as spot moves, so it can only be found by re-pricing gamma
+        at each hypothetical spot (not by cumulating the fixed snapshot
+        value).  Returns 0 where inputs are degenerate.
+        """
+        is_array = isinstance(S, np.ndarray)
+        if K <= 0 or T <= 0 or sigma <= 0:
+            return np.zeros_like(S, dtype=float) if is_array else 0.0
+        S_arr = np.asarray(S, dtype=float)
+        sqrt_T = np.sqrt(T)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            d1 = (np.log(S_arr / K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
+            gamma = stats.norm.pdf(d1) / (S_arr * sigma * sqrt_T)
+        gamma = np.where(S_arr > 0.0, gamma, 0.0)
+        return gamma if is_array else float(gamma)
+
     def _calculate_gex_by_strike(
         self, options: List[Dict[str, Any]], underlying_price: float, timestamp: datetime
     ) -> List[Dict[str, Any]]:
@@ -867,77 +897,109 @@ class AnalyticsEngine:
                 result[exp] = mp
         return result
 
-    def _cumulative_net_gex_curve(
-        self, gex_by_strike: List[Dict[str, Any]]
+    def _gamma_exposure_profile(
+        self,
+        options: List[Dict[str, Any]],
+        spot: float,
+        timestamp: datetime,
     ) -> List[Tuple[float, float]]:
-        """Aggregate net GEX by strike and return the ascending-by-strike
-        cumulative curve ``[(strike, running_total), ...]``.
+        """SpotGamma / SqueezeMetrics dealer gamma-exposure profile.
 
-        This is the single shared primitive behind BOTH the gamma flip
-        level (its zero crossing) and net-GEX-at-spot (its value sampled
-        at spot).  Deriving the two from one curve is what guarantees they
-        can never disagree about which side of the flip spot sits on —
-        the inconsistency this addresses, where a positive chain-wide
-        total was shown next to a spot far below the flip.
+        The single shared primitive behind BOTH the gamma flip (its zero
+        crossing) and net-GEX-at-spot (its value at the current price), so
+        the two can never disagree about which side of the flip spot sits
+        on.
 
-        Returns ``[]`` when there are fewer than 2 distinct strikes (no
-        meaningful curve / flip can be defined).
+        This is the actual industry construction, not the retail
+        cumulative-net-GEX-by-strike approximation it replaces: walk a
+        wide grid of hypothetical underlying prices, RE-PRICE every
+        option's gamma at each hypothetical price via Black-Scholes
+        (gamma is a function of spot, so the fixed snapshot gamma cannot
+        be cumulated to locate where exposure flips), sum dealer dollar
+        gamma with the same convention as :meth:`_calculate_gex_by_strike`
+        (calls +, puts −; ``γ·OI·100·S²·0.01``), and return the
+        ascending ``[(S, dealer_gex), ...]`` curve.  Each contract's
+        implied vol is held at its snapshot value across the shift
+        (sticky-strike — the standard simplification; a full
+        vol-surface re-shift is out of scope).
+
+        The grid spans ``spot ± GAMMA_PROFILE_SPAN_PCT`` stepped by
+        ``GAMMA_PROFILE_STEP_PCT`` of spot, so the zero crossing is found
+        regardless of how far it sits from spot / the ingested strike
+        band.  Returns ``[]`` when no profile can be built (no spot / no
+        usable contracts).
         """
-        if not gex_by_strike:
+        if spot <= 0 or not options:
             return []
 
-        # The raw gex_by_strike has one entry per (strike, expiration),
-        # so we must sum by strike before accumulating.
-        agg: Dict[float, float] = defaultdict(float)
-        for entry in gex_by_strike:
-            agg[entry["strike"]] += entry["net_gex"]
-
-        strikes_sorted = sorted(agg.items())  # ascending by strike
-        if len(strikes_sorted) < 2:
+        span = spot * GAMMA_PROFILE_SPAN_PCT
+        step = max(spot * GAMMA_PROFILE_STEP_PCT, 1e-6)
+        grid = np.arange(spot - span, spot + span + step, step)
+        grid = grid[grid > 0.0]
+        if grid.size < 2:
             return []
 
-        # Running cumulative GEX from the lowest strike upward.
-        cumulative: List[Tuple[float, float]] = []
-        running = 0.0
-        for strike, net_gex in strikes_sorted:
-            running += net_gex
-            cumulative.append((strike, running))
-        return cumulative
+        r = self.risk_free_rate
+        tte_cache: Dict = {}
+        total = np.zeros_like(grid, dtype=float)
+        used = False
+        for opt in options:
+            sigma = opt.get("implied_volatility") or 0.0
+            oi = opt.get("open_interest") or 0
+            K = opt.get("strike") or 0.0
+            if sigma <= 0 or oi <= 0 or K <= 0:
+                continue
+            expiration = opt["expiration"]
+            T = tte_cache.get(expiration)
+            if T is None:
+                T = self._calculate_time_to_expiration(timestamp, expiration)
+                tte_cache[expiration] = T
+            if T <= 0:
+                continue
+            gamma = self._calculate_bs_gamma(grid, K, T, r, sigma)
+            # Industry-standard dollar GEX per 1% move at the hypothetical
+            # spot: γ(S) × OI × 100 × S² × 0.01. Dealer sign: short calls
+            # (+), long puts (−) — matches _calculate_gex_by_strike.
+            dollar_gamma = gamma * oi * 100.0 * grid * grid * 0.01
+            sign = 1.0 if opt["option_type"] == "C" else -1.0
+            total += sign * dollar_gamma
+            used = True
+
+        if not used:
+            return []
+        return list(zip(grid.tolist(), total.tolist()))
 
     def _calculate_gamma_flip_point(
-        self, gex_by_strike: List[Dict[str, Any]], underlying_price: float
+        self, profile: List[Tuple[float, float]], underlying_price: float
     ) -> Optional[float]:
         """
-        Calculate the gamma flip / "zero gamma" level.
+        Gamma flip / "zero gamma" level: the hypothetical spot at which
+        the dealer gamma-exposure profile crosses zero.
 
-        Industry convention (SpotGamma / SqueezeMetrics): the spot level
-        at which *cumulative* dealer gamma exposure crosses zero — i.e.
-        run the strikes low→high, accumulate net GEX, and find where the
-        running total changes sign.  Above the level dealers are net long
-        gamma (stabilizing); below, net short (destabilizing).
+        Industry convention (SpotGamma / SqueezeMetrics): build the
+        spot-shift dealer gamma profile (see :meth:`_gamma_exposure_profile`
+        — gammas re-priced across a wide hypothetical-price grid) and take
+        the price where total dealer gamma changes sign.  Above the level
+        dealers are net long gamma (stabilizing); below, net short
+        (destabilizing).
 
-        Previously this used the *per-strike* net-GEX adjacent sign
-        change, which finds where calls start out-weighting puts
-        strike-by-strike — a different, non-standard level that can sit a
-        long way from the cumulative zero-gamma level on lumpy OI.
+        ``profile`` is that curve as an ascending ``[(S, dealer_gex), …]``.
+        With multiple crossings on a lumpy book, keep the one nearest spot
+        (the actionable level / established tie-break here).
 
-        When the cumulative curve is one-signed across the whole scanned
-        range (no crossing), the zero-gamma level sits *outside* the
-        scanned strikes, so the flip is clamped to the boundary strike on
-        that side (lowest strike if the curve is all-positive, highest if
-        all-negative) rather than returned as ``None``.  Returning a
-        tracking boundary instead of ``None`` keeps the persisted flip
-        from being silently frozen by the carry-forward — the same
-        endpoint-clamp convention ``_net_gex_at_spot`` already uses on the
-        identical curve, so the two stay sign-consistent.
+        If the profile is one-signed across the entire ±span grid (no
+        crossing) the zero-gamma level sits beyond the grid, so the flip
+        is clamped to the grid boundary on that side (low edge when the
+        profile is all-positive — dealers long gamma even far below spot;
+        high edge when all-negative) rather than returned as ``None``.
+        Clamping keeps the persisted flip from being silently frozen by
+        the carry-forward, and matches the endpoint-clamp
+        :meth:`_net_gex_at_spot` applies to the same curve so the two stay
+        sign-consistent.
         """
-        cumulative = self._cumulative_net_gex_curve(gex_by_strike)
-        if not cumulative:
+        if not profile:
             return None
 
-        # Zero crossing(s) of the cumulative curve. There can be more
-        # than one on lumpy books; keep the one nearest spot (the
-        # established tie-break in this codebase / the actionable level).
         best_flip = None
         best_dist = float("inf")
 
@@ -948,35 +1010,35 @@ class AnalyticsEngine:
                 best_dist = dist
                 best_flip = candidate
 
-        for i in range(len(cumulative) - 1):
-            s1, c1 = cumulative[i]
-            s2, c2 = cumulative[i + 1]
+        for i in range(len(profile) - 1):
+            s1, c1 = profile[i]
+            s2, c2 = profile[i + 1]
             if c1 == 0.0:
                 _consider(s1)
             elif c1 * c2 < 0.0:
                 _consider(s1 + (s2 - s1) * (-c1) / (c2 - c1))
-        # Whole book nets flat by the top strike => flip at that strike.
-        first_strike, _first_cum = cumulative[0]
-        last_strike, last_cum = cumulative[-1]
-        if last_cum == 0.0:
-            _consider(last_strike)
+        # Profile ends exactly at zero => flip at the top of the grid.
+        first_s, _first_v = profile[0]
+        last_s, last_v = profile[-1]
+        if last_v == 0.0:
+            _consider(last_s)
 
         clamped = False
         if best_flip is None:
-            # No interior zero, no sign change, and last_cum != 0 => the
-            # cumulative curve is strictly one-signed everywhere, so the
-            # zero-gamma level lies beyond the scanned strikes. Clamp to
-            # the boundary on that side (all-positive => crossing is at/
-            # below the lowest strike; all-negative => at/above the
-            # highest) instead of returning None and letting the
-            # carry-forward freeze a stale level.
-            best_flip = first_strike if last_cum > 0.0 else last_strike
+            # No interior zero and no sign change anywhere on the grid =>
+            # the profile is strictly one-signed across ±span, so the
+            # zero-gamma level lies beyond the grid. Clamp to the boundary
+            # on that side (all-positive => crossing is at/below the low
+            # edge; all-negative => at/above the high edge) instead of
+            # returning None and letting the carry-forward freeze a stale
+            # level.
+            best_flip = first_s if last_v > 0.0 else last_s
             clamped = True
 
         if best_flip is not None:
             logger.info(
-                "Gamma flip point (cumulative zero-gamma%s): $%.2f (nearest to spot $%.2f)",
-                " — clamped to scanned-range boundary" if clamped else "",
+                "Gamma flip point (spot-shift zero-gamma%s): $%.2f (nearest to spot $%.2f)",
+                " — clamped to ±span grid boundary" if clamped else "",
                 best_flip,
                 underlying_price,
             )
@@ -984,46 +1046,45 @@ class AnalyticsEngine:
         return best_flip
 
     def _net_gex_at_spot(
-        self, cumulative: List[Tuple[float, float]], underlying_price: float
+        self, profile: List[Tuple[float, float]], underlying_price: float
     ) -> Optional[float]:
-        """Cumulative dealer net GEX evaluated at the current spot.
+        """Dealer net GEX at the current spot.
 
-        This samples the SAME piecewise-linear curve whose zero crossing
-        defines the gamma flip (see ``_cumulative_net_gex_curve``).  It is
-        the value that actually describes dealer gamma *at the current
-        price*, as opposed to ``total_net_gex`` (the curve's endpoint =
-        the whole chain summed, which can be positive even when spot sits
-        deep in short-gamma territory because far-OTM call strikes
-        dominate the tail).
+        Piecewise-linear sample, at the current price, of the SAME
+        spot-shift gamma-exposure profile whose zero crossing defines the
+        gamma flip (see :meth:`_gamma_exposure_profile`).  This is dealer
+        dollar gamma *at spot* — the regime-correct headline figure — as
+        opposed to ``total_net_gex`` (the whole chain summed, which can
+        carry the opposite sign when far-OTM strikes dominate the tail).
 
-        Because flip and this value come from one curve, ``sign`` here is
-        on the short-gamma side whenever spot is below the (nearest) flip
-        and the long-gamma side when above — the headline figure and the
-        regime can no longer contradict each other.
+        Because the flip and this value are read off one curve, the sign
+        here is on the short-gamma side whenever spot is below the
+        (nearest) flip and the long-gamma side when above — the headline
+        figure and the spot-vs-flip regime can no longer contradict each
+        other.
 
-        Clamped to the curve's endpoints outside the strike range, which
-        matches how the flip routine treats the curve (it never
-        extrapolates beyond the first / last strike).  Returns ``None``
-        when no curve can be built.
+        Clamped to the profile's endpoints outside the ±span grid, exactly
+        as the flip routine treats it (neither extrapolates beyond the
+        grid).  Returns ``None`` when no profile can be built.
         """
-        if not cumulative:
+        if not profile:
             return None
 
-        first_strike, first_cum = cumulative[0]
-        last_strike, last_cum = cumulative[-1]
-        if underlying_price <= first_strike:
-            return first_cum
-        if underlying_price >= last_strike:
-            return last_cum
+        first_s, first_v = profile[0]
+        last_s, last_v = profile[-1]
+        if underlying_price <= first_s:
+            return first_v
+        if underlying_price >= last_s:
+            return last_v
 
-        for i in range(len(cumulative) - 1):
-            s1, c1 = cumulative[i]
-            s2, c2 = cumulative[i + 1]
+        for i in range(len(profile) - 1):
+            s1, c1 = profile[i]
+            s2, c2 = profile[i + 1]
             if s1 <= underlying_price <= s2:
                 if s2 == s1:
                     return c2
                 return c1 + (c2 - c1) * (underlying_price - s1) / (s2 - s1)
-        return last_cum
+        return last_v
 
     def _calculate_gex_summary(
         self,
@@ -1050,15 +1111,17 @@ class AnalyticsEngine:
         _mgs_strike, _mgs_value = max(_agg_by_strike.items(), key=lambda kv: abs(kv[1]))
         max_gamma_strike = {"strike": _mgs_strike, "net_gex": _mgs_value}
 
-        # Gamma flip + net-GEX-at-spot are two readings of ONE cumulative
-        # curve (see _cumulative_net_gex_curve): the flip is its zero
-        # crossing, net_gex_at_spot is its value at the current price.
-        # Deriving both from the same primitive is what keeps the headline
-        # figure and the spot-vs-flip regime from contradicting each other.
-        gamma_flip_point = self._calculate_gamma_flip_point(gex_by_strike, underlying_price)
-        net_gex_at_spot = self._net_gex_at_spot(
-            self._cumulative_net_gex_curve(gex_by_strike), underlying_price
-        )
+        # Gamma flip + net-GEX-at-spot are two readings of ONE spot-shift
+        # dealer gamma-exposure profile (see _gamma_exposure_profile): the
+        # flip is its zero crossing, net_gex_at_spot is its value at the
+        # current price. Deriving both from the same primitive keeps the
+        # headline figure and the spot-vs-flip regime from contradicting
+        # each other, and — because the profile re-prices gamma across a
+        # wide hypothetical-price grid — the flip resolves even when the
+        # zero-gamma level sits well outside the ingested strike band.
+        gamma_profile = self._gamma_exposure_profile(options, underlying_price, timestamp)
+        gamma_flip_point = self._calculate_gamma_flip_point(gamma_profile, underlying_price)
+        net_gex_at_spot = self._net_gex_at_spot(gamma_profile, underlying_price)
 
         # Calculate max pain per expiration, then pick the front month
         # (nearest non-expired settlement) for the headline scalar.  The
