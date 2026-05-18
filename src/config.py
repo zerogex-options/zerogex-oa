@@ -203,9 +203,7 @@ TS_STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").
 # before the supervisor force-reconnects. Gauged in wall-clock seconds,
 # NOT empty-drain count: the poll loop wakes sub-second on every option
 # tick, so the drain count races far ahead of real time.
-UNDERLYING_STREAM_STALE_WARN_SECONDS = int(
-    os.getenv("UNDERLYING_STREAM_STALE_WARN_SECONDS", "75")
-)
+UNDERLYING_STREAM_STALE_WARN_SECONDS = int(os.getenv("UNDERLYING_STREAM_STALE_WARN_SECONDS", "75"))
 UNDERLYING_STREAM_STALE_RESTART_SECONDS = int(
     os.getenv("UNDERLYING_STREAM_STALE_RESTART_SECONDS", "120")
 )
