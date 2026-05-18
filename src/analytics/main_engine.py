@@ -1111,6 +1111,7 @@ class AnalyticsEngine:
             "total_call_oi": total_call_oi,
             "total_put_oi": total_put_oi,
             "total_net_gex": total_net_gex,
+            "net_gex_at_spot": net_gex_at_spot,
             "call_wall": call_wall,
             "put_wall": put_wall,
             "max_pain_by_expiration": max_pain_by_exp,

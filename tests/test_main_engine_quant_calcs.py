@@ -208,6 +208,38 @@ def test_store_gex_summary_keeps_current_gamma_flip_when_present():
     assert insert_args[4] == 499.75
 
 
+def test_store_gex_summary_persists_net_gex_at_spot():
+    """End-to-end: net_gex_at_spot from the summary dict reaches the INSERT
+    params (regression: it was dropped between compute and persist, so the
+    column was always written NULL)."""
+    engine = AnalyticsEngine(underlying="SPY")
+    cursor = MagicMock()
+
+    summary = {
+        "underlying": "SPY",
+        "timestamp": datetime(2026, 4, 17, 14, 31, tzinfo=timezone.utc),
+        "max_gamma_strike": 500.0,
+        "max_gamma_value": 1234.0,
+        "gamma_flip_point": 499.75,
+        "put_call_ratio": 0.9,
+        "max_pain": 505.0,
+        "total_call_volume": 1000,
+        "total_put_volume": 900,
+        "total_call_oi": 2000,
+        "total_put_oi": 1800,
+        "total_net_gex": 555.0,
+        "net_gex_at_spot": -1_234_567.0,
+    }
+
+    engine._store_gex_summary(summary, cursor)
+
+    insert_args = cursor.execute.call_args_list[-1][0][1]
+    # Param order: ... total_net_gex (11), net_gex_at_spot (12), flip_distance (13) ...
+    assert insert_args[4] == 499.75  # gamma_flip_point index unchanged
+    assert insert_args[11] == 555.0
+    assert insert_args[12] == -1_234_567.0
+
+
 def test_gex_summary_includes_flip_distance_local_gex_and_convexity():
     engine = AnalyticsEngine(underlying="SPY")
     ts = datetime(2026, 4, 21, 14, 30, tzinfo=timezone.utc)
@@ -245,6 +277,12 @@ def test_gex_summary_includes_flip_distance_local_gex_and_convexity():
     assert summary["local_gex"] == abs(-2_000_000.0) + abs(3_000_000.0) + abs(1_000_000.0)
     expected_convexity = abs(summary["total_net_gex"]) / abs(summary["flip_distance"])
     assert summary["convexity_risk"] == expected_convexity
+    # net_gex_at_spot must be PRESENT in the summary dict (regression: it
+    # was computed but never added, so _store_gex_summary persisted NULL)
+    # and equal the cumulative curve sampled at spot. Cumulative at strike
+    # 500 (== spot) is -2M + 3M = +1M.
+    assert "net_gex_at_spot" in summary
+    assert abs(summary["net_gex_at_spot"] - 1_000_000.0) < 1e-6
 
 
 def _full_gex_row(ts):
