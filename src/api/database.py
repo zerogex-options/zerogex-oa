@@ -19,7 +19,7 @@ import json
 
 from src.api.queries.signals import SignalsQueriesMixin
 from src.api.queries.technicals import TechnicalsQueriesMixin
-from src.config import GEX_HEATMAP_STRIKE_BAND_PCT
+from src.config import GEX_HEATMAP_STRIKE_BAND_PCT, _getenv_bool
 from src.flow_series_sql import FLOW_SERIES_CTE_ASYNCPG, SNAPSHOT_SELECT_ASYNCPG
 from src.market_calendar import NYSE_HOLIDAYS
 from src.symbols import is_cash_index
@@ -257,8 +257,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # inline _refresh_max_pain_snapshot call and just reads from the
         # snapshot tables.  Symbols not listed here keep the original
         # on-demand-recompute behavior.
-        self._max_pain_background_refresh_enabled: bool = (
-            os.getenv("MAX_PAIN_BACKGROUND_REFRESH_ENABLED", "true").lower() == "true"
+        # Same tolerant parse the background loop's gate uses
+        # (src.config.MAX_PAIN_BACKGROUND_REFRESH_ENABLED) so the request
+        # path and the loop can never disagree on a value like "1"/"yes".
+        self._max_pain_background_refresh_enabled: bool = _getenv_bool(
+            "MAX_PAIN_BACKGROUND_REFRESH_ENABLED", True
         )
         self._max_pain_background_refresh_symbols: frozenset = frozenset(
             s.strip().upper()

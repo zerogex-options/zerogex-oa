@@ -241,9 +241,7 @@ FLOW_ENDPOINT_CACHE_TTL_SECONDS = float(os.getenv("FLOW_ENDPOINT_CACHE_TTL_SECON
 # Symbols not in MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS fall back to the original
 # on-demand recompute (still vulnerable to the 30s timeout, but only if anyone
 # polls for them).
-MAX_PAIN_BACKGROUND_REFRESH_ENABLED = (
-    os.getenv("MAX_PAIN_BACKGROUND_REFRESH_ENABLED", "true").lower() == "true"
-)
+MAX_PAIN_BACKGROUND_REFRESH_ENABLED = _getenv_bool("MAX_PAIN_BACKGROUND_REFRESH_ENABLED", True)
 MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS = [
     s.strip().upper()
     for s in os.getenv("MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS", "SPY,SPX,QQQ").split(",")
