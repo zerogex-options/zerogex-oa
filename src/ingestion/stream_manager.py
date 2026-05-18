@@ -45,6 +45,7 @@ from src.config import (
     STRIKE_CLEANUP_INTERVAL,
     SESSION_TEMPLATE,
     API_REQUEST_TIMEOUT,
+    UNDERLYING_STREAM_STALE_WARN_SECONDS,
     UNDERLYING_STREAM_STALE_RESTART_SECONDS,
     UNDERLYING_STREAM_RESTART_COOLDOWN_SECONDS,
     UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS,
@@ -1254,18 +1255,23 @@ class StreamManager:
         _total_underlying_yields = 0
         _total_empty_cycles = 0
         _last_metrics_time = time.monotonic()
-        # Underlying-stream staleness watchdog. Measured in wall-clock
-        # seconds since the last bar (drain-count proxies are coupled to
-        # loop wake cadence — options wake the loop sub-second — so they
-        # don't track real time). `None` until the first bar arrives so a
-        # slow feed open isn't mistaken for a stall.
+        # Underlying-stream staleness watchdog. Gauged in wall-clock
+        # seconds since the last bar — NEVER the empty-drain count: the
+        # loop wakes sub-second on every option tick (shared wakeup
+        # event), so the drain count races ~1/sec while a 1-minute bar
+        # feed is silent ~60s between bars by design. Gating the warning
+        # on the count fires it ~50s before the feed is actually late.
+        # `_last_underlying_bar_mono` is None until the first bar arrives
+        # so a slow feed open isn't mistaken for a stall. The empty-drain
+        # count is kept only as diagnostic context in the log line.
         _consecutive_empty_underlying = 0
-        _STALE_UNDERLYING_THRESHOLD = 10  # warn after this many empty drains
         _last_bar_updates = 0  # track updates_received delta
         _last_underlying_bar_mono: Optional[float] = None
         _last_forced_restart_mono = 0.0
         _underlying_restart_attempts = 0
         _underlying_restart_backed_off = False
+        _stale_warned = False
+        _last_stale_warn_mono = 0.0
 
         try:
             while True:
@@ -1340,7 +1346,7 @@ class StreamManager:
                         self.current_price = underlying_data["close"]
                         yield {"type": "underlying", "data": underlying_data}
                         _total_underlying_yields += 1
-                        if _consecutive_empty_underlying >= _STALE_UNDERLYING_THRESHOLD:
+                        if _stale_warned:
                             logger.info(
                                 "Underlying bar stream RECOVERED after %.0fs / " "%d empty drains",
                                 (
@@ -1354,21 +1360,31 @@ class StreamManager:
                         _last_underlying_bar_mono = time.monotonic()
                         _underlying_restart_attempts = 0
                         _underlying_restart_backed_off = False
+                        _stale_warned = False
                     elif feed_expected:
                         # No bar this cycle while the feed should be live.
-                        # Measure staleness in wall-clock seconds: drain
-                        # counts are coupled to loop wake cadence (options
-                        # wake the loop sub-second) and do not measure
-                        # elapsed time.
+                        # Staleness is judged in wall-clock seconds only:
+                        # the empty-drain count climbs ~1/sec (options wake
+                        # the loop sub-second) while a 1-minute bar feed is
+                        # legitimately silent ~60s between bars, so gating
+                        # on the count fires a false STALE ~50s early.
                         _consecutive_empty_underlying += 1
                         if _last_underlying_bar_mono is None:
                             # Feed hasn't produced its first bar yet (slow
                             # open). Don't count warm-up as a stall — arm
                             # the clock from the first expectant cycle.
                             _last_underlying_bar_mono = time.monotonic()
-                        stale_seconds = time.monotonic() - _last_underlying_bar_mono
+                        now_mono = time.monotonic()
+                        stale_seconds = now_mono - _last_underlying_bar_mono
 
-                        if _consecutive_empty_underlying == _STALE_UNDERLYING_THRESHOLD:
+                        # Warn once silence exceeds the threshold (which sits
+                        # above the bar cadence), then re-warn at that same
+                        # interval while it persists — never every cycle.
+                        if stale_seconds >= UNDERLYING_STREAM_STALE_WARN_SECONDS and (
+                            not _stale_warned
+                            or now_mono - _last_stale_warn_mono
+                            >= UNDERLYING_STREAM_STALE_WARN_SECONDS
+                        ):
                             cur_updates = self._underlying_accumulator.updates_received
                             logger.warning(
                                 "Underlying bar stream appears STALE: "
@@ -1381,6 +1397,8 @@ class StreamManager:
                                 cur_updates - _last_bar_updates,
                                 self._underlying_accumulator.is_alive,
                             )
+                            _stale_warned = True
+                            _last_stale_warn_mono = now_mono
 
                         # Active recovery. A socket-alive-but-data-starved
                         # feed never trips the socket read timeout or the
@@ -1388,7 +1406,6 @@ class StreamManager:
                         # has been stale long enough — rate-limited by a
                         # cooldown, then escalated to a backed-off
                         # upstream-outage state rather than tight-looping.
-                        now_mono = time.monotonic()
                         if (
                             stale_seconds >= UNDERLYING_STREAM_STALE_RESTART_SECONDS
                             and not _underlying_restart_backed_off
@@ -1418,16 +1435,6 @@ class StreamManager:
                                     f"{UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS})"
                                 )
                                 _last_forced_restart_mono = now_mono
-                        elif (
-                            _consecutive_empty_underlying > _STALE_UNDERLYING_THRESHOLD
-                            and _consecutive_empty_underlying % 50 == 0
-                        ):
-                            logger.warning(
-                                "Underlying bar stream still stale: "
-                                "%.0fs without a bar (%d empty drains)",
-                                stale_seconds,
-                                _consecutive_empty_underlying,
-                            )
                     else:
                         _consecutive_empty_underlying = 0
 
