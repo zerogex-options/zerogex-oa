@@ -1512,6 +1512,58 @@ CREATE TABLE IF NOT EXISTS component_normalizer_cache (
 );
 
 -- =============================================================================
+-- Max-pain daily OI snapshot (derived cache)
+-- =============================================================================
+-- /api/max-pain/current serves a per-day max-pain rollup from these tables
+-- instead of running the heavy multi-CTE recompute inline.  The background
+-- loop (src/api/main.py:_max_pain_refresh_loop ->
+-- DatabaseManager.refresh_max_pain_snapshots ->
+-- _refresh_max_pain_snapshot) upserts them off the request path; the
+-- endpoint then reads them back as a pure cache hit.  Both are 100% derived
+-- state — safe to TRUNCATE, the next refresh cycle rebuilds them.
+--
+-- max_pain_oi_snapshot holds one row per (symbol, as_of_date) with the
+-- chain-wide max pain plus a JSON rollup of every expiration.  The
+-- ON CONFLICT (symbol, as_of_date) upsert in _refresh_max_pain_snapshot
+-- relies on the primary key below.  ``updated_at`` is only set explicitly
+-- in the DO UPDATE branch, so the column DEFAULT supplies it on first
+-- insert.  Column types mirror option_chains.strike / gex_summary
+-- (NUMERIC(12,4)); they are left nullable to match gex_summary — the
+-- writer's ``WHERE max_pain IS NOT NULL`` filter and the endpoint's
+-- Pydantic model already enforce presence at the boundaries.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS max_pain_oi_snapshot (
+    symbol            VARCHAR(10)   NOT NULL,
+    as_of_date        DATE          NOT NULL,
+    source_timestamp  TIMESTAMPTZ   NOT NULL,
+    underlying_price  NUMERIC(12, 4),
+    max_pain          NUMERIC(12, 4),
+    difference        NUMERIC(12, 4),
+    expirations       JSONB         NOT NULL DEFAULT '[]'::jsonb,
+    updated_at        TIMESTAMPTZ   DEFAULT NOW(),
+    PRIMARY KEY (symbol, as_of_date)
+);
+
+-- max_pain_oi_snapshot_expiration is the same data flattened
+-- one-row-per-expiration so get_max_pain_current can read it back without
+-- re-parsing the JSON rollup.  ON CONFLICT (symbol, as_of_date,
+-- expiration) in the sync step relies on this composite primary key, which
+-- also covers the endpoint's ``WHERE symbol = $1 AND as_of_date = $2
+-- ORDER BY expiration`` read.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS max_pain_oi_snapshot_expiration (
+    symbol                      VARCHAR(10)   NOT NULL,
+    as_of_date                  DATE          NOT NULL,
+    source_timestamp            TIMESTAMPTZ   NOT NULL,
+    expiration                  DATE          NOT NULL,
+    max_pain                    NUMERIC(12, 4),
+    difference_from_underlying  NUMERIC(12, 4),
+    strikes                     JSONB         NOT NULL DEFAULT '[]'::jsonb,
+    updated_at                  TIMESTAMPTZ   DEFAULT NOW(),
+    PRIMARY KEY (symbol, as_of_date, expiration)
+);
+
+-- =============================================================================
 -- Per-user API keys
 -- =============================================================================
 -- Long-lived API keys for individual users.  Keys are stored as SHA-256
