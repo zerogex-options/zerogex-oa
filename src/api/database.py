@@ -285,9 +285,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # worker RSS grew without bound over a trading session. Capping size
         # and evicting oldest/expired keeps memory bounded — the cache is a
         # pure latency optimization so eviction can never affect correctness.
-        self._read_cache_maxsize: int = max(
-            64, int(os.getenv("READ_CACHE_MAXSIZE", "2048"))
-        )
+        self._read_cache_maxsize: int = max(64, int(os.getenv("READ_CACHE_MAXSIZE", "2048")))
         self._read_cache: "OrderedDict[str, Tuple[float, Any]]" = OrderedDict()
         self._load_credentials()
 
@@ -632,8 +630,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         await self._do_refresh_flow_cache(bg_conn, symbol)
             except Exception as e:
                 logger.warning(
-                    f"Background flow cache refresh failed for {symbol} "
-                    f"(non-fatal): {e}"
+                    f"Background flow cache refresh failed for {symbol} " f"(non-fatal): {e}"
                 )
 
         task = loop.create_task(_bg_refresh())
@@ -1734,7 +1731,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 await self._refresh_flow_cache(conn, symbol)
                 rows = await asyncio.wait_for(
                     self._fetch_timed(
-                        conn, query, symbol, effective_start, effective_end,
+                        conn,
+                        query,
+                        symbol,
+                        effective_start,
+                        effective_end,
                         timeout=15.0,
                     ),
                     timeout=15.0,
@@ -2013,8 +2014,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 """
                 row = await asyncio.wait_for(
                     self._fetch_timed(
-                        conn, query, symbol, session_start, session_end,
-                        timeout=10.0, fetchrow=True,
+                        conn,
+                        query,
+                        symbol,
+                        session_start,
+                        session_end,
+                        timeout=10.0,
+                        fetchrow=True,
                     ),
                     timeout=10.0,
                 )
@@ -2109,7 +2115,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 await self._refresh_flow_cache(conn, symbol)
                 rows = await asyncio.wait_for(
                     self._fetch_timed(
-                        conn, query, symbol, session_start, session_end, limit,
+                        conn,
+                        query,
+                        symbol,
+                        session_start,
+                        session_end,
+                        limit,
                         timeout=15.0,
                     ),
                     timeout=15.0,

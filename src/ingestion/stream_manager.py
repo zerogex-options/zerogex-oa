@@ -641,9 +641,7 @@ class UnderlyingBarAccumulator:
             # then overwrites that minute's real bar with a misdated one --
             # corrupting the underlying price Greeks are computed against.
             # Dropping the bar is strictly safer than fabricating a time.
-            logger.warning(
-                "Dropping underlying bar with unparseable TimeStamp=%r", timestamp_str
-            )
+            logger.warning("Dropping underlying bar with unparseable TimeStamp=%r", timestamp_str)
             return
 
         minute_bucket = timestamp.replace(second=0, microsecond=0)

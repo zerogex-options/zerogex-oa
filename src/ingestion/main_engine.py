@@ -1354,9 +1354,7 @@ class IngestionEngine:
                 # COMMIT or connection cleanup. The rows ARE persisted, so
                 # an additive re-write would double-count (M3). Treat as
                 # already-applied, not as a retryable pre-commit failure.
-                self._handle_ambiguous_option_commit(
-                    rows, e, phase="post-commit cleanup"
-                )
+                self._handle_ambiguous_option_commit(rows, e, phase="post-commit cleanup")
                 return
             self._db_consecutive_failures += 1
             self.errors_count += 1
