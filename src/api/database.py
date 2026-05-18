@@ -19,7 +19,7 @@ import json
 
 from src.api.queries.signals import SignalsQueriesMixin
 from src.api.queries.technicals import TechnicalsQueriesMixin
-from src.config import GEX_HEATMAP_STRIKE_BAND_PCT, _getenv_bool
+from src.config import GEX_HEATMAP_STRIKE_BAND_PCT
 from src.flow_series_sql import FLOW_SERIES_CTE_ASYNCPG, SNAPSHOT_SELECT_ASYNCPG
 from src.market_calendar import NYSE_HOLIDAYS
 from src.symbols import is_cash_index
@@ -252,47 +252,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._confluence_matrix_cache_ttl_seconds: float = float(
             os.getenv("CONFLUENCE_MATRIX_CACHE_TTL_SECONDS", "60.0")
         )
-        # Symbols whose max-pain snapshot is refreshed by a background task in
-        # the FastAPI lifespan; for these, get_max_pain_current skips the heavy
-        # inline _refresh_max_pain_snapshot call and just reads from the
-        # snapshot tables.  Symbols not listed here keep the original
-        # on-demand-recompute behavior.
-        # Same tolerant parse the background loop's gate uses
-        # (src.config.MAX_PAIN_BACKGROUND_REFRESH_ENABLED) so the request
-        # path and the loop can never disagree on a value like "1"/"yes".
-        self._max_pain_background_refresh_enabled: bool = _getenv_bool(
-            "MAX_PAIN_BACKGROUND_REFRESH_ENABLED", True
-        )
-        self._max_pain_background_refresh_symbols: frozenset = frozenset(
-            s.strip().upper()
-            for s in os.getenv("MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS", "SPY,SPX,QQQ").split(",")
-            if s.strip()
-        )
-        # /api/max-pain/current returns a daily OI snapshot that only
-        # changes every MAX_PAIN_BACKGROUND_REFRESH_INTERVAL_SECONDS (the
-        # background loop for listed symbols; the heavy inline recompute
-        # for non-listed ones).  Sharing the 5 s analytics TTL forced a
-        # DB round-trip ~every 5 s for data that moves ~every 5 min, and
-        # each of those reads competes for the small pool with the heavy
-        # background recompute — the head-of-line stall behind that
-        # recompute is what made the endpoint take ~9 s.  A dedicated,
-        # longer TTL keeps the request path a pure in-process cache hit
-        # between snapshot refreshes.  <= 0 disables endpoint caching.
+        # /api/max-pain/current is a PURE cache read of max_pain_oi_snapshot
+        # / _expiration.  Those tables are written only by the off-process
+        # daily job (zerogex-oa-max-pain-refresh.timer ->
+        # src.tools.max_pain_refresh).  There is no in-process background
+        # loop and no inline on-request recompute: the heavy option_chains
+        # scan ran during the cash session and starved the Analytics
+        # engine.  Max pain is daily-grained (OI only changes at
+        # settlement), so a process-local TTL on top of the daily snapshot
+        # just spares redundant identical DB reads.  <= 0 disables caching.
         self._max_pain_current_cache_ttl_seconds: float = float(
             os.getenv("MAX_PAIN_CURRENT_CACHE_TTL_SECONDS", "120.0")
-        )
-        # Hard cap on the *inline* (on-request) max-pain recompute.  This
-        # path runs only for symbols outside MAX_PAIN_BACKGROUND_REFRESH_
-        # SYMBOLS (or whenever background refresh is off), and the heavy
-        # multi-CTE recompute regularly exceeds the asyncpg pool's ~30s
-        # command_timeout during the cash session — the request then held a
-        # pooled connection for 30s and returned a 500 (observed:
-        # GET /api/max-pain/current, duration_ms≈30000).  Bound it short so
-        # a slow recompute fails fast and get_max_pain_current degrades to
-        # the existing (daily-grained, harmlessly stale) snapshot instead
-        # of starving the pool and erroring the client.
-        self._max_pain_inline_refresh_timeout_seconds: float = max(
-            1.0, float(os.getenv("MAX_PAIN_INLINE_REFRESH_TIMEOUT_SECONDS", "8.0"))
         )
         # Bounded LRU + TTL. Keys like option_symbol:* / flow_series:* have an
         # effectively unbounded keyspace (per strike-set/expiration-set query
@@ -2555,7 +2525,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     async def get_max_pain_current(
         self, symbol: str = "SPY", strike_limit: int = 200
     ) -> Optional[Dict[str, Any]]:
-        """Get current max pain from daily OI snapshot cache."""
+        """Get current max pain from the daily OI snapshot cache.
+
+        Pure read.  ``strike_limit`` is retained for API/signature
+        compatibility but no longer drives an on-request recompute — the
+        snapshot is produced off-process by src.tools.max_pain_refresh at
+        its configured strike limit.
+        """
         symbol = symbol.upper()
         cache_key = f"max_pain_current:{symbol}"
         cached = self._cache_get(cache_key)
@@ -2587,43 +2563,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ORDER BY expiration
         """
 
-        skip_inline_refresh = (
-            self._max_pain_background_refresh_enabled
-            and symbol in self._max_pain_background_refresh_symbols
-        )
+        # Pure cache read.  max_pain_oi_snapshot / _expiration are written
+        # only by the off-process daily job (src.tools.max_pain_refresh via
+        # zerogex-oa-max-pain-refresh.timer).  No inline recompute here —
+        # that heavy option_chains scan on the request path is exactly what
+        # starved the Analytics engine.  If the job hasn't populated a row
+        # yet, fetchrow returns None and the endpoint 404s (handled below).
         async with self._acquire_connection() as conn:
-            if not skip_inline_refresh:
-                # Best-effort freshen.  The inline recompute is an
-                # optimization, not a correctness requirement: max pain is a
-                # daily OI snapshot, so serving the row already in
-                # max_pain_oi_snapshot (minutes/hours old) is correct and
-                # vastly preferable to a 500.  A timeout / DB error here
-                # must fall through to the read below, never abort the
-                # request.  Bounded by a short command_timeout so it fails
-                # fast instead of pinning a pooled connection ~30s (the
-                # exact failure seen in prod: GET /api/max-pain/current,
-                # duration_ms≈30000, asyncpg TimeoutError).  asyncpg
-                # recovers the connection after a command_timeout, so the
-                # snapshot read below still runs on it.
-                try:
-                    await self._refresh_max_pain_snapshot(
-                        conn,
-                        symbol,
-                        strike_limit,
-                        timeout=self._max_pain_inline_refresh_timeout_seconds,
-                    )
-                except (
-                    TimeoutError,
-                    asyncpg.PostgresError,
-                    asyncpg.InterfaceError,
-                    OSError,
-                ):
-                    logger.warning(
-                        "inline max-pain refresh for %s timed out or failed; "
-                        "serving existing snapshot",
-                        symbol,
-                        exc_info=True,
-                    )
             snapshot = await conn.fetchrow(snapshot_query, symbol)
             if not snapshot:
                 return None

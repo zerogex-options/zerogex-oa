@@ -1,12 +1,9 @@
 """`/api/max-pain/current` must cache on its own (longer) TTL.
 
-The endpoint reads a daily OI snapshot that the background loop (or the
-heavy inline recompute for non-listed symbols) only changes every
-``MAX_PAIN_BACKGROUND_REFRESH_INTERVAL_SECONDS``.  Sharing the 5 s
-``ANALYTICS_CACHE_TTL_SECONDS`` forced a DB round-trip ~every 5 s for
-data that moves ~every 5 min, and each of those reads competed for the
-small asyncpg pool with the heavy background recompute — the head-of-
-line stall that made the endpoint take ~9 s.  These tests pin the
+The endpoint is a pure read of a daily OI snapshot that the off-process
+scheduled job (src.tools.max_pain_refresh) rewrites at most once a day.
+Sharing the 5 s ``ANALYTICS_CACHE_TTL_SECONDS`` forced a DB round-trip
+~every 5 s for data that changes ~once a day.  These tests pin the
 dedicated, longer TTL so a regression back to the shared 5 s TTL fails
 loudly.
 """
@@ -95,9 +92,8 @@ def test_get_max_pain_current_caches_with_dedicated_ttl(monkeypatch):
 
     assert first is not None
     assert second == first
-    # SPY is a background-refresh symbol by default, so the heavy inline
-    # recompute is skipped and exactly one snapshot read happened; the
-    # second call hit the cache (no extra fetchrow/fetch).
+    # Pure read: exactly one snapshot read happened; the second call hit
+    # the in-process cache (no extra fetchrow/fetch, no recompute).
     assert conn.fetchrow_calls == 1
     assert conn.fetch_calls == 1
     # And it was cached on the dedicated max-pain TTL, not the 5 s

@@ -26,9 +26,8 @@ import os
 _PINNED_DEFAULTS = {
     # src/api/database.py: DatabaseManager.__init__
     "FLOW_SERIES_USE_SNAPSHOT": "false",
-    "MAX_PAIN_BACKGROUND_REFRESH_ENABLED": "true",
-    "MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS": "SPY,SPX,QQQ",
     # src/config.py module-level constants
+    "MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS": "SPY,SPX,QQQ",
     "SIGNALS_BREAKOUT_SIZE_MULTIPLIER": "1.50",
     "SIGNALS_TRIGGER_THRESHOLD": "0.50",
 }

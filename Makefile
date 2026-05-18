@@ -586,6 +586,8 @@ help: ## Show this help message
 	@echo "  make normalizer-cache-install - Install nightly normalizer-refresh timer (04:30 ET)"
 	@echo "  make normalizer-cache-status  - Show normalizer-refresh timer status + recent log"
 	@echo "  make normalizer-cache-healthcheck - Flag stale cache rows (exit 1 = stale, for monitoring)"
+	@echo "  make max-pain-refresh-install - Install daily max-pain snapshot refresh timer (05:00 ET)"
+	@echo "  make max-pain-refresh-status  - Show max-pain refresh timer status + recent log"
 	@echo "  make alert-template-install   - Install zerogex-alert@.service + sample env (slack/sns/pagerduty/webhook)"
 	@echo "  make alert-template-test      - Fire a synthetic alert through the template"
 	@echo ""
@@ -3043,6 +3045,42 @@ normalizer-cache-healthcheck-strict: ## Healthcheck that also fails on missing r
 normalizer-cache-healthcheck-json: ## Healthcheck output as JSON (for monitoring scrapers)
 	@$(PY) -m src.tools.normalizer_cache_healthcheck \
 		--max-age-hours $(NORMALIZER_MAX_AGE_HOURS) --json
+
+# Max pain is a daily figure (OI changes only at settlement).  This job
+# replaces the old 5-min in-process loop / inline recompute that scanned
+# option_chains during the cash session and starved the Analytics engine.
+# Override the symbol set with: make max-pain-refresh MAX_PAIN_SYMBOLS="SPY QQQ"
+.PHONY: max-pain-refresh
+max-pain-refresh: ## Recompute the daily max-pain OI snapshot (run nightly, off-process)
+	@echo "$(BLUE)=== Refreshing max-pain OI snapshot ===$(NC)"
+	@$(PY) -m src.tools.max_pain_refresh \
+		$(if $(MAX_PAIN_SYMBOLS),--symbols $(MAX_PAIN_SYMBOLS))
+
+.PHONY: max-pain-refresh-healthcheck
+max-pain-refresh-healthcheck: ## Verify the snapshot caught up to chain data (0=ok,1=behind,2=db err)
+	@$(PY) -m src.tools.max_pain_healthcheck \
+		$(if $(MAX_PAIN_SYMBOLS),--symbols $(MAX_PAIN_SYMBOLS))
+
+.PHONY: max-pain-refresh-install
+max-pain-refresh-install: ## Install the daily max-pain refresh timer (05:00 ET)
+	@echo "$(BLUE)=== Installing Max-Pain Refresh Timer ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-max-pain-refresh.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-max-pain-refresh.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-max-pain-refresh.timer
+	@echo "$(GREEN)✅ Max-pain-refresh timer (05:00 ET) installed and started$(NC)"
+	@echo "$(YELLOW)Status:      systemctl status zerogex-oa-max-pain-refresh.timer$(NC)"
+	@echo "$(YELLOW)Logs:        journalctl -u zerogex-oa-max-pain-refresh$(NC)"
+	@echo "$(YELLOW)Trigger now: sudo systemctl start zerogex-oa-max-pain-refresh.service$(NC)"
+
+.PHONY: max-pain-refresh-status
+max-pain-refresh-status: ## Show max-pain refresh timer status + last/next fire + recent log
+	@echo "$(BLUE)=== Max-Pain Refresh Timer ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-max-pain-refresh.timer' || true
+	@echo ""
+	@systemctl status zerogex-oa-max-pain-refresh.service --no-pager -l || true
+	@echo ""
+	@sudo journalctl -u zerogex-oa-max-pain-refresh -n 30 --no-pager || true
 
 .PHONY: alert-template-install
 alert-template-install: ## Install zerogex-alert@.service template + sample env (does NOT enable OnFailure= hooks)

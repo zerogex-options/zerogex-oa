@@ -126,6 +126,11 @@ The deployment process runs these steps in order:
     row is older than 36 h, surfacing in `systemctl --failed` during
     business hours.  Wire active alerting by uncommenting the
     `OnFailure=` line in the unit file (see "Active alerting" below).
+  - `zerogex-oa-max-pain-refresh` - daily max-pain OI snapshot, 05:00 ET
+    (chained `After=` normalizer-refresh so the two heavy DB jobs don't
+    overlap; validates itself via `ExecStartPost=` that each symbol's
+    snapshot caught up to the latest option_chains trading date).
+    `/api/max-pain/current` is a pure cache read of what this job writes.
 - Enables services + timers to start on boot
 - Starts services and verifies status
 

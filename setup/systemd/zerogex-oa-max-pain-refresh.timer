@@ -1,0 +1,26 @@
+[Unit]
+Description=Daily trigger for ZeroGEX max-pain snapshot refresh (05:00 ET)
+
+[Timer]
+# Run daily at 05:00 server time (timezone is America/New_York, set by
+# deploy/steps/010.setup).  Schedule rationale — slots after the full
+# maintenance chain so nothing contends on the DB:
+#   • 02:00 ET — db-maintain (daily, up to 30 min)
+#   • 02:30 ET — db-vacuum-full (Sundays only, up to 90 min)
+#   • 03:30 ET — logs-clear (daily, up to 10 min)
+#   • 04:30 ET — normalizer-refresh
+#   • 05:00 ET — max-pain-refresh (this unit)
+# 05:00 sits after normalizer-refresh (chained via After= in the .service
+# so the two heavy DB jobs never overlap), still well before pre-market
+# data flow, and the prior session's OI is settled and present in
+# option_chains by then (same early-AM "prior day is final" assumption
+# normalizer-refresh relies on).  The endpoint then serves that settled
+# max pain all day as a pure cache read.  Jitter ±5 min.
+OnCalendar=*-*-* 05:00:00
+RandomizedDelaySec=5m
+# Run on next boot if the box was off when the timer should have fired
+# (don't skip a daily refresh after planned downtime).
+Persistent=true
+
+[Install]
+WantedBy=timers.target
