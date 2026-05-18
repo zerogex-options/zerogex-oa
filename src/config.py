@@ -196,6 +196,16 @@ TS_STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").
 # options stream is left untouched). Cooldown prevents thrash; after the
 # max consecutive ineffective reconnects it is treated as an upstream
 # outage (ERROR, backed-off) rather than restarted in a tight loop.
+# Warn (observability only, no action) once the underlying feed has been
+# silent this long. Must sit ABOVE the bar cadence (1-minute bars => ~60s
+# between bars is normal) so healthy operation never trips it, and BELOW
+# UNDERLYING_STREAM_STALE_RESTART_SECONDS so operators get a heads-up
+# before the supervisor force-reconnects. Gauged in wall-clock seconds,
+# NOT empty-drain count: the poll loop wakes sub-second on every option
+# tick, so the drain count races far ahead of real time.
+UNDERLYING_STREAM_STALE_WARN_SECONDS = int(
+    os.getenv("UNDERLYING_STREAM_STALE_WARN_SECONDS", "75")
+)
 UNDERLYING_STREAM_STALE_RESTART_SECONDS = int(
     os.getenv("UNDERLYING_STREAM_STALE_RESTART_SECONDS", "120")
 )
