@@ -278,6 +278,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._max_pain_current_cache_ttl_seconds: float = float(
             os.getenv("MAX_PAIN_CURRENT_CACHE_TTL_SECONDS", "120.0")
         )
+        # Hard cap on the *inline* (on-request) max-pain recompute.  This
+        # path runs only for symbols outside MAX_PAIN_BACKGROUND_REFRESH_
+        # SYMBOLS (or whenever background refresh is off), and the heavy
+        # multi-CTE recompute regularly exceeds the asyncpg pool's ~30s
+        # command_timeout during the cash session — the request then held a
+        # pooled connection for 30s and returned a 500 (observed:
+        # GET /api/max-pain/current, duration_ms≈30000).  Bound it short so
+        # a slow recompute fails fast and get_max_pain_current degrades to
+        # the existing (daily-grained, harmlessly stale) snapshot instead
+        # of starving the pool and erroring the client.
+        self._max_pain_inline_refresh_timeout_seconds: float = max(
+            1.0, float(os.getenv("MAX_PAIN_INLINE_REFRESH_TIMEOUT_SECONDS", "8.0"))
+        )
         # Bounded LRU + TTL. Keys like option_symbol:* / flow_series:* have an
         # effectively unbounded keyspace (per strike-set/expiration-set query
         # string); a plain dict only evicted a key when that exact key was
@@ -2577,7 +2590,37 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         )
         async with self._acquire_connection() as conn:
             if not skip_inline_refresh:
-                await self._refresh_max_pain_snapshot(conn, symbol, strike_limit)
+                # Best-effort freshen.  The inline recompute is an
+                # optimization, not a correctness requirement: max pain is a
+                # daily OI snapshot, so serving the row already in
+                # max_pain_oi_snapshot (minutes/hours old) is correct and
+                # vastly preferable to a 500.  A timeout / DB error here
+                # must fall through to the read below, never abort the
+                # request.  Bounded by a short command_timeout so it fails
+                # fast instead of pinning a pooled connection ~30s (the
+                # exact failure seen in prod: GET /api/max-pain/current,
+                # duration_ms≈30000, asyncpg TimeoutError).  asyncpg
+                # recovers the connection after a command_timeout, so the
+                # snapshot read below still runs on it.
+                try:
+                    await self._refresh_max_pain_snapshot(
+                        conn,
+                        symbol,
+                        strike_limit,
+                        timeout=self._max_pain_inline_refresh_timeout_seconds,
+                    )
+                except (
+                    TimeoutError,
+                    asyncpg.PostgresError,
+                    asyncpg.InterfaceError,
+                    OSError,
+                ):
+                    logger.warning(
+                        "inline max-pain refresh for %s timed out or failed; "
+                        "serving existing snapshot",
+                        symbol,
+                        exc_info=True,
+                    )
             snapshot = await conn.fetchrow(snapshot_query, symbol)
             if not snapshot:
                 return None

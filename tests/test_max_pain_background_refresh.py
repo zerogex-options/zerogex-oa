@@ -132,7 +132,7 @@ def test_get_max_pain_current_skips_inline_refresh_for_background_symbols():
 
     inline_calls: List[str] = []
 
-    async def fake_refresh(c, symbol, strike_limit):
+    async def fake_refresh(c, symbol, strike_limit, timeout=None):
         inline_calls.append(symbol)
 
     db._refresh_max_pain_snapshot = fake_refresh  # type: ignore[assignment]
@@ -157,7 +157,7 @@ def test_get_max_pain_current_falls_back_to_inline_for_unlisted_symbols():
 
     inline_calls: List[str] = []
 
-    async def fake_refresh(c, symbol, strike_limit):
+    async def fake_refresh(c, symbol, strike_limit, timeout=None):
         inline_calls.append(symbol)
 
     db._refresh_max_pain_snapshot = fake_refresh  # type: ignore[assignment]

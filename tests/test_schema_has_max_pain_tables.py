@@ -98,8 +98,7 @@ def test_primary_keys_match_on_conflict_targets():
     assert m, "max_pain_oi_snapshot has no PRIMARY KEY"
     pk = [c.strip() for c in m.group(1).split(",")]
     assert pk == ["symbol", "as_of_date"], (
-        f"max_pain_oi_snapshot PK {pk} must match the upsert's "
-        f"ON CONFLICT (symbol, as_of_date)"
+        f"max_pain_oi_snapshot PK {pk} must match the upsert's " f"ON CONFLICT (symbol, as_of_date)"
     )
 
     exp = _table_body(sql, "max_pain_oi_snapshot_expiration")
