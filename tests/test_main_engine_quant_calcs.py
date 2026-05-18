@@ -110,6 +110,50 @@ def test_gamma_flip_none_when_cumulative_never_crosses():
     assert engine._calculate_gamma_flip_point(gex, underlying_price=105.0) is None
 
 
+def test_net_gex_at_spot_interpolates_same_curve_as_flip():
+    """net_gex_at_spot samples the SAME cumulative curve the flip uses,
+    piecewise-linearly, at the current spot."""
+    engine = AnalyticsEngine(underlying="SPY")
+    gex = [
+        {"strike": 100.0, "net_gex": -10.0},  # cum -10
+        {"strike": 105.0, "net_gex": -4.0},  # cum -14
+        {"strike": 110.0, "net_gex": 20.0},  # cum  +6
+    ]
+    curve = engine._cumulative_net_gex_curve(gex)
+    # Between 105 (-14) and 110 (+6): -14 + 20 * (107-105)/(110-105) = -6.
+    assert abs(engine._net_gex_at_spot(curve, 107.0) - (-6.0)) < 1e-9
+    # Between 105 (-14) and 110 (+6): -14 + 20 * (109-105)/5 = +2.
+    assert abs(engine._net_gex_at_spot(curve, 109.0) - 2.0) < 1e-9
+
+
+def test_net_gex_at_spot_sign_agrees_with_flip_side():
+    """The core Fix-#1 guarantee: net_gex_at_spot is negative when spot is
+    below the flip and positive when above — so the headline figure can no
+    longer contradict the spot-vs-flip regime."""
+    engine = AnalyticsEngine(underlying="SPY")
+    gex = [
+        {"strike": 100.0, "net_gex": -10.0},
+        {"strike": 105.0, "net_gex": -4.0},
+        {"strike": 110.0, "net_gex": 20.0},
+    ]
+    curve = engine._cumulative_net_gex_curve(gex)
+    flip = engine._calculate_gamma_flip_point(gex, underlying_price=107.0)
+    assert engine._net_gex_at_spot(curve, flip - 1.0) < 0  # below flip => short gamma
+    assert engine._net_gex_at_spot(curve, flip + 1.0) > 0  # above flip => long gamma
+
+
+def test_net_gex_at_spot_clamps_outside_strike_range():
+    engine = AnalyticsEngine(underlying="SPY")
+    gex = [
+        {"strike": 100.0, "net_gex": -10.0},  # cum -10 (first)
+        {"strike": 110.0, "net_gex": 20.0},  # cum +10 (last == total)
+    ]
+    curve = engine._cumulative_net_gex_curve(gex)
+    assert engine._net_gex_at_spot(curve, 90.0) == -10.0  # clamp to first
+    assert engine._net_gex_at_spot(curve, 120.0) == 10.0  # clamp to last
+    assert engine._net_gex_at_spot([], 100.0) is None  # no curve
+
+
 def test_store_gex_summary_carries_forward_previous_gamma_flip_when_missing():
     engine = AnalyticsEngine(underlying="SPY")
     cursor = MagicMock()

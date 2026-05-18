@@ -15,6 +15,7 @@ class GEXSummary(BaseModel):
     total_call_gex: Decimal
     total_put_gex: Decimal
     net_gex: Decimal
+    net_gex_at_spot: Optional[Decimal] = None
     gamma_flip: Optional[Decimal] = None
     flip_distance: Optional[Decimal] = None
     local_gex: Optional[Decimal] = None

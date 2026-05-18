@@ -221,6 +221,12 @@ CREATE TABLE IF NOT EXISTS gex_summary (
     total_call_oi BIGINT DEFAULT 0,
     total_put_oi BIGINT DEFAULT 0,
     total_net_gex DOUBLE PRECISION,
+    -- Cumulative dealer net GEX sampled at the current spot (the value of
+    -- the same low→high cumulative curve whose zero crossing is
+    -- gamma_flip_point).  This is the regime-correct "dealer gamma here"
+    -- figure; total_net_gex is the curve's endpoint (whole chain) and can
+    -- carry the opposite sign when far-OTM strikes dominate the tail.
+    net_gex_at_spot DOUBLE PRECISION,
     flip_distance DOUBLE PRECISION,
     local_gex DOUBLE PRECISION,
     convexity_risk DOUBLE PRECISION,
@@ -262,6 +268,7 @@ ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS convexity_risk DOUBLE PRECISION
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS call_wall NUMERIC(12, 4);
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS put_wall NUMERIC(12, 4);
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS max_pain_by_expiration JSONB;
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS net_gex_at_spot DOUBLE PRECISION;
 
 CREATE TABLE IF NOT EXISTS gex_by_strike (
     underlying VARCHAR(10) NOT NULL,

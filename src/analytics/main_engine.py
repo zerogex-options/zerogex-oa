@@ -867,6 +867,43 @@ class AnalyticsEngine:
                 result[exp] = mp
         return result
 
+    def _cumulative_net_gex_curve(
+        self, gex_by_strike: List[Dict[str, Any]]
+    ) -> List[Tuple[float, float]]:
+        """Aggregate net GEX by strike and return the ascending-by-strike
+        cumulative curve ``[(strike, running_total), ...]``.
+
+        This is the single shared primitive behind BOTH the gamma flip
+        level (its zero crossing) and net-GEX-at-spot (its value sampled
+        at spot).  Deriving the two from one curve is what guarantees they
+        can never disagree about which side of the flip spot sits on —
+        the inconsistency this addresses, where a positive chain-wide
+        total was shown next to a spot far below the flip.
+
+        Returns ``[]`` when there are fewer than 2 distinct strikes (no
+        meaningful curve / flip can be defined).
+        """
+        if not gex_by_strike:
+            return []
+
+        # The raw gex_by_strike has one entry per (strike, expiration),
+        # so we must sum by strike before accumulating.
+        agg: Dict[float, float] = defaultdict(float)
+        for entry in gex_by_strike:
+            agg[entry["strike"]] += entry["net_gex"]
+
+        strikes_sorted = sorted(agg.items())  # ascending by strike
+        if len(strikes_sorted) < 2:
+            return []
+
+        # Running cumulative GEX from the lowest strike upward.
+        cumulative: List[Tuple[float, float]] = []
+        running = 0.0
+        for strike, net_gex in strikes_sorted:
+            running += net_gex
+            cumulative.append((strike, running))
+        return cumulative
+
     def _calculate_gamma_flip_point(
         self, gex_by_strike: List[Dict[str, Any]], underlying_price: float
     ) -> Optional[float]:
@@ -884,26 +921,9 @@ class AnalyticsEngine:
         strike-by-strike — a different, non-standard level that can sit a
         long way from the cumulative zero-gamma level on lumpy OI.
         """
-        if not gex_by_strike:
+        cumulative = self._cumulative_net_gex_curve(gex_by_strike)
+        if not cumulative:
             return None
-
-        # Aggregate net_gex by strike across all expirations.
-        # The raw gex_by_strike has one entry per (strike, expiration),
-        # so we must sum before accumulating.
-        agg: Dict[float, float] = defaultdict(float)
-        for entry in gex_by_strike:
-            agg[entry["strike"]] += entry["net_gex"]
-
-        strikes_sorted = sorted(agg.items())  # ascending by strike
-        if len(strikes_sorted) < 2:
-            return None
-
-        # Running cumulative GEX from the lowest strike upward.
-        cumulative: List[Tuple[float, float]] = []
-        running = 0.0
-        for strike, net_gex in strikes_sorted:
-            running += net_gex
-            cumulative.append((strike, running))
 
         # Zero crossing(s) of the cumulative curve. There can be more
         # than one on lumpy books; keep the one nearest spot (the
@@ -939,6 +959,48 @@ class AnalyticsEngine:
 
         return best_flip
 
+    def _net_gex_at_spot(
+        self, cumulative: List[Tuple[float, float]], underlying_price: float
+    ) -> Optional[float]:
+        """Cumulative dealer net GEX evaluated at the current spot.
+
+        This samples the SAME piecewise-linear curve whose zero crossing
+        defines the gamma flip (see ``_cumulative_net_gex_curve``).  It is
+        the value that actually describes dealer gamma *at the current
+        price*, as opposed to ``total_net_gex`` (the curve's endpoint =
+        the whole chain summed, which can be positive even when spot sits
+        deep in short-gamma territory because far-OTM call strikes
+        dominate the tail).
+
+        Because flip and this value come from one curve, ``sign`` here is
+        on the short-gamma side whenever spot is below the (nearest) flip
+        and the long-gamma side when above — the headline figure and the
+        regime can no longer contradict each other.
+
+        Clamped to the curve's endpoints outside the strike range, which
+        matches how the flip routine treats the curve (it never
+        extrapolates beyond the first / last strike).  Returns ``None``
+        when no curve can be built.
+        """
+        if not cumulative:
+            return None
+
+        first_strike, first_cum = cumulative[0]
+        last_strike, last_cum = cumulative[-1]
+        if underlying_price <= first_strike:
+            return first_cum
+        if underlying_price >= last_strike:
+            return last_cum
+
+        for i in range(len(cumulative) - 1):
+            s1, c1 = cumulative[i]
+            s2, c2 = cumulative[i + 1]
+            if s1 <= underlying_price <= s2:
+                if s2 == s1:
+                    return c2
+                return c1 + (c2 - c1) * (underlying_price - s1) / (s2 - s1)
+        return last_cum
+
     def _calculate_gex_summary(
         self,
         gex_by_strike: List[Dict[str, Any]],
@@ -964,8 +1026,15 @@ class AnalyticsEngine:
         _mgs_strike, _mgs_value = max(_agg_by_strike.items(), key=lambda kv: abs(kv[1]))
         max_gamma_strike = {"strike": _mgs_strike, "net_gex": _mgs_value}
 
-        # Calculate gamma flip point
+        # Gamma flip + net-GEX-at-spot are two readings of ONE cumulative
+        # curve (see _cumulative_net_gex_curve): the flip is its zero
+        # crossing, net_gex_at_spot is its value at the current price.
+        # Deriving both from the same primitive is what keeps the headline
+        # figure and the spot-vs-flip regime from contradicting each other.
         gamma_flip_point = self._calculate_gamma_flip_point(gex_by_strike, underlying_price)
+        net_gex_at_spot = self._net_gex_at_spot(
+            self._cumulative_net_gex_curve(gex_by_strike), underlying_price
+        )
 
         # Calculate max pain per expiration, then pick the front month
         # (nearest non-expired settlement) for the headline scalar.  The
@@ -1171,6 +1240,7 @@ class AnalyticsEngine:
         convexity_risk = summary.get("convexity_risk")
         spot_price = float(summary.get("underlying_price") or 0.0)
         total_net_gex = float(summary.get("total_net_gex") or 0.0)
+        net_gex_at_spot = summary.get("net_gex_at_spot")
         if flip_distance is None and gamma_flip_point is not None and spot_price > 0:
             flip_distance = (spot_price - gamma_flip_point) / spot_price
         if convexity_risk is None and flip_distance is not None:
@@ -1199,9 +1269,9 @@ class AnalyticsEngine:
             (underlying, timestamp, max_gamma_strike, max_gamma_value,
              gamma_flip_point, put_call_ratio, max_pain, total_call_volume,
              total_put_volume, total_call_oi, total_put_oi, total_net_gex,
-             flip_distance, local_gex, convexity_risk, call_wall, put_wall,
-             max_pain_by_expiration)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             net_gex_at_spot, flip_distance, local_gex, convexity_risk,
+             call_wall, put_wall, max_pain_by_expiration)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (underlying, timestamp) DO UPDATE SET
                 max_gamma_strike = EXCLUDED.max_gamma_strike,
                 max_gamma_value = EXCLUDED.max_gamma_value,
@@ -1213,6 +1283,7 @@ class AnalyticsEngine:
                 total_call_oi = EXCLUDED.total_call_oi,
                 total_put_oi = EXCLUDED.total_put_oi,
                 total_net_gex = EXCLUDED.total_net_gex,
+                net_gex_at_spot = EXCLUDED.net_gex_at_spot,
                 flip_distance = EXCLUDED.flip_distance,
                 local_gex = EXCLUDED.local_gex,
                 convexity_risk = EXCLUDED.convexity_risk,
@@ -1230,6 +1301,7 @@ class AnalyticsEngine:
                 OR EXCLUDED.total_call_oi IS DISTINCT FROM gex_summary.total_call_oi
                 OR EXCLUDED.total_put_oi IS DISTINCT FROM gex_summary.total_put_oi
                 OR EXCLUDED.total_net_gex IS DISTINCT FROM gex_summary.total_net_gex
+                OR EXCLUDED.net_gex_at_spot IS DISTINCT FROM gex_summary.net_gex_at_spot
                 OR EXCLUDED.flip_distance IS DISTINCT FROM gex_summary.flip_distance
                 OR EXCLUDED.local_gex IS DISTINCT FROM gex_summary.local_gex
                 OR EXCLUDED.convexity_risk IS DISTINCT FROM gex_summary.convexity_risk
@@ -1250,6 +1322,7 @@ class AnalyticsEngine:
                 int(summary["total_call_oi"]),
                 int(summary["total_put_oi"]),
                 float(summary["total_net_gex"]),
+                (float(net_gex_at_spot) if net_gex_at_spot is not None else None),
                 float(flip_distance) if flip_distance is not None else None,
                 float(summary.get("local_gex", 0.0)),
                 float(convexity_risk) if convexity_risk is not None else None,

@@ -1347,6 +1347,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     gs.total_put_oi,
                     gs.put_call_ratio,
                     gs.total_net_gex,
+                    gs.net_gex_at_spot,
                     gs.call_wall AS stored_call_wall,
                     gs.put_wall  AS stored_put_wall
                 FROM gex_summary gs
@@ -1414,6 +1415,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 -- always uses the current formula, even when the stored
                 -- summary row was written under an older convention.
                 (st.total_call_gex + st.total_put_gex) AS net_gex,
+                ls.net_gex_at_spot,
                 ls.gamma_flip_point AS gamma_flip,
                 ls.flip_distance,
                 ls.local_gex,
