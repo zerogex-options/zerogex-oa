@@ -15,14 +15,17 @@ from src.signals.components.flip_distance import (
 from src.tools.gamma_flip_revalidation import (
     EraStats,
     MIN_ERA_SAMPLES,
+    _parse_optional_instant,
     _resolve_deploy_cutoff,
     _subscore,
     _summarize_era,
     _verdict,
     analyze,
+    main,
 )
 
 _CUTOFF = _resolve_deploy_cutoff("2026-05-16")  # 2026-05-16 00:00 ET == 04:00Z
+_STABLE = _resolve_deploy_cutoff("2026-05-18")  # a later "flip calc settled" instant
 
 
 # --- _subscore is the live FlipDistanceComponent core -------------------------
@@ -104,7 +107,7 @@ def test_analyze_splits_at_deploy_boundary_and_drops_nulls():
         + [(_ts(18), None)]  # NULL flip_distance must be dropped
     )
     conn = _RoConn(rows)
-    pre, post, total = analyze(
+    pre, post, total, transitional_n = analyze(
         conn,
         "SPY",
         window_days=30,
@@ -113,6 +116,7 @@ def test_analyze_splits_at_deploy_boundary_and_drops_nulls():
         not_near_pct=0.006,
     )
     assert total == 67  # NULL row excluded by _fetch_flip_distances
+    assert transitional_n == 0  # no stable_since -> no transitional bucket
     assert pre is not None and pre.n == 35
     assert post is not None and post.n == 32
     # Read-only contract: only SELECT was ever issued.
@@ -126,7 +130,7 @@ def test_analyze_returns_none_for_thin_era():
     rows = [(_ts(14), 0.001) for _ in range(MIN_ERA_SAMPLES - 1)] + [
         (_ts(18), 0.02) for _ in range(MIN_ERA_SAMPLES)
     ]
-    pre, post, _ = analyze(
+    pre, post, _, _ = analyze(
         _RoConn(rows),
         "SPY",
         window_days=30,
@@ -136,6 +140,64 @@ def test_analyze_returns_none_for_thin_era():
     )
     assert pre is None  # below MIN_ERA_SAMPLES
     assert post is not None
+
+
+# --- stable-since (scoped post era) ------------------------------------------
+
+
+def test_stable_since_excludes_transitional_rows_from_post():
+    """pre = before cutoff; transitional = [cutoff, stable) is counted but
+    excluded from POST; POST = only rows >= stable_since (one settled def)."""
+    rows = (
+        [(_ts(14), 0.004) for _ in range(40)]  # pre-deploy
+        + [(_ts(17), 0.05) for _ in range(25)]  # transitional (mixed defs)
+        + [(_ts(18, 18), 0.009) for _ in range(35)]  # post-stable
+    )
+    pre, post, total, transitional_n = analyze(
+        _RoConn(rows),
+        "SPY",
+        window_days=30,
+        deploy_cutoff=_CUTOFF,
+        flip_min=0.6,
+        not_near_pct=0.006,
+        stable_since=_STABLE,
+    )
+    assert total == 100
+    assert pre is not None and pre.n == 40
+    assert transitional_n == 25
+    assert post is not None and post.n == 35  # transitional NOT in post
+    # The huge 0.05 transitional values must not pollute post percentiles.
+    assert post.p95 == pytest.approx(0.009)
+
+
+def test_stable_since_none_matches_single_split():
+    rows = [(_ts(14), 0.004) for _ in range(40)] + [(_ts(18, 18), 0.009) for _ in range(35)]
+    a = analyze(
+        _RoConn(rows),
+        "SPY",
+        window_days=30,
+        deploy_cutoff=_CUTOFF,
+        flip_min=0.6,
+        not_near_pct=0.006,
+    )
+    assert a[3] == 0 and a[1] is not None and a[1].n == 35
+
+
+@pytest.mark.parametrize("blank", [None, "", "   "])
+def test_parse_optional_instant_blank_is_none(blank):
+    assert _parse_optional_instant(blank) is None
+
+
+def test_parse_optional_instant_parses_and_fails_closed():
+    assert _parse_optional_instant("2026-05-18") == _STABLE
+    with pytest.raises(ValueError):
+        _parse_optional_instant("not-a-date")
+
+
+def test_main_rejects_stable_since_before_deploy_cutoff():
+    """Guard fires before any DB work (parser.error -> SystemExit)."""
+    with pytest.raises(SystemExit):
+        main(["--stable-since", "2020-01-01"])
 
 
 # --- distribution + firing-rate math ------------------------------------------
