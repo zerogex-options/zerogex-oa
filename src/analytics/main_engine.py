@@ -31,6 +31,8 @@ from src.config import (
     ANALYTICS_FLOW_CACHE_REFRESH_ENABLED,
     GAMMA_PROFILE_SPAN_PCT,
     GAMMA_PROFILE_STEP_PCT,
+    GAMMA_PROFILE_DTE_WEIGHTING,
+    GAMMA_PROFILE_DTE_REF_DAYS,
 )
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.analytics.walls import compute_call_put_walls
@@ -648,6 +650,34 @@ class AnalyticsEngine:
         gamma = np.where(S_arr > 0.0, gamma, 0.0)
         return gamma if is_array else float(gamma)
 
+    def _dte_profile_weight(self, T: float) -> float:
+        """DTE weight for a contract's spot-shift gamma-profile contribution.
+
+        ``min(1, DTE / GAMMA_PROFILE_DTE_REF_DAYS)`` with ``DTE = T·365``
+        (``T`` in calendar years, the same unit
+        :meth:`_calculate_time_to_expiration` returns).
+
+        The gamma flip is a *multi-day* regime level, so each expiry is
+        weighted by the fraction of the reference horizon over which the
+        contract still exists: a same-day 0DTE is gone by today's close
+        and is ~irrelevant to where the gamma regime sits over the next
+        several days, whereas anything living at least the full reference
+        horizon counts in full (weight saturates at 1.0 — longer-dated
+        regime structure, and all behavior away from near-dated, is
+        unchanged).  This horizon-occupancy ramp also incidentally tames
+        Black-Scholes' ``1/√T`` near-expiry gamma spike (the net 0DTE
+        contribution scales like ``√DTE → 0``), so a same-day wall can no
+        longer pin the regime flip to an irrelevant same-day strike.
+
+        Returns 1.0 unconditionally when DTE weighting is disabled, so
+        the profile is byte-for-byte the prior behavior.
+        """
+        if not GAMMA_PROFILE_DTE_WEIGHTING:
+            return 1.0
+        if T <= 0.0 or GAMMA_PROFILE_DTE_REF_DAYS <= 0.0:
+            return 0.0
+        return min(1.0, (T * 365.0) / GAMMA_PROFILE_DTE_REF_DAYS)
+
     def _calculate_gex_by_strike(
         self, options: List[Dict[str, Any]], underlying_price: float, timestamp: datetime
     ) -> List[Dict[str, Any]]:
@@ -928,6 +958,18 @@ class AnalyticsEngine:
         regardless of how far it sits from spot / the ingested strike
         band.  Returns ``[]`` when no profile can be built (no spot / no
         usable contracts).
+
+        Each contract's contribution is additionally scaled by
+        :meth:`_dte_profile_weight` (``min(1, DTE / DTE_REF)`` when
+        ``GAMMA_PROFILE_DTE_WEIGHTING`` is on): a linear horizon-occupancy
+        ramp that weights each expiry by the fraction of the multi-day
+        reference horizon over which the contract still exists, so an
+        OPEX-day 0DTE wall (gone by today's close, and carrying a colossal
+        re-greeked ``1/√T`` gamma spike) can no longer pin the
+        regime-defining flip to a same-day strike, while anything living
+        at least the full reference horizon is unweighted (1.0).  Because
+        the weight is applied here, in the one shared profile, the flip
+        and net-GEX-at-spot stay sign-consistent.
         """
         if spot <= 0 or not options:
             return []
@@ -962,7 +1004,12 @@ class AnalyticsEngine:
             # (+), long puts (−) — matches _calculate_gex_by_strike.
             dollar_gamma = gamma * oi * 100.0 * grid * grid * 0.01
             sign = 1.0 if opt["option_type"] == "C" else -1.0
-            total += sign * dollar_gamma
+            # Horizon-occupancy ramp min(1, DTE/ref): down-weights
+            # near-dated so a same-day 0DTE wall (and its 1/√T gamma
+            # spike) can't pin the multi-day regime flip (1.0 for
+            # DTE≥ref / weighting off).
+            dte_w = self._dte_profile_weight(T)
+            total += sign * dte_w * dollar_gamma
             used = True
 
         if not used:

@@ -186,6 +186,87 @@ def test_net_gex_at_spot_interpolates_and_clamps_generic_curve():
     assert engine._net_gex_at_spot(profile, 120.0) == 6.0  # clamp high edge
 
 
+def test_dte_profile_weight_is_horizon_occupancy_ramp(monkeypatch):
+    """min(1, DTE / ref_days): a linear horizon-occupancy ramp — the
+    fraction of the reference horizon over which the contract still
+    exists. 1.0 at/beyond the reference horizon, linearly less below it,
+    0 for non-positive DTE, and a hard 1.0 when weighting is disabled."""
+    engine = AnalyticsEngine(underlying="SPY")
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_WEIGHTING", True)
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_REF_DAYS", 5.0)
+    day = 1.0 / 365.0  # one calendar day, in years (T's unit)
+
+    assert engine._dte_profile_weight(5.0 * day) == 1.0  # exactly at ref
+    assert engine._dte_profile_weight(30.0 * day) == 1.0  # saturates beyond ref
+    assert abs(engine._dte_profile_weight(1.0 * day) - 0.2) < 1e-12  # 1/5
+    assert abs(engine._dte_profile_weight(2.5 * day) - 0.5) < 1e-12  # 2.5/5
+    assert engine._dte_profile_weight(0.0) == 0.0
+    assert engine._dte_profile_weight(-1.0) == 0.0
+
+    # Linear in DTE below ref => the weight halves when DTE halves.
+    assert (
+        abs(engine._dte_profile_weight(1.0 * day) - 2.0 * engine._dte_profile_weight(0.5 * day))
+        < 1e-12
+    )
+
+    # Disabled => identically 1.0 regardless of (even degenerate) DTE.
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_WEIGHTING", False)
+    assert engine._dte_profile_weight(1e-9) == 1.0
+    assert engine._dte_profile_weight(0.0) == 1.0
+    assert engine._dte_profile_weight(10.0) == 1.0
+
+
+def test_dte_weighting_unpins_flip_from_0dte_wall(monkeypatch):
+    """0DTE-heavy book: a same-day put wall just below spot, plus the
+    real multi-day regime structure (far-dated put/call mass) whose
+    zero-gamma level sits well below spot (~82 here).
+
+    The spot-shift rewrite alone does NOT tame this — re-greeking *adds*
+    a razor 1/√T gamma spike at the same-day strike, so with DTE
+    weighting off the nearest-to-spot crossing is pinned to the 0DTE
+    wall (~99), the original 751.82-vs-spot pathology. With weighting on
+    (the production default) the same-day expiry is horizon-occupancy
+    down-weighted out of contention and the flip resolves to the
+    multi-day regime level (~82) instead — the two differ by ~17pts."""
+    engine = AnalyticsEngine(underlying="SPY")
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_WEIGHTING", True)
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_REF_DAYS", 5.0)
+
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)  # ~5h to the 0DTE close
+    zero_dte = ts.date()
+    far = datetime(2026, 10, 16).date()  # ~5 months out -> weight 1.0
+    spot = 100.0
+
+    options = [
+        # Multi-day regime structure (heavy far-dated put mass low, even
+        # heavier call mass above) -> zero-gamma level sits down at ~82.
+        _opt(80.0, "P", oi=180000, iv=0.30, exp=far),
+        _opt(110.0, "C", oi=420000, iv=0.30, exp=far),
+        # Same-day 0DTE put wall just below spot — irrelevant to any
+        # multi-day horizon, but with a colossal re-greeked 1/√T spike.
+        _opt(98.0, "P", oi=50000, iv=0.20, exp=zero_dte),
+    ]
+
+    weighted_flip = engine._calculate_gamma_flip_point(
+        engine._gamma_exposure_profile(options, spot, ts), spot
+    )
+
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_WEIGHTING", False)
+    unweighted_flip = engine._calculate_gamma_flip_point(
+        engine._gamma_exposure_profile(options, spot, ts), spot
+    )
+
+    assert weighted_flip is not None and unweighted_flip is not None
+    # Weighting off: the 0DTE wall's 1/√T spike pins the flip to itself.
+    assert abs(unweighted_flip - 98.0) <= 2.5
+    # Weighting on: the flip is the multi-day regime level, well clear of
+    # the same-day wall (down at ~82 here).
+    assert weighted_flip <= 90.0
+    assert abs(weighted_flip - 98.0) >= 6.0
+    # ...and the two readings differ materially (>10% of spot here).
+    assert abs(weighted_flip - unweighted_flip) >= 0.10 * spot
+
+
 def test_store_gex_summary_carries_forward_previous_gamma_flip_when_missing():
     engine = AnalyticsEngine(underlying="SPY")
     cursor = MagicMock()

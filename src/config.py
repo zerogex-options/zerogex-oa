@@ -135,6 +135,22 @@ GEX_HEATMAP_STRIKE_BAND_PCT = _getenv_float("GEX_HEATMAP_STRIKE_BAND_PCT", 0.08,
 GAMMA_PROFILE_SPAN_PCT = _getenv_float("GAMMA_PROFILE_SPAN_PCT", 0.20, min=0.02, max=1.0)
 GAMMA_PROFILE_STEP_PCT = _getenv_float("GAMMA_PROFILE_STEP_PCT", 0.0025, min=0.0001, max=0.05)
 
+# The gamma flip is a *multi-day* regime level, but a same-day 0DTE wall
+# carries a colossal re-greeked Black-Scholes gamma spike (ATM gamma ∝
+# 1/√T) that can pin it to a strike irrelevant for any multi-day horizon
+# (the original 751.82-vs-spot pathology).  When enabled, each contract's
+# contribution to the spot-shift profile is scaled by a linear
+# horizon-occupancy ramp min(1, DTE / DTE_REF_DAYS): each expiry is
+# weighted by the fraction of the reference horizon over which the
+# contract still exists, so a 0DTE (gone by today's close) is
+# down-weighted out of contention for the regime level, while contracts
+# living at least the full reference horizon are unaffected (weight 1.0)
+# — longer-dated regime structure and all behavior away from near-dated
+# are unchanged.  Applied inside the single shared profile, so the flip
+# and net-GEX-at-spot stay sign-consistent by construction.
+GAMMA_PROFILE_DTE_WEIGHTING = _getenv_bool("GAMMA_PROFILE_DTE_WEIGHTING", True)
+GAMMA_PROFILE_DTE_REF_DAYS = _getenv_float("GAMMA_PROFILE_DTE_REF_DAYS", 5.0, min=0.5, max=60.0)
+
 # Batch Sizes
 QUOTE_BATCH_SIZE = int(os.getenv("QUOTE_BATCH_SIZE", "100"))  # TradeStation supports up to 500
 OPTION_BATCH_SIZE = int(os.getenv("OPTION_BATCH_SIZE", "100"))
