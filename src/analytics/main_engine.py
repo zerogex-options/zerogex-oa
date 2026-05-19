@@ -987,15 +987,13 @@ class AnalyticsEngine:
         With multiple crossings on a lumpy book, keep the one nearest spot
         (the actionable level / established tie-break here).
 
-        If the profile is one-signed across the entire ±span grid (no
-        crossing) the zero-gamma level sits beyond the grid, so the flip
-        is clamped to the grid boundary on that side (low edge when the
-        profile is all-positive — dealers long gamma even far below spot;
-        high edge when all-negative) rather than returned as ``None``.
-        Clamping keeps the persisted flip from being silently frozen by
-        the carry-forward, and matches the endpoint-clamp
-        :meth:`_net_gex_at_spot` applies to the same curve so the two stay
-        sign-consistent.
+        Returns ``None`` when the profile is one-signed across the entire
+        ±span grid (no crossing).  For a liquid chain that effectively only
+        happens when the usable (gamma-non-null) snapshot is degraded /
+        one-sided — a stale-feed / after-hours artifact — so the caller
+        treats ``None`` as *flip unresolved* (persist NULL + WARN) rather
+        than fabricating a grid-edge value or letting the carry-forward
+        silently re-freeze a stale level.
         """
         if not profile:
             return None
@@ -1018,27 +1016,13 @@ class AnalyticsEngine:
             elif c1 * c2 < 0.0:
                 _consider(s1 + (s2 - s1) * (-c1) / (c2 - c1))
         # Profile ends exactly at zero => flip at the top of the grid.
-        first_s, _first_v = profile[0]
         last_s, last_v = profile[-1]
         if last_v == 0.0:
             _consider(last_s)
 
-        clamped = False
-        if best_flip is None:
-            # No interior zero and no sign change anywhere on the grid =>
-            # the profile is strictly one-signed across ±span, so the
-            # zero-gamma level lies beyond the grid. Clamp to the boundary
-            # on that side (all-positive => crossing is at/below the low
-            # edge; all-negative => at/above the high edge) instead of
-            # returning None and letting the carry-forward freeze a stale
-            # level.
-            best_flip = first_s if last_v > 0.0 else last_s
-            clamped = True
-
         if best_flip is not None:
             logger.info(
-                "Gamma flip point (spot-shift zero-gamma%s): $%.2f (nearest to spot $%.2f)",
-                " — clamped to ±span grid boundary" if clamped else "",
+                "Gamma flip point (spot-shift zero-gamma): $%.2f (nearest to spot $%.2f)",
                 best_flip,
                 underlying_price,
             )
@@ -1123,6 +1107,36 @@ class AnalyticsEngine:
         gamma_flip_point = self._calculate_gamma_flip_point(gamma_profile, underlying_price)
         net_gex_at_spot = self._net_gex_at_spot(gamma_profile, underlying_price)
 
+        # No crossing across the whole ±span grid. For a liquid chain this
+        # is not a real "flip is far away" — it means the usable
+        # (gamma-non-null) snapshot was degraded/one-sided this cycle
+        # (stale-feed / after-hours: ingestion nulls greeks, the snapshot
+        # query drops gamma-NULL rows, the residual is one-signed). Mark
+        # the flip unresolved so it persists NULL (a visible gap) and the
+        # carry-forward does NOT silently re-freeze a stale level, and WARN
+        # so the degradation is visible in analytics-health rather than
+        # inferred from SQL.
+        gamma_flip_unresolved = gamma_flip_point is None
+        if gamma_flip_unresolved:
+            usable = sum(
+                1
+                for o in options
+                if (o.get("implied_volatility") or 0) > 0
+                and (o.get("open_interest") or 0) > 0
+                and (o.get("strike") or 0) > 0
+            )
+            logger.warning(
+                "Gamma flip UNRESOLVED for %s @ %s: dealer gamma profile one-signed "
+                "across spot ±%.0f%% (%d/%d usable contracts, %d profile points) — "
+                "degraded/one-sided chain; persisting NULL (no clamp, no carry-forward)",
+                self.db_symbol,
+                timestamp,
+                GAMMA_PROFILE_SPAN_PCT * 100.0,
+                usable,
+                len(options),
+                len(gamma_profile),
+            )
+
         # Calculate max pain per expiration, then pick the front month
         # (nearest non-expired settlement) for the headline scalar.  The
         # full per-expiration dict is persisted in gex_summary.max_pain_by_expiration
@@ -1188,6 +1202,7 @@ class AnalyticsEngine:
             "max_gamma_strike": max_gamma_strike["strike"],
             "max_gamma_value": max_gamma_strike["net_gex"],
             "gamma_flip_point": gamma_flip_point,
+            "gamma_flip_unresolved": gamma_flip_unresolved,
             "flip_distance": flip_distance,
             "local_gex": local_gex,
             "convexity_risk": convexity_risk,
@@ -1302,7 +1317,13 @@ class AnalyticsEngine:
         by-strike write.
         """
         gamma_flip_point = summary.get("gamma_flip_point")
-        if gamma_flip_point is None:
+        # When the flip is explicitly unresolved (degraded/one-sided chain
+        # — see _calculate_gex_summary) persist NULL: the carry-forward
+        # exists to bridge a transient missing value, NOT to mask a
+        # degraded snapshot as a live level (that was the original
+        # flat-flip bug). A bare None with no unresolved flag still
+        # carries forward (back-compatible with any non-degraded caller).
+        if gamma_flip_point is None and not summary.get("gamma_flip_unresolved"):
             cursor.execute(
                 """
                 SELECT gamma_flip_point
