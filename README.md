@@ -547,6 +547,12 @@ make analytics-health
      hypothetical spot prices (spot ± `GAMMA_PROFILE_SPAN_PCT`, default
      ±20%) and summing dealer dollar gamma at each — **not** a cumulative
      sum of the static snapshot gamma by strike
+   - Each contract's contribution is **DTE-weighted** by a
+     horizon-occupancy ramp (`min(1, DTE / GAMMA_PROFILE_DTE_REF_DAYS)`,
+     default 5 days, on by default via `GAMMA_PROFILE_DTE_WEIGHTING`) so a
+     same-day 0DTE / OPEX wall can't pin the multi-day regime flip to an
+     irrelevant same-day strike; contracts at/beyond the reference horizon
+     are unweighted (1.0)
    - The flip is the price where that spot-shift dealer gamma profile
      crosses zero (crossing nearest spot kept)
    - Above: Dealers are long gamma (stabilizing market)
