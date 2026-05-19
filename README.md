@@ -541,9 +541,19 @@ make analytics-health
    - Put GEX (negative for dealers who are long)
    - Net GEX (call - put from dealer perspective)
 
-2. **Gamma Flip Point** - Strike where net GEX crosses zero
+2. **Gamma Flip Point** - The "zero gamma" price level (SpotGamma /
+   SqueezeMetrics convention)
+   - Built by re-pricing every option's gamma across a grid of
+     hypothetical spot prices (spot ± `GAMMA_PROFILE_SPAN_PCT`, default
+     ±20%) and summing dealer dollar gamma at each — **not** a cumulative
+     sum of the static snapshot gamma by strike
+   - The flip is the price where that spot-shift dealer gamma profile
+     crosses zero (crossing nearest spot kept)
    - Above: Dealers are long gamma (stabilizing market)
    - Below: Dealers are short gamma (destabilizing market)
+   - Reported as **unresolved (NULL)** with a health warning when the
+     chain is degraded/one-sided (e.g. stale feed / after-hours), rather
+     than fabricating an edge value or freezing a stale level
 
 3. **Max Pain** - Strike where option holders lose most value
    - Computed **per expiration** (the strike that minimizes total
