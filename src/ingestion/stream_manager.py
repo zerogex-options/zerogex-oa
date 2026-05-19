@@ -1436,7 +1436,19 @@ class StreamManager:
                                 )
                                 _last_forced_restart_mono = now_mono
                     else:
+                        # Feed legitimately not expected (overnight /
+                        # weekend / holiday for a cash index). Reset the
+                        # staleness clock so the NEXT expected session
+                        # measures from its own open — otherwise the first
+                        # expectant cycle compares against last session's
+                        # final bar and fires a spurious ~10h "STALE" (and
+                        # one needless reconnect) at 09:30 before the feed
+                        # has had a chance to deliver the day's first bar.
                         _consecutive_empty_underlying = 0
+                        _last_underlying_bar_mono = None
+                        _stale_warned = False
+                        _underlying_restart_attempts = 0
+                        _underlying_restart_backed_off = False
 
                     # Drain only option contracts that changed since last cycle.
                     changed = self._accumulator.drain()
