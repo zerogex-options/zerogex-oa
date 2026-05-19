@@ -32,6 +32,7 @@ from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
 from src.validation import (
     bucket_timestamp,
+    get_market_session,
     is_engine_run_window,
     seconds_until_engine_run_window,
     underlying_feed_expected,
@@ -53,6 +54,22 @@ logger = get_logger(__name__)
 
 # Eastern Time timezone
 ET = pytz.timezone("US/Eastern")
+
+
+def _greeks_max_age_for_session(session: str, base: float, extended: float) -> float:
+    """Max tolerated underlying-price age (seconds) for Greeks in *session*.
+
+    The regular cash session has dense ~60s underlying bars; in
+    pre/after-hours an equity/ETF trades thinly and its 1-minute bars are
+    legitimately minutes apart (cash indices don't print extended hours and
+    are excluded upstream by ``underlying_feed_expected``), so the tight
+    regular-session gate would refuse Greeks for the entire extended
+    session. Use the wider gate outside the regular session.
+    """
+    if session in ("pre-market", "after-hours"):
+        return extended
+    return base
+
 
 # Marks a buffered snapshot whose cumulative volume has already been
 # classified and persisted for its bucket (a retained / carried-over seed).
@@ -156,6 +173,15 @@ class IngestionEngine:
         self.latest_underlying_timestamp: Optional[datetime] = None
         self.greeks_max_underlying_age_seconds = float(
             os.getenv("GREEKS_MAX_UNDERLYING_AGE_SECONDS", "90")
+        )
+        # Pre/after-hours an equity/ETF underlying trades thinly and its
+        # 1-minute bars are legitimately minutes apart, so the tight
+        # regular-session gate above would refuse Greeks for the whole
+        # extended session. Defaults to the stream watchdog's extended
+        # STALE-warn threshold so the two mechanisms stay coherent: Greeks
+        # are refused only once the feed itself is considered stale.
+        self.greeks_max_underlying_age_seconds_extended = float(
+            os.getenv("GREEKS_MAX_UNDERLYING_AGE_SECONDS_EXTENDED", "300")
         )
         # Counter so operators can see how often staleness rejects fire.
         self.greeks_stale_underlying_rejects = 0
@@ -411,9 +437,13 @@ class IngestionEngine:
 
         if self.greeks_calculator and self.latest_underlying_price:
             # Refuse to compute Greeks against a stale underlying price.
-            # The threshold is configurable; 90s is conservative enough to
-            # let pre-market low-frequency underlying bars through while
-            # still rejecting outright stale prices (halts, feed gaps).
+            # The age gate is session-aware: a tight regular-session
+            # threshold (dense ~60s bars) plus a wider extended-hours one,
+            # since pre/after-hours an equity/ETF underlying trades thinly
+            # and its 1-minute bars are legitimately minutes apart — the
+            # regular gate would otherwise refuse Greeks for the whole
+            # extended session. Both still reject outright stale prices
+            # (halts, feed gaps).
             if self.latest_underlying_timestamp is not None:
                 option_ts = data.get("timestamp") or datetime.now(ET)
                 try:
@@ -423,7 +453,13 @@ class IngestionEngine:
                     # rather than rejecting; the underlying writer just
                     # set the timestamp, this can only happen mid-test.
                     age = 0.0
-                if age > self.greeks_max_underlying_age_seconds:
+                session = get_market_session(option_ts)
+                max_age = _greeks_max_age_for_session(
+                    session,
+                    self.greeks_max_underlying_age_seconds,
+                    self.greeks_max_underlying_age_seconds_extended,
+                )
+                if age > max_age:
                     self.greeks_stale_underlying_rejects += 1
                     # Staleness is only a real problem while the feed
                     # should be delivering bars — its SESSION_TEMPLATE
@@ -441,7 +477,7 @@ class IngestionEngine:
                                 "(threshold %.0fs) while the feed should be live. "
                                 "Total rejects this run: %d",
                                 age,
-                                self.greeks_max_underlying_age_seconds,
+                                max_age,
                                 self.greeks_stale_underlying_rejects,
                             )
                     elif self.greeks_stale_underlying_rejects % 5000 == 1:
@@ -451,7 +487,7 @@ class IngestionEngine:
                             "window, this is expected. "
                             "Total rejects this run: %d",
                             age,
-                            self.greeks_max_underlying_age_seconds,
+                            max_age,
                             self.greeks_stale_underlying_rejects,
                         )
                     data["delta"] = data["gamma"] = data["theta"] = data["vega"] = None

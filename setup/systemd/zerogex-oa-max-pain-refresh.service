@@ -1,0 +1,48 @@
+[Unit]
+Description=ZeroGEX daily refresh of the max-pain OI snapshot
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target zerogex-oa-normalizer-refresh.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+# Environment
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Recompute max_pain_oi_snapshot / _expiration for the configured symbols.
+# Max pain is a daily figure (OI only changes at settlement), so this runs
+# ONCE per day, pre-market, while the cash session is closed and the box is
+# idle.  It replaces both the old 5-min in-process background loop and the
+# inline on-request recompute, whose heavy option_chains scans during the
+# session were starving the Analytics engine.  /api/max-pain/current is now
+# a pure cache read of whatever this job last wrote.
+ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa max-pain-refresh
+
+# Atomic post-refresh validation: confirm each symbol's snapshot caught up
+# to the latest option_chains trading date.  Catches the silent failure
+# where the refresh exits 0 but wrote nothing (e.g. every symbol errored).
+# Non-zero marks the unit failed -> surfaces in `systemctl --failed`.
+ExecStartPost=/usr/bin/make -C /home/ubuntu/zerogex-oa max-pain-refresh-healthcheck
+
+# The recompute is the heavy part: up to MAX_PAIN_BACKGROUND_REFRESH_
+# STATEMENT_TIMEOUT_MS (~300s) per symbol, isolated per-symbol.  Cap the
+# whole unit at the same 1800s ceiling db-maintain uses so a wedged DB
+# can't sit indefinitely; off-hours this has ample room for 3 symbols.
+TimeoutStartSec=1800
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-max-pain-refresh

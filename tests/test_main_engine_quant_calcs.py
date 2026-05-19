@@ -2,10 +2,25 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
+from scipy import stats
 
 from src.analytics import main_engine
 from src.analytics.main_engine import AnalyticsEngine
+
+
+def _opt(strike, otype, *, oi=1000, iv=0.20, exp=None, gamma=0.0, volume=0):
+    """Minimal option-chain row for the spot-shift gamma profile."""
+    return {
+        "strike": strike,
+        "option_type": otype,
+        "open_interest": oi,
+        "implied_volatility": iv,
+        "expiration": exp,
+        "gamma": gamma,
+        "volume": volume,
+    }
 
 
 def test_gex_by_strike_weights_gamma_by_open_interest():
@@ -72,86 +87,104 @@ def test_max_pain_minimizes_total_intrinsic_payout():
     assert engine._calculate_max_pain(options) == 100.0
 
 
-def test_gamma_flip_uses_cumulative_zero_crossing():
-    """Zero-gamma = where the CUMULATIVE GEX (low→high) crosses zero
-    (SpotGamma/SqueezeMetrics), not the per-strike adjacent sign flip."""
+def test_bs_gamma_matches_closed_form_and_degenerates():
     engine = AnalyticsEngine(underlying="SPY")
-    gex = [
-        {"strike": 100.0, "net_gex": -10.0},  # cum -10
-        {"strike": 105.0, "net_gex": -4.0},  # cum -14
-        {"strike": 110.0, "net_gex": 20.0},  # cum  +6
-    ]
-    # Cumulative straddles zero between 105 (-14) and 110 (+6):
-    #   flip = 105 + 5 * 14 / (6 - (-14)) = 105 + 5*0.7 = 108.5
-    flip = engine._calculate_gamma_flip_point(gex, underlying_price=107.0)
-    assert abs(flip - 108.5) < 1e-9
-    # Per-strike (old) convention would have flipped at 105.83 between
-    # the only adjacent net-GEX sign change (105:-4 -> 110:+20).
-    assert abs(flip - 105.833333) > 0.1
+    S, K, T, r, sigma = 100.0, 100.0, 0.5, 0.05, 0.2
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    expected = stats.norm.pdf(d1) / (S * sigma * np.sqrt(T))
+    assert abs(engine._calculate_bs_gamma(S, K, T, r, sigma) - expected) < 1e-12
+
+    # Vectorised over a price grid == element-wise scalar calls.
+    grid = np.array([80.0, 100.0, 130.0])
+    arr = engine._calculate_bs_gamma(grid, K, T, r, sigma)
+    assert isinstance(arr, np.ndarray)
+    for s, g in zip(grid, arr):
+        assert abs(float(g) - engine._calculate_bs_gamma(float(s), K, T, r, sigma)) < 1e-12
+    assert arr[1] > arr[0] and arr[1] > arr[2]  # gamma peaks near ATM
+
+    # Degenerate inputs => 0 / zeros, never NaN.
+    assert engine._calculate_bs_gamma(100.0, 100.0, 0.0, r, sigma) == 0.0
+    assert engine._calculate_bs_gamma(100.0, 100.0, T, r, 0.0) == 0.0
+    assert list(engine._calculate_bs_gamma(grid, K, -1.0, r, sigma)) == [0.0, 0.0, 0.0]
 
 
-def test_gamma_flip_returns_top_strike_when_book_nets_flat():
-    """Cumulative ending exactly at zero => flip at the top strike."""
+def test_gamma_profile_resolves_interior_flip_and_is_sign_consistent():
+    """Put mass below, call mass above => the spot-shift profile is short
+    gamma near the puts and long near the calls, so it has a genuine
+    interior zero crossing (the old cumulative-by-strike curve, given only
+    these strikes, was one-signed => None => carry-forward freeze)."""
     engine = AnalyticsEngine(underlying="SPY")
-    gex = [
-        {"strike": 100.0, "net_gex": -10.0},  # cum -10
-        {"strike": 110.0, "net_gex": 10.0},  # cum   0
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
+    exp = datetime(2026, 9, 18).date()
+    spot = 100.0
+    options = [
+        _opt(92.0, "P", oi=8000, iv=0.30, exp=exp),
+        _opt(112.0, "C", oi=8000, iv=0.30, exp=exp),
     ]
-    flip = engine._calculate_gamma_flip_point(gex, underlying_price=105.0)
-    assert flip == 110.0
+    profile = engine._gamma_exposure_profile(options, spot, ts)
+    assert profile
+    xs = [s for s, _ in profile]
+    assert xs == sorted(xs)
+    assert xs[0] <= spot * 0.80 + 1e-6 and xs[-1] >= spot * 1.20 - 1e-6
+    # Negative near the put strike, positive near the call strike =>
+    # exactly one interior crossing.
+    assert profile[0][1] < 0 < profile[-1][1]
+    flip = engine._calculate_gamma_flip_point(profile, spot)
+    assert flip is not None
+    assert 92.0 < flip < 112.0  # between the put and the call
+
+    # The core invariant (independent of which side spot lands on): the
+    # profile is short gamma strictly below the flip and long strictly
+    # above it, and net_gex_at_spot's sign tracks the spot-vs-flip side.
+    d = spot * 0.01
+    assert engine._net_gex_at_spot(profile, flip - d) < 0
+    assert engine._net_gex_at_spot(profile, flip + d) > 0
+    assert (engine._net_gex_at_spot(profile, spot) < 0) == (spot < flip)
 
 
-def test_gamma_flip_none_when_cumulative_never_crosses():
+def test_gamma_profile_clamps_when_one_signed_across_grid():
+    """A pure long-call book is dealer-long-gamma at every price on the
+    grid (no crossing) => clamp to the low grid edge instead of None, so
+    the flip tracks rather than being frozen by the carry-forward."""
     engine = AnalyticsEngine(underlying="SPY")
-    gex = [
-        {"strike": 100.0, "net_gex": 5.0},  # cum 5
-        {"strike": 110.0, "net_gex": 7.0},  # cum 12 (never <= 0)
-    ]
-    assert engine._calculate_gamma_flip_point(gex, underlying_price=105.0) is None
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
+    exp = datetime(2026, 9, 18).date()
+    spot = 100.0
+    profile = engine._gamma_exposure_profile(
+        [_opt(100.0, "C", oi=5000, iv=0.25, exp=exp)], spot, ts
+    )
+    assert all(v > 0 for _, v in profile)  # long gamma everywhere
+    flip = engine._calculate_gamma_flip_point(profile, spot)
+    assert flip == profile[0][0]  # clamped to the low grid edge
+    assert flip < spot  # tracks the grid, not a frozen absolute level
 
 
-def test_net_gex_at_spot_interpolates_same_curve_as_flip():
-    """net_gex_at_spot samples the SAME cumulative curve the flip uses,
-    piecewise-linearly, at the current spot."""
+def test_gamma_profile_none_when_no_usable_contracts():
     engine = AnalyticsEngine(underlying="SPY")
-    gex = [
-        {"strike": 100.0, "net_gex": -10.0},  # cum -10
-        {"strike": 105.0, "net_gex": -4.0},  # cum -14
-        {"strike": 110.0, "net_gex": 20.0},  # cum  +6
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
+    exp = datetime(2026, 9, 18).date()
+    assert engine._gamma_exposure_profile([], 100.0, ts) == []
+    assert engine._gamma_exposure_profile([_opt(100.0, "C", exp=exp)], 0.0, ts) == []
+    # σ<=0 and OI<=0 contracts are skipped => no usable contracts.
+    bad = [
+        _opt(100.0, "C", oi=0, exp=exp),
+        _opt(100.0, "P", iv=0.0, exp=exp),
     ]
-    curve = engine._cumulative_net_gex_curve(gex)
-    # Between 105 (-14) and 110 (+6): -14 + 20 * (107-105)/(110-105) = -6.
-    assert abs(engine._net_gex_at_spot(curve, 107.0) - (-6.0)) < 1e-9
-    # Between 105 (-14) and 110 (+6): -14 + 20 * (109-105)/5 = +2.
-    assert abs(engine._net_gex_at_spot(curve, 109.0) - 2.0) < 1e-9
+    assert engine._gamma_exposure_profile(bad, 100.0, ts) == []
+    assert engine._calculate_gamma_flip_point([], 100.0) is None
+    assert engine._net_gex_at_spot([], 100.0) is None
 
 
-def test_net_gex_at_spot_sign_agrees_with_flip_side():
-    """The core Fix-#1 guarantee: net_gex_at_spot is negative when spot is
-    below the flip and positive when above — so the headline figure can no
-    longer contradict the spot-vs-flip regime."""
+def test_net_gex_at_spot_interpolates_and_clamps_generic_curve():
+    """_net_gex_at_spot piecewise-linearly samples the profile and clamps
+    to its endpoints outside the grid."""
     engine = AnalyticsEngine(underlying="SPY")
-    gex = [
-        {"strike": 100.0, "net_gex": -10.0},
-        {"strike": 105.0, "net_gex": -4.0},
-        {"strike": 110.0, "net_gex": 20.0},
-    ]
-    curve = engine._cumulative_net_gex_curve(gex)
-    flip = engine._calculate_gamma_flip_point(gex, underlying_price=107.0)
-    assert engine._net_gex_at_spot(curve, flip - 1.0) < 0  # below flip => short gamma
-    assert engine._net_gex_at_spot(curve, flip + 1.0) > 0  # above flip => long gamma
-
-
-def test_net_gex_at_spot_clamps_outside_strike_range():
-    engine = AnalyticsEngine(underlying="SPY")
-    gex = [
-        {"strike": 100.0, "net_gex": -10.0},  # cum -10 (first)
-        {"strike": 110.0, "net_gex": 20.0},  # cum +10 (last == total)
-    ]
-    curve = engine._cumulative_net_gex_curve(gex)
-    assert engine._net_gex_at_spot(curve, 90.0) == -10.0  # clamp to first
-    assert engine._net_gex_at_spot(curve, 120.0) == 10.0  # clamp to last
-    assert engine._net_gex_at_spot([], 100.0) is None  # no curve
+    profile = [(100.0, -14.0), (105.0, -14.0), (110.0, 6.0)]
+    # Between 105 (-14) and 110 (+6): -14 + 20*(107-105)/5 = -6.
+    assert abs(engine._net_gex_at_spot(profile, 107.0) - (-6.0)) < 1e-9
+    assert abs(engine._net_gex_at_spot(profile, 109.0) - 2.0) < 1e-9
+    assert engine._net_gex_at_spot(profile, 90.0) == -14.0  # clamp low edge
+    assert engine._net_gex_at_spot(profile, 120.0) == 6.0  # clamp high edge
 
 
 def test_store_gex_summary_carries_forward_previous_gamma_flip_when_missing():
@@ -244,16 +277,13 @@ def test_gex_summary_includes_flip_distance_local_gex_and_convexity():
     engine = AnalyticsEngine(underlying="SPY")
     ts = datetime(2026, 4, 21, 14, 30, tzinfo=timezone.utc)
     spot = 500.0
+    exp = datetime(2026, 7, 17).date()
+    # Put mass at/below spot, call block above => spot-shift profile is
+    # short-gamma at spot and crosses to long above => a real flip in
+    # (spot, call strike).
     options = [
-        {
-            "strike": 500.0,
-            "expiration": ts.date(),
-            "option_type": "C",
-            "gamma": 0.02,
-            "open_interest": 10,
-            "volume": 1,
-            "implied_volatility": 0.2,
-        }
+        _opt(485.0, "P", oi=6000, iv=0.22, exp=exp, volume=10),
+        _opt(520.0, "C", oi=6000, iv=0.22, exp=exp, volume=12),
     ]
     gex_by_strike = [
         {"strike": 495.0, "net_gex": -2_000_000.0},
@@ -268,21 +298,19 @@ def test_gex_summary_includes_flip_distance_local_gex_and_convexity():
         timestamp=ts,
     )
 
-    # Cumulative GEX: 495 -> -2M, 500 -> +1M (crosses zero here),
-    # 505 -> +2M.  flip = 495 + 5 * 2M / (1M - (-2M)) = 495 + 10/3.
-    expected_flip = 495.0 + 5.0 * (2_000_000.0 / 3_000_000.0)
-    assert abs(summary["gamma_flip_point"] - expected_flip) < 1e-9
-    assert abs(summary["flip_distance"] - (spot - expected_flip) / spot) < 1e-12
-    # ±1% band around spot includes strikes [495, 505].
-    assert summary["local_gex"] == abs(-2_000_000.0) + abs(3_000_000.0) + abs(1_000_000.0)
-    expected_convexity = abs(summary["total_net_gex"]) / abs(summary["flip_distance"])
-    assert summary["convexity_risk"] == expected_convexity
-    # net_gex_at_spot must be PRESENT in the summary dict (regression: it
-    # was computed but never added, so _store_gex_summary persisted NULL)
-    # and equal the cumulative curve sampled at spot. Cumulative at strike
-    # 500 (== spot) is -2M + 3M = +1M.
+    flip = summary["gamma_flip_point"]
+    assert flip is not None
+    assert 485.0 < flip < 520.0  # between the put and the call strike
+    # flip_distance / convexity use the produced flip with the same formulas.
+    assert summary["flip_distance"] == pytest.approx((spot - flip) / spot)
+    # local_gex still comes from gex_by_strike (±1% of spot => [495,505]).
+    assert summary["local_gex"] == 2_000_000.0 + 3_000_000.0 + 1_000_000.0
+    expected_convexity = abs(summary["total_net_gex"]) / max(abs(summary["flip_distance"]), 1e-6)
+    assert summary["convexity_risk"] == pytest.approx(expected_convexity)
+    # net_gex_at_spot is read off the SAME profile, so its sign tracks the
+    # spot-vs-flip regime (short gamma iff spot is below the flip).
     assert "net_gex_at_spot" in summary
-    assert abs(summary["net_gex_at_spot"] - 1_000_000.0) < 1e-6
+    assert (summary["net_gex_at_spot"] < 0) == (spot < flip)
 
 
 def _full_gex_row(ts):

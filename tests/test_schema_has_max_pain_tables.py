@@ -1,13 +1,13 @@
 """Regression: setup/database/schema.sql must create the max-pain snapshot
 tables that the API actually reads from and writes to.
 
-``/api/max-pain/current`` and the background refresh loop
-(``_max_pain_refresh_loop`` -> ``DatabaseManager.refresh_max_pain_snapshots``
+``/api/max-pain/current`` (a pure read) and the scheduled refresh
+(``src.tools.max_pain_refresh`` -> ``DatabaseManager.refresh_max_pain_snapshots``
 -> ``_refresh_max_pain_snapshot``) both target ``max_pain_oi_snapshot`` and
 ``max_pain_oi_snapshot_expiration``.  Those tables were never added to
 schema.sql, so on any DB provisioned from it every request raised
 ``UndefinedTableError`` -> the endpoint logged a continual stream of
-``GET /api/max-pain/current failed`` 500s and the background refresh logged
+``GET /api/max-pain/current failed`` 500s and the refresh logged
 "non-fatal, will retry" forever.
 
 These checks pin the contract so code can never again reference a max-pain

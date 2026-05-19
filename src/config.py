@@ -125,6 +125,16 @@ API_RETRY_BACKOFF = _getenv_float("API_RETRY_BACKOFF", 2.0, min=1.0, max=10.0)  
 # ≈±0.7% of SPX, collapsing the index heatmap into a thin strip.
 GEX_HEATMAP_STRIKE_BAND_PCT = _getenv_float("GEX_HEATMAP_STRIKE_BAND_PCT", 0.08, min=0.005, max=0.5)
 
+# Gamma-flip / net-GEX-at-spot are derived from the SpotGamma-style
+# spot-shift dealer gamma-exposure profile: option gammas are re-priced
+# across a grid of hypothetical spots spanning spot ± SPAN_PCT, stepped
+# by STEP_PCT of spot. The span must comfortably exceed how far the
+# zero-gamma level realistically sits from spot (it is routinely several
+# percent away, well outside the ingested strike band) or the profile is
+# one-signed and the flip clamps to the grid edge instead of resolving.
+GAMMA_PROFILE_SPAN_PCT = _getenv_float("GAMMA_PROFILE_SPAN_PCT", 0.20, min=0.02, max=1.0)
+GAMMA_PROFILE_STEP_PCT = _getenv_float("GAMMA_PROFILE_STEP_PCT", 0.0025, min=0.0001, max=0.05)
+
 # Batch Sizes
 QUOTE_BATCH_SIZE = int(os.getenv("QUOTE_BATCH_SIZE", "100"))  # TradeStation supports up to 500
 OPTION_BATCH_SIZE = int(os.getenv("OPTION_BATCH_SIZE", "100"))
@@ -203,11 +213,21 @@ TS_STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").
 # before the supervisor force-reconnects. Gauged in wall-clock seconds,
 # NOT empty-drain count: the poll loop wakes sub-second on every option
 # tick, so the drain count races far ahead of real time.
-UNDERLYING_STREAM_STALE_WARN_SECONDS = int(
-    os.getenv("UNDERLYING_STREAM_STALE_WARN_SECONDS", "75")
-)
+UNDERLYING_STREAM_STALE_WARN_SECONDS = int(os.getenv("UNDERLYING_STREAM_STALE_WARN_SECONDS", "75"))
 UNDERLYING_STREAM_STALE_RESTART_SECONDS = int(
     os.getenv("UNDERLYING_STREAM_STALE_RESTART_SECONDS", "120")
+)
+# The thresholds above are tuned for the dense regular cash session where a
+# 1-minute bar prints roughly every ~60s. In pre-market / after-hours an
+# equity/ETF (SPY, QQQ — cash indices are clamped out of these windows) trades
+# thinly and a 1-minute bar stream legitimately goes minutes between bars, so
+# the regular-session thresholds produce false STALE/restart storms. Extended
+# hours therefore get their own, much wider thresholds.
+UNDERLYING_STREAM_STALE_WARN_SECONDS_EXTENDED = int(
+    os.getenv("UNDERLYING_STREAM_STALE_WARN_SECONDS_EXTENDED", "300")
+)
+UNDERLYING_STREAM_STALE_RESTART_SECONDS_EXTENDED = int(
+    os.getenv("UNDERLYING_STREAM_STALE_RESTART_SECONDS_EXTENDED", "600")
 )
 UNDERLYING_STREAM_RESTART_COOLDOWN_SECONDS = int(
     os.getenv("UNDERLYING_STREAM_RESTART_COOLDOWN_SECONDS", "90")
@@ -239,43 +259,34 @@ LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS = float(
 ANALYTICS_CACHE_TTL_SECONDS = float(os.getenv("ANALYTICS_CACHE_TTL_SECONDS", "5.0"))
 FLOW_ENDPOINT_CACHE_TTL_SECONDS = float(os.getenv("FLOW_ENDPOINT_CACHE_TTL_SECONDS", "3.0"))
 
-# /api/max-pain/current background refresh.
+# Max-pain daily snapshot refresh (scheduled, off-process).
 #
-# The max-pain snapshot is computed by a heavy multi-CTE recompute over
-# option_chains that exceeds the per-statement timeout (~30s) for our active
-# underlyings during market hours.  Running it inline on every request triggers
-# 500s and (pre-PR-#77) cascaded into pool-reconnect storms.  Instead, refresh
-# the snapshot off the request path on a fixed cadence; the endpoint then
-# becomes a pure cache read of max_pain_oi_snapshot.
-#
-# Symbols not in MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS fall back to the original
-# on-demand recompute (still vulnerable to the 30s timeout, but only if anyone
-# polls for them).
-MAX_PAIN_BACKGROUND_REFRESH_ENABLED = _getenv_bool("MAX_PAIN_BACKGROUND_REFRESH_ENABLED", True)
+# Max pain is a daily figure — open interest only changes at settlement.
+# The recompute is a heavy multi-CTE scan over option_chains; running it
+# every 5 min in-process (old background loop) or inline on the request
+# path (old on-demand fallback) hammered option_chains during the cash
+# session and starved the Analytics engine.  It now runs ONCE per day,
+# pre-market, as src.tools.max_pain_refresh driven by
+# zerogex-oa-max-pain-refresh.timer; /api/max-pain/current is a pure
+# cache read of max_pain_oi_snapshot.  These constants configure that
+# job (env var names kept stable so operator .env files don't churn).
 MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS = [
     s.strip().upper()
     for s in os.getenv("MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS", "SPY,SPX,QQQ").split(",")
     if s.strip()
 ]
-MAX_PAIN_BACKGROUND_REFRESH_INTERVAL_SECONDS = max(
-    30, int(os.getenv("MAX_PAIN_BACKGROUND_REFRESH_INTERVAL_SECONDS", "300"))
-)
 MAX_PAIN_BACKGROUND_REFRESH_STRIKE_LIMIT = max(
     10, min(1000, int(os.getenv("MAX_PAIN_BACKGROUND_REFRESH_STRIKE_LIMIT", "500")))
 )
-# Per-statement timeout override applied to the background refresh only,
-# allowing the heavy recompute to run beyond the pool's default
-# DB_STATEMENT_TIMEOUT_MS (~30s).  Applied via SET LOCAL on the server and
-# forwarded as ``timeout=`` to each asyncpg conn.execute() so the
-# client-side command_timeout doesn't fire first.
-#
-# 300s sized for SPX during cash session, where the active_symbols + LATERAL
-# latest-per-contract + cross-join-over-settlement-candidates CTE chain
-# legitimately exceeds 120s on a 2026-05-14 production observation.  Sized
-# to match MAX_PAIN_BACKGROUND_REFRESH_INTERVAL_SECONDS so a single SPX
-# attempt can use the full inter-cycle budget.  If this still trips,
-# optimize the query (start by dropping MAX_PAIN_BACKGROUND_REFRESH_STRIKE_LIMIT
-# from 500) — don't bump the timeout further.
+# Per-statement timeout for the recompute, applied via SET LOCAL on the
+# server and forwarded as asyncpg ``timeout=`` so the client-side
+# command_timeout doesn't fire first.  300s covers SPX during/after the
+# cash session (the active_symbols + LATERAL latest-per-contract +
+# settlement-candidate CTE chain exceeded 120s on a 2026-05-14 prod
+# observation).  The job runs off-hours with the box idle, so a long
+# budget here no longer contends with anything; if it still trips,
+# optimize the query (start by dropping the strike limit from 500) rather
+# than bumping this further.
 MAX_PAIN_BACKGROUND_REFRESH_STATEMENT_TIMEOUT_MS = max(
     1000, int(os.getenv("MAX_PAIN_BACKGROUND_REFRESH_STATEMENT_TIMEOUT_MS", "300000"))
 )

@@ -94,6 +94,7 @@ TIMER_UNITS=(
     "zerogex-oa-logs-clear"
     "zerogex-oa-normalizer-refresh"
     "zerogex-oa-normalizer-healthcheck"
+    "zerogex-oa-max-pain-refresh"
 )
 
 log "  → Installing timer-based maintenance units..."

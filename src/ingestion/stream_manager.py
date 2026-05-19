@@ -47,6 +47,8 @@ from src.config import (
     API_REQUEST_TIMEOUT,
     UNDERLYING_STREAM_STALE_WARN_SECONDS,
     UNDERLYING_STREAM_STALE_RESTART_SECONDS,
+    UNDERLYING_STREAM_STALE_WARN_SECONDS_EXTENDED,
+    UNDERLYING_STREAM_STALE_RESTART_SECONDS_EXTENDED,
     UNDERLYING_STREAM_RESTART_COOLDOWN_SECONDS,
     UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS,
 )
@@ -119,6 +121,52 @@ def _is_auth_error_payload(payload: Dict[str, Any]) -> bool:
     )
     text = " ".join(fields).lower()
     return any(token in text for token in ("unauthorized", "401", "token", "forbidden"))
+
+
+def _stale_thresholds_for_session(session: str) -> tuple[int, int]:
+    """Return ``(warn_seconds, restart_seconds)`` for a market session.
+
+    The regular cash session has dense ~60s 1-minute bar cadence; in
+    pre/after-hours an equity/ETF trades thinly and bars are legitimately
+    minutes apart (cash indices don't print extended hours at all and are
+    excluded upstream by ``underlying_feed_expected``). Extended hours
+    therefore use much wider thresholds so normal sparse cadence is not
+    misread as a dead feed and force-restarted.
+    """
+    if session in ("pre-market", "after-hours"):
+        return (
+            UNDERLYING_STREAM_STALE_WARN_SECONDS_EXTENDED,
+            UNDERLYING_STREAM_STALE_RESTART_SECONDS_EXTENDED,
+        )
+    return (
+        UNDERLYING_STREAM_STALE_WARN_SECONDS,
+        UNDERLYING_STREAM_STALE_RESTART_SECONDS,
+    )
+
+
+def _bar_timestamp_advanced(bar_ts: Any, last_fresh_ts: Optional[datetime]) -> bool:
+    """True when *bar_ts* is a genuinely newer bar than *last_fresh_ts*.
+
+    A reconnect opens the bar stream with ``barsback=1``, so every forced
+    restart immediately replays one historical bar carrying the same (or
+    older) timestamp. Counting that replay as liveness resets the staleness
+    clock and restart escalation, so a starved feed loops
+    "restart -> replay -> reset -> starve -> restart" forever and never
+    reaches the backed-off upstream-outage state. Only a strictly advancing
+    timestamp counts as fresh.
+
+    Fails safe to ``True`` (non-datetime payload, or a naive/aware
+    comparison mismatch) so a genuine stall is still detected rather than
+    silently suppressed by a wedged comparison.
+    """
+    if not isinstance(bar_ts, datetime):
+        return True
+    if last_fresh_ts is None:
+        return True
+    try:
+        return bar_ts > last_fresh_ts
+    except TypeError:
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -1272,6 +1320,14 @@ class StreamManager:
         _underlying_restart_backed_off = False
         _stale_warned = False
         _last_stale_warn_mono = 0.0
+        # Timestamp of the last *genuinely new* bar. A reconnect opens the
+        # bar stream with barsback=1, so every forced restart immediately
+        # replays one historical bar. Resetting the staleness/escalation
+        # state on a replayed (same-or-older) bar makes a starved feed loop
+        # "restart -> replay -> reset -> starve -> restart" forever and
+        # never reach the backed-off upstream-outage state. Gate the resets
+        # on the bar timestamp actually advancing.
+        _last_fresh_bar_ts: Optional[datetime] = None
 
         try:
             while True:
@@ -1289,6 +1345,11 @@ class StreamManager:
                     max_wait = EXTENDED_HOURS_POLL_INTERVAL
                 else:  # closed
                     max_wait = CLOSED_HOURS_POLL_INTERVAL
+
+                # Staleness thresholds are cadence-sensitive (dense regular
+                # session vs. sparse extended hours) — see
+                # _stale_thresholds_for_session.
+                stale_warn_secs, stale_restart_secs = _stale_thresholds_for_session(session)
 
                 # --- block until data arrives or timeout for housekeeping ---
                 # Clear before waiting so signals arriving during processing
@@ -1344,23 +1405,37 @@ class StreamManager:
                     underlying_data = self._underlying_accumulator.drain()
                     if underlying_data:
                         self.current_price = underlying_data["close"]
+                        # Yield unconditionally — the downstream OHLC upsert
+                        # is keyed by minute bucket and idempotent, so a
+                        # replayed bar is harmless to ingest. It is NOT
+                        # harmless to the watchdog, though: only a bar whose
+                        # timestamp advances past the last fresh one counts
+                        # as real liveness. A barsback=1 replay (same/older
+                        # timestamp on every reconnect) must NOT reset the
+                        # staleness clock or restart escalation.
                         yield {"type": "underlying", "data": underlying_data}
                         _total_underlying_yields += 1
-                        if _stale_warned:
-                            logger.info(
-                                "Underlying bar stream RECOVERED after %.0fs / " "%d empty drains",
-                                (
-                                    time.monotonic() - _last_underlying_bar_mono
-                                    if _last_underlying_bar_mono is not None
-                                    else 0.0
-                                ),
-                                _consecutive_empty_underlying,
-                            )
-                        _consecutive_empty_underlying = 0
-                        _last_underlying_bar_mono = time.monotonic()
-                        _underlying_restart_attempts = 0
-                        _underlying_restart_backed_off = False
-                        _stale_warned = False
+
+                        bar_ts = underlying_data.get("timestamp")
+                        if _bar_timestamp_advanced(bar_ts, _last_fresh_bar_ts):
+                            if _stale_warned:
+                                logger.info(
+                                    "Underlying bar stream RECOVERED after "
+                                    "%.0fs / %d empty drains",
+                                    (
+                                        time.monotonic() - _last_underlying_bar_mono
+                                        if _last_underlying_bar_mono is not None
+                                        else 0.0
+                                    ),
+                                    _consecutive_empty_underlying,
+                                )
+                            if isinstance(bar_ts, datetime):
+                                _last_fresh_bar_ts = bar_ts
+                            _consecutive_empty_underlying = 0
+                            _last_underlying_bar_mono = time.monotonic()
+                            _underlying_restart_attempts = 0
+                            _underlying_restart_backed_off = False
+                            _stale_warned = False
                     elif feed_expected:
                         # No bar this cycle while the feed should be live.
                         # Staleness is judged in wall-clock seconds only:
@@ -1380,10 +1455,8 @@ class StreamManager:
                         # Warn once silence exceeds the threshold (which sits
                         # above the bar cadence), then re-warn at that same
                         # interval while it persists — never every cycle.
-                        if stale_seconds >= UNDERLYING_STREAM_STALE_WARN_SECONDS and (
-                            not _stale_warned
-                            or now_mono - _last_stale_warn_mono
-                            >= UNDERLYING_STREAM_STALE_WARN_SECONDS
+                        if stale_seconds >= stale_warn_secs and (
+                            not _stale_warned or now_mono - _last_stale_warn_mono >= stale_warn_secs
                         ):
                             cur_updates = self._underlying_accumulator.updates_received
                             logger.warning(
@@ -1407,7 +1480,7 @@ class StreamManager:
                         # cooldown, then escalated to a backed-off
                         # upstream-outage state rather than tight-looping.
                         if (
-                            stale_seconds >= UNDERLYING_STREAM_STALE_RESTART_SECONDS
+                            stale_seconds >= stale_restart_secs
                             and not _underlying_restart_backed_off
                             and now_mono - _last_forced_restart_mono
                             >= UNDERLYING_STREAM_RESTART_COOLDOWN_SECONDS
