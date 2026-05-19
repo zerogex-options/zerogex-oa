@@ -127,12 +127,9 @@ def test_extended_hours_use_wider_thresholds():
     assert _stale_thresholds_for_session("pre-market") == extended
     assert _stale_thresholds_for_session("after-hours") == extended
     # The whole point of the fix: extended thresholds are strictly wider.
+    assert UNDERLYING_STREAM_STALE_WARN_SECONDS_EXTENDED > UNDERLYING_STREAM_STALE_WARN_SECONDS
     assert (
-        UNDERLYING_STREAM_STALE_WARN_SECONDS_EXTENDED > UNDERLYING_STREAM_STALE_WARN_SECONDS
-    )
-    assert (
-        UNDERLYING_STREAM_STALE_RESTART_SECONDS_EXTENDED
-        > UNDERLYING_STREAM_STALE_RESTART_SECONDS
+        UNDERLYING_STREAM_STALE_RESTART_SECONDS_EXTENDED > UNDERLYING_STREAM_STALE_RESTART_SECONDS
     )
 
 

@@ -1456,8 +1456,7 @@ class StreamManager:
                         # above the bar cadence), then re-warn at that same
                         # interval while it persists — never every cycle.
                         if stale_seconds >= stale_warn_secs and (
-                            not _stale_warned
-                            or now_mono - _last_stale_warn_mono >= stale_warn_secs
+                            not _stale_warned or now_mono - _last_stale_warn_mono >= stale_warn_secs
                         ):
                             cur_updates = self._underlying_accumulator.updates_received
                             logger.warning(
