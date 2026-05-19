@@ -142,10 +142,11 @@ def test_gamma_profile_resolves_interior_flip_and_is_sign_consistent():
     assert (engine._net_gex_at_spot(profile, spot) < 0) == (spot < flip)
 
 
-def test_gamma_profile_clamps_when_one_signed_across_grid():
-    """A pure long-call book is dealer-long-gamma at every price on the
-    grid (no crossing) => clamp to the low grid edge instead of None, so
-    the flip tracks rather than being frozen by the carry-forward."""
+def test_gamma_flip_none_when_profile_one_signed():
+    """A pure long-call book is dealer-long-gamma at every grid price (no
+    crossing). The flip is NOT clamped to a grid edge — it returns None so
+    the caller can mark it unresolved (degraded/one-sided chain) instead
+    of fabricating a level or letting the carry-forward re-freeze."""
     engine = AnalyticsEngine(underlying="SPY")
     ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
     exp = datetime(2026, 9, 18).date()
@@ -154,9 +155,7 @@ def test_gamma_profile_clamps_when_one_signed_across_grid():
         [_opt(100.0, "C", oi=5000, iv=0.25, exp=exp)], spot, ts
     )
     assert all(v > 0 for _, v in profile)  # long gamma everywhere
-    flip = engine._calculate_gamma_flip_point(profile, spot)
-    assert flip == profile[0][0]  # clamped to the low grid edge
-    assert flip < spot  # tracks the grid, not a frozen absolute level
+    assert engine._calculate_gamma_flip_point(profile, spot) is None
 
 
 def test_gamma_profile_none_when_no_usable_contracts():
@@ -241,6 +240,38 @@ def test_store_gex_summary_keeps_current_gamma_flip_when_present():
     assert insert_args[4] == 499.75
 
 
+def test_store_gex_summary_persists_null_when_flip_unresolved():
+    """Degraded/one-sided chain => gamma_flip_unresolved is set, so the
+    carry-forward is SKIPPED and NULL is persisted (a visible gap),
+    instead of silently re-freezing the last level (the original bug)."""
+    engine = AnalyticsEngine(underlying="SPY")
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (501.25,)  # a prior exists; must NOT be used
+
+    summary = {
+        "underlying": "SPY",
+        "timestamp": datetime(2026, 4, 17, 14, 32, tzinfo=timezone.utc),
+        "max_gamma_strike": 500.0,
+        "max_gamma_value": 1234.0,
+        "gamma_flip_point": None,
+        "gamma_flip_unresolved": True,
+        "put_call_ratio": 0.9,
+        "max_pain": 505.0,
+        "total_call_volume": 1000,
+        "total_put_volume": 900,
+        "total_call_oi": 2000,
+        "total_put_oi": 1800,
+        "total_net_gex": 555.0,
+    }
+
+    engine._store_gex_summary(summary, cursor)
+
+    # No carry-forward SELECT — only the INSERT — and flip persists NULL.
+    assert cursor.execute.call_count == 1
+    insert_args = cursor.execute.call_args_list[-1][0][1]
+    assert insert_args[4] is None
+
+
 def test_store_gex_summary_persists_net_gex_at_spot():
     """End-to-end: net_gex_at_spot from the summary dict reaches the INSERT
     params (regression: it was dropped between compute and persist, so the
@@ -311,6 +342,41 @@ def test_gex_summary_includes_flip_distance_local_gex_and_convexity():
     # spot-vs-flip regime (short gamma iff spot is below the flip).
     assert "net_gex_at_spot" in summary
     assert (summary["net_gex_at_spot"] < 0) == (spot < flip)
+
+
+def test_gex_summary_marks_flip_unresolved_on_one_sided_chain(caplog):
+    """One-signed (degraded) usable chain => no crossing => the summary
+    reports gamma_flip_point=None, gamma_flip_unresolved=True, and WARNs
+    (so it's visible in analytics-health, not a silent clamp/freeze)."""
+    import logging
+
+    engine = AnalyticsEngine(underlying="SPY")
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
+    exp = datetime(2026, 9, 18).date()
+    spot = 500.0
+    # Pure long-call book => dealer-long-gamma everywhere => no crossing.
+    options = [_opt(500.0, "C", oi=5000, iv=0.25, exp=exp, volume=3)]
+    gex_by_strike = [
+        {"strike": 495.0, "net_gex": 1_000_000.0},
+        {"strike": 505.0, "net_gex": 2_000_000.0},
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        summary = engine._calculate_gex_summary(
+            gex_by_strike=gex_by_strike,
+            options=options,
+            underlying_price=spot,
+            timestamp=ts,
+        )
+
+    assert summary["gamma_flip_point"] is None
+    assert summary["gamma_flip_unresolved"] is True
+    assert summary["flip_distance"] is None  # no flip => no distance
+    assert "net_gex_at_spot" in summary  # still sampled from the profile
+    assert any(
+        "Gamma flip UNRESOLVED" in r.message and r.levelno == logging.WARNING
+        for r in caplog.records
+    )
 
 
 def _full_gex_row(ts):
