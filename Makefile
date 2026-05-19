@@ -2472,6 +2472,21 @@ normalizer-cache-dry-run: ## Compute distributions without writing (preview only
 		$(if $(NORMALIZER_SYMBOLS),--symbols $(NORMALIZER_SYMBOLS)) \
 		--window-days $(NORMALIZER_WINDOW_DAYS) --dry-run
 
+# Read-only re-validation of the relative gamma-flip thresholds after the
+# 7106711 flip redefinition. Splits persisted gex_summary.flip_distance at
+# the deploy boundary (NORMALIZER_DEPLOY_CUTOFF) and reports the gate
+# firing-rate shift. Writes nothing; safe any time. Override scope with
+# GAMMA_FLIP_SYMBOL / GAMMA_FLIP_WINDOW_DAYS.
+GAMMA_FLIP_SYMBOL ?= SPY
+GAMMA_FLIP_WINDOW_DAYS ?= 30
+
+.PHONY: gamma-flip-revalidate
+gamma-flip-revalidate: ## Re-validate relative gamma-flip thresholds vs post-deploy data (read-only)
+	@echo "$(BLUE)=== Gamma-flip threshold re-validation ($(GAMMA_FLIP_SYMBOL)) ===$(NC)"
+	@$(PY) -m src.tools.gamma_flip_revalidation \
+		--underlying $(GAMMA_FLIP_SYMBOL) \
+		--window-days $(GAMMA_FLIP_WINDOW_DAYS)
+
 # Override SYMBOLS to scope; the snapshot covers current + prior session
 # (everything /api/flow/series can request).
 FLOW_SERIES_SYMBOLS ?= SPY

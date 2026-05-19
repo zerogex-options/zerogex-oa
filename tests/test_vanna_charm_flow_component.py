@@ -149,3 +149,19 @@ def test_dynamic_normalizer_from_context_reduces_score_magnitude():
     }
     scaled = comp.compute(ctx)
     assert abs(scaled) < abs(base)
+
+
+def test_cold_cache_fallback_not_saturated_at_spy_summed_scale():
+    """Regression: the pre-2026-05-19 _VANNA_NORM=1e7 sat ~6x below the
+    post-rescale SUMMED dealer-vanna scale (SPY p50≈6.4e7), so the
+    cold-cache fallback path railed to ±1 (observed live before the first
+    post-deploy cache refresh).  With the SPY-p95-calibrated fallback a
+    typical book must score mid-range, not clamp."""
+    ctx = _ctx(hour=14)  # 10:00 ET — charm_amplification == 1.0
+    # No ctx.extra['normalizers'] -> exercises the no-cache fallback.
+    ctx.extra["gex_by_strike"] = [
+        {"strike": 500.0, "dealer_vanna_exposure": 6.4e7, "dealer_charm_exposure": 0.0}
+    ]
+    score = comp.compute(ctx)
+    # Old 1e7 fallback -> 6.4 -> clamp 1.0 (would fail < 0.95).
+    assert 0.0 < score < 0.95, f"cold-cache fallback saturated: score={score}"
