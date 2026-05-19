@@ -217,6 +217,18 @@ UNDERLYING_STREAM_STALE_WARN_SECONDS = int(os.getenv("UNDERLYING_STREAM_STALE_WA
 UNDERLYING_STREAM_STALE_RESTART_SECONDS = int(
     os.getenv("UNDERLYING_STREAM_STALE_RESTART_SECONDS", "120")
 )
+# The thresholds above are tuned for the dense regular cash session where a
+# 1-minute bar prints roughly every ~60s. In pre-market / after-hours an
+# equity/ETF (SPY, QQQ — cash indices are clamped out of these windows) trades
+# thinly and a 1-minute bar stream legitimately goes minutes between bars, so
+# the regular-session thresholds produce false STALE/restart storms. Extended
+# hours therefore get their own, much wider thresholds.
+UNDERLYING_STREAM_STALE_WARN_SECONDS_EXTENDED = int(
+    os.getenv("UNDERLYING_STREAM_STALE_WARN_SECONDS_EXTENDED", "300")
+)
+UNDERLYING_STREAM_STALE_RESTART_SECONDS_EXTENDED = int(
+    os.getenv("UNDERLYING_STREAM_STALE_RESTART_SECONDS_EXTENDED", "600")
+)
 UNDERLYING_STREAM_RESTART_COOLDOWN_SECONDS = int(
     os.getenv("UNDERLYING_STREAM_RESTART_COOLDOWN_SECONDS", "90")
 )
