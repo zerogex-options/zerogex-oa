@@ -42,12 +42,23 @@ from src.signals.components.utils import (
 # (``normalizer_cache_refresh`` samples SUM(dealer_vanna_exposure) and
 # SUM(dealer_charm_exposure) separately), so any change to the stored
 # unit is absorbed by the next cache refresh and the score is unchanged.
-# The constants below are only coarse pre-cache / no-cache fallbacks.
+#
+# The constants below are only the coarse no-cache / cold-start fallback
+# (used for a symbol with no component_normalizer_cache row yet).  They
+# are calibrated to the SPY-magnitude *summed-across-the-book* p95 — the
+# same SUM(...) quantity ``_aggregate`` divides by and the cache samples.
+# The prior 1.0e7 / 1.0e9 predated post-rescale live data: after the
+# 2026-05-15 vanna ×0.01 rescale the summed SPY vanna p50 (~6.4e7) was
+# ~6x the 1e7 fallback, so the cold-cache path *railed to ±1* (observed
+# live 2026-05-19 before the first post-deploy cache refresh).  Re-pinned
+# to the SPY post-rescale summed p95 from that refresh (cutoff-guarded,
+# n≈997): dealer_vanna_exposure p95≈1.41e8, dealer_charm_exposure
+# p95≈9.35e9, rounded up so a typical book lands mid-range, not clamped.
 #
 # Back-compat: ``_VC_NORM`` is retained as an alias (= the vanna
 # fallback) for callers/tests that imported it.
-_VANNA_NORM = float(os.getenv("SIGNAL_VANNA_NORM", "1.0e7"))
-_CHARM_NORM = float(os.getenv("SIGNAL_CHARM_NORM", "1.0e9"))
+_VANNA_NORM = float(os.getenv("SIGNAL_VANNA_NORM", "1.5e8"))
+_CHARM_NORM = float(os.getenv("SIGNAL_CHARM_NORM", "1.0e10"))
 _VC_NORM = _VANNA_NORM
 
 # Afternoon charm amplification kicks in after this fraction of session.
