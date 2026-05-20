@@ -264,19 +264,33 @@ GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT = _getenv_float(
 GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE = _getenv_float(
     "GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE", 90.0, min=50.0, max=100.0
 )
-# Canonical span over which the structural reference (p90 of |profile|)
-# is computed.  Held constant across every ladder rung so the
-# significance test for a crossing depends ONLY on the chain, not on
-# how wide the resolver happens to be scanning.  Without this, widening
-# the grid from ±20% to ±35%/±50% diluted p90 with deep-OTM near-zero
-# values and lowered the floor enough for the SAME marginal crossing
-# to pass at the expansion rung after failing at the default — the
-# 2026-05-20 SPX/QQQ pathology where flips clustered just inside the
-# 8% distance gate and the chart line walked off the visible band.
-# Pinning the reference to ±15% keeps it inside the active chain
-# (where the dominant gamma peak lives) at all common rungs.
+# Span over which the structural-reference profile is built before the
+# active-strike filter is applied.  Held constant across every ladder
+# rung so the significance test for a crossing depends only on the
+# chain, not on how wide the resolver happens to be scanning.  Without
+# this, widening the grid from ±20% to ±35%/±50% diluted p90 with
+# deep-OTM near-zero values and lowered the floor enough for the SAME
+# marginal crossing to pass at the expansion rung after failing at the
+# default — the 2026-05-20 SPX/QQQ pathology where flips clustered
+# just inside the 8% distance gate and the chart line walked off the
+# visible band.  Anchored at ±15% so the active-strike filter (see
+# below) has enough profile points to work with even on chains whose
+# OI is geometrically concentrated.
 GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT = _getenv_float(
     "GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT", 0.15, min=0.02, max=1.0
+)
+# Active-strike filter for the structural reference.  After the
+# canonical-band profile is built, each grid point is INCLUDED in the
+# p90 reference only when its nearest option strike with non-zero open
+# interest sits within this fraction of spot.  Anchors the noise floor
+# to the actual book rather than to grid points that happen to live in
+# OI dead zones (extended-hours degraded chains where most strikes
+# have zero OI; long-dated tails where strike spacing widens out
+# beyond any meaningful contribution).  Default 1% of spot is roughly
+# four grid steps at the default GAMMA_PROFILE_STEP_PCT=0.25%; tighten
+# this for symbols with dense OI, loosen for thin chains.
+GAMMA_PROFILE_STRUCTURAL_ACTIVE_DISTANCE_PCT = _getenv_float(
+    "GAMMA_PROFILE_STRUCTURAL_ACTIVE_DISTANCE_PCT", 0.01, min=0.001, max=0.10
 )
 # Distance gate: a structurally valid interior crossing is rejected when
 # it sits further than this fraction of spot from the current underlying

@@ -10,6 +10,7 @@ This engine runs independently from ingestion and calculates:
 Runs on a configured interval and writes to gex_summary and gex_by_strike tables.
 """
 
+import bisect
 import os
 import signal
 import sys
@@ -36,6 +37,7 @@ from src.config import (
     GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT,
     GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE,
     GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT,
+    GAMMA_PROFILE_STRUCTURAL_ACTIVE_DISTANCE_PCT,
     GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT,
     GAMMA_PROFILE_STEP_PCT,
     GAMMA_PROFILE_DTE_WEIGHTING,
@@ -1109,29 +1111,36 @@ class AnalyticsEngine:
         spot: float,
         timestamp: datetime,
     ) -> float:
-        """Canonical structural reference for the resolver's noise floor.
+        """Active-strike-weighted structural reference for the resolver.
 
-        Builds the spot-shift gamma profile over a FIXED
+        Builds the spot-shift gamma profile over a fixed
         ``±GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT`` band around
-        spot and returns the
-        ``GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE``'th percentile
-        of ``|profile|``.  Held constant across every ladder rung
-        (see :meth:`_resolve_gamma_flip`) so the "is this crossing
-        structurally significant?" test depends only on the chain,
-        not on how wide the resolver happens to be scanning.
+        spot, then INCLUDES in the p90 reference only those grid
+        points whose nearest option with non-zero open interest sits
+        within ``GAMMA_PROFILE_STRUCTURAL_ACTIVE_DISTANCE_PCT`` of
+        spot.  Anchors the noise floor to where the chain actually
+        carries OI, so:
 
-        Without this anchor, widening the ladder from ±20% to
-        ±35%/±50% admitted ~120 deep-OTM near-zero grid points that
-        diluted p90 downward and lowered the floor enough for the
-        SAME marginal crossing to pass at the expanded rung after
-        failing at the default — the 2026-05-20 SPX/QQQ pathology
-        where resolved flips clustered just inside the 8% actionable
-        gate while most cycles went NULL.
+        * Grid points in OI dead zones (extended-hours degraded
+          chains; long-dated tails where strike spacing widens past
+          any contribution) don't drag p90 toward zero and falsely
+          lower the floor for marginal crossings elsewhere.
+        * The reference is invariant to ladder rung width — adding
+          ±35% or ±50% scan points outside the active band has zero
+          effect because they're filtered out.
 
-        Returns ``0.0`` when the canonical profile cannot be built
-        (degraded chain, no usable contracts).  Callers treat that as
-        "no structural basis available" and conservatively fall
-        through to NULL.
+        Used once per cycle (see :meth:`_resolve_gamma_flip`) so the
+        "is this crossing structurally significant?" test depends
+        only on the chain.  Without it, widening the grid diluted
+        p90 with deep-OTM near-zero values and lowered the floor for
+        the SAME crossing — the 2026-05-20 SPX/QQQ pathology where
+        resolved flips clustered just inside the 8% actionable gate
+        while most cycles went NULL.
+
+        Returns ``0.0`` when no usable profile can be built or no
+        active strikes lie within the canonical band; callers treat
+        that as "no structural basis available" and fall through to
+        NULL.
         """
         ref_profile = self._gamma_exposure_profile(
             options,
@@ -1141,20 +1150,51 @@ class AnalyticsEngine:
         )
         if not ref_profile:
             return 0.0
-        abs_vals = np.fromiter(
-            (abs(v) for _, v in ref_profile), dtype=float, count=len(ref_profile)
-        )
-        if abs_vals.size == 0 or abs_vals.max() <= 0.0:
+
+        # Active strikes = unique strikes with non-zero open interest.
+        # Sorted to support O(log N) nearest-strike lookup via bisect.
+        active_set: set = set()
+        for opt in options:
+            try:
+                if int(opt.get("open_interest") or 0) > 0:
+                    k = float(opt.get("strike") or 0.0)
+                    if k > 0:
+                        active_set.add(k)
+            except (TypeError, ValueError):
+                continue
+        if not active_set:
+            return 0.0
+        active_strikes = sorted(active_set)
+
+        max_distance = spot * GAMMA_PROFILE_STRUCTURAL_ACTIVE_DISTANCE_PCT
+        filtered_abs: List[float] = []
+        for s, v in ref_profile:
+            # Binary-search the nearest active strike.  bisect_left
+            # returns the insertion point; the nearest strike is
+            # either at that index or at index-1.
+            idx = bisect.bisect_left(active_strikes, s)
+            nearest_dist = float("inf")
+            if idx > 0:
+                nearest_dist = min(nearest_dist, abs(s - active_strikes[idx - 1]))
+            if idx < len(active_strikes):
+                nearest_dist = min(nearest_dist, abs(active_strikes[idx] - s))
+            if nearest_dist <= max_distance:
+                filtered_abs.append(abs(v))
+
+        if not filtered_abs:
+            return 0.0
+        abs_arr = np.asarray(filtered_abs, dtype=float)
+        if abs_arr.max() <= 0.0:
             return 0.0
         reference = float(
-            np.percentile(abs_vals, GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE)
+            np.percentile(abs_arr, GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE)
         )
         if reference <= 0.0:
             # All non-zero magnitude sits above the chosen percentile
-            # (very sparse profile).  Fall back to max so the gate
-            # still has a well-defined floor instead of degenerating
-            # to "accept everything".
-            reference = float(abs_vals.max())
+            # (very sparse filtered set).  Fall back to max so the
+            # gate still has a well-defined floor instead of
+            # degenerating to "accept everything".
+            reference = float(abs_arr.max())
         return reference
 
     def _find_structural_interior_crossing(
