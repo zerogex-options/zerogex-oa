@@ -439,6 +439,93 @@ def test_resolve_gamma_flip_rejects_crossing_beyond_distance_gate(monkeypatch):
     assert profile
 
 
+def test_gamma_flip_unresolved_diagnostics_surfaces_each_failure_mode():
+    """The diagnostic helper must surface the four documented failure
+    modes from the inputs alone, so the WARN log line is enough to
+    diagnose without cross-referencing the option_chains snapshot.
+
+    Exercised here on hand-built chains, one per mode, asserting only
+    the field that mode is meant to flag.
+    """
+    engine = AnalyticsEngine(underlying="SPY")
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
+    multi_day_exp = datetime(2026, 9, 18).date()
+    zero_dte_exp = ts.date()
+    spot = 100.0
+
+    # (1) IV-spike artifact: every contract priced at high σ.  Median /
+    # p90 / max should all sit near the elevated level, well above a
+    # normal regime (~0.20-0.25).
+    spike_options = [
+        _opt(95.0, "P", oi=5000, iv=0.85, exp=multi_day_exp),
+        _opt(100.0, "P", oi=5000, iv=0.90, exp=multi_day_exp),
+        _opt(105.0, "C", oi=5000, iv=0.88, exp=multi_day_exp),
+    ]
+    spike_profile = engine._gamma_exposure_profile(spike_options, spot, ts)
+    spike_diag = engine._gamma_flip_unresolved_diagnostics(
+        spike_options, spike_profile, spot, ts
+    )
+    assert spike_diag["iv_p50"] >= 0.80
+    assert spike_diag["iv_max"] >= 0.88
+    # IVs aren't the default sentinel — should NOT trip the stale-IV bucket.
+    assert spike_diag["iv_at_default_share"] == 0.0
+
+    # (2) 0DTE-dominant chain × DTE weighting: raw OI share heavy in
+    # 0DTE, but the DTE-weighted share collapses (0DTE weighted ~0,
+    # short-dated weighted small), exposing the weighting failure mode.
+    zero_dte_options = [
+        _opt(100.0, "C", oi=50_000, iv=0.30, exp=zero_dte_exp),
+        _opt(100.0, "P", oi=50_000, iv=0.30, exp=zero_dte_exp),
+        _opt(100.0, "C", oi=1_000, iv=0.30, exp=multi_day_exp),
+    ]
+    zdte_profile = engine._gamma_exposure_profile(zero_dte_options, spot, ts)
+    zdte_diag = engine._gamma_flip_unresolved_diagnostics(
+        zero_dte_options, zdte_profile, spot, ts
+    )
+    # Raw OI is overwhelmingly 0DTE.
+    assert zdte_diag["oi_share_0dte"] >= 0.95
+    # After DTE weighting, the 0DTE share is meaningfully smaller than
+    # its raw share — the weighting is doing its job (and the
+    # remaining weighted OI from far-dated contracts is what the
+    # resolver actually sees).
+    assert zdte_diag["weighted_oi_share_0dte"] < zdte_diag["oi_share_0dte"]
+
+    # (3) Stale-IV pipeline: NULL/0 IVs in the source row are filled
+    # with 0.20 at fetch time (see snapshot loader around line 503),
+    # so the sigma>0 filter doesn't catch them.  Diagnostic flags the
+    # exact-default cluster.
+    stale_options = [
+        _opt(95.0, "P", oi=5000, iv=0.20, exp=multi_day_exp),
+        _opt(100.0, "P", oi=5000, iv=0.20, exp=multi_day_exp),
+        _opt(105.0, "C", oi=5000, iv=0.20, exp=multi_day_exp),
+        _opt(110.0, "C", oi=5000, iv=0.35, exp=multi_day_exp),  # only 1 real IV
+    ]
+    stale_profile = engine._gamma_exposure_profile(stale_options, spot, ts)
+    stale_diag = engine._gamma_flip_unresolved_diagnostics(
+        stale_options, stale_profile, spot, ts
+    )
+    assert stale_diag["iv_at_default_count"] == 3
+    assert abs(stale_diag["iv_at_default_share"] - 0.75) < 1e-9
+
+    # (4) One-sided chain: all calls (or all puts) on the usable side.
+    # Diagnostic call/put counts are skewed, and the last-rung profile
+    # is monotonic (one of pos_pts / neg_pts is zero).
+    one_sided_options = [
+        _opt(100.0, "C", oi=5000, iv=0.25, exp=multi_day_exp),
+        _opt(105.0, "C", oi=5000, iv=0.25, exp=multi_day_exp),
+    ]
+    one_sided_profile = engine._gamma_exposure_profile(one_sided_options, spot, ts)
+    one_sided_diag = engine._gamma_flip_unresolved_diagnostics(
+        one_sided_options, one_sided_profile, spot, ts
+    )
+    assert one_sided_diag["usable_calls"] == 2
+    assert one_sided_diag["usable_puts"] == 0
+    # Pure long-call book is dealer-long-gamma everywhere => negative-side
+    # is empty, positive-side has every point.
+    assert one_sided_diag["profile_neg_pts"] == 0
+    assert one_sided_diag["profile_pos_pts"] > 0
+
+
 def test_resolve_gamma_flip_returns_none_at_max_rung_when_profile_truly_one_signed():
     """A book that is one-signed at EVERY ladder rung (pathological
     chain, e.g. all calls, no puts — or after-hours when every put has

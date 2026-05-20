@@ -1235,6 +1235,157 @@ class AnalyticsEngine:
                 return profile, flip, span_pct
         return last_profile, None, last_span
 
+    # Default IV substituted when an option_chains row has NULL/0 IV
+    # (see the snapshot fetch ~line 503).  Stale-IV pipelines cluster
+    # contracts here, so we count rows sitting on this exact sentinel
+    # value to surface the "IV pipeline is lagging" failure mode.
+    _GAMMA_FLIP_DIAGNOSTIC_DEFAULT_IV = 0.2
+
+    def _gamma_flip_unresolved_diagnostics(
+        self,
+        options: List[Dict[str, Any]],
+        gamma_profile: List[Tuple[float, float]],
+        underlying_price: float,
+        timestamp: datetime,
+    ) -> Dict[str, Any]:
+        """Diagnostic snapshot for a cycle that left ``gamma_flip_point``
+        unresolved.  Used only on the WARN path, so the analysis runs at
+        most once per unresolved cycle.
+
+        Fields are chosen to distinguish the four documented failure
+        modes from the log alone, without cross-referencing
+        ``option_chains`` or the IV-calculator state at the same
+        timestamp:
+
+        1. **IV-spike artifact** — ``iv_p50`` / ``iv_p90`` / ``iv_max``
+           jump versus the recent baseline.  BS gamma is
+           ``φ(d1) / (S σ √T)``, so a global σ jump collapses the
+           profile peak and slumps every region into the structural
+           floor (see :meth:`_find_structural_interior_crossing`).
+        2. **0DTE-dominant chain × DTE weighting** — ``oi_share_0dte``
+           is high *and* ``weighted_oi_share_*`` is concentrated in a
+           single thin bucket.  The horizon-occupancy ramp
+           (:meth:`_dte_profile_weight`) intentionally down-weights
+           near-dated, so a chain whose multi-day OI is thin can drop
+           below the structural floor after weighting even when the
+           raw chain looks healthy.
+        3. **Stale IV defaulting to 0.20** —
+           ``iv_at_default_share`` is high.  Rows ingested with a
+           NULL/0 IV are filled with 0.20 at fetch time, so the
+           ``sigma > 0`` filter never catches them — they enter the
+           profile with a constant IV that flattens the spot-shift
+           curve.
+        4. **One-sided chain** — ``usable_calls`` vs ``usable_puts``
+           is heavily skewed, or the last-rung profile's sign
+           distribution (``profile_pos_pts`` / ``profile_neg_pts``)
+           is monotonic.  No crossing exists at all; the resolver
+           returns None on the first gate.
+
+        Also emits the structural-floor value the gate compares
+        against, so an operator can read off "the chain HAD crossings
+        but their local peak was below the floor" directly.
+        """
+        DEFAULT_IV = self._GAMMA_FLIP_DIAGNOSTIC_DEFAULT_IV
+
+        usable_total = 0
+        usable_calls = 0
+        usable_puts = 0
+        ivs: List[float] = []
+        iv_at_default = 0
+        oi_by_bucket = {"0dte": 0, "1_2dte": 0, "3_7dte": 0, "8plus_dte": 0}
+        weighted_oi_by_bucket = dict(oi_by_bucket)
+        tte_cache: Dict = {}
+
+        for opt in options:
+            sigma = float(opt.get("implied_volatility") or 0.0)
+            oi = int(opt.get("open_interest") or 0)
+            K = float(opt.get("strike") or 0.0)
+            if sigma <= 0 or oi <= 0 or K <= 0:
+                continue
+
+            usable_total += 1
+            if opt.get("option_type") == "C":
+                usable_calls += 1
+            elif opt.get("option_type") == "P":
+                usable_puts += 1
+
+            ivs.append(sigma)
+            if abs(sigma - DEFAULT_IV) < 1e-9:
+                iv_at_default += 1
+
+            expiration = opt.get("expiration")
+            if expiration is None:
+                continue
+            T = tte_cache.get(expiration)
+            if T is None:
+                T = self._calculate_time_to_expiration(timestamp, expiration)
+                tte_cache[expiration] = T
+            if T <= 0:
+                continue
+            dte = T * 365.0
+            if dte < 1.0:
+                bucket = "0dte"
+            elif dte < 3.0:
+                bucket = "1_2dte"
+            elif dte < 8.0:
+                bucket = "3_7dte"
+            else:
+                bucket = "8plus_dte"
+            oi_by_bucket[bucket] += oi
+            dte_w = self._dte_profile_weight(T)
+            weighted_oi_by_bucket[bucket] += int(round(oi * dte_w))
+
+        if ivs:
+            ivs_arr = np.asarray(ivs, dtype=float)
+            iv_p10 = float(np.percentile(ivs_arr, 10))
+            iv_p50 = float(np.percentile(ivs_arr, 50))
+            iv_p90 = float(np.percentile(ivs_arr, 90))
+            iv_max = float(ivs_arr.max())
+        else:
+            iv_p10 = iv_p50 = iv_p90 = iv_max = 0.0
+
+        total_oi = sum(oi_by_bucket.values()) or 1
+        total_weighted_oi = sum(weighted_oi_by_bucket.values()) or 1
+
+        if gamma_profile:
+            vals = [v for _, v in gamma_profile]
+            abs_vals = [abs(v) for v in vals]
+            profile_peak = max(abs_vals) if abs_vals else 0.0
+            profile_median = float(np.median(abs_vals)) if abs_vals else 0.0
+            positive_pts = sum(1 for v in vals if v > 0)
+            negative_pts = sum(1 for v in vals if v < 0)
+            zero_pts = sum(1 for v in vals if v == 0)
+        else:
+            profile_peak = profile_median = 0.0
+            positive_pts = negative_pts = zero_pts = 0
+        structural_floor = profile_peak * GAMMA_PROFILE_STRUCTURAL_MIN_FRAC
+
+        return {
+            "usable_total": usable_total,
+            "usable_calls": usable_calls,
+            "usable_puts": usable_puts,
+            "iv_p10": iv_p10,
+            "iv_p50": iv_p50,
+            "iv_p90": iv_p90,
+            "iv_max": iv_max,
+            "iv_at_default_count": iv_at_default,
+            "iv_at_default_share": iv_at_default / max(1, usable_total),
+            "oi_share_0dte": oi_by_bucket["0dte"] / total_oi,
+            "oi_share_1_2dte": oi_by_bucket["1_2dte"] / total_oi,
+            "oi_share_3_7dte": oi_by_bucket["3_7dte"] / total_oi,
+            "oi_share_8plus_dte": oi_by_bucket["8plus_dte"] / total_oi,
+            "weighted_oi_share_0dte": weighted_oi_by_bucket["0dte"] / total_weighted_oi,
+            "weighted_oi_share_1_2dte": weighted_oi_by_bucket["1_2dte"] / total_weighted_oi,
+            "weighted_oi_share_3_7dte": weighted_oi_by_bucket["3_7dte"] / total_weighted_oi,
+            "weighted_oi_share_8plus_dte": weighted_oi_by_bucket["8plus_dte"] / total_weighted_oi,
+            "profile_peak": profile_peak,
+            "profile_median": profile_median,
+            "profile_pos_pts": positive_pts,
+            "profile_neg_pts": negative_pts,
+            "profile_zero_pts": zero_pts,
+            "structural_floor": structural_floor,
+        }
+
     def _net_gex_at_spot(
         self, profile: List[Tuple[float, float]], underlying_price: float
     ) -> Optional[float]:
@@ -1326,25 +1477,40 @@ class AnalyticsEngine:
 
         gamma_flip_unresolved = gamma_flip_point is None
         if gamma_flip_unresolved:
-            usable = sum(
-                1
-                for o in options
-                if (o.get("implied_volatility") or 0) > 0
-                and (o.get("open_interest") or 0) > 0
-                and (o.get("strike") or 0) > 0
+            diag = self._gamma_flip_unresolved_diagnostics(
+                options, gamma_profile, underlying_price, timestamp
             )
             logger.warning(
-                "Gamma flip UNRESOLVED for %s @ %s: no structural interior crossing "
-                "across the span ladder (max rung ±%.0f%% reached, %d/%d usable "
-                "contracts, %d profile points at max rung) — actionable flip is "
-                "beyond the widest rung or the chain is degraded; persisting NULL "
-                "(no clamp, no carry-forward)",
-                self.db_symbol,
-                timestamp,
+                "Gamma flip UNRESOLVED for %s @ %s: no structural interior "
+                "crossing across the span ladder (max rung ±%.0f%%, %d/%d "
+                "usable contracts, %d profile points at max rung) — "
+                "persisting NULL (no clamp, no carry-forward). "
+                "Sides usable C/P=%d/%d. "
+                "IV p10/p50/p90/max=%.3f/%.3f/%.3f/%.3f "
+                "(%d contracts at default IV=%.2f, share %.1f%% — high "
+                "share indicates stale IV pipeline). "
+                "OI share by DTE raw 0/1-2/3-7/8+=%.1f/%.1f/%.1f/%.1f%%; "
+                "DTE-weighted 0/1-2/3-7/8+=%.1f/%.1f/%.1f/%.1f%%. "
+                "Profile (widest rung) peak|GEX|=%.3g, median|GEX|=%.3g, "
+                "structural floor=%.3g (crossings need a local window peak "
+                "above this to qualify); sign distribution +/-/0=%d/%d/%d "
+                "points (a monotonic split means no crossing exists at all).",
+                self.db_symbol, timestamp,
                 gamma_flip_span_used * 100.0,
-                usable,
-                len(options),
-                len(gamma_profile),
+                diag["usable_total"], len(options), len(gamma_profile),
+                diag["usable_calls"], diag["usable_puts"],
+                diag["iv_p10"], diag["iv_p50"], diag["iv_p90"], diag["iv_max"],
+                diag["iv_at_default_count"],
+                self._GAMMA_FLIP_DIAGNOSTIC_DEFAULT_IV,
+                diag["iv_at_default_share"] * 100.0,
+                diag["oi_share_0dte"] * 100.0, diag["oi_share_1_2dte"] * 100.0,
+                diag["oi_share_3_7dte"] * 100.0, diag["oi_share_8plus_dte"] * 100.0,
+                diag["weighted_oi_share_0dte"] * 100.0,
+                diag["weighted_oi_share_1_2dte"] * 100.0,
+                diag["weighted_oi_share_3_7dte"] * 100.0,
+                diag["weighted_oi_share_8plus_dte"] * 100.0,
+                diag["profile_peak"], diag["profile_median"], diag["structural_floor"],
+                diag["profile_pos_pts"], diag["profile_neg_pts"], diag["profile_zero_pts"],
             )
         elif GAMMA_PROFILE_SPAN_LADDER and gamma_flip_span_used > GAMMA_PROFILE_SPAN_LADDER[0]:
             logger.info(
