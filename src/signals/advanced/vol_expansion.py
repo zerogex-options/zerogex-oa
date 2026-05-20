@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 
-from src.config import SIGNAL_GEX_NORMALIZATION
+from src.config import signal_gex_normalization_for
 from src.signals.components.base import MarketContext
 from src.signals.components.utils import (
     pct_change_n_bar,
@@ -14,7 +14,6 @@ from src.signals.components.utils import (
 from src.signals.advanced.base import AdvancedSignalResult
 
 _DIRECTION_Z_NORM = 1.0
-_GEX_NORM = SIGNAL_GEX_NORMALIZATION
 _GEX_FLOOR = 0.15
 
 
@@ -23,7 +22,7 @@ class VolExpansionSignal:
 
     @staticmethod
     def expansion(ctx: MarketContext) -> float:
-        return round(VolExpansionSignal._gex_readiness(ctx.net_gex) * 100.0, 2)
+        return round(VolExpansionSignal._gex_readiness(ctx.net_gex, ctx.underlying) * 100.0, 2)
 
     @staticmethod
     def direction_score(ctx: MarketContext) -> float:
@@ -33,7 +32,7 @@ class VolExpansionSignal:
 
     @staticmethod
     def magnitude(ctx: MarketContext) -> float:
-        exp = VolExpansionSignal._gex_readiness(ctx.net_gex)
+        exp = VolExpansionSignal._gex_readiness(ctx.net_gex, ctx.underlying)
         _, z = vol_normalized_momentum(ctx.recent_closes, n=5)
         momentum = max(-1.0, min(1.0, z / _DIRECTION_Z_NORM))
         return round(exp * abs(momentum) * 100.0, 2)
@@ -46,14 +45,14 @@ class VolExpansionSignal:
         sigma = realized_sigma(closes, window=60)
         if sigma <= 0:
             return None
-        exp = VolExpansionSignal._gex_readiness(ctx.net_gex)
+        exp = VolExpansionSignal._gex_readiness(ctx.net_gex, ctx.underlying)
         _, z = vol_normalized_momentum(closes, n=5)
         direction = max(-1.0, min(1.0, z / _DIRECTION_Z_NORM))
         projected_5b = sigma * math.sqrt(5)
         return round(direction * exp * projected_5b * 10000.0, 2)
 
     def compute(self, ctx: MarketContext) -> float:
-        exp = self._gex_readiness(ctx.net_gex)
+        exp = self._gex_readiness(ctx.net_gex, ctx.underlying)
         closes = ctx.recent_closes
         if len(closes) < 5 or closes[-5] <= 0:
             return 0.0
@@ -62,8 +61,9 @@ class VolExpansionSignal:
         return exp * momentum
 
     @staticmethod
-    def _gex_readiness(net_gex: float) -> float:
-        normalized = max(-1.0, min(1.0, -net_gex / _GEX_NORM))
+    def _gex_readiness(net_gex: float, underlying: str | None = None) -> float:
+        norm = signal_gex_normalization_for(underlying)
+        normalized = max(-1.0, min(1.0, -net_gex / norm))
         return _GEX_FLOOR + (1.0 - _GEX_FLOOR) * (normalized + 1.0) / 2.0
 
     def context_values(self, ctx: MarketContext) -> dict:
@@ -84,7 +84,7 @@ class VolExpansionSignal:
             "direction": self.direction_score(ctx),
             "magnitude": self.magnitude(ctx),
             "expected_5min_move_bps": self.expected_5min_move_bps(ctx),
-            "gex_readiness": round(self._gex_readiness(ctx.net_gex), 4),
+            "gex_readiness": round(self._gex_readiness(ctx.net_gex, ctx.underlying), 4),
             "pct_change_5bar": pct_change_5bar,
             "momentum_z": momentum_z,
             "momentum": momentum,

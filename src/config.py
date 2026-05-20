@@ -573,6 +573,38 @@ SIGNALS_PORTFOLIO_SIZE = float(os.getenv("SIGNALS_PORTFOLIO_SIZE", "1000000"))
 # underlyings.  Override via env var if your universe's typical GEX
 # magnitude differs.
 SIGNAL_GEX_NORMALIZATION = _getenv_float("SIGNAL_GEX_NORMALIZATION", 2_100_000_000.0, min=1.0)
+
+# Per-symbol overrides for SIGNAL_GEX_NORMALIZATION.  Net dealer dollar
+# gamma scales with (S² × OI), so a single global scale calibrated for
+# SPY-magnitude underlyings saturates instantly on SPX (≈10× SPY
+# notional, ~100× SPY dollar gamma per contract) and over-saturates
+# on SPY itself in stable long-gamma regimes.  Empirically observed
+# net_gex on 2026-05-20 with the previous 2.1B default: SPX +54B
+# (26× over), SPY +4.1B (2× over), QQQ +1.6B (slightly under).  All
+# three pinned to the Low expansion floor (gex_readiness = 0.15) with
+# no dynamic range.  These per-symbol defaults give the readiness
+# mapping room to move; override via SIGNAL_GEX_NORMALIZATION_<SYMBOL>
+# env var if your universe's typical magnitudes differ.
+SIGNAL_GEX_NORMALIZATION_BY_SYMBOL: Dict[str, float] = {
+    "SPX": _getenv_float("SIGNAL_GEX_NORMALIZATION_SPX", 1.0e11, min=1.0),
+    "SPY": _getenv_float("SIGNAL_GEX_NORMALIZATION_SPY", 1.0e10, min=1.0),
+    "QQQ": _getenv_float("SIGNAL_GEX_NORMALIZATION_QQQ", 2.0e9, min=1.0),
+}
+
+
+def signal_gex_normalization_for(symbol: Optional[str]) -> float:
+    """Return the GEX-readiness denominator for ``symbol``.
+
+    Falls back to ``SIGNAL_GEX_NORMALIZATION`` (the legacy global
+    default) when ``symbol`` is ``None`` or not in the per-symbol map.
+    See :data:`SIGNAL_GEX_NORMALIZATION_BY_SYMBOL` for the rationale
+    behind the per-symbol defaults.
+    """
+    if symbol is None:
+        return SIGNAL_GEX_NORMALIZATION
+    return SIGNAL_GEX_NORMALIZATION_BY_SYMBOL.get(
+        symbol.upper(), SIGNAL_GEX_NORMALIZATION
+    )
 POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS = (
     os.getenv("POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS", "false").lower() == "true"
 )

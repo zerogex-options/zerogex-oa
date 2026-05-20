@@ -10,7 +10,7 @@ import pytz
 
 from src.database import db_connection
 from src.config import (
-    SIGNAL_GEX_NORMALIZATION,
+    signal_gex_normalization_for,
     SIGNALS_KELLY_FRACTION,
     SIGNALS_PORTFOLIO_SIZE,
 )
@@ -867,7 +867,7 @@ class PositionOptimizerEngine:
             net_gamma = (call_leg["gamma"] + put_leg["gamma"]) * 100.0
             net_theta = (call_leg["theta"] + put_leg["theta"]) * 100.0
             base_pop = self._clamp(
-                0.40 + self._clamp(abs(ctx.net_gex) / SIGNAL_GEX_NORMALIZATION, 0.0, 1.0) * 0.25,
+                0.40 + self._clamp(abs(ctx.net_gex) / signal_gex_normalization_for(ctx.underlying), 0.0, 1.0) * 0.25,
                 0.2,
                 0.8,
             )
@@ -895,7 +895,7 @@ class PositionOptimizerEngine:
             net_gamma = (call_leg["gamma"] + put_leg["gamma"]) * 100.0
             net_theta = (call_leg["theta"] + put_leg["theta"]) * 100.0
             base_pop = self._clamp(
-                0.35 + self._clamp(abs(ctx.net_gex) / SIGNAL_GEX_NORMALIZATION, 0.0, 1.0) * 0.30,
+                0.35 + self._clamp(abs(ctx.net_gex) / signal_gex_normalization_for(ctx.underlying), 0.0, 1.0) * 0.30,
                 0.2,
                 0.8,
             )

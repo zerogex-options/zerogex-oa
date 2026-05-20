@@ -13,7 +13,7 @@ from datetime import datetime
 import math
 from typing import Optional
 
-from src.config import SIGNAL_GEX_NORMALIZATION
+from src.config import signal_gex_normalization_for
 
 
 @dataclass(frozen=True)
@@ -37,9 +37,10 @@ class StrategyBuilder:
         return max(low, min(value, high))
 
     @staticmethod
-    def _vol_expansion_readiness(net_gex: float) -> float:
+    def _vol_expansion_readiness(net_gex: float, underlying: Optional[str] = None) -> float:
         # Mirrors VolExpansionComponent._gex_readiness in lightweight form.
-        normalized = max(-1.0, min(1.0, -float(net_gex or 0.0) / SIGNAL_GEX_NORMALIZATION))
+        norm = signal_gex_normalization_for(underlying)
+        normalized = max(-1.0, min(1.0, -float(net_gex or 0.0) / norm))
         return 0.15 + (1.0 - 0.15) * ((normalized + 1.0) / 2.0)
 
     @staticmethod
@@ -95,7 +96,10 @@ class StrategyBuilder:
         option_rows: Optional[list[dict]] = None,
     ) -> StrategyDecision:
         iv_rank = self._clamp(float(market_ctx.get("iv_rank") or 0.5), 0.0, 1.0)
-        expansion = self._vol_expansion_readiness(float(market_ctx.get("net_gex") or 0.0))
+        expansion = self._vol_expansion_readiness(
+            float(market_ctx.get("net_gex") or 0.0),
+            market_ctx.get("underlying"),
+        )
         direction_signal = self._direction_signal(market_ctx.get("recent_closes") or [])
         momentum_mag = abs(direction_signal)
         momentum_dead = momentum_mag <= 0.25
