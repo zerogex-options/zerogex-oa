@@ -526,6 +526,63 @@ def test_gamma_flip_unresolved_diagnostics_surfaces_each_failure_mode():
     assert one_sided_diag["profile_pos_pts"] > 0
 
 
+def test_find_structural_interior_crossing_accepts_real_crossing_in_spike_shaped_profile():
+    """SPX 2026-05-20 pathology: low-IV, OI-concentrated chain produces
+    a dealer-gamma profile dominated by ONE colossal spike (e.g., a
+    near-ATM wall whose narrow BS gammas pile up at one strike) with
+    the rest of the profile at noise-floor magnitudes.
+
+    Under the prior max-relative gate the threshold was driven by the
+    spike (floor = 2% × 7.5B = 150M) and every legitimate interior
+    crossing in the rest of the chain was rejected as "noise relative
+    to the spike", yielding NULL on a healthy chain.  Under the
+    robust-percentile reference the spike is an outlier above p90, so
+    the floor is set by the chain's typical high magnitude and the
+    real crossing resolves.
+
+    The profile here is a hand-shaped synthetic that captures both
+    features: a tall narrow spike well above spot, a clear interior
+    sign change near spot in a region of moderate magnitude, and a
+    long stretch of noise-floor magnitudes filling out the grid.
+    """
+    engine = AnalyticsEngine(underlying="SPX")
+    spot = 100.0
+
+    profile = []
+    # 50 noise-floor points below the interior region (1% from edge to
+    # 10% margin).  Profile is in the negative noise floor here.
+    profile.extend((50.0 + 0.5 * i, -1e-3) for i in range(50))
+    # Active negative region heading into the crossing.
+    profile.extend([
+        (76.0, -8.0e6),
+        (82.0, -1.2e7),
+        (88.0, -3.0e7),
+        (94.0, -2.0e7),
+        (97.0, -1.0e7),
+        (99.0, -5.0e6),
+        # crossing somewhere in here
+        (101.0, 6.0e6),
+        (103.0, 1.5e7),
+        (106.0, 3.0e7),
+    ])
+    # Then a colossal spike high above spot (an ATM-of-tomorrow wall).
+    profile.extend([
+        (115.0, 2.0e8),
+        (117.0, 5.0e9),  # the spike — dominates global max
+        (119.0, 2.0e8),
+    ])
+    # And more noise floor up to the grid edge.
+    profile.extend((120.0 + 0.5 * i, 1e-3) for i in range(50))
+
+    # The spike at 117 is two orders of magnitude above the active
+    # region near spot, so the prior gate's max-relative floor (2% of
+    # 5e9 = 1e8) is well above the inner-window peak at the crossing
+    # near 100 (~3e7) — that's exactly the SPX failure mode.
+    flip = engine._find_structural_interior_crossing(profile, spot)
+    assert flip is not None
+    assert 99.0 < flip < 102.0
+
+
 def test_resolve_gamma_flip_returns_none_at_max_rung_when_profile_truly_one_signed():
     """A book that is one-signed at EVERY ladder rung (pathological
     chain, e.g. all calls, no puts — or after-hours when every put has

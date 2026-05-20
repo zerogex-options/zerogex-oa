@@ -34,6 +34,7 @@ from src.config import (
     GAMMA_PROFILE_INTERIOR_MARGIN,
     GAMMA_PROFILE_STRUCTURAL_MIN_FRAC,
     GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT,
+    GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE,
     GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT,
     GAMMA_PROFILE_STEP_PCT,
     GAMMA_PROFILE_DTE_WEIGHTING,
@@ -1119,12 +1120,27 @@ class AnalyticsEngine:
         * **Structural** — the peak ``|profile|`` value within
           ``±GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT × candidate`` of the
           crossing is at least ``GAMMA_PROFILE_STRUCTURAL_MIN_FRAC`` of
-          the global peak ``|profile|`` on the grid.  Rejects noise-floor
-          sign changes (profile slowly drifting through zero in a region
-          where every contract's gamma has decayed near zero — the
-          morning-open / extended-hours artifact where IVs spike, gammas
-          collapse globally, and a sliver of imbalance can flip sign
-          spuriously).
+          the chain's **robust high-magnitude reference** — the
+          ``GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE``'th
+          percentile of ``|profile|`` across the grid.  Rejects
+          noise-floor sign changes (profile slowly drifting through
+          zero in a region where every contract's gamma has decayed
+          near zero — the morning-open / extended-hours artifact where
+          IVs spike, gammas collapse globally, and a sliver of
+          imbalance can flip sign spuriously).
+
+          The reference is a robust percentile, not ``max(|profile|)``,
+          to keep a single colossal spike from defining the floor for
+          the rest of the chain.  The 2026-05-20 SPX/QQQ pathology was
+          a low-IV regime with a heavily OI-concentrated wall: the
+          profile peaked at 7.5B at a single grid point with the
+          median |GEX| in the rounding noise, so the prior
+          max-relative gate set the floor at 150M and swallowed every
+          legitimate interior crossing in the rest of the chain.  A
+          robust percentile collapses to the max in a truly
+          uniformly-noisy chain (where p90 ≈ max — the regime this
+          gate was originally calibrated for), so the morning-open
+          noise-floor rejection is unaffected.
 
         * **Actionable-distance** — the candidate sits within
           ``GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT`` of ``underlying_price``.
@@ -1156,10 +1172,19 @@ class AnalyticsEngine:
         interior_lo = s_lo + margin_abs
         interior_hi = s_hi - margin_abs
 
-        peak = max((abs(v) for _, v in profile), default=0.0)
-        if peak <= 0.0:
+        abs_profile = np.fromiter((abs(v) for _, v in profile), dtype=float, count=len(profile))
+        if abs_profile.size == 0 or abs_profile.max() <= 0.0:
             return None
-        floor_abs = GAMMA_PROFILE_STRUCTURAL_MIN_FRAC * peak
+        # Robust high-magnitude reference (p90 default) — see docstring.
+        reference = float(np.percentile(abs_profile, GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE))
+        if reference <= 0.0:
+            # All non-zero magnitude sits above the chosen percentile
+            # (e.g., a profile with vastly more zeros than active
+            # points). Fall back to max so the gate still has a
+            # well-defined floor instead of degenerating to "accept
+            # everything".
+            reference = float(abs_profile.max())
+        floor_abs = GAMMA_PROFILE_STRUCTURAL_MIN_FRAC * reference
 
         best_flip: Optional[float] = None
         best_dist = float("inf")
@@ -1363,13 +1388,18 @@ class AnalyticsEngine:
             abs_vals = [abs(v) for v in vals]
             profile_peak = max(abs_vals) if abs_vals else 0.0
             profile_median = float(np.median(abs_vals)) if abs_vals else 0.0
+            profile_reference = float(
+                np.percentile(abs_vals, GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE)
+            ) if abs_vals else 0.0
+            if profile_reference <= 0.0 and profile_peak > 0.0:
+                profile_reference = profile_peak
             positive_pts = sum(1 for v in vals if v > 0)
             negative_pts = sum(1 for v in vals if v < 0)
             zero_pts = sum(1 for v in vals if v == 0)
         else:
-            profile_peak = profile_median = 0.0
+            profile_peak = profile_median = profile_reference = 0.0
             positive_pts = negative_pts = zero_pts = 0
-        structural_floor = profile_peak * GAMMA_PROFILE_STRUCTURAL_MIN_FRAC
+        structural_floor = profile_reference * GAMMA_PROFILE_STRUCTURAL_MIN_FRAC
 
         return {
             "usable_total": usable_total,
@@ -1391,6 +1421,7 @@ class AnalyticsEngine:
             "weighted_oi_share_8plus_dte": weighted_oi_by_bucket["8plus_dte"] / total_weighted_oi,
             "profile_peak": profile_peak,
             "profile_median": profile_median,
+            "profile_reference": profile_reference,
             "profile_pos_pts": positive_pts,
             "profile_neg_pts": negative_pts,
             "profile_zero_pts": zero_pts,
@@ -1503,9 +1534,10 @@ class AnalyticsEngine:
                 "OI share by DTE raw 0/1-2/3-7/8+=%.1f/%.1f/%.1f/%.1f%%; "
                 "DTE-weighted 0/1-2/3-7/8+=%.1f/%.1f/%.1f/%.1f%%. "
                 "Profile (widest rung) peak|GEX|=%.3g, median|GEX|=%.3g, "
-                "structural floor=%.3g (crossings need a local window peak "
-                "above this to qualify); sign distribution +/-/0=%d/%d/%d "
-                "points (a monotonic split means no crossing exists at all).",
+                "p%.0f reference=%.3g, structural floor=%.3g (crossings need "
+                "a local window peak above this to qualify); sign distribution "
+                "+/-/0=%d/%d/%d points (a monotonic split means no crossing "
+                "exists at all).",
                 self.db_symbol, timestamp,
                 gamma_flip_span_used * 100.0,
                 diag["usable_total"], len(options), len(gamma_profile),
@@ -1520,7 +1552,9 @@ class AnalyticsEngine:
                 diag["weighted_oi_share_1_2dte"] * 100.0,
                 diag["weighted_oi_share_3_7dte"] * 100.0,
                 diag["weighted_oi_share_8plus_dte"] * 100.0,
-                diag["profile_peak"], diag["profile_median"], diag["structural_floor"],
+                diag["profile_peak"], diag["profile_median"],
+                GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE,
+                diag["profile_reference"], diag["structural_floor"],
                 diag["profile_pos_pts"], diag["profile_neg_pts"], diag["profile_zero_pts"],
             )
         elif GAMMA_PROFILE_SPAN_LADDER and gamma_flip_span_used > GAMMA_PROFILE_SPAN_LADDER[0]:
