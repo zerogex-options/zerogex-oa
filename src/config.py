@@ -7,7 +7,7 @@ All configurable constants in one place for easy tuning.
 import json
 import logging
 import os
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 
 # CRITICAL: Load environment variables FIRST before any config is read
@@ -75,6 +75,58 @@ def _getenv_float(
     return value
 
 
+def _getenv_float_list(
+    name: str,
+    default: List[float],
+    *,
+    min_item: Optional[float] = None,
+    max_item: Optional[float] = None,
+    ascending: bool = False,
+) -> List[float]:
+    """Fetch a comma-separated list of floats.  Empty / parse failure /
+    a result with no usable items falls back to ``default``.
+
+    ``ascending``: when True, drop entries that are not strictly greater
+    than the running max (keeps the list ascending without raising).
+    """
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        values: List[float] = list(default)
+    else:
+        parsed: List[float] = []
+        ok = True
+        for tok in raw.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                parsed.append(float(tok))
+            except (TypeError, ValueError):
+                ok = False
+                break
+        if not ok or not parsed:
+            _cfg_logger.error(
+                "Invalid float list for env var %s=%r — falling back to default %s",
+                name,
+                raw,
+                default,
+            )
+            values = list(default)
+        else:
+            values = parsed
+    if min_item is not None:
+        values = [v if v >= min_item else min_item for v in values]
+    if max_item is not None:
+        values = [v if v <= max_item else max_item for v in values]
+    if ascending:
+        cleaned: List[float] = []
+        for v in values:
+            if not cleaned or v > cleaned[-1]:
+                cleaned.append(v)
+        values = cleaned or list(default)
+    return values
+
+
 def _getenv_bool(name: str, default: bool) -> bool:
     """Fetch a boolean env var.  Accepts (case-insensitive) true/false/1/0/yes/no."""
     raw = os.getenv(name)
@@ -128,12 +180,74 @@ GEX_HEATMAP_STRIKE_BAND_PCT = _getenv_float("GEX_HEATMAP_STRIKE_BAND_PCT", 0.08,
 # Gamma-flip / net-GEX-at-spot are derived from the SpotGamma-style
 # spot-shift dealer gamma-exposure profile: option gammas are re-priced
 # across a grid of hypothetical spots spanning spot ± SPAN_PCT, stepped
-# by STEP_PCT of spot. The span must comfortably exceed how far the
-# zero-gamma level realistically sits from spot (it is routinely several
-# percent away, well outside the ingested strike band) or the profile is
-# one-signed and the flip clamps to the grid edge instead of resolving.
+# by STEP_PCT of spot.
+#
+# The gamma flip is resolved by *adaptive bracket-and-verify*: scan an
+# ascending ladder of spans (SPAN_PCT, then GAMMA_PROFILE_EXPANSION_RUNGS)
+# and accept the first rung at which a candidate sign change is both
+# INTERIOR (well away from the grid edges, where every contract's BS
+# gamma has decayed near zero and the profile enters its noise floor)
+# AND STRUCTURAL (the |profile| magnitude near the candidate is
+# meaningfully non-zero relative to the global peak — i.e. the profile
+# is REALLY crossing zero, not just drifting through it).  When even
+# the widest rung yields nothing, the flip is persisted NULL+WARN:
+# "actionable flip is beyond ±MAX% from spot, or chain is degraded" —
+# an honest signal, not a fabricated edge value.
+#
+# The asymptotic structure of dealer dollar gamma guarantees a
+# zero crossing exists somewhere in (0, ∞): f(S)→0− as S→0
+# (puts-only, dealer net short under this codebase's sign convention)
+# and f(S)→0+ as S→∞ (calls-only, dealer net long).  Our job is to
+# RESOLVE it in a window where the signal is strong enough to trust.
 GAMMA_PROFILE_SPAN_PCT = _getenv_float("GAMMA_PROFILE_SPAN_PCT", 0.20, min=0.02, max=1.0)
 GAMMA_PROFILE_STEP_PCT = _getenv_float("GAMMA_PROFILE_STEP_PCT", 0.0025, min=0.0001, max=0.05)
+
+# Adaptive expansion rungs BEYOND the initial GAMMA_PROFILE_SPAN_PCT,
+# in ascending order, each an absolute fraction of spot.  Tried only
+# when the smaller rung does not yield a structural interior crossing.
+# Bound to 1.0 (= ±100% of spot) — beyond that the grid would include
+# negative prices, and a flip that far from spot is not actionable on
+# any trading horizon.  The largest rung is the implicit "we tried hard
+# enough" threshold: anything beyond it is persisted NULL+WARN.
+GAMMA_PROFILE_EXPANSION_RUNGS = _getenv_float_list(
+    "GAMMA_PROFILE_EXPANSION_RUNGS",
+    [0.35, 0.50],
+    min_item=0.02,
+    max_item=1.0,
+    ascending=True,
+)
+# Composed ladder: initial span + any expansion rungs strictly greater
+# than it, ascending.  This is the runtime artifact the analytics engine
+# walks; the two env vars above are the user-facing knobs.
+GAMMA_PROFILE_SPAN_LADDER: List[float] = [
+    GAMMA_PROFILE_SPAN_PCT,
+    *[s for s in GAMMA_PROFILE_EXPANSION_RUNGS if s > GAMMA_PROFILE_SPAN_PCT],
+]
+
+# Interior gate: a candidate sign change between adjacent profile points
+# is rejected unless its linearly-interpolated crossing position sits at
+# least this fraction of the grid span away from EITHER edge.  Forces
+# the resolver to EXPAND the grid rather than accept a brittle near-edge
+# value (the 2026-05-19 QQQ pathology: $839 / $802 flips stuck at the
+# ±20% grid boundary).  Range [0.0, 0.49] — 0.49 is the largest value
+# that still permits a single qualifying crossing (the grid center).
+GAMMA_PROFILE_INTERIOR_MARGIN = _getenv_float(
+    "GAMMA_PROFILE_INTERIOR_MARGIN", 0.10, min=0.0, max=0.49
+)
+# Structural gate: a candidate sign change is rejected unless the peak
+# |profile| value within ±STRUCTURAL_WINDOW_PCT × candidate_price of the
+# crossing is at least STRUCTURAL_MIN_FRAC × (global peak |profile| over
+# the whole grid).  Filters noise-floor sign changes (profile drifting
+# through zero in a region where every contract's gamma has decayed —
+# the morning-open / extended-hours artifact where IVs spike, gammas
+# collapse, and the entire grid's profile slumps into a low-signal
+# regime where any imbalance can flip sign spuriously).
+GAMMA_PROFILE_STRUCTURAL_MIN_FRAC = _getenv_float(
+    "GAMMA_PROFILE_STRUCTURAL_MIN_FRAC", 0.02, min=0.0, max=1.0
+)
+GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT = _getenv_float(
+    "GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT", 0.01, min=0.001, max=0.10
+)
 
 # The gamma flip is a *multi-day* regime level, but a same-day 0DTE wall
 # carries a colossal re-greeked Black-Scholes gamma spike (ATM gamma ∝

@@ -30,6 +30,10 @@ from src.config import (
     RISK_FREE_RATE,
     ANALYTICS_FLOW_CACHE_REFRESH_ENABLED,
     GAMMA_PROFILE_SPAN_PCT,
+    GAMMA_PROFILE_SPAN_LADDER,
+    GAMMA_PROFILE_INTERIOR_MARGIN,
+    GAMMA_PROFILE_STRUCTURAL_MIN_FRAC,
+    GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT,
     GAMMA_PROFILE_STEP_PCT,
     GAMMA_PROFILE_DTE_WEIGHTING,
     GAMMA_PROFILE_DTE_REF_DAYS,
@@ -932,6 +936,8 @@ class AnalyticsEngine:
         options: List[Dict[str, Any]],
         spot: float,
         timestamp: datetime,
+        *,
+        span_pct: Optional[float] = None,
     ) -> List[Tuple[float, float]]:
         """SpotGamma / SqueezeMetrics dealer gamma-exposure profile.
 
@@ -953,10 +959,16 @@ class AnalyticsEngine:
         (sticky-strike — the standard simplification; a full
         vol-surface re-shift is out of scope).
 
-        The grid spans ``spot ± GAMMA_PROFILE_SPAN_PCT`` stepped by
-        ``GAMMA_PROFILE_STEP_PCT`` of spot, so the zero crossing is found
-        regardless of how far it sits from spot / the ingested strike
-        band.  Returns ``[]`` when no profile can be built (no spot / no
+        ``span_pct`` (optional) lets the adaptive flip resolver
+        (:meth:`_resolve_gamma_flip`) re-build the profile at a wider
+        span when the initial scan yields no structural interior
+        crossing.  When omitted, defaults to ``GAMMA_PROFILE_SPAN_PCT``
+        (the first ladder rung) — preserves the single-span API for
+        direct callers (tests, ad-hoc inspection).  Grid step stays
+        ``GAMMA_PROFILE_STEP_PCT`` regardless of span, so resolution
+        per dollar is constant across rungs.
+
+        Returns ``[]`` when no profile can be built (no spot / no
         usable contracts).
 
         Each contract's contribution is additionally scaled by
@@ -974,7 +986,8 @@ class AnalyticsEngine:
         if spot <= 0 or not options:
             return []
 
-        span = spot * GAMMA_PROFILE_SPAN_PCT
+        effective_span_pct = GAMMA_PROFILE_SPAN_PCT if span_pct is None else span_pct
+        span = spot * effective_span_pct
         step = max(spot * GAMMA_PROFILE_STEP_PCT, 1e-6)
         grid = np.arange(spot - span, spot + span + step, step)
         grid = grid[grid > 0.0]
@@ -1076,6 +1089,133 @@ class AnalyticsEngine:
 
         return best_flip
 
+    def _find_structural_interior_crossing(
+        self, profile: List[Tuple[float, float]], underlying_price: float
+    ) -> Optional[float]:
+        """First-class crossing detector for the adaptive flip resolver.
+
+        Walks the profile for adjacent sign changes (and exact zeros) and
+        returns the nearest-to-spot crossing that passes BOTH of:
+
+        * **Interior** — the linearly-interpolated crossing sits at least
+          ``GAMMA_PROFILE_INTERIOR_MARGIN`` of the grid span away from
+          either edge.  Forces the resolver to expand the grid rather
+          than accept a brittle near-edge value.  Geometrically the same
+          idea as a well-bracketed root in Brent's method: the bracket
+          must have non-trivial width on both sides.
+
+        * **Structural** — the peak ``|profile|`` value within
+          ``±GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT × candidate`` of the
+          crossing is at least ``GAMMA_PROFILE_STRUCTURAL_MIN_FRAC`` of
+          the global peak ``|profile|`` on the grid.  Rejects noise-floor
+          sign changes (profile slowly drifting through zero in a region
+          where every contract's gamma has decayed near zero — the
+          morning-open / extended-hours artifact where IVs spike, gammas
+          collapse globally, and a sliver of imbalance can flip sign
+          spuriously).
+
+        Returns ``None`` when nothing qualifies.  Unlike
+        :meth:`_calculate_gamma_flip_point`, this is intentionally
+        STRICT: a one-signed profile, a noise-floor crossing, and an
+        edge-only crossing all return ``None`` so the caller can decide
+        whether to expand the grid or give up.
+        """
+        if not profile or len(profile) < 2:
+            return None
+
+        s_lo = profile[0][0]
+        s_hi = profile[-1][0]
+        width = s_hi - s_lo
+        if width <= 0:
+            return None
+        margin_abs = GAMMA_PROFILE_INTERIOR_MARGIN * width
+        interior_lo = s_lo + margin_abs
+        interior_hi = s_hi - margin_abs
+
+        peak = max((abs(v) for _, v in profile), default=0.0)
+        if peak <= 0.0:
+            return None
+        floor_abs = GAMMA_PROFILE_STRUCTURAL_MIN_FRAC * peak
+
+        best_flip: Optional[float] = None
+        best_dist = float("inf")
+        for i in range(len(profile) - 1):
+            s1, c1 = profile[i]
+            s2, c2 = profile[i + 1]
+            if c1 * c2 < 0.0:
+                candidate = s1 + (s2 - s1) * (-c1) / (c2 - c1)
+            elif c1 == 0.0:
+                candidate = s1
+            else:
+                continue
+            if candidate < interior_lo or candidate > interior_hi:
+                continue
+            half = GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT * max(candidate, 1e-9)
+            w_lo = candidate - half
+            w_hi = candidate + half
+            window_peak = 0.0
+            for s, v in profile:
+                if w_lo <= s <= w_hi:
+                    av = abs(v)
+                    if av > window_peak:
+                        window_peak = av
+            if window_peak < floor_abs:
+                continue
+            dist = abs(candidate - underlying_price)
+            if dist < best_dist:
+                best_dist = dist
+                best_flip = candidate
+        return best_flip
+
+    def _resolve_gamma_flip(
+        self,
+        options: List[Dict[str, Any]],
+        spot: float,
+        timestamp: datetime,
+    ) -> Tuple[List[Tuple[float, float]], Optional[float], float]:
+        """Adaptive bracket-and-verify resolution of the gamma flip.
+
+        Industry-rigorous root-finding for a function known to have a
+        zero (the dealer dollar gamma profile has fixed asymptotic
+        signs: → 0− as S → 0 because only puts retain gamma, dealer net
+        short under this codebase's convention; → 0+ as S → ∞ because
+        only calls retain gamma, dealer net long).  Since a flip
+        ALWAYS exists somewhere in (0, ∞), the algorithm's job is to
+        RESOLVE it inside a window where the profile signal is strong
+        enough to trust — never to fabricate one at a grid edge or to
+        accept a noise-floor sign change.
+
+        Walks ``GAMMA_PROFILE_SPAN_LADDER`` in ascending order; at each
+        rung builds the spot-shift profile and tries
+        :meth:`_find_structural_interior_crossing` (interior +
+        structural gates).  Returns the FIRST rung that yields a
+        qualifying crossing.  When no rung qualifies, returns
+        ``(last_profile, None, last_span)`` and the caller persists
+        NULL+WARN — the honest "actionable flip beyond ±MAX% from spot
+        or the chain is degraded" signal.
+
+        Both the flip and ``net_gex_at_spot`` are read off the SAME
+        returned profile, so the sign-consistency invariant
+        (flip vs. net_gex_at_spot side-of-spot) holds at every rung —
+        the resolver never changes which profile produces the readings.
+
+        Returns ``(profile, flip, span_used)``.
+        """
+        last_profile: List[Tuple[float, float]] = []
+        last_span: float = (
+            GAMMA_PROFILE_SPAN_LADDER[0] if GAMMA_PROFILE_SPAN_LADDER else GAMMA_PROFILE_SPAN_PCT
+        )
+        for span_pct in GAMMA_PROFILE_SPAN_LADDER:
+            profile = self._gamma_exposure_profile(options, spot, timestamp, span_pct=span_pct)
+            last_profile = profile
+            last_span = span_pct
+            if not profile:
+                continue
+            flip = self._find_structural_interior_crossing(profile, spot)
+            if flip is not None:
+                return profile, flip, span_pct
+        return last_profile, None, last_span
+
     def _net_gex_at_spot(
         self, profile: List[Tuple[float, float]], underlying_price: float
     ) -> Optional[float]:
@@ -1145,24 +1285,26 @@ class AnalyticsEngine:
         # Gamma flip + net-GEX-at-spot are two readings of ONE spot-shift
         # dealer gamma-exposure profile (see _gamma_exposure_profile): the
         # flip is its zero crossing, net_gex_at_spot is its value at the
-        # current price. Deriving both from the same primitive keeps the
+        # current price.  Deriving both from the same primitive keeps the
         # headline figure and the spot-vs-flip regime from contradicting
-        # each other, and — because the profile re-prices gamma across a
-        # wide hypothetical-price grid — the flip resolves even when the
-        # zero-gamma level sits well outside the ingested strike band.
-        gamma_profile = self._gamma_exposure_profile(options, underlying_price, timestamp)
-        gamma_flip_point = self._calculate_gamma_flip_point(gamma_profile, underlying_price)
+        # each other.
+        #
+        # The flip is resolved by adaptive bracket-and-verify
+        # (_resolve_gamma_flip): the span ladder is walked in ascending
+        # order, and the first rung that yields a STRUCTURAL INTERIOR
+        # crossing — well away from the grid edges, in a region where
+        # the profile magnitude is meaningfully non-zero — is accepted.
+        # When no rung qualifies, gamma_flip_point is None: that's the
+        # honest "actionable flip is beyond ±MAX% from spot or chain is
+        # degraded" signal — NOT a fabricated grid-edge value, NOT a
+        # noise-floor sign change.  net_gex_at_spot is sampled at spot
+        # off the same (last-built) profile, preserving sign consistency
+        # regardless of which rung resolved.
+        gamma_profile, gamma_flip_point, gamma_flip_span_used = self._resolve_gamma_flip(
+            options, underlying_price, timestamp
+        )
         net_gex_at_spot = self._net_gex_at_spot(gamma_profile, underlying_price)
 
-        # No crossing across the whole ±span grid. For a liquid chain this
-        # is not a real "flip is far away" — it means the usable
-        # (gamma-non-null) snapshot was degraded/one-sided this cycle
-        # (stale-feed / after-hours: ingestion nulls greeks, the snapshot
-        # query drops gamma-NULL rows, the residual is one-signed). Mark
-        # the flip unresolved so it persists NULL (a visible gap) and the
-        # carry-forward does NOT silently re-freeze a stale level, and WARN
-        # so the degradation is visible in analytics-health rather than
-        # inferred from SQL.
         gamma_flip_unresolved = gamma_flip_point is None
         if gamma_flip_unresolved:
             usable = sum(
@@ -1173,15 +1315,29 @@ class AnalyticsEngine:
                 and (o.get("strike") or 0) > 0
             )
             logger.warning(
-                "Gamma flip UNRESOLVED for %s @ %s: dealer gamma profile one-signed "
-                "across spot ±%.0f%% (%d/%d usable contracts, %d profile points) — "
-                "degraded/one-sided chain; persisting NULL (no clamp, no carry-forward)",
+                "Gamma flip UNRESOLVED for %s @ %s: no structural interior crossing "
+                "across the span ladder (max rung ±%.0f%% reached, %d/%d usable "
+                "contracts, %d profile points at max rung) — actionable flip is "
+                "beyond the widest rung or the chain is degraded; persisting NULL "
+                "(no clamp, no carry-forward)",
                 self.db_symbol,
                 timestamp,
-                GAMMA_PROFILE_SPAN_PCT * 100.0,
+                gamma_flip_span_used * 100.0,
                 usable,
                 len(options),
                 len(gamma_profile),
+            )
+        elif GAMMA_PROFILE_SPAN_LADDER and gamma_flip_span_used > GAMMA_PROFILE_SPAN_LADDER[0]:
+            logger.info(
+                "Gamma flip resolved at expanded span ±%.0f%% for %s @ %s "
+                "(flip $%.2f, spot $%.2f) — first ladder rung ±%.0f%% was "
+                "insufficient (wider gamma regime than the default scan)",
+                gamma_flip_span_used * 100.0,
+                self.db_symbol,
+                timestamp,
+                gamma_flip_point,
+                underlying_price,
+                GAMMA_PROFILE_SPAN_LADDER[0] * 100.0,
             )
 
         # Calculate max pain per expiration, then pick the front month

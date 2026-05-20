@@ -267,6 +267,231 @@ def test_dte_weighting_unpins_flip_from_0dte_wall(monkeypatch):
     assert abs(weighted_flip - unweighted_flip) >= 0.10 * spot
 
 
+def test_find_structural_interior_crossing_geometry():
+    """Unit test for the interior + structural gates on a hand-built profile.
+
+    With the default 10% interior margin, a sign change in the last grid
+    cell is rejected (edge → expand the grid).  With a structural floor
+    that demands non-trivial magnitude, a sign change in the noise floor
+    is rejected (noise → expand the grid).  An interior sign change
+    surrounded by structurally-significant magnitude is accepted, and
+    among multiple qualifiers the one nearest spot wins.
+    """
+    engine = AnalyticsEngine(underlying="SPY")
+    # Grid 80..120, width 40.  At 10% margin, interior is (84, 116).
+    # Sign change in the LAST cell (118->120) is at the edge => reject.
+    profile_edge = [(s, -1.0) for s in range(80, 119)] + [(119.0, -1.0), (120.0, 5.0)]
+    assert engine._find_structural_interior_crossing(profile_edge, 100.0) is None
+
+    # Sign change in the FIRST cell (80->82): below interior_lo => reject.
+    profile_edge_lo = [(80.0, 5.0), (82.0, -1.0)] + [(s, -1.0) for s in range(84, 121)]
+    assert engine._find_structural_interior_crossing(profile_edge_lo, 100.0) is None
+
+    # Interior crossing at ~100, surrounded by large magnitudes both sides
+    # (|profile| peak ~ 1000): structural gate satisfied.
+    profile_clean = [
+        (90.0, -1000.0),
+        (95.0, -800.0),
+        (99.0, -100.0),
+        (101.0, 100.0),
+        (105.0, 800.0),
+        (110.0, 1000.0),
+    ]
+    flip = engine._find_structural_interior_crossing(profile_clean, 100.0)
+    assert flip is not None and abs(flip - 100.0) < 0.5
+
+    # Same crossing geometry, but the surrounding magnitudes are in the
+    # noise floor (peak |profile| dominated by a far-edge value).  The
+    # structural gate (default 2% of peak) rejects.
+    profile_noisy = [
+        (90.0, -10_000.0),  # dominates peak; sets noise floor at 0.02 * 10_000 = 200
+        (95.0, -50.0),
+        (99.0, -1.0),
+        (101.0, 1.0),
+        (105.0, 50.0),
+        (110.0, 100.0),  # window peak around 101 is ~50, well below 200
+    ]
+    assert engine._find_structural_interior_crossing(profile_noisy, 100.0) is None
+
+    # Two qualifying interior crossings.  Bracketing pairs are placed
+    # tightly enough that BOTH grid points fall inside the structural
+    # window (±1% of the candidate crossing, the default), so the
+    # structural gate sees the bracket's magnitude rather than zero:
+    #   (92.5, -100) → (93.5, +100) crosses at 93.0
+    #   (104, +1000) → (106, -1000) crosses at 105.0 (and (105, 0)
+    #   also sits in the structural window of 105)
+    profile_multi = [
+        (88.0, -1000.0),
+        (92.5, -100.0),
+        (93.5, 100.0),  # crossing at 93
+        (96.0, 1000.0),
+        (104.0, 1000.0),
+        (105.0, 0.0),
+        (106.0, -1000.0),  # crossing at 105
+        (110.0, -1000.0),
+        (112.0, -1000.0),
+    ]
+    # Spot 100 — both crossings interior, 105 is nearer (dist 5 vs 7).
+    flip = engine._find_structural_interior_crossing(profile_multi, 100.0)
+    assert flip is not None and abs(flip - 105.0) < 0.5
+    # Bias spot toward each side to prove the "nearest to spot" tie-break.
+    flip_low = engine._find_structural_interior_crossing(profile_multi, 92.0)
+    assert flip_low is not None and abs(flip_low - 93.0) < 0.5
+    flip_high = engine._find_structural_interior_crossing(profile_multi, 108.0)
+    assert flip_high is not None and abs(flip_high - 105.0) < 0.5
+
+
+def test_resolve_gamma_flip_uses_first_rung_when_interior_crossing_exists(monkeypatch):
+    """Default case: the flip is interior on the initial ±20% rung.
+    The resolver returns that rung's profile + crossing without
+    expanding — no wasted work on a regime where the smaller grid
+    already resolves cleanly.
+    """
+    engine = AnalyticsEngine(underlying="SPY")
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
+    exp = datetime(2026, 9, 18).date()
+    spot = 100.0
+    options = [
+        # Heavy put mass clearly below, call mass clearly above => interior
+        # crossing right in the middle on the first rung.
+        _opt(92.0, "P", oi=8000, iv=0.30, exp=exp),
+        _opt(112.0, "C", oi=8000, iv=0.30, exp=exp),
+    ]
+    profile, flip, span_used = engine._resolve_gamma_flip(options, spot, ts)
+    assert flip is not None and 92.0 < flip < 112.0
+    # First rung used (no expansion).
+    assert abs(span_used - main_engine.GAMMA_PROFILE_SPAN_LADDER[0]) < 1e-9
+    # Profile extends across only the first rung's span.
+    assert profile[0][0] >= spot * (1.0 - span_used) - 1e-6
+    assert profile[-1][0] <= spot * (1.0 + span_used) + 1e-6
+
+
+def test_resolve_gamma_flip_expands_grid_for_wide_real_flip():
+    """Genuinely wide flip case: at the initial ±20% rung the profile is
+    one-signed (no crossing at all), so the first rung's resolver yields
+    None.  The ladder steps up and resolves the real interior crossing
+    on a wider rung.  This is exactly the deep-short-gamma regime where
+    the previous code would have NULL+WARN'd a resolvable flip.
+
+    Chain: ATM put + deep-OTM call (K = +60% above spot).  Below ~+25%
+    spot move, the ATM put dominates dealer dollar gamma (calls there are
+    far OTM, gamma small); above ~+25% the OTM call's gamma climbs faster
+    than the put's drops.  Crossing lands around +25% — outside ±20%,
+    inside ±35%.
+    """
+    engine = AnalyticsEngine(underlying="SPY")
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
+    exp = datetime(2026, 9, 18).date()
+    spot = 100.0
+    options = [
+        _opt(100.0, "P", oi=200_000, iv=0.30, exp=exp),
+        _opt(160.0, "C", oi=200_000, iv=0.30, exp=exp),
+    ]
+    # Premise: first rung yields no structural interior crossing.
+    first_rung = main_engine.GAMMA_PROFILE_SPAN_LADDER[0]
+    first_rung_profile = engine._gamma_exposure_profile(options, spot, ts, span_pct=first_rung)
+    assert engine._find_structural_interior_crossing(first_rung_profile, spot) is None
+
+    profile, flip, span_used = engine._resolve_gamma_flip(options, spot, ts)
+    assert flip is not None
+    # The crossing sits outside the first rung's window — that's the point.
+    assert flip > spot * (1.0 + first_rung)
+    assert span_used > first_rung
+    assert profile[0][0] < flip < profile[-1][0]
+    # And the resolver still produced a sign-consistent net_gex_at_spot.
+    n_at_spot = engine._net_gex_at_spot(profile, spot)
+    assert n_at_spot is not None and (n_at_spot < 0) == (spot < flip)
+
+
+def test_resolve_gamma_flip_returns_none_at_max_rung_when_profile_truly_one_signed():
+    """A book that is one-signed at EVERY ladder rung (pathological
+    chain, e.g. all calls, no puts — or after-hours when every put has
+    been NULL-greeked out): the resolver walks the whole ladder, finds
+    no structural interior crossing anywhere, and returns (last_profile,
+    None, max_rung).  The caller persists NULL+WARN — not a fabricated
+    edge value.
+    """
+    engine = AnalyticsEngine(underlying="SPY")
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
+    exp = datetime(2026, 9, 18).date()
+    spot = 100.0
+    options = [_opt(100.0, "C", oi=5000, iv=0.25, exp=exp)]  # pure long calls
+    profile, flip, span_used = engine._resolve_gamma_flip(options, spot, ts)
+    assert flip is None
+    assert profile  # last profile is still built (net_gex_at_spot reads off it)
+    assert all(v >= 0 for _, v in profile)  # one-signed across the widest rung
+    assert abs(span_used - main_engine.GAMMA_PROFILE_SPAN_LADDER[-1]) < 1e-9
+
+
+def test_resolve_gamma_flip_rejects_noise_floor_edge_crossing(monkeypatch):
+    """The 2026-05-19 QQQ pathology: at the initial ±20% rung the only
+    sign change sits right at the grid edge in the noise floor (far
+    from spot, where every contract's gamma has decayed near zero).
+    The resolver's interior + structural gates reject it.  In this
+    synthesised case the wider rungs also have no qualifying crossing,
+    so the resolver correctly returns NULL — *not* the spurious
+    edge-resolved value the old code would have persisted.
+    """
+    engine = AnalyticsEngine(underlying="SPY")
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
+    # Tighten the ladder for the test so we can construct a focused
+    # one-signed-everywhere case without enormous synthetic OI.
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_SPAN_LADDER", [0.20, 0.35, 0.50])
+
+    exp = datetime(2026, 9, 18).date()
+    spot = 100.0
+    # Pure put book — short dealer gamma everywhere; no real interior
+    # crossing, but the BS-gamma vectorised re-pricing across the grid
+    # leaves rounding-scale residuals at the extreme edges that can
+    # produce a hairline sign change in the noise floor.  Structural
+    # gate must reject it.
+    options = [
+        _opt(80.0, "P", oi=10_000, iv=0.30, exp=exp),
+        _opt(85.0, "P", oi=10_000, iv=0.30, exp=exp),
+        _opt(90.0, "P", oi=10_000, iv=0.30, exp=exp),
+        _opt(95.0, "P", oi=10_000, iv=0.30, exp=exp),
+    ]
+    profile, flip, span_used = engine._resolve_gamma_flip(options, spot, ts)
+    assert flip is None
+    assert span_used == main_engine.GAMMA_PROFILE_SPAN_LADDER[-1]
+
+
+def test_resolve_gamma_flip_keeps_sign_consistency_invariant_at_every_rung():
+    """The flip/net_gex_at_spot sign-consistency invariant must hold
+    regardless of which ladder rung resolved.  Read both off the SAME
+    returned profile: net_gex_at_spot's sign matches sign(spot - flip).
+    """
+    engine = AnalyticsEngine(underlying="SPY")
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
+    exp = datetime(2026, 9, 18).date()
+    spot = 100.0
+
+    # Interior on the first rung.
+    options_a = [
+        _opt(92.0, "P", oi=8000, iv=0.30, exp=exp),
+        _opt(112.0, "C", oi=8000, iv=0.30, exp=exp),
+    ]
+    prof_a, flip_a, _ = engine._resolve_gamma_flip(options_a, spot, ts)
+    assert flip_a is not None
+    n_a = engine._net_gex_at_spot(prof_a, spot)
+    assert n_a is not None
+    # Same convention as the existing interior-flip test: short below,
+    # long above.  sign(net_gex_at_spot) == sign(spot - flip).
+    assert (n_a < 0) == (spot < flip_a)
+
+    # Wider regime: forces expansion (same construction as the
+    # wide-flip test above).
+    options_b = [
+        _opt(100.0, "P", oi=200_000, iv=0.30, exp=exp),
+        _opt(160.0, "C", oi=200_000, iv=0.30, exp=exp),
+    ]
+    prof_b, flip_b, _ = engine._resolve_gamma_flip(options_b, spot, ts)
+    assert flip_b is not None
+    n_b = engine._net_gex_at_spot(prof_b, spot)
+    assert n_b is not None
+    assert (n_b < 0) == (spot < flip_b)
+
+
 def test_store_gex_summary_carries_forward_previous_gamma_flip_when_missing():
     engine = AnalyticsEngine(underlying="SPY")
     cursor = MagicMock()
