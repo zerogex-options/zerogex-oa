@@ -89,6 +89,16 @@ MIN_ERA_SAMPLES = 30
 # here and kept env-overridable for the analysis.
 DEFAULT_FLIP_NOT_NEAR_PCT = float(os.getenv("GAMMA_FLIP_NOT_NEAR_PCT", "0.006"))
 
+# Optional later boundary: the flip calc kept changing after the deploy
+# (7106711 -> 1731efc spot-shift -> 62c70df DTE-weighted ...), so the raw
+# post-cutoff window can mix flip definitions.  Set this to when the flip
+# calc last STABILIZED in production (e.g. the 62c70df prod-deploy
+# instant) to restrict the POST era to a single, settled definition; the
+# rows between the deploy cutoff and this instant are reported as an
+# excluded "transitional (mixed flip defs)" bucket.  Blank = single split
+# at the deploy cutoff (original behavior).
+STABLE_SINCE_ENV = "GAMMA_FLIP_STABLE_SINCE"
+
 # Verdict heuristics — thresholds for FLAGGING a human review, never for
 # auto-applying a change.  A gate firing-rate moving by more than this
 # (in absolute percentage points), or the median |flip_distance| more
@@ -178,6 +188,15 @@ def _fetch_flip_distances(cur, underlying: str, window_days: int) -> list[tuple[
     return out
 
 
+def _parse_optional_instant(raw: Optional[str]) -> Optional[datetime]:
+    """Parse an optional ISO date/datetime (ET when offset-less), or None
+    when blank.  Reuses the deploy-cutoff parser (same ET/fail-closed
+    rules) — a non-blank value never falls through to its default."""
+    if raw is None or not raw.strip():
+        return None
+    return _resolve_deploy_cutoff(raw)
+
+
 def analyze(
     conn,
     underlying: str,
@@ -186,14 +205,32 @@ def analyze(
     deploy_cutoff: datetime,
     flip_min: float,
     not_near_pct: float,
-) -> tuple[Optional[EraStats], Optional[EraStats], int]:
-    """Partition persisted flip_distance at the deploy boundary and
-    summarize each era.  Returns (pre, post, total_rows)."""
+    stable_since: Optional[datetime] = None,
+) -> tuple[Optional[EraStats], Optional[EraStats], int, int]:
+    """Partition persisted flip_distance and summarize each era.
+
+    ``pre`` is always rows before the deploy cutoff (old per-strike
+    flip).  When ``stable_since`` is set the POST era is restricted to
+    rows at/after it (a single settled flip definition) and rows in
+    ``[deploy_cutoff, stable_since)`` are an excluded transitional
+    bucket; otherwise POST is everything at/after the deploy cutoff.
+    Returns ``(pre, post, total_rows, transitional_n)``."""
     with conn.cursor() as cur:
         rows = _fetch_flip_distances(cur, underlying, window_days)
 
+    post_floor = stable_since if stable_since is not None else deploy_cutoff
     pre = np.array([abs(fd) for ts, fd in rows if ts < deploy_cutoff], dtype=float)
-    post = np.array([abs(fd) for ts, fd in rows if ts >= deploy_cutoff], dtype=float)
+    post = np.array([abs(fd) for ts, fd in rows if ts >= post_floor], dtype=float)
+    transitional_n = (
+        sum(1 for ts, _ in rows if deploy_cutoff <= ts < stable_since)
+        if stable_since is not None
+        else 0
+    )
+    post_label = (
+        "post-stable (settled flip def, >= stable_since)"
+        if stable_since is not None
+        else "post-deploy (cumulative zero-gamma)"
+    )
     pre_stats = _summarize_era(
         "pre-deploy (old per-strike flip)",
         pre,
@@ -201,12 +238,12 @@ def analyze(
         not_near_pct=not_near_pct,
     )
     post_stats = _summarize_era(
-        "post-deploy (cumulative zero-gamma)",
+        post_label,
         post,
         flip_min=flip_min,
         not_near_pct=not_near_pct,
     )
-    return pre_stats, post_stats, len(rows)
+    return pre_stats, post_stats, len(rows), transitional_n
 
 
 def _verdict(pre: Optional[EraStats], post: Optional[EraStats]) -> str:
@@ -268,12 +305,29 @@ def _format_report(
     pre: Optional[EraStats],
     post: Optional[EraStats],
     total_rows: int,
+    stable_since: Optional[datetime] = None,
+    transitional_n: int = 0,
 ) -> str:
+    if stable_since is not None:
+        post_header = f"POST-stable (settled flip def, >= {stable_since.isoformat()}):"
+        scope_line = (
+            f"post era restricted to >= stable_since "
+            f"({STABLE_SINCE_ENV}): {stable_since.isoformat()}  "
+            f"[excluded {transitional_n} transitional rows in "
+            f"[{deploy_cutoff.isoformat()}, stable_since) — mixed flip defs]"
+        )
+    else:
+        post_header = "POST-deploy (cumulative zero-gamma flip):"
+        scope_line = (
+            "post era = all rows >= deploy cutoff (may mix flip defs if the "
+            f"calc changed again; set {STABLE_SINCE_ENV} for a clean read)"
+        )
     return "\n".join(
         [
             "=== Gamma-flip threshold re-validation ===",
             f"underlying={underlying}  window_days={window_days}  " f"rows={total_rows}",
             f"deploy boundary ({DEPLOY_CUTOFF_ENV}): {deploy_cutoff.isoformat()}",
+            scope_line,
             f"near-flip gate _FLIP_DISTANCE_MIN: bounce={_FLIP_MIN_BOUNCE:.2f} "
             f"break={_FLIP_MIN_BREAK:.2f} (analysis uses {flip_min:.2f})",
             f"saturation band: min={_FLIP_MIN_PCT} fallback={_FLIP_FALLBACK_PCT} "
@@ -282,7 +336,7 @@ def _format_report(
             "PRE-deploy (old per-strike flip):",
             _fmt_era(pre),
             "",
-            "POST-deploy (cumulative zero-gamma flip):",
+            post_header,
             _fmt_era(post),
             "",
             "VERDICT: " + _verdict(pre, post),
@@ -307,6 +361,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=DEFAULT_FLIP_NOT_NEAR_PCT,
         help="portfolio_engine 'flip not near' band (default 0.006).",
     )
+    parser.add_argument(
+        "--stable-since",
+        default=os.getenv(STABLE_SINCE_ENV),
+        help=(
+            "Optional ISO date/datetime (ET if offset-less): restrict the "
+            "POST era to a single settled flip definition (e.g. the "
+            "62c70df prod-deploy instant). Blank = single split at the "
+            "deploy cutoff."
+        ),
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -318,23 +382,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("--window-days must be positive")
 
     deploy_cutoff = _resolve_deploy_cutoff(os.getenv(DEPLOY_CUTOFF_ENV))
+    try:
+        stable_since = _parse_optional_instant(args.stable_since)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if stable_since is not None and stable_since <= deploy_cutoff:
+        parser.error(
+            f"--stable-since ({stable_since.isoformat()}) must be after the "
+            f"deploy cutoff ({deploy_cutoff.isoformat()}); it marks when the "
+            "flip calc settled, which is necessarily after the deploy."
+        )
     flip_min = max(_FLIP_MIN_BOUNCE, _FLIP_MIN_BREAK)  # the stricter gate
     logger.info(
-        "Re-validating %s flip thresholds (window=%dd, boundary=%s, " "flip_min=%.2f) — READ-ONLY",
+        "Re-validating %s flip thresholds (window=%dd, boundary=%s, "
+        "stable_since=%s, flip_min=%.2f) — READ-ONLY",
         args.underlying,
         args.window_days,
         deploy_cutoff.isoformat(),
+        stable_since.isoformat() if stable_since else "none",
         flip_min,
     )
 
     with db_connection() as conn:
-        pre, post, total = analyze(
+        pre, post, total, transitional_n = analyze(
             conn,
             args.underlying.upper(),
             window_days=args.window_days,
             deploy_cutoff=deploy_cutoff,
             flip_min=flip_min,
             not_near_pct=args.flip_not_near_pct,
+            stable_since=stable_since,
         )
         # Defensive: this tool never writes, but make the read-only
         # contract explicit even if a future edit adds a statement.
@@ -350,6 +427,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             pre=pre,
             post=post,
             total_rows=total,
+            stable_since=stable_since,
+            transitional_n=transitional_n,
         )
     )
     return 0

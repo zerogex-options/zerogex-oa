@@ -2479,13 +2479,18 @@ normalizer-cache-dry-run: ## Compute distributions without writing (preview only
 # GAMMA_FLIP_SYMBOL / GAMMA_FLIP_WINDOW_DAYS.
 GAMMA_FLIP_SYMBOL ?= SPY
 GAMMA_FLIP_WINDOW_DAYS ?= 30
+# Optional: restrict the POST era to one settled flip definition (e.g.
+# the 62c70df prod-deploy instant) so a still-moving flip calc can't mix
+# definitions in the comparison. Blank = single split at the deploy cutoff.
+GAMMA_FLIP_STABLE_SINCE ?=
 
 .PHONY: gamma-flip-revalidate
 gamma-flip-revalidate: ## Re-validate relative gamma-flip thresholds vs post-deploy data (read-only)
 	@echo "$(BLUE)=== Gamma-flip threshold re-validation ($(GAMMA_FLIP_SYMBOL)) ===$(NC)"
 	@$(PY) -m src.tools.gamma_flip_revalidation \
 		--underlying $(GAMMA_FLIP_SYMBOL) \
-		--window-days $(GAMMA_FLIP_WINDOW_DAYS)
+		--window-days $(GAMMA_FLIP_WINDOW_DAYS) \
+		$(if $(GAMMA_FLIP_STABLE_SINCE),--stable-since $(GAMMA_FLIP_STABLE_SINCE))
 
 # Override SYMBOLS to scope; the snapshot covers current + prior session
 # (everything /api/flow/series can request).
