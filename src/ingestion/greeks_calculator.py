@@ -307,11 +307,18 @@ class GreeksCalculator:
                 logger.error(f"Error in IV calculation: {e}", exc_info=True)
                 # Continue with original data
 
-        # Step 2: pick the IV to use for Greeks (default when missing).
+        # Step 2: pick the IV to use for Greeks. Fall back to default_iv
+        # locally when missing so we can still produce approximate Greeks,
+        # but DO NOT write it back into option_data. Persisting the default
+        # makes it indistinguishable from a real solver result downstream
+        # (e.g. vol_surface averages call+put IV per strike and the 0.20
+        # sentinel pollutes the curve, especially for ITM options
+        # pre-market where the IV solver routinely fails on intrinsic-only
+        # prices). Leaving implied_volatility as None lets the column stay
+        # NULL and lets the vol_surface router filter it via _iv_or_null.
         implied_volatility = option_data.get("implied_volatility")
         if not implied_volatility or implied_volatility <= 0:
             implied_volatility = self.default_iv
-            option_data["implied_volatility"] = implied_volatility
 
         # Step 3: validate required fields and either compute Greeks or
         # write Nones.  Single None-write path consolidates the four
