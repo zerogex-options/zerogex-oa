@@ -28,6 +28,13 @@ class MarketContext:
     vwap: Optional[float] = None
     vwap_deviation_pct: Optional[float] = None
     orb_status: Optional[str] = None
+    # Total open interest across the active chain (call_oi + put_oi).
+    # Used by vol_expansion's scale-invariant readiness formula
+    # (net_gex / (S² × total_oi)).  Optional so older context-builder
+    # paths that don't populate it can still pass MarketContext through;
+    # the readiness function falls back to the legacy global
+    # normalization when this is None or zero.
+    total_oi: Optional[int] = None
     # Trailing bar lows / highs aligned to ``recent_closes`` (oldest -> newest).
     # Populated alongside closes by the live data fetcher; patterns that need
     # wick info (e.g. gamma_flip_bounce) read these and fall back to closes

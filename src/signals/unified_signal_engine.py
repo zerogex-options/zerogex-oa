@@ -951,6 +951,8 @@ class UnifiedSignalEngine:
                     "put_call_ratio_volume": float(pcr or 1.0),
                     "put_call_ratio_oi": oi_pcr,
                     "max_pain": float(max_pain) if max_pain is not None else None,
+                    "total_call_oi": int(total_call_oi) if total_call_oi else 0,
+                    "total_put_oi": int(total_put_oi) if total_put_oi else 0,
                     "smart_call": float(sm_call or 0.0),
                     "smart_put": float(sm_put or 0.0),
                     "smart_call_net": float(sm_call or 0.0),
@@ -983,6 +985,9 @@ class UnifiedSignalEngine:
 
     def _build_market_context(self, ctx: dict) -> MarketContext:
         """Convert the dict returned by _fetch_market_context() into a MarketContext."""
+        call_oi = int(ctx.get("total_call_oi") or 0)
+        put_oi = int(ctx.get("total_put_oi") or 0)
+        total_oi = call_oi + put_oi
         return MarketContext(
             timestamp=ctx["timestamp"],
             underlying=self.db_symbol,
@@ -999,6 +1004,7 @@ class UnifiedSignalEngine:
             iv_rank=ctx.get("iv_rank"),
             vwap=ctx.get("vwap"),
             vwap_deviation_pct=ctx.get("vwap_deviation_pct"),
+            total_oi=total_oi if total_oi > 0 else None,
             extra={
                 "call_wall": ctx.get("call_wall"),
                 "prior_call_wall": ctx.get("prior_call_wall"),

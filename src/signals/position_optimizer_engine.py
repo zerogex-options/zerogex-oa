@@ -10,7 +10,8 @@ import pytz
 
 from src.database import db_connection
 from src.config import (
-    signal_gex_normalization_for,
+    GEX_SCALE_INVARIANT_SATURATION,
+    SIGNAL_GEX_NORMALIZATION,
     SIGNALS_KELLY_FRACTION,
     SIGNALS_PORTFOLIO_SIZE,
 )
@@ -604,6 +605,27 @@ class PositionOptimizerEngine:
     def _clamp(value: float, low: float, high: float) -> float:
         return max(low, min(value, high))
 
+    @classmethod
+    def _gex_magnitude_factor(cls, ctx) -> float:
+        """|net_gex| → [0, 1] magnitude factor for PoP heuristics.
+
+        Uses the scale-invariant denominator (S² × total_oi × 100 ×
+        0.01) when both spot (ctx.close) and total_oi are populated
+        on the MarketContext, multiplied by
+        GEX_SCALE_INVARIANT_SATURATION to map typical positive-regime
+        ratios into the [0, 1] clamp band.  Falls back to the legacy
+        global SIGNAL_GEX_NORMALIZATION when the new fields aren't
+        plumbed (older callers, tests).  Symbol-agnostic in either
+        path; no per-symbol tuning required.
+        """
+        net = abs(float(getattr(ctx, "net_gex", 0.0) or 0.0))
+        spot = float(getattr(ctx, "close", 0.0) or 0.0)
+        total_oi = getattr(ctx, "total_oi", None)
+        if spot > 0 and total_oi is not None and int(total_oi) > 0:
+            denom = spot * spot * float(int(total_oi)) * 100.0 * 0.01
+            return cls._clamp(net / denom * GEX_SCALE_INVARIANT_SATURATION, 0.0, 1.0)
+        return cls._clamp(net / SIGNAL_GEX_NORMALIZATION, 0.0, 1.0)
+
     def _liquidity_score(self, short_leg: dict, long_leg: dict) -> tuple[float, str]:
         mids = [max(self._mid(short_leg), 0.01), max(self._mid(long_leg), 0.01)]
         widths = [
@@ -867,7 +889,7 @@ class PositionOptimizerEngine:
             net_gamma = (call_leg["gamma"] + put_leg["gamma"]) * 100.0
             net_theta = (call_leg["theta"] + put_leg["theta"]) * 100.0
             base_pop = self._clamp(
-                0.40 + self._clamp(abs(ctx.net_gex) / signal_gex_normalization_for(ctx.underlying), 0.0, 1.0) * 0.25,
+                0.40 + self._gex_magnitude_factor(ctx) * 0.25,
                 0.2,
                 0.8,
             )
@@ -895,7 +917,7 @@ class PositionOptimizerEngine:
             net_gamma = (call_leg["gamma"] + put_leg["gamma"]) * 100.0
             net_theta = (call_leg["theta"] + put_leg["theta"]) * 100.0
             base_pop = self._clamp(
-                0.35 + self._clamp(abs(ctx.net_gex) / signal_gex_normalization_for(ctx.underlying), 0.0, 1.0) * 0.30,
+                0.35 + self._gex_magnitude_factor(ctx) * 0.30,
                 0.2,
                 0.8,
             )

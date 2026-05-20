@@ -588,37 +588,22 @@ SIGNALS_PORTFOLIO_SIZE = float(os.getenv("SIGNALS_PORTFOLIO_SIZE", "1000000"))
 # magnitude differs.
 SIGNAL_GEX_NORMALIZATION = _getenv_float("SIGNAL_GEX_NORMALIZATION", 2_100_000_000.0, min=1.0)
 
-# Per-symbol overrides for SIGNAL_GEX_NORMALIZATION.  Net dealer dollar
-# gamma scales with (S² × OI), so a single global scale calibrated for
-# SPY-magnitude underlyings saturates instantly on SPX (≈10× SPY
-# notional, ~100× SPY dollar gamma per contract) and over-saturates
-# on SPY itself in stable long-gamma regimes.  Empirically observed
-# net_gex on 2026-05-20 with the previous 2.1B default: SPX +54B
-# (26× over), SPY +4.1B (2× over), QQQ +1.6B (slightly under).  All
-# three pinned to the Low expansion floor (gex_readiness = 0.15) with
-# no dynamic range.  These per-symbol defaults give the readiness
-# mapping room to move; override via SIGNAL_GEX_NORMALIZATION_<SYMBOL>
-# env var if your universe's typical magnitudes differ.
-SIGNAL_GEX_NORMALIZATION_BY_SYMBOL: Dict[str, float] = {
-    "SPX": _getenv_float("SIGNAL_GEX_NORMALIZATION_SPX", 1.0e11, min=1.0),
-    "SPY": _getenv_float("SIGNAL_GEX_NORMALIZATION_SPY", 1.0e10, min=1.0),
-    "QQQ": _getenv_float("SIGNAL_GEX_NORMALIZATION_QQQ", 2.0e9, min=1.0),
-}
-
-
-def signal_gex_normalization_for(symbol: Optional[str]) -> float:
-    """Return the GEX-readiness denominator for ``symbol``.
-
-    Falls back to ``SIGNAL_GEX_NORMALIZATION`` (the legacy global
-    default) when ``symbol`` is ``None`` or not in the per-symbol map.
-    See :data:`SIGNAL_GEX_NORMALIZATION_BY_SYMBOL` for the rationale
-    behind the per-symbol defaults.
-    """
-    if symbol is None:
-        return SIGNAL_GEX_NORMALIZATION
-    return SIGNAL_GEX_NORMALIZATION_BY_SYMBOL.get(
-        symbol.upper(), SIGNAL_GEX_NORMALIZATION
-    )
+# Saturation scale for the scale-invariant GEX readiness formula
+# (see VolExpansionSignal._gex_readiness).  The signal computes
+# ``ratio = net_gex / (S² × total_oi × 100 × 0.01)`` — a dimensionless
+# balance measure that's symbol-agnostic by construction (the
+# denominator already absorbs the scale differences between SPX, SPY,
+# and QQQ).  This constant multiplies the raw ratio before the
+# [-1, +1] clamp, replacing the old global ``SIGNAL_GEX_NORMALIZATION``
+# as the single tuning knob.  Default 100 puts SPY's typical
+# stable-regime ratio (~0.01) at the saturation boundary, mapping
+# heavily long-gamma chains to the "Low" floor while leaving room for
+# Medium / High classifications as net_gex moves toward zero / negative.
+# Raise it to widen the dynamic range (more cycles read as Medium);
+# lower it to compress (more cycles saturate at the extremes).
+GEX_SCALE_INVARIANT_SATURATION = _getenv_float(
+    "GEX_SCALE_INVARIANT_SATURATION", 100.0, min=1.0
+)
 POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS = (
     os.getenv("POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS", "false").lower() == "true"
 )

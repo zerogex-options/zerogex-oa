@@ -13,7 +13,10 @@ from datetime import datetime
 import math
 from typing import Optional
 
-from src.config import signal_gex_normalization_for
+from src.config import (
+    GEX_SCALE_INVARIANT_SATURATION,
+    SIGNAL_GEX_NORMALIZATION,
+)
 
 
 @dataclass(frozen=True)
@@ -37,10 +40,20 @@ class StrategyBuilder:
         return max(low, min(value, high))
 
     @staticmethod
-    def _vol_expansion_readiness(net_gex: float, underlying: Optional[str] = None) -> float:
-        # Mirrors VolExpansionComponent._gex_readiness in lightweight form.
-        norm = signal_gex_normalization_for(underlying)
-        normalized = max(-1.0, min(1.0, -float(net_gex or 0.0) / norm))
+    def _vol_expansion_readiness(
+        net_gex: float,
+        spot: Optional[float] = None,
+        total_oi: Optional[int] = None,
+    ) -> float:
+        # Mirrors VolExpansionSignal._gex_readiness in lightweight form.
+        # Scale-invariant ratio when spot+total_oi are available;
+        # legacy global normalization when they aren't.
+        ng = float(net_gex or 0.0)
+        if spot is not None and spot > 0 and total_oi is not None and total_oi > 0:
+            denom = spot * spot * total_oi * 100.0 * 0.01
+            normalized = max(-1.0, min(1.0, (-ng / denom) * GEX_SCALE_INVARIANT_SATURATION))
+        else:
+            normalized = max(-1.0, min(1.0, -ng / SIGNAL_GEX_NORMALIZATION))
         return 0.15 + (1.0 - 0.15) * ((normalized + 1.0) / 2.0)
 
     @staticmethod
@@ -98,7 +111,8 @@ class StrategyBuilder:
         iv_rank = self._clamp(float(market_ctx.get("iv_rank") or 0.5), 0.0, 1.0)
         expansion = self._vol_expansion_readiness(
             float(market_ctx.get("net_gex") or 0.0),
-            market_ctx.get("underlying"),
+            spot=(float(market_ctx.get("close")) if market_ctx.get("close") is not None else None),
+            total_oi=(int(market_ctx.get("total_oi")) if market_ctx.get("total_oi") is not None else None),
         )
         direction_signal = self._direction_signal(market_ctx.get("recent_closes") or [])
         momentum_mag = abs(direction_signal)
