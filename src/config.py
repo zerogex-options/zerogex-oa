@@ -236,17 +236,33 @@ GAMMA_PROFILE_INTERIOR_MARGIN = _getenv_float(
 )
 # Structural gate: a candidate sign change is rejected unless the peak
 # |profile| value within ±STRUCTURAL_WINDOW_PCT × candidate_price of the
-# crossing is at least STRUCTURAL_MIN_FRAC × (global peak |profile| over
-# the whole grid).  Filters noise-floor sign changes (profile drifting
-# through zero in a region where every contract's gamma has decayed —
-# the morning-open / extended-hours artifact where IVs spike, gammas
-# collapse, and the entire grid's profile slumps into a low-signal
-# regime where any imbalance can flip sign spuriously).
+# crossing is at least STRUCTURAL_MIN_FRAC × (the chain's robust
+# high-magnitude reference — the STRUCTURAL_REFERENCE_PERCENTILE'th
+# percentile of |profile| across the whole grid).  Filters noise-floor
+# sign changes (profile drifting through zero in a region where every
+# contract's gamma has decayed — the morning-open / extended-hours
+# artifact where IVs spike, gammas collapse, and the entire grid's
+# profile slumps into a low-signal regime where any imbalance can flip
+# sign spuriously).
+#
+# The reference is a robust percentile, NOT the global max: a single
+# colossal spike (e.g., a low-IV / OI-concentrated ATM wall on SPX with
+# peak |GEX| ≫ p90) used to dominate the global max so every "ordinary"
+# crossing in the rest of the chain was rejected as noise relative to
+# the spike — the 2026-05-20 SPX/QQQ pathology where the diagnostic
+# logged peak=7.5B vs median≈0, so the 2%-of-peak floor swallowed every
+# legitimate interior crossing.  A robust percentile is stable to a
+# small number of outlier peaks while still matching the global max in
+# a truly uniformly-noisy chain (where p90 ≈ max), so the noise-floor
+# rejection it was originally designed for is preserved.
 GAMMA_PROFILE_STRUCTURAL_MIN_FRAC = _getenv_float(
     "GAMMA_PROFILE_STRUCTURAL_MIN_FRAC", 0.02, min=0.0, max=1.0
 )
 GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT = _getenv_float(
     "GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT", 0.01, min=0.001, max=0.10
+)
+GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE = _getenv_float(
+    "GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE", 90.0, min=50.0, max=100.0
 )
 # Distance gate: a structurally valid interior crossing is rejected when
 # it sits further than this fraction of spot from the current underlying
