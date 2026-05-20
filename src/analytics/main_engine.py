@@ -34,6 +34,7 @@ from src.config import (
     GAMMA_PROFILE_INTERIOR_MARGIN,
     GAMMA_PROFILE_STRUCTURAL_MIN_FRAC,
     GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT,
+    GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT,
     GAMMA_PROFILE_STEP_PCT,
     GAMMA_PROFILE_DTE_WEIGHTING,
     GAMMA_PROFILE_DTE_REF_DAYS,
@@ -1114,11 +1115,23 @@ class AnalyticsEngine:
           collapse globally, and a sliver of imbalance can flip sign
           spuriously).
 
+        * **Actionable-distance** — the candidate sits within
+          ``GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT`` of ``underlying_price``.
+          A flip further from spot than this is not actionable on any
+          reasonable trading horizon, and is the failure mode that
+          slipped past the structural gate during the SPX 2026-05-20
+          open: structurally valid interior crossings genuinely existed
+          far below spot as the chain degraded, the resolver accepted
+          them, and the gamma-flip line on the heatmap walked off the
+          bottom of the chart while the dashboard's latest-summary
+          endpoint went NULL on the very next cycle.
+
         Returns ``None`` when nothing qualifies.  Unlike
         :meth:`_calculate_gamma_flip_point`, this is intentionally
-        STRICT: a one-signed profile, a noise-floor crossing, and an
-        edge-only crossing all return ``None`` so the caller can decide
-        whether to expand the grid or give up.
+        STRICT: a one-signed profile, a noise-floor crossing, an
+        edge-only crossing, and a structurally valid but far-from-spot
+        crossing all return ``None`` so the caller can decide whether to
+        expand the grid or give up.
         """
         if not profile or len(profile) < 2:
             return None
@@ -1149,6 +1162,12 @@ class AnalyticsEngine:
             else:
                 continue
             if candidate < interior_lo or candidate > interior_hi:
+                continue
+            if (
+                underlying_price > 0
+                and abs(candidate - underlying_price) / underlying_price
+                > GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT
+            ):
                 continue
             half = GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT * max(candidate, 1e-9)
             w_lo = candidate - half

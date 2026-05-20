@@ -248,6 +248,19 @@ GAMMA_PROFILE_STRUCTURAL_MIN_FRAC = _getenv_float(
 GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT = _getenv_float(
     "GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT", 0.01, min=0.001, max=0.10
 )
+# Distance gate: a structurally valid interior crossing is rejected when
+# it sits further than this fraction of spot from the current underlying
+# price.  A flip that far from spot is not actionable on any reasonable
+# trading horizon, and is often a morning-open / IV-spike artifact that
+# slips past the structural gate (the SPX 2026-05-20 pathology, where
+# the resolved flip descended from ~spot toward the grid floor over the
+# first trading hour and ultimately fell off the chart while the
+# dashboard's latest-summary endpoint went NULL — same source column,
+# diverging displays).  Set to 1.0 to disable (= unbounded, prior
+# behavior).  Range [0.01, 1.0].
+GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT = _getenv_float(
+    "GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT", 0.08, min=0.01, max=1.0
+)
 
 # The gamma flip is a *multi-day* regime level, but a same-day 0DTE wall
 # carries a colossal re-greeked Black-Scholes gamma spike (ATM gamma ∝

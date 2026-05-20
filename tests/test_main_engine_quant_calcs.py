@@ -366,7 +366,7 @@ def test_resolve_gamma_flip_uses_first_rung_when_interior_crossing_exists(monkey
     assert profile[-1][0] <= spot * (1.0 + span_used) + 1e-6
 
 
-def test_resolve_gamma_flip_expands_grid_for_wide_real_flip():
+def test_resolve_gamma_flip_expands_grid_for_wide_real_flip(monkeypatch):
     """Genuinely wide flip case: at the initial ±20% rung the profile is
     one-signed (no crossing at all), so the first rung's resolver yields
     None.  The ladder steps up and resolves the real interior crossing
@@ -378,7 +378,12 @@ def test_resolve_gamma_flip_expands_grid_for_wide_real_flip():
     far OTM, gamma small); above ~+25% the OTM call's gamma climbs faster
     than the put's drops.  Crossing lands around +25% — outside ±20%,
     inside ±35%.
+
+    The actionable-distance gate (default 8% of spot) is disabled here
+    so the resolver is exercised on its pre-gate semantics; a separate
+    test asserts the gate behavior.
     """
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT", 1.0)
     engine = AnalyticsEngine(underlying="SPY")
     ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
     exp = datetime(2026, 9, 18).date()
@@ -401,6 +406,37 @@ def test_resolve_gamma_flip_expands_grid_for_wide_real_flip():
     # And the resolver still produced a sign-consistent net_gex_at_spot.
     n_at_spot = engine._net_gex_at_spot(profile, spot)
     assert n_at_spot is not None and (n_at_spot < 0) == (spot < flip)
+
+
+def test_resolve_gamma_flip_rejects_crossing_beyond_distance_gate(monkeypatch):
+    """Actionable-distance gate: even when a structurally valid interior
+    crossing exists on a wider rung, the resolver rejects it when it
+    sits further from spot than ``GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT``.
+
+    Uses the same put/deep-OTM-call chain as the "wide real flip" test
+    above (crossing at ~+25% of spot) and sets the distance gate to 10%.
+    The far-from-spot crossing is rejected at every rung, so the
+    resolver returns ``(last_profile, None, last_span)`` — the honest
+    "not actionable on any reasonable trading horizon" signal that
+    makes both the dashboard and the heatmap go NULL together instead
+    of one going N/A and the other walking the line off the chart.
+    """
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT", 0.10)
+    engine = AnalyticsEngine(underlying="SPY")
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
+    exp = datetime(2026, 9, 18).date()
+    spot = 100.0
+    options = [
+        _opt(100.0, "P", oi=200_000, iv=0.30, exp=exp),
+        _opt(160.0, "C", oi=200_000, iv=0.30, exp=exp),
+    ]
+    profile, flip, span_used = engine._resolve_gamma_flip(options, spot, ts)
+    assert flip is None
+    # The widest rung was reached because every rung's only candidate
+    # crossing was outside the actionable-distance window.
+    assert abs(span_used - main_engine.GAMMA_PROFILE_SPAN_LADDER[-1]) < 1e-9
+    # Profile is still built on the last rung (net_gex_at_spot reads off it).
+    assert profile
 
 
 def test_resolve_gamma_flip_returns_none_at_max_rung_when_profile_truly_one_signed():
@@ -456,11 +492,15 @@ def test_resolve_gamma_flip_rejects_noise_floor_edge_crossing(monkeypatch):
     assert span_used == main_engine.GAMMA_PROFILE_SPAN_LADDER[-1]
 
 
-def test_resolve_gamma_flip_keeps_sign_consistency_invariant_at_every_rung():
+def test_resolve_gamma_flip_keeps_sign_consistency_invariant_at_every_rung(monkeypatch):
     """The flip/net_gex_at_spot sign-consistency invariant must hold
     regardless of which ladder rung resolved.  Read both off the SAME
     returned profile: net_gex_at_spot's sign matches sign(spot - flip).
+
+    The actionable-distance gate is disabled here so the wide-flip rung
+    is exercisable; the invariant under test is independent of the gate.
     """
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT", 1.0)
     engine = AnalyticsEngine(underlying="SPY")
     ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
     exp = datetime(2026, 9, 18).date()
