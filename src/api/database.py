@@ -397,7 +397,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
     async def disconnect(self):
         """Close connection pool"""
-        logger.warning(
+        # DEBUG so the stack trace is available when chasing an unexpected
+        # disconnect, without polluting normal CLI runs (db_query_cli /
+        # make gex-summary etc.) where disconnect IS the expected shutdown
+        # path.
+        logger.debug(
             "DatabaseManager.disconnect() called — stack:\n%s",
             "".join(traceback.format_stack()),
         )
