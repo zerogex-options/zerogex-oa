@@ -500,7 +500,7 @@ class AnalyticsEngine:
                         "gamma": float(row[10]) if row[10] else 0.0,
                         "theta": float(row[11]) if row[11] else 0.0,
                         "vega": float(row[12]) if row[12] else 0.0,
-                        "implied_volatility": float(row[13]) if row[13] else 0.2,
+                        "implied_volatility": float(row[13]) if row[13] else None,
                     }
                     for row in rows
                 ]
@@ -757,8 +757,19 @@ class AnalyticsEngine:
                 _tte_cache[expiration] = T
 
             for opt in data["calls"] + data["puts"]:
+                # Skip contracts with no reliable IV. Previously the read
+                # path at line 502 substituted the IMPLIED_VOLATILITY_DEFAULT
+                # sentinel (0.20) for NULL IVs, which silently fabricated
+                # vanna/charm exposure for contracts where the solver had
+                # failed (typically deep ITM strikes pre-market). Honestly
+                # excluding them matches what _build_gamma_profile already
+                # does for the gamma side at line 1005.
+                iv = opt.get("implied_volatility")
+                if iv is None or iv <= 0:
+                    continue
+
                 vanna = self._calculate_vanna(
-                    underlying_price, strike, T, self.risk_free_rate, opt["implied_volatility"]
+                    underlying_price, strike, T, self.risk_free_rate, iv
                 )
 
                 charm = self._calculate_charm(
@@ -766,7 +777,7 @@ class AnalyticsEngine:
                     strike,
                     T,
                     self.risk_free_rate,
-                    opt["implied_volatility"],
+                    iv,
                 )
 
                 share_notional = opt["open_interest"] * 100 * underlying_price
