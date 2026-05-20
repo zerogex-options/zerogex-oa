@@ -264,6 +264,20 @@ GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT = _getenv_float(
 GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE = _getenv_float(
     "GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE", 90.0, min=50.0, max=100.0
 )
+# Canonical span over which the structural reference (p90 of |profile|)
+# is computed.  Held constant across every ladder rung so the
+# significance test for a crossing depends ONLY on the chain, not on
+# how wide the resolver happens to be scanning.  Without this, widening
+# the grid from ±20% to ±35%/±50% diluted p90 with deep-OTM near-zero
+# values and lowered the floor enough for the SAME marginal crossing
+# to pass at the expansion rung after failing at the default — the
+# 2026-05-20 SPX/QQQ pathology where flips clustered just inside the
+# 8% distance gate and the chart line walked off the visible band.
+# Pinning the reference to ±15% keeps it inside the active chain
+# (where the dominant gamma peak lives) at all common rungs.
+GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT = _getenv_float(
+    "GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT", 0.15, min=0.02, max=1.0
+)
 # Distance gate: a structurally valid interior crossing is rejected when
 # it sits further than this fraction of spot from the current underlying
 # price.  A flip that far from spot is not actionable on any reasonable

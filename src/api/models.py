@@ -17,6 +17,17 @@ class GEXSummary(BaseModel):
     net_gex: Decimal
     net_gex_at_spot: Optional[Decimal] = None
     gamma_flip: Optional[Decimal] = None
+    # Fraction of spot the resolver's grid was widened to in order to
+    # land ``gamma_flip``.  ``GAMMA_PROFILE_SPAN_LADDER[0]`` (default
+    # 0.20) means the default rung qualified — a stable regime level.
+    # Larger means the default rung had no qualifying interior crossing
+    # and the ladder fell through to an expansion rung; treat such
+    # flips as marginal (passed a wider geometric search; the
+    # structural floor is held constant across rungs as of the
+    # canonical-reference refactor, so this is purely a geometry
+    # signal — but a value that only resolves at ±35% / ±50% still
+    # means the chain has no near-spot regime boundary).
+    gamma_flip_span_used: Optional[Decimal] = None
     flip_distance: Optional[Decimal] = None
     local_gex: Optional[Decimal] = None
     convexity_risk: Optional[Decimal] = None

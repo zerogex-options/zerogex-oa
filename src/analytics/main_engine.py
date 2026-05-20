@@ -35,6 +35,7 @@ from src.config import (
     GAMMA_PROFILE_STRUCTURAL_MIN_FRAC,
     GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT,
     GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE,
+    GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT,
     GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT,
     GAMMA_PROFILE_STEP_PCT,
     GAMMA_PROFILE_DTE_WEIGHTING,
@@ -1102,8 +1103,65 @@ class AnalyticsEngine:
 
         return best_flip
 
+    def _structural_reference(
+        self,
+        options: List[Dict[str, Any]],
+        spot: float,
+        timestamp: datetime,
+    ) -> float:
+        """Canonical structural reference for the resolver's noise floor.
+
+        Builds the spot-shift gamma profile over a FIXED
+        ``±GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT`` band around
+        spot and returns the
+        ``GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE``'th percentile
+        of ``|profile|``.  Held constant across every ladder rung
+        (see :meth:`_resolve_gamma_flip`) so the "is this crossing
+        structurally significant?" test depends only on the chain,
+        not on how wide the resolver happens to be scanning.
+
+        Without this anchor, widening the ladder from ±20% to
+        ±35%/±50% admitted ~120 deep-OTM near-zero grid points that
+        diluted p90 downward and lowered the floor enough for the
+        SAME marginal crossing to pass at the expanded rung after
+        failing at the default — the 2026-05-20 SPX/QQQ pathology
+        where resolved flips clustered just inside the 8% actionable
+        gate while most cycles went NULL.
+
+        Returns ``0.0`` when the canonical profile cannot be built
+        (degraded chain, no usable contracts).  Callers treat that as
+        "no structural basis available" and conservatively fall
+        through to NULL.
+        """
+        ref_profile = self._gamma_exposure_profile(
+            options,
+            spot,
+            timestamp,
+            span_pct=GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT,
+        )
+        if not ref_profile:
+            return 0.0
+        abs_vals = np.fromiter(
+            (abs(v) for _, v in ref_profile), dtype=float, count=len(ref_profile)
+        )
+        if abs_vals.size == 0 or abs_vals.max() <= 0.0:
+            return 0.0
+        reference = float(
+            np.percentile(abs_vals, GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE)
+        )
+        if reference <= 0.0:
+            # All non-zero magnitude sits above the chosen percentile
+            # (very sparse profile).  Fall back to max so the gate
+            # still has a well-defined floor instead of degenerating
+            # to "accept everything".
+            reference = float(abs_vals.max())
+        return reference
+
     def _find_structural_interior_crossing(
-        self, profile: List[Tuple[float, float]], underlying_price: float
+        self,
+        profile: List[Tuple[float, float]],
+        underlying_price: float,
+        structural_reference: Optional[float] = None,
     ) -> Optional[float]:
         """First-class crossing detector for the adaptive flip resolver.
 
@@ -1120,27 +1178,24 @@ class AnalyticsEngine:
         * **Structural** — the peak ``|profile|`` value within
           ``±GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT × candidate`` of the
           crossing is at least ``GAMMA_PROFILE_STRUCTURAL_MIN_FRAC`` of
-          the chain's **robust high-magnitude reference** — the
-          ``GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE``'th
-          percentile of ``|profile|`` across the grid.  Rejects
-          noise-floor sign changes (profile slowly drifting through
-          zero in a region where every contract's gamma has decayed
-          near zero — the morning-open / extended-hours artifact where
-          IVs spike, gammas collapse globally, and a sliver of
-          imbalance can flip sign spuriously).
+          the chain's **robust high-magnitude reference**.  The
+          resolver supplies this reference precomputed (see
+          :meth:`_structural_reference`) so the gate has the SAME
+          floor at every ladder rung; when ``structural_reference`` is
+          ``None`` (legacy callers / direct tests) the reference is
+          computed from the passed profile via the same p90 rule,
+          preserving the original per-profile behavior.
 
-          The reference is a robust percentile, not ``max(|profile|)``,
-          to keep a single colossal spike from defining the floor for
-          the rest of the chain.  The 2026-05-20 SPX/QQQ pathology was
-          a low-IV regime with a heavily OI-concentrated wall: the
-          profile peaked at 7.5B at a single grid point with the
-          median |GEX| in the rounding noise, so the prior
-          max-relative gate set the floor at 150M and swallowed every
-          legitimate interior crossing in the rest of the chain.  A
-          robust percentile collapses to the max in a truly
-          uniformly-noisy chain (where p90 ≈ max — the regime this
-          gate was originally calibrated for), so the morning-open
-          noise-floor rejection is unaffected.
+          Without an anchored reference, widening the grid dilutes
+          p90 with deep-OTM near-zero values and lowers the floor for
+          the same crossing — that's the 2026-05-20 SPX/QQQ
+          pathology where the ±35% rung accepted flips the strict
+          ±20% gate had correctly rejected.  Rejects noise-floor
+          sign changes (profile slowly drifting through zero in a
+          region where every contract's gamma has decayed near zero —
+          the morning-open / extended-hours artifact where IVs spike,
+          gammas collapse globally, and a sliver of imbalance can
+          flip sign spuriously).
 
         * **Actionable-distance** — the candidate sits within
           ``GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT`` of ``underlying_price``.
@@ -1172,18 +1227,27 @@ class AnalyticsEngine:
         interior_lo = s_lo + margin_abs
         interior_hi = s_hi - margin_abs
 
-        abs_profile = np.fromiter((abs(v) for _, v in profile), dtype=float, count=len(profile))
-        if abs_profile.size == 0 or abs_profile.max() <= 0.0:
-            return None
-        # Robust high-magnitude reference (p90 default) — see docstring.
-        reference = float(np.percentile(abs_profile, GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE))
-        if reference <= 0.0:
-            # All non-zero magnitude sits above the chosen percentile
-            # (e.g., a profile with vastly more zeros than active
-            # points). Fall back to max so the gate still has a
-            # well-defined floor instead of degenerating to "accept
-            # everything".
-            reference = float(abs_profile.max())
+        if structural_reference is None:
+            # Legacy / direct-call path: derive the reference from the
+            # passed profile (same p90 rule that lived inline before
+            # the canonical-reference refactor).
+            abs_profile = np.fromiter(
+                (abs(v) for _, v in profile), dtype=float, count=len(profile)
+            )
+            if abs_profile.size == 0 or abs_profile.max() <= 0.0:
+                return None
+            reference = float(
+                np.percentile(abs_profile, GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE)
+            )
+            if reference <= 0.0:
+                reference = float(abs_profile.max())
+        else:
+            reference = structural_reference
+            if reference <= 0.0:
+                # Canonical reference unavailable (degraded chain).
+                # No basis for the structural test — conservative
+                # NULL; the resolver's exhaustion path persists NULL.
+                return None
         floor_abs = GAMMA_PROFILE_STRUCTURAL_MIN_FRAC * reference
 
         best_flip: Optional[float] = None
@@ -1254,8 +1318,18 @@ class AnalyticsEngine:
         (flip vs. net_gex_at_spot side-of-spot) holds at every rung —
         the resolver never changes which profile produces the readings.
 
+        The structural floor that gates each rung's crossing is
+        computed ONCE up front (see :meth:`_structural_reference`)
+        over a fixed canonical band around spot, so the
+        significance test is identical at every rung.  Widening the
+        ladder only widens the geometric search; it no longer
+        relaxes the noise floor by diluting p90 with deep-OTM
+        near-zero values.
+
         Returns ``(profile, flip, span_used)``.
         """
+        structural_reference = self._structural_reference(options, spot, timestamp)
+
         last_profile: List[Tuple[float, float]] = []
         last_span: float = (
             GAMMA_PROFILE_SPAN_LADDER[0] if GAMMA_PROFILE_SPAN_LADDER else GAMMA_PROFILE_SPAN_PCT
@@ -1266,7 +1340,9 @@ class AnalyticsEngine:
             last_span = span_pct
             if not profile:
                 continue
-            flip = self._find_structural_interior_crossing(profile, spot)
+            flip = self._find_structural_interior_crossing(
+                profile, spot, structural_reference=structural_reference
+            )
             if flip is not None:
                 return profile, flip, span_pct
         return last_profile, None, last_span
@@ -1388,17 +1464,19 @@ class AnalyticsEngine:
             abs_vals = [abs(v) for v in vals]
             profile_peak = max(abs_vals) if abs_vals else 0.0
             profile_median = float(np.median(abs_vals)) if abs_vals else 0.0
-            profile_reference = float(
-                np.percentile(abs_vals, GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE)
-            ) if abs_vals else 0.0
-            if profile_reference <= 0.0 and profile_peak > 0.0:
-                profile_reference = profile_peak
             positive_pts = sum(1 for v in vals if v > 0)
             negative_pts = sum(1 for v in vals if v < 0)
             zero_pts = sum(1 for v in vals if v == 0)
         else:
-            profile_peak = profile_median = profile_reference = 0.0
+            profile_peak = profile_median = 0.0
             positive_pts = negative_pts = zero_pts = 0
+        # Report the same canonical reference the resolver actually
+        # used to reject every rung (see _structural_reference) — not
+        # the widest-rung profile's p90, which can differ materially
+        # and would misrepresent why the resolver gave up.
+        profile_reference = self._structural_reference(options, underlying_price, timestamp)
+        if profile_reference <= 0.0 and profile_peak > 0.0:
+            profile_reference = profile_peak
         structural_floor = profile_reference * GAMMA_PROFILE_STRUCTURAL_MIN_FRAC
 
         return {
@@ -1636,6 +1714,7 @@ class AnalyticsEngine:
             "max_gamma_value": max_gamma_strike["net_gex"],
             "gamma_flip_point": gamma_flip_point,
             "gamma_flip_unresolved": gamma_flip_unresolved,
+            "gamma_flip_span_used": gamma_flip_span_used if gamma_flip_point is not None else None,
             "flip_distance": flip_distance,
             "local_gex": local_gex,
             "convexity_risk": convexity_risk,
@@ -1805,6 +1884,7 @@ class AnalyticsEngine:
             if mp_by_exp_raw
             else None
         )
+        gamma_flip_span_used = summary.get("gamma_flip_span_used")
         cursor.execute(
             """
             INSERT INTO gex_summary
@@ -1812,8 +1892,8 @@ class AnalyticsEngine:
              gamma_flip_point, put_call_ratio, max_pain, total_call_volume,
              total_put_volume, total_call_oi, total_put_oi, total_net_gex,
              net_gex_at_spot, flip_distance, local_gex, convexity_risk,
-             call_wall, put_wall, max_pain_by_expiration)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             call_wall, put_wall, max_pain_by_expiration, gamma_flip_span_used)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (underlying, timestamp) DO UPDATE SET
                 max_gamma_strike = EXCLUDED.max_gamma_strike,
                 max_gamma_value = EXCLUDED.max_gamma_value,
@@ -1831,7 +1911,8 @@ class AnalyticsEngine:
                 convexity_risk = EXCLUDED.convexity_risk,
                 call_wall = EXCLUDED.call_wall,
                 put_wall = EXCLUDED.put_wall,
-                max_pain_by_expiration = EXCLUDED.max_pain_by_expiration
+                max_pain_by_expiration = EXCLUDED.max_pain_by_expiration,
+                gamma_flip_span_used = EXCLUDED.gamma_flip_span_used
             WHERE
                 EXCLUDED.max_gamma_strike IS DISTINCT FROM gex_summary.max_gamma_strike
                 OR EXCLUDED.max_gamma_value IS DISTINCT FROM gex_summary.max_gamma_value
@@ -1850,6 +1931,7 @@ class AnalyticsEngine:
                 OR EXCLUDED.call_wall IS DISTINCT FROM gex_summary.call_wall
                 OR EXCLUDED.put_wall IS DISTINCT FROM gex_summary.put_wall
                 OR EXCLUDED.max_pain_by_expiration IS DISTINCT FROM gex_summary.max_pain_by_expiration
+                OR EXCLUDED.gamma_flip_span_used IS DISTINCT FROM gex_summary.gamma_flip_span_used
         """,
             (
                 summary["underlying"],
@@ -1871,6 +1953,7 @@ class AnalyticsEngine:
                 float(call_wall_val) if call_wall_val is not None else None,
                 float(put_wall_val) if put_wall_val is not None else None,
                 mp_by_exp_json,
+                (float(gamma_flip_span_used) if gamma_flip_span_used is not None else None),
             ),
         )
         logger.info("✅ Stored GEX summary")

@@ -1339,7 +1339,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     gs.total_net_gex,
                     gs.net_gex_at_spot,
                     gs.call_wall AS stored_call_wall,
-                    gs.put_wall  AS stored_put_wall
+                    gs.put_wall  AS stored_put_wall,
+                    gs.gamma_flip_span_used
                 FROM gex_summary gs
                 WHERE gs.underlying = $1
                 ORDER BY gs.timestamp DESC
@@ -1407,6 +1408,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 (st.total_call_gex + st.total_put_gex) AS net_gex,
                 ls.net_gex_at_spot,
                 ls.gamma_flip_point AS gamma_flip,
+                ls.gamma_flip_span_used,
                 ls.flip_distance,
                 ls.local_gex,
                 ls.convexity_risk,
@@ -1551,6 +1553,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     gs.underlying as symbol,
                     gs.total_net_gex as net_gex,
                     gs.gamma_flip_point as gamma_flip,
+                    gs.gamma_flip_span_used,
                     gs.max_pain,
                     gs.total_call_oi,
                     gs.total_put_oi,
@@ -1623,6 +1626,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 -- under an older convention.
                 (COALESCE(sa.total_call_gex, 0) + COALESCE(sa.total_put_gex, 0))::numeric AS net_gex,
                 b.gamma_flip,
+                b.gamma_flip_span_used,
                 b.max_pain,
                 COALESCE(b.stored_call_wall, cw.call_wall) AS call_wall,
                 COALESCE(b.stored_put_wall,  pw.put_wall)  AS put_wall,
@@ -2700,7 +2704,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 SELECT DISTINCT ON ({bucket})
                     {bucket} AS bucket_ts,
                     timestamp AS rep_ts,
-                    gamma_flip_point AS gamma_flip
+                    gamma_flip_point AS gamma_flip,
+                    gamma_flip_span_used AS gamma_flip_span_used
                 FROM gex_summary
                 WHERE underlying = $1
                     AND timestamp >= (SELECT start_time FROM time_window)
@@ -2725,7 +2730,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 CASE
                     WHEN g.strike = MIN(g.strike) OVER (PARTITION BY br.bucket_ts)
                     THEN MAX(br.gamma_flip)
-                END AS gamma_flip
+                END AS gamma_flip,
+                -- Same broadcast pattern for the span the resolver
+                -- landed on (default rung vs expansion rung).  Frontend
+                -- uses it to visually distinguish a default-rung flip
+                -- (live regime level) from an expansion-rung flip
+                -- (passed a looser bar — treat with caution).
+                CASE
+                    WHEN g.strike = MIN(g.strike) OVER (PARTITION BY br.bucket_ts)
+                    THEN MAX(br.gamma_flip_span_used)
+                END AS gamma_flip_span_used
             FROM bucket_reps br
             JOIN gex_by_strike g
                 ON g.underlying = $1

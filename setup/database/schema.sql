@@ -269,6 +269,15 @@ ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS call_wall NUMERIC(12, 4);
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS put_wall NUMERIC(12, 4);
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS max_pain_by_expiration JSONB;
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS net_gex_at_spot DOUBLE PRECISION;
+-- Ladder rung (fraction of spot) the resolver used to land the
+-- gamma_flip_point.  GAMMA_PROFILE_SPAN_LADDER[0] = default scan;
+-- anything larger means the default rung had no qualifying interior
+-- crossing and the ladder fell through to an expansion rung.  Surfaced
+-- so the frontend can visually distinguish a default-rung flip (the
+-- live regime level) from an expansion-rung flip (marginal — passed a
+-- looser bar; treat with caution).  NULL pre-rollout / on unresolved
+-- cycles.
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS gamma_flip_span_used DOUBLE PRECISION;
 
 CREATE TABLE IF NOT EXISTS gex_by_strike (
     underlying VARCHAR(10) NOT NULL,
