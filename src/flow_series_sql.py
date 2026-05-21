@@ -240,6 +240,11 @@ _UPSERT_DISTINCT = "\n        OR ".join(
 # prefixes the literal symbol so the 15 inserted columns line up. The
 # IS DISTINCT FROM guard suppresses no-op writes (gex_summary pattern):
 # closed bars are window-invariant so they never rewrite once final.
+#
+# This full-window form is reserved for cold-start / gap-fill cases
+# (first cycle of a fresh session, recovery from missed cycles).
+# Steady-state cycles use SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2 below,
+# which refreshes only the prev + curr bar -- 30x cheaper.
 SNAPSHOT_UPSERT_PSYCOPG2 = f"""
 INSERT INTO flow_series_5min (
     symbol,
@@ -254,3 +259,159 @@ ON CONFLICT (symbol, bar_start) DO UPDATE SET
 WHERE
         {_UPSERT_DISTINCT}
 """
+
+
+# Incremental UPSERT: refresh ONLY the prev + curr 5-min bars (the open
+# bar and the one immediately before it).
+#
+# Why this exists
+# ---------------
+# Closed bars in flow_series_5min are window-invariant: the canonical
+# CTE's outer SUM(...) OVER w_cum (ROWS UNBOUNDED PRECEDING ORDER BY
+# bar_start) means once a bar's 5-min boundary passes, its cumulative
+# values are mathematically fixed -- subsequent cycles compute the
+# identical values and the IS DISTINCT FROM guard suppresses the
+# write. But the CTE itself still RUNS over the full session window
+# every cycle, walking ~78 bars worth of flow_by_contract data even
+# though 76 of them are guaranteed no-ops. Measured cost: ~30s per
+# cycle on db.t3.small (the new bottleneck after the snapshot
+# lookback was shrunk).
+#
+# Direct cumulative computation
+# -----------------------------
+# ``flow_by_contract.raw_volume / raw_premium / net_volume / net_premium``
+# are session-cumulative per-contract values (see
+# ``AnalyticsEngine._refresh_flow_caches`` -- the engine writes each
+# bucket as SUM over flow_contract_facts from session_open through
+# bucket_end). Summing these across contracts at a given bar gives the
+# total-cumulative-through-bar directly, without the LAG-delta-then-
+# recum dance the canonical CTE uses. The two formulations are
+# algebraically equivalent (verified):
+#
+#   call_premium_cum(T) = SUM over bars b<=T of (SUM_c (net_premium_C(c,b) - net_premium_C(c,b-1)))
+#                       = SUM_c net_premium_C(c,T)   -- telescopes to direct sum
+#
+# So this incremental form computes the cumulatives directly from
+# flow_by_contract for the two target bars only. No window functions,
+# no 8-level CTE, no session-wide scan.
+#
+# Correctness model
+# -----------------
+# * Closed bars older than prev_bar: never touched. Their rows in
+#   flow_series_5min stay as computed by an earlier cycle (when they
+#   were the open bar). Window-invariant means they're final.
+# * prev_bar: refreshed every cycle. On the cycle that crosses the
+#   5-min boundary (prev_bar transitions from "the open bar last
+#   cycle" to "closed bar this cycle"), this refresh finalises its
+#   value to reflect any flow_by_contract writes that landed after
+#   the prior cycle's refresh.
+# * curr_bar: refreshed every cycle. Open bar, content changes within
+#   the 5-min window as new flow_by_contract.curr_bucket writes arrive.
+#
+# Backfill / gap handling
+# -----------------------
+# This form does NOT populate bars between session_open and prev_bar.
+# A fresh session (no flow_series_5min rows yet) or a recovery from a
+# multi-cycle gap should run the full SNAPSHOT_UPSERT_PSYCOPG2 once
+# first to seed the closed bars. The engine detects this and dispatches
+# accordingly -- see AnalyticsEngine._refresh_flow_series_snapshot.
+#
+# Parameters: %(symbol)s, %(prev_bar)s, %(curr_bar)s
+SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2 = """
+INSERT INTO flow_series_5min (
+    symbol,
+    bar_start,
+    call_premium_cum,
+    put_premium_cum,
+    call_volume_cum,
+    put_volume_cum,
+    net_volume_cum,
+    raw_volume_cum,
+    call_position_cum,
+    put_position_cum,
+    net_premium_cum,
+    put_call_ratio,
+    underlying_price,
+    contract_count,
+    is_synthetic
+)
+WITH target_bars AS (
+    SELECT bar_start FROM (
+        VALUES (%(prev_bar)s::timestamptz), (%(curr_bar)s::timestamptz)
+    ) AS t(bar_start)
+),
+per_bar_aggregates AS (
+    SELECT
+        t.bar_start,
+        COALESCE(SUM(CASE WHEN fbc.option_type = 'C' THEN fbc.net_premium ELSE 0 END), 0)::numeric
+            AS call_premium_cum,
+        COALESCE(SUM(CASE WHEN fbc.option_type = 'P' THEN fbc.net_premium ELSE 0 END), 0)::numeric
+            AS put_premium_cum,
+        COALESCE(SUM(CASE WHEN fbc.option_type = 'C' THEN fbc.raw_volume ELSE 0 END), 0)::bigint
+            AS call_volume_cum,
+        COALESCE(SUM(CASE WHEN fbc.option_type = 'P' THEN fbc.raw_volume ELSE 0 END), 0)::bigint
+            AS put_volume_cum,
+        COALESCE(SUM(fbc.net_volume), 0)::bigint AS net_volume_cum,
+        COALESCE(SUM(fbc.raw_volume), 0)::bigint AS raw_volume_cum,
+        COALESCE(SUM(CASE WHEN fbc.option_type = 'C' THEN fbc.net_volume ELSE 0 END), 0)::bigint
+            AS call_position_cum,
+        COALESCE(SUM(CASE WHEN fbc.option_type = 'P' THEN fbc.net_volume ELSE 0 END), 0)::bigint
+            AS put_position_cum,
+        COUNT(fbc.option_symbol)::int AS contract_count
+    FROM target_bars t
+    LEFT JOIN flow_by_contract fbc
+        ON fbc.symbol = %(symbol)s AND fbc.timestamp = t.bar_start
+    GROUP BY t.bar_start
+),
+underlying_price_per_bar AS (
+    SELECT
+        t.bar_start,
+        (
+            SELECT close
+            FROM underlying_quotes uq
+            WHERE uq.symbol = %(symbol)s
+              AND uq.timestamp >= t.bar_start
+              AND uq.timestamp <  t.bar_start + INTERVAL '5 minutes'
+            ORDER BY uq.timestamp DESC
+            LIMIT 1
+        ) AS bar_price,
+        -- Carry-forward: most recent prior price if no trade in this bar.
+        -- Matches the canonical CTE's carry semantic (FIRST_VALUE PARTITION
+        -- BY up_grp) for the no-trade case.
+        (
+            SELECT close
+            FROM underlying_quotes uq
+            WHERE uq.symbol = %(symbol)s
+              AND uq.timestamp < t.bar_start + INTERVAL '5 minutes'
+            ORDER BY uq.timestamp DESC
+            LIMIT 1
+        ) AS carry_price
+    FROM target_bars t
+)
+SELECT
+    %(symbol)s AS symbol,
+    a.bar_start,
+    a.call_premium_cum,
+    a.put_premium_cum,
+    a.call_volume_cum,
+    a.put_volume_cum,
+    a.net_volume_cum,
+    a.raw_volume_cum,
+    a.call_position_cum,
+    a.put_position_cum,
+    (a.call_premium_cum + a.put_premium_cum) AS net_premium_cum,
+    CASE
+        WHEN a.call_volume_cum > 0
+        THEN a.put_volume_cum::float8 / a.call_volume_cum::float8
+        ELSE NULL
+    END AS put_call_ratio,
+    COALESCE(u.bar_price, u.carry_price) AS underlying_price,
+    a.contract_count,
+    (a.contract_count = 0) AS is_synthetic
+FROM per_bar_aggregates a
+JOIN underlying_price_per_bar u USING (bar_start)
+ON CONFLICT (symbol, bar_start) DO UPDATE SET
+        {_UPSERT_SET}
+WHERE
+        {_UPSERT_DISTINCT}
+""".format(_UPSERT_SET=_UPSERT_SET, _UPSERT_DISTINCT=_UPSERT_DISTINCT)

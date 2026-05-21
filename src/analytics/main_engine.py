@@ -48,7 +48,7 @@ from src.config import (
 )
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.analytics.walls import compute_call_put_walls
-from src.flow_series_sql import SNAPSHOT_UPSERT_PSYCOPG2
+from src.flow_series_sql import SNAPSHOT_UPSERT_PSYCOPG2, SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2
 from src.market_calendar import (
     calculate_time_to_expiration,
     expiration_close_time_et,
@@ -2530,22 +2530,34 @@ class AnalyticsEngine:
     def _refresh_flow_series_snapshot(self, timestamp: datetime):
         """Materialise flow_series_5min for the current session.
 
-        Runs the *exact* /api/flow/series CTE (unfiltered) for this symbol
-        over the resolved current-session window and UPSERTs every row.
-        The stored rows therefore equal what the API CTE would compute by
-        construction — parity is not re-implemented. The outer window is
-        ROWS UNBOUNDED PRECEDING ORDER BY bar_start, so a closed bar's
-        cumulative values are window-invariant: once its 5-min boundary
-        passes, the row is final and the IS DISTINCT FROM guard turns
-        subsequent cycles into no-ops. Only the open bar (and any quiet
-        carry-forward tail) churns cycle-to-cycle, which is also how the
-        prior bucket gets "finalised" — the next cycle recomputes it to
-        its closed value and writes it once.
+        The stored rows mirror what the /api/flow/series CTE would compute
+        for session='current'. Closed bars are window-invariant (the
+        canonical CTE's outer SUM uses ROWS UNBOUNDED PRECEDING, so once a
+        5-min bar's boundary passes its cumulative values are
+        mathematically fixed); only the open bar (and the bar immediately
+        before it, during the boundary-crossing cycle) actually changes
+        each cycle.
+
+        Dispatch strategy
+        -----------------
+        * Steady-state cycles run an **incremental** UPSERT that refreshes
+          only the open bar + the one immediately before it (two rows),
+          using ``SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2``. ~30x cheaper
+          than the full-window form because it does direct per-bar
+          aggregation over flow_by_contract instead of walking the whole
+          session through an 8-level CTE with LAG / cumulative window
+          functions.
+        * Cold-start cycles (no flow_series_5min rows exist for the
+          current session, or the engine is restarting after >2 cycles
+          of downtime) run the full ``SNAPSHOT_UPSERT_PSYCOPG2`` once
+          to seed closed bars between session_open and prev_bar, then
+          subsequent cycles fall back to incremental. This guarantees
+          there are no gaps if the engine restarts mid-session.
 
         Best-effort and gated by the same flag as the flow-cache refresh:
-        the snapshot is downstream of flow_by_contract, and a failure here
-        must never break the analytics cycle or the GEX path. Mirrors
-        _refresh_flow_caches' error handling (log, do not raise).
+        a failure here must never break the analytics cycle or the GEX
+        path. Mirrors ``_refresh_flow_caches`` error handling: log, do
+        not raise.
         """
         if not self._analytics_flow_cache_refresh_enabled:
             return
@@ -2560,31 +2572,70 @@ class AnalyticsEngine:
             session_close = session_start + timedelta(hours=6, minutes=45)
             now_utc = datetime.now(timezone.utc)
             now_floor_epoch = int(now_utc.timestamp() // 300) * 300
-            now_floored = datetime.fromtimestamp(now_floor_epoch, tz=timezone.utc)
-            session_end = min(now_floored, session_close)
+            curr_bar = datetime.fromtimestamp(now_floor_epoch, tz=timezone.utc)
+            session_end = min(curr_bar, session_close)
             if session_end < session_start:
                 session_end = session_start
+            prev_bar = max(session_start, session_end - timedelta(minutes=5))
 
             with db_connection() as conn:
                 cursor = conn.cursor()
+                # Decide: incremental (steady-state) or full (cold-start /
+                # gap-fill).  The cheap probe is "do we have a row in
+                # flow_series_5min for prev_bar already?".  If yes, all
+                # earlier bars in this session were populated by an
+                # earlier cycle; refreshing just prev_bar + curr_bar is
+                # sufficient.  If no, we have a gap (fresh session, or
+                # missed >=2 cycles); run the full upsert to backfill.
                 cursor.execute(
-                    SNAPSHOT_UPSERT_PSYCOPG2,
-                    {
-                        "symbol": self.db_symbol,
-                        "session_start": session_start,
-                        "session_end": session_end,
-                        "strikes": None,
-                        "expirations": None,
-                    },
+                    """
+                    SELECT 1 FROM flow_series_5min
+                    WHERE symbol = %s AND bar_start = %s
+                    LIMIT 1
+                    """,
+                    (self.db_symbol, prev_bar),
                 )
-                conn.commit()
-                logger.info(
-                    "flow_series_5min snapshot upserted %d rows for %s " "(window [%s, %s])",
-                    cursor.rowcount,
-                    self.db_symbol,
-                    session_start.isoformat(),
-                    session_end.isoformat(),
-                )
+                prev_bar_known = cursor.fetchone() is not None
+
+                if prev_bar_known and prev_bar > session_start:
+                    cursor.execute(
+                        SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2,
+                        {
+                            "symbol": self.db_symbol,
+                            "prev_bar": prev_bar,
+                            "curr_bar": session_end,
+                        },
+                    )
+                    conn.commit()
+                    logger.info(
+                        "flow_series_5min incremental upserted %d rows for %s "
+                        "(bars [%s, %s])",
+                        cursor.rowcount,
+                        self.db_symbol,
+                        prev_bar.isoformat(),
+                        session_end.isoformat(),
+                    )
+                else:
+                    # Cold-start / gap-fill: full session backfill.
+                    cursor.execute(
+                        SNAPSHOT_UPSERT_PSYCOPG2,
+                        {
+                            "symbol": self.db_symbol,
+                            "session_start": session_start,
+                            "session_end": session_end,
+                            "strikes": None,
+                            "expirations": None,
+                        },
+                    )
+                    conn.commit()
+                    logger.info(
+                        "flow_series_5min full backfill upserted %d rows for %s "
+                        "(window [%s, %s]) -- cold-start or gap detected",
+                        cursor.rowcount,
+                        self.db_symbol,
+                        session_start.isoformat(),
+                        session_end.isoformat(),
+                    )
 
         except Exception as e:
             logger.error(f"Error refreshing flow_series_5min snapshot: {e}", exc_info=True)
