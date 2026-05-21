@@ -131,6 +131,13 @@ class VolExpansionSignal:
         sigma = realized_sigma(closes, window=60)
         return {
             "net_gex": ctx.net_gex,
+            "total_oi": ctx.total_oi,
+            "spot": ctx.close,
+            "readiness_path": (
+                "scale_invariant"
+                if (ctx.close and ctx.close > 0 and ctx.total_oi and ctx.total_oi > 0)
+                else "legacy_global"
+            ),
             "gex_regime": "negative" if ctx.net_gex < 0 else "positive",
             "expansion": self.expansion(ctx),
             "direction": self.direction_score(ctx),
