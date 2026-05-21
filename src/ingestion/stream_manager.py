@@ -781,6 +781,11 @@ class StreamManager:
         # Shared wakeup event — either accumulator sets this when new data arrives
         # so the main loop can react immediately instead of sleeping a fixed interval.
         self._wakeup = threading.Event()
+        # Shutdown latch. ``stream()`` checks this around its idle wait so a
+        # SIGTERM-triggered ``request_stop()`` exits in milliseconds, not after
+        # the full extended-hours poll interval (was up to 30s, causing systemd
+        # to SIGKILL the worker past TimeoutStopSec).
+        self._stop_event = threading.Event()
         # Background accumulators for persistent streaming connections.
         self._accumulator: Optional[OptionStreamAccumulator] = None
         self._underlying_accumulator: Optional[UnderlyingBarAccumulator] = None
@@ -1174,6 +1179,22 @@ class StreamManager:
         self._accumulator.start(seed_from_rest=seed_option_rest)
         self._underlying_accumulator.start()
 
+    def request_stop(self):
+        """Ask :meth:`stream` to exit at its next checkpoint.
+
+        Safe to call from a signal handler: only sets two threading.Event
+        flags, no buffer touching, no logging. The set on ``_wakeup`` is the
+        critical bit — without it the loop sits on its idle wait for up to
+        the full extended-hours poll interval (30s) and gets SIGKILLed by
+        systemd's TimeoutStopSec before it can drain.
+        """
+        self._stop_event.set()
+        # Interrupt any in-flight ``_wakeup.wait(timeout=...)``. The wait is
+        # the dominant blocker — accumulator HTTP reads happen on daemon
+        # threads, and ``run_streaming``'s DB writes happen between yields,
+        # not inside this generator.
+        self._wakeup.set()
+
     def _restart_underlying_accumulator(self, reason: str):
         """Tear down and recreate ONLY the underlying bar stream.
 
@@ -1330,7 +1351,7 @@ class StreamManager:
         _last_fresh_bar_ts: Optional[datetime] = None
 
         try:
-            while True:
+            while not self._stop_event.is_set():
                 iteration += 1
 
                 # Get current market session for dynamic polling
@@ -1355,7 +1376,19 @@ class StreamManager:
                 # Clear before waiting so signals arriving during processing
                 # are not lost (set-before-clear race).
                 self._wakeup.clear()
+                # Stop arriving between clear() and wait() would otherwise be
+                # erased by the clear; re-check before parking. request_stop()
+                # sets both flags, so a stop here means wakeup was also set
+                # and the subsequent wait would return immediately anyway —
+                # this check just spares one extra loop trip.
+                if self._stop_event.is_set():
+                    break
                 self._wakeup.wait(timeout=max_wait)
+                # Stop arriving during the wait: request_stop() sets _wakeup,
+                # so the wait returns in milliseconds rather than sitting on
+                # the full max_wait (up to 30s in extended hours).
+                if self._stop_event.is_set():
+                    break
 
                 cycle_start = time.monotonic()
 

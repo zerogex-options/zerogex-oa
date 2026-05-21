@@ -230,6 +230,12 @@ class IngestionEngine:
         self._last_underlying_signature: Optional[str] = None
         self._option_bucket_last_write: Dict[tuple[str, datetime], float] = {}
 
+        # Active StreamManager during run_streaming(). Held so _signal_handler
+        # can wake its idle wait — otherwise the loop sits on its wakeup for
+        # up to the full extended-hours poll interval (30s) before noticing
+        # self.running flipped, blowing past systemd's TimeoutStopSec.
+        self._active_stream_manager: Optional[StreamManager] = None
+
         logger.info(f"Initialized IngestionEngine for {underlying}")
         logger.info(f"Config: {num_expirations} expirations, {num_strikes} strikes each side")
 
@@ -290,11 +296,24 @@ class IngestionEngine:
         mid-append/mid-iterate, which would corrupt state or raise
         ``RuntimeError: dictionary changed size during iteration``.
 
-        Just flip ``running`` so the main loop exits cleanly; its ``finally``
-        block handles the flush and pool close.
+        Flip ``running`` so the main loop exits, and poke the active
+        StreamManager's stop event so its idle ``_wakeup.wait`` returns
+        immediately instead of blocking up to the full extended-hours poll
+        interval (30s — long enough for systemd to SIGKILL the worker past
+        TimeoutStopSec). The ``finally`` blocks downstream still handle the
+        flush and pool close.
         """
         logger.info(f"\n⚠️  Received signal {signum}, shutting down gracefully...")
         self.running = False
+        sm = self._active_stream_manager
+        if sm is not None:
+            try:
+                sm.request_stop()
+            except Exception:
+                # A signal handler must never raise — losing the wake-up is
+                # bad, but propagating an exception out of the handler is
+                # worse (kills the interpreter before any flush runs).
+                pass
 
     def _initialize_database(self):
         """Initialize database tables if needed"""
@@ -1501,17 +1520,21 @@ class IngestionEngine:
             num_strikes=self.num_strikes,
         )
 
-        if not stream_manager.initialize():
-            logger.error("Failed to initialize streaming")
-            return
-
-        logger.info("✅ Streaming initialized")
-        logger.info("Press Ctrl+C to stop\n")
-
-        self.running = True
+        # Publish the active manager before initialize()/stream() so a
+        # SIGTERM arriving during either path reaches request_stop().
+        self._active_stream_manager = stream_manager
 
         window_closed = False
         try:
+            if not stream_manager.initialize():
+                logger.error("Failed to initialize streaming")
+                return
+
+            logger.info("✅ Streaming initialized")
+            logger.info("Press Ctrl+C to stop\n")
+
+            self.running = True
+
             for item in stream_manager.stream(max_iterations=None):
                 if not self.running:
                     break
@@ -1545,6 +1568,10 @@ class IngestionEngine:
         except Exception as e:
             logger.error(f"Streaming error: {e}", exc_info=True)
         finally:
+            # Drop the reference BEFORE the slow flush path so a second
+            # SIGTERM during shutdown doesn't try to poke a half-torn-down
+            # stream manager.
+            self._active_stream_manager = None
             self._flush_all_buffers()
             try:
                 self.client.close_all_streams()
