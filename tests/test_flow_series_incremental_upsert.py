@@ -101,6 +101,99 @@ def test_incremental_sql_aggregates_flow_by_contract_directly():
 
 
 # ---------------------------------------------------------------------------
+# Column-existence guards
+# ---------------------------------------------------------------------------
+#
+# Background: shipping SQL that references columns that don't exist on
+# the referenced table is a class of bug that static-marker tests don't
+# catch and that requires a real Postgres to detect at runtime.  After
+# the May-21 incident (``COUNT(fbc.option_symbol)`` -- flow_by_contract
+# has no option_symbol column -- crashed every analytics cycle), we
+# parse the canonical schema and assert that every ``fbc.<col>``
+# reference resolves to a real flow_by_contract column.  Cheap, static,
+# no DB needed, and would have caught the original bug.
+
+
+def _columns_of(table: str) -> set[str]:
+    """Return the column names declared on ``table`` by parsing
+    setup/database/schema.sql.  Conservative -- only reads the
+    initial CREATE TABLE block; the ALTER TABLE ADD COLUMN
+    follow-ups in the same file are also picked up for completeness."""
+    import re
+    from pathlib import Path
+
+    schema = (Path(__file__).resolve().parent.parent / "setup" / "database" / "schema.sql").read_text()
+    cols: set[str] = set()
+    # CREATE TABLE [IF NOT EXISTS] <table> ( ... );
+    m = re.search(
+        rf"CREATE TABLE\s+(?:IF NOT EXISTS\s+)?{re.escape(table)}\s*\(([^;]+?)\)\s*;",
+        schema,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if m:
+        body = m.group(1)
+        for line in body.splitlines():
+            line = line.strip().rstrip(",")
+            # Skip table-level constraints (PRIMARY KEY, FOREIGN KEY, CHECK, ...)
+            # and empty/comment lines.
+            if not line or line.startswith("--"):
+                continue
+            up = line.upper()
+            if up.startswith(("PRIMARY KEY", "FOREIGN KEY", "UNIQUE", "CHECK", "CONSTRAINT")):
+                continue
+            # Column definition: first token is the column name.
+            name = line.split()[0].strip('"')
+            if name.isidentifier():
+                cols.add(name)
+    # ALTER TABLE <table> ADD COLUMN [IF NOT EXISTS] <name> ...
+    for am in re.finditer(
+        rf"ALTER TABLE\s+{re.escape(table)}\s+ADD COLUMN\s+(?:IF NOT EXISTS\s+)?(\w+)",
+        schema,
+        re.IGNORECASE,
+    ):
+        cols.add(am.group(1))
+    return cols
+
+
+def test_incremental_sql_references_only_real_flow_by_contract_columns():
+    """Every ``fbc.<col>`` reference must resolve to a real
+    flow_by_contract column.  Regression guard for the May-21
+    ``COUNT(fbc.option_symbol)`` runtime crash -- option_symbol is on
+    option_chains, NOT on flow_by_contract."""
+    import re
+
+    sql = SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2
+    fbc_cols = _columns_of("flow_by_contract")
+    assert fbc_cols, "could not parse flow_by_contract columns from schema.sql"
+
+    referenced = set(re.findall(r"\bfbc\.(\w+)", sql))
+    bogus = referenced - fbc_cols
+    assert not bogus, (
+        f"SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2 references columns that do "
+        f"not exist on flow_by_contract: {sorted(bogus)}. "
+        f"Real columns are: {sorted(fbc_cols)}"
+    )
+
+
+def test_incremental_sql_references_only_real_underlying_quotes_columns():
+    """Same guard for the underlying_quotes table (used for the
+    underlying_price subquery)."""
+    import re
+
+    sql = SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2
+    uq_cols = _columns_of("underlying_quotes")
+    assert uq_cols, "could not parse underlying_quotes columns from schema.sql"
+
+    referenced = set(re.findall(r"\buq\.(\w+)", sql))
+    bogus = referenced - uq_cols
+    assert not bogus, (
+        f"SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2 references columns that do "
+        f"not exist on underlying_quotes: {sorted(bogus)}. "
+        f"Real columns are: {sorted(uq_cols)}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Engine dispatch
 # ---------------------------------------------------------------------------
 

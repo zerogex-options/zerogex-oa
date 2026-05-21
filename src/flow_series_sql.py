@@ -357,7 +357,13 @@ per_bar_aggregates AS (
             AS call_position_cum,
         COALESCE(SUM(CASE WHEN fbc.option_type = 'P' THEN fbc.net_volume ELSE 0 END), 0)::bigint
             AS put_position_cum,
-        COUNT(fbc.option_symbol)::int AS contract_count
+        -- COUNT a NOT-NULL column from flow_by_contract so unmatched
+        -- LEFT JOIN rows (synthetic bars with zero contracts) read as 0
+        -- rather than 1.  ``strike`` is declared NOT NULL in the
+        -- schema; ``option_symbol`` does NOT exist on flow_by_contract
+        -- (its contract identity is (symbol, option_type, strike,
+        -- expiration) -- no per-row option_symbol column).
+        COUNT(fbc.strike)::int AS contract_count
     FROM target_bars t
     LEFT JOIN flow_by_contract fbc
         ON fbc.symbol = %(symbol)s AND fbc.timestamp = t.bar_start
