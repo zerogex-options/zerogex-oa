@@ -237,6 +237,140 @@ analytics-snapshot-explain: ## EXPLAIN (no ANALYZE) of the _get_snapshot query �
 		"EXPLAIN (VERBOSE) WITH latest_ts AS (SELECT timestamp AS ts FROM option_chains WHERE underlying = '$$UNDERLYING' ORDER BY timestamp DESC LIMIT 1), latest_per_contract AS (SELECT DISTINCT ON (oc.option_symbol) oc.option_symbol, oc.timestamp FROM option_chains oc, latest_ts lt WHERE oc.underlying = '$$UNDERLYING' AND oc.timestamp <= lt.ts AND oc.timestamp >= (lt.ts - ($$LOOKBACK * INTERVAL '1 minute')) AND oc.gamma IS NOT NULL ORDER BY oc.option_symbol, oc.timestamp DESC) SELECT lt.ts, lpc.option_symbol FROM latest_ts lt LEFT JOIN latest_per_contract lpc ON TRUE;" \
 		| $(PSQL) -v ON_ERROR_STOP=0
 
+.PHONY: db-tune-suggest
+db-tune-suggest: ## Print PostgreSQL config recommendations sized to host RAM + actual table sizes
+	@echo "$(BLUE)=== PostgreSQL tuning recommendations for this host ===$(NC)"
+	@echo "$(YELLOW)Reads pg_settings + pg_class.relpages + /proc/meminfo and prints recommended$(NC)"
+	@echo "$(YELLOW)values for shared_buffers, effective_cache_size, work_mem, maintenance_work_mem,$(NC)"
+	@echo "$(YELLOW)random_page_cost, and parallel-worker settings.  Diagnostic only -- prints the$(NC)"
+	@echo "$(YELLOW)ALTER SYSTEM SET commands you can copy/paste.  shared_buffers requires a$(NC)"
+	@echo "$(YELLOW)postgres restart to take effect; the rest reload via SELECT pg_reload_conf().$(NC)"
+	@echo ""
+	@echo "$(BLUE)[1/4] System memory + storage class$(NC)"
+	@if [ -r /proc/meminfo ]; then \
+		MEM_KB=$$(awk '/^MemTotal:/ {print $$2}' /proc/meminfo); \
+		MEM_MB=$$((MEM_KB / 1024)); \
+		MEM_GB=$$((MEM_MB / 1024)); \
+		echo "  Host RAM: $$MEM_GB GB ($$MEM_MB MB)"; \
+		SB_MB=$$((MEM_MB / 4)); \
+		ECS_MB=$$((MEM_MB * 3 / 4)); \
+		WM_MB=$$((MEM_MB / 200)); \
+		MWM_MB=$$((MEM_MB / 16)); \
+		[ $$MWM_MB -gt 2048 ] && MWM_MB=2048; \
+		echo "  Recommended shared_buffers       = $${SB_MB} MB   (~25% of RAM)"; \
+		echo "  Recommended effective_cache_size = $${ECS_MB} MB  (~75% of RAM)"; \
+		echo "  Recommended work_mem             = $${WM_MB} MB   (~RAM/200, per sort/hash node)"; \
+		echo "  Recommended maintenance_work_mem = $${MWM_MB} MB  (~RAM/16, capped at 2 GB)"; \
+	else \
+		echo "  $(RED)/proc/meminfo unreadable -- can't size recommendations to host RAM$(NC)"; \
+	fi
+	@echo ""
+	@echo "$(BLUE)[2/4] Current PostgreSQL settings$(NC)"
+	@printf "%s\n" \
+		"SELECT name, setting, unit, source, pending_restart FROM pg_settings WHERE name IN ('shared_buffers', 'effective_cache_size', 'work_mem', 'maintenance_work_mem', 'random_page_cost', 'seq_page_cost', 'effective_io_concurrency', 'max_parallel_workers_per_gather', 'autovacuum_naptime', 'checkpoint_completion_target') ORDER BY name;" \
+		| $(PSQL) -v ON_ERROR_STOP=0
+	@echo ""
+	@echo "$(BLUE)[3/4] Working-set sizing (largest tables)$(NC)"
+	@printf "%s\n" \
+		"SELECT relname AS table, pg_size_pretty(pg_total_relation_size(c.oid)) AS total, pg_size_pretty(pg_relation_size(c.oid)) AS heap, pg_size_pretty(pg_total_relation_size(c.oid) - pg_relation_size(c.oid)) AS indexes FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'r' ORDER BY pg_total_relation_size(c.oid) DESC LIMIT 10;" \
+		| $(PSQL) -v ON_ERROR_STOP=0
+	@echo ""
+	@echo "$(BLUE)[4/4] Recommended ALTER SYSTEM SET commands (review before running)$(NC)"
+	@echo "$(YELLOW)# random_page_cost defaults to 4.0 (assumes spinning disk).  EBS gp3 / NVMe$(NC)"
+	@echo "$(YELLOW)# SSD should use ~1.1; this often shifts the planner onto smaller index$(NC)"
+	@echo "$(YELLOW)# scans for queries like analytics _get_snapshot, eliminating cold-page reads.$(NC)"
+	@echo "$(YELLOW)#$(NC)"
+	@echo "$(YELLOW)# Run via 'make psql' and uncomment the lines you want:$(NC)"
+	@if [ -r /proc/meminfo ]; then \
+		MEM_KB=$$(awk '/^MemTotal:/ {print $$2}' /proc/meminfo); \
+		MEM_MB=$$((MEM_KB / 1024)); \
+		SB_MB=$$((MEM_MB / 4)); \
+		ECS_MB=$$((MEM_MB * 3 / 4)); \
+		WM_MB=$$((MEM_MB / 200)); \
+		MWM_MB=$$((MEM_MB / 16)); \
+		[ $$MWM_MB -gt 2048 ] && MWM_MB=2048; \
+		echo "  ALTER SYSTEM SET shared_buffers       = '$${SB_MB}MB';   -- requires postgres restart"; \
+		echo "  ALTER SYSTEM SET effective_cache_size = '$${ECS_MB}MB';  -- reload via pg_reload_conf()"; \
+		echo "  ALTER SYSTEM SET work_mem             = '$${WM_MB}MB';"; \
+		echo "  ALTER SYSTEM SET maintenance_work_mem = '$${MWM_MB}MB';"; \
+	fi
+	@echo "  ALTER SYSTEM SET random_page_cost     = '1.1';      -- SSD/EBS default; was 4.0"
+	@echo "  ALTER SYSTEM SET effective_io_concurrency = '200';  -- EBS gp3 / NVMe sustains this"
+	@echo "  SELECT pg_reload_conf();                            -- non-restart settings only"
+	@echo ""
+	@echo "$(GREEN)Procedure for shared_buffers (the one that needs a restart):$(NC)"
+	@echo "  1. ALTER SYSTEM SET shared_buffers = '<value>';"
+	@echo "  2. sudo systemctl restart postgresql"
+	@echo "  3. Verify: 'make psql' → SHOW shared_buffers;"
+	@echo ""
+	@echo "$(GREEN)Why this matters for the analytics snapshot wedge:$(NC)"
+	@echo "  option_chains is ~65 GB (heap + indexes).  With the default shared_buffers=128MB,"
+	@echo "  ~0.2% of the working set can stay cached, so every analytics cycle's snapshot"
+	@echo "  query has to re-read pages from disk (EBS ~10ms/page).  Bumping shared_buffers"
+	@echo "  to 25% of RAM eliminates the cold-pool problem for steady-state cycles."
+
+.PHONY: db-index-audit
+db-index-audit: ## Print an index audit for a table (default: option_chains), with drop candidates ranked by cost/benefit
+	@TABLE=$${TABLE:-option_chains}; \
+	echo "$(BLUE)=== Index audit: $$TABLE ===$(NC)"; \
+	echo "$(YELLOW)Surfaces low-scan + large-size indexes, redundant key patterns, and the$(NC)"; \
+	echo "$(YELLOW)pg_stat_user_indexes baseline so a drop decision can be justified with$(NC)"; \
+	echo "$(YELLOW)hard numbers.  Diagnostic only -- nothing is dropped here.$(NC)"; \
+	echo ""; \
+	echo "$(BLUE)[1/4] Indexes ranked by scan count (low scans + large size = drop candidate)$(NC)"; \
+	printf "%s\n" \
+		"SELECT indexrelname AS index, idx_scan AS scans, idx_tup_read AS tuples_read, CASE WHEN idx_scan > 0 THEN ROUND(idx_tup_read::numeric / idx_scan, 1) END AS tuples_per_scan, pg_size_pretty(pg_relation_size(indexrelid)) AS size, pg_relation_size(indexrelid) / 1024 / 1024 AS size_mb FROM pg_stat_user_indexes WHERE relname = '$$TABLE' ORDER BY idx_scan ASC, size_mb DESC;" \
+		| $(PSQL) -v ON_ERROR_STOP=0; \
+	echo ""; \
+	echo "$(BLUE)[2/4] Index definitions (look for redundant key prefixes)$(NC)"; \
+	printf "%s\n" \
+		"SELECT indexname, indexdef FROM pg_indexes WHERE tablename = '$$TABLE' ORDER BY indexname;" \
+		| $(PSQL) -v ON_ERROR_STOP=0; \
+	echo ""; \
+	echo "$(BLUE)[3/4] Bloat estimate (high dead_pct = REINDEX CONCURRENTLY may help)$(NC)"; \
+	printf "%s\n" \
+		"SELECT relname AS table, n_live_tup, n_dead_tup, ROUND(n_dead_tup::numeric / NULLIF(n_live_tup, 0) * 100, 1) AS dead_pct, last_autovacuum, last_autoanalyze FROM pg_stat_user_tables WHERE relname = '$$TABLE';" \
+		| $(PSQL) -v ON_ERROR_STOP=0; \
+	echo ""; \
+	echo "$(BLUE)[4/4] Total table + index footprint$(NC)"; \
+	printf "%s\n" \
+		"SELECT pg_size_pretty(pg_total_relation_size('$$TABLE')) AS total, pg_size_pretty(pg_relation_size('$$TABLE')) AS heap, pg_size_pretty(pg_total_relation_size('$$TABLE') - pg_relation_size('$$TABLE')) AS indexes_and_toast;" \
+		| $(PSQL) -v ON_ERROR_STOP=0
+	@echo ""
+	@echo "$(GREEN)How to read [1]:$(NC)"
+	@echo "  • $(GREEN)scans=0$(NC)                       → dead index. Drop with DROP INDEX CONCURRENTLY."
+	@echo "  • $(YELLOW)scans < 1000 + size > 1 GB$(NC)   → low-ROI index. Investigate WHICH query uses it via"
+	@echo "      pg_stat_statements before dropping; you may have a rarely-hit but important path."
+	@echo "  • $(YELLOW)tuples_per_scan > 100000$(NC)     → planner is doing big bitmap scans, not selective"
+	@echo "      lookups. Often a sign the key columns aren't selective enough."
+	@echo "  • In [2], look for one index whose key is a prefix of another's key -- the prefix one"
+	@echo "    is usually redundant (the longer index can serve the shorter prefix). Same for"
+	@echo "    INCLUDE columns -- a superset can replace a subset."
+	@echo "  • Repeat with TABLE=<other> to audit signal_scores, flow_by_contract, etc."
+
+.PHONY: db-drop-underused-option-chains-idx
+db-drop-underused-option-chains-idx: ## DROP CONCURRENTLY idx_option_chains_underlying (35 scans observed; subsumed by every (underlying, ...) composite). Pass CONFIRM=yes.
+	@echo "$(BLUE)=== Dropping idx_option_chains_underlying CONCURRENTLY ===$(NC)"
+	@echo "$(YELLOW)This index is keyed on (underlying) alone.  Per the May-21-2026 audit:$(NC)"
+	@echo "$(YELLOW)  pg_stat_user_indexes idx_scan = 35 (effectively unused)$(NC)"
+	@echo "$(YELLOW)  size                          = 359 MB$(NC)"
+	@echo "$(YELLOW)Every query that filters by ``underlying`` has at least one composite$(NC)"
+	@echo "$(YELLOW)index whose key starts with ``underlying`` (idx_option_chains_underlying_$(NC)"
+	@echo "$(YELLOW)timestamp, ..._exp_strike, ..._ts_gamma, ..._option_symbol_timestamp, etc.)$(NC)"
+	@echo "$(YELLOW)so the planner has multiple alternative paths and the single-column index$(NC)"
+	@echo "$(YELLOW)is pure write amplification.  Sanity check before dropping:$(NC)"
+	@echo "$(YELLOW)  make psql$(NC)"
+	@echo "$(YELLOW)  SELECT indexrelname, idx_scan, last_idx_scan FROM pg_stat_user_indexes$(NC)"
+	@echo "$(YELLOW)    WHERE indexrelname = 'idx_option_chains_underlying';$(NC)"
+	@if [ "$${CONFIRM}" != "yes" ]; then \
+		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to actually drop.$(NC)"; \
+	else \
+		printf "%s\n" \
+			"DROP INDEX CONCURRENTLY IF EXISTS idx_option_chains_underlying;" \
+			| $(PSQL) -v ON_ERROR_STOP=1; \
+		echo "$(GREEN)✓ Dropped idx_option_chains_underlying. Reclaimed ~359 MB + per-row write overhead.$(NC)"; \
+	fi
+
 .PHONY: db-add-distinct-on-index
 db-add-distinct-on-index: ## Build idx_option_chains_underlying_option_symbol_ts_gamma_covering CONCURRENTLY (~6 GB). Pass CONFIRM=yes to execute.
 	@echo "$(BLUE)=== Building idx_option_chains_underlying_option_symbol_ts_gamma_covering CONCURRENTLY ===$(NC)"

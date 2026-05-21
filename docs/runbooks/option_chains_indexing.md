@@ -73,3 +73,68 @@ make db-add-distinct-on-index
 Uses `CREATE INDEX CONCURRENTLY` to avoid blocking the
 `option_chains` writers. The `setup/database/schema.sql` entry
 serves fresh installs and idempotent retries.
+
+## Auditing & pruning (May 21, 2026)
+
+The May 21 incident — cycle-after-cycle `_get_snapshot` timing out
+at the configured `statement_timeout` even after restart — traced
+to a buffer pool too small for the working set (default
+`shared_buffers=128MB` against ~65 GB of table + indexes). Two
+related findings from the audit:
+
+1. **`idx_option_chains_underlying` is effectively dead.** 35 scans
+   observed (lifetime of `pg_stat_user_indexes`), 359 MB on disk.
+   Every query that filters by `underlying` has a composite index
+   whose key starts with `underlying` — the single-column variant
+   carries write amplification with no read benefit. Drop with
+   `make db-drop-underused-option-chains-idx CONFIRM=yes`.
+
+2. **The 19 GB covering index may be over-engineered for its
+   actual user.** `idx_option_chains_underlying_option_symbol_ts_gamma_covering`
+   was built to convert `_do_refresh_flow_cache`'s LATERAL backfill
+   into an Index Only Scan, but its `INCLUDE` list lacks
+   `ask_volume`, `bid_volume`, and `mid` — three columns the
+   backfill SELECTs — so the planner still has to fetch the heap
+   anyway. Meanwhile `idx_option_chains_underlying_option_symbol_timestamp`
+   (2.7 GB, 185 M scans) serves the same key with one heap fetch
+   per row, and is dominantly preferred by the planner. The
+   covering index records only 2.4 k scans lifetime. **Before
+   dropping, verify in `pg_stat_statements` that no other query is
+   actually achieving an Index Only Scan against it.** See
+   `make db-drop-distinct-on-index` for the gated drop.
+
+### Running the audit
+
+```sh
+make db-index-audit                    # default TABLE=option_chains
+make db-index-audit TABLE=signal_scores
+```
+
+Output ranks indexes by scan count and surfaces `tuples_per_scan`
+(planner-doing-big-scans signal) plus a bloat estimate. Always
+sanity-check `pg_stat_statements` for the SPECIFIC query patterns
+hitting a candidate before dropping.
+
+## Buffer pool sizing
+
+The query-plan choice (bitmap heap scan vs. index scan) is
+half the picture; the other half is whether the chosen pages
+stay in cache between cycles. The May 21 audit showed
+`shared_buffers=128MB` against 65 GB of working set —
+~0.2 % cache coverage — so every analytics cycle re-read pages
+from disk at EBS-typical ~10 ms/page. With three analytics
+workers querying different underlyings, the buffer pool churned
+constantly and no cycle ever found a warm pool.
+
+```sh
+make db-tune-suggest
+```
+
+Computes recommended `shared_buffers`, `effective_cache_size`,
+`work_mem`, `maintenance_work_mem`, `random_page_cost`, and
+`effective_io_concurrency` from `/proc/meminfo` + actual table
+sizes. Diagnostic only — prints the `ALTER SYSTEM SET` commands.
+
+`shared_buffers` requires a postgres restart; the rest reload via
+`SELECT pg_reload_conf();`. See
+`docs/runbooks/postgres_tuning.md` for the full procedure.
