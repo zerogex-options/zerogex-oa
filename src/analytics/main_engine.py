@@ -102,6 +102,22 @@ class AnalyticsEngine:
         self.snapshot_cold_start_statement_timeout_ms = max(
             0, int(os.getenv("ANALYTICS_SNAPSHOT_COLD_START_STATEMENT_TIMEOUT_MS", "180000"))
         )
+        # Dedicated per-statement timeout for the STEADY-STATE snapshot
+        # query.  The pool-wide DB_STATEMENT_TIMEOUT_MS (default 90s) is
+        # sized for sub-second API queries; the steady-state 2h snapshot
+        # walk usually finishes in seconds but can spike past 90s under
+        # autovacuum + concurrent ingestion bursts -- in which case the
+        # pool ceiling kills it, the cycle aborts at the "if not snapshot"
+        # guard, and the next cycle starts immediately into another 90s
+        # kill (no progress, downstream flow_series_5min snapshot never
+        # refreshes -> API shortfall alarms).  Default 0 = use the pool
+        # ceiling (no behavior change).  Operators seeing the snapshot
+        # wedge can raise this (e.g. 150000) without raising the
+        # pool-wide ceiling, since SET LOCAL is scoped to this single
+        # query and reverts on commit.
+        self.snapshot_statement_timeout_ms = max(
+            0, int(os.getenv("ANALYTICS_SNAPSHOT_STATEMENT_TIMEOUT_MS", "0"))
+        )
         self._snapshot_cold_start_consumed = False
         self.min_oi_coverage_pct_alert = float(
             os.getenv("ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT", "0.35")
@@ -470,6 +486,7 @@ class AnalyticsEngine:
                             self.snapshot_lookback_hours,
                             min_expiration,
                             snapshot_row_cap,
+                            statement_timeout_ms=self.snapshot_statement_timeout_ms,
                         )
                         conn.commit()
                 else:
@@ -479,6 +496,7 @@ class AnalyticsEngine:
                         self.snapshot_lookback_hours,
                         min_expiration,
                         snapshot_row_cap,
+                        statement_timeout_ms=self.snapshot_statement_timeout_ms,
                     )
                     conn.commit()
 
@@ -2538,6 +2556,13 @@ class AnalyticsEngine:
 
             if not snapshot:
                 logger.warning("No option data available in database")
+                # Record the partial timings so the cycle-overrun warning in
+                # run() reports the *current* failing cycle (just `snapshot`)
+                # instead of stale stage timings from a prior successful one.
+                # Without this an operator sees a snapshot=39.3s breakdown
+                # next to a cycle_duration=90.0s overrun and is misled into
+                # diagnosing the wrong stage.
+                self._last_stage_timings = stage_timings
                 return False
 
             latest_timestamp = snapshot["timestamp"]
@@ -2637,6 +2662,7 @@ class AnalyticsEngine:
 
             if not gex_by_strike:
                 logger.warning("No GEX data calculated")
+                self._last_stage_timings = stage_timings
                 return False
 
             logger.info(f"Calculated GEX for {len(gex_by_strike)} strikes")
@@ -2651,6 +2677,7 @@ class AnalyticsEngine:
 
             if not gex_summary:
                 logger.warning("Failed to calculate GEX summary")
+                self._last_stage_timings = stage_timings
                 return False
 
             # Validate internal arithmetic consistency before persisting.

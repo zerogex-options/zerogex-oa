@@ -371,6 +371,17 @@ class UnifiedSignalEngine:
                         )
                         max_gamma_strike = max_gamma_row["strike"]
                 except Exception as exc:  # pragma: no cover - defensive
+                    # A timeout / SQL error here leaves the transaction in
+                    # InFailedSqlTransaction state.  Without rolling back,
+                    # the next defensive sub-query immediately fails with
+                    # "current transaction is aborted, commands ignored
+                    # until end of transaction block" and the cascade keeps
+                    # going until an unguarded query (e.g. the smart-money
+                    # fallback) raises out and the whole signals cycle
+                    # ERRORs.  Reset early so each subsequent try/except
+                    # gets a clean transaction.  Safe in this entirely
+                    # read-only context fetch.
+                    self._reset_tx(conn)
                     logger.warning(
                         "UnifiedSignalEngine [%s]: gex_by_strike fetch failed: %s",
                         self.db_symbol,
@@ -436,6 +447,7 @@ class UnifiedSignalEngine:
                         if wall_row[1] is not None:
                             put_wall = float(wall_row[1])
                 except Exception as exc:  # pragma: no cover - defensive
+                    self._reset_tx(conn)
                     logger.warning(
                         "UnifiedSignalEngine [%s]: canonical wall fetch failed: %s",
                         self.db_symbol,
@@ -474,6 +486,7 @@ class UnifiedSignalEngine:
                             }
                         )
                 except Exception as exc:  # pragma: no cover - defensive
+                    self._reset_tx(conn)
                     logger.warning(
                         "UnifiedSignalEngine [%s]: per-type flow fetch failed: %s",
                         self.db_symbol,
@@ -513,6 +526,7 @@ class UnifiedSignalEngine:
                         elif r[0] == "C":
                             skew_info["otm_call_iv"] = float(r[1]) if r[1] is not None else None
                 except Exception as exc:  # pragma: no cover - defensive
+                    self._reset_tx(conn)
                     logger.warning(
                         "UnifiedSignalEngine [%s]: skew fetch failed: %s",
                         self.db_symbol,
@@ -552,23 +566,41 @@ class UnifiedSignalEngine:
                             sm_put = float(r[1] or 0.0)
                             sm_put_gross = float(r[2] or 0.0)
                 except Exception as exc:
+                    # Reset BEFORE the warning + fallback: without this the
+                    # fallback (which runs unconditionally inside the except)
+                    # inherits an aborted transaction and raises out, taking
+                    # the entire signals cycle with it.  Resetting first
+                    # lets the fallback execute on a fresh transaction.
+                    self._reset_tx(conn)
                     logger.warning(
                         "UnifiedSignalEngine [%s]: signed smart-money fetch failed: %s",
                         self.db_symbol,
                         exc,
                     )
-                    cur.execute(
-                        """
-                        SELECT COALESCE(SUM(CASE WHEN option_type='C' THEN total_premium ELSE 0 END), 0),
-                               COALESCE(SUM(CASE WHEN option_type='P' THEN total_premium ELSE 0 END), 0)
-                        FROM flow_smart_money
-                        WHERE symbol = %s
-                          AND timestamp BETWEEN %s - INTERVAL '30 minutes' AND %s
-                        """,
-                        (self.db_symbol, ts, ts),
-                    )
-                    sm_call, sm_put = cur.fetchone() or (0.0, 0.0)
-                    sm_call_gross, sm_put_gross = abs(sm_call), abs(sm_put)
+                    # The fallback itself is best-effort -- wrap it so that
+                    # if flow_smart_money also errors (e.g. statement timeout
+                    # under the same load that broke the primary) the cycle
+                    # still finishes with sm_call/sm_put defaulted to 0.
+                    try:
+                        cur.execute(
+                            """
+                            SELECT COALESCE(SUM(CASE WHEN option_type='C' THEN total_premium ELSE 0 END), 0),
+                                   COALESCE(SUM(CASE WHEN option_type='P' THEN total_premium ELSE 0 END), 0)
+                            FROM flow_smart_money
+                            WHERE symbol = %s
+                              AND timestamp BETWEEN %s - INTERVAL '30 minutes' AND %s
+                            """,
+                            (self.db_symbol, ts, ts),
+                        )
+                        sm_call, sm_put = cur.fetchone() or (0.0, 0.0)
+                        sm_call_gross, sm_put_gross = abs(sm_call), abs(sm_put)
+                    except Exception as fallback_exc:
+                        self._reset_tx(conn)
+                        logger.warning(
+                            "UnifiedSignalEngine [%s]: smart-money fallback fetch failed: %s",
+                            self.db_symbol,
+                            fallback_exc,
+                        )
 
                 # C6: true 0DTE flow by option_type and moneyness. Filters
                 # flow_contract_facts to today's expiration and splits by
@@ -604,6 +636,7 @@ class UnifiedSignalEngine:
                             }
                         )
                 except Exception as exc:
+                    self._reset_tx(conn)
                     logger.warning(
                         "UnifiedSignalEngine [%s]: 0dte flow fetch failed: %s",
                         self.db_symbol,
@@ -644,6 +677,7 @@ class UnifiedSignalEngine:
                     call_flow_delta = float(flow_delta_row[0] or 0.0)
                     put_flow_delta = float(flow_delta_row[1] or 0.0)
                 except Exception as exc:
+                    self._reset_tx(conn)
                     logger.warning(
                         "UnifiedSignalEngine [%s]: flow acceleration fetch failed: %s",
                         self.db_symbol,
@@ -675,6 +709,7 @@ class UnifiedSignalEngine:
                         if prev_row and prev_row[0] is not None:
                             prev_net_gex = float(prev_row[0])
                     except Exception as exc:
+                        self._reset_tx(conn)
                         logger.warning(
                             "UnifiedSignalEngine [%s]: previous net gex fetch failed: %s",
                             self.db_symbol,
@@ -724,6 +759,7 @@ class UnifiedSignalEngine:
                     if vix_row and vix_row[0] is not None:
                         vix_level = float(vix_row[0])
                 except Exception:
+                    self._reset_tx(conn)
                     vix_level = None
 
                 # Historical call_wall / put_wall strikes (~30min ago) so
@@ -801,6 +837,7 @@ class UnifiedSignalEngine:
                         if wrow[1] is not None:
                             prior_put_wall = float(wrow[1])
                 except Exception as exc:
+                    self._reset_tx(conn)
                     logger.debug(
                         "UnifiedSignalEngine [%s]: prior wall fetch failed: %s",
                         self.db_symbol,
@@ -833,6 +870,7 @@ class UnifiedSignalEngine:
                         elif p50 is not None and p50 > 0:
                             normalizers[field] = p50
                 except Exception:
+                    self._reset_tx(conn)
                     normalizers = {}
 
                 iv_rank = None
@@ -895,6 +933,7 @@ class UnifiedSignalEngine:
                             iv_rank = round(min(1.0, max(0.0, (current_iv - iv_low) / iv_range)), 4)
                     except Exception as exc:
                         # IV rank is supplemental; do not block signal generation if unavailable.
+                        self._reset_tx(conn)
                         logger.debug(
                             "UnifiedSignalEngine [%s]: iv_rank query failed: %s",
                             self.db_symbol,
