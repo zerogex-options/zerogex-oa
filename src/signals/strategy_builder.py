@@ -112,7 +112,9 @@ class StrategyBuilder:
         expansion = self._vol_expansion_readiness(
             float(market_ctx.get("net_gex") or 0.0),
             spot=(float(market_ctx.get("close")) if market_ctx.get("close") is not None else None),
-            total_oi=(int(market_ctx.get("total_oi")) if market_ctx.get("total_oi") is not None else None),
+            total_oi=(
+                int(market_ctx.get("total_oi")) if market_ctx.get("total_oi") is not None else None
+            ),
         )
         direction_signal = self._direction_signal(market_ctx.get("recent_closes") or [])
         momentum_mag = abs(direction_signal)

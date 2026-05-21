@@ -601,9 +601,7 @@ SIGNAL_GEX_NORMALIZATION = _getenv_float("SIGNAL_GEX_NORMALIZATION", 2_100_000_0
 # Medium / High classifications as net_gex moves toward zero / negative.
 # Raise it to widen the dynamic range (more cycles read as Medium);
 # lower it to compress (more cycles saturate at the extremes).
-GEX_SCALE_INVARIANT_SATURATION = _getenv_float(
-    "GEX_SCALE_INVARIANT_SATURATION", 100.0, min=1.0
-)
+GEX_SCALE_INVARIANT_SATURATION = _getenv_float("GEX_SCALE_INVARIANT_SATURATION", 100.0, min=1.0)
 POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS = (
     os.getenv("POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS", "false").lower() == "true"
 )

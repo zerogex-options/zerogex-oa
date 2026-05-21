@@ -772,9 +772,7 @@ class AnalyticsEngine:
                 if iv is None or iv <= 0:
                     continue
 
-                vanna = self._calculate_vanna(
-                    underlying_price, strike, T, self.risk_free_rate, iv
-                )
+                vanna = self._calculate_vanna(underlying_price, strike, T, self.risk_free_rate, iv)
 
                 charm = self._calculate_charm(
                     underlying_price,
@@ -1186,9 +1184,7 @@ class AnalyticsEngine:
         abs_arr = np.asarray(filtered_abs, dtype=float)
         if abs_arr.max() <= 0.0:
             return 0.0
-        reference = float(
-            np.percentile(abs_arr, GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE)
-        )
+        reference = float(np.percentile(abs_arr, GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE))
         if reference <= 0.0:
             # All non-zero magnitude sits above the chosen percentile
             # (very sparse filtered set).  Fall back to max so the
@@ -1271,9 +1267,7 @@ class AnalyticsEngine:
             # Legacy / direct-call path: derive the reference from the
             # passed profile (same p90 rule that lived inline before
             # the canonical-reference refactor).
-            abs_profile = np.fromiter(
-                (abs(v) for _, v in profile), dtype=float, count=len(profile)
-            )
+            abs_profile = np.fromiter((abs(v) for _, v in profile), dtype=float, count=len(profile))
             if abs_profile.size == 0 or abs_profile.max() <= 0.0:
                 return None
             reference = float(
@@ -1656,24 +1650,37 @@ class AnalyticsEngine:
                 "a local window peak above this to qualify); sign distribution "
                 "+/-/0=%d/%d/%d points (a monotonic split means no crossing "
                 "exists at all).",
-                self.db_symbol, timestamp,
+                self.db_symbol,
+                timestamp,
                 gamma_flip_span_used * 100.0,
-                diag["usable_total"], len(options), len(gamma_profile),
-                diag["usable_calls"], diag["usable_puts"],
-                diag["iv_p10"], diag["iv_p50"], diag["iv_p90"], diag["iv_max"],
+                diag["usable_total"],
+                len(options),
+                len(gamma_profile),
+                diag["usable_calls"],
+                diag["usable_puts"],
+                diag["iv_p10"],
+                diag["iv_p50"],
+                diag["iv_p90"],
+                diag["iv_max"],
                 diag["iv_at_default_count"],
                 self._GAMMA_FLIP_DIAGNOSTIC_DEFAULT_IV,
                 diag["iv_at_default_share"] * 100.0,
-                diag["oi_share_0dte"] * 100.0, diag["oi_share_1_2dte"] * 100.0,
-                diag["oi_share_3_7dte"] * 100.0, diag["oi_share_8plus_dte"] * 100.0,
+                diag["oi_share_0dte"] * 100.0,
+                diag["oi_share_1_2dte"] * 100.0,
+                diag["oi_share_3_7dte"] * 100.0,
+                diag["oi_share_8plus_dte"] * 100.0,
                 diag["weighted_oi_share_0dte"] * 100.0,
                 diag["weighted_oi_share_1_2dte"] * 100.0,
                 diag["weighted_oi_share_3_7dte"] * 100.0,
                 diag["weighted_oi_share_8plus_dte"] * 100.0,
-                diag["profile_peak"], diag["profile_median"],
+                diag["profile_peak"],
+                diag["profile_median"],
                 GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE,
-                diag["profile_reference"], diag["structural_floor"],
-                diag["profile_pos_pts"], diag["profile_neg_pts"], diag["profile_zero_pts"],
+                diag["profile_reference"],
+                diag["structural_floor"],
+                diag["profile_pos_pts"],
+                diag["profile_neg_pts"],
+                diag["profile_zero_pts"],
             )
         elif GAMMA_PROFILE_SPAN_LADDER and gamma_flip_span_used > GAMMA_PROFILE_SPAN_LADDER[0]:
             logger.info(

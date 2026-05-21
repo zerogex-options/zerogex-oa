@@ -462,9 +462,7 @@ def test_gamma_flip_unresolved_diagnostics_surfaces_each_failure_mode():
         _opt(105.0, "C", oi=5000, iv=0.88, exp=multi_day_exp),
     ]
     spike_profile = engine._gamma_exposure_profile(spike_options, spot, ts)
-    spike_diag = engine._gamma_flip_unresolved_diagnostics(
-        spike_options, spike_profile, spot, ts
-    )
+    spike_diag = engine._gamma_flip_unresolved_diagnostics(spike_options, spike_profile, spot, ts)
     assert spike_diag["iv_p50"] >= 0.80
     assert spike_diag["iv_max"] >= 0.88
     # IVs aren't the default sentinel — should NOT trip the stale-IV bucket.
@@ -479,9 +477,7 @@ def test_gamma_flip_unresolved_diagnostics_surfaces_each_failure_mode():
         _opt(100.0, "C", oi=1_000, iv=0.30, exp=multi_day_exp),
     ]
     zdte_profile = engine._gamma_exposure_profile(zero_dte_options, spot, ts)
-    zdte_diag = engine._gamma_flip_unresolved_diagnostics(
-        zero_dte_options, zdte_profile, spot, ts
-    )
+    zdte_diag = engine._gamma_flip_unresolved_diagnostics(zero_dte_options, zdte_profile, spot, ts)
     # Raw OI is overwhelmingly 0DTE.
     assert zdte_diag["oi_share_0dte"] >= 0.95
     # After DTE weighting, the 0DTE share is meaningfully smaller than
@@ -501,9 +497,7 @@ def test_gamma_flip_unresolved_diagnostics_surfaces_each_failure_mode():
         _opt(110.0, "C", oi=5000, iv=0.35, exp=multi_day_exp),  # only 1 real IV
     ]
     stale_profile = engine._gamma_exposure_profile(stale_options, spot, ts)
-    stale_diag = engine._gamma_flip_unresolved_diagnostics(
-        stale_options, stale_profile, spot, ts
-    )
+    stale_diag = engine._gamma_flip_unresolved_diagnostics(stale_options, stale_profile, spot, ts)
     assert stale_diag["iv_at_default_count"] == 3
     assert abs(stale_diag["iv_at_default_share"] - 0.75) < 1e-9
 
@@ -553,24 +547,28 @@ def test_find_structural_interior_crossing_accepts_real_crossing_in_spike_shaped
     # 10% margin).  Profile is in the negative noise floor here.
     profile.extend((50.0 + 0.5 * i, -1e-3) for i in range(50))
     # Active negative region heading into the crossing.
-    profile.extend([
-        (76.0, -8.0e6),
-        (82.0, -1.2e7),
-        (88.0, -3.0e7),
-        (94.0, -2.0e7),
-        (97.0, -1.0e7),
-        (99.0, -5.0e6),
-        # crossing somewhere in here
-        (101.0, 6.0e6),
-        (103.0, 1.5e7),
-        (106.0, 3.0e7),
-    ])
+    profile.extend(
+        [
+            (76.0, -8.0e6),
+            (82.0, -1.2e7),
+            (88.0, -3.0e7),
+            (94.0, -2.0e7),
+            (97.0, -1.0e7),
+            (99.0, -5.0e6),
+            # crossing somewhere in here
+            (101.0, 6.0e6),
+            (103.0, 1.5e7),
+            (106.0, 3.0e7),
+        ]
+    )
     # Then a colossal spike high above spot (an ATM-of-tomorrow wall).
-    profile.extend([
-        (115.0, 2.0e8),
-        (117.0, 5.0e9),  # the spike — dominates global max
-        (119.0, 2.0e8),
-    ])
+    profile.extend(
+        [
+            (115.0, 2.0e8),
+            (117.0, 5.0e9),  # the spike — dominates global max
+            (119.0, 2.0e8),
+        ]
+    )
     # And more noise floor up to the grid edge.
     profile.extend((120.0 + 0.5 * i, 1e-3) for i in range(50))
 
