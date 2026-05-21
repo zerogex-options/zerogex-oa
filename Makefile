@@ -333,27 +333,61 @@ db-tune-suggest: ## Print PostgreSQL config recommendations (auto-detects Aurora
 		fi; \
 		echo ""; \
 	fi
-	@echo "$(BLUE)[5/5] Dynamic settings (work on BOTH vanilla and Aurora via ALTER SYSTEM)$(NC)"
-	@echo "$(YELLOW)# random_page_cost defaults to 4.0 (assumes spinning disk).  EBS/SSD/$(NC)"
-	@echo "$(YELLOW)# Aurora storage should use ~1.1; this often shifts the planner onto$(NC)"
-	@echo "$(YELLOW)# smaller selective indexes for queries like analytics _get_snapshot,$(NC)"
-	@echo "$(YELLOW)# eliminating bulk-scan I/O.  Biggest single-knob improvement on this$(NC)"
-	@echo "$(YELLOW)# workload.$(NC)"
-	@echo ""
-	@echo "  $(GREEN)# Apply via 'make psql':$(NC)"
-	@echo "     ALTER SYSTEM SET random_page_cost     = '1.1';"
-	@echo "     ALTER SYSTEM SET effective_io_concurrency = '200';   -- prefetch on bitmap scans"
-	@echo "     ALTER SYSTEM SET effective_cache_size = '<DB-instance-RAM*0.75>';"
-	@echo "     -- work_mem is per-sort/hash node; keep modest unless you know it spills"
-	@echo "     SELECT pg_reload_conf();                              -- no restart needed"
-	@echo ""
-	@echo "$(GREEN)Why these matter on the cold-pool problem:$(NC)"
-	@echo "  random_page_cost=1.1 should shift the planner from the time-only Index Scan"
-	@echo "  + Filter onto idx_option_chains_underlying_ts_gamma (partial, ~1 GB) -- fewer"
-	@echo "  pages touched per cycle, which matters MUCH more than buffer-pool size on a"
-	@echo "  small instance where the pool can never hold the whole working set anyway."
-	@echo "  Run 'make analytics-snapshot-diagnose UNDERLYING=SPY' after applying to confirm"
-	@echo "  the plan shifted."
+	@IS_AURORA=$$(printf "%s\n" "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE proname = 'aurora_version') AS is_aurora \\gset" "\\echo :is_aurora" | $(PSQL) -tAX 2>/dev/null | tail -1); \
+	if [ "$$IS_AURORA" = "t" ] || [ "$$IS_AURORA" = "true" ]; then \
+		echo "$(BLUE)[5/5] Aurora: changing dynamic parameters (random_page_cost etc.)$(NC)"; \
+		echo "$(RED)IMPORTANT: Aurora REJECTS ``ALTER SYSTEM SET`` for ALL parameters --$(NC)"; \
+		echo "$(RED)including the dynamic ones.  You MUST use the cluster's DB Parameter$(NC)"; \
+		echo "$(RED)Group via AWS CLI or console.  ``random_page_cost`` is dynamic, so the$(NC)"; \
+		echo "$(RED)change applies cluster-wide immediately -- no reboot needed.$(NC)"; \
+		echo ""; \
+		echo "$(YELLOW)random_page_cost=1.1 is the highest-leverage tweak for this workload:$(NC)"; \
+		echo "$(YELLOW)default 4.0 biases the planner toward big sequential scans (assumes$(NC)"; \
+		echo "$(YELLOW)spinning disk); on Aurora storage / SSD ~1.1 is correct, and the$(NC)"; \
+		echo "$(YELLOW)plan often shifts onto the smaller idx_option_chains_underlying_ts_$(NC)"; \
+		echo "$(YELLOW)gamma partial index -- fewer pages touched per cycle, which matters$(NC)"; \
+		echo "$(YELLOW)more than buffer-pool size on a small instance.$(NC)"; \
+		echo ""; \
+		echo "  $(GREEN)# 1. Find the CLUSTER parameter group (not the instance one):$(NC)"; \
+		echo "     aws rds describe-db-clusters \\"; \
+		echo "       --query 'DBClusters[*].[DBClusterIdentifier,DBClusterParameterGroup]' \\"; \
+		echo "       --output table"; \
+		echo ""; \
+		echo "  $(GREEN)# 2. If it's the AWS default (default.aurora-postgresql<N>) you can't$(NC)"; \
+		echo "  $(GREEN)#    modify it -- create a custom one first:$(NC)"; \
+		echo "     aws rds create-db-cluster-parameter-group \\"; \
+		echo "       --db-cluster-parameter-group-name zerogex-cluster-pg \\"; \
+		echo "       --db-parameter-group-family aurora-postgresql17 \\"; \
+		echo "       --description 'Tuned for ZeroGEX analytics workload'"; \
+		echo "     aws rds modify-db-cluster \\"; \
+		echo "       --db-cluster-identifier <cluster-id> \\"; \
+		echo "       --db-cluster-parameter-group-name zerogex-cluster-pg \\"; \
+		echo "       --apply-immediately"; \
+		echo ""; \
+		echo "  $(GREEN)# 3. Set the dynamic parameters (no reboot needed):$(NC)"; \
+		echo "     aws rds modify-db-cluster-parameter-group \\"; \
+		echo "       --db-cluster-parameter-group-name zerogex-cluster-pg \\"; \
+		echo "       --parameters \\"; \
+		echo "         'ParameterName=random_page_cost,ParameterValue=1.1,ApplyMethod=immediate' \\"; \
+		echo "         'ParameterName=effective_io_concurrency,ParameterValue=200,ApplyMethod=immediate' \\"; \
+		echo "         'ParameterName=effective_cache_size,ParameterValue={DBInstanceClassMemory*3/4/8192},ApplyMethod=immediate'"; \
+		echo ""; \
+		echo "  $(GREEN)# 4. Verify on the writer (no reboot needed for dynamic params):$(NC)"; \
+		echo "     make psql -c \"SHOW random_page_cost; SHOW effective_cache_size;\""; \
+		echo ""; \
+		echo "  $(GREEN)# 5. Confirm the plan shifted:$(NC)"; \
+		echo "     make analytics-snapshot-diagnose UNDERLYING=SPY"; \
+		echo "     # [7/7] EXPLAIN should now use idx_option_chains_underlying_ts_gamma"; \
+		echo "     # (the 1 GB partial WHERE gamma IS NOT NULL index), not _timestamp."; \
+	else \
+		echo "$(BLUE)[5/5] Vanilla Postgres: dynamic settings via ALTER SYSTEM SET$(NC)"; \
+		echo ""; \
+		echo "  $(GREEN)# Apply via 'make psql':$(NC)"; \
+		echo "     ALTER SYSTEM SET random_page_cost     = '1.1';"; \
+		echo "     ALTER SYSTEM SET effective_io_concurrency = '200';"; \
+		echo "     ALTER SYSTEM SET effective_cache_size = '<RAM*0.75>';"; \
+		echo "     SELECT pg_reload_conf();                  -- no restart needed"; \
+	fi
 
 .PHONY: db-index-audit
 db-index-audit: ## Print an index audit for a table (default: option_chains), with drop candidates ranked by cost/benefit
