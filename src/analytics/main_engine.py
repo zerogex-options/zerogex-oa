@@ -88,12 +88,21 @@ class AnalyticsEngine:
         self.calculation_interval = calculation_interval
         self.risk_free_rate = risk_free_rate
         self.running = False
+        # Accept fractional hours (e.g. 0.5 = 30 min, 0.25 = 15 min) so an
+        # operator on a cold-storage buffer pool can dial the snapshot
+        # working set down without a code change.  Floor at 5 minutes
+        # (1/12 h) -- below that you risk losing recently-quoted contracts
+        # that haven't been requoted in the narrowed window, which
+        # silently distorts GEX/max-pain instead of failing loudly.
         self.snapshot_lookback_hours = max(
-            1, int(os.getenv("ANALYTICS_SNAPSHOT_LOOKBACK_HOURS", "2"))
+            1.0 / 12.0, float(os.getenv("ANALYTICS_SNAPSHOT_LOOKBACK_HOURS", "2"))
         )
+        # Cold-start lookback is integer-hours because it's always a
+        # multi-hour window (default 96 = full long-weekend gap); the
+        # fractional path above is for steady-state tuning only.
         self.snapshot_cold_start_lookback_hours = max(
             self.snapshot_lookback_hours,
-            int(os.getenv("ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS", "96")),
+            float(os.getenv("ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS", "96")),
         )
         # The wide cold-start scan can legitimately run longer than the
         # pool-wide DB_STATEMENT_TIMEOUT_MS (default 90s) when the buffer
@@ -437,12 +446,33 @@ class AnalyticsEngine:
                 want_cold_start = not self._snapshot_cold_start_consumed and data_age > timedelta(
                     hours=self.snapshot_lookback_hours
                 )
+                # Buffer-pool warmup is a separate concern from the
+                # data-staleness gate.  A mid-session restart with live
+                # ingestion sees fresh data (data_age < snapshot_lookback_hours)
+                # and skips the wide cold-start scan, but the buffer pool is
+                # still cold from the restart -- the 2h steady-state walk can
+                # then drag past the steady-state statement_timeout on that
+                # FIRST cycle and the whole process loops at 90-150s
+                # snapshot=timeout / no progress until something warms the
+                # pool.  Grant the SAME cold-start budget to cycle 1 on the
+                # steady-state path; from cycle 2 the pool is warm enough
+                # that the configured steady-state budget suffices.
+                is_first_cycle = not self._snapshot_cold_start_consumed
                 self._snapshot_cold_start_consumed = True
+                # Effective per-query ceiling used by the steady-state
+                # branch and the cold-start fallback retry.  Cycle 1 gets
+                # the cold-start budget because the pool is cold; later
+                # cycles get the configured steady-state value.
+                steady_state_timeout_ms = (
+                    self.snapshot_cold_start_statement_timeout_ms
+                    if is_first_cycle
+                    else self.snapshot_statement_timeout_ms
+                )
 
                 if want_cold_start:
                     logger.info(
                         "Cold-start snapshot: latest data is %.1fh old; using "
-                        "%dh lookback (steady-state %dh) with %dms statement_timeout",
+                        "%.2fh lookback (steady-state %.2fh) with %dms statement_timeout",
                         data_age.total_seconds() / 3600.0,
                         self.snapshot_cold_start_lookback_hours,
                         self.snapshot_lookback_hours,
@@ -486,17 +516,30 @@ class AnalyticsEngine:
                             self.snapshot_lookback_hours,
                             min_expiration,
                             snapshot_row_cap,
-                            statement_timeout_ms=self.snapshot_statement_timeout_ms,
+                            statement_timeout_ms=steady_state_timeout_ms,
                         )
                         conn.commit()
                 else:
+                    if is_first_cycle and steady_state_timeout_ms > 0:
+                        # Surface the warmup-budget upgrade so an operator
+                        # diagnosing a slow restart can see why cycle 1's
+                        # statement_timeout differs from the configured
+                        # steady-state value.
+                        logger.info(
+                            "First-cycle steady-state snapshot: applying "
+                            "%dms cold-start statement_timeout to absorb "
+                            "buffer-pool warmup (subsequent cycles use the "
+                            "%dms steady-state budget; 0 = pool default)",
+                            steady_state_timeout_ms,
+                            self.snapshot_statement_timeout_ms,
+                        )
                     rows = self._run_snapshot_query(
                         cursor,
                         timestamp,
                         self.snapshot_lookback_hours,
                         min_expiration,
                         snapshot_row_cap,
-                        statement_timeout_ms=self.snapshot_statement_timeout_ms,
+                        statement_timeout_ms=steady_state_timeout_ms,
                     )
                     conn.commit()
 
