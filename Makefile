@@ -238,76 +238,122 @@ analytics-snapshot-explain: ## EXPLAIN (no ANALYZE) of the _get_snapshot query �
 		| $(PSQL) -v ON_ERROR_STOP=0
 
 .PHONY: db-tune-suggest
-db-tune-suggest: ## Print PostgreSQL config recommendations sized to host RAM + actual table sizes
-	@echo "$(BLUE)=== PostgreSQL tuning recommendations for this host ===$(NC)"
-	@echo "$(YELLOW)Reads pg_settings + pg_class.relpages + /proc/meminfo and prints recommended$(NC)"
-	@echo "$(YELLOW)values for shared_buffers, effective_cache_size, work_mem, maintenance_work_mem,$(NC)"
-	@echo "$(YELLOW)random_page_cost, and parallel-worker settings.  Diagnostic only -- prints the$(NC)"
-	@echo "$(YELLOW)ALTER SYSTEM SET commands you can copy/paste.  shared_buffers requires a$(NC)"
-	@echo "$(YELLOW)postgres restart to take effect; the rest reload via SELECT pg_reload_conf().$(NC)"
+db-tune-suggest: ## Print PostgreSQL config recommendations (auto-detects Aurora vs vanilla and adjusts guidance)
+	@echo "$(BLUE)=== PostgreSQL tuning recommendations ===$(NC)"
+	@echo "$(YELLOW)Detects Aurora vs vanilla Postgres and prints platform-appropriate$(NC)"
+	@echo "$(YELLOW)guidance: ALTER SYSTEM SET for vanilla / dynamic Aurora parameters,$(NC)"
+	@echo "$(YELLOW)AWS CLI parameter-group commands for managed-only Aurora parameters$(NC)"
+	@echo "$(YELLOW)(notably shared_buffers).  Diagnostic only -- nothing is changed.$(NC)"
 	@echo ""
-	@echo "$(BLUE)[1/4] System memory + storage class$(NC)"
-	@if [ -r /proc/meminfo ]; then \
-		MEM_KB=$$(awk '/^MemTotal:/ {print $$2}' /proc/meminfo); \
-		MEM_MB=$$((MEM_KB / 1024)); \
-		MEM_GB=$$((MEM_MB / 1024)); \
-		echo "  Host RAM: $$MEM_GB GB ($$MEM_MB MB)"; \
-		SB_MB=$$((MEM_MB / 4)); \
-		ECS_MB=$$((MEM_MB * 3 / 4)); \
-		WM_MB=$$((MEM_MB / 200)); \
-		MWM_MB=$$((MEM_MB / 16)); \
-		[ $$MWM_MB -gt 2048 ] && MWM_MB=2048; \
-		echo "  Recommended shared_buffers       = $${SB_MB} MB   (~25% of RAM)"; \
-		echo "  Recommended effective_cache_size = $${ECS_MB} MB  (~75% of RAM)"; \
-		echo "  Recommended work_mem             = $${WM_MB} MB   (~RAM/200, per sort/hash node)"; \
-		echo "  Recommended maintenance_work_mem = $${MWM_MB} MB  (~RAM/16, capped at 2 GB)"; \
+	@echo "$(BLUE)[1/5] Detecting environment$(NC)"
+	@IS_AURORA=$$(printf "%s\n" "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE proname = 'aurora_version') AS is_aurora \\gset" "\\echo :is_aurora" | $(PSQL) -tAX 2>/dev/null | tail -1); \
+	if [ "$$IS_AURORA" = "t" ] || [ "$$IS_AURORA" = "true" ]; then \
+		echo "  $(GREEN)✓ Aurora PostgreSQL detected$(NC)"; \
+		printf "%s\n" \
+			"SELECT aurora_version() AS aurora_version, current_setting('server_version') AS pg_version;" \
+			| $(PSQL) -v ON_ERROR_STOP=0; \
+		echo "$(YELLOW)  Note: /proc/meminfo on this host is NOT the DB instance's RAM --$(NC)"; \
+		echo "$(YELLOW)  it's the EC2 host running the python services.  Aurora memory is$(NC)"; \
+		echo "$(YELLOW)  determined by the writer-instance class (db.t3.small=2GB,$(NC)"; \
+		echo "$(YELLOW)  db.r5.large=16GB, etc.).  See [4/5] for how to size correctly.$(NC)"; \
 	else \
-		echo "  $(RED)/proc/meminfo unreadable -- can't size recommendations to host RAM$(NC)"; \
+		echo "  $(GREEN)✓ Vanilla PostgreSQL$(NC) (or RDS Postgres, not Aurora)"; \
+		if [ -r /proc/meminfo ]; then \
+			MEM_KB=$$(awk '/^MemTotal:/ {print $$2}' /proc/meminfo); \
+			MEM_MB=$$((MEM_KB / 1024)); \
+			MEM_GB=$$((MEM_MB / 1024)); \
+			echo "  Host RAM (this host = DB host assumed): $$MEM_GB GB ($$MEM_MB MB)"; \
+		fi; \
 	fi
 	@echo ""
-	@echo "$(BLUE)[2/4] Current PostgreSQL settings$(NC)"
+	@echo "$(BLUE)[2/5] Current PostgreSQL settings$(NC)"
 	@printf "%s\n" \
-		"SELECT name, setting, unit, source, pending_restart FROM pg_settings WHERE name IN ('shared_buffers', 'effective_cache_size', 'work_mem', 'maintenance_work_mem', 'random_page_cost', 'seq_page_cost', 'effective_io_concurrency', 'max_parallel_workers_per_gather', 'autovacuum_naptime', 'checkpoint_completion_target') ORDER BY name;" \
+		"SELECT name, setting, unit, source, pending_restart FROM pg_settings WHERE name IN ('shared_buffers', 'effective_cache_size', 'work_mem', 'maintenance_work_mem', 'random_page_cost', 'seq_page_cost', 'effective_io_concurrency', 'max_parallel_workers_per_gather', 'max_connections', 'autovacuum_naptime', 'checkpoint_completion_target') ORDER BY name;" \
 		| $(PSQL) -v ON_ERROR_STOP=0
 	@echo ""
-	@echo "$(BLUE)[3/4] Working-set sizing (largest tables)$(NC)"
+	@echo "$(BLUE)[3/5] Working-set sizing (largest tables)$(NC)"
 	@printf "%s\n" \
 		"SELECT relname AS table, pg_size_pretty(pg_total_relation_size(c.oid)) AS total, pg_size_pretty(pg_relation_size(c.oid)) AS heap, pg_size_pretty(pg_total_relation_size(c.oid) - pg_relation_size(c.oid)) AS indexes FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'r' ORDER BY pg_total_relation_size(c.oid) DESC LIMIT 10;" \
 		| $(PSQL) -v ON_ERROR_STOP=0
 	@echo ""
-	@echo "$(BLUE)[4/4] Recommended ALTER SYSTEM SET commands (review before running)$(NC)"
-	@echo "$(YELLOW)# random_page_cost defaults to 4.0 (assumes spinning disk).  EBS gp3 / NVMe$(NC)"
-	@echo "$(YELLOW)# SSD should use ~1.1; this often shifts the planner onto smaller index$(NC)"
-	@echo "$(YELLOW)# scans for queries like analytics _get_snapshot, eliminating cold-page reads.$(NC)"
-	@echo "$(YELLOW)#$(NC)"
-	@echo "$(YELLOW)# Run via 'make psql' and uncomment the lines you want:$(NC)"
-	@if [ -r /proc/meminfo ]; then \
-		MEM_KB=$$(awk '/^MemTotal:/ {print $$2}' /proc/meminfo); \
-		MEM_MB=$$((MEM_KB / 1024)); \
-		SB_MB=$$((MEM_MB / 4)); \
-		ECS_MB=$$((MEM_MB * 3 / 4)); \
-		WM_MB=$$((MEM_MB / 200)); \
-		MWM_MB=$$((MEM_MB / 16)); \
-		[ $$MWM_MB -gt 2048 ] && MWM_MB=2048; \
-		echo "  ALTER SYSTEM SET shared_buffers       = '$${SB_MB}MB';   -- requires postgres restart"; \
-		echo "  ALTER SYSTEM SET effective_cache_size = '$${ECS_MB}MB';  -- reload via pg_reload_conf()"; \
-		echo "  ALTER SYSTEM SET work_mem             = '$${WM_MB}MB';"; \
-		echo "  ALTER SYSTEM SET maintenance_work_mem = '$${MWM_MB}MB';"; \
+	@IS_AURORA=$$(printf "%s\n" "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE proname = 'aurora_version') AS is_aurora \\gset" "\\echo :is_aurora" | $(PSQL) -tAX 2>/dev/null | tail -1); \
+	if [ "$$IS_AURORA" = "t" ] || [ "$$IS_AURORA" = "true" ]; then \
+		echo "$(BLUE)[4/5] Aurora-specific: shared_buffers + instance class$(NC)"; \
+		echo "$(YELLOW)Aurora manages shared_buffers automatically via the cluster's DB$(NC)"; \
+		echo "$(YELLOW)Parameter Group; ALTER SYSTEM SET does NOT work for it.  The default$(NC)"; \
+		echo "$(YELLOW)formula is roughly {DBInstanceClassMemory*3/4}/8KB on r5/r6 classes,$(NC)"; \
+		echo "$(YELLOW)reduced on t3/t4g micro classes.  To verify and (if needed) change:$(NC)"; \
+		echo ""; \
+		echo "  $(GREEN)# 1. Find your writer instance + parameter group:$(NC)"; \
+		echo "     aws rds describe-db-clusters \\"; \
+		echo "       --query 'DBClusters[*].[DBClusterIdentifier,DBClusterParameterGroup]' \\"; \
+		echo "       --output table"; \
+		echo "     aws rds describe-db-instances \\"; \
+		echo "       --query 'DBInstances[*].[DBInstanceIdentifier,DBInstanceClass,DBParameterGroups[0].DBParameterGroupName]' \\"; \
+		echo "       --output table"; \
+		echo ""; \
+		echo "  $(GREEN)# 2. Inspect current shared_buffers value in the parameter group:$(NC)"; \
+		echo "     aws rds describe-db-parameters \\"; \
+		echo "       --db-parameter-group-name <name-from-step-1> \\"; \
+		echo "       --query \"Parameters[?ParameterName=='shared_buffers']\""; \
+		echo ""; \
+		echo "  $(GREEN)# 3. If the value is too low for your workload, change it:$(NC)"; \
+		echo "     aws rds modify-db-parameter-group \\"; \
+		echo "       --db-parameter-group-name <name> \\"; \
+		echo "       --parameters \"ParameterName=shared_buffers,ParameterValue={DBInstanceClassMemory/16384},ApplyMethod=pending-reboot\""; \
+		echo "     (the value is in 8KB pages; the formula syntax is Aurora-specific)"; \
+		echo ""; \
+		echo "  $(GREEN)# 4. Reboot the writer to apply (3-5 min downtime if no failover replica):$(NC)"; \
+		echo "     aws rds reboot-db-instance --db-instance-identifier <writer-id>"; \
+		echo ""; \
+		echo "$(RED)Sizing reality check:$(NC) the option_chains working set above is ~66 GB."; \
+		echo "  • $(YELLOW)db.t3.small (2 GB RAM)$(NC)  → shared_buffers max ~500 MB → 0.7 % coverage."; \
+		echo "    No amount of config tuning makes a 2 GB instance handle a 66 GB hot table;"; \
+		echo "    every analytics cycle is structurally a cold-cache read.  The fix is upsizing."; \
+		echo "  • $(YELLOW)db.r5.large (16 GB)$(NC)   → ~12 GB shared_buffers → ~18 % coverage."; \
+		echo "    Probably enough for cycle 2+ to stay warm once the analytics interval is tuned."; \
+		echo "  • $(YELLOW)db.r5.xlarge (32 GB)$(NC)  → ~24 GB shared_buffers → ~36 % coverage."; \
+		echo "    Comfortable headroom + room for ingestion bursts."; \
+		echo ""; \
+	else \
+		echo "$(BLUE)[4/5] Vanilla Postgres: shared_buffers sizing$(NC)"; \
+		if [ -r /proc/meminfo ]; then \
+			MEM_KB=$$(awk '/^MemTotal:/ {print $$2}' /proc/meminfo); \
+			MEM_MB=$$((MEM_KB / 1024)); \
+			SB_MB=$$((MEM_MB / 4)); \
+			MWM_MB=$$((MEM_MB / 16)); \
+			[ $$MWM_MB -gt 2048 ] && MWM_MB=2048; \
+			echo "  Recommended shared_buffers       = $${SB_MB} MB   (~25% of RAM)"; \
+			echo "  Recommended maintenance_work_mem = $${MWM_MB} MB"; \
+			echo ""; \
+			echo "  Procedure (needs a Postgres restart):"; \
+			echo "    1. make psql -c \"ALTER SYSTEM SET shared_buffers = '$${SB_MB}MB';\""; \
+			echo "    2. sudo systemctl restart postgresql"; \
+			echo "    3. make psql -c 'SHOW shared_buffers;'  # verify"; \
+		fi; \
+		echo ""; \
 	fi
-	@echo "  ALTER SYSTEM SET random_page_cost     = '1.1';      -- SSD/EBS default; was 4.0"
-	@echo "  ALTER SYSTEM SET effective_io_concurrency = '200';  -- EBS gp3 / NVMe sustains this"
-	@echo "  SELECT pg_reload_conf();                            -- non-restart settings only"
+	@echo "$(BLUE)[5/5] Dynamic settings (work on BOTH vanilla and Aurora via ALTER SYSTEM)$(NC)"
+	@echo "$(YELLOW)# random_page_cost defaults to 4.0 (assumes spinning disk).  EBS/SSD/$(NC)"
+	@echo "$(YELLOW)# Aurora storage should use ~1.1; this often shifts the planner onto$(NC)"
+	@echo "$(YELLOW)# smaller selective indexes for queries like analytics _get_snapshot,$(NC)"
+	@echo "$(YELLOW)# eliminating bulk-scan I/O.  Biggest single-knob improvement on this$(NC)"
+	@echo "$(YELLOW)# workload.$(NC)"
 	@echo ""
-	@echo "$(GREEN)Procedure for shared_buffers (the one that needs a restart):$(NC)"
-	@echo "  1. ALTER SYSTEM SET shared_buffers = '<value>';"
-	@echo "  2. sudo systemctl restart postgresql"
-	@echo "  3. Verify: 'make psql' → SHOW shared_buffers;"
+	@echo "  $(GREEN)# Apply via 'make psql':$(NC)"
+	@echo "     ALTER SYSTEM SET random_page_cost     = '1.1';"
+	@echo "     ALTER SYSTEM SET effective_io_concurrency = '200';   -- prefetch on bitmap scans"
+	@echo "     ALTER SYSTEM SET effective_cache_size = '<DB-instance-RAM*0.75>';"
+	@echo "     -- work_mem is per-sort/hash node; keep modest unless you know it spills"
+	@echo "     SELECT pg_reload_conf();                              -- no restart needed"
 	@echo ""
-	@echo "$(GREEN)Why this matters for the analytics snapshot wedge:$(NC)"
-	@echo "  option_chains is ~65 GB (heap + indexes).  With the default shared_buffers=128MB,"
-	@echo "  ~0.2% of the working set can stay cached, so every analytics cycle's snapshot"
-	@echo "  query has to re-read pages from disk (EBS ~10ms/page).  Bumping shared_buffers"
-	@echo "  to 25% of RAM eliminates the cold-pool problem for steady-state cycles."
+	@echo "$(GREEN)Why these matter on the cold-pool problem:$(NC)"
+	@echo "  random_page_cost=1.1 should shift the planner from the time-only Index Scan"
+	@echo "  + Filter onto idx_option_chains_underlying_ts_gamma (partial, ~1 GB) -- fewer"
+	@echo "  pages touched per cycle, which matters MUCH more than buffer-pool size on a"
+	@echo "  small instance where the pool can never hold the whole working set anyway."
+	@echo "  Run 'make analytics-snapshot-diagnose UNDERLYING=SPY' after applying to confirm"
+	@echo "  the plan shifted."
 
 .PHONY: db-index-audit
 db-index-audit: ## Print an index audit for a table (default: option_chains), with drop candidates ranked by cost/benefit

@@ -1,11 +1,12 @@
 # PostgreSQL tuning — runbook
 
 Captured during the May 21, 2026 investigation into the analytics
-`_get_snapshot` timeout wedge. Default-installed PostgreSQL is sized
-for a laptop, not a 65 GB-table workload; left untuned it produces
-exactly the failure mode in that incident: every analytics cycle hits
-its `statement_timeout` because the buffer pool can't hold the working
-set warm between cycles.
+`_get_snapshot` timeout wedge. The default-installed (or in our
+case Aurora-default on a small instance class) Postgres is sized
+for a workload with ~100 MB of hot data, not a 66 GB-table workload;
+left as-is it produces exactly the failure mode in that incident:
+every analytics cycle hits its `statement_timeout` because the buffer
+pool can't hold the working set warm between cycles.
 
 ## TL;DR
 
@@ -13,39 +14,82 @@ set warm between cycles.
 make db-tune-suggest
 ```
 
-Prints recommended `ALTER SYSTEM SET` commands sized to host RAM and
-actual table footprint. Diagnostic only — review then run.
+Detects Aurora vs vanilla, prints platform-correct recommendations
+(ALTER SYSTEM for dynamic params, AWS CLI parameter-group commands
+for Aurora's managed-only params). Diagnostic only.
 
-## Settings that matter for this workload
+## Aurora-specific procedure
 
-### `shared_buffers` (the big one)
+ZeroGEX runs on **Aurora PostgreSQL**, which changes a few things:
 
-Postgres-internal page cache. Default `128MB` is wrong for any
-serious workload — the OS page cache picks up the slack but with
-extra copy overhead. Recommended: **~25 % of host RAM**, capped at
-~8 GB on hosts ≤ 32 GB.
+* `shared_buffers` is managed by Aurora through the cluster's **DB
+  Parameter Group**. `ALTER SYSTEM SET shared_buffers = ...` does
+  not work — you have to modify the parameter group and reboot the
+  writer. The Aurora default is `{DBInstanceClassMemory*3/4}/8KB`
+  on r5/r6 classes (≈ 75 % of RAM), reduced on t3/t4g micro classes.
+* Dynamic settings (`random_page_cost`, `effective_cache_size`,
+  `effective_io_concurrency`, `work_mem`, `maintenance_work_mem`)
+  still work via `ALTER SYSTEM SET` + `pg_reload_conf()`. No reboot
+  needed.
+* The "host RAM" in our app box (`/proc/meminfo`) is NOT the Aurora
+  instance's RAM — those are different machines. Size recommendations
+  off the **Aurora writer's instance class**, not the EC2 host.
 
-Why it matters for the analytics snapshot:
-* `option_chains` is ~65 GB (heap + indexes).
-* Default `shared_buffers=128MB` ≈ **0.2 %** of that.
-* Each `_get_snapshot` cycle reads ~50–100 k pages from disk
-  (~ 10 ms/page on EBS gp3 cold) = 60–120 s of pure I/O per cycle.
-* Three concurrent analytics workers querying different underlyings
-  evict each other's warm pages every cycle → cycle 2 is just as
-  cold as cycle 1.
-* Bumping to 25 % of RAM lets the working set stay resident
-  across cycles → cycle 2+ drops to single-digit seconds.
+### Changing `shared_buffers` on Aurora
 
-`shared_buffers` is the only one of these that requires a **restart**
-(it's allocated at postmaster startup):
+1. Find the cluster + writer + parameter group:
+   ```sh
+   aws rds describe-db-clusters \
+     --query 'DBClusters[*].[DBClusterIdentifier,DBClusterParameterGroup]' \
+     --output table
 
-```sql
-ALTER SYSTEM SET shared_buffers = '8GB';
-```
-```sh
-sudo systemctl restart postgresql
-make psql -c 'SHOW shared_buffers'   # verify
-```
+   aws rds describe-db-instances \
+     --query 'DBInstances[*].[DBInstanceIdentifier,DBInstanceClass,DBParameterGroups[0].DBParameterGroupName]' \
+     --output table
+   ```
+
+2. Inspect the current `shared_buffers` value:
+   ```sh
+   aws rds describe-db-parameters \
+     --db-parameter-group-name <name-from-step-1> \
+     --query "Parameters[?ParameterName=='shared_buffers']"
+   ```
+
+3. (If overriding the Aurora default) modify it. The value is in
+   8 KB pages; use the Aurora-specific formula syntax to scale
+   automatically with future instance class changes:
+   ```sh
+   aws rds modify-db-parameter-group \
+     --db-parameter-group-name <name> \
+     --parameters "ParameterName=shared_buffers,ParameterValue={DBInstanceClassMemory/16384},ApplyMethod=pending-reboot"
+   ```
+
+4. Reboot the writer (3–5 min downtime if no failover replica;
+   instant if there is one — Aurora promotes a replica):
+   ```sh
+   aws rds reboot-db-instance --db-instance-identifier <writer-id>
+   ```
+
+5. Verify:
+   ```sh
+   make psql -c 'SHOW shared_buffers;'
+   ```
+
+### Sizing for a 66 GB working set
+
+| Instance | RAM | Aurora-default shared_buffers | Working-set coverage |
+|---|---|---|---|
+| db.t3.small | 2 GB | ~500 MB | **0.7 %** — every cycle is cold |
+| db.t3.medium | 4 GB | ~1 GB | 1.5 % — still mostly cold |
+| db.r5.large | 16 GB | ~12 GB | ~18 % — cycle 2+ should stay warm |
+| db.r5.xlarge | 32 GB | ~24 GB | ~36 % — comfortable + ingestion bursts |
+| db.r5.2xlarge | 64 GB | ~48 GB | ~73 % — close to whole-table coverage |
+
+There is no parameter tweak that gets you from "structurally cold every
+cycle" to "hot cycles" without enough actual RAM. The right answer for
+a 66 GB hot table is to upsize the writer; a parallel answer is to
+shrink the hot table (archive rows older than 7–14 days to a separate
+table that's cold-tier-only).
 
 ### `effective_cache_size`
 
@@ -131,36 +175,62 @@ ALTER SYSTEM SET maintenance_work_mem = '2GB';
 SELECT pg_reload_conf();
 ```
 
-## Standard procedure
+## Standard procedure (Aurora)
 
-1. `make db-tune-suggest` — print recommendations.
-2. `make psql` — open a session.
-3. Run the `ALTER SYSTEM SET` commands you want.
-4. `SELECT pg_reload_conf();` — picks up everything except
-   `shared_buffers`.
-5. `sudo systemctl restart postgresql` if `shared_buffers` was
-   changed.
-6. Re-run `make analytics-snapshot-diagnose UNDERLYING=SPY` to
-   verify the plan + Buffers line. The key signal of success is
-   `Buffers: shared hit=N` dominating `read=M` once the pool has
-   warmed (1–2 minutes of normal traffic).
-7. `make services-health` — confirm `snapshot=…` stage timings in
-   the analytics WARNING are now sub-second on cycle 2+.
+1. `make db-tune-suggest` — print platform-correct recommendations.
+2. `make psql` — open a session against the writer.
+3. Apply dynamic settings:
+   ```sql
+   ALTER SYSTEM SET random_page_cost = '1.1';
+   ALTER SYSTEM SET effective_cache_size = '<3/4 of writer RAM>';
+   ALTER SYSTEM SET effective_io_concurrency = '200';
+   SELECT pg_reload_conf();
+   ```
+4. If `shared_buffers` also needs to change, modify the DB
+   Parameter Group via AWS CLI (see above) and reboot the writer.
+5. `make analytics-snapshot-diagnose UNDERLYING=SPY` — verify the
+   plan + Buffers line. Success signals:
+   * Plan now uses `idx_option_chains_underlying_ts_gamma` (the
+     partial index), NOT `idx_option_chains_timestamp` + Filter.
+   * `Buffers: shared hit=N` dominates `read=M` once warmed
+     (allow 1–2 minutes of normal traffic).
+6. `make services-health` — `snapshot=…` stage timings in the
+   analytics WARNING should drop to single-digit seconds on cycle 2+.
 
 ## Rollback
 
-`ALTER SYSTEM SET <name> = DEFAULT;` then `SELECT pg_reload_conf();`
-(or restart for `shared_buffers`). The previous values are also
-preserved in `postgresql.auto.conf` — back it up before changes if
-you want a literal-restore option.
+For dynamic settings: `ALTER SYSTEM SET <name> = DEFAULT;` then
+`SELECT pg_reload_conf();`.
 
-## Why `shared_buffers` instead of just bigger statement_timeouts
+For Aurora parameter-group settings (`shared_buffers`): revert via
+`aws rds modify-db-parameter-group` setting `ParameterValue=` to the
+Aurora default formula (`{DBInstanceClassMemory*3/4}/8192` for r5/r6
+classes, `{DBInstanceClassMemory/16384}` for the t3/t4g classes), then
+reboot.
+
+The previous values for ALTER SYSTEM settings are preserved in
+`postgresql.auto.conf` on vanilla; on Aurora the equivalent is the
+parameter-group version history visible in the RDS console.
+
+## Why `random_page_cost` matters most on a small instance
 
 You can keep raising `ANALYTICS_SNAPSHOT_STATEMENT_TIMEOUT_MS` to
 match how slow a cold-pool cycle takes, but that's symptomatic
-treatment: every cycle stays cold, every cycle takes minutes, and
-downstream consumers (signals engine, API flow_series) see stale
-data the whole time. Sizing `shared_buffers` correctly turns
-"every cycle is a cold cycle" into "cycle 1 is cold, cycles 2+ are
-fast" — and lets you put `ANALYTICS_SNAPSHOT_STATEMENT_TIMEOUT_MS`
-back to a tight ceiling, where it belongs.
+treatment. Two structural fixes:
+
+* `random_page_cost=1.1` shifts the planner to use the **smaller
+  selective index** (`idx_option_chains_underlying_ts_gamma`,
+  ~1 GB partial) instead of the big `idx_option_chains_timestamp`
+  with a post-filter. Fewer pages touched per cycle → less cold I/O
+  → faster regardless of buffer-pool size. **Biggest leverage on
+  any small instance** because it cuts the working set per query,
+  not just the cache for it.
+* `shared_buffers` sized to cover a meaningful chunk of the working
+  set turns "every cycle is cold" into "cycle 1 is cold, cycles 2+
+  are warm". Requires the instance to have enough RAM to begin
+  with — on db.t3.small (2 GB) there's nowhere for it to go.
+
+If you're stuck on the small instance for cost reasons, the
+two-step recovery is: (1) `random_page_cost=1.1` to cut per-cycle
+work, then (2) `ANALYTICS_SNAPSHOT_LOOKBACK_HOURS=0.25` to cut it
+further still.
