@@ -28,6 +28,9 @@ from psycopg2.extras import execute_values
 from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
 from src.config import (
+    _getenv_bool,
+    _getenv_float,
+    _getenv_int,
     RISK_FREE_RATE,
     ANALYTICS_FLOW_CACHE_REFRESH_ENABLED,
     GAMMA_PROFILE_SPAN_PCT,
@@ -94,22 +97,28 @@ class AnalyticsEngine:
         # (1/12 h) -- below that you risk losing recently-quoted contracts
         # that haven't been requoted in the narrowed window, which
         # silently distorts GEX/max-pain instead of failing loudly.
-        self.snapshot_lookback_hours = max(
-            1.0 / 12.0, float(os.getenv("ANALYTICS_SNAPSHOT_LOOKBACK_HOURS", "2"))
+        #
+        # All four env vars in this block go through _getenv_int /
+        # _getenv_float, which tolerate inline shell-style ``# comment``
+        # tails in the .env file (python-dotenv preserves everything
+        # after ``=`` literally, so a stray ``KEY=1 # foo`` would
+        # otherwise crash the analytics workers at startup).
+        self.snapshot_lookback_hours = _getenv_float(
+            "ANALYTICS_SNAPSHOT_LOOKBACK_HOURS", 2.0, min=1.0 / 12.0
         )
-        # Cold-start lookback is integer-hours because it's always a
-        # multi-hour window (default 96 = full long-weekend gap); the
-        # fractional path above is for steady-state tuning only.
+        # Cold-start lookback floors at the steady-state value so a
+        # misconfigured cold-start < steady-state silently uses the
+        # steady-state width (never narrower).
         self.snapshot_cold_start_lookback_hours = max(
             self.snapshot_lookback_hours,
-            float(os.getenv("ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS", "96")),
+            _getenv_float("ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS", 96.0),
         )
         # The wide cold-start scan can legitimately run longer than the
         # pool-wide DB_STATEMENT_TIMEOUT_MS (default 90s) when the buffer
         # pool is cold.  Give just that one query a higher per-statement
         # ceiling via SET LOCAL so a cold first cycle isn't killed at 90s.
-        self.snapshot_cold_start_statement_timeout_ms = max(
-            0, int(os.getenv("ANALYTICS_SNAPSHOT_COLD_START_STATEMENT_TIMEOUT_MS", "180000"))
+        self.snapshot_cold_start_statement_timeout_ms = _getenv_int(
+            "ANALYTICS_SNAPSHOT_COLD_START_STATEMENT_TIMEOUT_MS", 180000, min=0
         )
         # Dedicated per-statement timeout for the STEADY-STATE snapshot
         # query.  The pool-wide DB_STATEMENT_TIMEOUT_MS (default 90s) is
@@ -124,12 +133,12 @@ class AnalyticsEngine:
         # wedge can raise this (e.g. 150000) without raising the
         # pool-wide ceiling, since SET LOCAL is scoped to this single
         # query and reverts on commit.
-        self.snapshot_statement_timeout_ms = max(
-            0, int(os.getenv("ANALYTICS_SNAPSHOT_STATEMENT_TIMEOUT_MS", "0"))
+        self.snapshot_statement_timeout_ms = _getenv_int(
+            "ANALYTICS_SNAPSHOT_STATEMENT_TIMEOUT_MS", 0, min=0
         )
         self._snapshot_cold_start_consumed = False
-        self.min_oi_coverage_pct_alert = float(
-            os.getenv("ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT", "0.35")
+        self.min_oi_coverage_pct_alert = _getenv_float(
+            "ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT", 0.35
         )
 
         # Off-hours mode: keep cycling on weekends / NYSE holidays instead
@@ -139,12 +148,10 @@ class AnalyticsEngine:
         # (e.g. Friday's close on a Saturday) rather than reporting nothing.
         # A longer interval is used off-hours since the underlying data is
         # static until the next session.
-        self.off_hours_enabled = os.getenv(
-            "ANALYTICS_OFF_HOURS_ENABLED", "true"
-        ).strip().lower() in ("1", "true", "yes", "on")
+        self.off_hours_enabled = _getenv_bool("ANALYTICS_OFF_HOURS_ENABLED", True)
         self.off_hours_interval = max(
             self.calculation_interval,
-            int(os.getenv("ANALYTICS_OFF_HOURS_INTERVAL_SECONDS", "300")),
+            _getenv_int("ANALYTICS_OFF_HOURS_INTERVAL_SECONDS", 300),
         )
 
         # Metrics
@@ -179,8 +186,8 @@ class AnalyticsEngine:
         self._last_skip_logged_ts: Optional[datetime] = None
         self._last_flow_cache_ts: Optional[datetime] = None
         self._last_flow_cache_refresh_mono: float = 0.0
-        self._flow_cache_refresh_min_seconds: float = float(
-            os.getenv("FLOW_CACHE_REFRESH_MIN_SECONDS", "15")
+        self._flow_cache_refresh_min_seconds: float = _getenv_float(
+            "FLOW_CACHE_REFRESH_MIN_SECONDS", 15.0
         )
         self._analytics_flow_cache_refresh_enabled: bool = ANALYTICS_FLOW_CACHE_REFRESH_ENABLED
 
@@ -440,7 +447,7 @@ class AnalyticsEngine:
                 # against contracts whose option_symbol sorts last.
                 # The new cap is well above any realistic chain size; if
                 # we hit it we log a warning rather than silently dropping.
-                snapshot_row_cap = int(os.getenv("ANALYTICS_SNAPSHOT_MAX_ROWS", "50000"))
+                snapshot_row_cap = _getenv_int("ANALYTICS_SNAPSHOT_MAX_ROWS", 50000, min=1)
 
                 data_age = datetime.now(timezone.utc) - timestamp
                 want_cold_start = not self._snapshot_cold_start_consumed and data_age > timedelta(
