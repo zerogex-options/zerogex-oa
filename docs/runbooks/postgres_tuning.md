@@ -18,9 +18,65 @@ Detects Aurora vs vanilla, prints platform-correct recommendations
 (ALTER SYSTEM for dynamic params, AWS CLI parameter-group commands
 for Aurora's managed-only params). Diagnostic only.
 
+## RDS PostgreSQL procedure (this is what ZeroGEX runs on)
+
+ZeroGEX runs on **RDS PostgreSQL** (managed Postgres, not
+Aurora). Key things to know:
+
+* **`ALTER SYSTEM SET` is rejected on RDS PG too** — error:
+  `ALTER SYSTEM command is not supported`. Config goes through the
+  **DB Parameter Group** (instance-level — there are no cluster
+  parameter groups on plain RDS PG, unlike Aurora).
+* Dynamic params (`random_page_cost`, `effective_cache_size`,
+  `effective_io_concurrency`, `work_mem`) apply within ~30 s of
+  saving in the parameter group — no reboot.
+* **Caveat**: if the parameter group has ANY pending static change
+  (`shared_buffers`, `max_connections`, `wal_buffers`, etc.), the
+  instance shows a **Pending reboot** badge AND the dynamic
+  changes can be held too until the reboot completes. If
+  verification shows old values, reboot the instance.
+* The host's `/proc/meminfo` is NOT the DB instance's RAM — those
+  are different machines. Size recommendations off the **RDS
+  instance class** (db.t3.small = 2 GB, db.r5.large = 16 GB, etc.),
+  not the EC2 host.
+
+### Procedure (Console, no AWS CLI needed)
+
+1. **Identify the attached parameter group**: RDS Console →
+   Databases → click instance → **Configuration** tab → note the
+   "DB parameter group" name.
+2. **If on `default.postgresN`** (the AWS-default group, not
+   editable): Parameter groups → **Create parameter group** →
+   Engine type=PostgreSQL, Family=postgresN, name `zerogex-pg`,
+   description "Tuned for ZeroGEX analytics workload" → Create.
+   Then Databases → click instance → **Modify** → Database options
+   → DB parameter group → select `zerogex-pg` → Continue → Apply
+   immediately → Modify DB instance.
+3. **Edit parameters**: Parameter groups → click your custom
+   group → **Edit parameters** → use the search box:
+   * `random_page_cost` → `1.1`
+   * `effective_io_concurrency` → `200`
+   * `effective_cache_size` → integer pages (e.g. `196608` =
+     1.5 GB) if you want to nudge the planner higher
+   * `shared_buffers` only if you want to override the AWS default
+     (static — needs reboot)
+4. **Save changes** at the bottom (the button — clicking into a
+   cell only stages, Save commits).
+5. **If "Pending reboot" badge appears**: Actions → **Reboot**.
+   Leave "Reboot with failover" unchecked on single-instance
+   setups. ~60 s downtime; services reconnect automatically via
+   the pool's retry logic.
+6. **Verify**:
+   ```sh
+   make psql -c "SHOW random_page_cost; SHOW effective_io_concurrency; SHOW effective_cache_size;"
+   ```
+   Expect 1.1, 200, and whatever you set for cache_size.
+
 ## Aurora-specific procedure
 
-ZeroGEX runs on **Aurora PostgreSQL**, which changes a few things:
+If you ever migrate to Aurora (or run multiple clusters), Aurora
+adds a second kind of parameter group (cluster-level) on top of
+the instance-level one RDS PG has:
 
 * **`ALTER SYSTEM SET` is rejected by Aurora for EVERY parameter,
   not just static ones.** Even "dynamic" settings have to go
