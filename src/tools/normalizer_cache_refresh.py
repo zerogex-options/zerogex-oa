@@ -243,7 +243,10 @@ FIELD_SPECS: tuple[FieldSpec, ...] = (
               AND timestamp >= NOW() - (%s || ' days')::interval
               AND volume_delta > 0
         """,
-        notes="Per-contract per-cycle premium (volume_delta*price*100); p95 calibrates smart-money premium tiers.",
+        notes=(
+            "Per-contract per-cycle premium (volume_delta*price*100); "
+            "p95 calibrates smart-money premium tiers."
+        ),
     ),
 )
 

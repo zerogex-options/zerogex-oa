@@ -28,7 +28,6 @@ used).  These tests pin the invariants that fall out of that:
 
 import threading
 from datetime import date, datetime
-import time as _time
 
 import pytz
 

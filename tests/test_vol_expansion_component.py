@@ -9,7 +9,6 @@ dominates realized sigma, so the z-score clips at ±_DIRECTION_Z_NORM.
 
 from datetime import datetime, timezone
 
-import math
 
 import pytest
 
@@ -17,7 +16,6 @@ from src.signals.advanced.vol_expansion import (
     VolExpansionComponent,
     _GEX_NORM,
     _GEX_FLOOR,
-    _DIRECTION_Z_NORM,
 )
 from src.signals.components.base import MarketContext
 

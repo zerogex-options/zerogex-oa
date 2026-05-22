@@ -154,7 +154,9 @@ app = FastAPI(
         {"name": "Max Pain", "description": "Max pain analysis"},
         {
             "name": "Technicals",
-            "description": "Intraday technical signals: VWAP, ORB, dealer hedging, volume, momentum",
+            "description": (
+                "Intraday technical signals: VWAP, ORB, dealer hedging, volume, momentum"
+            ),
         },
         {
             "name": "Tools",
@@ -581,7 +583,8 @@ async def get_smart_money_flow(
     limit: int = Query(default=50, ge=1, le=50),
 ):
     """Get unusual activity / smart money flow — 1-min intervals.
-    Session runs 07:15–16:15 ET. session=current returns today's open session (or most recent if closed); session=prior returns the previous full session.
+    Session runs 07:15–16:15 ET. session=current returns today's open session
+    (or most recent if closed); session=prior returns the previous full session.
     """
     data = await db_manager.get_smart_money_flow(symbol, session, min(limit, 50))
     return [SmartMoneyFlowPoint(**row) for row in data]
@@ -603,7 +606,7 @@ async def get_flow_buying_pressure(
 # Market Session Helper
 # ============================================================================
 
-from src.market_calendar import ET as _ET, NYSE_HOLIDAYS as _NYSE_HOLIDAYS
+from src.market_calendar import ET as _ET, NYSE_HOLIDAYS as _NYSE_HOLIDAYS  # noqa: E402
 
 _SOFT_CLOSE_WINDOW = timedelta(seconds=30)
 

@@ -24,7 +24,7 @@ import asyncio
 import math
 import logging
 from datetime import datetime, timedelta, date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import pytz
 from fastapi import APIRouter, HTTPException

@@ -55,7 +55,8 @@ class GreeksCalculator:
         if IV_CALCULATION_ENABLED:
             self.iv_calculator = IVCalculator()
             logger.info(
-                "✅ IV calculation ENABLED - will calculate from option prices when API doesn't provide it"
+                "✅ IV calculation ENABLED - will calculate from option prices when API "
+                "doesn't provide it"
             )
         else:
             self.iv_calculator = None
@@ -377,7 +378,7 @@ def main():
     current_time = datetime.now(ET)
     expiration = (current_time + timedelta(days=30)).date()
 
-    print(f"Test Parameters:")
+    print("Test Parameters:")
     print(f"  Underlying: ${underlying_price:.2f}")
     print(f"  Strike: ${strike:.2f}")
     print(f"  Current Time: {current_time.strftime('%Y-%m-%d %H:%M:%S ET')}")
@@ -446,7 +447,7 @@ def main():
     print(f"  Strike: ${enriched['strike']:.2f}")
     print(f"  Last: ${enriched['last']:.2f}")
     print(f"  IV: {enriched.get('implied_volatility', 'N/A'):.4f}")
-    print(f"\n  Calculated Greeks:")
+    print("\n  Calculated Greeks:")
     print(f"    Delta: {enriched['delta']:8.6f}")
     print(f"    Gamma: {enriched['gamma']:8.6f}")
     print(f"    Theta: {enriched['theta']:8.6f}")

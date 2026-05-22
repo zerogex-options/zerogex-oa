@@ -16,12 +16,9 @@ from src.config import SIGNALS_GEX_STALE_BUFFER_SECONDS
 from src.database import db_connection
 from src.signals.basic.dealer_delta_pressure import DealerDeltaPressureComponent
 from src.signals.components.base import MarketContext
-from src.signals.components.flip_distance import FlipDistanceComponent
 from src.signals.components.gamma_anchor import GammaAnchorComponent
-from src.signals.components.local_gamma import LocalGammaComponent
 from src.signals.components.net_gex_sign import NetGexSignComponent
 from src.signals.components.order_flow_imbalance import OrderFlowImbalanceComponent
-from src.signals.components.price_vs_max_gamma import PriceVsMaxGammaComponent
 from src.signals.components.put_call_ratio_state import PutCallRatioStateComponent
 from src.signals.components.volatility_regime import VolatilityRegimeComponent
 from src.signals.advanced import AdvancedSignalEngine

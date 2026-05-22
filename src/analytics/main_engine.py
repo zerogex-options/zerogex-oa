@@ -616,8 +616,8 @@ class AnalyticsEngine:
                         f"({oi_coverage:.1%} coverage)"
                     )
                 else:
-                    logger.info(f"  Note: All options have OI=0 (normal for real-time data)")
-                    logger.info(f"  GEX will be calculated but will be 0 until OI updates")
+                    logger.info("  Note: All options have OI=0 (normal for real-time data)")
+                    logger.info("  GEX will be calculated but will be 0 until OI updates")
                 if options and oi_coverage < self.min_oi_coverage_pct_alert:
                     logger.warning(
                         f"⚠️ Low OI coverage in analytics snapshot: {oi_coverage:.1%} "
@@ -2982,7 +2982,7 @@ class AnalyticsEngine:
                 if success:
                     logger.info(f"✅ Calculation cycle {self.calculations_completed} complete")
                 else:
-                    logger.warning(f"⚠️  Calculation cycle had issues")
+                    logger.warning("⚠️  Calculation cycle had issues")
 
                 # Calculate sleep time
                 cycle_duration = time.time() - cycle_start

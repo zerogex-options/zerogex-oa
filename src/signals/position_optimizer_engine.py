@@ -380,7 +380,8 @@ class PositionOptimizerEngine:
                     return None
                 signal_ts, signal_direction, normalized_score = signal_row
                 normalized_score = float(normalized_score)
-                # Map normalized score → timeframe and strength (mirrors UnifiedSignalEngine thresholds)
+                # Map normalized score → timeframe and strength
+                # (mirrors UnifiedSignalEngine thresholds)
                 if normalized_score >= 0.84:
                     signal_timeframe = "intraday"
                 elif normalized_score >= 0.68:
@@ -1036,7 +1037,10 @@ class PositionOptimizerEngine:
             net_gamma = (far_leg["gamma"] - near_leg["gamma"]) * 100.0
             net_theta = (far_leg["theta"] - near_leg["theta"]) * 100.0
             base_pop = self._clamp(0.50 + self._clamp(ctx.regime_score, 0.0, 1.0) * 0.15, 0.3, 0.8)
-            strikes_label = f"Short {near_leg['strike']:.0f}{option_type} / Long {far_leg['strike']:.0f}{option_type}"
+            strikes_label = (
+                f"Short {near_leg['strike']:.0f}{option_type} / "
+                f"Long {far_leg['strike']:.0f}{option_type}"
+            )
             width = abs(near_leg["strike"] - far_leg["strike"])
             legs_payload = [
                 {
@@ -1153,10 +1157,16 @@ class PositionOptimizerEngine:
                 f"Net delta {net_delta:+.1f}, gamma {net_gamma:+.3f}, theta {net_theta:+.2f}.",
             ),
             "liquidity": (liquidity_score, liquidity_desc),
-            "market_structure": (market_structure_fit, f"Structure fit reflects {structure_desc}."),
+            "market_structure": (
+                market_structure_fit,
+                f"Structure fit reflects {structure_desc}.",
+            ),
             "edge_quality": (
                 edge_score,
-                f"Expected value is ${expected_value:,.2f} per spread with Kelly {kelly_fraction:.2%}.",
+                (
+                    f"Expected value is ${expected_value:,.2f} per spread with "
+                    f"Kelly {kelly_fraction:.2%}."
+                ),
             ),
         }
         components = []
@@ -1184,9 +1194,20 @@ class PositionOptimizerEngine:
 
         reasoning.extend(
             [
-                f"{strategy_type} targets the {ctx.signal_direction} {ctx.signal_timeframe} signal from {ctx.signal_timestamp.isoformat()}.",
-                f"POP {probability:.1%} with EV ${expected_value:,.2f} and max loss ${max_loss:,.2f}.",
-                f"Liquidity {liquidity_score:.2f}; market structure fit {market_structure_fit:.2f}; premium efficiency {premium_efficiency:.2f}.",
+                (
+                    f"{strategy_type} targets the {ctx.signal_direction} "
+                    f"{ctx.signal_timeframe} signal from "
+                    f"{ctx.signal_timestamp.isoformat()}."
+                ),
+                (
+                    f"POP {probability:.1%} with EV ${expected_value:,.2f} "
+                    f"and max loss ${max_loss:,.2f}."
+                ),
+                (
+                    f"Liquidity {liquidity_score:.2f}; market structure fit "
+                    f"{market_structure_fit:.2f}; premium efficiency "
+                    f"{premium_efficiency:.2f}."
+                ),
             ]
         )
         candidate = SpreadCandidate(

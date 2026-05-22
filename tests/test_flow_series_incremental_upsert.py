@@ -22,7 +22,7 @@ verifiable against a real Postgres and belongs in
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytz
@@ -32,7 +32,6 @@ from src.analytics.main_engine import AnalyticsEngine
 from src.flow_series_sql import (
     FLOW_SERIES_COLUMNS,
     SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2,
-    SNAPSHOT_UPSERT_PSYCOPG2,
 )
 
 ET = pytz.timezone("US/Eastern")

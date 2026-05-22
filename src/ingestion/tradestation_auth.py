@@ -320,7 +320,7 @@ def main():
         # terminal scrollback, journald, and shell history. Print just
         # enough metadata to confirm a successful refresh.
         print(f"\n✅ Access token obtained (length={len(token)})")
-        print(f"\n✅ Headers generated")
+        print("\n✅ Headers generated")
         print(f"   Authorization header set: {'Authorization' in headers}")
 
     except Exception as e:

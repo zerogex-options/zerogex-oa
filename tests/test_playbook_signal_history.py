@@ -6,13 +6,11 @@ squeeze_breakout 2-day sustained, vanna_charm_glide 2-day sustained
 sign, skew_inversion_reversal 20-day mean target + new-low predicate.
 """
 
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime
 
 import pytz
 
-from src.signals.components.base import MarketContext
-from src.signals.playbook.context import PlaybookContext, SignalSnapshot
+from src.signals.playbook.context import SignalSnapshot
 from src.signals.playbook.patterns.squeeze_breakout import PATTERN as SQB
 from src.signals.playbook.patterns.vanna_charm_glide import PATTERN as VCG
 from src.signals.playbook.patterns.skew_inversion_reversal import PATTERN as SIR

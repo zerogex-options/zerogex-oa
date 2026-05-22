@@ -364,7 +364,8 @@ class OptionStreamAccumulator:
 
                 if isinstance(payload, dict) and _is_auth_error_payload(payload):
                     logger.warning(
-                        "Option stream reported auth error payload; refreshing token and reconnecting"
+                        "Option stream reported auth error payload; refreshing token "
+                        "and reconnecting"
                     )
                     self._client.auth.force_refresh_access_token()
                     break
@@ -641,7 +642,8 @@ class UnderlyingBarAccumulator:
 
                 if isinstance(payload, dict) and _is_auth_error_payload(payload):
                     logger.warning(
-                        "Underlying bar stream reported auth error payload; refreshing token and reconnecting"
+                        "Underlying bar stream reported auth error payload; "
+                        "refreshing token and reconnecting"
                     )
                     self._client.auth.force_refresh_access_token()
                     break
@@ -954,7 +956,7 @@ class StreamManager:
                 return True
 
             # Log the change
-            logger.info(f"Expirations changed:")
+            logger.info("Expirations changed:")
             logger.info(f"  Old: {[str(exp) for exp in self.target_expirations]}")
             logger.info(f"  New: {[str(exp) for exp in new_expirations]}")
 
@@ -965,7 +967,8 @@ class StreamManager:
             if self.current_price:
                 self.tracked_option_symbols = self._build_option_symbols()
                 logger.info(
-                    f"Rebuilt {len(self.tracked_option_symbols)} option symbols with new expirations"
+                    f"Rebuilt {len(self.tracked_option_symbols)} option symbols "
+                    "with new expirations"
                 )
 
             # Update refresh timestamp
@@ -1097,8 +1100,8 @@ class StreamManager:
             if errors:
                 logger.error(f"Option quote validation failed for {test_symbol}: {errors[0]}")
                 logger.error(
-                    "This usually means the option symbol format is not accepted by TradeStation quotes endpoint "
-                    "for this underlying."
+                    "This usually means the option symbol format is not accepted "
+                    "by TradeStation quotes endpoint for this underlying."
                 )
                 return False
 
@@ -1147,7 +1150,7 @@ class StreamManager:
         # Set initial refresh timestamp (NEW)
         self.last_expiration_refresh = datetime.now(ET)
 
-        logger.info(f"✅ Initialization complete:")
+        logger.info("✅ Initialization complete:")
         logger.info(f"   Price: ${self.current_price:.2f}")
         logger.info(f"   Tracking {len(self.target_expirations)} expirations")
         logger.info(f"   Tracking {len(self.tracked_option_symbols)} option contracts")

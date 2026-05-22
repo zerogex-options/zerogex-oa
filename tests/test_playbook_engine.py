@@ -5,7 +5,7 @@ from typing import Optional
 
 from src.signals.components.base import MarketContext
 from src.signals.playbook.base import PatternBase
-from src.signals.playbook.context import PlaybookContext, SignalSnapshot, OpenPosition
+from src.signals.playbook.context import PlaybookContext, OpenPosition
 from src.signals.playbook.engine import PlaybookEngine
 from src.signals.playbook.types import (
     ActionCard,

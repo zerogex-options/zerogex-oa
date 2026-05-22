@@ -193,7 +193,11 @@ def validate_bar_data(bar: dict) -> bool:
 
     if not (low_price <= open_price <= high_price and low_price <= close_price <= high_price):
         logger.warning(
-            f"Invalid OHLC relationship: O={open_price} H={high_price} L={low_price} C={close_price}"
+            "Invalid OHLC relationship: O=%s H=%s L=%s C=%s",
+            open_price,
+            high_price,
+            low_price,
+            close_price,
         )
         return False
 

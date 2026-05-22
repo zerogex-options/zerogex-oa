@@ -123,12 +123,10 @@ def _get_flow_session_bounds(session: str = "current") -> tuple:
 # SQL fragment allowlists live in `_sql_helpers` so that both
 # DatabaseManager and the query mixins it composes can import them
 # without a circular import.
-from src.api.queries._sql_helpers import (
+from src.api.queries._sql_helpers import (  # noqa: E402
     _bucket_expr,
     _gex_by_strike_order_clause,
     _interval_expr,
-    _normalize_timeframe,
-    _timeframe_view_suffix,
 )
 
 # option_chains rows are UPSERTed in 60-second buckets: every contract that
@@ -2272,7 +2270,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         query = """
             WITH market_close_time AS (
                 -- Find the most recent 4:00 PM ET bar
-                SELECT 
+                SELECT
                     timestamp,
                     symbol,
                     close as previous_close
@@ -2286,7 +2284,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ),
             nearest_close AS (
                 -- Fallback: find the bar closest to 4:00 PM on the most recent trading day
-                SELECT 
+                SELECT
                     q.timestamp,
                     q.symbol,
                     q.close as previous_close,

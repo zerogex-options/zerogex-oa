@@ -228,7 +228,7 @@ class IVCalculator:
         T = self._calculate_time_to_expiration(current_time, expiration)
 
         if T <= 0:
-            logger.debug(f"Option already expired")
+            logger.debug("Option already expired")
             return None
 
         # Check for intrinsic value violations. Use the discounted European
@@ -505,7 +505,8 @@ def main():
     print(f"Ask: ${ask:.2f}")
     print(f"Mid: ${mid:.2f}")
     print(
-        f"Calculated IV: {calculated_iv:.4f if calculated_iv else 'FAIL'} ({calculated_iv*100:.2f}%)"
+        f"Calculated IV: {calculated_iv:.4f if calculated_iv else 'FAIL'} "
+        f"({calculated_iv*100:.2f}%)"
     )
 
     print("\n" + "=" * 80)
@@ -533,9 +534,8 @@ def main():
     print(f"Strike: ${enriched['strike']:.2f}")
     print(f"Last: ${enriched['last']:.2f}")
     print(f"Bid/Ask: ${enriched['bid']:.2f} / ${enriched['ask']:.2f}")
-    print(
-        f"\nCalculated IV: {enriched.get('implied_volatility'):.4f if enriched.get('implied_volatility') else 'None'}"
-    )
+    iv_val = enriched.get("implied_volatility")
+    print(f"\nCalculated IV: {iv_val:.4f if iv_val else 'None'}")
     if enriched.get("implied_volatility"):
         print(f"IV Percentage: {enriched['implied_volatility']*100:.2f}%")
 

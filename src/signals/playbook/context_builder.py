@@ -215,7 +215,6 @@ def _build_market_context(
     ddp_ctx = _comp_ctx("dealer_delta_pressure")
     dealer_net_delta = float(ddp_ctx.get("dealer_net_delta_estimated") or 0.0)
 
-    gamma_anchor_ctx = _comp_ctx("gamma_anchor")
     # gamma_anchor doesn't surface flip directly; pull from gvc snapshot if available.
     gvc = advanced.get("gamma_vwap_confluence")
     gvc_vals = gvc.context_values if gvc else {}

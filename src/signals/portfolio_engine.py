@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import re
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
@@ -589,18 +589,25 @@ class PortfolioEngine:
             optimizer_payload=optimizer_payload,
         )
 
-        rationale = f"MSI {msi:.1f} regime={regime} dir={trade_direction} [{tier_label}], " f"{candidate.strategy_type} {contracts}c Kelly={candidate.kelly_fraction:.1%}" + (
-            f" regime={candidate_result.get('strategy_regime')}:{candidate_result.get('strategy_regime_score', 0):.2f}"
-            if candidate_result.get("strategy_regime")
-            else ""
-        ) + (
-            " (DRS override)" if drs_override_active else ""
-        ) + (
-            " (fresh-cross boost)" if fresh_cross and cross_multiplier > 1.0 else ""
-        ) + (
-            f" (drawdown x{drawdown_multiplier:.2f}, rolling=${drawdown_state.get('rolling_pnl', 0.0):.0f})"
-            if drawdown_state.get("engaged")
-            else ""
+        rationale = (
+            (
+                f"MSI {msi:.1f} regime={regime} dir={trade_direction} [{tier_label}], "
+                f"{candidate.strategy_type} {contracts}c Kelly={candidate.kelly_fraction:.1%}"
+            )
+            + (
+                f" regime={candidate_result.get('strategy_regime')}"
+                f":{candidate_result.get('strategy_regime_score', 0):.2f}"
+                if candidate_result.get("strategy_regime")
+                else ""
+            )
+            + (" (DRS override)" if drs_override_active else "")
+            + (" (fresh-cross boost)" if fresh_cross and cross_multiplier > 1.0 else "")
+            + (
+                f" (drawdown x{drawdown_multiplier:.2f},"
+                f" rolling=${drawdown_state.get('rolling_pnl', 0.0):.0f})"
+                if drawdown_state.get("engaged")
+                else ""
+            )
         )
 
         return PortfolioTarget(
@@ -632,12 +639,6 @@ class PortfolioEngine:
              enough signals agree on direction with sufficient aggregated
              strength, that consensus is itself an entry signal.
         """
-        composite_target = self.compute_target(
-            score,
-            market_ctx,
-            conn=conn,
-            cached_option_rows=cached_option_rows,
-        )
         entry_target = self._build_advanced_target(
             score,
             market_ctx,

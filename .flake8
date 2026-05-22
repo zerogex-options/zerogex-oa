@@ -1,0 +1,28 @@
+[flake8]
+max-line-length = 100
+extend-ignore = E203, W503
+exclude =
+    .git,
+    __pycache__,
+    build,
+    dist,
+    .venv,
+    venv
+
+# Files where long lines occur inside multi-line SQL string literals.
+# `# noqa: E501` can't be added inside a triple-quoted string (it would
+# become part of the SQL), so E501 is suppressed file-wide. The SQL is
+# internally wrapped on natural boundaries; the Python around it stays
+# under 100 chars.
+per-file-ignores =
+    src/api/database.py:E501
+    src/api/queries/signals.py:E501
+    src/api/queries/technicals.py:E501
+    src/api/routers/trade_signals.py:E501
+    src/analytics/main_engine.py:E501
+    src/flow_series_sql.py:E501
+    src/ingestion/main_engine.py:E501
+    src/ingestion/tradestation_client.py:E501
+    src/signals/portfolio_engine.py:E501
+    src/signals/scoring_engine.py:E501
+    src/signals/unified_signal_engine.py:E501

@@ -170,7 +170,7 @@ class TradeStationClient:
                 # Check if response has content
                 if not response.content or len(response.content) == 0:
                     logger.warning(
-                        f"API returned 200 but empty response - likely market closed or no data available"
+                        "API returned 200 but empty response - likely market closed or no data available"
                     )
                     # Return empty structure based on endpoint
                     if "barcharts" in endpoint or "stream/barcharts" in endpoint:
@@ -204,7 +204,7 @@ class TradeStationClient:
                     error_data = response.json()
                     if error_data.get("Message") == "No data available.":
                         logger.warning(
-                            f"No data available for request (404) - this is normal for weekends/holidays"
+                            "No data available for request (404) - this is normal for weekends/holidays"
                         )
                         # Return empty but valid response structure based on endpoint
                         if "barcharts" in endpoint or "stream/barcharts" in endpoint:
@@ -937,7 +937,7 @@ Examples:
 
         # Test 2.5: Get stream bars (NEW)
         if test in ["all", "stream-bars"]:
-            print(f"Test: Get Stream Bars with Up/Down Volume")
+            print("Test: Get Stream Bars with Up/Down Volume")
             print("-" * 60)
             sym = symbols[0] if isinstance(symbols, list) else symbols
 
@@ -1003,15 +1003,15 @@ Examples:
             else:
                 print(f"⚠️  No stream bars data available for {sym}")
                 if not args.test_historical:
-                    print(f"   This could mean:")
-                    print(f"   1. Market just opened and first bar hasn't completed yet")
-                    print(f"   2. API delay in returning data")
-                    print(f"   3. Market is closed (weekend/holiday)")
-                    print(f"\n   Market hours: Mon-Fri 4:00 AM - 8:00 PM ET")
+                    print("   This could mean:")
+                    print("   1. Market just opened and first bar hasn't completed yet")
+                    print("   2. API delay in returning data")
+                    print("   3. Market is closed (weekend/holiday)")
+                    print("\n   Market hours: Mon-Fri 4:00 AM - 8:00 PM ET")
                     print(f"   Current time: {datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S ET')}")
-                    print(f"   Try: python run.py client --test stream-bars --test-historical")
+                    print("   Try: python run.py client --test stream-bars --test-historical")
                 else:
-                    print(f"   No data found for requested time range")
+                    print("   No data found for requested time range")
             print()
 
         # Test 3a: Option expirations

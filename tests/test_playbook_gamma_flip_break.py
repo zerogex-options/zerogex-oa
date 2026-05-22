@@ -238,10 +238,11 @@ def test_does_not_co_fire_with_wall_patterns_on_breakout():
 
     ctx = _ctx()  # controlled_trend regime
     gfb = GAMMA_FLIP_BREAK.match(ctx)
-    cwf = CALL_WALL_FADE.match(ctx)
-    pwb = PUT_WALL_BOUNCE.match(ctx)
-    assert gfb is not None
     # cwf and pwb may or may not match based on flow; the engine's regime
     # gate filters cwf/pwb out anyway since their valid_regimes don't include
-    # controlled_trend.  Here we just assert gfb fires cleanly.
+    # controlled_trend.  Here we just assert gfb fires cleanly and the other
+    # patterns' match() calls don't raise.
+    CALL_WALL_FADE.match(ctx)
+    PUT_WALL_BOUNCE.match(ctx)
+    assert gfb is not None
     assert gfb.pattern == "gamma_flip_break"

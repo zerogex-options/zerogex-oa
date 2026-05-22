@@ -21,9 +21,9 @@ import importlib.util
 import logging
 import os
 import sys
-from datetime import datetime, time, timedelta
+from datetime import time
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 from src.signals.playbook.base import PatternBase
 from src.signals.playbook.context import PlaybookContext

@@ -16,7 +16,6 @@ least ``_SUSTAINED_DAYS_MIN``.
 
 from __future__ import annotations
 
-import math
 import os
 from datetime import time, timedelta
 from typing import Literal, Optional

@@ -18,7 +18,7 @@ import json
 import threading
 import time
 import time as _time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from multiprocessing import Process
 from datetime import datetime, date as _date, time as dt_time, timezone
 from typing import Dict, Any, List, Optional
@@ -331,9 +331,9 @@ class IngestionEngine:
 
                 # Check if tables exist
                 cursor.execute("""
-                    SELECT table_name 
-                    FROM information_schema.tables 
-                    WHERE table_schema = 'public' 
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public'
                     AND table_name IN ('underlying_quotes', 'option_chains')
                 """)
 

@@ -4,7 +4,8 @@ Pydantic models for API request/response validation
 
 from pydantic import BaseModel, Field
 from datetime import datetime, date
-from typing import Optional
+from enum import Enum
+from typing import List, Optional
 from decimal import Decimal
 
 
@@ -365,10 +366,6 @@ class HealthStatus(BaseModel):
         json_encoders = {
             datetime: lambda v: v.isoformat() if v is not None else None,
         }
-
-
-from enum import Enum  # already imported via pydantic internals but be explicit
-from typing import List  # already imported above, included here for clarity
 
 
 class SignalDirection(str, Enum):

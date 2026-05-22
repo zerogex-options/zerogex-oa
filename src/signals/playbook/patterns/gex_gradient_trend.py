@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 import os
-from datetime import time, timedelta
+from datetime import timedelta
 from typing import Literal, Optional
 
 from src.signals.playbook.base import PatternBase

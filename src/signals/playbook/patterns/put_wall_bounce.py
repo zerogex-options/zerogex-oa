@@ -209,7 +209,8 @@ class PutWallBouncePattern(PatternBase):
         ):
             missing.append(
                 "no corroborating advanced signal "
-                "(trap_detection != 'bullish_fade' AND gamma_vwap_confluence != 'bullish_confluence')"
+                "(trap_detection != 'bullish_fade' AND "
+                "gamma_vwap_confluence != 'bullish_confluence')"
             )
 
         rbi = ctx.signal("range_break_imminence")

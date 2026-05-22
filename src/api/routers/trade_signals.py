@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from src.config import SIGNALS_PORTFOLIO_SIZE
 
 from ..database import DatabaseManager
+
+if TYPE_CHECKING:
+    from src.signals.playbook import PlaybookEngine
 
 router = APIRouter(prefix="/api/signals", tags=["Trade Signals"])
 

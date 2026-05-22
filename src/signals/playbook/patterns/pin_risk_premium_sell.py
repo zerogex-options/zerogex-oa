@@ -111,7 +111,8 @@ class PinRiskPremiumSellPattern(PatternBase):
         rationale = (
             f"Long-gamma pin: net GEX ${ctx.net_gex / 1e9:.1f}B, "
             f"price ${close:.2f} within {_MAX_PAIN_PROXIMITY_PCT * 100:.2f}% of max_pain "
-            f"${max_pain:.2f}, 30-min σ {sigma * 100:.3f}% < ceiling {_REALIZED_SIGMA_CEILING * 100:.2f}% "
+            f"${max_pain:.2f}, 30-min σ {sigma * 100:.3f}% < ceiling "
+            f"{_REALIZED_SIGMA_CEILING * 100:.2f}% "
             f"→ sell 1DTE iron condor with ±${wing_offset:.0f} wings."
         )
 

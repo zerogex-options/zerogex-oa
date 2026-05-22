@@ -30,8 +30,6 @@ def get_db_connection():
     Raises:
         Exception: If connection cannot be established
     """
-    global _connection_pool
-
     # Initialize pool if not already done. Double-checked locking so the
     # common hot-path stays allocation-free after startup; the lock only
     # guards first-time pool creation across threads.
@@ -79,8 +77,6 @@ def close_db_connection(conn):
     Args:
         conn: psycopg2 connection object
     """
-    global _connection_pool
-
     if not (_connection_pool and conn):
         return
 

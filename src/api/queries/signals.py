@@ -14,12 +14,14 @@ file preserves that access without creating a circular dependency.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-from datetime import datetime, timedelta, date, time, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta, date, time
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    import asyncpg
 
 logger = logging.getLogger(__name__)
 

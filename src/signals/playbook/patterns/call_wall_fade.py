@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 import os
-from datetime import time, timedelta
+from datetime import time
 from typing import Optional
 
 from src.signals.playbook.base import PatternBase
@@ -93,7 +93,6 @@ class CallWallFadePattern(PatternBase):
             action = ActionEnum.BUY_PUT_DEBIT
             legs = [Leg(expiry=expiry, strike=wall_strike, right="P", side="BUY", qty=1)]
             stop_kind = "premium_pct"
-            stop_premium_target = "-50% premium"
         else:
             action = ActionEnum.SELL_CALL_SPREAD
             long_strike = wall_strike + _SPREAD_WIDTH_POINTS
@@ -102,7 +101,6 @@ class CallWallFadePattern(PatternBase):
                 Leg(expiry=expiry, strike=long_strike, right="C", side="BUY", qty=1),
             ]
             stop_kind = "premium_pct"
-            stop_premium_target = "200% credit lost"
 
         # 3) Target selection: prefer max_pain → gamma_flip → percent.
         target_ref, target_level_name = self._pick_target(close, max_pain, gamma_flip, wall_strike)
@@ -223,7 +221,8 @@ class CallWallFadePattern(PatternBase):
         ):
             missing.append(
                 "no corroborating advanced signal "
-                "(trap_detection != 'bearish_fade' AND gamma_vwap_confluence != 'bearish_confluence')"
+                "(trap_detection != 'bearish_fade' AND "
+                "gamma_vwap_confluence != 'bearish_confluence')"
             )
 
         rbi = ctx.signal("range_break_imminence")
