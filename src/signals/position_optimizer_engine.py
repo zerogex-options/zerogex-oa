@@ -430,10 +430,34 @@ class PositionOptimizerEngine:
                     return None
                 net_gex, gamma_flip, pcr, max_pain = gex_row
 
+                # Canonical signed net premium over the 30-minute window, by
+                # option type. Mirrors the aggregation in
+                # ``unified_signal_engine._fetch_market_context`` (see the
+                # ``flow_contract_facts`` query that populates
+                # ``ctx["smart_call"]`` / ``ctx["smart_put"]``) so that
+                # ``PositionOptimizerContext.smart_call_premium`` /
+                # ``smart_put_premium`` carry the SAME semantics regardless of
+                # which code path constructed the context: the portfolio
+                # engine driver (``portfolio_engine.py:2429-2430``) already
+                # passes the canonical signed values, and so should this
+                # standalone fetch path.
+                #
+                # The prior version aggregated ``SUM(total_premium)`` from
+                # ``flow_smart_money``, which has two mismatches against the
+                # downstream ``flow_bias = smart_call_premium -
+                # smart_put_premium`` consumer at line ~668: (1) it is
+                # GROSS (volume_delta * trade_price * 100), not buy-sell
+                # signed; (2) it is filtered to the "unusual activity"
+                # subset, not the full per-contract flow. Heavy call-selling
+                # plus heavy put-selling showed up as bullish flow_bias even
+                # though directional intent was bearish — the same anti-
+                # pattern unified_signal_engine.py:533-540 documents was
+                # already fixed elsewhere.
                 cur.execute(
                     """
-                    SELECT option_type, SUM(total_premium)
-                    FROM flow_smart_money
+                    SELECT option_type,
+                           SUM(COALESCE(buy_premium, 0) - COALESCE(sell_premium, 0)) AS net_premium
+                    FROM flow_contract_facts
                     WHERE symbol = %s
                       AND timestamp BETWEEN %s - INTERVAL '30 minutes' AND %s
                     GROUP BY option_type
