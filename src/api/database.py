@@ -1512,6 +1512,77 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching GEX by strike: {e}", exc_info=True)
             raise
 
+    async def get_latest_gex_profile(
+        self,
+        symbol: str = "SPY",
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch the latest spot-shift dealer dollar-gamma profile.
+
+        Returns the profile that was written by the Analytics Engine on
+        the most recent cycle (see
+        ``_store_gex_profile``/``_gamma_exposure_profile``).  The profile
+        is the shared primitive behind both ``gamma_flip_point`` (its zero
+        crossing) and ``net_gex_at_spot`` (its value at the current
+        price) — so the curve, the flip line, and the headline summary
+        are all read off the SAME underlying construction.
+
+        Returns ``None`` when no profile has been persisted yet (fresh
+        deployment / degraded snapshot).
+        """
+        symbol = symbol.upper()
+        cache_key = f"gex_profile:{symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        query = """
+            SELECT
+                gp.underlying AS symbol,
+                gp.timestamp,
+                gp.spot_price,
+                gp.span_pct,
+                gp.profile,
+                gs.gamma_flip_point AS gamma_flip,
+                gs.net_gex_at_spot,
+                gs.call_wall,
+                gs.put_wall
+            FROM gex_profile gp
+            LEFT JOIN gex_summary gs
+              ON gs.underlying = gp.underlying
+             AND gs.timestamp = gp.timestamp
+            WHERE gp.underlying = $1
+            ORDER BY gp.timestamp DESC
+            LIMIT 1
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(query, symbol)
+                if row is None:
+                    return None
+                # asyncpg returns JSONB as a string by default; decode here so
+                # callers can rely on a list-of-dicts shape.
+                raw_profile = row["profile"]
+                if isinstance(raw_profile, str):
+                    raw_profile = json.loads(raw_profile)
+                payload = {
+                    "symbol": row["symbol"],
+                    "timestamp": row["timestamp"],
+                    "spot_price": row["spot_price"],
+                    "span_pct": row["span_pct"],
+                    "profile": raw_profile or [],
+                    "gamma_flip": row["gamma_flip"],
+                    "net_gex_at_spot": row["net_gex_at_spot"],
+                    "call_wall": row["call_wall"],
+                    "put_wall": row["put_wall"],
+                }
+                self._cache_set(
+                    cache_key, payload, self._analytics_cache_ttl_seconds
+                )
+                return payload
+        except Exception as e:
+            logger.error(f"Error fetching GEX profile: {e}", exc_info=True)
+            raise
+
     async def get_historical_gex(
         self,
         symbol: str = "SPY",

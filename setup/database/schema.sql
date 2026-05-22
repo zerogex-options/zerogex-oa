@@ -347,6 +347,44 @@ COMMENT ON COLUMN gex_by_strike.dealer_charm_exposure IS
     'Dealer-sign charm ($/day), = -charm_exposure. + => dealers buy underlying as time passes.';
 
 -- =============================================================================
+-- GEX profile (spot-shift dealer dollar-gamma curve)
+-- =============================================================================
+-- Stores the spot-shift dealer dollar-gamma curve that
+-- `_gamma_exposure_profile` computes per Analytics cycle.  The curve is
+-- a list of (hypothetical_price, dealer_dollar_gex) points and is the
+-- shared primitive whose zero crossing is `gamma_flip_point` and whose
+-- value at spot is `net_gex_at_spot` (both already persisted in
+-- gex_summary).  Storing the full curve lets the frontend overlay the
+-- GEX-profile line on the per-strike bars without the API recomputing
+-- the BS gamma grid on every request.
+--
+-- The payload is stored as a JSONB array of objects:
+--   [{"price": float, "gex": float}, ...]
+-- with `price` ascending.  A typical profile has 40-100 points
+-- (~3-6 KB per row).
+CREATE TABLE IF NOT EXISTS gex_profile (
+    underlying VARCHAR(10) NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL,
+    spot_price NUMERIC(12, 4) NOT NULL,
+    span_pct DOUBLE PRECISION,
+    profile JSONB NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (underlying, timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gex_profile_underlying_timestamp
+    ON gex_profile(underlying, timestamp DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_gex_profile_underlying') THEN
+        ALTER TABLE gex_profile
+        ADD CONSTRAINT fk_gex_profile_underlying
+        FOREIGN KEY (underlying) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+END $$;
+
+-- =============================================================================
 -- Remove legacy/non-essential objects (safe cleanup during migration)
 -- =============================================================================
 DROP TABLE IF EXISTS data_quality_log CASCADE;

@@ -1902,6 +1902,12 @@ class AnalyticsEngine:
             "call_wall": call_wall,
             "put_wall": put_wall,
             "max_pain_by_expiration": max_pain_by_exp,
+            # Spot-shift dealer gamma curve used to derive both
+            # gamma_flip_point (zero crossing) and net_gex_at_spot
+            # (value at spot).  Persisted to gex_profile so the frontend
+            # can overlay the curve on the per-strike GEX chart without
+            # the API recomputing the BS gamma grid on every request.
+            "gamma_profile": gamma_profile,
         }
 
         return summary
@@ -2131,26 +2137,72 @@ class AnalyticsEngine:
         )
         logger.info("✅ Stored GEX summary")
 
+    def _store_gex_profile(self, summary: Dict[str, Any], cursor) -> None:
+        """Write the spot-shift dealer gamma-exposure profile on ``cursor``.
+
+        The profile is a list of (hypothetical_price, dealer_dollar_gex)
+        tuples computed in :meth:`_calculate_gex_summary` and is the
+        shared primitive behind ``gamma_flip_point`` and
+        ``net_gex_at_spot``.  Persisting it here lets ``/api/gex/profile``
+        serve the curve without recomputing the BS gamma grid on every
+        request.  No-op when the profile is empty (degraded snapshot).
+
+        Like the other ``_store_*`` units this owns no transaction
+        boundary; the caller's ``db_connection()`` scope keeps the write
+        inside the same atomic transaction as the by-strike/summary
+        writes.
+        """
+        profile = summary.get("gamma_profile") or []
+        if not profile:
+            return
+        import json as _json
+
+        payload = _json.dumps(
+            [{"price": float(s), "gex": float(g)} for s, g in profile]
+        )
+        cursor.execute(
+            """
+            INSERT INTO gex_profile (underlying, timestamp, spot_price, span_pct, profile)
+            VALUES (%s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (underlying, timestamp) DO UPDATE SET
+                spot_price = EXCLUDED.spot_price,
+                span_pct = EXCLUDED.span_pct,
+                profile = EXCLUDED.profile
+            """,
+            (
+                summary["underlying"],
+                summary["timestamp"],
+                float(summary.get("underlying_price") or 0.0),
+                (
+                    float(summary["gamma_flip_span_used"])
+                    if summary.get("gamma_flip_span_used") is not None
+                    else None
+                ),
+                payload,
+            ),
+        )
+
     def _store_calculation_results(
         self,
         gex_data: List[Dict[str, Any]],
         summary: Dict[str, Any],
     ) -> None:
-        """Persist by-strike + summary in ONE transaction (all rows land or none).
+        """Persist by-strike + summary + profile in ONE transaction (all rows land or none).
 
-        Both writes run on the same connection inside a single
+        Writes run on the same connection inside a single
         ``db_connection()`` scope.  That context manager commits exactly
         once on a clean exit and rolls back on ANY exception, so a failure
-        in the summary write discards the by-strike rows written earlier
-        in the same transaction.  This atomicity ("both stores commit
+        in any one write discards the rows written earlier in the same
+        transaction.  This atomicity ("all three stores commit
         together") is the invariant downstream consumers rely on, so the
-        grouping must not be split into two independent transactions.
+        grouping must not be split into independent transactions.
         """
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
                 self._store_gex_by_strike(gex_data, cursor)
                 self._store_gex_summary(summary, cursor)
+                self._store_gex_profile(summary, cursor)
                 # db_connection() commits on a clean __exit__; the explicit
                 # commit makes the single-transaction boundary unambiguous
                 # and is a harmless no-op when the CM commits again.

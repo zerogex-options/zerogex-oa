@@ -73,6 +73,43 @@ class GEXByStrike(BaseModel):
         }
 
 
+class GEXProfilePoint(BaseModel):
+    # One point on the spot-shift dealer dollar-gamma curve. ``price`` is
+    # a hypothetical underlying price (grid x-axis); ``gex`` is the dealer
+    # dollar GEX evaluated at that price ($ per 1% spot move).
+    price: float
+    gex: float
+
+
+class GEXProfile(BaseModel):
+    """Spot-shift dealer dollar-gamma curve.
+
+    The shared primitive whose zero crossing is ``gamma_flip`` and whose
+    value at ``spot_price`` is ``net_gex_at_spot`` — the curve consumed
+    by the GEX-Profile overlay on the per-strike chart.
+    """
+
+    timestamp: datetime
+    symbol: str
+    spot_price: Decimal
+    span_pct: Optional[float] = None
+    profile: List[GEXProfilePoint]
+    # Convenience: the headline reference levels associated with this
+    # snapshot, so the frontend can render the flip line / walls without
+    # a second round-trip to /api/gex/summary.
+    gamma_flip: Optional[Decimal] = None
+    net_gex_at_spot: Optional[Decimal] = None
+    call_wall: Optional[Decimal] = None
+    put_wall: Optional[Decimal] = None
+
+    class Config:
+        from_attributes = True
+        json_encoders = {
+            Decimal: lambda v: float(v) if v is not None else None,
+            datetime: lambda v: v.isoformat() if v is not None else None,
+        }
+
+
 class OptionFlow(BaseModel):
     time_window_start: datetime
     time_window_end: datetime
