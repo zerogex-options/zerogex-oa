@@ -100,6 +100,48 @@ def test_classify_falls_back_to_nearest_neighbor_when_only_one_side_known():
     assert (av, mv, bv) == (50, 0, 0)
 
 
+def test_classify_locked_quote_above_routes_to_ask_volume():
+    # bid == ask is a legitimate locked market (common on tight ATM /
+    # illiquid contracts), not a degraded quote.  A print ABOVE the
+    # locked price is a buyer lifting the locked offer -> ask_volume.
+    # Before the fix, ``ask <= bid`` swept this into the nearest-neighbor
+    # fallback, where all three distances were equal and every locked
+    # print degenerated to mid_volume regardless of trade direction --
+    # and every first-of-process locked print also fired the WARN.
+    engine = _engine()
+    av, mv, bv = engine._classify_volume_chunk(100, last=2.55, bid=2.5, ask=2.5, mid=2.5)
+    assert (av, mv, bv) == (100, 0, 0)
+    # The fallback counter MUST NOT increment for a locked market.
+    assert getattr(engine, "_classify_fallback_count", 0) == 0
+
+
+def test_classify_locked_quote_below_routes_to_bid_volume():
+    # Print BELOW the locked price is a seller hitting the locked bid.
+    engine = _engine()
+    av, mv, bv = engine._classify_volume_chunk(100, last=1.35, bid=1.38, ask=1.38, mid=1.38)
+    assert (av, mv, bv) == (0, 0, 100)
+    assert getattr(engine, "_classify_fallback_count", 0) == 0
+
+
+def test_classify_locked_quote_at_price_routes_to_mid_volume():
+    # Print AT the locked price is ambiguous direction => mid_volume.
+    engine = _engine()
+    av, mv, bv = engine._classify_volume_chunk(100, last=2.5, bid=2.5, ask=2.5, mid=2.5)
+    assert (av, mv, bv) == (0, 100, 0)
+    assert getattr(engine, "_classify_fallback_count", 0) == 0
+
+
+def test_classify_truly_crossed_quote_still_fires_fallback():
+    # ask < bid (genuinely crossed -- stale or corrupt feed) MUST still
+    # trip the fallback so the data-quality WARN remains visible.
+    engine = _engine()
+    av, mv, bv = engine._classify_volume_chunk(100, last=5.0, bid=5.10, ask=4.90, mid=5.0)
+    # Crossed: dist_to_ask=0.10, dist_to_mid=0.0, dist_to_bid=0.10 ->
+    # nearest is mid, so mid_volume wins under nearest-neighbor.
+    assert (av, mv, bv) == (0, 100, 0)
+    assert engine._classify_fallback_count == 1
+
+
 def test_opening_auction_bucket_detected_at_0930_et():
     bucket_open = ET.localize(datetime(2026, 4, 28, 9, 30))
     bucket_post_open = ET.localize(datetime(2026, 4, 28, 9, 31))

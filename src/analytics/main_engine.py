@@ -174,6 +174,26 @@ class AnalyticsEngine:
         # logged once (INFO) per closed period instead of a WARNING every
         # interval, and is cleared the moment Greek-bearing data resumes.
         self._empty_snapshot_state: bool = False
+        # Latch for the "gamma flip unresolved" state.  The resolver
+        # correctly persists NULL (no clamp, no carry-forward) when no
+        # ladder rung yields a structural-interior crossing inside the
+        # actionable-distance gate -- but when that condition persists
+        # for an entire morning (e.g. SPX positioning placing the flip
+        # well beyond ±MAX_FLIP_DISTANCE_PCT, the May 22, 2026 SPX
+        # holiday-weekend regime), the verbose diagnostic warning used
+        # to fire once per minute, drowning operators in identical
+        # multi-line spam.  Now: emit the full diagnostic on the
+        # resolved→unresolved transition, and again every
+        # ``_gamma_flip_unresolved_warn_throttle_seconds`` while the
+        # condition persists, so operators still see a refresh of the
+        # underlying chain stats (IV, OI by DTE, peak/floor) instead of
+        # the log going silent for hours.  An info line is emitted on
+        # the unresolved→resolved transition so the recovery is visible.
+        self._gamma_flip_unresolved_state: bool = False
+        self._gamma_flip_unresolved_last_warn_mono: float = 0.0
+        self._gamma_flip_unresolved_warn_throttle_seconds: float = _getenv_float(
+            "GAMMA_FLIP_UNRESOLVED_WARN_THROTTLE_SECONDS", 900.0, min=0.0
+        )
         # Distinct frozen snapshot timestamp for which the unchanged-
         # snapshot skip has already been logged at INFO.  Off-hours the
         # timestamp is frozen for hours, so the skip guard would otherwise
@@ -1757,58 +1777,91 @@ class AnalyticsEngine:
 
         gamma_flip_unresolved = gamma_flip_point is None
         if gamma_flip_unresolved:
-            diag = self._gamma_flip_unresolved_diagnostics(
-                options, gamma_profile, underlying_price, timestamp
+            # Throttle the verbose diagnostic so a persistent unresolved
+            # regime (e.g. SPX with the actionable flip beyond
+            # ±MAX_FLIP_DISTANCE_PCT for an entire morning) doesn't
+            # produce one multi-line WARN per analytics cycle.  Emit on
+            # the resolved→unresolved transition (so the FIRST log line
+            # always carries the full diagnostic) and again every
+            # ``_gamma_flip_unresolved_warn_throttle_seconds`` while the
+            # latch is held, so operators still get a periodic refresh
+            # of the chain stats instead of the log going silent.
+            now_mono = _time.monotonic()
+            state_transition = not self._gamma_flip_unresolved_state
+            elapsed = now_mono - self._gamma_flip_unresolved_last_warn_mono
+            should_warn = state_transition or (
+                self._gamma_flip_unresolved_warn_throttle_seconds <= 0.0
+                or elapsed >= self._gamma_flip_unresolved_warn_throttle_seconds
             )
-            logger.warning(
-                "Gamma flip UNRESOLVED for %s @ %s: no structural interior "
-                "crossing across the span ladder (max rung ±%.0f%%, %d/%d "
-                "usable contracts, %d profile points at max rung) — "
-                "persisting NULL (no clamp, no carry-forward). "
-                "Sides usable C/P=%d/%d. "
-                "IV p10/p50/p90/max=%.3f/%.3f/%.3f/%.3f "
-                "(%d contracts at default IV=%.2f, share %.1f%% — high "
-                "share indicates stale IV pipeline). "
-                "OI share by DTE raw 0/1-2/3-7/8+=%.1f/%.1f/%.1f/%.1f%%; "
-                "DTE-weighted 0/1-2/3-7/8+=%.1f/%.1f/%.1f/%.1f%%. "
-                "Profile (widest rung) peak|GEX|=%.3g, median|GEX|=%.3g, "
-                "p%.0f reference=%.3g, structural floor=%.3g (crossings need "
-                "a local window peak above this to qualify); sign distribution "
-                "+/-/0=%d/%d/%d points (a monotonic split means no crossing "
-                "exists at all).",
-                self.db_symbol,
-                timestamp,
-                gamma_flip_span_used * 100.0,
-                diag["usable_total"],
-                len(options),
-                len(gamma_profile),
-                diag["usable_calls"],
-                diag["usable_puts"],
-                diag["iv_p10"],
-                diag["iv_p50"],
-                diag["iv_p90"],
-                diag["iv_max"],
-                diag["iv_at_default_count"],
-                self._GAMMA_FLIP_DIAGNOSTIC_DEFAULT_IV,
-                diag["iv_at_default_share"] * 100.0,
-                diag["oi_share_0dte"] * 100.0,
-                diag["oi_share_1_2dte"] * 100.0,
-                diag["oi_share_3_7dte"] * 100.0,
-                diag["oi_share_8plus_dte"] * 100.0,
-                diag["weighted_oi_share_0dte"] * 100.0,
-                diag["weighted_oi_share_1_2dte"] * 100.0,
-                diag["weighted_oi_share_3_7dte"] * 100.0,
-                diag["weighted_oi_share_8plus_dte"] * 100.0,
-                diag["profile_peak"],
-                diag["profile_median"],
-                GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE,
-                diag["profile_reference"],
-                diag["structural_floor"],
-                diag["profile_pos_pts"],
-                diag["profile_neg_pts"],
-                diag["profile_zero_pts"],
-            )
-        elif GAMMA_PROFILE_SPAN_LADDER and gamma_flip_span_used > GAMMA_PROFILE_SPAN_LADDER[0]:
+            if should_warn:
+                diag = self._gamma_flip_unresolved_diagnostics(
+                    options, gamma_profile, underlying_price, timestamp
+                )
+                logger.warning(
+                    "Gamma flip UNRESOLVED for %s @ %s: no structural interior "
+                    "crossing across the span ladder (max rung ±%.0f%%, %d/%d "
+                    "usable contracts, %d profile points at max rung) — "
+                    "persisting NULL (no clamp, no carry-forward). "
+                    "Sides usable C/P=%d/%d. "
+                    "IV p10/p50/p90/max=%.3f/%.3f/%.3f/%.3f "
+                    "(%d contracts at default IV=%.2f, share %.1f%% — high "
+                    "share indicates stale IV pipeline). "
+                    "OI share by DTE raw 0/1-2/3-7/8+=%.1f/%.1f/%.1f/%.1f%%; "
+                    "DTE-weighted 0/1-2/3-7/8+=%.1f/%.1f/%.1f/%.1f%%. "
+                    "Profile (widest rung) peak|GEX|=%.3g, median|GEX|=%.3g, "
+                    "p%.0f reference=%.3g, structural floor=%.3g (crossings need "
+                    "a local window peak above this to qualify); sign distribution "
+                    "+/-/0=%d/%d/%d points (a monotonic split means no crossing "
+                    "exists at all).",
+                    self.db_symbol,
+                    timestamp,
+                    gamma_flip_span_used * 100.0,
+                    diag["usable_total"],
+                    len(options),
+                    len(gamma_profile),
+                    diag["usable_calls"],
+                    diag["usable_puts"],
+                    diag["iv_p10"],
+                    diag["iv_p50"],
+                    diag["iv_p90"],
+                    diag["iv_max"],
+                    diag["iv_at_default_count"],
+                    self._GAMMA_FLIP_DIAGNOSTIC_DEFAULT_IV,
+                    diag["iv_at_default_share"] * 100.0,
+                    diag["oi_share_0dte"] * 100.0,
+                    diag["oi_share_1_2dte"] * 100.0,
+                    diag["oi_share_3_7dte"] * 100.0,
+                    diag["oi_share_8plus_dte"] * 100.0,
+                    diag["weighted_oi_share_0dte"] * 100.0,
+                    diag["weighted_oi_share_1_2dte"] * 100.0,
+                    diag["weighted_oi_share_3_7dte"] * 100.0,
+                    diag["weighted_oi_share_8plus_dte"] * 100.0,
+                    diag["profile_peak"],
+                    diag["profile_median"],
+                    GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE,
+                    diag["profile_reference"],
+                    diag["structural_floor"],
+                    diag["profile_pos_pts"],
+                    diag["profile_neg_pts"],
+                    diag["profile_zero_pts"],
+                )
+                self._gamma_flip_unresolved_last_warn_mono = now_mono
+            self._gamma_flip_unresolved_state = True
+        else:
+            if self._gamma_flip_unresolved_state:
+                logger.info(
+                    "Gamma flip RESOLVED for %s @ %s after persistent unresolved "
+                    "period: flip=$%.2f, spot=$%.2f, span used=±%.0f%%",
+                    self.db_symbol,
+                    timestamp,
+                    gamma_flip_point,
+                    underlying_price,
+                    gamma_flip_span_used * 100.0,
+                )
+            self._gamma_flip_unresolved_state = False
+        if not gamma_flip_unresolved and (
+            GAMMA_PROFILE_SPAN_LADDER and gamma_flip_span_used > GAMMA_PROFILE_SPAN_LADDER[0]
+        ):
             logger.info(
                 "Gamma flip resolved at expanded span ±%.0f%% for %s @ %s "
                 "(flip $%.2f, spot $%.2f) — first ladder rung ±%.0f%% was "
