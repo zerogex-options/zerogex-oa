@@ -216,6 +216,65 @@ def test_dte_profile_weight_is_horizon_occupancy_ramp(monkeypatch):
     assert engine._dte_profile_weight(10.0) == 1.0
 
 
+def test_dte_profile_weight_shapes_at_key_points(monkeypatch):
+    """The three curve shapes (linear | sqrt | exp) at a few canonical
+    DTE points.  Sanity: each shape returns the documented closed-form
+    value within a small tolerance, all three send w → 0 as DTE → 0 (so
+    the 0DTE-pinning bug stays solved), and the module constant for the
+    shape is correctly overridden by the per-call ``shape`` kwarg
+    without leaking back into the module."""
+    engine = AnalyticsEngine(underlying="SPY")
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_WEIGHTING", True)
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_REF_DAYS", 5.0)
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_WEIGHT_SHAPE", "linear")
+    day = 1.0 / 365.0
+
+    # Linear (module default) — already covered above; spot-check ref point.
+    assert engine._dte_profile_weight(5.0 * day) == 1.0
+    assert abs(engine._dte_profile_weight(2.0 * day) - 0.4) < 1e-12
+
+    # Sqrt — per-call override.  At ref days, saturates to 1.0; below,
+    # equals √(DTE/ref).
+    assert abs(engine._dte_profile_weight(5.0 * day, shape="sqrt") - 1.0) < 1e-12
+    assert abs(engine._dte_profile_weight(2.0 * day, shape="sqrt") - (0.4**0.5)) < 1e-9
+    assert abs(engine._dte_profile_weight(1.0 * day, shape="sqrt") - (0.2**0.5)) < 1e-9
+    assert engine._dte_profile_weight(0.0, shape="sqrt") == 0.0
+    # Sqrt is always >= linear below the reference (more weight on
+    # near-dated).  At DTE = 1, sqrt ≈ 0.447 > linear = 0.20.
+    assert engine._dte_profile_weight(1.0 * day, shape="sqrt") > engine._dte_profile_weight(
+        1.0 * day, shape="linear"
+    )
+
+    # Exp — asymptotic saturation.  At DTE=ref, w = 1 - 1/e ≈ 0.632.
+    assert abs(engine._dte_profile_weight(5.0 * day, shape="exp") - (1.0 - np.exp(-1.0))) < 1e-9
+    # Near zero, exp ≈ linear (Taylor: 1 - exp(-x) ≈ x for small x).
+    near_zero = 0.01 * day
+    exp_v = engine._dte_profile_weight(near_zero, shape="exp")
+    lin_v = engine._dte_profile_weight(near_zero, shape="linear")
+    assert abs(exp_v - lin_v) / max(lin_v, 1e-12) < 0.01
+    assert engine._dte_profile_weight(0.0, shape="exp") == 0.0
+    # Exp saturates asymptotically — at DTE=5*ref it's ~0.993 (well
+    # under linear's hard 1.0 cap at the same point).  Past DTE ~= 35*ref
+    # the float64 representation of 1 - exp(-x) collapses to 1.0 by
+    # underflow; the asymptotic property is about the early band where
+    # the difference vs linear is actually observable.
+    assert 0.99 < engine._dte_profile_weight(25.0 * day, shape="exp") < 1.0
+    assert engine._dte_profile_weight(25.0 * day, shape="linear") == 1.0
+
+    # Invalid shape falls back to linear silently (the warn fires once at
+    # module load; per-call invalid values just use linear).
+    assert engine._dte_profile_weight(2.0 * day, shape="bogus") == engine._dte_profile_weight(
+        2.0 * day, shape="linear"
+    )
+
+    # Disabled => identically 1.0 regardless of shape.
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_WEIGHTING", False)
+    for s in ("linear", "sqrt", "exp"):
+        assert engine._dte_profile_weight(1e-9, shape=s) == 1.0
+        assert engine._dte_profile_weight(0.0, shape=s) == 1.0
+        assert engine._dte_profile_weight(10.0, shape=s) == 1.0
+
+
 def test_dte_weighting_unpins_flip_from_0dte_wall(monkeypatch):
     """0DTE-heavy book: a same-day put wall just below spot, plus the
     real multi-day regime structure (far-dated put/call mass) whose
@@ -981,7 +1040,8 @@ def test_gex_summary_throttles_repeated_unresolved_warnings(caplog):
     with caplog.at_level(logging.WARNING):
         engine._calculate_gex_summary(gex_by_strike, options, spot, ts)
     first_warns = [
-        r for r in caplog.records
+        r
+        for r in caplog.records
         if "Gamma flip UNRESOLVED" in r.message and r.levelno == logging.WARNING
     ]
     assert len(first_warns) == 1, "first call must emit the verbose WARN"
@@ -990,7 +1050,8 @@ def test_gex_summary_throttles_repeated_unresolved_warnings(caplog):
     with caplog.at_level(logging.WARNING):
         engine._calculate_gex_summary(gex_by_strike, options, spot, ts)
     repeat_warns = [
-        r for r in caplog.records
+        r
+        for r in caplog.records
         if "Gamma flip UNRESOLVED" in r.message and r.levelno == logging.WARNING
     ]
     assert repeat_warns == [], "second call within throttle window must stay silent"
@@ -1010,9 +1071,7 @@ def test_gex_summary_logs_resolved_transition_after_unresolved_period(caplog):
 
     # Unresolved cycle: pure-call book, no crossing.
     unresolved_options = [_opt(500.0, "C", oi=5000, iv=0.25, exp=exp, volume=3)]
-    engine._calculate_gex_summary(
-        [{"strike": 500.0, "net_gex": 1.0}], unresolved_options, spot, ts
-    )
+    engine._calculate_gex_summary([{"strike": 500.0, "net_gex": 1.0}], unresolved_options, spot, ts)
     assert engine._gamma_flip_unresolved_state is True
 
     # Resolved cycle: balanced book with a real flip.
@@ -1028,8 +1087,7 @@ def test_gex_summary_logs_resolved_transition_after_unresolved_period(caplog):
     assert summary["gamma_flip_point"] is not None
     assert engine._gamma_flip_unresolved_state is False
     assert any(
-        "Gamma flip RESOLVED" in r.message and r.levelno == logging.INFO
-        for r in caplog.records
+        "Gamma flip RESOLVED" in r.message and r.levelno == logging.INFO for r in caplog.records
     )
 
 

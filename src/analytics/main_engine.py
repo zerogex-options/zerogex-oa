@@ -45,6 +45,7 @@ from src.config import (
     GAMMA_PROFILE_STEP_PCT,
     GAMMA_PROFILE_DTE_WEIGHTING,
     GAMMA_PROFILE_DTE_REF_DAYS,
+    GAMMA_PROFILE_DTE_WEIGHT_SHAPE,
 )
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.analytics.walls import compute_call_put_walls
@@ -745,27 +746,42 @@ class AnalyticsEngine:
         gamma = np.where(S_arr > 0.0, gamma, 0.0)
         return gamma if is_array else float(gamma)
 
-    def _dte_profile_weight(self, T: float, *, dte_ref_days: Optional[float] = None) -> float:
+    def _dte_profile_weight(
+        self,
+        T: float,
+        *,
+        dte_ref_days: Optional[float] = None,
+        shape: Optional[str] = None,
+    ) -> float:
         """DTE weight for a contract's spot-shift gamma-profile contribution.
 
-        ``min(1, DTE / GAMMA_PROFILE_DTE_REF_DAYS)`` with ``DTE = T·365``
-        (``T`` in calendar years, the same unit
-        :meth:`_calculate_time_to_expiration` returns).
+        Dispatched on ``GAMMA_PROFILE_DTE_WEIGHT_SHAPE``
+        (or the per-call ``shape`` override, which beats the module
+        constant for this single call) — three curves, all evaluated
+        with ``DTE = T·365`` (``T`` in calendar years, the unit
+        :meth:`_calculate_time_to_expiration` returns):
 
-        The gamma flip is a *multi-day* regime level, so each expiry is
-        weighted by the fraction of the reference horizon over which the
-        contract still exists: a same-day 0DTE is gone by today's close
-        and is ~irrelevant to where the gamma regime sits over the next
-        several days, whereas anything living at least the full reference
-        horizon counts in full (weight saturates at 1.0 — longer-dated
-        regime structure, and all behavior away from near-dated, is
-        unchanged).  This horizon-occupancy ramp also incidentally tames
-        Black-Scholes' ``1/√T`` near-expiry gamma spike (the net 0DTE
-        contribution scales like ``√DTE → 0``), so a same-day wall can no
-        longer pin the regime flip to an irrelevant same-day strike.
+        * ``linear`` (default, prior production behavior):
+            ``w(T) = min(1, DTE / ref_days)``.  Horizon-occupancy
+            ramp — the fraction of the reference horizon over which the
+            contract still exists.  Hard saturation at DTE = ref_days.
+
+        * ``sqrt``:
+            ``w(T) = sqrt(min(1, DTE / ref_days))``.  More aggressive
+            on near-dated; per-OI contribution to the profile is
+            CONSTANT (≈ 1/√ref_days) for all DTE < ref_days.
+
+        * ``exp``:
+            ``w(T) = 1 - exp(-DTE / ref_days)``.  Smooth — no corner
+            at DTE = ref_days.  Saturates asymptotically (~0.63 at
+            DTE=ref_days, ~0.95 at DTE=3*ref_days).
+
+        All three send w → 0 (or w/√T to a finite constant for sqrt)
+        as T → 0, so the BS 1/√T near-expiry gamma spike no longer
+        pins the multi-day regime flip to a same-day strike.
 
         Returns 1.0 unconditionally when DTE weighting is disabled, so
-        the profile is byte-for-byte the prior behavior.
+        the profile is byte-for-byte the prior behavior in that mode.
 
         ``dte_ref_days`` (optional) overrides the module-level
         ``GAMMA_PROFILE_DTE_REF_DAYS`` for this single call.  Used by
@@ -773,13 +789,30 @@ class AnalyticsEngine:
         multiple multi-day horizons from the same option snapshot.
         ``None`` preserves the production constant; positive values
         substitute that horizon (in days) for this call only.
+
+        ``shape`` (optional) overrides ``GAMMA_PROFILE_DTE_WEIGHT_SHAPE``
+        for this single call.  ``None`` preserves the production curve;
+        ``"linear" | "sqrt" | "exp"`` substitute for this call only.
+        Anything else falls back to ``"linear"``.
         """
         if not GAMMA_PROFILE_DTE_WEIGHTING:
             return 1.0
         ref_days = GAMMA_PROFILE_DTE_REF_DAYS if dte_ref_days is None else float(dte_ref_days)
         if T <= 0.0 or ref_days <= 0.0:
             return 0.0
-        return min(1.0, (T * 365.0) / ref_days)
+        chosen_shape = GAMMA_PROFILE_DTE_WEIGHT_SHAPE if shape is None else shape.strip().lower()
+        dte_over_ref = (T * 365.0) / ref_days
+        if chosen_shape == "sqrt":
+            return float(np.sqrt(min(1.0, dte_over_ref)))
+        if chosen_shape == "exp":
+            # 1 - exp(-x) is bounded in [0, 1) and never quite 1 — that's
+            # the design intent (no hard saturation cliff at the
+            # reference horizon).  The math.expm1 form avoids a tiny
+            # cancellation error for very small dte_over_ref but the
+            # difference is below profile noise; plain exp is fine.
+            return float(1.0 - np.exp(-dte_over_ref))
+        # linear (the default) and any unrecognized override fall here.
+        return min(1.0, dte_over_ref)
 
     def _calculate_gex_by_strike(
         self, options: List[Dict[str, Any]], underlying_price: float, timestamp: datetime
@@ -2302,9 +2335,7 @@ class AnalyticsEngine:
             return
         import json as _json
 
-        payload = _json.dumps(
-            [{"price": float(s), "gex": float(g)} for s, g in profile]
-        )
+        payload = _json.dumps([{"price": float(s), "gex": float(g)} for s, g in profile])
         cursor.execute(
             """
             INSERT INTO gex_profile (underlying, timestamp, spot_price, span_pct, profile)

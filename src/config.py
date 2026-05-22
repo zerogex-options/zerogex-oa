@@ -444,6 +444,39 @@ GAMMA_PROFILE_DTE_WEIGHTING = _getenv_bool("GAMMA_PROFILE_DTE_WEIGHTING", True)
 GAMMA_PROFILE_DTE_REF_DAYS = _getenv_float(
     "GAMMA_PROFILE_DTE_REF_DAYS", _FP["dte_ref_days"], min=0.5, max=60.0
 )
+# DTE weight curve shape.  All three shapes cancel the BS 1/√T near-expiry
+# gamma spike (linear and exp via w(T) → 0 as T → 0, sqrt via the constant
+# w(T)/√T limit), but redistribute weight across the near-dated bucket
+# differently.  Tunes how aggressively near-dated (< DTE_REF_DAYS) contracts
+# count in the spot-shift profile:
+#   * linear (default, preserves prior behavior): w = min(1, DTE/ref).
+#       Horizon-occupancy interpretation — the fraction of the reference
+#       horizon over which the contract still exists.  Hard saturation
+#       at DTE = ref.  Cleanest semantics, one knob.
+#   * sqrt:                                       w = sqrt(min(1, DTE/ref)).
+#       More aggressive on near-dated — 1DTE under sqrt at ref=2 is 0.71
+#       vs linear's 0.50.  Per-OI dollar gamma contribution is CONSTANT
+#       (≈ 1/√ref) for all DTE < ref (the 1/√T cancellation goes to a
+#       flat shelf instead of a √T ramp).  Hard saturation at DTE = ref.
+#   * exp:                                        w = 1 - exp(-DTE/ref).
+#       Smoothest curve — no corner at DTE=ref, asymptotic saturation
+#       (~0.63 at DTE=ref, ~0.95 at DTE=3*ref).  Same near-zero
+#       asymptotics as linear (both ~ T/ref near T=0).  Use when you want
+#       to avoid the sharp ON/OFF transition at the saturation point.
+# Invalid values fall back to "linear" with a WARN; the same env-var name
+# is the operator-facing knob.
+GAMMA_PROFILE_DTE_WEIGHT_SHAPE = (
+    os.getenv("GAMMA_PROFILE_DTE_WEIGHT_SHAPE", "linear").strip().lower()
+)
+if GAMMA_PROFILE_DTE_WEIGHT_SHAPE not in ("linear", "sqrt", "exp"):
+    import logging as _logging  # local to avoid disturbing module-load order
+
+    _logging.getLogger(__name__).warning(
+        "GAMMA_PROFILE_DTE_WEIGHT_SHAPE=%r is invalid; falling back to 'linear'. "
+        "Allowed: linear | sqrt | exp.",
+        GAMMA_PROFILE_DTE_WEIGHT_SHAPE,
+    )
+    GAMMA_PROFILE_DTE_WEIGHT_SHAPE = "linear"
 
 # Batch Sizes
 QUOTE_BATCH_SIZE = int(os.getenv("QUOTE_BATCH_SIZE", "100"))  # TradeStation supports up to 500
