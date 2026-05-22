@@ -3112,20 +3112,27 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     ) -> List[Dict[str, Any]]:
         """Run the 1-minute bar aggregation CTE for a single option contract.
 
-        Returned rows are newest-first. ``volume_delta`` is computed via
-        SQL LAG() over ``bar_ts ASC`` within the supplied window, so callers
-        that wish to incrementally extend a prior result must include the
-        last already-known bar as the lower bound to seed LAG correctly.
+        Returned rows are newest-first. ``volume_delta`` and the
+        classified-flow columns ``ask_volume`` / ``mid_volume`` /
+        ``bid_volume`` are all per-bar values, computed via SQL LAG()
+        over ``bar_ts ASC`` against session-cumulative storage (see
+        ``schema.sql`` COMMENT ON option_chains.{volume,ask_volume,
+        mid_volume,bid_volume}).  Callers that wish to incrementally
+        extend a prior result must include the last already-known bar
+        as the lower bound to seed LAG correctly.
         """
         query = """
             WITH ranked AS (
                 SELECT
                     *,
                     DATE_TRUNC('minute', timestamp)                          AS bar_ts,
-                    MAX(volume)      OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_volume,
+                    MAX(volume)        OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_volume,
                     MAX(open_interest) OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_oi,
-                    MAX(updated_at)  OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_updated_at,
-                    ROW_NUMBER()     OVER (
+                    MAX(ask_volume)    OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_ask_volume,
+                    MAX(mid_volume)    OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_mid_volume,
+                    MAX(bid_volume)    OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_bid_volume,
+                    MAX(updated_at)    OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_updated_at,
+                    ROW_NUMBER()       OVER (
                         PARTITION BY DATE_TRUNC('minute', timestamp)
                         ORDER BY timestamp DESC
                     ) AS rn
@@ -3146,9 +3153,26 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 mid,
                 bar_volume         AS volume,
                 bar_oi             AS open_interest,
-                ask_volume,
-                mid_volume,
-                bid_volume,
+                -- ask/mid/bid_volume are stored session-cumulative
+                -- (see schema COMMENT ON option_chains.*_volume).  The
+                -- /api/option/contract contract is per-bar classified
+                -- flow, so surface LAG deltas under the same names --
+                -- the window is a single ET session by construction.
+                GREATEST(
+                    COALESCE(bar_ask_volume, 0)
+                        - COALESCE(LAG(bar_ask_volume) OVER (ORDER BY bar_ts), 0),
+                    0
+                )::bigint          AS ask_volume,
+                GREATEST(
+                    COALESCE(bar_mid_volume, 0)
+                        - COALESCE(LAG(bar_mid_volume) OVER (ORDER BY bar_ts), 0),
+                    0
+                )::bigint          AS mid_volume,
+                GREATEST(
+                    COALESCE(bar_bid_volume, 0)
+                        - COALESCE(LAG(bar_bid_volume) OVER (ORDER BY bar_ts), 0),
+                    0
+                )::bigint          AS bid_volume,
                 implied_volatility,
                 delta,
                 gamma,
