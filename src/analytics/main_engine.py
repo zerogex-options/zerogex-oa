@@ -18,7 +18,7 @@ import time
 import time as _time
 from multiprocessing import Process
 from datetime import datetime, time as dt_time, timedelta, timezone
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Sequence, Tuple
 from collections import defaultdict
 import pytz
 import numpy as np
@@ -659,7 +659,7 @@ class AnalyticsEngine:
         gamma = np.where(S_arr > 0.0, gamma, 0.0)
         return gamma if is_array else float(gamma)
 
-    def _dte_profile_weight(self, T: float) -> float:
+    def _dte_profile_weight(self, T: float, *, dte_ref_days: Optional[float] = None) -> float:
         """DTE weight for a contract's spot-shift gamma-profile contribution.
 
         ``min(1, DTE / GAMMA_PROFILE_DTE_REF_DAYS)`` with ``DTE = T·365``
@@ -680,12 +680,20 @@ class AnalyticsEngine:
 
         Returns 1.0 unconditionally when DTE weighting is disabled, so
         the profile is byte-for-byte the prior behavior.
+
+        ``dte_ref_days`` (optional) overrides the module-level
+        ``GAMMA_PROFILE_DTE_REF_DAYS`` for this single call.  Used by
+        :meth:`compute_flip_term_structure` to compute the flip at
+        multiple multi-day horizons from the same option snapshot.
+        ``None`` preserves the production constant; positive values
+        substitute that horizon (in days) for this call only.
         """
         if not GAMMA_PROFILE_DTE_WEIGHTING:
             return 1.0
-        if T <= 0.0 or GAMMA_PROFILE_DTE_REF_DAYS <= 0.0:
+        ref_days = GAMMA_PROFILE_DTE_REF_DAYS if dte_ref_days is None else float(dte_ref_days)
+        if T <= 0.0 or ref_days <= 0.0:
             return 0.0
-        return min(1.0, (T * 365.0) / GAMMA_PROFILE_DTE_REF_DAYS)
+        return min(1.0, (T * 365.0) / ref_days)
 
     def _calculate_gex_by_strike(
         self, options: List[Dict[str, Any]], underlying_price: float, timestamp: datetime
@@ -952,6 +960,7 @@ class AnalyticsEngine:
         timestamp: datetime,
         *,
         span_pct: Optional[float] = None,
+        dte_ref_days: Optional[float] = None,
     ) -> List[Tuple[float, float]]:
         """SpotGamma / SqueezeMetrics dealer gamma-exposure profile.
 
@@ -1034,8 +1043,9 @@ class AnalyticsEngine:
             # Horizon-occupancy ramp min(1, DTE/ref): down-weights
             # near-dated so a same-day 0DTE wall (and its 1/√T gamma
             # spike) can't pin the multi-day regime flip (1.0 for
-            # DTE≥ref / weighting off).
-            dte_w = self._dte_profile_weight(T)
+            # DTE≥ref / weighting off).  dte_ref_days is the
+            # per-call override (None => module constant).
+            dte_w = self._dte_profile_weight(T, dte_ref_days=dte_ref_days)
             total += sign * dte_w * dollar_gamma
             used = True
 
@@ -1108,6 +1118,8 @@ class AnalyticsEngine:
         options: List[Dict[str, Any]],
         spot: float,
         timestamp: datetime,
+        *,
+        dte_ref_days: Optional[float] = None,
     ) -> float:
         """Active-strike-weighted structural reference for the resolver.
 
@@ -1145,6 +1157,7 @@ class AnalyticsEngine:
             spot,
             timestamp,
             span_pct=GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT,
+            dte_ref_days=dte_ref_days,
         )
         if not ref_profile:
             return 0.0
@@ -1325,6 +1338,8 @@ class AnalyticsEngine:
         options: List[Dict[str, Any]],
         spot: float,
         timestamp: datetime,
+        *,
+        dte_ref_days: Optional[float] = None,
     ) -> Tuple[List[Tuple[float, float]], Optional[float], float]:
         """Adaptive bracket-and-verify resolution of the gamma flip.
 
@@ -1362,14 +1377,18 @@ class AnalyticsEngine:
 
         Returns ``(profile, flip, span_used)``.
         """
-        structural_reference = self._structural_reference(options, spot, timestamp)
+        structural_reference = self._structural_reference(
+            options, spot, timestamp, dte_ref_days=dte_ref_days
+        )
 
         last_profile: List[Tuple[float, float]] = []
         last_span: float = (
             GAMMA_PROFILE_SPAN_LADDER[0] if GAMMA_PROFILE_SPAN_LADDER else GAMMA_PROFILE_SPAN_PCT
         )
         for span_pct in GAMMA_PROFILE_SPAN_LADDER:
-            profile = self._gamma_exposure_profile(options, spot, timestamp, span_pct=span_pct)
+            profile = self._gamma_exposure_profile(
+                options, spot, timestamp, span_pct=span_pct, dte_ref_days=dte_ref_days
+            )
             last_profile = profile
             last_span = span_pct
             if not profile:
@@ -1380,6 +1399,75 @@ class AnalyticsEngine:
             if flip is not None:
                 return profile, flip, span_pct
         return last_profile, None, last_span
+
+    def compute_flip_term_structure(
+        self,
+        options: List[Dict[str, Any]],
+        spot: float,
+        timestamp: datetime,
+        horizons_days: Sequence[float],
+    ) -> List[Dict[str, Any]]:
+        """Resolve the gamma flip at each requested multi-day horizon.
+
+        Each entry in ``horizons_days`` is substituted for
+        ``GAMMA_PROFILE_DTE_REF_DAYS`` for that one call only, so the
+        horizon-occupancy ramp ``min(1, DTE/h)`` re-weights the chain to
+        each horizon's regime.  The expensive part (option re-greeking
+        across the price grid) is repeated per horizon because the
+        weights enter inside the per-grid-point sum — no shortcut from
+        caching one base profile.
+
+        Production downstream consumers still read the single persisted
+        ``gamma_flip_point`` (built with the module-level constant); this
+        method is for on-demand multi-horizon exploration via the API
+        and does not mutate any persisted state.
+
+        Returns one dict per horizon with keys:
+          * ``horizon_days``       — the requested reference horizon
+          * ``flip``               — resolved zero crossing, or ``None``
+          * ``resolved``           — bool, True iff structural interior
+                                     crossing existed at any ladder rung
+          * ``span_used``          — fraction of spot at which the
+                                     ladder rung resolved (or the
+                                     last-tried rung when unresolved)
+          * ``net_gex_at_spot``    — profile value at the spot grid
+                                     point closest to ``spot``, or
+                                     ``None`` when the profile is empty.
+                                     Sign-consistent with ``flip`` since
+                                     both are read off the same profile.
+
+        Profiles themselves are intentionally NOT returned — the surface
+        endpoint is the right place for that payload.
+        """
+        results: List[Dict[str, Any]] = []
+        for h in horizons_days:
+            try:
+                h_f = float(h)
+            except (TypeError, ValueError):
+                continue
+            if h_f <= 0:
+                continue
+            profile, flip, span_used = self._resolve_gamma_flip(
+                options, spot, timestamp, dte_ref_days=h_f
+            )
+            net_gex_at_spot: Optional[float]
+            if profile:
+                # Nearest grid point to spot — the same convention
+                # _net_gex_at_spot uses for the persisted column.
+                idx = min(range(len(profile)), key=lambda i: abs(profile[i][0] - spot))
+                net_gex_at_spot = float(profile[idx][1])
+            else:
+                net_gex_at_spot = None
+            results.append(
+                {
+                    "horizon_days": h_f,
+                    "flip": float(flip) if flip is not None else None,
+                    "resolved": flip is not None,
+                    "span_used": float(span_used),
+                    "net_gex_at_spot": net_gex_at_spot,
+                }
+            )
+        return results
 
     # Default IV substituted when an option_chains row has NULL/0 IV
     # (see the snapshot fetch ~line 503).  Stale-IV pipelines cluster

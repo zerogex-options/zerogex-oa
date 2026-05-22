@@ -267,6 +267,99 @@ def test_dte_weighting_unpins_flip_from_0dte_wall(monkeypatch):
     assert abs(weighted_flip - unweighted_flip) >= 0.10 * spot
 
 
+def test_dte_ref_days_override_reshapes_profile_per_horizon(monkeypatch):
+    """Override semantics — per-call ``dte_ref_days`` substitutes for the
+    module-level constant for that one profile build only, without
+    mutating module state.
+
+    Verified at the profile level (rather than the resolved flip) so the
+    test isn't entangled with the resolver's interior / structural /
+    actionable-distance gates: a near-dated wall whose weight is 1.0 at
+    ref=2 but only 0.1 at ref=20 contributes 10× more dollar gamma to
+    the grid point at its strike under the short ref.  That contribution
+    is on top of an asymmetric base profile, so the *sign at spot*
+    flips with horizon — a directly observable, gate-free witness that
+    the override took effect."""
+    engine = AnalyticsEngine(underlying="SPY")
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_WEIGHTING", True)
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_REF_DAYS", 5.0)
+
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
+    near = datetime(2026, 5, 20).date()  # 2 DTE
+    far = datetime(2026, 10, 16).date()  # ~5 months, weight 1.0 at any reasonable ref
+    spot = 100.0
+
+    # Single 2DTE-only contract dominates the profile at spot.  At ref=2
+    # it counts at weight 1.0; at ref=20 it counts at weight 0.1.  The
+    # contribution at every grid point — including spot — is therefore
+    # exactly 10× larger in magnitude under the short-ref profile.
+    # Asserting the magnitude ratio is approximately the weight ratio is
+    # the cleanest, gate-free witness that the override took effect.
+    options = [
+        _opt(100.0, "P", oi=200000, iv=0.20, exp=near),
+        _opt(120.0, "C", oi=12000, iv=0.30, exp=far),
+    ]
+
+    profile_short = engine._gamma_exposure_profile(options, spot, ts, dte_ref_days=2.0)
+    profile_long = engine._gamma_exposure_profile(options, spot, ts, dte_ref_days=20.0)
+
+    # Both profiles built over the same grid (same span_pct default).
+    assert profile_short and profile_long
+    assert [p[0] for p in profile_short] == [p[0] for p in profile_long]
+
+    # Value at the grid point closest to spot.
+    def _at_spot(prof):
+        idx = min(range(len(prof)), key=lambda i: abs(prof[i][0] - spot))
+        return prof[idx][1]
+
+    v_short = _at_spot(profile_short)
+    v_long = _at_spot(profile_long)
+
+    # Short-ref weights the near-dated wall ~10× more heavily; the
+    # at-spot magnitude reflects that.  The far-dated contract gets
+    # weight 1.0 under both refs (longer than either reference) so it
+    # cancels out of the ratio.
+    assert abs(v_short) > 4.0 * abs(v_long), (v_short, v_long)
+
+    # Module state unchanged by the override calls.
+    assert main_engine.GAMMA_PROFILE_DTE_REF_DAYS == 5.0
+
+
+def test_compute_flip_term_structure_shape_and_alignment(monkeypatch):
+    """The public multi-horizon method returns one entry per requested
+    horizon in the requested order, with the documented keys.  Invalid /
+    non-positive horizons are skipped silently (so a client passing
+    ``"0,5"`` gets one row, not a 500)."""
+    engine = AnalyticsEngine(underlying="SPY")
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_WEIGHTING", True)
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_REF_DAYS", 5.0)
+
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
+    far = datetime(2026, 10, 16).date()
+    spot = 100.0
+    options = [
+        _opt(80.0, "P", oi=180000, iv=0.30, exp=far),
+        _opt(110.0, "C", oi=420000, iv=0.30, exp=far),
+        _opt(98.0, "P", oi=50000, iv=0.20, exp=datetime(2026, 5, 20).date()),
+    ]
+
+    results = engine.compute_flip_term_structure(options, spot, ts, [0.0, 2.0, -1.0, 5.0, 20.0])
+    # 0 and -1 are dropped; 2, 5, 20 survive.
+    assert [r["horizon_days"] for r in results] == [2.0, 5.0, 20.0]
+    for r in results:
+        assert set(r.keys()) == {
+            "horizon_days",
+            "flip",
+            "resolved",
+            "span_used",
+            "net_gex_at_spot",
+        }
+        assert isinstance(r["resolved"], bool)
+        if r["resolved"]:
+            assert r["flip"] is not None
+            assert r["net_gex_at_spot"] is not None
+
+
 def test_find_structural_interior_crossing_geometry():
     """Unit test for the interior + structural gates on a hand-built profile.
 

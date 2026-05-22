@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Gamma Flip · Term Structure (prototype)</title>
+  <!--
+    Standalone prototype for the multi-horizon gamma-flip visualization.
+    Drives off the new /api/gex/flip-term-structure endpoint.
+
+    Running locally:
+      1. Start the API: `make api-dev` (or however you launch uvicorn).
+      2. Allow CORS for file:// origin in dev:
+           export CORS_ALLOW_ORIGINS='*'  # NEVER in production
+      3. Open this file directly in a browser, or serve via
+           `python -m http.server 8001` from this directory.
+      4. Edit the API_BASE constant below if the API isn't on :8000.
+
+    The page renders two views:
+      * Term-structure curve  — live (today's flip per horizon + spot + historical dots)
+      * Horizon × price contour — placeholder, awaiting /api/gex/flip-surface
+
+    Caveat: historical dots come from gex_summary which persists ONE flip
+    per cycle, computed at the production GAMMA_PROFILE_DTE_REF_DAYS.  So
+    the dot at horizon h is "what the production flip looked like h days
+    ago", not strictly "what the h-day-horizon flip looked like h days ago".
+    They coincide at h == production constant.  Per-horizon historical
+    realization needs persisted per-horizon flips — the proper migration.
+  -->
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 24px; color: #111; }
+    h1 { margin: 0 0 4px 0; font-size: 20px; }
+    .subtitle { color: #666; margin-bottom: 16px; font-size: 13px; }
+    .controls { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+    .controls label { font-size: 13px; color: #555; }
+    .controls input, .controls button {
+      font: inherit; padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; background: #fff;
+    }
+    .controls button { cursor: pointer; background: #1a73e8; color: #fff; border-color: #1a73e8; }
+    .controls button:hover { background: #1664c9; }
+    .controls button:disabled { background: #888; border-color: #888; cursor: not-allowed; }
+    #status { font-size: 13px; color: #d04444; min-height: 1.2em; }
+    #term-structure { width: 100%; height: 500px; margin-bottom: 24px; }
+    #surface-stub {
+      width: 100%; height: 360px; margin-bottom: 24px;
+      border: 1px dashed #ccc; border-radius: 6px; background: #fafafa;
+      display: flex; align-items: center; justify-content: center; color: #888;
+      flex-direction: column; gap: 8px; padding: 16px; text-align: center;
+    }
+    #surface-stub code { background: #eee; padding: 1px 6px; border-radius: 3px; font-size: 12px; }
+    table { border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+    th, td { padding: 4px 10px; border-bottom: 1px solid #eee; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    th { font-weight: 600; color: #444; }
+    .muted { color: #999; }
+  </style>
+</head>
+<body>
+  <h1>Gamma Flip · Term Structure <span class="muted">(prototype)</span></h1>
+  <div class="subtitle">
+    Today's flip at each horizon, with persisted realizations from <em>h</em> days ago overlaid.
+  </div>
+
+  <div class="controls">
+    <label for="symbol">Symbol</label>
+    <input id="symbol" value="SPX" size="6" />
+    <label for="horizons">Horizons (days, comma-separated)</label>
+    <input id="horizons" value="1,3,5,10,20,60" size="28" />
+    <button id="reload">Reload</button>
+    <span id="status"></span>
+  </div>
+
+  <div id="term-structure"></div>
+
+  <div id="surface-stub">
+    <div><strong>Horizon × price contour</strong> — pending <code>/api/gex/flip-surface</code></div>
+    <div>See <code>docs/gex_flip_surface_contract.md</code> for the proposed payload contract.</div>
+  </div>
+
+  <div id="summary"></div>
+
+  <script>
+    const API_BASE = window.API_BASE || "http://localhost:8000";
+
+    const fmt = {
+      price: (v) => (v == null ? "—" : v.toFixed(2)),
+      pct:   (v) => (v == null ? "—" : (v * 100).toFixed(2) + "%"),
+      bn:    (v) => {
+        if (v == null) return "—";
+        const abs = Math.abs(v);
+        if (abs >= 1e9) return (v / 1e9).toFixed(2) + "B";
+        if (abs >= 1e6) return (v / 1e6).toFixed(2) + "M";
+        return v.toFixed(0);
+      },
+      iso:   (v) => (v == null ? "—" : new Date(v).toISOString().replace("T", " ").slice(0, 16) + "Z"),
+    };
+
+    async function fetchTermStructure(symbol, horizons) {
+      const url = `${API_BASE}/api/gex/flip-term-structure?symbol=${encodeURIComponent(symbol)}&horizons=${encodeURIComponent(horizons)}`;
+      const r = await fetch(url);
+      if (!r.ok) {
+        const detail = await r.text();
+        throw new Error(`HTTP ${r.status}: ${detail}`);
+      }
+      return r.json();
+    }
+
+    function render(data) {
+      // ---- term-structure curve ----
+      const horizons = data.horizons_days;
+      const resolved = data.curve.map(p => p.resolved);
+      const flips    = data.curve.map(p => p.resolved ? p.flip : null);
+      const spans    = data.curve.map(p => p.span_used);
+      const netGex   = data.curve.map(p => p.net_gex_at_spot);
+
+      // Live curve: today's flip at each horizon.
+      const curveTrace = {
+        x: horizons,
+        y: flips,
+        mode: "lines+markers",
+        type: "scatter",
+        name: "Today's flip @ horizon",
+        line:   { color: "#1a73e8", width: 2 },
+        marker: { color: "#1a73e8", size: 8 },
+        connectgaps: false,  // gap when unresolved → visually obvious
+        hovertemplate:
+          "<b>%{x}d horizon</b><br>" +
+          "flip $%{y:.2f}<br>" +
+          "span %{customdata[0]:.0%} · net-GEX@spot %{customdata[1]:.2s}<extra></extra>",
+        customdata: spans.map((s, i) => [s, netGex[i]]),
+      };
+
+      // Spot reference: horizontal line.
+      const spotTrace = {
+        x: [Math.min(...horizons), Math.max(...horizons)],
+        y: [data.spot, data.spot],
+        mode: "lines",
+        type: "scatter",
+        name: `Spot ($${data.spot.toFixed(2)})`,
+        line: { color: "#888", width: 1, dash: "dot" },
+        hoverinfo: "skip",
+      };
+
+      // Unresolved markers (red x) at horizons where the resolver gave up.
+      const unresolvedXs = horizons.filter((_, i) => !resolved[i]);
+      const unresolvedTrace = unresolvedXs.length ? {
+        x: unresolvedXs,
+        y: unresolvedXs.map(() => data.spot),  // sit at spot so they're visible
+        mode: "markers",
+        type: "scatter",
+        name: "Unresolved",
+        marker: { symbol: "x", color: "#d04444", size: 12, line: { width: 2 } },
+        hovertemplate: "<b>%{x}d horizon</b><br>flip unresolved (chain too narrow?)<extra></extra>",
+      } : null;
+
+      // Historical realization dots: persisted flip from h days ago.
+      const historicalX = (data.historical || []).filter(h => h.flip != null).map(h => h.horizon_days);
+      const historicalY = (data.historical || []).filter(h => h.flip != null).map(h => h.flip);
+      const historicalSkew = (data.historical || []).filter(h => h.flip != null).map(h => h.skew_seconds);
+      const historicalTrace = historicalX.length ? {
+        x: historicalX,
+        y: historicalY,
+        mode: "markers",
+        type: "scatter",
+        name: "Persisted flip from h days ago",
+        marker: {
+          symbol: "diamond-open", color: "#d97706", size: 10,
+          line: { color: "#d97706", width: 2 },
+        },
+        hovertemplate:
+          "<b>%{x}d ago</b><br>" +
+          "persisted flip $%{y:.2f}<br>" +
+          "skew %{customdata:.0f}s from target<extra></extra>",
+        customdata: historicalSkew,
+      } : null;
+
+      const traces = [spotTrace, curveTrace];
+      if (unresolvedTrace) traces.push(unresolvedTrace);
+      if (historicalTrace) traces.push(historicalTrace);
+
+      const layout = {
+        title: `${data.symbol} · gamma flip term structure (snapshot ${fmt.iso(data.timestamp)})`,
+        xaxis: {
+          title: "Reference horizon (days)",
+          type: "log",
+          tickvals: horizons,
+          ticktext: horizons.map(h => `${h}d`),
+        },
+        yaxis: { title: "Flip price ($)" },
+        legend: { orientation: "h", x: 0, y: 1.08 },
+        margin: { l: 60, r: 30, t: 80, b: 50 },
+        hovermode: "closest",
+      };
+      Plotly.react("term-structure", traces, layout, { responsive: true });
+
+      // ---- summary table ----
+      const histByH = Object.fromEntries((data.historical || []).map(h => [h.horizon_days, h]));
+      let rows = "";
+      data.curve.forEach((p, i) => {
+        const h = histByH[p.horizon_days] || {};
+        const drift = (p.flip != null && h.flip != null) ? (p.flip - h.flip) : null;
+        rows += `<tr>
+          <td>${p.horizon_days}d</td>
+          <td>${p.resolved ? "✓" : "—"}</td>
+          <td>${fmt.price(p.flip)}</td>
+          <td>${fmt.pct(p.span_used)}</td>
+          <td>${fmt.bn(p.net_gex_at_spot)}</td>
+          <td>${fmt.price(h.flip)}</td>
+          <td>${drift == null ? "—" : (drift >= 0 ? "+" : "") + drift.toFixed(2)}</td>
+        </tr>`;
+      });
+      document.getElementById("summary").innerHTML = `
+        <h2 style="font-size:15px;margin:24px 0 4px 0;">Summary</h2>
+        <div class="subtitle">Spot: <strong>$${data.spot.toFixed(2)}</strong> · snapshot ${fmt.iso(data.timestamp)}</div>
+        <table>
+          <thead><tr>
+            <th>Horizon</th><th>Resolved</th><th>Flip today</th>
+            <th>Span used</th><th>Net-GEX@spot</th>
+            <th>Flip <em>h</em>d ago</th><th>Drift</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      `;
+    }
+
+    async function reload() {
+      const symbol = document.getElementById("symbol").value.trim().toUpperCase();
+      const horizons = document.getElementById("horizons").value.trim();
+      const statusEl = document.getElementById("status");
+      const btn = document.getElementById("reload");
+      statusEl.textContent = "Loading…";
+      statusEl.style.color = "#888";
+      btn.disabled = true;
+      try {
+        const data = await fetchTermStructure(symbol, horizons);
+        render(data);
+        statusEl.textContent = "";
+      } catch (e) {
+        statusEl.textContent = e.message;
+        statusEl.style.color = "#d04444";
+        console.error(e);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    document.getElementById("reload").addEventListener("click", reload);
+    document.getElementById("symbol").addEventListener("keydown", e => { if (e.key === "Enter") reload(); });
+    document.getElementById("horizons").addEventListener("keydown", e => { if (e.key === "Enter") reload(); });
+    reload();
+  </script>
+</body>
+</html>

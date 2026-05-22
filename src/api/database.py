@@ -1651,6 +1651,79 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching historical GEX: {e}", exc_info=True)
             raise
 
+    async def get_historical_flips_at_offsets(
+        self,
+        symbol: str,
+        offset_days: List[float],
+    ) -> List[Dict[str, Any]]:
+        """For each offset h (in days), return the persisted gamma flip
+        closest to ``now() - h days`` for ``symbol``.
+
+        Used by ``/api/gex/flip-term-structure`` to overlay "what the
+        flip looked like h days ago" against today's per-horizon
+        resolution.  All persisted rows were written with the production
+        ``GAMMA_PROFILE_DTE_REF_DAYS`` (one scalar per cycle); this
+        endpoint mock approximates a per-horizon historical realization
+        by reading the persisted scalar at each offset.  Apples-to-apples
+        per-horizon history requires persisting per-horizon flips, which
+        is the proper follow-up if the mock proves useful.
+
+        Each result row carries the requested offset so the caller can
+        align it back to its term-structure point.  Snap rule: pick the
+        row with the smallest absolute distance from the target instant
+        within a ±12h window, so a closed-session offset (weekend, holiday)
+        still resolves to a real row instead of dropping out silently.
+        """
+        if not offset_days:
+            return []
+        symbol_upper = symbol.upper()
+        # asyncpg fans the array out into one DISTINCT ON row per offset;
+        # the ±12h band tolerates closed sessions while still failing
+        # closed when a sustained outage means the snap would jump days.
+        query = """
+            WITH targets AS (
+                SELECT unnest($2::float8[]) AS offset_days
+            ),
+            anchored AS (
+                SELECT
+                    t.offset_days,
+                    (NOW() - (t.offset_days || ' days')::interval) AS target_ts
+                FROM targets t
+            ),
+            picks AS (
+                SELECT DISTINCT ON (a.offset_days)
+                    a.offset_days,
+                    a.target_ts,
+                    gs.timestamp           AS realized_ts,
+                    gs.gamma_flip_point    AS flip,
+                    gs.gamma_flip_span_used,
+                    gs.flip_distance,
+                    EXTRACT(EPOCH FROM (gs.timestamp - a.target_ts)) AS skew_seconds
+                FROM anchored a
+                LEFT JOIN LATERAL (
+                    SELECT *
+                    FROM gex_summary
+                    WHERE underlying = $1
+                      AND timestamp BETWEEN a.target_ts - INTERVAL '12 hours'
+                                        AND a.target_ts + INTERVAL '12 hours'
+                      AND gamma_flip_point IS NOT NULL
+                    ORDER BY ABS(EXTRACT(EPOCH FROM (timestamp - a.target_ts)))
+                    LIMIT 1
+                ) gs ON TRUE
+                ORDER BY a.offset_days, gs.timestamp
+            )
+            SELECT *
+            FROM picks
+            ORDER BY offset_days
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol_upper, [float(h) for h in offset_days])
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error fetching historical flips at offsets: {e}", exc_info=True)
+            raise
+
     # ========================================================================
     # Options Flow Queries (from views)
     # ========================================================================
