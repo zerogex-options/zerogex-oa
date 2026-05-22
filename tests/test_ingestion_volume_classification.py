@@ -202,3 +202,95 @@ def test_accumulator_ingest_is_idempotent_for_same_cumulative():
     assert acc.ask_cum == ask_after_first
     assert acc.mid_cum == mid_after_first
     assert acc.bid_cum == bid_after_first
+
+
+def test_accumulator_reanchors_watermark_on_vendor_cumulative_reset():
+    """TradeStation resets per-contract cumulative volume at 09:30 ET.
+    The accumulator's ET-calendar-day session means the pre-cash watermark
+    (seeded from prior-day residual at 00:00 ET) would otherwise swallow
+    every cash-session trade whose post-reset cumulative is below it.
+    Regression test for the user-reported case: 1214-volume residual at
+    midnight ET, then 200 contracts traded at 09:35/09:48 ET — under the
+    pre-fix writer those 200 trades produced vol_delta=0 forever and
+    storage stayed pinned at 1214 (GREATEST upsert)."""
+    from src.ingestion.main_engine import _FlowAccumulator
+    from datetime import date
+
+    engine = _engine()
+
+    # Accumulator seeded with prior-day residual the way the first
+    # 00:00 ET snapshot would have left it: 1214 cumulative volume, all
+    # classified as ask (last==ask at that pre-cash snapshot).
+    pre_cash_bucket = ET.localize(datetime(2026, 4, 28, 0, 0))
+    acc = _FlowAccumulator(
+        session_date=date(2026, 4, 28),
+        last_volume_cum=1214,
+        ask_cum=1214,
+        mid_cum=0,
+        bid_cum=0,
+        last_bid=5.66,
+        last_ask=5.70,
+        last_mid=5.68,
+    )
+    assert engine._is_opening_auction_bucket(pre_cash_bucket) is False
+
+    # 09:35 ET: user trades 100 contracts.  TS has reset cumulative to 0
+    # at 09:30 ET, so the snapshot's volume is now 100 (not 1314).
+    # Pre-fix: vol_delta = max(100 - 1214, 0) = 0 -> trade dropped.
+    # Post-fix: watermark re-anchors to 0, vol_delta = 100 -> classified.
+    bucket_0935 = ET.localize(datetime(2026, 4, 28, 9, 35))
+    engine._ingest_snapshot_into_accumulator(
+        acc,
+        {"volume": 100, "last": 5.70, "bid": 5.66, "ask": 5.70, "mid": 5.68},
+        bucket_0935,
+    )
+    assert acc.last_volume_cum == 100, "watermark must re-anchor on vendor reset"
+    # Classified totals stay monotonic across the reset so the reader's
+    # LAG against the pre-reset bar surfaces the correct per-bar delta
+    # (1314 - 1214 = 100).  Resetting them would zero the LAG delta.
+    assert acc.ask_cum == 1314, "classified ask_cum must stay monotonic across reset"
+    assert acc.mid_cum == 0
+    assert acc.bid_cum == 0
+
+    # 09:48 ET: user closes the position, +100 more contracts.  TS cum
+    # advances 100 -> 200.  Normal post-reset delta path.
+    bucket_0948 = ET.localize(datetime(2026, 4, 28, 9, 48))
+    engine._ingest_snapshot_into_accumulator(
+        acc,
+        {"volume": 200, "last": 5.70, "bid": 5.66, "ask": 5.70, "mid": 5.68},
+        bucket_0948,
+    )
+    assert acc.last_volume_cum == 200
+    assert acc.ask_cum == 1414, "second 100 contracts must accumulate"
+
+
+def test_accumulator_reset_detection_does_not_fire_on_monotonic_advance():
+    """Sanity: reset detection must only trigger on a true decrease.
+    A normal session advance (curr_vol > watermark) leaves classified
+    totals untouched and just advances the watermark, same as before."""
+    from src.ingestion.main_engine import _FlowAccumulator
+    from datetime import date
+
+    engine = _engine()
+    bucket = ET.localize(datetime(2026, 4, 28, 10, 15))
+    acc = _FlowAccumulator(
+        session_date=date(2026, 4, 28),
+        last_volume_cum=500,
+        ask_cum=300,
+        mid_cum=100,
+        bid_cum=100,
+        last_bid=5.53,
+        last_ask=5.58,
+        last_mid=5.555,
+    )
+
+    engine._ingest_snapshot_into_accumulator(
+        acc,
+        {"volume": 600, "last": 5.58, "bid": 5.53, "ask": 5.58, "mid": 5.555},
+        bucket,
+    )
+    assert acc.last_volume_cum == 600
+    # 100-contract advance classified as ask -> ask_cum 300 -> 400.
+    assert acc.ask_cum == 400
+    assert acc.mid_cum == 100
+    assert acc.bid_cum == 100
