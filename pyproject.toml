@@ -57,6 +57,8 @@ dev = [
     "black>=24.8.0",
     "flake8>=6.0.0",
     "mypy>=1.0.0",
+    "types-pytz>=2023.3",
+    "types-requests>=2.31.0",
     "ipython>=8.0.0",
 ]
 metrics = [

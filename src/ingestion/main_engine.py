@@ -840,7 +840,7 @@ class IngestionEngine:
             bucket_et = pytz.UTC.localize(bucket).astimezone(ET)
         else:
             bucket_et = bucket.astimezone(ET)
-        return bucket_et.date()
+        return bucket_et.date()  # type: ignore[no-any-return]
 
     def _hydrate_flow_accumulator(
         self, option_symbol: str, session_date: _date

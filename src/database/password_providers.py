@@ -35,7 +35,8 @@ def get_db_password() -> Optional[str]:
     logger.debug(f"Using password provider: {provider}")
 
     if provider == "pgpass":
-        return _get_password_from_pgpass()  # type: ignore[func-returns-value]
+        _get_password_from_pgpass()  # raises if .pgpass missing/misconfigured
+        return None
     elif provider == "aws_secrets_manager":
         return _get_password_from_aws_secrets_manager()
     elif provider == "env":

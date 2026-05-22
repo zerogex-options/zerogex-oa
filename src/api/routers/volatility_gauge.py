@@ -46,7 +46,7 @@ ET = pytz.timezone("US/Eastern")
 
 def _session_start(d: date) -> datetime:
     """ET-localized 9:30 AM open for date *d*."""
-    return ET.localize(datetime(d.year, d.month, d.day, 9, 30, 0))
+    return ET.localize(datetime(d.year, d.month, d.day, 9, 30, 0))  # type: ignore[no-any-return]
 
 
 def _two_session_cutoff() -> datetime:

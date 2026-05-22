@@ -680,7 +680,9 @@ def get_market_session(asset_type: Optional[str], price_is_stable: bool = False)
         return "closed"
 
     def _boundary(h: int, m: int, s: int = 0) -> datetime:
-        return _ET.localize(datetime(today.year, today.month, today.day, h, m, s))
+        return _ET.localize(  # type: ignore[no-any-return]
+            datetime(today.year, today.month, today.day, h, m, s)
+        )
 
     pre_open_dt = _boundary(4, 0)
     market_open_dt = _boundary(9, 30)

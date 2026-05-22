@@ -61,7 +61,7 @@ def _parse_hhmm(value: str, default: time) -> time:
 def _to_et(ts: datetime) -> datetime:
     """Coerce any datetime to America/New_York for time-of-day comparisons."""
     if ts.tzinfo is None:
-        return ET.localize(ts)
+        return ET.localize(ts)  # type: ignore[no-any-return]
     return ts.astimezone(ET)
 
 
