@@ -239,7 +239,16 @@ def test_action_card_async_insert_is_idempotent_guarded():
     assert "WHERE NOT EXISTS" in norm
     # asyncpg positional reuse: dedup keys reuse $1 (underlying), $3
     # (pattern), $2 (timestamp) — so the arg count is UNCHANGED at 8.
-    assert "WHERE underlying = $1 AND pattern = $3 AND timestamp = $2" in norm
+    # Each reused parameter MUST carry an explicit type cast in BOTH the
+    # INSERT-SELECT value site and the WHERE comparison site; without
+    # them asyncpg rejects the prepare with ``inconsistent types deduced
+    # for parameter $N`` and the write is silently dropped.  See
+    # tests/test_insert_action_card_param_type_inference.py for a
+    # focused regression that pins this.
+    assert (
+        "WHERE underlying = $1::varchar AND pattern = $3::varchar "
+        "AND timestamp = $2::timestamptz" in norm
+    )
     assert "VALUES ($1," not in norm
     assert len(args) == 8
     assert args[0] == "SPY" and args[2] == "gamma_flip_bounce" and args[1] == ts
