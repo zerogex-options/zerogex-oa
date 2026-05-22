@@ -200,7 +200,7 @@ def backfill_symbol(conn, symbol: str, session_open: datetime, effective_end: da
         """,
         (symbol, session_open, effective_end, fallback_price),
     )
-    return cur.rowcount
+    return cur.rowcount  # type: ignore[no-any-return]
 
 
 def main() -> int:

@@ -82,7 +82,7 @@ async def _get_cached(key: tuple) -> Optional[VolSurfaceResponse]:
     async with _cache_lock:
         entry = _cache.get(key)
         if entry and (datetime.now(timezone.utc) - entry["ts"]).total_seconds() < _CACHE_TTL:
-            return entry["data"]
+            return entry["data"]  # type: ignore[no-any-return]
         if entry is not None:
             # Stale — drop it so it doesn't linger in the oldest slot.
             del _cache[key]
@@ -108,6 +108,7 @@ async def _set_cached(key: tuple, data: VolSurfaceResponse) -> None:
 def get_db() -> DatabaseManager:
     from ..main import db_manager
 
+    assert db_manager is not None, "db_manager not initialized"
     return db_manager
 
 
@@ -140,7 +141,7 @@ def _interpolate_atm_iv(
     # Exact hit
     for k, iv in valid:
         if k == spot:
-            return round(iv, 6)
+            return round(iv, 6)  # type: ignore[no-any-return]
 
     below = [(k, iv) for k, iv in valid if k <= spot]
     above = [(k, iv) for k, iv in valid if k > spot]
@@ -149,13 +150,13 @@ def _interpolate_atm_iv(
         k_lo, iv_lo = below[-1]
         k_hi, iv_hi = above[0]
         if k_hi == k_lo:
-            return round(iv_lo, 6)
+            return round(iv_lo, 6)  # type: ignore[no-any-return]
         frac = (spot - k_lo) / (k_hi - k_lo)
-        return round(iv_lo + (iv_hi - iv_lo) * frac, 6)
+        return round(iv_lo + (iv_hi - iv_lo) * frac, 6)  # type: ignore[no-any-return]
     elif below:
-        return round(below[-1][1], 6)
+        return round(below[-1][1], 6)  # type: ignore[no-any-return]
     else:
-        return round(above[0][1], 6)
+        return round(above[0][1], 6)  # type: ignore[no-any-return]
 
 
 def _compute_25d_skew(rows_for_exp: List[dict]) -> Optional[float]:

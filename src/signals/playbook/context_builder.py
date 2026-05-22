@@ -133,7 +133,7 @@ def _msi_component_snapshot(name: str, components: dict) -> Optional[SignalSnaps
         triggered=False,
         signal=None,
         direction=None,
-        context_values=ctx_vals,
+        context_values=ctx_vals,  # type: ignore[arg-type]
     )
 
 

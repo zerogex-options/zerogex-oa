@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, time, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from src.api.queries._sql_helpers import _bucket_expr, _interval_expr
 from src.symbols import resolve_volume_proxy
+
+if TYPE_CHECKING:
+    from contextlib import AbstractAsyncContextManager
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +30,12 @@ class TechnicalsQueriesMixin:
     VWAP deviation, opening-range breakout, dealer hedging, unusual
     volume spikes, momentum divergence.
     """
+
+    if TYPE_CHECKING:
+        _acquire_connection: Callable[[], AbstractAsyncContextManager[Any]]
+        _cache_get: Callable[[str], Optional[Any]]
+        _cache_set: Callable[[str, Any, float], None]
+        _analytics_cache_ttl_seconds: float
 
     async def get_vwap_deviation(
         self, symbol: str = "SPY", timeframe: str = "1min", window_units: int = 20
@@ -621,7 +630,7 @@ class TechnicalsQueriesMixin:
         cache_key = f"technicals_ts:{symbol}:{intervals}"
         cached = self._cache_get(cache_key)
         if cached is not None:
-            return cached
+            return cached  # type: ignore[no-any-return]
 
         async with self._acquire_connection() as conn:
             row = await conn.fetchrow(

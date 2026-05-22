@@ -53,8 +53,8 @@ class TradeStationAuth:
         self.token_url = self.SANDBOX_TOKEN_URL if sandbox else self.TOKEN_URL
 
         # Cached access token
-        self.access_token = None
-        self.token_expiry = None
+        self.access_token: Optional[str] = None
+        self.token_expiry: Optional[datetime] = None
         self._token_lock = Lock()
         self._last_refresh_epoch: float = 0.0
         # Monotonic counter bumped on every successful refresh.  Callers can
@@ -151,7 +151,7 @@ class TradeStationAuth:
                     logger.info("Access token expired, refreshing...")
             else:
                 if self._load_cached_token_from_disk():
-                    return self.access_token
+                    return self.access_token  # type: ignore[return-value]
                 logger.info("No cached token, obtaining new access token...")
 
             return self._refresh_access_token()
@@ -223,7 +223,7 @@ class TradeStationAuth:
 
                 # Another process may have refreshed while we waited for the lock.
                 if self._load_cached_token_from_disk():
-                    return self.access_token
+                    return self.access_token  # type: ignore[return-value]
 
                 # Make refresh token request to https://signin.tradestation.com/oauth/token
                 # (or for sandbox: https://sim-signin.tradestation.com/oauth/token)
@@ -263,7 +263,7 @@ class TradeStationAuth:
                 logger.info(f"✅ Access token refreshed successfully (expires in {expires_in}s)")
                 logger.debug(f"Token expiry set to: {self.token_expiry}")
 
-                return self.access_token
+                return self.access_token  # type: ignore[return-value]
 
         except requests.exceptions.Timeout:
             logger.error("Token refresh request timed out")

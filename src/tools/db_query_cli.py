@@ -44,7 +44,7 @@ def _f(value: Any, default: float = 0.0) -> float:
 
 def _et(ts) -> str:
     try:
-        return ts.astimezone(ET).strftime("%Y-%m-%d %H:%M")
+        return ts.astimezone(ET).strftime("%Y-%m-%d %H:%M")  # type: ignore[no-any-return]
     except Exception:
         return str(ts)
 
@@ -109,7 +109,7 @@ async def _flow_buying_pressure(db: DatabaseManager, symbol: str, limit: int) ->
         ]
         for r in rows
     ]
-    _print_table(headers, table)
+    _print_table(headers, table)  # type: ignore[arg-type]
 
 
 async def _max_pain_current(db: DatabaseManager, symbol: str, _limit: int) -> None:
@@ -144,7 +144,7 @@ async def _max_pain_expirations(db: DatabaseManager, symbol: str, _limit: int) -
         ]
         for e in (mp.get("expirations") or [])
     ]
-    _print_table(headers, table)
+    _print_table(headers, table)  # type: ignore[arg-type]
 
 
 async def _max_pain_strikes(db: DatabaseManager, symbol: str, limit: int) -> None:
@@ -174,7 +174,7 @@ async def _max_pain_strikes(db: DatabaseManager, symbol: str, limit: int) -> Non
         for s in strikes
     ]
     print(f"Nearest expiration: {nearest.get('expiration')}")
-    _print_table(headers, table)
+    _print_table(headers, table)  # type: ignore[arg-type]
 
 
 _COMMANDS = {

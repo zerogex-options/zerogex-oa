@@ -78,6 +78,7 @@ def _normalize_signal_score_row(row: dict[str, Any]) -> dict[str, Any]:
 def get_db() -> DatabaseManager:
     from ..main import db_manager
 
+    assert db_manager is not None, "db_manager not initialized"
     return db_manager
 
 

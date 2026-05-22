@@ -87,6 +87,7 @@ class ZeroDteImbalanceDriftPattern(PatternBase):
         odpi = ctx.signal("0dte_position_imbalance")
         # _check_triggers guarantees odpi is triggered with sufficient score
         # and a real zero_dte flow source.
+        assert odpi is not None
         drift: DriftDirection = "bullish" if odpi.score > 0 else "bearish"
 
         close = ctx.close
@@ -285,7 +286,7 @@ class ZeroDteImbalanceDriftPattern(PatternBase):
 
     @staticmethod
     def _zero_dte_expiry(ctx: PlaybookContext) -> str:
-        return ctx.et_date.isoformat()
+        return ctx.et_date.isoformat()  # type: ignore[no-any-return]
 
     @staticmethod
     def _compose_rationale(

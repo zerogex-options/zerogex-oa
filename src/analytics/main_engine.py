@@ -286,7 +286,7 @@ class AnalyticsEngine:
             self._SNAPSHOT_QUERY,
             (self.db_symbol, timestamp, lookback_start, min_expiration, row_cap),
         )
-        return cursor.fetchall()
+        return cursor.fetchall()  # type: ignore[no-any-return]
 
     def _get_snapshot(self) -> Optional[Dict[str, Any]]:
         """Fetch latest timestamp, underlying price, and option data.
@@ -487,7 +487,7 @@ class AnalyticsEngine:
                         rows = self._run_snapshot_query(
                             cursor,
                             timestamp,
-                            self.snapshot_cold_start_lookback_hours,
+                            self.snapshot_cold_start_lookback_hours,  # type: ignore[arg-type]
                             min_expiration,
                             snapshot_row_cap,
                             statement_timeout_ms=self.snapshot_cold_start_statement_timeout_ms,
@@ -518,7 +518,7 @@ class AnalyticsEngine:
                         rows = self._run_snapshot_query(
                             cursor,
                             timestamp,
-                            self.snapshot_lookback_hours,
+                            self.snapshot_lookback_hours,  # type: ignore[arg-type]
                             min_expiration,
                             snapshot_row_cap,
                             statement_timeout_ms=steady_state_timeout_ms,
@@ -541,7 +541,7 @@ class AnalyticsEngine:
                     rows = self._run_snapshot_query(
                         cursor,
                         timestamp,
-                        self.snapshot_lookback_hours,
+                        self.snapshot_lookback_hours,  # type: ignore[arg-type]
                         min_expiration,
                         snapshot_row_cap,
                         statement_timeout_ms=steady_state_timeout_ms,
@@ -663,7 +663,7 @@ class AnalyticsEngine:
 
         vanna = -stats.norm.pdf(d1) * d2 / sigma
 
-        return vanna
+        return vanna  # type: ignore[no-any-return]
 
     def _calculate_charm(self, S: float, K: float, T: float, r: float, sigma: float) -> float:
         """
@@ -698,7 +698,7 @@ class AnalyticsEngine:
         # Convert to per day
         charm_per_day = charm / 365.0
 
-        return charm_per_day
+        return charm_per_day  # type: ignore[no-any-return]
 
     def _calculate_bs_gamma(self, S, K: float, T: float, r: float, sigma: float):
         """Black-Scholes gamma (q=0; identical for calls and puts).
@@ -777,7 +777,7 @@ class AnalyticsEngine:
         _tte_cache: Dict = {}
 
         # Group by strike and expiration
-        strike_data = defaultdict(lambda: {"calls": [], "puts": []})
+        strike_data = defaultdict(lambda: {"calls": [], "puts": []})  # type: ignore[var-annotated]
 
         for opt in options:
             key = (opt["strike"], opt["expiration"])
@@ -991,7 +991,7 @@ class AnalyticsEngine:
             return None
         max_pain_strike = min(strike_payouts.items(), key=lambda x: x[1])[0]
 
-        return max_pain_strike
+        return max_pain_strike  # type: ignore[no-any-return]
 
     def _calculate_max_pain_by_expiration(self, options: List[Dict[str, Any]]) -> Dict[Any, float]:
         """Return ``{expiration: max_pain_strike}`` for every expiration.
@@ -1718,7 +1718,7 @@ class AnalyticsEngine:
 
         if not gex_by_strike:
             logger.warning("No GEX data to summarize")
-            return None
+            return None  # type: ignore[return-value]
 
         # Find max gamma strike.  Each gex_by_strike row is one
         # (strike, expiration) pair; aggregate net_gex by strike across
@@ -2278,7 +2278,7 @@ class AnalyticsEngine:
             )
             prem_mode = "tier"
 
-        return vol_tiers, prem_tiers, f"vol={vol_mode},prem={prem_mode}"
+        return vol_tiers, prem_tiers, f"vol={vol_mode},prem={prem_mode}"  # type: ignore[return-value]
 
     def _fetch_smart_money_p95(self, cursor) -> Tuple[Optional[float], Optional[float]]:
         """Read rolling p95(volume_delta) / p95(premium) for this symbol

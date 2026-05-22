@@ -111,9 +111,15 @@ class StrategyBuilder:
         iv_rank = self._clamp(float(market_ctx.get("iv_rank") or 0.5), 0.0, 1.0)
         expansion = self._vol_expansion_readiness(
             float(market_ctx.get("net_gex") or 0.0),
-            spot=(float(market_ctx.get("close")) if market_ctx.get("close") is not None else None),
+            spot=(
+                float(market_ctx.get("close"))  # type: ignore[arg-type]
+                if market_ctx.get("close") is not None
+                else None
+            ),
             total_oi=(
-                int(market_ctx.get("total_oi")) if market_ctx.get("total_oi") is not None else None
+                int(market_ctx.get("total_oi"))  # type: ignore[arg-type]
+                if market_ctx.get("total_oi") is not None
+                else None
             ),
         )
         direction_signal = self._direction_signal(market_ctx.get("recent_closes") or [])
@@ -147,7 +153,7 @@ class StrategyBuilder:
             "premium_sell": premium_sell_score,
             "calendar": calendar_score,
         }
-        regime = max(regime_scores, key=regime_scores.get)
+        regime = max(regime_scores, key=regime_scores.get)  # type: ignore[arg-type]
         regime_score = float(regime_scores[regime])
 
         optimizer_direction = score_direction

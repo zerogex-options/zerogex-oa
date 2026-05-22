@@ -173,7 +173,7 @@ class IVCalculator:
         else:  # Put
             price = K * np.exp(-r * T) * stats.norm.cdf(-d2) - S * stats.norm.cdf(-d1)
 
-        return price
+        return price  # type: ignore[no-any-return]
 
     def _vega(self, S: float, K: float, T: float, r: float, sigma: float) -> float:
         """
@@ -186,7 +186,7 @@ class IVCalculator:
         d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
         vega = S * stats.norm.pdf(d1) * np.sqrt(T)
 
-        return vega
+        return vega  # type: ignore[no-any-return]
 
     def calculate_iv(
         self,
@@ -411,17 +411,23 @@ class IVCalculator:
                 bid,
                 ask,
                 underlying_price,
-                strike,
-                expiration,
-                option_type,
-                timestamp,
+                strike,  # type: ignore[arg-type]
+                expiration,  # type: ignore[arg-type]
+                option_type,  # type: ignore[arg-type]
+                timestamp,  # type: ignore[arg-type]
                 risk_free_rate,
             )
 
         # Priority 2: Use last price
         if not calculated_iv and last and last > 0:
             calculated_iv = self.calculate_iv(
-                last, underlying_price, strike, expiration, option_type, timestamp, risk_free_rate
+                last,
+                underlying_price,
+                strike,  # type: ignore[arg-type]
+                expiration,  # type: ignore[arg-type]
+                option_type,  # type: ignore[arg-type]
+                timestamp,  # type: ignore[arg-type]
+                risk_free_rate,
             )
 
         if calculated_iv:

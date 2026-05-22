@@ -66,7 +66,7 @@ class SignalEngineService:
             except Exception as exc:
                 logger.error("SignalEngineService cycle failed: %s", exc, exc_info=True)
             elapsed = time.time() - started
-            sleep_for = max(1.0, self.interval_seconds - elapsed)
+            sleep_for = max(1.0, self.interval_seconds - elapsed)  # type: ignore[assignment]
             time.sleep(sleep_for)
 
 

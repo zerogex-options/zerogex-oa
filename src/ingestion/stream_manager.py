@@ -753,7 +753,7 @@ class StreamManager:
         self,
         client: TradeStationClient,
         underlying: str = "SPY",
-        db_underlying: str = None,
+        db_underlying: str = None,  # type: ignore[assignment]
         num_expirations: int = 3,
         num_strikes: int = 10,
     ):
@@ -882,7 +882,7 @@ class StreamManager:
             if bar_data:
                 price = bar_data["close"]
                 logger.debug(f"Current {self.underlying} price: ${price:.2f}")
-                return price
+                return price  # type: ignore[no-any-return]
 
             return None
 
@@ -1252,7 +1252,7 @@ class StreamManager:
 
             open_interest = safe_int(
                 raw.get("DailyOpenInterest"),
-                default=None,
+                default=None,  # type: ignore[arg-type]
                 field_name="DailyOpenInterest",
             )
             if open_interest is None:
@@ -1429,6 +1429,7 @@ class StreamManager:
                         datetime.now(ET), SESSION_TEMPLATE, self.db_underlying
                     )
 
+                    assert self._underlying_accumulator is not None
                     # Dead reader thread during the live window: recover
                     # the underlying stream only. The options stream is
                     # independent and may be healthy; restarting it would
@@ -1560,6 +1561,7 @@ class StreamManager:
                         _underlying_restart_backed_off = False
 
                     # Drain only option contracts that changed since last cycle.
+                    assert self._accumulator is not None
                     changed = self._accumulator.drain()
                     if changed:
                         option_results = self._yield_option_snapshot(changed)
@@ -1626,6 +1628,8 @@ class StreamManager:
                     if iteration % _METRICS_LOG_INTERVAL == 0:
                         elapsed = time.monotonic() - _last_metrics_time
                         cycle_ms = (time.monotonic() - cycle_start) * 1000
+                        assert self._accumulator is not None
+                        assert self._underlying_accumulator is not None
                         logger.info(
                             f"[METRICS] last {_METRICS_LOG_INTERVAL} cycles in {elapsed:.1f}s | "
                             f"option_batches={_total_option_batches} "

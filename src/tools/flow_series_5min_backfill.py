@@ -106,7 +106,7 @@ def _upsert_window(cur, symbol: str, session_start: datetime, session_end: datet
             "expirations": None,
         },
     )
-    return cur.rowcount
+    return cur.rowcount  # type: ignore[no-any-return]
 
 
 def backfill_symbol(conn, symbol: str, explicit_date: Optional[str]) -> int:

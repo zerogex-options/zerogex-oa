@@ -38,11 +38,11 @@ Notes on the formula choice:
 
 from __future__ import annotations
 
-from typing import Iterable, Mapping, Optional, Tuple
+from typing import Any, Iterable, Mapping, Optional, Tuple
 
 
 def compute_call_put_walls(
-    gex_by_strike: Iterable[Mapping[str, object]],
+    gex_by_strike: Iterable[Mapping[str, Any]],
     spot_price: float,
 ) -> Tuple[Optional[float], Optional[float]]:
     """Return ``(call_wall, put_wall)`` from per-strike gamma rows.

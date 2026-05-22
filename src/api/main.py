@@ -58,6 +58,18 @@ logger = get_logger(__name__)
 db_manager: Optional[DatabaseManager] = None
 
 
+def _db() -> DatabaseManager:
+    """Return the initialized db_manager.
+
+    Endpoint handlers run after the lifespan startup hook has set
+    ``db_manager``; this helper narrows the Optional for type-checkers and
+    raises a clear error if called before initialization.
+    """
+    if db_manager is None:
+        raise RuntimeError("db_manager not initialized")
+    return db_manager
+
+
 def _parse_cors_origins(raw_origins: Optional[str]) -> List[str]:
     """Parse comma-separated origins from env var into a normalized list.
 
@@ -274,7 +286,7 @@ async def health_check():
 @handle_api_errors("GET /api/gex/summary")
 async def get_gex_summary(symbol: str = Query(default="SPY")):
     """Get latest GEX summary"""
-    data = await db_manager.get_latest_gex_summary(symbol)
+    data = await _db().get_latest_gex_summary(symbol)
     if not data:
         raise HTTPException(status_code=404, detail="No GEX data available")
     return GEXSummary(**data)
@@ -299,7 +311,7 @@ async def get_gex_by_strike(
     - sort_by=distance: Returns strikes closest to current spot price (default)
     - sort_by=impact: Returns strikes with highest absolute net GEX (like 'make gex-strikes')
     """
-    data = await db_manager.get_gex_by_strike(symbol, limit, sort_by)
+    data = await _db().get_gex_by_strike(symbol, limit, sort_by)
     return [GEXByStrike(**row) for row in data]
 
 
@@ -317,9 +329,7 @@ async def get_historical_gex(
         start_dt = datetime.fromisoformat(start_date) if start_date else None
         end_dt = datetime.fromisoformat(end_date) if end_date else None
 
-        data = await db_manager.get_historical_gex(
-            symbol, start_dt, end_dt, window_units, timeframe
-        )
+        data = await _db().get_historical_gex(symbol, start_dt, end_dt, window_units, timeframe)
         return [GEXSummary(**row) for row in data]
     except HTTPException:
         raise
@@ -338,7 +348,7 @@ async def get_gex_heatmap(
     window_units: int = Query(default=60, ge=1, le=300),
 ):
     """Get GEX heatmap data (strike x time)"""
-    data = await db_manager.get_gex_heatmap(symbol, timeframe, window_units)
+    data = await _db().get_gex_heatmap(symbol, timeframe, window_units)
     return data or []
 
 
@@ -374,7 +384,7 @@ async def get_flow_by_contract(
     session=prior returns the previous full session. Pass intervals=N to
     limit the response to the most recent N 5-minute buckets.
     """
-    data = await db_manager.get_flow(symbol, session, intervals=intervals)
+    data = await _db().get_flow(symbol, session, intervals=intervals)
     return [FlowPoint(**row) for row in data]
 
 
@@ -538,7 +548,7 @@ async def get_flow_series(
     strikes_list = _parse_flow_strikes(strikes)
     expirations_list = _parse_flow_expirations(expirations)
 
-    rows = await db_manager.get_flow_series(
+    rows = await _db().get_flow_series(
         symbol=normalized,
         session=session,
         strikes=strikes_list,
@@ -569,7 +579,7 @@ async def get_flow_contracts(
             detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
         )
 
-    result = await db_manager.get_flow_contracts(symbol=normalized, session=session)
+    result = await _db().get_flow_contracts(symbol=normalized, session=session)
     if result is None:
         raise HTTPException(status_code=404, detail="symbol not found")
     return FlowContractsResponse(**result)
@@ -586,7 +596,7 @@ async def get_smart_money_flow(
     Session runs 07:15–16:15 ET. session=current returns today's open session
     (or most recent if closed); session=prior returns the previous full session.
     """
-    data = await db_manager.get_smart_money_flow(symbol, session, min(limit, 50))
+    data = await _db().get_smart_money_flow(symbol, session, min(limit, 50))
     return [SmartMoneyFlowPoint(**row) for row in data]
 
 
@@ -598,7 +608,7 @@ async def get_flow_buying_pressure(
     symbol: str = Query(default="SPY"), limit: int = Query(default=20, ge=1, le=500)
 ):
     """Get underlying buying/selling pressure"""
-    data = await db_manager.get_flow_buying_pressure(symbol, limit)
+    data = await _db().get_flow_buying_pressure(symbol, limit)
     return [FlowBuyingPressurePoint(**row) for row in data] if data else []
 
 
@@ -727,7 +737,7 @@ def get_market_session(asset_type: Optional[str], price_is_stable: bool = False)
 async def get_current_quote(symbol: str = Query(default="SPY")):
     """Get current underlying quote"""
     try:
-        data = await db_manager.get_latest_quote(symbol)
+        data = await _db().get_latest_quote(symbol)
         if not data:
             raise HTTPException(status_code=404, detail="No quote data available")
 
@@ -766,7 +776,7 @@ async def get_session_closes(symbol: str = Query(default="SPY")):
       on the most recent completed trading day).
     - prior_session_close: the session close immediately before current.
     """
-    data = await db_manager.get_session_closes(symbol)
+    data = await _db().get_session_closes(symbol)
     if not data:
         raise HTTPException(status_code=404, detail="No session close data available")
     return SessionCloses(**data)
@@ -786,9 +796,7 @@ async def get_historical_quotes(
         start_dt = datetime.fromisoformat(start_date) if start_date else None
         end_dt = datetime.fromisoformat(end_date) if end_date else None
 
-        data = await db_manager.get_historical_quotes(
-            symbol, start_dt, end_dt, window_units, timeframe
-        )
+        data = await _db().get_historical_quotes(symbol, start_dt, end_dt, window_units, timeframe)
         return [UnderlyingQuote(**row) for row in data]
     except HTTPException:
         raise
@@ -810,7 +818,7 @@ async def get_option_quote(
 ):
     """Get the most recent quote for a specific option contract"""
     try:
-        data = await db_manager.get_option_quote(underlying, strike, expiration, type)
+        data = await _db().get_option_quote(underlying, strike, expiration, type)
         if not data:
             raise HTTPException(status_code=404, detail="No option quote data available")
         return OptionQuote(**data)
@@ -833,7 +841,7 @@ async def get_open_interest(
     Returns one record per (strike, expiration, option_type) from the most recent
     option chain snapshot, ordered by expiration, strike, and option type.
     """
-    data = await db_manager.get_open_interest(underlying)
+    data = await _db().get_open_interest(underlying)
     if not data or not data.get("contracts"):
         raise HTTPException(status_code=404, detail="No open interest data available")
     return OpenInterestResponse(
@@ -851,7 +859,7 @@ async def get_max_pain_timeseries(
     window_units: int = Query(default=90, ge=1, le=300),
 ):
     """Get max pain over time aggregated by timeframe."""
-    data = await db_manager.get_max_pain_timeseries(symbol, timeframe, window_units)
+    data = await _db().get_max_pain_timeseries(symbol, timeframe, window_units)
     return [MaxPainTimeseriesPoint(**row) for row in data]
 
 
@@ -861,7 +869,7 @@ async def get_max_pain_current(
     symbol: str = Query(default="SPY"), strike_limit: int = Query(default=200, ge=10, le=1000)
 ):
     """Get current max pain and strike-by-strike call/put payout notional."""
-    data = await db_manager.get_max_pain_current(symbol, strike_limit)
+    data = await _db().get_max_pain_current(symbol, strike_limit)
     if not data:
         raise HTTPException(status_code=404, detail="No max pain data available")
     return MaxPainCurrent(**data)
@@ -950,7 +958,7 @@ async def get_technicals(
             detail="symbol must match [A-Z.]{1,10} (letters and dots only, up to 10 chars)",
         )
 
-    result = await db_manager.get_technicals_timeseries(normalized, intervals=intervals)
+    result = await _db().get_technicals_timeseries(normalized, intervals=intervals)
     if result is None:
         raise HTTPException(status_code=404, detail="symbol not found")
     return result
@@ -964,7 +972,7 @@ async def get_vwap_deviation(
     window_units: int = Query(default=20, ge=1, le=90),
 ):
     """Get VWAP deviation for mean reversion signals"""
-    return await db_manager.get_vwap_deviation(symbol, timeframe, window_units)
+    return await _db().get_vwap_deviation(symbol, timeframe, window_units)
 
 
 @app.get("/api/technicals/opening-range", tags=["Technicals"])
@@ -975,7 +983,7 @@ async def get_opening_range(
     window_units: int = Query(default=20, ge=1, le=90),
 ):
     """Get opening range breakout status"""
-    return await db_manager.get_opening_range_breakout(symbol, timeframe, window_units)
+    return await _db().get_opening_range_breakout(symbol, timeframe, window_units)
 
 
 @app.get("/api/technicals/dealer-hedging", tags=["Technicals"])
@@ -993,7 +1001,7 @@ async def get_dealer_hedging(symbol: str = Query(default="SPY")):
 
     Returns at most one row per symbol — this is not a timeseries.
     """
-    return await db_manager.get_dealer_hedging_pressure(symbol)
+    return await _db().get_dealer_hedging_pressure(symbol)
 
 
 @app.get("/api/technicals/volume-spikes", tags=["Technicals"])
@@ -1002,7 +1010,7 @@ async def get_volume_spikes(
     symbol: str = Query(default="SPY"), limit: int = Query(default=20, le=100)
 ):
     """Get unusual volume spikes"""
-    return await db_manager.get_unusual_volume_spikes(symbol, limit)
+    return await _db().get_unusual_volume_spikes(symbol, limit)
 
 
 @app.get(
@@ -1017,7 +1025,7 @@ async def get_momentum_divergence(
     window_units: int = Query(default=20, ge=1, le=90),
 ):
     """Get momentum divergence signals"""
-    data = await db_manager.get_momentum_divergence(symbol, timeframe, window_units)
+    data = await _db().get_momentum_divergence(symbol, timeframe, window_units)
     return [MomentumDivergencePoint(**row) for row in data]
 
 

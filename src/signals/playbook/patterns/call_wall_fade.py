@@ -87,7 +87,7 @@ class CallWallFadePattern(PatternBase):
         sigma = _realized_sigma_30min(ctx.market.recent_closes)
 
         # 2) Instrument selection.
-        wall_strike = _round_to_strike(call_wall, 1.0)
+        wall_strike = _round_to_strike(call_wall, 1.0)  # type: ignore[arg-type]
         expiry = self._zero_dte_expiry(ctx)
         if sigma > _VOL_DEBIT_SWITCH:
             action = ActionEnum.BUY_PUT_DEBIT
@@ -266,7 +266,7 @@ class CallWallFadePattern(PatternBase):
     def _zero_dte_expiry(ctx: PlaybookContext) -> str:
         # Use the date in ET so an after-hours UTC ts still maps to the
         # right session expiry.
-        return ctx.et_date.isoformat()
+        return ctx.et_date.isoformat()  # type: ignore[no-any-return]
 
     @staticmethod
     def _compose_rationale(

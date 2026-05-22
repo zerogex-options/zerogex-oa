@@ -599,8 +599,8 @@ class PositionOptimizerEngine:
         bid = row["bid"]
         ask = row["ask"]
         if bid > 0 and ask > 0:
-            return (bid + ask) / 2.0
-        return max(row.get("last", 0.0), ask, bid, 0.0)
+            return (bid + ask) / 2.0  # type: ignore[no-any-return]
+        return max(row.get("last", 0.0), ask, bid, 0.0)  # type: ignore[no-any-return]
 
     @staticmethod
     def _clamp(value: float, low: float, high: float) -> float:

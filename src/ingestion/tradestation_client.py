@@ -136,7 +136,7 @@ class TradeStationClient:
             except Exception as e:
                 logger.warning("API-call window writer raised: %s", e)
 
-    def _request(
+    def _request(  # type: ignore[return]
         self,
         method: str,
         endpoint: str,
@@ -186,7 +186,7 @@ class TradeStationClient:
 
                 result = response.json()
                 logger.debug(f"Response: {json.dumps(result, indent=2)[:1000]}...")
-                return result
+                return result  # type: ignore[no-any-return]
 
             # Handle expired/invalid token - force refresh and retry once
             if response.status_code == 401:
@@ -309,7 +309,7 @@ class TradeStationClient:
             line = self._next_stream_json_line(stream_key, state)
             if line is None:
                 return {}
-            return json.loads(line)
+            return json.loads(line)  # type: ignore[no-any-return]
         except StopIteration:
             # Stream endpoints may rotate/terminate connections. Treat this as a
             # normal reconnect event instead of warning-level noise.
@@ -675,7 +675,7 @@ class TradeStationClient:
         logger.info(f"Searching symbols: {search}")
         params = {"search": search}
         result = self._request("GET", "marketdata/symbols/search", params=params)
-        return result.get("Symbols", [])
+        return result.get("Symbols", [])  # type: ignore[no-any-return]
 
     def get_market_depth_quotes(self, symbols: Union[str, List[str]]) -> Dict[str, Any]:
         """Get Level 2 market depth quotes"""

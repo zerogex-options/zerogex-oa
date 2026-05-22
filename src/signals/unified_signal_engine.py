@@ -1297,7 +1297,7 @@ class UnifiedSignalEngine:
             elapsed = (current_ts - last_persist_ts).total_seconds()
         except (TypeError, AttributeError):
             return True
-        return elapsed >= cls._HEARTBEAT_SECONDS
+        return elapsed >= cls._HEARTBEAT_SECONDS  # type: ignore[no-any-return]
 
     def _evaluate_playbook(
         self,

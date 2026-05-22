@@ -1364,7 +1364,7 @@ class PortfolioEngine:
             target_direction = target.direction if target.target_positions else "neutral"
 
             action = "held"
-            action_detail: dict = {}
+            action_detail: dict = {}  # type: ignore[no-redef]
 
             # CASE A: target is 100% cash
             if not target.target_positions:
@@ -1711,7 +1711,7 @@ class PortfolioEngine:
             ),
         )
         # Commit is deferred to reconcile() so the entire cycle is atomic.
-        return cur.rowcount > 0
+        return cur.rowcount > 0  # type: ignore[no-any-return]
 
     # ------------------------------------------------------------------
     # _update_trade_mark

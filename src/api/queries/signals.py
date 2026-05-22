@@ -17,10 +17,12 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timedelta, date, time
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 if TYPE_CHECKING:
+    from contextlib import AbstractAsyncContextManager
+
     import asyncpg
 
 logger = logging.getLogger(__name__)
@@ -69,6 +71,12 @@ class SignalsQueriesMixin:
     ``self`` when mixed in.  See module docstring for the required
     instance-level interface.
     """
+
+    if TYPE_CHECKING:
+        _acquire_connection: Callable[[], AbstractAsyncContextManager[Any]]
+        _cache_get: Callable[[str], Optional[Any]]
+        _cache_set: Callable[[str, Any, float], None]
+        _confluence_matrix_cache_ttl_seconds: float
 
     async def _get_component_score_history(
         self,
@@ -610,22 +618,22 @@ class SignalsQueriesMixin:
                         "inputs": ctx,
                         "horizon": horizon,
                         "close": (
-                            float(row.get("close_at_timestamp"))
+                            float(row.get("close_at_timestamp"))  # type: ignore[arg-type]
                             if row.get("close_at_timestamp") is not None
                             else None
                         ),
                         "horizon_close": (
-                            float(row.get("close_at_horizon"))
+                            float(row.get("close_at_horizon"))  # type: ignore[arg-type]
                             if row.get("close_at_horizon") is not None
                             else None
                         ),
                         "realized_return": (
                             round(
                                 (
-                                    float(row.get("close_at_horizon"))
-                                    - float(row.get("close_at_timestamp"))
+                                    float(row.get("close_at_horizon"))  # type: ignore[arg-type]
+                                    - float(row.get("close_at_timestamp"))  # type: ignore[arg-type]
                                 )
-                                / float(row.get("close_at_timestamp")),
+                                / float(row.get("close_at_timestamp")),  # type: ignore[arg-type]
                                 6,
                             )
                             if row.get("close_at_timestamp")
@@ -680,7 +688,7 @@ class SignalsQueriesMixin:
         )
         cached = self._cache_get(cache_key)
         if cached is not None:
-            return cached
+            return cached  # type: ignore[no-any-return]
 
         component_order = list(component_names)
 

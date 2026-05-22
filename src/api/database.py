@@ -477,6 +477,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             pool = self.pool
             if not self._pool_is_usable(pool):
                 raise RuntimeError("Database pool is unavailable or closing")
+            assert pool is not None  # _pool_is_usable returned True
             try:
                 conn = await pool.acquire()
                 return conn, pool
@@ -1308,7 +1309,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         cache_key = f"latest_gex_summary:{symbol}"
         cached = self._cache_get(cache_key)
         if cached is not None:
-            return cached
+            return cached  # type: ignore[no-any-return]
 
         # Call/Put Walls are persisted to ``gex_summary`` by the Analytics
         # Engine using the canonical definition in
@@ -1455,7 +1456,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         cache_key = f"gex_by_strike:{symbol}:{limit}:{sort_by}"
         cached = self._cache_get(cache_key)
         if cached is not None:
-            return cached
+            return cached  # type: ignore[no-any-return]
 
         # `order_clause` is a validated literal from the allowlist; raises
         # ValueError on unknown sort_by. Runtime values use $1..$N.
@@ -1673,7 +1674,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         cache_key = f"flow:{symbol}:{session}:{intervals_key}"
         cached = self._cache_get(cache_key)
         if cached is not None:
-            return cached
+            return cached  # type: ignore[no-any-return]
 
         session_start, session_end = _get_flow_session_bounds(session)
 
@@ -1854,7 +1855,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             cache_key = f"flow_series:{symbol}:{session}:{strikes_key}:{exps_key}"
             cached = self._cache_get(cache_key)
             if cached is not None:
-                return cached
+                return cached  # type: ignore[no-any-return]
 
         strikes_arg = [float(s) for s in strikes] if strikes else None
         expirations_arg = list(expirations) if expirations else None
@@ -1868,7 +1869,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 session_start, session_end, has_session_data = resolved
                 if not has_session_data:
                     if use_cache:
-                        self._cache_set(cache_key, [], self._flow_series_endpoint_cache_ttl_seconds)
+                        self._cache_set(cache_key, [], self._flow_series_endpoint_cache_ttl_seconds)  # type: ignore[arg-type]
                     return []
 
                 if (
@@ -1945,7 +1946,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     # most-recent N 5-minute buckets.
                     result = result[:intervals]
                 if use_cache:
-                    self._cache_set(cache_key, result, self._flow_series_endpoint_cache_ttl_seconds)
+                    self._cache_set(cache_key, result, self._flow_series_endpoint_cache_ttl_seconds)  # type: ignore[arg-type]
                 return result
         except asyncio.TimeoutError:
             logger.warning(f"Flow series query timed out for {symbol}, returning empty")
@@ -1967,7 +1968,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         cache_key = f"flow_contracts:{symbol}:{session}"
         cached = self._cache_get(cache_key)
         if cached is not None:
-            return cached
+            return cached  # type: ignore[no-any-return]
 
         try:
             async with self._acquire_connection() as conn:
@@ -1977,7 +1978,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     return None
                 session_start, session_end, has_session_data = resolved
                 if not has_session_data:
-                    payload = {"strikes": [], "expirations": []}
+                    payload = {"strikes": [], "expirations": []}  # type: ignore[var-annotated]
                     self._cache_set(cache_key, payload, self._flow_endpoint_cache_ttl_seconds)
                     return payload
 
@@ -2216,7 +2217,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         cache_key = f"latest_quote:{symbol}"
         cached = self._cache_get(cache_key)
         if cached is not None:
-            return cached
+            return cached  # type: ignore[no-any-return]
 
         query = """
             WITH latest_quote AS (
@@ -2542,7 +2543,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         cache_key = f"max_pain_current:{symbol}"
         cached = self._cache_get(cache_key)
         if cached is not None:
-            return cached
+            return cached  # type: ignore[no-any-return]
 
         snapshot_query = """
             SELECT
@@ -2625,7 +2626,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         cache_key = f"gex_heatmap:{symbol}:{timeframe}:{window_units}"
         cached = self._cache_get(cache_key)
         if cached is not None:
-            return cached
+            return cached  # type: ignore[no-any-return]
         bucket = _bucket_expr(timeframe)
         step_interval = _interval_expr(timeframe)
 
@@ -3051,7 +3052,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             full_cache_key = f"option_contract_full:{option_symbol}:{target_date.isoformat()}"
             cached_full = self._cache_get(full_cache_key)
             if cached_full is not None:
-                return cached_full
+                return cached_full  # type: ignore[no-any-return]
             rows = await self._fetch_option_contract_bars(option_symbol, day_start_et, day_end_et)
             self._cache_set(full_cache_key, rows, 3600.0)
             return rows

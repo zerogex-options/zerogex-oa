@@ -75,7 +75,7 @@ _PRUNE_EVERY_N_UPSERTS = 120
 
 def _parse_bar(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Convert a raw TradeStation bar into our DB row shape, or None if invalid."""
-    ts = safe_datetime(raw.get("TimeStamp"), field_name="TimeStamp")
+    ts = safe_datetime(raw.get("TimeStamp"), field_name="TimeStamp")  # type: ignore[arg-type]
     if ts is None:
         return None
     close = safe_float(raw.get("Close"), field_name="Close")

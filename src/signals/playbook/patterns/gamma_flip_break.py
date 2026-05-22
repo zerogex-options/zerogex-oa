@@ -126,6 +126,7 @@ class GammaFlipBreakPattern(PatternBase):
             return None
 
         flip = ctx.market.gamma_flip
+        assert flip is not None, "_check_triggers ensures gamma_flip is set"
         close = ctx.close
         cross = _detect_cross(ctx.market.recent_closes, flip)
         if cross is None:
@@ -355,7 +356,7 @@ class GammaFlipBreakPattern(PatternBase):
 
     @staticmethod
     def _zero_dte_expiry(ctx: PlaybookContext) -> str:
-        return ctx.et_date.isoformat()
+        return ctx.et_date.isoformat()  # type: ignore[no-any-return]
 
     @staticmethod
     def _compose_rationale(

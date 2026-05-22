@@ -114,7 +114,7 @@ def _compute_db_backoff_seconds(consecutive_failures: int) -> float:
     don't retry in lockstep.
     """
     base = min(2**consecutive_failures, 60)
-    return base + random.uniform(0, base * 0.1)
+    return base + random.uniform(0, base * 0.1)  # type: ignore[no-any-return]
 
 
 def _to_db_float(value: Any) -> Optional[float]:
@@ -599,7 +599,7 @@ class IngestionEngine:
                 continue
 
             pre_symbol = data.get("option_symbol", "unknown")
-            data = self._enrich_with_greeks(data)
+            data = self._enrich_with_greeks(data)  # type: ignore[assignment]
             if data is None:
                 logger.warning(
                     "Dropping option quote after Greeks enrichment returned None: %s",
@@ -1332,10 +1332,10 @@ class IngestionEngine:
             # when a single bad row triggers a whole batch rollback — a
             # 5-symbol sample buries the outlier that caused the failure.
             unique_symbols = {r["option_symbol"] for r in rows}
-            unique_underlyings = sorted({r.get("underlying") for r in rows if r.get("underlying")})
+            unique_underlyings = sorted({r.get("underlying") for r in rows if r.get("underlying")})  # type: ignore[type-var]
             timestamps = [r.get("timestamp") for r in rows if r.get("timestamp") is not None]
-            ts_min = min(timestamps) if timestamps else None
-            ts_max = max(timestamps) if timestamps else None
+            ts_min = min(timestamps) if timestamps else None  # type: ignore[type-var]
+            ts_max = max(timestamps) if timestamps else None  # type: ignore[type-var]
             logger.error(
                 "[CIRCUIT-BREAKER] DB write failed (%d rows, %d unique symbols, "
                 "underlyings=%s, attempt #%d, backoff %.2fs): %s\n"
@@ -1585,9 +1585,9 @@ def main():
         from src.ingestion.api_call_tracker import attach_db_writer
 
         client = TradeStationClient(
-            os.getenv("TRADESTATION_CLIENT_ID"),
-            os.getenv("TRADESTATION_CLIENT_SECRET"),
-            os.getenv("TRADESTATION_REFRESH_TOKEN"),
+            os.getenv("TRADESTATION_CLIENT_ID"),  # type: ignore[arg-type]
+            os.getenv("TRADESTATION_CLIENT_SECRET"),  # type: ignore[arg-type]
+            os.getenv("TRADESTATION_REFRESH_TOKEN"),  # type: ignore[arg-type]
             sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true",
         )
         attach_db_writer(client)

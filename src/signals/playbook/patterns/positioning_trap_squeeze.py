@@ -71,6 +71,7 @@ class PositioningTrapSqueezePattern(PatternBase):
 
         ptrap = ctx.signal("positioning_trap")
         # Squeeze direction is OPPOSITE the crowd: long crowd → bearish squeeze.
+        assert ptrap is not None
         squeeze: SqueezeDirection = "bearish" if ptrap.score > 0 else "bullish"
 
         close = ctx.close
@@ -218,7 +219,7 @@ class PositioningTrapSqueezePattern(PatternBase):
 
     @staticmethod
     def _dte_expiry(ctx: PlaybookContext, days: int) -> str:
-        return (ctx.et_date + timedelta(days=days)).isoformat()
+        return (ctx.et_date + timedelta(days=days)).isoformat()  # type: ignore[no-any-return]
 
 
 PATTERN: PatternBase = PositioningTrapSqueezePattern()

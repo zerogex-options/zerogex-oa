@@ -40,7 +40,7 @@ class NetGexSignComponent(ComponentBase):
         if isinstance(norms, dict):
             v = norms.get("net_gex")
             try:
-                fv = float(v)
+                fv = float(v)  # type: ignore[arg-type]
                 if fv > 0:
                     return fv
             except (TypeError, ValueError):

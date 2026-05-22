@@ -192,7 +192,7 @@ class EODPressureSignal:
             if not isinstance(row, dict):
                 continue
             try:
-                strike = float(row.get("strike"))
+                strike = float(row.get("strike"))  # type: ignore[arg-type]
             except (TypeError, ValueError):
                 continue
             if not (lo <= strike <= hi):
