@@ -867,6 +867,79 @@ def test_gex_summary_marks_flip_unresolved_on_one_sided_chain(caplog):
     )
 
 
+def test_gex_summary_throttles_repeated_unresolved_warnings(caplog):
+    """When the unresolved condition persists across cycles (e.g. SPX
+    morning regime placing the flip beyond ±MAX_FLIP_DISTANCE_PCT for
+    an entire morning), the verbose WARN must NOT fire on every cycle.
+    The first call gets the full diagnostic (state transition), but a
+    second call inside the throttle window stays silent."""
+    import logging
+
+    engine = AnalyticsEngine(underlying="SPY")
+    # Long throttle so the second call in this test definitely lands
+    # inside the window regardless of test-runner wall-clock jitter.
+    engine._gamma_flip_unresolved_warn_throttle_seconds = 3600.0
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
+    exp = datetime(2026, 9, 18).date()
+    spot = 500.0
+    options = [_opt(500.0, "C", oi=5000, iv=0.25, exp=exp, volume=3)]
+    gex_by_strike = [{"strike": 500.0, "net_gex": 1_000_000.0}]
+
+    with caplog.at_level(logging.WARNING):
+        engine._calculate_gex_summary(gex_by_strike, options, spot, ts)
+    first_warns = [
+        r for r in caplog.records
+        if "Gamma flip UNRESOLVED" in r.message and r.levelno == logging.WARNING
+    ]
+    assert len(first_warns) == 1, "first call must emit the verbose WARN"
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        engine._calculate_gex_summary(gex_by_strike, options, spot, ts)
+    repeat_warns = [
+        r for r in caplog.records
+        if "Gamma flip UNRESOLVED" in r.message and r.levelno == logging.WARNING
+    ]
+    assert repeat_warns == [], "second call within throttle window must stay silent"
+
+
+def test_gex_summary_logs_resolved_transition_after_unresolved_period(caplog):
+    """When the chain recovers and a flip resolves after a persistent
+    unresolved period, log an INFO line so the recovery is visible in
+    the analytics-health timeline (mirrors the WARN that opened the
+    unresolved period)."""
+    import logging
+
+    engine = AnalyticsEngine(underlying="SPY")
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
+    exp = datetime(2026, 9, 18).date()
+    spot = 500.0
+
+    # Unresolved cycle: pure-call book, no crossing.
+    unresolved_options = [_opt(500.0, "C", oi=5000, iv=0.25, exp=exp, volume=3)]
+    engine._calculate_gex_summary(
+        [{"strike": 500.0, "net_gex": 1.0}], unresolved_options, spot, ts
+    )
+    assert engine._gamma_flip_unresolved_state is True
+
+    # Resolved cycle: balanced book with a real flip.
+    resolved_options = [
+        _opt(485.0, "P", oi=6000, iv=0.22, exp=exp, volume=10),
+        _opt(520.0, "C", oi=6000, iv=0.22, exp=exp, volume=12),
+    ]
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        summary = engine._calculate_gex_summary(
+            [{"strike": 500.0, "net_gex": 1.0}], resolved_options, spot, ts
+        )
+    assert summary["gamma_flip_point"] is not None
+    assert engine._gamma_flip_unresolved_state is False
+    assert any(
+        "Gamma flip RESOLVED" in r.message and r.levelno == logging.INFO
+        for r in caplog.records
+    )
+
+
 def _full_gex_row(ts):
     return {
         "underlying": "SPY",

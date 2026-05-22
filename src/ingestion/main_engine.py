@@ -775,7 +775,22 @@ class IngestionEngine:
         # visible to operators -- the previous silent fallback let
         # entire contracts route their flow through nearest-neighbor
         # classification with no telemetry.
-        if bid is None or ask is None or ask <= bid:
+        #
+        # A LOCKED market (``bid == ask``) is NOT a degraded quote: it is
+        # a legitimate state for tight ATM and illiquid contracts whose
+        # NBBO momentarily coincides at one tick.  Strict ``ask < bid``
+        # routes only TRULY crossed quotes into the fallback; the locked
+        # case falls through to the band logic below where the
+        # half-spread collapses to zero and the ask/bid thresholds
+        # collapse to the locked price -- ``last > price`` is then
+        # cleanly ask_volume (lift), ``last < price`` is bid_volume
+        # (hit), and ``last == price`` is mid_volume.  Before this gate
+        # was tightened, every locked print routed through
+        # nearest-neighbor, where the three distances are identical and
+        # everything degenerated to mid_volume regardless of trade
+        # direction -- and each first-of-process locked print fired the
+        # WARN above, drowning operators in false data-quality alerts.
+        if bid is None or ask is None or ask < bid:
             # Use getattr/setattr so test fixtures that build the engine
             # via ``IngestionEngine.__new__(...)`` (skipping __init__)
             # don't AttributeError on the counter access.
