@@ -18,6 +18,10 @@ from src.signals.advanced.base import AdvancedSignalResult
 
 _DIRECTION_Z_NORM = 1.0
 _GEX_FLOOR = 0.15
+# Legacy alias retained for tests and importers that pre-date the
+# scale-invariant readiness path; resolves to the same global as the
+# fallback branch in ``_gex_readiness``.
+_GEX_NORM = SIGNAL_GEX_NORMALIZATION
 
 
 class VolExpansionSignal:

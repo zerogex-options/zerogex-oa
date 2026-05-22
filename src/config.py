@@ -16,6 +16,23 @@ load_dotenv()
 _cfg_logger = logging.getLogger(__name__)
 
 
+def _strip_env_value(raw: Optional[str]) -> Optional[str]:
+    """Normalize a raw env-var value before numeric parsing.
+
+    Strips leading/trailing whitespace AND any inline ``# comment`` tail.
+    python-dotenv preserves everything after ``=`` literally (including
+    inline ``# ...`` annotations), so a ``.env`` file with a line like
+    ``KEY=1  # was 2`` would otherwise crash int()/float() with a
+    confusing ValueError on service startup.  ``#`` is never valid in a
+    numeric value, so dropping at the first ``#`` is safe for the
+    helpers that call this.
+    """
+    if raw is None:
+        return None
+    stripped = raw.split("#", 1)[0].strip()
+    return stripped
+
+
 def _getenv_int(
     name: str, default: int, *, min: Optional[int] = None, max: Optional[int] = None
 ) -> int:
@@ -26,16 +43,18 @@ def _getenv_int(
     drive an unreasonable parameter.
     """
     raw = os.getenv(name)
-    if raw is None or raw.strip() == "":
+    cleaned = _strip_env_value(raw)
+    if cleaned is None or cleaned == "":
         value = default
     else:
         try:
-            value = int(raw.strip())
+            value = int(cleaned)
         except (TypeError, ValueError):
             _cfg_logger.error(
-                "Invalid int for env var %s=%r — falling back to default %d",
+                "Invalid int for env var %s=%r (cleaned=%r) — falling back to default %d",
                 name,
                 raw,
+                cleaned,
                 default,
             )
             value = default
@@ -53,16 +72,18 @@ def _getenv_float(
 ) -> float:
     """Fetch a float env var with a clear error on parse failure and optional clamping."""
     raw = os.getenv(name)
-    if raw is None or raw.strip() == "":
+    cleaned = _strip_env_value(raw)
+    if cleaned is None or cleaned == "":
         value = default
     else:
         try:
-            value = float(raw.strip())
+            value = float(cleaned)
         except (TypeError, ValueError):
             _cfg_logger.error(
-                "Invalid float for env var %s=%r — falling back to default %s",
+                "Invalid float for env var %s=%r (cleaned=%r) — falling back to default %s",
                 name,
                 raw,
+                cleaned,
                 default,
             )
             value = default
@@ -128,11 +149,18 @@ def _getenv_float_list(
 
 
 def _getenv_bool(name: str, default: bool) -> bool:
-    """Fetch a boolean env var.  Accepts (case-insensitive) true/false/1/0/yes/no."""
+    """Fetch a boolean env var.  Accepts (case-insensitive) true/false/1/0/yes/no.
+
+    Inline ``# comment`` tails are stripped so an operator with a
+    ``KEY=true  # explanation`` line in .env still gets True (python-dotenv
+    preserves everything after ``=`` literally, otherwise that value would
+    silently fall back to the default + log an error every startup).
+    """
     raw = os.getenv(name)
-    if raw is None:
+    cleaned = _strip_env_value(raw)
+    if cleaned is None:
         return default
-    normalized = raw.strip().lower()
+    normalized = cleaned.lower()
     if normalized in {"true", "1", "yes", "on"}:
         return True
     if normalized in {"false", "0", "no", "off", ""}:

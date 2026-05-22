@@ -129,9 +129,16 @@ def test_first_cycle_uses_cold_start_window_when_data_is_stale(monkeypatch):
 
 def test_first_cycle_skips_cold_start_when_data_is_fresh(monkeypatch):
     """Smart gate: a mid-session restart with live ingestion (fresh newest
-    row) must NOT pay for the wide cold-start scan."""
+    row) must NOT pay for the wide cold-start scan -- the 2h steady-state
+    lookback is correct here.  The buffer pool is still cold from the
+    restart though, so the SAME first cycle DOES get the cold-start
+    statement_timeout budget (see
+    test_analytics_snapshot_steady_state_timeout.py::
+    test_first_cycle_steady_state_uses_cold_start_budget for the
+    converse assertion)."""
     monkeypatch.setenv("ANALYTICS_SNAPSHOT_LOOKBACK_HOURS", "2")
     monkeypatch.setenv("ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS", "96")
+    monkeypatch.setenv("ANALYTICS_SNAPSHOT_COLD_START_STATEMENT_TIMEOUT_MS", "180000")
     engine = AnalyticsEngine(underlying="SPY")
     snapshot_ts = _fresh_ts()
     expiration = snapshot_ts.astimezone(ET).date() + timedelta(days=7)
@@ -141,10 +148,12 @@ def test_first_cycle_skips_cold_start_when_data_is_fresh(monkeypatch):
     with patch.object(main_engine, "db_connection", return_value=cm):
         result = engine._get_snapshot()
     assert result is not None
-    # Steady-state window even though it's the first cycle.
+    # Steady-state WINDOW even though it's the first cycle (data is fresh).
     assert _snapshot_calls(cursor)[0][0][1][2] == snapshot_ts - timedelta(hours=2)
-    # No SET LOCAL override on the cheap path.
-    assert _set_local_calls(cursor) == []
+    # ...but the cold-start BUDGET is applied so a cold buffer pool can warm up.
+    set_local = _set_local_calls(cursor)
+    assert len(set_local) == 1
+    assert set_local[0][0][1] == ("180000",)
     assert engine._snapshot_cold_start_consumed is True
 
 
@@ -233,5 +242,7 @@ def test_cold_start_lookback_floor_is_steady_state_value(monkeypatch):
     monkeypatch.setenv("ANALYTICS_SNAPSHOT_LOOKBACK_HOURS", "12")
     monkeypatch.setenv("ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS", "4")
     engine = AnalyticsEngine(underlying="SPY")
-    assert engine.snapshot_lookback_hours == 12
-    assert engine.snapshot_cold_start_lookback_hours == 12
+    # Lookback values are now floats (so 0.5h / 30 min is configurable);
+    # compare as floats to match.
+    assert engine.snapshot_lookback_hours == 12.0
+    assert engine.snapshot_cold_start_lookback_hours == 12.0

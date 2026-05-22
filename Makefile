@@ -237,6 +237,262 @@ analytics-snapshot-explain: ## EXPLAIN (no ANALYZE) of the _get_snapshot query �
 		"EXPLAIN (VERBOSE) WITH latest_ts AS (SELECT timestamp AS ts FROM option_chains WHERE underlying = '$$UNDERLYING' ORDER BY timestamp DESC LIMIT 1), latest_per_contract AS (SELECT DISTINCT ON (oc.option_symbol) oc.option_symbol, oc.timestamp FROM option_chains oc, latest_ts lt WHERE oc.underlying = '$$UNDERLYING' AND oc.timestamp <= lt.ts AND oc.timestamp >= (lt.ts - ($$LOOKBACK * INTERVAL '1 minute')) AND oc.gamma IS NOT NULL ORDER BY oc.option_symbol, oc.timestamp DESC) SELECT lt.ts, lpc.option_symbol FROM latest_ts lt LEFT JOIN latest_per_contract lpc ON TRUE;" \
 		| $(PSQL) -v ON_ERROR_STOP=0
 
+.PHONY: db-tune-suggest
+db-tune-suggest: ## Print PostgreSQL config recommendations (auto-detects Aurora / RDS PG / self-hosted and adjusts guidance)
+	@echo "$(BLUE)=== PostgreSQL tuning recommendations ===$(NC)"
+	@echo "$(YELLOW)Detects Aurora / RDS PostgreSQL / self-hosted and prints platform-$(NC)"
+	@echo "$(YELLOW)appropriate guidance.  Aurora + RDS PG both reject ALTER SYSTEM SET --$(NC)"
+	@echo "$(YELLOW)config is managed via parameter groups.  Self-hosted uses ALTER SYSTEM.$(NC)"
+	@echo "$(YELLOW)Diagnostic only -- nothing is changed.$(NC)"
+	@echo ""
+	@echo "$(BLUE)[1/5] Detecting environment$(NC)"
+	@IS_AURORA=$$(printf "%s\n" "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE proname = 'aurora_version') AS is_aurora \\gset" "\\echo :is_aurora" | $(PSQL) -tAX 2>/dev/null | tail -1); \
+	IS_RDS=$$(printf "%s\n" "SELECT EXISTS(SELECT 1 FROM pg_settings WHERE name LIKE 'rds.%%') AS is_rds \\gset" "\\echo :is_rds" | $(PSQL) -tAX 2>/dev/null | tail -1); \
+	if [ "$$IS_AURORA" = "t" ] || [ "$$IS_AURORA" = "true" ]; then \
+		echo "  $(GREEN)✓ Aurora PostgreSQL detected$(NC)"; \
+		printf "%s\n" \
+			"SELECT aurora_version() AS aurora_version, current_setting('server_version') AS pg_version;" \
+			| $(PSQL) -v ON_ERROR_STOP=0; \
+		echo "$(YELLOW)  Note: /proc/meminfo on this host is NOT the DB instance's RAM --$(NC)"; \
+		echo "$(YELLOW)  it's the EC2 host running the python services.  Aurora memory is$(NC)"; \
+		echo "$(YELLOW)  determined by the writer-instance class (db.t3.small=2GB,$(NC)"; \
+		echo "$(YELLOW)  db.r5.large=16GB, etc.).  See [4/5] for how to size correctly.$(NC)"; \
+	elif [ "$$IS_RDS" = "t" ] || [ "$$IS_RDS" = "true" ]; then \
+		echo "  $(GREEN)✓ RDS PostgreSQL detected$(NC) (managed Postgres, not Aurora)"; \
+		printf "%s\n" \
+			"SELECT current_setting('server_version') AS pg_version;" \
+			| $(PSQL) -v ON_ERROR_STOP=0; \
+		echo "$(YELLOW)  Note: /proc/meminfo on this host is NOT the DB instance's RAM --$(NC)"; \
+		echo "$(YELLOW)  it's the EC2 host running the python services.  RDS PG memory is$(NC)"; \
+		echo "$(YELLOW)  determined by the instance class (db.t3.small=2GB, db.r5.large=16GB,$(NC)"; \
+		echo "$(YELLOW)  etc.).  See [4/5] for how to size correctly.$(NC)"; \
+	else \
+		echo "  $(GREEN)✓ Self-hosted PostgreSQL$(NC) (ALTER SYSTEM SET available)"; \
+		if [ -r /proc/meminfo ]; then \
+			MEM_KB=$$(awk '/^MemTotal:/ {print $$2}' /proc/meminfo); \
+			MEM_MB=$$((MEM_KB / 1024)); \
+			MEM_GB=$$((MEM_MB / 1024)); \
+			echo "  Host RAM (this host = DB host assumed): $$MEM_GB GB ($$MEM_MB MB)"; \
+		fi; \
+	fi
+	@echo ""
+	@echo "$(BLUE)[2/5] Current PostgreSQL settings$(NC)"
+	@printf "%s\n" \
+		"SELECT name, setting, unit, source, pending_restart FROM pg_settings WHERE name IN ('shared_buffers', 'effective_cache_size', 'work_mem', 'maintenance_work_mem', 'random_page_cost', 'seq_page_cost', 'effective_io_concurrency', 'max_parallel_workers_per_gather', 'max_connections', 'autovacuum_naptime', 'checkpoint_completion_target') ORDER BY name;" \
+		| $(PSQL) -v ON_ERROR_STOP=0
+	@echo ""
+	@echo "$(BLUE)[3/5] Working-set sizing (largest tables)$(NC)"
+	@printf "%s\n" \
+		"SELECT relname AS table, pg_size_pretty(pg_total_relation_size(c.oid)) AS total, pg_size_pretty(pg_relation_size(c.oid)) AS heap, pg_size_pretty(pg_total_relation_size(c.oid) - pg_relation_size(c.oid)) AS indexes FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'r' ORDER BY pg_total_relation_size(c.oid) DESC LIMIT 10;" \
+		| $(PSQL) -v ON_ERROR_STOP=0
+	@echo ""
+	@IS_AURORA=$$(printf "%s\n" "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE proname = 'aurora_version') AS is_aurora \\gset" "\\echo :is_aurora" | $(PSQL) -tAX 2>/dev/null | tail -1); \
+	IS_RDS=$$(printf "%s\n" "SELECT EXISTS(SELECT 1 FROM pg_settings WHERE name LIKE 'rds.%%') AS is_rds \\gset" "\\echo :is_rds" | $(PSQL) -tAX 2>/dev/null | tail -1); \
+	if [ "$$IS_AURORA" = "t" ] || [ "$$IS_AURORA" = "true" ]; then \
+		echo "$(BLUE)[4/5] Aurora-specific: shared_buffers + instance class$(NC)"; \
+		echo "$(YELLOW)Aurora manages shared_buffers automatically via the cluster's DB$(NC)"; \
+		echo "$(YELLOW)CLUSTER Parameter Group; ALTER SYSTEM SET does NOT work for it.$(NC)"; \
+		echo "$(YELLOW)Default formula is ~{DBInstanceClassMemory*3/4}/8KB on r5/r6 classes,$(NC)"; \
+		echo "$(YELLOW)reduced on t3/t4g micro classes.  To verify and (if needed) change:$(NC)"; \
+		echo ""; \
+		echo "  $(GREEN)Console path:$(NC)"; \
+		echo "    1. RDS Console → Databases → click cluster → Configuration tab"; \
+		echo "       → note 'DB cluster parameter group' name."; \
+		echo "    2. If on default.aurora-postgresql<N>, create custom + attach:"; \
+		echo "       Parameter groups → Create → Type=DB Cluster Parameter Group →"; \
+		echo "       Family=aurora-postgresqlN → name 'zerogex-cluster-pg'."; \
+		echo "       Then Databases → Modify cluster → select new group →"; \
+		echo "       Apply immediately."; \
+		echo "    3. Edit → set shared_buffers value → Save → reboot writer."; \
+		echo ""; \
+		echo "$(RED)Sizing reality check:$(NC) the option_chains working set above is ~66 GB."; \
+		echo "  • $(YELLOW)db.t3.small (2 GB RAM)$(NC)  → shared_buffers max ~500 MB → 0.7 % coverage."; \
+		echo "    No amount of config tuning makes a 2 GB instance handle a 66 GB hot table;"; \
+		echo "    every analytics cycle is structurally a cold-cache read.  The fix is upsizing."; \
+		echo "  • $(YELLOW)db.r5.large (16 GB)$(NC)   → ~12 GB shared_buffers → ~18 % coverage."; \
+		echo "    Probably enough for cycle 2+ to stay warm once the analytics interval is tuned."; \
+		echo "  • $(YELLOW)db.r5.xlarge (32 GB)$(NC)  → ~24 GB shared_buffers → ~36 % coverage."; \
+		echo "    Comfortable headroom + room for ingestion bursts."; \
+		echo ""; \
+	elif [ "$$IS_RDS" = "t" ] || [ "$$IS_RDS" = "true" ]; then \
+		echo "$(BLUE)[4/5] RDS PostgreSQL: shared_buffers + instance class$(NC)"; \
+		echo "$(YELLOW)RDS PG manages config via the DB Parameter Group (instance-level --$(NC)"; \
+		echo "$(YELLOW)there is NO cluster parameter group on plain RDS PG, unlike Aurora).$(NC)"; \
+		echo "$(YELLOW)ALTER SYSTEM SET is rejected ('ALTER SYSTEM command is not supported');$(NC)"; \
+		echo "$(YELLOW)you must edit the DB Parameter Group via the Console or AWS CLI.$(NC)"; \
+		echo ""; \
+		echo "  $(GREEN)Console path (no AWS CLI required):$(NC)"; \
+		echo "    1. RDS Console → Databases → click your instance → Configuration tab"; \
+		echo "       → note 'DB parameter group' name."; \
+		echo "    2. If on default.postgresN (AWS-default, not editable):"; \
+		echo "       Parameter groups → Create → Engine type=PostgreSQL →"; \
+		echo "       Family=postgresN → name 'zerogex-pg' → Create."; \
+		echo "       Then Databases → click instance → Modify → DB parameter group"; \
+		echo "       → select 'zerogex-pg' → Continue → Apply immediately → Modify."; \
+		echo "    3. Edit parameters → set static values (e.g. shared_buffers) → Save."; \
+		echo "    4. If 'Pending reboot' badge appears: Actions → Reboot."; \
+		echo "       (no failover reboot needed on single-instance setups; ~60s downtime)"; \
+		echo "    5. Verify: $(YELLOW)make psql -c 'SHOW shared_buffers;'$(NC)"; \
+		echo ""; \
+		echo "$(RED)Sizing reality check:$(NC) the option_chains working set above is ~66 GB."; \
+		echo "  • $(YELLOW)db.t3.small (2 GB RAM)$(NC)  → shared_buffers ~500 MB → 0.7 % coverage."; \
+		echo "    Cold-pool problem is structural at this instance class.  Code-side fixes"; \
+		echo "    (incremental flow_series_snapshot etc.) help more than buffer-pool tuning."; \
+		echo "  • $(YELLOW)db.t3.medium (4 GB)$(NC)   → ~1 GB shared_buffers → 1.5 % coverage."; \
+		echo "  • $(YELLOW)db.r5.large (16 GB)$(NC)   → ~12 GB shared_buffers → ~18 % coverage."; \
+		echo "    Probably enough for cycle 2+ to stay warm at current data volume."; \
+		echo ""; \
+	else \
+		echo "$(BLUE)[4/5] Self-hosted Postgres: shared_buffers sizing$(NC)"; \
+		if [ -r /proc/meminfo ]; then \
+			MEM_KB=$$(awk '/^MemTotal:/ {print $$2}' /proc/meminfo); \
+			MEM_MB=$$((MEM_KB / 1024)); \
+			SB_MB=$$((MEM_MB / 4)); \
+			MWM_MB=$$((MEM_MB / 16)); \
+			[ $$MWM_MB -gt 2048 ] && MWM_MB=2048; \
+			echo "  Recommended shared_buffers       = $${SB_MB} MB   (~25% of RAM)"; \
+			echo "  Recommended maintenance_work_mem = $${MWM_MB} MB"; \
+			echo ""; \
+			echo "  Procedure (needs a Postgres restart):"; \
+			echo "    1. make psql -c \"ALTER SYSTEM SET shared_buffers = '$${SB_MB}MB';\""; \
+			echo "    2. sudo systemctl restart postgresql"; \
+			echo "    3. make psql -c 'SHOW shared_buffers;'  # verify"; \
+		fi; \
+		echo ""; \
+	fi
+	@IS_AURORA=$$(printf "%s\n" "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE proname = 'aurora_version') AS is_aurora \\gset" "\\echo :is_aurora" | $(PSQL) -tAX 2>/dev/null | tail -1); \
+	IS_RDS=$$(printf "%s\n" "SELECT EXISTS(SELECT 1 FROM pg_settings WHERE name LIKE 'rds.%%') AS is_rds \\gset" "\\echo :is_rds" | $(PSQL) -tAX 2>/dev/null | tail -1); \
+	if [ "$$IS_AURORA" = "t" ] || [ "$$IS_AURORA" = "true" ]; then \
+		echo "$(BLUE)[5/5] Aurora: changing dynamic parameters (random_page_cost etc.)$(NC)"; \
+		echo "$(RED)IMPORTANT: Aurora REJECTS ``ALTER SYSTEM SET`` for ALL parameters --$(NC)"; \
+		echo "$(RED)including the dynamic ones.  Use the CLUSTER Parameter Group.$(NC)"; \
+		echo ""; \
+		echo "$(YELLOW)random_page_cost=1.1 is the highest-leverage tweak for this workload:$(NC)"; \
+		echo "$(YELLOW)default 4.0 biases the planner toward big sequential scans (assumes$(NC)"; \
+		echo "$(YELLOW)spinning disk); on Aurora storage ~1.1 is correct, and the plan often$(NC)"; \
+		echo "$(YELLOW)shifts onto smaller selective indexes -- fewer pages touched per cycle.$(NC)"; \
+		echo ""; \
+		echo "  $(GREEN)Console path:$(NC)"; \
+		echo "    RDS Console → Parameter groups → click cluster parameter group →"; \
+		echo "    Edit parameters → set random_page_cost=1.1, effective_io_concurrency=200"; \
+		echo "    → Save.  Dynamic params apply within ~30s, no reboot needed."; \
+		echo ""; \
+		echo "  $(GREEN)CLI path (if aws CLI installed):$(NC)"; \
+		echo "    aws rds modify-db-cluster-parameter-group \\"; \
+		echo "      --db-cluster-parameter-group-name <name> \\"; \
+		echo "      --parameters \\"; \
+		echo "        'ParameterName=random_page_cost,ParameterValue=1.1,ApplyMethod=immediate' \\"; \
+		echo "        'ParameterName=effective_io_concurrency,ParameterValue=200,ApplyMethod=immediate'"; \
+		echo ""; \
+		echo "  $(GREEN)Verify:$(NC) make psql -c \"SHOW random_page_cost; SHOW effective_io_concurrency;\""; \
+	elif [ "$$IS_RDS" = "t" ] || [ "$$IS_RDS" = "true" ]; then \
+		echo "$(BLUE)[5/5] RDS PostgreSQL: changing dynamic parameters (random_page_cost etc.)$(NC)"; \
+		echo "$(RED)IMPORTANT: RDS PG REJECTS ``ALTER SYSTEM SET`` for ALL parameters too$(NC)"; \
+		echo "$(RED)(error: 'ALTER SYSTEM command is not supported').  Use the DB Parameter$(NC)"; \
+		echo "$(RED)Group (instance-level -- there are no cluster parameter groups on RDS PG$(NC)"; \
+		echo "$(RED)unlike Aurora).$(NC)"; \
+		echo ""; \
+		echo "$(YELLOW)random_page_cost=1.1 + effective_io_concurrency=200 are the two highest-$(NC)"; \
+		echo "$(YELLOW)leverage tweaks for SSD-backed RDS.  Default 4.0 / 1 assume spinning$(NC)"; \
+		echo "$(YELLOW)disk; the SSD-correct values let the planner pick smaller selective$(NC)"; \
+		echo "$(YELLOW)indexes instead of big sequential scans.$(NC)"; \
+		echo ""; \
+		echo "  $(GREEN)Console path (no AWS CLI required):$(NC)"; \
+		echo "    1. RDS Console → Parameter groups → click your DB parameter group"; \
+		echo "       (the custom one attached to the instance -- NOT default.postgresN)."; \
+		echo "    2. Edit parameters → use the search box:"; \
+		echo "         random_page_cost          → set value to 1.1"; \
+		echo "         effective_io_concurrency  → set value to 200"; \
+		echo "    3. Click Save changes at the bottom (Enter on a cell only stages --"; \
+		echo "       Save is what commits)."; \
+		echo "    4. random_page_cost & effective_io_concurrency are DYNAMIC: apply"; \
+		echo "       within ~30s, no reboot.  BUT if the param group has any static"; \
+		echo "       change pending too (e.g. shared_buffers), the instance shows a"; \
+		echo "       'Pending reboot' badge AND dynamic changes can also be held until"; \
+		echo "       reboot.  If verification (step 5) shows old values, do a reboot:"; \
+		echo "       Databases → click instance → Actions → Reboot (~60s downtime)."; \
+		echo "    5. Verify: $(YELLOW)make psql -c 'SHOW random_page_cost; SHOW effective_io_concurrency;'$(NC)"; \
+		echo "       Expect 1.1 and 200."; \
+		echo ""; \
+		echo "  $(GREEN)Confirm plan shifted (only relevant on cold-pool restarts):$(NC)"; \
+		echo "    make analytics-snapshot-diagnose UNDERLYING=SPY"; \
+		echo "    # [7/7] EXPLAIN may use idx_option_chains_underlying_ts_gamma (partial,"; \
+		echo "    # ~1 GB) instead of idx_option_chains_timestamp + Filter.  Note: on a"; \
+		echo "    # warm pool the planner can legitimately pick the time-only index --"; \
+		echo "    # at ~5ms execution either plan is fine.  random_page_cost mostly helps"; \
+		echo "    # the cold-pool case (post-restart, post-autovacuum-eviction)."; \
+	else \
+		echo "$(BLUE)[5/5] Self-hosted Postgres: dynamic settings via ALTER SYSTEM SET$(NC)"; \
+		echo ""; \
+		echo "  $(GREEN)# Apply via 'make psql':$(NC)"; \
+		echo "     ALTER SYSTEM SET random_page_cost     = '1.1';"; \
+		echo "     ALTER SYSTEM SET effective_io_concurrency = '200';"; \
+		echo "     ALTER SYSTEM SET effective_cache_size = '<RAM*0.75>';"; \
+		echo "     SELECT pg_reload_conf();                  -- no restart needed"; \
+	fi
+
+.PHONY: db-index-audit
+db-index-audit: ## Print an index audit for a table (default: option_chains), with drop candidates ranked by cost/benefit
+	@TABLE=$${TABLE:-option_chains}; \
+	echo "$(BLUE)=== Index audit: $$TABLE ===$(NC)"; \
+	echo "$(YELLOW)Surfaces low-scan + large-size indexes, redundant key patterns, and the$(NC)"; \
+	echo "$(YELLOW)pg_stat_user_indexes baseline so a drop decision can be justified with$(NC)"; \
+	echo "$(YELLOW)hard numbers.  Diagnostic only -- nothing is dropped here.$(NC)"; \
+	echo ""; \
+	echo "$(BLUE)[1/4] Indexes ranked by scan count (low scans + large size = drop candidate)$(NC)"; \
+	printf "%s\n" \
+		"SELECT indexrelname AS index, idx_scan AS scans, idx_tup_read AS tuples_read, CASE WHEN idx_scan > 0 THEN ROUND(idx_tup_read::numeric / idx_scan, 1) END AS tuples_per_scan, pg_size_pretty(pg_relation_size(indexrelid)) AS size, pg_relation_size(indexrelid) / 1024 / 1024 AS size_mb FROM pg_stat_user_indexes WHERE relname = '$$TABLE' ORDER BY idx_scan ASC, size_mb DESC;" \
+		| $(PSQL) -v ON_ERROR_STOP=0; \
+	echo ""; \
+	echo "$(BLUE)[2/4] Index definitions (look for redundant key prefixes)$(NC)"; \
+	printf "%s\n" \
+		"SELECT indexname, indexdef FROM pg_indexes WHERE tablename = '$$TABLE' ORDER BY indexname;" \
+		| $(PSQL) -v ON_ERROR_STOP=0; \
+	echo ""; \
+	echo "$(BLUE)[3/4] Bloat estimate (high dead_pct = REINDEX CONCURRENTLY may help)$(NC)"; \
+	printf "%s\n" \
+		"SELECT relname AS table, n_live_tup, n_dead_tup, ROUND(n_dead_tup::numeric / NULLIF(n_live_tup, 0) * 100, 1) AS dead_pct, last_autovacuum, last_autoanalyze FROM pg_stat_user_tables WHERE relname = '$$TABLE';" \
+		| $(PSQL) -v ON_ERROR_STOP=0; \
+	echo ""; \
+	echo "$(BLUE)[4/4] Total table + index footprint$(NC)"; \
+	printf "%s\n" \
+		"SELECT pg_size_pretty(pg_total_relation_size('$$TABLE')) AS total, pg_size_pretty(pg_relation_size('$$TABLE')) AS heap, pg_size_pretty(pg_total_relation_size('$$TABLE') - pg_relation_size('$$TABLE')) AS indexes_and_toast;" \
+		| $(PSQL) -v ON_ERROR_STOP=0
+	@echo ""
+	@echo "$(GREEN)How to read [1]:$(NC)"
+	@echo "  • $(GREEN)scans=0$(NC)                       → dead index. Drop with DROP INDEX CONCURRENTLY."
+	@echo "  • $(YELLOW)scans < 1000 + size > 1 GB$(NC)   → low-ROI index. Investigate WHICH query uses it via"
+	@echo "      pg_stat_statements before dropping; you may have a rarely-hit but important path."
+	@echo "  • $(YELLOW)tuples_per_scan > 100000$(NC)     → planner is doing big bitmap scans, not selective"
+	@echo "      lookups. Often a sign the key columns aren't selective enough."
+	@echo "  • In [2], look for one index whose key is a prefix of another's key -- the prefix one"
+	@echo "    is usually redundant (the longer index can serve the shorter prefix). Same for"
+	@echo "    INCLUDE columns -- a superset can replace a subset."
+	@echo "  • Repeat with TABLE=<other> to audit signal_scores, flow_by_contract, etc."
+
+.PHONY: db-drop-underused-option-chains-idx
+db-drop-underused-option-chains-idx: ## DROP CONCURRENTLY idx_option_chains_underlying (35 scans observed; subsumed by every (underlying, ...) composite). Pass CONFIRM=yes.
+	@echo "$(BLUE)=== Dropping idx_option_chains_underlying CONCURRENTLY ===$(NC)"
+	@echo "$(YELLOW)This index is keyed on (underlying) alone.  Per the May-21-2026 audit:$(NC)"
+	@echo "$(YELLOW)  pg_stat_user_indexes idx_scan = 35 (effectively unused)$(NC)"
+	@echo "$(YELLOW)  size                          = 359 MB$(NC)"
+	@echo "$(YELLOW)Every query that filters by ``underlying`` has at least one composite$(NC)"
+	@echo "$(YELLOW)index whose key starts with ``underlying`` (idx_option_chains_underlying_$(NC)"
+	@echo "$(YELLOW)timestamp, ..._exp_strike, ..._ts_gamma, ..._option_symbol_timestamp, etc.)$(NC)"
+	@echo "$(YELLOW)so the planner has multiple alternative paths and the single-column index$(NC)"
+	@echo "$(YELLOW)is pure write amplification.  Sanity check before dropping:$(NC)"
+	@echo "$(YELLOW)  make psql$(NC)"
+	@echo "$(YELLOW)  SELECT indexrelname, idx_scan, last_idx_scan FROM pg_stat_user_indexes$(NC)"
+	@echo "$(YELLOW)    WHERE indexrelname = 'idx_option_chains_underlying';$(NC)"
+	@if [ "$${CONFIRM}" != "yes" ]; then \
+		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to actually drop.$(NC)"; \
+	else \
+		printf "%s\n" \
+			"DROP INDEX CONCURRENTLY IF EXISTS idx_option_chains_underlying;" \
+			| $(PSQL) -v ON_ERROR_STOP=1; \
+		echo "$(GREEN)✓ Dropped idx_option_chains_underlying. Reclaimed ~359 MB + per-row write overhead.$(NC)"; \
+	fi
+
 .PHONY: db-add-distinct-on-index
 db-add-distinct-on-index: ## Build idx_option_chains_underlying_option_symbol_ts_gamma_covering CONCURRENTLY (~6 GB). Pass CONFIRM=yes to execute.
 	@echo "$(BLUE)=== Building idx_option_chains_underlying_option_symbol_ts_gamma_covering CONCURRENTLY ===$(NC)"
