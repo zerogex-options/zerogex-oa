@@ -26,8 +26,21 @@ ET = pytz.timezone("US/Eastern")
 
 def _row(option_symbol, strike, expiration, option_type, quote_ts, *, gamma=0.01, oi=100):
     return (
-        option_symbol, strike, expiration, option_type,
-        1.0, 0.99, 1.01, 10, oi, 0.5, gamma, -0.05, 0.1, 0.2, quote_ts,
+        option_symbol,
+        strike,
+        expiration,
+        option_type,
+        1.0,
+        0.99,
+        1.01,
+        10,
+        oi,
+        0.5,
+        gamma,
+        -0.05,
+        0.1,
+        0.2,
+        quote_ts,
     )
 
 

@@ -137,9 +137,7 @@ class AnalyticsEngine:
             "ANALYTICS_SNAPSHOT_STATEMENT_TIMEOUT_MS", 0, min=0
         )
         self._snapshot_cold_start_consumed = False
-        self.min_oi_coverage_pct_alert = _getenv_float(
-            "ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT", 0.35
-        )
+        self.min_oi_coverage_pct_alert = _getenv_float("ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT", 0.35)
 
         # Off-hours mode: keep cycling on weekends / NYSE holidays instead
         # of sleeping until the next run window.  The snapshot is anchored
@@ -1283,7 +1281,10 @@ class AnalyticsEngine:
             span_pct=GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT,
         )
         return self._structural_reference_from_profile(
-            options, spot, ref_profile, GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT,
+            options,
+            spot,
+            ref_profile,
+            GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT,
         )
 
     def _find_structural_interior_crossing(
@@ -1487,12 +1488,16 @@ class AnalyticsEngine:
             if structural_reference is None:
                 if span_pct >= GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT:
                     structural_reference = self._structural_reference_from_profile(
-                        options, spot, profile,
+                        options,
+                        spot,
+                        profile,
                         GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT,
                     )
                 else:
                     structural_reference = self._structural_reference(
-                        options, spot, timestamp,
+                        options,
+                        spot,
+                        timestamp,
                     )
 
             flip = self._find_structural_interior_crossing(
@@ -2661,8 +2666,7 @@ class AnalyticsEngine:
                     )
                     conn.commit()
                     logger.info(
-                        "flow_series_5min incremental upserted %d rows for %s "
-                        "(bars [%s, %s])",
+                        "flow_series_5min incremental upserted %d rows for %s " "(bars [%s, %s])",
                         cursor.rowcount,
                         self.db_symbol,
                         prev_bar.isoformat(),

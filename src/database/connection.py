@@ -104,9 +104,7 @@ def close_db_connection(conn):
                 conn.rollback()
                 logger.warning("Rolled back open transaction before returning DB connection")
         except Exception:
-            logger.warning(
-                "DB connection unusable during pool return; discarding", exc_info=True
-            )
+            logger.warning("DB connection unusable during pool return; discarding", exc_info=True)
             discard = True
 
     try:

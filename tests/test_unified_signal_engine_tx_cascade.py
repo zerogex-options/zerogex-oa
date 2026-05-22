@@ -58,20 +58,20 @@ def _stub_cursor_with_skew_timeout(now_ts):
     # defensive ones (underlying+gex_summary at idx 0, vwap at idx 1).
     cursor.fetchone.side_effect = [
         (
-            now_ts,        # uq.timestamp
-            500.0,         # uq.close
-            now_ts,        # gs.timestamp
-            -1.0e9,        # gs.total_net_gex
-            499.0,         # gs.gamma_flip_point
-            0.002,         # gs.flip_distance
-            5.0e8,         # gs.local_gex
-            0.05,          # gs.convexity_risk
-            1.0,           # gs.put_call_ratio
-            500.0,         # gs.max_pain
-            10000,         # gs.total_call_oi
-            10000,         # gs.total_put_oi
+            now_ts,  # uq.timestamp
+            500.0,  # uq.close
+            now_ts,  # gs.timestamp
+            -1.0e9,  # gs.total_net_gex
+            499.0,  # gs.gamma_flip_point
+            0.002,  # gs.flip_distance
+            5.0e8,  # gs.local_gex
+            0.05,  # gs.convexity_risk
+            1.0,  # gs.put_call_ratio
+            500.0,  # gs.max_pain
+            10000,  # gs.total_call_oi
+            10000,  # gs.total_put_oi
         ),
-        (500.0, 0.001),    # vwap + dev
+        (500.0, 0.001),  # vwap + dev
     ] + [None] * 50
     cursor.fetchall.return_value = []
 
@@ -90,9 +90,7 @@ def _stub_cursor_with_skew_timeout(now_ts):
             and "implied_volatility" in sql
         ):
             call_state["skew_raised"] = True
-            raise psycopg2.errors.QueryCanceled(
-                "canceling statement due to statement timeout"
-            )
+            raise psycopg2.errors.QueryCanceled("canceling statement due to statement timeout")
         # After the skew failure, any execute that ISN'T a ROLLBACK must
         # not raise InFailedSqlTransaction -- success means the fix works.
         if call_state["skew_raised"]:

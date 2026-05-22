@@ -47,9 +47,9 @@ def test_incremental_sql_inserts_full_column_set():
     """Same target columns as the full form -- otherwise mixing the two
     forms (cold-start then steady-state) would leave incomplete rows."""
     for col in FLOW_SERIES_COLUMNS:
-        assert col in SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2, (
-            f"incremental SQL is missing column {col!r}"
-        )
+        assert (
+            col in SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2
+        ), f"incremental SQL is missing column {col!r}"
     # symbol is the only column not in FLOW_SERIES_COLUMNS but still
     # required (PK component).
     assert "symbol" in SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2
@@ -58,17 +58,15 @@ def test_incremental_sql_inserts_full_column_set():
 def test_incremental_sql_uses_same_conflict_and_distinct_guard_as_full():
     """The IS DISTINCT FROM no-op suppression must apply identically so
     the write semantics don't diverge between the two forms."""
-    assert "ON CONFLICT (symbol, bar_start) DO UPDATE SET" in (
-        SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2
-    )
+    assert "ON CONFLICT (symbol, bar_start) DO UPDATE SET" in (SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2)
     assert "IS DISTINCT FROM" in SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2
     # Every non-PK column appears in the distinct guard.
     for col in FLOW_SERIES_COLUMNS:
         if col == "bar_start":
             continue
-        assert f"flow_series_5min.{col}" in SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2, (
-            f"DISTINCT guard missing for column {col!r}"
-        )
+        assert (
+            f"flow_series_5min.{col}" in SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2
+        ), f"DISTINCT guard missing for column {col!r}"
 
 
 def test_incremental_sql_parameter_set_is_minimal():
@@ -77,9 +75,9 @@ def test_incremental_sql_parameter_set_is_minimal():
     for name in ("symbol", "prev_bar", "curr_bar"):
         assert f"%({name})s" in SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2
     for name in ("session_start", "session_end", "strikes", "expirations"):
-        assert f"%({name})s" not in SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2, (
-            f"incremental SQL unexpectedly references the {name!r} parameter"
-        )
+        assert (
+            f"%({name})s" not in SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2
+        ), f"incremental SQL unexpectedly references the {name!r} parameter"
 
 
 def test_incremental_sql_aggregates_flow_by_contract_directly():
@@ -95,9 +93,9 @@ def test_incremental_sql_aggregates_flow_by_contract_directly():
         "LAG(",
         "generate_series(",
     ):
-        assert marker not in sql, (
-            f"incremental SQL unexpectedly contains canonical CTE marker {marker!r}"
-        )
+        assert (
+            marker not in sql
+        ), f"incremental SQL unexpectedly contains canonical CTE marker {marker!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +120,9 @@ def _columns_of(table: str) -> set[str]:
     import re
     from pathlib import Path
 
-    schema = (Path(__file__).resolve().parent.parent / "setup" / "database" / "schema.sql").read_text()
+    schema = (
+        Path(__file__).resolve().parent.parent / "setup" / "database" / "schema.sql"
+    ).read_text()
     cols: set[str] = set()
     # CREATE TABLE [IF NOT EXISTS] <table> ( ... );
     m = re.search(
@@ -240,9 +240,9 @@ def test_steady_state_cycle_uses_incremental_upsert():
 
     sqls = _executed_sqls(cursor)
     # First execute is the probe; second is the upsert.
-    assert any("SELECT 1 FROM flow_series_5min" in s for s in sqls), (
-        "expected the prev_bar probe SELECT before dispatch"
-    )
+    assert any(
+        "SELECT 1 FROM flow_series_5min" in s for s in sqls
+    ), "expected the prev_bar probe SELECT before dispatch"
     upserts = [s for s in sqls if "INSERT INTO flow_series_5min" in s]
     assert len(upserts) == 1
     # Incremental form: references prev_bar/curr_bar parameters, NOT the
@@ -250,9 +250,9 @@ def test_steady_state_cycle_uses_incremental_upsert():
     upsert_sql = upserts[0]
     assert "%(prev_bar)s" in upsert_sql
     assert "%(curr_bar)s" in upsert_sql
-    assert "ROWS UNBOUNDED PRECEDING" not in upsert_sql, (
-        "steady-state cycle must NOT execute the canonical CTE"
-    )
+    assert (
+        "ROWS UNBOUNDED PRECEDING" not in upsert_sql
+    ), "steady-state cycle must NOT execute the canonical CTE"
 
 
 def test_cold_start_cycle_uses_full_upsert():
@@ -284,9 +284,7 @@ def test_refresh_short_circuits_when_flow_cache_disabled(monkeypatch):
     cm, _, cursor = _mock_conn_with_prev_bar(prev_bar_exists=True)
     with patch.object(main_engine, "db_connection", return_value=cm):
         engine._refresh_flow_series_snapshot(_fixed_ts())
-    assert cursor.execute.call_count == 0, (
-        "disabled flag must skip DB activity entirely"
-    )
+    assert cursor.execute.call_count == 0, "disabled flag must skip DB activity entirely"
 
 
 def test_first_bar_of_session_falls_back_to_full_backfill():
@@ -308,14 +306,15 @@ def test_first_bar_of_session_falls_back_to_full_backfill():
             return open_ts.astimezone(tz) if tz is not None else open_ts.replace(tzinfo=None)
 
     cm, _, cursor = _mock_conn_with_prev_bar(prev_bar_exists=True)
-    with patch.object(main_engine, "db_connection", return_value=cm), patch.object(
-        main_engine, "datetime", _FrozenDateTime
+    with (
+        patch.object(main_engine, "db_connection", return_value=cm),
+        patch.object(main_engine, "datetime", _FrozenDateTime),
     ):
         engine._refresh_flow_series_snapshot(open_ts)
 
     sqls = _executed_sqls(cursor)
     upserts = [s for s in sqls if "INSERT INTO flow_series_5min" in s]
     assert len(upserts) == 1
-    assert "%(session_start)s" in upserts[0], (
-        "the open-of-session edge case must take the full-backfill path"
-    )
+    assert (
+        "%(session_start)s" in upserts[0]
+    ), "the open-of-session edge case must take the full-backfill path"

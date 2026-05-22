@@ -49,8 +49,9 @@ def test_last_stage_timings_recorded_when_gex_by_strike_empty(monkeypatch):
         "underlying_price": 500.0,
         "options": [{"option_symbol": "X", "gamma": 0.01, "open_interest": 1}],
     }
-    with patch.object(engine, "_get_snapshot", return_value=fake_snapshot), patch.object(
-        engine, "_calculate_gex_by_strike", return_value=[]
+    with (
+        patch.object(engine, "_get_snapshot", return_value=fake_snapshot),
+        patch.object(engine, "_calculate_gex_by_strike", return_value=[]),
     ):
         assert engine.run_calculation() is False
 

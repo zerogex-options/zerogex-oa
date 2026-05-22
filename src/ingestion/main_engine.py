@@ -898,9 +898,7 @@ class IngestionEngine:
             bid_cum=0,
         )
 
-    def _get_flow_accumulator(
-        self, option_symbol: str, bucket: datetime
-    ) -> _FlowAccumulator:
+    def _get_flow_accumulator(self, option_symbol: str, bucket: datetime) -> _FlowAccumulator:
         """Return the live accumulator for this contract in the bucket's ET session.
 
         Triggers a hydrate on first observation and on session rollover
@@ -936,9 +934,7 @@ class IngestionEngine:
         curr_vol = int(snap.get("volume") or 0)
         vol_delta = max(curr_vol - acc.last_volume_cum, 0)
         if vol_delta > 0:
-            skip = FLOW_CLASSIFY_SKIP_OPEN_AUCTION and self._is_opening_auction_bucket(
-                bucket
-            )
+            skip = FLOW_CLASSIFY_SKIP_OPEN_AUCTION and self._is_opening_auction_bucket(bucket)
             if skip:
                 acc.mid_cum += vol_delta
             else:
@@ -1150,9 +1146,7 @@ class IngestionEngine:
                 "mid_volume",
                 "bid_volume",
             ):
-                existing[field] = max(
-                    existing.get(field) or 0, row.get(field) or 0
-                )
+                existing[field] = max(existing.get(field) or 0, row.get(field) or 0)
 
         return list(coalesced.values())
 

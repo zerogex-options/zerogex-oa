@@ -83,9 +83,16 @@ def _classified(agg: dict) -> int:
     return agg["ask_volume"] + agg["mid_volume"] + agg["bid_volume"]
 
 
-def _seed_accumulator(e: IngestionEngine, sym: str, bucket: datetime,
-                      *, last_volume_cum: int = 0,
-                      ask: int = 0, mid: int = 0, bid: int = 0) -> _FlowAccumulator:
+def _seed_accumulator(
+    e: IngestionEngine,
+    sym: str,
+    bucket: datetime,
+    *,
+    last_volume_cum: int = 0,
+    ask: int = 0,
+    mid: int = 0,
+    bid: int = 0,
+) -> _FlowAccumulator:
     """Install a hydrated accumulator without hitting the DB."""
     acc = _FlowAccumulator(
         session_date=e._bucket_session_date(bucket),
@@ -198,8 +205,13 @@ def test_session_rollover_resets_accumulator():
     # Make _hydrate_flow_accumulator return zeros (no DB) for the Tuesday call.
     def _zero_hydrate(_sym: str, sd: date) -> _FlowAccumulator:
         return _FlowAccumulator(
-            session_date=sd, last_volume_cum=0, ask_cum=0, mid_cum=0, bid_cum=0,
+            session_date=sd,
+            last_volume_cum=0,
+            ask_cum=0,
+            mid_cum=0,
+            bid_cum=0,
         )
+
     e._hydrate_flow_accumulator = _zero_hydrate  # type: ignore[method-assign]
 
     mon_acc = e._get_flow_accumulator(SYM, b_mon)

@@ -135,7 +135,10 @@ def test_accumulator_prior_tick_carries_across_snapshots():
     bucket = ET.localize(datetime(2026, 4, 28, 10, 15))
     acc = _FlowAccumulator(
         session_date=date(2026, 4, 28),
-        last_volume_cum=0, ask_cum=0, mid_cum=0, bid_cum=0,
+        last_volume_cum=0,
+        ask_cum=0,
+        mid_cum=0,
+        bid_cum=0,
     )
 
     # First snapshot: no prior NBBO yet, classifier falls through to the
@@ -181,7 +184,10 @@ def test_accumulator_ingest_is_idempotent_for_same_cumulative():
     bucket = ET.localize(datetime(2026, 4, 28, 10, 15))
     acc = _FlowAccumulator(
         session_date=date(2026, 4, 28),
-        last_volume_cum=0, ask_cum=0, mid_cum=0, bid_cum=0,
+        last_volume_cum=0,
+        ask_cum=0,
+        mid_cum=0,
+        bid_cum=0,
     )
 
     snap = {"volume": 100, "last": 5.58, "bid": 5.53, "ask": 5.58, "mid": 5.555}

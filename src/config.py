@@ -310,7 +310,9 @@ def _selected_flip_profile() -> Dict[str, Any]:
 _FP = _selected_flip_profile()
 
 GAMMA_PROFILE_SPAN_PCT = _getenv_float("GAMMA_PROFILE_SPAN_PCT", _FP["span_pct"], min=0.02, max=1.0)
-GAMMA_PROFILE_STEP_PCT = _getenv_float("GAMMA_PROFILE_STEP_PCT", _FP["step_pct"], min=0.0001, max=0.05)
+GAMMA_PROFILE_STEP_PCT = _getenv_float(
+    "GAMMA_PROFILE_STEP_PCT", _FP["step_pct"], min=0.0001, max=0.05
+)
 
 # Adaptive expansion rungs BEYOND the initial GAMMA_PROFILE_SPAN_PCT,
 # in ascending order, each an absolute fraction of spot.  Tried only
@@ -372,7 +374,10 @@ GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT = _getenv_float(
     "GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT", _FP["structural_window_pct"], min=0.001, max=0.10
 )
 GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE = _getenv_float(
-    "GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE", _FP["structural_reference_percentile"], min=50.0, max=100.0
+    "GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE",
+    _FP["structural_reference_percentile"],
+    min=50.0,
+    max=100.0,
 )
 # Span over which the structural-reference profile is built before the
 # active-strike filter is applied.  Held constant across every ladder
@@ -387,7 +392,10 @@ GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE = _getenv_float(
 # below) has enough profile points to work with even on chains whose
 # OI is geometrically concentrated.
 GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT = _getenv_float(
-    "GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT", _FP["structural_reference_span_pct"], min=0.02, max=1.0
+    "GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT",
+    _FP["structural_reference_span_pct"],
+    min=0.02,
+    max=1.0,
 )
 # Active-strike filter for the structural reference.  After the
 # canonical-band profile is built, each grid point is INCLUDED in the
@@ -400,7 +408,10 @@ GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT = _getenv_float(
 # four grid steps at the default GAMMA_PROFILE_STEP_PCT=0.25%; tighten
 # this for symbols with dense OI, loosen for thin chains.
 GAMMA_PROFILE_STRUCTURAL_ACTIVE_DISTANCE_PCT = _getenv_float(
-    "GAMMA_PROFILE_STRUCTURAL_ACTIVE_DISTANCE_PCT", _FP["structural_active_distance_pct"], min=0.001, max=0.10
+    "GAMMA_PROFILE_STRUCTURAL_ACTIVE_DISTANCE_PCT",
+    _FP["structural_active_distance_pct"],
+    min=0.001,
+    max=0.10,
 )
 # Distance gate: a structurally valid interior crossing is rejected when
 # it sits further than this fraction of spot from the current underlying
@@ -430,7 +441,9 @@ GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT = _getenv_float(
 # are unchanged.  Applied inside the single shared profile, so the flip
 # and net-GEX-at-spot stay sign-consistent by construction.
 GAMMA_PROFILE_DTE_WEIGHTING = _getenv_bool("GAMMA_PROFILE_DTE_WEIGHTING", True)
-GAMMA_PROFILE_DTE_REF_DAYS = _getenv_float("GAMMA_PROFILE_DTE_REF_DAYS", _FP["dte_ref_days"], min=0.5, max=60.0)
+GAMMA_PROFILE_DTE_REF_DAYS = _getenv_float(
+    "GAMMA_PROFILE_DTE_REF_DAYS", _FP["dte_ref_days"], min=0.5, max=60.0
+)
 
 # Batch Sizes
 QUOTE_BATCH_SIZE = int(os.getenv("QUOTE_BATCH_SIZE", "100"))  # TradeStation supports up to 500
