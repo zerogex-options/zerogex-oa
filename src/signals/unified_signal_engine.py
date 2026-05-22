@@ -563,41 +563,28 @@ class UnifiedSignalEngine:
                             sm_put = float(r[1] or 0.0)
                             sm_put_gross = float(r[2] or 0.0)
                 except Exception as exc:
-                    # Reset BEFORE the warning + fallback: without this the
-                    # fallback (which runs unconditionally inside the except)
-                    # inherits an aborted transaction and raises out, taking
-                    # the entire signals cycle with it.  Resetting first
-                    # lets the fallback execute on a fresh transaction.
+                    # Canonical query failed; reset the transaction so
+                    # subsequent queries in this cycle execute cleanly,
+                    # then leave sm_call / sm_put / *_gross at their
+                    # default 0.0 for this cycle.
+                    #
+                    # The prior fallback queried flow_smart_money for
+                    # SUM(total_premium) -- GROSS filtered notional, NOT
+                    # the signed net-premium the downstream consumer
+                    # expects.  A failure-mode value that tracked the
+                    # wrong axis was strictly worse than zero (it could
+                    # silently invert positioning_trap's directional
+                    # imbalance).  The flow_smart_money table was
+                    # decommissioned in the same change; the only safe
+                    # fallback is to surface the gap as "no signal" and
+                    # let the next cycle retry the canonical query.
                     self._reset_tx(conn)
                     logger.warning(
-                        "UnifiedSignalEngine [%s]: signed smart-money fetch failed: %s",
+                        "UnifiedSignalEngine [%s]: signed smart-money fetch failed: %s "
+                        "(sm_call/sm_put default to 0.0 for this cycle)",
                         self.db_symbol,
                         exc,
                     )
-                    # The fallback itself is best-effort -- wrap it so that
-                    # if flow_smart_money also errors (e.g. statement timeout
-                    # under the same load that broke the primary) the cycle
-                    # still finishes with sm_call/sm_put defaulted to 0.
-                    try:
-                        cur.execute(
-                            """
-                            SELECT COALESCE(SUM(CASE WHEN option_type='C' THEN total_premium ELSE 0 END), 0),
-                                   COALESCE(SUM(CASE WHEN option_type='P' THEN total_premium ELSE 0 END), 0)
-                            FROM flow_smart_money
-                            WHERE symbol = %s
-                              AND timestamp BETWEEN %s - INTERVAL '30 minutes' AND %s
-                            """,
-                            (self.db_symbol, ts, ts),
-                        )
-                        sm_call, sm_put = cur.fetchone() or (0.0, 0.0)
-                        sm_call_gross, sm_put_gross = abs(sm_call), abs(sm_put)
-                    except Exception as fallback_exc:
-                        self._reset_tx(conn)
-                        logger.warning(
-                            "UnifiedSignalEngine [%s]: smart-money fallback fetch failed: %s",
-                            self.db_symbol,
-                            fallback_exc,
-                        )
 
                 # C6: true 0DTE flow by option_type and moneyness. Filters
                 # flow_contract_facts to today's expiration and splits by

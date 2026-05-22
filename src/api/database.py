@@ -566,15 +566,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         Failures here are non-fatal: the endpoint will serve whatever data
         already exists in the cache tables rather than returning a 500.
 
-        Cache ownership: ``flow_by_contract`` and ``flow_smart_money`` are
-        normally written by the analytics engine
+        Cache ownership: ``flow_by_contract`` is normally written by the
+        analytics engine
         (``src/analytics/main_engine.py:_refresh_flow_caches``) on its
-        cycle interval (default 60s).  This API-side path is a per-request
-        backstop that fills in gaps when the analytics engine is
-        catching up after a restart, or when a hot symbol is polled
-        between analytics cycles.  The two refreshes are idempotent
-        upserts on the same primary key, so concurrent runs are safe;
-        the analytics engine remains the steady-state writer.
+        cycle interval (default 60s).  This API-side path also writes
+        ``flow_contract_facts`` as a per-request backstop that fills in
+        gaps when the analytics engine is catching up after a restart,
+        or when a hot symbol is polled between analytics cycles.  The
+        refreshes are idempotent upserts on the same primary key, so
+        concurrent runs are safe; the analytics engine remains the
+        steady-state writer.
 
         Set ``ANALYTICS_FLOW_CACHE_REFRESH_ENABLED=false`` to disable
         the analytics-side write and let this path handle 100% of
@@ -586,11 +587,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         if (now - last_refresh) < self._flow_refresh_min_seconds:
             return
 
-        # H4: do NOT run the heavy multi-CTE flow_contract_facts /
-        # flow_smart_money upsert on the request's pooled connection. With
-        # only ~3 pool connections, holding one for the duration of that
-        # write (the first request after each 15s throttle window paid the
-        # full write cost inline) was a primary pool-starvation / tail-
+        # H4: do NOT run the heavy multi-CTE flow_contract_facts upsert
+        # on the request's pooled connection. With only ~3 pool
+        # connections, holding one for the duration of that write (the
+        # first request after each 15s throttle window paid the full
+        # write cost inline) was a primary pool-starvation / tail-
         # latency source. The analytics engine is the steady-state writer;
         # this API-side path is only a backstop, so schedule it off the hot
         # path on its own connection and let the current request serve
@@ -879,99 +880,6 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             underlying_price,
             last_fact_ts if last_fact_ts is not None else datetime(1970, 1, 1, tzinfo=timezone.utc),
         )
-
-        smart_exists = await conn.fetchval(
-            """
-            SELECT 1 FROM flow_smart_money
-            WHERE symbol = $1 AND timestamp = $2
-            LIMIT 1
-            """,
-            symbol,
-            latest_ts,
-        )
-        if not smart_exists:
-            await conn.execute(
-                """
-                WITH with_prev AS (
-                    SELECT
-                        oc.timestamp,
-                        oc.option_symbol,
-                        oc.option_type,
-                        oc.strike,
-                        oc.expiration,
-                        oc.last,
-                        oc.implied_volatility,
-                        oc.delta,
-                        CASE
-                            WHEN LAG(oc.volume) OVER w IS NULL THEN COALESCE(oc.volume, 0)
-                            WHEN (LAG(oc.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
-                                = (oc.timestamp AT TIME ZONE 'America/New_York')::date
-                                THEN GREATEST(COALESCE(oc.volume, 0) - COALESCE(LAG(oc.volume) OVER w, 0), 0)
-                            ELSE COALESCE(oc.volume, 0)
-                        END::bigint AS volume_delta
-                    FROM option_chains oc
-                    WHERE oc.underlying = $1
-                      AND oc.timestamp >= $2::timestamptz - INTERVAL '2 minutes'
-                      AND oc.timestamp <= $2
-                    WINDOW w AS (PARTITION BY oc.option_symbol ORDER BY oc.timestamp)
-                )
-                INSERT INTO flow_smart_money (
-                    timestamp,
-                    symbol,
-                    option_symbol,
-                    strike,
-                    expiration,
-                    option_type,
-                    total_volume,
-                    total_premium,
-                    avg_iv,
-                    avg_delta,
-                    unusual_activity_score,
-                    underlying_price
-                )
-                SELECT
-                    timestamp,
-                    $1::varchar,
-                    option_symbol,
-                    strike,
-                    expiration,
-                    option_type,
-                    volume_delta::bigint,
-                    (volume_delta * COALESCE(last, 0) * 100)::numeric,
-                    implied_volatility::numeric,
-                    delta::numeric,
-                    LEAST(10, GREATEST(0,
-                        CASE WHEN volume_delta >= 500 THEN 4 WHEN volume_delta >= 200 THEN 3 WHEN volume_delta >= 100 THEN 2 WHEN volume_delta >= 50 THEN 1 ELSE 0 END +
-                        CASE WHEN volume_delta * COALESCE(last, 0) * 100 >= 500000 THEN 4 WHEN volume_delta * COALESCE(last, 0) * 100 >= 250000 THEN 3 WHEN volume_delta * COALESCE(last, 0) * 100 >= 100000 THEN 2 WHEN volume_delta * COALESCE(last, 0) * 100 >= 50000 THEN 1 ELSE 0 END +
-                        CASE WHEN implied_volatility > 1.0 THEN 2 WHEN implied_volatility > 0.6 THEN 1 ELSE 0 END
-                    ))::numeric,
-                    $3::numeric
-                FROM with_prev
-                WHERE timestamp = $2
-                  AND volume_delta > 0
-                  AND (
-                    volume_delta >= 50
-                    OR volume_delta * COALESCE(last, 0) * 100 >= 50000
-                    OR (implied_volatility > 0.4 AND volume_delta >= 20)
-                    OR (ABS(delta) < 0.15 AND volume_delta >= 20)
-                  )
-                ON CONFLICT (timestamp, symbol, option_symbol)
-                DO UPDATE SET
-                    strike = EXCLUDED.strike,
-                    expiration = EXCLUDED.expiration,
-                    option_type = EXCLUDED.option_type,
-                    total_volume = EXCLUDED.total_volume,
-                    total_premium = EXCLUDED.total_premium,
-                    avg_iv = EXCLUDED.avg_iv,
-                    avg_delta = EXCLUDED.avg_delta,
-                    unusual_activity_score = EXCLUDED.unusual_activity_score,
-                    underlying_price = EXCLUDED.underlying_price,
-                    updated_at = NOW()
-                """,
-                symbol,
-                latest_ts,
-                underlying_price,
-            )
 
     async def _refresh_max_pain_snapshot(
         self,

@@ -5,7 +5,7 @@ reads the latest option chain produced by Ingestion, computes per-strike
 dealer gamma / vanna / charm exposures, resolves the gamma flip via an
 adaptive multi-rung bracket-and-verify algorithm, computes call/put walls
 and max-pain, and persists results to `gex_summary`, `gex_by_strike`,
-`flow_by_contract`, `flow_smart_money`, and `flow_series_5min`.
+`flow_by_contract`, and `flow_series_5min`.
 
 Sources mapped: `src/analytics/main_engine.py`, `src/analytics/walls.py`,
 `src/flow_series_sql.py`, `src/signals/**`, `src/config.py`,
@@ -128,7 +128,6 @@ flowchart TB
     subgraph FLOW["Stage 7: Flow Caches (best-effort)"]
         direction TB
         F1["flow_by_contract (5-min, day-to-date cumulative)<br/>:2213-2307<br/>aggregates flow_contract_facts from 09:30 ET<br/>upserts current + previous 5-min bucket<br/>HAVING SUM(volume_delta)&gt;0"]:::compute
-        F2["flow_smart_money (unusual activity)<br/>:2308-2446<br/>tiers from component_normalizer_cache p95 (vol &amp; prem)<br/>or static cold-start tiers<br/>score = vol_tier + prem_tier + iv_tier (≤10)<br/>retention 7d (DELETE &gt; NOW() − 7 days)"]:::compute
         F3["flow_series_5min<br/>:2462-2522<br/>materializes /api/flow/series CTE<br/>(flow_series_sql.py canonical CTE)<br/>columns: bar_start, call/put premium &amp; volume cum,<br/>net_volume/raw_volume/net_premium cum,<br/>put_call_ratio, underlying_price, contract_count, is_synthetic<br/>idempotent: closed bars are final"]:::compute
     end
 
@@ -138,7 +137,6 @@ flowchart TB
         R1[("option_chains<br/>quotes + Greeks")]:::db_r
         R2[("underlying_quotes<br/>spot close")]:::db_r
         R3[("flow_contract_facts<br/>raw classified flow")]:::db_r
-        R4[("component_normalizer_cache<br/>p95 calibration")]:::db_r
     end
 
     subgraph DB_WRITE["Writes"]
@@ -146,7 +144,6 @@ flowchart TB
         W1[("gex_by_strike<br/>PK (underlying, ts, strike, expiration)<br/>UPSERT where IS DISTINCT FROM")]:::db_w
         W2[("gex_summary<br/>PK (underlying, ts)<br/>max_pain_by_expiration JSONB<br/>gamma_flip_span_used, gamma_flip_unresolved<br/>call_wall, put_wall, net_gex_at_spot")]:::db_w
         W3[("flow_by_contract<br/>PK (ts, sym, type, strike, exp)")]:::db_w
-        W4[("flow_smart_money<br/>PK (ts, sym, option_symbol)")]:::db_w
         W5[("flow_series_5min<br/>PK (symbol, bar_start)")]:::db_w
     end
 
@@ -162,7 +159,7 @@ flowchart TB
     %% ============ CONFIG ============
     subgraph CFG["Configuration (src/config.py)"]
         direction TB
-        CFG_BODY["ANALYTICS_INTERVAL=60s<br/>ANALYTICS_OFF_HOURS_INTERVAL_SECONDS=300s<br/>ANALYTICS_OFF_HOURS_ENABLED=true<br/>ANALYTICS_SNAPSHOT_LOOKBACK_HOURS=2<br/>ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS=96<br/>ANALYTICS_SNAPSHOT_COLD_START_STATEMENT_TIMEOUT_MS=180000<br/>ANALYTICS_SNAPSHOT_MAX_ROWS=50000<br/>ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT=0.35<br/>ANALYTICS_FLOW_CACHE_REFRESH_ENABLED=true<br/>FLOW_CACHE_REFRESH_MIN_SECONDS=15<br/><br/>RISK_FREE_RATE=0.05<br/><br/>──────────────────<br/>GAMMA_FLIP_PROFILE=default | strict | lenient<br/>(recommended entry point — bundles all 11 knobs below)<br/>──────────────────<br/>GAMMA_PROFILE_SPAN_PCT=0.20<br/>GAMMA_PROFILE_STEP_PCT=0.0025<br/>GAMMA_PROFILE_EXPANSION_RUNGS=[0.35, 0.50]<br/>GAMMA_PROFILE_INTERIOR_MARGIN=0.10<br/>GAMMA_PROFILE_STRUCTURAL_MIN_FRAC=0.02<br/>GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT=0.01<br/>GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE=90.0<br/>GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT=0.15<br/>GAMMA_PROFILE_STRUCTURAL_ACTIVE_DISTANCE_PCT=0.01<br/>GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT=0.08<br/>GAMMA_PROFILE_DTE_WEIGHTING=true<br/>GAMMA_PROFILE_DTE_REF_DAYS=5.0<br/><br/>SMART_MONEY_VOL_T1..T4=50/100/200/500<br/>SMART_MONEY_PREM_T1..T4=1x/2x/5x/10x notional<br/>SMART_MONEY_IV_INCL_DEFAULT=0.4<br/>SMART_MONEY_DEEP_OTM_DELTA_DEFAULT=0.15"]:::cfg
+        CFG_BODY["ANALYTICS_INTERVAL=60s<br/>ANALYTICS_OFF_HOURS_INTERVAL_SECONDS=300s<br/>ANALYTICS_OFF_HOURS_ENABLED=true<br/>ANALYTICS_SNAPSHOT_LOOKBACK_HOURS=2<br/>ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS=96<br/>ANALYTICS_SNAPSHOT_COLD_START_STATEMENT_TIMEOUT_MS=180000<br/>ANALYTICS_SNAPSHOT_MAX_ROWS=50000<br/>ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT=0.35<br/>ANALYTICS_FLOW_CACHE_REFRESH_ENABLED=true<br/>FLOW_CACHE_REFRESH_MIN_SECONDS=15<br/><br/>RISK_FREE_RATE=0.05<br/><br/>──────────────────<br/>GAMMA_FLIP_PROFILE=default | strict | lenient<br/>(recommended entry point — bundles all 11 knobs below)<br/>──────────────────<br/>GAMMA_PROFILE_SPAN_PCT=0.20<br/>GAMMA_PROFILE_STEP_PCT=0.0025<br/>GAMMA_PROFILE_EXPANSION_RUNGS=[0.35, 0.50]<br/>GAMMA_PROFILE_INTERIOR_MARGIN=0.10<br/>GAMMA_PROFILE_STRUCTURAL_MIN_FRAC=0.02<br/>GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT=0.01<br/>GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE=90.0<br/>GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT=0.15<br/>GAMMA_PROFILE_STRUCTURAL_ACTIVE_DISTANCE_PCT=0.01<br/>GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT=0.08<br/>GAMMA_PROFILE_DTE_WEIGHTING=true<br/>GAMMA_PROFILE_DTE_REF_DAYS=5.0"]:::cfg
     end
 
     %% ============ WIRING ============
@@ -180,19 +177,14 @@ flowchart TB
     S6 -.UPSERT.-> W2
 
     S7 --> F1
-    S7 --> F2
     S7 --> F3
     F1 -.SELECT.-> R3
     F1 -.UPSERT.-> W3
-    F2 -.SELECT.-> R3
-    F2 -.SELECT.-> R4
-    F2 -.UPSERT.-> W4
     F3 -.UPSERT.-> W5
 
     W2 -.read.-> API
     W1 -.read.-> API
     W3 -.read.-> API
-    W4 -.read.-> API
     W5 -.read.-> API
 
     W2 --> UNIFIED
@@ -274,7 +266,6 @@ sequenceDiagram
 
     E->>E: STAGE 7 _refresh_flow_caches (best-effort)
     E->>DB: UPSERT flow_by_contract (curr + prev 5-min bucket)
-    E->>DB: UPSERT flow_smart_money; DELETE rows &gt; 7d
     E->>SS: SNAPSHOT_UPSERT_PSYCOPG2 (canonical CTE)
     SS->>DB: UPSERT flow_series_5min (idempotent closed bars)
 
@@ -433,7 +424,6 @@ flowchart TB
     GSUM[(gex_summary)]:::out
     GBS[(gex_by_strike)]:::out
     FBC[(flow_by_contract)]:::out
-    FSM[(flow_smart_money)]:::out
     FS5[(flow_series_5min)]:::out
 
     subgraph BASIC["Basic Signals (weighted blend → MSI)"]
@@ -479,8 +469,6 @@ flowchart TB
     GBS --> COMP
     FBC --> B4
     FS5 --> B4
-    FSM --> A1
-    FSM --> A7
 
     BASIC --> UNI
     COMP --> UNI
@@ -498,9 +486,7 @@ erDiagram
     underlying_quotes ||--o{ gex_summary : "Q2 reads"
     option_chains ||--o{ gex_summary : "feeds"
     flow_contract_facts ||--o{ flow_by_contract : "aggregates"
-    flow_contract_facts ||--o{ flow_smart_money : "scores"
     flow_contract_facts ||--o{ flow_series_5min : "CTE"
-    component_normalizer_cache ||--o{ flow_smart_money : "tier p95"
     gex_summary ||--o{ gex_by_strike : "share PK (underlying, ts)"
 
     gex_by_strike {
@@ -560,20 +546,6 @@ erDiagram
         num  raw_premium
         int  net_volume
         num  net_premium
-        num  underlying_price
-    }
-    flow_smart_money {
-        ts   timestamp     PK
-        text symbol        PK
-        text option_symbol PK
-        num  strike
-        date expiration
-        text option_type
-        int  total_volume
-        num  total_premium
-        num  avg_iv
-        num  avg_delta
-        int  unusual_activity_score
         num  underlying_price
     }
     flow_series_5min {
