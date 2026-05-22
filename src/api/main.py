@@ -24,6 +24,7 @@ from .security import api_key_auth, key_store, require_scopes
 from .models import (
     GEXSummary,
     GEXByStrike,
+    GEXProfile,
     FlowPoint,
     FlowSeriesPoint,
     FlowContractsResponse,
@@ -313,6 +314,24 @@ async def get_gex_by_strike(
     """
     data = await _db().get_gex_by_strike(symbol, limit, sort_by)
     return [GEXByStrike(**row) for row in data]
+
+
+@app.get("/api/gex/profile", response_model=GEXProfile, tags=["GEX"])
+@handle_api_errors("GET /api/gex/profile")
+async def get_gex_profile(symbol: str = Query(default="SPY")):
+    """Latest spot-shift dealer dollar-gamma curve for ``symbol``.
+
+    Returns the curve persisted by the Analytics Engine on the most
+    recent cycle: an ascending ``[(price, gex), ...]`` series whose
+    zero crossing is ``gamma_flip`` and whose value at ``spot_price``
+    is ``net_gex_at_spot``.  Designed for the GEX-Profile overlay on
+    the per-strike chart; the same dataset that drives the headline
+    flip / net-at-spot figures already in /api/gex/summary.
+    """
+    data = await db_manager.get_latest_gex_profile(symbol)
+    if not data:
+        raise HTTPException(status_code=404, detail="No GEX profile data available")
+    return GEXProfile(**data)
 
 
 @app.get("/api/gex/historical", response_model=List[GEXSummary], tags=["GEX"])

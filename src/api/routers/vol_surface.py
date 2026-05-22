@@ -14,11 +14,51 @@ from typing import Dict, List, Optional, Any
 from collections import OrderedDict
 import asyncio
 import logging
+import os
 
 from ..database import DatabaseManager
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/gex/vol_surface", tags=["GEX"])
+
+# ---------------------------------------------------------------------------
+# Data quality filters
+# ---------------------------------------------------------------------------
+# The IV solver clamps at IV_MAX (default 5.0 = 500%) and is also prone to
+# numerical artefacts on options approaching settlement: with T → 0 the BS
+# vega collapses, so a stale post-close mark of even a few dollars on a
+# near-the-money strike can solve to an IV of 1.5–4.0 that has no bearing
+# on the live volatility surface.  The vol-surface endpoint is a regime
+# snapshot, not a per-contract pricing tool, so we filter these out at
+# the API layer:
+#
+# - VOL_SURFACE_IV_MAX caps individual IVs.  Anything above the cap is
+#   nulled (treated as "no usable IV at this strike"); the surface is
+#   re-computed without it so the ATM-IV interpolation and the 25-delta
+#   skew don't pick up the artefact.  Default 2.0 (200%) is well above
+#   even severe SPY stress (COVID 2020 saw VIX ~80 → ATM IVs ~80%), so
+#   it never trims legitimate values, but it always catches the
+#   near-expiry solver blow-ups (1.5+ on SPY at any DTE > 0 is virtually
+#   always an artefact).
+# - VOL_SURFACE_MIN_STRIKE_COVERAGE drops whole expirations when, after
+#   the per-IV filter, fewer than this fraction of the requested strikes
+#   carry at least one valid IV.  An expiration whose snapshot is so
+#   sparse that the surface row is dominated by nulls (the 0DTE
+#   post-close "ghost" expiration is the canonical case) is more noise
+#   than signal — dropping it is preferable to handing the frontend a
+#   row that would render as a near-empty line.
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+VOL_SURFACE_IV_MAX = _env_float("VOL_SURFACE_IV_MAX", 2.0)
+VOL_SURFACE_MIN_STRIKE_COVERAGE = _env_float("VOL_SURFACE_MIN_STRIKE_COVERAGE", 0.30)
 
 # ---------------------------------------------------------------------------
 # Response models
@@ -118,11 +158,23 @@ def get_db() -> DatabaseManager:
 
 
 def _iv_or_null(row: dict) -> Optional[float]:
-    """Return IV as float, or None if IV is missing/non-positive."""
+    """Return IV as float, or None if IV is missing/non-positive/outlier.
+
+    The upper bound (``VOL_SURFACE_IV_MAX``) filters out IV solver
+    artefacts on near-expiry / stale-mark options that round-trip the
+    IV_MAX clamp (5.0) or land at the 1.5-4.0 "couldn't converge"
+    plateau.  These values are not real volatility — they're the
+    solver hitting a pricing surface with vanishing vega — and they
+    silently corrupt the ATM-IV interpolation and the 25-delta skew
+    when they slip through.
+    """
     iv = row.get("implied_volatility")
     if iv is None or iv <= 0:
         return None
-    return float(iv)
+    iv_f = float(iv)
+    if iv_f > VOL_SURFACE_IV_MAX:
+        return None
+    return iv_f
 
 
 def _interpolate_atm_iv(
@@ -160,25 +212,25 @@ def _interpolate_atm_iv(
 
 
 def _compute_25d_skew(rows_for_exp: List[dict]) -> Optional[float]:
-    """25-delta put-call IV spread for a single expiration."""
-    calls = [
-        (float(r["delta"]), float(r["implied_volatility"]))
-        for r in rows_for_exp
-        if r["option_type"] == "C"
-        and r["delta"] is not None
-        and r["implied_volatility"] is not None
-        and r.get("open_interest")
-        and r["open_interest"] > 0
-    ]
-    puts = [
-        (float(r["delta"]), float(r["implied_volatility"]))
-        for r in rows_for_exp
-        if r["option_type"] == "P"
-        and r["delta"] is not None
-        and r["implied_volatility"] is not None
-        and r.get("open_interest")
-        and r["open_interest"] > 0
-    ]
+    """25-delta put-call IV spread for a single expiration.
+
+    Reuses ``_iv_or_null`` so the outlier filter applies here too: a
+    near-expiry put with IV solving to 3.5 would otherwise dominate the
+    25-delta skew with a fictional spread.
+    """
+    calls = []
+    puts = []
+    for r in rows_for_exp:
+        if r["delta"] is None or not r.get("open_interest") or r["open_interest"] <= 0:
+            continue
+        iv = _iv_or_null(r)
+        if iv is None:
+            continue
+        d = float(r["delta"])
+        if r["option_type"] == "C":
+            calls.append((d, iv))
+        elif r["option_type"] == "P":
+            puts.append((d, iv))
     if not calls or not puts:
         return None
 
@@ -236,10 +288,23 @@ async def get_vol_surface(
     expirations_sorted = sorted(by_exp.keys())
     strikes_sorted = sorted({float(r["strike"]) for r in rows})
 
-    # Build surface slices, ATM term structure, and 25d skew
+    # Build surface slices, ATM term structure, and 25d skew.
+    # ``min_strikes_required`` enforces the per-expiration coverage
+    # floor: with default 30% of e.g. 30 requested strikes that's 9
+    # strikes that must carry at least one valid IV.  Anything less is
+    # treated as a degraded snapshot and excluded from the response
+    # entirely (the canonical case is a 0DTE expiration whose
+    # post-close snapshot has only a handful of artefact IVs at strikes
+    # bracketing spot — the kind of row that silently corrupts the
+    # ATM-IV term structure if surfaced).
+    min_strikes_required = max(
+        1, int(len(strikes_sorted) * VOL_SURFACE_MIN_STRIKE_COVERAGE)
+    )
+
     surface: List[ExpirationSlice] = []
     atm_term: List[ATMTermPoint] = []
     skew_25d: List[Skew25dPoint] = []
+    kept_expirations: List[date] = []
 
     for exp in expirations_sorted:
         dte = (exp - today).days
@@ -257,6 +322,28 @@ async def get_vol_surface(
             else:
                 by_strike[k]["put_iv"] = iv
 
+        # Per-expiration coverage check: count strikes that, after the
+        # outlier filter, carry at least one valid IV.  Skip the whole
+        # expiration when coverage falls below the configured floor.
+        usable_strike_count = sum(
+            1
+            for v in by_strike.values()
+            if v["call_iv"] is not None or v["put_iv"] is not None
+        )
+        if usable_strike_count < min_strikes_required:
+            logger.info(
+                "vol_surface[%s]: dropping expiration %s (DTE=%d) — "
+                "only %d/%d strikes carry a valid IV (< %.0f%% floor); "
+                "snapshot is degraded.",
+                symbol.upper(),
+                exp.isoformat(),
+                dte,
+                usable_strike_count,
+                len(strikes_sorted),
+                VOL_SURFACE_MIN_STRIKE_COVERAGE * 100,
+            )
+            continue
+
         # Build IV list for this expiration (only include strikes in our set)
         ivs = [
             StrikeIV(strike=k, call_iv=by_strike[k]["call_iv"], put_iv=by_strike[k]["put_iv"])
@@ -264,6 +351,7 @@ async def get_vol_surface(
             if k in by_strike
         ]
         surface.append(ExpirationSlice(expiration=exp, dte=dte, ivs=ivs))
+        kept_expirations.append(exp)
 
         # ATM IV: average call/put IV per strike, then interpolate at spot
         atm_points = []
@@ -283,11 +371,17 @@ async def get_vol_surface(
         skew = _compute_25d_skew(exp_rows)
         skew_25d.append(Skew25dPoint(dte=dte, skew=skew))
 
+    if not surface:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No vol surface data for {symbol} after data-quality filters",
+        )
+
     response = VolSurfaceResponse(
         symbol=symbol.upper(),
         spot_price=spot,
         timestamp=timestamp,
-        expirations=expirations_sorted,
+        expirations=kept_expirations,
         strikes=strikes_sorted,
         surface=surface,
         atm_term_structure=atm_term,
