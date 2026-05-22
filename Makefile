@@ -470,6 +470,18 @@ db-index-audit: ## Print an index audit for a table (default: option_chains), wi
 	@echo "    INCLUDE columns -- a superset can replace a subset."
 	@echo "  • Repeat with TABLE=<other> to audit signal_scores, flow_by_contract, etc."
 
+.PHONY: db-drop-candidate-audit
+db-drop-candidate-audit: ## Evidence pack for the option_chains drop candidates (suspects 1+2). Vars: UNDERLYING=SPY LOOKBACK_HOURS=2. Read-only.
+	@echo "$(BLUE)=== option_chains drop-candidate audit ($(or $(UNDERLYING),SPY), $(or $(LOOKBACK_HOURS),2)h) ===$(NC)"
+	@echo "$(YELLOW)Read-only.  Pulls pg_stat_statements top-20, EXPLAINs the query shapes$(NC)"
+	@echo "$(YELLOW)where the two suspect indexes could be picked, and shows current$(NC)"
+	@echo "$(YELLOW)idx_scan / last_idx_scan deltas.  Nothing is dropped here.$(NC)"
+	@echo "$(YELLOW)Override with: make db-drop-candidate-audit UNDERLYING=SPX LOOKBACK_HOURS=96$(NC)"
+	@$(PSQL) \
+		-v underlying=$(or $(UNDERLYING),SPY) \
+		-v lookback_hours=$(or $(LOOKBACK_HOURS),2) \
+		-f setup/database/diagnostics/drop_candidate_audit.sql
+
 .PHONY: db-drop-underused-option-chains-idx
 db-drop-underused-option-chains-idx: ## DROP CONCURRENTLY idx_option_chains_underlying (35 scans observed; subsumed by every (underlying, ...) composite). Pass CONFIRM=yes.
 	@echo "$(BLUE)=== Dropping idx_option_chains_underlying CONCURRENTLY ===$(NC)"
