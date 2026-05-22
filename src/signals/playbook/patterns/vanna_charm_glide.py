@@ -94,6 +94,7 @@ class VannaCharmGlidePattern(PatternBase):
 
         vcf = ctx.signal("vanna_charm_flow")
         # _check_triggers ensures vcf is non-None and |score| >= threshold.
+        assert vcf is not None
         drift: DriftDirection = "bullish" if vcf.score > 0 else "bearish"
 
         close = ctx.close

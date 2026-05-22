@@ -302,3 +302,53 @@ def test_get_flow_full_session_clamped_to_session_start():
     _symbol, lo, hi = conn.last_args
     assert lo == session_start.astimezone(timezone.utc)
     assert hi == datetime(2026, 4, 23, 14, 40, tzinfo=et).astimezone(timezone.utc)
+
+
+def test_option_contract_bars_surface_per_bar_classified_flow():
+    """/api/option/contract must return per-bar ask/mid/bid_volume.
+
+    Storage in option_chains is session-cumulative for volume AND the three
+    classified-flow columns (see schema.sql COMMENT ON option_chains.*_volume),
+    so the read path must convert each to a per-bar delta via LAG.  Regression
+    guard for a bug introduced when the writer was migrated to cumulative
+    storage but this reader kept selecting the raw columns.
+    """
+    db = DatabaseManager()
+    conn = _FakeFlowConn([])
+
+    @asynccontextmanager
+    async def _acquire():
+        yield conn
+
+    db._acquire_connection = _acquire  # type: ignore[method-assign]
+
+    window_start = datetime(2026, 5, 22, 13, 30, tzinfo=timezone.utc)
+    window_end = datetime(2026, 5, 22, 20, 0, tzinfo=timezone.utc)
+    asyncio.run(db._fetch_option_contract_bars("SPY 250522C00500000", window_start, window_end))
+
+    sql = conn.last_query
+    assert sql is not None
+
+    # Each classified-flow column must be aggregated to its per-minute max
+    # in the CTE (to handle sub-minute snapshots, matching bar_volume) ...
+    for partition_alias in ("bar_ask_volume", "bar_mid_volume", "bar_bid_volume"):
+        assert partition_alias in sql, f"missing per-minute MAX alias {partition_alias}"
+
+    # ... and surfaced as a LAG-based delta in the outer SELECT, named the
+    # same as the original column so the OptionContractRow fields populate
+    # with per-interval values (not session-cumulative running totals).
+    for cum_alias, out_name in (
+        ("bar_ask_volume", "ask_volume"),
+        ("bar_mid_volume", "mid_volume"),
+        ("bar_bid_volume", "bid_volume"),
+    ):
+        lag_expr = f"LAG({cum_alias}) OVER (ORDER BY bar_ts)"
+        assert lag_expr in sql, f"{out_name} not computed via LAG of {cum_alias}"
+        assert f")::bigint          AS {out_name}" in sql, f"{out_name} missing AS clause"
+
+    # The raw column names must NOT appear as bare SELECT items -- those
+    # would be session-cumulative and would re-introduce the bug.
+    bare_indent = " " * 16
+    for col in ("ask_volume", "mid_volume", "bid_volume"):
+        bare = f"{bare_indent}{col},"
+        assert bare not in sql, f"raw cumulative column selected: {col}"

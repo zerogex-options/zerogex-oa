@@ -16,6 +16,23 @@ load_dotenv()
 _cfg_logger = logging.getLogger(__name__)
 
 
+def _strip_env_value(raw: Optional[str]) -> Optional[str]:
+    """Normalize a raw env-var value before numeric parsing.
+
+    Strips leading/trailing whitespace AND any inline ``# comment`` tail.
+    python-dotenv preserves everything after ``=`` literally (including
+    inline ``# ...`` annotations), so a ``.env`` file with a line like
+    ``KEY=1  # was 2`` would otherwise crash int()/float() with a
+    confusing ValueError on service startup.  ``#`` is never valid in a
+    numeric value, so dropping at the first ``#`` is safe for the
+    helpers that call this.
+    """
+    if raw is None:
+        return None
+    stripped = raw.split("#", 1)[0].strip()
+    return stripped
+
+
 def _getenv_int(
     name: str, default: int, *, min: Optional[int] = None, max: Optional[int] = None
 ) -> int:
@@ -26,16 +43,18 @@ def _getenv_int(
     drive an unreasonable parameter.
     """
     raw = os.getenv(name)
-    if raw is None or raw.strip() == "":
+    cleaned = _strip_env_value(raw)
+    if cleaned is None or cleaned == "":
         value = default
     else:
         try:
-            value = int(raw.strip())
+            value = int(cleaned)
         except (TypeError, ValueError):
             _cfg_logger.error(
-                "Invalid int for env var %s=%r — falling back to default %d",
+                "Invalid int for env var %s=%r (cleaned=%r) — falling back to default %d",
                 name,
                 raw,
+                cleaned,
                 default,
             )
             value = default
@@ -53,16 +72,18 @@ def _getenv_float(
 ) -> float:
     """Fetch a float env var with a clear error on parse failure and optional clamping."""
     raw = os.getenv(name)
-    if raw is None or raw.strip() == "":
+    cleaned = _strip_env_value(raw)
+    if cleaned is None or cleaned == "":
         value = default
     else:
         try:
-            value = float(raw.strip())
+            value = float(cleaned)
         except (TypeError, ValueError):
             _cfg_logger.error(
-                "Invalid float for env var %s=%r — falling back to default %s",
+                "Invalid float for env var %s=%r (cleaned=%r) — falling back to default %s",
                 name,
                 raw,
+                cleaned,
                 default,
             )
             value = default
@@ -128,11 +149,18 @@ def _getenv_float_list(
 
 
 def _getenv_bool(name: str, default: bool) -> bool:
-    """Fetch a boolean env var.  Accepts (case-insensitive) true/false/1/0/yes/no."""
+    """Fetch a boolean env var.  Accepts (case-insensitive) true/false/1/0/yes/no.
+
+    Inline ``# comment`` tails are stripped so an operator with a
+    ``KEY=true  # explanation`` line in .env still gets True (python-dotenv
+    preserves everything after ``=`` literally, otherwise that value would
+    silently fall back to the default + log an error every startup).
+    """
     raw = os.getenv(name)
-    if raw is None:
+    cleaned = _strip_env_value(raw)
+    if cleaned is None:
         return default
-    normalized = raw.strip().lower()
+    normalized = cleaned.lower()
     if normalized in {"true", "1", "yes", "on"}:
         return True
     if normalized in {"false", "0", "no", "off", ""}:
@@ -199,8 +227,92 @@ GEX_HEATMAP_STRIKE_BAND_PCT = _getenv_float("GEX_HEATMAP_STRIKE_BAND_PCT", 0.08,
 # (puts-only, dealer net short under this codebase's sign convention)
 # and f(S)→0+ as S→∞ (calls-only, dealer net long).  Our job is to
 # RESOLVE it in a window where the signal is strong enough to trust.
-GAMMA_PROFILE_SPAN_PCT = _getenv_float("GAMMA_PROFILE_SPAN_PCT", 0.20, min=0.02, max=1.0)
-GAMMA_PROFILE_STEP_PCT = _getenv_float("GAMMA_PROFILE_STEP_PCT", 0.0025, min=0.0001, max=0.05)
+#
+# ──────────────────────────────────────────────────────────────────
+# KNOB BUNDLE: GAMMA_FLIP_PROFILE
+# ──────────────────────────────────────────────────────────────────
+# The eleven individual knobs below have non-obvious interactions, so
+# direct tuning of any one of them in isolation is rarely the right
+# answer.  GAMMA_FLIP_PROFILE selects a vetted bundle of all of them
+# at once:
+#
+#   default — current production tuning (these are the values the
+#             codebase has been validated against; pick this unless
+#             you have a specific operational reason to deviate).
+#   strict  — tighter gates: rejects more candidate crossings, more
+#             NULLs, higher signal quality on the resolved flips.
+#             Use when downstream consumers are sensitive to false
+#             positives (e.g. an automated playbook in a degraded
+#             chain regime).
+#   lenient — looser gates: accepts more candidates, fewer NULLs,
+#             more noise.  Use when downstream consumers can tolerate
+#             a wider, more frequent signal (e.g. exploratory analysis).
+#
+# Per-knob env vars below STILL override the bundle for ops emergencies;
+# the bundle just supplies the default if no per-knob override is set.
+_FLIP_PROFILES: Dict[str, Dict[str, Any]] = {
+    "default": {
+        "span_pct": 0.20,
+        "step_pct": 0.0025,
+        "expansion_rungs": [0.35, 0.50],
+        "interior_margin": 0.10,
+        "structural_min_frac": 0.02,
+        "structural_window_pct": 0.01,
+        "structural_reference_percentile": 90.0,
+        "structural_reference_span_pct": 0.15,
+        "structural_active_distance_pct": 0.01,
+        "max_flip_distance_pct": 0.08,
+        "dte_ref_days": 5.0,
+    },
+    "strict": {
+        # Narrower max distance, higher floor fraction, tighter
+        # structural window — accepts only well-anchored, near-spot flips.
+        "span_pct": 0.20,
+        "step_pct": 0.0025,
+        "expansion_rungs": [0.35, 0.50],
+        "interior_margin": 0.15,
+        "structural_min_frac": 0.05,
+        "structural_window_pct": 0.005,
+        "structural_reference_percentile": 90.0,
+        "structural_reference_span_pct": 0.15,
+        "structural_active_distance_pct": 0.005,
+        "max_flip_distance_pct": 0.05,
+        "dte_ref_days": 5.0,
+    },
+    "lenient": {
+        # Wider max distance, lower floor fraction, looser interior
+        # margin — accepts more candidates, including marginal ones.
+        "span_pct": 0.20,
+        "step_pct": 0.0025,
+        "expansion_rungs": [0.35, 0.50],
+        "interior_margin": 0.05,
+        "structural_min_frac": 0.01,
+        "structural_window_pct": 0.02,
+        "structural_reference_percentile": 90.0,
+        "structural_reference_span_pct": 0.15,
+        "structural_active_distance_pct": 0.015,
+        "max_flip_distance_pct": 0.12,
+        "dte_ref_days": 5.0,
+    },
+}
+
+
+def _selected_flip_profile() -> Dict[str, Any]:
+    name = os.getenv("GAMMA_FLIP_PROFILE", "default").strip().lower()
+    if name not in _FLIP_PROFILES:
+        # Unknown bundle: degrade to default rather than fail import.
+        # This is the config layer; a bad value here shouldn't crash
+        # the engine at startup before we can log the diagnostic.
+        return _FLIP_PROFILES["default"]
+    return _FLIP_PROFILES[name]
+
+
+_FP = _selected_flip_profile()
+
+GAMMA_PROFILE_SPAN_PCT = _getenv_float("GAMMA_PROFILE_SPAN_PCT", _FP["span_pct"], min=0.02, max=1.0)
+GAMMA_PROFILE_STEP_PCT = _getenv_float(
+    "GAMMA_PROFILE_STEP_PCT", _FP["step_pct"], min=0.0001, max=0.05
+)
 
 # Adaptive expansion rungs BEYOND the initial GAMMA_PROFILE_SPAN_PCT,
 # in ascending order, each an absolute fraction of spot.  Tried only
@@ -211,7 +323,7 @@ GAMMA_PROFILE_STEP_PCT = _getenv_float("GAMMA_PROFILE_STEP_PCT", 0.0025, min=0.0
 # enough" threshold: anything beyond it is persisted NULL+WARN.
 GAMMA_PROFILE_EXPANSION_RUNGS = _getenv_float_list(
     "GAMMA_PROFILE_EXPANSION_RUNGS",
-    [0.35, 0.50],
+    _FP["expansion_rungs"],
     min_item=0.02,
     max_item=1.0,
     ascending=True,
@@ -232,7 +344,7 @@ GAMMA_PROFILE_SPAN_LADDER: List[float] = [
 # ±20% grid boundary).  Range [0.0, 0.49] — 0.49 is the largest value
 # that still permits a single qualifying crossing (the grid center).
 GAMMA_PROFILE_INTERIOR_MARGIN = _getenv_float(
-    "GAMMA_PROFILE_INTERIOR_MARGIN", 0.10, min=0.0, max=0.49
+    "GAMMA_PROFILE_INTERIOR_MARGIN", _FP["interior_margin"], min=0.0, max=0.49
 )
 # Structural gate: a candidate sign change is rejected unless the peak
 # |profile| value within ±STRUCTURAL_WINDOW_PCT × candidate_price of the
@@ -256,13 +368,16 @@ GAMMA_PROFILE_INTERIOR_MARGIN = _getenv_float(
 # a truly uniformly-noisy chain (where p90 ≈ max), so the noise-floor
 # rejection it was originally designed for is preserved.
 GAMMA_PROFILE_STRUCTURAL_MIN_FRAC = _getenv_float(
-    "GAMMA_PROFILE_STRUCTURAL_MIN_FRAC", 0.02, min=0.0, max=1.0
+    "GAMMA_PROFILE_STRUCTURAL_MIN_FRAC", _FP["structural_min_frac"], min=0.0, max=1.0
 )
 GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT = _getenv_float(
-    "GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT", 0.01, min=0.001, max=0.10
+    "GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT", _FP["structural_window_pct"], min=0.001, max=0.10
 )
 GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE = _getenv_float(
-    "GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE", 90.0, min=50.0, max=100.0
+    "GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE",
+    _FP["structural_reference_percentile"],
+    min=50.0,
+    max=100.0,
 )
 # Span over which the structural-reference profile is built before the
 # active-strike filter is applied.  Held constant across every ladder
@@ -277,7 +392,10 @@ GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE = _getenv_float(
 # below) has enough profile points to work with even on chains whose
 # OI is geometrically concentrated.
 GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT = _getenv_float(
-    "GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT", 0.15, min=0.02, max=1.0
+    "GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT",
+    _FP["structural_reference_span_pct"],
+    min=0.02,
+    max=1.0,
 )
 # Active-strike filter for the structural reference.  After the
 # canonical-band profile is built, each grid point is INCLUDED in the
@@ -290,7 +408,10 @@ GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT = _getenv_float(
 # four grid steps at the default GAMMA_PROFILE_STEP_PCT=0.25%; tighten
 # this for symbols with dense OI, loosen for thin chains.
 GAMMA_PROFILE_STRUCTURAL_ACTIVE_DISTANCE_PCT = _getenv_float(
-    "GAMMA_PROFILE_STRUCTURAL_ACTIVE_DISTANCE_PCT", 0.01, min=0.001, max=0.10
+    "GAMMA_PROFILE_STRUCTURAL_ACTIVE_DISTANCE_PCT",
+    _FP["structural_active_distance_pct"],
+    min=0.001,
+    max=0.10,
 )
 # Distance gate: a structurally valid interior crossing is rejected when
 # it sits further than this fraction of spot from the current underlying
@@ -303,7 +424,7 @@ GAMMA_PROFILE_STRUCTURAL_ACTIVE_DISTANCE_PCT = _getenv_float(
 # diverging displays).  Set to 1.0 to disable (= unbounded, prior
 # behavior).  Range [0.01, 1.0].
 GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT = _getenv_float(
-    "GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT", 0.08, min=0.01, max=1.0
+    "GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT", _FP["max_flip_distance_pct"], min=0.01, max=1.0
 )
 
 # The gamma flip is a *multi-day* regime level, but a same-day 0DTE wall
@@ -320,7 +441,9 @@ GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT = _getenv_float(
 # are unchanged.  Applied inside the single shared profile, so the flip
 # and net-GEX-at-spot stay sign-consistent by construction.
 GAMMA_PROFILE_DTE_WEIGHTING = _getenv_bool("GAMMA_PROFILE_DTE_WEIGHTING", True)
-GAMMA_PROFILE_DTE_REF_DAYS = _getenv_float("GAMMA_PROFILE_DTE_REF_DAYS", 5.0, min=0.5, max=60.0)
+GAMMA_PROFILE_DTE_REF_DAYS = _getenv_float(
+    "GAMMA_PROFILE_DTE_REF_DAYS", _FP["dte_ref_days"], min=0.5, max=60.0
+)
 
 # Batch Sizes
 QUOTE_BATCH_SIZE = int(os.getenv("QUOTE_BATCH_SIZE", "100"))  # TradeStation supports up to 500
@@ -383,6 +506,24 @@ STRIKE_CLEANUP_INTERVAL = int(os.getenv("STRIKE_CLEANUP_INTERVAL", "100"))  # it
 SESSION_TEMPLATE = os.getenv("SESSION_TEMPLATE", "Default")
 TS_STREAM_READ_TIMEOUT = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
 TS_STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").lower() == "true"
+
+# Streaming quotes endpoint encodes the symbol list in the URL path. With
+# ~1000+ option contracts tracked, a single-connection URL exceeds ~25KB
+# and triggers a 414 Request-URI Too Large from TradeStation's gateway.
+# Split tracked symbols across multiple stream connections so each URL
+# stays well under that gateway limit. At ~25 bytes/symbol, 500/chunk
+# yields URLs of ~12.5KB — comfortably under 25KB — and keeps the
+# concurrent-stream count low when multiple underlyings run side-by-side:
+# 3 ingestion processes × (1 underlying + 2 option chunks) = 9 streams,
+# fitting inside TradeStation's 10-stream-per-account cap. A smaller
+# default (200) produced 4 option chunks per process and pushed three
+# concurrent underlyings to 15 streams, silently exceeding the cap and
+# manifesting as "Response ended prematurely" disconnects with the
+# underlying bar stream the most frequent casualty (it starts last in
+# _start_accumulators so it loses the race for the remaining slot first).
+STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION = int(
+    os.getenv("STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION", "500")
+)
 
 # Underlying-stream data-staleness watchdog. The TradeStation bar stream
 # can stay socket-alive (heartbeats flowing) while delivering zero bars —
@@ -1294,6 +1435,7 @@ def get_all_config() -> Dict[str, Any]:
             "extended_hours_max_wait": EXTENDED_HOURS_POLL_INTERVAL,
             "closed_hours_max_wait": CLOSED_HOURS_POLL_INTERVAL,
             "stream_read_timeout": TS_STREAM_READ_TIMEOUT,
+            "quotes_max_symbols_per_connection": STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION,
             "option_oi_coverage_alert_threshold": OPTION_OI_COVERAGE_ALERT_THRESHOLD,
             "option_volume_coverage_alert_threshold": OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD,
             "option_volume_warmup_minutes": OPTION_VOLUME_WARMUP_MINUTES,
@@ -1319,8 +1461,12 @@ def get_all_config() -> Dict[str, Any]:
             "max_portfolio_heat_pct": SIGNALS_MAX_PORTFOLIO_HEAT_PCT,
             "same_direction_cooldown_minutes": SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES,
             "stop_loss_pct": SIGNALS_STOP_LOSS_PCT,
-            "independent_phase_scalp_minutes_from_open": SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN,
-            "independent_phase_swing_minutes_to_close": SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE,
+            "independent_phase_scalp_minutes_from_open": (
+                SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN
+            ),
+            "independent_phase_swing_minutes_to_close": (
+                SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE
+            ),
             "independent_phase_scalp_minutes_by_symbol": _jsonable_copy(
                 SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_BY_SYMBOL
             ),
@@ -1336,7 +1482,9 @@ def get_all_config() -> Dict[str, Any]:
             "independent_risk_profiles": {
                 "squeeze_setup": SIGNALS_INDEPENDENT_RISK_PROFILE_SQUEEZE_SETUP,
                 "trap_detection": SIGNALS_INDEPENDENT_RISK_PROFILE_TRAP_DETECTION,
-                "zero_dte_position_imbalance": SIGNALS_INDEPENDENT_RISK_PROFILE_ZERO_DTE_POSITION_IMBALANCE,
+                "zero_dte_position_imbalance": (
+                    SIGNALS_INDEPENDENT_RISK_PROFILE_ZERO_DTE_POSITION_IMBALANCE
+                ),
                 "gamma_vwap_confluence": SIGNALS_INDEPENDENT_RISK_PROFILE_GAMMA_VWAP_CONFLUENCE,
                 "vol_expansion": SIGNALS_INDEPENDENT_RISK_PROFILE_VOL_EXPANSION,
                 "eod_pressure": SIGNALS_INDEPENDENT_RISK_PROFILE_EOD_PRESSURE,

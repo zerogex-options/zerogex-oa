@@ -35,7 +35,8 @@ def get_db_password() -> Optional[str]:
     logger.debug(f"Using password provider: {provider}")
 
     if provider == "pgpass":
-        return _get_password_from_pgpass()
+        _get_password_from_pgpass()  # raises if .pgpass missing/misconfigured
+        return None
     elif provider == "aws_secrets_manager":
         return _get_password_from_aws_secrets_manager()
     elif provider == "env":
@@ -125,7 +126,7 @@ def _get_password_from_aws_secrets_manager() -> str:
             # AWS RDS secrets typically have a 'password' key
             if "password" in secret:
                 logger.info("✅ Successfully retrieved password from AWS Secrets Manager")
-                return secret["password"]
+                return secret["password"]  # type: ignore[no-any-return]
             else:
                 raise ValueError(
                     f"Secret '{secret_name}' does not contain 'password' key. "

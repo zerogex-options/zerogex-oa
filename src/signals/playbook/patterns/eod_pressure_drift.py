@@ -71,10 +71,12 @@ class EodPressureDriftPattern(PatternBase):
         eod = ctx.signal("eod_pressure")
         # _check_triggers guarantees eod is non-None, triggered, and
         # |score| >= _EOD_SCORE_MIN.
+        assert eod is not None
         drift: DriftDirection = "bullish" if eod.score > 0 else "bearish"
 
         close = ctx.close
         vwap = ctx.market.vwap
+        assert vwap is not None, "_check_triggers ensures vwap is set"
         # Spec target: VWAP + 1.5 × distance-from-VWAP-at-entry.  Algebra
         # collapses to the same formula for both directions.
         target_ref = _VWAP_TARGET_MULT * close - (_VWAP_TARGET_MULT - 1.0) * vwap
@@ -226,7 +228,7 @@ class EodPressureDriftPattern(PatternBase):
 
     @staticmethod
     def _zero_dte_expiry(ctx: PlaybookContext) -> str:
-        return ctx.et_date.isoformat()
+        return ctx.et_date.isoformat()  # type: ignore[no-any-return]
 
     @staticmethod
     def _compose_rationale(

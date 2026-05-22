@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import math
 import os
-from datetime import time, timedelta
+from datetime import timedelta
 from typing import Optional
 
 from src.signals.playbook.base import PatternBase
@@ -92,6 +92,7 @@ class SkewInversionReversalPattern(PatternBase):
 
         close = ctx.close
         skew = ctx.signal("skew_delta")  # _check_triggers ensures non-None
+        assert skew is not None
         sigma_1min = _realized_sigma_1min(ctx.market.recent_closes)
         atr_daily_proxy = sigma_1min * _DAILY_SIGMA_SCALAR
 
@@ -233,7 +234,7 @@ class SkewInversionReversalPattern(PatternBase):
         scores = [s for _ts, s in snap.score_history]
         if not scores:
             return None
-        return sum(scores) / len(scores)
+        return sum(scores) / len(scores)  # type: ignore[no-any-return]
 
     @staticmethod
     def _is_new_20d_low(snap) -> bool:
@@ -247,7 +248,7 @@ class SkewInversionReversalPattern(PatternBase):
         prior = [s for _ts, s in snap.score_history[:-1]]  # exclude latest
         if not prior:
             return False
-        return snap.clamped_score < min(prior)
+        return snap.clamped_score < min(prior)  # type: ignore[no-any-return]
 
     @staticmethod
     def _volatility_regime_score(ctx: PlaybookContext) -> Optional[float]:
@@ -261,7 +262,7 @@ class SkewInversionReversalPattern(PatternBase):
 
     @staticmethod
     def _dte_expiry(ctx: PlaybookContext, days: int) -> str:
-        return (ctx.et_date + timedelta(days=days)).isoformat()
+        return (ctx.et_date + timedelta(days=days)).isoformat()  # type: ignore[no-any-return]
 
 
 PATTERN: PatternBase = SkewInversionReversalPattern()

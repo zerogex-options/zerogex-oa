@@ -87,7 +87,7 @@ class VannaCharmFlowComponent(ComponentBase):
         # either field reaching its own scale can drive the score.
         v_term = max(-1.0, min(1.0, vanna / norm_v))
         c_term = max(-1.0, min(1.0, (charm * charm_weight) / norm_c))
-        return max(-1.0, min(1.0, v_term + c_term))
+        return max(-1.0, min(1.0, v_term + c_term))  # type: ignore[no-any-return]
 
     def context_values(self, ctx: MarketContext) -> dict:
         agg = self._aggregate(ctx)
@@ -191,13 +191,13 @@ class VannaCharmFlowComponent(ComponentBase):
         normalizers = extra.get("normalizers") if isinstance(extra, dict) else None
         if isinstance(normalizers, dict):
             try:
-                fv = float(normalizers.get("dealer_vanna_exposure"))
+                fv = float(normalizers.get("dealer_vanna_exposure"))  # type: ignore[arg-type]
                 if fv > 0:
                     norm_v = fv
             except (TypeError, ValueError):
                 pass
             try:
-                fc = float(normalizers.get("dealer_charm_exposure"))
+                fc = float(normalizers.get("dealer_charm_exposure"))  # type: ignore[arg-type]
                 if fc > 0:
                     norm_c = fc
             except (TypeError, ValueError):

@@ -28,6 +28,9 @@ from psycopg2.extras import execute_values
 from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
 from src.config import (
+    _getenv_bool,
+    _getenv_float,
+    _getenv_int,
     RISK_FREE_RATE,
     ANALYTICS_FLOW_CACHE_REFRESH_ENABLED,
     GAMMA_PROFILE_SPAN_PCT,
@@ -45,7 +48,7 @@ from src.config import (
 )
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.analytics.walls import compute_call_put_walls
-from src.flow_series_sql import SNAPSHOT_UPSERT_PSYCOPG2
+from src.flow_series_sql import SNAPSHOT_UPSERT_PSYCOPG2, SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2
 from src.market_calendar import (
     calculate_time_to_expiration,
     expiration_close_time_et,
@@ -88,24 +91,53 @@ class AnalyticsEngine:
         self.calculation_interval = calculation_interval
         self.risk_free_rate = risk_free_rate
         self.running = False
-        self.snapshot_lookback_hours = max(
-            1, int(os.getenv("ANALYTICS_SNAPSHOT_LOOKBACK_HOURS", "2"))
+        # Accept fractional hours (e.g. 0.5 = 30 min, 0.25 = 15 min) so an
+        # operator on a cold-storage buffer pool can dial the snapshot
+        # working set down without a code change.  Floor at 5 minutes
+        # (1/12 h) -- below that you risk losing recently-quoted contracts
+        # that haven't been requoted in the narrowed window, which
+        # silently distorts GEX/max-pain instead of failing loudly.
+        #
+        # All four env vars in this block go through _getenv_int /
+        # _getenv_float, which tolerate inline shell-style ``# comment``
+        # tails in the .env file (python-dotenv preserves everything
+        # after ``=`` literally, so a stray ``KEY=1 # foo`` would
+        # otherwise crash the analytics workers at startup).
+        self.snapshot_lookback_hours = _getenv_float(
+            "ANALYTICS_SNAPSHOT_LOOKBACK_HOURS", 2.0, min=1.0 / 12.0
         )
+        # Cold-start lookback floors at the steady-state value so a
+        # misconfigured cold-start < steady-state silently uses the
+        # steady-state width (never narrower).
         self.snapshot_cold_start_lookback_hours = max(
             self.snapshot_lookback_hours,
-            int(os.getenv("ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS", "96")),
+            _getenv_float("ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS", 96.0),
         )
         # The wide cold-start scan can legitimately run longer than the
         # pool-wide DB_STATEMENT_TIMEOUT_MS (default 90s) when the buffer
         # pool is cold.  Give just that one query a higher per-statement
         # ceiling via SET LOCAL so a cold first cycle isn't killed at 90s.
-        self.snapshot_cold_start_statement_timeout_ms = max(
-            0, int(os.getenv("ANALYTICS_SNAPSHOT_COLD_START_STATEMENT_TIMEOUT_MS", "180000"))
+        self.snapshot_cold_start_statement_timeout_ms = _getenv_int(
+            "ANALYTICS_SNAPSHOT_COLD_START_STATEMENT_TIMEOUT_MS", 180000, min=0
+        )
+        # Dedicated per-statement timeout for the STEADY-STATE snapshot
+        # query.  The pool-wide DB_STATEMENT_TIMEOUT_MS (default 90s) is
+        # sized for sub-second API queries; the steady-state 2h snapshot
+        # walk usually finishes in seconds but can spike past 90s under
+        # autovacuum + concurrent ingestion bursts -- in which case the
+        # pool ceiling kills it, the cycle aborts at the "if not snapshot"
+        # guard, and the next cycle starts immediately into another 90s
+        # kill (no progress, downstream flow_series_5min snapshot never
+        # refreshes -> API shortfall alarms).  Default 0 = use the pool
+        # ceiling (no behavior change).  Operators seeing the snapshot
+        # wedge can raise this (e.g. 150000) without raising the
+        # pool-wide ceiling, since SET LOCAL is scoped to this single
+        # query and reverts on commit.
+        self.snapshot_statement_timeout_ms = _getenv_int(
+            "ANALYTICS_SNAPSHOT_STATEMENT_TIMEOUT_MS", 0, min=0
         )
         self._snapshot_cold_start_consumed = False
-        self.min_oi_coverage_pct_alert = float(
-            os.getenv("ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT", "0.35")
-        )
+        self.min_oi_coverage_pct_alert = _getenv_float("ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT", 0.35)
 
         # Off-hours mode: keep cycling on weekends / NYSE holidays instead
         # of sleeping until the next run window.  The snapshot is anchored
@@ -114,12 +146,10 @@ class AnalyticsEngine:
         # (e.g. Friday's close on a Saturday) rather than reporting nothing.
         # A longer interval is used off-hours since the underlying data is
         # static until the next session.
-        self.off_hours_enabled = os.getenv(
-            "ANALYTICS_OFF_HOURS_ENABLED", "true"
-        ).strip().lower() in ("1", "true", "yes", "on")
+        self.off_hours_enabled = _getenv_bool("ANALYTICS_OFF_HOURS_ENABLED", True)
         self.off_hours_interval = max(
             self.calculation_interval,
-            int(os.getenv("ANALYTICS_OFF_HOURS_INTERVAL_SECONDS", "300")),
+            _getenv_int("ANALYTICS_OFF_HOURS_INTERVAL_SECONDS", 300),
         )
 
         # Metrics
@@ -144,6 +174,26 @@ class AnalyticsEngine:
         # logged once (INFO) per closed period instead of a WARNING every
         # interval, and is cleared the moment Greek-bearing data resumes.
         self._empty_snapshot_state: bool = False
+        # Latch for the "gamma flip unresolved" state.  The resolver
+        # correctly persists NULL (no clamp, no carry-forward) when no
+        # ladder rung yields a structural-interior crossing inside the
+        # actionable-distance gate -- but when that condition persists
+        # for an entire morning (e.g. SPX positioning placing the flip
+        # well beyond ±MAX_FLIP_DISTANCE_PCT, the May 22, 2026 SPX
+        # holiday-weekend regime), the verbose diagnostic warning used
+        # to fire once per minute, drowning operators in identical
+        # multi-line spam.  Now: emit the full diagnostic on the
+        # resolved→unresolved transition, and again every
+        # ``_gamma_flip_unresolved_warn_throttle_seconds`` while the
+        # condition persists, so operators still see a refresh of the
+        # underlying chain stats (IV, OI by DTE, peak/floor) instead of
+        # the log going silent for hours.  An info line is emitted on
+        # the unresolved→resolved transition so the recovery is visible.
+        self._gamma_flip_unresolved_state: bool = False
+        self._gamma_flip_unresolved_last_warn_mono: float = 0.0
+        self._gamma_flip_unresolved_warn_throttle_seconds: float = _getenv_float(
+            "GAMMA_FLIP_UNRESOLVED_WARN_THROTTLE_SECONDS", 900.0, min=0.0
+        )
         # Distinct frozen snapshot timestamp for which the unchanged-
         # snapshot skip has already been logged at INFO.  Off-hours the
         # timestamp is frozen for hours, so the skip guard would otherwise
@@ -154,8 +204,8 @@ class AnalyticsEngine:
         self._last_skip_logged_ts: Optional[datetime] = None
         self._last_flow_cache_ts: Optional[datetime] = None
         self._last_flow_cache_refresh_mono: float = 0.0
-        self._flow_cache_refresh_min_seconds: float = float(
-            os.getenv("FLOW_CACHE_REFRESH_MIN_SECONDS", "15")
+        self._flow_cache_refresh_min_seconds: float = _getenv_float(
+            "FLOW_CACHE_REFRESH_MIN_SECONDS", 15.0
         )
         self._analytics_flow_cache_refresh_enabled: bool = ANALYTICS_FLOW_CACHE_REFRESH_ENABLED
 
@@ -256,7 +306,7 @@ class AnalyticsEngine:
             self._SNAPSHOT_QUERY,
             (self.db_symbol, timestamp, lookback_start, min_expiration, row_cap),
         )
-        return cursor.fetchall()
+        return cursor.fetchall()  # type: ignore[no-any-return]
 
     def _get_snapshot(self) -> Optional[Dict[str, Any]]:
         """Fetch latest timestamp, underlying price, and option data.
@@ -415,18 +465,39 @@ class AnalyticsEngine:
                 # against contracts whose option_symbol sorts last.
                 # The new cap is well above any realistic chain size; if
                 # we hit it we log a warning rather than silently dropping.
-                snapshot_row_cap = int(os.getenv("ANALYTICS_SNAPSHOT_MAX_ROWS", "50000"))
+                snapshot_row_cap = _getenv_int("ANALYTICS_SNAPSHOT_MAX_ROWS", 50000, min=1)
 
                 data_age = datetime.now(timezone.utc) - timestamp
                 want_cold_start = not self._snapshot_cold_start_consumed and data_age > timedelta(
                     hours=self.snapshot_lookback_hours
                 )
+                # Buffer-pool warmup is a separate concern from the
+                # data-staleness gate.  A mid-session restart with live
+                # ingestion sees fresh data (data_age < snapshot_lookback_hours)
+                # and skips the wide cold-start scan, but the buffer pool is
+                # still cold from the restart -- the 2h steady-state walk can
+                # then drag past the steady-state statement_timeout on that
+                # FIRST cycle and the whole process loops at 90-150s
+                # snapshot=timeout / no progress until something warms the
+                # pool.  Grant the SAME cold-start budget to cycle 1 on the
+                # steady-state path; from cycle 2 the pool is warm enough
+                # that the configured steady-state budget suffices.
+                is_first_cycle = not self._snapshot_cold_start_consumed
                 self._snapshot_cold_start_consumed = True
+                # Effective per-query ceiling used by the steady-state
+                # branch and the cold-start fallback retry.  Cycle 1 gets
+                # the cold-start budget because the pool is cold; later
+                # cycles get the configured steady-state value.
+                steady_state_timeout_ms = (
+                    self.snapshot_cold_start_statement_timeout_ms
+                    if is_first_cycle
+                    else self.snapshot_statement_timeout_ms
+                )
 
                 if want_cold_start:
                     logger.info(
                         "Cold-start snapshot: latest data is %.1fh old; using "
-                        "%dh lookback (steady-state %dh) with %dms statement_timeout",
+                        "%.2fh lookback (steady-state %.2fh) with %dms statement_timeout",
                         data_age.total_seconds() / 3600.0,
                         self.snapshot_cold_start_lookback_hours,
                         self.snapshot_lookback_hours,
@@ -436,7 +507,7 @@ class AnalyticsEngine:
                         rows = self._run_snapshot_query(
                             cursor,
                             timestamp,
-                            self.snapshot_cold_start_lookback_hours,
+                            self.snapshot_cold_start_lookback_hours,  # type: ignore[arg-type]
                             min_expiration,
                             snapshot_row_cap,
                             statement_timeout_ms=self.snapshot_cold_start_statement_timeout_ms,
@@ -467,18 +538,33 @@ class AnalyticsEngine:
                         rows = self._run_snapshot_query(
                             cursor,
                             timestamp,
-                            self.snapshot_lookback_hours,
+                            self.snapshot_lookback_hours,  # type: ignore[arg-type]
                             min_expiration,
                             snapshot_row_cap,
+                            statement_timeout_ms=steady_state_timeout_ms,
                         )
                         conn.commit()
                 else:
+                    if is_first_cycle and steady_state_timeout_ms > 0:
+                        # Surface the warmup-budget upgrade so an operator
+                        # diagnosing a slow restart can see why cycle 1's
+                        # statement_timeout differs from the configured
+                        # steady-state value.
+                        logger.info(
+                            "First-cycle steady-state snapshot: applying "
+                            "%dms cold-start statement_timeout to absorb "
+                            "buffer-pool warmup (subsequent cycles use the "
+                            "%dms steady-state budget; 0 = pool default)",
+                            steady_state_timeout_ms,
+                            self.snapshot_statement_timeout_ms,
+                        )
                     rows = self._run_snapshot_query(
                         cursor,
                         timestamp,
-                        self.snapshot_lookback_hours,
+                        self.snapshot_lookback_hours,  # type: ignore[arg-type]
                         min_expiration,
                         snapshot_row_cap,
+                        statement_timeout_ms=steady_state_timeout_ms,
                     )
                     conn.commit()
 
@@ -550,8 +636,8 @@ class AnalyticsEngine:
                         f"({oi_coverage:.1%} coverage)"
                     )
                 else:
-                    logger.info(f"  Note: All options have OI=0 (normal for real-time data)")
-                    logger.info(f"  GEX will be calculated but will be 0 until OI updates")
+                    logger.info("  Note: All options have OI=0 (normal for real-time data)")
+                    logger.info("  GEX will be calculated but will be 0 until OI updates")
                 if options and oi_coverage < self.min_oi_coverage_pct_alert:
                     logger.warning(
                         f"⚠️ Low OI coverage in analytics snapshot: {oi_coverage:.1%} "
@@ -597,7 +683,7 @@ class AnalyticsEngine:
 
         vanna = -stats.norm.pdf(d1) * d2 / sigma
 
-        return vanna
+        return vanna  # type: ignore[no-any-return]
 
     def _calculate_charm(self, S: float, K: float, T: float, r: float, sigma: float) -> float:
         """
@@ -632,7 +718,7 @@ class AnalyticsEngine:
         # Convert to per day
         charm_per_day = charm / 365.0
 
-        return charm_per_day
+        return charm_per_day  # type: ignore[no-any-return]
 
     def _calculate_bs_gamma(self, S, K: float, T: float, r: float, sigma: float):
         """Black-Scholes gamma (q=0; identical for calls and puts).
@@ -719,7 +805,7 @@ class AnalyticsEngine:
         _tte_cache: Dict = {}
 
         # Group by strike and expiration
-        strike_data = defaultdict(lambda: {"calls": [], "puts": []})
+        strike_data = defaultdict(lambda: {"calls": [], "puts": []})  # type: ignore[var-annotated]
 
         for opt in options:
             key = (opt["strike"], opt["expiration"])
@@ -933,7 +1019,7 @@ class AnalyticsEngine:
             return None
         max_pain_strike = min(strike_payouts.items(), key=lambda x: x[1])[0]
 
-        return max_pain_strike
+        return max_pain_strike  # type: ignore[no-any-return]
 
     def _calculate_max_pain_by_expiration(self, options: List[Dict[str, Any]]) -> Dict[Any, float]:
         """Return ``{expiration: max_pain_strike}`` for every expiration.
@@ -1113,54 +1199,38 @@ class AnalyticsEngine:
 
         return best_flip
 
-    def _structural_reference(
+    def _structural_reference_from_profile(
         self,
         options: List[Dict[str, Any]],
         spot: float,
-        timestamp: datetime,
-        *,
-        dte_ref_days: Optional[float] = None,
+        profile: List[Tuple[float, float]],
+        ref_span_pct: float = GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT,
     ) -> float:
-        """Active-strike-weighted structural reference for the resolver.
+        """Compute the active-strike-weighted p90 reference from a profile slice.
 
-        Builds the spot-shift gamma profile over a fixed
-        ``±GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT`` band around
-        spot, then INCLUDES in the p90 reference only those grid
-        points whose nearest option with non-zero open interest sits
-        within ``GAMMA_PROFILE_STRUCTURAL_ACTIVE_DISTANCE_PCT`` of
-        spot.  Anchors the noise floor to where the chain actually
-        carries OI, so:
+        Takes an already-built profile that covers AT LEAST
+        ``spot ± ref_span_pct``, slices it to that canonical band, and
+        applies the active-strike filter described in
+        :meth:`_structural_reference`.  Callers must guarantee the
+        coverage requirement; :meth:`_resolve_gamma_flip` enforces it
+        before invoking this fast path.
 
-        * Grid points in OI dead zones (extended-hours degraded
-          chains; long-dated tails where strike spacing widens past
-          any contribution) don't drag p90 toward zero and falsely
-          lower the floor for marginal crossings elsewhere.
-        * The reference is invariant to ladder rung width — adding
-          ±35% or ±50% scan points outside the active band has zero
-          effect because they're filtered out.
+        Pure function of ``(options, spot, profile slice)`` — does not
+        touch the BS gamma kernel.  Behavior is byte-identical to
+        building a separate ``±ref_span_pct`` profile and running the
+        original filter, because the spot-shift kernel is deterministic
+        and the slice contains exactly the grid points the standalone
+        builder would have produced (same step, same span).
 
-        Used once per cycle (see :meth:`_resolve_gamma_flip`) so the
-        "is this crossing structurally significant?" test depends
-        only on the chain.  Without it, widening the grid diluted
-        p90 with deep-OTM near-zero values and lowered the floor for
-        the SAME crossing — the 2026-05-20 SPX/QQQ pathology where
-        resolved flips clustered just inside the 8% actionable gate
-        while most cycles went NULL.
-
-        Returns ``0.0`` when no usable profile can be built or no
-        active strikes lie within the canonical band; callers treat
-        that as "no structural basis available" and fall through to
-        NULL.
+        Returns ``0.0`` when no usable slice can be built or no active
+        strikes lie within the canonical band; callers treat that as
+        "no structural basis available" and fall through to NULL.
         """
-        ref_profile = self._gamma_exposure_profile(
-            options,
-            spot,
-            timestamp,
-            span_pct=GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT,
-            dte_ref_days=dte_ref_days,
-        )
-        if not ref_profile:
+        if not profile:
             return 0.0
+
+        ref_lo = spot - spot * ref_span_pct
+        ref_hi = spot + spot * ref_span_pct
 
         # Active strikes = unique strikes with non-zero open interest.
         # Sorted to support O(log N) nearest-strike lookup via bisect.
@@ -1179,7 +1249,9 @@ class AnalyticsEngine:
 
         max_distance = spot * GAMMA_PROFILE_STRUCTURAL_ACTIVE_DISTANCE_PCT
         filtered_abs: List[float] = []
-        for s, v in ref_profile:
+        for s, v in profile:
+            if s < ref_lo or s > ref_hi:
+                continue
             # Binary-search the nearest active strike.  bisect_left
             # returns the insertion point; the nearest strike is
             # either at that index or at index-1.
@@ -1205,6 +1277,53 @@ class AnalyticsEngine:
             # degenerating to "accept everything".
             reference = float(abs_arr.max())
         return reference
+
+    def _structural_reference(
+        self,
+        options: List[Dict[str, Any]],
+        spot: float,
+        timestamp: datetime,
+        *,
+        dte_ref_days: Optional[float] = None,
+    ) -> float:
+        """Active-strike-weighted structural reference for the resolver.
+
+        Builds a fresh spot-shift gamma profile over a fixed
+        ``±GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT`` band around
+        spot, then delegates to
+        :meth:`_structural_reference_from_profile`.
+
+        This standalone path is the fallback for callers that have no
+        precomputed profile, and is retained for the rare case where
+        the first ladder rung is configured NARROWER than the reference
+        span (the rung wouldn't cover the canonical band, so we can't
+        slice from it).  In the default configuration (rung 0 = ±20%,
+        reference = ±15%) :meth:`_resolve_gamma_flip` takes the fast
+        slice path and this method is not called per cycle.
+
+        ``dte_ref_days`` (optional) overrides the module-level
+        ``GAMMA_PROFILE_DTE_REF_DAYS`` so the multi-horizon resolver path
+        gets a reference profile weighted at the same horizon as the
+        candidate it gates.
+
+        Returns ``0.0`` when no usable profile can be built or no
+        active strikes lie within the canonical band; callers treat
+        that as "no structural basis available" and fall through to
+        NULL.
+        """
+        ref_profile = self._gamma_exposure_profile(
+            options,
+            spot,
+            timestamp,
+            span_pct=GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT,
+            dte_ref_days=dte_ref_days,
+        )
+        return self._structural_reference_from_profile(
+            options,
+            spot,
+            ref_profile,
+            GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT,
+        )
 
     def _find_structural_interior_crossing(
         self,
@@ -1368,18 +1487,27 @@ class AnalyticsEngine:
         the resolver never changes which profile produces the readings.
 
         The structural floor that gates each rung's crossing is
-        computed ONCE up front (see :meth:`_structural_reference`)
-        over a fixed canonical band around spot, so the
-        significance test is identical at every rung.  Widening the
-        ladder only widens the geometric search; it no longer
-        relaxes the noise floor by diluting p90 with deep-OTM
+        computed ONCE per cycle over a fixed canonical band around
+        spot, so the significance test is identical at every rung.
+        Widening the ladder only widens the geometric search; it no
+        longer relaxes the noise floor by diluting p90 with deep-OTM
         near-zero values.
+
+        The reference is sourced by SLICING the first valid ladder
+        rung's profile (which is a superset of the canonical
+        reference band whenever the first rung is at least as wide as
+        ``GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT``, which is the
+        default).  When the first rung is narrower than the reference
+        span — an unusual configuration — the standalone builder is
+        used as a fallback.  Slicing avoids a redundant BS gamma
+        kernel call (~half of the per-cycle resolver compute at
+        defaults) without changing the reference's value, since the
+        kernel is deterministic and the slice contains exactly the
+        grid points the standalone builder would have produced.
 
         Returns ``(profile, flip, span_used)``.
         """
-        structural_reference = self._structural_reference(
-            options, spot, timestamp, dte_ref_days=dte_ref_days
-        )
+        structural_reference: Optional[float] = None
 
         last_profile: List[Tuple[float, float]] = []
         last_span: float = (
@@ -1393,6 +1521,28 @@ class AnalyticsEngine:
             last_span = span_pct
             if not profile:
                 continue
+
+            # Compute the structural reference once, on first valid
+            # profile.  Slice the existing profile when it covers the
+            # canonical reference band; fall back to building a
+            # separate reference profile otherwise (rare —
+            # rung_0 < ref_span isn't the default configuration).
+            if structural_reference is None:
+                if span_pct >= GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT:
+                    structural_reference = self._structural_reference_from_profile(
+                        options,
+                        spot,
+                        profile,
+                        GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT,
+                    )
+                else:
+                    structural_reference = self._structural_reference(
+                        options,
+                        spot,
+                        timestamp,
+                        dte_ref_days=dte_ref_days,
+                    )
+
             flip = self._find_structural_interior_crossing(
                 profile, spot, structural_reference=structural_reference
             )
@@ -1680,7 +1830,7 @@ class AnalyticsEngine:
 
         if not gex_by_strike:
             logger.warning("No GEX data to summarize")
-            return None
+            return None  # type: ignore[return-value]
 
         # Find max gamma strike.  Each gex_by_strike row is one
         # (strike, expiration) pair; aggregate net_gex by strike across
@@ -1719,58 +1869,91 @@ class AnalyticsEngine:
 
         gamma_flip_unresolved = gamma_flip_point is None
         if gamma_flip_unresolved:
-            diag = self._gamma_flip_unresolved_diagnostics(
-                options, gamma_profile, underlying_price, timestamp
+            # Throttle the verbose diagnostic so a persistent unresolved
+            # regime (e.g. SPX with the actionable flip beyond
+            # ±MAX_FLIP_DISTANCE_PCT for an entire morning) doesn't
+            # produce one multi-line WARN per analytics cycle.  Emit on
+            # the resolved→unresolved transition (so the FIRST log line
+            # always carries the full diagnostic) and again every
+            # ``_gamma_flip_unresolved_warn_throttle_seconds`` while the
+            # latch is held, so operators still get a periodic refresh
+            # of the chain stats instead of the log going silent.
+            now_mono = _time.monotonic()
+            state_transition = not self._gamma_flip_unresolved_state
+            elapsed = now_mono - self._gamma_flip_unresolved_last_warn_mono
+            should_warn = state_transition or (
+                self._gamma_flip_unresolved_warn_throttle_seconds <= 0.0
+                or elapsed >= self._gamma_flip_unresolved_warn_throttle_seconds
             )
-            logger.warning(
-                "Gamma flip UNRESOLVED for %s @ %s: no structural interior "
-                "crossing across the span ladder (max rung ±%.0f%%, %d/%d "
-                "usable contracts, %d profile points at max rung) — "
-                "persisting NULL (no clamp, no carry-forward). "
-                "Sides usable C/P=%d/%d. "
-                "IV p10/p50/p90/max=%.3f/%.3f/%.3f/%.3f "
-                "(%d contracts at default IV=%.2f, share %.1f%% — high "
-                "share indicates stale IV pipeline). "
-                "OI share by DTE raw 0/1-2/3-7/8+=%.1f/%.1f/%.1f/%.1f%%; "
-                "DTE-weighted 0/1-2/3-7/8+=%.1f/%.1f/%.1f/%.1f%%. "
-                "Profile (widest rung) peak|GEX|=%.3g, median|GEX|=%.3g, "
-                "p%.0f reference=%.3g, structural floor=%.3g (crossings need "
-                "a local window peak above this to qualify); sign distribution "
-                "+/-/0=%d/%d/%d points (a monotonic split means no crossing "
-                "exists at all).",
-                self.db_symbol,
-                timestamp,
-                gamma_flip_span_used * 100.0,
-                diag["usable_total"],
-                len(options),
-                len(gamma_profile),
-                diag["usable_calls"],
-                diag["usable_puts"],
-                diag["iv_p10"],
-                diag["iv_p50"],
-                diag["iv_p90"],
-                diag["iv_max"],
-                diag["iv_at_default_count"],
-                self._GAMMA_FLIP_DIAGNOSTIC_DEFAULT_IV,
-                diag["iv_at_default_share"] * 100.0,
-                diag["oi_share_0dte"] * 100.0,
-                diag["oi_share_1_2dte"] * 100.0,
-                diag["oi_share_3_7dte"] * 100.0,
-                diag["oi_share_8plus_dte"] * 100.0,
-                diag["weighted_oi_share_0dte"] * 100.0,
-                diag["weighted_oi_share_1_2dte"] * 100.0,
-                diag["weighted_oi_share_3_7dte"] * 100.0,
-                diag["weighted_oi_share_8plus_dte"] * 100.0,
-                diag["profile_peak"],
-                diag["profile_median"],
-                GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE,
-                diag["profile_reference"],
-                diag["structural_floor"],
-                diag["profile_pos_pts"],
-                diag["profile_neg_pts"],
-                diag["profile_zero_pts"],
-            )
-        elif GAMMA_PROFILE_SPAN_LADDER and gamma_flip_span_used > GAMMA_PROFILE_SPAN_LADDER[0]:
+            if should_warn:
+                diag = self._gamma_flip_unresolved_diagnostics(
+                    options, gamma_profile, underlying_price, timestamp
+                )
+                logger.warning(
+                    "Gamma flip UNRESOLVED for %s @ %s: no structural interior "
+                    "crossing across the span ladder (max rung ±%.0f%%, %d/%d "
+                    "usable contracts, %d profile points at max rung) — "
+                    "persisting NULL (no clamp, no carry-forward). "
+                    "Sides usable C/P=%d/%d. "
+                    "IV p10/p50/p90/max=%.3f/%.3f/%.3f/%.3f "
+                    "(%d contracts at default IV=%.2f, share %.1f%% — high "
+                    "share indicates stale IV pipeline). "
+                    "OI share by DTE raw 0/1-2/3-7/8+=%.1f/%.1f/%.1f/%.1f%%; "
+                    "DTE-weighted 0/1-2/3-7/8+=%.1f/%.1f/%.1f/%.1f%%. "
+                    "Profile (widest rung) peak|GEX|=%.3g, median|GEX|=%.3g, "
+                    "p%.0f reference=%.3g, structural floor=%.3g (crossings need "
+                    "a local window peak above this to qualify); sign distribution "
+                    "+/-/0=%d/%d/%d points (a monotonic split means no crossing "
+                    "exists at all).",
+                    self.db_symbol,
+                    timestamp,
+                    gamma_flip_span_used * 100.0,
+                    diag["usable_total"],
+                    len(options),
+                    len(gamma_profile),
+                    diag["usable_calls"],
+                    diag["usable_puts"],
+                    diag["iv_p10"],
+                    diag["iv_p50"],
+                    diag["iv_p90"],
+                    diag["iv_max"],
+                    diag["iv_at_default_count"],
+                    self._GAMMA_FLIP_DIAGNOSTIC_DEFAULT_IV,
+                    diag["iv_at_default_share"] * 100.0,
+                    diag["oi_share_0dte"] * 100.0,
+                    diag["oi_share_1_2dte"] * 100.0,
+                    diag["oi_share_3_7dte"] * 100.0,
+                    diag["oi_share_8plus_dte"] * 100.0,
+                    diag["weighted_oi_share_0dte"] * 100.0,
+                    diag["weighted_oi_share_1_2dte"] * 100.0,
+                    diag["weighted_oi_share_3_7dte"] * 100.0,
+                    diag["weighted_oi_share_8plus_dte"] * 100.0,
+                    diag["profile_peak"],
+                    diag["profile_median"],
+                    GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE,
+                    diag["profile_reference"],
+                    diag["structural_floor"],
+                    diag["profile_pos_pts"],
+                    diag["profile_neg_pts"],
+                    diag["profile_zero_pts"],
+                )
+                self._gamma_flip_unresolved_last_warn_mono = now_mono
+            self._gamma_flip_unresolved_state = True
+        else:
+            if self._gamma_flip_unresolved_state:
+                logger.info(
+                    "Gamma flip RESOLVED for %s @ %s after persistent unresolved "
+                    "period: flip=$%.2f, spot=$%.2f, span used=±%.0f%%",
+                    self.db_symbol,
+                    timestamp,
+                    gamma_flip_point,
+                    underlying_price,
+                    gamma_flip_span_used * 100.0,
+                )
+            self._gamma_flip_unresolved_state = False
+        if not gamma_flip_unresolved and (
+            GAMMA_PROFILE_SPAN_LADDER and gamma_flip_span_used > GAMMA_PROFILE_SPAN_LADDER[0]
+        ):
             logger.info(
                 "Gamma flip resolved at expanded span ±%.0f%% for %s @ %s "
                 "(flip $%.2f, spot $%.2f) — first ladder rung ±%.0f%% was "
@@ -1864,6 +2047,12 @@ class AnalyticsEngine:
             "call_wall": call_wall,
             "put_wall": put_wall,
             "max_pain_by_expiration": max_pain_by_exp,
+            # Spot-shift dealer gamma curve used to derive both
+            # gamma_flip_point (zero crossing) and net_gex_at_spot
+            # (value at spot).  Persisted to gex_profile so the frontend
+            # can overlay the curve on the per-strike GEX chart without
+            # the API recomputing the BS gamma grid on every request.
+            "gamma_profile": gamma_profile,
         }
 
         return summary
@@ -2093,26 +2282,72 @@ class AnalyticsEngine:
         )
         logger.info("✅ Stored GEX summary")
 
+    def _store_gex_profile(self, summary: Dict[str, Any], cursor) -> None:
+        """Write the spot-shift dealer gamma-exposure profile on ``cursor``.
+
+        The profile is a list of (hypothetical_price, dealer_dollar_gex)
+        tuples computed in :meth:`_calculate_gex_summary` and is the
+        shared primitive behind ``gamma_flip_point`` and
+        ``net_gex_at_spot``.  Persisting it here lets ``/api/gex/profile``
+        serve the curve without recomputing the BS gamma grid on every
+        request.  No-op when the profile is empty (degraded snapshot).
+
+        Like the other ``_store_*`` units this owns no transaction
+        boundary; the caller's ``db_connection()`` scope keeps the write
+        inside the same atomic transaction as the by-strike/summary
+        writes.
+        """
+        profile = summary.get("gamma_profile") or []
+        if not profile:
+            return
+        import json as _json
+
+        payload = _json.dumps(
+            [{"price": float(s), "gex": float(g)} for s, g in profile]
+        )
+        cursor.execute(
+            """
+            INSERT INTO gex_profile (underlying, timestamp, spot_price, span_pct, profile)
+            VALUES (%s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (underlying, timestamp) DO UPDATE SET
+                spot_price = EXCLUDED.spot_price,
+                span_pct = EXCLUDED.span_pct,
+                profile = EXCLUDED.profile
+            """,
+            (
+                summary["underlying"],
+                summary["timestamp"],
+                float(summary.get("underlying_price") or 0.0),
+                (
+                    float(summary["gamma_flip_span_used"])
+                    if summary.get("gamma_flip_span_used") is not None
+                    else None
+                ),
+                payload,
+            ),
+        )
+
     def _store_calculation_results(
         self,
         gex_data: List[Dict[str, Any]],
         summary: Dict[str, Any],
     ) -> None:
-        """Persist by-strike + summary in ONE transaction (all rows land or none).
+        """Persist by-strike + summary + profile in ONE transaction (all rows land or none).
 
-        Both writes run on the same connection inside a single
+        Writes run on the same connection inside a single
         ``db_connection()`` scope.  That context manager commits exactly
         once on a clean exit and rolls back on ANY exception, so a failure
-        in the summary write discards the by-strike rows written earlier
-        in the same transaction.  This atomicity ("both stores commit
+        in any one write discards the rows written earlier in the same
+        transaction.  This atomicity ("all three stores commit
         together") is the invariant downstream consumers rely on, so the
-        grouping must not be split into two independent transactions.
+        grouping must not be split into independent transactions.
         """
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
                 self._store_gex_by_strike(gex_data, cursor)
                 self._store_gex_summary(summary, cursor)
+                self._store_gex_profile(summary, cursor)
                 # db_connection() commits on a clean __exit__; the explicit
                 # commit makes the single-transaction boundary unambiguous
                 # and is a harmless no-op when the CM commits again.
@@ -2240,7 +2475,7 @@ class AnalyticsEngine:
             )
             prem_mode = "tier"
 
-        return vol_tiers, prem_tiers, f"vol={vol_mode},prem={prem_mode}"
+        return vol_tiers, prem_tiers, f"vol={vol_mode},prem={prem_mode}"  # type: ignore[return-value]
 
     def _fetch_smart_money_p95(self, cursor) -> Tuple[Optional[float], Optional[float]]:
         """Read rolling p95(volume_delta) / p95(premium) for this symbol
@@ -2550,22 +2785,34 @@ class AnalyticsEngine:
     def _refresh_flow_series_snapshot(self, timestamp: datetime):
         """Materialise flow_series_5min for the current session.
 
-        Runs the *exact* /api/flow/series CTE (unfiltered) for this symbol
-        over the resolved current-session window and UPSERTs every row.
-        The stored rows therefore equal what the API CTE would compute by
-        construction — parity is not re-implemented. The outer window is
-        ROWS UNBOUNDED PRECEDING ORDER BY bar_start, so a closed bar's
-        cumulative values are window-invariant: once its 5-min boundary
-        passes, the row is final and the IS DISTINCT FROM guard turns
-        subsequent cycles into no-ops. Only the open bar (and any quiet
-        carry-forward tail) churns cycle-to-cycle, which is also how the
-        prior bucket gets "finalised" — the next cycle recomputes it to
-        its closed value and writes it once.
+        The stored rows mirror what the /api/flow/series CTE would compute
+        for session='current'. Closed bars are window-invariant (the
+        canonical CTE's outer SUM uses ROWS UNBOUNDED PRECEDING, so once a
+        5-min bar's boundary passes its cumulative values are
+        mathematically fixed); only the open bar (and the bar immediately
+        before it, during the boundary-crossing cycle) actually changes
+        each cycle.
+
+        Dispatch strategy
+        -----------------
+        * Steady-state cycles run an **incremental** UPSERT that refreshes
+          only the open bar + the one immediately before it (two rows),
+          using ``SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2``. ~30x cheaper
+          than the full-window form because it does direct per-bar
+          aggregation over flow_by_contract instead of walking the whole
+          session through an 8-level CTE with LAG / cumulative window
+          functions.
+        * Cold-start cycles (no flow_series_5min rows exist for the
+          current session, or the engine is restarting after >2 cycles
+          of downtime) run the full ``SNAPSHOT_UPSERT_PSYCOPG2`` once
+          to seed closed bars between session_open and prev_bar, then
+          subsequent cycles fall back to incremental. This guarantees
+          there are no gaps if the engine restarts mid-session.
 
         Best-effort and gated by the same flag as the flow-cache refresh:
-        the snapshot is downstream of flow_by_contract, and a failure here
-        must never break the analytics cycle or the GEX path. Mirrors
-        _refresh_flow_caches' error handling (log, do not raise).
+        a failure here must never break the analytics cycle or the GEX
+        path. Mirrors ``_refresh_flow_caches`` error handling: log, do
+        not raise.
         """
         if not self._analytics_flow_cache_refresh_enabled:
             return
@@ -2580,31 +2827,69 @@ class AnalyticsEngine:
             session_close = session_start + timedelta(hours=6, minutes=45)
             now_utc = datetime.now(timezone.utc)
             now_floor_epoch = int(now_utc.timestamp() // 300) * 300
-            now_floored = datetime.fromtimestamp(now_floor_epoch, tz=timezone.utc)
-            session_end = min(now_floored, session_close)
+            curr_bar = datetime.fromtimestamp(now_floor_epoch, tz=timezone.utc)
+            session_end = min(curr_bar, session_close)
             if session_end < session_start:
                 session_end = session_start
+            prev_bar = max(session_start, session_end - timedelta(minutes=5))
 
             with db_connection() as conn:
                 cursor = conn.cursor()
+                # Decide: incremental (steady-state) or full (cold-start /
+                # gap-fill).  The cheap probe is "do we have a row in
+                # flow_series_5min for prev_bar already?".  If yes, all
+                # earlier bars in this session were populated by an
+                # earlier cycle; refreshing just prev_bar + curr_bar is
+                # sufficient.  If no, we have a gap (fresh session, or
+                # missed >=2 cycles); run the full upsert to backfill.
                 cursor.execute(
-                    SNAPSHOT_UPSERT_PSYCOPG2,
-                    {
-                        "symbol": self.db_symbol,
-                        "session_start": session_start,
-                        "session_end": session_end,
-                        "strikes": None,
-                        "expirations": None,
-                    },
+                    """
+                    SELECT 1 FROM flow_series_5min
+                    WHERE symbol = %s AND bar_start = %s
+                    LIMIT 1
+                    """,
+                    (self.db_symbol, prev_bar),
                 )
-                conn.commit()
-                logger.info(
-                    "flow_series_5min snapshot upserted %d rows for %s " "(window [%s, %s])",
-                    cursor.rowcount,
-                    self.db_symbol,
-                    session_start.isoformat(),
-                    session_end.isoformat(),
-                )
+                prev_bar_known = cursor.fetchone() is not None
+
+                if prev_bar_known and prev_bar > session_start:
+                    cursor.execute(
+                        SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2,
+                        {
+                            "symbol": self.db_symbol,
+                            "prev_bar": prev_bar,
+                            "curr_bar": session_end,
+                        },
+                    )
+                    conn.commit()
+                    logger.info(
+                        "flow_series_5min incremental upserted %d rows for %s " "(bars [%s, %s])",
+                        cursor.rowcount,
+                        self.db_symbol,
+                        prev_bar.isoformat(),
+                        session_end.isoformat(),
+                    )
+                else:
+                    # Cold-start / gap-fill: full session backfill.
+                    cursor.execute(
+                        SNAPSHOT_UPSERT_PSYCOPG2,
+                        {
+                            "symbol": self.db_symbol,
+                            "session_start": session_start,
+                            "session_end": session_end,
+                            "strikes": None,
+                            "expirations": None,
+                        },
+                    )
+                    conn.commit()
+                    logger.info(
+                        "flow_series_5min full backfill upserted %d rows for %s "
+                        "(window [%s, %s]) -- cold-start or gap detected",
+                        cursor.rowcount,
+                        self.db_symbol,
+                        session_start.isoformat(),
+                        session_end.isoformat(),
+                    )
 
         except Exception as e:
             logger.error(f"Error refreshing flow_series_5min snapshot: {e}", exc_info=True)
@@ -2626,6 +2911,13 @@ class AnalyticsEngine:
 
             if not snapshot:
                 logger.warning("No option data available in database")
+                # Record the partial timings so the cycle-overrun warning in
+                # run() reports the *current* failing cycle (just `snapshot`)
+                # instead of stale stage timings from a prior successful one.
+                # Without this an operator sees a snapshot=39.3s breakdown
+                # next to a cycle_duration=90.0s overrun and is misled into
+                # diagnosing the wrong stage.
+                self._last_stage_timings = stage_timings
                 return False
 
             latest_timestamp = snapshot["timestamp"]
@@ -2725,6 +3017,7 @@ class AnalyticsEngine:
 
             if not gex_by_strike:
                 logger.warning("No GEX data calculated")
+                self._last_stage_timings = stage_timings
                 return False
 
             logger.info(f"Calculated GEX for {len(gex_by_strike)} strikes")
@@ -2739,6 +3032,7 @@ class AnalyticsEngine:
 
             if not gex_summary:
                 logger.warning("Failed to calculate GEX summary")
+                self._last_stage_timings = stage_timings
                 return False
 
             # Validate internal arithmetic consistency before persisting.
@@ -2885,7 +3179,7 @@ class AnalyticsEngine:
                 if success:
                     logger.info(f"✅ Calculation cycle {self.calculations_completed} complete")
                 else:
-                    logger.warning(f"⚠️  Calculation cycle had issues")
+                    logger.warning("⚠️  Calculation cycle had issues")
 
                 # Calculate sleep time
                 cycle_duration = time.time() - cycle_start

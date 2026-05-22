@@ -30,8 +30,6 @@ def get_db_connection():
     Raises:
         Exception: If connection cannot be established
     """
-    global _connection_pool
-
     # Initialize pool if not already done. Double-checked locking so the
     # common hot-path stays allocation-free after startup; the lock only
     # guards first-time pool creation across threads.
@@ -40,13 +38,36 @@ def get_db_connection():
             if _connection_pool is None:
                 _initialize_connection_pool()
 
-    try:
-        conn = _connection_pool.getconn()
+    # Up to two getconn attempts: SimpleConnectionPool doesn't validate on
+    # checkout, so if the server (or an intermediary: RDS, PgBouncer, NAT)
+    # silently killed an idle SSL connection, the conn psycopg2 hands back
+    # may already be `closed`. Discard it and pull a fresh one rather than
+    # letting the caller hit "SSL connection has been closed unexpectedly"
+    # and trip the circuit breaker. Capped at two attempts to avoid an
+    # infinite loop if every conn in the pool is bad simultaneously.
+    last_err = None
+    for _ in range(2):
+        try:
+            conn = _connection_pool.getconn()
+        except Exception as e:
+            logger.error(f"Failed to get connection from pool: {e}")
+            raise
+
+        if getattr(conn, "closed", 0):
+            logger.warning("Pool returned a closed connection; discarding and retrying")
+            try:
+                _connection_pool.putconn(conn, close=True)
+            except Exception:
+                logger.warning("Failed to discard closed connection", exc_info=True)
+            last_err = "closed connection"
+            continue
+
         logger.debug("Retrieved connection from pool")
         return conn
-    except Exception as e:
-        logger.error(f"Failed to get connection from pool: {e}")
-        raise
+
+    raise psycopg2.OperationalError(
+        f"Could not obtain a healthy DB connection from the pool ({last_err})"
+    )
 
 
 def close_db_connection(conn):
@@ -56,9 +77,21 @@ def close_db_connection(conn):
     Args:
         conn: psycopg2 connection object
     """
-    global _connection_pool
+    if not (_connection_pool and conn):
+        return
 
-    if _connection_pool and conn:
+    # A connection that just failed (or was silently terminated by the
+    # server / a proxy) must NOT be re-parked in the pool. SimpleConnection-
+    # Pool.putconn defaults to close=False, so without explicit eviction the
+    # same dead conn gets handed out on the next getconn — producing the
+    # tight flap pattern of "SSL connection has been closed unexpectedly"
+    # → 2s circuit-breaker backoff → immediate recovery → fail again that
+    # we were observing in production. Eviction here lets the pool grow a
+    # fresh replacement on the next getconn() up to maxconn.
+    discard = False
+    if getattr(conn, "closed", 0):
+        discard = True
+    else:
         try:
             tx_status = conn.get_transaction_status()
             if tx_status != extensions.TRANSACTION_STATUS_IDLE:
@@ -67,11 +100,14 @@ def close_db_connection(conn):
                 conn.rollback()
                 logger.warning("Rolled back open transaction before returning DB connection")
         except Exception:
-            logger.warning(
-                "Failed to inspect/reset transaction state before pool return", exc_info=True
-            )
-        _connection_pool.putconn(conn)
-        logger.debug("Returned connection to pool")
+            logger.warning("DB connection unusable during pool return; discarding", exc_info=True)
+            discard = True
+
+    try:
+        _connection_pool.putconn(conn, close=discard)
+    except Exception:
+        logger.warning("Failed to return connection to pool", exc_info=True)
+    logger.debug("Returned connection to pool (discard=%s)", discard)
 
 
 @contextmanager

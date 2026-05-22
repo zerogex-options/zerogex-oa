@@ -56,6 +56,7 @@ class OptionContractRow(BaseModel):
 def get_db() -> DatabaseManager:
     from ..main import db_manager
 
+    assert db_manager is not None, "db_manager not initialized"
     return db_manager
 
 

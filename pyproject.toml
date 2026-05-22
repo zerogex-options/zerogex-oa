@@ -57,6 +57,8 @@ dev = [
     "black>=24.8.0",
     "flake8>=6.0.0",
     "mypy>=1.0.0",
+    "types-pytz>=2023.3",
+    "types-requests>=2.31.0",
     "ipython>=8.0.0",
 ]
 metrics = [
@@ -143,6 +145,14 @@ warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
 ignore_missing_imports = true
+# `ignore_missing_imports` only suppresses `import-not-found` (module
+# can't be located).  `import-untyped` (module exists but has no PEP-561
+# stubs available) is a separate error code; suppress it project-wide so
+# `make ci` passes regardless of whether contributors have installed
+# every optional types-* package locally.  The dev extra in this file
+# pins `types-pytz` and `types-requests` for those who do install dev
+# tooling fully.
+disable_error_code = ["import-untyped"]
 
 [tool.flake8]
 max-line-length = 100

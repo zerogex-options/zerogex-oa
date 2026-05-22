@@ -85,7 +85,7 @@ class PutWallBouncePattern(PatternBase):
         sigma = _realized_sigma_30min(ctx.market.recent_closes)
 
         # Instrument selection (mirror of call_wall_fade).
-        wall_strike = _round_to_strike(put_wall, 1.0)
+        wall_strike = _round_to_strike(put_wall, 1.0)  # type: ignore[arg-type]
         expiry = self._zero_dte_expiry(ctx)
         if sigma > _VOL_DEBIT_SWITCH:
             action = ActionEnum.BUY_CALL_DEBIT
@@ -209,7 +209,8 @@ class PutWallBouncePattern(PatternBase):
         ):
             missing.append(
                 "no corroborating advanced signal "
-                "(trap_detection != 'bullish_fade' AND gamma_vwap_confluence != 'bullish_confluence')"
+                "(trap_detection != 'bullish_fade' AND "
+                "gamma_vwap_confluence != 'bullish_confluence')"
             )
 
         rbi = ctx.signal("range_break_imminence")
@@ -252,7 +253,7 @@ class PutWallBouncePattern(PatternBase):
 
     @staticmethod
     def _zero_dte_expiry(ctx: PlaybookContext) -> str:
-        return ctx.et_date.isoformat()
+        return ctx.et_date.isoformat()  # type: ignore[no-any-return]
 
     @staticmethod
     def _compose_rationale(

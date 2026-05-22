@@ -14,12 +14,16 @@ file preserves that access without creating a circular dependency.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-from datetime import datetime, timedelta, date, time, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta, date, time
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    from contextlib import AbstractAsyncContextManager
+
+    import asyncpg
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +71,12 @@ class SignalsQueriesMixin:
     ``self`` when mixed in.  See module docstring for the required
     instance-level interface.
     """
+
+    if TYPE_CHECKING:
+        _acquire_connection: Callable[[], AbstractAsyncContextManager[Any]]
+        _cache_get: Callable[[str], Optional[Any]]
+        _cache_set: Callable[[str, Any, float], None]
+        _confluence_matrix_cache_ttl_seconds: float
 
     async def _get_component_score_history(
         self,
@@ -608,22 +618,22 @@ class SignalsQueriesMixin:
                         "inputs": ctx,
                         "horizon": horizon,
                         "close": (
-                            float(row.get("close_at_timestamp"))
+                            float(row.get("close_at_timestamp"))  # type: ignore[arg-type]
                             if row.get("close_at_timestamp") is not None
                             else None
                         ),
                         "horizon_close": (
-                            float(row.get("close_at_horizon"))
+                            float(row.get("close_at_horizon"))  # type: ignore[arg-type]
                             if row.get("close_at_horizon") is not None
                             else None
                         ),
                         "realized_return": (
                             round(
                                 (
-                                    float(row.get("close_at_horizon"))
-                                    - float(row.get("close_at_timestamp"))
+                                    float(row.get("close_at_horizon"))  # type: ignore[arg-type]
+                                    - float(row.get("close_at_timestamp"))  # type: ignore[arg-type]
                                 )
-                                / float(row.get("close_at_timestamp")),
+                                / float(row.get("close_at_timestamp")),  # type: ignore[arg-type]
                                 6,
                             )
                             if row.get("close_at_timestamp")
@@ -678,7 +688,7 @@ class SignalsQueriesMixin:
         )
         cached = self._cache_get(cache_key)
         if cached is not None:
-            return cached
+            return cached  # type: ignore[no-any-return]
 
         component_order = list(component_names)
 
@@ -1070,15 +1080,30 @@ class SignalsQueriesMixin:
                     INSERT INTO signal_action_cards
                         (underlying, timestamp, pattern, action, tier,
                          direction, confidence, payload)
-                    SELECT $1, $2, $3, $4, $5, $6, $7, $8::jsonb
+                    SELECT $1::varchar, $2::timestamptz, $3::varchar,
+                           $4, $5, $6, $7, $8::jsonb
                     WHERE NOT EXISTS (
                         -- Idempotency guard (no UNIQUE on the logical key):
                         -- skip an exact (underlying, pattern, timestamp)
                         -- duplicate from a restart / overlapping cycle that
                         -- defeats the dwell-window dedup. asyncpg allows
-                        -- positional-parameter reuse, so no new args.
+                        -- positional-parameter reuse, but only when each
+                        -- parameter's type can be unambiguously deduced
+                        -- from a single context.  ``$1``/``$2``/``$3``
+                        -- appear in BOTH the INSERT-SELECT value position
+                        -- (type inferred from the target column) AND in
+                        -- the WHERE equality (type inferred from the LHS
+                        -- column type); without explicit casts the two
+                        -- deductions conflict and asyncpg rejects the
+                        -- prepare with ``inconsistent types deduced for
+                        -- parameter $N``, silently dropping every
+                        -- action-card write.  The explicit casts above
+                        -- pin each reused parameter to a single type so
+                        -- the deduction is unambiguous.
                         SELECT 1 FROM signal_action_cards
-                        WHERE underlying = $1 AND pattern = $3 AND timestamp = $2
+                        WHERE underlying = $1::varchar
+                          AND pattern = $3::varchar
+                          AND timestamp = $2::timestamptz
                     )
                     """,
                     card.get("underlying"),

@@ -9,7 +9,7 @@ used off-hours since the underlying data is static until the next
 session.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from src.analytics import main_engine
 from src.analytics.main_engine import AnalyticsEngine

@@ -147,7 +147,7 @@ def calculate_time_to_expiration(
     expiration_dt = ET.localize(datetime.combine(expiration_date, close_t))
 
     years = (expiration_dt - current_date).total_seconds() / 86_400 / 365.0
-    return max(years, _MIN_YEARS_TO_EXPIRATION)
+    return max(years, _MIN_YEARS_TO_EXPIRATION)  # type: ignore[no-any-return]
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +159,7 @@ def _to_et(dt: Optional[datetime]) -> datetime:
     if dt is None:
         return datetime.now(ET)
     if dt.tzinfo is None:
-        return pytz.UTC.localize(dt).astimezone(ET)
+        return pytz.UTC.localize(dt).astimezone(ET)  # type: ignore[no-any-return]
     return dt.astimezone(ET)
 
 

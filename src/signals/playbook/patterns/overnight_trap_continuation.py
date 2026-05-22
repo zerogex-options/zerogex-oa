@@ -86,6 +86,7 @@ class OvernightTrapContinuationPattern(PatternBase):
 
         trap = ctx.signal("trap_detection")
         # _check_triggers guarantees trap is triggered with a fade signal.
+        assert trap is not None
         direction: TrapDirection = "bullish" if trap.signal == "bullish_fade" else "bearish"
 
         close = ctx.close
@@ -245,7 +246,7 @@ class OvernightTrapContinuationPattern(PatternBase):
 
     @staticmethod
     def _one_dte_expiry(ctx: PlaybookContext) -> str:
-        return (ctx.et_date + timedelta(days=1)).isoformat()
+        return (ctx.et_date + timedelta(days=1)).isoformat()  # type: ignore[no-any-return]
 
 
 PATTERN: PatternBase = OvernightTrapContinuationPattern()

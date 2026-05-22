@@ -98,23 +98,26 @@ ALTER TABLE option_chains ADD COLUMN IF NOT EXISTS theta NUMERIC(10, 6);
 ALTER TABLE option_chains ADD COLUMN IF NOT EXISTS vega NUMERIC(10, 6);
 
 -- Column semantics (COMMENT ON is idempotent; safe to re-run).
--- ``volume`` is the vendor's SESSION-CUMULATIVE contract volume (resets
--- to 0 at the cash open and only ever increases intraday) — it is NOT a
--- per-minute figure. Period (per-bucket) volume must be derived from
--- ``flow_contract_facts`` (canonical: day-partitioned LAG deltas with
--- buy/sell classification), never by reading this column as if it were
--- the minute's traded volume. ``ask_volume`` / ``mid_volume`` /
--- ``bid_volume`` are the OPPOSITE: per-bucket classified deltas the
--- ingestion upsert ACCUMULATES additively, so they do not reconcile
--- against ``volume`` directly.
+-- ``volume`` and the three Lee-Ready classified flow columns share the
+-- SAME contract: vendor SESSION-CUMULATIVE, resets to 0 at the cash
+-- open, monotonic intraday.  Period (per-bucket) values for any of
+-- them are derived via ``LAG()`` deltas inside the same ET session —
+-- the canonical materialization lives in ``flow_contract_facts``.
+-- Per-row invariant: ``ask_volume + mid_volume + bid_volume == volume``
+-- modulo the opening-auction carve-out (09:30 ET bucket routes all
+-- volume to ``mid_volume`` because the auction cross price is not
+-- comparable to NBBO).  The ingestion writer maintains these as
+-- session-cumulative running totals in a per-contract in-memory
+-- accumulator and the upsert uses ``GREATEST`` on every monotonic
+-- column for idempotent replace semantics.
 COMMENT ON COLUMN option_chains.volume IS
     'Session-cumulative raw contract volume (resets at cash open, monotonic intraday). NOT per-minute. Use flow_contract_facts for period volume.';
 COMMENT ON COLUMN option_chains.ask_volume IS
-    'Per-bucket Lee-Ready ask-side (buyer-initiated) classified volume; upsert-accumulated. Does not reconcile against the cumulative volume column.';
+    'Session-cumulative Lee-Ready ask-side (buyer-initiated) classified volume. Resets at cash open, monotonic intraday. Per-bucket flow = LAG delta within the ET session.';
 COMMENT ON COLUMN option_chains.mid_volume IS
-    'Per-bucket mid/indeterminate classified volume; upsert-accumulated.';
+    'Session-cumulative mid/indeterminate classified volume. Includes the opening-auction bucket in full. Resets at cash open, monotonic intraday.';
 COMMENT ON COLUMN option_chains.bid_volume IS
-    'Per-bucket Lee-Ready bid-side (seller-initiated) classified volume; upsert-accumulated.';
+    'Session-cumulative Lee-Ready bid-side (seller-initiated) classified volume. Resets at cash open, monotonic intraday. Per-bucket flow = LAG delta within the ET session.';
 
 CREATE INDEX IF NOT EXISTS idx_option_chains_timestamp ON option_chains(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_option_chains_underlying ON option_chains(underlying);
@@ -279,6 +282,19 @@ ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS net_gex_at_spot DOUBLE PRECISIO
 -- cycles.
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS gamma_flip_span_used DOUBLE PRECISION;
 
+-- Volume column semantics. ``total_call_volume`` and ``total_put_volume``
+-- are per-snapshot session-cumulative aggregates summed across every
+-- call/put contract in the snapshot universe at this row's timestamp
+-- (see ``src/analytics/main_engine.py::_calculate_gex_summary``). Their
+-- parent ``option_chains.volume`` column is session-cumulative (resets
+-- 09:30 ET), so these aggregates inherit the same reset semantic.
+-- NOT per-bucket deltas -- use ``flow_contract_facts`` /
+-- ``flow_by_contract`` for windowed flow values.
+COMMENT ON COLUMN gex_summary.total_call_volume IS
+    'Snapshot session-cumulative call volume aggregated across every call contract in the snapshot universe. = SUM(option_chains.volume) over option_type=''C''. Resets at 09:30 ET with the underlying option_chains.volume. NOT a per-bucket delta.';
+COMMENT ON COLUMN gex_summary.total_put_volume IS
+    'Snapshot session-cumulative put volume aggregated across every put contract in the snapshot universe. = SUM(option_chains.volume) over option_type=''P''. Resets at 09:30 ET. NOT a per-bucket delta.';
+
 CREATE TABLE IF NOT EXISTS gex_by_strike (
     underlying VARCHAR(10) NOT NULL,
     timestamp TIMESTAMPTZ NOT NULL,
@@ -342,6 +358,55 @@ COMMENT ON COLUMN gex_by_strike.dealer_vanna_exposure IS
     'Dealer-sign vanna ($/vol-point), = -vanna_exposure. + => dealers buy underlying as IV rises.';
 COMMENT ON COLUMN gex_by_strike.dealer_charm_exposure IS
     'Dealer-sign charm ($/day), = -charm_exposure. + => dealers buy underlying as time passes.';
+
+-- ``call_volume`` and ``put_volume`` are per-(strike, expiration) sums
+-- of the session-cumulative ``option_chains.volume`` taken at this row's
+-- snapshot timestamp. They are snapshot aggregates, not per-bucket
+-- deltas: between two consecutive rows for the same (strike, expiration)
+-- they will be non-decreasing within the same session. See
+-- ``src/analytics/main_engine.py::_calculate_gex_by_strike``.
+COMMENT ON COLUMN gex_by_strike.call_volume IS
+    'Snapshot session-cumulative call volume at this (strike, expiration). = SUM(option_chains.volume) across call contracts at this strike/expiration. Resets at 09:30 ET. NOT a per-bucket delta.';
+COMMENT ON COLUMN gex_by_strike.put_volume IS
+    'Snapshot session-cumulative put volume at this (strike, expiration). = SUM(option_chains.volume) across put contracts at this strike/expiration. Resets at 09:30 ET. NOT a per-bucket delta.';
+
+-- =============================================================================
+-- GEX profile (spot-shift dealer dollar-gamma curve)
+-- =============================================================================
+-- Stores the spot-shift dealer dollar-gamma curve that
+-- `_gamma_exposure_profile` computes per Analytics cycle.  The curve is
+-- a list of (hypothetical_price, dealer_dollar_gex) points and is the
+-- shared primitive whose zero crossing is `gamma_flip_point` and whose
+-- value at spot is `net_gex_at_spot` (both already persisted in
+-- gex_summary).  Storing the full curve lets the frontend overlay the
+-- GEX-profile line on the per-strike bars without the API recomputing
+-- the BS gamma grid on every request.
+--
+-- The payload is stored as a JSONB array of objects:
+--   [{"price": float, "gex": float}, ...]
+-- with `price` ascending.  A typical profile has 40-100 points
+-- (~3-6 KB per row).
+CREATE TABLE IF NOT EXISTS gex_profile (
+    underlying VARCHAR(10) NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL,
+    spot_price NUMERIC(12, 4) NOT NULL,
+    span_pct DOUBLE PRECISION,
+    profile JSONB NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (underlying, timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gex_profile_underlying_timestamp
+    ON gex_profile(underlying, timestamp DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_gex_profile_underlying') THEN
+        ALTER TABLE gex_profile
+        ADD CONSTRAINT fk_gex_profile_underlying
+        FOREIGN KEY (underlying) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+END $$;
 
 -- =============================================================================
 -- Remove legacy/non-essential objects (safe cleanup during migration)
@@ -476,6 +541,34 @@ CREATE INDEX IF NOT EXISTS idx_flow_contract_facts_symbol_ts_exp
 CREATE INDEX IF NOT EXISTS idx_flow_contract_facts_symbol_ts_type
     ON flow_contract_facts(symbol, timestamp DESC, option_type);
 
+-- Column semantics for flow_contract_facts. Every value column is a
+-- PER-BUCKET DELTA (computed via LAG of option_chains.{volume,
+-- ask_volume, bid_volume} within an ET-calendar-day partition; see
+-- ``src/api/database.py::_do_refresh_flow_cache``). Sparse table: rows
+-- exist only for buckets where ``volume_delta > 0`` (WHERE filter at
+-- the INSERT site). The buy/sell split is EXTRAPOLATED so that
+-- ``buy_volume + sell_volume == volume_delta`` (the mid-classified
+-- portion from option_chains.mid_volume is redistributed across
+-- buy/sell in proportion to ask_vol_delta:bid_vol_delta) --
+-- ``buy_volume`` is NOT a direct copy of the option_chains ask_volume
+-- delta.
+COMMENT ON COLUMN flow_contract_facts.volume_delta IS
+    'Per-bucket raw volume delta = option_chains.volume - LAG(option_chains.volume) within ET session, clamped to >= 0. Sparse: row exists only when delta > 0.';
+COMMENT ON COLUMN flow_contract_facts.premium_delta IS
+    'Per-bucket gross premium dollars = volume_delta * trade_price * 100. Sparse, same rows as volume_delta.';
+COMMENT ON COLUMN flow_contract_facts.signed_volume IS
+    'Per-bucket directional volume delta = +volume_delta for calls, -volume_delta for puts. Used for cross-type position-imbalance metrics.';
+COMMENT ON COLUMN flow_contract_facts.signed_premium IS
+    'Per-bucket directional premium dollars = signed_volume * trade_price * 100. Calls positive, puts negative.';
+COMMENT ON COLUMN flow_contract_facts.buy_volume IS
+    'Per-bucket buy-classified volume delta, EXTRAPOLATED to cover the full volume_delta (the mid-classified portion is redistributed pro-rata across buy/sell based on ask_vol_delta:bid_vol_delta). Invariant: buy_volume + sell_volume == volume_delta (modulo integer rounding). NOT equal to the option_chains ask_volume delta.';
+COMMENT ON COLUMN flow_contract_facts.sell_volume IS
+    'Per-bucket sell-classified volume delta, mirror of buy_volume (see buy_volume for the extrapolation contract).';
+COMMENT ON COLUMN flow_contract_facts.buy_premium IS
+    'Per-bucket buy-classified premium dollars = buy_volume * trade_price * 100.';
+COMMENT ON COLUMN flow_contract_facts.sell_premium IS
+    'Per-bucket sell-classified premium dollars = sell_volume * trade_price * 100.';
+
 -- Unified 5-minute-bucketed flow rollup keyed by (type, strike, expiration).
 -- Replaces the legacy flow_by_type / flow_by_strike / flow_by_expiration
 -- cache tables, which have been consolidated into a single source of truth.
@@ -516,6 +609,23 @@ ALTER TABLE flow_by_contract DROP COLUMN IF EXISTS sell_premium;
 ALTER TABLE flow_by_contract DROP COLUMN IF EXISTS avg_iv;
 ALTER TABLE flow_by_contract DROP COLUMN IF EXISTS avg_delta;
 
+-- Column semantics for flow_by_contract. Each row is keyed on the
+-- 5-minute bucket boundary and stores DAY-TO-DATE CUMULATIVE values per
+-- contract through ``bucket_end``: i.e. SUM over flow_contract_facts
+-- from 09:30 ET session open through bucket_end. Resets at 09:30 ET.
+-- The per-bucket value for any of these can be recovered as a LAG-delta
+-- within a (symbol, option_type, strike, expiration) partition ordered
+-- by timestamp -- this is what the canonical ``flow_series_5min`` CTE
+-- does (see ``src/flow_series_sql.py``).
+COMMENT ON COLUMN flow_by_contract.raw_volume IS
+    'Day-to-date cumulative raw volume per contract through bucket_end. = SUM(flow_contract_facts.volume_delta) from 09:30 ET session open. Resets at 09:30 ET. Per-bucket delta = LAG within (symbol, option_type, strike, expiration) partition.';
+COMMENT ON COLUMN flow_by_contract.raw_premium IS
+    'Day-to-date cumulative gross premium dollars per contract through bucket_end. = SUM(flow_contract_facts.premium_delta) from session open. Resets at 09:30 ET.';
+COMMENT ON COLUMN flow_by_contract.net_volume IS
+    'Day-to-date cumulative SIGNED volume (buys - sells) per contract through bucket_end. = SUM(flow_contract_facts.buy_volume - sell_volume) from session open. Resets at 09:30 ET.';
+COMMENT ON COLUMN flow_by_contract.net_premium IS
+    'Day-to-date cumulative SIGNED premium dollars (buys - sells) per contract through bucket_end. = SUM(flow_contract_facts.buy_premium - sell_premium) from session open. Resets at 09:30 ET.';
+
 CREATE TABLE IF NOT EXISTS flow_smart_money (
     timestamp TIMESTAMPTZ NOT NULL,
     symbol VARCHAR(10) NOT NULL,
@@ -532,6 +642,22 @@ CREATE TABLE IF NOT EXISTS flow_smart_money (
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (timestamp, symbol, option_symbol)
 );
+
+-- WARNING: ``total_volume`` and ``total_premium`` on flow_smart_money are
+-- MISNAMED. Despite the "total" prefix, both store a SINGLE-BUCKET LAG-
+-- derived delta (see ``src/analytics/main_engine.py::_refresh_flow_caches``
+-- around the LAG(oc.volume) computation with a 2-minute lookback window).
+-- They are the per-row "this unusual-activity event size" magnitude, NOT
+-- a session cumulative or window aggregate. Summing them across rows
+-- over a time window IS approximately valid (each row represents a
+-- 1-minute delta), but using ``total_premium`` alone as a directional
+-- signal is INCORRECT -- it is gross (volume_delta * last * 100), not
+-- signed. For canonical signed flow use
+-- ``flow_contract_facts.buy_premium - sell_premium``.
+COMMENT ON COLUMN flow_smart_money.total_volume IS
+    'MISNAMED: single-bucket LAG-derived volume delta (1-minute lookback via option_chains LAG), NOT session-cumulative. Stored per unusual-activity event row. Use flow_contract_facts.volume_delta for the canonical per-bucket delta.';
+COMMENT ON COLUMN flow_smart_money.total_premium IS
+    'MISNAMED: single-bucket gross premium = total_volume * trade_price * 100, NOT session-cumulative. GROSS (no buy/sell sign). Use flow_contract_facts.buy_premium - sell_premium for canonical signed directional flow.';
 
 CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts
     ON flow_by_contract(symbol, timestamp DESC);

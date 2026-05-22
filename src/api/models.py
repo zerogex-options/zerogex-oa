@@ -4,7 +4,8 @@ Pydantic models for API request/response validation
 
 from pydantic import BaseModel, Field
 from datetime import datetime, date
-from typing import Optional
+from enum import Enum
+from typing import List, Optional
 from decimal import Decimal
 
 
@@ -69,6 +70,43 @@ class GEXByStrike(BaseModel):
             Decimal: lambda v: float(v) if v is not None else None,
             datetime: lambda v: v.isoformat() if v is not None else None,
             date: lambda v: v.isoformat() if v is not None else None,
+        }
+
+
+class GEXProfilePoint(BaseModel):
+    # One point on the spot-shift dealer dollar-gamma curve. ``price`` is
+    # a hypothetical underlying price (grid x-axis); ``gex`` is the dealer
+    # dollar GEX evaluated at that price ($ per 1% spot move).
+    price: float
+    gex: float
+
+
+class GEXProfile(BaseModel):
+    """Spot-shift dealer dollar-gamma curve.
+
+    The shared primitive whose zero crossing is ``gamma_flip`` and whose
+    value at ``spot_price`` is ``net_gex_at_spot`` — the curve consumed
+    by the GEX-Profile overlay on the per-strike chart.
+    """
+
+    timestamp: datetime
+    symbol: str
+    spot_price: Decimal
+    span_pct: Optional[float] = None
+    profile: List[GEXProfilePoint]
+    # Convenience: the headline reference levels associated with this
+    # snapshot, so the frontend can render the flip line / walls without
+    # a second round-trip to /api/gex/summary.
+    gamma_flip: Optional[Decimal] = None
+    net_gex_at_spot: Optional[Decimal] = None
+    call_wall: Optional[Decimal] = None
+    put_wall: Optional[Decimal] = None
+
+    class Config:
+        from_attributes = True
+        json_encoders = {
+            Decimal: lambda v: float(v) if v is not None else None,
+            datetime: lambda v: v.isoformat() if v is not None else None,
         }
 
 
@@ -365,10 +403,6 @@ class HealthStatus(BaseModel):
         json_encoders = {
             datetime: lambda v: v.isoformat() if v is not None else None,
         }
-
-
-from enum import Enum  # already imported via pydantic internals but be explicit
-from typing import List  # already imported above, included here for clarity
 
 
 class SignalDirection(str, Enum):

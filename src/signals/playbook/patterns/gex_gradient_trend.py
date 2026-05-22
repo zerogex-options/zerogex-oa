@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 import os
-from datetime import time, timedelta
+from datetime import timedelta
 from typing import Literal, Optional
 
 from src.signals.playbook.base import PatternBase
@@ -80,6 +80,8 @@ class GexGradientTrendPattern(PatternBase):
             return None
 
         gex_grad = ctx.signal("gex_gradient")
+        # _check_triggers guarantees gex_grad is non-None.
+        assert gex_grad is not None
         drift: DriftDirection = "bullish" if gex_grad.score > 0 else "bearish"
 
         close = ctx.close
@@ -237,7 +239,7 @@ class GexGradientTrendPattern(PatternBase):
 
     @staticmethod
     def _dte_expiry(ctx: PlaybookContext, days: int) -> str:
-        return (ctx.et_date + timedelta(days=days)).isoformat()
+        return (ctx.et_date + timedelta(days=days)).isoformat()  # type: ignore[no-any-return]
 
 
 PATTERN: PatternBase = GexGradientTrendPattern()

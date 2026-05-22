@@ -16,7 +16,6 @@ least ``_SUSTAINED_DAYS_MIN``.
 
 from __future__ import annotations
 
-import math
 import os
 from datetime import time, timedelta
 from typing import Literal, Optional
@@ -94,6 +93,7 @@ class SqueezeBreakoutPattern(PatternBase):
 
         gex_grad = ctx.signal("gex_gradient")
         # _check_triggers guarantees gex_grad has |score| >= threshold.
+        assert gex_grad is not None
         breakout: BreakoutDirection = "bullish" if gex_grad.score > 0 else "bearish"
 
         close = ctx.close
@@ -320,7 +320,7 @@ class SqueezeBreakoutPattern(PatternBase):
     @staticmethod
     def _dte_expiry(ctx: PlaybookContext, days: int) -> str:
         """Naive +N day expiry — broker integration handles calendar routing."""
-        return (ctx.et_date + timedelta(days=days)).isoformat()
+        return (ctx.et_date + timedelta(days=days)).isoformat()  # type: ignore[no-any-return]
 
 
 PATTERN: PatternBase = SqueezeBreakoutPattern()

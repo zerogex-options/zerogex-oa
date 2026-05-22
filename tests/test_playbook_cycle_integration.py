@@ -23,13 +23,13 @@ def _result(name: str, score: float, context: Optional[dict] = None):
     return SimpleNamespace(name=name, score=float(score), context=context or {})
 
 
-from src.signals.playbook.cycle import (
+from src.signals.playbook.cycle import (  # noqa: E402
     build_context_from_cycle,
     evaluate_and_persist,
     insert_action_card_sync,
 )
-from src.signals.playbook.engine import PlaybookEngine
-from src.signals.playbook.types import ActionEnum
+from src.signals.playbook.engine import PlaybookEngine  # noqa: E402
+from src.signals.playbook.types import ActionEnum  # noqa: E402
 
 # ----------------------------------------------------------------------
 # Test doubles

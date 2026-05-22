@@ -48,7 +48,7 @@ import argparse
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Iterable, Optional
 
@@ -353,7 +353,7 @@ def compute_outcome(
                 else target_price - entry_f * cost
             )
         else:
-            eff_target = target_price
+            eff_target = target_price  # type: ignore[assignment]
         if cost and stop_price is not None:
             eff_stop = (
                 stop_price + entry_f * cost
@@ -361,7 +361,7 @@ def compute_outcome(
                 else stop_price - entry_f * cost
             )
         else:
-            eff_stop = stop_price
+            eff_stop = stop_price  # type: ignore[assignment]
 
         hit_target = _hit_target(direction, eff_target, high, low)
         hit_stop = _hit_stop(direction, eff_stop, high, low)

@@ -80,7 +80,9 @@ class GexGradientComponent(ComponentBase):
         # than snapping to it.
         magnitude_confidence = min(1.0, total / _MIN_TOTAL_GAMMA) if _MIN_TOTAL_GAMMA > 0 else 1.0
 
-        return max(-1.0, min(1.0, score * wing_confidence * magnitude_confidence))
+        return max(  # type: ignore[no-any-return]
+            -1.0, min(1.0, score * wing_confidence * magnitude_confidence)
+        )
 
     def context_values(self, ctx: MarketContext) -> dict:
         buckets = self._buckets(ctx)

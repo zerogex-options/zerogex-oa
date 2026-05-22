@@ -244,7 +244,7 @@ def _extract_candidate(
     # X-API-Key but leaves Authorization untouched. Preferring Bearer lets a
     # caller-supplied per-user key authenticate through that path.
     if bearer and bearer.credentials:
-        return bearer.credentials
+        return bearer.credentials  # type: ignore[no-any-return]
     if x_api_key:
         return x_api_key
     return None

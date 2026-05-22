@@ -246,7 +246,7 @@ def test_stand_down_card_is_not_persisted(monkeypatch: pytest.MonkeyPatch):
 
 def test_recently_emitted_blocks_re_emission_via_hysteresis(monkeypatch: pytest.MonkeyPatch):
     """If get_recent_action_cards returns a recent emission, hysteresis suppresses re-fire."""
-    from datetime import datetime, timedelta, timezone
+    from datetime import timedelta
 
     app, dbmod = _build_app(monkeypatch)
     dbmod.DatabaseManager.get_latest_signal_score = AsyncMock(return_value=_score_row())

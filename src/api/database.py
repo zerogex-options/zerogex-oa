@@ -123,12 +123,10 @@ def _get_flow_session_bounds(session: str = "current") -> tuple:
 # SQL fragment allowlists live in `_sql_helpers` so that both
 # DatabaseManager and the query mixins it composes can import them
 # without a circular import.
-from src.api.queries._sql_helpers import (
+from src.api.queries._sql_helpers import (  # noqa: E402
     _bucket_expr,
     _gex_by_strike_order_clause,
     _interval_expr,
-    _normalize_timeframe,
-    _timeframe_view_suffix,
 )
 
 # option_chains rows are UPSERTed in 60-second buckets: every contract that
@@ -479,6 +477,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             pool = self.pool
             if not self._pool_is_usable(pool):
                 raise RuntimeError("Database pool is unavailable or closing")
+            assert pool is not None  # _pool_is_usable returned True
             try:
                 conn = await pool.acquire()
                 return conn, pool
@@ -1310,7 +1309,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         cache_key = f"latest_gex_summary:{symbol}"
         cached = self._cache_get(cache_key)
         if cached is not None:
-            return cached
+            return cached  # type: ignore[no-any-return]
 
         # Call/Put Walls are persisted to ``gex_summary`` by the Analytics
         # Engine using the canonical definition in
@@ -1457,7 +1456,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         cache_key = f"gex_by_strike:{symbol}:{limit}:{sort_by}"
         cached = self._cache_get(cache_key)
         if cached is not None:
-            return cached
+            return cached  # type: ignore[no-any-return]
 
         # `order_clause` is a validated literal from the allowlist; raises
         # ValueError on unknown sort_by. Runtime values use $1..$N.
@@ -1512,6 +1511,77 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 return result
         except Exception as e:
             logger.error(f"Error fetching GEX by strike: {e}", exc_info=True)
+            raise
+
+    async def get_latest_gex_profile(
+        self,
+        symbol: str = "SPY",
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch the latest spot-shift dealer dollar-gamma profile.
+
+        Returns the profile that was written by the Analytics Engine on
+        the most recent cycle (see
+        ``_store_gex_profile``/``_gamma_exposure_profile``).  The profile
+        is the shared primitive behind both ``gamma_flip_point`` (its zero
+        crossing) and ``net_gex_at_spot`` (its value at the current
+        price) — so the curve, the flip line, and the headline summary
+        are all read off the SAME underlying construction.
+
+        Returns ``None`` when no profile has been persisted yet (fresh
+        deployment / degraded snapshot).
+        """
+        symbol = symbol.upper()
+        cache_key = f"gex_profile:{symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        query = """
+            SELECT
+                gp.underlying AS symbol,
+                gp.timestamp,
+                gp.spot_price,
+                gp.span_pct,
+                gp.profile,
+                gs.gamma_flip_point AS gamma_flip,
+                gs.net_gex_at_spot,
+                gs.call_wall,
+                gs.put_wall
+            FROM gex_profile gp
+            LEFT JOIN gex_summary gs
+              ON gs.underlying = gp.underlying
+             AND gs.timestamp = gp.timestamp
+            WHERE gp.underlying = $1
+            ORDER BY gp.timestamp DESC
+            LIMIT 1
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(query, symbol)
+                if row is None:
+                    return None
+                # asyncpg returns JSONB as a string by default; decode here so
+                # callers can rely on a list-of-dicts shape.
+                raw_profile = row["profile"]
+                if isinstance(raw_profile, str):
+                    raw_profile = json.loads(raw_profile)
+                payload = {
+                    "symbol": row["symbol"],
+                    "timestamp": row["timestamp"],
+                    "spot_price": row["spot_price"],
+                    "span_pct": row["span_pct"],
+                    "profile": raw_profile or [],
+                    "gamma_flip": row["gamma_flip"],
+                    "net_gex_at_spot": row["net_gex_at_spot"],
+                    "call_wall": row["call_wall"],
+                    "put_wall": row["put_wall"],
+                }
+                self._cache_set(
+                    cache_key, payload, self._analytics_cache_ttl_seconds
+                )
+                return payload
+        except Exception as e:
+            logger.error(f"Error fetching GEX profile: {e}", exc_info=True)
             raise
 
     async def get_historical_gex(
@@ -1748,7 +1818,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         cache_key = f"flow:{symbol}:{session}:{intervals_key}"
         cached = self._cache_get(cache_key)
         if cached is not None:
-            return cached
+            return cached  # type: ignore[no-any-return]
 
         session_start, session_end = _get_flow_session_bounds(session)
 
@@ -1929,7 +1999,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             cache_key = f"flow_series:{symbol}:{session}:{strikes_key}:{exps_key}"
             cached = self._cache_get(cache_key)
             if cached is not None:
-                return cached
+                return cached  # type: ignore[no-any-return]
 
         strikes_arg = [float(s) for s in strikes] if strikes else None
         expirations_arg = list(expirations) if expirations else None
@@ -1943,7 +2013,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 session_start, session_end, has_session_data = resolved
                 if not has_session_data:
                     if use_cache:
-                        self._cache_set(cache_key, [], self._flow_series_endpoint_cache_ttl_seconds)
+                        self._cache_set(cache_key, [], self._flow_series_endpoint_cache_ttl_seconds)  # type: ignore[arg-type]
                     return []
 
                 if (
@@ -2020,7 +2090,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     # most-recent N 5-minute buckets.
                     result = result[:intervals]
                 if use_cache:
-                    self._cache_set(cache_key, result, self._flow_series_endpoint_cache_ttl_seconds)
+                    self._cache_set(cache_key, result, self._flow_series_endpoint_cache_ttl_seconds)  # type: ignore[arg-type]
                 return result
         except asyncio.TimeoutError:
             logger.warning(f"Flow series query timed out for {symbol}, returning empty")
@@ -2042,7 +2112,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         cache_key = f"flow_contracts:{symbol}:{session}"
         cached = self._cache_get(cache_key)
         if cached is not None:
-            return cached
+            return cached  # type: ignore[no-any-return]
 
         try:
             async with self._acquire_connection() as conn:
@@ -2052,7 +2122,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     return None
                 session_start, session_end, has_session_data = resolved
                 if not has_session_data:
-                    payload = {"strikes": [], "expirations": []}
+                    payload = {"strikes": [], "expirations": []}  # type: ignore[var-annotated]
                     self._cache_set(cache_key, payload, self._flow_endpoint_cache_ttl_seconds)
                     return payload
 
@@ -2291,7 +2361,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         cache_key = f"latest_quote:{symbol}"
         cached = self._cache_get(cache_key)
         if cached is not None:
-            return cached
+            return cached  # type: ignore[no-any-return]
 
         query = """
             WITH latest_quote AS (
@@ -2345,7 +2415,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         query = """
             WITH market_close_time AS (
                 -- Find the most recent 4:00 PM ET bar
-                SELECT 
+                SELECT
                     timestamp,
                     symbol,
                     close as previous_close
@@ -2359,7 +2429,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ),
             nearest_close AS (
                 -- Fallback: find the bar closest to 4:00 PM on the most recent trading day
-                SELECT 
+                SELECT
                     q.timestamp,
                     q.symbol,
                     q.close as previous_close,
@@ -2617,7 +2687,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         cache_key = f"max_pain_current:{symbol}"
         cached = self._cache_get(cache_key)
         if cached is not None:
-            return cached
+            return cached  # type: ignore[no-any-return]
 
         snapshot_query = """
             SELECT
@@ -2700,7 +2770,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         cache_key = f"gex_heatmap:{symbol}:{timeframe}:{window_units}"
         cached = self._cache_get(cache_key)
         if cached is not None:
-            return cached
+            return cached  # type: ignore[no-any-return]
         bucket = _bucket_expr(timeframe)
         step_interval = _interval_expr(timeframe)
 
@@ -3126,7 +3196,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             full_cache_key = f"option_contract_full:{option_symbol}:{target_date.isoformat()}"
             cached_full = self._cache_get(full_cache_key)
             if cached_full is not None:
-                return cached_full
+                return cached_full  # type: ignore[no-any-return]
             rows = await self._fetch_option_contract_bars(option_symbol, day_start_et, day_end_et)
             self._cache_set(full_cache_key, rows, 3600.0)
             return rows
@@ -3186,20 +3256,27 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     ) -> List[Dict[str, Any]]:
         """Run the 1-minute bar aggregation CTE for a single option contract.
 
-        Returned rows are newest-first. ``volume_delta`` is computed via
-        SQL LAG() over ``bar_ts ASC`` within the supplied window, so callers
-        that wish to incrementally extend a prior result must include the
-        last already-known bar as the lower bound to seed LAG correctly.
+        Returned rows are newest-first. ``volume_delta`` and the
+        classified-flow columns ``ask_volume`` / ``mid_volume`` /
+        ``bid_volume`` are all per-bar values, computed via SQL LAG()
+        over ``bar_ts ASC`` against session-cumulative storage (see
+        ``schema.sql`` COMMENT ON option_chains.{volume,ask_volume,
+        mid_volume,bid_volume}).  Callers that wish to incrementally
+        extend a prior result must include the last already-known bar
+        as the lower bound to seed LAG correctly.
         """
         query = """
             WITH ranked AS (
                 SELECT
                     *,
                     DATE_TRUNC('minute', timestamp)                          AS bar_ts,
-                    MAX(volume)      OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_volume,
+                    MAX(volume)        OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_volume,
                     MAX(open_interest) OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_oi,
-                    MAX(updated_at)  OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_updated_at,
-                    ROW_NUMBER()     OVER (
+                    MAX(ask_volume)    OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_ask_volume,
+                    MAX(mid_volume)    OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_mid_volume,
+                    MAX(bid_volume)    OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_bid_volume,
+                    MAX(updated_at)    OVER (PARTITION BY DATE_TRUNC('minute', timestamp)) AS bar_updated_at,
+                    ROW_NUMBER()       OVER (
                         PARTITION BY DATE_TRUNC('minute', timestamp)
                         ORDER BY timestamp DESC
                     ) AS rn
@@ -3220,9 +3297,26 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 mid,
                 bar_volume         AS volume,
                 bar_oi             AS open_interest,
-                ask_volume,
-                mid_volume,
-                bid_volume,
+                -- ask/mid/bid_volume are stored session-cumulative
+                -- (see schema COMMENT ON option_chains.*_volume).  The
+                -- /api/option/contract contract is per-bar classified
+                -- flow, so surface LAG deltas under the same names --
+                -- the window is a single ET session by construction.
+                GREATEST(
+                    COALESCE(bar_ask_volume, 0)
+                        - COALESCE(LAG(bar_ask_volume) OVER (ORDER BY bar_ts), 0),
+                    0
+                )::bigint          AS ask_volume,
+                GREATEST(
+                    COALESCE(bar_mid_volume, 0)
+                        - COALESCE(LAG(bar_mid_volume) OVER (ORDER BY bar_ts), 0),
+                    0
+                )::bigint          AS mid_volume,
+                GREATEST(
+                    COALESCE(bar_bid_volume, 0)
+                        - COALESCE(LAG(bar_bid_volume) OVER (ORDER BY bar_ts), 0),
+                    0
+                )::bigint          AS bid_volume,
                 implied_volatility,
                 delta,
                 gamma,

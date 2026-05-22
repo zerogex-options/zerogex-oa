@@ -85,7 +85,7 @@ class PinRiskPremiumSellPattern(PatternBase):
         max_pain = ctx.level("max_pain") or ctx.market.max_pain
         sigma = _realized_sigma_30min(ctx.market.recent_closes)
 
-        center = _round_to_strike(float(max_pain), 1.0)
+        center = _round_to_strike(float(max_pain), 1.0)  # type: ignore[arg-type]
         wing_distance = max(_WING_MIN_POINTS, _WING_SIGMA_MULT * sigma * close)
         # Round wing distance to whole strike units so legs land on real strikes.
         wing_offset = max(1.0, _round_to_strike(wing_distance, 1.0))
@@ -111,7 +111,8 @@ class PinRiskPremiumSellPattern(PatternBase):
         rationale = (
             f"Long-gamma pin: net GEX ${ctx.net_gex / 1e9:.1f}B, "
             f"price ${close:.2f} within {_MAX_PAIN_PROXIMITY_PCT * 100:.2f}% of max_pain "
-            f"${max_pain:.2f}, 30-min σ {sigma * 100:.3f}% < ceiling {_REALIZED_SIGMA_CEILING * 100:.2f}% "
+            f"${max_pain:.2f}, 30-min σ {sigma * 100:.3f}% < ceiling "
+            f"{_REALIZED_SIGMA_CEILING * 100:.2f}% "
             f"→ sell 1DTE iron condor with ±${wing_offset:.0f} wings."
         )
 
@@ -151,8 +152,8 @@ class PinRiskPremiumSellPattern(PatternBase):
                 "long_put_strike": long_put_strike,
                 "realized_sigma_30min": round(sigma, 6),
                 "rbi_label": (
-                    ctx.signal("range_break_imminence").context_values.get("label")
-                    if ctx.signal("range_break_imminence")
+                    rbi.context_values.get("label")
+                    if (rbi := ctx.signal("range_break_imminence")) is not None
                     else None
                 ),
             },
@@ -258,7 +259,7 @@ class PinRiskPremiumSellPattern(PatternBase):
         """
         from datetime import timedelta
 
-        return (ctx.et_date + timedelta(days=1)).isoformat()
+        return (ctx.et_date + timedelta(days=1)).isoformat()  # type: ignore[no-any-return]
 
 
 PATTERN: PatternBase = PinRiskPremiumSellPattern()

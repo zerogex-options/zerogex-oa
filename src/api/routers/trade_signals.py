@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from src.config import SIGNALS_PORTFOLIO_SIZE
 
 from ..database import DatabaseManager
+
+if TYPE_CHECKING:
+    from src.signals.playbook import PlaybookEngine
 
 router = APIRouter(prefix="/api/signals", tags=["Trade Signals"])
 
@@ -75,6 +78,7 @@ def _normalize_signal_score_row(row: dict[str, Any]) -> dict[str, Any]:
 def get_db() -> DatabaseManager:
     from ..main import db_manager
 
+    assert db_manager is not None, "db_manager not initialized"
     return db_manager
 
 

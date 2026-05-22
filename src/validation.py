@@ -9,7 +9,7 @@ sites.  New code should import them from ``src.market_calendar``
 directly.
 """
 
-from typing import Any, Optional
+from typing import Any, Optional, overload
 from datetime import datetime
 import pytz
 from src.utils import get_logger
@@ -31,7 +31,17 @@ from src.market_calendar import (  # noqa: F401 — re-exported for back-compat
 logger = get_logger(__name__)
 
 
-def safe_float(value: Any, default: float = 0.0, field_name: str = "value") -> float:
+@overload
+def safe_float(value: Any, default: float = 0.0, field_name: str = "value") -> float: ...
+
+
+@overload
+def safe_float(value: Any, default: None, field_name: str = "value") -> Optional[float]: ...
+
+
+def safe_float(
+    value: Any, default: Optional[float] = 0.0, field_name: str = "value"
+) -> Optional[float]:
     """
     Safely convert value to float with validation
 
@@ -63,7 +73,15 @@ def safe_float(value: Any, default: float = 0.0, field_name: str = "value") -> f
         return default
 
 
-def safe_int(value: Any, default: int = 0, field_name: str = "value") -> int:
+@overload
+def safe_int(value: Any, default: int = 0, field_name: str = "value") -> int: ...
+
+
+@overload
+def safe_int(value: Any, default: None, field_name: str = "value") -> Optional[int]: ...
+
+
+def safe_int(value: Any, default: Optional[int] = 0, field_name: str = "value") -> Optional[int]:
     """
     Safely convert value to int with validation
 
@@ -193,7 +211,11 @@ def validate_bar_data(bar: dict) -> bool:
 
     if not (low_price <= open_price <= high_price and low_price <= close_price <= high_price):
         logger.warning(
-            f"Invalid OHLC relationship: O={open_price} H={high_price} L={low_price} C={close_price}"
+            "Invalid OHLC relationship: O=%s H=%s L=%s C=%s",
+            open_price,
+            high_price,
+            low_price,
+            close_price,
         )
         return False
 

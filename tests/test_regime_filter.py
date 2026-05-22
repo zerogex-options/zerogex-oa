@@ -1,7 +1,7 @@
 """Tests for the time-of-day / scheduled-event regime filter."""
 
 import importlib
-from datetime import datetime, time
+from datetime import datetime
 
 import pytest
 import pytz

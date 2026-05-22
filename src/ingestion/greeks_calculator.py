@@ -55,10 +55,11 @@ class GreeksCalculator:
         if IV_CALCULATION_ENABLED:
             self.iv_calculator = IVCalculator()
             logger.info(
-                "✅ IV calculation ENABLED - will calculate from option prices when API doesn't provide it"
+                "✅ IV calculation ENABLED - will calculate from option prices when API "
+                "doesn't provide it"
             )
         else:
-            self.iv_calculator = None
+            self.iv_calculator = None  # type: ignore[assignment]
             logger.info("⚠️  IV calculation DISABLED - will only use API-provided IV or default")
 
     def _calculate_time_to_expiration(self, current_date: datetime, expiration_date: date) -> float:
@@ -115,7 +116,7 @@ class GreeksCalculator:
         else:  # Put
             delta = stats.norm.cdf(d1) - 1
 
-        return delta
+        return delta  # type: ignore[no-any-return]
 
     def calculate_gamma(self, S: float, K: float, T: float, r: float, sigma: float) -> float:
         """
@@ -141,7 +142,7 @@ class GreeksCalculator:
 
         gamma = stats.norm.pdf(d1) / (S * sigma * np.sqrt(T))
 
-        return gamma
+        return gamma  # type: ignore[no-any-return]
 
     def calculate_theta(
         self, S: float, K: float, T: float, r: float, sigma: float, option_type: str
@@ -181,7 +182,7 @@ class GreeksCalculator:
         # Convert from per year to per day
         theta_per_day = theta / 365.0
 
-        return theta_per_day
+        return theta_per_day  # type: ignore[no-any-return]
 
     def calculate_vega(self, S: float, K: float, T: float, r: float, sigma: float) -> float:
         """
@@ -209,7 +210,7 @@ class GreeksCalculator:
         # Vega per 1% change in volatility
         vega = S * stats.norm.pdf(d1) * np.sqrt(T) / 100.0
 
-        return vega
+        return vega  # type: ignore[no-any-return]
 
     def calculate_all_greeks(
         self,
@@ -346,10 +347,10 @@ class GreeksCalculator:
             option_data.update(
                 self.calculate_all_greeks(
                     underlying_price=underlying_price,
-                    strike=strike,
-                    expiration=expiration,
-                    option_type=option_type,
-                    current_time=timestamp,
+                    strike=strike,  # type: ignore[arg-type]
+                    expiration=expiration,  # type: ignore[arg-type]
+                    option_type=option_type,  # type: ignore[arg-type]
+                    current_time=timestamp,  # type: ignore[arg-type]
                     implied_volatility=implied_volatility,
                 )
             )
@@ -377,7 +378,7 @@ def main():
     current_time = datetime.now(ET)
     expiration = (current_time + timedelta(days=30)).date()
 
-    print(f"Test Parameters:")
+    print("Test Parameters:")
     print(f"  Underlying: ${underlying_price:.2f}")
     print(f"  Strike: ${strike:.2f}")
     print(f"  Current Time: {current_time.strftime('%Y-%m-%d %H:%M:%S ET')}")
@@ -446,7 +447,7 @@ def main():
     print(f"  Strike: ${enriched['strike']:.2f}")
     print(f"  Last: ${enriched['last']:.2f}")
     print(f"  IV: {enriched.get('implied_volatility', 'N/A'):.4f}")
-    print(f"\n  Calculated Greeks:")
+    print("\n  Calculated Greeks:")
     print(f"    Delta: {enriched['delta']:8.6f}")
     print(f"    Gamma: {enriched['gamma']:8.6f}")
     print(f"    Theta: {enriched['theta']:8.6f}")

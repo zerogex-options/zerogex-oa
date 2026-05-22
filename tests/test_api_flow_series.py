@@ -15,7 +15,6 @@ and response shape without booting a DB.
 from __future__ import annotations
 
 import asyncio
-import importlib
 import sys
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -362,7 +361,9 @@ def _build_app_with_mock_db(monkeypatch: pytest.MonkeyPatch):
 
 def _attach_series_mock(mainmod, returns):
     mainmod.db_manager = mainmod.db_manager or mainmod.DatabaseManager()
-    mainmod.db_manager.get_flow_series = AsyncMock(return_value=returns)  # type: ignore[method-assign]
+    mainmod.db_manager.get_flow_series = AsyncMock(  # type: ignore[method-assign]
+        return_value=returns
+    )
     return mainmod.db_manager
 
 
@@ -381,7 +382,9 @@ def _attach_by_contract_mock(mainmod, returns):
 
 def _attach_contracts_mock(mainmod, returns):
     mainmod.db_manager = mainmod.db_manager or mainmod.DatabaseManager()
-    mainmod.db_manager.get_flow_contracts = AsyncMock(return_value=returns)  # type: ignore[method-assign]
+    mainmod.db_manager.get_flow_contracts = AsyncMock(  # type: ignore[method-assign]
+        return_value=returns
+    )
     return mainmod.db_manager
 
 

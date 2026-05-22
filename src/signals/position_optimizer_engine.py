@@ -380,7 +380,8 @@ class PositionOptimizerEngine:
                     return None
                 signal_ts, signal_direction, normalized_score = signal_row
                 normalized_score = float(normalized_score)
-                # Map normalized score → timeframe and strength (mirrors UnifiedSignalEngine thresholds)
+                # Map normalized score → timeframe and strength
+                # (mirrors UnifiedSignalEngine thresholds)
                 if normalized_score >= 0.84:
                     signal_timeframe = "intraday"
                 elif normalized_score >= 0.68:
@@ -429,10 +430,34 @@ class PositionOptimizerEngine:
                     return None
                 net_gex, gamma_flip, pcr, max_pain = gex_row
 
+                # Canonical signed net premium over the 30-minute window, by
+                # option type. Mirrors the aggregation in
+                # ``unified_signal_engine._fetch_market_context`` (see the
+                # ``flow_contract_facts`` query that populates
+                # ``ctx["smart_call"]`` / ``ctx["smart_put"]``) so that
+                # ``PositionOptimizerContext.smart_call_premium`` /
+                # ``smart_put_premium`` carry the SAME semantics regardless of
+                # which code path constructed the context: the portfolio
+                # engine driver (``portfolio_engine.py:2429-2430``) already
+                # passes the canonical signed values, and so should this
+                # standalone fetch path.
+                #
+                # The prior version aggregated ``SUM(total_premium)`` from
+                # ``flow_smart_money``, which has two mismatches against the
+                # downstream ``flow_bias = smart_call_premium -
+                # smart_put_premium`` consumer at line ~668: (1) it is
+                # GROSS (volume_delta * trade_price * 100), not buy-sell
+                # signed; (2) it is filtered to the "unusual activity"
+                # subset, not the full per-contract flow. Heavy call-selling
+                # plus heavy put-selling showed up as bullish flow_bias even
+                # though directional intent was bearish — the same anti-
+                # pattern unified_signal_engine.py:533-540 documents was
+                # already fixed elsewhere.
                 cur.execute(
                     """
-                    SELECT option_type, SUM(total_premium)
-                    FROM flow_smart_money
+                    SELECT option_type,
+                           SUM(COALESCE(buy_premium, 0) - COALESCE(sell_premium, 0)) AS net_premium
+                    FROM flow_contract_facts
                     WHERE symbol = %s
                       AND timestamp BETWEEN %s - INTERVAL '30 minutes' AND %s
                     GROUP BY option_type
@@ -598,8 +623,8 @@ class PositionOptimizerEngine:
         bid = row["bid"]
         ask = row["ask"]
         if bid > 0 and ask > 0:
-            return (bid + ask) / 2.0
-        return max(row.get("last", 0.0), ask, bid, 0.0)
+            return (bid + ask) / 2.0  # type: ignore[no-any-return]
+        return max(row.get("last", 0.0), ask, bid, 0.0)  # type: ignore[no-any-return]
 
     @staticmethod
     def _clamp(value: float, low: float, high: float) -> float:
@@ -1036,7 +1061,10 @@ class PositionOptimizerEngine:
             net_gamma = (far_leg["gamma"] - near_leg["gamma"]) * 100.0
             net_theta = (far_leg["theta"] - near_leg["theta"]) * 100.0
             base_pop = self._clamp(0.50 + self._clamp(ctx.regime_score, 0.0, 1.0) * 0.15, 0.3, 0.8)
-            strikes_label = f"Short {near_leg['strike']:.0f}{option_type} / Long {far_leg['strike']:.0f}{option_type}"
+            strikes_label = (
+                f"Short {near_leg['strike']:.0f}{option_type} / "
+                f"Long {far_leg['strike']:.0f}{option_type}"
+            )
             width = abs(near_leg["strike"] - far_leg["strike"])
             legs_payload = [
                 {
@@ -1153,10 +1181,16 @@ class PositionOptimizerEngine:
                 f"Net delta {net_delta:+.1f}, gamma {net_gamma:+.3f}, theta {net_theta:+.2f}.",
             ),
             "liquidity": (liquidity_score, liquidity_desc),
-            "market_structure": (market_structure_fit, f"Structure fit reflects {structure_desc}."),
+            "market_structure": (
+                market_structure_fit,
+                f"Structure fit reflects {structure_desc}.",
+            ),
             "edge_quality": (
                 edge_score,
-                f"Expected value is ${expected_value:,.2f} per spread with Kelly {kelly_fraction:.2%}.",
+                (
+                    f"Expected value is ${expected_value:,.2f} per spread with "
+                    f"Kelly {kelly_fraction:.2%}."
+                ),
             ),
         }
         components = []
@@ -1184,9 +1218,20 @@ class PositionOptimizerEngine:
 
         reasoning.extend(
             [
-                f"{strategy_type} targets the {ctx.signal_direction} {ctx.signal_timeframe} signal from {ctx.signal_timestamp.isoformat()}.",
-                f"POP {probability:.1%} with EV ${expected_value:,.2f} and max loss ${max_loss:,.2f}.",
-                f"Liquidity {liquidity_score:.2f}; market structure fit {market_structure_fit:.2f}; premium efficiency {premium_efficiency:.2f}.",
+                (
+                    f"{strategy_type} targets the {ctx.signal_direction} "
+                    f"{ctx.signal_timeframe} signal from "
+                    f"{ctx.signal_timestamp.isoformat()}."
+                ),
+                (
+                    f"POP {probability:.1%} with EV ${expected_value:,.2f} "
+                    f"and max loss ${max_loss:,.2f}."
+                ),
+                (
+                    f"Liquidity {liquidity_score:.2f}; market structure fit "
+                    f"{market_structure_fit:.2f}; premium efficiency "
+                    f"{premium_efficiency:.2f}."
+                ),
             ]
         )
         candidate = SpreadCandidate(

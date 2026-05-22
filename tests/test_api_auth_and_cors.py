@@ -11,7 +11,6 @@ queries.
 
 from __future__ import annotations
 
-import importlib
 import sys
 from unittest.mock import AsyncMock
 
