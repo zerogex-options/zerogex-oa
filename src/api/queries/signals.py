@@ -1072,15 +1072,30 @@ class SignalsQueriesMixin:
                     INSERT INTO signal_action_cards
                         (underlying, timestamp, pattern, action, tier,
                          direction, confidence, payload)
-                    SELECT $1, $2, $3, $4, $5, $6, $7, $8::jsonb
+                    SELECT $1::varchar, $2::timestamptz, $3::varchar,
+                           $4, $5, $6, $7, $8::jsonb
                     WHERE NOT EXISTS (
                         -- Idempotency guard (no UNIQUE on the logical key):
                         -- skip an exact (underlying, pattern, timestamp)
                         -- duplicate from a restart / overlapping cycle that
                         -- defeats the dwell-window dedup. asyncpg allows
-                        -- positional-parameter reuse, so no new args.
+                        -- positional-parameter reuse, but only when each
+                        -- parameter's type can be unambiguously deduced
+                        -- from a single context.  ``$1``/``$2``/``$3``
+                        -- appear in BOTH the INSERT-SELECT value position
+                        -- (type inferred from the target column) AND in
+                        -- the WHERE equality (type inferred from the LHS
+                        -- column type); without explicit casts the two
+                        -- deductions conflict and asyncpg rejects the
+                        -- prepare with ``inconsistent types deduced for
+                        -- parameter $N``, silently dropping every
+                        -- action-card write.  The explicit casts above
+                        -- pin each reused parameter to a single type so
+                        -- the deduction is unambiguous.
                         SELECT 1 FROM signal_action_cards
-                        WHERE underlying = $1 AND pattern = $3 AND timestamp = $2
+                        WHERE underlying = $1::varchar
+                          AND pattern = $3::varchar
+                          AND timestamp = $2::timestamptz
                     )
                     """,
                     card.get("underlying"),
