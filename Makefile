@@ -706,6 +706,88 @@ db-drop-unused-indexes: ## Drop 4 indexes with idx_scan=0 (~2.8 GB reclaimed). R
 		echo "$(GREEN)✓ Unused indexes dropped. Run 'make analytics-snapshot-diagnose' to re-check.$(NC)"; \
 	fi
 
+.PHONY: db-flow-stuck-cleanup
+db-flow-stuck-cleanup: ## One-shot cleanup for the cash-open watermark bug: drop today's cash-session option_chains rows that are pinned at the pre-cash residual. Dry-run by default; pass CONFIRM=yes to execute. Optional: SYMBOL='SPY 260529P00744000' targets one contract.
+	@echo "$(BLUE)=== Flow Stuck-Watermark Recovery ===$(NC)"
+	@echo "$(YELLOW)Identifies contracts where today's cash-session cumulative volume is$(NC)"
+	@echo "$(YELLOW)pinned at the pre-cash (00:00-09:30 ET) max -- the signature of the$(NC)"
+	@echo "$(YELLOW)writer's missing cash-open reset detection silently swallowing every$(NC)"
+	@echo "$(YELLOW)cash-session trade.  Pre-cash rows are kept (quotes/Greeks are still$(NC)"
+	@echo "$(YELLOW)useful); only cash-session rows (>= 09:30 ET today) are dropped so the$(NC)"
+	@echo "$(YELLOW)writer rebuilds them cleanly after the next ingestion-service restart.$(NC)"
+	@echo "$(YELLOW)Workflow: deploy main_engine fix -> run this with CONFIRM=yes ->$(NC)"
+	@echo "$(YELLOW)         restart $(INGESTION_SERVICE).$(NC)"
+	@SYMBOL_FILTER=""; \
+	if [ -n "$${SYMBOL}" ]; then \
+		echo "$(YELLOW)Scoping to SYMBOL='$${SYMBOL}'$(NC)"; \
+		SYMBOL_FILTER="AND option_symbol = '$${SYMBOL}'"; \
+	else \
+		echo "$(YELLOW)No SYMBOL set -> scanning ALL contracts.$(NC)"; \
+	fi; \
+	IDENTIFY_SQL="WITH bounds AS ( \
+	    SELECT \
+	      (DATE_TRUNC('day', (NOW() AT TIME ZONE 'America/New_York'))) AT TIME ZONE 'America/New_York' AS day_start_utc, \
+	      (DATE_TRUNC('day', (NOW() AT TIME ZONE 'America/New_York')) + INTERVAL '9 hours 30 minutes') AT TIME ZONE 'America/New_York' AS cash_open_utc, \
+	      (DATE_TRUNC('day', (NOW() AT TIME ZONE 'America/New_York')) + INTERVAL '1 day') AT TIME ZONE 'America/New_York' AS day_end_utc \
+	  ), \
+	  pre_cash AS ( \
+	    SELECT oc.option_symbol, MAX(oc.volume) AS pre_max_vol \
+	    FROM option_chains oc CROSS JOIN bounds b \
+	    WHERE oc.timestamp >= b.day_start_utc AND oc.timestamp < b.cash_open_utc $${SYMBOL_FILTER} \
+	    GROUP BY oc.option_symbol \
+	  ), \
+	  cash_session AS ( \
+	    SELECT oc.option_symbol, MAX(oc.volume) AS cash_max_vol, COUNT(*) AS row_count \
+	    FROM option_chains oc CROSS JOIN bounds b \
+	    WHERE oc.timestamp >= b.cash_open_utc AND oc.timestamp < b.day_end_utc $${SYMBOL_FILTER} \
+	    GROUP BY oc.option_symbol \
+	  ) \
+	  SELECT cs.option_symbol, pc.pre_max_vol, cs.cash_max_vol, cs.row_count AS cash_rows_to_drop \
+	  FROM cash_session cs JOIN pre_cash pc USING (option_symbol) \
+	  WHERE pc.pre_max_vol >= cs.cash_max_vol AND pc.pre_max_vol > 0 \
+	  ORDER BY pc.pre_max_vol DESC LIMIT 50;"; \
+	echo "$(BLUE)--- Top 50 stuck contracts (pre_max_vol >= cash_max_vol) ---$(NC)"; \
+	$(PSQL) -c "$$IDENTIFY_SQL"; \
+	if [ "$${CONFIRM}" != "yes" ]; then \
+		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to DELETE the cash-session rows.$(NC)"; \
+		echo "$(YELLOW)Tip: scope a single contract with SYMBOL='SPY 260529P00744000'.$(NC)"; \
+	else \
+		echo "$(BLUE)--- Deleting stuck cash-session rows ---$(NC)"; \
+		DELETE_SQL="WITH bounds AS ( \
+		    SELECT \
+		      (DATE_TRUNC('day', (NOW() AT TIME ZONE 'America/New_York'))) AT TIME ZONE 'America/New_York' AS day_start_utc, \
+		      (DATE_TRUNC('day', (NOW() AT TIME ZONE 'America/New_York')) + INTERVAL '9 hours 30 minutes') AT TIME ZONE 'America/New_York' AS cash_open_utc, \
+		      (DATE_TRUNC('day', (NOW() AT TIME ZONE 'America/New_York')) + INTERVAL '1 day') AT TIME ZONE 'America/New_York' AS day_end_utc \
+		  ), \
+		  pre_cash AS ( \
+		    SELECT oc.option_symbol, MAX(oc.volume) AS pre_max_vol \
+		    FROM option_chains oc CROSS JOIN bounds b \
+		    WHERE oc.timestamp >= b.day_start_utc AND oc.timestamp < b.cash_open_utc $${SYMBOL_FILTER} \
+		    GROUP BY oc.option_symbol \
+		  ), \
+		  cash_session AS ( \
+		    SELECT oc.option_symbol, MAX(oc.volume) AS cash_max_vol \
+		    FROM option_chains oc CROSS JOIN bounds b \
+		    WHERE oc.timestamp >= b.cash_open_utc AND oc.timestamp < b.day_end_utc $${SYMBOL_FILTER} \
+		    GROUP BY oc.option_symbol \
+		  ), \
+		  stuck AS ( \
+		    SELECT cs.option_symbol \
+		    FROM cash_session cs JOIN pre_cash pc USING (option_symbol) \
+		    WHERE pc.pre_max_vol >= cs.cash_max_vol AND pc.pre_max_vol > 0 \
+		  ) \
+		  DELETE FROM option_chains oc \
+		  USING bounds b, stuck s \
+		  WHERE oc.option_symbol = s.option_symbol \
+		    AND oc.timestamp >= b.cash_open_utc \
+		    AND oc.timestamp < b.day_end_utc \
+		  RETURNING 1;"; \
+		ROWS=$$($(PSQL) -t -A -c "$$DELETE_SQL" | wc -l); \
+		echo "$(GREEN)✓ Deleted $$ROWS cash-session rows.$(NC)"; \
+		echo "$(YELLOW)Next: restart ingestion so accumulators rebuild from scratch:$(NC)"; \
+		echo "$(YELLOW)  sudo systemctl restart $(INGESTION_SERVICE)$(NC)"; \
+	fi
+
 .PHONY: flow-explain
 flow-explain: ## Diagnose /api/flow/series query planner choice on flow_by_contract (FLOW_SYMBOL=SPY)
 	@echo "$(BLUE)=== flow_by_contract Query Planner Diagnosis ===$(NC)"

@@ -930,8 +930,26 @@ class IngestionEngine:
         (``last_bid`` / ``last_ask`` / ``last_mid``), preserving the
         Lee-Ready prior-tick rule across snapshots and across bucket
         boundaries within the same session.
+
+        Reset detection: TradeStation's cumulative volume resets to 0
+        at the 09:30 ET cash open.  ``_bucket_session_date`` anchors
+        per-contract accumulators to the ET *calendar* day (midnight
+        ET), which means the first snapshot of the day at 00:00 ET
+        observes the prior session's residual cumulative and seeds
+        ``last_volume_cum`` with that residual.  When the vendor then
+        resets at 09:30 ET and the post-reset cumulative is below the
+        watermark, ``max(curr_vol - watermark, 0)`` would silently swallow
+        every cash-session trade for the rest of the day, and the
+        ``GREATEST`` upsert would preserve the bogus watermark in
+        storage.  Re-anchor the watermark when we observe a decrease
+        (a cumulative can only legitimately drop on a vendor reset).
+        Classified ``ask_cum`` / ``mid_cum`` / ``bid_cum`` stay
+        monotonic across the boundary so the reader's LAG continues
+        to recover correct per-bar deltas in the cash session.
         """
         curr_vol = int(snap.get("volume") or 0)
+        if curr_vol < acc.last_volume_cum:
+            acc.last_volume_cum = 0
         vol_delta = max(curr_vol - acc.last_volume_cum, 0)
         if vol_delta > 0:
             skip = FLOW_CLASSIFY_SKIP_OPEN_AUCTION and self._is_opening_auction_bucket(bucket)
