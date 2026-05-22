@@ -1,7 +1,8 @@
 # `/api/gex/flip-surface` — proposed payload contract
 
-Status: **DESIGN / NOT IMPLEMENTED**. This document is the contract sketch
-to review before any code lands. The companion endpoint
+Status: **CONTRACT READY / NOT IMPLEMENTED**. All four originally-open
+design questions are resolved below; the API shape is locked enough for
+an implementation pass. The companion endpoint
 `/api/gex/flip-term-structure` (implemented as a prototype) returns the
 flip points only; this one returns the full per-horizon dealer-gamma
 profile that the contour / 3D-surface visualizations consume.
@@ -171,17 +172,55 @@ combinatorial: `len(grid) × len(horizons_days) ≤ 4000`.
   canonical definition the rest of the codebase uses), unscaled by
   horizon — they're a chain-level overlay, not horizon-dependent.
 
-## Open questions for review
+## Resolved design decisions
 
-1. **Variable horizons across cache keys** — should the cache be keyed
-   on the *exact* horizon list, or normalized to a small canonical set?
-   The latter is cheaper but forces all clients to use the same horizons.
-2. **Sparse representation** — for very narrow chains where most grid
-   points are zero, would a sparse `(grid_idx, value)` per profile pay
-   off in payload size? Probably not worth the schema complexity.
-3. **Wall horizon-dependence** — current contract treats walls as
-   horizon-independent. The DTE-weighted analogue would be one wall set
-   per horizon. Worth doing only if the contour view actually needs it;
-   most renderings will overlay one set.
-4. **Stream variant** — a `/flip-surface/stream` SSE endpoint for live
-   updates? Probably premature until the static endpoint is in use.
+The four originally-open questions, now answered as v1 defaults. Each
+can be revisited if data shows it's needed; the goal is to ship the
+simplest contract that doesn't paint us into a corner.
+
+### 1. Cache key — **exact horizon list**
+
+The cache is keyed on the tuple
+``(symbol, tuple(sorted(horizons)), span_pct, step_pct)`` with the
+standard 5s TTL. Reasoning: the 12-horizon cap bounds total cardinality,
+the dashboard's default horizon set will dominate traffic, and a
+normalized canonical set would force every client to use the same
+horizons (breaking the per-consumer-horizon promise the multi-horizon
+design exists to deliver). Revisit if hit-rate ever measures below
+~60% in production.
+
+### 2. Payload representation — **dense arrays, no sparse fallback**
+
+Profiles are returned as dense `List[List[float]]` matching the shared
+`grid`. At default settings (~160 grid points × 6 horizons) the JSON
+payload is ~8 KB, ~4 KB gzipped — already small. A sparse
+`(grid_idx, value)` representation adds schema complexity and forks
+every client renderer for negligible byte savings on a chain dense
+enough to actually have a flip. The combinatorial cap
+``len(grid) × len(horizons_days) ≤ 4000`` still applies as a guardrail.
+
+### 3. Walls — **horizon-independent v1, per-horizon walls deferred**
+
+`walls[]` is computed once per request from
+`src.analytics.walls.compute_call_put_walls` (the same canonical
+definition the rest of the codebase uses) with the production
+DTE weighting — independent of the requested horizons. The contour
+visualization renders walls as a single set of vertical strike lines.
+
+Trade-off acknowledged: the per-horizon walls (the strikes whose
+*horizon-weighted* dollar GEX dominates) would be slightly different
+at the 1d vs 60d horizon, and a viewer might find the single overlay
+misleading on contour edges. Per-horizon walls become an additive
+field (`walls_by_horizon: Dict[float, List[FlipSurfaceWall]]`) in v2
+if/when a user reports this confusion — the existing field stays
+populated for backwards compatibility.
+
+### 4. Live updates — **HTTP polling, no SSE v1**
+
+Clients refresh by re-issuing the GET on whatever cadence they want.
+The 5s server cache and the existing analytics 5s recompute cadence
+make polling at 1–5s effectively free. A `/flip-surface/stream` SSE
+endpoint adds stateful connections, reconnection logic, and a second
+code path with no current consumer; defer until a "live dashboard" use
+case actually materializes. Most surface-style visualizations are
+opened, browsed, then closed — polling fits that pattern.
