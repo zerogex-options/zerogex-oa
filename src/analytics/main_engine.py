@@ -1103,51 +1103,38 @@ class AnalyticsEngine:
 
         return best_flip
 
-    def _structural_reference(
+    def _structural_reference_from_profile(
         self,
         options: List[Dict[str, Any]],
         spot: float,
-        timestamp: datetime,
+        profile: List[Tuple[float, float]],
+        ref_span_pct: float = GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT,
     ) -> float:
-        """Active-strike-weighted structural reference for the resolver.
+        """Compute the active-strike-weighted p90 reference from a profile slice.
 
-        Builds the spot-shift gamma profile over a fixed
-        ``±GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT`` band around
-        spot, then INCLUDES in the p90 reference only those grid
-        points whose nearest option with non-zero open interest sits
-        within ``GAMMA_PROFILE_STRUCTURAL_ACTIVE_DISTANCE_PCT`` of
-        spot.  Anchors the noise floor to where the chain actually
-        carries OI, so:
+        Takes an already-built profile that covers AT LEAST
+        ``spot ± ref_span_pct``, slices it to that canonical band, and
+        applies the active-strike filter described in
+        :meth:`_structural_reference`.  Callers must guarantee the
+        coverage requirement; :meth:`_resolve_gamma_flip` enforces it
+        before invoking this fast path.
 
-        * Grid points in OI dead zones (extended-hours degraded
-          chains; long-dated tails where strike spacing widens past
-          any contribution) don't drag p90 toward zero and falsely
-          lower the floor for marginal crossings elsewhere.
-        * The reference is invariant to ladder rung width — adding
-          ±35% or ±50% scan points outside the active band has zero
-          effect because they're filtered out.
+        Pure function of ``(options, spot, profile slice)`` — does not
+        touch the BS gamma kernel.  Behavior is byte-identical to
+        building a separate ``±ref_span_pct`` profile and running the
+        original filter, because the spot-shift kernel is deterministic
+        and the slice contains exactly the grid points the standalone
+        builder would have produced (same step, same span).
 
-        Used once per cycle (see :meth:`_resolve_gamma_flip`) so the
-        "is this crossing structurally significant?" test depends
-        only on the chain.  Without it, widening the grid diluted
-        p90 with deep-OTM near-zero values and lowered the floor for
-        the SAME crossing — the 2026-05-20 SPX/QQQ pathology where
-        resolved flips clustered just inside the 8% actionable gate
-        while most cycles went NULL.
-
-        Returns ``0.0`` when no usable profile can be built or no
-        active strikes lie within the canonical band; callers treat
-        that as "no structural basis available" and fall through to
-        NULL.
+        Returns ``0.0`` when no usable slice can be built or no active
+        strikes lie within the canonical band; callers treat that as
+        "no structural basis available" and fall through to NULL.
         """
-        ref_profile = self._gamma_exposure_profile(
-            options,
-            spot,
-            timestamp,
-            span_pct=GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT,
-        )
-        if not ref_profile:
+        if not profile:
             return 0.0
+
+        ref_lo = spot - spot * ref_span_pct
+        ref_hi = spot + spot * ref_span_pct
 
         # Active strikes = unique strikes with non-zero open interest.
         # Sorted to support O(log N) nearest-strike lookup via bisect.
@@ -1166,7 +1153,9 @@ class AnalyticsEngine:
 
         max_distance = spot * GAMMA_PROFILE_STRUCTURAL_ACTIVE_DISTANCE_PCT
         filtered_abs: List[float] = []
-        for s, v in ref_profile:
+        for s, v in profile:
+            if s < ref_lo or s > ref_hi:
+                continue
             # Binary-search the nearest active strike.  bisect_left
             # returns the insertion point; the nearest strike is
             # either at that index or at index-1.
@@ -1192,6 +1181,42 @@ class AnalyticsEngine:
             # degenerating to "accept everything".
             reference = float(abs_arr.max())
         return reference
+
+    def _structural_reference(
+        self,
+        options: List[Dict[str, Any]],
+        spot: float,
+        timestamp: datetime,
+    ) -> float:
+        """Active-strike-weighted structural reference for the resolver.
+
+        Builds a fresh spot-shift gamma profile over a fixed
+        ``±GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT`` band around
+        spot, then delegates to
+        :meth:`_structural_reference_from_profile`.
+
+        This standalone path is the fallback for callers that have no
+        precomputed profile, and is retained for the rare case where
+        the first ladder rung is configured NARROWER than the reference
+        span (the rung wouldn't cover the canonical band, so we can't
+        slice from it).  In the default configuration (rung 0 = ±20%,
+        reference = ±15%) :meth:`_resolve_gamma_flip` takes the fast
+        slice path and this method is not called per cycle.
+
+        Returns ``0.0`` when no usable profile can be built or no
+        active strikes lie within the canonical band; callers treat
+        that as "no structural basis available" and fall through to
+        NULL.
+        """
+        ref_profile = self._gamma_exposure_profile(
+            options,
+            spot,
+            timestamp,
+            span_pct=GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT,
+        )
+        return self._structural_reference_from_profile(
+            options, spot, ref_profile, GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT,
+        )
 
     def _find_structural_interior_crossing(
         self,
@@ -1353,16 +1378,27 @@ class AnalyticsEngine:
         the resolver never changes which profile produces the readings.
 
         The structural floor that gates each rung's crossing is
-        computed ONCE up front (see :meth:`_structural_reference`)
-        over a fixed canonical band around spot, so the
-        significance test is identical at every rung.  Widening the
-        ladder only widens the geometric search; it no longer
-        relaxes the noise floor by diluting p90 with deep-OTM
+        computed ONCE per cycle over a fixed canonical band around
+        spot, so the significance test is identical at every rung.
+        Widening the ladder only widens the geometric search; it no
+        longer relaxes the noise floor by diluting p90 with deep-OTM
         near-zero values.
+
+        The reference is sourced by SLICING the first valid ladder
+        rung's profile (which is a superset of the canonical
+        reference band whenever the first rung is at least as wide as
+        ``GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT``, which is the
+        default).  When the first rung is narrower than the reference
+        span — an unusual configuration — the standalone builder is
+        used as a fallback.  Slicing avoids a redundant BS gamma
+        kernel call (~half of the per-cycle resolver compute at
+        defaults) without changing the reference's value, since the
+        kernel is deterministic and the slice contains exactly the
+        grid points the standalone builder would have produced.
 
         Returns ``(profile, flip, span_used)``.
         """
-        structural_reference = self._structural_reference(options, spot, timestamp)
+        structural_reference: Optional[float] = None
 
         last_profile: List[Tuple[float, float]] = []
         last_span: float = (
@@ -1374,6 +1410,23 @@ class AnalyticsEngine:
             last_span = span_pct
             if not profile:
                 continue
+
+            # Compute the structural reference once, on first valid
+            # profile.  Slice the existing profile when it covers the
+            # canonical reference band; fall back to building a
+            # separate reference profile otherwise (rare —
+            # rung_0 < ref_span isn't the default configuration).
+            if structural_reference is None:
+                if span_pct >= GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT:
+                    structural_reference = self._structural_reference_from_profile(
+                        options, spot, profile,
+                        GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT,
+                    )
+                else:
+                    structural_reference = self._structural_reference(
+                        options, spot, timestamp,
+                    )
+
             flip = self._find_structural_interior_crossing(
                 profile, spot, structural_reference=structural_reference
             )

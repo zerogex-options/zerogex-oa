@@ -154,19 +154,25 @@ flowchart TB
 
         subgraph OPATH["Options Path"]
             direction TB
-            STOB["_store_option_batch()<br/>:562-659<br/>per-symbol minute buffer"]:::compute
-            ENRICH["_enrich_with_greeks()<br/>:452-556<br/>staleness gate:<br/>price age &lt; 90s RTH / 300s ext"]:::compute
-            BUF[/"options_buffer[symbol]<br/>list of in-minute snapshots"/]:::compute
-            ROLLOVER["new minute bucket?<br/>aggregate prior bucket<br/>seed next bucket with _SEED_FLAG"]:::compute
-            AGG["_prepare_option_agg()<br/>:930-1099<br/>Lee-Ready classify<br/>OI=MAX, Volume=MAX<br/>ask/mid/bid_volume = Σ deltas"]:::compute
-            BASE["_get_option_volume_baseline()<br/>:828-885<br/>TTL cache 1800s<br/>per ET session date"]:::compute
-            CLASSIFY["_classify_volume_chunk()<br/>:699-784<br/>prior-tick rule<br/>FLOW_CLASSIFY_MID_BAND_PCT=0.70<br/>09:30 open auction → mid"]:::compute
-            COAL["_coalesce_option_rows()<br/>:1142-1185<br/>dedup (sym,ts)"]:::compute
-            WRITE["_write_option_rows()<br/>:1262-1458<br/>additive upsert<br/>circuit breaker<br/>retained-failed-rows queue (≤20k)"]:::compute
+            STOB["_store_option_batch()<br/>per-symbol minute buffer<br/>classify-on-arrival into accumulator"]:::compute
+            ENRICH["_enrich_with_greeks()<br/>staleness gate:<br/>price age &lt; 90s RTH / 300s ext"]:::compute
+            ACC[/"_FlowAccumulator (per option, per ET session)<br/>last_volume_cum, ask_cum, mid_cum, bid_cum<br/>last_bid/ask/mid (prior tick for next classify)"/]:::compute
+            INGEST["_ingest_snapshot_into_accumulator()<br/>idempotent: watermark on last_volume_cum<br/>vol_delta = max(curr − watermark, 0)<br/>Lee-Ready classify using accumulator's prior NBBO"]:::compute
+            HYDRATE["_hydrate_flow_accumulator()<br/>on first observation per (option, session):<br/>load latest persisted row for this ET session<br/>(volume, ask, mid, bid, NBBO)"]:::compute
+            BUF[/"options_buffer[symbol]<br/>list of in-minute snapshots<br/>(quote/Greek fields only; flow lives in accumulator)"/]:::compute
+            ROLLOVER["new minute bucket?<br/>emit prior bucket row<br/>keep last snapshot (no SEED_FLAG needed —<br/>accumulator watermark already counted it)"]:::compute
+            AGG["_prepare_option_agg()<br/>read accumulator's session-cumulative totals<br/>pair with best-available quote/Greek fields"]:::compute
+            CLASSIFY["_classify_volume_chunk()<br/>prior-tick rule<br/>FLOW_CLASSIFY_MID_BAND_PCT=0.70<br/>09:30 open auction → mid"]:::compute
+            COAL["_coalesce_option_rows()<br/>dedup (sym,ts) via MAX on every<br/>monotonic cumulative field"]:::compute
+            WRITE["_write_option_rows()<br/>idempotent UPSERT (GREATEST on every monotonic col)<br/>unified retain-and-retry on any failure<br/>circuit breaker, retained-failed-rows queue (≤20k)"]:::compute
 
-            STOB --> ENRICH --> BUF --> ROLLOVER --> AGG
-            AGG --> BASE
-            AGG --> CLASSIFY
+            STOB --> ENRICH
+            ENRICH --> INGEST
+            INGEST --> ACC
+            HYDRATE --> ACC
+            INGEST --> CLASSIFY
+            ENRICH --> BUF --> ROLLOVER --> AGG
+            AGG -.read.-> ACC
             AGG --> COAL --> WRITE
         end
 
@@ -348,7 +354,11 @@ sequenceDiagram
 
 ---
 
-## 3. Lee-Ready Aggregation per One-Minute Bucket
+## 3. Lee-Ready Classification & Cumulative Flow Accumulation
+
+Classification happens at snapshot arrival (`_ingest_snapshot_into_accumulator`),
+not in the per-bucket aggregation step. The per-contract `_FlowAccumulator` holds
+running session-cumulative totals; the aggregation step just reads them.
 
 ```mermaid
 flowchart TB
@@ -358,24 +368,26 @@ flowchart TB
 
     A["incoming snapshot for option_symbol<br/>{last, bid, ask, mid, volume_cum, oi, iv, ts}"]:::step
     B["bucket = bucket_timestamp(ts, 60s)"]:::step
-    C{"first snapshot in this bucket?"}:::branch
-    D["fetch baseline cumulative volume<br/>_get_option_volume_baseline()<br/>cache TTL=1800s, scoped by ET session"]:::io
-    E["delta = volume_cum − baseline"]:::step
-    F["delta = volume_cum − prev_snapshot.volume_cum"]:::step
+    C["acc = _get_flow_accumulator(option_symbol, bucket)"]:::step
+    C2{"acc exists?<br/>acc.session_date matches bucket?"}:::branch
+    HYD["_hydrate_flow_accumulator()<br/>SELECT volume, ask_volume, mid_volume,<br/>bid_volume, bid, ask, mid<br/>FROM option_chains<br/>WHERE option_symbol=? AND timestamp >= session_start<br/>ORDER BY timestamp DESC LIMIT 1<br/><br/>or zeros if no row this session"]:::io
+    D["vol_delta = max(volume_cum − acc.last_volume_cum, 0)"]:::step
+    D2{"vol_delta &gt; 0?"}:::branch
+    E["acc unchanged; refresh prior tick fields"]:::step
     G{"is_opening_auction_bucket (09:30 ET)<br/>+ FLOW_CLASSIFY_SKIP_OPEN_AUCTION?"}:::branch
-    H["route all delta → mid_volume<br/>(auction price not comparable to NBBO)"]:::step
-    I["_classify_volume_chunk(delta, last, prior_bid, prior_ask, prior_mid)"]:::step
+    H["acc.mid_cum += vol_delta<br/>(auction price not comparable to NBBO)"]:::step
+    I["_classify_volume_chunk(vol_delta, last,<br/>acc.last_bid, acc.last_ask, acc.last_mid)"]:::step
 
     subgraph CL["Lee-Ready prior-tick rule"]
         direction TB
-        I1{"prior bid/ask available?"}:::branch
-        I2["nearest-neighbor fallback"]:::step
+        I1{"prior bid/ask in accumulator?"}:::branch
+        I2["fall through to snapshot's own bid/ask<br/>(cold-start: first snapshot of session)"]:::step
         I3["half_spread = (ask−bid)/2"]:::step
         I4["band = half_spread × FLOW_CLASSIFY_MID_BAND_PCT (0.70)"]:::step
         I5{"last vs mid ± band"}:::branch
-        I6["above mid+band → ask_volume += delta"]:::step
-        I7["below mid−band → bid_volume += delta"]:::step
-        I8["within band → mid_volume += delta"]:::step
+        I6["above mid+band → ask_volume"]:::step
+        I7["below mid−band → bid_volume"]:::step
+        I8["within band → mid_volume"]:::step
         I1 -- no --> I2
         I1 -- yes --> I3 --> I4 --> I5
         I5 -- &gt; --> I6
@@ -384,30 +396,47 @@ flowchart TB
     end
 
     I --> CL
+    CL --> J["acc.ask_cum/mid_cum/bid_cum += classified delta"]:::step
+    J --> K["acc.last_volume_cum = max(curr_vol, watermark)<br/>acc.last_bid/last_ask/last_mid = snapshot's NBBO"]:::step
+    E --> K
+    H --> K
 
-    J["repeat per snapshot pair in bucket"]:::step
-    K["aggregate row:<br/>last/bid/ask/mid = best non-null (reverse scan)<br/>volume = MAX of cumulative<br/>open_interest = MAX<br/>implied_volatility = last snapshot<br/>delta/gamma/theta/vega = last snapshot<br/>ask_volume/mid_volume/bid_volume = sums"]:::step
-    L["advance baseline cache to current volume_cum<br/>(optimistic; invalidated on commit failure)"]:::step
-    M["update last-quote cache (bid/ask/mid) for next bucket"]:::step
+    K --> L["snapshot appended to options_buffer[symbol]<br/>(for quote/Greek aggregation only)"]:::step
 
-    N{"keep_last_snapshot?"}:::branch
-    O["mark last snapshot _SEED_FLAG<br/>buffer = [seed] only<br/>seed contributes 0 volume next bucket"]:::step
-    P["clear buffer; drop write-throttle entry"]:::step
+    L --> M{"bucket rollover?"}:::branch
+    M -- "yes" --> N["emit prior bucket row via _prepare_option_agg()<br/>keep_last_snapshot=False"]:::step
+    M -- "no" --> O{"_should_write_option_bucket throttle?"}:::branch
+    O -- "yes" --> P["emit current bucket row via _prepare_option_agg()<br/>keep_last_snapshot=True"]:::step
+    O -- "no" --> Z["wait for next snapshot"]:::step
 
-    Q["row → _write_option_rows()"]:::step
-    R["_coalesce_option_rows()<br/>dedup by (option_symbol, timestamp)<br/>quote = latest non-null<br/>volume/OI = MAX<br/>flow vols = SUM"]:::step
-    S[("UPSERT option_chains<br/>ON CONFLICT (option_symbol, timestamp):<br/>quote=COALESCE; vol/OI=GREATEST;<br/>flow_vols = existing + EXCLUDED (ADDITIVE);<br/>greeks/iv = new")]:::io
+    PREP["_prepare_option_agg() reads accumulator:<br/>row.volume = acc.last_volume_cum<br/>row.ask_volume = acc.ask_cum<br/>row.mid_volume = acc.mid_cum<br/>row.bid_volume = acc.bid_cum<br/>row.last/bid/ask/mid/IV/Greeks = best from buffer"]:::step
+    N --> PREP
+    P --> PREP
 
-    A --> B --> C
-    C -- yes --> D --> E --> G
-    C -- no --> F --> G
-    G -- yes --> H --> J
-    G -- no --> I --> J
-    J --> K --> L --> M --> N
-    N -- yes (per-bucket throttled write) --> O --> Q
-    N -- no (rollover/flush) --> P --> Q
-    Q --> R --> S
+    PREP --> Q["row → _write_option_rows()"]:::step
+    Q --> R["_coalesce_option_rows()<br/>dedup by (option_symbol, timestamp)<br/>quote = latest non-null<br/>volume/OI/ask/mid/bid_volume = MAX"]:::step
+    R --> S[("UPSERT option_chains<br/>ON CONFLICT (option_symbol, timestamp):<br/>quote=COALESCE; greeks/iv = new;<br/>volume/OI/ask/mid/bid_volume = GREATEST<br/>(idempotent under retry)")]:::io
+
+    A --> B --> C --> C2
+    C2 -- "no" --> HYD --> D
+    C2 -- "yes" --> D
+    D --> D2
+    D2 -- "no" --> E
+    D2 -- "yes" --> G
+    G -- "yes" --> H
+    G -- "no" --> I
 ```
+
+**Key invariants in the new design:**
+
+| Invariant | Why it matters |
+|---|---|
+| `acc.last_volume_cum` is a watermark; `vol_delta = max(curr − watermark, 0)` | Replay-safe: the same snapshot ingested twice contributes zero new flow the second time |
+| Classification uses accumulator's prior NBBO, not snapshot's own | Lee-Ready prior-tick rule preserved across snapshots and across bucket boundaries within a session |
+| Accumulator is keyed by `(option_symbol, ET session date)` | TradeStation's 09:30 ET volume reset is honored automatically (different session date → fresh hydrate) |
+| `option_chains.{ask,mid,bid}_volume` are session-cumulative monotonic | Matches what `flow_contract_facts` already expected (via `LAG()` deltas) — fixes a latent inconsistency in the prior additive-upsert design |
+| UPSERT uses `GREATEST` on every monotonic column with `IS DISTINCT FROM` WHERE guard | Retries are idempotent: re-submitting a row that already committed is a no-op |
+| Per-row invariant: `ask_volume + mid_volume + bid_volume == volume` (modulo opening auction) | The classified columns reconcile against the raw volume column |
 
 ---
 
@@ -474,12 +503,10 @@ flowchart TB
         DB1["consecutive_failures += 1"]:::warn
         DB2["backoff = min(60, 2^N) + 0..10% jitter"]:::warn
         DB3["set _db_backoff_until = now+backoff"]:::warn
-        DB4["pre-commit fail → retain rows (≤20k)"]:::warn
-        DB5["commit-phase fail → DON'T retain<br/>(additive upsert would double-count)<br/>invalidate volume baselines"]:::err
+        DB4["pre-commit OR commit-phase fail → retain rows (≤20k)<br/>(unified path: GREATEST-based upsert makes retry idempotent;<br/>no fork between rolled-back vs ambiguous-commit)"]:::warn
         DB6["success → reset counters; log recovery"]:::ok
         DB1 --> DB2 --> DB3
         DB3 --> DB4
-        DB3 --> DB5
         DB3 --> DB6
     end
 

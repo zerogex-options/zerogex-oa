@@ -1,29 +1,38 @@
-"""Regression tests for the option volume-baseline / seed accumulation bug.
+"""Regression tests for per-contract session-cumulative classified flow.
 
-These pin the fix for a ~30-minute sawtooth in
-``option_chains.ask_volume / mid_volume / bid_volume`` (and therefore the
-Live Options Quotes chart). Two defects combined to produce it:
+The prior design wrote ``option_chains.ask_volume / mid_volume / bid_volume``
+as per-bucket additive values via an additive upsert
+(``ask_volume = option_chains.ask_volume + EXCLUDED.ask_volume``).  That
+stack required a TTL-backed baseline cache, a SEED_FLAG marker on
+carried-over snapshots, an optimistic-advance step, and a pre-commit /
+commit-phase failure fork.  When any link broke (the original
+sawtooth bug: bare-string optimistic-advance key vs. tuple read key)
+the columns could inflate by ~30 minutes of double-counted flow.
 
-* (a) ``_prepare_option_agg`` advanced the volume-baseline cache under a
-  bare ``option_symbol`` string key while ``_get_option_volume_baseline``
-  read it under a ``(option_symbol, session_date)`` tuple key, so the
-  per-aggregation refresh was a silent no-op and the only refresh left was
-  the ``OPTION_VOLUME_BASELINE_TTL_SECONDS`` (default 1800s = 30 min) TTL.
+The replacement keeps a single ``_FlowAccumulator`` per
+``(option_symbol, ET session date)`` holding running session-cumulative
+totals (matching what ``flow_contract_facts`` already derived via
+``LAG()`` deltas — and what the cumulative ``volume`` column already
+used).  These tests pin the invariants that fall out of that:
 
-* (b) the single-snapshot path re-derived a whole-bucket delta from that
-  (stale) baseline even when the lone buffered snapshot was a retained
-  seed whose volume had already been classified and persisted — and the
-  accumulating upsert added it again.
+* Each snapshot advances the cumulative once and only once
+  (idempotent under replay).
+* The bucket-rollover ``keep_last_snapshot`` path no longer needs a
+  marker — the watermark in the accumulator already records the
+  carried snapshot's volume.
+* Aggregated rows expose the accumulator's cumulative, so the
+  downstream LAG-delta consumer recovers the correct per-bucket flow.
+* Cross-bucket flush attribution uses the buffered timestamp, not
+  wall-clock.
 """
 
 import threading
-from collections import OrderedDict
-from datetime import datetime
+from datetime import date, datetime
 import time as _time
 
 import pytz
 
-from src.ingestion.main_engine import IngestionEngine, _SEED_FLAG
+from src.ingestion.main_engine import IngestionEngine, _FlowAccumulator
 from src.validation import bucket_timestamp
 
 ET = pytz.timezone("US/Eastern")
@@ -32,12 +41,8 @@ ET = pytz.timezone("US/Eastern")
 def _agg_engine() -> IngestionEngine:
     e = IngestionEngine.__new__(IngestionEngine)
     e.options_buffer = {}
-    e._option_volume_baseline = {}
-    e._option_volume_baseline_lock = threading.Lock()
-    e._option_volume_baseline_ttl = 1800.0
-    e._option_last_quote = OrderedDict()
-    e._option_last_quote_lock = threading.Lock()
-    e._option_last_quote_max = 10000
+    e._option_flow = {}
+    e._option_flow_lock = threading.Lock()
     e._option_bucket_last_write = {}
     e._classify_fallback_count = 0
     e.errors_count = 0
@@ -78,103 +83,132 @@ def _classified(agg: dict) -> int:
     return agg["ask_volume"] + agg["mid_volume"] + agg["bid_volume"]
 
 
-def test_baseline_advance_uses_read_path_key_and_tags_seed():
-    """Fix (a): the optimistic advance must land under the SAME key the
-    reader uses (and never as a stray bare-string key), and the retained
-    snapshot must be tagged as a seed."""
+def _seed_accumulator(e: IngestionEngine, sym: str, bucket: datetime,
+                      *, last_volume_cum: int = 0,
+                      ask: int = 0, mid: int = 0, bid: int = 0) -> _FlowAccumulator:
+    """Install a hydrated accumulator without hitting the DB."""
+    acc = _FlowAccumulator(
+        session_date=e._bucket_session_date(bucket),
+        last_volume_cum=last_volume_cum,
+        ask_cum=ask,
+        mid_cum=mid,
+        bid_cum=bid,
+    )
+    with e._option_flow_lock:
+        e._option_flow[sym] = acc
+    return acc
+
+
+def test_agg_row_exposes_session_cumulative_classified_flow():
+    """Agg row's ask/mid/bid_volume == accumulator's cumulative totals.
+    This is the contract the downstream LAG-delta query in
+    flow_contract_facts already assumes for these columns."""
     e = _agg_engine()
-    # Fresh cached baseline so _get_option_volume_baseline returns it
-    # without a DB hit. Cold-start (untagged) single snapshot.
-    key = e._baseline_cache_key(SYM, BUCKET)
-    e._option_volume_baseline[key] = (1000, _time.monotonic())
+    # Pre-existing session state from a hydrate or prior buckets.
+    _seed_accumulator(e, SYM, BUCKET, last_volume_cum=1000, ask=120, mid=80, bid=40)
     e.options_buffer[SYM] = [_snap(SYM, TS, volume=1500)]
 
+    acc = e._get_flow_accumulator(SYM, BUCKET)
+    # Simulate _store_option_batch's per-snapshot classify-on-arrival.
+    e._ingest_snapshot_into_accumulator(acc, e.options_buffer[SYM][-1], BUCKET)
+
     agg = e._prepare_option_agg(SYM, BUCKET, keep_last_snapshot=True)
-
     assert agg is not None
-    # Cold start: vol_delta = 1500 - 1000 = 500.
-    assert _classified(agg) == 500
-    # The advance landed under the reader's tuple key, set to the
-    # just-aggregated cumulative volume...
-    assert e._option_volume_baseline[key][0] == 1500
-    # ...and NOT under the old buggy bare-string key.
-    assert SYM not in e._option_volume_baseline
-    # Retained snapshot is tagged so a later lone flush won't re-count it.
-    assert e.options_buffer[SYM][0].get(_SEED_FLAG) is True
-
-
-def test_lone_seed_snapshot_contributes_zero_volume():
-    """Fix (b): a lone carried seed must classify zero volume and must not
-    even consult the baseline (its volume is already persisted)."""
-    e = _agg_engine()
-
-    def _boom(*_a, **_k):
-        raise AssertionError("baseline must not be consulted for a seed snapshot")
-
-    e._get_option_volume_baseline = _boom  # type: ignore[assignment]
-
-    seed = _snap(SYM, TS, volume=1500)
-    seed[_SEED_FLAG] = True
-    e.options_buffer[SYM] = [seed]
-
-    agg = e._prepare_option_agg(SYM, BUCKET, keep_last_snapshot=False)
-
-    assert agg is not None
-    assert agg["ask_volume"] == 0
-    assert agg["mid_volume"] == 0
-    assert agg["bid_volume"] == 0
-    # Quote / volume fields still populated so the upsert refreshes them.
+    # 1500 - 1000 = 500 new classified flow this snapshot, routed to mid
+    # (last==mid by construction).  Cumulative becomes 80 + 500 = 580.
+    assert agg["mid_volume"] == 580
+    assert agg["ask_volume"] == 120
+    assert agg["bid_volume"] == 40
+    # Volume column carries the same session-cumulative semantics.
     assert agg["volume"] == 1500
+    # ask + mid + bid + opening-auction carve-out invariant: in a
+    # non-opening bucket with last==mid, all new flow lands in mid_cum,
+    # so cumulative classified sum equals the cumulative volume only
+    # when all prior flow was also classified (here: 580+120+40=740,
+    # 1500-740=760 was pre-hydrate unclassified volume).
+    assert _classified(agg) == 740
 
 
-def test_no_sawtooth_across_buckets_with_stale_baseline():
-    """End-to-end: with a deliberately TTL-stale baseline, the classified
-    volume of a *subsequent* bucket is the true per-minute delta — not the
-    inflated baseline-relative value that produced the 30-minute sawtooth.
-    """
+def test_replaying_same_snapshot_does_not_double_count():
+    """The watermark in the accumulator makes ingest idempotent: replaying
+    the same snapshot is a no-op for the cumulative.  This is what makes
+    retain-and-retry safe under the unified failure path."""
     e = _agg_engine()
+    _seed_accumulator(e, SYM, BUCKET)
+    snap = _snap(SYM, TS, volume=1000)
+    e.options_buffer[SYM] = [snap]
+
+    acc = e._get_flow_accumulator(SYM, BUCKET)
+    e._ingest_snapshot_into_accumulator(acc, snap, BUCKET)
+    first_mid = acc.mid_cum
+
+    # Replay the same snapshot (same cumulative volume) — vol_delta = 0.
+    e._ingest_snapshot_into_accumulator(acc, snap, BUCKET)
+    assert acc.mid_cum == first_mid
+    assert acc.last_volume_cum == 1000
+
+
+def test_bucket_rollover_no_double_count_without_seed_flag():
+    """Carrying the previous bucket's last snapshot into the new bucket
+    must not re-classify its volume.  With the in-memory watermark, this
+    falls out automatically — no SEED_FLAG marker required."""
+    e = _agg_engine()
+    _seed_accumulator(e, SYM, BUCKET)
     ts1 = ET.localize(datetime(2026, 5, 15, 10, 15, 5))
-    ts1b = ET.localize(datetime(2026, 5, 15, 10, 15, 40))
     ts2 = ET.localize(datetime(2026, 5, 15, 10, 16, 3))
     b1 = bucket_timestamp(ts1, 60)
     b2 = bucket_timestamp(ts2, 60)
 
-    # Stale baseline: contract first seen earlier this session at cum vol 100.
-    e._option_volume_baseline[e._baseline_cache_key(SYM, b1)] = (
-        100,
-        _time.monotonic(),
-    )
+    snap1 = _snap(SYM, ts1, volume=1000)
+    snap2 = _snap(SYM, ts2, volume=1080)
 
-    # --- bucket b1: first observation (cold start, untagged) ---
-    e.options_buffer[SYM] = [_snap(SYM, ts1, volume=1000)]
-    a1 = e._prepare_option_agg(SYM, b1, keep_last_snapshot=True)
-    b1_total = _classified(a1)
-    # Cold start legitimately attributes pre-observation session volume
-    # (1000 - 100) to the first observed bucket.
-    assert b1_total == 900
-    seed_b1 = e.options_buffer[SYM][0]
-    assert seed_b1.get(_SEED_FLAG) is True
+    # Ingest snap1 (b1) then snap2 (b2). The carried-over snap1 in the
+    # b2 buffer doesn't get re-ingested — _store_option_batch only calls
+    # _ingest_snapshot_into_accumulator for each arriving snapshot, not
+    # for re-scanned buffer contents.
+    acc = e._get_flow_accumulator(SYM, b1)
+    e._ingest_snapshot_into_accumulator(acc, snap1, b1)
+    e.options_buffer[SYM] = [snap1]
+    agg1 = e._prepare_option_agg(SYM, b1, keep_last_snapshot=True)
+    # b1 row: cumulative is 1000, last==mid so all in mid.
+    assert agg1["mid_volume"] == 1000
 
-    # --- more ticks in b1, throttled re-flush (multi-snapshot) ---
-    e.options_buffer[SYM].append(_snap(SYM, ts1b, volume=1100))
-    a1b = e._prepare_option_agg(SYM, b1, keep_last_snapshot=True)
-    b1_total += _classified(a1b)
-    # Accumulated b1 == 1100 - 100 (the upsert sums per-flush contributions).
-    assert b1_total == 1000
+    # b2: ingest snap2 into the same (now-rollover) accumulator.
+    e.options_buffer[SYM].append(snap2)
+    acc2 = e._get_flow_accumulator(SYM, b2)
+    e._ingest_snapshot_into_accumulator(acc2, snap2, b2)
+    agg2 = e._prepare_option_agg(SYM, b2, keep_last_snapshot=True)
+    # b2 row: cumulative now 1080. LAG-delta downstream = 1080 - 1000 = 80
+    # — the true per-bucket flow.  No double counting from the carried seed.
+    assert agg2["mid_volume"] == 1080
+    assert agg2["volume"] == 1080
 
-    # --- cross into b2 exactly as _store_option_batch does ---
-    prev_snap = e.options_buffer[SYM][-1]  # lone tagged seed (vol 1100)
-    a1_final = e._prepare_option_agg(SYM, b1, keep_last_snapshot=False)
-    # The bucket-closing flush sees only the seed → zero (already counted).
-    assert _classified(a1_final) == 0
 
-    e.options_buffer[SYM] = [prev_snap]
-    e.options_buffer[SYM].append(_snap(SYM, ts2, volume=1130))
-    a2 = e._prepare_option_agg(SYM, b2, keep_last_snapshot=True)
+def test_session_rollover_resets_accumulator():
+    """A bucket in a new ET session date triggers a fresh hydrate.  Stub
+    out the DB call to simulate a cold start (no prior rows today)."""
+    e = _agg_engine()
+    monday_ts = ET.localize(datetime(2026, 5, 18, 10, 15, 5))
+    tuesday_ts = ET.localize(datetime(2026, 5, 19, 10, 15, 5))
+    b_mon = bucket_timestamp(monday_ts, 60)
+    b_tue = bucket_timestamp(tuesday_ts, 60)
 
-    # REGRESSION: b2 == true per-minute delta (1130 - 1100 = 30), NOT the
-    # stale-baseline-relative 1130 - 100 = 1030 that drove the sawtooth.
-    assert _classified(a2) == 30
+    _seed_accumulator(e, SYM, b_mon, last_volume_cum=5000, ask=2000, mid=1000, bid=2000)
+
+    # Make _hydrate_flow_accumulator return zeros (no DB) for the Tuesday call.
+    def _zero_hydrate(_sym: str, sd: date) -> _FlowAccumulator:
+        return _FlowAccumulator(
+            session_date=sd, last_volume_cum=0, ask_cum=0, mid_cum=0, bid_cum=0,
+        )
+    e._hydrate_flow_accumulator = _zero_hydrate  # type: ignore[method-assign]
+
+    mon_acc = e._get_flow_accumulator(SYM, b_mon)
+    assert mon_acc.last_volume_cum == 5000
+
+    tue_acc = e._get_flow_accumulator(SYM, b_tue)
+    # Different session date → fresh hydrate, NOT the Monday state.
+    assert tue_acc.last_volume_cum == 0
+    assert tue_acc.ask_cum == 0
 
 
 def test_flush_all_buffers_buckets_by_buffered_timestamp_not_wallclock():
@@ -185,16 +219,23 @@ def test_flush_all_buffers_buckets_by_buffered_timestamp_not_wallclock():
     e.underlying_buffer = []
     e.last_flush_time = datetime.now(ET)
     written: list = []
-    e._write_option_rows = lambda rows: written.extend(rows)  # no DB
+    e._write_option_rows = lambda rows: written.extend(rows)  # type: ignore[method-assign]
 
     # Buffered ticks traded at 10:15 ET; the flush "fires" whenever the
     # test runs (definitely not 2026-05-15 10:15 ET).
     ts_a = ET.localize(datetime(2026, 5, 15, 10, 15, 10))
     ts_b = ET.localize(datetime(2026, 5, 15, 10, 15, 50))
     minute_1015 = bucket_timestamp(ts_a, 60)
-    seed = _snap(SYM, ts_a, volume=1000)
-    seed[_SEED_FLAG] = True  # carried seed from a prior flush
-    e.options_buffer[SYM] = [seed, _snap(SYM, ts_b, volume=1080)]
+    snap_a = _snap(SYM, ts_a, volume=1000)
+    snap_b = _snap(SYM, ts_b, volume=1080)
+    e.options_buffer[SYM] = [snap_a, snap_b]
+
+    # Simulate the in-memory state _store_option_batch would have
+    # produced by classify-on-arrival for both snapshots.
+    _seed_accumulator(e, SYM, minute_1015)
+    acc = e._get_flow_accumulator(SYM, minute_1015)
+    e._ingest_snapshot_into_accumulator(acc, snap_a, minute_1015)
+    e._ingest_snapshot_into_accumulator(acc, snap_b, minute_1015)
 
     e._flush_all_buffers()
 
@@ -202,5 +243,5 @@ def test_flush_all_buffers_buckets_by_buffered_timestamp_not_wallclock():
     agg = written[0]
     # Bucketed to the minute the ticks traded, NOT datetime.now().
     assert agg["timestamp"] == minute_1015
-    # Multi-snapshot: 1080 - 1000 = 80 classified for that minute.
-    assert _classified(agg) == 80
+    # Cumulative classified flow for the bucket: 1080 (all in mid).
+    assert _classified(agg) == 1080

@@ -120,54 +120,79 @@ def test_opening_auction_helper_naive_datetime_treated_as_et():
     assert IngestionEngine._is_opening_auction_bucket(naive) is True
 
 
-def test_cached_last_quote_roundtrip():
-    from collections import OrderedDict
+def test_accumulator_prior_tick_carries_across_snapshots():
+    """The flow accumulator stores the most recent NBBO and reuses it as
+    the prior-tick quote for the next classification — same behavior the
+    deleted ``_option_last_quote`` cache provided, now consolidated into
+    the per-contract accumulator."""
+    from src.ingestion.main_engine import _FlowAccumulator
+    from datetime import date
 
     engine = _engine()
-    engine._option_last_quote = OrderedDict()
-    engine._option_last_quote_lock = threading.Lock()
-    engine._option_last_quote_max = 10000
+    engine._option_flow = {}
+    engine._option_flow_lock = threading.Lock()
 
-    assert engine._get_cached_last_quote("XYZ") is None
+    bucket = ET.localize(datetime(2026, 4, 28, 10, 15))
+    acc = _FlowAccumulator(
+        session_date=date(2026, 4, 28),
+        last_volume_cum=0, ask_cum=0, mid_cum=0, bid_cum=0,
+    )
 
-    engine._update_cached_last_quote("XYZ", bid=1.0, ask=1.1, mid=1.05)
-    cached = engine._get_cached_last_quote("XYZ")
-    assert cached == {"bid": 1.0, "ask": 1.1, "mid": 1.05}
+    # First snapshot: no prior NBBO yet, classifier falls through to the
+    # snapshot's own quote (degraded but unavoidable cold-start path).
+    # last=5.58 sits at the ask, above the default mid-band threshold
+    # (5.555 + 0.7*0.025 = 5.5725 → 5.58 is above → ask_volume).
+    engine._ingest_snapshot_into_accumulator(
+        acc,
+        {"volume": 100, "last": 5.58, "bid": 5.53, "ask": 5.58, "mid": 5.555},
+        bucket,
+    )
+    assert acc.last_volume_cum == 100
+    assert acc.ask_cum == 100  # first 100 classified as ask
+    # After ingesting, the accumulator captured the snapshot's NBBO as
+    # the prior tick for next time.
+    assert acc.last_bid == 5.53
+    assert acc.last_ask == 5.58
+    assert acc.last_mid == 5.555
 
-    # All-None update is a no-op (don't wipe a known quote with empty data).
-    engine._update_cached_last_quote("XYZ", bid=None, ask=None, mid=None)
-    assert engine._get_cached_last_quote("XYZ") == {"bid": 1.0, "ask": 1.1, "mid": 1.05}
+    # Second snapshot with a new quote and another at-ask print:
+    # classification uses the *prior* NBBO (5.53/5.58), so the 50 new
+    # contracts classify as ask, bringing ask_cum to 150.
+    engine._ingest_snapshot_into_accumulator(
+        acc,
+        {"volume": 150, "last": 5.58, "bid": 5.54, "ask": 5.59, "mid": 5.565},
+        bucket,
+    )
+    assert acc.last_volume_cum == 150
+    assert acc.ask_cum == 150  # cumulative: 100 + 50
+    # Prior tick advanced to the new NBBO for the *next* classification.
+    assert acc.last_bid == 5.54
+    assert acc.last_ask == 5.59
 
 
-def test_cached_last_quote_lru_eviction():
-    from collections import OrderedDict
+def test_accumulator_ingest_is_idempotent_for_same_cumulative():
+    """Replaying the same snapshot (same TS-reported cumulative volume)
+    contributes zero new flow. This is what makes retain-and-retry safe
+    without the prior design's pre-commit / commit-phase fork."""
+    from src.ingestion.main_engine import _FlowAccumulator
+    from datetime import date
 
     engine = _engine()
-    engine._option_last_quote = OrderedDict()
-    engine._option_last_quote_lock = threading.Lock()
-    engine._option_last_quote_max = 3
+    bucket = ET.localize(datetime(2026, 4, 28, 10, 15))
+    acc = _FlowAccumulator(
+        session_date=date(2026, 4, 28),
+        last_volume_cum=0, ask_cum=0, mid_cum=0, bid_cum=0,
+    )
 
-    for sym in ("A", "B", "C"):
-        engine._update_cached_last_quote(sym, bid=1.0, ask=1.1, mid=1.05)
-    assert list(engine._option_last_quote) == ["A", "B", "C"]
+    snap = {"volume": 100, "last": 5.58, "bid": 5.53, "ask": 5.58, "mid": 5.555}
+    engine._ingest_snapshot_into_accumulator(acc, snap, bucket)
+    ask_after_first = acc.ask_cum
+    mid_after_first = acc.mid_cum
+    bid_after_first = acc.bid_cum
 
-    # Reading A promotes it to most-recently-used; inserting D should evict B.
-    engine._get_cached_last_quote("A")
-    engine._update_cached_last_quote("D", bid=2.0, ask=2.1, mid=2.05)
-    assert list(engine._option_last_quote) == ["C", "A", "D"]
-    assert engine._get_cached_last_quote("B") is None
-
-
-def test_invalidate_baseline_also_drops_last_quote():
-    from collections import OrderedDict
-
-    engine = _engine()
-    engine._option_volume_baseline = {"XYZ": (100, 0.0)}
-    engine._option_volume_baseline_lock = threading.Lock()
-    engine._option_last_quote = OrderedDict()
-    engine._option_last_quote_lock = threading.Lock()
-    engine._option_last_quote_max = 10000
-
-    engine._update_cached_last_quote("XYZ", bid=1.0, ask=1.1, mid=1.05)
-    engine._invalidate_option_volume_baseline("XYZ")
-    assert engine._get_cached_last_quote("XYZ") is None
+    # Replay the same snapshot — cumulative watermark doesn't advance,
+    # so no new flow is attributed.
+    engine._ingest_snapshot_into_accumulator(acc, snap, bucket)
+    assert acc.ask_cum == ask_after_first
+    assert acc.mid_cum == mid_after_first
+    assert acc.bid_cum == bid_after_first

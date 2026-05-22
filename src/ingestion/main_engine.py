@@ -18,10 +18,11 @@ import json
 import threading
 import time
 import time as _time
+from dataclasses import dataclass, field
 from multiprocessing import Process
-from datetime import datetime, time as dt_time, timezone
+from datetime import datetime, date as _date, time as dt_time, timezone
 from typing import Dict, Any, List, Optional
-from collections import defaultdict, OrderedDict
+from collections import defaultdict
 import pytz
 from psycopg2.extras import execute_values
 
@@ -71,13 +72,36 @@ def _greeks_max_age_for_session(session: str, base: float, extended: float) -> f
     return base
 
 
-# Marks a buffered snapshot whose cumulative volume has already been
-# classified and persisted for its bucket (a retained / carried-over seed).
-# When such a snapshot is the *only* element in a buffer at flush time it
-# must NOT have its volume re-derived from the baseline: the accumulating
-# upsert (``ask_volume = option_chains.ask_volume + EXCLUDED.ask_volume``)
-# would add it a second time. See _prepare_option_agg.
-_SEED_FLAG = "_seed_classified"
+@dataclass
+class _FlowAccumulator:
+    """Per-contract session-cumulative classified flow state.
+
+    Single source of truth for an option's running totals within one ET
+    session: TS-reported cumulative volume, Lee-Ready-classified
+    ask/mid/bid cumulative flow, and the most recent NBBO used as the
+    prior tick for the next classification.
+
+    The downstream ``flow_contract_facts`` derivation (api/database.py)
+    recovers per-bucket flow via ``LAG()`` deltas of these cumulative
+    columns, matching what it already does for the cumulative ``volume``
+    column.  Writing per-bucket additive values (the prior design) leaked
+    signal when consecutive buckets had similar magnitudes (the LAG of
+    ``[10, 10]`` is 0 even though 10 trades occurred in the second
+    bucket).  Storing cumulative makes the writer and the consumer agree.
+
+    Instances are keyed by ``(option_symbol, session_date_ET)``; a new
+    session creates a fresh instance hydrated from the latest persisted
+    row for that contract in the new session (or zeros if none exists).
+    """
+
+    session_date: _date
+    last_volume_cum: int
+    ask_cum: int
+    mid_cum: int
+    bid_cum: int
+    last_bid: Optional[float] = None
+    last_ask: Optional[float] = None
+    last_mid: Optional[float] = None
 
 
 def _compute_db_backoff_seconds(consecutive_failures: int) -> float:
@@ -134,33 +158,16 @@ class IngestionEngine:
         # Buffering for options only (underlying writes every update)
         self.underlying_buffer: List[Dict[str, Any]] = []
         self.options_buffer: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        # Per-contract cumulative-volume baseline used to turn TradeStation's
-        # monotonically-increasing Volume field into per-bucket deltas.
-        # Entries are (baseline_value, monotonic_timestamp). The monotonic
-        # timestamp drives a TTL so the cache self-heals after any external
-        # DB write (data-retention sweeps, backfills, failed writes that
-        # left the cache ahead of the DB, etc.).
-        # Cache key is (option_symbol, session_date_ET) so a baseline from
-        # a prior session can't survive into a new session — TradeStation
-        # resets cumulative volume to 0 at session open.  See
-        # _get_option_volume_baseline for the read path.
-        self._option_volume_baseline: Dict[tuple, tuple[int, float]] = {}
-        self._option_volume_baseline_lock = threading.Lock()
-        self._option_volume_baseline_ttl = float(
-            os.getenv("OPTION_VOLUME_BASELINE_TTL_SECONDS", "1800")
-        )
-        # Last-known (bid, ask, mid) per contract used as the "prior tick"
-        # when a bucket only has a single buffered snapshot — without this,
-        # the only quote available is the post-trade snapshot, which defeats
-        # the prior-tick rule for borderline fills.
-        #
-        # LRU-bounded so multi-day sessions can't accumulate stale entries as
-        # the tracked-strike set drifts. Cap is generous relative to the
-        # realistic active-contract set (strikes × expirations × call/put ×
-        # underlyings) so live contracts are never evicted in practice.
-        self._option_last_quote: "OrderedDict[str, Dict[str, Optional[float]]]" = OrderedDict()
-        self._option_last_quote_lock = threading.Lock()
-        self._option_last_quote_max = int(os.getenv("OPTION_LAST_QUOTE_CACHE_MAX", "10000"))
+        # Per-contract session-cumulative classified-flow accumulators.
+        # Replaces the prior baseline-cache + SEED_FLAG + last-quote-cache
+        # stack: each ``_FlowAccumulator`` holds the running cumulative
+        # volume / ask / mid / bid totals for one contract in one ET
+        # session, plus the most recent NBBO used as the next snapshot's
+        # prior tick.  Hydrated from the DB on first observation of a
+        # (contract, session) pair; the in-memory state is then the
+        # source of truth for the rest of the session.
+        self._option_flow: Dict[str, _FlowAccumulator] = {}
+        self._option_flow_lock = threading.Lock()
 
         # Track latest underlying price for Greeks calculation.  Pair it
         # with the timestamp of the underlying bar so we can refuse to
@@ -217,12 +224,13 @@ class IngestionEngine:
         # re-submitted on the next write attempt. Without this, a DB write
         # failure (or a circuit-breaker skip) at/after a bucket rollover
         # permanently loses that bucket's classified flow: _prepare_option_agg
-        # has already cleared/seeded the buffer and advanced the baseline, and
-        # the post-rollover seed path never re-consults the (invalidated)
-        # baseline. Re-submitting the same agg dicts is safe and exact: a
-        # rolled-back transaction applied nothing and the upsert sums flow
-        # fields additively, so each agg's volume is added once when it
-        # finally commits. Bounded so a prolonged outage can't grow unbounded.
+        # has already cleared the buffer and the accumulator has already
+        # advanced past those snapshots.  Re-submission is unconditionally
+        # safe: the upsert now uses ``GREATEST`` on every monotonic field
+        # (ask/mid/bid_volume, volume, open_interest), so a row that was
+        # actually committed by a previous attempt becomes a no-op via the
+        # WHERE-clause guard the second time it's sent.  Bounded so a
+        # prolonged outage can't grow unbounded.
         self._pending_failed_option_rows: List[Dict[str, Any]] = []
         self._pending_failed_option_rows_max = int(
             os.getenv("OPTION_FAILED_ROWS_RETAIN_MAX", "20000")
@@ -563,10 +571,23 @@ class IngestionEngine:
         """
         Process a batch of option quotes with batched DB writes.
 
-        Each quote is enriched with Greeks and buffered into per-symbol
-        1-minute buckets.  All pending aggregations are then flushed to
-        the database in a single transaction — one commit for the entire
-        batch rather than one commit per contract.
+        Each quote is enriched with Greeks, classified into the
+        per-contract running session-cumulative flow accumulator, and
+        buffered into per-symbol 1-minute buckets.  All pending
+        aggregations are then flushed to the database in a single
+        transaction — one commit for the entire batch rather than one
+        commit per contract.
+
+        Volume classification happens here at snapshot arrival (not
+        later in ``_prepare_option_agg``) so the accumulator's
+        ``last_volume_cum`` advances exactly once per snapshot.  That
+        makes the per-snapshot delta computation idempotent under
+        replay and removes the need for a separate ``_SEED_FLAG``
+        marker on carried-over snapshots: by the time a snapshot is
+        re-observed (because it was retained as the buffer's last
+        element for the next bucket), its cumulative volume is
+        already ≤ the accumulator's watermark and contributes a
+        zero delta.
         """
         if not batch:
             return
@@ -600,6 +621,15 @@ class IngestionEngine:
                 logger.error("Option data missing option_symbol")
                 continue
 
+            # Classify this snapshot into the running cumulative
+            # accumulator before buffering.  Doing it here (not in
+            # _prepare_option_agg) means the accumulator advances
+            # exactly once per snapshot regardless of how many times
+            # the same snapshot ends up in the buffer (rollover seed,
+            # throttled re-flush, etc.).
+            acc = self._get_flow_accumulator(option_symbol, bucket)
+            self._ingest_snapshot_into_accumulator(acc, data, bucket)
+
             # If this symbol crossed into a new time bucket, aggregate the previous one.
             existing = self.options_buffer.get(option_symbol)
             if existing:
@@ -607,20 +637,19 @@ class IngestionEngine:
                 if prev_timestamp is not None:
                     prev_bucket = bucket_timestamp(prev_timestamp, AGGREGATION_BUCKET_SECONDS)
                     if prev_bucket != bucket:
-                        prev_snapshot = existing[-1]
                         agg = self._prepare_option_agg(
                             option_symbol, prev_bucket, keep_last_snapshot=False
                         )
                         if agg:
                             rows_to_write.append(agg)
-                        # Seed the new bucket with the previous snapshot for
-                        # volume delta. Tag it: its cumulative volume was
-                        # already classified in prev_bucket's flushes, so if
-                        # it ends up the lone buffered snapshot it must not be
-                        # re-counted (multi-snapshot still uses it only as the
-                        # prior for the first real delta, which is correct).
-                        prev_snapshot[_SEED_FLAG] = True
-                        self.options_buffer[option_symbol] = [prev_snapshot]
+                        # Seed the new bucket with the previous snapshot so
+                        # the bucket carries a defined quote/Greek baseline
+                        # for the first throttled write.  No special tag
+                        # needed: the accumulator's watermark already
+                        # reflects this snapshot's volume, so re-ingesting
+                        # it (via the buffer scan in _prepare_option_agg)
+                        # contributes a zero delta automatically.
+                        self.options_buffer[option_symbol] = [existing[-1]]
 
             self.options_buffer[option_symbol].append(data)
 
@@ -801,11 +830,11 @@ class IngestionEngine:
         return local.hour == 9 and local.minute == 30
 
     @staticmethod
-    def _baseline_session_date(bucket: datetime):
-        """ET session date for ``bucket`` (a tz-naive bucket is treated as UTC).
+    def _bucket_session_date(bucket: datetime) -> _date:
+        """ET session date for ``bucket`` (tz-naive treated as UTC).
 
         TradeStation resets option cumulative volume to 0 at session open,
-        so the baseline cache is scoped per ET session date.
+        so per-contract flow accumulators are scoped per ET session date.
         """
         if bucket.tzinfo is None:
             bucket_et = pytz.UTC.localize(bucket).astimezone(ET)
@@ -813,128 +842,148 @@ class IngestionEngine:
             bucket_et = bucket.astimezone(ET)
         return bucket_et.date()
 
-    def _baseline_cache_key(self, option_symbol: str, bucket: datetime) -> tuple:
-        """Key for the per-contract volume-baseline cache.
+    def _hydrate_flow_accumulator(
+        self, option_symbol: str, session_date: _date
+    ) -> _FlowAccumulator:
+        """Build a fresh accumulator for ``(option_symbol, session_date)``.
 
-        MUST be used by both the read path (``_get_option_volume_baseline``)
-        and the optimistic advance written in ``_prepare_option_agg``. A
-        divergence here (the advance previously used a bare ``option_symbol``
-        string while the reader used this tuple) made the advance a silent
-        no-op, leaving the TTL as the only refresh path and producing a
-        ~30-minute volume sawtooth in option_chains.ask/mid/bid_volume.
+        Loads the latest persisted row for this contract in this ET
+        session (if any) so the in-memory cumulative resumes exactly
+        where the DB left off — same recovery semantics as the prior
+        baseline cache, but for all four cumulative columns at once
+        (volume + ask + mid + bid).  Also picks up the row's NBBO so
+        the next snapshot's Lee-Ready classification has a real prior
+        tick from the start.  Zeros on DB failure or empty result.
         """
-        return (option_symbol, self._baseline_session_date(bucket))
-
-    def _get_option_volume_baseline(self, option_symbol: str, bucket: datetime) -> int:
-        """Get latest persisted cumulative volume before current bucket for a contract.
-
-        Scoped to the bucket's ET session date: TradeStation's option
-        cumulative volume resets to 0 at session start, so a baseline from
-        a prior session would produce ``current - prior_close`` clamped at
-        0 by the consumer — silently zeroing the entire opening-minute
-        volume.  The cache key includes the session date so a stale
-        prior-session entry can't outlive the rollover.
-
-        Cached in-memory; entries older than
-        ``OPTION_VOLUME_BASELINE_TTL_SECONDS`` are refreshed from the DB
-        so the cache self-heals after any external write (retention
-        sweeps, backfills) or failed write that left the cache ahead of
-        the persisted row.
-        """
-        now = _time.monotonic()
-        # Derive the ET session date for the bucket so we can scope both
-        # the cache and the DB lookup to today's session.
-        session_date = self._baseline_session_date(bucket)
         session_start_et = ET.localize(datetime.combine(session_date, dt_time(0, 0)))
         session_start_utc = session_start_et.astimezone(timezone.utc)
-
-        cache_key = self._baseline_cache_key(option_symbol, bucket)
-        with self._option_volume_baseline_lock:
-            cached = self._option_volume_baseline.get(cache_key)
-        if cached is not None:
-            value, cached_at = cached
-            if (now - cached_at) < self._option_volume_baseline_ttl:
-                return value
-
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
-                    SELECT volume
+                    SELECT volume, ask_volume, mid_volume, bid_volume,
+                           bid, ask, mid
                     FROM option_chains
                     WHERE option_symbol = %s
-                      AND timestamp < %s
                       AND timestamp >= %s
                     ORDER BY timestamp DESC
                     LIMIT 1
                     """,
-                    (option_symbol, bucket, session_start_utc),
+                    (option_symbol, session_start_utc),
                 )
                 row = cursor.fetchone()
-                baseline = int(row[0]) if row and row[0] is not None else 0
-                with self._option_volume_baseline_lock:
-                    self._option_volume_baseline[cache_key] = (baseline, now)
-                return baseline
+                if row is not None:
+                    return _FlowAccumulator(
+                        session_date=session_date,
+                        last_volume_cum=int(row[0] or 0),
+                        ask_cum=int(row[1] or 0),
+                        mid_cum=int(row[2] or 0),
+                        bid_cum=int(row[3] or 0),
+                        last_bid=_to_db_float(row[4]),
+                        last_ask=_to_db_float(row[5]),
+                        last_mid=_to_db_float(row[6]),
+                    )
         except Exception as e:
-            logger.warning(f"Failed loading volume baseline for {option_symbol}: {e}")
-            # On DB failure, prefer the stale cached value (if any) over
-            # zero — zero would overcount volume on the next flush.
-            if cached is not None:
-                return cached[0]
-            return 0
+            logger.warning(
+                "Failed hydrating flow accumulator for %s: %s — starting from zero",
+                option_symbol,
+                e,
+            )
+        return _FlowAccumulator(
+            session_date=session_date,
+            last_volume_cum=0,
+            ask_cum=0,
+            mid_cum=0,
+            bid_cum=0,
+        )
 
-    def _invalidate_option_volume_baseline(self, option_symbol: str) -> None:
-        """Drop a contract's cached baseline so the next read hits the DB.
+    def _get_flow_accumulator(
+        self, option_symbol: str, bucket: datetime
+    ) -> _FlowAccumulator:
+        """Return the live accumulator for this contract in the bucket's ET session.
 
-        The cache key is ``(option_symbol, session_date)`` — invalidating
-        the contract removes all session-date variants.
+        Triggers a hydrate on first observation and on session rollover
+        (the existing accumulator's ``session_date`` no longer matches
+        the bucket's).  The rollover branch is what makes the
+        TradeStation 09:30 ET reset safe: a stale prior-session value
+        cannot survive into a new session.
         """
-        with self._option_volume_baseline_lock:
-            stale_keys = [
-                key
-                for key in self._option_volume_baseline
-                if isinstance(key, tuple) and key[0] == option_symbol
-            ]
-            for key in stale_keys:
-                self._option_volume_baseline.pop(key, None)
-        self._invalidate_option_last_quote(option_symbol)
+        session_date = self._bucket_session_date(bucket)
+        with self._option_flow_lock:
+            acc = self._option_flow.get(option_symbol)
+            if acc is None or acc.session_date != session_date:
+                acc = self._hydrate_flow_accumulator(option_symbol, session_date)
+                self._option_flow[option_symbol] = acc
+            return acc
 
-    def _invalidate_option_last_quote(self, option_symbol: str) -> None:
-        with self._option_last_quote_lock:
-            self._option_last_quote.pop(option_symbol, None)
-
-    def _get_cached_last_quote(self, option_symbol: str) -> Optional[Dict[str, Optional[float]]]:
-        with self._option_last_quote_lock:
-            cached = self._option_last_quote.get(option_symbol)
-            if cached is None:
-                return None
-            self._option_last_quote.move_to_end(option_symbol)
-            return dict(cached)
-
-    def _update_cached_last_quote(
+    def _ingest_snapshot_into_accumulator(
         self,
-        option_symbol: str,
-        bid: Optional[float],
-        ask: Optional[float],
-        mid: Optional[float],
+        acc: _FlowAccumulator,
+        snap: Dict[str, Any],
+        bucket: datetime,
     ) -> None:
-        if bid is None and ask is None and mid is None:
-            return
-        with self._option_last_quote_lock:
-            self._option_last_quote[option_symbol] = {"bid": bid, "ask": ask, "mid": mid}
-            self._option_last_quote.move_to_end(option_symbol)
-            while len(self._option_last_quote) > self._option_last_quote_max:
-                self._option_last_quote.popitem(last=False)
+        """Advance ``acc`` by the classified delta this snapshot represents.
+
+        Idempotent: ``acc.last_volume_cum`` is the watermark, so a
+        snapshot replayed at the same cumulative volume produces
+        ``vol_delta == 0`` and contributes nothing the second time.
+        Classification uses the accumulator's stored prior-tick NBBO
+        (``last_bid`` / ``last_ask`` / ``last_mid``), preserving the
+        Lee-Ready prior-tick rule across snapshots and across bucket
+        boundaries within the same session.
+        """
+        curr_vol = int(snap.get("volume") or 0)
+        vol_delta = max(curr_vol - acc.last_volume_cum, 0)
+        if vol_delta > 0:
+            skip = FLOW_CLASSIFY_SKIP_OPEN_AUCTION and self._is_opening_auction_bucket(
+                bucket
+            )
+            if skip:
+                acc.mid_cum += vol_delta
+            else:
+                # Prior tick: whatever the accumulator last saw.  On
+                # the first snapshot of a session (no hydrate row, no
+                # prior snapshot) those are None and the classifier
+                # falls back through to the snapshot's own NBBO — same
+                # degraded behavior the prior design had at cold start.
+                prior_bid = acc.last_bid if acc.last_bid is not None else snap.get("bid")
+                prior_ask = acc.last_ask if acc.last_ask is not None else snap.get("ask")
+                prior_mid = acc.last_mid if acc.last_mid is not None else snap.get("mid")
+                av, mv, bv = self._classify_volume_chunk(
+                    vol_delta,
+                    snap.get("last"),
+                    prior_bid,
+                    prior_ask,
+                    prior_mid,
+                )
+                acc.ask_cum += av
+                acc.mid_cum += mv
+                acc.bid_cum += bv
+        if curr_vol > acc.last_volume_cum:
+            acc.last_volume_cum = curr_vol
+        # Update the prior-tick NBBO for the next classification.
+        if snap.get("bid") is not None:
+            acc.last_bid = _to_db_float(snap.get("bid"))
+        if snap.get("ask") is not None:
+            acc.last_ask = _to_db_float(snap.get("ask"))
+        if snap.get("mid") is not None:
+            acc.last_mid = _to_db_float(snap.get("mid"))
+        elif acc.last_bid is not None and acc.last_ask is not None:
+            acc.last_mid = (acc.last_bid + acc.last_ask) / 2.0
 
     def _prepare_option_agg(
         self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False
     ) -> Optional[Dict[str, Any]]:
-        """Aggregate a per-symbol option buffer into a single row dict.
+        """Emit a write-ready row dict for ``(option_symbol, bucket)``.
 
-        Handles volume delta classification and buffer cleanup.
-        Returns the aggregated dict ready for DB write, or None if the
-        buffer is empty.
+        Volume classification already happened at snapshot arrival
+        (``_ingest_snapshot_into_accumulator``).  This method just
+        reads the accumulator's running session-cumulative totals
+        and pairs them with the best-available quote/Greek fields
+        from the buffered snapshots for this bucket.
+
+        Returns ``None`` if the buffer is empty.
         """
         buffer = self.options_buffer.get(option_symbol, [])
         if not buffer:
@@ -942,80 +991,7 @@ class IngestionEngine:
 
         try:
             last = buffer[-1]
-
-            delta = _to_db_float(last.get("delta"))
-            gamma = _to_db_float(last.get("gamma"))
-            theta = _to_db_float(last.get("theta"))
-            vega = _to_db_float(last.get("vega"))
-            implied_volatility = _to_db_float(last.get("implied_volatility"))
-
-            # Volume delta classification using Lee-Ready prior-tick rule:
-            # the bid/ask used to classify a print is the quote that was
-            # prevailing BEFORE the trade, not the post-trade snapshot.
-            ask_volume = 0
-            mid_volume = 0
-            bid_volume = 0
-            skip_classification = (
-                FLOW_CLASSIFY_SKIP_OPEN_AUCTION and self._is_opening_auction_bucket(bucket)
-            )
-            if len(buffer) == 1:
-                curr = buffer[0]
-                if curr.get(_SEED_FLAG):
-                    # The lone snapshot is a seed carried over from a prior
-                    # flush — its cumulative volume was already classified and
-                    # persisted for its own bucket. Re-deriving a delta from
-                    # the baseline here and letting the accumulating upsert
-                    # (ask_volume = option_chains.ask_volume +
-                    # EXCLUDED.ask_volume) add it again double-counts the
-                    # bucket, and with a TTL-stale baseline inflated it into a
-                    # ~30-minute sawtooth. Contribute zero volume; the quote /
-                    # Greek fields below still refresh.
-                    pass
-                else:
-                    # Genuine first observation for this contract in the
-                    # buffer: there is no prior snapshot to diff against, so
-                    # fall back to the last persisted cumulative volume. Fix
-                    # (a) (the correctly-keyed optimistic advance) keeps this
-                    # baseline fresh instead of up to one TTL stale.
-                    curr_vol = curr.get("volume") or 0
-                    baseline = self._get_option_volume_baseline(option_symbol, bucket)
-                    vol_delta = max(curr_vol - baseline, 0)
-                    if vol_delta > 0:
-                        if skip_classification:
-                            mid_volume += vol_delta
-                        else:
-                            prior = self._get_cached_last_quote(option_symbol)
-                            av, mv, bv = self._classify_volume_chunk(
-                                vol_delta,
-                                curr.get("last"),
-                                (prior or curr).get("bid"),
-                                (prior or curr).get("ask"),
-                                (prior or curr).get("mid"),
-                            )
-                            ask_volume += av
-                            mid_volume += mv
-                            bid_volume += bv
-            else:
-                for i in range(1, len(buffer)):
-                    prev_snap = buffer[i - 1]
-                    prev_vol = prev_snap.get("volume") or 0
-                    curr = buffer[i]
-                    curr_vol = curr.get("volume") or 0
-                    vol_delta = max(curr_vol - prev_vol, 0)
-                    if vol_delta > 0:
-                        if skip_classification:
-                            mid_volume += vol_delta
-                            continue
-                        av, mv, bv = self._classify_volume_chunk(
-                            vol_delta,
-                            curr.get("last"),
-                            prev_snap.get("bid"),
-                            prev_snap.get("ask"),
-                            prev_snap.get("mid"),
-                        )
-                        ask_volume += av
-                        mid_volume += mv
-                        bid_volume += bv
+            acc = self._get_flow_accumulator(option_symbol, bucket)
 
             # Use the best available bid/ask/last from any snapshot in
             # the buffer — fall back through the buffer so a single delta
@@ -1040,47 +1016,30 @@ class IngestionEngine:
                 "bid": best_bid,
                 "ask": best_ask,
                 "mid": best_mid,
-                "volume": max((b.get("volume") or 0) for b in buffer),
+                "volume": acc.last_volume_cum,
                 "open_interest": max((b.get("open_interest") or 0) for b in buffer),
-                "implied_volatility": implied_volatility,
-                "ask_volume": ask_volume,
-                "mid_volume": mid_volume,
-                "bid_volume": bid_volume,
-                "delta": delta,
-                "gamma": gamma,
-                "theta": theta,
-                "vega": vega,
+                "implied_volatility": _to_db_float(last.get("implied_volatility")),
+                # SESSION-CUMULATIVE classified flow (resets at 09:30 ET).
+                # Downstream LAG-delta consumers (flow_contract_facts) and
+                # the volume column share the same semantics now.
+                "ask_volume": acc.ask_cum,
+                "mid_volume": acc.mid_cum,
+                "bid_volume": acc.bid_cum,
+                "delta": _to_db_float(last.get("delta")),
+                "gamma": _to_db_float(last.get("gamma")),
+                "theta": _to_db_float(last.get("theta")),
+                "vega": _to_db_float(last.get("vega")),
             }
 
             self._log_parity_signature("option_chains", agg)
 
-            # Advance the volume-baseline cache to what we just aggregated so
-            # the *next* bucket's first snapshot deltas against this value
-            # rather than one that can be up to
-            # OPTION_VOLUME_BASELINE_TTL_SECONDS (default 1800s = 30 min)
-            # stale. This MUST use the same key the read path uses — keying
-            # it by a bare option_symbol string was a silent no-op that left
-            # the TTL as the only refresh and produced a ~30-minute sawtooth.
-            with self._option_volume_baseline_lock:
-                self._option_volume_baseline[self._baseline_cache_key(option_symbol, bucket)] = (
-                    int(agg["volume"] or 0),
-                    _time.monotonic(),
-                )
-
-            # Cache the latest quote so the next bucket's first classification
-            # has a real prior tick instead of having to reuse the post-trade
-            # snapshot.
-            self._update_cached_last_quote(option_symbol, best_bid, best_ask, best_mid)
-
-            # Trim buffer.
+            # Trim buffer.  When keeping the last snapshot, no special
+            # marker is needed: the accumulator already counted its
+            # volume on arrival, so the buffer scan in this method
+            # treating it as the only element again would produce
+            # zero new flow (vol_delta against an equal watermark).
             if keep_last_snapshot and buffer:
-                # The retained snapshot becomes the seed for the next flush.
-                # Tag it so that, if it is later the lone buffered snapshot,
-                # its already-classified volume is not re-derived and
-                # re-accumulated by the upsert.
-                seed = buffer[-1]
-                seed[_SEED_FLAG] = True
-                self.options_buffer[option_symbol] = [seed]
+                self.options_buffer[option_symbol] = [buffer[-1]]
             else:
                 self.options_buffer[option_symbol] = []
                 stale_keys = [
@@ -1099,6 +1058,14 @@ class IngestionEngine:
             return None
 
     # SQL template shared by single and batch writes.
+    #
+    # ALL monotonic numeric columns (volume, open_interest, ask_volume,
+    # mid_volume, bid_volume) use ``GREATEST`` so any UPSERT is
+    # idempotent: re-sending a row that already committed is a no-op
+    # because the WHERE clause's ``IS DISTINCT FROM`` guard rejects
+    # the update.  This is what makes the unified pre-commit /
+    # commit-phase retry path safe — there is no scenario where a
+    # double-applied retry inflates the stored value.
     _OPTION_UPSERT_SQL = """
         INSERT INTO option_chains
         (option_symbol, timestamp, underlying, strike, expiration, option_type,
@@ -1114,9 +1081,9 @@ class IngestionEngine:
             volume = GREATEST(option_chains.volume, EXCLUDED.volume),
             open_interest = GREATEST(option_chains.open_interest, EXCLUDED.open_interest),
             implied_volatility = COALESCE(EXCLUDED.implied_volatility, option_chains.implied_volatility),
-            ask_volume = option_chains.ask_volume + EXCLUDED.ask_volume,
-            mid_volume = option_chains.mid_volume + EXCLUDED.mid_volume,
-            bid_volume = option_chains.bid_volume + EXCLUDED.bid_volume,
+            ask_volume = GREATEST(option_chains.ask_volume, EXCLUDED.ask_volume),
+            mid_volume = GREATEST(option_chains.mid_volume, EXCLUDED.mid_volume),
+            bid_volume = GREATEST(option_chains.bid_volume, EXCLUDED.bid_volume),
             delta = EXCLUDED.delta,
             gamma = EXCLUDED.gamma,
             theta = EXCLUDED.theta,
@@ -1130,9 +1097,9 @@ class IngestionEngine:
             OR GREATEST(option_chains.volume, EXCLUDED.volume) IS DISTINCT FROM option_chains.volume
             OR GREATEST(option_chains.open_interest, EXCLUDED.open_interest) IS DISTINCT FROM option_chains.open_interest
             OR COALESCE(EXCLUDED.implied_volatility, option_chains.implied_volatility) IS DISTINCT FROM option_chains.implied_volatility
-            OR (option_chains.ask_volume + EXCLUDED.ask_volume) IS DISTINCT FROM option_chains.ask_volume
-            OR (option_chains.mid_volume + EXCLUDED.mid_volume) IS DISTINCT FROM option_chains.mid_volume
-            OR (option_chains.bid_volume + EXCLUDED.bid_volume) IS DISTINCT FROM option_chains.bid_volume
+            OR GREATEST(option_chains.ask_volume, EXCLUDED.ask_volume) IS DISTINCT FROM option_chains.ask_volume
+            OR GREATEST(option_chains.mid_volume, EXCLUDED.mid_volume) IS DISTINCT FROM option_chains.mid_volume
+            OR GREATEST(option_chains.bid_volume, EXCLUDED.bid_volume) IS DISTINCT FROM option_chains.bid_volume
             OR EXCLUDED.delta IS DISTINCT FROM option_chains.delta
             OR EXCLUDED.gamma IS DISTINCT FROM option_chains.gamma
             OR EXCLUDED.theta IS DISTINCT FROM option_chains.theta
@@ -1140,7 +1107,17 @@ class IngestionEngine:
     """
 
     def _coalesce_option_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Collapse duplicate (option_symbol, timestamp) rows before DB writes."""
+        """Collapse duplicate (option_symbol, timestamp) rows before DB writes.
+
+        All cumulative monotonic numeric fields (volume, open_interest,
+        ask/mid/bid_volume) merge with ``max``; quote and Greek fields
+        take the latest non-null value.  No additive merging — the
+        per-contract flow accumulator already holds the running
+        session-cumulative totals, so two rows for the same
+        ``(option_symbol, timestamp)`` produced in the same batch
+        contain the same cumulative snapshot (possibly differing only
+        in which had the freshest quote), not two disjoint deltas.
+        """
         coalesced: Dict[tuple, Dict[str, Any]] = {}
 
         for row in rows:
@@ -1150,7 +1127,7 @@ class IngestionEngine:
                 coalesced[key] = dict(row)
                 continue
 
-            # Preserve latest non-null quote fields.
+            # Preserve latest non-null quote / Greek fields.
             for field in (
                 "last",
                 "bid",
@@ -1165,31 +1142,31 @@ class IngestionEngine:
                 if row.get(field) is not None:
                     existing[field] = row[field]
 
-            # Preserve monotonic fields.
-            existing["volume"] = max(existing.get("volume") or 0, row.get("volume") or 0)
-            existing["open_interest"] = max(
-                existing.get("open_interest") or 0, row.get("open_interest") or 0
-            )
-
-            # Preserve additive flow fields.
-            existing["ask_volume"] = (existing.get("ask_volume") or 0) + (
-                row.get("ask_volume") or 0
-            )
-            existing["mid_volume"] = (existing.get("mid_volume") or 0) + (
-                row.get("mid_volume") or 0
-            )
-            existing["bid_volume"] = (existing.get("bid_volume") or 0) + (
-                row.get("bid_volume") or 0
-            )
+            # All cumulative monotonic fields use max-wins.
+            for field in (
+                "volume",
+                "open_interest",
+                "ask_volume",
+                "mid_volume",
+                "bid_volume",
+            ):
+                existing[field] = max(
+                    existing.get(field) or 0, row.get(field) or 0
+                )
 
         return list(coalesced.values())
 
     def _retain_failed_option_rows(self, rows: List[Dict[str, Any]]) -> None:
         """Hold computed aggregates that did not persist, for re-submission.
 
-        Re-submitting is exact: the failed/skipped transaction committed
-        nothing and the upsert sums flow fields additively, so each agg's
-        classified volume is applied once when it eventually succeeds.
+        Re-submission is unconditionally safe under the current upsert
+        contract: every monotonic numeric column uses ``GREATEST`` and
+        the WHERE clause gates the UPDATE on ``IS DISTINCT FROM``, so a
+        retry of a row that actually committed on the prior attempt is
+        a no-op.  This collapses the prior pre-commit / commit-phase
+        fork: there is no longer a scenario where a double-applied
+        retry would inflate ``ask_volume`` / ``mid_volume`` / ``bid_volume``.
+
         Bounded — under a prolonged outage we drop the OLDEST rows and log
         an error rather than grow without limit or (as before) lose every
         row silently. ``getattr``/``setattr`` so ``__new__``-built test
@@ -1214,62 +1191,23 @@ class IngestionEngine:
             )
         self._pending_failed_option_rows = pending
 
-    def _handle_ambiguous_option_commit(
-        self,
-        rows: List[Dict[str, Any]],
-        err: Exception,
-        *,
-        phase: str = "commit",
-    ) -> None:
-        """Handle a commit-phase failure whose persistence is unknowable.
-
-        Unlike a pre-commit failure (transaction rolled back → exact-once
-        retain is correct), a failure at/after COMMIT may have been applied
-        server-side. Because the option upsert is additive, re-submitting
-        would double-count classified flow. So we deliberately do NOT
-        retain these rows; instead we invalidate the per-contract volume
-        baselines so the next snapshot delta recomputes against whatever
-        actually persisted, and trip the circuit breaker so we back off
-        the (evidently unhealthy) DB.
-        """
-        self._db_consecutive_failures += 1
-        self.errors_count += 1
-        backoff = _compute_db_backoff_seconds(self._db_consecutive_failures)
-        self._db_backoff_until = _time.monotonic() + backoff
-
-        for row in rows:
-            self._invalidate_option_volume_baseline(row["option_symbol"])
-
-        unique_symbols = {r["option_symbol"] for r in rows}
-        timestamps = [r.get("timestamp") for r in rows if r.get("timestamp") is not None]
-        logger.warning(
-            "[CIRCUIT-BREAKER] Ambiguous option write (%s phase): %d rows / "
-            "%d symbols may or may not have persisted. NOT retained (the "
-            "additive upsert would double-count); baselines invalidated so "
-            "the next delta re-syncs. attempt #%d, backoff %.2fs: %s\n"
-            "  timestamp range: %s .. %s",
-            phase,
-            len(rows),
-            len(unique_symbols),
-            self._db_consecutive_failures,
-            backoff,
-            err,
-            min(timestamps) if timestamps else None,
-            max(timestamps) if timestamps else None,
-            exc_info=True,
-        )
-
     def _write_option_rows(self, rows: List[Dict[str, Any]]):
         """Write multiple aggregated option rows in a single DB transaction.
 
         Includes a circuit breaker: after consecutive failures the engine
         backs off exponentially (2s, 4s, 8s … capped at 60s) so we don't
         hammer a dead database.  On recovery the breaker resets immediately.
+
+        Failure handling is unified across pre-commit and commit-phase
+        errors: the upsert is idempotent (``GREATEST`` on every monotonic
+        column, ``IS DISTINCT FROM`` WHERE guard), so retaining and
+        re-submitting any failed batch is safe regardless of whether
+        the prior attempt actually applied server-side.
         """
         # Re-submit aggregates a prior attempt failed to persist (or
-        # skipped during backoff). Prepend so they coalesce additively
-        # with any new same-(option_symbol, timestamp) rows; the prior
-        # transaction applied nothing, so this adds each agg exactly once.
+        # skipped during backoff). Prepend so they coalesce with any
+        # new same-(option_symbol, timestamp) rows under the max-wins
+        # rule in _coalesce_option_rows.
         pending = getattr(self, "_pending_failed_option_rows", None)
         if pending:
             rows = pending + list(rows)
@@ -1293,7 +1231,6 @@ class IngestionEngine:
             return
 
         t0 = _time.monotonic()
-        committed = False
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
@@ -1328,26 +1265,7 @@ class IngestionEngine:
                     values,
                     page_size=500,
                 )
-                try:
-                    conn.commit()
-                    committed = True
-                except Exception as commit_err:
-                    # AMBIGUOUS: the COMMIT may already have been applied
-                    # server-side before the failure surfaced (client-side
-                    # statement timeout / connection reset after the server
-                    # committed). The option upsert is additive
-                    # (ask_volume = option_chains.ask_volume +
-                    # EXCLUDED.ask_volume), so re-submitting these rows on
-                    # the next attempt would DOUBLE-COUNT classified flow —
-                    # an overstated buy/sell-pressure data-integrity bug
-                    # (M3). A pre-commit failure rolls back and is safe to
-                    # retain; a commit-phase failure is NOT. Do not retain
-                    # for additive re-application — invalidate the volume
-                    # baselines so the next snapshot delta re-syncs to
-                    # whatever actually persisted (a one-bucket under-count
-                    # is acceptable; silent inflation is not).
-                    self._handle_ambiguous_option_commit(rows, commit_err)
-                    return
+                conn.commit()
 
             elapsed_ms = (_time.monotonic() - t0) * 1000
             self.option_quotes_stored += len(rows)
@@ -1403,31 +1321,16 @@ class IngestionEngine:
                 self._obs_last_log = now
 
         except Exception as e:
-            if committed:
-                # The explicit COMMIT already succeeded; this exception
-                # came from the context manager's redundant post-commit
-                # COMMIT or connection cleanup. The rows ARE persisted, so
-                # an additive re-write would double-count (M3). Treat as
-                # already-applied, not as a retryable pre-commit failure.
-                self._handle_ambiguous_option_commit(rows, e, phase="post-commit cleanup")
-                return
             self._db_consecutive_failures += 1
             self.errors_count += 1
             backoff = _compute_db_backoff_seconds(self._db_consecutive_failures)
             self._db_backoff_until = _time.monotonic() + backoff
 
-            # The baseline cache was optimistically advanced in
-            # _prepare_option_agg; invalidate entries for failed rows so the
-            # next flush re-queries the DB and computes volume deltas against
-            # what was actually persisted.
-            for row in rows:
-                self._invalidate_option_volume_baseline(row["option_symbol"])
-
-            # Retain the computed aggregates so the next attempt re-writes
-            # them. _prepare_option_agg has already cleared/seeded the
-            # buffer and the post-rollover seed path won't reconsult the
-            # invalidated baseline, so without this the classified flow in
-            # these rows is lost for good.
+            # Single safe retry path: re-submission is idempotent under
+            # the GREATEST / IS DISTINCT FROM upsert contract, so
+            # whether this failure was pre-commit (rolled back) or
+            # commit-phase (may have applied), retaining the rows for
+            # the next attempt is correct.
             self._retain_failed_option_rows(rows)
 
             # Include affected-symbol counts, unique underlyings, and the full

@@ -162,7 +162,7 @@ flowchart TB
     %% ============ CONFIG ============
     subgraph CFG["Configuration (src/config.py)"]
         direction TB
-        CFG_BODY["ANALYTICS_INTERVAL=60s<br/>ANALYTICS_OFF_HOURS_INTERVAL_SECONDS=300s<br/>ANALYTICS_OFF_HOURS_ENABLED=true<br/>ANALYTICS_SNAPSHOT_LOOKBACK_HOURS=2<br/>ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS=96<br/>ANALYTICS_SNAPSHOT_COLD_START_STATEMENT_TIMEOUT_MS=180000<br/>ANALYTICS_SNAPSHOT_MAX_ROWS=50000<br/>ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT=0.35<br/>ANALYTICS_FLOW_CACHE_REFRESH_ENABLED=true<br/>FLOW_CACHE_REFRESH_MIN_SECONDS=15<br/><br/>RISK_FREE_RATE=0.05<br/><br/>GAMMA_PROFILE_SPAN_PCT=0.20<br/>GAMMA_PROFILE_STEP_PCT=0.0025<br/>GAMMA_PROFILE_EXPANSION_RUNGS=[0.35, 0.50]<br/>GAMMA_PROFILE_INTERIOR_MARGIN=0.10<br/>GAMMA_PROFILE_STRUCTURAL_MIN_FRAC=0.02<br/>GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT=0.01<br/>GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE=90.0<br/>GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT=0.15<br/>GAMMA_PROFILE_STRUCTURAL_ACTIVE_DISTANCE_PCT=0.01<br/>GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT=0.08<br/>GAMMA_PROFILE_DTE_WEIGHTING=true<br/>GAMMA_PROFILE_DTE_REF_DAYS=5.0<br/><br/>SMART_MONEY_VOL_T1..T4=50/100/200/500<br/>SMART_MONEY_PREM_T1..T4=1x/2x/5x/10x notional<br/>SMART_MONEY_IV_INCL_DEFAULT=0.4<br/>SMART_MONEY_DEEP_OTM_DELTA_DEFAULT=0.15"]:::cfg
+        CFG_BODY["ANALYTICS_INTERVAL=60s<br/>ANALYTICS_OFF_HOURS_INTERVAL_SECONDS=300s<br/>ANALYTICS_OFF_HOURS_ENABLED=true<br/>ANALYTICS_SNAPSHOT_LOOKBACK_HOURS=2<br/>ANALYTICS_SNAPSHOT_COLD_START_LOOKBACK_HOURS=96<br/>ANALYTICS_SNAPSHOT_COLD_START_STATEMENT_TIMEOUT_MS=180000<br/>ANALYTICS_SNAPSHOT_MAX_ROWS=50000<br/>ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT=0.35<br/>ANALYTICS_FLOW_CACHE_REFRESH_ENABLED=true<br/>FLOW_CACHE_REFRESH_MIN_SECONDS=15<br/><br/>RISK_FREE_RATE=0.05<br/><br/>──────────────────<br/>GAMMA_FLIP_PROFILE=default | strict | lenient<br/>(recommended entry point — bundles all 11 knobs below)<br/>──────────────────<br/>GAMMA_PROFILE_SPAN_PCT=0.20<br/>GAMMA_PROFILE_STEP_PCT=0.0025<br/>GAMMA_PROFILE_EXPANSION_RUNGS=[0.35, 0.50]<br/>GAMMA_PROFILE_INTERIOR_MARGIN=0.10<br/>GAMMA_PROFILE_STRUCTURAL_MIN_FRAC=0.02<br/>GAMMA_PROFILE_STRUCTURAL_WINDOW_PCT=0.01<br/>GAMMA_PROFILE_STRUCTURAL_REFERENCE_PERCENTILE=90.0<br/>GAMMA_PROFILE_STRUCTURAL_REFERENCE_SPAN_PCT=0.15<br/>GAMMA_PROFILE_STRUCTURAL_ACTIVE_DISTANCE_PCT=0.01<br/>GAMMA_PROFILE_MAX_FLIP_DISTANCE_PCT=0.08<br/>GAMMA_PROFILE_DTE_WEIGHTING=true<br/>GAMMA_PROFILE_DTE_REF_DAYS=5.0<br/><br/>SMART_MONEY_VOL_T1..T4=50/100/200/500<br/>SMART_MONEY_PREM_T1..T4=1x/2x/5x/10x notional<br/>SMART_MONEY_IV_INCL_DEFAULT=0.4<br/>SMART_MONEY_DEEP_OTM_DELTA_DEFAULT=0.15"]:::cfg
     end
 
     %% ============ WIRING ============
@@ -290,11 +290,16 @@ sequenceDiagram
 The flip is **not** just "where call OI = put OI". It is the zero crossing
 of the **spot-shift dealer gamma exposure profile**, found by:
 
-1. Building a canonical **structural reference** (one-time per cycle) from a
-   fixed ±15% band, considering only grid points within ±1% of an
-   active strike. The p90 of this band is the structural floor.
-2. Walking a **span ladder** (start ±20%, expand to ±35%, ±50%) until a
+1. Walking a **span ladder** (start ±20%, expand to ±35%, ±50%) until a
    crossing passes all three gates (interior, structural, actionable).
+2. The structural reference is computed **once per cycle** from a fixed
+   canonical band (±15% of spot), considering only grid points within
+   ±1% of an active strike. The p90 of this band is the structural floor.
+3. When the first ladder rung is at least as wide as the reference span
+   (the default: rung 0 = ±20%, reference = ±15%), the reference is
+   **sliced from the first rung's profile** rather than building a
+   separate ±15% profile. This saves ~half of the per-cycle resolver
+   compute without changing the reference's value.
 
 ```mermaid
 flowchart TB
@@ -304,11 +309,16 @@ flowchart TB
     classDef ok fill:#1a2733,stroke:#5b8def,color:#e6edf3
 
     START["enter _resolve_gamma_flip(options, spot, ts)"]:::step
-    REF["_structural_reference()<br/>build profile over ±15% band<br/>keep grid pts within ±1% of an active strike (OI&gt;0)<br/>structural_floor = p90 of |values|"]:::step
+    INIT["structural_reference = None<br/>(computed lazily on first valid rung)"]:::step
 
     RUNG["select span from ladder:<br/>[GAMMA_PROFILE_SPAN_PCT=0.20]<br/>then GAMMA_PROFILE_EXPANSION_RUNGS=[0.35, 0.50]"]:::step
 
     PROF["_gamma_exposure_profile(options, spot, ts, span_pct)<br/>grid = arange(S±span, step=S×STEP_PCT=0.0025)<br/>for each contract:<br/>  γ(S_i) via vectorized Black-Scholes (σ sticky-strike)<br/>  dollar_γ = γ(S_i) × OI × 100 × S_i² × 0.01<br/>  sign = +1 (call) or −1 (put)<br/>  w_DTE = min(1, DTE_days / DTE_REF_DAYS=5)<br/>  total[i] += sign × w_DTE × dollar_γ<br/>return [(S_i, total_i), ...]"]:::step
+
+    REFCHK{"structural_reference still None?"}:::gate
+    REF_SLICE["_structural_reference_from_profile()<br/>slice current rung's profile to ±15% band<br/>(rung is a superset, so no rebuild needed)<br/>filter to grid pts within ±1% of an active strike<br/>structural_floor = p90 of filtered |values|"]:::step
+    REF_BUILD["_structural_reference() — fallback<br/>(rare: only when first rung &lt; 15%)<br/>builds a separate ±15% profile"]:::step
+    RUNG_GE_REF{"span_pct &gt;= STRUCTURAL_REFERENCE_SPAN_PCT (0.15)?"}:::gate
 
     CROSS["walk adjacent pairs; collect sign changes<br/>linear interpolation to zero:<br/>candidate = S_i + (S_{i+1}−S_i) × (−c_i)/(c_{i+1}−c_i)"]:::step
 
@@ -323,7 +333,12 @@ flowchart TB
 
     DONE["persist:<br/>gamma_flip_point = pick (or NULL)<br/>gamma_flip_span_used = span (or NULL)<br/>gamma_flip_unresolved = bool"]:::ok
 
-    START --> REF --> RUNG --> PROF --> CROSS --> G1
+    START --> INIT --> RUNG --> PROF --> REFCHK
+    REFCHK -- "no (already set)" --> CROSS
+    REFCHK -- "yes (first valid rung)" --> RUNG_GE_REF
+    RUNG_GE_REF -- "yes" --> REF_SLICE --> CROSS
+    RUNG_GE_REF -- "no" --> REF_BUILD --> CROSS
+    CROSS --> G1
     G1 -- "fail" --> NEXT
     G1 -- "pass" --> G2
     G2 -- "fail" --> NEXT
