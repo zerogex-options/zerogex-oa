@@ -507,6 +507,18 @@ SESSION_TEMPLATE = os.getenv("SESSION_TEMPLATE", "Default")
 TS_STREAM_READ_TIMEOUT = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
 TS_STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").lower() == "true"
 
+# Streaming quotes endpoint encodes the symbol list in the URL path. With
+# ~1000+ option contracts tracked, a single-connection URL exceeds ~25KB
+# and triggers a 414 Request-URI Too Large from TradeStation's gateway.
+# Split tracked symbols across multiple stream connections so each URL
+# stays well under typical HTTP server limits (~8KB). 200 symbols/chunk
+# yields URLs of ~5KB and bounds the connection count well within the
+# 10-concurrent-stream cap (e.g. ~1100 symbols -> 6 chunks + 1 underlying
+# bar stream = 7 concurrent streams).
+STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION = int(
+    os.getenv("STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION", "200")
+)
+
 # Underlying-stream data-staleness watchdog. The TradeStation bar stream
 # can stay socket-alive (heartbeats flowing) while delivering zero bars —
 # a "connected but data-starved" gap that the socket read timeout and the
@@ -1417,6 +1429,7 @@ def get_all_config() -> Dict[str, Any]:
             "extended_hours_max_wait": EXTENDED_HOURS_POLL_INTERVAL,
             "closed_hours_max_wait": CLOSED_HOURS_POLL_INTERVAL,
             "stream_read_timeout": TS_STREAM_READ_TIMEOUT,
+            "quotes_max_symbols_per_connection": STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION,
             "option_oi_coverage_alert_threshold": OPTION_OI_COVERAGE_ALERT_THRESHOLD,
             "option_volume_coverage_alert_threshold": OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD,
             "option_volume_warmup_minutes": OPTION_VOLUME_WARMUP_MINUTES,
