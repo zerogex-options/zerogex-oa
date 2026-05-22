@@ -45,6 +45,7 @@ from src.config import (
     STRIKE_CLEANUP_INTERVAL,
     SESSION_TEMPLATE,
     API_REQUEST_TIMEOUT,
+    STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION,
     UNDERLYING_STREAM_STALE_WARN_SECONDS,
     UNDERLYING_STREAM_STALE_RESTART_SECONDS,
     UNDERLYING_STREAM_STALE_WARN_SECONDS_EXTENDED,
@@ -198,14 +199,27 @@ class OptionStreamAccumulator:
         client: TradeStationClient,
         symbols: List[str],
         wakeup: Optional[threading.Event] = None,
+        max_symbols_per_connection: Optional[int] = None,
     ):
         self._client = client
         self._symbols = list(symbols)
         self._state: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._running = False
-        self._thread: Optional[threading.Thread] = None
-        self._current_response = None
+        # The streaming quotes endpoint embeds the symbol list in the URL
+        # path; a single ~1000+ symbol URL exceeds ~25KB and returns 414.
+        # Split into chunks so each request stays well under typical HTTP
+        # server URL limits (~8KB) and run one daemon reader per chunk.
+        chunk_size = max_symbols_per_connection or STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION
+        if chunk_size <= 0:
+            chunk_size = len(self._symbols) or 1
+        self._chunk_size = chunk_size
+        self._chunks: List[List[str]] = [
+            self._symbols[i : i + chunk_size]
+            for i in range(0, len(self._symbols), chunk_size)
+        ] or [[]]
+        self._threads: List[threading.Thread] = []
+        self._current_responses: List[Optional[Any]] = []
         self._response_lock = threading.Lock()
         self._updates_received: int = 0
         self._connected = threading.Event()
@@ -221,37 +235,53 @@ class OptionStreamAccumulator:
         if seed_from_rest:
             self._seed_from_rest()
         self._running = True
-        self._thread = threading.Thread(
-            target=self._reader_loop,
-            daemon=True,
-            name="option-stream",
-        )
-        self._thread.start()
-        # Give the stream a moment to connect before returning.
+        # One reader thread per chunk, each with its own current-response slot.
+        self._current_responses = [None] * len(self._chunks)
+        self._threads = []
+        if len(self._chunks) > 1:
+            logger.info(
+                "Starting %d option stream connections (%d symbols, %d per connection)",
+                len(self._chunks),
+                len(self._symbols),
+                self._chunk_size,
+            )
+        for idx, chunk in enumerate(self._chunks):
+            t = threading.Thread(
+                target=self._reader_loop,
+                args=(idx, chunk),
+                daemon=True,
+                name=f"option-stream-{idx}" if len(self._chunks) > 1 else "option-stream",
+            )
+            t.start()
+            self._threads.append(t)
+        # Give at least one stream a moment to connect before returning.
         self._connected.wait(timeout=10)
 
     def stop(self):
-        """Stop the background reader and close the stream connection."""
+        """Stop the background readers and close all stream connections."""
         self._running = False
-        # Interrupt any blocking iter_lines() call.
+        # Interrupt any blocking iter_lines() calls.
         with self._response_lock:
-            if self._current_response is not None:
-                try:
-                    self._current_response.close()
-                except Exception:
-                    pass
-        if self._thread is not None:
-            self._thread.join(timeout=10)
-            if self._thread.is_alive():
+            for idx, resp in enumerate(self._current_responses):
+                if resp is not None:
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                self._current_responses[idx] = None
+        for t in self._threads:
+            t.join(timeout=10)
+            if t.is_alive():
                 logger.warning(
-                    "Option stream reader thread did not exit within 10s after stop(); "
-                    "abandoning reference (thread will continue consuming memory until it unblocks)"
+                    "Option stream reader thread %s did not exit within 10s after stop(); "
+                    "abandoning reference (thread will continue consuming memory until it unblocks)",
+                    t.name,
                 )
-            self._thread = None
+        self._threads = []
 
     @property
     def is_alive(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        return any(t.is_alive() for t in self._threads)
 
     @property
     def updates_received(self) -> int:
@@ -297,19 +327,24 @@ class OptionStreamAccumulator:
                 time.sleep(DELAY_BETWEEN_BATCHES)
         logger.info(f"REST seed complete: {seeded} quotes loaded")
 
-    def _reader_loop(self):
-        """Continuously read stream events; auto-reconnect on failure."""
+    def _reader_loop(self, chunk_idx: int, chunk_symbols: List[str]):
+        """Continuously read stream events for one chunk; auto-reconnect on failure."""
+        label = (
+            f"Option stream chunk {chunk_idx + 1}/{len(self._chunks)}"
+            if len(self._chunks) > 1
+            else "Option stream"
+        )
         while self._running:
             try:
-                self._read_stream()
+                self._read_stream(chunk_idx, chunk_symbols, label)
             except Exception as e:
                 if self._running:
-                    logger.warning(f"Option stream disconnected ({e}), reconnecting in 2s...")
+                    logger.warning(f"{label} disconnected ({e}), reconnecting in 2s...")
                     time.sleep(2)
 
-    def _read_stream(self):
-        """Open one stream connection and read events until it ends."""
-        symbols_str = ",".join(self._symbols)
+    def _read_stream(self, chunk_idx: int, chunk_symbols: List[str], label: str):
+        """Open one stream connection for *chunk_symbols* and read events until it ends."""
+        symbols_str = ",".join(chunk_symbols)
         url = f"{self._client.base_url}/marketdata/stream/quotes/{symbols_str}"
         headers = self._client.auth.get_headers()
 
@@ -326,17 +361,30 @@ class OptionStreamAccumulator:
                 self._client.auth.force_refresh_access_token()
                 return  # will retry on next loop iteration
 
+            if response.status_code == 414:
+                # URL too large despite chunking — operator pushed the per-chunk
+                # cap above what TradeStation's gateway accepts. Log loudly so
+                # the cause is obvious instead of being buried as a generic
+                # disconnect, then raise to trigger the standard reconnect path.
+                logger.error(
+                    "%s received 414 Request-URI Too Large for %d symbols. "
+                    "Reduce STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION (currently %d).",
+                    label,
+                    len(chunk_symbols),
+                    self._chunk_size,
+                )
+
             response.raise_for_status()
         except Exception:
             response.close()
             raise
 
         with self._response_lock:
-            self._current_response = response
+            self._current_responses[chunk_idx] = response
 
         self._connected.set()
 
-        decode_tracker = _DecodeErrorTracker("Option stream")
+        decode_tracker = _DecodeErrorTracker(label)
 
         try:
             for raw_line in response.iter_lines(decode_unicode=True):
@@ -364,8 +412,8 @@ class OptionStreamAccumulator:
 
                 if isinstance(payload, dict) and _is_auth_error_payload(payload):
                     logger.warning(
-                        "Option stream reported auth error payload; refreshing token "
-                        "and reconnecting"
+                        "%s reported auth error payload; refreshing token and reconnecting",
+                        label,
                     )
                     self._client.auth.force_refresh_access_token()
                     break
@@ -379,7 +427,7 @@ class OptionStreamAccumulator:
                     self._merge_single_quote(payload)
         finally:
             with self._response_lock:
-                self._current_response = None
+                self._current_responses[chunk_idx] = None
             response.close()
 
     def _merge_single_quote(self, q: dict):
