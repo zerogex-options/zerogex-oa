@@ -235,6 +235,9 @@ def test_context_values_keys():
     cv = comp.context_values(ctx)
     expected = {
         "net_gex",
+        "total_oi",
+        "spot",
+        "readiness_path",
         "gex_regime",
         "expansion",
         "direction",
