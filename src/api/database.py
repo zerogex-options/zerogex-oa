@@ -2708,11 +2708,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # extended-hours and overnight buckets makes the heatmap plot
         # nonsensical 17:00–19:00 ET cells for an index and misaligns the
         # surface with the RTH-only candlesticks.  For cash indices,
-        # restrict the per-bucket representatives to the regular session
+        # restrict BOTH the window anchor (latest_summary) AND the
+        # per-bucket representatives (bucket_reps) to the regular session
         # (weekdays, 09:30–16:00 ET, excluding NYSE holidays) — the same
-        # session definition get_session_closes uses.  ETFs / equities
-        # (SPY, QQQ, …) genuinely trade extended hours, so they keep the
-        # original query and params unchanged.
+        # session definition get_session_closes uses.  Applying it to the
+        # anchor too means the chart's right edge lands on the most recent
+        # RTH analytics row, not on whatever overnight cycle ran last; the
+        # visible window then spans a full ``window_units`` of RTH data
+        # instead of a fragment ending at the most recent RTH bar.  ETFs /
+        # equities (SPY, QQQ, …) genuinely trade extended hours, so they
+        # keep the original query and params unchanged.
         session_filter = ""
         params: list = [symbol, window_units]
         if is_cash_index(symbol):
@@ -2732,8 +2737,26 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # plain decimal literal — no user input — so it is safe to
         # interpolate alongside the other validated fragments below.
         band_pct = self._gex_heatmap_strike_band_pct
-        strike_band = f"(SELECT spot_close FROM latest_quote) * {band_pct:g}"
+        strike_band = f"(SELECT spot_close FROM spot) * {band_pct:g}"
         # `bucket` and `step_interval` are validated allowlist literals.
+        #
+        # Anchor choice: the window's right edge (``max_ts``) is the most
+        # recent ``gex_summary`` row for this underlying, NOT the most
+        # recent ``underlying_quotes`` row.  The heatmap is fundamentally
+        # a GEX chart driven by gex_summary / gex_by_strike; coupling its
+        # freshness to underlying_quotes meant that any condition stalling
+        # the TradeStation Stream Bars feed (per-account stream-cap
+        # eviction, single-symbol bar-feed outages, schema/write glitches
+        # at the 09:30 vendor reset, …) froze the heatmap even while
+        # analytics kept producing rows.  Anchoring on gex_summary
+        # mirrors get_historical_gex (which drives the gamma-flip line) and
+        # get_max_pain_timeseries, so the heatmap surface and the
+        # gamma-flip overlay can no longer drift apart on the time axis.
+        # ``underlying_quotes`` is still consulted, but only for
+        # ``spot_close`` (used to size the strike band around spot); a
+        # stale spot is harmless because the analytics engine writes
+        # gex_summary against that same stale spot, so the band stays
+        # centered on the level the heatmap was computed at.
         #
         # Perf: a true per-bucket AVG over raw gex_by_strike requires
         # reading every snapshot in the window.  gex_by_strike is the
@@ -2754,11 +2777,18 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # average across every snapshot in the bucket -- consistent with
         # the historical/summary endpoints.  Only the TIME aggregation
         # changed: the cross-expiration combination per (bucket, strike)
-        # is still AVG, and the spot±50 band filter is unchanged, so cell
-        # magnitudes stay comparable to before.
+        # is still AVG, and the spot±band_pct strike filter is unchanged,
+        # so cell magnitudes stay comparable to before.
         query = f"""
-            WITH latest_quote AS (
-                SELECT timestamp AS max_ts, close AS spot_close
+            WITH latest_summary AS (
+                SELECT timestamp AS max_ts
+                FROM gex_summary
+                WHERE underlying = $1{session_filter}
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            spot AS (
+                SELECT close::numeric AS spot_close
                 FROM underlying_quotes
                 WHERE symbol = $1
                 ORDER BY timestamp DESC
@@ -2768,7 +2798,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 SELECT
                     max_ts - ({step_interval} * ($2 - 1)) as start_time,
                     max_ts as end_time
-                FROM latest_quote
+                FROM latest_summary
             ),
             bucket_reps AS (
                 SELECT DISTINCT ON ({bucket})
@@ -2814,7 +2844,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             JOIN gex_by_strike g
                 ON g.underlying = $1
                AND g.timestamp = br.rep_ts
-            WHERE ABS(g.strike - (SELECT spot_close FROM latest_quote)) <= {strike_band}
+            WHERE ABS(g.strike - (SELECT spot_close FROM spot)) <= {strike_band}
             GROUP BY br.bucket_ts, g.strike
             ORDER BY br.bucket_ts DESC, g.strike ASC
         """
