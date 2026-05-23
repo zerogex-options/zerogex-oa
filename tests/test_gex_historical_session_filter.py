@@ -106,17 +106,23 @@ def test_historical_cash_index_restricts_to_regular_session():
 
     # The ``bucketed`` CTE aliases gex_summary as ``gs`` — its session
     # predicate must reference ``gs.timestamp``, not the bare column.
-    bucketed_block = sql[bucketed_idx : sql.index(") ,", bucketed_idx) if ") ," in sql[bucketed_idx:] else sql.index("base AS", bucketed_idx)]
-    assert "gs.timestamp AT TIME ZONE" in bucketed_block, (
-        "session filter inside bucketed CTE must be qualified with the gs alias"
-    )
+    bucketed_block = sql[
+        bucketed_idx : (
+            sql.index(") ,", bucketed_idx)
+            if ") ," in sql[bucketed_idx:]
+            else sql.index("base AS", bucketed_idx)
+        )
+    ]
+    assert (
+        "gs.timestamp AT TIME ZONE" in bucketed_block
+    ), "session filter inside bucketed CTE must be qualified with the gs alias"
 
     # Param shape: symbol, start_date, end_date, window_units, holidays[].
     assert len(captured["args"]) == 5
     assert captured["args"][0] == "SPX"
     assert captured["args"][1] is None  # start_date
     assert captured["args"][2] is None  # end_date
-    assert captured["args"][3] == 60    # window_units
+    assert captured["args"][3] == 60  # window_units
     assert isinstance(captured["args"][4], list)
 
 

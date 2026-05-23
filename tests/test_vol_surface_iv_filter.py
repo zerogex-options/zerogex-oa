@@ -44,10 +44,34 @@ def test_25d_skew_ignores_outlier_ivs():
     # it. The filter must reject the outlier so the realistic strike
     # wins on each side.
     rows = [
-        {"option_type": "C", "delta": 0.26, "implied_volatility": 3.5, "open_interest": 1, "strike": 750},
-        {"option_type": "C", "delta": 0.20, "implied_volatility": 0.15, "open_interest": 1, "strike": 745},
-        {"option_type": "P", "delta": -0.26, "implied_volatility": 4.2, "open_interest": 1, "strike": 730},
-        {"option_type": "P", "delta": -0.20, "implied_volatility": 0.20, "open_interest": 1, "strike": 735},
+        {
+            "option_type": "C",
+            "delta": 0.26,
+            "implied_volatility": 3.5,
+            "open_interest": 1,
+            "strike": 750,
+        },
+        {
+            "option_type": "C",
+            "delta": 0.20,
+            "implied_volatility": 0.15,
+            "open_interest": 1,
+            "strike": 745,
+        },
+        {
+            "option_type": "P",
+            "delta": -0.26,
+            "implied_volatility": 4.2,
+            "open_interest": 1,
+            "strike": 730,
+        },
+        {
+            "option_type": "P",
+            "delta": -0.20,
+            "implied_volatility": 0.20,
+            "open_interest": 1,
+            "strike": 735,
+        },
     ]
     skew = _compute_25d_skew(rows)
     # Post-filter the only usable pair is put 0.20 - call 0.15 = 0.05.

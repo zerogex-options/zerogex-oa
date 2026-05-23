@@ -71,8 +71,8 @@ CURRENT_DATE = date(2025, 4, 16)
 # parity test compares the canonical CTE — which auto-fills the full
 # session via generate_series — against the snapshot rows, so the
 # fixture must also be dense across all 82 bars.
-NUM_ACTIVE_BARS = 6   # first N bars have explicit varied flow values
-TOTAL_BARS = 82       # session window (09:30 -> 16:15 ET)
+NUM_ACTIVE_BARS = 6  # first N bars have explicit varied flow values
+TOTAL_BARS = 82  # session window (09:30 -> 16:15 ET)
 SESSION_OPEN_ET = datetime(PRIOR_DATE.year, PRIOR_DATE.month, PRIOR_DATE.day, 9, 30, tzinfo=_ET)
 SESSION_OPEN_UTC = SESSION_OPEN_ET.astimezone(timezone.utc)
 
@@ -95,26 +95,30 @@ assert len(UNDERLYING_CLOSES_ACTIVE) == NUM_ACTIVE_BARS
 # (HAVING SUM(volume_delta) > 0 from session_open through bucket_end).
 CONTRACTS: list[Tuple[str, float, date, list, list]] = [
     # SPY 540C, 0DTE, steadily-growing call-buying pressure
-    ("C", 540.0, PRIOR_DATE,
-     [100, 250, 400, 600, 800, 950],
-     [+60, +120, +180, +240, +290, +330]),
+    ("C", 540.0, PRIOR_DATE, [100, 250, 400, 600, 800, 950], [+60, +120, +180, +240, +290, +330]),
     # SPY 545C, 0DTE, late starter (no flow in bar 0/1)
-    ("C", 545.0, PRIOR_DATE,
-     [None, None, 50, 120, 200, 290],
-     [None, None, +25, +60, +100, +145]),
+    ("C", 545.0, PRIOR_DATE, [None, None, 50, 120, 200, 290], [None, None, +25, +60, +100, +145]),
     # SPY 540P, 0DTE, steady put-selling (net negative)
     ("P", 540.0, PRIOR_DATE, [80, 200, 320, 460, 600, 720], [-30, -75, -120, -170, -220, -260]),
     # SPY 535P, 0DTE, balanced flow (net ~0)
     ("P", 535.0, PRIOR_DATE, [60, 130, 200, 280, 370, 450], [-5, +10, +0, -5, +5, -10]),
     # SPY 545C, 2DTE -- different expiry, exercises (strike, expiration)
     # primary-key disambiguation in the LAG partition
-    ("C", 545.0, date(2025, 4, 17),
-     [40, 90, 140, 200, 270, 340],
-     [+20, +45, +70, +100, +135, +170]),
+    (
+        "C",
+        545.0,
+        date(2025, 4, 17),
+        [40, 90, 140, 200, 270, 340],
+        [+20, +45, +70, +100, +135, +170],
+    ),
     # SPY 540C, 2DTE -- second contract on same strike, different expiry
-    ("C", 540.0, date(2025, 4, 17),
-     [30, 70, 130, 200, 280, 360],
-     [+15, +35, +65, +100, +140, +180]),
+    (
+        "C",
+        540.0,
+        date(2025, 4, 17),
+        [30, 70, 130, 200, 280, 360],
+        [+15, +35, +65, +100, +140, +180],
+    ),
 ]
 
 
@@ -421,8 +425,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
     parser.add_argument(
         "--dsn",
-        default=os.environ.get("FLOW_SERIES_PARITY_DSN")
-        or os.environ.get("DATABASE_URL"),
+        default=os.environ.get("FLOW_SERIES_PARITY_DSN") or os.environ.get("DATABASE_URL"),
         help="psycopg2 DSN (default: $FLOW_SERIES_PARITY_DSN or $DATABASE_URL)",
     )
     args = parser.parse_args()

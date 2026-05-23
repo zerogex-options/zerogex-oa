@@ -67,11 +67,13 @@ def _smart_money_block(src: str) -> str:
     Excluding any of these criteria would match a different
     flow_contract_facts query in the same method.
     """
-    matches = list(re.finditer(
-        r"cur\.execute\(\s*\"\"\"(?P<sql>[^\"]*buy_premium[^\"]*)\"\"\"",
-        src,
-        flags=re.DOTALL,
-    ))
+    matches = list(
+        re.finditer(
+            r"cur\.execute\(\s*\"\"\"(?P<sql>[^\"]*buy_premium[^\"]*)\"\"\"",
+            src,
+            flags=re.DOTALL,
+        )
+    )
     assert matches, "expected at least one cur.execute(...) referencing buy_premium"
     signed_net_pattern = re.compile(
         r"SUM\(\s*COALESCE\(\s*buy_premium\s*,\s*0\s*\)\s*-\s*"
@@ -93,8 +95,7 @@ def _smart_money_block(src: str) -> str:
         candidates.append(sql)
     assert len(candidates) >= 1, (
         "expected at least one canonical signed-net-premium block; "
-        "candidates considered: "
-        + repr([m.group("sql")[:80] for m in matches])
+        "candidates considered: " + repr([m.group("sql")[:80] for m in matches])
     )
     return candidates[0]
 
@@ -112,9 +113,9 @@ def test_smart_money_query_reads_from_flow_contract_facts():
     of the bug."""
     src = _fetch_context_source()
     block = _smart_money_block(src)
-    assert "flow_contract_facts" in block, (
-        "smart-money aggregation must read from flow_contract_facts"
-    )
+    assert (
+        "flow_contract_facts" in block
+    ), "smart-money aggregation must read from flow_contract_facts"
 
 
 def test_smart_money_query_uses_buy_minus_sell_for_signed_net_premium():
@@ -144,9 +145,9 @@ def test_smart_money_query_window_is_30_minutes():
     horizons even though both claim "smart-money flow"."""
     src = _fetch_context_source()
     block = _smart_money_block(src)
-    assert "INTERVAL '30 minutes'" in block, (
-        "smart-money window must be 30 minutes to match unified_signal_engine"
-    )
+    assert (
+        "INTERVAL '30 minutes'" in block
+    ), "smart-money window must be 30 minutes to match unified_signal_engine"
 
 
 def test_smart_money_query_groups_by_option_type():
@@ -154,9 +155,7 @@ def test_smart_money_query_groups_by_option_type():
     ``flow_bias = smart_call_premium - smart_put_premium``."""
     src = _fetch_context_source()
     block = _smart_money_block(src)
-    assert "GROUP BY option_type" in block, (
-        "smart-money aggregation must group by option_type"
-    )
+    assert "GROUP BY option_type" in block, "smart-money aggregation must group by option_type"
 
 
 # ---------------------------------------------------------------------------
@@ -199,8 +198,7 @@ def test_smart_money_query_no_longer_aggregates_total_premium():
     for sql in sql_strings:
         assert "SUM(total_premium)" not in sql, (
             "found SUM(total_premium) inside _fetch_context's SQL -- the "
-            "buggy gross aggregation was supposed to be replaced.  SQL: "
-            + sql
+            "buggy gross aggregation was supposed to be replaced.  SQL: " + sql
         )
 
 
@@ -283,9 +281,7 @@ class _CannedCursor:
 
     def execute(self, sql, params=None):
         self._last_was_smart_money = (
-            "flow_contract_facts" in sql
-            and "buy_premium" in sql
-            and "GROUP BY option_type" in sql
+            "flow_contract_facts" in sql and "buy_premium" in sql and "GROUP BY option_type" in sql
         )
         self._last_sql = sql
 

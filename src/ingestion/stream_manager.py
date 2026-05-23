@@ -224,8 +224,7 @@ class OptionStreamAccumulator:
             chunk_size = len(self._symbols) or 1
         self._chunk_size = chunk_size
         self._chunks: List[List[str]] = [
-            self._symbols[i : i + chunk_size]
-            for i in range(0, len(self._symbols), chunk_size)
+            self._symbols[i : i + chunk_size] for i in range(0, len(self._symbols), chunk_size)
         ] or [[]]
         self._threads: List[threading.Thread] = []
         self._current_responses: List[Optional[Any]] = []

@@ -21,6 +21,7 @@ from ..database import DatabaseManager
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/gex/vol_surface", tags=["GEX"])
 
+
 # ---------------------------------------------------------------------------
 # Data quality filters
 # ---------------------------------------------------------------------------
@@ -297,9 +298,7 @@ async def get_vol_surface(
     # post-close snapshot has only a handful of artefact IVs at strikes
     # bracketing spot — the kind of row that silently corrupts the
     # ATM-IV term structure if surfaced).
-    min_strikes_required = max(
-        1, int(len(strikes_sorted) * VOL_SURFACE_MIN_STRIKE_COVERAGE)
-    )
+    min_strikes_required = max(1, int(len(strikes_sorted) * VOL_SURFACE_MIN_STRIKE_COVERAGE))
 
     surface: List[ExpirationSlice] = []
     atm_term: List[ATMTermPoint] = []
@@ -326,9 +325,7 @@ async def get_vol_surface(
         # outlier filter, carry at least one valid IV.  Skip the whole
         # expiration when coverage falls below the configured floor.
         usable_strike_count = sum(
-            1
-            for v in by_strike.values()
-            if v["call_iv"] is not None or v["put_iv"] is not None
+            1 for v in by_strike.values() if v["call_iv"] is not None or v["put_iv"] is not None
         )
         if usable_strike_count < min_strikes_required:
             logger.info(

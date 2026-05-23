@@ -1484,9 +1484,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     "call_wall": row["call_wall"],
                     "put_wall": row["put_wall"],
                 }
-                self._cache_set(
-                    cache_key, payload, self._analytics_cache_ttl_seconds
-                )
+                self._cache_set(cache_key, payload, self._analytics_cache_ttl_seconds)
                 return payload
         except Exception as e:
             logger.error(f"Error fetching GEX profile: {e}", exc_info=True)

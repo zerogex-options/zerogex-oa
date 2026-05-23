@@ -264,11 +264,7 @@ def test_cash_index_heatmap_restricts_to_regular_session():
     # selection in bucket_reps — but never to the gex_by_strike join.
     join_idx = sql.index("JOIN gex_by_strike g")
     assert sql.count("EXTRACT(DOW") == 2
-    extract_positions = [
-        i
-        for i in range(len(sql))
-        if sql.startswith("EXTRACT(DOW", i)
-    ]
+    extract_positions = [i for i in range(len(sql)) if sql.startswith("EXTRACT(DOW", i)]
     # Both EXTRACT(DOW occurrences precede the join, neither follows it.
     assert all(idx < join_idx for idx in extract_positions)
     # First occurrence is inside latest_summary; second is inside bucket_reps.
