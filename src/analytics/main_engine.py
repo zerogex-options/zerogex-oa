@@ -13,6 +13,7 @@ Runs on a configured interval and writes to gex_summary and gex_by_strike tables
 import bisect
 import os
 import signal
+import threading
 import sys
 import time
 import time as _time
@@ -219,9 +220,28 @@ class AnalyticsEngine:
                 "(ANALYTICS_FLOW_CACHE_REFRESH_ENABLED=false)"
             )
 
-        # Setup signal handlers
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        # Setup signal handlers for clean shutdown of the long-running
+        # daemon loop (see :meth:`run`).  ``signal.signal`` can only be
+        # called from the MAIN thread of the MAIN interpreter; library
+        # callers that instantiate the engine inside a worker thread
+        # (e.g. ``/api/gex/flip-term-structure`` runs the snapshot
+        # fetch via ``asyncio.to_thread``) have no use for these
+        # handlers and would crash on install.  Guard with a thread
+        # check and a defensive try/except so the constructor is safe
+        # in either context — the daemon entry point hits the handlers
+        # on the main thread and is unaffected.
+        if threading.current_thread() is threading.main_thread():
+            try:
+                signal.signal(signal.SIGINT, self._signal_handler)
+                signal.signal(signal.SIGTERM, self._signal_handler)
+            except (ValueError, OSError):
+                # ValueError: "signal only works in main thread" if the
+                # main-thread check above ever races; OSError on some
+                # platforms when the signal isn't installable.  Either
+                # way, the engine still works — the daemon loop polls
+                # ``self.running`` between cycles, which the caller can
+                # set from anywhere.
+                logger.debug("Signal handler install skipped (non-main thread)")
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully"""
