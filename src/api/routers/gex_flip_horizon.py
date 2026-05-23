@@ -245,3 +245,163 @@ async def get_flip_term_structure(
         curve=curve_points,
         historical=historical,
     )
+
+
+# ---------------------------------------------------------------------------
+# Surface endpoint — full per-horizon dealer-gamma profile on a shared grid.
+# Drives the horizon × price contour and the 3D surface visualizations.
+# Contract: docs/gex_flip_surface_contract.md.
+# ---------------------------------------------------------------------------
+
+
+class FlipSurfaceWall(BaseModel):
+    strike: float
+    type: str  # "call" | "put"
+    abs_dollar_gex: float
+
+
+class FlipSurfacePoint(BaseModel):
+    horizon_days: float
+    flip: Optional[float] = None
+    resolved: bool
+    span_used: float
+    net_gex_at_spot: Optional[float] = None
+
+
+class FlipSurfaceResponse(BaseModel):
+    symbol: str
+    spot: float
+    timestamp: datetime
+    grid: List[float]
+    horizons_days: List[float]
+    profiles: List[List[float]]
+    flips: List[FlipSurfacePoint]
+    walls: List[FlipSurfaceWall]
+
+    class Config:
+        json_encoders = {datetime: lambda v: v.isoformat() if v is not None else None}
+
+
+# Bounds match GAMMA_PROFILE_SPAN_PCT / GAMMA_PROFILE_STEP_PCT validators in
+# src/config.py; matching them here keeps query-param validation in sync with
+# the analytics-engine acceptance band.
+_SURFACE_SPAN_MIN = 0.02
+_SURFACE_SPAN_MAX = 1.0
+_SURFACE_STEP_MIN = 0.0005
+_SURFACE_STEP_MAX = 0.05
+# Guard against combinatorial blow-up; matches the cap noted in the contract
+# (len(grid) × len(horizons) ≤ 4000).  At default 0.20/0.0025 the grid is
+# ~160 entries, leaving room for 12 horizons (the parse cap).
+_SURFACE_MAX_GRID_HORIZON_PRODUCT = 4000
+
+
+def _compute_surface_sync(
+    symbol: str,
+    horizons: List[float],
+    span_pct: float,
+    step_pct: float,
+    include_walls: bool,
+) -> Optional[dict]:
+    """Sync compute: snapshot fetch + per-horizon profile + walls.  Called
+    via asyncio.to_thread from the async endpoint."""
+    engine = AnalyticsEngine(underlying=symbol)
+    snapshot = engine._get_snapshot()
+    if not snapshot or not snapshot.get("options"):
+        return None
+    surface = engine.compute_flip_surface(
+        snapshot["options"],
+        snapshot["underlying_price"],
+        snapshot["timestamp"],
+        horizons,
+        span_pct=span_pct,
+        step_pct=step_pct,
+        include_walls=include_walls,
+    )
+    return {
+        "spot": snapshot["underlying_price"],
+        "timestamp": snapshot["timestamp"],
+        **surface,
+    }
+
+
+@router.get("/flip-surface", response_model=FlipSurfaceResponse)
+async def get_flip_surface(
+    symbol: str = Query(default="SPX", description="Underlying symbol"),
+    horizons: str = Query(
+        default="1,3,5,10,20,60",
+        description=(
+            "Comma-separated list of multi-day reference horizons in days. "
+            "Bounds: [0.25, 365], at most 12 entries."
+        ),
+    ),
+    span_pct: float = Query(
+        default=0.20,
+        ge=_SURFACE_SPAN_MIN,
+        le=_SURFACE_SPAN_MAX,
+        description="Half-width of the rendered price grid, as a fraction of spot.",
+    ),
+    step_pct: float = Query(
+        default=0.0025,
+        ge=_SURFACE_STEP_MIN,
+        le=_SURFACE_STEP_MAX,
+        description="Grid step, as a fraction of spot.",
+    ),
+    include_walls: bool = Query(
+        default=True,
+        description="Include the canonical Call/Put walls overlay.",
+    ),
+):
+    """Multi-horizon spot-shift dealer-gamma surface (PROTOTYPE).
+
+    Returns the dealer-gamma profile per horizon on a shared price grid,
+    plus the resolved flip per horizon and a single wall overlay.  See
+    docs/gex_flip_surface_contract.md for the full contract.
+    """
+    horizons_list = _parse_horizons(horizons)
+    symbol_upper = symbol.upper()
+
+    # Combinatorial cap: prevents a malicious caller from pinning a huge
+    # grid (e.g. step_pct=0.0005, span_pct=1.0 → 4000+ entries) against
+    # the max-12 horizons (12 × 4000 = 48k floats = ~400 KB JSON per
+    # request).  The cap matches the contract.
+    approx_grid_size = int(2 * span_pct / step_pct) + 1
+    if approx_grid_size * len(horizons_list) > _SURFACE_MAX_GRID_HORIZON_PRODUCT:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"grid × horizons product {approx_grid_size * len(horizons_list)} "
+                f"exceeds cap {_SURFACE_MAX_GRID_HORIZON_PRODUCT}; "
+                "widen step_pct or drop horizons"
+            ),
+        )
+
+    try:
+        sync_result = await asyncio.to_thread(
+            _compute_surface_sync,
+            symbol_upper,
+            horizons_list,
+            span_pct,
+            step_pct,
+            include_walls,
+        )
+    except Exception as e:
+        logger.error("flip-surface compute failed for %s: %s", symbol_upper, e, exc_info=True)
+        raise HTTPException(status_code=500, detail="flip-surface compute failed")
+
+    if sync_result is None:
+        raise HTTPException(status_code=404, detail=f"No usable option snapshot for {symbol_upper}")
+
+    snapshot_ts = sync_result["timestamp"]
+    if snapshot_ts.tzinfo is None:
+        snapshot_ts = snapshot_ts.replace(tzinfo=timezone.utc)
+
+    return FlipSurfaceResponse(
+        symbol=symbol_upper,
+        spot=float(sync_result["spot"]),
+        timestamp=snapshot_ts,
+        grid=sync_result["grid"],
+        horizons_days=sync_result["horizons_days"],
+        profiles=sync_result["profiles"],
+        flips=[FlipSurfacePoint(**row) for row in sync_result["flips"]],
+        walls=[FlipSurfaceWall(**w) for w in sync_result["walls"]],
+    )

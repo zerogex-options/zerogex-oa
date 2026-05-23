@@ -1079,6 +1079,7 @@ class AnalyticsEngine:
         timestamp: datetime,
         *,
         span_pct: Optional[float] = None,
+        step_pct: Optional[float] = None,
         dte_ref_days: Optional[float] = None,
     ) -> List[Tuple[float, float]]:
         """SpotGamma / SqueezeMetrics dealer gamma-exposure profile.
@@ -1129,8 +1130,9 @@ class AnalyticsEngine:
             return []
 
         effective_span_pct = GAMMA_PROFILE_SPAN_PCT if span_pct is None else span_pct
+        effective_step_pct = GAMMA_PROFILE_STEP_PCT if step_pct is None else step_pct
         span = spot * effective_span_pct
-        step = max(spot * GAMMA_PROFILE_STEP_PCT, 1e-6)
+        step = max(spot * effective_step_pct, 1e-6)
         grid = np.arange(spot - span, spot + span + step, step)
         grid = grid[grid > 0.0]
         if grid.size < 2:
@@ -1651,6 +1653,176 @@ class AnalyticsEngine:
                 }
             )
         return results
+
+    def compute_flip_surface(
+        self,
+        options: List[Dict[str, Any]],
+        spot: float,
+        timestamp: datetime,
+        horizons_days: Sequence[float],
+        *,
+        span_pct: Optional[float] = None,
+        step_pct: Optional[float] = None,
+        include_walls: bool = True,
+    ) -> Dict[str, Any]:
+        """Spot-shift dealer-gamma surface across multiple horizons.
+
+        Builds the spot-shift profile (:meth:`_gamma_exposure_profile`)
+        for each requested horizon on a SHARED price grid (same
+        ``span_pct`` and ``step_pct`` for every horizon, so all profile
+        slices line up index-for-index — the contour / surface
+        visualization renders as a non-ragged 2D array).
+
+        Each horizon ALSO gets a separately-resolved flip via
+        :meth:`_resolve_gamma_flip` (the adaptive ladder with interior /
+        structural / actionable gates).  The resolver may pick a wider
+        rung than ``span_pct`` when the gates require it — the flip
+        value is still honest, it's just not guaranteed to sit on the
+        rendered grid.  The contour shows the gamma landscape on the
+        shared grid; the flip line overlays the resolver's validated
+        zero crossings.  Both readings stay sign-consistent because
+        each horizon's profile and its resolver use the same
+        ``dte_ref_days``.
+
+        Walls (when ``include_walls=True``) come from the canonical
+        :func:`src.analytics.walls.compute_call_put_walls` against the
+        production-weighted ``gex_by_strike`` — a chain-level overlay,
+        independent of horizon (per the API contract).  ``abs_dollar_gex``
+        is the dollar GEX magnitude at the wall's strike row.
+
+        Returns a dict matching the FlipSurface response model:
+          * ``grid``             — shared ascending price grid (USD).
+          * ``horizons_days``    — input list, in the order requested.
+          * ``profiles``         — ``len(horizons_days) × len(grid)``
+                                   nested list of dealer dollar-GEX
+                                   (calls +, puts −) per 1% move.
+          * ``flips``            — list of one dict per horizon (same
+                                   shape as :meth:`compute_flip_term_structure`
+                                   output).
+          * ``walls``            — list of wall dicts, possibly empty
+                                   when ``include_walls=False`` or no
+                                   eligible strikes.
+
+        Empty profile (no usable contracts at the given spot/options)
+        returns ``grid=[], profiles=[], flips=[...]`` with each flip
+        unresolved — the caller decides whether to 404.
+        """
+        # Drop non-positive horizons; preserve requested order.
+        valid_horizons: List[float] = []
+        for h in horizons_days:
+            try:
+                h_f = float(h)
+            except (TypeError, ValueError):
+                continue
+            if h_f > 0:
+                valid_horizons.append(h_f)
+
+        # Single source of truth for the shared grid: derived from the
+        # first non-empty profile we build.  Empty grid (degenerate
+        # input) propagates as empty profiles.
+        grid: List[float] = []
+        profiles: List[List[float]] = []
+        flips: List[Dict[str, Any]] = []
+
+        for h_f in valid_horizons:
+            prof = self._gamma_exposure_profile(
+                options,
+                spot,
+                timestamp,
+                span_pct=span_pct,
+                step_pct=step_pct,
+                dte_ref_days=h_f,
+            )
+            if prof:
+                if not grid:
+                    grid = [float(s) for s, _ in prof]
+                profiles.append([float(v) for _, v in prof])
+            else:
+                # No usable contracts at this horizon — pad with an
+                # empty row so indices stay aligned with valid_horizons.
+                profiles.append([])
+
+            # Resolved (gated) flip — independent of the rendered grid.
+            _, flip, span_used = self._resolve_gamma_flip(
+                options, spot, timestamp, dte_ref_days=h_f
+            )
+            if prof:
+                idx = min(range(len(prof)), key=lambda i: abs(prof[i][0] - spot))
+                net_gex_at_spot: Optional[float] = float(prof[idx][1])
+            else:
+                net_gex_at_spot = None
+            flips.append(
+                {
+                    "horizon_days": h_f,
+                    "flip": float(flip) if flip is not None else None,
+                    "resolved": flip is not None,
+                    "span_used": float(span_used),
+                    "net_gex_at_spot": net_gex_at_spot,
+                }
+            )
+
+        # Pad any empty profile rows to the shared grid width with 0.0
+        # so the response is a clean rectangular array (the contract:
+        # len(profiles[i]) == len(grid) for every i).  An empty row at
+        # this point means that horizon's _gamma_exposure_profile
+        # returned [] — degenerate at THIS horizon while another
+        # horizon resolved — extremely unlikely on a sane chain since
+        # weighting is the only difference, but cheap to handle.
+        if grid:
+            for i in range(len(profiles)):
+                if len(profiles[i]) != len(grid):
+                    profiles[i] = [0.0] * len(grid)
+
+        walls: List[Dict[str, Any]] = []
+        if include_walls and options and spot > 0:
+            gex_by_strike = self._calculate_gex_by_strike(options, spot, timestamp)
+            if gex_by_strike:
+                call_wall, put_wall = compute_call_put_walls(gex_by_strike, spot)
+                # Convert OI-weighted gamma at the wall strike to dollar
+                # GEX per 1% move via the canonical formula
+                # ``γ_aggregate × 100 × S² × 0.01`` (same convention
+                # _calculate_gex_by_strike uses inline; the per-strike
+                # row stores the gamma aggregate but not the dollar
+                # value, so we derive it here).
+                dollar_scale = 100.0 * spot * spot * 0.01
+                # _calculate_gex_by_strike groups by (strike, expiration),
+                # so the same strike can appear in multiple rows.  Sum
+                # the OI-weighted gammas at the chosen wall strike so a
+                # multi-expiration strike's wall magnitude reflects the
+                # full per-strike mass the wall picker selected on.
+                call_gamma_at_wall = 0.0
+                put_gamma_at_wall = 0.0
+                for row in gex_by_strike:
+                    strike = float(row.get("strike") or 0.0)
+                    if call_wall is not None and strike == float(call_wall):
+                        call_gamma_at_wall += float(row.get("call_gamma") or 0.0)
+                    if put_wall is not None and strike == float(put_wall):
+                        put_gamma_at_wall += float(row.get("put_gamma") or 0.0)
+
+                if call_wall is not None:
+                    walls.append(
+                        {
+                            "strike": float(call_wall),
+                            "type": "call",
+                            "abs_dollar_gex": abs(call_gamma_at_wall * dollar_scale),
+                        }
+                    )
+                if put_wall is not None:
+                    walls.append(
+                        {
+                            "strike": float(put_wall),
+                            "type": "put",
+                            "abs_dollar_gex": abs(put_gamma_at_wall * dollar_scale),
+                        }
+                    )
+
+        return {
+            "grid": grid,
+            "horizons_days": valid_horizons,
+            "profiles": profiles,
+            "flips": flips,
+            "walls": walls,
+        }
 
     # Default IV substituted when an option_chains row has NULL/0 IV
     # (see the snapshot fetch ~line 503).  Stale-IV pipelines cluster

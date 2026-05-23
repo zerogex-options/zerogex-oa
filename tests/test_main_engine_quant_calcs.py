@@ -419,6 +419,90 @@ def test_compute_flip_term_structure_shape_and_alignment(monkeypatch):
             assert r["net_gex_at_spot"] is not None
 
 
+def test_compute_flip_surface_shared_grid_and_shape(monkeypatch):
+    """The surface method's hard contract: every horizon's profile is
+    aligned to a single shared grid (len(profiles[i]) == len(grid)
+    for every i), the grid is strictly ascending, walls are returned
+    when requested, and the resolved-flip rows match the term-structure
+    method's per-horizon output."""
+    engine = AnalyticsEngine(underlying="SPY")
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_WEIGHTING", True)
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_REF_DAYS", 5.0)
+
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
+    far = datetime(2026, 10, 16).date()
+    spot = 100.0
+    # gamma is the snapshot per-contract gamma the walls helper reads
+    # (production rows are populated by the BS calculator upstream);
+    # set a small positive value so _calculate_gex_by_strike produces
+    # the call_gamma / put_gamma columns the wall picker scans.
+    options = [
+        _opt(92.0, "P", oi=180000, iv=0.30, exp=far, gamma=0.01),
+        _opt(108.0, "C", oi=420000, iv=0.30, exp=far, gamma=0.01),
+        _opt(98.0, "P", oi=50000, iv=0.20, exp=datetime(2026, 5, 20).date(), gamma=0.01),
+    ]
+
+    surface = engine.compute_flip_surface(
+        options,
+        spot,
+        ts,
+        [2.0, 5.0, 20.0],
+        span_pct=0.10,  # narrower to keep grid small for the test
+        step_pct=0.005,
+        include_walls=True,
+    )
+
+    # Top-level shape: documented keys present.
+    assert set(surface.keys()) == {"grid", "horizons_days", "profiles", "flips", "walls"}
+
+    # Grid: strictly ascending, brackets spot, all positive.
+    grid = surface["grid"]
+    assert grid and all(grid[i] < grid[i + 1] for i in range(len(grid) - 1))
+    assert grid[0] < spot < grid[-1]
+    assert all(g > 0 for g in grid)
+
+    # Profiles: rectangular array — every row matches len(grid).
+    assert len(surface["profiles"]) == len(surface["horizons_days"]) == 3
+    for row in surface["profiles"]:
+        assert len(row) == len(grid)
+
+    # Flips: one entry per horizon with the documented keys.
+    assert len(surface["flips"]) == 3
+    for r in surface["flips"]:
+        assert set(r.keys()) == {
+            "horizon_days",
+            "flip",
+            "resolved",
+            "span_used",
+            "net_gex_at_spot",
+        }
+
+    # Cross-check vs the term-structure method: the resolver's flip per
+    # horizon must match between the two endpoints (both call
+    # _resolve_gamma_flip with the same dte_ref_days).
+    ts_result = engine.compute_flip_term_structure(options, spot, ts, [2.0, 5.0, 20.0])
+    for s_row, t_row in zip(surface["flips"], ts_result):
+        assert s_row["horizon_days"] == t_row["horizon_days"]
+        assert s_row["flip"] == t_row["flip"]
+        assert s_row["resolved"] == t_row["resolved"]
+
+    # Walls: 92P and 108C are the dominant near-spot strikes; we should
+    # get exactly one call wall (108) and one put wall (92).
+    assert len(surface["walls"]) == 2
+    by_type = {w["type"]: w for w in surface["walls"]}
+    assert {"call", "put"} == set(by_type.keys())
+    assert by_type["call"]["strike"] == 108.0
+    assert by_type["put"]["strike"] == 92.0
+    assert by_type["call"]["abs_dollar_gex"] > 0
+    assert by_type["put"]["abs_dollar_gex"] > 0
+
+    # include_walls=False returns an empty walls list.
+    surface_no_walls = engine.compute_flip_surface(
+        options, spot, ts, [5.0], span_pct=0.10, step_pct=0.005, include_walls=False
+    )
+    assert surface_no_walls["walls"] == []
+
+
 def test_find_structural_interior_crossing_geometry():
     """Unit test for the interior + structural gates on a hand-built profile.
 

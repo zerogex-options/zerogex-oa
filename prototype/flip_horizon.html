@@ -15,9 +15,10 @@
            `python -m http.server 8001` from this directory.
       4. Edit the API_BASE constant below if the API isn't on :8000.
 
-    The page renders two views:
-      * Term-structure curve  — live (today's flip per horizon + spot + historical dots)
-      * Horizon × price contour — placeholder, awaiting /api/gex/flip-surface
+    The page renders two views, both live:
+      * Term-structure curve  — today's flip per horizon + spot + historical dots
+      * Horizon × price contour — signed dealer-GEX surface with the zero
+        line (flip curve), walls overlay, and spot reference
 
     Caveat: historical dots come from gex_summary which persists ONE flip
     per cycle, computed at the production GAMMA_PROFILE_DTE_REF_DAYS.  So
@@ -41,13 +42,7 @@
     .controls button:disabled { background: #888; border-color: #888; cursor: not-allowed; }
     #status { font-size: 13px; color: #d04444; min-height: 1.2em; }
     #term-structure { width: 100%; height: 500px; margin-bottom: 24px; }
-    #surface-stub {
-      width: 100%; height: 360px; margin-bottom: 24px;
-      border: 1px dashed #ccc; border-radius: 6px; background: #fafafa;
-      display: flex; align-items: center; justify-content: center; color: #888;
-      flex-direction: column; gap: 8px; padding: 16px; text-align: center;
-    }
-    #surface-stub code { background: #eee; padding: 1px 6px; border-radius: 3px; font-size: 12px; }
+    #surface { width: 100%; height: 540px; margin-bottom: 24px; }
     table { border-collapse: collapse; font-size: 13px; margin-top: 8px; }
     th, td { padding: 4px 10px; border-bottom: 1px solid #eee; text-align: right; }
     th:first-child, td:first-child { text-align: left; }
@@ -72,10 +67,7 @@
 
   <div id="term-structure"></div>
 
-  <div id="surface-stub">
-    <div><strong>Horizon × price contour</strong> — pending <code>/api/gex/flip-surface</code></div>
-    <div>See <code>docs/gex_flip_surface_contract.md</code> for the proposed payload contract.</div>
-  </div>
+  <div id="surface"></div>
 
   <div id="summary"></div>
 
@@ -97,6 +89,16 @@
 
     async function fetchTermStructure(symbol, horizons) {
       const url = `${API_BASE}/api/gex/flip-term-structure?symbol=${encodeURIComponent(symbol)}&horizons=${encodeURIComponent(horizons)}`;
+      const r = await fetch(url);
+      if (!r.ok) {
+        const detail = await r.text();
+        throw new Error(`HTTP ${r.status}: ${detail}`);
+      }
+      return r.json();
+    }
+
+    async function fetchSurface(symbol, horizons) {
+      const url = `${API_BASE}/api/gex/flip-surface?symbol=${encodeURIComponent(symbol)}&horizons=${encodeURIComponent(horizons)}&span_pct=0.08&step_pct=0.0025`;
       const r = await fetch(url);
       if (!r.ok) {
         const detail = await r.text();
@@ -192,6 +194,89 @@
         hovermode: "closest",
       };
       Plotly.react("term-structure", traces, layout, { responsive: true });
+    }
+
+    function renderSurface(s) {
+      // Symmetric diverging colorscale centered at zero so the zero
+      // crossing (the flip curve) sits at the white / colormap inflection.
+      const flatVals = s.profiles.flat().filter(v => Number.isFinite(v));
+      const peak = Math.max(1, ...flatVals.map(v => Math.abs(v)));
+
+      const heat = {
+        x: s.grid,
+        y: s.horizons_days,
+        z: s.profiles,
+        type: "heatmap",
+        colorscale: [
+          [0.0, "#b91c1c"], [0.45, "#fca5a5"], [0.5, "#ffffff"],
+          [0.55, "#93c5fd"], [1.0, "#1d4ed8"],
+        ],
+        zmin: -peak,
+        zmax:  peak,
+        zsmooth: "best",
+        colorbar: { title: "$GEX / 1% move", thickness: 12 },
+        hovertemplate:
+          "spot $%{x:.2f}<br>" +
+          "horizon %{y}d<br>" +
+          "dealer GEX %{z:.2s}<extra></extra>",
+      };
+
+      // Flip curve drawn on top of the heatmap (zero-crossing per horizon).
+      const flipResolved = s.flips.filter(f => f.resolved && f.flip != null);
+      const flipCurve = {
+        x: flipResolved.map(f => f.flip),
+        y: flipResolved.map(f => f.horizon_days),
+        mode: "lines+markers",
+        type: "scatter",
+        name: "Flip curve",
+        line: { color: "#111", width: 2 },
+        marker: { color: "#111", size: 6 },
+        hovertemplate: "<b>%{y}d horizon</b><br>flip $%{x:.2f}<extra></extra>",
+      };
+
+      // Spot guide.
+      const spotLine = {
+        x: [s.spot, s.spot],
+        y: [Math.min(...s.horizons_days), Math.max(...s.horizons_days)],
+        mode: "lines",
+        type: "scatter",
+        name: `Spot ($${s.spot.toFixed(2)})`,
+        line: { color: "#444", width: 1, dash: "dot" },
+        hoverinfo: "skip",
+      };
+
+      // Walls as vertical strike lines (call=blue, put=red).
+      const wallTraces = (s.walls || []).map(w => ({
+        x: [w.strike, w.strike],
+        y: [Math.min(...s.horizons_days), Math.max(...s.horizons_days)],
+        mode: "lines",
+        type: "scatter",
+        name: `${w.type === "call" ? "Call" : "Put"} wall $${w.strike.toFixed(2)}`,
+        line: {
+          color: w.type === "call" ? "#1d4ed8" : "#b91c1c",
+          width: 1.5,
+          dash: "dash",
+        },
+        hovertemplate:
+          `<b>${w.type === "call" ? "Call" : "Put"} wall</b><br>` +
+          `strike $${w.strike.toFixed(2)}<br>` +
+          `|$GEX| ${fmt.bn(w.abs_dollar_gex)}<extra></extra>`,
+      }));
+
+      const layout = {
+        title: `${s.symbol} · horizon × price gamma surface (snapshot ${fmt.iso(s.timestamp)})`,
+        xaxis: { title: "Hypothetical spot price ($)" },
+        yaxis: {
+          title: "Horizon (days)",
+          type: "log",
+          tickvals: s.horizons_days,
+          ticktext: s.horizons_days.map(h => `${h}d`),
+        },
+        legend: { orientation: "h", x: 0, y: 1.08 },
+        margin: { l: 70, r: 30, t: 80, b: 50 },
+        hovermode: "closest",
+      };
+      Plotly.react("surface", [heat, ...wallTraces, spotLine, flipCurve], layout, { responsive: true });
 
       // ---- summary table ----
       const histByH = Object.fromEntries((data.historical || []).map(h => [h.horizon_days, h]));
@@ -232,8 +317,16 @@
       statusEl.style.color = "#888";
       btn.disabled = true;
       try {
-        const data = await fetchTermStructure(symbol, horizons);
-        render(data);
+        // Fetch both concurrently — independent endpoints, both 5s-cached.
+        const [tsData, surfData] = await Promise.all([
+          fetchTermStructure(symbol, horizons),
+          fetchSurface(symbol, horizons).catch(e => {
+            console.warn("surface fetch failed (rendering term-structure only):", e);
+            return null;
+          }),
+        ]);
+        render(tsData);
+        if (surfData) renderSurface(surfData);
         statusEl.textContent = "";
       } catch (e) {
         statusEl.textContent = e.message;

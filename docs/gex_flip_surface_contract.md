@@ -1,11 +1,10 @@
 # `/api/gex/flip-surface` — proposed payload contract
 
-Status: **CONTRACT READY / NOT IMPLEMENTED**. All four originally-open
-design questions are resolved below; the API shape is locked enough for
-an implementation pass. The companion endpoint
-`/api/gex/flip-term-structure` (implemented as a prototype) returns the
-flip points only; this one returns the full per-horizon dealer-gamma
-profile that the contour / 3D-surface visualizations consume.
+Status: **IMPLEMENTED (PROTOTYPE)**. Live at `/api/gex/flip-surface`;
+companion `/api/gex/flip-term-structure` returns the flip points only;
+this one returns the full per-horizon dealer-gamma profile that the
+contour / 3D-surface visualizations consume. All four originally-open
+design questions resolved below per the v1 contract.
 
 ## Purpose
 
