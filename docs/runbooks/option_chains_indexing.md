@@ -1,16 +1,21 @@
 # option_chains indexing — runbook
 
 Background captured during the May 13–15, 2026 investigation into
-analytics `_get_snapshot()` wedge incidents.
+analytics `_get_snapshot()` wedge incidents, plus the May 23 drop
+of two confirmed-dead indexes.
 
 ## TL;DR
 
-`idx_option_chains_underlying_option_symbol_ts_gamma_covering`
-(partial covering index, `WHERE gamma IS NOT NULL`) was originally
-built to fix the May 13 `_get_snapshot()` wedge. **The planner does
-not pick it for that query at any lookback width.** It IS picked for
-per-contract LATERAL lookups and remains the canonical access path
-for those — see Live users below before dropping it.
+Two indexes were dropped on **May 23, 2026** after live audit confirmed
+both were dead:
+
+| Index | Size | Reason |
+|-------|------|--------|
+| `idx_option_chains_underlying_option_symbol_ts_gamma_covering` | 21 GB | Last scan May 15; planner always picked the non-partial sibling `idx_option_chains_underlying_option_symbol_timestamp` for the LATERAL lookup it was designed for. INCLUDE list missing `ask_volume`/`bid_volume`/`mid` precluded Index Only Scan. |
+| `idx_option_chains_underlying_timestamp_option_symbol`         | 3.5 GB | +3 scans in 17h vs. 2.7M scans on the sibling `idx_option_chains_underlying_timestamp` with the same `(underlying, timestamp DESC)` prefix. The trailing `option_symbol` column gave no measurable selectivity benefit. |
+
+Combined reclaim: **~24 GB** + per-row write overhead on every ingestion
+UPSERT. See "Audit & drop — May 23, 2026" below for the evidence trail.
 
 ## What `_get_snapshot` actually does
 
@@ -51,28 +56,19 @@ when the buffer pool is cold (just after autovacuum eviction).
 
 See `src/analytics/main_engine.py:_get_snapshot()`.
 
-## Live users of `idx_option_chains_underlying_option_symbol_ts_gamma_covering`
+## Per-contract LATERAL lookups (post-May-23)
 
-- `src/api/database.py:_do_refresh_flow_cache()` LATERAL backfill —
-  ~15s cadence under `/api/gex/contract_flow` polling. As of May
-  2026, `pg_stat_user_indexes` attributed ~2.4k scans / ~115M
-  tuples-read to this query alone.
-
-Before dropping this index, audit `pg_stat_user_indexes` for fresh
-scan activity and migrate any active users to an alternative plan
-first — per-contract lookups otherwise regress to seq-scan or
-bitmap-heap-scan of the whole window, which is orders of magnitude
-slower.
-
-## Building in production
-
-```sh
-make db-add-distinct-on-index
-```
-
-Uses `CREATE INDEX CONCURRENTLY` to avoid blocking the
-`option_chains` writers. The `setup/database/schema.sql` entry
-serves fresh installs and idempotent retries.
+`src/api/database.py:_do_refresh_flow_cache()`'s LATERAL backfill —
+~15s cadence under `/api/gex/contract_flow` polling — is now served
+by the non-partial sibling
+`idx_option_chains_underlying_option_symbol_timestamp` (same key,
+no `WHERE gamma IS NOT NULL`, no `INCLUDE` list). EXPLAIN on
+2026-05-23 confirmed this is the plan choice; idx_scan on that
+sibling stood at ~200M lifetime, vs. 2,447 (frozen since May 15) on
+the dropped covering index. Heap fetches per row are unchanged from
+the pre-drop state because the dropped index never achieved Index
+Only Scan anyway (missing `ask_volume`/`bid_volume`/`mid` from its
+INCLUDE list).
 
 ## Auditing & pruning (May 21, 2026)
 
@@ -89,19 +85,23 @@ related findings from the audit:
    carries write amplification with no read benefit. Drop with
    `make db-drop-underused-option-chains-idx CONFIRM=yes`.
 
-2. **The 19 GB covering index may be over-engineered for its
-   actual user.** `idx_option_chains_underlying_option_symbol_ts_gamma_covering`
+2. **The 19 GB covering index is over-engineered for its actual
+   user.** `idx_option_chains_underlying_option_symbol_ts_gamma_covering`
    was built to convert `_do_refresh_flow_cache`'s LATERAL backfill
    into an Index Only Scan, but its `INCLUDE` list lacks
    `ask_volume`, `bid_volume`, and `mid` — three columns the
    backfill SELECTs — so the planner still has to fetch the heap
    anyway. Meanwhile `idx_option_chains_underlying_option_symbol_timestamp`
    (2.7 GB, 185 M scans) serves the same key with one heap fetch
-   per row, and is dominantly preferred by the planner. The
-   covering index records only 2.4 k scans lifetime. **Before
-   dropping, verify in `pg_stat_statements` that no other query is
-   actually achieving an Index Only Scan against it.** See
-   `make db-drop-distinct-on-index` for the gated drop.
+   per row, and is dominantly preferred by the planner.
+   **Resolved: dropped on May 23, 2026** — see next section.
+
+3. **The 3.3 GB `idx_option_chains_underlying_timestamp_option_symbol`
+   is redundant.** Same `(underlying, timestamp DESC)` prefix as
+   `idx_option_chains_underlying_timestamp` (1 GB), but the latter
+   is used ~400× more often. The trailing `option_symbol` key column
+   adds no measurable selectivity for the query shapes the planner
+   sees. **Resolved: dropped on May 23, 2026.**
 
 ### Running the audit
 
@@ -114,6 +114,32 @@ Output ranks indexes by scan count and surfaces `tuples_per_scan`
 (planner-doing-big-scans signal) plus a bloat estimate. Always
 sanity-check `pg_stat_statements` for the SPECIFIC query patterns
 hitting a candidate before dropping.
+
+## Audit & drop — May 23, 2026
+
+Read-only audit run via `make db-drop-candidate-audit` (script:
+`setup/database/diagnostics/drop_candidate_audit.sql`) confirmed
+both indexes flagged by the May 21 review were dead:
+
+- Top-20 `pg_stat_statements` for `option_chains` showed no query
+  whose plan would prefer either suspect.
+- `EXPLAIN` on five representative shapes (LATERAL per-contract
+  lookup, range scan, `_get_snapshot` DISTINCT ON, quote-endpoint
+  control, per-contract history) showed the planner picking either
+  the healthy sibling or a different access path in every case.
+- Live `pg_stat_user_indexes` counters: covering index frozen at
+  2,447 scans (last scan **May 15**); ts_option_symbol moved from
+  6,878 → 6,881 in 17 h (+0.04%, indistinguishable from noise).
+
+Drops executed via:
+
+```sh
+make db-drop-distinct-on-index CONFIRM=yes
+make query SQL="DROP INDEX CONCURRENTLY idx_option_chains_underlying_timestamp_option_symbol;"
+```
+
+Post-drop footprint: 67 GB → **46 GB** total table size (heap 7.6 GB
++ remaining indexes 39 GB). 14 indexes remain.
 
 ## Buffer pool sizing
 

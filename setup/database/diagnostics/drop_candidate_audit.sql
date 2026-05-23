@@ -159,7 +159,7 @@ LIMIT 2000;
 \echo --- (d) /api/option/quote: latest row per underlying (CONTROL) ---
 \echo     Shape: WHERE underlying = X ORDER BY timestamp DESC LIMIT 1 (full SELECT list)
 \echo     Should pick idx_option_chains_underlying_ts_quote_covering (Index Only Scan).
-\echo     Neither suspect should appear -- if one does, that's a planner anomaly worth a look.
+\echo     Neither suspect should appear -- if one does, that is a planner anomaly worth a look.
 
 EXPLAIN (VERBOSE, SETTINGS, FORMAT TEXT)
 SELECT bid, ask, volume, open_interest, strike, expiration, option_type, timestamp
@@ -219,9 +219,9 @@ ORDER BY pg_relation_size(indexrelid) DESC;
 \echo ============================================================
 \echo Decision guide
 \echo ============================================================
-\echo [1/3] -- if any top-20 query shape isn't covered by (a)-(e), STOP and add it.
+\echo [1/3] -- if any top-20 query shape is NOT covered by (a)-(e), STOP and add it.
 \echo
-\echo [2/3] -- scan the index name in each plan's Scan node:
+\echo [2/3] -- scan the index name in each plan Scan node:
 \echo
 \echo   * If NEITHER suspect appears in ANY plan, both are dead.
 \echo     Proceed with the drops below.

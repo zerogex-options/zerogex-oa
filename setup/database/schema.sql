@@ -131,8 +131,6 @@ CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_time_type_strike
     ON option_chains(underlying, timestamp DESC, option_type, strike);
 CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_option_symbol_timestamp
     ON option_chains(underlying, option_symbol, timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_timestamp_option_symbol
-    ON option_chains(underlying, timestamp DESC, option_symbol);
 CREATE INDEX IF NOT EXISTS idx_option_chains_option_symbol_timestamp
     ON option_chains(option_symbol, timestamp DESC);
 -- Covering index for /api/option/quote: lets the planner satisfy
@@ -142,23 +140,6 @@ CREATE INDEX IF NOT EXISTS idx_option_chains_option_symbol_timestamp
 CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_ts_quote_covering
     ON option_chains(underlying, timestamp DESC)
     INCLUDE (bid, ask, volume, open_interest, strike, expiration, option_type);
--- Partial covering index for per-contract snapshot lookups (LATERAL
--- joins, src/api/database.py:_do_refresh_flow_cache).  NOT picked by
--- the planner for analytics _get_snapshot() despite being designed
--- for it -- bitmap-heap-scan wins at every lookback width.  Don't
--- drop without first migrating per-contract lookups to an alternate
--- plan.  Build in production via ``make db-add-distinct-on-index``
--- (CREATE INDEX CONCURRENTLY).  Full incident history in
--- docs/runbooks/option_chains_indexing.md.
-CREATE INDEX IF NOT EXISTS idx_option_chains_underlying_option_symbol_ts_gamma_covering
-    ON option_chains(underlying, option_symbol, timestamp DESC)
-    INCLUDE (
-        strike, option_type, expiration,
-        last, bid, ask,
-        volume, open_interest,
-        delta, gamma, theta, vega, implied_volatility
-    )
-    WHERE gamma IS NOT NULL;
 
 DO $$
 BEGIN
