@@ -544,16 +544,46 @@ TS_STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").
 # ~1000+ option contracts tracked, a single-connection URL exceeds ~25KB
 # and triggers a 414 Request-URI Too Large from TradeStation's gateway.
 # Split tracked symbols across multiple stream connections so each URL
-# stays well under that gateway limit. At ~25 bytes/symbol, 500/chunk
-# yields URLs of ~12.5KB — comfortably under 25KB — and keeps the
-# concurrent-stream count low when multiple underlyings run side-by-side:
-# 3 ingestion processes × (1 underlying + 2 option chunks) = 9 streams,
-# fitting inside TradeStation's 10-stream-per-account cap. A smaller
-# default (200) produced 4 option chunks per process and pushed three
-# concurrent underlyings to 15 streams, silently exceeding the cap and
-# manifesting as "Response ended prematurely" disconnects with the
-# underlying bar stream the most frequent casualty (it starts last in
-# _start_accumulators so it loses the race for the remaining slot first).
+# stays well under that gateway limit.
+#
+# Sizing — two constraints, both per ingestion *account* (NOT per process):
+#
+#   1. URL length per stream (TradeStation gateway).
+#        url_bytes ≈ chunk_size × 25
+#        Hard ceiling: ~25KB triggers 414.  Aim ≤ ~20KB (chunk_size ≤ 800).
+#
+#   2. Concurrent stream count (TradeStation account cap, nominally 10).
+#        total_streams = N_underlyings × (1 + ceil(symbols_per_underlying / chunk_size))
+#        i.e. one underlying bar stream + one stream per option-symbol chunk,
+#        multiplied by the number of ingestion processes (one per underlying
+#        symbol — see ``main()`` in ``ingestion/main_engine.py``).
+#        A short-lived (<30s) connection is the only on-the-wire fingerprint
+#        of cap exhaustion — no 414, no 429 — and is surfaced by the
+#        cap-exhaustion WARNING in ``OptionStreamAccumulator._read_stream``
+#        and ``UnderlyingBarAccumulator._read_stream``.
+#
+# Worked examples at the 500-symbol default:
+#
+#     | symbols/underlying | chunks/process | 1 underlying | 3 underlyings |
+#     | ------------------ | -------------- | ------------ | ------------- |
+#     |              1,000 |              2 |   3 streams  |   9 streams   |
+#     |              2,000 |              4 |   5 streams  |  15 streams   |
+#     |              3,000 |              6 |   7 streams  |  21 streams   |
+#
+# A 3-underlying deployment with ≥ ~1500 symbols/underlying exceeds the
+# nominal cap; if the cap WARNING fires, drop ``INGEST_STRIKE_COUNT`` /
+# ``INGEST_EXPIRATIONS`` to shrink ``symbols_per_underlying``, or raise
+# this value (chunk_size ≤ 800 keeps URLs safely under 414).
+#
+# Historical context: ``bb4a78b`` introduced chunking with a 200-symbol
+# default sized for a single-underlying deployment (1100 symbols → 6
+# chunks → 7 streams, "within the 10-stream cap").  That sizing implicitly
+# assumed N_underlyings = 1; running three underlyings at 200/chunk
+# pushed the account to 15+ streams and the underlying bar stream was the
+# most frequent casualty (it started last in ``_start_accumulators`` so it
+# lost the race for the remaining slot first).  The 500 default + the
+# start-order / no-recalc-thrash fixes in ``adaa9bc`` keep a 3×2000
+# deployment functioning even though it formally over-subscribes.
 STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION = int(
     os.getenv("STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION", "500")
 )

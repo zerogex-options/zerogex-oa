@@ -1596,11 +1596,42 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         bucket = _bucket_expr(timeframe)
         step_interval = _interval_expr(timeframe)
         # `bucket` and `step_interval` are validated allowlist literals.
+        #
+        # Cash-index session filter — same shape (and rationale) as
+        # ``get_gex_heatmap``: SPX / NDX / RUT have no underlying tape
+        # outside 09:30–16:00 ET, but their options trade extended /
+        # global hours, so ``gex_summary`` is written around the clock.
+        # Letting those after-hours / overnight rows reach a cash-index
+        # chart misaligns the gamma-flip overlay with the RTH-only
+        # candlesticks and drifts past the heatmap surface's right edge
+        # (which already clamps via the same filter).  Apply to BOTH the
+        # ``latest`` anchor (so max_ts lands on the most recent RTH row)
+        # and the ``bucketed`` scan (so out-of-session buckets never
+        # surface).  ETFs / equities keep the original query and params.
+        #
+        # The template is interpolated twice with different column
+        # references because ``bucketed`` aliases gex_summary as ``gs``
+        # while ``latest`` does not, and PostgreSQL won't resolve
+        # unqualified ``timestamp`` against an aliased table inside a
+        # multi-table-friendly fragment.
+        session_filter_latest = ""
+        session_filter_bucketed = ""
+        params: list = [symbol, start_date, end_date, window_units]
+        if is_cash_index(symbol):
+            session_filter_template = """
+                    AND EXTRACT(DOW FROM {ts} AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
+                    AND ({ts} AT TIME ZONE 'America/New_York')::time
+                        BETWEEN TIME '09:30' AND TIME '16:00'
+                    AND ({ts} AT TIME ZONE 'America/New_York')::date <> ALL($5::date[])
+            """
+            session_filter_latest = session_filter_template.format(ts="timestamp")
+            session_filter_bucketed = session_filter_template.format(ts="gs.timestamp")
+            params.append(sorted(NYSE_HOLIDAYS))
         query = f"""
             WITH latest AS (
                 SELECT timestamp AS max_ts
                 FROM gex_summary
-                WHERE underlying = $1
+                WHERE underlying = $1{session_filter_latest}
                 ORDER BY timestamp DESC
                 LIMIT 1
             ),
@@ -1634,7 +1665,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY gs.timestamp DESC) as rn
                 FROM gex_summary gs
                 WHERE gs.underlying = $1
-                    AND gs.timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+                    AND gs.timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds){session_filter_bucketed}
             ),
             base AS (
                 SELECT *
@@ -1715,7 +1746,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         try:
             async with self._acquire_connection() as conn:
                 window_units = max(1, min(window_units, 90))
-                rows = await conn.fetch(query, symbol, start_date, end_date, window_units)
+                params[3] = window_units
+                rows = await conn.fetch(query, *params)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching historical GEX: {e}", exc_info=True)
@@ -2639,11 +2671,29 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         bucket = _bucket_expr(timeframe)
         step_interval = _interval_expr(timeframe)
         # `bucket` and `step_interval` are validated allowlist literals.
+        #
+        # Cash-index session filter — see ``get_gex_heatmap`` for the
+        # full rationale.  SPX/NDX/RUT options trade extended hours so
+        # ``gex_summary`` (and therefore ``max_pain``) is written around
+        # the clock, but the underlying tape only prints 09:30–16:00 ET;
+        # surfacing overnight max-pain buckets misaligns this chart with
+        # the RTH-only candlesticks and with the heatmap right edge.
+        # Neither CTE aliases gex_summary, so a single template suffices.
+        session_filter = ""
+        params: list = [symbol, window_units]
+        if is_cash_index(symbol):
+            session_filter = """
+                    AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
+                    AND (timestamp AT TIME ZONE 'America/New_York')::time
+                        BETWEEN TIME '09:30' AND TIME '16:00'
+                    AND (timestamp AT TIME ZONE 'America/New_York')::date <> ALL($3::date[])
+            """
+            params.append(sorted(NYSE_HOLIDAYS))
         query = f"""
             WITH latest AS (
                 SELECT timestamp AS max_ts
                 FROM gex_summary
-                WHERE underlying = $1
+                WHERE underlying = $1{session_filter}
                 ORDER BY timestamp DESC
                 LIMIT 1
             ),
@@ -2660,7 +2710,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) AS rn
                 FROM gex_summary
                 WHERE underlying = $1
-                    AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+                    AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds){session_filter}
             )
             SELECT bucket_ts AS timestamp, symbol, max_pain
             FROM ranked
@@ -2670,7 +2720,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         """
 
         async with self._acquire_connection() as conn:
-            rows = await conn.fetch(query, symbol, window_units)
+            rows = await conn.fetch(query, *params)
             return [dict(row) for row in rows]
 
     async def get_max_pain_current(
@@ -2781,11 +2831,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # extended-hours and overnight buckets makes the heatmap plot
         # nonsensical 17:00–19:00 ET cells for an index and misaligns the
         # surface with the RTH-only candlesticks.  For cash indices,
-        # restrict the per-bucket representatives to the regular session
+        # restrict BOTH the window anchor (latest_summary) AND the
+        # per-bucket representatives (bucket_reps) to the regular session
         # (weekdays, 09:30–16:00 ET, excluding NYSE holidays) — the same
-        # session definition get_session_closes uses.  ETFs / equities
-        # (SPY, QQQ, …) genuinely trade extended hours, so they keep the
-        # original query and params unchanged.
+        # session definition get_session_closes uses.  Applying it to the
+        # anchor too means the chart's right edge lands on the most recent
+        # RTH analytics row, not on whatever overnight cycle ran last; the
+        # visible window then spans a full ``window_units`` of RTH data
+        # instead of a fragment ending at the most recent RTH bar.  ETFs /
+        # equities (SPY, QQQ, …) genuinely trade extended hours, so they
+        # keep the original query and params unchanged.
         session_filter = ""
         params: list = [symbol, window_units]
         if is_cash_index(symbol):
@@ -2805,8 +2860,26 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # plain decimal literal — no user input — so it is safe to
         # interpolate alongside the other validated fragments below.
         band_pct = self._gex_heatmap_strike_band_pct
-        strike_band = f"(SELECT spot_close FROM latest_quote) * {band_pct:g}"
+        strike_band = f"(SELECT spot_close FROM spot) * {band_pct:g}"
         # `bucket` and `step_interval` are validated allowlist literals.
+        #
+        # Anchor choice: the window's right edge (``max_ts``) is the most
+        # recent ``gex_summary`` row for this underlying, NOT the most
+        # recent ``underlying_quotes`` row.  The heatmap is fundamentally
+        # a GEX chart driven by gex_summary / gex_by_strike; coupling its
+        # freshness to underlying_quotes meant that any condition stalling
+        # the TradeStation Stream Bars feed (per-account stream-cap
+        # eviction, single-symbol bar-feed outages, schema/write glitches
+        # at the 09:30 vendor reset, …) froze the heatmap even while
+        # analytics kept producing rows.  Anchoring on gex_summary
+        # mirrors get_historical_gex (which drives the gamma-flip line) and
+        # get_max_pain_timeseries, so the heatmap surface and the
+        # gamma-flip overlay can no longer drift apart on the time axis.
+        # ``underlying_quotes`` is still consulted, but only for
+        # ``spot_close`` (used to size the strike band around spot); a
+        # stale spot is harmless because the analytics engine writes
+        # gex_summary against that same stale spot, so the band stays
+        # centered on the level the heatmap was computed at.
         #
         # Perf: a true per-bucket AVG over raw gex_by_strike requires
         # reading every snapshot in the window.  gex_by_strike is the
@@ -2827,11 +2900,18 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # average across every snapshot in the bucket -- consistent with
         # the historical/summary endpoints.  Only the TIME aggregation
         # changed: the cross-expiration combination per (bucket, strike)
-        # is still AVG, and the spot±50 band filter is unchanged, so cell
-        # magnitudes stay comparable to before.
+        # is still AVG, and the spot±band_pct strike filter is unchanged,
+        # so cell magnitudes stay comparable to before.
         query = f"""
-            WITH latest_quote AS (
-                SELECT timestamp AS max_ts, close AS spot_close
+            WITH latest_summary AS (
+                SELECT timestamp AS max_ts
+                FROM gex_summary
+                WHERE underlying = $1{session_filter}
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            spot AS (
+                SELECT close::numeric AS spot_close
                 FROM underlying_quotes
                 WHERE symbol = $1
                 ORDER BY timestamp DESC
@@ -2841,7 +2921,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 SELECT
                     max_ts - ({step_interval} * ($2 - 1)) as start_time,
                     max_ts as end_time
-                FROM latest_quote
+                FROM latest_summary
             ),
             bucket_reps AS (
                 SELECT DISTINCT ON ({bucket})
@@ -2887,7 +2967,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             JOIN gex_by_strike g
                 ON g.underlying = $1
                AND g.timestamp = br.rep_ts
-            WHERE ABS(g.strike - (SELECT spot_close FROM latest_quote)) <= {strike_band}
+            WHERE ABS(g.strike - (SELECT spot_close FROM spot)) <= {strike_band}
             GROUP BY br.bucket_ts, g.strike
             ORDER BY br.bucket_ts DESC, g.strike ASC
         """
