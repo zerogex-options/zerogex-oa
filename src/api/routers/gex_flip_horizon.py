@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+import time
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -136,11 +138,83 @@ def _parse_horizons(raw: str) -> List[float]:
     return horizons
 
 
+# On-demand endpoints get a wider snapshot lookback than the steady-state
+# analytics tick.  Analytics runs every 60s and is designed for very fresh
+# data (ANALYTICS_SNAPSHOT_LOOKBACK_HOURS commonly 0.25h = 15min), so its
+# default narrow window is appropriate for that cadence.  The API path
+# serves one-shot client requests that should tolerate a Greeks pipeline
+# that's lagged by a few minutes / a partial extended-hours session.  4h
+# covers a normal IV-pipeline lag without scanning 96h of option_chains.
+_ENDPOINT_MIN_LOOKBACK_HOURS = 4
+
+# In-memory response cache.  Heavy work (snapshot fetch + N profile builds)
+# can take >30s per request on a stale-data path; with a polling dashboard
+# this would multiply the cost N-fold for no signal.  TTL matches the 30s
+# cadence at which a multi-horizon flip view becomes stale anyway (the
+# underlying analytics tick is 60s, and a multi-day regime level doesn't
+# move minute-by-minute).
+_RESPONSE_CACHE: Dict[tuple, Dict[str, Any]] = {}
+_RESPONSE_CACHE_LOCK = threading.Lock()
+_RESPONSE_CACHE_TTL_SECONDS = 30.0
+_RESPONSE_CACHE_MAX_ENTRIES = 64
+
+
+def _cache_get(key: tuple) -> Optional[dict]:
+    now = time.monotonic()
+    with _RESPONSE_CACHE_LOCK:
+        entry = _RESPONSE_CACHE.get(key)
+        if entry and now - entry["ts"] < _RESPONSE_CACHE_TTL_SECONDS:
+            return entry["data"]
+        if entry is not None:
+            _RESPONSE_CACHE.pop(key, None)
+    return None
+
+
+def _cache_put(key: tuple, data: dict) -> None:
+    with _RESPONSE_CACHE_LOCK:
+        _RESPONSE_CACHE[key] = {"data": data, "ts": time.monotonic()}
+        # FIFO eviction — cheap; expected cardinality is tiny (a handful
+        # of symbols × default horizon set).
+        while len(_RESPONSE_CACHE) > _RESPONSE_CACHE_MAX_ENTRIES:
+            oldest = next(iter(_RESPONSE_CACHE))
+            _RESPONSE_CACHE.pop(oldest, None)
+
+
+def _prepare_endpoint_engine(symbol: str) -> AnalyticsEngine:
+    """Build an AnalyticsEngine tuned for the on-demand API path.
+
+    Two adjustments vs. the persisted analytics tick:
+
+    1. ``_snapshot_cold_start_consumed = True`` — skip the wide cold-start
+       lookback scan (default 96h, ~2M+ rows for SPY).  That branch
+       exists to absorb a process restart on a cold buffer pool, and it
+       flips to True after the analytics tick's first cycle.  The API
+       endpoint creates a fresh engine per request, so without this flip
+       every request would do a 96h scan whenever data is even slightly
+       older than the steady-state window — observed at 57s per call
+       on the prod box with stale extended-hours data.
+
+    2. ``snapshot_lookback_hours = max(configured, 4h)`` — the persisted
+       tick runs every minute and its narrow default (often 0.25h) is
+       right for that cadence.  On-demand calls should tolerate a few
+       minutes of IV-pipeline lag without bouncing back empty, so we
+       floor the lookback at 4h here.  This widens the scan modestly
+       relative to the persisted tick but is still orders of magnitude
+       cheaper than the cold-start path.
+    """
+    engine = AnalyticsEngine(underlying=symbol)
+    engine._snapshot_cold_start_consumed = True
+    engine.snapshot_lookback_hours = max(
+        engine.snapshot_lookback_hours, _ENDPOINT_MIN_LOOKBACK_HOURS
+    )
+    return engine
+
+
 def _compute_sync(symbol: str, horizons: List[float]) -> Optional[dict]:
     """Run the analytics-engine snapshot fetch + multi-horizon flip
     resolution.  Synchronous (psycopg2 + numpy); call via
     ``asyncio.to_thread`` from the async endpoint."""
-    engine = AnalyticsEngine(underlying=symbol)
+    engine = _prepare_endpoint_engine(symbol)
     # _get_snapshot is the same path the production analytics loop uses
     # for the persisted cycle — same options filter, same AM-settled drop,
     # same OI-coverage guard.  Underscore is a soft convention here.
@@ -181,16 +255,21 @@ async def get_flip_term_structure(
     """Multi-horizon gamma flip + historical-realization overlay (PROTOTYPE)."""
     horizons_list = _parse_horizons(horizons)
     symbol_upper = symbol.upper()
+    cache_key = ("term-structure", symbol_upper, tuple(horizons_list))
 
-    # Heavy work (DB snapshot fetch + N profile builds) is sync and CPU/IO
-    # bound — run it off the event loop so concurrent requests don't queue.
-    try:
-        sync_result = await asyncio.to_thread(_compute_sync, symbol_upper, horizons_list)
-    except Exception as e:
-        logger.error(
-            "flip-term-structure compute failed for %s: %s", symbol_upper, e, exc_info=True
-        )
-        raise HTTPException(status_code=500, detail="flip-term-structure compute failed")
+    sync_result = _cache_get(cache_key)
+    if sync_result is None:
+        # Heavy work (DB snapshot fetch + N profile builds) is sync and CPU/IO
+        # bound — run it off the event loop so concurrent requests don't queue.
+        try:
+            sync_result = await asyncio.to_thread(_compute_sync, symbol_upper, horizons_list)
+        except Exception as e:
+            logger.error(
+                "flip-term-structure compute failed for %s: %s", symbol_upper, e, exc_info=True
+            )
+            raise HTTPException(status_code=500, detail="flip-term-structure compute failed")
+        if sync_result is not None:
+            _cache_put(cache_key, sync_result)
 
     if sync_result is None:
         raise HTTPException(status_code=404, detail=f"No usable option snapshot for {symbol_upper}")
@@ -304,7 +383,7 @@ def _compute_surface_sync(
 ) -> Optional[dict]:
     """Sync compute: snapshot fetch + per-horizon profile + walls.  Called
     via asyncio.to_thread from the async endpoint."""
-    engine = AnalyticsEngine(underlying=symbol)
+    engine = _prepare_endpoint_engine(symbol)
     snapshot = engine._get_snapshot()
     if not snapshot or not snapshot.get("options"):
         return None
@@ -375,18 +454,35 @@ async def get_flip_surface(
             ),
         )
 
-    try:
-        sync_result = await asyncio.to_thread(
-            _compute_surface_sync,
-            symbol_upper,
-            horizons_list,
-            span_pct,
-            step_pct,
-            include_walls,
-        )
-    except Exception as e:
-        logger.error("flip-surface compute failed for %s: %s", symbol_upper, e, exc_info=True)
-        raise HTTPException(status_code=500, detail="flip-surface compute failed")
+    # Cache key includes the grid parameters so different rendering
+    # resolutions don't share a cached entry.
+    surface_cache_key = (
+        "surface",
+        symbol_upper,
+        (
+            tuple(horizons_list),
+            float(span_pct),
+            float(step_pct),
+            bool(include_walls),
+        ),
+    )
+
+    sync_result = _cache_get(surface_cache_key)
+    if sync_result is None:
+        try:
+            sync_result = await asyncio.to_thread(
+                _compute_surface_sync,
+                symbol_upper,
+                horizons_list,
+                span_pct,
+                step_pct,
+                include_walls,
+            )
+        except Exception as e:
+            logger.error("flip-surface compute failed for %s: %s", symbol_upper, e, exc_info=True)
+            raise HTTPException(status_code=500, detail="flip-surface compute failed")
+        if sync_result is not None:
+            _cache_put(surface_cache_key, sync_result)
 
     if sync_result is None:
         raise HTTPException(status_code=404, detail=f"No usable option snapshot for {symbol_upper}")
