@@ -1596,11 +1596,42 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         bucket = _bucket_expr(timeframe)
         step_interval = _interval_expr(timeframe)
         # `bucket` and `step_interval` are validated allowlist literals.
+        #
+        # Cash-index session filter — same shape (and rationale) as
+        # ``get_gex_heatmap``: SPX / NDX / RUT have no underlying tape
+        # outside 09:30–16:00 ET, but their options trade extended /
+        # global hours, so ``gex_summary`` is written around the clock.
+        # Letting those after-hours / overnight rows reach a cash-index
+        # chart misaligns the gamma-flip overlay with the RTH-only
+        # candlesticks and drifts past the heatmap surface's right edge
+        # (which already clamps via the same filter).  Apply to BOTH the
+        # ``latest`` anchor (so max_ts lands on the most recent RTH row)
+        # and the ``bucketed`` scan (so out-of-session buckets never
+        # surface).  ETFs / equities keep the original query and params.
+        #
+        # The template is interpolated twice with different column
+        # references because ``bucketed`` aliases gex_summary as ``gs``
+        # while ``latest`` does not, and PostgreSQL won't resolve
+        # unqualified ``timestamp`` against an aliased table inside a
+        # multi-table-friendly fragment.
+        session_filter_latest = ""
+        session_filter_bucketed = ""
+        params: list = [symbol, start_date, end_date, window_units]
+        if is_cash_index(symbol):
+            session_filter_template = """
+                    AND EXTRACT(DOW FROM {ts} AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
+                    AND ({ts} AT TIME ZONE 'America/New_York')::time
+                        BETWEEN TIME '09:30' AND TIME '16:00'
+                    AND ({ts} AT TIME ZONE 'America/New_York')::date <> ALL($5::date[])
+            """
+            session_filter_latest = session_filter_template.format(ts="timestamp")
+            session_filter_bucketed = session_filter_template.format(ts="gs.timestamp")
+            params.append(sorted(NYSE_HOLIDAYS))
         query = f"""
             WITH latest AS (
                 SELECT timestamp AS max_ts
                 FROM gex_summary
-                WHERE underlying = $1
+                WHERE underlying = $1{session_filter_latest}
                 ORDER BY timestamp DESC
                 LIMIT 1
             ),
@@ -1634,7 +1665,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY gs.timestamp DESC) as rn
                 FROM gex_summary gs
                 WHERE gs.underlying = $1
-                    AND gs.timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+                    AND gs.timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds){session_filter_bucketed}
             ),
             base AS (
                 SELECT *
@@ -1715,7 +1746,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         try:
             async with self._acquire_connection() as conn:
                 window_units = max(1, min(window_units, 90))
-                rows = await conn.fetch(query, symbol, start_date, end_date, window_units)
+                params[3] = window_units
+                rows = await conn.fetch(query, *params)
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching historical GEX: {e}", exc_info=True)
@@ -2566,11 +2598,29 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         bucket = _bucket_expr(timeframe)
         step_interval = _interval_expr(timeframe)
         # `bucket` and `step_interval` are validated allowlist literals.
+        #
+        # Cash-index session filter — see ``get_gex_heatmap`` for the
+        # full rationale.  SPX/NDX/RUT options trade extended hours so
+        # ``gex_summary`` (and therefore ``max_pain``) is written around
+        # the clock, but the underlying tape only prints 09:30–16:00 ET;
+        # surfacing overnight max-pain buckets misaligns this chart with
+        # the RTH-only candlesticks and with the heatmap right edge.
+        # Neither CTE aliases gex_summary, so a single template suffices.
+        session_filter = ""
+        params: list = [symbol, window_units]
+        if is_cash_index(symbol):
+            session_filter = """
+                    AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
+                    AND (timestamp AT TIME ZONE 'America/New_York')::time
+                        BETWEEN TIME '09:30' AND TIME '16:00'
+                    AND (timestamp AT TIME ZONE 'America/New_York')::date <> ALL($3::date[])
+            """
+            params.append(sorted(NYSE_HOLIDAYS))
         query = f"""
             WITH latest AS (
                 SELECT timestamp AS max_ts
                 FROM gex_summary
-                WHERE underlying = $1
+                WHERE underlying = $1{session_filter}
                 ORDER BY timestamp DESC
                 LIMIT 1
             ),
@@ -2587,7 +2637,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) AS rn
                 FROM gex_summary
                 WHERE underlying = $1
-                    AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+                    AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds){session_filter}
             )
             SELECT bucket_ts AS timestamp, symbol, max_pain
             FROM ranked
@@ -2597,7 +2647,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         """
 
         async with self._acquire_connection() as conn:
-            rows = await conn.fetch(query, symbol, window_units)
+            rows = await conn.fetch(query, *params)
             return [dict(row) for row in rows]
 
     async def get_max_pain_current(
