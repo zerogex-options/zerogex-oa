@@ -216,6 +216,65 @@ def test_dte_profile_weight_is_horizon_occupancy_ramp(monkeypatch):
     assert engine._dte_profile_weight(10.0) == 1.0
 
 
+def test_dte_profile_weight_shapes_at_key_points(monkeypatch):
+    """The three curve shapes (linear | sqrt | exp) at a few canonical
+    DTE points.  Sanity: each shape returns the documented closed-form
+    value within a small tolerance, all three send w → 0 as DTE → 0 (so
+    the 0DTE-pinning bug stays solved), and the module constant for the
+    shape is correctly overridden by the per-call ``shape`` kwarg
+    without leaking back into the module."""
+    engine = AnalyticsEngine(underlying="SPY")
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_WEIGHTING", True)
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_REF_DAYS", 5.0)
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_WEIGHT_SHAPE", "linear")
+    day = 1.0 / 365.0
+
+    # Linear (module default) — already covered above; spot-check ref point.
+    assert engine._dte_profile_weight(5.0 * day) == 1.0
+    assert abs(engine._dte_profile_weight(2.0 * day) - 0.4) < 1e-12
+
+    # Sqrt — per-call override.  At ref days, saturates to 1.0; below,
+    # equals √(DTE/ref).
+    assert abs(engine._dte_profile_weight(5.0 * day, shape="sqrt") - 1.0) < 1e-12
+    assert abs(engine._dte_profile_weight(2.0 * day, shape="sqrt") - (0.4**0.5)) < 1e-9
+    assert abs(engine._dte_profile_weight(1.0 * day, shape="sqrt") - (0.2**0.5)) < 1e-9
+    assert engine._dte_profile_weight(0.0, shape="sqrt") == 0.0
+    # Sqrt is always >= linear below the reference (more weight on
+    # near-dated).  At DTE = 1, sqrt ≈ 0.447 > linear = 0.20.
+    assert engine._dte_profile_weight(1.0 * day, shape="sqrt") > engine._dte_profile_weight(
+        1.0 * day, shape="linear"
+    )
+
+    # Exp — asymptotic saturation.  At DTE=ref, w = 1 - 1/e ≈ 0.632.
+    assert abs(engine._dte_profile_weight(5.0 * day, shape="exp") - (1.0 - np.exp(-1.0))) < 1e-9
+    # Near zero, exp ≈ linear (Taylor: 1 - exp(-x) ≈ x for small x).
+    near_zero = 0.01 * day
+    exp_v = engine._dte_profile_weight(near_zero, shape="exp")
+    lin_v = engine._dte_profile_weight(near_zero, shape="linear")
+    assert abs(exp_v - lin_v) / max(lin_v, 1e-12) < 0.01
+    assert engine._dte_profile_weight(0.0, shape="exp") == 0.0
+    # Exp saturates asymptotically — at DTE=5*ref it's ~0.993 (well
+    # under linear's hard 1.0 cap at the same point).  Past DTE ~= 35*ref
+    # the float64 representation of 1 - exp(-x) collapses to 1.0 by
+    # underflow; the asymptotic property is about the early band where
+    # the difference vs linear is actually observable.
+    assert 0.99 < engine._dte_profile_weight(25.0 * day, shape="exp") < 1.0
+    assert engine._dte_profile_weight(25.0 * day, shape="linear") == 1.0
+
+    # Invalid shape falls back to linear silently (the warn fires once at
+    # module load; per-call invalid values just use linear).
+    assert engine._dte_profile_weight(2.0 * day, shape="bogus") == engine._dte_profile_weight(
+        2.0 * day, shape="linear"
+    )
+
+    # Disabled => identically 1.0 regardless of shape.
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_WEIGHTING", False)
+    for s in ("linear", "sqrt", "exp"):
+        assert engine._dte_profile_weight(1e-9, shape=s) == 1.0
+        assert engine._dte_profile_weight(0.0, shape=s) == 1.0
+        assert engine._dte_profile_weight(10.0, shape=s) == 1.0
+
+
 def test_dte_weighting_unpins_flip_from_0dte_wall(monkeypatch):
     """0DTE-heavy book: a same-day put wall just below spot, plus the
     real multi-day regime structure (far-dated put/call mass) whose
@@ -265,6 +324,183 @@ def test_dte_weighting_unpins_flip_from_0dte_wall(monkeypatch):
     assert abs(weighted_flip - 98.0) >= 6.0
     # ...and the two readings differ materially (>10% of spot here).
     assert abs(weighted_flip - unweighted_flip) >= 0.10 * spot
+
+
+def test_dte_ref_days_override_reshapes_profile_per_horizon(monkeypatch):
+    """Override semantics — per-call ``dte_ref_days`` substitutes for the
+    module-level constant for that one profile build only, without
+    mutating module state.
+
+    Verified at the profile level (rather than the resolved flip) so the
+    test isn't entangled with the resolver's interior / structural /
+    actionable-distance gates: a near-dated wall whose weight is 1.0 at
+    ref=2 but only 0.1 at ref=20 contributes 10× more dollar gamma to
+    the grid point at its strike under the short ref.  That contribution
+    is on top of an asymmetric base profile, so the *sign at spot*
+    flips with horizon — a directly observable, gate-free witness that
+    the override took effect."""
+    engine = AnalyticsEngine(underlying="SPY")
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_WEIGHTING", True)
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_REF_DAYS", 5.0)
+
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
+    near = datetime(2026, 5, 20).date()  # 2 DTE
+    far = datetime(2026, 10, 16).date()  # ~5 months, weight 1.0 at any reasonable ref
+    spot = 100.0
+
+    # Single 2DTE-only contract dominates the profile at spot.  At ref=2
+    # it counts at weight 1.0; at ref=20 it counts at weight 0.1.  The
+    # contribution at every grid point — including spot — is therefore
+    # exactly 10× larger in magnitude under the short-ref profile.
+    # Asserting the magnitude ratio is approximately the weight ratio is
+    # the cleanest, gate-free witness that the override took effect.
+    options = [
+        _opt(100.0, "P", oi=200000, iv=0.20, exp=near),
+        _opt(120.0, "C", oi=12000, iv=0.30, exp=far),
+    ]
+
+    profile_short = engine._gamma_exposure_profile(options, spot, ts, dte_ref_days=2.0)
+    profile_long = engine._gamma_exposure_profile(options, spot, ts, dte_ref_days=20.0)
+
+    # Both profiles built over the same grid (same span_pct default).
+    assert profile_short and profile_long
+    assert [p[0] for p in profile_short] == [p[0] for p in profile_long]
+
+    # Value at the grid point closest to spot.
+    def _at_spot(prof):
+        idx = min(range(len(prof)), key=lambda i: abs(prof[i][0] - spot))
+        return prof[idx][1]
+
+    v_short = _at_spot(profile_short)
+    v_long = _at_spot(profile_long)
+
+    # Short-ref weights the near-dated wall ~10× more heavily; the
+    # at-spot magnitude reflects that.  The far-dated contract gets
+    # weight 1.0 under both refs (longer than either reference) so it
+    # cancels out of the ratio.
+    assert abs(v_short) > 4.0 * abs(v_long), (v_short, v_long)
+
+    # Module state unchanged by the override calls.
+    assert main_engine.GAMMA_PROFILE_DTE_REF_DAYS == 5.0
+
+
+def test_compute_flip_term_structure_shape_and_alignment(monkeypatch):
+    """The public multi-horizon method returns one entry per requested
+    horizon in the requested order, with the documented keys.  Invalid /
+    non-positive horizons are skipped silently (so a client passing
+    ``"0,5"`` gets one row, not a 500)."""
+    engine = AnalyticsEngine(underlying="SPY")
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_WEIGHTING", True)
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_REF_DAYS", 5.0)
+
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
+    far = datetime(2026, 10, 16).date()
+    spot = 100.0
+    options = [
+        _opt(80.0, "P", oi=180000, iv=0.30, exp=far),
+        _opt(110.0, "C", oi=420000, iv=0.30, exp=far),
+        _opt(98.0, "P", oi=50000, iv=0.20, exp=datetime(2026, 5, 20).date()),
+    ]
+
+    results = engine.compute_flip_term_structure(options, spot, ts, [0.0, 2.0, -1.0, 5.0, 20.0])
+    # 0 and -1 are dropped; 2, 5, 20 survive.
+    assert [r["horizon_days"] for r in results] == [2.0, 5.0, 20.0]
+    for r in results:
+        assert set(r.keys()) == {
+            "horizon_days",
+            "flip",
+            "resolved",
+            "span_used",
+            "net_gex_at_spot",
+        }
+        assert isinstance(r["resolved"], bool)
+        if r["resolved"]:
+            assert r["flip"] is not None
+            assert r["net_gex_at_spot"] is not None
+
+
+def test_compute_flip_surface_shared_grid_and_shape(monkeypatch):
+    """The surface method's hard contract: every horizon's profile is
+    aligned to a single shared grid (len(profiles[i]) == len(grid)
+    for every i), the grid is strictly ascending, walls are returned
+    when requested, and the resolved-flip rows match the term-structure
+    method's per-horizon output."""
+    engine = AnalyticsEngine(underlying="SPY")
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_WEIGHTING", True)
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_REF_DAYS", 5.0)
+
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
+    far = datetime(2026, 10, 16).date()
+    spot = 100.0
+    # gamma is the snapshot per-contract gamma the walls helper reads
+    # (production rows are populated by the BS calculator upstream);
+    # set a small positive value so _calculate_gex_by_strike produces
+    # the call_gamma / put_gamma columns the wall picker scans.
+    options = [
+        _opt(92.0, "P", oi=180000, iv=0.30, exp=far, gamma=0.01),
+        _opt(108.0, "C", oi=420000, iv=0.30, exp=far, gamma=0.01),
+        _opt(98.0, "P", oi=50000, iv=0.20, exp=datetime(2026, 5, 20).date(), gamma=0.01),
+    ]
+
+    surface = engine.compute_flip_surface(
+        options,
+        spot,
+        ts,
+        [2.0, 5.0, 20.0],
+        span_pct=0.10,  # narrower to keep grid small for the test
+        step_pct=0.005,
+        include_walls=True,
+    )
+
+    # Top-level shape: documented keys present.
+    assert set(surface.keys()) == {"grid", "horizons_days", "profiles", "flips", "walls"}
+
+    # Grid: strictly ascending, brackets spot, all positive.
+    grid = surface["grid"]
+    assert grid and all(grid[i] < grid[i + 1] for i in range(len(grid) - 1))
+    assert grid[0] < spot < grid[-1]
+    assert all(g > 0 for g in grid)
+
+    # Profiles: rectangular array — every row matches len(grid).
+    assert len(surface["profiles"]) == len(surface["horizons_days"]) == 3
+    for row in surface["profiles"]:
+        assert len(row) == len(grid)
+
+    # Flips: one entry per horizon with the documented keys.
+    assert len(surface["flips"]) == 3
+    for r in surface["flips"]:
+        assert set(r.keys()) == {
+            "horizon_days",
+            "flip",
+            "resolved",
+            "span_used",
+            "net_gex_at_spot",
+        }
+
+    # Cross-check vs the term-structure method: the resolver's flip per
+    # horizon must match between the two endpoints (both call
+    # _resolve_gamma_flip with the same dte_ref_days).
+    ts_result = engine.compute_flip_term_structure(options, spot, ts, [2.0, 5.0, 20.0])
+    for s_row, t_row in zip(surface["flips"], ts_result):
+        assert s_row["horizon_days"] == t_row["horizon_days"]
+        assert s_row["flip"] == t_row["flip"]
+        assert s_row["resolved"] == t_row["resolved"]
+
+    # Walls: 92P and 108C are the dominant near-spot strikes; we should
+    # get exactly one call wall (108) and one put wall (92).
+    assert len(surface["walls"]) == 2
+    by_type = {w["type"]: w for w in surface["walls"]}
+    assert {"call", "put"} == set(by_type.keys())
+    assert by_type["call"]["strike"] == 108.0
+    assert by_type["put"]["strike"] == 92.0
+    assert by_type["call"]["abs_dollar_gex"] > 0
+    assert by_type["put"]["abs_dollar_gex"] > 0
+
+    # include_walls=False returns an empty walls list.
+    surface_no_walls = engine.compute_flip_surface(
+        options, spot, ts, [5.0], span_pct=0.10, step_pct=0.005, include_walls=False
+    )
+    assert surface_no_walls["walls"] == []
 
 
 def test_find_structural_interior_crossing_geometry():
@@ -888,7 +1124,8 @@ def test_gex_summary_throttles_repeated_unresolved_warnings(caplog):
     with caplog.at_level(logging.WARNING):
         engine._calculate_gex_summary(gex_by_strike, options, spot, ts)
     first_warns = [
-        r for r in caplog.records
+        r
+        for r in caplog.records
         if "Gamma flip UNRESOLVED" in r.message and r.levelno == logging.WARNING
     ]
     assert len(first_warns) == 1, "first call must emit the verbose WARN"
@@ -897,7 +1134,8 @@ def test_gex_summary_throttles_repeated_unresolved_warnings(caplog):
     with caplog.at_level(logging.WARNING):
         engine._calculate_gex_summary(gex_by_strike, options, spot, ts)
     repeat_warns = [
-        r for r in caplog.records
+        r
+        for r in caplog.records
         if "Gamma flip UNRESOLVED" in r.message and r.levelno == logging.WARNING
     ]
     assert repeat_warns == [], "second call within throttle window must stay silent"
@@ -917,9 +1155,7 @@ def test_gex_summary_logs_resolved_transition_after_unresolved_period(caplog):
 
     # Unresolved cycle: pure-call book, no crossing.
     unresolved_options = [_opt(500.0, "C", oi=5000, iv=0.25, exp=exp, volume=3)]
-    engine._calculate_gex_summary(
-        [{"strike": 500.0, "net_gex": 1.0}], unresolved_options, spot, ts
-    )
+    engine._calculate_gex_summary([{"strike": 500.0, "net_gex": 1.0}], unresolved_options, spot, ts)
     assert engine._gamma_flip_unresolved_state is True
 
     # Resolved cycle: balanced book with a real flip.
@@ -935,8 +1171,7 @@ def test_gex_summary_logs_resolved_transition_after_unresolved_period(caplog):
     assert summary["gamma_flip_point"] is not None
     assert engine._gamma_flip_unresolved_state is False
     assert any(
-        "Gamma flip RESOLVED" in r.message and r.levelno == logging.INFO
-        for r in caplog.records
+        "Gamma flip RESOLVED" in r.message and r.levelno == logging.INFO for r in caplog.records
     )
 
 

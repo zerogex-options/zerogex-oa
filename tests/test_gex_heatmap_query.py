@@ -12,9 +12,17 @@ History:
                at those ~window_units timestamps (the get_historical_gex
                pattern).  Cells are the bucket-close GEX surface, not a
                within-bucket average.
+  v4         — anchor the window's right edge on MAX(gex_summary.timestamp)
+               (with the cash-index session filter applied to the anchor
+               too) instead of MAX(underlying_quotes.timestamp).  Decouples
+               heatmap freshness from the TradeStation Stream Bars feed
+               so an underlying-quotes stall no longer freezes the chart
+               while analytics is still writing rows.  ``underlying_quotes``
+               remains the source of ``spot_close`` for the strike band.
 
-These tests pin v3 so a refactor can't regress to scanning the full
-window of gex_by_strike again.
+These tests pin v4 so a refactor can't regress to scanning the full
+window of gex_by_strike or re-coupling the chart to underlying_quotes
+freshness.
 """
 
 import asyncio
@@ -82,19 +90,65 @@ def test_heatmap_reads_gex_by_strike_only_at_representative_timestamps():
     assert "latest_price AS" not in sql
 
 
-def test_heatmap_keeps_strike_band_and_single_latest_quote_cte():
+def test_heatmap_anchor_is_gex_summary_not_underlying_quotes():
+    """v4 pin: the window's right edge (max_ts) is selected from
+    gex_summary, not underlying_quotes.  Anchoring on underlying_quotes
+    coupled chart freshness to the TradeStation Stream Bars feed — any
+    cause of stalled underlying writes (stream-cap eviction, single-
+    symbol bar-feed outages, vendor reset glitches) froze the heatmap
+    even while analytics kept writing gex_summary rows.
+
+    The spot price for the strike-band predicate is still sourced from
+    underlying_quotes (no GEX-side equivalent), but that's a far softer
+    dependency: a stale spot just sizes the band against the level the
+    analytics engine has also been computing against, so the band stays
+    centered on the heatmap data instead of going dark.
+    """
     db = DatabaseManager()
     conn = _RecordingConn(fetch_rows=[])
     _install_conn(db, conn)
     asyncio.run(db.get_gex_heatmap("SPY", "5min", 60))
     sql = conn.queries[0]
 
-    assert "latest_quote AS" in sql
-    # Strike band is proportional to spot for every underlying (the old
-    # fixed ±50 absolute band is gone).
+    # New CTE names.
+    assert "latest_summary AS" in sql
+    assert "spot AS" in sql
+    # The old underlying_quotes-rooted anchor is gone.
+    assert "latest_quote AS" not in sql
+
+    # max_ts comes out of gex_summary inside latest_summary.
+    anchor_cte = sql[sql.index("latest_summary AS") : sql.index("spot AS")]
+    assert "FROM gex_summary" in anchor_cte
+    assert "FROM underlying_quotes" not in anchor_cte
+
+    # spot_close (used by the strike-band predicate only) still comes
+    # from underlying_quotes inside its own CTE.
+    spot_cte = sql[sql.index("spot AS") : sql.index("time_window AS")]
+    assert "FROM underlying_quotes" in spot_cte
+    assert "close" in spot_cte
+    assert "FROM gex_summary" not in spot_cte
+
+    # The time window's end_time is the gex_summary-derived max_ts, never
+    # the underlying_quote timestamp.
+    tw = sql[sql.index("time_window AS") : sql.index("bucket_reps AS")]
+    assert "FROM latest_summary" in tw
+    assert "FROM latest_quote" not in tw
+
+
+def test_heatmap_keeps_strike_band_around_underlying_spot():
+    """The strike band stays anchored to underlying_quotes.close (via the
+    ``spot`` CTE) and remains proportional to that spot — the old fixed
+    ±50 absolute band is gone."""
+    db = DatabaseManager()
+    conn = _RecordingConn(fetch_rows=[])
+    _install_conn(db, conn)
+    asyncio.run(db.get_gex_heatmap("SPY", "5min", 60))
+    sql = conn.queries[0]
+
+    assert "spot AS" in sql
     assert (
-        "ABS(g.strike - (SELECT spot_close FROM latest_quote)) "
-        "<= (SELECT spot_close FROM latest_quote) * 0.08" in sql
+        "ABS(g.strike - (SELECT spot_close FROM spot)) "
+        "<= (SELECT spot_close FROM spot) * 0.08" in sql
     )
     assert "<= 50" not in sql
     # Newest-first, strike ascending — the documented row order.
@@ -114,8 +168,14 @@ def test_heatmap_surfaces_gamma_flip_from_its_own_buckets():
     asyncio.run(db.get_gex_heatmap("SPX", "5min", 60))
     sql = conn.queries[0]
 
-    # Pulled from the representative gex_summary snapshot in bucket_reps.
-    reps = sql[sql.index("bucket_reps AS") : sql.index("FROM gex_summary")]
+    # gamma_flip_point is pulled from the representative gex_summary
+    # snapshot selected inside bucket_reps.  (Since v4, gex_summary is
+    # also scanned earlier inside the latest_summary CTE — look for
+    # "FROM gex_summary" only AFTER the bucket_reps marker so the slice
+    # captures the right region.)
+    bucket_reps_idx = sql.index("bucket_reps AS")
+    reps_from_idx = sql.index("FROM gex_summary", bucket_reps_idx)
+    reps = sql[bucket_reps_idx:reps_from_idx]
     assert "gamma_flip_point AS gamma_flip" in reps
 
     # Emitted once per bucket (lowest strike), NULL on the other strikes.
@@ -183,9 +243,13 @@ def test_etf_heatmap_has_no_cash_session_filter():
 
 
 def test_cash_index_heatmap_restricts_to_regular_session():
-    """SPX (a cash index) must restrict the per-bucket representatives to
+    """SPX (a cash index) must restrict BOTH the window anchor
+    (latest_summary) AND the per-bucket representatives (bucket_reps) to
     the regular cash session so extended-hours / overnight buckets never
-    reach the heatmap. The NYSE-holiday list is bound as the 3rd param."""
+    reach the heatmap AND the chart's right edge lands on the most recent
+    RTH analytics row instead of whatever overnight cycle ran last.  The
+    NYSE-holiday list is bound as the 3rd param and the same predicate
+    fragment is interpolated into both CTEs."""
     captured = _run_and_capture("SPX")
     sql = captured["query"]
 
@@ -195,11 +259,24 @@ def test_cash_index_heatmap_restricts_to_regular_session():
     # NYSE holidays excluded via a bound date[] param.
     assert "<> ALL($3::date[])" in sql
 
-    # The session predicate is attached to the gex_summary scan (the
-    # per-bucket representative selection), not the gex_by_strike join.
-    summary_idx = sql.index("FROM gex_summary")
+    # The session predicate is attached to BOTH gex_summary scans — the
+    # window anchor in latest_summary AND the per-bucket representative
+    # selection in bucket_reps — but never to the gex_by_strike join.
     join_idx = sql.index("JOIN gex_by_strike g")
-    assert summary_idx < sql.index("EXTRACT(DOW") < join_idx
+    assert sql.count("EXTRACT(DOW") == 2
+    extract_positions = [
+        i
+        for i in range(len(sql))
+        if sql.startswith("EXTRACT(DOW", i)
+    ]
+    # Both EXTRACT(DOW occurrences precede the join, neither follows it.
+    assert all(idx < join_idx for idx in extract_positions)
+    # First occurrence is inside latest_summary; second is inside bucket_reps.
+    summary_anchor_idx = sql.index("FROM gex_summary")  # first one — latest_summary
+    bucket_reps_idx = sql.index("bucket_reps AS")
+    assert summary_anchor_idx < extract_positions[0] < bucket_reps_idx
+    bucket_reps_summary_idx = sql.index("FROM gex_summary", bucket_reps_idx)
+    assert bucket_reps_summary_idx < extract_positions[1] < join_idx
 
     # symbol, window_units, then the holiday list.
     assert captured["args"][0] == "SPX"
@@ -215,8 +292,8 @@ def test_strike_band_is_proportional_for_every_underlying():
     for sym in ("SPY", "QQQ", "SPX", "NDX", "AAPL"):
         sql = _run_and_capture(sym)["query"]
         assert (
-            "ABS(g.strike - (SELECT spot_close FROM latest_quote)) "
-            "<= (SELECT spot_close FROM latest_quote) * 0.08" in sql
+            "ABS(g.strike - (SELECT spot_close FROM spot)) "
+            "<= (SELECT spot_close FROM spot) * 0.08" in sql
         ), sym
         assert "<= 50" not in sql, sym
 
@@ -247,7 +324,7 @@ def test_strike_band_pct_is_config_driven():
     _install_conn(db, conn)
     asyncio.run(db.get_gex_heatmap("SPY", "5min", 60))
     sql = conn.queries[0]
-    assert "(SELECT spot_close FROM latest_quote) * 0.05" in sql
+    assert "(SELECT spot_close FROM spot) * 0.05" in sql
     assert "* 0.08" not in sql
 
 

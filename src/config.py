@@ -444,6 +444,39 @@ GAMMA_PROFILE_DTE_WEIGHTING = _getenv_bool("GAMMA_PROFILE_DTE_WEIGHTING", True)
 GAMMA_PROFILE_DTE_REF_DAYS = _getenv_float(
     "GAMMA_PROFILE_DTE_REF_DAYS", _FP["dte_ref_days"], min=0.5, max=60.0
 )
+# DTE weight curve shape.  All three shapes cancel the BS 1/√T near-expiry
+# gamma spike (linear and exp via w(T) → 0 as T → 0, sqrt via the constant
+# w(T)/√T limit), but redistribute weight across the near-dated bucket
+# differently.  Tunes how aggressively near-dated (< DTE_REF_DAYS) contracts
+# count in the spot-shift profile:
+#   * linear (default, preserves prior behavior): w = min(1, DTE/ref).
+#       Horizon-occupancy interpretation — the fraction of the reference
+#       horizon over which the contract still exists.  Hard saturation
+#       at DTE = ref.  Cleanest semantics, one knob.
+#   * sqrt:                                       w = sqrt(min(1, DTE/ref)).
+#       More aggressive on near-dated — 1DTE under sqrt at ref=2 is 0.71
+#       vs linear's 0.50.  Per-OI dollar gamma contribution is CONSTANT
+#       (≈ 1/√ref) for all DTE < ref (the 1/√T cancellation goes to a
+#       flat shelf instead of a √T ramp).  Hard saturation at DTE = ref.
+#   * exp:                                        w = 1 - exp(-DTE/ref).
+#       Smoothest curve — no corner at DTE=ref, asymptotic saturation
+#       (~0.63 at DTE=ref, ~0.95 at DTE=3*ref).  Same near-zero
+#       asymptotics as linear (both ~ T/ref near T=0).  Use when you want
+#       to avoid the sharp ON/OFF transition at the saturation point.
+# Invalid values fall back to "linear" with a WARN; the same env-var name
+# is the operator-facing knob.
+GAMMA_PROFILE_DTE_WEIGHT_SHAPE = (
+    os.getenv("GAMMA_PROFILE_DTE_WEIGHT_SHAPE", "linear").strip().lower()
+)
+if GAMMA_PROFILE_DTE_WEIGHT_SHAPE not in ("linear", "sqrt", "exp"):
+    import logging as _logging  # local to avoid disturbing module-load order
+
+    _logging.getLogger(__name__).warning(
+        "GAMMA_PROFILE_DTE_WEIGHT_SHAPE=%r is invalid; falling back to 'linear'. "
+        "Allowed: linear | sqrt | exp.",
+        GAMMA_PROFILE_DTE_WEIGHT_SHAPE,
+    )
+    GAMMA_PROFILE_DTE_WEIGHT_SHAPE = "linear"
 
 # Batch Sizes
 QUOTE_BATCH_SIZE = int(os.getenv("QUOTE_BATCH_SIZE", "100"))  # TradeStation supports up to 500
@@ -506,6 +539,54 @@ STRIKE_CLEANUP_INTERVAL = int(os.getenv("STRIKE_CLEANUP_INTERVAL", "100"))  # it
 SESSION_TEMPLATE = os.getenv("SESSION_TEMPLATE", "Default")
 TS_STREAM_READ_TIMEOUT = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
 TS_STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").lower() == "true"
+
+# Streaming quotes endpoint encodes the symbol list in the URL path. With
+# ~1000+ option contracts tracked, a single-connection URL exceeds ~25KB
+# and triggers a 414 Request-URI Too Large from TradeStation's gateway.
+# Split tracked symbols across multiple stream connections so each URL
+# stays well under that gateway limit.
+#
+# Sizing — two constraints, both per ingestion *account* (NOT per process):
+#
+#   1. URL length per stream (TradeStation gateway).
+#        url_bytes ≈ chunk_size × 25
+#        Hard ceiling: ~25KB triggers 414.  Aim ≤ ~20KB (chunk_size ≤ 800).
+#
+#   2. Concurrent stream count (TradeStation account cap, nominally 10).
+#        total_streams = N_underlyings × (1 + ceil(symbols_per_underlying / chunk_size))
+#        i.e. one underlying bar stream + one stream per option-symbol chunk,
+#        multiplied by the number of ingestion processes (one per underlying
+#        symbol — see ``main()`` in ``ingestion/main_engine.py``).
+#        A short-lived (<30s) connection is the only on-the-wire fingerprint
+#        of cap exhaustion — no 414, no 429 — and is surfaced by the
+#        cap-exhaustion WARNING in ``OptionStreamAccumulator._read_stream``
+#        and ``UnderlyingBarAccumulator._read_stream``.
+#
+# Worked examples at the 500-symbol default:
+#
+#     | symbols/underlying | chunks/process | 1 underlying | 3 underlyings |
+#     | ------------------ | -------------- | ------------ | ------------- |
+#     |              1,000 |              2 |   3 streams  |   9 streams   |
+#     |              2,000 |              4 |   5 streams  |  15 streams   |
+#     |              3,000 |              6 |   7 streams  |  21 streams   |
+#
+# A 3-underlying deployment with ≥ ~1500 symbols/underlying exceeds the
+# nominal cap; if the cap WARNING fires, drop ``INGEST_STRIKE_COUNT`` /
+# ``INGEST_EXPIRATIONS`` to shrink ``symbols_per_underlying``, or raise
+# this value (chunk_size ≤ 800 keeps URLs safely under 414).
+#
+# Historical context: ``bb4a78b`` introduced chunking with a 200-symbol
+# default sized for a single-underlying deployment (1100 symbols → 6
+# chunks → 7 streams, "within the 10-stream cap").  That sizing implicitly
+# assumed N_underlyings = 1; running three underlyings at 200/chunk
+# pushed the account to 15+ streams and the underlying bar stream was the
+# most frequent casualty (it started last in ``_start_accumulators`` so it
+# lost the race for the remaining slot first).  The 500 default + the
+# start-order / no-recalc-thrash fixes in ``adaa9bc`` keep a 3×2000
+# deployment functioning even though it formally over-subscribes.
+STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION = int(
+    os.getenv("STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION", "500")
+)
 
 # Underlying-stream data-staleness watchdog. The TradeStation bar stream
 # can stay socket-alive (heartbeats flowing) while delivering zero bars —
@@ -1417,6 +1498,7 @@ def get_all_config() -> Dict[str, Any]:
             "extended_hours_max_wait": EXTENDED_HOURS_POLL_INTERVAL,
             "closed_hours_max_wait": CLOSED_HOURS_POLL_INTERVAL,
             "stream_read_timeout": TS_STREAM_READ_TIMEOUT,
+            "quotes_max_symbols_per_connection": STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION,
             "option_oi_coverage_alert_threshold": OPTION_OI_COVERAGE_ALERT_THRESHOLD,
             "option_volume_coverage_alert_threshold": OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD,
             "option_volume_warmup_minutes": OPTION_VOLUME_WARMUP_MINUTES,
