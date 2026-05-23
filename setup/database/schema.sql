@@ -626,38 +626,21 @@ COMMENT ON COLUMN flow_by_contract.net_volume IS
 COMMENT ON COLUMN flow_by_contract.net_premium IS
     'Day-to-date cumulative SIGNED premium dollars (buys - sells) per contract through bucket_end. = SUM(flow_contract_facts.buy_premium - sell_premium) from session open. Resets at 09:30 ET.';
 
-CREATE TABLE IF NOT EXISTS flow_smart_money (
-    timestamp TIMESTAMPTZ NOT NULL,
-    symbol VARCHAR(10) NOT NULL,
-    option_symbol VARCHAR(50) NOT NULL,
-    strike NUMERIC(12, 4) NOT NULL,
-    expiration DATE NOT NULL,
-    option_type CHAR(1) NOT NULL CHECK (option_type IN ('C', 'P')),
-    total_volume BIGINT NOT NULL,
-    total_premium NUMERIC(18, 2) NOT NULL,
-    avg_iv NUMERIC(10, 6),
-    avg_delta NUMERIC(10, 6),
-    unusual_activity_score NUMERIC(5, 2),
-    underlying_price NUMERIC(12, 4),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (timestamp, symbol, option_symbol)
-);
-
--- WARNING: ``total_volume`` and ``total_premium`` on flow_smart_money are
--- MISNAMED. Despite the "total" prefix, both store a SINGLE-BUCKET LAG-
--- derived delta (see ``src/analytics/main_engine.py::_refresh_flow_caches``
--- around the LAG(oc.volume) computation with a 2-minute lookback window).
--- They are the per-row "this unusual-activity event size" magnitude, NOT
--- a session cumulative or window aggregate. Summing them across rows
--- over a time window IS approximately valid (each row represents a
--- 1-minute delta), but using ``total_premium`` alone as a directional
--- signal is INCORRECT -- it is gross (volume_delta * last * 100), not
--- signed. For canonical signed flow use
--- ``flow_contract_facts.buy_premium - sell_premium``.
-COMMENT ON COLUMN flow_smart_money.total_volume IS
-    'MISNAMED: single-bucket LAG-derived volume delta (1-minute lookback via option_chains LAG), NOT session-cumulative. Stored per unusual-activity event row. Use flow_contract_facts.volume_delta for the canonical per-bucket delta.';
-COMMENT ON COLUMN flow_smart_money.total_premium IS
-    'MISNAMED: single-bucket gross premium = total_volume * trade_price * 100, NOT session-cumulative. GROSS (no buy/sell sign). Use flow_contract_facts.buy_premium - sell_premium for canonical signed directional flow.';
+-- =============================================================================
+-- flow_smart_money: DECOMMISSIONED (see docs/architecture/volume-tracking-review.md
+-- section 4 item 3).  The table was a write-only artifact:
+--   * the canonical /api/flow/smart-money endpoint and `make flow-smart-money`
+--     CLI both read from flow_contract_facts directly,
+--   * the only in-repo reader (a fallback path in unified_signal_engine) was
+--     semantically broken (gross filtered notional, not signed net premium)
+--     and never observed firing in pg_stat_statements,
+--   * a dynamic audit (pg_stat_user_tables + pg_stat_statements) confirmed
+--     zero external readers before the drop.
+-- CASCADE drops the dependent index, FK constraint, and any legacy views
+-- (flow_smart_money_1min / _5min / _15min / _1hr / _1day,
+-- option_flow_smart_money) atomically.  Idempotent: subsequent
+-- schema-apply runs are no-ops because the table is already absent.
+DROP TABLE IF EXISTS flow_smart_money CASCADE;
 
 CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts
     ON flow_by_contract(symbol, timestamp DESC);
@@ -691,8 +674,6 @@ CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts_type
 CREATE INDEX IF NOT EXISTS idx_flow_by_contract_symbol_ts_series_covering
     ON flow_by_contract(symbol, timestamp DESC)
     INCLUDE (option_type, strike, expiration, raw_volume, net_volume, net_premium);
-CREATE INDEX IF NOT EXISTS idx_flow_smart_money_symbol_ts
-    ON flow_smart_money(symbol, timestamp DESC);
 
 -- Pre-aggregated /api/flow/series snapshot. One row per (symbol,
 -- bar_start) 5-minute bucket holding exactly what the get_flow_series
@@ -743,11 +724,6 @@ BEGIN
         ADD CONSTRAINT fk_flow_by_contract_symbol
         FOREIGN KEY (symbol) REFERENCES symbols(symbol) ON DELETE CASCADE;
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_flow_smart_money_symbol') THEN
-        ALTER TABLE flow_smart_money
-        ADD CONSTRAINT fk_flow_smart_money_symbol
-        FOREIGN KEY (symbol) REFERENCES symbols(symbol) ON DELETE CASCADE;
-    END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_flow_series_5min_symbol') THEN
         ALTER TABLE flow_series_5min
         ADD CONSTRAINT fk_flow_series_5min_symbol
@@ -777,14 +753,6 @@ DROP VIEW IF EXISTS flow_by_expiration_5min CASCADE;
 DROP VIEW IF EXISTS flow_by_expiration_15min CASCADE;
 DROP VIEW IF EXISTS flow_by_expiration_1hr CASCADE;
 DROP VIEW IF EXISTS flow_by_expiration_1day CASCADE;
-
-DROP VIEW IF EXISTS flow_smart_money_1min CASCADE;
-DROP VIEW IF EXISTS flow_smart_money_5min CASCADE;
-DROP VIEW IF EXISTS flow_smart_money_15min CASCADE;
-DROP VIEW IF EXISTS flow_smart_money_1hr CASCADE;
-DROP VIEW IF EXISTS flow_smart_money_1day CASCADE;
-
-DROP VIEW IF EXISTS option_flow_smart_money CASCADE;
 
 -- =============================================================================
 -- Flow buying pressure + technicals views (kept)
