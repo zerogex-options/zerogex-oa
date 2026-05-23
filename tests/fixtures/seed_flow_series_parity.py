@@ -165,6 +165,57 @@ def _underlying_close_for_bar(i: int) -> float:
     return UNDERLYING_CLOSES_ACTIVE[-1]
 
 
+def _assert_dsn_is_safe_to_truncate(dsn: str) -> str:
+    """Refuse to run against any database whose name doesn't *clearly*
+    signal it is a disposable test target.
+
+    The seed script's first action is a ``TRUNCATE ... CASCADE`` across
+    every analytics + flow + signals + signal_trades table.  Pointed at
+    a production database (e.g. AWS RDS), that obliterates live data
+    with no recovery short of the most recent backup.  Two layers of
+    defense:
+
+      1. ``parse_dsn`` (libpq's own DSN parser via psycopg2) extracts
+         the dbname.  If the dbname literally contains the substring
+         ``test``, proceed -- this matches the CI's ``zerogex_test``
+         and any sane local convention.
+      2. If the dbname doesn't contain ``test``, the operator MUST set
+         ``CI_PARITY_ALLOW_NON_TEST_DB=yes`` (an explicit, unambiguous
+         opt-in) AND the script will print the host + dbname before
+         touching anything so the destruction is observed.
+
+    Returns the resolved dbname (for logging).  Raises SystemExit on a
+    refusal so the caller sees a clear failure rather than a silent
+    partial run.
+    """
+    parsed = psycopg2.extensions.parse_dsn(dsn)
+    dbname = parsed.get("dbname", "")
+    host = parsed.get("host", "(default)")
+    print(f"  target host:   {host}")
+    print(f"  target dbname: {dbname}")
+    if "test" in dbname.lower():
+        return dbname
+    override = os.environ.get("CI_PARITY_ALLOW_NON_TEST_DB", "").lower()
+    if override == "yes":
+        print(
+            "  CI_PARITY_ALLOW_NON_TEST_DB=yes -- proceeding against a "
+            "database that does NOT have 'test' in its name.  This is "
+            "your explicit opt-in to destructive operations against the "
+            "above target.",
+            file=sys.stderr,
+        )
+        return dbname
+    print(
+        f"REFUSING TO RUN: dbname={dbname!r} does not contain 'test'.\n"
+        f"  The seed script TRUNCATEs the analytics + flow + signals\n"
+        f"  tables.  Refusing to do that to a non-test database.\n"
+        f"  If you ARE 100% sure this database is disposable, re-run\n"
+        f"  with CI_PARITY_ALLOW_NON_TEST_DB=yes.",
+        file=sys.stderr,
+    )
+    raise SystemExit(3)
+
+
 def _truncate(cur) -> None:
     # ``CASCADE`` because flow_by_contract / flow_series_5min FK to
     # symbols.  Order ensures the truncate doesn't fight the FK.
@@ -335,6 +386,11 @@ def _populate_flow_series_5min_incremental(cur) -> int:
 
 
 def seed(dsn: str) -> dict:
+    # Safety FIRST: refuse to TRUNCATE a non-test DB.  Runs before
+    # opening any cursor so the operator sees the host/dbname banner
+    # even on a refusal.
+    print("Flow-series parity seed:")
+    _assert_dsn_is_safe_to_truncate(dsn)
     conn = psycopg2.connect(dsn)
     try:
         with conn.cursor() as cur:
