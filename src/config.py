@@ -511,12 +511,18 @@ TS_STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").
 # ~1000+ option contracts tracked, a single-connection URL exceeds ~25KB
 # and triggers a 414 Request-URI Too Large from TradeStation's gateway.
 # Split tracked symbols across multiple stream connections so each URL
-# stays well under typical HTTP server limits (~8KB). 200 symbols/chunk
-# yields URLs of ~5KB and bounds the connection count well within the
-# 10-concurrent-stream cap (e.g. ~1100 symbols -> 6 chunks + 1 underlying
-# bar stream = 7 concurrent streams).
+# stays well under that gateway limit. At ~25 bytes/symbol, 500/chunk
+# yields URLs of ~12.5KB — comfortably under 25KB — and keeps the
+# concurrent-stream count low when multiple underlyings run side-by-side:
+# 3 ingestion processes × (1 underlying + 2 option chunks) = 9 streams,
+# fitting inside TradeStation's 10-stream-per-account cap. A smaller
+# default (200) produced 4 option chunks per process and pushed three
+# concurrent underlyings to 15 streams, silently exceeding the cap and
+# manifesting as "Response ended prematurely" disconnects with the
+# underlying bar stream the most frequent casualty (it starts last in
+# _start_accumulators so it loses the race for the remaining slot first).
 STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION = int(
-    os.getenv("STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION", "200")
+    os.getenv("STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION", "500")
 )
 
 # Underlying-stream data-staleness watchdog. The TradeStation bar stream

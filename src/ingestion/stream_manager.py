@@ -71,6 +71,15 @@ _STREAM_READ_TIMEOUT = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
 _DECODE_WARN_EVERY = int(os.getenv("TS_STREAM_DECODE_WARN_EVERY", "100"))
 _DECODE_MAX_PER_MINUTE = int(os.getenv("TS_STREAM_DECODE_MAX_PER_MINUTE", "50"))
 
+# A stream that connects (200 OK) and then ends within this many seconds
+# almost certainly hit the TradeStation per-account concurrent-stream cap
+# (~10): the gateway accepts the connection but the upstream throttler
+# closes it shortly after. There is no 414 / 429 to grep for — the only
+# fingerprint is the short lifetime. Reader loops emit a dedicated
+# cap-exhaustion WARNING when a connection ends inside this window so
+# the symptom is named instead of looking like a generic disconnect.
+_STREAM_CAP_SUSPECT_SECONDS = int(os.getenv("TS_STREAM_CAP_SUSPECT_SECONDS", "30"))
+
 # Possible field names for implied volatility across TradeStation payload variants
 _IV_FIELD_NAMES = ("ImpliedVolatility", "IV", "Volatility", "IVol")
 
@@ -379,6 +388,15 @@ class OptionStreamAccumulator:
             response.close()
             raise
 
+        # Track how long the stream stays open. TradeStation enforces a
+        # per-account concurrent-stream cap (~10) by silently closing
+        # accepted-then-terminated connections — no 414, no 429, just an
+        # iter_lines() that ends seconds after it began. A short lifetime
+        # is the strongest fingerprint we have of cap exhaustion; warn
+        # loudly when we see it so it isn't lost in the generic
+        # "disconnected (Response ended prematurely)" noise.
+        connection_open_mono = time.monotonic()
+
         with self._response_lock:
             self._current_responses[chunk_idx] = response
 
@@ -429,6 +447,22 @@ class OptionStreamAccumulator:
             with self._response_lock:
                 self._current_responses[chunk_idx] = None
             response.close()
+            elapsed = time.monotonic() - connection_open_mono
+            # Only warn while we're still meant to be running: a quick exit
+            # caused by stop() / shutdown is not cap exhaustion.
+            if self._running and elapsed < _STREAM_CAP_SUSPECT_SECONDS:
+                logger.warning(
+                    "%s ended after only %.1fs (under %ds). Likely cause: "
+                    "TradeStation per-account concurrent-stream cap (~10) "
+                    "exhausted. Total streams in this process: 1 underlying "
+                    "+ %d option chunks. With N ingestion processes the "
+                    "account total is N × (1 + chunks). Reduce chunk count "
+                    "by raising STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION.",
+                    label,
+                    elapsed,
+                    _STREAM_CAP_SUSPECT_SECONDS,
+                    len(self._chunks),
+                )
 
     def _merge_single_quote(self, q: dict):
         """Merge one raw quote into accumulated state.
@@ -645,6 +679,13 @@ class UnderlyingBarAccumulator:
 
         logger.debug("Underlying bar stream: connected (HTTP %s)", response.status_code)
 
+        # See _STREAM_CAP_SUSPECT_SECONDS — a connection that ends well
+        # inside its read timeout is almost certainly being closed by
+        # TradeStation's per-account concurrent-stream cap rather than a
+        # network hiccup. Track open time so the finally block can emit a
+        # dedicated cap-exhaustion warning that names the symptom.
+        connection_open_mono = time.monotonic()
+
         with self._response_lock:
             self._current_response = response
 
@@ -725,6 +766,23 @@ class UnderlyingBarAccumulator:
             with self._response_lock:
                 self._current_response = None
             response.close()
+            elapsed = time.monotonic() - connection_open_mono
+            # Only warn while we're still meant to be running: a quick exit
+            # caused by stop() / shutdown is not cap exhaustion.
+            if self._running and elapsed < _STREAM_CAP_SUSPECT_SECONDS:
+                logger.warning(
+                    "Underlying bar stream for %s ended after only %.1fs "
+                    "(under %ds). Likely cause: TradeStation per-account "
+                    "concurrent-stream cap (~10) exhausted by option "
+                    "chunks. The heatmap query is anchored on "
+                    "MAX(underlying_quotes.timestamp), so an evicted "
+                    "underlying feed freezes the chart even while options "
+                    "are still flowing. Reduce option chunk count by "
+                    "raising STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION.",
+                    self._symbol,
+                    elapsed,
+                    _STREAM_CAP_SUSPECT_SECONDS,
+                )
 
     def _merge_bar(self, bar: dict):
         """Merge one raw bar into accumulated state with carry-forward."""
@@ -1205,30 +1263,55 @@ class StreamManager:
 
         return True
 
-    def _start_accumulators(self, seed_option_rest: bool = True):
-        """Start (or restart) background stream readers for options and underlying."""
-        # Stop existing accumulators if any.
+    def _start_accumulators(
+        self,
+        seed_option_rest: bool = True,
+        restart_underlying: bool = True,
+    ):
+        """Start (or restart) background stream readers for options and underlying.
+
+        ``restart_underlying=False`` leaves the live underlying bar stream
+        untouched and only cycles the option accumulator. Callers that swap
+        the option symbol set (expiration refresh, strike recalibration)
+        should pass False — the underlying symbol is fixed for this engine's
+        lifetime, the bar stream is independent of the option chunks, and
+        needlessly tearing it down forces it to re-race the option streams
+        for a TradeStation stream slot every minute. Under cap pressure
+        that race is exactly how the underlying feed loses its slot and
+        the heatmap freezes.
+        """
+        # Stop existing option accumulator (always — its symbol set may have
+        # changed) and the underlying only when explicitly asked to.
         if self._accumulator is not None:
             self._accumulator.stop()
-        if self._underlying_accumulator is not None:
+        if restart_underlying and self._underlying_accumulator is not None:
             self._underlying_accumulator.stop()
 
         self._wakeup.clear()
+
+        # Open the underlying bar stream FIRST so it claims its TradeStation
+        # stream slot before the option chunks consume the remaining budget.
+        # The bar stream is the data source the GEX heatmap is anchored on
+        # (latest underlying_quotes.timestamp drives the query window), so
+        # losing its slot freezes every downstream chart even when options
+        # are still flowing. Option chunks degrading gracefully under cap
+        # pressure is far less harmful than the underlying feed going dark.
+        if restart_underlying or self._underlying_accumulator is None:
+            self._underlying_accumulator = UnderlyingBarAccumulator(
+                client=self.client,
+                symbol=self.underlying,
+                db_symbol=self.db_underlying,
+                session_template=SESSION_TEMPLATE,
+                wakeup=self._wakeup,
+            )
+            self._underlying_accumulator.start()
 
         self._accumulator = OptionStreamAccumulator(
             client=self.client,
             symbols=self.tracked_option_symbols,
             wakeup=self._wakeup,
         )
-        self._underlying_accumulator = UnderlyingBarAccumulator(
-            client=self.client,
-            symbol=self.underlying,
-            db_symbol=self.db_underlying,
-            session_template=SESSION_TEMPLATE,
-            wakeup=self._wakeup,
-        )
         self._accumulator.start(seed_from_rest=seed_option_rest)
-        self._underlying_accumulator.start()
 
     def request_stop(self):
         """Ask :meth:`stream` to exit at its next checkpoint.
@@ -1459,7 +1542,10 @@ class StreamManager:
                         # before swapping accumulators — symbols dropped by
                         # the refreshed expiration set never tick again.
                         yield {"type": "flush_options", "reason": "expiration_refresh"}
-                        self._start_accumulators()
+                        # Underlying symbol is unchanged; leave its bar
+                        # stream untouched so it doesn't have to re-race
+                        # the option chunks for a TradeStation stream slot.
+                        self._start_accumulators(restart_underlying=False)
                     else:
                         logger.warning(
                             "⚠️  Expiration refresh failed, continuing " "with current expirations"
@@ -1709,7 +1795,14 @@ class StreamManager:
                                 # last partial bucket's classified flow is
                                 # otherwise lost.
                                 yield {"type": "flush_options", "reason": "strike_recalc"}
-                                self._start_accumulators(seed_option_rest=self.seed_rest_on_recalc)
+                                # Underlying symbol is unchanged; leave its
+                                # bar stream untouched on every recalc so
+                                # it doesn't have to re-race the option
+                                # chunks for a TradeStation stream slot.
+                                self._start_accumulators(
+                                    seed_option_rest=self.seed_rest_on_recalc,
+                                    restart_underlying=False,
+                                )
                                 logger.info(
                                     f"Recalibrated strikes around "
                                     f"${self.current_price:.2f} "
