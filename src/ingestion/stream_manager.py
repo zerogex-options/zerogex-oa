@@ -282,7 +282,8 @@ class OptionStreamAccumulator:
             if t.is_alive():
                 logger.warning(
                     "Option stream reader thread %s did not exit within 10s after stop(); "
-                    "abandoning reference (thread will continue consuming memory until it unblocks)",
+                    "abandoning reference (thread will continue consuming memory until it "
+                    "unblocks)",
                     t.name,
                 )
         self._threads = []
