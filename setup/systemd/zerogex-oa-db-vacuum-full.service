@@ -9,11 +9,21 @@ User=root
 Group=root
 WorkingDirectory=/home/ubuntu/zerogex-oa
 
+# Running as root so the `sudo systemctl stop/start` calls inside
+# `db-maintain-managed` are no-ops.  But systemd would otherwise set
+# HOME=/root, which breaks the Makefile's `PSQL = PGPASSFILE=~/.pgpass
+# psql ...` — the .pgpass file lives in the deploy user's home, not
+# root's, so psql would fall through to a password prompt and exit
+# non-zero on the first prune.  Pin HOME (and load .env / PATH) the
+# same way the daily zerogex-oa-db-maintain unit does.
+Environment="HOME=/home/ubuntu"
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
 # `db-maintain-managed` stops the four zerogex services, runs
 # `make db-maintain` (prune + VACUUM FULL + REINDEX + ANALYZE), and
 # restarts services on exit (via shell trap, so services come back up
-# even if maintenance fails halfway through).  Running as root makes
-# the `sudo` calls inside the recipe no-ops.
+# even if maintenance fails halfway through).
 ExecStart=/usr/bin/make db-maintain-managed
 
 # VACUUM FULL on a 20+ GB table can take a while.  Allow up to 90 min
