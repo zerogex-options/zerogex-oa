@@ -2792,6 +2792,24 @@ flow-series-parity: ## Diff flow_series_5min vs the live CTE (auto-uses DB_* fro
 		FLOW_SERIES_PARITY_SESSION="$(FLOW_SERIES_PARITY_SESSION)" \
 		$(PY) -m pytest tests/test_flow_series_parity.py -m integration --no-cov -q
 
+.PHONY: ci-parity
+ci-parity: ## End-to-end flow-series parity: apply schema, seed deterministic fixture via incremental writer, run parity test against canonical CTE oracle. Defaults to localhost test DB; override CI_PARITY_DSN=postgres://...
+	@DSN="$${CI_PARITY_DSN:-postgresql://zerogex_test:test@localhost:5432/zerogex_test}"; \
+	echo "$(BLUE)=== Flow Series Parity (CI-style end-to-end) ===$(NC)"; \
+	echo "$(YELLOW)DSN: $$DSN$(NC)"; \
+	echo "$(YELLOW)Step 1/3: apply schema$(NC)"; \
+	psql "$$DSN" -v ON_ERROR_STOP=1 -q -f setup/database/schema.sql > /tmp/ci_parity_schema.log 2>&1 || \
+		{ echo "$(RED)schema apply FAILED -- last 30 lines:$(NC)"; tail -30 /tmp/ci_parity_schema.log; exit 1; }; \
+	echo "$(GREEN)  schema applied (notices in /tmp/ci_parity_schema.log)$(NC)"; \
+	echo "$(YELLOW)Step 2/3: seed fixture (incremental writer drives flow_series_5min)$(NC)"; \
+	FLOW_SERIES_PARITY_DSN="$$DSN" $(PY) -m tests.fixtures.seed_flow_series_parity || exit 1; \
+	echo "$(YELLOW)Step 3/3: run parity test (canonical CTE oracle)$(NC)"; \
+	FLOW_SERIES_PARITY_DSN="$$DSN" \
+		FLOW_SERIES_PARITY_SYMBOL=SPY \
+		FLOW_SERIES_PARITY_SESSION=prior \
+		$(PY) -m pytest tests/test_flow_series_parity.py -m integration --no-cov -q -o "addopts=" || exit 1; \
+	echo "$(GREEN)✅ ci-parity passed$(NC)"
+
 # =============================================================================
 # Maintenance
 # =============================================================================

@@ -77,3 +77,67 @@ jobs:
           name: coverage-xml
           path: coverage.xml
           if-no-files-found: ignore
+
+  parity:
+    # Flow-series parity: spin up Postgres 17 (matches prod), apply
+    # schema.sql, seed flow_by_contract via the INCREMENTAL upsert
+    # form, then run the parity test that re-derives the same window
+    # via the CANONICAL CTE.  Catches drift between the two
+    # formulations that the structural-only tests at
+    # tests/test_flow_series_incremental_upsert.py can't see.
+    #
+    # Advisory for the first week (continue-on-error) to catch any
+    # fixture flakiness before this becomes a merge gate.  Drop the
+    # continue-on-error in a follow-up once the job has been green
+    # for several consecutive pushes.
+    name: Flow-series parity (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: zerogex_test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: zerogex_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zerogex_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CI_PARITY_DSN: postgresql://zerogex_test:test@localhost:5432/zerogex_test
+      PGPASSWORD: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package + dev extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,metrics,greeks,api]"
+
+      - name: Install psql client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client
+
+      - name: Wait for Postgres
+        run: |
+          for i in $(seq 1 20); do
+            pg_isready -h localhost -p 5432 -U zerogex_test && break
+            echo "Waiting for postgres... ($i/20)"
+            sleep 2
+          done
+
+      - name: Run end-to-end parity (schema + seed + test)
+        run: PY=python make ci-parity
