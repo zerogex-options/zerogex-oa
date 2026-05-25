@@ -1442,7 +1442,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         cache_key = f"gex_profile:{symbol}"
         cached = self._cache_get(cache_key)
         if cached is not None:
-            return cached
+            return cached  # type: ignore[no-any-return]
 
         query = """
             SELECT

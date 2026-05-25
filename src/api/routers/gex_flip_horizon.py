@@ -99,6 +99,13 @@ class FlipTermStructureResponse(BaseModel):
 def get_db() -> DatabaseManager:
     from ..main import db_manager
 
+    if db_manager is None:
+        from fastapi import HTTPException, status
+
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database not initialized",
+        )
     return db_manager
 
 
@@ -164,7 +171,7 @@ def _cache_get(key: tuple) -> Optional[dict]:
     with _RESPONSE_CACHE_LOCK:
         entry = _RESPONSE_CACHE.get(key)
         if entry and now - entry["ts"] < _RESPONSE_CACHE_TTL_SECONDS:
-            return entry["data"]
+            return entry["data"]  # type: ignore[no-any-return]
         if entry is not None:
             _RESPONSE_CACHE.pop(key, None)
     return None

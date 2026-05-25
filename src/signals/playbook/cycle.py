@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 from typing import Any, Iterable, Optional
 
 from src.signals.components.base import MarketContext
@@ -128,7 +129,9 @@ def _extract_levels(
     return levels
 
 
-def _load_recently_emitted_sync(conn, underlying: str, window_minutes: int = 60) -> dict[str, "datetime"]:
+def _load_recently_emitted_sync(
+    conn, underlying: str, window_minutes: int = 60
+) -> dict[str, datetime]:
     """Return ``{pattern_id: last_emit_ts}`` for cards in the recent window.
 
     Mirrors the async ``get_recent_action_cards`` query so the sync cycle

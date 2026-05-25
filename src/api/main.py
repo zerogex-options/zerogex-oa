@@ -330,7 +330,7 @@ async def get_gex_profile(symbol: str = Query(default="SPY")):
     the per-strike chart; the same dataset that drives the headline
     flip / net-at-spot figures already in /api/gex/summary.
     """
-    data = await db_manager.get_latest_gex_profile(symbol)
+    data = await _db().get_latest_gex_profile(symbol)
     if not data:
         raise HTTPException(status_code=404, detail="No GEX profile data available")
     return GEXProfile(**data)

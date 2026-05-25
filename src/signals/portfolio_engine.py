@@ -623,9 +623,7 @@ class PortfolioEngine:
                     self.max_heat_pct * 100,
                 )
                 contracts = capped_contracts
-                target_heat = (
-                    abs(entry_price) * contracts * 100 / max(SIGNALS_PORTFOLIO_SIZE, 1.0)
-                )
+                target_heat = abs(entry_price) * contracts * 100 / max(SIGNALS_PORTFOLIO_SIZE, 1.0)
 
         tp = TargetPosition(
             direction=trade_direction,
@@ -1905,9 +1903,7 @@ class PortfolioEngine:
             entry = abs(float(t.get("entry_price") or 0.0))
             components = t.get("components_at_entry") or {}
             risk = components.get("risk") if isinstance(components, dict) else None
-            pricing_mode = (
-                (risk.get("pricing_mode") if isinstance(risk, dict) else None) or "debit"
-            )
+            pricing_mode = (risk.get("pricing_mode") if isinstance(risk, dict) else None) or "debit"
             if pricing_mode == "credit":
                 # Credit: at-risk = max_loss (per contract). When unknown,
                 # fall back to entry × qty × 100 (the premium collected,

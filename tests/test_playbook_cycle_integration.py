@@ -229,7 +229,9 @@ def test_insert_action_card_sync_swallows_db_errors():
 
 
 def _inserts_into_action_cards(conn) -> list:
-    return [(sql, params) for sql, params in conn.executions if "INSERT INTO signal_action_cards" in sql]
+    return [
+        (sql, params) for sql, params in conn.executions if "INSERT INTO signal_action_cards" in sql
+    ]
 
 
 def test_evaluate_and_persist_writes_trade_card():

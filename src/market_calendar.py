@@ -87,8 +87,7 @@ NYSE_HOLIDAYS: set[date] = load_nyse_holidays()
 # expiring contracts decay gracefully out of the metrics rather than
 # spiking. ``ANALYTICS_MIN_TTE_MINUTES`` env override available for
 # operators who want the prior 1-minute behavior.
-import os as _os
-_MIN_TTE_MINUTES = max(0.5, float(_os.getenv("ANALYTICS_MIN_TTE_MINUTES", "30")))
+_MIN_TTE_MINUTES = max(0.5, float(os.getenv("ANALYTICS_MIN_TTE_MINUTES", "30")))
 _MIN_YEARS_TO_EXPIRATION = _MIN_TTE_MINUTES / (60.0 * 24.0 * 365.0)
 
 

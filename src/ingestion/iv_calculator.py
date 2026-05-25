@@ -318,9 +318,7 @@ class IVCalculator:
                     self._iv_clamp_floor_solves += 1
                 sigma = self.min_iv
                 if prev_at_floor:
-                    logger.debug(
-                        f"IV solver saturated at floor {self.min_iv:.4f}; returning bound"
-                    )
+                    logger.debug(f"IV solver saturated at floor {self.min_iv:.4f}; returning bound")
                     return sigma
             elif sigma > self.max_iv:
                 if not solve_hit_ceiling:
