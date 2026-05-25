@@ -311,10 +311,9 @@ def test_vol_tension_degrades_without_iv_rank():
 def test_full_bullish_loaded_aligned_inputs():
     """All four pillars line up bullish: tight walls + flip at spot,
     positive vanna+charm, call-flow heavy, dealers short, vol cheap+squeezed."""
-    closes = (
-        [600.0 + (1.0 if i % 2 else -1.0) for i in range(50)]
-        + [600.0 + (0.02 if i % 2 else -0.02) for i in range(10)]
-    )
+    closes = [600.0 + (1.0 if i % 2 else -1.0) for i in range(50)] + [
+        600.0 + (0.02 if i % 2 else -0.02) for i in range(10)
+    ]
     ctx = _ctx(
         close=600.0,
         gamma_flip=600.0,
@@ -343,10 +342,9 @@ def test_full_bullish_loaded_aligned_inputs():
 
 
 def test_full_bearish_loaded_aligned_inputs():
-    closes = (
-        [600.0 + (1.0 if i % 2 else -1.0) for i in range(50)]
-        + [600.0 + (0.02 if i % 2 else -0.02) for i in range(10)]
-    )
+    closes = [600.0 + (1.0 if i % 2 else -1.0) for i in range(50)] + [
+        600.0 + (0.02 if i % 2 else -0.02) for i in range(10)
+    ]
     ctx = _ctx(
         close=600.0,
         gamma_flip=600.0,
@@ -440,10 +438,9 @@ def test_label_progression_with_loading():
 def test_triggered_requires_both_loading_and_direction():
     signal = MarketPressureSignal()
     # Lots of loading but no direction (neutral pivot) → not triggered.
-    closes = (
-        [600.0 + (1.0 if i % 2 else -1.0) for i in range(50)]
-        + [600.0 + (0.02 if i % 2 else -0.02) for i in range(10)]
-    )
+    closes = [600.0 + (1.0 if i % 2 else -1.0) for i in range(50)] + [
+        600.0 + (0.02 if i % 2 else -0.02) for i in range(10)
+    ]
     ctx = _ctx(
         close=600.0,
         gamma_flip=600.0,

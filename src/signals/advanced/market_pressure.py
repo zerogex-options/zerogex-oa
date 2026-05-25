@@ -82,7 +82,6 @@ from src.signals.advanced.base import (
     flow_flux_norm,
 )
 
-
 # ---------------------------------------------------------------------------
 # Tunables (env-overridable so production can recalibrate without a deploy)
 # ---------------------------------------------------------------------------
@@ -194,14 +193,8 @@ class MarketPressureSignal:
         # Direction — weighted sum of three signed inputs.  F is gated by
         # its own magnitude so direction without volume contributes
         # nothing.  Dealer signed is in [-1, 1] via tanh-saturated DNI.
-        flow_signed_effective = (
-            flow["signed"] if flow["magnitude"] >= _FLOW_DIR_GATE else 0.0
-        )
-        dir_raw = (
-            _W_H * hedging["signed"]
-            + _W_F * flow_signed_effective
-            + _W_D * dealer["signed"]
-        )
+        flow_signed_effective = flow["signed"] if flow["magnitude"] >= _FLOW_DIR_GATE else 0.0
+        dir_raw = _W_H * hedging["signed"] + _W_F * flow_signed_effective + _W_D * dealer["signed"]
 
         confidence_mult = self._confidence(
             dir_raw,
@@ -214,11 +207,7 @@ class MarketPressureSignal:
         # √|direction| shape keeps moderate biases meaningful while
         # still grading smoothly through zero; (loading/100) scales by
         # the multiplicative magnitude.
-        score = (
-            (1.0 if direction >= 0 else -1.0)
-            * math.sqrt(abs(direction))
-            * (loading / 100.0)
-        )
+        score = (1.0 if direction >= 0 else -1.0) * math.sqrt(abs(direction)) * (loading / 100.0)
         score = max(-1.0, min(1.0, score))
 
         label, playbook = self._label_and_playbook(loading, direction)
@@ -231,11 +220,7 @@ class MarketPressureSignal:
                 "loading": round(loading, 2),
                 "direction": round(direction, 4),
                 "direction_sign": (
-                    "bullish"
-                    if direction > 1e-6
-                    else "bearish"
-                    if direction < -1e-6
-                    else "neutral"
+                    "bullish" if direction > 1e-6 else "bearish" if direction < -1e-6 else "neutral"
                 ),
                 "label": label,
                 "playbook": playbook,
@@ -637,13 +622,7 @@ class MarketPressureSignal:
                 "Pressure accumulating but not yet actionable. Tighten stops on "
                 "counter-pressure trades; prepare directional templates.",
             )
-        side = (
-            "upside"
-            if direction > 1e-6
-            else "downside"
-            if direction < -1e-6
-            else "either side"
-        )
+        side = "upside" if direction > 1e-6 else "downside" if direction < -1e-6 else "either side"
         if loading < _LABEL_CRITICAL_MIN:
             return (
                 "Loaded",

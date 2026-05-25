@@ -109,9 +109,7 @@ def test_market_pressure_endpoint_surfaces_loaded_context(monkeypatch):
     assert body["direction_value"] == 0.91
     # Full sub-component context still available under context_values.
     ctx = body["context_values"]
-    assert set(ctx).issuperset(
-        {"compression", "hedging", "flow", "tension", "dealer", "weights"}
-    )
+    assert set(ctx).issuperset({"compression", "hedging", "flow", "tension", "dealer", "weights"})
     # Score history passes through unmodified.
     assert isinstance(body["score_history"], list)
     assert len(body["score_history"]) == 2
