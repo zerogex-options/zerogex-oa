@@ -121,7 +121,8 @@ def _stub_stream_manager_for_idle_loop(monkeypatch, session: str):
     mgr.target_expirations = [date.today()]
     mgr.last_expiration_refresh = datetime.now(ET)
     mgr.current_price = 100.0
-    mgr.num_strikes = 1
+    mgr.strike_count_max = 2
+    mgr.strike_pct_range = 3.0
     mgr._accumulator = _FakeOptionAcc()
     mgr._underlying_accumulator = _FakeUnderlyingAcc()
     mgr.option_oi_coverage_alert_threshold = 0.35

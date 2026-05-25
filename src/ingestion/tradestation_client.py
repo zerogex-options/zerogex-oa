@@ -232,7 +232,8 @@ class TradeStationClient:
                     if error_data.get("Message", "").lower() == "quota exceeded":
                         logger.error(
                             "TradeStation API quota exceeded (403). Your account has hit its daily "
-                            "API call limit. Reduce INGEST_STRIKE_COUNT (e.g. 5) or INGEST_EXPIRATIONS "
+                            "API call limit. Reduce INGEST_STRIKE_COUNT_MAX (e.g. 20), narrow "
+                            "INGEST_STRIKE_PCT_RANGE (e.g. 1.5), or lower INGEST_EXPIRATIONS "
                             "to lower call volume. Quota resets daily."
                         )
                         response.raise_for_status()
