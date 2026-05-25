@@ -1595,6 +1595,15 @@ CREATE TABLE IF NOT EXISTS component_normalizer_cache (
     PRIMARY KEY (underlying, field_name)
 );
 
+-- Cleanup: remove dead normalizer rows for smart_money fields.  The
+-- smart_money_volume_delta / smart_money_premium tier calibration that
+-- consumed these rows was removed when flow_smart_money was
+-- decommissioned (commit b67ff67) and the corresponding FieldSpec
+-- entries in src/tools/normalizer_cache_refresh.py have been deleted.
+-- Idempotent on subsequent runs (DELETE of zero rows is a no-op).
+DELETE FROM component_normalizer_cache
+ WHERE field_name IN ('smart_money_volume_delta', 'smart_money_premium');
+
 -- =============================================================================
 -- Max-pain daily OI snapshot (derived cache)
 -- =============================================================================
