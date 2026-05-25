@@ -86,14 +86,14 @@ jobs:
     # formulations that the structural-only tests at
     # tests/test_flow_series_incremental_upsert.py can't see.
     #
-    # Advisory for the first week (continue-on-error) to catch any
-    # fixture flakiness before this becomes a merge gate.  Drop the
-    # continue-on-error in a follow-up once the job has been green
-    # for several consecutive pushes.
-    name: Flow-series parity (advisory)
+    # Promoted from advisory to blocking after several consecutive
+    # green runs on claude/** branches verified the fixture is
+    # stable.  Failing this job now fails CI -- restore
+    # continue-on-error only if a drift in the canonical CTE makes
+    # the fixture unrunnable while a fix is in flight.
+    name: Flow-series parity
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    continue-on-error: true
     services:
       postgres:
         image: postgres:17
