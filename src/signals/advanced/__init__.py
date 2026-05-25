@@ -19,6 +19,11 @@ from src.signals.advanced.gamma_vwap_confluence import (
 from src.signals.advanced.vol_expansion import VolExpansionSignal
 from src.signals.advanced.eod_pressure import EODPressureSignal, EodPressureSignal
 from src.signals.advanced.range_break_imminence import RangeBreakImminenceSignal
+from src.signals.advanced.market_pressure import (
+    MarketPressureComponent,
+    MarketPressureIndexSignal,
+    MarketPressureSignal,
+)
 
 __all__ = [
     "AdvancedSignalResult",
@@ -33,4 +38,7 @@ __all__ = [
     "EODPressureSignal",
     "EodPressureSignal",
     "RangeBreakImminenceSignal",
+    "MarketPressureSignal",
+    "MarketPressureComponent",
+    "MarketPressureIndexSignal",
 ]
