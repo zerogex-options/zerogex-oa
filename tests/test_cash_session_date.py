@@ -30,9 +30,9 @@ def test_cash_session_date_rth_returns_calendar_date():
     date.  Sample several intra-RTH points to be sure."""
     for hour, minute in [(9, 30), (10, 15), (12, 0), (15, 59), (16, 0), (19, 0), (23, 59)]:
         ts = _ET.localize(datetime(2025, 4, 15, hour, minute))
-        assert cash_session_date(ts) == date(2025, 4, 15), (
-            f"{hour:02d}:{minute:02d} ET on 2025-04-15 should be session 2025-04-15"
-        )
+        assert cash_session_date(ts) == date(
+            2025, 4, 15
+        ), f"{hour:02d}:{minute:02d} ET on 2025-04-15 should be session 2025-04-15"
 
 
 def test_cash_session_date_pre_cash_returns_prior_calendar_date():
@@ -41,9 +41,9 @@ def test_cash_session_date_pre_cash_returns_prior_calendar_date():
     tail, before the vendor-side cumulative reset)."""
     for hour, minute in [(0, 0), (4, 0), (8, 0), (9, 0), (9, 29)]:
         ts = _ET.localize(datetime(2025, 4, 15, hour, minute))
-        assert cash_session_date(ts) == date(2025, 4, 14), (
-            f"{hour:02d}:{minute:02d} ET on 2025-04-15 should belong to session 2025-04-14"
-        )
+        assert cash_session_date(ts) == date(
+            2025, 4, 14
+        ), f"{hour:02d}:{minute:02d} ET on 2025-04-15 should belong to session 2025-04-14"
 
 
 def test_cash_session_date_boundary_09_30_exact_belongs_to_today():
@@ -197,9 +197,7 @@ def test_cash_session_date_is_constant_across_a_single_cash_session():
     # Sample 8 evenly-spaced points across the next 24 hours.
     for hours in [0, 3, 6, 12, 18, 23]:
         ts = open_et + timedelta(hours=hours)
-        assert cash_session_date(ts) == d, (
-            f"ts={ts.isoformat()} should belong to session {d}"
-        )
+        assert cash_session_date(ts) == d, f"ts={ts.isoformat()} should belong to session {d}"
     # And one just before the next day's 09:30 boundary.
     next_open_minus_one = (open_et + timedelta(days=1)) - timedelta(seconds=1)
     assert cash_session_date(next_open_minus_one) == d
