@@ -56,6 +56,7 @@ from src.market_calendar import (
     expiration_close_time_et,
     is_engine_run_window,
     is_spx_am_settled_expiration,
+    is_underlying_active_session,
     seconds_until_engine_run_window,
 )
 
@@ -449,13 +450,30 @@ class AnalyticsEngine:
                     conn.commit()
                     logger.warning("No underlying price found for snapshot")
                     return None
-                # Max-staleness gate (default 15 min, configurable). The
-                # threshold matters most during the cash session; outside
-                # the session the analytics engine off-hours path already
-                # holds the snapshot anchored to the last live row, so the
-                # gate naturally widens to "however long since the close."
+                # Max-staleness gate — session-aware.
+                #
+                # In-session: a stuck underlying feed is a real anomaly.
+                # BS gamma is highly sensitive to S, so pairing hours-old
+                # underlying with fresh option chains silently fabricates
+                # GEX / walls / flip values. Refuse the cycle so the API
+                # continues serving the prior good gex_summary row rather
+                # than a freshly-written-but-degenerate one.
+                #
+                # Off-session: the gap is structural, not a fault. Cash
+                # equity feeds stop at 16:00 ET (or 20:00 ET extended)
+                # while option chains can keep printing minutes-to-hours
+                # later. We deliberately skip the gate so the engine can
+                # re-anchor to the latest option_chains row and refresh
+                # gex_summary with the frozen end-of-session snapshot —
+                # this is the "freeze" semantic the API depends on.
+                #
+                # Symbol asymmetry: cash indexes (SPX, NDX) freeze at
+                # 16:00 ET; stocks/ETFs (SPY, QQQ) freeze at 20:00 ET.
+                # ``is_underlying_active_session`` encodes both.
                 uq_timestamp = uq_row[1]
-                if uq_timestamp is not None:
+                if uq_timestamp is not None and is_underlying_active_session(
+                    timestamp, symbol=self.db_symbol
+                ):
                     underlying_age = (timestamp - uq_timestamp).total_seconds()
                     max_age_seconds = _getenv_int(
                         "ANALYTICS_MAX_UNDERLYING_STALENESS_SECONDS", 900, min=0
@@ -463,7 +481,8 @@ class AnalyticsEngine:
                     if max_age_seconds > 0 and underlying_age > max_age_seconds:
                         logger.warning(
                             "Underlying price stale: %.0fs old vs option chain "
-                            "(max=%ds). Refusing cycle to avoid degenerate GEX.",
+                            "(max=%ds, in-session). Refusing cycle to avoid "
+                            "degenerate GEX.",
                             underlying_age,
                             max_age_seconds,
                         )

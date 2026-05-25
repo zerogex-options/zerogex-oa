@@ -265,6 +265,40 @@ def underlying_feed_expected(
     return open_t <= dt.time() <= close_t
 
 
+def is_underlying_active_session(
+    dt: Optional[datetime] = None, symbol: Optional[str] = None
+) -> bool:
+    """Return True when the symbol's underlying feed is expected to print.
+
+    Symbol-aware "freeze" window. Outside this window the underlying
+    naturally trails (cash equity feed stops at 16:00 ET; cash-index feeds
+    stop the same), and the system is expected to be in "frozen" state —
+    APIs continue serving the last in-session snapshot persisted by the
+    analytics engine, but no new live data is arriving.
+
+    * **Stocks/ETFs**  (SPY, QQQ, AAPL …): 04:00 ET → 20:00 ET on weekdays
+      (extended-hours cash trading).
+    * **Cash indexes** (SPX, NDX …):       09:30 ET → 16:00 ET on weekdays
+      (regular cash session only — the index level itself does not print
+      pre/after-hours).
+
+    Weekends and configured NYSE holidays always return False.
+
+    Used by the analytics engine to decide whether to apply the tight
+    underlying-staleness gate (in-session: a stuck feed is a real anomaly)
+    or skip it (off-session: the gap between the latest option print and
+    the cash-close underlying snapshot is structural, not a fault).
+    """
+    dt = _to_et(dt)
+    if dt.weekday() > 4 or dt.date() in NYSE_HOLIDAYS:
+        return False
+    if symbol and is_cash_index(symbol):
+        open_t, close_t = time(9, 30), time(16, 0)
+    else:
+        open_t, close_t = time(4, 0), time(20, 0)
+    return open_t <= dt.time() <= close_t
+
+
 # ---------------------------------------------------------------------------
 # Engine run window (24x5 weekdays minus NYSE holidays)
 # ---------------------------------------------------------------------------

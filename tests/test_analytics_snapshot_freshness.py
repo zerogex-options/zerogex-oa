@@ -189,3 +189,110 @@ def test_expiration_boundary_at_exactly_1615_rolls_off():
     min_expiration = options_call[0][1][3]
     # 16:15 is the boundary; per the rule (ts.time() < 16:15) is False, so roll off today.
     assert min_expiration == ET.localize(datetime(2026, 5, 13)).date()
+
+
+# ---------------------------------------------------------------------------
+# Session-aware underlying staleness gate
+# ---------------------------------------------------------------------------
+#
+# These tests pin down the freeze semantic introduced alongside the
+# underlying-staleness check: in-session a 4h gap is a hard fault and
+# refuses the cycle; off-session the same gap is structural and the gate
+# steps aside so the analytics engine can re-anchor to the frozen
+# end-of-session option_chains snapshot.
+
+
+def _mock_db_connection_with_stale_underlying(
+    option_chain_ts, underlying_ts, underlying_price, option_rows
+):
+    """Variant that scripts a deliberate gap between the option-chain
+    anchor and the underlying-quote timestamp."""
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        (option_chain_ts,),
+        (underlying_price, underlying_ts),
+    ]
+    cursor.fetchall.return_value = option_rows
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    cm = MagicMock()
+    cm.__enter__.return_value = conn
+    cm.__exit__.return_value = False
+    return cm, cursor
+
+
+def test_in_session_stale_underlying_refuses_cycle():
+    """Wednesday noon: cash session, 1h underlying lag is a real fault."""
+    engine = AnalyticsEngine(underlying="SPY")
+    in_session = ET.localize(datetime(2026, 5, 13, 12, 0)).astimezone(timezone.utc)
+    underlying_ts = in_session - timedelta(hours=1)  # 3,600s — over 900s default
+    cm, _ = _mock_db_connection_with_stale_underlying(in_session, underlying_ts, 500.0, [])
+    with patch.object(main_engine, "db_connection", return_value=cm):
+        result = engine._get_snapshot()
+    assert result is None  # refused
+
+
+def test_in_session_fresh_underlying_proceeds():
+    engine = AnalyticsEngine(underlying="SPY")
+    in_session = ET.localize(datetime(2026, 5, 13, 12, 0)).astimezone(timezone.utc)
+    underlying_ts = in_session - timedelta(seconds=30)  # well under 900s
+    expiration = in_session.astimezone(ET).date() + timedelta(days=7)
+    rows = [_row("SPY260520C00500000", 500.0, expiration, "C", in_session)]
+    cm, _ = _mock_db_connection_with_stale_underlying(in_session, underlying_ts, 500.0, rows)
+    with patch.object(main_engine, "db_connection", return_value=cm):
+        result = engine._get_snapshot()
+    assert result is not None
+    assert result["underlying_price"] == 500.0
+
+
+def test_offhours_stale_underlying_proceeds_to_freeze_last_snapshot():
+    """Friday 21:00 ET (past SPY's 20:00 freeze): off-session, gate skipped.
+
+    Outside the extended-hours window the gap between the latest option
+    chain timestamp and the cash-close underlying is structural, not a
+    fault. The gate must step aside so the engine can refresh
+    ``gex_summary`` against the frozen end-of-session underlying — that
+    snapshot is what API consumers see all weekend.
+    """
+    engine = AnalyticsEngine(underlying="SPY")
+    # 21:00 ET on a Friday — past SPY's 20:00 extended-hours freeze.
+    option_chain_ts = ET.localize(datetime(2026, 5, 15, 21, 0)).astimezone(timezone.utc)
+    # Underlying frozen at the 16:00 cash close = 5h gap, well past 900s.
+    underlying_ts = ET.localize(datetime(2026, 5, 15, 16, 0)).astimezone(timezone.utc)
+    expiration = option_chain_ts.astimezone(ET).date() + timedelta(days=7)
+    rows = [_row("SPY260522C00500000", 500.0, expiration, "C", option_chain_ts)]
+    cm, _ = _mock_db_connection_with_stale_underlying(option_chain_ts, underlying_ts, 500.0, rows)
+    with patch.object(main_engine, "db_connection", return_value=cm):
+        result = engine._get_snapshot()
+    assert result is not None  # NOT refused — freeze path is permitted
+    assert result["underlying_price"] == 500.0
+
+
+def test_etf_extended_hours_still_in_session_gate_active():
+    """SPY at 19:00 ET is INSIDE the extended-hours window (closes at 20:00).
+
+    A 3-hour underlying lag during extended hours IS a real fault for
+    SPY (the SPY feed should still be printing), so the gate fires.
+    """
+    engine = AnalyticsEngine(underlying="SPY")
+    option_chain_ts = ET.localize(datetime(2026, 5, 15, 19, 0)).astimezone(timezone.utc)
+    underlying_ts = ET.localize(datetime(2026, 5, 15, 16, 0)).astimezone(timezone.utc)
+    cm, _ = _mock_db_connection_with_stale_underlying(option_chain_ts, underlying_ts, 500.0, [])
+    with patch.object(main_engine, "db_connection", return_value=cm):
+        result = engine._get_snapshot()
+    assert result is None  # gate fires — SPY's extended feed should be live
+
+
+def test_cash_index_offhours_skips_gate_even_within_extended_window():
+    """SPX freezes at 16:00 ET — 17:00 ET is already off-session for the
+    index even though it would still be in-session for SPY."""
+    engine = AnalyticsEngine(underlying="SPX")
+    # 17:00 ET — inside SPY's extended-hours window but past SPX's close.
+    option_chain_ts = ET.localize(datetime(2026, 5, 15, 17, 0)).astimezone(timezone.utc)
+    underlying_ts = ET.localize(datetime(2026, 5, 15, 16, 0)).astimezone(timezone.utc)
+    expiration = option_chain_ts.astimezone(ET).date() + timedelta(days=7)
+    rows = [_row("SPXW260522C05000000", 5000.0, expiration, "C", option_chain_ts)]
+    cm, _ = _mock_db_connection_with_stale_underlying(option_chain_ts, underlying_ts, 5000.0, rows)
+    with patch.object(main_engine, "db_connection", return_value=cm):
+        result = engine._get_snapshot()
+    assert result is not None  # gate stepped aside for the cash-index off-session
