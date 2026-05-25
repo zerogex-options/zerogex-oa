@@ -1425,6 +1425,15 @@ SIGNALS_SWING_TARGET_PCT = _getenv_float("SIGNALS_SWING_TARGET_PCT", SIGNALS_TAR
 # live-trading values are 0.01-0.03 (1-3%).
 SIGNALS_EXECUTION_SLIPPAGE_PCT = max(0.0, float(os.getenv("SIGNALS_EXECUTION_SLIPPAGE_PCT", "0.0")))
 
+# Reject option_chains quote rows older than this when marking an open trade
+# for stop/take-profit evaluation. Without this floor a quote-ingest stall
+# (or the first cycle after a weekend / holiday) would price the position
+# against a multi-day-stale mark and could fire a fictitious stop fill.
+# Set to 0 to disable the check (NOT recommended in live trading).
+SIGNALS_OPTION_QUOTE_MAX_AGE_SECONDS = _getenv_int(
+    "SIGNALS_OPTION_QUOTE_MAX_AGE_SECONDS", 900, min=0, max=86400
+)
+
 # =============================================================================
 # Ingestion/Analytics CLI Defaults
 # =============================================================================
