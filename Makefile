@@ -3130,6 +3130,7 @@ api-test: ## Test ALL API endpoints — HTTP code, time, size in an aligned tabl
 	hit "/api/signals/advanced/0dte-position-imbalance?symbol=$$SYMBOL"; \
 	hit "/api/signals/advanced/gamma-vwap-confluence?symbol=$$SYMBOL"; \
 	hit "/api/signals/advanced/range-break-imminence?symbol=$$SYMBOL"; \
+	hit "/api/signals/advanced/market-pressure?symbol=$$SYMBOL"; \
 	hit "/api/signals/advanced/confluence-matrix?symbol=$$SYMBOL&lookback=120"; \
 	hit "/api/signals/vol_expansion/events?symbol=$$SYMBOL"; \
 	hit "/api/signals/eod_pressure/events?symbol=$$SYMBOL"; \
