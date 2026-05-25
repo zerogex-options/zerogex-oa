@@ -59,7 +59,7 @@ def _mock_db_connection(latest_ts, underlying_price, option_rows):
     cursor = MagicMock()
     cursor.fetchone.side_effect = [
         (latest_ts,),  # query 1: latest option_chains timestamp
-        (underlying_price,),  # query 2: underlying close
+        (underlying_price, latest_ts),  # query 2: underlying close + ts
     ]
     cursor.fetchall.return_value = option_rows  # query 3: option rows
 

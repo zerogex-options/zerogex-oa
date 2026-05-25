@@ -228,6 +228,10 @@ def test_insert_action_card_sync_swallows_db_errors():
 # ----------------------------------------------------------------------
 
 
+def _inserts_into_action_cards(conn) -> list:
+    return [(sql, params) for sql, params in conn.executions if "INSERT INTO signal_action_cards" in sql]
+
+
 def test_evaluate_and_persist_writes_trade_card():
     conn = _FakeConn()
     # Inject the pattern explicitly so the test doesn't rely on the
@@ -245,8 +249,9 @@ def test_evaluate_and_persist_writes_trade_card():
         conn=conn,
     )
     assert card.pattern == "call_wall_fade"
-    # Persistence happened.
-    assert len(conn.executions) == 1
+    # Persistence happened. The cycle also fires a recently_emitted
+    # hysteresis SELECT now; assert specifically on the action_cards INSERT.
+    assert len(_inserts_into_action_cards(conn)) == 1
 
 
 def test_evaluate_and_persist_does_not_persist_stand_down():
@@ -267,7 +272,9 @@ def test_evaluate_and_persist_does_not_persist_stand_down():
         conn=conn,
     )
     assert card.action == ActionEnum.STAND_DOWN
-    assert conn.executions == []
+    # No action_cards INSERT for STAND_DOWN. (The hysteresis SELECT is
+    # expected and unconditional — that's how the cycle gates re-emission.)
+    assert _inserts_into_action_cards(conn) == []
 
 
 def test_evaluate_and_persist_works_without_conn():

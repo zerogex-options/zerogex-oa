@@ -79,7 +79,17 @@ NYSE_HOLIDAYS: set[date] = load_nyse_holidays()
 # Time-to-expiration
 # ---------------------------------------------------------------------------
 
-_MIN_YEARS_TO_EXPIRATION = 1.0 / 525_600  # one minute, in years
+# Lower bound on time-to-expiration in years. The BS gamma kernel has a
+# ``1/√T`` term: at T = 1 minute (1/525,600 yr) that's ~27 — so a single
+# 1-minute-to-expiry ATM contract dominates every aggregate metric
+# (GEX, walls, max-gamma) by ~50× relative to a 30-day strike at the same
+# OI. Floor at 30 minutes by default (= 1/17,520 yr → √T ≈ 0.0076) so
+# expiring contracts decay gracefully out of the metrics rather than
+# spiking. ``ANALYTICS_MIN_TTE_MINUTES`` env override available for
+# operators who want the prior 1-minute behavior.
+import os as _os
+_MIN_TTE_MINUTES = max(0.5, float(_os.getenv("ANALYTICS_MIN_TTE_MINUTES", "30")))
+_MIN_YEARS_TO_EXPIRATION = _MIN_TTE_MINUTES / (60.0 * 24.0 * 365.0)
 
 
 def is_spx_am_settled_expiration(symbol: str, expiration_date: date) -> bool:

@@ -46,7 +46,7 @@ def _row(option_symbol, strike, expiration, option_type, quote_ts, *, gamma=0.01
 
 def _mock_db_connection(latest_ts, underlying_price, option_rows):
     cursor = MagicMock()
-    cursor.fetchone.side_effect = [(latest_ts,), (underlying_price,)]
+    cursor.fetchone.side_effect = [(latest_ts,), (underlying_price, latest_ts)]
     cursor.fetchall.return_value = option_rows
     cursor.execute.side_effect = lambda *a, **kw: None
     conn = MagicMock()

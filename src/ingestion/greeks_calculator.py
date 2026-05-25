@@ -318,7 +318,7 @@ class GreeksCalculator:
         # prices). Leaving implied_volatility as None lets the column stay
         # NULL and lets the vol_surface router filter it via _iv_or_null.
         implied_volatility = option_data.get("implied_volatility")
-        if not implied_volatility or implied_volatility <= 0:
+        if implied_volatility is None or implied_volatility <= 0:
             implied_volatility = self.default_iv
 
         # Step 3: validate required fields and either compute Greeks or

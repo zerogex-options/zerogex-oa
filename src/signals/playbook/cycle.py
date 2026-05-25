@@ -128,20 +128,55 @@ def _extract_levels(
     return levels
 
 
+def _load_recently_emitted_sync(conn, underlying: str, window_minutes: int = 60) -> dict[str, "datetime"]:
+    """Return ``{pattern_id: last_emit_ts}`` for cards in the recent window.
+
+    Mirrors the async ``get_recent_action_cards`` query so the sync cycle
+    can apply the same hysteresis suppression as the API path. Previously
+    this was hardcoded ``{}`` in :func:`build_context_from_cycle`, which
+    completely disabled per-pattern hysteresis in the live tick loop —
+    every cycle re-evaluated patterns with no suppression, generating
+    correlated near-duplicate Cards that contaminate downstream backtest
+    statistics and produce log spam.
+    """
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT pattern, MAX(timestamp)
+            FROM signal_action_cards
+            WHERE underlying = %s
+              AND timestamp > NOW() - (%s || ' minutes')::interval
+            GROUP BY pattern
+            """,
+            (underlying, str(int(window_minutes))),
+        )
+        return {row[0]: row[1] for row in cur.fetchall() if row[0] and row[1]}
+    except Exception as e:
+        logger.debug("Failed to load recently_emitted cards: %s", e)
+        return {}
+
+
 def build_context_from_cycle(
     *,
     market_context: MarketContext,
     score,
     advanced_results: Iterable,
     basic_results: Iterable,
+    conn=None,
+    underlying: Optional[str] = None,
 ) -> PlaybookContext:
     """Build a PlaybookContext from in-memory cycle state.
 
     Skips the DB round-trips the async builder does — we have everything
     in memory.  ``score_history`` on each snapshot is left empty;
-    history-needy patterns fall back to "accept current trigger".  A
-    later PR can add sync history loading via ``db_connection`` if
-    we decide history is worth the cycle latency.
+    history-needy patterns fall back to "accept current trigger".
+
+    ``conn`` and ``underlying`` (when supplied) drive a single-row query
+    against ``signal_action_cards`` to populate ``recently_emitted`` so
+    the engine's hysteresis gate works in the sync path identically to
+    the async API builder. Backward compatible — callers that omit them
+    get the prior empty-dict behavior.
     """
     advanced: dict[str, SignalSnapshot] = {}
     for r in advanced_results or ():
@@ -149,6 +184,10 @@ def build_context_from_cycle(
     basic: dict[str, SignalSnapshot] = {}
     for r in basic_results or ():
         basic[r.name] = _snapshot_from_result(r)
+
+    recently_emitted: dict = {}
+    if conn is not None and underlying:
+        recently_emitted = _load_recently_emitted_sync(conn, underlying)
 
     return PlaybookContext(
         market=market_context,
@@ -159,7 +198,7 @@ def build_context_from_cycle(
         basic_signals=basic,
         levels=_extract_levels(market_context.extra or {}, advanced),
         open_positions=[],  # PR-15 will wire portfolio state through.
-        recently_emitted={},  # Cycle hysteresis: read from signal_action_cards below.
+        recently_emitted=recently_emitted,
     )
 
 
@@ -235,6 +274,8 @@ def evaluate_and_persist(
         score=score,
         advanced_results=advanced_results,
         basic_results=basic_results,
+        conn=conn,
+        underlying=getattr(market_context, "underlying", None),
     )
     card = engine.evaluate(ctx)
     if conn is not None:

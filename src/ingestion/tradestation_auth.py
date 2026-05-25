@@ -11,7 +11,7 @@ import time
 import json
 import tempfile
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Optional
 import fcntl
@@ -88,7 +88,7 @@ class TradeStationAuth:
             if expires_in <= self.refresh_buffer_seconds:
                 return False
             self.access_token = token
-            self.token_expiry = datetime.now() + timedelta(seconds=expires_in)
+            self.token_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
             self._last_refresh_epoch = time.time()
             logger.debug("Loaded TradeStation token from shared cache")
             return True
@@ -136,7 +136,7 @@ class TradeStationAuth:
             # or coming up for expiry, then return it
             # Otherwise, refresh it
             if self.access_token and self.token_expiry:
-                time_until_expiry = (self.token_expiry - datetime.now()).total_seconds()
+                time_until_expiry = (self.token_expiry - datetime.now(timezone.utc)).total_seconds()
                 logger.debug(f"Token expires in {time_until_expiry:.0f} seconds")
 
                 if time_until_expiry > self.refresh_buffer_seconds:
@@ -171,7 +171,7 @@ class TradeStationAuth:
                 and self.access_token
                 and self.access_token != failed_token
                 and self.token_expiry
-                and (self.token_expiry - datetime.now()).total_seconds()
+                and (self.token_expiry - datetime.now(timezone.utc)).total_seconds()
                 > self.refresh_buffer_seconds
             ):
                 logger.info("Skipping force-refresh: cached token already rotated since 401")
@@ -190,7 +190,7 @@ class TradeStationAuth:
         with self._token_lock:
             if not self.access_token or not self.token_expiry:
                 return -1.0
-            return (self.token_expiry - datetime.now()).total_seconds()
+            return (self.token_expiry - datetime.now(timezone.utc)).total_seconds()
 
     def should_refresh_soon(self, buffer_seconds: int = 120) -> bool:
         """Whether token is missing/expired/near expiry and should be refreshed."""
@@ -256,7 +256,7 @@ class TradeStationAuth:
                 # https://api.tradestation.com/docs/fundamentals/authentication/refresh-tokens
                 self.access_token = data["access_token"]
                 expires_in = data.get("expires_in", 1200)
-                self.token_expiry = datetime.now() + timedelta(seconds=expires_in)
+                self.token_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
                 self._last_refresh_epoch = time.time()
                 self._token_generation += 1
                 self._persist_cached_token_to_disk(expires_in)

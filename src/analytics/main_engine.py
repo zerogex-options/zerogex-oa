@@ -425,10 +425,16 @@ class AnalyticsEngine:
                     return None
                 timestamp = ts_row[0]
 
-                # 2. Underlying close as of that timestamp.
+                # 2. Underlying close as of that timestamp. Pull the
+                # timestamp too so we can refuse a cycle when the
+                # underlying feed is stale relative to the options chain
+                # — Black-Scholes gamma is extremely sensitive to S, so
+                # an hours-old underlying paired with fresh options
+                # silently repositions the gamma flip, walls, and GEX
+                # without any visible failure mode.
                 cursor.execute(
                     """
-                    SELECT close
+                    SELECT close, timestamp
                     FROM underlying_quotes
                     WHERE symbol = %s
                       AND timestamp <= %s
@@ -443,6 +449,26 @@ class AnalyticsEngine:
                     conn.commit()
                     logger.warning("No underlying price found for snapshot")
                     return None
+                # Max-staleness gate (default 15 min, configurable). The
+                # threshold matters most during the cash session; outside
+                # the session the analytics engine off-hours path already
+                # holds the snapshot anchored to the last live row, so the
+                # gate naturally widens to "however long since the close."
+                uq_timestamp = uq_row[1]
+                if uq_timestamp is not None:
+                    underlying_age = (timestamp - uq_timestamp).total_seconds()
+                    max_age_seconds = _getenv_int(
+                        "ANALYTICS_MAX_UNDERLYING_STALENESS_SECONDS", 900, min=0
+                    )
+                    if max_age_seconds > 0 and underlying_age > max_age_seconds:
+                        logger.warning(
+                            "Underlying price stale: %.0fs old vs option chain "
+                            "(max=%ds). Refusing cycle to avoid degenerate GEX.",
+                            underlying_age,
+                            max_age_seconds,
+                        )
+                        conn.commit()
+                        return None
 
                 # 3. Latest per-contract option quote, scoped to the
                 # lookback window plus the contract-expiration roll-off.

@@ -57,7 +57,7 @@ def _mock_db_connection(latest_ts, underlying_price, option_rows, fail_cold_star
     raises QueryCanceled; the steady-state retry then succeeds.
     """
     cursor = MagicMock()
-    cursor.fetchone.side_effect = [(latest_ts,), (underlying_price,)]
+    cursor.fetchone.side_effect = [(latest_ts,), (underlying_price, latest_ts)]
     cursor.fetchall.return_value = option_rows
 
     state = {"snapshot_calls": 0}
@@ -211,7 +211,7 @@ def test_cold_start_flag_consumed_even_when_fallback_also_fails(monkeypatch):
     snapshot_ts = _stale_ts()
 
     cursor = MagicMock()
-    cursor.fetchone.side_effect = [(snapshot_ts,), (500.0,)]
+    cursor.fetchone.side_effect = [(snapshot_ts,), (500.0, snapshot_ts)]
 
     def execute_side_effect(sql, params=None):
         if "DISTINCT ON" in sql:

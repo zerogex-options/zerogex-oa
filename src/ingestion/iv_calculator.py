@@ -304,16 +304,34 @@ class IVCalculator:
             # bound) so windowed telemetry can report the fraction of
             # solves that saturated — deep-OTM / near-expiry strikes do
             # this routinely, so it is tracked, not warned per hit.
+            #
+            # Early-exit when the iterate would push past a bound AND the
+            # bound has not moved the bs_price past the option_price yet:
+            # further iterations will just re-clamp every cycle. Burning
+            # all max_iterations spinning at a saturated bound is wasted
+            # work; treat the bound as the best available answer.
+            prev_at_floor = solve_hit_floor and sigma == self.min_iv
+            prev_at_ceiling = solve_hit_ceiling and sigma == self.max_iv
             if sigma < self.min_iv:
                 if not solve_hit_floor:
                     solve_hit_floor = True
                     self._iv_clamp_floor_solves += 1
                 sigma = self.min_iv
+                if prev_at_floor:
+                    logger.debug(
+                        f"IV solver saturated at floor {self.min_iv:.4f}; returning bound"
+                    )
+                    return sigma
             elif sigma > self.max_iv:
                 if not solve_hit_ceiling:
                     solve_hit_ceiling = True
                     self._iv_clamp_ceiling_solves += 1
                 sigma = self.max_iv
+                if prev_at_ceiling:
+                    logger.debug(
+                        f"IV solver saturated at ceiling {self.max_iv:.4f}; returning bound"
+                    )
+                    return sigma
 
         logger.debug(f"IV did not converge after {self.max_iterations} iterations")
         return None
@@ -348,6 +366,15 @@ class IVCalculator:
         # Use mid-price
         mid_price = (bid + ask) / 2
 
+        # Spread sanity. Far-OTM contracts with bid=0.01/ask=5.00 produce a
+        # nonsense mid that, when fed to the solver, fits a meaningless IV.
+        # Reject when the relative spread exceeds 50% of mid (the threshold
+        # is conservative; any caller who genuinely wants the loose-quote
+        # IV can still call calculate_iv() directly with their own price).
+        if (ask - bid) / mid_price > 0.5:
+            logger.debug(f"Spread too wide: bid={bid} ask={ask} mid={mid_price}")
+            return None
+
         return self.calculate_iv(
             mid_price,
             underlying_price,
@@ -378,14 +405,18 @@ class IVCalculator:
         # Check if IV calculation is enabled
         if not IV_CALCULATION_ENABLED:
             logger.debug("IV calculation is disabled via config")
-            # Keep API-provided IV if present, otherwise None
-            if not option_data.get("implied_volatility"):
+            # Keep API-provided IV if present and >0, otherwise None.
+            # Use ``is not None and > 0`` rather than truthy so a stored
+            # 0.0 sentinel does not pass through as if it were valid IV.
+            iv = option_data.get("implied_volatility")
+            if iv is None or iv <= 0:
                 option_data["implied_volatility"] = None
             return option_data
 
-        # If API already provided IV, use it
-        if option_data.get("implied_volatility"):
-            logger.debug(f"Using API-provided IV: {option_data['implied_volatility']:.4f}")
+        # If API already provided a positive IV, use it.
+        iv = option_data.get("implied_volatility")
+        if iv is not None and iv > 0:
+            logger.debug(f"Using API-provided IV: {iv:.4f}")
             return option_data
 
         # Extract required fields

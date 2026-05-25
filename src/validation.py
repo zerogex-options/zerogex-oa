@@ -256,20 +256,25 @@ def validate_option_symbol(symbol: str) -> bool:
 
 def bucket_timestamp(dt: datetime, bucket_seconds: int = 60) -> datetime:
     """
-    Round datetime down to nearest bucket (default: 1 minute)
+    Round datetime down to nearest bucket (default: 1 minute).
+
+    Naive datetimes are canonicalized to UTC (every other helper in the
+    codebase treats naive == UTC).  Previously ``dt.timestamp()`` on a
+    naive value silently reinterpreted it through the process's local
+    timezone, producing a bucket boundary off by the local UTC offset
+    and a naive return value with mixed TZ semantics.
 
     Args:
-        dt: Datetime to bucket
+        dt: Datetime to bucket (naive treated as UTC)
         bucket_seconds: Bucket size in seconds
 
     Returns:
-        Bucketed datetime
+        Bucketed datetime preserving the input's tz (UTC when input was naive).
     """
-    # Calculate seconds since epoch
+    from datetime import timezone as _tz
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_tz.utc)
     timestamp = dt.timestamp()
-
-    # Round down to nearest bucket
     bucketed_timestamp = (timestamp // bucket_seconds) * bucket_seconds
-
-    # Convert back to datetime, preserving timezone
     return datetime.fromtimestamp(bucketed_timestamp, tz=dt.tzinfo)

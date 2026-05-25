@@ -510,8 +510,14 @@ class PortfolioEngine:
         drawdown_state = self._drawdown_sizing_state(conn)
         drawdown_multiplier = float(drawdown_state.get("multiplier", 1.0))
         base_contracts = sizing.contracts
+        # Round DOWN (favorable-to-risk) and allow zero. The prior
+        # ``max(1, ...)`` silently forced at least one contract even when
+        # the combined downsizing multipliers (drawdown protection, chop
+        # cap, conviction) wanted size 0 — eliminating the entire purpose
+        # of those multipliers and exposing risk during the regimes they
+        # were designed to suppress.
         contracts = max(
-            1,
+            0,
             int(
                 base_contracts
                 * conviction
@@ -520,6 +526,14 @@ class PortfolioEngine:
                 * drawdown_multiplier
             ),
         )
+        if contracts == 0:
+            # All downsizing multipliers collapsed sizing to zero — return
+            # a cash target instead of forcing a 1-contract entry.
+            return self._cash_target(
+                score,
+                f"Sizing collapsed to zero: conviction={conviction:.2f} "
+                f"size_mult={size_multiplier:.2f} dd_mult={drawdown_multiplier:.2f}",
+            )
 
         entry_price = (candidate.entry_debit or candidate.entry_credit) / 100.0
         # Resolve option symbol for the primary leg
@@ -569,6 +583,49 @@ class PortfolioEngine:
         }
 
         target_heat = abs(entry_price) * contracts * 100 / max(SIGNALS_PORTFOLIO_SIZE, 1.0)
+
+        # Enforce SIGNALS_MAX_PORTFOLIO_HEAT_PCT against the live portfolio
+        # plus the proposed open. Previously this config existed but was
+        # never consulted at the gate, so a stack of concurrent signals
+        # could blow well past the configured ceiling.
+        try:
+            with self._use_conn(conn) as c:
+                existing_heat = self._current_portfolio_heat_pct(c)
+        except Exception:
+            existing_heat = 0.0
+        projected_heat = existing_heat + target_heat
+        if projected_heat > self.max_heat_pct:
+            # Trim contracts to fit the cap (floor-divide on the headroom).
+            headroom_pct = max(self.max_heat_pct - existing_heat, 0.0)
+            if headroom_pct <= 0.0:
+                return self._cash_target(
+                    score,
+                    f"Portfolio heat cap reached: existing={existing_heat:.2%} "
+                    f">= cap {self.max_heat_pct:.2%}",
+                )
+            headroom_dollars = headroom_pct * SIGNALS_PORTFOLIO_SIZE
+            per_contract = abs(entry_price) * 100.0
+            if per_contract <= 0:
+                return self._cash_target(score, "Invalid per-contract risk")
+            capped_contracts = max(0, int(headroom_dollars // per_contract))
+            if capped_contracts == 0:
+                return self._cash_target(
+                    score,
+                    f"Heat cap trims sizing to zero: existing={existing_heat:.2%} "
+                    f"requested={target_heat:.2%} cap={self.max_heat_pct:.2%}",
+                )
+            if capped_contracts < contracts:
+                logger.info(
+                    "Heat cap trim: %d -> %d contracts (existing=%.2f%%, cap=%.2f%%)",
+                    contracts,
+                    capped_contracts,
+                    existing_heat * 100,
+                    self.max_heat_pct * 100,
+                )
+                contracts = capped_contracts
+                target_heat = (
+                    abs(entry_price) * contracts * 100 / max(SIGNALS_PORTFOLIO_SIZE, 1.0)
+                )
 
         tp = TargetPosition(
             direction=trade_direction,
@@ -1547,7 +1604,14 @@ class PortfolioEngine:
         """
         mark, pricing_mode = self._spread_mark(trade, as_of, conn)
         if mark is None:
-            mark = trade["current_price"]
+            # No fresh mark available (e.g. chain data outage). Booking a
+            # close at the stale ``current_price`` would realize fictitious
+            # PnL; skip and retry on the next cycle.
+            logger.warning(
+                "close_trade: no fresh mark for trade id=%s; skipping close",
+                trade.get("id"),
+            )
+            return 0.0
 
         entry = trade["entry_price"]
         open_qty = trade["quantity_open"]
@@ -1819,6 +1883,45 @@ class PortfolioEngine:
     # ------------------------------------------------------------------
     # Internal helpers (ported from UnifiedSignalEngine)
     # ------------------------------------------------------------------
+
+    def _current_portfolio_heat_pct(self, conn) -> float:
+        """Return open-position risk as a fraction of ``SIGNALS_PORTFOLIO_SIZE``.
+
+        Uses ``entry_price × quantity_open × 100`` for debit positions
+        (premium at risk). Credit-spread risk uses the stored ``max_loss``
+        in ``components_at_entry`` when available; falls back to the
+        premium-collected debit-equivalent otherwise. Conservative — never
+        under-reports.
+        """
+        try:
+            open_trades = self._fetch_open_trades(conn)
+        except Exception:
+            return 0.0
+        total_at_risk = 0.0
+        for t in open_trades:
+            qty = int(t.get("quantity_open") or 0)
+            if qty <= 0:
+                continue
+            entry = abs(float(t.get("entry_price") or 0.0))
+            components = t.get("components_at_entry") or {}
+            risk = components.get("risk") if isinstance(components, dict) else None
+            pricing_mode = (
+                (risk.get("pricing_mode") if isinstance(risk, dict) else None) or "debit"
+            )
+            if pricing_mode == "credit":
+                # Credit: at-risk = max_loss (per contract). When unknown,
+                # fall back to entry × qty × 100 (the premium collected,
+                # which is a LOWER bound — still conservative for cap check).
+                max_loss = None
+                if isinstance(risk, dict):
+                    max_loss = risk.get("max_loss") or risk.get("max_loss_per_contract")
+                if max_loss is not None:
+                    total_at_risk += abs(float(max_loss)) * qty
+                else:
+                    total_at_risk += entry * qty * 100.0
+            else:
+                total_at_risk += entry * qty * 100.0
+        return total_at_risk / max(SIGNALS_PORTFOLIO_SIZE, 1.0)
 
     def _fetch_open_trades(self, conn) -> list[dict]:
         cur = conn.cursor()

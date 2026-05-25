@@ -35,10 +35,16 @@ class SqueezeSetupSignal:
         flip = ctx.gamma_flip
         above_flip = bool(flip is not None and ctx.close > flip)
         below_flip = bool(flip is not None and ctx.close < flip)
-        # Continuous gex_readiness: smooth tanh response so the regime tilt
-        # contribution is graded rather than a discrete 0.5/1.0 jump at the
-        # net-GEX zero crossing.
-        gex_readiness = 0.5 + 0.5 * max(
+        # Continuous gex_readiness: smooth tanh response in [0, 1] that
+        # goes to ~0 under deep long-gamma (no squeeze possible) and ~1
+        # under deep short-gamma (squeeze most likely).
+        #
+        # Bug history: the prior expression added an outer ``0.5 + 0.5 *``
+        # wrapper that forced the floor up to 0.5, so the squeeze signal
+        # retained 50% sensitivity even in damped (long-gamma) regimes
+        # where squeezes structurally can't happen — producing false
+        # positives on quiet days.
+        gex_readiness = max(
             0.0, min(1.0, 0.5 * (1.0 - math.tanh(float(ctx.net_gex or 0.0) / 5.0e8)))
         )
 
