@@ -33,12 +33,15 @@ from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
 from src.validation import (
     bucket_timestamp,
+    cash_session_date,
+    cash_session_start_utc,
     get_market_session,
     is_engine_run_window,
     seconds_until_engine_run_window,
     underlying_feed_expected,
 )
 from src.symbols import parse_underlyings, get_canonical_symbol
+from src import config as _config
 from src.config import (
     AGGREGATION_BUCKET_SECONDS,
     MAX_BUFFER_SIZE,
@@ -850,7 +853,14 @@ class IngestionEngine:
 
         TradeStation resets option cumulative volume to 0 at session open,
         so per-contract flow accumulators are scoped per ET session date.
+
+        Under ``USE_CASH_SESSION_KEYING`` returns the cash-session date
+        (pre-09:30 belongs to the PRIOR session), aligning the in-memory
+        rollover with the vendor's exact reset boundary.  Otherwise
+        returns the ET calendar date (legacy behavior).
         """
+        if _config.USE_CASH_SESSION_KEYING:
+            return cash_session_date(bucket)
         if bucket.tzinfo is None:
             bucket_et = pytz.UTC.localize(bucket).astimezone(ET)
         else:
@@ -870,8 +880,15 @@ class IngestionEngine:
         the next snapshot's Lee-Ready classification has a real prior
         tick from the start.  Zeros on DB failure or empty result.
         """
-        session_start_et = ET.localize(datetime.combine(session_date, dt_time(0, 0)))
-        session_start_utc = session_start_et.astimezone(timezone.utc)
+        if _config.USE_CASH_SESSION_KEYING:
+            # ``session_date`` is the cash-session date; the session began
+            # at 09:30 ET on that date.  Hydration must pull only rows in
+            # that cash-session window so we don't carry forward late-night
+            # extended-hours rows that belong to the PRIOR session.
+            session_start_utc = cash_session_start_utc(session_date)
+        else:
+            session_start_et = ET.localize(datetime.combine(session_date, dt_time(0, 0)))
+            session_start_utc = session_start_et.astimezone(timezone.utc)
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()

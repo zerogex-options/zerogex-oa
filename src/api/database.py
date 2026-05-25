@@ -19,6 +19,7 @@ import json
 
 from src.api.queries.signals import SignalsQueriesMixin
 from src.api.queries.technicals import TechnicalsQueriesMixin
+from src import config as _config
 from src.config import GEX_HEATMAP_STRIKE_BAND_PCT
 from src.flow_series_sql import FLOW_SERIES_CTE_ASYNCPG, SNAPSHOT_SELECT_ASYNCPG
 from src.market_calendar import NYSE_HOLIDAYS
@@ -184,6 +185,39 @@ def _expected_flow_series_bars(session_start: datetime, session_end: datetime) -
     if span < 0:
         return 0
     return int(span // 300) + 1
+
+
+def _flow_lag_same_session_clause(use_cash_keying: bool) -> str:
+    """SQL fragment for the ``flow_contract_facts`` LAG-CASE same-session check.
+
+    The LAG-CASE pattern compares the prior row's session against the
+    current row's session to decide whether the cumulative-volume delta
+    is intra-session (use the delta) or a session-boundary reset (use
+    the absolute volume).  Two formulations:
+
+    * ``use_cash_keying=False`` (legacy): equality on the ET CALENDAR
+      date.  Boundary is calendar midnight ET.
+    * ``use_cash_keying=True``: equality on the CASH-SESSION date,
+      computed by shifting the ET wall-clock back by 09:30 before
+      truncating.  Boundary is the 09:30 ET cash open -- the moment
+      TradeStation resets option cumulative volume.
+
+    Both branches operate on ``s.timestamp`` and ``LAG(s.timestamp)
+    OVER w`` from the surrounding query, so the fragment is purely
+    textual SQL.  The 9h30m shift handles DST automatically because
+    ``AT TIME ZONE 'America/New_York'`` resolves to local wall-clock.
+    """
+    if use_cash_keying:
+        return (
+            "((LAG(s.timestamp) OVER w AT TIME ZONE 'America/New_York') "
+            "- interval '9 hours 30 minutes')::date "
+            "= ((s.timestamp AT TIME ZONE 'America/New_York') "
+            "- interval '9 hours 30 minutes')::date"
+        )
+    return (
+        "(LAG(s.timestamp) OVER w AT TIME ZONE 'America/New_York')::date "
+        "= (s.timestamp AT TIME ZONE 'America/New_York')::date"
+    )
 
 
 class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
@@ -692,6 +726,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         # Canonical per-contract fact table used as the source of truth for flow APIs.
         # Uses LAG() window function instead of LATERAL join for O(n) vs O(n²) perf.
+        #
+        # ``same_session`` is the LAG-CASE WHEN clause chosen by
+        # USE_CASH_SESSION_KEYING.  It must match the in-memory
+        # _FlowAccumulator session-key semantics in main_engine.py
+        # exactly so persisted deltas and in-memory cumulatives stay
+        # consistent across a vendor reset.
+        same_session = _flow_lag_same_session_clause(_config.USE_CASH_SESSION_KEYING)
         await conn.execute(
             """
             WITH window_rows AS (
@@ -781,22 +822,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     s.delta,
                     CASE
                         WHEN LAG(s.volume) OVER w IS NULL THEN COALESCE(s.volume, 0)
-                        WHEN (LAG(s.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
-                            = (s.timestamp AT TIME ZONE 'America/New_York')::date
+                        WHEN {same_session}
                             THEN GREATEST(COALESCE(s.volume, 0) - COALESCE(LAG(s.volume) OVER w, 0), 0)
                         ELSE COALESCE(s.volume, 0)
                     END::bigint AS volume_delta,
                     CASE
                         WHEN LAG(s.ask_volume) OVER w IS NULL THEN COALESCE(s.ask_volume, 0)
-                        WHEN (LAG(s.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
-                            = (s.timestamp AT TIME ZONE 'America/New_York')::date
+                        WHEN {same_session}
                             THEN GREATEST(COALESCE(s.ask_volume, 0) - COALESCE(LAG(s.ask_volume) OVER w, 0), 0)
                         ELSE COALESCE(s.ask_volume, 0)
                     END::bigint AS ask_vol_delta,
                     CASE
                         WHEN LAG(s.bid_volume) OVER w IS NULL THEN COALESCE(s.bid_volume, 0)
-                        WHEN (LAG(s.timestamp) OVER w AT TIME ZONE 'America/New_York')::date
-                            = (s.timestamp AT TIME ZONE 'America/New_York')::date
+                        WHEN {same_session}
                             THEN GREATEST(COALESCE(s.bid_volume, 0) - COALESCE(LAG(s.bid_volume) OVER w, 0), 0)
                         ELSE COALESCE(s.bid_volume, 0)
                     END::bigint AS bid_vol_delta
@@ -873,7 +911,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 delta = EXCLUDED.delta,
                 underlying_price = EXCLUDED.underlying_price,
                 updated_at = NOW()
-            """,
+            """.format(same_session=same_session),
             symbol,
             backfill_start,
             latest_ts,
