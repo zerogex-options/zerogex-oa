@@ -947,6 +947,121 @@ async def get_range_break_imminence_signal(
     return row
 
 
+@router.get("/advanced/market-pressure")
+async def get_market_pressure_signal(
+    symbol: str = Query(default="SPY"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Market Pressure Index — forward-looking "coiled spring" detector.
+
+    Answers: *is the market loaded to move, and which way will it break?*
+    Distinct from `squeeze_setup` (reactive, fires AFTER momentum starts) and
+    from `range_break_imminence` (regime-switch inside chop) — this signal
+    measures how much DEALER HEDGING DEMAND is loaded into the book right
+    now and which direction that hedging flow will run when any catalyst
+    fires.
+
+    **Logic highlights** (`src/signals/advanced/market_pressure.py`):
+    - Magnitude is MULTIPLICATIVE across four pillars (all must be present):
+      - **Compression** (C): geometric mean of wall pinch
+        `1 − (call_wall − put_wall)/spot` and flip-proximity Cauchy kernel
+        `σ²/(σ² + d²)`; net-GEX regime multiplier amplifies short-gamma
+        and damps long-gamma.
+      - **Hedging vector** (H): session-weighted blend
+        `α·vanna + (1−α)·charm·charm_amp` (α ramps 0.7→0.3 open→close);
+        +20% alignment bonus when vanna and charm share sign, dealer-DNI
+        gate mutes the response when dealers are flat.
+      - **Flow asymmetry** (F): 0.6·premium_skew + 0.4·smart_money_skew,
+        magnitude-gated on total premium flux.
+      - **Vol tension** (T): `√((1 − iv_rank) · vol_squeeze)` where
+        `vol_squeeze` maps the 10-bar/60-bar realized sigma ratio to [0, 1];
+        modulates loading 0.5×–1.0× via a floor.
+    - `loading = 100 · C · H_mag · F_mag · (0.5 + 0.5·T)`  (0–100).
+    - Direction is a weighted vector: `0.45·H + 0.40·F·F_mag + 0.15·dealer`,
+      with a ±30% confidence multiplier based on how many of those three
+      inputs agree.
+    - `score = sign(direction) · √|direction| · (loading/100)` ∈ [-1, +1].
+    - **Triggered when `loading ≥ 50` AND `|direction| ≥ 0.20`** — both
+      magnitude AND directional clarity required.
+
+    **Params:** `symbol` (default `SPY`). Returns 404 when no data exists.
+
+    **Returns:**
+    ```json
+    {
+      "score": 56.0, "clamped_score": 0.56, "direction": "bullish",
+      "triggered": true,
+      "signal": "bullish_pressure",
+      "loading": 78.2,
+      "direction_value": 0.91,
+      "label": "Critical",
+      "playbook": "Coil at the limit. Expect violent resolution to the upside. Take the directional trade with reduced size on stops; cut all counter-pressure exposure.",
+      "confidence_mult": 1.3,
+      "context_values": {"...compression, hedging, flow, tension, dealer, weights..."},
+      "score_history": [{"score": 56.0, "timestamp": "..."}, "...up to 90"]
+    }
+    ```
+
+    - `score` — [-100, +100]; sign = pressure direction, magnitude tracks
+      both loading and directional clarity (`sign·√|direction|·loading`).
+    - `signal` — `"discharged"` | `"bullish_pressure"` |
+      `"bearish_pressure"` | `"loaded_neutral"`.
+    - `loading` — [0, 100]; multiplicative pressure magnitude
+      (Compression × Hedging × Flow × tension-modulator).
+    - `direction_value` — signed [-1, +1] directional vector after the
+      agreement-based confidence multiplier; *not* a clamped score.
+    - `direction` — `"bullish"` | `"bearish"` | `"neutral"` (sign of
+      `direction_value`, using a 1e-6 deadband).
+    - `label` — `"Discharged"` (0–24) | `"Building"` (25–49) |
+      `"Loaded"` (50–74) | `"Critical"` (75–100).
+    - `playbook` — trader-facing guidance string matching the label and
+      direction.
+    - `confidence_mult` — [≈0.7, ≈1.3]; reward/penalty applied to
+      direction when the hedging/flow/dealer inputs agree or fight.
+    - `triggered` — `true` when `loading ≥ 50` AND `|direction_value| ≥ 0.20`.
+
+    **Trader interpretation:**
+    - `label == "Discharged"` → no actionable loading; trade existing setups.
+    - `label == "Building"` → tighten stops on counter-pressure trades;
+      prepare directional templates.
+    - `label == "Loaded"` → stop fading; scale into continuation entries
+      on first confirmation (VWAP reclaim, wall break, flow spike).
+    - `label == "Critical"` → take the directional trade with reduced
+      size on stops; cut counter-pressure exposure.
+    - A `score = 0` does NOT mean "neutral market" — it means a pillar
+      collapsed (no walls, no greeks, no flow) or directional forces are
+      perfectly cancelling. Treat as "this lens is dark."
+
+    **Page design.** Half-circle gauge (0–100 `loading`) colored by
+    `direction`, with the label badge below. Four-bar stack of the
+    sub-component magnitudes (compression / hedging / flow / tension).
+    A small `confidence_mult` chip (e.g. "1.3× — all 3 agree" or
+    "0.8× — flow fighting"). Playbook text under the gauge. Flip the
+    card's accent between "fade-safe" (neutral) and "ride-the-break"
+    (loaded) at the 50-loading threshold.
+    """
+    row = await db.get_advanced_signal(symbol.upper(), "market_pressure")
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No market-pressure signal found for {symbol.upper()}",
+        )
+    ctx = row.get("context_values") or {}
+    row["score_history"] = row.get("score_history") or []
+    row["triggered"] = ctx.get("triggered", False)
+    row["signal"] = ctx.get("signal", "discharged")
+    row["loading"] = ctx.get("loading")
+    # ``direction`` from get_advanced_signal() is already the bullish/
+    # bearish/neutral string (derived from clamped_score sign). Surface
+    # the signed numeric vector under a non-clashing key so dashboards
+    # can plot both the score and the underlying directional confidence.
+    row["direction_value"] = ctx.get("direction")
+    row["label"] = ctx.get("label")
+    row["playbook"] = ctx.get("playbook")
+    row["confidence_mult"] = ctx.get("confidence_mult")
+    return row
+
+
 _BASIC_SIGNAL_NAMES: tuple[str, ...] = (
     "tape_flow_bias",
     "skew_delta",
@@ -1562,6 +1677,7 @@ _VALID_SIGNAL_EVENT_NAMES = {
     "zero_dte_position_imbalance",
     "gamma_vwap_confluence",
     "range_break_imminence",
+    "market_pressure",
     # Basic Signals
     *_BASIC_SIGNAL_NAMES,
 }
@@ -1588,8 +1704,8 @@ async def get_signal_events(
     **Params:**
     - `signal_name` — one of: `vol_expansion`, `eod_pressure`, `squeeze_setup`,
       `trap_detection`, `zero_dte_position_imbalance`, `gamma_vwap_confluence`,
-      `range_break_imminence`, `positioning_trap`, `vanna_charm_flow`.
-      Returns 400 for unknown names.
+      `range_break_imminence`, `market_pressure`, `positioning_trap`,
+      `vanna_charm_flow`.  Returns 400 for unknown names.
     - `symbol` (default `SPY`).
     - `limit` — 1–1000, default 1000 (cap on row count within the session window).
     - `horizon` — `"30m"` | `"60m"` | `"120m"` (default `"60m"`); forward window for realized return.
@@ -1679,6 +1795,7 @@ _ADVANCED_SIGNAL_NAMES: tuple[str, ...] = (
     "zero_dte_position_imbalance",
     "gamma_vwap_confluence",
     "range_break_imminence",
+    "market_pressure",
 )
 
 
@@ -1729,7 +1846,7 @@ async def get_advanced_confluence_matrix(
 
     **Signals (fixed order):** `vol_expansion`, `eod_pressure`, `squeeze_setup`,
     `trap_detection`, `zero_dte_position_imbalance`, `gamma_vwap_confluence`,
-    `range_break_imminence`.
+    `range_break_imminence`, `market_pressure`.
 
     **Returns:**
     ```json
