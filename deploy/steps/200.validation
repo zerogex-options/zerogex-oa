@@ -414,6 +414,18 @@ else
     log "  ⚠ Max-pain refresh timer not enabled (run: make max-pain-refresh-install)"
     WARNING_CHECKS=$((WARNING_CHECKS + 1))
 fi
+
+# Per-minute lightweight system monitor.  A missing timer here means the
+# rolling hourly/daily history at ~ubuntu/monitoring/state.json stops
+# updating silently — flag it the same way max-pain-refresh is flagged.
+TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+if sudo systemctl is-enabled --quiet zerogex-oa-system-monitor.timer 2>/dev/null; then
+    log "  ✓ System-monitor timer enabled"
+    PASSED_CHECKS=$((PASSED_CHECKS + 1))
+else
+    log "  ⚠ System-monitor timer not enabled (run: make system-monitor-install)"
+    WARNING_CHECKS=$((WARNING_CHECKS + 1))
+fi
 log ""
 
 # Final Summary
