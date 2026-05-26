@@ -584,7 +584,7 @@ USE_CASH_SESSION_KEYING = os.getenv("USE_CASH_SESSION_KEYING", "false").lower() 
 #     |              3,000 |              6 |   7 streams  |  21 streams   |
 #
 # A 3-underlying deployment with ≥ ~1500 symbols/underlying exceeds the
-# nominal cap; if the cap WARNING fires, drop ``INGEST_STRIKE_COUNT`` /
+# nominal cap; if the cap WARNING fires, drop ``INGEST_STRIKE_COUNT_MAX`` /
 # ``INGEST_EXPIRATIONS`` to shrink ``symbols_per_underlying``, or raise
 # this value (chunk_size ≤ 800 keeps URLs safely under 414).
 #
@@ -1454,7 +1454,8 @@ SIGNALS_OPTION_QUOTE_MAX_AGE_SECONDS = _getenv_int(
 INGEST_UNDERLYING = os.getenv("INGEST_UNDERLYING", "SPY")
 INGEST_UNDERLYINGS = os.getenv("INGEST_UNDERLYINGS", "")
 INGEST_EXPIRATIONS = int(os.getenv("INGEST_EXPIRATIONS", "3"))
-INGEST_STRIKE_COUNT = int(os.getenv("INGEST_STRIKE_COUNT", "10"))
+INGEST_STRIKE_COUNT_MAX = int(os.getenv("INGEST_STRIKE_COUNT_MAX", "40"))
+INGEST_STRIKE_PCT_RANGE = float(os.getenv("INGEST_STRIKE_PCT_RANGE", "3.0"))
 ANALYTICS_UNDERLYING = os.getenv("ANALYTICS_UNDERLYING", "SPY")
 ANALYTICS_UNDERLYINGS = os.getenv("ANALYTICS_UNDERLYINGS", "")
 ANALYTICS_INTERVAL = int(os.getenv("ANALYTICS_INTERVAL", "60"))

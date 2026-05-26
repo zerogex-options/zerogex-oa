@@ -145,7 +145,8 @@ class IngestionEngine:
         client: TradeStationClient,
         underlying: str = "SPY",
         num_expirations: int = 3,
-        num_strikes: int = 10,
+        strike_count_max: int = 40,
+        strike_pct_range: float = 3.0,
     ):
         """Initialize main ingestion engine"""
         self.client = client
@@ -154,7 +155,8 @@ class IngestionEngine:
             self.underlying
         )  # canonical alias for DB (e.g. "SPX")
         self.num_expirations = num_expirations
-        self.num_strikes = num_strikes
+        self.strike_count_max = strike_count_max
+        self.strike_pct_range = strike_pct_range
 
         self.running = False
 
@@ -248,7 +250,10 @@ class IngestionEngine:
         self._active_stream_manager: Optional[StreamManager] = None
 
         logger.info(f"Initialized IngestionEngine for {underlying}")
-        logger.info(f"Config: {num_expirations} expirations, {num_strikes} strikes each side")
+        logger.info(
+            f"Config: {num_expirations} expirations, "
+            f"±{strike_pct_range}% strike band (max {strike_count_max} strikes/exp)"
+        )
 
         # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -1464,7 +1469,8 @@ class IngestionEngine:
             underlying=self.underlying,
             db_underlying=self.db_symbol,
             num_expirations=self.num_expirations,
-            num_strikes=self.num_strikes,
+            strike_count_max=self.strike_count_max,
+            strike_pct_range=self.strike_pct_range,
         )
 
         # Publish the active manager before initialize()/stream() so a
@@ -1534,7 +1540,8 @@ class IngestionEngine:
         logger.info("=" * 80)
         logger.info(f"Underlying: {self.underlying}")
         logger.info(f"Expirations: {self.num_expirations}")
-        logger.info(f"Strikes Each Side: {self.num_strikes}")
+        logger.info(f"Strike Band: ±{self.strike_pct_range}% of spot")
+        logger.info(f"Strike Count Max: {self.strike_count_max} per expiration")
         logger.info(f"Greeks: {'ENABLED' if GREEKS_ENABLED else 'DISABLED'}")
         logger.info("")
         logger.info("NOTE: This engine streams forward-looking data.")
@@ -1603,10 +1610,16 @@ def main():
         help="Number of expirations (default: 3)",
     )
     parser.add_argument(
-        "--num-strikes",
+        "--strike-count-max",
         type=int,
-        default=int(os.getenv("INGEST_STRIKE_COUNT", "10")),
-        help="Number of strikes to track on each side of current price (default: 10)",
+        default=int(os.getenv("INGEST_STRIKE_COUNT_MAX", "40")),
+        help="Hard cap on strikes per expiration after the pct-range filter (default: 40)",
+    )
+    parser.add_argument(
+        "--strike-pct-range",
+        type=float,
+        default=float(os.getenv("INGEST_STRIKE_PCT_RANGE", "3.0")),
+        help="Strike-selection band as percent of spot, e.g. 3.0 -> ±3%% (default: 3.0)",
     )
     parser.add_argument(
         "--session-template",
@@ -1645,7 +1658,8 @@ def main():
             client=client,
             underlying=symbol,
             num_expirations=args.expirations,
-            num_strikes=args.num_strikes,
+            strike_count_max=args.strike_count_max,
+            strike_pct_range=args.strike_pct_range,
         )
         engine.run()
 

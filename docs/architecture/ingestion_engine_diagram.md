@@ -581,7 +581,7 @@ flowchart LR
 | `MAX_BUFFER_SIZE` | 10 000 | Safety-valve flush per symbol |
 | `BUFFER_FLUSH_INTERVAL` | 60 s | Time-based safety flush |
 | `OPTION_BUCKET_WRITE_MIN_SECONDS` | 5 | Throttle in-minute writes |
-| `INGEST_EXPIRATIONS` / `INGEST_STRIKE_COUNT` | 3 / 10 | Universe size per underlying |
+| `INGEST_EXPIRATIONS` / `INGEST_STRIKE_PCT_RANGE` / `INGEST_STRIKE_COUNT_MAX` | 3 / 3.0% / 40 | Per-underlying universe: N expirations × strikes within ±pct of spot, capped at MAX per exp (trim furthest-first) |
 | `GREEKS_ENABLED` | false | Enable Black-Scholes enrichment |
 | `RISK_FREE_RATE` | 0.05 | BS rate |
 | `IV_CALCULATION_ENABLED` | false | Solve IV from prices |

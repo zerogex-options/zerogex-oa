@@ -861,7 +861,8 @@ class StreamManager:
         underlying: str = "SPY",
         db_underlying: str = None,  # type: ignore[assignment]
         num_expirations: int = 3,
-        num_strikes: int = 10,
+        strike_count_max: int = 40,
+        strike_pct_range: float = 3.0,
     ):
         """Initialize stream manager"""
         self.client = client
@@ -875,7 +876,11 @@ class StreamManager:
             self.underlying
         )  # option root for quotes (e.g. "SPXW")
         self.num_expirations = num_expirations
-        self.num_strikes = num_strikes  # number of strikes to track on each side of current price
+        # Strike selection: take every strike within ±strike_pct_range % of
+        # spot, then trim from the furthest-from-spot strikes inward if the
+        # result exceeds strike_count_max (hard ceiling, total per expiration).
+        self.strike_count_max = strike_count_max
+        self.strike_pct_range = strike_pct_range
 
         # Track state
         self.current_price: Optional[float] = None
@@ -918,7 +923,10 @@ class StreamManager:
         )
 
         logger.info(f"Initialized StreamManager for {underlying}")
-        logger.info(f"Config: {num_expirations} expirations, {num_strikes} strikes each side")
+        logger.info(
+            f"Config: {num_expirations} expirations, "
+            f"±{strike_pct_range}% strike band (max {strike_count_max} strikes/exp)"
+        )
         logger.info(
             "Option REST seed on strike recalibration: %s",
             "enabled" if self.seed_rest_on_recalc else "disabled",
@@ -1124,7 +1132,13 @@ class StreamManager:
             return []
 
     def _get_strikes_near_price(self, expiration: date, current_price: float) -> List[float]:
-        """Get the N nearest strikes on each side of the current price."""
+        """Get strikes within ±strike_pct_range% of spot, capped at strike_count_max.
+
+        Selection is two-step: first filter to the percentage band around
+        spot, then if the band still holds more strikes than
+        ``strike_count_max`` trim from the furthest-from-spot strikes inward
+        until the count fits.
+        """
         try:
             exp_str = expiration.strftime("%m-%d-%Y")
             all_strikes = self.client.get_option_strikes(self.underlying, expiration=exp_str)
@@ -1133,16 +1147,29 @@ class StreamManager:
                 logger.warning(f"No strikes found for exp {exp_str}")
                 return []
 
-            below = sorted([s for s in all_strikes if s <= current_price], reverse=True)[
-                : self.num_strikes
-            ]
-            above = sorted([s for s in all_strikes if s > current_price])[: self.num_strikes]
-            nearby_strikes = sorted(below + above)
+            pct = self.strike_pct_range / 100.0
+            low = current_price * (1.0 - pct)
+            high = current_price * (1.0 + pct)
+            in_band = [s for s in all_strikes if low <= s <= high]
 
-            logger.debug(
+            trimmed_count = 0
+            if len(in_band) > self.strike_count_max:
+                trimmed_count = len(in_band) - self.strike_count_max
+                in_band.sort(key=lambda s: abs(s - current_price))
+                in_band = in_band[: self.strike_count_max]
+
+            nearby_strikes = sorted(in_band)
+            below = sum(1 for s in nearby_strikes if s <= current_price)
+            above = len(nearby_strikes) - below
+
+            log_msg = (
                 f"Exp {exp_str}: {len(nearby_strikes)} strikes "
-                f"({len(below)} below, {len(above)} above ${current_price:.2f})"
+                f"({below} below, {above} above ${current_price:.2f}) "
+                f"within ±{self.strike_pct_range}% [{low:.2f}, {high:.2f}]"
             )
+            if trimmed_count:
+                log_msg += f"; trimmed {trimmed_count} furthest at cap {self.strike_count_max}"
+            logger.debug(log_msg)
 
             return nearby_strikes
 
@@ -1806,7 +1833,8 @@ class StreamManager:
                                 logger.info(
                                     f"Recalibrated strikes around "
                                     f"${self.current_price:.2f} "
-                                    f"(±{self.num_strikes} strikes each side)"
+                                    f"(±{self.strike_pct_range}% band, "
+                                    f"max {self.strike_count_max} strikes/exp)"
                                 )
 
                     # Cleanup expired strikes periodically
@@ -1853,10 +1881,16 @@ def main():
         help="Number of expirations to track (default: 3)",
     )
     parser.add_argument(
-        "--num-strikes",
+        "--strike-count-max",
         type=int,
-        default=int(os.getenv("INGEST_STRIKE_COUNT", "10")),
-        help="Number of strikes to track on each side of current price (default: 10)",
+        default=int(os.getenv("INGEST_STRIKE_COUNT_MAX", "40")),
+        help="Hard cap on strikes per expiration after the pct-range filter (default: 40)",
+    )
+    parser.add_argument(
+        "--strike-pct-range",
+        type=float,
+        default=float(os.getenv("INGEST_STRIKE_PCT_RANGE", "3.0")),
+        help="Strike-selection band as percent of spot, e.g. 3.0 -> ±3%% (default: 3.0)",
     )
     parser.add_argument(
         "--max-iterations", type=int, help="Maximum iterations (default: unlimited)"
@@ -1876,7 +1910,8 @@ def main():
     print("=" * 80)
     print(f"Underlying: {args.underlying}")
     print(f"Expirations: {args.expirations}")
-    print(f"Strikes Each Side: {args.num_strikes}")
+    print(f"Strike Pct Range: ±{args.strike_pct_range}%")
+    print(f"Strike Count Max: {args.strike_count_max} per expiration")
     if args.max_iterations:
         print(f"Max Iterations: {args.max_iterations}")
     else:
@@ -1896,7 +1931,8 @@ def main():
         client=client,
         underlying=args.underlying,
         num_expirations=args.expirations,
-        num_strikes=args.num_strikes,
+        strike_count_max=args.strike_count_max,
+        strike_pct_range=args.strike_pct_range,
     )
 
     # Initialize
