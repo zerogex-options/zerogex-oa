@@ -1,0 +1,21 @@
+[Unit]
+Description=Trigger ZeroGEX system-monitor sample once per minute
+
+[Timer]
+# Fire the collector ~60 s after the unit becomes active, then every
+# 60 s thereafter relative to the last activation (not wall-clock). That
+# gives us steady spacing even if a tick overruns slightly — preferable
+# to OnCalendar=*:0/1:00 which would queue overlapping invocations on a
+# slow run.
+OnBootSec=1min
+OnUnitActiveSec=1min
+# A tiny jitter avoids the once-per-minute spike landing exactly on the
+# top of the second along with every other systemd timer on the box.
+AccuracySec=5s
+RandomizedDelaySec=5s
+# Run on next boot if the box was off when the timer was supposed to
+# fire so a planned reboot doesn't open a gap larger than necessary.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
