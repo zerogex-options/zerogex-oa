@@ -1108,6 +1108,46 @@ class IngestionEngine:
             self.errors_count += 1
             return None
 
+    # Dual-write companion: maintains the "latest quote per option_symbol"
+    # cache that the analytics snapshot reads when
+    # ``ANALYTICS_USE_LATEST_CACHE=true``.  One row per option_symbol;
+    # the ``WHERE EXCLUDED.timestamp >= option_chains_latest.timestamp``
+    # guard prevents an out-of-order / retry write from clobbering a
+    # newer row.  Greeks and quote columns track the row whose timestamp
+    # the writer is currently committing (latest-wins for the cache);
+    # the history table is the durable source of truth and uses the
+    # COALESCE-based merge below.
+    _OPTION_LATEST_UPSERT_SQL = """
+        INSERT INTO option_chains_latest
+        (option_symbol, timestamp, underlying, strike, expiration, option_type,
+         last, bid, ask, mid, volume, open_interest, implied_volatility,
+         ask_volume, mid_volume, bid_volume,
+         delta, gamma, theta, vega)
+        VALUES %s
+        ON CONFLICT (option_symbol) DO UPDATE SET
+            timestamp = EXCLUDED.timestamp,
+            underlying = EXCLUDED.underlying,
+            strike = EXCLUDED.strike,
+            expiration = EXCLUDED.expiration,
+            option_type = EXCLUDED.option_type,
+            last = EXCLUDED.last,
+            bid = EXCLUDED.bid,
+            ask = EXCLUDED.ask,
+            mid = EXCLUDED.mid,
+            volume = GREATEST(option_chains_latest.volume, EXCLUDED.volume),
+            open_interest = GREATEST(option_chains_latest.open_interest, EXCLUDED.open_interest),
+            implied_volatility = EXCLUDED.implied_volatility,
+            ask_volume = GREATEST(option_chains_latest.ask_volume, EXCLUDED.ask_volume),
+            mid_volume = GREATEST(option_chains_latest.mid_volume, EXCLUDED.mid_volume),
+            bid_volume = GREATEST(option_chains_latest.bid_volume, EXCLUDED.bid_volume),
+            delta = EXCLUDED.delta,
+            gamma = EXCLUDED.gamma,
+            theta = EXCLUDED.theta,
+            vega = EXCLUDED.vega,
+            updated_at = NOW()
+        WHERE EXCLUDED.timestamp >= option_chains_latest.timestamp
+    """
+
     # SQL template shared by single and batch writes.
     #
     # ALL monotonic numeric columns (volume, open_interest, ask_volume,
@@ -1311,6 +1351,22 @@ class IngestionEngine:
                 execute_values(
                     cursor,
                     self._OPTION_UPSERT_SQL,
+                    values,
+                    page_size=500,
+                )
+                # Dual-write to option_chains_latest in the SAME transaction
+                # so the cache cannot drift from history under partial
+                # failure -- either both upserts commit or both roll back.
+                # The cache UPSERT is keyed by option_symbol alone (one row
+                # per contract) with a `timestamp >= existing` guard, so an
+                # out-of-order replay cannot clobber a newer row.  Cheap
+                # relative to the main write: ~one btree page touch per
+                # active contract per batch.  Read by the analytics engine
+                # when ANALYTICS_USE_LATEST_CACHE=true; harmless until then
+                # (an unread maintained cache).
+                execute_values(
+                    cursor,
+                    self._OPTION_LATEST_UPSERT_SQL,
                     values,
                     page_size=500,
                 )
