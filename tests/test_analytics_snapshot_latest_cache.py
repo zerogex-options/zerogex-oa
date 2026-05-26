@@ -180,10 +180,72 @@ def test_cache_empty_falls_back_to_history(caplog):
 
     # Fallback yields the history row.
     assert result is not None and len(result["options"]) == 1
-    # And a clear operator-facing warning was emitted.
-    assert any(
-        "option_chains_latest cache returned 0 rows" in r.message for r in caplog.records
-    ), "operator must see the cache miss warning"
+    # A cache-stale warning was emitted because the cache missed data
+    # that history actually had -- that's a real signal worth surfacing
+    # (cache lookback / dual-write health).
+    cache_warnings = [
+        r for r in caplog.records
+        if r.levelname == "WARNING"
+        and "option_chains_latest cache returned 0 rows" in r.message
+    ]
+    assert cache_warnings, "operator must see the cache-stale warning"
+    # And the message must mention the fallback row count so the operator
+    # can tell at a glance whether it's a small or large miss.
+    assert "fallback returned 1" in cache_warnings[0].message
+
+
+# ---------------------------------------------------------------------------
+# Flag on, BOTH cache and history empty: no cache warning (genuine no-data).
+# ---------------------------------------------------------------------------
+
+def test_cache_empty_AND_history_empty_does_not_warn(caplog):
+    """When the cache returns 0 rows AND the history fallback also
+    returns 0 rows, the snapshot is genuinely no-data (post-close
+    expiration roll-off, weekend, market closed) and the engine's
+    downstream empty-snapshot latch already logs that at INFO.  We must
+    NOT also fire the cache-stale warning -- it would flood the journal
+    with a duplicate signal at every 16:15 ET roll-off on SPX without
+    surfacing any actionable problem.
+
+    Regression: the original cutover logged a cache warning every cycle
+    after the 16:15 ET roll-off because SPX's only freshly-quoted
+    contracts were today-expiring (filtered out by min_expiration > today)
+    while longer-dated contracts hadn't been quoted within the lookback
+    window.  Both queries returned empty for the same reason; the warning
+    was noise, not signal.
+    """
+    engine = AnalyticsEngine(underlying="SPY")
+    engine.use_latest_cache = True
+
+    snapshot_ts = _snapshot_ts()
+
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        (snapshot_ts,),
+        (500.0, snapshot_ts),
+    ]
+    # Both cache and history return 0 rows -- genuine no-data state.
+    cursor.fetchall.side_effect = [[], []]
+
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    cm = MagicMock()
+    cm.__enter__.return_value = conn
+    cm.__exit__.return_value = False
+
+    with patch.object(main_engine, "db_connection", return_value=cm):
+        with caplog.at_level("WARNING"):
+            engine._get_snapshot()
+
+    cache_warnings = [
+        r for r in caplog.records
+        if r.levelname == "WARNING"
+        and "option_chains_latest cache returned 0 rows" in r.message
+    ]
+    assert not cache_warnings, (
+        "genuine no-data state must NOT emit the cache-stale warning; "
+        f"got: {[r.message for r in cache_warnings]}"
+    )
 
 
 # ---------------------------------------------------------------------------

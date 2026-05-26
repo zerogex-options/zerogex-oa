@@ -634,6 +634,14 @@ class AnalyticsEngine:
                 # snapshot path below, so a too-early flag flip or a brief
                 # cache outage cannot leave the engine blind.
                 rows: Optional[List[Any]] = None
+                # Track whether the cache returned an empty result so we
+                # can log the right thing AFTER the fallback runs.  A cache
+                # exception (cache_error_logged below) is a different signal
+                # -- something broken, log immediately; cache-empty is only
+                # a real warning if the fallback actually finds rows, since
+                # post-close / weekend snapshots are legitimately empty.
+                cache_returned_empty = False
+                cache_error_logged = False
                 if self.use_latest_cache:
                     try:
                         rows = self._run_snapshot_query_from_cache(
@@ -664,23 +672,18 @@ class AnalyticsEngine:
                             exc_info=True,
                         )
                         rows = None
+                        cache_error_logged = True
                     else:
                         if not rows:
-                            # Expected during cache warm-up (first minutes
-                            # after the flag is flipped or after a
-                            # cache-table rebuild), and on a stale weekend
-                            # where every cache row's timestamp is older
-                            # than ``snapshot_lookback_hours``.  Fall
-                            # through to the history path; it will pick
-                            # the wide cold-start lookback when data is
-                            # genuinely old.
-                            logger.warning(
-                                "option_chains_latest cache returned 0 rows for "
-                                "%s; falling back to the historical DISTINCT ON "
-                                "snapshot for this cycle (cache warm-up or "
-                                "stale cache vs. configured lookback?)",
-                                self.db_symbol,
-                            )
+                            # Don't warn yet -- defer the decision until we
+                            # know whether the history fallback actually
+                            # finds rows.  If history is ALSO empty, the
+                            # snapshot is genuinely no-data (post-close,
+                            # weekend) and the downstream empty-snapshot
+                            # latch already logs that at INFO.  Warning
+                            # here too would flood the log with a duplicate
+                            # signal at every 16:15 ET roll-off on SPX.
+                            cache_returned_empty = True
 
                 # History fallback (also the only path when the flag is off).
                 # ``rows`` is None if cache disabled / cache errored;
@@ -781,6 +784,40 @@ class AnalyticsEngine:
                         "may be incomplete; raise ANALYTICS_SNAPSHOT_MAX_ROWS.",
                         snapshot_row_cap,
                     )
+
+                # Resolve the deferred cache-empty warning now that we know
+                # what the fallback found.  Two cases:
+                #   * Fallback found rows -> the cache was stale and missed
+                #     data that exists in history.  Real signal; log WARNING.
+                #     Causes: cache warm-up just after a flag flip, ingestion
+                #     dual-write outage, lookback window too narrow vs the
+                #     freshest cache timestamp.
+                #   * Fallback also empty -> the snapshot is genuinely no-data
+                #     (post-close + expiration roll-off filter excludes all
+                #     remaining cache rows, weekend, holiday).  The downstream
+                #     ``if not options`` latch handles this at INFO; logging
+                #     a WARNING here too would flood the journal with a
+                #     duplicate signal at every 16:15 ET roll-off.  Drop to
+                #     DEBUG so the diagnostic is still recoverable on demand
+                #     but doesn't enter the warning stream.
+                if cache_returned_empty:
+                    if rows:
+                        logger.warning(
+                            "option_chains_latest cache returned 0 rows for "
+                            "%s but the historical fallback returned %d -- "
+                            "investigate cache freshness (warm-up, stale "
+                            "cache vs configured lookback, or ingestion "
+                            "dual-write outage for this symbol)",
+                            self.db_symbol,
+                            len(rows),
+                        )
+                    else:
+                        logger.debug(
+                            "option_chains_latest cache returned 0 rows for "
+                            "%s; historical fallback also empty (genuine "
+                            "no-data state -- handled downstream)",
+                            self.db_symbol,
+                        )
 
                 options = [
                     {
