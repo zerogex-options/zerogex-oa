@@ -9,26 +9,43 @@ production flow_contract_facts INSERT CTE, never writes back.
 When the two formulations agree row-for-row, there is no divergence and
 flipping ``USE_CASH_SESSION_KEYING`` on is operationally safe.
 
-When they DISAGREE, the harness expects the divergences to cluster in
-two narrow bands per ET session date:
+When they DISAGREE, every divergence MUST have a structural cause -- the
+LAG and current timestamps for that row straddle exactly one of the two
+session boundaries the formulations define differently:
 
-* the 00:00 ET hour, where the legacy formulation treats midnight as
-  a session boundary and the cash formulation does not (a row at 00:15
-  ET belongs to the same cash session as the prior 23:45 ET row), and
-* the 09:30 ET hour, where the cash formulation treats 09:30 as the
-  session boundary and the legacy formulation does not (a row at 09:31
-  ET starts a fresh cumulative against the cash-keyed prior at 09:29).
+* ``crosses_calendar_only`` -- LAG and current are in different ET
+  calendar days but the same cash session.  Legacy sees a boundary
+  (so it uses the absolute volume); cash sees continuation (delta from
+  prior).  Happens on pre-09:30 ET rows whose predecessor was on the
+  prior calendar day.  Cash is correct here: TradeStation does not
+  reset cumulative volume at calendar midnight, so the delta IS the
+  right value.
 
-Any divergence OUTSIDE those bands is a real bug -- the helpers must
-agree throughout RTH, the overnight extended-hours run, and the
-pre-09:30 wee hours.  The test asserts exactly that.
+* ``crosses_cash_open_only`` -- LAG and current are in the same ET
+  calendar day but different cash sessions.  Legacy sees continuation
+  (delta); cash sees a boundary (absolute).  Happens for contracts
+  whose first post-09:30 tick on day D has its LAG in the pre-09:30 ET
+  hours of the same day D.  Cash is correct here too: TS resets at
+  09:30, so the post-09:30 cumulative IS a fresh count.
+
+* ``both_boundaries`` -- both formulations agree (no divergence).
+* ``neither_boundary`` -- both formulations agree.  If a divergence
+  shows up classified this way, something is wrong with the LAG-CASE
+  rendering and the test fails.
+
+The cutover is safe when the parity harness returns ONLY
+crosses_calendar_only and crosses_cash_open_only divergences.  Both of
+those are by-design behavior changes that the rollout commit-message
+documented.  The diagnostic prints the count + a sampling per cause so
+the operator can eyeball "how many rows in this day were affected" and
+"is the magnitude of those deltas sensible" before flipping the flag.
 
 Run this before flipping the flag in any environment:
 
-    CASH_SESSION_KEYING_PARITY_DSN=postgres://... \\
+    CASH_SESSION_KEYING_PARITY_DSN=postgresql://USER@HOST:PORT/DB \\
     CASH_SESSION_KEYING_PARITY_SYMBOL=SPY \\
     CASH_SESSION_KEYING_PARITY_DATE=2026-05-22 \\
-    pytest tests/test_cash_session_keying_parity.py -v
+    pytest tests/test_cash_session_keying_parity.py -v -s
 
 Date defaults to the most recent calendar day with option_chains data;
 symbol defaults to SPY.  The CTE is identical to the production INSERT's
@@ -132,6 +149,7 @@ _PARITY_CTE = """
     with_prev AS (
         SELECT
             s.timestamp,
+            LAG(s.timestamp) OVER w AS prior_ts,
             s.option_symbol,
             CASE
                 WHEN LAG(s.volume) OVER w IS NULL THEN COALESCE(s.volume, 0)
@@ -160,6 +178,7 @@ _PARITY_CTE = """
     )
     SELECT
         timestamp,
+        prior_ts,
         option_symbol,
         volume_delta,
         ask_vol_delta,
@@ -169,6 +188,33 @@ _PARITY_CTE = """
       AND volume_delta > 0
     ORDER BY timestamp, option_symbol
 """
+
+
+def _classify_divergence_cause(prior_ts, current_ts, et) -> str:
+    """Why might the two formulations disagree on this LAG/current pair?
+
+    See the module docstring for the four cases.  ``no_prior`` means
+    the row has no LAG (first row in the contract's window after the
+    seed); it cannot be the source of a divergence so it's classified
+    separately and ignored by the failure check.
+    """
+    from src.validation import cash_session_date
+
+    if prior_ts is None:
+        return "no_prior"
+    prior_cal = prior_ts.astimezone(et).date()
+    curr_cal = current_ts.astimezone(et).date()
+    prior_cash = cash_session_date(prior_ts)
+    curr_cash = cash_session_date(current_ts)
+    legacy_same = prior_cal == curr_cal
+    cash_same = prior_cash == curr_cash
+    if legacy_same and not cash_same:
+        return "crosses_cash_open_only"
+    if not legacy_same and cash_same:
+        return "crosses_calendar_only"
+    if not legacy_same and not cash_same:
+        return "both_boundaries"
+    return "neither_boundary"
 
 
 def _resolve_window(date_str: str | None) -> Tuple[datetime, datetime, date]:
@@ -272,58 +318,103 @@ def test_legacy_and_cash_session_keying_diverge_only_at_session_boundaries():
         ):
             delta_diffs.append({"key": key, "legacy": a, "cash": b})
 
-    # Bucket the divergences by ET hour-of-day for the assertion + report.
+    # Classify every divergent row by its structural cause.  See the
+    # _classify_divergence_cause helper / module docstring for what each
+    # cause means.  Divergences with cause ``neither_boundary`` are bugs
+    # (both formulations should agree when neither sees a session
+    # boundary between LAG and current); the test fails if any appear.
+    # The other causes are by-design behavior changes documented in the
+    # rollout commit message, and the test passes for those.
     def _et_hour(ts: datetime) -> int:
         return ts.astimezone(et).hour
 
-    diff_keys: List[Tuple[datetime, str]] = (
-        [(ts, sym) for ts, sym in legacy_only]
-        + [(ts, sym) for ts, sym in cash_only]
-        + [d["key"] for d in delta_diffs]
+    def _prior_ts_for(key: Tuple[datetime, str]):
+        # Both formulations share the same WINDOW (PARTITION BY
+        # option_symbol ORDER BY timestamp), so prior_ts is identical
+        # for any key present in either index.  Prefer legacy_idx
+        # because legacy_only rows are guaranteed to be there.
+        row = legacy_idx.get(key) or cash_idx[key]
+        return row["prior_ts"]
+
+    all_divergent_keys: List[Tuple[datetime, str]] = sorted(
+        set(legacy_only) | set(cash_only) | {d["key"] for d in delta_diffs}
     )
+
+    cause_counts: Dict[str, int] = defaultdict(int)
     hour_buckets: Dict[int, int] = defaultdict(int)
-    for ts, _sym in diff_keys:
-        hour_buckets[_et_hour(ts)] += 1
+    unexplained: List[Tuple[Tuple[datetime, str], Any]] = []
+    samples_per_cause: Dict[str, List[str]] = defaultdict(list)
 
-    # Allowed bands: the calendar-midnight transition (hour 0) and the
-    # cash-open transition (hour 9, since 09:30 is in hour 9).  Anything
-    # else is a real bug.
-    allowed_hours = {0, 9}
-    bad_hour_buckets = {h: n for h, n in hour_buckets.items() if h not in allowed_hours and n > 0}
-
-    diagnostic = (
-        f"\nSymbol={_SYMBOL} ET session date={session_date}\n"
-        f"  legacy rows={len(legacy_rows)}  cash rows={len(cash_rows)}\n"
-        f"  legacy_only={len(legacy_only)}  cash_only={len(cash_only)}  "
-        f"delta_diffs={len(delta_diffs)}\n"
-        f"  divergences by ET hour-of-day: {dict(sorted(hour_buckets.items()))}\n"
-        f"  allowed bands: {sorted(allowed_hours)} (00:00 = calendar-midnight, "
-        f"09:00-09:59 = 09:30 cash open)\n"
-    )
-
-    if bad_hour_buckets:
-        # Show up to 10 offending rows so the failure message is actionable
-        # without dumping the whole differing-row set.
-        sample: List[str] = []
-        for d in delta_diffs[:10]:
-            h = _et_hour(d["key"][0])
-            if h in bad_hour_buckets:
-                sample.append(
-                    f"    {d['key'][0].astimezone(et).isoformat()} {d['key'][1]} "
-                    f"legacy={d['legacy']['volume_delta']} cash={d['cash']['volume_delta']}"
+    for key in all_divergent_keys:
+        prior_ts = _prior_ts_for(key)
+        cause = _classify_divergence_cause(prior_ts, key[0], et)
+        cause_counts[cause] += 1
+        hour_buckets[_et_hour(key[0])] += 1
+        # neither_boundary -- both formulations should agree, didn't: bug.
+        # no_prior      -- the LAG-NULL branch is identical in both forms,
+        #                  so a divergent first-of-partition row can only
+        #                  exist if the SQL is mis-rendered: also a bug.
+        if cause in ("neither_boundary", "no_prior"):
+            unexplained.append((key, prior_ts))
+        if len(samples_per_cause[cause]) < 3:
+            # Three samples per cause is enough to eyeball "do the
+            # deltas look sensible" without dumping the world.
+            if key in legacy_idx and key in cash_idx:
+                samples_per_cause[cause].append(
+                    f"    {key[0].astimezone(et).isoformat()} {key[1]}  "
+                    f"legacy_vol_delta={legacy_idx[key]['volume_delta']}  "
+                    f"cash_vol_delta={cash_idx[key]['volume_delta']}  "
+                    f"prior_ts={prior_ts.astimezone(et).isoformat() if prior_ts else 'NULL'}"
                 )
-        for ts, sym in (legacy_only + cash_only)[:10]:
-            h = _et_hour(ts)
-            if h in bad_hour_buckets:
-                side = "legacy-only" if (ts, sym) in legacy_only else "cash-only"
-                sample.append(f"    {ts.astimezone(et).isoformat()} {sym} [{side}]")
-        sample_str = "\n".join(sample) if sample else "    (no examples captured)"
-        pytest.fail(
-            "Cash-session keying parity FAILED -- divergence outside the "
-            f"allowed 00:00/09:30 ET bands.\n{diagnostic}"
-            f"  offending hours: {bad_hour_buckets}\n"
-            f"  example offenders:\n{sample_str}"
+            else:
+                side = "legacy-only" if key in legacy_idx else "cash-only"
+                row = legacy_idx.get(key) or cash_idx[key]
+                samples_per_cause[cause].append(
+                    f"    {key[0].astimezone(et).isoformat()} {key[1]}  [{side}]  "
+                    f"vol_delta={row['volume_delta']}  "
+                    f"prior_ts={prior_ts.astimezone(et).isoformat() if prior_ts else 'NULL'}"
+                )
+
+    diagnostic_lines: List[str] = [
+        "",
+        f"Symbol={_SYMBOL} ET session date={session_date}",
+        f"  legacy rows={len(legacy_rows)}  cash rows={len(cash_rows)}",
+        f"  legacy_only={len(legacy_only)}  cash_only={len(cash_only)}  "
+        f"delta_diffs={len(delta_diffs)}  total_divergent={len(all_divergent_keys)}",
+        f"  divergences by ET hour-of-day: {dict(sorted(hour_buckets.items()))}",
+        f"  divergences by structural cause: {dict(sorted(cause_counts.items()))}",
+    ]
+    for cause in sorted(samples_per_cause):
+        diagnostic_lines.append(f"  sample {cause}:")
+        diagnostic_lines.extend(samples_per_cause[cause])
+    diagnostic = "\n".join(diagnostic_lines) + "\n"
+
+    if unexplained:
+        # The cash/legacy formulations differ at the LAG/current pair
+        # for a row where NEITHER formulation sees a session boundary --
+        # or where the LAG-NULL branch fired but the two indexes
+        # disagree.  Both cases imply the LAG-CASE SQL is mis-rendered
+        # or the date helpers return inconsistent results.  Surface up
+        # to ten so the failure message is actionable.
+        sample = "\n".join(
+            f"    {ts.astimezone(et).isoformat()} {sym}  "
+            f"prior_ts={prior.astimezone(et).isoformat() if prior else 'NULL'}"
+            for (ts, sym), prior in unexplained[:10]
         )
+        pytest.fail(
+            "Cash-session keying parity FAILED -- "
+            f"{len(unexplained)} divergences with no known structural cause.\n"
+            f"{diagnostic}"
+            f"  example unexplained divergences:\n"
+            f"{sample}"
+        )
+
+    # Pass: every divergence has a known structural cause.  Print the
+    # breakdown so ``pytest -v -s`` shows it and the operator can
+    # eyeball "is this a sensible amount of change before I flip the
+    # flag in staging".  Without -s, pytest captures the print but the
+    # test still passes.
+    print(diagnostic + "OK -- all divergences explained by known boundary causes.")
 
     # Pass -- print the diagnostic so the user can see how much divergence
     # there was even when it's all in the expected bands.  pytest -v shows
