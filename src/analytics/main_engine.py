@@ -3237,6 +3237,57 @@ class AnalyticsEngine:
             close_connection_pool()
 
 
+def _compute_worker_stagger(interval_seconds: int, num_workers: int) -> float:
+    """Resolve the per-worker startup-stagger window in seconds.
+
+    Multi-symbol analytics deployments fork one ``Process`` per symbol
+    inside the same systemd unit.  All children start at the same wall
+    clock instant and then enter a ``time.sleep(interval)`` cycle, which
+    locks their per-cycle ``_get_snapshot`` calls in-phase forever after
+    a restart.  Each of those calls reads ~hundreds of MB from
+    ``option_chains``; running them simultaneously starves the buffer
+    pool and produces the ``DataFileRead`` contention pattern in
+    ``pg_stat_activity``.  Offsetting each worker's first cycle by
+    ``i * (interval / N)`` spreads them evenly across the cycle so only
+    one snapshot query is "live" against the DB at any instant.
+
+    Configuration via ``ANALYTICS_WORKER_STAGGER_SECONDS``:
+      * ``auto`` / unset (default): even spread = ``interval / N``.
+      * ``0`` / ``off`` / ``false`` / ``disabled`` / ``""``: no stagger.
+      * any non-negative number: explicit per-worker delay in seconds.
+
+    Falls back to ``auto`` on parse failure rather than crashing worker
+    startup -- an unparseable value should not take the analytics engine
+    down.
+    """
+    if num_workers <= 1:
+        return 0.0
+
+    raw = os.getenv("ANALYTICS_WORKER_STAGGER_SECONDS", "auto").strip().lower()
+    # Strip inline shell-style comments tolerated elsewhere in this file.
+    if "#" in raw:
+        raw = raw.split("#", 1)[0].strip()
+
+    if raw in ("", "0", "off", "false", "disabled"):
+        return 0.0
+
+    auto_delay = float(interval_seconds) / float(num_workers)
+
+    if raw == "auto":
+        return auto_delay
+
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid ANALYTICS_WORKER_STAGGER_SECONDS=%r; falling back to "
+            "auto (%.1fs per worker)",
+            raw,
+            auto_delay,
+        )
+        return auto_delay
+
+
 def main():
     """Main entry point"""
     import argparse
@@ -3283,7 +3334,18 @@ def main():
         logger.error("No valid underlyings provided")
         sys.exit(1)
 
-    def run_for_symbol(symbol: str):
+    def run_for_symbol(symbol: str, startup_delay_seconds: float = 0.0):
+        # Multi-symbol deployments spread workers across the cycle interval
+        # so the per-worker `_get_snapshot` queries don't pile up on the
+        # same buffer-pool window.  Single-worker / `--once` paths skip the
+        # delay (delay=0).  See `_compute_worker_stagger`.
+        if startup_delay_seconds > 0 and not args.once:
+            logger.info(
+                f"[{symbol}] Worker stagger: sleeping {startup_delay_seconds:.1f}s "
+                "before first snapshot cycle"
+            )
+            _time.sleep(startup_delay_seconds)
+
         engine = AnalyticsEngine(
             underlying=symbol,
             calculation_interval=args.interval,
@@ -3301,11 +3363,32 @@ def main():
         run_for_symbol(symbols[0])
         return
 
-    logger.info(f"Starting analytics engines for symbols: {', '.join(symbols)}")
+    # Stagger per-worker startup so the N snapshot queries don't all
+    # hit the database at the same instant after a restart.  Each worker
+    # forks at the same moment and enters a `time.sleep(interval)` loop;
+    # without an offset they stay locked in-phase forever, so the per-cycle
+    # `_get_snapshot` calls pile up on a single buffer-pool window and
+    # crowd each other out via `DataFileRead` contention.  See
+    # `_compute_worker_stagger` for the env-var contract.
+    stagger_per_worker = _compute_worker_stagger(args.interval, len(symbols))
+
+    logger.info(
+        f"Starting analytics engines for symbols: {', '.join(symbols)}"
+        + (
+            f" (stagger: {stagger_per_worker:.1f}s between workers)"
+            if stagger_per_worker > 0
+            else ""
+        )
+    )
     processes: List[Process] = []
 
-    for symbol in symbols:
-        process = Process(target=run_for_symbol, args=(symbol,), name=f"analytics-{symbol}")
+    for index, symbol in enumerate(symbols):
+        startup_delay = stagger_per_worker * index
+        process = Process(
+            target=run_for_symbol,
+            args=(symbol, startup_delay),
+            name=f"analytics-{symbol}",
+        )
         process.start()
         processes.append(process)
 
