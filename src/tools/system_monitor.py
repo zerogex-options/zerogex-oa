@@ -75,7 +75,7 @@ WARNING_TOKEN = " - WARNING - "
 #   Stage timings (total 3.62s): snapshot=2.66s, gex_by_strike=0.15s, ...
 STAGE_TIMINGS_RE = re.compile(r"Stage timings \(total ([0-9]+(?:\.[0-9]+)?)s\)")
 
-STATE_VERSION = 1
+STATE_VERSION = 2  # v2 = disk metrics simplified from {max, avg} to {latest}
 
 
 # -----------------------------------------------------------------------------
@@ -442,9 +442,18 @@ def _aggregate_bucket(
     }
     for mount in disk_mounts:
         key = _disk_metric_key(mount)
-        vals = [s.disk_pcts.get(mount) for s in samples]
-        vals = [v for v in vals if v is not None]
-        metrics[key] = _max_avg(vals)
+        # Disk %used barely moves minute-to-minute and the user only wants
+        # to know the current value — so we expose the most recent reading
+        # in the bucket rather than max/avg.  Walk samples newest-first
+        # because some collectors may have returned None on transient `df`
+        # failures; "latest" means "most recent non-null reading".
+        latest: float | None = None
+        for s in reversed(samples):
+            v = s.disk_pcts.get(mount)
+            if v is not None:
+                latest = v
+                break
+        metrics[key] = {"latest": latest}
     metrics["errors_by_service"] = _sum_by_service(
         [s.errors_by_service for s in samples], services
     )
@@ -584,7 +593,38 @@ def load_state(path: Path) -> dict[str, Any]:
     data.setdefault("version", STATE_VERSION)
     data.setdefault("hourly", [])
     data.setdefault("daily", [])
+    _migrate_state_in_place(data)
     return data
+
+
+def _migrate_state_in_place(state: dict[str, Any]) -> None:
+    """Idempotent in-place migration of older state-file shapes.
+
+    v1 → v2: disk_*_pct metrics changed from {"max": x, "avg": y} to
+    {"latest": z}.  For closed buckets we lost the per-minute samples
+    that would let us recover the true "last reading", but disk %used
+    barely moves minute-to-minute so the bucket's max is within a
+    fraction of a percent of its closing latest — use it as the
+    migration value rather than dropping pre-v2 history.
+    """
+    if state.get("version", 0) >= STATE_VERSION:
+        return
+    for bucket in list(state.get("hourly") or []) + list(state.get("daily") or []):
+        metrics = bucket.get("metrics") if isinstance(bucket, dict) else None
+        if not isinstance(metrics, dict):
+            continue
+        for key, value in list(metrics.items()):
+            if not key.startswith("disk_"):
+                continue
+            if not isinstance(value, dict):
+                continue
+            if "latest" in value:
+                continue
+            fallback = value.get("max")
+            if fallback is None:
+                fallback = value.get("avg")
+            metrics[key] = {"latest": fallback}
+    state["version"] = STATE_VERSION
 
 
 def save_state(path: Path, state: dict[str, Any]) -> None:
@@ -810,7 +850,7 @@ def _summarise(state: dict[str, Any]) -> str:
         for k, v in metrics.items():
             if not k.startswith("disk_"):
                 continue
-            lines.append(f"  {k:<20s} max={_fmt(v.get('max'))} avg={_fmt(v.get('avg'))}")
+            lines.append(f"  {k:<20s} latest={_fmt(v.get('latest'))}")
         errs = metrics.get("errors_by_service") or {}
         warns = metrics.get("warnings_by_service") or {}
         if errs or warns:

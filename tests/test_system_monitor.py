@@ -192,9 +192,12 @@ def test_aggregate_bucket_basic_shape():
     services = ["zerogex-oa-analytics"]
     mounts = ["/", "/var/log"]
     samples = [
-        _make_sample(datetime(2026, 5, 26, 10, 0), cpu=10, mem=50, cycles=[1.0, 2.0]),
-        _make_sample(datetime(2026, 5, 26, 10, 1), cpu=20, mem=55, cycles=[3.0]),
-        _make_sample(datetime(2026, 5, 26, 10, 2), cpu=30, mem=60, cycles=[]),
+        _make_sample(datetime(2026, 5, 26, 10, 0), cpu=10, mem=50,
+                     cycles=[1.0, 2.0], disk_root=89.0, disk_log=12.0),
+        _make_sample(datetime(2026, 5, 26, 10, 1), cpu=20, mem=55,
+                     cycles=[3.0], disk_root=89.5, disk_log=12.5),
+        _make_sample(datetime(2026, 5, 26, 10, 2), cpu=30, mem=60,
+                     cycles=[], disk_root=90.0, disk_log=13.0),
     ]
     out = _aggregate_bucket(samples, mounts, services)
     assert out["sample_count"] == 3
@@ -203,8 +206,39 @@ def test_aggregate_bucket_basic_shape():
     assert out["cycle_time_s"]["max"] == 3.0
     assert out["cycle_time_s"]["median"] == 2.0
     assert out["cycle_time_s"]["count"] == 3
-    assert out["disk_root_pct"]["max"] == 90.0
-    assert out["disk_var_log_pct"]["max"] == 13.0
+    # Disk → newest-non-null only, no max/avg.  The user explicitly asked
+    # for "just the latest, whatever it is" because util barely moves
+    # minute-to-minute and a peak there is rarely actionable.
+    assert out["disk_root_pct"] == {"latest": 90.0}
+    assert out["disk_var_log_pct"] == {"latest": 13.0}
+
+
+def test_aggregate_bucket_disk_latest_skips_transient_df_failures():
+    """If `df` failed on the most recent tick (None reading), the bucket
+    should still surface the last good value rather than reporting None."""
+    services = ["svc"]
+    mounts = ["/"]
+    samples = [
+        _make_sample(datetime(2026, 5, 26, 10, 0), disk_root=89.0),
+        _make_sample(datetime(2026, 5, 26, 10, 1), disk_root=90.0),
+        # transient df failure on the latest tick
+        _make_sample(datetime(2026, 5, 26, 10, 2), disk_root=None),
+    ]
+    out = _aggregate_bucket(samples, mounts, services)
+    assert out["disk_root_pct"] == {"latest": 90.0}
+
+
+def test_aggregate_bucket_disk_latest_all_none_returns_none():
+    """If every reading failed we report None, not the absence of the key —
+    the consumer needs a stable shape to plot against."""
+    services = ["svc"]
+    mounts = ["/"]
+    samples = [
+        _make_sample(datetime(2026, 5, 26, 10, 0), disk_root=None),
+        _make_sample(datetime(2026, 5, 26, 10, 1), disk_root=None),
+    ]
+    out = _aggregate_bucket(samples, mounts, services)
+    assert out["disk_root_pct"] == {"latest": None}
 
 
 def test_fold_sample_overwrites_open_bucket_until_rollover():
@@ -347,6 +381,44 @@ def test_save_state_writes_atomically_no_partial_files(tmp_path: Path):
     assert leftovers == [], f"temp files left behind: {leftovers}"
 
 
+def test_load_state_migrates_v1_disk_shape_in_place(tmp_path: Path):
+    """A pre-v2 state file (disk metrics stored as {max, avg}) should be
+    transparently upgraded to {latest} on load, using the bucket's max as
+    the migration value.  Disk %used barely changes minute-to-minute so
+    `max` is the closest available proxy for the closing reading we'd
+    have stored under the new shape.  Migration must be idempotent.
+    """
+    path = tmp_path / "state.json"
+    pre_v2 = {
+        "version": 1,
+        "hourly": [
+            {
+                "bucket_start": "2026-05-26T10:00:00",
+                "metrics": {
+                    "cpu_pct": {"max": 50.0, "avg": 30.0},
+                    "disk_root_pct":    {"max": 90.0, "avg": 89.5},
+                    "disk_var_log_pct": {"max": 14.0, "avg": 13.5},
+                },
+            },
+        ],
+        "daily": [],
+    }
+    path.write_text(json.dumps(pre_v2))
+
+    loaded = load_state(path)
+    assert loaded["version"] == sm.STATE_VERSION
+    bucket = loaded["hourly"][0]["metrics"]
+    assert bucket["disk_root_pct"] == {"latest": 90.0}
+    assert bucket["disk_var_log_pct"] == {"latest": 14.0}
+    # Non-disk metrics untouched — only disk shape changed.
+    assert bucket["cpu_pct"] == {"max": 50.0, "avg": 30.0}
+
+    # Idempotency: a second load on the (already-migrated) in-memory state
+    # is a no-op.
+    sm._migrate_state_in_place(loaded)
+    assert loaded["hourly"][0]["metrics"]["disk_root_pct"] == {"latest": 90.0}
+
+
 def test_load_state_rotates_corrupt_file(tmp_path: Path):
     path = tmp_path / "state.json"
     path.write_text("{not valid json")
@@ -409,8 +481,8 @@ def test_run_once_persists_sample_and_rolls_cpu_state(tmp_path: Path, monkeypatc
     metrics = bucket["metrics"]
     assert metrics["cpu_pct"]["max"] == 42.0
     assert metrics["mem_pct"]["max"] == 58.5
-    assert metrics["disk_root_pct"]["max"] == 90.0
-    assert metrics["disk_var_log_pct"]["max"] == 13.0
+    assert metrics["disk_root_pct"] == {"latest": 90.0}
+    assert metrics["disk_var_log_pct"] == {"latest": 13.0}
     assert metrics["cycle_time_s"]["max"] == 3.62
     assert metrics["errors_by_service"] == {
         "zerogex-oa-analytics": 1, "zerogex-oa-api": 0,
