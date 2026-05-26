@@ -65,6 +65,7 @@ from src.config import (
     SIGNALS_MIN_HOLD_SECONDS,
     SIGNALS_NO_0DTE_AFTERNOON_MINUTES,
     SIGNALS_NO_0DTE_MORNING_MINUTES,
+    SIGNALS_OPTION_QUOTE_MAX_AGE_SECONDS,
     SIGNALS_PORTFOLIO_SIZE,
     SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES,
     SIGNALS_SCALP_MIN_HOLD_SECONDS,
@@ -816,7 +817,7 @@ class PortfolioEngine:
         target.source = f"advanced:{signal_result.name}"
         confirm_label = confirmation.get("label") or "no-confirm-required"
 
-        boost_label = self._apply_breakout_boost(target, signal_result.name)
+        boost_label = self._apply_breakout_boost(target, signal_result.name, conn)
 
         target.rationale = (
             f"Advanced {signal_result.name} score={signal_result.score:.3f} triggered "
@@ -827,8 +828,9 @@ class PortfolioEngine:
         )
         return target
 
-    @staticmethod
-    def _apply_breakout_boost(target: PortfolioTarget, signal_name: str) -> Optional[str]:
+    def _apply_breakout_boost(
+        self, target: PortfolioTarget, signal_name: str, conn
+    ) -> Optional[str]:
         """Apply Phase 3.2 sizing/target boost when the trigger is a directional-
         expansion advanced signal (range_break_imminence, squeeze_setup, etc.).
 
@@ -836,6 +838,13 @@ class PortfolioEngine:
         target_pct override into the optimizer payload so the risk plan widens
         the take-profit on this specific trade.  Returns a short human-readable
         label for the rationale, or ``None`` when no boost was applied.
+
+        Re-validates the post-boost contract count against the live
+        portfolio-heat cap. ``compute_target`` trims to the cap pre-boost, but
+        multiplying by ``SIGNALS_BREAKOUT_SIZE_MULTIPLIER`` would punch
+        through the cap without this re-check. Headroom is consumed across
+        target positions in order, so a multi-position target can't double-
+        count the same headroom on each leg.
         """
         eligible = {name.lower() for name in SIGNALS_BREAKOUT_SIGNAL_SOURCES}
         if signal_name.lower() not in eligible:
@@ -846,9 +855,34 @@ class PortfolioEngine:
         size_mult = float(SIGNALS_BREAKOUT_SIZE_MULTIPLIER)
         widen_target_pct = float(SIGNALS_BREAKOUT_TARGET_PCT)
 
+        try:
+            with self._use_conn(conn) as c:
+                existing_heat = self._current_portfolio_heat_pct(c)
+        except Exception:
+            existing_heat = 0.0
+        headroom_pct = max(self.max_heat_pct - existing_heat, 0.0)
+        remaining_dollars = headroom_pct * SIGNALS_PORTFOLIO_SIZE
+
         boosted_total = 0
+        cap_trimmed = False
         for tp in target.target_positions:
             scaled = max(int(round(tp.contracts * size_mult)), tp.contracts)
+            per_contract = abs(tp.entry_mark) * 100.0
+            if per_contract > 0 and remaining_dollars > 0:
+                cap_ceiling = int(remaining_dollars // per_contract)
+                if scaled > cap_ceiling:
+                    # Keep the pre-boost size if the cap is too tight to
+                    # accept any of the boost; never shrink below what
+                    # compute_target already validated.
+                    new_scaled = max(cap_ceiling, tp.contracts)
+                    if new_scaled < scaled:
+                        cap_trimmed = True
+                    scaled = new_scaled
+            elif per_contract > 0:
+                # Zero headroom — fall back to pre-boost size.
+                if scaled > tp.contracts:
+                    cap_trimmed = True
+                scaled = tp.contracts
             tp.contracts = scaled
             payload = dict(tp.optimizer_payload or {})
             risk_overrides = dict(payload.get("risk_overrides") or {})
@@ -862,6 +896,7 @@ class PortfolioEngine:
             payload["risk_overrides"] = risk_overrides
             tp.optimizer_payload = payload
             boosted_total += scaled
+            remaining_dollars -= per_contract * scaled
 
         target.total_target_contracts = boosted_total
         if target.target_positions:
@@ -870,6 +905,16 @@ class PortfolioEngine:
                 abs(primary.entry_mark) * boosted_total * 100 / max(SIGNALS_PORTFOLIO_SIZE, 1.0),
                 6,
             )
+        if cap_trimmed:
+            logger.info(
+                "Breakout boost trimmed by heat cap: existing=%.2f%% cap=%.2f%% "
+                "headroom=%.2f%% (signal=%s)",
+                existing_heat * 100,
+                self.max_heat_pct * 100,
+                headroom_pct * 100,
+                signal_name,
+            )
+            return f"breakout-boost x{size_mult:.2f} target={widen_target_pct:.0%} (cap-trimmed)"
         return f"breakout-boost x{size_mult:.2f} target={widen_target_pct:.0%}"
 
     @classmethod
@@ -1965,19 +2010,42 @@ class PortfolioEngine:
     def _latest_option_quote(
         self, option_symbol: str, as_of: datetime, conn
     ) -> Optional[tuple[float, float, float]]:
-        """Latest (bid, ask, last) for a single option at-or-before ``as_of``."""
+        """Latest (bid, ask, last) for a single option at-or-before ``as_of``.
+
+        Rejects quote rows older than ``SIGNALS_OPTION_QUOTE_MAX_AGE_SECONDS``
+        so a quote-ingest stall (or the first cycle after a weekend/holiday)
+        cannot price an open trade against a multi-day-stale mark. Returning
+        ``None`` makes ``_spread_mark`` return ``(None, mode)``, which
+        ``_close_trade`` refuses with a "no fresh mark" warning instead of
+        booking a fictitious fill.
+        """
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT bid, ask, last
-            FROM option_chains
-            WHERE option_symbol = %s
-              AND timestamp <= %s
-            ORDER BY timestamp DESC
-            LIMIT 1
-            """,
-            (option_symbol, as_of),
-        )
+        max_age = SIGNALS_OPTION_QUOTE_MAX_AGE_SECONDS
+        if max_age and max_age > 0:
+            cur.execute(
+                """
+                SELECT bid, ask, last
+                FROM option_chains
+                WHERE option_symbol = %s
+                  AND timestamp <= %s
+                  AND timestamp >= %s - (%s || ' seconds')::interval
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                (option_symbol, as_of, as_of, str(max_age)),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT bid, ask, last
+                FROM option_chains
+                WHERE option_symbol = %s
+                  AND timestamp <= %s
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                (option_symbol, as_of),
+            )
         row = cur.fetchone()
         if not row:
             return None

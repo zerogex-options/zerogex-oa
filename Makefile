@@ -857,6 +857,9 @@ help: ## Show this help message
 	@echo "  make normalizer-cache-healthcheck - Flag stale cache rows (exit 1 = stale, for monitoring)"
 	@echo "  make max-pain-refresh-install - Install daily max-pain snapshot refresh timer (05:00 ET)"
 	@echo "  make max-pain-refresh-status  - Show max-pain refresh timer status + recent log"
+	@echo "  make system-monitor-install   - Install per-minute system-monitor timer (CPU/mem/disk/errs/cycle)"
+	@echo "  make system-monitor-show      - Print latest hourly + daily aggregates"
+	@echo "  make system-monitor-status    - Show system-monitor timer status + recent log"
 	@echo "  make alert-template-install   - Install zerogex-alert@.service + sample env (slack/sns/pagerduty/webhook)"
 	@echo "  make alert-template-test      - Fire a synthetic alert through the template"
 	@echo ""
@@ -3130,6 +3133,7 @@ api-test: ## Test ALL API endpoints — HTTP code, time, size in an aligned tabl
 	hit "/api/signals/advanced/0dte-position-imbalance?symbol=$$SYMBOL"; \
 	hit "/api/signals/advanced/gamma-vwap-confluence?symbol=$$SYMBOL"; \
 	hit "/api/signals/advanced/range-break-imminence?symbol=$$SYMBOL"; \
+	hit "/api/signals/advanced/market-pressure?symbol=$$SYMBOL"; \
 	hit "/api/signals/advanced/confluence-matrix?symbol=$$SYMBOL&lookback=120"; \
 	hit "/api/signals/vol_expansion/events?symbol=$$SYMBOL"; \
 	hit "/api/signals/eod_pressure/events?symbol=$$SYMBOL"; \
@@ -3388,6 +3392,66 @@ max-pain-refresh-status: ## Show max-pain refresh timer status + last/next fire 
 	@systemctl status zerogex-oa-max-pain-refresh.service --no-pager -l || true
 	@echo ""
 	@sudo journalctl -u zerogex-oa-max-pain-refresh -n 30 --no-pager || true
+
+# =============================================================================
+# Lightweight System / Application Monitor
+# =============================================================================
+# Captures one sample per minute (CPU %, mem %, root + /var/log disk %, per-engine
+# error/warning counts, analytics cycle-time from "Stage timings" log lines) and
+# folds it into the *currently open* hourly + daily bucket in a single JSON
+# state file.  See src/tools/system_monitor.py for the full description.
+#
+# Override knobs (env vars; honoured by the script *and* its systemd service):
+#   MONITOR_STATE_FILE        default ~ubuntu/monitoring/state.json
+#   MONITOR_SERVICES          default ingestion,analytics,signals,api
+#   MONITOR_ANALYTICS_SERVICE default zerogex-oa-analytics
+#   MONITOR_DISK_MOUNTS       default /,/var/log
+#   MONITOR_HOURLY_RETENTION  default 720 (30 days)
+#   MONITOR_DAILY_RETENTION   default 90
+
+.PHONY: system-monitor
+system-monitor: ## Take a single monitoring sample (also runs every minute via timer once installed)
+	@$(PY) -m src.tools.system_monitor
+
+.PHONY: system-monitor-show
+system-monitor-show: ## Pretty-print the latest hourly + daily aggregate from the state file
+	@$(PY) -m src.tools.system_monitor --show
+
+.PHONY: system-monitor-show-json
+system-monitor-show-json: ## Dump the entire monitor state file as JSON (for piping into jq)
+	@$(PY) -m src.tools.system_monitor --show --json
+
+.PHONY: system-monitor-install
+system-monitor-install: ## Install the per-minute system-monitor timer
+	@echo "$(BLUE)=== Installing System Monitor Timer (1-minute cadence) ===$(NC)"
+	@sudo install -d -o ubuntu -g ubuntu -m 0755 /home/ubuntu/monitoring
+	@sudo cp setup/systemd/zerogex-oa-system-monitor.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-system-monitor.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-system-monitor.timer
+	@echo "$(GREEN)✅ system-monitor timer installed and started (fires every 60s)$(NC)"
+	@echo "$(YELLOW)Status:      systemctl status zerogex-oa-system-monitor.timer$(NC)"
+	@echo "$(YELLOW)Logs:        journalctl -u zerogex-oa-system-monitor$(NC)"
+	@echo "$(YELLOW)Latest:      make system-monitor-show$(NC)"
+	@echo "$(YELLOW)Trigger now: sudo systemctl start zerogex-oa-system-monitor.service$(NC)"
+
+.PHONY: system-monitor-uninstall
+system-monitor-uninstall: ## Remove the system-monitor timer (keeps state file)
+	@echo "$(YELLOW)Removing system-monitor timer (state file preserved)...$(NC)"
+	@sudo systemctl disable --now zerogex-oa-system-monitor.timer 2>/dev/null || true
+	@sudo rm -f /etc/systemd/system/zerogex-oa-system-monitor.service \
+	            /etc/systemd/system/zerogex-oa-system-monitor.timer
+	@sudo systemctl daemon-reload
+	@echo "$(GREEN)✅ system-monitor timer removed; state file at /home/ubuntu/monitoring/state.json untouched$(NC)"
+
+.PHONY: system-monitor-status
+system-monitor-status: ## Show system-monitor timer status + last/next fire + recent log
+	@echo "$(BLUE)=== System Monitor Timer ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-system-monitor.timer' || true
+	@echo ""
+	@systemctl status zerogex-oa-system-monitor.service --no-pager -l || true
+	@echo ""
+	@sudo journalctl -u zerogex-oa-system-monitor -n 30 --no-pager || true
 
 .PHONY: alert-template-install
 alert-template-install: ## Install zerogex-alert@.service template + sample env (does NOT enable OnFailure= hooks)

@@ -85,9 +85,9 @@ done
 sleep 3
 
 # -- Timer-based maintenance units -----------------------------------
-# Oneshot services driven by .timer units (run nightly).  Installed
-# separately from the always-on services above because they don't
-# need the start/stop dance — `enable --now <timer>` is enough.
+# Oneshot services driven by .timer units (run nightly + per-minute).
+# Installed separately from the always-on services above because they
+# don't need the start/stop dance — `enable --now <timer>` is enough.
 TIMER_UNITS=(
     "zerogex-oa-db-maintain"
     "zerogex-oa-db-vacuum-full"
@@ -95,7 +95,20 @@ TIMER_UNITS=(
     "zerogex-oa-normalizer-refresh"
     "zerogex-oa-normalizer-healthcheck"
     "zerogex-oa-max-pain-refresh"
+    # Per-minute lightweight monitor (CPU/mem/disk/per-engine errs+warns/
+    # analytics cycle time).  See src/tools/system_monitor.py.  Writes
+    # state to $HOME/monitoring/state.json; the directory is created
+    # below before the timer is enabled so the first tick doesn't race.
+    "zerogex-oa-system-monitor"
 )
+
+# Pre-create writable state directories needed by the timer units above.
+# system-monitor writes its rolling JSON to ~ubuntu/monitoring/state.json;
+# its service unit's ReadWritePaths= lists that directory so it must
+# exist before the first tick fires.
+log "  → Pre-creating state directories for timer units..."
+sudo install -d -o "$USER" -g "$USER" -m 0755 "$HOME/monitoring"
+log "     ✓ $HOME/monitoring (system-monitor state)"
 
 log "  → Installing timer-based maintenance units..."
 TIMER_INSTALLED=()

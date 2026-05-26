@@ -33,12 +33,15 @@ from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
 from src.validation import (
     bucket_timestamp,
+    cash_session_date,
+    cash_session_start_utc,
     get_market_session,
     is_engine_run_window,
     seconds_until_engine_run_window,
     underlying_feed_expected,
 )
 from src.symbols import parse_underlyings, get_canonical_symbol
+from src import config as _config
 from src.config import (
     AGGREGATION_BUCKET_SECONDS,
     MAX_BUFFER_SIZE,
@@ -142,7 +145,8 @@ class IngestionEngine:
         client: TradeStationClient,
         underlying: str = "SPY",
         num_expirations: int = 3,
-        num_strikes: int = 10,
+        strike_count_max: int = 40,
+        strike_pct_range: float = 3.0,
     ):
         """Initialize main ingestion engine"""
         self.client = client
@@ -151,7 +155,8 @@ class IngestionEngine:
             self.underlying
         )  # canonical alias for DB (e.g. "SPX")
         self.num_expirations = num_expirations
-        self.num_strikes = num_strikes
+        self.strike_count_max = strike_count_max
+        self.strike_pct_range = strike_pct_range
 
         self.running = False
 
@@ -245,7 +250,10 @@ class IngestionEngine:
         self._active_stream_manager: Optional[StreamManager] = None
 
         logger.info(f"Initialized IngestionEngine for {underlying}")
-        logger.info(f"Config: {num_expirations} expirations, {num_strikes} strikes each side")
+        logger.info(
+            f"Config: {num_expirations} expirations, "
+            f"±{strike_pct_range}% strike band (max {strike_count_max} strikes/exp)"
+        )
 
         # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -850,7 +858,14 @@ class IngestionEngine:
 
         TradeStation resets option cumulative volume to 0 at session open,
         so per-contract flow accumulators are scoped per ET session date.
+
+        Under ``USE_CASH_SESSION_KEYING`` returns the cash-session date
+        (pre-09:30 belongs to the PRIOR session), aligning the in-memory
+        rollover with the vendor's exact reset boundary.  Otherwise
+        returns the ET calendar date (legacy behavior).
         """
+        if _config.USE_CASH_SESSION_KEYING:
+            return cash_session_date(bucket)
         if bucket.tzinfo is None:
             bucket_et = pytz.UTC.localize(bucket).astimezone(ET)
         else:
@@ -870,8 +885,15 @@ class IngestionEngine:
         the next snapshot's Lee-Ready classification has a real prior
         tick from the start.  Zeros on DB failure or empty result.
         """
-        session_start_et = ET.localize(datetime.combine(session_date, dt_time(0, 0)))
-        session_start_utc = session_start_et.astimezone(timezone.utc)
+        if _config.USE_CASH_SESSION_KEYING:
+            # ``session_date`` is the cash-session date; the session began
+            # at 09:30 ET on that date.  Hydration must pull only rows in
+            # that cash-session window so we don't carry forward late-night
+            # extended-hours rows that belong to the PRIOR session.
+            session_start_utc = cash_session_start_utc(session_date)
+        else:
+            session_start_et = ET.localize(datetime.combine(session_date, dt_time(0, 0)))
+            session_start_utc = session_start_et.astimezone(timezone.utc)
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
@@ -1086,6 +1108,46 @@ class IngestionEngine:
             self.errors_count += 1
             return None
 
+    # Dual-write companion: maintains the "latest quote per option_symbol"
+    # cache that the analytics snapshot reads when
+    # ``ANALYTICS_USE_LATEST_CACHE=true``.  One row per option_symbol;
+    # the ``WHERE EXCLUDED.timestamp >= option_chains_latest.timestamp``
+    # guard prevents an out-of-order / retry write from clobbering a
+    # newer row.  Greeks and quote columns track the row whose timestamp
+    # the writer is currently committing (latest-wins for the cache);
+    # the history table is the durable source of truth and uses the
+    # COALESCE-based merge below.
+    _OPTION_LATEST_UPSERT_SQL = """
+        INSERT INTO option_chains_latest
+        (option_symbol, timestamp, underlying, strike, expiration, option_type,
+         last, bid, ask, mid, volume, open_interest, implied_volatility,
+         ask_volume, mid_volume, bid_volume,
+         delta, gamma, theta, vega)
+        VALUES %s
+        ON CONFLICT (option_symbol) DO UPDATE SET
+            timestamp = EXCLUDED.timestamp,
+            underlying = EXCLUDED.underlying,
+            strike = EXCLUDED.strike,
+            expiration = EXCLUDED.expiration,
+            option_type = EXCLUDED.option_type,
+            last = EXCLUDED.last,
+            bid = EXCLUDED.bid,
+            ask = EXCLUDED.ask,
+            mid = EXCLUDED.mid,
+            volume = GREATEST(option_chains_latest.volume, EXCLUDED.volume),
+            open_interest = GREATEST(option_chains_latest.open_interest, EXCLUDED.open_interest),
+            implied_volatility = EXCLUDED.implied_volatility,
+            ask_volume = GREATEST(option_chains_latest.ask_volume, EXCLUDED.ask_volume),
+            mid_volume = GREATEST(option_chains_latest.mid_volume, EXCLUDED.mid_volume),
+            bid_volume = GREATEST(option_chains_latest.bid_volume, EXCLUDED.bid_volume),
+            delta = EXCLUDED.delta,
+            gamma = EXCLUDED.gamma,
+            theta = EXCLUDED.theta,
+            vega = EXCLUDED.vega,
+            updated_at = NOW()
+        WHERE EXCLUDED.timestamp >= option_chains_latest.timestamp
+    """
+
     # SQL template shared by single and batch writes.
     #
     # ALL monotonic numeric columns (volume, open_interest, ask_volume,
@@ -1292,6 +1354,39 @@ class IngestionEngine:
                     values,
                     page_size=500,
                 )
+                # Dual-write to option_chains_latest in the SAME transaction
+                # so the cache cannot drift from history under partial
+                # failure -- either both upserts commit or both roll back.
+                #
+                # The cache UPSERT is keyed by option_symbol alone (one row
+                # per contract), while the history UPSERT is keyed by
+                # (option_symbol, timestamp).  A single batch can legitimately
+                # contain multiple timestamps for the same contract (e.g.
+                # several 1-minute bars flushed together), and PostgreSQL
+                # refuses to UPDATE the same target row twice in one
+                # `INSERT ... ON CONFLICT` statement ("ON CONFLICT DO UPDATE
+                # command cannot affect row a second time"), regardless of
+                # any WHERE clause on the UPDATE.  So pre-dedupe by
+                # option_symbol, keeping only the row with the latest
+                # timestamp -- the cache is meant to hold latest-per-contract
+                # anyway, and the older rows in the batch will be persisted
+                # in the history table by the previous UPSERT.
+                values_latest = list(
+                    {
+                        # Tuple index 0 = option_symbol, 1 = timestamp.
+                        # Iterate in order so the last-write-wins selection
+                        # picks the row with the highest timestamp for each
+                        # option_symbol.
+                        v[0]: v
+                        for v in sorted(values, key=lambda v: v[1])
+                    }.values()
+                )
+                execute_values(
+                    cursor,
+                    self._OPTION_LATEST_UPSERT_SQL,
+                    values_latest,
+                    page_size=500,
+                )
                 conn.commit()
 
             elapsed_ms = (_time.monotonic() - t0) * 1000
@@ -1447,7 +1542,8 @@ class IngestionEngine:
             underlying=self.underlying,
             db_underlying=self.db_symbol,
             num_expirations=self.num_expirations,
-            num_strikes=self.num_strikes,
+            strike_count_max=self.strike_count_max,
+            strike_pct_range=self.strike_pct_range,
         )
 
         # Publish the active manager before initialize()/stream() so a
@@ -1517,7 +1613,8 @@ class IngestionEngine:
         logger.info("=" * 80)
         logger.info(f"Underlying: {self.underlying}")
         logger.info(f"Expirations: {self.num_expirations}")
-        logger.info(f"Strikes Each Side: {self.num_strikes}")
+        logger.info(f"Strike Band: ±{self.strike_pct_range}% of spot")
+        logger.info(f"Strike Count Max: {self.strike_count_max} per expiration")
         logger.info(f"Greeks: {'ENABLED' if GREEKS_ENABLED else 'DISABLED'}")
         logger.info("")
         logger.info("NOTE: This engine streams forward-looking data.")
@@ -1586,10 +1683,16 @@ def main():
         help="Number of expirations (default: 3)",
     )
     parser.add_argument(
-        "--num-strikes",
+        "--strike-count-max",
         type=int,
-        default=int(os.getenv("INGEST_STRIKE_COUNT", "10")),
-        help="Number of strikes to track on each side of current price (default: 10)",
+        default=int(os.getenv("INGEST_STRIKE_COUNT_MAX", "40")),
+        help="Hard cap on strikes per expiration after the pct-range filter (default: 40)",
+    )
+    parser.add_argument(
+        "--strike-pct-range",
+        type=float,
+        default=float(os.getenv("INGEST_STRIKE_PCT_RANGE", "3.0")),
+        help="Strike-selection band as percent of spot, e.g. 3.0 -> ±3%% (default: 3.0)",
     )
     parser.add_argument(
         "--session-template",
@@ -1628,7 +1731,8 @@ def main():
             client=client,
             underlying=symbol,
             num_expirations=args.expirations,
-            num_strikes=args.num_strikes,
+            strike_count_max=args.strike_count_max,
+            strike_pct_range=args.strike_pct_range,
         )
         engine.run()
 

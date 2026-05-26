@@ -1,0 +1,49 @@
+[Unit]
+Description=ZeroGEX lightweight system + application monitor sample
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target
+Wants=network-online.target
+
+# Optional alert hook — mirrors the other ZeroGEX timer units. Uncomment
+# after running `make alert-template-install` and configuring a backend
+# in /etc/zerogex/alert.env if you want failures of this collector to
+# fire a pager (rare — the collector itself is best-effort and any
+# transient failure just leaves a 1-minute hole in the time series).
+#OnFailure=zerogex-alert@%n.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=-/home/ubuntu/zerogex-oa/.env
+
+# The collector is intentionally a single short python invocation per
+# minute — it reads /proc, shells out to `df`, and `journalctl -u <svc>
+# --since @ts --until @ts` for each service, then folds the result into
+# the JSON state file at $HOME/monitoring/state.json. No DB writes, no
+# network egress, no extra dependencies beyond the stdlib + coreutils.
+ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.tools.system_monitor
+
+# The whole cycle is sub-second on a quiet box and a few seconds on the
+# busiest one (journalctl scan for 4 services × 60 s of logs). 60 s cap
+# is generous; if we ever exceed that the box has bigger problems than
+# a missed sample.
+TimeoutStartSec=60
+
+# Sandbox — the collector only needs to read /proc, read journals, and
+# write to ~ubuntu/monitoring/.  Lock down everything else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+# Allow writes only to the state directory + the project working tree
+# (the latter is unused but ProtectSystem=strict otherwise blocks the
+# python interpreter from opening venv site-packages cached in __pycache__).
+ReadWritePaths=/home/ubuntu/monitoring /home/ubuntu/zerogex-oa
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-system-monitor

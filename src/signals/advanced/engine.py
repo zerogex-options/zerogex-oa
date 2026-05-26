@@ -6,6 +6,7 @@ from src.signals.components.base import MarketContext
 from src.signals.advanced.base import AdvancedSignalResult
 from src.signals.advanced.eod_pressure import EODPressureSignal
 from src.signals.advanced.gamma_vwap_confluence import GammaVWAPConfluenceSignal
+from src.signals.advanced.market_pressure import MarketPressureSignal
 from src.signals.advanced.range_break_imminence import RangeBreakImminenceSignal
 from src.signals.advanced.squeeze_setup import SqueezeSetupSignal
 from src.signals.advanced.trap_detection import TrapDetectionSignal
@@ -27,6 +28,7 @@ class AdvancedSignalEngine:
             ZeroDTEPositionImbalanceSignal(),
             GammaVWAPConfluenceSignal(),
             RangeBreakImminenceSignal(),
+            MarketPressureSignal(),
         )
 
     def evaluate(self, ctx: MarketContext) -> list[AdvancedSignalResult]:

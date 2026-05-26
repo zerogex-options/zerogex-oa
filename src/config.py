@@ -540,6 +540,19 @@ SESSION_TEMPLATE = os.getenv("SESSION_TEMPLATE", "Default")
 TS_STREAM_READ_TIMEOUT = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
 TS_STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").lower() == "true"
 
+# Cash-session keying for per-contract flow accumulators (Item 8 rollout).
+# When true, _FlowAccumulator session boundaries and flow_contract_facts
+# LAG-CASE date-equality both partition by cash-session date (the date the
+# 09:30 ET cash open belongs to) rather than the calendar date in ET.  Pre-
+# 09:30 extended-hours rows belong to the PRIOR session, matching the
+# TradeStation vendor cumulative-reset boundary exactly.
+#
+# Default off until the parity harness (Phase 4) and staged cutover
+# (Phase 5) sign off.  Both the in-memory accumulator (main_engine.py)
+# and the SQL LAG-CASE branch (api/database.py) MUST read this same flag
+# so in-memory and persisted-delta semantics stay consistent end-to-end.
+USE_CASH_SESSION_KEYING = os.getenv("USE_CASH_SESSION_KEYING", "false").lower() == "true"
+
 # Streaming quotes endpoint encodes the symbol list in the URL path. With
 # ~1000+ option contracts tracked, a single-connection URL exceeds ~25KB
 # and triggers a 414 Request-URI Too Large from TradeStation's gateway.
@@ -571,7 +584,7 @@ TS_STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").
 #     |              3,000 |              6 |   7 streams  |  21 streams   |
 #
 # A 3-underlying deployment with ≥ ~1500 symbols/underlying exceeds the
-# nominal cap; if the cap WARNING fires, drop ``INGEST_STRIKE_COUNT`` /
+# nominal cap; if the cap WARNING fires, drop ``INGEST_STRIKE_COUNT_MAX`` /
 # ``INGEST_EXPIRATIONS`` to shrink ``symbols_per_underlying``, or raise
 # this value (chunk_size ≤ 800 keeps URLs safely under 414).
 #
@@ -1425,6 +1438,15 @@ SIGNALS_SWING_TARGET_PCT = _getenv_float("SIGNALS_SWING_TARGET_PCT", SIGNALS_TAR
 # live-trading values are 0.01-0.03 (1-3%).
 SIGNALS_EXECUTION_SLIPPAGE_PCT = max(0.0, float(os.getenv("SIGNALS_EXECUTION_SLIPPAGE_PCT", "0.0")))
 
+# Reject option_chains quote rows older than this when marking an open trade
+# for stop/take-profit evaluation. Without this floor a quote-ingest stall
+# (or the first cycle after a weekend / holiday) would price the position
+# against a multi-day-stale mark and could fire a fictitious stop fill.
+# Set to 0 to disable the check (NOT recommended in live trading).
+SIGNALS_OPTION_QUOTE_MAX_AGE_SECONDS = _getenv_int(
+    "SIGNALS_OPTION_QUOTE_MAX_AGE_SECONDS", 900, min=0, max=86400
+)
+
 # =============================================================================
 # Ingestion/Analytics CLI Defaults
 # =============================================================================
@@ -1432,7 +1454,8 @@ SIGNALS_EXECUTION_SLIPPAGE_PCT = max(0.0, float(os.getenv("SIGNALS_EXECUTION_SLI
 INGEST_UNDERLYING = os.getenv("INGEST_UNDERLYING", "SPY")
 INGEST_UNDERLYINGS = os.getenv("INGEST_UNDERLYINGS", "")
 INGEST_EXPIRATIONS = int(os.getenv("INGEST_EXPIRATIONS", "3"))
-INGEST_STRIKE_COUNT = int(os.getenv("INGEST_STRIKE_COUNT", "10"))
+INGEST_STRIKE_COUNT_MAX = int(os.getenv("INGEST_STRIKE_COUNT_MAX", "40"))
+INGEST_STRIKE_PCT_RANGE = float(os.getenv("INGEST_STRIKE_PCT_RANGE", "3.0"))
 ANALYTICS_UNDERLYING = os.getenv("ANALYTICS_UNDERLYING", "SPY")
 ANALYTICS_UNDERLYINGS = os.getenv("ANALYTICS_UNDERLYINGS", "")
 ANALYTICS_INTERVAL = int(os.getenv("ANALYTICS_INTERVAL", "60"))

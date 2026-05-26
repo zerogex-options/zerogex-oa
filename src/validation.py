@@ -10,7 +10,7 @@ directly.
 """
 
 from typing import Any, Optional, overload
-from datetime import datetime
+from datetime import date as _date_type, datetime, timedelta as _timedelta
 import pytz
 from src.utils import get_logger
 
@@ -278,3 +278,92 @@ def bucket_timestamp(dt: datetime, bucket_seconds: int = 60) -> datetime:
     timestamp = dt.timestamp()
     bucketed_timestamp = (timestamp // bucket_seconds) * bucket_seconds
     return datetime.fromtimestamp(bucketed_timestamp, tz=dt.tzinfo)
+
+
+# ---------------------------------------------------------------------------
+# Cash-session date helpers (preparation for Item 8 of the volume-tracking
+# review).  TradeStation resets option cumulative volume at 09:30 ET cash
+# open, but the current ``_FlowAccumulator`` session key and the
+# ``flow_contract_facts`` LAG partitions use the calendar ET date —
+# a mismatch that forces load-bearing patches at the boundary.  Switching
+# to cash-session-date keying obsoletes those patches.
+#
+# These two helpers are SCAFFOLDING ONLY in this commit: they are not yet
+# consumed by any production code path.  Consumers will be migrated under
+# a feature flag in a subsequent commit so the new behavior is
+# observable / reversible before becoming default.
+# ---------------------------------------------------------------------------
+
+_ET_CASH_OPEN_HOUR = 9
+_ET_CASH_OPEN_MINUTE = 30
+_ET_TZ = pytz.timezone("US/Eastern")
+
+
+def cash_session_date(ts: datetime) -> _date_type:
+    """Return the ET cash-session date that ``ts`` belongs to.
+
+    Convention:
+      * ts >= 09:30:00 ET on day D  -> D
+      * ts <  09:30:00 ET on day D  -> D - 1 (pre-cash-open hours belong
+        to the prior cash session for purposes of TradeStation's option-
+        cumulative reset semantic)
+
+    Naive timestamps are treated as UTC (matches the rest of the
+    validation/bucket helpers).  Weekend / holiday handling is OUT OF
+    SCOPE: a Saturday 02:00 ET input returns Friday's calendar date,
+    which is the correct "session this volume belongs to" answer for
+    Friday-overnight extended-hours flow but does NOT inspect the NYSE
+    calendar.  If the caller cares about that distinction it must
+    layer ``market_calendar`` on top.
+
+    The 09:30 ET boundary is wall-clock based.  DST transitions are
+    handled correctly because ``pytz.localize`` / ``astimezone``
+    resolve the local time including the offset, so 09:30 ET means
+    09:30 ET on both EDT and EST days.
+    """
+    from datetime import date as _local_date
+    from datetime import timezone as _local_tz
+
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=_local_tz.utc)
+    ts_et = ts.astimezone(_ET_TZ)
+    # Strict ">= 09:30:00" boundary: 09:29:59.999999 ET still belongs to
+    # the prior session.  Comparing the full (hour, minute, second,
+    # microsecond) tuple rather than .time() to avoid any ambiguity
+    # introduced by pytz's exotic offset arithmetic.
+    minutes_since_midnight = ts_et.hour * 60 + ts_et.minute
+    cash_open_minutes = _ET_CASH_OPEN_HOUR * 60 + _ET_CASH_OPEN_MINUTE
+    if minutes_since_midnight < cash_open_minutes:
+        prior = ts_et.date() - _timedelta(days=1)
+        return _local_date(prior.year, prior.month, prior.day)
+    return _local_date(ts_et.year, ts_et.month, ts_et.day)
+
+
+def cash_session_start_utc(session_date: _date_type) -> datetime:
+    """UTC timestamp of the 09:30 ET cash-open on ``session_date``.
+
+    The companion to :func:`cash_session_date`: starting from a
+    session-date label, return the absolute UTC instant the session
+    began.  Useful for building LAG-CASE partitions or hydration
+    queries that need to span "this whole cash session" without
+    caring whether the date crosses DST.
+
+    Args:
+        session_date: The cash-session date as returned by
+            :func:`cash_session_date` (a plain ``date``).
+
+    Returns:
+        Timezone-aware datetime in UTC at 09:30 ET on ``session_date``.
+    """
+    from datetime import timezone as _local_tz
+
+    open_et = _ET_TZ.localize(
+        datetime(
+            session_date.year,
+            session_date.month,
+            session_date.day,
+            _ET_CASH_OPEN_HOUR,
+            _ET_CASH_OPEN_MINUTE,
+        )
+    )
+    return open_et.astimezone(_local_tz.utc)

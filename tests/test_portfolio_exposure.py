@@ -1255,6 +1255,64 @@ class TestSpreadPricing:
         assert mode == "debit"
 
 
+class TestLatestOptionQuoteStalenessGate:
+    """``_latest_option_quote`` must reject quote rows older than
+    ``SIGNALS_OPTION_QUOTE_MAX_AGE_SECONDS``.
+
+    Regression for a bug where the first cycle after a weekend/holiday
+    or any quote-ingest stall would price open positions against a
+    multi-day-stale option_chains row, potentially firing a fictitious
+    stop/take-profit fill. The fix is a lower-bound timestamp filter in
+    the SQL so a stale row returns None, which ``_close_trade`` then
+    refuses with a "no fresh mark" warning instead of marking against it.
+    """
+
+    def test_query_includes_lower_bound_when_max_age_positive(self):
+        engine = _make_engine()
+        conn = MagicMock()
+        cur = MagicMock()
+        cur.fetchone.return_value = (1.50, 1.55, 1.52)
+        conn.cursor.return_value = cur
+
+        with patch("src.signals.portfolio_engine.SIGNALS_OPTION_QUOTE_MAX_AGE_SECONDS", 900):
+            result = engine._latest_option_quote("SPY 260417C500", NOW, conn)
+        assert result == (1.50, 1.55, 1.52)
+        # The SQL must carry both upper (<=) and lower (>=) timestamp bounds.
+        sql = cur.execute.call_args[0][0]
+        assert "timestamp <=" in sql
+        assert "timestamp >=" in sql
+        assert "seconds')::interval" in sql
+
+    def test_query_omits_lower_bound_when_max_age_zero(self):
+        """A 0 setting disables the staleness gate (opt-out for debugging)."""
+        engine = _make_engine()
+        conn = MagicMock()
+        cur = MagicMock()
+        cur.fetchone.return_value = (1.50, 1.55, 1.52)
+        conn.cursor.return_value = cur
+
+        with patch("src.signals.portfolio_engine.SIGNALS_OPTION_QUOTE_MAX_AGE_SECONDS", 0):
+            engine._latest_option_quote("SPY 260417C500", NOW, conn)
+        sql = cur.execute.call_args[0][0]
+        assert "timestamp <=" in sql
+        assert "timestamp >=" not in sql
+
+    def test_stale_row_returns_none_so_close_trade_refuses(self):
+        """When the DB has only a stale row, ``fetchone`` returns None
+        (because the lower-bound clause excludes it), so
+        ``_latest_option_quote`` returns None, ``_spread_mark`` propagates
+        ``(None, mode)``, and ``_close_trade`` short-circuits with 0 PnL.
+        """
+        engine = _make_engine()
+        conn = MagicMock()
+        cur = MagicMock()
+        cur.fetchone.return_value = None  # SQL filter excluded the stale row
+        conn.cursor.return_value = cur
+
+        result = engine._latest_option_quote("SPY 260417C500", NOW, conn)
+        assert result is None
+
+
 # ---------------------------------------------------------------------------
 # Phase 2.3: multi-source confirmation gate for advanced-signal entries
 # ---------------------------------------------------------------------------
@@ -1463,8 +1521,11 @@ class TestBreakoutBoost:
         )
 
     def test_breakout_signal_scales_contracts_and_stamps_override(self):
+        engine = _make_engine()
         target = self._target(contracts=4)
-        label = PortfolioEngine._apply_breakout_boost(target, "range_break_imminence")
+        conn = MagicMock()
+        with patch.object(engine, "_current_portfolio_heat_pct", return_value=0.0):
+            label = engine._apply_breakout_boost(target, "range_break_imminence", conn=conn)
         assert label is not None and "breakout-boost" in label
         # 4 * 1.50 = 6 contracts.
         assert target.target_positions[0].contracts == 6
@@ -1475,8 +1536,11 @@ class TestBreakoutBoost:
         assert risk_overrides["breakout_boost"]["signal"] == "range_break_imminence"
 
     def test_non_breakout_signal_leaves_target_unchanged(self):
+        engine = _make_engine()
         target = self._target(contracts=4)
-        label = PortfolioEngine._apply_breakout_boost(target, "vol_expansion")
+        conn = MagicMock()
+        with patch.object(engine, "_current_portfolio_heat_pct", return_value=0.0):
+            label = engine._apply_breakout_boost(target, "vol_expansion", conn=conn)
         assert label is None
         assert target.target_positions[0].contracts == 4
         assert "risk_overrides" not in target.target_positions[0].optimizer_payload
@@ -1484,13 +1548,56 @@ class TestBreakoutBoost:
     def test_risk_plan_uses_overridden_target_pct(self):
         engine = _make_engine()
         target = self._target(contracts=4)
-        PortfolioEngine._apply_breakout_boost(target, "squeeze_setup")
+        conn = MagicMock()
+        with patch.object(engine, "_current_portfolio_heat_pct", return_value=0.0):
+            engine._apply_breakout_boost(target, "squeeze_setup", conn=conn)
         tp = target.target_positions[0]
         risk = engine._build_risk_plan(tp, NOW)
         # Default target_pct=0.50 would put target at 2.50 * 1.50 = 3.75.
         # Boost target_pct=1.00 widens to 2.50 * 2.00 = 5.00.
         assert risk["target_price"] == pytest.approx(5.00)
         assert risk["target_pct"] == 1.00
+
+    def test_breakout_boost_respects_heat_cap_when_existing_heat_high(self):
+        """Regression for the cap-bypass bug: ``compute_target`` trims to
+        ``SIGNALS_MAX_PORTFOLIO_HEAT_PCT`` pre-boost, but the boost
+        multiplies contracts by ``SIGNALS_BREAKOUT_SIZE_MULTIPLIER``
+        afterward. Without a re-check, a 4-contract pre-boost target with
+        most of the heat cap already consumed by other open positions
+        would scale to 6 and overshoot the cap. The re-check should trim
+        the boost back to the headroom (in contracts) while never
+        shrinking below the pre-boost size compute_target already
+        validated.
+        """
+        engine = _make_engine()
+        target = self._target(contracts=4)
+        conn = MagicMock()
+        # Pre-boost contract heat: 4 * 2.50 * 100 = $1000 = 0.1% of $1M.
+        # Set existing heat so headroom leaves room for at most 5 contracts
+        # post-boost (the boost wants 6).
+        # max_heat = 0.06; existing = 0.06 - 5*2.50*100/1e6 = 0.06 - 0.00125 = 0.05875
+        with patch.object(engine, "_current_portfolio_heat_pct", return_value=0.05875):
+            label = engine._apply_breakout_boost(target, "range_break_imminence", conn=conn)
+        assert label is not None
+        assert "cap-trimmed" in label
+        # Trimmed back to 5 (headroom in contracts), still above pre-boost 4.
+        assert target.target_positions[0].contracts == 5
+        assert target.total_target_contracts == 5
+
+    def test_breakout_boost_keeps_preboost_size_when_no_headroom(self):
+        """If the cap is fully consumed by existing positions, the boost
+        leaves contracts at the pre-boost size (which compute_target
+        already validated to fit within the cap including this trade's
+        pre-boost contribution). Never shrinks below pre-boost.
+        """
+        engine = _make_engine()
+        target = self._target(contracts=4)
+        conn = MagicMock()
+        with patch.object(engine, "_current_portfolio_heat_pct", return_value=0.06):
+            label = engine._apply_breakout_boost(target, "squeeze_setup", conn=conn)
+        assert label is not None and "cap-trimmed" in label
+        assert target.target_positions[0].contracts == 4
+        assert target.total_target_contracts == 4
 
 
 class TestAttributionMetadata:

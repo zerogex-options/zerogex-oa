@@ -675,6 +675,13 @@ class UnifiedSignalEngine:
                 # run 1Hz; analytics writes gex_summary every 60s), so the
                 # LATERAL and the "prev" query both returned the same row and
                 # net_gex_delta was structurally 0 on every cycle.
+                # Bound the lookback so the first cycle after a long weekend
+                # or holiday doesn't compare Tuesday-open net_gex against
+                # Friday-16:00 net_gex — that produces a structurally-spurious
+                # net_gex_delta_pct shock that downstream trap_detection then
+                # amplifies (gex_boost / strengthening_factor). 30 minutes is
+                # wide enough to ride out a missed cycle or two during normal
+                # operation but rejects multi-day-stale comparisons.
                 prev_net_gex = None
                 if gs_ts is not None:
                     try:
@@ -684,10 +691,11 @@ class UnifiedSignalEngine:
                             FROM gex_summary
                             WHERE underlying = %s
                               AND timestamp < %s
+                              AND timestamp >= %s - INTERVAL '30 minutes'
                             ORDER BY timestamp DESC
                             LIMIT 1
                             """,
-                            (self.db_symbol, gs_ts),
+                            (self.db_symbol, gs_ts, gs_ts),
                         )
                         prev_row = cur.fetchone()
                         if prev_row and prev_row[0] is not None:

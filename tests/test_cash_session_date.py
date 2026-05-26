@@ -1,0 +1,206 @@
+"""Tests for the cash-session-date helpers in src.validation.
+
+These pin the boundary semantics that Item 8 of the volume-tracking
+review (docs/architecture/volume-tracking-review.md) is built on.
+The helpers themselves are scaffolding -- no production code consumes
+them yet -- but the tests must lock in the boundary, DST, and
+naive-input behavior so a future migration of the FlowAccumulator
+session key and the flow_contract_facts LAG-CASE branches can be
+performed safely.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime, timedelta, timezone
+
+import pytz
+
+from src.validation import cash_session_date, cash_session_start_utc
+
+_ET = pytz.timezone("US/Eastern")
+
+
+# ---------------------------------------------------------------------------
+# cash_session_date
+# ---------------------------------------------------------------------------
+
+
+def test_cash_session_date_rth_returns_calendar_date():
+    """During RTH (>= 09:30 ET), the cash-session date is the calendar
+    date.  Sample several intra-RTH points to be sure."""
+    for hour, minute in [(9, 30), (10, 15), (12, 0), (15, 59), (16, 0), (19, 0), (23, 59)]:
+        ts = _ET.localize(datetime(2025, 4, 15, hour, minute))
+        assert cash_session_date(ts) == date(
+            2025, 4, 15
+        ), f"{hour:02d}:{minute:02d} ET on 2025-04-15 should be session 2025-04-15"
+
+
+def test_cash_session_date_pre_cash_returns_prior_calendar_date():
+    """Strictly before 09:30 ET on day D, the cash-session date is D-1
+    (those timestamps belong to the prior session's extended-hours
+    tail, before the vendor-side cumulative reset)."""
+    for hour, minute in [(0, 0), (4, 0), (8, 0), (9, 0), (9, 29)]:
+        ts = _ET.localize(datetime(2025, 4, 15, hour, minute))
+        assert cash_session_date(ts) == date(
+            2025, 4, 14
+        ), f"{hour:02d}:{minute:02d} ET on 2025-04-15 should belong to session 2025-04-14"
+
+
+def test_cash_session_date_boundary_09_30_exact_belongs_to_today():
+    """09:30:00.000000 ET on day D is the FIRST instant of session D
+    (>= comparison, not >).  This is the moment of the vendor reset."""
+    ts = _ET.localize(datetime(2025, 4, 15, 9, 30, 0))
+    assert cash_session_date(ts) == date(2025, 4, 15)
+
+
+def test_cash_session_date_just_before_boundary_belongs_to_prior():
+    """09:29:59.999999 ET is the LAST instant of the prior session.
+    Pins the strict-less-than half of the boundary."""
+    # 09:29 ET resolves to "prior session" via the minutes_since_midnight
+    # check.  09:29:59.999... isn't representable exactly in pytz
+    # localization (microsecond is the practical floor), so 09:29:59 is
+    # the sharpest assertion we can cleanly write -- still strictly
+    # before 09:30 and must map to the prior session.
+    ts = _ET.localize(datetime(2025, 4, 15, 9, 29, 59, 999999))
+    assert cash_session_date(ts) == date(2025, 4, 14)
+
+
+def test_cash_session_date_naive_datetime_treated_as_utc():
+    """A naive datetime is interpreted as UTC, then converted to ET.
+    13:30 UTC == 09:30 EDT (during DST) == 08:30 EST (outside DST).
+    Pins both regimes."""
+    # 2025-04-15 is EDT (UTC-4): 13:30 UTC = 09:30 EDT -> session today.
+    naive_dst = datetime(2025, 4, 15, 13, 30, 0)
+    assert cash_session_date(naive_dst) == date(2025, 4, 15)
+    # 2025-12-15 is EST (UTC-5): 13:30 UTC = 08:30 EST -> session yesterday.
+    naive_no_dst = datetime(2025, 12, 15, 13, 30, 0)
+    assert cash_session_date(naive_no_dst) == date(2025, 12, 14)
+
+
+def test_cash_session_date_utc_input_converts_correctly():
+    """Explicit UTC input is honored.  09:30 EDT == 13:30 UTC."""
+    ts = datetime(2025, 4, 15, 13, 30, 0, tzinfo=timezone.utc)
+    assert cash_session_date(ts) == date(2025, 4, 15)
+    ts = datetime(2025, 4, 15, 13, 29, 0, tzinfo=timezone.utc)
+    assert cash_session_date(ts) == date(2025, 4, 14)
+
+
+def test_cash_session_date_handles_spring_forward_dst():
+    """On the spring-forward DST transition the ET wall clock jumps from
+    02:00 EST to 03:00 EDT.  09:30 ET that day still resolves correctly
+    (pytz handles the offset; we only care that 09:30 wall-clock means
+    session start).  Sample 2025-03-09 (US DST starts)."""
+    # 09:30 EDT on the DST transition day = 13:30 UTC.
+    ts = datetime(2025, 3, 9, 13, 30, 0, tzinfo=timezone.utc)
+    assert cash_session_date(ts) == date(2025, 3, 9)
+    # 09:29 EDT on the same day = 13:29 UTC -> prior session.
+    ts = datetime(2025, 3, 9, 13, 29, 0, tzinfo=timezone.utc)
+    assert cash_session_date(ts) == date(2025, 3, 8)
+
+
+def test_cash_session_date_handles_fall_back_dst():
+    """On the fall-back DST transition the ET wall clock jumps from
+    02:00 EDT back to 01:00 EST.  09:30 ET that day uses EST (UTC-5)."""
+    # 09:30 EST on 2025-11-02 = 14:30 UTC.
+    ts = datetime(2025, 11, 2, 14, 30, 0, tzinfo=timezone.utc)
+    assert cash_session_date(ts) == date(2025, 11, 2)
+    # 09:29 EST = 14:29 UTC -> prior session.
+    ts = datetime(2025, 11, 2, 14, 29, 0, tzinfo=timezone.utc)
+    assert cash_session_date(ts) == date(2025, 11, 1)
+
+
+def test_cash_session_date_weekend_input_returns_calendar_arithmetic():
+    """The helper does NOT consult the NYSE calendar.  A Saturday
+    timestamp returns "Saturday" or "Friday" via plain date arithmetic
+    -- the caller is expected to layer market_calendar on top if it
+    cares.  Pin the behavior so a future caller knows what to expect."""
+    # Saturday 14:00 ET (post-09:30) -> Saturday (no-op).  The downstream
+    # LAG-CASE doesn't care that Saturday isn't a trading day; it just
+    # uses the date as a partition key.
+    sat = _ET.localize(datetime(2025, 4, 19, 14, 0, 0))  # Sat
+    assert cash_session_date(sat) == date(2025, 4, 19)
+    # Sunday 03:00 ET (pre-09:30) -> Saturday.
+    sun_early = _ET.localize(datetime(2025, 4, 20, 3, 0, 0))
+    assert cash_session_date(sun_early) == date(2025, 4, 19)
+
+
+def test_cash_session_date_month_boundary_pre_cash_returns_prior_month():
+    """Pre-cash on the 1st of a month rolls back to the last day of the
+    previous month.  Verifies the date arithmetic doesn't blow up on
+    month/year transitions."""
+    ts = _ET.localize(datetime(2025, 5, 1, 6, 0, 0))
+    assert cash_session_date(ts) == date(2025, 4, 30)
+    ts = _ET.localize(datetime(2025, 1, 1, 6, 0, 0))
+    assert cash_session_date(ts) == date(2024, 12, 31)
+
+
+# ---------------------------------------------------------------------------
+# cash_session_start_utc
+# ---------------------------------------------------------------------------
+
+
+def test_cash_session_start_utc_returns_utc_aware():
+    """The companion helper returns a tz-aware UTC datetime."""
+    start = cash_session_start_utc(date(2025, 4, 15))
+    assert start.tzinfo is not None
+    assert start.utcoffset() == timedelta(0)
+
+
+def test_cash_session_start_utc_edt_offset():
+    """In EDT (UTC-4), 09:30 ET == 13:30 UTC."""
+    start = cash_session_start_utc(date(2025, 4, 15))  # EDT
+    assert start == datetime(2025, 4, 15, 13, 30, 0, tzinfo=timezone.utc)
+
+
+def test_cash_session_start_utc_est_offset():
+    """In EST (UTC-5), 09:30 ET == 14:30 UTC."""
+    start = cash_session_start_utc(date(2025, 12, 15))  # EST
+    assert start == datetime(2025, 12, 15, 14, 30, 0, tzinfo=timezone.utc)
+
+
+def test_cash_session_start_utc_is_inverse_of_cash_session_date_during_rth():
+    """For any RTH timestamp ts, cash_session_start_utc(cash_session_date(ts))
+    must be <= ts and the gap must be <= 6h45m (full RTH session length).
+    Smoke check that the two helpers are mutually consistent."""
+    for d, h, m in [(date(2025, 4, 15), 10, 30), (date(2025, 11, 2), 12, 0)]:
+        ts = _ET.localize(datetime(d.year, d.month, d.day, h, m))
+        session_date = cash_session_date(ts)
+        start = cash_session_start_utc(session_date)
+        assert start <= ts.astimezone(timezone.utc)
+        assert (ts.astimezone(timezone.utc) - start) <= timedelta(hours=6, minutes=45)
+
+
+def test_cash_session_start_utc_invariant_under_dst_transition_day():
+    """09:30 ET on the spring-forward day is 13:30 UTC (EDT).
+    09:30 ET on the day before is 14:30 UTC (EST, UTC-5).  Verify the
+    helper picks the right offset on each side of the transition."""
+    # 2025-03-09 is the DST-start day in the US (EDT effective at 02:00).
+    # Day before (2025-03-08) is still EST.
+    before = cash_session_start_utc(date(2025, 3, 8))
+    after = cash_session_start_utc(date(2025, 3, 9))
+    assert before == datetime(2025, 3, 8, 14, 30, 0, tzinfo=timezone.utc)  # EST
+    assert after == datetime(2025, 3, 9, 13, 30, 0, tzinfo=timezone.utc)  # EDT
+
+
+# ---------------------------------------------------------------------------
+# Future-consumer contract: cash_session_date is partition-stable
+# ---------------------------------------------------------------------------
+
+
+def test_cash_session_date_is_constant_across_a_single_cash_session():
+    """Every timestamp from 09:30 ET on day D through 09:29:59 ET on day
+    D+1 must return the same session_date == D.  This is the property
+    that LAG-CASE consumers will rely on once they switch from
+    calendar-day to cash-session partitioning."""
+    d = date(2025, 4, 15)
+    open_et = _ET.localize(datetime(d.year, d.month, d.day, 9, 30))
+    # Sample 8 evenly-spaced points across the next 24 hours.
+    for hours in [0, 3, 6, 12, 18, 23]:
+        ts = open_et + timedelta(hours=hours)
+        assert cash_session_date(ts) == d, f"ts={ts.isoformat()} should belong to session {d}"
+    # And one just before the next day's 09:30 boundary.
+    next_open_minus_one = (open_et + timedelta(days=1)) - timedelta(seconds=1)
+    assert cash_session_date(next_open_minus_one) == d
+    # While the next day's open belongs to the new session.
+    next_open = open_et + timedelta(days=1)
+    assert cash_session_date(next_open) == d + timedelta(days=1)

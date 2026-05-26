@@ -163,6 +163,119 @@ BEGIN
 END $$;
 
 -- =============================================================================
+-- option_chains_latest — maintained "latest quote per contract" cache.
+--
+-- ROLE
+-- ----
+-- The analytics-engine snapshot read needs the most recent quote per
+-- option_symbol for the active universe (~2k contracts per underlying).
+-- Computing this against option_chains via
+--   SELECT DISTINCT ON (option_symbol) ... ORDER BY option_symbol, ts DESC
+-- forces PostgreSQL to scan and sort the entire intraday rolling window
+-- (~hundreds of MB for SPX) on every cycle, which blows past the buffer
+-- pool on small instances and produces the DataFileRead contention that
+-- triggered the 2026-05-26 incident.
+--
+-- This table holds ONE row per option_symbol, kept current by the
+-- ingestion writer's dual-UPSERT (see src/ingestion/main_engine.py:
+-- _OPTION_LATEST_UPSERT_SQL).  The analytics snapshot can then read
+-- by indexed lookup instead of deduplicating history every cycle.
+--
+-- CONSISTENCY
+-- -----------
+--   * Rows are NEVER deleted by the writer.  Stale contracts (expired,
+--     delisted) accumulate harmlessly; the analytics consumer filters
+--     them out by `timestamp >= NOW() - INTERVAL '...'` and `expiration`
+--     bounds in the snapshot WHERE clause.
+--   * The ingestion UPSERT gates UPDATEs on
+--     `EXCLUDED.timestamp >= option_chains_latest.timestamp` so an
+--     out-of-order / retry write CANNOT clobber a newer row.  Same
+--     guarantee as the history table's IS-DISTINCT-FROM guard.
+--   * Idempotent under re-deploy: re-applying schema.sql is a no-op,
+--     and the writer's UPSERT is safe to replay.
+--
+-- ACTIVATION (operator-facing — see also the commit message)
+-- ----------
+--   1. Apply schema (this file):  make schema-apply
+--   2. Restart ingestion so it begins dual-writing:
+--      sudo systemctl restart zerogex-oa-ingestion
+--   3. Wait 5-30 minutes during RTH for the cache to populate (every
+--      active contract re-quotes within minutes).  Verify:
+--        SELECT underlying, COUNT(*), MAX(timestamp) AT TIME ZONE 'US/Eastern'
+--        FROM option_chains_latest GROUP BY underlying;
+--   4. Cut the analytics read path over by setting in .env:
+--        ANALYTICS_USE_LATEST_CACHE=true
+--      then restart analytics:
+--        sudo systemctl restart zerogex-oa-analytics
+--   5. Observe stage timings drop in
+--        journalctl -u zerogex-oa-analytics -f
+--      (snapshot stage should fall from ~100s to single-digit ms).
+--
+-- The analytics read path falls back to the historical DISTINCT ON
+-- query when the cache returns zero rows, so flipping the flag too
+-- early cannot leave the engine empty -- it will just behave like
+-- the legacy path until the cache populates.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS option_chains_latest (
+    option_symbol VARCHAR(50) PRIMARY KEY,
+    timestamp TIMESTAMPTZ NOT NULL,
+    underlying VARCHAR(10) NOT NULL,
+    strike NUMERIC(12, 4) NOT NULL,
+    expiration DATE NOT NULL,
+    option_type CHAR(1) NOT NULL,
+    last NUMERIC(12, 4),
+    bid NUMERIC(12, 4),
+    ask NUMERIC(12, 4),
+    mid NUMERIC(12, 4),
+    volume BIGINT DEFAULT 0,
+    open_interest BIGINT DEFAULT 0,
+    ask_volume BIGINT DEFAULT 0,
+    mid_volume BIGINT DEFAULT 0,
+    bid_volume BIGINT DEFAULT 0,
+    implied_volatility NUMERIC(8, 6),
+    delta NUMERIC(8, 6),
+    gamma NUMERIC(10, 8),
+    theta NUMERIC(10, 6),
+    vega NUMERIC(10, 6),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Snapshot read path: WHERE underlying = $1 AND timestamp >= $2 AND gamma IS NOT NULL.
+-- Partial index excludes contracts whose Greeks haven't been populated
+-- yet (NULL gamma rows are unusable by the GEX calculation anyway).
+CREATE INDEX IF NOT EXISTS idx_option_chains_latest_underlying_ts_gamma
+    ON option_chains_latest (underlying, timestamp DESC)
+    WHERE gamma IS NOT NULL;
+
+-- Expiration roll-off filter applied to the snapshot read.
+CREATE INDEX IF NOT EXISTS idx_option_chains_latest_underlying_expiration
+    ON option_chains_latest (underlying, expiration);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'option_chains_latest_option_type_check'
+    ) THEN
+        ALTER TABLE option_chains_latest
+        ADD CONSTRAINT option_chains_latest_option_type_check
+        CHECK (option_type IN ('C', 'P'));
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'option_chains_latest_positive_strike_check'
+    ) THEN
+        ALTER TABLE option_chains_latest
+        ADD CONSTRAINT option_chains_latest_positive_strike_check
+        CHECK (strike > 0);
+    END IF;
+END $$;
+
+COMMENT ON TABLE option_chains_latest IS
+    'Maintained "latest quote per option_symbol" cache.  One row per contract, kept current by the ingestion writer (dual-UPSERT alongside option_chains).  Read by the analytics snapshot when ANALYTICS_USE_LATEST_CACHE=true to avoid DISTINCT ON over option_chains history.  See schema.sql header for activation steps.';
+
+-- =============================================================================
 -- VIX rolling window of 5-minute bars — used by /api/market/vix endpoint
 -- (level score uses latest close; momentum score needs a multi-bar window).
 -- Populated by the ingestion engine's VIX poller.
@@ -1594,6 +1707,15 @@ CREATE TABLE IF NOT EXISTS component_normalizer_cache (
     updated_at      TIMESTAMPTZ   DEFAULT NOW(),
     PRIMARY KEY (underlying, field_name)
 );
+
+-- Cleanup: remove dead normalizer rows for smart_money fields.  The
+-- smart_money_volume_delta / smart_money_premium tier calibration that
+-- consumed these rows was removed when flow_smart_money was
+-- decommissioned (commit b67ff67) and the corresponding FieldSpec
+-- entries in src/tools/normalizer_cache_refresh.py have been deleted.
+-- Idempotent on subsequent runs (DELETE of zero rows is a no-op).
+DELETE FROM component_normalizer_cache
+ WHERE field_name IN ('smart_money_volume_delta', 'smart_money_premium');
 
 -- =============================================================================
 -- Max-pain daily OI snapshot (derived cache)

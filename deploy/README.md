@@ -131,6 +131,15 @@ The deployment process runs these steps in order:
     overlap; validates itself via `ExecStartPost=` that each symbol's
     snapshot caught up to the latest option_chains trading date).
     `/api/max-pain/current` is a pure cache read of what this job writes.
+  - `zerogex-oa-system-monitor` - lightweight per-minute sampler that
+    folds CPU%, mem%, root + /var/log disk%, per-engine error/warning
+    counts (same tokens as `make services-check`), and analytics
+    cycle-time (from "Stage timings" log lines) into a rolling JSON
+    state file at `~ubuntu/monitoring/state.json`. The currently open
+    hourly + daily bucket is overwritten every tick until the wall
+    clock crosses into the next hour/day, then finalised. Inspect with
+    `make system-monitor-show` or `make system-monitor-show-json | jq`.
+- Pre-creates `~ubuntu/monitoring/` for the system-monitor state file
 - Enables services + timers to start on boot
 - Starts services and verifies status
 

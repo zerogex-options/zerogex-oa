@@ -67,10 +67,12 @@ def test_field_specs_cover_all_normalizer_consumers():
     should have a matching FieldSpec — otherwise the populator silently
     leaves that field unscaled.
 
-    The smart-money specs are NOT consumed via ctx.extra['normalizers'];
-    they are read directly by AnalyticsEngine._refresh_flow_caches for
-    distribution-based smart-money calibration.  They are allowed extras
-    here but pinned explicitly so an accidental rename is still caught."""
+    Pinned to the exact set: an accidental rename or unintentional
+    addition is a test failure (the populator's writes are not free, so
+    every FieldSpec must have an active consumer).  The historical
+    ``smart_money_volume_delta`` / ``smart_money_premium`` specs were
+    removed when flow_smart_money was decommissioned — those rows no
+    longer have a reader."""
     signal_consumers = {
         "dealer_vanna_exposure",
         "dealer_charm_exposure",
@@ -79,16 +81,11 @@ def test_field_specs_cover_all_normalizer_consumers():
         "call_flow_delta",
         "put_flow_delta",
     }
-    smart_money_consumers = {
-        "smart_money_volume_delta",
-        "smart_money_premium",
-    }
     actual = {spec.name for spec in FIELD_SPECS}
-    missing = signal_consumers - actual
-    assert not missing, f"signal normalizer consumers missing a FieldSpec: {missing}"
-    assert actual == signal_consumers | smart_money_consumers, (
-        f"unexpected FieldSpec set: extra={actual - signal_consumers - smart_money_consumers}, "
-        f"missing={(signal_consumers | smart_money_consumers) - actual}"
+    assert actual == signal_consumers, (
+        f"unexpected FieldSpec set: "
+        f"extra={actual - signal_consumers}, "
+        f"missing={signal_consumers - actual}"
     )
 
 

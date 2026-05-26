@@ -58,8 +58,11 @@ class _FakeDB:
 
     def __init__(self):
         self.up = True
-        # Each element is the list of value-tuples one execute_values saw.
-        self.persisted_batches: list[list[tuple]] = []
+        # All execute_values batches the writer issued, in call order.
+        # Each entry preserves the SQL so tests can distinguish the
+        # option_chains (history) write from the option_chains_latest
+        # (cache mirror) write that runs in the same transaction.
+        self._raw_batches: list[tuple[str, list[tuple]]] = []
 
     @contextlib.contextmanager
     def connection(self):
@@ -70,7 +73,23 @@ class _FakeDB:
     def execute_values(self, cursor, sql, values, page_size=None):
         if not self.up:
             raise RuntimeError("simulated DB down (execute)")
-        self.persisted_batches.append(list(values))
+        self._raw_batches.append((sql, list(values)))
+
+    @property
+    def persisted_batches(self) -> list[list[tuple]]:
+        """Only the option_chains (history) batches.
+
+        The writer dual-UPSERTs into ``option_chains_latest`` for the
+        snapshot-read cache; that mirror carries the same values as the
+        history write, so for retry-idempotency invariants we only need
+        to inspect the history side.  Filtering here keeps the existing
+        per-test assertions readable.
+        """
+        return [
+            values
+            for sql, values in self._raw_batches
+            if "INSERT INTO option_chains_latest" not in sql
+        ]
 
 
 def _install_fake_db(monkeypatch) -> _FakeDB:
