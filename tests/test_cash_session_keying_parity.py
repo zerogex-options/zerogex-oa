@@ -52,10 +52,31 @@ _DSN = os.getenv("CASH_SESSION_KEYING_PARITY_DSN")
 _SYMBOL = os.getenv("CASH_SESSION_KEYING_PARITY_SYMBOL", "SPY")
 _DATE_ENV = os.getenv("CASH_SESSION_KEYING_PARITY_DATE")
 
-pytest_skip_reason = (
-    "CASH_SESSION_KEYING_PARITY_DSN not set — Phase 4 cash-session "
-    "keying parity harness skipped.  See module docstring for usage."
+# Catch the common copy-paste failure where the operator pasted the
+# docstring's literal ``postgres://...`` example unchanged, or otherwise
+# handed us a DSN with no real host.  Without this guard, asyncpg gets
+# as far as DNS-resolving ``...`` and dies inside the IDNA codec with
+# ``UnicodeError: label empty or too long`` -- accurate, but actively
+# misleading about what went wrong.
+_PLACEHOLDER_DSN = _DSN is not None and (
+    "..." in _DSN or _DSN.rstrip("/") in ("postgres:", "postgresql:")
 )
+
+if _PLACEHOLDER_DSN:
+    pytest_skip_reason = (
+        f"CASH_SESSION_KEYING_PARITY_DSN={_DSN!r} looks like a placeholder. "
+        "Substitute real values, e.g. for the codebase's default pgpass "
+        "provider:  PGPASSFILE=~/.pgpass "
+        "CASH_SESSION_KEYING_PARITY_DSN="
+        "postgresql://USER@HOST:PORT/DB?sslmode=require  (asyncpg will look "
+        "up the password in ~/.pgpass).  Or inline the password: "
+        "postgresql://USER:PASS@HOST:PORT/DB."
+    )
+else:
+    pytest_skip_reason = (
+        "CASH_SESSION_KEYING_PARITY_DSN not set — Phase 4 cash-session "
+        "keying parity harness skipped.  See module docstring for usage."
+    )
 
 
 # The CTE mirrors src/api/database.py::_do_refresh_flow_cache exactly,
@@ -173,7 +194,7 @@ def _resolve_window(date_str: str | None) -> Tuple[datetime, datetime, date]:
     return start_et.astimezone(timezone.utc), end_et.astimezone(timezone.utc), et_date
 
 
-@pytest.mark.skipif(_DSN is None, reason=pytest_skip_reason)
+@pytest.mark.skipif(_DSN is None or _PLACEHOLDER_DSN, reason=pytest_skip_reason)
 def test_legacy_and_cash_session_keying_diverge_only_at_session_boundaries():
     import asyncio
 
