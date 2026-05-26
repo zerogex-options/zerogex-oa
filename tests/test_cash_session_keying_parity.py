@@ -415,8 +415,3 @@ def test_legacy_and_cash_session_keying_diverge_only_at_session_boundaries():
     # flag in staging".  Without -s, pytest captures the print but the
     # test still passes.
     print(diagnostic + "OK -- all divergences explained by known boundary causes.")
-
-    # Pass -- print the diagnostic so the user can see how much divergence
-    # there was even when it's all in the expected bands.  pytest -v shows
-    # this; pytest without -v swallows it but the test still passes.
-    print(diagnostic + "OK -- all divergences within expected boundary bands.")
