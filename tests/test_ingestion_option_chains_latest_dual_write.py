@@ -217,6 +217,94 @@ def test_cache_upsert_is_skipped_when_db_in_backoff():
     )
 
 
+def test_cache_upsert_deduped_by_option_symbol_when_batch_has_multiple_timestamps():
+    """Regression: PostgreSQL refuses to UPDATE the same conflict-target
+    row twice within a single ``INSERT ... ON CONFLICT DO UPDATE``
+    statement (error: "ON CONFLICT DO UPDATE command cannot affect row a
+    second time").  A batch with two timestamps for the same contract
+    would trigger that on the cache UPSERT (keyed by option_symbol alone)
+    even though the history UPSERT (keyed by option_symbol + timestamp)
+    is fine.  The writer must pre-dedupe by option_symbol, keeping the
+    latest-timestamp row, before issuing the cache UPSERT.
+
+    Hit production at 2026-05-26 15:44 EDT shortly after the cache
+    feature flag was flipped on; ingestion went into circuit-breaker
+    because every batch with multi-timestamp-per-contract rows failed.
+    """
+    engine = _make_engine_for_write_test()
+    cm, _, _ = _mock_db_connection()
+
+    ts_earlier = datetime(2026, 5, 26, 14, 30, tzinfo=timezone.utc)
+    ts_later = datetime(2026, 5, 26, 14, 31, tzinfo=timezone.utc)
+
+    sym = "SPY260520C00500000"
+    rows = [
+        _build_row(option_symbol=sym, timestamp=ts_earlier),
+        _build_row(option_symbol=sym, timestamp=ts_later),
+        # A second contract to confirm dedup is per-symbol, not global.
+        _build_row(option_symbol="SPY260520C00501000", timestamp=ts_later),
+    ]
+
+    with patch.object(ingestion_module, "db_connection", return_value=cm), patch.object(
+        ingestion_module, "execute_values"
+    ) as execute_values_mock:
+        engine._write_option_rows(rows)
+
+    calls = _execute_values_calls(execute_values_mock)
+    assert len(calls) == 2, "expected one history + one cache execute_values"
+    _, history_values = calls[0]
+    _, cache_values = calls[1]
+
+    # History got all THREE rows -- same (sym, ts) pairs are unique.
+    assert len(history_values) == 3
+
+    # Cache got TWO rows, one per option_symbol.  No duplicates.
+    cache_symbols = [v[0] for v in cache_values]
+    assert len(cache_values) == 2, (
+        f"cache UPSERT must dedupe by option_symbol; got {len(cache_values)} "
+        f"rows for {set(cache_symbols)}"
+    )
+    assert sorted(cache_symbols) == sorted({sym, "SPY260520C00501000"})
+
+    # And the kept row for the duplicated symbol is the LATER one.
+    sym_row = next(v for v in cache_values if v[0] == sym)
+    assert sym_row[1] == ts_later, (
+        "cache dedup must keep the latest-timestamp row, not an arbitrary one"
+    )
+
+
+def test_cache_upsert_dedup_preserves_history_order_too():
+    """Two contracts in one batch, with the latest timestamp for one and
+    a single timestamp for the other -- both must still reach BOTH
+    UPSERTs, not get dropped by the dedup."""
+    engine = _make_engine_for_write_test()
+    cm, _, _ = _mock_db_connection()
+
+    rows = [
+        _build_row(
+            option_symbol="SPY260520C00500000",
+            timestamp=datetime(2026, 5, 26, 14, 30, tzinfo=timezone.utc),
+        ),
+        _build_row(
+            option_symbol="SPY260520P00500000",
+            timestamp=datetime(2026, 5, 26, 14, 30, tzinfo=timezone.utc),
+        ),
+    ]
+
+    with patch.object(ingestion_module, "db_connection", return_value=cm), patch.object(
+        ingestion_module, "execute_values"
+    ) as execute_values_mock:
+        engine._write_option_rows(rows)
+
+    calls = _execute_values_calls(execute_values_mock)
+    _, history_values = calls[0]
+    _, cache_values = calls[1]
+    assert len(history_values) == 2
+    assert len(cache_values) == 2, (
+        "non-duplicated symbols must not be dropped by the dedup"
+    )
+
+
 def test_cache_upsert_sql_is_a_class_constant():
     """``_OPTION_LATEST_UPSERT_SQL`` must be defined on the class so it's
     cheap to access and stays in sync with the history UPSERT (any future

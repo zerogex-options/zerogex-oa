@@ -1357,17 +1357,34 @@ class IngestionEngine:
                 # Dual-write to option_chains_latest in the SAME transaction
                 # so the cache cannot drift from history under partial
                 # failure -- either both upserts commit or both roll back.
+                #
                 # The cache UPSERT is keyed by option_symbol alone (one row
-                # per contract) with a `timestamp >= existing` guard, so an
-                # out-of-order replay cannot clobber a newer row.  Cheap
-                # relative to the main write: ~one btree page touch per
-                # active contract per batch.  Read by the analytics engine
-                # when ANALYTICS_USE_LATEST_CACHE=true; harmless until then
-                # (an unread maintained cache).
+                # per contract), while the history UPSERT is keyed by
+                # (option_symbol, timestamp).  A single batch can legitimately
+                # contain multiple timestamps for the same contract (e.g.
+                # several 1-minute bars flushed together), and PostgreSQL
+                # refuses to UPDATE the same target row twice in one
+                # `INSERT ... ON CONFLICT` statement ("ON CONFLICT DO UPDATE
+                # command cannot affect row a second time"), regardless of
+                # any WHERE clause on the UPDATE.  So pre-dedupe by
+                # option_symbol, keeping only the row with the latest
+                # timestamp -- the cache is meant to hold latest-per-contract
+                # anyway, and the older rows in the batch will be persisted
+                # in the history table by the previous UPSERT.
+                values_latest = list(
+                    {
+                        # Tuple index 0 = option_symbol, 1 = timestamp.
+                        # Iterate in order so the last-write-wins selection
+                        # picks the row with the highest timestamp for each
+                        # option_symbol.
+                        v[0]: v
+                        for v in sorted(values, key=lambda v: v[1])
+                    }.values()
+                )
                 execute_values(
                     cursor,
                     self._OPTION_LATEST_UPSERT_SQL,
-                    values,
+                    values_latest,
                     page_size=500,
                 )
                 conn.commit()
