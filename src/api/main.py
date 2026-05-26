@@ -4,7 +4,7 @@ ZeroGEX API Server
 FastAPI backend for serving analytics data to the frontend
 """
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
@@ -251,14 +251,23 @@ app.include_router(gex_flip_horizon_router)
 
 
 @app.get("/api/health", response_model=HealthStatus, tags=["Health"])
-async def health_check():
-    """Check API and database health"""
+async def health_check(response: Response):
+    """Check API and database health.
+
+    Returns HTTP 200 only when the database is reachable. A degraded
+    backend (db_manager.check_health() returns False) surfaces as HTTP
+    503 with the same response body so uptime monitors, load balancers,
+    and Kubernetes probes can act on the status code — the previous
+    behavior returned 200 with ``status="degraded"`` and was treated as
+    healthy by every standard probe.
+    """
     try:
+        db = _db()
         # Test database connection
-        is_healthy = await db_manager.check_health()
+        is_healthy = await db.check_health()
 
         # Get data freshness
-        last_quote = await db_manager.get_latest_quote()
+        last_quote = await db.get_latest_quote()
         last_update = last_quote["timestamp"] if last_quote else None
 
         # Calculate data age
@@ -269,6 +278,8 @@ async def health_check():
             age = (now - last_update).total_seconds()
             data_age_seconds = int(age)
 
+        if not is_healthy:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return HealthStatus(
             status="healthy" if is_healthy else "degraded",
             database_connected=is_healthy,

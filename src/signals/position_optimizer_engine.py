@@ -12,6 +12,7 @@ from src.database import db_connection
 from src.config import (
     GEX_SCALE_INVARIANT_SATURATION,
     SIGNAL_GEX_NORMALIZATION,
+    SIGNALS_INTRADAY_STOP_LOSS_PCT,
     SIGNALS_KELLY_FRACTION,
     SIGNALS_PORTFOLIO_SIZE,
 )
@@ -714,13 +715,42 @@ class PositionOptimizerEngine:
         return round(self._clamp(k, 0.0, 1.0) * KELLY_FRACTION, 4)
 
     def _build_sizing_profiles(self, candidate: SpreadCandidate) -> list[SizingProfile]:
-        effective_risk = max(candidate.max_loss, candidate.entry_debit, 1.0)
+        # Effective per-contract risk for sizing.
+        #
+        # Stops fire at SIGNALS_INTRADAY_STOP_LOSS_PCT (default -0.25 =
+        # 25% premium loss), not at -100% (full max_loss). So real
+        # per-contract dollar risk under a working stop is
+        # ``|stop_drift| × entry_premium_dollars``. Using full ``max_loss``
+        # for sizing — the prior behavior — silently sized positions
+        # ~4× smaller than the configured heat budget intended.
+        #
+        # The portfolio engine's heat-cap layer continues to use
+        # ``max_loss`` as the catastrophic-risk denominator, so a stop
+        # that fails to fill is still bounded by the portfolio heat cap.
+        entry_premium_dollars = (
+            candidate.entry_debit if candidate.entry_debit > 0 else candidate.entry_credit
+        )
+        stop_pct = abs(float(SIGNALS_INTRADAY_STOP_LOSS_PCT))
+        if stop_pct > 0 and entry_premium_dollars > 0:
+            effective_risk = max(stop_pct * entry_premium_dollars, 1.0)
+        else:
+            # Legacy fallback: no configured stop or no premium — fall back
+            # to max_loss so we never underestimate risk to zero.
+            effective_risk = max(candidate.max_loss, candidate.entry_debit, 1.0)
         sizing = []
         for profile, heat_pct in RISK_PROFILE_BUDGETS.items():
             budget = ASSUMED_ACCOUNT_EQUITY * heat_pct
-            kelly_adjusted_budget = max(
-                budget * max(candidate.kelly_fraction, 0.10), min(budget, effective_risk)
-            )
+            # No floor on kelly_fraction. The prior ``max(kelly, 0.10)``
+            # neutralized Kelly downsizing entirely — every weak-edge
+            # candidate (true Kelly ~0.01) was sized at 10% of the heat
+            # budget. The outer ``max(..., min(budget, effective_risk))``
+            # then pinned kelly_adjusted_budget at full budget any time
+            # effective_risk fit inside it. Net: Kelly was dead.
+            #
+            # Now Kelly drives sizing directly. Weak edge → small budget →
+            # contracts==0 (legitimately rejected). Strong edge → full
+            # configured budget.
+            kelly_adjusted_budget = budget * candidate.kelly_fraction
             # Floor at 0 so a trade whose per-contract risk exceeds the profile
             # budget returns 0 contracts (no position) rather than being
             # force-sized to 1 and blowing the heat cap.  Callers treat
