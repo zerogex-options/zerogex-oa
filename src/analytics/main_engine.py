@@ -140,6 +140,18 @@ class AnalyticsEngine:
             "ANALYTICS_SNAPSHOT_STATEMENT_TIMEOUT_MS", 0, min=0
         )
         self._snapshot_cold_start_consumed = False
+        # Read latest-per-contract from option_chains_latest (the
+        # maintained cache populated by ingestion's dual-UPSERT) instead
+        # of DISTINCT ON over option_chains history.  Cache read is an
+        # O(active contracts) indexed lookup; history read is an
+        # O(2h * contracts * intraday quotes) bitmap-heap-scan + sort.
+        # Default OFF so deploying the code is a no-op; operators flip
+        # the flag after the cache has warmed up (see schema.sql header
+        # for the activation sequence).  Falls back to the history
+        # snapshot for THIS cycle when the cache returns zero rows
+        # (cache warm-up, off-hours pause, ingestion outage), so a
+        # too-early flip cannot leave analytics blind.
+        self.use_latest_cache = _getenv_bool("ANALYTICS_USE_LATEST_CACHE", False)
         self.min_oi_coverage_pct_alert = _getenv_float("ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT", 0.35)
 
         # Off-hours mode: keep cycling on weekends / NYSE holidays instead
@@ -249,6 +261,44 @@ class AnalyticsEngine:
         logger.info(f"\n⚠️  Received signal {signum}, shutting down...")
         self.running = False
 
+    # Cache-table version of the latest-per-contract snapshot query.
+    # Read by ``_run_snapshot_query_from_cache`` when
+    # ``ANALYTICS_USE_LATEST_CACHE=true``.  Mirrors the column order of
+    # ``_SNAPSHOT_QUERY`` exactly so the per-row tuple consumer at
+    # _get_snapshot's row→dict mapping works against either result set.
+    # No DISTINCT ON / no large sort: option_chains_latest already holds
+    # exactly one row per option_symbol (maintained by ingestion's
+    # dual-UPSERT), so this is a single indexed lookup.  Same parameter
+    # contract as ``_SNAPSHOT_QUERY`` -- (underlying, timestamp,
+    # lookback_start, min_expiration, row_cap) -- so the cache runner
+    # can share the call shape.
+    _SNAPSHOT_QUERY_CACHE = """
+        SELECT
+            ocl.option_symbol,
+            ocl.strike,
+            ocl.expiration,
+            ocl.option_type,
+            ocl.last,
+            ocl.bid,
+            ocl.ask,
+            ocl.volume,
+            ocl.open_interest,
+            ocl.delta,
+            ocl.gamma,
+            ocl.theta,
+            ocl.vega,
+            ocl.implied_volatility,
+            ocl.timestamp
+        FROM option_chains_latest ocl
+        WHERE ocl.underlying = %s
+          AND ocl.timestamp <= %s
+          AND ocl.timestamp >= %s
+          AND ocl.expiration > %s
+          AND ocl.gamma IS NOT NULL
+        ORDER BY ocl.option_symbol
+        LIMIT %s
+        """
+
     # SQL for the latest-per-contract snapshot (query #3 in _get_snapshot).
     # Kept as a class attribute so the cold-start and steady-state /
     # fallback paths execute byte-identical SQL (same plan shape).
@@ -326,6 +376,38 @@ class AnalyticsEngine:
         lookback_start = timestamp - timedelta(hours=lookback_hours)
         cursor.execute(
             self._SNAPSHOT_QUERY,
+            (self.db_symbol, timestamp, lookback_start, min_expiration, row_cap),
+        )
+        return cursor.fetchall()  # type: ignore[no-any-return]
+
+    def _run_snapshot_query_from_cache(
+        self,
+        cursor,
+        timestamp: datetime,
+        lookback_hours: float,
+        min_expiration,
+        row_cap: int,
+    ) -> list:
+        """Execute the cache-table version of the snapshot query.
+
+        Reads from ``option_chains_latest`` -- the maintained "one row
+        per option_symbol" cache populated by ingestion's dual-UPSERT --
+        as a single indexed lookup.  No DISTINCT ON / no large sort,
+        so the per-cycle cost is O(active contracts) rather than
+        O(history rows in the lookback window).
+
+        Returns rows in the same column order as ``_run_snapshot_query``
+        so the caller's row→dict mapping works against either result.
+
+        No ``SET LOCAL statement_timeout`` here: the cache read is
+        single-page-fetch class (a few index leaves + a tight heap
+        scan of ~2k rows) and well inside the pool-wide ceiling under
+        any plausible regime.  A separate per-query timeout would only
+        mask a real cache-table regression instead of surfacing it.
+        """
+        lookback_start = timestamp - timedelta(hours=lookback_hours)
+        cursor.execute(
+            self._SNAPSHOT_QUERY_CACHE,
             (self.db_symbol, timestamp, lookback_start, min_expiration, row_cap),
         )
         return cursor.fetchall()  # type: ignore[no-any-return]
@@ -533,74 +615,156 @@ class AnalyticsEngine:
                 # we hit it we log a warning rather than silently dropping.
                 snapshot_row_cap = _getenv_int("ANALYTICS_SNAPSHOT_MAX_ROWS", 50000, min=1)
 
-                data_age = datetime.now(timezone.utc) - timestamp
-                want_cold_start = not self._snapshot_cold_start_consumed and data_age > timedelta(
-                    hours=self.snapshot_lookback_hours
-                )
-                # Buffer-pool warmup is a separate concern from the
-                # data-staleness gate.  A mid-session restart with live
-                # ingestion sees fresh data (data_age < snapshot_lookback_hours)
-                # and skips the wide cold-start scan, but the buffer pool is
-                # still cold from the restart -- the 2h steady-state walk can
-                # then drag past the steady-state statement_timeout on that
-                # FIRST cycle and the whole process loops at 90-150s
-                # snapshot=timeout / no progress until something warms the
-                # pool.  Grant the SAME cold-start budget to cycle 1 on the
-                # steady-state path; from cycle 2 the pool is warm enough
-                # that the configured steady-state budget suffices.
+                # Flip the cold-start latch ONCE per process, before either
+                # the cache path or the history path runs, so a fallback
+                # from cache→history on cycle 2+ doesn't re-enter the wide
+                # cold-start scan unnecessarily.  ``is_first_cycle`` stays
+                # available to the history block below for its warmup
+                # statement_timeout decision.
                 is_first_cycle = not self._snapshot_cold_start_consumed
                 self._snapshot_cold_start_consumed = True
-                # Effective per-query ceiling used by the steady-state
-                # branch and the cold-start fallback retry.  Cycle 1 gets
-                # the cold-start budget because the pool is cold; later
-                # cycles get the configured steady-state value.
-                steady_state_timeout_ms = (
-                    self.snapshot_cold_start_statement_timeout_ms
-                    if is_first_cycle
-                    else self.snapshot_statement_timeout_ms
-                )
 
-                if want_cold_start:
-                    logger.info(
-                        "Cold-start snapshot: latest data is %.1fh old; using "
-                        "%.2fh lookback (steady-state %.2fh) with %dms statement_timeout",
-                        data_age.total_seconds() / 3600.0,
-                        self.snapshot_cold_start_lookback_hours,
-                        self.snapshot_lookback_hours,
-                        self.snapshot_cold_start_statement_timeout_ms,
-                    )
+                # Cache-first read path (gated on ANALYTICS_USE_LATEST_CACHE).
+                # ``option_chains_latest`` holds one row per option_symbol
+                # maintained by ingestion's dual-UPSERT, so this is a single
+                # indexed lookup -- the structural fix for the 2026-05-26
+                # production incident where DISTINCT ON over the intraday
+                # window saturated the buffer pool.  On cache miss (empty
+                # result, read error) we fall through to the historical
+                # snapshot path below, so a too-early flag flip or a brief
+                # cache outage cannot leave the engine blind.
+                rows: Optional[List[Any]] = None
+                if self.use_latest_cache:
                     try:
-                        rows = self._run_snapshot_query(
+                        rows = self._run_snapshot_query_from_cache(
                             cursor,
                             timestamp,
-                            self.snapshot_cold_start_lookback_hours,  # type: ignore[arg-type]
+                            self.snapshot_lookback_hours,
                             min_expiration,
                             snapshot_row_cap,
-                            statement_timeout_ms=self.snapshot_cold_start_statement_timeout_ms,
                         )
                         conn.commit()
-                    except Exception as cold_err:
-                        # Most commonly a statement-timeout QueryCanceled
-                        # on a cold buffer pool.  Roll back the aborted
-                        # transaction and immediately retry this SAME
-                        # cycle with the cheap steady-state window so the
-                        # first cycle still produces a (narrower but
-                        # non-empty) result instead of stalling a whole
-                        # interval and emitting a hard error.
+                    except Exception as cache_err:
+                        # Most commonly a transient connection error or a
+                        # cache-table outage during a schema migration.
+                        # Roll back the aborted transaction and fall
+                        # through to the history path.
                         try:
                             conn.rollback()
                         except Exception:
                             logger.warning(
-                                "Rollback after cold-start failure also failed",
+                                "Rollback after cache-snapshot failure also failed",
                                 exc_info=True,
                             )
                         logger.warning(
-                            "Cold-start snapshot failed (%s); retrying this "
-                            "cycle with the %dh steady-state lookback",
-                            cold_err.__class__.__name__,
-                            self.snapshot_lookback_hours,
+                            "option_chains_latest cache read failed (%s); "
+                            "falling back to the historical DISTINCT ON "
+                            "snapshot for this cycle",
+                            cache_err.__class__.__name__,
                             exc_info=True,
                         )
+                        rows = None
+                    else:
+                        if not rows:
+                            # Expected during cache warm-up (first minutes
+                            # after the flag is flipped or after a
+                            # cache-table rebuild), and on a stale weekend
+                            # where every cache row's timestamp is older
+                            # than ``snapshot_lookback_hours``.  Fall
+                            # through to the history path; it will pick
+                            # the wide cold-start lookback when data is
+                            # genuinely old.
+                            logger.warning(
+                                "option_chains_latest cache returned 0 rows for "
+                                "%s; falling back to the historical DISTINCT ON "
+                                "snapshot for this cycle (cache warm-up or "
+                                "stale cache vs. configured lookback?)",
+                                self.db_symbol,
+                            )
+
+                # History fallback (also the only path when the flag is off).
+                # ``rows`` is None if cache disabled / cache errored;
+                # empty list if cache returned 0 rows.  Either way, run
+                # the historical DISTINCT ON path below to assign ``rows``.
+                if not rows:
+                    data_age = datetime.now(timezone.utc) - timestamp
+                    want_cold_start = is_first_cycle and data_age > timedelta(
+                        hours=self.snapshot_lookback_hours
+                    )
+                    # Effective per-query ceiling used by the steady-state
+                    # branch and the cold-start fallback retry.  Cycle 1 gets
+                    # the cold-start budget because the pool is cold; later
+                    # cycles get the configured steady-state value.
+                    steady_state_timeout_ms = (
+                        self.snapshot_cold_start_statement_timeout_ms
+                        if is_first_cycle
+                        else self.snapshot_statement_timeout_ms
+                    )
+
+                    if want_cold_start:
+                        logger.info(
+                            "Cold-start snapshot: latest data is %.1fh old; using "
+                            "%.2fh lookback (steady-state %.2fh) with %dms statement_timeout",
+                            data_age.total_seconds() / 3600.0,
+                            self.snapshot_cold_start_lookback_hours,
+                            self.snapshot_lookback_hours,
+                            self.snapshot_cold_start_statement_timeout_ms,
+                        )
+                        try:
+                            rows = self._run_snapshot_query(
+                                cursor,
+                                timestamp,
+                                self.snapshot_cold_start_lookback_hours,  # type: ignore[arg-type]
+                                min_expiration,
+                                snapshot_row_cap,
+                                statement_timeout_ms=self.snapshot_cold_start_statement_timeout_ms,
+                            )
+                            conn.commit()
+                        except Exception as cold_err:
+                            # Most commonly a statement-timeout QueryCanceled
+                            # on a cold buffer pool.  Roll back the aborted
+                            # transaction and immediately retry this SAME
+                            # cycle with the cheap steady-state window so the
+                            # first cycle still produces a (narrower but
+                            # non-empty) result instead of stalling a whole
+                            # interval and emitting a hard error.
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                logger.warning(
+                                    "Rollback after cold-start failure also failed",
+                                    exc_info=True,
+                                )
+                            logger.warning(
+                                "Cold-start snapshot failed (%s); retrying this "
+                                "cycle with the %.2fh steady-state lookback",
+                                cold_err.__class__.__name__,
+                                self.snapshot_lookback_hours,
+                                exc_info=True,
+                            )
+                            rows = self._run_snapshot_query(
+                                cursor,
+                                timestamp,
+                                self.snapshot_lookback_hours,  # type: ignore[arg-type]
+                                min_expiration,
+                                snapshot_row_cap,
+                                statement_timeout_ms=steady_state_timeout_ms,
+                            )
+                            conn.commit()
+                    else:
+                        if is_first_cycle and steady_state_timeout_ms > 0:
+                            # Surface the warmup-budget upgrade so an operator
+                            # diagnosing a slow restart can see why cycle 1's
+                            # statement_timeout differs from the configured
+                            # steady-state value.
+                            logger.info(
+                                "First-cycle steady-state snapshot: applying "
+                                "%dms cold-start statement_timeout to absorb "
+                                "buffer-pool warmup (subsequent cycles use the "
+                                "%dms steady-state budget; 0 = pool default)",
+                                steady_state_timeout_ms,
+                                self.snapshot_statement_timeout_ms,
+                            )
                         rows = self._run_snapshot_query(
                             cursor,
                             timestamp,
@@ -610,29 +774,6 @@ class AnalyticsEngine:
                             statement_timeout_ms=steady_state_timeout_ms,
                         )
                         conn.commit()
-                else:
-                    if is_first_cycle and steady_state_timeout_ms > 0:
-                        # Surface the warmup-budget upgrade so an operator
-                        # diagnosing a slow restart can see why cycle 1's
-                        # statement_timeout differs from the configured
-                        # steady-state value.
-                        logger.info(
-                            "First-cycle steady-state snapshot: applying "
-                            "%dms cold-start statement_timeout to absorb "
-                            "buffer-pool warmup (subsequent cycles use the "
-                            "%dms steady-state budget; 0 = pool default)",
-                            steady_state_timeout_ms,
-                            self.snapshot_statement_timeout_ms,
-                        )
-                    rows = self._run_snapshot_query(
-                        cursor,
-                        timestamp,
-                        self.snapshot_lookback_hours,  # type: ignore[arg-type]
-                        min_expiration,
-                        snapshot_row_cap,
-                        statement_timeout_ms=steady_state_timeout_ms,
-                    )
-                    conn.commit()
 
                 if len(rows) >= snapshot_row_cap:
                     logger.warning(
