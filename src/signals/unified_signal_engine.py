@@ -992,95 +992,67 @@ class UnifiedSignalEngine:
 
                 iv_rank = None
                 if self._iv_rank_enabled:
-                    # IV rank: compare current ATM IV to its 30-day daily range.
+                    # IV rank: compare today's ATM call IV to the 30-day
+                    # daily range, both sourced from ``daily_atm_iv``.
                     #
-                    # Cached for 60s per symbol — iv_rank is a daily
-                    # percentile, so 1Hz recomputation is wasteful.
+                    # That table is maintained by the analytics engine
+                    # (src/analytics/main_engine.py:_store_daily_atm_iv);
+                    # one row per (underlying, trading_date), UPSERTed
+                    # every analytics cycle.  Today's row updates
+                    # continuously through the session and naturally
+                    # settles to the EOD value; older rows are static.
                     #
-                    # Implementation note: a naive 30-day AVG(iv)
-                    # GROUP BY day across option_chains scans millions of
-                    # rows per query (table is 26GB / 7.8GB heap; a 30-day
-                    # slice is ~25% of heap pages).  Even with the
-                    # ``(underlying, timestamp DESC, option_type, strike)``
-                    # covering index, implied_volatility isn't in any
-                    # index — so the heap must be touched for every
-                    # candidate row.  In prod this took >60s for SPX/SPY/QQQ
-                    # and consistently exceeded the engine's per-query
-                    # statement_timeout.
+                    # This query reads ~30 rows.  Previous in-engine
+                    # implementations aggregated 30 days of option_chains
+                    # (26GB table, ~25% of heap pages per scan) and
+                    # consistently timed out — no covering index exists
+                    # for ``(underlying, option_type, strike, IV)`` so
+                    # every row required a heap fetch.
                     #
-                    # Instead, sample the last ~50 ATM-call quotes per day
-                    # via a LATERAL subquery.  Reads at most
-                    # ``50 * 31 = 1550`` rows total, uses the covering
-                    # index for the (underlying, timestamp, option_type,
-                    # strike) prefix, and the explicit ``strike BETWEEN
-                    # ... AND ...`` (vs ``ABS(strike-X)/X < 0.01``) lets
-                    # the planner push the strike filter through as an
-                    # index condition.  Trivial under any timeout.
+                    # Still cached for 60s per symbol — the query is
+                    # cheap but iv_rank only changes at minute cadence.
                     cached = self._iv_rank_cache.get(self.db_symbol)
                     now_utc = datetime.now(timezone.utc)
                     if cached is not None and (now_utc - cached[0]).total_seconds() < 60:
                         iv_rank = cached[1]
                     else:
                         try:
-                            iv_timeout_ms = int(
-                                os.getenv("SIGNAL_IV_RANK_TIMEOUT_MS", "15000")
-                            )
-                            cur.execute(
-                                f"SET LOCAL statement_timeout = {iv_timeout_ms}"
-                            )
                             cur.execute(
                                 """
-                                WITH current_atm AS (
-                                    SELECT AVG(implied_volatility) AS current_iv
-                                    FROM option_chains
+                                WITH today_iv AS (
+                                    SELECT atm_call_iv AS current_iv
+                                    FROM daily_atm_iv
                                     WHERE underlying = %s
-                                      AND option_type = 'C'
-                                      AND strike BETWEEN %s * 0.99 AND %s * 1.01
-                                      AND implied_volatility IS NOT NULL
-                                      AND implied_volatility > 0
-                                      AND timestamp >= %s - INTERVAL '2 hours'
+                                      AND trading_date = (
+                                          (%s::timestamptz AT TIME ZONE 'America/New_York')::date
+                                      )
                                 ),
-                                days AS (
-                                    SELECT generate_series(
-                                        date_trunc('day', NOW() - INTERVAL '30 days'),
-                                        date_trunc('day', NOW()),
-                                        INTERVAL '1 day'
-                                    )::timestamptz AS day_start
-                                ),
-                                daily_iv AS (
-                                    SELECT d.day_start::date AS day,
-                                           AVG(snap.implied_volatility) AS avg_iv
-                                    FROM days d
-                                    CROSS JOIN LATERAL (
-                                        SELECT implied_volatility
-                                        FROM option_chains oc
-                                        WHERE oc.underlying = %s
-                                          AND oc.option_type = 'C'
-                                          AND oc.strike BETWEEN %s * 0.99 AND %s * 1.01
-                                          AND oc.implied_volatility IS NOT NULL
-                                          AND oc.implied_volatility > 0
-                                          AND oc.timestamp >= d.day_start
-                                          AND oc.timestamp <  d.day_start + INTERVAL '1 day'
-                                        ORDER BY oc.timestamp DESC
-                                        LIMIT 50
-                                    ) snap
-                                    GROUP BY d.day_start
+                                historical_iv AS (
+                                    SELECT MIN(atm_call_iv) AS iv_low,
+                                           MAX(atm_call_iv) AS iv_high,
+                                           COUNT(*) AS days
+                                    FROM daily_atm_iv
+                                    WHERE underlying = %s
+                                      AND trading_date < (
+                                          (%s::timestamptz AT TIME ZONE 'America/New_York')::date
+                                      )
+                                      AND trading_date >= (
+                                          (%s::timestamptz AT TIME ZONE 'America/New_York')::date
+                                      ) - INTERVAL '30 days'
                                 )
                                 SELECT
-                                    (SELECT current_iv FROM current_atm),
-                                    MIN(avg_iv),
-                                    MAX(avg_iv),
-                                    COUNT(*)
-                                FROM daily_iv
+                                    (SELECT current_iv FROM today_iv),
+                                    iv_low,
+                                    iv_high,
+                                    days
+                                FROM historical_iv
                                 """,
                                 (
                                     self.db_symbol,
-                                    close_f,
-                                    close_f,
                                     ts,
                                     self.db_symbol,
-                                    close_f,
-                                    close_f,
+                                    ts,
+                                    ts,
                                 ),
                             )
                             iv_row = cur.fetchone()
@@ -1103,23 +1075,23 @@ class UnifiedSignalEngine:
                                 # Clear the diag latch so a future failure re-logs.
                                 self._iv_rank_diag_logged[self.db_symbol] = False
                             elif not self._iv_rank_diag_logged.get(self.db_symbol):
-                                # Query succeeded but a CTE was empty.
-                                # Surface the components so we can tell
-                                # which window is missing (current_iv null
-                                # → no ATM rows in last 2h; iv_low/iv_high
-                                # null → no historical days).
+                                # daily_atm_iv is the data source — if a
+                                # window is empty, either the analytics
+                                # writer hasn't populated today (first
+                                # cycle after rollout) or the backfill
+                                # hasn't run yet.  Surface the components
+                                # so the operator can tell which.
                                 self._iv_rank_diag_logged[self.db_symbol] = True
                                 logger.warning(
-                                    "UnifiedSignalEngine [%s]: iv_rank query returned null components: "
-                                    "current_iv=%s iv_low=%s iv_high=%s daily_count=%s "
-                                    "(spot=%s ts=%s)",
+                                    "UnifiedSignalEngine [%s]: iv_rank read returned null components: "
+                                    "current_iv=%s iv_low=%s iv_high=%s historical_days=%s "
+                                    "(check that analytics has UPSERTed today's row and that "
+                                    "src/tools/daily_atm_iv_backfill.py has seeded history)",
                                     self.db_symbol,
                                     iv_row[0] if iv_row else None,
                                     iv_row[1] if iv_row else None,
                                     iv_row[2] if iv_row else None,
                                     iv_row[3] if iv_row else None,
-                                    close_f,
-                                    ts,
                                 )
                             # Cache even None so we don't retry every 1Hz
                             # cycle when the data is genuinely missing.

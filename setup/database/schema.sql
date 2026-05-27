@@ -1809,3 +1809,40 @@ CREATE TABLE IF NOT EXISTS api_keys (
 CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_active_hash
     ON api_keys(key_hash) WHERE revoked_at IS NULL;
+
+-- =============================================================================
+-- Daily ATM IV history (for iv_rank computation)
+-- =============================================================================
+-- One row per (underlying, trading_date) holding that day's ATM call IV.
+-- Powers the iv_rank percentile in the signals engine
+-- (src/signals/unified_signal_engine.py).  Replaces an earlier in-engine
+-- 30-day GROUP BY over option_chains that consistently exceeded the
+-- pool-wide DB_STATEMENT_TIMEOUT_MS: option_chains is 26GB and a 30-day
+-- slice scans ~25% of heap pages even with the best index, because
+-- implied_volatility isn't in any index (heap fetch mandatory per row).
+--
+-- This table is ~30 rows per symbol; the iv_rank read is a sub-ms scalar.
+--
+-- Writer: src/analytics/main_engine.py (UPSERTs once per analytics cycle
+-- for the current trading day; older days are immutable once the next
+-- day's row is written).  Backfill: src/tools/daily_atm_iv_backfill.py
+-- seeds 30 days of history once at deploy time.
+--
+-- ``sample_count`` records how many option_chains rows the aggregate was
+-- built from — used to suppress days where the chain wasn't fully ingested
+-- (e.g. half-day holidays, ingestion outages).
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS daily_atm_iv (
+    underlying      VARCHAR(10)    NOT NULL,
+    trading_date    DATE           NOT NULL,
+    atm_call_iv     NUMERIC(8, 6)  NOT NULL,
+    spot_price      NUMERIC(12, 4) NOT NULL,
+    sample_count    INTEGER        NOT NULL DEFAULT 0,
+    source_timestamp TIMESTAMPTZ   NOT NULL,
+    created_at      TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (underlying, trading_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_atm_iv_underlying_date
+    ON daily_atm_iv(underlying, trading_date DESC);

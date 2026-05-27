@@ -2773,10 +2773,97 @@ class AnalyticsEngine:
             ),
         )
 
+    def _store_daily_atm_iv(
+        self,
+        options: List[Dict[str, Any]],
+        summary: Dict[str, Any],
+        cursor,
+    ) -> None:
+        """Upsert today's row in ``daily_atm_iv`` for use by the signals engine.
+
+        Computes ATM call IV from the snapshot's options list using
+        strikes within ±1% of spot.  Idempotent per
+        ``(underlying, trading_date)`` — the row is rewritten on every
+        analytics cycle through the trading day, so the value naturally
+        settles to the EOD snapshot as the day closes.
+
+        Skips silently when:
+          * spot is missing / non-positive (no ATM reference)
+          * no ATM calls have positive IV (chain not yet populated)
+        Failures here must not abort the GEX persistence — wrapped in
+        try/except so a bad UPSERT logs and continues.
+        """
+        try:
+            spot = float(summary.get("underlying_price") or 0.0)
+            if spot <= 0:
+                return
+            underlying = summary["underlying"]
+            timestamp = summary["timestamp"]
+
+            low = spot * 0.99
+            high = spot * 1.01
+            atm_ivs: List[float] = []
+            for opt in options:
+                if opt.get("option_type") != "C":
+                    continue
+                strike = opt.get("strike")
+                iv = opt.get("implied_volatility")
+                if strike is None or iv is None:
+                    continue
+                try:
+                    strike_f = float(strike)
+                    iv_f = float(iv)
+                except (TypeError, ValueError):
+                    continue
+                if iv_f <= 0 or not (low <= strike_f <= high):
+                    continue
+                atm_ivs.append(iv_f)
+
+            if not atm_ivs:
+                return
+
+            atm_call_iv = sum(atm_ivs) / len(atm_ivs)
+            sample_count = len(atm_ivs)
+
+            cursor.execute(
+                """
+                INSERT INTO daily_atm_iv (
+                    underlying, trading_date, atm_call_iv, spot_price,
+                    sample_count, source_timestamp
+                )
+                VALUES (
+                    %s,
+                    (%s::timestamptz AT TIME ZONE 'America/New_York')::date,
+                    %s, %s, %s, %s
+                )
+                ON CONFLICT (underlying, trading_date) DO UPDATE
+                SET atm_call_iv      = EXCLUDED.atm_call_iv,
+                    spot_price       = EXCLUDED.spot_price,
+                    sample_count     = EXCLUDED.sample_count,
+                    source_timestamp = EXCLUDED.source_timestamp,
+                    updated_at       = NOW()
+                """,
+                (
+                    underlying,
+                    timestamp,
+                    atm_call_iv,
+                    spot,
+                    sample_count,
+                    timestamp,
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to upsert daily_atm_iv for %s: %s",
+                summary.get("underlying", "?"),
+                exc,
+            )
+
     def _store_calculation_results(
         self,
         gex_data: List[Dict[str, Any]],
         summary: Dict[str, Any],
+        options: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Persist by-strike + summary + profile in ONE transaction (all rows land or none).
 
@@ -2787,6 +2874,12 @@ class AnalyticsEngine:
         transaction.  This atomicity ("all three stores commit
         together") is the invariant downstream consumers rely on, so the
         grouping must not be split into independent transactions.
+
+        ``options`` is the raw per-contract snapshot list from
+        ``_get_snapshot()``.  When provided, also UPSERTs today's row
+        into ``daily_atm_iv`` so the signals engine can compute iv_rank
+        without scanning 30 days of option_chains itself.  Kept optional
+        so legacy callers without a snapshot still work.
         """
         try:
             with db_connection() as conn:
@@ -2794,6 +2887,8 @@ class AnalyticsEngine:
                 self._store_gex_by_strike(gex_data, cursor)
                 self._store_gex_summary(summary, cursor)
                 self._store_gex_profile(summary, cursor)
+                if options is not None:
+                    self._store_daily_atm_iv(options, summary, cursor)
                 # db_connection() commits on a clean __exit__; the explicit
                 # commit makes the single-transaction boundary unambiguous
                 # and is a harmless no-op when the CM commits again.
@@ -3226,7 +3321,7 @@ class AnalyticsEngine:
             # Store results
             logger.info("Storing results to database...")
             t0 = _time.monotonic()
-            self._store_calculation_results(gex_by_strike, gex_summary)
+            self._store_calculation_results(gex_by_strike, gex_summary, options=options)
             stage_timings["store_results"] = _time.monotonic() - t0
 
             # Refresh flow cache tables
