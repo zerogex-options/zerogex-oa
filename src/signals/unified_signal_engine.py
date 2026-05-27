@@ -995,20 +995,27 @@ class UnifiedSignalEngine:
                     # IV rank: compare current ATM IV to its 30-day daily range.
                     #
                     # Cached for 60s per symbol — iv_rank is a daily
-                    # percentile, so 1Hz recomputation is wasteful and the
-                    # 30-day aggregation is the largest query the engine
-                    # runs.
+                    # percentile, so 1Hz recomputation is wasteful.
                     #
-                    # The 30-day option_chains aggregation can exceed the
-                    # pool-wide DB_STATEMENT_TIMEOUT_MS (typically 20-90s)
-                    # under autovacuum or cold buffer pool conditions —
-                    # confirmed in prod logs where all three of SPX/SPY/QQQ
-                    # hit "canceling statement due to statement timeout"
-                    # every cycle.  Apply a dedicated, configurable budget
-                    # via ``SET LOCAL`` scoped to this transaction.  Safe
-                    # because this is the LAST query in
-                    # ``_fetch_market_context``; the relaxed budget
-                    # reverts when the transaction closes on function exit.
+                    # Implementation note: a naive 30-day AVG(iv)
+                    # GROUP BY day across option_chains scans millions of
+                    # rows per query (table is 26GB / 7.8GB heap; a 30-day
+                    # slice is ~25% of heap pages).  Even with the
+                    # ``(underlying, timestamp DESC, option_type, strike)``
+                    # covering index, implied_volatility isn't in any
+                    # index — so the heap must be touched for every
+                    # candidate row.  In prod this took >60s for SPX/SPY/QQQ
+                    # and consistently exceeded the engine's per-query
+                    # statement_timeout.
+                    #
+                    # Instead, sample the last ~50 ATM-call quotes per day
+                    # via a LATERAL subquery.  Reads at most
+                    # ``50 * 31 = 1550`` rows total, uses the covering
+                    # index for the (underlying, timestamp, option_type,
+                    # strike) prefix, and the explicit ``strike BETWEEN
+                    # ... AND ...`` (vs ``ABS(strike-X)/X < 0.01``) lets
+                    # the planner push the strike filter through as an
+                    # index condition.  Trivial under any timeout.
                     cached = self._iv_rank_cache.get(self.db_symbol)
                     now_utc = datetime.now(timezone.utc)
                     if cached is not None and (now_utc - cached[0]).total_seconds() < 60:
@@ -1016,7 +1023,7 @@ class UnifiedSignalEngine:
                     else:
                         try:
                             iv_timeout_ms = int(
-                                os.getenv("SIGNAL_IV_RANK_TIMEOUT_MS", "60000")
+                                os.getenv("SIGNAL_IV_RANK_TIMEOUT_MS", "15000")
                             )
                             cur.execute(
                                 f"SET LOCAL statement_timeout = {iv_timeout_ms}"
@@ -1027,23 +1034,37 @@ class UnifiedSignalEngine:
                                     SELECT AVG(implied_volatility) AS current_iv
                                     FROM option_chains
                                     WHERE underlying = %s
-                                      AND ABS(strike - %s) / NULLIF(%s, 0) < 0.01
                                       AND option_type = 'C'
+                                      AND strike BETWEEN %s * 0.99 AND %s * 1.01
                                       AND implied_volatility IS NOT NULL
                                       AND implied_volatility > 0
                                       AND timestamp >= %s - INTERVAL '2 hours'
                                 ),
+                                days AS (
+                                    SELECT generate_series(
+                                        date_trunc('day', NOW() - INTERVAL '30 days'),
+                                        date_trunc('day', NOW()),
+                                        INTERVAL '1 day'
+                                    )::timestamptz AS day_start
+                                ),
                                 daily_iv AS (
-                                    SELECT DATE_TRUNC('day', timestamp) AS day,
-                                           AVG(implied_volatility) AS avg_iv
-                                    FROM option_chains
-                                    WHERE underlying = %s
-                                      AND ABS(strike - %s) / NULLIF(%s, 0) < 0.01
-                                      AND option_type = 'C'
-                                      AND implied_volatility IS NOT NULL
-                                      AND implied_volatility > 0
-                                      AND timestamp >= NOW() - INTERVAL '30 days'
-                                    GROUP BY DATE_TRUNC('day', timestamp)
+                                    SELECT d.day_start::date AS day,
+                                           AVG(snap.implied_volatility) AS avg_iv
+                                    FROM days d
+                                    CROSS JOIN LATERAL (
+                                        SELECT implied_volatility
+                                        FROM option_chains oc
+                                        WHERE oc.underlying = %s
+                                          AND oc.option_type = 'C'
+                                          AND oc.strike BETWEEN %s * 0.99 AND %s * 1.01
+                                          AND oc.implied_volatility IS NOT NULL
+                                          AND oc.implied_volatility > 0
+                                          AND oc.timestamp >= d.day_start
+                                          AND oc.timestamp <  d.day_start + INTERVAL '1 day'
+                                        ORDER BY oc.timestamp DESC
+                                        LIMIT 50
+                                    ) snap
+                                    GROUP BY d.day_start
                                 )
                                 SELECT
                                     (SELECT current_iv FROM current_atm),
