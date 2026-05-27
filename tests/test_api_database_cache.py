@@ -352,3 +352,31 @@ def test_option_contract_bars_surface_per_bar_classified_flow():
     for col in ("ask_volume", "mid_volume", "bid_volume"):
         bare = f"{bare_indent}{col},"
         assert bare not in sql, f"raw cumulative column selected: {col}"
+
+
+def test_fetch_option_contract_bars_propagates_timeout():
+    """Statement / command timeouts surface as bare TimeoutError whose str()
+    is empty. The bar fetch must re-raise (not swallow to []) so the router
+    can map it to a 504; the prior generic ``except Exception`` log only
+    captured ``{e}`` and produced an empty error string in the logs.
+    """
+
+    class _TimeoutConn:
+        async def fetch(self, *_args, **_kwargs):
+            raise TimeoutError()
+
+    db = DatabaseManager()
+
+    @asynccontextmanager
+    async def _acquire():
+        yield _TimeoutConn()
+
+    db._acquire_connection = _acquire  # type: ignore[method-assign]
+
+    window_start = datetime(2026, 5, 22, 13, 30, tzinfo=timezone.utc)
+    window_end = datetime(2026, 5, 22, 20, 0, tzinfo=timezone.utc)
+
+    import pytest
+
+    with pytest.raises((asyncio.TimeoutError, TimeoutError)):
+        asyncio.run(db._fetch_option_contract_bars("SPY 250522C00500000", window_start, window_end))

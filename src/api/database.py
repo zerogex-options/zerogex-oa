@@ -3184,8 +3184,25 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         expiration_date,
                         option_type,
                     )
+            except (asyncio.TimeoutError, TimeoutError) as e:
+                # asyncpg's command_timeout (pool default 30s) and Postgres
+                # statement_timeout both surface here as bare TimeoutError
+                # whose str() is empty. Use !r so the type is visible in
+                # the log, and demote to a warning consistent with the
+                # other timeout-returning endpoints. Re-raise so the
+                # router can map this to a 504 instead of a misleading
+                # 500/404.
+                logger.warning(
+                    f"Option contract resolve timed out for "
+                    f"{underlying} {strike} {expiration} {option_type}: {e!r}"
+                )
+                raise
             except Exception as e:
-                logger.error(f"Error fetching option contract history: {e}", exc_info=True)
+                logger.error(
+                    f"Error resolving option contract for "
+                    f"{underlying} {strike} {expiration} {option_type}: {e!r}",
+                    exc_info=True,
+                )
                 raise
 
             if not resolved or resolved["option_symbol"] is None:
@@ -3364,8 +3381,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             async with self._acquire_connection() as conn:
                 rows = await conn.fetch(query, option_symbol, window_start, window_end)
                 return [dict(row) for row in rows]
+        except (asyncio.TimeoutError, TimeoutError) as e:
+            logger.warning(
+                f"Option contract bar query timed out for {option_symbol} "
+                f"({window_start} -> {window_end}): {e!r}"
+            )
+            raise
         except Exception as e:
-            logger.error(f"Error fetching option contract history: {e}", exc_info=True)
+            logger.error(
+                f"Error fetching option contract bars for {option_symbol}: {e!r}",
+                exc_info=True,
+            )
             raise
 
     # ------------------------------------------------------------------

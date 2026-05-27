@@ -9,6 +9,7 @@ day at or after 09:30 ET this is the current day's session; before the
 most recent cash session prior to now.
 """
 
+import asyncio
 from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
 from decimal import Decimal
@@ -89,6 +90,16 @@ async def get_option_contract(
         raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Invalid parameter: {e}")
+    except (asyncio.TimeoutError, TimeoutError):
+        # The database layer already logged this as a warning with full
+        # context. Surface it as 504 so the client can distinguish a slow
+        # backend from a real 500 — the prior generic 500 with an empty
+        # error string (bare TimeoutError str() is "") was unactionable.
+        raise HTTPException(status_code=504, detail="Database query timed out")
     except Exception as e:
-        logger.error(f"Error fetching option contract history: {e}")
+        logger.error(
+            f"Error fetching option contract history "
+            f"({underlying} {strike} {expiration} {option_type}): {e!r}",
+            exc_info=True,
+        )
         raise HTTPException(status_code=500, detail="Internal server error")
