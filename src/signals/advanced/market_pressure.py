@@ -248,12 +248,20 @@ class MarketPressureSignal:
     @staticmethod
     def _compression(ctx: MarketContext) -> dict:
         spot = ctx.close
+        net_gex = float(ctx.net_gex or 0.0)
         if spot <= 0:
             return {
                 "magnitude": 0.0,
                 "wall_pinch": None,
                 "flip_proximity": None,
                 "regime_mult": None,
+                "net_gex_mult": None,
+                "call_wall": None,
+                "put_wall": None,
+                "gamma_flip": None,
+                "flip": None,
+                "spot": None,
+                "net_gex": net_gex,
                 "reason": "no_spot",
             }
 
@@ -278,17 +286,31 @@ class MarketPressureSignal:
                 "wall_pinch": None,
                 "flip_proximity": None,
                 "regime_mult": None,
+                "net_gex_mult": None,
+                "call_wall": call_wall,
+                "put_wall": put_wall,
+                "gamma_flip": flip,
+                "flip": flip,
+                "spot": spot,
+                "net_gex": net_gex,
                 "reason": "no_structure",
             }
 
-        # Geometric mean when both present — BOTH must be high for real
-        # compression.  Passthrough when only one is available.
-        if wall_pinch is not None and flip_prox is not None:
-            base = math.sqrt(max(0.0, wall_pinch) * max(0.0, flip_prox))
-        elif wall_pinch is not None:
-            base = wall_pinch
-        else:
+        # Geometric mean when both inputs are informative (non-zero) — BOTH
+        # must be high for real compression.  When one input is saturated
+        # to zero (e.g. wide walls on QQQ at 4-5% spread), it carries no
+        # information; fall back to the other input alone rather than
+        # annihilating the whole pillar.
+        wp_informative = wall_pinch is not None and wall_pinch > 0.0
+        fp_informative = flip_prox is not None and flip_prox > 0.0
+        if wp_informative and fp_informative:
+            base = math.sqrt(wall_pinch * flip_prox)  # type: ignore[arg-type]
+        elif wp_informative:
+            base = wall_pinch  # type: ignore[assignment]
+        elif fp_informative:
             base = flip_prox  # type: ignore[assignment]
+        else:
+            base = 0.0
 
         regime_mult = MarketPressureSignal._regime_multiplier(ctx)
         magnitude = max(0.0, min(1.0, base * regime_mult))
@@ -298,9 +320,14 @@ class MarketPressureSignal:
             "wall_pinch": round(wall_pinch, 4) if wall_pinch is not None else None,
             "flip_proximity": round(flip_prox, 4) if flip_prox is not None else None,
             "regime_mult": round(regime_mult, 4),
+            # Alias for frontend / docstring shorthand.
+            "net_gex_mult": round(regime_mult, 4),
             "call_wall": call_wall,
             "put_wall": put_wall,
             "gamma_flip": flip,
+            "flip": flip,
+            "spot": spot,
+            "net_gex": net_gex,
         }
 
     @staticmethod
@@ -328,6 +355,7 @@ class MarketPressureSignal:
         return _REGIME_MID_MULT + (_REGIME_MIN_MULT - _REGIME_MID_MULT) * scaled
 
     def _hedging_vector(self, ctx: MarketContext) -> dict:
+        dni_raw = self._dealer_net_delta(ctx)
         agg = self._aggregate_vanna_charm(ctx)
         if agg is None:
             return {
@@ -335,6 +363,14 @@ class MarketPressureSignal:
                 "magnitude": 0.0,
                 "vanna": None,
                 "charm": None,
+                "alpha_vanna": None,
+                "session_alpha": None,
+                "charm_amplification": None,
+                "charm_amp": None,
+                "alignment_mult": None,
+                "alignment_bonus": None,
+                "dealer_gate": None,
+                "dealer_dni": round(dni_raw, 2) if dni_raw is not None else None,
                 "reason": "no_greeks",
             }
 
@@ -344,6 +380,16 @@ class MarketPressureSignal:
             return {
                 "signed": 0.0,
                 "magnitude": 0.0,
+                "vanna": round(vanna_total, 2),
+                "charm": round(charm_total, 2),
+                "alpha_vanna": None,
+                "session_alpha": None,
+                "charm_amplification": None,
+                "charm_amp": None,
+                "alignment_mult": None,
+                "alignment_bonus": None,
+                "dealer_gate": None,
+                "dealer_dni": round(dni_raw, 2) if dni_raw is not None else None,
                 "reason": "bad_norms",
             }
 
@@ -361,9 +407,9 @@ class MarketPressureSignal:
         else:
             align_mult = 1.0
 
-        dni = abs(self._dealer_net_delta(ctx) or 0.0)
+        dni_abs = abs(dni_raw or 0.0)
         dealer_gate = _DEALER_GATE_FLOOR + (1.0 - _DEALER_GATE_FLOOR) * min(
-            1.0, dni / max(_DEALER_NORM, 1.0)
+            1.0, dni_abs / max(_DEALER_NORM, 1.0)
         )
 
         magnitude_adj = max(0.0, min(1.0, abs(vector) * align_mult * dealer_gate))
@@ -377,9 +423,16 @@ class MarketPressureSignal:
             "vanna_normalized": round(v_norm, 4),
             "charm_normalized": round(c_norm, 4),
             "alpha_vanna": round(alpha, 4),
+            # Alias for frontend / docstring shorthand.
+            "session_alpha": round(alpha, 4),
             "charm_amplification": round(charm_amp, 4),
+            "charm_amp": round(charm_amp, 4),
             "alignment_mult": round(align_mult, 4),
+            "alignment_bonus": round(align_mult, 4),
             "dealer_gate": round(dealer_gate, 4),
+            # Signed DNI surfaced alongside the gate so the hedging card can
+            # show "Dealer DNI" without cross-referencing the dealer dict.
+            "dealer_dni": round(dni_raw, 2) if dni_raw is not None else None,
             "source": source,
         }
 
@@ -487,16 +540,33 @@ class MarketPressureSignal:
         signed = max(-1.0, min(1.0, signed))
         magnitude = min(1.0, prem_total / max(flow_norm, 1.0))
 
+        # Reason field surfaces "no flow ingested for this symbol" vs.
+        # "flow ingested but neutral" so the dashboard can distinguish a
+        # genuinely balanced book from a missing-data condition.  Both
+        # smart-money premium and acceleration deltas must be zero — a
+        # truly balanced book usually has *some* premium flux on both
+        # sides, so all-zero is a strong "no rows" indicator.
+        no_flow = prem_total == 0.0 and sm_call == 0.0 and sm_put == 0.0
+        reason: Optional[str] = "no_flow_data" if no_flow else None
+
         return {
             "signed": round(signed, 4),
             "magnitude": round(magnitude, 4),
             "premium_skew": round(prem_skew, 4),
             "smart_skew": round(smart_skew, 4),
+            # Alias for frontend / docstring shorthand.
+            "smart_money_skew": round(smart_skew, 4),
             "call_flow_delta": round(call_fd, 2),
             "put_flow_delta": round(put_fd, 2),
             "smart_call": round(sm_call, 2),
             "smart_put": round(sm_put, 2),
             "flow_norm_used": round(flow_norm, 2),
+            # Total signed premium flux across calls and puts (alias for
+            # |call_flow_delta| + |put_flow_delta|).  Frontends use this as
+            # the raw "is anything happening?" gauge before the magnitude
+            # is gated by flow_norm.
+            "total_flux": round(prem_total, 2),
+            "reason": reason,
         }
 
     @staticmethod

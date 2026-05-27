@@ -1,16 +1,20 @@
 from src.signals.unified_signal_engine import UnifiedSignalEngine
 
 
-def test_iv_rank_disabled_by_default(monkeypatch):
+def test_iv_rank_enabled_by_default(monkeypatch):
+    # The IV-rank query is opportunistic — it falls back gracefully when
+    # the 30-day daily IV history is missing — so it ships enabled. Without
+    # it, ``tension.iv_rank`` is permanently None and the vol-tension
+    # pillar in market_pressure is structurally capped at half magnitude.
     monkeypatch.delenv("SIGNAL_IV_RANK_ENABLED", raising=False)
     engine = UnifiedSignalEngine("SPY")
-    assert engine._iv_rank_enabled is False
-
-
-def test_iv_rank_can_be_enabled_via_env(monkeypatch):
-    monkeypatch.setenv("SIGNAL_IV_RANK_ENABLED", "true")
-    engine = UnifiedSignalEngine("SPY")
     assert engine._iv_rank_enabled is True
+
+
+def test_iv_rank_can_be_disabled_via_env(monkeypatch):
+    monkeypatch.setenv("SIGNAL_IV_RANK_ENABLED", "false")
+    engine = UnifiedSignalEngine("SPY")
+    assert engine._iv_rank_enabled is False
 
 
 def test_unified_engine_includes_market_state_components():

@@ -68,7 +68,18 @@ class UnifiedSignalEngine:
         # Per-signal hysteresis/dedupe state, keyed by advanced signal name.
         # Initialized eagerly so helper methods can assume the dict exists.
         self._advanced_state: dict[str, dict] = {}
-        self._iv_rank_enabled = os.getenv("SIGNAL_IV_RANK_ENABLED", "false").lower() == "true"
+        # Latch for the "no flow data" warning so it logs once per outage
+        # instead of every 1Hz cycle.  Keyed by db_symbol so multi-symbol
+        # engines (one instance per symbol) keep independent state.
+        self._flow_missing_logged: dict[str, bool] = {}
+        # IV rank query is opportunistic — falls back gracefully when the
+        # 30-day daily IV history is missing — so it's safe to enable by
+        # default.  Operators can disable via SIGNAL_IV_RANK_ENABLED=false
+        # if option_chains depth becomes a perf concern.  Without this,
+        # ``tension.iv_rank`` is permanently None and the vol-tension
+        # pillar is structurally capped at half magnitude in
+        # ``market_pressure``.
+        self._iv_rank_enabled = os.getenv("SIGNAL_IV_RANK_ENABLED", "true").lower() == "true"
         if not self._iv_rank_enabled:
             logger.info(
                 "UnifiedSignalEngine [%s]: IV-rank query disabled (set SIGNAL_IV_RANK_ENABLED=true to enable)",
@@ -94,6 +105,65 @@ class UnifiedSignalEngine:
             conn.rollback()
         except Exception:
             pass
+
+    @staticmethod
+    def _estimate_dealer_net_delta(
+        gex_strike_rows: list[dict], spot: float
+    ) -> float:
+        """Return dealer net delta (shares-equivalent) from per-strike rows.
+
+        Single source of truth for the DNI estimate consumed by
+        ``MarketContext.dealer_net_delta``.  Mirrors the fallback chains in
+        ``DealerDeltaPressureComponent._estimate_dni`` and
+        ``MarketPressureSignal._dealer_net_delta`` so both branches converge
+        on the same number.
+
+        * If any row provides explicit ``call_delta_oi`` / ``put_delta_oi``
+          (analytics-layer rollup), sum those and negate (dealers sit on
+          the opposite side of customer delta-weighted OI).
+        * Otherwise use a linear distance-from-spot delta proxy on
+          ``call_oi`` / ``put_oi``.
+
+        Returns ``0.0`` when there are no rows or no spot — callers should
+        treat that as "no info" and may fall back to their own logic.
+        """
+        if not gex_strike_rows or spot <= 0:
+            return 0.0
+
+        have_delta_oi = any(
+            isinstance(r, dict) and ("call_delta_oi" in r or "put_delta_oi" in r)
+            for r in gex_strike_rows
+        )
+        total = 0.0
+        if have_delta_oi:
+            for row in gex_strike_rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    call_d = float(row.get("call_delta_oi") or 0.0)
+                    put_d = float(row.get("put_delta_oi") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                total -= call_d + put_d
+            return total
+
+        for row in gex_strike_rows:
+            if not isinstance(row, dict):
+                continue
+            strike = row.get("strike")
+            if strike is None:
+                continue
+            try:
+                strike_f = float(strike)
+                call_oi_f = float(row.get("call_oi") or 0)
+                put_oi_f = float(row.get("put_oi") or 0)
+            except (TypeError, ValueError):
+                continue
+            distance_pct = (spot - strike_f) / spot
+            call_delta = max(0.0, min(1.0, 0.5 - distance_pct * 10))
+            put_delta = -max(0.0, min(1.0, 0.5 + distance_pct * 10))
+            total -= (call_oi_f * call_delta + put_oi_f * put_delta) * 100
+        return total
 
     def _fetch_market_context(self, conn=None) -> Optional[dict]:
         # Phase 2.5: defensive look-ahead guard.  Option quotes are aggregated
@@ -385,6 +455,19 @@ class UnifiedSignalEngine:
                         exc,
                     )
 
+                # Estimate dealer net delta (DNI) once from the strike rows
+                # so every downstream consumer
+                # (``DealerDeltaPressureComponent``, ``MarketPressureSignal``,
+                # ``RangeBreakImminenceSignal``) sees the same value.
+                # Without this step ``MarketContext.dealer_net_delta``
+                # remains at its 0.0 default and the explicit-field branch
+                # in each signal is dead code; they all silently re-derive
+                # the same number from ``gex_by_strike``.  Computed here so
+                # we don't repeat the work three times per cycle.
+                dealer_net_delta = self._estimate_dealer_net_delta(
+                    gex_strike_rows, close_f
+                )
+
                 # Read canonical Call/Put Wall from the latest gex_summary row
                 # (written by the Analytics Engine using
                 # ``src.analytics.compute_call_put_walls``).  Falls back to the
@@ -667,6 +750,35 @@ class UnifiedSignalEngine:
                         self.db_symbol,
                         exc,
                     )
+
+                # Diagnostic: if both flow deltas AND signed smart-money
+                # premium are all zero, the flow_contract_facts table has
+                # no rows for this symbol in the last 30 minutes.  That
+                # multiplicatively zeros the flow pillar in market_pressure
+                # and similar signals, so surface it as a warning to make
+                # ingestion gaps visible.  Throttled to once per symbol
+                # per process via the dict; otherwise live signals would
+                # spam this log at 1Hz.
+                if (
+                    call_flow_delta == 0.0
+                    and put_flow_delta == 0.0
+                    and (sm_call or 0.0) == 0.0
+                    and (sm_put or 0.0) == 0.0
+                    and not self._flow_missing_logged.get(self.db_symbol)
+                ):
+                    self._flow_missing_logged[self.db_symbol] = True
+                    logger.warning(
+                        "UnifiedSignalEngine [%s]: no flow_contract_facts rows in last 30 minutes "
+                        "(call/put flow deltas and signed smart-money premium all zero). "
+                        "Flow-asymmetry pillar will be 0 until ingestion catches up.",
+                        self.db_symbol,
+                    )
+                elif (call_flow_delta != 0.0 or put_flow_delta != 0.0) and self._flow_missing_logged.get(
+                    self.db_symbol
+                ):
+                    # Clear the latch when data returns so a future outage
+                    # is logged again.
+                    self._flow_missing_logged[self.db_symbol] = False
 
                 # C1: use gex_summary's own timestamp for the "previous" row,
                 # not underlying_quotes.timestamp.  Previously this compared
@@ -975,6 +1087,7 @@ class UnifiedSignalEngine:
                     "flip_distance": flip_distance_f,
                     "local_gex": local_gex_f,
                     "convexity_risk": convexity_risk_f,
+                    "dealer_net_delta": dealer_net_delta,
                     "put_call_ratio": effective_pcr,
                     "put_call_ratio_source": (
                         "oi" if oi_pcr is not None and oi_pcr > 0 else "volume"
@@ -1033,6 +1146,7 @@ class UnifiedSignalEngine:
             recent_lows=ctx.get("recent_lows") or [],
             recent_highs=ctx.get("recent_highs") or [],
             iv_rank=ctx.get("iv_rank"),
+            dealer_net_delta=float(ctx.get("dealer_net_delta") or 0.0),
             vwap=ctx.get("vwap"),
             vwap_deviation_pct=ctx.get("vwap_deviation_pct"),
             total_oi=total_oi if total_oi > 0 else None,
