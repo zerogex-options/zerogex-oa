@@ -533,8 +533,16 @@ class MarketPressureSignal:
 
         sm_call = float(ctx.smart_call or 0.0)
         sm_put = float(ctx.smart_put or 0.0)
-        sm_total = sm_call + sm_put
-        smart_skew = (sm_call - sm_put) / sm_total if sm_total > 0 else 0.0
+        # Smart-money premium is SIGNED (net = bought minus sold).  Using
+        # ``sm_call + sm_put`` as denominator produced out-of-bounds skew
+        # whenever the two sides had opposite signs — observed in prod
+        # with sm_call=+$4.96M and sm_put=-$995K yielding smart_skew=1.50.
+        # The correct normalizer is the total absolute flux, which keeps
+        # the ratio mathematically bounded in [-1, 1] regardless of
+        # signs.  Matches the ``premium_skew`` formula above which
+        # already uses ``abs() + abs()``.
+        sm_total_abs = abs(sm_call) + abs(sm_put)
+        smart_skew = (sm_call - sm_put) / sm_total_abs if sm_total_abs > 0 else 0.0
 
         signed = _PREM_SKEW_WEIGHT * prem_skew + (1.0 - _PREM_SKEW_WEIGHT) * smart_skew
         signed = max(-1.0, min(1.0, signed))

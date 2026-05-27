@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from typing import Optional
 import os
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from src.config import SIGNALS_GEX_STALE_BUFFER_SECONDS
 from src.database import db_connection
@@ -78,6 +78,13 @@ class UnifiedSignalEngine:
         # automatically on the next successful computation so a future
         # outage re-logs.
         self._iv_rank_diag_logged: dict[str, bool] = {}
+        # Cache for iv_rank — recomputed at most once per minute per
+        # symbol.  The 30-day daily IV aggregation is expensive (large
+        # option_chains scan) so caching makes a measurable difference
+        # for 1Hz signal cycles: 60x fewer queries, and the value
+        # genuinely doesn't change minute-to-minute since it's a daily
+        # percentile.  Stored as ``(computed_at_utc, iv_rank_value)``.
+        self._iv_rank_cache: dict[str, tuple[datetime, Optional[float]]] = {}
         # IV rank query is opportunistic — falls back gracefully when the
         # 30-day daily IV history is missing — so it's safe to enable by
         # default.  Operators can disable via SIGNAL_IV_RANK_ENABLED=false
@@ -987,110 +994,123 @@ class UnifiedSignalEngine:
                 if self._iv_rank_enabled:
                     # IV rank: compare current ATM IV to its 30-day daily range.
                     #
-                    # Each historical day's ATM IV is filtered against THAT
-                    # DAY's underlying close (joined from underlying_quotes),
-                    # not today's spot.  Previously the strike filter used
-                    # ``ABS(strike - today_close) / today_close < 0.01`` for
-                    # the 30-day window, which silently pulled OTM IVs from
-                    # days when spot was meaningfully different — biasing
-                    # the rank low in trending markets and skewing it
-                    # symbol-dependently (worse on SPX which has wider %
-                    # moves over 30 days than SPY).
-                    try:
-                        cur.execute(
-                            """
-                            WITH current_atm AS (
-                                SELECT AVG(implied_volatility) AS current_iv
-                                FROM option_chains
-                                WHERE underlying = %s
-                                  AND ABS(strike - %s) / NULLIF(%s, 0) < 0.01
-                                  AND option_type = 'C'
-                                  AND implied_volatility IS NOT NULL
-                                  AND implied_volatility > 0
-                                  AND timestamp >= %s - INTERVAL '2 hours'
-                            ),
-                            daily_close AS (
-                                SELECT (timestamp AT TIME ZONE 'America/New_York')::date AS et_day,
-                                       AVG(close) AS day_close
-                                FROM underlying_quotes
-                                WHERE symbol = %s
-                                  AND timestamp >= NOW() - INTERVAL '30 days'
-                                GROUP BY (timestamp AT TIME ZONE 'America/New_York')::date
-                            ),
-                            daily_iv AS (
-                                SELECT dc.et_day,
-                                       AVG(oc.implied_volatility) AS avg_iv
-                                FROM option_chains oc
-                                JOIN daily_close dc
-                                  ON (oc.timestamp AT TIME ZONE 'America/New_York')::date = dc.et_day
-                                WHERE oc.underlying = %s
-                                  AND oc.option_type = 'C'
-                                  AND oc.implied_volatility IS NOT NULL
-                                  AND oc.implied_volatility > 0
-                                  AND oc.timestamp >= NOW() - INTERVAL '30 days'
-                                  AND ABS(oc.strike - dc.day_close) / NULLIF(dc.day_close, 0) < 0.01
-                                GROUP BY dc.et_day
+                    # Cached for 60s per symbol — iv_rank is a daily
+                    # percentile, so 1Hz recomputation is wasteful and the
+                    # 30-day aggregation is the largest query the engine
+                    # runs.  An earlier per-day-close JOIN version timed
+                    # out under the engine's statement_timeout (~10s) on
+                    # SPX/SPY/QQQ because the AT TIME ZONE cast on the
+                    # JOIN key killed timestamp index usage.
+                    #
+                    # The historical strike filter uses today's spot at
+                    # ±3% rather than ±1% — this captures more genuine
+                    # ATM IVs on days when spot drifted from current
+                    # (vs ±1% which silently pulled OTM IVs from those
+                    # days and biased iv_rank low).  A truly correct fix
+                    # requires either a daily-ATM-IV materialized view or
+                    # a daily_close JOIN that the statement timeout
+                    # accommodates; both are bigger changes deferred for
+                    # later.
+                    cached = self._iv_rank_cache.get(self.db_symbol)
+                    now_utc = datetime.now(timezone.utc)
+                    if cached is not None and (now_utc - cached[0]).total_seconds() < 60:
+                        iv_rank = cached[1]
+                    else:
+                        try:
+                            cur.execute(
+                                """
+                                WITH current_atm AS (
+                                    SELECT AVG(implied_volatility) AS current_iv
+                                    FROM option_chains
+                                    WHERE underlying = %s
+                                      AND ABS(strike - %s) / NULLIF(%s, 0) < 0.01
+                                      AND option_type = 'C'
+                                      AND implied_volatility IS NOT NULL
+                                      AND implied_volatility > 0
+                                      AND timestamp >= %s - INTERVAL '2 hours'
+                                ),
+                                daily_iv AS (
+                                    SELECT DATE_TRUNC('day', timestamp) AS day,
+                                           AVG(implied_volatility) AS avg_iv
+                                    FROM option_chains
+                                    WHERE underlying = %s
+                                      AND ABS(strike - %s) / NULLIF(%s, 0) < 0.03
+                                      AND option_type = 'C'
+                                      AND implied_volatility IS NOT NULL
+                                      AND implied_volatility > 0
+                                      AND timestamp >= NOW() - INTERVAL '30 days'
+                                    GROUP BY DATE_TRUNC('day', timestamp)
+                                )
+                                SELECT
+                                    (SELECT current_iv FROM current_atm),
+                                    MIN(avg_iv),
+                                    MAX(avg_iv),
+                                    COUNT(*)
+                                FROM daily_iv
+                                """,
+                                (
+                                    self.db_symbol,
+                                    close_f,
+                                    close_f,
+                                    ts,
+                                    self.db_symbol,
+                                    close_f,
+                                    close_f,
+                                ),
                             )
-                            SELECT
-                                (SELECT current_iv FROM current_atm),
-                                MIN(avg_iv),
-                                MAX(avg_iv),
-                                COUNT(*)
-                            FROM daily_iv
-                            """,
-                            (
-                                self.db_symbol,
-                                close_f,
-                                close_f,
-                                ts,
-                                self.db_symbol,
-                                self.db_symbol,
-                            ),
-                        )
-                        iv_row = cur.fetchone()
-                        if (
-                            iv_row
-                            and iv_row[0] is not None
-                            and iv_row[1] is not None
-                            and iv_row[2] is not None
-                        ):
-                            current_iv, iv_low, iv_high = (
-                                float(iv_row[0]),
-                                float(iv_row[1]),
-                                float(iv_row[2]),
-                            )
-                            iv_range = max(iv_high - iv_low, 0.001)
-                            iv_rank = round(min(1.0, max(0.0, (current_iv - iv_low) / iv_range)), 4)
-                            # Clear the diag latch so a future failure re-logs.
-                            self._iv_rank_diag_logged[self.db_symbol] = False
-                        elif not self._iv_rank_diag_logged.get(self.db_symbol):
-                            # Query succeeded but a CTE was empty.  Surface
-                            # the components so we can tell which window is
-                            # missing (current_iv null → no ATM rows in last
-                            # 2h; iv_low/iv_high null → no historical days).
-                            self._iv_rank_diag_logged[self.db_symbol] = True
-                            logger.warning(
-                                "UnifiedSignalEngine [%s]: iv_rank query returned null components: "
-                                "current_iv=%s iv_low=%s iv_high=%s daily_count=%s "
-                                "(spot=%s ts=%s)",
-                                self.db_symbol,
-                                iv_row[0] if iv_row else None,
-                                iv_row[1] if iv_row else None,
-                                iv_row[2] if iv_row else None,
-                                iv_row[3] if iv_row else None,
-                                close_f,
-                                ts,
-                            )
-                    except Exception as exc:
-                        # IV rank is supplemental; do not block signal generation if unavailable.
-                        self._reset_tx(conn)
-                        if not self._iv_rank_diag_logged.get(self.db_symbol):
-                            self._iv_rank_diag_logged[self.db_symbol] = True
-                            logger.warning(
-                                "UnifiedSignalEngine [%s]: iv_rank query failed: %s",
-                                self.db_symbol,
-                                exc,
-                            )
+                            iv_row = cur.fetchone()
+                            if (
+                                iv_row
+                                and iv_row[0] is not None
+                                and iv_row[1] is not None
+                                and iv_row[2] is not None
+                            ):
+                                current_iv, iv_low, iv_high = (
+                                    float(iv_row[0]),
+                                    float(iv_row[1]),
+                                    float(iv_row[2]),
+                                )
+                                iv_range = max(iv_high - iv_low, 0.001)
+                                iv_rank = round(
+                                    min(1.0, max(0.0, (current_iv - iv_low) / iv_range)),
+                                    4,
+                                )
+                                # Clear the diag latch so a future failure re-logs.
+                                self._iv_rank_diag_logged[self.db_symbol] = False
+                            elif not self._iv_rank_diag_logged.get(self.db_symbol):
+                                # Query succeeded but a CTE was empty.
+                                # Surface the components so we can tell
+                                # which window is missing (current_iv null
+                                # → no ATM rows in last 2h; iv_low/iv_high
+                                # null → no historical days).
+                                self._iv_rank_diag_logged[self.db_symbol] = True
+                                logger.warning(
+                                    "UnifiedSignalEngine [%s]: iv_rank query returned null components: "
+                                    "current_iv=%s iv_low=%s iv_high=%s daily_count=%s "
+                                    "(spot=%s ts=%s)",
+                                    self.db_symbol,
+                                    iv_row[0] if iv_row else None,
+                                    iv_row[1] if iv_row else None,
+                                    iv_row[2] if iv_row else None,
+                                    iv_row[3] if iv_row else None,
+                                    close_f,
+                                    ts,
+                                )
+                            # Cache even None so we don't retry every 1Hz
+                            # cycle when the data is genuinely missing.
+                            self._iv_rank_cache[self.db_symbol] = (now_utc, iv_rank)
+                        except Exception as exc:
+                            # IV rank is supplemental; do not block signal generation if unavailable.
+                            self._reset_tx(conn)
+                            if not self._iv_rank_diag_logged.get(self.db_symbol):
+                                self._iv_rank_diag_logged[self.db_symbol] = True
+                                logger.warning(
+                                    "UnifiedSignalEngine [%s]: iv_rank query failed: %s",
+                                    self.db_symbol,
+                                    exc,
+                                )
+                            # Cache the failure too so retries are paced.
+                            self._iv_rank_cache[self.db_symbol] = (now_utc, None)
 
                 net_gex_f = float(net_gex or 0.0)
                 flip_distance_f = (

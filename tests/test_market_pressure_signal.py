@@ -158,6 +158,24 @@ def test_response_contract_emits_frontend_alias_keys():
     )
 
 
+def test_smart_skew_stays_bounded_with_opposite_signed_premium():
+    """Regression: when sm_call and sm_put have opposite signs (one
+    net-bought, one net-sold) the additive denominator ``sm_call +
+    sm_put`` shrinks and the ratio escapes [-1, 1].  Observed in prod
+    with sm_call=+$4.96M / sm_put=-$995K yielding smart_skew=1.50.
+    The correct normalizer is total absolute flux."""
+    signal = MarketPressureSignal()
+    ctx = _ctx(
+        smart_call=4_960_000.0,
+        smart_put=-995_000.0,
+        extra={"call_flow_delta": 0.0, "put_flow_delta": 0.0},
+    )
+    flow = signal._flow_asymmetry(ctx)
+    assert -1.0 <= flow["smart_skew"] <= 1.0
+    assert -1.0 <= flow["smart_money_skew"] <= 1.0
+    assert -1.0 <= flow["signed"] <= 1.0
+
+
 def test_flow_reason_no_flow_data_when_book_empty():
     """When call/put flow deltas AND smart-money premium are all zero,
     the flow dict surfaces ``reason="no_flow_data"`` so the dashboard
