@@ -118,6 +118,61 @@ def test_missing_optional_inputs_do_not_raise():
     assert result.score == 0.0
 
 
+def test_response_contract_emits_frontend_alias_keys():
+    """Frontend reads from the docstring-shorthand names (charm_amp,
+    session_alpha, alignment_bonus, dealer_dni, smart_money_skew,
+    total_flux, net_gex_mult, flip, spot, net_gex).  These must be
+    emitted alongside the canonical names so the existing dashboards
+    don't render "—" on every row."""
+    signal = MarketPressureSignal()
+    ctx = _ctx(
+        close=600.0,
+        gamma_flip=600.0,
+        dealer_net_delta=-2.5e8,
+        extra={
+            "call_wall": 600.5,
+            "put_wall": 599.5,
+            "call_flow_delta": 300_000.0,
+            "put_flow_delta": -100_000.0,
+            "gex_by_strike": _gex_rows_with_greeks(vanna=1.2e8, charm=8.0e9),
+        },
+    )
+    result = signal.evaluate(ctx)
+    comp = result.context["compression"]
+    hedging = result.context["hedging"]
+    flow = result.context["flow"]
+    # Compression aliases.
+    assert comp["net_gex_mult"] == comp["regime_mult"]
+    assert comp["flip"] == comp["gamma_flip"]
+    assert comp["spot"] == 600.0
+    assert "net_gex" in comp
+    # Hedging aliases.
+    assert hedging["charm_amp"] == hedging["charm_amplification"]
+    assert hedging["session_alpha"] == hedging["alpha_vanna"]
+    assert hedging["alignment_bonus"] == hedging["alignment_mult"]
+    assert hedging["dealer_dni"] is not None  # explicit DNI surfaced
+    # Flow aliases.
+    assert flow["smart_money_skew"] == flow["smart_skew"]
+    assert flow["total_flux"] == round(
+        abs(flow["call_flow_delta"]) + abs(flow["put_flow_delta"]), 2
+    )
+
+
+def test_flow_reason_no_flow_data_when_book_empty():
+    """When call/put flow deltas AND smart-money premium are all zero,
+    the flow dict surfaces ``reason="no_flow_data"`` so the dashboard
+    can distinguish 'genuinely balanced' from 'no rows ingested'."""
+    signal = MarketPressureSignal()
+    ctx = _ctx(
+        smart_call=0.0,
+        smart_put=0.0,
+        extra={"call_flow_delta": 0.0, "put_flow_delta": 0.0},
+    )
+    flow = signal._flow_asymmetry(ctx)
+    assert flow["reason"] == "no_flow_data"
+    assert flow["magnitude"] == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Compression sub-component
 # ---------------------------------------------------------------------------
@@ -136,7 +191,12 @@ def test_compression_high_when_walls_tight_and_flip_at_spot():
     assert comp["magnitude"] > 0.5
 
 
-def test_compression_zero_when_walls_far_apart():
+def test_compression_falls_back_to_flip_when_walls_too_wide():
+    """Wall pinch saturates to 0 on wide-strike-grid symbols (e.g. QQQ
+    with $5 strikes at 4-5% wall spread).  When that happens the
+    compression pillar should NOT annihilate — flip proximity is an
+    independent measure of "loaded to break" and should carry the
+    pillar on its own."""
     signal = MarketPressureSignal()
     ctx = _ctx(
         close=600.0,
@@ -144,9 +204,26 @@ def test_compression_zero_when_walls_far_apart():
         extra={"call_wall": 615.0, "put_wall": 585.0},  # 5% spread
     )
     comp = signal._compression(ctx)
-    # Wall pinch saturates to 0 — geometric mean with flip_prox=1.0 is 0.
+    # Wall pinch still saturates to 0 (wide walls).
     assert comp["wall_pinch"] == 0.0
-    assert comp["magnitude"] == 0.0
+    # But flip is at spot, so flip_proximity carries the pillar.
+    assert comp["flip_proximity"] == 1.0
+    assert comp["magnitude"] > 0.5
+
+
+def test_compression_zero_when_walls_wide_and_flip_far():
+    """When BOTH inputs are uninformative (wide walls AND flip distant
+    from spot), the compression pillar legitimately reports 0."""
+    signal = MarketPressureSignal()
+    ctx = _ctx(
+        close=600.0,
+        gamma_flip=540.0,  # 10% below spot — Cauchy kernel at 0.005 σ ≈ 0
+        extra={"call_wall": 615.0, "put_wall": 585.0},  # 5% spread
+    )
+    comp = signal._compression(ctx)
+    assert comp["wall_pinch"] == 0.0
+    assert comp["flip_proximity"] < 0.01
+    assert comp["magnitude"] < 0.01
 
 
 def test_compression_uses_flip_alone_when_walls_missing():
