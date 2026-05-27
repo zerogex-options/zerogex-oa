@@ -1608,6 +1608,7 @@ class StreamManager:
 
                     # Drain underlying bar from persistent stream.
                     underlying_data = self._underlying_accumulator.drain()
+                    bar_advanced = False
                     if underlying_data:
                         self.current_price = underlying_data["close"]
                         # Yield unconditionally — the downstream OHLC upsert
@@ -1623,6 +1624,7 @@ class StreamManager:
 
                         bar_ts = underlying_data.get("timestamp")
                         if _bar_timestamp_advanced(bar_ts, _last_fresh_bar_ts):
+                            bar_advanced = True
                             if _stale_warned:
                                 logger.info(
                                     "Underlying bar stream RECOVERED after "
@@ -1641,92 +1643,108 @@ class StreamManager:
                             _underlying_restart_attempts = 0
                             _underlying_restart_backed_off = False
                             _stale_warned = False
-                    elif feed_expected:
-                        # No bar this cycle while the feed should be live.
-                        # Staleness is judged in wall-clock seconds only:
-                        # the empty-drain count climbs ~1/sec (options wake
-                        # the loop sub-second) while a 1-minute bar feed is
-                        # legitimately silent ~60s between bars, so gating
-                        # on the count fires a false STALE ~50s early.
-                        _consecutive_empty_underlying += 1
-                        if _last_underlying_bar_mono is None:
-                            # Feed hasn't produced its first bar yet (slow
-                            # open). Don't count warm-up as a stall — arm
-                            # the clock from the first expectant cycle.
-                            _last_underlying_bar_mono = time.monotonic()
-                        now_mono = time.monotonic()
-                        stale_seconds = now_mono - _last_underlying_bar_mono
 
-                        # Warn once silence exceeds the threshold (which sits
-                        # above the bar cadence), then re-warn at that same
-                        # interval while it persists — never every cycle.
-                        if stale_seconds >= stale_warn_secs and (
-                            not _stale_warned or now_mono - _last_stale_warn_mono >= stale_warn_secs
-                        ):
-                            cur_updates = self._underlying_accumulator.updates_received
-                            logger.warning(
-                                "Underlying bar stream appears STALE: "
-                                "%.0fs without a bar, %d empty drains, "
-                                "bar_stream_updates=%d (delta=%d), "
-                                "thread_alive=%s",
-                                stale_seconds,
-                                _consecutive_empty_underlying,
-                                cur_updates,
-                                cur_updates - _last_bar_updates,
-                                self._underlying_accumulator.is_alive,
-                            )
-                            _stale_warned = True
-                            _last_stale_warn_mono = now_mono
+                    if not bar_advanced:
+                        if feed_expected:
+                            # No FRESH bar this cycle while the feed should
+                            # be live. Treats "drain returned nothing" and
+                            # "drain returned a non-advancing bar" the same
+                            # — otherwise an upstream that keeps re-emitting
+                            # the last known bar (server-side stuck on
+                            # yesterday's close timestamp) silently bypasses
+                            # the staleness ladder: branch (A) above absorbs
+                            # every iteration, the Greeks engine rejects
+                            # until 16:00, and no reconnect ever fires.
+                            # Staleness is judged in wall-clock seconds only:
+                            # the empty-drain count climbs ~1/sec (options
+                            # wake the loop sub-second) while a 1-minute bar
+                            # feed is legitimately silent ~60s between bars,
+                            # so gating on the count fires a false STALE
+                            # ~50s early.
+                            _consecutive_empty_underlying += 1
+                            if _last_underlying_bar_mono is None:
+                                # Feed hasn't produced its first bar yet
+                                # (slow open). Don't count warm-up as a
+                                # stall — arm the clock from the first
+                                # expectant cycle.
+                                _last_underlying_bar_mono = time.monotonic()
+                            now_mono = time.monotonic()
+                            stale_seconds = now_mono - _last_underlying_bar_mono
 
-                        # Active recovery. A socket-alive-but-data-starved
-                        # feed never trips the socket read timeout or the
-                        # dead-thread check, so force a reconnect once it
-                        # has been stale long enough — rate-limited by a
-                        # cooldown, then escalated to a backed-off
-                        # upstream-outage state rather than tight-looping.
-                        if (
-                            stale_seconds >= stale_restart_secs
-                            and not _underlying_restart_backed_off
-                            and now_mono - _last_forced_restart_mono
-                            >= UNDERLYING_STREAM_RESTART_COOLDOWN_SECONDS
-                        ):
-                            _underlying_restart_attempts += 1
-                            if (
-                                _underlying_restart_attempts
-                                > UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS
+                            # Warn once silence exceeds the threshold (which
+                            # sits above the bar cadence), then re-warn at
+                            # that same interval while it persists — never
+                            # every cycle.
+                            if stale_seconds >= stale_warn_secs and (
+                                not _stale_warned or now_mono - _last_stale_warn_mono >= stale_warn_secs
                             ):
-                                _underlying_restart_backed_off = True
-                                logger.error(
-                                    "Underlying bar stream still dead after %d "
-                                    "forced reconnects (%.0fs stale) — treating "
-                                    "as an upstream TradeStation outage. Options "
-                                    "ingestion is unaffected; reconnecting "
-                                    "resumes automatically once a bar arrives.",
-                                    _underlying_restart_attempts - 1,
+                                cur_updates = self._underlying_accumulator.updates_received
+                                logger.warning(
+                                    "Underlying bar stream appears STALE: "
+                                    "%.0fs without a fresh bar, "
+                                    "%d empty/replay drains, "
+                                    "bar_stream_updates=%d (delta=%d), "
+                                    "thread_alive=%s",
                                     stale_seconds,
+                                    _consecutive_empty_underlying,
+                                    cur_updates,
+                                    cur_updates - _last_bar_updates,
+                                    self._underlying_accumulator.is_alive,
                                 )
-                            else:
-                                self._restart_underlying_accumulator(
-                                    f"data-starved {stale_seconds:.0f}s during "
-                                    f"{session} (attempt "
-                                    f"{_underlying_restart_attempts}/"
-                                    f"{UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS})"
-                                )
-                                _last_forced_restart_mono = now_mono
-                    else:
-                        # Feed legitimately not expected (overnight /
-                        # weekend / holiday for a cash index). Reset the
-                        # staleness clock so the NEXT expected session
-                        # measures from its own open — otherwise the first
-                        # expectant cycle compares against last session's
-                        # final bar and fires a spurious ~10h "STALE" (and
-                        # one needless reconnect) at 09:30 before the feed
-                        # has had a chance to deliver the day's first bar.
-                        _consecutive_empty_underlying = 0
-                        _last_underlying_bar_mono = None
-                        _stale_warned = False
-                        _underlying_restart_attempts = 0
-                        _underlying_restart_backed_off = False
+                                _stale_warned = True
+                                _last_stale_warn_mono = now_mono
+
+                            # Active recovery. A socket-alive-but-data-
+                            # starved feed never trips the socket read
+                            # timeout or the dead-thread check, so force a
+                            # reconnect once it has been stale long enough —
+                            # rate-limited by a cooldown, then escalated to
+                            # a backed-off upstream-outage state rather than
+                            # tight-looping.
+                            if (
+                                stale_seconds >= stale_restart_secs
+                                and not _underlying_restart_backed_off
+                                and now_mono - _last_forced_restart_mono
+                                >= UNDERLYING_STREAM_RESTART_COOLDOWN_SECONDS
+                            ):
+                                _underlying_restart_attempts += 1
+                                if (
+                                    _underlying_restart_attempts
+                                    > UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS
+                                ):
+                                    _underlying_restart_backed_off = True
+                                    logger.error(
+                                        "Underlying bar stream still dead after %d "
+                                        "forced reconnects (%.0fs stale) — treating "
+                                        "as an upstream TradeStation outage. Options "
+                                        "ingestion is unaffected; reconnecting "
+                                        "resumes automatically once a bar arrives.",
+                                        _underlying_restart_attempts - 1,
+                                        stale_seconds,
+                                    )
+                                else:
+                                    self._restart_underlying_accumulator(
+                                        f"data-starved {stale_seconds:.0f}s during "
+                                        f"{session} (attempt "
+                                        f"{_underlying_restart_attempts}/"
+                                        f"{UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS})"
+                                    )
+                                    _last_forced_restart_mono = now_mono
+                        else:
+                            # Feed legitimately not expected (overnight /
+                            # weekend / holiday for a cash index). Reset the
+                            # staleness clock so the NEXT expected session
+                            # measures from its own open — otherwise the
+                            # first expectant cycle compares against last
+                            # session's final bar and fires a spurious ~10h
+                            # "STALE" (and one needless reconnect) at 09:30
+                            # before the feed has had a chance to deliver
+                            # the day's first bar.
+                            _consecutive_empty_underlying = 0
+                            _last_underlying_bar_mono = None
+                            _stale_warned = False
+                            _underlying_restart_attempts = 0
+                            _underlying_restart_backed_off = False
 
                     # Drain only option contracts that changed since last cycle.
                     assert self._accumulator is not None
