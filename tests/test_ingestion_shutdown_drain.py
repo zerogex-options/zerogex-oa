@@ -128,6 +128,7 @@ def _stub_stream_manager_for_idle_loop(monkeypatch, session: str):
     mgr.option_oi_coverage_alert_threshold = 0.35
     mgr.option_volume_coverage_alert_threshold = 0.35
     mgr.option_volume_warmup_minutes = 30
+    mgr.option_oi_warmup_minutes = 5
     mgr.seed_rest_on_recalc = False
     # No-op hot-path helpers so stream() never reaches real I/O.
     mgr._start_accumulators = lambda *a, **kw: None

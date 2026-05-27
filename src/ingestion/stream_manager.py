@@ -918,6 +918,13 @@ class StreamManager:
         # are a natural ramp where most contracts haven't traded yet, so
         # gate the warning on a warmup window past 09:30 ET.
         self.option_volume_warmup_minutes = int(os.getenv("OPTION_VOLUME_WARMUP_MINUTES", "30"))
+        # OI is sticky in the accumulator (only overwritten by positive
+        # values), but the REST seed and stream may not carry yesterday's
+        # settled OI before the regular open — so contracts that tick in
+        # pre-market often still show OI=0. Gate the alarm on a short
+        # warmup past 09:30 ET so the warning only fires when a genuine
+        # gap persists into the regular session.
+        self.option_oi_warmup_minutes = int(os.getenv("OPTION_OI_WARMUP_MINUTES", "5"))
         self.seed_rest_on_recalc = (
             os.getenv("OPTION_REST_SEED_ON_RECALC", "false").lower() == "true"
         )
@@ -1759,15 +1766,21 @@ class StreamManager:
                                 f"stream_updates={self._accumulator.updates_received}"
                             )
 
-                            if oi_coverage < self.option_oi_coverage_alert_threshold:
-                                logger.warning(
-                                    f"⚠️ Low option OI coverage: {oi_coverage:.1%} "
-                                    f"(threshold "
-                                    f"{self.option_oi_coverage_alert_threshold:.1%})"
-                                )
                             if session == "regular":
                                 now_et = datetime.now(ET)
                                 minutes_since_open = (now_et.hour - 9) * 60 + (now_et.minute - 30)
+                                if (
+                                    minutes_since_open >= self.option_oi_warmup_minutes
+                                    and oi_coverage
+                                    < self.option_oi_coverage_alert_threshold
+                                ):
+                                    logger.warning(
+                                        f"⚠️ Low option OI coverage: "
+                                        f"{oi_coverage:.1%} "
+                                        f"(threshold "
+                                        f"{self.option_oi_coverage_alert_threshold:.1%}, "
+                                        f"{minutes_since_open}min into session)"
+                                    )
                                 if (
                                     minutes_since_open >= self.option_volume_warmup_minutes
                                     and volume_coverage
