@@ -997,26 +997,30 @@ class UnifiedSignalEngine:
                     # Cached for 60s per symbol — iv_rank is a daily
                     # percentile, so 1Hz recomputation is wasteful and the
                     # 30-day aggregation is the largest query the engine
-                    # runs.  An earlier per-day-close JOIN version timed
-                    # out under the engine's statement_timeout (~10s) on
-                    # SPX/SPY/QQQ because the AT TIME ZONE cast on the
-                    # JOIN key killed timestamp index usage.
+                    # runs.
                     #
-                    # The historical strike filter uses today's spot at
-                    # ±3% rather than ±1% — this captures more genuine
-                    # ATM IVs on days when spot drifted from current
-                    # (vs ±1% which silently pulled OTM IVs from those
-                    # days and biased iv_rank low).  A truly correct fix
-                    # requires either a daily-ATM-IV materialized view or
-                    # a daily_close JOIN that the statement timeout
-                    # accommodates; both are bigger changes deferred for
-                    # later.
+                    # The 30-day option_chains aggregation can exceed the
+                    # pool-wide DB_STATEMENT_TIMEOUT_MS (typically 20-90s)
+                    # under autovacuum or cold buffer pool conditions —
+                    # confirmed in prod logs where all three of SPX/SPY/QQQ
+                    # hit "canceling statement due to statement timeout"
+                    # every cycle.  Apply a dedicated, configurable budget
+                    # via ``SET LOCAL`` scoped to this transaction.  Safe
+                    # because this is the LAST query in
+                    # ``_fetch_market_context``; the relaxed budget
+                    # reverts when the transaction closes on function exit.
                     cached = self._iv_rank_cache.get(self.db_symbol)
                     now_utc = datetime.now(timezone.utc)
                     if cached is not None and (now_utc - cached[0]).total_seconds() < 60:
                         iv_rank = cached[1]
                     else:
                         try:
+                            iv_timeout_ms = int(
+                                os.getenv("SIGNAL_IV_RANK_TIMEOUT_MS", "60000")
+                            )
+                            cur.execute(
+                                f"SET LOCAL statement_timeout = {iv_timeout_ms}"
+                            )
                             cur.execute(
                                 """
                                 WITH current_atm AS (
@@ -1034,7 +1038,7 @@ class UnifiedSignalEngine:
                                            AVG(implied_volatility) AS avg_iv
                                     FROM option_chains
                                     WHERE underlying = %s
-                                      AND ABS(strike - %s) / NULLIF(%s, 0) < 0.03
+                                      AND ABS(strike - %s) / NULLIF(%s, 0) < 0.01
                                       AND option_type = 'C'
                                       AND implied_volatility IS NOT NULL
                                       AND implied_volatility > 0
