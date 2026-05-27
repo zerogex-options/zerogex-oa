@@ -3083,6 +3083,113 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching open interest for {underlying}: {e}", exc_info=True)
             raise
 
+    async def _resolve_option_symbol(
+        self,
+        underlying: str,
+        strike: float,
+        expiration_date: date,
+        option_type: str,
+    ) -> Optional[str]:
+        """Resolve (underlying, strike, expiration, option_type) -> option_symbol.
+
+        Hot path: option_chains_latest (one row per contract, dual-written
+        by ingestion in the same txn as option_chains).  An exact index
+        lookup on (underlying, expiration, strike, option_type) - or a
+        small range scan on the existing (underlying, expiration) index
+        plus a filter - returns in milliseconds even under load.
+
+        Cold path: fallback to scanning option_chains for the last 14 days.
+        This is the historical resolve query.  It's only reached for
+        contracts that haven't been quoted since the dual-UPSERT was
+        deployed (2026-05-26).  Walks the (underlying, timestamp DESC)
+        index backward; because the index doesn't include
+        strike/expiration/option_type, every candidate requires a heap
+        fetch.  For SPX over 14 days this can hit the statement_timeout
+        for a contract that doesn't exist or is very stale.
+
+        Returns ``None`` when no contract is found in either path.
+        """
+        latest_query = """
+            SELECT option_symbol
+            FROM option_chains_latest
+            WHERE underlying = $1
+              AND expiration = $2
+              AND strike = $3
+              AND option_type = $4
+            LIMIT 1
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                resolved = await self._fetch_timed(
+                    conn,
+                    latest_query,
+                    underlying,
+                    expiration_date,
+                    strike,
+                    option_type,
+                    timeout=5.0,
+                    fetchrow=True,
+                )
+            if resolved and resolved["option_symbol"]:
+                return resolved["option_symbol"]
+        except (asyncio.TimeoutError, TimeoutError) as e:
+            # If the small lookup against the latest cache times out, the
+            # broader 14-day scan won't fare better - bail rather than
+            # waste another 30s on the fallback.
+            logger.warning(
+                f"Option contract latest-cache resolve timed out for "
+                f"{underlying} {strike} {expiration_date} {option_type}: {e!r}"
+            )
+            raise
+        except Exception as e:
+            # Unexpected error against the cache - log and try the
+            # historical fallback rather than failing the whole request.
+            logger.warning(
+                f"Option contract latest-cache resolve errored for "
+                f"{underlying} {strike} {expiration_date} {option_type}: {e!r}"
+            )
+
+        fallback_query = """
+            SELECT option_symbol
+            FROM option_chains
+            WHERE underlying = $1
+              AND strike = $2
+              AND expiration = $3
+              AND option_type = $4
+              AND timestamp >= NOW() - INTERVAL '14 days'
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                resolved = await self._fetch_timed(
+                    conn,
+                    fallback_query,
+                    underlying,
+                    strike,
+                    expiration_date,
+                    option_type,
+                    timeout=10.0,
+                    fetchrow=True,
+                )
+        except (asyncio.TimeoutError, TimeoutError) as e:
+            logger.warning(
+                f"Option contract resolve fallback timed out for "
+                f"{underlying} {strike} {expiration_date} {option_type}: {e!r}"
+            )
+            raise
+        except Exception as e:
+            logger.error(
+                f"Error resolving option contract (fallback) for "
+                f"{underlying} {strike} {expiration_date} {option_type}: {e!r}",
+                exc_info=True,
+            )
+            raise
+
+        if resolved and resolved["option_symbol"]:
+            return resolved["option_symbol"]
+        return None
+
     async def get_option_contract_history(
         self,
         underlying: str,
@@ -3150,64 +3257,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         if resolved_cached is not None:
             option_symbol = resolved_cached
         else:
-            # Resolve option_symbol once, then drive everything else off the
-            # (option_symbol, timestamp) primary key. Filtering option_chains
-            # by (underlying, strike, expiration, option_type) directly forces
-            # the planner onto (underlying, timestamp DESC) and re-checks the
-            # other three columns against every row for that underlying in
-            # the window — millions of rows for SPX, which trips the 30s
-            # statement_timeout.
-            #
-            # With ORDER BY timestamp DESC LIMIT 1 and the timestamp lower
-            # bound, the planner walks the (underlying, timestamp DESC)
-            # index backward and stops at the first row whose
-            # strike/expiration/option_type match — cheap for any contract
-            # that's been quoted recently. The 14-day floor bounds the worst
-            # case where the contract doesn't exist.
-            resolve_query = """
-                SELECT option_symbol
-                FROM option_chains
-                WHERE underlying = $1
-                  AND strike = $2
-                  AND expiration = $3
-                  AND option_type = $4
-                  AND timestamp >= NOW() - INTERVAL '14 days'
-                ORDER BY timestamp DESC
-                LIMIT 1
-            """
-            try:
-                async with self._acquire_connection() as conn:
-                    resolved = await conn.fetchrow(
-                        resolve_query,
-                        underlying,
-                        float(strike),
-                        expiration_date,
-                        option_type,
-                    )
-            except (asyncio.TimeoutError, TimeoutError) as e:
-                # asyncpg's command_timeout (pool default 30s) and Postgres
-                # statement_timeout both surface here as bare TimeoutError
-                # whose str() is empty. Use !r so the type is visible in
-                # the log, and demote to a warning consistent with the
-                # other timeout-returning endpoints. Re-raise so the
-                # router can map this to a 504 instead of a misleading
-                # 500/404.
-                logger.warning(
-                    f"Option contract resolve timed out for "
-                    f"{underlying} {strike} {expiration} {option_type}: {e!r}"
-                )
-                raise
-            except Exception as e:
-                logger.error(
-                    f"Error resolving option contract for "
-                    f"{underlying} {strike} {expiration} {option_type}: {e!r}",
-                    exc_info=True,
-                )
-                raise
-
-            if not resolved or resolved["option_symbol"] is None:
+            option_symbol = await self._resolve_option_symbol(
+                underlying, float(strike), expiration_date, option_type
+            )
+            if option_symbol is None:
                 return []
-            option_symbol = resolved["option_symbol"]
             self._cache_set(symbol_cache_key, option_symbol, 3600.0)
 
         if use_current_session:

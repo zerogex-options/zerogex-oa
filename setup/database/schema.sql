@@ -251,6 +251,17 @@ CREATE INDEX IF NOT EXISTS idx_option_chains_latest_underlying_ts_gamma
 CREATE INDEX IF NOT EXISTS idx_option_chains_latest_underlying_expiration
     ON option_chains_latest (underlying, expiration);
 
+-- Exact-contract lookup used by /api/option/contract to resolve
+-- (underlying, strike, expiration, option_type) -> option_symbol.  The
+-- previous resolve scanned 14 days of option_chains via
+-- (underlying, timestamp DESC) and did a heap fetch per candidate row
+-- to re-check strike/expiration/option_type -- for SPX this regularly
+-- hit the 30s statement_timeout under load.  The latest cache holds one
+-- row per contract, so this index turns the resolve into an O(log n)
+-- probe.
+CREATE INDEX IF NOT EXISTS idx_option_chains_latest_contract_lookup
+    ON option_chains_latest (underlying, expiration, strike, option_type);
+
 DO $$
 BEGIN
     IF NOT EXISTS (

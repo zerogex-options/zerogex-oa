@@ -380,3 +380,95 @@ def test_fetch_option_contract_bars_propagates_timeout():
 
     with pytest.raises((asyncio.TimeoutError, TimeoutError)):
         asyncio.run(db._fetch_option_contract_bars("SPY 250522C00500000", window_start, window_end))
+
+
+class _ResolveConn:
+    """Records each query and routes the response by which table is touched."""
+
+    def __init__(self, latest_row=None, fallback_row=None, latest_exc=None):
+        self.latest_row = latest_row
+        self.fallback_row = fallback_row
+        self.latest_exc = latest_exc
+        self.queries = []
+
+    async def fetchrow(self, query, *args, **_kwargs):
+        self.queries.append(query)
+        if "option_chains_latest" in query:
+            if self.latest_exc is not None:
+                raise self.latest_exc
+            return self.latest_row
+        return self.fallback_row
+
+    async def fetch(self, query, *args, **_kwargs):
+        # Not used by _resolve_option_symbol but kept for safety.
+        return []
+
+
+def _run_resolve(conn):
+    db = DatabaseManager()
+
+    @asynccontextmanager
+    async def _acquire():
+        yield conn
+
+    db._acquire_connection = _acquire  # type: ignore[method-assign]
+    return asyncio.run(db._resolve_option_symbol("SPY", 500.0, datetime(2026, 5, 8).date(), "C"))
+
+
+def test_resolve_option_symbol_hits_latest_cache_first():
+    """The hot path queries option_chains_latest and returns without touching
+    the (slow) 14-day option_chains scan when the cache has the contract.
+    Regression guard for the SPX-under-load 504s: the previous resolve query
+    forced a heap-fetch-per-row backward scan that frequently timed out."""
+    conn = _ResolveConn(latest_row={"option_symbol": "SPY 260508C00500000"})
+    result = _run_resolve(conn)
+    assert result == "SPY 260508C00500000"
+    assert len(conn.queries) == 1
+    assert "option_chains_latest" in conn.queries[0]
+
+
+def test_resolve_option_symbol_falls_back_when_latest_cache_misses():
+    """Cold path: contract not yet in option_chains_latest (hasn't been
+    quoted since the dual-UPSERT was deployed). Falls back to the original
+    14-day option_chains scan."""
+    conn = _ResolveConn(
+        latest_row=None,
+        fallback_row={"option_symbol": "SPY 260508C00500000"},
+    )
+    result = _run_resolve(conn)
+    assert result == "SPY 260508C00500000"
+    assert len(conn.queries) == 2
+    assert "option_chains_latest" in conn.queries[0]
+    assert "FROM option_chains" in conn.queries[1]
+    assert "option_chains_latest" not in conn.queries[1]
+
+
+def test_resolve_option_symbol_returns_none_when_neither_path_finds_it():
+    conn = _ResolveConn(latest_row=None, fallback_row=None)
+    assert _run_resolve(conn) is None
+    assert len(conn.queries) == 2
+
+
+def test_resolve_option_symbol_bails_on_latest_cache_timeout():
+    """When the small latest-cache lookup times out, the broader 14-day
+    fallback won't fare better. Raise rather than burn another 30s."""
+    conn = _ResolveConn(latest_exc=TimeoutError())
+    import pytest
+
+    with pytest.raises((asyncio.TimeoutError, TimeoutError)):
+        _run_resolve(conn)
+    # Only the latest-cache query ran -- no slow fallback.
+    assert len(conn.queries) == 1
+    assert "option_chains_latest" in conn.queries[0]
+
+
+def test_resolve_option_symbol_falls_back_on_non_timeout_latest_error():
+    """A non-timeout error against the cache (e.g. table missing in a stale
+    deploy) should still try the historical fallback."""
+    conn = _ResolveConn(
+        latest_exc=RuntimeError("relation does not exist"),
+        fallback_row={"option_symbol": "SPY 260508C00500000"},
+    )
+    result = _run_resolve(conn)
+    assert result == "SPY 260508C00500000"
+    assert len(conn.queries) == 2
