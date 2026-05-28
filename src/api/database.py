@@ -2753,11 +2753,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self, symbol: str = "SPY", timeframe: str = "5min", window_units: int = 60
     ) -> List[Dict[str, Any]]:
         """
-        Get GEX data by strike over time for heatmap visualization using interval + window units.
+        Get GEX data by strike over time for heatmap visualization.
 
-        Rows are ordered newest → oldest by ``timestamp`` (and ascending by
-        ``strike`` within each timestamp), so ``rows[0]`` is from the most
-        recent bucket.
+        Returns one object per time bucket, ordered newest → oldest::
+
+            [{"timestamp", "gamma_flip", "gamma_flip_span_used",
+              "heatmap": [{"strike", "net_gex"}, ...]}, ...]
+
+        ``gamma_flip`` / ``gamma_flip_span_used`` are the bucket's single
+        resolved values (NULL when unresolved); ``heatmap`` is ascending
+        by ``strike``.
         """
         symbol = symbol.upper()
         window_units = max(1, min(window_units, 300))
@@ -2922,7 +2927,35 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     self._fetch_timed(conn, query, *params, timeout=15.0),
                     timeout=15.0,
                 )
-                result = [dict(row) for row in rows]
+                flat = [dict(row) for row in rows]
+                # Group the flat (timestamp, strike) rows into the
+                # per-bucket shape the frontend consumes: one object per
+                # timestamp carrying that bucket's gamma_flip / span once,
+                # plus a ``heatmap`` array of {strike, net_gex}. The flip
+                # and span ride the lowest-strike row of each bucket only
+                # (NULL on the rest — see the SELECT's CASE), so capture
+                # the first non-NULL per bucket. A plain dict preserves
+                # insertion order, so the query's bucket_ts DESC /
+                # strike ASC ordering carries through.
+                grouped: Dict[Any, Dict[str, Any]] = {}
+                for r in flat:
+                    ts = r["timestamp"]
+                    bucket = grouped.get(ts)
+                    if bucket is None:
+                        bucket = {
+                            "timestamp": ts,
+                            "gamma_flip": r.get("gamma_flip"),
+                            "gamma_flip_span_used": r.get("gamma_flip_span_used"),
+                            "heatmap": [],
+                        }
+                        grouped[ts] = bucket
+                    elif bucket["gamma_flip"] is None and r.get("gamma_flip") is not None:
+                        bucket["gamma_flip"] = r.get("gamma_flip")
+                        bucket["gamma_flip_span_used"] = r.get("gamma_flip_span_used")
+                    bucket["heatmap"].append(
+                        {"strike": r["strike"], "net_gex": r["net_gex"]}
+                    )
+                result = list(grouped.values())
                 self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
                 return result
         except asyncio.TimeoutError:
