@@ -157,6 +157,14 @@ a 66 GB hot table is to upsize the writer; a parallel answer is to
 shrink the hot table (archive rows older than 7–14 days to a separate
 table that's cold-tier-only).
 
+**Applied 2026-05-28:** the writer was upsized **db.t3.small → db.r6g.large**
+(16 GB) when this failure mode resurfaced as `/api/flow` + `/api/gex` query
+timeouts during the cash session — see the **2026-05-28 resize** section at the
+end of this runbook for the full before/after and the exact parameter values.
+Caveat: the table's `shared_buffers` column is the **Aurora** default (~75 % of
+RAM); on **RDS PG** (what we run) the default is ~25 %, so r6g.large landed at
+~3.8 GB `shared_buffers`, not ~12 GB — the OS page cache holds the rest.
+
 ### `effective_cache_size`
 
 Planner estimate of how much filesystem cache + `shared_buffers` is
@@ -343,3 +351,97 @@ If you're stuck on the small instance for cost reasons, the
 two-step recovery is: (1) `random_page_cost=1.1` to cut per-cycle
 work, then (2) `ANALYTICS_SNAPSHOT_LOOKBACK_HOURS=0.25` to cut it
 further still.
+
+## 2026-05-28 resize: db.t3.small → db.r6g.large
+
+Second time the "buffer pool can't hold the working set" mode bit — this time
+surfacing as a steady stream of `src.api.database` WARNINGs through the cash
+session:
+
+```
+Flow contracts query timed out for SPX, returning empty
+GEX heatmap query timed out for SPY timeframe=5min window=270, returning empty
+Flow series query timed out for SPY, returning empty
+```
+
+Those are the per-endpoint 10–15 s `asyncio.wait_for` guards in
+`src/api/database.py` firing and returning `[]` — symptom, not cause.
+
+### Root cause
+
+Storage I/O saturation on `db.t3.small` (2 GB RAM, gp3 100 GiB / 3000 IOPS),
+from two compounding instance-class limits:
+
+1. **2 GB RAM** → page cache far too small for the 66 GB hot set; nearly every
+   read missed cache and hit disk.
+2. **t3 burstable EBS exhausted mid-session.** CloudWatch over the warning
+   window showed the cliff: `TotalIOPS` ~3,100 → ~1,000, `ReadLatency` ~10 ms →
+   30–44 ms, `DiskQueueDepth` → ~40 — the IOPS collapse landed at 16:10 UTC, the
+   same minute as the first warning (12:10 ET). The gp3 volume provisions 3000
+   IOPS, but the t3.small instance can't sustain pushing them (it's the
+   *instance's* EBS credit that runs out, not the volume's).
+
+Two amplifiers, each confirmed and fixed independently so the resize was
+isolated to the storage tier:
+
+* **API CFS throttling.** `zerogex-oa-api.service` ran `CPUQuota=100%` for 2
+  uvicorn workers → bursty event-loop freezes (`cpu.stat` showed ~9.5 % of
+  windows throttled) stacked scheduling delay on top of slow reads. Fixed:
+  `CPUQuota=200%` (validated 0 % throttle under load).
+* **Stale visibility map on `flow_by_contract`.** The covering-index Index-Only
+  Scan was doing 116 k heap fetches — default autovacuum `scale_factor=0.2` is
+  far too lazy for a table UPSERTed every ~60 s. Fixed:
+  `make db-tune-flow-tables-autovacuum` (scale_factor → 0.02) + one-off
+  `make db-vacuum-flow-tables`.
+
+### Why r6g.large (16 GB), not m6g.large (8 GB)
+
+Against the 66 GB hot table (sizing table above): 8 GB is ~9 % coverage (flow/gex
+cache but get evicted by `option_chains` scans); 16 GB is ~18 % — the "cycle 2+
+stays warm" entry point. `db.r6g.large` is the current-gen Graviton equivalent of
+the table's `db.r5.large`, with **sustained** (non-burstable) EBS — which is what
+removes the t3 cliff. r-class (more RAM per vCPU) fits a RAM/IO-bound workload
+better than m-class.
+
+### Changes applied
+
+* Instance class `db.t3.small` → `db.r6g.large` (Modify → Apply immediately;
+  single-AZ → ~5 min reboot, services reconnect via the pool retry logic).
+* Param group `zerogex-pg`: `effective_cache_size` → **`1572864`** (8 kB pages =
+  12 GB = 75 % of 16 GB; dynamic, no extra reboot).
+* `shared_buffers` left on `{DBInstanceClassMemory/32768}` → auto-scaled to
+  **3,987,104 kB ≈ 3.8 GB** (RDS PG default ≈ 25 % of usable RAM).
+* `random_page_cost=1.1`, `effective_io_concurrency=200` unchanged.
+
+### Before/after — `make flow-explain FLOW_SYMBOL=SPX`, query [5] (SPX, 24 h)
+
+| Stage | Execution | Per-page read | Cache hits | Heap Fetches |
+|---|---|---|---|---|
+| t3.small, stale VM | 27.3 s | 3.3 ms | 150 | 116,295 |
+| t3.small, post-vacuum | 24.3 s | 11.6 ms | 150 | 9,781 |
+| **r6g.large, post-resize** | **1.46 s** | **0.34 ms** | **4,172** | 65,068 |
+
+The middle row is the lesson: the vacuum dropped heap fetches 116 k → 9.8 k and
+pages read ~4×, yet wall-clock barely moved because per-page latency had *risen*
+(burst variance) — a real fix **masked by storage latency**. The resize delivered
+0.34 ms/page sustained + cache hits, and the query (and the timeouts) resolved.
+Planning time also fell 144 ms → 0.3 ms once catalog pages stayed cached.
+
+### Diagnostic order (to reproduce the reasoning)
+
+1. App CPU throttle — `cpu.stat` `nr_throttled`/`throttled_usec` delta over 60 s.
+2. `make db-diagnostics` — waits / blockers / dead tuples. (Here: 21 of 31
+   sessions on `DataFileRead`/`BufferIo`, **0 blocking chains** → I/O-bound, not
+   locks.)
+3. `EXPLAIN (ANALYZE, BUFFERS)` on the slow query — divide `I/O Timings: shared
+   read` by pages read for per-page latency. **Few pages but slow per-page =
+   storage tier, not a bad plan.**
+4. `make flow-explain` / `make db-explain-confluence-matrix` — `Heap Fetches`
+   (stale VM?) and `shared hit` vs `read`.
+5. RDS Console → Monitoring — `ReadLatency`, `DiskQueueDepth`, `ReadIOPS` vs
+   provisioned, `FreeableMemory`. (No `BurstBalance` graph on gp3 — that's
+   expected; the burst that ran out is the instance's EBS credit.)
+
+**Lesson:** more RAM would have *masked* the stale-VM heap fetches by caching
+them — vacuum is the clean fix for the fetches, the resize is for the storage
+tier. Both were needed; neither substituted for the other.
