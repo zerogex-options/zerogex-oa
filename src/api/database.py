@@ -1603,6 +1603,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     gs.total_call_oi,
                     gs.total_put_oi,
                     gs.put_call_ratio,
+                    gs.net_gex_at_spot,
+                    gs.flip_distance,
+                    gs.local_gex,
+                    gs.convexity_risk,
                     gs.call_wall AS stored_call_wall,
                     gs.put_wall  AS stored_put_wall,
                     {bucket} as bucket_ts,
@@ -1677,7 +1681,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 COALESCE(b.stored_put_wall,  pw.put_wall)  AS put_wall,
                 b.total_call_oi,
                 b.total_put_oi,
-                b.put_call_ratio
+                b.put_call_ratio,
+                b.net_gex_at_spot,
+                b.flip_distance,
+                b.local_gex,
+                b.convexity_risk
             FROM base b
             CROSS JOIN spot s
             LEFT JOIN strike_agg sa ON sa.timestamp = b.timestamp
