@@ -1073,9 +1073,19 @@ fmt-check: ## Run black --check on src + tests (CI-style; no writes)
 type-check: ## Run mypy on src
 	$(PY) -m mypy src
 
+# `ci` mirrors .github/workflows/ci.yml's bar: black --check and pytest are
+# BLOCKING; flake8 and mypy are ADVISORY (the workflow marks them
+# continue-on-error). The `-` prefix tells make to ignore their exit status so
+# a lint/type finding does not fail the suite. Run `make lint` / `make type-check`
+# directly for a blocking check of those tools.
 .PHONY: ci
-ci: fmt-check lint type-check test ## Run the full local CI suite (fmt-check, lint, type-check, test)
-	@echo "$(GREEN)✓ CI checks passed$(NC)"
+ci: fmt-check ## Run the local CI suite — mirrors ci.yml (black + pytest blocking; flake8 + mypy advisory)
+	@echo "$(YELLOW)flake8 (advisory — matches ci.yml continue-on-error)$(NC)"
+	-$(PY) -m flake8 src tests
+	@echo "$(YELLOW)mypy (advisory — matches ci.yml continue-on-error)$(NC)"
+	-$(PY) -m mypy src
+	$(PY) -m pytest -m "not integration"
+	@echo "$(GREEN)✓ CI passed (black + pytest); flake8 + mypy advisory$(NC)"
 
 
 # =============================================================================
