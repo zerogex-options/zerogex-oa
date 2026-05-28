@@ -2787,8 +2787,20 @@ class AnalyticsEngine:
         analytics cycle through the trading day, so the value naturally
         settles to the EOD snapshot as the day closes.
 
+        Gated to 09:30-16:15 ET to avoid the post-close drift trap.
+        SPX options stop liquid trading at 16:15 ET; after that the
+        option_chains snapshot reflects wide quoted spreads and stale
+        IVs that drift from the true settlement value.  Without this
+        gate, the analytics cycle running at 18:05 ET would overwrite
+        a clean 16:00 ET IV anchor with a post-market noise value
+        (observed in prod: SPX 0.1408 at 16:00 -> 0.1189 at 18:05).
+        Once 16:15 ET passes, today's row freezes at its last
+        cash-session value and stays accurate until the next 09:30
+        open writes a fresh one.
+
         Skips silently when:
           * spot is missing / non-positive (no ATM reference)
+          * timestamp is outside 09:30-16:15 ET (post-close drift)
           * no ATM calls have positive IV (chain not yet populated)
         Failures here must not abort the GEX persistence — wrapped in
         try/except so a bad UPSERT logs and continues.
@@ -2799,6 +2811,22 @@ class AnalyticsEngine:
                 return
             underlying = summary["underlying"]
             timestamp = summary["timestamp"]
+
+            # Cash-session gate.  ``timestamp`` from gex_summary is
+            # tz-aware (TIMESTAMPTZ in DB); fall back to UTC on the off
+            # chance an upstream caller passes a naive datetime.
+            ts_aware = (
+                timestamp
+                if timestamp.tzinfo is not None
+                else pytz.UTC.localize(timestamp)
+            )
+            et = ts_aware.astimezone(pytz.timezone("America/New_York"))
+            et_minute = et.hour * 60 + et.minute
+            # 09:30 ET = 570 min; 16:15 ET = 975 min.  16:15 captures
+            # the 0DTE SPX cash-settled close at 16:00 plus the 15 min
+            # of orderly close-out quoting that follows.
+            if not (570 <= et_minute <= 975):
+                return
 
             low = spot * 0.99
             high = spot * 1.01
