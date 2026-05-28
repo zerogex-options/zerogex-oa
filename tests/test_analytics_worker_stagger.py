@@ -80,11 +80,7 @@ def test_inline_comment_in_env_value_is_tolerated():
     """python-dotenv preserves trailing ``# comments`` verbatim; the helper
     strips them rather than failing the parse (parity with the
     `_getenv_int`/`_getenv_float` helpers used elsewhere in the engine)."""
-    with patch.dict(
-        os.environ, {"ANALYTICS_WORKER_STAGGER_SECONDS": "auto # spread evenly"}
-    ):
+    with patch.dict(os.environ, {"ANALYTICS_WORKER_STAGGER_SECONDS": "auto # spread evenly"}):
         assert _compute_worker_stagger(60, 3) == 20.0
-    with patch.dict(
-        os.environ, {"ANALYTICS_WORKER_STAGGER_SECONDS": "10 # explicit"}
-    ):
+    with patch.dict(os.environ, {"ANALYTICS_WORKER_STAGGER_SECONDS": "10 # explicit"}):
         assert _compute_worker_stagger(60, 3) == 10.0

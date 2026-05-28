@@ -1120,7 +1120,10 @@ class AnalyticsEngine:
         return min(1.0, dte_over_ref)
 
     def _calculate_gex_by_strike(
-        self, options: List[Dict[str, Any]], underlying_price: float, timestamp: datetime,
+        self,
+        options: List[Dict[str, Any]],
+        underlying_price: float,
+        timestamp: datetime,
         recompute_gamma: bool = False,
     ) -> List[Dict[str, Any]]:
         """
@@ -1186,14 +1189,18 @@ class AnalyticsEngine:
             # Note: there is typically one call/put contract per strike+expiration,
             # but we still compute this as a true weighted sum so the math remains
             # correct if upstream snapshots ever include multiple rows.
-            call_gamma = sum(_gamma_at_spot(opt, strike, T) * opt["open_interest"] for opt in data["calls"])
+            call_gamma = sum(
+                _gamma_at_spot(opt, strike, T) * opt["open_interest"] for opt in data["calls"]
+            )
             call_oi = sum(opt["open_interest"] for opt in data["calls"])
             call_volume = sum(opt["volume"] for opt in data["calls"])
             # Industry-standard dollar GEX per 1% move: γ × OI × 100 × S² × 0.01.
             call_gex = call_gamma * 100 * underlying_price * underlying_price * 0.01
 
             # Calculate put GEX (negative for dealers)
-            put_gamma = sum(_gamma_at_spot(opt, strike, T) * opt["open_interest"] for opt in data["puts"])
+            put_gamma = sum(
+                _gamma_at_spot(opt, strike, T) * opt["open_interest"] for opt in data["puts"]
+            )
             put_oi = sum(opt["open_interest"] for opt in data["puts"])
             put_volume = sum(opt["volume"] for opt in data["puts"])
             put_gex = -1 * put_gamma * 100 * underlying_price * underlying_price * 0.01
@@ -2896,11 +2903,7 @@ class AnalyticsEngine:
             # Cash-session gate.  ``timestamp`` from gex_summary is
             # tz-aware (TIMESTAMPTZ in DB); fall back to UTC on the off
             # chance an upstream caller passes a naive datetime.
-            ts_aware = (
-                timestamp
-                if timestamp.tzinfo is not None
-                else pytz.UTC.localize(timestamp)
-            )
+            ts_aware = timestamp if timestamp.tzinfo is not None else pytz.UTC.localize(timestamp)
             et = ts_aware.astimezone(pytz.timezone("America/New_York"))
             et_minute = et.hour * 60 + et.minute
             # 09:30 ET = 570 min; 16:15 ET = 975 min.  16:15 captures
@@ -3400,7 +3403,9 @@ class AnalyticsEngine:
             logger.info("Calculating GEX by strike...")
             t0 = _time.monotonic()
             gex_by_strike = self._calculate_gex_by_strike(
-                options, underlying_price, latest_timestamp,
+                options,
+                underlying_price,
+                latest_timestamp,
                 recompute_gamma=snapshot.get("spot_anchored", False),
             )
             stage_timings["gex_by_strike"] = _time.monotonic() - t0

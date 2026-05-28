@@ -67,9 +67,9 @@ def test_upserts_during_cash_session():
             _summary(_et(2026, 5, 27, hour, minute)),
             cur,
         )
-        assert cur.execute.called, (
-            f"expected UPSERT at {hour:02d}:{minute:02d} ET (within cash session)"
-        )
+        assert (
+            cur.execute.called
+        ), f"expected UPSERT at {hour:02d}:{minute:02d} ET (within cash session)"
 
 
 def test_skips_before_open():
@@ -83,9 +83,9 @@ def test_skips_before_open():
             _summary(_et(2026, 5, 27, hour, minute)),
             cur,
         )
-        assert not cur.execute.called, (
-            f"expected NO UPSERT at {hour:02d}:{minute:02d} ET (pre-open)"
-        )
+        assert (
+            not cur.execute.called
+        ), f"expected NO UPSERT at {hour:02d}:{minute:02d} ET (pre-open)"
 
 
 def test_skips_after_close():
@@ -103,9 +103,9 @@ def test_skips_after_close():
             _summary(_et(2026, 5, 27, hour, minute)),
             cur,
         )
-        assert not cur.execute.called, (
-            f"expected NO UPSERT at {hour:02d}:{minute:02d} ET (post-close)"
-        )
+        assert (
+            not cur.execute.called
+        ), f"expected NO UPSERT at {hour:02d}:{minute:02d} ET (post-close)"
 
 
 def test_handles_naive_timestamp_as_utc():

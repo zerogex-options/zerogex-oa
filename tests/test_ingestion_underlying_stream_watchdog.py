@@ -337,9 +337,7 @@ def test_watchdog_escalates_when_stream_replays_stale_bars(monkeypatch, caplog):
 
     # The exact symptom from the production journal: a STALE warning
     # naming the non-advancing replays. Old code logged NOTHING here.
-    stale_warnings = [
-        r for r in caplog.records if "appears STALE" in r.getMessage()
-    ]
+    stale_warnings = [r for r in caplog.records if "appears STALE" in r.getMessage()]
     assert stale_warnings, (
         "Watchdog did not warn on non-advancing bars. Before the fix the "
         "if underlying_data: branch absorbed every iteration and the "

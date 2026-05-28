@@ -116,15 +116,16 @@ def test_batch_write_dual_upserts_in_same_transaction():
     engine = _make_engine_for_write_test()
     cm, conn, cursor = _mock_db_connection()
 
-    with patch.object(ingestion_module, "db_connection", return_value=cm), patch.object(
-        ingestion_module, "execute_values"
-    ) as execute_values_mock:
+    with (
+        patch.object(ingestion_module, "db_connection", return_value=cm),
+        patch.object(ingestion_module, "execute_values") as execute_values_mock,
+    ):
         engine._write_option_rows([_build_row()])
 
     calls = _execute_values_calls(execute_values_mock)
-    assert len(calls) == 2, (
-        f"expected exactly 2 execute_values calls (history + cache), got {len(calls)}"
-    )
+    assert (
+        len(calls) == 2
+    ), f"expected exactly 2 execute_values calls (history + cache), got {len(calls)}"
 
     history_sql, _ = calls[0]
     cache_sql, _ = calls[1]
@@ -156,17 +157,18 @@ def test_history_and_cache_receive_identical_values():
     cm, _, _ = _mock_db_connection()
 
     row = _build_row()
-    with patch.object(ingestion_module, "db_connection", return_value=cm), patch.object(
-        ingestion_module, "execute_values"
-    ) as execute_values_mock:
+    with (
+        patch.object(ingestion_module, "db_connection", return_value=cm),
+        patch.object(ingestion_module, "execute_values") as execute_values_mock,
+    ):
         engine._write_option_rows([row])
 
     calls = _execute_values_calls(execute_values_mock)
     _, history_values = calls[0]
     _, cache_values = calls[1]
-    assert history_values == cache_values, (
-        "history and cache UPSERTs must receive byte-identical VALUES tuples"
-    )
+    assert (
+        history_values == cache_values
+    ), "history and cache UPSERTs must receive byte-identical VALUES tuples"
     assert len(history_values) == 1
 
 
@@ -176,13 +178,11 @@ def test_dual_write_applies_to_multi_row_batches():
     engine = _make_engine_for_write_test()
     cm, _, _ = _mock_db_connection()
 
-    rows = [
-        _build_row(option_symbol=f"SPY260520C0050{i:04d}000")
-        for i in range(5)
-    ]
-    with patch.object(ingestion_module, "db_connection", return_value=cm), patch.object(
-        ingestion_module, "execute_values"
-    ) as execute_values_mock:
+    rows = [_build_row(option_symbol=f"SPY260520C0050{i:04d}000") for i in range(5)]
+    with (
+        patch.object(ingestion_module, "db_connection", return_value=cm),
+        patch.object(ingestion_module, "execute_values") as execute_values_mock,
+    ):
         engine._write_option_rows(rows)
 
     calls = _execute_values_calls(execute_values_mock)
@@ -202,19 +202,18 @@ def test_cache_upsert_is_skipped_when_db_in_backoff():
 
     engine._db_backoff_until = _time.monotonic() + 30.0
 
-    with patch.object(
-        ingestion_module, "execute_values"
-    ) as execute_values_mock, patch.object(
-        ingestion_module, "db_connection"
-    ) as db_conn_mock:
+    with (
+        patch.object(ingestion_module, "execute_values") as execute_values_mock,
+        patch.object(ingestion_module, "db_connection") as db_conn_mock,
+    ):
         engine._write_option_rows([_build_row()])
 
     assert execute_values_mock.call_count == 0
     assert db_conn_mock.call_count == 0
     # Row must be retained for the next attempt.
-    assert engine._pending_failed_option_rows, (
-        "rows must be retained when the breaker skips the write"
-    )
+    assert (
+        engine._pending_failed_option_rows
+    ), "rows must be retained when the breaker skips the write"
 
 
 def test_cache_upsert_deduped_by_option_symbol_when_batch_has_multiple_timestamps():
@@ -245,9 +244,10 @@ def test_cache_upsert_deduped_by_option_symbol_when_batch_has_multiple_timestamp
         _build_row(option_symbol="SPY260520C00501000", timestamp=ts_later),
     ]
 
-    with patch.object(ingestion_module, "db_connection", return_value=cm), patch.object(
-        ingestion_module, "execute_values"
-    ) as execute_values_mock:
+    with (
+        patch.object(ingestion_module, "db_connection", return_value=cm),
+        patch.object(ingestion_module, "execute_values") as execute_values_mock,
+    ):
         engine._write_option_rows(rows)
 
     calls = _execute_values_calls(execute_values_mock)
@@ -268,9 +268,9 @@ def test_cache_upsert_deduped_by_option_symbol_when_batch_has_multiple_timestamp
 
     # And the kept row for the duplicated symbol is the LATER one.
     sym_row = next(v for v in cache_values if v[0] == sym)
-    assert sym_row[1] == ts_later, (
-        "cache dedup must keep the latest-timestamp row, not an arbitrary one"
-    )
+    assert (
+        sym_row[1] == ts_later
+    ), "cache dedup must keep the latest-timestamp row, not an arbitrary one"
 
 
 def test_cache_upsert_dedup_preserves_history_order_too():
@@ -291,18 +291,17 @@ def test_cache_upsert_dedup_preserves_history_order_too():
         ),
     ]
 
-    with patch.object(ingestion_module, "db_connection", return_value=cm), patch.object(
-        ingestion_module, "execute_values"
-    ) as execute_values_mock:
+    with (
+        patch.object(ingestion_module, "db_connection", return_value=cm),
+        patch.object(ingestion_module, "execute_values") as execute_values_mock,
+    ):
         engine._write_option_rows(rows)
 
     calls = _execute_values_calls(execute_values_mock)
     _, history_values = calls[0]
     _, cache_values = calls[1]
     assert len(history_values) == 2
-    assert len(cache_values) == 2, (
-        "non-duplicated symbols must not be dropped by the dedup"
-    )
+    assert len(cache_values) == 2, "non-duplicated symbols must not be dropped by the dedup"
 
 
 def test_cache_upsert_sql_is_a_class_constant():
