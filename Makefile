@@ -569,6 +569,19 @@ db-tune-signal-tables-autovacuum: ## ALTER TABLE signal_scores + signal_componen
 	@$(PSQL) -c "SELECT relname, reloptions FROM pg_class WHERE relname IN ('signal_scores','signal_component_scores');"
 	@echo "$(GREEN)✓ Autovacuum tuned. Settings take effect on the next autovacuum cycle.$(NC)"
 
+.PHONY: db-tune-flow-tables-autovacuum
+db-tune-flow-tables-autovacuum: ## ALTER TABLE flow_by_contract + flow_contract_facts for aggressive autovacuum (keeps the covering-index visibility map current for /api/flow reads). Best applied alongside the instance resize.
+	@echo "$(BLUE)=== Applying aggressive autovacuum settings to flow_by_contract + flow_contract_facts ===$(NC)"
+	@echo "$(YELLOW)Both tables are UPSERT-churned every analytics cycle (~60s) plus the$(NC)"
+	@echo "$(YELLOW)API-side backstop.  Default autovacuum (scale_factor=0.2) lets ~20% of$(NC)"
+	@echo "$(YELLOW)the table go dead before running, leaving the visibility map stale for$(NC)"
+	@echo "$(YELLOW)the Index-Only Scans behind /api/flow/series and /api/flow/contracts.$(NC)"
+	@echo "$(YELLOW)Lower to 2% + a small absolute threshold.$(NC)"
+	@$(PSQL) -c "ALTER TABLE flow_by_contract SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_vacuum_threshold = 1000, autovacuum_analyze_scale_factor = 0.02, autovacuum_analyze_threshold = 1000);"
+	@$(PSQL) -c "ALTER TABLE flow_contract_facts SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_vacuum_threshold = 1000, autovacuum_analyze_scale_factor = 0.02, autovacuum_analyze_threshold = 1000);"
+	@$(PSQL) -c "SELECT relname, reloptions FROM pg_class WHERE relname IN ('flow_by_contract','flow_contract_facts');"
+	@echo "$(GREEN)✓ Autovacuum tuned. Settings take effect on the next autovacuum cycle.$(NC)"
+
 .PHONY: db-vacuum-confluence-matrix-tables
 db-vacuum-confluence-matrix-tables: ## VACUUM (ANALYZE) signal_scores + signal_component_scores. Needed for Index Only Scan (refreshes visibility map) and planner stats.
 	@echo "$(BLUE)=== VACUUM ANALYZE signal_scores, signal_component_scores ===$(NC)"

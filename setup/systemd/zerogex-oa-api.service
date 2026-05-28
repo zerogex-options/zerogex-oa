@@ -53,7 +53,11 @@ SendSIGKILL=yes
 
 # Resource limits
 MemoryMax=1G
-CPUQuota=100%
+# 2 uvicorn workers (one event loop each) → allow up to 2 cores. At 100% the two
+# workers shared a single core and CFS-throttled in bursts during the cash session,
+# adding event-loop scheduling delay on top of DB reads. CPUWeight below still wins
+# contention against the background workers.
+CPUQuota=200%
 # API wins contended cycles over background workers (ingestion=100, analytics/signals=80)
 CPUWeight=400
 
