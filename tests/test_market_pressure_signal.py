@@ -141,21 +141,26 @@ def test_response_contract_emits_frontend_alias_keys():
     comp = result.context["compression"]
     hedging = result.context["hedging"]
     flow = result.context["flow"]
-    # Compression aliases.  ``netGexMultiplier`` (camelCase) is the exact
-    # accessor the frontend reads (market-pressure/page.tsx) — pin it so a
-    # rename can't silently break the dashboard again.
-    assert comp["net_gex_mult"] == comp["regime_mult"]
-    assert comp["netGexMultiplier"] == comp["regime_mult"]
+    # The frontend's API client camelizes snake_case keys, so each
+    # snake key below must round-trip to the exact camelCase accessor
+    # in market-pressure/page.tsx.  Pin them so a rename can't silently
+    # break the dashboard again.
+    #   net_gex_multiplier -> netGexMultiplier
+    #   alpha              -> alpha
+    #   net_delta          -> netDelta
+    dealer = result.context["dealer"]
+    # Compression.
+    assert comp["net_gex_multiplier"] == comp["regime_mult"]
     assert comp["flip"] == comp["gamma_flip"]
     assert comp["spot"] == 600.0
     assert "net_gex" in comp
-    # Hedging aliases.  ``alpha`` is the exact frontend accessor for the
-    # vanna/charm blend weight.
+    # Hedging.
     assert hedging["charm_amp"] == hedging["charm_amplification"]
-    assert hedging["session_alpha"] == hedging["alpha_vanna"]
     assert hedging["alpha"] == hedging["alpha_vanna"]
     assert hedging["alignment_bonus"] == hedging["alignment_mult"]
     assert hedging["dealer_dni"] is not None  # explicit DNI surfaced
+    # Dealer.
+    assert dealer["net_delta"] == dealer["dealer_net_delta"]
     # Flow aliases.
     assert flow["smart_money_skew"] == flow["smart_skew"]
     assert flow["total_flux"] == round(

@@ -255,8 +255,7 @@ class MarketPressureSignal:
                 "wall_pinch": None,
                 "flip_proximity": None,
                 "regime_mult": None,
-                "net_gex_mult": None,
-                "netGexMultiplier": None,
+                "net_gex_multiplier": None,
                 "call_wall": None,
                 "put_wall": None,
                 "gamma_flip": None,
@@ -287,8 +286,7 @@ class MarketPressureSignal:
                 "wall_pinch": None,
                 "flip_proximity": None,
                 "regime_mult": None,
-                "net_gex_mult": None,
-                "netGexMultiplier": None,
+                "net_gex_multiplier": None,
                 "call_wall": call_wall,
                 "put_wall": put_wall,
                 "gamma_flip": flip,
@@ -322,12 +320,12 @@ class MarketPressureSignal:
             "wall_pinch": round(wall_pinch, 4) if wall_pinch is not None else None,
             "flip_proximity": round(flip_prox, 4) if flip_prox is not None else None,
             "regime_mult": round(regime_mult, 4),
-            # Aliases for the frontend (market-pressure/page.tsx reads
-            # ``compression.netGexMultiplier``) and docstring shorthand
-            # (``net_gex_mult``).  All three carry the same regime
-            # multiplier value.
-            "net_gex_mult": round(regime_mult, 4),
-            "netGexMultiplier": round(regime_mult, 4),
+            # Frontend (market-pressure/page.tsx) reads
+            # ``compression.netGexMultiplier``.  Its API client camelizes
+            # snake_case keys, so emit ``net_gex_multiplier`` which
+            # round-trips to ``netGexMultiplier`` — same as every other
+            # field (call_wall->callWall, wall_pinch->wallPinch, ...).
+            "net_gex_multiplier": round(regime_mult, 4),
             "call_wall": call_wall,
             "put_wall": put_wall,
             "gamma_flip": flip,
@@ -370,7 +368,6 @@ class MarketPressureSignal:
                 "vanna": None,
                 "charm": None,
                 "alpha_vanna": None,
-                "session_alpha": None,
                 "alpha": None,
                 "charm_amplification": None,
                 "charm_amp": None,
@@ -390,7 +387,6 @@ class MarketPressureSignal:
                 "vanna": round(vanna_total, 2),
                 "charm": round(charm_total, 2),
                 "alpha_vanna": None,
-                "session_alpha": None,
                 "alpha": None,
                 "charm_amplification": None,
                 "charm_amp": None,
@@ -431,11 +427,9 @@ class MarketPressureSignal:
             "vanna_normalized": round(v_norm, 4),
             "charm_normalized": round(c_norm, 4),
             "alpha_vanna": round(alpha, 4),
-            # Aliases for the frontend (market-pressure/page.tsx reads
-            # ``hedging.alpha``) and docstring shorthand
-            # (``session_alpha``).  All three carry the same vanna/charm
-            # blend weight.
-            "session_alpha": round(alpha, 4),
+            # Frontend (market-pressure/page.tsx) reads ``hedging.alpha``.
+            # Single word, no underscore, so it passes through the API
+            # client's camelizer unchanged.
             "alpha": round(alpha, 4),
             "charm_amplification": round(charm_amp, 4),
             "charm_amp": round(charm_amp, 4),
@@ -623,12 +617,19 @@ class MarketPressureSignal:
     def _dealer_pressure(cls, ctx: MarketContext) -> dict:
         dni = cls._dealer_net_delta(ctx)
         if dni is None:
-            return {"signed": 0.0, "dealer_net_delta": None}
+            # ``net_delta`` is the frontend's accessor (camelizes to
+            # ``netDelta``); ``dealer_net_delta`` is the canonical name.
+            return {"signed": 0.0, "dealer_net_delta": None, "net_delta": None}
         # Dealers long delta (DNI > 0) ⇒ must sell into strength ⇒ bearish.
         signed = -math.tanh(dni / max(_DEALER_NORM, 1.0))
         return {
             "signed": round(signed, 4),
             "dealer_net_delta": round(dni, 2),
+            # Frontend (market-pressure/page.tsx) reads ``dealer.netDelta``.
+            # The API client camelizes ``dealer_net_delta`` to
+            # ``dealerNetDelta``, which doesn't match — emit ``net_delta``
+            # so it round-trips to ``netDelta``.
+            "net_delta": round(dni, 2),
         }
 
     @staticmethod
