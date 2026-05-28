@@ -174,6 +174,36 @@ def test_cors_development_allows_wildcard_by_default(monkeypatch: pytest.MonkeyP
     assert response.status_code == 200
 
 
+def test_cors_preflight_advertises_narrowed_methods_and_headers(monkeypatch: pytest.MonkeyPatch):
+    """Preflight must NOT advertise mutating methods or a wildcard header
+    set — the API is read-only GETs and only reads a known header surface."""
+    app = _build_app(
+        monkeypatch,
+        api_key=None,
+        environment="production",
+        cors_origins="https://app.example.com",
+    )
+    with TestClient(app) as client:
+        response = client.options(
+            "/api/health",
+            headers={
+                "Origin": "https://app.example.com",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "Authorization",
+            },
+        )
+    allow_methods = response.headers.get("access-control-allow-methods", "")
+    # Read-only surface: no POST/PUT/PATCH/DELETE, no wildcard.
+    assert "*" not in allow_methods
+    for verb in ("POST", "PUT", "PATCH", "DELETE"):
+        assert verb not in allow_methods
+    assert "GET" in allow_methods
+    allow_headers = response.headers.get("access-control-allow-headers", "")
+    assert "*" not in allow_headers
+    # The auth header the caller asked for is granted.
+    assert "Authorization" in allow_headers
+
+
 # --------------------------------------------------------------------------
 # Error-handling decorator
 # --------------------------------------------------------------------------

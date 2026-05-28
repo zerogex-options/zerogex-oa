@@ -200,6 +200,25 @@ class _FakeRequest:
         self.client = _FakeClient(host) if host is not None else None
 
 
+class _FakeRequestWithHeaders(_FakeRequest):
+    def __init__(self, host: str | None = "203.0.113.7", headers: dict | None = None) -> None:
+        super().__init__(host=host)
+        self.headers = headers or {}
+
+
+def _reload_ratelimit(monkeypatch: pytest.MonkeyPatch, *, trusted_proxies: str | None = None):
+    """Reimport ratelimit so module-level _TRUSTED_PROXIES re-reads env."""
+    monkeypatch.delenv("RATE_LIMIT_TRUSTED_PROXIES", raising=False)
+    if trusted_proxies is not None:
+        monkeypatch.setenv("RATE_LIMIT_TRUSTED_PROXIES", trusted_proxies)
+    sys.modules.pop("src.api.ratelimit", None)
+    import importlib
+
+    import src.api.ratelimit as rl
+
+    return importlib.reload(rl)
+
+
 def test_rate_limit_key_precedence(monkeypatch: pytest.MonkeyPatch):
     _reload_identity(monkeypatch, secret=_SECRET)
     from src.api.identity import RequestIdentity
@@ -217,6 +236,54 @@ def test_rate_limit_key_precedence(monkeypatch: pytest.MonkeyPatch):
     assert rate_limit_key(anon, req) == "ip:203.0.113.7"
 
     assert rate_limit_key(anon, _FakeRequest(host=None)) == "ip:unknown"
+
+
+def test_rate_limit_ignores_xff_from_untrusted_peer(monkeypatch: pytest.MonkeyPatch):
+    """With no trusted-proxy config, X-Forwarded-For is attacker-controlled
+    and must be ignored — the bucket keys off the direct peer."""
+    rl = _reload_ratelimit(monkeypatch, trusted_proxies=None)
+    from src.api.identity import RequestIdentity
+
+    anon = RequestIdentity(caller_kind="anonymous")
+    req = _FakeRequestWithHeaders(host="203.0.113.7", headers={"X-Forwarded-For": "1.2.3.4"})
+    # Spoofed XFF ignored → keyed on the real peer.
+    assert rl.rate_limit_key(anon, req) == "ip:203.0.113.7"
+
+
+def test_rate_limit_uses_xff_when_peer_is_trusted_proxy(monkeypatch: pytest.MonkeyPatch):
+    """When the direct peer is a configured trusted proxy, the bucket keys
+    off the real client from X-Forwarded-For, not the shared proxy IP."""
+    rl = _reload_ratelimit(monkeypatch, trusted_proxies="10.0.0.1")
+    from src.api.identity import RequestIdentity
+
+    anon = RequestIdentity(caller_kind="anonymous")
+    # nginx (10.0.0.1) forwards for real client 198.51.100.23.
+    req = _FakeRequestWithHeaders(host="10.0.0.1", headers={"X-Forwarded-For": "198.51.100.23"})
+    assert rl.rate_limit_key(anon, req) == "ip:198.51.100.23"
+
+
+def test_rate_limit_walks_past_chained_trusted_proxies(monkeypatch: pytest.MonkeyPatch):
+    """Multiple trusted hops: walk right-to-left to the first untrusted IP."""
+    rl = _reload_ratelimit(monkeypatch, trusted_proxies="10.0.0.1,10.0.0.2")
+    from src.api.identity import RequestIdentity
+
+    anon = RequestIdentity(caller_kind="anonymous")
+    # client -> edge(10.0.0.2) -> app-proxy(10.0.0.1) -> us.
+    req = _FakeRequestWithHeaders(
+        host="10.0.0.1",
+        headers={"X-Forwarded-For": "198.51.100.23, 10.0.0.2"},
+    )
+    assert rl.rate_limit_key(anon, req) == "ip:198.51.100.23"
+
+
+def test_rate_limit_falls_back_to_peer_when_chain_all_trusted(monkeypatch: pytest.MonkeyPatch):
+    rl = _reload_ratelimit(monkeypatch, trusted_proxies="10.0.0.1,10.0.0.2")
+    from src.api.identity import RequestIdentity
+
+    anon = RequestIdentity(caller_kind="anonymous")
+    req = _FakeRequestWithHeaders(host="10.0.0.1", headers={"X-Forwarded-For": "10.0.0.2"})
+    # No untrusted IP in the chain → fall back to the direct peer.
+    assert rl.rate_limit_key(anon, req) == "ip:10.0.0.1"
 
 
 # --------------------------------------------------------------------------
