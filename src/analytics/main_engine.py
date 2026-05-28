@@ -167,6 +167,23 @@ class AnalyticsEngine:
             _getenv_int("ANALYTICS_OFF_HOURS_INTERVAL_SECONDS", 300),
         )
 
+        # Spot re-anchor (extended hours). OFF by default — deploying is a
+        # no-op until an operator opts in. When enabled, an extended-hours
+        # cycle whose option chain lags the freshest underlying bar by more
+        # than ``_spot_anchor_min_chain_lag_seconds`` re-anchors on that fresh
+        # spot and re-prices gamma at it (see _get_snapshot and
+        # _calculate_gex_by_strike), so the surface tracks the moving ETF tape
+        # instead of freezing between sparse pre/post-market option quotes.
+        # The lag threshold keeps RTH (chain fresh every minute) on the
+        # unchanged option-anchored path. Cash indices have no extended-hours
+        # tape, so max(underlying_quotes) never advances and this never fires.
+        self._spot_anchored_extended_hours = _getenv_bool(
+            "ANALYTICS_SPOT_ANCHORED_EXTENDED_HOURS", False
+        )
+        self._spot_anchor_min_chain_lag_seconds = _getenv_int(
+            "ANALYTICS_SPOT_ANCHOR_MIN_CHAIN_LAG_SECONDS", 120, min=0
+        )
+
         # Metrics
         self.calculations_completed = 0
         self.errors_count = 0
@@ -571,6 +588,50 @@ class AnalyticsEngine:
                         conn.commit()
                         return None
 
+                # Spot re-anchor (extended hours, flag-gated). Pre/post-market
+                # the option chain updates only every few minutes while the
+                # ETF tape prints every minute, so the GEX surface would
+                # otherwise freeze between option quotes. When enabled and the
+                # chain lags the freshest underlying bar by more than the
+                # threshold (the thin extended-hours regime, NOT live RTH),
+                # re-anchor the cycle on that fresh spot. ``spot_anchored``
+                # flows to run_calculation -> _calculate_gex_by_strike, which
+                # re-prices gamma at the new spot. Cash indices have no
+                # extended-hours tape, so max(underlying_quotes) doesn't
+                # advance and this no-ops for them.
+                spot_anchored = False
+                if self._spot_anchored_extended_hours:
+                    cursor.execute(
+                        """
+                        SELECT close, timestamp
+                        FROM underlying_quotes
+                        WHERE symbol = %s
+                        ORDER BY timestamp DESC
+                        LIMIT 1
+                        """,
+                        (self.db_symbol,),
+                    )
+                    fresh = cursor.fetchone()
+                    if fresh and fresh[0] is not None and fresh[1] is not None:
+                        fresh_close = float(fresh[0])
+                        fresh_ts = fresh[1]
+                        lag_seconds = (fresh_ts - timestamp).total_seconds()
+                        if (
+                            lag_seconds > self._spot_anchor_min_chain_lag_seconds
+                            and is_underlying_active_session(fresh_ts, symbol=self.db_symbol)
+                        ):
+                            timestamp = fresh_ts
+                            underlying_price = fresh_close
+                            spot_anchored = True
+                            logger.info(
+                                "Spot-anchored cycle: option chain lags spot by "
+                                "%.0fs; anchoring at fresh spot $%.2f @ %s "
+                                "(re-pricing gamma at spot)",
+                                lag_seconds,
+                                fresh_close,
+                                fresh_ts,
+                            )
+
                 # 3. Latest per-contract option quote, scoped to the
                 # lookback window plus the contract-expiration roll-off.
                 # Returns one row per option_symbol — the most recent
@@ -892,6 +953,7 @@ class AnalyticsEngine:
                     "timestamp": timestamp,
                     "underlying_price": underlying_price,
                     "options": options,
+                    "spot_anchored": spot_anchored,
                 }
 
         except Exception as e:
@@ -1058,7 +1120,8 @@ class AnalyticsEngine:
         return min(1.0, dte_over_ref)
 
     def _calculate_gex_by_strike(
-        self, options: List[Dict[str, Any]], underlying_price: float, timestamp: datetime
+        self, options: List[Dict[str, Any]], underlying_price: float, timestamp: datetime,
+        recompute_gamma: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Calculate gamma exposure by strike.
@@ -1090,22 +1153,47 @@ class AnalyticsEngine:
             else:
                 strike_data[key]["puts"].append(opt)
 
+        # Per-contract gamma resolver. Default: the snapshot's stored gamma
+        # (computed by ingestion at the spot when the option last quoted).
+        # When ``recompute_gamma`` is set (an extended-hours spot-anchored
+        # cycle), re-price gamma via Black-Scholes at the CURRENT spot from
+        # the contract's stored IV — dealer gamma genuinely shifts as spot
+        # moves even with no new option quote. Falls back to stored gamma
+        # when IV is missing/non-positive. With recompute_gamma=False (the
+        # default, and every RTH / flag-off cycle) it returns opt["gamma"]
+        # unchanged, so the existing GEX math stays byte-identical.
+        def _gamma_at_spot(opt: Dict[str, Any], strike: float, T: float) -> float:
+            if recompute_gamma:
+                iv = opt.get("implied_volatility")
+                if iv is not None and iv > 0:
+                    return self._calculate_bs_gamma(
+                        underlying_price, strike, T, self.risk_free_rate, iv
+                    )
+            return opt["gamma"]
+
         # Calculate GEX for each strike
         gex_results = []
 
         for (strike, expiration), data in strike_data.items():
+            # T is the same for all options at this (strike, expiration), so
+            # cache it; resolved first so _gamma_at_spot can re-price below.
+            T = _tte_cache.get(expiration)
+            if T is None:
+                T = self._calculate_time_to_expiration(timestamp, expiration)
+                _tte_cache[expiration] = T
+
             # Aggregate gamma by contract with OI weighting.
             # Note: there is typically one call/put contract per strike+expiration,
             # but we still compute this as a true weighted sum so the math remains
             # correct if upstream snapshots ever include multiple rows.
-            call_gamma = sum(opt["gamma"] * opt["open_interest"] for opt in data["calls"])
+            call_gamma = sum(_gamma_at_spot(opt, strike, T) * opt["open_interest"] for opt in data["calls"])
             call_oi = sum(opt["open_interest"] for opt in data["calls"])
             call_volume = sum(opt["volume"] for opt in data["calls"])
             # Industry-standard dollar GEX per 1% move: γ × OI × 100 × S² × 0.01.
             call_gex = call_gamma * 100 * underlying_price * underlying_price * 0.01
 
             # Calculate put GEX (negative for dealers)
-            put_gamma = sum(opt["gamma"] * opt["open_interest"] for opt in data["puts"])
+            put_gamma = sum(_gamma_at_spot(opt, strike, T) * opt["open_interest"] for opt in data["puts"])
             put_oi = sum(opt["open_interest"] for opt in data["puts"])
             put_volume = sum(opt["volume"] for opt in data["puts"])
             put_gex = -1 * put_gamma * 100 * underlying_price * underlying_price * 0.01
@@ -1122,13 +1210,6 @@ class AnalyticsEngine:
             put_vanna_exposure = 0.0
             call_charm_exposure = 0.0
             put_charm_exposure = 0.0
-
-            # T is the same for all options at this (strike, expiration),
-            # so cache it to avoid redundant datetime math.
-            T = _tte_cache.get(expiration)
-            if T is None:
-                T = self._calculate_time_to_expiration(timestamp, expiration)
-                _tte_cache[expiration] = T
 
             for opt in data["calls"] + data["puts"]:
                 # Skip contracts with no reliable IV. Previously the read
@@ -3319,7 +3400,8 @@ class AnalyticsEngine:
             logger.info("Calculating GEX by strike...")
             t0 = _time.monotonic()
             gex_by_strike = self._calculate_gex_by_strike(
-                options, underlying_price, latest_timestamp
+                options, underlying_price, latest_timestamp,
+                recompute_gamma=snapshot.get("spot_anchored", False),
             )
             stage_timings["gex_by_strike"] = _time.monotonic() - t0
 
