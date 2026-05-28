@@ -256,6 +256,7 @@ class MarketPressureSignal:
                 "flip_proximity": None,
                 "regime_mult": None,
                 "net_gex_mult": None,
+                "netGexMultiplier": None,
                 "call_wall": None,
                 "put_wall": None,
                 "gamma_flip": None,
@@ -287,6 +288,7 @@ class MarketPressureSignal:
                 "flip_proximity": None,
                 "regime_mult": None,
                 "net_gex_mult": None,
+                "netGexMultiplier": None,
                 "call_wall": call_wall,
                 "put_wall": put_wall,
                 "gamma_flip": flip,
@@ -320,8 +322,12 @@ class MarketPressureSignal:
             "wall_pinch": round(wall_pinch, 4) if wall_pinch is not None else None,
             "flip_proximity": round(flip_prox, 4) if flip_prox is not None else None,
             "regime_mult": round(regime_mult, 4),
-            # Alias for frontend / docstring shorthand.
+            # Aliases for the frontend (market-pressure/page.tsx reads
+            # ``compression.netGexMultiplier``) and docstring shorthand
+            # (``net_gex_mult``).  All three carry the same regime
+            # multiplier value.
             "net_gex_mult": round(regime_mult, 4),
+            "netGexMultiplier": round(regime_mult, 4),
             "call_wall": call_wall,
             "put_wall": put_wall,
             "gamma_flip": flip,
@@ -365,6 +371,7 @@ class MarketPressureSignal:
                 "charm": None,
                 "alpha_vanna": None,
                 "session_alpha": None,
+                "alpha": None,
                 "charm_amplification": None,
                 "charm_amp": None,
                 "alignment_mult": None,
@@ -384,6 +391,7 @@ class MarketPressureSignal:
                 "charm": round(charm_total, 2),
                 "alpha_vanna": None,
                 "session_alpha": None,
+                "alpha": None,
                 "charm_amplification": None,
                 "charm_amp": None,
                 "alignment_mult": None,
@@ -423,8 +431,12 @@ class MarketPressureSignal:
             "vanna_normalized": round(v_norm, 4),
             "charm_normalized": round(c_norm, 4),
             "alpha_vanna": round(alpha, 4),
-            # Alias for frontend / docstring shorthand.
+            # Aliases for the frontend (market-pressure/page.tsx reads
+            # ``hedging.alpha``) and docstring shorthand
+            # (``session_alpha``).  All three carry the same vanna/charm
+            # blend weight.
             "session_alpha": round(alpha, 4),
+            "alpha": round(alpha, 4),
             "charm_amplification": round(charm_amp, 4),
             "charm_amp": round(charm_amp, 4),
             "alignment_mult": round(align_mult, 4),

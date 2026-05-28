@@ -141,14 +141,19 @@ def test_response_contract_emits_frontend_alias_keys():
     comp = result.context["compression"]
     hedging = result.context["hedging"]
     flow = result.context["flow"]
-    # Compression aliases.
+    # Compression aliases.  ``netGexMultiplier`` (camelCase) is the exact
+    # accessor the frontend reads (market-pressure/page.tsx) — pin it so a
+    # rename can't silently break the dashboard again.
     assert comp["net_gex_mult"] == comp["regime_mult"]
+    assert comp["netGexMultiplier"] == comp["regime_mult"]
     assert comp["flip"] == comp["gamma_flip"]
     assert comp["spot"] == 600.0
     assert "net_gex" in comp
-    # Hedging aliases.
+    # Hedging aliases.  ``alpha`` is the exact frontend accessor for the
+    # vanna/charm blend weight.
     assert hedging["charm_amp"] == hedging["charm_amplification"]
     assert hedging["session_alpha"] == hedging["alpha_vanna"]
+    assert hedging["alpha"] == hedging["alpha_vanna"]
     assert hedging["alignment_bonus"] == hedging["alignment_mult"]
     assert hedging["dealer_dni"] is not None  # explicit DNI surfaced
     # Flow aliases.
