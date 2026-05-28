@@ -591,6 +591,16 @@ db-vacuum-confluence-matrix-tables: ## VACUUM (ANALYZE) signal_scores + signal_c
 	@$(PSQL) -c "VACUUM (ANALYZE, VERBOSE) signal_component_scores;"
 	@echo "$(GREEN)✓ Done. Re-run 'make db-explain-confluence-matrix' — Heap Fetches should be 0.$(NC)"
 
+.PHONY: db-vacuum-flow-tables
+db-vacuum-flow-tables: ## VACUUM (ANALYZE) flow_by_contract + flow_contract_facts. Refreshes the visibility map so the /api/flow covering-index Index-Only Scans skip heap fetches.
+	@echo "$(BLUE)=== VACUUM ANALYZE flow_by_contract, flow_contract_facts ===$(NC)"
+	@echo "$(YELLOW)Refreshes the visibility map (so the covering-index IOS can skip heap$(NC)"
+	@echo "$(YELLOW)fetches) and planner statistics.  Plain VACUUM — non-blocking, concurrent$(NC)"
+	@echo "$(YELLOW)readers/writers proceed (this is NOT vacuum full).$(NC)"
+	@$(PSQL) -c "VACUUM (ANALYZE, VERBOSE) flow_by_contract;"
+	@$(PSQL) -c "VACUUM (ANALYZE, VERBOSE) flow_contract_facts;"
+	@echo "$(GREEN)✓ Done. Re-run 'make flow-explain FLOW_SYMBOL=SPX' — Heap Fetches should drop sharply.$(NC)"
+
 .PHONY: api-time-confluence-matrix
 api-time-confluence-matrix: ## Time /api/signals/{basic,advanced}/confluence-matrix end-to-end (uses OPS_API_KEY / API_KEY from .env).
 	@echo "$(BLUE)=== Timing /api/signals/{basic,advanced}/confluence-matrix ===$(NC)"
