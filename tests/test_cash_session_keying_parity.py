@@ -99,9 +99,15 @@ else:
 # The CTE mirrors src/api/database.py::_do_refresh_flow_cache exactly,
 # minus the columns the LAG-CASE classification doesn't touch (strike,
 # expiration, option_type, IV, delta, last/mid/bid/ask) and minus the
-# INSERT/ON CONFLICT tail.  If the production CTE structure changes,
-# this test will silently drift unless _flow_lag_same_session_clause
-# itself is what changes -- in which case the gating tests catch it.
+# INSERT/ON CONFLICT tail.  It also DELIBERATELY drops production's
+# ``AND timestamp > $5`` backfill-window bound: that bound only limits
+# which already-computed rows one incremental refresh emits (it never
+# changes a row's delta) and would restrict the legacy and cash result
+# sets identically, so dropping it lets the harness sweep the whole ET
+# day -- strictly more coverage, not less.  If the production CTE
+# structure changes, this test will silently drift unless
+# _flow_lag_same_session_clause itself is what changes -- in which case
+# the gating tests catch it.
 _PARITY_CTE = """
     WITH window_rows AS (
         SELECT
@@ -350,11 +356,19 @@ def test_legacy_and_cash_session_keying_diverge_only_at_session_boundaries():
         cause = _classify_divergence_cause(prior_ts, key[0], et)
         cause_counts[cause] += 1
         hour_buckets[_et_hour(key[0])] += 1
-        # neither_boundary -- both formulations should agree, didn't: bug.
-        # no_prior      -- the LAG-NULL branch is identical in both forms,
-        #                  so a divergent first-of-partition row can only
-        #                  exist if the SQL is mis-rendered: also a bug.
-        if cause in ("neither_boundary", "no_prior"):
+        # These three causes are all "the two formulations should have
+        # emitted the SAME value here, but didn't" -- i.e. contradictions
+        # that can only arise from a mis-rendered LAG-CASE or inconsistent
+        # session helpers:
+        #   neither_boundary -- neither sees a boundary, so both take the
+        #                       intra-session delta branch: must agree.
+        #   both_boundaries  -- each sees a boundary, so both take the
+        #                       absolute-volume branch (which doesn't depend
+        #                       on the session clause): must agree.
+        #   no_prior         -- the LAG-NULL branch is identical in both
+        #                       forms, so a divergent first-of-partition row
+        #                       can only exist if the SQL is mis-rendered.
+        if cause in ("neither_boundary", "both_boundaries", "no_prior"):
             unexplained.append((key, prior_ts))
         if len(samples_per_cause[cause]) < 3:
             # Three samples per cause is enough to eyeball "do the
@@ -390,12 +404,12 @@ def test_legacy_and_cash_session_keying_diverge_only_at_session_boundaries():
     diagnostic = "\n".join(diagnostic_lines) + "\n"
 
     if unexplained:
-        # The cash/legacy formulations differ at the LAG/current pair
-        # for a row where NEITHER formulation sees a session boundary --
-        # or where the LAG-NULL branch fired but the two indexes
-        # disagree.  Both cases imply the LAG-CASE SQL is mis-rendered
-        # or the date helpers return inconsistent results.  Surface up
-        # to ten so the failure message is actionable.
+        # Every divergence here has a cause that should have produced
+        # IDENTICAL values in both formulations (see the per-cause notes
+        # above): neither_boundary, both_boundaries, or no_prior.  Their
+        # presence implies the LAG-CASE SQL is mis-rendered or the date
+        # helpers return inconsistent results.  Surface up to ten so the
+        # failure message is actionable.
         sample = "\n".join(
             f"    {ts.astimezone(et).isoformat()} {sym}  "
             f"prior_ts={prior.astimezone(et).isoformat() if prior else 'NULL'}"
@@ -403,9 +417,11 @@ def test_legacy_and_cash_session_keying_diverge_only_at_session_boundaries():
         )
         pytest.fail(
             "Cash-session keying parity FAILED -- "
-            f"{len(unexplained)} divergences with no known structural cause.\n"
+            f"{len(unexplained)} divergences whose cause should have produced "
+            "identical values (LAG-CASE SQL mis-rendered or session helpers "
+            f"inconsistent).\n"
             f"{diagnostic}"
-            f"  example unexplained divergences:\n"
+            f"  example contradictory divergences:\n"
             f"{sample}"
         )
 
