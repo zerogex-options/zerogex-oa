@@ -3,7 +3,7 @@
 Captured during the May 21, 2026 investigation into the analytics
 `_get_snapshot` timeout wedge. The default-installed (or in our
 case Aurora-default on a small instance class) Postgres is sized
-for a workload with ~100 MB of hot data, not a 66 GB-table workload;
+for a workload with ~100 MB of hot data, not a tens-of-GB option-chains workload (~32 GB measured);
 left as-is it produces exactly the failure mode in that incident:
 every analytics cycle hits its `statement_timeout` because the buffer
 pool can't hold the working set warm between cycles.
@@ -141,7 +141,7 @@ the instance-level one RDS PG has:
    make psql -c 'SHOW shared_buffers;'
    ```
 
-### Sizing for a 66 GB working set
+### Sizing for the option_chains working set
 
 | Instance | RAM | Aurora-default shared_buffers | Working-set coverage |
 |---|---|---|---|
@@ -153,9 +153,16 @@ the instance-level one RDS PG has:
 
 There is no parameter tweak that gets you from "structurally cold every
 cycle" to "hot cycles" without enough actual RAM. The right answer for
-a 66 GB hot table is to upsize the writer; a parallel answer is to
-shrink the hot table (archive rows older than 7–14 days to a separate
-table that's cold-tier-only).
+a hot table this size is to upsize the writer; a parallel answer is to
+shrink the hot table (shorter `DATA_RETENTION_DAYS`, or archive old rows
+to a cold-tier table).
+
+> **Measured 2026-05-29:** `option_chains` is actually **~32 GB / 40.6M rows**
+> (≈90 days retained at the time), not the 66 GB estimated above — the estimate
+> was high (likely pre-vacuum bloat). Halve the table → roughly double the
+> coverage % per row of the table above; on the chosen **db.r6g.large (16 GB)**
+> the recent hot slice caches fully, confirmed by the post-resize flow-explain
+> (44 ms). Retention was subsequently cut to 60 days to trim the cold tail.
 
 **Applied 2026-05-28:** the writer was upsized **db.t3.small → db.r6g.large**
 (16 GB) when this failure mode resurfaced as `/api/flow` + `/api/gex` query
@@ -372,8 +379,8 @@ Those are the per-endpoint 10–15 s `asyncio.wait_for` guards in
 Storage I/O saturation on `db.t3.small` (2 GB RAM, gp3 100 GiB / 3000 IOPS),
 from two compounding instance-class limits:
 
-1. **2 GB RAM** → page cache far too small for the 66 GB hot set; nearly every
-   read missed cache and hit disk.
+1. **2 GB RAM** → page cache far too small for the ~32 GB table (then estimated
+   at 66 GB); nearly every read missed cache and hit disk.
 2. **t3 burstable EBS exhausted mid-session.** CloudWatch over the warning
    window showed the cliff: `TotalIOPS` ~3,100 → ~1,000, `ReadLatency` ~10 ms →
    30–44 ms, `DiskQueueDepth` → ~40 — the IOPS collapse landed at 16:10 UTC, the
@@ -396,11 +403,12 @@ isolated to the storage tier:
 
 ### Why r6g.large (16 GB), not m6g.large (8 GB)
 
-Against the 66 GB hot table (sizing table above): 8 GB is ~9 % coverage (flow/gex
-cache but get evicted by `option_chains` scans); 16 GB is ~18 % — the "cycle 2+
-stays warm" entry point. `db.r6g.large` is the current-gen Graviton equivalent of
-the table's `db.r5.large`, with **sustained** (non-burstable) EBS — which is what
-removes the t3 cliff. r-class (more RAM per vCPU) fits a RAM/IO-bound workload
+The decisive reason for r-class was **sustained, non-burstable EBS** to escape
+the t3 burst cliff — RAM was secondary. On the measured ~32 GB table (the sizing
+table above over-estimated 66 GB), 16 GB covers roughly half, and the recent hot
+slice the live engines + flow/gex reads actually touch caches fully (post-resize
+flow-explain: 44 ms). `db.r6g.large` is the current-gen Graviton equivalent of the
+table's `db.r5.large`; r-class (more RAM per vCPU) fits a RAM/IO-bound workload
 better than m-class.
 
 ### Changes applied
