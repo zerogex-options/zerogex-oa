@@ -26,12 +26,15 @@ import os
 _PINNED_DEFAULTS = {
     # src/api/database.py: DatabaseManager.__init__
     "FLOW_SERIES_USE_SNAPSHOT": "false",
-    # src/analytics/main_engine.py: AnalyticsEngine.__init__ (use_latest_cache).
-    # Operators that enable the option_chains_latest cache in prod set this to
-    # true; without pinning it, the analytics snapshot tests inherit that and
-    # take the cache path they don't mock, failing on the server while CI (no
-    # .env) stays green. Cache-path tests opt in via engine.use_latest_cache.
+    # src/analytics/main_engine.py: AnalyticsEngine.__init__. These two flags
+    # each add a DB round-trip to _get_snapshot (the cache query / the
+    # extended-hours spot re-anchor fetchone). The snapshot tests mock an exact
+    # fetchone/fetchall sequence for the legacy path, so an operator .env that
+    # enables either flag desyncs the mocks (StopIteration) — failing on the
+    # server while CI (no .env) stays green. Pin both to their code defaults;
+    # cache-path tests opt in via engine.use_latest_cache on the instance.
     "ANALYTICS_USE_LATEST_CACHE": "false",
+    "ANALYTICS_SPOT_ANCHORED_EXTENDED_HOURS": "false",
     # src/config.py module-level constants
     "MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS": "SPY,SPX,QQQ",
     "SIGNALS_BREAKOUT_SIZE_MULTIPLIER": "1.50",
