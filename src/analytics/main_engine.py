@@ -701,12 +701,11 @@ class AnalyticsEngine:
                 rows: Optional[List[Any]] = None
                 # Track whether the cache returned an empty result so we
                 # can log the right thing AFTER the fallback runs.  A cache
-                # exception (cache_error_logged below) is a different signal
-                # -- something broken, log immediately; cache-empty is only
-                # a real warning if the fallback actually finds rows, since
-                # post-close / weekend snapshots are legitimately empty.
+                # exception is a different signal -- something broken, log
+                # immediately; cache-empty is only a real warning if the
+                # fallback actually finds rows, since post-close / weekend
+                # snapshots are legitimately empty.
                 cache_returned_empty = False
-                cache_error_logged = False
                 if self.use_latest_cache:
                     try:
                         rows = self._run_snapshot_query_from_cache(
@@ -737,7 +736,6 @@ class AnalyticsEngine:
                             exc_info=True,
                         )
                         rows = None
-                        cache_error_logged = True
                     else:
                         if not rows:
                             # Don't warn yet -- defer the decision until we
