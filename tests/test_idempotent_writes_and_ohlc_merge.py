@@ -153,6 +153,42 @@ def test_underlying_upsert_skipped_during_circuit_breaker(monkeypatch):
     assert sink == []
 
 
+def test_store_underlying_buckets_close_stamped_bar_to_its_own_minute(monkeypatch):
+    """``_store_underlying`` must store a close-stamped bar on the minute it
+    COVERS, not the next one. TradeStation close-stamps each 1-min bar at its
+    END boundary, so the raw timestamp is one interval ahead; storing it
+    verbatim put the underlying bucket a minute ahead of the contemporaneous
+    option bucket and broke the analytics ``<= option_ts`` pairing at the open.
+    """
+    e = _underlying_engine()
+    e.db_symbol = "SPX"
+    e._last_underlying_signature = None
+    e.latest_underlying_price = None
+    e.latest_underlying_timestamp = None
+    monkeypatch.setattr(e, "_log_parity_signature", lambda *a, **k: None)
+    captured: dict = {}
+    monkeypatch.setattr(e, "_upsert_underlying_quote", lambda payload: captured.update(payload))
+
+    # 14:38:00 close-stamp == the 14:37:00–14:38:00 bar.
+    raw_ts = datetime(2026, 5, 15, 14, 38, 0, tzinfo=timezone.utc)
+    e._store_underlying(
+        {
+            "timestamp": raw_ts,
+            "open": 5500.0,
+            "high": 5505.0,
+            "low": 5498.0,
+            "close": 5502.0,
+            "up_volume": 10,
+            "down_volume": 5,
+        }
+    )
+
+    # Stored on the bar's own minute (one bucket back from the close stamp).
+    assert captured["timestamp"] == datetime(2026, 5, 15, 14, 37, 0, tzinfo=timezone.utc)
+    # The in-memory Greeks anchor intentionally keeps the RAW close stamp.
+    assert e.latest_underlying_timestamp == raw_ts
+
+
 # ===========================================================================
 # #5b — signal_action_cards idempotent insert (sync + async writers)
 # ===========================================================================
