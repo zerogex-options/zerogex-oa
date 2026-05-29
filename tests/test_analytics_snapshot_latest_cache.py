@@ -87,13 +87,14 @@ def _snapshot_ts():
 # Flag default off: cache is invisible.
 # ---------------------------------------------------------------------------
 
+
 def test_default_off_flag_skips_cache_query_entirely():
     """Without the env var set, _get_snapshot runs the legacy history
     query and never touches option_chains_latest."""
     engine = AnalyticsEngine(underlying="SPY")
-    assert engine.use_latest_cache is False, (
-        "default must be off so just-deploying the code is a no-op"
-    )
+    assert (
+        engine.use_latest_cache is False
+    ), "default must be off so just-deploying the code is a no-op"
 
     snapshot_ts = _snapshot_ts()
     expiration = snapshot_ts.astimezone(ET).date() + timedelta(days=7)
@@ -104,9 +105,9 @@ def test_default_off_flag_skips_cache_query_entirely():
         result = engine._get_snapshot()
 
     sqls = _execute_sqls(cursor)
-    assert not any("option_chains_latest" in s for s in sqls), (
-        "cache query must NOT run when flag is off"
-    )
+    assert not any(
+        "option_chains_latest" in s for s in sqls
+    ), "cache query must NOT run when flag is off"
     # Legacy history query still ran.
     assert any("DISTINCT ON" in s for s in sqls)
     assert result is not None and len(result["options"]) == 1
@@ -115,6 +116,7 @@ def test_default_off_flag_skips_cache_query_entirely():
 # ---------------------------------------------------------------------------
 # Flag on, cache populated: cache query runs; history query does NOT.
 # ---------------------------------------------------------------------------
+
 
 def test_cache_populated_skips_history_query():
     """When the cache returns rows, the legacy DISTINCT ON query
@@ -132,19 +134,18 @@ def test_cache_populated_skips_history_query():
 
     sqls = _execute_sqls(cursor)
     # Cache query ran.
-    assert any("option_chains_latest" in s for s in sqls), (
-        "cache query must run when flag is on"
-    )
+    assert any("option_chains_latest" in s for s in sqls), "cache query must run when flag is on"
     # Legacy DISTINCT ON path did NOT run -- the whole point.
-    assert not any("DISTINCT ON" in s for s in sqls), (
-        "history DISTINCT ON must not run when cache returns rows"
-    )
+    assert not any(
+        "DISTINCT ON" in s for s in sqls
+    ), "history DISTINCT ON must not run when cache returns rows"
     assert result is not None and len(result["options"]) == 1
 
 
 # ---------------------------------------------------------------------------
 # Flag on, cache empty: warning + fallback to history.
 # ---------------------------------------------------------------------------
+
 
 def test_cache_empty_falls_back_to_history(caplog):
     """An empty cache (warm-up, stale weekend, etc.) must transparently
@@ -184,9 +185,9 @@ def test_cache_empty_falls_back_to_history(caplog):
     # that history actually had -- that's a real signal worth surfacing
     # (cache lookback / dual-write health).
     cache_warnings = [
-        r for r in caplog.records
-        if r.levelname == "WARNING"
-        and "option_chains_latest cache returned 0 rows" in r.message
+        r
+        for r in caplog.records
+        if r.levelname == "WARNING" and "option_chains_latest cache returned 0 rows" in r.message
     ]
     assert cache_warnings, "operator must see the cache-stale warning"
     # And the message must mention the fallback row count so the operator
@@ -197,6 +198,7 @@ def test_cache_empty_falls_back_to_history(caplog):
 # ---------------------------------------------------------------------------
 # Flag on, BOTH cache and history empty: no cache warning (genuine no-data).
 # ---------------------------------------------------------------------------
+
 
 def test_cache_empty_AND_history_empty_does_not_warn(caplog):
     """When the cache returns 0 rows AND the history fallback also
@@ -238,9 +240,9 @@ def test_cache_empty_AND_history_empty_does_not_warn(caplog):
             engine._get_snapshot()
 
     cache_warnings = [
-        r for r in caplog.records
-        if r.levelname == "WARNING"
-        and "option_chains_latest cache returned 0 rows" in r.message
+        r
+        for r in caplog.records
+        if r.levelname == "WARNING" and "option_chains_latest cache returned 0 rows" in r.message
     ]
     assert not cache_warnings, (
         "genuine no-data state must NOT emit the cache-stale warning; "
@@ -251,6 +253,7 @@ def test_cache_empty_AND_history_empty_does_not_warn(caplog):
 # ---------------------------------------------------------------------------
 # Flag on, cache read raises: warning + fallback to history.
 # ---------------------------------------------------------------------------
+
 
 def test_cache_read_error_falls_back_to_history(caplog):
     """If the cache query raises (transient connection blip, table
@@ -284,14 +287,13 @@ def test_cache_read_error_falls_back_to_history(caplog):
     # Engine rolled back the failed cache transaction and ran history.
     conn.rollback.assert_called()
     assert result is not None and len(result["options"]) == 1
-    assert any(
-        "option_chains_latest cache read failed" in r.message for r in caplog.records
-    )
+    assert any("option_chains_latest cache read failed" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
 # Cache SQL shape.
 # ---------------------------------------------------------------------------
+
 
 def test_cache_sql_reads_from_option_chains_latest_no_distinct_on():
     """The cache query targets the cache table and does NOT use
@@ -345,6 +347,7 @@ def test_cache_query_receives_same_param_contract_as_history():
 # Cold-start latch interaction.
 # ---------------------------------------------------------------------------
 
+
 def test_first_cycle_latch_flips_even_when_cache_returns_rows():
     """``_snapshot_cold_start_consumed`` must flip on cycle 1 regardless
     of which path served the rows.  A later fallback (cache→history on
@@ -361,6 +364,6 @@ def test_first_cycle_latch_flips_even_when_cache_returns_rows():
     with patch.object(main_engine, "db_connection", return_value=cm):
         engine._get_snapshot()
 
-    assert engine._snapshot_cold_start_consumed is True, (
-        "first cycle must consume the cold-start latch on the cache path too"
-    )
+    assert (
+        engine._snapshot_cold_start_consumed is True
+    ), "first cycle must consume the cold-start latch on the cache path too"

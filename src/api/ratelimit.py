@@ -50,14 +50,53 @@ _WINDOW = int(os.getenv("END_USER_RATE_LIMIT_WINDOW_SECONDS", "60") or "60")
 _MAX_KEYS = int(os.getenv("END_USER_RATE_LIMIT_MAX_KEYS", "100000") or "100000")
 
 
+def _parse_trusted_proxies() -> frozenset[str]:
+    """Trusted reverse-proxy IPs from ``RATE_LIMIT_TRUSTED_PROXIES``.
+
+    Comma-separated. When empty (default), X-Forwarded-For is never
+    consulted and the rate-limit bucket falls back to the direct peer
+    IP — the pre-existing behavior.
+    """
+    raw = os.getenv("RATE_LIMIT_TRUSTED_PROXIES", "")
+    return frozenset(p.strip() for p in raw.split(",") if p.strip())
+
+
+_TRUSTED_PROXIES = _parse_trusted_proxies()
+
+
+def _client_ip(request: Request) -> str:
+    """Resolve the real client IP for rate-limit bucketing.
+
+    Behind a reverse proxy the direct peer (``request.client.host``) is
+    the proxy itself, so every anonymous request collides into one
+    bucket — turning the per-IP limit into a single global counter (or,
+    if X-Forwarded-For were trusted blindly, into a trivially spoofable
+    one). We only consult X-Forwarded-For when the *direct peer* is in
+    the operator-configured ``RATE_LIMIT_TRUSTED_PROXIES`` set, then walk
+    the chain right-to-left past any further trusted hops to the first
+    untrusted address (the real client). Otherwise we use the peer IP
+    directly — XFF from an untrusted peer is attacker-controlled and
+    ignored.
+    """
+    host = request.client.host if request.client else "unknown"
+    if not _TRUSTED_PROXIES or host not in _TRUSTED_PROXIES:
+        return host
+    xff = request.headers.get("X-Forwarded-For", "")
+    chain = [ip.strip() for ip in xff.split(",") if ip.strip()]
+    for ip in reversed(chain):
+        if ip not in _TRUSTED_PROXIES:
+            return ip
+    # Whole chain was trusted proxies (or XFF absent) — fall back to peer.
+    return host
+
+
 def rate_limit_key(identity, request: Request) -> str:
     """Most-specific stable bucket key: end-user > caller > client IP."""
     if getattr(identity, "end_user_id", None):
         return f"eu:{identity.end_user_id}"
     if getattr(identity, "caller_user_id", None):
         return f"cu:{identity.caller_user_id}"
-    host = request.client.host if request.client else "unknown"
-    return f"ip:{host}"
+    return f"ip:{_client_ip(request)}"
 
 
 # key -> (window_start_epoch, count). Per-worker; see module docstring.

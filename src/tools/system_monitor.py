@@ -54,7 +54,7 @@ logger = logging.getLogger("zerogex.system_monitor")
 
 DEFAULT_STATE_FILE = "~/monitoring/state.json"
 DEFAULT_HOURLY_RETENTION = 720  # 30 days of hourly buckets
-DEFAULT_DAILY_RETENTION = 90    # 90 days of daily buckets
+DEFAULT_DAILY_RETENTION = 90  # 90 days of daily buckets
 DEFAULT_SERVICES = (
     "zerogex-oa-ingestion",
     "zerogex-oa-analytics",
@@ -232,11 +232,7 @@ def sample_memory_percent() -> float | None:
     available = meminfo.get("MemAvailable")
     if available is None:
         # Pre-3.14 fallback: free + buffers + cached
-        available = (
-            meminfo.get("MemFree", 0)
-            + meminfo.get("Buffers", 0)
-            + meminfo.get("Cached", 0)
-        )
+        available = meminfo.get("MemFree", 0) + meminfo.get("Buffers", 0) + meminfo.get("Cached", 0)
     if total <= 0:
         return None
     used = max(0, total - available)
@@ -316,7 +312,9 @@ def journalctl_lines(
     if proc.returncode != 0:
         logger.warning(
             "journalctl %s exit=%s stderr=%s",
-            service, proc.returncode, proc.stderr.strip()[:200],
+            service,
+            proc.returncode,
+            proc.stderr.strip()[:200],
         )
         return []
     return proc.stdout.splitlines()
@@ -454,9 +452,7 @@ def _aggregate_bucket(
                 latest = v
                 break
         metrics[key] = {"latest": latest}
-    metrics["errors_by_service"] = _sum_by_service(
-        [s.errors_by_service for s in samples], services
-    )
+    metrics["errors_by_service"] = _sum_by_service([s.errors_by_service for s in samples], services)
     metrics["warnings_by_service"] = _sum_by_service(
         [s.warnings_by_service for s in samples], services
     )
@@ -630,9 +626,7 @@ def _migrate_state_in_place(state: dict[str, Any]) -> None:
 def save_state(path: Path, state: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # Atomic write so a crash mid-write never leaves a partial JSON file.
-    fd, tmp_path = tempfile.mkstemp(
-        prefix=".state.", suffix=".tmp", dir=str(path.parent)
-    )
+    fd, tmp_path = tempfile.mkstemp(prefix=".state.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(state, fh, separators=(",", ":"), sort_keys=False)
@@ -815,7 +809,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="With --show, emit raw JSON instead of a human summary.",
     )
     parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Enable INFO-level logging to stderr.",
     )
@@ -837,16 +832,24 @@ def _summarise(state: dict[str, Any]) -> str:
             continue
         latest = entries[-1]
         metrics = latest.get("metrics") or {}
-        lines.append(f"{label} bucket: {latest.get('bucket_start')} "
-                     f"(samples={metrics.get('sample_count')})")
-        lines.append(f"  {'cpu_pct':<20s} max={_fmt(metrics.get('cpu_pct', {}).get('max'))} "
-                     f"avg={_fmt(metrics.get('cpu_pct', {}).get('avg'))}")
-        lines.append(f"  {'mem_pct':<20s} max={_fmt(metrics.get('mem_pct', {}).get('max'))} "
-                     f"avg={_fmt(metrics.get('mem_pct', {}).get('avg'))}")
+        lines.append(
+            f"{label} bucket: {latest.get('bucket_start')} "
+            f"(samples={metrics.get('sample_count')})"
+        )
+        lines.append(
+            f"  {'cpu_pct':<20s} max={_fmt(metrics.get('cpu_pct', {}).get('max'))} "
+            f"avg={_fmt(metrics.get('cpu_pct', {}).get('avg'))}"
+        )
+        lines.append(
+            f"  {'mem_pct':<20s} max={_fmt(metrics.get('mem_pct', {}).get('max'))} "
+            f"avg={_fmt(metrics.get('mem_pct', {}).get('avg'))}"
+        )
         cyc = metrics.get("cycle_time_s") or {}
-        lines.append(f"  {'cycle_time_s':<20s} max={_fmt(cyc.get('max'))} "
-                     f"avg={_fmt(cyc.get('avg'))} median={_fmt(cyc.get('median'))} "
-                     f"(n={cyc.get('count') or 0})")
+        lines.append(
+            f"  {'cycle_time_s':<20s} max={_fmt(cyc.get('max'))} "
+            f"avg={_fmt(cyc.get('avg'))} median={_fmt(cyc.get('median'))} "
+            f"(n={cyc.get('count') or 0})"
+        )
         for k, v in metrics.items():
             if not k.startswith("disk_"):
                 continue

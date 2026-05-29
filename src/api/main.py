@@ -206,8 +206,22 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
     allow_credentials=allow_credentials,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    # The API surface is entirely read-only GETs (verified: no POST/PUT/
+    # PATCH/DELETE routes), so there is no reason to advertise mutating
+    # methods or a wildcard header set to cross-origin callers. Narrow to
+    # exactly what the browser clients send. ``allow_headers`` enumerates
+    # the auth + correlation headers the app actually reads
+    # (``security.api_key_auth``, ``identity``, ``middleware``) plus the
+    # standard content-negotiation pair.
+    allow_methods=["GET", "HEAD", "OPTIONS"],
+    allow_headers=[
+        "Authorization",
+        "X-API-Key",
+        "X-Request-Id",
+        "X-End-User-Token",
+        "Content-Type",
+        "Accept",
+    ],
 )
 
 # Compress responses so that large JSON payloads from endpoints like

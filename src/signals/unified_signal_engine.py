@@ -120,9 +120,7 @@ class UnifiedSignalEngine:
             pass
 
     @staticmethod
-    def _estimate_dealer_net_delta(
-        gex_strike_rows: list[dict], spot: float
-    ) -> float:
+    def _estimate_dealer_net_delta(gex_strike_rows: list[dict], spot: float) -> float:
         """Return dealer net delta (shares-equivalent) from per-strike rows.
 
         Single source of truth for the DNI estimate consumed by
@@ -477,9 +475,7 @@ class UnifiedSignalEngine:
                 # in each signal is dead code; they all silently re-derive
                 # the same number from ``gex_by_strike``.  Computed here so
                 # we don't repeat the work three times per cycle.
-                dealer_net_delta = self._estimate_dealer_net_delta(
-                    gex_strike_rows, close_f
-                )
+                dealer_net_delta = self._estimate_dealer_net_delta(gex_strike_rows, close_f)
 
                 # Read canonical Call/Put Wall from the latest gex_summary row
                 # (written by the Analytics Engine using
@@ -786,9 +782,9 @@ class UnifiedSignalEngine:
                         "Flow-asymmetry pillar will be 0 until ingestion catches up.",
                         self.db_symbol,
                     )
-                elif (call_flow_delta != 0.0 or put_flow_delta != 0.0) and self._flow_missing_logged.get(
-                    self.db_symbol
-                ):
+                elif (
+                    call_flow_delta != 0.0 or put_flow_delta != 0.0
+                ) and self._flow_missing_logged.get(self.db_symbol):
                     # Clear the latch when data returns so a future outage
                     # is logged again.
                     self._flow_missing_logged[self.db_symbol] = False

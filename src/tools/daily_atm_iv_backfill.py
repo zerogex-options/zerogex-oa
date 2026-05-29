@@ -40,9 +40,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_SYMBOLS = ["SPY", "QQQ", "SPX"]
 
 
-def _backfill_symbol(
-    symbol: str, days: int, statement_timeout_ms: int
-) -> tuple[int, int]:
+def _backfill_symbol(symbol: str, days: int, statement_timeout_ms: int) -> tuple[int, int]:
     """Backfill one symbol.  Returns (days_written, days_skipped).
 
     Per-symbol transaction with ``SET LOCAL statement_timeout`` so a

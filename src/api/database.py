@@ -2960,9 +2960,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     elif bucket["gamma_flip"] is None and r.get("gamma_flip") is not None:
                         bucket["gamma_flip"] = r.get("gamma_flip")
                         bucket["gamma_flip_span_used"] = r.get("gamma_flip_span_used")
-                    bucket["heatmap"].append(
-                        {"strike": r["strike"], "net_gex": r["net_gex"]}
-                    )
+                    bucket["heatmap"].append({"strike": r["strike"], "net_gex": r["net_gex"]})
                 result = list(grouped.values())
                 self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
                 return result

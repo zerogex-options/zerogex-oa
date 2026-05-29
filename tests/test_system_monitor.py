@@ -33,7 +33,6 @@ from src.tools.system_monitor import (
     save_state,
 )
 
-
 # ---------------------------------------------------------------------------
 # Log-line parsers
 # ---------------------------------------------------------------------------
@@ -82,11 +81,16 @@ def test_extract_stage_timing_totals_handles_multiple_and_integers():
 
 
 def test_extract_stage_timing_totals_ignores_non_matching_lines():
-    assert extract_stage_timing_totals([
-        "Stage timings: snapshot=1s",      # legacy 'no total' format
-        "Stage timings (total: 3s)",       # malformed
-        "",
-    ]) == []
+    assert (
+        extract_stage_timing_totals(
+            [
+                "Stage timings: snapshot=1s",  # legacy 'no total' format
+                "Stage timings (total: 3s)",  # malformed
+                "",
+            ]
+        )
+        == []
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -98,10 +102,12 @@ def test_cpu_percent_between_basic_arithmetic():
     """Idle goes from 80 -> 90 (delta 10), total from 100 -> 120 (delta 20).
     Non-idle fraction = (20-10)/20 = 50%.
     """
-    prev = CpuStat(captured_at=0.0, user=10, nice=0, system=10, idle=80,
-                   iowait=0, irq=0, softirq=0, steal=0)
-    curr = CpuStat(captured_at=60.0, user=15, nice=0, system=15, idle=90,
-                   iowait=0, irq=0, softirq=0, steal=0)
+    prev = CpuStat(
+        captured_at=0.0, user=10, nice=0, system=10, idle=80, iowait=0, irq=0, softirq=0, steal=0
+    )
+    curr = CpuStat(
+        captured_at=60.0, user=15, nice=0, system=15, idle=90, iowait=0, irq=0, softirq=0, steal=0
+    )
     pct = cpu_percent_between(prev, curr)
     assert pct == pytest.approx(50.0)
 
@@ -110,10 +116,12 @@ def test_cpu_percent_between_iowait_counted_as_idle():
     """The kernel convention: iowait is "not really busy" — fold it into idle.
     Without this, a box waiting on disk would look 100% busy.
     """
-    prev = CpuStat(captured_at=0.0, user=0, nice=0, system=0, idle=50,
-                   iowait=50, irq=0, softirq=0, steal=0)
-    curr = CpuStat(captured_at=60.0, user=0, nice=0, system=0, idle=60,
-                   iowait=60, irq=0, softirq=0, steal=0)
+    prev = CpuStat(
+        captured_at=0.0, user=0, nice=0, system=0, idle=50, iowait=50, irq=0, softirq=0, steal=0
+    )
+    curr = CpuStat(
+        captured_at=60.0, user=0, nice=0, system=0, idle=60, iowait=60, irq=0, softirq=0, steal=0
+    )
     # idle+iowait went 100 -> 120 (delta 20), total 100 -> 120 (delta 20) → 0% busy.
     assert cpu_percent_between(prev, curr) == pytest.approx(0.0)
 
@@ -121,8 +129,9 @@ def test_cpu_percent_between_iowait_counted_as_idle():
 def test_cpu_percent_between_returns_none_on_zero_delta():
     """Two reads inside the same jiffy — refusing to divide by zero is the
     only correct behavior; returning 0 would lie about the load."""
-    stat = CpuStat(captured_at=0.0, user=1, nice=0, system=1, idle=1,
-                   iowait=0, irq=0, softirq=0, steal=0)
+    stat = CpuStat(
+        captured_at=0.0, user=1, nice=0, system=1, idle=1, iowait=0, irq=0, softirq=0, steal=0
+    )
     assert cpu_percent_between(stat, stat) is None
 
 
@@ -192,12 +201,25 @@ def test_aggregate_bucket_basic_shape():
     services = ["zerogex-oa-analytics"]
     mounts = ["/", "/var/log"]
     samples = [
-        _make_sample(datetime(2026, 5, 26, 10, 0), cpu=10, mem=50,
-                     cycles=[1.0, 2.0], disk_root=89.0, disk_log=12.0),
-        _make_sample(datetime(2026, 5, 26, 10, 1), cpu=20, mem=55,
-                     cycles=[3.0], disk_root=89.5, disk_log=12.5),
-        _make_sample(datetime(2026, 5, 26, 10, 2), cpu=30, mem=60,
-                     cycles=[], disk_root=90.0, disk_log=13.0),
+        _make_sample(
+            datetime(2026, 5, 26, 10, 0),
+            cpu=10,
+            mem=50,
+            cycles=[1.0, 2.0],
+            disk_root=89.0,
+            disk_log=12.0,
+        ),
+        _make_sample(
+            datetime(2026, 5, 26, 10, 1),
+            cpu=20,
+            mem=55,
+            cycles=[3.0],
+            disk_root=89.5,
+            disk_log=12.5,
+        ),
+        _make_sample(
+            datetime(2026, 5, 26, 10, 2), cpu=30, mem=60, cycles=[], disk_root=90.0, disk_log=13.0
+        ),
     ]
     out = _aggregate_bucket(samples, mounts, services)
     assert out["sample_count"] == 3
@@ -312,8 +334,10 @@ def test_fold_sample_retention_trims_oldest():
         fold_sample(
             state,
             _make_sample(base + timedelta(hours=h), cpu=10.0 * h),
-            mounts, services,
-            hourly_retention=3, daily_retention=90,
+            mounts,
+            services,
+            hourly_retention=3,
+            daily_retention=90,
         )
     assert len(state["hourly"]) == 3
     starts = [b["bucket_start"] for b in state["hourly"]]
@@ -330,13 +354,20 @@ def test_fold_sample_aggregates_error_counts_across_minutes():
     fold_sample(
         state,
         _make_sample(base, errs={"zerogex-oa-analytics": 2, "zerogex-oa-api": 0}),
-        mounts, services, 720, 90,
+        mounts,
+        services,
+        720,
+        90,
     )
     fold_sample(
         state,
-        _make_sample(base + timedelta(minutes=5),
-                     errs={"zerogex-oa-analytics": 3, "zerogex-oa-api": 1}),
-        mounts, services, 720, 90,
+        _make_sample(
+            base + timedelta(minutes=5), errs={"zerogex-oa-analytics": 3, "zerogex-oa-api": 1}
+        ),
+        mounts,
+        services,
+        720,
+        90,
     )
     errs = state["hourly"][-1]["metrics"]["errors_by_service"]
     assert errs == {"zerogex-oa-analytics": 5, "zerogex-oa-api": 1}
@@ -396,7 +427,7 @@ def test_load_state_migrates_v1_disk_shape_in_place(tmp_path: Path):
                 "bucket_start": "2026-05-26T10:00:00",
                 "metrics": {
                     "cpu_pct": {"max": 50.0, "avg": 30.0},
-                    "disk_root_pct":    {"max": 90.0, "avg": 89.5},
+                    "disk_root_pct": {"max": 90.0, "avg": 89.5},
                     "disk_var_log_pct": {"max": 14.0, "avg": 13.5},
                 },
             },
@@ -444,12 +475,21 @@ def test_run_once_persists_sample_and_rolls_cpu_state(tmp_path: Path, monkeypatc
     state_path = tmp_path / "state.json"
 
     def fake_cpu(prev):
-        return 42.0, CpuStat(captured_at=fake_now.timestamp(), user=1, nice=0,
-                             system=1, idle=10, iowait=0, irq=0, softirq=0, steal=0)
+        return 42.0, CpuStat(
+            captured_at=fake_now.timestamp(),
+            user=1,
+            nice=0,
+            system=1,
+            idle=10,
+            iowait=0,
+            irq=0,
+            softirq=0,
+            steal=0,
+        )
+
     monkeypatch.setattr(sm, "sample_cpu_percent", fake_cpu)
     monkeypatch.setattr(sm, "sample_memory_percent", lambda: 58.5)
-    monkeypatch.setattr(sm, "sample_disk_percents",
-                        lambda mounts: {"/": 90.0, "/var/log": 13.0})
+    monkeypatch.setattr(sm, "sample_disk_percents", lambda mounts: {"/": 90.0, "/var/log": 13.0})
 
     captured = {}
 
@@ -462,6 +502,7 @@ def test_run_once_persists_sample_and_rolls_cpu_state(tmp_path: Path, monkeypatc
                 "2026-05-26 10:30:00 - __main__ - ERROR - [request_id=-] oops",
             ]
         return ["2026-05-26 10:30:00 - __main__ - WARNING - [request_id=-] note"]
+
     monkeypatch.setattr(sm, "journalctl_lines", fake_journal)
 
     state = run_once(
@@ -485,10 +526,12 @@ def test_run_once_persists_sample_and_rolls_cpu_state(tmp_path: Path, monkeypatc
     assert metrics["disk_var_log_pct"] == {"latest": 13.0}
     assert metrics["cycle_time_s"]["max"] == 3.62
     assert metrics["errors_by_service"] == {
-        "zerogex-oa-analytics": 1, "zerogex-oa-api": 0,
+        "zerogex-oa-analytics": 1,
+        "zerogex-oa-api": 0,
     }
     assert metrics["warnings_by_service"] == {
-        "zerogex-oa-analytics": 1, "zerogex-oa-api": 1,
+        "zerogex-oa-analytics": 1,
+        "zerogex-oa-api": 1,
     }
     # CPU snapshot was carried over for the next run.
     assert "last_cpu_stat" in state

@@ -194,7 +194,21 @@ def test_heatmap_returns_mapped_rows():
     _install_conn(db, conn)
 
     result = asyncio.run(db.get_gex_heatmap("spy", "5min", 60))
-    assert result == rows
+    # get_gex_heatmap groups the flat (timestamp, strike) DB rows into one
+    # object per bucket: gamma_flip / gamma_flip_span_used carried once
+    # (None here -- these mock rows omit those columns) plus a ``heatmap``
+    # array of {strike, net_gex} in the query's strike-ascending order.
+    assert result == [
+        {
+            "timestamp": "2026-05-15T20:00:00Z",
+            "gamma_flip": None,
+            "gamma_flip_span_used": None,
+            "heatmap": [
+                {"strike": 585.0, "net_gex": 1.2e9},
+                {"strike": 586.0, "net_gex": -3.4e8},
+            ],
+        }
+    ]
 
 
 def test_heatmap_window_units_clamped_to_300():
