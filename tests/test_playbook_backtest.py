@@ -286,6 +286,23 @@ def test_proposed_base_smoothing_pulls_toward_50pct():
     assert 0.45 < proposed < 0.65
 
 
+def test_proposed_base_reports_losing_pattern_below_old_clamp_floor():
+    """A genuinely losing pattern must report its raw smoothed rate, NOT be
+    floored to 0.40. Ten resolved stop-outs => 5/(10+10) = 0.25; the removed
+    clamp would have masked this as 0.40."""
+    base_ts = datetime(2026, 5, 1, 14, 0, tzinfo=timezone.utc)
+    outcomes = [
+        CardOutcome(card=_card(pattern="loser", timestamp=base_ts), outcome="stop_hit")
+        for _ in range(10)
+    ]
+    stats = aggregate(
+        outcomes, underlying="SPY", window_start=date(2026, 4, 1), window_end=date(2026, 5, 1)
+    )
+    proposed = stats[0].proposed_base
+    assert proposed is not None
+    assert abs(proposed - 0.25) < 1e-9  # raw 5/(10+10), unclamped (was floored to 0.40)
+
+
 def test_aggregate_no_data_outcomes_count_in_emitted_only():
     base_ts = datetime(2026, 5, 1, 14, 0, tzinfo=timezone.utc)
     outcomes = [

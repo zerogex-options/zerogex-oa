@@ -169,17 +169,23 @@ class PatternStats:
 
     @property
     def proposed_base(self) -> Optional[float]:
-        """Beta-smoothed empirical base, clamped to [0.40, 0.85].
+        """Raw beta-smoothed empirical win rate. Returns None when there's
+        nothing to estimate from.
 
-        Mirrors the spec range for ``pattern_base`` in §5 of the catalog.
-        Returns None when there's nothing to estimate from.
+        This is a *measurement* written to ``playbook_pattern_stats`` for
+        review, not a live input. It is deliberately NOT clamped to the
+        catalog's [0.40, 0.85] ``pattern_base`` band: clamping the floor here
+        reports a genuinely losing pattern (e.g. a 25%-win setup) as 0.40,
+        hiding the very signal this harness exists to surface. The
+        [0.40, 0.85] band belongs at the live-confidence consumer if/when these
+        numbers are wired into sizing — applied to the value, not baked into
+        the recorded statistic.
         """
         if self.n_resolved == 0:
             return None
         wins = self.n_target_hit + _PRIOR_ALPHA
         total = self.n_resolved + _PRIOR_ALPHA + _PRIOR_BETA
-        raw = wins / total
-        return max(0.40, min(0.85, raw))
+        return wins / total
 
 
 # ---------------------------------------------------------------------------
