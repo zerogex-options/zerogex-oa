@@ -35,6 +35,13 @@ _PINNED_DEFAULTS = {
     # cache-path tests opt in via engine.use_latest_cache on the instance.
     "ANALYTICS_USE_LATEST_CACHE": "false",
     "ANALYTICS_SPOT_ANCHORED_EXTENDED_HOURS": "false",
+    # src/config.py default (also .env.example). The in-session close-stamp
+    # re-anchor in _get_snapshot keys both its staleness threshold and its
+    # forward-bar search window (2 x bucket) off this. Its regression test
+    # places the fresh bar at open+60s, so an operator .env overriding the
+    # bucket moves that bar outside the search window and the re-anchor test
+    # fails on the server while CI (no .env) stays green. Pin to the default.
+    "AGGREGATION_BUCKET_SECONDS": "60",
     # src/config.py module-level constants
     "MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS": "SPY,SPX,QQQ",
     "SIGNALS_BREAKOUT_SIZE_MULTIPLIER": "1.50",
