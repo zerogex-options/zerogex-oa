@@ -51,6 +51,7 @@ from src.config import (
     OPTION_BUCKET_WRITE_MIN_SECONDS,
     FLOW_CLASSIFY_MID_BAND_PCT,
     FLOW_CLASSIFY_SKIP_OPEN_AUCTION,
+    FLOW_CLASSIFY_PRIOR_TICK_MAX_AGE_SECONDS,
     SESSION_TEMPLATE,
 )
 
@@ -105,6 +106,10 @@ class _FlowAccumulator:
     last_bid: Optional[float] = None
     last_ask: Optional[float] = None
     last_mid: Optional[float] = None
+    # Timestamp of the snapshot whose NBBO is currently stored in
+    # last_bid/last_ask/last_mid.  Used to age-check the prior tick before
+    # trusting it as the pre-trade quote (see _select_classify_quote).
+    last_quote_ts: Optional[datetime] = None
 
 
 def _compute_db_backoff_seconds(consecutive_failures: int) -> float:
@@ -773,6 +778,62 @@ class IngestionEngine:
         self._option_bucket_last_write[key] = now_mono
         return True
 
+    def _select_classify_quote(
+        self, acc: "_FlowAccumulator", snap: Dict[str, Any]
+    ) -> tuple:
+        """Pick the NBBO to classify ``snap``'s trade against.
+
+        Prefer the **prior tick** (``acc.last_*`` — the quote prevailing
+        before this trade): it keeps a marketable order from being scored
+        against the post-trade NBBO it just moved, which is the failure
+        mode the prior-tick rule exists to avoid.
+
+        But the prior tick is only a valid pre-trade proxy when it is
+        *recent*.  On a contract that has been quiet and then the price
+        moves, the last NBBO we recorded can be many seconds old; scoring
+        a fresh print against that stale quote turns the Lee-Ready
+        quote-test into a bar-over-bar tick-test and **inverts** the side
+        (e.g. a bid-hitting sell during a fast up-move reads as a lift ->
+        ``ask_volume`` -> "buy").  When the prior tick is older than
+        ``FLOW_CLASSIFY_PRIOR_TICK_MAX_AGE_SECONDS`` relative to this
+        trade, fall back to the snapshot's own (contemporaneous) NBBO,
+        which is sampled together with the trade.
+
+        Cold start (no prior tick yet) uses the snapshot's own NBBO, the
+        same degraded path the prior design used.  Returns
+        ``(bid, ask, mid)``.
+        """
+        snap_bid = snap.get("bid")
+        snap_ask = snap.get("ask")
+        snap_mid = snap.get("mid")
+
+        # No usable prior tick (cold start / hydrate miss): contemporaneous.
+        if acc.last_bid is None or acc.last_ask is None:
+            return snap_bid, snap_ask, snap_mid
+
+        max_age = FLOW_CLASSIFY_PRIOR_TICK_MAX_AGE_SECONDS
+        prior_is_fresh = True
+        if max_age > 0:
+            snap_ts = snap.get("timestamp")
+            if snap_ts is not None and acc.last_quote_ts is not None:
+                try:
+                    age = (snap_ts - acc.last_quote_ts).total_seconds()
+                except (TypeError, ValueError):
+                    age = None
+                if age is not None and age > max_age:
+                    prior_is_fresh = False
+
+        if prior_is_fresh:
+            return acc.last_bid, acc.last_ask, acc.last_mid
+
+        # Stale prior tick -> contemporaneous quote, falling back to the
+        # prior value per-side only if the snapshot omits that side.
+        return (
+            snap_bid if snap_bid is not None else acc.last_bid,
+            snap_ask if snap_ask is not None else acc.last_ask,
+            snap_mid if snap_mid is not None else acc.last_mid,
+        )
+
     def _classify_volume_chunk(
         self,
         volume_delta: int,
@@ -940,7 +1001,7 @@ class IngestionEngine:
                 cursor.execute(
                     """
                     SELECT volume, ask_volume, mid_volume, bid_volume,
-                           bid, ask, mid
+                           bid, ask, mid, timestamp
                     FROM option_chains
                     WHERE option_symbol = %s
                       AND timestamp >= %s
@@ -960,6 +1021,7 @@ class IngestionEngine:
                         last_bid=_to_db_float(row[4]),
                         last_ask=_to_db_float(row[5]),
                         last_mid=_to_db_float(row[6]),
+                        last_quote_ts=row[7],
                     )
         except Exception as e:
             logger.warning(
@@ -1006,7 +1068,11 @@ class IngestionEngine:
         Classification uses the accumulator's stored prior-tick NBBO
         (``last_bid`` / ``last_ask`` / ``last_mid``), preserving the
         Lee-Ready prior-tick rule across snapshots and across bucket
-        boundaries within the same session.
+        boundaries within the same session — but only while that prior
+        tick is recent.  ``_select_classify_quote`` falls back to the
+        snapshot's own contemporaneous NBBO when the prior tick has gone
+        stale (a quiet contract that then moves), which otherwise inverts
+        the side by degrading the quote-test into a tick-test.
 
         Reset detection: TradeStation's cumulative volume resets to 0
         at the 09:30 ET cash open.  ``_bucket_session_date`` anchors
@@ -1033,35 +1099,41 @@ class IngestionEngine:
             if skip:
                 acc.mid_cum += vol_delta
             else:
-                # Prior tick: whatever the accumulator last saw.  On
-                # the first snapshot of a session (no hydrate row, no
-                # prior snapshot) those are None and the classifier
-                # falls back through to the snapshot's own NBBO — same
-                # degraded behavior the prior design had at cold start.
-                prior_bid = acc.last_bid if acc.last_bid is not None else snap.get("bid")
-                prior_ask = acc.last_ask if acc.last_ask is not None else snap.get("ask")
-                prior_mid = acc.last_mid if acc.last_mid is not None else snap.get("mid")
+                # Quote to classify against: the prior tick when it is
+                # recent enough to be a valid pre-trade proxy, else the
+                # snapshot's own (contemporaneous) NBBO.  See
+                # _select_classify_quote for the staleness rationale.
+                q_bid, q_ask, q_mid = self._select_classify_quote(acc, snap)
                 av, mv, bv = self._classify_volume_chunk(
                     vol_delta,
                     snap.get("last"),
-                    prior_bid,
-                    prior_ask,
-                    prior_mid,
+                    q_bid,
+                    q_ask,
+                    q_mid,
                 )
                 acc.ask_cum += av
                 acc.mid_cum += mv
                 acc.bid_cum += bv
         if curr_vol > acc.last_volume_cum:
             acc.last_volume_cum = curr_vol
-        # Update the prior-tick NBBO for the next classification.
+        # Update the prior-tick NBBO for the next classification, and
+        # stamp it with this snapshot's time so the next trade can
+        # age-check it (a quiet contract leaves this timestamp old, which
+        # is what trips the staleness fallback in _select_classify_quote).
+        quote_seen = False
         if snap.get("bid") is not None:
             acc.last_bid = _to_db_float(snap.get("bid"))
+            quote_seen = True
         if snap.get("ask") is not None:
             acc.last_ask = _to_db_float(snap.get("ask"))
+            quote_seen = True
         if snap.get("mid") is not None:
             acc.last_mid = _to_db_float(snap.get("mid"))
+            quote_seen = True
         elif acc.last_bid is not None and acc.last_ask is not None:
             acc.last_mid = (acc.last_bid + acc.last_ask) / 2.0
+        if quote_seen and snap.get("timestamp") is not None:
+            acc.last_quote_ts = snap.get("timestamp")
 
     def _prepare_option_agg(
         self, option_symbol: str, bucket: datetime, keep_last_snapshot: bool = False

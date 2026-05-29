@@ -432,7 +432,7 @@ flowchart TB
 | Invariant | Why it matters |
 |---|---|
 | `acc.last_volume_cum` is a watermark; `vol_delta = max(curr − watermark, 0)` | Replay-safe: the same snapshot ingested twice contributes zero new flow the second time |
-| Classification uses accumulator's prior NBBO, not snapshot's own | Lee-Ready prior-tick rule preserved across snapshots and across bucket boundaries within a session |
+| Classification uses accumulator's prior NBBO when it is *recent*, else the snapshot's own | Lee-Ready prior-tick rule preserved across snapshots within a session — but a prior tick older than `FLOW_CLASSIFY_PRIOR_TICK_MAX_AGE_SECONDS` (a quiet contract that then moves) is rejected for the contemporaneous quote, so a stale quote can't invert the side by degrading the quote-test into a tick-test (`_select_classify_quote`) |
 | Accumulator is keyed by `(option_symbol, ET session date)` | TradeStation's 09:30 ET volume reset is honored automatically (different session date → fresh hydrate) |
 | `option_chains.{ask,mid,bid}_volume` are session-cumulative monotonic | Matches what `flow_contract_facts` already expected (via `LAG()` deltas) — fixes a latent inconsistency in the prior additive-upsert design |
 | UPSERT uses `GREATEST` on every monotonic column with `IS DISTINCT FROM` WHERE guard | Retries are idempotent: re-submitting a row that already committed is a no-op |

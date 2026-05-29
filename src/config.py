@@ -726,6 +726,22 @@ FLOW_CLASSIFY_MID_BAND_PCT = float(os.getenv("FLOW_CLASSIFY_MID_BAND_PCT", "0.70
 FLOW_CLASSIFY_SKIP_OPEN_AUCTION = (
     os.getenv("FLOW_CLASSIFY_SKIP_OPEN_AUCTION", "true").lower() == "true"
 )
+# Staleness guard for the Lee-Ready prior-tick quote.  Classification
+# normally compares a trade against the NBBO that prevailed *before* it
+# (the prior tick), which avoids crediting a marketable order against the
+# post-trade NBBO it just moved.  But the prior tick is only a valid
+# pre-trade proxy when it is RECENT.  On a contract that goes quiet and
+# then the price moves, the last NBBO we recorded can be many seconds (or
+# a full minute) old; comparing a fresh print against that stale quote
+# degrades the quote-test into a bar-over-bar tick-test and inverts the
+# side (a bid-hitting sell into a fast up-move reads as a lift -> "buy").
+# When the prior tick is older than this many seconds relative to the
+# trade being classified, fall back to the snapshot's own
+# (contemporaneous) NBBO, which is sampled together with the trade.
+# 0 disables the guard (always prior-tick; legacy behavior).
+FLOW_CLASSIFY_PRIOR_TICK_MAX_AGE_SECONDS = float(
+    os.getenv("FLOW_CLASSIFY_PRIOR_TICK_MAX_AGE_SECONDS", "10.0")
+)
 
 # =============================================================================
 # Symbol Mapping Configuration

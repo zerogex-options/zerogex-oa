@@ -336,3 +336,142 @@ def test_accumulator_reset_detection_does_not_fire_on_monotonic_advance():
     assert acc.ask_cum == 400
     assert acc.mid_cum == 100
     assert acc.bid_cum == 100
+
+
+def test_stale_prior_tick_falls_back_to_contemporaneous_quote():
+    """Regression for the user-reported SELL-tagged-BUY inversion.
+
+    Reconstructs the reported 10:06->10:07 ET option_chains rows for
+    SPY 260605P752: the contract was quiet (volume 560, last NBBO recorded
+    at 10:06 = 2.59/2.61), then the price gapped up and the user's 50-lot
+    SELL hit the 2.65 bid at 10:07 (quote now 2.65/2.67).
+
+    Against the STALE 10:06 prior tick (mid 2.60) the 2.65 print reads as a
+    lift (2.65 > 2.60) -> ask_volume -> "BUY": exactly the inversion the
+    user saw (ask_volume rose 70 -> 120 in the DB).  With the staleness
+    guard the minute-old prior tick is rejected and the trade is scored
+    against the contemporaneous 2.65/2.67 quote (mid 2.66), where 2.65 is
+    below mid -> bid_volume -> SELL.
+    """
+    from src.ingestion.main_engine import _FlowAccumulator
+    from datetime import date
+
+    engine = _engine()
+    # Accumulator state at the end of the 10:06 ET bucket (from the DB row).
+    acc = _FlowAccumulator(
+        session_date=date(2026, 5, 29),
+        last_volume_cum=560,
+        ask_cum=70,
+        mid_cum=76,
+        bid_cum=2836,
+        last_bid=2.59,
+        last_ask=2.61,
+        last_mid=2.60,
+        last_quote_ts=ET.localize(datetime(2026, 5, 29, 10, 6)),
+    )
+
+    # 10:07 ET: user's 50-lot SELL prints at the 2.65 bid; NBBO has gapped
+    # up to 2.65 x 2.67.  The prior tick is ~60s stale.
+    engine._ingest_snapshot_into_accumulator(
+        acc,
+        {
+            "volume": 610,
+            "last": 2.65,
+            "bid": 2.65,
+            "ask": 2.67,
+            "mid": 2.66,
+            "timestamp": ET.localize(datetime(2026, 5, 29, 10, 7)),
+        },
+        ET.localize(datetime(2026, 5, 29, 10, 7)),
+    )
+
+    # The +50 must land in bid_volume (SELL), NOT ask_volume (BUY).
+    assert acc.bid_cum == 2886, "stale prior tick must not credit a bid-hit as ask"
+    assert acc.ask_cum == 70
+    assert acc.mid_cum == 76
+
+
+def test_fresh_prior_tick_is_still_used_for_marketable_lift():
+    """A RECENT prior tick is still preferred over the contemporaneous quote.
+
+    This preserves the anti-contamination purpose of the prior-tick rule:
+    a marketable BUY that lifts the offer and bumps the NBBO up within the
+    same drain must be scored against the PRE-trade quote, not the
+    post-trade quote it just created.
+
+    Pre-trade quote 2.55/2.57 (recorded 1s ago); the buy lifts the 2.57
+    offer and the NBBO moves to 2.57/2.59.  Against the fresh prior tick
+    (mid 2.56) the 2.57 print is a lift -> ask_volume -> BUY (correct).
+    Against the contemporaneous post-trade quote (mid 2.58) it would read
+    2.57 < mid -> bid_volume -> SELL (the contamination the guard avoids).
+    """
+    from src.ingestion.main_engine import _FlowAccumulator
+    from datetime import date
+
+    engine = _engine()
+    acc = _FlowAccumulator(
+        session_date=date(2026, 5, 29),
+        last_volume_cum=100,
+        ask_cum=0,
+        mid_cum=0,
+        bid_cum=0,
+        last_bid=2.55,
+        last_ask=2.57,
+        last_mid=2.56,
+        last_quote_ts=ET.localize(datetime(2026, 5, 29, 10, 0, 0)),
+    )
+
+    engine._ingest_snapshot_into_accumulator(
+        acc,
+        {
+            "volume": 150,
+            "last": 2.57,
+            "bid": 2.57,
+            "ask": 2.59,
+            "mid": 2.58,
+            "timestamp": ET.localize(datetime(2026, 5, 29, 10, 0, 1)),  # 1s later
+        },
+        ET.localize(datetime(2026, 5, 29, 10, 0, 1)),
+    )
+
+    # Fresh prior tick -> the lift is correctly ask_volume (BUY).
+    assert acc.ask_cum == 50, "fresh prior tick must score the lift as ask (buy)"
+    assert acc.bid_cum == 0
+    assert acc.mid_cum == 0
+
+
+def test_prior_tick_age_threshold_is_configurable(monkeypatch):
+    """Setting the max-age to 0 disables the guard (legacy prior-tick)."""
+    import src.ingestion.main_engine as me
+    from src.ingestion.main_engine import _FlowAccumulator
+    from datetime import date
+
+    monkeypatch.setattr(me, "FLOW_CLASSIFY_PRIOR_TICK_MAX_AGE_SECONDS", 0.0)
+
+    engine = _engine()
+    acc = _FlowAccumulator(
+        session_date=date(2026, 5, 29),
+        last_volume_cum=560,
+        ask_cum=70,
+        mid_cum=76,
+        bid_cum=2836,
+        last_bid=2.59,
+        last_ask=2.61,
+        last_mid=2.60,
+        last_quote_ts=ET.localize(datetime(2026, 5, 29, 10, 6)),
+    )
+    engine._ingest_snapshot_into_accumulator(
+        acc,
+        {
+            "volume": 610,
+            "last": 2.65,
+            "bid": 2.65,
+            "ask": 2.67,
+            "mid": 2.66,
+            "timestamp": ET.localize(datetime(2026, 5, 29, 10, 7)),
+        },
+        ET.localize(datetime(2026, 5, 29, 10, 7)),
+    )
+    # Guard disabled -> legacy stale-prior-tick behavior (the bug): ask.
+    assert acc.ask_cum == 120
+    assert acc.bid_cum == 2836
