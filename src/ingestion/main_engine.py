@@ -1084,14 +1084,32 @@ class IngestionEngine:
         watermark, ``max(curr_vol - watermark, 0)`` would silently swallow
         every cash-session trade for the rest of the day, and the
         ``GREATEST`` upsert would preserve the bogus watermark in
-        storage.  Re-anchor the watermark when we observe a decrease
-        (a cumulative can only legitimately drop on a vendor reset).
-        Classified ``ask_cum`` / ``mid_cum`` / ``bid_cum`` stay
-        monotonic across the boundary so the reader's LAG continues
-        to recover correct per-bar deltas in the cash session.
+        storage.  Re-anchor the watermark when we observe a *positive*
+        cumulative below the watermark — a real reset hands us a
+        positive post-reset value, while ``curr_vol == 0`` is the
+        signature of a missing Volume field (e.g. a stream reconnect
+        whose first message after the merger's _state was cleared
+        omits Volume) and must NOT be treated as a vendor reset, or it
+        zeros the stored volume in the middle of pre-RTH.  Classified
+        ``ask_cum`` / ``mid_cum`` / ``bid_cum`` stay monotonic across
+        the boundary so the reader's LAG continues to recover correct
+        per-bar deltas in the cash session.
         """
         curr_vol = int(snap.get("volume") or 0)
-        if curr_vol < acc.last_volume_cum:
+        # Re-anchor on a legitimate vendor cumulative reset only.  A real
+        # reset (TS at the 09:30 ET cash open) hands us a *positive*
+        # post-reset cumulative; the merge already filters explicit
+        # Volume=0 quote messages (stream_manager._merge_single_quote).
+        # The path that still produces ``curr_vol == 0`` here is a
+        # missing Volume field -- which happens on a stream reconnect
+        # when the merger's _state was cleared and the first message
+        # back lacks Volume.  Treating that as a vendor reset zeros the
+        # watermark for the wrong reason and creates a phantom mid-day
+        # cliff (the reported 06:40 ET reset on SPY 260605P752: a
+        # missing-Volume snapshot dropped the stored volume to 0 while
+        # bid_volume kept its 2422 baseline by design).  Require
+        # ``curr_vol > 0`` so only a real post-reset cumulative trips it.
+        if curr_vol > 0 and curr_vol < acc.last_volume_cum:
             acc.last_volume_cum = 0
         vol_delta = max(curr_vol - acc.last_volume_cum, 0)
         if vol_delta > 0:

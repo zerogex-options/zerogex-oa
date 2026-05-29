@@ -475,3 +475,78 @@ def test_prior_tick_age_threshold_is_configurable(monkeypatch):
     # Guard disabled -> legacy stale-prior-tick behavior (the bug): ask.
     assert acc.ask_cum == 120
     assert acc.bid_cum == 2836
+
+
+def test_missing_volume_snapshot_does_not_re_anchor_watermark():
+    """Regression for the 06:40 ET phantom 'reset' on SPY 260605P752.
+
+    On a stream reconnect the merger's ``_state`` is cleared; if the first
+    message back lacks a ``Volume`` field, ``snap.get("volume")`` is None
+    and ``int(None or 0) == 0`` reaches the accumulator.  Before the fix,
+    ``curr_vol < last_volume_cum`` zeroed the watermark and the next
+    written row carried ``volume = 0`` while ``bid_volume`` kept its 2422
+    baseline by design — the exact cliff the user saw.
+
+    The re-anchor must only fire on a *positive* below-watermark
+    cumulative (a real vendor reset), so a missing Volume preserves the
+    watermark instead of dropping a phantom zero into storage.
+    """
+    from src.ingestion.main_engine import _FlowAccumulator
+    from datetime import date
+
+    engine = _engine()
+    acc = _FlowAccumulator(
+        session_date=date(2026, 5, 29),
+        last_volume_cum=2422,
+        ask_cum=0,
+        mid_cum=0,
+        bid_cum=2422,
+        last_bid=3.37,
+        last_ask=3.39,
+        last_mid=3.38,
+    )
+    bucket = ET.localize(datetime(2026, 5, 29, 6, 40))
+
+    # Snapshot from a fresh post-reconnect merge: NBBO present, Volume absent.
+    engine._ingest_snapshot_into_accumulator(
+        acc,
+        {"last": 3.37, "bid": 3.37, "ask": 3.39, "mid": 3.38},
+        bucket,
+    )
+
+    # Watermark must hold; no phantom reset.
+    assert acc.last_volume_cum == 2422, "missing Volume must not trigger a re-anchor"
+    assert acc.ask_cum == 0
+    assert acc.mid_cum == 0
+    assert acc.bid_cum == 2422
+
+
+def test_explicit_zero_volume_snapshot_does_not_re_anchor_watermark():
+    """Defensive: even if a literal Volume=0 slips past the merger's
+    skip-when-zero gate (stream_manager._merge_single_quote), the
+    accumulator must not treat it as a vendor reset.  Only a *positive*
+    below-watermark cumulative counts."""
+    from src.ingestion.main_engine import _FlowAccumulator
+    from datetime import date
+
+    engine = _engine()
+    acc = _FlowAccumulator(
+        session_date=date(2026, 5, 29),
+        last_volume_cum=2422,
+        ask_cum=0,
+        mid_cum=0,
+        bid_cum=2422,
+        last_bid=3.37,
+        last_ask=3.39,
+        last_mid=3.38,
+    )
+    bucket = ET.localize(datetime(2026, 5, 29, 6, 40))
+
+    engine._ingest_snapshot_into_accumulator(
+        acc,
+        {"volume": 0, "last": 3.37, "bid": 3.37, "ask": 3.39, "mid": 3.38},
+        bucket,
+    )
+
+    assert acc.last_volume_cum == 2422
+    assert acc.bid_cum == 2422
