@@ -727,8 +727,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument(
         "--no-write",
+        "--dry-run",
+        dest="no_write",
         action="store_true",
-        help="Compute and print stats but skip the playbook_pattern_stats UPSERT.",
+        help=(
+            "Compute and print stats but skip the playbook_pattern_stats UPSERT. "
+            "Use this to preview proposed_base (e.g. before re-baselining priors) "
+            "without overwriting the stored values."
+        ),
     )
     args = parser.parse_args(argv)
 

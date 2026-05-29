@@ -11,6 +11,7 @@ import json
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
+from src.signals.playbook import backtest as backtest_mod
 from src.signals.playbook.backtest import (
     CardOutcome,
     CardRow,
@@ -19,6 +20,7 @@ from src.signals.playbook.backtest import (
     compute_outcome,
     fetch_action_cards,
     fetch_quotes,
+    main,
     run,
     upsert_pattern_stats,
 )
@@ -502,3 +504,24 @@ def test_run_no_write_skips_persistence():
     stats = run(underlying="SPY", days=2, conn=conn, write=False)
     assert len(stats) == 1
     assert conn.commits == 0  # no upsert
+
+
+def test_cli_dry_run_and_no_write_skip_persistence(monkeypatch):
+    """--dry-run (alias of --no-write) must call run with write=False; the
+    default writes. Guards the preview path used before re-baselining priors."""
+    captured = {}
+
+    def _fake_run(*, underlying, days, write):
+        captured["write"] = write
+        return []
+
+    monkeypatch.setattr(backtest_mod, "run", _fake_run)
+
+    main(["--underlying", "SPY", "--days", "1", "--dry-run"])
+    assert captured["write"] is False
+
+    main(["--underlying", "SPY", "--days", "1", "--no-write"])
+    assert captured["write"] is False
+
+    main(["--underlying", "SPY", "--days", "1"])
+    assert captured["write"] is True  # default persists
