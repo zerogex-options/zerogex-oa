@@ -1450,6 +1450,38 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching GEX by strike: {e}", exc_info=True)
             raise
 
+    async def get_recent_underlying_bars(
+        self, symbol: str, limit: int = 120
+    ) -> Tuple[List[float], List[float], List[float]]:
+        """Return trailing ``(closes, lows, highs)`` for ``symbol`` from
+        ``underlying_quotes``, oldest → newest.
+
+        Mirrors the sync UnifiedSignalEngine context fetch (~2h of 1-min bars)
+        so the async API playbook path feeds patterns the same bar history
+        instead of empty lists. low/high fall back to close on pre-backfill
+        rows so the three lists stay aligned. Returns empty lists on any error —
+        callers treat missing bars as a graceful pattern fallback.
+        """
+        query = """
+            SELECT low, high, close
+            FROM underlying_quotes
+            WHERE symbol = $1
+            ORDER BY timestamp DESC
+            LIMIT $2
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, limit)
+        except Exception as e:
+            logger.warning(f"get_recent_underlying_bars({symbol}) failed: {e}")
+            return [], [], []
+        # Query is DESC (newest first); reverse to chronological oldest → newest.
+        bars = [r for r in reversed(rows) if r["close"] is not None]
+        closes = [float(r["close"]) for r in bars]
+        lows = [float(r["low"]) if r["low"] is not None else float(r["close"]) for r in bars]
+        highs = [float(r["high"]) if r["high"] is not None else float(r["close"]) for r in bars]
+        return closes, lows, highs
+
     async def get_latest_gex_profile(
         self,
         symbol: str = "SPY",

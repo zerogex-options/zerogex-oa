@@ -181,11 +181,16 @@ def _build_market_context(
     timestamp: datetime,
     score_row: Optional[dict],
     advanced: dict[str, SignalSnapshot],
+    recent_closes: Optional[list[float]] = None,
+    recent_lows: Optional[list[float]] = None,
+    recent_highs: Optional[list[float]] = None,
 ) -> MarketContext:
     """Reconstruct the most useful MarketContext we can from persisted state.
 
-    PR-2 reads only what's already on the latest signal_score and signal
-    rows.  PR-3 will wire the live MarketContext through directly.
+    Reads what's on the latest signal_score / signal rows; the caller also
+    threads recent underlying bars (closes/lows/highs, oldest → newest) from
+    ``underlying_quotes`` so bar-history patterns work on the async API path
+    instead of degrading to the empty-list fallback.
     """
     components = (score_row or {}).get("components") or {}
     if not isinstance(components, dict):
@@ -254,7 +259,9 @@ def _build_market_context(
         max_pain=float(max_pain) if max_pain is not None else None,
         smart_call=smart_call,
         smart_put=smart_put,
-        recent_closes=[],  # PR-3 will wire this through; for PR-2 patterns fall back gracefully
+        recent_closes=recent_closes or [],
+        recent_lows=recent_lows or [],
+        recent_highs=recent_highs or [],
         iv_rank=None,
         dealer_net_delta=dealer_net_delta,
         vwap=float(vwap) if vwap is not None else None,
@@ -336,11 +343,22 @@ async def build_playbook_context(
             rows = []
         snap.score_history = _normalize_history(rows)
 
+    # Recent underlying bars (~2h of 1-min OHLC) so bar-history patterns fire
+    # on the async API path. Fails closed to empty lists (= prior behavior).
+    try:
+        recent_closes, recent_lows, recent_highs = await db.get_recent_underlying_bars(underlying)
+    except Exception as exc:
+        logger.warning("get_recent_underlying_bars(%s) failed: %s", underlying, exc)
+        recent_closes, recent_lows, recent_highs = [], [], []
+
     market = _build_market_context(
         underlying=underlying,
         timestamp=timestamp,
         score_row=score_row,
         advanced=advanced,
+        recent_closes=recent_closes,
+        recent_lows=recent_lows,
+        recent_highs=recent_highs,
     )
     levels = _extract_levels(market.extra or {}, advanced)
 
