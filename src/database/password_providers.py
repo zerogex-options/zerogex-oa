@@ -172,3 +172,95 @@ def _get_password_from_env() -> str:
 
     logger.warning("⚠️  Using password from environment variable (not recommended for production)")
     return password
+
+
+def find_pgpass_entry(
+    host: Optional[str] = None,
+    port: Optional[str] = None,
+    database: Optional[str] = None,
+    user: Optional[str] = None,
+    pgpass_path: Optional[Path] = None,
+) -> Optional[dict]:
+    """Return the first ``~/.pgpass`` entry matching the requested target.
+
+    Each argument constrains the match only when non-``None``; a field of ``*``
+    in the file matches anything (standard PostgreSQL .pgpass semantics). This
+    lets callers that cannot rely on libpq's native .pgpass handling (notably
+    asyncpg, which does not read .pgpass) pull the password for THEIR
+    environment instead of blindly taking the first line — a multi-environment
+    .pgpass otherwise risks authenticating against the wrong database.
+
+    Returns ``{"host","port","database","user","password"}`` with the matched
+    line's literal fields (``*`` preserved for the caller to resolve), or
+    ``None`` when the file is absent or no line matches. The password may itself
+    contain ``:`` (everything past the 4th colon). Backslash escapes are not
+    interpreted (consistent with the prior hand-parser).
+    """
+    path = pgpass_path or (Path.home() / ".pgpass")
+    if not path.exists():
+        return None
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return None
+    wanted = (("host", host), ("port", port), ("database", database), ("user", user))
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(":")
+        if len(parts) < 5:
+            continue
+        fields = {
+            "host": parts[0],
+            "port": parts[1],
+            "database": parts[2],
+            "user": parts[3],
+            "password": ":".join(parts[4:]),
+        }
+        if all(want is None or fields[k] == "*" or fields[k] == want for k, want in wanted):
+            return fields
+    return None
+
+
+def resolve_db_credentials() -> dict:
+    """Resolve DB connection parameters for drivers that do not read .pgpass
+    natively (e.g. asyncpg).
+
+    The connection target (host/port/database/user) comes from the ``DB_*``
+    environment variables. The password is taken from the ``~/.pgpass`` line
+    that MATCHES that target — not the first line — so a multi-environment
+    .pgpass cannot connect the caller to the wrong database; it falls back to
+    ``DB_PASSWORD`` when no line matches. When the ``DB_*`` vars are unset the
+    match is unconstrained, preserving the prior first-line behavior.
+
+    Returns ``{"host","port","database","user","password"}`` (port as ``str``).
+    """
+    want_host = os.getenv("DB_HOST")
+    want_port = os.getenv("DB_PORT")
+    want_db = os.getenv("DB_NAME")
+    want_user = os.getenv("DB_USER")
+    entry = find_pgpass_entry(want_host, want_port, want_db, want_user)
+
+    def _pick(want: Optional[str], field: Optional[str], default: str) -> str:
+        if want:
+            return want
+        if field and field != "*":
+            return field
+        return default
+
+    if entry is not None:
+        return {
+            "host": _pick(want_host, entry["host"], "localhost"),
+            "port": _pick(want_port, entry["port"], "5432"),
+            "database": _pick(want_db, entry["database"], "zerogex"),
+            "user": _pick(want_user, entry["user"], "postgres"),
+            "password": entry["password"],
+        }
+    return {
+        "host": want_host or "localhost",
+        "port": want_port or "5432",
+        "database": want_db or "zerogex",
+        "user": want_user or "postgres",
+        "password": os.getenv("DB_PASSWORD", ""),
+    }

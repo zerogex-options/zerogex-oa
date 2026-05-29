@@ -30,10 +30,11 @@ import os
 import secrets
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import asyncpg
+
+from src.database.password_providers import resolve_db_credentials
 
 _PREFIX_LEN = 8
 
@@ -43,29 +44,16 @@ def _hash_key(raw: str) -> str:
 
 
 def _load_db_credentials() -> Dict[str, Any]:
-    """Mirror DatabaseManager._load_credentials: .pgpass first, env-vars next."""
-    pgpass = Path.home() / ".pgpass"
-    if pgpass.exists():
-        with open(pgpass) as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split(":")
-                if len(parts) >= 5:
-                    return {
-                        "host": parts[0],
-                        "port": int(parts[1]),
-                        "database": parts[2],
-                        "user": parts[3],
-                        "password": parts[4],
-                    }
+    """Resolve DB credentials the same way the API server does: target from the
+    ``DB_*`` env vars, password matched from ``~/.pgpass`` for that target (not
+    the first line). See ``resolve_db_credentials``."""
+    creds = resolve_db_credentials()
     return {
-        "host": os.getenv("DB_HOST", "localhost"),
-        "port": int(os.getenv("DB_PORT", "5432")),
-        "database": os.getenv("DB_NAME", "zerogex"),
-        "user": os.getenv("DB_USER", "postgres"),
-        "password": os.getenv("DB_PASSWORD", ""),
+        "host": creds["host"],
+        "port": int(creds["port"]),
+        "database": creds["database"],
+        "user": creds["user"],
+        "password": creds["password"],
     }
 
 

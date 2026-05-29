@@ -9,7 +9,6 @@ import os
 import time as time_module
 import traceback
 from collections import OrderedDict
-from pathlib import Path
 from typing import List, Dict, Optional, Any, Tuple
 from datetime import datetime, timedelta, date, time, timezone
 from contextlib import asynccontextmanager
@@ -18,6 +17,7 @@ import logging
 import json
 
 from src.api.queries.signals import SignalsQueriesMixin
+from src.database.password_providers import resolve_db_credentials
 from src.api.queries.technicals import TechnicalsQueriesMixin
 from src import config as _config
 from src.config import GEX_HEATMAP_STRIKE_BAND_PCT
@@ -374,29 +374,20 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         )
 
     def _load_credentials(self):
-        """Load database credentials from .pgpass or environment"""
-        # Try .pgpass first (production)
-        pgpass_file = Path.home() / ".pgpass"
-        if pgpass_file.exists():
-            with open(pgpass_file) as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#"):
-                        parts = line.split(":")
-                        if len(parts) >= 5:
-                            self.host = parts[0]
-                            self.port = parts[1]
-                            self.database = parts[2]
-                            self.user = parts[3]
-                            self.password = parts[4]
-                            return
+        """Resolve DB connection params.
 
-        # Fallback to environment variables
-        self.host = os.getenv("DB_HOST", "localhost")
-        self.port = os.getenv("DB_PORT", "5432")
-        self.database = os.getenv("DB_NAME", "zerogex")
-        self.user = os.getenv("DB_USER", "postgres")
-        self.password = os.getenv("DB_PASSWORD", "")
+        Target (host/port/db/user) comes from the ``DB_*`` env vars; the
+        password is matched from the ``~/.pgpass`` line for THAT target rather
+        than taken from the first line. asyncpg does not read .pgpass itself,
+        and a multi-environment .pgpass must not connect us to the wrong DB.
+        See ``resolve_db_credentials``.
+        """
+        creds = resolve_db_credentials()
+        self.host = creds["host"]
+        self.port = creds["port"]
+        self.database = creds["database"]
+        self.user = creds["user"]
+        self.password = creds["password"]
 
     async def connect(self):
         """Create connection pool"""
