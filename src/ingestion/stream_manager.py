@@ -928,6 +928,13 @@ class StreamManager:
         self.seed_rest_on_recalc = (
             os.getenv("OPTION_REST_SEED_ON_RECALC", "false").lower() == "true"
         )
+        # Session-cumulative set of option symbols seen with Volume>0 since the
+        # ET day rollover. Kept on the StreamManager (NOT the per-cycle
+        # accumulator, which is torn down and rebuilt without a REST re-seed
+        # every STRIKE_RECALC_INTERVAL ~60s) so volume coverage reflects the
+        # whole session rather than just trades since the last recalc reset.
+        self._session_volume_symbols: Set[str] = set()
+        self._session_volume_date: Optional[date] = None
 
         logger.info(f"Initialized StreamManager for {underlying}")
         logger.info(
@@ -1214,6 +1221,40 @@ class StreamManager:
 
         logger.info(f"Built {len(option_symbols)} option symbols to track")
         return option_symbols
+
+    def _update_session_volume_coverage(
+        self,
+        full_state: Dict[str, Dict[str, Any]],
+        tracked_total: int,
+        now_et: Optional[datetime] = None,
+    ) -> float:
+        """Session-cumulative fraction of the tracked universe seen trading.
+
+        The per-cycle option accumulator is torn down and rebuilt WITHOUT a
+        REST re-seed every ``STRIKE_RECALC_INTERVAL`` (~60s at the default 5s
+        poll), zeroing its in-memory ``Volume``. Counting ``Volume>0`` straight
+        off the accumulator therefore only ever reflects ~1 minute of trades
+        and reads far below the true session figure (~80% measured) — the
+        chronic false positive behind the "Low option volume coverage" alert.
+
+        Instead, accumulate the set of symbols seen with ``Volume>0`` on the
+        StreamManager (it survives the accumulator swaps), reset it at the ET
+        day rollover, and report the distinct count over the current universe
+        size, capped at 1.0 (the band drifts with spot, so the day's union can
+        exceed the current snapshot). Stays low only when volume genuinely
+        isn't arriving, which is what the alert is for; a volume STOP after
+        trades were already seen is left to stream_updates / flow-staleness.
+        """
+        et_date = (now_et or datetime.now(ET)).date()
+        if self._session_volume_date != et_date:
+            self._session_volume_symbols = set()
+            self._session_volume_date = et_date
+        self._session_volume_symbols.update(
+            sym for sym, raw in full_state.items() if int(raw.get("Volume") or 0) > 0
+        )
+        if tracked_total <= 0:
+            return 0.0
+        return min(1.0, len(self._session_volume_symbols) / tracked_total)
 
     def _cleanup_expired_strikes(self):
         """Remove strikes for expired expirations to prevent memory leak"""
@@ -1764,17 +1805,18 @@ class StreamManager:
                             tracked_total = len(self.tracked_option_symbols)
                             oi_coverage = option_with_oi / option_count
 
-                            # Volume coverage is computed against the full accumulator
-                            # state (cumulative across the day), not the drained subset.
-                            # Volume is cumulative daily and the accumulator only
-                            # overwrites it with positive values, so once a contract
-                            # trades it stays counted.  A per-drain ratio is misleading
-                            # because most batches are quote updates without trades.
+                            # Volume coverage = session-cumulative fraction of the
+                            # tracked universe that has traded. Tracked on the
+                            # StreamManager rather than counted off the live
+                            # accumulator: the accumulator is rebuilt WITHOUT a REST
+                            # re-seed every STRIKE_RECALC_INTERVAL (~60s), so a direct
+                            # count collapses to ~1 minute of trades each recalc and
+                            # chronically false-trips the alert (~0.4-16% seen vs ~80%
+                            # actual). See _update_session_volume_coverage.
                             full_state = self._accumulator.snapshot()
-                            session_with_volume = sum(
-                                1 for raw in full_state.values() if int(raw.get("Volume") or 0) > 0
+                            volume_coverage = self._update_session_volume_coverage(
+                                full_state, tracked_total
                             )
-                            volume_coverage = session_with_volume / max(tracked_total, 1)
 
                             logger.info(
                                 f"Option batch: {option_count} updated, "
