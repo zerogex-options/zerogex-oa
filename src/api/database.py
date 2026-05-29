@@ -1482,6 +1482,41 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         highs = [float(r["high"]) if r["high"] is not None else float(r["close"]) for r in bars]
         return closes, lows, highs
 
+    async def get_vix_bars(self, cutoff: datetime, tz) -> List[Dict[str, Any]]:
+        """Load VIX 5-min bars at/after ``cutoff`` from ``vix_bars``, ascending.
+
+        Async (asyncpg) replacement for the volatility-gauge router's prior
+        sync psycopg2 read on a threadpool. Returns dicts in the shape the VIX
+        scorers consume (timestamps normalized to ``tz``); rows with a NULL
+        close are dropped. Raises on DB error — the caller maps that to 503.
+        """
+        query = """
+            SELECT timestamp, open, high, low, close
+            FROM vix_bars
+            WHERE timestamp >= $1
+            ORDER BY timestamp ASC
+        """
+        async with self._acquire_connection() as conn:
+            rows = await conn.fetch(query, cutoff)
+
+        bars: List[Dict[str, Any]] = []
+        for r in rows:
+            if r["close"] is None:
+                continue
+            ts = r["timestamp"]
+            # Postgres TIMESTAMPTZ already carries tz info; normalise to tz.
+            ts_local = ts.astimezone(tz) if ts.tzinfo else tz.localize(ts)
+            bars.append(
+                {
+                    "timestamp": ts_local,
+                    "open": float(r["open"]) if r["open"] is not None else None,
+                    "high": float(r["high"]) if r["high"] is not None else None,
+                    "low": float(r["low"]) if r["low"] is not None else None,
+                    "close": float(r["close"]),
+                }
+            )
+        return bars
+
     async def get_latest_gex_profile(
         self,
         symbol: str = "SPY",

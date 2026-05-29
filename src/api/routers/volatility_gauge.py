@@ -20,23 +20,36 @@ Data source
   scoring.
 """
 
-import asyncio
 import math
 import logging
 from datetime import datetime, timedelta, date
 from typing import Any, Dict, List
 
 import pytz
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+
 from pydantic import BaseModel, Field
 
-from src.database import db_connection
+from src.api.database import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/market", tags=["Market Data"])
 
 ET = pytz.timezone("US/Eastern")
+
+
+def get_db() -> DatabaseManager:
+    from src.api.main import db_manager
+
+    if db_manager is None:
+        from fastapi import status
+
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database not initialized",
+        )
+    return db_manager
 
 
 # ============================================================================
@@ -64,47 +77,6 @@ def _two_session_cutoff() -> datetime:
                 break
         d -= timedelta(days=1)
     return _session_start(d)
-
-
-# ============================================================================
-# DB read
-# ============================================================================
-
-
-def _load_bars_from_db(cutoff: datetime) -> List[Dict[str, Any]]:
-    """
-    Load VIX 5-min bars >= *cutoff* from the database, sorted ascending.
-
-    Returned dicts use the same shape as the previous in-memory cache so the
-    scoring functions can stay untouched.
-    """
-    with db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT timestamp, open, high, low, close
-            FROM vix_bars
-            WHERE timestamp >= %s
-            ORDER BY timestamp ASC
-            """,
-            (cutoff,),
-        )
-        rows = cursor.fetchall()
-
-    bars: List[Dict[str, Any]] = []
-    for ts, op, hi, lo, cl in rows:
-        # Postgres TIMESTAMPTZ already carries tz info; normalise to ET.
-        ts_et = ts.astimezone(ET) if ts.tzinfo else ET.localize(ts)
-        bars.append(
-            {
-                "timestamp": ts_et,
-                "open": float(op) if op is not None else None,
-                "high": float(hi) if hi is not None else None,
-                "low": float(lo) if lo is not None else None,
-                "close": float(cl),
-            }
-        )
-    return bars
 
 
 # ============================================================================
@@ -278,7 +250,7 @@ class VolatilityGaugeResponse(BaseModel):
 
 
 @router.get("/vix", response_model=VolatilityGaugeResponse)
-async def get_volatility_gauge():
+async def get_volatility_gauge(db: DatabaseManager = Depends(get_db)):
     """
     Returns $VIX.X volatility metrics as two scored dimensions.
 
@@ -300,9 +272,8 @@ async def get_volatility_gauge():
     """
     cutoff = _two_session_cutoff()
 
-    loop = asyncio.get_event_loop()
     try:
-        bars = await loop.run_in_executor(None, _load_bars_from_db, cutoff)
+        bars = await db.get_vix_bars(cutoff, ET)
     except Exception as exc:
         logger.error("VIX DB read failed: %s", exc)
         raise HTTPException(
