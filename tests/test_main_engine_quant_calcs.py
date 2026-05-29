@@ -174,6 +174,68 @@ def test_gamma_profile_none_when_no_usable_contracts():
     assert engine._net_gex_at_spot([], 100.0) is None
 
 
+def _brute_force_max_pain(options, strike_range=None):
+    """Reference max-pain: the original strikes×options double loop. The
+    vectorized _calculate_max_pain must agree with this exactly, including the
+    lowest-strike tie-break."""
+    strikes = sorted(set(o["strike"] for o in options))
+    if strike_range:
+        strikes = [s for s in strikes if strike_range[0] <= s <= strike_range[1]]
+    if not strikes:
+        return None
+    payouts = {}
+    for test in strikes:
+        total = 0.0
+        for o in options:
+            if o["open_interest"] == 0:
+                continue
+            k = o["strike"]
+            oi = o["open_interest"]
+            if o["option_type"] == "C":
+                if test > k:
+                    total += (test - k) * oi * 100
+            else:
+                if test < k:
+                    total += (k - test) * oi * 100
+        payouts[test] = total
+    return min(payouts.items(), key=lambda x: x[1])[0]
+
+
+def test_max_pain_vectorized_matches_brute_force_and_tiebreak():
+    """The vectorized _calculate_max_pain reproduces the original double-loop
+    exactly across a randomized multi-strike chain, an empty set, an all-zero-OI
+    set (every payout 0 => lowest strike wins the tie), and a strike_range."""
+    engine = AnalyticsEngine(underlying="SPY")
+    rng = np.random.default_rng(20260529)
+    exp = datetime(2026, 6, 19).date()
+    opts = [
+        _opt(float(k), otype, oi=int(rng.integers(0, 9000)), exp=exp)
+        for k in range(80, 121)
+        for otype in ("C", "P")
+    ]
+    assert engine._calculate_max_pain(opts) == _brute_force_max_pain(opts)
+    assert engine._calculate_max_pain(opts, strike_range=(95.0, 105.0)) == _brute_force_max_pain(
+        opts, strike_range=(95.0, 105.0)
+    )
+    assert engine._calculate_max_pain([]) is None
+    # All payouts identically zero -> argmin picks the first (lowest) strike.
+    zero_oi = [_opt(float(k), "C", oi=0, exp=exp) for k in range(80, 121)]
+    assert engine._calculate_max_pain(zero_oi) == 80.0
+
+
+def test_bs_gamma_inline_pdf_matches_scipy():
+    """The inline standard-normal pdf in _calculate_bs_gamma is bit-identical to
+    scipy.stats.norm.pdf (the swap was a hot-path speedup, not a model change)."""
+    engine = AnalyticsEngine(underlying="SPY")
+    grid = np.linspace(60.0, 140.0, 161)
+    for K, T, sigma in [(100.0, 0.5, 0.20), (95.0, 0.05, 0.45), (120.0, 1.0, 0.15)]:
+        got = engine._calculate_bs_gamma(grid, K, T, 0.05, sigma)
+        sqrt_T = np.sqrt(T)
+        d1 = (np.log(grid / K) + (0.05 + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
+        expected = stats.norm.pdf(d1) / (grid * sigma * sqrt_T)
+        assert np.allclose(got, expected, rtol=0, atol=0)  # exact
+
+
 def test_net_gex_at_spot_interpolates_and_clamps_generic_curve():
     """_net_gex_at_spot piecewise-linearly samples the profile and clamps
     to its endpoints outside the grid."""
