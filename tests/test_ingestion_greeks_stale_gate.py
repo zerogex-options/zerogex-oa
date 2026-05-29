@@ -10,7 +10,16 @@ symptom: continuous ``Refusing Greeks: underlying price is ~100s stale
 mapping.
 """
 
-from src.ingestion.main_engine import _greeks_max_age_for_session
+import types
+from datetime import datetime
+from unittest.mock import MagicMock
+
+import pytz
+
+from src.ingestion import main_engine as me
+from src.ingestion.main_engine import IngestionEngine, _greeks_max_age_for_session
+
+ET = pytz.timezone("US/Eastern")
 
 _BASE = 90.0
 _EXTENDED = 300.0
@@ -42,3 +51,54 @@ def test_extended_gate_is_wider_so_sparse_extended_bars_pass():
     extended = _greeks_max_age_for_session("after-hours", _BASE, _EXTENDED)
     assert sparse_after_hours_age > base
     assert sparse_after_hours_age <= extended
+
+
+# ---------------------------------------------------------------------------
+# In-session staleness WARNING is throttled by wall-clock, not reject count.
+# A dense option stream produces thousands of rejects/min against one stale
+# underlying; the previous per-100-reject gate flooded the journal at the open
+# (the reported symptom: 124 warnings in ~11s). The reject COUNTER still
+# advances every reject — only the WARNING cadence is rate-limited.
+# ---------------------------------------------------------------------------
+
+
+def _stale_greeks_engine():
+    """Minimal engine wired so ``_enrich_with_greeks`` takes the in-session
+    stale-underlying reject branch without a real DB or Greeks calculator."""
+    e = IngestionEngine.__new__(IngestionEngine)
+    e.greeks_calculator = MagicMock()
+    e.latest_underlying_price = 100.0
+    # 1 hour stale relative to the option timestamps used below.
+    e.latest_underlying_timestamp = ET.localize(datetime(2026, 5, 15, 11, 0))
+    e.greeks_max_underlying_age_seconds = _BASE
+    e.greeks_max_underlying_age_seconds_extended = _EXTENDED
+    e.greeks_stale_underlying_rejects = 0
+    e.greeks_stale_warn_interval_seconds = 60.0
+    e._greeks_stale_last_warn_mono = 0.0
+    e.db_symbol = "SPX"
+    e.greeks_calculated = 0
+    return e
+
+
+def test_greeks_stale_warning_throttled_by_time(monkeypatch):
+    e = _stale_greeks_engine()
+    # Friday noon ET: regular cash session, underlying feed expected for SPX.
+    option_ts = ET.localize(datetime(2026, 5, 15, 12, 0))
+
+    clock = {"t": 10_000.0}
+    monkeypatch.setattr(me, "_time", types.SimpleNamespace(monotonic=lambda: clock["t"]))
+    fake_logger = MagicMock()
+    monkeypatch.setattr(me, "logger", fake_logger)
+
+    # A burst of 200 rejects in the same instant => exactly one WARNING,
+    # but every reject is still counted and every Greek is refused.
+    for _ in range(200):
+        out = e._enrich_with_greeks({"timestamp": option_ts, "option_symbol": "X"})
+        assert out["delta"] is None
+    assert fake_logger.warning.call_count == 1
+    assert e.greeks_stale_underlying_rejects == 200
+
+    # Once the interval elapses, the next reject warns again.
+    clock["t"] += 61.0
+    e._enrich_with_greeks({"timestamp": option_ts, "option_symbol": "X"})
+    assert fake_logger.warning.call_count == 2

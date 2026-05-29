@@ -203,14 +203,22 @@ def test_expiration_boundary_at_exactly_1615_rolls_off():
 
 
 def _mock_db_connection_with_stale_underlying(
-    option_chain_ts, underlying_ts, underlying_price, option_rows
+    option_chain_ts, underlying_ts, underlying_price, option_rows, forward_row=None
 ):
     """Variant that scripts a deliberate gap between the option-chain
-    anchor and the underlying-quote timestamp."""
+    anchor and the underlying-quote timestamp.
+
+    ``forward_row`` scripts the optional close-stamp-skew re-anchor lookup
+    (``SELECT close, timestamp ... timestamp > option_ts``) that
+    ``_get_snapshot`` issues when the paired bar is more than one bucket
+    old in-session. ``None`` (the default) means "no forward bar found",
+    so a genuinely stale underlying still trips the gate; off-session
+    cases never reach this query and leave the entry unconsumed."""
     cursor = MagicMock()
     cursor.fetchone.side_effect = [
         (option_chain_ts,),
         (underlying_price, underlying_ts),
+        forward_row,
     ]
     cursor.fetchall.return_value = option_rows
     conn = MagicMock()
@@ -243,6 +251,50 @@ def test_in_session_fresh_underlying_proceeds():
         result = engine._get_snapshot()
     assert result is not None
     assert result["underlying_price"] == 500.0
+
+
+def test_in_session_open_close_stamp_skew_reanchors_to_fresh_bar():
+    """Cash open: the ``<= option_ts`` lookup returns yesterday's 16:00
+    close because the day's first underlying bar is close-stamped one
+    bucket AHEAD of the option bucket and isn't visible to that lookup
+    yet. A fresh bar exists just past option_ts, so the snapshot must
+    re-anchor onto it and proceed rather than refuse on a bogus ~17h gap.
+    """
+    engine = AnalyticsEngine(underlying="SPX")
+    open_ts = ET.localize(datetime(2026, 5, 29, 9, 30)).astimezone(timezone.utc)
+    # `<= option_ts` falls back across the session boundary to 16:00 close.
+    prior_close_ts = ET.localize(datetime(2026, 5, 28, 16, 0)).astimezone(timezone.utc)
+    # Day's first bar, close-stamped one minute ahead of the open bucket.
+    fresh_ts = open_ts + timedelta(seconds=60)
+    expiration = open_ts.astimezone(ET).date() + timedelta(days=7)
+    rows = [_row("SPXW260605C05000000", 5000.0, expiration, "C", open_ts)]
+    cm, cursor = _mock_db_connection_with_stale_underlying(
+        open_ts, prior_close_ts, 4990.0, rows, forward_row=(5000.0, fresh_ts)
+    )
+    with patch.object(main_engine, "db_connection", return_value=cm):
+        result = engine._get_snapshot()
+    assert result is not None  # re-anchored, not refused
+    assert result["underlying_price"] == 5000.0  # the fresh bar, not the 16:00 close
+
+    # The forward lookup is bounded to ~2 buckets past option_ts so a
+    # genuinely frozen feed can't be rescued by a far-future straggler.
+    fwd_call = next(c for c in cursor.execute.call_args_list if "ORDER BY timestamp ASC" in c[0][0])
+    lower, upper = fwd_call[0][1][1], fwd_call[0][1][2]
+    assert lower == open_ts
+    assert upper == open_ts + timedelta(seconds=120)
+
+
+def test_in_session_stale_underlying_with_no_forward_bar_still_refuses():
+    """The re-anchor must not mask a real outage: when the paired bar is
+    stale in-session AND no fresh bar exists past option_ts, the cycle is
+    still refused (forward_row defaults to None => lookup finds nothing)."""
+    engine = AnalyticsEngine(underlying="SPX")
+    in_session = ET.localize(datetime(2026, 5, 29, 12, 0)).astimezone(timezone.utc)
+    underlying_ts = in_session - timedelta(hours=2)  # 7,200s, far over 900s
+    cm, _ = _mock_db_connection_with_stale_underlying(in_session, underlying_ts, 5000.0, [])
+    with patch.object(main_engine, "db_connection", return_value=cm):
+        result = engine._get_snapshot()
+    assert result is None  # genuine staleness still trips the gate
 
 
 def test_offhours_stale_underlying_proceeds_to_freeze_last_snapshot():

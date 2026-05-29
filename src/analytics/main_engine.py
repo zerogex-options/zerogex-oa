@@ -574,6 +574,55 @@ class AnalyticsEngine:
                 # 16:00 ET; stocks/ETFs (SPY, QQQ) freeze at 20:00 ET.
                 # ``is_underlying_active_session`` encodes both.
                 uq_timestamp = uq_row[1]
+
+                # Close-stamp skew re-anchor.
+                #
+                # The underlying bar feed close-stamps each 1-minute bar at
+                # its END boundary (the 09:30 bar arrives stamped 09:31:00),
+                # so an underlying bucket sits one interval AHEAD of the
+                # option-quote bucket for the same wall-clock minute (option
+                # quotes bucket to the minute they print in). The
+                # ``timestamp <= option_ts`` lookup above therefore can't
+                # match the current minute's bar and falls back to the prior
+                # bucket. Mid-session the prior bucket coincides with the
+                # option bucket (age ~0) so this is invisible — but at the
+                # cash OPEN there is no prior-session bar inside the window,
+                # so the lookup falls all the way back to yesterday's 16:00
+                # close: a bogus ~17h "staleness" that refuses the first
+                # minute of cycles (and floods the journal) until the option
+                # clock rolls to the bar's close boundary. When the paired
+                # bar is more than one bucket old in-session yet a bar exists
+                # within a bucket or two AFTER option_ts — the close-stamp
+                # skew, not a real outage — re-anchor onto it. A genuinely
+                # stalled feed has no such forward bar, so the staleness gate
+                # below still fires.
+                bucket_seconds = _getenv_int("AGGREGATION_BUCKET_SECONDS", 60, min=1)
+                if (
+                    uq_timestamp is not None
+                    and is_underlying_active_session(timestamp, symbol=self.db_symbol)
+                    and (timestamp - uq_timestamp).total_seconds() > bucket_seconds
+                ):
+                    cursor.execute(
+                        """
+                        SELECT close, timestamp
+                        FROM underlying_quotes
+                        WHERE symbol = %s
+                          AND timestamp > %s
+                          AND timestamp <= %s
+                        ORDER BY timestamp ASC
+                        LIMIT 1
+                        """,
+                        (
+                            self.db_symbol,
+                            timestamp,
+                            timestamp + timedelta(seconds=2 * bucket_seconds),
+                        ),
+                    )
+                    fwd_row = cursor.fetchone()
+                    if fwd_row and fwd_row[0] is not None and fwd_row[1] is not None:
+                        underlying_price = float(fwd_row[0])
+                        uq_timestamp = fwd_row[1]
+
                 if uq_timestamp is not None and is_underlying_active_session(
                     timestamp, symbol=self.db_symbol
                 ):

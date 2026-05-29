@@ -20,7 +20,7 @@ import time
 import time as _time
 from dataclasses import dataclass
 from multiprocessing import Process
-from datetime import datetime, date as _date, time as dt_time, timezone
+from datetime import datetime, date as _date, time as dt_time, timedelta, timezone
 from typing import Dict, Any, List, Optional
 from collections import defaultdict
 import pytz
@@ -197,6 +197,18 @@ class IngestionEngine:
         )
         # Counter so operators can see how often staleness rejects fire.
         self.greeks_stale_underlying_rejects = 0
+        # Time-based throttle for the in-session staleness WARNING. A dense
+        # option stream produces thousands of rejects/min against a single
+        # stale underlying, so the previous per-100-reject gate collapsed to
+        # a multi-Hz journal flood at the open. Warn at most once per
+        # interval instead, mirroring the stream watchdog's time-based
+        # cadence so the log reflects how long the feed has been stale, not
+        # how fast options tick. ``_greeks_stale_last_warn_mono`` starts at
+        # 0.0 so the first reject of a run warns immediately.
+        self.greeks_stale_warn_interval_seconds = float(
+            os.getenv("GREEKS_STALE_WARN_INTERVAL_SECONDS", "60")
+        )
+        self._greeks_stale_last_warn_mono = 0.0
         # Counter for crossed/missing-quote fallbacks in _classify_volume_chunk.
         self._classify_fallback_count: int = 0
 
@@ -361,7 +373,19 @@ class IngestionEngine:
         # The stream delivers the current 1-minute bar continuously.
         # Persist each update immediately and overwrite the in-progress minute.
         timestamp = data["timestamp"]
-        bucket = bucket_timestamp(timestamp, AGGREGATION_BUCKET_SECONDS)
+        # TradeStation close-stamps each 1-minute bar at its END boundary, so
+        # the raw bar timestamp is one interval ahead of the minute the bar
+        # actually covers (the 09:30 bar arrives stamped 09:31:00). Bucket the
+        # instant just before the close so the stored row lands on the bar's
+        # own minute — matching the option-quote convention (floor of the
+        # quote's print time) and wall-clock now(). Without this the
+        # underlying bucket sat one minute ahead of the contemporaneous option
+        # bucket, which (a) wrote underlying_quotes rows ~1 min into the future
+        # and (b) broke the analytics ``underlying.timestamp <= option_ts``
+        # pairing at the cash open — there it fell back across the session
+        # boundary to the prior 16:00 close and refused the first minute of GEX
+        # cycles. A bar stamped mid-interval floors to its own minute unchanged.
+        bucket = bucket_timestamp(timestamp - timedelta(seconds=1), AGGREGATION_BUCKET_SECONDS)
 
         payload = {
             "symbol": self.db_symbol,
@@ -394,6 +418,13 @@ class IngestionEngine:
         old_price = self.latest_underlying_price
         if "close" in data and data["close"] > 0:
             self.latest_underlying_price = data["close"]
+            # Intentionally the RAW (close-boundary) bar timestamp, NOT the
+            # period-start ``bucket`` written to the DB above. The Greeks gate
+            # compares this against the option quote time; the close-stamp's
+            # one-interval lead gives ~1 bar of slack that the 90s threshold
+            # was tuned around. Normalizing it here would effectively tighten
+            # the gate by a bucket and refuse Greeks whenever the bar feed
+            # streams a touch late within its minute.
             self.latest_underlying_timestamp = data.get("timestamp") or datetime.now(ET)
 
             # Log when we first get underlying price (important for Greeks)
@@ -506,7 +537,16 @@ class IngestionEngine:
                     # log at DEBUG and far less often so off-window runs
                     # don't flood the journal with a known-benign state.
                     if underlying_feed_expected(option_ts, SESSION_TEMPLATE, self.db_symbol):
-                        if self.greeks_stale_underlying_rejects % 100 == 1:
+                        # Throttle by wall-clock, not reject count: under a
+                        # dense option stream a per-100-reject gate fires
+                        # many times per second. One warning per interval
+                        # keeps the staleness visible without flooding.
+                        now_mono = _time.monotonic()
+                        if (
+                            now_mono - self._greeks_stale_last_warn_mono
+                            >= self.greeks_stale_warn_interval_seconds
+                        ):
+                            self._greeks_stale_last_warn_mono = now_mono
                             logger.warning(
                                 "Refusing Greeks: underlying price is %.0fs stale "
                                 "(threshold %.0fs) while the feed should be live. "
