@@ -69,10 +69,19 @@ def _normalize_signal_score_row(row: dict[str, Any]) -> dict[str, Any]:
         composite_score = 50.0
 
     components = _normalize_msi_components(out.get("components") or {})
-    return {
+    # Surface the row's persisted timestamp so the chart can dedupe
+    # consecutive polls when the engine isn't producing new ticks
+    # (weekends, holidays). Without it the client falls back to
+    # `Date.now()` and accumulates fake "current-time" points on top of
+    # a stale value, breaking the frozen-at-last-close behavior.
+    ts = out.get("timestamp")
+    payload: dict[str, Any] = {
         "composite_score": round(max(0.0, min(100.0, composite_score)), 2),
         "components": components,
     }
+    if ts is not None:
+        payload["timestamp"] = ts.isoformat() if hasattr(ts, "isoformat") else ts
+    return payload
 
 
 def get_db() -> DatabaseManager:
@@ -371,14 +380,16 @@ async def get_action_card(
 async def get_score_history(
     underlying: str = Query(default="SPY"),
     limit: int = Query(default=600, ge=1, le=5000),
+    lookback_days: int = Query(default=4, ge=1, le=30),
     db: DatabaseManager = Depends(get_db),
 ):
     """Time series of the composite MSI, newest-first.
 
-    **Params:** `underlying` (default `SPY`), `limit` (default 600, max 5000).
-    The DB read also caps results to roughly two trading sessions back (the
-    four most recent calendar days) so the default response covers the
-    current and previous sessions without truncation across weekends.
+    **Params:** `underlying` (default `SPY`), `limit` (default 600, max 5000),
+    `lookback_days` (default 4, max 30). The DB read caps results to the
+    requested calendar-day window so the default response covers the current
+    and previous sessions across a normal weekend; raise `lookback_days` to
+    drive multi-day chart presets (e.g. 5-trading-day view).
 
     **Returns.** An array of objects with `timestamp`, `composite_score`, and
     `components` (same shape as `/score`). Rows are ordered by `timestamp DESC`
@@ -409,7 +420,7 @@ async def get_score_history(
     regime bands at 20/40/70. Stacked-area chart of component `contribution`
     values underneath shows which component flipped the regime.
     """
-    rows = await db.get_signal_score_history(underlying.upper(), limit)
+    rows = await db.get_signal_score_history(underlying.upper(), limit, lookback_days)
     normalized_rows = []
     for row in rows:
         normalized = _normalize_signal_score_row(row)

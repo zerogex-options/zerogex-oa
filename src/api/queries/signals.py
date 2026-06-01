@@ -981,11 +981,14 @@ class SignalsQueriesMixin:
             return None
 
     async def get_signal_score_history(
-        self, symbol: str = "SPY", limit: int = SIGNAL_HISTORY_LIMIT
+        self,
+        symbol: str = "SPY",
+        limit: int = SIGNAL_HISTORY_LIMIT,
+        lookback_days: int = SIGNAL_HISTORY_LOOKBACK_DAYS,
     ) -> list[Dict[str, Any]]:
-        # Two-session lookback by calendar days plus a row cap. The composite
-        # MSI is persisted every cycle so dense underlyings can produce many
-        # thousands of rows over four days — LIMIT keeps the payload bounded.
+        # Calendar-day lookback plus a row cap. The composite MSI is persisted
+        # every cycle so dense underlyings can produce many thousands of rows
+        # — LIMIT keeps the payload bounded.
         query = """
             SELECT
                 ss.underlying,
@@ -1000,7 +1003,7 @@ class SignalsQueriesMixin:
         """
         try:
             async with self._acquire_connection() as conn:
-                rows = await conn.fetch(query, symbol, limit, SIGNAL_HISTORY_LOOKBACK_DAYS)
+                rows = await conn.fetch(query, symbol, limit, lookback_days)
                 out = []
                 for row in rows:
                     d = dict(row)
