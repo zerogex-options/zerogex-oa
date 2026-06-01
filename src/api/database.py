@@ -198,9 +198,25 @@ def _flow_lag_same_session_clause(use_cash_keying: bool) -> str:
     * ``use_cash_keying=False`` (legacy): equality on the ET CALENDAR
       date.  Boundary is calendar midnight ET.
     * ``use_cash_keying=True``: equality on the CASH-SESSION date,
-      computed by shifting the ET wall-clock back by 09:30 before
-      truncating.  Boundary is the 09:30 ET cash open -- the moment
-      TradeStation resets option cumulative volume.
+      computed by (a) shifting the ET wall-clock back by 09:30 to put
+      pre-cash-open hours on the prior calendar day, then (b) rolling
+      Sat/Sun back to the prior Friday so a weekend-bridge timestamp
+      (e.g. Mon 00:00 ET, which is Sun 14:30 ET after the shift)
+      doesn't land on a non-trading day that has no 09:30 ET cash
+      open to anchor against.  Without (b) the LAG-CASE treats
+      Mon 00:00 ET as a "Sunday session" boundary distinct from
+      Friday's session and generates a phantom flow event for every
+      contract that traded Friday -- the bug behind the user-reported
+      992 phantom midnight rows on 2026-06-01.
+
+    NYSE holiday handling is **not** folded in here yet: encoding
+    ``NYSE_HOLIDAYS`` in pure SQL would require either a holidays
+    lookup table or an inline VALUES list, and the Python
+    ``cash_session_date`` counterpart in ``src/validation.py`` is
+    currently weekend-only to stay symmetric.  On a holiday both
+    formulations treat the holiday as a trading day; consistent (if
+    not strictly correct) deltas result.  When the SQL gains
+    holiday awareness, update ``cash_session_date`` in lock-step.
 
     Both branches operate on ``s.timestamp`` and ``LAG(s.timestamp)
     OVER w`` from the surrounding query, so the fragment is purely
@@ -208,11 +224,28 @@ def _flow_lag_same_session_clause(use_cash_keying: bool) -> str:
     ``AT TIME ZONE 'America/New_York'`` resolves to local wall-clock.
     """
     if use_cash_keying:
+        # Roll Sat (DOW=6) back 1 day and Sun (DOW=0) back 2 days so a
+        # weekend-bridge timestamp lands on the prior Friday.  Inlined
+        # twice (once for LAG, once for current row) rather than
+        # factored to a CTE so the planner sees a pure expression.
+        def cash_session_date_expr(ts_sql: str) -> str:
+            shifted = (
+                "(("
+                + ts_sql
+                + " AT TIME ZONE 'America/New_York') "
+                "- interval '9 hours 30 minutes')::date"
+            )
+            return (
+                "CASE EXTRACT(DOW FROM " + shifted + ") "
+                "WHEN 6 THEN " + shifted + " - 1 "
+                "WHEN 0 THEN " + shifted + " - 2 "
+                "ELSE " + shifted + " END"
+            )
+
         return (
-            "((LAG(s.timestamp) OVER w AT TIME ZONE 'America/New_York') "
-            "- interval '9 hours 30 minutes')::date "
-            "= ((s.timestamp AT TIME ZONE 'America/New_York') "
-            "- interval '9 hours 30 minutes')::date"
+            cash_session_date_expr("LAG(s.timestamp) OVER w")
+            + " = "
+            + cash_session_date_expr("s.timestamp")
         )
     return (
         "(LAG(s.timestamp) OVER w AT TIME ZONE 'America/New_York')::date "
