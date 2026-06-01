@@ -172,6 +172,63 @@ def test_cash_session_date_monday_pre_open_rolls_back_to_prior_friday():
     assert cash_session_date(mon_open) == date(2026, 6, 1)
 
 
+def test_cash_session_date_rolls_back_over_nyse_holidays(monkeypatch):
+    """When a candidate date lands on an NYSE-observed holiday, the
+    helper must continue walking back until it finds a real trading
+    day.  Exercises the same Mon-midnight phantom pattern that bit on
+    2026-06-01, but now via a holiday bridge instead of a weekend.
+
+    Scenario: Friday 2026-07-03 is the NYSE-observed Independence Day
+    (July 4 falls on Saturday).  The trading-day-immediately-before
+    is Thursday 2026-07-02.  A Mon 2026-07-06 00:00 ET timestamp must
+    map back to Thu 2026-07-02, not to Friday 2026-07-03 (closed) or
+    to Sunday 2026-07-05 (the naive minus-9h30m result).
+    """
+    import src.validation as validation_mod
+
+    # Inject just the Friday-after-July-4 holiday for the duration of
+    # the test (don't depend on the env's actual NYSE_HOLIDAYS).
+    monkeypatch.setattr(
+        validation_mod, "NYSE_HOLIDAYS", {date(2026, 7, 3)}
+    )
+
+    # Mon 2026-07-06 00:00 ET -> naive shift gives Sun 2026-07-05;
+    # weekend roll-back hits Fri 2026-07-03 which is the holiday;
+    # holiday roll-back must continue to Thu 2026-07-02.
+    mon_after_holiday_midnight = _ET.localize(datetime(2026, 7, 6, 0, 0, 0))
+    assert cash_session_date(mon_after_holiday_midnight) == date(2026, 7, 2)
+    # The pre-open band on Monday must agree.
+    mon_after_holiday_pre_open = _ET.localize(datetime(2026, 7, 6, 9, 29, 59))
+    assert cash_session_date(mon_after_holiday_pre_open) == date(2026, 7, 2)
+    # And the Mon cash open itself rolls forward into the new session.
+    mon_after_holiday_open = _ET.localize(datetime(2026, 7, 6, 9, 30, 0))
+    assert cash_session_date(mon_after_holiday_open) == date(2026, 7, 6)
+    # Sat / Sun timestamps in the bridge also land on Thursday, not
+    # Friday-the-holiday.
+    sat_evening = _ET.localize(datetime(2026, 7, 4, 18, 0, 0))
+    assert cash_session_date(sat_evening) == date(2026, 7, 2)
+
+
+def test_cash_session_date_handles_extended_holiday_closure(monkeypatch):
+    """Worst-case stress test: a 4-trading-day closure (Sep 11-2001
+    style).  The helper must keep walking back as far as needed to
+    find a real trading day."""
+    import src.validation as validation_mod
+
+    # Fake closure: Tue 2026-09-15 through Fri 2026-09-18 are all
+    # NYSE-observed holidays.  Prior trading day is Mon 2026-09-14.
+    monkeypatch.setattr(
+        validation_mod,
+        "NYSE_HOLIDAYS",
+        {date(2026, 9, 15), date(2026, 9, 16), date(2026, 9, 17), date(2026, 9, 18)},
+    )
+
+    # Mon 2026-09-21 00:00 ET -> walks back through Sun, Sat, Fri,
+    # Thu, Wed, Tue (all closed) -> lands on Mon 2026-09-14.
+    deep_bridge = _ET.localize(datetime(2026, 9, 21, 0, 0, 0))
+    assert cash_session_date(deep_bridge) == date(2026, 9, 14)
+
+
 def test_cash_session_date_month_boundary_pre_cash_returns_prior_month():
     """Pre-cash on the 1st of a month rolls back to the last day of the
     previous month.  Verifies the date arithmetic doesn't blow up on

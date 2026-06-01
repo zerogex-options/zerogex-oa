@@ -187,6 +187,16 @@ def _expected_flow_series_bars(session_start: datetime, session_end: datetime) -
     return int(span // 300) + 1
 
 
+_CASH_SESSION_DATE_MAX_LOOKBACK_DAYS = 6
+"""Max days to walk back from a candidate date when finding the most
+recent NYSE trading day.  6 covers the worst-case extended closures the
+market has actually experienced (e.g. Sep 11-17 2001 = 4 trading days
+shuttered plus the surrounding weekend; Christmas on a Saturday with the
+observed close on Friday gives 4 consecutive non-trading days).  If
+NYSE_HOLIDAYS ever grows to bridge more than this many consecutive
+days, raise this value -- the COALESCE chain expands linearly."""
+
+
 def _flow_lag_same_session_clause(use_cash_keying: bool) -> str:
     """SQL fragment for the ``flow_contract_facts`` LAG-CASE same-session check.
 
@@ -200,23 +210,24 @@ def _flow_lag_same_session_clause(use_cash_keying: bool) -> str:
     * ``use_cash_keying=True``: equality on the CASH-SESSION date,
       computed by (a) shifting the ET wall-clock back by 09:30 to put
       pre-cash-open hours on the prior calendar day, then (b) rolling
-      Sat/Sun back to the prior Friday so a weekend-bridge timestamp
-      (e.g. Mon 00:00 ET, which is Sun 14:30 ET after the shift)
-      doesn't land on a non-trading day that has no 09:30 ET cash
-      open to anchor against.  Without (b) the LAG-CASE treats
-      Mon 00:00 ET as a "Sunday session" boundary distinct from
-      Friday's session and generates a phantom flow event for every
-      contract that traded Friday -- the bug behind the user-reported
-      992 phantom midnight rows on 2026-06-01.
+      Sat/Sun/NYSE-holidays back to the most recent trading day so a
+      gap-bridge timestamp (e.g. Mon 00:00 ET, which is Sun 14:30 ET
+      after the shift; or Tue 06:00 ET after a Mon holiday) doesn't
+      land on a non-trading day that has no 09:30 ET cash open to
+      anchor against.  Without (b) the LAG-CASE treats the bridge as
+      a session boundary distinct from the prior trading day's
+      session and generates a phantom flow event for every contract
+      that traded the prior session -- the bug behind the user-
+      reported 992 phantom midnight rows on 2026-06-01, and the same
+      bug in miniature around every holiday weekend.
 
-    NYSE holiday handling is **not** folded in here yet: encoding
-    ``NYSE_HOLIDAYS`` in pure SQL would require either a holidays
-    lookup table or an inline VALUES list, and the Python
-    ``cash_session_date`` counterpart in ``src/validation.py`` is
-    currently weekend-only to stay symmetric.  On a holiday both
-    formulations treat the holiday as a trading day; consistent (if
-    not strictly correct) deltas result.  When the SQL gains
-    holiday awareness, update ``cash_session_date`` in lock-step.
+    NYSE_HOLIDAYS is inlined as a literal ``IN (...)`` set at SQL
+    build time from the env-driven Python set in ``market_calendar``.
+    Keeps Python's ``cash_session_date`` and this fragment in
+    lock-step -- both walk back over weekends + holidays until they
+    land on a trading day.  When the holidays env var changes,
+    Python picks it up on next import and this fragment picks it up
+    on its next call.
 
     Both branches operate on ``s.timestamp`` and ``LAG(s.timestamp)
     OVER w`` from the surrounding query, so the fragment is purely
@@ -224,10 +235,22 @@ def _flow_lag_same_session_clause(use_cash_keying: bool) -> str:
     ``AT TIME ZONE 'America/New_York'`` resolves to local wall-clock.
     """
     if use_cash_keying:
-        # Roll Sat (DOW=6) back 1 day and Sun (DOW=0) back 2 days so a
-        # weekend-bridge timestamp lands on the prior Friday.  Inlined
-        # twice (once for LAG, once for current row) rather than
-        # factored to a CTE so the planner sees a pure expression.
+        # Inline the NYSE_HOLIDAYS set as a Postgres IN list.  Empty
+        # set falls back to a never-matching predicate (no holidays
+        # known yet) so the walk-back degenerates to weekends-only.
+        if NYSE_HOLIDAYS:
+            holiday_set_sql = "(" + ", ".join(
+                f"DATE '{h.isoformat()}'" for h in sorted(NYSE_HOLIDAYS)
+            ) + ")"
+        else:
+            holiday_set_sql = None
+
+        def is_trading_day(date_expr: str) -> str:
+            weekday_ok = f"EXTRACT(DOW FROM ({date_expr})) NOT IN (0, 6)"
+            if holiday_set_sql is None:
+                return weekday_ok
+            return f"({weekday_ok} AND ({date_expr}) NOT IN {holiday_set_sql})"
+
         def cash_session_date_expr(ts_sql: str) -> str:
             shifted = (
                 "(("
@@ -235,12 +258,20 @@ def _flow_lag_same_session_clause(use_cash_keying: bool) -> str:
                 + " AT TIME ZONE 'America/New_York') "
                 "- interval '9 hours 30 minutes')::date"
             )
-            return (
-                "CASE EXTRACT(DOW FROM " + shifted + ") "
-                "WHEN 6 THEN " + shifted + " - 1 "
-                "WHEN 0 THEN " + shifted + " - 2 "
-                "ELSE " + shifted + " END"
-            )
+            # Walk back up to N days via COALESCE.  Each step returns
+            # the candidate if it's a trading day, else NULL; the
+            # first non-NULL wins.  Falls through to ``shifted - N``
+            # unconditionally so the expression always evaluates to a
+            # date even if the worst-case bound is exceeded (degraded
+            # but not crashing).
+            branches = []
+            for offset in range(_CASH_SESSION_DATE_MAX_LOOKBACK_DAYS):
+                candidate = f"({shifted} - {offset})"
+                branches.append(
+                    f"CASE WHEN {is_trading_day(candidate)} THEN {candidate} END"
+                )
+            fallback = f"({shifted} - {_CASH_SESSION_DATE_MAX_LOOKBACK_DAYS})"
+            return "COALESCE(" + ", ".join(branches + [fallback]) + ")"
 
         return (
             cash_session_date_expr("LAG(s.timestamp) OVER w")

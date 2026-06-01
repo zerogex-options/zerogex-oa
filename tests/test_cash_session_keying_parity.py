@@ -28,15 +28,25 @@ session boundaries the formulations define differently:
   hours of the same day D.  Cash is correct here too: TS resets at
   09:30, so the post-09:30 cumulative IS a fresh count.
 
+* ``holiday_bridge_gap`` -- a sub-category of crosses_calendar_only
+  where the LAG/current pair spans an NYSE-observed holiday (not just
+  a weekend).  Cash correctly maps both ends to the same prior-trading-
+  day session; legacy still sees a calendar boundary.  Broken out as
+  its own category so a future regression in the SQL/Python holiday
+  walk-back (e.g. NYSE_HOLIDAYS not propagating to one side) shows up
+  visibly in the diagnostic rather than being mixed with normal
+  weekend bridges.
+
 * ``both_boundaries`` -- both formulations agree (no divergence).
 * ``neither_boundary`` -- both formulations agree.  If a divergence
   shows up classified this way, something is wrong with the LAG-CASE
   rendering and the test fails.
 
 The cutover is safe when the parity harness returns ONLY
-crosses_calendar_only and crosses_cash_open_only divergences.  Both of
-those are by-design behavior changes that the rollout commit-message
-documented.  The diagnostic prints the count + a sampling per cause so
+crosses_calendar_only, crosses_cash_open_only, and holiday_bridge_gap
+divergences.  All three are by-design behavior changes documented in
+the rollout commit messages.  The diagnostic prints the count + a
+sampling per cause so
 the operator can eyeball "how many rows in this day were affected" and
 "is the magnitude of those deltas sensible" before flipping the flag.
 
@@ -58,7 +68,7 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
 
 import pytest
@@ -205,11 +215,19 @@ _PARITY_CTE = """
 def _classify_divergence_cause(prior_ts, current_ts, et) -> str:
     """Why might the two formulations disagree on this LAG/current pair?
 
-    See the module docstring for the four cases.  ``no_prior`` means
-    the row has no LAG (first row in the contract's window after the
-    seed); it cannot be the source of a divergence so it's classified
-    separately and ignored by the failure check.
+    See the module docstring for the four base cases.  ``no_prior``
+    means the row has no LAG (first row in the contract's window
+    after the seed); it cannot be the source of a divergence so it's
+    classified separately and ignored by the failure check.
+
+    ``crosses_calendar_only`` is further split into a weekend-bridge
+    and a holiday-bridge sub-category so a regression that re-breaks
+    only the holiday walk-back (e.g. SQL and Python falling out of
+    sync on NYSE_HOLIDAYS) is visible in the output.  Both sub-
+    categories are accepted divergence causes -- they're just
+    sub-typed for diagnostic clarity.
     """
+    from src.market_calendar import NYSE_HOLIDAYS
     from src.validation import cash_session_date
 
     if prior_ts is None:
@@ -223,6 +241,15 @@ def _classify_divergence_cause(prior_ts, current_ts, et) -> str:
     if legacy_same and not cash_same:
         return "crosses_cash_open_only"
     if not legacy_same and cash_same:
+        # Distinguish whether the calendar-only crossing was spanned
+        # by weekend-only or also by an NYSE holiday.  The bridge
+        # range is all calendar dates strictly between prior_cal and
+        # curr_cal inclusive of the endpoints; if any of those is in
+        # NYSE_HOLIDAYS, this is a holiday_bridge_gap divergence.
+        lo, hi = sorted([prior_cal, curr_cal])
+        bridge_days = [lo + timedelta(days=i) for i in range((hi - lo).days + 1)]
+        if any(d in NYSE_HOLIDAYS for d in bridge_days):
+            return "holiday_bridge_gap"
         return "crosses_calendar_only"
     if not legacy_same and not cash_same:
         return "both_boundaries"

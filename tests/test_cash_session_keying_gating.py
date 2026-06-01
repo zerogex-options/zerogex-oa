@@ -118,11 +118,12 @@ def test_lag_clause_flag_on_shifts_both_sides_by_cash_open():
     assert "s.timestamp AT TIME ZONE 'America/New_York'" in clause
 
 
-def test_lag_clause_flag_on_rolls_weekend_back_to_friday():
-    """Cash-keying clause must roll Sat (DOW=6) and Sun (DOW=0) back to
-    the prior Friday so a Mon 00:00 ET timestamp (which sits at Sun
-    14:30 ET after the 9h30m shift) doesn't get assigned to a phantom
-    "Sunday session" that has no 09:30 ET cash open to anchor against.
+def test_lag_clause_flag_on_rolls_weekend_back_to_a_trading_day():
+    """Cash-keying clause must roll Sat/Sun (and NYSE holidays) back
+    to the most recent trading day so a gap-bridge timestamp (Mon
+    00:00 ET, or Tue 06:00 ET after a Mon holiday) doesn't get
+    assigned to a phantom "non-trading session" with no 09:30 ET
+    cash open to anchor against.
 
     Regression for the 2026-06-01 phantom-midnight bug where every
     contract that traded the prior Friday generated a spurious flow
@@ -131,8 +132,40 @@ def test_lag_clause_flag_on_rolls_weekend_back_to_friday():
     """
     clause = _flow_lag_same_session_clause(use_cash_keying=True)
     assert "EXTRACT(DOW" in clause
-    assert "WHEN 6" in clause  # Saturday roll-back
-    assert "WHEN 0" in clause  # Sunday roll-back
+    # The walk-back is now expressed as COALESCE over a chain of
+    # ``CASE WHEN <is_trading_day(candidate)> THEN candidate END``
+    # branches; the DOW check uses ``NOT IN (0, 6)`` to exclude both
+    # Sunday and Saturday simultaneously.
+    assert "NOT IN (0, 6)" in clause
+    assert "COALESCE" in clause
+
+
+def test_lag_clause_flag_on_rolls_holidays_back_when_present(monkeypatch):
+    """When ``NYSE_HOLIDAYS`` is non-empty, the cash-keying clause
+    must also exclude those dates from the trading-day predicate so a
+    Tue-after-Mon-holiday timestamp lands on the prior Friday's
+    session rather than the holiday Monday."""
+    import src.api.database as db_mod
+    from datetime import date
+
+    monkeypatch.setattr(
+        db_mod, "NYSE_HOLIDAYS", {date(2026, 7, 3), date(2026, 11, 26)}
+    )
+    clause = db_mod._flow_lag_same_session_clause(use_cash_keying=True)
+    assert "NOT IN (DATE '2026-07-03', DATE '2026-11-26')" in clause
+
+
+def test_lag_clause_flag_on_falls_back_to_weekend_only_with_no_holidays(monkeypatch):
+    """An empty ``NYSE_HOLIDAYS`` set must degrade to weekend-only
+    walk-back without producing an ``IN ()`` empty-list syntax error."""
+    import src.api.database as db_mod
+
+    monkeypatch.setattr(db_mod, "NYSE_HOLIDAYS", set())
+    clause = db_mod._flow_lag_same_session_clause(use_cash_keying=True)
+    # No DATE literal -> the holiday predicate is omitted entirely.
+    assert "DATE '" not in clause
+    # But the weekend predicate must still be there.
+    assert "NOT IN (0, 6)" in clause
 
 
 def test_lag_clause_both_forms_compare_lag_to_current():

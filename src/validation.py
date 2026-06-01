@@ -307,23 +307,24 @@ def cash_session_date(ts: datetime) -> _date_type:
       * ts <  09:30:00 ET on day D  -> D - 1 (pre-cash-open hours belong
         to the prior cash session for purposes of TradeStation's option-
         cumulative reset semantic)
-      * if the resulting date lands on a Saturday or Sunday, roll back
-        to the prior Friday: weekends have no 09:30 ET cash open, so a
-        Sat/Sun "session date" would have no rows to anchor against
-        and consumers (the ingest accumulator's session key, the
-        LAG-CASE same-session clause in flow_contract_facts) would
-        treat post-weekend pre-09:30 ET timestamps as the start of a
-        phantom "Sunday session" -- causing the Mon 00:00 ET fresh-
-        hydrate-from-zero phantom that bug-reported the need for this
-        roll-back in the first place.
+      * if the resulting date lands on a Saturday, Sunday, or
+        NYSE-observed holiday, roll back over the gap to the most
+        recent trading day: non-trading days have no 09:30 ET cash
+        open, so they would have no rows to anchor against and
+        consumers (the ingest accumulator's session key, the LAG-CASE
+        same-session clause in flow_contract_facts) would treat
+        post-gap pre-09:30 ET timestamps as the start of a phantom
+        "Sunday/holiday session" -- the Mon-00:00-ET fresh-hydrate-
+        from-zero phantom that bug-reported the need for the
+        weekend roll-back in the first place, and the same pattern
+        in miniature around holidays.
 
-    NYSE holiday handling is **not** folded in here on purpose: the SQL
-    counterpart in ``_flow_lag_same_session_clause`` currently handles
-    weekends only (holiday-aware SQL would require materializing
-    ``NYSE_HOLIDAYS`` as a table or VALUES list).  Keeping the two in
-    lock-step prevents Python/SQL disagreement at the LAG-CASE boundary.
-    When the SQL gains holiday awareness, fold ``NYSE_HOLIDAYS`` into
-    the roll-back loop here and the two stay aligned.
+    Holiday handling is symmetric with the SQL counterpart in
+    ``_flow_lag_same_session_clause``: both inline ``NYSE_HOLIDAYS``
+    from ``market_calendar.py`` (env-driven, ``NYSE_HOLIDAYS_STRICT``
+    fail-fast in production).  When the holidays env var changes,
+    Python picks it up on next import and the SQL fragment picks it
+    up on next call (rebuilt per call from the same Python set).
 
     Naive timestamps are treated as UTC (matches the rest of the
     validation/bucket helpers).
@@ -349,8 +350,13 @@ def cash_session_date(ts: datetime) -> _date_type:
         candidate = ts_et.date() - _timedelta(days=1)
     else:
         candidate = ts_et.date()
-    # Roll Sat/Sun back to Friday.  weekday(): Mon=0 .. Fri=4, Sat=5, Sun=6.
-    while candidate.weekday() > 4:
+    # Roll back over weekends and NYSE-observed holidays so the returned
+    # date is always the most recent trading day -- i.e. a date with a
+    # real 09:30 ET cash open.  Bounded by the longest contiguous NYSE
+    # closure we expect (Sep-11-2001 was four trading days; Christmas
+    # landing on a Saturday gives a four-day closure).  weekday():
+    # Mon=0 .. Fri=4, Sat=5, Sun=6.
+    while candidate.weekday() > 4 or candidate in NYSE_HOLIDAYS:
         candidate = candidate - _timedelta(days=1)
     return _local_date(candidate.year, candidate.month, candidate.day)
 
