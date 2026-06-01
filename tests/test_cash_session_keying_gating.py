@@ -106,9 +106,33 @@ def test_lag_clause_flag_on_shifts_both_sides_by_cash_open():
     clause = _flow_lag_same_session_clause(use_cash_keying=True)
     # The shift must apply to BOTH the LAG and the current timestamp;
     # otherwise the equality misclassifies pre-09:30 rows on one side.
-    assert clause.count("interval '9 hours 30 minutes'") == 2
-    assert clause.count("AT TIME ZONE 'America/New_York'") == 2
+    # The shift expression is inlined four times per side after the
+    # weekend roll-back was added (once for EXTRACT(DOW), three for
+    # the CASE branches), so both shift markers appear >= 2 with the
+    # same count across LAG and current.
+    assert clause.count("interval '9 hours 30 minutes'") >= 2
+    assert clause.count("AT TIME ZONE 'America/New_York'") >= 2
     assert "::date" in clause
+    # Both sides of the equality must be present.
+    assert "LAG(s.timestamp) OVER w" in clause
+    assert "s.timestamp AT TIME ZONE 'America/New_York'" in clause
+
+
+def test_lag_clause_flag_on_rolls_weekend_back_to_friday():
+    """Cash-keying clause must roll Sat (DOW=6) and Sun (DOW=0) back to
+    the prior Friday so a Mon 00:00 ET timestamp (which sits at Sun
+    14:30 ET after the 9h30m shift) doesn't get assigned to a phantom
+    "Sunday session" that has no 09:30 ET cash open to anchor against.
+
+    Regression for the 2026-06-01 phantom-midnight bug where every
+    contract that traded the prior Friday generated a spurious flow
+    event at exactly Mon 00:00 ET because both formulations agreed
+    that the weekend-bridge was a session boundary.
+    """
+    clause = _flow_lag_same_session_clause(use_cash_keying=True)
+    assert "EXTRACT(DOW" in clause
+    assert "WHEN 6" in clause  # Saturday roll-back
+    assert "WHEN 0" in clause  # Sunday roll-back
 
 
 def test_lag_clause_both_forms_compare_lag_to_current():

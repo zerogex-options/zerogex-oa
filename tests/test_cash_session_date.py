@@ -69,12 +69,15 @@ def test_cash_session_date_naive_datetime_treated_as_utc():
     """A naive datetime is interpreted as UTC, then converted to ET.
     13:30 UTC == 09:30 EDT (during DST) == 08:30 EST (outside DST).
     Pins both regimes."""
-    # 2025-04-15 is EDT (UTC-4): 13:30 UTC = 09:30 EDT -> session today.
+    # 2025-04-15 (Tue, EDT, UTC-4): 13:30 UTC = 09:30 EDT -> session today.
     naive_dst = datetime(2025, 4, 15, 13, 30, 0)
     assert cash_session_date(naive_dst) == date(2025, 4, 15)
-    # 2025-12-15 is EST (UTC-5): 13:30 UTC = 08:30 EST -> session yesterday.
-    naive_no_dst = datetime(2025, 12, 15, 13, 30, 0)
-    assert cash_session_date(naive_no_dst) == date(2025, 12, 14)
+    # 2025-12-16 (Tue, EST, UTC-5): 13:30 UTC = 08:30 EST -> session
+    # yesterday (Mon Dec 15).  Picking a Tuesday so the prior calendar
+    # day is a trading day -- the weekend roll-back wouldn't otherwise
+    # change the result.
+    naive_no_dst = datetime(2025, 12, 16, 13, 30, 0)
+    assert cash_session_date(naive_no_dst) == date(2025, 12, 15)
 
 
 def test_cash_session_date_utc_input_converts_correctly():
@@ -87,41 +90,86 @@ def test_cash_session_date_utc_input_converts_correctly():
 
 def test_cash_session_date_handles_spring_forward_dst():
     """On the spring-forward DST transition the ET wall clock jumps from
-    02:00 EST to 03:00 EDT.  09:30 ET that day still resolves correctly
-    (pytz handles the offset; we only care that 09:30 wall-clock means
-    session start).  Sample 2025-03-09 (US DST starts)."""
-    # 09:30 EDT on the DST transition day = 13:30 UTC.
-    ts = datetime(2025, 3, 9, 13, 30, 0, tzinfo=timezone.utc)
-    assert cash_session_date(ts) == date(2025, 3, 9)
-    # 09:29 EDT on the same day = 13:29 UTC -> prior session.
-    ts = datetime(2025, 3, 9, 13, 29, 0, tzinfo=timezone.utc)
-    assert cash_session_date(ts) == date(2025, 3, 8)
+    02:00 EST to 03:00 EDT.  09:30 ET resolves correctly across the
+    transition (pytz handles the offset).
+
+    The transition day itself (2025-03-09) is a Sunday, so any timestamp
+    on that day rolls back to the prior Friday (2025-03-07) under the
+    weekend-aware cash session date.  Use the Monday after to exercise
+    DST correctness without the weekend roll-back masking it.
+    """
+    # 2025-03-10 is the Monday after DST start (EDT now in effect).
+    # 09:30 EDT = 13:30 UTC.
+    ts = datetime(2025, 3, 10, 13, 30, 0, tzinfo=timezone.utc)
+    assert cash_session_date(ts) == date(2025, 3, 10)
+    # 09:29 EDT on the same Monday = 13:29 UTC -> prior session.  The
+    # naive prior-day arithmetic gives Sunday 2025-03-09 and the
+    # weekend roll-back maps that to Friday 2025-03-07.
+    ts = datetime(2025, 3, 10, 13, 29, 0, tzinfo=timezone.utc)
+    assert cash_session_date(ts) == date(2025, 3, 7)
 
 
 def test_cash_session_date_handles_fall_back_dst():
     """On the fall-back DST transition the ET wall clock jumps from
-    02:00 EDT back to 01:00 EST.  09:30 ET that day uses EST (UTC-5)."""
-    # 09:30 EST on 2025-11-02 = 14:30 UTC.
-    ts = datetime(2025, 11, 2, 14, 30, 0, tzinfo=timezone.utc)
-    assert cash_session_date(ts) == date(2025, 11, 2)
-    # 09:29 EST = 14:29 UTC -> prior session.
-    ts = datetime(2025, 11, 2, 14, 29, 0, tzinfo=timezone.utc)
-    assert cash_session_date(ts) == date(2025, 11, 1)
+    02:00 EDT back to 01:00 EST.  09:30 ET resolves correctly across
+    the transition.
+
+    2025-11-02 is the Sunday on which DST ends.  Like the spring case,
+    a Sunday timestamp rolls back to the prior Friday under the
+    weekend-aware cash session date, so we exercise DST correctness on
+    the Monday after.
+    """
+    # 2025-11-03 is the Monday after DST end.  09:30 EST = 14:30 UTC.
+    ts = datetime(2025, 11, 3, 14, 30, 0, tzinfo=timezone.utc)
+    assert cash_session_date(ts) == date(2025, 11, 3)
+    # 09:29 EST on the same Monday = 14:29 UTC -> prior session.  The
+    # weekend roll-back maps Sunday 2025-11-02 -> Friday 2025-10-31.
+    ts = datetime(2025, 11, 3, 14, 29, 0, tzinfo=timezone.utc)
+    assert cash_session_date(ts) == date(2025, 10, 31)
 
 
-def test_cash_session_date_weekend_input_returns_calendar_arithmetic():
-    """The helper does NOT consult the NYSE calendar.  A Saturday
-    timestamp returns "Saturday" or "Friday" via plain date arithmetic
-    -- the caller is expected to layer market_calendar on top if it
-    cares.  Pin the behavior so a future caller knows what to expect."""
-    # Saturday 14:00 ET (post-09:30) -> Saturday (no-op).  The downstream
-    # LAG-CASE doesn't care that Saturday isn't a trading day; it just
-    # uses the date as a partition key.
-    sat = _ET.localize(datetime(2025, 4, 19, 14, 0, 0))  # Sat
-    assert cash_session_date(sat) == date(2025, 4, 19)
-    # Sunday 03:00 ET (pre-09:30) -> Saturday.
+def test_cash_session_date_weekend_input_rolls_back_to_prior_friday():
+    """Weekend timestamps must map to the prior Friday's cash session.
+
+    The cash session that is "open" on a Sat/Sun timestamp began at the
+    most recent Friday 09:30 ET cash open and runs until the next
+    Monday 09:30 ET cash open.  Without rolling weekends back to that
+    Friday, downstream consumers (the ingest accumulator's session
+    key, the LAG-CASE in flow_contract_facts) hydrate a fresh
+    accumulator at a non-trading-day "session" with no anchor rows
+    and attribute Friday's residual cumulative as phantom flow at
+    Mon 00:00 ET.  This is the bug behind the 2026-06-01 phantom
+    midnight rows.  Pin the weekend roll-back so future callers can
+    rely on it.
+    """
+    # Saturday 14:00 ET (post-09:30) -> prior Friday.
+    sat_pm = _ET.localize(datetime(2025, 4, 19, 14, 0, 0))  # Sat
+    assert cash_session_date(sat_pm) == date(2025, 4, 18)
+    # Sunday 03:00 ET (pre-09:30) -> Saturday before the shift, Friday after.
     sun_early = _ET.localize(datetime(2025, 4, 20, 3, 0, 0))
-    assert cash_session_date(sun_early) == date(2025, 4, 19)
+    assert cash_session_date(sun_early) == date(2025, 4, 18)
+    # Sunday 16:00 ET (post-09:30 but on a non-trading day) -> Friday.
+    sun_pm = _ET.localize(datetime(2025, 4, 20, 16, 0, 0))
+    assert cash_session_date(sun_pm) == date(2025, 4, 18)
+
+
+def test_cash_session_date_monday_pre_open_rolls_back_to_prior_friday():
+    """The flagship regression: Mon 00:00 ET -> prior Friday.
+
+    Mon 00:00 ET is the timestamp that produced the 2026-06-01 phantom
+    rows.  Before the weekend-aware roll-back it returned Sunday
+    (via the plain ``timestamp - 9h30m`` arithmetic, which lands on
+    Sun 14:30 ET); now it must return Friday.
+    """
+    # Replicates the production case directly.
+    mon_midnight = _ET.localize(datetime(2026, 6, 1, 0, 0, 0))
+    assert cash_session_date(mon_midnight) == date(2026, 5, 29)  # Fri
+    # And anything in the Mon pre-open band stays on Friday.
+    mon_pre_open = _ET.localize(datetime(2026, 6, 1, 9, 29, 59))
+    assert cash_session_date(mon_pre_open) == date(2026, 5, 29)
+    # Once the cash open hits, the date rolls to Monday.
+    mon_open = _ET.localize(datetime(2026, 6, 1, 9, 30, 0))
+    assert cash_session_date(mon_open) == date(2026, 6, 1)
 
 
 def test_cash_session_date_month_boundary_pre_cash_returns_prior_month():
@@ -161,8 +209,14 @@ def test_cash_session_start_utc_est_offset():
 def test_cash_session_start_utc_is_inverse_of_cash_session_date_during_rth():
     """For any RTH timestamp ts, cash_session_start_utc(cash_session_date(ts))
     must be <= ts and the gap must be <= 6h45m (full RTH session length).
-    Smoke check that the two helpers are mutually consistent."""
-    for d, h, m in [(date(2025, 4, 15), 10, 30), (date(2025, 11, 2), 12, 0)]:
+    Smoke check that the two helpers are mutually consistent.
+
+    Inputs must be on actual trading days; a weekend timestamp rolls
+    back to the prior Friday, breaking the 6h45m gap bound.
+    """
+    # Pick weekdays in both DST regimes.  Tue Apr 15 2025 (EDT) and
+    # Mon Nov 3 2025 (EST) -- avoids weekends.
+    for d, h, m in [(date(2025, 4, 15), 10, 30), (date(2025, 11, 3), 12, 0)]:
         ts = _ET.localize(datetime(d.year, d.month, d.day, h, m))
         session_date = cash_session_date(ts)
         start = cash_session_start_utc(session_date)

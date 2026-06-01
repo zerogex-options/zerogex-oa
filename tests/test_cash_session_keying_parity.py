@@ -74,9 +74,15 @@ _DATE_ENV = os.getenv("CASH_SESSION_KEYING_PARITY_DATE")
 # handed us a DSN with no real host.  Without this guard, asyncpg gets
 # as far as DNS-resolving ``...`` and dies inside the IDNA codec with
 # ``UnicodeError: label empty or too long`` -- accurate, but actively
-# misleading about what went wrong.
+# misleading about what went wrong.  Also catches the ``HOST:PORT``
+# token form (e.g. ``postgresql://postgres@HOST:PORT/DB``) that the
+# previous guard let through: asyncpg fails int-parsing ``PORT`` deep
+# inside the URI parser, which is even less helpful than the IDNA
+# error.
+_PLACEHOLDER_TOKENS = ("...", "HOST", "PORT", "USER", "PASS", "DBNAME")
 _PLACEHOLDER_DSN = _DSN is not None and (
-    "..." in _DSN or _DSN.rstrip("/") in ("postgres:", "postgresql:")
+    _DSN.rstrip("/") in ("postgres:", "postgresql:")
+    or any(token in _DSN for token in _PLACEHOLDER_TOKENS)
 )
 
 if _PLACEHOLDER_DSN:

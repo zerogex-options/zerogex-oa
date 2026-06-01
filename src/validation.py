@@ -307,14 +307,26 @@ def cash_session_date(ts: datetime) -> _date_type:
       * ts <  09:30:00 ET on day D  -> D - 1 (pre-cash-open hours belong
         to the prior cash session for purposes of TradeStation's option-
         cumulative reset semantic)
+      * if the resulting date lands on a Saturday or Sunday, roll back
+        to the prior Friday: weekends have no 09:30 ET cash open, so a
+        Sat/Sun "session date" would have no rows to anchor against
+        and consumers (the ingest accumulator's session key, the
+        LAG-CASE same-session clause in flow_contract_facts) would
+        treat post-weekend pre-09:30 ET timestamps as the start of a
+        phantom "Sunday session" -- causing the Mon 00:00 ET fresh-
+        hydrate-from-zero phantom that bug-reported the need for this
+        roll-back in the first place.
+
+    NYSE holiday handling is **not** folded in here on purpose: the SQL
+    counterpart in ``_flow_lag_same_session_clause`` currently handles
+    weekends only (holiday-aware SQL would require materializing
+    ``NYSE_HOLIDAYS`` as a table or VALUES list).  Keeping the two in
+    lock-step prevents Python/SQL disagreement at the LAG-CASE boundary.
+    When the SQL gains holiday awareness, fold ``NYSE_HOLIDAYS`` into
+    the roll-back loop here and the two stay aligned.
 
     Naive timestamps are treated as UTC (matches the rest of the
-    validation/bucket helpers).  Weekend / holiday handling is OUT OF
-    SCOPE: a Saturday 02:00 ET input returns Friday's calendar date,
-    which is the correct "session this volume belongs to" answer for
-    Friday-overnight extended-hours flow but does NOT inspect the NYSE
-    calendar.  If the caller cares about that distinction it must
-    layer ``market_calendar`` on top.
+    validation/bucket helpers).
 
     The 09:30 ET boundary is wall-clock based.  DST transitions are
     handled correctly because ``pytz.localize`` / ``astimezone``
@@ -334,9 +346,13 @@ def cash_session_date(ts: datetime) -> _date_type:
     minutes_since_midnight = ts_et.hour * 60 + ts_et.minute
     cash_open_minutes = _ET_CASH_OPEN_HOUR * 60 + _ET_CASH_OPEN_MINUTE
     if minutes_since_midnight < cash_open_minutes:
-        prior = ts_et.date() - _timedelta(days=1)
-        return _local_date(prior.year, prior.month, prior.day)
-    return _local_date(ts_et.year, ts_et.month, ts_et.day)
+        candidate = ts_et.date() - _timedelta(days=1)
+    else:
+        candidate = ts_et.date()
+    # Roll Sat/Sun back to Friday.  weekday(): Mon=0 .. Fri=4, Sat=5, Sun=6.
+    while candidate.weekday() > 4:
+        candidate = candidate - _timedelta(days=1)
+    return _local_date(candidate.year, candidate.month, candidate.day)
 
 
 def cash_session_start_utc(session_date: _date_type) -> datetime:
