@@ -317,3 +317,33 @@ def test_cache_upsert_sql_is_a_class_constant():
         assert (
             f"GREATEST(option_chains_latest.{col}, EXCLUDED.{col})" in sql
         ), f"cache UPSERT must use GREATEST for monotonic column {col!r}"
+
+
+def test_cache_upsert_coalesces_greeks_and_iv_to_preserve_last_good_value():
+    """Regression: the cache UPSERT must COALESCE Greeks and IV so a
+    NULL-Greek write (the in-engine staleness gate at
+    ``_enrich_with_greeks`` sets ``data["gamma"] = None`` once the
+    underlying feed stalls past its session threshold) cannot clobber a
+    previously-good cache row.
+
+    Without COALESCE the cache row's gamma flips to NULL on every
+    post-close quote, the analytics snapshot's
+    ``WHERE gamma IS NOT NULL`` filter (``_SNAPSHOT_QUERY_CACHE``) then
+    drops those contracts, and the freeze semantic added in
+    ``analytics: session-aware underlying-staleness gate`` collapses to
+    a sparse one-strike surface — the symptom that hit production after
+    ``ANALYTICS_USE_LATEST_CACHE`` was flipped on.
+
+    History (``option_chains``) is keyed by ``(option_symbol, timestamp)``
+    so a NULL-gamma write at a NEW timestamp creates a new row and the
+    DISTINCT ON walk falls back to an earlier gamma-bearing row — the
+    cache has no such fallback (one row per contract) and must do the
+    preservation itself.
+    """
+    sql = IngestionEngine._OPTION_LATEST_UPSERT_SQL
+    for col in ("implied_volatility", "delta", "gamma", "theta", "vega"):
+        assert f"COALESCE(EXCLUDED.{col}, option_chains_latest.{col})" in sql, (
+            f"cache UPSERT must COALESCE {col!r} against the existing row "
+            "so a NULL-Greek write does not clobber a previously-good value "
+            "(off-session freeze regression)"
+        )

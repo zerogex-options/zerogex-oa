@@ -1243,10 +1243,21 @@ class IngestionEngine:
     # ``ANALYTICS_USE_LATEST_CACHE=true``.  One row per option_symbol;
     # the ``WHERE EXCLUDED.timestamp >= option_chains_latest.timestamp``
     # guard prevents an out-of-order / retry write from clobbering a
-    # newer row.  Greeks and quote columns track the row whose timestamp
-    # the writer is currently committing (latest-wins for the cache);
-    # the history table is the durable source of truth and uses the
-    # COALESCE-based merge below.
+    # newer row.
+    #
+    # Greeks and IV use ``COALESCE(EXCLUDED.x, option_chains_latest.x)``
+    # so a NULL-Greek write does not clobber a previously-good value.
+    # Required for the off-session freeze semantic: once the underlying
+    # feed stops, ingestion writes NULL Greeks (the in-engine staleness
+    # gate). Because the cache is keyed by option_symbol alone — one row
+    # per contract — a direct ``= EXCLUDED.gamma`` assignment would wipe
+    # the last-good gamma on every post-close quote, leaving the
+    # analytics snapshot's ``WHERE gamma IS NOT NULL`` filter to drop the
+    # affected contracts. The history table (option_chains) is keyed by
+    # (option_symbol, timestamp) so each new write is a new row and the
+    # DISTINCT ON snapshot query can fall back to an earlier
+    # gamma-bearing row; the cache has no such fallback, so it must
+    # preserve the last good Greek itself.
     _OPTION_LATEST_UPSERT_SQL = """
         INSERT INTO option_chains_latest
         (option_symbol, timestamp, underlying, strike, expiration, option_type,
@@ -1266,14 +1277,14 @@ class IngestionEngine:
             mid = EXCLUDED.mid,
             volume = GREATEST(option_chains_latest.volume, EXCLUDED.volume),
             open_interest = GREATEST(option_chains_latest.open_interest, EXCLUDED.open_interest),
-            implied_volatility = EXCLUDED.implied_volatility,
+            implied_volatility = COALESCE(EXCLUDED.implied_volatility, option_chains_latest.implied_volatility),
             ask_volume = GREATEST(option_chains_latest.ask_volume, EXCLUDED.ask_volume),
             mid_volume = GREATEST(option_chains_latest.mid_volume, EXCLUDED.mid_volume),
             bid_volume = GREATEST(option_chains_latest.bid_volume, EXCLUDED.bid_volume),
-            delta = EXCLUDED.delta,
-            gamma = EXCLUDED.gamma,
-            theta = EXCLUDED.theta,
-            vega = EXCLUDED.vega,
+            delta = COALESCE(EXCLUDED.delta, option_chains_latest.delta),
+            gamma = COALESCE(EXCLUDED.gamma, option_chains_latest.gamma),
+            theta = COALESCE(EXCLUDED.theta, option_chains_latest.theta),
+            vega = COALESCE(EXCLUDED.vega, option_chains_latest.vega),
             updated_at = NOW()
         WHERE EXCLUDED.timestamp >= option_chains_latest.timestamp
     """
