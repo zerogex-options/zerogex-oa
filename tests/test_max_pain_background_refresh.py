@@ -111,14 +111,23 @@ def test_refresh_continues_after_per_symbol_failure():
 
 
 class _FakeReadConn:
-    """Stand-in for the connection inside get_max_pain_current."""
+    """Stand-in for the connection inside get_max_pain_current.
 
-    def __init__(self, snapshot: Any, expirations: Any) -> None:
-        self._snapshot = snapshot
+    ``get_max_pain_current`` issues two ``fetchrow`` calls (snapshot
+    first, then the live overlay); pass each as a positional argument.
+    """
+
+    def __init__(self, snapshot: Any, expirations: Any, live: Any = None) -> None:
+        self._fetchrow_results = [snapshot, live]
         self._expirations = expirations
+        self.fetchrow_calls = 0
 
     async def fetchrow(self, query: str, *args: Any):
-        return self._snapshot
+        idx = self.fetchrow_calls
+        self.fetchrow_calls += 1
+        if idx >= len(self._fetchrow_results):
+            return None
+        return self._fetchrow_results[idx]
 
     async def fetch(self, query: str, *args: Any) -> List[Any]:
         return self._expirations
@@ -139,7 +148,7 @@ def test_get_max_pain_current_never_recomputes_and_returns_snapshot():
     db._refresh_max_pain_snapshot = _explode_if_called  # type: ignore[assignment]
 
     snapshot = {
-        "timestamp": "2026-05-18T19:15:00+00:00",
+        "source_timestamp": "2026-05-18T19:15:00+00:00",
         "symbol": "SPY",
         "as_of_date": "2026-05-18",
         "underlying_price": 736.09,
@@ -149,7 +158,9 @@ def test_get_max_pain_current_never_recomputes_and_returns_snapshot():
 
     @asynccontextmanager
     async def fake_acquire():
-        yield _FakeReadConn(snapshot, [])
+        # No live overlay row -> the response falls back to snapshot
+        # scalars; this is the "analytics paused" path.
+        yield _FakeReadConn(snapshot, [], live=None)
 
     db._acquire_connection = fake_acquire  # type: ignore[assignment]
 
@@ -169,8 +180,45 @@ def test_get_max_pain_current_returns_none_when_no_snapshot():
 
     @asynccontextmanager
     async def fake_acquire():
-        yield _FakeReadConn(None, [])
+        yield _FakeReadConn(None, [], live=None)
 
     db._acquire_connection = fake_acquire  # type: ignore[assignment]
 
     assert asyncio.run(db.get_max_pain_current(symbol="SPY", strike_limit=200)) is None
+
+
+def test_get_max_pain_current_overlays_live_max_pain_and_underlying():
+    """When the live overlay row is present its ``max_pain`` and
+    ``underlying_price`` REPLACE the snapshot's stale morning values so
+    the response agrees with the tail of /api/max-pain/timeseries.
+    ``difference`` is recomputed from the live pair (not carried over
+    from the snapshot)."""
+    db = DatabaseManager()
+    db._refresh_max_pain_snapshot = _explode_if_called  # type: ignore[assignment]
+
+    snapshot = {
+        "source_timestamp": "2026-06-03T08:53:00+00:00",
+        "symbol": "SPY",
+        "as_of_date": "2026-06-03",
+        "underlying_price": 759.09,
+        "max_pain": 755.0,  # stale morning settlement-style value
+        "difference": -4.09,
+    }
+    live = {
+        "live_timestamp": "2026-06-03T18:55:00+00:00",
+        "live_max_pain": 758.0,  # latest gex_summary scalar
+        "live_underlying_price": 760.25,  # latest underlying_quotes.close
+    }
+
+    @asynccontextmanager
+    async def fake_acquire():
+        yield _FakeReadConn(snapshot, [], live=live)
+
+    db._acquire_connection = fake_acquire  # type: ignore[assignment]
+
+    result = asyncio.run(db.get_max_pain_current(symbol="SPY", strike_limit=200))
+    assert result is not None
+    assert result["timestamp"] == "2026-06-03T18:55:00+00:00"
+    assert result["max_pain"] == 758.0
+    assert result["underlying_price"] == 760.25
+    assert result["difference"] == 758.0 - 760.25
