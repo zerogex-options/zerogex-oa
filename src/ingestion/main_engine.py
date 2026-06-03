@@ -214,6 +214,22 @@ class IngestionEngine:
             os.getenv("GREEKS_STALE_WARN_INTERVAL_SECONDS", "60")
         )
         self._greeks_stale_last_warn_mono = 0.0
+        # Watchdog: when the underlying price stays stale in-session past
+        # this many seconds, the in-process restart hooks have failed and
+        # we exit nonzero so systemd (Restart=always) recycles the process.
+        # Sized well above the stream watchdog's full retry budget
+        # (UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS × cooldown + a backoff
+        # retry interval) so a healthy in-process recovery never trips
+        # this. Set to 0 to disable. The 2026-06 prod incident sat in a
+        # broken state for 17h with 1.1M rejects because no escalation
+        # path existed; this is the last line of defense.
+        self.greeks_stale_fatal_seconds = float(
+            os.getenv("GREEKS_STALE_FATAL_SECONDS", "1800")
+        )
+        # Wall-clock monotonic timestamp of the current stale episode's
+        # start, or None when Greeks are flowing. Reset to None on the
+        # first successful Greek calc after a stale window.
+        self._greeks_stale_episode_started_mono: Optional[float] = None
         # Counter for crossed/missing-quote fallbacks in _classify_volume_chunk.
         self._classify_fallback_count: int = 0
 
@@ -560,6 +576,29 @@ class IngestionEngine:
                                 max_age,
                                 self.greeks_stale_underlying_rejects,
                             )
+                        # Watchdog escalation: if the stream watchdog and
+                        # its slow-retry path have both failed to recover
+                        # for too long, exit so systemd recycles us. Only
+                        # arms in-session — out-of-session staleness is
+                        # legitimate and would false-trip.
+                        if self._greeks_stale_episode_started_mono is None:
+                            self._greeks_stale_episode_started_mono = now_mono
+                        stuck_seconds = (
+                            now_mono - self._greeks_stale_episode_started_mono
+                        )
+                        if (
+                            self.greeks_stale_fatal_seconds > 0
+                            and stuck_seconds >= self.greeks_stale_fatal_seconds
+                        ):
+                            logger.error(
+                                "Underlying price stuck stale for %.0fs in-session — "
+                                "stream-watchdog recovery did not converge. "
+                                "Exiting nonzero so systemd recycles the process. "
+                                "Total rejects this run: %d",
+                                stuck_seconds,
+                                self.greeks_stale_underlying_rejects,
+                            )
+                            sys.exit(1)
                     elif self.greeks_stale_underlying_rejects % 5000 == 1:
                         logger.debug(
                             "Refusing Greeks: underlying price is %.0fs stale "
@@ -573,6 +612,10 @@ class IngestionEngine:
                     data["delta"] = data["gamma"] = data["theta"] = data["vega"] = None
                     data["implied_volatility"] = data.get("implied_volatility")
                     return data
+            # Fresh underlying — the staleness episode (if any) has ended.
+            # Clear the watchdog timer so the next gap starts measuring
+            # from its own onset rather than carrying forward.
+            self._greeks_stale_episode_started_mono = None
             try:
                 if self.greeks_calculated == 0:
                     logger.info(
