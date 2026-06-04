@@ -916,7 +916,17 @@ async def get_max_pain_timeseries(
 async def get_max_pain_current(
     symbol: str = Query(default="SPY"), strike_limit: int = Query(default=200, ge=10, le=1000)
 ):
-    """Get current max pain and strike-by-strike call/put payout notional."""
+    """Get current max pain and strike-by-strike call/put payout notional.
+
+    The top-level ``timestamp``, ``max_pain``, ``underlying_price``, and
+    ``difference`` fields reflect the latest analytics-engine reading and
+    agree with the most recent point in ``/api/max-pain/timeseries``.
+
+    The ``expirations[]`` array (per-expiration max pain plus the full
+    call/put payoff curve at each settlement candidate) comes from a
+    daily pre-market snapshot — open interest only publishes once per
+    day at settlement, so this detail is stable through the trading day.
+    """
     data = await _db().get_max_pain_current(symbol, strike_limit)
     if not data:
         raise HTTPException(status_code=404, detail="No max pain data available")

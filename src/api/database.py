@@ -2800,12 +2800,22 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     async def get_max_pain_current(
         self, symbol: str = "SPY", strike_limit: int = 200
     ) -> Optional[Dict[str, Any]]:
-        """Get current max pain from the daily OI snapshot cache.
+        """Get current max pain.
 
-        Pure read.  ``strike_limit`` is retained for API/signature
-        compatibility but no longer drives an on-request recompute — the
-        snapshot is produced off-process by src.tools.max_pain_refresh at
-        its configured strike limit.
+        The top-level scalars (``timestamp``, ``underlying_price``,
+        ``max_pain``, ``difference``) come from the latest
+        ``gex_summary`` row + latest ``underlying_quotes.close`` so this
+        endpoint agrees with the tail of ``/api/max-pain/timeseries``.
+        The per-expiration / per-strike payoff breakdown still comes
+        from the daily ``max_pain_oi_snapshot`` written off-process by
+        ``src.tools.max_pain_refresh``.
+
+        ``strike_limit`` is retained for API/signature compatibility but
+        no longer drives an on-request recompute.  If the snapshot job
+        hasn't populated a row yet the endpoint 404s (no snapshot = no
+        payoff detail = nothing useful to return).  If the live overlay
+        is unavailable we fall back to the snapshot's scalars so the
+        response stays internally consistent.
         """
         symbol = symbol.upper()
         cache_key = f"max_pain_current:{symbol}"
@@ -2817,7 +2827,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             SELECT
                 symbol,
                 as_of_date,
-                source_timestamp AS timestamp,
+                source_timestamp,
                 underlying_price,
                 max_pain,
                 difference
@@ -2836,6 +2846,46 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             WHERE symbol = $1
               AND as_of_date = $2
             ORDER BY expiration
+        """
+
+        # Live overlay — mirrors get_max_pain_timeseries' session filter
+        # so the scalar matches the latest in-session bucket of the
+        # timeseries chart.  SPX/NDX/RUT options stream around the
+        # clock but the underlying tape only prints 09:30–16:00 ET;
+        # without this filter overnight rows would diverge from the
+        # timeseries' RTH-only series.
+        session_filter = ""
+        live_params: list = [symbol]
+        if is_cash_index(symbol):
+            session_filter = """
+                    AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
+                    AND (timestamp AT TIME ZONE 'America/New_York')::time
+                        BETWEEN TIME '09:30' AND TIME '16:00'
+                    AND (timestamp AT TIME ZONE 'America/New_York')::date <> ALL($2::date[])
+            """
+            live_params.append(sorted(NYSE_HOLIDAYS))
+        live_query = f"""
+            WITH gs AS (
+                SELECT timestamp, max_pain::numeric AS max_pain
+                FROM gex_summary
+                WHERE underlying = $1{session_filter}
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            uq AS (
+                SELECT close::numeric AS underlying_price
+                FROM underlying_quotes
+                WHERE symbol = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
+            )
+            SELECT
+                gs.timestamp AS live_timestamp,
+                gs.max_pain AS live_max_pain,
+                uq.underlying_price AS live_underlying_price
+            FROM (SELECT 1) AS d
+            LEFT JOIN gs ON TRUE
+            LEFT JOIN uq ON TRUE
         """
 
         # Pure cache read.  max_pain_oi_snapshot / _expiration are written
@@ -2864,12 +2914,28 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     }
                 )
 
+            live = await conn.fetchrow(live_query, *live_params)
+            if (
+                live is not None
+                and live["live_max_pain"] is not None
+                and live["live_underlying_price"] is not None
+            ):
+                timestamp = live["live_timestamp"]
+                underlying_price = live["live_underlying_price"]
+                max_pain = live["live_max_pain"]
+                difference = max_pain - underlying_price
+            else:
+                timestamp = snapshot["source_timestamp"]
+                underlying_price = snapshot["underlying_price"]
+                max_pain = snapshot["max_pain"]
+                difference = snapshot["difference"]
+
             result = {
-                "timestamp": snapshot["timestamp"],
+                "timestamp": timestamp,
                 "symbol": snapshot["symbol"],
-                "underlying_price": snapshot["underlying_price"],
-                "max_pain": snapshot["max_pain"],
-                "difference": snapshot["difference"],
+                "underlying_price": underlying_price,
+                "max_pain": max_pain,
+                "difference": difference,
                 "expirations": expirations,
             }
             self._cache_set(cache_key, result, self._max_pain_current_cache_ttl_seconds)

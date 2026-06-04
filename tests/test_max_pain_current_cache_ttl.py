@@ -29,15 +29,21 @@ def test_default_and_env_override_for_max_pain_current_ttl(monkeypatch):
 
 
 class _FakeConn:
-    def __init__(self, fetchrow_value, fetch_value):
-        self._fetchrow_value = fetchrow_value
+    def __init__(self, fetchrow_values, fetch_value):
+        # ``get_max_pain_current`` issues two fetchrow calls: snapshot
+        # first, then the live overlay.  Pass each as an item in the
+        # list.
+        self._fetchrow_values = list(fetchrow_values)
         self._fetch_value = fetch_value
         self.fetchrow_calls = 0
         self.fetch_calls = 0
 
     async def fetchrow(self, *_a, **_k):
+        idx = self.fetchrow_calls
         self.fetchrow_calls += 1
-        return self._fetchrow_value
+        if idx >= len(self._fetchrow_values):
+            return None
+        return self._fetchrow_values[idx]
 
     async def fetch(self, *_a, **_k):
         self.fetch_calls += 1
@@ -50,10 +56,15 @@ def test_get_max_pain_current_caches_with_dedicated_ttl(monkeypatch):
     snapshot_row = {
         "symbol": "SPY",
         "as_of_date": "2026-05-15",
-        "timestamp": "2026-05-15T20:00:00+00:00",
+        "source_timestamp": "2026-05-15T20:00:00+00:00",
         "underlying_price": 500.0,
         "max_pain": 505.0,
         "difference": 5.0,
+    }
+    live_row = {
+        "live_timestamp": "2026-05-15T20:05:00+00:00",
+        "live_max_pain": 506.0,
+        "live_underlying_price": 501.0,
     }
     expiration_rows = [
         {
@@ -63,7 +74,7 @@ def test_get_max_pain_current_caches_with_dedicated_ttl(monkeypatch):
             "strikes": [],
         }
     ]
-    conn = _FakeConn(snapshot_row, expiration_rows)
+    conn = _FakeConn([snapshot_row, live_row], expiration_rows)
 
     @asynccontextmanager
     async def _fake_acquire():
@@ -92,9 +103,10 @@ def test_get_max_pain_current_caches_with_dedicated_ttl(monkeypatch):
 
     assert first is not None
     assert second == first
-    # Pure read: exactly one snapshot read happened; the second call hit
-    # the in-process cache (no extra fetchrow/fetch, no recompute).
-    assert conn.fetchrow_calls == 1
+    # Pure read: snapshot + live overlay each ran exactly once on the
+    # first call; the second call hit the in-process cache (no extra
+    # fetchrow/fetch, no recompute).
+    assert conn.fetchrow_calls == 2
     assert conn.fetch_calls == 1
     # And it was cached on the dedicated max-pain TTL, not the 5 s
     # shared analytics TTL.
