@@ -880,6 +880,8 @@ help: ## Show this help message
 	@echo "  make normalizer-cache-healthcheck - Flag stale cache rows (exit 1 = stale, for monitoring)"
 	@echo "  make max-pain-refresh-install - Install daily max-pain snapshot refresh timer (05:00 ET)"
 	@echo "  make max-pain-refresh-status  - Show max-pain refresh timer status + recent log"
+	@echo "  make daily-atm-iv-backfill-install - Install pre-open daily_atm_iv backfill timer (06:00 ET)"
+	@echo "  make daily-atm-iv-backfill-status  - Show daily_atm_iv backfill timer status + recent log"
 	@echo "  make system-monitor-install   - Install per-minute system-monitor timer (CPU/mem/disk/errs/cycle)"
 	@echo "  make system-monitor-show      - Print latest hourly + daily aggregates"
 	@echo "  make system-monitor-status    - Show system-monitor timer status + recent log"
@@ -3425,6 +3427,42 @@ max-pain-refresh-status: ## Show max-pain refresh timer status + last/next fire 
 	@systemctl status zerogex-oa-max-pain-refresh.service --no-pager -l || true
 	@echo ""
 	@sudo journalctl -u zerogex-oa-max-pain-refresh -n 30 --no-pager || true
+
+# =============================================================================
+# Daily ATM IV history backfill (pre-open seed of daily_atm_iv)
+# =============================================================================
+# Re-seeds the trailing 30 days of daily_atm_iv from option_chains.  The live
+# writer in analytics UPSERTs today's row each cycle; this is the safety net
+# for historical gaps (a missed analytics EOD cycle, deploy mid-window) that
+# would otherwise null out iv_low/iv_high in the signals iv_rank read.
+# Override with DAILY_ATM_IV_SYMBOLS / DAILY_ATM_IV_DAYS.
+.PHONY: daily-atm-iv-backfill
+daily-atm-iv-backfill: ## Re-seed daily_atm_iv 30-day history (idempotent, runs nightly via timer)
+	@echo "$(BLUE)=== Backfilling daily_atm_iv history ===$(NC)"
+	@$(PY) -m src.tools.daily_atm_iv_backfill \
+		$(if $(DAILY_ATM_IV_SYMBOLS),--symbols $(DAILY_ATM_IV_SYMBOLS)) \
+		$(if $(DAILY_ATM_IV_DAYS),--days $(DAILY_ATM_IV_DAYS))
+
+.PHONY: daily-atm-iv-backfill-install
+daily-atm-iv-backfill-install: ## Install the pre-open daily_atm_iv backfill timer (06:00 ET)
+	@echo "$(BLUE)=== Installing daily_atm_iv Backfill Timer ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-daily-atm-iv-backfill.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-daily-atm-iv-backfill.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-daily-atm-iv-backfill.timer
+	@echo "$(GREEN)✅ daily_atm_iv backfill timer (06:00 ET) installed and started$(NC)"
+	@echo "$(YELLOW)Status:      systemctl status zerogex-oa-daily-atm-iv-backfill.timer$(NC)"
+	@echo "$(YELLOW)Logs:        journalctl -u zerogex-oa-daily-atm-iv-backfill$(NC)"
+	@echo "$(YELLOW)Trigger now: sudo systemctl start zerogex-oa-daily-atm-iv-backfill.service$(NC)"
+
+.PHONY: daily-atm-iv-backfill-status
+daily-atm-iv-backfill-status: ## Show daily_atm_iv backfill timer status + last/next fire + recent log
+	@echo "$(BLUE)=== daily_atm_iv Backfill Timer ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-daily-atm-iv-backfill.timer' || true
+	@echo ""
+	@systemctl status zerogex-oa-daily-atm-iv-backfill.service --no-pager -l || true
+	@echo ""
+	@sudo journalctl -u zerogex-oa-daily-atm-iv-backfill -n 30 --no-pager || true
 
 # =============================================================================
 # Lightweight System / Application Monitor

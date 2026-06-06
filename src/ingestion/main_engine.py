@@ -125,6 +125,18 @@ def _compute_db_backoff_seconds(consecutive_failures: int) -> float:
     return base + random.uniform(0, base * 0.1)  # type: ignore[no-any-return]
 
 
+# Minimum gap between rolled-up "[CIRCUIT-BREAKER] Skipping write" WARNINGs
+# while in backoff. The first skip after a fresh backoff opens still logs
+# immediately so the cause is visible; subsequent skips are coalesced into
+# a single rolled-up line per interval. Without this, a 2s backoff during
+# a brief DB outage produces ~1000 identical warnings (~1044 observed in a
+# 2-3s burst during the 2026-06 RDS restart) because every batch attempt
+# from the live option stream hits the early-return + log path.
+_CB_SKIP_LOG_INTERVAL_SECONDS = float(
+    os.getenv("CIRCUIT_BREAKER_SKIP_LOG_INTERVAL_SECONDS", "5.0")
+)
+
+
 def _to_db_float(value: Any) -> Optional[float]:
     """Convert numeric-like values (including numpy scalars) to plain float for DB writes."""
     if value is None:
@@ -214,6 +226,22 @@ class IngestionEngine:
             os.getenv("GREEKS_STALE_WARN_INTERVAL_SECONDS", "60")
         )
         self._greeks_stale_last_warn_mono = 0.0
+        # Watchdog: when the underlying price stays stale in-session past
+        # this many seconds, the in-process restart hooks have failed and
+        # we exit nonzero so systemd (Restart=always) recycles the process.
+        # Sized well above the stream watchdog's full retry budget
+        # (UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS × cooldown + a backoff
+        # retry interval) so a healthy in-process recovery never trips
+        # this. Set to 0 to disable. The 2026-06 prod incident sat in a
+        # broken state for 17h with 1.1M rejects because no escalation
+        # path existed; this is the last line of defense.
+        self.greeks_stale_fatal_seconds = float(
+            os.getenv("GREEKS_STALE_FATAL_SECONDS", "1800")
+        )
+        # Wall-clock monotonic timestamp of the current stale episode's
+        # start, or None when Greeks are flowing. Reset to None on the
+        # first successful Greek calc after a stale window.
+        self._greeks_stale_episode_started_mono: Optional[float] = None
         # Counter for crossed/missing-quote fallbacks in _classify_volume_chunk.
         self._classify_fallback_count: int = 0
 
@@ -242,6 +270,17 @@ class IngestionEngine:
         # Circuit breaker: stop hammering a dead database.
         self._db_consecutive_failures = 0
         self._db_backoff_until = 0.0  # monotonic timestamp
+        # Throttle the per-batch "skipping write" warning. A wide universe
+        # (e.g. 3×~2000 symbols) generates hundreds of write attempts per
+        # second; emitting one WARNING per skipped batch produced ~1044
+        # warnings in 2-3s during the 33s RDS restart observed in production.
+        # Track the first skip in the current backoff window + roll-up
+        # counters and emit at most one line per
+        # ``_CB_SKIP_LOG_INTERVAL_SECONDS``.
+        self._cb_skip_window_first_logged = False
+        self._cb_skip_count_since_last_log = 0
+        self._cb_skip_rows_since_last_log = 0
+        self._cb_skip_last_log_mono = 0.0
         # Computed-but-unpersisted option aggregates are retained here and
         # re-submitted on the next write attempt. Without this, a DB write
         # failure (or a circuit-breaker skip) at/after a bucket rollover
@@ -486,6 +525,7 @@ class IngestionEngine:
                 # Reset breaker on success (underlying writes confirm DB is alive).
                 self._db_consecutive_failures = 0
                 self._db_backoff_until = 0.0
+                self._flush_circuit_breaker_skip_summary()
 
             self.underlying_bars_stored += 1
             self.last_flush_time = datetime.now(ET)
@@ -560,6 +600,29 @@ class IngestionEngine:
                                 max_age,
                                 self.greeks_stale_underlying_rejects,
                             )
+                        # Watchdog escalation: if the stream watchdog and
+                        # its slow-retry path have both failed to recover
+                        # for too long, exit so systemd recycles us. Only
+                        # arms in-session — out-of-session staleness is
+                        # legitimate and would false-trip.
+                        if self._greeks_stale_episode_started_mono is None:
+                            self._greeks_stale_episode_started_mono = now_mono
+                        stuck_seconds = (
+                            now_mono - self._greeks_stale_episode_started_mono
+                        )
+                        if (
+                            self.greeks_stale_fatal_seconds > 0
+                            and stuck_seconds >= self.greeks_stale_fatal_seconds
+                        ):
+                            logger.error(
+                                "Underlying price stuck stale for %.0fs in-session — "
+                                "stream-watchdog recovery did not converge. "
+                                "Exiting nonzero so systemd recycles the process. "
+                                "Total rejects this run: %d",
+                                stuck_seconds,
+                                self.greeks_stale_underlying_rejects,
+                            )
+                            sys.exit(1)
                     elif self.greeks_stale_underlying_rejects % 5000 == 1:
                         logger.debug(
                             "Refusing Greeks: underlying price is %.0fs stale "
@@ -573,6 +636,10 @@ class IngestionEngine:
                     data["delta"] = data["gamma"] = data["theta"] = data["vega"] = None
                     data["implied_volatility"] = data.get("implied_volatility")
                     return data
+            # Fresh underlying — the staleness episode (if any) has ended.
+            # Clear the watchdog timer so the next gap starts measuring
+            # from its own onset rather than carrying forward.
+            self._greeks_stale_episode_started_mono = None
             try:
                 if self.greeks_calculated == 0:
                     logger.info(
@@ -1421,6 +1488,76 @@ class IngestionEngine:
             )
         self._pending_failed_option_rows = pending
 
+    def _log_circuit_breaker_skip(self, row_count: int, now_mono: float) -> None:
+        """Throttled WARNING for option writes skipped during DB backoff.
+
+        Logs the first skip in a backoff window immediately (so the cause
+        appears at the head of the journal), then coalesces subsequent skips
+        into a single rolled-up line per ``_CB_SKIP_LOG_INTERVAL_SECONDS``.
+        Counters are flushed by ``_flush_circuit_breaker_skip_summary`` on
+        recovery so the journal records the total skipped during the outage.
+
+        ``getattr`` so test stubs that build the engine via ``__new__`` (see
+        tests/test_ingestion_failed_write_retention.py) don't have to seed
+        these counters — mirrors ``_retain_failed_option_rows`` above.
+        """
+        backoff_remaining = self._db_backoff_until - now_mono
+        first_logged = getattr(self, "_cb_skip_window_first_logged", False)
+        if not first_logged:
+            logger.warning(
+                "[CIRCUIT-BREAKER] Skipping write of %d rows — "
+                "DB backoff for %.1fs more (further skips rolled up "
+                "every %.1fs)",
+                row_count,
+                backoff_remaining,
+                _CB_SKIP_LOG_INTERVAL_SECONDS,
+            )
+            self._cb_skip_window_first_logged = True
+            self._cb_skip_count_since_last_log = 0
+            self._cb_skip_rows_since_last_log = 0
+            self._cb_skip_last_log_mono = now_mono
+            return
+
+        self._cb_skip_count_since_last_log = (
+            getattr(self, "_cb_skip_count_since_last_log", 0) + 1
+        )
+        self._cb_skip_rows_since_last_log = (
+            getattr(self, "_cb_skip_rows_since_last_log", 0) + row_count
+        )
+        last_log_mono = getattr(self, "_cb_skip_last_log_mono", now_mono)
+        if now_mono - last_log_mono >= _CB_SKIP_LOG_INTERVAL_SECONDS:
+            logger.warning(
+                "[CIRCUIT-BREAKER] Still in backoff (%.1fs more) — "
+                "skipped %d batches / %d rows in last %.1fs",
+                max(0.0, backoff_remaining),
+                self._cb_skip_count_since_last_log,
+                self._cb_skip_rows_since_last_log,
+                now_mono - last_log_mono,
+            )
+            self._cb_skip_count_since_last_log = 0
+            self._cb_skip_rows_since_last_log = 0
+            self._cb_skip_last_log_mono = now_mono
+
+    def _flush_circuit_breaker_skip_summary(self) -> None:
+        """Emit a final rolled-up line when the breaker closes, then reset.
+
+        Tolerant of test stubs built via ``__new__`` that never opened a
+        backoff window (no attributes seeded).
+        """
+        first_logged = getattr(self, "_cb_skip_window_first_logged", False)
+        residual = getattr(self, "_cb_skip_count_since_last_log", 0)
+        if first_logged and residual > 0:
+            logger.info(
+                "[CIRCUIT-BREAKER] Final rollup: %d additional batches / "
+                "%d rows were skipped before recovery",
+                residual,
+                getattr(self, "_cb_skip_rows_since_last_log", 0),
+            )
+        self._cb_skip_window_first_logged = False
+        self._cb_skip_count_since_last_log = 0
+        self._cb_skip_rows_since_last_log = 0
+        self._cb_skip_last_log_mono = 0.0
+
     def _write_option_rows(self, rows: List[Dict[str, Any]]):
         """Write multiple aggregated option rows in a single DB transaction.
 
@@ -1453,10 +1590,7 @@ class IngestionEngine:
         # Circuit breaker: skip write if still in backoff window.
         now_mono = _time.monotonic()
         if now_mono < self._db_backoff_until:
-            logger.warning(
-                f"[CIRCUIT-BREAKER] Skipping write of {len(rows)} rows — "
-                f"DB backoff for {self._db_backoff_until - now_mono:.1f}s more"
-            )
+            self._log_circuit_breaker_skip(len(rows), now_mono)
             self._retain_failed_option_rows(rows)
             return
 
@@ -1542,6 +1676,7 @@ class IngestionEngine:
                 )
             self._db_consecutive_failures = 0
             self._db_backoff_until = 0.0
+            self._flush_circuit_breaker_skip_summary()
 
             # Observability accumulators.
             self._obs_batches_written += 1

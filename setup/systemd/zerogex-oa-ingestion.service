@@ -4,6 +4,15 @@ Documentation=https://github.com/zerogex-options/zerogex-oa
 After=network-online.target
 Wants=network-online.target
 
+# Operator hook for active alerting (e.g. PagerDuty, Slack, email).
+# Drop a unit at /etc/systemd/system/zerogex-alert@.service that takes
+# the failed unit name as %i and uncomment the OnFailure= line below,
+# OR symlink an existing alert handler.  Left commented so the default
+# install doesn't depend on infra the operator may not run.  Fires when
+# the watchdog escalation in main_engine.py exits nonzero (stuck stale
+# underlying) or when systemd's StartLimit fires.
+#OnFailure=zerogex-alert@%n.service
+
 [Service]
 Type=simple
 User=ubuntu

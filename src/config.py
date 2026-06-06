@@ -595,10 +595,17 @@ USE_CASH_SESSION_KEYING = os.getenv("USE_CASH_SESSION_KEYING", "false").lower() 
 # pushed the account to 15+ streams and the underlying bar stream was the
 # most frequent casualty (it started last in ``_start_accumulators`` so it
 # lost the race for the remaining slot first).  The 500 default + the
-# start-order / no-recalc-thrash fixes in ``adaa9bc`` keep a 3×2000
-# deployment functioning even though it formally over-subscribes.
+# start-order / no-recalc-thrash fixes in ``adaa9bc`` kept a 3×2000
+# deployment functioning even though it formally over-subscribed.  Live
+# 3-underlying + VIX runs in 2026-06 still tripped the cap during a
+# reconnect storm (a 1000-symbol process at 500/chunk = 2 option chunks,
+# a 1500-symbol process = 3; account total 12-16 streams), so the default
+# moved to 800 — the upper bound that keeps URLs under 414.  At 800/chunk
+# the 1500-symbol process collapses to 2 chunks, dropping the account
+# total to ~12 with VIX, ~8-9 without.  Set lower via the env var if a
+# given deployment's per-chunk symbol mix produces over-long URIs.
 STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION = int(
-    os.getenv("STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION", "500")
+    os.getenv("STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION", "800")
 )
 
 # Underlying-stream data-staleness watchdog. The TradeStation bar stream
@@ -638,6 +645,19 @@ UNDERLYING_STREAM_RESTART_COOLDOWN_SECONDS = int(
 )
 UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS = int(
     os.getenv("UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS", "5")
+)
+# After the fast retry budget is exhausted the supervisor enters a
+# backed-off state — previously terminal until the process restarted.
+# A 2026-06 prod incident sat in that state for 17 hours, accumulating
+# 1.1M Greeks rejects, because no further reconnect was ever attempted.
+# Now: after this many seconds in the backed-off state, allow ONE more
+# reconnect, then drop back to backed-off until the interval elapses
+# again. Resets the fast-retry counter so a subsequent transient gap
+# gets the same full budget. 10 min is long enough to avoid pestering
+# a genuinely-down upstream and short enough that a recovered upstream
+# is rediscovered within a single market half-hour.
+UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS = int(
+    os.getenv("UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS", "600")
 )
 TS_STREAM_REUSE_QUOTES = os.getenv("TS_STREAM_REUSE_QUOTES", "false").lower() == "true"
 TS_WARN_MARKET_HOURS = os.getenv("TS_WARN_MARKET_HOURS", "true").lower() != "false"

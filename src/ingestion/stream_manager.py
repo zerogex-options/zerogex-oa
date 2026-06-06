@@ -52,6 +52,7 @@ from src.config import (
     UNDERLYING_STREAM_STALE_RESTART_SECONDS_EXTENDED,
     UNDERLYING_STREAM_RESTART_COOLDOWN_SECONDS,
     UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS,
+    UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS,
 )
 
 logger = get_logger(__name__)
@@ -1758,11 +1759,12 @@ class StreamManager:
                                     logger.error(
                                         "Underlying bar stream still dead after %d "
                                         "forced reconnects (%.0fs stale) — treating "
-                                        "as an upstream TradeStation outage. Options "
-                                        "ingestion is unaffected; reconnecting "
-                                        "resumes automatically once a bar arrives.",
+                                        "as an upstream TradeStation outage. Will "
+                                        "slow-retry every %ds until a bar arrives. "
+                                        "Options ingestion is unaffected.",
                                         _underlying_restart_attempts - 1,
                                         stale_seconds,
+                                        UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS,
                                     )
                                 else:
                                     self._restart_underlying_accumulator(
@@ -1772,6 +1774,33 @@ class StreamManager:
                                         f"{UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS})"
                                     )
                                     _last_forced_restart_mono = now_mono
+                            elif (
+                                stale_seconds >= stale_restart_secs
+                                and _underlying_restart_backed_off
+                                and now_mono - _last_forced_restart_mono
+                                >= UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS
+                            ):
+                                # Slow re-attempt after the fast-retry budget
+                                # was consumed. Without this, the supervisor
+                                # would stay dead until the process restarts —
+                                # the bug behind the 2026-06 17h outage with
+                                # 1.1M Greeks rejects. Reset the fast-retry
+                                # counter so a subsequent transient gap gets
+                                # the full budget again.
+                                logger.warning(
+                                    "Underlying bar stream still stale "
+                                    "(%.0fs) — slow re-attempt after %ds "
+                                    "backoff interval.",
+                                    stale_seconds,
+                                    UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS,
+                                )
+                                _underlying_restart_attempts = 1
+                                _underlying_restart_backed_off = False
+                                self._restart_underlying_accumulator(
+                                    f"backoff-retry {stale_seconds:.0f}s during "
+                                    f"{session}"
+                                )
+                                _last_forced_restart_mono = now_mono
                         else:
                             # Feed legitimately not expected (overnight /
                             # weekend / holiday for a cash index). Reset the

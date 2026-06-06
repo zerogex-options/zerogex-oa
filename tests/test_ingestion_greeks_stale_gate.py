@@ -62,9 +62,13 @@ def test_extended_gate_is_wider_so_sparse_extended_bars_pass():
 # ---------------------------------------------------------------------------
 
 
-def _stale_greeks_engine():
+def _stale_greeks_engine(fatal_seconds: float = 0.0):
     """Minimal engine wired so ``_enrich_with_greeks`` takes the in-session
-    stale-underlying reject branch without a real DB or Greeks calculator."""
+    stale-underlying reject branch without a real DB or Greeks calculator.
+
+    ``fatal_seconds=0`` disables the watchdog (default for tests that only
+    exercise the warning-throttle path).
+    """
     e = IngestionEngine.__new__(IngestionEngine)
     e.greeks_calculator = MagicMock()
     e.latest_underlying_price = 100.0
@@ -75,6 +79,8 @@ def _stale_greeks_engine():
     e.greeks_stale_underlying_rejects = 0
     e.greeks_stale_warn_interval_seconds = 60.0
     e._greeks_stale_last_warn_mono = 0.0
+    e.greeks_stale_fatal_seconds = fatal_seconds
+    e._greeks_stale_episode_started_mono = None
     e.db_symbol = "SPX"
     e.greeks_calculated = 0
     return e
@@ -102,3 +108,76 @@ def test_greeks_stale_warning_throttled_by_time(monkeypatch):
     clock["t"] += 61.0
     e._enrich_with_greeks({"timestamp": option_ts, "option_symbol": "X"})
     assert fake_logger.warning.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Watchdog escalation. When the underlying stays stuck stale in-session past
+# ``greeks_stale_fatal_seconds`` the engine exits nonzero so systemd recycles
+# it — last-line-of-defense against the 2026-06 outage where the stream
+# watchdog's terminal backed-off state held the feed dead for 17 hours.
+# ---------------------------------------------------------------------------
+
+
+def test_watchdog_exits_after_fatal_seconds_in_session(monkeypatch):
+    import pytest
+
+    fatal = 1800.0
+    e = _stale_greeks_engine(fatal_seconds=fatal)
+    option_ts = ET.localize(datetime(2026, 5, 15, 12, 0))
+
+    clock = {"t": 50_000.0}
+    monkeypatch.setattr(me, "_time", types.SimpleNamespace(monotonic=lambda: clock["t"]))
+    monkeypatch.setattr(me, "logger", MagicMock())
+
+    # First reject arms the episode timer.
+    e._enrich_with_greeks({"timestamp": option_ts, "option_symbol": "X"})
+    assert e._greeks_stale_episode_started_mono == 50_000.0
+
+    # Still under the fatal threshold — no exit.
+    clock["t"] += fatal - 1.0
+    e._enrich_with_greeks({"timestamp": option_ts, "option_symbol": "X"})
+
+    # Cross the threshold — engine exits nonzero so systemd recycles.
+    clock["t"] += 2.0
+    with pytest.raises(SystemExit) as exc:
+        e._enrich_with_greeks({"timestamp": option_ts, "option_symbol": "X"})
+    assert exc.value.code == 1
+
+
+def test_watchdog_resets_on_fresh_greeks(monkeypatch):
+    """A successful Greek calc clears the episode timer — the NEXT stale
+    window starts measuring from its own onset, not the previous one's."""
+    fatal = 1800.0
+    e = _stale_greeks_engine(fatal_seconds=fatal)
+    e.greeks_calculator.enrich_option_data = MagicMock(
+        return_value={"delta": 0.5, "gamma": 0.01, "theta": -0.02, "vega": 0.1}
+    )
+    option_ts = ET.localize(datetime(2026, 5, 15, 12, 0))
+
+    clock = {"t": 50_000.0}
+    monkeypatch.setattr(me, "_time", types.SimpleNamespace(monotonic=lambda: clock["t"]))
+    monkeypatch.setattr(me, "logger", MagicMock())
+
+    # Stale → arms the timer.
+    e._enrich_with_greeks({"timestamp": option_ts, "option_symbol": "X"})
+    assert e._greeks_stale_episode_started_mono is not None
+
+    # Fresh underlying → reset.
+    e.latest_underlying_timestamp = option_ts
+    e._enrich_with_greeks({"timestamp": option_ts, "option_symbol": "X"})
+    assert e._greeks_stale_episode_started_mono is None
+
+
+def test_watchdog_disabled_when_fatal_seconds_zero(monkeypatch):
+    e = _stale_greeks_engine(fatal_seconds=0.0)
+    option_ts = ET.localize(datetime(2026, 5, 15, 12, 0))
+
+    clock = {"t": 50_000.0}
+    monkeypatch.setattr(me, "_time", types.SimpleNamespace(monotonic=lambda: clock["t"]))
+    monkeypatch.setattr(me, "logger", MagicMock())
+
+    # Days of staleness — no exit because the watchdog is disabled.
+    for _ in range(5):
+        clock["t"] += 86_400.0
+        e._enrich_with_greeks({"timestamp": option_ts, "option_symbol": "X"})
+    # Survived the loop without SystemExit.

@@ -357,3 +357,64 @@ def test_watchdog_escalates_when_stream_replays_stale_bars(monkeypatch, caplog):
         "bars. The Greeks engine would reject every option tick until "
         "16:00 ET."
     )
+
+
+# --- slow re-attempt after backed-off (fix #3, 2026-06 outage) -----------
+#
+# Once UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS is exhausted the supervisor
+# enters a backed-off state and PREVIOUSLY stopped attempting reconnects
+# entirely — the bug behind the 2026-06 17h outage with 1.1M Greeks
+# rejects. The slow re-attempt path runs another reconnect every
+# UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS so a recovered upstream
+# is rediscovered without a manual service restart.
+
+
+def test_watchdog_slow_reattempts_after_backed_off(monkeypatch, caplog):
+    """After the fast-retry budget is consumed and the supervisor is
+    backed-off, a slow re-attempt MUST fire once the backoff interval
+    elapses — otherwise the supervisor stays dead until the process
+    restarts."""
+    mgr = _stale_repeat_manager(monkeypatch)
+    # Collapse the fast budget to 1 so we reach backed-off in one cycle,
+    # then make the backoff retry interval short enough to observe inside
+    # the test window.
+    monkeypatch.setattr(_sm, "UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS", 1)
+    monkeypatch.setattr(_sm, "UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS", 1)
+
+    restart_calls: list[str] = []
+    mgr._restart_underlying_accumulator = lambda reason: restart_calls.append(reason)
+
+    exited = _threading.Event()
+
+    def _run():
+        try:
+            for _ in mgr.stream(max_iterations=None):
+                pass
+        finally:
+            exited.set()
+
+    import logging as _logging
+
+    caplog.set_level(_logging.WARNING, logger="src.ingestion.stream_manager")
+
+    t = _threading.Thread(target=_run, daemon=True)
+    t.start()
+    try:
+        # 4s window: ~2s to consume the fast budget + go backed-off, plus
+        # at least one BACKOFF_RETRY_INTERVAL (1s) + scheduling slack.
+        _time.sleep(4.0)
+        mgr.request_stop()
+        assert exited.wait(timeout=3.0), "stream loop failed to exit"
+    finally:
+        mgr.request_stop()
+
+    # We expect at least two restart attempts: one fast, then one
+    # slow re-attempt with the backoff-retry reason after we went
+    # backed-off.
+    backoff_retries = [r for r in restart_calls if r.startswith("backoff-retry")]
+    assert backoff_retries, (
+        "Supervisor never re-attempted after entering the backed-off state. "
+        "Before the fix this is exactly how the 2026-06 outage sat broken "
+        "for 17 hours — once max attempts were consumed nothing forced a "
+        "fresh reconnect, even if the upstream had recovered."
+    )
