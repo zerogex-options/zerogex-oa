@@ -5,11 +5,12 @@ After=network-online.target zerogex-oa-ingestion.service
 Wants=network-online.target
 
 # Operator hook for active alerting (e.g. PagerDuty, Slack, email).
-# Drop a unit at /etc/systemd/system/zerogex-alert@.service that takes
-# the failed unit name as %i and uncomment the OnFailure= line below,
-# OR symlink an existing alert handler.  Left commented so the default
-# install doesn't depend on infra the operator may not run.
-#OnFailure=zerogex-alert@%n.service
+# Wired to zerogex-alert@%n.service, which takes the failed unit name
+# as %i and dispatches to whatever backend is configured in
+# /etc/zerogex/alert.env (slack | sns | pagerduty | webhook | stderr).
+# Without alert.env the dispatcher falls back to stderr — alerts still
+# land in the alert unit's own journal so the wiring is verifiable.
+OnFailure=zerogex-alert@%n.service
 
 [Service]
 Type=simple
