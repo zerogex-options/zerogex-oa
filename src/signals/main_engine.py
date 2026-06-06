@@ -7,6 +7,7 @@ and proprietary trade lifecycle management as a dedicated process.
 from __future__ import annotations
 
 import argparse
+import random
 import signal
 import time
 from multiprocessing import Process
@@ -18,6 +19,13 @@ from src.utils import get_logger
 from src.validation import is_engine_run_window, seconds_until_engine_run_window
 
 logger = get_logger(__name__)
+
+# Failed-cycle backoff bounds (seconds). On consecutive failures the
+# sleep doubles from the configured interval up to _MAX. Without this
+# a brief DB outage produces ~1 error log per worker per second — during
+# the 33s RDS restart observed in production this was ~197 error lines
+# across 3 workers, and similar bursts at every other DB hiccup.
+_FAILURE_BACKOFF_MAX_SECONDS = 60.0
 
 
 class SignalEngineService:
@@ -49,6 +57,7 @@ class SignalEngineService:
             self.underlying,
             self.interval_seconds,
         )
+        consecutive_failures = 0
         while self.running:
             if not is_engine_run_window():
                 sleep_for = seconds_until_engine_run_window()
@@ -63,10 +72,43 @@ class SignalEngineService:
             started = time.time()
             try:
                 self.run_cycle()
+                if consecutive_failures > 0:
+                    logger.info(
+                        "SignalEngineService [%s] recovered after %d consecutive failures",
+                        self.underlying,
+                        consecutive_failures,
+                    )
+                    consecutive_failures = 0
             except Exception as exc:
-                logger.error("SignalEngineService cycle failed: %s", exc, exc_info=True)
+                consecutive_failures += 1
+                # First failure logs the full traceback; subsequent failures
+                # log a one-liner so a multi-minute DB outage doesn't fill
+                # the journal with identical stacks (~197 lines observed
+                # across 3 workers during a 33s RDS restart).
+                if consecutive_failures == 1:
+                    logger.error(
+                        "SignalEngineService cycle failed: %s", exc, exc_info=True
+                    )
+                else:
+                    logger.warning(
+                        "SignalEngineService cycle still failing "
+                        "(attempt #%d): %s",
+                        consecutive_failures,
+                        exc,
+                    )
             elapsed = time.time() - started
-            sleep_for = max(1.0, self.interval_seconds - elapsed)  # type: ignore[assignment]
+            if consecutive_failures > 0:
+                # Exponential backoff with jitter, capped — same shape as
+                # the ingestion DB circuit breaker so concurrent services
+                # back off coherently rather than thundering-herd on
+                # recovery.
+                base = min(
+                    float(self.interval_seconds) * (2 ** (consecutive_failures - 1)),
+                    _FAILURE_BACKOFF_MAX_SECONDS,
+                )
+                sleep_for = base + random.uniform(0, base * 0.1)
+            else:
+                sleep_for = max(1.0, self.interval_seconds - elapsed)
             time.sleep(sleep_for)
 
 
