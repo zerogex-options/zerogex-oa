@@ -360,6 +360,66 @@ class OptionQuote(BaseModel):
         }
 
 
+class StrikeProfileStrike(BaseModel):
+    """Per-strike row inside a Strike-Profile-Timeseries bucket.
+
+    ``call_gamma`` / ``put_gamma`` / ``net_gamma`` carry the same dollar
+    gamma exposure quantities that ``/api/gex/by-strike`` returns under
+    ``call_gex`` / ``put_gex`` / ``net_gex`` (``γ × OI × 100 × S² × 0.01``,
+    "$ per 1% spot move"), evaluated against this bucket's close price.
+    Names follow the request shape — readers that already speak the
+    by-strike units can map them straight through.
+    """
+
+    strike: Decimal
+    call_gamma: Decimal
+    put_gamma: Decimal
+    net_gamma: Decimal
+    call_oi: int
+    put_oi: int
+
+    class Config:
+        from_attributes = True
+        json_encoders = {
+            Decimal: lambda v: float(v) if v is not None else None,
+        }
+
+
+class StrikeProfileBucket(BaseModel):
+    """One time bucket of the Strike-Profile-Timeseries.
+
+    ``timestamp`` is the bucket start (ET-session aligned via the same
+    bucket expression every historical endpoint uses).  ``open`` /
+    ``high`` / ``low`` / ``close`` are the underlying OHLC for the
+    bucket; ``close`` is the canonical "spot" used to compute the
+    per-strike dollar-gamma values below.  ``gamma_flip`` / ``call_wall``
+    / ``put_wall`` are the analytics-engine values from the bucket's
+    representative ``gex_summary`` row — aggregate-basis (all
+    expirations), matching the basis the live ``/api/gex/summary``
+    surfaces.  ``strikes`` is the per-strike payload; one row per strike
+    available in this bucket's snapshot universe (after the optional
+    expiration filter).
+    """
+
+    timestamp: datetime
+    symbol: str
+    open: Optional[Decimal] = None
+    high: Optional[Decimal] = None
+    low: Optional[Decimal] = None
+    close: Optional[Decimal] = None
+    gamma_flip: Optional[Decimal] = None
+    call_wall: Optional[Decimal] = None
+    put_wall: Optional[Decimal] = None
+    strikes: list[StrikeProfileStrike]
+
+    class Config:
+        from_attributes = True
+        json_encoders = {
+            Decimal: lambda v: float(v) if v is not None else None,
+            datetime: lambda v: v.isoformat() if v is not None else None,
+        }
+
+
 class OpenInterestRecord(BaseModel):
     timestamp: datetime
     underlying: str

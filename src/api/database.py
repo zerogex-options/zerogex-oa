@@ -1824,6 +1824,255 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching historical GEX: {e}", exc_info=True)
             raise
 
+    async def get_strike_profile_timeseries(
+        self,
+        symbol: str = "SPY",
+        timeframe: str = "1min",
+        window_units: int = 78,
+        expiration: Optional[date] = None,
+    ) -> List[Dict[str, Any]]:
+        """Aligned per-bucket Strike-Profile timeseries used by the rewind chart.
+
+        Returns ``window_units`` time buckets ASCENDING (most recent last)
+        for ``symbol`` at the requested ``timeframe``.  Each bucket carries:
+
+          * the underlying OHLC inside the bucket (from ``underlying_quotes``);
+          * the bucket's representative ``gex_summary`` row's
+            ``gamma_flip_point`` / ``call_wall`` / ``put_wall`` — aggregate
+            basis, matching the live ``/api/gex/summary`` regardless of any
+            per-expiration filter applied to the strikes payload (live
+            view shows aggregate walls too, so this keeps rewind in basis
+            parity with "now");
+          * every strike's gamma exposure in the same dollar-GEX units
+            ``/api/gex/by-strike`` uses (``γ × OI × 100 × S² × 0.01``),
+            evaluated against the bucket's own ``close`` so the surface
+            matches each bucket's candlestick instead of being scaled by
+            a single trailing spot.
+
+        ``expiration=None`` → sum strike-level gamma / OI across ALL
+        expirations per (bucket, strike) — same basis as the live
+        by-strike endpoint with "Expiry All".
+
+        ``expiration=<date>`` → restrict the strikes payload to that single
+        expiration.  Walls remain aggregate-basis (see above).
+
+        Cash-index session filter is applied to both the window anchor
+        and the bucket-rep CTE — same shape ``get_historical_gex`` uses —
+        so SPX / NDX / RUT charts never surface overnight rows.
+        """
+        symbol = symbol.upper()
+        window_units = max(1, min(window_units, 480))
+        cache_key = (
+            f"strike_profile_ts:{symbol}:{timeframe}:{window_units}:"
+            f"{expiration.isoformat() if expiration else 'all'}"
+        )
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        bucket = _bucket_expr(timeframe)
+        step_interval = _interval_expr(timeframe)
+
+        # Same two-template cash-index session filter pattern get_historical_gex
+        # uses, with $5 reserved for the expiration filter so the holidays array
+        # binds as $6 when applicable.
+        session_filter_latest = ""
+        session_filter_bucketed = ""
+        params: List[Any] = [symbol, window_units, expiration]
+        if is_cash_index(symbol):
+            session_filter_template = """
+                    AND EXTRACT(DOW FROM {ts} AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
+                    AND ({ts} AT TIME ZONE 'America/New_York')::time
+                        BETWEEN TIME '09:30' AND TIME '16:00'
+                    AND ({ts} AT TIME ZONE 'America/New_York')::date <> ALL($4::date[])
+            """
+            session_filter_latest = session_filter_template.format(ts="timestamp")
+            session_filter_bucketed = session_filter_template.format(ts="gs.timestamp")
+            params.append(sorted(NYSE_HOLIDAYS))
+
+        # Bucketing/anchoring mirrors get_historical_gex and get_gex_heatmap:
+        # anchor on max(gex_summary.timestamp), pick the LATEST gex_summary row
+        # per bucket as the bucket's representative (rep_ts), JOIN gex_by_strike
+        # only at those rep_ts values (not range-scanned across the window).
+        # OHLC is bucketed against the SAME bucket expression so it lines up
+        # exactly with the GEX buckets even on holiday / half-day boundaries.
+        #
+        # $1 = symbol, $2 = window_units, $3 = expiration (date or NULL),
+        # $4 = NYSE_HOLIDAYS (cash indices only).
+        expiration_param_idx = 3
+        query = f"""
+            WITH latest AS (
+                SELECT timestamp AS max_ts
+                FROM gex_summary
+                WHERE underlying = $1{session_filter_latest}
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            bounds AS (
+                SELECT
+                    max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
+                    max_ts AS end_ts
+                FROM latest
+            ),
+            bucket_reps AS (
+                SELECT DISTINCT ON ({bucket})
+                    {bucket} AS bucket_ts,
+                    gs.timestamp AS rep_ts,
+                    gs.gamma_flip_point AS gamma_flip,
+                    gs.call_wall AS call_wall,
+                    gs.put_wall AS put_wall
+                FROM gex_summary gs
+                WHERE gs.underlying = $1
+                    AND gs.timestamp BETWEEN (SELECT start_ts FROM bounds)
+                                         AND (SELECT end_ts FROM bounds){session_filter_bucketed}
+                ORDER BY {bucket}, gs.timestamp DESC
+            ),
+            -- OHLC bucketed against the SAME bucket expression. Uses the
+            -- get_historical_quotes pattern (rn_open / rn_close window
+            -- functions to pick first-open / last-close within a bucket).
+            ohlc AS (
+                SELECT
+                    bucket_ts,
+                    MAX(open) FILTER (WHERE rn_open = 1) AS open,
+                    MAX(high) AS high,
+                    MIN(low) AS low,
+                    MAX(close) FILTER (WHERE rn_close = 1) AS close
+                FROM (
+                    SELECT
+                        {bucket} AS bucket_ts,
+                        open, high, low, close,
+                        ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp ASC) AS rn_open,
+                        ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) AS rn_close
+                    FROM underlying_quotes
+                    WHERE symbol = $1
+                        AND timestamp BETWEEN (SELECT start_ts FROM bounds)
+                                          AND (SELECT end_ts FROM bounds)
+                ) q
+                GROUP BY bucket_ts
+            ),
+            -- gex_by_strike JOINed ONLY at the bucket representative timestamps
+            -- (~window_units rows from the strike table), then SUM-aggregated
+            -- across expirations per (bucket_ts, strike) when no expiration
+            -- filter is set.  The (${expiration_param_idx}::date IS NULL OR ...)
+            -- predicate keeps a single fixed-shape SQL for both modes.
+            strikes AS (
+                SELECT
+                    br.bucket_ts,
+                    gbs.strike,
+                    SUM(COALESCE(gbs.call_gamma, 0))::numeric AS call_gamma,
+                    SUM(COALESCE(gbs.put_gamma, 0))::numeric  AS put_gamma,
+                    SUM(COALESCE(gbs.call_oi, 0))::bigint     AS call_oi,
+                    SUM(COALESCE(gbs.put_oi, 0))::bigint      AS put_oi
+                FROM bucket_reps br
+                JOIN gex_by_strike gbs
+                  ON gbs.underlying = $1
+                 AND gbs.timestamp  = br.rep_ts
+                WHERE (${expiration_param_idx}::date IS NULL OR gbs.expiration = ${expiration_param_idx}::date)
+                GROUP BY br.bucket_ts, gbs.strike
+            )
+            SELECT
+                br.bucket_ts AS timestamp,
+                o.open,
+                o.high,
+                o.low,
+                o.close,
+                br.gamma_flip,
+                br.call_wall,
+                br.put_wall,
+                s.strike,
+                -- Convert summed gamma to dollar GEX at the bucket's own
+                -- close (same convention as /api/gex/by-strike). When the
+                -- underlying tape is missing for the bucket, fall back to
+                -- 0 — frontend will treat the strikes as empty for that
+                -- bucket, but the bucket still renders with its OHLC NULLs.
+                (s.call_gamma * 100 * COALESCE(o.close, 0) * COALESCE(o.close, 0) * 0.01)::numeric AS call_gex,
+                (-1 * s.put_gamma * 100 * COALESCE(o.close, 0) * COALESCE(o.close, 0) * 0.01)::numeric AS put_gex,
+                ((s.call_gamma - s.put_gamma) * 100 * COALESCE(o.close, 0) * COALESCE(o.close, 0) * 0.01)::numeric AS net_gex,
+                s.call_oi,
+                s.put_oi
+            FROM bucket_reps br
+            LEFT JOIN ohlc o ON o.bucket_ts = br.bucket_ts
+            LEFT JOIN strikes s ON s.bucket_ts = br.bucket_ts
+            ORDER BY br.bucket_ts ASC, s.strike ASC
+        """
+
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await asyncio.wait_for(
+                    self._fetch_timed(conn, query, *params, timeout=15.0),
+                    timeout=15.0,
+                )
+                # Group flat (bucket_ts, strike) rows into per-bucket dicts.
+                # A plain dict preserves insertion order, so the query's
+                # bucket_ts ASC / strike ASC ordering carries through to the
+                # response array. Buckets with no strikes (LEFT JOIN miss
+                # because gex_by_strike happened to be empty at the rep_ts)
+                # still appear, carrying their OHLC + walls and an empty
+                # strikes array — the chart renders the candle/level
+                # without a per-strike surface for that bucket.
+                grouped: "OrderedDict[Any, Dict[str, Any]]" = OrderedDict()
+                for r in rows:
+                    ts = r["timestamp"]
+                    bucket = grouped.get(ts)
+                    if bucket is None:
+                        bucket = {
+                            "timestamp": ts,
+                            "symbol": symbol,
+                            "open": r["open"],
+                            "high": r["high"],
+                            "low": r["low"],
+                            "close": r["close"],
+                            "gamma_flip": r["gamma_flip"],
+                            "call_wall": r["call_wall"],
+                            "put_wall": r["put_wall"],
+                            "strikes": [],
+                        }
+                        grouped[ts] = bucket
+                    if r["strike"] is None:
+                        continue
+                    # Omit empty strikes — when every gamma/OI component is
+                    # zero/None there is nothing for the panels to render
+                    # at that strike and shipping them just bloats the
+                    # payload for a few-hundred-bucket window.
+                    call_gex = r["call_gex"]
+                    put_gex = r["put_gex"]
+                    net_gex = r["net_gex"]
+                    call_oi = r["call_oi"] or 0
+                    put_oi = r["put_oi"] or 0
+                    if (
+                        (call_gex is None or call_gex == 0)
+                        and (put_gex is None or put_gex == 0)
+                        and (net_gex is None or net_gex == 0)
+                        and call_oi == 0
+                        and put_oi == 0
+                    ):
+                        continue
+                    bucket["strikes"].append(
+                        {
+                            "strike": r["strike"],
+                            # Names follow the request payload; values are
+                            # the same dollar-GEX quantities the by-strike
+                            # endpoint calls call_gex / put_gex / net_gex.
+                            "call_gamma": call_gex,
+                            "put_gamma": put_gex,
+                            "net_gamma": net_gex,
+                            "call_oi": int(call_oi),
+                            "put_oi": int(put_oi),
+                        }
+                    )
+                result = list(grouped.values())
+                self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
+                return result
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Strike-profile timeseries query timed out for "
+                f"{symbol} timeframe={timeframe} window={window_units}, returning empty"
+            )
+            return []
+        except Exception as e:
+            logger.error(f"Error fetching strike profile timeseries: {e}", exc_info=True)
+            raise
+
     async def get_historical_flips_at_offsets(
         self,
         symbol: str,

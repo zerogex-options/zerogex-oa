@@ -60,6 +60,7 @@ def _build_app_with_mocked_method(monkeypatch: pytest.MonkeyPatch, method_name: 
 LIST_ENDPOINTS = [
     ("/api/gex/by-strike?symbol=SPY", "get_gex_by_strike"),
     ("/api/gex/historical?symbol=SPY", "get_historical_gex"),
+    ("/api/gex/strike-profile-timeseries?symbol=SPY", "get_strike_profile_timeseries"),
     ("/api/market/historical?symbol=SPY", "get_historical_quotes"),
     ("/api/max-pain/timeseries?symbol=SPY", "get_max_pain_timeseries"),
     ("/api/technicals/vwap-deviation?symbol=SPY", "get_vwap_deviation"),

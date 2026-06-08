@@ -39,6 +39,7 @@ from .models import (
     OptionQuote,
     OpenInterestRecord,
     OpenInterestResponse,
+    StrikeProfileBucket,
 )
 from .routers.trade_signals import router as trade_signals_router
 from .routers.volatility_gauge import router as volatility_gauge_router
@@ -396,6 +397,68 @@ async def get_gex_heatmap(
     """Get GEX heatmap data (strike x time)"""
     data = await _db().get_gex_heatmap(symbol, timeframe, window_units)
     return data or []
+
+
+@app.get(
+    "/api/gex/strike-profile-timeseries",
+    response_model=List[StrikeProfileBucket],
+    tags=["GEX"],
+)
+@handle_api_errors("GET /api/gex/strike-profile-timeseries")
+async def get_strike_profile_timeseries(
+    symbol: str = Query(default="SPY"),
+    timeframe: Literal["1min", "5min", "15min"] = Query(default="1min"),
+    window_units: int = Query(default=78, ge=1, le=480),
+    expirations: str = Query(
+        default="all",
+        description=(
+            "'all' to aggregate strikes across every expiration (same basis as "
+            "the live /api/gex/by-strike with Expiry All), or a single "
+            "YYYY-MM-DD expiration date to restrict the strikes payload."
+        ),
+    ),
+):
+    """Aligned per-bucket Strike-Profile timeseries used by the rewind chart.
+
+    Returns ``window_units`` time buckets ASCENDING (most recent last) for
+    ``symbol`` at the requested ``timeframe``.  Each bucket carries:
+
+      * the underlying OHLC inside the bucket (from ``underlying_quotes``);
+      * the bucket's representative ``gex_summary`` row's
+        ``gamma_flip`` / ``call_wall`` / ``put_wall`` — aggregate-basis,
+        matching the live ``/api/gex/summary`` regardless of the
+        ``expirations`` filter (the live view shows aggregate walls too, so
+        this keeps rewind in basis parity with "now");
+      * every strike's gamma exposure in the same dollar-GEX units
+        ``/api/gex/by-strike`` uses (``γ × OI × 100 × S² × 0.01``),
+        evaluated against the bucket's own ``close`` so the surface
+        matches each bucket's candlestick.
+
+    ``expirations=all`` sums strike gamma / OI across all expirations per
+    (bucket, strike).  ``expirations=<YYYY-MM-DD>`` restricts the
+    strikes payload to that single expiration date.  Names in the
+    strikes payload follow the request shape (``call_gamma`` /
+    ``put_gamma`` / ``net_gamma``) but the values are the dollar-GEX
+    quantities, not raw gamma — see the per-row docstring on
+    ``StrikeProfileStrike``.
+    """
+    expiration_date: Optional[date_type] = None
+    raw = (expirations or "all").strip()
+    if raw.lower() != "all":
+        try:
+            expiration_date = date_type.fromisoformat(raw)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "expirations must be 'all' or a YYYY-MM-DD expiration date"
+                ),
+            )
+
+    data = await _db().get_strike_profile_timeseries(
+        symbol, timeframe, window_units, expiration_date
+    )
+    return [StrikeProfileBucket(**row) for row in data]
 
 
 # ============================================================================
