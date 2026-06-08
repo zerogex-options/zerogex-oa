@@ -347,3 +347,36 @@ def test_window_units_clamped_to_safe_range():
     captured_low = _run("SPY", window_units=0)
     # Lower clamp keeps at least 1 bucket.
     assert captured_low["args"][1] == 1
+
+
+# ---------------------------------------------------------------------------
+# Cache TTL — long-lived for this endpoint specifically
+# ---------------------------------------------------------------------------
+
+
+def test_response_cached_with_dedicated_ttl():
+    """This endpoint's response is cached with the dedicated
+    ``_strike_profile_timeseries_cache_ttl_seconds`` TTL (default 30s) —
+    NOT the shared 5s analytics TTL.  The query JOINs ~720K rows on a
+    480-bucket request; sharing the analytics TTL meant every 1Hz poll
+    paid that full cost.  With the dedicated TTL only the first poll in
+    each TTL window does, and bounded staleness is fine because the
+    analytics cycle is ~60s anyway."""
+    db = DatabaseManager()
+    conn = _RecordingConn(fetch_rows=[])
+    _install_conn(db, conn)
+    # First call hits the DB and populates the cache.
+    asyncio.run(db.get_strike_profile_timeseries("SPY", "1min", 78, None))
+    assert len(conn.queries) == 1
+    # Inspect the cache entry directly so we don't have to mock the clock —
+    # the entry must exist and carry a TTL strictly greater than the shared
+    # analytics TTL.  Either condition failing means the endpoint reverted to
+    # the shared TTL and the rewind chart's polling cost will collapse.
+    matching_keys = [k for k in db._read_cache if k.startswith("strike_profile_ts:")]
+    assert matching_keys, "endpoint did not cache its response"
+    expires_at, _ = db._read_cache[matching_keys[0]]
+    assert db._strike_profile_timeseries_cache_ttl_seconds > db._analytics_cache_ttl_seconds
+
+    # Second call hits the cache, no extra DB round-trip.
+    asyncio.run(db.get_strike_profile_timeseries("SPY", "1min", 78, None))
+    assert len(conn.queries) == 1

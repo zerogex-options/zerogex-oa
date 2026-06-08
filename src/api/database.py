@@ -301,6 +301,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self._analytics_cache_ttl_seconds: float = float(
             os.getenv("ANALYTICS_CACHE_TTL_SECONDS", "5.0")
         )
+        # /api/gex/strike-profile-timeseries gets its own, longer TTL.  The
+        # rewind chart polls this endpoint at 1Hz for a window_units=~480
+        # response — a query that JOINs ``gex_by_strike`` at ~480 rep_ts and
+        # SUM-aggregates ~720K rows.  Without a longer TTL every poll pays
+        # that full cost; with one, only the first poll inside the TTL
+        # window does.  Bounded staleness is fine because the analytics
+        # engine cycle is ~60s anyway (so the data hasn't actually changed
+        # in the cache window), and the live-tip Strike-Profile poll on the
+        # frontend uses a tiny window_units=3 fetch that costs ~150 rows
+        # — fast even on a cold cache.  <= 0 disables endpoint caching.
+        self._strike_profile_timeseries_cache_ttl_seconds: float = float(
+            os.getenv("STRIKE_PROFILE_TIMESERIES_CACHE_TTL_SECONDS", "30.0")
+        )
         # Fraction of spot used as the /api/gex/heatmap strike half-band
         # (validated + bounded in config). Proportional so the heatmap
         # fills the frontend's price-cropped y-axis for any underlying.
@@ -2061,7 +2074,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                         }
                     )
                 result = list(grouped.values())
-                self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
+                self._cache_set(
+                    cache_key, result, self._strike_profile_timeseries_cache_ttl_seconds
+                )
                 return result
         except asyncio.TimeoutError:
             logger.warning(

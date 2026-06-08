@@ -423,6 +423,14 @@ CREATE INDEX IF NOT EXISTS idx_gex_by_strike_timestamp ON gex_by_strike(timestam
 CREATE INDEX IF NOT EXISTS idx_gex_by_strike_underlying ON gex_by_strike(underlying);
 CREATE INDEX IF NOT EXISTS idx_gex_by_strike_expiration ON gex_by_strike(expiration);
 CREATE INDEX IF NOT EXISTS idx_gex_by_strike_underlying_timestamp_strike ON gex_by_strike(underlying, timestamp DESC, strike);
+-- Covers /api/gex/strike-profile-timeseries with a single-expiration filter:
+-- the endpoint JOINs gex_by_strike at ~window_units rep_ts values, then filters
+-- on expiration; without an (underlying, expiration, timestamp) index PG has
+-- to fetch every strike at each rep_ts and filter, fetching ~30x more rows
+-- than necessary.  The composite leads with expiration so a single
+-- expiration's full session window can be range-scanned in one go.
+CREATE INDEX IF NOT EXISTS idx_gex_by_strike_underlying_expiration_timestamp
+    ON gex_by_strike(underlying, expiration, timestamp DESC);
 
 DO $$
 BEGIN
