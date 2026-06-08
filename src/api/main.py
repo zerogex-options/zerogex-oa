@@ -399,6 +399,23 @@ async def get_gex_heatmap(
     return data or []
 
 
+@app.get("/api/gex/expirations", response_model=List[date_type], tags=["GEX"])
+@handle_api_errors("GET /api/gex/expirations")
+async def get_gex_expirations(
+    symbol: str = Query(default="SPY"),
+    lookback_hours: int = Query(default=24, ge=1, le=168),
+):
+    """Distinct option expirations seen in ``gex_by_strike`` within the
+    trailing ``lookback_hours``.  Powers the Strike-Profile chart's
+    expiry dropdown so today's expiration stays available even after
+    market close (when the latest ``/api/gex/by-strike`` snapshot has
+    dropped it — the analytics engine stops writing rows for expired
+    contracts).  Default 24h covers a post-close shift; cap at 168h
+    (1 week) bounds the scan."""
+    data = await _db().get_gex_expirations(symbol, lookback_hours)
+    return data
+
+
 @app.get(
     "/api/gex/strike-profile-timeseries",
     response_model=List[StrikeProfileBucket],

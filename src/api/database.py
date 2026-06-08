@@ -1449,6 +1449,57 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching GEX summary: {e}", exc_info=True)
             raise
 
+    async def get_gex_expirations(
+        self,
+        symbol: str = "SPY",
+        lookback_hours: int = 24,
+    ) -> List[date]:
+        """Return distinct option expirations seen in ``gex_by_strike``
+        within the trailing ``lookback_hours`` for ``symbol``.
+
+        Powers the Strike-Profile chart's expiry dropdown.  Reading from
+        a TRAILING WINDOW (not just the latest snapshot, which is what
+        ``/api/gex/by-strike`` does) is the key fix for the post-close
+        case: at 18:10 ET today's 0DTE options have expired, the
+        analytics engine no longer writes ``gex_by_strike`` rows for
+        them, so today's expiration vanishes from the latest snapshot —
+        but the rewind feature still has access to the day's data when
+        those contracts were live, so the dropdown should still offer
+        today's date.  24h covers a full post-close shift while staying
+        light on the index scan.
+
+        Idempotent / pure read — cached at the analytics TTL since the
+        universe of expirations only grows by one entry per trading day
+        and shrinks by post-expiry pruning that we explicitly want to
+        defer to the 24h boundary.
+        """
+        symbol = symbol.upper()
+        cache_key = f"gex_expirations:{symbol}:{lookback_hours}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        # Uses idx_gex_by_strike_underlying_timestamp_strike for the
+        # underlying+timestamp range scan, then a hashagg for DISTINCT.
+        # 24h × ~60 cycles/h × ~30 expirations = ~43K rows scanned
+        # worst case — cheap by every measure.
+        query = """
+            SELECT DISTINCT expiration
+            FROM gex_by_strike
+            WHERE underlying = $1
+              AND timestamp >= NOW() - make_interval(hours => $2)
+            ORDER BY expiration
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, lookback_hours)
+                result = [row["expiration"] for row in rows]
+                self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
+                return result
+        except Exception as e:
+            logger.error(f"Error fetching GEX expirations: {e}", exc_info=True)
+            raise
+
     async def get_gex_by_strike(
         self,
         symbol: str = "SPY",
