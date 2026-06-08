@@ -6,8 +6,12 @@ day of option_chains data.  Read-only: derives the volume_delta /
 ask_vol_delta / bid_vol_delta columns via a SELECT-only mirror of the
 production flow_contract_facts INSERT CTE, never writes back.
 
-When the two formulations agree row-for-row, there is no divergence and
-flipping ``USE_CASH_SESSION_KEYING`` on is operationally safe.
+Cash-session keying is now the unconditional production path (the
+``USE_CASH_SESSION_KEYING`` rollout flag has been removed). This harness
+is retained as a regression guard: it confirms the production cash keying
+still differs from the legacy calendar-date formulation ONLY at session
+boundaries. When the two formulations agree row-for-row, there is no
+divergence at all.
 
 When they DISAGREE, every divergence MUST have a structural cause -- the
 LAG and current timestamps for that row straddle exactly one of the two
@@ -42,15 +46,14 @@ session boundaries the formulations define differently:
   shows up classified this way, something is wrong with the LAG-CASE
   rendering and the test fails.
 
-The cutover is safe when the parity harness returns ONLY
+The keying is sound when the parity harness returns ONLY
 crosses_calendar_only, crosses_cash_open_only, and holiday_bridge_gap
-divergences.  All three are by-design behavior changes documented in
-the rollout commit messages.  The diagnostic prints the count + a
-sampling per cause so
-the operator can eyeball "how many rows in this day were affected" and
-"is the magnitude of those deltas sensible" before flipping the flag.
+divergences.  All three are by-design differences documented in the
+rollout commit messages.  The diagnostic prints the count + a sampling
+per cause so an operator auditing a real day can eyeball "how many rows
+were affected" and "is the magnitude of those deltas sensible".
 
-Run this before flipping the flag in any environment:
+Run this against a real day of data to audit the keying:
 
     CASH_SESSION_KEYING_PARITY_DSN=postgresql://USER@HOST:PORT/DB \\
     CASH_SESSION_KEYING_PARITY_SYMBOL=SPY \\

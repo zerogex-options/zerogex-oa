@@ -20,7 +20,7 @@ import time
 import time as _time
 from dataclasses import dataclass
 from multiprocessing import Process
-from datetime import datetime, date as _date, time as dt_time, timedelta, timezone
+from datetime import datetime, date as _date, timedelta
 from typing import Dict, Any, List, Optional
 from collections import defaultdict
 import pytz
@@ -41,7 +41,6 @@ from src.validation import (
     underlying_feed_expected,
 )
 from src.symbols import parse_underlyings, get_canonical_symbol
-from src import config as _config
 from src.config import (
     AGGREGATION_BUCKET_SECONDS,
     MAX_BUFFER_SIZE,
@@ -132,9 +131,7 @@ def _compute_db_backoff_seconds(consecutive_failures: int) -> float:
 # a brief DB outage produces ~1000 identical warnings (~1044 observed in a
 # 2-3s burst during the 2026-06 RDS restart) because every batch attempt
 # from the live option stream hits the early-return + log path.
-_CB_SKIP_LOG_INTERVAL_SECONDS = float(
-    os.getenv("CIRCUIT_BREAKER_SKIP_LOG_INTERVAL_SECONDS", "5.0")
-)
+_CB_SKIP_LOG_INTERVAL_SECONDS = float(os.getenv("CIRCUIT_BREAKER_SKIP_LOG_INTERVAL_SECONDS", "5.0"))
 
 
 def _to_db_float(value: Any) -> Optional[float]:
@@ -235,9 +232,7 @@ class IngestionEngine:
         # this. Set to 0 to disable. The 2026-06 prod incident sat in a
         # broken state for 17h with 1.1M rejects because no escalation
         # path existed; this is the last line of defense.
-        self.greeks_stale_fatal_seconds = float(
-            os.getenv("GREEKS_STALE_FATAL_SECONDS", "1800")
-        )
+        self.greeks_stale_fatal_seconds = float(os.getenv("GREEKS_STALE_FATAL_SECONDS", "1800"))
         # Wall-clock monotonic timestamp of the current stale episode's
         # start, or None when Greeks are flowing. Reset to None on the
         # first successful Greek calc after a stale window.
@@ -607,9 +602,7 @@ class IngestionEngine:
                         # legitimate and would false-trip.
                         if self._greeks_stale_episode_started_mono is None:
                             self._greeks_stale_episode_started_mono = now_mono
-                        stuck_seconds = (
-                            now_mono - self._greeks_stale_episode_started_mono
-                        )
+                        stuck_seconds = now_mono - self._greeks_stale_episode_started_mono
                         if (
                             self.greeks_stale_fatal_seconds > 0
                             and stuck_seconds >= self.greeks_stale_fatal_seconds
@@ -845,9 +838,7 @@ class IngestionEngine:
         self._option_bucket_last_write[key] = now_mono
         return True
 
-    def _select_classify_quote(
-        self, acc: "_FlowAccumulator", snap: Dict[str, Any]
-    ) -> tuple:
+    def _select_classify_quote(self, acc: "_FlowAccumulator", snap: Dict[str, Any]) -> tuple:
         """Pick the NBBO to classify ``snap``'s trade against.
 
         Prefer the **prior tick** (``acc.last_*`` — the quote prevailing
@@ -1027,18 +1018,11 @@ class IngestionEngine:
         TradeStation resets option cumulative volume to 0 at session open,
         so per-contract flow accumulators are scoped per ET session date.
 
-        Under ``USE_CASH_SESSION_KEYING`` returns the cash-session date
-        (pre-09:30 belongs to the PRIOR session), aligning the in-memory
-        rollover with the vendor's exact reset boundary.  Otherwise
-        returns the ET calendar date (legacy behavior).
+        Returns the cash-session date (pre-09:30 belongs to the PRIOR
+        session), aligning the in-memory rollover with the vendor's exact
+        reset boundary.
         """
-        if _config.USE_CASH_SESSION_KEYING:
-            return cash_session_date(bucket)
-        if bucket.tzinfo is None:
-            bucket_et = pytz.UTC.localize(bucket).astimezone(ET)
-        else:
-            bucket_et = bucket.astimezone(ET)
-        return bucket_et.date()  # type: ignore[no-any-return]
+        return cash_session_date(bucket)
 
     def _hydrate_flow_accumulator(
         self, option_symbol: str, session_date: _date
@@ -1053,15 +1037,11 @@ class IngestionEngine:
         the next snapshot's Lee-Ready classification has a real prior
         tick from the start.  Zeros on DB failure or empty result.
         """
-        if _config.USE_CASH_SESSION_KEYING:
-            # ``session_date`` is the cash-session date; the session began
-            # at 09:30 ET on that date.  Hydration must pull only rows in
-            # that cash-session window so we don't carry forward late-night
-            # extended-hours rows that belong to the PRIOR session.
-            session_start_utc = cash_session_start_utc(session_date)
-        else:
-            session_start_et = ET.localize(datetime.combine(session_date, dt_time(0, 0)))
-            session_start_utc = session_start_et.astimezone(timezone.utc)
+        # ``session_date`` is the cash-session date; the session began at
+        # 09:30 ET on that date.  Hydration must pull only rows in that
+        # cash-session window so we don't carry forward late-night
+        # extended-hours rows that belong to the PRIOR session.
+        session_start_utc = cash_session_start_utc(session_date)
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
@@ -1518,9 +1498,7 @@ class IngestionEngine:
             self._cb_skip_last_log_mono = now_mono
             return
 
-        self._cb_skip_count_since_last_log = (
-            getattr(self, "_cb_skip_count_since_last_log", 0) + 1
-        )
+        self._cb_skip_count_since_last_log = getattr(self, "_cb_skip_count_since_last_log", 0) + 1
         self._cb_skip_rows_since_last_log = (
             getattr(self, "_cb_skip_rows_since_last_log", 0) + row_count
         )

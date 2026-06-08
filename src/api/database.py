@@ -19,7 +19,6 @@ import json
 from src.api.queries.signals import SignalsQueriesMixin
 from src.database.password_providers import resolve_db_credentials
 from src.api.queries.technicals import TechnicalsQueriesMixin
-from src import config as _config
 from src.config import GEX_HEATMAP_STRIKE_BAND_PCT
 from src.flow_series_sql import FLOW_SERIES_CTE_ASYNCPG, SNAPSHOT_SELECT_ASYNCPG
 from src.market_calendar import NYSE_HOLIDAYS
@@ -239,9 +238,9 @@ def _flow_lag_same_session_clause(use_cash_keying: bool) -> str:
         # set falls back to a never-matching predicate (no holidays
         # known yet) so the walk-back degenerates to weekends-only.
         if NYSE_HOLIDAYS:
-            holiday_set_sql = "(" + ", ".join(
-                f"DATE '{h.isoformat()}'" for h in sorted(NYSE_HOLIDAYS)
-            ) + ")"
+            holiday_set_sql = (
+                "(" + ", ".join(f"DATE '{h.isoformat()}'" for h in sorted(NYSE_HOLIDAYS)) + ")"
+            )
         else:
             holiday_set_sql = None
 
@@ -253,9 +252,7 @@ def _flow_lag_same_session_clause(use_cash_keying: bool) -> str:
 
         def cash_session_date_expr(ts_sql: str) -> str:
             shifted = (
-                "(("
-                + ts_sql
-                + " AT TIME ZONE 'America/New_York') "
+                "((" + ts_sql + " AT TIME ZONE 'America/New_York') "
                 "- interval '9 hours 30 minutes')::date"
             )
             # Walk back up to N days via COALESCE.  Each step returns
@@ -267,9 +264,7 @@ def _flow_lag_same_session_clause(use_cash_keying: bool) -> str:
             branches = []
             for offset in range(_CASH_SESSION_DATE_MAX_LOOKBACK_DAYS):
                 candidate = f"({shifted} - {offset})"
-                branches.append(
-                    f"CASE WHEN {is_trading_day(candidate)} THEN {candidate} END"
-                )
+                branches.append(f"CASE WHEN {is_trading_day(candidate)} THEN {candidate} END")
             fallback = f"({shifted} - {_CASH_SESSION_DATE_MAX_LOOKBACK_DAYS})"
             return "COALESCE(" + ", ".join(branches + [fallback]) + ")"
 
@@ -782,12 +777,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # Canonical per-contract fact table used as the source of truth for flow APIs.
         # Uses LAG() window function instead of LATERAL join for O(n) vs O(n²) perf.
         #
-        # ``same_session`` is the LAG-CASE WHEN clause chosen by
-        # USE_CASH_SESSION_KEYING.  It must match the in-memory
-        # _FlowAccumulator session-key semantics in main_engine.py
-        # exactly so persisted deltas and in-memory cumulatives stay
-        # consistent across a vendor reset.
-        same_session = _flow_lag_same_session_clause(_config.USE_CASH_SESSION_KEYING)
+        # ``same_session`` is the cash-session LAG-CASE WHEN clause.  It
+        # must match the in-memory _FlowAccumulator session-key semantics
+        # in main_engine.py exactly so persisted deltas and in-memory
+        # cumulatives stay consistent across a vendor reset.  The legacy
+        # calendar-date formulation is retained behind the
+        # ``use_cash_keying`` parameter solely for the parity regression
+        # harness; production is unconditionally cash-keyed.
+        same_session = _flow_lag_same_session_clause(use_cash_keying=True)
         await conn.execute(
             """
             WITH window_rows AS (

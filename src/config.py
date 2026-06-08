@@ -540,19 +540,6 @@ SESSION_TEMPLATE = os.getenv("SESSION_TEMPLATE", "Default")
 TS_STREAM_READ_TIMEOUT = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
 TS_STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").lower() == "true"
 
-# Cash-session keying for per-contract flow accumulators (Item 8 rollout).
-# When true, _FlowAccumulator session boundaries and flow_contract_facts
-# LAG-CASE date-equality both partition by cash-session date (the date the
-# 09:30 ET cash open belongs to) rather than the calendar date in ET.  Pre-
-# 09:30 extended-hours rows belong to the PRIOR session, matching the
-# TradeStation vendor cumulative-reset boundary exactly.
-#
-# Default off until the parity harness (Phase 4) and staged cutover
-# (Phase 5) sign off.  Both the in-memory accumulator (main_engine.py)
-# and the SQL LAG-CASE branch (api/database.py) MUST read this same flag
-# so in-memory and persisted-delta semantics stay consistent end-to-end.
-USE_CASH_SESSION_KEYING = os.getenv("USE_CASH_SESSION_KEYING", "false").lower() == "true"
-
 # Streaming quotes endpoint encodes the symbol list in the URL path. With
 # ~1000+ option contracts tracked, a single-connection URL exceeds ~25KB
 # and triggers a 414 Request-URI Too Large from TradeStation's gateway.
