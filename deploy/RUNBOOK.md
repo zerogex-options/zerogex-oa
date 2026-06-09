@@ -452,3 +452,53 @@ aws ec2 associate-address --instance-id $OLD_INSTANCE_ID --allocation-id $EIP_AL
 aws ec2 stop-instances     --instance-ids $OLD_INSTANCE_ID   # 48h soak
 aws ec2 terminate-instances --instance-ids $OLD_INSTANCE_ID  # final
 ```
+
+---
+
+## Appendix — Auth DB backup restore drill
+
+Unlike this instance — where all durable state lives in RDS (see "Assumed
+setup") — the `zerogex-web` box keeps the SQLite **auth DB** as local
+state. It is the only copy of every account, session, OAuth identity, and
+the user→tier mapping that reconciles against Stripe. Replacing the web box
+without a restored `auth.db` loses every user, so prove the backup+restore
+path works *before* you need it.
+
+Run this **quarterly on the `zerogex-web` box**. It never touches the live
+DB — the restore goes to a scratch path. The canonical backup/DR checklist
+(S3 versioning/Object Lock, RDS retention/PITR, RPO/RTO targets) lives in
+`deploy/BACKUP_RESILIENCE.md`; this is the runnable drill.
+
+```bash
+# On the zerogex-web box.
+cd ~/zerogex-web
+
+# 1. Take a fresh, known-good backup on demand. The hourly systemd timer
+#    already does this; running it once now gives a just-made archive to
+#    drill against (and exercises the same code path a real backup uses).
+make backup-auth
+
+# 2. Restore the latest archive to a SCRATCH path — NEVER $AUTH_DB_PATH.
+latest=$(ls -t ~/zerogex-auth-backups/auth-*.db.gz* | head -1)
+echo "drilling restore of: $latest"
+gunzip -c "$latest" > /tmp/auth-drill.db
+#   If backups are GPG-encrypted (BACKUP_GPG_RECIPIENT set), instead:
+#   gpg -d "$latest" | gunzip -c > /tmp/auth-drill.db
+
+# 3. Verify the restored copy is intact and actually holds account data.
+sqlite3 /tmp/auth-drill.db 'PRAGMA integrity_check;'                       # expect: ok
+sqlite3 /tmp/auth-drill.db 'SELECT count(*) AS users FROM users;'
+sqlite3 /tmp/auth-drill.db 'SELECT email FROM users ORDER BY created_at DESC LIMIT 1;'
+
+# 4. Discard the scratch copy.
+rm -f /tmp/auth-drill.db
+```
+
+Record the wall-clock time for steps 2–3 and compare it against the 1-hour
+auth-DB RTO target in `BACKUP_RESILIENCE.md`. A *real* restore is the same
+`gunzip` into `$AUTH_DB_PATH` with PM2 stopped first — see
+`zerogex-web/deploy/README.md` ("Auth Database Backups").
+
+If `make backup-auth` reports "Auth DB not found", the app simply hasn't
+created the DB yet (it's created lazily on the first runtime DB call), so
+there is nothing to back up — a valid result on a freshly-deployed box.
