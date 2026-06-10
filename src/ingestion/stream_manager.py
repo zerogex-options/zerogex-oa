@@ -1867,8 +1867,7 @@ class StreamManager:
                                 _underlying_restart_attempts = 1
                                 _underlying_restart_backed_off = False
                                 self._restart_underlying_accumulator(
-                                    f"backoff-retry {stale_seconds:.0f}s during "
-                                    f"{session}"
+                                    f"backoff-retry {stale_seconds:.0f}s during " f"{session}"
                                 )
                                 _last_forced_restart_mono = now_mono
                         else:

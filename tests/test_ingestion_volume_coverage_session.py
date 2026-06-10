@@ -44,18 +44,17 @@ def test_coverage_survives_accumulator_reset():
     mgr = _bare_manager(tracked)
 
     # Cycle 1: 60 of 100 contracts have traded.
-    assert mgr._update_session_volume_coverage(
-        _state(tracked[:60], tracked[60:]), 100, now_et=DAY
-    ) == 0.60
+    assert (
+        mgr._update_session_volume_coverage(_state(tracked[:60], tracked[60:]), 100, now_et=DAY)
+        == 0.60
+    )
 
     # Cycle 2: strike recalc just rebuilt the accumulator -> empty state.
     # The old accumulator-only count would collapse to 0.0 here.
     assert mgr._update_session_volume_coverage({}, 100, now_et=DAY) == 0.60
 
     # Cycle 3: 20 *different* contracts trade after the reset -> cumulative 80.
-    assert mgr._update_session_volume_coverage(
-        _state(tracked[60:80]), 100, now_et=DAY
-    ) == 0.80
+    assert mgr._update_session_volume_coverage(_state(tracked[60:80]), 100, now_et=DAY) == 0.80
 
 
 def test_coverage_resets_at_day_rollover():

@@ -86,13 +86,10 @@ class SignalEngineService:
                 # the journal with identical stacks (~197 lines observed
                 # across 3 workers during a 33s RDS restart).
                 if consecutive_failures == 1:
-                    logger.error(
-                        "SignalEngineService cycle failed: %s", exc, exc_info=True
-                    )
+                    logger.error("SignalEngineService cycle failed: %s", exc, exc_info=True)
                 else:
                     logger.warning(
-                        "SignalEngineService cycle still failing "
-                        "(attempt #%d): %s",
+                        "SignalEngineService cycle still failing " "(attempt #%d): %s",
                         consecutive_failures,
                         exc,
                     )

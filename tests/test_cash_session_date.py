@@ -188,9 +188,7 @@ def test_cash_session_date_rolls_back_over_nyse_holidays(monkeypatch):
 
     # Inject just the Friday-after-July-4 holiday for the duration of
     # the test (don't depend on the env's actual NYSE_HOLIDAYS).
-    monkeypatch.setattr(
-        validation_mod, "NYSE_HOLIDAYS", {date(2026, 7, 3)}
-    )
+    monkeypatch.setattr(validation_mod, "NYSE_HOLIDAYS", {date(2026, 7, 3)})
 
     # Mon 2026-07-06 00:00 ET -> naive shift gives Sun 2026-07-05;
     # weekend roll-back hits Fri 2026-07-03 which is the holiday;

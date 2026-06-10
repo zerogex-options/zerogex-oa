@@ -74,7 +74,9 @@ def test_empty_iterlines_logs_degraded_upstream_and_backs_off(monkeypatch):
     the per-account cap, and the finally block must sleep so the reader
     loop doesn't hammer TradeStation."""
     acc = _bare_option_acc(monkeypatch)
-    monkeypatch.setattr(sm, "_requests", types.SimpleNamespace(get=lambda *a, **k: _FakeResponse([])))
+    monkeypatch.setattr(
+        sm, "_requests", types.SimpleNamespace(get=lambda *a, **k: _FakeResponse([]))
+    )
 
     sleep_calls = []
     monkeypatch.setattr(sm.time, "sleep", lambda s: sleep_calls.append(s))
@@ -127,7 +129,9 @@ def test_stopped_mid_read_does_not_warn(monkeypatch):
     not look like cap exhaustion or degradation."""
     acc = _bare_option_acc(monkeypatch)
     acc._running = False  # simulate stop() already called
-    monkeypatch.setattr(sm, "_requests", types.SimpleNamespace(get=lambda *a, **k: _FakeResponse([])))
+    monkeypatch.setattr(
+        sm, "_requests", types.SimpleNamespace(get=lambda *a, **k: _FakeResponse([]))
+    )
 
     sleep_calls = []
     monkeypatch.setattr(sm.time, "sleep", lambda s: sleep_calls.append(s))

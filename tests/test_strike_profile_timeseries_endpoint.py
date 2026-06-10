@@ -106,8 +106,18 @@ def test_response_shape_is_list_of_buckets(monkeypatch: pytest.MonkeyPatch):
 
     bucket = body[0]
     # Top-level field shape pinned to the request payload.
-    for field in ("timestamp", "symbol", "open", "high", "low", "close",
-                  "gamma_flip", "call_wall", "put_wall", "strikes"):
+    for field in (
+        "timestamp",
+        "symbol",
+        "open",
+        "high",
+        "low",
+        "close",
+        "gamma_flip",
+        "call_wall",
+        "put_wall",
+        "strikes",
+    ):
         assert field in bucket, field
 
     # Numerics arrive as floats (Decimal → float via the model's
@@ -118,8 +128,7 @@ def test_response_shape_is_list_of_buckets(monkeypatch: pytest.MonkeyPatch):
     # Strikes shape uses exactly the names the frontend type-checks
     # against (call_gamma / put_gamma / net_gamma, not call_gex et al.).
     strike_row = bucket["strikes"][0]
-    for field in ("strike", "call_gamma", "put_gamma", "net_gamma",
-                  "call_oi", "put_oi"):
+    for field in ("strike", "call_gamma", "put_gamma", "net_gamma", "call_oi", "put_oi"):
         assert field in strike_row, field
     assert isinstance(strike_row["call_oi"], int)
     assert strike_row["call_gamma"] == 1234.5
@@ -184,9 +193,7 @@ def test_expirations_invalid_returns_400(monkeypatch: pytest.MonkeyPatch):
     interpolate the raw string into the SQL."""
     client, _ = _build_app_with_mocked_method(monkeypatch, returns=[])
     with client:
-        response = client.get(
-            "/api/gex/strike-profile-timeseries?symbol=SPY&expirations=tomorrow"
-        )
+        response = client.get("/api/gex/strike-profile-timeseries?symbol=SPY&expirations=tomorrow")
     assert response.status_code == 400
     assert "expirations" in response.json()["detail"].lower()
 
@@ -216,9 +223,7 @@ def test_window_units_respects_upper_bound(monkeypatch: pytest.MonkeyPatch):
     accidental fetch and we want a clear 422 not a slow DB scan)."""
     client, _ = _build_app_with_mocked_method(monkeypatch, returns=[])
     with client:
-        response = client.get(
-            "/api/gex/strike-profile-timeseries?symbol=SPY&window_units=10000"
-        )
+        response = client.get("/api/gex/strike-profile-timeseries?symbol=SPY&window_units=10000")
     assert response.status_code == 422
 
 
@@ -229,7 +234,5 @@ def test_timeframe_only_accepts_minute_intervals(monkeypatch: pytest.MonkeyPatch
     in the frontend doesn't silently produce an unusable response."""
     client, _ = _build_app_with_mocked_method(monkeypatch, returns=[])
     with client:
-        response = client.get(
-            "/api/gex/strike-profile-timeseries?symbol=SPY&timeframe=1hr"
-        )
+        response = client.get("/api/gex/strike-profile-timeseries?symbol=SPY&timeframe=1hr")
     assert response.status_code == 422

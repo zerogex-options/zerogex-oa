@@ -467,9 +467,7 @@ async def get_strike_profile_timeseries(
         except ValueError:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    "expirations must be 'all' or a YYYY-MM-DD expiration date"
-                ),
+                detail=("expirations must be 'all' or a YYYY-MM-DD expiration date"),
             )
 
     data = await _db().get_strike_profile_timeseries(
