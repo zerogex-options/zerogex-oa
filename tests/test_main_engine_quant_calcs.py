@@ -1159,10 +1159,50 @@ def test_gex_summary_marks_flip_unresolved_on_one_sided_chain(caplog):
     assert summary["gamma_flip_unresolved"] is True
     assert summary["flip_distance"] is None  # no flip => no distance
     assert "net_gex_at_spot" in summary  # still sampled from the profile
-    assert any(
-        "Gamma flip UNRESOLVED" in r.message and r.levelno == logging.WARNING
+    unresolved_warns = [
+        r
         for r in caplog.records
-    )
+        if "Gamma flip UNRESOLVED" in r.message and r.levelno == logging.WARNING
+    ]
+    assert unresolved_warns
+    # Healthy IV pipeline (iv=0.25 ≠ 0.20 sentinel for every contract): the
+    # "high share indicates stale IV pipeline" hint must NOT render, since
+    # the actual share is 0%. The 2026-06-09 prod regression unconditionally
+    # rendered the hint alongside "share 0.0%", inverting the meaning.
+    assert "stale IV pipeline" not in unresolved_warns[0].message
+
+
+def test_unresolved_warn_renders_stale_iv_hint_when_share_actually_high(caplog):
+    """Mirror of the prior test for the affirmative case: when the IV
+    pipeline really is stale (many contracts pinned at the 0.20 sentinel),
+    the hint must render so operators see the root cause."""
+    import logging
+
+    engine = AnalyticsEngine(underlying="SPY")
+    ts = datetime(2026, 5, 18, 15, 0, tzinfo=timezone.utc)
+    exp = datetime(2026, 9, 18).date()
+    spot = 500.0
+    # 4/5 contracts pinned at the default IV sentinel (80% share, well
+    # above the 20% threshold). All calls so the chain is one-signed and
+    # the UNRESOLVED branch fires.
+    options = [
+        _opt(500.0, "C", oi=5000, iv=0.20, exp=exp, volume=3),
+        _opt(505.0, "C", oi=5000, iv=0.20, exp=exp, volume=3),
+        _opt(510.0, "C", oi=5000, iv=0.20, exp=exp, volume=3),
+        _opt(515.0, "C", oi=5000, iv=0.20, exp=exp, volume=3),
+        _opt(520.0, "C", oi=5000, iv=0.35, exp=exp, volume=3),
+    ]
+    gex_by_strike = [{"strike": 500.0, "net_gex": 1_000_000.0}]
+
+    with caplog.at_level(logging.WARNING):
+        engine._calculate_gex_summary(gex_by_strike, options, spot, ts)
+    unresolved_warns = [
+        r
+        for r in caplog.records
+        if "Gamma flip UNRESOLVED" in r.message and r.levelno == logging.WARNING
+    ]
+    assert unresolved_warns
+    assert "stale IV pipeline" in unresolved_warns[0].message
 
 
 def test_gex_summary_throttles_repeated_unresolved_warnings(caplog):

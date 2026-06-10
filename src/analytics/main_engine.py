@@ -2208,6 +2208,12 @@ class AnalyticsEngine:
     # contracts here, so we count rows sitting on this exact sentinel
     # value to surface the "IV pipeline is lagging" failure mode.
     _GAMMA_FLIP_DIAGNOSTIC_DEFAULT_IV = 0.2
+    # IV-at-default share above which the "stale IV pipeline" hint is
+    # actually informative. Below it the share is just noise (today's
+    # 2026-06-09 UNRESOLVED bursts logged ``share 0.0%`` alongside the
+    # message "high share indicates stale IV pipeline", which inverted
+    # the meaning every time). The matrix proposed 20%.
+    _GAMMA_FLIP_DIAGNOSTIC_STALE_IV_SHARE_THRESHOLD = 0.20
 
     def _gamma_flip_unresolved_diagnostics(
         self,
@@ -2473,6 +2479,17 @@ class AnalyticsEngine:
                 diag = self._gamma_flip_unresolved_diagnostics(
                     options, gamma_profile, underlying_price, timestamp
                 )
+                # Only attach the "stale IV pipeline" tail when the share is
+                # actually high enough to suggest one. The previous wording
+                # ran the hint unconditionally, so a healthy 0% share read
+                # "share 0.0% — high share indicates stale IV pipeline",
+                # which is the opposite of what the data was saying.
+                iv_default_hint = (
+                    " — high share indicates stale IV pipeline"
+                    if diag["iv_at_default_share"]
+                    >= self._GAMMA_FLIP_DIAGNOSTIC_STALE_IV_SHARE_THRESHOLD
+                    else ""
+                )
                 logger.warning(
                     "Gamma flip UNRESOLVED for %s @ %s: no structural interior "
                     "crossing across the span ladder (max rung ±%.0f%%, %d/%d "
@@ -2480,8 +2497,7 @@ class AnalyticsEngine:
                     "persisting NULL (no clamp, no carry-forward). "
                     "Sides usable C/P=%d/%d. "
                     "IV p10/p50/p90/max=%.3f/%.3f/%.3f/%.3f "
-                    "(%d contracts at default IV=%.2f, share %.1f%% — high "
-                    "share indicates stale IV pipeline). "
+                    "(%d contracts at default IV=%.2f, share %.1f%%%s). "
                     "OI share by DTE raw 0/1-2/3-7/8+=%.1f/%.1f/%.1f/%.1f%%; "
                     "DTE-weighted 0/1-2/3-7/8+=%.1f/%.1f/%.1f/%.1f%%. "
                     "Profile (widest rung) peak|GEX|=%.3g, median|GEX|=%.3g, "
@@ -2504,6 +2520,7 @@ class AnalyticsEngine:
                     diag["iv_at_default_count"],
                     self._GAMMA_FLIP_DIAGNOSTIC_DEFAULT_IV,
                     diag["iv_at_default_share"] * 100.0,
+                    iv_default_hint,
                     diag["oi_share_0dte"] * 100.0,
                     diag["oi_share_1_2dte"] * 100.0,
                     diag["oi_share_3_7dte"] * 100.0,
