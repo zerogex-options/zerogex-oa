@@ -81,6 +81,16 @@ _DECODE_MAX_PER_MINUTE = int(os.getenv("TS_STREAM_DECODE_MAX_PER_MINUTE", "50"))
 # the symptom is named instead of looking like a generic disconnect.
 _STREAM_CAP_SUSPECT_SECONDS = int(os.getenv("TS_STREAM_CAP_SUSPECT_SECONDS", "30"))
 
+# When a stream connects (200 OK) and ends without delivering ANY data,
+# TradeStation's upstream gateway is the likely culprit rather than the
+# per-account cap (which closes connections that were producing data).
+# Reader loops only sleep on raised exceptions, so a clean iter_lines()
+# return immediately retries — back off this many seconds in the
+# finally block to keep an upstream blip from hot-looping at 10 Hz.
+_STREAM_DEGRADED_UPSTREAM_BACKOFF_SECONDS = int(
+    os.getenv("TS_STREAM_DEGRADED_UPSTREAM_BACKOFF_SECONDS", "2")
+)
+
 # Possible field names for implied volatility across TradeStation payload variants
 _IV_FIELD_NAMES = ("ImpliedVolatility", "IV", "Volatility", "IVol")
 
@@ -404,6 +414,14 @@ class OptionStreamAccumulator:
         self._connected.set()
 
         decode_tracker = _DecodeErrorTracker(label)
+        # Quote-payload counter for the cap-vs-degraded-upstream
+        # classifier in ``finally``. A connection that flowed data and
+        # was cut points at the per-account cap; one that accepted 200
+        # OK and immediately closed without yielding any quotes points
+        # at an upstream gateway hiccup (the 06:33 burst in the
+        # 2026-06-09 journal was ten 0.0s-elapsed closes capped by an
+        # explicit 502 — pure-200/no-data is the early fingerprint).
+        payloads_received = 0
 
         try:
             for raw_line in response.iter_lines(decode_unicode=True):
@@ -442,8 +460,10 @@ class OptionStreamAccumulator:
                     for q in payload["Quotes"]:
                         if isinstance(q, dict):
                             self._merge_single_quote(q)
+                            payloads_received += 1
                 elif isinstance(payload, dict) and "Symbol" in payload:
                     self._merge_single_quote(payload)
+                    payloads_received += 1
         finally:
             with self._response_lock:
                 self._current_responses[chunk_idx] = None
@@ -452,18 +472,39 @@ class OptionStreamAccumulator:
             # Only warn while we're still meant to be running: a quick exit
             # caused by stop() / shutdown is not cap exhaustion.
             if self._running and elapsed < _STREAM_CAP_SUSPECT_SECONDS:
-                logger.warning(
-                    "%s ended after only %.1fs (under %ds). Likely cause: "
-                    "TradeStation per-account concurrent-stream cap (~10) "
-                    "exhausted. Total streams in this process: 1 underlying "
-                    "+ %d option chunks. With N ingestion processes the "
-                    "account total is N × (1 + chunks). Reduce chunk count "
-                    "by raising STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION.",
-                    label,
-                    elapsed,
-                    _STREAM_CAP_SUSPECT_SECONDS,
-                    len(self._chunks),
-                )
+                if payloads_received == 0:
+                    # 200 OK with an empty stream — upstream degradation,
+                    # not the per-account cap. The reader-loop only sleeps
+                    # on raised exceptions, so a normal-return + immediate
+                    # retry hot-loops the upstream (10 attempts in ~1s in
+                    # the prod burst); back off here to space the retries.
+                    logger.warning(
+                        "%s ended after %.1fs without yielding any quotes "
+                        "(under %ds). Likely cause: TradeStation upstream "
+                        "gateway degradation (accepted-then-closed with no "
+                        "data), NOT the per-account concurrent-stream cap. "
+                        "Backing off %ds before reconnect.",
+                        label,
+                        elapsed,
+                        _STREAM_CAP_SUSPECT_SECONDS,
+                        _STREAM_DEGRADED_UPSTREAM_BACKOFF_SECONDS,
+                    )
+                    time.sleep(_STREAM_DEGRADED_UPSTREAM_BACKOFF_SECONDS)
+                else:
+                    logger.warning(
+                        "%s ended after only %.1fs (under %ds) after %d "
+                        "quote payloads. Likely cause: TradeStation "
+                        "per-account concurrent-stream cap (~10) exhausted. "
+                        "Total streams in this process: 1 underlying + %d "
+                        "option chunks. With N ingestion processes the "
+                        "account total is N × (1 + chunks). Reduce chunk "
+                        "count by raising STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION.",
+                        label,
+                        elapsed,
+                        _STREAM_CAP_SUSPECT_SECONDS,
+                        payloads_received,
+                        len(self._chunks),
+                    )
 
     def _merge_single_quote(self, q: dict):
         """Merge one raw quote into accumulated state.
@@ -771,19 +812,41 @@ class UnderlyingBarAccumulator:
             # Only warn while we're still meant to be running: a quick exit
             # caused by stop() / shutdown is not cap exhaustion.
             if self._running and elapsed < _STREAM_CAP_SUSPECT_SECONDS:
-                logger.warning(
-                    "Underlying bar stream for %s ended after only %.1fs "
-                    "(under %ds). Likely cause: TradeStation per-account "
-                    "concurrent-stream cap (~10) exhausted by option "
-                    "chunks. The heatmap query is anchored on "
-                    "MAX(underlying_quotes.timestamp), so an evicted "
-                    "underlying feed freezes the chart even while options "
-                    "are still flowing. Reduce option chunk count by "
-                    "raising STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION.",
-                    self._symbol,
-                    elapsed,
-                    _STREAM_CAP_SUSPECT_SECONDS,
-                )
+                if _line_count == 0 and _heartbeat_count == 0:
+                    # See _read_stream's mirror branch: 200 OK with no
+                    # traffic (not even a heartbeat) is the upstream-
+                    # gateway-degraded fingerprint, not the per-account
+                    # cap. Back off so the reader loop doesn't spin.
+                    logger.warning(
+                        "Underlying bar stream for %s ended after %.1fs "
+                        "without yielding any traffic (under %ds). Likely "
+                        "cause: TradeStation upstream gateway degradation "
+                        "(accepted-then-closed with no data), NOT the "
+                        "per-account concurrent-stream cap. Backing off "
+                        "%ds before reconnect.",
+                        self._symbol,
+                        elapsed,
+                        _STREAM_CAP_SUSPECT_SECONDS,
+                        _STREAM_DEGRADED_UPSTREAM_BACKOFF_SECONDS,
+                    )
+                    time.sleep(_STREAM_DEGRADED_UPSTREAM_BACKOFF_SECONDS)
+                else:
+                    logger.warning(
+                        "Underlying bar stream for %s ended after only %.1fs "
+                        "(under %ds) after %d data lines and %d heartbeats. "
+                        "Likely cause: TradeStation per-account concurrent-"
+                        "stream cap (~10) exhausted by option chunks. The "
+                        "heatmap query is anchored on MAX(underlying_quotes."
+                        "timestamp), so an evicted underlying feed freezes "
+                        "the chart even while options are still flowing. "
+                        "Reduce option chunk count by raising "
+                        "STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION.",
+                        self._symbol,
+                        elapsed,
+                        _STREAM_CAP_SUSPECT_SECONDS,
+                        _line_count,
+                        _heartbeat_count,
+                    )
 
     def _merge_bar(self, bar: dict):
         """Merge one raw bar into accumulated state with carry-forward."""
