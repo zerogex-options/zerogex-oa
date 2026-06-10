@@ -562,18 +562,37 @@ TS_STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").
 #        cap-exhaustion WARNING in ``OptionStreamAccumulator._read_stream``
 #        and ``UnderlyingBarAccumulator._read_stream``.
 #
-# Worked examples at the 500-symbol default:
+# Worked examples at the 800-symbol default:
 #
 #     | symbols/underlying | chunks/process | 1 underlying | 3 underlyings |
 #     | ------------------ | -------------- | ------------ | ------------- |
-#     |              1,000 |              2 |   3 streams  |   9 streams   |
-#     |              2,000 |              4 |   5 streams  |  15 streams   |
-#     |              3,000 |              6 |   7 streams  |  21 streams   |
+#     |              1,200 |              2 |   3 streams  |   9 streams   |
+#     |              1,600 |              2 |   3 streams  |   9 streams   |
+#     |              2,000 |              3 |   4 streams  |  10 streams   |
+#     |              2,400 |              3 |   4 streams  |  10 streams   |
 #
-# A 3-underlying deployment with ≥ ~1500 symbols/underlying exceeds the
-# nominal cap; if the cap WARNING fires, drop ``INGEST_STRIKE_COUNT_MAX`` /
-# ``INGEST_EXPIRATIONS`` to shrink ``symbols_per_underlying``, or raise
-# this value (chunk_size ≤ 800 keeps URLs safely under 414).
+# Operational guidance when the cap-exhaustion WARN fires:
+#
+#   ``STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION`` is already at the URL
+#   ceiling — RAISING IT IS NOT THE FIX.  At ~25 bytes/symbol after URL-
+#   encoding, 800 symbols ≈ 20KB per URL, with the 414 cliff at ~25KB;
+#   going higher trades cap-exhaustion warnings for hard 414 errors.
+#
+#   The real lever is ``symbols_per_underlying``.  Trim, in order:
+#
+#     1. ``INGEST_EXPIRATIONS`` — least disruptive.  No downstream signal
+#        filters by the 8+ DTE bucket; ``_gamma_exposure_profile`` reads
+#        all contracts but the furthest-dated LEAPS carry full DTE-weight
+#        (1.0), so dropping them shifts the gamma flip output (worth
+#        measuring against a baseline session before going further).
+#     2. ``INGEST_STRIKE_COUNT_MAX`` — graceful degradation.  Only binds
+#        on dense-chain underlyings (typically SPX with $5 strikes);
+#        SPY/QQQ usually sit below the cap already.  Vol surface and GEX-
+#        gradient signals soft-clamp on lower density.
+#     3. ``INGEST_STRIKE_PCT_RANGE`` — DO NOT CUT BELOW 4.0.  The wing
+#        GEX signal (``src/signals/basic/gex_gradient.py`` ``_WING_WINDOW_PCT
+#        = 0.04``) hard-depends on streamed strikes reaching ±4%; below
+#        that the wing-fraction confidence collapses to zero.
 #
 # Historical context: ``bb4a78b`` introduced chunking with a 200-symbol
 # default sized for a single-underlying deployment (1100 symbols → 6

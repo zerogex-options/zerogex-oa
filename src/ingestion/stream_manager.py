@@ -498,7 +498,11 @@ class OptionStreamAccumulator:
                         "Total streams in this process: 1 underlying + %d "
                         "option chunks. With N ingestion processes the "
                         "account total is N × (1 + chunks). Reduce chunk "
-                        "count by raising STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION.",
+                        "count by shrinking the streamed symbol universe "
+                        "(INGEST_EXPIRATIONS first, then INGEST_STRIKE_"
+                        "COUNT_MAX); STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION "
+                        "is already at the 414 URL ceiling — see comment in "
+                        "src/config.py.",
                         label,
                         elapsed,
                         _STREAM_CAP_SUSPECT_SECONDS,
@@ -839,8 +843,11 @@ class UnderlyingBarAccumulator:
                         "heatmap query is anchored on MAX(underlying_quotes."
                         "timestamp), so an evicted underlying feed freezes "
                         "the chart even while options are still flowing. "
-                        "Reduce option chunk count by raising "
-                        "STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION.",
+                        "Reduce option chunk count by shrinking the streamed "
+                        "symbol universe (INGEST_EXPIRATIONS first, then "
+                        "INGEST_STRIKE_COUNT_MAX); "
+                        "STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION is already "
+                        "at the 414 URL ceiling — see comment in src/config.py.",
                         self._symbol,
                         elapsed,
                         _STREAM_CAP_SUSPECT_SECONDS,
