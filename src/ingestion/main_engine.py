@@ -210,7 +210,15 @@ class IngestionEngine:
             os.getenv("GREEKS_MAX_UNDERLYING_AGE_SECONDS_EXTENDED", "300")
         )
         # Counter so operators can see how often staleness rejects fire.
+        # ``_total`` advances on every reject (in- and out-of-session);
+        # ``_in_session`` advances only when the underlying feed is
+        # actually expected to be live. The WARN message reports both so
+        # SPX's overnight DEBUG-path noise (cash index doesn't print
+        # pre/after-hours, options do — millions of expected rejects
+        # accumulate by morning) doesn't make the in-session count look
+        # like a 100k+ data-quality incident at the open.
         self.greeks_stale_underlying_rejects = 0
+        self.greeks_stale_underlying_rejects_in_session = 0
         # Time-based throttle for the in-session staleness WARNING. A dense
         # option stream produces thousands of rejects/min against a single
         # stale underlying, so the previous per-100-reject gate collapsed to
@@ -577,6 +585,7 @@ class IngestionEngine:
                     # log at DEBUG and far less often so off-window runs
                     # don't flood the journal with a known-benign state.
                     if underlying_feed_expected(option_ts, SESSION_TEMPLATE, self.db_symbol):
+                        self.greeks_stale_underlying_rejects_in_session += 1
                         # Throttle by wall-clock, not reject count: under a
                         # dense option stream a per-100-reject gate fires
                         # many times per second. One warning per interval
@@ -590,9 +599,10 @@ class IngestionEngine:
                             logger.warning(
                                 "Refusing Greeks: underlying price is %.0fs stale "
                                 "(threshold %.0fs) while the feed should be live. "
-                                "Total rejects this run: %d",
+                                "Rejects this run: %d in-session / %d total.",
                                 age,
                                 max_age,
+                                self.greeks_stale_underlying_rejects_in_session,
                                 self.greeks_stale_underlying_rejects,
                             )
                         # Watchdog escalation: if the stream watchdog and
@@ -611,8 +621,9 @@ class IngestionEngine:
                                 "Underlying price stuck stale for %.0fs in-session — "
                                 "stream-watchdog recovery did not converge. "
                                 "Exiting nonzero so systemd recycles the process. "
-                                "Total rejects this run: %d",
+                                "Rejects this run: %d in-session / %d total.",
                                 stuck_seconds,
+                                self.greeks_stale_underlying_rejects_in_session,
                                 self.greeks_stale_underlying_rejects,
                             )
                             sys.exit(1)

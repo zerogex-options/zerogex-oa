@@ -77,6 +77,7 @@ def _stale_greeks_engine(fatal_seconds: float = 0.0):
     e.greeks_max_underlying_age_seconds = _BASE
     e.greeks_max_underlying_age_seconds_extended = _EXTENDED
     e.greeks_stale_underlying_rejects = 0
+    e.greeks_stale_underlying_rejects_in_session = 0
     e.greeks_stale_warn_interval_seconds = 60.0
     e._greeks_stale_last_warn_mono = 0.0
     e.greeks_stale_fatal_seconds = fatal_seconds
@@ -103,11 +104,37 @@ def test_greeks_stale_warning_throttled_by_time(monkeypatch):
         assert out["delta"] is None
     assert fake_logger.warning.call_count == 1
     assert e.greeks_stale_underlying_rejects == 200
+    # In-session counter advances in lockstep with total in this test
+    # because every option_ts is inside the SPX cash session.
+    assert e.greeks_stale_underlying_rejects_in_session == 200
 
     # Once the interval elapses, the next reject warns again.
     clock["t"] += 61.0
     e._enrich_with_greeks({"timestamp": option_ts, "option_symbol": "X"})
     assert fake_logger.warning.call_count == 2
+
+
+def test_out_of_session_rejects_dont_inflate_in_session_counter(monkeypatch):
+    """SPX options ticking pre-market (cash index doesn't print until
+    09:30 ET) increment the TOTAL counter via the DEBUG branch but must
+    not inflate the IN-SESSION counter — that distinction is what makes
+    the WARN message's two numbers meaningful at the open."""
+    e = _stale_greeks_engine()
+    # 08:00 ET on a weekday: SPX cash index is NOT yet expected to print
+    # (regular session begins 09:30); options trade pre-market.
+    option_ts = ET.localize(datetime(2026, 5, 15, 8, 0))
+    # Underlying stamp from yesterday's close: clearly stale.
+    e.latest_underlying_timestamp = ET.localize(datetime(2026, 5, 14, 16, 0))
+
+    clock = {"t": 10_000.0}
+    monkeypatch.setattr(me, "_time", types.SimpleNamespace(monotonic=lambda: clock["t"]))
+    monkeypatch.setattr(me, "logger", MagicMock())
+
+    for _ in range(50):
+        e._enrich_with_greeks({"timestamp": option_ts, "option_symbol": "X"})
+
+    assert e.greeks_stale_underlying_rejects == 50
+    assert e.greeks_stale_underlying_rejects_in_session == 0
 
 
 # ---------------------------------------------------------------------------
