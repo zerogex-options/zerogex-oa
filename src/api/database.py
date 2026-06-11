@@ -779,13 +779,33 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         except ValueError:
             canonical_backfill_minutes = 90
 
+        # Reprocess the last few closed minutes on each refresh.  option_chains.volume
+        # can grow after its first write within a bucket: late snapshots upsert via
+        # GREATEST on the monotonic counters, so the first delta we LAG-compute for a
+        # minute is sometimes a partial count.  The old `timestamp > last_fact_ts`
+        # floor froze that partial value forever; we now slide the floor back by
+        # FLOW_REPROCESS_MINUTES and let ON CONFLICT DO UPDATE replace stale rows.
+        # Default 5 minutes; bump if the vendor's late-arrival window is wider.
+        try:
+            reprocess_minutes = max(0, int(os.getenv("FLOW_REPROCESS_MINUTES", "5")))
+        except ValueError:
+            reprocess_minutes = 5
+
         backfill_start = (
             latest_ts - timedelta(minutes=canonical_backfill_minutes)
             if last_fact_ts is None
             else max(
-                last_fact_ts - timedelta(minutes=1),
+                last_fact_ts - timedelta(minutes=reprocess_minutes + 1),
                 latest_ts - timedelta(minutes=canonical_backfill_minutes),
             )
+        )
+        # Lower bound on the INSERT SELECT: rows at or before this timestamp are
+        # treated as final and skipped.  Sliding it back by reprocess_minutes is
+        # what lets stale partial rows get refreshed via ON CONFLICT DO UPDATE.
+        reprocess_floor = (
+            last_fact_ts - timedelta(minutes=reprocess_minutes)
+            if last_fact_ts is not None
+            else datetime(1970, 1, 1, tzinfo=timezone.utc)
         )
 
         # Canonical per-contract fact table used as the source of truth for flow APIs.
@@ -982,7 +1002,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             backfill_start,
             latest_ts,
             underlying_price,
-            last_fact_ts if last_fact_ts is not None else datetime(1970, 1, 1, tzinfo=timezone.utc),
+            reprocess_floor,
         )
 
     async def _refresh_max_pain_snapshot(
