@@ -107,7 +107,7 @@ still moving.
 
 | date | reviewer | stable-window result | decision (A / B / other) | applied? |
 |---|---|---|---|---|
-| | | | | no |
+| 2026-06-11 | zerogex-options | 60d window, stable_since=2026-05-18 ET (0 transitional rows — weekend); PRE n=8327, POST-stable n=10915; p50 \|fd\| 0.0041 → 0.0060 (×1.45, below ×2.0 material threshold); fallback-σ gate firing 75.5% → 61.7% (−13.8 pp); backtest (--days 25): gamma_flip_bounce n=12 / hit 10.0% / avg_mae 2× avg_mfe (net-negative); gamma_flip_break n=8 / hit 83.3% on n_resolved=6 (promising but thin). Patterns firing, not dormant; widening band would amplify the net-negative bounce. Revisit in ~6 weeks when gamma_flip_break has n_resolved ≥ 25-30. | A | no |
 
 ---
 *Generated as a review artifact for the `claude/fix-gex-calculation-KkUVW`
