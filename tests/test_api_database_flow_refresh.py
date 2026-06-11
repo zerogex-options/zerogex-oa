@@ -109,9 +109,7 @@ def test_refresh_flow_cache_overrides_both_server_and_client_timeouts():
     assert "180000" in timeout_calls[0]
 
     set_idx = next(
-        i
-        for i, (q, _a, _k) in enumerate(conn.execute_calls)
-        if "SET LOCAL statement_timeout" in q
+        i for i, (q, _a, _k) in enumerate(conn.execute_calls) if "SET LOCAL statement_timeout" in q
     )
     insert_idx = next(
         i
