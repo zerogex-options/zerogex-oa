@@ -80,6 +80,34 @@ def test_refresh_flow_cache_slides_floor_back_for_late_arrivals():
     assert canonical_args[4] == last_fact_ts - timedelta(minutes=5)
 
 
+def test_refresh_flow_cache_sets_local_statement_timeout_for_heavy_upsert():
+    # The default pool command_timeout (30s) silently kills the multi-hour
+    # cold-start backfill, leaving 09:30+ rows missing forever (the backfill
+    # rolls back but advances the throttle, so subsequent refreshes only
+    # tail-poll).  Refresh path must override statement_timeout for its own
+    # transaction so the upsert can finish.
+    db = DatabaseManager()
+    conn = _FakeFlowRefreshConn()
+    os.environ["FLOW_REFRESH_STATEMENT_TIMEOUT_MS"] = "180000"
+
+    asyncio.run(db._do_refresh_flow_cache(conn, "SPX"))
+
+    timeout_calls = [q for q, _ in conn.execute_calls if "SET LOCAL statement_timeout" in q]
+    assert timeout_calls, "refresh must SET LOCAL statement_timeout before heavy upsert"
+    assert "180000" in timeout_calls[0]
+
+    # Order matters: the SET LOCAL must precede the INSERT or the override is
+    # useless (statement_timeout only takes effect for statements that run after
+    # it inside the same transaction).
+    set_idx = next(
+        i for i, (q, _) in enumerate(conn.execute_calls) if "SET LOCAL statement_timeout" in q
+    )
+    insert_idx = next(
+        i for i, (q, _) in enumerate(conn.execute_calls) if "INSERT INTO flow_contract_facts" in q
+    )
+    assert set_idx < insert_idx
+
+
 def test_refresh_flow_cache_reprocess_minutes_zero_preserves_legacy_floor():
     # Operators who want the old append-only behaviour can opt out by setting
     # FLOW_REPROCESS_MINUTES=0; the floor then collapses back to last_fact_ts
