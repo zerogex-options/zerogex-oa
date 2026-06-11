@@ -392,11 +392,20 @@ class StrikeProfileBucket(BaseModel):
     bucket expression every historical endpoint uses).  ``open`` /
     ``high`` / ``low`` / ``close`` are the underlying OHLC for the
     bucket; ``close`` is the canonical "spot" used to compute the
-    per-strike dollar-gamma values below.  ``gamma_flip`` / ``call_wall``
-    / ``put_wall`` are the analytics-engine values from the bucket's
-    representative ``gex_summary`` row — aggregate-basis (all
-    expirations), matching the basis the live ``/api/gex/summary``
-    surfaces.  ``strikes`` is the per-strike payload; one row per strike
+    per-strike dollar-gamma values below.  ``gamma_flip`` is the
+    analytics-engine value from the bucket's representative
+    ``gex_summary`` row.  ``call_wall`` / ``put_wall`` are computed
+    live for the bucket from the same (expiration-filtered,
+    summed-by-strike) gamma rows the ``strikes`` payload renders, via
+    the canonical :func:`src.analytics.walls.compute_call_put_walls`
+    helper, evaluated against this bucket's ``close``.  Wall scope
+    therefore follows the request's ``expirations`` filter:
+    ``expirations=all`` yields the cross-expiration aggregate walls
+    (same basis as the live ``/api/gex/summary``);
+    ``expirations=<YYYY-MM-DD>`` yields walls scoped to that
+    expiration's gamma alone.  ``call_wall`` / ``put_wall`` are
+    ``None`` when the bucket has no strikes or no underlying close.
+    ``strikes`` is the per-strike payload; one row per strike
     available in this bucket's snapshot universe (after the optional
     expiration filter).
     """
