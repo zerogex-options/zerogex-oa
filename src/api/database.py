@@ -809,12 +809,20 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         # The cold-start backfill is a multi-CTE upsert over potentially hours of
         # option_chains rows × hundreds of active contracts -- it routinely
-        # exceeds the pool's default 30s command_timeout (DB_STATEMENT_TIMEOUT_MS).
-        # When it does, the transaction rolls back and 09:30+ data silently never
-        # lands.  The analytics engine's own cold-start path uses 180s for the
-        # same reason (see docs/architecture/analytics_engine_diagram.md:227).
-        # SET LOCAL only affects this transaction so other paths keep the tight
-        # 30s default; tuneable via env for operators with larger chains.
+        # exceeds the pool's default 30s timeouts.  When it does, the transaction
+        # rolls back and 09:30+ data silently never lands.  The analytics engine's
+        # own cold-start path uses 180s for the same reason
+        # (see docs/architecture/analytics_engine_diagram.md:227).
+        #
+        # We need to lift BOTH halves of the ceiling for the heavy upsert below:
+        #
+        # * Server-side: SET LOCAL statement_timeout = N.  Affects only this
+        #   transaction so other paths keep the tight DB_STATEMENT_TIMEOUT_MS
+        #   default.
+        # * Client-side: pass timeout=N/1000 to conn.execute below.  The pool
+        #   is built with command_timeout=30 (hardcoded in _create_pool), and
+        #   asyncpg will cancel the call client-side at 30s regardless of the
+        #   server-side limit -- so SET LOCAL alone is not enough.
         try:
             refresh_statement_timeout_ms = max(
                 1000,
@@ -822,6 +830,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             )
         except ValueError:
             refresh_statement_timeout_ms = 180000
+        refresh_timeout_seconds = refresh_statement_timeout_ms / 1000.0
         await conn.execute(f"SET LOCAL statement_timeout = {refresh_statement_timeout_ms}")
 
         # Canonical per-contract fact table used as the source of truth for flow APIs.
@@ -1019,6 +1028,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             latest_ts,
             underlying_price,
             reprocess_floor,
+            timeout=refresh_timeout_seconds,
         )
 
     async def _refresh_max_pain_snapshot(
