@@ -808,6 +808,23 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             else datetime(1970, 1, 1, tzinfo=timezone.utc)
         )
 
+        # The cold-start backfill is a multi-CTE upsert over potentially hours of
+        # option_chains rows × hundreds of active contracts -- it routinely
+        # exceeds the pool's default 30s command_timeout (DB_STATEMENT_TIMEOUT_MS).
+        # When it does, the transaction rolls back and 09:30+ data silently never
+        # lands.  The analytics engine's own cold-start path uses 180s for the
+        # same reason (see docs/architecture/analytics_engine_diagram.md:227).
+        # SET LOCAL only affects this transaction so other paths keep the tight
+        # 30s default; tuneable via env for operators with larger chains.
+        try:
+            refresh_statement_timeout_ms = max(
+                1000,
+                int(os.getenv("FLOW_REFRESH_STATEMENT_TIMEOUT_MS", "180000")),
+            )
+        except ValueError:
+            refresh_statement_timeout_ms = 180000
+        await conn.execute(f"SET LOCAL statement_timeout = {refresh_statement_timeout_ms}")
+
         # Canonical per-contract fact table used as the source of truth for flow APIs.
         # Uses LAG() window function instead of LATERAL join for O(n) vs O(n²) perf.
         #
