@@ -19,8 +19,8 @@ class _FakeFlowRefreshConn:
             return self._last_fact_ts
         return None
 
-    async def execute(self, query, *_args):
-        self.execute_calls.append((query, _args))
+    async def execute(self, query, *args, **kwargs):
+        self.execute_calls.append((query, args, kwargs))
         return "INSERT 0 1"
 
 
@@ -34,10 +34,14 @@ def test_refresh_flow_cache_seeds_prior_rows_for_lag():
 
     assert conn.execute_calls
     canonical_call = next(
-        ((q, args) for (q, args) in conn.execute_calls if "INSERT INTO flow_contract_facts" in q),
-        ("", ()),
+        (
+            (q, args, kwargs)
+            for (q, args, kwargs) in conn.execute_calls
+            if "INSERT INTO flow_contract_facts" in q
+        ),
+        ("", (), {}),
     )
-    canonical_query, canonical_args = canonical_call
+    canonical_query, canonical_args, _ = canonical_call
     assert canonical_query
     assert "WITH window_rows AS (" in canonical_query
     assert "seed_rows AS (" in canonical_query
@@ -65,10 +69,14 @@ def test_refresh_flow_cache_slides_floor_back_for_late_arrivals():
     asyncio.run(db._do_refresh_flow_cache(conn, "SPX"))
 
     canonical_call = next(
-        ((q, args) for (q, args) in conn.execute_calls if "INSERT INTO flow_contract_facts" in q),
-        ("", ()),
+        (
+            (q, args, kwargs)
+            for (q, args, kwargs) in conn.execute_calls
+            if "INSERT INTO flow_contract_facts" in q
+        ),
+        ("", (), {}),
     )
-    canonical_query, canonical_args = canonical_call
+    canonical_query, canonical_args, _ = canonical_call
     assert canonical_query
 
     # $2 (backfill_start) reaches reprocess_minutes + 1 minutes before
@@ -80,32 +88,42 @@ def test_refresh_flow_cache_slides_floor_back_for_late_arrivals():
     assert canonical_args[4] == last_fact_ts - timedelta(minutes=5)
 
 
-def test_refresh_flow_cache_sets_local_statement_timeout_for_heavy_upsert():
-    # The default pool command_timeout (30s) silently kills the multi-hour
-    # cold-start backfill, leaving 09:30+ rows missing forever (the backfill
-    # rolls back but advances the throttle, so subsequent refreshes only
-    # tail-poll).  Refresh path must override statement_timeout for its own
-    # transaction so the upsert can finish.
+def test_refresh_flow_cache_overrides_both_server_and_client_timeouts():
+    # The default pool command_timeout (30s, hardcoded) silently kills the
+    # multi-hour cold-start backfill, leaving 09:30+ rows missing forever (the
+    # backfill rolls back but advances the throttle, so subsequent refreshes
+    # only tail-poll).  Refresh must lift BOTH ceilings:
+    #   - server-side: SET LOCAL statement_timeout (per-transaction)
+    #   - client-side: pass timeout= to conn.execute (per-call override)
+    # SET LOCAL alone is insufficient -- asyncpg cancels the call client-side
+    # at command_timeout regardless of the server-side limit.
     db = DatabaseManager()
     conn = _FakeFlowRefreshConn()
     os.environ["FLOW_REFRESH_STATEMENT_TIMEOUT_MS"] = "180000"
 
     asyncio.run(db._do_refresh_flow_cache(conn, "SPX"))
 
-    timeout_calls = [q for q, _ in conn.execute_calls if "SET LOCAL statement_timeout" in q]
+    # Server-side: SET LOCAL statement_timeout fires before the INSERT.
+    timeout_calls = [q for q, _a, _k in conn.execute_calls if "SET LOCAL statement_timeout" in q]
     assert timeout_calls, "refresh must SET LOCAL statement_timeout before heavy upsert"
     assert "180000" in timeout_calls[0]
 
-    # Order matters: the SET LOCAL must precede the INSERT or the override is
-    # useless (statement_timeout only takes effect for statements that run after
-    # it inside the same transaction).
     set_idx = next(
-        i for i, (q, _) in enumerate(conn.execute_calls) if "SET LOCAL statement_timeout" in q
+        i
+        for i, (q, _a, _k) in enumerate(conn.execute_calls)
+        if "SET LOCAL statement_timeout" in q
     )
     insert_idx = next(
-        i for i, (q, _) in enumerate(conn.execute_calls) if "INSERT INTO flow_contract_facts" in q
+        i
+        for i, (q, _a, _k) in enumerate(conn.execute_calls)
+        if "INSERT INTO flow_contract_facts" in q
     )
     assert set_idx < insert_idx
+
+    # Client-side: the heavy INSERT call passes timeout= matching the env var.
+    insert_call = conn.execute_calls[insert_idx]
+    _q, _args, kwargs = insert_call
+    assert kwargs.get("timeout") == 180.0
 
 
 def test_refresh_flow_cache_reprocess_minutes_zero_preserves_legacy_floor():
@@ -121,9 +139,13 @@ def test_refresh_flow_cache_reprocess_minutes_zero_preserves_legacy_floor():
     asyncio.run(db._do_refresh_flow_cache(conn, "SPX"))
 
     canonical_call = next(
-        ((q, args) for (q, args) in conn.execute_calls if "INSERT INTO flow_contract_facts" in q),
-        ("", ()),
+        (
+            (q, args, kwargs)
+            for (q, args, kwargs) in conn.execute_calls
+            if "INSERT INTO flow_contract_facts" in q
+        ),
+        ("", (), {}),
     )
-    _, canonical_args = canonical_call
+    _, canonical_args, _ = canonical_call
     assert canonical_args[1] == last_fact_ts - timedelta(minutes=1)
     assert canonical_args[4] == last_fact_ts
