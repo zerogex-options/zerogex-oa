@@ -1805,8 +1805,6 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     gs.flip_distance,
                     gs.local_gex,
                     gs.convexity_risk,
-                    gs.call_wall AS stored_call_wall,
-                    gs.put_wall  AS stored_put_wall,
                     {bucket} as bucket_ts,
                     ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY gs.timestamp DESC) as rn
                 FROM gex_summary gs
@@ -1817,6 +1815,32 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 SELECT *
                 FROM bucketed
                 WHERE rn = 1
+            ),
+            -- Per-bucket close from underlying_quotes — used as the spot
+            -- reference for the wall computation so each bucket's walls
+            -- reflect the underlying price at that bucket's time (not
+            -- today's spot, which would mis-bucket above-/below-spot for
+            -- historical buckets).  Matches the bucket-close definition
+            -- in get_strike_profile_timeseries (last close in the
+            -- bucket window via rn_close=1), so /api/gex/historical and
+            -- /api/gex/strike-profile-timeseries with expirations=all
+            -- compute walls against the same per-bucket spot and agree
+            -- byte-for-byte.
+            bucket_closes AS (
+                SELECT
+                    bucket_ts,
+                    MAX(close) FILTER (WHERE rn_close = 1)::numeric AS bucket_close
+                FROM (
+                    SELECT
+                        {bucket} AS bucket_ts,
+                        close,
+                        ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) AS rn_close
+                    FROM underlying_quotes
+                    WHERE symbol = $1
+                        AND timestamp BETWEEN (SELECT start_ts FROM bounds)
+                                          AND (SELECT end_ts FROM bounds)
+                ) q
+                GROUP BY bucket_ts
             ),
             strike_agg AS (
                 SELECT
@@ -1830,54 +1854,55 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                   AND gbs.timestamp IN (SELECT timestamp FROM base)
                 GROUP BY gbs.timestamp
             ),
-            -- Canonical Call/Put Wall fallback (matches src/analytics/walls.py):
-            -- Call Wall = strike >= spot with max SUM(call_gamma) across
-            -- expirations, ties → lowest strike.
-            -- Put  Wall = strike <= spot with max SUM(put_gamma)  across
-            -- expirations, ties → highest strike.
-            -- Only used for buckets where ``gex_summary.call_wall`` /
-            -- ``put_wall`` is NULL (i.e., rows persisted before the column
-            -- backfill).  All new analytics runs write the canonical value
-            -- straight into ``gex_summary``.  gex_by_strike is keyed
-            -- (strike, expiration); aggregating per-strike is what makes
-            -- the wall agree with the cross-expiration view consumers see.
+            -- Canonical Call/Put Wall computation (matches src/analytics/walls.py
+            -- and /api/gex/strike-profile-timeseries with expirations=all):
+            -- Call Wall = strike >= bucket_close with max SUM(call_gamma)
+            -- across expirations, ties → lowest strike.
+            -- Put  Wall = strike <= bucket_close with max SUM(put_gamma)
+            -- across expirations, ties → highest strike.
+            -- Walls are computed live (not read from gex_summary.call_wall)
+            -- so every bucket's wall reflects the underlying price at its
+            -- own time and uses the same single source of record as every
+            -- other consumer.  gex_by_strike is keyed (strike, expiration);
+            -- aggregating per-strike is what makes the wall agree with
+            -- the cross-expiration view consumers see.
             call_walls AS (
-                SELECT DISTINCT ON (timestamp)
-                    timestamp,
+                SELECT DISTINCT ON (bucket_ts)
+                    bucket_ts,
                     strike::numeric AS call_wall
                 FROM (
                     SELECT
-                        gbs.timestamp,
+                        b.bucket_ts,
                         gbs.strike,
                         SUM(COALESCE(gbs.call_gamma, 0)) AS call_gamma
                     FROM gex_by_strike gbs
-                    CROSS JOIN spot s
+                    JOIN base b ON b.timestamp = gbs.timestamp
+                    JOIN bucket_closes bc ON bc.bucket_ts = b.bucket_ts
                     WHERE gbs.underlying = $1
-                      AND gbs.timestamp IN (SELECT timestamp FROM base)
-                      AND gbs.strike >= s.spot_price
-                    GROUP BY gbs.timestamp, gbs.strike
+                      AND gbs.strike >= bc.bucket_close
+                    GROUP BY b.bucket_ts, gbs.strike
                 ) per_strike
                 WHERE call_gamma > 0
-                ORDER BY timestamp, call_gamma DESC, strike ASC
+                ORDER BY bucket_ts, call_gamma DESC, strike ASC
             ),
             put_walls AS (
-                SELECT DISTINCT ON (timestamp)
-                    timestamp,
+                SELECT DISTINCT ON (bucket_ts)
+                    bucket_ts,
                     strike::numeric AS put_wall
                 FROM (
                     SELECT
-                        gbs.timestamp,
+                        b.bucket_ts,
                         gbs.strike,
                         SUM(COALESCE(gbs.put_gamma, 0)) AS put_gamma
                     FROM gex_by_strike gbs
-                    CROSS JOIN spot s
+                    JOIN base b ON b.timestamp = gbs.timestamp
+                    JOIN bucket_closes bc ON bc.bucket_ts = b.bucket_ts
                     WHERE gbs.underlying = $1
-                      AND gbs.timestamp IN (SELECT timestamp FROM base)
-                      AND gbs.strike <= s.spot_price
-                    GROUP BY gbs.timestamp, gbs.strike
+                      AND gbs.strike <= bc.bucket_close
+                    GROUP BY b.bucket_ts, gbs.strike
                 ) per_strike
                 WHERE put_gamma > 0
-                ORDER BY timestamp, put_gamma DESC, strike DESC
+                ORDER BY bucket_ts, put_gamma DESC, strike DESC
             )
             SELECT
                 b.bucket_ts as timestamp,
@@ -1893,8 +1918,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 b.gamma_flip,
                 b.gamma_flip_span_used,
                 b.max_pain,
-                COALESCE(b.stored_call_wall, cw.call_wall) AS call_wall,
-                COALESCE(b.stored_put_wall,  pw.put_wall)  AS put_wall,
+                cw.call_wall,
+                pw.put_wall,
                 b.total_call_oi,
                 b.total_put_oi,
                 b.put_call_ratio,
@@ -1905,8 +1930,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             FROM base b
             CROSS JOIN spot s
             LEFT JOIN strike_agg sa ON sa.timestamp = b.timestamp
-            LEFT JOIN call_walls cw ON cw.timestamp = b.timestamp
-            LEFT JOIN put_walls  pw ON pw.timestamp = b.timestamp
+            LEFT JOIN call_walls cw ON cw.bucket_ts = b.bucket_ts
+            LEFT JOIN put_walls  pw ON pw.bucket_ts = b.bucket_ts
             ORDER BY timestamp DESC
             LIMIT $4
         """

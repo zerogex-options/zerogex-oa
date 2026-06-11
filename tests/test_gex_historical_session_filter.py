@@ -59,6 +59,55 @@ def _run_historical(symbol, timeframe="5min", window_units=60):
     return {"query": conn.queries[0], "args": conn.args[0]}
 
 
+def test_historical_walls_computed_live_against_per_bucket_close():
+    """Walls in /api/gex/historical are computed live from gex_by_strike
+    (the same canonical helper every other consumer uses), using each
+    bucket's own ``underlying_quotes`` close as the above-/below-spot
+    reference.  The persisted ``gex_summary.call_wall`` / ``put_wall``
+    columns are NOT read — that keeps /api/gex/historical
+    byte-for-byte agreement with /api/gex/strike-profile-timeseries
+    when its ``expirations=all``.
+
+    Pinning the SQL shape so future refactors don't silently revert to
+    the persisted-column read (which used the cycle's live spot, not
+    the bucket's close, and could disagree on the boundary).
+    """
+    captured = _run_historical("SPY")
+    sql = captured["query"]
+
+    # Per-bucket close CTE exists and feeds the wall computation.
+    assert "bucket_closes AS" in sql
+    assert "rn_close" in sql
+
+    # Walls compare against the per-bucket close, NOT a constant
+    # ``s.spot_price``.  The previous shape used ``WHERE gbs.strike >=
+    # s.spot_price`` for the wall split; the new shape uses
+    # ``bc.bucket_close``.
+    bucket_closes_idx = sql.index("bucket_closes AS")
+    call_walls_idx = sql.index("call_walls AS")
+    put_walls_idx = sql.index("put_walls AS")
+    # bucket_closes must be defined before the wall CTEs reference it.
+    assert bucket_closes_idx < call_walls_idx
+    assert bucket_closes_idx < put_walls_idx
+
+    walls_block = sql[call_walls_idx:]
+    assert "bc.bucket_close" in walls_block
+    assert "JOIN bucket_closes bc" in walls_block
+    # The wall CTEs must aggregate by strike before ranking — the
+    # cross-expiration aggregation that is the whole point of routing
+    # through the canonical helper.
+    assert walls_block.count("GROUP BY b.bucket_ts, gbs.strike") == 2
+
+    # The bucketed CTE must NOT read stored_call_wall / stored_put_wall;
+    # they were a basis-disagreement footgun (analytics-cycle spot vs.
+    # bucket close).  Walls now come from cw.call_wall / pw.put_wall
+    # exclusively.
+    assert "stored_call_wall" not in sql
+    assert "stored_put_wall" not in sql
+    assert "COALESCE(b.stored_call_wall" not in sql
+    assert "COALESCE(b.stored_put_wall" not in sql
+
+
 def test_historical_etf_has_no_session_filter():
     """ETFs / equities (SPY, QQQ, AAPL) trade extended hours legitimately,
     so the query and its bound params stay exactly as before — no session
