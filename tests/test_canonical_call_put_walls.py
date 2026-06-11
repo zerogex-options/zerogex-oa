@@ -171,6 +171,77 @@ def test_pre_sorted_input_does_not_change_result():
     assert compute_call_put_walls(rows_a, spot) == compute_call_put_walls(rows_b, spot)
 
 
+def test_aggregates_per_strike_across_expirations():
+    """When ``gex_by_strike`` rows arrive per-(strike, expiration), the
+    helper must sum ``call_gamma`` / ``put_gamma`` by strike before
+    ranking.  This is the basis the strike-profile chart, ``/api/gex/by-strike``
+    aggregate view, and ``max_gamma_strike`` already use; ranking
+    per-row picks a single-expiration outlier and disagrees with what
+    dealers actually hedge.
+    """
+    spot = 100.0
+    # Strike 105 has three expirations summing to 90 of call gamma.
+    # Strike 110 has one expiration carrying 80 — bigger than any single
+    # 105 row but smaller than the 105 aggregate.  Walls must pick 105.
+    rows = [
+        _row(105.0, call_gamma=30.0),  # exp A
+        _row(105.0, call_gamma=30.0),  # exp B
+        _row(105.0, call_gamma=30.0),  # exp C
+        _row(110.0, call_gamma=80.0),  # single-expiration outlier
+        # Symmetric setup on the put side.
+        _row(95.0, put_gamma=30.0),
+        _row(95.0, put_gamma=30.0),
+        _row(95.0, put_gamma=30.0),
+        _row(90.0, put_gamma=80.0),
+    ]
+    call_wall, put_wall = compute_call_put_walls(rows, spot)
+    assert call_wall == 105.0
+    assert put_wall == 95.0
+
+
+def test_aggregation_tiebreaker_uses_summed_basis():
+    """The nearest-to-spot tiebreaker applies to the post-aggregation
+    totals, not the per-row values.  Two strikes whose summed gamma
+    matches should resolve to the strike nearest spot regardless of
+    how many expirations contributed.
+    """
+    spot = 100.0
+    rows = [
+        # Strike 105 aggregates to 50 across two expirations.
+        _row(105.0, call_gamma=20.0),
+        _row(105.0, call_gamma=30.0),
+        # Strike 110 aggregates to 50 in a single expiration.
+        _row(110.0, call_gamma=50.0),
+        # Strike 95 aggregates to 50 across two expirations.
+        _row(95.0, put_gamma=25.0),
+        _row(95.0, put_gamma=25.0),
+        # Strike 90 aggregates to 50 in a single expiration.
+        _row(90.0, put_gamma=50.0),
+    ]
+    call_wall, put_wall = compute_call_put_walls(rows, spot)
+    assert call_wall == 105.0  # nearest above spot wins the tie
+    assert put_wall == 95.0  # nearest below spot wins the tie
+
+
+def test_aggregation_handles_split_call_and_put_at_same_strike():
+    """A row stream can carry mixed-side gamma at the same strike across
+    expirations (calls from one, puts from another).  Aggregation must
+    keep the call and put accumulators independent.
+    """
+    spot = 100.0
+    rows = [
+        # Strike 105: 40 call gamma in one expiration, 0 in another.
+        _row(105.0, call_gamma=40.0, put_gamma=0.0),
+        _row(105.0, call_gamma=0.0, put_gamma=0.0),
+        # Strike 95: 0 then 60 of put gamma across two expirations.
+        _row(95.0, call_gamma=0.0, put_gamma=0.0),
+        _row(95.0, call_gamma=0.0, put_gamma=60.0),
+    ]
+    call_wall, put_wall = compute_call_put_walls(rows, spot)
+    assert call_wall == 105.0
+    assert put_wall == 95.0
+
+
 def test_main_engine_summary_includes_call_put_walls():
     """The Analytics Engine ``_calculate_gex_summary`` must surface canonical
     walls in the summary dict so ``_store_gex_summary`` can persist them.

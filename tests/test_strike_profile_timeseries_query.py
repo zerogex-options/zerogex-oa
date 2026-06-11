@@ -225,9 +225,9 @@ def test_response_groups_flat_rows_into_per_bucket_dicts():
             "low": 511.85,
             "close": 512.80,
             "gamma_flip": 510.0,
-            "call_wall": 515.0,
-            "put_wall": 505.0,
             "strike": 505.0,
+            "call_gamma_raw": 0.0,
+            "put_gamma_raw": 80.0,
             "call_gex": 1234.5,
             "put_gex": -2345.6,
             "net_gex": -1111.1,
@@ -241,9 +241,9 @@ def test_response_groups_flat_rows_into_per_bucket_dicts():
             "low": 511.85,
             "close": 512.80,
             "gamma_flip": 510.0,
-            "call_wall": 515.0,
-            "put_wall": 505.0,
-            "strike": 510.0,
+            "strike": 515.0,
+            "call_gamma_raw": 50.0,
+            "put_gamma_raw": 0.0,
             "call_gex": 5555.5,
             "put_gex": -1111.1,
             "net_gex": 4444.4,
@@ -261,6 +261,10 @@ def test_response_groups_flat_rows_into_per_bucket_dicts():
     assert bucket["open"] == 512.30
     assert bucket["close"] == 512.80
     assert bucket["gamma_flip"] == 510.0
+    # Walls are computed from the bucket's own (filtered, summed) gamma
+    # rows against the bucket's close (512.80) — the only call_gamma_raw
+    # above spot sits at 515; the only put_gamma_raw below spot sits at
+    # 505.
     assert bucket["call_wall"] == 515.0
     assert bucket["put_wall"] == 505.0
     assert len(bucket["strikes"]) == 2
@@ -270,7 +274,11 @@ def test_response_groups_flat_rows_into_per_bucket_dicts():
     assert bucket["strikes"][0]["put_gamma"] == -2345.6
     assert bucket["strikes"][0]["net_gamma"] == -1111.1
     assert bucket["strikes"][0]["call_oi"] == 8200
-    assert bucket["strikes"][1]["strike"] == 510.0
+    assert bucket["strikes"][1]["strike"] == 515.0
+    # Raw-gamma fields are wall-computation inputs only; they must not
+    # leak into the response payload.
+    assert "call_gamma_raw" not in bucket["strikes"][0]
+    assert "put_gamma_raw" not in bucket["strikes"][0]
 
 
 def test_response_omits_strikes_with_zero_values_only():
@@ -285,9 +293,9 @@ def test_response_omits_strikes_with_zero_values_only():
             "low": 1.0,
             "close": 1.0,
             "gamma_flip": None,
-            "call_wall": None,
-            "put_wall": None,
             "strike": 500.0,
+            "call_gamma_raw": 0.0,
+            "put_gamma_raw": 0.0,
             "call_gex": 0,
             "put_gex": 0,
             "net_gex": 0,
@@ -301,9 +309,9 @@ def test_response_omits_strikes_with_zero_values_only():
             "low": 1.0,
             "close": 1.0,
             "gamma_flip": None,
-            "call_wall": None,
-            "put_wall": None,
             "strike": 510.0,
+            "call_gamma_raw": 1.0,
+            "put_gamma_raw": 0.0,
             "call_gex": 100,
             "put_gex": 0,
             "net_gex": 100,
@@ -322,10 +330,14 @@ def test_response_omits_strikes_with_zero_values_only():
 def test_response_keeps_buckets_with_no_strikes():
     """A bucket whose representative gex_summary timestamp had no
     gex_by_strike rows (rare — typically when ingestion lagged on that
-    cycle) still appears, carrying OHLC + walls and an empty strikes
+    cycle) still appears, carrying OHLC + flip and an empty strikes
     array.  The chart renders the candle and flip line without the
     per-strike surface for that bucket rather than dropping the bucket
-    entirely (which would misalign the rewindIndex grid)."""
+    entirely (which would misalign the rewindIndex grid).  Walls are
+    NULL because there are no strikes to compute them from — the
+    persisted ``gex_summary.call_wall`` is no longer carried through;
+    /api/gex/summary remains the source for the aggregate-basis walls
+    when callers want them independent of the chart's filter."""
     rows = [
         {
             "timestamp": "2026-06-08T14:30:00+00:00",
@@ -334,9 +346,9 @@ def test_response_keeps_buckets_with_no_strikes():
             "low": 99.0,
             "close": 100.5,
             "gamma_flip": 100.0,
-            "call_wall": 102.0,
-            "put_wall": 98.0,
             "strike": None,
+            "call_gamma_raw": None,
+            "put_gamma_raw": None,
             "call_gex": None,
             "put_gex": None,
             "net_gex": None,
@@ -351,6 +363,145 @@ def test_response_keeps_buckets_with_no_strikes():
     assert result[0]["close"] == 100.5
     assert result[0]["gamma_flip"] == 100.0
     assert result[0]["strikes"] == []
+    assert result[0]["call_wall"] is None
+    assert result[0]["put_wall"] is None
+
+
+def test_walls_per_bucket_follow_the_summed_gamma_basis():
+    """Walls must agree with the bars in the same bucket.  When the
+    request filter aggregates expirations (``expirations=all``), the
+    summed-by-strike gamma is what the chart renders; the wall must
+    point at the strike with the largest summed gamma, not a
+    single-expiration outlier.  This is the user-visible bug the
+    helper fix targets.
+    """
+    # Spot 100, three strikes above spot.  Per-strike summed call gamma:
+    #   105 -> 90 (two expirations, 45 + 45 not modeled here — SQL has
+    #              already SUMmed by strike before returning)
+    #   110 -> 70
+    #   115 -> 80
+    # Below spot, the put side has 95 -> 90, 90 -> 60, 85 -> 70.
+    # Walls must be 105 / 95 — the strikes with the largest aggregated
+    # gamma on each side of spot.
+    base = {
+        "timestamp": "2026-06-08T14:30:00+00:00",
+        "open": 100.0,
+        "high": 100.0,
+        "low": 100.0,
+        "close": 100.0,
+        "gamma_flip": None,
+        "call_oi": 0,
+        "put_oi": 0,
+    }
+    rows = []
+    for strike, cg, pg in (
+        (105.0, 90.0, 0.0),
+        (110.0, 70.0, 0.0),
+        (115.0, 80.0, 0.0),
+        (95.0, 0.0, 90.0),
+        (90.0, 0.0, 60.0),
+        (85.0, 0.0, 70.0),
+    ):
+        rows.append(
+            {
+                **base,
+                "strike": strike,
+                "call_gamma_raw": cg,
+                "put_gamma_raw": pg,
+                # Dollar GEX values just need to be non-zero so the
+                # row isn't dropped as noise; the wall computation
+                # only reads call_gamma_raw / put_gamma_raw.
+                "call_gex": max(cg, 1.0),
+                "put_gex": -max(pg, 1.0),
+                "net_gex": cg - pg,
+            }
+        )
+    captured = _run("SPY", rows=rows)
+    bucket = captured["result"][0]
+    assert bucket["call_wall"] == 105.0
+    assert bucket["put_wall"] == 95.0
+
+
+def test_walls_use_bucket_close_as_spot():
+    """The spot used to split strikes into call/put regions is the
+    bucket's own close — same convention the dollar-GEX scaling already
+    uses.  This keeps the wall basis consistent with the candle shown
+    in the bucket, even on historical buckets whose close diverges from
+    the trailing live spot.
+    """
+    rows = [
+        # Close = 100; 99 should be eligible only as a put wall, 101
+        # only as a call wall.
+        {
+            "timestamp": "2026-06-08T14:30:00+00:00",
+            "open": 100.0,
+            "high": 100.0,
+            "low": 100.0,
+            "close": 100.0,
+            "gamma_flip": None,
+            "strike": 99.0,
+            "call_gamma_raw": 50.0,
+            "put_gamma_raw": 40.0,
+            "call_gex": 50.0,
+            "put_gex": -40.0,
+            "net_gex": 10.0,
+            "call_oi": 0,
+            "put_oi": 0,
+        },
+        {
+            "timestamp": "2026-06-08T14:30:00+00:00",
+            "open": 100.0,
+            "high": 100.0,
+            "low": 100.0,
+            "close": 100.0,
+            "gamma_flip": None,
+            "strike": 101.0,
+            "call_gamma_raw": 30.0,
+            "put_gamma_raw": 70.0,
+            "call_gex": 30.0,
+            "put_gex": -70.0,
+            "net_gex": -40.0,
+            "call_oi": 0,
+            "put_oi": 0,
+        },
+    ]
+    captured = _run("SPY", rows=rows)
+    bucket = captured["result"][0]
+    # 101 is the only above-spot strike; 99 the only below-spot strike.
+    # The spot filter dominates the gamma ranking.
+    assert bucket["call_wall"] == 101.0
+    assert bucket["put_wall"] == 99.0
+
+
+def test_walls_null_when_close_is_missing():
+    """A bucket whose underlying tape was missing has a NULL close.
+    Without a spot reference the above/below-spot split is undefined,
+    so walls must be NULL too — the chart already treats NULL walls as
+    "no level drawn".  Failing closed here is cheaper than fabricating a
+    wall from the wrong spot.
+    """
+    rows = [
+        {
+            "timestamp": "2026-06-08T14:30:00+00:00",
+            "open": None,
+            "high": None,
+            "low": None,
+            "close": None,
+            "gamma_flip": None,
+            "strike": 100.0,
+            "call_gamma_raw": 50.0,
+            "put_gamma_raw": 50.0,
+            "call_gex": 0.0,
+            "put_gex": 0.0,
+            "net_gex": 0.0,
+            "call_oi": 10,
+            "put_oi": 10,
+        },
+    ]
+    captured = _run("SPY", rows=rows)
+    bucket = captured["result"][0]
+    assert bucket["call_wall"] is None
+    assert bucket["put_wall"] is None
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 import logging
 import json
 
+from src.analytics.walls import compute_call_put_walls
 from src.api.queries.signals import SignalsQueriesMixin
 from src.database.password_providers import resolve_db_credentials
 from src.api.queries.technicals import TechnicalsQueriesMixin
@@ -1378,31 +1379,45 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ),
             -- Canonical Call Wall fallback: max call-gamma strike at-or-above
             -- spot, tiebreaker nearest-to-spot (lowest strike above spot).
-            -- Only used when gex_summary.call_wall is NULL.
+            -- Only used when gex_summary.call_wall is NULL.  Aggregates
+            -- ``call_gamma`` across expirations per strike — gex_by_strike
+            -- is keyed (strike, expiration), and ranking per-row picks the
+            -- single largest-expiration outlier, disagreeing with the
+            -- cross-expiration view consumers see.  Matches
+            -- ``compute_call_put_walls`` in src/analytics/walls.py.
             fallback_call_wall AS (
-                SELECT gbs.strike::numeric AS call_wall
-                FROM gex_by_strike gbs
-                JOIN latest_summary ls
-                  ON gbs.underlying = ls.underlying
-                 AND gbs.timestamp = ls.timestamp
-                JOIN latest_quote lq ON TRUE
-                WHERE gbs.strike >= lq.spot_price
-                  AND COALESCE(gbs.call_gamma, 0) > 0
-                ORDER BY gbs.call_gamma DESC, gbs.strike ASC
+                SELECT strike::numeric AS call_wall
+                FROM (
+                    SELECT gbs.strike, SUM(COALESCE(gbs.call_gamma, 0)) AS call_gamma
+                    FROM gex_by_strike gbs
+                    JOIN latest_summary ls
+                      ON gbs.underlying = ls.underlying
+                     AND gbs.timestamp = ls.timestamp
+                    JOIN latest_quote lq ON TRUE
+                    WHERE gbs.strike >= lq.spot_price
+                    GROUP BY gbs.strike
+                ) per_strike
+                WHERE call_gamma > 0
+                ORDER BY call_gamma DESC, strike ASC
                 LIMIT 1
             ),
             -- Canonical Put Wall fallback: max put-gamma strike at-or-below
             -- spot, tiebreaker nearest-to-spot (highest strike below spot).
+            -- Cross-expiration aggregation (see fallback_call_wall above).
             fallback_put_wall AS (
-                SELECT gbs.strike::numeric AS put_wall
-                FROM gex_by_strike gbs
-                JOIN latest_summary ls
-                  ON gbs.underlying = ls.underlying
-                 AND gbs.timestamp = ls.timestamp
-                JOIN latest_quote lq ON TRUE
-                WHERE gbs.strike <= lq.spot_price
-                  AND COALESCE(gbs.put_gamma, 0) > 0
-                ORDER BY gbs.put_gamma DESC, gbs.strike DESC
+                SELECT strike::numeric AS put_wall
+                FROM (
+                    SELECT gbs.strike, SUM(COALESCE(gbs.put_gamma, 0)) AS put_gamma
+                    FROM gex_by_strike gbs
+                    JOIN latest_summary ls
+                      ON gbs.underlying = ls.underlying
+                     AND gbs.timestamp = ls.timestamp
+                    JOIN latest_quote lq ON TRUE
+                    WHERE gbs.strike <= lq.spot_price
+                    GROUP BY gbs.strike
+                ) per_strike
+                WHERE put_gamma > 0
+                ORDER BY put_gamma DESC, strike DESC
                 LIMIT 1
             )
             SELECT
@@ -1816,35 +1831,53 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 GROUP BY gbs.timestamp
             ),
             -- Canonical Call/Put Wall fallback (matches src/analytics/walls.py):
-            -- Call Wall = strike >= spot with max call_gamma, ties → lowest strike.
-            -- Put  Wall = strike <= spot with max put_gamma,  ties → highest strike.
+            -- Call Wall = strike >= spot with max SUM(call_gamma) across
+            -- expirations, ties → lowest strike.
+            -- Put  Wall = strike <= spot with max SUM(put_gamma)  across
+            -- expirations, ties → highest strike.
             -- Only used for buckets where ``gex_summary.call_wall`` /
             -- ``put_wall`` is NULL (i.e., rows persisted before the column
             -- backfill).  All new analytics runs write the canonical value
-            -- straight into ``gex_summary``.
+            -- straight into ``gex_summary``.  gex_by_strike is keyed
+            -- (strike, expiration); aggregating per-strike is what makes
+            -- the wall agree with the cross-expiration view consumers see.
             call_walls AS (
-                SELECT DISTINCT ON (gbs.timestamp)
-                    gbs.timestamp,
-                    gbs.strike::numeric AS call_wall
-                FROM gex_by_strike gbs
-                CROSS JOIN spot s
-                WHERE gbs.underlying = $1
-                  AND gbs.timestamp IN (SELECT timestamp FROM base)
-                  AND gbs.strike >= s.spot_price
-                  AND COALESCE(gbs.call_gamma, 0) > 0
-                ORDER BY gbs.timestamp, gbs.call_gamma DESC, gbs.strike ASC
+                SELECT DISTINCT ON (timestamp)
+                    timestamp,
+                    strike::numeric AS call_wall
+                FROM (
+                    SELECT
+                        gbs.timestamp,
+                        gbs.strike,
+                        SUM(COALESCE(gbs.call_gamma, 0)) AS call_gamma
+                    FROM gex_by_strike gbs
+                    CROSS JOIN spot s
+                    WHERE gbs.underlying = $1
+                      AND gbs.timestamp IN (SELECT timestamp FROM base)
+                      AND gbs.strike >= s.spot_price
+                    GROUP BY gbs.timestamp, gbs.strike
+                ) per_strike
+                WHERE call_gamma > 0
+                ORDER BY timestamp, call_gamma DESC, strike ASC
             ),
             put_walls AS (
-                SELECT DISTINCT ON (gbs.timestamp)
-                    gbs.timestamp,
-                    gbs.strike::numeric AS put_wall
-                FROM gex_by_strike gbs
-                CROSS JOIN spot s
-                WHERE gbs.underlying = $1
-                  AND gbs.timestamp IN (SELECT timestamp FROM base)
-                  AND gbs.strike <= s.spot_price
-                  AND COALESCE(gbs.put_gamma, 0) > 0
-                ORDER BY gbs.timestamp, gbs.put_gamma DESC, gbs.strike DESC
+                SELECT DISTINCT ON (timestamp)
+                    timestamp,
+                    strike::numeric AS put_wall
+                FROM (
+                    SELECT
+                        gbs.timestamp,
+                        gbs.strike,
+                        SUM(COALESCE(gbs.put_gamma, 0)) AS put_gamma
+                    FROM gex_by_strike gbs
+                    CROSS JOIN spot s
+                    WHERE gbs.underlying = $1
+                      AND gbs.timestamp IN (SELECT timestamp FROM base)
+                      AND gbs.strike <= s.spot_price
+                    GROUP BY gbs.timestamp, gbs.strike
+                ) per_strike
+                WHERE put_gamma > 0
+                ORDER BY timestamp, put_gamma DESC, strike DESC
             )
             SELECT
                 b.bucket_ts as timestamp,
@@ -1918,7 +1951,18 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         by-strike endpoint with "Expiry All".
 
         ``expiration=<date>`` → restrict the strikes payload to that single
-        expiration.  Walls remain aggregate-basis (see above).
+        expiration.
+
+        Walls follow the request's expiration scope.  Each bucket's
+        ``call_wall`` / ``put_wall`` is computed live from the same
+        (filtered, summed-by-strike) gamma rows the bucket's bars
+        render — via :func:`src.analytics.walls.compute_call_put_walls`,
+        the single source of record — against the bucket's own
+        close.  This guarantees the wall always sits at the strike the
+        bars say it should: with ``expiration=all`` walls are the
+        cross-expiration aggregate (matches ``/api/gex/summary``); with
+        a specific expiration walls are scoped to that expiration's
+        gamma alone.
 
         Cash-index session filter is applied to both the window anchor
         and the bucket-rep CTE — same shape ``get_historical_gex`` uses —
@@ -1978,13 +2022,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     max_ts AS end_ts
                 FROM latest
             ),
+            -- Walls aren't read from gex_summary here — they're computed
+            -- in Python below from each bucket's expiration-filtered
+            -- strikes via compute_call_put_walls.  That keeps the wall
+            -- consistent with the bars rendered in the same bucket
+            -- (e.g. ``expirations=2026-06-13`` → walls scoped to 2026-06-13
+            -- gamma only) and routes every consumer through one helper.
             bucket_reps AS (
                 SELECT DISTINCT ON ({bucket})
                     {bucket} AS bucket_ts,
                     gs.timestamp AS rep_ts,
-                    gs.gamma_flip_point AS gamma_flip,
-                    gs.call_wall AS call_wall,
-                    gs.put_wall AS put_wall
+                    gs.gamma_flip_point AS gamma_flip
                 FROM gex_summary gs
                 WHERE gs.underlying = $1
                     AND gs.timestamp BETWEEN (SELECT start_ts FROM bounds)
@@ -2041,9 +2089,13 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 o.low,
                 o.close,
                 br.gamma_flip,
-                br.call_wall,
-                br.put_wall,
                 s.strike,
+                -- Raw summed gamma at this (bucket, strike) — used by the
+                -- Python wall computation below.  Not exposed in the
+                -- response; the dollar-GEX values below carry the same
+                -- information scaled by ``100 × close² × 0.01``.
+                s.call_gamma AS call_gamma_raw,
+                s.put_gamma  AS put_gamma_raw,
                 -- Convert summed gamma to dollar GEX at the bucket's own
                 -- close (same convention as /api/gex/by-strike). When the
                 -- underlying tape is missing for the bucket, fall back to
@@ -2071,10 +2123,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 # bucket_ts ASC / strike ASC ordering carries through to the
                 # response array. Buckets with no strikes (LEFT JOIN miss
                 # because gex_by_strike happened to be empty at the rep_ts)
-                # still appear, carrying their OHLC + walls and an empty
-                # strikes array — the chart renders the candle/level
-                # without a per-strike surface for that bucket.
+                # still appear with an empty strikes array (and NULL walls)
+                # — the chart renders the candle/flip without a per-strike
+                # surface for that bucket.
                 grouped: "OrderedDict[Any, Dict[str, Any]]" = OrderedDict()
+                # Raw per-strike gamma rows per bucket, used as input to
+                # compute_call_put_walls.  Kept separate from the response
+                # ``strikes`` list because that list ships dollar-GEX
+                # quantities (and the put values are sign-flipped) — the
+                # wall helper needs the unsigned summed gamma straight from
+                # ``gex_by_strike``.
+                wall_inputs: "OrderedDict[Any, List[Dict[str, float]]]" = OrderedDict()
                 for r in rows:
                     ts = r["timestamp"]
                     bucket = grouped.get(ts)
@@ -2087,11 +2146,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             "low": r["low"],
                             "close": r["close"],
                             "gamma_flip": r["gamma_flip"],
-                            "call_wall": r["call_wall"],
-                            "put_wall": r["put_wall"],
+                            # Filled in below, after the bucket's strikes
+                            # are known.
+                            "call_wall": None,
+                            "put_wall": None,
                             "strikes": [],
                         }
                         grouped[ts] = bucket
+                        wall_inputs[ts] = []
                     if r["strike"] is None:
                         continue
                     # Omit empty strikes — when every gamma/OI component is
@@ -2124,6 +2186,28 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                             "put_oi": int(put_oi),
                         }
                     )
+                    wall_inputs[ts].append(
+                        {
+                            "strike": float(r["strike"]),
+                            "call_gamma": float(r["call_gamma_raw"] or 0.0),
+                            "put_gamma": float(r["put_gamma_raw"] or 0.0),
+                        }
+                    )
+                # Compute per-bucket walls from the (expiration-filtered,
+                # summed-by-strike) gamma rows the chart bars render.  Spot
+                # is the bucket's own close so the wall stays consistent
+                # with the candle in that bucket.  Buckets without a close
+                # (no underlying tape) leave both walls NULL.
+                for ts, bucket in grouped.items():
+                    close_val = bucket.get("close")
+                    if close_val is None:
+                        continue
+                    inputs = wall_inputs.get(ts, [])
+                    if not inputs:
+                        continue
+                    cw, pw = compute_call_put_walls(inputs, float(close_val))
+                    bucket["call_wall"] = cw
+                    bucket["put_wall"] = pw
                 result = list(grouped.values())
                 self._cache_set(
                     cache_key, result, self._strike_profile_timeseries_cache_ttl_seconds

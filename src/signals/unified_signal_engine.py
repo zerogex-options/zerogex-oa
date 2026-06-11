@@ -494,24 +494,38 @@ class UnifiedSignalEngine:
                             ORDER BY timestamp DESC
                             LIMIT 1
                         ),
+                        -- Cross-expiration aggregation per strike before
+                        -- ranking — matches compute_call_put_walls in
+                        -- src/analytics/walls.py.  gex_by_strike is keyed
+                        -- (strike, expiration); ranking per-row picks a
+                        -- single-expiration outlier and disagrees with the
+                        -- aggregate-basis walls every other consumer sees.
                         fallback_call AS (
-                            SELECT g.strike::numeric AS strike
-                            FROM gex_by_strike g, latest_summary ls
-                            WHERE g.underlying = %s
-                              AND g.timestamp = ls.timestamp
-                              AND g.strike >= %s
-                              AND COALESCE(g.call_gamma, 0) > 0
-                            ORDER BY g.call_gamma DESC, g.strike ASC
+                            SELECT strike::numeric AS strike
+                            FROM (
+                                SELECT g.strike, SUM(COALESCE(g.call_gamma, 0)) AS call_gamma
+                                FROM gex_by_strike g, latest_summary ls
+                                WHERE g.underlying = %s
+                                  AND g.timestamp = ls.timestamp
+                                  AND g.strike >= %s
+                                GROUP BY g.strike
+                            ) per_strike
+                            WHERE call_gamma > 0
+                            ORDER BY call_gamma DESC, strike ASC
                             LIMIT 1
                         ),
                         fallback_put AS (
-                            SELECT g.strike::numeric AS strike
-                            FROM gex_by_strike g, latest_summary ls
-                            WHERE g.underlying = %s
-                              AND g.timestamp = ls.timestamp
-                              AND g.strike <= %s
-                              AND COALESCE(g.put_gamma, 0) > 0
-                            ORDER BY g.put_gamma DESC, g.strike DESC
+                            SELECT strike::numeric AS strike
+                            FROM (
+                                SELECT g.strike, SUM(COALESCE(g.put_gamma, 0)) AS put_gamma
+                                FROM gex_by_strike g, latest_summary ls
+                                WHERE g.underlying = %s
+                                  AND g.timestamp = ls.timestamp
+                                  AND g.strike <= %s
+                                GROUP BY g.strike
+                            ) per_strike
+                            WHERE put_gamma > 0
+                            ORDER BY put_gamma DESC, strike DESC
                             LIMIT 1
                         )
                         SELECT
@@ -911,24 +925,35 @@ class UnifiedSignalEngine:
                             FROM gex_summary gs, window_max w
                             WHERE gs.underlying = %s AND gs.timestamp = w.timestamp
                         ),
+                        -- Cross-expiration aggregation per strike before
+                        -- ranking (see compute_call_put_walls in
+                        -- src/analytics/walls.py).
                         fallback_call AS (
-                            SELECT g.strike::numeric AS strike
-                            FROM gex_by_strike g, prior p
-                            WHERE g.underlying = %s
-                              AND g.timestamp = p.timestamp
-                              AND g.strike >= %s
-                              AND COALESCE(g.call_gamma, 0) > 0
-                            ORDER BY g.call_gamma DESC, g.strike ASC
+                            SELECT strike::numeric AS strike
+                            FROM (
+                                SELECT g.strike, SUM(COALESCE(g.call_gamma, 0)) AS call_gamma
+                                FROM gex_by_strike g, prior p
+                                WHERE g.underlying = %s
+                                  AND g.timestamp = p.timestamp
+                                  AND g.strike >= %s
+                                GROUP BY g.strike
+                            ) per_strike
+                            WHERE call_gamma > 0
+                            ORDER BY call_gamma DESC, strike ASC
                             LIMIT 1
                         ),
                         fallback_put AS (
-                            SELECT g.strike::numeric AS strike
-                            FROM gex_by_strike g, prior p
-                            WHERE g.underlying = %s
-                              AND g.timestamp = p.timestamp
-                              AND g.strike <= %s
-                              AND COALESCE(g.put_gamma, 0) > 0
-                            ORDER BY g.put_gamma DESC, g.strike DESC
+                            SELECT strike::numeric AS strike
+                            FROM (
+                                SELECT g.strike, SUM(COALESCE(g.put_gamma, 0)) AS put_gamma
+                                FROM gex_by_strike g, prior p
+                                WHERE g.underlying = %s
+                                  AND g.timestamp = p.timestamp
+                                  AND g.strike <= %s
+                                GROUP BY g.strike
+                            ) per_strike
+                            WHERE put_gamma > 0
+                            ORDER BY put_gamma DESC, strike DESC
                             LIMIT 1
                         )
                         SELECT

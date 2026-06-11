@@ -441,11 +441,16 @@ async def get_strike_profile_timeseries(
     ``symbol`` at the requested ``timeframe``.  Each bucket carries:
 
       * the underlying OHLC inside the bucket (from ``underlying_quotes``);
-      * the bucket's representative ``gex_summary`` row's
-        ``gamma_flip`` / ``call_wall`` / ``put_wall`` — aggregate-basis,
-        matching the live ``/api/gex/summary`` regardless of the
-        ``expirations`` filter (the live view shows aggregate walls too, so
-        this keeps rewind in basis parity with "now");
+      * the bucket's ``gamma_flip`` from the representative
+        ``gex_summary`` row;
+      * ``call_wall`` / ``put_wall`` computed live for the bucket from
+        the same (expiration-filtered, summed-by-strike) gamma rows the
+        bucket's bars render, against the bucket's own close — via the
+        canonical :func:`src.analytics.walls.compute_call_put_walls`
+        helper (single source of record).  ``expirations=all`` yields
+        the cross-expiration aggregate walls (matches
+        ``/api/gex/summary``); ``expirations=<YYYY-MM-DD>`` yields walls
+        scoped to that expiration's gamma alone;
       * every strike's gamma exposure in the same dollar-GEX units
         ``/api/gex/by-strike`` uses (``γ × OI × 100 × S² × 0.01``),
         evaluated against the bucket's own ``close`` so the surface

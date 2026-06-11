@@ -3,6 +3,9 @@
 Single source of truth for Call/Put Wall strikes consumed by:
   - ``gex_summary`` row written by :class:`src.analytics.main_engine.AnalyticsEngine`
   - ``/api/gex/summary`` and ``/api/gex/history`` endpoints
+  - ``/api/gex/strike-profile-timeseries`` (per-bucket walls follow the
+    request's ``expirations`` filter — the helper is the same, the input
+    rows differ)
   - :class:`src.signals.unified_signal_engine.UnifiedSignalEngine` (current and
     ~30min-prior walls used by ``trap_detection`` and ``gamma_vwap_confluence``)
   - all playbook patterns that read ``ctx.level("call_wall" | "put_wall")``
@@ -11,10 +14,12 @@ The canonical definition (industry-standard, matching SpotGamma /
 SqueezeMetrics / Cheddar Flow):
 
 * **Call Wall** — strike at or above spot with the largest dollar call gamma
-  exposure ``γ_call × OI × 100 × S² × 0.01``.  Ties broken by nearest-to-spot
+  exposure ``γ_call × OI × 100 × S² × 0.01``, aggregated across the
+  expirations the caller chose to include.  Ties broken by nearest-to-spot
   (lowest strike above spot wins).
 * **Put Wall**  — strike at or below spot with the largest dollar put gamma
-  exposure ``γ_put  × OI × 100 × S² × 0.01``.  Ties broken by nearest-to-spot
+  exposure ``γ_put  × OI × 100 × S² × 0.01``, aggregated across the
+  expirations the caller chose to include.  Ties broken by nearest-to-spot
   (highest strike below spot wins).
 
 Notes on the formula choice:
@@ -34,10 +39,21 @@ Notes on the formula choice:
   resistance, puts below act as support.  A historical bug where the
   ``/api/gex/summary`` endpoint disagreed with the signals layer was caused by
   the endpoint omitting this filter.
+* Cross-expiration aggregation is performed **inside** the helper.
+  ``gex_by_strike`` is keyed ``(strike, expiration)`` so a single strike
+  surfaces multiple rows when several expirations have OI there; ranking
+  per-row instead of per-strike picks the single largest-expiration outlier
+  and disagrees with every cross-expiration view of the chain
+  (``/api/gex/by-strike`` summed, ``/api/gex/strike-profile-timeseries``
+  bars, ``max_gamma_strike``).  Aggregating by strike before ranking
+  matches what dealers actually hedge and what the chart actually shows.
+  Restrict expirations *before* calling the helper to get walls scoped to
+  a specific expiration grouping (e.g. 0DTE only).
 """
 
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import Any, Iterable, Mapping, Optional, Tuple
 
 
@@ -48,11 +64,13 @@ def compute_call_put_walls(
     """Return ``(call_wall, put_wall)`` from per-strike gamma rows.
 
     :param gex_by_strike: iterable of rows with at least the keys ``strike``,
-        ``call_gamma``, ``put_gamma``.  Extra keys are ignored.  Each row's
-        ``call_gamma`` / ``put_gamma`` is the OI-weighted aggregate
-        ``Σ(γ × OI)`` at that strike (same convention as
-        :func:`src.analytics.main_engine.AnalyticsEngine._calculate_gex_by_strike`
-        and the ``gex_by_strike`` table).
+        ``call_gamma``, ``put_gamma``.  Extra keys are ignored.  Rows may
+        be per-(strike, expiration) — the helper aggregates ``call_gamma``
+        and ``put_gamma`` by strike before ranking, so passing the raw
+        ``gex_by_strike`` table rows produces the same answer as passing
+        already-summed rows.  To scope the walls to a specific expiration
+        grouping (e.g. 0DTE only, or a single date), filter rows on the
+        caller side before passing them in.
     :param spot_price: current underlying price; used to split strikes into
         the above-spot (call) and below-spot (put) regions.
     :returns: ``(call_wall_strike, put_wall_strike)``.  Either side is
@@ -69,24 +87,32 @@ def compute_call_put_walls(
     if spot_price is None or spot_price <= 0:
         return None, None
 
-    call_wall: Optional[float] = None
-    put_wall: Optional[float] = None
-    best_call: float = 0.0
-    best_put: float = 0.0
-
+    # Aggregate per-(strike, expiration) rows into per-strike sums so the
+    # ranking matches the cross-expiration view consumers actually see.
+    agg_call: "defaultdict[float, float]" = defaultdict(float)
+    agg_put: "defaultdict[float, float]" = defaultdict(float)
     for row in gex_by_strike:
         try:
             strike = float(row["strike"])
         except (KeyError, TypeError, ValueError):
             continue
-        call_gamma = float(row.get("call_gamma") or 0.0)
-        put_gamma = float(row.get("put_gamma") or 0.0)
+        agg_call[strike] += float(row.get("call_gamma") or 0.0)
+        agg_put[strike] += float(row.get("put_gamma") or 0.0)
+
+    call_wall: Optional[float] = None
+    put_wall: Optional[float] = None
+    best_call: float = 0.0
+    best_put: float = 0.0
+
+    # Iterate strikes ascending so the tiebreaker (lowest strike above
+    # spot for call, highest strike below spot for put) falls out of a
+    # strictly-greater comparison without an explicit min/max-distance
+    # rule.
+    for strike in sorted(agg_call.keys() | agg_put.keys()):
+        call_gamma = agg_call.get(strike, 0.0)
+        put_gamma = agg_put.get(strike, 0.0)
 
         if strike >= spot_price and call_gamma > 0:
-            # Strictly-greater keeps the lowest-strike tiebreaker because we
-            # iterate strikes in input order; callers must pre-sort by strike
-            # ascending if they want deterministic ties.  When ties arise we
-            # explicitly prefer the lowest strike (nearest to spot).
             if call_gamma > best_call or (
                 call_gamma == best_call and (call_wall is None or strike < call_wall)
             ):
@@ -113,20 +139,34 @@ def compute_call_put_walls(
 # backfill.  New writes go through the Analytics Engine, which calls the
 # Python helper and persists the result to ``gex_summary.call_wall`` /
 # ``gex_summary.put_wall``.
+#
+# Note the GROUP BY strike — ``gex_by_strike`` is keyed
+# ``(strike, expiration)`` and the Python helper aggregates by strike before
+# ranking; the SQL fallback must match.
 CANONICAL_WALL_SQL_DOC = """
 call_wall (per timestamp):
+    WITH per_strike AS (
+        SELECT strike, SUM(COALESCE(call_gamma, 0)) AS call_gamma
+        FROM gex_by_strike
+        WHERE underlying = :symbol AND timestamp = :ts AND strike >= :spot
+        GROUP BY strike
+    )
     SELECT strike
-    FROM gex_by_strike
-    WHERE underlying = :symbol AND timestamp = :ts AND strike >= :spot
-      AND COALESCE(call_gamma, 0) > 0
+    FROM per_strike
+    WHERE call_gamma > 0
     ORDER BY call_gamma DESC, strike ASC
     LIMIT 1;
 
 put_wall (per timestamp):
+    WITH per_strike AS (
+        SELECT strike, SUM(COALESCE(put_gamma, 0)) AS put_gamma
+        FROM gex_by_strike
+        WHERE underlying = :symbol AND timestamp = :ts AND strike <= :spot
+        GROUP BY strike
+    )
     SELECT strike
-    FROM gex_by_strike
-    WHERE underlying = :symbol AND timestamp = :ts AND strike <= :spot
-      AND COALESCE(put_gamma, 0) > 0
+    FROM per_strike
+    WHERE put_gamma > 0
     ORDER BY put_gamma DESC, strike DESC
     LIMIT 1;
 """.strip()
