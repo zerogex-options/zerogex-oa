@@ -17,6 +17,7 @@ Storage is handled by IngestionEngine.
 
 import json
 import os
+import random
 import threading
 import time
 from datetime import datetime, date
@@ -90,6 +91,52 @@ _STREAM_CAP_SUSPECT_SECONDS = int(os.getenv("TS_STREAM_CAP_SUSPECT_SECONDS", "30
 _STREAM_DEGRADED_UPSTREAM_BACKOFF_SECONDS = int(
     os.getenv("TS_STREAM_DEGRADED_UPSTREAM_BACKOFF_SECONDS", "2")
 )
+
+# Reconnect backoff for the background reader loops. A flat 2s retry meant
+# every reader thread (one per option chunk + the underlying) across every
+# ingestion process reconnected every ~2s during an outage — a thundering
+# herd that perpetuated the very per-account concurrent-stream-cap exhaustion
+# the cap classifier diagnoses. Use exponential backoff with jitter, capped,
+# and reset once a connection has stayed healthy.
+_STREAM_RECONNECT_BASE_SECONDS = float(os.getenv("TS_STREAM_RECONNECT_BASE_SECONDS", "2.0"))
+_STREAM_RECONNECT_MAX_SECONDS = float(os.getenv("TS_STREAM_RECONNECT_MAX_SECONDS", "60.0"))
+# A connection that stayed open at least this long is treated as healthy, so
+# the next disconnect starts its backoff from scratch instead of carrying a
+# stale failure count forward.
+_STREAM_RECONNECT_HEALTHY_SECONDS = float(os.getenv("TS_STREAM_RECONNECT_HEALTHY_SECONDS", "30.0"))
+
+
+def _stream_reconnect_delay(consecutive_failures: int) -> float:
+    """Exponential backoff in seconds with 0–10% jitter, capped.
+
+    ``consecutive_failures`` starts at 1 for the first failure. Base doubles
+    each attempt (2, 4, 8 …) up to ``_STREAM_RECONNECT_MAX_SECONDS``; jitter is
+    uniform on [0, base*0.1) so concurrent readers don't retry in lockstep.
+    """
+    n = max(1, consecutive_failures)
+    base = min(_STREAM_RECONNECT_BASE_SECONDS * (2 ** (n - 1)), _STREAM_RECONNECT_MAX_SECONDS)
+    return base + random.uniform(0, base * 0.1)
+
+
+def _sleep_interruptible(seconds: float, is_running) -> None:
+    """Sleep up to ``seconds`` but return early once ``is_running()`` is False.
+
+    Keeps reconnect backoff from delaying a stop()/shutdown by the full
+    (now potentially 60s) backoff window.
+    """
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not is_running():
+            return
+        time.sleep(min(0.5, remaining))
+
+
+class _NonRetryableStreamError(Exception):
+    """Raised by a reader when reconnecting cannot succeed without operator
+    action (e.g. a 414 from an over-sized chunk URL). The reader loop stops
+    that reader instead of hot-looping the identical doomed request."""
+
 
 # Possible field names for implied volatility across TradeStation payload variants
 _IV_FIELD_NAMES = ("ImpliedVolatility", "IV", "Volatility", "IVol")
@@ -354,13 +401,36 @@ class OptionStreamAccumulator:
             if len(self._chunks) > 1
             else "Option stream"
         )
+        consecutive_failures = 0
         while self._running:
+            started = time.monotonic()
             try:
                 self._read_stream(chunk_idx, chunk_symbols, label)
+                # Clean return = stream ended. Reset backoff only if the
+                # connection stayed healthy for a while; a fast return
+                # (cap/degraded) keeps the failure count climbing.
+                if time.monotonic() - started >= _STREAM_RECONNECT_HEALTHY_SECONDS:
+                    consecutive_failures = 0
+            except _NonRetryableStreamError as e:
+                logger.error(
+                    "%s: non-retryable stream error (%s); stopping this reader "
+                    "until the configuration is fixed.",
+                    label,
+                    e,
+                )
+                break
             except Exception as e:
                 if self._running:
-                    logger.warning(f"{label} disconnected ({e}), reconnecting in 2s...")
-                    time.sleep(2)
+                    consecutive_failures += 1
+                    delay = _stream_reconnect_delay(consecutive_failures)
+                    logger.warning(
+                        "%s disconnected (%s), reconnecting in %.1fs (consecutive failures: %d)...",
+                        label,
+                        e,
+                        delay,
+                        consecutive_failures,
+                    )
+                    _sleep_interruptible(delay, lambda: self._running)
 
     def _read_stream(self, chunk_idx: int, chunk_symbols: List[str], label: str):
         """Open one stream connection for *chunk_symbols* and read events until it ends."""
@@ -383,15 +453,16 @@ class OptionStreamAccumulator:
 
             if response.status_code == 414:
                 # URL too large despite chunking — operator pushed the per-chunk
-                # cap above what TradeStation's gateway accepts. Log loudly so
-                # the cause is obvious instead of being buried as a generic
-                # disconnect, then raise to trigger the standard reconnect path.
-                logger.error(
-                    "%s received 414 Request-URI Too Large for %d symbols. "
-                    "Reduce STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION (currently %d).",
-                    label,
-                    len(chunk_symbols),
-                    self._chunk_size,
+                # cap above what TradeStation's gateway accepts. This is
+                # deterministic: the URL won't shrink without a config change,
+                # so reconnecting the identical request just hot-loops. Raise a
+                # non-retryable error so the reader loop stops THIS chunk
+                # instead of spinning forever.
+                response.close()
+                raise _NonRetryableStreamError(
+                    f"{label} received 414 Request-URI Too Large for "
+                    f"{len(chunk_symbols)} symbols. Reduce "
+                    f"STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION (currently {self._chunk_size})."
                 )
 
             response.raise_for_status()
@@ -680,15 +751,25 @@ class UnderlyingBarAccumulator:
 
     def _reader_loop(self):
         """Continuously read bar stream events; auto-reconnect on failure."""
+        consecutive_failures = 0
         while self._running:
+            started = time.monotonic()
             try:
                 self._read_stream()
+                if time.monotonic() - started >= _STREAM_RECONNECT_HEALTHY_SECONDS:
+                    consecutive_failures = 0
             except Exception as e:
                 if self._running:
+                    consecutive_failures += 1
+                    delay = _stream_reconnect_delay(consecutive_failures)
                     logger.warning(
-                        f"Underlying bar stream disconnected ({e}), reconnecting in 2s..."
+                        "Underlying bar stream disconnected (%s), reconnecting in %.1fs "
+                        "(consecutive failures: %d)...",
+                        e,
+                        delay,
+                        consecutive_failures,
                     )
-                    time.sleep(2)
+                    _sleep_interruptible(delay, lambda: self._running)
 
     def _read_stream(self):
         """Open one stream connection and read bar events until it ends."""
