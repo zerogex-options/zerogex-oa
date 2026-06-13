@@ -19,6 +19,7 @@ from src.ingestion.tradestation_auth import TradeStationAuth
 from src.utils import get_logger
 from src.validation import safe_float, safe_int
 from src.symbols import parse_underlyings, resolve_option_root
+from src.market_calendar import NYSE_HOLIDAYS
 from src.config import (
     API_REQUEST_TIMEOUT,
     API_RETRY_ATTEMPTS,
@@ -33,6 +34,28 @@ ET = pytz.timezone("US/Eastern")
 STREAM_READ_TIMEOUT_SECONDS = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
 STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").lower() == "true"
 STREAM_REUSE_QUOTES = os.getenv("TS_STREAM_REUSE_QUOTES", "false").lower() == "true"
+
+
+def _load_nyse_half_days() -> set:
+    """NYSE early-close (1:00 PM ET) dates from the ``NYSE_HALF_DAYS`` env var.
+
+    Comma-separated ISO dates (e.g. day before Independence Day, day after
+    Thanksgiving, Christmas Eve). Invalid tokens are skipped.
+    """
+    raw = os.getenv("NYSE_HALF_DAYS", "")
+    out = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            out.add(date.fromisoformat(token))
+        except ValueError:
+            logger.warning("Invalid date in NYSE_HALF_DAYS: %r", token)
+    return out
+
+
+NYSE_HALF_DAYS = _load_nyse_half_days()
 
 
 class TradeStationClient:
@@ -739,11 +762,20 @@ class TradeStationClient:
         return symbol
 
     def is_market_open(self, check_extended: bool = False) -> bool:
-        """Check if US equity market is currently open"""
+        """Check if US equity market is currently open.
+
+        Accounts for NYSE holidays (which fall on weekdays) and half-day
+        early closes (regular session ends 13:00 ET) — the prior weekday +
+        time-of-day check reported the market open on both.
+        """
         now_et = datetime.now(ET)
 
         # Check if weekday
         if now_et.weekday() > 4:
+            return False
+
+        # NYSE holidays fall on weekdays; the market is closed all day.
+        if now_et.date() in NYSE_HOLIDAYS:
             return False
 
         current_time = now_et.time()
@@ -753,7 +785,11 @@ class TradeStationClient:
             market_close = datetime.strptime("20:00:00", "%H:%M:%S").time()
         else:
             market_open = datetime.strptime("09:30:00", "%H:%M:%S").time()
-            market_close = datetime.strptime("16:00:00", "%H:%M:%S").time()
+            # Half-day early close: regular session ends at 13:00 ET.
+            if now_et.date() in NYSE_HALF_DAYS:
+                market_close = datetime.strptime("13:00:00", "%H:%M:%S").time()
+            else:
+                market_close = datetime.strptime("16:00:00", "%H:%M:%S").time()
 
         return market_open <= current_time <= market_close
 
