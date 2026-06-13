@@ -745,16 +745,16 @@ class IngestionEngine:
                 logger.error("Option data missing option_symbol")
                 continue
 
-            # Classify this snapshot into the running cumulative
-            # accumulator before buffering.  Doing it here (not in
-            # _prepare_option_agg) means the accumulator advances
-            # exactly once per snapshot regardless of how many times
-            # the same snapshot ends up in the buffer (rollover seed,
-            # throttled re-flush, etc.).
-            acc = self._get_flow_accumulator(option_symbol, bucket)
-            self._ingest_snapshot_into_accumulator(acc, data, bucket)
-
-            # If this symbol crossed into a new time bucket, aggregate the previous one.
+            # If this symbol crossed into a new time bucket, FINALIZE the
+            # previous bucket BEFORE this snapshot advances the cumulative
+            # accumulator.  _prepare_option_agg stamps the row with the live
+            # accumulator cumulatives (volume / ask / mid / bid), so
+            # ingesting the new-bucket snapshot first folded its increment
+            # into the previous bucket's stored cumulative — the downstream
+            # LAG-delta reader (api/database.py) then attributed the first
+            # tick of every minute to the PRIOR minute.  Closing the prior
+            # bucket against the pre-ingest watermark keeps each bucket's
+            # cumulative pinned to its own boundary.
             existing = self.options_buffer.get(option_symbol)
             if existing:
                 prev_timestamp = existing[-1].get("timestamp")
@@ -768,12 +768,19 @@ class IngestionEngine:
                             rows_to_write.append(agg)
                         # Seed the new bucket with the previous snapshot so
                         # the bucket carries a defined quote/Greek baseline
-                        # for the first throttled write.  No special tag
-                        # needed: the accumulator's watermark already
-                        # reflects this snapshot's volume, so re-ingesting
-                        # it (via the buffer scan in _prepare_option_agg)
-                        # contributes a zero delta automatically.
+                        # for the first throttled write.  It was already
+                        # classified on its own arrival, so it is not
+                        # re-ingested below.
                         self.options_buffer[option_symbol] = [existing[-1]]
+
+            # Classify this snapshot into the running cumulative accumulator.
+            # Done AFTER the prev-bucket finalize above so the previous
+            # bucket's stored cumulative excludes this (new-bucket) snapshot.
+            # Still exactly once per snapshot regardless of how many times the
+            # same snapshot ends up in the buffer (rollover seed, throttled
+            # re-flush): the watermark makes a replay contribute a zero delta.
+            acc = self._get_flow_accumulator(option_symbol, bucket)
+            self._ingest_snapshot_into_accumulator(acc, data, bucket)
 
             self.options_buffer[option_symbol].append(data)
 
