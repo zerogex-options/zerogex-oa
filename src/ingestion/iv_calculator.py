@@ -546,7 +546,7 @@ def main():
 
         print(
             f"{status} True IV: {true_iv:.4f} | Price: ${test_price:.2f} | "
-            f"Calculated IV: {calculated_iv:.4f if calculated_iv else 'FAIL'} | "
+            f"Calculated IV: {f'{calculated_iv:.4f}' if calculated_iv else 'FAIL'} | "
             f"Error: {error:.6f}"
         )
 
@@ -565,10 +565,10 @@ def main():
     print(f"Bid: ${bid:.2f}")
     print(f"Ask: ${ask:.2f}")
     print(f"Mid: ${mid:.2f}")
-    print(
-        f"Calculated IV: {calculated_iv:.4f if calculated_iv else 'FAIL'} "
-        f"({calculated_iv*100:.2f}%)"
-    )
+    if calculated_iv:
+        print(f"Calculated IV: {calculated_iv:.4f} ({calculated_iv * 100:.2f}%)")
+    else:
+        print("Calculated IV: FAIL")
 
     print("\n" + "=" * 80)
     print("Test 3: Enrich option data (integration test)")
@@ -596,7 +596,7 @@ def main():
     print(f"Last: ${enriched['last']:.2f}")
     print(f"Bid/Ask: ${enriched['bid']:.2f} / ${enriched['ask']:.2f}")
     iv_val = enriched.get("implied_volatility")
-    print(f"\nCalculated IV: {iv_val:.4f if iv_val else 'None'}")
+    print(f"\nCalculated IV: {f'{iv_val:.4f}' if iv_val else 'None'}")
     if enriched.get("implied_volatility"):
         print(f"IV Percentage: {enriched['implied_volatility']*100:.2f}%")
 

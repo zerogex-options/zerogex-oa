@@ -57,11 +57,6 @@ class TradeStationAuth:
         self.token_expiry: Optional[datetime] = None
         self._token_lock = Lock()
         self._last_refresh_epoch: float = 0.0
-        # Monotonic counter bumped on every successful refresh.  Callers can
-        # pass their observed token (or its generation) to force_refresh so we
-        # can detect whether the token was already rotated by another thread
-        # while they were making a failing request.
-        self._token_generation: int = 0
         self.refresh_buffer_seconds = int(os.getenv("TS_REFRESH_BUFFER_SECONDS", "30"))
         # Token refresh is the least-resilient call in the stack: a single
         # transient blip used to hard-fail the request that triggered it
@@ -303,7 +298,6 @@ class TradeStationAuth:
                 expires_in = data.get("expires_in", 1200)
                 self.token_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
                 self._last_refresh_epoch = time.time()
-                self._token_generation += 1
                 self._persist_cached_token_to_disk(expires_in)
                 logger.info(f"✅ Access token refreshed successfully (expires in {expires_in}s)")
                 logger.debug(f"Token expiry set to: {self.token_expiry}")
