@@ -486,7 +486,15 @@ class IngestionEngine:
     def _upsert_underlying_quote(self, quote: Dict[str, Any]):
         """Upsert one underlying quote row for the current minute bucket."""
         # Share circuit breaker with option writes — if DB is down, skip.
+        # The stream re-sends the in-progress minute bar continuously, so a
+        # skipped write self-heals once the breaker closes; emit a DEBUG line
+        # so the skip is at least observable (the option path logs its skips
+        # via the throttled circuit-breaker summary; this one was silent).
         if _time.monotonic() < self._db_backoff_until:
+            logger.debug(
+                "[CIRCUIT-BREAKER] Skipping underlying upsert during backoff " "(%.1fs remaining)",
+                self._db_backoff_until - _time.monotonic(),
+            )
             return
         try:
             with db_connection() as conn:
