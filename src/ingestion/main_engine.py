@@ -1846,8 +1846,6 @@ class IngestionEngine:
                     self._store_underlying(item["data"])
                 elif item["type"] == "option_batch":
                     self._store_option_batch(item["data"])
-                elif item["type"] == "option":
-                    self._store_option(item["data"])
                 elif item["type"] == "flush_options":
                     # C3: the stream is about to swap the tracked option
                     # symbol set (strike recalc / expiration refresh).

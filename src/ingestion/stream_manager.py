@@ -1656,16 +1656,16 @@ class StreamManager:
         drains only the contracts that received new data since the last
         cycle and yields them as a single batch for efficient DB writes.
 
-        Yields dictionaries with:
-            {
-                'type': 'underlying',
-                'data': {...}
-            }
-        or:
-            {
-                'type': 'option_batch',
-                'data': [list of option dicts]
-            }
+        Yields dictionaries of one of three types:
+            {'type': 'underlying', 'data': {...}}
+            {'type': 'option_batch', 'data': [list of option dicts]}
+            {'type': 'flush_options', 'reason': str}
+                Emitted right BEFORE the tracked option-symbol set is
+                swapped (expiration refresh / strike recalc). The consumer
+                must flush pending partial buckets for contracts about to be
+                dropped, since those contracts never tick again. (There is no
+                singular 'option' item type — options are only ever emitted
+                as 'option_batch'.)
         """
         if not self.tracked_option_symbols:
             logger.error("Not initialized. Call initialize() first.")
