@@ -1383,11 +1383,11 @@ class StreamManager:
 
     def _update_session_volume_coverage(
         self,
-        full_state: Dict[str, Dict[str, Any]],
+        changed_state: Dict[str, Dict[str, Any]],
         tracked_total: int,
         now_et: Optional[datetime] = None,
     ) -> float:
-        """Session-cumulative fraction of the tracked universe seen trading.
+        """Session-cumulative fraction of the CURRENT tracked universe trading.
 
         The per-cycle option accumulator is torn down and rebuilt WITHOUT a
         REST re-seed every ``STRIKE_RECALC_INTERVAL`` (~60s at the default 5s
@@ -1397,19 +1397,29 @@ class StreamManager:
         chronic false positive behind the "Low option volume coverage" alert.
 
         Instead, accumulate the set of symbols seen with ``Volume>0`` on the
-        StreamManager (it survives the accumulator swaps), reset it at the ET
-        day rollover, and report the distinct count over the current universe
-        size, capped at 1.0 (the band drifts with spot, so the day's union can
-        exceed the current snapshot). Stays low only when volume genuinely
-        isn't arriving, which is what the alert is for; a volume STOP after
-        trades were already seen is left to stream_updates / flow-staleness.
+        StreamManager (it survives the accumulator swaps) and reset it at the ET
+        day rollover.  ``changed_state`` is the drained changed-contract subset,
+        which is sufficient because the union persists across cycles.
+
+        The union is intersected with the CURRENT tracked set before reporting:
+        on a trending day spot drifts, strikes recalibrate, and symbols leave
+        the tracked band — leaving their day's-union membership in place made
+        the numerator exceed (and pin at) 100% even when the current band's
+        coverage was poor, rendering the alert useless mid-trend. Pruning to the
+        current universe also bounds the set's memory.
         """
         et_date = (now_et or datetime.now(ET)).date()
         if self._session_volume_date != et_date:
             self._session_volume_symbols = set()
             self._session_volume_date = et_date
+
+        tracked_set = set(self.tracked_option_symbols)
+        # Prune drifted-out symbols so they don't inflate the numerator.
+        self._session_volume_symbols &= tracked_set
         self._session_volume_symbols.update(
-            sym for sym, raw in full_state.items() if int(raw.get("Volume") or 0) > 0
+            sym
+            for sym, raw in changed_state.items()
+            if sym in tracked_set and int(raw.get("Volume") or 0) > 0
         )
         if tracked_total <= 0:
             return 0.0
@@ -2009,10 +2019,14 @@ class StreamManager:
                             # re-seed every STRIKE_RECALC_INTERVAL (~60s), so a direct
                             # count collapses to ~1 minute of trades each recalc and
                             # chronically false-trips the alert (~0.4-16% seen vs ~80%
-                            # actual). See _update_session_volume_coverage.
-                            full_state = self._accumulator.snapshot()
+                            # actual). See _update_session_volume_coverage. Feed the
+                            # already-drained CHANGED subset rather than a full
+                            # snapshot() copy of every tracked contract: the union is
+                            # accumulated across cycles, so the changed subset is
+                            # sufficient and avoids an O(universe) deep copy under the
+                            # accumulator lock on the hot path every cycle.
                             volume_coverage = self._update_session_volume_coverage(
-                                full_state, tracked_total
+                                changed, tracked_total
                             )
 
                             logger.info(
