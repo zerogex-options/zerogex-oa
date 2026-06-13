@@ -167,7 +167,14 @@ class TradeStationClient:
         try:
             response = self._build_request_response(method, url, headers, params, data)
 
-            if response.status_code in [200, 201]:
+            # Any 2xx is success. The prior ``in [200, 201]`` check let a
+            # 202/204 (e.g. No Content) fall through every branch below to
+            # raise_for_status(), which does NOT raise for 2xx -- so the
+            # method returned None and callers like get_option_expirations
+            # ("if 'Expirations' in result") hit ``TypeError: argument of
+            # type 'NoneType' is not iterable``. The empty-content guard
+            # returns the right endpoint-shaped empty dict for a 204.
+            if 200 <= response.status_code < 300:
                 # Check if response has content
                 if not response.content or len(response.content) == 0:
                     logger.warning(
