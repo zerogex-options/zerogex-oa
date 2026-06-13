@@ -1830,6 +1830,43 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_active_hash
     ON api_keys(key_hash) WHERE revoked_at IS NULL;
 
 -- =============================================================================
+-- Durable per-key API usage counters (for usage-based billing & quotas)
+-- =============================================================================
+-- One row per (UTC day, caller, key, end-user), holding that day's request
+-- and error totals.  Populated by the in-process UsageMeter
+-- (src/api/usage.py), which aggregates requests in memory and flushes them
+-- here on an interval with an increment-UPSERT.  That merge
+-- (request_count = request_count + EXCLUDED.request_count) means N API
+-- workers each flushing their own slice sum correctly into one row, so the
+-- table is the cross-worker source of truth for how much each customer used.
+--
+-- Dimensions:
+--   * ``caller_user_id`` — the authenticated key's owner (the B2B account).
+--   * ``caller_key_id``  — which of that owner's keys was used (0 when the
+--                          request came in on the static break-glass key or
+--                          anonymously); supports per-key rotation/attribution.
+--   * ``end_user_id``    — the website-attributed end-user from
+--                          X-End-User-Token ('-' when absent); supports
+--                          per-seat (B2B2C) billing.
+-- Absent dimensions use the sentinels '-'/0 (never NULL) so every row has a
+-- well-defined composite primary key for the UPSERT to conflict on.
+CREATE TABLE IF NOT EXISTS api_usage_daily (
+    day             DATE          NOT NULL,
+    caller_user_id  VARCHAR(128)  NOT NULL DEFAULT '-',
+    caller_key_id   BIGINT        NOT NULL DEFAULT 0,
+    end_user_id     VARCHAR(256)  NOT NULL DEFAULT '-',
+    request_count   BIGINT        NOT NULL DEFAULT 0,
+    error_count     BIGINT        NOT NULL DEFAULT 0,
+    first_seen_at   TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    last_seen_at    TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (day, caller_user_id, caller_key_id, end_user_id)
+);
+
+-- Per-customer usage over time (billing rollups, dashboards).
+CREATE INDEX IF NOT EXISTS idx_api_usage_daily_caller
+    ON api_usage_daily(caller_user_id, day);
+
+-- =============================================================================
 -- Daily ATM IV history (for iv_rank computation)
 -- =============================================================================
 -- One row per (underlying, trading_date) holding that day's ATM call IV.

@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional
 
 import asyncpg
 
+from src.api.scopes import TIERS, expand_tier
 from src.database.password_providers import resolve_db_credentials
 
 _PREFIX_LEN = 8
@@ -203,15 +204,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Friendly label for the key (e.g. 'alice-laptop', 'ci-bot')",
     )
     p_create.add_argument(
+        "--tier",
+        default=None,
+        choices=sorted(TIERS),
+        # Expands to the tier's scope bundle (see src/api/scopes.py) and is
+        # merged with any explicit --scope values. This is the ergonomic way
+        # to provision a customer key: `--tier analytics` grants the derived
+        # endpoints; only `--tier full` includes raw market data.
+        help="Grant a tier's scope bundle (merged with any --scope values).",
+    )
+    p_create.add_argument(
         "--scope",
         action="append",
         default=None,
         dest="scopes",
-        # Stored in api_keys.scopes (text[]); not enforced anywhere in the
-        # request path today. Useful as an audit record of intended scope.
-        # Real enforcement would require a per-endpoint "required scopes"
-        # declaration and a check in api_key_auth after the DB lookup.
-        help="Optional scope tag, repeat for multiple. Advisory only — stored but not enforced.",
+        # Stored in api_keys.scopes (text[]). Enforced per-endpoint via
+        # require_scopes() once API_SCOPE_ENFORCEMENT=1; until then it is a
+        # recorded-but-inert grant. The wildcard "*" always passes.
+        help="Additional scope tag, repeat for multiple. Merged with --tier.",
     )
 
     p_list = sub.add_parser("list", help="List API keys")
@@ -233,7 +243,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     if args.cmd == "create":
-        return asyncio.run(_create(args.user_id, args.name, args.scopes))
+        # Merge the tier bundle (if any) with explicit --scope values,
+        # de-duplicated and sorted for a stable stored array.
+        scopes: List[str] = list(args.scopes or [])
+        if args.tier:
+            scopes.extend(expand_tier(args.tier))
+        merged = sorted(set(scopes)) if scopes else None
+        return asyncio.run(_create(args.user_id, args.name, merged))
     if args.cmd == "list":
         return asyncio.run(_list(args.user_id, args.active))
     if args.cmd == "revoke":

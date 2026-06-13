@@ -18,9 +18,11 @@ import pytz
 
 from .database import DatabaseManager
 from .errors import handle_api_errors
-from .middleware import AuditLogMiddleware, RequestIdMiddleware
+from .middleware import AuditLogMiddleware, RequestIdMiddleware, UsageMeterMiddleware
 from .ratelimit import rate_limit
+from .scopes import FLOW, GEX, MARKET_RAW, MAXPAIN, SIGNALS, TECHNICALS
 from .security import api_key_auth, key_store, require_scopes
+from .usage import usage_meter
 from .models import (
     GEXSummary,
     GEXByStrike,
@@ -123,6 +125,12 @@ async def lifespan(app: FastAPI):
     # on the next lookup instead of holding a stale, closed reference.
     key_store.configure(lambda: db_manager.pool)
 
+    # Wire the durable usage meter to the same live pool and start its
+    # background flush loop. No-op unless API_USAGE_METERING_ENABLED is set,
+    # so this is inert until metering is switched on.
+    usage_meter.configure(lambda: db_manager.pool)
+    usage_meter.start()
+
     # The max-pain snapshot is refreshed off-process by the
     # zerogex-oa-max-pain-refresh.timer (daily, pre-market) — not by an
     # in-process loop and not inline on the request path.  The endpoint is
@@ -131,6 +139,10 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down ZeroGEX API Server...")
+    # Stop the meter first (cancels the loop and flushes the final window)
+    # while the DB pool is still up, then drop both pool getters.
+    await usage_meter.stop()
+    usage_meter.configure(None)
     key_store.configure(None)
     if db_manager:
         await db_manager.disconnect()
@@ -241,24 +253,43 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 # dependency resolution.
 app.add_middleware(AuditLogMiddleware)
 
+# Usage metering. Same nesting level as audit (wraps routing so it sees
+# the resolved identity). No-op unless API_USAGE_METERING_ENABLED is set.
+app.add_middleware(UsageMeterMiddleware)
+
 # Request-ID propagation: every log line emitted while handling a request
 # carries the id, and the same id is echoed back via X-Request-Id so
 # clients (and server logs) can correlate.
 app.add_middleware(RequestIdMiddleware)
 
-# The /api/signals surface is the premium (basic/pro) tier. Wire scope
-# enforcement here. It is a no-op until keys carry scopes AND
-# API_SCOPE_ENFORCEMENT=1 (see security.require_scopes), so this closes
-# the server-side tier gap without 403ing today's scopeless keys.
+# Per-endpoint scope dependencies — one reusable Depends per capability
+# scope (see scopes.py for the taxonomy and tier bundles). Wiring these
+# onto the routes below is a no-op until keys are backfilled with scopes
+# AND API_SCOPE_ENFORCEMENT=1 (see security.require_scopes); a key with
+# the wildcard "*" scope always passes. This draws the authorization map
+# — including isolating raw market data behind MARKET_RAW so it can be
+# withheld from external/B2B keys — without 403ing today's scopeless keys.
+_scope_gex = Depends(require_scopes(GEX))
+_scope_flow = Depends(require_scopes(FLOW))
+_scope_maxpain = Depends(require_scopes(MAXPAIN))
+_scope_technicals = Depends(require_scopes(TECHNICALS))
+_scope_signals = Depends(require_scopes(SIGNALS))
+_scope_market_raw = Depends(require_scopes(MARKET_RAW))
+
+# The /api/signals surface is the premium (basic/pro) tier.
 app.include_router(
     trade_signals_router,
-    dependencies=[Depends(require_scopes("signals"))],
+    dependencies=[_scope_signals],
 )
-app.include_router(volatility_gauge_router)
-app.include_router(option_contract_router)
-app.include_router(option_calculator_router)
-app.include_router(vol_surface_router)
-app.include_router(gex_flip_horizon_router)
+# Derived analytics routers — broadly redistributable.
+app.include_router(volatility_gauge_router, dependencies=[_scope_gex])
+app.include_router(vol_surface_router, dependencies=[_scope_gex])
+app.include_router(gex_flip_horizon_router, dependencies=[_scope_gex])
+# Raw market data routers — per-contract option history (option_contract)
+# and the option-calculator (which embeds raw contract prices). Gated
+# behind MARKET_RAW so they are excluded from derived-only tiers.
+app.include_router(option_contract_router, dependencies=[_scope_market_raw])
+app.include_router(option_calculator_router, dependencies=[_scope_market_raw])
 
 # ============================================================================
 # Health Check
@@ -311,7 +342,7 @@ async def health_check(response: Response):
 # ============================================================================
 
 
-@app.get("/api/gex/summary", response_model=GEXSummary, tags=["GEX"])
+@app.get("/api/gex/summary", response_model=GEXSummary, tags=["GEX"], dependencies=[_scope_gex])
 @handle_api_errors("GET /api/gex/summary")
 async def get_gex_summary(symbol: str = Query(default="SPY")):
     """Get latest GEX summary"""
@@ -321,7 +352,12 @@ async def get_gex_summary(symbol: str = Query(default="SPY")):
     return GEXSummary(**data)
 
 
-@app.get("/api/gex/by-strike", response_model=List[GEXByStrike], tags=["GEX"])
+@app.get(
+    "/api/gex/by-strike",
+    response_model=List[GEXByStrike],
+    tags=["GEX"],
+    dependencies=[_scope_gex],
+)
 @handle_api_errors("GET /api/gex/by-strike")
 async def get_gex_by_strike(
     symbol: str = Query(default="SPY"),
@@ -344,7 +380,7 @@ async def get_gex_by_strike(
     return [GEXByStrike(**row) for row in data]
 
 
-@app.get("/api/gex/profile", response_model=GEXProfile, tags=["GEX"])
+@app.get("/api/gex/profile", response_model=GEXProfile, tags=["GEX"], dependencies=[_scope_gex])
 @handle_api_errors("GET /api/gex/profile")
 async def get_gex_profile(symbol: str = Query(default="SPY")):
     """Latest spot-shift dealer dollar-gamma curve for ``symbol``.
@@ -362,7 +398,12 @@ async def get_gex_profile(symbol: str = Query(default="SPY")):
     return GEXProfile(**data)
 
 
-@app.get("/api/gex/historical", response_model=List[GEXSummary], tags=["GEX"])
+@app.get(
+    "/api/gex/historical",
+    response_model=List[GEXSummary],
+    tags=["GEX"],
+    dependencies=[_scope_gex],
+)
 async def get_historical_gex(
     symbol: str = Query(default="SPY"),
     start_date: Optional[str] = None,
@@ -387,7 +428,7 @@ async def get_historical_gex(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@app.get("/api/gex/heatmap", tags=["GEX"])
+@app.get("/api/gex/heatmap", tags=["GEX"], dependencies=[_scope_gex])
 @handle_api_errors("GET /api/gex/heatmap")
 async def get_gex_heatmap(
     symbol: str = Query(default="SPY"),
@@ -399,7 +440,12 @@ async def get_gex_heatmap(
     return data or []
 
 
-@app.get("/api/gex/expirations", response_model=List[date_type], tags=["GEX"])
+@app.get(
+    "/api/gex/expirations",
+    response_model=List[date_type],
+    tags=["GEX"],
+    dependencies=[_scope_gex],
+)
 @handle_api_errors("GET /api/gex/expirations")
 async def get_gex_expirations(
     symbol: str = Query(default="SPY"),
@@ -420,6 +466,7 @@ async def get_gex_expirations(
     "/api/gex/strike-profile-timeseries",
     response_model=List[StrikeProfileBucket],
     tags=["GEX"],
+    dependencies=[_scope_gex],
 )
 @handle_api_errors("GET /api/gex/strike-profile-timeseries")
 async def get_strike_profile_timeseries(
@@ -486,7 +533,12 @@ async def get_strike_profile_timeseries(
 # ============================================================================
 
 
-@app.get("/api/flow/by-contract", response_model=List[FlowPoint], tags=["Options Flow"])
+@app.get(
+    "/api/flow/by-contract",
+    response_model=List[FlowPoint],
+    tags=["Options Flow"],
+    dependencies=[_scope_flow],
+)
 @handle_api_errors("GET /api/flow/by-contract")
 async def get_flow_by_contract(
     symbol: str = Query(default="SPY"),
@@ -627,7 +679,12 @@ def _format_flow_series_row(row: dict) -> dict:
     }
 
 
-@app.get("/api/flow/series", response_model=List[FlowSeriesPoint], tags=["Options Flow"])
+@app.get(
+    "/api/flow/series",
+    response_model=List[FlowSeriesPoint],
+    tags=["Options Flow"],
+    dependencies=[_scope_flow],
+)
 @handle_api_errors("GET /api/flow/series")
 async def get_flow_series(
     symbol: str = Query(..., min_length=1, max_length=10),
@@ -689,7 +746,12 @@ async def get_flow_series(
     return JSONResponse(content=[_format_flow_series_row(r) for r in rows])
 
 
-@app.get("/api/flow/contracts", response_model=FlowContractsResponse, tags=["Options Flow"])
+@app.get(
+    "/api/flow/contracts",
+    response_model=FlowContractsResponse,
+    tags=["Options Flow"],
+    dependencies=[_scope_flow],
+)
 @handle_api_errors("GET /api/flow/contracts")
 async def get_flow_contracts(
     symbol: str = Query(..., min_length=1, max_length=10),
@@ -714,7 +776,12 @@ async def get_flow_contracts(
     return FlowContractsResponse(**result)
 
 
-@app.get("/api/flow/smart-money", response_model=List[SmartMoneyFlowPoint], tags=["Options Flow"])
+@app.get(
+    "/api/flow/smart-money",
+    response_model=List[SmartMoneyFlowPoint],
+    tags=["Options Flow"],
+    dependencies=[_scope_flow],
+)
 @handle_api_errors("GET /api/flow/smart-money")
 async def get_smart_money_flow(
     symbol: str = Query(default="SPY"),
@@ -730,7 +797,10 @@ async def get_smart_money_flow(
 
 
 @app.get(
-    "/api/flow/buying-pressure", response_model=List[FlowBuyingPressurePoint], tags=["Options Flow"]
+    "/api/flow/buying-pressure",
+    response_model=List[FlowBuyingPressurePoint],
+    tags=["Options Flow"],
+    dependencies=[_scope_flow],
 )
 @handle_api_errors("GET /api/flow/buying-pressure")
 async def get_flow_buying_pressure(
@@ -861,6 +931,7 @@ def get_market_session(asset_type: Optional[str], price_is_stable: bool = False)
 
 @app.get(
     "/api/market/quote",
+    dependencies=[_scope_market_raw],
     response_model=UnderlyingQuote,
     response_model_exclude_none=True,
     tags=["Market Data"],
@@ -897,7 +968,12 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@app.get("/api/market/session-closes", response_model=SessionCloses, tags=["Market Data"])
+@app.get(
+    "/api/market/session-closes",
+    response_model=SessionCloses,
+    tags=["Market Data"],
+    dependencies=[_scope_market_raw],
+)
 @handle_api_errors("GET /api/market/session-closes")
 async def get_session_closes(symbol: str = Query(default="SPY")):
     """
@@ -913,7 +989,12 @@ async def get_session_closes(symbol: str = Query(default="SPY")):
     return SessionCloses(**data)
 
 
-@app.get("/api/market/historical", response_model=List[UnderlyingQuote], tags=["Market Data"])
+@app.get(
+    "/api/market/historical",
+    response_model=List[UnderlyingQuote],
+    tags=["Market Data"],
+    dependencies=[_scope_market_raw],
+)
 async def get_historical_quotes(
     symbol: str = Query(default="SPY"),
     start_date: Optional[str] = None,
@@ -938,7 +1019,12 @@ async def get_historical_quotes(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@app.get("/api/option/quote", response_model=OptionQuote, tags=["Market Data"])
+@app.get(
+    "/api/option/quote",
+    response_model=OptionQuote,
+    tags=["Market Data"],
+    dependencies=[_scope_market_raw],
+)
 async def get_option_quote(
     underlying: str = Query(default="SPY", description="Underlying symbol, e.g. SPY"),
     strike: Optional[float] = Query(default=None, description="Strike price"),
@@ -962,7 +1048,12 @@ async def get_option_quote(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@app.get("/api/market/open-interest", response_model=OpenInterestResponse, tags=["Market Data"])
+@app.get(
+    "/api/market/open-interest",
+    response_model=OpenInterestResponse,
+    tags=["Market Data"],
+    dependencies=[_scope_market_raw],
+)
 @handle_api_errors("GET /api/market/open-interest")
 async def get_open_interest(
     underlying: str = Query(default="SPY", description="Underlying symbol, e.g. SPY"),
@@ -982,7 +1073,12 @@ async def get_open_interest(
     )
 
 
-@app.get("/api/max-pain/timeseries", response_model=List[MaxPainTimeseriesPoint], tags=["Max Pain"])
+@app.get(
+    "/api/max-pain/timeseries",
+    response_model=List[MaxPainTimeseriesPoint],
+    tags=["Max Pain"],
+    dependencies=[_scope_maxpain],
+)
 @handle_api_errors("GET /api/max-pain/timeseries")
 async def get_max_pain_timeseries(
     symbol: str = Query(default="SPY"),
@@ -994,7 +1090,12 @@ async def get_max_pain_timeseries(
     return [MaxPainTimeseriesPoint(**row) for row in data]
 
 
-@app.get("/api/max-pain/current", response_model=MaxPainCurrent, tags=["Max Pain"])
+@app.get(
+    "/api/max-pain/current",
+    response_model=MaxPainCurrent,
+    tags=["Max Pain"],
+    dependencies=[_scope_maxpain],
+)
 @handle_api_errors("GET /api/max-pain/current")
 async def get_max_pain_current(
     symbol: str = Query(default="SPY"), strike_limit: int = Query(default=200, ge=10, le=1000)
@@ -1024,7 +1125,7 @@ async def get_max_pain_current(
 _TECHNICALS_SYMBOL_PATTERN = re.compile(r"^[A-Z.]{1,10}$")
 
 
-@app.get("/api/technicals", tags=["Technicals"])
+@app.get("/api/technicals", tags=["Technicals"], dependencies=[_scope_technicals])
 @handle_api_errors("GET /api/technicals")
 async def get_technicals(
     symbol: str = Query(default="SPY", min_length=1, max_length=10),
@@ -1105,7 +1206,7 @@ async def get_technicals(
     return result
 
 
-@app.get("/api/technicals/vwap-deviation", tags=["Technicals"])
+@app.get("/api/technicals/vwap-deviation", tags=["Technicals"], dependencies=[_scope_technicals])
 @handle_api_errors("GET /api/technicals/vwap-deviation")
 async def get_vwap_deviation(
     symbol: str = Query(default="SPY"),
@@ -1116,7 +1217,7 @@ async def get_vwap_deviation(
     return await _db().get_vwap_deviation(symbol, timeframe, window_units)
 
 
-@app.get("/api/technicals/opening-range", tags=["Technicals"])
+@app.get("/api/technicals/opening-range", tags=["Technicals"], dependencies=[_scope_technicals])
 @handle_api_errors("GET /api/technicals/opening-range")
 async def get_opening_range(
     symbol: str = Query(default="SPY"),
@@ -1127,7 +1228,7 @@ async def get_opening_range(
     return await _db().get_opening_range_breakout(symbol, timeframe, window_units)
 
 
-@app.get("/api/technicals/dealer-hedging", tags=["Technicals"])
+@app.get("/api/technicals/dealer-hedging", tags=["Technicals"], dependencies=[_scope_technicals])
 @handle_api_errors("GET /api/technicals/dealer-hedging")
 async def get_dealer_hedging(symbol: str = Query(default="SPY")):
     """Get current dealer hedging pressure (point-in-time snapshot).
@@ -1145,7 +1246,7 @@ async def get_dealer_hedging(symbol: str = Query(default="SPY")):
     return await _db().get_dealer_hedging_pressure(symbol)
 
 
-@app.get("/api/technicals/volume-spikes", tags=["Technicals"])
+@app.get("/api/technicals/volume-spikes", tags=["Technicals"], dependencies=[_scope_technicals])
 @handle_api_errors("GET /api/technicals/volume-spikes")
 async def get_volume_spikes(
     symbol: str = Query(default="SPY"), limit: int = Query(default=20, le=100)
@@ -1158,6 +1259,7 @@ async def get_volume_spikes(
     "/api/technicals/momentum-divergence",
     response_model=List[MomentumDivergencePoint],
     tags=["Technicals"],
+    dependencies=[_scope_technicals],
 )
 @handle_api_errors("GET /api/technicals/momentum-divergence")
 async def get_momentum_divergence(

@@ -18,6 +18,14 @@ AuditLogMiddleware
     still wraps routing, so it observes the identity resolved during
     dependency injection. All audit work runs in a guarded ``finally`` so
     it can never break or slow a response.
+
+UsageMeterMiddleware
+    Records exactly one usage increment per HTTP request against the
+    resolved identity into the process-wide :data:`src.api.usage.usage_meter`.
+    Pure-ASGI and, like the audit middleware, wraps routing so it sees the
+    identity the auth dependency set. The meter is a no-op unless usage
+    metering is enabled, and the increment runs in a guarded ``finally`` so
+    it can never break or slow a response.
 """
 
 from __future__ import annotations
@@ -29,6 +37,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from src.utils import get_logger
 from src.utils.logging import new_request_id, request_id_var
+
+from .usage import usage_meter
 
 _audit_logger = get_logger("src.api.audit")
 
@@ -110,4 +120,41 @@ class AuditLogMiddleware:
                 )
             except Exception:
                 # Auditing must never break or slow a response.
+                pass
+
+
+class UsageMeterMiddleware:
+    """Pure-ASGI per-request usage metering.
+
+    Captures the response status, reads the identity the auth dependency
+    stashed on ``request.state`` (mirrored into ``scope["state"]``), and
+    records one increment against :data:`src.api.usage.usage_meter`. The
+    meter guards the disabled fast path; the call here is additionally
+    wrapped in a guarded ``finally`` — metering must never break or slow a
+    response.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        captured = {"status": 0}
+
+        async def send_with_meter(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                captured["status"] = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_meter)
+        finally:
+            try:
+                identity = (scope.get("state") or {}).get("identity")
+                usage_meter.record(identity, captured["status"])
+            except Exception:
+                # Metering must never break or slow a response.
                 pass
