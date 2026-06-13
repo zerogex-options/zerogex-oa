@@ -1722,6 +1722,15 @@ class IngestionEngine:
                 self._obs_write_time_ms = 0.0
                 self._obs_last_log = now
 
+                # Persist any completed API-call window even during a quiet
+                # period: the client only flushes window counts on the next
+                # request or on close_all_streams, so a lull would otherwise
+                # drop the last window's count. Best-effort.
+                try:
+                    self.client.flush_api_call_window()
+                except Exception as flush_err:
+                    logger.debug("API-call window flush skipped: %s", flush_err)
+
         except Exception as e:
             self._db_consecutive_failures += 1
             self.errors_count += 1

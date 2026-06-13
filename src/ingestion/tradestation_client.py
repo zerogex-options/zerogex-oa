@@ -159,6 +159,33 @@ class TradeStationClient:
             except Exception as e:
                 logger.warning("API-call window writer raised: %s", e)
 
+    def flush_api_call_window(self) -> None:
+        """Persist the current API-call window if wall-clock has left it.
+
+        Window counts are otherwise only flushed lazily on the NEXT request or
+        on ``close_all_streams``. During a quiet period (no requests) the last
+        completed window's count is never written. Call this on a periodic
+        cadence (the engine's observability tick) so a completed window is
+        persisted even when no new request triggers the rollover. Idempotent:
+        only the not-yet-persisted delta of an ELAPSED window is written.
+        """
+        now_window = self._floor_to_five_minute_window(datetime.now(timezone.utc))
+        rolled_start: Optional[datetime] = None
+        delta = 0
+        with self._api_session_counter_lock:
+            if now_window != self._api_session_window_start:
+                rolled_start = self._api_session_window_start
+                delta = self._api_session_window_count - self._api_session_window_persisted
+                # Mark fully persisted but keep the count for the log on the
+                # eventual natural rollover; advance the window so we don't
+                # re-flush the same one.
+                self._api_session_window_persisted = self._api_session_window_count
+        if rolled_start is not None and delta > 0 and self._api_call_window_writer is not None:
+            try:
+                self._api_call_window_writer(rolled_start, delta)
+            except Exception as e:
+                logger.warning("API-call window flush writer raised: %s", e)
+
     def _request(  # type: ignore[return]
         self,
         method: str,
