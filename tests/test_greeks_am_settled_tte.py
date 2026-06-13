@@ -40,10 +40,13 @@ def test_settlement_close_time_spy_is_pm():
 def test_am_settled_gamma_decays_by_settlement():
     calc = _calc()
     exp = date(2026, 6, 19)
-    # 10:00 ET on expiration morning: AM-settled SPX has already settled
-    # (09:30), so TTE is floored near zero and gamma collapses; the 16:00
-    # default would still see ~6h of life and report meaningful gamma.
-    now = ET.localize(datetime(2026, 6, 19, 10, 0))
+    # 09:15 ET on expiration morning, BEFORE the 09:30 SOQ: the AM-settled
+    # contract has ~15 min of life (floored to the 30-min TTE floor) while
+    # the PM (SPXW) view still sees ~6.75h. The ATM 1/sqrt(T) gamma is
+    # therefore far larger for the (tiny-T) AM contract. (After 09:30 the
+    # AM contract is expired and gamma is 0 per the expired-TTE fix; this
+    # case pins the pre-settlement divergence directly.)
+    now = ET.localize(datetime(2026, 6, 19, 9, 15))
     am = calc.calculate_all_greeks(
         underlying_price=5000.0,
         strike=5000.0,
@@ -64,8 +67,9 @@ def test_am_settled_gamma_decays_by_settlement():
         underlying_symbol="SPX",
         option_symbol="SPXW 260619C5000",
     )
-    # AM-settled gamma uses the 30-min TTE floor; PM-settled still has ~6h.
+    # AM-settled gamma uses the 30-min TTE floor; PM-settled still has ~6.75h.
     # The ATM 1/sqrt(T) gamma is therefore strictly larger for the
-    # (tiny-T) AM contract, and the two must differ.
-    assert am["gamma"] != pm["gamma"]
+    # (tiny-T) AM contract, and both must be positive (alive).
+    assert am["gamma"] > 0.0
+    assert pm["gamma"] > 0.0
     assert am["gamma"] > pm["gamma"]
