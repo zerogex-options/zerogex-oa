@@ -1596,7 +1596,17 @@ class StreamManager:
             raw_ts = raw.get("TimeStamp", "")
             timestamp = safe_datetime(raw_ts, field_name="TimeStamp")
             if not timestamp:
-                timestamp = datetime.now(ET)
+                # Drop the snapshot rather than fabricating ``now()`` on the
+                # INGEST path: a garbled TimeStamp would otherwise stamp the
+                # quote into the current minute bucket and mis-date its
+                # volume/flow. The bar path already drops bad timestamps; do
+                # the same here so a malformed quote can't corrupt bucketing.
+                logger.warning(
+                    "Dropping option quote with unparseable TimeStamp %r for %s",
+                    raw_ts,
+                    option_symbol,
+                )
+                continue
 
             last = safe_float(raw.get("Last"), default=None, field_name="Last")
             bid = safe_float(raw.get("Bid"), default=None, field_name="Bid")
