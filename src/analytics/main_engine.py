@@ -2611,7 +2611,16 @@ class AnalyticsEngine:
         # Put/call ratio
         put_call_ratio = total_put_volume / total_call_volume if total_call_volume > 0 else 0
 
-        # Total net GEX
+        # Total net GEX — sum of the per-strike snapshot GEX. NOTE: this is
+        # the UNWEIGHTED whole-chain sum (every expiration counted at full
+        # weight), whereas ``net_gex_at_spot`` above is read off the spot-shift
+        # profile that applies the DTE horizon-occupancy weight. The two
+        # therefore use different bases and can legitimately differ in
+        # magnitude (and occasionally sign when far-OTM/long-dated strikes
+        # dominate the unweighted tail). ``net_gex_at_spot`` is the
+        # regime-correct headline figure; ``total_net_gex`` is retained as the
+        # raw chain aggregate. Downstream consumers must not treat them as
+        # interchangeable.
         total_net_gex = sum(strike["net_gex"] for strike in gex_by_strike)
 
         # Distance from spot to flip (normalized by spot).
