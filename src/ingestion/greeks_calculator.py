@@ -161,6 +161,14 @@ class GreeksCalculator:
         Returns:
             Delta value
         """
+        # Guard degenerate inputs like the other Greeks do. Without this,
+        # _calculate_d1_d2 returns its (0, 0) sentinel and delta collapses to
+        # N(0)=0.5 (call) / -0.5 (put) — a plausible-looking but wrong value
+        # for an invalid/expired contract (sigma<=0 or T<=0). Return 0.0 so a
+        # degenerate row is clearly non-directional rather than half-delta.
+        if S <= 0 or K <= 0 or sigma <= 0 or T <= 0:
+            return 0.0
+
         d1, _ = self._calculate_d1_d2(S, K, T, r, sigma, q)
         discount = np.exp(-q * T)
 
