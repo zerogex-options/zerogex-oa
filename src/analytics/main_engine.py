@@ -1428,6 +1428,16 @@ class AnalyticsEngine:
             else:  # Put
                 payout += np.maximum(k - test, 0.0) * oi * 100
 
+        # No usable open interest -> the payout grid is uniformly zero and
+        # ``argmin`` would silently return ``strikes[0]`` (the lowest strike),
+        # fabricating a max-pain pin at the bottom of the chain.  This is the
+        # common intraday cold-start state ("All options have OI=0") the
+        # snapshot path explicitly logs.  Return ``None`` so the docstring's
+        # "no usable data" contract holds, rather than persisting a bogus pin
+        # that saturates downstream pin-gravity scoring.
+        if not np.any(payout > 0.0):
+            return None
+
         # Max pain is where aggregate payout to holders is minimized. Index back
         # into the original ``strikes`` list so the returned value keeps its
         # original type/identity (matches the prior dict-key return).
