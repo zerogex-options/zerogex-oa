@@ -63,6 +63,17 @@ class TradeStationAuth:
         # while they were making a failing request.
         self._token_generation: int = 0
         self.refresh_buffer_seconds = int(os.getenv("TS_REFRESH_BUFFER_SECONDS", "30"))
+        # Token refresh is the least-resilient call in the stack: a single
+        # transient blip used to hard-fail the request that triggered it
+        # (hard-coded 10s timeout, no retry).  Give it the same resilience as
+        # data calls — a configurable timeout (defaulting to API_REQUEST_TIMEOUT)
+        # and a small exponential-backoff retry budget on transient network
+        # errors only (an auth rejection still fails fast).
+        self._refresh_timeout_seconds = int(
+            os.getenv("TS_REFRESH_TIMEOUT_SECONDS", os.getenv("API_REQUEST_TIMEOUT", "30"))
+        )
+        self._refresh_max_attempts = max(1, int(os.getenv("TS_REFRESH_MAX_ATTEMPTS", "3")))
+        self._refresh_retry_base_delay = float(os.getenv("TS_REFRESH_RETRY_DELAY", "1.0"))
         token_cache_name = (
             "tradestation_token_cache_sandbox.json" if sandbox else "tradestation_token_cache.json"
         )
@@ -226,8 +237,42 @@ class TradeStationAuth:
                     return self.access_token  # type: ignore[return-value]
 
                 # Make refresh token request to https://signin.tradestation.com/oauth/token
-                # (or for sandbox: https://sim-signin.tradestation.com/oauth/token)
-                response = requests.post(self.token_url, data=payload, timeout=10)
+                # (or for sandbox: https://sim-signin.tradestation.com/oauth/token).
+                # Retry transient network failures with exponential backoff so a
+                # single blip at the most critical call doesn't fail the request
+                # that triggered the refresh.  Auth REJECTIONS (non-2xx) are not
+                # retried here — they go through raise_for_status below.
+                response = None
+                last_exc: Optional[Exception] = None
+                for attempt in range(self._refresh_max_attempts):
+                    try:
+                        response = requests.post(
+                            self.token_url,
+                            data=payload,
+                            timeout=self._refresh_timeout_seconds,
+                        )
+                        break
+                    except (
+                        requests.exceptions.Timeout,
+                        requests.exceptions.ConnectionError,
+                    ) as exc:
+                        last_exc = exc
+                        if attempt < self._refresh_max_attempts - 1:
+                            delay = self._refresh_retry_base_delay * (2**attempt)
+                            logger.warning(
+                                "Token refresh network error (attempt %d/%d): %s — "
+                                "retrying in %.1fs",
+                                attempt + 1,
+                                self._refresh_max_attempts,
+                                exc.__class__.__name__,
+                                delay,
+                            )
+                            time.sleep(delay)
+                if response is None:
+                    logger.error(
+                        "Token refresh failed after %d attempts", self._refresh_max_attempts
+                    )
+                    raise last_exc  # type: ignore[misc]
 
                 logger.debug(f"Token request status code: {response.status_code}")
 

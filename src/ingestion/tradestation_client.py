@@ -143,6 +143,7 @@ class TradeStationClient:
         params: Optional[Dict] = None,
         data: Optional[Dict] = None,
         retry_count: int = 0,
+        auth_refreshed: bool = False,
     ) -> Dict[str, Any]:
         """
         Make HTTP request with retry logic
@@ -188,14 +189,22 @@ class TradeStationClient:
                 logger.debug(f"Response: {json.dumps(result, indent=2)[:1000]}...")
                 return result  # type: ignore[no-any-return]
 
-            # Handle expired/invalid token - force refresh and retry once
+            # Handle expired/invalid token - force refresh and retry once.
+            # The auth-refresh budget is decoupled from the data-retry budget
+            # (API_RETRY_ATTEMPTS): a 401 ALWAYS gets exactly one refresh+retry
+            # via the sticky ``auth_refreshed`` flag, even when
+            # API_RETRY_ATTEMPTS<=1 (the prior ``retry_count < ATTEMPTS-1`` gate
+            # never refreshed in that config, failing every call with an expired
+            # token).
             if response.status_code == 401:
-                if retry_count < API_RETRY_ATTEMPTS - 1:
+                if not auth_refreshed:
                     logger.warning("TradeStation returned 401; forcing token refresh and retrying")
                     failed_token = headers.get("Authorization", "").removeprefix("Bearer ")
                     self.auth.force_refresh_access_token(failed_token=failed_token)
-                    return self._request(method, endpoint, params, data, retry_count + 1)
-                logger.error("TradeStation returned 401 after retries")
+                    return self._request(
+                        method, endpoint, params, data, retry_count, auth_refreshed=True
+                    )
+                logger.error("TradeStation returned 401 after token refresh")
                 response.raise_for_status()
 
             # Handle 404 "No data available" - don't retry, just return empty
@@ -249,7 +258,9 @@ class TradeStationClient:
                     retry_delay = API_RETRY_DELAY * (API_RETRY_BACKOFF**retry_count)
                     logger.warning(f"Rate limited (429), retrying in {retry_delay}s...")
                     time.sleep(retry_delay)
-                    return self._request(method, endpoint, params, data, retry_count + 1)
+                    return self._request(
+                        method, endpoint, params, data, retry_count + 1, auth_refreshed
+                    )
 
             # Handle server errors with retry
             if response.status_code >= 500:
@@ -259,7 +270,9 @@ class TradeStationClient:
                         f"Server error ({response.status_code}), retrying in {retry_delay}s..."
                     )
                     time.sleep(retry_delay)
-                    return self._request(method, endpoint, params, data, retry_count + 1)
+                    return self._request(
+                        method, endpoint, params, data, retry_count + 1, auth_refreshed
+                    )
 
             # Other errors
             logger.error(f"API request failed: {response.status_code}")
@@ -271,7 +284,9 @@ class TradeStationClient:
                 retry_delay = API_RETRY_DELAY * (API_RETRY_BACKOFF**retry_count)
                 logger.warning(f"Request timeout, retrying in {retry_delay}s...")
                 time.sleep(retry_delay)
-                return self._request(method, endpoint, params, data, retry_count + 1)
+                return self._request(
+                    method, endpoint, params, data, retry_count + 1, auth_refreshed
+                )
             logger.error(f"Request timed out after {API_RETRY_ATTEMPTS} attempts")
             raise
 
