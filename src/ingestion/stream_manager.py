@@ -1818,11 +1818,17 @@ class StreamManager:
                     )
 
                     assert self._underlying_accumulator is not None
-                    # Dead reader thread during the live window: recover
-                    # the underlying stream only. The options stream is
-                    # independent and may be healthy; restarting it would
-                    # force an expensive REST re-seed and gap option
-                    # ingestion for no reason.
+                    # Defensive backstop: if the underlying reader THREAD has
+                    # exited during the live window, recreate it. The reader
+                    # loop normally only exits on stop(), but a reader can now
+                    # also terminate on a non-retryable error (e.g. a 414), and
+                    # an unexpected crash in the reconnect path would leave a
+                    # dead thread too — the data-starvation staleness ladder
+                    # below cannot recover from a thread that is no longer
+                    # running, so this catches that case. Underlying-only
+                    # restart: the options stream is independent and may be
+                    # healthy; restarting it would force an expensive REST
+                    # re-seed and gap option ingestion for no reason.
                     if feed_expected and not self._underlying_accumulator.is_alive:
                         self._restart_underlying_accumulator("reader thread is DEAD")
 
