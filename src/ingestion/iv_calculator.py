@@ -305,11 +305,18 @@ class IVCalculator:
             # solves that saturated — deep-OTM / near-expiry strikes do
             # this routinely, so it is tracked, not warned per hit.
             #
-            # Early-exit when the iterate would push past a bound AND the
-            # bound has not moved the bs_price past the option_price yet:
-            # further iterations will just re-clamp every cycle. Burning
-            # all max_iterations spinning at a saturated bound is wasted
-            # work; treat the bound as the best available answer.
+            # Early-exit when the iterate would push past a bound across two
+            # consecutive iterations: further iterations will just re-clamp
+            # every cycle, so spinning out all max_iterations is wasted work.
+            # The bound is NOT a converged IV — the BS price at the bound
+            # never reached option_price (otherwise the convergence check
+            # above would have returned first) — so this is a solver FAILURE.
+            # Returning the bound (the prior behavior) persisted a fake IV
+            # pinned at IV_MIN/IV_MAX into option_chains, polluting the vol
+            # surface and the analytics vanna/charm + re-greeked gamma that
+            # read it. Return None so the column stays NULL, matching the
+            # non-convergence path below and the default-IV no-persist policy
+            # in GreeksCalculator.enrich_option_data.
             prev_at_floor = solve_hit_floor and sigma == self.min_iv
             prev_at_ceiling = solve_hit_ceiling and sigma == self.max_iv
             if sigma < self.min_iv:
@@ -318,8 +325,11 @@ class IVCalculator:
                     self._iv_clamp_floor_solves += 1
                 sigma = self.min_iv
                 if prev_at_floor:
-                    logger.debug(f"IV solver saturated at floor {self.min_iv:.4f}; returning bound")
-                    return sigma
+                    logger.debug(
+                        f"IV solver saturated at floor {self.min_iv:.4f}; "
+                        "treating as non-convergence (returning None)"
+                    )
+                    return None
             elif sigma > self.max_iv:
                 if not solve_hit_ceiling:
                     solve_hit_ceiling = True
@@ -327,9 +337,10 @@ class IVCalculator:
                 sigma = self.max_iv
                 if prev_at_ceiling:
                     logger.debug(
-                        f"IV solver saturated at ceiling {self.max_iv:.4f}; returning bound"
+                        f"IV solver saturated at ceiling {self.max_iv:.4f}; "
+                        "treating as non-convergence (returning None)"
                     )
-                    return sigma
+                    return None
 
         logger.debug(f"IV did not converge after {self.max_iterations} iterations")
         return None
