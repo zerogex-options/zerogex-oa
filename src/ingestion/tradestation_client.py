@@ -671,7 +671,23 @@ class TradeStationClient:
 
         strikes = []
         if "Strikes" in result:
-            strikes = [float(strike[0]) for strike in result["Strikes"]]
+            # Guard each row: TradeStation returns strikes as nested arrays,
+            # but a single malformed/empty entry used to raise
+            # IndexError/ValueError and abort the entire strike fetch (and
+            # with it the strike-recalc cycle). Skip bad rows and warn instead.
+            bad = 0
+            for strike in result["Strikes"]:
+                parsed = safe_float(
+                    strike[0] if isinstance(strike, (list, tuple)) and strike else strike,
+                    default=None,
+                    field_name="Strike",
+                )
+                if parsed is None or parsed <= 0:
+                    bad += 1
+                    continue
+                strikes.append(parsed)
+            if bad:
+                logger.warning("Skipped %d malformed strike rows for %s", bad, underlying)
 
         logger.info(f"Found {len(strikes)} strikes")
         return strikes
