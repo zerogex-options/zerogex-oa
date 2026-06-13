@@ -391,12 +391,33 @@ class TradeStationClient:
     def _get_or_open_stream(
         self, stream_key: str, endpoint: str, params: Optional[Dict]
     ) -> Dict[str, Any]:
+        # Fast path: a stream for this key is already open.
         with self._stream_lock:
             existing = self._stream_state.get(stream_key)
             if existing:
                 return existing
 
-            url = f"{self.base_url}/{endpoint}"
+        # Open the connection OUTSIDE the lock. The connect handshake (up to
+        # the connect timeout) plus a possible 401 refresh (a second network
+        # round-trip) can take seconds; holding _stream_lock across it
+        # serialized every stream open, so a thread opening one symbol chunk
+        # blocked all threads opening other chunks. Distinct keys must not
+        # contend.
+        url = f"{self.base_url}/{endpoint}"
+        headers = self.auth.get_headers()
+        self._record_api_https_session_open()
+        response = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            stream=True,
+            timeout=(API_REQUEST_TIMEOUT, STREAM_READ_TIMEOUT_SECONDS),
+        )
+
+        if response.status_code == 401:
+            response.close()
+            failed_token = headers.get("Authorization", "").removeprefix("Bearer ")
+            self.auth.force_refresh_access_token(failed_token=failed_token)
             headers = self.auth.get_headers()
             self._record_api_https_session_open()
             response = requests.get(
@@ -407,29 +428,27 @@ class TradeStationClient:
                 timeout=(API_REQUEST_TIMEOUT, STREAM_READ_TIMEOUT_SECONDS),
             )
 
-            if response.status_code == 401:
-                response.close()
-                failed_token = headers.get("Authorization", "").removeprefix("Bearer ")
-                self.auth.force_refresh_access_token(failed_token=failed_token)
-                headers = self.auth.get_headers()
-                self._record_api_https_session_open()
-                response = requests.get(
-                    url,
-                    headers=headers,
-                    params=params,
-                    stream=True,
-                    timeout=(API_REQUEST_TIMEOUT, STREAM_READ_TIMEOUT_SECONDS),
-                )
+        if response.status_code not in [200, 201]:
+            logger.error(f"Stream request failed: {response.status_code} [{endpoint}]")
+            logger.error(f"Response: {response.text}")
+            response.raise_for_status()
 
-            if response.status_code not in [200, 201]:
-                logger.error(f"Stream request failed: {response.status_code} [{endpoint}]")
-                logger.error(f"Response: {response.text}")
-                response.raise_for_status()
+        state = {
+            "response": response,
+            "iterator": response.iter_lines(decode_unicode=True),
+        }
 
-            state = {
-                "response": response,
-                "iterator": response.iter_lines(decode_unicode=True),
-            }
+        # Publish under the lock with a double-check: if another thread raced
+        # us and already opened this exact key, discard ours (close it so the
+        # socket isn't leaked) and use theirs.
+        with self._stream_lock:
+            existing = self._stream_state.get(stream_key)
+            if existing:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                return existing
             self._stream_state[stream_key] = state
             return state
 
