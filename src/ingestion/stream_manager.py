@@ -954,7 +954,6 @@ class UnderlyingBarAccumulator:
             return
 
         minute_bucket = timestamp.replace(second=0, microsecond=0)
-        prior = self._bar_state.get(minute_bucket, {})
 
         raw_up = bar.get("UpVolume")
         raw_down = bar.get("DownVolume")
@@ -964,38 +963,46 @@ class UnderlyingBarAccumulator:
         down_volume = safe_int(raw_down, field_name="DownVolume")
         total_volume = safe_int(raw_total, field_name="TotalVolume")
 
-        # Carry forward omitted volume fields from the same minute bucket.
-        if raw_up in (None, "", "N/A"):
-            up_volume = prior.get("up_volume", up_volume)
-        if raw_down in (None, "", "N/A"):
-            down_volume = prior.get("down_volume", down_volume)
-        if raw_total in (None, "", "N/A"):
-            total_volume = prior.get("volume", total_volume)
-
-        bar_data = {
-            "symbol": self._db_symbol,
-            "timestamp": timestamp,
-            "open": safe_float(bar.get("Open"), field_name="Open"),
-            "high": safe_float(bar.get("High"), field_name="High"),
-            "low": safe_float(bar.get("Low"), field_name="Low"),
-            "close": safe_float(bar.get("Close"), field_name="Close"),
-            "up_volume": up_volume,
-            "down_volume": down_volume,
-            "volume": total_volume,
-        }
-
-        # Update carry-forward state for this minute.
-        self._bar_state[minute_bucket] = {
-            "up_volume": up_volume,
-            "down_volume": down_volume,
-            "volume": total_volume,
-        }
-        # Evict stale minute buckets.
-        stale = [k for k in self._bar_state if k < minute_bucket]
-        for k in stale:
-            del self._bar_state[k]
-
+        # The _bar_state carry-forward read-modify-write, its eviction, and
+        # the _bar publish must be atomic relative to drain(): hold the lock
+        # across all of it so a concurrent drain() never observes a _bar whose
+        # volume carry-forward was computed against a _bar_state another caller
+        # is mid-mutating (the eviction in particular). The work under the lock
+        # is pure dict arithmetic — no network — so the critical section is
+        # tiny.
         with self._lock:
+            prior = self._bar_state.get(minute_bucket, {})
+            # Carry forward omitted volume fields from the same minute bucket.
+            if raw_up in (None, "", "N/A"):
+                up_volume = prior.get("up_volume", up_volume)
+            if raw_down in (None, "", "N/A"):
+                down_volume = prior.get("down_volume", down_volume)
+            if raw_total in (None, "", "N/A"):
+                total_volume = prior.get("volume", total_volume)
+
+            bar_data = {
+                "symbol": self._db_symbol,
+                "timestamp": timestamp,
+                "open": safe_float(bar.get("Open"), field_name="Open"),
+                "high": safe_float(bar.get("High"), field_name="High"),
+                "low": safe_float(bar.get("Low"), field_name="Low"),
+                "close": safe_float(bar.get("Close"), field_name="Close"),
+                "up_volume": up_volume,
+                "down_volume": down_volume,
+                "volume": total_volume,
+            }
+
+            # Update carry-forward state for this minute.
+            self._bar_state[minute_bucket] = {
+                "up_volume": up_volume,
+                "down_volume": down_volume,
+                "volume": total_volume,
+            }
+            # Evict stale minute buckets.
+            stale = [k for k in self._bar_state if k < minute_bucket]
+            for k in stale:
+                del self._bar_state[k]
+
             self._bar = bar_data
             self._dirty = True
             self._updates_received += 1
