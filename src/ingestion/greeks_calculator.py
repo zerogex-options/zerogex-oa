@@ -16,7 +16,7 @@ from typing import Dict, Any, Optional
 
 from src.market_calendar import ET, calculate_time_to_expiration, expiration_close_time_et
 from src.utils import get_logger
-from src.config import RISK_FREE_RATE, IMPLIED_VOLATILITY_DEFAULT
+from src.config import RISK_FREE_RATE, DIVIDEND_YIELD, IMPLIED_VOLATILITY_DEFAULT
 from src.ingestion.iv_calculator import IVCalculator
 from src.config import IV_CALCULATION_ENABLED
 
@@ -35,7 +35,10 @@ class GreeksCalculator:
     """
 
     def __init__(
-        self, risk_free_rate: float = RISK_FREE_RATE, default_iv: float = IMPLIED_VOLATILITY_DEFAULT
+        self,
+        risk_free_rate: float = RISK_FREE_RATE,
+        default_iv: float = IMPLIED_VOLATILITY_DEFAULT,
+        dividend_yield: float = DIVIDEND_YIELD,
     ):
         """
         Initialize Greeks calculator
@@ -43,12 +46,18 @@ class GreeksCalculator:
         Args:
             risk_free_rate: Annual risk-free rate (default from config)
             default_iv: Default implied volatility if not available (default from config)
+            dividend_yield: Continuous dividend yield q (default from config; 0.0
+                reproduces the prior dividend-free model exactly)
         """
         self.risk_free_rate = risk_free_rate
         self.default_iv = default_iv
+        self.dividend_yield = dividend_yield
 
         logger.info(
-            f"Initialized GreeksCalculator: r={risk_free_rate:.4f}, default_iv={default_iv:.4f}"
+            "Initialized GreeksCalculator: r=%.4f, q=%.4f, default_iv=%.4f",
+            risk_free_rate,
+            dividend_yield,
+            default_iv,
         )
 
         # Add IV calculator if enabled
@@ -99,9 +108,11 @@ class GreeksCalculator:
             return "16:00:00"
         return expiration_close_time_et(underlying_symbol, expiration)
 
-    def _calculate_d1_d2(self, S: float, K: float, T: float, r: float, sigma: float) -> tuple:
+    def _calculate_d1_d2(
+        self, S: float, K: float, T: float, r: float, sigma: float, q: float = 0.0
+    ) -> tuple:
         """
-        Calculate d1 and d2 for Black-Scholes formula
+        Calculate d1 and d2 for the Black-Scholes-Merton formula
 
         Args:
             S: Underlying price
@@ -109,6 +120,7 @@ class GreeksCalculator:
             T: Time to expiration (years)
             r: Risk-free rate
             sigma: Implied volatility
+            q: Continuous dividend yield (0.0 = dividend-free model)
 
         Returns:
             Tuple of (d1, d2)
@@ -117,13 +129,20 @@ class GreeksCalculator:
         if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
             return (0.0, 0.0)
 
-        d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
         d2 = d1 - sigma * np.sqrt(T)
 
         return (d1, d2)
 
     def calculate_delta(
-        self, S: float, K: float, T: float, r: float, sigma: float, option_type: str
+        self,
+        S: float,
+        K: float,
+        T: float,
+        r: float,
+        sigma: float,
+        option_type: str,
+        q: float = 0.0,
     ) -> float:
         """
         Calculate option delta
@@ -142,16 +161,19 @@ class GreeksCalculator:
         Returns:
             Delta value
         """
-        d1, _ = self._calculate_d1_d2(S, K, T, r, sigma)
+        d1, _ = self._calculate_d1_d2(S, K, T, r, sigma, q)
+        discount = np.exp(-q * T)
 
         if option_type == "C":
-            delta = stats.norm.cdf(d1)
+            delta = discount * stats.norm.cdf(d1)
         else:  # Put
-            delta = stats.norm.cdf(d1) - 1
+            delta = discount * (stats.norm.cdf(d1) - 1)
 
         return delta  # type: ignore[no-any-return]
 
-    def calculate_gamma(self, S: float, K: float, T: float, r: float, sigma: float) -> float:
+    def calculate_gamma(
+        self, S: float, K: float, T: float, r: float, sigma: float, q: float = 0.0
+    ) -> float:
         """
         Calculate option gamma
 
@@ -171,14 +193,21 @@ class GreeksCalculator:
         if S <= 0 or sigma <= 0 or T <= 0:
             return 0.0
 
-        d1, _ = self._calculate_d1_d2(S, K, T, r, sigma)
+        d1, _ = self._calculate_d1_d2(S, K, T, r, sigma, q)
 
-        gamma = stats.norm.pdf(d1) / (S * sigma * np.sqrt(T))
+        gamma = np.exp(-q * T) * stats.norm.pdf(d1) / (S * sigma * np.sqrt(T))
 
         return gamma  # type: ignore[no-any-return]
 
     def calculate_theta(
-        self, S: float, K: float, T: float, r: float, sigma: float, option_type: str
+        self,
+        S: float,
+        K: float,
+        T: float,
+        r: float,
+        sigma: float,
+        option_type: str,
+        q: float = 0.0,
     ) -> float:
         """
         Calculate option theta (per day)
@@ -201,23 +230,31 @@ class GreeksCalculator:
         if S <= 0 or K <= 0 or sigma <= 0 or T <= 0:
             return 0.0
 
-        d1, d2 = self._calculate_d1_d2(S, K, T, r, sigma)
+        d1, d2 = self._calculate_d1_d2(S, K, T, r, sigma, q)
 
+        disc_q = np.exp(-q * T)
+        disc_r = np.exp(-r * T)
+        # BSM theta with continuous dividend yield q. The decay term carries
+        # the e^{-qT} factor; the q*S*e^{-qT}*N(±d1) term is the dividend
+        # carry. With q=0 this reduces to the prior dividend-free form.
+        decay = -S * disc_q * stats.norm.pdf(d1) * sigma / (2 * np.sqrt(T))
         if option_type == "C":
-            theta = -S * stats.norm.pdf(d1) * sigma / (2 * np.sqrt(T)) - r * K * np.exp(
-                -r * T
-            ) * stats.norm.cdf(d2)
+            theta = (
+                decay - r * K * disc_r * stats.norm.cdf(d2) + q * S * disc_q * stats.norm.cdf(d1)
+            )
         else:  # Put
-            theta = -S * stats.norm.pdf(d1) * sigma / (2 * np.sqrt(T)) + r * K * np.exp(
-                -r * T
-            ) * stats.norm.cdf(-d2)
+            theta = (
+                decay + r * K * disc_r * stats.norm.cdf(-d2) - q * S * disc_q * stats.norm.cdf(-d1)
+            )
 
         # Convert from per year to per day
         theta_per_day = theta / 365.0
 
         return theta_per_day  # type: ignore[no-any-return]
 
-    def calculate_vega(self, S: float, K: float, T: float, r: float, sigma: float) -> float:
+    def calculate_vega(
+        self, S: float, K: float, T: float, r: float, sigma: float, q: float = 0.0
+    ) -> float:
         """
         Calculate option vega
 
@@ -238,10 +275,10 @@ class GreeksCalculator:
         if S <= 0 or sigma <= 0 or T <= 0:
             return 0.0
 
-        d1, _ = self._calculate_d1_d2(S, K, T, r, sigma)
+        d1, _ = self._calculate_d1_d2(S, K, T, r, sigma, q)
 
         # Vega per 1% change in volatility
-        vega = S * stats.norm.pdf(d1) * np.sqrt(T) / 100.0
+        vega = S * np.exp(-q * T) * stats.norm.pdf(d1) * np.sqrt(T) / 100.0
 
         return vega  # type: ignore[no-any-return]
 
@@ -297,18 +334,19 @@ class GreeksCalculator:
             return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
 
         # Calculate Greeks
+        q = self.dividend_yield
         try:
             delta = self.calculate_delta(
-                underlying_price, strike, T, risk_free_rate, implied_volatility, option_type
+                underlying_price, strike, T, risk_free_rate, implied_volatility, option_type, q
             )
             gamma = self.calculate_gamma(
-                underlying_price, strike, T, risk_free_rate, implied_volatility
+                underlying_price, strike, T, risk_free_rate, implied_volatility, q
             )
             theta = self.calculate_theta(
-                underlying_price, strike, T, risk_free_rate, implied_volatility, option_type
+                underlying_price, strike, T, risk_free_rate, implied_volatility, option_type, q
             )
             vega = self.calculate_vega(
-                underlying_price, strike, T, risk_free_rate, implied_volatility
+                underlying_price, strike, T, risk_free_rate, implied_volatility, q
             )
 
             greeks = {
@@ -341,7 +379,7 @@ class GreeksCalculator:
         if self.iv_calculator:
             try:
                 option_data = self.iv_calculator.enrich_option_data_with_iv(
-                    option_data, underlying_price, self.risk_free_rate
+                    option_data, underlying_price, self.risk_free_rate, self.dividend_yield
                 )
             except Exception as e:
                 logger.error(f"Error in IV calculation: {e}", exc_info=True)

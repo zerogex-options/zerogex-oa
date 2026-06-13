@@ -27,6 +27,8 @@ from src.config import (
     IV_MAX,
     IV_CLAMP_REPORT_INTERVAL_SECONDS,
     IV_CLAMP_WARN_FRACTION,
+    RISK_FREE_RATE,
+    DIVIDEND_YIELD,
 )
 
 logger = get_logger(__name__)
@@ -146,10 +148,10 @@ class IVCalculator:
         return calculate_time_to_expiration(current_date, expiration_date)
 
     def _black_scholes_price(
-        self, S: float, K: float, T: float, r: float, sigma: float, option_type: str
+        self, S: float, K: float, T: float, r: float, sigma: float, option_type: str, q: float = 0.0
     ) -> float:
         """
-        Calculate Black-Scholes option price
+        Calculate Black-Scholes-Merton option price
 
         Args:
             S: Underlying price
@@ -158,6 +160,7 @@ class IVCalculator:
             r: Risk-free rate
             sigma: Volatility
             option_type: 'C' for call, 'P' for put
+            q: Continuous dividend yield (0.0 = dividend-free model)
 
         Returns:
             Option price
@@ -165,17 +168,19 @@ class IVCalculator:
         if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
             return 0.0
 
-        d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
         d2 = d1 - sigma * np.sqrt(T)
+        disc_q = np.exp(-q * T)
+        disc_r = np.exp(-r * T)
 
         if option_type == "C":
-            price = S * stats.norm.cdf(d1) - K * np.exp(-r * T) * stats.norm.cdf(d2)
+            price = S * disc_q * stats.norm.cdf(d1) - K * disc_r * stats.norm.cdf(d2)
         else:  # Put
-            price = K * np.exp(-r * T) * stats.norm.cdf(-d2) - S * stats.norm.cdf(-d1)
+            price = K * disc_r * stats.norm.cdf(-d2) - S * disc_q * stats.norm.cdf(-d1)
 
         return price  # type: ignore[no-any-return]
 
-    def _vega(self, S: float, K: float, T: float, r: float, sigma: float) -> float:
+    def _vega(self, S: float, K: float, T: float, r: float, sigma: float, q: float = 0.0) -> float:
         """
         Calculate vega for Newton-Raphson iteration
         (Derivative of price with respect to volatility)
@@ -183,8 +188,8 @@ class IVCalculator:
         if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
             return 0.0
 
-        d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-        vega = S * stats.norm.pdf(d1) * np.sqrt(T)
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+        vega = S * np.exp(-q * T) * stats.norm.pdf(d1) * np.sqrt(T)
 
         return vega  # type: ignore[no-any-return]
 
@@ -196,8 +201,9 @@ class IVCalculator:
         expiration: date,
         option_type: str,
         current_time: datetime,
-        risk_free_rate: float = 0.05,
+        risk_free_rate: float = RISK_FREE_RATE,
         initial_guess: float = 0.25,
+        dividend_yield: float = DIVIDEND_YIELD,
     ) -> Optional[float]:
         """
         Calculate implied volatility using Newton-Raphson method
@@ -238,10 +244,11 @@ class IVCalculator:
         # so the old undiscounted gate wrongly rejected valid quotes and
         # forced them onto the hardcoded default IV.
         discounted_strike = strike * math.exp(-risk_free_rate * T)
+        discounted_spot = underlying_price * math.exp(-dividend_yield * T)
         if option_type == "C":
-            intrinsic = max(0, underlying_price - discounted_strike)
+            intrinsic = max(0, discounted_spot - discounted_strike)
         else:
-            intrinsic = max(0, discounted_strike - underlying_price)
+            intrinsic = max(0, discounted_strike - discounted_spot)
 
         if option_price < intrinsic * 0.99:  # Allow small discrepancy
             logger.debug(f"Option price ({option_price}) < intrinsic value ({intrinsic})")
@@ -261,7 +268,7 @@ class IVCalculator:
         for iteration in range(self.max_iterations):
             # Calculate BS price with current sigma
             bs_price = self._black_scholes_price(
-                underlying_price, strike, T, risk_free_rate, sigma, option_type
+                underlying_price, strike, T, risk_free_rate, sigma, option_type, dividend_yield
             )
 
             # Calculate price difference
@@ -276,7 +283,7 @@ class IVCalculator:
                 return sigma
 
             # Calculate vega (derivative)
-            vega = self._vega(underlying_price, strike, T, risk_free_rate, sigma)
+            vega = self._vega(underlying_price, strike, T, risk_free_rate, sigma, dividend_yield)
 
             if not math.isfinite(vega) or abs(vega) < 1e-10:
                 logger.debug("Vega too small or non-finite, cannot continue iteration")
@@ -354,7 +361,8 @@ class IVCalculator:
         expiration: date,
         option_type: str,
         current_time: datetime,
-        risk_free_rate: float = 0.05,
+        risk_free_rate: float = RISK_FREE_RATE,
+        dividend_yield: float = DIVIDEND_YIELD,
     ) -> Optional[float]:
         """
         Calculate IV using mid-price between bid and ask
@@ -392,10 +400,15 @@ class IVCalculator:
             option_type,
             current_time,
             risk_free_rate,
+            dividend_yield=dividend_yield,
         )
 
     def enrich_option_data_with_iv(
-        self, option_data: dict, underlying_price: float, risk_free_rate: float = 0.05
+        self,
+        option_data: dict,
+        underlying_price: float,
+        risk_free_rate: float = RISK_FREE_RATE,
+        dividend_yield: float = DIVIDEND_YIELD,
     ) -> dict:
         """
         Add calculated IV to option data dictionary
@@ -456,6 +469,7 @@ class IVCalculator:
                 option_type,  # type: ignore[arg-type]
                 timestamp,  # type: ignore[arg-type]
                 risk_free_rate,
+                dividend_yield=dividend_yield,
             )
 
         # Priority 2: Use last price
@@ -468,6 +482,7 @@ class IVCalculator:
                 option_type,  # type: ignore[arg-type]
                 timestamp,  # type: ignore[arg-type]
                 risk_free_rate,
+                dividend_yield=dividend_yield,
             )
 
         if calculated_iv:

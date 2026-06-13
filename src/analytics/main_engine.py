@@ -33,6 +33,7 @@ from src.config import (
     _getenv_float,
     _getenv_int,
     RISK_FREE_RATE,
+    DIVIDEND_YIELD,
     ANALYTICS_FLOW_CACHE_REFRESH_ENABLED,
     GAMMA_PROFILE_SPAN_PCT,
     GAMMA_PROFILE_SPAN_LADDER,
@@ -97,6 +98,9 @@ class AnalyticsEngine:
         )  # canonical alias for DB queries (e.g. "SPX")
         self.calculation_interval = calculation_interval
         self.risk_free_rate = risk_free_rate
+        # Continuous dividend yield q for the BSM gamma/vanna/charm kernels.
+        # 0.0 (config default) reproduces the prior dividend-free model.
+        self.dividend_yield = DIVIDEND_YIELD
         self.running = False
         # Accept fractional hours (e.g. 0.5 = 30 min, 0.25 = 15 min) so an
         # operator on a cold-storage buffer pool can dial the snapshot
@@ -1026,62 +1030,64 @@ class AnalyticsEngine:
             current_date, expiration_date, market_close_time=close_t
         )
 
-    def _calculate_vanna(self, S: float, K: float, T: float, r: float, sigma: float) -> float:
+    def _calculate_vanna(
+        self, S: float, K: float, T: float, r: float, sigma: float, q: float = 0.0
+    ) -> float:
         """
         Calculate Vanna (∂²V/∂S∂σ)
 
-        Vanna measures how delta changes with volatility.
+        Vanna measures how delta changes with volatility.  ``q`` is the
+        continuous dividend yield (0.0 = dividend-free model).
         """
         if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
             return 0.0
 
-        d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
         d2 = d1 - sigma * np.sqrt(T)
 
-        vanna = -stats.norm.pdf(d1) * d2 / sigma
+        vanna = -np.exp(-q * T) * stats.norm.pdf(d1) * d2 / sigma
 
         return vanna  # type: ignore[no-any-return]
 
-    def _calculate_charm(self, S: float, K: float, T: float, r: float, sigma: float) -> float:
+    def _calculate_charm(
+        self, S: float, K: float, T: float, r: float, sigma: float, q: float = 0.0
+    ) -> float:
         """
-        Calculate Charm (∂²V/∂S∂T)
+        Calculate Charm (∂²V/∂S∂T) — call charm; ``q`` is the dividend yield.
 
-        Charm measures how delta changes with time (delta decay).
-
-        No ``option_type`` parameter: with q=0 (the dividend-free model used
-        everywhere else in this codebase) put charm equals call charm by
-        put-call parity, so charm is option-type independent.  The F1 fix
-        pass kept an unused ``option_type`` arg for caller compatibility;
-        it's now removed since this is the only call site.
+        At q=0 call charm equals put charm by put-call parity
+        (Δ_put = Δ_call − 1, so ∂Δ/∂t is option-type independent), which is
+        why this takes no ``option_type``.  At q>0 the dividend carry term
+        ``q·e^{-qT}·N(d1)`` enters and the two diverge slightly; we report
+        the call form, consistent with the dealer-call-dominated GEX book.
         """
         if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
             return 0.0
 
-        d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-        d2 = d1 - sigma * np.sqrt(T)
+        sqrt_T = np.sqrt(T)
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
+        d2 = d1 - sigma * sqrt_T
 
-        # Call charm: -N'(d1) * [2rT - d2*sigma*sqrt(T)] / [2T*sigma*sqrt(T)]
-        # With q=0 (no dividend yield, the model used everywhere else in
-        # this codebase), put charm equals call charm:
-        #   Δ_put = Δ_call − 1 (put-call parity), so ∂Δ_put/∂t = ∂Δ_call/∂t.
-        # The previous version added r·e^(−rT) for puts; that's a theta
-        # adjustment, not a charm one, and is incorrect at q=0.
-        charm = (
-            -stats.norm.pdf(d1)
-            * (2 * r * T - d2 * sigma * np.sqrt(T))
-            / (2 * T * sigma * np.sqrt(T))
-        )
+        # BSM call charm with continuous dividend yield q (per year):
+        #   q·e^{-qT}·N(d1) − e^{-qT}·N'(d1)·[2(r−q)T − d2·σ√T] / [2T·σ√T]
+        # With q=0 the carry term vanishes and this reduces to the prior
+        # dividend-free form −N'(d1)·[2rT − d2·σ√T]/[2T·σ√T].
+        disc_q = np.exp(-q * T)
+        charm = q * disc_q * stats.norm.cdf(d1) - disc_q * stats.norm.pdf(d1) * (
+            2 * (r - q) * T - d2 * sigma * sqrt_T
+        ) / (2 * T * sigma * sqrt_T)
 
         # Convert to per day
         charm_per_day = charm / 365.0
 
         return charm_per_day  # type: ignore[no-any-return]
 
-    def _calculate_bs_gamma(self, S, K: float, T: float, r: float, sigma: float):
-        """Black-Scholes gamma (q=0; identical for calls and puts).
+    def _calculate_bs_gamma(self, S, K: float, T: float, r: float, sigma: float, q: float = 0.0):
+        """Black-Scholes-Merton gamma (identical for calls and puts).
 
-        ``γ = N'(d1) / (S·σ·√T)`` using the same dividend-free model and
-        ``d1`` form as :meth:`_calculate_vanna` / :meth:`_calculate_charm`.
+        ``γ = e^{-qT}·N'(d1) / (S·σ·√T)`` using the same ``d1`` form as
+        :meth:`_calculate_vanna` / :meth:`_calculate_charm`.  ``q`` is the
+        continuous dividend yield (0.0 = dividend-free model).
 
         Accepts ``S`` as a scalar or a NumPy array of underlying prices —
         the array form so the spot-shift gamma profile can re-price a
@@ -1097,13 +1103,13 @@ class AnalyticsEngine:
         S_arr = np.asarray(S, dtype=float)
         sqrt_T = np.sqrt(T)
         with np.errstate(divide="ignore", invalid="ignore"):
-            d1 = (np.log(S_arr / K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
+            d1 = (np.log(S_arr / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
             # Standard-normal pdf inline: bit-identical to scipy.stats.norm.pdf
             # (verified Δ==0) but ~15× faster, and this is the gamma hot path —
             # re-priced for every contract across the whole spot-shift grid in
             # _gamma_exposure_profile (the live gamma-flip primitive).
             pdf_d1 = np.exp(-0.5 * d1 * d1) / _SQRT_2PI
-            gamma = pdf_d1 / (S_arr * sigma * sqrt_T)
+            gamma = np.exp(-q * T) * pdf_d1 / (S_arr * sigma * sqrt_T)
         gamma = np.where(S_arr > 0.0, gamma, 0.0)
         return gamma if is_array else float(gamma)
 
@@ -1226,7 +1232,7 @@ class AnalyticsEngine:
                 iv = opt.get("implied_volatility")
                 if iv is not None and iv > 0:
                     return self._calculate_bs_gamma(
-                        underlying_price, strike, T, self.risk_free_rate, iv
+                        underlying_price, strike, T, self.risk_free_rate, iv, self.dividend_yield
                     )
             return opt["gamma"]
 
@@ -1286,7 +1292,9 @@ class AnalyticsEngine:
                 if iv is None or iv <= 0:
                     continue
 
-                vanna = self._calculate_vanna(underlying_price, strike, T, self.risk_free_rate, iv)
+                vanna = self._calculate_vanna(
+                    underlying_price, strike, T, self.risk_free_rate, iv, self.dividend_yield
+                )
 
                 charm = self._calculate_charm(
                     underlying_price,
@@ -1294,6 +1302,7 @@ class AnalyticsEngine:
                     T,
                     self.risk_free_rate,
                     iv,
+                    self.dividend_yield,
                 )
 
                 share_notional = opt["open_interest"] * 100 * underlying_price
@@ -1544,7 +1553,7 @@ class AnalyticsEngine:
                 tte_cache[expiration] = T
             if T <= 0:
                 continue
-            gamma = self._calculate_bs_gamma(grid, K, T, r, sigma)
+            gamma = self._calculate_bs_gamma(grid, K, T, r, sigma, self.dividend_yield)
             # Industry-standard dollar GEX per 1% move at the hypothetical
             # spot: γ(S) × OI × 100 × S² × 0.01. Dealer sign: short calls
             # (+), long puts (−) — matches _calculate_gex_by_strike.
