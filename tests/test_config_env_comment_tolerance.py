@@ -58,6 +58,42 @@ def test_boolean_flags_tolerate_inline_comments(monkeypatch):
     assert c.OPTION_REST_SEED_ON_RECALC is True
 
 
+def test_safe_string_vars_strip_inline_comments(monkeypatch):
+    # Symbols / templates / log level / environment are read via _getenv_str,
+    # which strips an inline comment that would otherwise become part of the
+    # string (and break enum/choices checks or symbol parsing).
+    c = _reload_with(
+        {
+            "LOG_LEVEL": "DEBUG   # verbose",
+            "SESSION_TEMPLATE": "USEQ24Hour  # 24h",
+            "ENVIRONMENT": "staging  # env",
+            "INGEST_UNDERLYINGS": "SPY,QQQ  # majors",
+            "ANALYTICS_UNDERLYING": "SPX  # index",
+        },
+        monkeypatch,
+    )
+    assert c.LOG_LEVEL == "DEBUG"
+    assert c.SESSION_TEMPLATE == "USEQ24Hour"
+    assert c.ENVIRONMENT == "staging"
+    assert c.INGEST_UNDERLYINGS == "SPY,QQQ"
+    assert c.ANALYTICS_UNDERLYING == "SPX"
+
+
+def test_api_numeric_vars_tolerate_inline_comments(monkeypatch):
+    # API-layer module-level reads (ratelimit/security) now use the helpers
+    # too. Reload the actual modules with commented env to exercise them.
+    monkeypatch.setenv("END_USER_RATE_LIMIT_REQUESTS", "600  # rl")
+    monkeypatch.setenv("END_USER_RATE_LIMIT_WINDOW_SECONDS", "60  # window")
+    monkeypatch.setenv("API_KEY_CACHE_TTL_SECONDS", "60  # ttl")
+    import src.api.ratelimit as rl
+    import src.api.security as sec
+
+    importlib.reload(rl)
+    importlib.reload(sec)
+    assert rl._LIMIT == 600
+    assert rl._WINDOW == 60
+
+
 def test_auth_refresh_fields_tolerate_inline_comments(monkeypatch):
     monkeypatch.setenv("API_REQUEST_TIMEOUT", "30          # seconds")
     monkeypatch.setenv("TS_REFRESH_MAX_ATTEMPTS", "3  # retries")

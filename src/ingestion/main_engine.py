@@ -42,6 +42,7 @@ from src.validation import (
 )
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.config import (
+    _getenv_str,
     _getenv_int,
     _getenv_bool,
     _getenv_float,
@@ -1967,7 +1968,7 @@ def main():
     )
     parser.add_argument(
         "--underlyings",
-        default=os.getenv("INGEST_UNDERLYINGS", os.getenv("INGEST_UNDERLYING", "SPY")),
+        default=_getenv_str("INGEST_UNDERLYINGS", _getenv_str("INGEST_UNDERLYING", "SPY")),
         help="Comma-separated underlying symbols or aliases (default: SPY)",
     )
     parser.add_argument(
@@ -1990,7 +1991,7 @@ def main():
     )
     parser.add_argument(
         "--session-template",
-        default=os.getenv("SESSION_TEMPLATE", "Default"),
+        default=_getenv_str("SESSION_TEMPLATE", "Default"),
         choices=["Default", "USEQPre", "USEQ24Hour"],
         help="Session template (default: Default)",
     )

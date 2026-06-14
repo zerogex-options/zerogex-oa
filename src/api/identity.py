@@ -32,6 +32,7 @@ import hmac
 import json
 import logging
 import os
+from src.config import _getenv_int
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -43,8 +44,8 @@ logger = logging.getLogger(__name__)
 # Read at import time so a misconfigured secret can't be hot-swapped under
 # a running worker and so the disabled-path is a cheap identity check.
 _SECRET: Optional[str] = (os.getenv("END_USER_TOKEN_SECRET") or "").strip() or None
-_LEEWAY: int = int(os.getenv("END_USER_TOKEN_LEEWAY_SECONDS", "60") or "60")
-_MAX_AGE: int = int(os.getenv("END_USER_TOKEN_MAX_AGE_SECONDS", "900") or "900")
+_LEEWAY: int = _getenv_int("END_USER_TOKEN_LEEWAY_SECONDS", 60)
+_MAX_AGE: int = _getenv_int("END_USER_TOKEN_MAX_AGE_SECONDS", 900)
 _HEADER = "X-End-User-Token"
 _MAX_SUB_LEN = 256
 

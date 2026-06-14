@@ -209,12 +209,26 @@ def _getenv_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _getenv_str(name: str, default: str) -> str:
+    """Fetch a string env var, stripping an inline ``# comment`` tail.
+
+    Only for values that can never legitimately contain ``#`` (symbols,
+    session templates, log level, environment name). Do NOT use for secrets,
+    DSNs, CORS lists, or tokens, where ``#`` may be meaningful. Empty after
+    stripping falls back to ``default``.
+    """
+    cleaned = _strip_env_value(os.getenv(name))
+    if cleaned is None or cleaned == "":
+        return default
+    return cleaned
+
+
 # =============================================================================
 # API Configuration
 # =============================================================================
 
 # Logging
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = _getenv_str("LOG_LEVEL", "INFO").upper()
 
 # CORS
 # Comma-separated list consumed by src.api.main._parse_cors_origins().
@@ -222,7 +236,7 @@ CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS")
 
 # Deployment environment name.  Enables prod-only guardrails
 # (e.g. refuse to start with CORS "*" when ENVIRONMENT=production).
-ENVIRONMENT = os.getenv("ENVIRONMENT", "development").strip().lower()
+ENVIRONMENT = _getenv_str("ENVIRONMENT", "development").lower()
 
 # Rate Limiting & Delays
 API_REQUEST_TIMEOUT = _getenv_int("API_REQUEST_TIMEOUT", 30, min=1, max=600)  # seconds
@@ -571,7 +585,7 @@ STRIKE_CLEANUP_INTERVAL = _getenv_int("STRIKE_CLEANUP_INTERVAL", 100)  # iterati
 
 # Session template for market data
 # Options: "Default" (9:30-16:00), "USEQPre" (4:00-9:30), "USEQ24Hour" (4:00-20:00)
-SESSION_TEMPLATE = os.getenv("SESSION_TEMPLATE", "Default")
+SESSION_TEMPLATE = _getenv_str("SESSION_TEMPLATE", "Default")
 TS_STREAM_READ_TIMEOUT = _getenv_int("TS_STREAM_READ_TIMEOUT", 300)
 TS_STREAM_REUSE_CONNECTIONS = _getenv_bool("TS_STREAM_REUSE_CONNECTIONS", False)
 
@@ -1534,13 +1548,13 @@ SIGNALS_OPTION_QUOTE_MAX_AGE_SECONDS = _getenv_int(
 # Ingestion/Analytics CLI Defaults
 # =============================================================================
 
-INGEST_UNDERLYING = os.getenv("INGEST_UNDERLYING", "SPY")
-INGEST_UNDERLYINGS = os.getenv("INGEST_UNDERLYINGS", "")
+INGEST_UNDERLYING = _getenv_str("INGEST_UNDERLYING", "SPY")
+INGEST_UNDERLYINGS = _getenv_str("INGEST_UNDERLYINGS", "")
 INGEST_EXPIRATIONS = _getenv_int("INGEST_EXPIRATIONS", 3)
 INGEST_STRIKE_COUNT_MAX = _getenv_int("INGEST_STRIKE_COUNT_MAX", 40)
 INGEST_STRIKE_PCT_RANGE = _getenv_float("INGEST_STRIKE_PCT_RANGE", 3.0)
-ANALYTICS_UNDERLYING = os.getenv("ANALYTICS_UNDERLYING", "SPY")
-ANALYTICS_UNDERLYINGS = os.getenv("ANALYTICS_UNDERLYINGS", "")
+ANALYTICS_UNDERLYING = _getenv_str("ANALYTICS_UNDERLYING", "SPY")
+ANALYTICS_UNDERLYINGS = _getenv_str("ANALYTICS_UNDERLYINGS", "")
 ANALYTICS_INTERVAL = _getenv_int("ANALYTICS_INTERVAL", 60)
 ANALYTICS_SNAPSHOT_LOOKBACK_MINUTES = max(1, _getenv_int("ANALYTICS_SNAPSHOT_LOOKBACK_MINUTES", 5))
 ANALYTICS_SNAPSHOT_FRESHNESS_SECONDS = max(

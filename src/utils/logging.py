@@ -118,7 +118,7 @@ def _configure_logging() -> int:
     if _logging_configured:
         return logging.getLogger().level
 
-    log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
+    log_level_str = os.getenv("LOG_LEVEL", "INFO").split("#")[0].strip().upper()
     if log_level_str in VALID_LEVELS:
         log_level = VALID_LEVELS[log_level_str]
     else:

@@ -21,6 +21,7 @@ from src.validation import safe_float, safe_int
 from src.symbols import parse_underlyings, resolve_option_root
 from src.market_calendar import NYSE_HOLIDAYS
 from src.config import (
+    _getenv_str,
     _getenv_int,
     _getenv_bool,
     API_REQUEST_TIMEOUT,
@@ -991,7 +992,7 @@ Examples:
     query = args.query if args.query else os.getenv("TS_QUERY", "Apple")
     expiration = args.expiration if args.expiration else None
     option_symbol_arg = args.option_symbol if args.option_symbol else None
-    debug = args.debug or os.getenv("LOG_LEVEL", "").upper() == "DEBUG"
+    debug = args.debug or _getenv_str("LOG_LEVEL", "").upper() == "DEBUG"
 
     # Set logging level
     if debug:

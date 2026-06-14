@@ -20,7 +20,7 @@ from src.analytics.walls import compute_call_put_walls
 from src.api.queries.signals import SignalsQueriesMixin
 from src.database.password_providers import resolve_db_credentials
 from src.api.queries.technicals import TechnicalsQueriesMixin
-from src.config import GEX_HEATMAP_STRIKE_BAND_PCT
+from src.config import GEX_HEATMAP_STRIKE_BAND_PCT, _getenv_int, _getenv_float
 from src.flow_series_sql import FLOW_SERIES_CTE_ASYNCPG, SNAPSHOT_SELECT_ASYNCPG
 from src.market_calendar import NYSE_HOLIDAYS
 from src.symbols import is_cash_index
@@ -144,7 +144,7 @@ from src.api.queries._sql_helpers import (  # noqa: E402
 # fall back to the prior bucket, which must be complete since ingestion has
 # already rolled over to a newer one. If only one bucket exists, use it.
 # The only bound parameter referenced is `$1 = underlying`.
-_STABLE_SNAPSHOT_QUIESCENCE_SECONDS = float(os.getenv("STABLE_SNAPSHOT_QUIESCENCE_SECONDS", "15"))
+_STABLE_SNAPSHOT_QUIESCENCE_SECONDS = _getenv_float("STABLE_SNAPSHOT_QUIESCENCE_SECONDS", 15)
 
 _STABLE_SNAPSHOT_CTE = f"""
     recent_ts AS (
@@ -287,21 +287,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self.pool: Optional[asyncpg.Pool] = None
         self._pool_lock = asyncio.Lock()
         self._last_flow_refresh_by_symbol: Dict[str, float] = {}
-        self._flow_refresh_min_seconds: float = float(
-            os.getenv("FLOW_CACHE_REFRESH_MIN_SECONDS", "15")
+        self._flow_refresh_min_seconds: float = _getenv_float("FLOW_CACHE_REFRESH_MIN_SECONDS", 15)
+        self._latest_quote_cache_ttl_seconds: float = _getenv_float(
+            "LATEST_QUOTE_CACHE_TTL_SECONDS", 1.5
         )
-        self._latest_quote_cache_ttl_seconds: float = float(
-            os.getenv("LATEST_QUOTE_CACHE_TTL_SECONDS", "1.5")
-        )
-        self._latest_gex_summary_cache_ttl_seconds: float = float(
-            os.getenv("LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS", "1.5")
+        self._latest_gex_summary_cache_ttl_seconds: float = _getenv_float(
+            "LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS", 1.5
         )
         # TTL for analytics-derived endpoints (gex_by_strike, gex_walls, etc.)
         # that only change on the analytics cycle (~60s). A moderate TTL
         # eliminates redundant DB round-trips from rapid frontend polling.
-        self._analytics_cache_ttl_seconds: float = float(
-            os.getenv("ANALYTICS_CACHE_TTL_SECONDS", "5.0")
-        )
+        self._analytics_cache_ttl_seconds: float = _getenv_float("ANALYTICS_CACHE_TTL_SECONDS", 5.0)
         # /api/gex/strike-profile-timeseries gets its own, longer TTL.  The
         # rewind chart polls this endpoint at 1Hz for a window_units=~480
         # response — a query that JOINs ``gex_by_strike`` at ~480 rep_ts and
@@ -312,8 +308,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # in the cache window), and the live-tip Strike-Profile poll on the
         # frontend uses a tiny window_units=3 fetch that costs ~150 rows
         # — fast even on a cold cache.  <= 0 disables endpoint caching.
-        self._strike_profile_timeseries_cache_ttl_seconds: float = float(
-            os.getenv("STRIKE_PROFILE_TIMESERIES_CACHE_TTL_SECONDS", "30.0")
+        self._strike_profile_timeseries_cache_ttl_seconds: float = _getenv_float(
+            "STRIKE_PROFILE_TIMESERIES_CACHE_TTL_SECONDS", 30.0
         )
         # Fraction of spot used as the /api/gex/heatmap strike half-band
         # (validated + bounded in config). Proportional so the heatmap
@@ -322,8 +318,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # Flow endpoints are frequently polled by the frontend. A short TTL
         # dramatically cuts repeated heavy reads while keeping intraday charts
         # effectively real-time.
-        self._flow_endpoint_cache_ttl_seconds: float = float(
-            os.getenv("FLOW_ENDPOINT_CACHE_TTL_SECONDS", "3.0")
+        self._flow_endpoint_cache_ttl_seconds: float = _getenv_float(
+            "FLOW_ENDPOINT_CACHE_TTL_SECONDS", 3.0
         )
         # /api/flow/series gets its own, longer TTL. Its unfiltered read
         # is a flow_series_5min snapshot the Analytics Engine only
@@ -335,8 +331,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # strike/expiration-filtered CTE (measured 6-26x the snapshot).
         # by-contract/contracts deliberately keep the shared TTL above.
         # <= 0 disables endpoint caching.
-        self._flow_series_endpoint_cache_ttl_seconds: float = float(
-            os.getenv("FLOW_SERIES_ENDPOINT_CACHE_TTL_SECONDS", "30.0")
+        self._flow_series_endpoint_cache_ttl_seconds: float = _getenv_float(
+            "FLOW_SERIES_ENDPOINT_CACHE_TTL_SECONDS", 30.0
         )
         # Phase-2 read switch for the flow_series_5min snapshot. When true,
         # unfiltered /api/flow/series reads the pre-aggregated snapshot
@@ -354,8 +350,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # uvicorn from re-hitting the DB on every poll, so a longer TTL is
         # worth the staleness — and 5 s (the analytics default) frequently
         # expires inside a single cold call's wall-clock and gives no benefit.
-        self._confluence_matrix_cache_ttl_seconds: float = float(
-            os.getenv("CONFLUENCE_MATRIX_CACHE_TTL_SECONDS", "60.0")
+        self._confluence_matrix_cache_ttl_seconds: float = _getenv_float(
+            "CONFLUENCE_MATRIX_CACHE_TTL_SECONDS", 60.0
         )
         # /api/max-pain/current is a PURE cache read of max_pain_oi_snapshot
         # / _expiration.  Those tables are written only by the off-process
@@ -366,8 +362,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # engine.  Max pain is daily-grained (OI only changes at
         # settlement), so a process-local TTL on top of the daily snapshot
         # just spares redundant identical DB reads.  <= 0 disables caching.
-        self._max_pain_current_cache_ttl_seconds: float = float(
-            os.getenv("MAX_PAIN_CURRENT_CACHE_TTL_SECONDS", "120.0")
+        self._max_pain_current_cache_ttl_seconds: float = _getenv_float(
+            "MAX_PAIN_CURRENT_CACHE_TTL_SECONDS", 120.0
         )
         # Bounded LRU + TTL. Keys like option_symbol:* / flow_series:* have an
         # effectively unbounded keyspace (per strike-set/expiration-set query
@@ -376,7 +372,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # worker RSS grew without bound over a trading session. Capping size
         # and evicting oldest/expired keeps memory bounded — the cache is a
         # pure latency optimization so eviction can never affect correctness.
-        self._read_cache_maxsize: int = max(64, int(os.getenv("READ_CACHE_MAXSIZE", "2048")))
+        self._read_cache_maxsize: int = max(64, _getenv_int("READ_CACHE_MAXSIZE", 2048))
         self._read_cache: "OrderedDict[str, Tuple[float, Any]]" = OrderedDict()
         self._load_credentials()
 
@@ -411,12 +407,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
     async def _create_pool(self) -> asyncpg.Pool:
         """Create and return a fresh asyncpg pool instance."""
-        connect_timeout = float(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "20"))
+        connect_timeout = _getenv_float("DB_CONNECT_TIMEOUT_SECONDS", 20)
         # Keep defaults conservative to avoid exhausting RDS connections when
         # multiple services/workers run at once.
-        min_size = int(os.getenv("DB_POOL_MIN", "1"))
-        max_size = int(os.getenv("DB_POOL_MAX", "3"))
-        statement_timeout_ms = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "30000"))
+        min_size = _getenv_int("DB_POOL_MIN", 1)
+        max_size = _getenv_int("DB_POOL_MAX", 3)
+        statement_timeout_ms = _getenv_int("DB_STATEMENT_TIMEOUT_MS", 30000)
         ssl_mode = os.getenv("DB_SSLMODE", "").strip().lower()
         ssl = None
         if ssl_mode in {"require", "verify-ca", "verify-full"}:
@@ -464,8 +460,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
     async def connect(self):
         """Create connection pool"""
-        retries = int(os.getenv("DB_CONNECT_RETRIES", "5"))
-        retry_base_delay = float(os.getenv("DB_CONNECT_RETRY_DELAY_SECONDS", "1.5"))
+        retries = _getenv_int("DB_CONNECT_RETRIES", 5)
+        retry_base_delay = _getenv_float("DB_CONNECT_RETRY_DELAY_SECONDS", 1.5)
         last_error: Optional[Exception] = None
 
         for attempt in range(1, retries + 1):
@@ -774,7 +770,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         try:
             canonical_backfill_minutes = max(
                 1,
-                int(os.getenv("FLOW_CANONICAL_BACKFILL_MINUTES", "90")),
+                _getenv_int("FLOW_CANONICAL_BACKFILL_MINUTES", 90),
             )
         except ValueError:
             canonical_backfill_minutes = 90
@@ -787,7 +783,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # FLOW_REPROCESS_MINUTES and let ON CONFLICT DO UPDATE replace stale rows.
         # Default 5 minutes; bump if the vendor's late-arrival window is wider.
         try:
-            reprocess_minutes = max(0, int(os.getenv("FLOW_REPROCESS_MINUTES", "5")))
+            reprocess_minutes = max(0, _getenv_int("FLOW_REPROCESS_MINUTES", 5))
         except ValueError:
             reprocess_minutes = 5
 
@@ -827,7 +823,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         try:
             refresh_statement_timeout_ms = max(
                 1000,
-                int(os.getenv("FLOW_REFRESH_STATEMENT_TIMEOUT_MS", "180000")),
+                _getenv_int("FLOW_REFRESH_STATEMENT_TIMEOUT_MS", 180000),
             )
         except ValueError:
             refresh_statement_timeout_ms = 180000

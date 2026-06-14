@@ -29,6 +29,7 @@ from psycopg2.extras import execute_values
 from src.database import db_connection, close_connection_pool
 from src.utils import get_logger
 from src.config import (
+    _getenv_str,
     _getenv_bool,
     _getenv_float,
     _getenv_int,
@@ -3783,7 +3784,7 @@ def main():
     )
     parser.add_argument(
         "--underlyings",
-        default=os.getenv("ANALYTICS_UNDERLYINGS", os.getenv("ANALYTICS_UNDERLYING", "SPY")),
+        default=_getenv_str("ANALYTICS_UNDERLYINGS", _getenv_str("ANALYTICS_UNDERLYING", "SPY")),
         help="Comma-separated underlying symbols or aliases (default: SPY)",
     )
     parser.add_argument(

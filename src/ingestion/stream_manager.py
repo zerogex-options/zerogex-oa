@@ -37,6 +37,7 @@ from src.validation import (
 )
 from src.symbols import resolve_option_root
 from src.config import (
+    _getenv_str,
     _getenv_int,
     _getenv_bool,
     _getenv_float,
@@ -2161,7 +2162,7 @@ def main():
     parser = argparse.ArgumentParser(description="Stream real-time options data")
     parser.add_argument(
         "--underlying",
-        default=os.getenv("INGEST_UNDERLYING", "SPY"),
+        default=_getenv_str("INGEST_UNDERLYING", "SPY"),
         help="Underlying symbol or alias (default: SPY)",
     )
     parser.add_argument(

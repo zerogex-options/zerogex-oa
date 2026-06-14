@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+from src.config import _getenv_int
 import time
 from typing import Dict, Tuple
 
@@ -45,9 +46,9 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 _ENABLED = _env_flag("END_USER_RATE_LIMIT_ENABLED")
 _ENFORCE = _env_flag("END_USER_RATE_LIMIT_ENFORCE")
-_LIMIT = int(os.getenv("END_USER_RATE_LIMIT_REQUESTS", "600") or "600")
-_WINDOW = int(os.getenv("END_USER_RATE_LIMIT_WINDOW_SECONDS", "60") or "60")
-_MAX_KEYS = int(os.getenv("END_USER_RATE_LIMIT_MAX_KEYS", "100000") or "100000")
+_LIMIT = _getenv_int("END_USER_RATE_LIMIT_REQUESTS", 600)
+_WINDOW = _getenv_int("END_USER_RATE_LIMIT_WINDOW_SECONDS", 60)
+_MAX_KEYS = _getenv_int("END_USER_RATE_LIMIT_MAX_KEYS", 100000)
 
 
 def _parse_trusted_proxies() -> frozenset[str]:
