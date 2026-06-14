@@ -782,14 +782,18 @@ OPTION_ROOT_ALIASES = os.getenv("OPTION_ROOT_ALIASES", "")
 
 # Greeks Calculation
 GREEKS_ENABLED = os.getenv("GREEKS_ENABLED", "true").lower() == "true"
-RISK_FREE_RATE = float(os.getenv("RISK_FREE_RATE", "0.05"))  # 5%
+RISK_FREE_RATE = _getenv_float("RISK_FREE_RATE", 0.05)  # 5%
 # Continuous dividend yield (q) for the Black-Scholes-Merton model. Default
 # 0.0 keeps every Greek/price byte-identical to the prior dividend-free model
 # so deploying is a no-op; operators can set it per underlying basket (e.g.
 # ~0.013 for SPY, ~0.015 for the SPX constituents) to remove the
 # systematic call/put-delta and solved-IV bias on dividend-paying names.
-DIVIDEND_YIELD = float(os.getenv("DIVIDEND_YIELD", "0.0"))
-IMPLIED_VOLATILITY_DEFAULT = float(os.getenv("IMPLIED_VOLATILITY_DEFAULT", "0.20"))  # 20%
+#
+# Parsed via _getenv_float (NOT bare float()) so an inline ``# comment`` tail
+# or stray whitespace in the .env value can't crash service startup —
+# python-dotenv preserves everything after ``=`` literally.
+DIVIDEND_YIELD = _getenv_float("DIVIDEND_YIELD", 0.0, min=0.0, max=0.2)
+IMPLIED_VOLATILITY_DEFAULT = _getenv_float("IMPLIED_VOLATILITY_DEFAULT", 0.20)  # 20%
 
 # IV Calculation
 IV_CALCULATION_ENABLED = os.getenv("IV_CALCULATION_ENABLED", "true").lower() == "true"
