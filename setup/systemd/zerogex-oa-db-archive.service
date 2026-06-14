@@ -37,14 +37,15 @@ ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa db-archive
 TimeoutStartSec=3600
 
 # Security — mirror zerogex-oa-db-maintain, plus grant write to the local
-# archive root.  Harmless when ARCHIVE_DEST is an s3:// URI (that path just
-# goes unused); set ReadWritePaths to your dest if you relocate the local
-# archive off /var/lib/zerogex.
+# archive root.  The leading '-' on /var/lib/zerogex makes systemd tolerate
+# its absence, so a pure-S3 ARCHIVE_DEST (where nothing local is written and
+# the dir may not exist) still starts cleanly.  If you relocate the local
+# archive elsewhere, add that path here too.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/ubuntu/zerogex-oa /var/lib/zerogex
+ReadWritePaths=/home/ubuntu/zerogex-oa -/var/lib/zerogex
 
 # Logging
 StandardOutput=journal
