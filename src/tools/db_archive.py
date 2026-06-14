@@ -1,6 +1,9 @@
-"""Incremental, immutable archiver for the timestamped tables that the
-daily ``make db-prune`` permanently deletes (option_chains, gex_by_strike,
-gex_summary, underlying_quotes, flow_contract_facts, flow_by_contract).
+"""Incremental, immutable archiver for the high-value timestamped tables
+that the daily ``make db-prune`` permanently deletes — the raw/derived
+market state (option_chains, gex_by_strike, gex_summary, gex_profile,
+underlying_quotes, flow_contract_facts, flow_by_contract, flow_series_5min)
+and the signal engine's own history (signal_scores, signal_component_scores,
+signal_action_cards, portfolio_snapshots).  See DEFAULT_TABLE_SPECS.
 
 Why this exists
 ---------------
@@ -75,25 +78,38 @@ from zoneinfo import ZoneInfo
 ET = ZoneInfo("America/New_York")
 log = logging.getLogger("db_archive")
 
-# The timestamped tables that db-prune deletes on the rolling retention
-# window — i.e. everything in the Makefile's DB_MAINTAIN_TABLES that
-# actually exists in schema.sql with a `timestamp TIMESTAMPTZ` column.
-# The dead entries (flow_smart_money / trade_signals /
-# position_optimizer_signals — listed in DB_MAINTAIN_TABLES but absent
-# from schema.sql) are intentionally excluded.
-DEFAULT_TABLES = [
-    "option_chains",
-    "gex_by_strike",
-    "gex_summary",
-    "underlying_quotes",
-    "flow_contract_facts",
-    "flow_by_contract",
+# The (table, time-column) pairs archived by default — the "archive→prune"
+# tier: every table db-prune deletes on the rolling retention window that
+# also carries history worth keeping for backtesting.  Each is bucketed by
+# the listed TIMESTAMPTZ column (verified against schema.sql); most use
+# `timestamp`, but flow_series_5min keys on `bar_start`.
+#
+# Kept in sync with the Makefile's DB_PRUNE_SPEC (which additionally prunes
+# a few telemetry-only tables — tradestation_api_calls, vix_bars,
+# signal_events — that are deliberately NOT archived).  The stale names in
+# the old DB_MAINTAIN_TABLES (flow_smart_money / trade_signals /
+# position_optimizer_signals) are gone — no table backs them.
+DEFAULT_TABLE_SPECS: List[Tuple[str, str]] = [
+    # Raw + derived market state.
+    ("option_chains", "timestamp"),
+    ("gex_by_strike", "timestamp"),
+    ("gex_summary", "timestamp"),
+    ("gex_profile", "timestamp"),
+    ("underlying_quotes", "timestamp"),
+    ("flow_contract_facts", "timestamp"),
+    ("flow_by_contract", "timestamp"),
+    ("flow_series_5min", "bar_start"),
+    # Signal-engine history (its own track record — valuable for evaluating
+    # and backtesting the signal pipeline).  signal_trades is intentionally
+    # absent: it's one row per trade and kept in-DB forever.
+    ("signal_scores", "timestamp"),
+    ("signal_component_scores", "timestamp"),
+    ("signal_action_cards", "timestamp"),  # feeds src/signals/playbook/backtest.py
+    ("portfolio_snapshots", "timestamp"),
 ]
 
-# Every archived table buckets on this TIMESTAMPTZ column (verified
-# against schema.sql).  Override per-invocation only if you extend the
-# table list to something keyed differently.
-TIMESTAMP_COLUMN = "timestamp"
+# Default time column when a --tables / ARCHIVE_TABLES entry omits one.
+DEFAULT_TIMESTAMP_COLUMN = "timestamp"
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -104,6 +120,28 @@ def _ident(name: str) -> str:
     if not _IDENT_RE.match(name):
         raise ValueError(f"unsafe SQL identifier: {name!r}")
     return name
+
+
+def _specs_to_str(specs: List[Tuple[str, str]]) -> str:
+    """Encode (table, col) pairs as the comma list accepted by --tables /
+    ARCHIVE_TABLES, eliding the column when it's the default."""
+    return ",".join(
+        t if c == DEFAULT_TIMESTAMP_COLUMN else f"{t}:{c}" for t, c in specs
+    )
+
+
+def _parse_specs(items: List[str]) -> List[Tuple[str, str]]:
+    """Parse `table` or `table:tscol` tokens into validated (table, col)
+    pairs (default column = timestamp)."""
+    out: List[Tuple[str, str]] = []
+    for raw in items:
+        token = raw.strip()
+        if not token:
+            continue
+        table, _, col = token.partition(":")
+        out.append((_ident(table), _ident(col) if col else DEFAULT_TIMESTAMP_COLUMN))
+    return out
+
 
 
 def _pg_conninfo() -> str:
@@ -177,11 +215,11 @@ def _connect(dest: str, conninfo: str):
     return con
 
 
-def _distinct_days(con, table: str, start: datetime, end_excl: datetime) -> List[date]:
+def _distinct_days(con, table: str, tscol: str, start: datetime, end_excl: datetime) -> List[date]:
     """ET trading days that actually carry rows in [start, end_excl).
     Bucketing runs inside Postgres so timezone semantics are exact and
     only non-empty days come back (weekends/holidays drop out)."""
-    col = _ident(TIMESTAMP_COLUMN)
+    col = _ident(tscol)
     tbl = _ident(table)
     inner = (
         f"SELECT DISTINCT ({col} AT TIME ZONE ''America/New_York'')::date AS dt "
@@ -193,10 +231,10 @@ def _distinct_days(con, table: str, start: datetime, end_excl: datetime) -> List
     return [r[0] for r in rows]
 
 
-def _copy_day(con, table: str, day: date, target_uri: str, compression: str) -> int:
+def _copy_day(con, table: str, tscol: str, day: date, target_uri: str, compression: str) -> int:
     """Extract one ET trading day of `table` to a single Parquet file.
     Local targets are written to a .tmp sibling and atomically renamed."""
-    col = _ident(TIMESTAMP_COLUMN)
+    col = _ident(tscol)
     tbl = _ident(table)
     inner = (
         f"SELECT * FROM {tbl} "
@@ -242,7 +280,7 @@ def _date_window(args) -> Tuple[date, date]:
 
 def archive(args) -> int:
     dest = args.dest
-    tables = [_ident(t.strip()) for t in args.tables if t.strip()]
+    specs = _parse_specs(args.tables)
     since, until = _date_window(args)
     # Half-open [start, end_excl) in ET, expressed as tz-aware bounds.
     start = datetime.combine(since, datetime.min.time(), ET)
@@ -250,7 +288,7 @@ def archive(args) -> int:
 
     log.info(
         "Archiving %s → %s  (ET days %s … %s, %d table(s)%s)",
-        ",".join(tables), dest, since, until, len(tables),
+        ",".join(t for t, _ in specs), dest, since, until, len(specs),
         ", DRY-RUN" if args.dry_run else "",
     )
 
@@ -258,26 +296,26 @@ def archive(args) -> int:
     con = _connect(dest, conninfo)
 
     total_files = total_rows = total_skipped = total_empty = 0
-    for table in tables:
-        days = _distinct_days(con, table, start, end_excl)
+    for table, tscol in specs:
+        days = _distinct_days(con, table, tscol, start, end_excl)
         if not days:
             total_empty += 1
-            log.info("  %-22s no rows in window — nothing to archive", table)
+            log.info("  %-24s no rows in window — nothing to archive", table)
             continue
         for day in days:
             uri = _partition_uri(dest, table, day)
             if not args.force and _target_exists(uri):
                 total_skipped += 1
-                log.debug("  %-22s %s  skip (exists)", table, day)
+                log.debug("  %-24s %s  skip (exists)", table, day)
                 continue
             if args.dry_run:
                 total_files += 1
-                log.info("  %-22s %s  would write → %s", table, day, uri)
+                log.info("  %-24s %s  would write → %s", table, day, uri)
                 continue
-            rows = _copy_day(con, table, day, uri, args.compression)
+            rows = _copy_day(con, table, tscol, day, uri, args.compression)
             total_files += 1
             total_rows += rows
-            log.info("  %-22s %s  wrote %d rows → %s", table, day, rows, uri)
+            log.info("  %-24s %s  wrote %d rows → %s", table, day, rows, uri)
 
     con.close()
     log.info(
@@ -304,8 +342,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--tables",
         type=lambda s: s.split(","),
-        default=os.environ.get("ARCHIVE_TABLES", ",".join(DEFAULT_TABLES)).split(","),
-        help="Comma-separated tables to archive (env ARCHIVE_TABLES).",
+        default=os.environ.get("ARCHIVE_TABLES", _specs_to_str(DEFAULT_TABLE_SPECS)).split(","),
+        help="Comma-separated tables to archive as `table` or `table:tscol` "
+        "(env ARCHIVE_TABLES; default time column = timestamp).",
     )
     p.add_argument(
         "--lookback-days",

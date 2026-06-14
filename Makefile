@@ -2865,19 +2865,41 @@ vacuum: ## Vacuum analyze all tables
 
 DATA_RETENTION_DAYS ?= 90
 
-# Helper: all tables that hold timestamped data and need regular maintenance.
-DB_MAINTAIN_TABLES = option_chains underlying_quotes gex_summary gex_by_strike \
-	flow_contract_facts flow_by_contract \
-	flow_smart_money trade_signals \
-	position_optimizer_signals
+# Tables that hold timestamped data and are pruned on the rolling
+# DATA_RETENTION_DAYS window, as `table:time_column` (most key on
+# `timestamp`; flow_series_5min on `bar_start`, tradestation_api_calls on
+# `window_start`).  Two tiers — both pruned, but:
+#   • archive→prune  — also snapshotted to Parquet by `make db-archive`
+#                      first (DEFAULT_TABLE_SPECS in src/tools/db_archive.py
+#                      must stay in sync with this sub-list), so the full
+#                      history survives off-box for backtesting.
+#   • prune-only     — pure telemetry / re-fetchable; deleted, not archived.
+# Deliberately NOT pruned: signal_trades (one row per trade — the system's
+# track record, kept in-DB forever) and the upsert/low-cardinality tables
+# (option_chains_latest, *_cache, daily_atm_iv, max_pain_*, symbols, …).
+# The old stale names (flow_smart_money / trade_signals /
+# position_optimizer_signals) are gone — no table backs them.
+DB_PRUNE_SPEC = \
+	option_chains:timestamp underlying_quotes:timestamp \
+	gex_summary:timestamp gex_by_strike:timestamp gex_profile:timestamp \
+	flow_contract_facts:timestamp flow_by_contract:timestamp \
+	flow_series_5min:bar_start \
+	signal_scores:timestamp signal_component_scores:timestamp \
+	signal_action_cards:timestamp portfolio_snapshots:timestamp \
+	tradestation_api_calls:window_start vix_bars:timestamp signal_events:timestamp
+
+# Plain table-name list (the spec with the :column stripped) for the
+# VACUUM / REINDEX loops in db-maintain and vacuum.
+DB_MAINTAIN_TABLES = $(foreach s,$(DB_PRUNE_SPEC),$(firstword $(subst :, ,$(s))))
 
 .PHONY: db-prune
 db-prune: ## Delete data older than DATA_RETENTION_DAYS (default 90)
 	@echo "$(YELLOW)Pruning data older than $(DATA_RETENTION_DAYS) days...$(NC)"
-	@for tbl in $(DB_MAINTAIN_TABLES); do \
-		echo "  Pruning $$tbl ..."; \
+	@for spec in $(DB_PRUNE_SPEC); do \
+		tbl=$${spec%%:*}; col=$${spec##*:}; \
+		echo "  Pruning $$tbl (by $$col) ..."; \
 		if $(PSQL) -tAc "SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename='$$tbl'" | grep -q 1; then \
-			$(PSQL) -c "DELETE FROM $$tbl WHERE timestamp < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"; \
+			$(PSQL) -c "DELETE FROM $$tbl WHERE $$col < NOW() - INTERVAL '$(DATA_RETENTION_DAYS) days';"; \
 		else \
 			echo "    ⚠️  Table $$tbl does not exist, skipping"; \
 		fi; \
