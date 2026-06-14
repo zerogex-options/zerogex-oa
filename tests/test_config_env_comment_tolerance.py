@@ -94,6 +94,23 @@ def test_api_numeric_vars_tolerate_inline_comments(monkeypatch):
     assert rl._WINDOW == 60
 
 
+def test_list_and_map_vars_tolerate_inline_comments(monkeypatch):
+    # List- and JSON-map env vars previously silently fell back to the default
+    # on a commented value (the trailing token / '}  # note' broke parsing).
+    c = _reload_with(
+        {
+            "GAMMA_PROFILE_EXPANSION_RUNGS": "0.2,0.35,0.5  # ladder",
+            "DIVIDEND_YIELD_BY_SYMBOL": '{"SPY": 0.013, "SPX": 0.015}  # yields',
+            "SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_BY_SYMBOL": '{"SPY": 30}  # scalp',
+        },
+        monkeypatch,
+    )
+    assert c.GAMMA_PROFILE_EXPANSION_RUNGS == [0.2, 0.35, 0.5]
+    assert c.DIVIDEND_YIELD_BY_SYMBOL == {"SPY": 0.013, "SPX": 0.015}
+    assert c.resolve_dividend_yield("SPX") == 0.015
+    assert c.SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_BY_SYMBOL == {"SPY": 30}
+
+
 def test_auth_refresh_fields_tolerate_inline_comments(monkeypatch):
     monkeypatch.setenv("API_REQUEST_TIMEOUT", "30          # seconds")
     monkeypatch.setenv("TS_REFRESH_MAX_ATTEMPTS", "3  # retries")

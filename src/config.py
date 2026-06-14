@@ -103,7 +103,9 @@ def _parse_symbol_float_map(name: str, *, min: float, max: float) -> Dict[str, f
     ``[min, max]``. Used for per-symbol overrides like ``DIVIDEND_YIELD_BY_SYMBOL``.
     Returns ``{}`` on empty/invalid input (never raises at import time).
     """
-    raw = os.getenv(name, "").strip()
+    # Strip an inline ``# comment`` tail before JSON parsing so a
+    # ``{...}  # note`` .env line parses instead of silently falling back.
+    raw = _strip_env_value(os.getenv(name)) or ""
     if not raw:
         return {}
     try:
@@ -145,7 +147,9 @@ def _getenv_float_list(
     ``ascending``: when True, drop entries that are not strictly greater
     than the running max (keeps the list ascending without raising).
     """
-    raw = os.getenv(name)
+    # Strip an inline ``# comment`` tail so ``0.2,0.35,0.5  # ladder`` parses
+    # instead of silently falling back to the default on the last token.
+    raw = _strip_env_value(os.getenv(name))
     if raw is None or raw.strip() == "":
         values: List[float] = list(default)
     else:
@@ -1275,7 +1279,9 @@ def _clamped_threshold(raw: float) -> float:
 
 def _parse_symbol_minutes_map(name: str) -> Dict[str, int]:
     """Parse symbol->minutes map from JSON env var."""
-    raw = os.getenv(name, "").strip()
+    # Strip an inline ``# comment`` tail before JSON parsing so a
+    # ``{...}  # note`` .env line parses instead of silently falling back.
+    raw = _strip_env_value(os.getenv(name)) or ""
     if not raw:
         return {}
     try:
@@ -1300,7 +1306,9 @@ def _parse_symbol_minutes_map(name: str) -> Dict[str, int]:
 
 def _parse_signal_phase_threshold_overrides(name: str) -> Dict[str, Dict[str, float]]:
     """Parse nested {signal: {phase: threshold}} override map from JSON env var."""
-    raw = os.getenv(name, "").strip()
+    # Strip an inline ``# comment`` tail before JSON parsing so a
+    # ``{...}  # note`` .env line parses instead of silently falling back.
+    raw = _strip_env_value(os.getenv(name)) or ""
     if not raw:
         return {}
     try:
