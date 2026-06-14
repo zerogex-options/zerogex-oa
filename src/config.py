@@ -96,6 +96,41 @@ def _getenv_float(
     return value
 
 
+def _parse_symbol_float_map(name: str, *, min: float, max: float) -> Dict[str, float]:
+    """Parse a ``{symbol: float}`` JSON env map with canonical-upper keys.
+
+    Mirrors :func:`_parse_symbol_minutes_map` but for float values, clamped to
+    ``[min, max]``. Used for per-symbol overrides like ``DIVIDEND_YIELD_BY_SYMBOL``.
+    Returns ``{}`` on empty/invalid input (never raises at import time).
+    """
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        _cfg_logger.error("Invalid JSON for env var %s=%r — ignoring", name, raw)
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+
+    out: Dict[str, float] = {}
+    for k, v in parsed.items():
+        symbol = str(k or "").strip().upper()
+        if not symbol:
+            continue
+        try:
+            value = float(v)
+        except (TypeError, ValueError):
+            continue
+        if value < min:
+            value = min
+        if value > max:
+            value = max
+        out[symbol] = value
+    return out
+
+
 def _getenv_float_list(
     name: str,
     default: List[float],
@@ -793,6 +828,25 @@ RISK_FREE_RATE = _getenv_float("RISK_FREE_RATE", 0.05)  # 5%
 # or stray whitespace in the .env value can't crash service startup —
 # python-dotenv preserves everything after ``=`` literally.
 DIVIDEND_YIELD = _getenv_float("DIVIDEND_YIELD", 0.0, min=0.0, max=0.2)
+# Per-symbol dividend-yield overrides, keyed by CANONICAL symbol (e.g. "SPY",
+# "SPX" — what get_canonical_symbol returns, NOT "$SPX.X"). JSON map, e.g.
+# DIVIDEND_YIELD_BY_SYMBOL='{"SPY": 0.013, "QQQ": 0.006, "SPX": 0.015}'.
+# Any symbol not in the map falls back to the scalar DIVIDEND_YIELD above.
+# Note: $SPX.X is a cash index that pays no dividend itself, but its BSM
+# forward should still discount the constituents' yield (~1.5%), so a non-zero
+# q for "SPX" is correct.
+DIVIDEND_YIELD_BY_SYMBOL = _parse_symbol_float_map("DIVIDEND_YIELD_BY_SYMBOL", min=0.0, max=0.2)
+
+
+def resolve_dividend_yield(symbol: str) -> float:
+    """Dividend yield q for ``symbol`` (canonical), or the scalar fallback.
+
+    Each ingestion/analytics worker runs for a single symbol and resolves its
+    q once at construction, so the per-symbol map is consulted exactly here.
+    """
+    return DIVIDEND_YIELD_BY_SYMBOL.get((symbol or "").upper(), DIVIDEND_YIELD)
+
+
 IMPLIED_VOLATILITY_DEFAULT = _getenv_float("IMPLIED_VOLATILITY_DEFAULT", 0.20)  # 20%
 
 # IV Calculation

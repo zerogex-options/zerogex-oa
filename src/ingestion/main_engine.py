@@ -52,6 +52,7 @@ from src.config import (
     FLOW_CLASSIFY_SKIP_OPEN_AUCTION,
     FLOW_CLASSIFY_PRIOR_TICK_MAX_AGE_SECONDS,
     SESSION_TEMPLATE,
+    resolve_dividend_yield,
 )
 
 logger = get_logger(__name__)
@@ -248,10 +249,15 @@ class IngestionEngine:
         # Counter for crossed/missing-quote fallbacks in _classify_volume_chunk.
         self._classify_fallback_count: int = 0
 
-        # Greeks calculator (initialize if enabled)
+        # Greeks calculator (initialize if enabled). Resolve this symbol's
+        # dividend yield q once here (each worker is single-symbol), so the
+        # per-symbol DIVIDEND_YIELD_BY_SYMBOL override applies; falls back to
+        # the scalar DIVIDEND_YIELD for symbols not in the map.
         self.greeks_calculator = None
         if GREEKS_ENABLED:
-            self.greeks_calculator = GreeksCalculator()
+            self.greeks_calculator = GreeksCalculator(
+                dividend_yield=resolve_dividend_yield(self.db_symbol)
+            )
             logger.info("✅ Greeks calculation ENABLED")
             logger.info("   Note: Will use mid-price for IV calculation if API doesn't provide IV")
         else:

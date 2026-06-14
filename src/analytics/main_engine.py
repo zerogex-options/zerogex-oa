@@ -33,7 +33,7 @@ from src.config import (
     _getenv_float,
     _getenv_int,
     RISK_FREE_RATE,
-    DIVIDEND_YIELD,
+    resolve_dividend_yield,
     ANALYTICS_FLOW_CACHE_REFRESH_ENABLED,
     GAMMA_PROFILE_SPAN_PCT,
     GAMMA_PROFILE_SPAN_LADDER,
@@ -99,8 +99,9 @@ class AnalyticsEngine:
         self.calculation_interval = calculation_interval
         self.risk_free_rate = risk_free_rate
         # Continuous dividend yield q for the BSM gamma/vanna/charm kernels.
-        # 0.0 (config default) reproduces the prior dividend-free model.
-        self.dividend_yield = DIVIDEND_YIELD
+        # Resolved per-symbol (each worker is single-symbol); falls back to the
+        # scalar DIVIDEND_YIELD (default 0.0 -> prior dividend-free model).
+        self.dividend_yield = resolve_dividend_yield(self.db_symbol)
         self.running = False
         # Accept fractional hours (e.g. 0.5 = 30 min, 0.25 = 15 min) so an
         # operator on a cold-storage buffer pool can dial the snapshot
