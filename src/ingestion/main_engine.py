@@ -42,6 +42,8 @@ from src.validation import (
 )
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.config import (
+    _getenv_int,
+    _getenv_float,
     AGGREGATION_BUCKET_SECONDS,
     MAX_BUFFER_SIZE,
     BUFFER_FLUSH_INTERVAL,
@@ -132,7 +134,7 @@ def _compute_db_backoff_seconds(consecutive_failures: int) -> float:
 # a brief DB outage produces ~1000 identical warnings (~1044 observed in a
 # 2-3s burst during the 2026-06 RDS restart) because every batch attempt
 # from the live option stream hits the early-return + log path.
-_CB_SKIP_LOG_INTERVAL_SECONDS = float(os.getenv("CIRCUIT_BREAKER_SKIP_LOG_INTERVAL_SECONDS", "5.0"))
+_CB_SKIP_LOG_INTERVAL_SECONDS = _getenv_float("CIRCUIT_BREAKER_SKIP_LOG_INTERVAL_SECONDS", 5.0)
 
 
 def _to_db_float(value: Any) -> Optional[float]:
@@ -198,8 +200,8 @@ class IngestionEngine:
         # downstream calculation.
         self.latest_underlying_price: Optional[float] = None
         self.latest_underlying_timestamp: Optional[datetime] = None
-        self.greeks_max_underlying_age_seconds = float(
-            os.getenv("GREEKS_MAX_UNDERLYING_AGE_SECONDS", "90")
+        self.greeks_max_underlying_age_seconds = _getenv_float(
+            "GREEKS_MAX_UNDERLYING_AGE_SECONDS", 90
         )
         # Pre/after-hours an equity/ETF underlying trades thinly and its
         # 1-minute bars are legitimately minutes apart, so the tight
@@ -207,8 +209,8 @@ class IngestionEngine:
         # extended session. Defaults to the stream watchdog's extended
         # STALE-warn threshold so the two mechanisms stay coherent: Greeks
         # are refused only once the feed itself is considered stale.
-        self.greeks_max_underlying_age_seconds_extended = float(
-            os.getenv("GREEKS_MAX_UNDERLYING_AGE_SECONDS_EXTENDED", "300")
+        self.greeks_max_underlying_age_seconds_extended = _getenv_float(
+            "GREEKS_MAX_UNDERLYING_AGE_SECONDS_EXTENDED", 300
         )
         # Counter so operators can see how often staleness rejects fire.
         # ``_total`` advances on every reject (in- and out-of-session);
@@ -228,8 +230,8 @@ class IngestionEngine:
         # cadence so the log reflects how long the feed has been stale, not
         # how fast options tick. ``_greeks_stale_last_warn_mono`` starts at
         # 0.0 so the first reject of a run warns immediately.
-        self.greeks_stale_warn_interval_seconds = float(
-            os.getenv("GREEKS_STALE_WARN_INTERVAL_SECONDS", "60")
+        self.greeks_stale_warn_interval_seconds = _getenv_float(
+            "GREEKS_STALE_WARN_INTERVAL_SECONDS", 60
         )
         self._greeks_stale_last_warn_mono = 0.0
         # Watchdog: when the underlying price stays stale in-session past
@@ -241,7 +243,7 @@ class IngestionEngine:
         # this. Set to 0 to disable. The 2026-06 prod incident sat in a
         # broken state for 17h with 1.1M rejects because no escalation
         # path existed; this is the last line of defense.
-        self.greeks_stale_fatal_seconds = float(os.getenv("GREEKS_STALE_FATAL_SECONDS", "1800"))
+        self.greeks_stale_fatal_seconds = _getenv_float("GREEKS_STALE_FATAL_SECONDS", 1800)
         # Wall-clock monotonic timestamp of the current stale episode's
         # start, or None when Greeks are flowing. Reset to None on the
         # first successful Greek calc after a stale window.
@@ -302,9 +304,7 @@ class IngestionEngine:
         # WHERE-clause guard the second time it's sent.  Bounded so a
         # prolonged outage can't grow unbounded.
         self._pending_failed_option_rows: List[Dict[str, Any]] = []
-        self._pending_failed_option_rows_max = int(
-            os.getenv("OPTION_FAILED_ROWS_RETAIN_MAX", "20000")
-        )
+        self._pending_failed_option_rows_max = _getenv_int("OPTION_FAILED_ROWS_RETAIN_MAX", 20000)
         self._last_underlying_signature: Optional[str] = None
         self._option_bucket_last_write: Dict[tuple[str, datetime], float] = {}
 
@@ -1972,19 +1972,19 @@ def main():
     parser.add_argument(
         "--expirations",
         type=int,
-        default=int(os.getenv("INGEST_EXPIRATIONS", "3")),
+        default=_getenv_int("INGEST_EXPIRATIONS", 3),
         help="Number of expirations (default: 3)",
     )
     parser.add_argument(
         "--strike-count-max",
         type=int,
-        default=int(os.getenv("INGEST_STRIKE_COUNT_MAX", "40")),
+        default=_getenv_int("INGEST_STRIKE_COUNT_MAX", 40),
         help="Hard cap on strikes per expiration after the pct-range filter (default: 40)",
     )
     parser.add_argument(
         "--strike-pct-range",
         type=float,
-        default=float(os.getenv("INGEST_STRIKE_PCT_RANGE", "3.0")),
+        default=_getenv_float("INGEST_STRIKE_PCT_RANGE", 3.0),
         help="Strike-selection band as percent of spot, e.g. 3.0 -> ±3%% (default: 3.0)",
     )
     parser.add_argument(

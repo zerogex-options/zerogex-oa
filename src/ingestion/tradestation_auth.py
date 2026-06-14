@@ -16,6 +16,7 @@ from threading import Lock
 from typing import Optional
 import fcntl
 from src.utils import get_logger
+from src.config import _getenv_int, _getenv_float, API_REQUEST_TIMEOUT
 
 # Initialize logger
 logger = get_logger(__name__)
@@ -57,18 +58,20 @@ class TradeStationAuth:
         self.token_expiry: Optional[datetime] = None
         self._token_lock = Lock()
         self._last_refresh_epoch: float = 0.0
-        self.refresh_buffer_seconds = int(os.getenv("TS_REFRESH_BUFFER_SECONDS", "30"))
+        self.refresh_buffer_seconds = _getenv_int("TS_REFRESH_BUFFER_SECONDS", 30)
         # Token refresh is the least-resilient call in the stack: a single
         # transient blip used to hard-fail the request that triggered it
         # (hard-coded 10s timeout, no retry).  Give it the same resilience as
         # data calls — a configurable timeout (defaulting to API_REQUEST_TIMEOUT)
         # and a small exponential-backoff retry budget on transient network
-        # errors only (an auth rejection still fails fast).
-        self._refresh_timeout_seconds = int(
-            os.getenv("TS_REFRESH_TIMEOUT_SECONDS", os.getenv("API_REQUEST_TIMEOUT", "30"))
+        # errors only (an auth rejection still fails fast). Parsed via the
+        # comment-tolerant config helpers so a ``KEY=30  # note`` .env line can't
+        # crash worker startup.
+        self._refresh_timeout_seconds = _getenv_int(
+            "TS_REFRESH_TIMEOUT_SECONDS", API_REQUEST_TIMEOUT
         )
-        self._refresh_max_attempts = max(1, int(os.getenv("TS_REFRESH_MAX_ATTEMPTS", "3")))
-        self._refresh_retry_base_delay = float(os.getenv("TS_REFRESH_RETRY_DELAY", "1.0"))
+        self._refresh_max_attempts = max(1, _getenv_int("TS_REFRESH_MAX_ATTEMPTS", 3))
+        self._refresh_retry_base_delay = _getenv_float("TS_REFRESH_RETRY_DELAY", 1.0)
         token_cache_name = (
             "tradestation_token_cache_sandbox.json" if sandbox else "tradestation_token_cache.json"
         )

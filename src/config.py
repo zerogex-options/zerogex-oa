@@ -514,12 +514,12 @@ if GAMMA_PROFILE_DTE_WEIGHT_SHAPE not in ("linear", "sqrt", "exp"):
     GAMMA_PROFILE_DTE_WEIGHT_SHAPE = "linear"
 
 # Batch Sizes
-QUOTE_BATCH_SIZE = int(os.getenv("QUOTE_BATCH_SIZE", "100"))  # TradeStation supports up to 500
-OPTION_BATCH_SIZE = int(os.getenv("OPTION_BATCH_SIZE", "100"))
+QUOTE_BATCH_SIZE = _getenv_int("QUOTE_BATCH_SIZE", 100)  # TradeStation supports up to 500
+OPTION_BATCH_SIZE = _getenv_int("OPTION_BATCH_SIZE", 100)
 
 # Delays Between Requests
-DELAY_BETWEEN_BATCHES = float(os.getenv("DELAY_BETWEEN_BATCHES", "0.5"))  # seconds
-DELAY_BETWEEN_BARS = float(os.getenv("DELAY_BETWEEN_BARS", "1.0"))  # seconds
+DELAY_BETWEEN_BATCHES = _getenv_float("DELAY_BETWEEN_BATCHES", 0.5)  # seconds
+DELAY_BETWEEN_BARS = _getenv_float("DELAY_BETWEEN_BARS", 1.0)  # seconds
 
 # =============================================================================
 # Database Configuration
@@ -527,7 +527,7 @@ DELAY_BETWEEN_BARS = float(os.getenv("DELAY_BETWEEN_BARS", "1.0"))  # seconds
 
 # Connectivity settings
 DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = int(os.getenv("DB_PORT", "5432"))
+DB_PORT = _getenv_int("DB_PORT", 5432)
 DB_NAME = os.getenv("DB_NAME", "zerogex")
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
@@ -537,18 +537,18 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 DB_SSLMODE = os.getenv("DB_SSLMODE", "").strip()
 
 # Connection Pool
-DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "1"))
-DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "4"))
-DB_CONNECT_TIMEOUT_SECONDS = float(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "20"))
-DB_CONNECT_RETRIES = int(os.getenv("DB_CONNECT_RETRIES", "5"))
-DB_CONNECT_RETRY_DELAY_SECONDS = float(os.getenv("DB_CONNECT_RETRY_DELAY_SECONDS", "1.5"))
-DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "30000"))
-DB_KEEPALIVES_IDLE_SECONDS = int(os.getenv("DB_KEEPALIVES_IDLE_SECONDS", "30"))
-DB_KEEPALIVES_INTERVAL_SECONDS = int(os.getenv("DB_KEEPALIVES_INTERVAL_SECONDS", "10"))
-DB_KEEPALIVES_COUNT = int(os.getenv("DB_KEEPALIVES_COUNT", "5"))
+DB_POOL_MIN = _getenv_int("DB_POOL_MIN", 1)
+DB_POOL_MAX = _getenv_int("DB_POOL_MAX", 4)
+DB_CONNECT_TIMEOUT_SECONDS = _getenv_float("DB_CONNECT_TIMEOUT_SECONDS", 20)
+DB_CONNECT_RETRIES = _getenv_int("DB_CONNECT_RETRIES", 5)
+DB_CONNECT_RETRY_DELAY_SECONDS = _getenv_float("DB_CONNECT_RETRY_DELAY_SECONDS", 1.5)
+DB_STATEMENT_TIMEOUT_MS = _getenv_int("DB_STATEMENT_TIMEOUT_MS", 30000)
+DB_KEEPALIVES_IDLE_SECONDS = _getenv_int("DB_KEEPALIVES_IDLE_SECONDS", 30)
+DB_KEEPALIVES_INTERVAL_SECONDS = _getenv_int("DB_KEEPALIVES_INTERVAL_SECONDS", 10)
+DB_KEEPALIVES_COUNT = _getenv_int("DB_KEEPALIVES_COUNT", 5)
 
 # Data Retention
-DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", "90"))  # days to keep data
+DATA_RETENTION_DAYS = _getenv_int("DATA_RETENTION_DAYS", 90)  # days to keep data
 
 # =============================================================================
 # Streaming Configuration
@@ -557,22 +557,22 @@ DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", "90"))  # days to kee
 # Maximum wait between drain cycles.  The main loop wakes *immediately*
 # when a stream accumulator receives data; these values only cap the
 # longest the loop will block when the streams are quiet.
-MARKET_HOURS_POLL_INTERVAL = int(os.getenv("MARKET_HOURS_POLL_INTERVAL", "5"))  # seconds
-EXTENDED_HOURS_POLL_INTERVAL = int(os.getenv("EXTENDED_HOURS_POLL_INTERVAL", "30"))  # seconds
-CLOSED_HOURS_POLL_INTERVAL = int(os.getenv("CLOSED_HOURS_POLL_INTERVAL", "300"))  # 5 minutes
+MARKET_HOURS_POLL_INTERVAL = _getenv_int("MARKET_HOURS_POLL_INTERVAL", 5)  # seconds
+EXTENDED_HOURS_POLL_INTERVAL = _getenv_int("EXTENDED_HOURS_POLL_INTERVAL", 30)  # seconds
+CLOSED_HOURS_POLL_INTERVAL = _getenv_int("CLOSED_HOURS_POLL_INTERVAL", 300)  # 5 minutes
 
 # Strike Recalculation
 # One iteration = one poll cycle (MARKET_HOURS_POLL_INTERVAL seconds during market hours).
 # At the default 5s poll interval, STRIKE_RECALC_INTERVAL=12 recalibrates every ~1 minute.
-STRIKE_RECALC_INTERVAL = int(os.getenv("STRIKE_RECALC_INTERVAL", "12"))  # iterations
+STRIKE_RECALC_INTERVAL = _getenv_int("STRIKE_RECALC_INTERVAL", 12)  # iterations
 
 # Memory Management
-STRIKE_CLEANUP_INTERVAL = int(os.getenv("STRIKE_CLEANUP_INTERVAL", "100"))  # iterations
+STRIKE_CLEANUP_INTERVAL = _getenv_int("STRIKE_CLEANUP_INTERVAL", 100)  # iterations
 
 # Session template for market data
 # Options: "Default" (9:30-16:00), "USEQPre" (4:00-9:30), "USEQ24Hour" (4:00-20:00)
 SESSION_TEMPLATE = os.getenv("SESSION_TEMPLATE", "Default")
-TS_STREAM_READ_TIMEOUT = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
+TS_STREAM_READ_TIMEOUT = _getenv_int("TS_STREAM_READ_TIMEOUT", 300)
 TS_STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").lower() == "true"
 
 # Streaming quotes endpoint encodes the symbol list in the URL path. With
@@ -645,8 +645,8 @@ TS_STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").
 # the 1500-symbol process collapses to 2 chunks, dropping the account
 # total to ~12 with VIX, ~8-9 without.  Set lower via the env var if a
 # given deployment's per-chunk symbol mix produces over-long URIs.
-STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION = int(
-    os.getenv("STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION", "800")
+STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION = _getenv_int(
+    "STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION", 800
 )
 
 # Underlying-stream data-staleness watchdog. The TradeStation bar stream
@@ -665,9 +665,9 @@ STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION = int(
 # before the supervisor force-reconnects. Gauged in wall-clock seconds,
 # NOT empty-drain count: the poll loop wakes sub-second on every option
 # tick, so the drain count races far ahead of real time.
-UNDERLYING_STREAM_STALE_WARN_SECONDS = int(os.getenv("UNDERLYING_STREAM_STALE_WARN_SECONDS", "75"))
-UNDERLYING_STREAM_STALE_RESTART_SECONDS = int(
-    os.getenv("UNDERLYING_STREAM_STALE_RESTART_SECONDS", "120")
+UNDERLYING_STREAM_STALE_WARN_SECONDS = _getenv_int("UNDERLYING_STREAM_STALE_WARN_SECONDS", 75)
+UNDERLYING_STREAM_STALE_RESTART_SECONDS = _getenv_int(
+    "UNDERLYING_STREAM_STALE_RESTART_SECONDS", 120
 )
 # The thresholds above are tuned for the dense regular cash session where a
 # 1-minute bar prints roughly every ~60s. In pre-market / after-hours an
@@ -675,18 +675,16 @@ UNDERLYING_STREAM_STALE_RESTART_SECONDS = int(
 # thinly and a 1-minute bar stream legitimately goes minutes between bars, so
 # the regular-session thresholds produce false STALE/restart storms. Extended
 # hours therefore get their own, much wider thresholds.
-UNDERLYING_STREAM_STALE_WARN_SECONDS_EXTENDED = int(
-    os.getenv("UNDERLYING_STREAM_STALE_WARN_SECONDS_EXTENDED", "300")
+UNDERLYING_STREAM_STALE_WARN_SECONDS_EXTENDED = _getenv_int(
+    "UNDERLYING_STREAM_STALE_WARN_SECONDS_EXTENDED", 300
 )
-UNDERLYING_STREAM_STALE_RESTART_SECONDS_EXTENDED = int(
-    os.getenv("UNDERLYING_STREAM_STALE_RESTART_SECONDS_EXTENDED", "600")
+UNDERLYING_STREAM_STALE_RESTART_SECONDS_EXTENDED = _getenv_int(
+    "UNDERLYING_STREAM_STALE_RESTART_SECONDS_EXTENDED", 600
 )
-UNDERLYING_STREAM_RESTART_COOLDOWN_SECONDS = int(
-    os.getenv("UNDERLYING_STREAM_RESTART_COOLDOWN_SECONDS", "90")
+UNDERLYING_STREAM_RESTART_COOLDOWN_SECONDS = _getenv_int(
+    "UNDERLYING_STREAM_RESTART_COOLDOWN_SECONDS", 90
 )
-UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS = int(
-    os.getenv("UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS", "5")
-)
+UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS = _getenv_int("UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS", 5)
 # After the fast retry budget is exhausted the supervisor enters a
 # backed-off state — previously terminal until the process restarted.
 # A 2026-06 prod incident sat in that state for 17 hours, accumulating
@@ -697,33 +695,29 @@ UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS = int(
 # gets the same full budget. 10 min is long enough to avoid pestering
 # a genuinely-down upstream and short enough that a recovered upstream
 # is rediscovered within a single market half-hour.
-UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS = int(
-    os.getenv("UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS", "600")
+UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS = _getenv_int(
+    "UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS", 600
 )
 TS_STREAM_REUSE_QUOTES = os.getenv("TS_STREAM_REUSE_QUOTES", "false").lower() == "true"
 TS_WARN_MARKET_HOURS = os.getenv("TS_WARN_MARKET_HOURS", "true").lower() != "false"
-OPTION_OI_COVERAGE_ALERT_THRESHOLD = float(os.getenv("OPTION_OI_COVERAGE_ALERT_THRESHOLD", "0.35"))
-OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD = float(
-    os.getenv("OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD", "0.35")
+OPTION_OI_COVERAGE_ALERT_THRESHOLD = _getenv_float("OPTION_OI_COVERAGE_ALERT_THRESHOLD", 0.35)
+OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD = _getenv_float(
+    "OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD", 0.35
 )
-OPTION_VOLUME_WARMUP_MINUTES = int(os.getenv("OPTION_VOLUME_WARMUP_MINUTES", "30"))
-OPTION_OI_WARMUP_MINUTES = int(os.getenv("OPTION_OI_WARMUP_MINUTES", "5"))
+OPTION_VOLUME_WARMUP_MINUTES = _getenv_int("OPTION_VOLUME_WARMUP_MINUTES", 30)
+OPTION_OI_WARMUP_MINUTES = _getenv_int("OPTION_OI_WARMUP_MINUTES", 5)
 OPTION_REST_SEED_ON_RECALC = os.getenv("OPTION_REST_SEED_ON_RECALC", "false").lower() == "true"
-FLOW_CACHE_REFRESH_MIN_SECONDS = float(os.getenv("FLOW_CACHE_REFRESH_MIN_SECONDS", "15"))
+FLOW_CACHE_REFRESH_MIN_SECONDS = _getenv_float("FLOW_CACHE_REFRESH_MIN_SECONDS", 15)
 FLOW_CANONICAL_ONLY = os.getenv("FLOW_CANONICAL_ONLY", "true").lower() == "true"
 ANALYTICS_FLOW_CACHE_REFRESH_ENABLED = (
     os.getenv("ANALYTICS_FLOW_CACHE_REFRESH_ENABLED", "true").lower() == "true"
 )
-TS_REFRESH_BUFFER_SECONDS = int(os.getenv("TS_REFRESH_BUFFER_SECONDS", "30"))
-TS_MIN_FORCE_REFRESH_INTERVAL_SECONDS = int(
-    os.getenv("TS_MIN_FORCE_REFRESH_INTERVAL_SECONDS", "60")
-)
-LATEST_QUOTE_CACHE_TTL_SECONDS = float(os.getenv("LATEST_QUOTE_CACHE_TTL_SECONDS", "1.5"))
-LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS = float(
-    os.getenv("LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS", "1.5")
-)
-ANALYTICS_CACHE_TTL_SECONDS = float(os.getenv("ANALYTICS_CACHE_TTL_SECONDS", "5.0"))
-FLOW_ENDPOINT_CACHE_TTL_SECONDS = float(os.getenv("FLOW_ENDPOINT_CACHE_TTL_SECONDS", "3.0"))
+TS_REFRESH_BUFFER_SECONDS = _getenv_int("TS_REFRESH_BUFFER_SECONDS", 30)
+TS_MIN_FORCE_REFRESH_INTERVAL_SECONDS = _getenv_int("TS_MIN_FORCE_REFRESH_INTERVAL_SECONDS", 60)
+LATEST_QUOTE_CACHE_TTL_SECONDS = _getenv_float("LATEST_QUOTE_CACHE_TTL_SECONDS", 1.5)
+LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS = _getenv_float("LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS", 1.5)
+ANALYTICS_CACHE_TTL_SECONDS = _getenv_float("ANALYTICS_CACHE_TTL_SECONDS", 5.0)
+FLOW_ENDPOINT_CACHE_TTL_SECONDS = _getenv_float("FLOW_ENDPOINT_CACHE_TTL_SECONDS", 3.0)
 
 # Max-pain daily snapshot refresh (scheduled, off-process).
 #
@@ -742,7 +736,7 @@ MAX_PAIN_BACKGROUND_REFRESH_SYMBOLS = [
     if s.strip()
 ]
 MAX_PAIN_BACKGROUND_REFRESH_STRIKE_LIMIT = max(
-    10, min(1000, int(os.getenv("MAX_PAIN_BACKGROUND_REFRESH_STRIKE_LIMIT", "500")))
+    10, min(1000, _getenv_int("MAX_PAIN_BACKGROUND_REFRESH_STRIKE_LIMIT", 500))
 )
 # Per-statement timeout for the recompute, applied via SET LOCAL on the
 # server and forwarded as asyncpg ``timeout=`` so the client-side
@@ -754,7 +748,7 @@ MAX_PAIN_BACKGROUND_REFRESH_STRIKE_LIMIT = max(
 # optimize the query (start by dropping the strike limit from 500) rather
 # than bumping this further.
 MAX_PAIN_BACKGROUND_REFRESH_STATEMENT_TIMEOUT_MS = max(
-    1000, int(os.getenv("MAX_PAIN_BACKGROUND_REFRESH_STATEMENT_TIMEOUT_MS", "300000"))
+    1000, _getenv_int("MAX_PAIN_BACKGROUND_REFRESH_STATEMENT_TIMEOUT_MS", 300000)
 )
 
 # =============================================================================
@@ -762,13 +756,13 @@ MAX_PAIN_BACKGROUND_REFRESH_STATEMENT_TIMEOUT_MS = max(
 # =============================================================================
 
 # Time Bucket Size
-AGGREGATION_BUCKET_SECONDS = int(os.getenv("AGGREGATION_BUCKET_SECONDS", "60"))  # 1 minute
+AGGREGATION_BUCKET_SECONDS = _getenv_int("AGGREGATION_BUCKET_SECONDS", 60)  # 1 minute
 
 # Buffer Flush Settings
-MAX_BUFFER_SIZE = int(os.getenv("MAX_BUFFER_SIZE", "1000"))  # flush if buffer exceeds
-BUFFER_FLUSH_INTERVAL = int(os.getenv("BUFFER_FLUSH_INTERVAL", "60"))  # seconds
+MAX_BUFFER_SIZE = _getenv_int("MAX_BUFFER_SIZE", 1000)  # flush if buffer exceeds
+BUFFER_FLUSH_INTERVAL = _getenv_int("BUFFER_FLUSH_INTERVAL", 60)  # seconds
 # Throttle in-minute option upserts per contract/bucket to reduce UPDATE churn.
-OPTION_BUCKET_WRITE_MIN_SECONDS = float(os.getenv("OPTION_BUCKET_WRITE_MIN_SECONDS", "5"))
+OPTION_BUCKET_WRITE_MIN_SECONDS = _getenv_float("OPTION_BUCKET_WRITE_MIN_SECONDS", 5)
 
 # =============================================================================
 # Flow Classification Configuration
@@ -781,7 +775,7 @@ OPTION_BUCKET_WRITE_MIN_SECONDS = float(os.getenv("OPTION_BUCKET_WRITE_MIN_SECON
 # Default 0.70 widens the mid zone past nearest-neighbor so borderline
 # fills (e.g. a print at 5.57 with bid 5.53 / ask 5.58) land in mid_volume
 # rather than being credited as full ask volume.
-FLOW_CLASSIFY_MID_BAND_PCT = float(os.getenv("FLOW_CLASSIFY_MID_BAND_PCT", "0.70"))
+FLOW_CLASSIFY_MID_BAND_PCT = _getenv_float("FLOW_CLASSIFY_MID_BAND_PCT", 0.70)
 # Route the opening-auction bucket (09:30 ET) to mid_volume instead of running
 # Lee-Ready against post-open quotes that don't reflect the auction cross.
 FLOW_CLASSIFY_SKIP_OPEN_AUCTION = (
@@ -800,8 +794,8 @@ FLOW_CLASSIFY_SKIP_OPEN_AUCTION = (
 # trade being classified, fall back to the snapshot's own
 # (contemporaneous) NBBO, which is sampled together with the trade.
 # 0 disables the guard (always prior-tick; legacy behavior).
-FLOW_CLASSIFY_PRIOR_TICK_MAX_AGE_SECONDS = float(
-    os.getenv("FLOW_CLASSIFY_PRIOR_TICK_MAX_AGE_SECONDS", "10.0")
+FLOW_CLASSIFY_PRIOR_TICK_MAX_AGE_SECONDS = _getenv_float(
+    "FLOW_CLASSIFY_PRIOR_TICK_MAX_AGE_SECONDS", 10.0
 )
 
 # =============================================================================
@@ -851,48 +845,48 @@ IMPLIED_VOLATILITY_DEFAULT = _getenv_float("IMPLIED_VOLATILITY_DEFAULT", 0.20)  
 
 # IV Calculation
 IV_CALCULATION_ENABLED = os.getenv("IV_CALCULATION_ENABLED", "true").lower() == "true"
-IV_MAX_ITERATIONS = int(os.getenv("IV_MAX_ITERATIONS", "100"))
-IV_TOLERANCE = float(os.getenv("IV_TOLERANCE", "0.00001"))
-IV_MIN = float(os.getenv("IV_MIN", "0.01"))
-IV_MAX = float(os.getenv("IV_MAX", "5.0"))
+IV_MAX_ITERATIONS = _getenv_int("IV_MAX_ITERATIONS", 100)
+IV_TOLERANCE = _getenv_float("IV_TOLERANCE", 0.00001)
+IV_MIN = _getenv_float("IV_MIN", 0.01)
+IV_MAX = _getenv_float("IV_MAX", 5.0)
 # Windowed clamp telemetry for the IV solver. Every Newton iterate is
 # clamped into [IV_MIN, IV_MAX]; deep-OTM / near-expiry strikes saturate
 # the bounds as a matter of course, so a raw per-hit count is noise.
 # Instead the solver reports the *fraction of solves* that saturated over
 # a rolling window: INFO normally, WARNING only when that fraction is high
 # enough to suggest IV_MIN/IV_MAX are miscalibrated for the regime.
-IV_CLAMP_REPORT_INTERVAL_SECONDS = float(os.getenv("IV_CLAMP_REPORT_INTERVAL_SECONDS", "300"))
-IV_CLAMP_WARN_FRACTION = float(os.getenv("IV_CLAMP_WARN_FRACTION", "0.25"))
+IV_CLAMP_REPORT_INTERVAL_SECONDS = _getenv_float("IV_CLAMP_REPORT_INTERVAL_SECONDS", 300)
+IV_CLAMP_WARN_FRACTION = _getenv_float("IV_CLAMP_WARN_FRACTION", 0.25)
 
 # =============================================================================
 # Analytics Signal Configuration
 # =============================================================================
-SIGNAL_SMART_MONEY_DOMINANCE_RATIO = float(os.getenv("SIGNAL_SMART_MONEY_DOMINANCE_RATIO", "1.2"))
-SIGNAL_VWAP_DEV_BULL_THRESHOLD_PCT = float(os.getenv("SIGNAL_VWAP_DEV_BULL_THRESHOLD_PCT", "0.2"))
-SIGNAL_VWAP_DEV_BEAR_THRESHOLD_PCT = float(os.getenv("SIGNAL_VWAP_DEV_BEAR_THRESHOLD_PCT", "-0.2"))
-SIGNAL_PCR_BULLISH_THRESHOLD = float(os.getenv("SIGNAL_PCR_BULLISH_THRESHOLD", "0.7"))
-SIGNAL_PCR_BEARISH_THRESHOLD = float(os.getenv("SIGNAL_PCR_BEARISH_THRESHOLD", "1.3"))
+SIGNAL_SMART_MONEY_DOMINANCE_RATIO = _getenv_float("SIGNAL_SMART_MONEY_DOMINANCE_RATIO", 1.2)
+SIGNAL_VWAP_DEV_BULL_THRESHOLD_PCT = _getenv_float("SIGNAL_VWAP_DEV_BULL_THRESHOLD_PCT", 0.2)
+SIGNAL_VWAP_DEV_BEAR_THRESHOLD_PCT = _getenv_float("SIGNAL_VWAP_DEV_BEAR_THRESHOLD_PCT", -0.2)
+SIGNAL_PCR_BULLISH_THRESHOLD = _getenv_float("SIGNAL_PCR_BULLISH_THRESHOLD", 0.7)
+SIGNAL_PCR_BEARISH_THRESHOLD = _getenv_float("SIGNAL_PCR_BEARISH_THRESHOLD", 1.3)
 SIGNAL_AUTO_TUNE_ENABLED = os.getenv("SIGNAL_AUTO_TUNE_ENABLED", "true").lower() == "true"
-SIGNAL_AUTO_TUNE_LOOKBACK_DAYS = max(5, int(os.getenv("SIGNAL_AUTO_TUNE_LOOKBACK_DAYS", "20")))
-SIGNAL_AUTO_TUNE_MIN_SAMPLES = max(50, int(os.getenv("SIGNAL_AUTO_TUNE_MIN_SAMPLES", "250")))
+SIGNAL_AUTO_TUNE_LOOKBACK_DAYS = max(5, _getenv_int("SIGNAL_AUTO_TUNE_LOOKBACK_DAYS", 20))
+SIGNAL_AUTO_TUNE_MIN_SAMPLES = max(50, _getenv_int("SIGNAL_AUTO_TUNE_MIN_SAMPLES", 250))
 SIGNAL_IV_RANK_ENABLED = os.getenv("SIGNAL_IV_RANK_ENABLED", "false").lower() == "true"
 
 # =============================================================================
 # Volatility Expansion Configuration
 # =============================================================================
-VOL_SMART_MONEY_DOMINANCE_RATIO = float(os.getenv("VOL_SMART_MONEY_DOMINANCE_RATIO", "1.2"))
+VOL_SMART_MONEY_DOMINANCE_RATIO = _getenv_float("VOL_SMART_MONEY_DOMINANCE_RATIO", 1.2)
 # Calibrated for the industry-standard "dollar gamma per 1% move" GEX
 # convention (γ × OI × 100 × S² × 0.01).  Pre-fix values (-5e9 / -3e9) were
 # in the share-equivalent share scale; multiplied by ≈7 for SPY-magnitude
 # underlyings to keep the same regime classification.
-VOL_GAMMA_DEEP_NEGATIVE = float(os.getenv("VOL_GAMMA_DEEP_NEGATIVE", "-35000000000"))
-VOL_GAMMA_NEGATIVE = float(os.getenv("VOL_GAMMA_NEGATIVE", "-21000000000"))
-VOL_GAMMA_FLIP_NEAR_PCT = float(os.getenv("VOL_GAMMA_FLIP_NEAR_PCT", "0.003"))
-VOL_PCR_HIGH = float(os.getenv("VOL_PCR_HIGH", "1.8"))
-VOL_PCR_LOW = float(os.getenv("VOL_PCR_LOW", "0.4"))
+VOL_GAMMA_DEEP_NEGATIVE = _getenv_float("VOL_GAMMA_DEEP_NEGATIVE", -35000000000)
+VOL_GAMMA_NEGATIVE = _getenv_float("VOL_GAMMA_NEGATIVE", -21000000000)
+VOL_GAMMA_FLIP_NEAR_PCT = _getenv_float("VOL_GAMMA_FLIP_NEAR_PCT", 0.003)
+VOL_PCR_HIGH = _getenv_float("VOL_PCR_HIGH", 1.8)
+VOL_PCR_LOW = _getenv_float("VOL_PCR_LOW", 0.4)
 VOL_AUTO_TUNE_ENABLED = os.getenv("VOL_AUTO_TUNE_ENABLED", "true").lower() == "true"
-VOL_AUTO_TUNE_LOOKBACK_DAYS = max(5, int(os.getenv("VOL_AUTO_TUNE_LOOKBACK_DAYS", "30")))
-VOL_AUTO_TUNE_MIN_SAMPLES = max(50, int(os.getenv("VOL_AUTO_TUNE_MIN_SAMPLES", "250")))
+VOL_AUTO_TUNE_LOOKBACK_DAYS = max(5, _getenv_int("VOL_AUTO_TUNE_LOOKBACK_DAYS", 30))
+VOL_AUTO_TUNE_MIN_SAMPLES = max(50, _getenv_int("VOL_AUTO_TUNE_MIN_SAMPLES", 250))
 
 
 # =============================================================================
@@ -900,8 +894,8 @@ VOL_AUTO_TUNE_MIN_SAMPLES = max(50, int(os.getenv("VOL_AUTO_TUNE_MIN_SAMPLES", "
 # =============================================================================
 
 SIGNALS_UNDERLYINGS = os.getenv("SIGNALS_UNDERLYINGS", "SPY")
-SIGNALS_INTERVAL = max(1, int(os.getenv("SIGNALS_INTERVAL", "1")))
-SIGNALS_PORTFOLIO_SIZE = float(os.getenv("SIGNALS_PORTFOLIO_SIZE", "1000000"))
+SIGNALS_INTERVAL = max(1, _getenv_int("SIGNALS_INTERVAL", 1))
+SIGNALS_PORTFOLIO_SIZE = _getenv_float("SIGNALS_PORTFOLIO_SIZE", 1000000)
 
 # GEX normalization scale used to map net_gex into [-1, 1] for multiple
 # signal components (vol_expansion, strategy_builder, position optimizer).
@@ -932,11 +926,9 @@ POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS = (
 
 # Aggregate exposure limits — prevent the engine from piling into the same
 # direction without regard for what is already on the books.
-SIGNALS_MAX_OPEN_TRADES = int(os.getenv("SIGNALS_MAX_OPEN_TRADES", "3"))
-SIGNALS_MAX_PORTFOLIO_HEAT_PCT = float(os.getenv("SIGNALS_MAX_PORTFOLIO_HEAT_PCT", "0.06"))
-SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES = int(
-    os.getenv("SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES", "30")
-)
+SIGNALS_MAX_OPEN_TRADES = _getenv_int("SIGNALS_MAX_OPEN_TRADES", 3)
+SIGNALS_MAX_PORTFOLIO_HEAT_PCT = _getenv_float("SIGNALS_MAX_PORTFOLIO_HEAT_PCT", 0.06)
+SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES = _getenv_int("SIGNALS_SAME_DIRECTION_COOLDOWN_MINUTES", 30)
 SIGNALS_TRIGGER_THRESHOLD = _getenv_float("SIGNALS_TRIGGER_THRESHOLD", 0.50, min=0.0, max=1.0)
 # Asymmetric exit: once a position is open in a direction, conviction must
 # decay below this floor (lower than the entry trigger) before we close.
@@ -955,9 +947,9 @@ SIGNALS_TREND_THRESHOLD_BPS = _getenv_float(
     "SIGNALS_TREND_THRESHOLD_BPS", 15.0, min=0.0, max=10000.0
 )
 SIGNALS_TREND_LOOKBACK_BARS = _getenv_int("SIGNALS_TREND_LOOKBACK_BARS", 5, min=2, max=120)
-SIGNALS_TREND_CONFIRMATION_BARS = max(0, int(os.getenv("SIGNALS_TREND_CONFIRMATION_BARS", "3")))
+SIGNALS_TREND_CONFIRMATION_BARS = max(0, _getenv_int("SIGNALS_TREND_CONFIRMATION_BARS", 3))
 SIGNALS_TREND_CONFIRMATION_MIN_MATCH = max(
-    0, int(os.getenv("SIGNALS_TREND_CONFIRMATION_MIN_MATCH", "1"))
+    0, _getenv_int("SIGNALS_TREND_CONFIRMATION_MIN_MATCH", 1)
 )
 
 # -----------------------------------------------------------------------------
@@ -1209,8 +1201,8 @@ SIGNALS_GEX_STALE_BUFFER_SECONDS = _getenv_int(
 SIGNALS_DRS_HARD_GATES_ENABLED = (
     os.getenv("SIGNALS_DRS_HARD_GATES_ENABLED", "true").lower() == "true"
 )
-SIGNALS_DRS_CALL_ENTRY_MIN = float(os.getenv("SIGNALS_DRS_CALL_ENTRY_MIN", "0.40"))
-SIGNALS_DRS_PUT_ENTRY_MAX = float(os.getenv("SIGNALS_DRS_PUT_ENTRY_MAX", "0.20"))
+SIGNALS_DRS_CALL_ENTRY_MIN = _getenv_float("SIGNALS_DRS_CALL_ENTRY_MIN", 0.40)
+SIGNALS_DRS_PUT_ENTRY_MAX = _getenv_float("SIGNALS_DRS_PUT_ENTRY_MAX", 0.20)
 
 # -----------------------------------------------------------------------------
 # Conviction aggregation -- fights dilution from abstaining components
@@ -1225,16 +1217,12 @@ SIGNALS_CONVICTION_AGGREGATION_ENABLED = (
 # Absolute-score cutoff below which a component is treated as abstaining
 # (removed from the active-weight denominator). 0.02 keeps legitimately
 # near-zero directional reads in the pool while dropping hard zeros.
-SIGNALS_CONVICTION_ABSTAIN_EPSILON = float(os.getenv("SIGNALS_CONVICTION_ABSTAIN_EPSILON", "0.02"))
+SIGNALS_CONVICTION_ABSTAIN_EPSILON = _getenv_float("SIGNALS_CONVICTION_ABSTAIN_EPSILON", 0.02)
 # Maximum multiplier applied when all active components agree in direction.
-SIGNALS_CONVICTION_AGREEMENT_MAX_MULT = float(
-    os.getenv("SIGNALS_CONVICTION_AGREEMENT_MAX_MULT", "1.75")
-)
+SIGNALS_CONVICTION_AGREEMENT_MAX_MULT = _getenv_float("SIGNALS_CONVICTION_AGREEMENT_MAX_MULT", 1.75)
 # Extremity amplifier: extra boost when the loudest active component is
 # screaming. Applied multiplicatively on top of agreement.
-SIGNALS_CONVICTION_EXTREMITY_MAX_MULT = float(
-    os.getenv("SIGNALS_CONVICTION_EXTREMITY_MAX_MULT", "1.30")
-)
+SIGNALS_CONVICTION_EXTREMITY_MAX_MULT = _getenv_float("SIGNALS_CONVICTION_EXTREMITY_MAX_MULT", 1.30)
 
 # -----------------------------------------------------------------------------
 # Scalp-tier trigger -- second, lower threshold for reduced-size trades
@@ -1244,9 +1232,9 @@ SIGNALS_CONVICTION_EXTREMITY_MAX_MULT = float(
 # This captures the "split-second technical opportunities" use case without
 # requiring conviction-trade strength.
 SIGNALS_SCALP_TRIGGER_ENABLED = os.getenv("SIGNALS_SCALP_TRIGGER_ENABLED", "true").lower() == "true"
-SIGNALS_SCALP_TRIGGER_THRESHOLD = float(os.getenv("SIGNALS_SCALP_TRIGGER_THRESHOLD", "0.36"))
+SIGNALS_SCALP_TRIGGER_THRESHOLD = _getenv_float("SIGNALS_SCALP_TRIGGER_THRESHOLD", 0.36)
 # Fraction of normal Kelly-based contracts used for scalp-tier trades.
-SIGNALS_SCALP_SIZE_MULTIPLIER = float(os.getenv("SIGNALS_SCALP_SIZE_MULTIPLIER", "0.40"))
+SIGNALS_SCALP_SIZE_MULTIPLIER = _getenv_float("SIGNALS_SCALP_SIZE_MULTIPLIER", 0.40)
 
 # -----------------------------------------------------------------------------
 # Strong-conviction DRS override -- lets high-conviction reversals through
@@ -1254,13 +1242,13 @@ SIGNALS_SCALP_SIZE_MULTIPLIER = float(os.getenv("SIGNALS_SCALP_SIZE_MULTIPLIER",
 # already below the gamma flip, where the "fresh cross" rule fires once).
 # -----------------------------------------------------------------------------
 SIGNALS_DRS_OVERRIDE_ENABLED = os.getenv("SIGNALS_DRS_OVERRIDE_ENABLED", "true").lower() == "true"
-SIGNALS_DRS_OVERRIDE_THRESHOLD = float(os.getenv("SIGNALS_DRS_OVERRIDE_THRESHOLD", "0.70"))
+SIGNALS_DRS_OVERRIDE_THRESHOLD = _getenv_float("SIGNALS_DRS_OVERRIDE_THRESHOLD", 0.70)
 
 # Conviction uplift for a fresh gamma-flip cross in the signaled direction.
 # Previously "fresh cross" was a hard bearish-entry requirement; symmetrizing
 # the DRS gates moved it to an additive sizing boost applied after the gate
 # passes. 0.0 disables the boost.
-SIGNALS_DRS_FRESH_CROSS_BOOST = max(0.0, float(os.getenv("SIGNALS_DRS_FRESH_CROSS_BOOST", "0.20")))
+SIGNALS_DRS_FRESH_CROSS_BOOST = max(0.0, _getenv_float("SIGNALS_DRS_FRESH_CROSS_BOOST", 0.20))
 
 # -----------------------------------------------------------------------------
 # Independent signal trigger risk controls
@@ -1345,10 +1333,10 @@ def _jsonable_copy(value):
 
 # Session-phase segmentation for independent-trigger gating.
 SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN = max(
-    15, int(os.getenv("SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN", "75"))
+    15, _getenv_int("SIGNALS_INDEPENDENT_PHASE_SCALP_MINUTES_FROM_OPEN", 75)
 )
 SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE = max(
-    15, int(os.getenv("SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE", "90"))
+    15, _getenv_int("SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE", 90)
 )
 # Optional per-symbol overrides:
 #   {"SPY": 60, "QQQ": 45}
@@ -1361,13 +1349,13 @@ SIGNALS_INDEPENDENT_PHASE_SWING_MINUTES_TO_CLOSE_BY_SYMBOL = _parse_symbol_minut
 
 # Base threshold by phase (higher = stricter; all values clamped in [0,1]).
 SIGNALS_INDEPENDENT_THRESHOLD_SCALP = max(
-    0.0, min(1.0, float(os.getenv("SIGNALS_INDEPENDENT_THRESHOLD_SCALP", "0.38")))
+    0.0, min(1.0, _getenv_float("SIGNALS_INDEPENDENT_THRESHOLD_SCALP", 0.38))
 )
 SIGNALS_INDEPENDENT_THRESHOLD_INTRADAY = max(
-    0.0, min(1.0, float(os.getenv("SIGNALS_INDEPENDENT_THRESHOLD_INTRADAY", "0.30")))
+    0.0, min(1.0, _getenv_float("SIGNALS_INDEPENDENT_THRESHOLD_INTRADAY", 0.30))
 )
 SIGNALS_INDEPENDENT_THRESHOLD_SWING = max(
-    0.0, min(1.0, float(os.getenv("SIGNALS_INDEPENDENT_THRESHOLD_SWING", "0.34")))
+    0.0, min(1.0, _getenv_float("SIGNALS_INDEPENDENT_THRESHOLD_SWING", 0.34))
 )
 # Optional per-signal/per-phase overrides:
 # {"squeeze_setup":{"scalp":0.40,"intraday":0.33},"eod_pressure":{"swing":0.42}}
@@ -1380,26 +1368,26 @@ SIGNALS_INDEPENDENT_RISK_MULT_CONSERVATIVE = max(
     0.5,
     min(
         2.0,
-        float(os.getenv("SIGNALS_INDEPENDENT_RISK_MULT_CONSERVATIVE", "1.15")),
+        _getenv_float("SIGNALS_INDEPENDENT_RISK_MULT_CONSERVATIVE", 1.15),
     ),
 )
 SIGNALS_INDEPENDENT_RISK_MULT_BALANCED = max(
     0.5,
-    min(2.0, float(os.getenv("SIGNALS_INDEPENDENT_RISK_MULT_BALANCED", "1.00"))),
+    min(2.0, _getenv_float("SIGNALS_INDEPENDENT_RISK_MULT_BALANCED", 1.00)),
 )
 SIGNALS_INDEPENDENT_RISK_MULT_AGGRESSIVE = max(
     0.5,
-    min(2.0, float(os.getenv("SIGNALS_INDEPENDENT_RISK_MULT_AGGRESSIVE", "0.90"))),
+    min(2.0, _getenv_float("SIGNALS_INDEPENDENT_RISK_MULT_AGGRESSIVE", 0.90)),
 )
 
 # Hard floors to avoid over-loose thresholds even in aggressive profiles.
 SIGNALS_INDEPENDENT_MIN_THRESHOLD_SQUEEZE_SETUP = max(
     0.0,
-    min(1.0, float(os.getenv("SIGNALS_INDEPENDENT_MIN_THRESHOLD_SQUEEZE_SETUP", "0.25"))),
+    min(1.0, _getenv_float("SIGNALS_INDEPENDENT_MIN_THRESHOLD_SQUEEZE_SETUP", 0.25)),
 )
 SIGNALS_INDEPENDENT_MIN_THRESHOLD_TRAP_DETECTION = max(
     0.0,
-    min(1.0, float(os.getenv("SIGNALS_INDEPENDENT_MIN_THRESHOLD_TRAP_DETECTION", "0.25"))),
+    min(1.0, _getenv_float("SIGNALS_INDEPENDENT_MIN_THRESHOLD_TRAP_DETECTION", 0.25)),
 )
 SIGNALS_INDEPENDENT_MIN_THRESHOLD_ZERO_DTE_POSITION_IMBALANCE = max(
     0.0,
@@ -1417,16 +1405,16 @@ SIGNALS_INDEPENDENT_MIN_THRESHOLD_GAMMA_VWAP_CONFLUENCE = max(
     0.0,
     min(
         1.0,
-        float(os.getenv("SIGNALS_INDEPENDENT_MIN_THRESHOLD_GAMMA_VWAP_CONFLUENCE", "0.20")),
+        _getenv_float("SIGNALS_INDEPENDENT_MIN_THRESHOLD_GAMMA_VWAP_CONFLUENCE", 0.20),
     ),
 )
 SIGNALS_INDEPENDENT_MIN_THRESHOLD_VOL_EXPANSION = max(
     0.0,
-    min(1.0, float(os.getenv("SIGNALS_INDEPENDENT_MIN_THRESHOLD_VOL_EXPANSION", "0.25"))),
+    min(1.0, _getenv_float("SIGNALS_INDEPENDENT_MIN_THRESHOLD_VOL_EXPANSION", 0.25)),
 )
 SIGNALS_INDEPENDENT_MIN_THRESHOLD_EOD_PRESSURE = max(
     0.0,
-    min(1.0, float(os.getenv("SIGNALS_INDEPENDENT_MIN_THRESHOLD_EOD_PRESSURE", "0.20"))),
+    min(1.0, _getenv_float("SIGNALS_INDEPENDENT_MIN_THRESHOLD_EOD_PRESSURE", 0.20)),
 )
 
 # Per-signal risk profile knobs.
@@ -1470,16 +1458,14 @@ SIGNALS_CONTRARIAN_OVERRIDE_ENABLED = (
 SIGNALS_CONTRARIAN_REWEIGHT_ENABLED = (
     os.getenv("SIGNALS_CONTRARIAN_REWEIGHT_ENABLED", "true").lower() == "true"
 )
-SIGNALS_CONTRARIAN_REWEIGHT_MULT = max(
-    1.0, float(os.getenv("SIGNALS_CONTRARIAN_REWEIGHT_MULT", "1.45"))
-)
+SIGNALS_CONTRARIAN_REWEIGHT_MULT = max(1.0, _getenv_float("SIGNALS_CONTRARIAN_REWEIGHT_MULT", 1.45))
 SIGNALS_CONTRARIAN_OVERRIDE_THRESHOLD = max(
-    0.0, min(1.0, float(os.getenv("SIGNALS_CONTRARIAN_OVERRIDE_THRESHOLD", "0.60")))
+    0.0, min(1.0, _getenv_float("SIGNALS_CONTRARIAN_OVERRIDE_THRESHOLD", 0.60))
 )
 # Minimum composite magnitude before the override can fire. Prevents flipping
 # near-zero composites where the trend signal isn't really pointing anywhere.
 SIGNALS_CONTRARIAN_OVERRIDE_MIN_COMPOSITE = max(
-    0.0, float(os.getenv("SIGNALS_CONTRARIAN_OVERRIDE_MIN_COMPOSITE", "0.20"))
+    0.0, _getenv_float("SIGNALS_CONTRARIAN_OVERRIDE_MIN_COMPOSITE", 0.20)
 )
 
 # -----------------------------------------------------------------------------
@@ -1518,7 +1504,7 @@ SIGNALS_CONFLUENCE_ADVANCED_WEIGHT = _getenv_float(
 # Stop-loss as a fraction of trade outlay (entry_price * quantity * 100).
 # Default -0.25 means the trade is stopped out when it loses 25% of the
 # initial premium paid (debit trades) or 25% of max-risk (credit trades).
-SIGNALS_STOP_LOSS_PCT = float(os.getenv("SIGNALS_STOP_LOSS_PCT", "-0.25"))
+SIGNALS_STOP_LOSS_PCT = _getenv_float("SIGNALS_STOP_LOSS_PCT", -0.25)
 
 # Optional timeframe-specific stop/target overrides (fallback: global stop/target).
 SIGNALS_SCALP_STOP_LOSS_PCT = _getenv_float("SIGNALS_SCALP_STOP_LOSS_PCT", SIGNALS_STOP_LOSS_PCT)
@@ -1543,7 +1529,7 @@ SIGNALS_SWING_TARGET_PCT = _getenv_float("SIGNALS_SWING_TARGET_PCT", SIGNALS_TAR
 #   seller gets = bid * (1 - slippage)
 # Default 0.0 preserves historical behavior (pure bid/ask fill).  Typical
 # live-trading values are 0.01-0.03 (1-3%).
-SIGNALS_EXECUTION_SLIPPAGE_PCT = max(0.0, float(os.getenv("SIGNALS_EXECUTION_SLIPPAGE_PCT", "0.0")))
+SIGNALS_EXECUTION_SLIPPAGE_PCT = max(0.0, _getenv_float("SIGNALS_EXECUTION_SLIPPAGE_PCT", 0.0))
 
 # Reject option_chains quote rows older than this when marking an open trade
 # for stop/take-profit evaluation. Without this floor a quote-ingest stall
@@ -1560,21 +1546,17 @@ SIGNALS_OPTION_QUOTE_MAX_AGE_SECONDS = _getenv_int(
 
 INGEST_UNDERLYING = os.getenv("INGEST_UNDERLYING", "SPY")
 INGEST_UNDERLYINGS = os.getenv("INGEST_UNDERLYINGS", "")
-INGEST_EXPIRATIONS = int(os.getenv("INGEST_EXPIRATIONS", "3"))
-INGEST_STRIKE_COUNT_MAX = int(os.getenv("INGEST_STRIKE_COUNT_MAX", "40"))
-INGEST_STRIKE_PCT_RANGE = float(os.getenv("INGEST_STRIKE_PCT_RANGE", "3.0"))
+INGEST_EXPIRATIONS = _getenv_int("INGEST_EXPIRATIONS", 3)
+INGEST_STRIKE_COUNT_MAX = _getenv_int("INGEST_STRIKE_COUNT_MAX", 40)
+INGEST_STRIKE_PCT_RANGE = _getenv_float("INGEST_STRIKE_PCT_RANGE", 3.0)
 ANALYTICS_UNDERLYING = os.getenv("ANALYTICS_UNDERLYING", "SPY")
 ANALYTICS_UNDERLYINGS = os.getenv("ANALYTICS_UNDERLYINGS", "")
-ANALYTICS_INTERVAL = int(os.getenv("ANALYTICS_INTERVAL", "60"))
-ANALYTICS_SNAPSHOT_LOOKBACK_MINUTES = max(
-    1, int(os.getenv("ANALYTICS_SNAPSHOT_LOOKBACK_MINUTES", "5"))
-)
+ANALYTICS_INTERVAL = _getenv_int("ANALYTICS_INTERVAL", 60)
+ANALYTICS_SNAPSHOT_LOOKBACK_MINUTES = max(1, _getenv_int("ANALYTICS_SNAPSHOT_LOOKBACK_MINUTES", 5))
 ANALYTICS_SNAPSHOT_FRESHNESS_SECONDS = max(
-    30, int(os.getenv("ANALYTICS_SNAPSHOT_FRESHNESS_SECONDS", "180"))
+    30, _getenv_int("ANALYTICS_SNAPSHOT_FRESHNESS_SECONDS", 180)
 )
-ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT = float(
-    os.getenv("ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT", "0.35")
-)
+ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT = _getenv_float("ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT", 0.35)
 
 # TradeStation credential variables (used by service startup and helper scripts).
 TRADESTATION_CLIENT_ID = os.getenv("TRADESTATION_CLIENT_ID")
@@ -1585,8 +1567,8 @@ TRADESTATION_USE_SANDBOX = os.getenv("TRADESTATION_USE_SANDBOX", "false").lower(
 # TradeStation CLI test defaults.
 TS_TEST = os.getenv("TS_TEST", "all")
 TS_SYMBOL = os.getenv("TS_SYMBOL", "SPY")
-TS_BARS_BACK = int(os.getenv("TS_BARS_BACK", "5"))
-TS_INTERVAL = int(os.getenv("TS_INTERVAL", "1"))
+TS_BARS_BACK = _getenv_int("TS_BARS_BACK", 5)
+TS_INTERVAL = _getenv_int("TS_INTERVAL", 1)
 TS_UNIT = os.getenv("TS_UNIT", "Daily")
 TS_QUERY = os.getenv("TS_QUERY", "Apple")
 

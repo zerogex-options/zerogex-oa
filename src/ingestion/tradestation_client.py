@@ -21,6 +21,7 @@ from src.validation import safe_float, safe_int
 from src.symbols import parse_underlyings, resolve_option_root
 from src.market_calendar import NYSE_HOLIDAYS
 from src.config import (
+    _getenv_int,
     API_REQUEST_TIMEOUT,
     API_RETRY_ATTEMPTS,
     API_RETRY_DELAY,
@@ -31,7 +32,7 @@ logger = get_logger(__name__)
 
 # Eastern Time timezone
 ET = pytz.timezone("US/Eastern")
-STREAM_READ_TIMEOUT_SECONDS = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
+STREAM_READ_TIMEOUT_SECONDS = _getenv_int("TS_STREAM_READ_TIMEOUT", 300)
 STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").lower() == "true"
 STREAM_REUSE_QUOTES = os.getenv("TS_STREAM_REUSE_QUOTES", "false").lower() == "true"
 
@@ -983,8 +984,8 @@ Examples:
     # Load environment variable defaults
     test = args.test if args.test else os.getenv("TS_TEST", "all")
     symbol = args.symbol if args.symbol else os.getenv("TS_SYMBOL", "SPY")
-    bars_back = args.bars_back if args.bars_back else int(os.getenv("TS_BARS_BACK", "5"))
-    interval = args.interval if args.interval else int(os.getenv("TS_INTERVAL", "1"))
+    bars_back = args.bars_back if args.bars_back else _getenv_int("TS_BARS_BACK", 5)
+    interval = args.interval if args.interval else _getenv_int("TS_INTERVAL", 1)
     unit = args.unit if args.unit else os.getenv("TS_UNIT", "Daily")
     query = args.query if args.query else os.getenv("TS_QUERY", "Apple")
     expiration = args.expiration if args.expiration else None

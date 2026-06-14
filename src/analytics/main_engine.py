@@ -3789,13 +3789,13 @@ def main():
     parser.add_argument(
         "--interval",
         type=int,
-        default=int(os.getenv("ANALYTICS_INTERVAL", "60")),
+        default=_getenv_int("ANALYTICS_INTERVAL", 60),
         help="Calculation interval in seconds (default: 60)",
     )
     parser.add_argument(
         "--risk-free-rate",
         type=float,
-        default=float(os.getenv("RISK_FREE_RATE", "0.05")),
+        default=_getenv_float("RISK_FREE_RATE", 0.05),
         help="Risk-free rate (default: 0.05)",
     )
     parser.add_argument("--once", action="store_true", help="Run once and exit (for testing)")

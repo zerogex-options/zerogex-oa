@@ -37,6 +37,7 @@ import requests as _requests
 
 from src.ingestion.tradestation_client import TradeStationClient
 from src.database import db_connection, close_connection_pool
+from src.config import _getenv_int
 from src.utils import get_logger
 from src.validation import (
     safe_float,
@@ -54,14 +55,14 @@ VIX_SYMBOL = "$VIX.X"
 VIX_BAR_INTERVAL = 5
 VIX_BAR_UNIT = "Minute"
 # Seed enough bars on first connect to cover ~2 trading sessions (≈156 bars).
-VIX_INITIAL_BARSBACK = int(os.getenv("VIX_INITIAL_BARSBACK", "160"))
+VIX_INITIAL_BARSBACK = _getenv_int("VIX_INITIAL_BARSBACK", 160)
 # On reconnect, request just enough history to cover short outages.
-VIX_POLL_BARSBACK = int(os.getenv("VIX_POLL_BARSBACK", "3"))
-VIX_BARS_RETENTION_DAYS = int(os.getenv("VIX_BARS_RETENTION_DAYS", "7"))
+VIX_POLL_BARSBACK = _getenv_int("VIX_POLL_BARSBACK", 3)
+VIX_BARS_RETENTION_DAYS = _getenv_int("VIX_BARS_RETENTION_DAYS", 7)
 
 # How long the stream reader waits for the next event before timing out.
 # Shared env var with the main stream manager so operators tune one knob.
-_STREAM_READ_TIMEOUT = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
+_STREAM_READ_TIMEOUT = _getenv_int("TS_STREAM_READ_TIMEOUT", 300)
 
 # Session template for the bar stream; "Default" matches the prior REST poll.
 _SESSION_TEMPLATE = "Default"

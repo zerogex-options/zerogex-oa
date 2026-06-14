@@ -37,6 +37,8 @@ from src.validation import (
 )
 from src.symbols import resolve_option_root
 from src.config import (
+    _getenv_int,
+    _getenv_float,
     OPTION_BATCH_SIZE,
     DELAY_BETWEEN_BATCHES,
     MARKET_HOURS_POLL_INTERVAL,
@@ -63,15 +65,15 @@ ET = pytz.timezone("US/Eastern")
 
 # Stream read timeout — how long the background reader waits for the next
 # event before the socket times out (triggers a reconnect).
-_STREAM_READ_TIMEOUT = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
+_STREAM_READ_TIMEOUT = _getenv_int("TS_STREAM_READ_TIMEOUT", 300)
 
 # JSON decode error budgeting.  Streams sometimes emit partial/garbled
 # lines, and swallowing them silently masks real outages (expired session,
 # proxy truncation, etc).  We log a WARNING every N failures and raise
 # once the per-minute rate exceeds the threshold so the outer reader loop
 # tears down the connection and reconnects with a fresh token.
-_DECODE_WARN_EVERY = int(os.getenv("TS_STREAM_DECODE_WARN_EVERY", "100"))
-_DECODE_MAX_PER_MINUTE = int(os.getenv("TS_STREAM_DECODE_MAX_PER_MINUTE", "50"))
+_DECODE_WARN_EVERY = _getenv_int("TS_STREAM_DECODE_WARN_EVERY", 100)
+_DECODE_MAX_PER_MINUTE = _getenv_int("TS_STREAM_DECODE_MAX_PER_MINUTE", 50)
 
 # A stream that connects (200 OK) and then ends within this many seconds
 # almost certainly hit the TradeStation per-account concurrent-stream cap
@@ -80,7 +82,7 @@ _DECODE_MAX_PER_MINUTE = int(os.getenv("TS_STREAM_DECODE_MAX_PER_MINUTE", "50"))
 # fingerprint is the short lifetime. Reader loops emit a dedicated
 # cap-exhaustion WARNING when a connection ends inside this window so
 # the symptom is named instead of looking like a generic disconnect.
-_STREAM_CAP_SUSPECT_SECONDS = int(os.getenv("TS_STREAM_CAP_SUSPECT_SECONDS", "30"))
+_STREAM_CAP_SUSPECT_SECONDS = _getenv_int("TS_STREAM_CAP_SUSPECT_SECONDS", 30)
 
 # When a stream connects (200 OK) and ends without delivering ANY data,
 # TradeStation's upstream gateway is the likely culprit rather than the
@@ -88,8 +90,8 @@ _STREAM_CAP_SUSPECT_SECONDS = int(os.getenv("TS_STREAM_CAP_SUSPECT_SECONDS", "30
 # Reader loops only sleep on raised exceptions, so a clean iter_lines()
 # return immediately retries — back off this many seconds in the
 # finally block to keep an upstream blip from hot-looping at 10 Hz.
-_STREAM_DEGRADED_UPSTREAM_BACKOFF_SECONDS = int(
-    os.getenv("TS_STREAM_DEGRADED_UPSTREAM_BACKOFF_SECONDS", "2")
+_STREAM_DEGRADED_UPSTREAM_BACKOFF_SECONDS = _getenv_int(
+    "TS_STREAM_DEGRADED_UPSTREAM_BACKOFF_SECONDS", 2
 )
 
 # Reconnect backoff for the background reader loops. A flat 2s retry meant
@@ -98,12 +100,12 @@ _STREAM_DEGRADED_UPSTREAM_BACKOFF_SECONDS = int(
 # herd that perpetuated the very per-account concurrent-stream-cap exhaustion
 # the cap classifier diagnoses. Use exponential backoff with jitter, capped,
 # and reset once a connection has stayed healthy.
-_STREAM_RECONNECT_BASE_SECONDS = float(os.getenv("TS_STREAM_RECONNECT_BASE_SECONDS", "2.0"))
-_STREAM_RECONNECT_MAX_SECONDS = float(os.getenv("TS_STREAM_RECONNECT_MAX_SECONDS", "60.0"))
+_STREAM_RECONNECT_BASE_SECONDS = _getenv_float("TS_STREAM_RECONNECT_BASE_SECONDS", 2.0)
+_STREAM_RECONNECT_MAX_SECONDS = _getenv_float("TS_STREAM_RECONNECT_MAX_SECONDS", 60.0)
 # A connection that stayed open at least this long is treated as healthy, so
 # the next disconnect starts its backoff from scratch instead of carrying a
 # stale failure count forward.
-_STREAM_RECONNECT_HEALTHY_SECONDS = float(os.getenv("TS_STREAM_RECONNECT_HEALTHY_SECONDS", "30.0"))
+_STREAM_RECONNECT_HEALTHY_SECONDS = _getenv_float("TS_STREAM_RECONNECT_HEALTHY_SECONDS", 30.0)
 
 
 def _stream_reconnect_delay(consecutive_failures: int) -> float:
@@ -1067,23 +1069,23 @@ class StreamManager:
 
         # Track last expiration refresh time
         self.last_expiration_refresh: Optional[datetime] = None
-        self.option_oi_coverage_alert_threshold = float(
-            os.getenv("OPTION_OI_COVERAGE_ALERT_THRESHOLD", "0.35")
+        self.option_oi_coverage_alert_threshold = _getenv_float(
+            "OPTION_OI_COVERAGE_ALERT_THRESHOLD", 0.35
         )
-        self.option_volume_coverage_alert_threshold = float(
-            os.getenv("OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD", "0.35")
+        self.option_volume_coverage_alert_threshold = _getenv_float(
+            "OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD", 0.35
         )
         # Volume is cumulative for the day; the first ~30 min after open
         # are a natural ramp where most contracts haven't traded yet, so
         # gate the warning on a warmup window past 09:30 ET.
-        self.option_volume_warmup_minutes = int(os.getenv("OPTION_VOLUME_WARMUP_MINUTES", "30"))
+        self.option_volume_warmup_minutes = _getenv_int("OPTION_VOLUME_WARMUP_MINUTES", 30)
         # OI is sticky in the accumulator (only overwritten by positive
         # values), but the REST seed and stream may not carry yesterday's
         # settled OI before the regular open — so contracts that tick in
         # pre-market often still show OI=0. Gate the alarm on a short
         # warmup past 09:30 ET so the warning only fires when a genuine
         # gap persists into the regular session.
-        self.option_oi_warmup_minutes = int(os.getenv("OPTION_OI_WARMUP_MINUTES", "5"))
+        self.option_oi_warmup_minutes = _getenv_int("OPTION_OI_WARMUP_MINUTES", 5)
         self.seed_rest_on_recalc = (
             os.getenv("OPTION_REST_SEED_ON_RECALC", "false").lower() == "true"
         )
@@ -2166,19 +2168,19 @@ def main():
     parser.add_argument(
         "--expirations",
         type=int,
-        default=int(os.getenv("INGEST_EXPIRATIONS", "3")),
+        default=_getenv_int("INGEST_EXPIRATIONS", 3),
         help="Number of expirations to track (default: 3)",
     )
     parser.add_argument(
         "--strike-count-max",
         type=int,
-        default=int(os.getenv("INGEST_STRIKE_COUNT_MAX", "40")),
+        default=_getenv_int("INGEST_STRIKE_COUNT_MAX", 40),
         help="Hard cap on strikes per expiration after the pct-range filter (default: 40)",
     )
     parser.add_argument(
         "--strike-pct-range",
         type=float,
-        default=float(os.getenv("INGEST_STRIKE_PCT_RANGE", "3.0")),
+        default=_getenv_float("INGEST_STRIKE_PCT_RANGE", 3.0),
         help="Strike-selection band as percent of spot, e.g. 3.0 -> ±3%% (default: 3.0)",
     )
     parser.add_argument(
