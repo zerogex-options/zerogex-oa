@@ -38,6 +38,7 @@ from src.validation import (
 from src.symbols import resolve_option_root
 from src.config import (
     _getenv_int,
+    _getenv_bool,
     _getenv_float,
     OPTION_BATCH_SIZE,
     DELAY_BETWEEN_BATCHES,
@@ -1086,9 +1087,7 @@ class StreamManager:
         # warmup past 09:30 ET so the warning only fires when a genuine
         # gap persists into the regular session.
         self.option_oi_warmup_minutes = _getenv_int("OPTION_OI_WARMUP_MINUTES", 5)
-        self.seed_rest_on_recalc = (
-            os.getenv("OPTION_REST_SEED_ON_RECALC", "false").lower() == "true"
-        )
+        self.seed_rest_on_recalc = _getenv_bool("OPTION_REST_SEED_ON_RECALC", False)
         # Session-cumulative set of option symbols seen with Volume>0 since the
         # ET day rollover. Kept on the StreamManager (NOT the per-cycle
         # accumulator, which is torn down and rebuilt without a REST re-seed
@@ -2214,7 +2213,7 @@ def main():
         os.getenv("TRADESTATION_CLIENT_ID"),
         os.getenv("TRADESTATION_CLIENT_SECRET"),
         os.getenv("TRADESTATION_REFRESH_TOKEN"),
-        sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true",
+        sandbox=_getenv_bool("TRADESTATION_USE_SANDBOX", False),
     )
 
     # Initialize stream manager

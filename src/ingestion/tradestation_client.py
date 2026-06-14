@@ -22,6 +22,7 @@ from src.symbols import parse_underlyings, resolve_option_root
 from src.market_calendar import NYSE_HOLIDAYS
 from src.config import (
     _getenv_int,
+    _getenv_bool,
     API_REQUEST_TIMEOUT,
     API_RETRY_ATTEMPTS,
     API_RETRY_DELAY,
@@ -33,8 +34,8 @@ logger = get_logger(__name__)
 # Eastern Time timezone
 ET = pytz.timezone("US/Eastern")
 STREAM_READ_TIMEOUT_SECONDS = _getenv_int("TS_STREAM_READ_TIMEOUT", 300)
-STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").lower() == "true"
-STREAM_REUSE_QUOTES = os.getenv("TS_STREAM_REUSE_QUOTES", "false").lower() == "true"
+STREAM_REUSE_CONNECTIONS = _getenv_bool("TS_STREAM_REUSE_CONNECTIONS", False)
+STREAM_REUSE_QUOTES = _getenv_bool("TS_STREAM_REUSE_QUOTES", False)
 
 
 def _load_nyse_half_days() -> set:
@@ -92,7 +93,7 @@ class TradeStationClient:
         self._api_call_window_writer: Optional[Callable[[datetime, int], None]] = None
 
         # Check if market hours warnings should be suppressed
-        self.warn_market_hours = os.getenv("TS_WARN_MARKET_HOURS", "true").lower() != "false"
+        self.warn_market_hours = _getenv_bool("TS_WARN_MARKET_HOURS", True)
 
         if sandbox:
             logger.warning(f"Using SANDBOX environment [{self.base_url}]")
@@ -1008,7 +1009,7 @@ Examples:
         os.getenv("TRADESTATION_CLIENT_ID"),
         os.getenv("TRADESTATION_CLIENT_SECRET"),
         os.getenv("TRADESTATION_REFRESH_TOKEN"),
-        sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true",
+        sandbox=_getenv_bool("TRADESTATION_USE_SANDBOX", False),
     )
 
     try:

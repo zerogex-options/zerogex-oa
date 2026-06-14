@@ -40,6 +40,24 @@ def test_config_constants_tolerate_inline_comments(monkeypatch):
     assert c.MAX_BUFFER_SIZE == 1000
 
 
+def test_boolean_flags_tolerate_inline_comments(monkeypatch):
+    # A commented bool used to silently flip: "true  # on".lower() == "true"
+    # is False, so the flag fell back to the wrong value with no error.
+    c = _reload_with(
+        {
+            "GREEKS_ENABLED": "true   # keep on",
+            "IV_CALCULATION_ENABLED": "yes  # also on",
+            "TS_WARN_MARKET_HOURS": "false  # quiet please",
+            "OPTION_REST_SEED_ON_RECALC": "on  # enable",
+        },
+        monkeypatch,
+    )
+    assert c.GREEKS_ENABLED is True
+    assert c.IV_CALCULATION_ENABLED is True
+    assert c.TS_WARN_MARKET_HOURS is False
+    assert c.OPTION_REST_SEED_ON_RECALC is True
+
+
 def test_auth_refresh_fields_tolerate_inline_comments(monkeypatch):
     monkeypatch.setenv("API_REQUEST_TIMEOUT", "30          # seconds")
     monkeypatch.setenv("TS_REFRESH_MAX_ATTEMPTS", "3  # retries")

@@ -16,7 +16,7 @@ from threading import Lock
 from typing import Optional
 import fcntl
 from src.utils import get_logger
-from src.config import _getenv_int, _getenv_float, API_REQUEST_TIMEOUT
+from src.config import _getenv_int, _getenv_bool, _getenv_float, API_REQUEST_TIMEOUT
 
 # Initialize logger
 logger = get_logger(__name__)
@@ -350,7 +350,7 @@ def main():
         os.getenv("TRADESTATION_CLIENT_ID"),
         os.getenv("TRADESTATION_CLIENT_SECRET"),
         os.getenv("TRADESTATION_REFRESH_TOKEN"),
-        sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true",
+        sandbox=_getenv_bool("TRADESTATION_USE_SANDBOX", False),
     )
 
     try:

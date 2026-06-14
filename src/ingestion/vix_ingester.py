@@ -37,7 +37,7 @@ import requests as _requests
 
 from src.ingestion.tradestation_client import TradeStationClient
 from src.database import db_connection, close_connection_pool
-from src.config import _getenv_int
+from src.config import _getenv_int, _getenv_bool
 from src.utils import get_logger
 from src.validation import (
     safe_float,
@@ -372,7 +372,7 @@ def main() -> None:
         os.getenv("TRADESTATION_CLIENT_ID", ""),
         os.getenv("TRADESTATION_CLIENT_SECRET", ""),
         os.getenv("TRADESTATION_REFRESH_TOKEN", ""),
-        sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true",
+        sandbox=_getenv_bool("TRADESTATION_USE_SANDBOX", False),
     )
 
     # Wire up the API-calls DB writer so this child process also contributes

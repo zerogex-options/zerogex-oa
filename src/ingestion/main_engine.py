@@ -43,6 +43,7 @@ from src.validation import (
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.config import (
     _getenv_int,
+    _getenv_bool,
     _getenv_float,
     AGGREGATION_BUCKET_SECONDS,
     MAX_BUFFER_SIZE,
@@ -2017,7 +2018,7 @@ def main():
             os.getenv("TRADESTATION_CLIENT_ID"),  # type: ignore[arg-type]
             os.getenv("TRADESTATION_CLIENT_SECRET"),  # type: ignore[arg-type]
             os.getenv("TRADESTATION_REFRESH_TOKEN"),  # type: ignore[arg-type]
-            sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true",
+            sandbox=_getenv_bool("TRADESTATION_USE_SANDBOX", False),
         )
         attach_db_writer(client)
         engine = IngestionEngine(
@@ -2036,7 +2037,7 @@ def main():
 
     # Always run the VIX ingester alongside the per-symbol engines so that
     # /api/market/vix can read from `vix_bars` without hitting TradeStation.
-    vix_enabled = os.getenv("INGEST_VIX_ENABLED", "true").lower() != "false"
+    vix_enabled = _getenv_bool("INGEST_VIX_ENABLED", True)
 
     if len(symbols) == 1 and not vix_enabled:
         run_for_symbol(symbols[0])

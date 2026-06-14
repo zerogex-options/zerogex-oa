@@ -573,7 +573,7 @@ STRIKE_CLEANUP_INTERVAL = _getenv_int("STRIKE_CLEANUP_INTERVAL", 100)  # iterati
 # Options: "Default" (9:30-16:00), "USEQPre" (4:00-9:30), "USEQ24Hour" (4:00-20:00)
 SESSION_TEMPLATE = os.getenv("SESSION_TEMPLATE", "Default")
 TS_STREAM_READ_TIMEOUT = _getenv_int("TS_STREAM_READ_TIMEOUT", 300)
-TS_STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").lower() == "true"
+TS_STREAM_REUSE_CONNECTIONS = _getenv_bool("TS_STREAM_REUSE_CONNECTIONS", False)
 
 # Streaming quotes endpoint encodes the symbol list in the URL path. With
 # ~1000+ option contracts tracked, a single-connection URL exceeds ~25KB
@@ -698,20 +698,18 @@ UNDERLYING_STREAM_MAX_RESTART_ATTEMPTS = _getenv_int("UNDERLYING_STREAM_MAX_REST
 UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS = _getenv_int(
     "UNDERLYING_STREAM_BACKOFF_RETRY_INTERVAL_SECONDS", 600
 )
-TS_STREAM_REUSE_QUOTES = os.getenv("TS_STREAM_REUSE_QUOTES", "false").lower() == "true"
-TS_WARN_MARKET_HOURS = os.getenv("TS_WARN_MARKET_HOURS", "true").lower() != "false"
+TS_STREAM_REUSE_QUOTES = _getenv_bool("TS_STREAM_REUSE_QUOTES", False)
+TS_WARN_MARKET_HOURS = _getenv_bool("TS_WARN_MARKET_HOURS", True)
 OPTION_OI_COVERAGE_ALERT_THRESHOLD = _getenv_float("OPTION_OI_COVERAGE_ALERT_THRESHOLD", 0.35)
 OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD = _getenv_float(
     "OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD", 0.35
 )
 OPTION_VOLUME_WARMUP_MINUTES = _getenv_int("OPTION_VOLUME_WARMUP_MINUTES", 30)
 OPTION_OI_WARMUP_MINUTES = _getenv_int("OPTION_OI_WARMUP_MINUTES", 5)
-OPTION_REST_SEED_ON_RECALC = os.getenv("OPTION_REST_SEED_ON_RECALC", "false").lower() == "true"
+OPTION_REST_SEED_ON_RECALC = _getenv_bool("OPTION_REST_SEED_ON_RECALC", False)
 FLOW_CACHE_REFRESH_MIN_SECONDS = _getenv_float("FLOW_CACHE_REFRESH_MIN_SECONDS", 15)
-FLOW_CANONICAL_ONLY = os.getenv("FLOW_CANONICAL_ONLY", "true").lower() == "true"
-ANALYTICS_FLOW_CACHE_REFRESH_ENABLED = (
-    os.getenv("ANALYTICS_FLOW_CACHE_REFRESH_ENABLED", "true").lower() == "true"
-)
+FLOW_CANONICAL_ONLY = _getenv_bool("FLOW_CANONICAL_ONLY", True)
+ANALYTICS_FLOW_CACHE_REFRESH_ENABLED = _getenv_bool("ANALYTICS_FLOW_CACHE_REFRESH_ENABLED", True)
 TS_REFRESH_BUFFER_SECONDS = _getenv_int("TS_REFRESH_BUFFER_SECONDS", 30)
 TS_MIN_FORCE_REFRESH_INTERVAL_SECONDS = _getenv_int("TS_MIN_FORCE_REFRESH_INTERVAL_SECONDS", 60)
 LATEST_QUOTE_CACHE_TTL_SECONDS = _getenv_float("LATEST_QUOTE_CACHE_TTL_SECONDS", 1.5)
@@ -778,9 +776,7 @@ OPTION_BUCKET_WRITE_MIN_SECONDS = _getenv_float("OPTION_BUCKET_WRITE_MIN_SECONDS
 FLOW_CLASSIFY_MID_BAND_PCT = _getenv_float("FLOW_CLASSIFY_MID_BAND_PCT", 0.70)
 # Route the opening-auction bucket (09:30 ET) to mid_volume instead of running
 # Lee-Ready against post-open quotes that don't reflect the auction cross.
-FLOW_CLASSIFY_SKIP_OPEN_AUCTION = (
-    os.getenv("FLOW_CLASSIFY_SKIP_OPEN_AUCTION", "true").lower() == "true"
-)
+FLOW_CLASSIFY_SKIP_OPEN_AUCTION = _getenv_bool("FLOW_CLASSIFY_SKIP_OPEN_AUCTION", True)
 # Staleness guard for the Lee-Ready prior-tick quote.  Classification
 # normally compares a trade against the NBBO that prevailed *before* it
 # (the prior tick), which avoids crediting a marketable order against the
@@ -810,7 +806,7 @@ OPTION_ROOT_ALIASES = os.getenv("OPTION_ROOT_ALIASES", "")
 # =============================================================================
 
 # Greeks Calculation
-GREEKS_ENABLED = os.getenv("GREEKS_ENABLED", "true").lower() == "true"
+GREEKS_ENABLED = _getenv_bool("GREEKS_ENABLED", True)
 RISK_FREE_RATE = _getenv_float("RISK_FREE_RATE", 0.05)  # 5%
 # Continuous dividend yield (q) for the Black-Scholes-Merton model. Default
 # 0.0 keeps every Greek/price byte-identical to the prior dividend-free model
@@ -844,7 +840,7 @@ def resolve_dividend_yield(symbol: str) -> float:
 IMPLIED_VOLATILITY_DEFAULT = _getenv_float("IMPLIED_VOLATILITY_DEFAULT", 0.20)  # 20%
 
 # IV Calculation
-IV_CALCULATION_ENABLED = os.getenv("IV_CALCULATION_ENABLED", "true").lower() == "true"
+IV_CALCULATION_ENABLED = _getenv_bool("IV_CALCULATION_ENABLED", True)
 IV_MAX_ITERATIONS = _getenv_int("IV_MAX_ITERATIONS", 100)
 IV_TOLERANCE = _getenv_float("IV_TOLERANCE", 0.00001)
 IV_MIN = _getenv_float("IV_MIN", 0.01)
@@ -866,10 +862,10 @@ SIGNAL_VWAP_DEV_BULL_THRESHOLD_PCT = _getenv_float("SIGNAL_VWAP_DEV_BULL_THRESHO
 SIGNAL_VWAP_DEV_BEAR_THRESHOLD_PCT = _getenv_float("SIGNAL_VWAP_DEV_BEAR_THRESHOLD_PCT", -0.2)
 SIGNAL_PCR_BULLISH_THRESHOLD = _getenv_float("SIGNAL_PCR_BULLISH_THRESHOLD", 0.7)
 SIGNAL_PCR_BEARISH_THRESHOLD = _getenv_float("SIGNAL_PCR_BEARISH_THRESHOLD", 1.3)
-SIGNAL_AUTO_TUNE_ENABLED = os.getenv("SIGNAL_AUTO_TUNE_ENABLED", "true").lower() == "true"
+SIGNAL_AUTO_TUNE_ENABLED = _getenv_bool("SIGNAL_AUTO_TUNE_ENABLED", True)
 SIGNAL_AUTO_TUNE_LOOKBACK_DAYS = max(5, _getenv_int("SIGNAL_AUTO_TUNE_LOOKBACK_DAYS", 20))
 SIGNAL_AUTO_TUNE_MIN_SAMPLES = max(50, _getenv_int("SIGNAL_AUTO_TUNE_MIN_SAMPLES", 250))
-SIGNAL_IV_RANK_ENABLED = os.getenv("SIGNAL_IV_RANK_ENABLED", "false").lower() == "true"
+SIGNAL_IV_RANK_ENABLED = _getenv_bool("SIGNAL_IV_RANK_ENABLED", False)
 
 # =============================================================================
 # Volatility Expansion Configuration
@@ -884,7 +880,7 @@ VOL_GAMMA_NEGATIVE = _getenv_float("VOL_GAMMA_NEGATIVE", -21000000000)
 VOL_GAMMA_FLIP_NEAR_PCT = _getenv_float("VOL_GAMMA_FLIP_NEAR_PCT", 0.003)
 VOL_PCR_HIGH = _getenv_float("VOL_PCR_HIGH", 1.8)
 VOL_PCR_LOW = _getenv_float("VOL_PCR_LOW", 0.4)
-VOL_AUTO_TUNE_ENABLED = os.getenv("VOL_AUTO_TUNE_ENABLED", "true").lower() == "true"
+VOL_AUTO_TUNE_ENABLED = _getenv_bool("VOL_AUTO_TUNE_ENABLED", True)
 VOL_AUTO_TUNE_LOOKBACK_DAYS = max(5, _getenv_int("VOL_AUTO_TUNE_LOOKBACK_DAYS", 30))
 VOL_AUTO_TUNE_MIN_SAMPLES = max(50, _getenv_int("VOL_AUTO_TUNE_MIN_SAMPLES", 250))
 
@@ -920,8 +916,8 @@ SIGNAL_GEX_NORMALIZATION = _getenv_float("SIGNAL_GEX_NORMALIZATION", 2_100_000_0
 # Raise it to widen the dynamic range (more cycles read as Medium);
 # lower it to compress (more cycles saturate at the extremes).
 GEX_SCALE_INVARIANT_SATURATION = _getenv_float("GEX_SCALE_INVARIANT_SATURATION", 100.0, min=1.0)
-POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS = (
-    os.getenv("POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS", "false").lower() == "true"
+POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS = _getenv_bool(
+    "POSITION_OPTIMIZER_VERBOSE_DIAGNOSTICS", False
 )
 
 # Aggregate exposure limits — prevent the engine from piling into the same
@@ -1198,9 +1194,7 @@ SIGNALS_DRAWDOWN_SIZE_MULTIPLIER = _getenv_float(
 SIGNALS_GEX_STALE_BUFFER_SECONDS = _getenv_int(
     "SIGNALS_GEX_STALE_BUFFER_SECONDS", 0, min=0, max=3600
 )
-SIGNALS_DRS_HARD_GATES_ENABLED = (
-    os.getenv("SIGNALS_DRS_HARD_GATES_ENABLED", "true").lower() == "true"
-)
+SIGNALS_DRS_HARD_GATES_ENABLED = _getenv_bool("SIGNALS_DRS_HARD_GATES_ENABLED", True)
 SIGNALS_DRS_CALL_ENTRY_MIN = _getenv_float("SIGNALS_DRS_CALL_ENTRY_MIN", 0.40)
 SIGNALS_DRS_PUT_ENTRY_MAX = _getenv_float("SIGNALS_DRS_PUT_ENTRY_MAX", 0.20)
 
@@ -1211,8 +1205,8 @@ SIGNALS_DRS_PUT_ENTRY_MAX = _getenv_float("SIGNALS_DRS_PUT_ENTRY_MAX", 0.20)
 # the active (non-abstaining) components, then applies an agreement and an
 # extremity amplifier so that 8 components all screaming the same direction
 # isn't averaged down to 0.2 by 6 quiet ones.
-SIGNALS_CONVICTION_AGGREGATION_ENABLED = (
-    os.getenv("SIGNALS_CONVICTION_AGGREGATION_ENABLED", "true").lower() == "true"
+SIGNALS_CONVICTION_AGGREGATION_ENABLED = _getenv_bool(
+    "SIGNALS_CONVICTION_AGGREGATION_ENABLED", True
 )
 # Absolute-score cutoff below which a component is treated as abstaining
 # (removed from the active-weight denominator). 0.02 keeps legitimately
@@ -1231,7 +1225,7 @@ SIGNALS_CONVICTION_EXTREMITY_MAX_MULT = _getenv_float("SIGNALS_CONVICTION_EXTREM
 # SIGNALS_TRIGGER_THRESHOLD, the engine opens a smaller ("scalp") position.
 # This captures the "split-second technical opportunities" use case without
 # requiring conviction-trade strength.
-SIGNALS_SCALP_TRIGGER_ENABLED = os.getenv("SIGNALS_SCALP_TRIGGER_ENABLED", "true").lower() == "true"
+SIGNALS_SCALP_TRIGGER_ENABLED = _getenv_bool("SIGNALS_SCALP_TRIGGER_ENABLED", True)
 SIGNALS_SCALP_TRIGGER_THRESHOLD = _getenv_float("SIGNALS_SCALP_TRIGGER_THRESHOLD", 0.36)
 # Fraction of normal Kelly-based contracts used for scalp-tier trades.
 SIGNALS_SCALP_SIZE_MULTIPLIER = _getenv_float("SIGNALS_SCALP_SIZE_MULTIPLIER", 0.40)
@@ -1241,7 +1235,7 @@ SIGNALS_SCALP_SIZE_MULTIPLIER = _getenv_float("SIGNALS_SCALP_SIZE_MULTIPLIER", 0
 # even when the DRS hard gates would block them (e.g. bearish entry on a day
 # already below the gamma flip, where the "fresh cross" rule fires once).
 # -----------------------------------------------------------------------------
-SIGNALS_DRS_OVERRIDE_ENABLED = os.getenv("SIGNALS_DRS_OVERRIDE_ENABLED", "true").lower() == "true"
+SIGNALS_DRS_OVERRIDE_ENABLED = _getenv_bool("SIGNALS_DRS_OVERRIDE_ENABLED", True)
 SIGNALS_DRS_OVERRIDE_THRESHOLD = _getenv_float("SIGNALS_DRS_OVERRIDE_THRESHOLD", 0.70)
 
 # Conviction uplift for a fresh gamma-flip cross in the signaled direction.
@@ -1452,12 +1446,8 @@ SIGNALS_INDEPENDENT_RISK_PROFILE_EOD_PRESSURE = _independent_risk_profile(
 # and the composite has enough magnitude to have picked a clear direction,
 # flip the composite sign so the portfolio engine routes a counter-trend
 # trade instead of doubling down on the exhausted move.
-SIGNALS_CONTRARIAN_OVERRIDE_ENABLED = (
-    os.getenv("SIGNALS_CONTRARIAN_OVERRIDE_ENABLED", "true").lower() == "true"
-)
-SIGNALS_CONTRARIAN_REWEIGHT_ENABLED = (
-    os.getenv("SIGNALS_CONTRARIAN_REWEIGHT_ENABLED", "true").lower() == "true"
-)
+SIGNALS_CONTRARIAN_OVERRIDE_ENABLED = _getenv_bool("SIGNALS_CONTRARIAN_OVERRIDE_ENABLED", True)
+SIGNALS_CONTRARIAN_REWEIGHT_ENABLED = _getenv_bool("SIGNALS_CONTRARIAN_REWEIGHT_ENABLED", True)
 SIGNALS_CONTRARIAN_REWEIGHT_MULT = max(1.0, _getenv_float("SIGNALS_CONTRARIAN_REWEIGHT_MULT", 1.45))
 SIGNALS_CONTRARIAN_OVERRIDE_THRESHOLD = max(
     0.0, min(1.0, _getenv_float("SIGNALS_CONTRARIAN_OVERRIDE_THRESHOLD", 0.60))
@@ -1562,7 +1552,7 @@ ANALYTICS_MIN_OI_COVERAGE_PCT_ALERT = _getenv_float("ANALYTICS_MIN_OI_COVERAGE_P
 TRADESTATION_CLIENT_ID = os.getenv("TRADESTATION_CLIENT_ID")
 TRADESTATION_CLIENT_SECRET = os.getenv("TRADESTATION_CLIENT_SECRET")
 TRADESTATION_REFRESH_TOKEN = os.getenv("TRADESTATION_REFRESH_TOKEN")
-TRADESTATION_USE_SANDBOX = os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true"
+TRADESTATION_USE_SANDBOX = _getenv_bool("TRADESTATION_USE_SANDBOX", False)
 
 # TradeStation CLI test defaults.
 TS_TEST = os.getenv("TS_TEST", "all")
@@ -1581,7 +1571,7 @@ NYSE_HOLIDAYS = os.getenv("NYSE_HOLIDAYS", "")
 
 # Emits deterministic payload signatures before DB writes so stream-vs-rest
 # ingestion parity can be validated in production without schema changes.
-INGEST_PARITY_GUARD_ENABLED = os.getenv("INGEST_PARITY_GUARD_ENABLED", "false").lower() == "true"
+INGEST_PARITY_GUARD_ENABLED = _getenv_bool("INGEST_PARITY_GUARD_ENABLED", False)
 
 # =============================================================================
 # Helper Functions
