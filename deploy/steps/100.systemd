@@ -89,6 +89,11 @@ sleep 3
 # Installed separately from the always-on services above because they
 # don't need the start/stop dance — `enable --now <timer>` is enough.
 TIMER_UNITS=(
+    # Snapshots the pruned tables to partitioned Parquet at 01:30 ET, just
+    # ahead of the 02:00 db-maintain prune, so the data survives for
+    # backtesting.  See src/tools/db_archive.py.  Local archive root is
+    # pre-created below (its service ReadWritePaths= lists it).
+    "zerogex-oa-db-archive"
     "zerogex-oa-db-maintain"
     "zerogex-oa-db-vacuum-full"
     "zerogex-oa-logs-clear"
@@ -109,6 +114,15 @@ TIMER_UNITS=(
 log "  → Pre-creating state directories for timer units..."
 sudo install -d -o "$USER" -g "$USER" -m 0755 "$HOME/monitoring"
 log "     ✓ $HOME/monitoring (system-monitor state)"
+# db-archive writes Parquet under ARCHIVE_DEST (default /var/lib/zerogex/
+# archive); its service ReadWritePaths= grants write there, but the root
+# must exist first.  Skip when ARCHIVE_DEST is an s3:// URI — nothing local
+# to create in that case.
+ARCHIVE_DEST="${ARCHIVE_DEST:-/var/lib/zerogex/archive}"
+if [[ "$ARCHIVE_DEST" != s3://* ]]; then
+    sudo install -d -o "$USER" -g "$USER" -m 0755 "$ARCHIVE_DEST"
+    log "     ✓ $ARCHIVE_DEST (db-archive backtest Parquet)"
+fi
 
 log "  → Installing timer-based maintenance units..."
 TIMER_INSTALLED=()

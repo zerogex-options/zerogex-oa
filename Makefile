@@ -1031,6 +1031,8 @@ help: ## Show this help message
 	@echo "  make vacuum             - Vacuum analyze all tables"
 	@echo "  make db-maintain        - Full maintenance: prune old data, vacuum full, reindex"
 	@echo "  make db-prune           - Delete data older than DATA_RETENTION_DAYS (default 90)"
+	@echo "  make db-archive         - Archive pruned tables → partitioned Parquet for backtesting"
+	@echo "  make db-archive-install - Install nightly backtest-archive timer (01:30 ET)"
 	@echo "  make db-size            - Show table sizes"
 	@echo "  make refresh-views      - Refresh materialized views"
 	@echo "  make db-prune-legacy    - Drop obsolete legacy refresh/materialized-view artifacts"
@@ -2882,6 +2884,27 @@ db-prune: ## Delete data older than DATA_RETENTION_DAYS (default 90)
 	done
 	@echo "$(GREEN)✅ Prune complete$(NC)"
 
+# Offline historical archive for backtesting.  The same tables db-prune
+# DELETEs on the rolling DATA_RETENTION_DAYS window are the ones worth
+# keeping for backtests, so db-archive snapshots each completed ET trading
+# day to partitioned Parquet *before* it can age out.  Driven nightly at
+# 01:30 ET by zerogex-oa-db-archive.timer (ahead of the 02:00 prune); the
+# lookback re-checks recent days so a missed run self-heals.  Idempotent:
+# already-archived days are skipped unless ARCHIVE_FORCE=1.
+#   ARCHIVE_DEST   local dir or s3://bucket/prefix (default /var/lib/zerogex/archive)
+#   ARCHIVE_ARGS   extra flags passed through (e.g. "--since 2026-05-01 --until 2026-05-31")
+ARCHIVE_DEST ?= /var/lib/zerogex/archive
+
+.PHONY: db-archive
+db-archive: ## Archive pruned tables to partitioned Parquet for backtesting (ARCHIVE_DEST, ARCHIVE_ARGS)
+	@echo "$(YELLOW)Archiving pruned tables → $(ARCHIVE_DEST) ...$(NC)"
+	@$(PY) -m src.tools.db_archive --dest "$(ARCHIVE_DEST)" $(if $(filter 1 yes true,$(ARCHIVE_FORCE)),--force,) $(ARCHIVE_ARGS)
+	@echo "$(GREEN)✅ Archive complete$(NC)"
+
+.PHONY: db-archive-dry-run
+db-archive-dry-run: ## Show which day partitions db-archive would write (no writes)
+	@$(PY) -m src.tools.db_archive --dest "$(ARCHIVE_DEST)" --dry-run $(ARCHIVE_ARGS)
+
 .PHONY: db-maintain
 db-maintain: ## Full maintenance: prune old data, vacuum full, reindex (run with services stopped)
 	@echo "$(BLUE)=== Full Database Maintenance ===$(NC)"
@@ -3335,6 +3358,22 @@ db-maintain-install: ## Install daily DB maintenance timer (prune old data + vac
 	@echo "$(GREEN)✅ DB maintenance timer installed and started$(NC)"
 	@echo "$(YELLOW)Runs daily at 2:00 AM. Check status: systemctl status zerogex-oa-db-maintain.timer$(NC)"
 	@echo "$(YELLOW)View logs: journalctl -u zerogex-oa-db-maintain$(NC)"
+
+.PHONY: db-archive-install
+db-archive-install: ## Install nightly backtest-archive timer (01:30 ET, ahead of the prune)
+	@echo "$(BLUE)=== Installing DB Archive Timer ===$(NC)"
+	@echo "$(YELLOW)Ensuring DuckDB is installed (pip install -e .[archive])...$(NC)"
+	@$(PY) -c "import duckdb" 2>/dev/null || $(PY) -m pip install -e .[archive]
+	@sudo install -d -o ubuntu -g ubuntu -m 0755 $(ARCHIVE_DEST) 2>/dev/null || true
+	@sudo cp setup/systemd/zerogex-oa-db-archive.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-db-archive.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-db-archive.timer
+	@echo "$(GREEN)✅ DB archive timer installed and started (01:30 ET, before the 02:00 prune)$(NC)"
+	@echo "$(YELLOW)Status:      systemctl status zerogex-oa-db-archive.timer$(NC)"
+	@echo "$(YELLOW)Logs:        journalctl -u zerogex-oa-db-archive$(NC)"
+	@echo "$(YELLOW)Dry-run now: make db-archive-dry-run$(NC)"
+	@echo "$(YELLOW)Trigger now: sudo systemctl start zerogex-oa-db-archive.service$(NC)"
 
 .PHONY: normalizer-cache-install
 normalizer-cache-install: ## Install nightly refresh + drift-detect healthcheck timers

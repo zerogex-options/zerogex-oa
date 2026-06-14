@@ -74,8 +74,15 @@ api = [
     "pydantic>=2.5.0",
     "python-json-logger>=2.0.0",
 ]
+archive = [
+    # Used by src/tools/db_archive.py to stream the pruned timestamped
+    # tables straight into partitioned Parquet (Postgres scanner +
+    # httpfs/S3 + ZSTD, all in one in-process engine).  boto3 (S3
+    # head/credential chain) is already a core dependency above.
+    "duckdb>=1.0.0",
+]
 all = [
-    "zerogex-oa[dev,metrics,greeks,api]",
+    "zerogex-oa[dev,metrics,greeks,api,archive]",
 ]
 
 [project.urls]

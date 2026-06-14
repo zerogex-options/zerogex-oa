@@ -1,0 +1,52 @@
+[Unit]
+Description=ZeroGEX nightly backtest archive (pruned tables → partitioned Parquet)
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target
+Wants=network-online.target
+# Runs at 01:30 ET, ahead of the 02:00 ET db-prune (zerogex-oa-db-maintain).
+# Before= makes the ordering explicit on the rare occasion both are queued
+# in the same boot/catch-up batch, so a day is always archived before it
+# could be pruned.
+Before=zerogex-oa-db-maintain.service
+
+# Operator hook for active alerting — same wiring as the other refresh
+# jobs.  An archive miss is silent data loss once the prune window passes,
+# so failures should page.  Dispatches via zerogex-alert@%n.service to
+# whatever backend /etc/zerogex/alert.env configures (falls back to stderr).
+OnFailure=zerogex-alert@%n.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+# Environment
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Snapshot each completed ET trading day of the pruned tables to columnar
+# Parquet.  Incremental + idempotent: re-checks the trailing
+# ARCHIVE_LOOKBACK_DAYS and writes only missing day partitions, so a
+# skipped night self-heals on the next run.  ARCHIVE_DEST (local dir or
+# s3://bucket/prefix) comes from .env; defaults to /var/lib/zerogex/archive.
+ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa db-archive
+
+# First run (and any catch-up after downtime) writes several days across
+# the large option_chains / gex_by_strike tables — allow ample headroom.
+TimeoutStartSec=3600
+
+# Security — mirror zerogex-oa-db-maintain, plus grant write to the local
+# archive root.  Harmless when ARCHIVE_DEST is an s3:// URI (that path just
+# goes unused); set ReadWritePaths to your dest if you relocate the local
+# archive off /var/lib/zerogex.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa /var/lib/zerogex
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-db-archive

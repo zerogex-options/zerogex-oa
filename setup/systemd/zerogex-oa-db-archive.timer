@@ -1,0 +1,24 @@
+[Unit]
+Description=Pre-prune trigger for ZeroGEX backtest archive (01:30 ET)
+
+[Timer]
+# Run daily at 01:30 server time (timezone is America/New_York, set by
+# deploy/steps/010.setup) — 30 min AHEAD of the 02:00 ET db-prune so the
+# just-completed session is captured to Parquet before any prune could
+# delete an aged row.  Fits the overnight maintenance chain:
+#   • 01:30 ET — db-archive      (this unit, snapshot → Parquet)
+#   • 02:00 ET — db-maintain     (prune + plain VACUUM)
+#   • 02:30 ET — db-vacuum-full  (Sundays only)
+#   • 03:30 ET — logs-clear
+# The archive only reads (read-only ATTACH), so the 30-min gap before the
+# prune is comfortable; the lookback window adds a multi-day safety margin
+# on top, well inside DATA_RETENTION_DAYS.  Jitter ±5 min.
+OnCalendar=*-*-* 01:30:00
+RandomizedDelaySec=5m
+# Run on next boot if the box was off when the timer should have fired, so
+# a planned reboot never silently skips an archive (the deleted data would
+# be unrecoverable once it ages past the retention window).
+Persistent=true
+
+[Install]
+WantedBy=timers.target
