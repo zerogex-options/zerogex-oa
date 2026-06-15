@@ -12,6 +12,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, date as date_type
 import os
+from src.config import _getenv_str
 import re
 from typing import List, Optional, Literal
 import pytz
@@ -87,7 +88,7 @@ def _parse_cors_origins(raw_origins: Optional[str]) -> List[str]:
     if raw_origins:
         origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
 
-    environment = os.getenv("ENVIRONMENT", "development").strip().lower()
+    environment = _getenv_str("ENVIRONMENT", "development").lower()
     if not origins:
         if environment == "production":
             raise RuntimeError(

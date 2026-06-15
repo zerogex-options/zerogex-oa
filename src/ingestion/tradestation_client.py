@@ -19,20 +19,52 @@ from src.ingestion.tradestation_auth import TradeStationAuth
 from src.utils import get_logger
 from src.validation import safe_float, safe_int
 from src.symbols import parse_underlyings, resolve_option_root
+from src.market_calendar import NYSE_HOLIDAYS
 from src.config import (
+    _getenv_str,
+    _getenv_int,
+    _getenv_bool,
     API_REQUEST_TIMEOUT,
     API_RETRY_ATTEMPTS,
     API_RETRY_DELAY,
     API_RETRY_BACKOFF,
+    TS_RATE_LIMIT_PER_5MIN,
+    TS_RATE_LIMIT_SYNC_INTERVAL,
+    TS_STRIKES_CACHE_TTL,
+    TS_RATE_LIMIT_HEADER_GATE_ENABLED,
+    TS_RATE_LIMIT_HEADER_MIN_REMAINING,
+    TS_RATE_LIMIT_HEADER_STALE_SECONDS,
 )
 
 logger = get_logger(__name__)
 
 # Eastern Time timezone
 ET = pytz.timezone("US/Eastern")
-STREAM_READ_TIMEOUT_SECONDS = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
-STREAM_REUSE_CONNECTIONS = os.getenv("TS_STREAM_REUSE_CONNECTIONS", "false").lower() == "true"
-STREAM_REUSE_QUOTES = os.getenv("TS_STREAM_REUSE_QUOTES", "false").lower() == "true"
+STREAM_READ_TIMEOUT_SECONDS = _getenv_int("TS_STREAM_READ_TIMEOUT", 300)
+STREAM_REUSE_CONNECTIONS = _getenv_bool("TS_STREAM_REUSE_CONNECTIONS", False)
+STREAM_REUSE_QUOTES = _getenv_bool("TS_STREAM_REUSE_QUOTES", False)
+
+
+def _load_nyse_half_days() -> set:
+    """NYSE early-close (1:00 PM ET) dates from the ``NYSE_HALF_DAYS`` env var.
+
+    Comma-separated ISO dates (e.g. day before Independence Day, day after
+    Thanksgiving, Christmas Eve). Invalid tokens are skipped.
+    """
+    raw = os.getenv("NYSE_HALF_DAYS", "")
+    out = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            out.add(date.fromisoformat(token))
+        except ValueError:
+            logger.warning("Invalid date in NYSE_HALF_DAYS: %r", token)
+    return out
+
+
+NYSE_HALF_DAYS = _load_nyse_half_days()
 
 
 class TradeStationClient:
@@ -66,9 +98,49 @@ class TradeStationClient:
         # to the tradestation_api_calls table.  Kept optional so this module
         # stays usable without a database.
         self._api_call_window_writer: Optional[Callable[[datetime, int], None]] = None
+        # Optional callback (window_start) -> persisted total for that window.
+        # Returned value covers ALL processes that have already flushed into
+        # tradestation_api_calls.  Used by the rate-limit governor to estimate
+        # cross-process call volume in the current in-flight window.
+        self._api_call_window_reader: Optional[Callable[[datetime], int]] = None
+
+        # Rate-limit governor state.  All accessed under
+        # ``_api_session_counter_lock`` along with the existing window
+        # counters so the snapshot of (local count, persisted count, window)
+        # stays consistent.
+        self._rate_limit_persisted_count = 0
+        self._rate_limit_persisted_last_sync_mono = 0.0
+
+        # Strikes endpoint cache: key=(underlying, expiration_str) ->
+        # {"strikes": [...], "expires_at_mono": float}.  Strike chains
+        # rarely change intraday and were responsible for most of the
+        # repeated quota burn during pre-market.
+        self._strikes_cache: Dict[str, Dict[str, Any]] = {}
+        self._strikes_cache_lock = Lock()
+
+        # Header-driven rate-limit state, populated by parsing
+        # ``X-RateLimit-*`` and ``X-Concurrency-*`` headers from every
+        # response.  Keyed by the resource name TradeStation returns in
+        # ``X-RateLimit-Resource`` so each endpoint group (option-strikes,
+        # quotes, barcharts, ...) gates independently against its own
+        # quota -- which is the model TradeStation actually uses.
+        #
+        # The endpoint-pattern -> resource mapping is LEARNED at request
+        # time (we don't hard-code it) so we stay correct if TradeStation
+        # adds or renames resources.  Until the first observation for a
+        # given pattern, the pre-emptive gate is a no-op for that pattern;
+        # the static-cap path inherited from the earlier fix continues to
+        # back-stop us.
+        self._resource_rate_limit_state: Dict[str, Dict[str, Any]] = {}
+        self._endpoint_to_resource: Dict[str, str] = {}
+        self._resource_rate_limit_lock = Lock()
+        # Concurrency telemetry (X-Concurrency-*).  Stored alongside but
+        # NOT used to gate -- we surface it for monitoring so operators
+        # can see when stream caps are tight without changing behaviour.
+        self._concurrency_state: Dict[str, Dict[str, Any]] = {}
 
         # Check if market hours warnings should be suppressed
-        self.warn_market_hours = os.getenv("TS_WARN_MARKET_HOURS", "true").lower() != "false"
+        self.warn_market_hours = _getenv_bool("TS_WARN_MARKET_HOURS", True)
 
         if sandbox:
             logger.warning(f"Using SANDBOX environment [{self.base_url}]")
@@ -84,6 +156,310 @@ class TradeStationClient:
     def set_api_call_window_writer(self, writer: Optional[Callable[[datetime, int], None]]) -> None:
         """Install a callback invoked with (window_start, count) on rollover."""
         self._api_call_window_writer = writer
+
+    def set_api_call_window_reader(self, reader: Optional[Callable[[datetime], int]]) -> None:
+        """Install a callback that returns the persisted total for a window.
+
+        Used by the rate-limit governor to learn how many calls other
+        ingestion processes have already contributed to the current 5-min
+        bucket.  Reader is invoked with the floored window start and must
+        return a non-negative int (0 if no rows yet).
+        """
+        self._api_call_window_reader = reader
+
+    def _gate_for_rate_limit(self) -> None:
+        """Block before issuing a request if the 5-min window is at its cap.
+
+        Periodically (every ``TS_RATE_LIMIT_SYNC_INTERVAL`` seconds) flushes
+        this process's in-flight partial count to the DB and refreshes the
+        cross-process total via the configured reader callback.  When the
+        combined estimate (persisted + local in-flight) reaches
+        ``TS_RATE_LIMIT_PER_5MIN``, sleeps until the next 5-min boundary
+        so subsequent requests land in a fresh quota window.
+
+        Disabled if the cap is 0 OR no reader is wired (single-process mode
+        still works on the local count alone via the cap check below).
+        """
+        if TS_RATE_LIMIT_PER_5MIN <= 0:
+            return
+
+        now_utc = datetime.now(timezone.utc)
+        current_window = self._floor_to_five_minute_window(now_utc)
+        now_mono = time.monotonic()
+
+        flush_delta = 0
+        flush_window: Optional[datetime] = None
+        writer = self._api_call_window_writer
+        with self._api_session_counter_lock:
+            # Window rollover during gate -- reset persisted snapshot.
+            if current_window != self._api_session_window_start:
+                # Let _record_api_https_session_open handle the rollover bookkeeping
+                # on its own; here we just reset OUR persisted-count cache for the
+                # new window so we don't carry stale numbers across boundaries.
+                self._rate_limit_persisted_count = 0
+                self._rate_limit_persisted_last_sync_mono = 0.0
+
+            stale = (
+                now_mono - self._rate_limit_persisted_last_sync_mono
+                >= TS_RATE_LIMIT_SYNC_INTERVAL
+            )
+            local_count = self._api_session_window_count
+            # Only mark a delta as persisted if a writer is wired -- otherwise
+            # _api_session_window_persisted would drift past what's actually
+            # in the DB, causing the cap check below to under-count this
+            # process's contribution by the unflushed delta.
+            if stale and writer is not None and self._api_session_window_start == current_window:
+                flush_delta = local_count - self._api_session_window_persisted
+                if flush_delta > 0:
+                    flush_window = current_window
+                    self._api_session_window_persisted = local_count
+
+        # DB I/O outside the lock.
+        if flush_window is not None and writer is not None:
+            try:
+                writer(flush_window, flush_delta)
+            except Exception as e:
+                logger.debug("Rate-limit partial-flush writer raised: %s", e)
+                # Writer failed: roll back the persisted marker so we retry
+                # the same delta on the next sync instead of pretending it
+                # landed in the DB.
+                with self._api_session_counter_lock:
+                    self._api_session_window_persisted = max(
+                        self._api_session_window_persisted - flush_delta, 0
+                    )
+
+        if self._api_call_window_reader is not None and (
+            now_mono - self._rate_limit_persisted_last_sync_mono >= TS_RATE_LIMIT_SYNC_INTERVAL
+        ):
+            try:
+                persisted = int(self._api_call_window_reader(current_window) or 0)
+            except Exception as e:
+                logger.debug("Rate-limit reader raised: %s (continuing on local count)", e)
+                persisted = self._rate_limit_persisted_count
+            with self._api_session_counter_lock:
+                self._rate_limit_persisted_count = max(persisted, 0)
+                self._rate_limit_persisted_last_sync_mono = now_mono
+
+        with self._api_session_counter_lock:
+            local_count = (
+                self._api_session_window_count
+                if self._api_session_window_start == current_window
+                else 0
+            )
+            # Persisted count includes this process's flushed partial, so subtract
+            # it before re-adding local to avoid double-counting our own calls.
+            others = max(self._rate_limit_persisted_count - self._api_session_window_persisted, 0)
+            estimated_total = others + local_count
+
+        if estimated_total < TS_RATE_LIMIT_PER_5MIN:
+            return
+
+        next_window = current_window + timedelta(minutes=5)
+        # +0.25s cushion so monotonic clock skew can't land us inside the
+        # boundary window still appearing to be the prior bucket.
+        sleep_seconds = max((next_window - now_utc).total_seconds() + 0.25, 0.0)
+        if sleep_seconds <= 0:
+            return
+        logger.warning(
+            "TradeStation 5-min rate-limit cap reached (estimated %d >= %d); "
+            "sleeping %.1fs until next window starts at %s UTC.",
+            estimated_total,
+            TS_RATE_LIMIT_PER_5MIN,
+            sleep_seconds,
+            next_window.strftime("%H:%M:%S"),
+        )
+        time.sleep(sleep_seconds)
+
+    # ------------------------------------------------------------------
+    # Header-driven rate-limit gate (primary path).
+    #
+    # TradeStation publishes per-resource quota state on every response
+    # via the ``X-RateLimit-*`` family of headers (see TradeStation API
+    # docs, "Rate Limiting Overview").  Reading those headers gives us
+    # the exact remaining budget and an exact reset time -- strictly
+    # better than the static 5-min UTC cap above, which is a coarse
+    # approximation of "rolling N-second" windows that aren't aligned
+    # to UTC.
+    #
+    # The static cap above is kept as a defense-in-depth fallback for
+    # the cold-start window (first request to a given endpoint pattern
+    # before we've observed a header), and as an escape hatch if
+    # TradeStation ever ships malformed or missing headers.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _endpoint_pattern(endpoint: str) -> str:
+        """Normalize an endpoint to a stable key for resource lookup.
+
+        TradeStation paths embed the symbol (and sometimes expiration) as
+        the LAST path segment: ``marketdata/options/strikes/SPY``,
+        ``marketdata/quotes/SPY,QQQ``, ``marketdata/stream/quotes/SPY,QQQ``.
+        The rate-limit resource is the same for every variant of the
+        static prefix, so we drop the trailing dynamic segment to get a
+        stable key.  Endpoints with only 1-2 segments (uncommon for the
+        endpoints this client actually calls) are kept as-is.
+        """
+        head = endpoint.split("?", 1)[0]
+        parts = [p for p in head.split("/") if p]
+        if len(parts) >= 3:
+            return "/".join(parts[:-1])
+        return "/".join(parts)
+
+    def _record_rate_limit_headers(self, response: Response, endpoint: str) -> None:
+        """Parse ``X-RateLimit-*`` / ``X-Concurrency-*`` and update state.
+
+        Safe against missing/malformed headers: every value is parsed
+        through int() inside a try block, and a single bad value drops
+        the update for that response without touching cached state.
+        Called after EVERY response (success and 429 alike) so the
+        gate's view stays current.
+        """
+        if response is None:
+            return
+        try:
+            headers = response.headers
+        except Exception:
+            return
+
+        resource = headers.get("X-RateLimit-Resource") or headers.get("x-ratelimit-resource")
+        # ----- Rate-limit window state -----
+        if resource:
+            try:
+                limit = int(headers["X-RateLimit-Limit"])
+                period = int(headers["X-RateLimit-Period"])
+                remaining = int(headers["X-RateLimit-Remaining"])
+                reset_seconds = int(headers["X-RateLimit-Reset"])
+            except (KeyError, ValueError, TypeError):
+                # Partial headers -- skip rate-limit update but still try concurrency below.
+                pass
+            else:
+                now_mono = time.monotonic()
+                now_utc = datetime.now(timezone.utc)
+                # Clamp obviously-bad values rather than poisoning the cache.
+                remaining = max(remaining, 0)
+                reset_seconds = max(reset_seconds, 0)
+                period = max(period, 1)
+                with self._resource_rate_limit_lock:
+                    self._resource_rate_limit_state[resource] = {
+                        "resource": resource,
+                        "limit": limit,
+                        "period_seconds": period,
+                        "remaining": remaining,
+                        "reset_at_mono": now_mono + reset_seconds,
+                        "observed_at_mono": now_mono,
+                        "observed_at_utc": now_utc,
+                    }
+                    self._endpoint_to_resource[self._endpoint_pattern(endpoint)] = resource
+
+        # ----- Concurrency telemetry (informational) -----
+        conc_resource = headers.get("X-Concurrency-Resource") or headers.get(
+            "x-concurrency-resource"
+        )
+        if conc_resource:
+            try:
+                conc_limit = int(headers["X-Concurrency-Limit"])
+                conc_remaining = int(headers["X-Concurrency-Remaining"])
+            except (KeyError, ValueError, TypeError):
+                return
+            with self._resource_rate_limit_lock:
+                self._concurrency_state[conc_resource] = {
+                    "resource": conc_resource,
+                    "limit": conc_limit,
+                    "remaining": max(conc_remaining, 0),
+                    "observed_at_mono": time.monotonic(),
+                }
+            if conc_remaining <= 0:
+                logger.warning(
+                    "TradeStation concurrency limit reached for %s (limit=%d, "
+                    "remaining=0).  Open stream count is at the per-key cap; "
+                    "additional stream opens will fail until one is closed.",
+                    conc_resource,
+                    conc_limit,
+                )
+
+    def _gate_for_resource(self, endpoint: str) -> None:
+        """Block before a request when the endpoint's resource is exhausted.
+
+        Looks up the resource for ``endpoint`` from the learned mapping,
+        consults the most recent observation, and sleeps until reset if
+        the remaining budget is at or below
+        ``TS_RATE_LIMIT_HEADER_MIN_REMAINING``.  No-op when:
+          * The header-driven gate is disabled via env var.
+          * We've never observed a header for this endpoint pattern
+            (cold start -- the static-cap gate continues to back-stop).
+          * The cached observation is older than
+            ``TS_RATE_LIMIT_HEADER_STALE_SECONDS`` (TradeStation's period
+            has long since elapsed; the cached state is meaningless).
+        """
+        if not TS_RATE_LIMIT_HEADER_GATE_ENABLED:
+            return
+
+        pattern = self._endpoint_pattern(endpoint)
+        with self._resource_rate_limit_lock:
+            resource = self._endpoint_to_resource.get(pattern)
+            if resource is None:
+                return
+            state = self._resource_rate_limit_state.get(resource)
+            if state is None:
+                return
+            # Defensive copy so we drop the lock before any logging/sleep.
+            state = dict(state)
+
+        now_mono = time.monotonic()
+        if now_mono - state["observed_at_mono"] > TS_RATE_LIMIT_HEADER_STALE_SECONDS:
+            return
+        if state["remaining"] > TS_RATE_LIMIT_HEADER_MIN_REMAINING:
+            return
+
+        sleep_seconds = state["reset_at_mono"] - now_mono
+        if sleep_seconds <= 0:
+            # Reset has passed; the next request will refresh the state
+            # naturally, and TradeStation's rolling replenishment means
+            # we should already have capacity again.
+            return
+
+        # Cap sleep at the resource's period so a bogus reset value
+        # (e.g. >>period) can't strand us for hours.  +0.25s cushion so
+        # we land cleanly inside the next window.
+        sleep_seconds = min(sleep_seconds, state["period_seconds"]) + 0.25
+        logger.warning(
+            "TradeStation rate-limit gate: resource=%s remaining=%d limit=%d; "
+            "sleeping %.1fs until reset (endpoint=%s).",
+            state["resource"],
+            state["remaining"],
+            state["limit"],
+            sleep_seconds,
+            pattern,
+        )
+        time.sleep(sleep_seconds)
+
+    def _retry_delay_for_429(
+        self, response: Optional[Response], retry_count: int
+    ) -> float:
+        """Return the precise sleep duration for a 429 response.
+
+        Prefers ``X-RateLimit-Reset`` from the response headers (the
+        deterministic source of truth); falls back to the configured
+        exponential backoff if the header is missing/malformed -- which
+        is what the original code did for every 429.  The header path
+        replaces "guess and check" retries with a single deterministic
+        wait sized exactly to TradeStation's reset clock.
+        """
+        if response is not None:
+            try:
+                reset_raw = response.headers.get("X-RateLimit-Reset") or response.headers.get(
+                    "x-ratelimit-reset"
+                )
+                if reset_raw is not None:
+                    reset_seconds = int(reset_raw)
+                    if reset_seconds >= 0:
+                        # +0.5s cushion to ensure we land AFTER the reset.
+                        # Hard cap at 10 minutes so a bogus header can't
+                        # strand the client indefinitely.
+                        return min(reset_seconds + 0.5, 600.0)
+            except (ValueError, TypeError):
+                pass
+        return API_RETRY_DELAY * (API_RETRY_BACKOFF**retry_count)
 
     def _record_api_https_session_open(self):
         """
@@ -136,6 +512,33 @@ class TradeStationClient:
             except Exception as e:
                 logger.warning("API-call window writer raised: %s", e)
 
+    def flush_api_call_window(self) -> None:
+        """Persist the current API-call window if wall-clock has left it.
+
+        Window counts are otherwise only flushed lazily on the NEXT request or
+        on ``close_all_streams``. During a quiet period (no requests) the last
+        completed window's count is never written. Call this on a periodic
+        cadence (the engine's observability tick) so a completed window is
+        persisted even when no new request triggers the rollover. Idempotent:
+        only the not-yet-persisted delta of an ELAPSED window is written.
+        """
+        now_window = self._floor_to_five_minute_window(datetime.now(timezone.utc))
+        rolled_start: Optional[datetime] = None
+        delta = 0
+        with self._api_session_counter_lock:
+            if now_window != self._api_session_window_start:
+                rolled_start = self._api_session_window_start
+                delta = self._api_session_window_count - self._api_session_window_persisted
+                # Mark fully persisted but keep the count for the log on the
+                # eventual natural rollover; advance the window so we don't
+                # re-flush the same one.
+                self._api_session_window_persisted = self._api_session_window_count
+        if rolled_start is not None and delta > 0 and self._api_call_window_writer is not None:
+            try:
+                self._api_call_window_writer(rolled_start, delta)
+            except Exception as e:
+                logger.warning("API-call window flush writer raised: %s", e)
+
     def _request(  # type: ignore[return]
         self,
         method: str,
@@ -143,6 +546,7 @@ class TradeStationClient:
         params: Optional[Dict] = None,
         data: Optional[Dict] = None,
         retry_count: int = 0,
+        auth_refreshed: bool = False,
     ) -> Dict[str, Any]:
         """
         Make HTTP request with retry logic
@@ -166,7 +570,20 @@ class TradeStationClient:
         try:
             response = self._build_request_response(method, url, headers, params, data)
 
-            if response.status_code in [200, 201]:
+            # Refresh per-resource rate-limit state from response headers
+            # BEFORE any branching on status code -- a 429 also carries the
+            # X-RateLimit-* headers, and the next request needs the freshest
+            # observation regardless of whether this one succeeded.
+            self._record_rate_limit_headers(response, endpoint)
+
+            # Any 2xx is success. The prior ``in [200, 201]`` check let a
+            # 202/204 (e.g. No Content) fall through every branch below to
+            # raise_for_status(), which does NOT raise for 2xx -- so the
+            # method returned None and callers like get_option_expirations
+            # ("if 'Expirations' in result") hit ``TypeError: argument of
+            # type 'NoneType' is not iterable``. The empty-content guard
+            # returns the right endpoint-shaped empty dict for a 204.
+            if 200 <= response.status_code < 300:
                 # Check if response has content
                 if not response.content or len(response.content) == 0:
                     logger.warning(
@@ -188,14 +605,22 @@ class TradeStationClient:
                 logger.debug(f"Response: {json.dumps(result, indent=2)[:1000]}...")
                 return result  # type: ignore[no-any-return]
 
-            # Handle expired/invalid token - force refresh and retry once
+            # Handle expired/invalid token - force refresh and retry once.
+            # The auth-refresh budget is decoupled from the data-retry budget
+            # (API_RETRY_ATTEMPTS): a 401 ALWAYS gets exactly one refresh+retry
+            # via the sticky ``auth_refreshed`` flag, even when
+            # API_RETRY_ATTEMPTS<=1 (the prior ``retry_count < ATTEMPTS-1`` gate
+            # never refreshed in that config, failing every call with an expired
+            # token).
             if response.status_code == 401:
-                if retry_count < API_RETRY_ATTEMPTS - 1:
+                if not auth_refreshed:
                     logger.warning("TradeStation returned 401; forcing token refresh and retrying")
                     failed_token = headers.get("Authorization", "").removeprefix("Bearer ")
                     self.auth.force_refresh_access_token(failed_token=failed_token)
-                    return self._request(method, endpoint, params, data, retry_count + 1)
-                logger.error("TradeStation returned 401 after retries")
+                    return self._request(
+                        method, endpoint, params, data, retry_count, auth_refreshed=True
+                    )
+                logger.error("TradeStation returned 401 after token refresh")
                 response.raise_for_status()
 
             # Handle 404 "No data available" - don't retry, just return empty
@@ -243,13 +668,25 @@ class TradeStationClient:
                 logger.error(f"Response: {response.text}")
                 response.raise_for_status()
 
-            # Handle rate limiting with exponential backoff
+            # Handle rate limiting with header-driven retry delay (preferred)
+            # or exponential backoff (fallback when X-RateLimit-Reset is
+            # missing/malformed).  TradeStation's docs explicitly recommend
+            # using X-RateLimit-Reset for retry timing, which gives us a
+            # deterministic single sleep instead of escalating guesses.
             if response.status_code == 429:
                 if retry_count < API_RETRY_ATTEMPTS - 1:
-                    retry_delay = API_RETRY_DELAY * (API_RETRY_BACKOFF**retry_count)
-                    logger.warning(f"Rate limited (429), retrying in {retry_delay}s...")
+                    retry_delay = self._retry_delay_for_429(response, retry_count)
+                    logger.warning(
+                        "Rate limited (429), retrying in %.1fs (reset=%s, "
+                        "resource=%s)",
+                        retry_delay,
+                        response.headers.get("X-RateLimit-Reset", "n/a"),
+                        response.headers.get("X-RateLimit-Resource", "n/a"),
+                    )
                     time.sleep(retry_delay)
-                    return self._request(method, endpoint, params, data, retry_count + 1)
+                    return self._request(
+                        method, endpoint, params, data, retry_count + 1, auth_refreshed
+                    )
 
             # Handle server errors with retry
             if response.status_code >= 500:
@@ -259,7 +696,9 @@ class TradeStationClient:
                         f"Server error ({response.status_code}), retrying in {retry_delay}s..."
                     )
                     time.sleep(retry_delay)
-                    return self._request(method, endpoint, params, data, retry_count + 1)
+                    return self._request(
+                        method, endpoint, params, data, retry_count + 1, auth_refreshed
+                    )
 
             # Other errors
             logger.error(f"API request failed: {response.status_code}")
@@ -271,7 +710,9 @@ class TradeStationClient:
                 retry_delay = API_RETRY_DELAY * (API_RETRY_BACKOFF**retry_count)
                 logger.warning(f"Request timeout, retrying in {retry_delay}s...")
                 time.sleep(retry_delay)
-                return self._request(method, endpoint, params, data, retry_count + 1)
+                return self._request(
+                    method, endpoint, params, data, retry_count + 1, auth_refreshed
+                )
             logger.error(f"Request timed out after {API_RETRY_ATTEMPTS} attempts")
             raise
 
@@ -284,6 +725,13 @@ class TradeStationClient:
         data: Optional[Dict],
     ) -> Response:
         """Build and execute a standard JSON API request."""
+        # Endpoint reconstruction for the resource lookup -- ``url`` was
+        # already built from ``base_url + endpoint`` and we need the latter.
+        endpoint_for_gate = url[len(self.base_url) :].lstrip("/") if url.startswith(
+            self.base_url
+        ) else url
+        self._gate_for_resource(endpoint_for_gate)
+        self._gate_for_rate_limit()
         self._record_api_https_session_open()
         return requests.request(
             method=method,
@@ -346,13 +794,39 @@ class TradeStationClient:
     def _get_or_open_stream(
         self, stream_key: str, endpoint: str, params: Optional[Dict]
     ) -> Dict[str, Any]:
+        # Fast path: a stream for this key is already open.
         with self._stream_lock:
             existing = self._stream_state.get(stream_key)
             if existing:
                 return existing
 
-            url = f"{self.base_url}/{endpoint}"
+        # Open the connection OUTSIDE the lock. The connect handshake (up to
+        # the connect timeout) plus a possible 401 refresh (a second network
+        # round-trip) can take seconds; holding _stream_lock across it
+        # serialized every stream open, so a thread opening one symbol chunk
+        # blocked all threads opening other chunks. Distinct keys must not
+        # contend.
+        url = f"{self.base_url}/{endpoint}"
+        headers = self.auth.get_headers()
+        self._gate_for_resource(endpoint)
+        self._gate_for_rate_limit()
+        self._record_api_https_session_open()
+        response = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            stream=True,
+            timeout=(API_REQUEST_TIMEOUT, STREAM_READ_TIMEOUT_SECONDS),
+        )
+        self._record_rate_limit_headers(response, endpoint)
+
+        if response.status_code == 401:
+            response.close()
+            failed_token = headers.get("Authorization", "").removeprefix("Bearer ")
+            self.auth.force_refresh_access_token(failed_token=failed_token)
             headers = self.auth.get_headers()
+            self._gate_for_resource(endpoint)
+            self._gate_for_rate_limit()
             self._record_api_https_session_open()
             response = requests.get(
                 url,
@@ -361,30 +835,29 @@ class TradeStationClient:
                 stream=True,
                 timeout=(API_REQUEST_TIMEOUT, STREAM_READ_TIMEOUT_SECONDS),
             )
+            self._record_rate_limit_headers(response, endpoint)
 
-            if response.status_code == 401:
-                response.close()
-                failed_token = headers.get("Authorization", "").removeprefix("Bearer ")
-                self.auth.force_refresh_access_token(failed_token=failed_token)
-                headers = self.auth.get_headers()
-                self._record_api_https_session_open()
-                response = requests.get(
-                    url,
-                    headers=headers,
-                    params=params,
-                    stream=True,
-                    timeout=(API_REQUEST_TIMEOUT, STREAM_READ_TIMEOUT_SECONDS),
-                )
+        if response.status_code not in [200, 201]:
+            logger.error(f"Stream request failed: {response.status_code} [{endpoint}]")
+            logger.error(f"Response: {response.text}")
+            response.raise_for_status()
 
-            if response.status_code not in [200, 201]:
-                logger.error(f"Stream request failed: {response.status_code} [{endpoint}]")
-                logger.error(f"Response: {response.text}")
-                response.raise_for_status()
+        state = {
+            "response": response,
+            "iterator": response.iter_lines(decode_unicode=True),
+        }
 
-            state = {
-                "response": response,
-                "iterator": response.iter_lines(decode_unicode=True),
-            }
+        # Publish under the lock with a double-check: if another thread raced
+        # us and already opened this exact key, discard ours (close it so the
+        # socket isn't leaked) and use theirs.
+        with self._stream_lock:
+            existing = self._stream_state.get(stream_key)
+            if existing:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                return existing
             self._stream_state[stream_key] = state
             return state
 
@@ -615,8 +1088,33 @@ class TradeStationClient:
         logger.info(f"Found {len(expirations)} expirations")
         return sorted(expirations)
 
+    @staticmethod
+    def _strikes_cache_key(underlying: str, expiration: Optional[str]) -> str:
+        return f"{underlying}|{expiration or '*'}"
+
     def get_option_strikes(self, underlying: str, expiration: Optional[str] = None) -> List[float]:
-        """Get available strike prices"""
+        """Get available strike prices, cached intraday.
+
+        Strike chains rarely change inside a session for liquid underlyings,
+        so the full list is cached per (underlying, expiration) for
+        ``TS_STRIKES_CACHE_TTL`` seconds.  Empty results are NOT cached so a
+        transient upstream failure can't poison the cache for an hour.  Set
+        the TTL to 0 to disable.
+        """
+        cache_key = self._strikes_cache_key(underlying, expiration)
+        if TS_STRIKES_CACHE_TTL > 0:
+            now_mono = time.monotonic()
+            with self._strikes_cache_lock:
+                entry = self._strikes_cache.get(cache_key)
+                if entry is not None and entry["expires_at_mono"] > now_mono:
+                    logger.debug(
+                        "Strikes cache hit for %s exp=%s (%d strikes)",
+                        underlying,
+                        expiration,
+                        len(entry["strikes"]),
+                    )
+                    return list(entry["strikes"])
+
         params = {}
         if expiration:
             params["expiration"] = expiration
@@ -626,10 +1124,55 @@ class TradeStationClient:
 
         strikes = []
         if "Strikes" in result:
-            strikes = [float(strike[0]) for strike in result["Strikes"]]
+            # Guard each row: TradeStation returns strikes as nested arrays,
+            # but a single malformed/empty entry used to raise
+            # IndexError/ValueError and abort the entire strike fetch (and
+            # with it the strike-recalc cycle). Skip bad rows and warn instead.
+            bad = 0
+            for strike in result["Strikes"]:
+                parsed = safe_float(
+                    strike[0] if isinstance(strike, (list, tuple)) and strike else strike,
+                    default=None,
+                    field_name="Strike",
+                )
+                if parsed is None or parsed <= 0:
+                    bad += 1
+                    continue
+                strikes.append(parsed)
+            if bad:
+                logger.warning("Skipped %d malformed strike rows for %s", bad, underlying)
 
         logger.info(f"Found {len(strikes)} strikes")
+
+        if TS_STRIKES_CACHE_TTL > 0 and strikes:
+            with self._strikes_cache_lock:
+                self._strikes_cache[cache_key] = {
+                    "strikes": list(strikes),
+                    "expires_at_mono": time.monotonic() + TS_STRIKES_CACHE_TTL,
+                }
+
         return strikes
+
+    def invalidate_strikes_cache(
+        self, underlying: Optional[str] = None, expiration: Optional[str] = None
+    ) -> None:
+        """Drop cached strike lists.
+
+        With no args, clears the entire cache.  With ``underlying`` only,
+        clears every expiration for that underlying.  With both, clears the
+        single (underlying, expiration) entry.  Callers should invoke this
+        on day rollover or when an upstream chain change is suspected.
+        """
+        with self._strikes_cache_lock:
+            if underlying is None:
+                self._strikes_cache.clear()
+                return
+            if expiration is not None:
+                self._strikes_cache.pop(self._strikes_cache_key(underlying, expiration), None)
+                return
+            prefix = f"{underlying}|"
+            for key in [k for k in self._strikes_cache if k.startswith(prefix)]:
+                self._strikes_cache.pop(key, None)
 
     def get_option_quotes(self, option_symbols: Union[str, List[str]]) -> Dict[str, Any]:
         """Get quotes for specific option symbols"""
@@ -717,11 +1260,20 @@ class TradeStationClient:
         return symbol
 
     def is_market_open(self, check_extended: bool = False) -> bool:
-        """Check if US equity market is currently open"""
+        """Check if US equity market is currently open.
+
+        Accounts for NYSE holidays (which fall on weekdays) and half-day
+        early closes (regular session ends 13:00 ET) — the prior weekday +
+        time-of-day check reported the market open on both.
+        """
         now_et = datetime.now(ET)
 
         # Check if weekday
         if now_et.weekday() > 4:
+            return False
+
+        # NYSE holidays fall on weekdays; the market is closed all day.
+        if now_et.date() in NYSE_HOLIDAYS:
             return False
 
         current_time = now_et.time()
@@ -731,7 +1283,11 @@ class TradeStationClient:
             market_close = datetime.strptime("20:00:00", "%H:%M:%S").time()
         else:
             market_open = datetime.strptime("09:30:00", "%H:%M:%S").time()
-            market_close = datetime.strptime("16:00:00", "%H:%M:%S").time()
+            # Half-day early close: regular session ends at 13:00 ET.
+            if now_et.date() in NYSE_HALF_DAYS:
+                market_close = datetime.strptime("13:00:00", "%H:%M:%S").time()
+            else:
+                market_close = datetime.strptime("16:00:00", "%H:%M:%S").time()
 
         return market_open <= current_time <= market_close
 
@@ -863,13 +1419,13 @@ Examples:
     # Load environment variable defaults
     test = args.test if args.test else os.getenv("TS_TEST", "all")
     symbol = args.symbol if args.symbol else os.getenv("TS_SYMBOL", "SPY")
-    bars_back = args.bars_back if args.bars_back else int(os.getenv("TS_BARS_BACK", "5"))
-    interval = args.interval if args.interval else int(os.getenv("TS_INTERVAL", "1"))
+    bars_back = args.bars_back if args.bars_back else _getenv_int("TS_BARS_BACK", 5)
+    interval = args.interval if args.interval else _getenv_int("TS_INTERVAL", 1)
     unit = args.unit if args.unit else os.getenv("TS_UNIT", "Daily")
     query = args.query if args.query else os.getenv("TS_QUERY", "Apple")
     expiration = args.expiration if args.expiration else None
     option_symbol_arg = args.option_symbol if args.option_symbol else None
-    debug = args.debug or os.getenv("LOG_LEVEL", "").upper() == "DEBUG"
+    debug = args.debug or _getenv_str("LOG_LEVEL", "").upper() == "DEBUG"
 
     # Set logging level
     if debug:
@@ -887,7 +1443,7 @@ Examples:
         os.getenv("TRADESTATION_CLIENT_ID"),
         os.getenv("TRADESTATION_CLIENT_SECRET"),
         os.getenv("TRADESTATION_REFRESH_TOKEN"),
-        sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true",
+        sandbox=_getenv_bool("TRADESTATION_USE_SANDBOX", False),
     )
 
     try:

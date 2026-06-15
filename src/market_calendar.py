@@ -156,6 +156,15 @@ def calculate_time_to_expiration(
     expiration_dt = ET.localize(datetime.combine(expiration_date, close_t))
 
     years = (expiration_dt - current_date).total_seconds() / 86_400 / 365.0
+    # Past the settlement instant the contract has EXPIRED. Return 0 so
+    # callers' ``T <= 0`` guards (BS gamma/IV solver/Greeks) drop it. The
+    # floor below intentionally only protects *still-alive* near-expiry
+    # contracts (0 < years < floor) from the ``1/√T`` gamma spike; applying
+    # it to ``years <= 0`` fabricated ~30 min of life and produced non-NULL
+    # Greeks/IV for dead contracts whose option_chains rows linger after
+    # settlement (e.g. AM-settled SPX after 09:30, PM contracts 16:00-16:15).
+    if years <= 0.0:
+        return 0.0
     return max(years, _MIN_YEARS_TO_EXPIRATION)  # type: ignore[no-any-return]
 
 

@@ -950,6 +950,8 @@ help: ## Show this help message
 	@echo "  make flow-reset-session-facts - Delete one ET session from flow_contract_facts"
 	@echo "  make flow-rebuild-session - Reset one ET session, restart API, trigger flow refresh"
 	@echo "    (override: FLOW_SYMBOL=SPX FLOW_REBUILD_DATE=2026-04-10 FLOW_REBUILD_START_ET=09:30 FLOW_REBUILD_END_ET=16:15)"
+	@echo "  make flow-rebuild-session-full - Wipe whole ET date + restart + trigger + wait 60s"
+	@echo "    (use when flow-rebuild-session leaves a morning gap — e.g. when a 90-min backstop poll between reset and restart pins last_fact_ts to a recent row)"
 	@echo ""
 	@echo "$(GREEN)Technicals Support:$(NC)"
 	@echo "  make vwap               - VWAP deviation tracker"
@@ -2180,6 +2182,13 @@ flow-rebuild-session: flow-reset-session-facts ## Reset one ET session, restart 
 	@echo "$(YELLOW)Triggering /api/flow/by-contract refresh for $(FLOW_SYMBOL)...$(NC)"
 	@curl -fsS "http://localhost:8000/api/flow/by-contract?symbol=$(FLOW_SYMBOL)&session=current" > /dev/null
 	@echo "$(GREEN)Rebuild trigger sent. Validate with: make flow-by-contract FLOW_SYMBOL=$(FLOW_SYMBOL)$(NC)"
+
+.PHONY: flow-rebuild-session-full
+flow-rebuild-session-full: ## Full-day rebuild: wipes the WHOLE ET date (not just 09:30-16:15) so the refresh's last_fact_ts can't be pinned to a recent row by a stray 90-min backstop poll, then restarts + triggers + waits long enough for the cold-start to commit. Use after a long outage or when flow-rebuild-session leaves a morning gap.
+	@$(MAKE) flow-rebuild-session FLOW_SYMBOL=$(FLOW_SYMBOL) FLOW_REBUILD_DATE=$(FLOW_REBUILD_DATE) FLOW_REBUILD_START_ET=00:00 FLOW_REBUILD_END_ET=23:59
+	@echo "$(YELLOW)Cold-start upsert can take 60-120s for a full session; waiting...$(NC)"
+	@sleep 60
+	@echo "$(GREEN)Done. Spot-check a known minute with: make psql -c \"SELECT COUNT(*) FROM flow_contract_facts WHERE symbol='$(FLOW_SYMBOL)' AND (timestamp AT TIME ZONE 'America/New_York')::date = DATE '$(FLOW_REBUILD_DATE)';\"$(NC)"
 
 .PHONY: vwap
 vwap: ## VWAP deviation tracker

@@ -16,6 +16,7 @@ from threading import Lock
 from typing import Optional
 import fcntl
 from src.utils import get_logger
+from src.config import _getenv_int, _getenv_bool, _getenv_float, API_REQUEST_TIMEOUT
 
 # Initialize logger
 logger = get_logger(__name__)
@@ -57,12 +58,20 @@ class TradeStationAuth:
         self.token_expiry: Optional[datetime] = None
         self._token_lock = Lock()
         self._last_refresh_epoch: float = 0.0
-        # Monotonic counter bumped on every successful refresh.  Callers can
-        # pass their observed token (or its generation) to force_refresh so we
-        # can detect whether the token was already rotated by another thread
-        # while they were making a failing request.
-        self._token_generation: int = 0
-        self.refresh_buffer_seconds = int(os.getenv("TS_REFRESH_BUFFER_SECONDS", "30"))
+        self.refresh_buffer_seconds = _getenv_int("TS_REFRESH_BUFFER_SECONDS", 30)
+        # Token refresh is the least-resilient call in the stack: a single
+        # transient blip used to hard-fail the request that triggered it
+        # (hard-coded 10s timeout, no retry).  Give it the same resilience as
+        # data calls — a configurable timeout (defaulting to API_REQUEST_TIMEOUT)
+        # and a small exponential-backoff retry budget on transient network
+        # errors only (an auth rejection still fails fast). Parsed via the
+        # comment-tolerant config helpers so a ``KEY=30  # note`` .env line can't
+        # crash worker startup.
+        self._refresh_timeout_seconds = _getenv_int(
+            "TS_REFRESH_TIMEOUT_SECONDS", API_REQUEST_TIMEOUT
+        )
+        self._refresh_max_attempts = max(1, _getenv_int("TS_REFRESH_MAX_ATTEMPTS", 3))
+        self._refresh_retry_base_delay = _getenv_float("TS_REFRESH_RETRY_DELAY", 1.0)
         token_cache_name = (
             "tradestation_token_cache_sandbox.json" if sandbox else "tradestation_token_cache.json"
         )
@@ -226,8 +235,42 @@ class TradeStationAuth:
                     return self.access_token  # type: ignore[return-value]
 
                 # Make refresh token request to https://signin.tradestation.com/oauth/token
-                # (or for sandbox: https://sim-signin.tradestation.com/oauth/token)
-                response = requests.post(self.token_url, data=payload, timeout=10)
+                # (or for sandbox: https://sim-signin.tradestation.com/oauth/token).
+                # Retry transient network failures with exponential backoff so a
+                # single blip at the most critical call doesn't fail the request
+                # that triggered the refresh.  Auth REJECTIONS (non-2xx) are not
+                # retried here — they go through raise_for_status below.
+                response = None
+                last_exc: Optional[Exception] = None
+                for attempt in range(self._refresh_max_attempts):
+                    try:
+                        response = requests.post(
+                            self.token_url,
+                            data=payload,
+                            timeout=self._refresh_timeout_seconds,
+                        )
+                        break
+                    except (
+                        requests.exceptions.Timeout,
+                        requests.exceptions.ConnectionError,
+                    ) as exc:
+                        last_exc = exc
+                        if attempt < self._refresh_max_attempts - 1:
+                            delay = self._refresh_retry_base_delay * (2**attempt)
+                            logger.warning(
+                                "Token refresh network error (attempt %d/%d): %s — "
+                                "retrying in %.1fs",
+                                attempt + 1,
+                                self._refresh_max_attempts,
+                                exc.__class__.__name__,
+                                delay,
+                            )
+                            time.sleep(delay)
+                if response is None:
+                    logger.error(
+                        "Token refresh failed after %d attempts", self._refresh_max_attempts
+                    )
+                    raise last_exc  # type: ignore[misc]
 
                 logger.debug(f"Token request status code: {response.status_code}")
 
@@ -258,7 +301,6 @@ class TradeStationAuth:
                 expires_in = data.get("expires_in", 1200)
                 self.token_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
                 self._last_refresh_epoch = time.time()
-                self._token_generation += 1
                 self._persist_cached_token_to_disk(expires_in)
                 logger.info(f"✅ Access token refreshed successfully (expires in {expires_in}s)")
                 logger.debug(f"Token expiry set to: {self.token_expiry}")
@@ -308,7 +350,7 @@ def main():
         os.getenv("TRADESTATION_CLIENT_ID"),
         os.getenv("TRADESTATION_CLIENT_SECRET"),
         os.getenv("TRADESTATION_REFRESH_TOKEN"),
-        sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true",
+        sandbox=_getenv_bool("TRADESTATION_USE_SANDBOX", False),
     )
 
     try:

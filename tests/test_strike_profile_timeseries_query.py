@@ -137,9 +137,10 @@ def test_etf_has_no_session_filter():
 
 def test_cash_index_restricts_to_regular_session():
     """SPX / NDX / RUT charts can't surface overnight gex_summary rows —
-    they have no candlestick to align with.  Filter applied to BOTH the
-    anchor and the bucket-rep CTE (the two-template trick
-    get_historical_gex uses)."""
+    they have no candlestick to align with.  Filter applied to all three
+    gex_summary scans: the ``latest`` anchor, the ``bounds`` bucket-floor
+    subquery (so ``window_units`` counts only RTH buckets), and the
+    ``bucket_reps`` per-bucket selector."""
     captured = _run("SPX")
     sql = captured["query"]
 
@@ -148,14 +149,26 @@ def test_cash_index_restricts_to_regular_session():
     assert "BETWEEN TIME '09:30' AND TIME '16:00'" in sql
     assert "<> ALL($4::date[])" in sql
 
-    # Filter is applied in BOTH gex_summary scans.
-    assert sql.count("EXTRACT(DOW") == 2
+    # Filter applied to all three gex_summary scans: latest anchor,
+    # bucket-floor subquery, and bucket_reps. Counting RTH-only buckets
+    # for the floor matches what bucket_reps will surface — anything
+    # less would re-introduce the wall-clock sparsity bug for cash
+    # indices on coarser intervals.
+    assert sql.count("EXTRACT(DOW") == 3
 
     # bucket_reps aliases gex_summary as ``gs`` — its session predicate
     # must reference gs.timestamp, not the bare column (PG won't resolve).
     bucket_reps_idx = sql.index("bucket_reps AS")
     bucket_reps_block = sql[bucket_reps_idx:]
     assert "gs.timestamp AT TIME ZONE" in bucket_reps_block
+
+    # The bucket-floor subquery sits inside ``bounds`` and scans
+    # gex_summary without aliasing it, so its session predicate must
+    # reference the bare ``timestamp`` column.
+    bounds_idx = sql.index("bounds AS")
+    bounds_block = sql[bounds_idx:bucket_reps_idx]
+    assert "EXTRACT(DOW FROM timestamp AT TIME ZONE" in bounds_block
+    assert "LIMIT $2" in bounds_block
 
     # Param shape: symbol, window_units, expiration, holidays[].
     assert len(captured["args"]) == 4

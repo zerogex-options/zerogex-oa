@@ -17,9 +17,10 @@ Storage is handled by IngestionEngine.
 
 import json
 import os
+import random
 import threading
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import Generator, List, Dict, Any, Optional, Set
 import pytz
 import requests as _requests
@@ -34,8 +35,13 @@ from src.validation import (
     get_market_session,
     underlying_feed_expected,
 )
-from src.symbols import resolve_option_root
+from src.symbols import resolve_option_root, is_cash_index
+from src.market_calendar import is_underlying_active_session
 from src.config import (
+    _getenv_str,
+    _getenv_int,
+    _getenv_bool,
+    _getenv_float,
     OPTION_BATCH_SIZE,
     DELAY_BETWEEN_BATCHES,
     MARKET_HOURS_POLL_INTERVAL,
@@ -62,15 +68,15 @@ ET = pytz.timezone("US/Eastern")
 
 # Stream read timeout — how long the background reader waits for the next
 # event before the socket times out (triggers a reconnect).
-_STREAM_READ_TIMEOUT = int(os.getenv("TS_STREAM_READ_TIMEOUT", "300"))
+_STREAM_READ_TIMEOUT = _getenv_int("TS_STREAM_READ_TIMEOUT", 300)
 
 # JSON decode error budgeting.  Streams sometimes emit partial/garbled
 # lines, and swallowing them silently masks real outages (expired session,
 # proxy truncation, etc).  We log a WARNING every N failures and raise
 # once the per-minute rate exceeds the threshold so the outer reader loop
 # tears down the connection and reconnects with a fresh token.
-_DECODE_WARN_EVERY = int(os.getenv("TS_STREAM_DECODE_WARN_EVERY", "100"))
-_DECODE_MAX_PER_MINUTE = int(os.getenv("TS_STREAM_DECODE_MAX_PER_MINUTE", "50"))
+_DECODE_WARN_EVERY = _getenv_int("TS_STREAM_DECODE_WARN_EVERY", 100)
+_DECODE_MAX_PER_MINUTE = _getenv_int("TS_STREAM_DECODE_MAX_PER_MINUTE", 50)
 
 # A stream that connects (200 OK) and then ends within this many seconds
 # almost certainly hit the TradeStation per-account concurrent-stream cap
@@ -79,7 +85,7 @@ _DECODE_MAX_PER_MINUTE = int(os.getenv("TS_STREAM_DECODE_MAX_PER_MINUTE", "50"))
 # fingerprint is the short lifetime. Reader loops emit a dedicated
 # cap-exhaustion WARNING when a connection ends inside this window so
 # the symptom is named instead of looking like a generic disconnect.
-_STREAM_CAP_SUSPECT_SECONDS = int(os.getenv("TS_STREAM_CAP_SUSPECT_SECONDS", "30"))
+_STREAM_CAP_SUSPECT_SECONDS = _getenv_int("TS_STREAM_CAP_SUSPECT_SECONDS", 30)
 
 # When a stream connects (200 OK) and ends without delivering ANY data,
 # TradeStation's upstream gateway is the likely culprit rather than the
@@ -87,9 +93,55 @@ _STREAM_CAP_SUSPECT_SECONDS = int(os.getenv("TS_STREAM_CAP_SUSPECT_SECONDS", "30
 # Reader loops only sleep on raised exceptions, so a clean iter_lines()
 # return immediately retries — back off this many seconds in the
 # finally block to keep an upstream blip from hot-looping at 10 Hz.
-_STREAM_DEGRADED_UPSTREAM_BACKOFF_SECONDS = int(
-    os.getenv("TS_STREAM_DEGRADED_UPSTREAM_BACKOFF_SECONDS", "2")
+_STREAM_DEGRADED_UPSTREAM_BACKOFF_SECONDS = _getenv_int(
+    "TS_STREAM_DEGRADED_UPSTREAM_BACKOFF_SECONDS", 2
 )
+
+# Reconnect backoff for the background reader loops. A flat 2s retry meant
+# every reader thread (one per option chunk + the underlying) across every
+# ingestion process reconnected every ~2s during an outage — a thundering
+# herd that perpetuated the very per-account concurrent-stream-cap exhaustion
+# the cap classifier diagnoses. Use exponential backoff with jitter, capped,
+# and reset once a connection has stayed healthy.
+_STREAM_RECONNECT_BASE_SECONDS = _getenv_float("TS_STREAM_RECONNECT_BASE_SECONDS", 2.0)
+_STREAM_RECONNECT_MAX_SECONDS = _getenv_float("TS_STREAM_RECONNECT_MAX_SECONDS", 60.0)
+# A connection that stayed open at least this long is treated as healthy, so
+# the next disconnect starts its backoff from scratch instead of carrying a
+# stale failure count forward.
+_STREAM_RECONNECT_HEALTHY_SECONDS = _getenv_float("TS_STREAM_RECONNECT_HEALTHY_SECONDS", 30.0)
+
+
+def _stream_reconnect_delay(consecutive_failures: int) -> float:
+    """Exponential backoff in seconds with 0–10% jitter, capped.
+
+    ``consecutive_failures`` starts at 1 for the first failure. Base doubles
+    each attempt (2, 4, 8 …) up to ``_STREAM_RECONNECT_MAX_SECONDS``; jitter is
+    uniform on [0, base*0.1) so concurrent readers don't retry in lockstep.
+    """
+    n = max(1, consecutive_failures)
+    base = min(_STREAM_RECONNECT_BASE_SECONDS * (2 ** (n - 1)), _STREAM_RECONNECT_MAX_SECONDS)
+    return base + random.uniform(0, base * 0.1)
+
+
+def _sleep_interruptible(seconds: float, is_running) -> None:
+    """Sleep up to ``seconds`` but return early once ``is_running()`` is False.
+
+    Keeps reconnect backoff from delaying a stop()/shutdown by the full
+    (now potentially 60s) backoff window.
+    """
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not is_running():
+            return
+        time.sleep(min(0.5, remaining))
+
+
+class _NonRetryableStreamError(Exception):
+    """Raised by a reader when reconnecting cannot succeed without operator
+    action (e.g. a 414 from an over-sized chunk URL). The reader loop stops
+    that reader instead of hot-looping the identical doomed request."""
+
 
 # Possible field names for implied volatility across TradeStation payload variants
 _IV_FIELD_NAMES = ("ImpliedVolatility", "IV", "Volatility", "IVol")
@@ -354,13 +406,36 @@ class OptionStreamAccumulator:
             if len(self._chunks) > 1
             else "Option stream"
         )
+        consecutive_failures = 0
         while self._running:
+            started = time.monotonic()
             try:
                 self._read_stream(chunk_idx, chunk_symbols, label)
+                # Clean return = stream ended. Reset backoff only if the
+                # connection stayed healthy for a while; a fast return
+                # (cap/degraded) keeps the failure count climbing.
+                if time.monotonic() - started >= _STREAM_RECONNECT_HEALTHY_SECONDS:
+                    consecutive_failures = 0
+            except _NonRetryableStreamError as e:
+                logger.error(
+                    "%s: non-retryable stream error (%s); stopping this reader "
+                    "until the configuration is fixed.",
+                    label,
+                    e,
+                )
+                break
             except Exception as e:
                 if self._running:
-                    logger.warning(f"{label} disconnected ({e}), reconnecting in 2s...")
-                    time.sleep(2)
+                    consecutive_failures += 1
+                    delay = _stream_reconnect_delay(consecutive_failures)
+                    logger.warning(
+                        "%s disconnected (%s), reconnecting in %.1fs (consecutive failures: %d)...",
+                        label,
+                        e,
+                        delay,
+                        consecutive_failures,
+                    )
+                    _sleep_interruptible(delay, lambda: self._running)
 
     def _read_stream(self, chunk_idx: int, chunk_symbols: List[str], label: str):
         """Open one stream connection for *chunk_symbols* and read events until it ends."""
@@ -383,15 +458,16 @@ class OptionStreamAccumulator:
 
             if response.status_code == 414:
                 # URL too large despite chunking — operator pushed the per-chunk
-                # cap above what TradeStation's gateway accepts. Log loudly so
-                # the cause is obvious instead of being buried as a generic
-                # disconnect, then raise to trigger the standard reconnect path.
-                logger.error(
-                    "%s received 414 Request-URI Too Large for %d symbols. "
-                    "Reduce STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION (currently %d).",
-                    label,
-                    len(chunk_symbols),
-                    self._chunk_size,
+                # cap above what TradeStation's gateway accepts. This is
+                # deterministic: the URL won't shrink without a config change,
+                # so reconnecting the identical request just hot-loops. Raise a
+                # non-retryable error so the reader loop stops THIS chunk
+                # instead of spinning forever.
+                response.close()
+                raise _NonRetryableStreamError(
+                    f"{label} received 414 Request-URI Too Large for "
+                    f"{len(chunk_symbols)} symbols. Reduce "
+                    f"STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION (currently {self._chunk_size})."
                 )
 
             response.raise_for_status()
@@ -680,15 +756,25 @@ class UnderlyingBarAccumulator:
 
     def _reader_loop(self):
         """Continuously read bar stream events; auto-reconnect on failure."""
+        consecutive_failures = 0
         while self._running:
+            started = time.monotonic()
             try:
                 self._read_stream()
+                if time.monotonic() - started >= _STREAM_RECONNECT_HEALTHY_SECONDS:
+                    consecutive_failures = 0
             except Exception as e:
                 if self._running:
+                    consecutive_failures += 1
+                    delay = _stream_reconnect_delay(consecutive_failures)
                     logger.warning(
-                        f"Underlying bar stream disconnected ({e}), reconnecting in 2s..."
+                        "Underlying bar stream disconnected (%s), reconnecting in %.1fs "
+                        "(consecutive failures: %d)...",
+                        e,
+                        delay,
+                        consecutive_failures,
                     )
-                    time.sleep(2)
+                    _sleep_interruptible(delay, lambda: self._running)
 
     def _read_stream(self):
         """Open one stream connection and read bar events until it ends."""
@@ -873,7 +959,6 @@ class UnderlyingBarAccumulator:
             return
 
         minute_bucket = timestamp.replace(second=0, microsecond=0)
-        prior = self._bar_state.get(minute_bucket, {})
 
         raw_up = bar.get("UpVolume")
         raw_down = bar.get("DownVolume")
@@ -883,38 +968,46 @@ class UnderlyingBarAccumulator:
         down_volume = safe_int(raw_down, field_name="DownVolume")
         total_volume = safe_int(raw_total, field_name="TotalVolume")
 
-        # Carry forward omitted volume fields from the same minute bucket.
-        if raw_up in (None, "", "N/A"):
-            up_volume = prior.get("up_volume", up_volume)
-        if raw_down in (None, "", "N/A"):
-            down_volume = prior.get("down_volume", down_volume)
-        if raw_total in (None, "", "N/A"):
-            total_volume = prior.get("volume", total_volume)
-
-        bar_data = {
-            "symbol": self._db_symbol,
-            "timestamp": timestamp,
-            "open": safe_float(bar.get("Open"), field_name="Open"),
-            "high": safe_float(bar.get("High"), field_name="High"),
-            "low": safe_float(bar.get("Low"), field_name="Low"),
-            "close": safe_float(bar.get("Close"), field_name="Close"),
-            "up_volume": up_volume,
-            "down_volume": down_volume,
-            "volume": total_volume,
-        }
-
-        # Update carry-forward state for this minute.
-        self._bar_state[minute_bucket] = {
-            "up_volume": up_volume,
-            "down_volume": down_volume,
-            "volume": total_volume,
-        }
-        # Evict stale minute buckets.
-        stale = [k for k in self._bar_state if k < minute_bucket]
-        for k in stale:
-            del self._bar_state[k]
-
+        # The _bar_state carry-forward read-modify-write, its eviction, and
+        # the _bar publish must be atomic relative to drain(): hold the lock
+        # across all of it so a concurrent drain() never observes a _bar whose
+        # volume carry-forward was computed against a _bar_state another caller
+        # is mid-mutating (the eviction in particular). The work under the lock
+        # is pure dict arithmetic — no network — so the critical section is
+        # tiny.
         with self._lock:
+            prior = self._bar_state.get(minute_bucket, {})
+            # Carry forward omitted volume fields from the same minute bucket.
+            if raw_up in (None, "", "N/A"):
+                up_volume = prior.get("up_volume", up_volume)
+            if raw_down in (None, "", "N/A"):
+                down_volume = prior.get("down_volume", down_volume)
+            if raw_total in (None, "", "N/A"):
+                total_volume = prior.get("volume", total_volume)
+
+            bar_data = {
+                "symbol": self._db_symbol,
+                "timestamp": timestamp,
+                "open": safe_float(bar.get("Open"), field_name="Open"),
+                "high": safe_float(bar.get("High"), field_name="High"),
+                "low": safe_float(bar.get("Low"), field_name="Low"),
+                "close": safe_float(bar.get("Close"), field_name="Close"),
+                "up_volume": up_volume,
+                "down_volume": down_volume,
+                "volume": total_volume,
+            }
+
+            # Update carry-forward state for this minute.
+            self._bar_state[minute_bucket] = {
+                "up_volume": up_volume,
+                "down_volume": down_volume,
+                "volume": total_volume,
+            }
+            # Evict stale minute buckets.
+            stale = [k for k in self._bar_state if k < minute_bucket]
+            for k in stale:
+                del self._bar_state[k]
+
             self._bar = bar_data
             self._dirty = True
             self._updates_received += 1
@@ -979,26 +1072,24 @@ class StreamManager:
 
         # Track last expiration refresh time
         self.last_expiration_refresh: Optional[datetime] = None
-        self.option_oi_coverage_alert_threshold = float(
-            os.getenv("OPTION_OI_COVERAGE_ALERT_THRESHOLD", "0.35")
+        self.option_oi_coverage_alert_threshold = _getenv_float(
+            "OPTION_OI_COVERAGE_ALERT_THRESHOLD", 0.35
         )
-        self.option_volume_coverage_alert_threshold = float(
-            os.getenv("OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD", "0.35")
+        self.option_volume_coverage_alert_threshold = _getenv_float(
+            "OPTION_VOLUME_COVERAGE_ALERT_THRESHOLD", 0.35
         )
         # Volume is cumulative for the day; the first ~30 min after open
         # are a natural ramp where most contracts haven't traded yet, so
         # gate the warning on a warmup window past 09:30 ET.
-        self.option_volume_warmup_minutes = int(os.getenv("OPTION_VOLUME_WARMUP_MINUTES", "30"))
+        self.option_volume_warmup_minutes = _getenv_int("OPTION_VOLUME_WARMUP_MINUTES", 30)
         # OI is sticky in the accumulator (only overwritten by positive
         # values), but the REST seed and stream may not carry yesterday's
         # settled OI before the regular open — so contracts that tick in
         # pre-market often still show OI=0. Gate the alarm on a short
         # warmup past 09:30 ET so the warning only fires when a genuine
         # gap persists into the regular session.
-        self.option_oi_warmup_minutes = int(os.getenv("OPTION_OI_WARMUP_MINUTES", "5"))
-        self.seed_rest_on_recalc = (
-            os.getenv("OPTION_REST_SEED_ON_RECALC", "false").lower() == "true"
-        )
+        self.option_oi_warmup_minutes = _getenv_int("OPTION_OI_WARMUP_MINUTES", 5)
+        self.seed_rest_on_recalc = _getenv_bool("OPTION_REST_SEED_ON_RECALC", False)
         # Session-cumulative set of option symbols seen with Volume>0 since the
         # ET day rollover. Kept on the StreamManager (NOT the per-cycle
         # accumulator, which is torn down and rebuilt without a REST re-seed
@@ -1295,11 +1386,11 @@ class StreamManager:
 
     def _update_session_volume_coverage(
         self,
-        full_state: Dict[str, Dict[str, Any]],
+        changed_state: Dict[str, Dict[str, Any]],
         tracked_total: int,
         now_et: Optional[datetime] = None,
     ) -> float:
-        """Session-cumulative fraction of the tracked universe seen trading.
+        """Session-cumulative fraction of the CURRENT tracked universe trading.
 
         The per-cycle option accumulator is torn down and rebuilt WITHOUT a
         REST re-seed every ``STRIKE_RECALC_INTERVAL`` (~60s at the default 5s
@@ -1309,23 +1400,69 @@ class StreamManager:
         chronic false positive behind the "Low option volume coverage" alert.
 
         Instead, accumulate the set of symbols seen with ``Volume>0`` on the
-        StreamManager (it survives the accumulator swaps), reset it at the ET
-        day rollover, and report the distinct count over the current universe
-        size, capped at 1.0 (the band drifts with spot, so the day's union can
-        exceed the current snapshot). Stays low only when volume genuinely
-        isn't arriving, which is what the alert is for; a volume STOP after
-        trades were already seen is left to stream_updates / flow-staleness.
+        StreamManager (it survives the accumulator swaps) and reset it at the ET
+        day rollover.  ``changed_state`` is the drained changed-contract subset,
+        which is sufficient because the union persists across cycles.
+
+        The union is intersected with the CURRENT tracked set before reporting:
+        on a trending day spot drifts, strikes recalibrate, and symbols leave
+        the tracked band — leaving their day's-union membership in place made
+        the numerator exceed (and pin at) 100% even when the current band's
+        coverage was poor, rendering the alert useless mid-trend. Pruning to the
+        current universe also bounds the set's memory.
         """
         et_date = (now_et or datetime.now(ET)).date()
         if self._session_volume_date != et_date:
             self._session_volume_symbols = set()
+            # Day rollover side-effects centralised here so future per-day
+            # resets have one obvious place to land.
+            self._on_session_day_rollover(prev_date=self._session_volume_date, new_date=et_date)
             self._session_volume_date = et_date
+
+        tracked_set = set(self.tracked_option_symbols)
+        # Prune drifted-out symbols so they don't inflate the numerator.
+        self._session_volume_symbols &= tracked_set
         self._session_volume_symbols.update(
-            sym for sym, raw in full_state.items() if int(raw.get("Volume") or 0) > 0
+            sym
+            for sym, raw in changed_state.items()
+            if sym in tracked_set and int(raw.get("Volume") or 0) > 0
         )
         if tracked_total <= 0:
             return 0.0
         return min(1.0, len(self._session_volume_symbols) / tracked_total)
+
+    def _on_session_day_rollover(self, prev_date: Optional[date], new_date: date) -> None:
+        """Fire when the ET calendar day rolls over.
+
+        Centralised so per-day resets stay co-located with day-rollover
+        detection.  Called from ``_update_session_volume_coverage`` AFTER
+        the volume-symbol set has been cleared but BEFORE the date marker
+        is advanced -- the previous date is passed in for logging.
+
+        Currently invalidates the TradeStation strikes cache: overnight,
+        new weekly expirations are listed and the prior day's cached
+        strike lists for those expirations would point at the wrong row
+        set.  Within an intraday session strikes barely change, so the
+        cache TTL handles staleness; across a day boundary we drop the
+        whole cache so the first fetch after rollover gets a fresh view.
+        """
+        try:
+            self.client.invalidate_strikes_cache()
+        except Exception as e:
+            # Cache invalidation must never crash the stream loop.
+            logger.warning("Strikes-cache invalidation on day rollover failed: %s", e)
+        if prev_date is not None:
+            logger.info(
+                "Session day rollover %s -> %s; cleared volume-coverage set "
+                "and TradeStation strikes cache.",
+                prev_date,
+                new_date,
+            )
+        else:
+            logger.debug(
+                "First session-day observation (%s); strikes cache invalidated as a baseline.",
+                new_date,
+            )
 
     def _cleanup_expired_strikes(self):
         """Remove strikes for expired expirations to prevent memory leak"""
@@ -1506,6 +1643,28 @@ class StreamManager:
 
         Returns a list (not a generator) so callers can count results.
         """
+        # Cash-settled index options (SPX, NDX, RUT, DJX …) don't have a
+        # market outside 09:30-16:00 ET, but TradeStation still streams
+        # bid/ask updates from market makers all day.  After we added the
+        # receive-time fallback in 9481dd8, those off-session updates
+        # would land in option_chains stamped with the current wall clock
+        # but carrying stale Friday quote data.  The cash-index session
+        # filter at query time (database.py:get_gex_heatmap) already
+        # excludes them downstream, so we're writing rows we'll never
+        # read.  Skip the whole batch here -- less DB load, less write
+        # contention, identical downstream output.  ETFs (SPY, QQQ) skip
+        # this branch because is_cash_index() returns False for them, so
+        # their pre/post-market quotes still write as before.
+        if state and is_cash_index(self.db_underlying):
+            now_utc = datetime.now(timezone.utc)
+            if not is_underlying_active_session(now_utc, symbol=self.db_underlying):
+                logger.debug(
+                    "Skipping %d cash-settled option quotes for %s outside session.",
+                    len(state),
+                    self.db_underlying,
+                )
+                return []
+
         results = []
         for option_symbol, raw in state.items():
             meta = self._symbol_metadata.get(option_symbol)
@@ -1514,8 +1673,6 @@ class StreamManager:
 
             raw_ts = raw.get("TimeStamp", "")
             timestamp = safe_datetime(raw_ts, field_name="TimeStamp")
-            if not timestamp:
-                timestamp = datetime.now(ET)
 
             last = safe_float(raw.get("Last"), default=None, field_name="Last")
             bid = safe_float(raw.get("Bid"), default=None, field_name="Bid")
@@ -1524,6 +1681,41 @@ class StreamManager:
 
             if mid is None and bid is not None and ask is not None:
                 mid = (bid + ask) / 2.0
+
+            if timestamp is None:
+                # TradeStation emits stream updates with TimeStamp='' for any
+                # option contract that hasn't trade-printed in the current
+                # session. That's the common case for far-OTM ETF strikes
+                # pre-market, and the universal case for cash-settled SPX/NDX
+                # contracts outside 09:30-16:00 ET — they get a continuous
+                # quote feed but no last-trade timestamp.
+                #
+                # Fall back to stream arrival time (now) when the snapshot
+                # carries a usable bid/ask/mid: the quote IS current, we just
+                # don't have a trade-time to anchor on, and stamping with the
+                # receive time is the correct semantic for a real-time order-
+                # book snapshot. Without this fallback the pre-market option
+                # universe drops to zero and downstream (option_chains -> Greeks
+                # -> gex_summary -> heatmap/flip) stays empty until the cash
+                # session opens.
+                #
+                # The bar path (line ~948) still drops bad timestamps because
+                # underlying bars MUST anchor to their period boundary — receive
+                # time would shift them into the wrong minute bucket. Option
+                # quotes aren't time-bucketed the same way: the snapshot is a
+                # point-in-time read.
+                if bid is not None or ask is not None or mid is not None:
+                    timestamp = datetime.now(timezone.utc)
+                else:
+                    # No timestamp AND no quote -- nothing useful to write.
+                    # Demoted from WARNING to DEBUG because this fires at high
+                    # cadence during pre-market for thinly-quoted contracts
+                    # and was flooding service logs.
+                    logger.debug(
+                        "Dropping option quote with no TimeStamp and no bid/ask/mid for %s",
+                        option_symbol,
+                    )
+                    continue
 
             volume = safe_int(raw.get("Volume"), default=None, field_name="Volume")
 
@@ -1575,16 +1767,16 @@ class StreamManager:
         drains only the contracts that received new data since the last
         cycle and yields them as a single batch for efficient DB writes.
 
-        Yields dictionaries with:
-            {
-                'type': 'underlying',
-                'data': {...}
-            }
-        or:
-            {
-                'type': 'option_batch',
-                'data': [list of option dicts]
-            }
+        Yields dictionaries of one of three types:
+            {'type': 'underlying', 'data': {...}}
+            {'type': 'option_batch', 'data': [list of option dicts]}
+            {'type': 'flush_options', 'reason': str}
+                Emitted right BEFORE the tracked option-symbol set is
+                swapped (expiration refresh / strike recalc). The consumer
+                must flush pending partial buckets for contracts about to be
+                dropped, since those contracts never tick again. (There is no
+                singular 'option' item type — options are only ever emitted
+                as 'option_batch'.)
         """
         if not self.tracked_option_symbols:
             logger.error("Not initialized. Call initialize() first.")
@@ -1710,11 +1902,17 @@ class StreamManager:
                     )
 
                     assert self._underlying_accumulator is not None
-                    # Dead reader thread during the live window: recover
-                    # the underlying stream only. The options stream is
-                    # independent and may be healthy; restarting it would
-                    # force an expensive REST re-seed and gap option
-                    # ingestion for no reason.
+                    # Defensive backstop: if the underlying reader THREAD has
+                    # exited during the live window, recreate it. The reader
+                    # loop normally only exits on stop(), but a reader can now
+                    # also terminate on a non-retryable error (e.g. a 414), and
+                    # an unexpected crash in the reconnect path would leave a
+                    # dead thread too — the data-starvation staleness ladder
+                    # below cannot recover from a thread that is no longer
+                    # running, so this catches that case. Underlying-only
+                    # restart: the options stream is independent and may be
+                    # healthy; restarting it would force an expensive REST
+                    # re-seed and gap option ingestion for no reason.
                     if feed_expected and not self._underlying_accumulator.is_alive:
                         self._restart_underlying_accumulator("reader thread is DEAD")
 
@@ -1911,10 +2109,14 @@ class StreamManager:
                             # re-seed every STRIKE_RECALC_INTERVAL (~60s), so a direct
                             # count collapses to ~1 minute of trades each recalc and
                             # chronically false-trips the alert (~0.4-16% seen vs ~80%
-                            # actual). See _update_session_volume_coverage.
-                            full_state = self._accumulator.snapshot()
+                            # actual). See _update_session_volume_coverage. Feed the
+                            # already-drained CHANGED subset rather than a full
+                            # snapshot() copy of every tracked contract: the union is
+                            # accumulated across cycles, so the changed subset is
+                            # sufficient and avoids an O(universe) deep copy under the
+                            # accumulator lock on the hot path every cycle.
                             volume_coverage = self._update_session_volume_coverage(
-                                full_state, tracked_total
+                                changed, tracked_total
                             )
 
                             logger.info(
@@ -2042,25 +2244,25 @@ def main():
     parser = argparse.ArgumentParser(description="Stream real-time options data")
     parser.add_argument(
         "--underlying",
-        default=os.getenv("INGEST_UNDERLYING", "SPY"),
+        default=_getenv_str("INGEST_UNDERLYING", "SPY"),
         help="Underlying symbol or alias (default: SPY)",
     )
     parser.add_argument(
         "--expirations",
         type=int,
-        default=int(os.getenv("INGEST_EXPIRATIONS", "3")),
+        default=_getenv_int("INGEST_EXPIRATIONS", 3),
         help="Number of expirations to track (default: 3)",
     )
     parser.add_argument(
         "--strike-count-max",
         type=int,
-        default=int(os.getenv("INGEST_STRIKE_COUNT_MAX", "40")),
+        default=_getenv_int("INGEST_STRIKE_COUNT_MAX", 40),
         help="Hard cap on strikes per expiration after the pct-range filter (default: 40)",
     )
     parser.add_argument(
         "--strike-pct-range",
         type=float,
-        default=float(os.getenv("INGEST_STRIKE_PCT_RANGE", "3.0")),
+        default=_getenv_float("INGEST_STRIKE_PCT_RANGE", 3.0),
         help="Strike-selection band as percent of spot, e.g. 3.0 -> ±3%% (default: 3.0)",
     )
     parser.add_argument(
@@ -2094,7 +2296,7 @@ def main():
         os.getenv("TRADESTATION_CLIENT_ID"),
         os.getenv("TRADESTATION_CLIENT_SECRET"),
         os.getenv("TRADESTATION_REFRESH_TOKEN"),
-        sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true",
+        sandbox=_getenv_bool("TRADESTATION_USE_SANDBOX", False),
     )
 
     # Initialize stream manager

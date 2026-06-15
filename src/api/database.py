@@ -20,7 +20,7 @@ from src.analytics.walls import compute_call_put_walls
 from src.api.queries.signals import SignalsQueriesMixin
 from src.database.password_providers import resolve_db_credentials
 from src.api.queries.technicals import TechnicalsQueriesMixin
-from src.config import GEX_HEATMAP_STRIKE_BAND_PCT
+from src.config import GEX_HEATMAP_STRIKE_BAND_PCT, _getenv_int, _getenv_float
 from src.flow_series_sql import FLOW_SERIES_CTE_ASYNCPG, SNAPSHOT_SELECT_ASYNCPG
 from src.market_calendar import NYSE_HOLIDAYS
 from src.symbols import is_cash_index
@@ -126,8 +126,8 @@ def _get_flow_session_bounds(session: str = "current") -> tuple:
 # without a circular import.
 from src.api.queries._sql_helpers import (  # noqa: E402
     _bucket_expr,
+    _bucket_floor_subquery,
     _gex_by_strike_order_clause,
-    _interval_expr,
 )
 
 # option_chains rows are UPSERTed in 60-second buckets: every contract that
@@ -144,7 +144,7 @@ from src.api.queries._sql_helpers import (  # noqa: E402
 # fall back to the prior bucket, which must be complete since ingestion has
 # already rolled over to a newer one. If only one bucket exists, use it.
 # The only bound parameter referenced is `$1 = underlying`.
-_STABLE_SNAPSHOT_QUIESCENCE_SECONDS = float(os.getenv("STABLE_SNAPSHOT_QUIESCENCE_SECONDS", "15"))
+_STABLE_SNAPSHOT_QUIESCENCE_SECONDS = _getenv_float("STABLE_SNAPSHOT_QUIESCENCE_SECONDS", 15)
 
 _STABLE_SNAPSHOT_CTE = f"""
     recent_ts AS (
@@ -287,21 +287,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         self.pool: Optional[asyncpg.Pool] = None
         self._pool_lock = asyncio.Lock()
         self._last_flow_refresh_by_symbol: Dict[str, float] = {}
-        self._flow_refresh_min_seconds: float = float(
-            os.getenv("FLOW_CACHE_REFRESH_MIN_SECONDS", "15")
+        self._flow_refresh_min_seconds: float = _getenv_float("FLOW_CACHE_REFRESH_MIN_SECONDS", 15)
+        self._latest_quote_cache_ttl_seconds: float = _getenv_float(
+            "LATEST_QUOTE_CACHE_TTL_SECONDS", 1.5
         )
-        self._latest_quote_cache_ttl_seconds: float = float(
-            os.getenv("LATEST_QUOTE_CACHE_TTL_SECONDS", "1.5")
-        )
-        self._latest_gex_summary_cache_ttl_seconds: float = float(
-            os.getenv("LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS", "1.5")
+        self._latest_gex_summary_cache_ttl_seconds: float = _getenv_float(
+            "LATEST_GEX_SUMMARY_CACHE_TTL_SECONDS", 1.5
         )
         # TTL for analytics-derived endpoints (gex_by_strike, gex_walls, etc.)
         # that only change on the analytics cycle (~60s). A moderate TTL
         # eliminates redundant DB round-trips from rapid frontend polling.
-        self._analytics_cache_ttl_seconds: float = float(
-            os.getenv("ANALYTICS_CACHE_TTL_SECONDS", "5.0")
-        )
+        self._analytics_cache_ttl_seconds: float = _getenv_float("ANALYTICS_CACHE_TTL_SECONDS", 5.0)
         # /api/gex/strike-profile-timeseries gets its own, longer TTL.  The
         # rewind chart polls this endpoint at 1Hz for a window_units=~480
         # response — a query that JOINs ``gex_by_strike`` at ~480 rep_ts and
@@ -312,8 +308,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # in the cache window), and the live-tip Strike-Profile poll on the
         # frontend uses a tiny window_units=3 fetch that costs ~150 rows
         # — fast even on a cold cache.  <= 0 disables endpoint caching.
-        self._strike_profile_timeseries_cache_ttl_seconds: float = float(
-            os.getenv("STRIKE_PROFILE_TIMESERIES_CACHE_TTL_SECONDS", "30.0")
+        self._strike_profile_timeseries_cache_ttl_seconds: float = _getenv_float(
+            "STRIKE_PROFILE_TIMESERIES_CACHE_TTL_SECONDS", 30.0
         )
         # Fraction of spot used as the /api/gex/heatmap strike half-band
         # (validated + bounded in config). Proportional so the heatmap
@@ -322,8 +318,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # Flow endpoints are frequently polled by the frontend. A short TTL
         # dramatically cuts repeated heavy reads while keeping intraday charts
         # effectively real-time.
-        self._flow_endpoint_cache_ttl_seconds: float = float(
-            os.getenv("FLOW_ENDPOINT_CACHE_TTL_SECONDS", "3.0")
+        self._flow_endpoint_cache_ttl_seconds: float = _getenv_float(
+            "FLOW_ENDPOINT_CACHE_TTL_SECONDS", 3.0
         )
         # /api/flow/series gets its own, longer TTL. Its unfiltered read
         # is a flow_series_5min snapshot the Analytics Engine only
@@ -335,8 +331,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # strike/expiration-filtered CTE (measured 6-26x the snapshot).
         # by-contract/contracts deliberately keep the shared TTL above.
         # <= 0 disables endpoint caching.
-        self._flow_series_endpoint_cache_ttl_seconds: float = float(
-            os.getenv("FLOW_SERIES_ENDPOINT_CACHE_TTL_SECONDS", "30.0")
+        self._flow_series_endpoint_cache_ttl_seconds: float = _getenv_float(
+            "FLOW_SERIES_ENDPOINT_CACHE_TTL_SECONDS", 30.0
         )
         # Phase-2 read switch for the flow_series_5min snapshot. When true,
         # unfiltered /api/flow/series reads the pre-aggregated snapshot
@@ -354,8 +350,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # uvicorn from re-hitting the DB on every poll, so a longer TTL is
         # worth the staleness — and 5 s (the analytics default) frequently
         # expires inside a single cold call's wall-clock and gives no benefit.
-        self._confluence_matrix_cache_ttl_seconds: float = float(
-            os.getenv("CONFLUENCE_MATRIX_CACHE_TTL_SECONDS", "60.0")
+        self._confluence_matrix_cache_ttl_seconds: float = _getenv_float(
+            "CONFLUENCE_MATRIX_CACHE_TTL_SECONDS", 60.0
         )
         # /api/max-pain/current is a PURE cache read of max_pain_oi_snapshot
         # / _expiration.  Those tables are written only by the off-process
@@ -366,8 +362,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # engine.  Max pain is daily-grained (OI only changes at
         # settlement), so a process-local TTL on top of the daily snapshot
         # just spares redundant identical DB reads.  <= 0 disables caching.
-        self._max_pain_current_cache_ttl_seconds: float = float(
-            os.getenv("MAX_PAIN_CURRENT_CACHE_TTL_SECONDS", "120.0")
+        self._max_pain_current_cache_ttl_seconds: float = _getenv_float(
+            "MAX_PAIN_CURRENT_CACHE_TTL_SECONDS", 120.0
         )
         # Bounded LRU + TTL. Keys like option_symbol:* / flow_series:* have an
         # effectively unbounded keyspace (per strike-set/expiration-set query
@@ -376,7 +372,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # worker RSS grew without bound over a trading session. Capping size
         # and evicting oldest/expired keeps memory bounded — the cache is a
         # pure latency optimization so eviction can never affect correctness.
-        self._read_cache_maxsize: int = max(64, int(os.getenv("READ_CACHE_MAXSIZE", "2048")))
+        self._read_cache_maxsize: int = max(64, _getenv_int("READ_CACHE_MAXSIZE", 2048))
         self._read_cache: "OrderedDict[str, Tuple[float, Any]]" = OrderedDict()
         self._load_credentials()
 
@@ -411,12 +407,12 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
     async def _create_pool(self) -> asyncpg.Pool:
         """Create and return a fresh asyncpg pool instance."""
-        connect_timeout = float(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "20"))
+        connect_timeout = _getenv_float("DB_CONNECT_TIMEOUT_SECONDS", 20)
         # Keep defaults conservative to avoid exhausting RDS connections when
         # multiple services/workers run at once.
-        min_size = int(os.getenv("DB_POOL_MIN", "1"))
-        max_size = int(os.getenv("DB_POOL_MAX", "3"))
-        statement_timeout_ms = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "30000"))
+        min_size = _getenv_int("DB_POOL_MIN", 1)
+        max_size = _getenv_int("DB_POOL_MAX", 3)
+        statement_timeout_ms = _getenv_int("DB_STATEMENT_TIMEOUT_MS", 30000)
         ssl_mode = os.getenv("DB_SSLMODE", "").strip().lower()
         ssl = None
         if ssl_mode in {"require", "verify-ca", "verify-full"}:
@@ -464,8 +460,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
     async def connect(self):
         """Create connection pool"""
-        retries = int(os.getenv("DB_CONNECT_RETRIES", "5"))
-        retry_base_delay = float(os.getenv("DB_CONNECT_RETRY_DELAY_SECONDS", "1.5"))
+        retries = _getenv_int("DB_CONNECT_RETRIES", 5)
+        retry_base_delay = _getenv_float("DB_CONNECT_RETRY_DELAY_SECONDS", 1.5)
         last_error: Optional[Exception] = None
 
         for attempt in range(1, retries + 1):
@@ -774,19 +770,65 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         try:
             canonical_backfill_minutes = max(
                 1,
-                int(os.getenv("FLOW_CANONICAL_BACKFILL_MINUTES", "90")),
+                _getenv_int("FLOW_CANONICAL_BACKFILL_MINUTES", 90),
             )
         except ValueError:
             canonical_backfill_minutes = 90
+
+        # Reprocess the last few closed minutes on each refresh.  option_chains.volume
+        # can grow after its first write within a bucket: late snapshots upsert via
+        # GREATEST on the monotonic counters, so the first delta we LAG-compute for a
+        # minute is sometimes a partial count.  The old `timestamp > last_fact_ts`
+        # floor froze that partial value forever; we now slide the floor back by
+        # FLOW_REPROCESS_MINUTES and let ON CONFLICT DO UPDATE replace stale rows.
+        # Default 5 minutes; bump if the vendor's late-arrival window is wider.
+        try:
+            reprocess_minutes = max(0, _getenv_int("FLOW_REPROCESS_MINUTES", 5))
+        except ValueError:
+            reprocess_minutes = 5
 
         backfill_start = (
             latest_ts - timedelta(minutes=canonical_backfill_minutes)
             if last_fact_ts is None
             else max(
-                last_fact_ts - timedelta(minutes=1),
+                last_fact_ts - timedelta(minutes=reprocess_minutes + 1),
                 latest_ts - timedelta(minutes=canonical_backfill_minutes),
             )
         )
+        # Lower bound on the INSERT SELECT: rows at or before this timestamp are
+        # treated as final and skipped.  Sliding it back by reprocess_minutes is
+        # what lets stale partial rows get refreshed via ON CONFLICT DO UPDATE.
+        reprocess_floor = (
+            last_fact_ts - timedelta(minutes=reprocess_minutes)
+            if last_fact_ts is not None
+            else datetime(1970, 1, 1, tzinfo=timezone.utc)
+        )
+
+        # The cold-start backfill is a multi-CTE upsert over potentially hours of
+        # option_chains rows × hundreds of active contracts -- it routinely
+        # exceeds the pool's default 30s timeouts.  When it does, the transaction
+        # rolls back and 09:30+ data silently never lands.  The analytics engine's
+        # own cold-start path uses 180s for the same reason
+        # (see docs/architecture/analytics_engine_diagram.md:227).
+        #
+        # We need to lift BOTH halves of the ceiling for the heavy upsert below:
+        #
+        # * Server-side: SET LOCAL statement_timeout = N.  Affects only this
+        #   transaction so other paths keep the tight DB_STATEMENT_TIMEOUT_MS
+        #   default.
+        # * Client-side: pass timeout=N/1000 to conn.execute below.  The pool
+        #   is built with command_timeout=30 (hardcoded in _create_pool), and
+        #   asyncpg will cancel the call client-side at 30s regardless of the
+        #   server-side limit -- so SET LOCAL alone is not enough.
+        try:
+            refresh_statement_timeout_ms = max(
+                1000,
+                _getenv_int("FLOW_REFRESH_STATEMENT_TIMEOUT_MS", 180000),
+            )
+        except ValueError:
+            refresh_statement_timeout_ms = 180000
+        refresh_timeout_seconds = refresh_statement_timeout_ms / 1000.0
+        await conn.execute(f"SET LOCAL statement_timeout = {refresh_statement_timeout_ms}")
 
         # Canonical per-contract fact table used as the source of truth for flow APIs.
         # Uses LAG() window function instead of LATERAL join for O(n) vs O(n²) perf.
@@ -982,7 +1024,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             backfill_start,
             latest_ts,
             underlying_price,
-            last_fact_ts if last_fact_ts is not None else datetime(1970, 1, 1, tzinfo=timezone.utc),
+            reprocess_floor,
+            timeout=refresh_timeout_seconds,
         )
 
     async def _refresh_max_pain_snapshot(
@@ -1736,8 +1779,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     ) -> List[Dict[str, Any]]:
         """Get historical GEX summary data aggregated by timeframe."""
         bucket = _bucket_expr(timeframe)
-        step_interval = _interval_expr(timeframe)
-        # `bucket` and `step_interval` are validated allowlist literals.
+        # `bucket` is a validated allowlist literal.
         #
         # Cash-index session filter — same shape (and rationale) as
         # ``get_gex_heatmap``: SPX / NDX / RUT have no underlying tape
@@ -1746,16 +1788,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # Letting those after-hours / overnight rows reach a cash-index
         # chart misaligns the gamma-flip overlay with the RTH-only
         # candlesticks and drifts past the heatmap surface's right edge
-        # (which already clamps via the same filter).  Apply to BOTH the
-        # ``latest`` anchor (so max_ts lands on the most recent RTH row)
-        # and the ``bucketed`` scan (so out-of-session buckets never
-        # surface).  ETFs / equities keep the original query and params.
+        # (which already clamps via the same filter).  Apply to the
+        # ``latest`` anchor, the ``bounds`` bucket-floor subquery, and
+        # the ``bucketed`` scan so overnight rows never enter the result
+        # or the bucket count.  ETFs / equities keep the original shape
+        # (no session predicate) and the same param shape.
         #
-        # The template is interpolated twice with different column
-        # references because ``bucketed`` aliases gex_summary as ``gs``
-        # while ``latest`` does not, and PostgreSQL won't resolve
-        # unqualified ``timestamp`` against an aliased table inside a
-        # multi-table-friendly fragment.
+        # The template is interpolated with different column references
+        # because ``bucketed`` aliases gex_summary as ``gs`` while the
+        # other scans don't, and PostgreSQL won't resolve unqualified
+        # ``timestamp`` against an aliased table inside a multi-table-
+        # friendly fragment.
         session_filter_latest = ""
         session_filter_bucketed = ""
         params: list = [symbol, start_date, end_date, window_units]
@@ -1769,6 +1812,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             session_filter_latest = session_filter_template.format(ts="timestamp")
             session_filter_bucketed = session_filter_template.format(ts="gs.timestamp")
             params.append(sorted(NYSE_HOLIDAYS))
+        # Bucket-aware window floor — ``window_units`` always means "N
+        # buckets that have data", not "N step_interval-units of wall-
+        # clock time". Cash indices get the same session predicate the
+        # ``latest`` and ``bucketed`` scans use so the bucket count is
+        # consistent with what surfaces in the response.
+        bucket_floor = _bucket_floor_subquery(
+            table="gex_summary",
+            bucket_expr=bucket,
+            symbol_predicate="underlying = $1",
+            end_expr="COALESCE($3::timestamptz, (SELECT max_ts FROM latest))",
+            limit_param="$4",
+            extra_filter=session_filter_latest,
+        )
         query = f"""
             WITH latest AS (
                 SELECT timestamp AS max_ts
@@ -1779,7 +1835,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ),
             bounds AS (
                 SELECT
-                    COALESCE($2::timestamptz, max_ts - ({step_interval} * ($4 - 1))) AS start_ts,
+                    COALESCE($2::timestamptz, {bucket_floor}) AS start_ts,
                     COALESCE($3::timestamptz, max_ts) AS end_ts
                 FROM latest
             ),
@@ -2004,7 +2060,6 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             return cached  # type: ignore[no-any-return]
 
         bucket = _bucket_expr(timeframe)
-        step_interval = _interval_expr(timeframe)
 
         # Same two-template cash-index session filter pattern get_historical_gex
         # uses, with $5 reserved for the expiration filter so the holidays array
@@ -2022,6 +2077,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             session_filter_latest = session_filter_template.format(ts="timestamp")
             session_filter_bucketed = session_filter_template.format(ts="gs.timestamp")
             params.append(sorted(NYSE_HOLIDAYS))
+
+        # Bucket-aware window floor — see get_historical_quotes for the
+        # rationale.  Cash indices inherit the same session predicate the
+        # ``latest`` anchor uses so the bucket count agrees with what the
+        # ``bucket_reps`` CTE downstream will surface.
+        bucket_floor = _bucket_floor_subquery(
+            table="gex_summary",
+            bucket_expr=bucket,
+            symbol_predicate="underlying = $1",
+            end_expr="(SELECT max_ts FROM latest)",
+            limit_param="$2",
+            extra_filter=session_filter_latest,
+        )
 
         # Bucketing/anchoring mirrors get_historical_gex and get_gex_heatmap:
         # anchor on max(gex_summary.timestamp), pick the LATEST gex_summary row
@@ -2043,7 +2111,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ),
             bounds AS (
                 SELECT
-                    max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
+                    {bucket_floor} AS start_ts,
                     max_ts AS end_ts
                 FROM latest
             ),
@@ -3100,8 +3168,20 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     ) -> List[Dict[str, Any]]:
         """Get historical quotes aggregated by timeframe."""
         bucket = _bucket_expr(timeframe)
-        step_interval = _interval_expr(timeframe)
-        # `bucket` and `step_interval` are validated allowlist literals.
+        # `bucket` is a validated allowlist literal.  The window floor is
+        # bucket-aware (Nth most recent bucket that has data) rather than
+        # ``max_ts - step_interval * (N - 1)`` wall-clock, so weekend /
+        # overnight gaps in the feed don't cause sparse charts — e.g. a
+        # 5-min × 576-bucket cash-index request on a Monday afternoon used
+        # to land its lower bound on Saturday and miss the entire Friday
+        # session even though plenty of RTH buckets existed further back.
+        bucket_floor = _bucket_floor_subquery(
+            table="underlying_quotes",
+            bucket_expr=bucket,
+            symbol_predicate="symbol = $1",
+            end_expr="COALESCE($3::timestamptz, (SELECT max_ts FROM latest))",
+            limit_param="$4",
+        )
         query = f"""
             WITH latest AS (
                 SELECT timestamp AS max_ts
@@ -3112,7 +3192,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ),
             bounds AS (
                 SELECT
-                    COALESCE($2::timestamptz, max_ts - ({step_interval} * ($4 - 1))) AS start_ts,
+                    COALESCE($2::timestamptz, {bucket_floor}) AS start_ts,
                     COALESCE($3::timestamptz, max_ts) AS end_ts
                 FROM latest
             ),
@@ -3164,8 +3244,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         """Get max pain timeseries aggregated to timeframe over window units."""
         window_units = max(1, min(window_units, 300))
         bucket = _bucket_expr(timeframe)
-        step_interval = _interval_expr(timeframe)
-        # `bucket` and `step_interval` are validated allowlist literals.
+        # `bucket` is a validated allowlist literal.
         #
         # Cash-index session filter — see ``get_gex_heatmap`` for the
         # full rationale.  SPX/NDX/RUT options trade extended hours so
@@ -3184,6 +3263,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     AND (timestamp AT TIME ZONE 'America/New_York')::date <> ALL($3::date[])
             """
             params.append(sorted(NYSE_HOLIDAYS))
+        # Bucket-aware window floor — see get_historical_quotes for the
+        # rationale.  Cash indices inherit the same session predicate the
+        # ``latest`` and ``ranked`` scans use so the bucket count agrees.
+        bucket_floor = _bucket_floor_subquery(
+            table="gex_summary",
+            bucket_expr=bucket,
+            symbol_predicate="underlying = $1",
+            end_expr="(SELECT max_ts FROM latest)",
+            limit_param="$2",
+            extra_filter=session_filter,
+        )
         query = f"""
             WITH latest AS (
                 SELECT timestamp AS max_ts
@@ -3193,7 +3283,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 LIMIT 1
             ),
             bounds AS (
-                SELECT max_ts - ({step_interval} * ($2 - 1)) AS start_ts, max_ts AS end_ts
+                SELECT {bucket_floor} AS start_ts, max_ts AS end_ts
                 FROM latest
             ),
             ranked AS (
@@ -3388,7 +3478,6 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         if cached is not None:
             return cached  # type: ignore[no-any-return]
         bucket = _bucket_expr(timeframe)
-        step_interval = _interval_expr(timeframe)
 
         # Cash indices (SPX, NDX, RUT, …) have no underlying price/volume of
         # their own outside the regular cash session, yet their options
@@ -3417,6 +3506,18 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     AND (timestamp AT TIME ZONE 'America/New_York')::date <> ALL($3::date[])
             """
             params.append(sorted(NYSE_HOLIDAYS))
+        # Bucket-aware window floor — see get_historical_quotes for the
+        # rationale.  Cash indices inherit the same session predicate the
+        # ``latest_summary`` and ``bucket_reps`` scans use so the bucket
+        # count stays consistent with what surfaces in the response.
+        bucket_floor = _bucket_floor_subquery(
+            table="gex_summary",
+            bucket_expr=bucket,
+            symbol_predicate="underlying = $1",
+            end_expr="(SELECT max_ts FROM latest_summary)",
+            limit_param="$2",
+            extra_filter=session_filter,
+        )
         # Strike half-band around spot, proportional for every underlying
         # so the colored surface fills the frontend's price-cropped y-axis
         # at any price level. A fixed ±50 was ≈±8.5% of a ~$585 SPY but
@@ -3427,7 +3528,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # interpolate alongside the other validated fragments below.
         band_pct = self._gex_heatmap_strike_band_pct
         strike_band = f"(SELECT spot_close FROM spot) * {band_pct:g}"
-        # `bucket` and `step_interval` are validated allowlist literals.
+        # `bucket` is a validated allowlist literal.
         #
         # Anchor choice: the window's right edge (``max_ts``) is the most
         # recent ``gex_summary`` row for this underlying, NOT the most
@@ -3485,7 +3586,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ),
             time_window AS (
                 SELECT
-                    max_ts - ({step_interval} * ($2 - 1)) as start_time,
+                    {bucket_floor} as start_time,
                     max_ts as end_time
                 FROM latest_summary
             ),

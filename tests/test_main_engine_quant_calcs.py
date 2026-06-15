@@ -204,7 +204,8 @@ def _brute_force_max_pain(options, strike_range=None):
 def test_max_pain_vectorized_matches_brute_force_and_tiebreak():
     """The vectorized _calculate_max_pain reproduces the original double-loop
     exactly across a randomized multi-strike chain, an empty set, an all-zero-OI
-    set (every payout 0 => lowest strike wins the tie), and a strike_range."""
+    set (no usable open interest => None, not a fabricated bottom-strike pin),
+    and a strike_range."""
     engine = AnalyticsEngine(underlying="SPY")
     rng = np.random.default_rng(20260529)
     exp = datetime(2026, 6, 19).date()
@@ -218,9 +219,11 @@ def test_max_pain_vectorized_matches_brute_force_and_tiebreak():
         opts, strike_range=(95.0, 105.0)
     )
     assert engine._calculate_max_pain([]) is None
-    # All payouts identically zero -> argmin picks the first (lowest) strike.
+    # No usable open interest -> the payout grid is uniformly zero. Returning
+    # the lowest strike here fabricated a max-pain pin at the bottom of the
+    # chain (the common intraday OI=0 cold-start state), so it now returns None.
     zero_oi = [_opt(float(k), "C", oi=0, exp=exp) for k in range(80, 121)]
-    assert engine._calculate_max_pain(zero_oi) == 80.0
+    assert engine._calculate_max_pain(zero_oi) is None
 
 
 def test_bs_gamma_inline_pdf_matches_scipy():

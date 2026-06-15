@@ -26,6 +26,7 @@ import hashlib
 import hmac
 import logging
 import os
+from src.config import _getenv_float, _getenv_str
 import time as _time
 from typing import Any, Callable, Dict, Optional, Set, Tuple
 
@@ -56,7 +57,7 @@ _bearer_scheme = HTTPBearer(auto_error=False, bearerFormat="API-Key")
 _PUBLIC_PATHS: Set[str] = {"/api/health"}
 
 _API_KEY: Optional[str] = (os.getenv("API_KEY") or "").strip() or None
-_ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development").strip().lower()
+_ENVIRONMENT: str = _getenv_str("ENVIRONMENT", "development").lower()
 
 # Per-endpoint scope enforcement. The `api_keys.scopes` column exists but
 # every key provisioned to date defaults to `[]` (no key→tier mapping has
@@ -96,10 +97,8 @@ class _KeyStore:
     def __init__(self) -> None:
         self._get_pool: Optional[Callable[[], Any]] = None
         self._cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
-        self._cache_ttl: float = float(os.getenv("API_KEY_CACHE_TTL_SECONDS", "60"))
-        self._touch_throttle_seconds: float = float(
-            os.getenv("API_KEY_TOUCH_THROTTLE_SECONDS", "60")
-        )
+        self._cache_ttl: float = _getenv_float("API_KEY_CACHE_TTL_SECONDS", 60)
+        self._touch_throttle_seconds: float = _getenv_float("API_KEY_TOUCH_THROTTLE_SECONDS", 60)
         self._last_touch: Dict[str, float] = {}
         self._touch_tasks: Set[asyncio.Task] = set()
 

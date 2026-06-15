@@ -7,6 +7,10 @@ client logs the completed count.  This helper attaches a DB writer so
 the same count is also upserted into the `tradestation_api_calls`
 table, where the ON CONFLICT clause accumulates counts from multiple
 ingestion processes that share a window.
+
+It also exposes a reader the client's rate-limit governor calls to
+learn how many calls other processes have already contributed to the
+current in-flight 5-minute window.
 """
 
 from __future__ import annotations
@@ -48,6 +52,38 @@ def write_api_call_window(window_start: datetime, call_count: int) -> None:
         logger.warning("Failed to persist tradestation_api_calls row: %s", e)
 
 
+def read_api_call_window(window_start: datetime) -> int:
+    """Return the persisted call_count for ``window_start``, or 0 if none.
+
+    Reads only the single row for the given window so the query is a
+    primary-key lookup.  Any DB error is logged and treated as 0 — the
+    rate-limit governor falls back to the local in-process counter in
+    that case, which is the safe direction (slightly under-counts vs.
+    over-counts and blocks unnecessarily).
+    """
+    try:
+        with db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT call_count FROM tradestation_api_calls WHERE window_start = %s",
+                (window_start,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return 0
+            return int(row[0] or 0)
+    except Exception as e:
+        logger.debug("Failed to read tradestation_api_calls row: %s", e)
+        return 0
+
+
 def attach_db_writer(client: TradeStationClient) -> None:
-    """Install `write_api_call_window` as the client's rollover callback."""
+    """Install the rollover writer AND the rate-limit governor reader.
+
+    Name kept for backwards compat with existing call sites; this now also
+    wires ``read_api_call_window`` so each process's
+    ``_gate_for_rate_limit`` can see the other processes' contributions
+    to the current 5-min window.
+    """
     client.set_api_call_window_writer(write_api_call_window)
+    client.set_api_call_window_reader(read_api_call_window)

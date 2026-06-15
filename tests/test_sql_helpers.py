@@ -16,6 +16,7 @@ from src.api.queries._sql_helpers import (
     _INTERVAL_EXPRS,
     _VIEW_SUFFIXES,
     _bucket_expr,
+    _bucket_floor_subquery,
     _gex_by_strike_order_clause,
     _interval_expr,
     _normalize_timeframe,
@@ -118,6 +119,75 @@ class TestGexByStrikeOrderClause:
     def test_rejects_unknown(self, bad):
         with pytest.raises(ValueError, match="Unsupported sort_by"):
             _gex_by_strike_order_clause(bad)  # type: ignore[arg-type]
+
+
+class TestBucketFloorSubquery:
+    """``_bucket_floor_subquery`` returns a scalar SQL fragment that yields
+    the start timestamp of the Nth most recent bucket in a table.  It
+    powers ``window_units`` = "N available buckets" semantics across every
+    timeseries endpoint, replacing the old wall-clock floor that under-
+    filled charts when the source feed had weekend / overnight gaps."""
+
+    def _basic(self, **overrides):
+        kwargs = {
+            "table": "underlying_quotes",
+            "bucket_expr": _bucket_expr("5min"),
+            "symbol_predicate": "symbol = $1",
+            "end_expr": "(SELECT max_ts FROM latest)",
+            "limit_param": "$2",
+        }
+        kwargs.update(overrides)
+        return _bucket_floor_subquery(**kwargs)
+
+    def test_returns_scalar_subquery_with_min_bucket(self):
+        sql = self._basic()
+        # Outer SELECT MIN over the inner DISTINCT bucket list — picks the
+        # earliest of the N most recent buckets, i.e. the start_ts that
+        # makes ``window_units`` mean "N available buckets".
+        assert sql.startswith("(SELECT MIN(bucket_ts) FROM (")
+        assert "SELECT DISTINCT" in sql
+        assert "AS bucket_ts" in sql
+        assert sql.endswith("recent_buckets)")
+
+    def test_uses_provided_table_and_predicate(self):
+        sql = self._basic(table="gex_summary", symbol_predicate="underlying = $1")
+        assert "FROM gex_summary" in sql
+        assert "WHERE underlying = $1" in sql
+
+    def test_orders_desc_and_limits_to_window_units(self):
+        # Take the N MOST RECENT buckets; MIN of those is the start_ts.
+        # ORDER ASC would pick the earliest N — the opposite of what we want.
+        sql = self._basic(limit_param="$4")
+        assert "ORDER BY bucket_ts DESC" in sql
+        assert "LIMIT $4" in sql
+
+    def test_end_expr_caps_the_lookback(self):
+        sql = self._basic(end_expr="COALESCE($3::timestamptz, (SELECT max_ts FROM latest))")
+        assert "AND timestamp <= COALESCE($3::timestamptz" in sql
+
+    def test_extra_filter_is_interpolated(self):
+        # Cash-index session predicate is an allowlist fragment using the
+        # bare timestamp column (the subquery doesn't alias the source).
+        session_filter = (
+            "\n        AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') "
+            "BETWEEN 1 AND 5"
+        )
+        sql = self._basic(extra_filter=session_filter)
+        assert "EXTRACT(DOW FROM timestamp" in sql
+
+    def test_no_extra_filter_by_default(self):
+        sql = self._basic()
+        assert "EXTRACT(DOW" not in sql
+        assert "America/New_York" not in sql
+
+    def test_uses_validated_bucket_expression(self):
+        # The bucket fragment is whatever ``_bucket_expr`` returns — pinning
+        # this composition keeps the helper out of the f-string SQL fast
+        # lane only via validated literals.
+        sql_5min = self._basic(bucket_expr=_bucket_expr("5min"))
+        sql_15min = self._basic(bucket_expr=_bucket_expr("15min"))
+        assert "/ 5)" in sql_5min
+        assert "/ 15)" in sql_15min
 
 
 class TestAllowlistsAreLiteralsOnly:

@@ -42,6 +42,10 @@ from src.validation import (
 )
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.config import (
+    _getenv_str,
+    _getenv_int,
+    _getenv_bool,
+    _getenv_float,
     AGGREGATION_BUCKET_SECONDS,
     MAX_BUFFER_SIZE,
     BUFFER_FLUSH_INTERVAL,
@@ -52,6 +56,7 @@ from src.config import (
     FLOW_CLASSIFY_SKIP_OPEN_AUCTION,
     FLOW_CLASSIFY_PRIOR_TICK_MAX_AGE_SECONDS,
     SESSION_TEMPLATE,
+    resolve_dividend_yield,
 )
 
 logger = get_logger(__name__)
@@ -131,7 +136,7 @@ def _compute_db_backoff_seconds(consecutive_failures: int) -> float:
 # a brief DB outage produces ~1000 identical warnings (~1044 observed in a
 # 2-3s burst during the 2026-06 RDS restart) because every batch attempt
 # from the live option stream hits the early-return + log path.
-_CB_SKIP_LOG_INTERVAL_SECONDS = float(os.getenv("CIRCUIT_BREAKER_SKIP_LOG_INTERVAL_SECONDS", "5.0"))
+_CB_SKIP_LOG_INTERVAL_SECONDS = _getenv_float("CIRCUIT_BREAKER_SKIP_LOG_INTERVAL_SECONDS", 5.0)
 
 
 def _to_db_float(value: Any) -> Optional[float]:
@@ -197,8 +202,8 @@ class IngestionEngine:
         # downstream calculation.
         self.latest_underlying_price: Optional[float] = None
         self.latest_underlying_timestamp: Optional[datetime] = None
-        self.greeks_max_underlying_age_seconds = float(
-            os.getenv("GREEKS_MAX_UNDERLYING_AGE_SECONDS", "90")
+        self.greeks_max_underlying_age_seconds = _getenv_float(
+            "GREEKS_MAX_UNDERLYING_AGE_SECONDS", 90
         )
         # Pre/after-hours an equity/ETF underlying trades thinly and its
         # 1-minute bars are legitimately minutes apart, so the tight
@@ -206,8 +211,8 @@ class IngestionEngine:
         # extended session. Defaults to the stream watchdog's extended
         # STALE-warn threshold so the two mechanisms stay coherent: Greeks
         # are refused only once the feed itself is considered stale.
-        self.greeks_max_underlying_age_seconds_extended = float(
-            os.getenv("GREEKS_MAX_UNDERLYING_AGE_SECONDS_EXTENDED", "300")
+        self.greeks_max_underlying_age_seconds_extended = _getenv_float(
+            "GREEKS_MAX_UNDERLYING_AGE_SECONDS_EXTENDED", 300
         )
         # Counter so operators can see how often staleness rejects fire.
         # ``_total`` advances on every reject (in- and out-of-session);
@@ -227,8 +232,8 @@ class IngestionEngine:
         # cadence so the log reflects how long the feed has been stale, not
         # how fast options tick. ``_greeks_stale_last_warn_mono`` starts at
         # 0.0 so the first reject of a run warns immediately.
-        self.greeks_stale_warn_interval_seconds = float(
-            os.getenv("GREEKS_STALE_WARN_INTERVAL_SECONDS", "60")
+        self.greeks_stale_warn_interval_seconds = _getenv_float(
+            "GREEKS_STALE_WARN_INTERVAL_SECONDS", 60
         )
         self._greeks_stale_last_warn_mono = 0.0
         # Watchdog: when the underlying price stays stale in-session past
@@ -240,7 +245,7 @@ class IngestionEngine:
         # this. Set to 0 to disable. The 2026-06 prod incident sat in a
         # broken state for 17h with 1.1M rejects because no escalation
         # path existed; this is the last line of defense.
-        self.greeks_stale_fatal_seconds = float(os.getenv("GREEKS_STALE_FATAL_SECONDS", "1800"))
+        self.greeks_stale_fatal_seconds = _getenv_float("GREEKS_STALE_FATAL_SECONDS", 1800)
         # Wall-clock monotonic timestamp of the current stale episode's
         # start, or None when Greeks are flowing. Reset to None on the
         # first successful Greek calc after a stale window.
@@ -248,10 +253,15 @@ class IngestionEngine:
         # Counter for crossed/missing-quote fallbacks in _classify_volume_chunk.
         self._classify_fallback_count: int = 0
 
-        # Greeks calculator (initialize if enabled)
+        # Greeks calculator (initialize if enabled). Resolve this symbol's
+        # dividend yield q once here (each worker is single-symbol), so the
+        # per-symbol DIVIDEND_YIELD_BY_SYMBOL override applies; falls back to
+        # the scalar DIVIDEND_YIELD for symbols not in the map.
         self.greeks_calculator = None
         if GREEKS_ENABLED:
-            self.greeks_calculator = GreeksCalculator()
+            self.greeks_calculator = GreeksCalculator(
+                dividend_yield=resolve_dividend_yield(self.db_symbol)
+            )
             logger.info("✅ Greeks calculation ENABLED")
             logger.info("   Note: Will use mid-price for IV calculation if API doesn't provide IV")
         else:
@@ -296,9 +306,7 @@ class IngestionEngine:
         # WHERE-clause guard the second time it's sent.  Bounded so a
         # prolonged outage can't grow unbounded.
         self._pending_failed_option_rows: List[Dict[str, Any]] = []
-        self._pending_failed_option_rows_max = int(
-            os.getenv("OPTION_FAILED_ROWS_RETAIN_MAX", "20000")
-        )
+        self._pending_failed_option_rows_max = _getenv_int("OPTION_FAILED_ROWS_RETAIN_MAX", 20000)
         self._last_underlying_signature: Optional[str] = None
         self._option_bucket_last_write: Dict[tuple[str, datetime], float] = {}
 
@@ -486,7 +494,15 @@ class IngestionEngine:
     def _upsert_underlying_quote(self, quote: Dict[str, Any]):
         """Upsert one underlying quote row for the current minute bucket."""
         # Share circuit breaker with option writes — if DB is down, skip.
+        # The stream re-sends the in-progress minute bar continuously, so a
+        # skipped write self-heals once the breaker closes; emit a DEBUG line
+        # so the skip is at least observable (the option path logs its skips
+        # via the throttled circuit-breaker summary; this one was silent).
         if _time.monotonic() < self._db_backoff_until:
+            logger.debug(
+                "[CIRCUIT-BREAKER] Skipping underlying upsert during backoff " "(%.1fs remaining)",
+                self._db_backoff_until - _time.monotonic(),
+            )
             return
         try:
             with db_connection() as conn:
@@ -745,16 +761,16 @@ class IngestionEngine:
                 logger.error("Option data missing option_symbol")
                 continue
 
-            # Classify this snapshot into the running cumulative
-            # accumulator before buffering.  Doing it here (not in
-            # _prepare_option_agg) means the accumulator advances
-            # exactly once per snapshot regardless of how many times
-            # the same snapshot ends up in the buffer (rollover seed,
-            # throttled re-flush, etc.).
-            acc = self._get_flow_accumulator(option_symbol, bucket)
-            self._ingest_snapshot_into_accumulator(acc, data, bucket)
-
-            # If this symbol crossed into a new time bucket, aggregate the previous one.
+            # If this symbol crossed into a new time bucket, FINALIZE the
+            # previous bucket BEFORE this snapshot advances the cumulative
+            # accumulator.  _prepare_option_agg stamps the row with the live
+            # accumulator cumulatives (volume / ask / mid / bid), so
+            # ingesting the new-bucket snapshot first folded its increment
+            # into the previous bucket's stored cumulative — the downstream
+            # LAG-delta reader (api/database.py) then attributed the first
+            # tick of every minute to the PRIOR minute.  Closing the prior
+            # bucket against the pre-ingest watermark keeps each bucket's
+            # cumulative pinned to its own boundary.
             existing = self.options_buffer.get(option_symbol)
             if existing:
                 prev_timestamp = existing[-1].get("timestamp")
@@ -768,12 +784,19 @@ class IngestionEngine:
                             rows_to_write.append(agg)
                         # Seed the new bucket with the previous snapshot so
                         # the bucket carries a defined quote/Greek baseline
-                        # for the first throttled write.  No special tag
-                        # needed: the accumulator's watermark already
-                        # reflects this snapshot's volume, so re-ingesting
-                        # it (via the buffer scan in _prepare_option_agg)
-                        # contributes a zero delta automatically.
+                        # for the first throttled write.  It was already
+                        # classified on its own arrival, so it is not
+                        # re-ingested below.
                         self.options_buffer[option_symbol] = [existing[-1]]
+
+            # Classify this snapshot into the running cumulative accumulator.
+            # Done AFTER the prev-bucket finalize above so the previous
+            # bucket's stored cumulative excludes this (new-bucket) snapshot.
+            # Still exactly once per snapshot regardless of how many times the
+            # same snapshot ends up in the buffer (rollover seed, throttled
+            # re-flush): the watermark makes a replay contribute a zero delta.
+            acc = self._get_flow_accumulator(option_symbol, bucket)
+            self._ingest_snapshot_into_accumulator(acc, data, bucket)
 
             self.options_buffer[option_symbol].append(data)
 
@@ -1707,6 +1730,15 @@ class IngestionEngine:
                 self._obs_write_time_ms = 0.0
                 self._obs_last_log = now
 
+                # Persist any completed API-call window even during a quiet
+                # period: the client only flushes window counts on the next
+                # request or on close_all_streams, so a lull would otherwise
+                # drop the last window's count. Best-effort.
+                try:
+                    self.client.flush_api_call_window()
+                except Exception as flush_err:
+                    logger.debug("API-call window flush skipped: %s", flush_err)
+
         except Exception as e:
             self._db_consecutive_failures += 1
             self.errors_count += 1
@@ -1839,8 +1871,6 @@ class IngestionEngine:
                     self._store_underlying(item["data"])
                 elif item["type"] == "option_batch":
                     self._store_option_batch(item["data"])
-                elif item["type"] == "option":
-                    self._store_option(item["data"])
                 elif item["type"] == "flush_options":
                     # C3: the stream is about to swap the tracked option
                     # symbol set (strike recalc / expiration refresh).
@@ -1938,30 +1968,30 @@ def main():
     )
     parser.add_argument(
         "--underlyings",
-        default=os.getenv("INGEST_UNDERLYINGS", os.getenv("INGEST_UNDERLYING", "SPY")),
+        default=_getenv_str("INGEST_UNDERLYINGS", _getenv_str("INGEST_UNDERLYING", "SPY")),
         help="Comma-separated underlying symbols or aliases (default: SPY)",
     )
     parser.add_argument(
         "--expirations",
         type=int,
-        default=int(os.getenv("INGEST_EXPIRATIONS", "3")),
+        default=_getenv_int("INGEST_EXPIRATIONS", 3),
         help="Number of expirations (default: 3)",
     )
     parser.add_argument(
         "--strike-count-max",
         type=int,
-        default=int(os.getenv("INGEST_STRIKE_COUNT_MAX", "40")),
+        default=_getenv_int("INGEST_STRIKE_COUNT_MAX", 40),
         help="Hard cap on strikes per expiration after the pct-range filter (default: 40)",
     )
     parser.add_argument(
         "--strike-pct-range",
         type=float,
-        default=float(os.getenv("INGEST_STRIKE_PCT_RANGE", "3.0")),
+        default=_getenv_float("INGEST_STRIKE_PCT_RANGE", 3.0),
         help="Strike-selection band as percent of spot, e.g. 3.0 -> ±3%% (default: 3.0)",
     )
     parser.add_argument(
         "--session-template",
-        default=os.getenv("SESSION_TEMPLATE", "Default"),
+        default=_getenv_str("SESSION_TEMPLATE", "Default"),
         choices=["Default", "USEQPre", "USEQ24Hour"],
         help="Session template (default: Default)",
     )
@@ -1989,7 +2019,7 @@ def main():
             os.getenv("TRADESTATION_CLIENT_ID"),  # type: ignore[arg-type]
             os.getenv("TRADESTATION_CLIENT_SECRET"),  # type: ignore[arg-type]
             os.getenv("TRADESTATION_REFRESH_TOKEN"),  # type: ignore[arg-type]
-            sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true",
+            sandbox=_getenv_bool("TRADESTATION_USE_SANDBOX", False),
         )
         attach_db_writer(client)
         engine = IngestionEngine(
@@ -2008,7 +2038,7 @@ def main():
 
     # Always run the VIX ingester alongside the per-symbol engines so that
     # /api/market/vix can read from `vix_bars` without hitting TradeStation.
-    vix_enabled = os.getenv("INGEST_VIX_ENABLED", "true").lower() != "false"
+    vix_enabled = _getenv_bool("INGEST_VIX_ENABLED", True)
 
     if len(symbols) == 1 and not vix_enabled:
         run_for_symbol(symbols[0])

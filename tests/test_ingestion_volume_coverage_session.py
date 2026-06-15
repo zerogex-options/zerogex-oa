@@ -68,13 +68,29 @@ def test_coverage_resets_at_day_rollover():
     assert mgr._session_volume_date == next_day.date()
 
 
-def test_coverage_capped_at_one_as_band_drifts():
-    # The tracked band re-centres on spot through the day, so the union of all
-    # contracts that ever traded can exceed the current snapshot size; the
-    # reported coverage saturates at 1.0 rather than overflowing.
+def test_drifted_out_symbols_do_not_inflate_coverage():
+    # The tracked band re-centres on spot through the day. Contracts that have
+    # drifted OUT of the current tracked set must not count toward coverage --
+    # the old union-only metric pinned at 100% on a trending day even when the
+    # current band's coverage was poor. Only currently-tracked symbols count.
     mgr = _bare_manager([f"O{i}" for i in range(10)])
-    drifted = [f"D{i}" for i in range(15)]  # 15 distinct contracts over the session
-    assert mgr._update_session_volume_coverage(_state(drifted), 10, now_et=DAY) == 1.0
+    # 5 currently-tracked trade + 15 drifted (no-longer-tracked) trade.
+    feed = _state([f"O{i}" for i in range(5)] + [f"D{i}" for i in range(15)])
+    assert mgr._update_session_volume_coverage(feed, 10, now_et=DAY) == 0.50
+
+
+def test_union_pruned_when_symbol_leaves_tracked_band():
+    # A symbol seen trading earlier, then dropped from the tracked band, is
+    # pruned from the session union so coverage reflects the current universe.
+    mgr = _bare_manager([f"O{i}" for i in range(10)])
+    assert (
+        mgr._update_session_volume_coverage(_state([f"O{i}" for i in range(8)]), 10, now_et=DAY)
+        == 0.80
+    )
+    # Band recalibrates: O0..O4 drift out, replaced by N0..N4 (none traded yet).
+    mgr.tracked_option_symbols = [f"O{i}" for i in range(5, 10)] + [f"N{i}" for i in range(5)]
+    # O5..O7 (3 of the still-tracked) remain in the union; O0..O4 are pruned.
+    assert mgr._update_session_volume_coverage({}, 10, now_et=DAY) == 0.30
 
 
 def test_zero_tracked_total_is_safe():
