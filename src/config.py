@@ -616,6 +616,35 @@ TS_RATE_LIMIT_SYNC_INTERVAL = _getenv_int("TS_RATE_LIMIT_SYNC_INTERVAL", 5, min=
 # to disable caching entirely (fetch every call).
 TS_STRIKES_CACHE_TTL = _getenv_int("TS_STRIKES_CACHE_TTL", 3600, min=0)
 
+# TradeStation response-header rate-limit gate (preferred path).
+# TradeStation exposes ``X-RateLimit-Limit/Period/Remaining/Reset/Resource``
+# on every response.  When set, the client parses these headers, tracks
+# per-resource state in memory, and gates subsequent requests against the
+# observed remaining quota -- replacing blind retry-on-429 with deterministic
+# sleep-until-reset.  The static cap above (TS_RATE_LIMIT_PER_5MIN) remains
+# as a defense-in-depth fallback for first requests after process start
+# when no header has been observed yet.
+#
+# ``TS_RATE_LIMIT_HEADER_GATE_ENABLED``: master switch.  Set False to disable
+# the header-driven gate and rely solely on the static cap + retry path
+# (the behaviour shipped at 7e7e56d).  Default True.
+# ``TS_RATE_LIMIT_HEADER_MIN_REMAINING``: pre-emptive sleep threshold.  When
+# a resource has fewer than this many requests remaining, the client sleeps
+# the proportional fraction of the period instead of consuming the last
+# request and risking a 429.  Set 0 to only sleep on outright remaining=0.
+# Default 1 (sleep only when budget is fully exhausted).
+# ``TS_RATE_LIMIT_HEADER_STALE_SECONDS``: discard a resource's cached state
+# after this many seconds with no fresh observation, so we don't gate on
+# stale data after a long quiet period.  Default 600 (10 minutes -- well
+# longer than any normal TradeStation period of 60-300s).
+TS_RATE_LIMIT_HEADER_GATE_ENABLED = _getenv_bool("TS_RATE_LIMIT_HEADER_GATE_ENABLED", True)
+TS_RATE_LIMIT_HEADER_MIN_REMAINING = _getenv_int(
+    "TS_RATE_LIMIT_HEADER_MIN_REMAINING", 1, min=0
+)
+TS_RATE_LIMIT_HEADER_STALE_SECONDS = _getenv_int(
+    "TS_RATE_LIMIT_HEADER_STALE_SECONDS", 600, min=1
+)
+
 # Streaming quotes endpoint encodes the symbol list in the URL path. With
 # ~1000+ option contracts tracked, a single-connection URL exceeds ~25KB
 # and triggers a 414 Request-URI Too Large from TradeStation's gateway.

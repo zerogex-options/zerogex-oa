@@ -31,6 +31,9 @@ from src.config import (
     TS_RATE_LIMIT_PER_5MIN,
     TS_RATE_LIMIT_SYNC_INTERVAL,
     TS_STRIKES_CACHE_TTL,
+    TS_RATE_LIMIT_HEADER_GATE_ENABLED,
+    TS_RATE_LIMIT_HEADER_MIN_REMAINING,
+    TS_RATE_LIMIT_HEADER_STALE_SECONDS,
 )
 
 logger = get_logger(__name__)
@@ -114,6 +117,27 @@ class TradeStationClient:
         # repeated quota burn during pre-market.
         self._strikes_cache: Dict[str, Dict[str, Any]] = {}
         self._strikes_cache_lock = Lock()
+
+        # Header-driven rate-limit state, populated by parsing
+        # ``X-RateLimit-*`` and ``X-Concurrency-*`` headers from every
+        # response.  Keyed by the resource name TradeStation returns in
+        # ``X-RateLimit-Resource`` so each endpoint group (option-strikes,
+        # quotes, barcharts, ...) gates independently against its own
+        # quota -- which is the model TradeStation actually uses.
+        #
+        # The endpoint-pattern -> resource mapping is LEARNED at request
+        # time (we don't hard-code it) so we stay correct if TradeStation
+        # adds or renames resources.  Until the first observation for a
+        # given pattern, the pre-emptive gate is a no-op for that pattern;
+        # the static-cap path inherited from the earlier fix continues to
+        # back-stop us.
+        self._resource_rate_limit_state: Dict[str, Dict[str, Any]] = {}
+        self._endpoint_to_resource: Dict[str, str] = {}
+        self._resource_rate_limit_lock = Lock()
+        # Concurrency telemetry (X-Concurrency-*).  Stored alongside but
+        # NOT used to gate -- we surface it for monitoring so operators
+        # can see when stream caps are tight without changing behaviour.
+        self._concurrency_state: Dict[str, Dict[str, Any]] = {}
 
         # Check if market hours warnings should be suppressed
         self.warn_market_hours = _getenv_bool("TS_WARN_MARKET_HOURS", True)
@@ -246,6 +270,197 @@ class TradeStationClient:
         )
         time.sleep(sleep_seconds)
 
+    # ------------------------------------------------------------------
+    # Header-driven rate-limit gate (primary path).
+    #
+    # TradeStation publishes per-resource quota state on every response
+    # via the ``X-RateLimit-*`` family of headers (see TradeStation API
+    # docs, "Rate Limiting Overview").  Reading those headers gives us
+    # the exact remaining budget and an exact reset time -- strictly
+    # better than the static 5-min UTC cap above, which is a coarse
+    # approximation of "rolling N-second" windows that aren't aligned
+    # to UTC.
+    #
+    # The static cap above is kept as a defense-in-depth fallback for
+    # the cold-start window (first request to a given endpoint pattern
+    # before we've observed a header), and as an escape hatch if
+    # TradeStation ever ships malformed or missing headers.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _endpoint_pattern(endpoint: str) -> str:
+        """Normalize an endpoint to a stable key for resource lookup.
+
+        TradeStation paths embed the symbol (and sometimes expiration) as
+        the LAST path segment: ``marketdata/options/strikes/SPY``,
+        ``marketdata/quotes/SPY,QQQ``, ``marketdata/stream/quotes/SPY,QQQ``.
+        The rate-limit resource is the same for every variant of the
+        static prefix, so we drop the trailing dynamic segment to get a
+        stable key.  Endpoints with only 1-2 segments (uncommon for the
+        endpoints this client actually calls) are kept as-is.
+        """
+        head = endpoint.split("?", 1)[0]
+        parts = [p for p in head.split("/") if p]
+        if len(parts) >= 3:
+            return "/".join(parts[:-1])
+        return "/".join(parts)
+
+    def _record_rate_limit_headers(self, response: Response, endpoint: str) -> None:
+        """Parse ``X-RateLimit-*`` / ``X-Concurrency-*`` and update state.
+
+        Safe against missing/malformed headers: every value is parsed
+        through int() inside a try block, and a single bad value drops
+        the update for that response without touching cached state.
+        Called after EVERY response (success and 429 alike) so the
+        gate's view stays current.
+        """
+        if response is None:
+            return
+        try:
+            headers = response.headers
+        except Exception:
+            return
+
+        resource = headers.get("X-RateLimit-Resource") or headers.get("x-ratelimit-resource")
+        # ----- Rate-limit window state -----
+        if resource:
+            try:
+                limit = int(headers["X-RateLimit-Limit"])
+                period = int(headers["X-RateLimit-Period"])
+                remaining = int(headers["X-RateLimit-Remaining"])
+                reset_seconds = int(headers["X-RateLimit-Reset"])
+            except (KeyError, ValueError, TypeError):
+                # Partial headers -- skip rate-limit update but still try concurrency below.
+                pass
+            else:
+                now_mono = time.monotonic()
+                now_utc = datetime.now(timezone.utc)
+                # Clamp obviously-bad values rather than poisoning the cache.
+                remaining = max(remaining, 0)
+                reset_seconds = max(reset_seconds, 0)
+                period = max(period, 1)
+                with self._resource_rate_limit_lock:
+                    self._resource_rate_limit_state[resource] = {
+                        "resource": resource,
+                        "limit": limit,
+                        "period_seconds": period,
+                        "remaining": remaining,
+                        "reset_at_mono": now_mono + reset_seconds,
+                        "observed_at_mono": now_mono,
+                        "observed_at_utc": now_utc,
+                    }
+                    self._endpoint_to_resource[self._endpoint_pattern(endpoint)] = resource
+
+        # ----- Concurrency telemetry (informational) -----
+        conc_resource = headers.get("X-Concurrency-Resource") or headers.get(
+            "x-concurrency-resource"
+        )
+        if conc_resource:
+            try:
+                conc_limit = int(headers["X-Concurrency-Limit"])
+                conc_remaining = int(headers["X-Concurrency-Remaining"])
+            except (KeyError, ValueError, TypeError):
+                return
+            with self._resource_rate_limit_lock:
+                self._concurrency_state[conc_resource] = {
+                    "resource": conc_resource,
+                    "limit": conc_limit,
+                    "remaining": max(conc_remaining, 0),
+                    "observed_at_mono": time.monotonic(),
+                }
+            if conc_remaining <= 0:
+                logger.warning(
+                    "TradeStation concurrency limit reached for %s (limit=%d, "
+                    "remaining=0).  Open stream count is at the per-key cap; "
+                    "additional stream opens will fail until one is closed.",
+                    conc_resource,
+                    conc_limit,
+                )
+
+    def _gate_for_resource(self, endpoint: str) -> None:
+        """Block before a request when the endpoint's resource is exhausted.
+
+        Looks up the resource for ``endpoint`` from the learned mapping,
+        consults the most recent observation, and sleeps until reset if
+        the remaining budget is at or below
+        ``TS_RATE_LIMIT_HEADER_MIN_REMAINING``.  No-op when:
+          * The header-driven gate is disabled via env var.
+          * We've never observed a header for this endpoint pattern
+            (cold start -- the static-cap gate continues to back-stop).
+          * The cached observation is older than
+            ``TS_RATE_LIMIT_HEADER_STALE_SECONDS`` (TradeStation's period
+            has long since elapsed; the cached state is meaningless).
+        """
+        if not TS_RATE_LIMIT_HEADER_GATE_ENABLED:
+            return
+
+        pattern = self._endpoint_pattern(endpoint)
+        with self._resource_rate_limit_lock:
+            resource = self._endpoint_to_resource.get(pattern)
+            if resource is None:
+                return
+            state = self._resource_rate_limit_state.get(resource)
+            if state is None:
+                return
+            # Defensive copy so we drop the lock before any logging/sleep.
+            state = dict(state)
+
+        now_mono = time.monotonic()
+        if now_mono - state["observed_at_mono"] > TS_RATE_LIMIT_HEADER_STALE_SECONDS:
+            return
+        if state["remaining"] > TS_RATE_LIMIT_HEADER_MIN_REMAINING:
+            return
+
+        sleep_seconds = state["reset_at_mono"] - now_mono
+        if sleep_seconds <= 0:
+            # Reset has passed; the next request will refresh the state
+            # naturally, and TradeStation's rolling replenishment means
+            # we should already have capacity again.
+            return
+
+        # Cap sleep at the resource's period so a bogus reset value
+        # (e.g. >>period) can't strand us for hours.  +0.25s cushion so
+        # we land cleanly inside the next window.
+        sleep_seconds = min(sleep_seconds, state["period_seconds"]) + 0.25
+        logger.warning(
+            "TradeStation rate-limit gate: resource=%s remaining=%d limit=%d; "
+            "sleeping %.1fs until reset (endpoint=%s).",
+            state["resource"],
+            state["remaining"],
+            state["limit"],
+            sleep_seconds,
+            pattern,
+        )
+        time.sleep(sleep_seconds)
+
+    def _retry_delay_for_429(
+        self, response: Optional[Response], retry_count: int
+    ) -> float:
+        """Return the precise sleep duration for a 429 response.
+
+        Prefers ``X-RateLimit-Reset`` from the response headers (the
+        deterministic source of truth); falls back to the configured
+        exponential backoff if the header is missing/malformed -- which
+        is what the original code did for every 429.  The header path
+        replaces "guess and check" retries with a single deterministic
+        wait sized exactly to TradeStation's reset clock.
+        """
+        if response is not None:
+            try:
+                reset_raw = response.headers.get("X-RateLimit-Reset") or response.headers.get(
+                    "x-ratelimit-reset"
+                )
+                if reset_raw is not None:
+                    reset_seconds = int(reset_raw)
+                    if reset_seconds >= 0:
+                        # +0.5s cushion to ensure we land AFTER the reset.
+                        # Hard cap at 10 minutes so a bogus header can't
+                        # strand the client indefinitely.
+                        return min(reset_seconds + 0.5, 600.0)
+            except (ValueError, TypeError):
+                pass
+        return API_RETRY_DELAY * (API_RETRY_BACKOFF**retry_count)
+
     def _record_api_https_session_open(self):
         """
         Track each new HTTPS session open to api.tradestation.com in 5-min windows.
@@ -355,6 +570,12 @@ class TradeStationClient:
         try:
             response = self._build_request_response(method, url, headers, params, data)
 
+            # Refresh per-resource rate-limit state from response headers
+            # BEFORE any branching on status code -- a 429 also carries the
+            # X-RateLimit-* headers, and the next request needs the freshest
+            # observation regardless of whether this one succeeded.
+            self._record_rate_limit_headers(response, endpoint)
+
             # Any 2xx is success. The prior ``in [200, 201]`` check let a
             # 202/204 (e.g. No Content) fall through every branch below to
             # raise_for_status(), which does NOT raise for 2xx -- so the
@@ -447,11 +668,21 @@ class TradeStationClient:
                 logger.error(f"Response: {response.text}")
                 response.raise_for_status()
 
-            # Handle rate limiting with exponential backoff
+            # Handle rate limiting with header-driven retry delay (preferred)
+            # or exponential backoff (fallback when X-RateLimit-Reset is
+            # missing/malformed).  TradeStation's docs explicitly recommend
+            # using X-RateLimit-Reset for retry timing, which gives us a
+            # deterministic single sleep instead of escalating guesses.
             if response.status_code == 429:
                 if retry_count < API_RETRY_ATTEMPTS - 1:
-                    retry_delay = API_RETRY_DELAY * (API_RETRY_BACKOFF**retry_count)
-                    logger.warning(f"Rate limited (429), retrying in {retry_delay}s...")
+                    retry_delay = self._retry_delay_for_429(response, retry_count)
+                    logger.warning(
+                        "Rate limited (429), retrying in %.1fs (reset=%s, "
+                        "resource=%s)",
+                        retry_delay,
+                        response.headers.get("X-RateLimit-Reset", "n/a"),
+                        response.headers.get("X-RateLimit-Resource", "n/a"),
+                    )
                     time.sleep(retry_delay)
                     return self._request(
                         method, endpoint, params, data, retry_count + 1, auth_refreshed
@@ -494,6 +725,12 @@ class TradeStationClient:
         data: Optional[Dict],
     ) -> Response:
         """Build and execute a standard JSON API request."""
+        # Endpoint reconstruction for the resource lookup -- ``url`` was
+        # already built from ``base_url + endpoint`` and we need the latter.
+        endpoint_for_gate = url[len(self.base_url) :].lstrip("/") if url.startswith(
+            self.base_url
+        ) else url
+        self._gate_for_resource(endpoint_for_gate)
         self._gate_for_rate_limit()
         self._record_api_https_session_open()
         return requests.request(
@@ -571,6 +808,7 @@ class TradeStationClient:
         # contend.
         url = f"{self.base_url}/{endpoint}"
         headers = self.auth.get_headers()
+        self._gate_for_resource(endpoint)
         self._gate_for_rate_limit()
         self._record_api_https_session_open()
         response = requests.get(
@@ -580,12 +818,14 @@ class TradeStationClient:
             stream=True,
             timeout=(API_REQUEST_TIMEOUT, STREAM_READ_TIMEOUT_SECONDS),
         )
+        self._record_rate_limit_headers(response, endpoint)
 
         if response.status_code == 401:
             response.close()
             failed_token = headers.get("Authorization", "").removeprefix("Bearer ")
             self.auth.force_refresh_access_token(failed_token=failed_token)
             headers = self.auth.get_headers()
+            self._gate_for_resource(endpoint)
             self._gate_for_rate_limit()
             self._record_api_https_session_open()
             response = requests.get(
@@ -595,6 +835,7 @@ class TradeStationClient:
                 stream=True,
                 timeout=(API_REQUEST_TIMEOUT, STREAM_READ_TIMEOUT_SECONDS),
             )
+            self._record_rate_limit_headers(response, endpoint)
 
         if response.status_code not in [200, 201]:
             logger.error(f"Stream request failed: {response.status_code} [{endpoint}]")
