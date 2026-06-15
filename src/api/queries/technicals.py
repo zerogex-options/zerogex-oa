@@ -13,7 +13,10 @@ from datetime import datetime, time, timedelta
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
-from src.api.queries._sql_helpers import _bucket_expr, _interval_expr
+from src.api.queries._sql_helpers import (
+    _bucket_expr,
+    _bucket_floor_subquery,
+)
 from src.symbols import resolve_volume_proxy
 
 if TYPE_CHECKING:
@@ -53,8 +56,16 @@ class TechnicalsQueriesMixin:
         proxy = resolve_volume_proxy(symbol)
         if proxy:
             return await self._get_vwap_deviation_with_proxy(symbol, proxy, timeframe, window_units)
-        step_interval = _interval_expr(timeframe)
         bucket = _bucket_expr(timeframe)
+        # Bucket-aware window floor — see get_historical_quotes for the
+        # rationale.  ``window_units`` means "N buckets that have data".
+        bucket_floor = _bucket_floor_subquery(
+            table="underlying_vwap_deviation",
+            bucket_expr=bucket,
+            symbol_predicate="symbol = $1",
+            end_expr="(SELECT max_ts FROM latest)",
+            limit_param="$2",
+        )
         query = f"""
             WITH latest AS (
                 SELECT timestamp AS max_ts
@@ -65,7 +76,7 @@ class TechnicalsQueriesMixin:
             ),
             bounds AS (
                 SELECT
-                    max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
+                    {bucket_floor} AS start_ts,
                     max_ts AS end_ts
                 FROM latest
             ),
@@ -123,8 +134,16 @@ class TechnicalsQueriesMixin:
         Buckets/windows match the non-proxy path so the response shape is
         identical.
         """
-        step_interval = _interval_expr(timeframe)
         bucket = _bucket_expr(timeframe)
+        # Bucket-aware window floor over the with_vwap CTE — see
+        # get_historical_quotes for the rationale.
+        bucket_floor = _bucket_floor_subquery(
+            table="with_vwap",
+            bucket_expr=bucket,
+            symbol_predicate="symbol = $1",
+            end_expr="(SELECT max_ts FROM latest)",
+            limit_param="$2",
+        )
         query = f"""
             WITH index_quotes AS (
                 SELECT
@@ -198,7 +217,7 @@ class TechnicalsQueriesMixin:
             ),
             bounds AS (
                 SELECT
-                    max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
+                    {bucket_floor} AS start_ts,
                     max_ts AS end_ts
                 FROM latest
             ),
@@ -254,8 +273,16 @@ class TechnicalsQueriesMixin:
     ) -> List[Dict[str, Any]]:
         """Get opening range breakout status by interval/window."""
         window_units = max(1, min(window_units, 90))
-        step_interval = _interval_expr(timeframe)
         bucket = _bucket_expr(timeframe)
+        # Bucket-aware window floor — see get_historical_quotes for the
+        # rationale.  ``window_units`` means "N buckets that have data".
+        bucket_floor = _bucket_floor_subquery(
+            table="opening_range_breakout",
+            bucket_expr=bucket,
+            symbol_predicate="symbol = $1",
+            end_expr="(SELECT max_ts FROM latest)",
+            limit_param="$2",
+        )
         query = f"""
             WITH latest AS (
                 SELECT timestamp AS max_ts
@@ -266,7 +293,7 @@ class TechnicalsQueriesMixin:
             ),
             bounds AS (
                 SELECT
-                    max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
+                    {bucket_floor} AS start_ts,
                     max_ts AS end_ts
                 FROM latest
             ),

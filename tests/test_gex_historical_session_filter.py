@@ -126,8 +126,10 @@ def test_historical_etf_has_no_session_filter():
 
 
 def test_historical_cash_index_restricts_to_regular_session():
-    """SPX (and NDX, RUT) must restrict both CTEs that scan gex_summary
-    to weekdays 09:30–16:00 ET, excluding NYSE holidays."""
+    """SPX (and NDX, RUT) must restrict every gex_summary scan to weekdays
+    09:30–16:00 ET, excluding NYSE holidays: the ``latest`` anchor, the
+    bucket-floor subquery inside ``bounds`` (so ``window_units`` counts
+    only RTH buckets), and the per-bucket ``bucketed`` scan."""
     captured = _run_historical("SPX")
     sql = captured["query"]
 
@@ -138,16 +140,21 @@ def test_historical_cash_index_restricts_to_regular_session():
     # NYSE holidays bound as the 5th param.
     assert "<> ALL($5::date[])" in sql
 
-    # Filter is applied in BOTH gex_summary scans — the anchor in
-    # ``latest`` AND the per-bucket selection in ``bucketed``.
-    assert sql.count("EXTRACT(DOW") == 2
+    # Filter is applied to all three gex_summary scans — the anchor in
+    # ``latest``, the bucket-floor in ``bounds``, and the per-bucket
+    # selection in ``bucketed``.
+    assert sql.count("EXTRACT(DOW") == 3
     extract_positions = [i for i in range(len(sql)) if sql.startswith("EXTRACT(DOW", i)]
+    bounds_idx = sql.index("bounds AS")
     bucketed_idx = sql.index("bucketed AS")
-    # First occurrence is inside ``latest`` (before ``bucketed``).
-    assert extract_positions[0] < bucketed_idx
-    # Second occurrence is inside ``bucketed`` (after that marker).
-    assert extract_positions[1] > bucketed_idx
-    # Neither extends into the gex_by_strike joins (strike_agg / call_walls
+    # First occurrence is inside ``latest`` (before ``bounds``).
+    assert extract_positions[0] < bounds_idx
+    # Second occurrence is inside ``bounds`` (between ``bounds`` and
+    # ``bucketed``).
+    assert bounds_idx < extract_positions[1] < bucketed_idx
+    # Third occurrence is inside ``bucketed`` (after that marker).
+    assert extract_positions[2] > bucketed_idx
+    # None extend into the gex_by_strike joins (strike_agg / call_walls
     # / put_walls inherit the RTH-only timestamp set transitively via
     # ``base``).
     strike_agg_idx = sql.index("strike_agg AS")
@@ -165,6 +172,13 @@ def test_historical_cash_index_restricts_to_regular_session():
     assert (
         "gs.timestamp AT TIME ZONE" in bucketed_block
     ), "session filter inside bucketed CTE must be qualified with the gs alias"
+
+    # The bucket-floor subquery sits inside ``bounds`` and scans
+    # gex_summary unaliased, so its predicate must reference the bare
+    # ``timestamp`` column.
+    bounds_block = sql[bounds_idx:bucketed_idx]
+    assert "EXTRACT(DOW FROM timestamp AT TIME ZONE" in bounds_block
+    assert "LIMIT $4" in bounds_block
 
     # Param shape: symbol, start_date, end_date, window_units, holidays[].
     assert len(captured["args"]) == 5
@@ -220,9 +234,10 @@ def test_max_pain_cash_index_restricts_to_regular_session():
     assert "BETWEEN TIME '09:30' AND TIME '16:00'" in sql
     assert "<> ALL($3::date[])" in sql
 
-    # Filter applied in BOTH gex_summary scans (latest + ranked) — same
-    # pattern as the heatmap.
-    assert sql.count("EXTRACT(DOW") == 2
+    # Filter applied to all three gex_summary scans: ``latest`` anchor,
+    # ``bounds`` bucket-floor subquery (so ``window_units`` counts only
+    # RTH buckets), and ``ranked`` per-bucket selection.
+    assert sql.count("EXTRACT(DOW") == 3
 
     # Param shape: symbol, window_units, holidays[].
     assert len(captured["args"]) == 3
