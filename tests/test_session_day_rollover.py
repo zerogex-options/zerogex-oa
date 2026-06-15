@@ -10,7 +10,6 @@ fetch after the date flips.
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Optional
 from unittest.mock import MagicMock
 
 import pytz

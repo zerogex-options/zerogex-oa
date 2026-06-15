@@ -35,7 +35,8 @@ from src.validation import (
     get_market_session,
     underlying_feed_expected,
 )
-from src.symbols import resolve_option_root
+from src.symbols import resolve_option_root, is_cash_index
+from src.market_calendar import is_underlying_active_session
 from src.config import (
     _getenv_str,
     _getenv_int,
@@ -1642,6 +1643,28 @@ class StreamManager:
 
         Returns a list (not a generator) so callers can count results.
         """
+        # Cash-settled index options (SPX, NDX, RUT, DJX …) don't have a
+        # market outside 09:30-16:00 ET, but TradeStation still streams
+        # bid/ask updates from market makers all day.  After we added the
+        # receive-time fallback in 9481dd8, those off-session updates
+        # would land in option_chains stamped with the current wall clock
+        # but carrying stale Friday quote data.  The cash-index session
+        # filter at query time (database.py:get_gex_heatmap) already
+        # excludes them downstream, so we're writing rows we'll never
+        # read.  Skip the whole batch here -- less DB load, less write
+        # contention, identical downstream output.  ETFs (SPY, QQQ) skip
+        # this branch because is_cash_index() returns False for them, so
+        # their pre/post-market quotes still write as before.
+        if state and is_cash_index(self.db_underlying):
+            now_utc = datetime.now(timezone.utc)
+            if not is_underlying_active_session(now_utc, symbol=self.db_underlying):
+                logger.debug(
+                    "Skipping %d cash-settled option quotes for %s outside session.",
+                    len(state),
+                    self.db_underlying,
+                )
+                return []
+
         results = []
         for option_symbol, raw in state.items():
             meta = self._symbol_metadata.get(option_symbol)

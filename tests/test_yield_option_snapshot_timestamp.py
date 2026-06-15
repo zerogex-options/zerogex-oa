@@ -10,22 +10,33 @@ gamma flip) stayed blank until the cash session opened.
 The fix uses the stream arrival time as the timestamp when the snapshot
 carries a valid bid/ask/mid.  Quotes with neither timestamp NOR any quote
 data are still dropped (nothing useful to write) but at DEBUG level.
+
+Item #4 of the follow-up plan layers a second guard on top: cash-settled
+(SPX/NDX/...) option quotes outside their RTH session are skipped before
+the receive-time fallback runs, since those quotes carry stale data the
+downstream cash-index query filter would have excluded anyway.
 """
 
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from unittest.mock import patch
 
 from src.ingestion.stream_manager import StreamManager
 
 
-def _bare_stream_manager() -> StreamManager:
+def _bare_stream_manager(db_underlying: str = "QQQ") -> StreamManager:
     sm = StreamManager.__new__(StreamManager)
-    sm.db_underlying = "QQQ"
+    sm.db_underlying = db_underlying
     sm._symbol_metadata = {
         "QQQ 260616C740": {
             "strike": 740.0,
             "expiration": date(2026, 6, 16),
+            "option_type": "C",
+        },
+        "SPXW 260618C5300": {
+            "strike": 5300.0,
+            "expiration": date(2026, 6, 18),
             "option_type": "C",
         },
     }
@@ -144,3 +155,84 @@ def test_unknown_symbol_in_state_is_skipped():
     results = sm._yield_option_snapshot(state)
     assert len(results) == 1
     assert results[0]["option_symbol"] == "QQQ 260616C740"
+
+
+# --- Item #4: skip cash-settled writes outside RTH -------------------------
+
+
+def test_cash_settled_off_session_skips_whole_batch():
+    """SPX option batch during pre-market -> skip entirely.
+
+    The downstream cash-index session filter at query time already
+    excludes off-session rows, so writing them is pure waste.
+    """
+    sm = _bare_stream_manager(db_underlying="SPX")
+    state = {
+        "SPXW 260618C5300": {
+            "TimeStamp": "",
+            "Bid": "10.50",
+            "Ask": "11.00",
+        }
+    }
+    # 08:30 ET on a weekday = pre-market for cash index (which trades 09:30-16:00).
+    with patch(
+        "src.ingestion.stream_manager.is_cash_index", return_value=True
+    ), patch(
+        "src.ingestion.stream_manager.is_underlying_active_session", return_value=False
+    ):
+        results = sm._yield_option_snapshot(state)
+    assert results == []
+
+
+def test_cash_settled_in_session_writes_normally():
+    """SPX option batch during 09:30-16:00 ET -> normal write path."""
+    sm = _bare_stream_manager(db_underlying="SPX")
+    state = {
+        "SPXW 260618C5300": {
+            "TimeStamp": "2026-06-15T13:30:00Z",
+            "Bid": "10.50",
+            "Ask": "11.00",
+        }
+    }
+    with patch(
+        "src.ingestion.stream_manager.is_cash_index", return_value=True
+    ), patch(
+        "src.ingestion.stream_manager.is_underlying_active_session", return_value=True
+    ):
+        results = sm._yield_option_snapshot(state)
+    assert len(results) == 1
+    assert results[0]["option_symbol"] == "SPXW 260618C5300"
+
+
+def test_etf_off_session_still_writes():
+    """SPY/QQQ off-session must NOT be skipped -- they trade extended hours."""
+    sm = _bare_stream_manager(db_underlying="QQQ")
+    state = {
+        "QQQ 260616C740": {
+            "TimeStamp": "",  # forces receive-time fallback
+            "Bid": "1.20",
+            "Ask": "1.25",
+        }
+    }
+    # is_cash_index returns False for ETFs -> the cash-settled skip is bypassed
+    # entirely.  is_underlying_active_session isn't even consulted for ETFs
+    # in this path, but we set it False to prove ETFs aren't gated on it.
+    with patch(
+        "src.ingestion.stream_manager.is_cash_index", return_value=False
+    ), patch(
+        "src.ingestion.stream_manager.is_underlying_active_session", return_value=False
+    ):
+        results = sm._yield_option_snapshot(state)
+    assert len(results) == 1
+    assert results[0]["option_symbol"] == "QQQ 260616C740"
+
+
+def test_cash_settled_off_session_with_empty_batch_no_op():
+    """An empty drain on a cash-settled symbol off-session must not error."""
+    sm = _bare_stream_manager(db_underlying="SPX")
+    with patch(
+        "src.ingestion.stream_manager.is_cash_index", return_value=True
+    ), patch(
+        "src.ingestion.stream_manager.is_underlying_active_session", return_value=False
+    ):
+        assert sm._yield_option_snapshot({}) == []
