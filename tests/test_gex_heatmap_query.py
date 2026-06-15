@@ -257,13 +257,14 @@ def test_etf_heatmap_has_no_cash_session_filter():
 
 
 def test_cash_index_heatmap_restricts_to_regular_session():
-    """SPX (a cash index) must restrict BOTH the window anchor
-    (latest_summary) AND the per-bucket representatives (bucket_reps) to
-    the regular cash session so extended-hours / overnight buckets never
+    """SPX (a cash index) must restrict every gex_summary scan to the
+    regular cash session so extended-hours / overnight buckets never
     reach the heatmap AND the chart's right edge lands on the most recent
     RTH analytics row instead of whatever overnight cycle ran last.  The
     NYSE-holiday list is bound as the 3rd param and the same predicate
-    fragment is interpolated into both CTEs."""
+    fragment is interpolated into the window anchor (latest_summary), the
+    bucket-floor subquery in time_window (so ``window_units`` counts only
+    RTH buckets), and the per-bucket representatives (bucket_reps)."""
     captured = _run_and_capture("SPX")
     sql = captured["query"]
 
@@ -273,20 +274,23 @@ def test_cash_index_heatmap_restricts_to_regular_session():
     # NYSE holidays excluded via a bound date[] param.
     assert "<> ALL($3::date[])" in sql
 
-    # The session predicate is attached to BOTH gex_summary scans — the
-    # window anchor in latest_summary AND the per-bucket representative
-    # selection in bucket_reps — but never to the gex_by_strike join.
+    # The session predicate is attached to all three gex_summary scans —
+    # the latest_summary anchor, the bucket-floor subquery in time_window,
+    # and bucket_reps — but never to the gex_by_strike join.
     join_idx = sql.index("JOIN gex_by_strike g")
-    assert sql.count("EXTRACT(DOW") == 2
+    assert sql.count("EXTRACT(DOW") == 3
     extract_positions = [i for i in range(len(sql)) if sql.startswith("EXTRACT(DOW", i)]
-    # Both EXTRACT(DOW occurrences precede the join, neither follows it.
+    # All EXTRACT(DOW occurrences precede the join, none follow it.
     assert all(idx < join_idx for idx in extract_positions)
-    # First occurrence is inside latest_summary; second is inside bucket_reps.
-    summary_anchor_idx = sql.index("FROM gex_summary")  # first one — latest_summary
+    # Each occurrence lands in its corresponding CTE — anchor, then
+    # time_window bucket-floor, then bucket_reps.
+    summary_anchor_idx = sql.index("FROM gex_summary")
+    time_window_idx = sql.index("time_window AS")
     bucket_reps_idx = sql.index("bucket_reps AS")
-    assert summary_anchor_idx < extract_positions[0] < bucket_reps_idx
+    assert summary_anchor_idx < extract_positions[0] < time_window_idx
+    assert time_window_idx < extract_positions[1] < bucket_reps_idx
     bucket_reps_summary_idx = sql.index("FROM gex_summary", bucket_reps_idx)
-    assert bucket_reps_summary_idx < extract_positions[1] < join_idx
+    assert bucket_reps_summary_idx < extract_positions[2] < join_idx
 
     # symbol, window_units, then the holiday list.
     assert captured["args"][0] == "SPX"

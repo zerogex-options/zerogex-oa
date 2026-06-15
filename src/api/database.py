@@ -126,8 +126,8 @@ def _get_flow_session_bounds(session: str = "current") -> tuple:
 # without a circular import.
 from src.api.queries._sql_helpers import (  # noqa: E402
     _bucket_expr,
+    _bucket_floor_subquery,
     _gex_by_strike_order_clause,
-    _interval_expr,
 )
 
 # option_chains rows are UPSERTed in 60-second buckets: every contract that
@@ -1779,8 +1779,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     ) -> List[Dict[str, Any]]:
         """Get historical GEX summary data aggregated by timeframe."""
         bucket = _bucket_expr(timeframe)
-        step_interval = _interval_expr(timeframe)
-        # `bucket` and `step_interval` are validated allowlist literals.
+        # `bucket` is a validated allowlist literal.
         #
         # Cash-index session filter — same shape (and rationale) as
         # ``get_gex_heatmap``: SPX / NDX / RUT have no underlying tape
@@ -1789,16 +1788,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # Letting those after-hours / overnight rows reach a cash-index
         # chart misaligns the gamma-flip overlay with the RTH-only
         # candlesticks and drifts past the heatmap surface's right edge
-        # (which already clamps via the same filter).  Apply to BOTH the
-        # ``latest`` anchor (so max_ts lands on the most recent RTH row)
-        # and the ``bucketed`` scan (so out-of-session buckets never
-        # surface).  ETFs / equities keep the original query and params.
+        # (which already clamps via the same filter).  Apply to the
+        # ``latest`` anchor, the ``bounds`` bucket-floor subquery, and
+        # the ``bucketed`` scan so overnight rows never enter the result
+        # or the bucket count.  ETFs / equities keep the original shape
+        # (no session predicate) and the same param shape.
         #
-        # The template is interpolated twice with different column
-        # references because ``bucketed`` aliases gex_summary as ``gs``
-        # while ``latest`` does not, and PostgreSQL won't resolve
-        # unqualified ``timestamp`` against an aliased table inside a
-        # multi-table-friendly fragment.
+        # The template is interpolated with different column references
+        # because ``bucketed`` aliases gex_summary as ``gs`` while the
+        # other scans don't, and PostgreSQL won't resolve unqualified
+        # ``timestamp`` against an aliased table inside a multi-table-
+        # friendly fragment.
         session_filter_latest = ""
         session_filter_bucketed = ""
         params: list = [symbol, start_date, end_date, window_units]
@@ -1812,6 +1812,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             session_filter_latest = session_filter_template.format(ts="timestamp")
             session_filter_bucketed = session_filter_template.format(ts="gs.timestamp")
             params.append(sorted(NYSE_HOLIDAYS))
+        # Bucket-aware window floor — ``window_units`` always means "N
+        # buckets that have data", not "N step_interval-units of wall-
+        # clock time". Cash indices get the same session predicate the
+        # ``latest`` and ``bucketed`` scans use so the bucket count is
+        # consistent with what surfaces in the response.
+        bucket_floor = _bucket_floor_subquery(
+            table="gex_summary",
+            bucket_expr=bucket,
+            symbol_predicate="underlying = $1",
+            end_expr="COALESCE($3::timestamptz, (SELECT max_ts FROM latest))",
+            limit_param="$4",
+            extra_filter=session_filter_latest,
+        )
         query = f"""
             WITH latest AS (
                 SELECT timestamp AS max_ts
@@ -1822,7 +1835,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ),
             bounds AS (
                 SELECT
-                    COALESCE($2::timestamptz, max_ts - ({step_interval} * ($4 - 1))) AS start_ts,
+                    COALESCE($2::timestamptz, {bucket_floor}) AS start_ts,
                     COALESCE($3::timestamptz, max_ts) AS end_ts
                 FROM latest
             ),
@@ -2047,7 +2060,6 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             return cached  # type: ignore[no-any-return]
 
         bucket = _bucket_expr(timeframe)
-        step_interval = _interval_expr(timeframe)
 
         # Same two-template cash-index session filter pattern get_historical_gex
         # uses, with $5 reserved for the expiration filter so the holidays array
@@ -2065,6 +2077,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             session_filter_latest = session_filter_template.format(ts="timestamp")
             session_filter_bucketed = session_filter_template.format(ts="gs.timestamp")
             params.append(sorted(NYSE_HOLIDAYS))
+
+        # Bucket-aware window floor — see get_historical_quotes for the
+        # rationale.  Cash indices inherit the same session predicate the
+        # ``latest`` anchor uses so the bucket count agrees with what the
+        # ``bucket_reps`` CTE downstream will surface.
+        bucket_floor = _bucket_floor_subquery(
+            table="gex_summary",
+            bucket_expr=bucket,
+            symbol_predicate="underlying = $1",
+            end_expr="(SELECT max_ts FROM latest)",
+            limit_param="$2",
+            extra_filter=session_filter_latest,
+        )
 
         # Bucketing/anchoring mirrors get_historical_gex and get_gex_heatmap:
         # anchor on max(gex_summary.timestamp), pick the LATEST gex_summary row
@@ -2086,7 +2111,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ),
             bounds AS (
                 SELECT
-                    max_ts - ({step_interval} * ($2 - 1)) AS start_ts,
+                    {bucket_floor} AS start_ts,
                     max_ts AS end_ts
                 FROM latest
             ),
@@ -3143,8 +3168,20 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     ) -> List[Dict[str, Any]]:
         """Get historical quotes aggregated by timeframe."""
         bucket = _bucket_expr(timeframe)
-        step_interval = _interval_expr(timeframe)
-        # `bucket` and `step_interval` are validated allowlist literals.
+        # `bucket` is a validated allowlist literal.  The window floor is
+        # bucket-aware (Nth most recent bucket that has data) rather than
+        # ``max_ts - step_interval * (N - 1)`` wall-clock, so weekend /
+        # overnight gaps in the feed don't cause sparse charts — e.g. a
+        # 5-min × 576-bucket cash-index request on a Monday afternoon used
+        # to land its lower bound on Saturday and miss the entire Friday
+        # session even though plenty of RTH buckets existed further back.
+        bucket_floor = _bucket_floor_subquery(
+            table="underlying_quotes",
+            bucket_expr=bucket,
+            symbol_predicate="symbol = $1",
+            end_expr="COALESCE($3::timestamptz, (SELECT max_ts FROM latest))",
+            limit_param="$4",
+        )
         query = f"""
             WITH latest AS (
                 SELECT timestamp AS max_ts
@@ -3155,7 +3192,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ),
             bounds AS (
                 SELECT
-                    COALESCE($2::timestamptz, max_ts - ({step_interval} * ($4 - 1))) AS start_ts,
+                    COALESCE($2::timestamptz, {bucket_floor}) AS start_ts,
                     COALESCE($3::timestamptz, max_ts) AS end_ts
                 FROM latest
             ),
@@ -3207,8 +3244,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         """Get max pain timeseries aggregated to timeframe over window units."""
         window_units = max(1, min(window_units, 300))
         bucket = _bucket_expr(timeframe)
-        step_interval = _interval_expr(timeframe)
-        # `bucket` and `step_interval` are validated allowlist literals.
+        # `bucket` is a validated allowlist literal.
         #
         # Cash-index session filter — see ``get_gex_heatmap`` for the
         # full rationale.  SPX/NDX/RUT options trade extended hours so
@@ -3227,6 +3263,17 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     AND (timestamp AT TIME ZONE 'America/New_York')::date <> ALL($3::date[])
             """
             params.append(sorted(NYSE_HOLIDAYS))
+        # Bucket-aware window floor — see get_historical_quotes for the
+        # rationale.  Cash indices inherit the same session predicate the
+        # ``latest`` and ``ranked`` scans use so the bucket count agrees.
+        bucket_floor = _bucket_floor_subquery(
+            table="gex_summary",
+            bucket_expr=bucket,
+            symbol_predicate="underlying = $1",
+            end_expr="(SELECT max_ts FROM latest)",
+            limit_param="$2",
+            extra_filter=session_filter,
+        )
         query = f"""
             WITH latest AS (
                 SELECT timestamp AS max_ts
@@ -3236,7 +3283,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 LIMIT 1
             ),
             bounds AS (
-                SELECT max_ts - ({step_interval} * ($2 - 1)) AS start_ts, max_ts AS end_ts
+                SELECT {bucket_floor} AS start_ts, max_ts AS end_ts
                 FROM latest
             ),
             ranked AS (
@@ -3431,7 +3478,6 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         if cached is not None:
             return cached  # type: ignore[no-any-return]
         bucket = _bucket_expr(timeframe)
-        step_interval = _interval_expr(timeframe)
 
         # Cash indices (SPX, NDX, RUT, …) have no underlying price/volume of
         # their own outside the regular cash session, yet their options
@@ -3460,6 +3506,18 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     AND (timestamp AT TIME ZONE 'America/New_York')::date <> ALL($3::date[])
             """
             params.append(sorted(NYSE_HOLIDAYS))
+        # Bucket-aware window floor — see get_historical_quotes for the
+        # rationale.  Cash indices inherit the same session predicate the
+        # ``latest_summary`` and ``bucket_reps`` scans use so the bucket
+        # count stays consistent with what surfaces in the response.
+        bucket_floor = _bucket_floor_subquery(
+            table="gex_summary",
+            bucket_expr=bucket,
+            symbol_predicate="underlying = $1",
+            end_expr="(SELECT max_ts FROM latest_summary)",
+            limit_param="$2",
+            extra_filter=session_filter,
+        )
         # Strike half-band around spot, proportional for every underlying
         # so the colored surface fills the frontend's price-cropped y-axis
         # at any price level. A fixed ±50 was ≈±8.5% of a ~$585 SPY but
@@ -3470,7 +3528,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # interpolate alongside the other validated fragments below.
         band_pct = self._gex_heatmap_strike_band_pct
         strike_band = f"(SELECT spot_close FROM spot) * {band_pct:g}"
-        # `bucket` and `step_interval` are validated allowlist literals.
+        # `bucket` is a validated allowlist literal.
         #
         # Anchor choice: the window's right edge (``max_ts``) is the most
         # recent ``gex_summary`` row for this underlying, NOT the most
@@ -3528,7 +3586,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ),
             time_window AS (
                 SELECT
-                    max_ts - ({step_interval} * ($2 - 1)) as start_time,
+                    {bucket_floor} as start_time,
                     max_ts as end_time
                 FROM latest_summary
             ),
