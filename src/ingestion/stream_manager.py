@@ -1413,6 +1413,9 @@ class StreamManager:
         et_date = (now_et or datetime.now(ET)).date()
         if self._session_volume_date != et_date:
             self._session_volume_symbols = set()
+            # Day rollover side-effects centralised here so future per-day
+            # resets have one obvious place to land.
+            self._on_session_day_rollover(prev_date=self._session_volume_date, new_date=et_date)
             self._session_volume_date = et_date
 
         tracked_set = set(self.tracked_option_symbols)
@@ -1426,6 +1429,39 @@ class StreamManager:
         if tracked_total <= 0:
             return 0.0
         return min(1.0, len(self._session_volume_symbols) / tracked_total)
+
+    def _on_session_day_rollover(self, prev_date: Optional[date], new_date: date) -> None:
+        """Fire when the ET calendar day rolls over.
+
+        Centralised so per-day resets stay co-located with day-rollover
+        detection.  Called from ``_update_session_volume_coverage`` AFTER
+        the volume-symbol set has been cleared but BEFORE the date marker
+        is advanced -- the previous date is passed in for logging.
+
+        Currently invalidates the TradeStation strikes cache: overnight,
+        new weekly expirations are listed and the prior day's cached
+        strike lists for those expirations would point at the wrong row
+        set.  Within an intraday session strikes barely change, so the
+        cache TTL handles staleness; across a day boundary we drop the
+        whole cache so the first fetch after rollover gets a fresh view.
+        """
+        try:
+            self.client.invalidate_strikes_cache()
+        except Exception as e:
+            # Cache invalidation must never crash the stream loop.
+            logger.warning("Strikes-cache invalidation on day rollover failed: %s", e)
+        if prev_date is not None:
+            logger.info(
+                "Session day rollover %s -> %s; cleared volume-coverage set "
+                "and TradeStation strikes cache.",
+                prev_date,
+                new_date,
+            )
+        else:
+            logger.debug(
+                "First session-day observation (%s); strikes cache invalidated as a baseline.",
+                new_date,
+            )
 
     def _cleanup_expired_strikes(self):
         """Remove strikes for expired expirations to prevent memory leak"""
