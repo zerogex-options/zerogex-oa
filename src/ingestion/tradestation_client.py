@@ -28,6 +28,9 @@ from src.config import (
     API_RETRY_ATTEMPTS,
     API_RETRY_DELAY,
     API_RETRY_BACKOFF,
+    TS_RATE_LIMIT_PER_5MIN,
+    TS_RATE_LIMIT_SYNC_INTERVAL,
+    TS_STRIKES_CACHE_TTL,
 )
 
 logger = get_logger(__name__)
@@ -92,6 +95,25 @@ class TradeStationClient:
         # to the tradestation_api_calls table.  Kept optional so this module
         # stays usable without a database.
         self._api_call_window_writer: Optional[Callable[[datetime, int], None]] = None
+        # Optional callback (window_start) -> persisted total for that window.
+        # Returned value covers ALL processes that have already flushed into
+        # tradestation_api_calls.  Used by the rate-limit governor to estimate
+        # cross-process call volume in the current in-flight window.
+        self._api_call_window_reader: Optional[Callable[[datetime], int]] = None
+
+        # Rate-limit governor state.  All accessed under
+        # ``_api_session_counter_lock`` along with the existing window
+        # counters so the snapshot of (local count, persisted count, window)
+        # stays consistent.
+        self._rate_limit_persisted_count = 0
+        self._rate_limit_persisted_last_sync_mono = 0.0
+
+        # Strikes endpoint cache: key=(underlying, expiration_str) ->
+        # {"strikes": [...], "expires_at_mono": float}.  Strike chains
+        # rarely change intraday and were responsible for most of the
+        # repeated quota burn during pre-market.
+        self._strikes_cache: Dict[str, Dict[str, Any]] = {}
+        self._strikes_cache_lock = Lock()
 
         # Check if market hours warnings should be suppressed
         self.warn_market_hours = _getenv_bool("TS_WARN_MARKET_HOURS", True)
@@ -110,6 +132,119 @@ class TradeStationClient:
     def set_api_call_window_writer(self, writer: Optional[Callable[[datetime, int], None]]) -> None:
         """Install a callback invoked with (window_start, count) on rollover."""
         self._api_call_window_writer = writer
+
+    def set_api_call_window_reader(self, reader: Optional[Callable[[datetime], int]]) -> None:
+        """Install a callback that returns the persisted total for a window.
+
+        Used by the rate-limit governor to learn how many calls other
+        ingestion processes have already contributed to the current 5-min
+        bucket.  Reader is invoked with the floored window start and must
+        return a non-negative int (0 if no rows yet).
+        """
+        self._api_call_window_reader = reader
+
+    def _gate_for_rate_limit(self) -> None:
+        """Block before issuing a request if the 5-min window is at its cap.
+
+        Periodically (every ``TS_RATE_LIMIT_SYNC_INTERVAL`` seconds) flushes
+        this process's in-flight partial count to the DB and refreshes the
+        cross-process total via the configured reader callback.  When the
+        combined estimate (persisted + local in-flight) reaches
+        ``TS_RATE_LIMIT_PER_5MIN``, sleeps until the next 5-min boundary
+        so subsequent requests land in a fresh quota window.
+
+        Disabled if the cap is 0 OR no reader is wired (single-process mode
+        still works on the local count alone via the cap check below).
+        """
+        if TS_RATE_LIMIT_PER_5MIN <= 0:
+            return
+
+        now_utc = datetime.now(timezone.utc)
+        current_window = self._floor_to_five_minute_window(now_utc)
+        now_mono = time.monotonic()
+
+        flush_delta = 0
+        flush_window: Optional[datetime] = None
+        writer = self._api_call_window_writer
+        with self._api_session_counter_lock:
+            # Window rollover during gate -- reset persisted snapshot.
+            if current_window != self._api_session_window_start:
+                # Let _record_api_https_session_open handle the rollover bookkeeping
+                # on its own; here we just reset OUR persisted-count cache for the
+                # new window so we don't carry stale numbers across boundaries.
+                self._rate_limit_persisted_count = 0
+                self._rate_limit_persisted_last_sync_mono = 0.0
+
+            stale = (
+                now_mono - self._rate_limit_persisted_last_sync_mono
+                >= TS_RATE_LIMIT_SYNC_INTERVAL
+            )
+            local_count = self._api_session_window_count
+            # Only mark a delta as persisted if a writer is wired -- otherwise
+            # _api_session_window_persisted would drift past what's actually
+            # in the DB, causing the cap check below to under-count this
+            # process's contribution by the unflushed delta.
+            if stale and writer is not None and self._api_session_window_start == current_window:
+                flush_delta = local_count - self._api_session_window_persisted
+                if flush_delta > 0:
+                    flush_window = current_window
+                    self._api_session_window_persisted = local_count
+
+        # DB I/O outside the lock.
+        if flush_window is not None and writer is not None:
+            try:
+                writer(flush_window, flush_delta)
+            except Exception as e:
+                logger.debug("Rate-limit partial-flush writer raised: %s", e)
+                # Writer failed: roll back the persisted marker so we retry
+                # the same delta on the next sync instead of pretending it
+                # landed in the DB.
+                with self._api_session_counter_lock:
+                    self._api_session_window_persisted = max(
+                        self._api_session_window_persisted - flush_delta, 0
+                    )
+
+        if self._api_call_window_reader is not None and (
+            now_mono - self._rate_limit_persisted_last_sync_mono >= TS_RATE_LIMIT_SYNC_INTERVAL
+        ):
+            try:
+                persisted = int(self._api_call_window_reader(current_window) or 0)
+            except Exception as e:
+                logger.debug("Rate-limit reader raised: %s (continuing on local count)", e)
+                persisted = self._rate_limit_persisted_count
+            with self._api_session_counter_lock:
+                self._rate_limit_persisted_count = max(persisted, 0)
+                self._rate_limit_persisted_last_sync_mono = now_mono
+
+        with self._api_session_counter_lock:
+            local_count = (
+                self._api_session_window_count
+                if self._api_session_window_start == current_window
+                else 0
+            )
+            # Persisted count includes this process's flushed partial, so subtract
+            # it before re-adding local to avoid double-counting our own calls.
+            others = max(self._rate_limit_persisted_count - self._api_session_window_persisted, 0)
+            estimated_total = others + local_count
+
+        if estimated_total < TS_RATE_LIMIT_PER_5MIN:
+            return
+
+        next_window = current_window + timedelta(minutes=5)
+        # +0.25s cushion so monotonic clock skew can't land us inside the
+        # boundary window still appearing to be the prior bucket.
+        sleep_seconds = max((next_window - now_utc).total_seconds() + 0.25, 0.0)
+        if sleep_seconds <= 0:
+            return
+        logger.warning(
+            "TradeStation 5-min rate-limit cap reached (estimated %d >= %d); "
+            "sleeping %.1fs until next window starts at %s UTC.",
+            estimated_total,
+            TS_RATE_LIMIT_PER_5MIN,
+            sleep_seconds,
+            next_window.strftime("%H:%M:%S"),
+        )
+        time.sleep(sleep_seconds)
 
     def _record_api_https_session_open(self):
         """
@@ -359,6 +494,7 @@ class TradeStationClient:
         data: Optional[Dict],
     ) -> Response:
         """Build and execute a standard JSON API request."""
+        self._gate_for_rate_limit()
         self._record_api_https_session_open()
         return requests.request(
             method=method,
@@ -435,6 +571,7 @@ class TradeStationClient:
         # contend.
         url = f"{self.base_url}/{endpoint}"
         headers = self.auth.get_headers()
+        self._gate_for_rate_limit()
         self._record_api_https_session_open()
         response = requests.get(
             url,
@@ -449,6 +586,7 @@ class TradeStationClient:
             failed_token = headers.get("Authorization", "").removeprefix("Bearer ")
             self.auth.force_refresh_access_token(failed_token=failed_token)
             headers = self.auth.get_headers()
+            self._gate_for_rate_limit()
             self._record_api_https_session_open()
             response = requests.get(
                 url,
@@ -709,8 +847,33 @@ class TradeStationClient:
         logger.info(f"Found {len(expirations)} expirations")
         return sorted(expirations)
 
+    @staticmethod
+    def _strikes_cache_key(underlying: str, expiration: Optional[str]) -> str:
+        return f"{underlying}|{expiration or '*'}"
+
     def get_option_strikes(self, underlying: str, expiration: Optional[str] = None) -> List[float]:
-        """Get available strike prices"""
+        """Get available strike prices, cached intraday.
+
+        Strike chains rarely change inside a session for liquid underlyings,
+        so the full list is cached per (underlying, expiration) for
+        ``TS_STRIKES_CACHE_TTL`` seconds.  Empty results are NOT cached so a
+        transient upstream failure can't poison the cache for an hour.  Set
+        the TTL to 0 to disable.
+        """
+        cache_key = self._strikes_cache_key(underlying, expiration)
+        if TS_STRIKES_CACHE_TTL > 0:
+            now_mono = time.monotonic()
+            with self._strikes_cache_lock:
+                entry = self._strikes_cache.get(cache_key)
+                if entry is not None and entry["expires_at_mono"] > now_mono:
+                    logger.debug(
+                        "Strikes cache hit for %s exp=%s (%d strikes)",
+                        underlying,
+                        expiration,
+                        len(entry["strikes"]),
+                    )
+                    return list(entry["strikes"])
+
         params = {}
         if expiration:
             params["expiration"] = expiration
@@ -739,7 +902,36 @@ class TradeStationClient:
                 logger.warning("Skipped %d malformed strike rows for %s", bad, underlying)
 
         logger.info(f"Found {len(strikes)} strikes")
+
+        if TS_STRIKES_CACHE_TTL > 0 and strikes:
+            with self._strikes_cache_lock:
+                self._strikes_cache[cache_key] = {
+                    "strikes": list(strikes),
+                    "expires_at_mono": time.monotonic() + TS_STRIKES_CACHE_TTL,
+                }
+
         return strikes
+
+    def invalidate_strikes_cache(
+        self, underlying: Optional[str] = None, expiration: Optional[str] = None
+    ) -> None:
+        """Drop cached strike lists.
+
+        With no args, clears the entire cache.  With ``underlying`` only,
+        clears every expiration for that underlying.  With both, clears the
+        single (underlying, expiration) entry.  Callers should invoke this
+        on day rollover or when an upstream chain change is suspected.
+        """
+        with self._strikes_cache_lock:
+            if underlying is None:
+                self._strikes_cache.clear()
+                return
+            if expiration is not None:
+                self._strikes_cache.pop(self._strikes_cache_key(underlying, expiration), None)
+                return
+            prefix = f"{underlying}|"
+            for key in [k for k in self._strikes_cache if k.startswith(prefix)]:
+                self._strikes_cache.pop(key, None)
 
     def get_option_quotes(self, option_symbols: Union[str, List[str]]) -> Dict[str, Any]:
         """Get quotes for specific option symbols"""

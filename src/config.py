@@ -593,6 +593,29 @@ SESSION_TEMPLATE = _getenv_str("SESSION_TEMPLATE", "Default")
 TS_STREAM_READ_TIMEOUT = _getenv_int("TS_STREAM_READ_TIMEOUT", 300)
 TS_STREAM_REUSE_CONNECTIONS = _getenv_bool("TS_STREAM_REUSE_CONNECTIONS", False)
 
+# TradeStation API rate-limit governor.
+# Caps combined API call volume across all ingestion processes in each
+# 5-minute UTC window (the same bucket used by ``tradestation_api_calls``).
+# When the cross-process estimate meets the cap, callers sleep until the
+# next 5-minute boundary instead of issuing further requests that would
+# return 429 and burn the per-process retry budget.
+#
+# ``TS_RATE_LIMIT_PER_5MIN``: hard cap.  Leaves headroom below the observed
+# TradeStation ceiling (~1000/5min on the production account); set 0 to
+# disable the governor entirely.
+# ``TS_RATE_LIMIT_SYNC_INTERVAL``: how often (seconds) each process pushes
+# its in-flight partial count to the DB AND refreshes its read of the
+# cross-process total.  Shorter = tighter coordination, more DB chatter.
+TS_RATE_LIMIT_PER_5MIN = _getenv_int("TS_RATE_LIMIT_PER_5MIN", 900, min=0)
+TS_RATE_LIMIT_SYNC_INTERVAL = _getenv_int("TS_RATE_LIMIT_SYNC_INTERVAL", 5, min=1)
+
+# Strikes endpoint cache TTL (seconds).
+# Strike chains barely change intraday for liquid underlyings, so re-fetching
+# them every STRIKE_RECALC_INTERVAL cycle wastes API calls.  Cache the full
+# strike list per (underlying, expiration) for this many seconds.  Set 0
+# to disable caching entirely (fetch every call).
+TS_STRIKES_CACHE_TTL = _getenv_int("TS_STRIKES_CACHE_TTL", 3600, min=0)
+
 # Streaming quotes endpoint encodes the symbol list in the URL path. With
 # ~1000+ option contracts tracked, a single-connection URL exceeds ~25KB
 # and triggers a 414 Request-URI Too Large from TradeStation's gateway.
