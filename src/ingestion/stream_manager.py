@@ -20,7 +20,7 @@ import os
 import random
 import threading
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import Generator, List, Dict, Any, Optional, Set
 import pytz
 import requests as _requests
@@ -1614,18 +1614,6 @@ class StreamManager:
 
             raw_ts = raw.get("TimeStamp", "")
             timestamp = safe_datetime(raw_ts, field_name="TimeStamp")
-            if not timestamp:
-                # Drop the snapshot rather than fabricating ``now()`` on the
-                # INGEST path: a garbled TimeStamp would otherwise stamp the
-                # quote into the current minute bucket and mis-date its
-                # volume/flow. The bar path already drops bad timestamps; do
-                # the same here so a malformed quote can't corrupt bucketing.
-                logger.warning(
-                    "Dropping option quote with unparseable TimeStamp %r for %s",
-                    raw_ts,
-                    option_symbol,
-                )
-                continue
 
             last = safe_float(raw.get("Last"), default=None, field_name="Last")
             bid = safe_float(raw.get("Bid"), default=None, field_name="Bid")
@@ -1634,6 +1622,41 @@ class StreamManager:
 
             if mid is None and bid is not None and ask is not None:
                 mid = (bid + ask) / 2.0
+
+            if timestamp is None:
+                # TradeStation emits stream updates with TimeStamp='' for any
+                # option contract that hasn't trade-printed in the current
+                # session. That's the common case for far-OTM ETF strikes
+                # pre-market, and the universal case for cash-settled SPX/NDX
+                # contracts outside 09:30-16:00 ET — they get a continuous
+                # quote feed but no last-trade timestamp.
+                #
+                # Fall back to stream arrival time (now) when the snapshot
+                # carries a usable bid/ask/mid: the quote IS current, we just
+                # don't have a trade-time to anchor on, and stamping with the
+                # receive time is the correct semantic for a real-time order-
+                # book snapshot. Without this fallback the pre-market option
+                # universe drops to zero and downstream (option_chains -> Greeks
+                # -> gex_summary -> heatmap/flip) stays empty until the cash
+                # session opens.
+                #
+                # The bar path (line ~948) still drops bad timestamps because
+                # underlying bars MUST anchor to their period boundary — receive
+                # time would shift them into the wrong minute bucket. Option
+                # quotes aren't time-bucketed the same way: the snapshot is a
+                # point-in-time read.
+                if bid is not None or ask is not None or mid is not None:
+                    timestamp = datetime.now(timezone.utc)
+                else:
+                    # No timestamp AND no quote -- nothing useful to write.
+                    # Demoted from WARNING to DEBUG because this fires at high
+                    # cadence during pre-market for thinly-quoted contracts
+                    # and was flooding service logs.
+                    logger.debug(
+                        "Dropping option quote with no TimeStamp and no bid/ask/mid for %s",
+                        option_symbol,
+                    )
+                    continue
 
             volume = safe_int(raw.get("Volume"), default=None, field_name="Volume")
 
