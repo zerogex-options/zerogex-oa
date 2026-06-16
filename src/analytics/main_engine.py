@@ -3185,6 +3185,15 @@ class AnalyticsEngine:
                 session_open_et = ET.localize(datetime(ts_et.year, ts_et.month, ts_et.day, 9, 30))
                 session_open = session_open_et.astimezone(timezone.utc)
 
+                if curr_bucket_start < session_open:
+                    # Pre-session-open: both bucket targets get filtered
+                    # out by the WHERE bucket_start >= session_open clause
+                    # so the SQL would just write 0 rows. Skip the heavy
+                    # CTE entirely — the standalone flow cycle runs this
+                    # every loop iteration, including pre-market for
+                    # SPY/QQQ, so the noise compounds otherwise.
+                    return
+
                 logger.info(
                     "Refreshing flow_by_contract for %s buckets=[%s, %s]",
                     self.db_symbol,
@@ -3390,7 +3399,14 @@ class AnalyticsEngine:
             curr_bar = datetime.fromtimestamp(now_floor_epoch, tz=timezone.utc)
             session_end = min(curr_bar, session_close)
             if session_end < session_start:
-                session_end = session_start
+                # Pre-session-open: the anchor timestamp's ET date has
+                # today's 09:30 open in the future relative to wall-clock
+                # (common pre-market for SPY/QQQ once the standalone flow
+                # cycle starts running every loop iteration). Nothing to
+                # materialise yet — return cleanly instead of writing 0
+                # rows on every cycle and mislabelling that as
+                # "cold-start or gap detected".
+                return
             prev_bar = max(session_start, session_end - timedelta(minutes=5))
 
             with db_connection() as conn:
