@@ -661,20 +661,26 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         already exists in the cache tables rather than returning a 500.
 
         Cache ownership: ``flow_by_contract`` is normally written by the
-        analytics engine
-        (``src/analytics/main_engine.py:_refresh_flow_caches``) on its
-        cycle interval (default 60s).  This API-side path also writes
-        ``flow_contract_facts`` as a per-request backstop that fills in
+        analytics engine's ``_run_flow_cycle``
+        (``src/analytics/main_engine.py``) on its loop interval (default
+        60s), decoupled from the GEX recompute pipeline so a frozen
+        underlying feed doesn't drag down the flow side. The same
+        engine cycle materialises ``flow_series_5min`` off the just-
+        refreshed ``flow_by_contract``.
+
+        This API-side path is a per-request backstop for
+        ``flow_contract_facts`` + ``flow_by_contract`` that fills in
         gaps when the analytics engine is catching up after a restart,
-        or when a hot symbol is polled between analytics cycles.  The
+        or when a hot symbol is polled between engine cycles. The
         refreshes are idempotent upserts on the same primary key, so
         concurrent runs are safe; the analytics engine remains the
         steady-state writer.
 
         Set ``ANALYTICS_FLOW_CACHE_REFRESH_ENABLED=false`` to disable
-        the analytics-side write and let this path handle 100% of
-        cache freshness (useful when a single API process serves all
-        flow reads and the analytics engine doesn't need the cache).
+        the analytics-side write (covers both ``_run_flow_cycle`` calls)
+        and let this path handle 100% of cache freshness (useful when a
+        single API process serves all flow reads and the analytics
+        engine doesn't need the cache).
         """
         now = time_module.monotonic()
         last_refresh = self._last_flow_refresh_by_symbol.get(symbol, 0.0)

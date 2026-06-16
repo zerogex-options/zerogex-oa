@@ -3269,48 +3269,78 @@ class AnalyticsEngine:
         except Exception as e:
             logger.error(f"Error refreshing flow caches: {e}", exc_info=True)
 
-    def _skip_path_should_refresh_snapshot(
-        self,
-        latest_timestamp: datetime,
-        now: Optional[datetime] = None,
-    ) -> bool:
-        """Decide whether to fire ``_refresh_flow_series_snapshot`` when the
-        main analytics pipeline is short-circuited (steady-state
-        timestamp-unchanged or post-close empty-options paths).
+    def _run_flow_cycle(self):
+        """Standalone flow-refresh cycle, decoupled from the GEX pipeline.
 
-        Without this bypass the snapshot stops growing once the GEX
-        recompute starts skipping — typically the 15:55 ET bar — because
-        the underlying feed freezes at cash close (16:00 ET) and the next
-        four cycles all short-circuit. But SPX options trade through
-        16:15 ET, flow_by_contract keeps receiving those trades, and the
-        API's ``/api/flow/series`` ``current`` window extends to 16:15 ET.
-        The skipped cycles leave a structural 4-bar gap that fires
-        ``flow_series_5min shortfall`` warnings on every poll until the
-        next session lands.
+        Architecture note
+        -----------------
+        ``flow_by_contract`` and ``flow_series_5min`` have their own data
+        lifecycle independent of ``option_chains``'s Greek-bearing rows:
+        trades keep printing through 16:15 ET even after the underlying
+        feed freezes at 16:00 ET cash close, so the flow side has work
+        to do for ~15 minutes after the GEX side has nothing to recompute.
 
-        Fires while either:
-          * this is the first cycle since process start (covers an engine
-            restart mid-overnight that lost an earlier cycle's writes), or
-          * wall-clock is at or before ``session_close + 5 min`` for the ET
-            date of ``latest_timestamp`` (one ``ANALYTICS_INTERVAL`` of
-            grace past 16:15 ET so the trailing bar is captured even if
-            the cycle clock drifts past the boundary).
+        Previously both refreshes lived as stages of ``run_calculation``,
+        so the cycle-skip optimisations there (timestamp-unchanged
+        skip-guard, empty-options short-circuit) dragged the flow side
+        along — leaving the 16:00–16:15 ET bars unwritten and firing
+        ``flow_series_5min shortfall`` on every API poll until the next
+        session lands. Running the flow refresh from ``run()`` instead,
+        on every loop iteration regardless of GEX outcome, eliminates
+        that coupling at the architectural level.
 
-        Outside that window all 82 bars are already written; further calls
-        would re-upsert the (already correct) tail every cycle for the
-        rest of the night.
-
-        ``now`` is exposed for deterministic testing; production callers
-        leave it None so the gate observes real wall-clock.
+        Best-effort: every failure is caught and logged. The flow side
+        must never wedge the analytics loop.
         """
-        if self._last_processed_snapshot_ts is None:
-            return True
-        ts_et = latest_timestamp.astimezone(ET)
-        session_open_et = ET.localize(datetime(ts_et.year, ts_et.month, ts_et.day, 9, 30))
-        session_close = session_open_et.astimezone(timezone.utc) + timedelta(hours=6, minutes=45)
-        if now is None:
-            now = datetime.now(timezone.utc)
-        return now <= session_close + timedelta(minutes=5)
+        if not self._analytics_flow_cache_refresh_enabled:
+            return
+        try:
+            with db_connection() as conn:
+                cursor = conn.cursor()
+                # Anchor the session date off the freshest option_chains
+                # row, matching what ``_get_snapshot`` would have used.
+                # Post-close this row keeps advancing with NULL-Greek
+                # rows; that's fine — both refreshes treat the timestamp
+                # only as a session-date anchor, and their bucket /
+                # session_end math caps the actual writes at the current
+                # 5-min boundary and session_close respectively.
+                cursor.execute(
+                    """
+                    SELECT timestamp
+                    FROM option_chains
+                    WHERE underlying = %s
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                    """,
+                    (self.db_symbol,),
+                )
+                row = cursor.fetchone()
+                if not row or row[0] is None:
+                    return
+                anchor_ts = row[0]
+                cursor.execute(
+                    """
+                    SELECT close
+                    FROM underlying_quotes
+                    WHERE symbol = %s
+                      AND timestamp <= %s
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                    """,
+                    (self.db_symbol, anchor_ts),
+                )
+                uq_row = cursor.fetchone()
+                underlying_price = float(uq_row[0]) if uq_row and uq_row[0] is not None else None
+        except Exception as e:
+            logger.error(f"Error resolving flow cycle anchor: {e}", exc_info=True)
+            return
+
+        # Caches before snapshot: the snapshot reads ``flow_by_contract``,
+        # which the cache refresh upserts from ``flow_contract_facts``.
+        # Each refresh has its own try/except internally, so a failure in
+        # one does not block the other.
+        self._refresh_flow_caches(anchor_ts, underlying_price=underlying_price)
+        self._refresh_flow_series_snapshot(anchor_ts)
 
     def _refresh_flow_series_snapshot(self, timestamp: datetime):
         """Materialise flow_series_5min for the current session.
@@ -3495,15 +3525,6 @@ class AnalyticsEngine:
                         "recompute (suppressed repeat).",
                         latest_timestamp,
                     )
-                # The GEX recompute is genuinely a no-op, but the
-                # flow_series_5min snapshot writer is anchored to wall-clock
-                # (session_end = min(now_floor, session_close)) and can still
-                # extend the snapshot while we are inside the session window.
-                # Letting it run covers the 16:00–16:15 ET bars that would
-                # otherwise be skipped because the underlying feed freezes at
-                # cash close — see _skip_path_should_refresh_snapshot.
-                if self._skip_path_should_refresh_snapshot(latest_timestamp):
-                    self._refresh_flow_series_snapshot(latest_timestamp)
                 return True
 
             logger.info(f"Running calculation for timestamp: {latest_timestamp}")
@@ -3539,14 +3560,6 @@ class AnalyticsEngine:
                         latest_timestamp,
                     )
                     self._empty_snapshot_state = True
-                # Even with no Greek-bearing options the flow_series_5min
-                # snapshot writer can still advance — flow_by_contract is
-                # fed by a separate trade pipeline that keeps printing
-                # through the 16:15 ET option settle close. Refresh now so
-                # the 16:00–16:15 ET bars land before the gate closes for
-                # the night. See _skip_path_should_refresh_snapshot.
-                if self._skip_path_should_refresh_snapshot(latest_timestamp):
-                    self._refresh_flow_series_snapshot(latest_timestamp)
                 self._last_processed_snapshot_ts = latest_timestamp
                 return True
 
@@ -3594,18 +3607,11 @@ class AnalyticsEngine:
             self._store_calculation_results(gex_by_strike, gex_summary, options=options)
             stage_timings["store_results"] = _time.monotonic() - t0
 
-            # Refresh flow cache tables
-            logger.info("Refreshing flow cache tables...")
-            t0 = _time.monotonic()
-            self._refresh_flow_caches(latest_timestamp, underlying_price)
-            stage_timings["refresh_flow_caches"] = _time.monotonic() - t0
-
-            # Materialise the flow_series_5min snapshot off the same
-            # timestamp (downstream of the flow_by_contract refresh above).
-            logger.info("Refreshing flow series snapshot...")
-            t0 = _time.monotonic()
-            self._refresh_flow_series_snapshot(latest_timestamp)
-            stage_timings["flow_series_snapshot"] = _time.monotonic() - t0
+            # Flow cache + flow_series_5min snapshot refresh used to run
+            # as stages of run_calculation here, which coupled them to the
+            # cycle-skip optimisations above. Both are now driven by
+            # ``_run_flow_cycle`` from the main loop so that a skipped GEX
+            # cycle no longer skips the flow side. See _run_flow_cycle.
 
             # Log summary
             logger.info("")
@@ -3730,6 +3736,15 @@ class AnalyticsEngine:
                     logger.info(f"✅ Calculation cycle {self.calculations_completed} complete")
                 else:
                     logger.warning("⚠️  Calculation cycle had issues")
+
+                # Refresh the flow caches and the flow_series_5min snapshot
+                # on every loop iteration regardless of GEX outcome. These
+                # used to be stages of run_calculation() and got skipped
+                # whenever its short-circuits fired, even though their
+                # data sources (flow_contract_facts → flow_by_contract)
+                # remain live well past the GEX side's cash-close freeze.
+                # See _run_flow_cycle for the full rationale.
+                self._run_flow_cycle()
 
                 # Calculate sleep time
                 cycle_duration = time.time() - cycle_start

@@ -58,15 +58,14 @@ def test_skips_recompute_when_snapshot_timestamp_unchanged():
 
     # Pretend the prior cycle already processed this exact timestamp.
     engine._last_processed_snapshot_ts = ts
-    # Force the flow-snapshot bypass closed so this test isolates the
-    # GEX-recompute skip from the late-session snapshot top-up path
-    # (covered separately by the flow_series tests below).
-    engine._skip_path_should_refresh_snapshot = MagicMock(return_value=False)
 
     result = engine.run_calculation()
 
     assert result is True
-    # The whole pipeline is skipped — no recompute, no store, no refresh.
+    # The GEX pipeline is skipped — no recompute, no store. Flow-cache
+    # and flow-series-snapshot refreshes are now driven by run()'s
+    # _run_flow_cycle and are no longer stages of run_calculation, so
+    # they must not be invoked from this path either.
     engine._calculate_gex_by_strike.assert_not_called()
     engine._calculate_gex_summary.assert_not_called()
     engine._store_calculation_results.assert_not_called()
@@ -95,7 +94,11 @@ def test_recomputes_when_snapshot_timestamp_advances():
     assert result is True
     engine._calculate_gex_by_strike.assert_called_once()
     engine._store_calculation_results.assert_called_once()
-    engine._refresh_flow_caches.assert_called_once()
+    # Flow-cache + snapshot refresh used to be stages of run_calculation
+    # but now live in run()'s _run_flow_cycle (separate concern); they
+    # must NOT be called by run_calculation itself.
+    engine._refresh_flow_caches.assert_not_called()
+    engine._refresh_flow_series_snapshot.assert_not_called()
     assert engine.calculations_completed == 1
     # The newly processed timestamp is recorded for next-cycle comparison.
     assert engine._last_processed_snapshot_ts == new_ts
