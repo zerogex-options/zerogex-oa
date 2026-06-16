@@ -58,6 +58,10 @@ def test_skips_recompute_when_snapshot_timestamp_unchanged():
 
     # Pretend the prior cycle already processed this exact timestamp.
     engine._last_processed_snapshot_ts = ts
+    # Force the flow-snapshot bypass closed so this test isolates the
+    # GEX-recompute skip from the late-session snapshot top-up path
+    # (covered separately by the flow_series tests below).
+    engine._skip_path_should_refresh_snapshot = MagicMock(return_value=False)
 
     result = engine.run_calculation()
 

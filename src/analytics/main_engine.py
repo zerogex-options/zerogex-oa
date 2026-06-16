@@ -3269,6 +3269,49 @@ class AnalyticsEngine:
         except Exception as e:
             logger.error(f"Error refreshing flow caches: {e}", exc_info=True)
 
+    def _skip_path_should_refresh_snapshot(
+        self,
+        latest_timestamp: datetime,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Decide whether to fire ``_refresh_flow_series_snapshot`` when the
+        main analytics pipeline is short-circuited (steady-state
+        timestamp-unchanged or post-close empty-options paths).
+
+        Without this bypass the snapshot stops growing once the GEX
+        recompute starts skipping — typically the 15:55 ET bar — because
+        the underlying feed freezes at cash close (16:00 ET) and the next
+        four cycles all short-circuit. But SPX options trade through
+        16:15 ET, flow_by_contract keeps receiving those trades, and the
+        API's ``/api/flow/series`` ``current`` window extends to 16:15 ET.
+        The skipped cycles leave a structural 4-bar gap that fires
+        ``flow_series_5min shortfall`` warnings on every poll until the
+        next session lands.
+
+        Fires while either:
+          * this is the first cycle since process start (covers an engine
+            restart mid-overnight that lost an earlier cycle's writes), or
+          * wall-clock is at or before ``session_close + 5 min`` for the ET
+            date of ``latest_timestamp`` (one ``ANALYTICS_INTERVAL`` of
+            grace past 16:15 ET so the trailing bar is captured even if
+            the cycle clock drifts past the boundary).
+
+        Outside that window all 82 bars are already written; further calls
+        would re-upsert the (already correct) tail every cycle for the
+        rest of the night.
+
+        ``now`` is exposed for deterministic testing; production callers
+        leave it None so the gate observes real wall-clock.
+        """
+        if self._last_processed_snapshot_ts is None:
+            return True
+        ts_et = latest_timestamp.astimezone(ET)
+        session_open_et = ET.localize(datetime(ts_et.year, ts_et.month, ts_et.day, 9, 30))
+        session_close = session_open_et.astimezone(timezone.utc) + timedelta(hours=6, minutes=45)
+        if now is None:
+            now = datetime.now(timezone.utc)
+        return now <= session_close + timedelta(minutes=5)
+
     def _refresh_flow_series_snapshot(self, timestamp: datetime):
         """Materialise flow_series_5min for the current session.
 
@@ -3452,6 +3495,15 @@ class AnalyticsEngine:
                         "recompute (suppressed repeat).",
                         latest_timestamp,
                     )
+                # The GEX recompute is genuinely a no-op, but the
+                # flow_series_5min snapshot writer is anchored to wall-clock
+                # (session_end = min(now_floor, session_close)) and can still
+                # extend the snapshot while we are inside the session window.
+                # Letting it run covers the 16:00–16:15 ET bars that would
+                # otherwise be skipped because the underlying feed freezes at
+                # cash close — see _skip_path_should_refresh_snapshot.
+                if self._skip_path_should_refresh_snapshot(latest_timestamp):
+                    self._refresh_flow_series_snapshot(latest_timestamp)
                 return True
 
             logger.info(f"Running calculation for timestamp: {latest_timestamp}")
@@ -3487,6 +3539,14 @@ class AnalyticsEngine:
                         latest_timestamp,
                     )
                     self._empty_snapshot_state = True
+                # Even with no Greek-bearing options the flow_series_5min
+                # snapshot writer can still advance — flow_by_contract is
+                # fed by a separate trade pipeline that keeps printing
+                # through the 16:15 ET option settle close. Refresh now so
+                # the 16:00–16:15 ET bars land before the gate closes for
+                # the night. See _skip_path_should_refresh_snapshot.
+                if self._skip_path_should_refresh_snapshot(latest_timestamp):
+                    self._refresh_flow_series_snapshot(latest_timestamp)
                 self._last_processed_snapshot_ts = latest_timestamp
                 return True
 
