@@ -186,6 +186,69 @@ async def _revoke(key_id: int) -> int:
     return 0
 
 
+async def _rotate(key_id: int) -> int:
+    """Mint a new key carrying the same scopes, revoke the old one.
+
+    Done in a single transaction so the customer never has zero valid
+    keys mid-rotation. The new raw secret is printed exactly once.
+    """
+    raw = secrets.token_urlsafe(32)
+    prefix = raw[:_PREFIX_LEN]
+    key_hash = _hash_key(raw)
+
+    conn = await _connect()
+    try:
+        async with conn.transaction():
+            existing = await conn.fetchrow(
+                """
+                SELECT id, user_id, name, scopes, revoked_at
+                FROM api_keys
+                WHERE id = $1
+                """,
+                key_id,
+            )
+            if existing is None:
+                print(f"No key with id={key_id}", file=sys.stderr)
+                return 1
+            if existing["revoked_at"] is not None:
+                print(
+                    f"Key id={key_id} is already revoked; cannot rotate. "
+                    "Use `create` to issue a new key.",
+                    file=sys.stderr,
+                )
+                return 1
+            new_name = f"{existing['name']} (rotated)"[:128]
+            new_row = await conn.fetchrow(
+                """
+                INSERT INTO api_keys (user_id, name, key_hash, prefix, scopes)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id, created_at
+                """,
+                existing["user_id"],
+                new_name,
+                key_hash,
+                prefix,
+                list(existing["scopes"] or []),
+            )
+            await conn.execute(
+                "UPDATE api_keys SET revoked_at = NOW() WHERE id = $1",
+                key_id,
+            )
+    finally:
+        await conn.close()
+
+    print(
+        f"Rotated key id={key_id} -> new id={new_row['id']} "
+        f"user_id={existing['user_id']} prefix={prefix}"
+    )
+    print()
+    print("New API key (shown once — copy it now):")
+    print(f"  {raw}")
+    print()
+    print(f"Old key id={key_id} has been revoked.")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="admin_keys",
@@ -235,6 +298,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_revoke = sub.add_parser("revoke", help="Revoke an API key by id")
     p_revoke.add_argument("key_id", type=int)
 
+    p_rotate = sub.add_parser(
+        "rotate",
+        help="Mint a new key carrying the same scopes and revoke the old one",
+    )
+    p_rotate.add_argument("key_id", type=int)
+
     return parser
 
 
@@ -254,6 +323,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return asyncio.run(_list(args.user_id, args.active))
     if args.cmd == "revoke":
         return asyncio.run(_revoke(args.key_id))
+    if args.cmd == "rotate":
+        return asyncio.run(_rotate(args.key_id))
     parser.print_help()
     return 1
 

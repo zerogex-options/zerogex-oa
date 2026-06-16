@@ -73,6 +73,13 @@ api = [
     "asyncpg>=0.29.0",
     "pydantic>=2.5.0",
     "python-json-logger>=2.0.0",
+    # Optional at runtime: ratelimit.py + cache.py degrade to in-memory
+    # when redis-py isn't importable, but the production deployment uses
+    # the shared coordinator so we list it here.
+    "redis>=5.0.0",
+    # Optional at runtime: billing.py only imports stripe lazily, but the
+    # B2B daily reporter needs the SDK present to ship meter events.
+    "stripe>=11.0.0",
 ]
 all = [
     "zerogex-oa[dev,metrics,greeks,api]",

@@ -1867,6 +1867,64 @@ CREATE INDEX IF NOT EXISTS idx_api_usage_daily_caller
     ON api_usage_daily(caller_user_id, day);
 
 -- =============================================================================
+-- B2B billing customers (Stripe subscription mirror)
+-- =============================================================================
+-- One row per developer (= `api_keys.user_id`) carrying the Stripe IDs that
+-- identify their B2B API subscription.  Populated by the
+-- /api/billing/dev-webhook handler from `customer.subscription.*` events on
+-- the B2B API SKUs; deliberately separate from the frontend's SQLite users
+-- table so the B2C and B2B billing streams cannot interfere with each
+-- other.
+--
+-- `stripe_subscription_item_id` is the field the daily metered-usage
+-- reporter (src/api/billing.py) attaches usage to via Stripe's
+-- Billing.MeterEvent API.  The reporter walks `api_usage_daily` joined on
+-- this table so only developers with an active subscription are billed.
+CREATE TABLE IF NOT EXISTS api_billing_customers (
+    user_id                     VARCHAR(128) PRIMARY KEY,
+    stripe_customer_id          VARCHAR(64),
+    stripe_subscription_id      VARCHAR(64),
+    stripe_subscription_item_id VARCHAR(64),
+    tier                        VARCHAR(32),
+    -- Mirrors Stripe `subscription.status` (active, trialing, past_due,
+    -- canceled, incomplete, …).  The reporter only bills `active`,
+    -- `trialing`, and `past_due`; canceled rows stay so an audit of who
+    -- was billed when is reconstructible after churn.
+    status                      VARCHAR(32) NOT NULL,
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_billing_customers_stripe_customer
+    ON api_billing_customers(stripe_customer_id);
+
+-- =============================================================================
+-- B2B billing usage reports (idempotent meter-event audit)
+-- =============================================================================
+-- One row per (day, user_id) recording the daily reporter's outcome.  The
+-- PK is the dedup contract — a posted row blocks a re-post for the same
+-- slice, so a reporter crashed mid-batch can be safely restarted without
+-- double-billing.  Failed posts are written too (with status='failed' and
+-- empty `stripe_event_id`) so the next pass picks them up; the SELECT in
+-- src/api/billing.py joins LEFT…WHERE status='posted' so failed rows do
+-- not block retries.
+CREATE TABLE IF NOT EXISTS api_billing_usage_reports (
+    day             DATE         NOT NULL,
+    user_id         VARCHAR(128) NOT NULL,
+    request_count   BIGINT       NOT NULL,
+    error_count     BIGINT       NOT NULL DEFAULT 0,
+    posted_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    stripe_event_id VARCHAR(96)  NOT NULL DEFAULT '',
+    -- 'posted' = Stripe accepted the meter event; 'failed' = the post
+    -- raised, retry on the next pass.
+    status          VARCHAR(16)  NOT NULL,
+    PRIMARY KEY (day, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_billing_usage_reports_status
+    ON api_billing_usage_reports(status, day);
+
+-- =============================================================================
 -- Daily ATM IV history (for iv_rank computation)
 -- =============================================================================
 -- One row per (underlying, trading_date) holding that day's ATM call IV.

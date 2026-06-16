@@ -32,7 +32,18 @@ def test_market_raw_is_isolated_from_derived():
 
 
 def test_all_scopes_is_the_union():
-    assert scopes.ALL_SCOPES == scopes.DERIVED_SCOPES | {scopes.MARKET_RAW}
+    # ALL_SCOPES = derived ∪ raw ∪ dev_portal. The dev_portal scope gates
+    # the self-serve key administration endpoints and is held by the
+    # website BFF only — never folded into DERIVED_SCOPES, never granted
+    # to an external customer key.
+    assert scopes.ALL_SCOPES == (scopes.DERIVED_SCOPES | {scopes.MARKET_RAW, scopes.DEV_PORTAL})
+
+
+def test_dev_portal_is_isolated_from_derived():
+    assert scopes.DEV_PORTAL not in scopes.DERIVED_SCOPES
+    assert scopes.DEV_PORTAL not in scopes.TIERS[scopes.TIER_ANALYTICS]
+    assert scopes.DEV_PORTAL not in scopes.TIERS[scopes.TIER_SIGNALS]
+    assert scopes.DEV_PORTAL in scopes.TIERS[scopes.TIER_FULL]
 
 
 def test_analytics_tier_excludes_raw_and_signals():

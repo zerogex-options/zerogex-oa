@@ -4,7 +4,7 @@ ZeroGEX API Server
 FastAPI backend for serving analytics data to the frontend
 """
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
@@ -17,11 +17,14 @@ import re
 from typing import List, Optional, Literal
 import pytz
 
+from . import billing as api_billing
+from . import redis_client
+from .cache import cache_response
 from .database import DatabaseManager
 from .errors import handle_api_errors
 from .middleware import AuditLogMiddleware, RequestIdMiddleware, UsageMeterMiddleware
 from .ratelimit import rate_limit
-from .scopes import FLOW, GEX, MARKET_RAW, MAXPAIN, SIGNALS, TECHNICALS
+from .scopes import DEV_PORTAL, FLOW, GEX, MARKET_RAW, MAXPAIN, SIGNALS, TECHNICALS
 from .security import api_key_auth, key_store, require_scopes
 from .usage import usage_meter
 from .models import (
@@ -50,6 +53,8 @@ from .routers.option_contract import router as option_contract_router
 from .routers.option_calculator import router as option_calculator_router
 from .routers.vol_surface import router as vol_surface_router
 from .routers.gex_flip_horizon import router as gex_flip_horizon_router
+from .routers.dev_portal import router as dev_portal_router
+from .routers.billing import router as billing_router
 
 # Logging is configured centrally in src.utils.logging; importing
 # get_logger triggers _configure_logging which honors LOG_LEVEL and
@@ -132,6 +137,12 @@ async def lifespan(app: FastAPI):
     usage_meter.configure(lambda: db_manager.pool)
     usage_meter.start()
 
+    # Wire the B2B billing reporter against the same pool. ``start()`` is a
+    # no-op unless API_BILLING_ENABLED=1 AND STRIPE_API_KEY is set, so this
+    # is inert until billing is switched on.
+    api_billing.reporter.configure(lambda: db_manager.pool)
+    api_billing.reporter.start()
+
     # The max-pain snapshot is refreshed off-process by the
     # zerogex-oa-max-pain-refresh.timer (daily, pre-market) — not by an
     # in-process loop and not inline on the request path.  The endpoint is
@@ -140,10 +151,14 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down ZeroGEX API Server...")
-    # Stop the meter first (cancels the loop and flushes the final window)
-    # while the DB pool is still up, then drop both pool getters.
+    # Stop the meter and the billing reporter first (cancels their loops)
+    # while the DB pool is still up, then drop their getters and close any
+    # Redis pool that was opened.
     await usage_meter.stop()
     usage_meter.configure(None)
+    await api_billing.reporter.stop()
+    api_billing.reporter.configure(None)
+    await redis_client.close()
     key_store.configure(None)
     if db_manager:
         await db_manager.disconnect()
@@ -276,6 +291,7 @@ _scope_maxpain = Depends(require_scopes(MAXPAIN))
 _scope_technicals = Depends(require_scopes(TECHNICALS))
 _scope_signals = Depends(require_scopes(SIGNALS))
 _scope_market_raw = Depends(require_scopes(MARKET_RAW))
+_scope_dev_portal = Depends(require_scopes(DEV_PORTAL))
 
 # The /api/signals surface is the premium (basic/pro) tier.
 app.include_router(
@@ -291,6 +307,13 @@ app.include_router(gex_flip_horizon_router, dependencies=[_scope_gex])
 # behind MARKET_RAW so they are excluded from derived-only tiers.
 app.include_router(option_contract_router, dependencies=[_scope_market_raw])
 app.include_router(option_calculator_router, dependencies=[_scope_market_raw])
+# Self-serve developer portal — administration endpoints (list/create/
+# rotate/revoke keys, usage rollups) for the calling SaaS user. Gated by
+# DEV_PORTAL so only the website BFF (TIER_FULL or wildcard) reaches them;
+# the JWT in X-End-User-Token then scopes every row to that one user.
+app.include_router(dev_portal_router, dependencies=[_scope_dev_portal])
+# B2B Stripe webhook — verifies its own signature, so no api-key auth.
+app.include_router(billing_router)
 
 # ============================================================================
 # Health Check
@@ -345,7 +368,8 @@ async def health_check(response: Response):
 
 @app.get("/api/gex/summary", response_model=GEXSummary, tags=["GEX"], dependencies=[_scope_gex])
 @handle_api_errors("GET /api/gex/summary")
-async def get_gex_summary(symbol: str = Query(default="SPY")):
+@cache_response("gex_summary", ttl_seconds=30)
+async def get_gex_summary(request: Request, symbol: str = Query(default="SPY")):
     """Get latest GEX summary"""
     data = await _db().get_latest_gex_summary(symbol)
     if not data:

@@ -27,6 +27,12 @@ Each scope names one analytics domain:
   derivative. Held in its own scope precisely so it can be granted to the
   internal website BFF and **withheld from every external customer** — the
   derived scopes above are broadly redistributable, this one is not.
+* :data:`DEV_PORTAL` — **self-serve developer-portal administration**:
+  list/issue/rotate/revoke a logged-in SaaS user's own ``api_keys`` rows
+  and read their ``api_usage_daily`` rollups. Held by the website BFF only
+  — never by an external customer — because these endpoints mint
+  bearer credentials, so a key carrying ``DEV_PORTAL`` can spawn keys for
+  any end-user it can sign a token for.
 
 Tier bundles
 ------------
@@ -35,8 +41,9 @@ Tiers are named bundles of scopes — the unit of commercial packaging:
 * :data:`TIER_ANALYTICS` — the clean, derived B2B/B2B2C product:
   GEX + FLOW + MAXPAIN + TECHNICALS. **No raw data, no signals.**
 * :data:`TIER_SIGNALS` — analytics plus the signal engine.
-* :data:`TIER_FULL` — everything *including* ``MARKET_RAW``. Intended for
-  the internal website backend only, never for external resale.
+* :data:`TIER_FULL` — everything *including* ``MARKET_RAW`` and
+  ``DEV_PORTAL``. Intended for the internal website backend only, never
+  for external resale.
 
 Enforcement is opt-in (``API_SCOPE_ENFORCEMENT`` in ``security.py``) and a
 key carrying the wildcard ``"*"`` always passes, so adding these scope
@@ -56,13 +63,16 @@ MAXPAIN: str = "maxpain"
 TECHNICALS: str = "technicals"
 SIGNALS: str = "signals"
 MARKET_RAW: str = "market_raw"
+DEV_PORTAL: str = "dev_portal"
 
 #: Every capability scope the API knows about.
-ALL_SCOPES: FrozenSet[str] = frozenset({GEX, FLOW, MAXPAIN, TECHNICALS, SIGNALS, MARKET_RAW})
+ALL_SCOPES: FrozenSet[str] = frozenset(
+    {GEX, FLOW, MAXPAIN, TECHNICALS, SIGNALS, MARKET_RAW, DEV_PORTAL}
+)
 
 #: The derived-analytics scopes — the subset that is broadly licensable
 #: for redistribution because each is a computed output, not raw upstream
-#: market data. ``MARKET_RAW`` is deliberately excluded.
+#: market data. ``MARKET_RAW`` and ``DEV_PORTAL`` are deliberately excluded.
 DERIVED_SCOPES: FrozenSet[str] = frozenset({GEX, FLOW, MAXPAIN, TECHNICALS, SIGNALS})
 
 # --- Tier bundles ---------------------------------------------------------
