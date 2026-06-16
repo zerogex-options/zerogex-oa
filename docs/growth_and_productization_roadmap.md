@@ -1,6 +1,13 @@
 # ZeroGEX Growth & Productization Roadmap
 
-_Last updated: 2026-06-15_
+_Last updated: 2026-06-16_
+
+> **Update 2026-06-16:** The Stream-1 PostHog funnel is no longer a to-do — it
+> was built, shipped, merged to `release`, and verified **live** (real
+> `zerogex.io` traffic confirmed flowing into PostHog). Details inline below.
+> Observed already: inbound traffic arriving via `utm_source=chatgpt.com`. No
+> PRs were opened (per direction); work is on branch
+> `claude/zerogex-revenue-potential-rfmuxa` and in `release`.
 
 This document captures the strategy and action plan developed for ZeroGEX.
 It is organized around the two parallel streams of work:
@@ -72,11 +79,23 @@ partly blind.
 ### Recommended moves (in priority order)
 
 **1. Instrument the funnel + close the loop by hand.** _(highest ROI, ~free, do now)_
-- Add product analytics (PostHog free tier) to `zerogex-web`. Track:
-  `signup → trial start → first "aha" event (e.g. first live dashboard view)
-  → paid → active@30d`.
-- At 277 signups you're still small enough to **email/DM every non-converter
-  and trial drop-off** and ask why. That qualitative gold disappears at scale.
+- ✅ **DONE (2026-06-16) — PostHog funnel built, shipped to `release`, verified
+  live.** Code in `zerogex-web` under `frontend/core/telemetry/` (`events.ts`,
+  `posthog-client.ts`, `posthog-server.ts`; `TelemetryProvider.tsx`) — renamed
+  from `analytics`. Off by default (no key = no-op); autocapture + session
+  recording OFF (explicit events + manual pageviews only). Events wired:
+  `pageviews + identify` (ClientLayout, keyed to user id), `signup` (register
+  success), `first_value` "aha" (gamma-exposure first render, ref-guarded),
+  `checkout_started` (pricing subscribe), and server-side via the Stripe webhook
+  on status transitions: `trial_started`, `subscription_paid` (incl. trial→paid),
+  `subscription_cancelled`. Client + server stitch to one person via shared user
+  id. To activate: set `NEXT_PUBLIC_POSTHOG_KEY` (+ optional
+  `NEXT_PUBLIC_POSTHOG_HOST`), deploy — already confirmed flowing.
+- **Still to do (the human half):** build the funnel view in PostHog
+  (`signup → first_value → checkout_started → trial_started →
+  subscription_paid`) + a churn view off `subscription_cancelled`; and at 277
+  signups you're still small enough to **email/DM every non-converter and trial
+  drop-off** and ask why. That qualitative gold disappears at scale.
 - _Why:_ you can't optimize a funnel you can't see; this tells you the single
   highest-leverage thing to fix.
 
@@ -255,7 +274,8 @@ free-and-clear.
 ## Sequenced action plan (what to do, in what order)
 
 **Now (Stream 1, cheap, highest leverage):**
-1. Add PostHog + funnel instrumentation to `zerogex-web`.
+1. ✅ PostHog + funnel instrumentation added to `zerogex-web` (live as of
+   2026-06-16). Remaining: build the funnel + churn views in the PostHog UI.
 2. Manually email/DM non-converters and trial drop-offs.
 3. Start the free newsletter; publish the free delayed lead-magnet page.
 4. Stand up Discord; gate premium channels.
