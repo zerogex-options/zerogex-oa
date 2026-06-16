@@ -3164,6 +3164,73 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching session closes: {e}", exc_info=True)
             raise
 
+    async def has_todays_close_landed(self, symbol: str, asset_type: Optional[str]) -> bool:
+        """
+        Data-state gate for the session transition at the cash close.
+
+        Returns True iff the data layer has observed today's market close —
+        the same observable ``get_session_closes`` implicitly depends on to
+        return today (rather than yesterday) as ``current_session_close``.
+        The quote endpoint consults this before transitioning ``session``
+        from ``"open"`` to ``"after-hours"`` / ``"closed"`` so the two
+        endpoints can never disagree about whether today's close is
+        actually available.
+
+        Signal differs by asset type because the underlying data differs:
+
+        * Non-INDEX (SPY, QQQ, …): post-cash-close, AH trading starts
+          immediately.  The first AH tick at 16:00:01+ ET creates today's
+          ``16:00`` bucket.  Existence of any bar with time > '16:00' for
+          today is therefore an unambiguous "cash close has happened" signal
+          — and crucially it also implies the ``15:59`` closing-minute
+          bucket has had its ``close`` updated by the 16:00:00 tick, which
+          is exactly what ``get_session_closes`` reads as
+          ``current_session_close``.
+        * INDEX (SPX, NDX, …): no AH feed, so there is no equivalent
+          data-state signal.  The existing 30s soft-close window combined
+          with the price-stability heuristic in ``get_market_session``
+          already handles INDEX correctly (prices stabilize as soon as no
+          more cash-session ticks arrive), so return True unconditionally
+          here and let that path through.
+
+        Cached briefly (1s) per symbol.  During the lookup window between
+        16:00:00 ET and the moment the first AH bar lands, the worst case
+        is one DB hit per second per active symbol — negligible.
+        """
+        if asset_type == "INDEX":
+            return True
+
+        symbol = symbol.upper()
+        cache_key = f"todays_close_landed:{symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return bool(cached)
+
+        query = """
+            SELECT EXISTS(
+                SELECT 1 FROM underlying_quotes
+                WHERE symbol = $1
+                  AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
+                  AND (timestamp AT TIME ZONE 'America/New_York')::date
+                      = (NOW() AT TIME ZONE 'America/New_York')::date
+                  AND (timestamp AT TIME ZONE 'America/New_York')::time > '16:00'
+                  AND timestamp <= NOW()
+            ) AS exists
+        """
+
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(query, symbol)
+                result = bool(row["exists"]) if row else False
+                self._cache_set(cache_key, result, ttl_seconds=1.0)
+                return result
+        except Exception as e:
+            logger.error(f"Error checking today's close landing: {e}", exc_info=True)
+            # Fail-open: a DB error shouldn't strand the session in "open"
+            # forever.  Falling back to the pre-existing wall-clock-only
+            # behavior is the safe degradation path.
+            return True
+
     async def get_historical_quotes(
         self,
         symbol: str = "SPY",

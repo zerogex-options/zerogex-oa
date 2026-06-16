@@ -851,7 +851,11 @@ _soft_close_trackers: dict[str, _SoftCloseTracker] = {}
 _SOFT_CLOSE_TRACKER_MAX = 100  # prevent unbounded growth
 
 
-def get_market_session(asset_type: Optional[str], price_is_stable: bool = False) -> str:
+def get_market_session(
+    asset_type: Optional[str],
+    price_is_stable: bool = False,
+    close_data_available: bool = True,
+) -> str:
     """Return the current US equity market session label.
 
     Session boundaries (all times US/Eastern, exact to the second):
@@ -872,6 +876,17 @@ def get_market_session(asset_type: Optional[str], price_is_stable: bool = False)
 
       Both types
         09:30:00 – 15:59:59   open
+
+    ``close_data_available`` gates the wall-clock-driven transition out of
+    the cash session.  Wall-clock says "the market closed at 16:00 ET" but
+    the frontend's after-hours rendering pulls ``current_session_close``
+    from ``/api/market/session-closes`` — if today's close hasn't yet been
+    ingested when this endpoint flips ``session``, the two endpoints
+    disagree about reality and the header briefly renders yesterday's
+    daily change.  Gating the transition on the data layer's view of the
+    same observable keeps both endpoints structurally consistent: the
+    session label only advances once the close has been observed.  See
+    ``DatabaseClient.has_todays_close_landed`` for the signal definition.
     """
     now_et = datetime.now(_ET)
     today = now_et.date()
@@ -901,6 +916,14 @@ def get_market_session(asset_type: Optional[str], price_is_stable: bool = False)
 
     # Cash session — open for both types
     if market_open_dt <= now_et < market_close_dt:
+        return "open"
+
+    # Past wall-clock close.  Hold "open" until the data layer confirms
+    # today's close has been observed, so /api/market/quote and
+    # /api/market/session-closes can't disagree about whether today's
+    # close is available.  Once the gate opens, fall through to the
+    # existing post-close branches below.
+    if not close_data_available:
         return "open"
 
     # Soft-close window at market close
@@ -960,7 +983,10 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
         tracker = _soft_close_trackers.setdefault(symbol, _SoftCloseTracker())
         tracker.record(data.get("close"))
 
-        data["session"] = get_market_session(asset_type, tracker.is_stable())
+        close_data_available = await _db().has_todays_close_landed(symbol, asset_type)
+        data["session"] = get_market_session(
+            asset_type, tracker.is_stable(), close_data_available
+        )
         return UnderlyingQuote(**data)
     except HTTPException:
         raise
