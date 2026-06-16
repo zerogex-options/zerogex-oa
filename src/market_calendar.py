@@ -202,6 +202,24 @@ def is_market_hours(dt: Optional[datetime] = None, check_extended: bool = False)
     return market_open <= current_time <= market_close
 
 
+def is_rth_settled(dt: Optional[datetime] = None, settle_minutes: int = 30) -> bool:
+    """True iff ``dt`` (default: now) is within RTH (09:30–16:00 ET) AND at
+    least ``settle_minutes`` past the 09:30 ET open.
+
+    Used to gate "no data yet" diagnostics so that a worker restart in
+    the pre-market extended-hours window (04:00–09:30 ET) or in the
+    first few minutes after open doesn't false-positive when options
+    ingestion / analytics has legitimately not produced any rows yet.
+    Weekends and configured NYSE holidays always return False.
+    """
+    dt_et = _to_et(dt)
+    if dt_et.weekday() > 4 or dt_et.date() in NYSE_HOLIDAYS:
+        return False
+    open_dt = dt_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_dt = dt_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    return open_dt + timedelta(minutes=settle_minutes) <= dt_et <= close_dt
+
+
 def get_market_session(dt: Optional[datetime] = None) -> str:
     """Return the generic session label for ``dt``.
 

@@ -1,8 +1,10 @@
 """The "no flow_contract_facts rows in last 30 minutes" diagnostic must
 fire during the trading day (so a real ingestion gap surfaces in journal
-logs) but stay silent outside extended market hours (so an operator
-restart on a Friday evening / weekend / holiday doesn't re-fire the
-warning for every symbol when zero flow rows is the expected state).
+logs) but stay silent outside the settled RTH window (so an operator
+restart on a Friday evening / weekend / holiday — or during the
+04:00–10:00 ET pre-market grace window where SPY/QQQ options
+legitimately have no last-30-min rows — doesn't re-fire the warning for
+every symbol when zero flow rows is the expected state).
 """
 
 from __future__ import annotations
@@ -75,16 +77,16 @@ def _flow_missing_warnings(logger_mock) -> int:
     return count
 
 
-def test_flow_missing_warning_fires_during_market_hours(monkeypatch):
+def test_flow_missing_warning_fires_during_settled_rth(monkeypatch):
     use_module = _reload_engine(monkeypatch)
     eng = _make_engine(use_module, "SPY")
 
-    now = datetime(2026, 6, 5, 14, 35, tzinfo=timezone.utc)  # Fri 10:35 ET — RTH
+    now = datetime(2026, 6, 5, 14, 35, tzinfo=timezone.utc)  # Fri 10:35 ET — RTH, settled
     cursor = _stub_cursor_with_no_flow(now)
     conn = _stub_conn(cursor)
 
     with (
-        patch.object(use_module, "is_market_hours", return_value=True),
+        patch.object(use_module, "is_rth_settled", return_value=True),
         patch.object(use_module, "logger") as logger_mock,
     ):
         try:
@@ -95,7 +97,7 @@ def test_flow_missing_warning_fires_during_market_hours(monkeypatch):
             pass
 
     assert _flow_missing_warnings(logger_mock) == 1, (
-        "expected the flow-missing diagnostic to fire once during market hours; "
+        "expected the flow-missing diagnostic to fire once during settled RTH; "
         f"warning calls were: {logger_mock.warning.call_args_list!r}"
     )
     assert (
@@ -112,7 +114,7 @@ def test_flow_missing_warning_suppressed_when_market_closed(monkeypatch):
     conn = _stub_conn(cursor)
 
     with (
-        patch.object(use_module, "is_market_hours", return_value=False),
+        patch.object(use_module, "is_rth_settled", return_value=False),
         patch.object(use_module, "logger") as logger_mock,
     ):
         try:
@@ -127,6 +129,38 @@ def test_flow_missing_warning_suppressed_when_market_closed(monkeypatch):
     assert eng._flow_missing_logged.get("SPY") in (None, False), (
         "latch must NOT be set when the warning was suppressed, so a real "
         "ingestion gap at next market open still surfaces"
+    )
+
+
+def test_flow_missing_warning_suppressed_during_premarket_rth_grace(monkeypatch):
+    """A worker restart at 04:19 ET (extended hours, before the 10:00 ET
+    RTH-settled threshold) must NOT fire the flow-missing diagnostic.
+    SPY/QQQ options legitimately have no last-30-min rows pre-market;
+    the gate change protects against this false positive."""
+    use_module = _reload_engine(monkeypatch)
+    eng = _make_engine(use_module, "QQQ")
+
+    now = datetime(2026, 6, 16, 8, 19, tzinfo=timezone.utc)  # Tue 04:19 ET — pre-open
+    cursor = _stub_cursor_with_no_flow(now)
+    conn = _stub_conn(cursor)
+
+    # is_rth_settled() is wall-clock-anchored via datetime.now(ET); patch
+    # it to the deterministic pre-market state we want to exercise.
+    with (
+        patch.object(use_module, "is_rth_settled", return_value=False),
+        patch.object(use_module, "logger") as logger_mock,
+    ):
+        try:
+            eng._fetch_market_context(conn=conn)
+        except Exception:
+            pass
+
+    assert _flow_missing_warnings(logger_mock) == 0, (
+        "expected NO flow-missing diagnostic during the 04:00–10:00 ET RTH grace; "
+        f"warning calls were: {logger_mock.warning.call_args_list!r}"
+    )
+    assert eng._flow_missing_logged.get("QQQ") in (None, False), (
+        "latch must stay un-armed so a real ingestion gap once RTH settles " "still surfaces"
     )
 
 

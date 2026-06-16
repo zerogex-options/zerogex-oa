@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 from src.config import SIGNALS_GEX_STALE_BUFFER_SECONDS
 from src.database import db_connection
-from src.market_calendar import is_market_hours
+from src.market_calendar import is_rth_settled
 from src.signals.basic.dealer_delta_pressure import DealerDeltaPressureComponent
 from src.signals.components.base import MarketContext
 from src.signals.components.gamma_anchor import GammaAnchorComponent
@@ -782,18 +782,20 @@ class UnifiedSignalEngine:
                 # and similar signals, so surface it as a warning to make
                 # ingestion gaps visible.  Throttled to once per symbol
                 # per process via the dict; otherwise live signals would
-                # spam this log at 1Hz.  Skipped entirely outside extended
-                # market hours (04:00-20:00 ET, weekdays minus NYSE
-                # holidays): options ingestion legitimately produces no
-                # rows when the market is closed, so a restart after-hours
-                # would otherwise re-fire this warning for every symbol.
+                # spam this log at 1Hz.  Gated on ``is_rth_settled`` so a
+                # restart in the pre-market extended window (04:00–09:30
+                # ET) or the first 30 minutes after open doesn't
+                # false-positive: SPY/QQQ options legitimately have zero
+                # last-30-min rows until ~10:00 ET, and an after-hours
+                # restart on a weekend / holiday would otherwise re-fire
+                # this warning for every symbol.
                 if (
                     call_flow_delta == 0.0
                     and put_flow_delta == 0.0
                     and (sm_call or 0.0) == 0.0
                     and (sm_put or 0.0) == 0.0
                     and not self._flow_missing_logged.get(self.db_symbol)
-                    and is_market_hours(check_extended=True)
+                    and is_rth_settled()
                 ):
                     self._flow_missing_logged[self.db_symbol] = True
                     logger.warning(
@@ -1101,13 +1103,23 @@ class UnifiedSignalEngine:
                                 )
                                 # Clear the diag latch so a future failure re-logs.
                                 self._iv_rank_diag_logged[self.db_symbol] = False
-                            elif not self._iv_rank_diag_logged.get(self.db_symbol):
+                            elif (
+                                not self._iv_rank_diag_logged.get(self.db_symbol)
+                                and is_rth_settled()
+                            ):
                                 # daily_atm_iv is the data source — if a
                                 # window is empty, either the analytics
                                 # writer hasn't populated today (first
                                 # cycle after rollout) or the backfill
                                 # hasn't run yet.  Surface the components
                                 # so the operator can tell which.
+                                #
+                                # Gated on ``is_rth_settled`` so a
+                                # pre-market restart (04:00–10:00 ET)
+                                # doesn't false-positive — analytics
+                                # legitimately hasn't UPSERTed today's
+                                # row yet because no Greek-bearing
+                                # options data is flowing.
                                 self._iv_rank_diag_logged[self.db_symbol] = True
                                 logger.warning(
                                     "UnifiedSignalEngine [%s]: iv_rank read returned null components: "
