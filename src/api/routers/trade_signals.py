@@ -116,6 +116,7 @@ async def get_signal_history(
           "quantity_initial": 10, "quantity_open": 0,
           "realized_pnl": 330.0, "unrealized_pnl": 0.0, "total_pnl": 330.0,
           "pnl_percent": 27.05,
+          "pricing_mode": "debit",
           "outcome": "win"
         }
       ],
@@ -128,6 +129,9 @@ async def get_signal_history(
 
     - `portfolio_size` — from `SIGNALS_PORTFOLIO_SIZE` env var.
     - `outcome` — `"win"` (pnl > 0), `"loss"` (pnl < 0), or `"flat"`.
+    - `pricing_mode` — `"debit"` (held long: entry = premium paid, exit = sale
+      proceeds) or `"credit"` (held short: entry = premium received, exit =
+      buyback cost). Drives PnL sign and frontend labelling.
     - `win_rate` — 4-decimal fraction; `null` when no trades exist.
     - `score_at_entry` / `score_latest` — MSI composite values (0–100).
 
@@ -170,17 +174,20 @@ async def get_live_signals(db: DatabaseManager = Depends(get_db)):
           "entry_price": 1.22, "current_price": 1.55,
           "quantity_initial": 10, "quantity_open": 10,
           "realized_pnl": 0.0, "unrealized_pnl": 330.0, "total_pnl": 330.0,
-          "pnl_percent": 27.05
+          "pnl_percent": 27.05,
+          "pricing_mode": "debit"
         }
       ],
       "count": 1
     }
     ```
 
-    - `direction` — `"bullish"` | `"bearish"`.
+    - `direction` — `"bullish"` | `"bearish"` (regime view, not trade side).
     - `option_type` — `"call"` | `"put"`.
     - `score_at_entry` / `score_latest` — MSI composite values (0–100).
-    - `pnl_percent` — percentage of premium paid.
+    - `pnl_percent` — percentage of premium paid (debit) or received (credit).
+    - `pricing_mode` — `"debit"` (held long) or `"credit"` (held short).
+      Determines whether `current_price > entry_price` is a gain or a loss.
 
     **Page design.** Card grid: option symbol, direction chip, big P&L number
     (unrealized), MSI-at-entry vs latest delta with a color arrow.

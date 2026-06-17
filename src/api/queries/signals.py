@@ -893,7 +893,8 @@ class SignalsQueriesMixin:
                    status, direction, score_at_entry, score_latest,
                    option_symbol, option_type, expiration, strike,
                    entry_price, current_price, quantity_initial, quantity_open,
-                   realized_pnl, unrealized_pnl, total_pnl, pnl_percent
+                   realized_pnl, unrealized_pnl, total_pnl, pnl_percent,
+                   components_at_entry->'optimizer'->>'pricing_mode' AS pricing_mode
             FROM signal_trades
             WHERE status = 'open'
             ORDER BY opened_at DESC
@@ -913,6 +914,7 @@ class SignalsQueriesMixin:
                    option_symbol, option_type, expiration, strike,
                    entry_price, current_price, quantity_initial, quantity_open,
                    realized_pnl, unrealized_pnl, total_pnl, pnl_percent,
+                   components_at_entry->'optimizer'->>'pricing_mode' AS pricing_mode,
                    CASE WHEN total_pnl > 0 THEN 'win'
                         WHEN total_pnl < 0 THEN 'loss'
                         ELSE 'flat' END AS outcome
