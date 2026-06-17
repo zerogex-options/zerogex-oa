@@ -143,6 +143,42 @@ class _NonRetryableStreamError(Exception):
     that reader instead of hot-looping the identical doomed request."""
 
 
+class _RateLimitedStreamError(Exception):
+    """Raised when a stream endpoint returns 429. Carries the deterministic
+    sleep duration (``X-RateLimit-Reset`` + 0.5s cushion) the reader loop
+    sleeps before reopening — replaces the generic exponential backoff with
+    the server-prescribed wait. Mirrors the REST path at
+    ``TradeStationClient._retry_delay_for_429``.
+    """
+
+    def __init__(self, delay: float, message: str):
+        super().__init__(message)
+        self.delay = delay
+
+
+def _stream_retry_delay_for_429(response: Any, default_seconds: float = 30.0) -> float:
+    """Return the deterministic retry delay for a 429 stream response.
+
+    Prefers ``X-RateLimit-Reset`` (TradeStation's reset clock, the
+    documented source of truth); falls back to ``default_seconds`` when the
+    header is missing or malformed so the reader doesn't tight-loop on a
+    sustained cap. Hard-capped at 10 minutes so a bogus header can't strand
+    the reader. +0.5s cushion ensures we land AFTER the reset.
+    """
+    if response is not None:
+        try:
+            reset_raw = response.headers.get("X-RateLimit-Reset") or response.headers.get(
+                "x-ratelimit-reset"
+            )
+            if reset_raw is not None:
+                reset_seconds = int(reset_raw)
+                if reset_seconds >= 0:
+                    return min(reset_seconds + 0.5, 600.0)
+        except (ValueError, TypeError):
+            pass
+    return default_seconds
+
+
 # Possible field names for implied volatility across TradeStation payload variants
 _IV_FIELD_NAMES = ("ImpliedVolatility", "IV", "Volatility", "IVol")
 
@@ -424,6 +460,15 @@ class OptionStreamAccumulator:
                     e,
                 )
                 break
+            except _RateLimitedStreamError as e:
+                if self._running:
+                    # Deterministic delay from X-RateLimit-Reset — bypass the
+                    # exponential backoff and DO NOT increment consecutive_
+                    # failures: this isn't a transient network blip the
+                    # backoff curve is sized for, it's the server telling us
+                    # exactly when to come back.
+                    logger.warning("%s", e)
+                    _sleep_interruptible(e.delay, lambda: self._running)
             except Exception as e:
                 if self._running:
                     consecutive_failures += 1
@@ -468,6 +513,26 @@ class OptionStreamAccumulator:
                     f"{label} received 414 Request-URI Too Large for "
                     f"{len(chunk_symbols)} symbols. Reduce "
                     f"STREAM_QUOTES_MAX_SYMBOLS_PER_CONNECTION (currently {self._chunk_size})."
+                )
+
+            if response.status_code == 429:
+                # Rate limited. Use TradeStation's X-RateLimit-Reset as the
+                # deterministic sleep duration instead of the reader-loop's
+                # exponential backoff — exponential 2/4/8s reconnects against
+                # a server that has explicitly told us when to retry waste
+                # the budget and prolong the storm. Mirrors the REST handler
+                # at TradeStationClient._retry_delay_for_429.
+                delay = _stream_retry_delay_for_429(response)
+                reset = response.headers.get("X-RateLimit-Reset", "n/a")
+                resource = response.headers.get("X-RateLimit-Resource", "n/a")
+                response.close()
+                raise _RateLimitedStreamError(
+                    delay,
+                    f"{label} rate-limited (429); X-RateLimit-Reset={reset}, "
+                    f"X-RateLimit-Resource={resource}, sleeping {delay:.1f}s "
+                    f"before reopen. Sustained 429s indicate the streamed "
+                    f"symbol universe is too large for the per-account budget — "
+                    f"reduce INGEST_EXPIRATIONS / INGEST_STRIKE_COUNT_MAX.",
                 )
 
             response.raise_for_status()
@@ -763,6 +828,13 @@ class UnderlyingBarAccumulator:
                 self._read_stream()
                 if time.monotonic() - started >= _STREAM_RECONNECT_HEALTHY_SECONDS:
                     consecutive_failures = 0
+            except _RateLimitedStreamError as e:
+                if self._running:
+                    # See OptionStreamAccumulator._reader_loop — honor the
+                    # server-prescribed reset window instead of exponential
+                    # backoff; don't bump consecutive_failures.
+                    logger.warning("%s", e)
+                    _sleep_interruptible(e.delay, lambda: self._running)
             except Exception as e:
                 if self._running:
                     consecutive_failures += 1
@@ -803,6 +875,21 @@ class UnderlyingBarAccumulator:
                 )
                 self._client.auth.force_refresh_access_token()
                 return
+
+            if response.status_code == 429:
+                # See OptionStreamAccumulator._read_stream for the rationale —
+                # honor X-RateLimit-Reset instead of falling into the reader-
+                # loop's exponential backoff.
+                delay = _stream_retry_delay_for_429(response)
+                reset = response.headers.get("X-RateLimit-Reset", "n/a")
+                resource = response.headers.get("X-RateLimit-Resource", "n/a")
+                response.close()
+                raise _RateLimitedStreamError(
+                    delay,
+                    f"Underlying bar stream rate-limited (429); "
+                    f"X-RateLimit-Reset={reset}, X-RateLimit-Resource={resource}, "
+                    f"sleeping {delay:.1f}s before reopen.",
+                )
 
             response.raise_for_status()
         except Exception:
