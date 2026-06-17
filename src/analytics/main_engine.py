@@ -60,6 +60,7 @@ from src.market_calendar import (
     is_spx_am_settled_expiration,
     is_underlying_active_session,
     seconds_until_engine_run_window,
+    settlement_close_time_for_contract,
 )
 
 logger = get_logger(__name__)
@@ -1022,12 +1023,25 @@ class AnalyticsEngine:
     # the top of this module.  Kept as a method-style accessor so
     # existing ``self._calculate_time_to_expiration(...)`` call sites
     # keep working without touching dozens of lines of calc code.
-    # Anchors at the per-symbol settlement time (09:30 ET for SPX
-    # AM-settled monthlies, 16:00 ET for everything else) so the
-    # morning of an SPX 3rd-Friday doesn't carry ~6.5 hours of phantom
-    # time value into Greeks downstream.
-    def _calculate_time_to_expiration(self, current_date: datetime, expiration_date) -> float:
-        close_t = expiration_close_time_et(self.db_symbol, expiration_date)
+    # Anchors at the per-CONTRACT settlement time (09:30 ET for SPX
+    # AM-settled monthlies, 16:00 ET for everything else, including
+    # SPXW on a 3rd-Friday). The optional ``option_symbol`` lets the
+    # caller disambiguate when monthly chain expansion is on and SPX
+    # + SPXW share a 3rd-Friday date — without it, callers default to
+    # the 16:00 path EXCEPT when the canonical underlying alone is
+    # enough to settle the question (legacy single-chain path).
+    def _calculate_time_to_expiration(
+        self,
+        current_date: datetime,
+        expiration_date,
+        option_symbol: Optional[str] = None,
+    ) -> float:
+        if option_symbol is not None:
+            close_t = settlement_close_time_for_contract(
+                self.db_symbol, option_symbol, expiration_date
+            )
+        else:
+            close_t = expiration_close_time_et(self.db_symbol, expiration_date)
         return calculate_time_to_expiration(
             current_date, expiration_date, market_close_time=close_t
         )
@@ -1206,11 +1220,33 @@ class AnalyticsEngine:
 
         Net GEX = Call GEX - Put GEX
         """
-        # Cache time-to-expiration per expiration date to avoid redundant
-        # datetime arithmetic and scipy calls inside the inner loop.
+        # Cache time-to-expiration keyed by (expiration, close_time) so a
+        # 3rd-Friday under SPX monthly chain expansion gets one T for
+        # SPX (AM-settled, 09:30) and a separate T for SPXW (PM-settled,
+        # 16:00). Keying on expiration alone collapsed both contracts to
+        # the AM time and shorted the SPXW row's T by ~6.5h on expiry
+        # morning. The bucket below still aggregates same-strike calls
+        # across roots — dealer hedging is genuinely the union — but each
+        # contract's gamma now uses its own T.
         _tte_cache: Dict = {}
 
-        # Group by strike and expiration
+        def _tte_for(opt: Dict[str, Any]) -> float:
+            close_t = settlement_close_time_for_contract(
+                self.db_symbol, opt.get("option_symbol"), opt["expiration"]
+            )
+            cache_key = (opt["expiration"], close_t)
+            cached = _tte_cache.get(cache_key)
+            if cached is None:
+                cached = calculate_time_to_expiration(
+                    timestamp, opt["expiration"], market_close_time=close_t
+                )
+                _tte_cache[cache_key] = cached
+            return cached
+
+        # Group by strike and expiration. Same-strike contracts from
+        # different option roots (e.g. SPX + SPXW on a shared 3rd-Friday)
+        # still bucket together — that matches dealer hedging exposure —
+        # but the inner loop uses each contract's own settlement-aware T.
         strike_data = defaultdict(lambda: {"calls": [], "puts": []})  # type: ignore[var-annotated]
 
         for opt in options:
@@ -1242,19 +1278,13 @@ class AnalyticsEngine:
         gex_results = []
 
         for (strike, expiration), data in strike_data.items():
-            # T is the same for all options at this (strike, expiration), so
-            # cache it; resolved first so _gamma_at_spot can re-price below.
-            T = _tte_cache.get(expiration)
-            if T is None:
-                T = self._calculate_time_to_expiration(timestamp, expiration)
-                _tte_cache[expiration] = T
-
-            # Aggregate gamma by contract with OI weighting.
-            # Note: there is typically one call/put contract per strike+expiration,
-            # but we still compute this as a true weighted sum so the math remains
-            # correct if upstream snapshots ever include multiple rows.
+            # Aggregate gamma by contract with OI weighting. Each opt's T
+            # is resolved per-row via _tte_for so AM-settled SPX and PM-
+            # settled SPXW contracts at the same strike+expiration don't
+            # share a single (wrong-for-one-of-them) T.
             call_gamma = sum(
-                _gamma_at_spot(opt, strike, T) * opt["open_interest"] for opt in data["calls"]
+                _gamma_at_spot(opt, strike, _tte_for(opt)) * opt["open_interest"]
+                for opt in data["calls"]
             )
             call_oi = sum(opt["open_interest"] for opt in data["calls"])
             call_volume = sum(opt["volume"] for opt in data["calls"])
@@ -1263,7 +1293,8 @@ class AnalyticsEngine:
 
             # Calculate put GEX (negative for dealers)
             put_gamma = sum(
-                _gamma_at_spot(opt, strike, T) * opt["open_interest"] for opt in data["puts"]
+                _gamma_at_spot(opt, strike, _tte_for(opt)) * opt["open_interest"]
+                for opt in data["puts"]
             )
             put_oi = sum(opt["open_interest"] for opt in data["puts"])
             put_volume = sum(opt["volume"] for opt in data["puts"])
@@ -1294,14 +1325,15 @@ class AnalyticsEngine:
                 if iv is None or iv <= 0:
                     continue
 
+                T_opt = _tte_for(opt)
                 vanna = self._calculate_vanna(
-                    underlying_price, strike, T, self.risk_free_rate, iv, self.dividend_yield
+                    underlying_price, strike, T_opt, self.risk_free_rate, iv, self.dividend_yield
                 )
 
                 charm = self._calculate_charm(
                     underlying_price,
                     strike,
-                    T,
+                    T_opt,
                     self.risk_free_rate,
                     iv,
                     self.dividend_yield,
@@ -1539,6 +1571,9 @@ class AnalyticsEngine:
             return []
 
         r = self.risk_free_rate
+        # Settlement-aware TTE: key on (expiration, close_time) so SPX
+        # (AM-settled) and SPXW (PM-settled) contracts that share a
+        # 3rd-Friday don't collapse to a single (wrong-for-one) T.
         tte_cache: Dict = {}
         total = np.zeros_like(grid, dtype=float)
         used = False
@@ -1549,10 +1584,16 @@ class AnalyticsEngine:
             if sigma <= 0 or oi <= 0 or K <= 0:
                 continue
             expiration = opt["expiration"]
-            T = tte_cache.get(expiration)
+            close_t = settlement_close_time_for_contract(
+                self.db_symbol, opt.get("option_symbol"), expiration
+            )
+            cache_key = (expiration, close_t)
+            T = tte_cache.get(cache_key)
             if T is None:
-                T = self._calculate_time_to_expiration(timestamp, expiration)
-                tte_cache[expiration] = T
+                T = calculate_time_to_expiration(
+                    timestamp, expiration, market_close_time=close_t
+                )
+                tte_cache[cache_key] = T
             if T <= 0:
                 continue
             gamma = self._calculate_bs_gamma(grid, K, T, r, sigma, self.dividend_yield)
@@ -2311,10 +2352,16 @@ class AnalyticsEngine:
             expiration = opt.get("expiration")
             if expiration is None:
                 continue
-            T = tte_cache.get(expiration)
+            close_t = settlement_close_time_for_contract(
+                self.db_symbol, opt.get("option_symbol"), expiration
+            )
+            cache_key = (expiration, close_t)
+            T = tte_cache.get(cache_key)
             if T is None:
-                T = self._calculate_time_to_expiration(timestamp, expiration)
-                tte_cache[expiration] = T
+                T = calculate_time_to_expiration(
+                    timestamp, expiration, market_close_time=close_t
+                )
+                tte_cache[cache_key] = T
             if T <= 0:
                 continue
             dte = T * 365.0

@@ -14,7 +14,12 @@ from scipy import stats
 from datetime import datetime, date
 from typing import Dict, Any, Optional
 
-from src.market_calendar import ET, calculate_time_to_expiration, expiration_close_time_et
+from src.market_calendar import (
+    ET,
+    calculate_time_to_expiration,
+    expiration_close_time_et,
+    settlement_close_time_for_contract,
+)
 from src.utils import get_logger
 from src.config import RISK_FREE_RATE, DIVIDEND_YIELD, IMPLIED_VOLATILITY_DEFAULT
 from src.ingestion.iv_calculator import IVCalculator
@@ -88,25 +93,7 @@ class GreeksCalculator:
             current_date, expiration_date, market_close_time=market_close_time
         )
 
-    @staticmethod
-    def _settlement_close_time(
-        underlying_symbol: Optional[str],
-        option_symbol: Optional[str],
-        expiration: date,
-    ) -> str:
-        """Resolve the ET settlement time for a contract.
-
-        16:00 ET for everything except SPX AM-settled (3rd-Friday)
-        monthlies, which settle at the 09:30 ET SOQ.  SPXW (weekly)
-        shares the ``$SPX.X`` underlying but settles PM, so a leading
-        ``SPXW`` option-symbol prefix forces the 16:00 path.  Without a
-        usable underlying symbol we keep the legacy 16:00 default.
-        """
-        if not underlying_symbol:
-            return "16:00:00"
-        if (option_symbol or "").upper().startswith("SPXW"):
-            return "16:00:00"
-        return expiration_close_time_et(underlying_symbol, expiration)
+    _settlement_close_time = staticmethod(settlement_close_time_for_contract)
 
     def _calculate_d1_d2(
         self, S: float, K: float, T: float, r: float, sigma: float, q: float = 0.0

@@ -135,6 +135,27 @@ def expiration_close_time_et(symbol: str, expiration_date: date) -> str:
     return "16:00:00"
 
 
+def settlement_close_time_for_contract(
+    underlying_symbol: Optional[str],
+    option_symbol: Optional[str],
+    expiration: date,
+) -> str:
+    """Per-contract version of ``expiration_close_time_et``.
+
+    Picks the right ET close time given an option_symbol prefix, so
+    SPXW (PM-settled) and SPX (AM-settled) contracts that share an
+    underlying AND an expiration date (e.g. a 3rd-Friday under SPX
+    monthly chain expansion) get distinct close times.  Falls back to
+    16:00 ET when called without an underlying — the most common case
+    (equity ETFs / equities).
+    """
+    if not underlying_symbol:
+        return "16:00:00"
+    if (option_symbol or "").upper().startswith("SPXW"):
+        return "16:00:00"
+    return expiration_close_time_et(underlying_symbol, expiration)
+
+
 def calculate_time_to_expiration(
     current_date: datetime,
     expiration_date: date,

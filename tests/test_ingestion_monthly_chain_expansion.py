@@ -138,8 +138,15 @@ def test_monthly_off_by_default_preserves_legacy_behavior():
     assert all(mgr._expiration_underlying[d] == WEEKLY_TS for d in exps)
 
 
-def test_misconfigured_monthly_count_without_mapping_falls_back_to_weeklies(caplog):
-    """count > 0 but no monthly_underlying -> weekly only, with a warning."""
+def test_monthly_count_without_mapping_silently_uses_primary_chain(caplog):
+    """count > 0 but no monthly_underlying -> primary chain only, NO WARN.
+
+    The env var is a single global knob applied across every worker;
+    equity ETFs (SPY, QQQ, ...) share weeklies+monthlies on one chain
+    so the absence of a per-symbol mapping is the EXPECTED config for
+    them, not a misconfiguration. Emitting WARN per ETF worker on every
+    startup was actionable-looking noise.
+    """
     weekly = [date(2026, 6, 17), date(2026, 6, 19), date(2026, 6, 24)]
     with caplog.at_level("WARNING"):
         mgr = _build_manager(
@@ -150,11 +157,11 @@ def test_misconfigured_monthly_count_without_mapping_falls_back_to_weeklies(capl
             monthly_dates=[date(2026, 7, 17), date(2026, 8, 21)],
         )
 
-    # Init-time warning surfaces the misconfiguration to operators.
-    assert any(
-        "INGEST_MONTHLY_EXPIRATIONS" in rec.message and "monthly expansion DISABLED" in rec.message
+    # Init must NOT emit a warning here.
+    assert not any(
+        "INGEST_MONTHLY_EXPIRATIONS" in rec.message and rec.levelname == "WARNING"
         for rec in caplog.records
-    )
+    ), [rec.message for rec in caplog.records if rec.levelname == "WARNING"]
 
     exps = mgr._get_target_expirations()
     assert exps == weekly

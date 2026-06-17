@@ -1140,10 +1140,17 @@ class StreamManager:
                 resolve_option_root(self.monthly_underlying),
             )
         elif self.num_monthly_expirations > 0:
-            logger.warning(
-                "INGEST_MONTHLY_EXPIRATIONS=%d but no monthly_underlying mapped "
-                "for %s (set INGEST_MONTHLY_UNDERLYING_ALIASES); monthly "
-                "expansion DISABLED.",
+            # INGEST_MONTHLY_EXPIRATIONS is a single global knob applied to
+            # every worker, but only index underlyings (SPX, NDX, RUT, ...)
+            # actually have a separate AM-settled monthly chain. For equity
+            # ETFs (SPY, QQQ, IWM, ...) and most equities, monthlies share
+            # the primary chain and are already reachable via INGEST_EXPIRATIONS,
+            # so the absence of an INGEST_MONTHLY_UNDERLYING_ALIASES entry is
+            # the expected configuration -- DEBUG, not WARN.
+            logger.debug(
+                "INGEST_MONTHLY_EXPIRATIONS=%d set, but no monthly chain "
+                "mapped for %s -- monthlies (if any) come through the primary "
+                "chain.",
                 self.num_monthly_expirations,
                 self.db_underlying,
             )
