@@ -1067,12 +1067,14 @@ class StreamManager:
         # the same TS symbol — no second chain to layer in.
         if self.monthly_underlying == self.underlying:
             self.monthly_underlying = None
-        # Per-expiration lookup symbol. Populated by _get_target_expirations:
-        # weekly entries map to self.underlying, monthly entries to
-        # self.monthly_underlying. Read by _get_strikes_near_price and
+        # Per-expiration TS chain list. Populated by _get_target_expirations:
+        # weekly entries hold [self.underlying], monthly-only entries hold
+        # [self.monthly_underlying], and a date that appears in BOTH chains
+        # (e.g. Juneteenth-displaced SPX June OPEX falling on a SPXW
+        # weekly date) holds both. Read by _get_strikes_near_price and
         # _build_option_symbols so each expiration's strikes and option
-        # symbols come from the correct chain.
-        self._expiration_underlying: Dict[date, str] = {}
+        # symbols come from the correct chain(s).
+        self._expiration_underlying: Dict[date, List[str]] = {}
 
         # Track state
         self.current_price: Optional[float] = None
@@ -1336,12 +1338,16 @@ class StreamManager:
         Monthly chain expansion: when self.monthly_underlying is set and
         self.num_monthly_expirations > 0, additionally fetches the first N
         future expirations from that chain (e.g. "$SPX.X" for AM-settled
-        SPX monthlies) and merges them in. The monthly entries are recorded
-        in ``self._expiration_underlying`` so downstream strikes/symbol
-        construction routes through the correct chain root. The merged
-        list is returned sorted; dedupe is keyed on (date, ts_symbol) so a
-        weekly-vs-monthly chain that happen to share a date (rare but
-        possible) tracks both contracts.
+        SPX monthlies). When a monthly date COLLIDES with one already in
+        the primary (weekly) set, BOTH chains are tracked for that date
+        rather than the weekly winning -- the option_symbol root prefix
+        is the contract-level disambiguator and the two chains are
+        materially different contracts (e.g. on Juneteenth-affected
+        June 2026 OPEX the SPX monthly settles AM at 09:30 on Thu 6/18
+        while SPXW 6/18 is a regular PM-settled weekly). The mapping is
+        recorded in ``self._expiration_underlying`` so downstream
+        strikes/symbol construction can iterate per (date, ts_symbol)
+        pair.
         """
         self._expiration_underlying = {}
         try:
@@ -1351,9 +1357,10 @@ class StreamManager:
                 label="weekly",
             )
             for exp in primary:
-                self._expiration_underlying[exp] = self.underlying
+                self._expiration_underlying.setdefault(exp, []).append(self.underlying)
 
             monthly: List[date] = []
+            monthly_added = 0
             if self.num_monthly_expirations > 0 and self.monthly_underlying:
                 monthly = self._fetch_chain_expirations(
                     ts_symbol=self.monthly_underlying,
@@ -1361,19 +1368,21 @@ class StreamManager:
                     label="monthly",
                 )
                 for exp in monthly:
-                    # Weekly takes precedence on a date collision: same
-                    # date already wired to the primary chain stays there.
-                    # We log so an operator notices when the monthly N is
-                    # silently shrinking.
-                    if exp in self._expiration_underlying:
+                    chains = self._expiration_underlying.setdefault(exp, [])
+                    if self.monthly_underlying in chains:
+                        # The monthly chain already wired itself to this
+                        # date (only possible if the same TS symbol was
+                        # passed for both primary and monthly, which the
+                        # constructor already guards against -- log a
+                        # debug and move on instead of double-counting).
                         logger.debug(
-                            "Monthly expiration %s already covered by primary "
-                            "chain %s; skipping duplicate.",
+                            "Monthly chain %s already mapped to %s; skipping.",
+                            self.monthly_underlying,
                             exp,
-                            self.underlying,
                         )
                         continue
-                    self._expiration_underlying[exp] = self.monthly_underlying
+                    chains.append(self.monthly_underlying)
+                    monthly_added += 1
 
             if not self._expiration_underlying:
                 if primary or monthly:
@@ -1381,12 +1390,19 @@ class StreamManager:
                 return []
 
             target_exps = sorted(self._expiration_underlying.keys())
-            logger.info(
-                "Target expirations (%d weekly + %d monthly): %s",
-                len(primary),
-                len([e for e in target_exps if self._expiration_underlying[e] != self.underlying]),
-                [str(exp) for exp in target_exps],
-            )
+            if self.num_monthly_expirations > 0 and self.monthly_underlying:
+                logger.info(
+                    "Target expirations (%d weekly + %d monthly): %s",
+                    len(primary),
+                    monthly_added,
+                    [str(exp) for exp in target_exps],
+                )
+            else:
+                logger.info(
+                    "Target expirations (%d): %s",
+                    len(primary),
+                    [str(exp) for exp in target_exps],
+                )
             return target_exps
 
         except Exception as e:
@@ -1416,7 +1432,12 @@ class StreamManager:
             return []
         return future[:limit]
 
-    def _get_strikes_near_price(self, expiration: date, current_price: float) -> List[float]:
+    def _get_strikes_near_price(
+        self,
+        expiration: date,
+        current_price: float,
+        ts_symbol: Optional[str] = None,
+    ) -> List[float]:
         """Get strikes within ±strike_pct_range% of spot, capped at strike_count_max.
 
         Selection is two-step: first filter to the percentage band around
@@ -1427,9 +1448,13 @@ class StreamManager:
         The strikes endpoint is queried under the per-expiration TS chain
         symbol so monthly expirations (mapped to a different chain root
         via INGEST_MONTHLY_UNDERLYING_ALIASES) fetch their own chain's
-        strike grid rather than the primary chain's.
+        strike grid rather than the primary chain's. When the caller
+        doesn't pass ``ts_symbol`` (legacy callsites), use the first
+        chain registered for this expiration in ``_expiration_underlying``.
         """
-        ts_symbol = self._expiration_underlying.get(expiration, self.underlying)
+        if ts_symbol is None:
+            chains = self._expiration_underlying.get(expiration, [self.underlying])
+            ts_symbol = chains[0] if chains else self.underlying
         try:
             exp_str = expiration.strftime("%m-%d-%Y")
             all_strikes = self.client.get_option_strikes(ts_symbol, expiration=exp_str)
@@ -1471,11 +1496,12 @@ class StreamManager:
     def _build_option_symbols(self) -> List[str]:
         """Build list of option symbols to track and pre-parse metadata.
 
-        Each expiration's option symbols are built under its mapped TS
-        chain (see ``self._expiration_underlying``), so monthly chain
-        expirations resolve through ``resolve_option_root`` against the
-        monthly TS symbol (e.g. ``$SPX.X`` -> ``SPX``) instead of the
-        primary one (e.g. ``$SPXW.X`` -> ``SPXW``).
+        Iterates per (expiration, ts_chain) pair so dates with both a
+        weekly and a monthly chain entry (e.g. Juneteenth-displaced
+        SPX June OPEX falling on a Thursday SPXW weekly date) produce
+        BOTH sets of option_symbols. The root prefix
+        (``resolve_option_root`` against each chain's TS symbol) is the
+        contract-level disambiguator.
         """
         if not self.current_price:
             logger.warning("No current price, cannot build option symbols")
@@ -1487,22 +1513,29 @@ class StreamManager:
         self._symbol_metadata = {}
 
         for expiration in self.target_expirations:
-            strikes = self._get_strikes_near_price(expiration, self.current_price)
-            self.all_tracked_strikes[expiration] = set(strikes)
-            ts_symbol = self._expiration_underlying.get(expiration, self.underlying)
+            ts_chains = self._expiration_underlying.get(expiration, [self.underlying])
+            union_strikes: set = set()
 
-            for strike in strikes:
-                for opt_type in ("C", "P"):
-                    symbol = self.client.build_option_symbol(
-                        ts_symbol, expiration, opt_type, strike
-                    )
-                    option_symbols.append(symbol)
-                    self.tracked_strikes.add(strike)
-                    self._symbol_metadata[symbol] = {
-                        "strike": strike,
-                        "expiration": expiration,
-                        "option_type": opt_type,
-                    }
+            for ts_symbol in ts_chains:
+                strikes = self._get_strikes_near_price(
+                    expiration, self.current_price, ts_symbol=ts_symbol
+                )
+                union_strikes.update(strikes)
+
+                for strike in strikes:
+                    for opt_type in ("C", "P"):
+                        symbol = self.client.build_option_symbol(
+                            ts_symbol, expiration, opt_type, strike
+                        )
+                        option_symbols.append(symbol)
+                        self.tracked_strikes.add(strike)
+                        self._symbol_metadata[symbol] = {
+                            "strike": strike,
+                            "expiration": expiration,
+                            "option_type": opt_type,
+                        }
+
+            self.all_tracked_strikes[expiration] = union_strikes
 
         logger.info(f"Built {len(option_symbols)} option symbols to track")
         return option_symbols

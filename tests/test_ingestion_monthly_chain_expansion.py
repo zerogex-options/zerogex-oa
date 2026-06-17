@@ -92,7 +92,7 @@ def _build_manager(
 
 
 def test_monthly_expirations_layered_on_top_of_weeklies():
-    """3 weeklies + 2 monthlies -> 5 distinct dates, monthlies tagged with $SPX.X."""
+    """3 weeklies + 2 monthlies layered. Collision date tracks BOTH chains."""
     weekly = [date(2026, 6, 17), date(2026, 6, 19), date(2026, 6, 24)]
     monthly = [date(2026, 6, 19), date(2026, 7, 17), date(2026, 8, 21)]
     mgr = _build_manager(
@@ -105,19 +105,19 @@ def test_monthly_expirations_layered_on_top_of_weeklies():
 
     exps = mgr._get_target_expirations()
 
-    # 3 weekly + 2 monthly, minus 1 collision (2026-06-19) covered by weekly first.
-    expected = sorted(set(weekly) | set(monthly[:2]))
-    assert exps == expected
+    expected_dates = sorted(set(weekly) | set(monthly[:2]))
+    assert exps == expected_dates
 
-    # Weekly dates route to the primary chain symbol.
-    for d in weekly:
-        assert mgr._expiration_underlying[d] == WEEKLY_TS, d
+    # Pure-weekly dates: only the primary chain mapped.
+    assert mgr._expiration_underlying[date(2026, 6, 17)] == [WEEKLY_TS]
+    assert mgr._expiration_underlying[date(2026, 6, 24)] == [WEEKLY_TS]
 
-    # Monthly-only date routes to the monthly chain symbol.
-    assert mgr._expiration_underlying[date(2026, 7, 17)] == MONTHLY_TS
+    # Pure-monthly date: only the monthly chain mapped.
+    assert mgr._expiration_underlying[date(2026, 7, 17)] == [MONTHLY_TS]
 
-    # Collision: weekly takes precedence on shared dates.
-    assert mgr._expiration_underlying[date(2026, 6, 19)] == WEEKLY_TS
+    # Collision date (e.g. Juneteenth-displaced SPX June OPEX falling on
+    # a SPXW weekly): BOTH chains are tracked so both contracts ingest.
+    assert mgr._expiration_underlying[date(2026, 6, 19)] == [WEEKLY_TS, MONTHLY_TS]
 
 
 def test_monthly_off_by_default_preserves_legacy_behavior():
@@ -135,7 +135,7 @@ def test_monthly_off_by_default_preserves_legacy_behavior():
     exps = mgr._get_target_expirations()
 
     assert exps == weekly
-    assert all(mgr._expiration_underlying[d] == WEEKLY_TS for d in exps)
+    assert all(mgr._expiration_underlying[d] == [WEEKLY_TS] for d in exps)
 
 
 def test_monthly_count_without_mapping_silently_uses_primary_chain(caplog):
@@ -165,7 +165,36 @@ def test_monthly_count_without_mapping_silently_uses_primary_chain(caplog):
 
     exps = mgr._get_target_expirations()
     assert exps == weekly
-    assert all(mgr._expiration_underlying[d] == WEEKLY_TS for d in exps)
+    assert all(mgr._expiration_underlying[d] == [WEEKLY_TS] for d in exps)
+
+
+def test_collision_date_produces_both_chain_option_symbols():
+    """Regression: 2026-06-18 is both a SPXW weekly and (Juneteenth-displaced)
+    SPX June 2026 monthly OPEX. Both must yield contracts -- earlier code
+    deduped and dropped the AM-settled monthly OPEX, the exact contract
+    the user most needs ingested during OPEX week."""
+    shared = date(2026, 6, 18)
+    weekly = [date(2026, 6, 17), shared, date(2026, 6, 22)]
+    monthly = [shared, date(2026, 7, 17), date(2026, 8, 21)]
+    mgr = _build_manager(
+        num_expirations=3,
+        num_monthly_expirations=3,
+        monthly_underlying=MONTHLY_TS,
+        weekly_dates=weekly,
+        monthly_dates=monthly,
+        strikes=[5050.0],
+    )
+
+    mgr.target_expirations = mgr._get_target_expirations()
+    syms = mgr._build_option_symbols()
+
+    # On 2026-06-18 we must have BOTH SPXW and SPX option symbols.
+    shared_weekly = [s for s in syms if "260618" in s and s.startswith("SPXW ")]
+    shared_monthly = [s for s in syms if "260618" in s and s.startswith("SPX ") and not s.startswith("SPXW ")]
+    assert shared_weekly, syms
+    assert shared_monthly, syms
+    assert len(shared_weekly) == 2  # C + P
+    assert len(shared_monthly) == 2
 
 
 def test_option_symbols_use_chain_root_per_expiration():
