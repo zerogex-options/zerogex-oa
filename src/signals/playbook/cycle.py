@@ -258,6 +258,43 @@ def insert_action_card_sync(conn, card: dict[str, Any]) -> None:
         logger.warning("insert_action_card_sync failed (%s): %s", card.get("pattern"), exc)
 
 
+def _classify_and_persist_regime(ctx: PlaybookContext, conn) -> None:
+    """Run the Copilot regime classifier and persist its output.
+
+    Best-effort: any failure is swallowed so a Copilot bug can never
+    break the signal cycle. Imports are local so the cycle module stays
+    importable when ``src.copilot`` is absent (e.g. in slim test envs).
+    """
+    if conn is None:
+        return
+    try:
+        from src.copilot.regime_narrative import classify_regime
+        from src.copilot.persistence import (
+            insert_regime_narrative_sync,
+            query_max_pain_convergence_sync,
+            query_prior_regime_sync,
+            query_realized_vol_30m_sync,
+            query_vix_change_pct_sync,
+        )
+
+        symbol = ctx.underlying
+        prior = query_prior_regime_sync(conn, symbol)
+        vix_change_pct = query_vix_change_pct_sync(conn)
+        realized_vol_30m = query_realized_vol_30m_sync(conn, symbol)
+        convergence = query_max_pain_convergence_sync(conn, symbol)
+
+        narrative = classify_regime(
+            ctx,
+            prior=prior,
+            vix_change_pct=vix_change_pct,
+            realized_vol_30m=realized_vol_30m,
+            max_pain_convergence=convergence,
+        )
+        insert_regime_narrative_sync(conn, narrative)
+    except Exception as exc:
+        logger.warning("Copilot regime classification skipped: %s", exc)
+
+
 def evaluate_and_persist(
     *,
     engine: PlaybookEngine,
@@ -280,6 +317,7 @@ def evaluate_and_persist(
         conn=conn,
         underlying=getattr(market_context, "underlying", None),
     )
+    _classify_and_persist_regime(ctx, conn)
     card = engine.evaluate(ctx)
     if conn is not None:
         insert_action_card_sync(conn, card.to_dict())

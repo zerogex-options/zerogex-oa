@@ -1902,3 +1902,49 @@ CREATE TABLE IF NOT EXISTS daily_atm_iv (
 
 CREATE INDEX IF NOT EXISTS idx_daily_atm_iv_underlying_date
     ON daily_atm_iv(underlying, trading_date DESC);
+
+-- =============================================================================
+-- Copilot — regime_narratives
+-- One row per analytics cycle, per symbol. Translates the internal MSI regime
+-- + GEX posture into a novice-comprehensible label with a confidence score
+-- and an audit-trail inputs snapshot. See docs/design/gex_copilot_architecture.md.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS regime_narratives (
+    id           BIGSERIAL PRIMARY KEY,
+    underlying   VARCHAR(10) NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    timestamp    TIMESTAMPTZ NOT NULL,
+    label        VARCHAR(32) NOT NULL,
+    confidence   DOUBLE PRECISION NOT NULL,
+    spot         DOUBLE PRECISION NOT NULL,
+    msi_regime   VARCHAR(32) NOT NULL,
+    payload      JSONB NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_regime_narratives_underlying_ts
+    ON regime_narratives(underlying, timestamp DESC);
+
+-- =============================================================================
+-- Copilot — novice_cards
+-- NoviceCard wrapper around ActionCard with plain-English thesis, dollar risk,
+-- invalidation, lifecycle. Status updated by an analytics-cycle hook.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS novice_cards (
+    card_id              UUID PRIMARY KEY,
+    underlying           VARCHAR(10) NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    pattern_id           VARCHAR(64) NOT NULL,
+    emitted_at           TIMESTAMPTZ NOT NULL,
+    expires_at           TIMESTAMPTZ NOT NULL,
+    status               VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',
+    regime_label         VARCHAR(32) NOT NULL,
+    regime_confidence    DOUBLE PRECISION NOT NULL,
+    action_card          JSONB NOT NULL,
+    novice_fields        JSONB NOT NULL,
+    closed_at            TIMESTAMPTZ,
+    realized_pnl_dollars DOUBLE PRECISION
+);
+
+CREATE INDEX IF NOT EXISTS idx_novice_cards_underlying_emitted
+    ON novice_cards(underlying, emitted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_novice_cards_active
+    ON novice_cards(status) WHERE status = 'ACTIVE';

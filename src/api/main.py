@@ -292,6 +292,13 @@ app.include_router(gex_flip_horizon_router, dependencies=[_scope_gex])
 app.include_router(option_contract_router, dependencies=[_scope_market_raw])
 app.include_router(option_calculator_router, dependencies=[_scope_market_raw])
 
+# Copilot — novice-facing chat + regime narrative endpoints. Treated as
+# a signals-tier feature; the agent loop only reaches read-only data
+# through the bounded tool catalog defined in src/copilot/grounding_tools.py.
+from .routers.copilot import router as copilot_router  # noqa: E402
+
+app.include_router(copilot_router, dependencies=[_scope_signals])
+
 # ============================================================================
 # Health Check
 # ============================================================================
