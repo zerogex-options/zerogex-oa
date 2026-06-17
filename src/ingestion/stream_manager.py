@@ -35,7 +35,7 @@ from src.validation import (
     get_market_session,
     underlying_feed_expected,
 )
-from src.symbols import resolve_option_root, is_cash_index
+from src.symbols import resolve_option_root, is_cash_index, resolve_monthly_underlying
 from src.market_calendar import is_underlying_active_session
 from src.config import (
     _getenv_str,
@@ -1027,6 +1027,8 @@ class StreamManager:
         num_expirations: int = 3,
         strike_count_max: int = 40,
         strike_pct_range: float = 3.0,
+        num_monthly_expirations: int = 0,
+        monthly_underlying: Optional[str] = None,
     ):
         """Initialize stream manager"""
         self.client = client
@@ -1045,6 +1047,32 @@ class StreamManager:
         # result exceeds strike_count_max (hard ceiling, total per expiration).
         self.strike_count_max = strike_count_max
         self.strike_pct_range = strike_pct_range
+
+        # Monthly chain expansion. When num_monthly_expirations > 0 AND
+        # monthly_underlying resolves to a distinct TS symbol, the engine
+        # ALSO fetches expirations/strikes from that chain and tracks the
+        # quotes alongside the primary (weekly) ones. Used for index
+        # underlyings whose AM-settled monthlies live under a different
+        # chain root than the weekly listing (SPX vs SPXW, NDX vs NDXP,
+        # etc.) and would otherwise never be ingested regardless of how
+        # large INGEST_EXPIRATIONS is set. A canonical DB row keys both
+        # streams under the same self.db_underlying so downstream signal
+        # math sees one universe; the option_symbol root prefix is the
+        # only differentiator at the row level.
+        self.num_monthly_expirations = max(0, int(num_monthly_expirations))
+        self.monthly_underlying = (
+            monthly_underlying.upper() if monthly_underlying else None
+        )
+        # Treat the monthly chain as inactive when it would just re-fetch
+        # the same TS symbol — no second chain to layer in.
+        if self.monthly_underlying == self.underlying:
+            self.monthly_underlying = None
+        # Per-expiration lookup symbol. Populated by _get_target_expirations:
+        # weekly entries map to self.underlying, monthly entries to
+        # self.monthly_underlying. Read by _get_strikes_near_price and
+        # _build_option_symbols so each expiration's strikes and option
+        # symbols come from the correct chain.
+        self._expiration_underlying: Dict[date, str] = {}
 
         # Track state
         self.current_price: Optional[float] = None
@@ -1103,6 +1131,22 @@ class StreamManager:
             f"Config: {num_expirations} expirations, "
             f"±{strike_pct_range}% strike band (max {strike_count_max} strikes/exp)"
         )
+        if self.num_monthly_expirations > 0 and self.monthly_underlying:
+            logger.info(
+                "Monthly chain expansion ENABLED: +%d expirations from %s "
+                "(option_root=%s)",
+                self.num_monthly_expirations,
+                self.monthly_underlying,
+                resolve_option_root(self.monthly_underlying),
+            )
+        elif self.num_monthly_expirations > 0:
+            logger.warning(
+                "INGEST_MONTHLY_EXPIRATIONS=%d but no monthly_underlying mapped "
+                "for %s (set INGEST_MONTHLY_UNDERLYING_ALIASES); monthly "
+                "expansion DISABLED.",
+                self.num_monthly_expirations,
+                self.db_underlying,
+            )
         logger.info(
             "Option REST seed on strike recalibration: %s",
             "enabled" if self.seed_rest_on_recalc else "disabled",
@@ -1281,31 +1325,89 @@ class StreamManager:
         For SPX weekly options: use SYMBOL_ALIASES=SPX=$SPXW.X (not $SPX.X) so that
         expirations and strikes are fetched under $SPXW.X, then set
         OPTION_ROOT_ALIASES=$SPXW.X=SPXW so quotes are built as "SPXW 260320C6630".
+
+        Monthly chain expansion: when self.monthly_underlying is set and
+        self.num_monthly_expirations > 0, additionally fetches the first N
+        future expirations from that chain (e.g. "$SPX.X" for AM-settled
+        SPX monthlies) and merges them in. The monthly entries are recorded
+        in ``self._expiration_underlying`` so downstream strikes/symbol
+        construction routes through the correct chain root. The merged
+        list is returned sorted; dedupe is keyed on (date, ts_symbol) so a
+        weekly-vs-monthly chain that happen to share a date (rare but
+        possible) tracks both contracts.
         """
+        self._expiration_underlying = {}
         try:
-            all_expirations = self.client.get_option_expirations(self.underlying)
+            primary = self._fetch_chain_expirations(
+                ts_symbol=self.underlying,
+                limit=self.num_expirations,
+                label="weekly",
+            )
+            for exp in primary:
+                self._expiration_underlying[exp] = self.underlying
 
-            if not all_expirations:
-                logger.warning(f"No expirations found for {self.underlying}")
+            monthly: List[date] = []
+            if self.num_monthly_expirations > 0 and self.monthly_underlying:
+                monthly = self._fetch_chain_expirations(
+                    ts_symbol=self.monthly_underlying,
+                    limit=self.num_monthly_expirations,
+                    label="monthly",
+                )
+                for exp in monthly:
+                    # Weekly takes precedence on a date collision: same
+                    # date already wired to the primary chain stays there.
+                    # We log so an operator notices when the monthly N is
+                    # silently shrinking.
+                    if exp in self._expiration_underlying:
+                        logger.debug(
+                            "Monthly expiration %s already covered by primary "
+                            "chain %s; skipping duplicate.",
+                            exp,
+                            self.underlying,
+                        )
+                        continue
+                    self._expiration_underlying[exp] = self.monthly_underlying
+
+            if not self._expiration_underlying:
+                if primary or monthly:
+                    logger.warning("All resolved expirations filtered out")
                 return []
 
-            # Filter to future expirations
-            today = date.today()
-            future_expirations = [exp for exp in all_expirations if exp >= today]
-
-            if not future_expirations:
-                logger.warning("No future expirations available")
-                return []
-
-            # Take first N
-            target_exps = future_expirations[: self.num_expirations]
-
-            logger.info(f"Target expirations: {[str(exp) for exp in target_exps]}")
+            target_exps = sorted(self._expiration_underlying.keys())
+            logger.info(
+                "Target expirations (%d weekly + %d monthly): %s",
+                len(primary),
+                len([e for e in target_exps if self._expiration_underlying[e] != self.underlying]),
+                [str(exp) for exp in target_exps],
+            )
             return target_exps
 
         except Exception as e:
             logger.error(f"Error fetching expirations: {e}", exc_info=True)
             return []
+
+    def _fetch_chain_expirations(
+        self, ts_symbol: str, limit: int, label: str
+    ) -> List[date]:
+        """Fetch the first N future expirations for a TS chain symbol.
+
+        Isolated from ``_get_target_expirations`` so the same logic
+        applies to both the primary (weekly) and the monthly chain.
+        """
+        if limit <= 0:
+            return []
+        all_expirations = self.client.get_option_expirations(ts_symbol)
+        if not all_expirations:
+            logger.warning(
+                "No %s expirations found for %s", label, ts_symbol
+            )
+            return []
+        today = date.today()
+        future = [exp for exp in all_expirations if exp >= today]
+        if not future:
+            logger.warning("No future %s expirations available for %s", label, ts_symbol)
+            return []
+        return future[:limit]
 
     def _get_strikes_near_price(self, expiration: date, current_price: float) -> List[float]:
         """Get strikes within ±strike_pct_range% of spot, capped at strike_count_max.
@@ -1314,13 +1416,19 @@ class StreamManager:
         spot, then if the band still holds more strikes than
         ``strike_count_max`` trim from the furthest-from-spot strikes inward
         until the count fits.
+
+        The strikes endpoint is queried under the per-expiration TS chain
+        symbol so monthly expirations (mapped to a different chain root
+        via INGEST_MONTHLY_UNDERLYING_ALIASES) fetch their own chain's
+        strike grid rather than the primary chain's.
         """
+        ts_symbol = self._expiration_underlying.get(expiration, self.underlying)
         try:
             exp_str = expiration.strftime("%m-%d-%Y")
-            all_strikes = self.client.get_option_strikes(self.underlying, expiration=exp_str)
+            all_strikes = self.client.get_option_strikes(ts_symbol, expiration=exp_str)
 
             if not all_strikes:
-                logger.warning(f"No strikes found for exp {exp_str}")
+                logger.warning(f"No strikes found for exp {exp_str} ({ts_symbol})")
                 return []
 
             pct = self.strike_pct_range / 100.0
@@ -1339,7 +1447,7 @@ class StreamManager:
             above = len(nearby_strikes) - below
 
             log_msg = (
-                f"Exp {exp_str}: {len(nearby_strikes)} strikes "
+                f"Exp {exp_str} ({ts_symbol}): {len(nearby_strikes)} strikes "
                 f"({below} below, {above} above ${current_price:.2f}) "
                 f"within ±{self.strike_pct_range}% [{low:.2f}, {high:.2f}]"
             )
@@ -1354,7 +1462,14 @@ class StreamManager:
             return []
 
     def _build_option_symbols(self) -> List[str]:
-        """Build list of option symbols to track and pre-parse metadata."""
+        """Build list of option symbols to track and pre-parse metadata.
+
+        Each expiration's option symbols are built under its mapped TS
+        chain (see ``self._expiration_underlying``), so monthly chain
+        expirations resolve through ``resolve_option_root`` against the
+        monthly TS symbol (e.g. ``$SPX.X`` -> ``SPX``) instead of the
+        primary one (e.g. ``$SPXW.X`` -> ``SPXW``).
+        """
         if not self.current_price:
             logger.warning("No current price, cannot build option symbols")
             return []
@@ -1367,11 +1482,12 @@ class StreamManager:
         for expiration in self.target_expirations:
             strikes = self._get_strikes_near_price(expiration, self.current_price)
             self.all_tracked_strikes[expiration] = set(strikes)
+            ts_symbol = self._expiration_underlying.get(expiration, self.underlying)
 
             for strike in strikes:
                 for opt_type in ("C", "P"):
                     symbol = self.client.build_option_symbol(
-                        self.underlying, expiration, opt_type, strike
+                        ts_symbol, expiration, opt_type, strike
                     )
                     option_symbols.append(symbol)
                     self.tracked_strikes.add(strike)
@@ -2254,6 +2370,15 @@ def main():
         help="Number of expirations to track (default: 3)",
     )
     parser.add_argument(
+        "--monthly-expirations",
+        type=int,
+        default=_getenv_int("INGEST_MONTHLY_EXPIRATIONS", 0),
+        help=(
+            "Extra monthly expirations to ALSO track from the chain mapped "
+            "by INGEST_MONTHLY_UNDERLYING_ALIASES (default: 0)."
+        ),
+    )
+    parser.add_argument(
         "--strike-count-max",
         type=int,
         default=_getenv_int("INGEST_STRIKE_COUNT_MAX", 40),
@@ -2278,11 +2403,26 @@ def main():
 
         set_log_level("DEBUG")
 
+    # Resolve aliases (so --underlying SPX still finds INGEST_MONTHLY_UNDERLYING_ALIASES).
+    from src.symbols import resolve_symbol, get_canonical_symbol
+
+    ts_underlying = resolve_symbol(args.underlying)
+    db_underlying = get_canonical_symbol(ts_underlying) or args.underlying.upper()
+    monthly_ts = resolve_monthly_underlying(db_underlying)
+
     print("\n" + "=" * 80)
     print("STREAM MANAGER - STANDALONE TEST")
     print("=" * 80)
-    print(f"Underlying: {args.underlying}")
+    print(f"Underlying: {args.underlying} (TS: {ts_underlying}, DB: {db_underlying})")
     print(f"Expirations: {args.expirations}")
+    if args.monthly_expirations > 0 and monthly_ts:
+        print(f"Monthly Expirations: +{args.monthly_expirations} from {monthly_ts}")
+    elif args.monthly_expirations > 0:
+        print(
+            f"Monthly Expirations: +{args.monthly_expirations} requested "
+            f"but no INGEST_MONTHLY_UNDERLYING_ALIASES entry for {db_underlying} "
+            "-- expansion disabled."
+        )
     print(f"Strike Pct Range: ±{args.strike_pct_range}%")
     print(f"Strike Count Max: {args.strike_count_max} per expiration")
     if args.max_iterations:
@@ -2302,10 +2442,13 @@ def main():
     # Initialize stream manager
     manager = StreamManager(
         client=client,
-        underlying=args.underlying,
+        underlying=ts_underlying,
+        db_underlying=db_underlying,
         num_expirations=args.expirations,
         strike_count_max=args.strike_count_max,
         strike_pct_range=args.strike_pct_range,
+        num_monthly_expirations=args.monthly_expirations,
+        monthly_underlying=monthly_ts,
     )
 
     # Initialize

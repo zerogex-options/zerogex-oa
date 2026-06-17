@@ -131,3 +131,34 @@ def resolve_option_root(underlying: str) -> str:
 
     option_roots = get_option_root_aliases()
     return option_roots.get(normalized, normalized)
+
+
+def get_monthly_underlying_aliases() -> Dict[str, str]:
+    """Return canonical-symbol -> TS-monthly-chain-symbol mapping.
+
+    Source: ``INGEST_MONTHLY_UNDERLYING_ALIASES`` (same KEY=VAL,KEY2=VAL2
+    format as ``SYMBOL_ALIASES``).
+
+    Index options are listed under TWO separate TradeStation chains: the
+    weekly PM-settled chain (e.g. ``$SPXW.X`` -> root ``SPXW``) and the
+    monthly AM-settled chain (e.g. ``$SPX.X`` -> root ``SPX``). The primary
+    weekly chain is wired via ``SYMBOL_ALIASES`` + ``OPTION_ROOT_ALIASES``;
+    this map tells the ingestion engine which TS symbol to query for the
+    *monthly* expansion when ``INGEST_MONTHLY_EXPIRATIONS`` > 0.
+
+    Example: ``INGEST_MONTHLY_UNDERLYING_ALIASES=SPX=$SPX.X,NDX=$NDX.X``
+    """
+    return _parse_alias_mapping(os.getenv("INGEST_MONTHLY_UNDERLYING_ALIASES", ""))
+
+
+def resolve_monthly_underlying(canonical_symbol: str) -> str | None:
+    """Return the TS symbol used to query the monthly chain, or None.
+
+    ``canonical_symbol`` is the user-facing alias (e.g. ``SPX``), NOT the
+    TS symbol. Returns None when no monthly chain is mapped — the caller
+    should skip the monthly expansion in that case.
+    """
+    normalized = (canonical_symbol or "").strip().upper()
+    if not normalized:
+        return None
+    return get_monthly_underlying_aliases().get(normalized)

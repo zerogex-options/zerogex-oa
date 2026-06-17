@@ -870,6 +870,10 @@ FLOW_CLASSIFY_PRIOR_TICK_MAX_AGE_SECONDS = _getenv_float(
 
 SYMBOL_ALIASES = os.getenv("SYMBOL_ALIASES", "")
 OPTION_ROOT_ALIASES = os.getenv("OPTION_ROOT_ALIASES", "")
+# Per-underlying TS symbol used to query the MONTHLY chain. Same alias
+# format as SYMBOL_ALIASES. See INGEST_MONTHLY_EXPIRATIONS below for the
+# rationale; resolved by src.symbols.resolve_monthly_underlying().
+INGEST_MONTHLY_UNDERLYING_ALIASES = os.getenv("INGEST_MONTHLY_UNDERLYING_ALIASES", "")
 
 # =============================================================================
 # Greeks & IV Calculation Configuration
@@ -1611,6 +1615,14 @@ SIGNALS_OPTION_QUOTE_MAX_AGE_SECONDS = _getenv_int(
 INGEST_UNDERLYING = _getenv_str("INGEST_UNDERLYING", "SPY")
 INGEST_UNDERLYINGS = _getenv_str("INGEST_UNDERLYINGS", "")
 INGEST_EXPIRATIONS = _getenv_int("INGEST_EXPIRATIONS", 3)
+# Additional expirations pulled from the monthly chain mapped via
+# INGEST_MONTHLY_UNDERLYING_ALIASES. These layer ON TOP OF the primary
+# (weekly) window selected by INGEST_EXPIRATIONS — useful for index
+# underlyings where the AM-settled monthlies live under a separate TS
+# chain root (e.g. SPX vs SPXW) and would otherwise never be ingested.
+# Default 0 keeps prior behavior; per-process knob — each ingestion
+# worker fetches its own monthly window from its mapped chain symbol.
+INGEST_MONTHLY_EXPIRATIONS = _getenv_int("INGEST_MONTHLY_EXPIRATIONS", 0)
 INGEST_STRIKE_COUNT_MAX = _getenv_int("INGEST_STRIKE_COUNT_MAX", 40)
 INGEST_STRIKE_PCT_RANGE = _getenv_float("INGEST_STRIKE_PCT_RANGE", 3.0)
 ANALYTICS_UNDERLYING = _getenv_str("ANALYTICS_UNDERLYING", "SPY")

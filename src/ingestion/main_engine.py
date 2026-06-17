@@ -40,7 +40,7 @@ from src.validation import (
     seconds_until_engine_run_window,
     underlying_feed_expected,
 )
-from src.symbols import parse_underlyings, get_canonical_symbol
+from src.symbols import parse_underlyings, get_canonical_symbol, resolve_monthly_underlying
 from src.config import (
     _getenv_str,
     _getenv_int,
@@ -166,6 +166,8 @@ class IngestionEngine:
         num_expirations: int = 3,
         strike_count_max: int = 40,
         strike_pct_range: float = 3.0,
+        num_monthly_expirations: int = 0,
+        monthly_underlying: Optional[str] = None,
     ):
         """Initialize main ingestion engine"""
         self.client = client
@@ -176,6 +178,15 @@ class IngestionEngine:
         self.num_expirations = num_expirations
         self.strike_count_max = strike_count_max
         self.strike_pct_range = strike_pct_range
+        self.num_monthly_expirations = max(0, int(num_monthly_expirations))
+        # If the caller didn't pass an explicit monthly_underlying, derive
+        # it from INGEST_MONTHLY_UNDERLYING_ALIASES keyed on the canonical
+        # DB symbol. Lets a single env-var entry drive every worker
+        # process spawned for an underlying.
+        if monthly_underlying:
+            self.monthly_underlying = monthly_underlying.upper()
+        else:
+            self.monthly_underlying = resolve_monthly_underlying(self.db_symbol)
 
         self.running = False
 
@@ -321,6 +332,12 @@ class IngestionEngine:
             f"Config: {num_expirations} expirations, "
             f"±{strike_pct_range}% strike band (max {strike_count_max} strikes/exp)"
         )
+        if self.num_monthly_expirations > 0 and self.monthly_underlying:
+            logger.info(
+                "Monthly chain expansion: +%d expirations from %s",
+                self.num_monthly_expirations,
+                self.monthly_underlying,
+            )
 
         # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -1841,6 +1858,8 @@ class IngestionEngine:
             num_expirations=self.num_expirations,
             strike_count_max=self.strike_count_max,
             strike_pct_range=self.strike_pct_range,
+            num_monthly_expirations=self.num_monthly_expirations,
+            monthly_underlying=self.monthly_underlying,
         )
 
         # Publish the active manager before initialize()/stream() so a
@@ -1908,6 +1927,11 @@ class IngestionEngine:
         logger.info("=" * 80)
         logger.info(f"Underlying: {self.underlying}")
         logger.info(f"Expirations: {self.num_expirations}")
+        if self.num_monthly_expirations > 0 and self.monthly_underlying:
+            logger.info(
+                f"Monthly Expirations: +{self.num_monthly_expirations} "
+                f"from {self.monthly_underlying}"
+            )
         logger.info(f"Strike Band: ±{self.strike_pct_range}% of spot")
         logger.info(f"Strike Count Max: {self.strike_count_max} per expiration")
         logger.info(f"Greeks: {'ENABLED' if GREEKS_ENABLED else 'DISABLED'}")
@@ -1978,6 +2002,17 @@ def main():
         help="Number of expirations (default: 3)",
     )
     parser.add_argument(
+        "--monthly-expirations",
+        type=int,
+        default=_getenv_int("INGEST_MONTHLY_EXPIRATIONS", 0),
+        help=(
+            "Extra monthly expirations from the chain mapped by "
+            "INGEST_MONTHLY_UNDERLYING_ALIASES (default: 0). Use for index "
+            "underlyings whose AM-settled monthlies live under a separate "
+            "TS chain root (e.g. SPX vs SPXW)."
+        ),
+    )
+    parser.add_argument(
         "--strike-count-max",
         type=int,
         default=_getenv_int("INGEST_STRIKE_COUNT_MAX", 40),
@@ -2028,6 +2063,7 @@ def main():
             num_expirations=args.expirations,
             strike_count_max=args.strike_count_max,
             strike_pct_range=args.strike_pct_range,
+            num_monthly_expirations=args.monthly_expirations,
         )
         engine.run()
 

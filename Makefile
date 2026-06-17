@@ -913,6 +913,8 @@ help: ## Show this help message
 	@echo "  make run-greeks         - Test Greeks calculator"
 	@echo "  make run-iv             - Test IV calculator"
 	@echo "  make run-config         - Show current configuration"
+	@echo "  make validate-ingest-universe SYMBOL=SPX [EXPECT_MONTHLY=1] [MAX_STALE_SECONDS=600] [JSON=1]"
+	@echo "                          - Per-expiration ingestion health (root prefix split)"
 	@echo ""
 	@echo "$(GREEN)Quick Stats:$(NC)"
 	@echo "  make stats              - Show overall data statistics"
@@ -3385,6 +3387,14 @@ normalizer-cache-status: ## Show refresh + healthcheck timer status + last/next 
 # 04:30 ET nightly with up to 5 min jitter; 36 h leaves room for a
 # single missed cycle (e.g. a planned reboot) without alerting.
 NORMALIZER_MAX_AGE_HOURS ?= 36
+
+.PHONY: validate-ingest-universe
+validate-ingest-universe: ## Show per-expiration ingestion status for SYMBOL=...; pass EXPECT_MONTHLY=1 to require AM-settled monthlies
+	@$(PY) -m src.tools.ingestion_universe_validate \
+		$(or $(SYMBOL),SPX) \
+		$(if $(MAX_STALE_SECONDS),--max-stale-seconds $(MAX_STALE_SECONDS)) \
+		$(if $(EXPECT_MONTHLY),--expect-monthly) \
+		$(if $(JSON),--json)
 
 .PHONY: normalizer-cache-healthcheck
 normalizer-cache-healthcheck: ## Verify cache rows are fresh (exit 0=ok, 1=stale, 2=db error)

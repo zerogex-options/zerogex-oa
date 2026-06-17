@@ -582,6 +582,7 @@ flowchart LR
 | `BUFFER_FLUSH_INTERVAL` | 60 s | Time-based safety flush |
 | `OPTION_BUCKET_WRITE_MIN_SECONDS` | 5 | Throttle in-minute writes |
 | `INGEST_EXPIRATIONS` / `INGEST_STRIKE_PCT_RANGE` / `INGEST_STRIKE_COUNT_MAX` | 3 / 3.0% / 40 | Per-underlying universe: N expirations × strikes within ±pct of spot, capped at MAX per exp (trim furthest-first) |
+| `INGEST_MONTHLY_EXPIRATIONS` / `INGEST_MONTHLY_UNDERLYING_ALIASES` | 0 / `""` | Extra N expirations layered from a different TS chain (e.g. AM-settled SPX monthlies under `$SPX.X` while weeklies stream from `$SPXW.X`). Same `option_chains.underlying` keying — option_symbol root prefix is the disambiguator. Validate via `make validate-ingest-universe SYMBOL=SPX EXPECT_MONTHLY=1`. |
 | `GREEKS_ENABLED` | false | Enable Black-Scholes enrichment |
 | `RISK_FREE_RATE` | 0.05 | BS rate |
 | `IV_CALCULATION_ENABLED` | false | Solve IV from prices |
