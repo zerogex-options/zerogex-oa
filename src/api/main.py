@@ -50,6 +50,7 @@ from .routers.option_contract import router as option_contract_router
 from .routers.option_calculator import router as option_calculator_router
 from .routers.vol_surface import router as vol_surface_router
 from .routers.gex_flip_horizon import router as gex_flip_horizon_router
+from .routers.ai_context import router as ai_context_router
 
 # Logging is configured centrally in src.utils.logging; importing
 # get_logger triggers _configure_logging which honors LOG_LEVEL and
@@ -291,6 +292,10 @@ app.include_router(gex_flip_horizon_router, dependencies=[_scope_gex])
 # behind MARKET_RAW so they are excluded from derived-only tiers.
 app.include_router(option_contract_router, dependencies=[_scope_market_raw])
 app.include_router(option_calculator_router, dependencies=[_scope_market_raw])
+# AI grounding context — composed derived analytics (GEX + MSI + Action
+# Card) for the copilot and MCP server. Scope is declared on the router
+# itself (require_scopes(SIGNALS)); no raw market data is exposed.
+app.include_router(ai_context_router)
 
 # ============================================================================
 # Health Check
