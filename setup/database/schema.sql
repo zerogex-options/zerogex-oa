@@ -1902,3 +1902,108 @@ CREATE TABLE IF NOT EXISTS daily_atm_iv (
 
 CREATE INDEX IF NOT EXISTS idx_daily_atm_iv_underlying_date
     ON daily_atm_iv(underlying, trading_date DESC);
+
+-- =============================================================================
+-- BACKTESTING PLATFORM (see docs/design/backtesting-platform.md)
+--
+-- Four tables power the customer-facing backtester:
+--   * option_chains_archive — durable, retention-EXEMPT copy of the minute
+--     option_chains rows a backtest needs. The DB-maintenance prune job that
+--     enforces DATA_RETENTION_DAYS (src/config.py:569) MUST skip this table;
+--     it is the only place chain history older than 90 days survives.
+--   * backtest_runs    — one row per run (spec + status + summary).
+--   * backtest_trades  — one simulated trade per row.
+--   * backtest_equity  — the equity curve, one point per closed trade.
+-- =============================================================================
+
+-- Durable archive of minute option-chain rows. Same shape as option_chains
+-- plus archived_at; written by the nightly backtest-archive job (Phase 1.5)
+-- and read by the engine for windows that have aged past live retention.
+CREATE TABLE IF NOT EXISTS option_chains_archive (
+    option_symbol        VARCHAR(50)    NOT NULL,
+    timestamp            TIMESTAMPTZ    NOT NULL,
+    underlying           VARCHAR(10)    NOT NULL,
+    strike               NUMERIC(12, 4) NOT NULL,
+    expiration           DATE           NOT NULL,
+    option_type          CHAR(1)        NOT NULL,
+    last                 NUMERIC(12, 4),
+    bid                  NUMERIC(12, 4),
+    ask                  NUMERIC(12, 4),
+    mid                  NUMERIC(12, 4),
+    implied_volatility   NUMERIC(8, 6),
+    delta                NUMERIC(8, 6),
+    gamma                NUMERIC(10, 8),
+    theta                NUMERIC(10, 6),
+    vega                 NUMERIC(10, 6),
+    archived_at          TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (option_symbol, timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_option_chains_archive_underlying_ts
+    ON option_chains_archive(underlying, timestamp);
+
+-- One row per backtest run. ``spec`` is the validated BacktestSpec the user
+-- submitted; ``summary`` holds the aggregate statistics once complete.
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    id            BIGSERIAL    PRIMARY KEY,
+    end_user      VARCHAR(128),
+    underlying    VARCHAR(10)  NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    start_date    DATE         NOT NULL,
+    end_date      DATE         NOT NULL,
+    patterns      TEXT[]       NOT NULL DEFAULT '{}',
+    spec          JSONB        NOT NULL,
+    status        VARCHAR(12)  NOT NULL DEFAULT 'queued'
+                    CHECK (status IN ('queued', 'running', 'completed', 'failed')),
+    progress      DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    summary       JSONB,
+    error         TEXT,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    started_at    TIMESTAMPTZ,
+    completed_at  TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_user_created
+    ON backtest_runs(end_user, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_status
+    ON backtest_runs(status, created_at DESC);
+
+-- One simulated trade per row. ``outcome`` mirrors the playbook backtest
+-- harness vocabulary (target_hit / stop_hit / time_exit / no_fill / no_data).
+CREATE TABLE IF NOT EXISTS backtest_trades (
+    id             BIGSERIAL    PRIMARY KEY,
+    run_id         BIGINT       NOT NULL REFERENCES backtest_runs(id) ON DELETE CASCADE,
+    seq            INTEGER      NOT NULL,
+    pattern        VARCHAR(64)  NOT NULL,
+    direction      VARCHAR(20)  NOT NULL,
+    tier           VARCHAR(8)   NOT NULL,
+    option_symbol  VARCHAR(50)  NOT NULL,
+    option_type    CHAR(1)      NOT NULL,
+    strike         NUMERIC(12, 4),
+    expiration     DATE,
+    entered_at     TIMESTAMPTZ  NOT NULL,
+    exited_at      TIMESTAMPTZ,
+    entry_premium  NUMERIC(12, 6) NOT NULL,
+    exit_premium   NUMERIC(12, 6),
+    contracts      INTEGER      NOT NULL,
+    gross_pnl      NUMERIC(14, 4) NOT NULL DEFAULT 0,
+    commission     NUMERIC(14, 4) NOT NULL DEFAULT 0,
+    net_pnl        NUMERIC(14, 4) NOT NULL DEFAULT 0,
+    return_pct     NUMERIC(12, 4),
+    outcome        VARCHAR(16)  NOT NULL,
+    mfe_pct        DOUBLE PRECISION,
+    mae_pct        DOUBLE PRECISION,
+    hold_minutes   INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_trades_run_seq
+    ON backtest_trades(run_id, seq);
+
+-- Equity curve: one point per closed trade, in chronological order.
+CREATE TABLE IF NOT EXISTS backtest_equity (
+    run_id        BIGINT       NOT NULL REFERENCES backtest_runs(id) ON DELETE CASCADE,
+    seq           INTEGER      NOT NULL,
+    t             TIMESTAMPTZ  NOT NULL,
+    equity        NUMERIC(16, 4) NOT NULL,
+    drawdown_pct  DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    PRIMARY KEY (run_id, seq)
+);
