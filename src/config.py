@@ -1009,6 +1009,21 @@ SIGNALS_PATTERN_CALIBRATION_LOOKBACK_DAYS = _getenv_int(
     "SIGNALS_PATTERN_CALIBRATION_LOOKBACK_DAYS", 60, min=5
 )
 
+# ---------------------------------------------------------------------------
+# Backtesting platform — signal cooldown / dedup
+#
+# The live engine emits an Action Card nearly every cycle, so a naive backtest
+# would "take" thousands of near-identical signals per day. The cooldown
+# collapses that continuous stream into discrete entries: at most one new entry
+# per (pattern) per this many minutes. 0 disables (price every card). This is
+# both a realism fix (you don't re-enter the same setup every minute) and a
+# performance fix (cards inside a cooldown are skipped BEFORE pricing).
+# Per-request overridable via BacktestSpec.cooldown_minutes.
+# ---------------------------------------------------------------------------
+BACKTEST_SIGNAL_COOLDOWN_MINUTES = _getenv_int(
+    "BACKTEST_SIGNAL_COOLDOWN_MINUTES", 30, min=0, max=1440
+)
+
 # GEX normalization scale used to map net_gex into [-1, 1] for multiple
 # signal components (vol_expansion, strategy_builder, position optimizer).
 # Calibrated for the industry-standard "dollar gamma per 1% move" GEX

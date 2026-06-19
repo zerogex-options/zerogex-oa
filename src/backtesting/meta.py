@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import logging
 
-from src.config import DATA_RETENTION_DAYS, SIGNALS_UNDERLYINGS
+from src.config import (
+    BACKTEST_SIGNAL_COOLDOWN_MINUTES,
+    DATA_RETENTION_DAYS,
+    SIGNALS_UNDERLYINGS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +23,7 @@ _DEFAULTS = {
     "slippage_pct": 0.01,
     "commission_per_contract": 0.65,
     "max_concurrent": 3,
+    "cooldown_minutes": BACKTEST_SIGNAL_COOLDOWN_MINUTES,
 }
 
 
