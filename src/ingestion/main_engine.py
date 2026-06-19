@@ -2072,17 +2072,27 @@ def main():
 
         vix_main()
 
+    def run_vxn_ingester():
+        from src.ingestion.vxn_ingester import main as vxn_main
+
+        vxn_main()
+
     # Always run the VIX ingester alongside the per-symbol engines so that
     # /api/market/vix can read from `vix_bars` without hitting TradeStation.
     vix_enabled = _getenv_bool("INGEST_VIX_ENABLED", True)
+    # Same pattern for VXN so /api/market/volatility?ticker=VXN can read
+    # from `vxn_bars` without hitting TradeStation.
+    vxn_enabled = _getenv_bool("INGEST_VXN_ENABLED", True)
 
-    if len(symbols) == 1 and not vix_enabled:
+    if len(symbols) == 1 and not vix_enabled and not vxn_enabled:
         run_for_symbol(symbols[0])
         return
 
     logger.info(f"Starting ingestion engines for symbols: {', '.join(symbols)}")
     if vix_enabled:
         logger.info("Starting VIX ingester alongside symbol engines")
+    if vxn_enabled:
+        logger.info("Starting VXN ingester alongside symbol engines")
     processes: List[Process] = []
 
     for symbol in symbols:
@@ -2094,6 +2104,11 @@ def main():
         vix_process = Process(target=run_vix_ingester, name="ingest-vix")
         vix_process.start()
         processes.append(vix_process)
+
+    if vxn_enabled:
+        vxn_process = Process(target=run_vxn_ingester, name="ingest-vxn")
+        vxn_process.start()
+        processes.append(vxn_process)
 
     def shutdown_children(signum, frame):
         logger.info(f"Received signal {signum}, terminating ingestion workers...")

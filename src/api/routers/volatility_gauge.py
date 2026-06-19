@@ -6,8 +6,9 @@ GET /api/market/vix
     table (populated by src/ingestion/vix_ingester.py).
 
 GET /api/market/volatility?ticker=VIX|VXN
-    Pulls the bar window for the requested index ($VIX.X or $VXN.X)
-    directly from TradeStation on each request and scores it inline.
+    Reads the rolling window of 5-minute bars for the requested index
+    ($VIX.X from `vix_bars`, $VXN.X from `vxn_bars`) — same per-ticker
+    streaming ingester pattern, same scoring math.
 
 Both endpoints return the same two scored dimensions:
   - level    (0–10): Current index reading expressed on a log scale anchored
@@ -21,13 +22,10 @@ Only bars within the 2 most-recent regular trading sessions are used for
 scoring.
 """
 
-import asyncio
 import math
 import logging
-import os
-import threading
 from datetime import datetime, timedelta, date
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal
 
 import pytz
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -35,25 +33,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from src.api.database import DatabaseManager
-from src.config import _getenv_bool
-from src.validation import safe_datetime, safe_float
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/market", tags=["Market Data"])
 
 ET = pytz.timezone("US/Eastern")
-
-# Symbol map for /api/market/volatility — keeps the public ?ticker= surface
-# decoupled from TradeStation's "$XXX.X" cash-index notation.
-_TICKER_SYMBOLS: Dict[str, str] = {
-    "VIX": "$VIX.X",
-    "VXN": "$VXN.X",
-}
-
-# 5-min bars × ~78 per regular session × 2 sessions ≈ 156. Matches
-# VIX_INITIAL_BARSBACK in the ingester.
-_VOLATILITY_BARSBACK = 160
 
 
 def get_db() -> DatabaseManager:
@@ -67,38 +52,6 @@ def get_db() -> DatabaseManager:
             detail="Database not initialized",
         )
     return db_manager
-
-
-# ----------------------------------------------------------------------------
-# TradeStation client (lazy singleton)
-# ----------------------------------------------------------------------------
-
-_ts_client: Optional[Any] = None
-_ts_client_lock = threading.Lock()
-
-
-def get_tradestation_client() -> Any:
-    """Return a process-wide TradeStation client, instantiating on first use.
-
-    The API has historically been DB-only; this endpoint is the sole caller
-    that needs live TradeStation access, so the client is created lazily on
-    first request rather than wired through ``main.py`` lifespan.
-    """
-    global _ts_client
-    if _ts_client is not None:
-        return _ts_client
-    with _ts_client_lock:
-        if _ts_client is not None:
-            return _ts_client
-        from src.ingestion.tradestation_client import TradeStationClient
-
-        _ts_client = TradeStationClient(
-            os.getenv("TRADESTATION_CLIENT_ID", ""),
-            os.getenv("TRADESTATION_CLIENT_SECRET", ""),
-            os.getenv("TRADESTATION_REFRESH_TOKEN", ""),
-            sandbox=_getenv_bool("TRADESTATION_USE_SANDBOX", False),
-        )
-        return _ts_client
 
 
 # ============================================================================
@@ -362,7 +315,7 @@ async def get_volatility_gauge(db: DatabaseManager = Depends(get_db)):
 
 
 # ============================================================================
-# /api/market/volatility — TradeStation-direct variant (VIX or VXN)
+# /api/market/volatility — generic gauge over either VIX or VXN bars
 # ============================================================================
 
 
@@ -398,7 +351,9 @@ class VolatilityIndexResponse(BaseModel):
         description="Human-readable label: Collapsing / Easing / Stable / Rising / Surging"
     )
 
-    cache_bars: int = Field(description="5-min bars fetched from TradeStation for this response")
+    cache_bars: int = Field(
+        description="5-min bars used from the per-ticker bars table for this response"
+    )
     latest_bars: List[VolatilityBar] = Field(
         description="Most-recent 10 bars for debugging / charting", default_factory=list
     )
@@ -407,54 +362,13 @@ class VolatilityIndexResponse(BaseModel):
         json_encoders = {datetime: lambda v: v.isoformat()}
 
 
-def _parse_ts_bar(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Convert a raw TradeStation bar into the scorer-friendly shape.
-
-    Mirrors src.ingestion.vix_ingester._parse_bar so the scoring math sees
-    the same dict shape it consumes from the DB read.
-    """
-    ts = safe_datetime(raw.get("TimeStamp"), field_name="TimeStamp")  # type: ignore[arg-type]
-    if ts is None:
-        return None
-    close = safe_float(raw.get("Close"), field_name="Close", default=None)
-    if close is None:
-        return None
-    return {
-        "timestamp": ts,
-        "open": safe_float(raw.get("Open"), field_name="Open", default=None),
-        "high": safe_float(raw.get("High"), field_name="High", default=None),
-        "low": safe_float(raw.get("Low"), field_name="Low", default=None),
-        "close": close,
-    }
-
-
-def _fetch_ts_bars(client: Any, symbol: str) -> List[Dict[str, Any]]:
-    """Synchronous TradeStation fetch, intended to run in a worker thread.
-
-    Returns ascending-by-timestamp bars filtered to the 2 most-recent
-    regular sessions so the scoring window matches /api/market/vix.
-    """
-    payload = client.get_bars(
-        symbol=symbol,
-        interval=5,
-        unit="Minute",
-        barsback=_VOLATILITY_BARSBACK,
-        sessiontemplate="Default",
-        warn_if_closed=False,
-    )
-    raw_bars = payload.get("Bars", []) if isinstance(payload, dict) else []
-    parsed = [b for b in (_parse_ts_bar(r) for r in raw_bars) if b is not None]
-    parsed.sort(key=lambda b: b["timestamp"])
-    cutoff = _two_session_cutoff()
-    return [b for b in parsed if b["timestamp"] >= cutoff]
-
-
 @router.get("/volatility", response_model=VolatilityIndexResponse)
 async def get_volatility_index(
     ticker: Literal["VIX", "VXN"] = Query(
         default="VIX",
         description="Volatility index to score: 'VIX' ($VIX.X) or 'VXN' ($VXN.X).",
     ),
+    db: DatabaseManager = Depends(get_db),
 ):
     """
     Returns volatility-index metrics as two scored dimensions, for either
@@ -474,25 +388,28 @@ async def get_volatility_index(
     Weighted composite rate-of-change across five time scales (5 min through
     2 hrs), normalised against realised per-bar volatility of the index.
 
-    **Data source** — pulls the requested index's 5-min bar window directly
-    from TradeStation on each request (no DB cache).
+    **Data source** — reads the rolling 5-min bar window maintained by the
+    per-ticker streaming ingester (VIX → ``vix_bars``, VXN → ``vxn_bars``).
     """
-    symbol = _TICKER_SYMBOLS[ticker]
-    client = get_tradestation_client()
+    cutoff = _two_session_cutoff()
 
     try:
-        bars = await asyncio.to_thread(_fetch_ts_bars, client, symbol)
+        bars = await db.get_volatility_index_bars(ticker, cutoff, ET)
     except Exception as exc:
-        logger.error("TradeStation fetch failed for %s: %s", symbol, exc)
+        logger.error("%s DB read failed: %s", ticker, exc)
         raise HTTPException(
             status_code=503,
-            detail=f"Unable to fetch {ticker} bars from TradeStation.",
+            detail=f"Unable to read {ticker} data from database.",
         )
 
     if not bars:
+        table = "vix_bars" if ticker == "VIX" else "vxn_bars"
         raise HTTPException(
             status_code=503,
-            detail=f"{ticker} data unavailable — TradeStation returned no bars.",
+            detail=(
+                f"{ticker} data unavailable — {table} table is empty. "
+                f"Check that the ingestion engine's {ticker} poller is running."
+            ),
         )
 
     latest = bars[-1]

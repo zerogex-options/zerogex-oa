@@ -3147,6 +3147,8 @@ api-test: ## Test ALL API endpoints — HTTP code, time, size in an aligned tabl
 	hit "/api/market/quote?symbol=$$SYMBOL"; \
 	hit "/api/market/session-closes?symbol=$$SYMBOL"; \
 	hit "/api/market/vix"; \
+	hit "/api/market/volatility?ticker=VIX"; \
+	hit "/api/market/volatility?ticker=VXN"; \
 	hit "/api/market/open-interest?underlying=$$SYMBOL"; \
 	hit "/api/option/quote?underlying=$$SYMBOL&type=C"; \
 	hit "/api/max-pain/current?symbol=$$SYMBOL&strike_limit=100"; \
