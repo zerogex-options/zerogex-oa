@@ -64,7 +64,12 @@ single-pattern CLI harness (`src/signals/playbook/backtest.py`) into:
 1. **Create** — `POST /api/backtest/runs` validates a `BacktestSpec`, inserts a
    `backtest_runs` row (`status='queued'`), and schedules the job.
 2. **Replay** — the engine loads `signal_action_cards` for `(underlying, window,
-   patterns)`. For each Card it resolves the option leg (from the Card's own
+   patterns)`, then applies a **per-pattern cooldown** (`cooldown_minutes`,
+   default `BACKTEST_SIGNAL_COOLDOWN_MINUTES=30`) to collapse the continuous
+   card stream into discrete entries before pricing — the live engine emits a
+   card nearly every cycle, so without this a run would price (and the
+   concurrency cap then discard) thousands of near-identical signals per day.
+   For each surviving Card it resolves the option leg (from the Card's own
    `legs`, falling back to a tier-based ATM contract).
 3. **Entry fill** — looks up the leg's `option_chains` row at/after the Card
    timestamp; entry premium = `leg_fill_price(action='open')`.
@@ -182,6 +187,12 @@ Computed in `engine.py`, stored in `backtest_runs.summary`:
 - **profit_factor** = Σ wins / |Σ losses|.
 - **sharpe** (per-trade, annualized by √(trades/yr)) — informational in v1.
 - **avg_win_pct / avg_loss_pct / avg_hold_minutes**, plus **by_pattern** breakdown.
+
+**Diagnostics.** `summary.diagnostics` records the funnel for the run so a
+0-trade result is explainable: `cards_total`, `cards_in_scope` (after pattern
+filter), `cards_after_cooldown`, `priced_candidates`, `drops` (a reason→count
+map: `outcome:no_fill`, `no_entry_quote`, `no_exit_quote`, `no_leg`, …),
+`concurrency_skipped`, and `sized_out`.
 
 A round-trip **commission** (`commission_per_contract × contracts × 2`) and the
 **slippage_pct** widening are both applied so the curve is net of frictions —

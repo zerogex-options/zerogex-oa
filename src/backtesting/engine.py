@@ -205,12 +205,14 @@ def _build_candidate(
     conn,
     card: CardRow,
     spec: BacktestSpec,
-) -> Optional[dict]:
-    """Resolve one Card into a priced candidate trade, or None if unusable.
+) -> tuple[Optional[dict], str]:
+    """Resolve one Card into a priced candidate trade.
 
-    Computes exit timing on the underlying, then prices the option leg at
-    entry and exit. Returns a dict with everything except final sizing (which
-    needs the chronological equity walk).
+    Returns ``(candidate, reason)``. On success ``candidate`` is a dict and
+    ``reason`` is ``"ok"``; on a drop ``candidate`` is None and ``reason`` names
+    the funnel stage that rejected the card (``outcome:<label>``, ``no_leg``,
+    ``no_entry_quote``, ``no_exit_quote``, ``bad_premium``) so the run's
+    diagnostics can explain a 0-trade result.
     """
     payload = dict(card.payload or {})
     # Apply the spec's max-hold override (or supply a default) so cards that
@@ -237,18 +239,18 @@ def _build_candidate(
     outcome = compute_outcome(card, quotes)
     # Only price trades that actually opened and resolved to a price exit.
     if outcome.outcome not in ("target_hit", "stop_hit", "time_exit"):
-        return None
+        return None, f"outcome:{outcome.outcome}"
     exit_at = _exit_timestamp(outcome)
     if exit_at is None:
-        return None
+        return None, "outcome:no_exit_ts"
 
     leg = _select_leg(card)
     if leg is None:
-        return None
+        return None, "no_leg"
 
     entry_q = _fetch_leg_quote(conn, underlying=card.underlying, leg=leg, at=card.timestamp)
     if entry_q is None:
-        return None
+        return None, "no_entry_quote"
     # Lock the leg to the contract we actually entered so the exit prices the
     # same option (important for the synthetic-ATM fallback).
     resolved_leg = {
@@ -258,7 +260,7 @@ def _build_candidate(
     }
     exit_q = _fetch_leg_quote(conn, underlying=card.underlying, leg=resolved_leg, at=exit_at)
     if exit_q is None:
-        return None
+        return None, "no_exit_quote"
 
     slip = spec.fill_model.slippage_pct
     entry_premium = leg_fill_price(
@@ -270,7 +272,7 @@ def _build_candidate(
         side="long", action="close", slippage_pct=slip,
     )
     if entry_premium <= 0:
-        return None
+        return None, "bad_premium"
 
     hold_minutes = max(0, int((exit_at - card.timestamp).total_seconds() // 60))
     return {
@@ -288,7 +290,7 @@ def _build_candidate(
         "hold_minutes": hold_minutes,
         "mfe_pct": outcome.mfe_pct,
         "mae_pct": outcome.mae_pct,
-    }
+    }, "ok"
 
 
 def _simulate(candidates: list[dict], spec: BacktestSpec) -> RunResult:
@@ -307,6 +309,8 @@ def _simulate(candidates: list[dict], spec: BacktestSpec) -> RunResult:
     trades: list[TradeResult] = []
     equity: list[EquityPoint] = []
     seq = 0
+    concurrency_skipped = 0
+    sized_out = 0
 
     def _close_until(when: datetime) -> None:
         nonlocal realized_equity, peak_equity
@@ -323,11 +327,13 @@ def _simulate(candidates: list[dict], spec: BacktestSpec) -> RunResult:
         _close_until(cand["entered_at"])
 
         if len(open_positions) >= max_concurrent:
+            concurrency_skipped += 1
             continue  # concurrency cap reached; skip this signal
 
         entry_premium = cand["entry_premium"]
         per_contract_cost = entry_premium * 100.0
         if per_contract_cost <= 0:
+            sized_out += 1
             continue
         # Allocate risk_frac of *currently realized* equity as premium.
         risk_dollars = max(realized_equity, 0.0) * risk_frac
@@ -337,6 +343,7 @@ def _simulate(candidates: list[dict], spec: BacktestSpec) -> RunResult:
         if per_contract_cost * contracts > max(realized_equity, 0.0):
             contracts = int(math.floor(max(realized_equity, 0.0) / per_contract_cost))
         if contracts < 1:
+            sized_out += 1
             continue  # can't afford even one contract
 
         gross = cand["pnl_per_contract"] * contracts
@@ -381,6 +388,10 @@ def _simulate(candidates: list[dict], spec: BacktestSpec) -> RunResult:
     _close_until(sentinel)
 
     summary = _summarize(trades, equity, capital)
+    summary["diagnostics"] = {
+        "concurrency_skipped": concurrency_skipped,
+        "sized_out": sized_out,
+    }
     return RunResult(trades=trades, equity=equity, summary=summary)
 
 
@@ -441,6 +452,28 @@ def _summarize(trades: list[TradeResult], equity: list[EquityPoint], capital: fl
     }
 
 
+def _apply_cooldown(cards: list, cooldown_minutes: int) -> list:
+    """Collapse the continuous card stream to discrete per-pattern entries.
+
+    Cards arrive ~every cycle, so without this a backtest would price (and the
+    concurrency cap would then mostly discard) thousands of near-identical
+    signals per day. Keeps the first card of each pattern, then suppresses any
+    further card of that pattern until ``cooldown_minutes`` have elapsed.
+    ``cooldown_minutes <= 0`` is a passthrough (price every card).
+    """
+    if cooldown_minutes <= 0:
+        return list(cards)
+    gap = timedelta(minutes=cooldown_minutes)
+    last_kept: dict[str, datetime] = {}
+    kept: list = []
+    for card in sorted(cards, key=lambda c: c.timestamp):
+        prev = last_kept.get(card.pattern)
+        if prev is None or (card.timestamp - prev) >= gap:
+            kept.append(card)
+            last_kept[card.pattern] = card.timestamp
+    return kept
+
+
 def run_backtest(
     conn,
     spec: BacktestSpec,
@@ -454,29 +487,45 @@ def run_backtest(
     """
     start_dt = datetime.combine(spec.start_date, datetime.min.time())
     end_dt = datetime.combine(spec.end_date, datetime.max.time())
-    cards = fetch_action_cards(conn, spec.underlying, start_dt, end_dt)
+    all_cards = fetch_action_cards(conn, spec.underlying, start_dt, end_dt)
     if spec.patterns:
         wanted = set(spec.patterns)
-        cards = [c for c in cards if c.pattern in wanted]
+        in_scope = [c for c in all_cards if c.pattern in wanted]
+    else:
+        in_scope = list(all_cards)
+    cards = _apply_cooldown(in_scope, spec.cooldown_minutes)
+
+    # Funnel diagnostics so a 0-trade run is explainable: where did cards go?
+    diag = {
+        "cards_total": len(all_cards),
+        "cards_in_scope": len(in_scope),
+        "cards_after_cooldown": len(cards),
+        "drops": {},          # reason -> count (outcome:no_fill, no_entry_quote, …)
+        "priced_candidates": 0,
+    }
 
     candidates: list[dict] = []
     total = len(cards) or 1
     for i, card in enumerate(cards):
         try:
-            cand = _build_candidate(conn, _to_card_row(card), spec)
+            cand, reason = _build_candidate(conn, _to_card_row(card), spec)
         except Exception:  # pragma: no cover - defensive; one bad Card must not kill the run
             logger.warning(
                 "backtest: skipping card at %s due to pricing error",
                 getattr(card, "timestamp", "?"),
                 exc_info=True,
             )
-            cand = None
+            cand, reason = None, "error"
         if cand is not None:
             candidates.append(cand)
+        else:
+            diag["drops"][reason] = diag["drops"].get(reason, 0) + 1
         if progress_cb is not None and (i % 25 == 0 or i == total - 1):
             progress_cb((i + 1) / total)
+    diag["priced_candidates"] = len(candidates)
 
     result = _simulate(candidates, spec)
+    result.summary["diagnostics"] = {**diag, **result.summary.get("diagnostics", {})}
     if progress_cb is not None:
         progress_cb(1.0)
     return result

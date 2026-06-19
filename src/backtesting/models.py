@@ -36,6 +36,19 @@ def _coerce_float(value: Any, *, field_name: str, lo: float, hi: float, default:
     return min(max(out, lo), hi)
 
 
+def _coerce_cooldown(value: Any) -> int:
+    """Cooldown minutes, defaulting to the configured value when omitted/blank."""
+    if value in (None, ""):
+        from src import config
+
+        return int(config.BACKTEST_SIGNAL_COOLDOWN_MINUTES)
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        raise SpecError("cooldown_minutes must be an integer")
+    return min(max(out, 0), 1440)
+
+
 def _coerce_date(value: Any, *, field_name: str) -> date:
     if isinstance(value, date) and not isinstance(value, datetime):
         return value
@@ -137,6 +150,10 @@ class BacktestSpec:
     fill_model: FillModel = field(default_factory=FillModel)
     sizing: Sizing = field(default_factory=Sizing)
     exit: ExitRules = field(default_factory=ExitRules)
+    # Minimum minutes between consecutive entries of the same pattern. Defaults
+    # to BACKTEST_SIGNAL_COOLDOWN_MINUTES; 0 prices every card. Collapses the
+    # continuous Action-Card stream into discrete trades.
+    cooldown_minutes: int = 0
 
     @classmethod
     def from_dict(cls, raw: dict) -> "BacktestSpec":
@@ -163,6 +180,7 @@ class BacktestSpec:
             fill_model=FillModel.from_dict(raw.get("fill_model")),
             sizing=Sizing.from_dict(raw.get("sizing")),
             exit=ExitRules.from_dict(raw.get("exit")),
+            cooldown_minutes=_coerce_cooldown(raw.get("cooldown_minutes")),
         )
 
     def to_dict(self) -> dict:
@@ -181,6 +199,7 @@ class BacktestSpec:
                 "max_concurrent": self.sizing.max_concurrent,
             },
             "exit": {"max_hold_minutes": self.exit.max_hold_minutes},
+            "cooldown_minutes": self.cooldown_minutes,
         }
 
 

@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from src.backtesting.engine import _select_leg, _simulate, run_backtest
+from src.backtesting.engine import _apply_cooldown, _select_leg, _simulate, run_backtest
 from src.backtesting.models import BacktestSpec, SpecError
 from src.signals.playbook.backtest import CardRow
 
@@ -329,3 +329,76 @@ def test_run_backtest_end_to_end(monkeypatch):
     assert tr.exit_premium == pytest.approx(2.00)
     assert tr.contracts >= 1
     assert progress and progress[-1] == 1.0
+    # Diagnostics funnel is populated so a 0-trade run would be explainable.
+    diag = result.summary["diagnostics"]
+    assert diag["cards_total"] == 1
+    assert diag["cards_in_scope"] == 1
+    assert diag["priced_candidates"] == 1
+    assert diag["drops"] == {}
+
+
+# ----------------------------------------------------------------------
+# Cooldown / dedup
+# ----------------------------------------------------------------------
+
+
+def test_apply_cooldown_collapses_rapid_same_pattern_cards():
+    cards = [
+        _card(pattern="p", ts=T0),
+        _card(pattern="p", ts=T0 + timedelta(minutes=5)),    # within 30m → dropped
+        _card(pattern="p", ts=T0 + timedelta(minutes=35)),   # >=30m → kept
+        _card(pattern="q", ts=T0 + timedelta(minutes=1)),    # different pattern → kept
+    ]
+    kept = _apply_cooldown(cards, cooldown_minutes=30)
+    times = sorted((c.pattern, c.timestamp) for c in kept)
+    assert times == [
+        ("p", T0),
+        ("p", T0 + timedelta(minutes=35)),
+        ("q", T0 + timedelta(minutes=1)),
+    ]
+
+
+def test_apply_cooldown_zero_is_passthrough():
+    cards = [_card(pattern="p", ts=T0), _card(pattern="p", ts=T0 + timedelta(minutes=1))]
+    assert len(_apply_cooldown(cards, cooldown_minutes=0)) == 2
+
+
+def test_run_backtest_diagnostics_explains_missing_quote(monkeypatch):
+    # Card resolves (target_hit) and synthesizes an ATM leg, but option_chains
+    # has no matching row → dropped as "no_entry_quote", surfaced in diagnostics.
+    ts = datetime(2026, 5, 1, 14, 0, tzinfo=ET)
+    payload = {
+        "entry": {"ref_price": 500.0, "trigger": "at_market"},
+        "target": {"ref_price": 503.0, "kind": "level"},
+        "stop": {"ref_price": 498.0, "kind": "level"},
+        "max_hold_minutes": 120,
+        # no legs
+    }
+    cards = [("SPY", ts, "p", "BUY_CALL", "0DTE", "bullish", 0.7, json.dumps(payload))]
+    quotes = [
+        (ts, 500.0, 500.5, 499.8, 500.2),
+        (ts + timedelta(minutes=10), 500.2, 503.4, 500.0, 503.1),
+    ]
+    # No option_chains row → entry-quote lookup fails → "no_entry_quote".
+    store = {"cards": cards, "quotes": quotes, "leg_quote": None}
+
+    class _NoLegCursor(_FakeCursor):
+        def execute(self, sql, params=None):
+            super().execute(sql, params)
+            if "FROM option_chains" in " ".join(sql.split()) and "to_regclass" not in sql:
+                self._result = []  # no quote found
+
+    class _NoLegConn(_FakeConn):
+        def cursor(self):
+            return _NoLegCursor(self._store)
+
+    spec = BacktestSpec.from_dict(
+        {"underlying": "SPY", "start_date": "2026-05-01", "end_date": "2026-05-01",
+         "cooldown_minutes": 0}
+    )
+    result = run_backtest(_NoLegConn(store), spec)
+    assert result.summary["n_trades"] == 0
+    diag = result.summary["diagnostics"]
+    assert diag["cards_in_scope"] == 1
+    assert diag["priced_candidates"] == 0
+    assert diag["drops"].get("no_entry_quote") == 1
