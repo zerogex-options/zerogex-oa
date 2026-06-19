@@ -1,25 +1,22 @@
 """
 Volatility Gauge Router
 
-GET /api/market/vix
-    Reads the rolling window of 5-minute $VIX.X bars from the `vix_bars`
-    table (populated by src/ingestion/vix_ingester.py).
-
 GET /api/market/volatility?ticker=VIX|VXN
     Reads the rolling window of 5-minute bars for the requested index
-    ($VIX.X from `vix_bars`, $VXN.X from `vxn_bars`) — same per-ticker
-    streaming ingester pattern, same scoring math.
+    ($VIX.X from `vix_bars`, $VXN.X from `vxn_bars`) and returns two
+    scored dimensions:
 
-Both endpoints return the same two scored dimensions:
-  - level    (0–10): Current index reading expressed on a log scale anchored
-                     to historical percentiles — where the index sits right
-                     now.
-  - momentum (0–10): Weighted rate-of-change across five time scales,
-                     normalised to ±4σ — which direction and how fast the
-                     index is moving relative to its own recent behaviour.
+      - level    (0–10): Current index reading expressed on a log scale
+                         anchored to historical percentiles — where the
+                         index sits right now.
+      - momentum (0–10): Weighted rate-of-change across five time scales,
+                         normalised to ±4σ — which direction and how fast
+                         the index is moving relative to its own recent
+                         behaviour.
 
 Only bars within the 2 most-recent regular trading sessions are used for
-scoring.
+scoring.  The per-ticker bars tables are populated by the streaming
+ingesters in src/ingestion/{vix,vxn}_ingester.py.
 """
 
 import math
@@ -86,37 +83,39 @@ def _two_session_cutoff() -> datetime:
 # ============================================================================
 
 
-def _level(vix_close: float) -> float:
+def _level(index_close: float) -> float:
     """
-    Map VIX level → 0–10 using a log scale anchored to historical percentiles.
+    Map an index level → 0–10 using a log scale anchored to historical
+    VIX-style percentiles (VXN trades in a similar range so the scale
+    transfers cleanly).
 
     Approximate readings:
-      VIX 10  →  0.0  (record low territory)
-      VIX 15  →  2.0
-      VIX 20  →  3.6  (long-run median ~17)
-      VIX 25  →  5.0
-      VIX 30  →  6.2  (elevated / high-fear threshold)
-      VIX 40  →  8.0
-      VIX 50  → 10.0  (extreme panic)
+      10  →  0.0  (record low territory)
+      15  →  2.0
+      20  →  3.6  (long-run median ~17)
+      25  →  5.0
+      30  →  6.2  (elevated / high-fear threshold)
+      40  →  8.0
+      50  → 10.0  (extreme panic)
     """
-    if vix_close <= 0:
+    if index_close <= 0:
         return 0.0
-    lo = math.log(10.0)  # VIX floor  → score 0
-    hi = math.log(50.0)  # VIX ceiling → score 10
-    score = 10.0 * (math.log(vix_close) - lo) / (hi - lo)
+    lo = math.log(10.0)  # floor    → score 0
+    hi = math.log(50.0)  # ceiling  → score 10
+    score = 10.0 * (math.log(index_close) - lo) / (hi - lo)
     return round(max(0.0, min(10.0, score)), 2)
 
 
 def _momentum(bars: List[Dict[str, Any]]) -> float:
     """
-    Map VIX momentum → 0–10.
+    Map index momentum → 0–10.
 
     Steps:
     1. Compute a weighted composite rate-of-change (RoC) across five lookback
        windows.  Weights are distributed across short and medium-term horizons
        so that a single noisy bar does not dominate the reading.
     2. Normalise the composite RoC by the rolling 1-bar RoC std derived from
-       the window itself (realised per-bar volatility of VIX).
+       the window itself (realised per-bar volatility of the index).
     3. Map the z-score using a ±4σ range so that only truly extreme moves
        reach the extremes:
          z = –4 → 0   (sharply falling)
@@ -162,7 +161,7 @@ def _momentum(bars: List[Dict[str, Any]]) -> float:
             one_bar_rocs.append((closes[i] - prev) / prev)
 
     if len(one_bar_rocs) < 3:
-        # Fallback: VIX typically moves ~0.5 % per 5-min bar in normal markets
+        # Fallback: VIX/VXN typically move ~0.5 % per 5-min bar in normal markets
         sigma = 0.005
     else:
         n = len(one_bar_rocs)
@@ -202,120 +201,6 @@ def _momentum_label(score: float) -> str:
 
 # ============================================================================
 # Response models
-# ============================================================================
-
-
-class VIXBar(BaseModel):
-    timestamp: datetime
-    close: float
-
-    class Config:
-        json_encoders = {datetime: lambda v: v.isoformat()}
-
-
-class VolatilityGaugeResponse(BaseModel):
-    timestamp: datetime = Field(description="Timestamp of the latest VIX bar (ET)")
-    vix: float = Field(description="Current $VIX.X close")
-
-    level: float = Field(
-        description=(
-            "VIX level mapped to 0–10 (log scale). "
-            "0 = ultra-calm (VIX ~10), 5 = VIX ~25, 10 = extreme fear (VIX ~50+)."
-        )
-    )
-    level_label: str = Field(
-        description="Human-readable label: Subdued / Low / Moderate / Elevated / Extreme"
-    )
-
-    momentum: float = Field(
-        description=(
-            "VIX rate-of-change mapped to 0–10 (±4σ range). "
-            "0 = collapsing, 5 = stable, 10 = surging."
-        )
-    )
-    momentum_label: str = Field(
-        description="Human-readable label: Collapsing / Easing / Stable / Rising / Surging"
-    )
-
-    cache_bars: int = Field(description="5-min bars used from vix_bars for this response")
-    latest_bars: List[VIXBar] = Field(
-        description="Most-recent 10 bars for debugging / charting", default_factory=list
-    )
-
-    class Config:
-        json_encoders = {datetime: lambda v: v.isoformat()}
-
-
-# ============================================================================
-# Endpoint
-# ============================================================================
-
-
-@router.get("/vix", response_model=VolatilityGaugeResponse)
-async def get_volatility_gauge(db: DatabaseManager = Depends(get_db)):
-    """
-    Returns $VIX.X volatility metrics as two scored dimensions.
-
-    **Level** — *where is VIX right now?*
-    Maps the current $VIX.X reading to a 0–10 log scale anchored to
-    historical percentiles:
-    - `0–2`  → Subdued  (VIX ~10–15, historically quiet)
-    - `2–4`  → Low      (VIX ~15–19, below-average vol)
-    - `4–6`  → Moderate (VIX ~19–27, near long-run average)
-    - `6–8`  → Elevated (VIX ~27–38, above-average fear)
-    - `8–10` → Extreme  (VIX ~38+, crisis-level fear)
-
-    **Momentum** — *which direction and how fast is VIX moving?*
-    Weighted composite rate-of-change across five time scales (5 min through
-    2 hrs), normalised against realised per-bar volatility of VIX.
-
-    **Data source** — reads the rolling 5-min VIX bar window maintained by
-    the ingestion engine's VIX poller from the `vix_bars` table.
-    """
-    cutoff = _two_session_cutoff()
-
-    try:
-        bars = await db.get_vix_bars(cutoff, ET)
-    except Exception as exc:
-        logger.error("VIX DB read failed: %s", exc)
-        raise HTTPException(
-            status_code=503,
-            detail="Unable to read VIX data from database.",
-        )
-
-    if not bars:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "VIX data unavailable — vix_bars table is empty. "
-                "Check that the ingestion engine's VIX poller is running."
-            ),
-        )
-
-    latest = bars[-1]
-    vix_close = latest["close"]
-
-    lvl = _level(vix_close)
-    mom = _momentum(bars)
-
-    # Newest-first to match the convention used by the rest of the
-    # timeseries APIs.
-    recent_bars = [VIXBar(timestamp=b["timestamp"], close=b["close"]) for b in reversed(bars[-10:])]
-
-    return VolatilityGaugeResponse(
-        timestamp=latest["timestamp"],
-        vix=round(vix_close, 2),
-        level=lvl,
-        level_label=_level_label(lvl),
-        momentum=mom,
-        momentum_label=_momentum_label(mom),
-        cache_bars=len(bars),
-        latest_bars=recent_bars,
-    )
-
-
-# ============================================================================
-# /api/market/volatility — generic gauge over either VIX or VXN bars
 # ============================================================================
 
 
@@ -360,6 +245,11 @@ class VolatilityIndexResponse(BaseModel):
 
     class Config:
         json_encoders = {datetime: lambda v: v.isoformat()}
+
+
+# ============================================================================
+# Endpoint
+# ============================================================================
 
 
 @router.get("/volatility", response_model=VolatilityIndexResponse)

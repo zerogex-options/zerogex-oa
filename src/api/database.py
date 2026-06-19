@@ -1724,15 +1724,6 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             )
         return bars
 
-    async def get_vix_bars(self, cutoff: datetime, tz) -> List[Dict[str, Any]]:
-        """Backward-compat alias for the VIX-specific bars read.
-
-        Defers to :meth:`get_volatility_index_bars` with ``ticker="VIX"`` so
-        existing callers (the legacy ``/api/market/vix`` endpoint and its
-        tests) keep working unchanged.
-        """
-        return await self.get_volatility_index_bars("VIX", cutoff, tz)
-
     async def get_latest_gex_profile(
         self,
         symbol: str = "SPY",

@@ -287,9 +287,9 @@ COMMENT ON TABLE option_chains_latest IS
     'Maintained "latest quote per option_symbol" cache.  One row per contract, kept current by the ingestion writer (dual-UPSERT alongside option_chains).  Read by the analytics snapshot when ANALYTICS_USE_LATEST_CACHE=true to avoid DISTINCT ON over option_chains history.  See schema.sql header for activation steps.';
 
 -- =============================================================================
--- VIX rolling window of 5-minute bars — used by /api/market/vix and
--- /api/market/volatility?ticker=VIX endpoints (level score uses latest
--- close; momentum score needs a multi-bar window).
+-- VIX rolling window of 5-minute bars — used by
+-- /api/market/volatility?ticker=VIX (level score uses latest close;
+-- momentum score needs a multi-bar window).
 -- Populated by the ingestion engine's VIX poller.
 -- =============================================================================
 CREATE TABLE IF NOT EXISTS vix_bars (

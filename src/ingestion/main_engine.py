@@ -2078,7 +2078,8 @@ def main():
         vxn_main()
 
     # Always run the VIX ingester alongside the per-symbol engines so that
-    # /api/market/vix can read from `vix_bars` without hitting TradeStation.
+    # /api/market/volatility?ticker=VIX can read from `vix_bars` without
+    # hitting TradeStation.
     vix_enabled = _getenv_bool("INGEST_VIX_ENABLED", True)
     # Same pattern for VXN so /api/market/volatility?ticker=VXN can read
     # from `vxn_bars` without hitting TradeStation.

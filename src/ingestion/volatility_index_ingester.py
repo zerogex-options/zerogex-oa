@@ -4,10 +4,9 @@ Volatility-Index Ingester
 Generic streaming ingester that pulls 5-minute bars for a CBOE-style cash
 volatility index from TradeStation's ``/stream/barcharts`` endpoint and
 upserts them into a per-ticker bars table (``vix_bars``, ``vxn_bars``, …).
-The ``/api/market/vix`` and ``/api/market/volatility`` endpoints read from
-those tables instead of calling TradeStation directly, so the endpoints
-stay fast and a single long-running ingester process per index keeps the
-window fresh.
+The ``/api/market/volatility?ticker=…`` endpoint reads from those tables
+instead of calling TradeStation directly, so the endpoint stays fast and
+a single long-running ingester process per index keeps the window fresh.
 
 This module owns the streaming + persistence + retention loop; the
 per-ticker entry points (see ``vix_ingester.py`` and ``vxn_ingester.py``)
