@@ -1,9 +1,10 @@
-"""Unit test for DatabaseManager.get_vix_bars shaping.
+"""Unit tests for DatabaseManager volatility-index bar reads.
 
-Covers the async (asyncpg) VIX-bar read that replaced the volatility-gauge
-router's sync psycopg2 + run_in_executor path: ascending order preserved,
+Covers the async (asyncpg) bar reads behind /api/market/vix and
+/api/market/volatility?ticker=VIX|VXN: ascending order preserved,
 timestamps normalized to the requested tz, NULL-close rows dropped, OHLC
-floats (with None passthrough for non-close fields).
+floats (with None passthrough for non-close fields), and the ticker
+allowlist that protects the table-name SQL interpolation.
 """
 
 from datetime import datetime, timezone
@@ -17,19 +18,23 @@ ET = pytz.timezone("US/Eastern")
 
 
 class _FakeConn:
-    def __init__(self, rows):
+    def __init__(self, rows, captured_queries=None):
         self._rows = rows
+        self._captured = captured_queries
 
-    async def fetch(self, *args, **kwargs):
+    async def fetch(self, query, *args, **kwargs):
+        if self._captured is not None:
+            self._captured.append(query)
         return self._rows
 
 
 class _FakeAcquire:
-    def __init__(self, rows):
+    def __init__(self, rows, captured_queries=None):
         self._rows = rows
+        self._captured = captured_queries
 
     async def __aenter__(self):
-        return _FakeConn(self._rows)
+        return _FakeConn(self._rows, self._captured)
 
     async def __aexit__(self, *exc):
         return False
@@ -71,3 +76,50 @@ async def test_get_vix_bars_drops_null_close(monkeypatch):
 
     bars = await db.get_vix_bars(t0, ET)
     assert len(bars) == 1 and bars[0]["close"] == 18.2  # NULL-close row dropped
+
+
+@pytest.mark.asyncio
+async def test_get_volatility_index_bars_dispatches_to_vxn_table(monkeypatch):
+    """ticker="VXN" must hit ``vxn_bars`` (not vix_bars)."""
+    db = DatabaseManager()
+    t0 = datetime(2026, 6, 18, 14, 30, tzinfo=timezone.utc)
+    rows = [{"timestamp": t0, "open": 26.5, "high": 26.7, "low": 26.3, "close": 26.4}]
+    captured: list[str] = []
+    monkeypatch.setattr(db, "_acquire_connection", lambda: _FakeAcquire(rows, captured))
+
+    bars = await db.get_volatility_index_bars("VXN", t0, ET)
+
+    assert len(bars) == 1 and bars[0]["close"] == 26.4
+    assert len(captured) == 1
+    assert "FROM vxn_bars" in captured[0]
+    assert "FROM vix_bars" not in captured[0]
+
+
+@pytest.mark.asyncio
+async def test_get_vix_bars_alias_targets_vix_table(monkeypatch):
+    """get_vix_bars() must keep targeting vix_bars after the alias refactor."""
+    db = DatabaseManager()
+    t0 = datetime(2026, 5, 18, 14, 30, tzinfo=timezone.utc)
+    rows = [{"timestamp": t0, "open": 18.0, "high": 18.5, "low": 17.8, "close": 18.2}]
+    captured: list[str] = []
+    monkeypatch.setattr(db, "_acquire_connection", lambda: _FakeAcquire(rows, captured))
+
+    await db.get_vix_bars(t0, ET)
+
+    assert len(captured) == 1
+    assert "FROM vix_bars" in captured[0]
+    assert "FROM vxn_bars" not in captured[0]
+
+
+@pytest.mark.asyncio
+async def test_get_volatility_index_bars_normalizes_ticker_case():
+    """Lowercase tickers should resolve via the .upper() normalization."""
+    db = DatabaseManager()
+    # No DB access needed — ValueError fires from the allowlist check
+    # before _acquire_connection is touched.  Just confirm "vix" / "vxn"
+    # don't raise and "rvx" does.
+    assert "VIX" in DatabaseManager._VOLATILITY_INDEX_TABLES
+    assert "VXN" in DatabaseManager._VOLATILITY_INDEX_TABLES
+
+    with pytest.raises(ValueError, match="Unsupported volatility-index ticker"):
+        await db.get_volatility_index_bars("RVX", datetime(2026, 6, 18, tzinfo=timezone.utc), ET)

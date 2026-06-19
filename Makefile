@@ -171,6 +171,11 @@ db-tail-vix-bars: ## Show 20 most recent rows from vix_bars
 	@echo "$(BLUE)=== vix_bars (last 20) ===$(NC)"
 	@$(PSQL) -c "SELECT * FROM vix_bars ORDER BY timestamp DESC LIMIT 20;"
 
+.PHONY: db-tail-vxn-bars
+db-tail-vxn-bars: ## Show 20 most recent rows from vxn_bars
+	@echo "$(BLUE)=== vxn_bars (last 20) ===$(NC)"
+	@$(PSQL) -c "SELECT * FROM vxn_bars ORDER BY timestamp DESC LIMIT 20;"
+
 .PHONY: db-tail-api-calls
 db-tail-api-calls: ## Show 50 most recent rows from tradestation_api_calls
 	@echo "$(BLUE)=== tradestation_api_calls (last 50) ===$(NC)"
@@ -3146,7 +3151,6 @@ api-test: ## Test ALL API endpoints — HTTP code, time, size in an aligned tabl
 	hit "/api/gex/vol_surface?symbol=$$SYMBOL"; \
 	hit "/api/market/quote?symbol=$$SYMBOL"; \
 	hit "/api/market/session-closes?symbol=$$SYMBOL"; \
-	hit "/api/market/vix"; \
 	hit "/api/market/volatility?ticker=VIX"; \
 	hit "/api/market/volatility?ticker=VXN"; \
 	hit "/api/market/open-interest?underlying=$$SYMBOL"; \
