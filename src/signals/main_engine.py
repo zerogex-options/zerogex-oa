@@ -13,6 +13,7 @@ import time
 from multiprocessing import Process
 
 from src.config import SIGNALS_INTERVAL, SIGNALS_UNDERLYINGS
+from src.signals.playbook import calibration as pattern_calibration
 from src.signals.unified_signal_engine import UnifiedSignalEngine
 from src.symbols import parse_underlyings
 from src.utils import get_logger
@@ -43,6 +44,10 @@ class SignalEngineService:
         self.running = False
 
     def run_cycle(self) -> None:
+        # Refresh the playbook pattern-calibration store if its TTL has
+        # elapsed. Cheap no-op between reloads and fully best-effort — a
+        # failed refresh never blocks the signal cycle (handled internally).
+        pattern_calibration.maybe_refresh()
         unified_ok = self.unified_engine.run_cycle()
         logger.info(
             "SignalEngineService cycle [%s] complete | unified=%s",

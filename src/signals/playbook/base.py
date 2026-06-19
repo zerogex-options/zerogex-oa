@@ -23,6 +23,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Iterable, Optional
 
+from src.signals.playbook.calibration import calibrated_base
 from src.signals.playbook.context import PlaybookContext
 from src.signals.playbook.types import ActionCard, clamp_confidence
 
@@ -95,7 +96,12 @@ class PatternBase(ABC):
         of a signal counts as alignment (e.g. for a bearish pattern,
         a signal with score < 0 is aligned-for).
         """
-        base = self.pattern_base
+        # Empirical-base feedback loop: when pattern calibration is enabled and
+        # a trustworthy measurement exists, this replaces the hand-set prior
+        # with the pattern's measured win rate for this underlying. Returns
+        # ``self.pattern_base`` unchanged when calibration is off / absent, so
+        # confidence is identical to before unless an operator opts in.
+        base = calibrated_base(self.id, ctx.underlying, self.pattern_base)
         regime_fit = self._regime_fit(ctx.msi_regime)
         confluence = self._confluence_multiplier(
             ctx, bias=bias, extra_for=extra_for, extra_against=extra_against

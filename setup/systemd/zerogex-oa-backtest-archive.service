@@ -1,0 +1,38 @@
+[Unit]
+Description=ZeroGEX nightly archive of option_chains into option_chains_archive
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target
+Wants=network-online.target
+
+# Operator hook for active alerting — see the other refresh units.
+OnFailure=zerogex-alert@%n.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Copy the prior day's minute option_chains rows into the durable,
+# retention-exempt option_chains_archive so the backtesting platform can
+# price option legs past the 90-day DATA_RETENTION_DAYS prune horizon.
+# Idempotent (ON CONFLICT DO NOTHING), so a missed night is recovered by
+# the next run plus an occasional `make backtest-archive DAYS=N` backfill.
+ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa backtest-archive
+
+# One day x configured underlyings — bounded, but allow headroom on a cold
+# buffer pool.
+TimeoutStartSec=1800
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-backtest-archive

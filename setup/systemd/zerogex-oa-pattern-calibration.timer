@@ -1,0 +1,15 @@
+[Unit]
+Description=Pre-open trigger for ZeroGEX playbook pattern calibration (06:30 ET)
+
+[Timer]
+# Run daily at 06:30 server time (America/New_York), right after the 06:00
+# daily_atm_iv backfill and ~3h before the cash open. Slots after every
+# DB-heavy maintenance job so the backtest scan doesn't contend, and lands
+# fresh calibration in playbook_pattern_stats before the signals engine's
+# first cycles of the day. Jitter ±10 min.
+OnCalendar=*-*-* 06:30:00
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
