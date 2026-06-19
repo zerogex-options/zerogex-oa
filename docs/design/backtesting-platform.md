@@ -195,8 +195,16 @@ critical because gross 0DTE underlying-touch numbers materially overstate edge
 - **Phase 1 (this PR — v1):** schema, engine (underlying-timed exits + leg-priced
   P&L), async API, `/backtesting` UI, tests. Reads live `option_chains` within
   retention.
-- **Phase 1.5:** nightly `option_chains_archive` writer + prune-job exemption so
-  windows older than 90 days work.
+- **Phase 1.5 (shipped):** nightly `option_chains_archive` writer
+  (`src/tools/backtest_archive.py`, `make backtest-archive`,
+  `zerogex-oa-backtest-archive.timer`) + an explicit prune-job exemption
+  (`option_chains_archive` is intentionally absent from `DB_MAINTAIN_TABLES`),
+  so windows older than 90 days resolve. The engine tries live `option_chains`
+  first and falls back to the archive.
+  **Plus** the pattern-calibration feedback loop
+  (`docs/design/pattern-calibration.md`): the live engine can replace each
+  pattern's hand-set `pattern_base` with its measured win rate, refreshed
+  nightly (`zerogex-oa-pattern-calibration.timer`). Off by default.
 - **Phase 2 — custom strategies:** a rule/condition builder (GEX sign, flip
   distance, walls, flow, MSI bands) compiled into synthetic Cards, plus
   option-premium-series exit resolution (`Target.kind=premium_pct`).

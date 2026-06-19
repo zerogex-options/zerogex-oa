@@ -90,19 +90,46 @@ def _select_leg(card: CardRow) -> Optional[dict]:
     }
 
 
-def _fetch_leg_quote(
+# Source tables tried, in order, for a leg quote: the live hot table first
+# (covers the 90-day retained window), then the durable archive (covers older
+# windows once the nightly src/tools/backtest_archive.py job has copied them).
+_LEG_QUOTE_TABLES = ("option_chains", "option_chains_archive")
+
+
+def _archive_available(conn) -> bool:
+    """Whether option_chains_archive exists, memoized on the connection.
+
+    Checked once via ``to_regclass`` rather than catching a failing SELECT per
+    call — a failed statement would poison a non-autocommit transaction and
+    break every subsequent card in the run.
+    """
+    cached = getattr(conn, "_zg_archive_available", None)
+    if cached is not None:
+        return cached
+    available = False
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT to_regclass('public.option_chains_archive') IS NOT NULL")
+        row = cur.fetchone()
+        available = bool(row and row[0])
+    except Exception:  # pragma: no cover - default to live-only on any probe error
+        available = False
+    try:
+        conn._zg_archive_available = available
+    except Exception:  # pragma: no cover - some fakes disallow attribute set
+        pass
+    return available
+
+
+def _fetch_leg_quote_from(
     conn,
+    table: str,
     *,
     underlying: str,
     leg: dict,
     at: datetime,
-) -> Optional[dict]:
-    """Nearest option_chains quote for ``leg`` around instant ``at``.
-
-    Returns a dict with bid/ask/last/mid/option_symbol/strike/expiration, or
-    None when no quote exists within the tolerance window (a data gap).
-    Selects the row whose timestamp is closest to ``at`` (either side).
-    """
+) -> Optional[tuple]:
+    """Nearest quote row for ``leg`` around ``at`` from a single table, or None."""
     cur = conn.cursor()
     lo = at - timedelta(minutes=_QUOTE_TOLERANCE_MIN)
     hi = at + timedelta(minutes=_QUOTE_TOLERANCE_MIN)
@@ -111,7 +138,6 @@ def _fetch_leg_quote(
     if leg.get("expiry"):
         expiry_clause = "AND expiration = %s"
         params.append(leg["expiry"])
-    strike_clause = ""
     if leg.get("strike") is not None:
         # Match the closest strike to the requested one (synthetic ATM may not
         # land exactly on a listed strike).
@@ -124,7 +150,7 @@ def _fetch_leg_quote(
         f"""
         SELECT option_symbol, strike, expiration, option_type,
                bid, ask, last, mid, timestamp
-        FROM option_chains
+        FROM {table}
         WHERE underlying = %s
           AND option_type = %s
           AND timestamp BETWEEN %s AND %s
@@ -134,7 +160,28 @@ def _fetch_leg_quote(
         """,
         params,
     )
-    row = cur.fetchone()
+    return cur.fetchone()
+
+
+def _fetch_leg_quote(
+    conn,
+    *,
+    underlying: str,
+    leg: dict,
+    at: datetime,
+) -> Optional[dict]:
+    """Nearest leg quote around ``at``, trying live chains then the archive.
+
+    Returns a dict with bid/ask/last/mid/option_symbol/strike/expiration, or
+    None when no quote exists within the tolerance window in either source.
+    """
+    row = None
+    for table in _LEG_QUOTE_TABLES:
+        if table == "option_chains_archive" and not _archive_available(conn):
+            continue
+        row = _fetch_leg_quote_from(conn, table, underlying=underlying, leg=leg, at=at)
+        if row is not None:
+            break
     if row is None:
         return None
     return {

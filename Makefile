@@ -2875,6 +2875,11 @@ vacuum: ## Vacuum analyze all tables
 DATA_RETENTION_DAYS ?= 90
 
 # Helper: all tables that hold timestamped data and need regular maintenance.
+# Tables subject to DATA_RETENTION_DAYS pruning + VACUUM FULL.
+# NOTE: option_chains_archive is INTENTIONALLY EXCLUDED — it is the durable,
+# retention-exempt copy that backs the backtesting platform (see
+# src/tools/backtest_archive.py and docs/design/backtesting-platform.md). Do
+# NOT add it here; doing so would delete exactly the history backtests rely on.
 DB_MAINTAIN_TABLES = option_chains underlying_quotes gex_summary gex_by_strike \
 	flow_contract_facts flow_by_contract \
 	flow_smart_money trade_signals \
@@ -3461,6 +3466,22 @@ daily-atm-iv-backfill: ## Re-seed daily_atm_iv 30-day history (idempotent, runs 
 	@$(PY) -m src.tools.daily_atm_iv_backfill \
 		$(if $(DAILY_ATM_IV_SYMBOLS),--symbols $(DAILY_ATM_IV_SYMBOLS)) \
 		$(if $(DAILY_ATM_IV_DAYS),--days $(DAILY_ATM_IV_DAYS))
+
+# Backtesting platform: archive + calibration jobs (run nightly via timers).
+# Override with ARCHIVE_DAYS / ARCHIVE_UNDERLYINGS, CALIB_DAYS / CALIB_UNDERLYINGS.
+.PHONY: backtest-archive
+backtest-archive: ## Copy prior day's option_chains into option_chains_archive (idempotent)
+	@echo "$(BLUE)=== Archiving option_chains → option_chains_archive ===$(NC)"
+	@$(PY) -m src.tools.backtest_archive \
+		$(if $(ARCHIVE_DAYS),--days $(ARCHIVE_DAYS)) \
+		$(if $(ARCHIVE_UNDERLYINGS),--underlyings $(ARCHIVE_UNDERLYINGS))
+
+.PHONY: pattern-calibration-refresh
+pattern-calibration-refresh: ## Refresh playbook_pattern_stats + report calibrated bases
+	@echo "$(BLUE)=== Refreshing playbook pattern calibration ===$(NC)"
+	@$(PY) -m src.tools.pattern_calibration_refresh \
+		$(if $(CALIB_DAYS),--days $(CALIB_DAYS)) \
+		$(if $(CALIB_UNDERLYINGS),--underlyings $(CALIB_UNDERLYINGS))
 
 .PHONY: daily-atm-iv-backfill-install
 daily-atm-iv-backfill-install: ## Install the pre-open daily_atm_iv backfill timer (06:00 ET)

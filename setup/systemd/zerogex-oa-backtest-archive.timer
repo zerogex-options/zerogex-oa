@@ -1,0 +1,17 @@
+[Unit]
+Description=Post-close trigger for ZeroGEX option_chains archive (17:30 ET)
+
+[Timer]
+# Run daily at 17:30 server time (America/New_York). The cash session has
+# closed (16:00 ET) and option_chains has settled, so yesterday→today's rows
+# are stable. Running here — many hours before the 02:00 ET db-prune — keeps
+# a wide safety margin: rows are archived long before they approach the
+# 90-day retention horizon. Jitter ±5 min.
+OnCalendar=*-*-* 17:30:00
+RandomizedDelaySec=5m
+# Catch up on next boot if the box was off when the timer should have fired
+# (don't silently drop a day from the archive).
+Persistent=true
+
+[Install]
+WantedBy=timers.target

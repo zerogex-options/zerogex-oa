@@ -1,0 +1,36 @@
+[Unit]
+Description=ZeroGEX nightly playbook pattern calibration refresh
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target zerogex-oa-daily-atm-iv-backfill.service
+Wants=network-online.target
+
+OnFailure=zerogex-alert@%n.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Re-run the playbook backtest for each underlying to refresh
+# playbook_pattern_stats, then report the calibrated pattern bases the live
+# engine will adopt (when SIGNALS_PATTERN_CALIBRATION_ENABLED=1). The live
+# signals process reloads these on its own TTL; this job only refreshes the
+# measurements and emits a reviewable prior→calibrated diff to the journal.
+ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa pattern-calibration-refresh
+
+# Backtest scan over the lookback window x configured underlyings.
+TimeoutStartSec=1800
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-pattern-calibration

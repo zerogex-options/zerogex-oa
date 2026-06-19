@@ -967,6 +967,48 @@ SIGNALS_UNDERLYINGS = os.getenv("SIGNALS_UNDERLYINGS", "SPY")
 SIGNALS_INTERVAL = max(1, _getenv_int("SIGNALS_INTERVAL", 1))
 SIGNALS_PORTFOLIO_SIZE = _getenv_float("SIGNALS_PORTFOLIO_SIZE", 1000000)
 
+# ---------------------------------------------------------------------------
+# Playbook pattern calibration (empirical-base feedback loop)
+#
+# When enabled, the live PlaybookEngine replaces each pattern's hand-set
+# ``pattern_base`` prior with the empirical win rate measured by the playbook
+# backtest harness (``playbook_pattern_stats.proposed_base``), so live Action
+# Card confidence reflects what a pattern actually did rather than a guess.
+# OFF by default — turning it on changes live trade-signal confidence, so it
+# is an explicit operator decision. See docs/design/pattern-calibration.md.
+# ---------------------------------------------------------------------------
+SIGNALS_PATTERN_CALIBRATION_ENABLED = _getenv_bool(
+    "SIGNALS_PATTERN_CALIBRATION_ENABLED", False
+)
+# Minimum resolved trades in a (pattern, underlying) window before its measured
+# base is trusted. Below this the hand-set prior is kept.
+SIGNALS_PATTERN_CALIBRATION_MIN_SAMPLES = _getenv_int(
+    "SIGNALS_PATTERN_CALIBRATION_MIN_SAMPLES", 20, min=1
+)
+# Ignore stats windows whose end date is older than this — a pattern's edge
+# decays, so stale measurements should fall back to the prior.
+SIGNALS_PATTERN_CALIBRATION_MAX_AGE_DAYS = _getenv_int(
+    "SIGNALS_PATTERN_CALIBRATION_MAX_AGE_DAYS", 45, min=1
+)
+# Clamp band for the calibrated base. Mirrors the catalog's [0.40, 0.85]
+# pattern_base band so a single unlucky window can't zero out a pattern or a
+# lucky one can't inflate it past the engine's design envelope.
+SIGNALS_PATTERN_CALIBRATION_FLOOR = _getenv_float(
+    "SIGNALS_PATTERN_CALIBRATION_FLOOR", 0.40, min=0.0, max=1.0
+)
+SIGNALS_PATTERN_CALIBRATION_CEIL = _getenv_float(
+    "SIGNALS_PATTERN_CALIBRATION_CEIL", 0.85, min=0.0, max=1.0
+)
+# How often the long-running signals process reloads the calibration store
+# from the stats table (seconds). Cheap no-op between reloads.
+SIGNALS_PATTERN_CALIBRATION_REFRESH_SECONDS = _getenv_int(
+    "SIGNALS_PATTERN_CALIBRATION_REFRESH_SECONDS", 21600, min=60  # 6h
+)
+# Number of days of history each nightly calibration backtest scans.
+SIGNALS_PATTERN_CALIBRATION_LOOKBACK_DAYS = _getenv_int(
+    "SIGNALS_PATTERN_CALIBRATION_LOOKBACK_DAYS", 60, min=5
+)
+
 # GEX normalization scale used to map net_gex into [-1, 1] for multiple
 # signal components (vol_expansion, strategy_builder, position optimizer).
 # Calibrated for the industry-standard "dollar gamma per 1% move" GEX

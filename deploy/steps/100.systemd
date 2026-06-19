@@ -100,6 +100,11 @@ TIMER_UNITS=(
     # state to $HOME/monitoring/state.json; the directory is created
     # below before the timer is enabled so the first tick doesn't race.
     "zerogex-oa-system-monitor"
+    # Backtesting platform: nightly option_chains → archive copy (17:30 ET) and
+    # the playbook pattern-calibration refresh (06:30 ET). See
+    # docs/design/backtesting-platform.md + docs/design/pattern-calibration.md.
+    "zerogex-oa-backtest-archive"
+    "zerogex-oa-pattern-calibration"
 )
 
 # Pre-create writable state directories needed by the timer units above.
