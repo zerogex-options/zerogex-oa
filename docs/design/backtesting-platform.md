@@ -1,6 +1,6 @@
 # ZeroGEX Backtesting Platform — Design
 
-**Status:** Phases 1–2 shipped & validated on live data · **Last updated:** 2026-06-21
+**Status:** Phases 1–3 shipped (1–2 validated on live data) · **Last updated:** 2026-06-21
 **Owners:** ZeroGEX engine team
 **Repos:** `zerogex-oa` (engine + API), `zerogex-web` (subscriber UI)
 
@@ -241,9 +241,13 @@ critical because gross 0DTE underlying-touch numbers materially overstate edge
   (`exit.profit_target_pct` / `stop_loss_pct`), checked alongside the underlying
   level triggers and exposed in the config form. Rescues Cards whose target/stop
   are non-level (previously dropped as `unresolved`).
-- **Phase 3 — custom strategy builder (next):** a rule/condition builder (GEX
-  sign, flip distance, walls, flow, MSI bands) compiled into synthetic Cards, so
-  users backtest setups beyond the built-in playbook patterns.
+- **Phase 3 — custom strategy builder (shipped):** a condition builder over
+  per-minute market structure (`net_gex_sign`, `flip_distance_pct`, `msi` /
+  `msi_regime`, wall distances, `put_call_ratio`, …) compiled into synthetic ATM
+  Cards that flow through the same forward-walk engine. `src/backtesting/
+  strategy.py` as-of merges `underlying_quotes ⋈ gex_summary ⋈ signal_scores`;
+  exits combine underlying level offsets with the Phase-2 premium overlay. UI:
+  a "Custom strategy" mode with a dynamic condition builder on `/backtesting`.
 - **Phase 4 — multi-leg structures:** verticals/condors priced per-leg through
   the same `leg_fill_price` model (the Card already carries `legs[]`), Greeks-
   aware sizing, and a dedicated worker process replacing `BackgroundTasks`.
