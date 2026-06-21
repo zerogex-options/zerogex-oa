@@ -1,6 +1,6 @@
 # ZeroGEX Backtesting Platform — Design
 
-**Status:** v1 (Phase 1 shipping) · **Last updated:** 2026-06-18
+**Status:** Phases 1–3 shipped (1–2 validated on live data) · **Last updated:** 2026-06-21
 **Owners:** ZeroGEX engine team
 **Repos:** `zerogex-oa` (engine + API), `zerogex-web` (subscriber UI)
 
@@ -218,9 +218,8 @@ critical because gross 0DTE underlying-touch numbers materially overstate edge
 
 ## 6. Phasing
 
-- **Phase 1 (this PR — v1):** schema, engine (underlying-timed exits + leg-priced
-  P&L), async API, `/backtesting` UI, tests. Reads live `option_chains` within
-  retention.
+- **Phase 1 — v1 (shipped, validated on live data):** schema, engine, async API,
+  `/backtesting` UI, tests. Reads live `option_chains` within retention.
 - **Phase 1.5 (shipped):** nightly `option_chains_archive` writer
   (`src/tools/backtest_archive.py`, `make backtest-archive`,
   `zerogex-oa-backtest-archive.timer`) + an explicit prune-job exemption
@@ -231,19 +230,38 @@ critical because gross 0DTE underlying-touch numbers materially overstate edge
   (`docs/design/pattern-calibration.md`): the live engine can replace each
   pattern's hand-set `pattern_base` with its measured win rate, refreshed
   nightly (`zerogex-oa-pattern-calibration.timer`). Off by default.
-- **Phase 2 — custom strategies:** a rule/condition builder (GEX sign, flip
-  distance, walls, flow, MSI bands) compiled into synthetic Cards, plus
-  option-premium-series exit resolution (`Target.kind=premium_pct`).
-- **Phase 3 — multi-leg structures:** verticals/condors priced per-leg through
+- **Phase 1.6 — forward-walk exit engine (shipped):** replaced the two-point
+  pricing model with a bar-by-bar walk — entry filled at its trigger bar, exit
+  scanned **strictly after** the fill bar (≥1-bar min hold), so a target that
+  prints inside the entry bar no longer books a zero-hold spread loss. Plus the
+  per-pattern signal **cooldown** (`BACKTEST_SIGNAL_COOLDOWN_MINUTES`) and the
+  run **diagnostics funnel** (`summary.diagnostics`, surfaced in the UI).
+- **Phase 2 — option-premium exit resolution (shipped):** take-profit /
+  stop-loss resolved on the option's own premium series
+  (`exit.profit_target_pct` / `stop_loss_pct`), checked alongside the underlying
+  level triggers and exposed in the config form. Rescues Cards whose target/stop
+  are non-level (previously dropped as `unresolved`).
+- **Phase 3 — custom strategy builder (shipped):** a condition builder over
+  per-minute market structure (`net_gex_sign`, `flip_distance_pct`, `msi` /
+  `msi_regime`, wall distances, `put_call_ratio`, …) compiled into synthetic ATM
+  Cards that flow through the same forward-walk engine. `src/backtesting/
+  strategy.py` as-of merges `underlying_quotes ⋈ gex_summary ⋈ signal_scores`;
+  exits combine underlying level offsets with the Phase-2 premium overlay. UI:
+  a "Custom strategy" mode with a dynamic condition builder on `/backtesting`.
+- **Phase 4 — multi-leg structures:** verticals/condors priced per-leg through
   the same `leg_fill_price` model (the Card already carries `legs[]`), Greeks-
   aware sizing, and a dedicated worker process replacing `BackgroundTasks`.
 
 ---
 
-## 7. Out of scope for v1
+## 7. Out of scope (still open)
 
 - Walk-forward optimization / parameter sweeps.
 - Saved/shareable backtest configs and CSV export (trivial follow-up).
-- Intraday option-premium target/stop resolution (Phase 2).
-- A standalone worker/queue (v1 uses FastAPI `BackgroundTasks`; fine for the
-  single-process API host, replaced in Phase 3).
+- Custom user-defined strategies beyond the playbook patterns (Phase 3).
+- A standalone worker/queue (today uses FastAPI `BackgroundTasks`; fine for the
+  single-process API host, replaced in Phase 4).
+- **Same-bar exit precision:** the min-hold removes the zero-hold artifact, but
+  a same-bar level target still exits at next-bar market rather than the exact
+  target premium. The premium overlay (Phase 2) is the precise tool when a
+  defined profit/stop is wanted.

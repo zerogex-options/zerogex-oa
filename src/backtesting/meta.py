@@ -79,10 +79,50 @@ def _data_window(conn) -> dict:
     }
 
 
+# Catalog for the custom-strategy condition builder. Each entry describes one
+# selectable field, its type, operators, an optional unit hint, and (for
+# categorical fields) the allowed values.
+def _strategy_fields() -> list[dict]:
+    from src.backtesting.models import STRATEGY_CATEGORICAL_FIELDS
+
+    numeric = [
+        ("price", "Underlying price", "$"),
+        ("msi", "MSI composite (0–100)", ""),
+        ("net_gex", "Net GEX (total)", ""),
+        ("net_gex_at_spot", "Net GEX at spot", ""),
+        ("flip_distance_pct", "Distance to gamma flip", "%"),
+        ("dist_to_call_wall_pct", "Distance to call wall (+ = above)", "%"),
+        ("dist_to_put_wall_pct", "Distance to put wall (+ = below)", "%"),
+        ("put_call_ratio", "Put/call ratio", ""),
+        ("convexity_risk", "Convexity risk", ""),
+        ("gamma_flip_point", "Gamma flip level", "$"),
+        ("call_wall", "Call wall level", "$"),
+        ("put_wall", "Put wall level", "$"),
+        ("max_pain", "Max pain level", "$"),
+        ("flip_distance", "Flip distance (raw)", ""),
+    ]
+    out = [
+        {"field": f, "label": label, "type": "numeric",
+         "ops": ["<", "<=", ">", ">=", "==", "!="], "unit": unit}
+        for f, label, unit in numeric
+    ]
+    labels = {
+        "net_gex_sign": "Net GEX sign",
+        "msi_regime": "MSI regime",
+    }
+    for field, values in STRATEGY_CATEGORICAL_FIELDS.items():
+        out.append({
+            "field": field, "label": labels.get(field, field), "type": "categorical",
+            "ops": ["==", "!="], "values": list(values),
+        })
+    return out
+
+
 def build_meta(conn) -> dict:
     return {
         "underlyings": _underlyings(),
         "patterns": _pattern_catalog(),
+        "strategy_fields": _strategy_fields(),
         "data_window": _data_window(conn),
         "defaults": dict(_DEFAULTS),
     }
