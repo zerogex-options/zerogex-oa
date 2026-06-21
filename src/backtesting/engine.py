@@ -208,6 +208,51 @@ def _fetch_leg_quote(
     }
 
 
+def _fetch_option_series(conn, option_symbol: str, after_ts: datetime, deadline: datetime) -> dict:
+    """Minute premium series for one resolved contract, keyed by timestamp.
+
+    Spans ``(after_ts, deadline]``. Used by the Phase-2 premium exit overlay to
+    detect take-profit / stop-loss touches and to price the exit at the trigger
+    bar. Live ``option_chains`` takes precedence; the archive fills older bars.
+    """
+    series: dict[datetime, dict] = {}
+    for table in _LEG_QUOTE_TABLES:
+        if table == "option_chains_archive" and not _archive_available(conn):
+            continue
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT timestamp, bid, ask, last, mid
+            FROM {table}
+            WHERE option_symbol = %s AND timestamp > %s AND timestamp <= %s
+            ORDER BY timestamp
+            """,
+            (option_symbol, after_ts, deadline),
+        )
+        for r in cur.fetchall():
+            ts = r[0]
+            if ts in series:  # live (queried first) wins
+                continue
+            series[ts] = {
+                "bid": float(r[1]) if r[1] is not None else 0.0,
+                "ask": float(r[2]) if r[2] is not None else 0.0,
+                "last": float(r[3]) if r[3] is not None else 0.0,
+                "mid": float(r[4]) if r[4] is not None else 0.0,
+            }
+    return series
+
+
+def _option_mark(row: dict) -> float:
+    """Best mark for a premium-trigger check: mid, else (bid+ask)/2, else last."""
+    mid = row.get("mid") or 0.0
+    if mid > 0:
+        return mid
+    bid, ask, last = row.get("bid") or 0.0, row.get("ask") or 0.0, row.get("last") or 0.0
+    if bid > 0 and ask > 0:
+        return (bid + ask) / 2.0
+    return max(last, ask, bid, 0.0)
+
+
 def _resolve_entry_fill(quotes, *, entry_ref: float, immediate: bool):
     """Return the (ts, idx) of the bar the trade fills on, or (None, None).
 
@@ -268,8 +313,14 @@ def _build_candidate(
 
     target_price = _level_or_none(payload.get("target"))
     stop_price = _level_or_none(payload.get("stop"))
-    if target_price is None and stop_price is None:
-        # Premium/event exits aren't resolvable from the underlying — Phase 2.
+    profit_target_pct = spec.exit.profit_target_pct
+    stop_loss_pct = spec.exit.stop_loss_pct
+    has_level = target_price is not None or stop_price is not None
+    has_premium = profit_target_pct is not None or stop_loss_pct is not None
+    if not has_level and not has_premium:
+        # Card's target/stop are premium/event-kind and no premium overlay was
+        # supplied — nothing resolvable. Configure exit.profit_target_pct /
+        # stop_loss_pct to backtest these on the option premium series.
         return None, "outcome:unresolved"
 
     leg = _select_leg(
@@ -312,6 +363,16 @@ def _build_candidate(
     if entry_premium <= 0:
         return None, "bad_premium"
 
+    # Phase-2 premium exit overlay: take-profit / stop on the option's own
+    # premium series, checked alongside the underlying level triggers.
+    deadline = card.timestamp + timedelta(minutes=max_hold)
+    opt_series = (
+        _fetch_option_series(conn, entry_q["option_symbol"], fill_ts, deadline)
+        if has_premium else {}
+    )
+    prem_target = entry_premium * (1.0 + profit_target_pct) if profit_target_pct else None
+    prem_stop = entry_premium * (1.0 - stop_loss_pct) if stop_loss_pct else None
+
     # 3) Forward walk for the exit — bars STRICTLY AFTER the fill bar (min hold).
     mfe_pct = 0.0
     mae_pct = 0.0
@@ -323,6 +384,14 @@ def _build_candidate(
         mae_pct = min(mae_pct, _signed_excursion(direction, entry_ref, adverse))
         hit_t = _hit_target(direction, target_price, high, low)
         hit_s = _hit_stop(direction, stop_price, high, low)
+        # Premium overlay: compare the option mark at this bar to the targets.
+        opt_row = opt_series.get(ts)
+        if opt_row is not None:
+            mark = _option_mark(opt_row)
+            if prem_target is not None and mark >= prem_target:
+                hit_t = True
+            if prem_stop is not None and mark <= prem_stop:
+                hit_s = True
         # Same-bar both-touch: intrabar order is unknown → resolve to stop.
         if hit_t and hit_s:
             exit_ts, outcome = ts, "stop_hit"
@@ -339,8 +408,16 @@ def _build_candidate(
         # Only the fill bar existed — no bar to hold into.
         return None, "outcome:no_exit_bar"
 
-    # 4) Exit option price at the resolved bar.
-    exit_q = _fetch_leg_quote(conn, underlying=card.underlying, leg=resolved_leg, at=exit_ts)
+    # 4) Exit option price at the resolved bar — prefer the already-fetched
+    # series row, else look the contract up directly.
+    exit_q = None
+    series_row = opt_series.get(exit_ts)
+    if series_row is not None:
+        exit_q = {
+            "bid": series_row["bid"], "ask": series_row["ask"], "last": series_row["last"],
+        }
+    if exit_q is None:
+        exit_q = _fetch_leg_quote(conn, underlying=card.underlying, leg=resolved_leg, at=exit_ts)
     if exit_q is None:
         return None, "no_exit_quote"
     exit_premium = leg_fill_price(

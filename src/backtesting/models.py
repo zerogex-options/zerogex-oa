@@ -120,23 +120,56 @@ class Sizing:
         )
 
 
+def _coerce_opt_pct(value: Any, *, field_name: str, hi: float) -> Optional[float]:
+    """Optional positive fraction (e.g. 0.5 = 50%); None/blank ⇒ disabled."""
+    if value in (None, ""):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        raise SpecError(f"{field_name} must be a number or null")
+    if out != out or out <= 0:  # NaN or non-positive ⇒ treat as disabled
+        return None
+    return min(out, hi)
+
+
 @dataclass
 class ExitRules:
-    """Optional overrides for per-Card exit behavior."""
+    """Optional overrides for per-Card exit behavior.
+
+    ``profit_target_pct`` / ``stop_loss_pct`` are an option-premium exit overlay
+    (Phase 2): take profit when the option's premium rises ``profit_target_pct``
+    above the entry fill, stop out when it falls ``stop_loss_pct`` below — both
+    resolved on the option's own premium series, in addition to any underlying
+    level target/stop the Card carries. ``None`` disables that side.
+    """
 
     max_hold_minutes: Optional[int] = None
+    profit_target_pct: Optional[float] = None
+    stop_loss_pct: Optional[float] = None
 
     @classmethod
     def from_dict(cls, raw: Optional[dict]) -> "ExitRules":
         raw = raw or {}
         mhm = raw.get("max_hold_minutes")
         if mhm in (None, ""):
-            return cls(max_hold_minutes=None)
-        try:
-            val = int(mhm)
-        except (TypeError, ValueError):
-            raise SpecError("exit.max_hold_minutes must be an integer or null")
-        return cls(max_hold_minutes=max(1, min(val, 10_080)))
+            max_hold = None
+        else:
+            try:
+                max_hold = max(1, min(int(mhm), 10_080))
+            except (TypeError, ValueError):
+                raise SpecError("exit.max_hold_minutes must be an integer or null")
+        return cls(
+            max_hold_minutes=max_hold,
+            # Take-profit can exceed 100% (a 0DTE can multiply); stop caps at
+            # 100% (the option can't lose more than its premium).
+            profit_target_pct=_coerce_opt_pct(
+                raw.get("profit_target_pct"), field_name="exit.profit_target_pct", hi=20.0
+            ),
+            stop_loss_pct=_coerce_opt_pct(
+                raw.get("stop_loss_pct"), field_name="exit.stop_loss_pct", hi=1.0
+            ),
+        )
 
 
 @dataclass
@@ -198,7 +231,11 @@ class BacktestSpec:
                 "risk_per_trade_pct": self.sizing.risk_per_trade_pct,
                 "max_concurrent": self.sizing.max_concurrent,
             },
-            "exit": {"max_hold_minutes": self.exit.max_hold_minutes},
+            "exit": {
+                "max_hold_minutes": self.exit.max_hold_minutes,
+                "profit_target_pct": self.exit.profit_target_pct,
+                "stop_loss_pct": self.exit.stop_loss_pct,
+            },
             "cooldown_minutes": self.cooldown_minutes,
         }
 

@@ -83,6 +83,24 @@ def test_spec_clamps_sizing_and_fill():
     assert spec.sizing.max_concurrent == 20  # clamped
 
 
+def test_spec_parses_premium_overlay():
+    spec = BacktestSpec.from_dict(
+        {
+            "underlying": "SPY", "start_date": "2026-05-01", "end_date": "2026-05-02",
+            "exit": {"profit_target_pct": 0.5, "stop_loss_pct": 1.5},
+        }
+    )
+    assert spec.exit.profit_target_pct == 0.5
+    assert spec.exit.stop_loss_pct == 1.0  # stop clamps at 100% (option to zero)
+    # Omitted / non-positive ⇒ disabled (None), not 0.
+    bare = BacktestSpec.from_dict(
+        {"underlying": "SPY", "start_date": "2026-05-01", "end_date": "2026-05-02"}
+    )
+    assert bare.exit.profit_target_pct is None
+    assert bare.exit.stop_loss_pct is None
+    assert "profit_target_pct" in bare.to_dict()["exit"]
+
+
 def test_spec_roundtrips_through_dict():
     raw = {
         "underlying": "QQQ",
@@ -265,6 +283,9 @@ class _FakeCursor:
             self._result = self._store["cards"]
         elif "FROM underlying_quotes" in s:
             self._result = self._store["quotes"]
+        elif "option_symbol = %s" in s and "timestamp > %s" in s:
+            # Phase-2 option-premium series query for the resolved contract.
+            self._result = list(self._store.get("opt_series", []))
         elif "FROM option_chains" in s:
             # entry vs exit both hit option_chains; return the single canned
             # leg quote (closest-row LIMIT 1 semantics).
@@ -352,8 +373,11 @@ def _bt_spec(**over):
     return BacktestSpec.from_dict(base)
 
 
-def _conn_with(cards, quotes, leg_quote):
-    return _FakeConn({"cards": cards, "quotes": quotes, "leg_quote": leg_quote})
+def _conn_with(cards, quotes, leg_quote, opt_series=None):
+    return _FakeConn({
+        "cards": cards, "quotes": quotes, "leg_quote": leg_quote,
+        "opt_series": opt_series or [],
+    })
 
 
 def run_backtest_single(conn, spec=None):
@@ -446,6 +470,79 @@ def test_build_candidate_no_fill_when_trigger_never_touched():
         _conn_with([_legcard(trigger="on_break", entry=500.0)], quotes, leg_quote)
     )
     assert reason == "outcome:no_fill"
+    assert cand is None
+
+
+# ----------------------------------------------------------------------
+# Phase 2: option-premium exit overlay
+# ----------------------------------------------------------------------
+
+
+def _prem_card(*, ts):
+    """A premium-exit Card: target/stop are premium_pct (non-level) — only the
+    option-premium overlay can resolve it."""
+    payload = {
+        "entry": {"ref_price": 500.0, "trigger": "at_market"},
+        "target": {"ref_price": None, "kind": "premium_pct"},
+        "stop": {"ref_price": None, "kind": "premium_pct"},
+        "max_hold_minutes": 120,
+        "legs": [{"expiry": "2026-05-01", "strike": 500, "right": "C", "side": "BUY"}],
+    }
+    return ("SPY", ts, "pin_risk_premium_sell", "BUY_CALL", "0DTE", "bullish", 0.7,
+            json.dumps(payload))
+
+
+def test_premium_overlay_rescues_unresolved_card():
+    ts = datetime(2026, 5, 1, 14, 0, tzinfo=ET)
+    quotes = [
+        (ts, 500.0, 500.2, 499.9, 500.1),
+        (ts + timedelta(minutes=5), 500.1, 500.3, 500.0, 500.2),
+        (ts + timedelta(minutes=10), 500.2, 500.4, 500.1, 500.3),
+    ]
+    # entry premium = ask*1.0 = 2.00 (slippage 0 in _bt_spec). +50% target = 3.00.
+    leg_quote = ("SPY 260501C500", 500.0, date(2026, 5, 1), "C", 2.00, 2.00, 2.00, 2.00, ts)
+    # Option mark jumps to 3.10 on the 3rd bar → take-profit (>= 3.00).
+    opt_series = [
+        (ts + timedelta(minutes=5), 2.40, 2.40, 2.40, 2.40),
+        (ts + timedelta(minutes=10), 3.10, 3.10, 3.10, 3.10),
+    ]
+    spec = _bt_spec(exit={"profit_target_pct": 0.5, "stop_loss_pct": 0.5})
+    cand, reason = run_backtest_single(
+        _conn_with([_prem_card(ts=ts)], quotes, leg_quote, opt_series), spec
+    )
+    assert reason == "ok"                              # no longer "unresolved"
+    assert cand["outcome"] == "target_hit"
+    assert cand["exited_at"] == ts + timedelta(minutes=10)
+    assert cand["exit_premium"] == pytest.approx(3.10)  # priced from the series row
+
+
+def test_premium_overlay_stop_loss():
+    ts = datetime(2026, 5, 1, 14, 0, tzinfo=ET)
+    quotes = [
+        (ts, 500.0, 500.2, 499.9, 500.1),
+        (ts + timedelta(minutes=5), 500.1, 500.2, 499.5, 499.6),
+    ]
+    leg_quote = ("SPY 260501C500", 500.0, date(2026, 5, 1), "C", 2.00, 2.00, 2.00, 2.00, ts)
+    # Option mark drops to 0.90 → below the −50% stop (1.00).
+    opt_series = [(ts + timedelta(minutes=5), 0.90, 0.90, 0.90, 0.90)]
+    spec = _bt_spec(exit={"profit_target_pct": 0.5, "stop_loss_pct": 0.5})
+    cand, reason = run_backtest_single(
+        _conn_with([_prem_card(ts=ts)], quotes, leg_quote, opt_series), spec
+    )
+    assert reason == "ok"
+    assert cand["outcome"] == "stop_hit"
+    assert cand["exit_premium"] == pytest.approx(0.90)
+
+
+def test_premium_card_still_unresolved_without_overlay():
+    ts = datetime(2026, 5, 1, 14, 0, tzinfo=ET)
+    quotes = [
+        (ts, 500.0, 500.2, 499.9, 500.1),
+        (ts + timedelta(minutes=5), 500.1, 500.3, 500.0, 500.2),
+    ]
+    leg_quote = ("SPY 260501C500", 500.0, date(2026, 5, 1), "C", 2.00, 2.00, 2.00, 2.00, ts)
+    cand, reason = run_backtest_single(_conn_with([_prem_card(ts=ts)], quotes, leg_quote))
+    assert reason == "outcome:unresolved"
     assert cand is None
 
 
