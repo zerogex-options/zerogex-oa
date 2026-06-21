@@ -92,7 +92,8 @@ def get_trades(run_id: int, *, limit: int = 100, offset: int = 0) -> dict:
             """
             SELECT seq, pattern, direction, tier, option_symbol, option_type,
                    strike, expiration, entered_at, exited_at, entry_premium,
-                   exit_premium, contracts, net_pnl, return_pct, outcome, hold_minutes
+                   exit_premium, contracts, net_pnl, return_pct, outcome, hold_minutes,
+                   structure, legs
             FROM backtest_trades
             WHERE run_id = %s
             ORDER BY seq
@@ -119,6 +120,8 @@ def get_trades(run_id: int, *, limit: int = 100, offset: int = 0) -> dict:
                 "return_pct": float(r[14]) if r[14] is not None else None,
                 "outcome": r[15],
                 "hold_minutes": r[16],
+                "structure": r[17],
+                "legs": r[18] if r[18] is not None else [],
             }
             for r in cur.fetchall()
         ]

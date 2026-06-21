@@ -158,6 +158,20 @@ def _passes(conditions: list[Condition], bar: dict) -> bool:
     return True
 
 
+def _build_legs(strategy: StrategySpec, price: float, expiry: str) -> list[dict]:
+    """ATM single, or a defined-risk vertical (long ATM + short OTM by width)."""
+    right = "C" if strategy.direction == "bullish" else "P"
+    atm = round(price)
+    long_leg = {"expiry": expiry, "strike": atm, "right": right, "side": "BUY"}
+    if strategy.structure != "vertical":
+        return [long_leg]
+    # Bullish call vertical: short the higher-strike call. Bearish put vertical:
+    # short the lower-strike put. Both are debit spreads in the trade direction.
+    short_strike = atm + strategy.width if strategy.direction == "bullish" else atm - strategy.width
+    short_leg = {"expiry": expiry, "strike": short_strike, "right": right, "side": "SELL"}
+    return [long_leg, short_leg]
+
+
 def _synth_card(strategy: StrategySpec, bar: dict, *, underlying: str, max_hold: int) -> CardRow:
     price = bar["price"]
     direction = strategy.direction
@@ -168,7 +182,7 @@ def _synth_card(strategy: StrategySpec, bar: dict, *, underlying: str, max_hold:
         "direction": direction,
         "entry": {"ref_price": price, "trigger": "at_market"},
         "max_hold_minutes": max_hold,
-        "legs": [{"expiry": expiry, "strike": round(price), "right": right, "side": "BUY"}],
+        "legs": _build_legs(strategy, price, expiry),
     }
     # Level-offset exits (favorable target / adverse stop), if configured.
     if strategy.target_offset_pct is not None:

@@ -241,6 +241,8 @@ class StrategySpec:
     direction: str
     conditions: list[Condition]
     dte: int = 0
+    structure: str = "single"        # "single" | "vertical"
+    width: float = 5.0               # vertical width in strike points
     target_offset_pct: Optional[float] = None  # fraction of entry price, favorable
     stop_offset_pct: Optional[float] = None    # fraction of entry price, adverse
 
@@ -260,10 +262,25 @@ class StrategySpec:
             dte = int(entry.get("dte", 0) or 0)
         except (TypeError, ValueError):
             raise SpecError("strategy.entry.dte must be an integer")
+        structure = str(raw.get("structure") or "single").strip().lower()
+        if structure not in ("single", "vertical"):
+            raise SpecError("strategy.structure must be 'single' or 'vertical'")
+        width_raw = raw.get("width")
+        if width_raw in (None, ""):
+            width = 5.0
+        else:
+            try:
+                width = float(width_raw)
+            except (TypeError, ValueError):
+                raise SpecError("strategy.width must be a number")
+        if width <= 0:
+            raise SpecError("strategy.width must be positive")
         return cls(
             direction=direction,
             conditions=conditions,
             dte=min(max(dte, 0), 30),
+            structure=structure,
+            width=width,
             target_offset_pct=_coerce_opt_pct(
                 raw.get("target_offset_pct"), field_name="strategy.target_offset_pct", hi=1.0
             ),
@@ -277,6 +294,8 @@ class StrategySpec:
             "direction": self.direction,
             "conditions": [c.to_dict() for c in self.conditions],
             "entry": {"dte": self.dte},
+            "structure": self.structure,
+            "width": self.width,
             "target_offset_pct": self.target_offset_pct,
             "stop_offset_pct": self.stop_offset_pct,
         }
@@ -396,6 +415,8 @@ class TradeResult:
     mfe_pct: Optional[float]
     mae_pct: Optional[float]
     hold_minutes: Optional[int]
+    structure: str = "single"
+    legs: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -403,6 +424,8 @@ class TradeResult:
             "pattern": self.pattern,
             "direction": self.direction,
             "tier": self.tier,
+            "structure": self.structure,
+            "legs": self.legs,
             "option_symbol": self.option_symbol,
             "option_type": self.option_type,
             "strike": float(self.strike) if self.strike is not None else None,

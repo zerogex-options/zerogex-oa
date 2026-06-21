@@ -546,6 +546,91 @@ def test_premium_card_still_unresolved_without_overlay():
     assert cand is None
 
 
+# ----------------------------------------------------------------------
+# Phase 4: multi-leg structures
+# ----------------------------------------------------------------------
+
+
+def test_select_legs_normalizes_vertical():
+    from src.backtesting.engine import _select_legs
+
+    card = _card()
+    card.payload["legs"] = [
+        {"expiry": "2026-05-01", "strike": 500, "right": "C", "side": "BUY"},
+        {"expiry": "2026-05-01", "strike": 505, "right": "C", "side": "SELL"},
+    ]
+    legs = _select_legs(card)
+    assert [leg["side"] for leg in legs] == ["long", "short"]
+    assert [leg["strike"] for leg in legs] == [500, 505]
+
+
+def test_structure_label_and_max_loss():
+    from src.backtesting.engine import _max_loss_per_share, _structure_label
+
+    resolved = [
+        {"option_symbol": "C500", "right": "C", "side": "long", "strike": 500.0, "qty": 1},
+        {"option_symbol": "C505", "right": "C", "side": "short", "strike": 505.0, "qty": 1},
+    ]
+    assert _structure_label(resolved) == "vertical"
+    # Debit spread: open_cashflow = -2.6 ⇒ net debit 2.6 ⇒ max loss 2.6.
+    assert _max_loss_per_share(-2.6, resolved) == pytest.approx(2.6)
+    # Credit spread: open_cashflow = +1.5 (credit) on a 5-wide ⇒ max loss 3.5.
+    assert _max_loss_per_share(1.5, resolved) == pytest.approx(3.5)
+    # Credit >= width would be a non-sane structure ⇒ None.
+    assert _max_loss_per_share(6.0, resolved) is None
+
+
+class _StrikeCur:
+    """Leg-quote cursor that returns a strike-specific row."""
+
+    def __init__(self, quotes_by_strike):
+        self._q = quotes_by_strike
+        self._r = []
+
+    def execute(self, sql, params=None):
+        s = " ".join(sql.split())
+        if "to_regclass" in s:
+            self._r = []
+        elif "FROM option_chains" in s and params is not None:
+            strike = next((p for p in params if isinstance(p, (int, float)) and p in self._q), None)
+            self._r = [self._q[strike]] if strike is not None else []
+        else:
+            self._r = []
+
+    def fetchall(self):
+        return list(self._r)
+
+    def fetchone(self):
+        return self._r[0] if self._r else None
+
+
+class _StrikeConn:
+    def __init__(self, quotes_by_strike):
+        self._q = quotes_by_strike
+
+    def cursor(self):
+        return _StrikeCur(self._q)
+
+
+def test_price_legs_vertical_net_debit():
+    from src.backtesting.engine import _price_legs
+
+    d = date(2026, 5, 1)
+    quotes = {
+        500: ("SPY C500", 500.0, d, "C", 4.90, 5.00, 4.95, 4.95, T0),
+        505: ("SPY C505", 505.0, d, "C", 2.40, 2.50, 2.45, 2.45, T0),
+    }
+    legs = [
+        {"expiry": "2026-05-01", "strike": 500, "right": "C", "side": "long", "qty": 1},
+        {"expiry": "2026-05-01", "strike": 505, "right": "C", "side": "short", "qty": 1},
+    ]
+    open_cashflow, resolved = _price_legs(_StrikeConn(quotes), "SPY", legs, T0, "open", 0.0)
+    # long buys 500 at ask 5.00 (−5.00); short sells 505 at bid 2.40 (+2.40).
+    assert open_cashflow == pytest.approx(-2.60)
+    assert resolved[0]["option_symbol"] == "SPY C500"
+    assert resolved[1]["side"] == "short"
+
+
 def test_apply_cooldown_collapses_rapid_same_pattern_cards():
     cards = [
         _card(pattern="p", ts=T0),

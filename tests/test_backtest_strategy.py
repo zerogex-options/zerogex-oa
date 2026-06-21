@@ -155,6 +155,31 @@ def test_synth_card_levels_and_leg_for_bullish():
     assert card.payload["stop"]["ref_price"] == pytest.approx(500.0 * 0.8)
 
 
+def test_synth_card_vertical_builds_two_legs():
+    spec = _spec(strategy={
+        "direction": "bullish",
+        "conditions": [{"field": "msi", "op": "<", "value": 40}],
+        "structure": "vertical", "width": 5,
+        "target_offset_pct": 0.006,
+    })
+    card = strat._synth_card(spec.strategy, {"ts": T0, "price": 500.0},
+                             underlying="SPY", max_hold=60)
+    legs = card.payload["legs"]
+    assert len(legs) == 2
+    assert legs[0] == {"expiry": "2026-06-10", "strike": 500, "right": "C", "side": "BUY"}
+    # Bullish call vertical: short the higher strike.
+    assert legs[1]["strike"] == 505 and legs[1]["right"] == "C" and legs[1]["side"] == "SELL"
+
+
+def test_strategy_vertical_requires_positive_width():
+    with pytest.raises(SpecError):
+        _spec(strategy={
+            "direction": "bullish",
+            "conditions": [{"field": "msi", "op": "<", "value": 40}],
+            "structure": "vertical", "width": 0, "target_offset_pct": 0.006,
+        })
+
+
 def test_synth_card_bearish_uses_put_and_inverts_levels():
     spec = _spec(strategy={
         "direction": "bearish",

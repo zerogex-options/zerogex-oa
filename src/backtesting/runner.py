@@ -69,14 +69,15 @@ def _persist_results(conn, run_id: int, result: RunResult) -> None:
                 (run_id, seq, pattern, direction, tier, option_symbol, option_type,
                  strike, expiration, entered_at, exited_at, entry_premium, exit_premium,
                  contracts, gross_pnl, commission, net_pnl, return_pct, outcome,
-                 mfe_pct, mae_pct, hold_minutes)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 mfe_pct, mae_pct, hold_minutes, structure, legs)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
             """,
             (
                 run_id, t.seq, t.pattern, t.direction, t.tier, t.option_symbol,
                 t.option_type, t.strike, t.expiration, t.entered_at, t.exited_at,
                 t.entry_premium, t.exit_premium, t.contracts, t.gross_pnl, t.commission,
                 t.net_pnl, t.return_pct, t.outcome, t.mfe_pct, t.mae_pct, t.hold_minutes,
+                t.structure, json.dumps(t.legs),
             ),
         )
     for i, p in enumerate(result.equity, start=1):

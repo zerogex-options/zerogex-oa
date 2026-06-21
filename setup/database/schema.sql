@@ -1998,6 +1998,15 @@ CREATE TABLE IF NOT EXISTS backtest_trades (
 CREATE INDEX IF NOT EXISTS idx_backtest_trades_run_seq
     ON backtest_trades(run_id, seq);
 
+-- Multi-leg structures (Phase 4): ``structure`` names the shape
+-- (single / vertical / strangle / condor / …) and ``legs`` is the full per-leg
+-- breakdown (option_symbol, right, side, strike, expiration, qty). The flat
+-- option_symbol/strike/expiration columns above keep the *primary* (first) leg
+-- for the blotter; ``legs`` carries the rest. Added via ALTER for existing
+-- installs.
+ALTER TABLE backtest_trades ADD COLUMN IF NOT EXISTS structure VARCHAR(32) NOT NULL DEFAULT 'single';
+ALTER TABLE backtest_trades ADD COLUMN IF NOT EXISTS legs JSONB NOT NULL DEFAULT '[]'::jsonb;
+
 -- Equity curve: one point per closed trade, in chronological order.
 CREATE TABLE IF NOT EXISTS backtest_equity (
     run_id        BIGINT       NOT NULL REFERENCES backtest_runs(id) ON DELETE CASCADE,

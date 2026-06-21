@@ -27,7 +27,16 @@ _DEFAULTS = {
     # Option-premium exit overlay (Phase 2); null ⇒ off, resolve on Card levels.
     "profit_target_pct": None,
     "stop_loss_pct": None,
+    # Custom-strategy structure (Phase 4).
+    "structure": "single",
+    "width": 5,
 }
+
+# Multi-leg structures a custom strategy can trade.
+STRATEGY_STRUCTURES = [
+    {"id": "single", "label": "Single option (ATM)"},
+    {"id": "vertical", "label": "Vertical spread (defined risk)"},
+]
 
 
 def _pattern_catalog() -> list[dict]:
@@ -123,6 +132,7 @@ def build_meta(conn) -> dict:
         "underlyings": _underlyings(),
         "patterns": _pattern_catalog(),
         "strategy_fields": _strategy_fields(),
+        "strategy_structures": list(STRATEGY_STRUCTURES),
         "data_window": _data_window(conn),
         "defaults": dict(_DEFAULTS),
     }

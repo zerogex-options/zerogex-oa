@@ -101,6 +101,120 @@ def _select_leg(card: CardRow) -> Optional[dict]:
     }
 
 
+def _leg_is_buy(side: str, action: str) -> bool:
+    """Opening a long = buy; closing a short = buy-to-close (sign of cashflow)."""
+    return (side == "long") == (action == "open")
+
+
+def _select_legs(card: CardRow) -> Optional[list[dict]]:
+    """All legs of the structure (1 for single-leg, 2 for a vertical, …).
+
+    Each leg is normalized to ``{expiry, strike, right, side('long'|'short'),
+    qty}``. Falls back to a single synthetic ATM long when the Card carries no
+    legs.
+    """
+    payload = card.payload or {}
+    raw_legs = payload.get("legs") or []
+    legs: list[dict] = []
+    for leg in raw_legs:
+        side_raw = str(leg.get("side") or "BUY").upper()
+        side = "long" if side_raw in ("BUY", "LONG", "") else "short"
+        right = str(leg.get("right") or "").upper()[:1]
+        if right not in ("C", "P"):
+            right = "C" if card.direction == "bullish" else "P"
+        try:
+            qty = max(1, int(leg.get("qty") or 1))
+        except (TypeError, ValueError):
+            qty = 1
+        legs.append({
+            "expiry": leg.get("expiry"), "strike": leg.get("strike"),
+            "right": right, "side": side, "qty": qty,
+        })
+    if legs:
+        return legs
+    single = _select_leg(card)
+    if single is None:
+        return None
+    return [{**single, "side": "long", "qty": 1}]
+
+
+def _price_legs(conn, underlying, legs, at, action, slip):
+    """Net per-share cashflow to ``action`` (open/close) the position at ``at``.
+
+    Buys are a negative cashflow (you pay the ask), sells positive (you receive
+    the bid); each scaled by leg qty. Returns ``(cashflow, resolved_legs)`` —
+    ``resolved_legs`` carry the concrete contract so the exit prices the same
+    options — or ``None`` if any leg is unpriceable.
+    """
+    cashflow = 0.0
+    resolved: list[dict] = []
+    for leg in legs:
+        q = _fetch_leg_quote(conn, underlying=underlying, leg=leg, at=at)
+        if q is None:
+            return None
+        fill = leg_fill_price(
+            bid=q["bid"], ask=q["ask"], last=q["last"],
+            side=leg["side"], action=action, slippage_pct=slip,
+        )
+        if fill <= 0:
+            return None
+        sign = -1.0 if _leg_is_buy(leg["side"], action) else 1.0
+        cashflow += sign * fill * leg["qty"]
+        resolved.append({
+            **leg, "option_symbol": q["option_symbol"], "strike": q["strike"],
+            "expiry": q["expiration"], "right": q["option_type"],
+        })
+    return cashflow, resolved
+
+
+def _close_cashflow_from_series(resolved_legs, series_by_symbol, at, slip) -> Optional[float]:
+    """Net cashflow to close the position at ``at`` using pre-fetched series.
+
+    Returns None when any leg lacks a quote at ``at`` (so the overlay simply
+    skips that bar rather than mispricing the spread).
+    """
+    cashflow = 0.0
+    for leg in resolved_legs:
+        row = series_by_symbol.get(leg["option_symbol"], {}).get(at)
+        if row is None:
+            return None
+        fill = leg_fill_price(
+            bid=row["bid"], ask=row["ask"], last=row["last"],
+            side=leg["side"], action="close", slippage_pct=slip,
+        )
+        sign = -1.0 if _leg_is_buy(leg["side"], "close") else 1.0
+        cashflow += sign * fill * leg["qty"]
+    return cashflow
+
+
+def _structure_label(resolved_legs: list[dict]) -> str:
+    if len(resolved_legs) == 1:
+        return "single"
+    rights = {leg["right"] for leg in resolved_legs}
+    if len(resolved_legs) == 2 and len(rights) == 1:
+        return "vertical"
+    if len(resolved_legs) == 2:
+        return "strangle" if rights == {"C", "P"} else "spread"
+    if len(resolved_legs) == 4:
+        return "condor"
+    return "multi_leg"
+
+
+def _max_loss_per_share(open_cashflow: float, resolved_legs: list[dict]) -> Optional[float]:
+    """Defined-risk capital at risk per share (×100 = per contract).
+
+    Debit (you paid): the debit. Credit (you received): width − credit. A
+    non-positive result means the structure isn't a sane defined-risk position.
+    """
+    net_debit = -open_cashflow
+    if net_debit >= 0:
+        return net_debit if net_debit > 0 else None
+    strikes = [float(leg["strike"]) for leg in resolved_legs if leg.get("strike") is not None]
+    width = (max(strikes) - min(strikes)) if len(strikes) >= 2 else 0.0
+    max_loss = width + net_debit  # net_debit is negative ⇒ width − credit
+    return max_loss if max_loss > 0 else None
+
+
 # Source tables tried, in order, for a leg quote: the live hot table first
 # (covers the 90-day retained window), then the durable archive (covers older
 # windows once the nightly src/tools/backtest_archive.py job has copied them).
@@ -323,14 +437,14 @@ def _build_candidate(
         # stop_loss_pct to backtest these on the option premium series.
         return None, "outcome:unresolved"
 
-    leg = _select_leg(
+    legs = _select_legs(
         CardRow(
             underlying=card.underlying, timestamp=card.timestamp, pattern=card.pattern,
             action=card.action, tier=card.tier, direction=direction,
             confidence=card.confidence, payload=payload,
         )
     )
-    if leg is None:
+    if not legs:
         return None, "no_leg"
 
     max_hold = int(payload.get("max_hold_minutes") or _DEFAULT_MAX_HOLD_MIN)
@@ -346,32 +460,29 @@ def _build_candidate(
     if fill_ts is None:
         return None, "outcome:no_fill"
 
-    # 2) Entry option price at the fill bar; lock the resolved contract.
+    # 2) Open the position at the fill bar; lock the resolved contracts.
     slip = spec.fill_model.slippage_pct
-    entry_q = _fetch_leg_quote(conn, underlying=card.underlying, leg=leg, at=fill_ts)
-    if entry_q is None:
+    opened = _price_legs(conn, card.underlying, legs, fill_ts, "open", slip)
+    if opened is None:
         return None, "no_entry_quote"
-    resolved_leg = {
-        "expiry": entry_q["expiration"],
-        "strike": entry_q["strike"],
-        "right": entry_q["option_type"],
-    }
-    entry_premium = leg_fill_price(
-        bid=entry_q["bid"], ask=entry_q["ask"], last=entry_q["last"],
-        side="long", action="open", slippage_pct=slip,
-    )
-    if entry_premium <= 0:
+    open_cashflow, resolved_legs = opened
+    net_debit = -open_cashflow              # >0 debit paid, <0 credit received
+    max_loss = _max_loss_per_share(open_cashflow, resolved_legs)
+    if max_loss is None:
         return None, "bad_premium"
 
-    # Phase-2 premium exit overlay: take-profit / stop on the option's own
-    # premium series, checked alongside the underlying level triggers.
+    # Phase-2 premium exit overlay, generalized to the structure: take-profit /
+    # stop on net position P&L expressed as a fraction of capital-at-risk
+    # (max_loss). For a single long this is exactly the old "mark vs entry·(1±pct)".
     deadline = card.timestamp + timedelta(minutes=max_hold)
-    opt_series = (
-        _fetch_option_series(conn, entry_q["option_symbol"], fill_ts, deadline)
-        if has_premium else {}
-    )
-    prem_target = entry_premium * (1.0 + profit_target_pct) if profit_target_pct else None
-    prem_stop = entry_premium * (1.0 - stop_loss_pct) if stop_loss_pct else None
+    series_by_symbol: dict = {}
+    if has_premium:
+        for leg in resolved_legs:
+            series_by_symbol[leg["option_symbol"]] = _fetch_option_series(
+                conn, leg["option_symbol"], fill_ts, deadline
+            )
+    prem_target = profit_target_pct * max_loss if profit_target_pct else None
+    prem_stop = stop_loss_pct * max_loss if stop_loss_pct else None
 
     # 3) Forward walk for the exit — bars STRICTLY AFTER the fill bar (min hold).
     mfe_pct = 0.0
@@ -384,14 +495,15 @@ def _build_candidate(
         mae_pct = min(mae_pct, _signed_excursion(direction, entry_ref, adverse))
         hit_t = _hit_target(direction, target_price, high, low)
         hit_s = _hit_stop(direction, stop_price, high, low)
-        # Premium overlay: compare the option mark at this bar to the targets.
-        opt_row = opt_series.get(ts)
-        if opt_row is not None:
-            mark = _option_mark(opt_row)
-            if prem_target is not None and mark >= prem_target:
-                hit_t = True
-            if prem_stop is not None and mark <= prem_stop:
-                hit_s = True
+        # Premium overlay: net P&L if we closed the whole structure at this bar.
+        if has_premium:
+            close_cf = _close_cashflow_from_series(resolved_legs, series_by_symbol, ts, slip)
+            if close_cf is not None:
+                pnl = open_cashflow + close_cf
+                if prem_target is not None and pnl >= prem_target:
+                    hit_t = True
+                if prem_stop is not None and pnl <= -prem_stop:
+                    hit_s = True
         # Same-bar both-touch: intrabar order is unknown → resolve to stop.
         if hit_t and hit_s:
             exit_ts, outcome = ts, "stop_hit"
@@ -408,36 +520,42 @@ def _build_candidate(
         # Only the fill bar existed — no bar to hold into.
         return None, "outcome:no_exit_bar"
 
-    # 4) Exit option price at the resolved bar — prefer the already-fetched
-    # series row, else look the contract up directly.
-    exit_q = None
-    series_row = opt_series.get(exit_ts)
-    if series_row is not None:
-        exit_q = {
-            "bid": series_row["bid"], "ask": series_row["ask"], "last": series_row["last"],
-        }
-    if exit_q is None:
-        exit_q = _fetch_leg_quote(conn, underlying=card.underlying, leg=resolved_leg, at=exit_ts)
-    if exit_q is None:
-        return None, "no_exit_quote"
-    exit_premium = leg_fill_price(
-        bid=exit_q["bid"], ask=exit_q["ask"], last=exit_q["last"],
-        side="long", action="close", slippage_pct=slip,
-    )
+    # 4) Close the position at the resolved bar — prefer the already-fetched
+    # premium series (consistent with what the overlay saw), else a point lookup.
+    close_cashflow: Optional[float] = None
+    if has_premium:
+        close_cashflow = _close_cashflow_from_series(resolved_legs, series_by_symbol, exit_ts, slip)
+    if close_cashflow is None:
+        closed = _price_legs(conn, card.underlying, resolved_legs, exit_ts, "close", slip)
+        if closed is None:
+            return None, "no_exit_quote"
+        close_cashflow, _ = closed
 
+    primary = resolved_legs[0]
     hold_minutes = max(0, int((exit_ts - fill_ts).total_seconds() // 60))
     return {
         "card": card,
         "outcome": outcome,
         "entered_at": fill_ts,
         "exited_at": exit_ts,
-        "option_symbol": entry_q["option_symbol"],
-        "option_type": entry_q["option_type"],
-        "strike": entry_q["strike"],
-        "expiration": entry_q["expiration"],
-        "entry_premium": entry_premium,
-        "exit_premium": exit_premium,
-        "pnl_per_contract": (exit_premium - entry_premium) * 100.0,
+        "structure": _structure_label(resolved_legs),
+        "n_legs": len(resolved_legs),
+        "legs": [
+            {"option_symbol": leg["option_symbol"], "right": leg["right"],
+             "side": leg["side"],
+             "strike": float(leg["strike"]) if leg["strike"] is not None else None,
+             "expiration": leg["expiry"].isoformat() if leg.get("expiry") else None,
+             "qty": leg["qty"]}
+            for leg in resolved_legs
+        ],
+        "option_symbol": primary["option_symbol"],
+        "option_type": primary["right"],
+        "strike": primary["strike"],
+        "expiration": primary["expiry"],
+        "entry_premium": net_debit,            # net debit (credit if negative)
+        "exit_premium": close_cashflow,        # net credit received to close
+        "max_loss_per_share": max_loss,
+        "pnl_per_contract": (open_cashflow + close_cashflow) * 100.0,
         "hold_minutes": hold_minutes,
         "mfe_pct": round(mfe_pct, 6),
         "mae_pct": round(mae_pct, 6),
@@ -481,26 +599,28 @@ def _simulate(candidates: list[dict], spec: BacktestSpec) -> RunResult:
             concurrency_skipped += 1
             continue  # concurrency cap reached; skip this signal
 
-        entry_premium = cand["entry_premium"]
-        per_contract_cost = entry_premium * 100.0
-        if per_contract_cost <= 0:
+        # Capital at risk per contract = defined max loss (= net debit for a
+        # single long / debit spread; width − credit for a credit spread).
+        risk_per_contract = cand.get("max_loss_per_share", cand["entry_premium"]) * 100.0
+        if risk_per_contract <= 0:
             sized_out += 1
             continue
-        # Allocate risk_frac of *currently realized* equity as premium.
+        # Allocate risk_frac of *currently realized* equity to max loss.
         risk_dollars = max(realized_equity, 0.0) * risk_frac
-        contracts = int(math.floor(risk_dollars / per_contract_cost))
+        contracts = int(math.floor(risk_dollars / risk_per_contract))
         contracts = max(contracts, 1)
-        # Never spend more premium than we have on hand.
-        if per_contract_cost * contracts > max(realized_equity, 0.0):
-            contracts = int(math.floor(max(realized_equity, 0.0) / per_contract_cost))
+        # Never risk more than the capital on hand can cover.
+        if risk_per_contract * contracts > max(realized_equity, 0.0):
+            contracts = int(math.floor(max(realized_equity, 0.0) / risk_per_contract))
         if contracts < 1:
             sized_out += 1
-            continue  # can't afford even one contract
+            continue  # can't afford even one position
 
         gross = cand["pnl_per_contract"] * contracts
-        comm = commission * contracts * 2.0  # round trip
+        # Commission is per leg, per side (round trip).
+        comm = commission * cand.get("n_legs", 1) * contracts * 2.0
         net = gross - comm
-        cost_basis = per_contract_cost * contracts
+        cost_basis = risk_per_contract * contracts
         return_pct = (net / cost_basis * 100.0) if cost_basis > 0 else None
 
         seq += 1
@@ -516,7 +636,7 @@ def _simulate(candidates: list[dict], spec: BacktestSpec) -> RunResult:
                 expiration=cand["expiration"],
                 entered_at=cand["entered_at"],
                 exited_at=cand["exited_at"],
-                entry_premium=entry_premium,
+                entry_premium=cand["entry_premium"],
                 exit_premium=cand["exit_premium"],
                 contracts=contracts,
                 gross_pnl=gross,
@@ -527,6 +647,8 @@ def _simulate(candidates: list[dict], spec: BacktestSpec) -> RunResult:
                 mfe_pct=cand["mfe_pct"],
                 mae_pct=cand["mae_pct"],
                 hold_minutes=cand["hold_minutes"],
+                structure=cand.get("structure", "single"),
+                legs=cand.get("legs", []),
             )
         )
         open_positions.append({"exit_at": cand["exited_at"], "net_pnl": net})
