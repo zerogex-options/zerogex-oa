@@ -1671,20 +1671,38 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         highs = [float(r["high"]) if r["high"] is not None else float(r["close"]) for r in bars]
         return closes, lows, highs
 
-    async def get_vix_bars(self, cutoff: datetime, tz) -> List[Dict[str, Any]]:
-        """Load VIX 5-min bars at/after ``cutoff`` from ``vix_bars``, ascending.
+    # Ticker → bars-table allowlist for the generic volatility-index read.
+    # The whitelist keeps the table-name SQL interpolation safe.
+    _VOLATILITY_INDEX_TABLES: Dict[str, str] = {
+        "VIX": "vix_bars",
+        "VXN": "vxn_bars",
+    }
 
-        Async (asyncpg) replacement for the volatility-gauge router's prior
-        sync psycopg2 read on a threadpool. Returns dicts in the shape the VIX
-        scorers consume (timestamps normalized to ``tz``); rows with a NULL
-        close are dropped. Raises on DB error — the caller maps that to 503.
+    async def get_volatility_index_bars(
+        self, ticker: str, cutoff: datetime, tz
+    ) -> List[Dict[str, Any]]:
+        """Load a volatility index's 5-min bars at/after ``cutoff``, ascending.
+
+        Dispatches on ``ticker`` (``"VIX"`` → ``vix_bars``, ``"VXN"`` →
+        ``vxn_bars``) so the API layer doesn't need to know table names.
+        Returns dicts in the shape the level/momentum scorers consume
+        (timestamps normalized to ``tz``); rows with a NULL close are
+        dropped. Raises ``ValueError`` for unknown tickers and propagates
+        DB errors to the caller (mapped to 503 at the router).
         """
-        query = """
-            SELECT timestamp, open, high, low, close
-            FROM vix_bars
-            WHERE timestamp >= $1
-            ORDER BY timestamp ASC
-        """
+        normalized = ticker.upper()
+        table = self._VOLATILITY_INDEX_TABLES.get(normalized)
+        if table is None:
+            raise ValueError(
+                f"Unsupported volatility-index ticker {ticker!r}; "
+                f"expected one of {sorted(self._VOLATILITY_INDEX_TABLES)}"
+            )
+        query = (
+            f"SELECT timestamp, open, high, low, close "
+            f"FROM {table} "
+            f"WHERE timestamp >= $1 "
+            f"ORDER BY timestamp ASC"
+        )
         async with self._acquire_connection() as conn:
             rows = await conn.fetch(query, cutoff)
 

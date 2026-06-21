@@ -49,12 +49,17 @@ flowchart TB
         end
 
         subgraph WVIX["Worker: VIX"]
-            VIX["VIXIngester.run()<br/><i>vix_ingester.py:317-361</i><br/>5-min bars for $VIX.X"]:::proc
+            VIX["VolatilityIndexIngester.run()<br/><i>volatility_index_ingester.py</i><br/>5-min bars for $VIX.X → vix_bars"]:::proc
+        end
+
+        subgraph WVXN["Worker: VXN"]
+            VXN["VolatilityIndexIngester.run()<br/><i>volatility_index_ingester.py</i><br/>5-min bars for $VXN.X → vxn_bars"]:::proc
         end
 
         MAIN --> WSPY
         MAIN --> WSPX
         MAIN -- "INGEST_VIX_ENABLED" --> WVIX
+        MAIN -- "INGEST_VXN_ENABLED" --> WVXN
     end
 
     %% ============ AUTH ============
@@ -219,6 +224,7 @@ flowchart TB
         TBL_OC[("option_chains<br/>PK (option_symbol, timestamp)<br/>Quote: COALESCE(new, existing)<br/>Volume/OI: GREATEST<br/>Flow vols: ADDITIVE<br/>Greeks/IV: new wins")]:::db
         TBL_API[("tradestation_api_calls<br/>PK (window_start)<br/>count summed across procs")]:::db
         TBL_VIX[("vix_bars<br/>PK (timestamp)<br/>retention 7 days")]:::db
+        TBL_VXN[("vxn_bars<br/>PK (timestamp)<br/>retention 7 days")]:::db
     end
 
     %% ============ WIRING ============
@@ -548,6 +554,7 @@ flowchart LR
     PSPY[Worker: SPY]:::proc
     PSPX[Worker: SPX]:::proc
     PVIX[Worker: VIX]:::proc
+    PVXN[Worker: VXN]:::proc
 
     TC[("/tmp/tradestation_token_cache.json<br/>fcntl-locked, mode 0o600")]:::shared
     PG[(PostgreSQL<br/>shared pool per worker)]:::db
@@ -556,14 +563,17 @@ flowchart LR
     PMain --> PSPY
     PMain --> PSPX
     PMain --> PVIX
+    PMain --> PVXN
 
     PSPY <-->|"refresh under file lock<br/>others read cached"| TC
     PSPX <-->|"refresh under file lock"| TC
     PVIX <-->|"refresh under file lock"| TC
+    PVXN <-->|"refresh under file lock"| TC
 
     PSPY -->|"UPSERT underlying_quotes,<br/>option_chains, symbols"| PG
     PSPX -->|"UPSERT underlying_quotes,<br/>option_chains, symbols"| PG
     PVIX -->|"UPSERT vix_bars<br/>(retention 7d prune)"| PG
+    PVXN -->|"UPSERT vxn_bars<br/>(retention 7d prune)"| PG
 
     PSPY -->|"5-min window count"| APIWIN
     PSPX -->|"5-min window count"| APIWIN
