@@ -172,9 +172,123 @@ class ExitRules:
         )
 
 
+# ---------------------------------------------------------------------------
+# Custom strategy builder (Phase 3)
+#
+# Numeric fields compare with </<=/>/>=/==/!=; categorical fields with ==/!=.
+# Every field maps to a per-minute value materialized by
+# ``src/backtesting/strategy.py`` from gex_summary ⋈ signal_scores ⋈
+# underlying_quotes.
+# ---------------------------------------------------------------------------
+STRATEGY_NUMERIC_FIELDS = {
+    "price", "net_gex", "net_gex_at_spot", "flip_distance", "flip_distance_pct",
+    "gamma_flip_point", "call_wall", "put_wall", "dist_to_call_wall_pct",
+    "dist_to_put_wall_pct", "put_call_ratio", "max_pain", "convexity_risk", "msi",
+}
+STRATEGY_CATEGORICAL_FIELDS = {
+    "net_gex_sign": ("positive", "negative", "zero"),
+    "msi_regime": ("trend_expansion", "controlled_trend", "chop_range", "high_risk_reversal"),
+}
+_NUMERIC_OPS = ("<", "<=", ">", ">=", "==", "!=")
+_CATEGORICAL_OPS = ("==", "!=")
+
+
+@dataclass
+class Condition:
+    """One AND-ed entry condition: ``field op value``."""
+
+    field: str
+    op: str
+    value: object  # float for numeric fields, str for categorical
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "Condition":
+        if not isinstance(raw, dict):
+            raise SpecError("each condition must be an object")
+        fld = str(raw.get("field") or "").strip()
+        op = str(raw.get("op") or "").strip()
+        if fld in STRATEGY_NUMERIC_FIELDS:
+            if op not in _NUMERIC_OPS:
+                raise SpecError(f"condition op for {fld!r} must be one of {_NUMERIC_OPS}")
+            try:
+                value: object = float(raw.get("value"))
+            except (TypeError, ValueError):
+                raise SpecError(f"condition value for {fld!r} must be a number")
+        elif fld in STRATEGY_CATEGORICAL_FIELDS:
+            if op not in _CATEGORICAL_OPS:
+                raise SpecError(f"condition op for {fld!r} must be == or !=")
+            value = str(raw.get("value") or "").strip()
+            allowed = STRATEGY_CATEGORICAL_FIELDS[fld]
+            if value not in allowed:
+                raise SpecError(f"condition value for {fld!r} must be one of {allowed}")
+        else:
+            raise SpecError(f"unknown condition field {fld!r}")
+        return cls(field=fld, op=op, value=value)
+
+    def to_dict(self) -> dict:
+        return {"field": self.field, "op": self.op, "value": self.value}
+
+
+@dataclass
+class StrategySpec:
+    """A user-defined entry rule compiled into synthetic Action Cards.
+
+    Fires a directional ATM entry on every bar where ALL ``conditions`` hold.
+    Exits combine the optional underlying-level offsets here with the
+    option-premium overlay on the top-level ``exit`` (whichever triggers first).
+    """
+
+    direction: str
+    conditions: list[Condition]
+    dte: int = 0
+    target_offset_pct: Optional[float] = None  # fraction of entry price, favorable
+    stop_offset_pct: Optional[float] = None    # fraction of entry price, adverse
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "StrategySpec":
+        if not isinstance(raw, dict):
+            raise SpecError("strategy must be an object")
+        direction = str(raw.get("direction") or "").strip().lower()
+        if direction not in ("bullish", "bearish"):
+            raise SpecError("strategy.direction must be bullish or bearish")
+        conds_raw = raw.get("conditions") or []
+        if not isinstance(conds_raw, list) or not conds_raw:
+            raise SpecError("strategy.conditions must be a non-empty list")
+        conditions = [Condition.from_dict(c) for c in conds_raw]
+        entry = raw.get("entry") or {}
+        try:
+            dte = int(entry.get("dte", 0) or 0)
+        except (TypeError, ValueError):
+            raise SpecError("strategy.entry.dte must be an integer")
+        return cls(
+            direction=direction,
+            conditions=conditions,
+            dte=min(max(dte, 0), 30),
+            target_offset_pct=_coerce_opt_pct(
+                raw.get("target_offset_pct"), field_name="strategy.target_offset_pct", hi=1.0
+            ),
+            stop_offset_pct=_coerce_opt_pct(
+                raw.get("stop_offset_pct"), field_name="strategy.stop_offset_pct", hi=1.0
+            ),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "direction": self.direction,
+            "conditions": [c.to_dict() for c in self.conditions],
+            "entry": {"dte": self.dte},
+            "target_offset_pct": self.target_offset_pct,
+            "stop_offset_pct": self.stop_offset_pct,
+        }
+
+
 @dataclass
 class BacktestSpec:
-    """A fully-validated backtest request."""
+    """A fully-validated backtest request.
+
+    Either ``patterns`` (built-in playbook patterns) OR ``strategy`` (a custom
+    condition rule) selects the entries; ``strategy`` takes precedence.
+    """
 
     underlying: str
     start_date: date
@@ -187,6 +301,7 @@ class BacktestSpec:
     # to BACKTEST_SIGNAL_COOLDOWN_MINUTES; 0 prices every card. Collapses the
     # continuous Action-Card stream into discrete trades.
     cooldown_minutes: int = 0
+    strategy: Optional[StrategySpec] = None
 
     @classmethod
     def from_dict(cls, raw: dict) -> "BacktestSpec":
@@ -205,6 +320,20 @@ class BacktestSpec:
         if not isinstance(patterns_raw, list):
             raise SpecError("patterns must be a list")
         patterns = [str(p).strip() for p in patterns_raw if str(p).strip()]
+        strategy = StrategySpec.from_dict(raw["strategy"]) if raw.get("strategy") else None
+        exit_rules = ExitRules.from_dict(raw.get("exit"))
+        if strategy is not None:
+            has_level = (
+                strategy.target_offset_pct is not None or strategy.stop_offset_pct is not None
+            )
+            has_premium = (
+                exit_rules.profit_target_pct is not None or exit_rules.stop_loss_pct is not None
+            )
+            if not has_level and not has_premium:
+                raise SpecError(
+                    "a custom strategy needs an exit: set strategy.target_offset_pct / "
+                    "stop_offset_pct, or exit.profit_target_pct / stop_loss_pct"
+                )
         return cls(
             underlying=underlying,
             start_date=start,
@@ -212,8 +341,9 @@ class BacktestSpec:
             patterns=patterns,
             fill_model=FillModel.from_dict(raw.get("fill_model")),
             sizing=Sizing.from_dict(raw.get("sizing")),
-            exit=ExitRules.from_dict(raw.get("exit")),
+            exit=exit_rules,
             cooldown_minutes=_coerce_cooldown(raw.get("cooldown_minutes")),
+            strategy=strategy,
         )
 
     def to_dict(self) -> dict:
@@ -237,6 +367,7 @@ class BacktestSpec:
                 "stop_loss_pct": self.exit.stop_loss_pct,
             },
             "cooldown_minutes": self.cooldown_minutes,
+            "strategy": self.strategy.to_dict() if self.strategy else None,
         }
 
 

@@ -10,18 +10,22 @@ See ``docs/design/backtesting-platform.md`` for the full design.
 
 from src.backtesting.models import (
     BacktestSpec,
+    Condition,
     FillModel,
     Sizing,
     ExitRules,
+    StrategySpec,
     TradeResult,
     RunResult,
 )
 
 __all__ = [
     "BacktestSpec",
+    "Condition",
     "FillModel",
     "Sizing",
     "ExitRules",
+    "StrategySpec",
     "TradeResult",
     "RunResult",
 ]

@@ -638,12 +638,20 @@ def run_backtest(
     """
     start_dt = datetime.combine(spec.start_date, datetime.min.time())
     end_dt = datetime.combine(spec.end_date, datetime.max.time())
-    all_cards = fetch_action_cards(conn, spec.underlying, start_dt, end_dt)
-    if spec.patterns:
-        wanted = set(spec.patterns)
-        in_scope = [c for c in all_cards if c.pattern in wanted]
+    if spec.strategy is not None:
+        # Phase 3: custom strategy — synthesize cards from the condition rule.
+        from src.backtesting.strategy import generate_strategy_cards
+
+        max_hold = spec.exit.max_hold_minutes or _DEFAULT_MAX_HOLD_MIN
+        all_cards = generate_strategy_cards(conn, spec, max_hold=max_hold)
+        in_scope = all_cards
     else:
-        in_scope = list(all_cards)
+        all_cards = fetch_action_cards(conn, spec.underlying, start_dt, end_dt)
+        if spec.patterns:
+            wanted = set(spec.patterns)
+            in_scope = [c for c in all_cards if c.pattern in wanted]
+        else:
+            in_scope = list(all_cards)
     cards = _apply_cooldown(in_scope, spec.cooldown_minutes)
 
     # Funnel diagnostics so a 0-trade run is explainable: where did cards go?
