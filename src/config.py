@@ -1023,6 +1023,12 @@ SIGNALS_PATTERN_CALIBRATION_LOOKBACK_DAYS = _getenv_int(
 BACKTEST_SIGNAL_COOLDOWN_MINUTES = _getenv_int(
     "BACKTEST_SIGNAL_COOLDOWN_MINUTES", 30, min=0, max=1440
 )
+# Absolute cap on contracts per simulated trade — keeps a near-zero-debit
+# spread (tiny per-contract risk) from being sized into an unrealistic position
+# whose commission alone would dominate. Realistic retail-scale default.
+BACKTEST_MAX_CONTRACTS_PER_TRADE = _getenv_int(
+    "BACKTEST_MAX_CONTRACTS_PER_TRADE", 100, min=1
+)
 
 # Dedicated worker (Phase 4): when enabled, the API only ENQUEUES runs and a
 # standalone `python -m src.backtesting.worker` process drains them, so long

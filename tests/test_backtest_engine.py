@@ -197,7 +197,8 @@ def test_simulate_single_winning_trade_pnl_and_commission():
             "sizing": {"capital": 10_000, "risk_per_trade_pct": 10, "max_concurrent": 5},
         }
     )
-    # entry premium $2.00 → $200/contract; 10% of 10k = $1000 risk → 5 contracts.
+    # risk/contract = $200 max loss + $2 round-trip commission = $202; 10% of
+    # 10k = $1000 risk → floor(1000/202) = 4 contracts.
     cand = _candidate(
         seq_pnl_per_contract=50.0, entry_premium=2.0,
         entered=T0, exited=T0 + timedelta(minutes=30),
@@ -205,15 +206,42 @@ def test_simulate_single_winning_trade_pnl_and_commission():
     result = _simulate([cand], spec)
     assert len(result.trades) == 1
     tr = result.trades[0]
-    assert tr.contracts == 5
-    assert tr.gross_pnl == pytest.approx(250.0)  # 50 * 5
-    assert tr.commission == pytest.approx(10.0)  # 1.0 * 5 * 2 (round trip)
-    assert tr.net_pnl == pytest.approx(240.0)
+    assert tr.contracts == 4
+    assert tr.gross_pnl == pytest.approx(200.0)  # 50 * 4
+    assert tr.commission == pytest.approx(8.0)   # 1.0 * 1 leg * 2 sides * 4
+    assert tr.net_pnl == pytest.approx(192.0)
     assert result.summary["n_trades"] == 1
     assert result.summary["win_rate"] == 1.0
-    assert result.summary["net_pnl"] == pytest.approx(240.0)
-    # equity curve ends above starting capital
-    assert result.equity[-1].equity == pytest.approx(10_240.0)
+    assert result.summary["net_pnl"] == pytest.approx(192.0)
+    assert result.equity[-1].equity == pytest.approx(10_192.0)
+
+
+def test_simulate_tiny_risk_trade_is_bounded():
+    """A near-zero-risk-per-contract trade must not be sized into a blowup.
+
+    Regression for the live-data −4.5× account loss: a tiny-max-loss spread was
+    sized into thousands of contracts whose commission dominated. Folding
+    commission into the per-contract risk + the absolute cap bounds it.
+    """
+    spec = BacktestSpec.from_dict(
+        {
+            "underlying": "SPY", "start_date": "2026-05-01", "end_date": "2026-05-01",
+            "fill_model": {"slippage_pct": 0.0, "commission_per_contract": 0.65},
+            "sizing": {"capital": 25_000, "risk_per_trade_pct": 2, "max_concurrent": 5},
+        }
+    )
+    cand = _candidate(
+        seq_pnl_per_contract=-5.0, entry_premium=0.05,  # 5¢ spread, loses its $5 max
+        entered=T0, exited=T0 + timedelta(minutes=10),
+    )
+    cand["max_loss_per_share"] = 0.05  # $5/contract
+    cand["n_legs"] = 2
+    result = _simulate([cand], spec)
+    tr = result.trades[0]
+    # Capped at the absolute per-trade limit, not 25000*0.02/5 = 100s+.
+    assert tr.contracts <= 100
+    # Total loss stays within ~the 2% risk budget ($500), not multiples of it.
+    assert tr.net_pnl > -600
 
 
 def test_simulate_concurrency_cap_skips_overlap():

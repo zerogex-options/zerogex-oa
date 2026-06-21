@@ -31,6 +31,7 @@ import math
 from datetime import datetime, timedelta
 from typing import Callable, Optional
 
+from src import config
 from src.backtesting.models import (
     BacktestSpec,
     EquityPoint,
@@ -632,15 +633,22 @@ def _simulate(candidates: list[dict], spec: BacktestSpec) -> RunResult:
             continue  # concurrency cap reached; skip this signal
 
         # Capital at risk per contract = defined max loss (= net debit for a
-        # single long / debit spread; width − credit for a credit spread).
-        risk_per_contract = cand.get("max_loss_per_share", cand["entry_premium"]) * 100.0
+        # single long / debit spread; width − credit for a credit spread) PLUS
+        # the round-trip commission. Folding commission in is what keeps a
+        # near-zero-debit spread from being sized into thousands of contracts
+        # whose commission alone dwarfs the account.
+        round_trip_comm = commission * cand.get("n_legs", 1) * 2.0
+        max_loss = cand.get("max_loss_per_share", cand["entry_premium"]) * 100.0
+        risk_per_contract = max_loss + round_trip_comm
         if risk_per_contract <= 0:
             sized_out += 1
             continue
-        # Allocate risk_frac of *currently realized* equity to max loss.
+        # Allocate risk_frac of *currently realized* equity to total risk.
         risk_dollars = max(realized_equity, 0.0) * risk_frac
         contracts = int(math.floor(risk_dollars / risk_per_contract))
         contracts = max(contracts, 1)
+        # Absolute cap so a single trade is a realistic position size.
+        contracts = min(contracts, config.BACKTEST_MAX_CONTRACTS_PER_TRADE)
         # Never risk more than the capital on hand can cover.
         if risk_per_contract * contracts > max(realized_equity, 0.0):
             contracts = int(math.floor(max(realized_equity, 0.0) / risk_per_contract))
@@ -649,8 +657,7 @@ def _simulate(candidates: list[dict], spec: BacktestSpec) -> RunResult:
             continue  # can't afford even one position
 
         gross = cand["pnl_per_contract"] * contracts
-        # Commission is per leg, per side (round trip).
-        comm = commission * cand.get("n_legs", 1) * contracts * 2.0
+        comm = round_trip_comm * contracts
         net = gross - comm
         cost_basis = risk_per_contract * contracts
         return_pct = (net / cost_basis * 100.0) if cost_basis > 0 else None
