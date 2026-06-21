@@ -1,6 +1,6 @@
 # ZeroGEX Backtesting Platform — Design
 
-**Status:** Phases 1–4 shipped (1–3 validated on live data) · **Last updated:** 2026-06-21
+**Status:** Phases 1–5a shipped (1–4 validated on live data) · **Last updated:** 2026-06-21
 **Owners:** ZeroGEX engine team
 **Repos:** `zerogex-oa` (engine + API), `zerogex-web` (subscriber UI)
 
@@ -256,8 +256,15 @@ critical because gross 0DTE underlying-touch numbers materially overstate edge
   drains queued runs via `FOR UPDATE SKIP LOCKED` with stale-run recovery, so
   long runs survive API restarts; gated by `BACKTEST_WORKER_ENABLED` (the API
   enqueues only when the worker is the executor).
-- **Phase 5 — further structures & fidelity (next):** iron condors / strangles
-  / straddles, Greeks-aware sizing, and per-leg premium-target exits.
+- **Phase 5a — neutral defined-risk structures (shipped):** long straddle, long
+  strangle, and iron condor in the custom strategy builder, via a unified
+  `_risk_profile` that bounds defined risk for any structure (debit, credit
+  vertical, or condor). Neutral structures are non-directional and exit on the
+  premium overlay. Naked short straddles/strangles are intentionally excluded
+  (undefined risk). UI: structure picker with strike-offset + condor wing.
+- **Phase 5b — sizing/exit fidelity (next):** Greeks-aware sizing (delta/vega
+  caps from the per-leg greeks in `option_chains`) and per-leg premium-target
+  exits.
 
 ---
 
