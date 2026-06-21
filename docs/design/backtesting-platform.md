@@ -82,15 +82,30 @@ single-pattern CLI harness (`src/signals/playbook/backtest.py`) into:
 7. **Persist** — each trade → `backtest_trades`; a chronological equity series →
    `backtest_equity`; aggregate stats → `backtest_runs.summary` (JSONB).
 
-### v1 fidelity choice (explicit)
+### Exit model (forward walk)
 
-**Exit *timing* is resolved on the underlying** (proven, robust, reuses
-`compute_outcome`); **P&L is priced from the option leg's bid/ask** (realistic).
-This deliberately decouples "when did we exit" from "what did the option pay,"
-which keeps the proven trigger/MFE/MAE logic intact while delivering real
-option economics. Phase 2 moves target/stop resolution onto the option premium
-series itself (`Target.kind = premium_pct`), which the Card schema already
-supports.
+The engine walks the underlying series bar by bar:
+
+1. **Entry fills at its trigger bar** — immediately for at-market Cards, or at
+   the first bar that touches `entry.ref_price` for touch/break triggers (a Card
+   whose trigger never prints is `no_fill`). The entry option is priced at that
+   fill bar.
+2. **Exit is scanned strictly after the fill bar** — a **≥1-bar minimum hold**.
+   This is deliberate: the original two-point model priced entry and exit at the
+   same resolution timestamp, so a target that printed *inside the entry bar*
+   booked a zero-hold same-instant round trip = pure bid/ask spread loss (a
+   `target_hit` that lost money). Requiring the exit to be a later bar removes
+   that artifact. The first level target/stop touch resolves the exit (same-bar
+   both-touch → stop, conservatively); otherwise it times out at the last bar in
+   the hold window.
+3. **P&L** is priced from the resolved contract's bid/ask at the fill and exit
+   bars via `leg_fill_price` (long buys at ask·(1+slip), sells at bid·(1−slip)),
+   net of per-contract commission both ways.
+
+**Phase 2** extends the same walk to **option-premium exits**: resolve
+`Target.kind = premium_pct` (and a configurable premium take-profit/stop) on the
+option's own premium series, which also rescues Cards currently dropped as
+`unresolved` (target and stop both non-level).
 
 ---
 

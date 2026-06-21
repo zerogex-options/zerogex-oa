@@ -17,7 +17,14 @@ from typing import Any
 
 import pytest
 
-from src.backtesting.engine import _apply_cooldown, _select_leg, _simulate, run_backtest
+from src.backtesting.engine import (
+    _apply_cooldown,
+    _build_candidate,
+    _select_leg,
+    _simulate,
+    run_backtest,
+)
+from src.signals.playbook.backtest import fetch_action_cards
 from src.backtesting.models import BacktestSpec, SpecError
 from src.signals.playbook.backtest import CardRow
 
@@ -144,14 +151,9 @@ def test_select_leg_none_without_entry_ref():
 
 def _candidate(*, seq_pnl_per_contract: float, entry_premium: float, entered: datetime,
                exited: datetime, pattern: str = "gamma_flip_break", outcome: str = "target_hit"):
-    class _O:
-        pass
-
-    o = _O()
-    o.outcome = outcome
     return {
         "card": _card(pattern=pattern),
-        "outcome": o,
+        "outcome": outcome,
         "entered_at": entered,
         "exited_at": exited,
         "option_symbol": "SPY 260501C500",
@@ -340,6 +342,111 @@ def test_run_backtest_end_to_end(monkeypatch):
 # ----------------------------------------------------------------------
 # Cooldown / dedup
 # ----------------------------------------------------------------------
+
+
+def _bt_spec(**over):
+    base = {"underlying": "SPY", "start_date": "2026-05-01", "end_date": "2026-05-01",
+            "cooldown_minutes": 0,
+            "fill_model": {"slippage_pct": 0.0, "commission_per_contract": 0.0}}
+    base.update(over)
+    return BacktestSpec.from_dict(base)
+
+
+def _conn_with(cards, quotes, leg_quote):
+    return _FakeConn({"cards": cards, "quotes": quotes, "leg_quote": leg_quote})
+
+
+def run_backtest_single(conn, spec=None):
+    """Load the first card via the real fetch + resolve it through _build_candidate."""
+    spec = spec or _bt_spec()
+    cards = fetch_action_cards(
+        conn, "SPY",
+        datetime(2026, 5, 1, tzinfo=ET), datetime(2026, 5, 2, tzinfo=ET),
+    )
+    return _build_candidate(conn, cards[0], spec)
+
+
+def _legcard(*, direction="bullish", entry=500.0, target=503.0, stop=498.0,
+             trigger="at_market", ts=None):
+    ts = ts or datetime(2026, 5, 1, 14, 0, tzinfo=ET)
+    payload = {
+        "entry": {"ref_price": entry, "trigger": trigger},
+        "target": {"ref_price": target, "kind": "level"},
+        "stop": {"ref_price": stop, "kind": "level"},
+        "max_hold_minutes": 120,
+        "legs": [{"expiry": "2026-05-01", "strike": 500, "right": "C", "side": "BUY"}],
+    }
+    return ("SPY", ts, "gamma_flip_break", "BUY_CALL", "0DTE", direction, 0.7, json.dumps(payload))
+
+
+def test_build_candidate_min_hold_no_same_bar_roundtrip():
+    """A target that prints in the ENTRY bar must NOT book a zero-hold exit.
+
+    Old model resolved target_hit at the entry bar → entered_at == exited_at →
+    pure spread loss. The forward walk only looks at bars after the fill bar, so
+    a fill-bar-only touch resolves to a held time_exit instead.
+    """
+    ts = datetime(2026, 5, 1, 14, 0, tzinfo=ET)
+    # Entry bar's range spans BOTH entry (500) and target (503); the next bar
+    # never reaches the target.
+    quotes = [
+        (ts, 500.0, 503.5, 499.8, 500.2),                       # fill bar (touches target)
+        (ts + timedelta(minutes=5), 500.2, 501.0, 500.0, 500.5),  # later bar: no target
+    ]
+    leg_quote = ("SPY 260501C500", 500.0, date(2026, 5, 1), "C", 2.00, 2.10, 2.05, 2.05, ts)
+    conn = _conn_with([_legcard()], quotes, leg_quote)
+    cand, reason = run_backtest_single(conn)
+    assert reason == "ok"
+    assert cand["outcome"] == "time_exit"          # NOT target_hit on the entry bar
+    assert cand["entered_at"] == ts
+    assert cand["exited_at"] == ts + timedelta(minutes=5)
+    assert cand["hold_minutes"] == 5               # real hold, not 0
+
+
+def test_build_candidate_target_hit_on_later_bar():
+    ts = datetime(2026, 5, 1, 14, 0, tzinfo=ET)
+    quotes = [
+        (ts, 500.0, 500.5, 499.8, 500.2),                          # fill bar
+        (ts + timedelta(minutes=10), 500.2, 503.4, 500.0, 503.1),  # target hit here
+    ]
+    leg_quote = ("SPY 260501C500", 500.0, date(2026, 5, 1), "C", 2.00, 2.10, 2.05, 2.05, ts)
+    cand, reason = run_backtest_single(_conn_with([_legcard()], quotes, leg_quote))
+    assert reason == "ok"
+    assert cand["outcome"] == "target_hit"
+    assert cand["exited_at"] == ts + timedelta(minutes=10)
+
+
+def test_build_candidate_touch_trigger_fills_at_touch_bar():
+    ts = datetime(2026, 5, 1, 14, 0, tzinfo=ET)
+    # on_break entry at 500: bar0 never reaches 500; bar1 touches it (fill); bar2
+    # hits the target. Entry must be dated to bar1, not the Card timestamp.
+    quotes = [
+        (ts, 501.0, 501.5, 500.8, 501.2),                          # no fill (low 500.8 > 500)
+        (ts + timedelta(minutes=3), 500.9, 501.5, 499.9, 500.4),   # touches 500 → fill here
+        (ts + timedelta(minutes=8), 500.4, 503.6, 500.2, 503.3),   # target hit
+    ]
+    leg_quote = ("SPY 260501C500", 500.0, date(2026, 5, 1), "C", 2.00, 2.10, 2.05, 2.05, ts)
+    cand, reason = run_backtest_single(
+        _conn_with([_legcard(trigger="on_break")], quotes, leg_quote)
+    )
+    assert reason == "ok"
+    assert cand["entered_at"] == ts + timedelta(minutes=3)   # filled at the touch bar
+    assert cand["exited_at"] == ts + timedelta(minutes=8)    # target on a later bar
+    assert cand["outcome"] == "target_hit"
+
+
+def test_build_candidate_no_fill_when_trigger_never_touched():
+    ts = datetime(2026, 5, 1, 14, 0, tzinfo=ET)
+    quotes = [
+        (ts, 501.0, 501.5, 500.8, 501.2),
+        (ts + timedelta(minutes=5), 501.0, 502.0, 500.5, 501.5),  # never reaches 500
+    ]
+    leg_quote = ("SPY 260501C500", 500.0, date(2026, 5, 1), "C", 2.00, 2.10, 2.05, 2.05, ts)
+    cand, reason = run_backtest_single(
+        _conn_with([_legcard(trigger="on_break", entry=500.0)], quotes, leg_quote)
+    )
+    assert reason == "outcome:no_fill"
+    assert cand is None
 
 
 def test_apply_cooldown_collapses_rapid_same_pattern_cards():

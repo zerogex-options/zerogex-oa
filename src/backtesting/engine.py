@@ -1,15 +1,22 @@
 """Backtest simulation engine.
 
 Replays persisted Action Cards over a historical window and prices each one as
-a real option-leg round trip. The v1 fidelity model (see
-``docs/design/backtesting-platform.md`` §2) is deliberately split:
+a real option-leg round trip via a forward bar-by-bar walk
+(``docs/design/backtesting-platform.md`` §2):
 
-* **Exit *timing*** is resolved on the underlying series by reusing
-  ``src.signals.playbook.backtest.compute_outcome`` — the proven intrabar
-  MFE/MAE + entry-trigger-fill logic.
-* **P&L** is priced from the chosen option leg's bid/ask via
-  ``src.signals.execution.leg_fill_price`` — long bought at ask·(1+slip) on
-  entry, sold at bid·(1−slip) on exit, plus per-contract commission both ways.
+* **Entry** fills at its trigger bar — immediately for at-market Cards, or at
+  the first bar that touches ``entry.ref_price`` for touch/break triggers — and
+  the entry option is priced at that fill bar.
+* **Exit** is resolved by scanning the underlying series **strictly after** the
+  fill bar (a ≥1-bar minimum hold, so a target that prints inside the entry bar
+  no longer forces a zero-hold same-instant round trip that booked pure spread
+  loss). The first level target/stop touch resolves the exit, else it times out
+  at the last bar in the hold window; the exit option is priced at that bar.
+* **P&L** uses ``src.signals.execution.leg_fill_price`` — long bought at
+  ask·(1+slip), sold at bid·(1−slip), plus per-contract commission both ways.
+
+Premium/event-kind target/stop exits are handled in Phase 2; here a Card whose
+target and stop are both non-level is ``unresolved``.
 
 Position sizing allocates ``risk_per_trade_pct`` of *running realized equity*
 to premium per trade, capped by ``max_concurrent`` simultaneously-open
@@ -32,8 +39,12 @@ from src.backtesting.models import (
 )
 from src.signals.execution import leg_fill_price
 from src.signals.playbook.backtest import (
+    _IMMEDIATE_TRIGGERS,
+    _hit_stop,
+    _hit_target,
+    _level_or_none,
+    _signed_excursion,
     CardRow,
-    compute_outcome,
     fetch_action_cards,
     fetch_quotes,
 )
@@ -197,8 +208,19 @@ def _fetch_leg_quote(
     }
 
 
-def _exit_timestamp(outcome) -> Optional[datetime]:
-    return outcome.target_hit_at or outcome.stop_hit_at or outcome.expired_at
+def _resolve_entry_fill(quotes, *, entry_ref: float, immediate: bool):
+    """Return the (ts, idx) of the bar the trade fills on, or (None, None).
+
+    Immediate triggers (at_market/at_close/…) fill on the first bar at/after the
+    Card timestamp. Touch/break triggers fill on the first bar whose intrabar
+    range reaches ``entry_ref`` — a Card whose trigger never prints is a genuine
+    ``no_fill`` and must not be counted as a trade (it was the pattern firing,
+    not a realized entry).
+    """
+    for idx, (ts, o, high, low, c) in enumerate(quotes):
+        if immediate or (low <= entry_ref <= high):
+            return ts, idx
+    return None, None
 
 
 def _build_candidate(
@@ -206,13 +228,23 @@ def _build_candidate(
     card: CardRow,
     spec: BacktestSpec,
 ) -> tuple[Optional[dict], str]:
-    """Resolve one Card into a priced candidate trade.
+    """Resolve one Card into a priced option round-trip via a forward walk.
 
-    Returns ``(candidate, reason)``. On success ``candidate`` is a dict and
-    ``reason`` is ``"ok"``; on a drop ``candidate`` is None and ``reason`` names
-    the funnel stage that rejected the card (``outcome:<label>``, ``no_leg``,
-    ``no_entry_quote``, ``no_exit_quote``, ``bad_premium``) so the run's
-    diagnostics can explain a 0-trade result.
+    Unlike the original two-point model (which priced entry and exit at the same
+    ``compute_outcome`` timestamp and so booked a pure spread loss whenever the
+    target printed inside the entry bar), this walks the underlying series:
+
+      1. fills the entry at its trigger bar (immediate, or first touch/break),
+      2. prices the entry option at that fill bar,
+      3. scans bars **strictly after** the fill bar (a ≥1-bar min hold, so there
+         is never a zero-hold same-instant round trip) for the first level
+         target/stop touch, else times out at the last bar,
+      4. prices the exit option at that resolved bar.
+
+    Returns ``(candidate, reason)``; on a drop ``reason`` names the funnel stage
+    (``outcome:<label>`` / ``no_leg`` / ``no_entry_quote`` / ``no_exit_quote`` /
+    ``bad_premium``) for the run diagnostics. Premium-kind target/stop exits are
+    handled in a follow-up (Phase 2); here non-level exits are ``unresolved``.
     """
     payload = dict(card.payload or {})
     # Apply the spec's max-hold override (or supply a default) so cards that
@@ -221,65 +253,107 @@ def _build_candidate(
         payload = {**payload, "max_hold_minutes": spec.exit.max_hold_minutes}
     elif not payload.get("max_hold_minutes"):
         payload = {**payload, "max_hold_minutes": _DEFAULT_MAX_HOLD_MIN}
-    card = CardRow(
-        underlying=card.underlying,
-        timestamp=card.timestamp,
-        pattern=card.pattern,
-        action=card.action,
-        tier=card.tier,
-        direction=card.direction,
-        confidence=card.confidence,
-        payload=payload,
+
+    direction = card.direction or payload.get("direction") or ""
+    if direction not in ("bullish", "bearish"):
+        return None, "outcome:non_directional"
+
+    entry_payload = payload.get("entry") or {}
+    entry_ref = entry_payload.get("ref_price")
+    if not isinstance(entry_ref, (int, float)) or entry_ref <= 0:
+        return None, "outcome:no_entry_ref"
+    entry_ref = float(entry_ref)
+    trigger = str(entry_payload.get("trigger") or "").strip().lower()
+    immediate = trigger in _IMMEDIATE_TRIGGERS
+
+    target_price = _level_or_none(payload.get("target"))
+    stop_price = _level_or_none(payload.get("stop"))
+    if target_price is None and stop_price is None:
+        # Premium/event exits aren't resolvable from the underlying — Phase 2.
+        return None, "outcome:unresolved"
+
+    leg = _select_leg(
+        CardRow(
+            underlying=card.underlying, timestamp=card.timestamp, pattern=card.pattern,
+            action=card.action, tier=card.tier, direction=direction,
+            confidence=card.confidence, payload=payload,
+        )
     )
+    if leg is None:
+        return None, "no_leg"
 
     max_hold = int(payload.get("max_hold_minutes") or _DEFAULT_MAX_HOLD_MIN)
     quotes = fetch_quotes(
         conn, card.underlying, card.timestamp, card.timestamp + timedelta(minutes=max_hold)
     )
-    outcome = compute_outcome(card, quotes)
-    # Only price trades that actually opened and resolved to a price exit.
-    if outcome.outcome not in ("target_hit", "stop_hit", "time_exit"):
-        return None, f"outcome:{outcome.outcome}"
-    exit_at = _exit_timestamp(outcome)
-    if exit_at is None:
-        return None, "outcome:no_exit_ts"
+    quotes = [q for q in quotes if q[0] >= card.timestamp]
+    if not quotes:
+        return None, "outcome:no_data"
 
-    leg = _select_leg(card)
-    if leg is None:
-        return None, "no_leg"
+    # 1) Entry fill bar.
+    fill_ts, fill_idx = _resolve_entry_fill(quotes, entry_ref=entry_ref, immediate=immediate)
+    if fill_ts is None:
+        return None, "outcome:no_fill"
 
-    entry_q = _fetch_leg_quote(conn, underlying=card.underlying, leg=leg, at=card.timestamp)
+    # 2) Entry option price at the fill bar; lock the resolved contract.
+    slip = spec.fill_model.slippage_pct
+    entry_q = _fetch_leg_quote(conn, underlying=card.underlying, leg=leg, at=fill_ts)
     if entry_q is None:
         return None, "no_entry_quote"
-    # Lock the leg to the contract we actually entered so the exit prices the
-    # same option (important for the synthetic-ATM fallback).
     resolved_leg = {
         "expiry": entry_q["expiration"],
         "strike": entry_q["strike"],
         "right": entry_q["option_type"],
     }
-    exit_q = _fetch_leg_quote(conn, underlying=card.underlying, leg=resolved_leg, at=exit_at)
-    if exit_q is None:
-        return None, "no_exit_quote"
-
-    slip = spec.fill_model.slippage_pct
     entry_premium = leg_fill_price(
         bid=entry_q["bid"], ask=entry_q["ask"], last=entry_q["last"],
         side="long", action="open", slippage_pct=slip,
     )
+    if entry_premium <= 0:
+        return None, "bad_premium"
+
+    # 3) Forward walk for the exit — bars STRICTLY AFTER the fill bar (min hold).
+    mfe_pct = 0.0
+    mae_pct = 0.0
+    exit_ts: Optional[datetime] = None
+    outcome = "time_exit"
+    for (ts, o, high, low, c) in quotes[fill_idx + 1:]:
+        favorable, adverse = (high, low) if direction == "bullish" else (low, high)
+        mfe_pct = max(mfe_pct, _signed_excursion(direction, entry_ref, favorable))
+        mae_pct = min(mae_pct, _signed_excursion(direction, entry_ref, adverse))
+        hit_t = _hit_target(direction, target_price, high, low)
+        hit_s = _hit_stop(direction, stop_price, high, low)
+        # Same-bar both-touch: intrabar order is unknown → resolve to stop.
+        if hit_t and hit_s:
+            exit_ts, outcome = ts, "stop_hit"
+            break
+        if hit_t:
+            exit_ts, outcome = ts, "target_hit"
+            break
+        if hit_s:
+            exit_ts, outcome = ts, "stop_hit"
+            break
+        exit_ts = ts  # trail the last seen bar for the time-exit case
+
+    if exit_ts is None:
+        # Only the fill bar existed — no bar to hold into.
+        return None, "outcome:no_exit_bar"
+
+    # 4) Exit option price at the resolved bar.
+    exit_q = _fetch_leg_quote(conn, underlying=card.underlying, leg=resolved_leg, at=exit_ts)
+    if exit_q is None:
+        return None, "no_exit_quote"
     exit_premium = leg_fill_price(
         bid=exit_q["bid"], ask=exit_q["ask"], last=exit_q["last"],
         side="long", action="close", slippage_pct=slip,
     )
-    if entry_premium <= 0:
-        return None, "bad_premium"
 
-    hold_minutes = max(0, int((exit_at - card.timestamp).total_seconds() // 60))
+    hold_minutes = max(0, int((exit_ts - fill_ts).total_seconds() // 60))
     return {
         "card": card,
         "outcome": outcome,
-        "entered_at": card.timestamp,
-        "exited_at": exit_at,
+        "entered_at": fill_ts,
+        "exited_at": exit_ts,
         "option_symbol": entry_q["option_symbol"],
         "option_type": entry_q["option_type"],
         "strike": entry_q["strike"],
@@ -288,8 +362,8 @@ def _build_candidate(
         "exit_premium": exit_premium,
         "pnl_per_contract": (exit_premium - entry_premium) * 100.0,
         "hold_minutes": hold_minutes,
-        "mfe_pct": outcome.mfe_pct,
-        "mae_pct": outcome.mae_pct,
+        "mfe_pct": round(mfe_pct, 6),
+        "mae_pct": round(mae_pct, 6),
     }, "ok"
 
 
@@ -372,7 +446,7 @@ def _simulate(candidates: list[dict], spec: BacktestSpec) -> RunResult:
                 commission=comm,
                 net_pnl=net,
                 return_pct=return_pct,
-                outcome=cand["outcome"].outcome,
+                outcome=cand["outcome"],
                 mfe_pct=cand["mfe_pct"],
                 mae_pct=cand["mae_pct"],
                 hold_minutes=cand["hold_minutes"],
