@@ -27,15 +27,21 @@ _DEFAULTS = {
     # Option-premium exit overlay (Phase 2); null ⇒ off, resolve on Card levels.
     "profit_target_pct": None,
     "stop_loss_pct": None,
-    # Custom-strategy structure (Phase 4).
+    # Custom-strategy structure (Phase 4/5).
     "structure": "single",
     "width": 5,
+    "wing": 5,
 }
 
-# Multi-leg structures a custom strategy can trade.
+# Defined-risk structures a custom strategy can trade. ``neutral`` structures
+# are non-directional and exit on the premium overlay; directional ones take a
+# bullish/bearish direction.
 STRATEGY_STRUCTURES = [
-    {"id": "single", "label": "Single option (ATM)"},
-    {"id": "vertical", "label": "Vertical spread (defined risk)"},
+    {"id": "single", "label": "Single option (ATM)", "kind": "directional"},
+    {"id": "vertical", "label": "Vertical spread (defined risk)", "kind": "directional"},
+    {"id": "straddle", "label": "Long straddle (ATM call+put)", "kind": "neutral"},
+    {"id": "strangle", "label": "Long strangle (OTM call+put)", "kind": "neutral"},
+    {"id": "condor", "label": "Iron condor (sell strangle, buy wings)", "kind": "neutral"},
 ]
 
 

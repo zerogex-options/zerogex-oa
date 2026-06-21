@@ -189,60 +189,83 @@ def _close_cashflow_from_series(resolved_legs, series_by_symbol, at, slip) -> Op
 
 
 def _structure_label(resolved_legs: list[dict]) -> str:
+    rights = {leg["right"] for leg in resolved_legs}
     if len(resolved_legs) == 1:
         return "single"
-    rights = {leg["right"] for leg in resolved_legs}
     if len(resolved_legs) == 2 and len(rights) == 1:
         return "vertical"
-    if len(resolved_legs) == 2:
-        return "strangle" if rights == {"C", "P"} else "spread"
-    if len(resolved_legs) == 4:
+    if len(resolved_legs) == 2 and rights == {"C", "P"}:
+        strikes = {float(leg["strike"]) for leg in resolved_legs if leg.get("strike") is not None}
+        return "straddle" if len(strikes) == 1 else "strangle"
+    if len(resolved_legs) == 4 and rights == {"C", "P"}:
         return "condor"
     return "multi_leg"
 
 
-def _defined_risk_clamp(pnl_per_share: float, net_debit: float, resolved_legs: list[dict]) -> float:
-    """Bound a vertical's realized P&L to its no-arbitrage limits.
+def _risk_profile(open_cashflow: float, resolved_legs: list[dict]):
+    """Return ``(max_loss_per_share, max_gain_per_share)`` for the structure.
 
-    A vertical's liquidation value is in [0, width], so its P&L is in
-    [-net_debit, width-net_debit] (debit) or the credit-spread mirror. Illiquid
-    near-expiry bid/ask on the short leg can imply a worse close than that
-    bound; without the clamp a tiny-debit spread (sized into a large contract
-    count) books losses far beyond its defined risk. Singles (value ≥ 0) are
-    already bounded, so they pass through unchanged.
+    Unifies defined-risk reasoning across every supported structure:
+
+    * **Debit** (net_debit ≥ 0): max loss = the debit (a long position can't be
+      worth less than 0). Max gain is the spread width − debit for a same-right
+      *vertical*, else unbounded (``None``) — long straddles/strangles/singles
+      have open-ended upside.
+    * **Credit** (net_debit < 0): the position is a credit spread / iron condor.
+      Max loss = (widest per-right wing) − credit; max gain = the credit.
+
+    ``max_loss`` is ``None`` when the structure isn't a sane defined-risk
+    position (e.g. zero debit, or a credit ≥ its wing).
     """
-    strikes = [float(leg["strike"]) for leg in resolved_legs if leg.get("strike") is not None]
-    is_vertical = (
-        len(resolved_legs) == 2
-        and len({leg["right"] for leg in resolved_legs}) == 1
-        and len(strikes) == 2
-    )
-    if not is_vertical:
-        return pnl_per_share
-    width = max(strikes) - min(strikes)
-    if width <= 0:
-        return pnl_per_share
+    net_debit = -open_cashflow
+    by_right: dict[str, list[float]] = {}
+    for leg in resolved_legs:
+        if leg.get("strike") is not None:
+            by_right.setdefault(leg["right"], []).append(float(leg["strike"]))
+    rights = {leg["right"] for leg in resolved_legs}
+
     if net_debit >= 0:
-        lo, hi = -net_debit, width - net_debit
-    else:  # credit spread: received -net_debit, risk = width − credit
-        credit = -net_debit
-        lo, hi = -(width - credit), credit
-    return min(max(pnl_per_share, lo), hi)
+        if net_debit <= 0:
+            return None, None
+        is_vertical = len(resolved_legs) == 2 and len(rights) == 1 and len(by_right.get(
+            next(iter(rights)), [])) == 2
+        if is_vertical:
+            strikes = by_right[next(iter(rights))]
+            width = max(strikes) - min(strikes)
+            return net_debit, max(width - net_debit, 0.0)
+        return net_debit, None  # long single / straddle / strangle: unbounded gain
+
+    credit = -net_debit
+    # Widest per-right wing (a credit vertical has one right; a condor has two).
+    wings = [max(s) - min(s) for s in by_right.values() if len(s) >= 2]
+    max_wing = max(wings) if wings else 0.0
+    max_loss = max_wing - credit
+    if max_loss <= 0:
+        return None, credit
+    return max_loss, credit
 
 
 def _max_loss_per_share(open_cashflow: float, resolved_legs: list[dict]) -> Optional[float]:
-    """Defined-risk capital at risk per share (×100 = per contract).
+    return _risk_profile(open_cashflow, resolved_legs)[0]
 
-    Debit (you paid): the debit. Credit (you received): width − credit. A
-    non-positive result means the structure isn't a sane defined-risk position.
+
+def _defined_risk_clamp(
+    pnl_per_share: float, open_cashflow: float, resolved_legs: list[dict]
+) -> float:
+    """Bound realized P&L to the structure's no-arbitrage limits.
+
+    A defined-risk structure's P&L lies in [-max_loss, max_gain]. Illiquid
+    near-expiry bid/ask on a short leg can imply a worse (or better) close than
+    that bound; without the clamp a tiny-risk position (sized into a large
+    contract count) books losses far beyond its defined risk. Positions with
+    unbounded upside (long single/straddle/strangle) only get the lower bound.
     """
-    net_debit = -open_cashflow
-    if net_debit >= 0:
-        return net_debit if net_debit > 0 else None
-    strikes = [float(leg["strike"]) for leg in resolved_legs if leg.get("strike") is not None]
-    width = (max(strikes) - min(strikes)) if len(strikes) >= 2 else 0.0
-    max_loss = width + net_debit  # net_debit is negative ⇒ width − credit
-    return max_loss if max_loss > 0 else None
+    max_loss, max_gain = _risk_profile(open_cashflow, resolved_legs)
+    if max_loss is None:
+        return pnl_per_share
+    lo = -max_loss
+    hi = max_gain if max_gain is not None else float("inf")
+    return min(max(pnl_per_share, lo), hi)
 
 
 # Source tables tried, in order, for a leg quote: the live hot table first
@@ -444,7 +467,7 @@ def _build_candidate(
         payload = {**payload, "max_hold_minutes": _DEFAULT_MAX_HOLD_MIN}
 
     direction = card.direction or payload.get("direction") or ""
-    if direction not in ("bullish", "bearish"):
+    if direction not in ("bullish", "bearish", "neutral"):
         return None, "outcome:non_directional"
 
     entry_payload = payload.get("entry") or {}
@@ -520,11 +543,17 @@ def _build_candidate(
     exit_ts: Optional[datetime] = None
     outcome = "time_exit"
     for (ts, o, high, low, c) in quotes[fill_idx + 1:]:
-        favorable, adverse = (high, low) if direction == "bullish" else (low, high)
-        mfe_pct = max(mfe_pct, _signed_excursion(direction, entry_ref, favorable))
-        mae_pct = min(mae_pct, _signed_excursion(direction, entry_ref, adverse))
-        hit_t = _hit_target(direction, target_price, high, low)
-        hit_s = _hit_stop(direction, stop_price, high, low)
+        # MFE/MAE + level target/stop are only meaningful for a directional
+        # position; neutral structures (straddle/strangle/condor) exit purely on
+        # the premium overlay below.
+        if direction in ("bullish", "bearish"):
+            favorable, adverse = (high, low) if direction == "bullish" else (low, high)
+            mfe_pct = max(mfe_pct, _signed_excursion(direction, entry_ref, favorable))
+            mae_pct = min(mae_pct, _signed_excursion(direction, entry_ref, adverse))
+            hit_t = _hit_target(direction, target_price, high, low)
+            hit_s = _hit_stop(direction, stop_price, high, low)
+        else:
+            hit_t = hit_s = False
         # Premium overlay: net P&L if we closed the whole structure at this bar.
         if has_premium:
             close_cf = _close_cashflow_from_series(resolved_legs, series_by_symbol, ts, slip)
@@ -563,7 +592,9 @@ def _build_candidate(
 
     primary = resolved_legs[0]
     hold_minutes = max(0, int((exit_ts - fill_ts).total_seconds() // 60))
-    pnl_per_share = _defined_risk_clamp(open_cashflow + close_cashflow, net_debit, resolved_legs)
+    pnl_per_share = _defined_risk_clamp(
+        open_cashflow + close_cashflow, open_cashflow, resolved_legs
+    )
     exit_value = net_debit + pnl_per_share  # keeps (exit − entry)·100 == pnl
 
     return {

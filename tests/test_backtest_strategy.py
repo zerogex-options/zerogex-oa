@@ -171,6 +171,65 @@ def test_synth_card_vertical_builds_two_legs():
     assert legs[1]["strike"] == 505 and legs[1]["right"] == "C" and legs[1]["side"] == "SELL"
 
 
+def test_strategy_neutral_structures_build_legs():
+    # Straddle: long ATM call + put.
+    spec = _spec(strategy={
+        "structure": "straddle",
+        "conditions": [{"field": "msi", "op": "<", "value": 40}],
+    }, exit={"profit_target_pct": 0.5, "stop_loss_pct": 0.5})
+    assert spec.strategy.direction == "neutral"
+    legs = strat._build_legs(spec.strategy, 500.0, "2026-06-10")
+    assert sorted((leg_["right"], leg_["side"]) for leg_ in legs) == [("C", "BUY"), ("P", "BUY")]
+    assert all(leg_["strike"] == 500 for leg_ in legs)
+
+    # Strangle: long OTM call/put offset by width.
+    sp2 = _spec(strategy={
+        "structure": "strangle", "width": 5,
+        "conditions": [{"field": "msi", "op": "<", "value": 40}],
+    }, exit={"profit_target_pct": 0.5})
+    legs = strat._build_legs(sp2.strategy, 500.0, "2026-06-10")
+    strikes = {leg_["right"]: leg_["strike"] for leg_ in legs}
+    assert strikes == {"C": 505, "P": 495}
+
+    # Iron condor: 4 legs — sell inner strangle, buy wings.
+    sp3 = _spec(strategy={
+        "structure": "condor", "width": 5, "wing": 5,
+        "conditions": [{"field": "msi", "op": "<", "value": 40}],
+    }, exit={"profit_target_pct": 0.5, "stop_loss_pct": 0.5})
+    legs = strat._build_legs(sp3.strategy, 500.0, "2026-06-10")
+    assert len(legs) == 4
+    sides = {(leg_["right"], leg_["strike"]): leg_["side"] for leg_ in legs}
+    assert sides[("C", 505)] == "SELL" and sides[("C", 510)] == "BUY"
+    assert sides[("P", 495)] == "SELL" and sides[("P", 490)] == "BUY"
+
+
+def test_strategy_neutral_rejects_directional_direction():
+    with pytest.raises(SpecError):
+        _spec(strategy={
+            "structure": "straddle", "direction": "bullish",
+            "conditions": [{"field": "msi", "op": "<", "value": 40}],
+        }, exit={"profit_target_pct": 0.5})
+
+
+def test_strategy_neutral_requires_premium_exit():
+    # Level offsets don't apply to a neutral structure ⇒ must use premium overlay.
+    with pytest.raises(SpecError):
+        _spec(strategy={
+            "structure": "strangle",
+            "conditions": [{"field": "msi", "op": "<", "value": 40}],
+            "target_offset_pct": 0.3,  # directional offset — not a valid neutral exit
+        })
+
+
+def test_strategy_directional_still_requires_direction():
+    with pytest.raises(SpecError):
+        _spec(strategy={
+            "structure": "vertical",
+            "conditions": [{"field": "msi", "op": "<", "value": 40}],
+            "target_offset_pct": 0.3,
+        })  # no direction
+
+
 def test_strategy_vertical_requires_positive_width():
     with pytest.raises(SpecError):
         _spec(strategy={

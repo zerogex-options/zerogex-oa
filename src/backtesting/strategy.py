@@ -159,24 +159,43 @@ def _passes(conditions: list[Condition], bar: dict) -> bool:
 
 
 def _build_legs(strategy: StrategySpec, price: float, expiry: str) -> list[dict]:
-    """ATM single, or a defined-risk vertical (long ATM + short OTM by width)."""
-    right = "C" if strategy.direction == "bullish" else "P"
+    """Legs for the chosen structure, all anchored at the ATM strike.
+
+    Directional: single (long ATM) or vertical (long ATM + short OTM by width).
+    Neutral defined-risk: straddle (long ATM call+put), strangle (long OTM
+    call+put by width), iron condor (sell the inner strangle by width, buy the
+    wings by ``wing`` further out).
+    """
     atm = round(price)
-    long_leg = {"expiry": expiry, "strike": atm, "right": right, "side": "BUY"}
-    if strategy.structure != "vertical":
-        return [long_leg]
-    # Bullish call vertical: short the higher-strike call. Bearish put vertical:
-    # short the lower-strike put. Both are debit spreads in the trade direction.
-    short_strike = atm + strategy.width if strategy.direction == "bullish" else atm - strategy.width
-    short_leg = {"expiry": expiry, "strike": short_strike, "right": right, "side": "SELL"}
-    return [long_leg, short_leg]
+    w, wing = strategy.width, strategy.wing
+
+    def leg(strike, right, side):
+        return {"expiry": expiry, "strike": strike, "right": right, "side": side}
+
+    s = strategy.structure
+    if s == "single":
+        right = "C" if strategy.direction == "bullish" else "P"
+        return [leg(atm, right, "BUY")]
+    if s == "vertical":
+        right = "C" if strategy.direction == "bullish" else "P"
+        short = atm + w if strategy.direction == "bullish" else atm - w
+        return [leg(atm, right, "BUY"), leg(short, right, "SELL")]
+    if s == "straddle":
+        return [leg(atm, "C", "BUY"), leg(atm, "P", "BUY")]
+    if s == "strangle":
+        return [leg(atm + w, "C", "BUY"), leg(atm - w, "P", "BUY")]
+    # iron condor: short inner strangle, long outer wings → net credit.
+    return [
+        leg(atm + w, "C", "SELL"), leg(atm + w + wing, "C", "BUY"),
+        leg(atm - w, "P", "SELL"), leg(atm - w - wing, "P", "BUY"),
+    ]
 
 
 def _synth_card(strategy: StrategySpec, bar: dict, *, underlying: str, max_hold: int) -> CardRow:
     price = bar["price"]
     direction = strategy.direction
-    right = "C" if direction == "bullish" else "P"
     expiry = (bar["ts"].date() + timedelta(days=strategy.dte)).isoformat()
+    directional = direction in ("bullish", "bearish")
 
     payload: dict = {
         "direction": direction,
@@ -184,8 +203,9 @@ def _synth_card(strategy: StrategySpec, bar: dict, *, underlying: str, max_hold:
         "max_hold_minutes": max_hold,
         "legs": _build_legs(strategy, price, expiry),
     }
-    # Level-offset exits (favorable target / adverse stop), if configured.
-    if strategy.target_offset_pct is not None:
+    # Level-offset exits are directional only; neutral structures fall through
+    # to non-level (premium-overlay) target/stop.
+    if directional and strategy.target_offset_pct is not None:
         tgt = (
             price * (1 + strategy.target_offset_pct) if direction == "bullish"
             else price * (1 - strategy.target_offset_pct)
@@ -193,7 +213,7 @@ def _synth_card(strategy: StrategySpec, bar: dict, *, underlying: str, max_hold:
         payload["target"] = {"ref_price": tgt, "kind": "level", "level_name": "custom_target"}
     else:
         payload["target"] = {"ref_price": None, "kind": "premium_pct"}
-    if strategy.stop_offset_pct is not None:
+    if directional and strategy.stop_offset_pct is not None:
         stp = (
             price * (1 - strategy.stop_offset_pct) if direction == "bullish"
             else price * (1 + strategy.stop_offset_pct)
@@ -206,7 +226,7 @@ def _synth_card(strategy: StrategySpec, bar: dict, *, underlying: str, max_hold:
         underlying=underlying,
         timestamp=bar["ts"],
         pattern=_STRATEGY_PATTERN,
-        action="BUY_CALL" if right == "C" else "BUY_PUT",
+        action=strategy.structure.upper(),
         tier="custom",
         direction=direction,
         confidence=0.0,

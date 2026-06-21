@@ -241,18 +241,37 @@ class StrategySpec:
     direction: str
     conditions: list[Condition]
     dte: int = 0
-    structure: str = "single"        # "single" | "vertical"
-    width: float = 5.0               # vertical width in strike points
+    structure: str = "single"        # single|vertical|straddle|strangle|condor
+    width: float = 5.0               # vertical width / strangle & condor offset, pts
+    wing: float = 5.0               # condor wing width (short→long strike), pts
     target_offset_pct: Optional[float] = None  # fraction of entry price, favorable
     stop_offset_pct: Optional[float] = None    # fraction of entry price, adverse
+
+    # Defined-risk structures supported. Directional ones take a bullish/bearish
+    # direction; neutral ones (straddle/strangle/condor) are non-directional.
+    DIRECTIONAL = ("single", "vertical")
+    NEUTRAL = ("straddle", "strangle", "condor")
 
     @classmethod
     def from_dict(cls, raw: dict) -> "StrategySpec":
         if not isinstance(raw, dict):
             raise SpecError("strategy must be an object")
+        structure = str(raw.get("structure") or "single").strip().lower()
+        if structure not in cls.DIRECTIONAL + cls.NEUTRAL:
+            raise SpecError(
+                "strategy.structure must be one of "
+                f"{cls.DIRECTIONAL + cls.NEUTRAL}"
+            )
         direction = str(raw.get("direction") or "").strip().lower()
-        if direction not in ("bullish", "bearish"):
-            raise SpecError("strategy.direction must be bullish or bearish")
+        if structure in cls.NEUTRAL:
+            # Non-directional structures are always neutral; accept an omitted or
+            # explicit 'neutral' direction, reject a directional one.
+            if direction in ("", "neutral"):
+                direction = "neutral"
+            else:
+                raise SpecError(f"{structure} is non-directional; set direction 'neutral'")
+        elif direction not in ("bullish", "bearish"):
+            raise SpecError(f"{structure} requires direction 'bullish' or 'bearish'")
         conds_raw = raw.get("conditions") or []
         if not isinstance(conds_raw, list) or not conds_raw:
             raise SpecError("strategy.conditions must be a non-empty list")
@@ -262,25 +281,26 @@ class StrategySpec:
             dte = int(entry.get("dte", 0) or 0)
         except (TypeError, ValueError):
             raise SpecError("strategy.entry.dte must be an integer")
-        structure = str(raw.get("structure") or "single").strip().lower()
-        if structure not in ("single", "vertical"):
-            raise SpecError("strategy.structure must be 'single' or 'vertical'")
-        width_raw = raw.get("width")
-        if width_raw in (None, ""):
-            width = 5.0
-        else:
+
+        def _pos_pts(key: str, default: float) -> float:
+            v = raw.get(key)
+            if v in (None, ""):
+                return default
             try:
-                width = float(width_raw)
+                out = float(v)
             except (TypeError, ValueError):
-                raise SpecError("strategy.width must be a number")
-        if width <= 0:
-            raise SpecError("strategy.width must be positive")
+                raise SpecError(f"strategy.{key} must be a number")
+            if out <= 0:
+                raise SpecError(f"strategy.{key} must be positive")
+            return out
+
         return cls(
             direction=direction,
             conditions=conditions,
             dte=min(max(dte, 0), 30),
             structure=structure,
-            width=width,
+            width=_pos_pts("width", 5.0),
+            wing=_pos_pts("wing", 5.0),
             target_offset_pct=_coerce_opt_pct(
                 raw.get("target_offset_pct"), field_name="strategy.target_offset_pct", hi=1.0
             ),
@@ -296,6 +316,7 @@ class StrategySpec:
             "entry": {"dte": self.dte},
             "structure": self.structure,
             "width": self.width,
+            "wing": self.wing,
             "target_offset_pct": self.target_offset_pct,
             "stop_offset_pct": self.stop_offset_pct,
         }
@@ -348,6 +369,13 @@ class BacktestSpec:
             has_premium = (
                 exit_rules.profit_target_pct is not None or exit_rules.stop_loss_pct is not None
             )
+            if strategy.direction == "neutral" and not has_premium:
+                # Level offsets are directional; neutral structures exit on the
+                # premium overlay (and/or the time stop) only.
+                raise SpecError(
+                    f"a {strategy.structure} is non-directional — set an exit via "
+                    "exit.profit_target_pct / stop_loss_pct (level offsets don't apply)"
+                )
             if not has_level and not has_premium:
                 raise SpecError(
                     "a custom strategy needs an exit: set strategy.target_offset_pct / "

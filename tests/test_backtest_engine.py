@@ -647,15 +647,63 @@ def test_defined_risk_clamp_bounds_vertical_loss():
         {"right": "C", "side": "long", "strike": 500.0, "qty": 1},
         {"right": "C", "side": "short", "strike": 505.0, "qty": 1},
     ]
-    # Debit 1.40 on a 5-wide: P&L bounded to [-1.40, 3.60].
-    assert _defined_risk_clamp(-9.9, 1.40, legs) == pytest.approx(-1.40)   # overshoot clamped
-    assert _defined_risk_clamp(99.0, 1.40, legs) == pytest.approx(3.60)    # gain capped at width
-    assert _defined_risk_clamp(-0.50, 1.40, legs) == pytest.approx(-0.50)  # within bounds
-    # Credit spread (net_debit −1.50, 5-wide): P&L bounded to [−3.50, 1.50].
-    assert _defined_risk_clamp(-9.0, -1.50, legs) == pytest.approx(-3.50)
-    # A single leg passes through (naturally bounded).
+    # Debit 1.40 (open_cashflow −1.40) on a 5-wide: P&L bounded to [-1.40, 3.60].
+    assert _defined_risk_clamp(-9.9, -1.40, legs) == pytest.approx(-1.40)  # overshoot clamped
+    assert _defined_risk_clamp(99.0, -1.40, legs) == pytest.approx(3.60)   # gain capped at width
+    assert _defined_risk_clamp(-0.50, -1.40, legs) == pytest.approx(-0.50)  # within bounds
+    # Credit spread (credit 1.50 ⇒ open_cashflow +1.50, 5-wide): bounded [−3.50, 1.50].
+    assert _defined_risk_clamp(-9.0, 1.50, legs) == pytest.approx(-3.50)
+    assert _defined_risk_clamp(9.0, 1.50, legs) == pytest.approx(1.50)
+    # A long single passes its lower bound only (unbounded upside).
     single = [{"right": "C", "side": "long", "strike": 500.0, "qty": 1}]
-    assert _defined_risk_clamp(-9.9, 2.0, single) == pytest.approx(-9.9)
+    assert _defined_risk_clamp(-9.9, -2.0, single) == pytest.approx(-2.0)  # loss ≤ debit
+    assert _defined_risk_clamp(50.0, -2.0, single) == pytest.approx(50.0)  # gain uncapped
+
+
+def test_structure_label_phase5():
+    from src.backtesting.engine import _structure_label
+
+    straddle = [
+        {"right": "C", "side": "long", "strike": 500.0},
+        {"right": "P", "side": "long", "strike": 500.0},
+    ]
+    strangle = [
+        {"right": "C", "side": "long", "strike": 505.0},
+        {"right": "P", "side": "long", "strike": 495.0},
+    ]
+    condor = [
+        {"right": "C", "side": "short", "strike": 505.0},
+        {"right": "C", "side": "long", "strike": 510.0},
+        {"right": "P", "side": "short", "strike": 495.0},
+        {"right": "P", "side": "long", "strike": 490.0},
+    ]
+    assert _structure_label(straddle) == "straddle"
+    assert _structure_label(strangle) == "strangle"
+    assert _structure_label(condor) == "condor"
+
+
+def test_risk_profile_across_structures():
+    from src.backtesting.engine import _risk_profile
+
+    # Long straddle (debit 6.0): max loss = debit, gain unbounded.
+    straddle = [
+        {"right": "C", "side": "long", "strike": 500.0, "qty": 1},
+        {"right": "P", "side": "long", "strike": 500.0, "qty": 1},
+    ]
+    ml, mg = _risk_profile(-6.0, straddle)  # open_cashflow −6 ⇒ debit 6
+    assert ml == pytest.approx(6.0) and mg is None
+    # Iron condor (credit 1.5, 5-wide wings): max loss = 3.5, gain = 1.5.
+    condor = [
+        {"right": "C", "side": "short", "strike": 505.0, "qty": 1},
+        {"right": "C", "side": "long", "strike": 510.0, "qty": 1},
+        {"right": "P", "side": "short", "strike": 495.0, "qty": 1},
+        {"right": "P", "side": "long", "strike": 490.0, "qty": 1},
+    ]
+    ml, mg = _risk_profile(1.5, condor)  # open_cashflow +1.5 ⇒ credit 1.5
+    assert ml == pytest.approx(3.5) and mg == pytest.approx(1.5)
+    # Credit ≥ wing ⇒ not a sane defined-risk position.
+    ml, mg = _risk_profile(6.0, condor)
+    assert ml is None
 
 
 def test_price_legs_vertical_net_debit():
@@ -675,6 +723,86 @@ def test_price_legs_vertical_net_debit():
     assert open_cashflow == pytest.approx(-2.60)
     assert resolved[0]["option_symbol"] == "SPY C500"
     assert resolved[1]["side"] == "short"
+
+
+class _StraddleCur:
+    """Routes leg quotes by option_type, and the premium series by symbol."""
+
+    def __init__(self, store):
+        self._s = store
+        self._r = []
+
+    def execute(self, sql, params=None):
+        t = " ".join(sql.split())
+        if "to_regclass" in t:
+            self._r = []
+        elif "FROM underlying_quotes" in t:
+            self._r = self._s["quotes"]
+        elif "option_symbol = %s" in t and "timestamp > %s" in t:
+            self._r = list(self._s["series"].get(params[0], []))
+        elif "FROM option_chains" in t and params is not None:
+            right = next((p for p in params if p in ("C", "P")), None)
+            self._r = [self._s["legs"][right]] if right in self._s["legs"] else []
+        else:
+            self._r = []
+
+    def fetchall(self):
+        return list(self._r)
+
+    def fetchone(self):
+        return self._r[0] if self._r else None
+
+
+class _StraddleConn:
+    def __init__(self, store):
+        self._s = store
+
+    def cursor(self):
+        return _StraddleCur(self._s)
+
+
+def test_build_candidate_neutral_straddle_prices_and_exits_on_premium():
+    from src.backtesting.engine import _build_candidate
+
+    ts = datetime(2026, 5, 1, 14, 0, tzinfo=ET)
+    d = date(2026, 5, 1)
+    payload = {
+        "direction": "neutral",
+        "entry": {"ref_price": 500.0, "trigger": "at_market"},
+        "max_hold_minutes": 120,
+        "target": {"ref_price": None, "kind": "premium_pct"},
+        "stop": {"ref_price": None, "kind": "premium_pct"},
+        "legs": [
+            {"expiry": "2026-05-01", "strike": 500, "right": "C", "side": "BUY"},
+            {"expiry": "2026-05-01", "strike": 500, "right": "P", "side": "BUY"},
+        ],
+    }
+    card = CardRow(
+        underlying="SPY", timestamp=ts, pattern="custom_strategy", action="STRADDLE",
+        tier="custom", direction="neutral", confidence=0.0, payload=payload,
+    )
+    quotes = [  # underlying barely moves; the straddle exits on premium, not level
+        (ts, 500.0, 500.1, 499.9, 500.0),
+        (ts + timedelta(minutes=5), 500.0, 500.2, 499.8, 500.1),
+        (ts + timedelta(minutes=10), 500.1, 500.3, 499.7, 500.2),
+    ]
+    legs = {  # entry quotes per right (debit = 2.10 + 2.00 = 4.10; max_loss 4.10)
+        "C": ("SPY C500", 500.0, d, "C", 2.00, 2.10, 2.05, 2.05, ts),
+        "P": ("SPY P500", 500.0, d, "P", 1.90, 2.00, 1.95, 1.95, ts),
+    }
+    # By bar 3 the straddle's marks jump enough that net P&L ≥ 0.5·max_loss (2.05).
+    series = {
+        "SPY C500": [(ts + timedelta(minutes=10), 4.40, 4.50, 4.45, 4.45)],
+        "SPY P500": [(ts + timedelta(minutes=10), 2.40, 2.50, 2.45, 2.45)],
+    }
+    spec = _bt_spec(exit={"profit_target_pct": 0.5, "stop_loss_pct": 0.5})
+    conn = _StraddleConn({"quotes": quotes, "legs": legs, "series": series})
+    cand, reason = _build_candidate(conn, card, spec)
+    assert reason == "ok"
+    assert cand["structure"] == "straddle"
+    assert cand["n_legs"] == 2
+    assert cand["outcome"] == "target_hit"   # premium take-profit
+    assert cand["entry_premium"] == pytest.approx(4.10)  # net debit
 
 
 def test_apply_cooldown_collapses_rapid_same_pattern_cards():
