@@ -1,7 +1,14 @@
 # Playbook Pattern Calibration — Empirical-Base Feedback Loop
 
-**Status:** shipped (OFF by default) · **Last updated:** 2026-06-18
+**Status:** shipped (OFF by default) · **Last updated:** 2026-06-21
 **Repo:** `zerogex-oa`
+
+> **Data source note:** calibration currently feeds from the **underlying-touch**
+> harness (`playbook/backtest.py` → `playbook_pattern_stats.proposed_base`), the
+> conservative proxy. The leg-level backtest platform (`src/backtesting/`, now
+> through Phase 2 with realistic option-premium exits) can later write into the
+> same stats table so live confidence is driven by **realized option P&L**
+> instead of an underlying proxy — a forward-looking enhancement, not yet wired.
 
 ## Problem
 
