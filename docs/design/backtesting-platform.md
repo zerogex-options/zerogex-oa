@@ -1,6 +1,6 @@
 # ZeroGEX Backtesting Platform — Design
 
-**Status:** Phases 1–3 shipped (1–2 validated on live data) · **Last updated:** 2026-06-21
+**Status:** Phases 1–4 shipped (1–3 validated on live data) · **Last updated:** 2026-06-21
 **Owners:** ZeroGEX engine team
 **Repos:** `zerogex-oa` (engine + API), `zerogex-web` (subscriber UI)
 
@@ -248,9 +248,16 @@ critical because gross 0DTE underlying-touch numbers materially overstate edge
   strategy.py` as-of merges `underlying_quotes ⋈ gex_summary ⋈ signal_scores`;
   exits combine underlying level offsets with the Phase-2 premium overlay. UI:
   a "Custom strategy" mode with a dynamic condition builder on `/backtesting`.
-- **Phase 4 — multi-leg structures:** verticals/condors priced per-leg through
-  the same `leg_fill_price` model (the Card already carries `legs[]`), Greeks-
-  aware sizing, and a dedicated worker process replacing `BackgroundTasks`.
+- **Phase 4 — multi-leg structures + dedicated worker (shipped):** the engine
+  prices N legs per-leg through `leg_fill_price` (net debit/credit, defined-risk
+  max-loss sizing, per-leg commission); custom strategies can trade a defined-
+  risk **vertical** (long ATM + short OTM by width). And a standalone
+  **worker** (`src/backtesting/worker.py`, `zerogex-oa-backtest-worker.service`)
+  drains queued runs via `FOR UPDATE SKIP LOCKED` with stale-run recovery, so
+  long runs survive API restarts; gated by `BACKTEST_WORKER_ENABLED` (the API
+  enqueues only when the worker is the executor).
+- **Phase 5 — further structures & fidelity (next):** iron condors / strangles
+  / straddles, Greeks-aware sizing, and per-leg premium-target exits.
 
 ---
 

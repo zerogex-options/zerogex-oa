@@ -1,0 +1,49 @@
+[Unit]
+Description=ZeroGEX Backtest Worker
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target
+Wants=network-online.target
+
+OnFailure=zerogex-alert@%n.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+# Environment. Set BACKTEST_WORKER_ENABLED=1 in .env so the API stops executing
+# runs in-process and this worker becomes the sole executor.
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Drains queued backtest_runs (FOR UPDATE SKIP LOCKED), executes them, requeues
+# runs orphaned by a crash. Safe to run multiple instances.
+ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.backtesting.worker
+
+Restart=always
+RestartSec=10
+StartLimitBurst=5
+StartLimitInterval=300
+
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=45
+SendSIGKILL=yes
+
+# A heavy multi-week run can use real memory/CPU; bound it generously.
+MemoryMax=2G
+CPUWeight=60
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-backtest-worker
+
+[Install]
+WantedBy=multi-user.target

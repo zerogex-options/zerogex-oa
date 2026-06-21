@@ -1024,6 +1024,17 @@ BACKTEST_SIGNAL_COOLDOWN_MINUTES = _getenv_int(
     "BACKTEST_SIGNAL_COOLDOWN_MINUTES", 30, min=0, max=1440
 )
 
+# Dedicated worker (Phase 4): when enabled, the API only ENQUEUES runs and a
+# standalone `python -m src.backtesting.worker` process drains them, so long
+# backtests don't tie up an API thread and survive API restarts. OFF by default
+# ⇒ the API executes runs in-process via BackgroundTasks (single-host default).
+# Enabling without a running worker leaves runs queued, so flip this on only
+# together with the worker service.
+BACKTEST_WORKER_ENABLED = _getenv_bool("BACKTEST_WORKER_ENABLED", False)
+BACKTEST_WORKER_POLL_SECONDS = _getenv_float("BACKTEST_WORKER_POLL_SECONDS", 2.0, min=0.2)
+# Runs stuck 'running' longer than this (e.g. orphaned by a crash) are requeued.
+BACKTEST_WORKER_STALE_MINUTES = _getenv_int("BACKTEST_WORKER_STALE_MINUTES", 30, min=1)
+
 # GEX normalization scale used to map net_gex into [-1, 1] for multiple
 # signal components (vol_expansion, strategy_builder, position optimizer).
 # Calibrated for the industry-standard "dollar gamma per 1% move" GEX

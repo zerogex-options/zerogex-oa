@@ -61,8 +61,12 @@ async def create_backtest_run(request: Request, background_tasks: BackgroundTask
         logger.exception("failed to create backtest run")
         raise HTTPException(status_code=500, detail="could not create backtest run")
 
-    # Starlette runs this sync task in its threadpool after the response.
-    background_tasks.add_task(execute_run, run_id)
+    # With a dedicated worker the API only enqueues; otherwise Starlette runs
+    # the sync execution in its threadpool after the response.
+    from src.config import BACKTEST_WORKER_ENABLED
+
+    if not BACKTEST_WORKER_ENABLED:
+        background_tasks.add_task(execute_run, run_id)
     return {"run_id": run_id, "status": "queued"}
 
 

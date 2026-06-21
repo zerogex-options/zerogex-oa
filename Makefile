@@ -3489,6 +3489,11 @@ pattern-calibration-refresh: ## Refresh playbook_pattern_stats + report calibrat
 		$(if $(CALIB_DAYS),--days $(CALIB_DAYS)) \
 		$(if $(CALIB_UNDERLYINGS),--underlyings $(CALIB_UNDERLYINGS))
 
+.PHONY: backtest-worker
+backtest-worker: ## Run the backtest worker (drains queued runs; needs BACKTEST_WORKER_ENABLED=1)
+	@echo "$(BLUE)=== Starting backtest worker ===$(NC)"
+	@$(PY) -m src.backtesting.worker
+
 .PHONY: daily-atm-iv-backfill-install
 daily-atm-iv-backfill-install: ## Install the pre-open daily_atm_iv backfill timer (06:00 ET)
 	@echo "$(BLUE)=== Installing daily_atm_iv Backfill Timer ===$(NC)"

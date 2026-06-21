@@ -21,6 +21,51 @@ from src.database.connection import close_db_connection, get_db_connection
 logger = logging.getLogger(__name__)
 
 
+def claim_next_queued_run(conn) -> Optional[int]:
+    """Atomically transition the oldest queued run to running; return its id.
+
+    Uses ``FOR UPDATE SKIP LOCKED`` so multiple worker processes never grab the
+    same run. Returns None when the queue is empty.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE backtest_runs SET status = 'running', started_at = NOW()
+        WHERE id = (
+            SELECT id FROM backtest_runs
+            WHERE status = 'queued'
+            ORDER BY created_at
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+        )
+        RETURNING id
+        """
+    )
+    row = cur.fetchone()
+    return int(row[0]) if row else None
+
+
+def requeue_stale_runs(conn, *, older_than_minutes: int = 30) -> int:
+    """Return runs orphaned in 'running' (e.g. a crashed worker) to the queue.
+
+    A run that has been 'running' longer than ``older_than_minutes`` without
+    completing was almost certainly abandoned by a dead process; reset it to
+    'queued' so a worker picks it up again. Returns the number requeued.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE backtest_runs
+        SET status = 'queued', started_at = NULL, progress = 0.0
+        WHERE status = 'running'
+          AND started_at IS NOT NULL
+          AND started_at < NOW() - (%s || ' minutes')::interval
+        """,
+        (str(older_than_minutes),),
+    )
+    return cur.rowcount if cur.rowcount is not None else 0
+
+
 def create_run(spec: BacktestSpec, *, end_user: Optional[str]) -> int:
     """Insert a queued ``backtest_runs`` row and return its id."""
     conn = get_db_connection()
