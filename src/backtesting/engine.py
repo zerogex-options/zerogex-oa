@@ -200,6 +200,35 @@ def _structure_label(resolved_legs: list[dict]) -> str:
     return "multi_leg"
 
 
+def _defined_risk_clamp(pnl_per_share: float, net_debit: float, resolved_legs: list[dict]) -> float:
+    """Bound a vertical's realized P&L to its no-arbitrage limits.
+
+    A vertical's liquidation value is in [0, width], so its P&L is in
+    [-net_debit, width-net_debit] (debit) or the credit-spread mirror. Illiquid
+    near-expiry bid/ask on the short leg can imply a worse close than that
+    bound; without the clamp a tiny-debit spread (sized into a large contract
+    count) books losses far beyond its defined risk. Singles (value ≥ 0) are
+    already bounded, so they pass through unchanged.
+    """
+    strikes = [float(leg["strike"]) for leg in resolved_legs if leg.get("strike") is not None]
+    is_vertical = (
+        len(resolved_legs) == 2
+        and len({leg["right"] for leg in resolved_legs}) == 1
+        and len(strikes) == 2
+    )
+    if not is_vertical:
+        return pnl_per_share
+    width = max(strikes) - min(strikes)
+    if width <= 0:
+        return pnl_per_share
+    if net_debit >= 0:
+        lo, hi = -net_debit, width - net_debit
+    else:  # credit spread: received -net_debit, risk = width − credit
+        credit = -net_debit
+        lo, hi = -(width - credit), credit
+    return min(max(pnl_per_share, lo), hi)
+
+
 def _max_loss_per_share(open_cashflow: float, resolved_legs: list[dict]) -> Optional[float]:
     """Defined-risk capital at risk per share (×100 = per contract).
 
@@ -533,6 +562,9 @@ def _build_candidate(
 
     primary = resolved_legs[0]
     hold_minutes = max(0, int((exit_ts - fill_ts).total_seconds() // 60))
+    pnl_per_share = _defined_risk_clamp(open_cashflow + close_cashflow, net_debit, resolved_legs)
+    exit_value = net_debit + pnl_per_share  # keeps (exit − entry)·100 == pnl
+
     return {
         "card": card,
         "outcome": outcome,
@@ -553,9 +585,9 @@ def _build_candidate(
         "strike": primary["strike"],
         "expiration": primary["expiry"],
         "entry_premium": net_debit,            # net debit (credit if negative)
-        "exit_premium": close_cashflow,        # net credit received to close
+        "exit_premium": exit_value,            # net value to close (defined-risk clamped)
         "max_loss_per_share": max_loss,
-        "pnl_per_contract": (open_cashflow + close_cashflow) * 100.0,
+        "pnl_per_contract": pnl_per_share * 100.0,
         "hold_minutes": hold_minutes,
         "mfe_pct": round(mfe_pct, 6),
         "mae_pct": round(mae_pct, 6),

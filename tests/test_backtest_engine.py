@@ -612,6 +612,24 @@ class _StrikeConn:
         return _StrikeCur(self._q)
 
 
+def test_defined_risk_clamp_bounds_vertical_loss():
+    from src.backtesting.engine import _defined_risk_clamp
+
+    legs = [
+        {"right": "C", "side": "long", "strike": 500.0, "qty": 1},
+        {"right": "C", "side": "short", "strike": 505.0, "qty": 1},
+    ]
+    # Debit 1.40 on a 5-wide: P&L bounded to [-1.40, 3.60].
+    assert _defined_risk_clamp(-9.9, 1.40, legs) == pytest.approx(-1.40)   # overshoot clamped
+    assert _defined_risk_clamp(99.0, 1.40, legs) == pytest.approx(3.60)    # gain capped at width
+    assert _defined_risk_clamp(-0.50, 1.40, legs) == pytest.approx(-0.50)  # within bounds
+    # Credit spread (net_debit −1.50, 5-wide): P&L bounded to [−3.50, 1.50].
+    assert _defined_risk_clamp(-9.0, -1.50, legs) == pytest.approx(-3.50)
+    # A single leg passes through (naturally bounded).
+    single = [{"right": "C", "side": "long", "strike": 500.0, "qty": 1}]
+    assert _defined_risk_clamp(-9.9, 2.0, single) == pytest.approx(-9.9)
+
+
 def test_price_legs_vertical_net_debit():
     from src.backtesting.engine import _price_legs
 
