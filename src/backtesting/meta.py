@@ -23,6 +23,9 @@ _DEFAULTS = {
     "slippage_pct": 0.01,
     "commission_per_contract": 0.65,
     "max_concurrent": 3,
+    # Greeks-aware sizing caps (Phase 5b); null ⇒ off.
+    "max_net_delta": None,
+    "max_net_vega": None,
     "cooldown_minutes": BACKTEST_SIGNAL_COOLDOWN_MINUTES,
     # Option-premium exit overlay (Phase 2); null ⇒ off, resolve on Card levels.
     "profit_target_pct": None,

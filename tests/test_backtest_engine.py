@@ -660,6 +660,37 @@ def test_defined_risk_clamp_bounds_vertical_loss():
     assert _defined_risk_clamp(50.0, -2.0, single) == pytest.approx(50.0)  # gain uncapped
 
 
+def test_position_greeks_long_adds_short_subtracts():
+    from src.backtesting.engine import _position_greeks
+
+    legs = [
+        {"side": "long", "delta": 0.50, "vega": 0.10, "qty": 1},
+        {"side": "short", "delta": 0.30, "vega": 0.08, "qty": 1},
+    ]
+    d, v = _position_greeks(legs)
+    assert d == pytest.approx((0.50 - 0.30) * 100.0)   # 20 net delta
+    assert v == pytest.approx((0.10 - 0.08) * 100.0)   # 2 net vega
+
+
+def test_simulate_greeks_delta_cap():
+    spec = BacktestSpec.from_dict(
+        {
+            "underlying": "SPY", "start_date": "2026-05-01", "end_date": "2026-05-01",
+            "fill_model": {"slippage_pct": 0.0, "commission_per_contract": 0.0},
+            "sizing": {"capital": 100_000, "risk_per_trade_pct": 50, "max_concurrent": 5,
+                       "max_net_delta": 200},
+        }
+    )
+    cand = _candidate(seq_pnl_per_contract=10.0, entry_premium=0.5,
+                      entered=T0, exited=T0 + timedelta(minutes=10))
+    cand["max_loss_per_share"] = 0.5     # $50/contract ⇒ risk allows ~100s
+    cand["delta_per_contract"] = 50.0    # 50 deltas/contract ⇒ delta cap binds
+    result = _simulate([cand], spec)
+    tr = result.trades[0]
+    assert tr.contracts == 4             # 200 / 50
+    assert tr.net_delta == pytest.approx(200.0)
+
+
 def test_structure_label_phase5():
     from src.backtesting.engine import _structure_label
 
@@ -803,6 +834,95 @@ def test_build_candidate_neutral_straddle_prices_and_exits_on_premium():
     assert cand["n_legs"] == 2
     assert cand["outcome"] == "target_hit"   # premium take-profit
     assert cand["entry_premium"] == pytest.approx(4.10)  # net debit
+
+
+class _CreditCur:
+    """Leg quotes by strike (11-col incl. greeks); series by option_symbol."""
+
+    def __init__(self, store):
+        self._s = store
+        self._r = []
+
+    def execute(self, sql, params=None):
+        t = " ".join(sql.split())
+        if "to_regclass" in t:
+            self._r = []
+        elif "FROM underlying_quotes" in t:
+            self._r = self._s["quotes"]
+        elif "option_symbol = %s" in t and "timestamp > %s" in t:
+            self._r = list(self._s["series"].get(params[0], []))
+        elif "FROM option_chains" in t and params is not None:
+            strike = next((p for p in params if isinstance(p, (int, float)) and p in self._s["legs"]),
+                          None)
+            self._r = [self._s["legs"][strike]] if strike is not None else []
+        else:
+            self._r = []
+
+    def fetchall(self):
+        return list(self._r)
+
+    def fetchone(self):
+        return self._r[0] if self._r else None
+
+
+class _CreditConn:
+    def __init__(self, store):
+        self._s = store
+
+    def cursor(self):
+        return _CreditCur(self._s)
+
+
+def test_build_candidate_credit_spread_profit_target_is_reachable():
+    """A credit structure's take-profit is a fraction of its CREDIT (max gain).
+
+    Regression for the Phase-5b fix: pricing the profit target off max_loss made
+    a credit spread's target exceed its max possible gain — unreachable, so it
+    could only ever stop out.
+    """
+    from src.backtesting.engine import _build_candidate
+
+    ts = datetime(2026, 5, 1, 14, 0, tzinfo=ET)
+    d = date(2026, 5, 1)
+    payload = {
+        "direction": "bearish",  # short call vertical = bearish
+        "entry": {"ref_price": 500.0, "trigger": "at_market"},
+        "max_hold_minutes": 120,
+        "target": {"ref_price": None, "kind": "premium_pct"},
+        "stop": {"ref_price": None, "kind": "premium_pct"},
+        "legs": [
+            {"expiry": "2026-05-01", "strike": 500, "right": "C", "side": "SELL"},
+            {"expiry": "2026-05-01", "strike": 505, "right": "C", "side": "BUY"},
+        ],
+    }
+    card = CardRow(
+        underlying="SPY", timestamp=ts, pattern="custom", action="SELL_CALL_SPREAD",
+        tier="custom", direction="bearish", confidence=0.0, payload=payload,
+    )
+    quotes = [
+        (ts, 500.0, 500.1, 499.9, 500.0),
+        (ts + timedelta(minutes=5), 500.0, 500.1, 499.9, 500.0),
+        (ts + timedelta(minutes=10), 500.0, 500.1, 499.9, 500.0),
+    ]
+    # Entry: sell C500 @ bid 3.0, buy C505 @ ask 1.6 → credit 1.40; max gain 1.40.
+    legs = {
+        500: ("C500", 500.0, d, "C", 3.00, 3.10, 3.05, 3.05, ts, -0.50, 0.10),
+        505: ("C505", 505.0, d, "C", 1.50, 1.60, 1.55, 1.55, ts, -0.30, 0.10),
+    }
+    # By bar 3 the spread has decayed to a 0.60 close cost ⇒ P&L = 1.40 − 0.60 =
+    # 0.80 > 0.70 = 50% of the 1.40 credit (target). The old max_loss basis put
+    # the target at 0.5·3.6 = 1.80 — above the max possible 1.40 gain, unreachable.
+    series = {
+        "C500": [(ts + timedelta(minutes=10), 0.60, 0.70, 0.65, 0.65)],
+        "C505": [(ts + timedelta(minutes=10), 0.10, 0.20, 0.15, 0.15)],
+    }
+    spec = _bt_spec(exit={"profit_target_pct": 0.5, "stop_loss_pct": 0.9})
+    conn = _CreditConn({"quotes": quotes, "legs": legs, "series": series})
+    cand, reason = _build_candidate(conn, card, spec)
+    assert reason == "ok"
+    assert cand["structure"] == "vertical"
+    assert cand["entry_premium"] == pytest.approx(-1.40)  # net credit
+    assert cand["outcome"] == "target_hit"                 # reachable now
 
 
 def test_apply_cooldown_collapses_rapid_same_pattern_cards():

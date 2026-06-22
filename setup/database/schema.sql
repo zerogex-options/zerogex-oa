@@ -2024,6 +2024,10 @@ CREATE INDEX IF NOT EXISTS idx_backtest_trades_run_seq
 -- installs.
 ALTER TABLE backtest_trades ADD COLUMN IF NOT EXISTS structure VARCHAR(32) NOT NULL DEFAULT 'single';
 ALTER TABLE backtest_trades ADD COLUMN IF NOT EXISTS legs JSONB NOT NULL DEFAULT '[]'::jsonb;
+-- Net position greeks at entry (Phase 5b): delta in share-equivalents, vega in
+-- dollars per vol-point; signed (long adds, short subtracts).
+ALTER TABLE backtest_trades ADD COLUMN IF NOT EXISTS net_delta DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE backtest_trades ADD COLUMN IF NOT EXISTS net_vega DOUBLE PRECISION NOT NULL DEFAULT 0;
 
 -- Equity curve: one point per closed trade, in chronological order.
 CREATE TABLE IF NOT EXISTS backtest_equity (

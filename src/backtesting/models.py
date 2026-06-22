@@ -99,6 +99,10 @@ class Sizing:
     capital: float = 25_000.0
     risk_per_trade_pct: float = 2.0
     max_concurrent: int = 3
+    # Greeks-aware caps (Phase 5b): cap |net position delta| / |net vega| per
+    # trade (share-deltas and dollar-vega). None ⇒ that cap is off.
+    max_net_delta: Optional[float] = None
+    max_net_vega: Optional[float] = None
 
     @classmethod
     def from_dict(cls, raw: Optional[dict]) -> "Sizing":
@@ -107,6 +111,17 @@ class Sizing:
             max_concurrent = int(raw.get("max_concurrent", 3) or 3)
         except (TypeError, ValueError):
             raise SpecError("sizing.max_concurrent must be an integer")
+
+        def _opt_positive(key: str) -> Optional[float]:
+            v = raw.get(key)
+            if v in (None, ""):
+                return None
+            try:
+                out = float(v)
+            except (TypeError, ValueError):
+                raise SpecError(f"sizing.{key} must be a number or null")
+            return out if out > 0 else None
+
         return cls(
             capital=_coerce_float(
                 raw.get("capital"), field_name="sizing.capital",
@@ -117,6 +132,8 @@ class Sizing:
                 lo=0.1, hi=100.0, default=2.0,
             ),
             max_concurrent=min(max(max_concurrent, 1), 20),
+            max_net_delta=_opt_positive("max_net_delta"),
+            max_net_vega=_opt_positive("max_net_vega"),
         )
 
 
@@ -407,6 +424,8 @@ class BacktestSpec:
                 "capital": self.sizing.capital,
                 "risk_per_trade_pct": self.sizing.risk_per_trade_pct,
                 "max_concurrent": self.sizing.max_concurrent,
+                "max_net_delta": self.sizing.max_net_delta,
+                "max_net_vega": self.sizing.max_net_vega,
             },
             "exit": {
                 "max_hold_minutes": self.exit.max_hold_minutes,
@@ -445,6 +464,8 @@ class TradeResult:
     hold_minutes: Optional[int]
     structure: str = "single"
     legs: list = field(default_factory=list)
+    net_delta: float = 0.0
+    net_vega: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -454,6 +475,8 @@ class TradeResult:
             "tier": self.tier,
             "structure": self.structure,
             "legs": self.legs,
+            "net_delta": round(self.net_delta, 1),
+            "net_vega": round(self.net_vega, 2),
             "option_symbol": self.option_symbol,
             "option_type": self.option_type,
             "strike": float(self.strike) if self.strike is not None else None,

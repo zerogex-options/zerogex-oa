@@ -164,8 +164,20 @@ def _price_legs(conn, underlying, legs, at, action, slip):
         resolved.append({
             **leg, "option_symbol": q["option_symbol"], "strike": q["strike"],
             "expiry": q["expiration"], "right": q["option_type"],
+            "delta": q.get("delta", 0.0), "vega": q.get("vega", 0.0),
         })
     return cashflow, resolved
+
+
+def _position_greeks(resolved_legs: list[dict]) -> tuple[float, float]:
+    """Net (delta, vega) per *contract* — long adds, short subtracts, ×100 sh."""
+    pos_delta = pos_vega = 0.0
+    for leg in resolved_legs:
+        pos_sign = 1.0 if leg["side"] == "long" else -1.0
+        qty = leg.get("qty", 1)
+        pos_delta += pos_sign * float(leg.get("delta") or 0.0) * qty * 100.0
+        pos_vega += pos_sign * float(leg.get("vega") or 0.0) * qty * 100.0
+    return pos_delta, pos_vega
 
 
 def _close_cashflow_from_series(resolved_legs, series_by_symbol, at, slip) -> Optional[float]:
@@ -327,7 +339,7 @@ def _fetch_leg_quote_from(
     cur.execute(
         f"""
         SELECT option_symbol, strike, expiration, option_type,
-               bid, ask, last, mid, timestamp
+               bid, ask, last, mid, timestamp, delta, vega
         FROM {table}
         WHERE underlying = %s
           AND option_type = %s
@@ -372,6 +384,8 @@ def _fetch_leg_quote(
         "last": float(row[6]) if row[6] is not None else 0.0,
         "mid": float(row[7]) if row[7] is not None else 0.0,
         "ts": row[8],
+        "delta": float(row[9]) if len(row) > 9 and row[9] is not None else 0.0,
+        "vega": float(row[10]) if len(row) > 10 and row[10] is not None else 0.0,
     }
 
 
@@ -520,9 +534,15 @@ def _build_candidate(
         return None, "no_entry_quote"
     open_cashflow, resolved_legs = opened
     net_debit = -open_cashflow              # >0 debit paid, <0 credit received
-    max_loss = _max_loss_per_share(open_cashflow, resolved_legs)
+    max_loss, max_gain = _risk_profile(open_cashflow, resolved_legs)
     if max_loss is None:
         return None, "bad_premium"
+    delta_per_contract, vega_per_contract = _position_greeks(resolved_legs)
+    # Profit target basis: the credit for a credit structure (its max gain),
+    # else the debit (= max_loss). Using max_loss for both made a credit
+    # structure's profit target exceed its max possible gain — unreachable, so
+    # it could only ever stop out. (Phase 5b fidelity fix.)
+    target_basis = max_gain if (net_debit < 0 and max_gain is not None) else max_loss
 
     # Phase-2 premium exit overlay, generalized to the structure: take-profit /
     # stop on net position P&L expressed as a fraction of capital-at-risk
@@ -534,7 +554,7 @@ def _build_candidate(
             series_by_symbol[leg["option_symbol"]] = _fetch_option_series(
                 conn, leg["option_symbol"], fill_ts, deadline
             )
-    prem_target = profit_target_pct * max_loss if profit_target_pct else None
+    prem_target = profit_target_pct * target_basis if profit_target_pct else None
     prem_stop = stop_loss_pct * max_loss if stop_loss_pct else None
 
     # 3) Forward walk for the exit — bars STRICTLY AFTER the fill bar (min hold).
@@ -619,6 +639,8 @@ def _build_candidate(
         "entry_premium": net_debit,            # net debit (credit if negative)
         "exit_premium": exit_value,            # net value to close (defined-risk clamped)
         "max_loss_per_share": max_loss,
+        "delta_per_contract": delta_per_contract,
+        "vega_per_contract": vega_per_contract,
         "pnl_per_contract": pnl_per_share * 100.0,
         "hold_minutes": hold_minutes,
         "mfe_pct": round(mfe_pct, 6),
@@ -680,6 +702,15 @@ def _simulate(candidates: list[dict], spec: BacktestSpec) -> RunResult:
         contracts = max(contracts, 1)
         # Absolute cap so a single trade is a realistic position size.
         contracts = min(contracts, config.BACKTEST_MAX_CONTRACTS_PER_TRADE)
+        # Greeks-aware caps (Phase 5b): bound |net delta| / |net vega| per trade.
+        # Skip a cap when the exposure per contract is ~0 (e.g. a delta-neutral
+        # straddle vs the delta cap) so it doesn't divide by zero.
+        d_pc = abs(cand.get("delta_per_contract") or 0.0)
+        v_pc = abs(cand.get("vega_per_contract") or 0.0)
+        if spec.sizing.max_net_delta is not None and d_pc > 1e-6:
+            contracts = min(contracts, int(math.floor(spec.sizing.max_net_delta / d_pc)))
+        if spec.sizing.max_net_vega is not None and v_pc > 1e-6:
+            contracts = min(contracts, int(math.floor(spec.sizing.max_net_vega / v_pc)))
         # Never risk more than the capital on hand can cover.
         if risk_per_contract * contracts > max(realized_equity, 0.0):
             contracts = int(math.floor(max(realized_equity, 0.0) / risk_per_contract))
@@ -719,6 +750,8 @@ def _simulate(candidates: list[dict], spec: BacktestSpec) -> RunResult:
                 hold_minutes=cand["hold_minutes"],
                 structure=cand.get("structure", "single"),
                 legs=cand.get("legs", []),
+                net_delta=cand.get("delta_per_contract", 0.0) * contracts,
+                net_vega=cand.get("vega_per_contract", 0.0) * contracts,
             )
         )
         open_positions.append({"exit_at": cand["exited_at"], "net_pnl": net})
