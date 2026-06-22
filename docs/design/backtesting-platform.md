@@ -1,6 +1,6 @@
 # ZeroGEX Backtesting Platform — Design
 
-**Status:** Phases 1–5a shipped (1–4 validated on live data) · **Last updated:** 2026-06-21
+**Status:** Phases 1–5 shipped (1–5a validated on live data) · **Last updated:** 2026-06-21
 **Owners:** ZeroGEX engine team
 **Repos:** `zerogex-oa` (engine + API), `zerogex-web` (subscriber UI)
 
@@ -262,9 +262,15 @@ critical because gross 0DTE underlying-touch numbers materially overstate edge
   vertical, or condor). Neutral structures are non-directional and exit on the
   premium overlay. Naked short straddles/strangles are intentionally excluded
   (undefined risk). UI: structure picker with strike-offset + condor wing.
-- **Phase 5b — sizing/exit fidelity (next):** Greeks-aware sizing (delta/vega
-  caps from the per-leg greeks in `option_chains`) and per-leg premium-target
-  exits.
+- **Phase 5b — sizing/exit fidelity (shipped):** Greeks-aware sizing
+  (`sizing.max_net_delta` / `max_net_vega` cap net position delta/vega per trade
+  using the per-leg greeks in `option_chains`; net Δ/vega surfaced in the
+  blotter), and a credit-structure premium-exit fix — the profit target is now a
+  fraction of the **credit** (max gain) for credit structures rather than
+  max-loss (which made it unreachable).
+- **Phase 6 — further fidelity (future):** walk-forward / parameter sweeps,
+  saved & shareable configs, CSV export, and an intraday option-premium target
+  on a per-leg basis.
 
 ---
 
