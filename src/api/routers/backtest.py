@@ -12,9 +12,11 @@ See ``docs/design/backtesting-platform.md`` for the contract.
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import logging
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, Response
 
 from src.api.identity import resolve_end_user
 from src.backtesting import queries
@@ -103,6 +105,37 @@ async def get_backtest_trades(
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
     return await asyncio.to_thread(queries.get_trades, run_id, limit=limit, offset=offset)
+
+
+# CSV columns for the trade-blotter export (flat fields only; ``legs`` omitted).
+_CSV_COLUMNS = [
+    "seq", "structure", "pattern", "direction", "tier", "option_symbol",
+    "option_type", "strike", "expiration", "entered_at", "exited_at",
+    "entry_premium", "exit_premium", "contracts", "net_pnl", "return_pct",
+    "outcome", "hold_minutes", "net_delta", "net_vega",
+]
+
+
+@router.get("/runs/{run_id}/trades.csv")
+async def download_backtest_trades_csv(run_id: int, request: Request) -> Response:
+    """Download the full trade blotter for a run as CSV."""
+    end_user, _ = resolve_end_user(request)
+    run = await asyncio.to_thread(queries.get_run, run_id, end_user=end_user)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    page = await asyncio.to_thread(queries.get_trades, run_id, limit=1_000_000, offset=0)
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=_CSV_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    for trade in page["trades"]:
+        writer.writerow(trade)
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="backtest_run_{run_id}_trades.csv"',
+        },
+    )
 
 
 @router.get("/runs/{run_id}/equity")
