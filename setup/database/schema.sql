@@ -2038,3 +2038,22 @@ CREATE TABLE IF NOT EXISTS backtest_equity (
     drawdown_pct  DOUBLE PRECISION NOT NULL DEFAULT 0.0,
     PRIMARY KEY (run_id, seq)
 );
+
+-- Saved & shareable backtest configurations (Phase 6). A config is just a
+-- named, validated BacktestSpec the user can reload into the form or hand to
+-- someone else. ``share_token`` is a random URL-safe id minted at creation;
+-- anyone holding it can load the spec read-only (clone into their own form),
+-- without being able to enumerate or mutate the owner's other configs.
+CREATE TABLE IF NOT EXISTS backtest_configs (
+    id            BIGSERIAL    PRIMARY KEY,
+    end_user      VARCHAR(128),
+    name          VARCHAR(120) NOT NULL,
+    underlying    VARCHAR(10)  NOT NULL,
+    spec          JSONB        NOT NULL,
+    share_token   VARCHAR(32)  UNIQUE,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_configs_user_updated
+    ON backtest_configs(end_user, updated_at DESC);

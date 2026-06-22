@@ -19,7 +19,7 @@ import logging
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, Response
 
 from src.api.identity import resolve_end_user
-from src.backtesting import queries
+from src.backtesting import configs, queries
 from src.backtesting.meta import build_meta
 from src.backtesting.models import BacktestSpec, SpecError
 from src.backtesting.runner import create_run, execute_run
@@ -146,3 +146,114 @@ async def get_backtest_equity(run_id: int, request: Request) -> list:
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
     return await asyncio.to_thread(queries.get_equity, run_id)
+
+
+# ---------------------------------------------------------------------------
+# Saved & shareable configurations (Phase 6)
+# ---------------------------------------------------------------------------
+
+
+def _validated_spec(body: dict) -> BacktestSpec:
+    """Validate the ``spec`` block of a config request body, or 422."""
+    spec_in = body.get("spec")
+    if not isinstance(spec_in, dict):
+        raise HTTPException(status_code=422, detail="`spec` object is required")
+    try:
+        return BacktestSpec.from_dict(spec_in)
+    except SpecError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@router.post("/configs", status_code=201)
+async def create_backtest_config(request: Request) -> dict:
+    """Save a named, validated BacktestSpec; returns its summary + share token."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="request body must be valid JSON")
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="`name` is required")
+    if len(name) > 120:
+        name = name[:120]
+    spec = _validated_spec(body)
+    end_user, _ = resolve_end_user(request)
+    return await asyncio.to_thread(
+        configs.save_config,
+        spec.to_dict(),
+        name=name,
+        underlying=spec.underlying,
+        end_user=end_user,
+    )
+
+
+@router.get("/configs")
+async def list_backtest_configs(request: Request) -> list:
+    """Saved configs for the calling end-user (anonymous pool when unauthenticated)."""
+    end_user, _ = resolve_end_user(request)
+    return await asyncio.to_thread(configs.list_configs, end_user=end_user)
+
+
+@router.get("/configs/shared/{share_token}")
+async def get_shared_backtest_config(share_token: str) -> dict:
+    """Public read-only fetch of a shared config by token (clone into the form)."""
+    cfg = await asyncio.to_thread(configs.get_shared_config, share_token)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail="shared config not found")
+    return cfg
+
+
+@router.get("/configs/{config_id}")
+async def get_backtest_config(config_id: int, request: Request) -> dict:
+    """Fetch one saved config (incl. spec), scoped to its owner."""
+    end_user, _ = resolve_end_user(request)
+    cfg = await asyncio.to_thread(configs.get_config, config_id, end_user=end_user)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail="config not found")
+    return cfg
+
+
+@router.put("/configs/{config_id}")
+async def update_backtest_config(config_id: int, request: Request) -> dict:
+    """Rename and/or replace a saved config's spec (owner only)."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="request body must be valid JSON")
+
+    name = body.get("name")
+    if name is not None:
+        name = str(name).strip()[:120] or None
+
+    spec_dict: dict | None = None
+    underlying: str | None = None
+    if body.get("spec") is not None:
+        spec = _validated_spec(body)
+        spec_dict = spec.to_dict()
+        underlying = spec.underlying
+
+    if name is None and spec_dict is None:
+        raise HTTPException(status_code=422, detail="nothing to update")
+
+    end_user, _ = resolve_end_user(request)
+    cfg = await asyncio.to_thread(
+        configs.update_config,
+        config_id,
+        end_user=end_user,
+        name=name,
+        spec_dict=spec_dict,
+        underlying=underlying,
+    )
+    if cfg is None:
+        raise HTTPException(status_code=404, detail="config not found")
+    return cfg
+
+
+@router.delete("/configs/{config_id}")
+async def delete_backtest_config(config_id: int, request: Request) -> dict:
+    """Delete a saved config (owner only)."""
+    end_user, _ = resolve_end_user(request)
+    ok = await asyncio.to_thread(configs.delete_config, config_id, end_user=end_user)
+    if not ok:
+        raise HTTPException(status_code=404, detail="config not found")
+    return {"deleted": True}

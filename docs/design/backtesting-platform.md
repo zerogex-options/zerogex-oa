@@ -1,6 +1,6 @@
 # ZeroGEX Backtesting Platform — Design
 
-**Status:** Phases 1–5 shipped (1–5a validated on live data) · **Last updated:** 2026-06-21
+**Status:** Phases 1–5 shipped (1–5a validated on live data); Phase 6 in progress (CSV export + saved/shareable configs shipped) · **Last updated:** 2026-06-22
 **Owners:** ZeroGEX engine team
 **Repos:** `zerogex-oa` (engine + API), `zerogex-web` (subscriber UI)
 
@@ -268,16 +268,24 @@ critical because gross 0DTE underlying-touch numbers materially overstate edge
   blotter), and a credit-structure premium-exit fix — the profit target is now a
   fraction of the **credit** (max gain) for credit structures rather than
   max-loss (which made it unreachable).
-- **Phase 6 — further fidelity (future):** walk-forward / parameter sweeps,
-  saved & shareable configs, CSV export, and an intraday option-premium target
-  on a per-leg basis.
+- **Phase 6 — convenience & fidelity (in progress):**
+  - *CSV export (shipped):* `GET /api/backtest/runs/{id}/trades.csv` streams the
+    full blotter; an "Export CSV" link sits in the Trade Blotter header.
+  - *Saved & shareable configs (shipped):* `backtest_configs` table +
+    `/api/backtest/configs` CRUD. A config is a named, validated `BacktestSpec`;
+    each carries a random `share_token` so `/backtesting?config=<token>` clones it
+    read-only into a fresh form. Owner-scoped list/get/delete mirror the runs
+    ownership model. UI: a "Saved configurations" block in the config panel
+    (save / load / share-link / delete).
+  - *Walk-forward / parameter sweeps (next):* run a spec across a grid of
+    parameter values and compare summaries.
+  - *Per-leg intraday option-premium target (future).*
 
 ---
 
 ## 7. Out of scope (still open)
 
 - Walk-forward optimization / parameter sweeps.
-- Saved/shareable backtest configs and CSV export (trivial follow-up).
 - Custom user-defined strategies beyond the playbook patterns (Phase 3).
 - A standalone worker/queue (today uses FastAPI `BackgroundTasks`; fine for the
   single-process API host, replaced in Phase 4).
