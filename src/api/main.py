@@ -28,6 +28,7 @@ from .models import (
     GEXSummary,
     GEXByStrike,
     GEXProfile,
+    GEXHistoricalContext,
     FlowPoint,
     FlowSeriesPoint,
     FlowContractsResponse,
@@ -400,6 +401,37 @@ async def get_gex_profile(symbol: str = Query(default="SPY")):
     if not data:
         raise HTTPException(status_code=404, detail="No GEX profile data available")
     return GEXProfile(**data)
+
+
+@app.get(
+    "/api/gex/historical-context",
+    response_model=GEXHistoricalContext,
+    tags=["GEX"],
+    dependencies=[_scope_gex],
+)
+@handle_api_errors("GET /api/gex/historical-context")
+async def get_gex_historical_context(symbol: str = Query(default="SPY")):
+    """Historical-distribution context for the live headline GEX metrics.
+
+    For each of ``net_gex_at_spot`` and ``total_net_gex``, returns the
+    current value plus the rolling-30-day and all-time distributions
+    (p05/p25/p50/p75/p95, mean/std, min/max, sample size), the live value's
+    interpolated percentile and z-score against each window, and a regime
+    label (``record_high`` / ``extreme_high`` / ``elevated`` / ``normal`` /
+    ``low`` / ``extreme_low`` / ``record_low`` / ``unknown``).
+
+    Distribution rows are produced nightly by
+    ``src.tools.gex_historical_stats_refresh`` and bucketed by 5-minute ET
+    RTH bucket so the EOD-pinning seasonality doesn't dominate the
+    comparison.  Falls back to a flat (no TOD bucketing) distribution when
+    a specific bucket is thin.
+
+    Returns 404 if no ``gex_summary`` row exists for the symbol yet.
+    """
+    data = await _db().get_gex_historical_context(symbol)
+    if not data:
+        raise HTTPException(status_code=404, detail="No GEX historical context available")
+    return GEXHistoricalContext(**data)
 
 
 @app.get(

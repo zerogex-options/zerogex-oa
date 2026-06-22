@@ -280,6 +280,112 @@ def _flow_lag_same_session_clause(use_cash_keying: bool) -> str:
     )
 
 
+# 5-minute RTH bucket index for an option_chain timestamp.  Returns a
+# value in [0, 78) when the timestamp falls inside the cash RTH window
+# (09:30 ET inclusive, 16:00 ET exclusive); -1 otherwise.  Mirrors the
+# bucket convention used by src/tools/gex_historical_stats_refresh.py so
+# the lookup and the writer agree on bucket boundaries.
+_RTH_BUCKETS = 78
+
+
+def _tod_bucket_for_timestamp(ts: datetime) -> int:
+    et = ts.astimezone(_ET)
+    minutes = (et.hour - 9) * 60 + (et.minute - 30)
+    if minutes < 0 or minutes >= _RTH_BUCKETS * 5:
+        return -1
+    return minutes // 5
+
+
+def _historical_context_for(
+    current: Optional[float],
+    stats: Dict[str, Any],
+    tod_bucket_used: Optional[int],
+) -> Dict[str, Any]:
+    """Build the per-(metric, window) context block.
+
+    Derives the current value's percentile by linear interpolation between
+    the stored p05/p25/p50/p75/p95 anchors, computes a z-score against the
+    rolling mean/std, and produces the regime label requested for the
+    /api/gex/historical-context endpoint.  ``record_high``/``record_low``
+    short-circuits the z-score branch when the live value exceeds the
+    pre-aggregated min/max — so a session that sets a new record gets
+    flagged immediately, without waiting for tonight's refresh.
+    """
+    p05 = stats.get("p05")
+    p25 = stats.get("p25")
+    p50 = stats.get("p50")
+    p75 = stats.get("p75")
+    p95 = stats.get("p95")
+    mean = stats.get("mean")
+    std = stats.get("std")
+    minv = stats.get("min_value")
+    maxv = stats.get("max_value")
+
+    percentile: Optional[float] = None
+    z_score: Optional[float] = None
+    regime = "unknown"
+
+    cur = float(current) if current is not None else None
+
+    # Percentile: piecewise-linear interpolation across the stored anchors.
+    if cur is not None and all(v is not None for v in (p05, p25, p50, p75, p95)):
+        anchors: list[Tuple[float, float]] = [
+            (5.0, float(p05)),
+            (25.0, float(p25)),
+            (50.0, float(p50)),
+            (75.0, float(p75)),
+            (95.0, float(p95)),
+        ]
+        if cur <= anchors[0][1]:
+            percentile = anchors[0][0]
+        elif cur >= anchors[-1][1]:
+            percentile = anchors[-1][0]
+        else:
+            for (p_lo, v_lo), (p_hi, v_hi) in zip(anchors, anchors[1:]):
+                if v_lo <= cur <= v_hi:
+                    if v_hi == v_lo:
+                        percentile = p_lo
+                    else:
+                        percentile = p_lo + (p_hi - p_lo) * (cur - v_lo) / (v_hi - v_lo)
+                    break
+
+    if cur is not None and mean is not None and std is not None and std > 0:
+        z_score = (cur - float(mean)) / float(std)
+
+    if cur is not None and maxv is not None and cur > float(maxv):
+        regime = "record_high"
+    elif cur is not None and minv is not None and cur < float(minv):
+        regime = "record_low"
+    elif z_score is not None:
+        if z_score >= 2.0:
+            regime = "extreme_high"
+        elif z_score >= 1.0:
+            regime = "elevated"
+        elif z_score <= -2.0:
+            regime = "extreme_low"
+        elif z_score <= -1.0:
+            regime = "low"
+        else:
+            regime = "normal"
+
+    return {
+        "p05": float(p05) if p05 is not None else None,
+        "p25": float(p25) if p25 is not None else None,
+        "p50": float(p50) if p50 is not None else None,
+        "p75": float(p75) if p75 is not None else None,
+        "p95": float(p95) if p95 is not None else None,
+        "mean": float(mean) if mean is not None else None,
+        "std": float(std) if std is not None else None,
+        "min": float(minv) if minv is not None else None,
+        "max": float(maxv) if maxv is not None else None,
+        "sample_size": int(stats["sample_size"]),
+        "percentile": percentile,
+        "z_score": z_score,
+        "regime": regime,
+        "tod_bucket_used": tod_bucket_used,
+    }
+
+
 class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     """Manages database connections and queries"""
 
@@ -1791,6 +1897,123 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 return payload
         except Exception as e:
             logger.error(f"Error fetching GEX profile: {e}", exc_info=True)
+            raise
+
+    async def get_gex_historical_context(
+        self,
+        symbol: str = "SPY",
+    ) -> Optional[Dict[str, Any]]:
+        """Return the historical-context snapshot for the live GEX metrics.
+
+        Reads the latest ``gex_summary`` row for the symbol, then joins it
+        against ``gex_historical_stats`` to compare the current values
+        against pre-aggregated 30-day and all-time distributions.  The
+        distribution rows are produced nightly by
+        ``src.tools.gex_historical_stats_refresh``.
+
+        For each (metric × window) we attempt a TOD-bucketed match first
+        (the ``gex_summary.timestamp`` mapped onto a 5-minute RTH bucket)
+        so the EOD-pinning seasonality doesn't dominate the comparison.
+        If that bucket is missing or thin we transparently fall back to
+        the symbol's flat (tod=-1) distribution for the same window.
+
+        Returns a dict with:
+            * ``symbol``, ``timestamp``, ``tod_bucket``, ``in_rth``
+            * ``metrics``: {metric_name -> {
+                ``current``, ``windows``: {window_label -> {
+                    p05, p25, p50, p75, p95, mean, std,
+                    min, max, sample_size, percentile, z_score,
+                    regime, tod_bucket_used
+                }}}}
+
+        Returns ``None`` when there is no current GEX summary row for the
+        symbol (fresh deployment / degraded snapshot).
+        """
+        symbol = symbol.upper()
+        cache_key = f"gex_historical_context:{symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        latest_query = """
+            SELECT timestamp,
+                   total_net_gex::double precision AS total_net_gex,
+                   net_gex_at_spot::double precision AS net_gex_at_spot
+            FROM gex_summary
+            WHERE underlying = $1
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+
+        stats_query = """
+            SELECT metric, window_label, tod_bucket,
+                   p05, p25, p50, p75, p95,
+                   mean, std, min_value, max_value, sample_size
+            FROM gex_historical_stats
+            WHERE underlying = $1
+              AND tod_bucket IN ($2, -1)
+        """
+
+        try:
+            async with self._acquire_connection() as conn:
+                latest = await conn.fetchrow(latest_query, symbol)
+                if latest is None or latest["timestamp"] is None:
+                    return None
+
+                tod_bucket = _tod_bucket_for_timestamp(latest["timestamp"])
+                in_rth = tod_bucket >= 0
+                # When the latest snapshot is outside RTH (overnight, weekend)
+                # we still want to render a useful context — fall through to
+                # the flat distribution by querying tod=-1 only.
+                bucket_param = tod_bucket if in_rth else -1
+                rows = await conn.fetch(stats_query, symbol, bucket_param)
+
+                # Index rows by (metric, window) -> {tod_bucket -> stats}.
+                by_key: Dict[Tuple[str, str], Dict[int, Dict[str, Any]]] = {}
+                for r in rows:
+                    by_key.setdefault((r["metric"], r["window_label"]), {})[
+                        r["tod_bucket"]
+                    ] = dict(r)
+
+                metrics_out: Dict[str, Any] = {}
+                for metric_name in ("net_gex_at_spot", "total_net_gex"):
+                    current = latest[metric_name]
+                    metric_block: Dict[str, Any] = {
+                        "current": float(current) if current is not None else None,
+                        "windows": {},
+                    }
+                    for window_label in ("30d", "all_time"):
+                        key = (metric_name, window_label)
+                        bucket_map = by_key.get(key) or {}
+                        # Prefer the TOD-bucketed row; fall back to flat
+                        # when the bucket is missing.
+                        stats_row: Optional[Dict[str, Any]] = bucket_map.get(bucket_param)
+                        bucket_used: Optional[int] = bucket_param
+                        if stats_row is None:
+                            stats_row = bucket_map.get(-1)
+                            bucket_used = -1 if stats_row is not None else None
+                        if stats_row is None:
+                            metric_block["windows"][window_label] = None
+                            continue
+                        ctx = _historical_context_for(
+                            current=current,
+                            stats=stats_row,
+                            tod_bucket_used=bucket_used,
+                        )
+                        metric_block["windows"][window_label] = ctx
+                    metrics_out[metric_name] = metric_block
+
+                payload = {
+                    "symbol": symbol,
+                    "timestamp": latest["timestamp"],
+                    "tod_bucket": tod_bucket if in_rth else None,
+                    "in_rth": in_rth,
+                    "metrics": metrics_out,
+                }
+                self._cache_set(cache_key, payload, self._analytics_cache_ttl_seconds)
+                return payload
+        except Exception as e:
+            logger.error(f"Error fetching GEX historical context: {e}", exc_info=True)
             raise
 
     async def get_historical_gex(

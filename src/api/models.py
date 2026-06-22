@@ -5,7 +5,7 @@ Pydantic models for API request/response validation
 from pydantic import BaseModel, Field
 from datetime import datetime, date
 from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional
 from decimal import Decimal
 
 
@@ -106,6 +106,67 @@ class GEXProfile(BaseModel):
         from_attributes = True
         json_encoders = {
             Decimal: lambda v: float(v) if v is not None else None,
+            datetime: lambda v: v.isoformat() if v is not None else None,
+        }
+
+
+class GEXHistoricalWindow(BaseModel):
+    """One historical window (e.g. 30d, all_time) for a single metric.
+
+    ``percentile`` is the interpolated rank of the LIVE value across the
+    stored p05/p25/p50/p75/p95 anchors.  ``z_score`` is the standard
+    z-score against the same window's mean/std.  ``regime`` is the
+    user-facing bucket label — record_high / extreme_high / elevated /
+    normal / low / extreme_low / record_low / unknown.
+
+    ``tod_bucket_used``:
+        * 0..77 — a time-of-day-aware bucket (5-min RTH index, 0=09:30 ET)
+        * -1    — the flat (non-TOD) fallback for the same window
+        * None  — neither bucket was available (no stats row yet)
+    """
+
+    p05: Optional[float] = None
+    p25: Optional[float] = None
+    p50: Optional[float] = None
+    p75: Optional[float] = None
+    p95: Optional[float] = None
+    mean: Optional[float] = None
+    std: Optional[float] = None
+    min: Optional[float] = None
+    max: Optional[float] = None
+    sample_size: int
+    percentile: Optional[float] = None
+    z_score: Optional[float] = None
+    regime: str
+    tod_bucket_used: Optional[int] = None
+
+
+class GEXHistoricalMetric(BaseModel):
+    """Live value plus one entry per known window."""
+
+    current: Optional[float] = None
+    windows: Dict[str, Optional[GEXHistoricalWindow]]
+
+
+class GEXHistoricalContext(BaseModel):
+    """Response shape for ``/api/gex/historical-context``.
+
+    Headline GEX figures from the latest ``gex_summary`` row alongside the
+    historical-distribution context (30d + all_time, TOD-aware) for each.
+    The frontend uses this to render "P82 vs 30d", "RECORD HIGH",
+    "elevated" style badges on the live MetricCards and the dedicated
+    /gamma-pulse page.
+    """
+
+    symbol: str
+    timestamp: datetime
+    tod_bucket: Optional[int] = None
+    in_rth: bool
+    metrics: Dict[str, GEXHistoricalMetric]
+
+    class Config:
+        from_attributes = True
+        json_encoders = {
             datetime: lambda v: v.isoformat() if v is not None else None,
         }
 

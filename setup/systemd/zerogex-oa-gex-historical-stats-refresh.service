@@ -1,0 +1,39 @@
+[Unit]
+Description=ZeroGEX nightly refresh of gex_historical_stats percentile bands
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target zerogex-oa-normalizer-refresh.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+# Environment
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Recompute per-symbol historical distributions of total_net_gex /
+# net_gex_at_spot from gex_summary so /api/gex/historical-context can
+# answer "is the current value unusual?" without a heavy on-request
+# PERCENTILE_CONT pass.  TOD-bucketed (5-min RTH) so the structural EOD
+# 0DTE pinning isn't mis-flagged as "record high" every afternoon.
+ExecStart=/usr/bin/make -C /home/ubuntu/zerogex-oa gex-historical-stats-refresh
+
+# Refresh runs in seconds even for ~6 months of gex_summary; cap well
+# below the 1800s the db-maintain unit uses so a stuck DB doesn't sit
+# overnight.
+TimeoutStartSec=600
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-gex-historical-stats-refresh

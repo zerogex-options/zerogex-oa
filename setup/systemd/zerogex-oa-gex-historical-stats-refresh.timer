@@ -1,0 +1,22 @@
+[Unit]
+Description=Nightly trigger for ZeroGEX gex_historical_stats refresh (04:45 ET)
+
+[Timer]
+# Run daily at 04:45 server time (timezone is America/New_York, set
+# by deploy/steps/010.setup).  Schedule rationale — sits AFTER the
+# normalizer-refresh slot (04:30) which depends on the same database,
+# and well before pre-market data flow picks up:
+#   • 02:00 ET — db-maintain (daily, up to 30 min)
+#   • 02:30 ET — db-vacuum-full (Sundays only, up to 90 min)
+#   • 03:30 ET — logs-clear (daily, up to 10 min)
+#   • 04:30 ET — normalizer-refresh
+#   • 04:45 ET — gex-historical-stats-refresh (this unit)
+# Jitter ±5 min to avoid lock contention if anything overruns.
+OnCalendar=*-*-* 04:45:00
+RandomizedDelaySec=5m
+# Run on next boot if the box was off when the timer should have
+# fired (don't skip nightly refreshes after planned downtime).
+Persistent=true
+
+[Install]
+WantedBy=timers.target

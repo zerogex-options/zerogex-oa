@@ -2795,6 +2795,18 @@ normalizer-cache-dry-run: ## Compute distributions without writing (preview only
 		$(if $(NORMALIZER_SYMBOLS),--symbols $(NORMALIZER_SYMBOLS)) \
 		--window-days $(NORMALIZER_WINDOW_DAYS) --dry-run
 
+.PHONY: gex-historical-stats-refresh
+gex-historical-stats-refresh: ## Recompute gex_historical_stats percentile bands (run nightly)
+	@echo "$(BLUE)=== Refreshing gex_historical_stats ===$(NC)"
+	@$(PY) -m src.tools.gex_historical_stats_refresh \
+		$(if $(GEX_HIST_SYMBOLS),--symbols $(GEX_HIST_SYMBOLS))
+
+.PHONY: gex-historical-stats-dry-run
+gex-historical-stats-dry-run: ## Compute gex_historical_stats distributions without writing
+	@echo "$(BLUE)=== gex_historical_stats (dry-run) ===$(NC)"
+	@$(PY) -m src.tools.gex_historical_stats_refresh \
+		$(if $(GEX_HIST_SYMBOLS),--symbols $(GEX_HIST_SYMBOLS)) --dry-run
+
 # Read-only re-validation of the relative gamma-flip thresholds after the
 # 7106711 flip redefinition. Splits persisted gex_summary.flip_distance at
 # the deploy boundary (NORMALIZER_DEPLOY_CUTOFF) and reports the gate

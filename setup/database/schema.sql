@@ -1755,6 +1755,57 @@ DELETE FROM component_normalizer_cache
  WHERE field_name IN ('smart_money_volume_delta', 'smart_money_premium');
 
 -- =============================================================================
+-- gex_historical_stats
+-- =============================================================================
+-- Per-symbol historical distribution snapshots of headline GEX metrics
+-- (total_net_gex and net_gex_at_spot).  The /api/gex/historical-context
+-- endpoint reads from this table to surface "is the current dealer gamma
+-- here unusual, elevated, or a record?" badges on the live MetricCards
+-- and on the /gamma-pulse page.
+--
+-- Granularity
+--   * underlying    — symbol
+--   * metric        — 'total_net_gex' or 'net_gex_at_spot'
+--   * window_label  — '30d' (rolling 30-calendar-day) or 'all_time'
+--                     (everything since data started)
+--   * tod_bucket    — 5-minute RTH bucket index (0 = 09:30-09:35 ET,
+--                     1 = 09:35-09:40, ..., 77 = 15:55-16:00); -1 is the
+--                     flat (all-day) distribution used as a fallback when
+--                     a specific bucket has too few samples.
+--
+-- Refresh
+--   Populated by src/tools/gex_historical_stats_refresh.py, run nightly
+--   from the zerogex-oa-gex-historical-stats-refresh timer (04:35 ET,
+--   just after the normalizer cache).  Idempotent UPSERT.
+--
+-- Records-vs-live
+--   The endpoint compares the LIVE current value to ``max_value`` /
+--   ``min_value`` in this table so a fresh record (today exceeded last
+--   night's max) gets flagged in real time without waiting for tonight's
+--   refresh.
+CREATE TABLE IF NOT EXISTS gex_historical_stats (
+    underlying    VARCHAR(10)   NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    metric        VARCHAR(32)   NOT NULL,
+    window_label  VARCHAR(16)   NOT NULL,
+    tod_bucket    SMALLINT      NOT NULL,
+    p05           DOUBLE PRECISION,
+    p25           DOUBLE PRECISION,
+    p50           DOUBLE PRECISION,
+    p75           DOUBLE PRECISION,
+    p95           DOUBLE PRECISION,
+    mean          DOUBLE PRECISION,
+    std           DOUBLE PRECISION,
+    min_value     DOUBLE PRECISION,
+    max_value     DOUBLE PRECISION,
+    sample_size   INTEGER       NOT NULL,
+    refreshed_at  TIMESTAMPTZ   DEFAULT NOW(),
+    PRIMARY KEY (underlying, metric, window_label, tod_bucket)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gex_historical_stats_lookup
+    ON gex_historical_stats(underlying, metric, window_label);
+
+-- =============================================================================
 -- Max-pain daily OI snapshot (derived cache)
 -- =============================================================================
 -- /api/max-pain/current serves a per-day max-pain rollup from these tables
