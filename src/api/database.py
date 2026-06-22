@@ -306,10 +306,17 @@ def _historical_context_for(
     Derives the current value's percentile by linear interpolation between
     the stored p05/p25/p50/p75/p95 anchors, computes a z-score against the
     rolling mean/std, and produces the regime label requested for the
-    /api/gex/historical-context endpoint.  ``record_high``/``record_low``
-    short-circuits the z-score branch when the live value exceeds the
-    pre-aggregated min/max — so a session that sets a new record gets
-    flagged immediately, without waiting for tonight's refresh.
+    /api/gex/historical-context endpoint.
+
+    Regime is z-score based (extreme_high / elevated / normal / low /
+    extreme_low / unknown).  Records are surfaced as separate boolean
+    flags — ``is_record_high`` / ``is_record_low`` — fired when the live
+    value exceeds the stored min/max, so a session that sets a new
+    record gets flagged immediately without waiting for tonight's
+    refresh.  When a record fires we ALSO promote the regime to the
+    matching extreme label, even if z-score alone would have been
+    elevated/low; this keeps the badge color consistent with the trophy
+    icon the frontend renders on top.
     """
     p05 = stats.get("p05")
     p25 = stats.get("p25")
@@ -352,11 +359,10 @@ def _historical_context_for(
     if cur is not None and mean is not None and std is not None and std > 0:
         z_score = (cur - float(mean)) / float(std)
 
-    if cur is not None and maxv is not None and cur > float(maxv):
-        regime = "record_high"
-    elif cur is not None and minv is not None and cur < float(minv):
-        regime = "record_low"
-    elif z_score is not None:
+    is_record_high = cur is not None and maxv is not None and cur > float(maxv)
+    is_record_low = cur is not None and minv is not None and cur < float(minv)
+
+    if z_score is not None:
         if z_score >= 2.0:
             regime = "extreme_high"
         elif z_score >= 1.0:
@@ -367,6 +373,15 @@ def _historical_context_for(
             regime = "low"
         else:
             regime = "normal"
+
+    # A new record is always "extreme" by definition — promote the regime
+    # label so badge color and the trophy icon agree visually.  Covers the
+    # edge case where the historical distribution is very tight and a
+    # record-setting value still lands below the |z|>=2 cutoff.
+    if is_record_high:
+        regime = "extreme_high"
+    elif is_record_low:
+        regime = "extreme_low"
 
     return {
         "p05": float(p05) if p05 is not None else None,
@@ -382,6 +397,8 @@ def _historical_context_for(
         "percentile": percentile,
         "z_score": z_score,
         "regime": regime,
+        "is_record_high": bool(is_record_high),
+        "is_record_low": bool(is_record_low),
         "tod_bucket_used": tod_bucket_used,
     }
 
@@ -1919,11 +1936,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         Returns a dict with:
             * ``symbol``, ``timestamp``, ``tod_bucket``, ``in_rth``
+            * ``tracking_started_at`` — earliest ``gex_summary.timestamp``
+              for the symbol; the date the all-time records are measured
+              "since" in the trophy-icon tooltip on the frontend.
             * ``metrics``: {metric_name -> {
                 ``current``, ``windows``: {window_label -> {
                     p05, p25, p50, p75, p95, mean, std,
                     min, max, sample_size, percentile, z_score,
-                    regime, tod_bucket_used
+                    regime, is_record_high, is_record_low, tod_bucket_used
                 }}}}
 
         Returns ``None`` when there is no current GEX summary row for the
@@ -1935,6 +1955,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         if cached is not None:
             return cached  # type: ignore[no-any-return]
 
+        # MAX(...) / MIN(...) over an indexed (underlying, timestamp) range
+        # is a single index scan — cheap enough to pull both bounds in one
+        # round-trip, and avoids a second query for the "since YYYY-MM-DD"
+        # date the all-time trophy tooltip needs.
         latest_query = """
             SELECT timestamp,
                    total_net_gex::double precision AS total_net_gex,
@@ -1942,6 +1966,14 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             FROM gex_summary
             WHERE underlying = $1
             ORDER BY timestamp DESC
+            LIMIT 1
+        """
+
+        tracking_started_query = """
+            SELECT timestamp
+            FROM gex_summary
+            WHERE underlying = $1
+            ORDER BY timestamp ASC
             LIMIT 1
         """
 
@@ -1959,6 +1991,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 latest = await conn.fetchrow(latest_query, symbol)
                 if latest is None or latest["timestamp"] is None:
                     return None
+
+                tracking_row = await conn.fetchrow(tracking_started_query, symbol)
+                tracking_started_at = tracking_row["timestamp"] if tracking_row else None
 
                 tod_bucket = _tod_bucket_for_timestamp(latest["timestamp"])
                 in_rth = tod_bucket >= 0
@@ -2008,6 +2043,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     "timestamp": latest["timestamp"],
                     "tod_bucket": tod_bucket if in_rth else None,
                     "in_rth": in_rth,
+                    "tracking_started_at": tracking_started_at,
                     "metrics": metrics_out,
                 }
                 self._cache_set(cache_key, payload, self._analytics_cache_ttl_seconds)

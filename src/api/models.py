@@ -116,8 +116,18 @@ class GEXHistoricalWindow(BaseModel):
     ``percentile`` is the interpolated rank of the LIVE value across the
     stored p05/p25/p50/p75/p95 anchors.  ``z_score`` is the standard
     z-score against the same window's mean/std.  ``regime`` is the
-    user-facing bucket label — record_high / extreme_high / elevated /
-    normal / low / extreme_low / record_low / unknown.
+    user-facing bucket label — extreme_high / elevated / normal / low /
+    extreme_low / unknown — derived purely from z-score so the band
+    bucketing stays explainable.
+
+    ``is_record_high`` / ``is_record_low`` are independent boolean flags
+    fired when the live value exceeds the stored min/max for this window.
+    They're carried alongside the regime so the frontend can stamp a
+    trophy icon next to the badge label without losing the regime word.
+    When a record fires we ALSO promote the regime to the matching
+    extreme label, so the badge color stays consistent with the trophy
+    even if z-score alone would have left the regime at "elevated"
+    (happens when the historical distribution is very tight).
 
     ``tod_bucket_used``:
         * 0..77 — a time-of-day-aware bucket (5-min RTH index, 0=09:30 ET)
@@ -138,6 +148,8 @@ class GEXHistoricalWindow(BaseModel):
     percentile: Optional[float] = None
     z_score: Optional[float] = None
     regime: str
+    is_record_high: bool = False
+    is_record_low: bool = False
     tod_bucket_used: Optional[int] = None
 
 
@@ -153,15 +165,21 @@ class GEXHistoricalContext(BaseModel):
 
     Headline GEX figures from the latest ``gex_summary`` row alongside the
     historical-distribution context (30d + all_time, TOD-aware) for each.
-    The frontend uses this to render "P82 vs 30d", "RECORD HIGH",
-    "elevated" style badges on the live MetricCards and the dedicated
+    The frontend uses this to render "P82 vs 30d", "EXTREME HIGH",
+    "elevated" style badges on the live MetricCards (with a trophy icon
+    overlay when the value is a record for that window) and a dedicated
     /gamma-pulse page.
+
+    ``tracking_started_at`` is the earliest ``gex_summary.timestamp`` for
+    the symbol — the "since YYYY-MM-DD" date the all-time-record trophy
+    tooltip cites.
     """
 
     symbol: str
     timestamp: datetime
     tod_bucket: Optional[int] = None
     in_rth: bool
+    tracking_started_at: Optional[datetime] = None
     metrics: Dict[str, GEXHistoricalMetric]
 
     class Config:
