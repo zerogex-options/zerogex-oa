@@ -1,6 +1,6 @@
 # ZeroGEX Backtesting Platform — Design
 
-**Status:** Phases 1–5 shipped (1–5a validated on live data); Phase 6 in progress (CSV export + saved/shareable configs shipped) · **Last updated:** 2026-06-22
+**Status:** Phases 1–5 shipped (1–5a validated on live data); Phase 6 shipped (CSV export, saved/shareable configs, parameter sweeps) · **Last updated:** 2026-06-22
 **Owners:** ZeroGEX engine team
 **Repos:** `zerogex-oa` (engine + API), `zerogex-web` (subscriber UI)
 
@@ -277,15 +277,21 @@ critical because gross 0DTE underlying-touch numbers materially overstate edge
     read-only into a fresh form. Owner-scoped list/get/delete mirror the runs
     ownership model. UI: a "Saved configurations" block in the config panel
     (save / load / share-link / delete).
-  - *Walk-forward / parameter sweeps (next):* run a spec across a grid of
-    parameter values and compare summaries.
+  - *Parameter sweeps (shipped):* `backtest_sweeps` table + `sweep_id` /
+    `sweep_cell` on `backtest_runs`, and `/api/backtest/sweeps` (create / list /
+    get). A sweep runs one base spec across the Cartesian product of one or two
+    whitelisted parameter axes (`src/backtesting/sweeps.py::SWEEPABLE`, surfaced
+    in `/meta.sweep_params`); each cell is a normal run, so it reuses the engine,
+    worker, and persistence. Bounded to ≤2 axes / ≤8 values / ≤24 cells. UI: an
+    optional axes editor in the config panel and a results grid (1-axis table /
+    2-axis heat matrix) with a metric selector. Sweep child runs are filtered out
+    of the standalone Recent Runs list.
   - *Per-leg intraday option-premium target (future).*
 
 ---
 
 ## 7. Out of scope (still open)
 
-- Walk-forward optimization / parameter sweeps.
 - Custom user-defined strategies beyond the playbook patterns (Phase 3).
 - A standalone worker/queue (today uses FastAPI `BackgroundTasks`; fine for the
   single-process API host, replaced in Phase 4).

@@ -2057,3 +2057,29 @@ CREATE TABLE IF NOT EXISTS backtest_configs (
 
 CREATE INDEX IF NOT EXISTS idx_backtest_configs_user_updated
     ON backtest_configs(end_user, updated_at DESC);
+
+-- Parameter sweeps (Phase 6). A sweep runs one base BacktestSpec across the
+-- Cartesian product of one or two parameter axes; each grid cell is a normal
+-- ``backtest_runs`` row (so it reuses the engine, worker, and persistence) tied
+-- back via ``sweep_id`` and tagged with its ``sweep_cell`` overrides. ``axes``
+-- records the swept params and their value lists for rendering the grid.
+CREATE TABLE IF NOT EXISTS backtest_sweeps (
+    id            BIGSERIAL    PRIMARY KEY,
+    end_user      VARCHAR(128),
+    underlying    VARCHAR(10)  NOT NULL,
+    base_spec     JSONB        NOT NULL,
+    axes          JSONB        NOT NULL,
+    n_cells       INTEGER      NOT NULL,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_sweeps_user_created
+    ON backtest_sweeps(end_user, created_at DESC);
+
+-- A run may belong to a sweep: ``sweep_id`` links it to its parent and
+-- ``sweep_cell`` records the per-cell parameter overrides ({param: value}).
+-- Standalone runs leave both NULL; the Recent Runs list filters those in.
+ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS sweep_id BIGINT
+    REFERENCES backtest_sweeps(id) ON DELETE CASCADE;
+ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS sweep_cell JSONB;
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_sweep ON backtest_runs(sweep_id, id);

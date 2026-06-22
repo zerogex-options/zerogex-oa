@@ -47,6 +47,32 @@ STRATEGY_STRUCTURES = [
     {"id": "condor", "label": "Iron condor (sell strangle, buy wings)", "kind": "neutral"},
 ]
 
+# Parameters a sweep can vary (Phase 6). ``scope`` is "any" (applies to any
+# spec) or "strategy" (only custom-strategy specs). ``unit`` is a display hint.
+# ``as_fraction`` marks axes whose spec value is a FRACTION (0.5), so the UI
+# accepts a percent and divides by 100 — exactly like the single-run form's
+# pctToFraction. Params without it take their raw number as typed (e.g.
+# ``risk_per_trade_pct`` is stored as a percent number like 2.0, not a fraction).
+SWEEP_PARAMS = [
+    {"param": "profit_target_pct", "label": "Take profit", "unit": "%",
+     "scope": "any", "as_fraction": True},
+    {"param": "stop_loss_pct", "label": "Stop loss", "unit": "%",
+     "scope": "any", "as_fraction": True},
+    {"param": "risk_per_trade_pct", "label": "Risk / trade", "unit": "%", "scope": "any"},
+    {"param": "max_concurrent", "label": "Max concurrent", "unit": "", "scope": "any"},
+    {"param": "max_hold_minutes", "label": "Max hold", "unit": "min", "scope": "any"},
+    {"param": "slippage_pct", "label": "Slippage", "unit": "", "scope": "any"},
+    {"param": "max_net_delta", "label": "Max net Δ", "unit": "", "scope": "any"},
+    {"param": "max_net_vega", "label": "Max net vega", "unit": "", "scope": "any"},
+    {"param": "dte", "label": "DTE", "unit": "", "scope": "strategy"},
+    {"param": "width", "label": "Spread width", "unit": "pts", "scope": "strategy"},
+    {"param": "wing", "label": "Wing width", "unit": "pts", "scope": "strategy"},
+    {"param": "target_offset_pct", "label": "Target offset", "unit": "%",
+     "scope": "strategy", "as_fraction": True},
+    {"param": "stop_offset_pct", "label": "Stop offset", "unit": "%",
+     "scope": "strategy", "as_fraction": True},
+]
+
 
 def _pattern_catalog() -> list[dict]:
     """Discover the built-in playbook patterns and describe each."""
@@ -142,6 +168,7 @@ def build_meta(conn) -> dict:
         "patterns": _pattern_catalog(),
         "strategy_fields": _strategy_fields(),
         "strategy_structures": list(STRATEGY_STRUCTURES),
+        "sweep_params": list(SWEEP_PARAMS),
         "data_window": _data_window(conn),
         "defaults": dict(_DEFAULTS),
     }

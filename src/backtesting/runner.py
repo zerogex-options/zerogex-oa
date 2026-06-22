@@ -66,8 +66,14 @@ def requeue_stale_runs(conn, *, older_than_minutes: int = 30) -> int:
     return cur.rowcount if cur.rowcount is not None else 0
 
 
-def create_run(spec: BacktestSpec, *, end_user: Optional[str]) -> int:
-    """Insert a queued ``backtest_runs`` row and return its id."""
+def create_run(spec: BacktestSpec, *, end_user: Optional[str],
+               sweep_id: Optional[int] = None,
+               sweep_cell: Optional[dict] = None) -> int:
+    """Insert a queued ``backtest_runs`` row and return its id.
+
+    ``sweep_id`` / ``sweep_cell`` link the row to a parameter sweep (Phase 6);
+    standalone runs leave them NULL.
+    """
     conn = get_db_connection()
     try:
         conn.autocommit = True
@@ -75,8 +81,9 @@ def create_run(spec: BacktestSpec, *, end_user: Optional[str]) -> int:
         cur.execute(
             """
             INSERT INTO backtest_runs
-                (end_user, underlying, start_date, end_date, patterns, spec, status)
-            VALUES (%s, %s, %s, %s, %s, %s, 'queued')
+                (end_user, underlying, start_date, end_date, patterns, spec, status,
+                 sweep_id, sweep_cell)
+            VALUES (%s, %s, %s, %s, %s, %s, 'queued', %s, %s)
             RETURNING id
             """,
             (
@@ -86,6 +93,8 @@ def create_run(spec: BacktestSpec, *, end_user: Optional[str]) -> int:
                 spec.end_date,
                 spec.patterns,
                 json.dumps(spec.to_dict()),
+                sweep_id,
+                json.dumps(sweep_cell) if sweep_cell is not None else None,
             ),
         )
         run_id = int(cur.fetchone()[0])

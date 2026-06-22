@@ -15,14 +15,16 @@ import asyncio
 import csv
 import io
 import logging
+from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, Response
 
 from src.api.identity import resolve_end_user
-from src.backtesting import configs, queries
+from src.backtesting import configs, queries, sweeps
 from src.backtesting.meta import build_meta
 from src.backtesting.models import BacktestSpec, SpecError
 from src.backtesting.runner import create_run, execute_run
+from src.backtesting.sweeps import SweepError
 from src.database.connection import close_db_connection, get_db_connection
 
 logger = logging.getLogger(__name__)
@@ -257,3 +259,71 @@ async def delete_backtest_config(config_id: int, request: Request) -> dict:
     if not ok:
         raise HTTPException(status_code=404, detail="config not found")
     return {"deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Parameter sweeps (Phase 6)
+# ---------------------------------------------------------------------------
+
+
+def _create_sweep_sync(base_spec: BacktestSpec, axes: list,
+                       end_user: Optional[str]) -> dict:
+    return sweeps.create_sweep(base_spec, axes, end_user=end_user)
+
+
+@router.post("/sweeps", status_code=202)
+async def create_backtest_sweep(request: Request,
+                                background_tasks: BackgroundTasks) -> dict:
+    """Run a base spec across a parameter grid; one queued child run per cell."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="request body must be valid JSON")
+    try:
+        base_spec = BacktestSpec.from_dict(body.get("spec") or {})
+    except SpecError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    try:
+        axes = sweeps.validate_axes(body.get("axes"), base_spec)
+    except SweepError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    end_user, _ = resolve_end_user(request)
+    try:
+        result = await asyncio.to_thread(
+            _create_sweep_sync, base_spec, axes, end_user
+        )
+    except SweepError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception:
+        logger.exception("failed to create backtest sweep")
+        raise HTTPException(status_code=500, detail="could not create backtest sweep")
+
+    # Same dispatch model as single runs: a dedicated worker drains the queue,
+    # otherwise schedule each child run on Starlette's threadpool.
+    from src.config import BACKTEST_WORKER_ENABLED
+
+    if not BACKTEST_WORKER_ENABLED:
+        for run_id in result["run_ids"]:
+            background_tasks.add_task(execute_run, run_id)
+    return result
+
+
+@router.get("/sweeps")
+async def list_backtest_sweeps(
+    request: Request,
+    limit: int = Query(25, ge=1, le=100),
+) -> list:
+    """Recent sweeps for the calling end-user."""
+    end_user, _ = resolve_end_user(request)
+    return await asyncio.to_thread(sweeps.list_sweeps, end_user=end_user, limit=limit)
+
+
+@router.get("/sweeps/{sweep_id}")
+async def get_backtest_sweep(sweep_id: int, request: Request) -> dict:
+    """Sweep header + per-cell run status/metrics (used while polling)."""
+    end_user, _ = resolve_end_user(request)
+    sweep = await asyncio.to_thread(sweeps.get_sweep, sweep_id, end_user=end_user)
+    if sweep is None:
+        raise HTTPException(status_code=404, detail="sweep not found")
+    return sweep

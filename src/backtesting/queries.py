@@ -65,16 +65,20 @@ def list_runs(*, end_user: Optional[str], limit: int = 25) -> list[dict]:
     conn = get_db_connection()
     try:
         cur = conn.cursor()
+        # Sweep child runs (sweep_id NOT NULL) are surfaced via the sweep grid,
+        # not the standalone Recent Runs list — filter them out here.
         if end_user:
             cur.execute(
                 f"SELECT {_RUN_COLS} FROM backtest_runs "
-                "WHERE end_user = %s ORDER BY created_at DESC LIMIT %s",
+                "WHERE end_user = %s AND sweep_id IS NULL "
+                "ORDER BY created_at DESC LIMIT %s",
                 (end_user, limit),
             )
         else:
             cur.execute(
                 f"SELECT {_RUN_COLS} FROM backtest_runs "
-                "WHERE end_user IS NULL ORDER BY created_at DESC LIMIT %s",
+                "WHERE end_user IS NULL AND sweep_id IS NULL "
+                "ORDER BY created_at DESC LIMIT %s",
                 (limit,),
             )
         return [_row_to_run(r, include_spec=False) for r in cur.fetchall()]
