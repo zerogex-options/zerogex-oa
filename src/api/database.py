@@ -4715,6 +4715,23 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ORDER BY oc.expiration, oc.strike
         """
 
+        # Available bounds at the snapshot, UNFILTERED by dte_max/strike_count,
+        # so the UI can size its "Max DTE" / "Strikes" dropdowns to what the
+        # chain actually offers rather than fixed ladders. max_dte counts to
+        # the furthest expiration; strike_count is the distinct strike total
+        # for this option_type.
+        bounds_query = f"""
+            WITH {_STABLE_SNAPSHOT_CTE}
+            SELECT
+                MAX(oc.expiration) AS max_expiration,
+                COUNT(DISTINCT oc.strike) AS strike_count
+            FROM option_chains oc
+            CROSS JOIN latest_ts
+            WHERE oc.underlying = $1
+              AND oc.option_type = $2
+              AND oc.timestamp = latest_ts.ts
+        """
+
         try:
             async with self._acquire_connection() as conn:
                 spot_row = await conn.fetchrow(spot_query, symbol)
@@ -4727,10 +4744,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 rows = await conn.fetch(
                     chain_query, symbol, dte_max, spot_price, strike_count, option_type
                 )
+                bounds_row = await conn.fetchrow(bounds_query, symbol, option_type)
                 return {
                     "spot_price": spot_price,
                     "timestamp": timestamp,
                     "rows": [dict(r) for r in rows],
+                    "available_max_expiration": (
+                        bounds_row["max_expiration"] if bounds_row else None
+                    ),
+                    "available_strike_count": (
+                        int(bounds_row["strike_count"])
+                        if bounds_row and bounds_row["strike_count"]
+                        else 0
+                    ),
                 }
         except Exception as e:
             logger.error(f"Error fetching premium surface data: {e}", exc_info=True)

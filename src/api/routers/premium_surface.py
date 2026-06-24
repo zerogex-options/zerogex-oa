@@ -62,6 +62,12 @@ class PremiumSurfaceResponse(BaseModel):
     expirations: List[date]
     strikes: List[float]
     surface: List[ExpirationSlice]
+    # Available bounds at the snapshot (unfiltered by the dte_max/strike_count
+    # query params) so the client can size its dropdowns to the real chain.
+    # max_dte is clamped to the endpoint's 365-day ceiling; strike_count to
+    # its 100 cap.
+    available_max_dte: int
+    available_strike_count: int
 
     class Config:
         json_encoders = {
@@ -218,6 +224,13 @@ async def get_premium_surface(
         strike_points.sort(key=lambda p: p.strike)
         surface.append(ExpirationSlice(expiration=exp, dte=dte, strikes=strike_points))
 
+    # Available dropdown bounds, clamped to the endpoint's query-param ceilings
+    # (dte_max <= 365, strike_count <= 100) so the client never offers a value
+    # the API would reject.
+    max_exp = data.get("available_max_expiration")
+    available_max_dte = max(0, min(365, (max_exp - today).days)) if max_exp else 0
+    available_strike_count = min(100, int(data.get("available_strike_count") or 0))
+
     response = PremiumSurfaceResponse(
         symbol=sym,
         option_type=option_type,
@@ -226,6 +239,8 @@ async def get_premium_surface(
         expirations=expirations_sorted,
         strikes=strikes_sorted,
         surface=surface,
+        available_max_dte=available_max_dte,
+        available_strike_count=available_strike_count,
     )
 
     await _set_cached(cache_key, response)
