@@ -4652,3 +4652,86 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         except Exception as e:
             logger.error(f"Error fetching vol surface data: {e}", exc_info=True)
             raise
+
+    async def get_premium_surface_data(
+        self,
+        symbol: str,
+        dte_max: int,
+        strike_count: int,
+        option_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch the latest option-chain snapshot for a premium surface.
+
+        Returns spot price, snapshot timestamp, and rows of
+        (strike, expiration, bid, ask, mid, last) for a single
+        ``option_type`` ('C' or 'P'), filtered to the ``strike_count``
+        strikes nearest spot and expirations within ``dte_max`` days.
+
+        Mirrors :meth:`get_vol_surface_data` but pulls quoted prices rather
+        than implied volatility so the caller can compute the extrinsic
+        (premium − intrinsic) surface. Anchors on the stable snapshot
+        timestamp (see ``_STABLE_SNAPSHOT_CTE``) so a quiescing post-close
+        feed doesn't return a half-written terminal bucket.
+        """
+        spot_query = """
+            SELECT close, timestamp
+            FROM underlying_quotes
+            WHERE symbol = $1
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+
+        # eligible_strikes picks the `strike_count` strikes whose value is
+        # nearest spot at the stable snapshot, for this option_type only.
+        chain_query = f"""
+            WITH {_STABLE_SNAPSHOT_CTE},
+            eligible_strikes AS (
+                SELECT strike
+                FROM (
+                    SELECT DISTINCT strike
+                    FROM option_chains, latest_ts
+                    WHERE underlying = $1
+                      AND option_type = $5
+                      AND timestamp = latest_ts.ts
+                      AND expiration <= CURRENT_DATE + make_interval(days => $2)
+                ) sub
+                ORDER BY ABS(sub.strike - $3::numeric)
+                LIMIT $4
+            )
+            SELECT
+                oc.strike,
+                oc.expiration,
+                oc.bid,
+                oc.ask,
+                oc.mid,
+                oc.last
+            FROM option_chains oc
+            CROSS JOIN latest_ts
+            JOIN eligible_strikes es ON es.strike = oc.strike
+            WHERE oc.underlying = $1
+              AND oc.option_type = $5
+              AND oc.timestamp = latest_ts.ts
+              AND oc.expiration <= CURRENT_DATE + make_interval(days => $2)
+            ORDER BY oc.expiration, oc.strike
+        """
+
+        try:
+            async with self._acquire_connection() as conn:
+                spot_row = await conn.fetchrow(spot_query, symbol)
+                if not spot_row:
+                    return None
+
+                spot_price = float(spot_row["close"])
+                timestamp = spot_row["timestamp"]
+
+                rows = await conn.fetch(
+                    chain_query, symbol, dte_max, spot_price, strike_count, option_type
+                )
+                return {
+                    "spot_price": spot_price,
+                    "timestamp": timestamp,
+                    "rows": [dict(r) for r in rows],
+                }
+        except Exception as e:
+            logger.error(f"Error fetching premium surface data: {e}", exc_info=True)
+            raise

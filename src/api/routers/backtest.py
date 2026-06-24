@@ -29,7 +29,9 @@ from src.database.connection import close_db_connection, get_db_connection
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/backtest", tags=["Backtesting"])
+# Tagged "Beta" in addition to "Backtesting" so the whole platform surfaces
+# under the Beta group in the OpenAPI/Swagger docs while it stabilises.
+router = APIRouter(prefix="/api/backtest", tags=["Backtesting", "Beta"])
 
 
 def _build_meta_sync() -> dict:

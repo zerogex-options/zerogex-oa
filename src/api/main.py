@@ -50,6 +50,7 @@ from .routers.volatility_gauge import router as volatility_gauge_router
 from .routers.option_contract import router as option_contract_router
 from .routers.option_calculator import router as option_calculator_router
 from .routers.vol_surface import router as vol_surface_router
+from .routers.premium_surface import router as premium_surface_router
 from .routers.gex_flip_horizon import router as gex_flip_horizon_router
 from .routers.backtest import router as backtest_router
 
@@ -207,6 +208,14 @@ app = FastAPI(
                 "Default symbol is SPY; pass ?symbol= or ?underlying= to override."
             ),
         },
+        {
+            "name": "Beta",
+            "description": (
+                "Beta features under active development. The contract and behaviour "
+                "of these endpoints may change without notice. Currently includes the "
+                "backtesting platform and the options premium (extrinsic-value) surface."
+            ),
+        },
     ],
 )
 
@@ -287,6 +296,10 @@ app.include_router(
 # Derived analytics routers — broadly redistributable.
 app.include_router(volatility_gauge_router, dependencies=[_scope_gex])
 app.include_router(vol_surface_router, dependencies=[_scope_gex])
+# Options premium (extrinsic-value) surface — Beta. Derived analytics built
+# from quoted option prices, redistributable on the same GEX scope as the
+# vol surface.
+app.include_router(premium_surface_router, dependencies=[_scope_gex])
 app.include_router(gex_flip_horizon_router, dependencies=[_scope_gex])
 # Raw market data routers — per-contract option history (option_contract)
 # and the option-calculator (which embeds raw contract prices). Gated
