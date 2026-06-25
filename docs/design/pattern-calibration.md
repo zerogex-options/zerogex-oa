@@ -1,14 +1,25 @@
 # Playbook Pattern Calibration — Empirical-Base Feedback Loop
 
-**Status:** shipped (OFF by default) · **Last updated:** 2026-06-21
+**Status:** shipped (OFF by default) · **Last updated:** 2026-06-22
 **Repo:** `zerogex-oa`
 
-> **Data source note:** calibration currently feeds from the **underlying-touch**
-> harness (`playbook/backtest.py` → `playbook_pattern_stats.proposed_base`), the
-> conservative proxy. The leg-level backtest platform (`src/backtesting/`, now
-> through Phase 2 with realistic option-premium exits) can later write into the
-> same stats table so live confidence is driven by **realized option P&L**
-> instead of an underlying proxy — a forward-looking enhancement, not yet wired.
+> **Data source note:** calibration can feed from either of two measurement
+> harnesses, both writing `playbook_pattern_stats` (tagged by a `source`
+> column):
+>
+> * **`underlying_touch`** — `playbook/backtest.py`. The conservative proxy:
+>   "did the underlying reach the target/stop?" Ignores premium decay, bid/ask,
+>   and commission, so it overstates 0DTE edge. Single-leg, directional.
+> * **`option_pnl`** — `src/backtesting/calibration_feed.py`. Realized leg-level
+>   option P&L: "did the trade actually profit after real fills + slippage +
+>   commission?" A trade is a win when `net_pnl > 0`. This is the honest measure.
+>
+> The live store picks which to trust via **`SIGNALS_PATTERN_CALIBRATION_SOURCE`**
+> (`underlying_touch` (default) | `option_pnl` | `auto`). `auto` prefers
+> `option_pnl` per (pattern, underlying) when it has a trustworthy window and
+> falls back to `underlying_touch` otherwise. Both harnesses run in the nightly
+> refresh; the consult, gates, clamp, and confidence formula are unchanged —
+> only the `base` input source differs.
 
 ## Problem
 

@@ -1008,6 +1008,19 @@ SIGNALS_PATTERN_CALIBRATION_REFRESH_SECONDS = _getenv_int(
 SIGNALS_PATTERN_CALIBRATION_LOOKBACK_DAYS = _getenv_int(
     "SIGNALS_PATTERN_CALIBRATION_LOOKBACK_DAYS", 60, min=5
 )
+# Which measurement source drives the calibrated base:
+#   'underlying_touch' — the conservative proxy (did the underlying reach the
+#                        target/stop?), written by the playbook backtest harness.
+#   'option_pnl'       — realized leg-level option P&L (did the trade actually
+#                        profit after real fills + slippage + commission?),
+#                        written by the backtester's calibration feed.
+#   'auto'             — prefer 'option_pnl' per (pattern, underlying) when it
+#                        has a trustworthy window, else fall back to
+#                        'underlying_touch'.
+# Default keeps the historical behavior (underlying_touch only).
+SIGNALS_PATTERN_CALIBRATION_SOURCE = _getenv_str(
+    "SIGNALS_PATTERN_CALIBRATION_SOURCE", "underlying_touch"
+).strip().lower()
 
 # ---------------------------------------------------------------------------
 # Backtesting platform — signal cooldown / dedup

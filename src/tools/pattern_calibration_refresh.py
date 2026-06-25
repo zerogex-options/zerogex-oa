@@ -32,9 +32,11 @@ from typing import Optional
 
 from src.config import (
     SIGNALS_PATTERN_CALIBRATION_LOOKBACK_DAYS,
+    SIGNALS_PATTERN_CALIBRATION_SOURCE,
     SIGNALS_UNDERLYINGS,
 )
 from src.database.connection import db_connection
+from src.backtesting import calibration_feed
 from src.signals.playbook import backtest as playbook_backtest
 from src.signals.playbook import calibration as pattern_calibration
 
@@ -85,24 +87,49 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--no-backtest", action="store_true",
         help="report against existing stats without re-running the backtest",
     )
+    parser.add_argument(
+        "--no-touch", action="store_true",
+        help="skip the underlying-touch harness (refresh only the P&L feed)",
+    )
+    parser.add_argument(
+        "--pnl", dest="pnl", action="store_true", default=None,
+        help="also refresh the realized option-P&L feed (option_pnl source)",
+    )
+    parser.add_argument(
+        "--no-pnl", dest="pnl", action="store_false",
+        help="skip the realized option-P&L feed",
+    )
     args = parser.parse_args(argv)
 
     underlyings = args.underlyings if args.underlyings else _default_underlyings()
 
+    # Default: run the P&L feed whenever the live engine would consult it.
+    run_pnl = args.pnl
+    if run_pnl is None:
+        run_pnl = SIGNALS_PATTERN_CALIBRATION_SOURCE in ("option_pnl", "auto")
+
     with db_connection() as conn:
         if not args.no_backtest:
             for u in underlyings:
-                logger.info("refreshing stats: backtest %s over %d days", u, args.days)
-                try:
-                    playbook_backtest.run(underlying=u, days=args.days, conn=conn, write=True)
-                except Exception:  # noqa: BLE001 - one underlying failing must not abort the rest
-                    logger.exception("backtest failed for %s; continuing", u)
+                if not args.no_touch:
+                    logger.info("refreshing underlying_touch stats: %s over %d days", u, args.days)
+                    try:
+                        playbook_backtest.run(underlying=u, days=args.days, conn=conn, write=True)
+                    except Exception:  # noqa: BLE001 - one underlying must not abort the rest
+                        logger.exception("touch backtest failed for %s; continuing", u)
+                if run_pnl:
+                    logger.info("refreshing option_pnl stats: %s over %d days", u, args.days)
+                    try:
+                        calibration_feed.run(underlying=u, days=args.days, conn=conn, write=True)
+                    except Exception:  # noqa: BLE001 - one underlying must not abort the rest
+                        logger.exception("P&L calibration failed for %s; continuing", u)
         store = pattern_calibration.load_store(conn)
 
+    print(f"\nActive calibration source: {SIGNALS_PATTERN_CALIBRATION_SOURCE}")
     print(_format_report(_priors(), store))
     logger.info(
-        "calibration store: %d trusted pairs, %d pattern-wide bases",
-        len(store.by_pair), len(store.by_pattern),
+        "calibration store (source=%s): %d trusted pairs, %d pattern-wide bases",
+        SIGNALS_PATTERN_CALIBRATION_SOURCE, len(store.by_pair), len(store.by_pattern),
     )
     return 0
 
