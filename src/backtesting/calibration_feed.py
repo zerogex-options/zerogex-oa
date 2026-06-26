@@ -82,14 +82,21 @@ class PnlPatternStat:
         return wins / total
 
 
-def calibration_spec(underlying: str, window_start: date, window_end: date) -> BacktestSpec:
-    """Build the standardized single-leg measurement spec (see module docstring)."""
+def calibration_spec(
+    underlying: str, window_start: date, window_end: date,
+    *, patterns: list[str] | None = None,
+) -> BacktestSpec:
+    """Build the standardized single-leg measurement spec (see module docstring).
+
+    ``patterns`` restricts the run to specific pattern ids (used by the
+    single-pattern explain/drill-in); the default empty list scans all patterns.
+    """
     return BacktestSpec.from_dict(
         {
             "underlying": underlying,
             "start_date": window_start.isoformat(),
             "end_date": window_end.isoformat(),
-            "patterns": [],  # all patterns
+            "patterns": list(patterns) if patterns else [],
             "fill_model": {"slippage_pct": 0.01, "commission_per_contract": 0.65},
             # Large capital + max concurrency so neither sizing nor the
             # concurrency cap drops entries — maximize the measured sample.
@@ -101,6 +108,26 @@ def calibration_spec(underlying: str, window_start: date, window_end: date) -> B
             "exit": {"max_hold_minutes": None},  # rely on each Card's own levels
         }
     )
+
+
+def _window(days: int) -> tuple[date, date]:
+    """The (window_start, window_end) ET dates for a ``days``-back lookback."""
+    et = pytz.timezone("America/New_York")
+    end_dt = datetime.now(pytz.UTC)
+    start_dt = end_dt - timedelta(days=days)
+    return start_dt.astimezone(et).date(), end_dt.astimezone(et).date()
+
+
+def explain_trades(conn, *, underlying: str, pattern: str, days: int = _DEFAULT_DAYS):
+    """Run the calibration backtest for ONE pattern and return its RunResult.
+
+    Used by the drill-in report to inspect the actual per-trade P&L behind a
+    pattern's measured base (e.g. confirming a touch-vs-P&L divergence is a real
+    theta trap, not a pricing artifact).
+    """
+    window_start, window_end = _window(days)
+    spec = calibration_spec(underlying, window_start, window_end, patterns=[pattern])
+    return run_backtest(conn, spec)
 
 
 def aggregate_trades(trades, *, underlying: str, window_start: date,
@@ -178,11 +205,7 @@ def run(*, underlying: str, days: int = _DEFAULT_DAYS, conn=None,
     Opens its own connection when ``conn`` is None. ``write=False`` returns the
     stats without persisting (tests / dry runs).
     """
-    et = pytz.timezone("America/New_York")
-    end_dt = datetime.now(pytz.UTC)
-    start_dt = end_dt - timedelta(days=days)
-    window_start = start_dt.astimezone(et).date()
-    window_end = end_dt.astimezone(et).date()
+    window_start, window_end = _window(days)
 
     if conn is None:
         from src.database.connection import db_connection
