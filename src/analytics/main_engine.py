@@ -1513,6 +1513,7 @@ class AnalyticsEngine:
         span_pct: Optional[float] = None,
         step_pct: Optional[float] = None,
         dte_ref_days: Optional[float] = None,
+        apply_dte_weight: bool = True,
     ) -> List[Tuple[float, float]]:
         """SpotGamma / SqueezeMetrics dealer gamma-exposure profile.
 
@@ -1557,6 +1558,16 @@ class AnalyticsEngine:
         at least the full reference horizon is unweighted (1.0).  Because
         the weight is applied here, in the one shared profile, the flip
         and net-GEX-at-spot stay sign-consistent.
+
+        ``apply_dte_weight`` (default ``True``) gates that ramp for this
+        single call.  ``False`` builds the RAW, un-weighted profile —
+        every contract at full weight — which is the convention behind
+        ``gamma_flip_raw`` (the "nearest crossing" figure competitor
+        dashboards publish): with the ramp off, near-dated 0DTE walls can
+        pull the crossing toward spot, so the raw flip can sit much closer
+        to spot than the horizon-weighted structural flip.  The structural
+        flip / net-GEX-at-spot path always leaves this ``True`` so their
+        sign-consistency is untouched.
         """
         if spot <= 0 or not options:
             return []
@@ -1607,7 +1618,9 @@ class AnalyticsEngine:
             # spike) can't pin the multi-day regime flip (1.0 for
             # DTE≥ref / weighting off).  dte_ref_days is the
             # per-call override (None => module constant).
-            dte_w = self._dte_profile_weight(T, dte_ref_days=dte_ref_days)
+            dte_w = (
+                self._dte_profile_weight(T, dte_ref_days=dte_ref_days) if apply_dte_weight else 1.0
+            )
             total += sign * dte_w * dollar_gamma
             used = True
 
@@ -2525,16 +2538,29 @@ class AnalyticsEngine:
         )
         net_gex_at_spot = self._net_gex_at_spot(gamma_profile, underlying_price)
 
-        # Raw nearest zero-crossing of the SAME profile, with none of the
-        # structural-interior gating _resolve_gamma_flip applies. This is
-        # the "nearest crossing to spot" figure other dashboards publish
-        # (and the one that oscillates intraday when the book is lumpy near
-        # spot). Surfaced as a SECONDARY reference next to the structural
-        # gamma_flip_point — NOT a replacement: it can land on a noise-floor
-        # crossing the structural resolver deliberately rejects. Read off
-        # the same returned profile so it stays sign-consistent with the
-        # headline flip and net_gex_at_spot.
-        gamma_flip_raw = self._calculate_gamma_flip_point(gamma_profile, underlying_price)
+        # Raw nearest zero-crossing on the UN-DTE-weighted profile — the
+        # "nearest crossing to spot" convention competitor dashboards
+        # publish. Built without the horizon-occupancy ramp (apply_dte_weight
+        # =False) so near-dated 0DTE walls can pull the crossing toward spot;
+        # that is exactly why it can diverge from — and sit much closer to
+        # spot than — the horizon-weighted structural gamma_flip_point.
+        # Scanned over the same span the structural resolver landed on so
+        # both read the same geometric window. SECONDARY reference only: it
+        # carries no structural-significance gate, so it can land on a
+        # near-spot noise crossing the structural flip rejects. When DTE
+        # weighting is globally off the un-weighted profile IS the structural
+        # profile, so we reuse it rather than rebuild the BS gamma grid.
+        if GAMMA_PROFILE_DTE_WEIGHTING:
+            raw_profile = self._gamma_exposure_profile(
+                options,
+                underlying_price,
+                timestamp,
+                span_pct=gamma_flip_span_used,
+                apply_dte_weight=False,
+            )
+        else:
+            raw_profile = gamma_profile
+        gamma_flip_raw = self._calculate_gamma_flip_point(raw_profile, underlying_price)
 
         gamma_flip_unresolved = gamma_flip_point is None
         if gamma_flip_unresolved:
