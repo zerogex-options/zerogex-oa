@@ -23,6 +23,14 @@
 >   `proposed_base`. Both are tunable; re-measure with
 >   `pattern-calibration-explain` after changing them.
 >
+> The instrument matters as much as the exit: a near-dated single long bleeds to
+> spread + theta. `make pattern-calibration-structures` measures each pattern as
+> a single long **vs a defined-risk vertical** (pattern-mode `structure` override
+> on `BacktestSpec`, short strike `width_pct` of the entry price OTM) and prints
+> win% / profit factor / expectancy side by side — so you can tell a theta/vega
+> problem (the vertical lifts it) from a genuine lack of directional edge (both
+> stay poor).
+>
 > The live store picks which to trust via **`SIGNALS_PATTERN_CALIBRATION_SOURCE`**
 > (`underlying_touch` (default) | `option_pnl` | `auto`). `auto` prefers
 > `option_pnl` per (pattern, underlying) when it has a trustworthy window and

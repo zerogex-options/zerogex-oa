@@ -139,6 +139,32 @@ def _select_legs(card: CardRow) -> Optional[list[dict]]:
     return [{**single, "side": "long", "qty": 1}]
 
 
+def _to_vertical(legs: list[dict], direction: str, entry_ref: float,
+                 width_pct: float) -> list[dict]:
+    """Reshape a directional single leg into a long-ATM/short-OTM debit spread.
+
+    Keeps the Card's own long leg (so the comparison vs the single-leg measure
+    is clean: vertical = single + a short wing) and adds a short leg ``width_pct``
+    of the entry price further OTM, same right and expiry. The width is taken
+    from the entry price so it scales across SPY / QQQ / SPX.
+    """
+    long = dict(legs[0])
+    long["side"] = "long"
+    long["qty"] = 1
+    right = long.get("right") or ("C" if direction == "bullish" else "P")
+    long["right"] = right
+    base = long.get("strike")
+    base = float(base) if base else float(round(entry_ref))
+    long["strike"] = base
+    offset = max(1.0, float(round(entry_ref * width_pct)))
+    short_strike = base + offset if direction == "bullish" else base - offset
+    short = {
+        "expiry": long.get("expiry"), "strike": short_strike,
+        "right": right, "side": "short", "qty": 1,
+    }
+    return [long, short]
+
+
 def _price_legs(conn, underlying, legs, at, action, slip):
     """Net per-share cashflow to ``action`` (open/close) the position at ``at``.
 
@@ -513,6 +539,11 @@ def _build_candidate(
     )
     if not legs:
         return None, "no_leg"
+
+    # Pattern-mode structure override: trade the directional Card as a defined-
+    # risk vertical instead of its raw (single long) leg.
+    if getattr(spec, "structure", "single") == "vertical" and direction in ("bullish", "bearish"):
+        legs = _to_vertical(legs, direction, entry_ref, getattr(spec, "width_pct", 0.01))
 
     max_hold = int(payload.get("max_hold_minutes") or _DEFAULT_MAX_HOLD_MIN)
     quotes = fetch_quotes(

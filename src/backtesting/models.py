@@ -359,6 +359,13 @@ class BacktestSpec:
     # continuous Action-Card stream into discrete trades.
     cooldown_minutes: int = 0
     strategy: Optional[StrategySpec] = None
+    # Pattern-mode structure override (ignored when ``strategy`` is set, which
+    # carries its own structure). "single" prices each Card's own legs; "vertical"
+    # reshapes the directional Card into a long-ATM/short-OTM debit spread, the
+    # short strike ``width_pct`` of the entry price out. Used by the structure-
+    # aware calibration feed to measure a pattern as a defined-risk spread.
+    structure: str = "single"
+    width_pct: float = 0.01
 
     @classmethod
     def from_dict(cls, raw: dict) -> "BacktestSpec":
@@ -379,6 +386,12 @@ class BacktestSpec:
         patterns = [str(p).strip() for p in patterns_raw if str(p).strip()]
         strategy = StrategySpec.from_dict(raw["strategy"]) if raw.get("strategy") else None
         exit_rules = ExitRules.from_dict(raw.get("exit"))
+        structure = str(raw.get("structure") or "single").strip().lower()
+        if structure not in ("single", "vertical"):
+            raise SpecError("structure must be 'single' or 'vertical'")
+        width_pct = _coerce_float(
+            raw.get("width_pct"), field_name="width_pct", lo=0.001, hi=0.2, default=0.01
+        )
         if strategy is not None:
             has_level = (
                 strategy.target_offset_pct is not None or strategy.stop_offset_pct is not None
@@ -408,6 +421,8 @@ class BacktestSpec:
             exit=exit_rules,
             cooldown_minutes=_coerce_cooldown(raw.get("cooldown_minutes")),
             strategy=strategy,
+            structure=structure,
+            width_pct=width_pct,
         )
 
     def to_dict(self) -> dict:
@@ -434,6 +449,8 @@ class BacktestSpec:
             },
             "cooldown_minutes": self.cooldown_minutes,
             "strategy": self.strategy.to_dict() if self.strategy else None,
+            "structure": self.structure,
+            "width_pct": self.width_pct,
         }
 
 
