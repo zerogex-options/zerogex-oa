@@ -1604,12 +1604,39 @@ CREATE TABLE IF NOT EXISTS playbook_pattern_stats (
     avg_mfe_pct       DOUBLE PRECISION,
     avg_mae_pct       DOUBLE PRECISION,
     proposed_base     DOUBLE PRECISION,
+    -- Which harness produced this row: 'underlying_touch' (the conservative
+    -- price-touch proxy) or 'option_pnl' (realized leg-level option P&L). Both
+    -- can coexist for the same window; the live calibration store picks which
+    -- to trust via SIGNALS_PATTERN_CALIBRATION_SOURCE.
+    source            VARCHAR(24)   NOT NULL DEFAULT 'underlying_touch',
     computed_at       TIMESTAMPTZ   DEFAULT NOW(),
-    PRIMARY KEY (pattern, underlying, window_start, window_end)
+    PRIMARY KEY (pattern, underlying, window_start, window_end, source)
 );
+
+-- Backfill for installs created before the `source` column / 5-col PK existed.
+ALTER TABLE playbook_pattern_stats
+    ADD COLUMN IF NOT EXISTS source VARCHAR(24) NOT NULL DEFAULT 'underlying_touch';
+-- Migrate the primary key from the original 4-column form to include `source`
+-- so option_pnl rows can sit alongside underlying_touch rows for one window.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'playbook_pattern_stats_pkey'
+          AND conrelid = 'playbook_pattern_stats'::regclass
+          AND array_length(conkey, 1) = 4
+    ) THEN
+        ALTER TABLE playbook_pattern_stats DROP CONSTRAINT playbook_pattern_stats_pkey;
+        ALTER TABLE playbook_pattern_stats
+            ADD CONSTRAINT playbook_pattern_stats_pkey
+            PRIMARY KEY (pattern, underlying, window_start, window_end, source);
+    END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_playbook_pattern_stats_underlying_window
     ON playbook_pattern_stats(underlying, window_end DESC);
+CREATE INDEX IF NOT EXISTS idx_playbook_pattern_stats_source
+    ON playbook_pattern_stats(source, underlying, window_end DESC);
 
 -- ---------------------------------------------------------------------------
 -- portfolio_snapshots (schema only — used in Part 2)

@@ -509,7 +509,16 @@ def fetch_quotes(
     return out
 
 
-def upsert_pattern_stats(conn, stats: Iterable[PatternStats]) -> None:
+def upsert_pattern_stats(
+    conn, stats: Iterable[PatternStats], *, source: str = "underlying_touch"
+) -> None:
+    """Persist measured stats, tagged with the harness ``source``.
+
+    ``source`` distinguishes the underlying-touch proxy ('underlying_touch',
+    this harness) from the realized option-P&L feed ('option_pnl',
+    ``src/backtesting/calibration_feed.py``) so both can coexist for the same
+    window; the conflict key includes ``source`` accordingly.
+    """
     cur = conn.cursor()
     for s in stats:
         cur.execute(
@@ -518,9 +527,9 @@ def upsert_pattern_stats(conn, stats: Iterable[PatternStats]) -> None:
                 (pattern, underlying, window_start, window_end,
                  n_emitted, n_resolved, n_target_hit, n_stop_hit, n_time_exit,
                  hit_rate, avg_confidence, avg_mfe_pct, avg_mae_pct,
-                 proposed_base, computed_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (pattern, underlying, window_start, window_end) DO UPDATE SET
+                 proposed_base, source, computed_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (pattern, underlying, window_start, window_end, source) DO UPDATE SET
                 n_emitted     = EXCLUDED.n_emitted,
                 n_resolved    = EXCLUDED.n_resolved,
                 n_target_hit  = EXCLUDED.n_target_hit,
@@ -548,6 +557,7 @@ def upsert_pattern_stats(conn, stats: Iterable[PatternStats]) -> None:
                 s.avg_mfe_pct,
                 s.avg_mae_pct,
                 s.proposed_base,
+                source,
             ),
         )
     conn.commit()

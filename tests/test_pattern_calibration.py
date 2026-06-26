@@ -114,20 +114,80 @@ def test_calibrated_base_uses_store_when_enabled(_enabled):
     assert cal.calibrated_base("unknown", "SPY", fallback=0.50) == 0.50
 
 
-def test_load_store_uses_distinct_on_query(_enabled):
-    class _Cur:
-        def __init__(self):
-            self.sql = ""
+class _Cur:
+    """Fake cursor returning per-source scripted rows, capturing the params."""
 
-        def execute(self, sql):
-            self.sql = sql
+    def __init__(self, rows_by_source):
+        self._rows_by_source = rows_by_source
+        self.calls: list = []
+        self._last_source = None
 
-        def fetchall(self):
-            return [_row("p", "SPY", 1, 30, 0.58)]
+    def execute(self, sql, params=None):
+        self.calls.append((sql, params))
+        self._last_source = params[0] if params else None
 
-    class _Conn:
-        def cursor(self):
-            return _Cur()
+    def fetchall(self):
+        return self._rows_by_source.get(self._last_source, [])
 
-    store = cal.load_store(_Conn())
+
+class _Conn:
+    def __init__(self, rows_by_source):
+        self._cur = _Cur(rows_by_source)
+
+    def cursor(self):
+        return self._cur
+
+
+def test_load_store_filters_by_source(monkeypatch, _enabled):
+    monkeypatch.setattr(config, "SIGNALS_PATTERN_CALIBRATION_SOURCE", "underlying_touch")
+    conn = _Conn({"underlying_touch": [_row("p", "SPY", 1, 30, 0.58)]})
+    store = cal.load_store(conn)
     assert store.by_pair[("p", "SPY")] == pytest.approx(0.58)
+    # The query was scoped to the configured source.
+    assert conn._cur.calls[0][1] == ("underlying_touch",)
+    assert "source = %s" in " ".join(conn._cur.calls[0][0].split())
+
+
+def test_load_store_option_pnl_source(monkeypatch, _enabled):
+    monkeypatch.setattr(config, "SIGNALS_PATTERN_CALIBRATION_SOURCE", "option_pnl")
+    conn = _Conn({"option_pnl": [_row("p", "SPY", 1, 30, 0.71)]})
+    store = cal.load_store(conn)
+    assert store.by_pair[("p", "SPY")] == pytest.approx(0.71)
+    assert conn._cur.calls[0][1] == ("option_pnl",)
+
+
+def test_load_store_unknown_source_falls_back_to_touch(monkeypatch, _enabled):
+    monkeypatch.setattr(config, "SIGNALS_PATTERN_CALIBRATION_SOURCE", "bogus")
+    conn = _Conn({"underlying_touch": [_row("p", "SPY", 1, 30, 0.55)]})
+    store = cal.load_store(conn)
+    assert store.by_pair[("p", "SPY")] == pytest.approx(0.55)
+    assert conn._cur.calls[0][1] == ("underlying_touch",)
+
+
+def test_load_store_auto_prefers_pnl_with_touch_fallback(monkeypatch, _enabled):
+    monkeypatch.setattr(config, "SIGNALS_PATTERN_CALIBRATION_SOURCE", "auto")
+    conn = _Conn(
+        {
+            # 'p'/SPY measured by both — option_pnl must win.
+            # 'q'/SPY measured only by touch — must fall back.
+            "underlying_touch": [
+                _row("p", "SPY", 1, 40, 0.55),
+                _row("q", "SPY", 1, 40, 0.48),
+            ],
+            "option_pnl": [_row("p", "SPY", 1, 40, 0.72)],
+        }
+    )
+    store = cal.load_store(conn)
+    assert store.by_pair[("p", "SPY")] == pytest.approx(0.72)  # P&L preferred
+    assert store.by_pair[("q", "SPY")] == pytest.approx(0.48)  # touch fallback
+
+
+def test_merge_prefer_overlays_preferred():
+    base = cal.CalibrationStore(
+        by_pair={("a", "SPY"): 0.5, ("b", "SPY"): 0.6}, by_pattern={"a": 0.5}
+    )
+    pref = cal.CalibrationStore(by_pair={("a", "SPY"): 0.8}, by_pattern={"a": 0.8})
+    merged = cal._merge_prefer(base, pref)
+    assert merged.by_pair[("a", "SPY")] == 0.8   # preferred wins
+    assert merged.by_pair[("b", "SPY")] == 0.6   # base retained
+    assert merged.by_pattern["a"] == 0.8
