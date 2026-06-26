@@ -18,6 +18,14 @@ class GEXSummary(BaseModel):
     net_gex: Decimal
     net_gex_at_spot: Optional[Decimal] = None
     gamma_flip: Optional[Decimal] = None
+    # Raw nearest zero-crossing of the dealer gamma profile, WITHOUT the
+    # structural-interior gating ``gamma_flip`` applies.  Secondary
+    # reference that matches the "nearest crossing to spot" convention
+    # some competitor dashboards publish; it can sit on a noise-floor
+    # crossing the structural flip rejects, so treat the structural
+    # ``gamma_flip`` as the headline regime level.  NULL when the profile
+    # is one-signed / degraded.
+    gamma_flip_raw: Optional[Decimal] = None
     # Fraction of spot the resolver's grid was widened to in order to
     # land ``gamma_flip``.  ``GAMMA_PROFILE_SPAN_LADDER[0]`` (default
     # 0.20) means the default rung qualified — a stable regime level.
