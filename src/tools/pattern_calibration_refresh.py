@@ -188,13 +188,33 @@ def _explain_report(result, *, pattern: str, underlying: str, limit: int = 40) -
     # Outcome distribution with profitability — the theta-trap tell.
     dist: dict[str, list[int]] = {}
     wins = 0
+    win_pnls: list[float] = []
+    loss_pnls: list[float] = []
     for t in trades:
         slot = dist.setdefault(t.outcome, [0, 0])
         slot[0] += 1
         if t.net_pnl > 0:
             slot[1] += 1
             wins += 1
+            win_pnls.append(t.net_pnl)
+        else:
+            loss_pnls.append(t.net_pnl)
+
+    # P&L economics — what the premium stop actually moves (win RATE barely
+    # changes; total return / profit factor / avg loss are where it shows up).
+    total = sum(t.net_pnl for t in trades)
+    gross_win = sum(win_pnls)
+    gross_loss = abs(sum(loss_pnls))
+    pf = (gross_win / gross_loss) if gross_loss > 0 else float("inf")
+    avg_win = (sum(win_pnls) / len(win_pnls)) if win_pnls else 0.0
+    avg_loss = (sum(loss_pnls) / len(loss_pnls)) if loss_pnls else 0.0
+
     head.append(f"\n  realized win rate: {wins}/{n} = {wins / n:.1%}")
+    head.append(
+        f"  net P&L ${total:,.0f} · expectancy ${total / n:,.0f}/trade · "
+        f"profit factor {pf:.2f}"
+    )
+    head.append(f"  avg win ${avg_win:,.0f} · avg loss ${avg_loss:,.0f}")
     head.append("  by outcome (count, profitable):")
     for outcome, (cnt, prof) in sorted(dist.items(), key=lambda kv: -kv[1][0]):
         head.append(f"    {outcome:<14} {cnt:>4}  profitable {prof:>4} ({prof / cnt:.0%})")

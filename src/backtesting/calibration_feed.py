@@ -41,6 +41,7 @@ from datetime import date, datetime, timedelta
 
 import pytz
 
+from src import config
 from src.backtesting.engine import run_backtest
 from src.backtesting.models import BacktestSpec
 from src.signals.playbook.backtest import _PRIOR_ALPHA, _PRIOR_BETA
@@ -90,7 +91,14 @@ def calibration_spec(
 
     ``patterns`` restricts the run to specific pattern ids (used by the
     single-pattern explain/drill-in); the default empty list scans all patterns.
+
+    A standardized premium stop-loss
+    (``SIGNALS_PATTERN_CALIBRATION_PNL_STOP_PCT``) cuts a losing option rather
+    than riding a near-dated long to full decay, so the measured P&L reflects a
+    disciplined trade. The card's own target/stop levels still apply for the
+    upside; 0 disables the stop.
     """
+    stop = config.SIGNALS_PATTERN_CALIBRATION_PNL_STOP_PCT
     return BacktestSpec.from_dict(
         {
             "underlying": underlying,
@@ -105,7 +113,12 @@ def calibration_spec(
                 "risk_per_trade_pct": 1.0,
                 "max_concurrent": 20,
             },
-            "exit": {"max_hold_minutes": None},  # rely on each Card's own levels
+            # Keep each Card's own target/stop levels, but cut a decaying option
+            # at the standardized premium stop instead of riding it to expiry.
+            "exit": {
+                "max_hold_minutes": None,
+                "stop_loss_pct": stop if stop and stop > 0 else None,
+            },
         }
     )
 

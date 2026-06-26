@@ -1012,6 +1012,14 @@ SIGNALS_PATTERN_CALIBRATION_CEIL_OPTION_PNL = _getenv_float(
     "SIGNALS_PATTERN_CALIBRATION_CEIL_OPTION_PNL",
     SIGNALS_PATTERN_CALIBRATION_CEIL, min=0.0, max=1.0
 )
+# Standardized premium stop-loss applied by the option_pnl calibration feed: a
+# losing option is cut once its premium falls this fraction below the entry fill
+# (0.50 = −50%), instead of riding a near-dated long option to full decay. Models
+# a disciplined trade so the measured P&L reflects edge, not theta blowups. 0
+# disables the stop (ride to the card's own levels / hold timeout).
+SIGNALS_PATTERN_CALIBRATION_PNL_STOP_PCT = _getenv_float(
+    "SIGNALS_PATTERN_CALIBRATION_PNL_STOP_PCT", 0.50, min=0.0, max=1.0
+)
 # How often the long-running signals process reloads the calibration store
 # from the stats table (seconds). Cheap no-op between reloads.
 SIGNALS_PATTERN_CALIBRATION_REFRESH_SECONDS = _getenv_int(
