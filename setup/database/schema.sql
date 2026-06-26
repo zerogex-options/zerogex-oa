@@ -340,14 +340,15 @@ CREATE TABLE IF NOT EXISTS gex_summary (
     max_gamma_strike NUMERIC(12, 4),
     max_gamma_value DOUBLE PRECISION,
     gamma_flip_point DOUBLE PRECISION,
-    -- Raw nearest zero-crossing of the SAME dealer gamma profile as
-    -- gamma_flip_point, but WITHOUT the structural-interior gating the
-    -- resolver applies.  This is the "nearest crossing to spot" figure
-    -- other dashboards publish (the one that oscillates intraday on a
-    -- lumpy near-spot book).  Surfaced as a SECONDARY reference only —
-    -- it can sit on a noise-floor crossing gamma_flip_point rejects, so
-    -- the structural value remains the headline regime level.  NULL when
-    -- the profile is one-signed (no crossing) or degraded.
+    -- Raw nearest zero-crossing on the UN-DTE-weighted dealer gamma
+    -- profile -- the "nearest crossing to spot" convention competitor
+    -- dashboards publish.  gamma_flip_point applies a horizon-occupancy
+    -- ramp (down-weighting near-dated 0DTE walls); this raw value drops
+    -- that ramp, so near-dated walls can pull the crossing toward spot and
+    -- it can sit much closer to spot than the structural flip.  SECONDARY
+    -- reference only -- no structural-significance gate, so it can land on
+    -- a near-spot noise crossing.  NULL when the profile is one-signed (no
+    -- crossing) or degraded.
     gamma_flip_raw DOUBLE PRECISION,
     put_call_ratio DOUBLE PRECISION,
     max_pain DOUBLE PRECISION,
@@ -414,10 +415,11 @@ ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS net_gex_at_spot DOUBLE PRECISIO
 -- cycles.
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS gamma_flip_span_used DOUBLE PRECISION;
 
--- Raw nearest zero-crossing of the dealer gamma profile (no structural
--- gating).  Secondary reference next to the structural gamma_flip_point;
--- matches the "nearest crossing" convention some competitor dashboards
--- publish.  See src/analytics/main_engine.py::_calculate_gamma_flip_point.
+-- Raw nearest zero-crossing on the un-DTE-weighted dealer gamma profile.
+-- Secondary reference next to the structural gamma_flip_point; matches the
+-- "nearest crossing" convention some competitor dashboards publish (the
+-- horizon-occupancy ramp is dropped so near-dated walls can pull it toward
+-- spot).  See src/analytics/main_engine.py::_calculate_gex_summary.
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS gamma_flip_raw DOUBLE PRECISION;
 
 -- Volume column semantics. ``total_call_volume`` and ``total_put_volume``

@@ -1175,6 +1175,65 @@ def test_gex_summary_marks_flip_unresolved_on_one_sided_chain(caplog):
     assert "stale IV pipeline" not in unresolved_warns[0].message
 
 
+def test_unweighted_profile_matches_weighted_when_all_contracts_past_ref_horizon():
+    """``apply_dte_weight=False`` is a no-op when every contract already sits
+    at/beyond the reference horizon: each horizon-occupancy weight is 1.0, so
+    the un-weighted profile (``gamma_flip_raw``'s basis) is byte-identical to
+    the weighted one. Guards against the raw flip silently diverging when
+    there is no near-dated mass to pull it."""
+    engine = AnalyticsEngine(underlying="SPY")
+    ts = datetime(2026, 4, 21, 14, 30, tzinfo=timezone.utc)
+    spot = 500.0
+    far = datetime(2026, 6, 20).date()  # ~60 DTE >> GAMMA_PROFILE_DTE_REF_DAYS (5)
+    options = [
+        _opt(470.0, "P", oi=12000, iv=0.25, exp=far, volume=5),
+        _opt(540.0, "C", oi=12000, iv=0.25, exp=far, volume=5),
+    ]
+    weighted = engine._gamma_exposure_profile(options, spot, ts)
+    unweighted = engine._gamma_exposure_profile(options, spot, ts, apply_dte_weight=False)
+    assert weighted == unweighted
+
+
+def test_gamma_flip_raw_is_unweighted_nearest_crossing_and_can_diverge():
+    """gamma_flip_raw is the nearest zero-crossing of the UN-DTE-weighted
+    profile (the competitor "nearest crossing" convention), NOT the horizon-
+    weighted structural flip. A near-dated wall above spot pulls the raw
+    crossing up while the structural flip stays on the far-dated symmetric
+    structure below spot — so the two land on opposite sides of spot."""
+    engine = AnalyticsEngine(underlying="SPY")
+    ts = datetime(2026, 4, 21, 14, 30, tzinfo=timezone.utc)
+    spot = 500.0
+    near = datetime(2026, 4, 22).date()  # 1 DTE -> heavily down-weighted (~0.2)
+    far = datetime(2026, 6, 20).date()   # ~60 DTE -> full weight (1.0)
+    options = [
+        _opt(470.0, "P", oi=14000, iv=0.25, exp=far, volume=5),
+        _opt(530.0, "C", oi=14000, iv=0.25, exp=far, volume=5),
+        _opt(508.0, "P", oi=11000, iv=0.16, exp=near, volume=5),
+        _opt(512.0, "C", oi=11000, iv=0.16, exp=near, volume=5),
+    ]
+    gex_by_strike = [{"strike": 500.0, "net_gex": 1_000_000.0}]
+
+    summary = engine._calculate_gex_summary(
+        gex_by_strike=gex_by_strike,
+        options=options,
+        underlying_price=spot,
+        timestamp=ts,
+    )
+
+    # gamma_flip_raw must equal the nearest crossing of the explicitly
+    # un-weighted profile, scanned over the span the resolver landed on.
+    unweighted = engine._gamma_exposure_profile(
+        options, spot, ts, span_pct=summary["gamma_flip_span_used"], apply_dte_weight=False
+    )
+    expected_raw = engine._calculate_gamma_flip_point(unweighted, spot)
+    assert summary["gamma_flip_raw"] == pytest.approx(expected_raw)
+
+    # The two genuinely diverge (Option B's whole point): the near-dated wall
+    # above spot pulls the raw crossing above spot, while the horizon-weighted
+    # structural flip stays below it.
+    assert summary["gamma_flip_point"] < spot < summary["gamma_flip_raw"]
+
+
 def test_unresolved_warn_renders_stale_iv_hint_when_share_actually_high(caplog):
     """Mirror of the prior test for the affirmative case: when the IV
     pipeline really is stale (many contracts pinned at the 0.20 sentinel),
