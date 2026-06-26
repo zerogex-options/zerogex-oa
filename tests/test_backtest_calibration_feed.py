@@ -68,6 +68,19 @@ def test_calibration_spec_is_single_leg_permissive():
     assert spec.patterns == []             # all patterns
     assert spec.sizing.max_concurrent == 20
     assert spec.sizing.capital >= 1_000_000.0
+    # Standardized premium stop applied; card targets kept (no premium target).
+    assert spec.exit.stop_loss_pct == pytest.approx(0.50)
+    assert spec.exit.profit_target_pct is None
+
+
+def test_calibration_spec_stop_from_config(monkeypatch):
+    from src import config
+
+    monkeypatch.setattr(config, "SIGNALS_PATTERN_CALIBRATION_PNL_STOP_PCT", 0.35)
+    assert feed.calibration_spec("SPY", _WS, _WE).exit.stop_loss_pct == pytest.approx(0.35)
+    # 0 disables the stop entirely.
+    monkeypatch.setattr(config, "SIGNALS_PATTERN_CALIBRATION_PNL_STOP_PCT", 0.0)
+    assert feed.calibration_spec("SPY", _WS, _WE).exit.stop_loss_pct is None
 
 
 # ---- upsert + run() against a scripted connection ------------------------

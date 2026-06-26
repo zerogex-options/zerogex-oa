@@ -288,6 +288,9 @@ def test_explain_report_outcome_distribution():
     assert "realized win rate: 2/6" in out
     assert "target_hit" in out
     assert "profitable    1 (25%)" in out  # 1 of 4 target_hits made money
+    # Economics block: 2×80 win, 4×−150 loss → net −440, PF (160/600)=0.27.
+    assert "net P&L $-440" in out
+    assert "profit factor 0.27" in out
 
 
 def test_explain_report_empty():
