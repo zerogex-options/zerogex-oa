@@ -1020,6 +1020,16 @@ SIGNALS_PATTERN_CALIBRATION_CEIL_OPTION_PNL = _getenv_float(
 SIGNALS_PATTERN_CALIBRATION_PNL_STOP_PCT = _getenv_float(
     "SIGNALS_PATTERN_CALIBRATION_PNL_STOP_PCT", 0.50, min=0.0, max=1.0
 )
+# Standardized premium take-profit applied by the option_pnl calibration feed:
+# lock a winning option once its premium rises this fraction above entry
+# (0.75 = +75%), so a directional move that spikes then gives it back is booked
+# as a win rather than decaying back to a loss. THIS is the lever that moves the
+# win-rate-based proposed_base (the stop only caps loss size). May exceed 1.0
+# (a near-dated option can more than double). 0 disables (let winners run to the
+# card's own target). Tune and re-measure with pattern-calibration-explain.
+SIGNALS_PATTERN_CALIBRATION_PNL_TARGET_PCT = _getenv_float(
+    "SIGNALS_PATTERN_CALIBRATION_PNL_TARGET_PCT", 0.75, min=0.0, max=20.0
+)
 # How often the long-running signals process reloads the calibration store
 # from the stats table (seconds). Cheap no-op between reloads.
 SIGNALS_PATTERN_CALIBRATION_REFRESH_SECONDS = _getenv_int(

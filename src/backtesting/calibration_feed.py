@@ -92,13 +92,15 @@ def calibration_spec(
     ``patterns`` restricts the run to specific pattern ids (used by the
     single-pattern explain/drill-in); the default empty list scans all patterns.
 
-    A standardized premium stop-loss
-    (``SIGNALS_PATTERN_CALIBRATION_PNL_STOP_PCT``) cuts a losing option rather
-    than riding a near-dated long to full decay, so the measured P&L reflects a
-    disciplined trade. The card's own target/stop levels still apply for the
-    upside; 0 disables the stop.
+    Disciplined-trade exits model the option's own premium: a standardized
+    stop-loss (``SIGNALS_PATTERN_CALIBRATION_PNL_STOP_PCT``) cuts a decaying long
+    rather than riding it to expiry, and a take-profit
+    (``SIGNALS_PATTERN_CALIBRATION_PNL_TARGET_PCT``) books a winner that spikes
+    then gives it back. Each card's own underlying target/stop still applies;
+    whichever triggers first wins. Either knob set to 0 disables that side.
     """
     stop = config.SIGNALS_PATTERN_CALIBRATION_PNL_STOP_PCT
+    target = config.SIGNALS_PATTERN_CALIBRATION_PNL_TARGET_PCT
     return BacktestSpec.from_dict(
         {
             "underlying": underlying,
@@ -113,11 +115,13 @@ def calibration_spec(
                 "risk_per_trade_pct": 1.0,
                 "max_concurrent": 20,
             },
-            # Keep each Card's own target/stop levels, but cut a decaying option
-            # at the standardized premium stop instead of riding it to expiry.
+            # Keep each Card's own target/stop levels, but overlay a standardized
+            # premium take-profit / stop so winners are booked and losers cut
+            # instead of riding a near-dated long to full decay.
             "exit": {
                 "max_hold_minutes": None,
                 "stop_loss_pct": stop if stop and stop > 0 else None,
+                "profit_target_pct": target if target and target > 0 else None,
             },
         }
     )

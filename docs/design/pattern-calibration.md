@@ -13,12 +13,15 @@
 > * **`option_pnl`** — `src/backtesting/calibration_feed.py`. Realized leg-level
 >   option P&L: "did the trade actually profit after real fills + slippage +
 >   commission?" A trade is a win when `net_pnl > 0`. Runs a standardized
->   single-leg spec with a premium stop-loss
->   (`SIGNALS_PATTERN_CALIBRATION_PNL_STOP_PCT`, default −50%) so a decaying
->   near-dated long is cut rather than ridden to expiry — modelling a disciplined
->   trade. Note: the stop caps loss *size*, so it lifts P&L economics (total
->   return / profit factor / avg loss) far more than the win-*rate* that drives
->   `proposed_base`; use `pattern-calibration-explain` to see the economics.
+>   single-leg spec with disciplined premium exits — a stop-loss
+>   (`SIGNALS_PATTERN_CALIBRATION_PNL_STOP_PCT`, default −50%) that cuts a
+>   decaying long, and a take-profit
+>   (`SIGNALS_PATTERN_CALIBRATION_PNL_TARGET_PCT`, default +75%) that books a
+>   spike before it gives back — overlaid on each card's own underlying levels
+>   (whichever triggers first). The stop caps loss *size* (lifts profit factor /
+>   avg loss); the take-profit is what moves the win-*rate* that drives
+>   `proposed_base`. Both are tunable; re-measure with
+>   `pattern-calibration-explain` after changing them.
 >
 > The live store picks which to trust via **`SIGNALS_PATTERN_CALIBRATION_SOURCE`**
 > (`underlying_touch` (default) | `option_pnl` | `auto`). `auto` prefers
