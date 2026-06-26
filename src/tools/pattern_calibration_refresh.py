@@ -32,6 +32,7 @@ from typing import Optional
 
 from src.config import (
     SIGNALS_PATTERN_CALIBRATION_LOOKBACK_DAYS,
+    SIGNALS_PATTERN_CALIBRATION_MIN_SAMPLES,
     SIGNALS_PATTERN_CALIBRATION_SOURCE,
     SIGNALS_UNDERLYINGS,
 )
@@ -75,6 +76,59 @@ def _format_report(priors: dict[str, float], store: pattern_calibration.Calibrat
     return "\n".join(lines)
 
 
+def _compare_report(
+    priors: dict[str, float],
+    touch_rows: list,
+    pnl_rows: list,
+    *,
+    min_samples: int,
+) -> str:
+    """Side-by-side of the two measurement sources per (pattern, underlying).
+
+    Each row prints the prior, the raw measured base + resolved count for each
+    source ('—' if absent, marked '·' if below the sample gate so it would fall
+    back to the prior), and Δ = option_pnl − underlying_touch where both exist.
+    """
+    def _index(rows):
+        # rows: (pattern, underlying, window_end, n_resolved, proposed_base)
+        out = {}
+        for pattern, underlying, _we, n, base in rows:
+            out[(pattern, (underlying or "").upper())] = (base, int(n or 0))
+        return out
+
+    touch = _index(touch_rows)
+    pnl = _index(pnl_rows)
+
+    def _cell(entry) -> str:
+        if entry is None or entry[0] is None:
+            return f"{'—':>13}"
+        base, n = entry
+        gate = " " if n >= min_samples else "·"
+        return f"{base:.3f}{gate}({n:>6})"
+
+    keys = sorted(set(touch) | set(pnl))
+    lines = [
+        "",
+        "Calibration sources — underlying_touch vs option_pnl "
+        f"(· = below {min_samples}-sample gate):",
+        f"  {'pattern':<30}{'undl':<6}{'prior':>7}  "
+        f"{'touch (n)':>13}  {'option_pnl (n)':>14}  {'Δ(pnl−touch)':>12}",
+    ]
+    for pattern, undl in keys:
+        prior = priors.get(pattern)
+        t = touch.get((pattern, undl))
+        p = pnl.get((pattern, undl))
+        prior_s = f"{prior:.3f}" if prior is not None else "  ?  "
+        delta_s = ""
+        if t and p and t[0] is not None and p[0] is not None:
+            delta_s = f"{p[0] - t[0]:+.3f}"
+        lines.append(
+            f"  {pattern:<30}{undl:<6}{prior_s:>7}  "
+            f"{_cell(t):>13}  {_cell(p):>14}  {delta_s:>12}"
+        )
+    return "\n".join(lines)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Refresh + report playbook pattern calibration")
@@ -99,9 +153,25 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--no-pnl", dest="pnl", action="store_false",
         help="skip the realized option-P&L feed",
     )
+    parser.add_argument(
+        "--compare", action="store_true",
+        help="print a side-by-side of both sources from existing stats and exit",
+    )
     args = parser.parse_args(argv)
 
     underlyings = args.underlyings if args.underlyings else _default_underlyings()
+
+    if args.compare:
+        with db_connection() as conn:
+            touch_rows = pattern_calibration._load_rows(conn, "underlying_touch")
+            pnl_rows = pattern_calibration._load_rows(conn, "option_pnl")
+        print(
+            _compare_report(
+                _priors(), touch_rows, pnl_rows,
+                min_samples=SIGNALS_PATTERN_CALIBRATION_MIN_SAMPLES,
+            )
+        )
+        return 0
 
     # Default: run the P&L feed whenever the live engine would consult it.
     run_pnl = args.pnl

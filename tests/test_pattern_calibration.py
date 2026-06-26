@@ -182,6 +182,60 @@ def test_load_store_auto_prefers_pnl_with_touch_fallback(monkeypatch, _enabled):
     assert store.by_pair[("q", "SPY")] == pytest.approx(0.48)  # touch fallback
 
 
+def test_band_for_source_uses_pnl_override(monkeypatch, _enabled):
+    monkeypatch.setattr(config, "SIGNALS_PATTERN_CALIBRATION_FLOOR_OPTION_PNL", 0.25)
+    monkeypatch.setattr(config, "SIGNALS_PATTERN_CALIBRATION_CEIL_OPTION_PNL", 0.90)
+    assert cal._band_for_source("option_pnl") == (0.25, 0.90)
+    assert cal._band_for_source("underlying_touch") == (0.40, 0.85)
+    assert cal._band_for_source(None) == (0.40, 0.85)
+
+
+def test_option_pnl_band_clamps_independently(monkeypatch, _enabled):
+    # A genuinely-losing 0.13 base: the global band pins it at 0.40, but the
+    # option_pnl band (floor lowered to 0.20) marks it down further.
+    monkeypatch.setattr(config, "SIGNALS_PATTERN_CALIBRATION_FLOOR_OPTION_PNL", 0.20)
+    touch = cal.build_store_from_rows(
+        [_row("p", "SPY", 1, 50, 0.13)], source="underlying_touch"
+    )
+    pnl = cal.build_store_from_rows(
+        [_row("p", "SPY", 1, 50, 0.13)], source="option_pnl"
+    )
+    assert touch.by_pair[("p", "SPY")] == pytest.approx(0.40)
+    assert pnl.by_pair[("p", "SPY")] == pytest.approx(0.20)
+
+
+def test_load_store_auto_applies_per_source_band(monkeypatch, _enabled):
+    monkeypatch.setattr(config, "SIGNALS_PATTERN_CALIBRATION_SOURCE", "auto")
+    monkeypatch.setattr(config, "SIGNALS_PATTERN_CALIBRATION_FLOOR_OPTION_PNL", 0.20)
+    conn = _Conn(
+        {
+            "underlying_touch": [_row("p", "SPY", 1, 40, 0.13)],
+            "option_pnl": [_row("p", "SPY", 1, 40, 0.13)],
+        }
+    )
+    store = cal.load_store(conn)
+    # option_pnl wins under 'auto' AND is clamped with its own lower floor.
+    assert store.by_pair[("p", "SPY")] == pytest.approx(0.20)
+
+
+def test_compare_report_marks_gate_and_delta():
+    from src.tools.pattern_calibration_refresh import _compare_report
+
+    out = _compare_report(
+        {"p": 0.5},
+        [("p", "SPY", None, 1000, 0.04)],
+        [("p", "SPY", None, 120, 0.33)],
+        min_samples=20,
+    )
+    assert "option_pnl" in out
+    assert "+0.290" in out  # Δ = 0.33 − 0.04
+    # A below-gate cell (n < min_samples) is flagged with '·'.
+    gated = _compare_report(
+        {"q": 0.5}, [("q", "SPY", None, 10, 0.70)], [], min_samples=20
+    )
+    assert "·" in gated
+
+
 def test_merge_prefer_overlays_preferred():
     base = cal.CalibrationStore(
         by_pair={("a", "SPY"): 0.5, ("b", "SPY"): 0.6}, by_pattern={"a": 0.5}

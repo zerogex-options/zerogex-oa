@@ -999,6 +999,19 @@ SIGNALS_PATTERN_CALIBRATION_FLOOR = _getenv_float(
 SIGNALS_PATTERN_CALIBRATION_CEIL = _getenv_float(
     "SIGNALS_PATTERN_CALIBRATION_CEIL", 0.85, min=0.0, max=1.0
 )
+# Per-source clamp overrides for the realized-P&L feed. Realized option P&L is
+# the honest measure, so an operator may want a wider band than the touch
+# proxy's [0.40, 0.85] — e.g. a lower floor so a genuinely losing pattern is
+# marked down further rather than pinned at 0.40. Default to the global band, so
+# behavior is unchanged until these are set explicitly.
+SIGNALS_PATTERN_CALIBRATION_FLOOR_OPTION_PNL = _getenv_float(
+    "SIGNALS_PATTERN_CALIBRATION_FLOOR_OPTION_PNL",
+    SIGNALS_PATTERN_CALIBRATION_FLOOR, min=0.0, max=1.0
+)
+SIGNALS_PATTERN_CALIBRATION_CEIL_OPTION_PNL = _getenv_float(
+    "SIGNALS_PATTERN_CALIBRATION_CEIL_OPTION_PNL",
+    SIGNALS_PATTERN_CALIBRATION_CEIL, min=0.0, max=1.0
+)
 # How often the long-running signals process reloads the calibration store
 # from the stats table (seconds). Cheap no-op between reloads.
 SIGNALS_PATTERN_CALIBRATION_REFRESH_SECONDS = _getenv_int(
