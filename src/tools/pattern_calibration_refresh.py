@@ -221,6 +221,35 @@ def _explain_report(result, *, pattern: str, underlying: str, limit: int = 40) -
     return "\n".join(head)
 
 
+def _structures_report(by_structure: dict, *, underlying: str) -> str:
+    """Per-pattern economics under single long vs defined-risk vertical.
+
+    The single-vs-vertical contrast answers whether a pattern's weak long-option
+    P&L is a theta/vega problem (vertical lifts win rate / profit factor / cuts
+    the loss) or genuine lack of directional edge (both stay poor).
+    """
+    single = by_structure.get("single", {})
+    vert = by_structure.get("vertical", {})
+    patterns = sorted(set(single) | set(vert))
+
+    def _cell(e: Optional[dict]) -> str:
+        if not e or not e.get("n"):
+            return f"{'—':>27}"
+        wr = e["win_rate"]
+        pf = e["pf"]
+        pf_s = "inf" if pf == float("inf") else f"{pf:.2f}"
+        return f"{wr:>5.0%} ({e['n']:>3})  pf {pf_s:>5}  ${e['expectancy']:>7,.0f}"
+
+    lines = [
+        f"\nStructure comparison @ {underlying} — single long vs 1% debit vertical",
+        "  (win% (n)  profit factor  expectancy/trade):",
+        f"  {'pattern':<30}{'single':>27}   {'vertical':>27}",
+    ]
+    for p in patterns:
+        lines.append(f"  {p:<30}{_cell(single.get(p))}   {_cell(vert.get(p))}")
+    return "\n".join(lines)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Refresh + report playbook pattern calibration")
@@ -253,9 +282,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--explain", metavar="PATTERN", default=None,
         help="drill into one pattern: run its option_pnl trades and dump them",
     )
+    parser.add_argument(
+        "--structures", action="store_true",
+        help="compare per-pattern economics as a single long vs a defined-risk vertical",
+    )
     args = parser.parse_args(argv)
 
     underlyings = args.underlyings if args.underlyings else _default_underlyings()
+
+    if args.structures:
+        from src.backtesting import calibration_feed as feed
+
+        with db_connection() as conn:
+            for u in underlyings:
+                by_structure = feed.run_structures(conn, underlying=u, days=args.days)
+                print(_structures_report(by_structure, underlying=u))
+        return 0
 
     if args.explain:
         from src.backtesting import calibration_feed as feed

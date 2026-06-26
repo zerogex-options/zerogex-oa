@@ -3514,6 +3514,13 @@ pattern-calibration-explain: ## Drill into one pattern's option_pnl trades (PATT
 		$(if $(CALIB_DAYS),--days $(CALIB_DAYS)) \
 		$(if $(CALIB_UNDERLYINGS),--underlyings $(CALIB_UNDERLYINGS))
 
+.PHONY: pattern-calibration-structures
+pattern-calibration-structures: ## Compare per-pattern economics as single long vs defined-risk vertical (read-only)
+	@echo "$(BLUE)=== Comparing structures (single vs vertical) ===$(NC)"
+	@$(PY) -m src.tools.pattern_calibration_refresh --structures \
+		$(if $(CALIB_DAYS),--days $(CALIB_DAYS)) \
+		$(if $(CALIB_UNDERLYINGS),--underlyings $(CALIB_UNDERLYINGS))
+
 .PHONY: backtest-worker
 backtest-worker: ## Run the backtest worker (drains queued runs; needs BACKTEST_WORKER_ENABLED=1)
 	@echo "$(BLUE)=== Starting backtest worker ===$(NC)"

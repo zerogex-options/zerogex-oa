@@ -86,25 +86,30 @@ class PnlPatternStat:
 def calibration_spec(
     underlying: str, window_start: date, window_end: date,
     *, patterns: list[str] | None = None,
+    structure: str = "single", width_pct: float = 0.01,
 ) -> BacktestSpec:
     """Build the standardized single-leg measurement spec (see module docstring).
 
     ``patterns`` restricts the run to specific pattern ids (used by the
     single-pattern explain/drill-in); the default empty list scans all patterns.
 
-    A standardized premium stop-loss
-    (``SIGNALS_PATTERN_CALIBRATION_PNL_STOP_PCT``) cuts a losing option rather
-    than riding a near-dated long to full decay, so the measured P&L reflects a
-    disciplined trade. The card's own target/stop levels still apply for the
-    upside; 0 disables the stop.
+    Disciplined-trade exits model the option's own premium: a standardized
+    stop-loss (``SIGNALS_PATTERN_CALIBRATION_PNL_STOP_PCT``) cuts a decaying long
+    rather than riding it to expiry, and a take-profit
+    (``SIGNALS_PATTERN_CALIBRATION_PNL_TARGET_PCT``) books a winner that spikes
+    then gives it back. Each card's own underlying target/stop still applies;
+    whichever triggers first wins. Either knob set to 0 disables that side.
     """
     stop = config.SIGNALS_PATTERN_CALIBRATION_PNL_STOP_PCT
+    target = config.SIGNALS_PATTERN_CALIBRATION_PNL_TARGET_PCT
     return BacktestSpec.from_dict(
         {
             "underlying": underlying,
             "start_date": window_start.isoformat(),
             "end_date": window_end.isoformat(),
             "patterns": list(patterns) if patterns else [],
+            "structure": structure,
+            "width_pct": width_pct,
             "fill_model": {"slippage_pct": 0.01, "commission_per_contract": 0.65},
             # Large capital + max concurrency so neither sizing nor the
             # concurrency cap drops entries — maximize the measured sample.
@@ -113,11 +118,13 @@ def calibration_spec(
                 "risk_per_trade_pct": 1.0,
                 "max_concurrent": 20,
             },
-            # Keep each Card's own target/stop levels, but cut a decaying option
-            # at the standardized premium stop instead of riding it to expiry.
+            # Keep each Card's own target/stop levels, but overlay a standardized
+            # premium take-profit / stop so winners are booked and losers cut
+            # instead of riding a near-dated long to full decay.
             "exit": {
                 "max_hold_minutes": None,
                 "stop_loss_pct": stop if stop and stop > 0 else None,
+                "profit_target_pct": target if target and target > 0 else None,
             },
         }
     )
@@ -129,6 +136,42 @@ def _window(days: int) -> tuple[date, date]:
     end_dt = datetime.now(pytz.UTC)
     start_dt = end_dt - timedelta(days=days)
     return start_dt.astimezone(et).date(), end_dt.astimezone(et).date()
+
+
+def aggregate_economics(trades) -> dict:
+    """Per-pattern P&L economics: win rate, profit factor, expectancy, net P&L."""
+    out: dict[str, dict] = {}
+    for t in trades:
+        e = out.setdefault(
+            t.pattern, {"n": 0, "wins": 0, "net": 0.0, "gw": 0.0, "gl": 0.0}
+        )
+        e["n"] += 1
+        e["net"] += t.net_pnl
+        if t.net_pnl > 0:
+            e["wins"] += 1
+            e["gw"] += t.net_pnl
+        else:
+            e["gl"] += abs(t.net_pnl)
+    for e in out.values():
+        e["win_rate"] = e["wins"] / e["n"] if e["n"] else None
+        e["pf"] = (e["gw"] / e["gl"]) if e["gl"] > 0 else float("inf")
+        e["expectancy"] = e["net"] / e["n"] if e["n"] else 0.0
+    return out
+
+
+def run_structures(conn, *, underlying: str, days: int = _DEFAULT_DAYS,
+                   structures=("single", "vertical")) -> dict:
+    """Run the calibration backtest under each structure; return per-pattern
+    economics keyed by structure name. One full backtest per structure (all
+    patterns at once), so cost is len(structures) runs, not per-pattern.
+    """
+    window_start, window_end = _window(days)
+    out: dict[str, dict] = {}
+    for s in structures:
+        spec = calibration_spec(underlying, window_start, window_end, structure=s)
+        result = run_backtest(conn, spec)
+        out[s] = aggregate_economics(result.trades)
+    return out
 
 
 def explain_trades(conn, *, underlying: str, pattern: str, days: int = _DEFAULT_DAYS):

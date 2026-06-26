@@ -68,19 +68,25 @@ def test_calibration_spec_is_single_leg_permissive():
     assert spec.patterns == []             # all patterns
     assert spec.sizing.max_concurrent == 20
     assert spec.sizing.capital >= 1_000_000.0
-    # Standardized premium stop applied; card targets kept (no premium target).
+    # Standardized premium stop + take-profit overlay the card's own levels.
     assert spec.exit.stop_loss_pct == pytest.approx(0.50)
-    assert spec.exit.profit_target_pct is None
+    assert spec.exit.profit_target_pct == pytest.approx(0.75)
 
 
-def test_calibration_spec_stop_from_config(monkeypatch):
+def test_calibration_spec_exits_from_config(monkeypatch):
     from src import config
 
     monkeypatch.setattr(config, "SIGNALS_PATTERN_CALIBRATION_PNL_STOP_PCT", 0.35)
-    assert feed.calibration_spec("SPY", _WS, _WE).exit.stop_loss_pct == pytest.approx(0.35)
-    # 0 disables the stop entirely.
+    monkeypatch.setattr(config, "SIGNALS_PATTERN_CALIBRATION_PNL_TARGET_PCT", 1.20)
+    spec = feed.calibration_spec("SPY", _WS, _WE)
+    assert spec.exit.stop_loss_pct == pytest.approx(0.35)
+    assert spec.exit.profit_target_pct == pytest.approx(1.20)
+    # 0 on either side disables it.
     monkeypatch.setattr(config, "SIGNALS_PATTERN_CALIBRATION_PNL_STOP_PCT", 0.0)
-    assert feed.calibration_spec("SPY", _WS, _WE).exit.stop_loss_pct is None
+    monkeypatch.setattr(config, "SIGNALS_PATTERN_CALIBRATION_PNL_TARGET_PCT", 0.0)
+    spec = feed.calibration_spec("SPY", _WS, _WE)
+    assert spec.exit.stop_loss_pct is None
+    assert spec.exit.profit_target_pct is None
 
 
 # ---- upsert + run() against a scripted connection ------------------------
@@ -139,6 +145,69 @@ def test_run_aggregates_and_writes(monkeypatch):
     assert captured["spec"].sizing.max_concurrent == 20
     assert conn.committed is True
     assert any(p[-1] == "option_pnl" for _, p in conn._cur.executed if p)
+
+
+def test_to_vertical_scales_with_price():
+    from src.backtesting.engine import _to_vertical
+
+    # Bullish ATM call: short leg one width above, scaled off the entry price.
+    legs = [{"expiry": "2026-03-02", "strike": 600, "right": "C", "side": "long", "qty": 1}]
+    out = _to_vertical(legs, "bullish", 600.0, 0.01)
+    assert [leg_["side"] for leg_ in out] == ["long", "short"]
+    assert out[0]["strike"] == 600.0 and out[1]["strike"] == 606.0
+    assert out[1]["right"] == "C"  # same right as the long
+
+    # Bearish, synthetic (None strike) → anchored at round(entry); short below.
+    spx = _to_vertical(
+        [{"expiry": None, "strike": None, "right": "P", "side": "long", "qty": 1}],
+        "bearish", 7000.0, 0.01,
+    )
+    assert spx[0]["strike"] == 7000.0 and spx[1]["strike"] == 6930.0
+
+
+def test_spec_structure_validation():
+    from src.backtesting.models import BacktestSpec, SpecError
+
+    base = {"underlying": "SPY", "start_date": "2026-03-01", "end_date": "2026-06-01"}
+    assert BacktestSpec.from_dict(base).structure == "single"        # default
+    v = BacktestSpec.from_dict({**base, "structure": "vertical", "width_pct": 0.02})
+    assert v.structure == "vertical" and v.width_pct == pytest.approx(0.02)
+    assert v.to_dict()["structure"] == "vertical"                    # round-trips
+    with pytest.raises(SpecError, match="structure must be"):
+        BacktestSpec.from_dict({**base, "structure": "condor"})
+
+
+def test_calibration_spec_structure_param():
+    spec = feed.calibration_spec("SPY", _WS, _WE, structure="vertical", width_pct=0.015)
+    assert spec.structure == "vertical"
+    assert spec.width_pct == pytest.approx(0.015)
+
+
+def test_aggregate_economics():
+    trades = [
+        _Trade("a", 100.0), _Trade("a", -50.0), _Trade("a", -25.0),  # 1 win, gw100 gl75
+        _Trade("b", 200.0),
+    ]
+    econ = feed.aggregate_economics(trades)
+    assert econ["a"]["n"] == 3 and econ["a"]["wins"] == 1
+    assert econ["a"]["win_rate"] == pytest.approx(1 / 3)
+    assert econ["a"]["pf"] == pytest.approx(100 / 75)
+    assert econ["a"]["expectancy"] == pytest.approx((100 - 50 - 25) / 3)
+    assert econ["b"]["pf"] == float("inf")  # no losses
+
+
+def test_run_structures_runs_each_structure(monkeypatch):
+    # Return different trades per structure so we can tell them apart.
+    def fake_run_backtest(conn, spec, **kw):
+        if spec.structure == "vertical":
+            return type("R", (), {"trades": [_Trade("p", 50.0), _Trade("p", -10.0)]})()
+        return type("R", (), {"trades": [_Trade("p", -100.0)]})()
+
+    monkeypatch.setattr(feed, "run_backtest", fake_run_backtest)
+    out = feed.run_structures(_Conn(), underlying="SPY", days=30)
+    assert set(out) == {"single", "vertical"}
+    assert out["single"]["p"]["win_rate"] == 0.0          # the lone trade lost
+    assert out["vertical"]["p"]["win_rate"] == pytest.approx(0.5)
 
 
 def test_run_no_write_skips_persist(monkeypatch):

@@ -293,6 +293,18 @@ def test_explain_report_outcome_distribution():
     assert "profit factor 0.27" in out
 
 
+def test_structures_report_single_vs_vertical():
+    from src.tools.pattern_calibration_refresh import _structures_report
+
+    single = {"p": {"n": 75, "win_rate": 0.13, "pf": 0.10, "expectancy": -1417.0}}
+    vert = {"p": {"n": 70, "win_rate": 0.41, "pf": 0.95, "expectancy": -95.0}}
+    out = _structures_report({"single": single, "vertical": vert}, underlying="SPY")
+    assert "single" in out and "vertical" in out
+    assert "13% ( 75)" in out      # single win% + n
+    assert "41% ( 70)" in out      # vertical win% + n
+    assert "pf  0.95" in out
+
+
 def test_explain_report_empty():
     from types import SimpleNamespace as NS
 
