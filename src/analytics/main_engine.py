@@ -2525,6 +2525,17 @@ class AnalyticsEngine:
         )
         net_gex_at_spot = self._net_gex_at_spot(gamma_profile, underlying_price)
 
+        # Raw nearest zero-crossing of the SAME profile, with none of the
+        # structural-interior gating _resolve_gamma_flip applies. This is
+        # the "nearest crossing to spot" figure other dashboards publish
+        # (and the one that oscillates intraday when the book is lumpy near
+        # spot). Surfaced as a SECONDARY reference next to the structural
+        # gamma_flip_point — NOT a replacement: it can land on a noise-floor
+        # crossing the structural resolver deliberately rejects. Read off
+        # the same returned profile so it stays sign-consistent with the
+        # headline flip and net_gex_at_spot.
+        gamma_flip_raw = self._calculate_gamma_flip_point(gamma_profile, underlying_price)
+
         gamma_flip_unresolved = gamma_flip_point is None
         if gamma_flip_unresolved:
             # Throttle the verbose diagnostic so a persistent unresolved
@@ -2709,6 +2720,7 @@ class AnalyticsEngine:
             "max_gamma_strike": max_gamma_strike["strike"],
             "max_gamma_value": max_gamma_strike["net_gex"],
             "gamma_flip_point": gamma_flip_point,
+            "gamma_flip_raw": gamma_flip_raw,
             "gamma_flip_unresolved": gamma_flip_unresolved,
             "gamma_flip_span_used": gamma_flip_span_used if gamma_flip_point is not None else None,
             "flip_distance": flip_distance,
@@ -2887,6 +2899,7 @@ class AnalyticsEngine:
             else None
         )
         gamma_flip_span_used = summary.get("gamma_flip_span_used")
+        gamma_flip_raw = summary.get("gamma_flip_raw")
         cursor.execute(
             """
             INSERT INTO gex_summary
@@ -2894,12 +2907,14 @@ class AnalyticsEngine:
              gamma_flip_point, put_call_ratio, max_pain, total_call_volume,
              total_put_volume, total_call_oi, total_put_oi, total_net_gex,
              net_gex_at_spot, flip_distance, local_gex, convexity_risk,
-             call_wall, put_wall, max_pain_by_expiration, gamma_flip_span_used)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             call_wall, put_wall, max_pain_by_expiration, gamma_flip_span_used,
+             gamma_flip_raw)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (underlying, timestamp) DO UPDATE SET
                 max_gamma_strike = EXCLUDED.max_gamma_strike,
                 max_gamma_value = EXCLUDED.max_gamma_value,
                 gamma_flip_point = EXCLUDED.gamma_flip_point,
+                gamma_flip_raw = EXCLUDED.gamma_flip_raw,
                 put_call_ratio = EXCLUDED.put_call_ratio,
                 max_pain = EXCLUDED.max_pain,
                 total_call_volume = EXCLUDED.total_call_volume,
@@ -2934,6 +2949,7 @@ class AnalyticsEngine:
                 OR EXCLUDED.put_wall IS DISTINCT FROM gex_summary.put_wall
                 OR EXCLUDED.max_pain_by_expiration IS DISTINCT FROM gex_summary.max_pain_by_expiration
                 OR EXCLUDED.gamma_flip_span_used IS DISTINCT FROM gex_summary.gamma_flip_span_used
+                OR EXCLUDED.gamma_flip_raw IS DISTINCT FROM gex_summary.gamma_flip_raw
         """,
             (
                 summary["underlying"],
@@ -2956,6 +2972,7 @@ class AnalyticsEngine:
                 float(put_wall_val) if put_wall_val is not None else None,
                 mp_by_exp_json,
                 (float(gamma_flip_span_used) if gamma_flip_span_used is not None else None),
+                (float(gamma_flip_raw) if gamma_flip_raw is not None else None),
             ),
         )
         logger.info("✅ Stored GEX summary")

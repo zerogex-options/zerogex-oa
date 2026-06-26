@@ -340,6 +340,15 @@ CREATE TABLE IF NOT EXISTS gex_summary (
     max_gamma_strike NUMERIC(12, 4),
     max_gamma_value DOUBLE PRECISION,
     gamma_flip_point DOUBLE PRECISION,
+    -- Raw nearest zero-crossing of the SAME dealer gamma profile as
+    -- gamma_flip_point, but WITHOUT the structural-interior gating the
+    -- resolver applies.  This is the "nearest crossing to spot" figure
+    -- other dashboards publish (the one that oscillates intraday on a
+    -- lumpy near-spot book).  Surfaced as a SECONDARY reference only —
+    -- it can sit on a noise-floor crossing gamma_flip_point rejects, so
+    -- the structural value remains the headline regime level.  NULL when
+    -- the profile is one-signed (no crossing) or degraded.
+    gamma_flip_raw DOUBLE PRECISION,
     put_call_ratio DOUBLE PRECISION,
     max_pain DOUBLE PRECISION,
     total_call_volume BIGINT DEFAULT 0,
@@ -404,6 +413,12 @@ ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS net_gex_at_spot DOUBLE PRECISIO
 -- looser bar; treat with caution).  NULL pre-rollout / on unresolved
 -- cycles.
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS gamma_flip_span_used DOUBLE PRECISION;
+
+-- Raw nearest zero-crossing of the dealer gamma profile (no structural
+-- gating).  Secondary reference next to the structural gamma_flip_point;
+-- matches the "nearest crossing" convention some competitor dashboards
+-- publish.  See src/analytics/main_engine.py::_calculate_gamma_flip_point.
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS gamma_flip_raw DOUBLE PRECISION;
 
 -- Volume column semantics. ``total_call_volume`` and ``total_put_volume``
 -- are per-snapshot session-cumulative aggregates summed across every
