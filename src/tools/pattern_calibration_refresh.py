@@ -87,7 +87,10 @@ def _compare_report(
 
     Each row prints the prior, the raw measured base + resolved count for each
     source ('—' if absent, marked '·' if below the sample gate so it would fall
-    back to the prior), and Δ = option_pnl − underlying_touch where both exist.
+    back to the prior), Δ = option_pnl − underlying_touch where both exist, and
+    the value the live engine would actually use under ``source=auto`` (the
+    gated + clamped base, tagged by which source won: P=option_pnl, T=touch,
+    w=pattern-wide fallback, or 'prior' when nothing trustworthy exists).
     """
     def _index(rows):
         # rows: (pattern, underlying, window_end, n_resolved, proposed_base)
@@ -98,6 +101,22 @@ def _compare_report(
 
     touch = _index(touch_rows)
     pnl = _index(pnl_rows)
+
+    # What 'auto' would resolve to: the gated + clamped, P&L-preferred store.
+    touch_store = pattern_calibration.build_store_from_rows(
+        touch_rows, source="underlying_touch"
+    )
+    pnl_store = pattern_calibration.build_store_from_rows(pnl_rows, source="option_pnl")
+
+    def _auto_cell(pattern, key) -> str:
+        if key in pnl_store.by_pair:
+            return f"{pnl_store.by_pair[key]:.3f} P"
+        if key in touch_store.by_pair:
+            return f"{touch_store.by_pair[key]:.3f} T"
+        wide = pnl_store.by_pattern.get(pattern, touch_store.by_pattern.get(pattern))
+        if wide is not None:
+            return f"{wide:.3f} w"
+        return "prior"
 
     def _cell(entry) -> str:
         if entry is None or entry[0] is None:
@@ -112,21 +131,74 @@ def _compare_report(
         "Calibration sources — underlying_touch vs option_pnl "
         f"(· = below {min_samples}-sample gate):",
         f"  {'pattern':<30}{'undl':<6}{'prior':>7}  "
-        f"{'touch (n)':>13}  {'option_pnl (n)':>14}  {'Δ(pnl−touch)':>12}",
+        f"{'touch (n)':>13}  {'option_pnl (n)':>14}  {'Δ(pnl−touch)':>12}  "
+        f"{'auto→':>11}",
     ]
     for pattern, undl in keys:
+        key = (pattern, undl)
         prior = priors.get(pattern)
-        t = touch.get((pattern, undl))
-        p = pnl.get((pattern, undl))
+        t = touch.get(key)
+        p = pnl.get(key)
         prior_s = f"{prior:.3f}" if prior is not None else "  ?  "
         delta_s = ""
         if t and p and t[0] is not None and p[0] is not None:
             delta_s = f"{p[0] - t[0]:+.3f}"
         lines.append(
             f"  {pattern:<30}{undl:<6}{prior_s:>7}  "
-            f"{_cell(t):>13}  {_cell(p):>14}  {delta_s:>12}"
+            f"{_cell(t):>13}  {_cell(p):>14}  {delta_s:>12}  "
+            f"{_auto_cell(pattern, key):>11}"
         )
     return "\n".join(lines)
+
+
+def _explain_report(result, *, pattern: str, underlying: str, limit: int = 40) -> str:
+    """Per-trade drill-in for one pattern's realized-P&L run.
+
+    Prints each trade (entry/exit premium, hold, P&L, outcome) and — the key
+    diagnostic — the outcome distribution with how many trades in EACH outcome
+    were actually profitable. A pattern whose ``target_hit`` trades are mostly
+    unprofitable is a confirmed theta trap (right on direction, wrong on premium).
+    """
+    trades = list(result.trades)
+    n = len(trades)
+    head = [f"\n{pattern} @ {underlying}: {n} option_pnl trade(s)"]
+    if n == 0:
+        head.append(
+            "  (no priced entries — e.g. a premium-seller skipped by the "
+            "defined-risk guard)"
+        )
+        return "\n".join(head)
+
+    head.append(
+        f"  {'#':>3}  {'entered':<16}{'hold':>6}  {'contract':<10}"
+        f"{'entry':>8}{'exit':>8}{'net_pnl':>11}{'ret%':>8}  outcome"
+    )
+    for t in trades[:limit]:
+        entered = t.entered_at.strftime("%m-%d %H:%M") if t.entered_at else "—"
+        strike = f"{t.strike:g}{(t.option_type or '').upper()}" if t.strike else "—"
+        ret = f"{t.return_pct:+.1f}" if t.return_pct is not None else "—"
+        exitp = f"{t.exit_premium:.2f}" if t.exit_premium is not None else "—"
+        head.append(
+            f"  {t.seq:>3}  {entered:<16}{(t.hold_minutes or 0):>6}  {strike:<10}"
+            f"{t.entry_premium:>8.2f}{exitp:>8}{t.net_pnl:>11.0f}{ret:>8}  {t.outcome}"
+        )
+    if n > limit:
+        head.append(f"  … {n - limit} more")
+
+    # Outcome distribution with profitability — the theta-trap tell.
+    dist: dict[str, list[int]] = {}
+    wins = 0
+    for t in trades:
+        slot = dist.setdefault(t.outcome, [0, 0])
+        slot[0] += 1
+        if t.net_pnl > 0:
+            slot[1] += 1
+            wins += 1
+    head.append(f"\n  realized win rate: {wins}/{n} = {wins / n:.1%}")
+    head.append("  by outcome (count, profitable):")
+    for outcome, (cnt, prof) in sorted(dist.items(), key=lambda kv: -kv[1][0]):
+        head.append(f"    {outcome:<14} {cnt:>4}  profitable {prof:>4} ({prof / cnt:.0%})")
+    return "\n".join(head)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -157,9 +229,24 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--compare", action="store_true",
         help="print a side-by-side of both sources from existing stats and exit",
     )
+    parser.add_argument(
+        "--explain", metavar="PATTERN", default=None,
+        help="drill into one pattern: run its option_pnl trades and dump them",
+    )
     args = parser.parse_args(argv)
 
     underlyings = args.underlyings if args.underlyings else _default_underlyings()
+
+    if args.explain:
+        from src.backtesting import calibration_feed as feed
+
+        with db_connection() as conn:
+            for u in underlyings:
+                result = feed.explain_trades(
+                    conn, underlying=u, pattern=args.explain, days=args.days
+                )
+                print(_explain_report(result, pattern=args.explain, underlying=u))
+        return 0
 
     if args.compare:
         with db_connection() as conn:

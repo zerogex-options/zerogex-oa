@@ -30,7 +30,13 @@
 >
 > Inspect both sources side by side before switching:
 > `make pattern-calibration-compare` (read-only; prints prior vs touch vs
-> option_pnl per pattern, with Δ and a below-sample-gate marker).
+> option_pnl per pattern, with Δ, a below-sample-gate marker, and an `auto→`
+> column showing the gated+clamped base the live engine would use under
+> `source=auto`, tagged P/T/w/prior). Drill into one pattern's realized trades
+> with `make pattern-calibration-explain PATTERN=<id>` — it dumps each trade and
+> the outcome distribution with per-outcome profitability, so a touch-vs-P&L
+> divergence can be confirmed as a real theta trap (target hit, premium lost)
+> rather than a pricing artifact.
 
 ## Problem
 

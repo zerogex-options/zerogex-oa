@@ -3495,6 +3495,13 @@ pattern-calibration-compare: ## Side-by-side of underlying_touch vs option_pnl b
 	@$(PY) -m src.tools.pattern_calibration_refresh --compare \
 		$(if $(CALIB_UNDERLYINGS),--underlyings $(CALIB_UNDERLYINGS))
 
+.PHONY: pattern-calibration-explain
+pattern-calibration-explain: ## Drill into one pattern's option_pnl trades (PATTERN=<id> [CALIB_UNDERLYINGS=SPY] [CALIB_DAYS=60])
+	@echo "$(BLUE)=== Explaining $(PATTERN) realized P&L ===$(NC)"
+	@$(PY) -m src.tools.pattern_calibration_refresh --explain $(PATTERN) \
+		$(if $(CALIB_DAYS),--days $(CALIB_DAYS)) \
+		$(if $(CALIB_UNDERLYINGS),--underlyings $(CALIB_UNDERLYINGS))
+
 .PHONY: backtest-worker
 backtest-worker: ## Run the backtest worker (drains queued runs; needs BACKTEST_WORKER_ENABLED=1)
 	@echo "$(BLUE)=== Starting backtest worker ===$(NC)"

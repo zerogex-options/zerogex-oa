@@ -221,19 +221,82 @@ def test_load_store_auto_applies_per_source_band(monkeypatch, _enabled):
 def test_compare_report_marks_gate_and_delta():
     from src.tools.pattern_calibration_refresh import _compare_report
 
+    today = date.today()
     out = _compare_report(
         {"p": 0.5},
-        [("p", "SPY", None, 1000, 0.04)],
-        [("p", "SPY", None, 120, 0.33)],
+        [("p", "SPY", today, 1000, 0.04)],
+        [("p", "SPY", today, 120, 0.33)],
         min_samples=20,
     )
     assert "option_pnl" in out
     assert "+0.290" in out  # Δ = 0.33 − 0.04
     # A below-gate cell (n < min_samples) is flagged with '·'.
     gated = _compare_report(
-        {"q": 0.5}, [("q", "SPY", None, 10, 0.70)], [], min_samples=20
+        {"q": 0.5}, [("q", "SPY", today, 10, 0.70)], [], min_samples=20
     )
     assert "·" in gated
+
+
+def test_compare_report_auto_column(_enabled):
+    from src.tools.pattern_calibration_refresh import _compare_report
+
+    today = date.today()
+    out = _compare_report(
+        {"a": 0.5, "b": 0.5},
+        # 'a' measured by both (pnl trustworthy ⇒ auto picks P); 'b' touch-only.
+        [("a", "SPY", today, 1000, 0.04), ("b", "SPY", today, 1000, 0.62)],
+        [("a", "SPY", today, 72, 0.585)],
+        min_samples=20,
+    )
+    assert "0.585 P" in out   # auto prefers the trustworthy option_pnl base
+    assert "0.620 T" in out   # auto falls back to touch where no P&L window
+
+
+def test_compare_report_auto_below_gate_falls_back(_enabled):
+    from src.tools.pattern_calibration_refresh import _compare_report
+
+    today = date.today()
+    # option_pnl present but below the gate (n=3) ⇒ auto must not pick it.
+    out = _compare_report(
+        {"a": 0.5},
+        [("a", "SPY", today, 1000, 0.50)],
+        [("a", "SPY", today, 3, 0.90)],
+        min_samples=20,
+    )
+    assert "0.500 T" in out
+    assert "0.900 P" not in out
+
+
+def test_explain_report_outcome_distribution():
+    from types import SimpleNamespace as NS
+    from datetime import datetime
+
+    from src.tools.pattern_calibration_refresh import _explain_report
+
+    # 4 target_hit (1 profitable) + 2 time_exit (1 profitable) — a theta trap:
+    # the pattern hits its target but the option mostly loses money.
+    trades = [
+        NS(seq=i, entered_at=datetime(2026, 5, 1, 10, i), exited_at=None,
+           hold_minutes=30, strike=500, option_type="C", entry_premium=2.0,
+           exit_premium=0.5, contracts=1,
+           net_pnl=(80 if i in (0, 5) else -150),
+           return_pct=(40.0 if i in (0, 5) else -75.0),
+           outcome=("time_exit" if i in (0, 3) else "target_hit"))
+        for i in range(6)
+    ]
+    out = _explain_report(NS(trades=trades), pattern="overnight_trap", underlying="SPY")
+    assert "realized win rate: 2/6" in out
+    assert "target_hit" in out
+    assert "profitable    1 (25%)" in out  # 1 of 4 target_hits made money
+
+
+def test_explain_report_empty():
+    from types import SimpleNamespace as NS
+
+    from src.tools.pattern_calibration_refresh import _explain_report
+
+    out = _explain_report(NS(trades=[]), pattern="pin_risk_premium_sell", underlying="SPY")
+    assert "no priced entries" in out
 
 
 def test_merge_prefer_overlays_preferred():
