@@ -18,8 +18,19 @@
 > (`underlying_touch` (default) | `option_pnl` | `auto`). `auto` prefers
 > `option_pnl` per (pattern, underlying) when it has a trustworthy window and
 > falls back to `underlying_touch` otherwise. Both harnesses run in the nightly
-> refresh; the consult, gates, clamp, and confidence formula are unchanged —
-> only the `base` input source differs.
+> refresh; the consult, gates, and confidence formula are unchanged — only the
+> `base` input source differs.
+>
+> The clamp band is per-source: `option_pnl` has its own
+> `SIGNALS_PATTERN_CALIBRATION_FLOOR_OPTION_PNL` /
+> `…_CEIL_OPTION_PNL` (default = the global `[0.40, 0.85]`), so an operator can
+> give the honest realized-P&L measure a wider band — e.g. a lower floor so a
+> genuinely losing pattern is marked down rather than pinned at 0.40 — without
+> touching the touch-proxy band.
+>
+> Inspect both sources side by side before switching:
+> `make pattern-calibration-compare` (read-only; prints prior vs touch vs
+> option_pnl per pattern, with Δ and a below-sample-gate marker).
 
 ## Problem
 

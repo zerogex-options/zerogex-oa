@@ -39,9 +39,25 @@ from src import config
 logger = logging.getLogger(__name__)
 
 
-def _clamp(value: float) -> float:
-    lo = config.SIGNALS_PATTERN_CALIBRATION_FLOOR
-    hi = config.SIGNALS_PATTERN_CALIBRATION_CEIL
+def _band_for_source(source: Optional[str]) -> tuple[float, float]:
+    """Return the (floor, ceil) clamp band for a measurement source.
+
+    ``option_pnl`` has its own overridable band (defaulting to the global one);
+    every other source uses the global [FLOOR, CEIL].
+    """
+    if source == "option_pnl":
+        return (
+            config.SIGNALS_PATTERN_CALIBRATION_FLOOR_OPTION_PNL,
+            config.SIGNALS_PATTERN_CALIBRATION_CEIL_OPTION_PNL,
+        )
+    return (
+        config.SIGNALS_PATTERN_CALIBRATION_FLOOR,
+        config.SIGNALS_PATTERN_CALIBRATION_CEIL,
+    )
+
+
+def _clamp(value: float, source: Optional[str] = None) -> float:
+    lo, hi = _band_for_source(source)
     return min(max(value, lo), hi)
 
 
@@ -100,13 +116,16 @@ def calibrated_base(pattern_id: str, underlying: str, fallback: float) -> float:
     return value if value is not None else fallback
 
 
-def build_store_from_rows(rows) -> CalibrationStore:
+def build_store_from_rows(rows, *, source: Optional[str] = None) -> CalibrationStore:
     """Construct a :class:`CalibrationStore` from stats rows.
 
     Each row is ``(pattern, underlying, window_end, n_resolved, proposed_base)``
     — the latest window per (pattern, underlying). Rows that fail the
     sample-size or freshness gates are dropped. The pattern-wide fallback is a
     resolved-count-weighted mean of the surviving per-underlying bases.
+
+    ``source`` selects the clamp band (``option_pnl`` has its own overridable
+    band; everything else uses the global one).
     """
     min_samples = config.SIGNALS_PATTERN_CALIBRATION_MIN_SAMPLES
     max_age = timedelta(days=config.SIGNALS_PATTERN_CALIBRATION_MAX_AGE_DAYS)
@@ -121,7 +140,7 @@ def build_store_from_rows(rows) -> CalibrationStore:
             continue
         if window_end is not None and (today - window_end) > max_age:
             continue
-        base = _clamp(float(proposed_base))
+        base = _clamp(float(proposed_base), source)
         key = (pattern, (underlying or "").upper())
         by_pair[key] = base
         agg.setdefault(pattern, []).append((base, int(n_resolved)))
@@ -132,7 +151,7 @@ def build_store_from_rows(rows) -> CalibrationStore:
         if total_n <= 0:
             continue
         by_pattern[pattern] = _clamp(
-            sum(b * n for b, n in samples) / total_n
+            sum(b * n for b, n in samples) / total_n, source
         )
 
     return CalibrationStore(by_pair=by_pair, by_pattern=by_pattern, loaded_at=time.time())
@@ -183,8 +202,12 @@ def load_store(conn) -> CalibrationStore:
     """
     source = config.SIGNALS_PATTERN_CALIBRATION_SOURCE
     if source == "auto":
-        touch = build_store_from_rows(_load_rows(conn, "underlying_touch"))
-        pnl = build_store_from_rows(_load_rows(conn, "option_pnl"))
+        touch = build_store_from_rows(
+            _load_rows(conn, "underlying_touch"), source="underlying_touch"
+        )
+        pnl = build_store_from_rows(
+            _load_rows(conn, "option_pnl"), source="option_pnl"
+        )
         return _merge_prefer(touch, pnl)
     if source not in _VALID_SOURCES:
         logger.warning(
@@ -192,7 +215,7 @@ def load_store(conn) -> CalibrationStore:
             source,
         )
         source = "underlying_touch"
-    return build_store_from_rows(_load_rows(conn, source))
+    return build_store_from_rows(_load_rows(conn, source), source=source)
 
 
 def maybe_refresh(ttl_seconds: Optional[int] = None) -> None:

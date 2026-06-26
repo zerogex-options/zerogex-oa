@@ -3489,6 +3489,12 @@ pattern-calibration-refresh: ## Refresh playbook_pattern_stats + report calibrat
 		$(if $(CALIB_DAYS),--days $(CALIB_DAYS)) \
 		$(if $(CALIB_UNDERLYINGS),--underlyings $(CALIB_UNDERLYINGS))
 
+.PHONY: pattern-calibration-compare
+pattern-calibration-compare: ## Side-by-side of underlying_touch vs option_pnl bases (read-only)
+	@echo "$(BLUE)=== Comparing calibration sources ===$(NC)"
+	@$(PY) -m src.tools.pattern_calibration_refresh --compare \
+		$(if $(CALIB_UNDERLYINGS),--underlyings $(CALIB_UNDERLYINGS))
+
 .PHONY: backtest-worker
 backtest-worker: ## Run the backtest worker (drains queued runs; needs BACKTEST_WORKER_ENABLED=1)
 	@echo "$(BLUE)=== Starting backtest worker ===$(NC)"
