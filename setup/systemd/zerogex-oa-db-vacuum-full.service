@@ -20,15 +20,27 @@ Environment="HOME=/home/ubuntu"
 Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=/home/ubuntu/zerogex-oa/.env
 
-# `db-maintain-managed` stops the four zerogex services, runs
-# `make db-maintain` (prune + VACUUM FULL + REINDEX + ANALYZE), and
-# restarts services on exit (via shell trap, so services come back up
-# even if maintenance fails halfway through).
+# `db-maintain-managed` stops the four zerogex services and runs
+# `make db-maintain` (prune + VACUUM FULL + REINDEX + ANALYZE).  It
+# also installs a shell EXIT trap that restarts services on exit, but
+# that trap is not reliable when systemd kills the unit's cgroup on
+# TimeoutStartSec — see ExecStopPost= below for the real safety net.
 ExecStart=/usr/bin/make db-maintain-managed
 
-# VACUUM FULL on a 20+ GB table can take a while.  Allow up to 90 min
-# before systemd kills the unit.
-TimeoutStartSec=5400
+# Unconditional restart of the four services after the maintenance
+# unit transitions to inactive/failed (success, non-zero exit, OR
+# TimeoutStartSec SIGTERM/SIGKILL).  Belt-and-braces for the Makefile
+# trap, which does not survive a cgroup-wide SIGTERM cleanly — that is
+# what left the platform dark for 8 hours on 2026-06-28.
+# Idempotent: `systemctl start` on already-active units is a no-op.
+ExecStopPost=/usr/bin/systemctl start zerogex-oa-ingestion zerogex-oa-analytics zerogex-oa-signals zerogex-oa-api
+
+# VACUUM FULL + REINDEX across the maintained tables can take several
+# hours on a production-sized chain.  Observed on 2026-06-28: option_chains
+# alone consumed 74 min (41 min VACUUM + 33 min REINDEX); the previous
+# 5400 s budget timed out partway through flow_by_contract.  4 h gives
+# the full pass headroom; bump again if a future run still gets cut off.
+TimeoutStartSec=14400
 
 StandardOutput=journal
 StandardError=journal

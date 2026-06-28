@@ -37,7 +37,11 @@ StartLimitInterval=300
 # Process management
 KillMode=mixed
 KillSignal=SIGTERM
-TimeoutStopSec=30
+# 30 s was too tight: the in-memory bar buffers + DB pool teardown
+# regularly need >30 s during graceful shutdown, which led to SIGKILL
+# (see 2026-06-28 02:35:31 stop-sigterm timeout under the weekly
+# VACUUM FULL).  60 s lets the flush path actually finish.
+TimeoutStopSec=60
 SendSIGKILL=yes
 
 # Resource limits
