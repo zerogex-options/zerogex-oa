@@ -3236,7 +3236,20 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     # ========================================================================
 
     async def get_latest_quote(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
-        """Get latest underlying quote"""
+        """Get latest underlying quote (any session — includes pre/after-hours).
+
+        Returns the most recent bar by timestamp regardless of session, so
+        callers that need raw-feed liveness (e.g. the API soft-close tracker
+        in ``src/api/main.py`` that decides when the AH window has settled)
+        keep seeing every print TradeStation delivers.
+
+        For the user-facing "spot price" callers want, use
+        ``get_latest_in_session_quote`` instead — that one filters to the
+        regular cash session so pre/after-hours drift on ETFs (and the
+        usual 4–8 PM ET extended-hours bars TradeStation streams under the
+        ``Default`` session template) doesn't move the displayed spot away
+        from the canonical 16:00 ET cash close after the bell.
+        """
         symbol = symbol.upper()
         cache_key = f"latest_quote:{symbol}"
         cached = self._cache_get(cache_key)
@@ -3285,6 +3298,86 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 return payload
         except Exception as e:
             logger.error(f"Error fetching latest quote: {e!r}", exc_info=True)
+            raise
+
+    async def get_latest_in_session_quote(
+        self, symbol: str = "SPY"
+    ) -> Optional[Dict[str, Any]]:
+        """Latest underlying quote restricted to the regular cash session.
+
+        Same payload shape as ``get_latest_quote``, but the candidate set is
+        bars whose ET-local timestamp lies inside the regular cash session
+        (09:30–16:00 ET, Mon–Fri). The latest such bar is returned.
+
+        Universal rule, no time-of-day branching:
+
+          * Live (in-session):   latest cash-session bar = the in-progress
+                                 minute bar — same as ``get_latest_quote``.
+          * Pre-market:          last Friday-or-prior 16:00 cash close —
+                                 pre-market drift doesn't move "spot".
+          * After-hours:         today's 16:00 cash close — ETF AH prints
+                                 are kept out of the displayed spot.
+          * Weekend / holiday:   the most recent trading day's 16:00 close.
+          * Half-day (e.g. 13:00 close): the 13:00 bar (still ≤ 16:00 ET).
+
+        Vendor-behavior-agnostic: independent of what TradeStation's
+        ``SESSION_TEMPLATE`` actually delivers — we filter at read time.
+        """
+        symbol = symbol.upper()
+        cache_key = f"latest_in_session_quote:{symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        query = """
+            WITH latest_quote AS (
+                SELECT
+                    uq.timestamp,
+                    uq.symbol,
+                    uq.open,
+                    uq.high,
+                    uq.low,
+                    uq.close
+                FROM underlying_quotes uq
+                WHERE uq.symbol = $1
+                  AND EXTRACT(
+                        DOW FROM (uq.timestamp AT TIME ZONE 'America/New_York')
+                      ) BETWEEN 1 AND 5
+                  AND (uq.timestamp AT TIME ZONE 'America/New_York')::time
+                        >= TIME '09:30'
+                  AND (uq.timestamp AT TIME ZONE 'America/New_York')::time
+                        <= TIME '16:00'
+                ORDER BY uq.timestamp DESC
+                LIMIT 1
+            )
+            SELECT
+                lq.timestamp,
+                lq.symbol,
+                lq.open,
+                lq.high,
+                lq.low,
+                lq.close,
+                COALESCE(udv.cumulative_daily_volume, 0)::bigint AS cumulative_daily_volume,
+                s.asset_type
+            FROM latest_quote lq
+            LEFT JOIN underlying_daily_volume udv
+              ON udv.symbol = lq.symbol
+             AND udv.trade_date_et = (lq.timestamp AT TIME ZONE 'America/New_York')::date
+            LEFT JOIN symbols s ON s.symbol = lq.symbol
+        """
+
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(query, symbol)
+                payload = dict(row) if row else None
+                self._cache_set(
+                    cache_key,
+                    payload,
+                    self._latest_quote_cache_ttl_seconds,
+                )
+                return payload
+        except Exception as e:
+            logger.error(f"Error fetching latest in-session quote: {e!r}", exc_info=True)
             raise
 
     async def get_previous_close(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
