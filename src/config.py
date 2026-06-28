@@ -1052,6 +1052,27 @@ SIGNALS_PATTERN_CALIBRATION_LOOKBACK_DAYS = _getenv_int(
 SIGNALS_PATTERN_CALIBRATION_SOURCE = _getenv_str(
     "SIGNALS_PATTERN_CALIBRATION_SOURCE", "underlying_touch"
 ).strip().lower()
+# Auto-source soft veto: under SOURCE=auto, a (pattern, underlying) pair whose
+# option_pnl window is below MIN_SAMPLES leaves the touch base in place — and
+# the touch proxy can overstate edge (a target/stop hit is not a profitable
+# trade). When the sub-gate pnl reading materially disagrees with touch, the
+# touch base for that pair is dropped so the live consult falls through to the
+# catalog prior. Asymmetric and one-directional: only fires when the touch base
+# is HIGHER than the pnl reading by at least the threshold (the unsafe side —
+# touch under-stating is the conservative direction and is left alone).
+#
+# Threshold is an absolute base-units delta (so 0.15 ≈ 15 percentage points of
+# the [0.0, 1.0] base scale). Set to 0 to disable the veto entirely.
+SIGNALS_PATTERN_CALIBRATION_AUTO_DISAGREEMENT_THRESHOLD = _getenv_float(
+    "SIGNALS_PATTERN_CALIBRATION_AUTO_DISAGREEMENT_THRESHOLD",
+    0.15, min=0.0, max=1.0
+)
+# Minimum option_pnl trades required for the disagreement veto to consider a
+# pair. Below this, a single losing trade could veto an otherwise-good touch
+# base. Set to 0 to disable the veto entirely.
+SIGNALS_PATTERN_CALIBRATION_AUTO_PNL_SOFT_MIN_SAMPLES = _getenv_int(
+    "SIGNALS_PATTERN_CALIBRATION_AUTO_PNL_SOFT_MIN_SAMPLES", 8, min=0
+)
 
 # ---------------------------------------------------------------------------
 # Backtesting platform — signal cooldown / dedup

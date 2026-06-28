@@ -1,6 +1,6 @@
 # Playbook Pattern Calibration — Empirical-Base Feedback Loop
 
-**Status:** shipped (OFF by default) · **Last updated:** 2026-06-22
+**Status:** shipped (OFF by default) · **Last updated:** 2026-06-28
 **Repo:** `zerogex-oa`
 
 > **Data source note:** calibration can feed from either of two measurement
@@ -111,6 +111,33 @@ live:     SignalEngineService.run_cycle ──► calibration.maybe_refresh (TTL
 | Clamp | `…_FLOOR` / `…_CEIL` | `0.40` / `0.85` | Calibrated base bounded to the catalog band. |
 | Reload TTL | `…_REFRESH_SECONDS` | `21600` (6h) | How often the live process reloads. |
 | Backtest window | `…_LOOKBACK_DAYS` | `60` | History each nightly backtest scans. |
+| Auto-veto threshold | `…_AUTO_DISAGREEMENT_THRESHOLD` | `0.15` | Under `source=auto`, a (pattern, underlying) touch base is dropped when it is HIGHER than a sub-gate `option_pnl` reading by this much. Asymmetric: only fires on the unsafe side (touch over-stating). Set to `0` to disable the veto. |
+| Auto-veto min sample | `…_AUTO_PNL_SOFT_MIN_SAMPLES` | `8` | Minimum `option_pnl` trades for the veto to fire; below this a single trade could veto an otherwise-good touch base. Set to `0` to disable the veto. |
+
+### Auto-source disagreement veto
+
+Under `SIGNALS_PATTERN_CALIBRATION_SOURCE=auto`, the live store prefers
+`option_pnl` per (pattern, underlying) when its window passes `MIN_SAMPLES`, and
+otherwise falls back to `underlying_touch`. The touch proxy can over-state edge
+— a target/stop hit is not a profitable trade — so a pair with `touch n=40 at
+0.85` and a sub-gate `option_pnl n=10 at 0.30` would currently leave the
+inflated touch base in place under `auto`.
+
+The veto closes that hole. When a sub-gate `option_pnl` reading meets the soft
+sample minimum AND is at least `AUTO_DISAGREEMENT_THRESHOLD` lower than the
+clamped touch base for the same pair, the touch base for that pair is dropped
+before the merge. The live consult then falls through to the pattern-wide
+cross-underlying mean (computed from non-vetoed samples) or the catalog prior —
+preserving "conservative by construction": we never *replace* touch with thin
+pnl, but we refuse to *use* a touch base the honest measure visibly contradicts.
+
+The veto is **one-directional**: touch *under-rating* relative to pnl is the
+conservative side and is left alone. The veto fires only on `touch − pnl ≥
+threshold` (post-clamp on each side's own band).
+
+`make pattern-calibration-compare` honors the same veto: the `auto→` column
+shows `0.X v` (pattern-wide fall-through after veto) or `veto→prior`, and a
+footer line lists every vetoed pair.
 
 ## Rollout
 
@@ -122,11 +149,19 @@ live:     SignalEngineService.run_cycle ──► calibration.maybe_refresh (TTL
    measured edge on the next reload; no code change or restart logic required.
 3. To revert instantly, set it back to `0`.
 
+> **Go-live caveat.** Under `source=auto`, pairs whose `option_pnl` window is
+> just below the `MIN_SAMPLES` gate fall back to the touch base, and touch can
+> over-state edge. Before flipping `ENABLED=1`, run
+> `make pattern-calibration-compare` and confirm the patterns you care about
+> clear the gate on `option_pnl` (or that the auto-disagreement veto fires on
+> any inflated touch pairs you'd otherwise inherit — vetoed pairs appear with
+> `v` in the `auto→` column and in the footer list).
+
 ## Notes
 
-- v1 feeds calibration from the **underlying-touch** harness
-  (`playbook/backtest.py`), the conservative, reviewed measurement. The new
-  leg-level platform (`src/backtesting/`) can later write into the same stats
-  table to drive calibration from realized option P&L instead.
+- Both measurement harnesses (`underlying_touch` and `option_pnl`) write into
+  `playbook_pattern_stats`, tagged by `source`. The live store picks one (or
+  merges both under `auto`) via `SIGNALS_PATTERN_CALIBRATION_SOURCE`. The
+  consult, gates, and confidence formula are unchanged.
 - Calibration changes the *base*; confluence and regime_fit multipliers are
   untouched, and the final `[0.20, 0.95]` confidence clamp still applies.

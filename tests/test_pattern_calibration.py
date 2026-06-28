@@ -323,3 +323,174 @@ def test_merge_prefer_overlays_preferred():
     assert merged.by_pair[("a", "SPY")] == 0.8   # preferred wins
     assert merged.by_pair[("b", "SPY")] == 0.6   # base retained
     assert merged.by_pattern["a"] == 0.8
+
+
+# ----------------------------------------------------------------------
+# Auto-source soft-pnl disagreement veto
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def _veto_defaults(monkeypatch):
+    """Veto enabled with documented defaults — covers the live config path."""
+    monkeypatch.setattr(
+        config, "SIGNALS_PATTERN_CALIBRATION_AUTO_DISAGREEMENT_THRESHOLD", 0.15
+    )
+    monkeypatch.setattr(
+        config, "SIGNALS_PATTERN_CALIBRATION_AUTO_PNL_SOFT_MIN_SAMPLES", 8
+    )
+
+
+def test_auto_vetoed_pairs_drops_inflated_touch(_enabled, _veto_defaults):
+    # The caveat case: touch n=40 gives 0.850 (inflated), option_pnl n=10
+    # (below the hard gate of 20) gives 0.30 — a 0.55 disagreement. Veto.
+    touch_rows = [_row("p", "SPX", 1, 40, 0.85)]
+    pnl_rows = [_row("p", "SPX", 1, 10, 0.30)]
+    assert cal.auto_vetoed_pairs(touch_rows, pnl_rows) == {("p", "SPX")}
+
+
+def test_auto_vetoed_pairs_respects_soft_min(_enabled, _veto_defaults):
+    # Same disagreement, but pnl n=3 — below the soft minimum, single trade
+    # would have outsized weight, so no veto.
+    touch_rows = [_row("p", "SPX", 1, 40, 0.85)]
+    pnl_rows = [_row("p", "SPX", 1, 3, 0.30)]
+    assert cal.auto_vetoed_pairs(touch_rows, pnl_rows) == set()
+
+
+def test_auto_vetoed_pairs_is_one_directional(_enabled, _veto_defaults):
+    # Touch UNDER-rates the pattern relative to pnl — the safe direction
+    # (lower confidence). No veto; touch base stays.
+    touch_rows = [_row("p", "SPY", 1, 40, 0.40)]
+    pnl_rows = [_row("p", "SPY", 1, 10, 0.80)]
+    assert cal.auto_vetoed_pairs(touch_rows, pnl_rows) == set()
+
+
+def test_auto_vetoed_pairs_respects_threshold(_enabled, _veto_defaults):
+    # Disagreement under the threshold (post-clamp) — no veto. Touch 0.55
+    # vs pnl 0.45 = 0.10 < 0.15 threshold.
+    touch_rows = [_row("p", "SPY", 1, 40, 0.55)]
+    pnl_rows = [_row("p", "SPY", 1, 10, 0.45)]
+    assert cal.auto_vetoed_pairs(touch_rows, pnl_rows) == set()
+
+
+def test_auto_vetoed_pairs_skips_stale_pnl(_enabled, _veto_defaults):
+    # A six-month-old pnl row shouldn't be allowed to veto a fresh touch reading
+    # — its window is stale by the same MAX_AGE_DAYS gate the store uses.
+    touch_rows = [_row("p", "SPY", 1, 40, 0.85)]
+    pnl_rows = [_row("p", "SPY", 200, 10, 0.30)]
+    assert cal.auto_vetoed_pairs(touch_rows, pnl_rows) == set()
+
+
+def test_auto_vetoed_pairs_disabled_when_threshold_zero(_enabled, monkeypatch):
+    monkeypatch.setattr(
+        config, "SIGNALS_PATTERN_CALIBRATION_AUTO_DISAGREEMENT_THRESHOLD", 0.0
+    )
+    monkeypatch.setattr(
+        config, "SIGNALS_PATTERN_CALIBRATION_AUTO_PNL_SOFT_MIN_SAMPLES", 8
+    )
+    touch_rows = [_row("p", "SPY", 1, 40, 0.85)]
+    pnl_rows = [_row("p", "SPY", 1, 50, 0.30)]
+    assert cal.auto_vetoed_pairs(touch_rows, pnl_rows) == set()
+
+
+def test_auto_vetoed_pairs_disabled_when_soft_min_zero(_enabled, monkeypatch):
+    monkeypatch.setattr(
+        config, "SIGNALS_PATTERN_CALIBRATION_AUTO_DISAGREEMENT_THRESHOLD", 0.15
+    )
+    monkeypatch.setattr(
+        config, "SIGNALS_PATTERN_CALIBRATION_AUTO_PNL_SOFT_MIN_SAMPLES", 0
+    )
+    touch_rows = [_row("p", "SPY", 1, 40, 0.85)]
+    pnl_rows = [_row("p", "SPY", 1, 50, 0.30)]
+    assert cal.auto_vetoed_pairs(touch_rows, pnl_rows) == set()
+
+
+def test_build_store_honors_exclude_pairs(_enabled):
+    # Vetoed pair must drop out of both by_pair AND the by_pattern weighted mean
+    # — otherwise the touch overshoot leaks through the pattern-wide fallback.
+    rows = [
+        _row("p", "SPY", 1, 40, 0.50),
+        _row("p", "SPX", 1, 40, 0.85),
+    ]
+    full = cal.build_store_from_rows(rows, source="underlying_touch")
+    assert full.by_pair[("p", "SPX")] == pytest.approx(0.85)
+    excluded = cal.build_store_from_rows(
+        rows, source="underlying_touch", exclude_pairs={("p", "SPX")}
+    )
+    assert ("p", "SPX") not in excluded.by_pair
+    # by_pattern weighted mean now reflects only the non-vetoed SPY sample.
+    assert excluded.by_pattern["p"] == pytest.approx(0.50)
+
+
+def test_load_store_auto_vetoes_inflated_touch_pair(
+    monkeypatch, _enabled, _veto_defaults
+):
+    monkeypatch.setattr(config, "SIGNALS_PATTERN_CALIBRATION_SOURCE", "auto")
+    conn = _Conn(
+        {
+            # SPX: inflated touch (n=40) vs sub-gate pnl that strongly disagrees
+            #      ⇒ vetoed. Live falls through to the pattern-wide / prior.
+            # SPY: pnl is hard-gated and provides its own honest reading ⇒
+            #      pnl wins on the merge as today.
+            "underlying_touch": [
+                _row("p", "SPX", 1, 40, 0.85),
+                _row("p", "SPY", 1, 40, 0.62),
+            ],
+            "option_pnl": [
+                _row("p", "SPX", 1, 10, 0.30),     # sub-gate disagreement
+                _row("p", "SPY", 1, 40, 0.55),     # hard-gated
+            ],
+        }
+    )
+    store = cal.load_store(conn)
+    # SPX touch base is gone; SPY pnl base remains.
+    assert ("p", "SPX") not in store.by_pair
+    assert store.by_pair[("p", "SPY")] == pytest.approx(0.55)
+    # Merge prefers pnl by_pattern (the hard-gated SPY pnl row), so the
+    # cross-underlying fallback reflects the honest pnl measurement, not the
+    # vetoed touch overshoot. (build_store_from_rows already excluded SPX from
+    # touch.by_pattern as well — verified by test_build_store_honors_exclude_pairs.)
+    assert store.by_pattern["p"] == pytest.approx(0.55)
+
+
+def test_compare_report_auto_veto_marker(_enabled, _veto_defaults):
+    from src.tools.pattern_calibration_refresh import _compare_report
+
+    today = date.today()
+    out = _compare_report(
+        {"p": 0.5},
+        # touch n=40 at 0.85 (inflated)
+        [("p", "SPX", today, 40, 0.85)],
+        # sub-gate pnl at 0.30 — 0.55 disagreement, veto fires
+        [("p", "SPX", today, 10, 0.30)],
+        min_samples=20,
+    )
+    # Auto column shows 'veto→prior' (no pattern-wide fallback in this fixture).
+    assert "veto" in out
+    # The auto-veto footer summarizes which pairs were dropped.
+    assert "p/SPX" in out
+    assert "auto-veto" in out
+
+
+def test_compare_report_no_veto_marker_when_disabled(_enabled, monkeypatch):
+    from src.tools.pattern_calibration_refresh import _compare_report
+
+    monkeypatch.setattr(
+        config, "SIGNALS_PATTERN_CALIBRATION_AUTO_DISAGREEMENT_THRESHOLD", 0.0
+    )
+    monkeypatch.setattr(
+        config, "SIGNALS_PATTERN_CALIBRATION_AUTO_PNL_SOFT_MIN_SAMPLES", 8
+    )
+    today = date.today()
+    out = _compare_report(
+        {"p": 0.5},
+        [("p", "SPX", today, 40, 0.85)],
+        [("p", "SPX", today, 10, 0.30)],
+        min_samples=20,
+    )
+    # With the veto off, the inflated touch base comes through unchanged.
+    assert "0.850 T" in out
+    # The legend line always mentions the v marker, but with no vetoes fired
+    # the per-pair veto cell and the dropped-pairs footer must both be absent.
+    assert "veto→prior" not in out
+    assert "touch pair(s) dropped" not in out

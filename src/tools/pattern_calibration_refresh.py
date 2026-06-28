@@ -30,6 +30,7 @@ import logging
 import sys
 from typing import Optional
 
+from src import config
 from src.config import (
     SIGNALS_PATTERN_CALIBRATION_LOOKBACK_DAYS,
     SIGNALS_PATTERN_CALIBRATION_MIN_SAMPLES,
@@ -90,7 +91,9 @@ def _compare_report(
     back to the prior), Δ = option_pnl − underlying_touch where both exist, and
     the value the live engine would actually use under ``source=auto`` (the
     gated + clamped base, tagged by which source won: P=option_pnl, T=touch,
-    w=pattern-wide fallback, or 'prior' when nothing trustworthy exists).
+    w=pattern-wide fallback, v=touch was vetoed by a sub-gate pnl disagreement
+    so the value shown is the pattern-wide fall-through, or 'prior' when
+    nothing trustworthy exists).
     """
     def _index(rows):
         # rows: (pattern, underlying, window_end, n_resolved, proposed_base)
@@ -102,13 +105,22 @@ def _compare_report(
     touch = _index(touch_rows)
     pnl = _index(pnl_rows)
 
-    # What 'auto' would resolve to: the gated + clamped, P&L-preferred store.
+    # What 'auto' would resolve to: the gated + clamped, P&L-preferred store
+    # — with the soft-pnl disagreement veto applied, matching load_store().
+    vetoed = pattern_calibration.auto_vetoed_pairs(touch_rows, pnl_rows)
     touch_store = pattern_calibration.build_store_from_rows(
-        touch_rows, source="underlying_touch"
+        touch_rows, source="underlying_touch", exclude_pairs=vetoed,
     )
     pnl_store = pattern_calibration.build_store_from_rows(pnl_rows, source="option_pnl")
 
     def _auto_cell(pattern, key) -> str:
+        if key in vetoed:
+            # Touch reading for this pair was suppressed; live falls through to
+            # the pattern-wide cross-underlying mean (or the prior).
+            wide = pnl_store.by_pattern.get(pattern, touch_store.by_pattern.get(pattern))
+            if wide is not None:
+                return f"{wide:.3f} v"
+            return "veto→prior"
         if key in pnl_store.by_pair:
             return f"{pnl_store.by_pair[key]:.3f} P"
         if key in touch_store.by_pair:
@@ -129,7 +141,7 @@ def _compare_report(
     lines = [
         "",
         "Calibration sources — underlying_touch vs option_pnl "
-        f"(· = below {min_samples}-sample gate):",
+        f"(· = below {min_samples}-sample gate; v = auto-veto):",
         f"  {'pattern':<30}{'undl':<6}{'prior':>7}  "
         f"{'touch (n)':>13}  {'option_pnl (n)':>14}  {'Δ(pnl−touch)':>12}  "
         f"{'auto→':>11}",
@@ -147,6 +159,14 @@ def _compare_report(
             f"  {pattern:<30}{undl:<6}{prior_s:>7}  "
             f"{_cell(t):>13}  {_cell(p):>14}  {delta_s:>12}  "
             f"{_auto_cell(pattern, key):>11}"
+        )
+    if vetoed:
+        lines.append(
+            f"\n  auto-veto: {len(vetoed)} touch pair(s) dropped on "
+            f"sub-gate pnl disagreement "
+            f"(≥{config.SIGNALS_PATTERN_CALIBRATION_AUTO_DISAGREEMENT_THRESHOLD:.2f}, "
+            f"n≥{config.SIGNALS_PATTERN_CALIBRATION_AUTO_PNL_SOFT_MIN_SAMPLES}): "
+            f"{', '.join(f'{p}/{u}' for p, u in sorted(vetoed))}"
         )
     return "\n".join(lines)
 
