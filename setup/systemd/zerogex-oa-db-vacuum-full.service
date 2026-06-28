@@ -3,6 +3,13 @@ Description=ZeroGEX weekly full DB maintenance (VACUUM FULL + REINDEX)
 Documentation=https://github.com/zerogex-options/zerogex-oa
 After=network-online.target
 
+# Alert on failure (non-zero exit OR TimeoutStartSec timeout).  Without
+# this, the 2026-06-28 04:04:30 timeout fired no direct alert — we only
+# noticed via collateral OnFailure= from the SIGKILLed child services.
+# This wires the maintenance unit's own failure straight to the
+# dispatcher so the next timeout (or any future failure) pages directly.
+OnFailure=zerogex-alert@%n.service
+
 [Service]
 Type=oneshot
 User=root
