@@ -1060,27 +1060,32 @@ class SignalsQueriesMixin:
             logger.warning("get_signal_history failed (%s, %s): %s", symbol, component_name, exc)
             return []
 
-    async def insert_action_card(self, card: Dict[str, Any]) -> None:
+    async def insert_action_card(self, card: Dict[str, Any]) -> Optional[int]:
         """Persist a non-STAND_DOWN Action Card.
 
         Caller passes ``card.to_dict()`` from the Playbook engine.  Failures
         are logged but never raised — persistence is best-effort and should
         not break the API response path.
+
+        Returns the inserted row's ``id`` on a fresh write, or the existing
+        row's ``id`` when the idempotency guard matches a recently-persisted
+        duplicate (same underlying / pattern / timestamp).  Returns ``None``
+        for STAND_DOWN cards, malformed payloads, or any DB error.
         """
         if not card or card.get("action") == "STAND_DOWN":
-            return
+            return None
         ts = card.get("timestamp")
         if isinstance(ts, str):
             try:
                 ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
             except ValueError:
                 logger.warning("insert_action_card: bad timestamp %r", ts)
-                return
+                return None
         if ts is None:
-            return
+            return None
         try:
             async with self._acquire_connection() as conn:
-                await conn.execute(
+                inserted_id = await conn.fetchval(
                     """
                     INSERT INTO signal_action_cards
                         (underlying, timestamp, pattern, action, tier,
@@ -1110,6 +1115,7 @@ class SignalsQueriesMixin:
                           AND pattern = $3::varchar
                           AND timestamp = $2::timestamptz
                     )
+                    RETURNING id
                     """,
                     card.get("underlying"),
                     ts,
@@ -1120,9 +1126,29 @@ class SignalsQueriesMixin:
                     float(card.get("confidence") or 0.0),
                     json.dumps(card, default=str),
                 )
+                if inserted_id is not None:
+                    return int(inserted_id)
+                # Idempotency guard matched — return the existing row's id so
+                # the live API response can still expose a stable permalink for
+                # the same logical card.
+                existing_id = await conn.fetchval(
+                    """
+                    SELECT id FROM signal_action_cards
+                    WHERE underlying = $1::varchar
+                      AND pattern = $2::varchar
+                      AND timestamp = $3::timestamptz
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    card.get("underlying"),
+                    card.get("pattern"),
+                    ts,
+                )
+                return int(existing_id) if existing_id is not None else None
         except Exception as exc:
             # Best-effort — don't surface persistence errors to API callers.
             logger.warning("insert_action_card failed (%s): %s", card.get("pattern"), exc)
+            return None
 
     async def get_recent_action_cards(
         self, underlying: str, since_minutes: int = 90
@@ -1149,4 +1175,119 @@ class SignalsQueriesMixin:
                 return [dict(r) for r in rows]
         except Exception as exc:
             logger.warning("get_recent_action_cards failed (%s): %s", underlying, exc)
+            return []
+
+    async def get_action_card_by_id(self, card_id: int) -> Optional[Dict[str, Any]]:
+        """Return a single persisted Action Card by primary key.
+
+        Returns the full ``payload`` (the Card's ``to_dict()`` form) plus the
+        row's ``id`` and ``created_at`` so callers can build stable permalinks.
+        Returns ``None`` if no row matches.
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, underlying, timestamp, pattern, action, tier,
+                           direction, confidence, payload, created_at
+                    FROM signal_action_cards
+                    WHERE id = $1
+                    """,
+                    int(card_id),
+                )
+                if row is None:
+                    return None
+                payload = row["payload"]
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except json.JSONDecodeError:
+                        payload = {}
+                payload = dict(payload or {})
+                payload["id"] = int(row["id"])
+                payload["created_at"] = row["created_at"]
+                # Normalize a few top-level fields in case the payload was
+                # written by an older engine version that omitted them.
+                payload.setdefault("underlying", row["underlying"])
+                payload.setdefault("timestamp", row["timestamp"])
+                payload.setdefault("pattern", row["pattern"])
+                payload.setdefault("action", row["action"])
+                payload.setdefault("tier", row["tier"])
+                payload.setdefault("direction", row["direction"])
+                payload.setdefault("confidence", float(row["confidence"]))
+                return payload
+        except Exception as exc:
+            logger.warning("get_action_card_by_id failed (%s): %s", card_id, exc)
+            return None
+
+    async def get_action_cards_chronological(
+        self,
+        underlying: Optional[str] = None,
+        limit: int = 50,
+        since_hours: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Chronological list of persisted Action Cards for the public feed.
+
+        Unlike ``get_recent_action_cards`` (which DISTINCT-ONs per pattern for
+        hysteresis bookkeeping), this returns every row newest-first so the
+        site can paginate the full history without collapsing duplicates.
+
+        ``underlying`` filters to one symbol; ``since_hours`` restricts to a
+        rolling window (default: no restriction, just the ``limit`` rows).
+        """
+        params: List[Any] = []
+        where_parts: List[str] = []
+        if underlying:
+            params.append(underlying)
+            where_parts.append(f"underlying = ${len(params)}")
+        if since_hours is not None and since_hours > 0:
+            params.append(int(since_hours))
+            where_parts.append(
+                f"timestamp > NOW() - (${len(params)}::int * INTERVAL '1 hour')"
+            )
+        where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+        params.append(int(limit))
+        limit_placeholder = f"${len(params)}"
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    f"""
+                    SELECT id, underlying, timestamp, pattern, action, tier,
+                           direction, confidence, payload, created_at
+                    FROM signal_action_cards
+                    {where_clause}
+                    ORDER BY timestamp DESC
+                    LIMIT {limit_placeholder}
+                    """,
+                    *params,
+                )
+                out: List[Dict[str, Any]] = []
+                for r in rows:
+                    payload = r["payload"]
+                    if isinstance(payload, str):
+                        try:
+                            payload = json.loads(payload)
+                        except json.JSONDecodeError:
+                            payload = {}
+                    out.append(
+                        {
+                            "id": int(r["id"]),
+                            "underlying": r["underlying"],
+                            "timestamp": r["timestamp"],
+                            "pattern": r["pattern"],
+                            "action": r["action"],
+                            "tier": r["tier"],
+                            "direction": r["direction"],
+                            "confidence": float(r["confidence"]),
+                            "created_at": r["created_at"],
+                            "rationale": (payload or {}).get("rationale"),
+                        }
+                    )
+                return out
+        except Exception as exc:
+            logger.warning(
+                "get_action_cards_chronological failed (underlying=%s): %s",
+                underlying,
+                exc,
+            )
             return []
