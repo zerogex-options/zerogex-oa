@@ -55,6 +55,7 @@ from .routers.gex_flip_horizon import router as gex_flip_horizon_router
 from .routers.backtest import router as backtest_router
 from .routers.scorecard import router as scorecard_router
 from .routers.forecast import router as forecast_router
+from .routers.replay import router as replay_router
 
 # Logging is configured centrally in src.utils.logging; importing
 # get_logger triggers _configure_logging which honors LOG_LEVEL and
@@ -318,6 +319,10 @@ app.include_router(scorecard_router, dependencies=[_scope_signals])
 # public /forecast/{date} page. Read-only here; the writer cron jobs live
 # in src.jobs.forecast_writer and src.jobs.forecast_receipt.
 app.include_router(forecast_router, dependencies=[_scope_signals])
+# GEX Replay — scrubbable per-minute frames over historical gex_summary +
+# gex_by_strike data. Read-only; no new ingestion. Scope matches the rest
+# of the GEX surface (basic + pro tiers).
+app.include_router(replay_router, dependencies=[_scope_gex])
 
 # ============================================================================
 # Health Check
