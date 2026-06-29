@@ -99,6 +99,19 @@ def close_db_connection(conn):
                 # to the pool (this can hold locks and bloat table churn).
                 conn.rollback()
                 logger.warning("Rolled back open transaction before returning DB connection")
+            # Reset session-level state that callers may have set on this
+            # conn (e.g. ``runner.execute_run`` and ``worker.py`` set
+            # ``conn.autocommit = True`` for their lifetime so per-statement
+            # writes are immediately visible to API polls). Without this
+            # reset the flag persists on the pooled conn, and the next
+            # checkout — usually a reader expecting transactional
+            # semantics — silently inherits autocommit. That makes
+            # behavior dependent on pool-checkout order rather than on the
+            # caller's own code. ``autocommit=False`` is psycopg2's
+            # default, so resetting here normalizes every checkout to a
+            # known starting state.
+            if getattr(conn, "autocommit", False):
+                conn.autocommit = False
         except Exception:
             logger.warning("DB connection unusable during pool return; discarding", exc_info=True)
             discard = True

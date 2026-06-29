@@ -165,7 +165,12 @@ def test_update_owner_sets_name_and_spec(patched):
 def test_update_foreign_owner_returns_none(patched):
     conn = patched([("alice",)])
     assert configs_mod.update_config(1, end_user="mallory", name="x") is None
-    assert all("UPDATE" not in e[0] for e in conn._cur.executed)
+    # The ownership SELECT now uses ``FOR UPDATE`` to lock the row across
+    # the check+write (configs.update_config docstring explains the race).
+    # The previous ``"UPDATE" not in e[0]`` substring check would now
+    # spuriously match the row-lock clause, so assert the actual UPDATE
+    # statement on the ``backtest_configs`` table never ran instead.
+    assert all("UPDATE backtest_configs SET" not in e[0] for e in conn._cur.executed)
 
 
 def test_shared_lookup_by_token(patched):
