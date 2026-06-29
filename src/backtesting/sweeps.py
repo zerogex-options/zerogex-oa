@@ -21,7 +21,7 @@ from typing import Optional
 
 from src.backtesting.models import BacktestSpec, SpecError
 from src.backtesting.runner import create_run
-from src.database.connection import close_db_connection, get_db_connection
+from src.database.connection import close_db_connection, db_connection, get_db_connection
 
 # Flat axis key -> dotted path into the spec dict produced by ``to_dict``.
 # ``strategy.*`` keys only apply when the base spec carries a ``strategy`` block.
@@ -194,8 +194,7 @@ def _summary_metric(summary: Optional[dict]) -> Optional[dict]:
 
 def get_sweep(sweep_id: int, *, end_user: Optional[str]) -> Optional[dict]:
     """Sweep header + per-cell run status/metrics, scoped to its owner."""
-    conn = get_db_connection()
-    try:
+    with db_connection() as conn:
         cur = conn.cursor()
         cur.execute(
             "SELECT id, underlying, axes, n_cells, created_at, end_user "
@@ -235,14 +234,11 @@ def get_sweep(sweep_id: int, *, end_user: Optional[str]) -> Optional[dict]:
             "completed": done,
             "status": "completed" if done == len(cells) and cells else "running",
         }
-    finally:
-        close_db_connection(conn)
 
 
 def list_sweeps(*, end_user: Optional[str], limit: int = 25) -> list[dict]:
     """Recent sweeps for this end-user (or the anonymous pool)."""
-    conn = get_db_connection()
-    try:
+    with db_connection() as conn:
         cur = conn.cursor()
         if end_user:
             cur.execute(
@@ -266,5 +262,3 @@ def list_sweeps(*, end_user: Optional[str], limit: int = 25) -> list[dict]:
             }
             for r in cur.fetchall()
         ]
-    finally:
-        close_db_connection(conn)

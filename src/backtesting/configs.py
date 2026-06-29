@@ -19,7 +19,7 @@ import json
 import secrets
 from typing import Optional
 
-from src.database.connection import close_db_connection, get_db_connection
+from src.database.connection import close_db_connection, db_connection, get_db_connection
 
 
 def _new_share_token() -> str:
@@ -63,8 +63,7 @@ def save_config(spec_dict: dict, *, name: str, underlying: str,
 
 def list_configs(*, end_user: Optional[str], limit: int = 100) -> list[dict]:
     """Saved configs for this end-user (or the anonymous pool when unauthenticated)."""
-    conn = get_db_connection()
-    try:
+    with db_connection() as conn:
         cur = conn.cursor()
         if end_user:
             cur.execute(
@@ -79,14 +78,11 @@ def list_configs(*, end_user: Optional[str], limit: int = 100) -> list[dict]:
                 (limit,),
             )
         return [_row_to_summary(r) for r in cur.fetchall()]
-    finally:
-        close_db_connection(conn)
 
 
 def get_config(config_id: int, *, end_user: Optional[str]) -> Optional[dict]:
     """Fetch one config (incl. spec), scoped to its owner. None if absent/foreign."""
-    conn = get_db_connection()
-    try:
+    with db_connection() as conn:
         cur = conn.cursor()
         cur.execute(
             f"SELECT {_SUMMARY_COLS}, spec, end_user FROM backtest_configs WHERE id = %s",
@@ -101,8 +97,6 @@ def get_config(config_id: int, *, end_user: Optional[str]) -> Optional[dict]:
         out = _row_to_summary(row)
         out["spec"] = row[6]
         return out
-    finally:
-        close_db_connection(conn)
 
 
 def update_config(config_id: int, *, end_user: Optional[str],
@@ -169,8 +163,7 @@ def get_shared_config(share_token: str) -> Optional[dict]:
     No owner scoping — possession of the token is the authorization. Only the
     fields needed to clone the config into a fresh form are returned.
     """
-    conn = get_db_connection()
-    try:
+    with db_connection() as conn:
         cur = conn.cursor()
         cur.execute(
             "SELECT name, underlying, spec FROM backtest_configs WHERE share_token = %s",
@@ -180,5 +173,3 @@ def get_shared_config(share_token: str) -> Optional[dict]:
         if row is None:
             return None
         return {"name": row[0], "underlying": row[1], "spec": row[2]}
-    finally:
-        close_db_connection(conn)
