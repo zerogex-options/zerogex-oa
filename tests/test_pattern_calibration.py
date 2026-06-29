@@ -472,6 +472,29 @@ def test_compare_report_auto_veto_marker(_enabled, _veto_defaults):
     assert "auto-veto" in out
 
 
+def test_compare_report_pnl_wins_display_even_when_pair_vetoed(
+    _enabled, _veto_defaults
+):
+    from src.tools.pattern_calibration_refresh import _compare_report
+
+    today = date.today()
+    # touch overshoots inflated; pnl is HARD-gated AND disagrees by a lot.
+    # The veto fires (touch removed from by_pair), but pnl's pair entry wins
+    # on the merge anyway, so the auto cell must show 'P' (the value live
+    # actually returns) — NOT a misleading by_pattern fall-through 'v'.
+    out = _compare_report(
+        {"p": 0.5},
+        [("p", "SPY", today, 100, 0.85)],
+        [("p", "SPY", today, 60, 0.30)],     # n=60 ≥ MIN_SAMPLES=20
+        min_samples=20,
+    )
+    assert "0.400 P" in out          # pnl 0.30 clamped to the global floor 0.40
+    assert "0.400 v" not in out      # the veto did not fall through here
+    # The footer still records that the veto fired (its by_pattern effect ran).
+    assert "p/SPY" in out
+    assert "auto-veto" in out
+
+
 def test_compare_report_no_veto_marker_when_disabled(_enabled, monkeypatch):
     from src.tools.pattern_calibration_refresh import _compare_report
 

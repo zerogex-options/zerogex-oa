@@ -114,15 +114,21 @@ def _compare_report(
     pnl_store = pattern_calibration.build_store_from_rows(pnl_rows, source="option_pnl")
 
     def _auto_cell(pattern, key) -> str:
+        # Match live load_store(): pnl per-pair entry wins on the merge whether
+        # or not the touch base for this pair was vetoed. A veto whose pair has
+        # a hard-gated pnl reading is effectively a no-op for the by_pair store
+        # (its only effect is on the cross-underlying by_pattern fallback) — so
+        # we must NOT pretend the live consult fell through to that fallback.
+        if key in pnl_store.by_pair:
+            return f"{pnl_store.by_pair[key]:.3f} P"
         if key in vetoed:
-            # Touch reading for this pair was suppressed; live falls through to
-            # the pattern-wide cross-underlying mean (or the prior).
+            # Touch was suppressed and pnl isn't hard-gated for this pair, so
+            # the live consult genuinely falls through to the cross-underlying
+            # pattern-wide mean — or the catalog prior if even that is absent.
             wide = pnl_store.by_pattern.get(pattern, touch_store.by_pattern.get(pattern))
             if wide is not None:
                 return f"{wide:.3f} v"
             return "veto→prior"
-        if key in pnl_store.by_pair:
-            return f"{pnl_store.by_pair[key]:.3f} P"
         if key in touch_store.by_pair:
             return f"{touch_store.by_pair[key]:.3f} T"
         wide = pnl_store.by_pattern.get(pattern, touch_store.by_pattern.get(pattern))
