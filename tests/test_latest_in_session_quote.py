@@ -300,3 +300,70 @@ def test_cache_hit_short_circuits_db():
     assert first == row
     assert second == row
     assert len(conn.queries) == 1
+
+
+# ---------------------------------------------------------------------------
+# Other consumers of the 16:00 cash close must use the SAME asset-aware rule
+# ---------------------------------------------------------------------------
+#
+# Header.tsx (and every page mirroring its price-change summary via
+# ``getPrimaryPriceChangeSummary``) displays ``current_session_close`` from
+# ``/api/market/session-closes`` as the headline price during after-hours,
+# pre-market, weekends, and holidays — NOT the live ``/api/market/quote``
+# value. If ``get_session_closes`` returns the AH-contaminated 16:00 ``close``
+# while ``get_latest_in_session_quote`` returns the auction-print ``open``,
+# the header drifts away from the cash close while the live-RTH read remains
+# correct, and the fix appears not to work even after a hard refresh.
+# Same applies to ``get_previous_close``, which feeds the prior-day anchor
+# used by % change calculations.
+#
+# Pin both to the same rule below.
+
+
+def _captured_conn(db, fn_name, fetchrow_result=None):
+    """Run an async DB method against a fresh mock conn and return the
+    captured SQL string for assertion."""
+    conn = _RecordingConn(fetchrow_result=fetchrow_result)
+    _install_conn(db, conn)
+    asyncio.run(getattr(db, fn_name)("SPY"))
+    return conn.queries[0]
+
+
+def test_get_session_closes_uses_asset_aware_close_for_1600_bar():
+    """``current_session_close`` and ``prior_session_close`` are returned by
+    this query and drive the header price in the AH/closed/weekend states.
+    Must use the same CASE the live-quote endpoint uses: 16:00 bar OPEN for
+    non-INDEX, CLOSE for INDEX. Without this fix the header keeps showing
+    AH-contaminated prices (the original bug) even after the live-quote
+    endpoint is fixed."""
+    db = _new_db()
+    sql = _captured_conn(db, "get_session_closes")
+
+    # Inside the session_closes CTE the SELECT now uses a CASE, not raw close.
+    assert "CASE" in sql
+    assert "TIME '16:00'" in sql
+    assert "IS DISTINCT FROM 'INDEX'" in sql
+    assert "THEN uq.open" in sql
+    assert "ELSE uq.close" in sql
+
+    # The symbols table must be joined so asset_type is in scope of the CASE.
+    assert "LEFT JOIN symbols s" in sql
+
+
+def test_get_previous_close_uses_asset_aware_close_for_1600_bar():
+    """The prior-day anchor used by % change calculations must follow the
+    same rule. Both the primary 16:00-exact CTE and the nearest-to-16:00
+    fallback CTE need the CASE, since either can produce the returned
+    ``previous_close`` depending on whether the exact bar exists."""
+    db = _new_db()
+    sql = _captured_conn(db, "get_previous_close")
+
+    # CASE appears in both CTEs; the predicate is asset-type aware.
+    assert sql.count("CASE") >= 2
+    assert "IS DISTINCT FROM 'INDEX'" in sql
+
+    # The primary CTE doesn't need the time predicate because the WHERE
+    # already pins HOUR=16 AND MINUTE=0; the nearest-close CTE does need it
+    # to scope the OPEN substitution to the 16:00 bar specifically.
+    assert "= TIME '16:00'" in sql  # in the nearest_close CTE
+    assert "LEFT JOIN symbols s" in sql

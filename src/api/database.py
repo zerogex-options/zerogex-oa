@@ -3425,32 +3425,57 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         """
         Get the most recent 4:00 PM ET close price (previous trading day's close).
         Works on any day including weekends and holidays.
+
+        Uses the same asset-type-aware cash-close selection as
+        ``get_latest_in_session_quote``: for non-INDEX symbols the 16:00
+        bar's ``open`` is the closing-auction print (the canonical cash
+        close), not its ``close`` which captures the first ~60s of
+        after-hours trading due to TradeStation's start-of-minute bar
+        timestamping. For INDEX symbols the 16:00 ``close`` is the
+        post-auction settled level.
         """
         query = """
             WITH market_close_time AS (
                 -- Find the most recent 4:00 PM ET bar
                 SELECT
-                    timestamp,
-                    symbol,
-                    close as previous_close
-                FROM underlying_quotes
-                WHERE symbol = $1
-                    AND EXTRACT(HOUR FROM timestamp AT TIME ZONE 'America/New_York') = 16
-                    AND EXTRACT(MINUTE FROM timestamp AT TIME ZONE 'America/New_York') = 0
-                    AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
-                ORDER BY timestamp DESC
+                    uq.timestamp,
+                    uq.symbol,
+                    -- Asset-aware cash-close: see get_latest_in_session_quote
+                    -- docstring for the auction-print / settle-level rationale.
+                    CASE
+                        WHEN s.asset_type IS DISTINCT FROM 'INDEX'
+                        THEN uq.open
+                        ELSE uq.close
+                    END AS previous_close
+                FROM underlying_quotes uq
+                LEFT JOIN symbols s ON s.symbol = uq.symbol
+                WHERE uq.symbol = $1
+                    AND EXTRACT(HOUR FROM uq.timestamp AT TIME ZONE 'America/New_York') = 16
+                    AND EXTRACT(MINUTE FROM uq.timestamp AT TIME ZONE 'America/New_York') = 0
+                    AND EXTRACT(DOW FROM uq.timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
+                ORDER BY uq.timestamp DESC
                 LIMIT 1
             ),
             nearest_close AS (
                 -- Fallback: find the bar closest to 4:00 PM on the most recent trading day
                 SELECT
-                    q.timestamp,
-                    q.symbol,
-                    q.close as previous_close,
+                    uq.timestamp,
+                    uq.symbol,
+                    -- Same asset-aware rule; OPEN substitution only applies
+                    -- to the exact 16:00 bar, since that's the bar that
+                    -- straddles the closing auction. Earlier bars (15:xx)
+                    -- use CLOSE as usual.
+                    CASE
+                        WHEN (uq.timestamp AT TIME ZONE 'America/New_York')::time = TIME '16:00'
+                         AND s.asset_type IS DISTINCT FROM 'INDEX'
+                        THEN uq.open
+                        ELSE uq.close
+                    END AS previous_close,
                     ABS(EXTRACT(EPOCH FROM (
-                        (q.timestamp AT TIME ZONE 'America/New_York')::time - '16:00:00'::time
+                        (uq.timestamp AT TIME ZONE 'America/New_York')::time - '16:00:00'::time
                     ))) as time_diff_seconds
-                FROM underlying_quotes q
+                FROM underlying_quotes uq
+                LEFT JOIN symbols s ON s.symbol = uq.symbol
                 CROSS JOIN (
                     -- Get the most recent trading day that has data
                     SELECT DISTINCT DATE(timestamp AT TIME ZONE 'America/New_York') as trade_date
@@ -3460,9 +3485,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     ORDER BY DATE(timestamp AT TIME ZONE 'America/New_York') DESC
                     LIMIT 1
                 ) recent_day
-                WHERE q.symbol = $1
-                    AND DATE(q.timestamp AT TIME ZONE 'America/New_York') = recent_day.trade_date
-                    AND EXTRACT(HOUR FROM q.timestamp AT TIME ZONE 'America/New_York') BETWEEN 15 AND 16
+                WHERE uq.symbol = $1
+                    AND DATE(uq.timestamp AT TIME ZONE 'America/New_York') = recent_day.trade_date
+                    AND EXTRACT(HOUR FROM uq.timestamp AT TIME ZONE 'America/New_York') BETWEEN 15 AND 16
                 ORDER BY time_diff_seconds ASC
                 LIMIT 1
             )
@@ -3496,24 +3521,41 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
           (last bar <= 16:00 ET on the most recent day whose session has ended).
           Today's session is only included if the current time is at/after 16:00 ET.
         prior_session_close = the session close immediately before current.
+
+        Uses the same asset-type-aware cash-close selection as
+        ``get_latest_in_session_quote``: for non-INDEX symbols the 16:00
+        bar's ``open`` is the closing-auction print, not its ``close``
+        which captures the first ~60s of after-hours. For INDEX symbols
+        the 16:00 ``close`` is the post-auction settled level. This is
+        the displayed header price during AH / weekends / holidays via
+        the ``current_session_close`` field consumed by Header.tsx, so
+        it MUST stay in lockstep with ``get_latest_in_session_quote``.
         """
         query = """
             WITH session_closes AS (
-                SELECT DISTINCT ON ((timestamp AT TIME ZONE 'America/New_York')::date)
-                    timestamp,
-                    close
-                FROM underlying_quotes
-                WHERE symbol = $1
-                    AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
-                    AND (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '09:30' AND '16:00'
-                    AND timestamp <= NOW()
+                SELECT DISTINCT ON ((uq.timestamp AT TIME ZONE 'America/New_York')::date)
+                    uq.timestamp,
+                    -- Asset-aware cash-close: see get_latest_in_session_quote
+                    -- docstring for the auction-print / settle-level rationale.
+                    CASE
+                        WHEN (uq.timestamp AT TIME ZONE 'America/New_York')::time = TIME '16:00'
+                         AND s.asset_type IS DISTINCT FROM 'INDEX'
+                        THEN uq.open
+                        ELSE uq.close
+                    END AS close
+                FROM underlying_quotes uq
+                LEFT JOIN symbols s ON s.symbol = uq.symbol
+                WHERE uq.symbol = $1
+                    AND EXTRACT(DOW FROM uq.timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
+                    AND (uq.timestamp AT TIME ZONE 'America/New_York')::time BETWEEN '09:30' AND '16:00'
+                    AND uq.timestamp <= NOW()
                     -- Exclude today's date if the session hasn't closed yet (before 16:00 ET)
                     AND (
-                        (timestamp AT TIME ZONE 'America/New_York')::date
+                        (uq.timestamp AT TIME ZONE 'America/New_York')::date
                         < (NOW() AT TIME ZONE 'America/New_York')::date
                         OR (NOW() AT TIME ZONE 'America/New_York')::time >= '16:00'
                     )
-                ORDER BY (timestamp AT TIME ZONE 'America/New_York')::date DESC, timestamp DESC
+                ORDER BY (uq.timestamp AT TIME ZONE 'America/New_York')::date DESC, uq.timestamp DESC
                 LIMIT 2
             ),
             ranked AS (
