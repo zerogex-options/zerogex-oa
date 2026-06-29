@@ -116,7 +116,12 @@ def calibrated_base(pattern_id: str, underlying: str, fallback: float) -> float:
     return value if value is not None else fallback
 
 
-def build_store_from_rows(rows, *, source: Optional[str] = None) -> CalibrationStore:
+def build_store_from_rows(
+    rows,
+    *,
+    source: Optional[str] = None,
+    exclude_pairs: Optional[set[tuple[str, str]]] = None,
+) -> CalibrationStore:
     """Construct a :class:`CalibrationStore` from stats rows.
 
     Each row is ``(pattern, underlying, window_end, n_resolved, proposed_base)``
@@ -126,6 +131,11 @@ def build_store_from_rows(rows, *, source: Optional[str] = None) -> CalibrationS
 
     ``source`` selects the clamp band (``option_pnl`` has its own overridable
     band; everything else uses the global one).
+
+    ``exclude_pairs`` drops specific (pattern, underlying) rows before any
+    aggregation — used by the auto-source disagreement veto to keep an inflated
+    touch reading from contributing to either the per-pair store OR the
+    sample-weighted pattern-wide fallback.
     """
     min_samples = config.SIGNALS_PATTERN_CALIBRATION_MIN_SAMPLES
     max_age = timedelta(days=config.SIGNALS_PATTERN_CALIBRATION_MAX_AGE_DAYS)
@@ -140,8 +150,10 @@ def build_store_from_rows(rows, *, source: Optional[str] = None) -> CalibrationS
             continue
         if window_end is not None and (today - window_end) > max_age:
             continue
-        base = _clamp(float(proposed_base), source)
         key = (pattern, (underlying or "").upper())
+        if exclude_pairs and key in exclude_pairs:
+            continue
+        base = _clamp(float(proposed_base), source)
         by_pair[key] = base
         agg.setdefault(pattern, []).append((base, int(n_resolved)))
 
@@ -192,6 +204,60 @@ def _merge_prefer(base: CalibrationStore, preferred: CalibrationStore) -> Calibr
     )
 
 
+def auto_vetoed_pairs(touch_rows, pnl_rows) -> set[tuple[str, str]]:
+    """(pattern, underlying) pairs whose touch base is vetoed under SOURCE=auto.
+
+    Why: a pair whose ``option_pnl`` window is below ``MIN_SAMPLES`` currently
+    leaves the touch base in place, and the touch proxy can overstate edge — a
+    target/stop hit is not a profitable trade. When the sub-gate pnl reading
+    materially disagrees with touch, the safe move is to drop the touch base so
+    the live consult falls through to the catalog prior.
+
+    Asymmetric and one-directional: only fires when ``touch_base − pnl_base ≥
+    threshold`` (touch is HIGHER than pnl by at least the threshold — the
+    unsafe direction). Touch under-stating relative to pnl is the conservative
+    side and is left alone. Both sides are clamped to their respective bands
+    before the comparison so the check tracks what the live engine would
+    actually use, not raw beta-smoothed values.
+
+    Returns an empty set when either knob is disabled
+    (``THRESHOLD == 0`` or ``SOFT_MIN_SAMPLES == 0``).
+    """
+    threshold = config.SIGNALS_PATTERN_CALIBRATION_AUTO_DISAGREEMENT_THRESHOLD
+    soft_min = config.SIGNALS_PATTERN_CALIBRATION_AUTO_PNL_SOFT_MIN_SAMPLES
+    if threshold <= 0 or soft_min <= 0:
+        return set()
+
+    max_age = timedelta(days=config.SIGNALS_PATTERN_CALIBRATION_MAX_AGE_DAYS)
+    today = date.today()
+    pnl_band = _band_for_source("option_pnl")
+    touch_band = _band_for_source("underlying_touch")
+
+    touch_index: dict[tuple[str, str], float] = {}
+    for pattern, underlying, _we, n_resolved, proposed_base in touch_rows:
+        if proposed_base is None or n_resolved is None:
+            continue
+        key = (pattern, (underlying or "").upper())
+        clamped = min(max(float(proposed_base), touch_band[0]), touch_band[1])
+        touch_index[key] = clamped
+
+    vetoed: set[tuple[str, str]] = set()
+    for pattern, underlying, window_end, n_resolved, proposed_base in pnl_rows:
+        if proposed_base is None or n_resolved is None:
+            continue
+        if int(n_resolved) < soft_min:
+            continue
+        if window_end is not None and (today - window_end) > max_age:
+            continue
+        key = (pattern, (underlying or "").upper())
+        if key not in touch_index:
+            continue
+        pnl_clamped = min(max(float(proposed_base), pnl_band[0]), pnl_band[1])
+        if touch_index[key] - pnl_clamped >= threshold:
+            vetoed.add(key)
+    return vetoed
+
+
 def load_store(conn) -> CalibrationStore:
     """Load the calibration store, honoring ``SIGNALS_PATTERN_CALIBRATION_SOURCE``.
 
@@ -199,15 +265,29 @@ def load_store(conn) -> CalibrationStore:
       harness's rows;
     * 'auto' loads both and prefers 'option_pnl' per (pattern, underlying),
       falling back to 'underlying_touch' where no trustworthy P&L window exists.
+      Under 'auto' a sub-gate pnl reading that strongly disagrees with the
+      touch base vetoes that touch pair via :func:`auto_vetoed_pairs`, so the
+      live consult falls through to the catalog prior rather than inheriting an
+      inflated touch overshoot.
     """
     source = config.SIGNALS_PATTERN_CALIBRATION_SOURCE
     if source == "auto":
+        touch_rows = _load_rows(conn, "underlying_touch")
+        pnl_rows = _load_rows(conn, "option_pnl")
+        vetoed = auto_vetoed_pairs(touch_rows, pnl_rows)
+        if vetoed:
+            logger.info(
+                "pattern calibration: auto-source vetoed %d touch pair(s) "
+                "(touch − pnl ≥ %.2f, n ≥ %d): %s",
+                len(vetoed),
+                config.SIGNALS_PATTERN_CALIBRATION_AUTO_DISAGREEMENT_THRESHOLD,
+                config.SIGNALS_PATTERN_CALIBRATION_AUTO_PNL_SOFT_MIN_SAMPLES,
+                ", ".join(f"{p}/{u}" for p, u in sorted(vetoed)),
+            )
         touch = build_store_from_rows(
-            _load_rows(conn, "underlying_touch"), source="underlying_touch"
+            touch_rows, source="underlying_touch", exclude_pairs=vetoed,
         )
-        pnl = build_store_from_rows(
-            _load_rows(conn, "option_pnl"), source="option_pnl"
-        )
+        pnl = build_store_from_rows(pnl_rows, source="option_pnl")
         return _merge_prefer(touch, pnl)
     if source not in _VALID_SOURCES:
         logger.warning(
