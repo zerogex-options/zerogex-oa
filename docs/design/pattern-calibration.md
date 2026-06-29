@@ -40,10 +40,11 @@
 >
 > The clamp band is per-source: `option_pnl` has its own
 > `SIGNALS_PATTERN_CALIBRATION_FLOOR_OPTION_PNL` /
-> `…_CEIL_OPTION_PNL` (default = the global `[0.40, 0.85]`), so an operator can
-> give the honest realized-P&L measure a wider band — e.g. a lower floor so a
-> genuinely losing pattern is marked down rather than pinned at 0.40 — without
-> touching the touch-proxy band.
+> `…_CEIL_OPTION_PNL` (default `[0.25, 0.85]` — wider on the floor side than
+> the global `[0.40, 0.85]` touch band so a genuinely losing pattern is marked
+> down further rather than compressed to the same value as every other loser).
+> Either bound can be overridden in `.env` if a deployment wants the original
+> touch band back.
 >
 > Inspect both sources side by side before switching:
 > `make pattern-calibration-compare` (read-only; prints prior vs touch vs

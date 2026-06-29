@@ -488,8 +488,11 @@ def test_compare_report_pnl_wins_display_even_when_pair_vetoed(
         [("p", "SPY", today, 60, 0.30)],     # n=60 ≥ MIN_SAMPLES=20
         min_samples=20,
     )
-    assert "0.400 P" in out          # pnl 0.30 clamped to the global floor 0.40
-    assert "0.400 v" not in out      # the veto did not fall through here
+    # pnl 0.30 falls inside the option_pnl band so the displayed cell is its
+    # exact post-clamp value, tagged 'P'. Crucially, NOT 'v' — the veto did
+    # not fall through here, because pnl's hard-gated pair entry wins.
+    assert "0.300 P" in out
+    assert "0.300 v" not in out
     # The footer still records that the veto fired (its by_pattern effect ran).
     assert "p/SPY" in out
     assert "auto-veto" in out
