@@ -1011,17 +1011,21 @@ def get_market_session(
 async def get_current_quote(symbol: str = Query(default="SPY")):
     """Get current underlying quote.
 
-    The displayed price is sourced from ``get_latest_in_session_quote`` so
-    that after the cash bell (and on weekends / holidays) the spot is the
-    canonical 16:00 ET cash close, not whatever extended-hours bar
-    TradeStation last streamed under the ``Default`` session template.
-    The soft-close stability tracker is still fed from the raw latest
-    quote (``get_latest_quote``) so the after-hours feed-liveness signal
-    that drives the 20:00 ET session-label transition for non-INDEX
-    symbols is unchanged.
+    Returns the live tick (the latest ``underlying_quotes`` bar of any
+    session). This is what every "what is it trading at right now"
+    surface needs: the header's extended-hours row, the GEX live spot,
+    the chart's tip-close merge, the strike-profile spot line.
+
+    The header's HEADLINE price during AH / pre-market / closed /
+    weekend is sourced separately from ``/api/market/session-closes``
+    (which applies the asset-aware 16:00 cash-close rule); the frontend
+    multiplexes between the two via ``getPrimaryPriceChangeSummary``.
+    Do NOT collapse this endpoint into the cash-close path — that
+    freezes the extended-hours ticker at the cash close on every
+    surface that reads ``quoteData.close``.
     """
     try:
-        data = await _db().get_latest_in_session_quote(symbol)
+        data = await _db().get_latest_quote(symbol)
         if not data:
             raise HTTPException(status_code=404, detail="No quote data available")
 
@@ -1030,11 +1034,8 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
         if "cumulative_daily_volume" in data:
             data["volume"] = data.pop("cumulative_daily_volume")
 
-        # Update per-symbol soft-close tracker and evaluate stability.
-        # The tracker observes raw latest-bar prints (any session) so
-        # after-hours feed activity continues to gate the 20:00 ET
-        # transition for non-INDEX symbols. The displayed price above is
-        # session-filtered; this signal is separate by design.
+        # Update per-symbol soft-close tracker and evaluate stability
+        # Evict oldest entries if tracker dict grows too large
         if (
             symbol not in _soft_close_trackers
             and len(_soft_close_trackers) >= _SOFT_CLOSE_TRACKER_MAX
@@ -1042,8 +1043,7 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
             oldest_key = next(iter(_soft_close_trackers))
             del _soft_close_trackers[oldest_key]
         tracker = _soft_close_trackers.setdefault(symbol, _SoftCloseTracker())
-        raw_latest = await _db().get_latest_quote(symbol)
-        tracker.record((raw_latest or {}).get("close"))
+        tracker.record(data.get("close"))
 
         close_data_available = await _db().has_todays_close_landed(symbol, asset_type)
         data["session"] = get_market_session(
