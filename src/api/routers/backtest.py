@@ -25,7 +25,7 @@ from src.backtesting.meta import build_meta
 from src.backtesting.models import BacktestSpec, SpecError
 from src.backtesting.runner import create_run, execute_run
 from src.backtesting.sweeps import SweepError
-from src.database.connection import close_db_connection, get_db_connection
+from src.database.connection import db_connection
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +35,8 @@ router = APIRouter(prefix="/api/backtest", tags=["Backtesting", "Beta"])
 
 
 def _build_meta_sync() -> dict:
-    conn = get_db_connection()
-    try:
+    with db_connection() as conn:
         return build_meta(conn)
-    finally:
-        close_db_connection(conn)
 
 
 @router.get("/meta")

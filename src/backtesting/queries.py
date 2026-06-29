@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from src.database.connection import close_db_connection, get_db_connection
+from src.database.connection import db_connection
 
 
 def _row_to_run(row, *, include_spec: bool) -> dict:
@@ -42,8 +42,7 @@ def get_run(run_id: int, *, end_user: Optional[str]) -> Optional[dict]:
     A run with a NULL ``end_user`` (anonymous) is readable by anyone; a run
     owned by an end-user is only readable by that same end-user.
     """
-    conn = get_db_connection()
-    try:
+    with db_connection() as conn:
         cur = conn.cursor()
         cur.execute(
             f"SELECT {_RUN_COLS}, spec, end_user FROM backtest_runs WHERE id = %s",
@@ -56,14 +55,11 @@ def get_run(run_id: int, *, end_user: Optional[str]) -> Optional[dict]:
         if owner is not None and owner != end_user:
             return None
         return _row_to_run(row, include_spec=True)
-    finally:
-        close_db_connection(conn)
 
 
 def list_runs(*, end_user: Optional[str], limit: int = 25) -> list[dict]:
     """Recent runs for this end-user (plus anonymous runs when unauthenticated)."""
-    conn = get_db_connection()
-    try:
+    with db_connection() as conn:
         cur = conn.cursor()
         # Sweep child runs (sweep_id NOT NULL) are surfaced via the sweep grid,
         # not the standalone Recent Runs list — filter them out here.
@@ -82,13 +78,10 @@ def list_runs(*, end_user: Optional[str], limit: int = 25) -> list[dict]:
                 (limit,),
             )
         return [_row_to_run(r, include_spec=False) for r in cur.fetchall()]
-    finally:
-        close_db_connection(conn)
 
 
 def get_trades(run_id: int, *, limit: int = 100, offset: int = 0) -> dict:
-    conn = get_db_connection()
-    try:
+    with db_connection() as conn:
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM backtest_trades WHERE run_id = %s", (run_id,))
         total = int(cur.fetchone()[0])
@@ -132,13 +125,10 @@ def get_trades(run_id: int, *, limit: int = 100, offset: int = 0) -> dict:
             for r in cur.fetchall()
         ]
         return {"trades": trades, "total": total}
-    finally:
-        close_db_connection(conn)
 
 
 def get_equity(run_id: int) -> list[dict]:
-    conn = get_db_connection()
-    try:
+    with db_connection() as conn:
         cur = conn.cursor()
         cur.execute(
             "SELECT t, equity, drawdown_pct FROM backtest_equity "
@@ -153,5 +143,3 @@ def get_equity(run_id: int) -> list[dict]:
             }
             for r in cur.fetchall()
         ]
-    finally:
-        close_db_connection(conn)

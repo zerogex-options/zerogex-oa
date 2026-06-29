@@ -43,17 +43,42 @@ class _Conn:
     def cursor(self):
         return self._cur
 
+    # Reader helpers in configs now route through the ``db_connection()``
+    # context manager (commits on success, rolls back on exception) instead
+    # of the raw ``get_db_connection`` / ``close_db_connection`` pair. The
+    # context manager invokes ``conn.commit()`` on clean exit, so the fake
+    # conn needs harmless no-op commit/rollback hooks. The bool methods
+    # below are never asserted by these tests — they exist only so the
+    # context manager doesn't AttributeError.
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
 
 @pytest.fixture
 def patched(monkeypatch):
     """Install a fake connection and return a setter for its scripted rows."""
+    from src.database import connection as conn_module
+
     holder = {}
 
     def install(fetch_results):
         conn = _Conn(fetch_results)
         holder["conn"] = conn
+        # Writers in configs still use the raw get/close pair (autocommit
+        # pattern) — patch them on the configs module's imported names so
+        # the unchanged save/update/delete paths keep using this fake conn.
         monkeypatch.setattr(configs_mod, "get_db_connection", lambda: conn)
         monkeypatch.setattr(configs_mod, "close_db_connection", lambda c: None)
+        # Readers go through ``db_connection()`` (defined in
+        # ``src.database.connection``), which resolves ``get_db_connection``
+        # and ``close_db_connection`` against the source module — not the
+        # caller's bound imports. Patch the source too so both paths land
+        # on the same fake conn.
+        monkeypatch.setattr(conn_module, "get_db_connection", lambda: conn)
+        monkeypatch.setattr(conn_module, "close_db_connection", lambda c: None)
         return conn
 
     return install
