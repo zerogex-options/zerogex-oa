@@ -133,8 +133,90 @@ def test_joins_daily_volume_and_asset_type():
 
     assert "underlying_daily_volume" in sql
     assert "cumulative_daily_volume" in sql
-    assert "s.asset_type" in sql
+    assert "lq.asset_type" in sql
     assert "LEFT JOIN symbols s" in sql
+
+
+# ---------------------------------------------------------------------------
+# Asset-type-aware close selection for the 16:00 bar
+# ---------------------------------------------------------------------------
+#
+# TradeStation start-of-minute-stamps its 1-minute bars, so the bar timestamped
+# 16:00:00 spans 16:00:00–16:00:59 ET — a window that begins with the closing
+# auction print and ends with the first ~60s of after-hours trading. The bar's
+# ``close`` is therefore AH-contaminated for any symbol that trades extended
+# hours. Verified against Friday 2026-06-26 data:
+#
+#                 15:59 close   16:00 open   16:00 close   official close
+#   SPY (ETF)        731.66       729.01       731.54         728.99
+#   QQQ (ETF)        706.63       705.88       707.75         706.52
+#   SPX (INDEX)     7345.16      7335.70      7353.01        7354.03
+#
+# Non-INDEX symbols: 16:00 open (auction print) ≈ official close. INDEX symbols:
+# 16:00 close (post-auction settled level) ≈ official close. These tests pin
+# the asset-type-aware substitution that produces those values.
+
+
+def test_sql_substitutes_open_for_non_index_at_1600():
+    """The CASE in the projection must return the 16:00 bar's ``open``
+    when the symbol is NOT an INDEX — for ETFs/stocks the bar's ``open``
+    is the closing-auction print, while its ``close`` is the AH-
+    contaminated last tick of the 16:00 minute."""
+    db = _new_db()
+    sql, _args = _captured_sql(db, _RecordingConn(fetchrow_result=None))
+
+    # The selector must key on bar timestamp == 16:00 ET AND non-INDEX.
+    assert "CASE" in sql
+    assert "TIME '16:00'" in sql
+    assert "IS DISTINCT FROM 'INDEX'" in sql
+    assert "THEN lq.open" in sql
+    assert "ELSE lq.close" in sql
+
+
+def test_sql_preserves_close_for_index_at_1600():
+    """For INDEX symbols the 16:00 ``close`` is the post-auction settled
+    level (its ``open`` is the pre-auction snapshot and is much further
+    from the official close). The CASE must fall through to ELSE."""
+    db = _new_db()
+    sql, _args = _captured_sql(db, _RecordingConn(fetchrow_result=None))
+
+    # ``IS DISTINCT FROM 'INDEX'`` is the gate. For INDEX rows the gate
+    # is False so the CASE returns the ELSE branch (lq.close), which is
+    # what we want — the post-auction settled level.
+    assert "lq.asset_type IS DISTINCT FROM 'INDEX'" in sql
+    assert "ELSE lq.close" in sql
+
+
+def test_sql_does_not_substitute_for_non_1600_bars():
+    """Every live in-session bar (09:30 through 15:59, and the in-progress
+    bar during cash hours) must use ``close`` unchanged so live ticking
+    behaves exactly as ``get_latest_quote`` does. The CASE predicate must
+    bind on the bar's timestamp equaling 16:00 ET specifically — not a
+    broader window — otherwise a 15:59 bar would also have its ``open``
+    substituted, freezing the displayed spot mid-session."""
+    db = _new_db()
+    sql, _args = _captured_sql(db, _RecordingConn(fetchrow_result=None))
+
+    # The equality predicate on the bar timestamp.
+    assert "= TIME '16:00'" in sql
+
+
+def test_asset_type_joined_in_inner_cte_not_just_outer():
+    """``asset_type`` must be available to the CASE in the projection,
+    which means the ``symbols`` join belongs inside the inner CTE (next
+    to the candidate-bar selection), not only as an outer enrichment.
+    Without this the CASE can't see ``lq.asset_type`` and the
+    substitution silently no-ops."""
+    db = _new_db()
+    sql, _args = _captured_sql(db, _RecordingConn(fetchrow_result=None))
+
+    # The inner CTE selects asset_type alongside OHLC, and the join is
+    # inside that CTE.
+    cte_start = sql.find("WITH latest_quote AS")
+    cte_end = sql.find(")", cte_start)
+    inner = sql[cte_start:cte_end]
+    assert "s.asset_type" in inner
+    assert "LEFT JOIN symbols s" in inner
 
 
 # ---------------------------------------------------------------------------
