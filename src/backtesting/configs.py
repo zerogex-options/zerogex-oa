@@ -103,12 +103,21 @@ def update_config(config_id: int, *, end_user: Optional[str],
                   name: Optional[str] = None,
                   spec_dict: Optional[dict] = None,
                   underlying: Optional[str] = None) -> Optional[dict]:
-    """Rename and/or replace a config's spec (owner only). None if absent/foreign."""
-    conn = get_db_connection()
-    try:
-        conn.autocommit = True
+    """Rename and/or replace a config's spec (owner only). None if absent/foreign.
+
+    The ownership SELECT and the UPDATE run in a single transaction with
+    ``SELECT … FOR UPDATE`` so they're atomic: a concurrent owner change
+    (or a delete) between the check and the write can't slip through.
+    Without this, the pre-fix autocommit pattern had a small race window
+    where a config could be ``UPDATE``d by a caller whose ownership view
+    of the row was already stale.
+    """
+    with db_connection() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT end_user FROM backtest_configs WHERE id = %s", (config_id,))
+        cur.execute(
+            "SELECT end_user FROM backtest_configs WHERE id = %s FOR UPDATE",
+            (config_id,),
+        )
         row = cur.fetchone()
         if row is None:
             return None
@@ -134,17 +143,20 @@ def update_config(config_id: int, *, end_user: Optional[str],
             params,
         )
         return _row_to_summary(cur.fetchone())
-    finally:
-        close_db_connection(conn)
 
 
 def delete_config(config_id: int, *, end_user: Optional[str]) -> bool:
-    """Delete a config (owner only). Returns True if a row was removed."""
-    conn = get_db_connection()
-    try:
-        conn.autocommit = True
+    """Delete a config (owner only). Returns True if a row was removed.
+
+    Atomic ownership check + delete: see ``update_config`` for the
+    race-window rationale.
+    """
+    with db_connection() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT end_user FROM backtest_configs WHERE id = %s", (config_id,))
+        cur.execute(
+            "SELECT end_user FROM backtest_configs WHERE id = %s FOR UPDATE",
+            (config_id,),
+        )
         row = cur.fetchone()
         if row is None:
             return False
@@ -153,8 +165,6 @@ def delete_config(config_id: int, *, end_user: Optional[str]) -> bool:
             return False
         cur.execute("DELETE FROM backtest_configs WHERE id = %s", (config_id,))
         return True
-    finally:
-        close_db_connection(conn)
 
 
 def get_shared_config(share_token: str) -> Optional[dict]:
