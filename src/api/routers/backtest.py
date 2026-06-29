@@ -45,6 +45,24 @@ async def get_meta() -> dict:
     return await asyncio.to_thread(_build_meta_sync)
 
 
+@router.get("/insights/patterns")
+async def get_pattern_insights(
+    source: str = Query("option_pnl", pattern="^(option_pnl|underlying_touch)$"),
+    underlying: Optional[str] = Query(None, pattern="^[A-Za-z]{1,10}$"),
+) -> list:
+    """Pattern leaderboard: latest stats row per (pattern, underlying).
+
+    Read-only roll-up of ``playbook_pattern_stats`` — n, win rate, dollar
+    economics, derived PF / expectancy, the window dates, and the most-recent
+    ``computed_at`` per pair. Defaults to ``source=option_pnl`` (the realized
+    P&L feed); ``source=underlying_touch`` returns the proxy rows without
+    dollar economics. Optional ``underlying`` narrows to one symbol.
+    """
+    return await asyncio.to_thread(
+        queries.get_pattern_insights, source=source, underlying=underlying,
+    )
+
+
 @router.post("/runs", status_code=202)
 async def create_backtest_run(request: Request, background_tasks: BackgroundTasks) -> dict:
     """Validate a BacktestSpec, persist a queued run, and schedule execution."""

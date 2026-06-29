@@ -1621,6 +1621,13 @@ CREATE TABLE IF NOT EXISTS playbook_pattern_stats (
     avg_mfe_pct       DOUBLE PRECISION,
     avg_mae_pct       DOUBLE PRECISION,
     proposed_base     DOUBLE PRECISION,
+    -- Dollar economics — populated only by the option_pnl feed (touch is a
+    -- proxy and has no real P&L). gross_win_pnl is the sum of winning trades'
+    -- net_pnl; gross_loss_pnl is the absolute sum of losing trades' net_pnl
+    -- (always ≥ 0). Net P&L, profit factor, expectancy, and avg win/loss are
+    -- all derivable from these two + the counts already on the row.
+    gross_win_pnl     DOUBLE PRECISION,
+    gross_loss_pnl    DOUBLE PRECISION,
     -- Which harness produced this row: 'underlying_touch' (the conservative
     -- price-touch proxy) or 'option_pnl' (realized leg-level option P&L). Both
     -- can coexist for the same window; the live calibration store picks which
@@ -1633,6 +1640,12 @@ CREATE TABLE IF NOT EXISTS playbook_pattern_stats (
 -- Backfill for installs created before the `source` column / 5-col PK existed.
 ALTER TABLE playbook_pattern_stats
     ADD COLUMN IF NOT EXISTS source VARCHAR(24) NOT NULL DEFAULT 'underlying_touch';
+-- Backfill for installs created before the dollar-economics columns existed.
+-- Old rows stay NULL; the option_pnl feed populates them on its next refresh.
+ALTER TABLE playbook_pattern_stats
+    ADD COLUMN IF NOT EXISTS gross_win_pnl DOUBLE PRECISION;
+ALTER TABLE playbook_pattern_stats
+    ADD COLUMN IF NOT EXISTS gross_loss_pnl DOUBLE PRECISION;
 -- Migrate the primary key from the original 4-column form to include `source`
 -- so option_pnl rows can sit alongside underlying_touch rows for one window.
 DO $$

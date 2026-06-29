@@ -143,3 +143,126 @@ def get_equity(run_id: int) -> list[dict]:
             }
             for r in cur.fetchall()
         ]
+
+
+# ---------------------------------------------------------------------------
+# Pattern insights (the leaderboard read side)
+# ---------------------------------------------------------------------------
+
+
+def _derive_pattern_economics(
+    n_resolved: int,
+    n_wins: int,
+    n_losses: int,
+    gross_win_pnl: float | None,
+    gross_loss_pnl: float | None,
+) -> dict:
+    """Compute PF / expectancy / net / avg win/loss from the persisted counts
+    and dollar economics. Returns None for every field when the gross-pnl
+    inputs are missing (touch-source rows persist NULL for these), and None
+    for ``profit_factor`` when there are no losses (PF is undefined, not ∞).
+    """
+    if gross_win_pnl is None or gross_loss_pnl is None:
+        return {
+            "net_pnl": None, "profit_factor": None, "expectancy": None,
+            "avg_win_pnl": None, "avg_loss_pnl": None,
+        }
+    gw = float(gross_win_pnl)
+    gl = float(gross_loss_pnl)
+    return {
+        "net_pnl": gw - gl,
+        "profit_factor": (gw / gl) if gl > 0 else None,
+        "expectancy": ((gw - gl) / n_resolved) if n_resolved > 0 else None,
+        "avg_win_pnl": (gw / n_wins) if n_wins > 0 else None,
+        "avg_loss_pnl": (gl / n_losses) if n_losses > 0 else None,
+    }
+
+
+_VALID_INSIGHT_SOURCES = ("option_pnl", "underlying_touch")
+
+
+def get_pattern_insights(
+    *, source: str = "option_pnl", underlying: Optional[str] = None,
+) -> list[dict]:
+    """Latest stats row per (pattern, underlying) for the leaderboard.
+
+    Returns one row per pair, ordered by net_pnl DESC and then by sample size
+    DESC — the engine-server's opinion of "most profitable, then most
+    trustworthy." The frontend can re-sort however it wants. Rows include the
+    raw counts + dollar economics from the table, plus derived PF / expectancy
+    / avg win / avg loss so the page doesn't need to recompute them.
+    """
+    if source not in _VALID_INSIGHT_SOURCES:
+        source = "option_pnl"
+    where = "WHERE source = %s"
+    params: list = [source]
+    if underlying:
+        where += " AND underlying = %s"
+        params.append(underlying.upper())
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT DISTINCT ON (pattern, underlying)
+                   pattern, underlying, window_start, window_end,
+                   n_emitted, n_resolved, n_target_hit, n_stop_hit,
+                   hit_rate, proposed_base,
+                   gross_win_pnl, gross_loss_pnl,
+                   source, computed_at
+            FROM playbook_pattern_stats
+            {where}
+            ORDER BY pattern, underlying, window_end DESC, computed_at DESC
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+    out: list[dict] = []
+    for r in rows:
+        (
+            pattern, underlying_, window_start, window_end,
+            n_emitted, n_resolved, n_wins, n_losses,
+            hit_rate, proposed_base, gross_win_pnl, gross_loss_pnl,
+            row_source, computed_at,
+        ) = r
+        econ = _derive_pattern_economics(
+            int(n_resolved or 0),
+            int(n_wins or 0),
+            int(n_losses or 0),
+            gross_win_pnl,
+            gross_loss_pnl,
+        )
+        out.append({
+            "pattern": pattern,
+            "underlying": underlying_,
+            "window_start": window_start.isoformat() if window_start else None,
+            "window_end": window_end.isoformat() if window_end else None,
+            "n_emitted": int(n_emitted or 0),
+            "n_resolved": int(n_resolved or 0),
+            "n_wins": int(n_wins or 0),
+            "n_losses": int(n_losses or 0),
+            "hit_rate": float(hit_rate) if hit_rate is not None else None,
+            "proposed_base": float(proposed_base) if proposed_base is not None else None,
+            "gross_win_pnl": (
+                float(gross_win_pnl) if gross_win_pnl is not None else None
+            ),
+            "gross_loss_pnl": (
+                float(gross_loss_pnl) if gross_loss_pnl is not None else None
+            ),
+            "source": row_source,
+            "computed_at": computed_at.isoformat() if computed_at else None,
+            **econ,
+        })
+    # Server-side default ordering: net_pnl desc (NULLs last), then n_resolved
+    # desc. Stable enough that the client can show a usable view before it
+    # re-sorts.
+
+    def _sort_key(d: dict) -> tuple:
+        net = d.get("net_pnl")
+        return (
+            0 if net is not None else 1,
+            -(net if net is not None else 0.0),
+            -(d.get("n_resolved") or 0),
+        )
+
+    out.sort(key=_sort_key)
+    return out

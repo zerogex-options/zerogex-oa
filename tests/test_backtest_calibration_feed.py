@@ -61,6 +61,55 @@ def test_aggregate_trades_counts_wins_and_losses():
     assert (stats["b"].n_trades, stats["b"].n_wins, stats["b"].n_losses) == (2, 0, 2)
 
 
+def test_aggregate_trades_tracks_gross_pnl_economics():
+    # gross_win is sum of positive net_pnl; gross_loss is the ABS sum of the
+    # non-positive ones (PF/expectancy on the read side rely on both being ≥0).
+    trades = [
+        _Trade("p", 80.0),
+        _Trade("p", 120.0),
+        _Trade("p", -50.0),
+        _Trade("p", -150.0),
+        _Trade("p", 0.0),  # zero counts as a loss with 0 contribution
+    ]
+    stats = feed.aggregate_trades(
+        trades, underlying="SPY", window_start=_WS, window_end=_WE,
+    )
+    p = next(s for s in stats if s.pattern == "p")
+    assert p.gross_win_pnl == pytest.approx(200.0)
+    assert p.gross_loss_pnl == pytest.approx(200.0)
+    assert p.n_trades == 5 and p.n_wins == 2 and p.n_losses == 3
+
+
+def test_aggregate_trades_winners_only_pattern():
+    trades = [_Trade("hot", 10.0), _Trade("hot", 20.0)]
+    p = feed.aggregate_trades(
+        trades, underlying="SPY", window_start=_WS, window_end=_WE,
+    )[0]
+    assert p.gross_win_pnl == pytest.approx(30.0)
+    assert p.gross_loss_pnl == pytest.approx(0.0)
+
+
+def test_upsert_includes_gross_pnl_columns():
+    conn = _Conn()
+    s = feed.PnlPatternStat(
+        pattern="p", underlying="SPY", window_start=_WS, window_end=_WE,
+        n_trades=10, n_wins=4, n_losses=6,
+        gross_win_pnl=400.0, gross_loss_pnl=180.0,
+    )
+    feed.upsert_pnl_stats(conn, [s])
+    sql, params = conn._cur.executed[0]
+    # Columns appear in the INSERT clause...
+    flat = " ".join(sql.split())
+    assert "gross_win_pnl" in flat and "gross_loss_pnl" in flat
+    # ...and the ON CONFLICT branch updates them so a re-run of the same
+    # window refreshes the economics rather than silently keeping stale ones.
+    assert "gross_win_pnl  = EXCLUDED.gross_win_pnl" in flat or \
+           "gross_win_pnl = EXCLUDED.gross_win_pnl" in flat
+    assert "gross_loss_pnl = EXCLUDED.gross_loss_pnl" in flat
+    # And the values are bound in the params tuple.
+    assert 400.0 in params and 180.0 in params
+
+
 def test_calibration_spec_is_single_leg_permissive():
     spec = feed.calibration_spec("SPY", _WS, _WE)
     assert spec.underlying == "SPY"
