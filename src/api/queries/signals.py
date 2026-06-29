@@ -1177,6 +1177,234 @@ class SignalsQueriesMixin:
             logger.warning("get_recent_action_cards failed (%s): %s", underlying, exc)
             return []
 
+    async def get_daily_scorecard(
+        self,
+        symbol: str,
+        start_utc: datetime,
+        end_utc: datetime,
+        signal_names: List[str],
+        horizon_minutes: int = 60,
+    ) -> Dict[str, Any]:
+        """Aggregate the day's signal-engine output for the public scorecard.
+
+        Returns a single dict combining three independent reads:
+
+        1. **Action Cards** persisted in the window — total count, breakdown
+           by ``action`` enum, and the id of the first non-STAND_DOWN card
+           emitted that day (used as the OG card's anchor permalink).
+        2. **Per-signal flip events** with realized return at the requested
+           horizon — for each of the 13 signal names, counts the number of
+           direction-flip events in the window, the number that "won"
+           (return same-sign as the flip direction), and the average
+           directional return. Best/worst signal are picked from the names
+           with at least two qualifying events.
+        3. **Closing regime** — the most recent ``signal_scores`` row at or
+           before ``end_utc``, used to label the day's MSI regime.
+
+        Every fetch is best-effort: if one chunk fails the scorecard still
+        renders with the remaining sections populated. ``start_utc`` is
+        inclusive, ``end_utc`` is exclusive (matches the 1-min bucket
+        boundary convention used elsewhere).
+        """
+        from collections import Counter
+
+        out: Dict[str, Any] = {
+            "symbol": symbol,
+            "window_start_utc": start_utc,
+            "window_end_utc": end_utc,
+            "horizon_minutes": horizon_minutes,
+            "cards": {
+                "total": 0,
+                "by_action": [],
+                "first_card_id": None,
+            },
+            "signals": {
+                "events": [],
+                "best": None,
+                "worst": None,
+            },
+            "regime": None,
+        }
+
+        # 1. Action Card aggregates for the day.
+        try:
+            async with self._acquire_connection() as conn:
+                card_rows = await conn.fetch(
+                    """
+                    SELECT id, action
+                    FROM signal_action_cards
+                    WHERE underlying = $1
+                      AND timestamp >= $2
+                      AND timestamp < $3
+                      AND action <> 'STAND_DOWN'
+                    ORDER BY timestamp ASC, id ASC
+                    """,
+                    symbol,
+                    start_utc,
+                    end_utc,
+                )
+            if card_rows:
+                out["cards"]["total"] = len(card_rows)
+                out["cards"]["first_card_id"] = int(card_rows[0]["id"])
+                counts = Counter(r["action"] for r in card_rows if r["action"])
+                out["cards"]["by_action"] = [
+                    {"action": action, "count": count}
+                    for action, count in counts.most_common(5)
+                ]
+        except Exception as exc:
+            logger.warning(
+                "get_daily_scorecard: cards section failed (%s, %s..%s): %s",
+                symbol, start_utc, end_utc, exc,
+            )
+
+        # 2. Per-signal flip events with realized return at horizon.
+        if signal_names:
+            horizon_interval = f"{int(horizon_minutes)} minutes"
+            try:
+                async with self._acquire_connection() as conn:
+                    sig_rows = await conn.fetch(
+                        f"""
+                        WITH events AS (
+                            SELECT
+                                scs.component_name,
+                                scs.timestamp,
+                                scs.clamped_score,
+                                SIGN(scs.clamped_score) AS sign_now,
+                                LAG(SIGN(scs.clamped_score)) OVER (
+                                    PARTITION BY scs.component_name
+                                    ORDER BY scs.timestamp
+                                ) AS sign_prev,
+                                q0.close AS close_at_ts,
+                                q1.close AS close_at_horizon
+                            FROM signal_component_scores scs
+                            LEFT JOIN LATERAL (
+                                SELECT close FROM underlying_quotes uq
+                                WHERE uq.symbol = scs.underlying
+                                  AND uq.timestamp <= scs.timestamp
+                                ORDER BY uq.timestamp DESC LIMIT 1
+                            ) q0 ON TRUE
+                            LEFT JOIN LATERAL (
+                                SELECT close FROM underlying_quotes uq
+                                WHERE uq.symbol = scs.underlying
+                                  AND uq.timestamp >= scs.timestamp + INTERVAL '{horizon_interval}'
+                                ORDER BY uq.timestamp ASC LIMIT 1
+                            ) q1 ON TRUE
+                            WHERE scs.underlying = $1
+                              AND scs.component_name = ANY($2::varchar[])
+                              AND scs.timestamp >= $3
+                              AND scs.timestamp < $4
+                        ),
+                        flips AS (
+                            -- A "flip" is a non-zero sign that differs from the
+                            -- previous non-zero sign. The LAG above returns the
+                            -- immediately-prior bar's sign, which may be 0; we
+                            -- treat 0-prev as "not a flip" so we only count
+                            -- transitions between live directional states.
+                            SELECT
+                                component_name,
+                                sign_now,
+                                close_at_ts,
+                                close_at_horizon,
+                                CASE
+                                    WHEN close_at_ts IS NULL OR close_at_horizon IS NULL THEN NULL
+                                    WHEN sign_now > 0 THEN (close_at_horizon - close_at_ts) / NULLIF(close_at_ts, 0)
+                                    WHEN sign_now < 0 THEN (close_at_ts - close_at_horizon) / NULLIF(close_at_ts, 0)
+                                    ELSE NULL
+                                END AS directional_return
+                            FROM events
+                            WHERE sign_now <> 0
+                              AND sign_prev IS NOT NULL
+                              AND sign_prev <> 0
+                              AND sign_now <> sign_prev
+                        )
+                        SELECT
+                            component_name,
+                            COUNT(*) AS flips,
+                            COUNT(directional_return) AS scored,
+                            SUM(CASE WHEN directional_return > 0 THEN 1 ELSE 0 END) AS wins,
+                            SUM(CASE WHEN directional_return < 0 THEN 1 ELSE 0 END) AS losses,
+                            AVG(directional_return) AS avg_directional_return
+                        FROM flips
+                        GROUP BY component_name
+                        """,
+                        symbol,
+                        list(signal_names),
+                        start_utc,
+                        end_utc,
+                    )
+                events: List[Dict[str, Any]] = []
+                for r in sig_rows:
+                    avg = r["avg_directional_return"]
+                    events.append(
+                        {
+                            "name": r["component_name"],
+                            "flips": int(r["flips"] or 0),
+                            "scored": int(r["scored"] or 0),
+                            "wins": int(r["wins"] or 0),
+                            "losses": int(r["losses"] or 0),
+                            "avg_directional_return": float(avg) if avg is not None else None,
+                        }
+                    )
+                out["signals"]["events"] = sorted(
+                    events,
+                    key=lambda e: (
+                        e["avg_directional_return"]
+                        if e["avg_directional_return"] is not None
+                        else 0.0
+                    ),
+                    reverse=True,
+                )
+                # Pick best/worst from names with ≥ 2 scored events so a
+                # one-print outlier doesn't crown a signal of the day.
+                qualifying = [
+                    e for e in events
+                    if e["scored"] >= 2 and e["avg_directional_return"] is not None
+                ]
+                if qualifying:
+                    out["signals"]["best"] = max(
+                        qualifying, key=lambda e: e["avg_directional_return"]
+                    )
+                    out["signals"]["worst"] = min(
+                        qualifying, key=lambda e: e["avg_directional_return"]
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "get_daily_scorecard: signals section failed (%s): %s",
+                    symbol, exc,
+                )
+
+        # 3. Closing regime — most recent signal_scores row in the window.
+        try:
+            async with self._acquire_connection() as conn:
+                regime_row = await conn.fetchrow(
+                    """
+                    SELECT underlying, timestamp, composite_score, normalized_score, direction
+                    FROM signal_scores
+                    WHERE underlying = $1
+                      AND timestamp >= $2
+                      AND timestamp < $3
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                    """,
+                    symbol,
+                    start_utc,
+                    end_utc,
+                )
+            if regime_row:
+                out["regime"] = {
+                    "timestamp": regime_row["timestamp"],
+                    "composite_score": float(regime_row["composite_score"]) if regime_row["composite_score"] is not None else None,
+                    "normalized_score": float(regime_row["normalized_score"]) if regime_row["normalized_score"] is not None else None,
+                    "direction": regime_row["direction"],
+                }
+        except Exception as exc:
+            logger.warning(
+                "get_daily_scorecard: regime section failed (%s): %s",
+                symbol, exc,
+            )
+
+        return out
+
     async def get_action_card_by_id(self, card_id: int) -> Optional[Dict[str, Any]]:
         """Return a single persisted Action Card by primary key.
 

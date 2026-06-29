@@ -53,6 +53,7 @@ from .routers.vol_surface import router as vol_surface_router
 from .routers.premium_surface import router as premium_surface_router
 from .routers.gex_flip_horizon import router as gex_flip_horizon_router
 from .routers.backtest import router as backtest_router
+from .routers.scorecard import router as scorecard_router
 
 # Logging is configured centrally in src.utils.logging; importing
 # get_logger triggers _configure_logging which honors LOG_LEVEL and
@@ -308,6 +309,10 @@ app.include_router(option_contract_router, dependencies=[_scope_market_raw])
 app.include_router(option_calculator_router, dependencies=[_scope_market_raw])
 # Backtesting platform — premium (basic/pro) tier, same scope as /api/signals.
 app.include_router(backtest_router, dependencies=[_scope_signals])
+# Daily Scorecard — aggregates Action Cards + per-signal flip P&L into one
+# trading day's recap. Powers the public /scorecard/{date} permalink and the
+# 4:15 PM ET auto-tweet job. Same signals scope as /api/signals.
+app.include_router(scorecard_router, dependencies=[_scope_signals])
 
 # ============================================================================
 # Health Check

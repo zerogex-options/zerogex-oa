@@ -1,0 +1,19 @@
+[Unit]
+Description=Daily trigger for ZeroGEX Yesterday's Scorecard auto-tweet (4:15 PM ET)
+
+[Timer]
+# Fire at 16:15 server time (America/New_York, set by deploy/steps/010.setup),
+# Monday–Friday only.  Schedule rationale: the cash session closes at 16:00
+# and signal_scores / signal_action_cards finalize within seconds; 15 minutes
+# of buffer lets late ticks land before we aggregate.  The job itself
+# consults market_calendar.NYSE_HOLIDAYS and silently skips configured
+# holidays, so the OnCalendar Mon-Fri filter is a coarse first pass.
+OnCalendar=Mon..Fri *-*-* 16:15:00
+RandomizedDelaySec=2m
+# Run on next boot if the box was off when the timer should have fired
+# (don't silently drop a missed daily artifact — the public scoreboard
+# cadence is the whole point of the feature).
+Persistent=true
+
+[Install]
+WantedBy=timers.target
