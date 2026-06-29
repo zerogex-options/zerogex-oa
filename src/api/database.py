@@ -3236,19 +3236,22 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
     # ========================================================================
 
     async def get_latest_quote(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
-        """Get latest underlying quote (any session — includes pre/after-hours).
+        """Get latest underlying quote — the live tick, regardless of session.
 
-        Returns the most recent bar by timestamp regardless of session, so
-        callers that need raw-feed liveness (e.g. the API soft-close tracker
-        in ``src/api/main.py`` that decides when the AH window has settled)
-        keep seeing every print TradeStation delivers.
+        Returns the most recent ``underlying_quotes`` bar by timestamp with
+        no session filtering, so pre-market and after-hours prints flow
+        through as the displayed live tick. This is what every "what is it
+        trading at right now" surface needs — the header's extended-hours
+        row, the GEX live spot, the strike-profile spot line, the chart
+        tip-close merge.
 
-        For the user-facing "spot price" callers want, use
-        ``get_latest_in_session_quote`` instead — that one filters to the
-        regular cash session so pre/after-hours drift on ETFs (and the
-        usual 4–8 PM ET extended-hours bars TradeStation streams under the
-        ``Default`` session template) doesn't move the displayed spot away
-        from the canonical 16:00 ET cash close after the bell.
+        For the canonical 16:00 ET cash close used as the headline price
+        anchor during AH / pre-market / closed / weekend sessions, callers
+        should read ``get_session_closes`` (or ``get_previous_close``)
+        instead — those apply the asset-type-aware closing-auction-print
+        vs settled-level selection. ``Header.tsx`` /
+        ``getPrimaryPriceChangeSummary`` already multiplexes between the
+        live tick (this method) and the cash-close anchor.
         """
         symbol = symbol.upper()
         cache_key = f"latest_quote:{symbol}"
@@ -3300,139 +3303,18 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching latest quote: {e!r}", exc_info=True)
             raise
 
-    async def get_latest_in_session_quote(
-        self, symbol: str = "SPY"
-    ) -> Optional[Dict[str, Any]]:
-        """Latest underlying quote restricted to the regular cash session.
-
-        Candidate bars: ET-local timestamp inside [09:30, 16:00] on
-        weekdays. Latest match is returned.
-
-        Universal rule, no time-of-day branching:
-
-          * Live (in-session):   latest cash-session bar = the in-progress
-                                 minute bar.
-          * Pre-market:          last Friday-or-prior 16:00 ET cash close —
-                                 pre-market drift doesn't move "spot".
-          * After-hours:         today's 16:00 ET cash close — extended-hours
-                                 prints are kept out of the displayed spot.
-          * Weekend / holiday:   the most recent trading day's 16:00 close.
-          * Half-day (e.g. 13:00 close): the 13:00 bar (still ≤ 16:00 ET).
-
-        Asset-type-aware close selection for the 16:00 bar
-        --------------------------------------------------
-        TradeStation start-of-minute-stamps its 1-minute bars, so the bar
-        timestamped 16:00:00 spans 16:00:00–16:00:59 ET — a window that
-        begins with the closing auction print and ends with the first ~60s
-        of after-hours trading. The bar's ``close`` (last tick in the
-        window) is therefore extended-hours-contaminated for any symbol
-        that trades AH. Asset type decides which field is the canonical
-        cash close:
-
-          * **non-INDEX (stocks/ETFs)**: ``open`` of the 16:00 bar = the
-            closing auction print, i.e. the official cash close consumers
-            see. On the data we calibrated against (Friday 2026-06-26):
-            SPY 16:00 ``open`` 729.01 vs official 728.99 ($0.02 residual);
-            QQQ 705.88 vs 706.52 ($0.64 — upstream vendor noise).
-            Compared to the bar's ``close`` (731.54 / 707.75) this is an
-            order of magnitude better.
-          * **INDEX (SPX, NDX, …)**: ``close`` of the 16:00 bar = the
-            post-auction settled index level. The ``open`` of the same
-            bar is the pre-auction snapshot and is far less accurate
-            (SPX 16:00 ``open`` 7335.70 vs ``close`` 7353.01 vs official
-            7354.03).
-
-        For any bar whose timestamp is NOT exactly 16:00 ET — i.e. every
-        live in-session bar from 09:30 through 15:59 — ``close`` is used
-        as usual, so live ticking is unchanged. The residual gap vs the
-        official close (small for SPY, $0.64 QQQ, $1 SPX) is a property
-        of TradeStation's tick aggregation and would require a second
-        data vendor to close further.
-
-        Vendor-behavior-agnostic on the WHERE side: independent of what
-        TradeStation's ``SESSION_TEMPLATE`` actually delivers — we
-        filter at read time.
-        """
-        symbol = symbol.upper()
-        cache_key = f"latest_in_session_quote:{symbol}"
-        cached = self._cache_get(cache_key)
-        if cached is not None:
-            return cached  # type: ignore[no-any-return]
-
-        query = """
-            WITH latest_quote AS (
-                SELECT
-                    uq.timestamp,
-                    uq.symbol,
-                    uq.open,
-                    uq.high,
-                    uq.low,
-                    uq.close,
-                    s.asset_type
-                FROM underlying_quotes uq
-                LEFT JOIN symbols s ON s.symbol = uq.symbol
-                WHERE uq.symbol = $1
-                  AND EXTRACT(
-                        DOW FROM (uq.timestamp AT TIME ZONE 'America/New_York')
-                      ) BETWEEN 1 AND 5
-                  AND (uq.timestamp AT TIME ZONE 'America/New_York')::time
-                        >= TIME '09:30'
-                  AND (uq.timestamp AT TIME ZONE 'America/New_York')::time
-                        <= TIME '16:00'
-                ORDER BY uq.timestamp DESC
-                LIMIT 1
-            )
-            SELECT
-                lq.timestamp,
-                lq.symbol,
-                lq.open,
-                lq.high,
-                lq.low,
-                -- Asset-type-aware cash-close selection for the 16:00 bar
-                -- only; every other bar's close is returned as-is so the
-                -- live in-session tick path is unchanged. See method
-                -- docstring for the auction-print / settle-level rationale.
-                CASE
-                    WHEN (lq.timestamp AT TIME ZONE 'America/New_York')::time
-                            = TIME '16:00'
-                     AND lq.asset_type IS DISTINCT FROM 'INDEX'
-                    THEN lq.open
-                    ELSE lq.close
-                END AS close,
-                COALESCE(udv.cumulative_daily_volume, 0)::bigint AS cumulative_daily_volume,
-                lq.asset_type
-            FROM latest_quote lq
-            LEFT JOIN underlying_daily_volume udv
-              ON udv.symbol = lq.symbol
-             AND udv.trade_date_et = (lq.timestamp AT TIME ZONE 'America/New_York')::date
-        """
-
-        try:
-            async with self._acquire_connection() as conn:
-                row = await conn.fetchrow(query, symbol)
-                payload = dict(row) if row else None
-                self._cache_set(
-                    cache_key,
-                    payload,
-                    self._latest_quote_cache_ttl_seconds,
-                )
-                return payload
-        except Exception as e:
-            logger.error(f"Error fetching latest in-session quote: {e!r}", exc_info=True)
-            raise
-
     async def get_previous_close(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
         """
         Get the most recent 4:00 PM ET close price (previous trading day's close).
         Works on any day including weekends and holidays.
 
         Uses the same asset-type-aware cash-close selection as
-        ``get_latest_in_session_quote``: for non-INDEX symbols the 16:00
-        bar's ``open`` is the closing-auction print (the canonical cash
-        close), not its ``close`` which captures the first ~60s of
-        after-hours trading due to TradeStation's start-of-minute bar
-        timestamping. For INDEX symbols the 16:00 ``close`` is the
-        post-auction settled level.
+        ``get_session_closes`` (see that docstring for the auction-print
+        vs settled-level rationale): for non-INDEX symbols the 16:00
+        bar's ``open`` is the closing-auction print, not its ``close``
+        which captures the first ~60s of after-hours trading due to
+        TradeStation's start-of-minute bar timestamping. For INDEX
+        symbols the 16:00 ``close`` is the post-auction settled level.
         """
         query = """
             WITH market_close_time AS (
@@ -3440,8 +3322,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 SELECT
                     uq.timestamp,
                     uq.symbol,
-                    -- Asset-aware cash-close: see get_latest_in_session_quote
-                    -- docstring for the auction-print / settle-level rationale.
+                    -- Asset-aware cash-close: see get_session_closes docstring
+                    -- for the auction-print / settle-level rationale.
                     CASE
                         WHEN s.asset_type IS DISTINCT FROM 'INDEX'
                         THEN uq.open
@@ -3522,21 +3404,46 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
           Today's session is only included if the current time is at/after 16:00 ET.
         prior_session_close = the session close immediately before current.
 
-        Uses the same asset-type-aware cash-close selection as
-        ``get_latest_in_session_quote``: for non-INDEX symbols the 16:00
-        bar's ``open`` is the closing-auction print, not its ``close``
-        which captures the first ~60s of after-hours. For INDEX symbols
-        the 16:00 ``close`` is the post-auction settled level. This is
-        the displayed header price during AH / weekends / holidays via
-        the ``current_session_close`` field consumed by Header.tsx, so
-        it MUST stay in lockstep with ``get_latest_in_session_quote``.
+        This endpoint is the canonical owner of the "asset-type-aware cash
+        close" rule, consumed by Header.tsx via ``current_session_close``
+        as the headline price during AH / pre-market / closed / weekend.
+        ``get_previous_close`` applies the same rule for its prior-day
+        anchor and references this docstring.
+
+        Asset-type-aware close selection for the 16:00 bar
+        --------------------------------------------------
+        TradeStation start-of-minute-stamps its 1-minute bars, so the bar
+        timestamped 16:00:00 spans 16:00:00–16:00:59 ET — a window that
+        begins with the closing auction print and ends with the first
+        ~60s of after-hours trading. The bar's ``close`` is therefore
+        extended-hours-contaminated for any symbol that trades AH. Asset
+        type decides which field is the canonical cash close:
+
+          * **non-INDEX (stocks/ETFs)**: ``open`` of the 16:00 bar = the
+            closing auction print, i.e. the official cash close consumers
+            see. On Friday 2026-06-26: SPY 16:00 ``open`` 729.01 vs
+            official 728.99 ($0.02 residual); QQQ 705.88 vs 706.52 ($0.64
+            — upstream vendor noise). Compared to the bar's ``close``
+            (731.54 / 707.75) this is an order of magnitude better.
+          * **INDEX (SPX, NDX, …)**: ``close`` of the 16:00 bar = the
+            post-auction settled index level. The bar's ``open`` is the
+            pre-auction snapshot and is far less accurate (SPX 16:00
+            ``open`` 7335.70 vs ``close`` 7353.01 vs official 7354.03).
+
+        For any bar whose timestamp is NOT exactly 16:00 ET — e.g. a
+        half-day's 13:00 early close — ``close`` is used as usual.
+
+        The live tick endpoint ``get_latest_quote`` deliberately does NOT
+        apply this rule: it returns the live AH price so the header's
+        extended-hours ticker, the GEX live spot, and chart tip-close
+        merge all see real-time prints.
         """
         query = """
             WITH session_closes AS (
                 SELECT DISTINCT ON ((uq.timestamp AT TIME ZONE 'America/New_York')::date)
                     uq.timestamp,
-                    -- Asset-aware cash-close: see get_latest_in_session_quote
-                    -- docstring for the auction-print / settle-level rationale.
+                    -- Asset-aware cash-close: see this method's docstring
+                    -- for the auction-print / settle-level rationale.
                     CASE
                         WHEN (uq.timestamp AT TIME ZONE 'America/New_York')::time = TIME '16:00'
                          AND s.asset_type IS DISTINCT FROM 'INDEX'
