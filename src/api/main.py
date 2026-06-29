@@ -54,6 +54,7 @@ from .routers.premium_surface import router as premium_surface_router
 from .routers.gex_flip_horizon import router as gex_flip_horizon_router
 from .routers.backtest import router as backtest_router
 from .routers.scorecard import router as scorecard_router
+from .routers.forecast import router as forecast_router
 
 # Logging is configured centrally in src.utils.logging; importing
 # get_logger triggers _configure_logging which honors LOG_LEVEL and
@@ -313,6 +314,10 @@ app.include_router(backtest_router, dependencies=[_scope_signals])
 # trading day's recap. Powers the public /scorecard/{date} permalink and the
 # 4:15 PM ET auto-tweet job. Same signals scope as /api/signals.
 app.include_router(scorecard_router, dependencies=[_scope_signals])
+# Daily Gamma Forecast — 7:00 AM ET commit + 4:05 PM ET receipt for the
+# public /forecast/{date} page. Read-only here; the writer cron jobs live
+# in src.jobs.forecast_writer and src.jobs.forecast_receipt.
+app.include_router(forecast_router, dependencies=[_scope_signals])
 
 # ============================================================================
 # Health Check

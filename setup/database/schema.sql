@@ -2178,3 +2178,82 @@ ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS sweep_id BIGINT
     REFERENCES backtest_sweeps(id) ON DELETE CASCADE;
 ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS sweep_cell JSONB;
 CREATE INDEX IF NOT EXISTS idx_backtest_runs_sweep ON backtest_runs(sweep_id, id);
+
+-- ============================================================================
+-- daily_forecast (Phase 3: Gamma Forecast Card + 4 PM Receipt)
+-- ============================================================================
+-- One row per trading day per symbol. The morning writer fills the OPEN_*
+-- columns at 07:00 ET and computes content_hash from the canonical payload;
+-- the row is then immutable for that day (the writer refuses to overwrite
+-- via the (symbol, date) primary key). The receipt writer fills the
+-- RECEIPT_* columns at 16:05 ET from the day's actual session OHLC; the
+-- immutability trigger prevents any later UPDATE from rewriting either
+-- block. The schema deliberately mirrors what the public /forecast/{date}
+-- page renders so the receipt is a faithful, falsifiable diff against the
+-- morning's commitment — no quiet retroactive edits possible.
+
+CREATE TABLE IF NOT EXISTS daily_forecast (
+    symbol              VARCHAR(10) NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    date                DATE        NOT NULL,
+    -- Morning snapshot — written at 07:00 ET, immutable thereafter.
+    open_ts             TIMESTAMPTZ NOT NULL,
+    open_spot           NUMERIC(12,4) NOT NULL,
+    call_wall           NUMERIC(12,4),
+    put_wall            NUMERIC(12,4),
+    gamma_flip          NUMERIC(12,4),
+    open_msi            NUMERIC(8,4),
+    regime              VARCHAR(32) NOT NULL,  -- 'long_gamma' | 'short_gamma' | 'transition'
+    projected_low       NUMERIC(12,4) NOT NULL,
+    projected_high      NUMERIC(12,4) NOT NULL,
+    projected_close     NUMERIC(12,4),
+    pin_strike          NUMERIC(12,4),
+    flagship_setup      JSONB,                 -- Playbook Action Card or null
+    range_model         VARCHAR(32) NOT NULL,  -- e.g. 'heuristic_v1', 'quantile_v1'
+    content_hash        TEXT        NOT NULL,
+    -- Receipt — written at 16:05 ET, never rewritten.
+    receipt_ts          TIMESTAMPTZ,
+    actual_low          NUMERIC(12,4),
+    actual_high         NUMERIC(12,4),
+    actual_close        NUMERIC(12,4),
+    range_respected     BOOLEAN,
+    pin_hit             BOOLEAN,
+    regime_correct      BOOLEAN,
+    setup_outcome       JSONB,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (symbol, date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_forecast_date_desc
+    ON daily_forecast(date DESC);
+CREATE INDEX IF NOT EXISTS idx_daily_forecast_symbol_date_desc
+    ON daily_forecast(symbol, date DESC);
+
+-- Immutability: the morning snapshot is set once on INSERT and the receipt
+-- is set once when the morning row exists. Any UPDATE that tries to change
+-- a non-null morning column to a different value — or a non-null receipt
+-- column to a different value — raises. Allows NULL → value transitions
+-- (the receipt-write path) but rejects value → value' rewrites.
+CREATE OR REPLACE FUNCTION enforce_daily_forecast_immutability()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Morning columns are immutable after the initial INSERT.
+    IF OLD.open_ts          IS NOT NULL AND NEW.open_ts          IS DISTINCT FROM OLD.open_ts          THEN RAISE EXCEPTION 'daily_forecast.open_ts is immutable'; END IF;
+    IF OLD.open_spot        IS NOT NULL AND NEW.open_spot        IS DISTINCT FROM OLD.open_spot        THEN RAISE EXCEPTION 'daily_forecast.open_spot is immutable'; END IF;
+    IF OLD.projected_low    IS NOT NULL AND NEW.projected_low    IS DISTINCT FROM OLD.projected_low    THEN RAISE EXCEPTION 'daily_forecast.projected_low is immutable'; END IF;
+    IF OLD.projected_high   IS NOT NULL AND NEW.projected_high   IS DISTINCT FROM OLD.projected_high   THEN RAISE EXCEPTION 'daily_forecast.projected_high is immutable'; END IF;
+    IF OLD.regime           IS NOT NULL AND NEW.regime           IS DISTINCT FROM OLD.regime           THEN RAISE EXCEPTION 'daily_forecast.regime is immutable'; END IF;
+    IF OLD.content_hash     IS NOT NULL AND NEW.content_hash     IS DISTINCT FROM OLD.content_hash     THEN RAISE EXCEPTION 'daily_forecast.content_hash is immutable'; END IF;
+    -- Receipt columns are immutable once written.
+    IF OLD.receipt_ts       IS NOT NULL AND NEW.receipt_ts       IS DISTINCT FROM OLD.receipt_ts       THEN RAISE EXCEPTION 'daily_forecast.receipt_ts is immutable once set'; END IF;
+    IF OLD.actual_close     IS NOT NULL AND NEW.actual_close     IS DISTINCT FROM OLD.actual_close     THEN RAISE EXCEPTION 'daily_forecast.actual_close is immutable once set'; END IF;
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS daily_forecast_immutable ON daily_forecast;
+CREATE TRIGGER daily_forecast_immutable
+    BEFORE UPDATE ON daily_forecast
+    FOR EACH ROW
+    EXECUTE FUNCTION enforce_daily_forecast_immutability();

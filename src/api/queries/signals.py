@@ -1519,3 +1519,236 @@ class SignalsQueriesMixin:
                 exc,
             )
             return []
+
+    # ------------------------------------------------------------------
+    # Daily Forecast (Phase 3: Gamma Forecast Card + 4 PM Receipt)
+    # ------------------------------------------------------------------
+
+    async def insert_daily_forecast_morning(
+        self, payload: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Persist the 7:00 AM ET morning snapshot for one trading day.
+
+        Idempotent: the (symbol, date) primary key plus the morning-column
+        immutability trigger guarantee that re-running the writer cannot
+        overwrite a row already committed for the day. Returns the resulting
+        row dict (whether freshly inserted or pre-existing) so the caller
+        can confirm the content_hash matches what they computed.
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO daily_forecast (
+                        symbol, date, open_ts, open_spot,
+                        call_wall, put_wall, gamma_flip, open_msi,
+                        regime, projected_low, projected_high, projected_close,
+                        pin_strike, flagship_setup, range_model, content_hash
+                    )
+                    VALUES (
+                        $1, $2, $3, $4,
+                        $5, $6, $7, $8,
+                        $9, $10, $11, $12,
+                        $13, $14::jsonb, $15, $16
+                    )
+                    ON CONFLICT (symbol, date) DO NOTHING
+                    RETURNING symbol, date, open_ts, open_spot, call_wall,
+                              put_wall, gamma_flip, open_msi, regime,
+                              projected_low, projected_high, projected_close,
+                              pin_strike, flagship_setup, range_model,
+                              content_hash, created_at
+                    """,
+                    payload["symbol"],
+                    payload["date"],
+                    payload["open_ts"],
+                    payload["open_spot"],
+                    payload.get("call_wall"),
+                    payload.get("put_wall"),
+                    payload.get("gamma_flip"),
+                    payload.get("open_msi"),
+                    payload["regime"],
+                    payload["projected_low"],
+                    payload["projected_high"],
+                    payload.get("projected_close"),
+                    payload.get("pin_strike"),
+                    json.dumps(payload.get("flagship_setup"), default=str)
+                    if payload.get("flagship_setup") is not None
+                    else None,
+                    payload["range_model"],
+                    payload["content_hash"],
+                )
+                if row is not None:
+                    return dict(row)
+                # ON CONFLICT no-op: return the existing row so callers can
+                # log "already committed" rather than silently double-running.
+                existing = await conn.fetchrow(
+                    """
+                    SELECT * FROM daily_forecast
+                    WHERE symbol = $1 AND date = $2
+                    """,
+                    payload["symbol"], payload["date"],
+                )
+                return dict(existing) if existing else None
+        except Exception as exc:
+            logger.warning(
+                "insert_daily_forecast_morning failed (%s, %s): %s",
+                payload.get("symbol"), payload.get("date"), exc,
+            )
+            return None
+
+    async def update_daily_forecast_receipt(
+        self,
+        symbol: str,
+        forecast_date: date,
+        receipt_ts: datetime,
+        actual_low: float,
+        actual_high: float,
+        actual_close: float,
+        setup_outcome: Optional[Dict[str, Any]] = None,
+        pin_tolerance: float = 1.0,
+    ) -> Optional[Dict[str, Any]]:
+        """Write the 4:05 PM ET receipt for an existing morning row.
+
+        Computes derived verdicts (``range_respected`` / ``pin_hit`` /
+        ``regime_correct``) from the actual OHLC against the immutable
+        morning columns. Skips silently and returns None if no morning row
+        exists (the writer either never ran or failed earlier in the day);
+        skips silently and returns the existing row if the receipt has
+        already been written (the trigger enforces immutability).
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT projected_low, projected_high, pin_strike, regime,
+                           open_spot, receipt_ts
+                    FROM daily_forecast
+                    WHERE symbol = $1 AND date = $2
+                    """,
+                    symbol, forecast_date,
+                )
+                if row is None:
+                    logger.info(
+                        "update_daily_forecast_receipt: no morning row for %s %s — skipping",
+                        symbol, forecast_date.isoformat(),
+                    )
+                    return None
+                if row["receipt_ts"] is not None:
+                    logger.info(
+                        "update_daily_forecast_receipt: receipt already written for %s %s — skipping",
+                        symbol, forecast_date.isoformat(),
+                    )
+                    return dict(row)
+
+                projected_low = float(row["projected_low"])
+                projected_high = float(row["projected_high"])
+                pin_strike = (
+                    float(row["pin_strike"]) if row["pin_strike"] is not None else None
+                )
+                regime = row["regime"]
+                open_spot = float(row["open_spot"])
+
+                # Range respected = the day's traded high/low both sat
+                # inside the band. Wicks count: the band is a no-touch
+                # prediction, not a 90%-of-bars threshold.
+                range_respected = (
+                    actual_low >= projected_low and actual_high <= projected_high
+                )
+                pin_hit = (
+                    pin_strike is not None
+                    and abs(actual_close - pin_strike) <= pin_tolerance
+                )
+                # Regime correctness: long-gamma days should chop (close
+                # within 0.5% of open); short-gamma days should trend
+                # (close moved more than 0.5%). Transition days are
+                # neutral — never marked wrong.
+                move_pct = abs(actual_close - open_spot) / open_spot if open_spot else 0.0
+                if regime == "long_gamma":
+                    regime_correct = move_pct <= 0.005
+                elif regime == "short_gamma":
+                    regime_correct = move_pct > 0.005
+                else:
+                    regime_correct = None
+
+                updated = await conn.fetchrow(
+                    """
+                    UPDATE daily_forecast
+                    SET receipt_ts = $3,
+                        actual_low = $4,
+                        actual_high = $5,
+                        actual_close = $6,
+                        range_respected = $7,
+                        pin_hit = $8,
+                        regime_correct = $9,
+                        setup_outcome = $10::jsonb
+                    WHERE symbol = $1 AND date = $2
+                    RETURNING *
+                    """,
+                    symbol, forecast_date, receipt_ts,
+                    actual_low, actual_high, actual_close,
+                    range_respected, pin_hit, regime_correct,
+                    json.dumps(setup_outcome, default=str) if setup_outcome else None,
+                )
+                return dict(updated) if updated else None
+        except Exception as exc:
+            logger.warning(
+                "update_daily_forecast_receipt failed (%s, %s): %s",
+                symbol, forecast_date, exc,
+            )
+            return None
+
+    async def get_daily_forecast(
+        self, symbol: str, forecast_date: date
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch one symbol/date forecast row, morning + receipt combined."""
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT * FROM daily_forecast
+                    WHERE symbol = $1 AND date = $2
+                    """,
+                    symbol, forecast_date,
+                )
+                if row is None:
+                    return None
+                out = dict(row)
+                for key in ("flagship_setup", "setup_outcome"):
+                    val = out.get(key)
+                    if isinstance(val, str):
+                        try:
+                            out[key] = json.loads(val)
+                        except json.JSONDecodeError:
+                            out[key] = None
+                return out
+        except Exception as exc:
+            logger.warning(
+                "get_daily_forecast failed (%s, %s): %s", symbol, forecast_date, exc,
+            )
+            return None
+
+    async def get_daily_forecast_history(
+        self, symbol: str, limit: int = 30
+    ) -> List[Dict[str, Any]]:
+        """Recent forecasts (newest first) — powers the stats endpoint and
+        the website's rolling hit-rate strip."""
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT symbol, date, open_spot, projected_low, projected_high,
+                           pin_strike, regime, range_respected, pin_hit,
+                           regime_correct, actual_close, receipt_ts
+                    FROM daily_forecast
+                    WHERE symbol = $1
+                    ORDER BY date DESC
+                    LIMIT $2
+                    """,
+                    symbol, int(limit),
+                )
+                return [dict(r) for r in rows]
+        except Exception as exc:
+            logger.warning(
+                "get_daily_forecast_history failed (%s): %s", symbol, exc,
+            )
+            return []

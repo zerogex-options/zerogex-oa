@@ -1764,6 +1764,39 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching GEX by strike: {e}", exc_info=True)
             raise
 
+    async def get_underlying_bars_for_session(
+        self, symbol: str, session_date: date
+    ) -> List[Dict[str, Any]]:
+        """Cash-session 1-min bars for one ET trading day.
+
+        Returns a chronological list of ``{timestamp, open, high, low, close}``
+        dicts for the 09:30–16:00 America/New_York window. Used by the
+        4:05 PM ET forecast-receipt cron to compute the day's actual low /
+        high / close against the morning's commitment.
+
+        Returns ``[]`` on any error so the cron can fall back to a
+        degenerate (close-only) receipt rather than crashing the timer.
+        """
+        query = """
+            SELECT timestamp, open, high, low, close
+            FROM underlying_quotes
+            WHERE symbol = $1
+              AND (timestamp AT TIME ZONE 'America/New_York')::date = $2
+              AND (timestamp AT TIME ZONE 'America/New_York')::time
+                  BETWEEN TIME '09:30' AND TIME '16:00'
+            ORDER BY timestamp ASC
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, session_date)
+            return [dict(r) for r in rows]
+        except Exception as e:
+            logger.warning(
+                "get_underlying_bars_for_session(%s, %s) failed: %s",
+                symbol, session_date, e,
+            )
+            return []
+
     async def get_recent_underlying_bars(
         self, symbol: str, limit: int = 120
     ) -> Tuple[List[float], List[float], List[float]]:

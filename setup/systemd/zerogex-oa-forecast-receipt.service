@@ -1,0 +1,30 @@
+[Unit]
+Description=ZeroGEX Gamma Forecast receipt writer (16:05 ET)
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Reads the day's actual cash-session OHLC, computes the verdict columns
+# (range_respected / pin_hit / regime_correct / setup_outcome) against
+# the immutable morning commitment, and writes them once.  The
+# immutability trigger blocks any later edit — a receipt is forever.
+ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.forecast_receipt
+
+TimeoutStartSec=120
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-forecast-receipt

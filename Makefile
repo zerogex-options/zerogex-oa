@@ -3513,6 +3513,65 @@ scorecard-tweet-status: ## Show scorecard tweet timer status + last/next fire + 
 	@sudo journalctl -u zerogex-oa-scorecard-tweet -n 30 --no-pager || true
 
 # =============================================================================
+# Daily Gamma Forecast Card + 4 PM Receipt (07:00 + 16:05 ET weekdays)
+# =============================================================================
+# Two crons that commit + grade one immutable daily_forecast row per trading
+# day per symbol.  Override symbol with FORECAST_SYMBOLS=SPY (default), or
+# backfill a specific date with FORECAST_DATE=YYYY-MM-DD.
+.PHONY: forecast-writer-dry-run
+forecast-writer-dry-run: ## Dry-run today's morning forecast (always logs, never writes)
+	@echo "$(BLUE)=== Dry-run Gamma Forecast writer ===$(NC)"
+	@$(PY) -m src.jobs.forecast_writer --dry-run \
+		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
+		$(if $(FORECAST_SYMBOLS),--symbol $(FORECAST_SYMBOLS))
+
+.PHONY: forecast-writer
+forecast-writer: ## Write today's morning forecast row (idempotent; immutable after first write)
+	@echo "$(BLUE)=== Writing Gamma Forecast morning row ===$(NC)"
+	@$(PY) -m src.jobs.forecast_writer \
+		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
+		$(if $(FORECAST_SYMBOLS),--symbol $(FORECAST_SYMBOLS))
+
+.PHONY: forecast-receipt-dry-run
+forecast-receipt-dry-run: ## Dry-run today's forecast receipt (always logs, never writes)
+	@echo "$(BLUE)=== Dry-run Gamma Forecast receipt ===$(NC)"
+	@$(PY) -m src.jobs.forecast_receipt --dry-run \
+		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
+		$(if $(FORECAST_SYMBOLS),--symbol $(FORECAST_SYMBOLS))
+
+.PHONY: forecast-receipt
+forecast-receipt: ## Write today's receipt against the immutable morning commitment
+	@echo "$(BLUE)=== Writing Gamma Forecast receipt ===$(NC)"
+	@$(PY) -m src.jobs.forecast_receipt \
+		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
+		$(if $(FORECAST_SYMBOLS),--symbol $(FORECAST_SYMBOLS))
+
+.PHONY: forecast-install
+forecast-install: ## Install both forecast timers (07:00 writer, 16:05 receipt; Mon-Fri)
+	@echo "$(BLUE)=== Installing Forecast Timers ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-forecast-writer.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-writer.timer /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-receipt.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-receipt.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-forecast-writer.timer
+	@sudo systemctl enable --now zerogex-oa-forecast-receipt.timer
+	@echo "$(GREEN)✅ Forecast timers installed (07:00 writer, 16:05 receipt; Mon-Fri)$(NC)"
+	@echo "$(YELLOW)Status:  systemctl list-timers 'zerogex-oa-forecast-*'$(NC)"
+	@echo "$(YELLOW)Logs:    journalctl -u zerogex-oa-forecast-writer -u zerogex-oa-forecast-receipt$(NC)"
+
+.PHONY: forecast-status
+forecast-status: ## Show both forecast timers + last/next fire + recent logs
+	@echo "$(BLUE)=== Forecast Timers ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-forecast-*.timer' || true
+	@echo ""
+	@systemctl status zerogex-oa-forecast-writer.service --no-pager -l || true
+	@echo ""
+	@systemctl status zerogex-oa-forecast-receipt.service --no-pager -l || true
+	@echo ""
+	@sudo journalctl -u zerogex-oa-forecast-writer -u zerogex-oa-forecast-receipt -n 30 --no-pager || true
+
+# =============================================================================
 # Daily ATM IV history backfill (pre-open seed of daily_atm_iv)
 # =============================================================================
 # Re-seeds the trailing 30 days of daily_atm_iv from option_chains.  The live
