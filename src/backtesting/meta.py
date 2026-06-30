@@ -149,6 +149,27 @@ def _extract_description(doc: str) -> str:
     return text[:280]
 
 
+def _docstring_for_pattern(p) -> str:
+    """Return the most useful docstring available for a pattern instance.
+
+    Convention across ``src/signals/playbook/patterns/*.py`` is that the
+    natural-language description lives in the MODULE docstring, not on the
+    class itself (the classes typically have no docstring of their own). So
+    we look up the module via ``__module__`` and read its docstring,
+    falling back to the class's own docstring if a future pattern is
+    written class-doc-first.
+    """
+    import sys
+
+    module_name = getattr(type(p), "__module__", "") or getattr(p, "__module__", "")
+    module_doc = ""
+    if module_name and module_name in sys.modules:
+        module_doc = (sys.modules[module_name].__doc__ or "").strip()
+    if module_doc:
+        return module_doc
+    return (type(p).__doc__ or getattr(p, "__doc__", "") or "").strip()
+
+
 def _pattern_catalog() -> list[dict]:
     """Discover the built-in playbook patterns and describe each."""
     try:
@@ -160,8 +181,7 @@ def _pattern_catalog() -> list[dict]:
         return []
     out = []
     for p in patterns:
-        doc = (getattr(p, "__doc__", "") or type(p).__doc__ or "").strip()
-        description = _extract_description(doc)
+        description = _extract_description(_docstring_for_pattern(p))
         out.append(
             {
                 "id": getattr(p, "id", "") or "",

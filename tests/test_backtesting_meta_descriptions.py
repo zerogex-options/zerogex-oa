@@ -10,7 +10,10 @@ so it needs to be the readable paragraph, not the dev header.
 
 from __future__ import annotations
 
-from src.backtesting.meta import _extract_description
+import sys
+import types
+
+from src.backtesting.meta import _docstring_for_pattern, _extract_description
 
 
 def test_strips_header_line_and_returns_first_paragraph():
@@ -112,3 +115,60 @@ def test_drops_leading_blank_lines_in_docstring():
     doc = "\n\n  Pattern 1.4: ``x`` — X.\n\n  Real explanation here.\n"
     description = _extract_description(doc)
     assert description == "Real explanation here."
+
+
+# ----------------------------------------------------------------------
+# _docstring_for_pattern — module-vs-class docstring lookup
+# ----------------------------------------------------------------------
+
+
+def _make_fake_pattern(module_name: str, module_doc: str | None, class_doc: str | None):
+    """Build a fake pattern instance whose __module__ points at a temp
+    module with ``module_doc`` and whose class has ``class_doc``. Used to
+    cover the module-vs-class precedence in _docstring_for_pattern.
+    """
+    fake_module = types.ModuleType(module_name)
+    fake_module.__doc__ = module_doc
+    sys.modules[module_name] = fake_module
+    cls = type("FakePattern", (), {"__module__": module_name, "__doc__": class_doc})
+    return cls()
+
+
+def test_docstring_for_pattern_prefers_module_doc():
+    # Real patterns put the description on the MODULE, not the class — so
+    # the lookup must read the module's __doc__ first.
+    p = _make_fake_pattern(
+        "tests._fake_pattern_module_only",
+        "Module-level docstring.",
+        None,
+    )
+    assert _docstring_for_pattern(p) == "Module-level docstring."
+
+
+def test_docstring_for_pattern_falls_back_to_class_doc():
+    # If a future pattern is class-doc-first (rare), don't lose its
+    # description just because the module has none.
+    p = _make_fake_pattern(
+        "tests._fake_pattern_class_only",
+        None,
+        "Class-level docstring.",
+    )
+    assert _docstring_for_pattern(p) == "Class-level docstring."
+
+
+def test_docstring_for_pattern_returns_empty_when_both_missing():
+    p = _make_fake_pattern("tests._fake_pattern_none", None, None)
+    assert _docstring_for_pattern(p) == ""
+
+
+def test_docstring_for_pattern_real_pattern_has_module_doc():
+    # End-to-end smoke: at least one real pattern in the catalog must have
+    # a non-empty module docstring. Cheap insurance against future code that
+    # accidentally drops the docstrings.
+    from src.signals.playbook.engine import PlaybookEngine
+
+    patterns = PlaybookEngine._discover_builtin_patterns()
+    assert any(_docstring_for_pattern(p) for p in patterns), (
+        "no playbook pattern has a discoverable docstring — meta descriptions "
+        "would all be empty"
+    )
