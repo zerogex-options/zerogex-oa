@@ -243,6 +243,16 @@ def test_action_card_async_insert_is_idempotent_guarded():
     captured: list = []
 
     class _Conn:
+        # insert_action_card now uses fetchval() so the INSERT can RETURNING
+        # the persisted row id (needed by /api/signals/action to attach `id`
+        # to the live response for the /cards/{id} permalink). The legacy
+        # execute() shim stays a no-op so any rare-path caller is quiet.
+        async def fetchval(self, sql, *args):
+            captured.append((sql, args))
+            # Simulate a fresh insert: return the synthetic primary key. Any
+            # follow-up existing-id lookup lands as a second capture entry.
+            return 4221
+
         async def execute(self, sql, *args):
             captured.append((sql, args))
 
@@ -254,7 +264,7 @@ def test_action_card_async_insert_is_idempotent_guarded():
     db._acquire_connection = _acq.__get__(db, DatabaseManager)
 
     ts = datetime(2026, 5, 15, 18, 30, tzinfo=timezone.utc)
-    asyncio.run(
+    inserted_id = asyncio.run(
         db.insert_action_card(
             {
                 "underlying": "SPY",
@@ -268,11 +278,16 @@ def test_action_card_async_insert_is_idempotent_guarded():
         )
     )
 
+    # Fresh-insert path: exactly one fetchval; existing-id fallback only
+    # fires when the INSERT no-ops via the idempotency guard, which our
+    # fake doesn't simulate.
     assert len(captured) == 1
+    assert inserted_id == 4221
     sql, args = captured[0]
     norm = " ".join(sql.split())
     assert "INSERT INTO signal_action_cards" in norm
     assert "WHERE NOT EXISTS" in norm
+    assert "RETURNING id" in norm
     # asyncpg positional reuse: dedup keys reuse $1 (underlying), $3
     # (pattern), $2 (timestamp) — so the arg count is UNCHANGED at 8.
     # Each reused parameter MUST carry an explicit type cast in BOTH the
