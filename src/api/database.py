@@ -1879,9 +1879,24 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         start_utc = start_et.astimezone(utc)
         end_utc = end_et.astimezone(utc)
 
+        # Session spot (last cash-session underlying_quotes close for the
+        # date) sizes the strike band once for the whole session.  gex_summary
+        # itself carries no spot column — the analytics engine records levels
+        # (walls, flip, GEX) but the spot underlying comes from underlying_quotes.
+        # gex_by_strike already stores a per-strike net_gex; AVG across
+        # expirations mirrors the aggregation get_gex_heatmap uses.
         query = """
-            WITH session_summary AS (
-                SELECT timestamp, spot_price, gamma_flip
+            WITH session_spot AS (
+                SELECT close::numeric AS spot_close
+                FROM underlying_quotes
+                WHERE symbol = $1
+                  AND timestamp >= $2
+                  AND timestamp < $3
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            session_summary AS (
+                SELECT timestamp, gamma_flip_point AS gamma_flip
                 FROM gex_summary
                 WHERE underlying = $1
                   AND timestamp >= $2
@@ -1890,19 +1905,19 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             SELECT
                 s.timestamp,
                 s.gamma_flip,
-                s.spot_price,
                 gbs.strike,
-                ((gbs.call_gamma - gbs.put_gamma) * 100
-                    * s.spot_price * s.spot_price * 0.01) AS net_gex
+                AVG(gbs.net_gex) AS net_gex
             FROM session_summary s
             LEFT JOIN gex_by_strike gbs
               ON gbs.underlying = $1
              AND gbs.timestamp = s.timestamp
-             -- Strike band ±$4 for SPY equivalent; expands with spot so
-             -- SPX/NDX cover a comparable dollar band. Filter here (in SQL)
-             -- rather than post-fetch so we don't ship 40k rows over the wire.
-             AND (gbs.strike IS NULL OR
-                  ABS(gbs.strike - s.spot_price) <= s.spot_price * $4)
+             -- Strike band centered on the session's closing spot; filter
+             -- in SQL so we don't ship every strike (~40k for SPX) over the
+             -- wire.  Missing session_spot (rare — index with no cash quotes
+             -- yet) short-circuits to no-band, matching get_gex_heatmap.
+             AND ABS(gbs.strike - (SELECT spot_close FROM session_spot))
+                 <= (SELECT spot_close FROM session_spot) * $4
+            GROUP BY s.timestamp, s.gamma_flip, gbs.strike
             ORDER BY s.timestamp ASC, gbs.strike ASC
         """
         try:
