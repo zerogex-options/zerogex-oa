@@ -167,38 +167,33 @@ async def get_replay_range(
         ..., alias="date", description="Trading day YYYY-MM-DD (ET)."
     ),
     timeframe: str = Query(default="1min", pattern="^(1min|5min|15min)$"),
-    window_units: int = Query(default=300, ge=1, le=300),
+    strike_band_pct: float = Query(default=0.04, ge=0.005, le=0.10),
     db: DatabaseManager = Depends(get_db),
 ):
     """All replay frames for one session — bundled for the playhead buffer.
 
-    Returns the heatmap matrix (strike × time) plus the per-minute
-    gex_summary timeline so a single round-trip pre-warms an entire
-    session into the browser's IndexedDB. The scrubber then renders
-    locally without a per-frame fetch.
+    Returns per-minute ``gex_summary`` + ``gex_by_strike`` bars for the
+    requested ET session date so a single round-trip pre-warms an entire
+    session into the browser. The scrubber then renders locally without
+    a per-frame fetch.
 
-    ``timeframe`` controls the per-bar bucket the heatmap matrix is
-    aggregated to: ``1min`` is the canonical frame cadence; ``5min`` /
-    ``15min`` produce coarser scrubbing for quick session overviews.
+    ``strike_band_pct`` filters strikes to a ±band around each bar's
+    spot so the payload stays bounded — a full-chain SPX session would
+    be ~40k rows otherwise. Default 4% covers the strikes that actually
+    matter for a same-day dealer-positioning view.
+
+    ``timeframe`` is accepted but currently ignored: we always return
+    1-min frames. 5-min / 15-min down-sampling is a v2 optimization
+    when payload size becomes a real problem.
     """
     sym = symbol.upper()
     target = _parse_date(session_date)
-    start_utc, _end_utc = _et_session_window(target)
     today_et = datetime.now(tz=ET).date()
     is_today = target == today_et
 
-    # window_units is bar-bound to the heatmap query; we explicitly
-    # request the entire cash session by oversizing it (300 1-min bars =
-    # 5h, beyond a full ETF cash session). The query clamps internally.
-    heatmap = await db.get_gex_heatmap(sym, timeframe=timeframe, window_units=window_units)
-    # Heatmap is newest-first; trim to the requested session window and
-    # reverse to chronological order for the scrubber.
-    in_window = [
-        bar for bar in heatmap
-        if bar.get("timestamp") is not None
-        and start_utc <= bar["timestamp"] < (start_utc + timedelta(hours=6, minutes=30))
-    ]
-    in_window.reverse()
+    raw_frames = await db.get_gex_frames_for_session(
+        sym, target, strike_band_pct=strike_band_pct,
+    )
 
     frames = [
         {
@@ -206,10 +201,10 @@ async def get_replay_range(
             "gamma_flip": _f(bar.get("gamma_flip")),
             "strikes": [
                 {"strike": _f(s.get("strike")), "net_gex": _f(s.get("net_gex"))}
-                for s in (bar.get("heatmap") or [])
+                for s in (bar.get("strikes") or [])
             ],
         }
-        for bar in in_window
+        for bar in raw_frames
     ]
     return {
         "symbol": sym,

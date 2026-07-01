@@ -1851,6 +1851,88 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             )
             return []
 
+    async def get_gex_frames_for_session(
+        self, symbol: str, session_date: date, strike_band_pct: float = 0.04,
+    ) -> List[Dict[str, Any]]:
+        """Every per-minute GEX frame for one cash-session date (09:30-16:00 ET).
+
+        Powers /api/replay/range for a specific historical day. Anchors on
+        the requested date's session window (converted to UTC via ET
+        ZoneInfo — DST-aware) rather than the "latest N buckets" anchor
+        that ``get_gex_heatmap`` uses, which is why the heatmap query
+        can't stand in for arbitrary date replay.
+
+        Returns chronological list of ``{timestamp, gamma_flip, strikes}``
+        rows. Each frame's ``strikes`` is a list of ``{strike, net_gex}``
+        entries filtered to a ±``strike_band_pct`` band around the bar's
+        spot so the payload stays bounded (a full session at every strike
+        would be ~40k rows for SPX).
+
+        Returns ``[]`` on any error so the endpoint can render an empty
+        state instead of crashing.
+        """
+        et = ZoneInfo("America/New_York")
+        utc = ZoneInfo("UTC")
+        start_et = datetime.combine(session_date, time(9, 30), tzinfo=et)
+        # +1 minute so the 16:00 bar itself is included.
+        end_et = datetime.combine(session_date, time(16, 1), tzinfo=et)
+        start_utc = start_et.astimezone(utc)
+        end_utc = end_et.astimezone(utc)
+
+        query = """
+            WITH session_summary AS (
+                SELECT timestamp, spot_price, gamma_flip
+                FROM gex_summary
+                WHERE underlying = $1
+                  AND timestamp >= $2
+                  AND timestamp < $3
+            )
+            SELECT
+                s.timestamp,
+                s.gamma_flip,
+                s.spot_price,
+                gbs.strike,
+                ((gbs.call_gamma - gbs.put_gamma) * 100
+                    * s.spot_price * s.spot_price * 0.01) AS net_gex
+            FROM session_summary s
+            LEFT JOIN gex_by_strike gbs
+              ON gbs.underlying = $1
+             AND gbs.timestamp = s.timestamp
+             -- Strike band ±$4 for SPY equivalent; expands with spot so
+             -- SPX/NDX cover a comparable dollar band. Filter here (in SQL)
+             -- rather than post-fetch so we don't ship 40k rows over the wire.
+             AND (gbs.strike IS NULL OR
+                  ABS(gbs.strike - s.spot_price) <= s.spot_price * $4)
+            ORDER BY s.timestamp ASC, gbs.strike ASC
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    query, symbol, start_utc, end_utc, float(strike_band_pct),
+                )
+        except Exception as e:
+            logger.warning(
+                "get_gex_frames_for_session(%s, %s) failed: %s",
+                symbol, session_date, e,
+            )
+            return []
+
+        # Group by timestamp preserving chronological order (dict insertion).
+        frames: dict = {}
+        for r in rows:
+            ts = r["timestamp"]
+            if ts not in frames:
+                frames[ts] = {
+                    "timestamp": ts,
+                    "gamma_flip": r["gamma_flip"],
+                    "strikes": [],
+                }
+            if r["strike"] is not None:
+                frames[ts]["strikes"].append(
+                    {"strike": r["strike"], "net_gex": r["net_gex"]}
+                )
+        return list(frames.values())
+
     async def get_replay_session_dates(
         self, symbol: str, limit: int = 30
     ) -> List[Dict[str, Any]]:
