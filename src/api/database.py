@@ -1764,6 +1764,159 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching GEX by strike: {e}", exc_info=True)
             raise
 
+    async def get_gex_summary_at_ts(
+        self, symbol: str, at_ts: datetime
+    ) -> Optional[Dict[str, Any]]:
+        """Most recent ``gex_summary`` row at or before ``at_ts``.
+
+        Used by the replay endpoints to anchor a per-minute frame against
+        the headline GEX snapshot (spot, call_wall, put_wall, gamma_flip,
+        max_pain) closest to a user-selected scrubber timestamp. Returns
+        None when no row at-or-before exists (e.g. requesting a moment
+        before the engine first wrote for this symbol).
+        """
+        query = """
+            SELECT timestamp, underlying as symbol, spot_price,
+                   total_call_gex, total_put_gex, net_gex, net_gex_at_spot,
+                   gamma_flip, gamma_flip_raw, gamma_flip_span_used,
+                   flip_distance, max_pain, call_wall, put_wall,
+                   total_call_oi, total_put_oi, put_call_ratio
+            FROM gex_summary
+            WHERE underlying = $1
+              AND timestamp <= $2
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(query, symbol, at_ts)
+                return dict(row) if row else None
+        except Exception as e:
+            logger.warning(
+                "get_gex_summary_at_ts(%s, %s) failed: %s", symbol, at_ts, e,
+            )
+            return None
+
+    async def get_gex_by_strike_at_ts(
+        self, symbol: str, at_ts: datetime, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Per-strike GEX breakdown at a specific historical timestamp.
+
+        Like ``get_gex_by_strike`` (latest), but pinned to a user-selected
+        minute and ordered by absolute impact so the replay's bar chart
+        always shows the most structurally meaningful strikes for that
+        moment. Spot price is taken from the matching ``gex_summary`` row
+        rather than ``underlying_quotes`` so the historical $ GEX values
+        reflect the spot that drove the original calculation.
+        """
+        query = """
+            WITH anchor AS (
+                SELECT timestamp, spot_price
+                FROM gex_summary
+                WHERE underlying = $1
+                  AND timestamp <= $2
+                ORDER BY timestamp DESC
+                LIMIT 1
+            )
+            SELECT
+                g.timestamp,
+                g.underlying as symbol,
+                g.strike,
+                g.expiration,
+                g.call_oi,
+                g.put_oi,
+                g.call_volume,
+                g.put_volume,
+                (g.call_gamma * 100 * a.spot_price * a.spot_price * 0.01) AS call_gex,
+                (-1 * g.put_gamma * 100 * a.spot_price * a.spot_price * 0.01) AS put_gex,
+                ((g.call_gamma - g.put_gamma) * 100 * a.spot_price * a.spot_price * 0.01) AS net_gex,
+                g.vanna_exposure,
+                g.charm_exposure,
+                a.spot_price,
+                g.strike - a.spot_price AS distance_from_spot
+            FROM gex_by_strike g
+            CROSS JOIN anchor a
+            WHERE g.underlying = $1
+              AND g.timestamp = a.timestamp
+            ORDER BY ABS(g.strike - a.spot_price) ASC
+            LIMIT $3
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, at_ts, int(limit))
+                return [dict(r) for r in rows]
+        except Exception as e:
+            logger.warning(
+                "get_gex_by_strike_at_ts(%s, %s) failed: %s", symbol, at_ts, e,
+            )
+            return []
+
+    async def get_replay_session_dates(
+        self, symbol: str, limit: int = 30
+    ) -> List[Dict[str, Any]]:
+        """Distinct trading dates that have ``gex_summary`` rows, newest first.
+
+        Used by the replay date picker. Returns up to ``limit`` dates with
+        bar-count + first/last timestamp metadata so the picker can show
+        "full session" vs "partial session" indicators.
+        """
+        query = """
+            SELECT (timestamp AT TIME ZONE 'America/New_York')::date AS session_date,
+                   COUNT(*)::int AS bar_count,
+                   MIN(timestamp) AS first_ts,
+                   MAX(timestamp) AS last_ts
+            FROM gex_summary
+            WHERE underlying = $1
+              AND (timestamp AT TIME ZONE 'America/New_York')::time
+                  BETWEEN TIME '09:30' AND TIME '16:00'
+              AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
+            GROUP BY (timestamp AT TIME ZONE 'America/New_York')::date
+            ORDER BY session_date DESC
+            LIMIT $2
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, int(limit))
+                return [dict(r) for r in rows]
+        except Exception as e:
+            logger.warning(
+                "get_replay_session_dates(%s) failed: %s", symbol, e,
+            )
+            return []
+
+    async def get_underlying_bars_for_session(
+        self, symbol: str, session_date: date
+    ) -> List[Dict[str, Any]]:
+        """Cash-session 1-min bars for one ET trading day.
+
+        Returns a chronological list of ``{timestamp, open, high, low, close}``
+        dicts for the 09:30–16:00 America/New_York window. Used by the
+        4:05 PM ET forecast-receipt cron to compute the day's actual low /
+        high / close against the morning's commitment.
+
+        Returns ``[]`` on any error so the cron can fall back to a
+        degenerate (close-only) receipt rather than crashing the timer.
+        """
+        query = """
+            SELECT timestamp, open, high, low, close
+            FROM underlying_quotes
+            WHERE symbol = $1
+              AND (timestamp AT TIME ZONE 'America/New_York')::date = $2
+              AND (timestamp AT TIME ZONE 'America/New_York')::time
+                  BETWEEN TIME '09:30' AND TIME '16:00'
+            ORDER BY timestamp ASC
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, session_date)
+            return [dict(r) for r in rows]
+        except Exception as e:
+            logger.warning(
+                "get_underlying_bars_for_session(%s, %s) failed: %s",
+                symbol, session_date, e,
+            )
+            return []
+
     async def get_recent_underlying_bars(
         self, symbol: str, limit: int = 120
     ) -> Tuple[List[float], List[float], List[float]]:

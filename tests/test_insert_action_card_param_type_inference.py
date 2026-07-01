@@ -32,13 +32,25 @@ from src.api.queries.signals import SignalsQueriesMixin
 
 
 class _FakeConn:
-    """Captures execute() calls for assertion."""
+    """Captures fetchval() calls for assertion.
+
+    ``insert_action_card`` uses ``fetchval`` with ``RETURNING id`` so the
+    handler can attach the persisted row id to the live ``/action`` response
+    (enables /cards/{id} permalinks). The legacy ``execute`` shim returns
+    None to keep any rare paths quiet during the suite.
+    """
 
     def __init__(self) -> None:
         self.calls: List[Tuple[str, Tuple[Any, ...]]] = []
 
     async def execute(self, sql: str, *args: Any) -> None:
         self.calls.append((sql, args))
+
+    async def fetchval(self, sql: str, *args: Any) -> Any:
+        self.calls.append((sql, args))
+        # Simulate a fresh insert: return the synthetic primary key. Any
+        # follow-up "existing id" lookup will be captured as a second call.
+        return 4221
 
 
 class _Stub(SignalsQueriesMixin):
@@ -73,9 +85,13 @@ def test_insert_action_card_casts_every_reused_parameter():
     value and WHERE equality).  Both occurrences must carry an explicit
     type cast so asyncpg's prepare-time type deduction is unambiguous."""
     stub = _Stub()
-    _run(stub.insert_action_card(_card()))
+    inserted_id = _run(stub.insert_action_card(_card()))
 
-    assert len(stub.conn.calls) == 1, "execute should have been called exactly once"
+    # The fresh-insert path runs exactly one fetchval (the INSERT ... RETURNING
+    # id); the existing-id fallback only fires when the INSERT no-ops via the
+    # idempotency guard, which our fake doesn't simulate.
+    assert len(stub.conn.calls) == 1, "fetchval should have been called exactly once"
+    assert inserted_id == 4221, "fresh insert path must return the new row id"
     sql, args = stub.conn.calls[0]
 
     # Reused params: each must appear with an explicit cast in BOTH
@@ -120,5 +136,6 @@ def test_insert_action_card_short_circuits_stand_down():
     stub = _Stub()
     card = _card()
     card["action"] = "STAND_DOWN"
-    _run(stub.insert_action_card(card))
-    assert stub.conn.calls == [], "STAND_DOWN must short-circuit before execute"
+    result = _run(stub.insert_action_card(card))
+    assert stub.conn.calls == [], "STAND_DOWN must short-circuit before any DB call"
+    assert result is None, "STAND_DOWN must return None (no row to permalink)"

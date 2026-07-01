@@ -379,7 +379,86 @@ async def get_action_card(
     payload = card.to_dict()
     # Persist trade Cards (not STAND_DOWNs) so the next cycle can apply
     # hysteresis.  Best-effort — DB failure must not break the response.
-    await db.insert_action_card(payload)
+    # When a row was written (or already existed via the idempotency guard),
+    # surface its ``id`` on the payload so the live UI can deep-link to the
+    # /cards/{id} permalink. STAND_DOWN payloads remain unpersisted and
+    # therefore intentionally omit the id.
+    card_id = await db.insert_action_card(payload)
+    if card_id is not None:
+        payload["id"] = card_id
+    return payload
+
+
+@router.get("/action/recent")
+async def list_recent_action_cards(
+    underlying: str | None = Query(default=None, max_length=10),
+    limit: int = Query(default=50, ge=1, le=200),
+    since_hours: int | None = Query(default=None, ge=1, le=720),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Chronological feed of persisted Action Cards (newest first).
+
+    Powers the public Action-Card feed on the website. Returns lightweight
+    rows — full payload is available per-card via ``/action/{card_id}``.
+
+    **Params:**
+    - ``underlying`` — optional symbol filter (e.g. ``SPY``).
+    - ``limit`` — page size (1–200, default 50).
+    - ``since_hours`` — optional rolling window (1–720h).
+
+    **Returns:**
+    ```json
+    {
+      "cards": [
+        {
+          "id": 4221, "underlying": "SPY",
+          "timestamp": "2026-06-29T18:42:13Z",
+          "pattern": "call_wall_fade", "action": "SELL_CALL_SPREAD",
+          "tier": "0DTE", "direction": "bearish", "confidence": 0.68,
+          "rationale": "Price pinned at call wall ...",
+          "permalink": "/cards/4221"
+        }
+      ],
+      "count": 1
+    }
+    ```
+
+    STAND_DOWN Cards are not persisted by the engine and therefore never
+    appear in this feed.
+    """
+    sym = underlying.upper() if underlying else None
+    rows = await db.get_action_cards_chronological(
+        underlying=sym, limit=limit, since_hours=since_hours
+    )
+    cards = [
+        {
+            **row,
+            "permalink": f"/cards/{row['id']}",
+        }
+        for row in rows
+    ]
+    return {"cards": cards, "count": len(cards)}
+
+
+@router.get("/action/{card_id}")
+async def get_action_card_by_id(
+    card_id: int,
+    db: DatabaseManager = Depends(get_db),
+):
+    """Full persisted Action Card by id — powers the ``/cards/{id}`` permalink.
+
+    Returns the engine's full ``card.to_dict()`` payload (entry/stop/target,
+    legs, rationale, context, alternatives_considered) augmented with the
+    row's ``id`` and ``created_at``. Returns 404 if no row matches.
+
+    **Params:**
+    - ``card_id`` — primary key of ``signal_action_cards`` row (positive int).
+    """
+    if card_id <= 0:
+        raise HTTPException(status_code=404, detail=f"Action card {card_id} not found")
+    payload = await db.get_action_card_by_id(card_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail=f"Action card {card_id} not found")
     return payload
 
 

@@ -53,6 +53,9 @@ from .routers.vol_surface import router as vol_surface_router
 from .routers.premium_surface import router as premium_surface_router
 from .routers.gex_flip_horizon import router as gex_flip_horizon_router
 from .routers.backtest import router as backtest_router
+from .routers.scorecard import router as scorecard_router
+from .routers.forecast import router as forecast_router
+from .routers.replay import router as replay_router
 
 # Logging is configured centrally in src.utils.logging; importing
 # get_logger triggers _configure_logging which honors LOG_LEVEL and
@@ -308,6 +311,18 @@ app.include_router(option_contract_router, dependencies=[_scope_market_raw])
 app.include_router(option_calculator_router, dependencies=[_scope_market_raw])
 # Backtesting platform — premium (basic/pro) tier, same scope as /api/signals.
 app.include_router(backtest_router, dependencies=[_scope_signals])
+# Daily Scorecard — aggregates Action Cards + per-signal flip P&L into one
+# trading day's recap. Powers the public /scorecard/{date} permalink and the
+# 4:15 PM ET auto-tweet job. Same signals scope as /api/signals.
+app.include_router(scorecard_router, dependencies=[_scope_signals])
+# Daily Gamma Forecast — 7:00 AM ET commit + 4:05 PM ET receipt for the
+# public /forecast/{date} page. Read-only here; the writer cron jobs live
+# in src.jobs.forecast_writer and src.jobs.forecast_receipt.
+app.include_router(forecast_router, dependencies=[_scope_signals])
+# GEX Replay — scrubbable per-minute frames over historical gex_summary +
+# gex_by_strike data. Read-only; no new ingestion. Scope matches the rest
+# of the GEX surface (basic + pro tiers).
+app.include_router(replay_router, dependencies=[_scope_gex])
 
 # ============================================================================
 # Health Check
