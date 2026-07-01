@@ -10,6 +10,14 @@ and whiff publicly.
 The interface (``compute_forecast``) returns a typed result whose contract
 is what the quantile-regression v2 model will produce when it ships, so
 swapping models later is a one-line change in the writer.
+
+TODO(2027-01): Replace heuristic_v1 with quantile-regression v2 once we
+have ~120 receipt rows in daily_forecast. See
+``docs/design/quantile-regression-range-model.md`` for the training plan,
+feature set, A/B rollout protocol, and the SQL check that tells you
+whether we've collected enough data yet. Do NOT tune WALL_EXPANSION,
+EVENT_DAY_MULTIPLIER, or the clamp bounds in the meantime — changing
+heuristic_v1 mid-collection contaminates the v1-vs-v2 comparison.
 """
 
 from __future__ import annotations
