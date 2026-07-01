@@ -3572,6 +3572,60 @@ forecast-status: ## Show both forecast timers + last/next fire + recent logs
 	@sudo journalctl -u zerogex-oa-forecast-writer -u zerogex-oa-forecast-receipt -n 30 --no-pager || true
 
 # =============================================================================
+# Gamma Forecast auto-tweet (Phase 3b — 07:10 + 16:10 ET weekdays)
+# =============================================================================
+# Companion crons to the forecast writer/receipt.  Two modes share one script:
+#   * morning tweet at 07:10 ET (after the 07:00 writer commits the row)
+#   * receipt tweet at 16:10 ET (after the 16:05 receipt writer grades it)
+# Both dry-run unless X_BOT_BEARER_TOKEN is set AND --post is passed.
+.PHONY: forecast-tweet-morning-dry-run
+forecast-tweet-morning-dry-run: ## Dry-run today's morning forecast tweet
+	@echo "$(BLUE)=== Dry-run morning forecast tweet ===$(NC)"
+	@$(PY) -m src.jobs.forecast_tweet --mode morning \
+		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
+		$(if $(FORECAST_SYMBOL),--symbol $(FORECAST_SYMBOL))
+
+.PHONY: forecast-tweet-receipt-dry-run
+forecast-tweet-receipt-dry-run: ## Dry-run today's receipt forecast tweet
+	@echo "$(BLUE)=== Dry-run receipt forecast tweet ===$(NC)"
+	@$(PY) -m src.jobs.forecast_tweet --mode receipt \
+		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
+		$(if $(FORECAST_SYMBOL),--symbol $(FORECAST_SYMBOL))
+
+.PHONY: forecast-tweet-morning-post
+forecast-tweet-morning-post: ## Post today's morning forecast tweet (needs X_BOT_BEARER_TOKEN)
+	@echo "$(BLUE)=== Posting morning forecast tweet ===$(NC)"
+	@$(PY) -m src.jobs.forecast_tweet --mode morning --post \
+		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
+		$(if $(FORECAST_SYMBOL),--symbol $(FORECAST_SYMBOL))
+
+.PHONY: forecast-tweet-receipt-post
+forecast-tweet-receipt-post: ## Post today's receipt forecast tweet (needs X_BOT_BEARER_TOKEN)
+	@echo "$(BLUE)=== Posting receipt forecast tweet ===$(NC)"
+	@$(PY) -m src.jobs.forecast_tweet --mode receipt --post \
+		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
+		$(if $(FORECAST_SYMBOL),--symbol $(FORECAST_SYMBOL))
+
+.PHONY: forecast-tweet-install
+forecast-tweet-install: ## Install both forecast tweet timers (07:10 + 16:10 ET Mon-Fri)
+	@echo "$(BLUE)=== Installing Forecast Tweet Timers ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-forecast-tweet-morning.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-tweet-morning.timer /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-tweet-receipt.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-tweet-receipt.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-forecast-tweet-morning.timer
+	@sudo systemctl enable --now zerogex-oa-forecast-tweet-receipt.timer
+	@echo "$(GREEN)✅ Forecast tweet timers installed (07:10 morning, 16:10 receipt; Mon-Fri)$(NC)"
+
+.PHONY: forecast-tweet-status
+forecast-tweet-status: ## Show forecast tweet timers + last/next fire + recent logs
+	@echo "$(BLUE)=== Forecast Tweet Timers ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-forecast-tweet-*.timer' || true
+	@echo ""
+	@sudo journalctl -u zerogex-oa-forecast-tweet-morning -u zerogex-oa-forecast-tweet-receipt -n 30 --no-pager || true
+
+# =============================================================================
 # Daily ATM IV history backfill (pre-open seed of daily_atm_iv)
 # =============================================================================
 # Re-seeds the trailing 30 days of daily_atm_iv from option_chains.  The live

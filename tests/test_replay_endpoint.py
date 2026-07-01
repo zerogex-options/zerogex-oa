@@ -108,31 +108,47 @@ def test_frame_rejects_invalid_ts(monkeypatch):
     assert r.status_code == 422
 
 
-def test_range_filters_to_session_window(monkeypatch):
-    """The heatmap call returns newest-first; the route must filter to the
-    requested session window (13:30 UTC = 09:30 ET in EDT) and reverse
-    to chronological order."""
+def test_range_returns_session_frames_by_date(monkeypatch):
+    """The range endpoint MUST fetch by the requested date, not just
+    return the latest N buckets. Regression against the bug where
+    ``get_gex_heatmap`` (latest-N-anchored) was used in place of a
+    date-scoped query — that shipped a session picker showing every
+    date but only delivering data for today."""
     app, dbmod = _build_app(monkeypatch)
-    # Build heatmap with bars across two days; only 2026-06-29 should survive.
-    in_session = datetime(2026, 6, 29, 14, 30, tzinfo=timezone.utc)
-    out_of_session_early = datetime(2026, 6, 29, 12, 0, tzinfo=timezone.utc)  # pre-open
-    out_of_session_late = datetime(2026, 6, 29, 21, 0, tzinfo=timezone.utc)   # post-close
-    other_day = datetime(2026, 6, 28, 14, 30, tzinfo=timezone.utc)
-    dbmod.DatabaseManager.get_gex_heatmap = AsyncMock(return_value=[
-        {"timestamp": other_day, "gamma_flip": Decimal("601"), "heatmap": []},
-        {"timestamp": out_of_session_late, "gamma_flip": Decimal("601"), "heatmap": []},
-        {"timestamp": in_session, "gamma_flip": Decimal("600.5"),
-         "heatmap": [{"strike": Decimal("600"), "net_gex": Decimal("1234.5")}]},
-        {"timestamp": out_of_session_early, "gamma_flip": Decimal("600"), "heatmap": []},
+    bar_a = datetime(2026, 6, 29, 13, 30, tzinfo=timezone.utc)
+    bar_b = datetime(2026, 6, 29, 14, 30, tzinfo=timezone.utc)
+    dbmod.DatabaseManager.get_gex_frames_for_session = AsyncMock(return_value=[
+        {"timestamp": bar_a, "gamma_flip": Decimal("600.5"),
+         "strikes": [{"strike": Decimal("600"), "net_gex": Decimal("1234.5")}]},
+        {"timestamp": bar_b, "gamma_flip": Decimal("601"),
+         "strikes": [{"strike": Decimal("600"), "net_gex": Decimal("2222.5")}]},
     ])
     with TestClient(app) as client:
         r = client.get("/api/replay/range?symbol=SPY&date=2026-06-29")
     body = r.json()
     assert r.status_code == 200, r.text
     assert body["date"] == "2026-06-29"
-    assert body["count"] == 1
-    assert body["frames"][0]["timestamp"] == in_session.isoformat()
+    assert body["count"] == 2
+    # Chronological order preserved by the DB helper.
+    assert body["frames"][0]["timestamp"] == bar_a.isoformat()
+    assert body["frames"][1]["timestamp"] == bar_b.isoformat()
     assert body["frames"][0]["strikes"][0]["strike"] == pytest.approx(600.0)
+    # Confirm the endpoint routed to the date-scoped helper, not the
+    # latest-N heatmap (the actual bug we're guarding against).
+    call = dbmod.DatabaseManager.get_gex_frames_for_session.call_args
+    assert call.args[0] == "SPY"
+    assert call.args[1] == date(2026, 6, 29)
+
+
+def test_range_returns_empty_when_date_has_no_data(monkeypatch):
+    app, dbmod = _build_app(monkeypatch)
+    dbmod.DatabaseManager.get_gex_frames_for_session = AsyncMock(return_value=[])
+    with TestClient(app) as client:
+        r = client.get("/api/replay/range?symbol=SPY&date=2020-01-01")
+    body = r.json()
+    assert r.status_code == 200
+    assert body["count"] == 0
+    assert body["frames"] == []
 
 
 def test_diff_computes_strike_deltas(monkeypatch):

@@ -1,0 +1,16 @@
+[Unit]
+Description=Daily trigger for ZeroGEX morning forecast tweet (07:10 ET Mon-Fri)
+
+[Timer]
+# Fires 10 minutes after the morning writer's scheduled 07:00 ET slot so
+# the daily_forecast row is guaranteed to be committed before we tweet
+# from it.  The morning writer itself is fast (< 5s in practice) but the
+# extra buffer covers RandomizedDelaySec drift + any DB latency spike.
+OnCalendar=Mon..Fri *-*-* 07:10:00
+RandomizedDelaySec=1m
+# Catch up after planned downtime — a morning-tweet still adds value if
+# it lands by, say, 09:00 (pre-market).
+Persistent=true
+
+[Install]
+WantedBy=timers.target
