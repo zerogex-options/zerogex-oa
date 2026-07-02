@@ -140,6 +140,29 @@ def test_get_latest_forecast_404_when_history_empty(monkeypatch):
     assert r.status_code == 404
 
 
+def test_available_dates_lists_symbol_history(monkeypatch):
+    """The /forecast landing page picker fetches this; must route to the
+    literal '/available-dates' handler (not the /{forecast_date} catchall)
+    and return newest-first date rows with verdict badges."""
+    app, dbmod = _build_app(monkeypatch)
+    dbmod.DatabaseManager.get_forecast_available_dates = AsyncMock(return_value=[
+        {"date": date(2026, 6, 29), "regime": "short_gamma", "has_receipt": True,
+         "range_respected": True, "pin_hit": False, "regime_correct": True},
+        {"date": date(2026, 6, 26), "regime": "long_gamma", "has_receipt": False,
+         "range_respected": None, "pin_hit": None, "regime_correct": None},
+    ])
+    with TestClient(app) as client:
+        r = client.get("/api/forecast/available-dates?symbol=SPY&limit=30")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["symbol"] == "SPY"
+    assert body["count"] == 2
+    assert body["dates"][0]["date"] == "2026-06-29"
+    assert body["dates"][0]["has_receipt"] is True
+    assert body["dates"][0]["range_respected"] is True
+    assert body["dates"][1]["has_receipt"] is False
+
+
 def test_recent_history_returns_compact_rows(monkeypatch):
     app, dbmod = _build_app(monkeypatch)
     dbmod.DatabaseManager.get_daily_forecast_history = AsyncMock(

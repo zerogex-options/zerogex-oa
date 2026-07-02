@@ -95,6 +95,37 @@ def _shape_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
+@router.get("/available-dates")
+async def get_available_dates(
+    symbol: str = Query(default="SPY", max_length=10),
+    limit: int = Query(default=60, ge=1, le=365),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Distinct forecast dates for the /forecast landing page's date picker.
+
+    Mirrors the /api/replay/sessions contract: newest-first list with per-date
+    metadata (regime, verdict pills) so cards can render without a second
+    fetch. Returns ``{symbol, count, dates: []}`` — empty ``dates`` when the
+    writer has never fired for that symbol.
+    """
+    rows = await db.get_forecast_available_dates(symbol.upper(), limit=limit)
+    return {
+        "symbol": symbol.upper(),
+        "count": len(rows),
+        "dates": [
+            {
+                "date": r["date"].isoformat() if isinstance(r["date"], date) else r["date"],
+                "regime": r.get("regime"),
+                "has_receipt": bool(r.get("has_receipt")),
+                "range_respected": r.get("range_respected"),
+                "pin_hit": r.get("pin_hit"),
+                "regime_correct": r.get("regime_correct"),
+            }
+            for r in rows
+        ],
+    }
+
+
 @router.get("/{forecast_date}")
 async def get_forecast_for_date(
     forecast_date: str,

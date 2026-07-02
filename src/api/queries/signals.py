@@ -1727,6 +1727,38 @@ class SignalsQueriesMixin:
             )
             return None
 
+    async def get_forecast_available_dates(
+        self, symbol: str, limit: int = 60
+    ) -> List[Dict[str, Any]]:
+        """Distinct forecast dates for a symbol (newest first) — powers the
+        /forecast landing-page date picker. Each row carries the metadata
+        the picker needs to badge a card: regime, whether the receipt row
+        landed, and (if it did) the top-level verdict pills so the picker
+        can render green/red at a glance without a second fetch."""
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT date,
+                           regime,
+                           receipt_ts IS NOT NULL AS has_receipt,
+                           range_respected,
+                           pin_hit,
+                           regime_correct
+                    FROM daily_forecast
+                    WHERE symbol = $1
+                    ORDER BY date DESC
+                    LIMIT $2
+                    """,
+                    symbol, int(limit),
+                )
+                return [dict(r) for r in rows]
+        except Exception as exc:
+            logger.warning(
+                "get_forecast_available_dates failed (%s): %s", symbol, exc,
+            )
+            return []
+
     async def get_daily_forecast_history(
         self, symbol: str, limit: int = 30
     ) -> List[Dict[str, Any]]:
