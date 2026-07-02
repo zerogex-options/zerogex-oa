@@ -2207,9 +2207,21 @@ CREATE TABLE IF NOT EXISTS daily_forecast (
     projected_high      NUMERIC(12,4) NOT NULL,
     projected_close     NUMERIC(12,4),
     pin_strike          NUMERIC(12,4),
+    pin_tolerance       NUMERIC(10,4),          -- v1.2+: dynamic per-symbol pin threshold
     flagship_setup      JSONB,                 -- Playbook Action Card or null
-    range_model         VARCHAR(32) NOT NULL,  -- e.g. 'heuristic_v1', 'quantile_v1'
+    range_model         VARCHAR(32) NOT NULL,  -- e.g. 'heuristic_v1', 'heuristic_v1_2', 'quantile_v1'
     content_hash        TEXT        NOT NULL,
+    -- v1.2 extension: raw-vs-corrected snapshots + input signals so we
+    -- can grade both the heuristic AND the Layer-2 correction layer
+    -- separately when receipts land.
+    raw_projected_low   NUMERIC(12,4),
+    raw_projected_high  NUMERIC(12,4),
+    raw_pin_strike      NUMERIC(12,4),
+    -- Snapshot of the v1.2 signal inputs (VIX/VXN, IV rank, ATR, top gamma
+    -- nodes, calendar flags) + the calibration scalars applied at write
+    -- time. JSONB so we can evolve the shape without another migration
+    -- while receipts are still being collected.
+    forecast_inputs     JSONB,
     -- Receipt — written at 16:05 ET, never rewritten.
     receipt_ts          TIMESTAMPTZ,
     actual_low          NUMERIC(12,4),
@@ -2218,11 +2230,25 @@ CREATE TABLE IF NOT EXISTS daily_forecast (
     range_respected     BOOLEAN,
     pin_hit             BOOLEAN,
     regime_correct      BOOLEAN,
+    -- v1.2: independent verdicts on the raw (pre-correction) forecast so
+    -- the calibration cron can compare correction effectiveness.
+    raw_range_respected BOOLEAN,
+    raw_pin_hit         BOOLEAN,
     setup_outcome       JSONB,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (symbol, date)
 );
+
+-- Idempotent additive migration for pre-v1.2 databases where daily_forecast
+-- already exists without the extended columns. IF NOT EXISTS is 12+.
+ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS pin_tolerance       NUMERIC(10,4);
+ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS raw_projected_low   NUMERIC(12,4);
+ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS raw_projected_high  NUMERIC(12,4);
+ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS raw_pin_strike      NUMERIC(12,4);
+ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS forecast_inputs     JSONB;
+ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS raw_range_respected BOOLEAN;
+ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS raw_pin_hit         BOOLEAN;
 
 CREATE INDEX IF NOT EXISTS idx_daily_forecast_date_desc
     ON daily_forecast(date DESC);
@@ -2244,6 +2270,11 @@ BEGIN
     IF OLD.projected_high   IS NOT NULL AND NEW.projected_high   IS DISTINCT FROM OLD.projected_high   THEN RAISE EXCEPTION 'daily_forecast.projected_high is immutable'; END IF;
     IF OLD.regime           IS NOT NULL AND NEW.regime           IS DISTINCT FROM OLD.regime           THEN RAISE EXCEPTION 'daily_forecast.regime is immutable'; END IF;
     IF OLD.content_hash     IS NOT NULL AND NEW.content_hash     IS DISTINCT FROM OLD.content_hash     THEN RAISE EXCEPTION 'daily_forecast.content_hash is immutable'; END IF;
+    -- v1.2 raw predictions are equally immutable — they're the "before
+    -- correction" claim we grade separately from the corrected forecast.
+    IF OLD.raw_projected_low  IS NOT NULL AND NEW.raw_projected_low  IS DISTINCT FROM OLD.raw_projected_low  THEN RAISE EXCEPTION 'daily_forecast.raw_projected_low is immutable'; END IF;
+    IF OLD.raw_projected_high IS NOT NULL AND NEW.raw_projected_high IS DISTINCT FROM OLD.raw_projected_high THEN RAISE EXCEPTION 'daily_forecast.raw_projected_high is immutable'; END IF;
+    IF OLD.forecast_inputs    IS NOT NULL AND NEW.forecast_inputs    IS DISTINCT FROM OLD.forecast_inputs    THEN RAISE EXCEPTION 'daily_forecast.forecast_inputs is immutable'; END IF;
     -- Receipt columns are immutable once written.
     IF OLD.receipt_ts       IS NOT NULL AND NEW.receipt_ts       IS DISTINCT FROM OLD.receipt_ts       THEN RAISE EXCEPTION 'daily_forecast.receipt_ts is immutable once set'; END IF;
     IF OLD.actual_close     IS NOT NULL AND NEW.actual_close     IS DISTINCT FROM OLD.actual_close     THEN RAISE EXCEPTION 'daily_forecast.actual_close is immutable once set'; END IF;
@@ -2257,3 +2288,53 @@ CREATE TRIGGER daily_forecast_immutable
     BEFORE UPDATE ON daily_forecast
     FOR EACH ROW
     EXECUTE FUNCTION enforce_daily_forecast_immutability();
+
+-- ============================================================================
+-- forecast_calibration_state (Phase 3.5: Layer 2 online correction)
+-- ============================================================================
+-- One row per symbol. Nightly job (forecast_calibrate) reads the trailing-20
+-- receipts and shifts these scalars with a small learning rate so the
+-- writer's Layer 1 output gets corrected before it goes into daily_forecast.
+--
+-- These are Bayesian residual corrections around the heuristic:
+--   * band_width_mult:   scale factor on both half-bands (widen if the
+--                        band has been getting broken too often)
+--   * pin_tolerance_mult: scale factor on the pin-strike tolerance
+--   * upside_lean:       additive tilt of the upper band; positive
+--                        widens upside, negative tightens (range ±0.20)
+--   * downside_lean:     additive tilt of the lower band, same range
+--
+-- Bounds are enforced in Python (calibration cron clamps before writing);
+-- the schema just provides the storage + audit trail.
+--
+-- Not immutable: the whole point is that this table is rewritten each night.
+CREATE TABLE IF NOT EXISTS forecast_calibration_state (
+    symbol                  VARCHAR(10) PRIMARY KEY REFERENCES symbols(symbol) ON DELETE CASCADE,
+    band_width_mult         NUMERIC(6,4) NOT NULL DEFAULT 1.0,
+    pin_tolerance_mult      NUMERIC(6,4) NOT NULL DEFAULT 1.0,
+    upside_lean             NUMERIC(6,4) NOT NULL DEFAULT 0.0,
+    downside_lean           NUMERIC(6,4) NOT NULL DEFAULT 0.0,
+    -- Bookkeeping so we know how much data backed the current scalars
+    -- and can trace the last update.  n_receipts_used tells the writer
+    -- whether the corrections are "cold" (too few labels; apply
+    -- conservatively) or "warm" (enough data to trust).
+    n_receipts_used         INTEGER      NOT NULL DEFAULT 0,
+    last_calibrated_ts      TIMESTAMPTZ,
+    last_calibrated_summary JSONB,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE OR REPLACE FUNCTION touch_forecast_calibration_state()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS forecast_calibration_state_touch ON forecast_calibration_state;
+CREATE TRIGGER forecast_calibration_state_touch
+    BEFORE UPDATE ON forecast_calibration_state
+    FOR EACH ROW
+    EXECUTE FUNCTION touch_forecast_calibration_state();

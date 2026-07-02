@@ -1543,19 +1543,25 @@ class SignalsQueriesMixin:
                         symbol, date, open_ts, open_spot,
                         call_wall, put_wall, gamma_flip, open_msi,
                         regime, projected_low, projected_high, projected_close,
-                        pin_strike, flagship_setup, range_model, content_hash
+                        pin_strike, pin_tolerance, flagship_setup, range_model,
+                        raw_projected_low, raw_projected_high, raw_pin_strike,
+                        forecast_inputs, content_hash
                     )
                     VALUES (
                         $1, $2, $3, $4,
                         $5, $6, $7, $8,
                         $9, $10, $11, $12,
-                        $13, $14::jsonb, $15, $16
+                        $13, $14, $15::jsonb, $16,
+                        $17, $18, $19,
+                        $20::jsonb, $21
                     )
                     ON CONFLICT (symbol, date) DO NOTHING
                     RETURNING symbol, date, open_ts, open_spot, call_wall,
                               put_wall, gamma_flip, open_msi, regime,
                               projected_low, projected_high, projected_close,
-                              pin_strike, flagship_setup, range_model,
+                              pin_strike, pin_tolerance, flagship_setup,
+                              range_model, raw_projected_low, raw_projected_high,
+                              raw_pin_strike, forecast_inputs,
                               content_hash, created_at
                     """,
                     payload["symbol"],
@@ -1571,10 +1577,17 @@ class SignalsQueriesMixin:
                     payload["projected_high"],
                     payload.get("projected_close"),
                     payload.get("pin_strike"),
+                    payload.get("pin_tolerance"),
                     json.dumps(payload.get("flagship_setup"), default=str)
                     if payload.get("flagship_setup") is not None
                     else None,
                     payload["range_model"],
+                    payload.get("raw_projected_low"),
+                    payload.get("raw_projected_high"),
+                    payload.get("raw_pin_strike"),
+                    json.dumps(payload.get("forecast_inputs"), default=str)
+                    if payload.get("forecast_inputs") is not None
+                    else None,
                     payload["content_hash"],
                 )
                 if row is not None:
@@ -1648,6 +1661,16 @@ class SignalsQueriesMixin:
                 regime = row["regime"]
                 open_spot = float(row["open_spot"])
 
+                # Dynamic pin tolerance from the morning row (v1.2+); fall
+                # back to the argument for pre-v1.2 rows that don't carry
+                # it.  A row committed under heuristic_v1 will simply be
+                # graded at the caller's default $1 threshold.
+                effective_pin_tol = (
+                    float(row["pin_tolerance"])
+                    if row.get("pin_tolerance") is not None
+                    else pin_tolerance
+                )
+
                 # Range respected = the day's traded high/low both sat
                 # inside the band. Wicks count: the band is a no-touch
                 # prediction, not a 90%-of-bars threshold.
@@ -1656,8 +1679,26 @@ class SignalsQueriesMixin:
                 )
                 pin_hit = (
                     pin_strike is not None
-                    and abs(actual_close - pin_strike) <= pin_tolerance
+                    and abs(actual_close - pin_strike) <= effective_pin_tol
                 )
+
+                # v1.2 raw (pre-correction) verdicts.  Grades the same
+                # actuals against the RAW band + RAW pin so the
+                # calibration cron can compare correction effectiveness.
+                # NULL when the row was written pre-v1.2 (no raw fields).
+                raw_low = row.get("raw_projected_low")
+                raw_high = row.get("raw_projected_high")
+                raw_pin = row.get("raw_pin_strike")
+                if raw_low is not None and raw_high is not None:
+                    raw_range_respected = (
+                        actual_low >= float(raw_low) and actual_high <= float(raw_high)
+                    )
+                else:
+                    raw_range_respected = None
+                if raw_pin is not None:
+                    raw_pin_hit = abs(actual_close - float(raw_pin)) <= effective_pin_tol
+                else:
+                    raw_pin_hit = None
                 # Regime correctness: long-gamma days should chop (close
                 # within 0.5% of open); short-gamma days should trend
                 # (close moved more than 0.5%). Transition days are
@@ -1680,13 +1721,16 @@ class SignalsQueriesMixin:
                         range_respected = $7,
                         pin_hit = $8,
                         regime_correct = $9,
-                        setup_outcome = $10::jsonb
+                        raw_range_respected = $10,
+                        raw_pin_hit = $11,
+                        setup_outcome = $12::jsonb
                     WHERE symbol = $1 AND date = $2
                     RETURNING *
                     """,
                     symbol, forecast_date, receipt_ts,
                     actual_low, actual_high, actual_close,
                     range_respected, pin_hit, regime_correct,
+                    raw_range_respected, raw_pin_hit,
                     json.dumps(setup_outcome, default=str) if setup_outcome else None,
                 )
                 return dict(updated) if updated else None
@@ -1784,3 +1828,317 @@ class SignalsQueriesMixin:
                 "get_daily_forecast_history failed (%s): %s", symbol, exc,
             )
             return []
+
+    async def get_iv_rank_30d(self, symbol: str) -> Optional[float]:
+        """Compute the 30-day IV rank for ``symbol`` from ``daily_atm_iv``.
+
+        ``rank = (today - min) / (max - min)`` over the trailing 30 calendar
+        days.  Returns None when there aren't enough historical rows or
+        today's ATM IV hasn't been written yet.  Range 0.0..1.0.
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    WITH today_iv AS (
+                        SELECT atm_call_iv AS current_iv
+                        FROM daily_atm_iv
+                        WHERE underlying = $1
+                          AND trading_date = (
+                              (NOW()::timestamptz AT TIME ZONE 'America/New_York')::date
+                          )
+                    ),
+                    historical AS (
+                        SELECT MIN(atm_call_iv) AS iv_low,
+                               MAX(atm_call_iv) AS iv_high,
+                               COUNT(*) AS n_days
+                        FROM daily_atm_iv
+                        WHERE underlying = $1
+                          AND trading_date >= (
+                              (NOW()::timestamptz AT TIME ZONE 'America/New_York')::date
+                          ) - INTERVAL '30 days'
+                          AND trading_date < (
+                              (NOW()::timestamptz AT TIME ZONE 'America/New_York')::date
+                          )
+                    )
+                    SELECT (SELECT current_iv FROM today_iv) AS current_iv,
+                           iv_low, iv_high, n_days
+                    FROM historical
+                    """,
+                    symbol,
+                )
+                if row is None or row["current_iv"] is None:
+                    return None
+                if row["iv_low"] is None or row["iv_high"] is None:
+                    return None
+                if int(row["n_days"] or 0) < 10:
+                    return None
+                current = float(row["current_iv"])
+                low = float(row["iv_low"])
+                high = float(row["iv_high"])
+                span = max(high - low, 0.001)
+                return round(min(1.0, max(0.0, (current - low) / span)), 4)
+        except Exception as exc:
+            logger.warning("get_iv_rank_30d failed (%s): %s", symbol, exc)
+            return None
+
+    async def get_atr_5d(self, symbol: str) -> Optional[float]:
+        """Simple 5-day average true range in dollars from ``underlying_quotes``.
+
+        ATR here is the mean of the trailing 5 completed cash sessions'
+        ``high - low``.  Not the classic Wilder ATR (which folds in prior
+        close), but close enough for a range-forecast floor and much
+        simpler to compute cheaply.  Returns None when < 5 sessions of
+        history exist.
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    WITH sessions AS (
+                        SELECT (timestamp AT TIME ZONE 'America/New_York')::date AS d,
+                               MAX(high) AS hi,
+                               MIN(low)  AS lo
+                        FROM underlying_quotes
+                        WHERE symbol = $1
+                          AND (timestamp AT TIME ZONE 'America/New_York')::date
+                              < (NOW() AT TIME ZONE 'America/New_York')::date
+                          AND (timestamp AT TIME ZONE 'America/New_York')::time
+                              BETWEEN TIME '09:30' AND TIME '16:00'
+                        GROUP BY d
+                        ORDER BY d DESC
+                        LIMIT 5
+                    )
+                    SELECT AVG(hi - lo) AS atr, COUNT(*) AS n FROM sessions
+                    """,
+                    symbol,
+                )
+                if row is None or row["atr"] is None or int(row["n"] or 0) < 5:
+                    return None
+                return round(float(row["atr"]), 4)
+        except Exception as exc:
+            logger.warning("get_atr_5d failed (%s): %s", symbol, exc)
+            return None
+
+    async def get_vix_z_score_20d(self, ticker: str = "VIX") -> Optional[float]:
+        """Z-score of the last VIX close vs. the trailing 20 daily closes.
+
+        Uses ``vix_bars`` / ``vxn_bars`` (5-min bars); takes the 15:55 ET
+        close per session so the value is settled.  Returns None if fewer
+        than 15 prior sessions are available.
+        """
+        table = f"{ticker.lower()}_bars"
+        if table not in {"vix_bars", "vxn_bars"}:
+            return None
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    f"""
+                    WITH daily AS (
+                        SELECT (timestamp AT TIME ZONE 'America/New_York')::date AS d,
+                               (ARRAY_AGG(close ORDER BY timestamp DESC))[1] AS close
+                        FROM {table}
+                        WHERE (timestamp AT TIME ZONE 'America/New_York')::time
+                              BETWEEN TIME '09:30' AND TIME '16:00'
+                        GROUP BY d
+                        ORDER BY d DESC
+                        LIMIT 21
+                    ),
+                    stats AS (
+                        SELECT (ARRAY_AGG(close ORDER BY d DESC))[1] AS latest,
+                               AVG(close) FILTER (WHERE d < (SELECT MAX(d) FROM daily)) AS mean_prior,
+                               STDDEV_SAMP(close) FILTER (WHERE d < (SELECT MAX(d) FROM daily)) AS sd_prior,
+                               COUNT(*) FILTER (WHERE d < (SELECT MAX(d) FROM daily)) AS n_prior
+                        FROM daily
+                    )
+                    SELECT latest, mean_prior, sd_prior, n_prior FROM stats
+                    """,
+                )
+                if row is None or row["latest"] is None or row["mean_prior"] is None:
+                    return None
+                if int(row["n_prior"] or 0) < 15 or (row["sd_prior"] or 0) <= 0:
+                    return None
+                latest = float(row["latest"])
+                mean = float(row["mean_prior"])
+                sd = float(row["sd_prior"])
+                return round((latest - mean) / sd, 4)
+        except Exception as exc:
+            logger.warning("get_vix_z_score_20d failed (%s): %s", ticker, exc)
+            return None
+
+    async def get_top_gamma_nodes(
+        self, symbol: str, k: int = 3
+    ) -> list[Dict[str, Any]]:
+        """Top-K strikes by ``|net_gex|`` from the most recent
+        ``gex_by_strike`` snapshot.  Returns list of {strike, net_gex}
+        sorted by descending absolute magnitude."""
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    """
+                    WITH latest AS (
+                        SELECT MAX(timestamp) AS ts
+                        FROM gex_by_strike
+                        WHERE underlying = $1
+                    )
+                    SELECT strike, SUM(net_gex) AS net_gex
+                    FROM gex_by_strike
+                    WHERE underlying = $1
+                      AND timestamp = (SELECT ts FROM latest)
+                    GROUP BY strike
+                    ORDER BY ABS(SUM(net_gex)) DESC NULLS LAST
+                    LIMIT $2
+                    """,
+                    symbol, int(k),
+                )
+                return [
+                    {"strike": float(r["strike"]), "net_gex": float(r["net_gex"] or 0.0)}
+                    for r in rows
+                    if r["strike"] is not None
+                ]
+        except Exception as exc:
+            logger.warning("get_top_gamma_nodes failed (%s): %s", symbol, exc)
+            return []
+
+    async def get_walls_by_expiration(
+        self, symbol: str, expiration_date: date
+    ) -> Optional[Dict[str, Optional[float]]]:
+        """Approximate call/put walls restricted to a single expiration.
+
+        Used to isolate 0DTE dealer positioning on OPEX days.  Wall
+        strikes are the highest-|net_gex| strike ABOVE spot (call wall)
+        and BELOW spot (put wall) for that expiration.  Not identical to
+        the analytics engine's smoothed wall algorithm but close enough
+        for a 70/30 blend against the full-chain wall value.
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    WITH latest AS (
+                        SELECT MAX(timestamp) AS ts
+                        FROM gex_by_strike
+                        WHERE underlying = $1 AND expiration = $2
+                    ),
+                    spot AS (
+                        SELECT close::numeric AS s
+                        FROM underlying_quotes
+                        WHERE symbol = $1
+                        ORDER BY timestamp DESC
+                        LIMIT 1
+                    ),
+                    strikes AS (
+                        SELECT strike, net_gex
+                        FROM gex_by_strike
+                        WHERE underlying = $1
+                          AND expiration = $2
+                          AND timestamp = (SELECT ts FROM latest)
+                    )
+                    SELECT
+                        (SELECT strike FROM strikes
+                         WHERE strike >= (SELECT s FROM spot)
+                         ORDER BY ABS(net_gex) DESC NULLS LAST
+                         LIMIT 1) AS call_wall,
+                        (SELECT strike FROM strikes
+                         WHERE strike <= (SELECT s FROM spot)
+                         ORDER BY ABS(net_gex) DESC NULLS LAST
+                         LIMIT 1) AS put_wall
+                    """,
+                    symbol, expiration_date,
+                )
+                if row is None:
+                    return None
+                return {
+                    "call_wall": float(row["call_wall"]) if row["call_wall"] is not None else None,
+                    "put_wall": float(row["put_wall"]) if row["put_wall"] is not None else None,
+                }
+        except Exception as exc:
+            logger.warning(
+                "get_walls_by_expiration failed (%s, %s): %s",
+                symbol, expiration_date, exc,
+            )
+            return None
+
+    async def get_forecast_calibration(self, symbol: str) -> Dict[str, Any]:
+        """Read the current Layer-2 correction scalars for a symbol.
+
+        Falls back to the neutral state ({1.0, 1.0, 0, 0}) with
+        ``n_receipts_used=0`` when no row exists yet — first-ever call
+        for a symbol shouldn't require pre-seeding.
+        """
+        neutral = {
+            "symbol": symbol,
+            "band_width_mult": 1.0,
+            "pin_tolerance_mult": 1.0,
+            "upside_lean": 0.0,
+            "downside_lean": 0.0,
+            "n_receipts_used": 0,
+            "last_calibrated_ts": None,
+        }
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT symbol, band_width_mult, pin_tolerance_mult,
+                           upside_lean, downside_lean, n_receipts_used,
+                           last_calibrated_ts
+                    FROM forecast_calibration_state
+                    WHERE symbol = $1
+                    """,
+                    symbol,
+                )
+                if row is None:
+                    return neutral
+                out = dict(row)
+                for f in ("band_width_mult", "pin_tolerance_mult",
+                          "upside_lean", "downside_lean"):
+                    out[f] = float(out[f]) if out.get(f) is not None else 1.0 if "mult" in f else 0.0
+                out["n_receipts_used"] = int(out.get("n_receipts_used") or 0)
+                return out
+        except Exception as exc:
+            logger.warning("get_forecast_calibration failed (%s): %s", symbol, exc)
+            return neutral
+
+    async def upsert_forecast_calibration(
+        self,
+        symbol: str,
+        band_width_mult: float,
+        pin_tolerance_mult: float,
+        upside_lean: float,
+        downside_lean: float,
+        n_receipts_used: int,
+        summary: Dict[str, Any],
+    ) -> bool:
+        """Write the calibration state for a symbol.  Nightly job caller.
+        Bounds enforcement is the caller's responsibility — this method
+        writes what it's given."""
+        try:
+            async with self._acquire_connection() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO forecast_calibration_state
+                        (symbol, band_width_mult, pin_tolerance_mult,
+                         upside_lean, downside_lean, n_receipts_used,
+                         last_calibrated_ts, last_calibrated_summary)
+                    VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7::jsonb)
+                    ON CONFLICT (symbol) DO UPDATE
+                    SET band_width_mult = EXCLUDED.band_width_mult,
+                        pin_tolerance_mult = EXCLUDED.pin_tolerance_mult,
+                        upside_lean = EXCLUDED.upside_lean,
+                        downside_lean = EXCLUDED.downside_lean,
+                        n_receipts_used = EXCLUDED.n_receipts_used,
+                        last_calibrated_ts = EXCLUDED.last_calibrated_ts,
+                        last_calibrated_summary = EXCLUDED.last_calibrated_summary
+                    """,
+                    symbol,
+                    float(band_width_mult),
+                    float(pin_tolerance_mult),
+                    float(upside_lean),
+                    float(downside_lean),
+                    int(n_receipts_used),
+                    json.dumps(summary),
+                )
+                return True
+        except Exception as exc:
+            logger.warning("upsert_forecast_calibration failed (%s): %s", symbol, exc)
+            return False
