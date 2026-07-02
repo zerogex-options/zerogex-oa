@@ -243,6 +243,38 @@ async def test_swallows_db_failure(monkeypatch, caplog):
 
 
 @pytest.mark.asyncio
+async def test_multi_symbol_loop_dry_runs_each(monkeypatch, caplog):
+    """--symbols SPY,QQQ,IWM must fan out; a symbol with no row skips
+    silently and the loop continues to the next."""
+    mod = _reload_module()
+    seen: list[str] = []
+
+    class _FakeDB:
+        async def connect(self):
+            return None
+        async def disconnect(self):
+            return None
+        async def get_daily_forecast(self, symbol, forecast_date):
+            seen.append(symbol)
+            if symbol == "QQQ":
+                return None
+            return _morning_row(symbol=symbol)
+
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: _FakeDB())
+    monkeypatch.delenv("X_BOT_BEARER_TOKEN", raising=False)
+    args = mod._parse_args([
+        "--mode", "morning", "--date", "2026-07-01", "--symbols", "SPY,QQQ,IWM",
+    ])
+    with caplog.at_level("INFO"):
+        rc = await mod._run(args)
+    assert rc == 0
+    assert seen == ["SPY", "QQQ", "IWM"]
+    assert any("DRY RUN SPY" in r.message for r in caplog.records)
+    assert any("no daily_forecast row for QQQ" in r.message for r in caplog.records)
+    assert any("DRY RUN IWM" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_swallows_x_api_failure(monkeypatch, caplog):
     mod = _reload_module()
 

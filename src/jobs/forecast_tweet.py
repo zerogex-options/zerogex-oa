@@ -169,6 +169,75 @@ def post_tweet_via_x_api(text: str, bearer_token: str, timeout_seconds: int = 15
 # ---------------------------------------------------------------------------
 
 
+async def _tweet_one(
+    db: DatabaseManager, symbol: str, day: date, args: argparse.Namespace,
+) -> None:
+    """Post (or dry-run) one symbol's forecast/receipt tweet. Never raises —
+    a symbol-level failure logs and returns so the outer loop keeps going."""
+    symbol = symbol.upper()
+    try:
+        row = await db.get_daily_forecast(symbol, day)
+    except Exception as exc:
+        logger.warning(
+            "forecast_tweet[%s]: get_daily_forecast(%s) failed (%s) — skipping",
+            args.mode, symbol, exc,
+        )
+        return
+
+    if row is None:
+        logger.info(
+            "forecast_tweet[%s]: no daily_forecast row for %s %s — skipping",
+            args.mode, symbol, day.isoformat(),
+        )
+        return
+
+    if args.mode == "morning":
+        tweet_text = build_morning_tweet(row, args.site_url)
+    elif args.mode == "receipt":
+        if row.get("receipt_ts") is None:
+            logger.info(
+                "forecast_tweet[receipt]: %s %s morning row exists but receipt "
+                "not written yet — skipping",
+                symbol, day.isoformat(),
+            )
+            return
+        tweet_text = build_receipt_tweet(row, args.site_url)
+    else:
+        logger.warning("forecast_tweet: unknown mode %r — skipping %s", args.mode, symbol)
+        return
+
+    bearer = os.environ.get("X_BOT_BEARER_TOKEN", "").strip()
+
+    if not args.post or not bearer:
+        reason = "no --post flag" if not args.post else "X_BOT_BEARER_TOKEN unset"
+        logger.info(
+            "forecast_tweet[%s]: DRY RUN %s (%s)\n----\n%s\n----",
+            args.mode, symbol, reason, tweet_text,
+        )
+        return
+
+    try:
+        resp = post_tweet_via_x_api(tweet_text, bearer)
+    except (HTTPError, URLError) as exc:
+        logger.warning(
+            "forecast_tweet[%s]: X API call failed for %s (%s) — skipping",
+            args.mode, symbol, exc,
+        )
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "forecast_tweet[%s]: unexpected X API error for %s (%s) — skipping",
+            args.mode, symbol, exc,
+        )
+        return
+
+    tweet_id = (resp.get("data") or {}).get("id")
+    logger.info(
+        "forecast_tweet[%s]: posted tweet id=%s for %s %s",
+        args.mode, tweet_id, symbol, day.isoformat(),
+    )
+
+
 async def _run(args: argparse.Namespace) -> int:
     day = date.fromisoformat(args.date) if args.date else _today_et()
     if not _is_trading_day(day) and not args.allow_non_trading_day:
@@ -176,6 +245,18 @@ async def _run(args: argparse.Namespace) -> int:
             "forecast_tweet[%s]: skipping %s — not a trading day",
             args.mode, day.isoformat(),
         )
+        return 0
+
+    # Backward-compat: --symbol (singular) overrides the multi-symbol default.
+    # Otherwise fan out over every entry in --symbols / FORECAST_SYMBOLS so
+    # one systemd fire tweets the whole roster in a fixed order.
+    symbols = (
+        [args.symbol.upper()]
+        if args.symbol
+        else [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    )
+    if not symbols:
+        logger.warning("forecast_tweet: no symbols resolved — exiting 0")
         return 0
 
     db = DatabaseManager()
@@ -188,67 +269,8 @@ async def _run(args: argparse.Namespace) -> int:
         return 0
 
     try:
-        try:
-            row = await db.get_daily_forecast(args.symbol.upper(), day)
-        except Exception as exc:
-            logger.warning(
-                "forecast_tweet[%s]: get_daily_forecast failed (%s) — exiting 0",
-                args.mode, exc,
-            )
-            return 0
-
-        if row is None:
-            logger.info(
-                "forecast_tweet[%s]: no daily_forecast row for %s %s — skipping",
-                args.mode, args.symbol.upper(), day.isoformat(),
-            )
-            return 0
-
-        if args.mode == "morning":
-            tweet_text = build_morning_tweet(row, args.site_url)
-        elif args.mode == "receipt":
-            if row.get("receipt_ts") is None:
-                logger.info(
-                    "forecast_tweet[receipt]: %s %s morning row exists but receipt "
-                    "not written yet — skipping",
-                    args.symbol.upper(), day.isoformat(),
-                )
-                return 0
-            tweet_text = build_receipt_tweet(row, args.site_url)
-        else:
-            logger.warning("forecast_tweet: unknown mode %r — exiting 0", args.mode)
-            return 0
-
-        bearer = os.environ.get("X_BOT_BEARER_TOKEN", "").strip()
-
-        if not args.post or not bearer:
-            reason = "no --post flag" if not args.post else "X_BOT_BEARER_TOKEN unset"
-            logger.info(
-                "forecast_tweet[%s]: DRY RUN (%s)\n----\n%s\n----",
-                args.mode, reason, tweet_text,
-            )
-            return 0
-
-        try:
-            resp = post_tweet_via_x_api(tweet_text, bearer)
-        except (HTTPError, URLError) as exc:
-            logger.warning(
-                "forecast_tweet[%s]: X API call failed (%s) — exiting 0",
-                args.mode, exc,
-            )
-            return 0
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "forecast_tweet[%s]: unexpected X API error (%s) — exiting 0",
-                args.mode, exc,
-            )
-            return 0
-
-        tweet_id = (resp.get("data") or {}).get("id")
-        logger.info(
-            "forecast_tweet[%s]: posted tweet id=%s for %s %s",
-            args.mode, tweet_id, args.symbol.upper(), day.isoformat(),
-        )
+        for symbol in symbols:
+            await _tweet_one(db, symbol, day, args)
         return 0
     finally:
         try:
@@ -266,9 +288,14 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Which tweet to build (morning commit or 4 PM receipt).",
     )
     parser.add_argument(
+        "--symbols",
+        default=os.environ.get("FORECAST_SYMBOLS", "SPY"),
+        help="Comma-separated symbols to tweet for (default: $FORECAST_SYMBOLS or SPY).",
+    )
+    parser.add_argument(
         "--symbol",
-        default=os.environ.get("FORECAST_SYMBOLS", "SPY").split(",")[0].strip(),
-        help="Underlying (default: first FORECAST_SYMBOLS entry, else SPY).",
+        default=None,
+        help="Single symbol override — takes precedence over --symbols. Useful for backfill.",
     )
     parser.add_argument("--date", help="Target date (YYYY-MM-DD). Default: today ET.")
     parser.add_argument(
