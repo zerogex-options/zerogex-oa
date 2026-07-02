@@ -61,7 +61,7 @@ def test_build_tweet_copy_full_day():
     assert "Best: Squeeze Setup +0.74%" in text
     assert "Worst: Vanna Charm Flow −0.31%" in text
     assert "Regime: short gamma" in text
-    assert text.endswith("https://zerogex.io/scorecard/2026-06-29")
+    assert text.endswith("https://zerogex.io/scorecard/SPY/2026-06-29")
     assert len(text) <= mod.TWEET_MAX_LEN
 
 
@@ -72,7 +72,7 @@ def test_build_tweet_copy_truncates_to_280():
     text = mod.build_tweet_copy(_payload(), date(2026, 6, 29), "SPY", long_url)
     assert len(text) <= mod.TWEET_MAX_LEN
     # Permalink must still be present in full — the receipt is the whole point.
-    assert text.endswith(f"{long_url}/scorecard/2026-06-29")
+    assert text.endswith(f"{long_url}/scorecard/SPY/2026-06-29")
 
 
 def test_build_tweet_copy_quiet_tape():
@@ -87,7 +87,7 @@ def test_build_tweet_copy_quiet_tape():
     # No trailing whitespace or punctuation artifacts.
     body, sep, url = text.rpartition("\n")
     assert sep == "\n"
-    assert url == "https://zerogex.io/scorecard/2026-06-29"
+    assert url == "https://zerogex.io/scorecard/SPY/2026-06-29"
     assert body == body.strip()
     assert not body.endswith((" —", " -", ",", ";"))
 

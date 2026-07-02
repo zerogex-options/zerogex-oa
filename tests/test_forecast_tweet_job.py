@@ -76,7 +76,7 @@ def test_morning_tweet_shape():
     assert "Range: $744.82 – $748.76" in text
     assert "Pin: $744.00" in text
     assert "Regime: Long Gamma" in text
-    assert text.endswith("https://zerogex.io/forecast/2026-07-01")
+    assert text.endswith("https://zerogex.io/forecast/SPY/2026-07-01")
     assert len(text) <= mod.TWEET_MAX_LEN
 
 
@@ -89,7 +89,7 @@ def test_receipt_tweet_uses_verdict_pills():
     assert "Pin ✗ missed" in text
     assert "Regime ✓ correct" in text
     assert "Close: $746.90" in text
-    assert text.endswith("https://zerogex.io/forecast/2026-07-01")
+    assert text.endswith("https://zerogex.io/forecast/SPY/2026-07-01")
 
 
 def test_receipt_tweet_handles_transition_regime_gracefully():
@@ -108,7 +108,7 @@ def test_morning_tweet_truncates_to_280():
     text = mod.build_morning_tweet(_morning_row(), long_url)
     assert len(text) <= mod.TWEET_MAX_LEN
     # Permalink must survive intact — it's the whole point.
-    assert text.endswith(f"{long_url}/forecast/2026-07-01")
+    assert text.endswith(f"{long_url}/forecast/SPY/2026-07-01")
 
 
 # ---------------------------------------------------------------------------
