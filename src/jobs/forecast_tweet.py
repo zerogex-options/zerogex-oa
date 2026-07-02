@@ -4,7 +4,7 @@ Two modes, both back-ended by the same script + two systemd timers:
 
   * ``--mode morning`` fires 07:10 ET, ~10 minutes after the morning writer
     lands the ``daily_forecast`` row. Tweets today's projected range /
-    pin strike / regime + the ``/forecast/{date}`` permalink.
+    pin strike / regime + the ``/forecast/{symbol}/{date}`` permalink.
   * ``--mode receipt`` fires 16:10 ET, ~5 minutes after the receipt writer
     grades the morning commitment. Tweets the verdict overlay ("range
     held/broken", "pin hit/missed", "regime correct/wrong") + the same
@@ -95,7 +95,7 @@ def build_morning_tweet(row: dict[str, Any], site_url: str) -> str:
     high = _fmt_price(row.get("projected_high"))
     pin = _fmt_price(row.get("pin_strike"))
     regime = _humanize_regime(row.get("regime"))
-    permalink = f"{site_url.rstrip('/')}/forecast/{day_iso}"
+    permalink = f"{site_url.rstrip('/')}/forecast/{sym}/{day_iso}"
 
     body = (
         f"{sym} · {day_iso} morning forecast\n"
@@ -122,7 +122,7 @@ def build_receipt_tweet(row: dict[str, Any], site_url: str) -> str:
     pin_v = row.get("pin_hit")
     regime_v = row.get("regime_correct")
     actual_close = _fmt_price(row.get("actual_close"))
-    permalink = f"{site_url.rstrip('/')}/forecast/{day_iso}"
+    permalink = f"{site_url.rstrip('/')}/forecast/{sym}/{day_iso}"
 
     range_txt = "held" if range_v is True else "broken" if range_v is False else "—"
     pin_txt = "hit" if pin_v is True else "missed" if pin_v is False else "—"

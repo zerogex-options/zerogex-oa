@@ -131,7 +131,7 @@ def build_tweet_copy(payload: dict[str, Any], day: date, symbol: str, site_url: 
     worst = payload["signals"]["worst"]
     regime = payload.get("regime") or {}
     regime_label = regime.get("label") or "unknown"
-    permalink = f"{site_url.rstrip('/')}/scorecard/{day.isoformat()}"
+    permalink = f"{site_url.rstrip('/')}/scorecard/{symbol}/{day.isoformat()}"
 
     parts: list[str] = [f"{symbol} · {day.isoformat()}"]
     if cards["total"]:
