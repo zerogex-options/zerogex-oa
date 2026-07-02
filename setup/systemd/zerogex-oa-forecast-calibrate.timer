@@ -1,0 +1,14 @@
+[Unit]
+Description=Nightly trigger for ZeroGEX forecast Layer-2 recalibration (20:00 ET Mon-Fri)
+
+[Timer]
+# Fires at 20:00 ET on weekdays — long after the 16:05 receipt writer
+# has landed (and its tweet at 16:10), so every same-day receipt is
+# available for the recalibration cron to grade against.  Runs on
+# weekdays only; nothing to grade over the weekend.
+OnCalendar=Mon..Fri *-*-* 20:00:00
+RandomizedDelaySec=2m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -3546,19 +3546,32 @@ forecast-receipt: ## Write today's receipt against the immutable morning commitm
 		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
 		$(if $(FORECAST_SYMBOLS),--symbol $(FORECAST_SYMBOLS))
 
+.PHONY: forecast-calibrate-dry-run
+forecast-calibrate-dry-run: ## Dry-run tonight's Layer-2 calibration nudges (never writes)
+	@$(PY) -m src.jobs.forecast_calibrate --dry-run \
+		$(if $(FORECAST_SYMBOLS),--symbols $(FORECAST_SYMBOLS))
+
+.PHONY: forecast-calibrate
+forecast-calibrate: ## Recalibrate Layer-2 scalars from trailing 20 receipts (per symbol)
+	@$(PY) -m src.jobs.forecast_calibrate \
+		$(if $(FORECAST_SYMBOLS),--symbols $(FORECAST_SYMBOLS))
+
 .PHONY: forecast-install
-forecast-install: ## Install both forecast timers (07:00 writer, 16:05 receipt; Mon-Fri)
+forecast-install: ## Install all forecast timers (07:00 writer, 16:05 receipt, 20:00 calibrate; Mon-Fri)
 	@echo "$(BLUE)=== Installing Forecast Timers ===$(NC)"
 	@sudo cp setup/systemd/zerogex-oa-forecast-writer.service /etc/systemd/system/
 	@sudo cp setup/systemd/zerogex-oa-forecast-writer.timer /etc/systemd/system/
 	@sudo cp setup/systemd/zerogex-oa-forecast-receipt.service /etc/systemd/system/
 	@sudo cp setup/systemd/zerogex-oa-forecast-receipt.timer /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-calibrate.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-calibrate.timer /etc/systemd/system/
 	@sudo systemctl daemon-reload
 	@sudo systemctl enable --now zerogex-oa-forecast-writer.timer
 	@sudo systemctl enable --now zerogex-oa-forecast-receipt.timer
-	@echo "$(GREEN)✅ Forecast timers installed (07:00 writer, 16:05 receipt; Mon-Fri)$(NC)"
+	@sudo systemctl enable --now zerogex-oa-forecast-calibrate.timer
+	@echo "$(GREEN)✅ Forecast timers installed (07:00 writer, 16:05 receipt, 20:00 calibrate; Mon-Fri)$(NC)"
 	@echo "$(YELLOW)Status:  systemctl list-timers 'zerogex-oa-forecast-*'$(NC)"
-	@echo "$(YELLOW)Logs:    journalctl -u zerogex-oa-forecast-writer -u zerogex-oa-forecast-receipt$(NC)"
+	@echo "$(YELLOW)Logs:    journalctl -u zerogex-oa-forecast-writer -u zerogex-oa-forecast-receipt -u zerogex-oa-forecast-calibrate$(NC)"
 
 .PHONY: forecast-status
 forecast-status: ## Show both forecast timers + last/next fire + recent logs

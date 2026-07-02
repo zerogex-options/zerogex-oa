@@ -27,12 +27,28 @@ from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from src.api.database import DatabaseManager
+from src.jobs.forecast_calendar import (
+    days_to_next_opex,
+    is_monthly_opex_friday,
+    is_post_opex_monday,
+    is_vix_expiration_day,
+)
 from src.jobs.forecast_range_model import (
     ForecastInputs,
     ForecastResult,
     compute_forecast,
 )
 from src.market_calendar import NYSE_HOLIDAYS
+
+# Cash-index symbols use VXN as their vol regime proxy; everything else
+# uses VIX.  QQQ tracks NASDAQ; SPY / SPX / IWM track S&P style vol.
+_VXN_SYMBOLS = {"QQQ", "NDX"}
+
+
+def _strike_step_for(symbol: str) -> float:
+    """Ladder step for pin snapping and tolerance scaling.  SPX uses $5
+    strikes at scale; everything else uses $1."""
+    return 5.0 if symbol.upper() in {"SPX", "NDX", "RUT"} else 1.0
 
 logger = logging.getLogger("zerogex.forecast_writer")
 ET = ZoneInfo("America/New_York")
@@ -72,36 +88,35 @@ def _content_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+async def _fetch_optional(db: DatabaseManager, method_name: str, label: str, symbol: str, *args, **kwargs) -> Any:
+    """Best-effort DB fetch — catches missing methods (AttributeError) and
+    coroutine failures alike so a signal fetch failure never breaks the
+    forecast; it just degrades the quality of that day's inputs."""
+    try:
+        method = getattr(db, method_name)
+    except AttributeError:
+        logger.warning("forecast_writer: %s missing on db layer (skipping %s)", method_name, label)
+        return None
+    try:
+        return await method(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("forecast_writer: %s failed (%s): %s", label, symbol, exc)
+        return None
+
+
 async def _gather_inputs(db: DatabaseManager, symbol: str) -> Optional[ForecastInputs]:
-    """Pull every input the model needs from the in-process DB layer.
+    """Pull every input the v1.2 model needs from the in-process DB layer.
 
-    Falls back gracefully — missing GEX walls or MSI just narrows the
-    forecast quality, not the writer's ability to commit. Spot is the
-    only hard requirement; without it we can't anchor the band.
+    Every optional signal degrades gracefully — a missing VIX just means
+    no implied-vol blend, missing gex_by_strike means no top-gamma-nodes,
+    etc.  Spot is the only hard requirement; without it we can't anchor
+    the band.
     """
-    try:
-        gex = await db.get_latest_gex_summary(symbol)
-    except Exception as exc:
-        logger.warning("forecast_writer: get_latest_gex_summary failed (%s): %s", symbol, exc)
-        gex = None
+    gex = await _fetch_optional(db, "get_latest_gex_summary", "get_latest_gex_summary", symbol, symbol)
+    quote = await _fetch_optional(db, "get_latest_quote", "get_latest_quote", symbol, symbol)
+    score = await _fetch_optional(db, "get_latest_signal_score", "get_latest_signal_score", symbol, symbol)
 
-    try:
-        quote = await db.get_latest_quote(symbol)
-    except Exception as exc:
-        logger.warning("forecast_writer: get_latest_quote failed (%s): %s", symbol, exc)
-        quote = None
-
-    try:
-        score = await db.get_latest_signal_score(symbol)
-    except Exception as exc:
-        logger.warning("forecast_writer: get_latest_signal_score failed (%s): %s", symbol, exc)
-        score = None
-
-    # Flagship setup is best-effort: the live /action endpoint computes
-    # the Playbook Card on demand. From a cron context we read whatever
-    # the most recent persisted card looks like (the engine writes one
-    # per cycle). If nothing fresh exists today, we leave it None — the
-    # OG card just skips the flagship section.
+    # Flagship setup — best-effort read of the most recent Action Card.
     flagship = None
     try:
         recent = await db.get_action_cards_chronological(
@@ -133,6 +148,64 @@ async def _gather_inputs(db: DatabaseManager, symbol: str) -> Optional[ForecastI
         except (TypeError, ValueError):
             return None
 
+    # Vol regime — VIX for equity index-ish, VXN for NASDAQ-family.
+    is_nasdaq_family = symbol.upper() in _VXN_SYMBOLS
+    vol_ticker = "VXN" if is_nasdaq_family else "VIX"
+    vix_bars = await _fetch_optional(
+        db, "get_volatility_index_bars", f"get_volatility_index_bars[{vol_ticker}]", symbol,
+        ticker=vol_ticker, cutoff=None, tz="UTC",
+    )
+    vix_close = None
+    if vix_bars:
+        last = vix_bars[-1]
+        vix_close = _f(last.get("close"))
+
+    vix_z = await _fetch_optional(db, "get_vix_z_score_20d", f"get_vix_z_score_20d[{vol_ticker}]", symbol, vol_ticker)
+    iv_rank = await _fetch_optional(db, "get_iv_rank_30d", "get_iv_rank_30d", symbol, symbol)
+    atr = await _fetch_optional(db, "get_atr_5d", "get_atr_5d", symbol, symbol)
+    top_nodes = await _fetch_optional(db, "get_top_gamma_nodes", "get_top_gamma_nodes", symbol, symbol, k=3) or []
+
+    # 0DTE walls — only worth fetching on OPEX-adjacent days.  We ask
+    # for today's expiration; if the analytics engine wrote a row for
+    # it, we get real values back, else None.
+    call_wall_0dte, put_wall_0dte = None, None
+    is_opex_fri = is_monthly_opex_friday(today)
+    is_post_opex = is_post_opex_monday(today)
+    if is_opex_fri or is_post_opex:
+        walls_0dte = await _fetch_optional(
+            db, "get_walls_by_expiration", "get_walls_by_expiration", symbol, symbol, today,
+        )
+        if walls_0dte:
+            call_wall_0dte = _f(walls_0dte.get("call_wall"))
+            put_wall_0dte = _f(walls_0dte.get("put_wall"))
+
+    # Layer 2 calibration scalars (v1.3 correction layer).  On cold start
+    # this returns the neutral {1.0, 1.0, 0, 0} state which is a no-op.
+    calibration_row = await _fetch_optional(
+        db, "get_forecast_calibration", "get_forecast_calibration", symbol, symbol,
+    )
+    calibration_payload = None
+    if calibration_row:
+        calibration_payload = {
+            "band_width_mult": float(calibration_row["band_width_mult"]),
+            "pin_tolerance_mult": float(calibration_row["pin_tolerance_mult"]),
+            "upside_lean": float(calibration_row["upside_lean"]),
+            "downside_lean": float(calibration_row["downside_lean"]),
+            "n_receipts_used": int(calibration_row.get("n_receipts_used") or 0),
+        }
+
+    # MSI sub-signals for the "screaming amplifier" — put/call ratio and
+    # skew_delta.  Both live in gex_summary / basic_signals respectively.
+    pcr = _f(gex.get("put_call_ratio")) if gex else None
+    skew = None
+    skew_signal = await _fetch_optional(db, "get_basic_signal", "skew_delta", symbol, symbol, "skew_delta")
+    if skew_signal:
+        ctx = skew_signal.get("context_values") or {}
+        put_iv = ctx.get("otm_put_iv")
+        call_iv = ctx.get("otm_call_iv")
+        if put_iv is not None and call_iv is not None:
+            skew = float(put_iv) - float(call_iv)
+
     return ForecastInputs(
         symbol=symbol,
         forecast_date=today,
@@ -141,15 +214,56 @@ async def _gather_inputs(db: DatabaseManager, symbol: str) -> Optional[ForecastI
         put_wall=_f(gex.get("put_wall")) if gex else None,
         gamma_flip=_f(gex.get("gamma_flip")) if gex else None,
         max_pain=_f(gex.get("max_pain")) if gex else None,
+        call_wall_0dte=call_wall_0dte,
+        put_wall_0dte=put_wall_0dte,
+        top_gamma_nodes=top_nodes,
         msi_composite=_f(score.get("composite_score")) if score else None,
         msi_normalized=_f(score.get("normalized_score")) if score else None,
+        put_call_ratio=pcr,
+        skew_delta=skew,
+        vix_close=None if is_nasdaq_family else vix_close,
+        vxn_close=vix_close if is_nasdaq_family else None,
+        vix_z_score_20d=vix_z,
+        iv_rank_30d=iv_rank,
+        atr_5d=atr,
         flagship_setup=flagship,
         is_event_day=_is_event_day(today),
+        is_opex_friday=is_opex_fri,
+        is_vix_expiration=is_vix_expiration_day(today),
+        is_post_opex_monday=is_post_opex,
+        days_to_opex=days_to_next_opex(today),
+        strike_step=_strike_step_for(symbol),
+        calibration=calibration_payload,
     )
 
 
 def _build_payload(inputs: ForecastInputs, result: ForecastResult, open_ts: datetime) -> dict[str, Any]:
     """Translate (inputs, result) → daily_forecast row payload + hash."""
+    # forecast_inputs is a JSONB audit blob — everything the model saw
+    # at write time so we can later diagnose why a specific forecast
+    # went a particular way.  Excludes flagship_setup (already own
+    # column) and calibration (would race against the calibration state
+    # table's own timeline).
+    inputs_snapshot: dict[str, Any] = {
+        "vix_close": inputs.vix_close,
+        "vxn_close": inputs.vxn_close,
+        "vix_z_score_20d": inputs.vix_z_score_20d,
+        "iv_rank_30d": inputs.iv_rank_30d,
+        "atr_5d": inputs.atr_5d,
+        "put_call_ratio": inputs.put_call_ratio,
+        "skew_delta": inputs.skew_delta,
+        "call_wall_0dte": inputs.call_wall_0dte,
+        "put_wall_0dte": inputs.put_wall_0dte,
+        "top_gamma_nodes": inputs.top_gamma_nodes,
+        "is_opex_friday": inputs.is_opex_friday,
+        "is_vix_expiration": inputs.is_vix_expiration,
+        "is_post_opex_monday": inputs.is_post_opex_monday,
+        "days_to_opex": inputs.days_to_opex,
+        "is_event_day": inputs.is_event_day,
+        "calibration_applied": result.calibration_applied,
+        "rationale": result.rationale,
+    }
+
     base = {
         "symbol": inputs.symbol,
         "date": inputs.forecast_date,
@@ -164,8 +278,13 @@ def _build_payload(inputs: ForecastInputs, result: ForecastResult, open_ts: date
         "projected_high": result.projected_high,
         "projected_close": result.projected_close,
         "pin_strike": result.pin_strike,
+        "pin_tolerance": result.pin_tolerance,
         "flagship_setup": inputs.flagship_setup,
         "range_model": result.range_model,
+        "raw_projected_low": result.raw_projected_low,
+        "raw_projected_high": result.raw_projected_high,
+        "raw_pin_strike": result.raw_pin_strike,
+        "forecast_inputs": inputs_snapshot,
     }
     # The content hash deliberately excludes open_ts (which is recorded
     # at the moment of write and would otherwise make every dry-run

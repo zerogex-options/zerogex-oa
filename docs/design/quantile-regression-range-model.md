@@ -7,19 +7,83 @@
 > The `daily_forecast` table (shipped 2026-06-30) records both the morning
 > projection and the 4 PM receipt. Once ~120 trading days of receipts have
 > accumulated we have enough labelled data to train a real range model that
-> replaces `heuristic_v1`. This doc captures the intent so we don't forget it
+> replaces the heuristic. This doc captures the intent so we don't forget it
 > and can walk in cold and pick up.
+>
+> **Update 2026-07-02:** the base heuristic is now **v1.2** with a **Layer 2
+> online correction** loop; see the layer diagram below. The 120-receipt
+> threshold and 2027-01 re-check target are unchanged — the correction loop
+> nudges scalars around v1.2, quantile v2 will replace v1.2 as the base
+> layer.
 
-## Why v1 is a heuristic, not a model
+## The three-layer architecture
 
-`src/jobs/forecast_range_model.py` (`heuristic_v1`) computes the projected
-range by expanding the wider of `(spot − put_wall)` and `(call_wall − spot)`
-by a 10% wick allowance, plus a 1.5× multiplier on FOMC/CPI/NFP days, then
-clamps to a `[0.3%, 2.5%]` fraction-of-spot band. It's honest — every
-component is auditable and the algorithm is deterministic — but every
-constant (`WALL_EXPANSION = 1.10`, `EVENT_DAY_MULTIPLIER = 1.5`, the clamp
-bounds) is a guess informed by nothing but intuition. We can do better once
-we have realized data.
+```
+Layer 3 (v2 quantile regression, ~2027-01) ← 6 mo data collection
+Layer 2 (v1.3 online correction, live)     ← nightly nudges
+Layer 1 (v1.2 feature-weighted, live)      ← rich heuristic
+```
+
+Layer 1 is a rich hand-tuned model with explicit physical logic (walls,
+skew, VIX, ATR, MSI, gamma nodes, special-day handlers). Layer 2 sits
+on top and shifts four per-symbol scalars based on trailing-20 accuracy.
+Layer 3 arrives later and replaces Layer 1 as the base; Layer 2 keeps
+correcting whatever's underneath it.
+
+## Why v1 was a heuristic — and what v1.2 changes
+
+The original `heuristic_v1` computed the projected range by expanding the
+wider of `(spot − put_wall)` and `(call_wall − spot)` by a 10% wick
+allowance, plus a 1.5× multiplier on FOMC/CPI/NFP days, then clamped to a
+`[0.3%, 2.5%]` fraction-of-spot band. It was honest but naive: symmetric
+around spot, no directional lean, no VIX input, no calendar awareness
+beyond one env-var list.
+
+**v1.2** (shipped 2026-07-02) folds in ~15 signals with explicit physical
+logic:
+
+| Signal | v1.1 use | v1.2 use |
+|---|---|---|
+| Call/put wall distances | Symmetric max | Separate asymmetric half-bands |
+| Wall magnitude (net GEX) | Ignored | Sticky-node tightener above 1e8 threshold |
+| Top-3 gamma nodes | Ignored | Same sticky-node logic |
+| Max pain | Pin only | Pin + projected-close attractor |
+| 0DTE walls (per-expiration) | Ignored | 70/30 blend on OPEX Fridays / post-OPEX Mondays |
+| MSI composite (signed) | Regime label only | Regime label + directional lean (±25% cap) |
+| MSI intensity | Ignored | Screaming-indicator tightener when |composite|>0.6 |
+| Put/call ratio | Ignored | Screaming-bearish/bullish trigger |
+| VIX (SPY/SPX) / VXN (QQQ) | Ignored | Implied 1-day move blend (max-of-band-and-implied) |
+| VIX z-score 20d | Ignored | Vol-scream widener / vol-compressed tightener |
+| IV rank 30d | Ignored | Feature snapshot for eventual v2 training (not yet weighted) |
+| ATR 5d | Ignored | Floor: band can't be tighter than half the trailing 5-day ATR |
+| Monthly OPEX Friday | Ignored | ×1.15 widen + 0DTE wall blend |
+| VIX-piration Wed (3rd Wed) | Ignored | Dampen implied-vol blend to 30% (implied surface stale mid-week) |
+| Post-OPEX Monday | Ignored | Enable 0DTE wall blend |
+| Event day (FOMC/CPI/NFP) | ×1.5 flat | ×1.5 + overnight-gap asymmetric tilt |
+
+The pin tolerance is now **dynamic per symbol**: `max(strike_step × 0.5,
+spot × 0.1%)` — a floor of 10bps for SPX, half-strike for SPY. The
+receipt writer honors the row's own `pin_tolerance` column when
+grading, falling back to the caller default for legacy rows.
+
+## Layer 2 online correction (v1.3)
+
+New table `forecast_calibration_state` (one row per symbol) holds four
+scalars: `band_width_mult`, `pin_tolerance_mult`, `upside_lean`,
+`downside_lean`. The nightly `forecast_calibrate` cron (fires 20:00 ET
+Mon–Fri via systemd timer) reads the trailing 20 receipts, grades
+against the RAW pre-correction band + pin (stored in
+`raw_projected_low/high` and `raw_pin_hit`), and nudges each scalar with
+a learning rate of 0.05 toward whatever the trailing coverage /
+break-imbalance / pin-hit-rate signal suggests.
+
+Cold-start guard: `n_receipts_used < 15` → hold neutral. Bounds are
+clamped hard (band ∈ [0.7, 1.5], leans ∈ [±0.20]) so no run of misses
+can push the model somewhere unreasonable.
+
+Both the RAW and CORRECTED forecasts are stored on every daily_forecast
+row so the eventual v2 evaluation can compare all three layers head-to-
+head.
 
 ## What v2 looks like — quantile GBRT
 
