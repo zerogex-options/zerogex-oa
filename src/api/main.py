@@ -161,6 +161,19 @@ async def lifespan(app: FastAPI):
     except Exception:  # noqa: BLE001 — defensive during startup
         logger.warning("TradeWorkz bot provisioning skipped", exc_info=True)
 
+    # Start the TradeWorkz in-process tick scheduler. Runs one engine.tick()
+    # every TRADEWORKZ_ENGINE_INTERVAL_SECONDS on a background asyncio task,
+    # dispatching the synchronous psycopg2 work through asyncio.to_thread so
+    # it doesn't block the FastAPI event loop. No-op when
+    # TRADEWORKZ_ENGINE_ENABLED=false. Wrapped in try/except so a startup
+    # failure inside the scheduler can't prevent the API from serving.
+    try:
+        from src.tradeworkz.scheduler import scheduler as _tw_scheduler
+
+        _tw_scheduler.start()
+    except Exception:  # noqa: BLE001
+        logger.warning("TradeWorkz scheduler failed to start", exc_info=True)
+
     yield
 
     # Shutdown
@@ -170,6 +183,14 @@ async def lifespan(app: FastAPI):
     await usage_meter.stop()
     usage_meter.configure(None)
     key_store.configure(None)
+    # Stop the TradeWorkz scheduler while the pool is still up so any final
+    # in-flight tick can finish its DB writes cleanly before we tear down.
+    try:
+        from src.tradeworkz.scheduler import scheduler as _tw_scheduler
+
+        await _tw_scheduler.stop()
+    except Exception:  # noqa: BLE001
+        logger.warning("TradeWorkz scheduler shutdown failed", exc_info=True)
     if db_manager:
         await db_manager.disconnect()
     logger.info("Shutdown complete")
