@@ -231,7 +231,7 @@ async def list_bots(
 
 @router.get("/leaderboard")
 async def leaderboard(
-    period: str = Query(default="all", regex="^(1d|7d|30d|365d|all)$"),
+    period: str = Query(default="all", pattern="^(1d|7d|30d|365d|all)$"),
     db: DatabaseManager = Depends(get_db),
 ) -> Dict[str, Any]:
     """Ranked list of bots by return over ``period``."""

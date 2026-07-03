@@ -140,9 +140,13 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
     """
     cur = conn.cursor()
 
+    # underlying_quotes is per-bar OHLC (open/high/low/close per timestamp)
+    # — there is no session_high / session_low / session_open on the row.
+    # Fetch the latest tick for the current spot + timestamp, then aggregate
+    # today's session bounds in a second query.
     cur.execute(
         """
-        SELECT timestamp, close, session_high, session_low, session_open
+        SELECT timestamp, close
         FROM underlying_quotes
         WHERE symbol = %s
         ORDER BY timestamp DESC
@@ -154,14 +158,38 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
     if row is None:
         logger.debug("build_snapshot(%s): no underlying_quotes row", underlying)
         return None
-    ts, spot, sess_hi, sess_lo, sess_open = row
+    ts, spot = row
     if spot is None or float(spot) <= 0:
         return None
 
+    # Session bounds: MIN/MAX of per-bar low/high, plus the earliest open in
+    # today's session window (09:30-16:15 ET, expressed as the last 24h to
+    # keep the query timezone-agnostic — the bots that care about session
+    # bounds only look at intraday behavior anyway).
     cur.execute(
         """
-        SELECT net_gex, gamma_flip, max_pain, put_call_ratio, call_wall, put_wall,
-               max_gamma_strike, dealer_net_delta
+        SELECT MIN(low), MAX(high),
+               (SELECT open FROM underlying_quotes
+                WHERE symbol = %s AND timestamp >= NOW() - INTERVAL '24 hours'
+                ORDER BY timestamp ASC LIMIT 1)
+        FROM underlying_quotes
+        WHERE symbol = %s AND timestamp >= NOW() - INTERVAL '24 hours'
+        """,
+        (underlying, underlying),
+    )
+    session_row = cur.fetchone()
+    sess_lo = session_row[0] if session_row else None
+    sess_hi = session_row[1] if session_row else None
+    sess_open = session_row[2] if session_row else None
+
+    # gex_summary — real column names differ from earlier drafts:
+    #   * total_net_gex   (not net_gex)
+    #   * gamma_flip_point (not gamma_flip)
+    #   * no dealer_net_delta column
+    cur.execute(
+        """
+        SELECT total_net_gex, gamma_flip_point, max_pain, put_call_ratio,
+               call_wall, put_wall, max_gamma_strike
         FROM gex_summary
         WHERE underlying = %s
         ORDER BY timestamp DESC
@@ -174,7 +202,7 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
         gx = gex_rows[0]
         prior = gex_rows[1] if len(gex_rows) > 1 else None
     else:
-        gx = (None,) * 8
+        gx = (None,) * 7
         prior = None
 
     cur.execute(
@@ -208,7 +236,10 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
         call_wall=_maybe_float(gx[4]),
         put_wall=_maybe_float(gx[5]),
         max_gamma_strike=_maybe_float(gx[6]),
-        dealer_net_delta=_maybe_float(gx[7]),
+        # dealer_net_delta is not persisted on gex_summary — leave it None
+        # so the DealerDeltaPressureRider bot stays inactive until a real
+        # source is wired. All other bots ignore this field.
+        dealer_net_delta=None,
         prior_call_wall=_maybe_float(prior[4]) if prior else None,
         prior_put_wall=_maybe_float(prior[5]) if prior else None,
         session_high=_maybe_float(sess_hi),
