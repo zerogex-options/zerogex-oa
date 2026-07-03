@@ -395,6 +395,48 @@ async def bot_equity_curve(
     return {"bot_id": bot_id, "points": [dict(r) for r in rows]}
 
 
+@router.get("/equity-curves")
+async def all_equity_curves(
+    days: int = Query(default=90, ge=1, le=730),
+    db: DatabaseManager = Depends(get_db),
+) -> Dict[str, Any]:
+    """Bundled equity curves for every enabled bot.
+
+    The dashboard's fleet-overview chart overlays every bot on one axis, so
+    one round-trip returning all curves beats N parallel requests — both for
+    latency (single DB scan on the bot_id-indexed table) and for the React
+    hook rules (no dynamic hook-in-loop on the client)."""
+    async with db.pool.acquire() as conn:
+        bots = await conn.fetch(
+            "SELECT id, display_name FROM tw_bots WHERE enabled = TRUE ORDER BY id",
+        )
+        points = await conn.fetch(
+            """
+            SELECT bot_id, session_date, starting_nav, ending_nav,
+                   realized_pnl, unrealized_pnl, heat_pct, n_trades
+            FROM tw_equity_curve_daily
+            WHERE session_date >= CURRENT_DATE - ($1 || ' days')::interval
+            ORDER BY bot_id, session_date
+            """,
+            str(days),
+        )
+    by_bot: Dict[str, list[Dict[str, Any]]] = {b["id"]: [] for b in bots}
+    for p in points:
+        row = dict(p)
+        bot_id = row.pop("bot_id")
+        if bot_id in by_bot:
+            by_bot[bot_id].append(row)
+    bundles = [
+        {
+            "bot_id": b["id"],
+            "display_name": b["display_name"],
+            "points": by_bot.get(b["id"], []),
+        }
+        for b in bots
+    ]
+    return {"days": days, "bundles": bundles}
+
+
 @router.get("/bots/{bot_id}/metrics")
 async def bot_metrics(
     bot_id: str,
@@ -602,3 +644,62 @@ async def admin_update_capital(
             bot_id, *fields.values(),
         )
     return {"status": "ok", "bot_id": bot_id, "updated": fields}
+
+
+@router.post(
+    "/admin/simulate",
+    dependencies=[Depends(require_scopes(SIGNALS))],
+)
+async def admin_simulate(
+    body: Dict[str, Any] = Body(default_factory=dict),
+) -> Dict[str, Any]:
+    """Seed the tw_ tables with deterministic synthetic trade history.
+
+    Fully wipes any existing trades / equity / metrics / ml_state per bot
+    before inserting, so the endpoint is idempotent — re-running with the
+    same body converges to the same fleet state. Uses the synchronous
+    psycopg2 pool via ``src.database.db_connection`` because the simulator
+    does many small inserts and pipelining them through asyncpg would add
+    complexity for no throughput gain here.
+
+    Body (all optional):
+        days: how many trading days of history to synthesize (default 60,
+              min 1, max 365)
+        seed: master RNG seed for reproducibility (default 42)
+        scale: PnL magnitude multiplier (default 1.0)
+        bot_ids: subset to simulate; default = every enabled bot
+    """
+    from src.database import db_connection
+    from src.tradeworkz.simulate import simulate
+
+    days = int(body.get("days") or 60)
+    days = max(1, min(365, days))
+    master_seed = int(body.get("seed") or 42)
+    scale = float(body.get("scale") or 1.0)
+    bot_ids = body.get("bot_ids")
+    if bot_ids is not None and not isinstance(bot_ids, list):
+        raise HTTPException(status_code=400, detail="bot_ids must be a list of strings")
+
+    with db_connection() as conn:
+        summary = simulate(
+            conn, days=days, master_seed=master_seed, scale=scale, bot_ids=bot_ids,
+        )
+    return summary
+
+
+@router.post(
+    "/admin/simulate/clear",
+    dependencies=[Depends(require_scopes(SIGNALS))],
+)
+async def admin_simulate_clear(
+    body: Dict[str, Any] = Body(default_factory=dict),
+) -> Dict[str, Any]:
+    """Wipe all synthesized (and real) trade history back to a clean fleet."""
+    from src.database import db_connection
+    from src.tradeworkz.simulate import clear
+
+    bot_ids = body.get("bot_ids")
+    if bot_ids is not None and not isinstance(bot_ids, list):
+        raise HTTPException(status_code=400, detail="bot_ids must be a list of strings")
+    with db_connection() as conn:
+        return clear(conn, bot_ids=bot_ids)
