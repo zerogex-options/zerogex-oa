@@ -557,6 +557,21 @@ class IngestionEngine:
                         quote["down_volume"],
                     ),
                 )
+                # NOTIFY inside the same transaction so it delivers exactly
+                # once on commit (and is discarded on rollback). Payload is
+                # deliberately tiny — {symbol, ts} — the API-side broker
+                # refetches the enriched row so the WS payload matches the
+                # /api/market/quote response shape without duplicating the
+                # enrichment (session, cumulative volume join) here.
+                notify_payload = json.dumps(
+                    {
+                        "symbol": quote["symbol"],
+                        "ts": quote["timestamp"].isoformat()
+                        if hasattr(quote["timestamp"], "isoformat")
+                        else str(quote["timestamp"]),
+                    }
+                )
+                cursor.execute("SELECT pg_notify(%s, %s)", ("underlying_quote_events", notify_payload))
                 conn.commit()
                 # Reset breaker on success (underlying writes confirm DB is alive).
                 self._db_consecutive_failures = 0

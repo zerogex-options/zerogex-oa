@@ -4,7 +4,7 @@ ZeroGEX API Server
 FastAPI backend for serving analytics data to the frontend
 """
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
@@ -20,6 +20,7 @@ import pytz
 from .database import DatabaseManager
 from .errors import handle_api_errors
 from .middleware import AuditLogMiddleware, RequestIdMiddleware, UsageMeterMiddleware
+from .quote_broker import QuoteBroker
 from .ratelimit import rate_limit
 from .scopes import FLOW, GEX, MARKET_RAW, MAXPAIN, SIGNALS, TECHNICALS
 from .security import api_key_auth, key_store, require_scopes
@@ -69,6 +70,12 @@ logger = get_logger(__name__)
 # Database manager
 db_manager: Optional[DatabaseManager] = None
 
+# Quote broker — fans out underlying_quote NOTIFY events to WS subscribers.
+# Wired in lifespan() so it shares the API process's event loop; the
+# ``_load_enriched_quote`` closure below reuses the REST endpoint's
+# enrichment path so the WS payload is byte-identical to /api/market/quote.
+quote_broker: Optional[QuoteBroker] = None
+
 
 def _db() -> DatabaseManager:
     """Return the initialized db_manager.
@@ -115,7 +122,7 @@ def _parse_cors_origins(raw_origins: Optional[str]) -> List[str]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
-    global db_manager
+    global db_manager, quote_broker
 
     # Startup
     logger.info("Starting ZeroGEX API Server...")
@@ -138,6 +145,18 @@ async def lifespan(app: FastAPI):
     usage_meter.configure(lambda: db_manager.pool)
     usage_meter.start()
 
+    # Start the quote broker: one LISTEN connection + per-symbol fanout.
+    # Feature-flagged so an ops emergency can silence WS delivery without
+    # rebuilding the API image. The REST /api/market/quote endpoint keeps
+    # working either way.
+    if _getenv_str("QUOTE_WS_ENABLED", "1") not in ("0", "false", "False", ""):
+        quote_broker = QuoteBroker(
+            connect_factory=lambda: db_manager.open_listen_connection(),
+            enrich=_load_enriched_quote,
+        )
+        quote_broker.start()
+        logger.info("Quote broker started (LISTEN underlying_quote_events)")
+
     # The max-pain snapshot is refreshed off-process by the
     # zerogex-oa-max-pain-refresh.timer (daily, pre-market) — not by an
     # in-process loop and not inline on the request path.  The endpoint is
@@ -146,6 +165,8 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down ZeroGEX API Server...")
+    if quote_broker is not None:
+        await quote_broker.stop()
     # Stop the meter first (cancels the loop and flushes the final window)
     # while the DB pool is still up, then drop both pool getters.
     await usage_meter.stop()
@@ -1016,6 +1037,41 @@ def get_market_session(
 # ============================================================================
 
 
+async def _load_enriched_quote(symbol: str) -> Optional[dict]:
+    """Fetch + enrich the current underlying quote.
+
+    Extracted from ``get_current_quote`` so the WS broker
+    (``quote_broker.QuoteBroker``) can produce the exact same payload
+    shape on each NOTIFY event without duplicating the session /
+    soft-close / cumulative-volume logic.
+
+    Returns ``None`` when there's no quote row for the symbol.
+    """
+    data = await _db().get_latest_quote(symbol)
+    if not data:
+        return None
+
+    data = dict(data)
+    asset_type = data.pop("asset_type", None)
+    if "cumulative_daily_volume" in data:
+        data["volume"] = data.pop("cumulative_daily_volume")
+
+    if (
+        symbol not in _soft_close_trackers
+        and len(_soft_close_trackers) >= _SOFT_CLOSE_TRACKER_MAX
+    ):
+        oldest_key = next(iter(_soft_close_trackers))
+        del _soft_close_trackers[oldest_key]
+    tracker = _soft_close_trackers.setdefault(symbol, _SoftCloseTracker())
+    tracker.record(data.get("close"))
+
+    close_data_available = await _db().has_todays_close_landed(symbol, asset_type)
+    data["session"] = get_market_session(
+        asset_type, tracker.is_stable(), close_data_available
+    )
+    return data
+
+
 @app.get(
     "/api/market/quote",
     dependencies=[_scope_market_raw],
@@ -1040,36 +1096,127 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
     surface that reads ``quoteData.close``.
     """
     try:
-        data = await _db().get_latest_quote(symbol)
-        if not data:
+        data = await _load_enriched_quote(symbol)
+        if data is None:
             raise HTTPException(status_code=404, detail="No quote data available")
-
-        data = dict(data)
-        asset_type = data.pop("asset_type", None)
-        if "cumulative_daily_volume" in data:
-            data["volume"] = data.pop("cumulative_daily_volume")
-
-        # Update per-symbol soft-close tracker and evaluate stability
-        # Evict oldest entries if tracker dict grows too large
-        if (
-            symbol not in _soft_close_trackers
-            and len(_soft_close_trackers) >= _SOFT_CLOSE_TRACKER_MAX
-        ):
-            oldest_key = next(iter(_soft_close_trackers))
-            del _soft_close_trackers[oldest_key]
-        tracker = _soft_close_trackers.setdefault(symbol, _SoftCloseTracker())
-        tracker.record(data.get("close"))
-
-        close_data_available = await _db().has_todays_close_landed(symbol, asset_type)
-        data["session"] = get_market_session(
-            asset_type, tracker.is_stable(), close_data_available
-        )
         return UnderlyingQuote(**data)
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error fetching quote: {e!r}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+async def _authorize_ws(websocket: WebSocket) -> bool:
+    """Authenticate a WebSocket handshake against ``api_key_auth`` rules.
+
+    Browsers can't set custom headers on WS handshakes, so credentials
+    ride in on ``?token=`` (or, for server-side callers, the
+    ``Authorization: Bearer`` / ``X-API-Key`` header the initial GET
+    carries — Starlette exposes both). We reuse ``key_store`` directly
+    rather than the HTTP ``api_key_auth`` dep because that dep wants a
+    ``Request``; the semantics we need — static break-glass key OR a
+    live DB key with the MARKET_RAW scope OR fully-disabled auth in
+    dev — collapse to a few lines here.
+    """
+    static_enabled = os.getenv("API_KEY") is not None
+    db_enabled = key_store.is_enabled()
+
+    # Dev / CI: no backend configured, no auth.
+    if not static_enabled and not db_enabled:
+        return True
+
+    token = (
+        websocket.query_params.get("token")
+        or websocket.headers.get("x-api-key")
+    )
+    if not token:
+        bearer = websocket.headers.get("authorization")
+        if bearer and bearer.lower().startswith("bearer "):
+            token = bearer.split(" ", 1)[1].strip()
+
+    if not token:
+        return False
+
+    if static_enabled and token == os.getenv("API_KEY"):
+        return True
+
+    if db_enabled:
+        info = await key_store.lookup(token)
+        if info is None:
+            return False
+        # Same scope gate the REST endpoint uses. When
+        # API_SCOPE_ENFORCEMENT is off this is inert (keys without scopes
+        # are still admitted); when it flips on, the WS route respects
+        # MARKET_RAW just like /api/market/quote does.
+        scopes = set(info.get("scopes") or ())
+        enforcement = os.getenv("API_SCOPE_ENFORCEMENT", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not enforcement or "*" in scopes or MARKET_RAW in scopes:
+            return True
+        return False
+
+    return False
+
+
+@app.websocket("/ws/market/quote")
+async def ws_market_quote(websocket: WebSocket, symbol: str = "SPY"):
+    """Live-tick underlying quote pushed as each ingestion write lands.
+
+    Wire protocol (JSON frames, one per WS message):
+      * ``{"type":"snapshot", "data": UnderlyingQuote}`` — sent once on
+        connect if a cached tick is available.  Clients that want a
+        guaranteed first frame should REST /api/market/quote before
+        opening the socket, but for symbols we've already seen the
+        cached snapshot means they don't have to.
+      * ``{"type":"tick", "data": UnderlyingQuote}`` — one per NOTIFY.
+      * ``{"type":"error", "detail": "..."}`` — terminal errors.
+
+    Auth: same key set as the REST surface (see ``_authorize_ws``).
+    Feature-flagged via ``QUOTE_WS_ENABLED``: when disabled the broker
+    isn't started, so subscribe() would block forever — refuse the
+    connection instead.
+    """
+    if quote_broker is None:
+        # 1013 = "try again later"
+        await websocket.close(code=1013)
+        return
+
+    if not await _authorize_ws(websocket):
+        await websocket.close(code=4401)
+        return
+
+    symbol = (symbol or "SPY").upper()
+    await websocket.accept()
+
+    sub, snapshot = await quote_broker.subscribe(symbol)
+    try:
+        if snapshot is not None:
+            # Serialize through the pydantic model so the wire shape is
+            # identical to /api/market/quote (drops None fields via
+            # response_model_exclude_none semantics).
+            await websocket.send_json(
+                {"type": "snapshot", "data": UnderlyingQuote(**snapshot).model_dump(exclude_none=True, mode="json")}
+            )
+        while True:
+            payload = await sub.queue.get()
+            await websocket.send_json(
+                {"type": "tick", "data": UnderlyingQuote(**payload).model_dump(exclude_none=True, mode="json")}
+            )
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.warning("[ws-quote] %s subscriber error: %r", symbol, exc)
+        try:
+            await websocket.send_json({"type": "error", "detail": "stream error"})
+        except Exception:
+            pass
+    finally:
+        await quote_broker.unsubscribe(symbol, sub)
 
 
 @app.get(

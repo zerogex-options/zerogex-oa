@@ -610,6 +610,29 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
 
         raise RuntimeError(f"Failed to create database pool after {retries} attempts: {last_error}")
 
+    async def open_listen_connection(self) -> asyncpg.Connection:
+        """Open a dedicated asyncpg connection for LISTEN/NOTIFY.
+
+        Not backed by the pool: a ``LISTEN`` connection stays checked out
+        for its entire lifetime, so borrowing from ``self.pool`` (max 3
+        by default) would deadlock request-serving code. The broker owns
+        one of these per-process for its lifetime.
+        """
+        connect_timeout = _getenv_float("DB_CONNECT_TIMEOUT_SECONDS", 20)
+        ssl_mode = os.getenv("DB_SSLMODE", "").strip().lower()
+        ssl = None
+        if ssl_mode in {"require", "verify-ca", "verify-full"}:
+            ssl = True
+        return await asyncpg.connect(
+            host=self.host,
+            port=self.port,
+            database=self.database,
+            user=self.user,
+            password=self.password,
+            timeout=connect_timeout,
+            ssl=ssl,
+        )
+
     async def disconnect(self):
         """Close connection pool"""
         # DEBUG so the stack trace is available when chasing an unexpected
