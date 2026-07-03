@@ -74,11 +74,23 @@ fi
 # Load ~/.env if present so the operator doesn't have to source it
 # manually before every invocation. Silently no-ops if the file is
 # missing (dev laptop path).
+#
+# We disable ``set -u`` around the source: real-world ``.env`` files
+# often contain values like ``SYMBOL_ALIASES=SPX=$SPXW.X`` that are
+# meant to be read literally by python-dotenv but that bash tries to
+# expand when sourcing.  Under nounset that expansion crashes the
+# wrapper before Python ever runs.  Python's own dotenv parser reads
+# the file as text and doesn't have this problem, so all we need out
+# of the shell source is to seed the env vars whose values ARE plain
+# strings — anything with a ``$`` in the value will get re-read
+# correctly by the Python process anyway.
 if [[ -f "$SCRIPT_DIR/.env" ]]; then
+    set +u
     set -a
     # shellcheck disable=SC1090,SC1091
     source "$SCRIPT_DIR/.env"
     set +a
+    set -u
 fi
 
 cd "$SCRIPT_DIR"
