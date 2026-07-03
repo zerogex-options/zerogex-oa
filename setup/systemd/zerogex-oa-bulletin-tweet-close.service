@@ -1,0 +1,31 @@
+[Unit]
+Description=ZeroGEX Live-Bulletin post-market X post (16:05 ET)
+Documentation=https://github.com/zerogex/options/zerogex-oa
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Posts the post-market bulletin tweet.  See the premarket unit for the
+# dry-run / --post gating story — same rules apply here.  This is the
+# highest-signal fire of the three: closing print + the auction, and
+# the day's replay clip is complete so the video attachment shows the
+# full session sweep.
+ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.bulletin_tweet --mode close --post
+
+TimeoutStartSec=240
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa /var/lib/zerogex-oa
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-bulletin-tweet-close

@@ -1,0 +1,34 @@
+[Unit]
+Description=ZeroGEX Live-Bulletin pre-market X post (09:15 ET)
+Documentation=https://github.com/zerogex/options/zerogex-oa
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Posts the pre-market bulletin tweet.  Requires BOTH the --post flag
+# AND X_BOT_BEARER_TOKEN (plus the four OAuth1 secrets for the media
+# attachments) to be set in the EnvironmentFile — defense in depth so
+# a half-configured rollout can't accidentally tweet.  Until those are
+# in place, every run emits the would-be tweet text + PNG + clip to
+# the artifact directory (default /var/lib/zerogex-oa/bulletin-tweets).
+ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.bulletin_tweet --mode premarket --post
+
+TimeoutStartSec=240
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+# The artifact directory is the primary write target; also allow the
+# job's local logs to accumulate under the working directory.
+ReadWritePaths=/home/ubuntu/zerogex-oa /var/lib/zerogex-oa
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-bulletin-tweet-premarket

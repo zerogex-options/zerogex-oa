@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily trigger for ZeroGEX pre-market bulletin tweet (09:15 ET Mon-Fri)
+
+[Timer]
+# Fires at 09:15 ET — 15 minutes before the cash open, so the tweet
+# sets up the day's dealer-gamma frame while the operator still has
+# time to react to it.  ``America/New_York`` handles DST for us.
+OnCalendar=Mon..Fri *-*-* 09:15:00
+RandomizedDelaySec=45s
+# Catch up after planned downtime — a pre-market read still adds value
+# if it lands by the open.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
