@@ -557,6 +557,15 @@ class IngestionEngine:
                         quote["down_volume"],
                     ),
                 )
+                # Real-time fan-out to the API workers via Postgres NOTIFY,
+                # in the same transaction as the upsert so subscribers
+                # only see a tick iff it landed durably (NOTIFY is
+                # delivered on COMMIT). Best-effort — a NOTIFY failure
+                # (payload too big, channel name too long, etc.) must not
+                # abort the persist path that every downstream analytic
+                # depends on. See src/api/quote_broadcaster.py for the
+                # LISTEN side.
+                self._publish_quote_notify(cursor, quote)
                 conn.commit()
                 # Reset breaker on success (underlying writes confirm DB is alive).
                 self._db_consecutive_failures = 0
@@ -576,6 +585,80 @@ class IngestionEngine:
                 f"(attempt #{self._db_consecutive_failures}, backoff {backoff:.2f}s): {e}",
                 exc_info=True,
             )
+
+    # ------------------------------------------------------------------
+    # Real-time WebSocket fan-out — publish quote to 'zgx_quote_updates'.
+    # ------------------------------------------------------------------
+    # Postgres NOTIFY is the inter-process bus between this ingestion
+    # process and the FastAPI workers (separate systemd services, no
+    # shared memory, no broker in the stack). Delivered on COMMIT of
+    # the surrounding transaction — subscribers see the tick iff the
+    # row landed durably.
+    _WS_NOTIFY_CHANNEL = "zgx_quote_updates"
+    # Postgres caps NOTIFY payloads at 8000 bytes; our JSON is ~250B
+    # but we guard to catch runaway values (a bad up_volume string cast
+    # etc.) rather than raise mid-commit.
+    _WS_NOTIFY_PAYLOAD_LIMIT = 7500
+
+    def _publish_quote_notify(self, cursor, quote: Dict[str, Any]) -> None:
+        """Emit a NOTIFY carrying the current tick to WebSocket subscribers.
+
+        Best-effort: any failure logs and returns, so a broken WS path
+        never breaks ingestion. Runs on the same cursor as the upsert so
+        the notify commits atomically with the row.
+        """
+        try:
+            asset_type = getattr(self, "_asset_type_cache", None)
+            if asset_type is None:
+                asset_type = self._lookup_asset_type(cursor, quote["symbol"])
+            payload = {
+                "symbol": quote["symbol"],
+                "timestamp": (
+                    quote["timestamp"].isoformat()
+                    if hasattr(quote["timestamp"], "isoformat")
+                    else str(quote["timestamp"])
+                ),
+                "open": float(quote["open"]) if quote.get("open") is not None else None,
+                "high": float(quote["high"]) if quote.get("high") is not None else None,
+                "low": float(quote["low"]) if quote.get("low") is not None else None,
+                "close": float(quote["close"]) if quote.get("close") is not None else None,
+                "up_volume": int(quote["up_volume"]) if quote.get("up_volume") is not None else None,
+                "down_volume": (
+                    int(quote["down_volume"]) if quote.get("down_volume") is not None else None
+                ),
+                "asset_type": asset_type,
+            }
+            body = json.dumps(payload, separators=(",", ":"), default=str)
+            if len(body.encode("utf-8")) > self._WS_NOTIFY_PAYLOAD_LIMIT:
+                logger.warning(
+                    "WS notify payload too large (%d bytes); dropping tick",
+                    len(body),
+                )
+                return
+            # ``pg_notify`` is used (rather than ``NOTIFY zgx_quote_updates,
+            # '...'``) because it takes the payload as a parameter — no
+            # SQL-literal escaping to worry about.
+            cursor.execute("SELECT pg_notify(%s, %s)", (self._WS_NOTIFY_CHANNEL, body))
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug("WS notify emit failed (ignored): %s", exc)
+
+    def _lookup_asset_type(self, cursor, symbol: str) -> Optional[str]:
+        """One-shot lookup for the symbol's asset_type; cache for reuse.
+
+        Ingestion runs one process per underlying so the cache is a
+        single-slot memo — no eviction needed.
+        """
+        try:
+            cursor.execute("SELECT asset_type FROM symbols WHERE symbol = %s", (symbol,))
+            row = cursor.fetchone()
+        except Exception:
+            row = None
+        asset_type = row[0] if row else None
+        # Memoize on the instance so subsequent notifies skip the query.
+        # Bind to the calling instance from within a method — walking up
+        # would be fragile; assign directly.
+        self._asset_type_cache = asset_type
+        return asset_type
 
     def _enrich_with_greeks(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Apply Greeks calculation to option data, returning enriched copy."""
