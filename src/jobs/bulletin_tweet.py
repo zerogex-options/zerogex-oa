@@ -119,7 +119,7 @@ MODE_COPY: dict[str, ModeCopy] = {
         ],
     ),
     "midday": ModeCopy(
-        label="mid-session update",
+        label="midday update",
         lead_variants=[
             "Halfway through the session — checking in on the dealer gamma map.",
             "Mid-session read on where the walls have held (and where they haven't).",
@@ -349,10 +349,30 @@ def build_tweet_body(
     symbols_present = [b.symbol for b in present]
     header_symbols = " / ".join(f"${b.symbol}" for b in bulletins)
 
-    # Rotate the lead sentence off a hash of the day + mode so the
-    # copy varies day-to-day without the operator having to think
-    # about it — but stays deterministic within a given fire so a
-    # dry-run and the live post match.
+    numeric_block = _numeric_read_block(present)
+
+    # LLM-generated narrative if ANTHROPIC_API_KEY is set. Any failure
+    # (no key, API down, malformed reply, invented prices) returns None
+    # and we fall back to the static template below — never fail the
+    # tweet just because the LLM path had a bad day.
+    section = _try_llm_section(mode, day, present)
+    if section is not None:
+        text = _compose_with_llm_section(
+            section, header_symbols, numeric_block, site_url,
+        )
+        fallback = _build_fallback_tweet(
+            mode, present, header_symbols, site_url, section.header_label or copy.label,
+        )
+        return TweetBody(
+            text=text,
+            fallback=fallback,
+            lead_symbol=lead_symbol,
+            symbols_present=symbols_present,
+        )
+
+    # Static template fallback — rotates the lead sentence off a hash
+    # of (date, mode) so it varies day-to-day but stays deterministic
+    # within a given fire, so a dry-run and the live post match.
     day_seed = int(day.strftime("%Y%m%d"))
     seed = _hash_seed(day_seed, hash(mode) & 0xFFFFFFFF)
     lead = _pick(copy.lead_variants, seed)
@@ -364,19 +384,12 @@ def build_tweet_body(
         "",
         "Current ZeroGEX read:",
         "",
+        numeric_block,
+        "",
+        site_url.rstrip("/").replace("https://", "").replace("http://", ""),
+        "",
+        "$SPY $SPX $QQQ #Gamma #GEX #OptionsTrading #0DTE",
     ]
-    for i, b in enumerate(present):
-        block = _symbol_block(b)
-        if block:
-            blocks.append(block)
-            if i < len(present) - 1:
-                blocks.append("")
-
-    blocks.append("")
-    blocks.append(site_url.rstrip("/").replace("https://", "").replace("http://", ""))
-    blocks.append("")
-    blocks.append("$SPY $SPX $QQQ #Gamma #GEX #OptionsTrading #0DTE")
-
     text = "\n".join(blocks).strip()
 
     fallback = _build_fallback_tweet(mode, present, header_symbols, site_url, copy.label)
@@ -386,6 +399,106 @@ def build_tweet_body(
         lead_symbol=lead_symbol,
         symbols_present=symbols_present,
     )
+
+
+def _numeric_read_block(present: list[SymbolBulletin]) -> str:
+    """The deterministic ``Current ZeroGEX read:`` numeric block.
+
+    Extracted so both the LLM composition path and the static template
+    can share the same source of truth for the numbers — no chance the
+    two paths drift on formatting."""
+    parts: list[str] = []
+    for i, b in enumerate(present):
+        block = _symbol_block(b)
+        if block:
+            if i > 0:
+                parts.append("")
+            parts.append(block)
+    return "\n".join(parts)
+
+
+def _try_llm_section(
+    mode: str, day: date, present: list[SymbolBulletin],
+):
+    """Attempt LLM narrative generation. Returns None on any failure.
+
+    Imports the LLM helper lazily so a broken import (missing env
+    variable dependency, network outage during module import) cannot
+    take down the static-template path."""
+    try:
+        from src.jobs import bulletin_llm  # noqa: WPS433 — optional
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("bulletin_tweet: bulletin_llm import failed (%s)", exc)
+        return None
+
+    inputs = [
+        bulletin_llm.SymbolInput(
+            symbol=b.symbol,
+            spot=b.spot,
+            gamma_flip=b.gamma_flip,
+            call_wall=b.call_wall,
+            put_wall=b.put_wall,
+            max_pain=b.max_pain,
+            net_gex=b.net_gex,
+        )
+        for b in present
+    ]
+    try:
+        return bulletin_llm.generate_narrative(mode=mode, day=day, symbols=inputs)
+    except Exception as exc:  # noqa: BLE001 — never let the LLM path throw
+        logger.warning("bulletin_tweet: LLM narrative generation failed (%s)", exc)
+        return None
+
+
+def _compose_with_llm_section(
+    section,
+    header_symbols: str,
+    numeric_block: str,
+    site_url: str,
+) -> str:
+    """Assemble the tweet body around an LLM-generated ``LlmSection``.
+
+    Layout matches the operator's spec:
+
+        {header_symbols} {header_label}:
+        <blank line>
+        {opening}
+        <blank line>
+        Current ZeroGEX read:
+        <blank line>
+        {numeric_block}
+        <blank line>
+        {clean_read}
+        <blank line>
+        {closing}
+        <blank line>
+        {signoff (optional)}
+        <blank line>
+        zerogex.io
+        <blank line>
+        $SPY $SPX $QQQ #Gamma #GEX #OptionsTrading #0DTE
+
+    Any section coming back empty is elided so the composed body
+    never carries a lonely trailing blank paragraph."""
+    def _sep(existing: list[str], value: str) -> None:
+        stripped = value.strip()
+        if not stripped:
+            return
+        if existing and existing[-1] != "":
+            existing.append("")
+        existing.append(stripped)
+
+    header_label = section.header_label.strip() or "update"
+    blocks: list[str] = [f"{header_symbols} {header_label}:"]
+    _sep(blocks, section.opening)
+    _sep(blocks, "Current ZeroGEX read:")
+    _sep(blocks, numeric_block)
+    _sep(blocks, section.clean_read)
+    _sep(blocks, section.closing)
+    _sep(blocks, section.signoff)
+    _sep(blocks, site_url.rstrip("/").replace("https://", "").replace("http://", ""))
+    _sep(blocks, "$SPY $SPX $QQQ #Gamma #GEX #OptionsTrading #0DTE")
+    return "\n".join(blocks).strip()
 
 
 def _build_fallback_tweet(

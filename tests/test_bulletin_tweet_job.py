@@ -125,7 +125,7 @@ def test_build_tweet_body_labels_per_mode():
     bulletins = [mod._shape_bulletin(_summary_row("SPY", spot=744.51), "SPY")]
     for mode, expected in (
         ("premarket", "pre-market update"),
-        ("midday", "mid-session update"),
+        ("midday", "midday update"),
         ("close", "post-market update"),
     ):
         body = mod.build_tweet_body(
@@ -410,3 +410,178 @@ def test_load_credentials_from_env_reports_all_missing(monkeypatch):
     for k in ("X_BOT_API_KEY", "X_BOT_API_SECRET",
               "X_BOT_ACCESS_TOKEN", "X_BOT_ACCESS_TOKEN_SECRET"):
         assert k in str(ex.value)
+
+
+# ---------------------------------------------------------------------------
+# LLM narrative path
+# ---------------------------------------------------------------------------
+
+
+def test_build_tweet_body_falls_back_to_template_without_api_key(monkeypatch):
+    """No ANTHROPIC_API_KEY → the static template path runs unchanged.
+
+    This is the "safe default" — nothing about the LLM path should
+    take the tweet down when the operator hasn't opted in yet."""
+    mod = _reload_module()
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    bulletins = [
+        mod._shape_bulletin(_summary_row("SPY", spot=744.51), "SPY"),
+        mod._shape_bulletin(_summary_row("SPX"), "SPX"),
+    ]
+    body = mod.build_tweet_body("close", date(2026, 7, 3), bulletins,
+                                site_url="https://zerogex.io", lead_symbol="SPX")
+    # Static template = the deterministic lead sentence + no LLM-specific
+    # "The clean read:" phrasing.
+    assert "post-market update:" in body.text
+    assert "Current ZeroGEX read:" in body.text
+    # And the static template's site-tag row is still there
+    assert body.text.rstrip().endswith(
+        "$SPY $SPX $QQQ #Gamma #GEX #OptionsTrading #0DTE",
+    )
+
+
+def test_build_tweet_body_uses_llm_when_generator_returns_section(monkeypatch):
+    """When bulletin_llm.generate_narrative returns a section, the composed
+    body swaps in the LLM prose but keeps the deterministic numeric block."""
+    mod = _reload_module()
+    from src.jobs import bulletin_llm
+
+    def _fake_generate(**kwargs):
+        return bulletin_llm.LlmSection(
+            header_label="post-market update",
+            opening=(
+                "Interesting close into the holiday.\n\n"
+                "The morning started long-gamma, then the walls broke down."
+            ),
+            clean_read=(
+                "The clean read:\n\n"
+                "SPY finished pinned at the flip. SPX held its box."
+            ),
+            closing=(
+                "With the market closed tomorrow, this is a fitting place "
+                "to leave it."
+            ),
+            signoff="Happy 250th, America. 🇺🇸",
+        )
+
+    monkeypatch.setattr(bulletin_llm, "generate_narrative", _fake_generate)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
+
+    bulletins = [
+        mod._shape_bulletin(
+            _summary_row("SPY", spot=744.51, gamma_flip=744.51,
+                         call_wall=750.0, put_wall=740.0, max_pain=742.0,
+                         net_gex=72_300_000.0),
+            "SPY",
+        ),
+        mod._shape_bulletin(_summary_row("SPX"), "SPX"),
+    ]
+    body = mod.build_tweet_body("close", date(2026, 7, 3), bulletins,
+                                site_url="https://zerogex.io", lead_symbol="SPX")
+
+    # The LLM's narrative shows up verbatim
+    assert "Interesting close into the holiday." in body.text
+    assert "The clean read:" in body.text
+    assert "Happy 250th, America." in body.text
+    # But the numeric block is still the deterministic Python-composed one
+    assert "SPY spot: ~744.51" in body.text
+    assert "Net GEX: +$72.3M" in body.text
+    # And the hashtag row still terminates the post
+    assert body.text.rstrip().endswith(
+        "$SPY $SPX $QQQ #Gamma #GEX #OptionsTrading #0DTE",
+    )
+
+
+def test_llm_section_falls_back_when_generator_returns_none(monkeypatch):
+    """A None from the LLM path → static template composes the body.
+
+    Covers the API-error + malformed-reply paths without needing to
+    mock the whole HTTP layer."""
+    mod = _reload_module()
+    from src.jobs import bulletin_llm
+
+    monkeypatch.setattr(bulletin_llm, "generate_narrative", lambda **k: None)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
+
+    bulletins = [mod._shape_bulletin(_summary_row("SPY", spot=744.51), "SPY")]
+    body = mod.build_tweet_body("close", date(2026, 7, 3), bulletins,
+                                site_url="https://zerogex.io", lead_symbol="SPY")
+    # Template-shape check: the one-line lead sentence variant is present
+    # somewhere in the body.
+    assert "post-market update:" in body.text
+    assert any(v in body.text for v in mod.MODE_COPY["close"].lead_variants)
+
+
+def test_llm_invented_price_guard():
+    """Model output that quotes a fabricated price falls the section back
+    to None — never post a wrong number."""
+    from src.jobs import bulletin_llm
+
+    section = bulletin_llm.LlmSection(
+        header_label="update",
+        opening="SPY looks pinned to $999.99.",  # invented — not in inputs
+        clean_read="Nothing to see here.",
+        closing="",
+        signoff="",
+    )
+    inputs = [
+        bulletin_llm.SymbolInput(symbol="SPY", spot=744.51, gamma_flip=744.51),
+    ]
+    assert bulletin_llm._validate_no_invented_prices(section, inputs) is False
+
+
+def test_llm_validator_accepts_input_prices():
+    """A section that only quotes numbers actually in the inputs passes."""
+    from src.jobs import bulletin_llm
+
+    section = bulletin_llm.LlmSection(
+        header_label="update",
+        opening="SPX sits at 7,483 with the gamma flip at 7,448.",
+        clean_read="Call wall 7,500, put wall 7,480.",
+        closing="Watch the flip.",
+        signoff="",
+    )
+    inputs = [
+        bulletin_llm.SymbolInput(
+            symbol="SPX",
+            spot=7483.0,
+            gamma_flip=7448.0,
+            call_wall=7500.0,
+            put_wall=7480.0,
+        ),
+    ]
+    assert bulletin_llm._validate_no_invented_prices(section, inputs) is True
+
+
+def test_llm_extract_json_block_ignores_preamble():
+    from src.jobs import bulletin_llm
+
+    reply = (
+        "Sure, here you go:\n"
+        '{"header_label": "update", "opening": "hello"}\n'
+        "Hope that helps."
+    )
+    block = bulletin_llm._extract_json_block(reply)
+    assert block is not None
+    import json as _json
+    assert _json.loads(block) == {"header_label": "update", "opening": "hello"}
+
+
+def test_llm_generate_returns_none_without_api_key(monkeypatch):
+    from src.jobs import bulletin_llm
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    inputs = [bulletin_llm.SymbolInput(symbol="SPY", spot=744.51)]
+    assert bulletin_llm.generate_narrative(
+        mode="close", day=date(2026, 7, 3), symbols=inputs,
+    ) is None
+
+
+def test_next_trading_day_skips_weekend():
+    from src.jobs.bulletin_llm import next_trading_day
+
+    # Pure weekend skip — Friday 2026-01-02 → Monday 2026-01-05.
+    # NYSE_HOLIDAYS is env-driven and unset in the test process, so a
+    # holiday-eve assertion here would depend on production config.
+    assert next_trading_day(date(2026, 1, 2)).isoformat() == "2026-01-05"
