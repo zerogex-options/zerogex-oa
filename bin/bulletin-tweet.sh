@@ -71,27 +71,22 @@ else
     PYTHON="${PYTHON:-python3}"
 fi
 
-# Load ~/.env if present so the operator doesn't have to source it
-# manually before every invocation. Silently no-ops if the file is
-# missing (dev laptop path).
+# Note: we deliberately do NOT ``source`` the .env file here.  Real
+# .env files at zerogex-oa contain values that are legal Python-
+# dotenv syntax but not legal bash — unquoted lists like
+# ``KEY=0.010,foo,bar`` (bash parses ``foo,bar`` as a command name)
+# and $-refs like ``SYMBOL_ALIASES=SPX=$SPXW.X`` (bash tries to
+# expand ``$SPXW``).  Sourcing that file in bash crashes on the
+# first offending line long before Python runs.
 #
-# We disable ``set -u`` around the source: real-world ``.env`` files
-# often contain values like ``SYMBOL_ALIASES=SPX=$SPXW.X`` that are
-# meant to be read literally by python-dotenv but that bash tries to
-# expand when sourcing.  Under nounset that expansion crashes the
-# wrapper before Python ever runs.  Python's own dotenv parser reads
-# the file as text and doesn't have this problem, so all we need out
-# of the shell source is to seed the env vars whose values ARE plain
-# strings — anything with a ``$`` in the value will get re-read
-# correctly by the Python process anyway.
-if [[ -f "$SCRIPT_DIR/.env" ]]; then
-    set +u
-    set -a
-    # shellcheck disable=SC1090,SC1091
-    source "$SCRIPT_DIR/.env"
-    set +a
-    set -u
-fi
+# We don't need those vars in the shell env anyway: the Python job
+# imports ``src.config`` which calls ``load_dotenv()`` at startup,
+# so the .env is read correctly by the actual consumer.  This
+# wrapper only exists to pick the venv Python and print a banner.
+#
+# Systemd invocations of the job go through ``EnvironmentFile=`` in
+# the .service unit, which uses systemd's own parser (also not
+# bash) so the production path was never affected.
 
 cd "$SCRIPT_DIR"
 
