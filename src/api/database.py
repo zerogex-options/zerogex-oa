@@ -1981,6 +1981,56 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             )
             return []
 
+    async def get_underlying_candles_for_session(
+        self, symbol: str, session_date: date,
+    ) -> List[Dict[str, Any]]:
+        """Per-minute OHLC bars for the underlying over one cash session.
+
+        Powers the price-action chart the Replay scrubber renders alongside
+        the strike profile so a trader can read "where was the tape when
+        this GEX frame was published?" without leaving the tool. Anchors
+        on the same 09:30-16:00 ET window as ``get_gex_frames_for_session``
+        so the two series line up minute-for-minute.
+
+        Returns chronological ``{timestamp, open, high, low, close, volume}``
+        rows; missing volume columns fall back to zero. ``[]`` on any
+        error so the caller can render an empty state.
+        """
+        et = ZoneInfo("America/New_York")
+        utc = ZoneInfo("UTC")
+        start_et = datetime.combine(session_date, time(9, 30), tzinfo=et)
+        # +1 minute so the 16:00 bar is included; matches the GEX frames
+        # window so cursor alignment is exact.
+        end_et = datetime.combine(session_date, time(16, 1), tzinfo=et)
+        start_utc = start_et.astimezone(utc)
+        end_utc = end_et.astimezone(utc)
+
+        query = """
+            SELECT timestamp,
+                   open,
+                   high,
+                   low,
+                   close,
+                   COALESCE(up_volume, 0)::bigint AS up_volume,
+                   COALESCE(down_volume, 0)::bigint AS down_volume,
+                   (COALESCE(up_volume, 0) + COALESCE(down_volume, 0))::bigint AS volume
+            FROM underlying_quotes
+            WHERE symbol = $1
+              AND timestamp >= $2
+              AND timestamp < $3
+            ORDER BY timestamp ASC
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, start_utc, end_utc)
+                return [dict(r) for r in rows]
+        except Exception as e:
+            logger.warning(
+                "get_underlying_candles_for_session(%s, %s) failed: %s",
+                symbol, session_date, e,
+            )
+            return []
+
     async def get_underlying_bars_for_session(
         self, symbol: str, session_date: date
     ) -> List[Dict[str, Any]]:

@@ -123,6 +123,14 @@ def test_range_returns_session_frames_by_date(monkeypatch):
         {"timestamp": bar_b, "gamma_flip": Decimal("601"),
          "strikes": [{"strike": Decimal("600"), "net_gex": Decimal("2222.5")}]},
     ])
+    dbmod.DatabaseManager.get_underlying_candles_for_session = AsyncMock(return_value=[
+        {"timestamp": bar_a, "open": Decimal("600.10"), "high": Decimal("600.50"),
+         "low": Decimal("599.80"), "close": Decimal("600.40"),
+         "up_volume": 1200, "down_volume": 300, "volume": 1500},
+        {"timestamp": bar_b, "open": Decimal("600.40"), "high": Decimal("601.20"),
+         "low": Decimal("600.30"), "close": Decimal("601.00"),
+         "up_volume": 800, "down_volume": 200, "volume": 1000},
+    ])
     with TestClient(app) as client:
         r = client.get("/api/replay/range?symbol=SPY&date=2026-06-29")
     body = r.json()
@@ -138,17 +146,28 @@ def test_range_returns_session_frames_by_date(monkeypatch):
     call = dbmod.DatabaseManager.get_gex_frames_for_session.call_args
     assert call.args[0] == "SPY"
     assert call.args[1] == date(2026, 6, 29)
+    # Underlying candles come back on the same axis as the frames so
+    # the replay scrubber can render price action next to the strike
+    # profile without a second round-trip.
+    assert len(body["candles"]) == 2
+    assert body["candles"][0]["timestamp"] == bar_a.isoformat()
+    assert body["candles"][0]["open"] == pytest.approx(600.10)
+    assert body["candles"][0]["close"] == pytest.approx(600.40)
+    assert body["candles"][0]["volume"] == 1500
+    assert body["candles"][1]["high"] == pytest.approx(601.20)
 
 
 def test_range_returns_empty_when_date_has_no_data(monkeypatch):
     app, dbmod = _build_app(monkeypatch)
     dbmod.DatabaseManager.get_gex_frames_for_session = AsyncMock(return_value=[])
+    dbmod.DatabaseManager.get_underlying_candles_for_session = AsyncMock(return_value=[])
     with TestClient(app) as client:
         r = client.get("/api/replay/range?symbol=SPY&date=2020-01-01")
     body = r.json()
     assert r.status_code == 200
     assert body["count"] == 0
     assert body["frames"] == []
+    assert body["candles"] == []
 
 
 def test_diff_computes_strike_deltas(monkeypatch):
