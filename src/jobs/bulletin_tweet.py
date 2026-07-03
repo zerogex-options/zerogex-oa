@@ -17,16 +17,16 @@ Every post includes:
     live from the same ``get_latest_gex_summary`` powering the Live
     Bulletin admin page — so the tweet and the on-site card can never
     contradict each other.
-  * A PNG attachment: the Live Bulletin GammaReportCard for the lead
-    symbol (SPX by default; overridable via ``--lead-symbol`` /
-    ``BULLETIN_TWEET_LEAD_SYMBOL``). Rendered server-side by the
-    Next.js frontend at ``/api/bulletin/card?symbol=…`` — no headless
-    browser needed on the OA host.
+  * A PNG attachment: a screenshot of the exact ``GammaReportCard``
+    component the paid /live-bulletin page renders, captured by the
+    frontend Playwright helper ``scripts/render-bulletin-png.mjs``
+    against the public snapshot route ``/live-bulletin/snapshot/<sym>``.
+    Optional — if Playwright isn't installed on the host the tweet
+    still goes out text-only.
   * A short video/GIF clip attachment: the day's Replay scrubber
     animated across the session frames, rendered by the frontend
-    ``scripts/render-replay-clip.mjs`` Playwright helper. Optional —
-    if the helper isn't reachable or the render fails, the post goes
-    out with the PNG only (never blocks the text).
+    ``scripts/render-replay-clip.mjs`` Playwright helper. Also optional
+    on the same graceful-degradation path.
 
 Design rules — inherited wholesale from
 :mod:`src.jobs.forecast_tweet` and :mod:`src.jobs.scorecard_tweet`:
@@ -490,48 +490,130 @@ class MediaArtifacts:
     clip_path: Path | None = None
 
 
+def _locate_frontend_helper(
+    filename: str,
+    explicit: str | None,
+    env_var: str,
+) -> Path | None:
+    """Resolve one of the Playwright helper scripts on disk.
+
+    Both render helpers live in the sibling ``zerogex-web`` repo at
+    ``frontend/scripts/<filename>.mjs``. This walks the same candidate
+    ladder for each: explicit override → ``$env_var`` → ``$ZEROGEX_WEB_DIR``
+    → the dev checkout layout ``../zerogex-web/frontend/scripts/…``.
+    Returns None (the caller degrades) when no candidate exists — the
+    tweet job never depends on Playwright being installed."""
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit))
+    env_helper = os.environ.get(env_var, "").strip()
+    if env_helper:
+        candidates.append(Path(env_helper))
+    web_dir = os.environ.get("ZEROGEX_WEB_DIR", "").strip()
+    if web_dir:
+        candidates.append(Path(web_dir) / "scripts" / filename)
+    candidates.append(
+        Path(__file__).resolve().parents[2].parent
+        / "zerogex-web"
+        / "frontend"
+        / "scripts"
+        / filename
+    )
+    return next((p for p in candidates if p.exists()), None)
+
+
+def _run_frontend_helper(
+    helper: Path,
+    cmd_args: list[str],
+    out_path: Path,
+    timeout_seconds: int,
+    label: str,
+) -> Path | None:
+    """Run a node <helper> subprocess and return ``out_path`` on success.
+
+    Shared by both media helpers so their failure-logging and non-zero-
+    exit handling stays consistent. Any non-zero exit or empty output
+    file returns None and logs a warning — the caller degrades to a
+    text-only (or PNG-only) tweet."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["node", str(helper), *cmd_args]
+    try:
+        proc = subprocess.run(  # noqa: S603 — args are constructed in-process
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        logger.warning("bulletin_tweet: %s helper failed (%s) — %s", label, cmd, exc)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "bulletin_tweet: %s helper unexpected error (%s) — %s", label, cmd, exc,
+        )
+        return None
+
+    if proc.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
+        logger.warning(
+            "bulletin_tweet: %s helper exited %d, stderr: %s",
+            label, proc.returncode, proc.stderr[:500],
+        )
+        return None
+    return out_path
+
+
 def render_bulletin_png(
     symbol: str,
     day: date,
     mode: str,
     site_url: str,
     out_path: Path,
-    timeout_seconds: int = 30,
+    helper_path: str | None = None,
+    timeout_seconds: int = 90,
 ) -> Path | None:
-    """Fetch the server-rendered bulletin PNG from the Next.js frontend.
+    """Screenshot the Live Bulletin card via the frontend's Playwright helper.
 
-    The frontend exposes ``/api/bulletin/card?symbol=X&mode=Y&date=Z``
-    which returns image/png bytes. We POST-nothing; a plain GET is
-    enough. Failures return None so the job can still tweet text-only
-    if the frontend is briefly down.
+    The helper (``frontend/scripts/render-bulletin-png.mjs``) visits
+    ``/live-bulletin/snapshot/{symbol}``, waits for the card's ready
+    signal, and captures the ``[data-bulletin-card]`` element as PNG.
+    This screenshots the SAME ``<GammaReportCard>`` component the paid
+    /live-bulletin page renders — no parallel implementation, no drift.
 
-    ``mode`` is threaded through so the card can render mode-specific
-    copy (e.g. "pre-market read" vs "post-market read"). ``day`` lets
-    us pin a specific date for backfill; the frontend accepts either
-    today (implicit) or an explicit YYYY-MM-DD."""
-    url = (
-        f"{site_url.rstrip('/')}/api/bulletin/card"
-        f"?symbol={symbol.upper()}&mode={mode}&date={day.isoformat()}"
+    Requires Playwright installed on the host running this cron. When
+    it isn't, the helper exits with code 2 and we log + return None so
+    the tweet still goes out text-only. The v1 dry-run + text-only
+    posting paths were validated against the ripped-out ``next/og``
+    fallback; the render is graceful-degradation-tested.
+
+    The snapshot page is token-gated by ``BULLETIN_SNAPSHOT_TOKEN`` on
+    the frontend side; we pass the same value from env here so a
+    stranger can't hit the public route and scrape gamma data."""
+    helper = _locate_frontend_helper(
+        "render-bulletin-png.mjs",
+        helper_path,
+        "BULLETIN_TWEET_PNG_HELPER",
     )
-    try:
-        req = Request(
-            url,
-            headers={"User-Agent": "zerogex-bulletin-tweet/1.0", "Accept": "image/png"},
+    if helper is None:
+        logger.info(
+            "bulletin_tweet: bulletin-png helper not found — skipping PNG attachment",
         )
-        with urlopen(req, timeout=timeout_seconds) as resp:
-            body = resp.read()
-        if not body:
-            logger.warning("bulletin_tweet: bulletin PNG endpoint returned empty body (%s)", url)
-            return None
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_bytes(body)
-        return out_path
-    except (HTTPError, URLError) as exc:
-        logger.warning("bulletin_tweet: bulletin PNG render failed (%s) — %s", url, exc)
         return None
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("bulletin_tweet: bulletin PNG unexpected error (%s) — %s", url, exc)
-        return None
+
+    token = os.environ.get("BULLETIN_SNAPSHOT_TOKEN", "").strip()
+    cmd_args = [
+        "--symbol", symbol.upper(),
+        "--mode", mode,
+        "--date", day.isoformat(),
+        "--site-url", site_url,
+        "--out", str(out_path),
+    ]
+    if token:
+        cmd_args.extend(["--token", token])
+
+    return _run_frontend_helper(
+        helper, cmd_args, out_path, timeout_seconds, label="bulletin-png",
+    )
 
 
 def render_replay_clip(
@@ -551,77 +633,27 @@ def render_replay_clip(
     when the helper is missing or Playwright/Chromium isn't
     installed on the host, the subprocess exits non-zero and we log
     a warning and return None so the tweet still goes out with the
-    PNG only.
-
-    ``helper_path`` overrides the default lookup. We check, in order:
-      1. explicit ``helper_path`` argument
-      2. ``$BULLETIN_TWEET_REPLAY_HELPER`` env
-      3. ``$ZEROGEX_WEB_DIR/scripts/render-replay-clip.mjs``
-      4. ``../zerogex-web/frontend/scripts/render-replay-clip.mjs``
-         (dev checkout layout)
-    """
-    candidates: list[Path] = []
-    if helper_path:
-        candidates.append(Path(helper_path))
-    env_helper = os.environ.get("BULLETIN_TWEET_REPLAY_HELPER", "").strip()
-    if env_helper:
-        candidates.append(Path(env_helper))
-    web_dir = os.environ.get("ZEROGEX_WEB_DIR", "").strip()
-    if web_dir:
-        candidates.append(Path(web_dir) / "scripts" / "render-replay-clip.mjs")
-    candidates.append(
-        Path(__file__).resolve().parents[2].parent
-        / "zerogex-web"
-        / "frontend"
-        / "scripts"
-        / "render-replay-clip.mjs"
+    PNG only."""
+    helper = _locate_frontend_helper(
+        "render-replay-clip.mjs",
+        helper_path,
+        "BULLETIN_TWEET_REPLAY_HELPER",
     )
-
-    helper = next((p for p in candidates if p.exists()), None)
     if helper is None:
         logger.info(
-            "bulletin_tweet: replay-clip helper not found in %s — skipping video attachment",
-            [str(p) for p in candidates],
+            "bulletin_tweet: replay-clip helper not found — skipping video attachment",
         )
         return None
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "node",
-        str(helper),
-        "--symbol",
-        symbol.upper(),
-        "--date",
-        day.isoformat(),
-        "--site-url",
-        site_url,
-        "--out",
-        str(out_path),
+    cmd_args = [
+        "--symbol", symbol.upper(),
+        "--date", day.isoformat(),
+        "--site-url", site_url,
+        "--out", str(out_path),
     ]
-    try:
-        proc = subprocess.run(  # noqa: S603 — args are constructed in-process
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
-        logger.warning("bulletin_tweet: replay-clip helper failed (%s) — %s", cmd, exc)
-        return None
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "bulletin_tweet: replay-clip helper unexpected error (%s) — %s", cmd, exc,
-        )
-        return None
-
-    if proc.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
-        logger.warning(
-            "bulletin_tweet: replay-clip helper exited %d, stderr: %s",
-            proc.returncode, proc.stderr[:500],
-        )
-        return None
-    return out_path
+    return _run_frontend_helper(
+        helper, cmd_args, out_path, timeout_seconds, label="replay-clip",
+    )
 
 
 # ---------------------------------------------------------------------------
