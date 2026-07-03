@@ -46,6 +46,7 @@ from .models import (
     StrikeProfileBucket,
 )
 from .routers.trade_signals import router as trade_signals_router
+from .routers.tradeworkz import router as tradeworkz_router
 from .routers.volatility_gauge import router as volatility_gauge_router
 from .routers.option_contract import router as option_contract_router
 from .routers.option_calculator import router as option_calculator_router
@@ -139,6 +140,24 @@ async def lifespan(app: FastAPI):
     # zerogex-oa-max-pain-refresh.timer (daily, pre-market) — not by an
     # in-process loop and not inline on the request path.  The endpoint is
     # a pure cache read; nothing to start/stop here.
+
+    # Seed TradeWorkz bot roster + capital sleeves on first boot. Idempotent:
+    # ON CONFLICT DO NOTHING at the row level, so a subsequent restart with
+    # existing rows is a no-op. Wrapped in try/except so a missing schema
+    # (fresh instance where `make schema-apply` has not yet been run) does
+    # not block API startup — the operator will run schema-apply and then a
+    # subsequent boot will complete the seed.
+    try:
+        from src.database import db_connection as _db_connection
+        from src.tradeworkz.engine import provision_defaults as _tw_provision
+
+        with _db_connection() as _conn:
+            _inserted = _tw_provision(_conn)
+        if _inserted:
+            logger.info("TradeWorkz: provisioned %d default bots", _inserted)
+    except Exception:  # noqa: BLE001 — defensive during startup
+        logger.warning("TradeWorkz bot provisioning skipped", exc_info=True)
+
     yield
 
     # Shutdown
@@ -308,6 +327,13 @@ app.include_router(option_contract_router, dependencies=[_scope_market_raw])
 app.include_router(option_calculator_router, dependencies=[_scope_market_raw])
 # Backtesting platform — premium (basic/pro) tier, same scope as /api/signals.
 app.include_router(backtest_router, dependencies=[_scope_signals])
+
+# TradeWorkz™ multi-bot signaled-trading engine — admin-tier surface. The
+# frontend /trading-signals page is admin-gated in frontend/core/auth.ts so
+# customers never reach the API even though the router is mounted here.
+# Router-level guard is the SIGNALS scope; the /admin/* sub-endpoints add
+# an additional require_scopes check inline.
+app.include_router(tradeworkz_router, dependencies=[_scope_signals])
 
 # ============================================================================
 # Health Check

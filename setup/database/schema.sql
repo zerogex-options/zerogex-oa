@@ -2191,3 +2191,200 @@ ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS sweep_id BIGINT
     REFERENCES backtest_sweeps(id) ON DELETE CASCADE;
 ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS sweep_cell JSONB;
 CREATE INDEX IF NOT EXISTS idx_backtest_runs_sweep ON backtest_runs(sweep_id, id);
+
+-- ============================================================================
+-- TradeWorkz™ multi-bot signaled-trading engine
+-- ============================================================================
+--
+-- Wipes the legacy single-portfolio Signaled Trade surface and replaces it
+-- with a per-bot competition. Each bot owns its own capital sleeve, position
+-- book, immutable trade blotter, equity curve, daily rollup metrics, and
+-- online ML calibration state. Followers are tracked per (end_user, bot) so
+-- entry/exit notifications can fan out only to opted-in users.
+--
+-- Everything under this header is idempotent: legacy DROPs are gated on
+-- IF EXISTS, new CREATEs use IF NOT EXISTS, ALTERs use ADD COLUMN IF NOT
+-- EXISTS. Re-running the file on a fresh DB or on a partially-migrated DB
+-- both converge to the same target state.
+
+-- 9.1 Wipe legacy Signaled-Trade blotter tables — narrow, surgical scope:
+--     only the tables that back the OLD /trading-signals page and the
+--     single-portfolio reconciler. The MSI composite (signal_scores,
+--     signal_component_scores), independent-signal events (signal_events),
+--     and normalizer cache stay in place — they feed the /signal-score and
+--     /advanced-signals pages which remain live.
+DROP TABLE IF EXISTS signal_action_cards CASCADE;
+DROP TABLE IF EXISTS portfolio_snapshots CASCADE;
+DROP TABLE IF EXISTS signal_trades CASCADE;
+DROP FUNCTION IF EXISTS prevent_closed_signal_trade_updates() CASCADE;
+
+-- 9.2 Bot registry — every TradeWorkz bot the engine can run.
+CREATE TABLE IF NOT EXISTS tw_bots (
+    id              VARCHAR(64)  PRIMARY KEY,
+    display_name    VARCHAR(96)  NOT NULL,
+    strategy_class  VARCHAR(96)  NOT NULL,
+    tier            VARCHAR(12)  NOT NULL DEFAULT '0DTE'
+                     CHECK (tier IN ('0DTE','1DTE','swing')),
+    direction_mode  VARCHAR(20)  NOT NULL DEFAULT 'context',
+    universe        VARCHAR(64)  NOT NULL DEFAULT 'SPY',
+    tagline         VARCHAR(240),
+    description     TEXT,
+    is_public       BOOLEAN      NOT NULL DEFAULT TRUE,
+    enabled         BOOLEAN      NOT NULL DEFAULT TRUE,
+    params          JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_tw_bots_enabled ON tw_bots(enabled, tier);
+CREATE INDEX IF NOT EXISTS idx_tw_bots_public ON tw_bots(is_public, enabled);
+
+-- 9.3 Per-bot capital sleeve (admin-owned, one row per bot). The engine
+--     slices TRADEWORKZ_FLEET_CAPITAL evenly across enabled bots at
+--     provisioning time; admins can then override individual sleeves.
+CREATE TABLE IF NOT EXISTS tw_bot_capital (
+    bot_id            VARCHAR(64)  PRIMARY KEY REFERENCES tw_bots(id) ON DELETE CASCADE,
+    starting_capital  NUMERIC(14,2) NOT NULL,
+    current_capital   NUMERIC(14,2) NOT NULL,
+    peak_capital      NUMERIC(14,2) NOT NULL,
+    max_heat_pct      DOUBLE PRECISION NOT NULL DEFAULT 0.06,
+    kelly_fraction    DOUBLE PRECISION NOT NULL DEFAULT 0.50,
+    daily_kill_pct    DOUBLE PRECISION NOT NULL DEFAULT 0.02,
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 9.4 Open positions (fast lookup for per-tick reconcile). One row per
+--     bot per open position; on close the row is deleted and a matching
+--     immutable tw_trades row is written in the same transaction.
+CREATE TABLE IF NOT EXISTS tw_positions (
+    id                 BIGSERIAL PRIMARY KEY,
+    bot_id             VARCHAR(64) NOT NULL REFERENCES tw_bots(id) ON DELETE CASCADE,
+    underlying         VARCHAR(10) NOT NULL,
+    opened_at          TIMESTAMPTZ NOT NULL,
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    direction          VARCHAR(10) NOT NULL CHECK (direction IN ('bullish','bearish','neutral')),
+    strategy_type      VARCHAR(40) NOT NULL,
+    legs               JSONB       NOT NULL,
+    entry_price        NUMERIC(12,6) NOT NULL,
+    current_price      NUMERIC(12,6) NOT NULL,
+    quantity_open      INTEGER     NOT NULL,
+    unrealized_pnl     NUMERIC(14,4) NOT NULL DEFAULT 0,
+    stop_price         NUMERIC(12,6),
+    target_price       NUMERIC(12,6),
+    time_stop_at       TIMESTAMPTZ,
+    min_hold_until     TIMESTAMPTZ,
+    wall_ref_price     NUMERIC(12,6),
+    wall_ref_side      VARCHAR(10),
+    entry_conviction   DOUBLE PRECISION,
+    components_at_entry JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_tw_positions_bot_open ON tw_positions(bot_id, opened_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tw_positions_underlying ON tw_positions(underlying, opened_at DESC);
+
+-- 9.5 Immutable trade blotter — every closed round-trip. Never updated after
+--     insert. Serves both the leaderboard aggregates and the per-bot ML
+--     calibrator's rolling win-rate windows.
+CREATE TABLE IF NOT EXISTS tw_trades (
+    id                 BIGSERIAL PRIMARY KEY,
+    bot_id             VARCHAR(64) NOT NULL REFERENCES tw_bots(id) ON DELETE CASCADE,
+    underlying         VARCHAR(10) NOT NULL,
+    opened_at          TIMESTAMPTZ NOT NULL,
+    closed_at          TIMESTAMPTZ NOT NULL,
+    direction          VARCHAR(10) NOT NULL,
+    strategy_type      VARCHAR(40) NOT NULL,
+    legs               JSONB       NOT NULL,
+    entry_price        NUMERIC(12,6) NOT NULL,
+    exit_price         NUMERIC(12,6) NOT NULL,
+    quantity           INTEGER     NOT NULL,
+    realized_pnl       NUMERIC(14,4) NOT NULL,
+    pnl_percent        NUMERIC(12,4) NOT NULL,
+    outcome            VARCHAR(12) NOT NULL CHECK (outcome IN ('win','loss','scratch')),
+    close_reason       VARCHAR(32) NOT NULL,
+    entry_conviction   DOUBLE PRECISION,
+    components_at_entry JSONB NOT NULL DEFAULT '{}'::jsonb,
+    components_at_exit  JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_tw_trades_bot_closed ON tw_trades(bot_id, closed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tw_trades_underlying_closed ON tw_trades(underlying, closed_at DESC);
+
+-- 9.6 Per-bot equity curve — one row per bot per session. Cheap to render
+--     as a sparkline (30-day window = 30 rows/bot) and cheap to write EOD.
+CREATE TABLE IF NOT EXISTS tw_equity_curve_daily (
+    bot_id         VARCHAR(64)  NOT NULL REFERENCES tw_bots(id) ON DELETE CASCADE,
+    session_date   DATE         NOT NULL,
+    starting_nav   NUMERIC(14,2) NOT NULL,
+    ending_nav     NUMERIC(14,2) NOT NULL,
+    realized_pnl   NUMERIC(14,4) NOT NULL,
+    unrealized_pnl NUMERIC(14,4) NOT NULL,
+    heat_pct       DOUBLE PRECISION NOT NULL DEFAULT 0,
+    n_trades       INTEGER      NOT NULL DEFAULT 0,
+    PRIMARY KEY (bot_id, session_date)
+);
+CREATE INDEX IF NOT EXISTS idx_tw_equity_curve_bot ON tw_equity_curve_daily(bot_id, session_date DESC);
+
+-- 9.7 Daily rollup metrics used by the leaderboard's sortable columns.
+CREATE TABLE IF NOT EXISTS tw_bot_metrics_daily (
+    bot_id           VARCHAR(64) NOT NULL REFERENCES tw_bots(id) ON DELETE CASCADE,
+    session_date     DATE        NOT NULL,
+    trades_count     INTEGER     NOT NULL DEFAULT 0,
+    wins             INTEGER     NOT NULL DEFAULT 0,
+    losses           INTEGER     NOT NULL DEFAULT 0,
+    win_rate         DOUBLE PRECISION,
+    avg_win_pnl      DOUBLE PRECISION,
+    avg_loss_pnl     DOUBLE PRECISION,
+    profit_factor    DOUBLE PRECISION,
+    sharpe_20d       DOUBLE PRECISION,
+    max_drawdown_pct DOUBLE PRECISION,
+    PRIMARY KEY (bot_id, session_date)
+);
+
+-- 9.8 ML calibration state. Each bot maintains an online logistic-regression
+--     model over its own feature vector (conviction, wall proximity, GEX
+--     regime, VIX regime, time-of-day). The weights column is a JSONB of
+--     {feature_name: weight_value} — updated after each trade close by the
+--     nightly (or configurable-cadence) calibration worker.
+CREATE TABLE IF NOT EXISTS tw_ml_state (
+    bot_id             VARCHAR(64)  PRIMARY KEY REFERENCES tw_bots(id) ON DELETE CASCADE,
+    n_samples          INTEGER      NOT NULL DEFAULT 0,
+    n_wins             INTEGER      NOT NULL DEFAULT 0,
+    hit_rate           DOUBLE PRECISION,
+    confidence_base    DOUBLE PRECISION NOT NULL DEFAULT 0.50,
+    confidence_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.55,
+    size_multiplier    DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    weights            JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    feature_mean       JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    feature_var        JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    last_win_rate_7d   DOUBLE PRECISION,
+    last_win_rate_30d  DOUBLE PRECISION,
+    last_profit_factor DOUBLE PRECISION,
+    computed_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+-- 9.9 Followers — one row per (end_user, bot) opt-in. Mirrors the
+--     backtest_configs end_user attribution pattern.
+CREATE TABLE IF NOT EXISTS tw_bot_followers (
+    end_user       VARCHAR(128) NOT NULL,
+    bot_id         VARCHAR(64)  NOT NULL REFERENCES tw_bots(id) ON DELETE CASCADE,
+    followed_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    channels       JSONB        NOT NULL DEFAULT '{"in_app":true}'::jsonb,
+    min_confidence DOUBLE PRECISION DEFAULT 0.0,
+    PRIMARY KEY (end_user, bot_id)
+);
+CREATE INDEX IF NOT EXISTS idx_tw_bot_followers_bot ON tw_bot_followers(bot_id, followed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tw_bot_followers_user ON tw_bot_followers(end_user, followed_at DESC);
+
+-- 9.10 Notifications log — delivery audit trail for entry/exit/adjust events.
+CREATE TABLE IF NOT EXISTS tw_notifications_log (
+    id           BIGSERIAL PRIMARY KEY,
+    end_user     VARCHAR(128) NOT NULL,
+    bot_id       VARCHAR(64)  NOT NULL REFERENCES tw_bots(id) ON DELETE CASCADE,
+    event_type   VARCHAR(24)  NOT NULL,
+    trade_id     BIGINT       REFERENCES tw_trades(id) ON DELETE SET NULL,
+    position_id  BIGINT,
+    channel      VARCHAR(16)  NOT NULL,
+    status       VARCHAR(16)  NOT NULL,
+    payload      JSONB        NOT NULL,
+    error        TEXT,
+    sent_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_tw_notifications_user_sent ON tw_notifications_log(end_user, sent_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tw_notifications_bot_sent ON tw_notifications_log(bot_id, sent_at DESC);
