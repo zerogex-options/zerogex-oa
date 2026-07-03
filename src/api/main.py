@@ -149,8 +149,34 @@ async def lifespan(app: FastAPI):
     # WS_ENABLED (or set it to "0") to keep the socket wiring dormant
     # during the rollout window.
     if _getenv_str("WS_ENABLED", "1").strip().lower() not in {"0", "false", "no"}:
+        # Same host/port/database/user/password the pool was built with
+        # so the LISTEN connection tracks the pool's credentials (a
+        # DatabaseManager reconnect that changed them is picked up on
+        # the next reconnect of the LISTEN loop). We build the kwargs
+        # here rather than inspecting asyncpg's private ``_params``
+        # because that internal field's schema varies by version (0.31+
+        # lost the ``dsn`` attribute the earlier draft relied on,
+        # causing LISTEN to never come up).
+        def _listen_kwargs():
+            if db_manager is None:
+                return None
+            ssl_mode = os.getenv("DB_SSLMODE", "").strip().lower()
+            ssl = True if ssl_mode in {"require", "verify-ca", "verify-full"} else None
+            return {
+                "host": db_manager.host,
+                "port": db_manager.port,
+                "database": db_manager.database,
+                "user": db_manager.user,
+                "password": db_manager.password,
+                "ssl": ssl,
+                # Short connect timeout — a slow initial connect just
+                # means the outer reconnect loop retries; don't tie up
+                # the LISTEN task for minutes.
+                "timeout": 10.0,
+            }
+
         quote_broadcaster = QuoteBroadcaster(
-            pool_getter=lambda: db_manager.pool,
+            connect_kwargs_getter=_listen_kwargs,
             session_computer=lambda asset_type, stable, close_avail: get_market_session(
                 asset_type, stable, close_avail
             ),

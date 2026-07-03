@@ -600,17 +600,24 @@ class IngestionEngine:
     # etc.) rather than raise mid-commit.
     _WS_NOTIFY_PAYLOAD_LIMIT = 7500
 
+    # Sentinel for the asset_type memo. ``None`` is a valid cached
+    # value (symbol has no row in ``symbols``) — using a distinct
+    # sentinel lets us memoize the *miss* too instead of re-issuing
+    # the SELECT on every subsequent tick.
+    _ASSET_TYPE_UNSET = object()
+
     def _publish_quote_notify(self, cursor, quote: Dict[str, Any]) -> None:
         """Emit a NOTIFY carrying the current tick to WebSocket subscribers.
 
-        Best-effort: any failure logs and returns, so a broken WS path
-        never breaks ingestion. Runs on the same cursor as the upsert so
-        the notify commits atomically with the row.
+        Best-effort: any failure MUST NOT abort the surrounding upsert
+        transaction. psycopg2 aborts a transaction on the first failed
+        statement — a subsequent ``conn.commit()`` is silently
+        translated to ROLLBACK, so a NOTIFY that raises inside the
+        outer INSERT's transaction would drop the just-INSERTed row.
+        We isolate the notify inside a SAVEPOINT so a NOTIFY error
+        rolls back only the savepoint; the upsert still commits.
         """
         try:
-            asset_type = getattr(self, "_asset_type_cache", None)
-            if asset_type is None:
-                asset_type = self._lookup_asset_type(cursor, quote["symbol"])
             payload = {
                 "symbol": quote["symbol"],
                 "timestamp": (
@@ -626,37 +633,78 @@ class IngestionEngine:
                 "down_volume": (
                     int(quote["down_volume"]) if quote.get("down_volume") is not None else None
                 ),
-                "asset_type": asset_type,
+                "asset_type": self._lookup_asset_type(cursor, quote["symbol"]),
             }
             body = json.dumps(payload, separators=(",", ":"), default=str)
-            if len(body.encode("utf-8")) > self._WS_NOTIFY_PAYLOAD_LIMIT:
-                logger.warning(
-                    "WS notify payload too large (%d bytes); dropping tick",
-                    len(body),
+        except Exception as exc:
+            logger.debug("WS notify payload build failed (ignored): %s", exc)
+            return
+        if len(body.encode("utf-8")) > self._WS_NOTIFY_PAYLOAD_LIMIT:
+            logger.warning(
+                "WS notify payload too large (%d bytes); dropping tick",
+                len(body),
+            )
+            return
+        # SAVEPOINT-scoped so a NOTIFY failure (a permission revoke, a
+        # backend-side disconnect between INSERT and NOTIFY, etc.)
+        # rolls back only the savepoint and leaves the outer INSERT
+        # intact. Named uniquely per call so nested SAVEPOINTs (if
+        # ever added upstream) don't clash.
+        try:
+            cursor.execute("SAVEPOINT zgx_ws_notify")
+            try:
+                cursor.execute(
+                    "SELECT pg_notify(%s, %s)", (self._WS_NOTIFY_CHANNEL, body)
                 )
+            except Exception as exc:
+                cursor.execute("ROLLBACK TO SAVEPOINT zgx_ws_notify")
+                logger.debug("WS notify emit failed (savepoint rolled back): %s", exc)
                 return
-            # ``pg_notify`` is used (rather than ``NOTIFY zgx_quote_updates,
-            # '...'``) because it takes the payload as a parameter — no
-            # SQL-literal escaping to worry about.
-            cursor.execute("SELECT pg_notify(%s, %s)", (self._WS_NOTIFY_CHANNEL, body))
-        except Exception as exc:  # pragma: no cover — defensive
-            logger.debug("WS notify emit failed (ignored): %s", exc)
+            cursor.execute("RELEASE SAVEPOINT zgx_ws_notify")
+        except Exception as exc:
+            # SAVEPOINT/RELEASE itself failed — most likely the outer
+            # transaction is already aborted from something else. The
+            # outer commit will fail on its own; nothing to do here.
+            logger.debug("WS notify savepoint plumbing failed (ignored): %s", exc)
 
     def _lookup_asset_type(self, cursor, symbol: str) -> Optional[str]:
-        """One-shot lookup for the symbol's asset_type; cache for reuse.
+        """Memoized one-shot lookup for the symbol's asset_type.
 
-        Ingestion runs one process per underlying so the cache is a
-        single-slot memo — no eviction needed.
+        Ingestion runs one process per underlying so the memo is a
+        single-slot cache; no eviction needed. Uses a sentinel to
+        distinguish "not yet queried" from a legitimate ``None`` result
+        (symbol missing from ``symbols`` table), so a bootstrap tick
+        arriving before the symbol row exists doesn't re-issue the
+        SELECT on every subsequent tick forever.
+
+        Wrapped in a SAVEPOINT so a query failure (schema migration in
+        flight, row-level lock contention) doesn't abort the outer
+        INSERT transaction — same class of bug as the notify path.
         """
+        cached = getattr(self, "_asset_type_cache", self._ASSET_TYPE_UNSET)
+        if cached is not self._ASSET_TYPE_UNSET:
+            return cached  # type: ignore[no-any-return]
+        row = None
         try:
-            cursor.execute("SELECT asset_type FROM symbols WHERE symbol = %s", (symbol,))
-            row = cursor.fetchone()
-        except Exception:
-            row = None
+            cursor.execute("SAVEPOINT zgx_asset_type_lookup")
+            try:
+                cursor.execute("SELECT asset_type FROM symbols WHERE symbol = %s", (symbol,))
+                row = cursor.fetchone()
+            except Exception as exc:
+                cursor.execute("ROLLBACK TO SAVEPOINT zgx_asset_type_lookup")
+                logger.debug("asset_type lookup failed (savepoint rolled back): %s", exc)
+                # Don't memoize — try again next tick when the DB blip
+                # has cleared.
+                return None
+            cursor.execute("RELEASE SAVEPOINT zgx_asset_type_lookup")
+        except Exception as exc:
+            logger.debug("asset_type savepoint plumbing failed (ignored): %s", exc)
+            return None
         asset_type = row[0] if row else None
-        # Memoize on the instance so subsequent notifies skip the query.
-        # Bind to the calling instance from within a method — walking up
-        # would be fragile; assign directly.
+        # Memoize both hits and misses so the SELECT runs at most once
+        # per process. If a bootstrap-before-symbol-insert case ever
+        # matters, the ingestion service is symbol-scoped and won't
+        # subscribe to a symbol that doesn't exist upstream anyway.
         self._asset_type_cache = asset_type
         return asset_type
 

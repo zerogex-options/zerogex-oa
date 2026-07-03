@@ -68,28 +68,47 @@ MAX_PAYLOAD_BYTES = 7500
 # code 1008. Set via env so ops can raise it without a code change.
 _MAX_CONNECTIONS = int(os.getenv("WS_MAX_CONNECTIONS_PER_WORKER", "2000"))
 
+# Per-authenticated-user connection cap. Without this, one logged-in
+# caller scripting reconnects can fill the entire worker's slot pool
+# (the workflow-level DoS finding). Set intentionally low — a browser
+# with SPY, QQQ, and SPX tabs each open a socket, so 8 leaves plenty
+# of headroom for legitimate multi-tab use while blocking runaway
+# scripts.
+_MAX_CONNECTIONS_PER_USER = int(os.getenv("WS_MAX_CONNECTIONS_PER_USER", "8"))
+
+# Bounded keepalive — an asyncpg ``SELECT 1`` on a silently-dead peer
+# (VPC gateway drop, iptables blackhole, RDS failover mid-flight) can
+# block for the OS TCP keepalive timeout (~2h on Linux). Wrapping the
+# ping in a hard wait_for lets the LISTEN reconnect loop notice within
+# seconds instead of hours.
+_KEEPALIVE_TIMEOUT_SECONDS = float(os.getenv("WS_LISTEN_KEEPALIVE_TIMEOUT", "10"))
+
 
 class QuoteBroadcaster:
     """Owns the LISTEN connection and the per-symbol subscriber sets.
 
     Lifecycle mirrors ``usage_meter``:
 
-        broadcaster = QuoteBroadcaster(pool_getter=lambda: db.pool,
-                                       session_computer=get_market_session)
+        broadcaster = QuoteBroadcaster(
+            connect_kwargs_getter=lambda: db.asyncpg_kwargs(),
+            session_computer=get_market_session,
+        )
         await broadcaster.start()
         ...
         await broadcaster.stop()
 
-    ``pool_getter`` is a callable so a DB pool swap (reconnect) inside
-    ``DatabaseManager`` is transparent — same pattern the key store uses.
+    ``connect_kwargs_getter`` is a callable returning the asyncpg
+    ``connect(**kwargs)`` args for the current DB. Called each time we
+    (re)open the LISTEN connection so a DatabaseManager reconnect that
+    changed credentials is transparent — mirrors the key-store pattern.
     """
 
     def __init__(
         self,
-        pool_getter,
+        connect_kwargs_getter,
         session_computer,
     ) -> None:
-        self._get_pool = pool_getter
+        self._get_connect_kwargs = connect_kwargs_getter
         # ``session_computer(asset_type, price_is_stable, close_data_available)
         # -> str`` — imported from main.py so we don't duplicate the market
         # session state machine. See main.get_market_session.
@@ -123,7 +142,20 @@ class QuoteBroadcaster:
         self._listen_conn: Optional[asyncpg.Connection] = None
         self._task: Optional[asyncio.Task] = None
         self._stopping = asyncio.Event()
+        # Total sockets registered on this worker (bounded by
+        # ``_MAX_CONNECTIONS``). Owned by the reservation lock — read
+        # and mutated only under it — so ``try_reserve``'s check-and-
+        # bump is atomic and the TOCTOU between check and accept()
+        # can't drive it past the ceiling.
         self._connection_count = 0
+        self._per_user_count: Dict[str, int] = {}
+        self._ws_owner: Dict[int, str] = {}
+        self._reservation_lock = asyncio.Lock()
+        # Long-lived, strong-referenced set of in-flight fan-out tasks
+        # so ``asyncio.create_task`` in ``_on_notify`` isn't garbage-
+        # collected mid-flight. Python's event loop only weak-refs
+        # tasks; the docs explicitly recommend this pattern.
+        self._fanout_tasks: Set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -209,9 +241,24 @@ class QuoteBroadcaster:
                     try:
                         await asyncio.wait_for(self._stopping.wait(), timeout=30.0)
                     except asyncio.TimeoutError:
-                        # Keepalive ping — if this fails the outer loop
-                        # tears down and reconnects.
-                        await conn.execute("SELECT 1")
+                        # Keepalive ping — bounded so a silently-dead
+                        # peer (VPC gateway drop, RDS failover) can't
+                        # park us on a stuck socket read until the
+                        # 2h-plus OS TCP keepalive fires. On timeout
+                        # we raise, break out of the inner loop, and
+                        # let the outer reconnect path take over.
+                        try:
+                            await asyncio.wait_for(
+                                conn.execute("SELECT 1"),
+                                timeout=_KEEPALIVE_TIMEOUT_SECONDS,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "LISTEN keepalive timed out (>%.1fs); "
+                                "reconnecting",
+                                _KEEPALIVE_TIMEOUT_SECONDS,
+                            )
+                            raise
                 if self._stopping.is_set():
                     break
             except (asyncpg.PostgresError, OSError, asyncio.TimeoutError) as exc:
@@ -231,40 +278,26 @@ class QuoteBroadcaster:
             backoff = min(backoff * 2, 30.0)
 
     async def _open_listen_connection(self) -> Optional[asyncpg.Connection]:
-        """Open a bare asyncpg connection using the DatabaseManager's DSN.
+        """Open a bare asyncpg connection using the DatabaseManager's creds.
 
         We can't ``pool.acquire()`` because LISTEN is per-connection and
         a released connection would drop the subscription; and we don't
-        want to burn a pool slot indefinitely either. Cloning the DSN
-        keeps us aligned with whatever creds/timeouts the pool uses.
+        want to burn a pool slot indefinitely either. Using the same
+        host/port/database/user/password kwargs the pool was created
+        with keeps us aligned with whatever creds the app uses without
+        depending on asyncpg-internal DSN fields (which don't exist on
+        every version — earlier code that inspected `_params.dsn` was
+        a no-op on asyncpg 0.31+).
         """
-        pool = self._get_pool() if self._get_pool else None
-        if pool is None:
-            return None
-        # asyncpg exposes the connect args via each pool holder; the
-        # simplest cross-version-safe path is to acquire briefly, read
-        # the DSN off the underlying connection, then open a fresh one.
-        # If that fails we fall back to env-var DSN construction.
         try:
-            dsn: Optional[str] = None
-            async with pool.acquire() as probe:
-                # asyncpg stores connection settings on _params; not part
-                # of the public API but has been stable for years. Wrap
-                # the access so a version bump doesn't crash the loop —
-                # we degrade to env DSN.
-                params = getattr(probe, "_params", None)
-                if params is not None:
-                    dsn = getattr(params, "dsn", None)
-            if not dsn:
-                dsn = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_DSN")
-            if not dsn:
-                logger.error(
-                    "QuoteBroadcaster: could not resolve DSN for LISTEN "
-                    "connection (pool DSN inaccessible and DATABASE_URL/"
-                    "POSTGRES_DSN unset)"
-                )
-                return None
-            return await asyncpg.connect(dsn=dsn)
+            kwargs = self._get_connect_kwargs() if self._get_connect_kwargs else None
+        except Exception:
+            logger.exception("QuoteBroadcaster: connect_kwargs_getter raised")
+            return None
+        if not kwargs or not isinstance(kwargs, dict):
+            return None
+        try:
+            return await asyncpg.connect(**kwargs)
         except Exception:
             logger.exception("QuoteBroadcaster: failed to open LISTEN connection")
             return None
@@ -281,13 +314,18 @@ class QuoteBroadcaster:
         asyncpg calls listeners synchronously in the event loop; we
         immediately schedule the async fan-out so a slow/backlogged
         subscriber never blocks the connection or delays the next tick.
+        We hold a strong reference to the task in ``_fanout_tasks`` for
+        its lifetime — the asyncio event loop only weak-refs tasks and
+        low-frequency notifications could otherwise be GC'd mid-flight.
         """
         try:
             data = json.loads(payload)
         except (ValueError, TypeError):
             logger.warning("Malformed NOTIFY payload dropped (%d bytes)", len(payload))
             return
-        asyncio.create_task(self._fanout(data))
+        task = asyncio.create_task(self._fanout(data))
+        self._fanout_tasks.add(task)
+        task.add_done_callback(self._fanout_tasks.discard)
 
     async def _fanout(self, raw: Dict[str, Any]) -> None:
         """Enrich the raw ingestion payload and send to all subscribers."""
@@ -367,13 +405,19 @@ class QuoteBroadcaster:
             return False
 
     async def _drop_dead(self, symbol: str, dead) -> None:
+        """Remove sockets whose send just failed from this symbol's set.
+
+        The connection is not released here — the receive loop in the
+        WS handler catches the disconnect and calls ``unregister()``,
+        which is the single authoritative release path. Doing it in
+        both places would double-decrement the counter.
+        """
         async with self._lock:
             symbol_set = self._subscribers.get(symbol)
             if symbol_set is None:
                 return
             for ws in dead:
                 symbol_set.discard(ws)
-                self._connection_count = max(0, self._connection_count - 0)
             if not symbol_set:
                 self._subscribers.pop(symbol, None)
 
@@ -381,16 +425,39 @@ class QuoteBroadcaster:
     # Subscriber API — called from the WebSocket route handler
     # ------------------------------------------------------------------
 
-    def can_accept(self) -> bool:
-        """Return False when the per-worker connection ceiling is reached."""
-        return self._connection_count < _MAX_CONNECTIONS
+    async def try_reserve(self, ws: WebSocket, end_user_id: str) -> bool:
+        """Atomically check the caps and reserve a slot for ``ws``.
 
-    async def register(self, ws: WebSocket) -> None:
-        """Called after ``websocket.accept()`` to count the connection."""
-        self._connection_count += 1
+        Returns ``True`` when the caller may proceed with
+        ``websocket.accept()``. Returns ``False`` (and reserves
+        nothing) when either the per-worker or per-user cap is
+        exhausted. The check-and-bump runs under a single lock so two
+        concurrent handshakes at the ceiling can't both succeed — the
+        TOCTOU that the pre-fix ``can_accept()`` + ``register()`` pair
+        allowed.
+
+        Call ``unregister(ws)`` on the socket regardless of whether
+        the accept succeeds or the session later dies, and it
+        releases the slot exactly once.
+        """
+        async with self._reservation_lock:
+            if self._connection_count >= _MAX_CONNECTIONS:
+                return False
+            user_count = self._per_user_count.get(end_user_id, 0)
+            if user_count >= _MAX_CONNECTIONS_PER_USER:
+                return False
+            self._connection_count += 1
+            self._per_user_count[end_user_id] = user_count + 1
+            self._ws_owner[id(ws)] = end_user_id
+        return True
 
     async def unregister(self, ws: WebSocket) -> None:
-        """Remove ``ws`` from every symbol set on disconnect."""
+        """Drop ``ws`` from every symbol set and release its reservation.
+
+        Safe to call twice (the finally + explicit-close paths both
+        call it); the ``pop`` on ``_ws_owner`` is the idempotency
+        marker.
+        """
         async with self._lock:
             empty = []
             for symbol, sockets in self._subscribers.items():
@@ -400,7 +467,16 @@ class QuoteBroadcaster:
                         empty.append(symbol)
             for symbol in empty:
                 self._subscribers.pop(symbol, None)
-        self._connection_count = max(0, self._connection_count - 1)
+        async with self._reservation_lock:
+            owner = self._ws_owner.pop(id(ws), None)
+            if owner is None:
+                return  # already released or never reserved
+            self._connection_count = max(0, self._connection_count - 1)
+            user_count = self._per_user_count.get(owner, 0) - 1
+            if user_count <= 0:
+                self._per_user_count.pop(owner, None)
+            else:
+                self._per_user_count[owner] = user_count
 
     async def subscribe(self, ws: WebSocket, symbol: str) -> Optional[Dict[str, Any]]:
         """Add ``ws`` to the ``symbol`` subscriber set; return snapshot if any."""

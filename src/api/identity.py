@@ -131,6 +131,22 @@ def verify_end_user_token(token: Optional[str]) -> Optional[str]:
         if not isinstance(payload, dict):
             return None
 
+        # Audience separation — reject any token whose `aud` claim
+        # names a different purpose (currently only "ws" is minted;
+        # this guard makes the header-token path forward-compatible
+        # with any future audience). Without this a WS ticket
+        # (`aud=ws`) is a valid header token because verify_end_user_
+        # token would otherwise ignore the `aud` field entirely — and
+        # both are signed with the same secret. Tokens minted for
+        # this path have historically been aud-less; the intent of
+        # this check is "if the minter DID set aud, it must not name
+        # something else."
+        aud = payload.get("aud")
+        if aud is not None and aud != "":
+            # Legacy tokens without aud continue to pass; anything
+            # with a non-empty aud must not be this path.
+            return None
+
         now = int(time.time())
 
         exp = payload.get("exp")
@@ -189,6 +205,12 @@ def resolve_end_user(request: Request) -> Tuple[Optional[str], Optional[str]]:
 
 _WS_AUDIENCE = "ws"
 _WS_TICKET_MAX_AGE: int = _getenv_int("WS_TICKET_MAX_AGE_SECONDS", 90)
+# WS-specific clock-skew leeway. The shared ``_LEEWAY`` (default 60s)
+# stacks on top of the 60s TTL the frontend mints — verified TTL was
+# effectively 120s, not the documented 60s. Ten seconds is enough to
+# tolerate ordinary NTP skew between the BFF host and the API host
+# without doubling the ticket's replay window.
+_WS_TICKET_LEEWAY: int = _getenv_int("WS_TICKET_LEEWAY_SECONDS", 10)
 
 
 def verify_ws_ticket(ticket: Optional[str]) -> Optional[str]:
@@ -219,28 +241,36 @@ def verify_ws_ticket(ticket: Optional[str]) -> Optional[str]:
             return None
 
         # Audience is the sole marker separating WS tickets from header
-        # end-user tokens — a token minted for the HTTP path (no aud) or
-        # for any other purpose must not open a WS. Do not treat missing
-        # ``aud`` as a match.
+        # end-user tokens — a token minted for the HTTP path (no aud)
+        # or for any other purpose must not open a WS. Do not treat
+        # missing ``aud`` as a match. A JWT ``aud`` claim may be a
+        # string or an array of strings per RFC 7519 §4.1.3.
         aud = payload.get("aud")
-        if aud != _WS_AUDIENCE:
+        if aud == _WS_AUDIENCE:
+            pass
+        elif isinstance(aud, list) and _WS_AUDIENCE in aud:
+            pass
+        else:
             return None
 
         now = int(time.time())
 
+        # WS tickets use a TIGHT leeway so the effective replay window
+        # is bounded by the mint TTL (60s), not doubled by the shared
+        # 60s HTTP-token leeway.
         exp = payload.get("exp")
         if not isinstance(exp, (int, float)) or isinstance(exp, bool):
             return None
-        if now > int(exp) + _LEEWAY:
+        if now > int(exp) + _WS_TICKET_LEEWAY:
             return None
 
         iat = payload.get("iat")
         if iat is not None:
             if not isinstance(iat, (int, float)) or isinstance(iat, bool):
                 return None
-            if int(iat) > now + _LEEWAY:
+            if int(iat) > now + _WS_TICKET_LEEWAY:
                 return None
-            if now - int(iat) > _WS_TICKET_MAX_AGE + _LEEWAY:
+            if now - int(iat) > _WS_TICKET_MAX_AGE + _WS_TICKET_LEEWAY:
                 return None
 
         sub = payload.get("sub")

@@ -130,13 +130,29 @@ def register(
             await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
             return
 
-        if not broadcaster.can_accept():
-            logger.warning("WS handshake refused: worker connection cap reached")
+        # Atomic per-user reservation. The pre-fix pattern of
+        # ``can_accept()`` then ``accept()`` then ``register()`` had two
+        # bugs: (a) two concurrent handshakes at the ceiling could both
+        # pass the check, and (b) the counter was per-worker only, so
+        # one authenticated user scripting reconnects could fill every
+        # slot and lock out other users. ``try_reserve`` holds a lock
+        # across both checks and the bump.
+        if not await broadcaster.try_reserve(websocket, end_user_id):
+            logger.warning(
+                "WS handshake refused: connection cap reached (user=%r)",
+                end_user_id,
+            )
             await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
             return
 
-        await websocket.accept()
-        await broadcaster.register(websocket)
+        try:
+            await websocket.accept()
+        except Exception:
+            # accept() itself failed (client disconnected during
+            # handshake). Release the slot we reserved above so a
+            # flaky client can't leak reservations.
+            await broadcaster.unregister(websocket)
+            raise
 
         try:
             await websocket.send_text(
