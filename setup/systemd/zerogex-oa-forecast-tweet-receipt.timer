@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily trigger for ZeroGEX forecast receipt tweet (16:10 ET Mon-Fri)
+
+[Timer]
+# Fires 5 minutes after the receipt writer's 16:05 ET slot so verdict
+# columns are guaranteed to be written before we tweet them.  Slotted
+# between the receipt writer (16:05) and the scorecard tweet (16:15) so
+# the three afternoon jobs fan out cleanly across a 10-minute window.
+OnCalendar=Mon..Fri *-*-* 16:10:00
+RandomizedDelaySec=1m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

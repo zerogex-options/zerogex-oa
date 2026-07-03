@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily trigger for ZeroGEX mid-session bulletin tweet (12:30 ET Mon-Fri)
+
+[Timer]
+# Fires at 12:30 ET — halfway through the cash session.  Deliberately
+# NOT set to 12:00 sharp so the mid-session read incorporates the
+# lunch-hour repositioning that often reshapes the gamma map.
+OnCalendar=Mon..Fri *-*-* 12:30:00
+RandomizedDelaySec=45s
+# Catch up after planned downtime — a mid-session read still adds
+# value up until the close.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

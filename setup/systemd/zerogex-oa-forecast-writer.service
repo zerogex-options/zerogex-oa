@@ -1,0 +1,32 @@
+[Unit]
+Description=ZeroGEX morning Gamma Forecast writer (07:00 ET)
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Commits today's projected range / pin / regime / flagship setup to one
+# immutable daily_forecast row.  Pulls inputs from the in-process DB
+# layer (GEX summary, MSI score, max pain, Playbook Action Card) and runs
+# the v1 wall-bounded range model.  Re-running the same day is a no-op
+# by design — the row's PK + immutability trigger guarantee the public
+# commitment cannot be retroactively edited.
+ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.forecast_writer
+
+TimeoutStartSec=120
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-forecast-writer

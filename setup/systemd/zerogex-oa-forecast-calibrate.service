@@ -1,0 +1,32 @@
+[Unit]
+Description=ZeroGEX forecast Layer-2 recalibration (nightly, post-close)
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target postgresql.service zerogex-oa-forecast-receipt.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Reads the trailing 20 receipts per symbol from daily_forecast and
+# shifts the four Layer-2 correction scalars (band width / pin
+# tolerance / upside lean / downside lean).  Writes to
+# forecast_calibration_state, which the morning writer reads at 07:00
+# ET the next trading day.  Cold-start guard: needs >=15 receipts per
+# symbol before any correction actually applies.
+ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.forecast_calibrate
+
+TimeoutStartSec=120
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-forecast-calibrate

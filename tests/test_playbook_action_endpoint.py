@@ -40,8 +40,11 @@ def _build_app(monkeypatch: pytest.MonkeyPatch):
     dbmod.DatabaseManager.disconnect = AsyncMock(return_value=None)
     dbmod.DatabaseManager.check_health = AsyncMock(return_value=True)
     dbmod.DatabaseManager.get_latest_quote = AsyncMock(return_value=None)
-    # PR-3 persistence: stub by default; tests override per-case.
-    dbmod.DatabaseManager.insert_action_card = AsyncMock(return_value=None)
+    # PR-3 persistence: stub by default; tests override per-case.  The returned
+    # value is the persisted row id (None for STAND_DOWN and DB failures); the
+    # /action handler attaches it to the response payload as ``id`` so the
+    # live UI can deep-link to /cards/{id}.
+    dbmod.DatabaseManager.insert_action_card = AsyncMock(return_value=4221)
     dbmod.DatabaseManager.get_recent_action_cards = AsyncMock(return_value=[])
     from src.api.main import app  # noqa: E402
 
@@ -219,6 +222,10 @@ def test_action_endpoint_returns_trade_card_when_call_wall_fade_triggers(
     persisted_payload = dbmod.DatabaseManager.insert_action_card.call_args.args[0]
     assert persisted_payload["pattern"] == "call_wall_fade"
     assert persisted_payload["action"] != "STAND_DOWN"
+    # Phase 1 permalink wiring: the row id returned by insert_action_card
+    # must be attached to the response payload as ``id`` so the live UI
+    # can render a /cards/{id} deep-link.
+    assert body["id"] == 4221
 
 
 # --------------------------------------------------------------------------
@@ -229,6 +236,9 @@ def test_action_endpoint_returns_trade_card_when_call_wall_fade_triggers(
 def test_stand_down_card_is_not_persisted(monkeypatch: pytest.MonkeyPatch):
     """STAND_DOWN must not pollute signal_action_cards."""
     app, dbmod = _build_app(monkeypatch)
+    # Override the default to mirror the real impl: STAND_DOWN short-circuits
+    # internally and returns None, so the response must not carry an ``id``.
+    dbmod.DatabaseManager.insert_action_card = AsyncMock(return_value=None)
     dbmod.DatabaseManager.get_latest_signal_score = AsyncMock(return_value=_score_row())
     dbmod.DatabaseManager.get_advanced_signal = AsyncMock(return_value=None)
     dbmod.DatabaseManager.get_basic_signal = AsyncMock(return_value=None)
@@ -236,12 +246,122 @@ def test_stand_down_card_is_not_persisted(monkeypatch: pytest.MonkeyPatch):
     with TestClient(app) as client:
         r = client.get("/api/signals/action?underlying=SPY")
     assert r.status_code == 200
-    assert r.json()["action"] == "STAND_DOWN"
+    body = r.json()
+    assert body["action"] == "STAND_DOWN"
+    # STAND_DOWN must not carry a persisted id — it isn't shareable.
+    assert "id" not in body
     # insert_action_card is called, but it short-circuits internally for
     # STAND_DOWN — assert the impl-level guard via the payload it received.
     assert dbmod.DatabaseManager.insert_action_card.call_count == 1
     payload = dbmod.DatabaseManager.insert_action_card.call_args.args[0]
     assert payload["action"] == "STAND_DOWN"
+
+
+# --------------------------------------------------------------------------
+# /action/{card_id} permalink + /action/recent feed (Phase 1: Action Card
+# permalinks + OG images).  Both endpoints back the public /cards/{id} page.
+# --------------------------------------------------------------------------
+
+
+def test_action_by_id_returns_404_for_missing_card(monkeypatch: pytest.MonkeyPatch):
+    app, dbmod = _build_app(monkeypatch)
+    dbmod.DatabaseManager.get_action_card_by_id = AsyncMock(return_value=None)
+    with TestClient(app) as client:
+        r = client.get("/api/signals/action/99999")
+    assert r.status_code == 404
+    assert "99999" in r.json()["detail"]
+
+
+def test_action_by_id_returns_404_for_nonpositive_id(monkeypatch: pytest.MonkeyPatch):
+    app, dbmod = _build_app(monkeypatch)
+    # Guard runs before DB lookup; should not be queried.
+    dbmod.DatabaseManager.get_action_card_by_id = AsyncMock(return_value={"id": 0})
+    with TestClient(app) as client:
+        r = client.get("/api/signals/action/0")
+    assert r.status_code == 404
+    dbmod.DatabaseManager.get_action_card_by_id.assert_not_called()
+
+
+def test_action_by_id_returns_full_payload(monkeypatch: pytest.MonkeyPatch):
+    app, dbmod = _build_app(monkeypatch)
+    sample = {
+        "id": 4221,
+        "underlying": "SPY",
+        "timestamp": "2026-05-01T18:42:13+00:00",
+        "pattern": "call_wall_fade",
+        "action": "SELL_CALL_SPREAD",
+        "tier": "0DTE",
+        "direction": "bearish",
+        "confidence": 0.68,
+        "rationale": "Price pinned at call wall ...",
+        "legs": [
+            {"expiry": "2026-05-01", "strike": 678.0, "right": "C", "side": "SELL", "qty": 1},
+        ],
+        "entry": {"ref_price": 678.40, "trigger": "at_touch"},
+        "target": {"ref_price": 675.00, "kind": "level", "level_name": "max_pain"},
+        "stop": {"ref_price": 680.03, "kind": "premium_pct", "level_name": "call_wall_break"},
+        "created_at": "2026-05-01T18:42:14+00:00",
+    }
+    dbmod.DatabaseManager.get_action_card_by_id = AsyncMock(return_value=sample)
+    with TestClient(app) as client:
+        r = client.get("/api/signals/action/4221")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["id"] == 4221
+    assert body["pattern"] == "call_wall_fade"
+    assert body["entry"]["ref_price"] == 678.40
+    assert len(body["legs"]) == 1
+
+
+def test_action_recent_returns_chronological_with_permalinks(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    app, dbmod = _build_app(monkeypatch)
+    rows = [
+        {
+            "id": 4222,
+            "underlying": "SPY",
+            "timestamp": "2026-05-01T18:42:13+00:00",
+            "pattern": "call_wall_fade",
+            "action": "SELL_CALL_SPREAD",
+            "tier": "0DTE",
+            "direction": "bearish",
+            "confidence": 0.68,
+            "rationale": "Pinned at call wall",
+            "created_at": "2026-05-01T18:42:14+00:00",
+        },
+        {
+            "id": 4221,
+            "underlying": "SPY",
+            "timestamp": "2026-05-01T17:35:00+00:00",
+            "pattern": "put_wall_bounce",
+            "action": "BUY_CALL_DEBIT",
+            "tier": "intraday",
+            "direction": "bullish",
+            "confidence": 0.54,
+            "rationale": "Bouncing off put wall",
+            "created_at": "2026-05-01T17:35:01+00:00",
+        },
+    ]
+    dbmod.DatabaseManager.get_action_cards_chronological = AsyncMock(return_value=rows)
+    with TestClient(app) as client:
+        r = client.get("/api/signals/action/recent?underlying=SPY&limit=10")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["count"] == 2
+    assert [c["id"] for c in body["cards"]] == [4222, 4221]
+    assert body["cards"][0]["permalink"] == "/cards/4222"
+    # underlying was uppercased before being passed to the query layer
+    args, kwargs = dbmod.DatabaseManager.get_action_cards_chronological.call_args
+    assert kwargs.get("underlying") == "SPY"
+    assert kwargs.get("limit") == 10
+
+
+def test_action_recent_rejects_out_of_range_limit(monkeypatch: pytest.MonkeyPatch):
+    app, _ = _build_app(monkeypatch)
+    with TestClient(app) as client:
+        r = client.get("/api/signals/action/recent?limit=9999")
+    assert r.status_code == 422
 
 
 def test_recently_emitted_blocks_re_emission_via_hysteresis(monkeypatch: pytest.MonkeyPatch):

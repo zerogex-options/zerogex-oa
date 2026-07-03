@@ -1,0 +1,17 @@
+[Unit]
+Description=Daily trigger for ZeroGEX Gamma Forecast receipt (16:05 ET Mon-Fri)
+
+[Timer]
+# Fires 5 minutes after the cash close so the 16:00 ET bar has fully
+# landed (TradeStation's bars are start-of-minute-stamped → the 16:00
+# bar closes at 16:00:59, then there's a small lag for ingestion to
+# bucket it).  Five minutes is the same buffer the Scorecard tweet
+# uses; sequencing them 10 minutes apart (16:05 receipt, 16:15 tweet)
+# means the Scorecard's tweet copy can reference a fresh receipt if
+# we later choose to bundle them.
+OnCalendar=Mon..Fri *-*-* 16:05:00
+RandomizedDelaySec=2m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

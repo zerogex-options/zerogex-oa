@@ -1,0 +1,18 @@
+[Unit]
+Description=Daily trigger for ZeroGEX morning Gamma Forecast (07:00 ET Mon-Fri)
+
+[Timer]
+# Fires at 07:00 ET, well before the pre-market liquidity window heats up
+# and any opening-auction data lands.  By this time the overnight engine
+# has refreshed gex_summary, max_pain has been recomputed by the 05:00
+# job, and the underlying quote feed has the prior-day close.  Mon-Fri
+# only — the writer skips holidays internally via NYSE_HOLIDAYS so a
+# legitimate trading-day Friday-after-holiday still posts.
+OnCalendar=Mon..Fri *-*-* 07:00:00
+RandomizedDelaySec=2m
+# Catch up after planned downtime — a missed morning forecast can still
+# be useful if it lands by 09:00 (pre-market).
+Persistent=true
+
+[Install]
+WantedBy=timers.target

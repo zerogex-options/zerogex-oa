@@ -3471,6 +3471,263 @@ max-pain-refresh-status: ## Show max-pain refresh timer status + last/next fire 
 	@sudo journalctl -u zerogex-oa-max-pain-refresh -n 30 --no-pager || true
 
 # =============================================================================
+# Yesterday's Scorecard auto-tweet (16:15 ET weekdays)
+# =============================================================================
+# Daily one-line recap of Action Cards emitted + per-signal flip P&L, posted to
+# the brand X account via the 4:15 PM ET timer.  Until X_BOT_BEARER_TOKEN is
+# configured in .env, every run dry-logs the tweet copy.  Override the symbol
+# with SCORECARD_SYMBOL=SPY (default), or the date with SCORECARD_DATE=YYYY-MM-DD.
+.PHONY: scorecard-tweet-dry-run
+scorecard-tweet-dry-run: ## Dry-run today's scorecard tweet (always logs copy, never posts)
+	@echo "$(BLUE)=== Dry-run Yesterday's Scorecard tweet ===$(NC)"
+	@$(PY) -m src.jobs.scorecard_tweet \
+		$(if $(SCORECARD_DATE),--date $(SCORECARD_DATE)) \
+		$(if $(SCORECARD_SYMBOL),--symbol $(SCORECARD_SYMBOL))
+
+.PHONY: scorecard-tweet-post
+scorecard-tweet-post: ## Actually post today's scorecard tweet (needs X_BOT_BEARER_TOKEN)
+	@echo "$(BLUE)=== Posting Yesterday's Scorecard tweet ===$(NC)"
+	@$(PY) -m src.jobs.scorecard_tweet --post \
+		$(if $(SCORECARD_DATE),--date $(SCORECARD_DATE)) \
+		$(if $(SCORECARD_SYMBOL),--symbol $(SCORECARD_SYMBOL))
+
+.PHONY: scorecard-tweet-install
+scorecard-tweet-install: ## Install the daily scorecard tweet timer (16:15 ET Mon-Fri)
+	@echo "$(BLUE)=== Installing Scorecard Tweet Timer ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-scorecard-tweet.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-scorecard-tweet.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-scorecard-tweet.timer
+	@echo "$(GREEN)✅ Scorecard tweet timer (16:15 ET Mon-Fri) installed and started$(NC)"
+	@echo "$(YELLOW)Status:      systemctl status zerogex-oa-scorecard-tweet.timer$(NC)"
+	@echo "$(YELLOW)Logs:        journalctl -u zerogex-oa-scorecard-tweet$(NC)"
+	@echo "$(YELLOW)Trigger now: sudo systemctl start zerogex-oa-scorecard-tweet.service$(NC)"
+
+.PHONY: scorecard-tweet-status
+scorecard-tweet-status: ## Show scorecard tweet timer status + last/next fire + recent log
+	@echo "$(BLUE)=== Scorecard Tweet Timer ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-scorecard-tweet.timer' || true
+	@echo ""
+	@systemctl status zerogex-oa-scorecard-tweet.service --no-pager -l || true
+	@echo ""
+	@sudo journalctl -u zerogex-oa-scorecard-tweet -n 30 --no-pager || true
+
+# =============================================================================
+# Daily Gamma Forecast Card + 4 PM Receipt (07:00 + 16:05 ET weekdays)
+# =============================================================================
+# Two crons that commit + grade one immutable daily_forecast row per trading
+# day per symbol.  Override symbol with FORECAST_SYMBOLS=SPY (default), or
+# backfill a specific date with FORECAST_DATE=YYYY-MM-DD.
+.PHONY: forecast-writer-dry-run
+forecast-writer-dry-run: ## Dry-run today's morning forecast (always logs, never writes)
+	@echo "$(BLUE)=== Dry-run Gamma Forecast writer ===$(NC)"
+	@$(PY) -m src.jobs.forecast_writer --dry-run \
+		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
+		$(if $(FORECAST_SYMBOLS),--symbol $(FORECAST_SYMBOLS))
+
+.PHONY: forecast-writer
+forecast-writer: ## Write today's morning forecast row (idempotent; immutable after first write)
+	@echo "$(BLUE)=== Writing Gamma Forecast morning row ===$(NC)"
+	@$(PY) -m src.jobs.forecast_writer \
+		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
+		$(if $(FORECAST_SYMBOLS),--symbol $(FORECAST_SYMBOLS))
+
+.PHONY: forecast-receipt-dry-run
+forecast-receipt-dry-run: ## Dry-run today's forecast receipt (always logs, never writes)
+	@echo "$(BLUE)=== Dry-run Gamma Forecast receipt ===$(NC)"
+	@$(PY) -m src.jobs.forecast_receipt --dry-run \
+		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
+		$(if $(FORECAST_SYMBOLS),--symbol $(FORECAST_SYMBOLS))
+
+.PHONY: forecast-receipt
+forecast-receipt: ## Write today's receipt against the immutable morning commitment
+	@echo "$(BLUE)=== Writing Gamma Forecast receipt ===$(NC)"
+	@$(PY) -m src.jobs.forecast_receipt \
+		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
+		$(if $(FORECAST_SYMBOLS),--symbol $(FORECAST_SYMBOLS))
+
+.PHONY: forecast-calibrate-dry-run
+forecast-calibrate-dry-run: ## Dry-run tonight's Layer-2 calibration nudges (never writes)
+	@$(PY) -m src.jobs.forecast_calibrate --dry-run \
+		$(if $(FORECAST_SYMBOLS),--symbols $(FORECAST_SYMBOLS))
+
+.PHONY: forecast-calibrate
+forecast-calibrate: ## Recalibrate Layer-2 scalars from trailing 20 receipts (per symbol)
+	@$(PY) -m src.jobs.forecast_calibrate \
+		$(if $(FORECAST_SYMBOLS),--symbols $(FORECAST_SYMBOLS))
+
+.PHONY: forecast-install
+forecast-install: ## Install all forecast timers (07:00 writer, 16:05 receipt, 20:00 calibrate; Mon-Fri)
+	@echo "$(BLUE)=== Installing Forecast Timers ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-forecast-writer.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-writer.timer /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-receipt.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-receipt.timer /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-calibrate.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-calibrate.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-forecast-writer.timer
+	@sudo systemctl enable --now zerogex-oa-forecast-receipt.timer
+	@sudo systemctl enable --now zerogex-oa-forecast-calibrate.timer
+	@echo "$(GREEN)✅ Forecast timers installed (07:00 writer, 16:05 receipt, 20:00 calibrate; Mon-Fri)$(NC)"
+	@echo "$(YELLOW)Status:  systemctl list-timers 'zerogex-oa-forecast-*'$(NC)"
+	@echo "$(YELLOW)Logs:    journalctl -u zerogex-oa-forecast-writer -u zerogex-oa-forecast-receipt -u zerogex-oa-forecast-calibrate$(NC)"
+
+.PHONY: forecast-status
+forecast-status: ## Show both forecast timers + last/next fire + recent logs
+	@echo "$(BLUE)=== Forecast Timers ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-forecast-*.timer' || true
+	@echo ""
+	@systemctl status zerogex-oa-forecast-writer.service --no-pager -l || true
+	@echo ""
+	@systemctl status zerogex-oa-forecast-receipt.service --no-pager -l || true
+	@echo ""
+	@sudo journalctl -u zerogex-oa-forecast-writer -u zerogex-oa-forecast-receipt -n 30 --no-pager || true
+
+# =============================================================================
+# Gamma Forecast auto-tweet (Phase 3b — 07:10 + 16:10 ET weekdays)
+# =============================================================================
+# Companion crons to the forecast writer/receipt.  Two modes share one script:
+#   * morning tweet at 07:10 ET (after the 07:00 writer commits the row)
+#   * receipt tweet at 16:10 ET (after the 16:05 receipt writer grades it)
+# Both dry-run unless X_BOT_BEARER_TOKEN is set AND --post is passed.
+.PHONY: forecast-tweet-morning-dry-run
+forecast-tweet-morning-dry-run: ## Dry-run today's morning forecast tweet
+	@echo "$(BLUE)=== Dry-run morning forecast tweet ===$(NC)"
+	@$(PY) -m src.jobs.forecast_tweet --mode morning \
+		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
+		$(if $(FORECAST_SYMBOL),--symbol $(FORECAST_SYMBOL))
+
+.PHONY: forecast-tweet-receipt-dry-run
+forecast-tweet-receipt-dry-run: ## Dry-run today's receipt forecast tweet
+	@echo "$(BLUE)=== Dry-run receipt forecast tweet ===$(NC)"
+	@$(PY) -m src.jobs.forecast_tweet --mode receipt \
+		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
+		$(if $(FORECAST_SYMBOL),--symbol $(FORECAST_SYMBOL))
+
+.PHONY: forecast-tweet-morning-post
+forecast-tweet-morning-post: ## Post today's morning forecast tweet (needs X_BOT_BEARER_TOKEN)
+	@echo "$(BLUE)=== Posting morning forecast tweet ===$(NC)"
+	@$(PY) -m src.jobs.forecast_tweet --mode morning --post \
+		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
+		$(if $(FORECAST_SYMBOL),--symbol $(FORECAST_SYMBOL))
+
+.PHONY: forecast-tweet-receipt-post
+forecast-tweet-receipt-post: ## Post today's receipt forecast tweet (needs X_BOT_BEARER_TOKEN)
+	@echo "$(BLUE)=== Posting receipt forecast tweet ===$(NC)"
+	@$(PY) -m src.jobs.forecast_tweet --mode receipt --post \
+		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
+		$(if $(FORECAST_SYMBOL),--symbol $(FORECAST_SYMBOL))
+
+.PHONY: forecast-tweet-install
+forecast-tweet-install: ## Install both forecast tweet timers (07:10 + 16:10 ET Mon-Fri)
+	@echo "$(BLUE)=== Installing Forecast Tweet Timers ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-forecast-tweet-morning.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-tweet-morning.timer /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-tweet-receipt.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-forecast-tweet-receipt.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-forecast-tweet-morning.timer
+	@sudo systemctl enable --now zerogex-oa-forecast-tweet-receipt.timer
+	@echo "$(GREEN)✅ Forecast tweet timers installed (07:10 morning, 16:10 receipt; Mon-Fri)$(NC)"
+
+.PHONY: forecast-tweet-status
+forecast-tweet-status: ## Show forecast tweet timers + last/next fire + recent logs
+	@echo "$(BLUE)=== Forecast Tweet Timers ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-forecast-tweet-*.timer' || true
+	@echo ""
+	@sudo journalctl -u zerogex-oa-forecast-tweet-morning -u zerogex-oa-forecast-tweet-receipt -n 30 --no-pager || true
+
+# =============================================================================
+# Live Bulletin auto-tweet (09:15 pre-market, 12:30 midday, 16:05 close ET)
+# =============================================================================
+# Three fires per trading day, one script.  Each fire builds a
+# multi-paragraph read across SPY/SPX/QQQ from get_latest_gex_summary,
+# renders the lead symbol's Live Bulletin PNG via the frontend's
+# /api/bulletin/card endpoint, and (best-effort) records the day's Replay
+# scrubber via the frontend's Playwright helper.  Every mode is dry-run
+# by default; artifacts (tweet text + PNG + clip + manifest.json) land
+# in $BULLETIN_TWEET_ARTIFACT_DIR (default /var/lib/zerogex-oa/
+# bulletin-tweets) for operator inspection before flipping --post on.
+#
+# Override symbols with BULLETIN_TWEET_SYMBOLS=SPY,SPX,QQQ (default), the
+# lead attachment symbol with BULLETIN_TWEET_LEAD_SYMBOL=SPX (default),
+# or a specific date with BULLETIN_TWEET_DATE=YYYY-MM-DD.
+.PHONY: bulletin-tweet-premarket-dry-run
+bulletin-tweet-premarket-dry-run: ## Dry-run today's pre-market bulletin tweet (09:15 slot)
+	@echo "$(BLUE)=== Dry-run pre-market bulletin tweet ===$(NC)"
+	@$(PY) -m src.jobs.bulletin_tweet --mode premarket \
+		$(if $(BULLETIN_TWEET_DATE),--date $(BULLETIN_TWEET_DATE)) \
+		$(if $(BULLETIN_TWEET_SYMBOLS),--symbols $(BULLETIN_TWEET_SYMBOLS)) \
+		$(if $(BULLETIN_TWEET_LEAD_SYMBOL),--lead-symbol $(BULLETIN_TWEET_LEAD_SYMBOL))
+
+.PHONY: bulletin-tweet-midday-dry-run
+bulletin-tweet-midday-dry-run: ## Dry-run today's mid-session bulletin tweet (12:30 slot)
+	@echo "$(BLUE)=== Dry-run mid-session bulletin tweet ===$(NC)"
+	@$(PY) -m src.jobs.bulletin_tweet --mode midday \
+		$(if $(BULLETIN_TWEET_DATE),--date $(BULLETIN_TWEET_DATE)) \
+		$(if $(BULLETIN_TWEET_SYMBOLS),--symbols $(BULLETIN_TWEET_SYMBOLS)) \
+		$(if $(BULLETIN_TWEET_LEAD_SYMBOL),--lead-symbol $(BULLETIN_TWEET_LEAD_SYMBOL))
+
+.PHONY: bulletin-tweet-close-dry-run
+bulletin-tweet-close-dry-run: ## Dry-run today's post-market bulletin tweet (16:05 slot)
+	@echo "$(BLUE)=== Dry-run post-market bulletin tweet ===$(NC)"
+	@$(PY) -m src.jobs.bulletin_tweet --mode close \
+		$(if $(BULLETIN_TWEET_DATE),--date $(BULLETIN_TWEET_DATE)) \
+		$(if $(BULLETIN_TWEET_SYMBOLS),--symbols $(BULLETIN_TWEET_SYMBOLS)) \
+		$(if $(BULLETIN_TWEET_LEAD_SYMBOL),--lead-symbol $(BULLETIN_TWEET_LEAD_SYMBOL))
+
+.PHONY: bulletin-tweet-premarket-post
+bulletin-tweet-premarket-post: ## Post today's pre-market bulletin tweet (needs X_BOT_BEARER_TOKEN + OAuth1)
+	@echo "$(BLUE)=== Posting pre-market bulletin tweet ===$(NC)"
+	@$(PY) -m src.jobs.bulletin_tweet --mode premarket --post \
+		$(if $(BULLETIN_TWEET_DATE),--date $(BULLETIN_TWEET_DATE)) \
+		$(if $(BULLETIN_TWEET_SYMBOLS),--symbols $(BULLETIN_TWEET_SYMBOLS)) \
+		$(if $(BULLETIN_TWEET_LEAD_SYMBOL),--lead-symbol $(BULLETIN_TWEET_LEAD_SYMBOL))
+
+.PHONY: bulletin-tweet-midday-post
+bulletin-tweet-midday-post: ## Post today's mid-session bulletin tweet (needs X_BOT_BEARER_TOKEN + OAuth1)
+	@echo "$(BLUE)=== Posting mid-session bulletin tweet ===$(NC)"
+	@$(PY) -m src.jobs.bulletin_tweet --mode midday --post \
+		$(if $(BULLETIN_TWEET_DATE),--date $(BULLETIN_TWEET_DATE)) \
+		$(if $(BULLETIN_TWEET_SYMBOLS),--symbols $(BULLETIN_TWEET_SYMBOLS)) \
+		$(if $(BULLETIN_TWEET_LEAD_SYMBOL),--lead-symbol $(BULLETIN_TWEET_LEAD_SYMBOL))
+
+.PHONY: bulletin-tweet-close-post
+bulletin-tweet-close-post: ## Post today's post-market bulletin tweet (needs X_BOT_BEARER_TOKEN + OAuth1)
+	@echo "$(BLUE)=== Posting post-market bulletin tweet ===$(NC)"
+	@$(PY) -m src.jobs.bulletin_tweet --mode close --post \
+		$(if $(BULLETIN_TWEET_DATE),--date $(BULLETIN_TWEET_DATE)) \
+		$(if $(BULLETIN_TWEET_SYMBOLS),--symbols $(BULLETIN_TWEET_SYMBOLS)) \
+		$(if $(BULLETIN_TWEET_LEAD_SYMBOL),--lead-symbol $(BULLETIN_TWEET_LEAD_SYMBOL))
+
+.PHONY: bulletin-tweet-install
+bulletin-tweet-install: ## Install all three bulletin tweet timers (09:15, 12:30, 16:05 ET Mon-Fri)
+	@echo "$(BLUE)=== Installing Live Bulletin Tweet Timers ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-bulletin-tweet-premarket.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-bulletin-tweet-premarket.timer /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-bulletin-tweet-midday.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-bulletin-tweet-midday.timer /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-bulletin-tweet-close.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-bulletin-tweet-close.timer /etc/systemd/system/
+	@sudo install -d -o ubuntu -g ubuntu -m 0755 /var/lib/zerogex-oa/bulletin-tweets
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-bulletin-tweet-premarket.timer
+	@sudo systemctl enable --now zerogex-oa-bulletin-tweet-midday.timer
+	@sudo systemctl enable --now zerogex-oa-bulletin-tweet-close.timer
+	@echo "$(GREEN)✅ Bulletin tweet timers installed (09:15 premarket, 12:30 midday, 16:05 close; Mon-Fri)$(NC)"
+	@echo "$(YELLOW)Status:      systemctl list-timers 'zerogex-oa-bulletin-tweet-*'$(NC)"
+	@echo "$(YELLOW)Logs:        journalctl -u zerogex-oa-bulletin-tweet-premarket -u zerogex-oa-bulletin-tweet-midday -u zerogex-oa-bulletin-tweet-close$(NC)"
+	@echo "$(YELLOW)Trigger now: sudo systemctl start zerogex-oa-bulletin-tweet-close.service$(NC)"
+
+.PHONY: bulletin-tweet-status
+bulletin-tweet-status: ## Show bulletin tweet timers + last/next fire + recent logs
+	@echo "$(BLUE)=== Bulletin Tweet Timers ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-bulletin-tweet-*.timer' || true
+	@echo ""
+	@sudo journalctl -u zerogex-oa-bulletin-tweet-premarket -u zerogex-oa-bulletin-tweet-midday -u zerogex-oa-bulletin-tweet-close -n 30 --no-pager || true
+
+# =============================================================================
 # Daily ATM IV history backfill (pre-open seed of daily_atm_iv)
 # =============================================================================
 # Re-seeds the trailing 30 days of daily_atm_iv from option_chains.  The live

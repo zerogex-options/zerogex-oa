@@ -1060,27 +1060,32 @@ class SignalsQueriesMixin:
             logger.warning("get_signal_history failed (%s, %s): %s", symbol, component_name, exc)
             return []
 
-    async def insert_action_card(self, card: Dict[str, Any]) -> None:
+    async def insert_action_card(self, card: Dict[str, Any]) -> Optional[int]:
         """Persist a non-STAND_DOWN Action Card.
 
         Caller passes ``card.to_dict()`` from the Playbook engine.  Failures
         are logged but never raised — persistence is best-effort and should
         not break the API response path.
+
+        Returns the inserted row's ``id`` on a fresh write, or the existing
+        row's ``id`` when the idempotency guard matches a recently-persisted
+        duplicate (same underlying / pattern / timestamp).  Returns ``None``
+        for STAND_DOWN cards, malformed payloads, or any DB error.
         """
         if not card or card.get("action") == "STAND_DOWN":
-            return
+            return None
         ts = card.get("timestamp")
         if isinstance(ts, str):
             try:
                 ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
             except ValueError:
                 logger.warning("insert_action_card: bad timestamp %r", ts)
-                return
+                return None
         if ts is None:
-            return
+            return None
         try:
             async with self._acquire_connection() as conn:
-                await conn.execute(
+                inserted_id = await conn.fetchval(
                     """
                     INSERT INTO signal_action_cards
                         (underlying, timestamp, pattern, action, tier,
@@ -1110,6 +1115,7 @@ class SignalsQueriesMixin:
                           AND pattern = $3::varchar
                           AND timestamp = $2::timestamptz
                     )
+                    RETURNING id
                     """,
                     card.get("underlying"),
                     ts,
@@ -1120,9 +1126,29 @@ class SignalsQueriesMixin:
                     float(card.get("confidence") or 0.0),
                     json.dumps(card, default=str),
                 )
+                if inserted_id is not None:
+                    return int(inserted_id)
+                # Idempotency guard matched — return the existing row's id so
+                # the live API response can still expose a stable permalink for
+                # the same logical card.
+                existing_id = await conn.fetchval(
+                    """
+                    SELECT id FROM signal_action_cards
+                    WHERE underlying = $1::varchar
+                      AND pattern = $2::varchar
+                      AND timestamp = $3::timestamptz
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    card.get("underlying"),
+                    card.get("pattern"),
+                    ts,
+                )
+                return int(existing_id) if existing_id is not None else None
         except Exception as exc:
             # Best-effort — don't surface persistence errors to API callers.
             logger.warning("insert_action_card failed (%s): %s", card.get("pattern"), exc)
+            return None
 
     async def get_recent_action_cards(
         self, underlying: str, since_minutes: int = 90
@@ -1150,3 +1176,969 @@ class SignalsQueriesMixin:
         except Exception as exc:
             logger.warning("get_recent_action_cards failed (%s): %s", underlying, exc)
             return []
+
+    async def get_daily_scorecard(
+        self,
+        symbol: str,
+        start_utc: datetime,
+        end_utc: datetime,
+        signal_names: List[str],
+        horizon_minutes: int = 60,
+    ) -> Dict[str, Any]:
+        """Aggregate the day's signal-engine output for the public scorecard.
+
+        Returns a single dict combining three independent reads:
+
+        1. **Action Cards** persisted in the window — total count, breakdown
+           by ``action`` enum, and the id of the first non-STAND_DOWN card
+           emitted that day (used as the OG card's anchor permalink).
+        2. **Per-signal flip events** with realized return at the requested
+           horizon — for each of the 13 signal names, counts the number of
+           direction-flip events in the window, the number that "won"
+           (return same-sign as the flip direction), and the average
+           directional return. Best/worst signal are picked from the names
+           with at least two qualifying events.
+        3. **Closing regime** — the most recent ``signal_scores`` row at or
+           before ``end_utc``, used to label the day's MSI regime.
+
+        Every fetch is best-effort: if one chunk fails the scorecard still
+        renders with the remaining sections populated. ``start_utc`` is
+        inclusive, ``end_utc`` is exclusive (matches the 1-min bucket
+        boundary convention used elsewhere).
+        """
+        from collections import Counter
+
+        out: Dict[str, Any] = {
+            "symbol": symbol,
+            "window_start_utc": start_utc,
+            "window_end_utc": end_utc,
+            "horizon_minutes": horizon_minutes,
+            "cards": {
+                "total": 0,
+                "by_action": [],
+                "first_card_id": None,
+            },
+            "signals": {
+                "events": [],
+                "best": None,
+                "worst": None,
+            },
+            "regime": None,
+        }
+
+        # 1. Action Card aggregates for the day.
+        try:
+            async with self._acquire_connection() as conn:
+                card_rows = await conn.fetch(
+                    """
+                    SELECT id, action
+                    FROM signal_action_cards
+                    WHERE underlying = $1
+                      AND timestamp >= $2
+                      AND timestamp < $3
+                      AND action <> 'STAND_DOWN'
+                    ORDER BY timestamp ASC, id ASC
+                    """,
+                    symbol,
+                    start_utc,
+                    end_utc,
+                )
+            if card_rows:
+                out["cards"]["total"] = len(card_rows)
+                out["cards"]["first_card_id"] = int(card_rows[0]["id"])
+                counts = Counter(r["action"] for r in card_rows if r["action"])
+                out["cards"]["by_action"] = [
+                    {"action": action, "count": count}
+                    for action, count in counts.most_common(5)
+                ]
+        except Exception as exc:
+            logger.warning(
+                "get_daily_scorecard: cards section failed (%s, %s..%s): %s",
+                symbol, start_utc, end_utc, exc,
+            )
+
+        # 2. Per-signal flip events with realized return at horizon.
+        if signal_names:
+            horizon_interval = f"{int(horizon_minutes)} minutes"
+            try:
+                async with self._acquire_connection() as conn:
+                    sig_rows = await conn.fetch(
+                        f"""
+                        WITH events AS (
+                            SELECT
+                                scs.component_name,
+                                scs.timestamp,
+                                scs.clamped_score,
+                                SIGN(scs.clamped_score) AS sign_now,
+                                LAG(SIGN(scs.clamped_score)) OVER (
+                                    PARTITION BY scs.component_name
+                                    ORDER BY scs.timestamp
+                                ) AS sign_prev,
+                                q0.close AS close_at_ts,
+                                q1.close AS close_at_horizon
+                            FROM signal_component_scores scs
+                            LEFT JOIN LATERAL (
+                                SELECT close FROM underlying_quotes uq
+                                WHERE uq.symbol = scs.underlying
+                                  AND uq.timestamp <= scs.timestamp
+                                ORDER BY uq.timestamp DESC LIMIT 1
+                            ) q0 ON TRUE
+                            LEFT JOIN LATERAL (
+                                SELECT close FROM underlying_quotes uq
+                                WHERE uq.symbol = scs.underlying
+                                  AND uq.timestamp >= scs.timestamp + INTERVAL '{horizon_interval}'
+                                ORDER BY uq.timestamp ASC LIMIT 1
+                            ) q1 ON TRUE
+                            WHERE scs.underlying = $1
+                              AND scs.component_name = ANY($2::varchar[])
+                              AND scs.timestamp >= $3
+                              AND scs.timestamp < $4
+                        ),
+                        flips AS (
+                            -- A "flip" is a non-zero sign that differs from the
+                            -- previous non-zero sign. The LAG above returns the
+                            -- immediately-prior bar's sign, which may be 0; we
+                            -- treat 0-prev as "not a flip" so we only count
+                            -- transitions between live directional states.
+                            SELECT
+                                component_name,
+                                sign_now,
+                                close_at_ts,
+                                close_at_horizon,
+                                CASE
+                                    WHEN close_at_ts IS NULL OR close_at_horizon IS NULL THEN NULL
+                                    WHEN sign_now > 0 THEN (close_at_horizon - close_at_ts) / NULLIF(close_at_ts, 0)
+                                    WHEN sign_now < 0 THEN (close_at_ts - close_at_horizon) / NULLIF(close_at_ts, 0)
+                                    ELSE NULL
+                                END AS directional_return
+                            FROM events
+                            WHERE sign_now <> 0
+                              AND sign_prev IS NOT NULL
+                              AND sign_prev <> 0
+                              AND sign_now <> sign_prev
+                        )
+                        SELECT
+                            component_name,
+                            COUNT(*) AS flips,
+                            COUNT(directional_return) AS scored,
+                            SUM(CASE WHEN directional_return > 0 THEN 1 ELSE 0 END) AS wins,
+                            SUM(CASE WHEN directional_return < 0 THEN 1 ELSE 0 END) AS losses,
+                            AVG(directional_return) AS avg_directional_return
+                        FROM flips
+                        GROUP BY component_name
+                        """,
+                        symbol,
+                        list(signal_names),
+                        start_utc,
+                        end_utc,
+                    )
+                events: List[Dict[str, Any]] = []
+                for r in sig_rows:
+                    avg = r["avg_directional_return"]
+                    events.append(
+                        {
+                            "name": r["component_name"],
+                            "flips": int(r["flips"] or 0),
+                            "scored": int(r["scored"] or 0),
+                            "wins": int(r["wins"] or 0),
+                            "losses": int(r["losses"] or 0),
+                            "avg_directional_return": float(avg) if avg is not None else None,
+                        }
+                    )
+                out["signals"]["events"] = sorted(
+                    events,
+                    key=lambda e: (
+                        e["avg_directional_return"]
+                        if e["avg_directional_return"] is not None
+                        else 0.0
+                    ),
+                    reverse=True,
+                )
+                # Pick best/worst from names with ≥ 2 scored events so a
+                # one-print outlier doesn't crown a signal of the day.
+                qualifying = [
+                    e for e in events
+                    if e["scored"] >= 2 and e["avg_directional_return"] is not None
+                ]
+                if qualifying:
+                    out["signals"]["best"] = max(
+                        qualifying, key=lambda e: e["avg_directional_return"]
+                    )
+                    out["signals"]["worst"] = min(
+                        qualifying, key=lambda e: e["avg_directional_return"]
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "get_daily_scorecard: signals section failed (%s): %s",
+                    symbol, exc,
+                )
+
+        # 3. Closing regime — most recent signal_scores row in the window.
+        try:
+            async with self._acquire_connection() as conn:
+                regime_row = await conn.fetchrow(
+                    """
+                    SELECT underlying, timestamp, composite_score, normalized_score, direction
+                    FROM signal_scores
+                    WHERE underlying = $1
+                      AND timestamp >= $2
+                      AND timestamp < $3
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                    """,
+                    symbol,
+                    start_utc,
+                    end_utc,
+                )
+            if regime_row:
+                out["regime"] = {
+                    "timestamp": regime_row["timestamp"],
+                    "composite_score": float(regime_row["composite_score"]) if regime_row["composite_score"] is not None else None,
+                    "normalized_score": float(regime_row["normalized_score"]) if regime_row["normalized_score"] is not None else None,
+                    "direction": regime_row["direction"],
+                }
+        except Exception as exc:
+            logger.warning(
+                "get_daily_scorecard: regime section failed (%s): %s",
+                symbol, exc,
+            )
+
+        return out
+
+    async def get_action_card_by_id(self, card_id: int) -> Optional[Dict[str, Any]]:
+        """Return a single persisted Action Card by primary key.
+
+        Returns the full ``payload`` (the Card's ``to_dict()`` form) plus the
+        row's ``id`` and ``created_at`` so callers can build stable permalinks.
+        Returns ``None`` if no row matches.
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, underlying, timestamp, pattern, action, tier,
+                           direction, confidence, payload, created_at
+                    FROM signal_action_cards
+                    WHERE id = $1
+                    """,
+                    int(card_id),
+                )
+                if row is None:
+                    return None
+                payload = row["payload"]
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except json.JSONDecodeError:
+                        payload = {}
+                payload = dict(payload or {})
+                payload["id"] = int(row["id"])
+                payload["created_at"] = row["created_at"]
+                # Normalize a few top-level fields in case the payload was
+                # written by an older engine version that omitted them.
+                payload.setdefault("underlying", row["underlying"])
+                payload.setdefault("timestamp", row["timestamp"])
+                payload.setdefault("pattern", row["pattern"])
+                payload.setdefault("action", row["action"])
+                payload.setdefault("tier", row["tier"])
+                payload.setdefault("direction", row["direction"])
+                payload.setdefault("confidence", float(row["confidence"]))
+                return payload
+        except Exception as exc:
+            logger.warning("get_action_card_by_id failed (%s): %s", card_id, exc)
+            return None
+
+    async def get_action_cards_chronological(
+        self,
+        underlying: Optional[str] = None,
+        limit: int = 50,
+        since_hours: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Chronological list of persisted Action Cards for the public feed.
+
+        Unlike ``get_recent_action_cards`` (which DISTINCT-ONs per pattern for
+        hysteresis bookkeeping), this returns every row newest-first so the
+        site can paginate the full history without collapsing duplicates.
+
+        ``underlying`` filters to one symbol; ``since_hours`` restricts to a
+        rolling window (default: no restriction, just the ``limit`` rows).
+        """
+        params: List[Any] = []
+        where_parts: List[str] = []
+        if underlying:
+            params.append(underlying)
+            where_parts.append(f"underlying = ${len(params)}")
+        if since_hours is not None and since_hours > 0:
+            params.append(int(since_hours))
+            where_parts.append(
+                f"timestamp > NOW() - (${len(params)}::int * INTERVAL '1 hour')"
+            )
+        where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+        params.append(int(limit))
+        limit_placeholder = f"${len(params)}"
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    f"""
+                    SELECT id, underlying, timestamp, pattern, action, tier,
+                           direction, confidence, payload, created_at
+                    FROM signal_action_cards
+                    {where_clause}
+                    ORDER BY timestamp DESC
+                    LIMIT {limit_placeholder}
+                    """,
+                    *params,
+                )
+                out: List[Dict[str, Any]] = []
+                for r in rows:
+                    payload = r["payload"]
+                    if isinstance(payload, str):
+                        try:
+                            payload = json.loads(payload)
+                        except json.JSONDecodeError:
+                            payload = {}
+                    out.append(
+                        {
+                            "id": int(r["id"]),
+                            "underlying": r["underlying"],
+                            "timestamp": r["timestamp"],
+                            "pattern": r["pattern"],
+                            "action": r["action"],
+                            "tier": r["tier"],
+                            "direction": r["direction"],
+                            "confidence": float(r["confidence"]),
+                            "created_at": r["created_at"],
+                            "rationale": (payload or {}).get("rationale"),
+                        }
+                    )
+                return out
+        except Exception as exc:
+            logger.warning(
+                "get_action_cards_chronological failed (underlying=%s): %s",
+                underlying,
+                exc,
+            )
+            return []
+
+    # ------------------------------------------------------------------
+    # Daily Forecast (Phase 3: Gamma Forecast Card + 4 PM Receipt)
+    # ------------------------------------------------------------------
+
+    async def insert_daily_forecast_morning(
+        self, payload: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Persist the 7:00 AM ET morning snapshot for one trading day.
+
+        Idempotent: the (symbol, date) primary key plus the morning-column
+        immutability trigger guarantee that re-running the writer cannot
+        overwrite a row already committed for the day. Returns the resulting
+        row dict (whether freshly inserted or pre-existing) so the caller
+        can confirm the content_hash matches what they computed.
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO daily_forecast (
+                        symbol, date, open_ts, open_spot,
+                        call_wall, put_wall, gamma_flip, open_msi,
+                        regime, projected_low, projected_high, projected_close,
+                        pin_strike, pin_tolerance, flagship_setup, range_model,
+                        raw_projected_low, raw_projected_high, raw_pin_strike,
+                        forecast_inputs, content_hash
+                    )
+                    VALUES (
+                        $1, $2, $3, $4,
+                        $5, $6, $7, $8,
+                        $9, $10, $11, $12,
+                        $13, $14, $15::jsonb, $16,
+                        $17, $18, $19,
+                        $20::jsonb, $21
+                    )
+                    ON CONFLICT (symbol, date) DO NOTHING
+                    RETURNING symbol, date, open_ts, open_spot, call_wall,
+                              put_wall, gamma_flip, open_msi, regime,
+                              projected_low, projected_high, projected_close,
+                              pin_strike, pin_tolerance, flagship_setup,
+                              range_model, raw_projected_low, raw_projected_high,
+                              raw_pin_strike, forecast_inputs,
+                              content_hash, created_at
+                    """,
+                    payload["symbol"],
+                    payload["date"],
+                    payload["open_ts"],
+                    payload["open_spot"],
+                    payload.get("call_wall"),
+                    payload.get("put_wall"),
+                    payload.get("gamma_flip"),
+                    payload.get("open_msi"),
+                    payload["regime"],
+                    payload["projected_low"],
+                    payload["projected_high"],
+                    payload.get("projected_close"),
+                    payload.get("pin_strike"),
+                    payload.get("pin_tolerance"),
+                    json.dumps(payload.get("flagship_setup"), default=str)
+                    if payload.get("flagship_setup") is not None
+                    else None,
+                    payload["range_model"],
+                    payload.get("raw_projected_low"),
+                    payload.get("raw_projected_high"),
+                    payload.get("raw_pin_strike"),
+                    json.dumps(payload.get("forecast_inputs"), default=str)
+                    if payload.get("forecast_inputs") is not None
+                    else None,
+                    payload["content_hash"],
+                )
+                if row is not None:
+                    return dict(row)
+                # ON CONFLICT no-op: return the existing row so callers can
+                # log "already committed" rather than silently double-running.
+                existing = await conn.fetchrow(
+                    """
+                    SELECT * FROM daily_forecast
+                    WHERE symbol = $1 AND date = $2
+                    """,
+                    payload["symbol"], payload["date"],
+                )
+                return dict(existing) if existing else None
+        except Exception as exc:
+            logger.warning(
+                "insert_daily_forecast_morning failed (%s, %s): %s",
+                payload.get("symbol"), payload.get("date"), exc,
+            )
+            return None
+
+    async def update_daily_forecast_receipt(
+        self,
+        symbol: str,
+        forecast_date: date,
+        receipt_ts: datetime,
+        actual_low: float,
+        actual_high: float,
+        actual_close: float,
+        setup_outcome: Optional[Dict[str, Any]] = None,
+        pin_tolerance: float = 1.0,
+    ) -> Optional[Dict[str, Any]]:
+        """Write the 4:05 PM ET receipt for an existing morning row.
+
+        Computes derived verdicts (``range_respected`` / ``pin_hit`` /
+        ``regime_correct``) from the actual OHLC against the immutable
+        morning columns. Skips silently and returns None if no morning row
+        exists (the writer either never ran or failed earlier in the day);
+        skips silently and returns the existing row if the receipt has
+        already been written (the trigger enforces immutability).
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT projected_low, projected_high, pin_strike, regime,
+                           open_spot, receipt_ts
+                    FROM daily_forecast
+                    WHERE symbol = $1 AND date = $2
+                    """,
+                    symbol, forecast_date,
+                )
+                if row is None:
+                    logger.info(
+                        "update_daily_forecast_receipt: no morning row for %s %s — skipping",
+                        symbol, forecast_date.isoformat(),
+                    )
+                    return None
+                if row["receipt_ts"] is not None:
+                    logger.info(
+                        "update_daily_forecast_receipt: receipt already written for %s %s — skipping",
+                        symbol, forecast_date.isoformat(),
+                    )
+                    return dict(row)
+
+                projected_low = float(row["projected_low"])
+                projected_high = float(row["projected_high"])
+                pin_strike = (
+                    float(row["pin_strike"]) if row["pin_strike"] is not None else None
+                )
+                regime = row["regime"]
+                open_spot = float(row["open_spot"])
+
+                # Dynamic pin tolerance from the morning row (v1.2+); fall
+                # back to the argument for pre-v1.2 rows that don't carry
+                # it.  A row committed under heuristic_v1 will simply be
+                # graded at the caller's default $1 threshold.
+                effective_pin_tol = (
+                    float(row["pin_tolerance"])
+                    if row.get("pin_tolerance") is not None
+                    else pin_tolerance
+                )
+
+                # Range respected = the day's traded high/low both sat
+                # inside the band. Wicks count: the band is a no-touch
+                # prediction, not a 90%-of-bars threshold.
+                range_respected = (
+                    actual_low >= projected_low and actual_high <= projected_high
+                )
+                pin_hit = (
+                    pin_strike is not None
+                    and abs(actual_close - pin_strike) <= effective_pin_tol
+                )
+
+                # v1.2 raw (pre-correction) verdicts.  Grades the same
+                # actuals against the RAW band + RAW pin so the
+                # calibration cron can compare correction effectiveness.
+                # NULL when the row was written pre-v1.2 (no raw fields).
+                raw_low = row.get("raw_projected_low")
+                raw_high = row.get("raw_projected_high")
+                raw_pin = row.get("raw_pin_strike")
+                if raw_low is not None and raw_high is not None:
+                    raw_range_respected = (
+                        actual_low >= float(raw_low) and actual_high <= float(raw_high)
+                    )
+                else:
+                    raw_range_respected = None
+                if raw_pin is not None:
+                    raw_pin_hit = abs(actual_close - float(raw_pin)) <= effective_pin_tol
+                else:
+                    raw_pin_hit = None
+                # Regime correctness: long-gamma days should chop (close
+                # within 0.5% of open); short-gamma days should trend
+                # (close moved more than 0.5%). Transition days are
+                # neutral — never marked wrong.
+                move_pct = abs(actual_close - open_spot) / open_spot if open_spot else 0.0
+                if regime == "long_gamma":
+                    regime_correct = move_pct <= 0.005
+                elif regime == "short_gamma":
+                    regime_correct = move_pct > 0.005
+                else:
+                    regime_correct = None
+
+                updated = await conn.fetchrow(
+                    """
+                    UPDATE daily_forecast
+                    SET receipt_ts = $3,
+                        actual_low = $4,
+                        actual_high = $5,
+                        actual_close = $6,
+                        range_respected = $7,
+                        pin_hit = $8,
+                        regime_correct = $9,
+                        raw_range_respected = $10,
+                        raw_pin_hit = $11,
+                        setup_outcome = $12::jsonb
+                    WHERE symbol = $1 AND date = $2
+                    RETURNING *
+                    """,
+                    symbol, forecast_date, receipt_ts,
+                    actual_low, actual_high, actual_close,
+                    range_respected, pin_hit, regime_correct,
+                    raw_range_respected, raw_pin_hit,
+                    json.dumps(setup_outcome, default=str) if setup_outcome else None,
+                )
+                return dict(updated) if updated else None
+        except Exception as exc:
+            logger.warning(
+                "update_daily_forecast_receipt failed (%s, %s): %s",
+                symbol, forecast_date, exc,
+            )
+            return None
+
+    async def get_daily_forecast(
+        self, symbol: str, forecast_date: date
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch one symbol/date forecast row, morning + receipt combined."""
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT * FROM daily_forecast
+                    WHERE symbol = $1 AND date = $2
+                    """,
+                    symbol, forecast_date,
+                )
+                if row is None:
+                    return None
+                out = dict(row)
+                for key in ("flagship_setup", "setup_outcome"):
+                    val = out.get(key)
+                    if isinstance(val, str):
+                        try:
+                            out[key] = json.loads(val)
+                        except json.JSONDecodeError:
+                            out[key] = None
+                return out
+        except Exception as exc:
+            logger.warning(
+                "get_daily_forecast failed (%s, %s): %s", symbol, forecast_date, exc,
+            )
+            return None
+
+    async def get_forecast_available_dates(
+        self, symbol: str, limit: int = 60
+    ) -> List[Dict[str, Any]]:
+        """Distinct forecast dates for a symbol (newest first) — powers the
+        /forecast landing-page date picker. Each row carries the metadata
+        the picker needs to badge a card: regime, whether the receipt row
+        landed, and (if it did) the top-level verdict pills so the picker
+        can render green/red at a glance without a second fetch."""
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT date,
+                           regime,
+                           receipt_ts IS NOT NULL AS has_receipt,
+                           range_respected,
+                           pin_hit,
+                           regime_correct
+                    FROM daily_forecast
+                    WHERE symbol = $1
+                    ORDER BY date DESC
+                    LIMIT $2
+                    """,
+                    symbol, int(limit),
+                )
+                return [dict(r) for r in rows]
+        except Exception as exc:
+            logger.warning(
+                "get_forecast_available_dates failed (%s): %s", symbol, exc,
+            )
+            return []
+
+    async def get_daily_forecast_history(
+        self, symbol: str, limit: int = 30
+    ) -> List[Dict[str, Any]]:
+        """Recent forecasts (newest first) — powers the stats endpoint and
+        the website's rolling hit-rate strip."""
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT symbol, date, open_spot, projected_low, projected_high,
+                           pin_strike, regime, range_respected, pin_hit,
+                           regime_correct, actual_close, receipt_ts
+                    FROM daily_forecast
+                    WHERE symbol = $1
+                    ORDER BY date DESC
+                    LIMIT $2
+                    """,
+                    symbol, int(limit),
+                )
+                return [dict(r) for r in rows]
+        except Exception as exc:
+            logger.warning(
+                "get_daily_forecast_history failed (%s): %s", symbol, exc,
+            )
+            return []
+
+    async def get_iv_rank_30d(self, symbol: str) -> Optional[float]:
+        """Compute the 30-day IV rank for ``symbol`` from ``daily_atm_iv``.
+
+        ``rank = (today - min) / (max - min)`` over the trailing 30 calendar
+        days.  Returns None when there aren't enough historical rows or
+        today's ATM IV hasn't been written yet.  Range 0.0..1.0.
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    WITH today_iv AS (
+                        SELECT atm_call_iv AS current_iv
+                        FROM daily_atm_iv
+                        WHERE underlying = $1
+                          AND trading_date = (
+                              (NOW()::timestamptz AT TIME ZONE 'America/New_York')::date
+                          )
+                    ),
+                    historical AS (
+                        SELECT MIN(atm_call_iv) AS iv_low,
+                               MAX(atm_call_iv) AS iv_high,
+                               COUNT(*) AS n_days
+                        FROM daily_atm_iv
+                        WHERE underlying = $1
+                          AND trading_date >= (
+                              (NOW()::timestamptz AT TIME ZONE 'America/New_York')::date
+                          ) - INTERVAL '30 days'
+                          AND trading_date < (
+                              (NOW()::timestamptz AT TIME ZONE 'America/New_York')::date
+                          )
+                    )
+                    SELECT (SELECT current_iv FROM today_iv) AS current_iv,
+                           iv_low, iv_high, n_days
+                    FROM historical
+                    """,
+                    symbol,
+                )
+                if row is None or row["current_iv"] is None:
+                    return None
+                if row["iv_low"] is None or row["iv_high"] is None:
+                    return None
+                if int(row["n_days"] or 0) < 10:
+                    return None
+                current = float(row["current_iv"])
+                low = float(row["iv_low"])
+                high = float(row["iv_high"])
+                span = max(high - low, 0.001)
+                return round(min(1.0, max(0.0, (current - low) / span)), 4)
+        except Exception as exc:
+            logger.warning("get_iv_rank_30d failed (%s): %s", symbol, exc)
+            return None
+
+    async def get_atr_5d(self, symbol: str) -> Optional[float]:
+        """Simple 5-day average true range in dollars from ``underlying_quotes``.
+
+        ATR here is the mean of the trailing 5 completed cash sessions'
+        ``high - low``.  Not the classic Wilder ATR (which folds in prior
+        close), but close enough for a range-forecast floor and much
+        simpler to compute cheaply.  Returns None when < 5 sessions of
+        history exist.
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    WITH sessions AS (
+                        SELECT (timestamp AT TIME ZONE 'America/New_York')::date AS d,
+                               MAX(high) AS hi,
+                               MIN(low)  AS lo
+                        FROM underlying_quotes
+                        WHERE symbol = $1
+                          AND (timestamp AT TIME ZONE 'America/New_York')::date
+                              < (NOW() AT TIME ZONE 'America/New_York')::date
+                          AND (timestamp AT TIME ZONE 'America/New_York')::time
+                              BETWEEN TIME '09:30' AND TIME '16:00'
+                        GROUP BY d
+                        ORDER BY d DESC
+                        LIMIT 5
+                    )
+                    SELECT AVG(hi - lo) AS atr, COUNT(*) AS n FROM sessions
+                    """,
+                    symbol,
+                )
+                if row is None or row["atr"] is None or int(row["n"] or 0) < 5:
+                    return None
+                return round(float(row["atr"]), 4)
+        except Exception as exc:
+            logger.warning("get_atr_5d failed (%s): %s", symbol, exc)
+            return None
+
+    async def get_vix_z_score_20d(self, ticker: str = "VIX") -> Optional[float]:
+        """Z-score of the last VIX close vs. the trailing 20 daily closes.
+
+        Uses ``vix_bars`` / ``vxn_bars`` (5-min bars); takes the 15:55 ET
+        close per session so the value is settled.  Returns None if fewer
+        than 15 prior sessions are available.
+        """
+        table = f"{ticker.lower()}_bars"
+        if table not in {"vix_bars", "vxn_bars"}:
+            return None
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    f"""
+                    WITH daily AS (
+                        SELECT (timestamp AT TIME ZONE 'America/New_York')::date AS d,
+                               (ARRAY_AGG(close ORDER BY timestamp DESC))[1] AS close
+                        FROM {table}
+                        WHERE (timestamp AT TIME ZONE 'America/New_York')::time
+                              BETWEEN TIME '09:30' AND TIME '16:00'
+                        GROUP BY d
+                        ORDER BY d DESC
+                        LIMIT 21
+                    ),
+                    stats AS (
+                        SELECT (ARRAY_AGG(close ORDER BY d DESC))[1] AS latest,
+                               AVG(close) FILTER (WHERE d < (SELECT MAX(d) FROM daily)) AS mean_prior,
+                               STDDEV_SAMP(close) FILTER (WHERE d < (SELECT MAX(d) FROM daily)) AS sd_prior,
+                               COUNT(*) FILTER (WHERE d < (SELECT MAX(d) FROM daily)) AS n_prior
+                        FROM daily
+                    )
+                    SELECT latest, mean_prior, sd_prior, n_prior FROM stats
+                    """,
+                )
+                if row is None or row["latest"] is None or row["mean_prior"] is None:
+                    return None
+                if int(row["n_prior"] or 0) < 15 or (row["sd_prior"] or 0) <= 0:
+                    return None
+                latest = float(row["latest"])
+                mean = float(row["mean_prior"])
+                sd = float(row["sd_prior"])
+                return round((latest - mean) / sd, 4)
+        except Exception as exc:
+            logger.warning("get_vix_z_score_20d failed (%s): %s", ticker, exc)
+            return None
+
+    async def get_top_gamma_nodes(
+        self, symbol: str, k: int = 3
+    ) -> list[Dict[str, Any]]:
+        """Top-K strikes by ``|net_gex|`` from the most recent
+        ``gex_by_strike`` snapshot.  Returns list of {strike, net_gex}
+        sorted by descending absolute magnitude."""
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(
+                    """
+                    WITH latest AS (
+                        SELECT MAX(timestamp) AS ts
+                        FROM gex_by_strike
+                        WHERE underlying = $1
+                    )
+                    SELECT strike, SUM(net_gex) AS net_gex
+                    FROM gex_by_strike
+                    WHERE underlying = $1
+                      AND timestamp = (SELECT ts FROM latest)
+                    GROUP BY strike
+                    ORDER BY ABS(SUM(net_gex)) DESC NULLS LAST
+                    LIMIT $2
+                    """,
+                    symbol, int(k),
+                )
+                return [
+                    {"strike": float(r["strike"]), "net_gex": float(r["net_gex"] or 0.0)}
+                    for r in rows
+                    if r["strike"] is not None
+                ]
+        except Exception as exc:
+            logger.warning("get_top_gamma_nodes failed (%s): %s", symbol, exc)
+            return []
+
+    async def get_walls_by_expiration(
+        self, symbol: str, expiration_date: date
+    ) -> Optional[Dict[str, Optional[float]]]:
+        """Approximate call/put walls restricted to a single expiration.
+
+        Used to isolate 0DTE dealer positioning on OPEX days.  Wall
+        strikes are the highest-|net_gex| strike ABOVE spot (call wall)
+        and BELOW spot (put wall) for that expiration.  Not identical to
+        the analytics engine's smoothed wall algorithm but close enough
+        for a 70/30 blend against the full-chain wall value.
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    WITH latest AS (
+                        SELECT MAX(timestamp) AS ts
+                        FROM gex_by_strike
+                        WHERE underlying = $1 AND expiration = $2
+                    ),
+                    spot AS (
+                        SELECT close::numeric AS s
+                        FROM underlying_quotes
+                        WHERE symbol = $1
+                        ORDER BY timestamp DESC
+                        LIMIT 1
+                    ),
+                    strikes AS (
+                        SELECT strike, net_gex
+                        FROM gex_by_strike
+                        WHERE underlying = $1
+                          AND expiration = $2
+                          AND timestamp = (SELECT ts FROM latest)
+                    )
+                    SELECT
+                        (SELECT strike FROM strikes
+                         WHERE strike >= (SELECT s FROM spot)
+                         ORDER BY ABS(net_gex) DESC NULLS LAST
+                         LIMIT 1) AS call_wall,
+                        (SELECT strike FROM strikes
+                         WHERE strike <= (SELECT s FROM spot)
+                         ORDER BY ABS(net_gex) DESC NULLS LAST
+                         LIMIT 1) AS put_wall
+                    """,
+                    symbol, expiration_date,
+                )
+                if row is None:
+                    return None
+                return {
+                    "call_wall": float(row["call_wall"]) if row["call_wall"] is not None else None,
+                    "put_wall": float(row["put_wall"]) if row["put_wall"] is not None else None,
+                }
+        except Exception as exc:
+            logger.warning(
+                "get_walls_by_expiration failed (%s, %s): %s",
+                symbol, expiration_date, exc,
+            )
+            return None
+
+    async def get_forecast_calibration(self, symbol: str) -> Dict[str, Any]:
+        """Read the current Layer-2 correction scalars for a symbol.
+
+        Falls back to the neutral state ({1.0, 1.0, 0, 0}) with
+        ``n_receipts_used=0`` when no row exists yet — first-ever call
+        for a symbol shouldn't require pre-seeding.
+        """
+        neutral = {
+            "symbol": symbol,
+            "band_width_mult": 1.0,
+            "pin_tolerance_mult": 1.0,
+            "upside_lean": 0.0,
+            "downside_lean": 0.0,
+            "n_receipts_used": 0,
+            "last_calibrated_ts": None,
+        }
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT symbol, band_width_mult, pin_tolerance_mult,
+                           upside_lean, downside_lean, n_receipts_used,
+                           last_calibrated_ts
+                    FROM forecast_calibration_state
+                    WHERE symbol = $1
+                    """,
+                    symbol,
+                )
+                if row is None:
+                    return neutral
+                out = dict(row)
+                for f in ("band_width_mult", "pin_tolerance_mult",
+                          "upside_lean", "downside_lean"):
+                    out[f] = float(out[f]) if out.get(f) is not None else 1.0 if "mult" in f else 0.0
+                out["n_receipts_used"] = int(out.get("n_receipts_used") or 0)
+                return out
+        except Exception as exc:
+            logger.warning("get_forecast_calibration failed (%s): %s", symbol, exc)
+            return neutral
+
+    async def upsert_forecast_calibration(
+        self,
+        symbol: str,
+        band_width_mult: float,
+        pin_tolerance_mult: float,
+        upside_lean: float,
+        downside_lean: float,
+        n_receipts_used: int,
+        summary: Dict[str, Any],
+    ) -> bool:
+        """Write the calibration state for a symbol.  Nightly job caller.
+        Bounds enforcement is the caller's responsibility — this method
+        writes what it's given."""
+        try:
+            async with self._acquire_connection() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO forecast_calibration_state
+                        (symbol, band_width_mult, pin_tolerance_mult,
+                         upside_lean, downside_lean, n_receipts_used,
+                         last_calibrated_ts, last_calibrated_summary)
+                    VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7::jsonb)
+                    ON CONFLICT (symbol) DO UPDATE
+                    SET band_width_mult = EXCLUDED.band_width_mult,
+                        pin_tolerance_mult = EXCLUDED.pin_tolerance_mult,
+                        upside_lean = EXCLUDED.upside_lean,
+                        downside_lean = EXCLUDED.downside_lean,
+                        n_receipts_used = EXCLUDED.n_receipts_used,
+                        last_calibrated_ts = EXCLUDED.last_calibrated_ts,
+                        last_calibrated_summary = EXCLUDED.last_calibrated_summary
+                    """,
+                    symbol,
+                    float(band_width_mult),
+                    float(pin_tolerance_mult),
+                    float(upside_lean),
+                    float(downside_lean),
+                    int(n_receipts_used),
+                    json.dumps(summary),
+                )
+                return True
+        except Exception as exc:
+            logger.warning("upsert_forecast_calibration failed (%s): %s", symbol, exc)
+            return False
