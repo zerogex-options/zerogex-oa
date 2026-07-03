@@ -175,11 +175,22 @@ async def lifespan(app: FastAPI):
                 "timeout": 10.0,
             }
 
+        # Same 1s-LRU-cached signal the HTTP handler uses, so the two
+        # paths' session labels agree at 16:00 ET (previously the
+        # broadcaster shortcut'd close_data_available=True and briefly
+        # disagreed with the HTTP handler while the first post-close
+        # bar was landing).
+        async def _close_data_check(symbol, asset_type):
+            if db_manager is None:
+                return True
+            return await db_manager.has_todays_close_landed(symbol, asset_type)
+
         quote_broadcaster = QuoteBroadcaster(
             connect_kwargs_getter=_listen_kwargs,
             session_computer=lambda asset_type, stable, close_avail: get_market_session(
                 asset_type, stable, close_avail
             ),
+            close_data_check=_close_data_check,
         )
         set_broadcaster(quote_broadcaster)
         await quote_broadcaster.start()

@@ -138,6 +138,37 @@ server {
     server_tokens off;
     client_max_body_size 10m;
 
+    # Dedicated WebSocket handshake route. Split from ``location /``
+    # so we can (a) suppress access_log — the ticket JWT rides in
+    # ?ticket= and the default combined format would log it — and
+    # (b) apply timeouts long enough for the persistent connection
+    # (the app-side idle window is 120s; anything less than that on
+    # nginx would cut connections mid-conversation).
+    location = /ws {
+        proxy_pass http://127.0.0.1:8000/ws;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+
+        # Ticket-in-URL never touches the log.
+        access_log off;
+
+        # Handshake bypasses the response cache — WS is not cacheable
+        # and we don't want the cache_key auth-header ladder here.
+
+        proxy_connect_timeout 15s;
+        proxy_send_timeout 300s;
+        proxy_read_timeout 300s;
+
+        # Handshake-rate cap + concurrent-connection cap.
+        limit_req zone=zerogex_api_per_ip burst=100 nodelay;
+        limit_conn zerogex_ws_per_ip 32;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:8000;
         proxy_http_version 1.1;

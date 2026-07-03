@@ -70,11 +70,13 @@ _MAX_CONNECTIONS = int(os.getenv("WS_MAX_CONNECTIONS_PER_WORKER", "2000"))
 
 # Per-authenticated-user connection cap. Without this, one logged-in
 # caller scripting reconnects can fill the entire worker's slot pool
-# (the workflow-level DoS finding). Set intentionally low — a browser
-# with SPY, QQQ, and SPX tabs each open a socket, so 8 leaves plenty
-# of headroom for legitimate multi-tab use while blocking runaway
-# scripts.
-_MAX_CONNECTIONS_PER_USER = int(os.getenv("WS_MAX_CONNECTIONS_PER_USER", "8"))
+# (the workflow-level DoS finding). Set with headroom for legitimate
+# multi-tab power-users: a user with three symbols × four tabs = 12
+# sockets is a plausible daily-driver pattern. 20 leaves slack for
+# rapid tab churn (where the old socket's slot hasn't yet been
+# released when the new tab opens its own) while still blocking
+# runaway scripts.
+_MAX_CONNECTIONS_PER_USER = int(os.getenv("WS_MAX_CONNECTIONS_PER_USER", "20"))
 
 # Bounded keepalive — an asyncpg ``SELECT 1`` on a silently-dead peer
 # (VPC gateway drop, iptables blackhole, RDS failover mid-flight) can
@@ -107,8 +109,19 @@ class QuoteBroadcaster:
         self,
         connect_kwargs_getter,
         session_computer,
+        close_data_check=None,
     ) -> None:
         self._get_connect_kwargs = connect_kwargs_getter
+        # ``close_data_check(symbol, asset_type) -> Awaitable[bool]`` —
+        # shared with the HTTP handler's ``has_todays_close_landed``.
+        # The HTTP handler queries this before flipping ``session``
+        # from "open" to "after-hours"; the broadcaster must consult
+        # the same signal or the two paths will disagree for up to a
+        # minute around 16:00 ET. The check is 1s-cached inside
+        # ``DatabaseManager``, so the per-notify cost is a dict
+        # lookup once the cache warms. Optional so this file can be
+        # imported/unit-tested without a DB.
+        self._close_data_check = close_data_check
         # ``session_computer(asset_type, price_is_stable, close_data_available)
         # -> str`` — imported from main.py so we don't duplicate the market
         # session state machine. See main.get_market_session.
@@ -351,13 +364,19 @@ class QuoteBroadcaster:
             prices.append(close_val)
             del prices[:-3]
         stable = len(prices) >= 3 and len(set(prices)) == 1
-        # ``close_data_available`` on the fast path is approximated as
-        # True: ingestion by definition has landed at least one bar for
-        # today. Full parity with the HTTP handler would require another
-        # DB round-trip per notify — not worth it; the header multiplexes
-        # this against session-closes anyway.
+        # Query ``close_data_available`` from the same signal the HTTP
+        # handler uses (1s-cached in DatabaseManager) so the two paths
+        # agree at the 16:00 ET boundary. On failure or when no check
+        # is wired we degrade to True — matches the pre-fix behavior
+        # so a broken DB never strands the WS in perpetual "open".
+        close_avail = True
+        if self._close_data_check is not None:
+            try:
+                close_avail = bool(await self._close_data_check(symbol, asset_type))
+            except Exception:
+                close_avail = True
         try:
-            session = self._compute_session(asset_type, stable, True)
+            session = self._compute_session(asset_type, stable, close_avail)
         except Exception:
             session = None
 
