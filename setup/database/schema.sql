@@ -2351,3 +2351,53 @@ CREATE TRIGGER forecast_calibration_state_touch
     BEFORE UPDATE ON forecast_calibration_state
     FOR EACH ROW
     EXECUTE FUNCTION touch_forecast_calibration_state();
+
+-- ============================================================================
+-- newsletter_publications (Beehiiv paid+free newsletter reconciliation)
+-- ============================================================================
+-- One row per (cadence, publication_date) that the publish_beehiiv cron
+-- either committed to Beehiiv or attempted to. Beehiiv is the source of
+-- truth for subscribers; this table is only what WE published. Two roles:
+--
+--   * Idempotency: the publish cron checks this table before firing the
+--     API call — a row with status='published' for today's cadence means
+--     skip, so a re-run of the timer (systemd Persistent=true catchup,
+--     manual re-invocation) can't produce a duplicate post.
+--   * Reconciliation: on failure we still write a row with status='failed'
+--     and error_message so the operator can grep the DB / journalctl to
+--     find what went out and what didn't.
+--
+-- body_html_sha256 is a tamper-evident fingerprint of the rendered
+-- template output — if the template later evolves we can identify which
+-- publications ran under which template version by hash.
+CREATE TABLE IF NOT EXISTS newsletter_publications (
+    id                SERIAL      PRIMARY KEY,
+    cadence           TEXT        NOT NULL,   -- 'daily' | 'weekly'
+    audience          TEXT        NOT NULL,   -- 'free' | 'premium'
+    publication_date  DATE        NOT NULL,
+    beehiiv_post_id   TEXT,
+    beehiiv_url       TEXT,
+    subject_line      TEXT        NOT NULL,
+    body_html_sha256  TEXT        NOT NULL,
+    status            TEXT        NOT NULL,   -- 'pending' | 'published' | 'failed'
+    error_message     TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (cadence, publication_date)
+);
+CREATE INDEX IF NOT EXISTS ix_newsletter_publications_publication_date
+    ON newsletter_publications(publication_date);
+
+CREATE OR REPLACE FUNCTION touch_newsletter_publications()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS newsletter_publications_touch ON newsletter_publications;
+CREATE TRIGGER newsletter_publications_touch
+    BEFORE UPDATE ON newsletter_publications
+    FOR EACH ROW
+    EXECUTE FUNCTION touch_newsletter_publications();
