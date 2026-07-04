@@ -1,0 +1,15 @@
+[Unit]
+Description=Sunday trigger for ZeroGEX Beehiiv weekly review (07:00 ET Sun)
+
+[Timer]
+# Fires 07:00 ET on Sundays.  Deliberately early enough that a stuck
+# publish leaves the operator all morning to intervene before the
+# US-East audience starts opening the inbox.  System TZ on the deploy
+# target is America/New_York.
+OnCalendar=Sun *-*-* 07:00:00
+AccuracySec=1min
+RandomizedDelaySec=60s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,38 @@
+[Unit]
+Description=ZeroGEX Beehiiv weekly newsletter (Sunday Playbook Review — 07:00 ET Sun)
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Publishes the paid weekly "Sunday Playbook Review" to Beehiiv.
+# Requires BOTH the --post flag AND BEEHIIV_API_KEY + BEEHIIV_PUBLICATION_ID
+# in the EnvironmentFile.  Until those are in place, dry-runs to
+# journalctl + newsletter_publications (status='pending').
+ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.publish_beehiiv --cadence weekly --post
+
+TimeoutStartSec=180
+
+Restart=on-failure
+RestartSec=30
+
+MemoryMax=512M
+CPUQuota=50%
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-beehiiv-weekly

@@ -1,0 +1,19 @@
+[Unit]
+Description=Daily trigger for ZeroGEX Beehiiv newsletter (08:30 ET Mon-Fri)
+
+[Timer]
+# Fires 08:30 ET on trading days.  The forecast_writer runs at 07:00 ET
+# so today's row is already committed before this cron picks it up; the
+# service also After=zerogex-oa-forecast-writer so a slow forecast still
+# lets the publish run in the same session.  System TZ is
+# America/New_York on the deploy target — see setup/deploy.sh.
+OnCalendar=Mon..Fri *-*-* 08:30:00
+AccuracySec=1min
+RandomizedDelaySec=45s
+# Catch up after planned downtime — an operator manually stopping the
+# timer overnight shouldn't miss the morning card if the box is back up
+# before the next scheduled fire.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

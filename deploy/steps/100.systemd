@@ -105,6 +105,13 @@ TIMER_UNITS=(
     # docs/design/backtesting-platform.md + docs/design/pattern-calibration.md.
     "zerogex-oa-backtest-archive"
     "zerogex-oa-pattern-calibration"
+    # Beehiiv newsletter publisher (Move 2): daily "GEX Morning Card"
+    # at 08:30 ET Mon-Fri (audience=free) and weekly "Sunday Playbook
+    # Review" at 07:00 ET Sun (audience=premium).  Dry-runs on any
+    # instance that hasn't had BEEHIIV_API_KEY / BEEHIIV_PUBLICATION_ID
+    # set in .env — safe by default.
+    "zerogex-oa-beehiiv-daily"
+    "zerogex-oa-beehiiv-weekly"
 )
 
 # Pre-create writable state directories needed by the timer units above.

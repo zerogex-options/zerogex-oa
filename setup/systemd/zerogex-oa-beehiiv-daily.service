@@ -1,0 +1,49 @@
+[Unit]
+Description=ZeroGEX Beehiiv daily newsletter (GEX Morning Card — 08:30 ET Mon-Fri)
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target postgresql.service zerogex-oa-forecast-writer.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Publishes the free daily "GEX Morning Card" to Beehiiv.  Requires BOTH
+# the --post flag AND BEEHIIV_API_KEY + BEEHIIV_PUBLICATION_ID to be set
+# in the EnvironmentFile — defense in depth so a half-configured rollout
+# cannot accidentally publish.  Until those are in place, every run
+# renders the HTML + writes a status='pending' row to
+# newsletter_publications and emits the HTML preview to journalctl for
+# operator review.
+ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.publish_beehiiv --cadence daily --post
+
+TimeoutStartSec=180
+
+# Idempotent + non-throwing: the job checks newsletter_publications for
+# an already-published (cadence, date) row and skips.  A wedged Beehiiv
+# API call is the only path to non-zero exit; the TimeoutStartSec above
+# bounds that.
+Restart=on-failure
+RestartSec=30
+
+# Resource ceiling — the job's memory footprint is dominated by a small
+# Jinja render + a single POST.  512M / 50% CPU is generous headroom.
+MemoryMax=512M
+CPUQuota=50%
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-beehiiv-daily

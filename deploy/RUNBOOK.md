@@ -433,6 +433,60 @@ Total rollback window: 1–3 min.
 
 ---
 
+## Beehiiv newsletter (Move 2)
+
+The `publish_beehiiv` cron ships two audiences: the free daily "GEX
+Morning Card" at 08:30 ET Mon-Fri and the paid weekly "Sunday Playbook
+Review" at 07:00 ET Sun. Beehiiv is the source of truth for
+subscribers; the `newsletter_publications` table records only what WE
+sent (post id, URL, subject, HTML sha256) so a re-fire of the timer
+after an outage cannot duplicate a post.
+
+**Enable** — after Beehiiv provisioning is done offline (site owner
+creates the publication + paid tier in Beehiiv UI):
+
+```bash
+# In /home/ubuntu/zerogex-oa/.env on the box, add:
+#   BEEHIIV_API_KEY=bk_...
+#   BEEHIIV_PUBLICATION_ID=pub_...
+sudo systemctl daemon-reload
+sudo systemctl enable --now zerogex-oa-beehiiv-daily.timer
+sudo systemctl enable --now zerogex-oa-beehiiv-weekly.timer
+```
+
+Both timers dry-run silently until BOTH env vars are set — the service
+never publishes without `--post` AND both keys present.
+
+**Disable** — pause without uninstalling:
+
+```bash
+sudo systemctl disable --now zerogex-oa-beehiiv-daily.timer
+sudo systemctl disable --now zerogex-oa-beehiiv-weekly.timer
+```
+
+**One-off dry-run** — inspect exactly what would go out before flipping
+env vars on:
+
+```bash
+cd /home/ubuntu/zerogex-oa
+sudo -u ubuntu venv/bin/python -m src.jobs.publish_beehiiv \
+    --cadence daily --dry-run --allow-non-trading-day
+# HTML preview goes to journalctl -u zerogex-oa-beehiiv-daily -n 200
+# A row with status='pending' + body_html_sha256 lands in
+# newsletter_publications for reconciliation.
+```
+
+Force a live re-publish (e.g. Beehiiv 500'd on the scheduled fire and
+the operator wants to retry the same day):
+
+```bash
+# Clear the row so the idempotency check doesn't skip:
+psql -c "DELETE FROM newsletter_publications WHERE cadence='daily' AND publication_date=CURRENT_DATE;"
+sudo systemctl start zerogex-oa-beehiiv-daily.service
+```
+
+---
+
 ## Quick reference
 
 ```bash
