@@ -703,3 +703,108 @@ async def admin_simulate_clear(
         raise HTTPException(status_code=400, detail="bot_ids must be a list of strings")
     with db_connection() as conn:
         return clear(conn, bot_ids=bot_ids)
+
+
+# ---------------------------------------------------------------------------
+# Internal delivery-worker endpoints
+# ---------------------------------------------------------------------------
+#
+# The frontend Node worker at ``scripts/tradeworkz-notify-deliver.mts``
+# polls queued email / webhook notification rows, ships them through
+# Resend / a webhook, and reports success or failure back. Both endpoints
+# require the SIGNALS scope — the same scope the worker's shared
+# ``ZEROGEX_API_TOKEN`` already carries for the BFF proxy. That way we
+# don't invent a new scope just for a one-caller machine credential.
+
+
+@router.get(
+    "/internal/queued-notifications",
+    dependencies=[Depends(require_scopes(SIGNALS))],
+)
+async def internal_queued_notifications(
+    limit: int = Query(default=100, ge=1, le=1000),
+    channel: Optional[str] = Query(default=None, pattern="^(email|webhook)$"),
+    db: DatabaseManager = Depends(get_db),
+) -> Dict[str, Any]:
+    """Return queued email / webhook notification rows for the worker.
+
+    Rows are ordered by ``sent_at`` (which for a queued row is the
+    ``NOW()`` at insert time — effectively FIFO). The worker pulls
+    ``limit`` at a time so a burst of hundreds of exits doesn't stall
+    delivery of newer ones.
+    """
+    async with db.pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT n.id, n.end_user, n.bot_id, b.display_name AS bot_display_name,
+                   n.event_type, n.trade_id, n.position_id, n.channel,
+                   n.status, n.payload, n.sent_at
+            FROM tw_notifications_log n
+            LEFT JOIN tw_bots b ON b.id = n.bot_id
+            WHERE n.status = 'queued'
+              AND ($1::text IS NULL OR n.channel = $1)
+              AND n.channel IN ('email', 'webhook')
+            ORDER BY n.sent_at ASC
+            LIMIT $2
+            """,
+            channel, limit,
+        )
+    entries = []
+    for r in rows:
+        payload = r["payload"] or {}
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        entries.append(
+            {
+                "id": r["id"],
+                "end_user": r["end_user"],
+                "bot_id": r["bot_id"],
+                "bot_display_name": r["bot_display_name"],
+                "event_type": r["event_type"],
+                "trade_id": r["trade_id"],
+                "position_id": r["position_id"],
+                "channel": r["channel"],
+                "status": r["status"],
+                "payload": payload,
+                "sent_at": r["sent_at"].isoformat() if r["sent_at"] else None,
+            }
+        )
+    return {"entries": entries}
+
+
+@router.post(
+    "/internal/mark-notification",
+    dependencies=[Depends(require_scopes(SIGNALS))],
+)
+async def internal_mark_notification(
+    body: Dict[str, Any] = Body(...),
+    db: DatabaseManager = Depends(get_db),
+) -> Dict[str, Any]:
+    """Mark a queued notification row as sent or failed.
+
+    Body:
+        id: BIGINT, the tw_notifications_log row id.
+        status: 'sent' | 'failed'.
+        error: optional string; recorded on failure so an operator can
+               inspect why (bad recipient, Resend rate-limit, transient
+               5xx, etc.).
+    """
+    row_id = body.get("id")
+    status = body.get("status")
+    error = body.get("error")
+    if not isinstance(row_id, int):
+        raise HTTPException(status_code=400, detail="id must be an integer")
+    if status not in ("sent", "failed"):
+        raise HTTPException(status_code=400, detail="status must be 'sent' or 'failed'")
+    async with db.pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE tw_notifications_log
+            SET status = $1,
+                error = $2,
+                sent_at = CASE WHEN $1 = 'sent' THEN NOW() ELSE sent_at END
+            WHERE id = $3
+            """,
+            status, error, row_id,
+        )
+    return {"status": "ok", "id": row_id, "new_status": status, "result": result}
