@@ -1,0 +1,82 @@
+{# Paid weekly "Sunday Playbook Review" — one email each Sunday.
+
+   Sections and their sources:
+
+     * ``accuracy_rows`` — last week's per-signal accuracy stats,
+                          pulled from playbook_pattern_stats.
+     * ``deep_dive``     — one playbook pattern that fired: setup,
+                          entry, exit, PnL if backtestable.
+     * ``landscape``     — next week's macro-adjacent gamma landscape
+                          summary paragraph (from GEX historical stats).
+     * ``postmortem``    — one backtest post-mortem paragraph (from the
+                          most recent backtest_runs row for the paying tier).
+
+   Every section is optional; a run with only one section still ships.
+#}
+<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 640px; margin: 0 auto; color: #111; line-height: 1.55;">
+
+  <p style="font-size: 14px; color: #666; margin: 0 0 8px 0;">
+    Sunday Playbook Review &middot; Week of {{ week_start_label }}
+  </p>
+  <h1 style="font-size: 22px; font-weight: 700; margin: 0 0 24px 0;">
+    Last week's tape, next week's setup.
+  </h1>
+
+  {% if accuracy_rows %}
+  <h2 style="font-size: 15px; font-weight: 600; margin: 0 0 8px 0; color: #333;">
+    Signal accuracy — last 7 sessions
+  </h2>
+  <table role="presentation" cellspacing="0" cellpadding="0" style="width: 100%; border-collapse: collapse; margin: 0 0 24px 0;">
+    <thead>
+      <tr style="text-align: left; font-size: 12px; color: #666; text-transform: uppercase; letter-spacing: 0.5px;">
+        <th style="padding: 6px 8px; border-bottom: 1px solid #e5e5e5;">Pattern</th>
+        <th style="padding: 6px 8px; border-bottom: 1px solid #e5e5e5;">Symbol</th>
+        <th style="padding: 6px 8px; border-bottom: 1px solid #e5e5e5;">Resolved</th>
+        <th style="padding: 6px 8px; border-bottom: 1px solid #e5e5e5;">Hit rate</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in accuracy_rows %}
+      <tr style="font-size: 14px;">
+        <td style="padding: 8px; border-bottom: 1px solid #f0f0f0;">{{ row.pattern }}</td>
+        <td style="padding: 8px; border-bottom: 1px solid #f0f0f0;">${{ row.underlying }}</td>
+        <td style="padding: 8px; border-bottom: 1px solid #f0f0f0;">{{ row.n_resolved }}</td>
+        <td style="padding: 8px; border-bottom: 1px solid #f0f0f0;">{{ row.hit_rate }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  {% if deep_dive %}
+  <h2 style="font-size: 15px; font-weight: 600; margin: 0 0 8px 0; color: #333;">
+    Pattern deep dive: {{ deep_dive.pattern }}
+  </h2>
+  <p style="margin: 0 0 8px 0;"><strong>Setup:</strong> {{ deep_dive.setup }}</p>
+  <p style="margin: 0 0 8px 0;"><strong>Entry:</strong> {{ deep_dive.entry }}</p>
+  <p style="margin: 0 0 8px 0;"><strong>Exit:</strong> {{ deep_dive.exit }}</p>
+  {% if deep_dive.pnl %}
+  <p style="margin: 0 0 24px 0;"><strong>Realized PnL:</strong> {{ deep_dive.pnl }}</p>
+  {% endif %}
+  {% endif %}
+
+  {% if landscape %}
+  <h2 style="font-size: 15px; font-weight: 600; margin: 0 0 8px 0; color: #333;">
+    Next week's landscape
+  </h2>
+  <p style="margin: 0 0 24px 0;">{{ landscape }}</p>
+  {% endif %}
+
+  {% if postmortem %}
+  <h2 style="font-size: 15px; font-weight: 600; margin: 0 0 8px 0; color: #333;">
+    Backtest post-mortem
+  </h2>
+  <p style="margin: 0 0 24px 0;">{{ postmortem }}</p>
+  {% endif %}
+
+  <p style="font-size: 12px; color: #999; margin-top: 32px; border-top: 1px solid #e5e5e5; padding-top: 12px;">
+    This newsletter uses derived analytics computed by ZeroGEX. We do not
+    redistribute raw exchange quotes. Data sourced via TradeStation.
+  </p>
+
+</div>

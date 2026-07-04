@@ -1,0 +1,83 @@
+{# Free daily "GEX Morning Card" — one email per trading morning.
+
+   Data comes from three places, all derived numbers (see the license-
+   safety footer for why we never redistribute raw NBBO):
+
+     * ``recap``   — yesterday's session recap paragraph, pulled from
+                     the scorecard artifact for the prior trading day.
+     * ``levels``  — today's projected gamma flip / call wall / put wall
+                     for each symbol we forecast (SPY / SPX / QQQ).
+     * ``pattern`` — one playbook pattern likely to trigger today, pulled
+                     from the flagship_setup blob on today's forecast row.
+
+   Missing sections quietly degrade — a broken row on one symbol doesn't
+   kill the whole email. See src/jobs/publish_beehiiv.py for the render
+   contract.
+#}
+<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 640px; margin: 0 auto; color: #111; line-height: 1.55;">
+
+  <p style="font-size: 14px; color: #666; margin: 0 0 8px 0;">
+    GEX Morning Card &middot; {{ headline_date }}
+  </p>
+  <h1 style="font-size: 22px; font-weight: 700; margin: 0 0 24px 0;">
+    Today's dealer gamma map.
+  </h1>
+
+  {% if recap %}
+  <h2 style="font-size: 15px; font-weight: 600; margin: 0 0 8px 0; color: #333;">
+    Yesterday's tape
+  </h2>
+  <p style="margin: 0 0 24px 0;">{{ recap }}</p>
+  {% endif %}
+
+  {% if levels %}
+  <h2 style="font-size: 15px; font-weight: 600; margin: 0 0 8px 0; color: #333;">
+    Today's key levels
+  </h2>
+  <table role="presentation" cellspacing="0" cellpadding="0" style="width: 100%; border-collapse: collapse; margin: 0 0 24px 0;">
+    <thead>
+      <tr style="text-align: left; font-size: 12px; color: #666; text-transform: uppercase; letter-spacing: 0.5px;">
+        <th style="padding: 6px 8px; border-bottom: 1px solid #e5e5e5;">Symbol</th>
+        <th style="padding: 6px 8px; border-bottom: 1px solid #e5e5e5;">Gamma Flip</th>
+        <th style="padding: 6px 8px; border-bottom: 1px solid #e5e5e5;">Call Wall</th>
+        <th style="padding: 6px 8px; border-bottom: 1px solid #e5e5e5;">Put Wall</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in levels %}
+      <tr style="font-size: 14px;">
+        <td style="padding: 8px; border-bottom: 1px solid #f0f0f0; font-weight: 600;">${{ row.symbol }}</td>
+        <td style="padding: 8px; border-bottom: 1px solid #f0f0f0;">{{ row.gamma_flip }}</td>
+        <td style="padding: 8px; border-bottom: 1px solid #f0f0f0;">{{ row.call_wall }}</td>
+        <td style="padding: 8px; border-bottom: 1px solid #f0f0f0;">{{ row.put_wall }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  {% if pattern %}
+  <h2 style="font-size: 15px; font-weight: 600; margin: 0 0 8px 0; color: #333;">
+    One pattern to watch
+  </h2>
+  <p style="margin: 0 0 4px 0;"><strong>{{ pattern.name }}</strong> &middot; ${{ pattern.symbol }}</p>
+  <p style="margin: 0 0 24px 0;">{{ pattern.rationale }}</p>
+  {% endif %}
+
+  <div style="border-top: 1px solid #e5e5e5; padding-top: 16px; margin-top: 24px;">
+    <p style="margin: 0 0 8px 0;">
+      Want the deep dive? The <strong>Sunday Playbook Review</strong> covers
+      last week's signal accuracy, one pattern that fired end-to-end, and
+      next week's macro-adjacent gamma landscape.
+    </p>
+    <p style="margin: 0 0 16px 0;">
+      <a href="{{ upgrade_url }}" style="background: #111; color: #fff; padding: 10px 16px; text-decoration: none; border-radius: 6px; display: inline-block; font-weight: 600;">Upgrade to weekly ($15/mo)</a>
+    </p>
+  </div>
+
+  <p style="font-size: 12px; color: #999; margin-top: 32px; border-top: 1px solid #e5e5e5; padding-top: 12px;">
+    This newsletter uses derived analytics computed by ZeroGEX. We do not
+    redistribute raw exchange quotes. Data sourced via TradeStation.
+  </p>
+
+</div>

@@ -17,6 +17,7 @@ import logging
 import json
 
 from src.analytics.walls import compute_call_put_walls
+from src.api.queries.newsletter import NewsletterQueriesMixin
 from src.api.queries.signals import SignalsQueriesMixin
 from src.database.password_providers import resolve_db_credentials
 from src.api.queries.technicals import TechnicalsQueriesMixin
@@ -403,7 +404,9 @@ def _historical_context_for(
     }
 
 
-class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
+class DatabaseManager(
+    SignalsQueriesMixin, TechnicalsQueriesMixin, NewsletterQueriesMixin,
+):
     """Manages database connections and queries"""
 
     def __init__(self):
