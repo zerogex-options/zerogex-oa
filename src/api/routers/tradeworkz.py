@@ -705,6 +705,113 @@ async def admin_simulate_clear(
         return clear(conn, bot_ids=bot_ids)
 
 
+@router.post(
+    "/admin/inject-test-event",
+    dependencies=[Depends(require_scopes(SIGNALS))],
+)
+async def admin_inject_test_event(
+    body: Dict[str, Any] = Body(...),
+) -> Dict[str, Any]:
+    """Synthesize a fake entry / exit / lifecycle notification for a bot.
+
+    Drives the same ``notifications.fanout_event`` helper the reconciler
+    uses on real ticks, so every follower of the bot whose channel
+    preferences include the enabled channel gets a row in
+    ``tw_notifications_log``:
+      * in_app  — status='sent' (visible in the bell immediately)
+      * email   — status='queued' (delivery worker picks it up ≤60s)
+      * webhook — status='queued' (delivery worker not yet wired)
+
+    Body:
+        bot_id (required): the bot to attribute the fake event to.
+        event_type: 'entry' | 'exit' | 'both'. Default 'exit'.
+        payload: optional dict of overrides merged over the synthesized
+                 default payload for the event type.
+    """
+    from src.database import db_connection
+    from src.tradeworkz.notifications import fanout_event
+
+    bot_id = body.get("bot_id")
+    if not isinstance(bot_id, str) or not bot_id:
+        raise HTTPException(status_code=400, detail="bot_id (string) is required")
+    event_type = body.get("event_type") or "exit"
+    if event_type not in ("entry", "exit", "both"):
+        raise HTTPException(
+            status_code=400,
+            detail="event_type must be one of 'entry', 'exit', 'both'",
+        )
+    payload_overrides = body.get("payload") or {}
+    if not isinstance(payload_overrides, dict):
+        raise HTTPException(status_code=400, detail="payload must be an object")
+
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, display_name FROM tw_bots WHERE id = %s",
+            (bot_id,),
+        )
+        bot_row = cur.fetchone()
+        if not bot_row:
+            raise HTTPException(status_code=404, detail=f"Bot {bot_id!r} not found")
+
+        entry_default: Dict[str, Any] = {
+            "underlying": "SPY",
+            "direction": "bullish",
+            "strategy_type": "BUY_CALL_DEBIT",
+            "conviction": 0.72,
+            "contracts": 4,
+            "entry_price": 3.15,
+            "target_price": 4.20,
+            "stop_price": 2.80,
+            "rationale": "Injected test entry: put-wall rejection at 578 in positive-γ regime.",
+            "test": True,
+        }
+        exit_default: Dict[str, Any] = {
+            "underlying": "SPY",
+            "direction": "bullish",
+            "strategy_type": "BUY_CALL_DEBIT",
+            "outcome": "win",
+            "realized_pnl": 348.0,
+            "pnl_percent": 0.276,
+            "reason": "target",
+            "contracts": 4,
+            "entry_price": 3.15,
+            "exit_price": 4.02,
+            "conviction": 0.72,
+            "test": True,
+        }
+
+        written = {"entry": 0, "exit": 0}
+        if event_type in ("entry", "both"):
+            entry_payload = {**entry_default, **payload_overrides}
+            written["entry"] = fanout_event(
+                conn,
+                bot_id=bot_id,
+                event_type="entry",
+                payload=entry_payload,
+            )
+        if event_type in ("exit", "both"):
+            exit_payload = {**exit_default, **payload_overrides}
+            written["exit"] = fanout_event(
+                conn,
+                bot_id=bot_id,
+                event_type="exit",
+                payload=exit_payload,
+            )
+
+    return {
+        "status": "ok",
+        "bot_id": bot_id,
+        "bot_display_name": bot_row[1],
+        "event_type": event_type,
+        "notifications_written": written,
+        "note": (
+            "in_app rows are visible in the bell immediately. email rows "
+            "will be picked up by zerogex-web-tradeworkz-notify.timer within a minute."
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Internal delivery-worker endpoints
 # ---------------------------------------------------------------------------
