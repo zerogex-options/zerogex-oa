@@ -3735,6 +3735,11 @@ bulletin-tweet-close-post: ## Post today's post-market bulletin tweet (needs X_B
 		$(if $(BULLETIN_TWEET_SYMBOLS),--symbols $(BULLETIN_TWEET_SYMBOLS)) \
 		$(if $(BULLETIN_TWEET_LEAD_SYMBOL),--lead-symbol $(BULLETIN_TWEET_LEAD_SYMBOL))
 
+.PHONY: bulletin-tweet-bootstrap
+bulletin-tweet-bootstrap: ## One-shot runtime bootstrap (idempotent): ffmpeg + Node + Playwright + Chromium + directories
+	@echo "$(BLUE)=== Bootstrapping Bulletin Tweet runtime ===$(NC)"
+	@bash deploy/steps/205.bulletin_tweet_setup
+
 .PHONY: bulletin-tweet-install
 bulletin-tweet-install: ## Install all three bulletin tweet timers (09:15, 12:30, 16:05 ET Mon-Fri)
 	@echo "$(BLUE)=== Installing Live Bulletin Tweet Timers ===$(NC)"
