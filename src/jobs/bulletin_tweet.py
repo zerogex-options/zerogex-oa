@@ -647,9 +647,16 @@ def _run_frontend_helper(
     Shared by both media helpers so their failure-logging and non-zero-
     exit handling stays consistent. Any non-zero exit or empty output
     file returns None and logs a warning — the caller degrades to a
-    text-only (or PNG-only) tweet."""
+    text-only (or PNG-only) tweet.
+
+    Systemd runs with a stripped PATH — nvm-installed node isn't
+    reachable via bare ``node``.  Operators can either symlink node
+    into /usr/local/bin OR set ``BULLETIN_TWEET_NODE_BINARY`` in .env
+    to the full path (e.g.
+    ``/home/ubuntu/.nvm/versions/node/v22.22.2/bin/node``)."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = ["node", str(helper), *cmd_args]
+    node_bin = os.environ.get("BULLETIN_TWEET_NODE_BINARY", "").strip() or "node"
+    cmd = [node_bin, str(helper), *cmd_args]
     try:
         proc = subprocess.run(  # noqa: S603 — args are constructed in-process
             cmd,
@@ -1138,6 +1145,10 @@ def _call_notify_hook(
     the staging job."""
     hook = os.environ.get("BULLETIN_TWEET_NOTIFY_HOOK", "").strip()
     if not hook:
+        logger.info(
+            "bulletin_tweet: no BULLETIN_TWEET_NOTIFY_HOOK configured — "
+            "skipping notification (operator polls artifact dir)",
+        )
         return
     hook_path = Path(hook)
     if not hook_path.exists():
@@ -1154,8 +1165,9 @@ def _call_notify_hook(
     env["BULLETIN_TWEET_HAS_PNG"] = "1" if media.png_path else "0"
     env["BULLETIN_TWEET_HAS_CLIP"] = "1" if media.clip_path else "0"
     env["BULLETIN_TWEET_LEAD_SYMBOL"] = tweet.lead_symbol
+    logger.info("bulletin_tweet: calling notify hook %s", hook_path)
     try:
-        subprocess.run(  # noqa: S603
+        proc = subprocess.run(  # noqa: S603
             [str(hook_path), mode, str(artifact_dir)],
             env=env,
             timeout=30,
@@ -1165,6 +1177,17 @@ def _call_notify_hook(
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("bulletin_tweet: notify hook failed (%s) — %s", hook_path, exc)
+        return
+    if proc.returncode != 0:
+        logger.warning(
+            "bulletin_tweet: notify hook exited %d (stdout=%r stderr=%r)",
+            proc.returncode, proc.stdout[:500], proc.stderr[:500],
+        )
+    else:
+        logger.info(
+            "bulletin_tweet: notify hook exited 0 — stdout: %s",
+            proc.stdout.strip()[:500] or "<empty>",
+        )
 
 
 # ---------------------------------------------------------------------------
