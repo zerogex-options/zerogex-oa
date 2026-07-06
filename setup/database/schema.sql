@@ -2207,16 +2207,26 @@ CREATE INDEX IF NOT EXISTS idx_backtest_runs_sweep ON backtest_runs(sweep_id, id
 -- EXISTS. Re-running the file on a fresh DB or on a partially-migrated DB
 -- both converge to the same target state.
 
--- 9.1 Wipe legacy Signaled-Trade blotter tables — narrow, surgical scope:
---     only the tables that back the OLD /trading-signals page and the
---     single-portfolio reconciler. The MSI composite (signal_scores,
---     signal_component_scores), independent-signal events (signal_events),
---     and normalizer cache stay in place — they feed the /signal-score and
---     /advanced-signals pages which remain live.
-DROP TABLE IF EXISTS signal_action_cards CASCADE;
-DROP TABLE IF EXISTS portfolio_snapshots CASCADE;
-DROP TABLE IF EXISTS signal_trades CASCADE;
-DROP FUNCTION IF EXISTS prevent_closed_signal_trade_updates() CASCADE;
+-- 9.1 Legacy Signaled-Trade blotter tables STAY IN PLACE.
+--
+-- Earlier drafts of this block wiped signal_trades / portfolio_snapshots
+-- / signal_action_cards CASCADE, then relied on the CREATE TABLE IF NOT
+-- EXISTS higher up in this file to recreate them empty on the next apply.
+-- That was wrong for two reasons:
+--   (a) schema.sql is applied on every deploy, so the wipe kept firing
+--       on every rollout — no help for the "one-time migration" intent.
+--   (b) The legacy MSI signal engine (zerogex-oa-signals.service) still
+--       writes signal_scores / signal_component_scores / signal_events
+--       (which /signal-score and /advanced-signals consume) AND writes
+--       signal_trades / signal_action_cards on the same tick. Every
+--       between-deploy window the tables came back empty, but the wipe
+--       reset them again on the next schema-apply, so the service
+--       error-logged "relation signal_trades does not exist" ~200x/hour.
+-- Fix: don't wipe. The tables persist and accept writes; nothing user-
+-- facing reads them (the old /trading-signals page is now TradeWorkz).
+-- A one-time truncation, if ever desired, is an operator ad-hoc
+-- (`TRUNCATE signal_trades, signal_action_cards, portfolio_snapshots`),
+-- not a permanent schema.sql statement.
 
 -- 9.2 Bot registry — every TradeWorkz bot the engine can run.
 CREATE TABLE IF NOT EXISTS tw_bots (
