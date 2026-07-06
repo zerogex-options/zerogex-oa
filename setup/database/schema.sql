@@ -56,6 +56,59 @@ BEGIN
     END IF;
 END $$;
 
+-- =============================================================================
+-- session_levels — captured pre-market + previous-session high/low
+-- =============================================================================
+-- One row per (symbol, ET trading date), written by the
+-- ``src.jobs.session_levels`` capture job (systemd timer: every 5 min
+-- through the 04:00-09:30 ET pre-market window plus a 10:00 ET finalize
+-- pass).  Only non-index symbols (ETFs/equities such as SPY, QQQ) get
+-- rows — cash indexes (SPX, NDX, …) have no pre-market print, so the
+-- job skips them and ``/api/market/session-levels`` reports
+-- ``is_index: true`` with null levels instead.
+--
+--   premarket_high/low     — high/low of the 04:00-09:30 ET pre-market
+--                            session of ``trading_date``.  Updated live
+--                            on each timer tick while the pre-market is
+--                            in progress; final after the 09:30 open.
+--   prev_session_high/low  — high/low of the previous trading day's
+--                            regular session (09:30-16:00 ET; 09:30-13:00
+--                            on NYSE half-days), including the closing
+--                            auction print (the 16:00 bar's open — same
+--                            asset-aware close rule get_session_closes
+--                            applies for non-INDEX symbols).
+--   *_source               — provenance: 'tradestation' (bars API),
+--                            'underlying_quotes' (1-min bar aggregate),
+--                            or 'tradestation+underlying_quotes' (union).
+CREATE TABLE IF NOT EXISTS session_levels (
+    symbol VARCHAR(10) NOT NULL,
+    trading_date DATE NOT NULL,
+    premarket_high NUMERIC(12, 4),
+    premarket_low NUMERIC(12, 4),
+    premarket_source VARCHAR(40),
+    prev_session_date DATE,
+    prev_session_high NUMERIC(12, 4),
+    prev_session_low NUMERIC(12, 4),
+    prev_session_source VARCHAR(40),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (symbol, trading_date),
+    CHECK (premarket_high IS NULL OR premarket_low IS NULL OR premarket_high >= premarket_low),
+    CHECK (prev_session_high IS NULL OR prev_session_low IS NULL OR prev_session_high >= prev_session_low)
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_levels_symbol_date_desc
+    ON session_levels(symbol, trading_date DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_session_levels_symbol') THEN
+        ALTER TABLE session_levels
+        ADD CONSTRAINT fk_session_levels_symbol
+        FOREIGN KEY (symbol) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS option_chains (
     option_symbol VARCHAR(50) NOT NULL,
     timestamp TIMESTAMPTZ NOT NULL,

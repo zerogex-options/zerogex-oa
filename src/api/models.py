@@ -399,6 +399,36 @@ class SessionCloses(BaseModel):
         }
 
 
+class SessionLevels(BaseModel):
+    """Pre-market + previous-session high/low for the chart level overlays.
+
+    ``is_index`` is True for cash indexes (SPX, NDX, …) — they have no
+    pre-market print, so all level fields are null and the frontend skips
+    drawing.  ``trading_date`` is the ET date whose pre-market the
+    ``premarket_*`` fields describe; ``prev_session_*`` describe the
+    regular session of ``prev_session_date``.  ``source`` records
+    provenance (``captured`` / ``live`` / ``captured+live``).
+    """
+
+    symbol: str
+    is_index: bool = False
+    trading_date: Optional[date] = None
+    premarket_high: Optional[Decimal] = None
+    premarket_low: Optional[Decimal] = None
+    prev_session_date: Optional[date] = None
+    prev_session_high: Optional[Decimal] = None
+    prev_session_low: Optional[Decimal] = None
+    source: Optional[str] = None
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+        json_encoders = {
+            Decimal: lambda v: float(v) if v is not None else None,
+            datetime: lambda v: v.isoformat() if v is not None else None,
+        }
+
+
 class MaxPainPoint(BaseModel):
     expiration: date | None = None
     settlement_price: Decimal

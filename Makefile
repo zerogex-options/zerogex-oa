@@ -3546,6 +3546,40 @@ forecast-receipt: ## Write today's receipt against the immutable morning commitm
 		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
 		$(if $(FORECAST_SYMBOLS),--symbol $(FORECAST_SYMBOLS))
 
+.PHONY: session-levels-dry-run
+session-levels-dry-run: ## Dry-run the session-levels capture (pre-market + prev-session H/L; never writes)
+	@echo "$(BLUE)=== Dry-run session-levels capture ===$(NC)"
+	@$(PY) -m src.jobs.session_levels --dry-run \
+		$(if $(SESSION_LEVELS_DATE),--date $(SESSION_LEVELS_DATE)) \
+		$(if $(SESSION_LEVELS_SYMBOLS),--symbols $(SESSION_LEVELS_SYMBOLS))
+
+.PHONY: session-levels
+session-levels: ## Capture pre-market + previous-session high/low into session_levels
+	@echo "$(BLUE)=== Capturing session levels (pre-market + prev-session H/L) ===$(NC)"
+	@$(PY) -m src.jobs.session_levels \
+		$(if $(SESSION_LEVELS_DATE),--date $(SESSION_LEVELS_DATE)) \
+		$(if $(SESSION_LEVELS_SYMBOLS),--symbols $(SESSION_LEVELS_SYMBOLS))
+
+.PHONY: session-levels-install
+session-levels-install: ## Install the session-levels capture timer (every 5 min 04:00-09:55 ET + 10:00 finalize; Mon-Fri)
+	@echo "$(BLUE)=== Installing session-levels timer ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-session-levels.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-session-levels.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-session-levels.timer
+	@echo "$(GREEN)✅ session-levels timer installed (04:00-09:55 ET every 5 min + 10:00 finalize; Mon-Fri)$(NC)"
+	@echo "$(YELLOW)Status:  systemctl list-timers 'zerogex-oa-session-levels*'$(NC)"
+	@echo "$(YELLOW)Logs:    journalctl -u zerogex-oa-session-levels$(NC)"
+
+.PHONY: session-levels-status
+session-levels-status: ## Show the session-levels timer + last run logs
+	@echo "$(BLUE)=== Session-levels timer ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-session-levels.timer' || true
+	@echo ""
+	@systemctl status zerogex-oa-session-levels.service --no-pager -l || true
+	@echo ""
+	@sudo journalctl -u zerogex-oa-session-levels -n 30 --no-pager || true
+
 .PHONY: forecast-calibrate-dry-run
 forecast-calibrate-dry-run: ## Dry-run tonight's Layer-2 calibration nudges (never writes)
 	@$(PY) -m src.jobs.forecast_calibrate --dry-run \

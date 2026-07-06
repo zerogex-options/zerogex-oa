@@ -37,6 +37,7 @@ from .models import (
     FlowBuyingPressurePoint,
     UnderlyingQuote,
     SessionCloses,
+    SessionLevels,
     HealthStatus,
     MaxPainCurrent,
     MaxPainTimeseriesPoint,
@@ -1138,6 +1139,39 @@ async def get_session_closes(symbol: str = Query(default="SPY")):
     if not data:
         raise HTTPException(status_code=404, detail="No session close data available")
     return SessionCloses(**data)
+
+
+@app.get(
+    "/api/market/session-levels",
+    response_model=SessionLevels,
+    tags=["Market Data"],
+    dependencies=[_scope_market_raw],
+)
+@handle_api_errors("GET /api/market/session-levels")
+async def get_session_levels(symbol: str = Query(default="SPY")):
+    """
+    Get pre-market and previous-session high/low levels for a symbol.
+
+    Non-index symbols only (ETFs/equities such as SPY, QQQ) — cash indexes
+    have no pre-market print, so they return ``is_index: true`` with null
+    levels and no 404.
+
+    - premarket_high / premarket_low: high/low of today's 04:00-09:30 ET
+      pre-market session (live-updating while the pre-market is in
+      progress, final after the open).
+    - prev_session_high / prev_session_low: high/low of the previous
+      trading day's regular session (09:30-16:00 ET), including the
+      closing auction print.
+
+    Levels roll at the start of each new pre-market session (04:00 ET),
+    not at the close — the same anchoring traders use for PDH/PDL lines.
+    Source of record is the ``session_levels`` capture job; the endpoint
+    falls back to a live 1-min-bar aggregate when no captured row exists.
+    """
+    data = await _db().get_session_levels(symbol)
+    if not data:
+        raise HTTPException(status_code=404, detail="No session level data available")
+    return SessionLevels(**data)
 
 
 @app.get(

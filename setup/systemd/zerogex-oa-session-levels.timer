@@ -1,0 +1,26 @@
+[Unit]
+Description=Recurring trigger for ZeroGEX session-levels capture (pre-market ticks + 10:00 ET finalize)
+
+[Timer]
+# Server timezone is America/New_York (deploy/steps/010.setup), so these
+# calendar expressions are ET.
+#
+# Every 5 minutes through the 04:00-09:55 ET window: the first tick at
+# 04:00 seeds the row with the previous session's high/low the moment the
+# new pre-market opens, and each subsequent tick ratchets the pre-market
+# high/low outward as the session extends (the upsert never clobbers, so
+# overlapping runs are harmless).
+OnCalendar=Mon..Fri *-*-* 04..09:00/5:00
+# One finalize pass after the 09:30 open so the pre-market extremes are
+# complete even if the 09:55 tick fired mid-window on a delayed feed.
+OnCalendar=Mon..Fri *-*-* 10:00:00
+# Small jitter only — pre-market ticks should land close to their slot so
+# the chart overlays track the live session.
+RandomizedDelaySec=20
+# Catch up after downtime: the job captures the full pre-market window
+# historically (TradeStation bars fetch), so a single late run after a
+# reboot still produces today's complete levels.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
