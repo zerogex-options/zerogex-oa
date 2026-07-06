@@ -1,0 +1,230 @@
+#!/bin/bash
+
+# ==============================================
+# Step 205: Bulletin Tweet Runtime Setup
+# ==============================================
+# Idempotent bootstrap for everything the bulletin-tweet cron needs
+# at runtime that isn't already covered by earlier steps:
+#
+#   * State + tmp directories under /var/lib/zerogex-oa and
+#     /var/log/playwright-browsers.
+#   * ffmpeg for MP4 transcoding of the replay clip.
+#   * Node.js 20 via NodeSource (for the frontend helpers).
+#   * A /usr/local/bin/node symlink so systemd (which runs with a
+#     stripped PATH) can find the nvm-installed binary.
+#   * Playwright + Chromium in the frontend workspace, browsers
+#     redirected to /var/log/playwright-browsers so root doesn't
+#     fill up.
+#   * A smoke test that verifies the render-bulletin-png.mjs helper
+#     produces a real PNG.
+#
+# Every step is guarded — if the piece is already installed / set up,
+# the step is a no-op.  Safe to run any number of times to bring a
+# fresh host into the same working state we hand-built the first time.
+#
+# Not run by ./deploy.sh by default (the earlier scripted setup steps
+# are for the always-on services); run this once by hand when you
+# stand up bulletin-tweet on a new host:
+#
+#     bash deploy/steps/205.bulletin_tweet_setup
+
+set -e
+
+# ``log`` is defined by deploy/lib/common.sh (source when running
+# under ./deploy.sh).  When invoked stand-alone, fall through to
+# plain echo.
+if ! command -v log >/dev/null 2>&1; then
+    log() { echo "$@"; }
+fi
+
+log "Bulletin Tweet Runtime Setup"
+
+APP_DIR="${APP_DIR:-$HOME/zerogex-oa}"
+WEB_DIR="${WEB_DIR:-$HOME/zerogex-web}"
+
+if [ ! -d "$APP_DIR" ]; then
+    log "  ✗ zerogex-oa directory not found: $APP_DIR"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 1. Directory layout
+# ---------------------------------------------------------------------------
+
+log "  → Creating runtime directories..."
+
+# Artifact directory the tweet job writes drafts to.  Systemd unit
+# lists this in ReadWritePaths= so the job can write under
+# ProtectSystem=strict.
+sudo install -d -o ubuntu -g ubuntu -m 0755 /var/lib/zerogex-oa/bulletin-tweets
+log "     ✓ /var/lib/zerogex-oa/bulletin-tweets"
+
+# Playwright's temp scratch dir (TMPDIR).  Must be writable from the
+# systemd sandbox; /tmp is PrivateTmp'd, and /var/log/* is read-only
+# under ProtectSystem=strict, so we plant it under /var/lib.
+sudo install -d -o ubuntu -g ubuntu -m 0755 /var/lib/zerogex-oa/playwright-tmp
+log "     ✓ /var/lib/zerogex-oa/playwright-tmp"
+
+# Chromium browser binaries — put here rather than $HOME so /var/log's
+# 10G volume absorbs the ~450MB installed size rather than /'s 6-10G.
+sudo install -d -o ubuntu -g ubuntu -m 0755 /var/log/playwright-browsers
+log "     ✓ /var/log/playwright-browsers"
+
+# ---------------------------------------------------------------------------
+# 2. ffmpeg (for the replay-clip helper's WebM → MP4 transcode)
+# ---------------------------------------------------------------------------
+
+log "  → Ensuring ffmpeg..."
+if command -v ffmpeg >/dev/null; then
+    log "     ✓ ffmpeg already installed ($(ffmpeg -version | head -1 | awk '{print $3}'))"
+else
+    log "     • Installing ffmpeg (this pulls in ~130 pkgs / 300MB)..."
+    sudo apt-get update -qq
+    sudo apt-get install -y -qq ffmpeg
+    log "     ✓ ffmpeg installed"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Node.js 20 via NodeSource
+# ---------------------------------------------------------------------------
+
+log "  → Ensuring Node.js 20..."
+if command -v node >/dev/null && node --version | grep -qE '^v(20|22)\.'; then
+    log "     ✓ node $(node --version) already installed"
+else
+    log "     • Installing Node.js 20..."
+    curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+    sudo apt-get install -y -qq nodejs
+    log "     ✓ node $(node --version) installed"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Symlink node into /usr/local/bin (systemd's PATH doesn't include
+#    nvm's ~/.nvm/versions/node/*/bin, so systemd services can't find
+#    a bare ``node`` — the ln here fixes it once).
+# ---------------------------------------------------------------------------
+
+log "  → Ensuring /usr/local/bin/node symlink..."
+if [ -e /usr/local/bin/node ] && [ -e /usr/local/bin/npm ]; then
+    log "     ✓ symlinks already in place"
+else
+    sudo ln -sf "$(readlink -f "$(command -v node)")" /usr/local/bin/node
+    sudo ln -sf "$(readlink -f "$(command -v npm)")"  /usr/local/bin/npm
+    log "     ✓ /usr/local/bin/{node,npm} -> $(readlink -f "$(command -v node)")"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Playwright + Chromium in the zerogex-web workspace
+# ---------------------------------------------------------------------------
+
+if [ -d "$WEB_DIR/frontend" ]; then
+    log "  → Ensuring Playwright + Chromium (browsers → /var/log/playwright-browsers)..."
+    export PLAYWRIGHT_BROWSERS_PATH=/var/log/playwright-browsers
+    export TMPDIR=/var/lib/zerogex-oa/playwright-tmp
+
+    if [ -d "$WEB_DIR/frontend/node_modules/playwright" ]; then
+        log "     ✓ node_modules/playwright already installed"
+    else
+        (cd "$WEB_DIR/frontend" && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install --no-save --silent playwright)
+        log "     ✓ npm install playwright completed"
+    fi
+
+    # Playwright organizes browsers as chromium-<version>/chrome-linux/chrome.
+    # If ANY subdirectory matching that pattern exists, we've already
+    # downloaded — skip the ~450MB fetch on re-runs.
+    if compgen -G "/var/log/playwright-browsers/chromium-*/chrome-linux*/chrome" >/dev/null; then
+        log "     ✓ Chromium already downloaded"
+    else
+        log "     • Downloading Chromium (~450MB)..."
+        (cd "$WEB_DIR/frontend" && npx --yes playwright install chromium)
+        log "     ✓ Chromium installed"
+    fi
+else
+    log "  ⚠ Skipping Playwright — $WEB_DIR/frontend not found"
+    log "    (clone zerogex-web into $WEB_DIR, then re-run this step)"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Verify .env has the required env vars documented
+# ---------------------------------------------------------------------------
+
+log "  → Verifying .env has bulletin-tweet keys..."
+ENV_FILE="$APP_DIR/.env"
+if [ ! -f "$ENV_FILE" ]; then
+    log "     ⚠ $ENV_FILE not found — copy .env.example and populate before firing"
+else
+    MISSING=()
+    for key in \
+        ANTHROPIC_API_KEY \
+        BULLETIN_SNAPSHOT_TOKEN \
+        PLAYWRIGHT_BROWSERS_PATH \
+        TMPDIR \
+        ; do
+        if ! grep -q "^${key}=" "$ENV_FILE"; then
+            MISSING+=("$key")
+        fi
+    done
+    if [ "${#MISSING[@]}" -eq 0 ]; then
+        log "     ✓ core keys present in .env"
+    else
+        log "     ⚠ .env is missing: ${MISSING[*]}"
+        log "       See .env.example for values."
+    fi
+    # Optional keys — worth flagging but not fatal.
+    OPTIONAL_MISSING=()
+    for key in \
+        X_BOT_BEARER_TOKEN \
+        X_BOT_API_KEY \
+        X_BOT_API_SECRET \
+        X_BOT_ACCESS_TOKEN \
+        X_BOT_ACCESS_TOKEN_SECRET \
+        BULLETIN_TWEET_NOTIFY_HOOK \
+        RESEND_API_KEY \
+        RESEND_FROM_EMAIL \
+        BULLETIN_TWEET_EMAIL_TO \
+        ; do
+        if ! grep -q "^${key}=" "$ENV_FILE"; then
+            OPTIONAL_MISSING+=("$key")
+        fi
+    done
+    if [ "${#OPTIONAL_MISSING[@]}" -gt 0 ]; then
+        log "     • Optional keys not set (fine to defer): ${OPTIONAL_MISSING[*]}"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Smoke test: render one bulletin PNG standalone.
+# ---------------------------------------------------------------------------
+
+if [ -f "$WEB_DIR/frontend/scripts/render-bulletin-png.mjs" ]; then
+    log "  → Smoke-testing PNG helper..."
+    SMOKE_OUT="$(mktemp -u --suffix=.png)"
+    TOKEN="$(grep '^BULLETIN_SNAPSHOT_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d= -f2-)"
+    if PLAYWRIGHT_BROWSERS_PATH=/var/log/playwright-browsers \
+       TMPDIR=/var/lib/zerogex-oa/playwright-tmp \
+       node "$WEB_DIR/frontend/scripts/render-bulletin-png.mjs" \
+           --symbol SPX --mode close \
+           --date "$(date +%F)" \
+           --site-url "${ZEROGEX_SITE_URL:-https://zerogex.io}" \
+           ${TOKEN:+--token "$TOKEN"} \
+           --out "$SMOKE_OUT" \
+       > /tmp/bulletin-png-smoke.log 2>&1; then
+        if [ -s "$SMOKE_OUT" ]; then
+            log "     ✓ PNG smoke test OK ($(stat -c%s "$SMOKE_OUT") bytes → $SMOKE_OUT)"
+            rm -f "$SMOKE_OUT"
+        else
+            log "     ⚠ PNG smoke test wrote empty file — see /tmp/bulletin-png-smoke.log"
+        fi
+    else
+        log "     ⚠ PNG smoke test failed (rc=$?) — see /tmp/bulletin-png-smoke.log"
+    fi
+fi
+
+log ""
+log "Bulletin tweet runtime setup complete."
+log ""
+log "To install / re-install the systemd timers:"
+log "    make -C $APP_DIR bulletin-tweet-install"
+log ""
+log "To fire a stage-only test:"
+log "    $APP_DIR/bin/bulletin-tweet.sh close --allow-non-trading-day --stage"
