@@ -585,3 +585,276 @@ def test_next_trading_day_skips_weekend():
     # NYSE_HOLIDAYS is env-driven and unset in the test process, so a
     # holiday-eve assertion here would depend on production config.
     assert next_trading_day(date(2026, 1, 2)).isoformat() == "2026-01-05"
+
+
+# ---------------------------------------------------------------------------
+# Approval mechanism — --stage flag + bulletin_approve module
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stage_flag_writes_pending_and_calls_hook(tmp_path, monkeypatch):
+    """--stage writes state=pending manifest and calls notify hook.
+
+    Must NOT POST to X, even when X_BOT_BEARER_TOKEN is set — safe by
+    default so the timer can't accidentally tweet before the operator
+    has flipped autopilot on."""
+    mod = _reload_module()
+
+    db_instance = MagicMock()
+    db_instance.connect = AsyncMock()
+    db_instance.disconnect = AsyncMock()
+    db_instance.get_latest_gex_summary = AsyncMock(
+        side_effect=lambda symbol: _summary_row(symbol),
+    )
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: db_instance)
+
+    # Fail loudly if the runner ever tries to POST or upload media in
+    # --stage mode.
+    def _boom(*args, **kwargs):
+        raise AssertionError("--stage mode posted to X!")
+
+    monkeypatch.setattr(mod, "post_bulletin", _boom)
+    monkeypatch.setattr(mod, "render_bulletin_png", lambda *args, **kwargs: None)
+    monkeypatch.setattr(mod, "render_replay_clip", lambda *args, **kwargs: None)
+
+    # Even with the bearer set, --stage without autopilot must not post.
+    monkeypatch.setenv("X_BOT_BEARER_TOKEN", "test-bearer")
+    monkeypatch.delenv("BULLETIN_TWEET_AUTOPILOT", raising=False)
+
+    # Set up a notify hook to confirm it gets called.
+    hook_called_marker = tmp_path / "hook_fired"
+    hook_script = tmp_path / "hook.sh"
+    hook_script.write_text(
+        "#!/bin/bash\n"
+        f'touch {hook_called_marker}\n'
+        f'echo "$1" > {hook_called_marker}.mode\n'
+    )
+    hook_script.chmod(0o755)
+    monkeypatch.setenv("BULLETIN_TWEET_NOTIFY_HOOK", str(hook_script))
+
+    args = mod._parse_args([
+        "--mode", "close",
+        "--date", "2026-07-06",  # Monday
+        "--artifact-dir", str(tmp_path / "artifacts"),
+        "--stage",
+        "--allow-non-trading-day",
+    ])
+    rc = await mod._run(args)
+    assert rc == 0
+
+    # Manifest should say state=pending
+    manifest_path = tmp_path / "artifacts" / "close" / "2026-07-06" / "manifest.json"
+    assert manifest_path.exists()
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["state"] == "pending"
+
+    # And the notify hook must have fired with the right mode arg.
+    assert hook_called_marker.exists()
+    mode_marker = tmp_path / "hook_fired.mode"
+    assert mode_marker.exists()
+    assert mode_marker.read_text().strip() == "close"
+
+
+@pytest.mark.asyncio
+async def test_autopilot_env_var_upgrades_stage_to_post(tmp_path, monkeypatch):
+    """BULLETIN_TWEET_AUTOPILOT=1 silently upgrades --stage → --post.
+
+    Enables one-line-env-flip switch to autopilot without editing the
+    systemd unit file or touching daemon-reload."""
+    mod = _reload_module()
+
+    db_instance = MagicMock()
+    db_instance.connect = AsyncMock()
+    db_instance.disconnect = AsyncMock()
+    db_instance.get_latest_gex_summary = AsyncMock(
+        side_effect=lambda symbol: _summary_row(symbol),
+    )
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: db_instance)
+    monkeypatch.setattr(mod, "render_bulletin_png", lambda *args, **kwargs: None)
+    monkeypatch.setattr(mod, "render_replay_clip", lambda *args, **kwargs: None)
+
+    posts: list[dict] = []
+
+    def _fake_post(**kwargs):
+        posts.append(kwargs)
+        return {"id": "fake-tweet-id-42"}
+
+    monkeypatch.setattr(mod, "post_bulletin", _fake_post)
+    monkeypatch.setenv("X_BOT_BEARER_TOKEN", "test-bearer")
+    monkeypatch.setenv("BULLETIN_TWEET_AUTOPILOT", "1")
+    monkeypatch.delenv("BULLETIN_TWEET_NOTIFY_HOOK", raising=False)
+
+    args = mod._parse_args([
+        "--mode", "close",
+        "--date", "2026-07-06",
+        "--artifact-dir", str(tmp_path),
+        "--stage",  # would normally skip POST — but autopilot upgrades it
+        "--allow-non-trading-day",
+    ])
+    rc = await mod._run(args)
+    assert rc == 0
+
+    # Post_bulletin should have been called once.
+    assert len(posts) == 1
+    # And the manifest should reflect state=posted with the returned id.
+    manifest = json.loads(
+        (tmp_path / "close" / "2026-07-06" / "manifest.json").read_text(),
+    )
+    assert manifest["state"] == "posted"
+    assert manifest["posted_id"] == "fake-tweet-id-42"
+
+
+def test_approve_module_reads_pending_manifest_and_posts(tmp_path, monkeypatch):
+    """bulletin_approve reads a pending draft and calls post_bulletin.
+
+    Exercises the operator's approve path: draft was staged earlier,
+    operator SSHs in and runs the approve command, tweet lands."""
+    from src.jobs import bulletin_approve
+
+    # Set up a mock pending draft on disk.
+    art_dir = tmp_path / "close" / "2026-07-06"
+    art_dir.mkdir(parents=True)
+    (art_dir / "tweet_text.md").write_text("hello world\n")
+    (art_dir / "tweet_text_fallback.md").write_text("hello\n")
+    (art_dir / "manifest.json").write_text(json.dumps({
+        "mode": "close",
+        "date": "2026-07-06",
+        "state": "pending",
+        "posted_id": None,
+        "lead_symbol": "SPX",
+        "symbols_present": ["SPY", "SPX", "QQQ"],
+        "text_len": 11,
+        "fallback_len": 5,
+        "media": {"png": None, "clip": None},
+        "bulletins": [],
+    }))
+
+    posts: list[dict] = []
+
+    def _fake_post(**kwargs):
+        posts.append(kwargs)
+        return {"id": "approved-tweet-id-99"}
+
+    monkeypatch.setattr(bulletin_approve, "post_bulletin", _fake_post)
+    monkeypatch.setenv("X_BOT_BEARER_TOKEN", "test-bearer")
+
+    args = bulletin_approve._parse_args([
+        "--mode", "close",
+        "--date", "2026-07-06",
+        "--artifact-dir", str(tmp_path),
+    ])
+    rc = bulletin_approve._run(args)
+    assert rc == 0
+    assert len(posts) == 1
+
+    # Manifest should now reflect state=posted with the returned id.
+    manifest = json.loads((art_dir / "manifest.json").read_text())
+    assert manifest["state"] == "posted"
+    assert manifest["posted_id"] == "approved-tweet-id-99"
+    assert "approved_ts" in manifest
+
+
+def test_approve_module_is_idempotent_when_already_posted(tmp_path, monkeypatch):
+    """Re-running approve on a state=posted draft is a no-op.
+
+    Guards against a double-post if the operator accidentally re-runs
+    ``bin/bulletin-approve.sh`` after a successful approval."""
+    from src.jobs import bulletin_approve
+
+    art_dir = tmp_path / "close" / "2026-07-06"
+    art_dir.mkdir(parents=True)
+    (art_dir / "tweet_text.md").write_text("hi\n")
+    (art_dir / "tweet_text_fallback.md").write_text("hi\n")
+    (art_dir / "manifest.json").write_text(json.dumps({
+        "mode": "close",
+        "date": "2026-07-06",
+        "state": "posted",
+        "posted_id": "prior-tweet-id",
+        "lead_symbol": "SPX",
+        "symbols_present": ["SPX"],
+        "text_len": 3, "fallback_len": 3,
+        "media": {"png": None, "clip": None},
+        "bulletins": [],
+    }))
+
+    posts: list[dict] = []
+    monkeypatch.setattr(
+        bulletin_approve, "post_bulletin", lambda **k: posts.append(k) or {"id": "OOPS"},
+    )
+    monkeypatch.setenv("X_BOT_BEARER_TOKEN", "test-bearer")
+
+    args = bulletin_approve._parse_args([
+        "--mode", "close",
+        "--date", "2026-07-06",
+        "--artifact-dir", str(tmp_path),
+    ])
+    rc = bulletin_approve._run(args)
+    assert rc == 0
+    # post_bulletin must NEVER be called on an already-posted draft.
+    assert posts == []
+
+
+def test_approve_module_discard_marks_state_and_skips_post(tmp_path, monkeypatch):
+    """--discard flips state=discarded without ever calling post_bulletin."""
+    from src.jobs import bulletin_approve
+
+    art_dir = tmp_path / "close" / "2026-07-06"
+    art_dir.mkdir(parents=True)
+    (art_dir / "tweet_text.md").write_text("hi\n")
+    (art_dir / "tweet_text_fallback.md").write_text("hi\n")
+    (art_dir / "manifest.json").write_text(json.dumps({
+        "mode": "close", "date": "2026-07-06", "state": "pending", "posted_id": None,
+        "lead_symbol": "SPX", "symbols_present": ["SPX"],
+        "text_len": 3, "fallback_len": 3,
+        "media": {"png": None, "clip": None}, "bulletins": [],
+    }))
+
+    def _boom(**k):
+        raise AssertionError("discard called post_bulletin!")
+
+    monkeypatch.setattr(bulletin_approve, "post_bulletin", _boom)
+    monkeypatch.setenv("X_BOT_BEARER_TOKEN", "test-bearer")
+
+    args = bulletin_approve._parse_args([
+        "--mode", "close", "--date", "2026-07-06",
+        "--artifact-dir", str(tmp_path), "--discard",
+    ])
+    rc = bulletin_approve._run(args)
+    assert rc == 0
+
+    manifest = json.loads((art_dir / "manifest.json").read_text())
+    assert manifest["state"] == "discarded"
+
+
+def test_approve_prints_for_manual_when_bearer_unset(tmp_path, monkeypatch, capsys):
+    """Without X_BOT_BEARER_TOKEN, --print mode dumps the draft to stdout.
+
+    This is the "X developer application still pending" workflow: the
+    pipeline still produces real drafts, and the operator pastes them
+    into the X web UI manually."""
+    from src.jobs import bulletin_approve
+
+    art_dir = tmp_path / "close" / "2026-07-06"
+    art_dir.mkdir(parents=True)
+    (art_dir / "tweet_text.md").write_text("full tweet body here\n")
+    (art_dir / "tweet_text_fallback.md").write_text("short\n")
+    (art_dir / "manifest.json").write_text(json.dumps({
+        "mode": "close", "date": "2026-07-06", "state": "pending", "posted_id": None,
+        "lead_symbol": "SPX", "symbols_present": ["SPX"],
+        "text_len": 20, "fallback_len": 5,
+        "media": {"png": None, "clip": None}, "bulletins": [],
+    }))
+
+    monkeypatch.delenv("X_BOT_BEARER_TOKEN", raising=False)
+
+    args = bulletin_approve._parse_args([
+        "--mode", "close", "--date", "2026-07-06",
+        "--artifact-dir", str(tmp_path),
+    ])
+    rc = bulletin_approve._run(args)
+    assert rc == 0
+
+    captured = capsys.readouterr()
+    assert "MANUAL POSTING MODE" in captured.out
+    assert "full tweet body here" in captured.out

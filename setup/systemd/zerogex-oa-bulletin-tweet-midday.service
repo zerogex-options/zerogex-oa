@@ -13,9 +13,11 @@ WorkingDirectory=/home/ubuntu/zerogex-oa
 Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=/home/ubuntu/zerogex-oa/.env
 
-# Posts the mid-session bulletin tweet.  See the premarket unit for the
-# dry-run / --post gating story — same rules apply here.
-ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.bulletin_tweet --mode midday --post
+# Stages the mid-session bulletin tweet for human approval.  See the
+# premarket unit for the full stage → approve → post lifecycle; same
+# rules apply here.  Flip BULLETIN_TWEET_AUTOPILOT=1 in the
+# EnvironmentFile to auto-post without approval.
+ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.bulletin_tweet --mode midday --stage
 
 TimeoutStartSec=240
 NoNewPrivileges=true
