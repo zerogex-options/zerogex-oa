@@ -20,6 +20,22 @@ if [ ! -f "$SITE_CONF" ]; then
     exit 1
 fi
 
+# Escape hatch: ``SKIP_CERTBOT=1`` bypasses DNS preflight, certbot
+# install/renew, and the renewal dry-run. Use ONLY when the cert
+# already exists and works (e.g. because the domain is now Cloudflare-
+# proxied or the cert is otherwise managed off-box). Still writes and
+# reloads the nginx config so an nginx-only update (adding a new
+# location block, changing timeouts, etc.) can land without touching
+# the cert path.
+if [ "${SKIP_CERTBOT:-0}" = "1" ]; then
+    log "  → SKIP_CERTBOT=1 — skipping DNS preflight, certbot install/renew, and renewal dry-run"
+    log "     (nginx config write + reload still runs)"
+    SKIP_CERTBOT_PATH=1
+else
+    SKIP_CERTBOT_PATH=0
+fi
+
+if [ "$SKIP_CERTBOT_PATH" = "0" ]; then
 # DNS preflight: certbot's HTTP-01 challenge requires DOMAIN_NAME to
 # resolve to this instance's public IP.  Catch the misconfiguration
 # here with a clear message rather than letting certbot fail the
@@ -96,6 +112,7 @@ else
     log "  • Nginx config test fails"
     exit 1
 fi
+fi   # SKIP_CERTBOT_PATH
 
 log "  → Installing hardened HTTPS nginx config..."
 sudo tee "$SITE_CONF" > /dev/null <<EOF
@@ -223,6 +240,7 @@ sudo nginx -t
 log "  → Reloading nginx..."
 sudo systemctl reload nginx
 
+if [ "$SKIP_CERTBOT_PATH" = "0" ]; then
 log "  → Writing cert deploy hook..."
 sudo tee /usr/local/bin/zerogex-certbot-deploy-hook.sh > /dev/null <<'HOOKEOF'
 #!/bin/bash
@@ -246,6 +264,8 @@ sudo systemctl enable --now zerogex-cert-renew.timer
 
 log "  → Testing renewal flow (dry-run)..."
 sudo certbot renew --dry-run --cert-name "$DOMAIN_NAME" --deploy-hook "/usr/local/bin/zerogex-certbot-deploy-hook.sh"
+
+fi   # SKIP_CERTBOT_PATH — everything above (deploy hook, renewal units, timer, dry-run) is certbot-related
 
 log ""
 log "SSL setup complete!"
