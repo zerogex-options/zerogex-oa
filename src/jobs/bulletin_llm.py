@@ -91,9 +91,11 @@ Reply with a single JSON object and nothing else.  The object has:
 }
 
 STRICT RULES:
-* Every dollar figure, strike price, or GEX value you write MUST appear
-  verbatim in the input's ``levels`` block.  Never invent numbers.
-  Never quote a price that isn't in the input.
+* Every dollar figure or strike price you write MUST appear verbatim
+  in the input's ``levels`` block.  Never invent numbers.
+* When quoting Net GEX, use the ``net_gex_display`` value ("+$7.74B",
+  "−$125.0M") — NEVER the raw ``net_gex`` float.  Writing "SPY net GEX
+  of 7,740,721,297.75" is wrong; write "SPY net GEX at +$7.74B".
 * Do not include the numeric block "Current ZeroGEX read: ..." — that
   gets interpolated by the caller.
 * Do not include hashtags, "zerogex.io", or the ticker cash-tag line —
@@ -138,7 +140,14 @@ class SymbolInput:
             "call_wall": self.call_wall,
             "put_wall": self.put_wall,
             "max_pain": self.max_pain,
+            # Present net_gex both as raw float (for the model to reason
+            # about magnitude/sign) AND pre-formatted in the short scale
+            # the model MUST use verbatim if it quotes the number.
+            # Without this, the model sometimes writes "SPY's net GEX of
+            # 7,740,721,297.75" instead of "+$7.74B" — factually right
+            # but visually ugly.
             "net_gex": self.net_gex,
+            "net_gex_display": _short_scale_gex(self.net_gex),
             "regime": self.regime,
             "change_pct": (
                 None
@@ -146,6 +155,26 @@ class SymbolInput:
                 else (self.spot - self.prior_close) / self.prior_close * 100
             ),
         }
+
+
+def _short_scale_gex(v: float | None) -> str | None:
+    """Mirror :func:`src.jobs.bulletin_tweet._fmt_net_gex` — the short-scale
+    form ("+$7.74B", "−$125.0M") the tweet's numeric block uses.
+
+    Duplicated here so bulletin_llm has no import dependency on
+    bulletin_tweet (which imports the LLM module lazily via
+    _try_llm_section).  Keeps them decoupled."""
+    if v is None:
+        return None
+    abs_v = abs(v)
+    sign = "+" if v >= 0 else "−"
+    if abs_v >= 1e9:
+        return f"{sign}${abs_v / 1e9:.2f}B"
+    if abs_v >= 1e6:
+        return f"{sign}${abs_v / 1e6:.1f}M"
+    if abs_v >= 1e3:
+        return f"{sign}${abs_v / 1e3:.0f}K"
+    return f"{sign}${abs_v:.0f}"
 
 
 @dataclass
