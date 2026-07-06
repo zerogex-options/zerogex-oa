@@ -164,8 +164,18 @@ export APP_DIR ENV_FILE
 # deploy. Without this, a missing var surfaces several steps later as
 # a cryptic error (e.g. an empty OA_API_DOMAIN crashing 130.ssl's DNS
 # preflight with `dig: '' is not a legal name`).
+#
+# Escape hatch: ``SKIP_PREFLIGHT=1`` bypasses the check. Intended for
+# targeted --start-from re-deploys (e.g. an nginx-only touch) where
+# the operator knows the missing vars aren't needed by the steps
+# actually being run. Do NOT use for a cold deploy — the failure
+# modes preflight guards against are real.
 PREFLIGHT_SCRIPT="$STEPS_DIR/005.preflight"
-if [ -x "$PREFLIGHT_SCRIPT" ]; then
+if [ "${SKIP_PREFLIGHT:-0}" = "1" ]; then
+    log "=========================================="
+    log "SKIP_PREFLIGHT=1 — bypassing 005.preflight (use only for targeted re-deploys)"
+    log ""
+elif [ -x "$PREFLIGHT_SCRIPT" ]; then
     log "=========================================="
     log "Executing: 005.preflight ..."
     if bash "$PREFLIGHT_SCRIPT"; then
