@@ -24,6 +24,8 @@ from .ratelimit import rate_limit
 from .scopes import FLOW, GEX, MARKET_RAW, MAXPAIN, SIGNALS, TECHNICALS
 from .security import api_key_auth, key_store, require_scopes
 from .usage import usage_meter
+from .quote_broadcaster import QuoteBroadcaster, set_broadcaster
+from .routers import websockets as ws_router
 from .models import (
     GEXSummary,
     GEXByStrike,
@@ -140,6 +142,62 @@ async def lifespan(app: FastAPI):
     usage_meter.configure(lambda: db_manager.pool)
     usage_meter.start()
 
+    # Real-time quote broadcaster — LISTEN 'zgx_quote_updates' →
+    # per-symbol WebSocket fan-out. Held for the process lifetime;
+    # reconnects internally if the DB blips. get_market_session is
+    # defined later in this module, so passing it by callable defers
+    # binding until the notify actually fires. Feature-gated: unset
+    # WS_ENABLED (or set it to "0") to keep the socket wiring dormant
+    # during the rollout window.
+    if _getenv_str("WS_ENABLED", "1").strip().lower() not in {"0", "false", "no"}:
+        # Same host/port/database/user/password the pool was built with
+        # so the LISTEN connection tracks the pool's credentials (a
+        # DatabaseManager reconnect that changed them is picked up on
+        # the next reconnect of the LISTEN loop). We build the kwargs
+        # here rather than inspecting asyncpg's private ``_params``
+        # because that internal field's schema varies by version (0.31+
+        # lost the ``dsn`` attribute the earlier draft relied on,
+        # causing LISTEN to never come up).
+        def _listen_kwargs():
+            if db_manager is None:
+                return None
+            ssl_mode = os.getenv("DB_SSLMODE", "").strip().lower()
+            ssl = True if ssl_mode in {"require", "verify-ca", "verify-full"} else None
+            return {
+                "host": db_manager.host,
+                "port": db_manager.port,
+                "database": db_manager.database,
+                "user": db_manager.user,
+                "password": db_manager.password,
+                "ssl": ssl,
+                # Short connect timeout — a slow initial connect just
+                # means the outer reconnect loop retries; don't tie up
+                # the LISTEN task for minutes.
+                "timeout": 10.0,
+            }
+
+        # Same 1s-LRU-cached signal the HTTP handler uses, so the two
+        # paths' session labels agree at 16:00 ET (previously the
+        # broadcaster shortcut'd close_data_available=True and briefly
+        # disagreed with the HTTP handler while the first post-close
+        # bar was landing).
+        async def _close_data_check(symbol, asset_type):
+            if db_manager is None:
+                return True
+            return await db_manager.has_todays_close_landed(symbol, asset_type)
+
+        quote_broadcaster = QuoteBroadcaster(
+            connect_kwargs_getter=_listen_kwargs,
+            session_computer=lambda asset_type, stable, close_avail: get_market_session(
+                asset_type, stable, close_avail
+            ),
+            close_data_check=_close_data_check,
+        )
+        set_broadcaster(quote_broadcaster)
+        await quote_broadcaster.start()
+    else:
+        logger.info("WS_ENABLED=0 — quote broadcaster not started")
+
     # The max-pain snapshot is refreshed off-process by the
     # zerogex-oa-max-pain-refresh.timer (daily, pre-market) — not by an
     # in-process loop and not inline on the request path.  The endpoint is
@@ -181,6 +239,11 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down ZeroGEX API Server...")
     # Stop the meter first (cancels the loop and flushes the final window)
     # while the DB pool is still up, then drop both pool getters.
+    from .quote_broadcaster import get_broadcaster as _get_bc
+    bc = _get_bc()
+    if bc is not None:
+        await bc.stop()
+        set_broadcaster(None)
     await usage_meter.stop()
     usage_meter.configure(None)
     key_store.configure(None)
@@ -1455,6 +1518,19 @@ async def get_momentum_divergence(
     """Get momentum divergence signals"""
     data = await _db().get_momentum_divergence(symbol, timeframe, window_units)
     return [MomentumDivergencePoint(**row) for row in data]
+
+
+# ============================================================================
+# WebSocket streaming endpoints
+# ============================================================================
+
+# /ws — real-time underlying quote stream. See routers/websockets.py for
+# the wire protocol. Registered via a plain function (not APIRouter) so
+# the route captures ``get_broadcaster`` lazily and picks up the lifespan-
+# owned broadcaster singleton without a global reference at import time.
+from .quote_broadcaster import get_broadcaster as _get_ws_broadcaster  # noqa: E402
+
+ws_router.register(app, get_broadcaster=_get_ws_broadcaster)
 
 
 # ============================================================================

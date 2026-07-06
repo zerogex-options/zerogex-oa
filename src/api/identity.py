@@ -131,6 +131,22 @@ def verify_end_user_token(token: Optional[str]) -> Optional[str]:
         if not isinstance(payload, dict):
             return None
 
+        # Audience separation — reject any token whose `aud` claim
+        # names a different purpose (currently only "ws" is minted;
+        # this guard makes the header-token path forward-compatible
+        # with any future audience). Without this a WS ticket
+        # (`aud=ws`) is a valid header token because verify_end_user_
+        # token would otherwise ignore the `aud` field entirely — and
+        # both are signed with the same secret. Tokens minted for
+        # this path have historically been aud-less; the intent of
+        # this check is "if the minter DID set aud, it must not name
+        # something else."
+        aud = payload.get("aud")
+        if aud is not None and aud != "":
+            # Legacy tokens without aud continue to pass; anything
+            # with a non-empty aud must not be this path.
+            return None
+
         now = int(time.time())
 
         exp = payload.get("exp")
@@ -171,6 +187,107 @@ def resolve_end_user(request: Request) -> Tuple[Optional[str], Optional[str]]:
     if sub:
         return sub, "web-token"
     return None, None
+
+
+# ---------------------------------------------------------------------------
+# WebSocket ticket verification
+#
+# Browsers can't attach custom headers to the WebSocket handshake, so the
+# regular Bearer/X-API-Key path isn't reachable. The Next.js BFF instead
+# mints a short-lived JWT ("ticket") tied to the same
+# ``END_USER_TOKEN_SECRET`` and hands it to the browser, which passes it
+# as ``?ticket=<jwt>`` in the WS URL. This function verifies the ticket
+# with the same HS256/algorithm-confusion guard as the header token, and
+# additionally requires ``aud="ws"`` so a leaked end-user token can't
+# authenticate a WS connection (and vice versa). Never raises — a bad
+# ticket returns ``None`` and the caller rejects the handshake.
+# ---------------------------------------------------------------------------
+
+_WS_AUDIENCE = "ws"
+_WS_TICKET_MAX_AGE: int = _getenv_int("WS_TICKET_MAX_AGE_SECONDS", 90)
+# WS-specific clock-skew leeway. The shared ``_LEEWAY`` (default 60s)
+# stacks on top of the 60s TTL the frontend mints — verified TTL was
+# effectively 120s, not the documented 60s. Ten seconds is enough to
+# tolerate ordinary NTP skew between the BFF host and the API host
+# without doubling the ticket's replay window.
+_WS_TICKET_LEEWAY: int = _getenv_int("WS_TICKET_LEEWAY_SECONDS", 10)
+
+
+def verify_ws_ticket(ticket: Optional[str]) -> Optional[str]:
+    """Verify a WebSocket handshake ticket; return its ``sub`` or ``None``."""
+    if _SECRET is None or not ticket:
+        return None
+    try:
+        parts = ticket.split(".")
+        if len(parts) != 3:
+            return None
+        h_b64, p_b64, s_b64 = parts
+
+        header = json.loads(_b64url_decode(h_b64))
+        if not isinstance(header, dict) or header.get("alg") != "HS256":
+            return None
+
+        expected_sig = hmac.new(
+            _SECRET.encode("utf-8"),
+            f"{h_b64}.{p_b64}".encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+        presented_sig = _b64url_decode(s_b64)
+        if not hmac.compare_digest(expected_sig, presented_sig):
+            return None
+
+        payload = json.loads(_b64url_decode(p_b64))
+        if not isinstance(payload, dict):
+            return None
+
+        # Audience is the sole marker separating WS tickets from header
+        # end-user tokens — a token minted for the HTTP path (no aud)
+        # or for any other purpose must not open a WS. Do not treat
+        # missing ``aud`` as a match. A JWT ``aud`` claim may be a
+        # string or an array of strings per RFC 7519 §4.1.3.
+        aud = payload.get("aud")
+        if aud == _WS_AUDIENCE:
+            pass
+        elif isinstance(aud, list) and _WS_AUDIENCE in aud:
+            pass
+        else:
+            return None
+
+        now = int(time.time())
+
+        # WS tickets use a TIGHT leeway so the effective replay window
+        # is bounded by the mint TTL (60s), not doubled by the shared
+        # 60s HTTP-token leeway.
+        exp = payload.get("exp")
+        if not isinstance(exp, (int, float)) or isinstance(exp, bool):
+            return None
+        if now > int(exp) + _WS_TICKET_LEEWAY:
+            return None
+
+        iat = payload.get("iat")
+        if iat is not None:
+            if not isinstance(iat, (int, float)) or isinstance(iat, bool):
+                return None
+            if int(iat) > now + _WS_TICKET_LEEWAY:
+                return None
+            if now - int(iat) > _WS_TICKET_MAX_AGE + _WS_TICKET_LEEWAY:
+                return None
+
+        sub = payload.get("sub")
+        if not isinstance(sub, str):
+            return None
+        sub = sub.strip()
+        if not sub or len(sub) > _MAX_SUB_LEN:
+            return None
+        return sub
+    except (ValueError, binascii.Error, TypeError, json.JSONDecodeError):
+        return None
+    except Exception:
+        logger.warning(
+            "Unexpected error verifying WS ticket; treating as unauthenticated",
+            exc_info=True,
+        )
+        return None
 
 
 def current_identity(request: Request) -> RequestIdentity:
