@@ -258,24 +258,27 @@ def _build_user_message(
 
 
 def _extract_json_block(text: str) -> str | None:
-    """Find the first balanced ``{...}`` block in the model output.
+    """Find the JSON object block in the model output.
 
-    We ask the model to reply with a JSON object and nothing else, but
-    accept a leading preamble ("Here you go:") so a slightly
-    ill-behaved reply still parses."""
-    start = text.find("{")
-    if start == -1:
+    Uses first-``{`` to last-``}`` rather than brace counting because
+    the model's string values can contain literal braces (e.g. in a
+    bulleted item like ``* SPY {750}``) that throw off a naive depth
+    counter.  Since we ask for a JSON object as the entire response,
+    the outermost braces bracket the whole payload."""
+    # Strip common markdown code-fence wrappers first — some models
+    # add ``` ```json ... ``` `` even when told not to.
+    stripped = text.strip()
+    for fence in ("```json", "```JSON", "```"):
+        if stripped.startswith(fence):
+            stripped = stripped[len(fence):].lstrip()
+            break
+    if stripped.endswith("```"):
+        stripped = stripped[:-3].rstrip()
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start == -1 or end == -1 or end < start:
         return None
-    depth = 0
-    for i in range(start, len(text)):
-        ch = text[i]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start:i + 1]
-    return None
+    return stripped[start:end + 1]
 
 
 def _call_claude(
@@ -346,7 +349,12 @@ def _parse_section(body_json: str) -> LlmSection | None:
     ceiling).  Returns None on any structural failure so the caller
     falls back to the template."""
     try:
-        obj = json.loads(body_json)
+        # strict=False accepts unescaped control chars (literal \n, \r,
+        # \t) inside string values.  Claude sometimes emits multi-para
+        # ``opening`` fields with literal newlines rather than ``\\n``
+        # escape sequences; that renders fine but breaks strict JSON.
+        # Tolerating it here saves an otherwise-good response.
+        obj = json.loads(body_json, strict=False)
     except json.JSONDecodeError as exc:
         logger.warning("bulletin_llm: model JSON did not parse (%s)", exc)
         return None
