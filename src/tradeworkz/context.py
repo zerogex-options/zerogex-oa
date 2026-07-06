@@ -185,11 +185,13 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
     # gex_summary — real column names differ from earlier drafts:
     #   * total_net_gex   (not net_gex)
     #   * gamma_flip_point (not gamma_flip)
-    #   * no dealer_net_delta column
+    #   * dealer_net_delta is not persisted, so we proxy it below using
+    #     net_gex_at_spot × 100. Signed, in the same units the
+    #     DealerDeltaPressureRider bot's threshold assumes.
     cur.execute(
         """
         SELECT total_net_gex, gamma_flip_point, max_pain, put_call_ratio,
-               call_wall, put_wall, max_gamma_strike
+               call_wall, put_wall, max_gamma_strike, net_gex_at_spot
         FROM gex_summary
         WHERE underlying = %s
         ORDER BY timestamp DESC
@@ -202,7 +204,7 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
         gx = gex_rows[0]
         prior = gex_rows[1] if len(gex_rows) > 1 else None
     else:
-        gx = (None,) * 7
+        gx = (None,) * 8
         prior = None
 
     cur.execute(
@@ -213,6 +215,24 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
     )
     vix_row = cur.fetchone()
     vix = float(vix_row[0]) if vix_row and vix_row[0] is not None else None
+
+    # Session VWAP + deviation from the existing view
+    # (underlying_vwap_deviation). The view is keyed by symbol +
+    # timestamp and returns the running per-session VWAP across the
+    # current trading day; we pick the latest row.
+    cur.execute(
+        """
+        SELECT vwap, vwap_deviation_pct
+        FROM underlying_vwap_deviation
+        WHERE symbol = %s
+        ORDER BY timestamp DESC
+        LIMIT 1
+        """,
+        (underlying,),
+    )
+    vwap_row = cur.fetchone()
+    vwap_value = _maybe_float(vwap_row[0]) if vwap_row else None
+    vwap_deviation = _maybe_float(vwap_row[1]) if vwap_row else None
 
     cur.execute(
         """
@@ -225,6 +245,15 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
     )
     closes = [float(r[0]) for r in cur.fetchall() if r[0] is not None][::-1]
 
+    # dealer_net_delta proxy: gex_summary persists net_gex_at_spot as
+    # "cumulative dealer net GEX sampled at spot" (the value of the same
+    # curve whose zero-crossing is gamma_flip_point). Signed, same
+    # magnitude scale the DealerDeltaPressureRider bot's ~5e8 threshold
+    # is calibrated to. This is a directional proxy for aggregate dealer
+    # delta pressure — a persisted per-contract dealer delta column
+    # doesn't exist and computing it per tick would be expensive.
+    dealer_net_delta = _maybe_float(gx[7])
+
     return MarketSnapshot(
         underlying=underlying,
         timestamp=ts if isinstance(ts, datetime) else datetime.utcnow(),
@@ -236,15 +265,14 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
         call_wall=_maybe_float(gx[4]),
         put_wall=_maybe_float(gx[5]),
         max_gamma_strike=_maybe_float(gx[6]),
-        # dealer_net_delta is not persisted on gex_summary — leave it None
-        # so the DealerDeltaPressureRider bot stays inactive until a real
-        # source is wired. All other bots ignore this field.
-        dealer_net_delta=None,
+        dealer_net_delta=dealer_net_delta,
         prior_call_wall=_maybe_float(prior[4]) if prior else None,
         prior_put_wall=_maybe_float(prior[5]) if prior else None,
         session_high=_maybe_float(sess_hi),
         session_low=_maybe_float(sess_lo),
         open_price=_maybe_float(sess_open),
+        vwap=vwap_value,
+        vwap_deviation_pct=vwap_deviation,
         vix=vix,
         recent_closes=closes,
     )

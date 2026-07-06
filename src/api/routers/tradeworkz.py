@@ -527,6 +527,38 @@ async def unfollow_bot(
     return {"status": "ok", "bot_id": bot_id}
 
 
+@router.delete("/me/feed")
+async def clear_my_feed(
+    request: Request,
+    db: DatabaseManager = Depends(get_db),
+) -> Dict[str, Any]:
+    """Delete every ``in_app`` notification row belonging to the caller.
+
+    Only touches the ``in_app`` channel — pending ``email`` / ``webhook``
+    rows the delivery worker hasn't shipped yet are left in place so a
+    "clear my inbox" gesture on the dashboard doesn't accidentally
+    cancel a queued email. Returns the number of rows deleted.
+    """
+    user = _resolve_user(request)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Sign in required")
+    async with db.pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            DELETE FROM tw_notifications_log
+            WHERE end_user = $1 AND channel = 'in_app'
+            """,
+            user,
+        )
+    deleted = 0
+    if isinstance(result, str) and result.startswith("DELETE "):
+        try:
+            deleted = int(result.split()[1])
+        except (IndexError, ValueError):
+            deleted = 0
+    return {"status": "ok", "deleted": deleted}
+
+
 @router.get("/me/feed")
 async def my_feed(
     request: Request,
