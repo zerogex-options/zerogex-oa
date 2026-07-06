@@ -44,8 +44,12 @@ logger = logging.getLogger("zerogex.bulletin_llm")
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MODEL = "claude-sonnet-5"
-DEFAULT_MAX_TOKENS = 1200
-DEFAULT_TIMEOUT_SECONDS = 30
+# 2500 gives comfortable headroom over the typical output size (~1200
+# tokens for a nuanced multi-paragraph response with JSON scaffolding).
+# The static template fallback kicks in if the model still overflows,
+# but at 2500 that's a rare case rather than the default.
+DEFAULT_MAX_TOKENS = 2500
+DEFAULT_TIMEOUT_SECONDS = 45
 
 
 SYSTEM_PROMPT = """\
@@ -473,6 +477,9 @@ def generate_narrative(
     model_id = (
         model or os.environ.get("BULLETIN_TWEET_LLM_MODEL", "").strip() or DEFAULT_MODEL
     )
+    env_max_tokens = os.environ.get("BULLETIN_TWEET_LLM_MAX_TOKENS", "").strip()
+    if env_max_tokens.isdigit():
+        max_tokens = int(env_max_tokens)
 
     user_msg = _build_user_message(symbols, ctx)
     resp = _call_claude(
@@ -486,13 +493,25 @@ def generate_narrative(
         logger.warning("bulletin_llm: Claude response had no text content")
         return None
 
+    stop_reason = resp.get("stop_reason")
     json_block = _extract_json_block(text)
     if not json_block:
-        logger.warning(
-            "bulletin_llm: could not find a JSON object in model output — "
-            "first 200 chars: %r",
-            text[:200],
-        )
+        # Most common cause: max_tokens capped the response mid-JSON.
+        # Surface that explicitly so the operator knows to bump the
+        # ceiling rather than think it's a prompt problem.
+        if stop_reason == "max_tokens":
+            logger.warning(
+                "bulletin_llm: model output truncated at max_tokens=%d — "
+                "increase BULLETIN_TWEET_LLM_MAX_TOKENS if this keeps happening. "
+                "Falling back to static template.",
+                max_tokens,
+            )
+        else:
+            logger.warning(
+                "bulletin_llm: could not find a JSON object in model output "
+                "(stop_reason=%s) — first 200 chars: %r",
+                stop_reason, text[:200],
+            )
         return None
 
     section = _parse_section(json_block)
