@@ -833,20 +833,30 @@ async def _fetch_bulletins(
     return out
 
 
-def _write_dry_run_artifacts(
+def _write_manifest_and_text(
     artifact_dir: Path,
     tweet: TweetBody,
     media: MediaArtifacts,
     mode: str,
     day: date,
     bulletins: list[SymbolBulletin],
+    state: str = "dry_run",
+    posted_id: str | None = None,
 ) -> None:
     """Persist a JSON manifest + the raw tweet text next to the media.
+
+    Written at three points in the fire lifecycle:
+
+      * dry_run — no --post flag, just showing what would go out
+      * pending — --stage was used, waiting for approval to post
+      * posted  — the tweet was successfully sent to X
 
     Operators need to be able to open one directory and see everything
     that would have gone out — text, PNG, clip and a small JSON with
     the level fields sourced from the DB (so a wrong number in the
-    tweet can be traced back to the underlying summary row)."""
+    tweet can be traced back to the underlying summary row).  The
+    ``state`` field lets the approve command distinguish drafts that
+    are eligible to POST from ones already sent."""
     body_path = artifact_dir / "tweet_text.md"
     body_path.write_text(tweet.text + "\n", encoding="utf-8")
     fallback_path = artifact_dir / "tweet_text_fallback.md"
@@ -855,6 +865,8 @@ def _write_dry_run_artifacts(
     manifest = {
         "mode": mode,
         "date": day.isoformat(),
+        "state": state,
+        "posted_id": posted_id,
         "lead_symbol": tweet.lead_symbol,
         "symbols_present": tweet.symbols_present,
         "text_len": len(tweet.text),
@@ -990,55 +1002,169 @@ async def _run(args: argparse.Namespace) -> int:
             tweet.lead_symbol, day, args.site_url, clip_out,
         )
 
-    _write_dry_run_artifacts(artifact_dir, tweet, media, args.mode, day, bulletins)
+    _write_manifest_and_text(
+        artifact_dir, tweet, media, args.mode, day, bulletins, state="dry_run",
+    )
 
     bearer = os.environ.get("X_BOT_BEARER_TOKEN", "").strip()
 
-    if not args.post or not bearer:
-        reason = "no --post flag" if not args.post else "X_BOT_BEARER_TOKEN unset"
+    # Autopilot: BULLETIN_TWEET_AUTOPILOT=1 in .env silently upgrades
+    # --stage to --post at runtime, so switching to full autopost is a
+    # one-line env-var flip — no systemd surgery required.  Explicit
+    # --post on the CLI always wins regardless.
+    autopilot = os.environ.get("BULLETIN_TWEET_AUTOPILOT", "").strip() in ("1", "true", "yes")
+    effective_post = bool(args.post) or (bool(args.stage) and autopilot)
+    effective_stage = bool(args.stage) and not effective_post
+
+    if effective_stage:
+        _write_manifest_and_text(
+            artifact_dir, tweet, media, args.mode, day, bulletins, state="pending",
+        )
+        _log_approval_required(args.mode, artifact_dir, tweet)
+        _call_notify_hook(args.mode, artifact_dir, tweet, media)
+        return 0
+
+    if not effective_post or not bearer:
+        reason = "no --post flag" if not effective_post else "X_BOT_BEARER_TOKEN unset"
         logger.info(
             "bulletin_tweet[%s]: DRY RUN (%s) — artifacts at %s\n----\n%s\n----",
             args.mode, reason, artifact_dir, tweet.text,
         )
         return 0
 
+    post_result = post_bulletin(
+        tweet=tweet,
+        media=media,
+        bearer=bearer,
+        long=args.long,
+        mode_label=args.mode,
+    )
+    if post_result:
+        _write_manifest_and_text(
+            artifact_dir, tweet, media, args.mode, day, bulletins,
+            state="posted", posted_id=post_result.get("id"),
+        )
+    return 0
+
+
+def post_bulletin(
+    tweet: TweetBody,
+    media: MediaArtifacts,
+    bearer: str,
+    long: bool,
+    mode_label: str,
+) -> dict[str, Any] | None:
+    """Upload media, POST to X, return {"id": tweet_id} on success.
+
+    Shared between the direct-post path (``bulletin_tweet --post``) and
+    the approve-a-staged-draft path (``bulletin_approve``) so both use
+    identical upload + fallback + retry logic.  Returns None on failure
+    so the caller can update the manifest state accordingly."""
     media_ids = _upload_media_files(media)
 
-    text_to_post = tweet.text if args.long else tweet.fallback
+    text_to_post = tweet.text if long else tweet.fallback
     if len(text_to_post) > LONG_TWEET_MAX_LEN:
         logger.warning(
             "bulletin_tweet[%s]: text length %d > %d — falling back to short body",
-            args.mode, len(text_to_post), LONG_TWEET_MAX_LEN,
+            mode_label, len(text_to_post), LONG_TWEET_MAX_LEN,
         )
         text_to_post = tweet.fallback
 
     try:
         resp = post_tweet_via_x_api(text_to_post, bearer, media_ids=media_ids or None)
     except (HTTPError, URLError) as exc:
-        logger.warning("bulletin_tweet[%s]: X API call failed (%s)", args.mode, exc)
+        logger.warning("bulletin_tweet[%s]: X API call failed (%s)", mode_label, exc)
         # If a long-form post failed with 403, try again with the fallback
         # (classic 280-char body) in case the bot handle isn't Premium.
-        if args.long and text_to_post != tweet.fallback:
-            logger.info("bulletin_tweet[%s]: retrying with short fallback body", args.mode)
+        if long and text_to_post != tweet.fallback:
+            logger.info("bulletin_tweet[%s]: retrying with short fallback body", mode_label)
             try:
                 resp = post_tweet_via_x_api(tweet.fallback, bearer, media_ids=media_ids or None)
             except Exception as exc2:  # noqa: BLE001
                 logger.warning(
-                    "bulletin_tweet[%s]: fallback retry also failed (%s)", args.mode, exc2,
+                    "bulletin_tweet[%s]: fallback retry also failed (%s)", mode_label, exc2,
                 )
-                return 0
         else:
-            return 0
+            return None
     except Exception as exc:  # noqa: BLE001
-        logger.warning("bulletin_tweet[%s]: unexpected X API error (%s)", args.mode, exc)
-        return 0
+        logger.warning("bulletin_tweet[%s]: unexpected X API error (%s)", mode_label, exc)
+        return None
 
     tweet_id = (resp.get("data") or {}).get("id")
     logger.info(
-        "bulletin_tweet[%s]: posted tweet id=%s for %s (media=%d, artifacts=%s)",
-        args.mode, tweet_id, day.isoformat(), len(media_ids), artifact_dir,
+        "bulletin_tweet[%s]: posted tweet id=%s (media=%d)",
+        mode_label, tweet_id, len(media_ids),
     )
-    return 0
+    return {"id": tweet_id, "response": resp}
+
+
+def _log_approval_required(mode: str, artifact_dir: Path, tweet: TweetBody) -> None:
+    logger.info(
+        "\n"
+        "================================================================\n"
+        "bulletin_tweet[%s]: STAGED — APPROVAL REQUIRED\n"
+        "================================================================\n"
+        "Artifacts:    %s\n"
+        "Text length:  %d chars (fallback %d)\n"
+        "Approve with: bin/bulletin-approve.sh %s\n"
+        "Discard with: bin/bulletin-approve.sh %s --discard\n"
+        "Autopilot:    set BULLETIN_TWEET_AUTOPILOT=1 in .env\n"
+        "================================================================\n"
+        "----\n%s\n----",
+        mode, artifact_dir, len(tweet.text), len(tweet.fallback), mode, mode, tweet.text,
+    )
+
+
+def _call_notify_hook(
+    mode: str,
+    artifact_dir: Path,
+    tweet: TweetBody,
+    media: MediaArtifacts,
+) -> None:
+    """Invoke $BULLETIN_TWEET_NOTIFY_HOOK if configured — noop otherwise.
+
+    The hook is called with args ``<mode> <artifact_dir>`` and receives
+    these extra env vars so an email/Slack/ntfy script has everything
+    it needs without re-parsing the manifest:
+
+      * BULLETIN_TWEET_MODE
+      * BULLETIN_TWEET_ARTIFACT_DIR
+      * BULLETIN_TWEET_TEXT_LEN
+      * BULLETIN_TWEET_HAS_PNG
+      * BULLETIN_TWEET_HAS_CLIP
+      * BULLETIN_TWEET_LEAD_SYMBOL
+
+    Any error from the hook logs a warning and returns — never fails
+    the staging job."""
+    hook = os.environ.get("BULLETIN_TWEET_NOTIFY_HOOK", "").strip()
+    if not hook:
+        return
+    hook_path = Path(hook)
+    if not hook_path.exists():
+        logger.warning(
+            "bulletin_tweet: notify hook %s does not exist — skipping notification",
+            hook_path,
+        )
+        return
+
+    env = os.environ.copy()
+    env["BULLETIN_TWEET_MODE"] = mode
+    env["BULLETIN_TWEET_ARTIFACT_DIR"] = str(artifact_dir)
+    env["BULLETIN_TWEET_TEXT_LEN"] = str(len(tweet.text))
+    env["BULLETIN_TWEET_HAS_PNG"] = "1" if media.png_path else "0"
+    env["BULLETIN_TWEET_HAS_CLIP"] = "1" if media.clip_path else "0"
+    env["BULLETIN_TWEET_LEAD_SYMBOL"] = tweet.lead_symbol
+    try:
+        subprocess.run(  # noqa: S603
+            [str(hook_path), mode, str(artifact_dir)],
+            env=env,
+            timeout=30,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("bulletin_tweet: notify hook failed (%s) — %s", hook_path, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1077,6 +1203,18 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help=(
             "Actually post to X. Without this flag the job dry-runs even when "
             "X_BOT_BEARER_TOKEN is set — safe by default."
+        ),
+    )
+    parser.add_argument(
+        "--stage",
+        action="store_true",
+        help=(
+            "Stage the draft for human approval instead of posting.  Writes "
+            "the full artifact set (text + PNG + clip + manifest with "
+            "state=pending) and calls $BULLETIN_TWEET_NOTIFY_HOOK if set.  "
+            "Operator approves with ``bin/bulletin-approve.sh <mode>``.  "
+            "Set BULLETIN_TWEET_AUTOPILOT=1 in .env to upgrade --stage to "
+            "--post at runtime — the one-line switch to full autopilot."
         ),
     )
     parser.add_argument(

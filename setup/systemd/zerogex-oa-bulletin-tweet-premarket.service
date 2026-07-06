@@ -13,13 +13,16 @@ WorkingDirectory=/home/ubuntu/zerogex-oa
 Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=/home/ubuntu/zerogex-oa/.env
 
-# Posts the pre-market bulletin tweet.  Requires BOTH the --post flag
-# AND X_BOT_BEARER_TOKEN (plus the four OAuth1 secrets for the media
-# attachments) to be set in the EnvironmentFile — defense in depth so
-# a half-configured rollout can't accidentally tweet.  Until those are
-# in place, every run emits the would-be tweet text + PNG + clip to
-# the artifact directory (default /var/lib/zerogex-oa/bulletin-tweets).
-ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.bulletin_tweet --mode premarket --post
+# Stages the pre-market bulletin tweet for human approval.  Writes the
+# full draft (text + PNG + clip + manifest with state=pending) and
+# calls $BULLETIN_TWEET_NOTIFY_HOOK if configured — operator then runs
+# ``bin/bulletin-approve.sh premarket`` to actually POST to X.
+#
+# Flip to full autopilot (no approval) by setting
+# ``BULLETIN_TWEET_AUTOPILOT=1`` in the EnvironmentFile — that upgrades
+# --stage to --post at runtime.  Safe-by-default: without the env var,
+# nothing goes out until you approve.
+ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.bulletin_tweet --mode premarket --stage
 
 TimeoutStartSec=240
 NoNewPrivileges=true
