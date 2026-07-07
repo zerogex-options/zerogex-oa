@@ -83,6 +83,27 @@ async def test_writer_dry_run_logs_payload(monkeypatch, caplog):
 
 
 @pytest.mark.asyncio
+async def test_writer_logs_signal_health_summary(monkeypatch, caplog):
+    """The signal-health line must fire every writer run so silent
+    degradation (VIX quietly missing for a week) becomes greppable."""
+    mod = _reload_module()
+    fake = _fake_db()
+    # Fake DB has no VIX method → vix falls back to None (missing).
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
+    args = mod._parse_args(["--date", "2026-06-29", "--symbol", "SPY", "--dry-run"])
+    with caplog.at_level("INFO"):
+        rc = await mod._run(args)
+    assert rc == 0
+    # Health line format: "SPY signals — walls=✓ pcr=... vix=✗ ..."
+    summary_lines = [r.message for r in caplog.records if "SPY signals" in r.message]
+    assert len(summary_lines) == 1
+    line = summary_lines[0]
+    assert "walls=✓" in line               # gex payload was present
+    assert "vix=✗" in line                 # fake db has no VIX helper
+    assert "atr=✗" in line                 # fake db has no ATR helper
+
+
+@pytest.mark.asyncio
 async def test_writer_commits_row_on_first_call(monkeypatch, caplog):
     mod = _reload_module()
 

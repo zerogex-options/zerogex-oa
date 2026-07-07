@@ -212,7 +212,7 @@ async def _gather_inputs(db: DatabaseManager, symbol: str) -> Optional[ForecastI
         if put_iv is not None and call_iv is not None:
             skew = float(put_iv) - float(call_iv)
 
-    return ForecastInputs(
+    inputs = ForecastInputs(
         symbol=symbol,
         forecast_date=today,
         spot=spot,
@@ -241,6 +241,38 @@ async def _gather_inputs(db: DatabaseManager, symbol: str) -> Optional[ForecastI
         strike_step=_strike_step_for(symbol),
         calibration=calibration_payload,
     )
+
+    # Signal-health summary — one line per symbol per fire so a daily
+    # ``journalctl -u zerogex-oa-forecast-writer | grep signals`` reveals
+    # exactly what's feeding the model.  Silent degradation was the reason
+    # VIX quietly missing for a week — this line makes gaps visible
+    # without inflating WARNING count.  Ticks (=✓) for populated fields,
+    # crosses (=✗) for missing.
+    def _tick(value: Any) -> str:
+        return "✓" if value is not None and value != [] else "✗"
+
+    logger.info(
+        "forecast_writer: %s signals — walls=%s pcr=%s msi=%s "
+        "%s=%s vix_z=%s iv_rank=%s atr=%s nodes=%d skew=%s "
+        "calib=%s flagship=%s (opex_fri=%s vix_exp=%s post_opex=%s event=%s)",
+        symbol,
+        _tick(inputs.call_wall if inputs.call_wall is not None else inputs.put_wall),
+        _tick(inputs.put_call_ratio),
+        _tick(inputs.msi_composite),
+        "vix" if not is_nasdaq_family else "vxn",
+        _tick(inputs.vix_close if not is_nasdaq_family else inputs.vxn_close),
+        _tick(inputs.vix_z_score_20d),
+        _tick(inputs.iv_rank_30d),
+        _tick(inputs.atr_5d),
+        len(inputs.top_gamma_nodes),
+        _tick(inputs.skew_delta),
+        _tick(inputs.calibration) if calibration_payload else "cold",
+        _tick(inputs.flagship_setup),
+        inputs.is_opex_friday, inputs.is_vix_expiration,
+        inputs.is_post_opex_monday, inputs.is_event_day,
+    )
+
+    return inputs
 
 
 def _build_payload(inputs: ForecastInputs, result: ForecastResult, open_ts: datetime) -> dict[str, Any]:
