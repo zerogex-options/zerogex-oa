@@ -51,6 +51,7 @@ import os
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
+from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocketState
 
 from ..identity import verify_ws_ticket
@@ -102,10 +103,27 @@ def register(
     ``get_broadcaster`` is a callable so the route captures the lookup,
     not the instance — the lifespan may wire the broadcaster after
     ``register`` is called, and a hot-reload could re-create it.
+
+    IMPORTANT: registered via Starlette's ``WebSocketRoute`` directly
+    on ``app.router.routes`` rather than the ``@app.websocket("/ws")``
+    decorator. The decorator path goes through FastAPI's dependency-
+    injection layer, which runs every app-level ``Depends()`` — and
+    ``api_key_auth`` uses ``Security(HTTPBearer(...))`` whose
+    ``__call__(self, request: Request)`` blows up on a WebSocket
+    scope with:
+
+        TypeError: HTTPBearer.__call__() missing 1 required
+            positional argument: 'request'
+
+    Bypassing the DI layer means the handler runs directly under
+    Starlette middleware (RequestId/Audit/UsageMeter/GZip/CORS —
+    which ARE WS-safe) and our own ticket auth is the only auth
+    gate. This is correct: browsers can't attach the Bearer/X-API-
+    Key headers that ``api_key_auth`` would look for anyway, so the
+    dep is a no-op at best on a WS handshake.
     """
     allowed_origins = _parse_origins(os.getenv("CORS_ALLOW_ORIGINS"))
 
-    @app.websocket("/ws")
     async def quote_stream(websocket: WebSocket) -> None:
         # ------------------------------------------------------------------
         # Handshake
@@ -265,6 +283,11 @@ def register(
                     await websocket.close()
                 except Exception:
                     pass
+
+    # Register directly on the underlying Starlette router — see the
+    # module docstring / register() docstring above for why we
+    # deliberately do NOT use ``@app.websocket("/ws")``.
+    app.router.routes.append(WebSocketRoute("/ws", endpoint=quote_stream))
 
 
 # ---------------------------------------------------------------------------
