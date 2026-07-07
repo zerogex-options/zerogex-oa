@@ -1543,7 +1543,8 @@ class SignalsQueriesMixin:
                         symbol, date, open_ts, open_spot,
                         call_wall, put_wall, gamma_flip, open_msi,
                         regime, projected_low, projected_high, projected_close,
-                        pin_strike, pin_tolerance, flagship_setup, range_model,
+                        pin_strike, pin_tolerance, regime_move_threshold,
+                        flagship_setup, range_model,
                         raw_projected_low, raw_projected_high, raw_pin_strike,
                         forecast_inputs, content_hash
                     )
@@ -1551,16 +1552,18 @@ class SignalsQueriesMixin:
                         $1, $2, $3, $4,
                         $5, $6, $7, $8,
                         $9, $10, $11, $12,
-                        $13, $14, $15::jsonb, $16,
-                        $17, $18, $19,
-                        $20::jsonb, $21
+                        $13, $14, $15,
+                        $16::jsonb, $17,
+                        $18, $19, $20,
+                        $21::jsonb, $22
                     )
                     ON CONFLICT (symbol, date) DO NOTHING
                     RETURNING symbol, date, open_ts, open_spot, call_wall,
                               put_wall, gamma_flip, open_msi, regime,
                               projected_low, projected_high, projected_close,
-                              pin_strike, pin_tolerance, flagship_setup,
-                              range_model, raw_projected_low, raw_projected_high,
+                              pin_strike, pin_tolerance, regime_move_threshold,
+                              flagship_setup, range_model,
+                              raw_projected_low, raw_projected_high,
                               raw_pin_strike, forecast_inputs,
                               content_hash, created_at
                     """,
@@ -1578,6 +1581,7 @@ class SignalsQueriesMixin:
                     payload.get("projected_close"),
                     payload.get("pin_strike"),
                     payload.get("pin_tolerance"),
+                    payload.get("regime_move_threshold"),
                     json.dumps(payload.get("flagship_setup"), default=str)
                     if payload.get("flagship_setup") is not None
                     else None,
@@ -1699,15 +1703,26 @@ class SignalsQueriesMixin:
                     raw_pin_hit = abs(actual_close - float(raw_pin)) <= effective_pin_tol
                 else:
                     raw_pin_hit = None
-                # Regime correctness: long-gamma days should chop (close
-                # within 0.5% of open); short-gamma days should trend
-                # (close moved more than 0.5%). Transition days are
-                # neutral — never marked wrong.
+                # Regime correctness: long-gamma days should chop
+                # (close move <= threshold); short-gamma days should
+                # trend (close moved more than threshold).  Transition
+                # days are neutral — never marked wrong.
+                #
+                # v1.3+ threshold is VIX-normalized and captured at
+                # write time — the receipt grader uses whatever the
+                # writer committed to.  Pre-v1.3 rows fall back to the
+                # legacy 0.5% behavior so their grades stay consistent
+                # with what was originally intended.
+                threshold_fraction = (
+                    float(row["regime_move_threshold"])
+                    if row.get("regime_move_threshold") is not None
+                    else 0.005
+                )
                 move_pct = abs(actual_close - open_spot) / open_spot if open_spot else 0.0
                 if regime == "long_gamma":
-                    regime_correct = move_pct <= 0.005
+                    regime_correct = move_pct <= threshold_fraction
                 elif regime == "short_gamma":
-                    regime_correct = move_pct > 0.005
+                    regime_correct = move_pct > threshold_fraction
                 else:
                     regime_correct = None
 

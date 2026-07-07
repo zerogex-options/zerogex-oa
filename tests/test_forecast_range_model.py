@@ -301,6 +301,48 @@ def test_regime_transition_when_msi_near_zero():
 
 
 # ---------------------------------------------------------------------------
+# VIX-normalized regime threshold (v1.3)
+# ---------------------------------------------------------------------------
+
+
+def test_regime_threshold_scales_up_with_vix():
+    """VIX=20 → implied ~1.26%; threshold = 0.6 × 0.0126 ≈ 0.756%.
+    VIX=12 → implied ~0.756%; threshold ≈ 0.453% → clamped to 0.5%? No,
+    floor is 0.3% so 0.453% is fine."""
+    low = compute_forecast(_inputs(vix_close=12.0)).regime_move_threshold
+    mid = compute_forecast(_inputs(vix_close=20.0)).regime_move_threshold
+    high = compute_forecast(_inputs(vix_close=30.0)).regime_move_threshold
+    assert low < mid < high
+
+
+def test_regime_threshold_uses_vxn_for_nasdaq():
+    """QQQ uses VXN, not VIX.  When VIX is None and VXN is provided,
+    threshold should reflect VXN."""
+    result = compute_forecast(_inputs(vix_close=None, vxn_close=22.0))
+    # Should not be the fallback 0.5%
+    assert result.regime_move_threshold != pytest.approx(0.005, abs=0.0001)
+    assert result.regime_move_threshold > 0.003
+
+
+def test_regime_threshold_falls_back_when_no_vol():
+    """No VIX and no VXN → fall back to legacy 0.5% (0.005)."""
+    result = compute_forecast(_inputs(vix_close=None, vxn_close=None))
+    assert result.regime_move_threshold == pytest.approx(0.005, abs=0.0001)
+
+
+def test_regime_threshold_clamped_at_floor():
+    """VIX ~5 (basically 0) → threshold below floor → clamp to 0.3%."""
+    result = compute_forecast(_inputs(vix_close=4.0))
+    assert result.regime_move_threshold == pytest.approx(0.003, abs=0.0002)
+
+
+def test_regime_threshold_clamped_at_ceiling():
+    """VIX 60 → threshold above ceiling → clamp to 2%."""
+    result = compute_forecast(_inputs(vix_close=60.0))
+    assert result.regime_move_threshold == pytest.approx(0.020, abs=0.0002)
+
+
+# ---------------------------------------------------------------------------
 # Layer-2 calibration
 # ---------------------------------------------------------------------------
 

@@ -2541,6 +2541,10 @@ CREATE TABLE IF NOT EXISTS daily_forecast (
     -- time. JSONB so we can evolve the shape without another migration
     -- while receipts are still being collected.
     forecast_inputs     JSONB,
+    -- v1.3: VIX-normalized chop/trend threshold captured at write time.
+    -- Immutable — the receipt grader uses this specific number so a VIX
+    -- shift between morning and close doesn't rewrite the grading rule.
+    regime_move_threshold NUMERIC(8,6),
     -- Receipt — written at 16:05 ET, never rewritten.
     receipt_ts          TIMESTAMPTZ,
     actual_low          NUMERIC(12,4),
@@ -2568,6 +2572,11 @@ ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS raw_pin_strike      NUMERIC(
 ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS forecast_inputs     JSONB;
 ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS raw_range_respected BOOLEAN;
 ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS raw_pin_hit         BOOLEAN;
+-- v1.3: VIX-normalized regime threshold captured at write time so the
+-- receipt grader uses the SAME threshold the morning writer committed to
+-- (not whatever the current VIX happens to be at 4 PM).  A NULL value on
+-- legacy pre-v1.3 rows falls back to the caller default in the grader.
+ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS regime_move_threshold NUMERIC(8,6);
 
 CREATE INDEX IF NOT EXISTS idx_daily_forecast_date_desc
     ON daily_forecast(date DESC);
@@ -2594,6 +2603,7 @@ BEGIN
     IF OLD.raw_projected_low  IS NOT NULL AND NEW.raw_projected_low  IS DISTINCT FROM OLD.raw_projected_low  THEN RAISE EXCEPTION 'daily_forecast.raw_projected_low is immutable'; END IF;
     IF OLD.raw_projected_high IS NOT NULL AND NEW.raw_projected_high IS DISTINCT FROM OLD.raw_projected_high THEN RAISE EXCEPTION 'daily_forecast.raw_projected_high is immutable'; END IF;
     IF OLD.forecast_inputs    IS NOT NULL AND NEW.forecast_inputs    IS DISTINCT FROM OLD.forecast_inputs    THEN RAISE EXCEPTION 'daily_forecast.forecast_inputs is immutable'; END IF;
+    IF OLD.regime_move_threshold IS NOT NULL AND NEW.regime_move_threshold IS DISTINCT FROM OLD.regime_move_threshold THEN RAISE EXCEPTION 'daily_forecast.regime_move_threshold is immutable'; END IF;
     -- Receipt columns are immutable once written.
     IF OLD.receipt_ts       IS NOT NULL AND NEW.receipt_ts       IS DISTINCT FROM OLD.receipt_ts       THEN RAISE EXCEPTION 'daily_forecast.receipt_ts is immutable once set'; END IF;
     IF OLD.actual_close     IS NOT NULL AND NEW.actual_close     IS DISTINCT FROM OLD.actual_close     THEN RAISE EXCEPTION 'daily_forecast.actual_close is immutable once set'; END IF;

@@ -74,6 +74,8 @@ def _shape_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
             "projected_high": _f(row.get("projected_high")),
             "projected_close": _f(row.get("projected_close")),
             "pin_strike": _f(row.get("pin_strike")),
+            "pin_tolerance": _f(row.get("pin_tolerance")),
+            "regime_move_threshold": _f(row.get("regime_move_threshold")),
             "flagship_setup": row.get("flagship_setup"),
             "range_model": row.get("range_model"),
             "content_hash": row.get("content_hash"),

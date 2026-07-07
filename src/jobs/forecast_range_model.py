@@ -89,6 +89,16 @@ PIN_TOLERANCE_MIN_SPOT_FRACTION = 0.0015
 # that matters"; smaller nodes are noise.
 STICKY_NODE_MIN_MAGNITUDE = 1e8
 
+# Regime chop/trend threshold — see _compute_regime_threshold.  0.6 ×
+# implied-1-day-move is roughly "closed inside 60% of the implied
+# envelope" — that's what a chop day looks like on a VIX-15 tape.  Below
+# the floor a VIX-8 day still needs some tolerance; above the ceiling a
+# VIX-40 tape can't be classified because everything moves.
+REGIME_THRESHOLD_MULTIPLIER = 0.6
+REGIME_THRESHOLD_MIN = 0.003        # 30bps absolute floor
+REGIME_THRESHOLD_MAX = 0.020        # 2% absolute ceiling
+REGIME_THRESHOLD_FALLBACK = 0.005   # matches legacy 0.5% behavior when no VIX
+
 DEFAULT_STRIKE_STEP = 1.0
 
 
@@ -174,6 +184,7 @@ class ForecastResult:
     pin_tolerance: float
 
     regime: str
+    regime_move_threshold: float = REGIME_THRESHOLD_FALLBACK
     range_model: str = "heuristic_v1_3"
     rationale: list[str] = field(default_factory=list)
 
@@ -222,6 +233,36 @@ def _vix_implied_daily_move(spot: float, vix: Optional[float]) -> Optional[float
     if vix is None or vix <= 0 or spot <= 0:
         return None
     return spot * (vix / 100.0) / math.sqrt(VIX_TRADING_DAYS_YEAR)
+
+
+def _compute_regime_threshold(
+    spot: float, vix_close: Optional[float], vxn_close: Optional[float]
+) -> float:
+    """Chop/trend threshold as a fraction of spot.
+
+    The receipt grader uses:
+      * ``long_gamma``  correct when ``|close-open|/open <= threshold``
+      * ``short_gamma`` correct when ``|close-open|/open >  threshold``
+
+    v1 hardcoded 0.5% for every symbol and every vol regime.  That made
+    the grade a VIX thermometer: on VIX-30 everything was a "trend day",
+    on VIX-12 everything a "chop day".  v1.3 pins the threshold to
+    ``0.6 × VIX-implied 1-day move / spot`` so a compressed-vol day
+    grades chop against a tighter bar and a high-vol day grades trend
+    against a looser bar.
+
+    Floor 30bps (a VIX-8 tape still needs some tolerance) and cap 2%
+    (a VIX-40 tape is unclassifiable — no threshold is meaningful).
+    Fallback to 0.005 (legacy) when VIX/VXN is unavailable so pre-v1.3
+    behavior is preserved for symbols we haven't wired vol for.
+    """
+    vol = vix_close if vix_close is not None else vxn_close
+    implied_dollars = _vix_implied_daily_move(spot, vol)
+    if implied_dollars is None or spot <= 0:
+        return REGIME_THRESHOLD_FALLBACK
+    implied_fraction = implied_dollars / spot
+    threshold = REGIME_THRESHOLD_MULTIPLIER * implied_fraction
+    return _clamp(threshold, REGIME_THRESHOLD_MIN, REGIME_THRESHOLD_MAX)
 
 
 def _select_pin_strike(inp: ForecastInputs) -> Optional[float]:
@@ -577,12 +618,17 @@ def compute_forecast(inp: ForecastInputs) -> ForecastResult:
         rationale.append("No pin candidate — projected close = open spot")
     pin_tol = _pin_tolerance(spot, inp.strike_step, calibration["pin_tolerance_mult"])
 
-    # Step 9 — regime.
+    # Step 9 — regime + VIX-normalized chop/trend threshold.
     regime = _classify_regime(inp.msi_composite)
+    regime_threshold = _compute_regime_threshold(spot, inp.vix_close, inp.vxn_close)
     rationale.append(
         f"Regime={regime} from MSI composite={inp.msi_composite}"
         if inp.msi_composite is not None
         else "Regime=transition (no MSI)"
+    )
+    rationale.append(
+        f"Chop/trend threshold={regime_threshold:.4f} "
+        f"({regime_threshold * 100:.2f}%)"
     )
 
     return ForecastResult(
@@ -592,6 +638,7 @@ def compute_forecast(inp: ForecastInputs) -> ForecastResult:
         pin_strike=pin_strike,
         pin_tolerance=round(pin_tol, 4),
         regime=regime,
+        regime_move_threshold=round(regime_threshold, 6),
         range_model="heuristic_v1_3",
         rationale=rationale,
         raw_projected_low=raw_low,

@@ -279,6 +279,7 @@ def _build_payload(inputs: ForecastInputs, result: ForecastResult, open_ts: date
         "projected_close": result.projected_close,
         "pin_strike": result.pin_strike,
         "pin_tolerance": result.pin_tolerance,
+        "regime_move_threshold": result.regime_move_threshold,
         "flagship_setup": inputs.flagship_setup,
         "range_model": result.range_model,
         "raw_projected_low": result.raw_projected_low,
