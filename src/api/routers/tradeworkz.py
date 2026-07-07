@@ -857,6 +857,297 @@ async def admin_inject_test_event(
 
 
 @router.get(
+    "/admin/diagnose",
+    dependencies=[Depends(require_scopes(SIGNALS))],
+)
+async def admin_diagnose() -> Dict[str, Any]:
+    """Explain per-bot why an entry did or did not fire on the current tick.
+
+    Rebuilds one MarketSnapshot per universe, then runs every enabled
+    bot's ``open_criteria`` inline and captures:
+
+      * The raw snapshot (spot, walls, GEX, regime, session progress).
+      * Whether the bot returned a signal — and if not, which gate
+        rejected it, walked in the same order the bot uses at tick time.
+      * For any bot that DID emit a signal: whether ``spread_price``
+        would return a fillable per-share debit, which is the single
+        biggest reason "signal fires but no trade is inserted." A
+        missing or stale ``option_chains`` row for the ATM strike is
+        the usual culprit.
+      * Scheduler status + when it last ticked (best-effort log-derived).
+
+    This endpoint is read-only — it never inserts a position or
+    persists any state — so it is safe to hit repeatedly during
+    diagnosis. Admin-scoped for consistency with the other
+    ``/admin/*`` endpoints.
+    """
+    from dataclasses import asdict
+    from src.database import db_connection
+    from src.tradeworkz import scheduler as scheduler_mod
+    from src.tradeworkz.bots.base import BaseBot
+    from src.tradeworkz.context import build_snapshot, MarketSnapshot
+    from src.tradeworkz.models import BotSpec
+    from src.tradeworkz.pricing import spread_price
+    from src.tradeworkz.registry import get_bot_class
+    from src.tradeworkz import ml as ml_mod
+    from src.tradeworkz.reconciler import load_capital
+
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, display_name, strategy_class, tier, direction_mode,
+                   universe, tagline, description, is_public, enabled, params
+            FROM tw_bots WHERE enabled = TRUE
+            ORDER BY id
+            """
+        )
+        bots = cur.fetchall()
+
+        underlyings = sorted({row[5] for row in bots}) or [tw_config.UNIVERSE]
+        snapshots: Dict[str, Optional[MarketSnapshot]] = {}
+        for u in underlyings:
+            snapshots[u] = build_snapshot(conn, u)
+
+        bot_reports: List[Dict[str, Any]] = []
+        for row in bots:
+            (
+                bot_id, display_name, strategy_class, tier, direction_mode,
+                universe, tagline, description, is_public, enabled, params,
+            ) = row
+            if isinstance(params, str):
+                try:
+                    params = json.loads(params)
+                except Exception:
+                    params = {}
+            snap = snapshots.get(universe)
+            report: Dict[str, Any] = {
+                "bot_id": bot_id,
+                "display_name": display_name,
+                "strategy_class": strategy_class,
+                "universe": universe,
+            }
+            if snap is None:
+                report["decision"] = "no_snapshot"
+                report["reason"] = (
+                    f"build_snapshot({universe}) returned None — no "
+                    "underlying_quotes tick or no gex_summary row."
+                )
+                bot_reports.append(report)
+                continue
+
+            spec = BotSpec(
+                id=bot_id, display_name=display_name,
+                strategy_class=strategy_class, tier=tier,
+                direction_mode=direction_mode, universe=universe,
+                tagline=tagline or "", description=description or "",
+                params=dict(params or {}),
+                is_public=bool(is_public), enabled=bool(enabled),
+            )
+            ml_state = ml_mod.load_state(conn, bot_id)
+            capital = load_capital(conn, bot_id)
+            bot_cls = get_bot_class(strategy_class)
+            bot: BaseBot = bot_cls(spec, ml_state=asdict(ml_state))
+
+            open_pos_count = 0
+            cur.execute(
+                "SELECT COUNT(1) FROM tw_positions WHERE bot_id = %s",
+                (bot_id,),
+            )
+            row_ct = cur.fetchone()
+            open_pos_count = int(row_ct[0]) if row_ct else 0
+            report["open_positions"] = open_pos_count
+            report["current_capital"] = (
+                capital.current_capital if capital else None
+            )
+            report["confidence_base"] = bot.confidence_base()
+            report["confidence_threshold"] = bot.confidence_threshold()
+            report["size_multiplier"] = bot.size_multiplier()
+
+            try:
+                signal = bot.open_criteria(snap)
+            except Exception as exc:  # noqa: BLE001
+                report["decision"] = "error"
+                report["error"] = f"{type(exc).__name__}: {exc}"
+                bot_reports.append(report)
+                continue
+
+            if signal is None:
+                report["decision"] = "no_signal"
+                report["reason"] = _explain_no_signal(bot, snap)
+                bot_reports.append(report)
+                continue
+
+            report["decision"] = "signal"
+            report["direction"] = signal.direction
+            report["strategy_type"] = signal.strategy_type
+            report["conviction"] = signal.conviction
+            report["legs"] = [
+                {
+                    "option_symbol": l.option_symbol,
+                    "side": l.side,
+                    "option_type": l.option_type,
+                    "strike": l.strike,
+                    "expiration": l.expiration,
+                }
+                for l in signal.legs
+            ]
+            report["rationale"] = signal.rationale
+
+            legs_dicts = [
+                {
+                    "option_symbol": l.option_symbol,
+                    "side": l.side,
+                    "option_type": l.option_type,
+                    "strike": l.strike,
+                    "expiration": l.expiration,
+                }
+                for l in signal.legs
+            ]
+            fill_probe: Dict[str, Any] = {}
+            for l in legs_dicts:
+                sym = l["option_symbol"]
+                cur.execute(
+                    """
+                    SELECT bid, ask, last, timestamp,
+                           EXTRACT(EPOCH FROM (NOW() - timestamp)) AS age_s
+                    FROM option_chains
+                    WHERE option_symbol = %s
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                    """,
+                    (sym,),
+                )
+                q = cur.fetchone()
+                fill_probe[sym] = (
+                    {
+                        "bid": float(q[0]) if q[0] is not None else None,
+                        "ask": float(q[1]) if q[1] is not None else None,
+                        "last": float(q[2]) if q[2] is not None else None,
+                        "quote_age_s": float(q[4]) if q[4] is not None else None,
+                    }
+                    if q
+                    else {"status": "no_row"}
+                )
+            report["fill_probe"] = fill_probe
+
+            price = spread_price(conn, legs_dicts, action="open")
+            report["fill_price"] = price
+            report["fillable"] = price is not None and price > 0
+            if not report["fillable"]:
+                report["fill_block_reason"] = (
+                    "spread_price returned None or <= 0. Either no "
+                    "option_chains row exists for the ATM symbol, or "
+                    "the quote is older than OPTION_QUOTE_MAX_AGE_SECONDS."
+                )
+            bot_reports.append(report)
+
+    scheduler = scheduler_mod.scheduler
+    scheduler_status = {
+        "enabled": tw_config.ENGINE_ENABLED,
+        "running": scheduler.is_running(),
+        "interval_seconds": tw_config.ENGINE_INTERVAL_SECONDS,
+    }
+
+    snapshot_summaries: Dict[str, Any] = {}
+    for u, snap in snapshots.items():
+        if snap is None:
+            snapshot_summaries[u] = None
+            continue
+        snapshot_summaries[u] = {
+            "timestamp": (
+                snap.timestamp.isoformat()
+                if hasattr(snap.timestamp, "isoformat")
+                else str(snap.timestamp)
+            ),
+            "spot": snap.spot,
+            "call_wall": snap.call_wall,
+            "put_wall": snap.put_wall,
+            "gamma_flip": snap.gamma_flip,
+            "max_pain": snap.max_pain,
+            "net_gex": snap.net_gex,
+            "gex_regime": snap.gex_regime(),
+            "dealer_net_delta": snap.dealer_net_delta,
+            "vix": snap.vix,
+            "vwap": snap.vwap,
+            "vwap_deviation_pct": snap.vwap_deviation_pct,
+            "session_high": snap.session_high,
+            "session_low": snap.session_low,
+            "minutes_since_open": snap.minutes_since_open,
+            "minutes_to_close": snap.minutes_to_close,
+            "distance_to_call_wall_pct": snap.distance_to_call_wall_pct(),
+            "distance_to_put_wall_pct": snap.distance_to_put_wall_pct(),
+        }
+
+    return {
+        "scheduler": scheduler_status,
+        "snapshots": snapshot_summaries,
+        "bots": bot_reports,
+    }
+
+
+def _explain_no_signal(bot: "BaseBot", snap: "MarketSnapshot") -> str:  # noqa: F821
+    """Walk the shared gates every bot uses and name the first one that fails.
+
+    Each bot's ``open_criteria`` implements its own gate order, so this is
+    a best-effort common-case explanation covering:
+      * gamma regime (only relevant for regime-gated bots)
+      * minutes_since_open floor (early-session noise reject)
+      * wall_proximity_pct (for the wall bouncer)
+      * confidence threshold vs. base
+
+    Anything more specific requires reading the individual bot's source.
+    """
+    reasons: List[str] = []
+    regime = snap.gex_regime()
+    strategy = bot.spec.strategy_class
+
+    if strategy == "PutCallWallBouncer":
+        if regime not in {"positive_strong", "positive_weak"}:
+            return (
+                f"regime_gate: gex_regime={regime!r}; wall bouncer only fires "
+                "in positive-γ regimes."
+            )
+        mins = snap.minutes_since_open
+        if mins is None or mins < 30:
+            return (
+                f"session_gate: minutes_since_open={mins}; wall bouncer waits "
+                "≥30 min after the open."
+            )
+        prox_pct = float(bot.params.get("wall_proximity_pct", 0.002))
+        call_d = snap.distance_to_call_wall_pct()
+        put_d = snap.distance_to_put_wall_pct()
+        call_touch = (
+            call_d is not None
+            and abs(call_d) <= prox_pct
+            and snap.spot <= (snap.call_wall or 0)
+        )
+        put_touch = (
+            put_d is not None
+            and abs(put_d) <= prox_pct
+            and snap.spot >= (snap.put_wall or 0)
+        )
+        if not (call_touch or put_touch):
+            return (
+                f"proximity_gate: spot {snap.spot} not within "
+                f"{prox_pct * 100:.2f}% of call_wall={snap.call_wall} "
+                f"(dist={call_d}) or put_wall={snap.put_wall} "
+                f"(dist={put_d})."
+            )
+        return (
+            "conviction_gate: wall was touched but blended conviction < "
+            f"threshold ({bot.confidence_threshold():.2f})."
+        )
+    if snap.gex_regime() == "unknown":
+        reasons.append("net_gex is None — gex_summary may be empty.")
+    if snap.minutes_since_open is None:
+        reasons.append("session hasn't started (pre-open).")
+    return "; ".join(reasons) or (
+        f"bot-specific gate; open_criteria returned None with regime={regime}."
+    )
+
+
+@router.get(
     "/internal/queued-notifications",
     dependencies=[Depends(require_scopes(SIGNALS))],
 )
