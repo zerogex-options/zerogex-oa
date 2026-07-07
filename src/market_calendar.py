@@ -24,7 +24,7 @@ from typing import Optional
 
 import pytz
 
-from src.symbols import is_cash_index
+from src.symbols import is_cash_index, resolve_index_future
 from src.utils import get_logger
 
 logger = get_logger(__name__)
@@ -345,6 +345,104 @@ def is_underlying_active_session(
     else:
         open_t, close_t = time(4, 0), time(20, 0)
     return open_t <= dt.time() <= close_t
+
+
+# ---------------------------------------------------------------------------
+# CME equity-index futures session (for the out-of-cash-session display swap)
+# ---------------------------------------------------------------------------
+
+# CME Globex equity-index futures (ES, NQ, RTY, YM) trade nearly 24h:
+#   Sunday 18:00 ET  →  Friday 17:00 ET
+# with a daily maintenance break 17:00–18:00 ET.  This is DISPLAY-only
+# session logic — used to decide when a cash-index quote/candle surface
+# should show its futures equivalent instead of the (frozen) index.
+#
+# CME holidays (which differ from the NYSE calendar) are intentionally NOT
+# modelled here: on a CME holiday the futures feed simply returns no fresh
+# bars, which the request-time fetch surfaces as a stale/last print — the
+# same graceful degradation as any other quiet period.
+
+_FUTURES_REOPEN = time(18, 0)  # Sunday open / daily reopen after maintenance
+_FUTURES_DAILY_CLOSE = time(17, 0)  # Friday close / daily maintenance start
+
+
+def is_futures_session_open(dt: Optional[datetime] = None) -> bool:
+    """True when the CME equity-index futures session is trading at ``dt``.
+
+    Session: Sunday 18:00 ET → Friday 17:00 ET, with a daily maintenance
+    break 17:00–18:00 ET.  Weekends outside those bounds are closed.
+    """
+    dt = _to_et(dt)
+    wd = dt.weekday()  # Mon=0 … Sun=6
+    t = dt.time()
+
+    # Daily maintenance break (17:00–18:00 ET every trading day).
+    if _FUTURES_DAILY_CLOSE <= t < _FUTURES_REOPEN:
+        return False
+    if wd == 5:  # Saturday — closed all day
+        return False
+    if wd == 6:  # Sunday — opens at 18:00 ET
+        return t >= _FUTURES_REOPEN
+    if wd == 4:  # Friday — closes at 17:00 ET
+        return t < _FUTURES_DAILY_CLOSE
+    return True  # Mon–Thu — open except the 17:00–18:00 break handled above
+
+
+def is_futures_display_window(dt: Optional[datetime] = None) -> bool:
+    """True when the site is in the overnight futures-display window.
+
+    The window is 18:00 ET → next 09:30 ET AND the CME futures session is
+    actually trading (so the Friday 17:00 → Sunday 18:00 weekend gap and
+    the daily 17:00–18:00 maintenance break are excluded).  This is the
+    symbol-agnostic timing gate shared by the display swap
+    (:func:`should_display_future`) and the futures ingester, so both agree
+    on exactly when the flip happens.
+    """
+    dt = _to_et(dt)
+    t = dt.time()
+    in_overnight_window = t >= _FUTURES_REOPEN or t < time(9, 30)
+    return in_overnight_window and is_futures_session_open(dt)
+
+
+def should_display_future(symbol: Optional[str], dt: Optional[datetime] = None) -> bool:
+    """True when a cash-index display surface should swap to its future.
+
+    Policy (all times ET): show the cash index (SPX/NDX/…) during the
+    regular cash session AND through the post-close / maintenance evening
+    hold, then swap to the future only during the overnight futures window
+    — 18:00 ET → next 09:30 ET — while the futures market is actually
+    trading.  Concretely:
+
+      * 09:30–16:00  cash session      → index (live)
+      * 16:00–18:00  post-close / break→ index (frozen cash close)
+      * 18:00–09:30  overnight futures → future  (when the future is open)
+      * Fri 17:00 → Sun 18:00 weekend  → index (frozen Friday close)
+
+    Requires ``symbol`` to be a cash index WITH a mapped future; returns
+    False otherwise.  DISPLAY-ONLY — never used to key data, persistence,
+    or analytics.
+    """
+    if not symbol or not is_cash_index(symbol):
+        return False
+    if resolve_index_future(symbol) is None:
+        return False
+    return is_futures_display_window(dt)
+
+
+def current_futures_session_start(dt: Optional[datetime] = None) -> datetime:
+    """Return the 18:00 ET open of the current overnight futures session.
+
+    Used as the reference point for the overnight change display: the
+    change is quoted futures-vs-futures (last minus the session-open print)
+    so it never mixes in the cash index's basis.  If it's on/after 18:00
+    ET the boundary is today's 18:00; in the early-morning tail (before
+    09:30 ET) it's the prior calendar day's 18:00.
+    """
+    dt = _to_et(dt)
+    anchor_date = dt.date()
+    if dt.time() < _FUTURES_REOPEN:
+        anchor_date = anchor_date - timedelta(days=1)
+    return ET.localize(datetime.combine(anchor_date, _FUTURES_REOPEN))
 
 
 # ---------------------------------------------------------------------------

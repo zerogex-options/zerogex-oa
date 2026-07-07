@@ -374,6 +374,46 @@ CREATE TABLE IF NOT EXISTS vxn_bars (
 CREATE INDEX IF NOT EXISTS idx_vxn_bars_timestamp ON vxn_bars(timestamp DESC);
 
 -- =============================================================================
+-- futures_quotes — rolling window of 1-minute CME equity-index futures bars.
+-- =============================================================================
+-- DISPLAY-ONLY substitute for a cash index outside the regular cash
+-- session.  During the overnight futures window (18:00 ET -> next 09:30 ET)
+-- the futures ingester (src/ingestion/futures_underlying_ingester.py)
+-- streams the mapped continuous future (SPX->@ES, NDX->@NQ, ...) into this
+-- table, and /api/market/quote + /api/market/historical read from here
+-- (under the INDEX label) when should_display_future() is true.
+--
+-- This table NEVER feeds GEX / greeks / signals / settlement — those key
+-- on underlying_quotes.symbol (the cash index).  Rows are pruned to a
+-- rolling retention window (default 7 days), so this is not a durable
+-- store; it exists purely to back the live/near-live display swap.
+--
+--   index_symbol   — the cash index the future stands in for (SPX, NDX, …);
+--                    the key the API reads by.
+--   future_symbol  — the TradeStation continuous-contract symbol actually
+--                    streamed (@ES, @NQ, …); surfaced to the UI as the
+--                    "showing futures: ES" badge (data_symbol).
+CREATE TABLE IF NOT EXISTS futures_quotes (
+    index_symbol VARCHAR(10) NOT NULL,
+    future_symbol VARCHAR(16) NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL,
+    open NUMERIC(12, 4) NOT NULL,
+    high NUMERIC(12, 4) NOT NULL,
+    low NUMERIC(12, 4) NOT NULL,
+    close NUMERIC(12, 4) NOT NULL,
+    up_volume BIGINT DEFAULT 0,
+    down_volume BIGINT DEFAULT 0,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (index_symbol, timestamp),
+    CONSTRAINT check_fq_positive_prices CHECK (open > 0 AND high > 0 AND low > 0 AND close > 0),
+    CONSTRAINT check_fq_high_low CHECK (high >= low)
+);
+
+CREATE INDEX IF NOT EXISTS idx_futures_quotes_timestamp ON futures_quotes(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_futures_quotes_index_symbol_timestamp
+    ON futures_quotes(index_symbol, timestamp DESC);
+
+-- =============================================================================
 -- TradeStation API call counts per 5-minute UTC window.
 -- Each ingestion process upserts its window count at window rollover; the
 -- ON CONFLICT clause sums counts across processes that share the same window.
@@ -649,6 +689,12 @@ CREATE TRIGGER update_option_chains_updated_at
 DROP TRIGGER IF EXISTS update_vix_bars_updated_at ON vix_bars;
 CREATE TRIGGER update_vix_bars_updated_at
     BEFORE UPDATE ON vix_bars
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_futures_quotes_updated_at ON futures_quotes;
+CREATE TRIGGER update_futures_quotes_updated_at
+    BEFORE UPDATE ON futures_quotes
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 

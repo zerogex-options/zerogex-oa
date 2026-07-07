@@ -83,6 +83,51 @@ def is_cash_index(symbol: str) -> bool:
     return resolve_volume_proxy(symbol) is not None
 
 
+# Cash indices print an underlying level only during the regular cash
+# session (09:30–16:00 ET).  For "what is it doing right now" display
+# surfaces OUTSIDE that session, we substitute the equivalent CME
+# equity-index future (SPX→ES, NDX→NQ, …), which trades nearly 24h.
+#
+# This is a DISPLAY-ONLY substitution: it feeds the header quote, the
+# quote cards, and the candlestick charts, and NOTHING else.  GEX,
+# Greeks, signals, settlement, session-levels and every DB write continue
+# to key on the cash-index symbol.  The futures data is fetched at request
+# time and is NOT persisted.
+#
+# Override with the ``INDEX_FUTURES_MAP`` env var (same KEY=VALUE format as
+# ``SYMBOL_ALIASES``).  Values are TradeStation CONTINUOUS-contract symbols
+# (the ``@`` form, e.g. ``@ES``) so contract roll is handled upstream by
+# the provider.
+_DEFAULT_INDEX_FUTURES: Dict[str, str] = {
+    "SPX": "@ES",
+    "NDX": "@NQ",
+    "RUT": "@RTY",
+    "DJX": "@YM",
+}
+
+
+def get_index_futures() -> Dict[str, str]:
+    """Return the index → continuous-future display mapping (env-overridable)."""
+    overrides = _parse_alias_mapping(os.getenv("INDEX_FUTURES_MAP", ""))
+    merged = dict(_DEFAULT_INDEX_FUTURES)
+    merged.update(overrides)
+    return merged
+
+
+def resolve_index_future(symbol: str) -> str | None:
+    """Return the futures symbol to DISPLAY for ``symbol`` outside cash hours.
+
+    Returns None when ``symbol`` is not a cash index with a mapped future —
+    i.e. there is nothing to substitute.  DISPLAY-ONLY: callers must keep
+    using the original ``symbol`` for every non-display purpose (GEX,
+    Greeks, signals, settlement, persistence).
+    """
+    normalized = (symbol or "").strip().upper()
+    if not normalized:
+        return None
+    return get_index_futures().get(normalized)
+
+
 def resolve_symbol(symbol_or_alias: str) -> str:
     """Resolve a symbol or alias (case-insensitive) to TradeStation symbol."""
     normalized = symbol_or_alias.strip().upper()
