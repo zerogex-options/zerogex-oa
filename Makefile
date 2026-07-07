@@ -3546,6 +3546,47 @@ forecast-receipt: ## Write today's receipt against the immutable morning commitm
 		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
 		$(if $(FORECAST_SYMBOLS),--symbol $(FORECAST_SYMBOLS))
 
+.PHONY: forecast-prune
+forecast-prune: ## Delete daily_forecast rows before a cutoff. Vars: BEFORE=YYYY-MM-DD (required), SYMBOL=SPY (optional scope). Dry-run by default; pass CONFIRM=yes to execute.
+	@echo "$(BLUE)=== Forecast Prune (daily_forecast) ===$(NC)"
+	@if [ -z "$${BEFORE}" ]; then \
+		echo "$(RED)BEFORE=YYYY-MM-DD is required -- refusing to run without an explicit cutoff.$(NC)"; \
+		echo "$(YELLOW)Deletes rows with date < BEFORE (BEFORE itself is kept).$(NC)"; \
+		echo "$(YELLOW)  make forecast-prune BEFORE=2026-07-06             # keep 2026-07-06 and newer, all symbols$(NC)"; \
+		echo "$(YELLOW)  make forecast-prune BEFORE=2026-07-06 SYMBOL=SPY  # scope to one symbol$(NC)"; \
+		echo "$(YELLOW)  make forecast-prune BEFORE=2026-07-06 CONFIRM=yes # actually delete$(NC)"; \
+		exit 1; \
+	fi; \
+	if ! echo "$${BEFORE}" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$$'; then \
+		echo "$(RED)BEFORE='$${BEFORE}' is not a YYYY-MM-DD date.$(NC)"; \
+		exit 1; \
+	fi; \
+	SYMBOL_FILTER=""; \
+	if [ -n "$${SYMBOL}" ]; then \
+		echo "$(YELLOW)Scoping to SYMBOL='$${SYMBOL}'.$(NC)"; \
+		SYMBOL_FILTER="AND symbol = '$${SYMBOL}'"; \
+	else \
+		echo "$(YELLOW)No SYMBOL set -> ALL symbols.$(NC)"; \
+	fi; \
+	echo "$(YELLOW)Target: daily_forecast rows with date < '$${BEFORE}' (permanent DELETE).$(NC)"; \
+	echo "$(YELLOW)These are immutable public commitments + 4 PM receipts. Snapshot first if$(NC)"; \
+	echo "$(YELLOW)you may want them back, e.g. inside psql:$(NC)"; \
+	echo "$(YELLOW)  CREATE TABLE daily_forecast_archive AS$(NC)"; \
+	echo "$(YELLOW)  SELECT * FROM daily_forecast WHERE date < '$${BEFORE}' $${SYMBOL_FILTER};$(NC)"; \
+	echo "$(BLUE)--- Rows to delete (grouped by symbol) ---$(NC)"; \
+	$(PSQL) -c "SELECT symbol, COUNT(*) AS n_rows, MIN(date) AS oldest, MAX(date) AS newest, \
+		COUNT(*) FILTER (WHERE receipt_ts IS NOT NULL) AS graded \
+		FROM daily_forecast WHERE date < '$${BEFORE}' $${SYMBOL_FILTER} \
+		GROUP BY symbol ORDER BY symbol;"; \
+	if [ "$${CONFIRM}" != "yes" ]; then \
+		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to DELETE the rows above.$(NC)"; \
+	else \
+		echo "$(BLUE)--- Deleting ---$(NC)"; \
+		ROWS=$$($(PSQL) -t -A -c "DELETE FROM daily_forecast WHERE date < '$${BEFORE}' $${SYMBOL_FILTER} RETURNING 1;" | wc -l); \
+		echo "$(GREEN)✓ Deleted $$ROWS daily_forecast row(s) before $${BEFORE}.$(NC)"; \
+		echo "$(YELLOW)The /forecast list refreshes on its ISR cache (~1 h landing / ~30 min detail).$(NC)"; \
+	fi
+
 .PHONY: session-levels-dry-run
 session-levels-dry-run: ## Dry-run the session-levels capture (pre-market + prev-session H/L; never writes)
 	@echo "$(BLUE)=== Dry-run session-levels capture ===$(NC)"
