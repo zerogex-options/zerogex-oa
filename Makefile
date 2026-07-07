@@ -3582,8 +3582,8 @@ forecast-prune: ## Delete daily_forecast rows before a cutoff. Vars: BEFORE=YYYY
 		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to DELETE the rows above.$(NC)"; \
 	else \
 		echo "$(BLUE)--- Deleting ---$(NC)"; \
-		ROWS=$$($(PSQL) -t -A -c "DELETE FROM daily_forecast WHERE date < '$${BEFORE}' $${SYMBOL_FILTER} RETURNING 1;" | wc -l); \
-		echo "$(GREEN)✓ Deleted $$ROWS daily_forecast row(s) before $${BEFORE}.$(NC)"; \
+		ROWS=$$($(PSQL) -t -A -c "WITH deleted AS (DELETE FROM daily_forecast WHERE date < '$${BEFORE}' $${SYMBOL_FILTER} RETURNING 1) SELECT COUNT(*) FROM deleted;"); \
+		echo "$(GREEN)✓ Deleted $${ROWS} daily_forecast row(s) before $${BEFORE}.$(NC)"; \
 		echo "$(YELLOW)The /forecast list refreshes on its ISR cache (~1 h landing / ~30 min detail).$(NC)"; \
 	fi
 
