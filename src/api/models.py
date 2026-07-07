@@ -239,9 +239,10 @@ class UnderlyingQuote(BaseModel):
     #   display_source: 'futures' when the future should be shown, else None.
     #   data_symbol:    the future's UI ticker (e.g. 'ES'), else None.
     #   futures_close:  the future's last price (the number those surfaces show).
-    #   futures_reference_close: the future's session-open print (tonight's
-    #       18:00 ET bar) — the baseline for the overnight change, so it stays
-    #       futures-vs-futures and never mixes in the index↔future basis.
+    #   futures_reference_close: the future's price at the 16:00 ET cash close
+    #       — the baseline for the overnight change, measured futures-vs-futures
+    #       (the future's own 16:00 print) so it never mixes in the index↔future
+    #       basis.
     display_source: Optional[str] = None
     data_symbol: Optional[str] = None
     futures_close: Optional[Decimal] = None

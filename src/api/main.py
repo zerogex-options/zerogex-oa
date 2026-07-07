@@ -994,7 +994,7 @@ from src.market_calendar import (  # noqa: E402
     ET as _ET,
     NYSE_HOLIDAYS as _NYSE_HOLIDAYS,
     should_display_future,
-    current_futures_session_start,
+    current_cash_close_reference,
 )
 from src.config import _getenv_bool  # noqa: E402
 from src.symbols import resolve_index_future  # noqa: E402
@@ -1210,7 +1210,7 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
         # omitted if the futures ingester has no rows yet.
         if _index_futures_display_enabled() and should_display_future(symbol):
             fut = await _db().get_latest_future_quote(
-                symbol, current_futures_session_start()
+                symbol, current_cash_close_reference()
             )
             if fut and fut.get("close") is not None:
                 data["display_source"] = "futures"
