@@ -22,7 +22,7 @@ import json
 import logging
 import os
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -151,9 +151,15 @@ async def _gather_inputs(db: DatabaseManager, symbol: str) -> Optional[ForecastI
     # Vol regime — VIX for equity index-ish, VXN for NASDAQ-family.
     is_nasdaq_family = symbol.upper() in _VXN_SYMBOLS
     vol_ticker = "VXN" if is_nasdaq_family else "VIX"
+    # get_volatility_index_bars requires a real datetime cutoff and a
+    # tzinfo object — passing None + "UTC" (string) silently swallowed
+    # every VIX/VXN fetch through _fetch_optional's error catcher.  A
+    # 3-day lookback comfortably covers the latest bar even after a
+    # holiday weekend.
+    vix_cutoff = datetime.now(timezone.utc) - timedelta(days=3)
     vix_bars = await _fetch_optional(
         db, "get_volatility_index_bars", f"get_volatility_index_bars[{vol_ticker}]", symbol,
-        ticker=vol_ticker, cutoff=None, tz="UTC",
+        ticker=vol_ticker, cutoff=vix_cutoff, tz=timezone.utc,
     )
     vix_close = None
     if vix_bars:
