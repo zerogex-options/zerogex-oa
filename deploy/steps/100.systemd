@@ -105,6 +105,11 @@ TIMER_UNITS=(
     # docs/design/backtesting-platform.md + docs/design/pattern-calibration.md.
     "zerogex-oa-backtest-archive"
     "zerogex-oa-pattern-calibration"
+    # Pre-market + previous-session high/low capture (every 5 min through
+    # the 04:00-09:30 ET pre-market window + 10:00 ET finalize).  Feeds
+    # /api/market/session-levels and the frontend chart level overlays.
+    # See src/jobs/session_levels.py.
+    "zerogex-oa-session-levels"
 )
 
 # Pre-create writable state directories needed by the timer units above.

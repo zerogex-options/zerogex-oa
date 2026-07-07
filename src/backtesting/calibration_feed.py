@@ -63,6 +63,14 @@ class PnlPatternStat:
     n_trades: int = 0
     n_wins: int = 0
     n_losses: int = 0
+    # Dollar economics — gross_win_pnl is the sum of winning trades' net_pnl
+    # (always ≥ 0); gross_loss_pnl is the absolute sum of losing trades'
+    # net_pnl (also ≥ 0). Net P&L = gross_win − gross_loss; profit factor =
+    # gross_win / gross_loss; expectancy = (gross_win − gross_loss) / n_trades.
+    # Stored so the insights endpoint can serve PF/expectancy from one DB
+    # read without re-running the engine.
+    gross_win_pnl: float = 0.0
+    gross_loss_pnl: float = 0.0
 
     @property
     def hit_rate(self) -> float | None:
@@ -188,7 +196,7 @@ def explain_trades(conn, *, underlying: str, pattern: str, days: int = _DEFAULT_
 
 def aggregate_trades(trades, *, underlying: str, window_start: date,
                      window_end: date) -> list[PnlPatternStat]:
-    """Group engine trades by pattern into realized win/loss counts."""
+    """Group engine trades by pattern into realized win/loss counts + economics."""
     by_pattern: dict[str, PnlPatternStat] = {}
     for t in trades:
         ps = by_pattern.setdefault(
@@ -203,8 +211,10 @@ def aggregate_trades(trades, *, underlying: str, window_start: date,
         ps.n_trades += 1
         if t.net_pnl > 0:
             ps.n_wins += 1
+            ps.gross_win_pnl += float(t.net_pnl)
         else:
             ps.n_losses += 1
+            ps.gross_loss_pnl += abs(float(t.net_pnl))
     return list(by_pattern.values())
 
 
@@ -224,17 +234,21 @@ def upsert_pnl_stats(conn, stats) -> None:
                 (pattern, underlying, window_start, window_end,
                  n_emitted, n_resolved, n_target_hit, n_stop_hit, n_time_exit,
                  hit_rate, avg_confidence, avg_mfe_pct, avg_mae_pct,
-                 proposed_base, source, computed_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, NULL, NULL, %s, %s, NOW())
+                 proposed_base, gross_win_pnl, gross_loss_pnl,
+                 source, computed_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    NULL, NULL, NULL, %s, %s, %s, %s, NOW())
             ON CONFLICT (pattern, underlying, window_start, window_end, source) DO UPDATE SET
-                n_emitted     = EXCLUDED.n_emitted,
-                n_resolved    = EXCLUDED.n_resolved,
-                n_target_hit  = EXCLUDED.n_target_hit,
-                n_stop_hit    = EXCLUDED.n_stop_hit,
-                n_time_exit   = EXCLUDED.n_time_exit,
-                hit_rate      = EXCLUDED.hit_rate,
-                proposed_base = EXCLUDED.proposed_base,
-                computed_at   = NOW()
+                n_emitted      = EXCLUDED.n_emitted,
+                n_resolved     = EXCLUDED.n_resolved,
+                n_target_hit   = EXCLUDED.n_target_hit,
+                n_stop_hit     = EXCLUDED.n_stop_hit,
+                n_time_exit    = EXCLUDED.n_time_exit,
+                hit_rate       = EXCLUDED.hit_rate,
+                proposed_base  = EXCLUDED.proposed_base,
+                gross_win_pnl  = EXCLUDED.gross_win_pnl,
+                gross_loss_pnl = EXCLUDED.gross_loss_pnl,
+                computed_at    = NOW()
             """,
             (
                 s.pattern,
@@ -248,6 +262,8 @@ def upsert_pnl_stats(conn, stats) -> None:
                 0,                # n_time_exit (not distinguished here)
                 s.hit_rate,
                 s.proposed_base,
+                s.gross_win_pnl,
+                s.gross_loss_pnl,
                 SOURCE,
             ),
         )

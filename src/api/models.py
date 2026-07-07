@@ -231,6 +231,21 @@ class UnderlyingQuote(BaseModel):
     down_volume: Optional[int] = None
     volume: Optional[int] = None
     session: Optional[str] = None
+    # DISPLAY-only index→future swap (see market_calendar.should_display_future).
+    # These are ADDITIVE: the base OHLC/close/session stay the cash index so
+    # every downstream consumer of the quote (GEX spot, greeks, options
+    # calculator, heatmap) is unaffected. Only the header quote, the quote
+    # card, and the candlestick chart read the futures fields.
+    #   display_source: 'futures' when the future should be shown, else None.
+    #   data_symbol:    the future's UI ticker (e.g. 'ES'), else None.
+    #   futures_close:  the future's last price (the number those surfaces show).
+    #   futures_reference_close: the future's session-open print (tonight's
+    #       18:00 ET bar) — the baseline for the overnight change, so it stays
+    #       futures-vs-futures and never mixes in the index↔future basis.
+    display_source: Optional[str] = None
+    data_symbol: Optional[str] = None
+    futures_close: Optional[Decimal] = None
+    futures_reference_close: Optional[Decimal] = None
 
     class Config:
         from_attributes = True
@@ -390,6 +405,36 @@ class SessionCloses(BaseModel):
     current_session_close_ts: Optional[datetime]
     prior_session_close: Decimal
     prior_session_close_ts: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+        json_encoders = {
+            Decimal: lambda v: float(v) if v is not None else None,
+            datetime: lambda v: v.isoformat() if v is not None else None,
+        }
+
+
+class SessionLevels(BaseModel):
+    """Pre-market + previous-session high/low for the chart level overlays.
+
+    ``is_index`` is True for cash indexes (SPX, NDX, …) — they have no
+    pre-market print, so all level fields are null and the frontend skips
+    drawing.  ``trading_date`` is the ET date whose pre-market the
+    ``premarket_*`` fields describe; ``prev_session_*`` describe the
+    regular session of ``prev_session_date``.  ``source`` records
+    provenance (``captured`` / ``live`` / ``captured+live``).
+    """
+
+    symbol: str
+    is_index: bool = False
+    trading_date: Optional[date] = None
+    premarket_high: Optional[Decimal] = None
+    premarket_low: Optional[Decimal] = None
+    prev_session_date: Optional[date] = None
+    prev_session_high: Optional[Decimal] = None
+    prev_session_low: Optional[Decimal] = None
+    source: Optional[str] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

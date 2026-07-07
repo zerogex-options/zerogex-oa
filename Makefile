@@ -3546,6 +3546,81 @@ forecast-receipt: ## Write today's receipt against the immutable morning commitm
 		$(if $(FORECAST_DATE),--date $(FORECAST_DATE)) \
 		$(if $(FORECAST_SYMBOLS),--symbol $(FORECAST_SYMBOLS))
 
+.PHONY: forecast-prune
+forecast-prune: ## Delete daily_forecast rows before a cutoff. Vars: BEFORE=YYYY-MM-DD (required), SYMBOL=SPY (optional scope). Dry-run by default; pass CONFIRM=yes to execute.
+	@echo "$(BLUE)=== Forecast Prune (daily_forecast) ===$(NC)"
+	@if [ -z "$${BEFORE}" ]; then \
+		echo "$(RED)BEFORE=YYYY-MM-DD is required -- refusing to run without an explicit cutoff.$(NC)"; \
+		echo "$(YELLOW)Deletes rows with date < BEFORE (BEFORE itself is kept).$(NC)"; \
+		echo "$(YELLOW)  make forecast-prune BEFORE=2026-07-06             # keep 2026-07-06 and newer, all symbols$(NC)"; \
+		echo "$(YELLOW)  make forecast-prune BEFORE=2026-07-06 SYMBOL=SPY  # scope to one symbol$(NC)"; \
+		echo "$(YELLOW)  make forecast-prune BEFORE=2026-07-06 CONFIRM=yes # actually delete$(NC)"; \
+		exit 1; \
+	fi; \
+	if ! echo "$${BEFORE}" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$$'; then \
+		echo "$(RED)BEFORE='$${BEFORE}' is not a YYYY-MM-DD date.$(NC)"; \
+		exit 1; \
+	fi; \
+	SYMBOL_FILTER=""; \
+	if [ -n "$${SYMBOL}" ]; then \
+		echo "$(YELLOW)Scoping to SYMBOL='$${SYMBOL}'.$(NC)"; \
+		SYMBOL_FILTER="AND symbol = '$${SYMBOL}'"; \
+	else \
+		echo "$(YELLOW)No SYMBOL set -> ALL symbols.$(NC)"; \
+	fi; \
+	echo "$(YELLOW)Target: daily_forecast rows with date < '$${BEFORE}' (permanent DELETE).$(NC)"; \
+	echo "$(YELLOW)These are immutable public commitments + 4 PM receipts. Snapshot first if$(NC)"; \
+	echo "$(YELLOW)you may want them back, e.g. inside psql:$(NC)"; \
+	echo "$(YELLOW)  CREATE TABLE daily_forecast_archive AS$(NC)"; \
+	echo "$(YELLOW)  SELECT * FROM daily_forecast WHERE date < '$${BEFORE}' $${SYMBOL_FILTER};$(NC)"; \
+	echo "$(BLUE)--- Rows to delete (grouped by symbol) ---$(NC)"; \
+	$(PSQL) -c "SELECT symbol, COUNT(*) AS n_rows, MIN(date) AS oldest, MAX(date) AS newest, \
+		COUNT(*) FILTER (WHERE receipt_ts IS NOT NULL) AS graded \
+		FROM daily_forecast WHERE date < '$${BEFORE}' $${SYMBOL_FILTER} \
+		GROUP BY symbol ORDER BY symbol;"; \
+	if [ "$${CONFIRM}" != "yes" ]; then \
+		echo "$(YELLOW)Dry run. Re-run with CONFIRM=yes to DELETE the rows above.$(NC)"; \
+	else \
+		echo "$(BLUE)--- Deleting ---$(NC)"; \
+		ROWS=$$($(PSQL) -t -A -c "WITH deleted AS (DELETE FROM daily_forecast WHERE date < '$${BEFORE}' $${SYMBOL_FILTER} RETURNING 1) SELECT COUNT(*) FROM deleted;"); \
+		echo "$(GREEN)✓ Deleted $${ROWS} daily_forecast row(s) before $${BEFORE}.$(NC)"; \
+		echo "$(YELLOW)The /forecast list refreshes on its ISR cache (~1 h landing / ~30 min detail).$(NC)"; \
+	fi
+
+.PHONY: session-levels-dry-run
+session-levels-dry-run: ## Dry-run the session-levels capture (pre-market + prev-session H/L; never writes)
+	@echo "$(BLUE)=== Dry-run session-levels capture ===$(NC)"
+	@$(PY) -m src.jobs.session_levels --dry-run \
+		$(if $(SESSION_LEVELS_DATE),--date $(SESSION_LEVELS_DATE)) \
+		$(if $(SESSION_LEVELS_SYMBOLS),--symbols $(SESSION_LEVELS_SYMBOLS))
+
+.PHONY: session-levels
+session-levels: ## Capture pre-market + previous-session high/low into session_levels
+	@echo "$(BLUE)=== Capturing session levels (pre-market + prev-session H/L) ===$(NC)"
+	@$(PY) -m src.jobs.session_levels \
+		$(if $(SESSION_LEVELS_DATE),--date $(SESSION_LEVELS_DATE)) \
+		$(if $(SESSION_LEVELS_SYMBOLS),--symbols $(SESSION_LEVELS_SYMBOLS))
+
+.PHONY: session-levels-install
+session-levels-install: ## Install the session-levels capture timer (every 5 min 04:00-09:55 ET + 10:00 finalize; Mon-Fri)
+	@echo "$(BLUE)=== Installing session-levels timer ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-session-levels.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-session-levels.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-session-levels.timer
+	@echo "$(GREEN)✅ session-levels timer installed (04:00-09:55 ET every 5 min + 10:00 finalize; Mon-Fri)$(NC)"
+	@echo "$(YELLOW)Status:  systemctl list-timers 'zerogex-oa-session-levels*'$(NC)"
+	@echo "$(YELLOW)Logs:    journalctl -u zerogex-oa-session-levels$(NC)"
+
+.PHONY: session-levels-status
+session-levels-status: ## Show the session-levels timer + last run logs
+	@echo "$(BLUE)=== Session-levels timer ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-session-levels.timer' || true
+	@echo ""
+	@systemctl status zerogex-oa-session-levels.service --no-pager -l || true
+	@echo ""
+	@sudo journalctl -u zerogex-oa-session-levels -n 30 --no-pager || true
+
 .PHONY: forecast-calibrate-dry-run
 forecast-calibrate-dry-run: ## Dry-run tonight's Layer-2 calibration nudges (never writes)
 	@$(PY) -m src.jobs.forecast_calibrate --dry-run \
@@ -3637,6 +3712,100 @@ forecast-tweet-status: ## Show forecast tweet timers + last/next fire + recent l
 	@systemctl list-timers --all --no-pager 'zerogex-oa-forecast-tweet-*.timer' || true
 	@echo ""
 	@sudo journalctl -u zerogex-oa-forecast-tweet-morning -u zerogex-oa-forecast-tweet-receipt -n 30 --no-pager || true
+
+# =============================================================================
+# Live Bulletin auto-tweet (09:15 pre-market, 12:30 midday, 16:05 close ET)
+# =============================================================================
+# Three fires per trading day, one script.  Each fire builds a
+# multi-paragraph read across SPY/SPX/QQQ from get_latest_gex_summary,
+# renders the lead symbol's Live Bulletin PNG via the frontend's
+# /api/bulletin/card endpoint, and (best-effort) records the day's Replay
+# scrubber via the frontend's Playwright helper.  Every mode is dry-run
+# by default; artifacts (tweet text + PNG + clip + manifest.json) land
+# in $BULLETIN_TWEET_ARTIFACT_DIR (default /var/lib/zerogex-oa/
+# bulletin-tweets) for operator inspection before flipping --post on.
+#
+# Override symbols with BULLETIN_TWEET_SYMBOLS=SPY,SPX,QQQ (default), the
+# lead attachment symbol with BULLETIN_TWEET_LEAD_SYMBOL=SPX (default),
+# or a specific date with BULLETIN_TWEET_DATE=YYYY-MM-DD.
+.PHONY: bulletin-tweet-premarket-dry-run
+bulletin-tweet-premarket-dry-run: ## Dry-run today's pre-market bulletin tweet (09:15 slot)
+	@echo "$(BLUE)=== Dry-run pre-market bulletin tweet ===$(NC)"
+	@$(PY) -m src.jobs.bulletin_tweet --mode premarket \
+		$(if $(BULLETIN_TWEET_DATE),--date $(BULLETIN_TWEET_DATE)) \
+		$(if $(BULLETIN_TWEET_SYMBOLS),--symbols $(BULLETIN_TWEET_SYMBOLS)) \
+		$(if $(BULLETIN_TWEET_LEAD_SYMBOL),--lead-symbol $(BULLETIN_TWEET_LEAD_SYMBOL))
+
+.PHONY: bulletin-tweet-midday-dry-run
+bulletin-tweet-midday-dry-run: ## Dry-run today's mid-session bulletin tweet (12:30 slot)
+	@echo "$(BLUE)=== Dry-run mid-session bulletin tweet ===$(NC)"
+	@$(PY) -m src.jobs.bulletin_tweet --mode midday \
+		$(if $(BULLETIN_TWEET_DATE),--date $(BULLETIN_TWEET_DATE)) \
+		$(if $(BULLETIN_TWEET_SYMBOLS),--symbols $(BULLETIN_TWEET_SYMBOLS)) \
+		$(if $(BULLETIN_TWEET_LEAD_SYMBOL),--lead-symbol $(BULLETIN_TWEET_LEAD_SYMBOL))
+
+.PHONY: bulletin-tweet-close-dry-run
+bulletin-tweet-close-dry-run: ## Dry-run today's post-market bulletin tweet (16:05 slot)
+	@echo "$(BLUE)=== Dry-run post-market bulletin tweet ===$(NC)"
+	@$(PY) -m src.jobs.bulletin_tweet --mode close \
+		$(if $(BULLETIN_TWEET_DATE),--date $(BULLETIN_TWEET_DATE)) \
+		$(if $(BULLETIN_TWEET_SYMBOLS),--symbols $(BULLETIN_TWEET_SYMBOLS)) \
+		$(if $(BULLETIN_TWEET_LEAD_SYMBOL),--lead-symbol $(BULLETIN_TWEET_LEAD_SYMBOL))
+
+.PHONY: bulletin-tweet-premarket-post
+bulletin-tweet-premarket-post: ## Post today's pre-market bulletin tweet (needs X_BOT_BEARER_TOKEN + OAuth1)
+	@echo "$(BLUE)=== Posting pre-market bulletin tweet ===$(NC)"
+	@$(PY) -m src.jobs.bulletin_tweet --mode premarket --post \
+		$(if $(BULLETIN_TWEET_DATE),--date $(BULLETIN_TWEET_DATE)) \
+		$(if $(BULLETIN_TWEET_SYMBOLS),--symbols $(BULLETIN_TWEET_SYMBOLS)) \
+		$(if $(BULLETIN_TWEET_LEAD_SYMBOL),--lead-symbol $(BULLETIN_TWEET_LEAD_SYMBOL))
+
+.PHONY: bulletin-tweet-midday-post
+bulletin-tweet-midday-post: ## Post today's mid-session bulletin tweet (needs X_BOT_BEARER_TOKEN + OAuth1)
+	@echo "$(BLUE)=== Posting mid-session bulletin tweet ===$(NC)"
+	@$(PY) -m src.jobs.bulletin_tweet --mode midday --post \
+		$(if $(BULLETIN_TWEET_DATE),--date $(BULLETIN_TWEET_DATE)) \
+		$(if $(BULLETIN_TWEET_SYMBOLS),--symbols $(BULLETIN_TWEET_SYMBOLS)) \
+		$(if $(BULLETIN_TWEET_LEAD_SYMBOL),--lead-symbol $(BULLETIN_TWEET_LEAD_SYMBOL))
+
+.PHONY: bulletin-tweet-close-post
+bulletin-tweet-close-post: ## Post today's post-market bulletin tweet (needs X_BOT_BEARER_TOKEN + OAuth1)
+	@echo "$(BLUE)=== Posting post-market bulletin tweet ===$(NC)"
+	@$(PY) -m src.jobs.bulletin_tweet --mode close --post \
+		$(if $(BULLETIN_TWEET_DATE),--date $(BULLETIN_TWEET_DATE)) \
+		$(if $(BULLETIN_TWEET_SYMBOLS),--symbols $(BULLETIN_TWEET_SYMBOLS)) \
+		$(if $(BULLETIN_TWEET_LEAD_SYMBOL),--lead-symbol $(BULLETIN_TWEET_LEAD_SYMBOL))
+
+.PHONY: bulletin-tweet-bootstrap
+bulletin-tweet-bootstrap: ## One-shot runtime bootstrap (idempotent): ffmpeg + Node + Playwright + Chromium + directories
+	@echo "$(BLUE)=== Bootstrapping Bulletin Tweet runtime ===$(NC)"
+	@bash deploy/steps/205.bulletin_tweet_setup
+
+.PHONY: bulletin-tweet-install
+bulletin-tweet-install: ## Install all three bulletin tweet timers (09:15, 12:30, 16:05 ET Mon-Fri)
+	@echo "$(BLUE)=== Installing Live Bulletin Tweet Timers ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-bulletin-tweet-premarket.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-bulletin-tweet-premarket.timer /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-bulletin-tweet-midday.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-bulletin-tweet-midday.timer /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-bulletin-tweet-close.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-bulletin-tweet-close.timer /etc/systemd/system/
+	@sudo install -d -o ubuntu -g ubuntu -m 0755 /var/lib/zerogex-oa/bulletin-tweets
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-bulletin-tweet-premarket.timer
+	@sudo systemctl enable --now zerogex-oa-bulletin-tweet-midday.timer
+	@sudo systemctl enable --now zerogex-oa-bulletin-tweet-close.timer
+	@echo "$(GREEN)✅ Bulletin tweet timers installed (09:15 premarket, 12:30 midday, 16:05 close; Mon-Fri)$(NC)"
+	@echo "$(YELLOW)Status:      systemctl list-timers 'zerogex-oa-bulletin-tweet-*'$(NC)"
+	@echo "$(YELLOW)Logs:        journalctl -u zerogex-oa-bulletin-tweet-premarket -u zerogex-oa-bulletin-tweet-midday -u zerogex-oa-bulletin-tweet-close$(NC)"
+	@echo "$(YELLOW)Trigger now: sudo systemctl start zerogex-oa-bulletin-tweet-close.service$(NC)"
+
+.PHONY: bulletin-tweet-status
+bulletin-tweet-status: ## Show bulletin tweet timers + last/next fire + recent logs
+	@echo "$(BLUE)=== Bulletin Tweet Timers ===$(NC)"
+	@systemctl list-timers --all --no-pager 'zerogex-oa-bulletin-tweet-*.timer' || true
+	@echo ""
+	@sudo journalctl -u zerogex-oa-bulletin-tweet-premarket -u zerogex-oa-bulletin-tweet-midday -u zerogex-oa-bulletin-tweet-close -n 30 --no-pager || true
 
 # =============================================================================
 # Daily ATM IV history backfill (pre-open seed of daily_atm_iv)

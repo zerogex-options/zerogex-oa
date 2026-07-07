@@ -1000,13 +1000,14 @@ SIGNALS_PATTERN_CALIBRATION_CEIL = _getenv_float(
     "SIGNALS_PATTERN_CALIBRATION_CEIL", 0.85, min=0.0, max=1.0
 )
 # Per-source clamp overrides for the realized-P&L feed. Realized option P&L is
-# the honest measure, so an operator may want a wider band than the touch
-# proxy's [0.40, 0.85] — e.g. a lower floor so a genuinely losing pattern is
-# marked down further rather than pinned at 0.40. Default to the global band, so
-# behavior is unchanged until these are set explicitly.
+# the honest measure, so the band is widened on the floor side: a genuinely
+# losing pattern's calibrated base should be marked down below the touch-proxy
+# 0.40 floor (where every loser compressed to the same value), so the engine
+# can distinguish moderate losers from total losers. The ceil mirrors the
+# global default. Either can be overridden in .env if a deployment wants the
+# original [0.40, 0.85] band back.
 SIGNALS_PATTERN_CALIBRATION_FLOOR_OPTION_PNL = _getenv_float(
-    "SIGNALS_PATTERN_CALIBRATION_FLOOR_OPTION_PNL",
-    SIGNALS_PATTERN_CALIBRATION_FLOOR, min=0.0, max=1.0
+    "SIGNALS_PATTERN_CALIBRATION_FLOOR_OPTION_PNL", 0.25, min=0.0, max=1.0
 )
 SIGNALS_PATTERN_CALIBRATION_CEIL_OPTION_PNL = _getenv_float(
     "SIGNALS_PATTERN_CALIBRATION_CEIL_OPTION_PNL",

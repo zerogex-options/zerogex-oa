@@ -48,6 +48,10 @@ sudo tee /etc/nginx/conf.d/zerogex-rate-limit.conf > /dev/null <<'LIMITEOF'
 # Generous limit; the response cache (zerogex_cache) absorbs upstream load and
 # fail2ban handles real abuse — this is just a guardrail against runaway loops.
 limit_req_zone $binary_remote_addr zone=zerogex_api_per_ip:10m rate=500r/s;
+# Per-IP concurrent-connection cap for /ws. limit_req caps handshake
+# rate but WS is long-lived; without limit_conn a single IP could open
+# thousands of persistent sockets. 10m holds ~160k unique client IPs.
+limit_conn_zone $binary_remote_addr zone=zerogex_ws_per_ip:10m;
 LIMITEOF
 
 sudo tee /etc/nginx/conf.d/zerogex-cache-zone.conf > /dev/null <<'CACHEEOF'

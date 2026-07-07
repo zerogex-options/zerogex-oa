@@ -24,6 +24,8 @@ from .ratelimit import rate_limit
 from .scopes import FLOW, GEX, MARKET_RAW, MAXPAIN, SIGNALS, TECHNICALS
 from .security import api_key_auth, key_store, require_scopes
 from .usage import usage_meter
+from .quote_broadcaster import QuoteBroadcaster, set_broadcaster
+from .routers import websockets as ws_router
 from .models import (
     GEXSummary,
     GEXByStrike,
@@ -37,6 +39,7 @@ from .models import (
     FlowBuyingPressurePoint,
     UnderlyingQuote,
     SessionCloses,
+    SessionLevels,
     HealthStatus,
     MaxPainCurrent,
     MaxPainTimeseriesPoint,
@@ -46,6 +49,7 @@ from .models import (
     StrikeProfileBucket,
 )
 from .routers.trade_signals import router as trade_signals_router
+from .routers.tradeworkz import router as tradeworkz_router
 from .routers.volatility_gauge import router as volatility_gauge_router
 from .routers.option_contract import router as option_contract_router
 from .routers.option_calculator import router as option_calculator_router
@@ -138,19 +142,119 @@ async def lifespan(app: FastAPI):
     usage_meter.configure(lambda: db_manager.pool)
     usage_meter.start()
 
+    # Real-time quote broadcaster — LISTEN 'zgx_quote_updates' →
+    # per-symbol WebSocket fan-out. Held for the process lifetime;
+    # reconnects internally if the DB blips. get_market_session is
+    # defined later in this module, so passing it by callable defers
+    # binding until the notify actually fires. Feature-gated: unset
+    # WS_ENABLED (or set it to "0") to keep the socket wiring dormant
+    # during the rollout window.
+    if _getenv_str("WS_ENABLED", "1").strip().lower() not in {"0", "false", "no"}:
+        # Same host/port/database/user/password the pool was built with
+        # so the LISTEN connection tracks the pool's credentials (a
+        # DatabaseManager reconnect that changed them is picked up on
+        # the next reconnect of the LISTEN loop). We build the kwargs
+        # here rather than inspecting asyncpg's private ``_params``
+        # because that internal field's schema varies by version (0.31+
+        # lost the ``dsn`` attribute the earlier draft relied on,
+        # causing LISTEN to never come up).
+        def _listen_kwargs():
+            if db_manager is None:
+                return None
+            ssl_mode = os.getenv("DB_SSLMODE", "").strip().lower()
+            ssl = True if ssl_mode in {"require", "verify-ca", "verify-full"} else None
+            return {
+                "host": db_manager.host,
+                "port": db_manager.port,
+                "database": db_manager.database,
+                "user": db_manager.user,
+                "password": db_manager.password,
+                "ssl": ssl,
+                # Short connect timeout — a slow initial connect just
+                # means the outer reconnect loop retries; don't tie up
+                # the LISTEN task for minutes.
+                "timeout": 10.0,
+            }
+
+        # Same 1s-LRU-cached signal the HTTP handler uses, so the two
+        # paths' session labels agree at 16:00 ET (previously the
+        # broadcaster shortcut'd close_data_available=True and briefly
+        # disagreed with the HTTP handler while the first post-close
+        # bar was landing).
+        async def _close_data_check(symbol, asset_type):
+            if db_manager is None:
+                return True
+            return await db_manager.has_todays_close_landed(symbol, asset_type)
+
+        quote_broadcaster = QuoteBroadcaster(
+            connect_kwargs_getter=_listen_kwargs,
+            session_computer=lambda asset_type, stable, close_avail: get_market_session(
+                asset_type, stable, close_avail
+            ),
+            close_data_check=_close_data_check,
+        )
+        set_broadcaster(quote_broadcaster)
+        await quote_broadcaster.start()
+    else:
+        logger.info("WS_ENABLED=0 — quote broadcaster not started")
+
     # The max-pain snapshot is refreshed off-process by the
     # zerogex-oa-max-pain-refresh.timer (daily, pre-market) — not by an
     # in-process loop and not inline on the request path.  The endpoint is
     # a pure cache read; nothing to start/stop here.
+
+    # Seed TradeWorkz bot roster + capital sleeves on first boot. Idempotent:
+    # ON CONFLICT DO NOTHING at the row level, so a subsequent restart with
+    # existing rows is a no-op. Wrapped in try/except so a missing schema
+    # (fresh instance where `make schema-apply` has not yet been run) does
+    # not block API startup — the operator will run schema-apply and then a
+    # subsequent boot will complete the seed.
+    try:
+        from src.database import db_connection as _db_connection
+        from src.tradeworkz.engine import provision_defaults as _tw_provision
+
+        with _db_connection() as _conn:
+            _inserted = _tw_provision(_conn)
+        if _inserted:
+            logger.info("TradeWorkz: provisioned %d default bots", _inserted)
+    except Exception:  # noqa: BLE001 — defensive during startup
+        logger.warning("TradeWorkz bot provisioning skipped", exc_info=True)
+
+    # Start the TradeWorkz in-process tick scheduler. Runs one engine.tick()
+    # every TRADEWORKZ_ENGINE_INTERVAL_SECONDS on a background asyncio task,
+    # dispatching the synchronous psycopg2 work through asyncio.to_thread so
+    # it doesn't block the FastAPI event loop. No-op when
+    # TRADEWORKZ_ENGINE_ENABLED=false. Wrapped in try/except so a startup
+    # failure inside the scheduler can't prevent the API from serving.
+    try:
+        from src.tradeworkz.scheduler import scheduler as _tw_scheduler
+
+        _tw_scheduler.start()
+    except Exception:  # noqa: BLE001
+        logger.warning("TradeWorkz scheduler failed to start", exc_info=True)
+
     yield
 
     # Shutdown
     logger.info("Shutting down ZeroGEX API Server...")
     # Stop the meter first (cancels the loop and flushes the final window)
     # while the DB pool is still up, then drop both pool getters.
+    from .quote_broadcaster import get_broadcaster as _get_bc
+    bc = _get_bc()
+    if bc is not None:
+        await bc.stop()
+        set_broadcaster(None)
     await usage_meter.stop()
     usage_meter.configure(None)
     key_store.configure(None)
+    # Stop the TradeWorkz scheduler while the pool is still up so any final
+    # in-flight tick can finish its DB writes cleanly before we tear down.
+    try:
+        from src.tradeworkz.scheduler import scheduler as _tw_scheduler
+
+        await _tw_scheduler.stop()
+    except Exception:  # noqa: BLE001
+        logger.warning("TradeWorkz scheduler shutdown failed", exc_info=True)
     if db_manager:
         await db_manager.disconnect()
     logger.info("Shutdown complete")
@@ -323,6 +427,13 @@ app.include_router(forecast_router, dependencies=[_scope_signals])
 # gex_by_strike data. Read-only; no new ingestion. Scope matches the rest
 # of the GEX surface (basic + pro tiers).
 app.include_router(replay_router, dependencies=[_scope_gex])
+
+# TradeWorkz™ multi-bot signaled-trading engine — admin-tier surface. The
+# frontend /trading-signals page is admin-gated in frontend/core/auth.ts so
+# customers never reach the API even though the router is mounted here.
+# Router-level guard is the SIGNALS scope; the /admin/* sub-endpoints add
+# an additional require_scopes check inline.
+app.include_router(tradeworkz_router, dependencies=[_scope_signals])
 
 # ============================================================================
 # Health Check
@@ -879,9 +990,34 @@ async def get_flow_buying_pressure(
 # Market Session Helper
 # ============================================================================
 
-from src.market_calendar import ET as _ET, NYSE_HOLIDAYS as _NYSE_HOLIDAYS  # noqa: E402
+from src.market_calendar import (  # noqa: E402
+    ET as _ET,
+    NYSE_HOLIDAYS as _NYSE_HOLIDAYS,
+    should_display_future,
+    current_futures_session_start,
+)
+from src.config import _getenv_bool  # noqa: E402
+from src.symbols import resolve_index_future  # noqa: E402
 
 _SOFT_CLOSE_WINDOW = timedelta(seconds=30)
+
+
+def _index_futures_display_enabled() -> bool:
+    """Read-side master switch for the index→future display swap.
+
+    Read per-call (cheap env lookup) so an operator can flip the feature on
+    or off without restarting the API, once the futures ingester has
+    populated ``futures_quotes``.
+    """
+    return _getenv_bool("INDEX_FUTURES_DISPLAY_ENABLED", False)
+
+
+def _future_display_label(future_symbol: Optional[str]) -> Optional[str]:
+    """UI ticker for a TradeStation continuous future (``@ES`` → ``ES``)."""
+    if not future_symbol:
+        return None
+    return future_symbol.lstrip("@").upper() or None
+
 
 if not _NYSE_HOLIDAYS:
     logger.warning("NYSE_HOLIDAYS env var is empty — no holiday filtering will occur")
@@ -1064,6 +1200,24 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
         data["session"] = get_market_session(
             asset_type, tracker.is_stable(), close_data_available
         )
+
+        # Index→future DISPLAY swap (ADDITIVE): during the overnight futures
+        # window, attach the future's price as *separate* fields. The base
+        # quote (close/open/high/low/session) stays the cash index, so every
+        # downstream consumer of this endpoint — GEX spot, greeks, options
+        # calculator, heatmap — is untouched. Only the header quote, the quote
+        # card, and the candlestick chart read the futures_* fields. Silently
+        # omitted if the futures ingester has no rows yet.
+        if _index_futures_display_enabled() and should_display_future(symbol):
+            fut = await _db().get_latest_future_quote(
+                symbol, current_futures_session_start()
+            )
+            if fut and fut.get("close") is not None:
+                data["display_source"] = "futures"
+                data["data_symbol"] = _future_display_label(fut.get("future_symbol"))
+                data["futures_close"] = fut.get("close")
+                data["futures_reference_close"] = fut.get("reference_close")
+
         return UnderlyingQuote(**data)
     except HTTPException:
         raise
@@ -1094,6 +1248,39 @@ async def get_session_closes(symbol: str = Query(default="SPY")):
 
 
 @app.get(
+    "/api/market/session-levels",
+    response_model=SessionLevels,
+    tags=["Market Data"],
+    dependencies=[_scope_market_raw],
+)
+@handle_api_errors("GET /api/market/session-levels")
+async def get_session_levels(symbol: str = Query(default="SPY")):
+    """
+    Get pre-market and previous-session high/low levels for a symbol.
+
+    Non-index symbols only (ETFs/equities such as SPY, QQQ) — cash indexes
+    have no pre-market print, so they return ``is_index: true`` with null
+    levels and no 404.
+
+    - premarket_high / premarket_low: high/low of today's 04:00-09:30 ET
+      pre-market session (live-updating while the pre-market is in
+      progress, final after the open).
+    - prev_session_high / prev_session_low: high/low of the previous
+      trading day's regular session (09:30-16:00 ET), including the
+      closing auction print.
+
+    Levels roll at the start of each new pre-market session (04:00 ET),
+    not at the close — the same anchoring traders use for PDH/PDL lines.
+    Source of record is the ``session_levels`` capture job; the endpoint
+    falls back to a live 1-min-bar aggregate when no captured row exists.
+    """
+    data = await _db().get_session_levels(symbol)
+    if not data:
+        raise HTTPException(status_code=404, detail="No session level data available")
+    return SessionLevels(**data)
+
+
+@app.get(
     "/api/market/historical",
     response_model=List[UnderlyingQuote],
     tags=["Market Data"],
@@ -1105,12 +1292,43 @@ async def get_historical_quotes(
     end_date: Optional[str] = None,
     window_units: int = Query(default=192, ge=1, le=576),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
+    allow_futures: bool = Query(
+        default=False,
+        description=(
+            "Opt-in: when true and outside the cash session, return the cash "
+            "index's futures bars instead of the (frozen) index series. Only "
+            "the candlestick chart sets this; index-keyed overlays (gamma "
+            "heatmap, max-pain, smart-money) leave it false so their price "
+            "series stays the index."
+        ),
+    ),
 ):
     """Get historical quotes"""
     try:
         # Parse dates if provided
         start_dt = datetime.fromisoformat(start_date) if start_date else None
         end_dt = datetime.fromisoformat(end_date) if end_date else None
+
+        # Index→future DISPLAY swap for the candlestick series — ONLY when the
+        # caller opts in via allow_futures (the candle chart). Read-only from
+        # futures_quotes; falls through to the index series if the ingester
+        # has no rows for the requested window.
+        if (
+            allow_futures
+            and _index_futures_display_enabled()
+            and should_display_future(symbol)
+        ):
+            fut_rows = await _db().get_historical_futures(
+                symbol, start_dt, end_dt, window_units, timeframe
+            )
+            if fut_rows:
+                label = _future_display_label(resolve_index_future(symbol))
+                return [
+                    UnderlyingQuote(
+                        **{**row, "display_source": "futures", "data_symbol": label}
+                    )
+                    for row in fut_rows
+                ]
 
         data = await _db().get_historical_quotes(symbol, start_dt, end_dt, window_units, timeframe)
         return [UnderlyingQuote(**row) for row in data]
@@ -1374,6 +1592,19 @@ async def get_momentum_divergence(
     """Get momentum divergence signals"""
     data = await _db().get_momentum_divergence(symbol, timeframe, window_units)
     return [MomentumDivergencePoint(**row) for row in data]
+
+
+# ============================================================================
+# WebSocket streaming endpoints
+# ============================================================================
+
+# /ws — real-time underlying quote stream. See routers/websockets.py for
+# the wire protocol. Registered via a plain function (not APIRouter) so
+# the route captures ``get_broadcaster`` lazily and picks up the lifespan-
+# owned broadcaster singleton without a global reference at import time.
+from .quote_broadcaster import get_broadcaster as _get_ws_broadcaster  # noqa: E402
+
+ws_router.register(app, get_broadcaster=_get_ws_broadcaster)
 
 
 # ============================================================================

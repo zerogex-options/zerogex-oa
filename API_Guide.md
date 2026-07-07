@@ -252,6 +252,35 @@ Get the two most recently completed regular session closes (4:00 PM ET bars).
 }
 ```
 
+### GET /api/market/session-levels
+Get pre-market and previous-session high/low levels — the chart's PM High/Low and Prev High/Low overlays.
+
+Non-index symbols only (ETFs/equities such as SPY, QQQ). Cash indexes have no pre-market print and return `is_index: true` with null levels (HTTP 200, not 404).
+
+- `premarket_high` / `premarket_low` — high/low of `trading_date`'s 04:00–09:30 ET pre-market session. Live-updating while the pre-market is in progress; final after the 09:30 open.
+- `prev_session_high` / `prev_session_low` — high/low of `prev_session_date`'s regular session (09:30–16:00 ET; 13:00 close on NYSE half-days), including the closing auction print.
+- Levels roll at the start of each new pre-market session (04:00 ET), not at the close.
+- `source` — provenance: `captured` (the session-levels capture job), `live` (on-the-fly 1-min-bar aggregate fallback), or `captured+live` (pre-market union of both while the session is in progress).
+
+**Parameters:**
+- `symbol` (optional): default `SPY`
+
+**Example response:**
+```json
+{
+  "symbol": "SPY",
+  "is_index": false,
+  "trading_date": "2026-07-06",
+  "premarket_high": 625.4,
+  "premarket_low": 622.15,
+  "prev_session_date": "2026-07-03",
+  "prev_session_high": 626.28,
+  "prev_session_low": 621.4,
+  "source": "captured",
+  "updated_at": "2026-07-06T13:55:04.412331+00:00"
+}
+```
+
 ### GET /api/market/historical
 Get historical underlying quotes.
 

@@ -1,0 +1,119 @@
+"""PutCallWallBouncer — the flagship wall-fade bot.
+
+Fires when SPY is pressed against a wall in a positive-gamma regime. The
+edge is dealer hedging: at the call wall dealers are net long gamma above
+spot and mechanically sell rallies; at the put wall they buy dips. The bot
+sizes proportional to wall strength × conviction and cuts on:
+
+* underlying blowing past the wall by ``wall_break_pct`` (default 0.3%),
+* the wall itself migrating in the direction that disfavors the trade,
+* configured target hit (max_pain / gamma_flip),
+* configured stop or time-stop.
+"""
+
+from __future__ import annotations
+
+from datetime import timedelta
+from typing import Optional
+
+from src.tradeworkz.bots.base import BaseBot, _utcnow
+from src.tradeworkz.context import MarketSnapshot
+from src.tradeworkz.models import OpenPosition, TradeSignal
+
+
+class PutCallWallBouncer(BaseBot):
+    tier = "0DTE"
+    direction_mode = "context"
+    tagline = "Fade the wall. Ride the mean reversion. Cut if the wall breaks."
+    description = (
+        "Enters mean-reversion trades against the nearest call or put wall in "
+        "a positive-gamma regime. Size scales with the wall's dollar-gamma "
+        "strength; risk is capped by an intraday wall-break stop."
+    )
+
+    def open_criteria(self, snap: MarketSnapshot) -> Optional[TradeSignal]:
+        if snap.gex_regime() not in {"positive_strong", "positive_weak"}:
+            return None
+        m = snap.minutes_since_open
+        if m is None or m < 30:  # avoid opening-print noise
+            return None
+        prox_pct = float(self.params.get("wall_proximity_pct", 0.002))
+        call_d = snap.distance_to_call_wall_pct()
+        put_d = snap.distance_to_put_wall_pct()
+
+        direction: Optional[str] = None
+        wall_side: Optional[str] = None
+        wall_price: Optional[float] = None
+        target: Optional[float] = None
+
+        if call_d is not None and abs(call_d) <= prox_pct and snap.spot <= (snap.call_wall or 0):
+            direction = "bearish"
+            wall_side = "call"
+            wall_price = snap.call_wall
+            target = snap.max_pain or snap.gamma_flip or snap.spot * 0.997
+        elif put_d is not None and abs(put_d) <= prox_pct and snap.spot >= (snap.put_wall or 0):
+            direction = "bullish"
+            wall_side = "put"
+            wall_price = snap.put_wall
+            target = snap.max_pain or snap.gamma_flip or snap.spot * 1.003
+        else:
+            return None
+
+        quality = self._quality(snap, wall_side)
+        conviction = self.compute_conviction(snap, quality)
+        if conviction < self.confidence_threshold():
+            return None
+
+        expiration = _today_expiration(snap)
+        strike = round(snap.spot)
+        opt_type = "call" if direction == "bullish" else "put"
+        legs = self.build_atm_debit(snap.underlying, opt_type, strike, expiration, 0.0)
+        stop = (wall_price or snap.spot) * (
+            1.0 + float(self.params.get("wall_break_pct", 0.003))
+            if direction == "bearish"
+            else 1.0 - float(self.params.get("wall_break_pct", 0.003))
+        )
+
+        return TradeSignal(
+            bot_id=self.spec.id,
+            underlying=snap.underlying,
+            direction=direction,
+            strategy_type="BUY_CALL_DEBIT" if direction == "bullish" else "BUY_PUT_DEBIT",
+            legs=legs,
+            entry_price=0.0,  # filled by engine
+            conviction=conviction,
+            target_price=target,
+            stop_price=stop,
+            time_stop_at=_utcnow() + timedelta(minutes=int(self.params.get("max_hold_minutes", 90))),
+            wall_ref_price=wall_price,
+            wall_ref_side=wall_side,
+            rationale=(
+                f"{wall_side}-wall rejection at {wall_price} in {snap.gex_regime()} gamma; "
+                f"conviction {conviction:.2f}"
+            ),
+            components_at_entry={
+                "wall_side": wall_side,
+                "wall_price": wall_price,
+                "net_gex": snap.net_gex,
+                "distance_pct": call_d if wall_side == "call" else put_d,
+                "vix": snap.vix,
+                "quality": quality,
+            },
+        )
+
+    def _quality(self, snap: MarketSnapshot, wall_side: str) -> float:
+        """Bot-authored 0..1 read of setup quality.
+
+        Rewards deeper positive-gamma, larger relative wall strength, and
+        earlier session (more time for mean reversion to play out).
+        """
+        gex = snap.net_gex or 0.0
+        gex_score = min(1.0, max(0.0, gex / 3.0e9))
+        mins = snap.minutes_since_open or 0.0
+        session_score = 1.0 - min(1.0, max(0.0, (mins - 30) / 300.0))
+        return 0.5 * gex_score + 0.5 * session_score
+
+
+def _today_expiration(snap: MarketSnapshot) -> str:
+    """Same-session expiration as ISO date — TradeWorkz assumes 0DTE cash-settled."""
+    return snap.et_date.isoformat()

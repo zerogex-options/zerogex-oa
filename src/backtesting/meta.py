@@ -74,6 +74,102 @@ SWEEP_PARAMS = [
 ]
 
 
+def _extract_description(doc: str) -> str:
+    """Pull a customer-facing description out of a pattern module docstring.
+
+    The convention across ``src/signals/playbook/patterns/*.py`` is::
+
+        Pattern X.Y: ``pattern_id`` — Name.
+
+        <natural-language explanation of when / why this fires, possibly
+        spanning a few lines, sometimes followed by developer notes.>
+
+        Per ``docs/playbook_catalog.md`` §X.Y.Z.
+
+        PR-N simplification: <impl note>...
+
+    We want only the natural-language middle paragraph. So:
+
+    * drop the header line (``Pattern X.Y: ...``);
+    * stop at the first blank line, or at developer-cruft lines starting
+      with ``Per docs/...`` / ``PR-...``;
+    * strip backtick wrappers around inline ids and collapse whitespace.
+
+    Falls back to the header line (current behavior) if the docstring is
+    short or oddly shaped, so we never lose information — only upgrade it.
+    """
+    if not doc:
+        return ""
+    lines = [line.strip() for line in doc.strip().splitlines()]
+    # Drop leading blank lines (defensive — `inspect.cleandoc` usage varies).
+    while lines and not lines[0]:
+        lines.pop(0)
+    if not lines:
+        return ""
+
+    header = lines[0]
+    body: list[str] = []
+    for line in lines[1:]:
+        stripped = line.strip()
+        # Paragraph break ⇒ stop. The first paragraph after the header is
+        # the customer description; later paragraphs are developer notes.
+        if not stripped:
+            if body:
+                break
+            continue
+        # Developer-only lines: kill on first match.
+        lowered = stripped.lower()
+        if lowered.startswith("per docs") or lowered.startswith("per `docs"):
+            break
+        if lowered.startswith("pr-") and ":" in lowered:
+            break
+        body.append(stripped)
+
+    if not body:
+        # No usable body — fall back to the header line so the catalog
+        # entry at least carries SOMETHING (current behavior).
+        return header[:200]
+
+    text = " ".join(body)
+    # Strip ``inline-code`` backticks so the UI doesn't render them raw.
+    text = text.replace("``", "").replace("`", "")
+    # Collapse repeated whitespace from the line joins.
+    text = " ".join(text.split())
+    # Some docstrings append the "Per docs/playbook_catalog.md §X.Y" pointer
+    # to the final sentence of the customer paragraph (no blank-line break).
+    # Truncate on that sentinel so it doesn't reach the UI.
+    for sentinel in (" Per docs", " Per Docs", " Per the docs"):
+        idx = text.find(sentinel)
+        if idx != -1:
+            text = text[:idx].rstrip()
+            break
+    # Drop a trailing period+space orphan ("...wall.  ") left behind by the
+    # cut so the description reads cleanly.
+    text = text.rstrip()
+    return text[:280]
+
+
+def _docstring_for_pattern(p) -> str:
+    """Return the most useful docstring available for a pattern instance.
+
+    Convention across ``src/signals/playbook/patterns/*.py`` is that the
+    natural-language description lives in the MODULE docstring, not on the
+    class itself (the classes typically have no docstring of their own). So
+    we look up the module via ``__module__`` and read its docstring,
+    falling back to the class's own docstring if a future pattern is
+    written class-doc-first.
+    """
+    import sys
+
+    module_name = getattr(type(p), "__module__", "") or getattr(p, "__module__", "")
+    module_doc = ""
+    if module_name and module_name in sys.modules:
+        module_doc = (sys.modules[module_name].__doc__ or "").strip()
+    if module_doc:
+        return module_doc
+    return (type(p).__doc__ or getattr(p, "__doc__", "") or "").strip()
+
+
 def _pattern_catalog() -> list[dict]:
     """Discover the built-in playbook patterns and describe each."""
     try:
@@ -85,8 +181,7 @@ def _pattern_catalog() -> list[dict]:
         return []
     out = []
     for p in patterns:
-        doc = (getattr(p, "__doc__", "") or type(p).__doc__ or "").strip()
-        description = doc.split("\n", 1)[0][:200] if doc else ""
+        description = _extract_description(_docstring_for_pattern(p))
         out.append(
             {
                 "id": getattr(p, "id", "") or "",

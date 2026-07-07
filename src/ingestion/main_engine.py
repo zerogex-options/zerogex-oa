@@ -557,6 +557,15 @@ class IngestionEngine:
                         quote["down_volume"],
                     ),
                 )
+                # Real-time fan-out to the API workers via Postgres NOTIFY,
+                # in the same transaction as the upsert so subscribers
+                # only see a tick iff it landed durably (NOTIFY is
+                # delivered on COMMIT). Best-effort — a NOTIFY failure
+                # (payload too big, channel name too long, etc.) must not
+                # abort the persist path that every downstream analytic
+                # depends on. See src/api/quote_broadcaster.py for the
+                # LISTEN side.
+                self._publish_quote_notify(cursor, quote)
                 conn.commit()
                 # Reset breaker on success (underlying writes confirm DB is alive).
                 self._db_consecutive_failures = 0
@@ -576,6 +585,128 @@ class IngestionEngine:
                 f"(attempt #{self._db_consecutive_failures}, backoff {backoff:.2f}s): {e}",
                 exc_info=True,
             )
+
+    # ------------------------------------------------------------------
+    # Real-time WebSocket fan-out — publish quote to 'zgx_quote_updates'.
+    # ------------------------------------------------------------------
+    # Postgres NOTIFY is the inter-process bus between this ingestion
+    # process and the FastAPI workers (separate systemd services, no
+    # shared memory, no broker in the stack). Delivered on COMMIT of
+    # the surrounding transaction — subscribers see the tick iff the
+    # row landed durably.
+    _WS_NOTIFY_CHANNEL = "zgx_quote_updates"
+    # Postgres caps NOTIFY payloads at 8000 bytes; our JSON is ~250B
+    # but we guard to catch runaway values (a bad up_volume string cast
+    # etc.) rather than raise mid-commit.
+    _WS_NOTIFY_PAYLOAD_LIMIT = 7500
+
+    # Sentinel for the asset_type memo. ``None`` is a valid cached
+    # value (symbol has no row in ``symbols``) — using a distinct
+    # sentinel lets us memoize the *miss* too instead of re-issuing
+    # the SELECT on every subsequent tick.
+    _ASSET_TYPE_UNSET = object()
+
+    def _publish_quote_notify(self, cursor, quote: Dict[str, Any]) -> None:
+        """Emit a NOTIFY carrying the current tick to WebSocket subscribers.
+
+        Best-effort: any failure MUST NOT abort the surrounding upsert
+        transaction. psycopg2 aborts a transaction on the first failed
+        statement — a subsequent ``conn.commit()`` is silently
+        translated to ROLLBACK, so a NOTIFY that raises inside the
+        outer INSERT's transaction would drop the just-INSERTed row.
+        We isolate the notify inside a SAVEPOINT so a NOTIFY error
+        rolls back only the savepoint; the upsert still commits.
+        """
+        try:
+            payload = {
+                "symbol": quote["symbol"],
+                "timestamp": (
+                    quote["timestamp"].isoformat()
+                    if hasattr(quote["timestamp"], "isoformat")
+                    else str(quote["timestamp"])
+                ),
+                "open": float(quote["open"]) if quote.get("open") is not None else None,
+                "high": float(quote["high"]) if quote.get("high") is not None else None,
+                "low": float(quote["low"]) if quote.get("low") is not None else None,
+                "close": float(quote["close"]) if quote.get("close") is not None else None,
+                "up_volume": int(quote["up_volume"]) if quote.get("up_volume") is not None else None,
+                "down_volume": (
+                    int(quote["down_volume"]) if quote.get("down_volume") is not None else None
+                ),
+                "asset_type": self._lookup_asset_type(cursor, quote["symbol"]),
+            }
+            body = json.dumps(payload, separators=(",", ":"), default=str)
+        except Exception as exc:
+            logger.debug("WS notify payload build failed (ignored): %s", exc)
+            return
+        if len(body.encode("utf-8")) > self._WS_NOTIFY_PAYLOAD_LIMIT:
+            logger.warning(
+                "WS notify payload too large (%d bytes); dropping tick",
+                len(body),
+            )
+            return
+        # SAVEPOINT-scoped so a NOTIFY failure (a permission revoke, a
+        # backend-side disconnect between INSERT and NOTIFY, etc.)
+        # rolls back only the savepoint and leaves the outer INSERT
+        # intact. Named uniquely per call so nested SAVEPOINTs (if
+        # ever added upstream) don't clash.
+        try:
+            cursor.execute("SAVEPOINT zgx_ws_notify")
+            try:
+                cursor.execute(
+                    "SELECT pg_notify(%s, %s)", (self._WS_NOTIFY_CHANNEL, body)
+                )
+            except Exception as exc:
+                cursor.execute("ROLLBACK TO SAVEPOINT zgx_ws_notify")
+                logger.debug("WS notify emit failed (savepoint rolled back): %s", exc)
+                return
+            cursor.execute("RELEASE SAVEPOINT zgx_ws_notify")
+        except Exception as exc:
+            # SAVEPOINT/RELEASE itself failed — most likely the outer
+            # transaction is already aborted from something else. The
+            # outer commit will fail on its own; nothing to do here.
+            logger.debug("WS notify savepoint plumbing failed (ignored): %s", exc)
+
+    def _lookup_asset_type(self, cursor, symbol: str) -> Optional[str]:
+        """Memoized one-shot lookup for the symbol's asset_type.
+
+        Ingestion runs one process per underlying so the memo is a
+        single-slot cache; no eviction needed. Uses a sentinel to
+        distinguish "not yet queried" from a legitimate ``None`` result
+        (symbol missing from ``symbols`` table), so a bootstrap tick
+        arriving before the symbol row exists doesn't re-issue the
+        SELECT on every subsequent tick forever.
+
+        Wrapped in a SAVEPOINT so a query failure (schema migration in
+        flight, row-level lock contention) doesn't abort the outer
+        INSERT transaction — same class of bug as the notify path.
+        """
+        cached = getattr(self, "_asset_type_cache", self._ASSET_TYPE_UNSET)
+        if cached is not self._ASSET_TYPE_UNSET:
+            return cached  # type: ignore[no-any-return]
+        row = None
+        try:
+            cursor.execute("SAVEPOINT zgx_asset_type_lookup")
+            try:
+                cursor.execute("SELECT asset_type FROM symbols WHERE symbol = %s", (symbol,))
+                row = cursor.fetchone()
+            except Exception as exc:
+                cursor.execute("ROLLBACK TO SAVEPOINT zgx_asset_type_lookup")
+                logger.debug("asset_type lookup failed (savepoint rolled back): %s", exc)
+                # Don't memoize — try again next tick when the DB blip
+                # has cleared.
+                return None
+            cursor.execute("RELEASE SAVEPOINT zgx_asset_type_lookup")
+        except Exception as exc:
+            logger.debug("asset_type savepoint plumbing failed (ignored): %s", exc)
+            return None
+        asset_type = row[0] if row else None
+        # Memoize both hits and misses so the SELECT runs at most once
+        # per process. If a bootstrap-before-symbol-insert case ever
+        # matters, the ingestion service is symbol-scoped and won't
+        # subscribe to a symbol that doesn't exist upstream anyway.
+        self._asset_type_cache = asset_type
+        return asset_type
 
     def _enrich_with_greeks(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Apply Greeks calculation to option data, returning enriched copy."""
@@ -2077,6 +2208,11 @@ def main():
 
         vxn_main()
 
+    def run_futures_for_index(index_symbol: str):
+        from src.ingestion.futures_underlying_ingester import run_futures_ingester
+
+        run_futures_ingester(index_symbol)
+
     # Always run the VIX ingester alongside the per-symbol engines so that
     # /api/market/volatility?ticker=VIX can read from `vix_bars` without
     # hitting TradeStation.
@@ -2085,7 +2221,24 @@ def main():
     # from `vxn_bars` without hitting TradeStation.
     vxn_enabled = _getenv_bool("INGEST_VXN_ENABLED", True)
 
-    if len(symbols) == 1 and not vix_enabled and not vxn_enabled:
+    # Index→futures DISPLAY feed: one child per configured index streams its
+    # continuous future (SPX→@ES, …) into `futures_quotes` during the
+    # overnight window so /api/market/quote + /api/market/historical can
+    # serve the future under the index label outside the cash session.
+    # Opt-in (defaults off) so it stays dark until an operator enables it.
+    futures_enabled = _getenv_bool("INGEST_FUTURES_ENABLED", False)
+    futures_indexes = [
+        s.strip().upper()
+        for s in os.getenv("INGEST_FUTURES_INDEXES", "SPX").split(",")
+        if s.strip()
+    ]
+
+    if (
+        len(symbols) == 1
+        and not vix_enabled
+        and not vxn_enabled
+        and not futures_enabled
+    ):
         run_for_symbol(symbols[0])
         return
 
@@ -2110,6 +2263,20 @@ def main():
         vxn_process = Process(target=run_vxn_ingester, name="ingest-vxn")
         vxn_process.start()
         processes.append(vxn_process)
+
+    if futures_enabled:
+        for index_symbol in futures_indexes:
+            logger.info(
+                "Starting futures ingester for %s (overnight display feed)",
+                index_symbol,
+            )
+            fut_process = Process(
+                target=run_futures_for_index,
+                args=(index_symbol,),
+                name=f"ingest-futures-{index_symbol}",
+            )
+            fut_process.start()
+            processes.append(fut_process)
 
     def shutdown_children(signum, frame):
         logger.info(f"Received signal {signum}, terminating ingestion workers...")

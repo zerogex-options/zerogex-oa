@@ -1,0 +1,34 @@
+[Unit]
+Description=ZeroGEX session-levels capture (pre-market + previous-session high/low)
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Captures pre-market (04:00-09:30 ET) high/low and the previous regular
+# session's high/low for the non-index ingestion universe (ETFs/equities
+# such as SPY, QQQ; cash indexes are skipped — no pre-market print).
+# Sources: TradeStation bars API (USEQPre session template) unioned with
+# the underlying_quotes 1-min aggregate; rows upsert into session_levels
+# with never-clobber merge semantics, so re-runs and catch-up firings are
+# safe at any time of day.  Consumed by /api/market/session-levels and
+# the frontend chart level overlays.
+ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.session_levels
+
+TimeoutStartSec=120
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-session-levels

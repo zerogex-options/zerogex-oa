@@ -56,6 +56,59 @@ BEGIN
     END IF;
 END $$;
 
+-- =============================================================================
+-- session_levels — captured pre-market + previous-session high/low
+-- =============================================================================
+-- One row per (symbol, ET trading date), written by the
+-- ``src.jobs.session_levels`` capture job (systemd timer: every 5 min
+-- through the 04:00-09:30 ET pre-market window plus a 10:00 ET finalize
+-- pass).  Only non-index symbols (ETFs/equities such as SPY, QQQ) get
+-- rows — cash indexes (SPX, NDX, …) have no pre-market print, so the
+-- job skips them and ``/api/market/session-levels`` reports
+-- ``is_index: true`` with null levels instead.
+--
+--   premarket_high/low     — high/low of the 04:00-09:30 ET pre-market
+--                            session of ``trading_date``.  Updated live
+--                            on each timer tick while the pre-market is
+--                            in progress; final after the 09:30 open.
+--   prev_session_high/low  — high/low of the previous trading day's
+--                            regular session (09:30-16:00 ET; 09:30-13:00
+--                            on NYSE half-days), including the closing
+--                            auction print (the 16:00 bar's open — same
+--                            asset-aware close rule get_session_closes
+--                            applies for non-INDEX symbols).
+--   *_source               — provenance: 'tradestation' (bars API),
+--                            'underlying_quotes' (1-min bar aggregate),
+--                            or 'tradestation+underlying_quotes' (union).
+CREATE TABLE IF NOT EXISTS session_levels (
+    symbol VARCHAR(10) NOT NULL,
+    trading_date DATE NOT NULL,
+    premarket_high NUMERIC(12, 4),
+    premarket_low NUMERIC(12, 4),
+    premarket_source VARCHAR(40),
+    prev_session_date DATE,
+    prev_session_high NUMERIC(12, 4),
+    prev_session_low NUMERIC(12, 4),
+    prev_session_source VARCHAR(40),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (symbol, trading_date),
+    CHECK (premarket_high IS NULL OR premarket_low IS NULL OR premarket_high >= premarket_low),
+    CHECK (prev_session_high IS NULL OR prev_session_low IS NULL OR prev_session_high >= prev_session_low)
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_levels_symbol_date_desc
+    ON session_levels(symbol, trading_date DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_session_levels_symbol') THEN
+        ALTER TABLE session_levels
+        ADD CONSTRAINT fk_session_levels_symbol
+        FOREIGN KEY (symbol) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS option_chains (
     option_symbol VARCHAR(50) NOT NULL,
     timestamp TIMESTAMPTZ NOT NULL,
@@ -319,6 +372,46 @@ CREATE TABLE IF NOT EXISTS vxn_bars (
 );
 
 CREATE INDEX IF NOT EXISTS idx_vxn_bars_timestamp ON vxn_bars(timestamp DESC);
+
+-- =============================================================================
+-- futures_quotes — rolling window of 1-minute CME equity-index futures bars.
+-- =============================================================================
+-- DISPLAY-ONLY substitute for a cash index outside the regular cash
+-- session.  During the overnight futures window (18:00 ET -> next 09:30 ET)
+-- the futures ingester (src/ingestion/futures_underlying_ingester.py)
+-- streams the mapped continuous future (SPX->@ES, NDX->@NQ, ...) into this
+-- table, and /api/market/quote + /api/market/historical read from here
+-- (under the INDEX label) when should_display_future() is true.
+--
+-- This table NEVER feeds GEX / greeks / signals / settlement — those key
+-- on underlying_quotes.symbol (the cash index).  Rows are pruned to a
+-- rolling retention window (default 7 days), so this is not a durable
+-- store; it exists purely to back the live/near-live display swap.
+--
+--   index_symbol   — the cash index the future stands in for (SPX, NDX, …);
+--                    the key the API reads by.
+--   future_symbol  — the TradeStation continuous-contract symbol actually
+--                    streamed (@ES, @NQ, …); surfaced to the UI as the
+--                    "showing futures: ES" badge (data_symbol).
+CREATE TABLE IF NOT EXISTS futures_quotes (
+    index_symbol VARCHAR(10) NOT NULL,
+    future_symbol VARCHAR(16) NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL,
+    open NUMERIC(12, 4) NOT NULL,
+    high NUMERIC(12, 4) NOT NULL,
+    low NUMERIC(12, 4) NOT NULL,
+    close NUMERIC(12, 4) NOT NULL,
+    up_volume BIGINT DEFAULT 0,
+    down_volume BIGINT DEFAULT 0,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (index_symbol, timestamp),
+    CONSTRAINT check_fq_positive_prices CHECK (open > 0 AND high > 0 AND low > 0 AND close > 0),
+    CONSTRAINT check_fq_high_low CHECK (high >= low)
+);
+
+CREATE INDEX IF NOT EXISTS idx_futures_quotes_timestamp ON futures_quotes(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_futures_quotes_index_symbol_timestamp
+    ON futures_quotes(index_symbol, timestamp DESC);
 
 -- =============================================================================
 -- TradeStation API call counts per 5-minute UTC window.
@@ -596,6 +689,12 @@ CREATE TRIGGER update_option_chains_updated_at
 DROP TRIGGER IF EXISTS update_vix_bars_updated_at ON vix_bars;
 CREATE TRIGGER update_vix_bars_updated_at
     BEFORE UPDATE ON vix_bars
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_futures_quotes_updated_at ON futures_quotes;
+CREATE TRIGGER update_futures_quotes_updated_at
+    BEFORE UPDATE ON futures_quotes
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
@@ -1621,6 +1720,13 @@ CREATE TABLE IF NOT EXISTS playbook_pattern_stats (
     avg_mfe_pct       DOUBLE PRECISION,
     avg_mae_pct       DOUBLE PRECISION,
     proposed_base     DOUBLE PRECISION,
+    -- Dollar economics — populated only by the option_pnl feed (touch is a
+    -- proxy and has no real P&L). gross_win_pnl is the sum of winning trades'
+    -- net_pnl; gross_loss_pnl is the absolute sum of losing trades' net_pnl
+    -- (always ≥ 0). Net P&L, profit factor, expectancy, and avg win/loss are
+    -- all derivable from these two + the counts already on the row.
+    gross_win_pnl     DOUBLE PRECISION,
+    gross_loss_pnl    DOUBLE PRECISION,
     -- Which harness produced this row: 'underlying_touch' (the conservative
     -- price-touch proxy) or 'option_pnl' (realized leg-level option P&L). Both
     -- can coexist for the same window; the live calibration store picks which
@@ -1633,6 +1739,12 @@ CREATE TABLE IF NOT EXISTS playbook_pattern_stats (
 -- Backfill for installs created before the `source` column / 5-col PK existed.
 ALTER TABLE playbook_pattern_stats
     ADD COLUMN IF NOT EXISTS source VARCHAR(24) NOT NULL DEFAULT 'underlying_touch';
+-- Backfill for installs created before the dollar-economics columns existed.
+-- Old rows stay NULL; the option_pnl feed populates them on its next refresh.
+ALTER TABLE playbook_pattern_stats
+    ADD COLUMN IF NOT EXISTS gross_win_pnl DOUBLE PRECISION;
+ALTER TABLE playbook_pattern_stats
+    ADD COLUMN IF NOT EXISTS gross_loss_pnl DOUBLE PRECISION;
 -- Migrate the primary key from the original 4-column form to include `source`
 -- so option_pnl rows can sit alongside underlying_touch rows for one window.
 DO $$
@@ -2178,6 +2290,213 @@ ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS sweep_id BIGINT
     REFERENCES backtest_sweeps(id) ON DELETE CASCADE;
 ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS sweep_cell JSONB;
 CREATE INDEX IF NOT EXISTS idx_backtest_runs_sweep ON backtest_runs(sweep_id, id);
+
+-- ============================================================================
+-- TradeWorkz™ multi-bot signaled-trading engine
+-- ============================================================================
+--
+-- Wipes the legacy single-portfolio Signaled Trade surface and replaces it
+-- with a per-bot competition. Each bot owns its own capital sleeve, position
+-- book, immutable trade blotter, equity curve, daily rollup metrics, and
+-- online ML calibration state. Followers are tracked per (end_user, bot) so
+-- entry/exit notifications can fan out only to opted-in users.
+--
+-- Everything under this header is idempotent: legacy DROPs are gated on
+-- IF EXISTS, new CREATEs use IF NOT EXISTS, ALTERs use ADD COLUMN IF NOT
+-- EXISTS. Re-running the file on a fresh DB or on a partially-migrated DB
+-- both converge to the same target state.
+
+-- 9.1 Legacy Signaled-Trade blotter tables STAY IN PLACE.
+--
+-- Earlier drafts of this block wiped signal_trades / portfolio_snapshots
+-- / signal_action_cards CASCADE, then relied on the CREATE TABLE IF NOT
+-- EXISTS higher up in this file to recreate them empty on the next apply.
+-- That was wrong for two reasons:
+--   (a) schema.sql is applied on every deploy, so the wipe kept firing
+--       on every rollout — no help for the "one-time migration" intent.
+--   (b) The legacy MSI signal engine (zerogex-oa-signals.service) still
+--       writes signal_scores / signal_component_scores / signal_events
+--       (which /signal-score and /advanced-signals consume) AND writes
+--       signal_trades / signal_action_cards on the same tick. Every
+--       between-deploy window the tables came back empty, but the wipe
+--       reset them again on the next schema-apply, so the service
+--       error-logged "relation signal_trades does not exist" ~200x/hour.
+-- Fix: don't wipe. The tables persist and accept writes; nothing user-
+-- facing reads them (the old /trading-signals page is now TradeWorkz).
+-- A one-time truncation, if ever desired, is an operator ad-hoc
+-- (`TRUNCATE signal_trades, signal_action_cards, portfolio_snapshots`),
+-- not a permanent schema.sql statement.
+
+-- 9.2 Bot registry — every TradeWorkz bot the engine can run.
+CREATE TABLE IF NOT EXISTS tw_bots (
+    id              VARCHAR(64)  PRIMARY KEY,
+    display_name    VARCHAR(96)  NOT NULL,
+    strategy_class  VARCHAR(96)  NOT NULL,
+    tier            VARCHAR(12)  NOT NULL DEFAULT '0DTE'
+                     CHECK (tier IN ('0DTE','1DTE','swing')),
+    direction_mode  VARCHAR(20)  NOT NULL DEFAULT 'context',
+    universe        VARCHAR(64)  NOT NULL DEFAULT 'SPY',
+    tagline         VARCHAR(240),
+    description     TEXT,
+    is_public       BOOLEAN      NOT NULL DEFAULT TRUE,
+    enabled         BOOLEAN      NOT NULL DEFAULT TRUE,
+    params          JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_tw_bots_enabled ON tw_bots(enabled, tier);
+CREATE INDEX IF NOT EXISTS idx_tw_bots_public ON tw_bots(is_public, enabled);
+
+-- 9.3 Per-bot capital sleeve (admin-owned, one row per bot). The engine
+--     slices TRADEWORKZ_FLEET_CAPITAL evenly across enabled bots at
+--     provisioning time; admins can then override individual sleeves.
+CREATE TABLE IF NOT EXISTS tw_bot_capital (
+    bot_id            VARCHAR(64)  PRIMARY KEY REFERENCES tw_bots(id) ON DELETE CASCADE,
+    starting_capital  NUMERIC(14,2) NOT NULL,
+    current_capital   NUMERIC(14,2) NOT NULL,
+    peak_capital      NUMERIC(14,2) NOT NULL,
+    max_heat_pct      DOUBLE PRECISION NOT NULL DEFAULT 0.06,
+    kelly_fraction    DOUBLE PRECISION NOT NULL DEFAULT 0.50,
+    daily_kill_pct    DOUBLE PRECISION NOT NULL DEFAULT 0.02,
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 9.4 Open positions (fast lookup for per-tick reconcile). One row per
+--     bot per open position; on close the row is deleted and a matching
+--     immutable tw_trades row is written in the same transaction.
+CREATE TABLE IF NOT EXISTS tw_positions (
+    id                 BIGSERIAL PRIMARY KEY,
+    bot_id             VARCHAR(64) NOT NULL REFERENCES tw_bots(id) ON DELETE CASCADE,
+    underlying         VARCHAR(10) NOT NULL,
+    opened_at          TIMESTAMPTZ NOT NULL,
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    direction          VARCHAR(10) NOT NULL CHECK (direction IN ('bullish','bearish','neutral')),
+    strategy_type      VARCHAR(40) NOT NULL,
+    legs               JSONB       NOT NULL,
+    entry_price        NUMERIC(12,6) NOT NULL,
+    current_price      NUMERIC(12,6) NOT NULL,
+    quantity_open      INTEGER     NOT NULL,
+    unrealized_pnl     NUMERIC(14,4) NOT NULL DEFAULT 0,
+    stop_price         NUMERIC(12,6),
+    target_price       NUMERIC(12,6),
+    time_stop_at       TIMESTAMPTZ,
+    min_hold_until     TIMESTAMPTZ,
+    wall_ref_price     NUMERIC(12,6),
+    wall_ref_side      VARCHAR(10),
+    entry_conviction   DOUBLE PRECISION,
+    components_at_entry JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_tw_positions_bot_open ON tw_positions(bot_id, opened_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tw_positions_underlying ON tw_positions(underlying, opened_at DESC);
+
+-- 9.5 Immutable trade blotter — every closed round-trip. Never updated after
+--     insert. Serves both the leaderboard aggregates and the per-bot ML
+--     calibrator's rolling win-rate windows.
+CREATE TABLE IF NOT EXISTS tw_trades (
+    id                 BIGSERIAL PRIMARY KEY,
+    bot_id             VARCHAR(64) NOT NULL REFERENCES tw_bots(id) ON DELETE CASCADE,
+    underlying         VARCHAR(10) NOT NULL,
+    opened_at          TIMESTAMPTZ NOT NULL,
+    closed_at          TIMESTAMPTZ NOT NULL,
+    direction          VARCHAR(10) NOT NULL,
+    strategy_type      VARCHAR(40) NOT NULL,
+    legs               JSONB       NOT NULL,
+    entry_price        NUMERIC(12,6) NOT NULL,
+    exit_price         NUMERIC(12,6) NOT NULL,
+    quantity           INTEGER     NOT NULL,
+    realized_pnl       NUMERIC(14,4) NOT NULL,
+    pnl_percent        NUMERIC(12,4) NOT NULL,
+    outcome            VARCHAR(12) NOT NULL CHECK (outcome IN ('win','loss','scratch')),
+    close_reason       VARCHAR(32) NOT NULL,
+    entry_conviction   DOUBLE PRECISION,
+    components_at_entry JSONB NOT NULL DEFAULT '{}'::jsonb,
+    components_at_exit  JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_tw_trades_bot_closed ON tw_trades(bot_id, closed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tw_trades_underlying_closed ON tw_trades(underlying, closed_at DESC);
+
+-- 9.6 Per-bot equity curve — one row per bot per session. Cheap to render
+--     as a sparkline (30-day window = 30 rows/bot) and cheap to write EOD.
+CREATE TABLE IF NOT EXISTS tw_equity_curve_daily (
+    bot_id         VARCHAR(64)  NOT NULL REFERENCES tw_bots(id) ON DELETE CASCADE,
+    session_date   DATE         NOT NULL,
+    starting_nav   NUMERIC(14,2) NOT NULL,
+    ending_nav     NUMERIC(14,2) NOT NULL,
+    realized_pnl   NUMERIC(14,4) NOT NULL,
+    unrealized_pnl NUMERIC(14,4) NOT NULL,
+    heat_pct       DOUBLE PRECISION NOT NULL DEFAULT 0,
+    n_trades       INTEGER      NOT NULL DEFAULT 0,
+    PRIMARY KEY (bot_id, session_date)
+);
+CREATE INDEX IF NOT EXISTS idx_tw_equity_curve_bot ON tw_equity_curve_daily(bot_id, session_date DESC);
+
+-- 9.7 Daily rollup metrics used by the leaderboard's sortable columns.
+CREATE TABLE IF NOT EXISTS tw_bot_metrics_daily (
+    bot_id           VARCHAR(64) NOT NULL REFERENCES tw_bots(id) ON DELETE CASCADE,
+    session_date     DATE        NOT NULL,
+    trades_count     INTEGER     NOT NULL DEFAULT 0,
+    wins             INTEGER     NOT NULL DEFAULT 0,
+    losses           INTEGER     NOT NULL DEFAULT 0,
+    win_rate         DOUBLE PRECISION,
+    avg_win_pnl      DOUBLE PRECISION,
+    avg_loss_pnl     DOUBLE PRECISION,
+    profit_factor    DOUBLE PRECISION,
+    sharpe_20d       DOUBLE PRECISION,
+    max_drawdown_pct DOUBLE PRECISION,
+    PRIMARY KEY (bot_id, session_date)
+);
+
+-- 9.8 ML calibration state. Each bot maintains an online logistic-regression
+--     model over its own feature vector (conviction, wall proximity, GEX
+--     regime, VIX regime, time-of-day). The weights column is a JSONB of
+--     {feature_name: weight_value} — updated after each trade close by the
+--     nightly (or configurable-cadence) calibration worker.
+CREATE TABLE IF NOT EXISTS tw_ml_state (
+    bot_id             VARCHAR(64)  PRIMARY KEY REFERENCES tw_bots(id) ON DELETE CASCADE,
+    n_samples          INTEGER      NOT NULL DEFAULT 0,
+    n_wins             INTEGER      NOT NULL DEFAULT 0,
+    hit_rate           DOUBLE PRECISION,
+    confidence_base    DOUBLE PRECISION NOT NULL DEFAULT 0.50,
+    confidence_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.55,
+    size_multiplier    DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    weights            JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    feature_mean       JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    feature_var        JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    last_win_rate_7d   DOUBLE PRECISION,
+    last_win_rate_30d  DOUBLE PRECISION,
+    last_profit_factor DOUBLE PRECISION,
+    computed_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+-- 9.9 Followers — one row per (end_user, bot) opt-in. Mirrors the
+--     backtest_configs end_user attribution pattern.
+CREATE TABLE IF NOT EXISTS tw_bot_followers (
+    end_user       VARCHAR(128) NOT NULL,
+    bot_id         VARCHAR(64)  NOT NULL REFERENCES tw_bots(id) ON DELETE CASCADE,
+    followed_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    channels       JSONB        NOT NULL DEFAULT '{"in_app":true}'::jsonb,
+    min_confidence DOUBLE PRECISION DEFAULT 0.0,
+    PRIMARY KEY (end_user, bot_id)
+);
+CREATE INDEX IF NOT EXISTS idx_tw_bot_followers_bot ON tw_bot_followers(bot_id, followed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tw_bot_followers_user ON tw_bot_followers(end_user, followed_at DESC);
+
+-- 9.10 Notifications log — delivery audit trail for entry/exit/adjust events.
+CREATE TABLE IF NOT EXISTS tw_notifications_log (
+    id           BIGSERIAL PRIMARY KEY,
+    end_user     VARCHAR(128) NOT NULL,
+    bot_id       VARCHAR(64)  NOT NULL REFERENCES tw_bots(id) ON DELETE CASCADE,
+    event_type   VARCHAR(24)  NOT NULL,
+    trade_id     BIGINT       REFERENCES tw_trades(id) ON DELETE SET NULL,
+    position_id  BIGINT,
+    channel      VARCHAR(16)  NOT NULL,
+    status       VARCHAR(16)  NOT NULL,
+    payload      JSONB        NOT NULL,
+    error        TEXT,
+    sent_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_tw_notifications_user_sent ON tw_notifications_log(end_user, sent_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tw_notifications_bot_sent ON tw_notifications_log(bot_id, sent_at DESC);
 
 -- ============================================================================
 -- daily_forecast (Phase 3: Gamma Forecast Card + 4 PM Receipt)

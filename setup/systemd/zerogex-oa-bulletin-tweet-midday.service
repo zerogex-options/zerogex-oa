@@ -1,0 +1,30 @@
+[Unit]
+Description=ZeroGEX Live-Bulletin mid-session X post (12:30 ET)
+Documentation=https://github.com/zerogex/options/zerogex-oa
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Stages the mid-session bulletin tweet for human approval.  See the
+# premarket unit for the full stage → approve → post lifecycle; same
+# rules apply here.  Flip BULLETIN_TWEET_AUTOPILOT=1 in the
+# EnvironmentFile to auto-post without approval.
+ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.bulletin_tweet --mode midday --stage
+
+TimeoutStartSec=240
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa /var/lib/zerogex-oa
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-bulletin-tweet-midday

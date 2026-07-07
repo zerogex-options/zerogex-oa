@@ -1,0 +1,17 @@
+[Unit]
+Description=Daily trigger for ZeroGEX post-market bulletin tweet (16:05 ET Mon-Fri)
+
+[Timer]
+# Fires at 16:05 ET — 5 minutes after the cash bell so the closing
+# print and the last-minute rebalancing flow are already in the
+# gex_summary snapshot the job reads.  The forecast-receipt timer
+# fires at 16:10 and grades against roughly the same snapshot, so
+# the tweet and the receipt are numerically consistent.
+OnCalendar=Mon..Fri *-*-* 16:05:00
+RandomizedDelaySec=45s
+# Catch up after planned downtime — an EOD read still adds value up
+# until midnight ET.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

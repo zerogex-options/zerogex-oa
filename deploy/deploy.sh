@@ -111,19 +111,49 @@ if [ ! -f "$ENV_FILE" ]; then
     exit 1
 fi
 log "Sourcing configuration from $ENV_FILE"
-# Syntactic check first — a malformed line otherwise aborts deploy.sh
-# under `set -e` with no clear log line written.
-if ! bash -n "$ENV_FILE" 2>/tmp/deploy-env-syntax.log; then
-    log "✗ .env has shell syntax errors:"
-    while IFS= read -r line; do log "    $line"; done < /tmp/deploy-env-syntax.log
-    log ""
-    log "    Fix the file and re-run."
-    exit 1
-fi
-set -a
-# shellcheck disable=SC1090
-source "$ENV_FILE"
-set +a
+# Parse .env with the same semantics systemd's EnvironmentFile= uses —
+# everything after the first `=` is taken as a literal string. That
+# means values with spaces, `<`, `>`, `&`, `$`, `|`, etc. do NOT need
+# shell-style quoting, and consumers that read the raw file (grep
+# pipelines, .env-style readers) see the unquoted value they expect.
+#
+# Prior versions used ``bash -n`` + ``source`` here; that broke on any
+# value containing unquoted shell metacharacters. Rather than force
+# every consumer to agree on a quoting convention, we parse .env
+# manually and export each KEY=VALUE.
+#
+# Behavior:
+#   * Skips blank lines and lines starting with `#`.
+#   * Strips one surrounding pair of single or double quotes if
+#     present, so a manually-quoted value yields the same literal as
+#     the unquoted form.
+#   * Ignores lines whose key is not a valid POSIX identifier.
+#   * Tolerates a leading ``export `` on each line.
+while IFS= read -r _env_line || [ -n "$_env_line" ]; do
+    case "$_env_line" in
+        ''|'#'*) continue ;;
+    esac
+    _env_key="${_env_line%%=*}"
+    # If no `=` on the line, %%=* returns the whole line; skip.
+    if [ "$_env_key" = "$_env_line" ]; then
+        continue
+    fi
+    _env_val="${_env_line#*=}"
+    # Trim optional ``export `` prefix and stray leading whitespace.
+    _env_key="${_env_key#export }"
+    _env_key="${_env_key# }"
+    # Validate identifier ([A-Za-z_][A-Za-z0-9_]*).
+    case "$_env_key" in
+        [!A-Za-z_]*|*[!A-Za-z0-9_]*) continue ;;
+    esac
+    # Strip one surrounding quote pair if present.
+    case "$_env_val" in
+        \"*\") _env_val="${_env_val#\"}"; _env_val="${_env_val%\"}" ;;
+        \'*\') _env_val="${_env_val#\'}"; _env_val="${_env_val%\'}" ;;
+    esac
+    export "$_env_key=$_env_val"
+done < "$ENV_FILE"
+unset _env_line _env_key _env_val
 export APP_DIR ENV_FILE
 
 # Always run 005.preflight, regardless of --start-from. It only validates
@@ -134,8 +164,18 @@ export APP_DIR ENV_FILE
 # deploy. Without this, a missing var surfaces several steps later as
 # a cryptic error (e.g. an empty OA_API_DOMAIN crashing 130.ssl's DNS
 # preflight with `dig: '' is not a legal name`).
+#
+# Escape hatch: ``SKIP_PREFLIGHT=1`` bypasses the check. Intended for
+# targeted --start-from re-deploys (e.g. an nginx-only touch) where
+# the operator knows the missing vars aren't needed by the steps
+# actually being run. Do NOT use for a cold deploy — the failure
+# modes preflight guards against are real.
 PREFLIGHT_SCRIPT="$STEPS_DIR/005.preflight"
-if [ -x "$PREFLIGHT_SCRIPT" ]; then
+if [ "${SKIP_PREFLIGHT:-0}" = "1" ]; then
+    log "=========================================="
+    log "SKIP_PREFLIGHT=1 — bypassing 005.preflight (use only for targeted re-deploys)"
+    log ""
+elif [ -x "$PREFLIGHT_SCRIPT" ]; then
     log "=========================================="
     log "Executing: 005.preflight ..."
     if bash "$PREFLIGHT_SCRIPT"; then

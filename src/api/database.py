@@ -1981,6 +1981,56 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             )
             return []
 
+    async def get_underlying_candles_for_session(
+        self, symbol: str, session_date: date,
+    ) -> List[Dict[str, Any]]:
+        """Per-minute OHLC bars for the underlying over one cash session.
+
+        Powers the price-action chart the Replay scrubber renders alongside
+        the strike profile so a trader can read "where was the tape when
+        this GEX frame was published?" without leaving the tool. Anchors
+        on the same 09:30-16:00 ET window as ``get_gex_frames_for_session``
+        so the two series line up minute-for-minute.
+
+        Returns chronological ``{timestamp, open, high, low, close, volume}``
+        rows; missing volume columns fall back to zero. ``[]`` on any
+        error so the caller can render an empty state.
+        """
+        et = ZoneInfo("America/New_York")
+        utc = ZoneInfo("UTC")
+        start_et = datetime.combine(session_date, time(9, 30), tzinfo=et)
+        # +1 minute so the 16:00 bar is included; matches the GEX frames
+        # window so cursor alignment is exact.
+        end_et = datetime.combine(session_date, time(16, 1), tzinfo=et)
+        start_utc = start_et.astimezone(utc)
+        end_utc = end_et.astimezone(utc)
+
+        query = """
+            SELECT timestamp,
+                   open,
+                   high,
+                   low,
+                   close,
+                   COALESCE(up_volume, 0)::bigint AS up_volume,
+                   COALESCE(down_volume, 0)::bigint AS down_volume,
+                   (COALESCE(up_volume, 0) + COALESCE(down_volume, 0))::bigint AS volume
+            FROM underlying_quotes
+            WHERE symbol = $1
+              AND timestamp >= $2
+              AND timestamp < $3
+            ORDER BY timestamp ASC
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, start_utc, end_utc)
+                return [dict(r) for r in rows]
+        except Exception as e:
+            logger.warning(
+                "get_underlying_candles_for_session(%s, %s) failed: %s",
+                symbol, session_date, e,
+            )
+            return []
+
     async def get_underlying_bars_for_session(
         self, symbol: str, session_date: date
     ) -> List[Dict[str, Any]]:
@@ -3553,6 +3603,73 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching latest quote: {e!r}", exc_info=True)
             raise
 
+    async def get_latest_future_quote(
+        self, index_symbol: str, session_start: Optional[datetime] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Latest ``futures_quotes`` bar for a cash index (DISPLAY-only swap).
+
+        Returns the most recent overnight future bar LABELLED under the cash
+        index (``symbol`` = the index, e.g. ``SPX``) plus ``future_symbol``
+        (e.g. ``@ES``) for the UI badge, or ``None`` when the futures
+        ingester has no rows yet — in which case the caller falls back to
+        the frozen index quote.  Reads only ``futures_quotes``; never joins
+        or touches ``underlying_quotes`` or the index analytics tables.
+
+        ``session_start`` (the current overnight session's 18:00 ET open)
+        pins ``reference_close`` to the session-open print so the overnight
+        change is measured futures-vs-futures (no cash-index basis mixed
+        in).  When None, the earliest available bar's open is used.
+        """
+        index_symbol = index_symbol.upper()
+        cache_key = f"latest_future_quote:{index_symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        query = """
+            WITH latest AS (
+                SELECT *
+                FROM futures_quotes
+                WHERE index_symbol = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            session_open AS (
+                SELECT open AS ref_open
+                FROM futures_quotes
+                WHERE index_symbol = $1
+                  AND ($2::timestamptz IS NULL OR timestamp >= $2::timestamptz)
+                ORDER BY timestamp ASC
+                LIMIT 1
+            )
+            SELECT
+                l.timestamp,
+                l.index_symbol AS symbol,
+                l.future_symbol,
+                l.open,
+                l.high,
+                l.low,
+                l.close,
+                l.up_volume,
+                l.down_volume,
+                (COALESCE(l.up_volume, 0) + COALESCE(l.down_volume, 0))::bigint AS volume,
+                (SELECT ref_open FROM session_open) AS reference_close
+            FROM latest l
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(query, index_symbol, session_start)
+                payload = dict(row) if row else None
+                self._cache_set(
+                    cache_key,
+                    payload,
+                    self._latest_quote_cache_ttl_seconds,
+                )
+                return payload
+        except Exception as e:
+            logger.error(f"Error fetching latest future quote: {e!r}", exc_info=True)
+            raise
+
     async def get_previous_close(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
         """
         Get the most recent 4:00 PM ET close price (previous trading day's close).
@@ -3843,6 +3960,398 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             # behavior is the safe degradation path.
             return True
 
+    # ------------------------------------------------------------------
+    # Session levels (pre-market + previous-session high/low)
+    # ------------------------------------------------------------------
+
+    # ET time-window constants for the session-levels computations.  The
+    # pre-market window is [04:00, 09:30) — the 09:30 bucket is the first
+    # RTH bar.  The previous-session window is [09:30, close], where the
+    # close-time bar (16:00, or 13:00 on NYSE half-days) is start-of-minute
+    # stamped and therefore extended-hours-contaminated for non-INDEX
+    # symbols; only its ``open`` (the closing-auction print) participates
+    # in the high/low, mirroring ``get_session_closes``'s asset-aware
+    # cash-close rule.
+    _SESSION_LEVELS_LIVE_SQL = """
+        WITH premarket AS (
+            SELECT
+                MAX(high) AS pm_high,
+                MIN(low)  AS pm_low,
+                COUNT(*)  AS pm_bars
+            FROM underlying_quotes
+            WHERE symbol = $1
+              AND (timestamp AT TIME ZONE 'America/New_York')::date = $2
+              AND (timestamp AT TIME ZONE 'America/New_York')::time >= TIME '04:00'
+              AND (timestamp AT TIME ZONE 'America/New_York')::time <  TIME '09:30'
+        ),
+        prev_date AS (
+            SELECT MAX((timestamp AT TIME ZONE 'America/New_York')::date) AS d
+            FROM underlying_quotes
+            WHERE symbol = $1
+              AND (timestamp AT TIME ZONE 'America/New_York')::date < $2
+              AND EXTRACT(DOW FROM timestamp AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
+              AND (timestamp AT TIME ZONE 'America/New_York')::time >= TIME '09:30'
+              AND (timestamp AT TIME ZONE 'America/New_York')::time <  TIME '16:00'
+        ),
+        prev_close AS (
+            SELECT
+                pd.d,
+                CASE WHEN pd.d = ANY($3::date[]) THEN TIME '13:00' ELSE TIME '16:00' END AS close_t
+            FROM prev_date pd
+        ),
+        prev_session AS (
+            SELECT
+                MAX(uq.high) FILTER (
+                    WHERE (uq.timestamp AT TIME ZONE 'America/New_York')::time < pc.close_t
+                ) AS rth_high,
+                MIN(uq.low) FILTER (
+                    WHERE (uq.timestamp AT TIME ZONE 'America/New_York')::time < pc.close_t
+                ) AS rth_low,
+                MAX(uq.open) FILTER (
+                    WHERE (uq.timestamp AT TIME ZONE 'America/New_York')::time = pc.close_t
+                ) AS auction_open
+            FROM underlying_quotes uq
+            CROSS JOIN prev_close pc
+            WHERE uq.symbol = $1
+              AND (uq.timestamp AT TIME ZONE 'America/New_York')::date = pc.d
+              AND (uq.timestamp AT TIME ZONE 'America/New_York')::time >= TIME '09:30'
+              AND (uq.timestamp AT TIME ZONE 'America/New_York')::time <= pc.close_t
+        )
+        SELECT
+            pm.pm_high,
+            pm.pm_low,
+            pm.pm_bars,
+            pc.d AS prev_session_date,
+            -- GREATEST/LEAST ignore NULLs in Postgres, so a missing auction
+            -- print degrades gracefully to the plain RTH aggregate.
+            GREATEST(ps.rth_high, ps.auction_open) AS prev_high,
+            LEAST(ps.rth_low, ps.auction_open)     AS prev_low
+        FROM premarket pm
+        CROSS JOIN prev_close pc
+        CROSS JOIN prev_session ps
+    """
+
+    @staticmethod
+    def _nyse_half_days() -> List[date]:
+        """NYSE early-close (13:00 ET) dates from the ``NYSE_HALF_DAYS`` env var."""
+        out: List[date] = []
+        for token in os.getenv("NYSE_HALF_DAYS", "").split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                out.append(date.fromisoformat(token))
+            except ValueError:
+                logger.warning("Invalid date in NYSE_HALF_DAYS: %r", token)
+        return out
+
+    async def compute_live_session_levels(
+        self, symbol: str, trading_date: date
+    ) -> Dict[str, Any]:
+        """Aggregate pre-market + previous-session high/low from 1-min bars.
+
+        Computes, directly from ``underlying_quotes``:
+
+        * ``premarket_high`` / ``premarket_low`` — the [04:00, 09:30) ET
+          window of ``trading_date``.  Non-null only on deployments whose
+          ingestion ``SESSION_TEMPLATE`` covers extended hours.
+        * ``prev_session_date`` + ``prev_session_high`` / ``prev_session_low``
+          — the most recent ET weekday before ``trading_date`` that has RTH
+          bars.  The high/low spans [09:30, close) plus the close-time bar's
+          ``open`` (closing-auction print); close is 13:00 on NYSE half-days.
+
+        Used by ``get_session_levels`` as the live fallback when the capture
+        job hasn't written a row yet, and by the ``session_levels`` job as
+        its ``underlying_quotes`` source.  All fields may be None.
+        """
+        async with self._acquire_connection() as conn:
+            row = await conn.fetchrow(
+                self._SESSION_LEVELS_LIVE_SQL,
+                symbol,
+                trading_date,
+                self._nyse_half_days(),
+            )
+        if not row:
+            return {
+                "premarket_high": None,
+                "premarket_low": None,
+                "prev_session_date": None,
+                "prev_session_high": None,
+                "prev_session_low": None,
+            }
+        return {
+            "premarket_high": row["pm_high"],
+            "premarket_low": row["pm_low"],
+            "prev_session_date": row["prev_session_date"],
+            "prev_session_high": row["prev_high"],
+            "prev_session_low": row["prev_low"],
+        }
+
+    async def ensure_symbol_row(self, symbol: str, asset_type: str) -> None:
+        """Insert a minimal ``symbols`` row if missing (FK prerequisite).
+
+        ``ON CONFLICT DO NOTHING`` — the ingestion engine owns the
+        authoritative symbol metadata; this only satisfies the FK for
+        writers that may run before ingestion has seen the symbol.
+        """
+        async with self._acquire_connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO symbols (symbol, name, asset_type, is_active)
+                VALUES ($1, $1, $2, TRUE)
+                ON CONFLICT (symbol) DO NOTHING
+                """,
+                symbol,
+                asset_type,
+            )
+
+    async def upsert_session_levels(
+        self,
+        *,
+        symbol: str,
+        trading_date: date,
+        premarket_high: Optional[float],
+        premarket_low: Optional[float],
+        premarket_source: Optional[str],
+        prev_session_date: Optional[date],
+        prev_session_high: Optional[float],
+        prev_session_low: Optional[float],
+        prev_session_source: Optional[str],
+    ) -> None:
+        """Upsert one (symbol, trading_date) row of captured session levels.
+
+        Merge semantics: a re-run never clobbers previously captured values
+        with NULLs — each field only advances when the new capture produced
+        one (COALESCE on the EXCLUDED side).  During the pre-market window
+        successive runs therefore ratchet the high/low outward as the
+        session extends.
+        """
+        async with self._acquire_connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO session_levels (
+                    symbol, trading_date,
+                    premarket_high, premarket_low, premarket_source,
+                    prev_session_date, prev_session_high, prev_session_low,
+                    prev_session_source
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (symbol, trading_date) DO UPDATE SET
+                    premarket_high = COALESCE(EXCLUDED.premarket_high, session_levels.premarket_high),
+                    premarket_low  = COALESCE(EXCLUDED.premarket_low,  session_levels.premarket_low),
+                    premarket_source = CASE
+                        WHEN EXCLUDED.premarket_high IS NOT NULL
+                          OR EXCLUDED.premarket_low IS NOT NULL
+                        THEN EXCLUDED.premarket_source
+                        ELSE session_levels.premarket_source
+                    END,
+                    prev_session_date = COALESCE(EXCLUDED.prev_session_date, session_levels.prev_session_date),
+                    prev_session_high = COALESCE(EXCLUDED.prev_session_high, session_levels.prev_session_high),
+                    prev_session_low  = COALESCE(EXCLUDED.prev_session_low,  session_levels.prev_session_low),
+                    prev_session_source = CASE
+                        WHEN EXCLUDED.prev_session_high IS NOT NULL
+                          OR EXCLUDED.prev_session_low IS NOT NULL
+                        THEN EXCLUDED.prev_session_source
+                        ELSE session_levels.prev_session_source
+                    END,
+                    updated_at = NOW()
+                """,
+                symbol,
+                trading_date,
+                premarket_high,
+                premarket_low,
+                premarket_source,
+                prev_session_date,
+                prev_session_high,
+                prev_session_low,
+                prev_session_source,
+            )
+
+    async def get_session_levels(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
+        """Serve pre-market + previous-session high/low for the chart overlays.
+
+        Source of record is the ``session_levels`` table written by the
+        ``src.jobs.session_levels`` capture job.  Semantics:
+
+        * A row's ``trading_date`` is active from its 04:00 ET pre-market
+          start until the next trading day's pre-market begins — i.e. the
+          latest row with ``trading_date <= today (ET)`` is served, so the
+          levels roll at the start of each new pre-market session, not at
+          the close.
+        * INDEX symbols (SPX, NDX, …) have no pre-market print; they get
+          ``is_index: true`` with null levels and the frontend draws
+          nothing.
+        * While today's pre-market is in progress the captured values are
+          unioned with a live ``underlying_quotes`` aggregate so the levels
+          stay fresh between capture-job ticks (on deployments whose
+          ingestion covers extended hours).
+        * If the capture job hasn't produced a row (fresh deploy, timer not
+          installed) the endpoint falls back to the live aggregate
+          entirely.
+
+        Returns None only when the symbol has no captured row AND no live
+        data at all.
+        """
+        symbol = symbol.upper()
+        cache_key = f"session_levels:{symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        now_et = datetime.now(_ET)
+        today_et = now_et.date()
+
+        try:
+            async with self._acquire_connection() as conn:
+                asset_row = await conn.fetchrow(
+                    "SELECT asset_type FROM symbols WHERE symbol = $1", symbol
+                )
+                asset_type = asset_row["asset_type"] if asset_row else None
+                is_index = (
+                    asset_type == "INDEX"
+                    if asset_type is not None
+                    else is_cash_index(symbol)
+                )
+
+                if is_index:
+                    result: Dict[str, Any] = {
+                        "symbol": symbol,
+                        "is_index": True,
+                        "trading_date": today_et,
+                        "premarket_high": None,
+                        "premarket_low": None,
+                        "prev_session_date": None,
+                        "prev_session_high": None,
+                        "prev_session_low": None,
+                        "source": None,
+                        "updated_at": None,
+                    }
+                    self._cache_set(cache_key, result, ttl_seconds=60.0)
+                    return result
+
+                captured = await conn.fetchrow(
+                    """
+                    SELECT trading_date,
+                           premarket_high, premarket_low,
+                           prev_session_date, prev_session_high, prev_session_low,
+                           updated_at
+                    FROM session_levels
+                    WHERE symbol = $1
+                      AND trading_date <= $2
+                    ORDER BY trading_date DESC
+                    LIMIT 1
+                    """,
+                    symbol,
+                    today_et,
+                )
+
+            # Live aggregate for today — only meaningful once today's
+            # pre-market window has opened on a trading day.
+            is_trading_today = now_et.weekday() <= 4 and today_et not in NYSE_HOLIDAYS
+            premarket_open = now_et.hour >= 4
+            live: Optional[Dict[str, Any]] = None
+            if is_trading_today and premarket_open:
+                live = await self.compute_live_session_levels(symbol, today_et)
+
+            result = self._merge_session_levels(symbol, today_et, captured, live)
+            if result is not None:
+                self._cache_set(cache_key, result, ttl_seconds=15.0)
+            return result
+        except Exception as e:
+            logger.error(f"Error fetching session levels: {e!r}", exc_info=True)
+            raise
+
+    @staticmethod
+    def _merge_session_levels(
+        symbol: str,
+        today_et: date,
+        captured: Optional[Any],
+        live: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Merge the captured row with the live aggregate (pure; unit-tested).
+
+        Preference order:
+        1. Captured row for today — pre-market values unioned with the live
+           aggregate so the levels track between capture ticks.
+        2. Live aggregate for today when the captured row is stale/missing
+           but live data exists (capture job not yet deployed).
+        3. Stale captured row as-is (e.g. weekend: Friday's row).
+        4. None when there is nothing at all.
+        """
+
+        def _f(value: Any) -> Optional[float]:
+            return float(value) if value is not None else None
+
+        live_has_signal = live is not None and any(
+            live.get(k) is not None
+            for k in (
+                "premarket_high",
+                "premarket_low",
+                "prev_session_high",
+                "prev_session_low",
+            )
+        )
+
+        if captured is not None and captured["trading_date"] == today_et:
+            pm_high = _f(captured["premarket_high"])
+            pm_low = _f(captured["premarket_low"])
+            source = "captured"
+            if live is not None:
+                live_high = _f(live.get("premarket_high"))
+                live_low = _f(live.get("premarket_low"))
+                merged_high = max(
+                    (v for v in (pm_high, live_high) if v is not None), default=None
+                )
+                merged_low = min(
+                    (v for v in (pm_low, live_low) if v is not None), default=None
+                )
+                if (merged_high, merged_low) != (pm_high, pm_low):
+                    source = "captured+live"
+                pm_high, pm_low = merged_high, merged_low
+            return {
+                "symbol": symbol,
+                "is_index": False,
+                "trading_date": captured["trading_date"],
+                "premarket_high": pm_high,
+                "premarket_low": pm_low,
+                "prev_session_date": captured["prev_session_date"],
+                "prev_session_high": _f(captured["prev_session_high"]),
+                "prev_session_low": _f(captured["prev_session_low"]),
+                "source": source,
+                "updated_at": captured["updated_at"],
+            }
+
+        if live_has_signal:
+            assert live is not None
+            return {
+                "symbol": symbol,
+                "is_index": False,
+                "trading_date": today_et,
+                "premarket_high": _f(live.get("premarket_high")),
+                "premarket_low": _f(live.get("premarket_low")),
+                "prev_session_date": live.get("prev_session_date"),
+                "prev_session_high": _f(live.get("prev_session_high")),
+                "prev_session_low": _f(live.get("prev_session_low")),
+                "source": "live",
+                "updated_at": None,
+            }
+
+        if captured is not None:
+            return {
+                "symbol": symbol,
+                "is_index": False,
+                "trading_date": captured["trading_date"],
+                "premarket_high": _f(captured["premarket_high"]),
+                "premarket_low": _f(captured["premarket_low"]),
+                "prev_session_date": captured["prev_session_date"],
+                "prev_session_high": _f(captured["prev_session_high"]),
+                "prev_session_low": _f(captured["prev_session_low"]),
+                "source": "captured",
+                "updated_at": captured["updated_at"],
+            }
+
+        return None
+
     async def get_historical_quotes(
         self,
         symbol: str = "SPY",
@@ -3921,6 +4430,86 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching historical quotes: {e}", exc_info=True)
+            raise
+
+    async def get_historical_futures(
+        self,
+        index_symbol: str,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        window_units: int = 192,
+        timeframe: str = "1min",
+    ) -> List[Dict[str, Any]]:
+        """Historical futures bars for a cash index (DISPLAY-only swap).
+
+        Same bucketed shape as :meth:`get_historical_quotes` (rows carry
+        ``symbol`` = the cash index so the client stays index-keyed), but
+        sourced from ``futures_quotes`` for the mapped continuous future.
+        Used by ``/api/market/historical`` when the site is in the overnight
+        futures window.  Reads only ``futures_quotes``.
+        """
+        index_symbol = index_symbol.upper()
+        bucket = _bucket_expr(timeframe)
+        bucket_floor = _bucket_floor_subquery(
+            table="futures_quotes",
+            bucket_expr=bucket,
+            symbol_predicate="index_symbol = $1",
+            end_expr="COALESCE($3::timestamptz, (SELECT max_ts FROM latest))",
+            limit_param="$4",
+        )
+        query = f"""
+            WITH latest AS (
+                SELECT timestamp AS max_ts
+                FROM futures_quotes
+                WHERE index_symbol = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            bounds AS (
+                SELECT
+                    COALESCE($2::timestamptz, {bucket_floor}) AS start_ts,
+                    COALESCE($3::timestamptz, max_ts) AS end_ts
+                FROM latest
+            ),
+            base AS (
+                SELECT
+                    {bucket} as bucket_ts,
+                    index_symbol,
+                    timestamp,
+                    open,
+                    high,
+                    low,
+                    close,
+                    up_volume,
+                    down_volume,
+                    ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp ASC) as rn_open,
+                    ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) as rn_close
+                FROM futures_quotes
+                WHERE index_symbol = $1
+                    AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+            )
+            SELECT
+                bucket_ts as timestamp,
+                index_symbol AS symbol,
+                MAX(open) FILTER (WHERE rn_open = 1) as open,
+                MAX(high) as high,
+                MIN(low) as low,
+                MAX(close) FILTER (WHERE rn_close = 1) as close,
+                SUM(up_volume)::bigint as up_volume,
+                SUM(down_volume)::bigint as down_volume,
+                (SUM(up_volume) + SUM(down_volume))::bigint as volume
+            FROM base
+            GROUP BY bucket_ts, index_symbol
+            ORDER BY timestamp DESC
+            LIMIT $4
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                window_units = max(1, min(window_units, 576))
+                rows = await conn.fetch(query, index_symbol, start_date, end_date, window_units)
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error fetching historical futures: {e}", exc_info=True)
             raise
 
     async def get_max_pain_timeseries(

@@ -99,6 +99,24 @@ def _shape_strikes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def _shape_candle(row: dict[str, Any]) -> dict[str, Any]:
+    """underlying_quotes row → replay candle dict.
+
+    Volume columns fall back to zero so the frontend can render up/down
+    volume splits without null-guarding every field.
+    """
+    return {
+        "timestamp": row["timestamp"].isoformat() if row.get("timestamp") else None,
+        "open": _f(row.get("open")),
+        "high": _f(row.get("high")),
+        "low": _f(row.get("low")),
+        "close": _f(row.get("close")),
+        "up_volume": int(row["up_volume"]) if row.get("up_volume") is not None else 0,
+        "down_volume": int(row["down_volume"]) if row.get("down_volume") is not None else 0,
+        "volume": int(row["volume"]) if row.get("volume") is not None else 0,
+    }
+
+
 @router.get("/sessions")
 async def list_replay_sessions(
     symbol: str = Query(default="SPY", max_length=10),
@@ -194,6 +212,7 @@ async def get_replay_range(
     raw_frames = await db.get_gex_frames_for_session(
         sym, target, strike_band_pct=strike_band_pct,
     )
+    raw_candles = await db.get_underlying_candles_for_session(sym, target)
 
     frames = [
         {
@@ -206,6 +225,7 @@ async def get_replay_range(
         }
         for bar in raw_frames
     ]
+    candles = [_shape_candle(row) for row in raw_candles]
     return {
         "symbol": sym,
         "date": target.isoformat(),
@@ -213,6 +233,7 @@ async def get_replay_range(
         "is_today": is_today,
         "count": len(frames),
         "frames": frames,
+        "candles": candles,
     }
 
 
