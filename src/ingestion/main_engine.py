@@ -2208,6 +2208,11 @@ def main():
 
         vxn_main()
 
+    def run_futures_for_index(index_symbol: str):
+        from src.ingestion.futures_underlying_ingester import run_futures_ingester
+
+        run_futures_ingester(index_symbol)
+
     # Always run the VIX ingester alongside the per-symbol engines so that
     # /api/market/volatility?ticker=VIX can read from `vix_bars` without
     # hitting TradeStation.
@@ -2216,7 +2221,24 @@ def main():
     # from `vxn_bars` without hitting TradeStation.
     vxn_enabled = _getenv_bool("INGEST_VXN_ENABLED", True)
 
-    if len(symbols) == 1 and not vix_enabled and not vxn_enabled:
+    # Index→futures DISPLAY feed: one child per configured index streams its
+    # continuous future (SPX→@ES, …) into `futures_quotes` during the
+    # overnight window so /api/market/quote + /api/market/historical can
+    # serve the future under the index label outside the cash session.
+    # Opt-in (defaults off) so it stays dark until an operator enables it.
+    futures_enabled = _getenv_bool("INGEST_FUTURES_ENABLED", False)
+    futures_indexes = [
+        s.strip().upper()
+        for s in os.getenv("INGEST_FUTURES_INDEXES", "SPX").split(",")
+        if s.strip()
+    ]
+
+    if (
+        len(symbols) == 1
+        and not vix_enabled
+        and not vxn_enabled
+        and not futures_enabled
+    ):
         run_for_symbol(symbols[0])
         return
 
@@ -2241,6 +2263,20 @@ def main():
         vxn_process = Process(target=run_vxn_ingester, name="ingest-vxn")
         vxn_process.start()
         processes.append(vxn_process)
+
+    if futures_enabled:
+        for index_symbol in futures_indexes:
+            logger.info(
+                "Starting futures ingester for %s (overnight display feed)",
+                index_symbol,
+            )
+            fut_process = Process(
+                target=run_futures_for_index,
+                args=(index_symbol,),
+                name=f"ingest-futures-{index_symbol}",
+            )
+            fut_process.start()
+            processes.append(fut_process)
 
     def shutdown_children(signum, frame):
         logger.info(f"Received signal {signum}, terminating ingestion workers...")

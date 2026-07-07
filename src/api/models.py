@@ -231,6 +231,14 @@ class UnderlyingQuote(BaseModel):
     down_volume: Optional[int] = None
     volume: Optional[int] = None
     session: Optional[str] = None
+    # DISPLAY-only provenance for the index→future swap (see
+    # market_calendar.should_display_future). ``display_source='futures'``
+    # tells the UI this row is the cash index's future, shown outside the
+    # cash session; ``data_symbol`` is the future's ticker for the badge
+    # (e.g. 'ES'). Both stay None on the normal index/ETF path. ``symbol``
+    # remains the cash index so the client keeps requesting the index.
+    display_source: Optional[str] = None
+    data_symbol: Optional[str] = None
 
     class Config:
         from_attributes = True

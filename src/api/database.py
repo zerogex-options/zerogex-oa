@@ -3603,6 +3603,55 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching latest quote: {e!r}", exc_info=True)
             raise
 
+    async def get_latest_future_quote(
+        self, index_symbol: str
+    ) -> Optional[Dict[str, Any]]:
+        """Latest ``futures_quotes`` bar for a cash index (DISPLAY-only swap).
+
+        Returns the most recent overnight future bar LABELLED under the cash
+        index (``symbol`` = the index, e.g. ``SPX``) plus ``future_symbol``
+        (e.g. ``@ES``) for the UI badge, or ``None`` when the futures
+        ingester has no rows yet — in which case the caller falls back to
+        the frozen index quote.  Reads only ``futures_quotes``; never joins
+        or touches ``underlying_quotes`` or the index analytics tables.
+        """
+        index_symbol = index_symbol.upper()
+        cache_key = f"latest_future_quote:{index_symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        query = """
+            SELECT
+                timestamp,
+                index_symbol AS symbol,
+                future_symbol,
+                open,
+                high,
+                low,
+                close,
+                up_volume,
+                down_volume,
+                (COALESCE(up_volume, 0) + COALESCE(down_volume, 0))::bigint AS volume
+            FROM futures_quotes
+            WHERE index_symbol = $1
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(query, index_symbol)
+                payload = dict(row) if row else None
+                self._cache_set(
+                    cache_key,
+                    payload,
+                    self._latest_quote_cache_ttl_seconds,
+                )
+                return payload
+        except Exception as e:
+            logger.error(f"Error fetching latest future quote: {e!r}", exc_info=True)
+            raise
+
     async def get_previous_close(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
         """
         Get the most recent 4:00 PM ET close price (previous trading day's close).
@@ -4363,6 +4412,86 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error fetching historical quotes: {e}", exc_info=True)
+            raise
+
+    async def get_historical_futures(
+        self,
+        index_symbol: str,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        window_units: int = 192,
+        timeframe: str = "1min",
+    ) -> List[Dict[str, Any]]:
+        """Historical futures bars for a cash index (DISPLAY-only swap).
+
+        Same bucketed shape as :meth:`get_historical_quotes` (rows carry
+        ``symbol`` = the cash index so the client stays index-keyed), but
+        sourced from ``futures_quotes`` for the mapped continuous future.
+        Used by ``/api/market/historical`` when the site is in the overnight
+        futures window.  Reads only ``futures_quotes``.
+        """
+        index_symbol = index_symbol.upper()
+        bucket = _bucket_expr(timeframe)
+        bucket_floor = _bucket_floor_subquery(
+            table="futures_quotes",
+            bucket_expr=bucket,
+            symbol_predicate="index_symbol = $1",
+            end_expr="COALESCE($3::timestamptz, (SELECT max_ts FROM latest))",
+            limit_param="$4",
+        )
+        query = f"""
+            WITH latest AS (
+                SELECT timestamp AS max_ts
+                FROM futures_quotes
+                WHERE index_symbol = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            bounds AS (
+                SELECT
+                    COALESCE($2::timestamptz, {bucket_floor}) AS start_ts,
+                    COALESCE($3::timestamptz, max_ts) AS end_ts
+                FROM latest
+            ),
+            base AS (
+                SELECT
+                    {bucket} as bucket_ts,
+                    index_symbol,
+                    timestamp,
+                    open,
+                    high,
+                    low,
+                    close,
+                    up_volume,
+                    down_volume,
+                    ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp ASC) as rn_open,
+                    ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY timestamp DESC) as rn_close
+                FROM futures_quotes
+                WHERE index_symbol = $1
+                    AND timestamp BETWEEN (SELECT start_ts FROM bounds) AND (SELECT end_ts FROM bounds)
+            )
+            SELECT
+                bucket_ts as timestamp,
+                index_symbol AS symbol,
+                MAX(open) FILTER (WHERE rn_open = 1) as open,
+                MAX(high) as high,
+                MIN(low) as low,
+                MAX(close) FILTER (WHERE rn_close = 1) as close,
+                SUM(up_volume)::bigint as up_volume,
+                SUM(down_volume)::bigint as down_volume,
+                (SUM(up_volume) + SUM(down_volume))::bigint as volume
+            FROM base
+            GROUP BY bucket_ts, index_symbol
+            ORDER BY timestamp DESC
+            LIMIT $4
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                window_units = max(1, min(window_units, 576))
+                rows = await conn.fetch(query, index_symbol, start_date, end_date, window_units)
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error fetching historical futures: {e}", exc_info=True)
             raise
 
     async def get_max_pain_timeseries(

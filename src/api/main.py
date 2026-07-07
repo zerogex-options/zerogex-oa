@@ -990,9 +990,33 @@ async def get_flow_buying_pressure(
 # Market Session Helper
 # ============================================================================
 
-from src.market_calendar import ET as _ET, NYSE_HOLIDAYS as _NYSE_HOLIDAYS  # noqa: E402
+from src.market_calendar import (  # noqa: E402
+    ET as _ET,
+    NYSE_HOLIDAYS as _NYSE_HOLIDAYS,
+    should_display_future,
+)
+from src.config import _getenv_bool  # noqa: E402
+from src.symbols import resolve_index_future  # noqa: E402
 
 _SOFT_CLOSE_WINDOW = timedelta(seconds=30)
+
+
+def _index_futures_display_enabled() -> bool:
+    """Read-side master switch for the index→future display swap.
+
+    Read per-call (cheap env lookup) so an operator can flip the feature on
+    or off without restarting the API, once the futures ingester has
+    populated ``futures_quotes``.
+    """
+    return _getenv_bool("INDEX_FUTURES_DISPLAY_ENABLED", False)
+
+
+def _future_display_label(future_symbol: Optional[str]) -> Optional[str]:
+    """UI ticker for a TradeStation continuous future (``@ES`` → ``ES``)."""
+    if not future_symbol:
+        return None
+    return future_symbol.lstrip("@").upper() or None
+
 
 if not _NYSE_HOLIDAYS:
     logger.warning("NYSE_HOLIDAYS env var is empty — no holiday filtering will occur")
@@ -1151,6 +1175,21 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
     surface that reads ``quoteData.close``.
     """
     try:
+        # Index→future DISPLAY swap: outside the cash session (overnight
+        # futures window) serve the mapped future under the index label.
+        # Read-only from futures_quotes; the client keeps sending the index
+        # symbol so nothing downstream changes.  Falls through to the frozen
+        # index quote if the futures ingester has no rows yet.
+        if _index_futures_display_enabled() and should_display_future(symbol):
+            fut = await _db().get_latest_future_quote(symbol)
+            if fut:
+                fut = dict(fut)
+                future_symbol = fut.pop("future_symbol", None)
+                fut["session"] = "futures"
+                fut["display_source"] = "futures"
+                fut["data_symbol"] = _future_display_label(future_symbol)
+                return UnderlyingQuote(**fut)
+
         data = await _db().get_latest_quote(symbol)
         if not data:
             raise HTTPException(status_code=404, detail="No quote data available")
@@ -1255,6 +1294,23 @@ async def get_historical_quotes(
         # Parse dates if provided
         start_dt = datetime.fromisoformat(start_date) if start_date else None
         end_dt = datetime.fromisoformat(end_date) if end_date else None
+
+        # Index→future DISPLAY swap for the candlestick series: outside the
+        # cash session, serve the mapped future's bars under the index label
+        # (read-only from futures_quotes). Falls through to the index series
+        # if the futures ingester has no rows for the requested window.
+        if _index_futures_display_enabled() and should_display_future(symbol):
+            fut_rows = await _db().get_historical_futures(
+                symbol, start_dt, end_dt, window_units, timeframe
+            )
+            if fut_rows:
+                label = _future_display_label(resolve_index_future(symbol))
+                return [
+                    UnderlyingQuote(
+                        **{**row, "display_source": "futures", "data_symbol": label}
+                    )
+                    for row in fut_rows
+                ]
 
         data = await _db().get_historical_quotes(symbol, start_dt, end_dt, window_units, timeframe)
         return [UnderlyingQuote(**row) for row in data]

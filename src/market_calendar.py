@@ -388,6 +388,22 @@ def is_futures_session_open(dt: Optional[datetime] = None) -> bool:
     return True  # Mon–Thu — open except the 17:00–18:00 break handled above
 
 
+def is_futures_display_window(dt: Optional[datetime] = None) -> bool:
+    """True when the site is in the overnight futures-display window.
+
+    The window is 18:00 ET → next 09:30 ET AND the CME futures session is
+    actually trading (so the Friday 17:00 → Sunday 18:00 weekend gap and
+    the daily 17:00–18:00 maintenance break are excluded).  This is the
+    symbol-agnostic timing gate shared by the display swap
+    (:func:`should_display_future`) and the futures ingester, so both agree
+    on exactly when the flip happens.
+    """
+    dt = _to_et(dt)
+    t = dt.time()
+    in_overnight_window = t >= _FUTURES_REOPEN or t < time(9, 30)
+    return in_overnight_window and is_futures_session_open(dt)
+
+
 def should_display_future(symbol: Optional[str], dt: Optional[datetime] = None) -> bool:
     """True when a cash-index display surface should swap to its future.
 
@@ -410,10 +426,7 @@ def should_display_future(symbol: Optional[str], dt: Optional[datetime] = None) 
         return False
     if resolve_index_future(symbol) is None:
         return False
-    dt = _to_et(dt)
-    t = dt.time()
-    in_overnight_window = t >= _FUTURES_REOPEN or t < time(9, 30)
-    return in_overnight_window and is_futures_session_open(dt)
+    return is_futures_display_window(dt)
 
 
 # ---------------------------------------------------------------------------
