@@ -429,6 +429,22 @@ def should_display_future(symbol: Optional[str], dt: Optional[datetime] = None) 
     return is_futures_display_window(dt)
 
 
+def current_futures_session_start(dt: Optional[datetime] = None) -> datetime:
+    """Return the 18:00 ET open of the current overnight futures session.
+
+    Used as the reference point for the overnight change display: the
+    change is quoted futures-vs-futures (last minus the session-open print)
+    so it never mixes in the cash index's basis.  If it's on/after 18:00
+    ET the boundary is today's 18:00; in the early-morning tail (before
+    09:30 ET) it's the prior calendar day's 18:00.
+    """
+    dt = _to_et(dt)
+    anchor_date = dt.date()
+    if dt.time() < _FUTURES_REOPEN:
+        anchor_date = anchor_date - timedelta(days=1)
+    return ET.localize(datetime.combine(anchor_date, _FUTURES_REOPEN))
+
+
 # ---------------------------------------------------------------------------
 # Engine run window (24x5 weekdays minus NYSE holidays)
 # ---------------------------------------------------------------------------

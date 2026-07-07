@@ -3604,7 +3604,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             raise
 
     async def get_latest_future_quote(
-        self, index_symbol: str
+        self, index_symbol: str, session_start: Optional[datetime] = None
     ) -> Optional[Dict[str, Any]]:
         """Latest ``futures_quotes`` bar for a cash index (DISPLAY-only swap).
 
@@ -3614,6 +3614,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         ingester has no rows yet — in which case the caller falls back to
         the frozen index quote.  Reads only ``futures_quotes``; never joins
         or touches ``underlying_quotes`` or the index analytics tables.
+
+        ``session_start`` (the current overnight session's 18:00 ET open)
+        pins ``reference_close`` to the session-open print so the overnight
+        change is measured futures-vs-futures (no cash-index basis mixed
+        in).  When None, the earliest available bar's open is used.
         """
         index_symbol = index_symbol.upper()
         cache_key = f"latest_future_quote:{index_symbol}"
@@ -3622,25 +3627,38 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             return cached  # type: ignore[no-any-return]
 
         query = """
+            WITH latest AS (
+                SELECT *
+                FROM futures_quotes
+                WHERE index_symbol = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            session_open AS (
+                SELECT open AS ref_open
+                FROM futures_quotes
+                WHERE index_symbol = $1
+                  AND ($2::timestamptz IS NULL OR timestamp >= $2::timestamptz)
+                ORDER BY timestamp ASC
+                LIMIT 1
+            )
             SELECT
-                timestamp,
-                index_symbol AS symbol,
-                future_symbol,
-                open,
-                high,
-                low,
-                close,
-                up_volume,
-                down_volume,
-                (COALESCE(up_volume, 0) + COALESCE(down_volume, 0))::bigint AS volume
-            FROM futures_quotes
-            WHERE index_symbol = $1
-            ORDER BY timestamp DESC
-            LIMIT 1
+                l.timestamp,
+                l.index_symbol AS symbol,
+                l.future_symbol,
+                l.open,
+                l.high,
+                l.low,
+                l.close,
+                l.up_volume,
+                l.down_volume,
+                (COALESCE(l.up_volume, 0) + COALESCE(l.down_volume, 0))::bigint AS volume,
+                (SELECT ref_open FROM session_open) AS reference_close
+            FROM latest l
         """
         try:
             async with self._acquire_connection() as conn:
-                row = await conn.fetchrow(query, index_symbol)
+                row = await conn.fetchrow(query, index_symbol, session_start)
                 payload = dict(row) if row else None
                 self._cache_set(
                     cache_key,

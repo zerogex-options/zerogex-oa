@@ -994,6 +994,7 @@ from src.market_calendar import (  # noqa: E402
     ET as _ET,
     NYSE_HOLIDAYS as _NYSE_HOLIDAYS,
     should_display_future,
+    current_futures_session_start,
 )
 from src.config import _getenv_bool  # noqa: E402
 from src.symbols import resolve_index_future  # noqa: E402
@@ -1175,21 +1176,6 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
     surface that reads ``quoteData.close``.
     """
     try:
-        # Index→future DISPLAY swap: outside the cash session (overnight
-        # futures window) serve the mapped future under the index label.
-        # Read-only from futures_quotes; the client keeps sending the index
-        # symbol so nothing downstream changes.  Falls through to the frozen
-        # index quote if the futures ingester has no rows yet.
-        if _index_futures_display_enabled() and should_display_future(symbol):
-            fut = await _db().get_latest_future_quote(symbol)
-            if fut:
-                fut = dict(fut)
-                future_symbol = fut.pop("future_symbol", None)
-                fut["session"] = "futures"
-                fut["display_source"] = "futures"
-                fut["data_symbol"] = _future_display_label(future_symbol)
-                return UnderlyingQuote(**fut)
-
         data = await _db().get_latest_quote(symbol)
         if not data:
             raise HTTPException(status_code=404, detail="No quote data available")
@@ -1214,6 +1200,24 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
         data["session"] = get_market_session(
             asset_type, tracker.is_stable(), close_data_available
         )
+
+        # Index→future DISPLAY swap (ADDITIVE): during the overnight futures
+        # window, attach the future's price as *separate* fields. The base
+        # quote (close/open/high/low/session) stays the cash index, so every
+        # downstream consumer of this endpoint — GEX spot, greeks, options
+        # calculator, heatmap — is untouched. Only the header quote, the quote
+        # card, and the candlestick chart read the futures_* fields. Silently
+        # omitted if the futures ingester has no rows yet.
+        if _index_futures_display_enabled() and should_display_future(symbol):
+            fut = await _db().get_latest_future_quote(
+                symbol, current_futures_session_start()
+            )
+            if fut and fut.get("close") is not None:
+                data["display_source"] = "futures"
+                data["data_symbol"] = _future_display_label(fut.get("future_symbol"))
+                data["futures_close"] = fut.get("close")
+                data["futures_reference_close"] = fut.get("reference_close")
+
         return UnderlyingQuote(**data)
     except HTTPException:
         raise
@@ -1288,6 +1292,16 @@ async def get_historical_quotes(
     end_date: Optional[str] = None,
     window_units: int = Query(default=192, ge=1, le=576),
     timeframe: Literal["1min", "5min", "15min", "1hr", "1day", "1hour"] = Query(default="1min"),
+    allow_futures: bool = Query(
+        default=False,
+        description=(
+            "Opt-in: when true and outside the cash session, return the cash "
+            "index's futures bars instead of the (frozen) index series. Only "
+            "the candlestick chart sets this; index-keyed overlays (gamma "
+            "heatmap, max-pain, smart-money) leave it false so their price "
+            "series stays the index."
+        ),
+    ),
 ):
     """Get historical quotes"""
     try:
@@ -1295,11 +1309,15 @@ async def get_historical_quotes(
         start_dt = datetime.fromisoformat(start_date) if start_date else None
         end_dt = datetime.fromisoformat(end_date) if end_date else None
 
-        # Index→future DISPLAY swap for the candlestick series: outside the
-        # cash session, serve the mapped future's bars under the index label
-        # (read-only from futures_quotes). Falls through to the index series
-        # if the futures ingester has no rows for the requested window.
-        if _index_futures_display_enabled() and should_display_future(symbol):
+        # Index→future DISPLAY swap for the candlestick series — ONLY when the
+        # caller opts in via allow_futures (the candle chart). Read-only from
+        # futures_quotes; falls through to the index series if the ingester
+        # has no rows for the requested window.
+        if (
+            allow_futures
+            and _index_futures_display_enabled()
+            and should_display_future(symbol)
+        ):
             fut_rows = await _db().get_historical_futures(
                 symbol, start_dt, end_dt, window_units, timeframe
             )

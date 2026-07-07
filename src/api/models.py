@@ -231,14 +231,21 @@ class UnderlyingQuote(BaseModel):
     down_volume: Optional[int] = None
     volume: Optional[int] = None
     session: Optional[str] = None
-    # DISPLAY-only provenance for the index→future swap (see
-    # market_calendar.should_display_future). ``display_source='futures'``
-    # tells the UI this row is the cash index's future, shown outside the
-    # cash session; ``data_symbol`` is the future's ticker for the badge
-    # (e.g. 'ES'). Both stay None on the normal index/ETF path. ``symbol``
-    # remains the cash index so the client keeps requesting the index.
+    # DISPLAY-only index→future swap (see market_calendar.should_display_future).
+    # These are ADDITIVE: the base OHLC/close/session stay the cash index so
+    # every downstream consumer of the quote (GEX spot, greeks, options
+    # calculator, heatmap) is unaffected. Only the header quote, the quote
+    # card, and the candlestick chart read the futures fields.
+    #   display_source: 'futures' when the future should be shown, else None.
+    #   data_symbol:    the future's UI ticker (e.g. 'ES'), else None.
+    #   futures_close:  the future's last price (the number those surfaces show).
+    #   futures_reference_close: the future's session-open print (tonight's
+    #       18:00 ET bar) — the baseline for the overnight change, so it stays
+    #       futures-vs-futures and never mixes in the index↔future basis.
     display_source: Optional[str] = None
     data_symbol: Optional[str] = None
+    futures_close: Optional[Decimal] = None
+    futures_reference_close: Optional[Decimal] = None
 
     class Config:
         from_attributes = True
