@@ -97,9 +97,25 @@ def build_morning_tweet(row: dict[str, Any], site_url: str) -> str:
     regime = _humanize_regime(row.get("regime"))
     permalink = f"{site_url.rstrip('/')}/forecast/{sym}/{day_iso}"
 
+    # Asymmetric ± % display makes the confidence readable at a glance —
+    # a ±0.35% band and a −0.60%/+0.90% band are very different claims
+    # even when the dollar bounds look similar.
+    pct_line = ""
+    spot = row.get("open_spot")
+    pl = row.get("projected_low")
+    ph = row.get("projected_high")
+    try:
+        if spot is not None and float(spot) > 0 and pl is not None and ph is not None:
+            spot_f = float(spot)
+            down_pct = (spot_f - float(pl)) / spot_f * 100.0
+            up_pct = (float(ph) - spot_f) / spot_f * 100.0
+            pct_line = f" (−{down_pct:.2f}%/+{up_pct:.2f}%)"
+    except (TypeError, ValueError):
+        pass
+
     body = (
         f"{sym} · {day_iso} morning forecast\n"
-        f"Range: {low} – {high}\n"
+        f"Range: {low} – {high}{pct_line}\n"
         f"Pin: {pin} · Regime: {regime}"
     )
     text = f"{body}\n{permalink}"

@@ -100,7 +100,7 @@ async def test_writer_commits_row_on_first_call(monkeypatch, caplog):
     payload = fake.insert_daily_forecast_morning.call_args.args[0]
     assert payload["symbol"] == "SPY"
     assert payload["regime"] == "short_gamma"
-    assert payload["range_model"] == "heuristic_v1_2"
+    assert payload["range_model"] == "heuristic_v1_3"
     assert len(payload["content_hash"]) == 64
     assert any("committed SPY" in r.message for r in caplog.records)
 

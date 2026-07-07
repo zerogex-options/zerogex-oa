@@ -21,10 +21,10 @@ the RAW (pre-correction) and CORRECTED bands are returned so the
 receipt writer grades each separately and the calibration loop can tell
 if its corrections actually helped.
 
-TODO(2027-01): Replace heuristic_v1_2 with quantile-regression v2 once
+TODO(2027-01): Replace heuristic_v1_3 with quantile-regression v2 once
 we have ~120 receipt rows per symbol.  See
 ``docs/design/quantile-regression-range-model.md`` for the plan.  In the
-meantime, heuristic_v1_2 + Layer 2 corrections is what powers the card.
+meantime, heuristic_v1_3 + Layer 2 corrections is what powers the card.
 """
 
 from __future__ import annotations
@@ -46,9 +46,12 @@ from typing import Any, Optional
 MIN_RANGE_FRACTION = 0.0015
 MAX_RANGE_FRACTION = 0.030
 
-# Base wick allowance on wall distances.  1.10 = "walls plus a 10% margin
-# so a wick tap doesn't count as a break."
-BASE_WALL_EXPANSION = 1.10
+# Base wick allowance on wall distances.  1.15 = "walls plus a 15% margin
+# so a wick tap doesn't count as a break."  Bumped from 1.10 in v1.3 —
+# the first week of receipts showed v1.2 ranges systematically 20-35%
+# too narrow; the calibration loop would eventually widen this, but a
+# base bump lets us not wait 3 weeks for the correction layer to kick in.
+BASE_WALL_EXPANSION = 1.15
 
 # Event-day multiplier (FOMC / CPI / NFP).  Applied AFTER wall expansion.
 EVENT_DAY_MULTIPLIER = 1.5
@@ -73,10 +76,13 @@ MSI_SCREAMING_ABS_COMPOSITE = 0.6      # >0.6 or <-0.6 on -1..+1 composite
 PCR_SCREAMING_HIGH = 1.5                # very bearish
 PCR_SCREAMING_LOW = 0.5                 # very bullish
 
-# Pin tolerance: dynamic per-symbol.  max(strike_step * 0.5, spot * 0.001)
-# gives ~10bps floor everywhere and half-a-strike ceiling.
+# Pin tolerance: dynamic per-symbol.  max(strike_step * 0.5, spot * 0.0015)
+# gives ~15bps floor everywhere and half-a-strike ceiling.  Bumped in v1.3
+# from 10bps → 15bps; "the close was within one strike of max_pain" is
+# what a trader would call a pin day, and 10bps was too tight to catch
+# real pinning behavior (SPY was pinning at 15-20bps of the pin strike).
 PIN_TOLERANCE_MIN_STRIKE_FRACTION = 0.5
-PIN_TOLERANCE_MIN_SPOT_FRACTION = 0.001
+PIN_TOLERANCE_MIN_SPOT_FRACTION = 0.0015
 
 # Wall-magnitude weight for "sticky node inside band" — top gamma node
 # magnitudes measured in absolute net_gex.  1e8 is a full-chain "wall
@@ -168,7 +174,7 @@ class ForecastResult:
     pin_tolerance: float
 
     regime: str
-    range_model: str = "heuristic_v1_2"
+    range_model: str = "heuristic_v1_3"
     rationale: list[str] = field(default_factory=list)
 
     # Raw (pre-correction) snapshot — for A/B measurement.
@@ -586,7 +592,7 @@ def compute_forecast(inp: ForecastInputs) -> ForecastResult:
         pin_strike=pin_strike,
         pin_tolerance=round(pin_tol, 4),
         regime=regime,
-        range_model="heuristic_v1_2",
+        range_model="heuristic_v1_3",
         rationale=rationale,
         raw_projected_low=raw_low,
         raw_projected_high=raw_high,

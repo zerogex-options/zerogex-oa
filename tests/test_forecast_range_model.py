@@ -47,7 +47,7 @@ def _inputs(**overrides) -> ForecastInputs:
 
 def test_range_model_tag():
     result = compute_forecast(_inputs())
-    assert result.range_model == "heuristic_v1_2"
+    assert result.range_model == "heuristic_v1_3"
 
 
 def test_asymmetric_walls_produce_asymmetric_band():
@@ -265,14 +265,14 @@ def test_pin_strike_falls_back_to_nearest_strike():
 
 def test_pin_tolerance_dynamic_spy():
     result = compute_forecast(_inputs(strike_step=1.0))
-    # max(1.0 * 0.5, 600 * 0.001) = max(0.5, 0.6) = 0.6
-    assert result.pin_tolerance == pytest.approx(0.6, abs=0.005)
+    # v1.3: max(1.0 * 0.5, 600 * 0.0015) = max(0.5, 0.9) = 0.9
+    assert result.pin_tolerance == pytest.approx(0.9, abs=0.005)
 
 
 def test_pin_tolerance_dynamic_spx():
     result = compute_forecast(_inputs(spot=5000.0, strike_step=5.0))
-    # max(5.0 * 0.5, 5000 * 0.001) = max(2.5, 5.0) = 5.0
-    assert result.pin_tolerance == pytest.approx(5.0, abs=0.005)
+    # v1.3: max(5.0 * 0.5, 5000 * 0.0015) = max(2.5, 7.5) = 7.5
+    assert result.pin_tolerance == pytest.approx(7.5, abs=0.005)
 
 
 def test_projected_close_clamped_into_band():
