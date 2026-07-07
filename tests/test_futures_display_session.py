@@ -15,6 +15,7 @@ from datetime import datetime
 import pytz
 
 from src.market_calendar import (
+    current_cash_close_reference,
     current_futures_session_start,
     is_futures_display_window,
     is_futures_session_open,
@@ -118,3 +119,15 @@ def test_current_futures_session_start():
     assert as_et(_et(2026, 7, 8, 3, 0)) == "2026-07-07 18:00"
     assert as_et(_et(2026, 7, 8, 9, 0)) == "2026-07-07 18:00"
     assert as_et(_et(2026, 7, 8, 18, 30)) == "2026-07-08 18:00"
+
+
+def test_current_cash_close_reference():
+    # The overnight change is anchored to the session's 16:00 ET cash close:
+    # today's 16:00 in the evening, the prior day's 16:00 in the morning tail.
+    def as_et(dt):
+        return current_cash_close_reference(dt).astimezone(ET).strftime("%Y-%m-%d %H:%M")
+
+    assert as_et(_et(2026, 7, 7, 18, 30)) == "2026-07-07 16:00"  # Tue evening
+    assert as_et(_et(2026, 7, 7, 23, 0)) == "2026-07-07 16:00"  # Tue late
+    assert as_et(_et(2026, 7, 8, 3, 0)) == "2026-07-07 16:00"  # Wed overnight
+    assert as_et(_et(2026, 7, 8, 9, 0)) == "2026-07-07 16:00"  # Wed pre-open

@@ -445,6 +445,21 @@ def current_futures_session_start(dt: Optional[datetime] = None) -> datetime:
     return ET.localize(datetime.combine(anchor_date, _FUTURES_REOPEN))
 
 
+def current_cash_close_reference(dt: Optional[datetime] = None) -> datetime:
+    """Return the 16:00 ET cash-close instant of the current overnight session.
+
+    Anchors the overnight change to the 4pm cash close — how traders read
+    "where is it vs the close" — but resolved against the FUTURE's own 16:00
+    print (the caller looks up the futures bar at/after this instant), so the
+    change stays futures-vs-futures and isn't inflated by the index↔future
+    basis.  Shares the session-date logic with
+    :func:`current_futures_session_start`: today's 16:00 in the evening, the
+    prior calendar day's 16:00 in the 00:00–09:30 ET tail.
+    """
+    session_date = current_futures_session_start(dt).date()
+    return ET.localize(datetime.combine(session_date, time(16, 0)))
+
+
 # ---------------------------------------------------------------------------
 # Engine run window (24x5 weekdays minus NYSE holidays)
 # ---------------------------------------------------------------------------

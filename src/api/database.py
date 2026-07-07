@@ -3615,10 +3615,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         the frozen index quote.  Reads only ``futures_quotes``; never joins
         or touches ``underlying_quotes`` or the index analytics tables.
 
-        ``session_start`` (the current overnight session's 18:00 ET open)
-        pins ``reference_close`` to the session-open print so the overnight
-        change is measured futures-vs-futures (no cash-index basis mixed
-        in).  When None, the earliest available bar's open is used.
+        ``session_start`` (the current session's 16:00 ET cash-close instant)
+        pins ``reference_close`` to the future's 16:00 print — the earliest
+        futures bar at/after 16:00 — so the overnight change is measured
+        futures-vs-futures (no cash-index basis mixed in).  When None, the
+        earliest available bar's open is used.
         """
         index_symbol = index_symbol.upper()
         cache_key = f"latest_future_quote:{index_symbol}"
