@@ -193,6 +193,26 @@ def register(
         subscribed: Set[str] = set()
         try:
             while True:
+                # Check state at the top of each iteration. Real-world
+                # browser traffic (tab close, mobile backgrounding,
+                # network drop) can flip the socket's application_state
+                # to DISCONNECTED via a prior send_text() that hit
+                # OSError inside the broadcaster's fanout — Starlette
+                # transitions the state silently and our _safe_send
+                # swallows the exception. On the next iteration
+                # ``receive_text()`` would then raise a bare
+                # RuntimeError('WebSocket is not connected...') instead
+                # of a proper WebSocketDisconnect, which the outer
+                # ``except Exception`` used to log as an ERROR with a
+                # traceback. That's misleading noise — the socket is
+                # already gone and cleanup is correct. Exit cleanly
+                # instead of raising.
+                if (
+                    websocket.application_state != WebSocketState.CONNECTED
+                    or websocket.client_state != WebSocketState.CONNECTED
+                ):
+                    break
+
                 # Idle timeout — an abandoned tab holding a WS burns a
                 # slot forever. Any inbound message (subscribe/ping)
                 # resets the clock; nothing arriving for _IDLE_TIMEOUT
@@ -203,6 +223,12 @@ def register(
                     )
                 except asyncio.TimeoutError:
                     await _safe_send_error(websocket, "idle_timeout", "no message received")
+                    break
+                except RuntimeError:
+                    # Safety net for the same disconnect-race: if the
+                    # state flipped between our check above and this
+                    # call, Starlette raises RuntimeError. Treat as a
+                    # normal end-of-session, not an error.
                     break
 
                 try:
