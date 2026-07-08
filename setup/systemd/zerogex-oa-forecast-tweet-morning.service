@@ -1,5 +1,5 @@
 [Unit]
-Description=ZeroGEX Gamma Forecast morning tweet (07:10 ET, ~10 min after writer)
+Description=ZeroGEX Gamma Forecast morning tweet (08:40 ET, ~10 min after writer)
 Documentation=https://github.com/zerogex-options/zerogex-oa
 After=network-online.target postgresql.service zerogex-oa-forecast-writer.service
 Wants=network-online.target

@@ -16,7 +16,7 @@ EnvironmentFile=/home/ubuntu/zerogex-oa/.env
 # Reads the trailing 20 receipts per symbol from daily_forecast and
 # shifts the four Layer-2 correction scalars (band width / pin
 # tolerance / upside lean / downside lean).  Writes to
-# forecast_calibration_state, which the morning writer reads at 07:00
+# forecast_calibration_state, which the morning writer reads at 08:30
 # ET the next trading day.  Cold-start guard: needs >=15 receipts per
 # symbol before any correction actually applies.
 ExecStart=/home/ubuntu/zerogex-oa/venv/bin/python -m src.jobs.forecast_calibrate

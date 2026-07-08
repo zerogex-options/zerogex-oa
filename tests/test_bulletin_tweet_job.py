@@ -162,6 +162,58 @@ def test_build_tweet_body_elides_symbols_with_no_data():
     assert body.symbols_present == ["SPY", "QQQ"]
 
 
+def test_symbol_block_shows_projected_indicator():
+    """A futures-projected SPX spot is clearly labeled in the numeric block."""
+    mod = _reload_module()
+    b = mod._shape_bulletin(_summary_row("SPX", spot=6432.0), "SPX")
+    b.spot_is_projected = True
+    b.future_symbol = "@ES"
+    block = mod._symbol_block(b)
+    assert "SPX spot:" in block
+    assert "implied from ES futures, cash closed" in block
+    # The frozen structural levels stay unlabeled (no futures equivalent).
+    assert "Gamma Flip:" in block
+
+
+def test_symbol_block_no_indicator_when_live():
+    mod = _reload_module()
+    b = mod._shape_bulletin(_summary_row("SPY", spot=744.51), "SPY")
+    block = mod._symbol_block(b)
+    assert "implied from" not in block
+
+
+@pytest.mark.asyncio
+async def test_fetch_bulletins_projects_spx_spot(monkeypatch):
+    """_fetch_bulletins overrides a cash index's frozen spot with the
+    futures-implied level and flags it, leaving ETFs untouched."""
+    mod = _reload_module()
+    from src.jobs.index_projection import ImpliedIndexSpot
+
+    async def _fake_projection(db, symbol, *, at=None):
+        if symbol.upper() == "SPX":
+            return ImpliedIndexSpot(
+                symbol="SPX", implied_price=6432.0, cash_ref_close=6400.0,
+                future_now=6450.0, future_ref=6418.0, future_symbol="@ES",
+            )
+        return None
+
+    monkeypatch.setattr(mod, "implied_index_spot", _fake_projection)
+
+    db = MagicMock()
+    db.get_latest_gex_summary = AsyncMock(
+        side_effect=lambda sym: _summary_row(sym, spot=6400.0 if sym == "SPX" else 744.51)
+    )
+    bulletins = await mod._fetch_bulletins(db, ["SPY", "SPX"])
+    by_sym = {b.symbol: b for b in bulletins}
+    # SPX spot replaced with the implied level and flagged.
+    assert by_sym["SPX"].spot == pytest.approx(6432.0)
+    assert by_sym["SPX"].spot_is_projected is True
+    assert by_sym["SPX"].future_symbol == "@ES"
+    # SPY (ETF) untouched — still the live cash spot, not projected.
+    assert by_sym["SPY"].spot == pytest.approx(744.51)
+    assert by_sym["SPY"].spot_is_projected is False
+
+
 def test_build_tweet_body_lead_variant_deterministic_per_day():
     """The lead sentence should be stable within a fire (dry-run and live
     match), so the seed is deterministic on (date, mode)."""

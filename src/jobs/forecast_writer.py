@@ -1,4 +1,11 @@
-"""Morning forecast writer — fires at 07:00 ET on weekdays.
+"""Morning forecast writer — fires at 08:30 ET on weekdays.
+
+Timing note: 08:30 ET is deliberately AFTER the ~07:30 ET options reset so
+the GEX surface reflects today's positioning (not yesterday's stale chain),
+and the dealer-gamma regime is a live read.  Cash indexes (SPX) do not
+trade overnight, so their spot anchor is projected from the mapped future
+(@ES) at this time rather than the frozen prior cash close — see
+``src.jobs.index_projection``.
 
 Pulls live GEX + MSI + Playbook state from the in-process DatabaseManager,
 computes today's projected range / pin / regime / flagship setup via the
@@ -38,11 +45,57 @@ from src.jobs.forecast_range_model import (
     ForecastResult,
     compute_forecast,
 )
+from src.jobs.index_projection import implied_index_spot
 from src.market_calendar import NYSE_HOLIDAYS
 
 # Cash-index symbols use VXN as their vol regime proxy; everything else
 # uses VIX.  QQQ tracks NASDAQ; SPY / SPX / IWM track S&P style vol.
 _VXN_SYMBOLS = {"QQQ", "NDX"}
+
+# A GEX snapshot older than this at forecast time is treated as stale — the
+# regime degrades to "transition" rather than asserting dealer positioning
+# off a frozen prior-session surface.  The analytics engine rewrites the
+# surface every 60s in-session / 300s off-hours, so a healthy pre-market
+# snapshot is minutes old; 6h cleanly separates "today, post-07:30-reset"
+# (minutes old at 08:30 ET) from a frozen prior-session surface (~16h old).
+GEX_MAX_STALENESS = timedelta(hours=6)
+
+
+def _signed_composite(value: Any) -> Optional[float]:
+    """Map the 0-100 Market State Index composite to the signed -1..+1 scale
+    the range model expects (neutral 50 -> 0).
+
+    The writer historically fed the raw 0-100 value into a model that keys
+    off a signed value, which pinned every symbol's regime to ``long_gamma``
+    and silently disabled the MSI band adjustments (see
+    ``forecast_range_model`` docstrings)."""
+    try:
+        c = float(value)
+    except (TypeError, ValueError):
+        return None
+    return (c - 50.0) / 50.0
+
+
+def _signed_normalized(value: Any) -> Optional[float]:
+    """Map the 0-1 normalized MSI to the signed -100..+100 scale the range
+    model and the stored ``open_msi`` expect (neutral 0.5 -> 0)."""
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    return (n - 0.5) * 200.0
+
+
+def _gex_is_fresh(ts: Any, *, now: Optional[datetime] = None) -> bool:
+    """True when a GEX snapshot is recent enough to assert a dealer-gamma
+    regime off it.  A ``None``/non-datetime timestamp, or one older than
+    ``GEX_MAX_STALENESS``, is stale -> the regime degrades to transition."""
+    if not isinstance(ts, datetime):
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    ref = now or datetime.now(tz=timezone.utc)
+    return (ref - ts) <= GEX_MAX_STALENESS
 
 
 def _strike_step_for(symbol: str) -> float:
@@ -130,13 +183,44 @@ async def _gather_inputs(db: DatabaseManager, symbol: str) -> Optional[ForecastI
         logger.warning("forecast_writer: flagship setup fetch failed (%s): %s", symbol, exc)
 
     spot = None
-    if quote and quote.get("last") is not None:
-        spot = float(quote["last"])
+    # get_latest_quote returns the latest 1-min bar's ``close`` (there is no
+    # ``last`` key — the old ``quote["last"]`` branch was dead code and always
+    # fell through to gex.spot_price).  Both resolve to the same latest cash
+    # print; gex.spot_price is the fallback when no quote row exists.
+    if quote and quote.get("close") is not None:
+        spot = float(quote["close"])
     elif gex and gex.get("spot_price") is not None:
         spot = float(gex["spot_price"])
     if spot is None:
         logger.warning("forecast_writer: no spot for %s — cannot forecast", symbol)
         return None
+
+    # Futures-implied anchor for cash indexes OUTSIDE the cash session.  A
+    # cash index (SPX/NDX/…) has no overnight print, so the cash spot above
+    # is a frozen prior 16:00 close — anchoring the morning forecast on it
+    # ignores wherever the futures have moved the market overnight.  Project
+    # the implied cash level from the mapped future (@ES) instead.  Returns
+    # None (keep the cash spot) in-session, on weekends, or when the futures
+    # feed is empty — so SPY/QQQ and in-session runs are unaffected.
+    open_spot_source = "cash"
+    open_spot_projection: Optional[dict[str, Any]] = None
+    futures_gap_pct: Optional[float] = None
+    proj = None
+    try:
+        proj = await implied_index_spot(db, symbol)
+    except Exception as exc:  # noqa: BLE001 — never let projection break the forecast
+        logger.warning("forecast_writer: index projection failed (%s): %s", symbol, exc)
+    if proj is not None:
+        spot = proj.implied_price
+        open_spot_source = "futures_implied"
+        open_spot_projection = proj.as_audit()
+        futures_gap_pct = proj.gap_pct
+        logger.info(
+            "forecast_writer: %s spot projected from %s — implied $%.2f "
+            "(cash close $%.2f, overnight %+.2f pts / %+.2f%%)",
+            symbol, proj.future_symbol, proj.implied_price,
+            proj.cash_ref_close, proj.gap_points, proj.gap_pct * 100.0,
+        )
 
     today = _today_et()
 
@@ -220,11 +304,16 @@ async def _gather_inputs(db: DatabaseManager, symbol: str) -> Optional[ForecastI
         put_wall=_f(gex.get("put_wall")) if gex else None,
         gamma_flip=_f(gex.get("gamma_flip")) if gex else None,
         max_pain=_f(gex.get("max_pain")) if gex else None,
+        net_gex=_f(gex.get("net_gex")) if gex else None,
+        gex_surface_fresh=_gex_is_fresh(gex.get("timestamp")) if gex else False,
         call_wall_0dte=call_wall_0dte,
         put_wall_0dte=put_wall_0dte,
         top_gamma_nodes=top_nodes,
-        msi_composite=_f(score.get("composite_score")) if score else None,
-        msi_normalized=_f(score.get("normalized_score")) if score else None,
+        # Feed the MSI on the SIGNED scale the range model expects: the raw
+        # composite is 0-100 (neutral 50) and normalized 0-1 (neutral 0.5);
+        # passing them unsigned pinned the regime + disabled the band lean.
+        msi_composite=_signed_composite(score.get("composite_score")) if score else None,
+        msi_normalized=_signed_normalized(score.get("normalized_score")) if score else None,
         put_call_ratio=pcr,
         skew_delta=skew,
         vix_close=None if is_nasdaq_family else vix_close,
@@ -232,6 +321,9 @@ async def _gather_inputs(db: DatabaseManager, symbol: str) -> Optional[ForecastI
         vix_z_score_20d=vix_z,
         iv_rank_30d=iv_rank,
         atr_5d=atr,
+        futures_gap_pct=futures_gap_pct,
+        open_spot_source=open_spot_source,
+        open_spot_projection=open_spot_projection,
         flagship_setup=flagship,
         is_event_day=_is_event_day(today),
         is_opex_friday=is_opex_fri,
@@ -300,6 +392,12 @@ def _build_payload(inputs: ForecastInputs, result: ForecastResult, open_ts: date
         "is_event_day": inputs.is_event_day,
         "calibration_applied": result.calibration_applied,
         "rationale": result.rationale,
+        # Spot-anchor provenance: "cash" or "futures_implied" (+ the
+        # projection audit) so a committed SPX open_spot can be traced back
+        # to the @ES level it was projected from.
+        "open_spot_source": inputs.open_spot_source,
+        "open_spot_projection": inputs.open_spot_projection,
+        "futures_gap_pct": inputs.futures_gap_pct,
     }
 
     base = {

@@ -3632,7 +3632,7 @@ forecast-calibrate: ## Recalibrate Layer-2 scalars from trailing 20 receipts (pe
 		$(if $(FORECAST_SYMBOLS),--symbols $(FORECAST_SYMBOLS))
 
 .PHONY: forecast-install
-forecast-install: ## Install all forecast timers (07:00 writer, 16:05 receipt, 20:00 calibrate; Mon-Fri)
+forecast-install: ## Install all forecast timers (08:30 writer, 16:05 receipt, 20:00 calibrate; Mon-Fri)
 	@echo "$(BLUE)=== Installing Forecast Timers ===$(NC)"
 	@sudo cp setup/systemd/zerogex-oa-forecast-writer.service /etc/systemd/system/
 	@sudo cp setup/systemd/zerogex-oa-forecast-writer.timer /etc/systemd/system/
@@ -3644,7 +3644,7 @@ forecast-install: ## Install all forecast timers (07:00 writer, 16:05 receipt, 2
 	@sudo systemctl enable --now zerogex-oa-forecast-writer.timer
 	@sudo systemctl enable --now zerogex-oa-forecast-receipt.timer
 	@sudo systemctl enable --now zerogex-oa-forecast-calibrate.timer
-	@echo "$(GREEN)✅ Forecast timers installed (07:00 writer, 16:05 receipt, 20:00 calibrate; Mon-Fri)$(NC)"
+	@echo "$(GREEN)✅ Forecast timers installed (08:30 writer, 16:05 receipt, 20:00 calibrate; Mon-Fri)$(NC)"
 	@echo "$(YELLOW)Status:  systemctl list-timers 'zerogex-oa-forecast-*'$(NC)"
 	@echo "$(YELLOW)Logs:    journalctl -u zerogex-oa-forecast-writer -u zerogex-oa-forecast-receipt -u zerogex-oa-forecast-calibrate$(NC)"
 
@@ -3660,10 +3660,10 @@ forecast-status: ## Show both forecast timers + last/next fire + recent logs
 	@sudo journalctl -u zerogex-oa-forecast-writer -u zerogex-oa-forecast-receipt -n 30 --no-pager || true
 
 # =============================================================================
-# Gamma Forecast auto-tweet (Phase 3b — 07:10 + 16:10 ET weekdays)
+# Gamma Forecast auto-tweet (Phase 3b — 08:40 + 16:10 ET weekdays)
 # =============================================================================
 # Companion crons to the forecast writer/receipt.  Two modes share one script:
-#   * morning tweet at 07:10 ET (after the 07:00 writer commits the row)
+#   * morning tweet at 08:40 ET (after the 08:30 writer commits the row)
 #   * receipt tweet at 16:10 ET (after the 16:05 receipt writer grades it)
 # Both dry-run unless X_BOT_BEARER_TOKEN is set AND --post is passed.
 .PHONY: forecast-tweet-morning-dry-run
@@ -3695,7 +3695,7 @@ forecast-tweet-receipt-post: ## Post today's receipt forecast tweet (needs X_BOT
 		$(if $(FORECAST_SYMBOL),--symbol $(FORECAST_SYMBOL))
 
 .PHONY: forecast-tweet-install
-forecast-tweet-install: ## Install both forecast tweet timers (07:10 + 16:10 ET Mon-Fri)
+forecast-tweet-install: ## Install both forecast tweet timers (08:40 + 16:10 ET Mon-Fri)
 	@echo "$(BLUE)=== Installing Forecast Tweet Timers ===$(NC)"
 	@sudo cp setup/systemd/zerogex-oa-forecast-tweet-morning.service /etc/systemd/system/
 	@sudo cp setup/systemd/zerogex-oa-forecast-tweet-morning.timer /etc/systemd/system/
@@ -3704,7 +3704,7 @@ forecast-tweet-install: ## Install both forecast tweet timers (07:10 + 16:10 ET 
 	@sudo systemctl daemon-reload
 	@sudo systemctl enable --now zerogex-oa-forecast-tweet-morning.timer
 	@sudo systemctl enable --now zerogex-oa-forecast-tweet-receipt.timer
-	@echo "$(GREEN)✅ Forecast tweet timers installed (07:10 morning, 16:10 receipt; Mon-Fri)$(NC)"
+	@echo "$(GREEN)✅ Forecast tweet timers installed (08:40 morning, 16:10 receipt; Mon-Fri)$(NC)"
 
 .PHONY: forecast-tweet-status
 forecast-tweet-status: ## Show forecast tweet timers + last/next fire + recent logs

@@ -285,18 +285,40 @@ def test_projected_close_clamped_into_band():
 # ---------------------------------------------------------------------------
 
 
-def test_regime_long_gamma_when_msi_positive():
-    result = compute_forecast(_inputs(msi_composite=0.4))
+def test_regime_long_gamma_when_net_gex_positive():
+    # Dealer regime is the sign of net GEX — positive = dealers long gamma.
+    result = compute_forecast(_inputs(net_gex=5.0e9))
     assert result.regime == "long_gamma"
 
 
-def test_regime_short_gamma_when_msi_negative():
-    result = compute_forecast(_inputs(msi_composite=-0.4))
+def test_regime_short_gamma_when_net_gex_negative():
+    result = compute_forecast(_inputs(net_gex=-5.0e9))
     assert result.regime == "short_gamma"
 
 
-def test_regime_transition_when_msi_near_zero():
-    result = compute_forecast(_inputs(msi_composite=0.08))
+def test_regime_ignores_msi_sign():
+    # The MSI composite must NOT drive the regime anymore — a strongly
+    # positive MSI with negative net_gex is still a short-gamma tape.
+    result = compute_forecast(_inputs(net_gex=-5.0e9, msi_composite=0.9))
+    assert result.regime == "short_gamma"
+
+
+def test_regime_falls_back_to_spot_vs_flip_when_net_gex_missing():
+    above = compute_forecast(_inputs(net_gex=None, spot=605.0, gamma_flip=600.0))
+    assert above.regime == "long_gamma"
+    below = compute_forecast(_inputs(net_gex=None, spot=595.0, gamma_flip=600.0))
+    assert below.regime == "short_gamma"
+
+
+def test_regime_transition_when_surface_stale():
+    # Even with a clear net_gex sign, a stale/missing GEX surface degrades to
+    # transition rather than asserting a positioning we can't substantiate.
+    result = compute_forecast(_inputs(net_gex=5.0e9, gex_surface_fresh=False))
+    assert result.regime == "transition"
+
+
+def test_regime_transition_when_no_dealer_signal():
+    result = compute_forecast(_inputs(net_gex=None, gamma_flip=None))
     assert result.regime == "transition"
 
 

@@ -88,13 +88,16 @@ def _label_regime(reg: dict[str, Any] | None) -> str:
         return "unknown"
     direction = (reg.get("direction") or "").lower()
     composite = reg.get("composite_score")
-    # The composite_score sign is the cleanest gamma-regime proxy we have
-    # without re-querying gex_summary here: positive = long-gamma stabilizing,
-    # negative = short-gamma destabilizing.
+    # ``composite_score`` is the 0-100 Market State Index (neutral 50); map it
+    # to a signed -1..+1 lean before thresholding.  Comparing the raw 0-100
+    # value against ±0.15 made this ALWAYS return "long gamma" (the composite
+    # is never below 0.15).  Positive lean = long-gamma stabilizing, negative
+    # = short-gamma destabilizing.
     if isinstance(composite, (int, float)):
-        if composite > 0.15:
+        lean = (float(composite) - 50.0) / 50.0
+        if lean > 0.15:
             return "long gamma"
-        if composite < -0.15:
+        if lean < -0.15:
             return "short gamma"
         return "transition"
     if "bull" in direction:

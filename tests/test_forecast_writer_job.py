@@ -4,7 +4,7 @@ re-run idempotency, weekend skip, and dry-run safety."""
 from __future__ import annotations
 
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock
 
@@ -27,13 +27,22 @@ def _gex_row(**overrides):
         "put_wall": Decimal("594.00"),
         "gamma_flip": Decimal("600.50"),
         "max_pain": Decimal("599.00"),
+        # net_gex < 0 -> dealers short gamma -> regime "short_gamma".
+        "net_gex": Decimal("-8000000000"),
+        # Fresh surface so the regime is asserted (not degraded to transition).
+        "timestamp": datetime.now(timezone.utc),
     }
     base.update(overrides)
     return base
 
 
 def _score_row(**overrides):
-    base = {"composite_score": -0.32, "normalized_score": -32.0}
+    # Real ScoringEngine output scale: composite 0-100 (neutral 50),
+    # normalized 0-1 (neutral 0.5).  The writer converts these to the signed
+    # scale the range model expects — so this row must use the REAL scale, not
+    # pre-signed values (using pre-signed values is what let the units bug hide
+    # from the tests).  34.0 -> signed -0.32; 0.34 -> signed -32.0.
+    base = {"composite_score": 34.0, "normalized_score": 0.34}
     base.update(overrides)
     return base
 
@@ -45,7 +54,7 @@ def _fake_db(*, gex=None, quote=None, score=None, cards=None, full_card=None,
     db.disconnect = AsyncMock(return_value=None)
     db.get_latest_gex_summary = AsyncMock(return_value=gex if gex is not None else _gex_row())
     db.get_latest_quote = AsyncMock(
-        return_value=quote if quote is not None else {"last": Decimal("600.0")}
+        return_value=quote if quote is not None else {"close": Decimal("600.0")}
     )
     db.get_latest_signal_score = AsyncMock(
         return_value=score if score is not None else _score_row()
@@ -126,6 +135,111 @@ async def test_writer_commits_row_on_first_call(monkeypatch, caplog):
     assert any("committed SPY" in r.message for r in caplog.records)
 
 
+async def _commit_and_get_payload(monkeypatch, *, gex=None, score=None, symbol="SPY"):
+    """Run the writer end-to-end through the real ScoringEngine->model wiring
+    and return the committed payload (integration, not a hand-built input)."""
+    mod = _reload_module()
+    fake = _fake_db(gex=gex, score=score)
+    fake.insert_daily_forecast_morning = AsyncMock(side_effect=lambda payload: payload)
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
+    args = mod._parse_args(["--date", "2026-06-29", "--symbol", symbol])
+    rc = await mod._run(args)
+    assert rc == 0
+    fake.insert_daily_forecast_morning.assert_called_once()
+    return fake.insert_daily_forecast_morning.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_writer_projects_spx_spot_from_futures(monkeypatch):
+    """A cash index outside the cash session commits the futures-IMPLIED spot
+    as open_spot, tagged futures_implied, with the projection audit stored."""
+    from src.jobs.index_projection import ImpliedIndexSpot
+
+    mod = _reload_module()
+    canned = ImpliedIndexSpot(
+        symbol="SPX", implied_price=6030.0, cash_ref_close=5980.0,
+        future_now=6050.0, future_ref=6000.0, future_symbol="@ES",
+    )
+
+    async def _fake_projection(db, symbol, *, at=None):
+        return canned if symbol.upper() == "SPX" else None
+
+    monkeypatch.setattr(mod, "implied_index_spot", _fake_projection)
+    fake = _fake_db(gex=_gex_row(spot_price=Decimal("5980.00")))
+    fake.insert_daily_forecast_morning = AsyncMock(side_effect=lambda payload: payload)
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
+    args = mod._parse_args(["--date", "2026-06-29", "--symbol", "SPX"])
+    rc = await mod._run(args)
+    assert rc == 0
+    payload = fake.insert_daily_forecast_morning.call_args.args[0]
+    # Committed anchor is the implied level, NOT the frozen 5980 cash close.
+    assert payload["open_spot"] == pytest.approx(6030.0)
+    snap = payload["forecast_inputs"]
+    assert snap["open_spot_source"] == "futures_implied"
+    assert snap["open_spot_projection"]["future_symbol"] == "@ES"
+    assert snap["futures_gap_pct"] == pytest.approx((6050.0 - 6000.0) / 6000.0)
+
+
+@pytest.mark.asyncio
+async def test_writer_uses_cash_spot_when_no_projection(monkeypatch):
+    """SPY (not a cash index) is never projected — the real helper returns
+    None without touching the feed, so the writer keeps the cash spot and
+    tags the source 'cash'."""
+    payload = await _commit_and_get_payload(monkeypatch, symbol="SPY")
+    assert payload["open_spot"] == pytest.approx(600.0)
+    assert payload["forecast_inputs"]["open_spot_source"] == "cash"
+
+
+@pytest.mark.asyncio
+async def test_writer_regime_is_dealer_gamma_not_msi(monkeypatch):
+    """Regression for the units bug that pinned every symbol to long_gamma.
+
+    A STRONGLY bullish MSI (composite 90 on the 0-100 scale) with NEGATIVE
+    net_gex must still commit ``short_gamma`` — the regime is dealer gamma,
+    not the MSI sign.  (The old code fed the raw 0-100 composite into a
+    signed classifier and always returned long_gamma.)"""
+    payload = await _commit_and_get_payload(
+        monkeypatch,
+        gex=_gex_row(net_gex=Decimal("-8000000000")),
+        score=_score_row(composite_score=90.0, normalized_score=0.90),
+    )
+    assert payload["regime"] == "short_gamma"
+    # And the stored open_msi is on the signed scale (composite 90 -> +80).
+    assert payload["open_msi"] == pytest.approx(80.0)
+
+
+@pytest.mark.asyncio
+async def test_writer_regime_long_gamma_when_net_gex_positive(monkeypatch):
+    payload = await _commit_and_get_payload(
+        monkeypatch,
+        gex=_gex_row(net_gex=Decimal("9000000000")),
+        # Neutral-ish MSI (composite 50) proves net_gex alone decides.
+        score=_score_row(composite_score=50.0, normalized_score=0.50),
+    )
+    assert payload["regime"] == "long_gamma"
+
+
+@pytest.mark.asyncio
+async def test_writer_regime_transition_when_gex_surface_stale(monkeypatch):
+    """A stale GEX snapshot (older than the freshness window) must degrade to
+    transition rather than asserting a positioning off yesterday's surface."""
+    stale = _gex_row(
+        net_gex=Decimal("9000000000"),
+        timestamp=datetime.now(timezone.utc) - timedelta(hours=20),
+    )
+    payload = await _commit_and_get_payload(monkeypatch, gex=stale)
+    assert payload["regime"] == "transition"
+
+
+@pytest.mark.asyncio
+async def test_writer_regime_transition_when_no_timestamp(monkeypatch):
+    """No timestamp on the GEX row -> can't establish freshness -> transition."""
+    no_ts = _gex_row(net_gex=Decimal("9000000000"))
+    no_ts.pop("timestamp", None)
+    payload = await _commit_and_get_payload(monkeypatch, gex=no_ts)
+    assert payload["regime"] == "transition"
+
+
 @pytest.mark.asyncio
 async def test_writer_logs_already_committed_when_hash_differs(monkeypatch, caplog):
     """If a row already exists for the day with a different content_hash
@@ -152,7 +266,7 @@ async def test_writer_logs_already_committed_when_hash_differs(monkeypatch, capl
 @pytest.mark.asyncio
 async def test_writer_skips_when_spot_missing(monkeypatch, caplog):
     mod = _reload_module()
-    fake = _fake_db(quote={"last": None}, gex={"spot_price": None})
+    fake = _fake_db(quote={"close": None}, gex={"spot_price": None})
     monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
     args = mod._parse_args(["--date", "2026-06-29", "--symbol", "SPY"])
     with caplog.at_level("WARNING"):
