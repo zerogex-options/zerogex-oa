@@ -840,6 +840,197 @@ async def admin_reset_fleet(
         return clear(conn, bot_ids=bot_ids)
 
 
+@router.get(
+    "/admin/trades",
+    dependencies=[Depends(require_scopes(SIGNALS))],
+)
+async def admin_trades(
+    origin: str = Query(default="all", pattern="^(all|live|simulate)$"),
+    bot_id: Optional[str] = Query(default=None),
+    since: Optional[str] = Query(
+        default=None,
+        description="ISO-8601 timestamp; only trades closed on/after this.",
+    ),
+    until: Optional[str] = Query(
+        default=None,
+        description="ISO-8601 timestamp; only trades closed before this.",
+    ),
+    limit: int = Query(default=200, ge=1, le=2000),
+    offset: int = Query(default=0, ge=0),
+    format: str = Query(default="json", pattern="^(json|csv)$"),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Audit-trail feed of every closed trade with an explicit sim/live tag.
+
+    Params:
+        origin: 'all' (default), 'live', or 'simulate'. Rows whose
+                ``components_at_entry`` has no ``origin`` field predate
+                the stamping change and are treated as **live** (legacy
+                real trades).
+        bot_id: filter to one bot.
+        since / until: ISO-8601 (or bare ``YYYY-MM-DD``) filter on
+                       ``closed_at``. ``until`` is exclusive.
+        limit / offset: standard paging. Max page size 2000.
+        format: ``json`` (default) or ``csv``. CSV is returned with a
+                Content-Type of text/csv so a curl > file.csv works.
+
+    The response includes a summary row (n_trades, sum_realized_pnl,
+    n_wins, n_losses, n_scratches) computed across the FILTERED set —
+    useful for "does the total P&L in the audit view match the
+    leaderboard NAV?" sanity checks.
+    """
+    from fastapi.responses import PlainTextResponse
+
+    where: List[str] = []
+    params: List[Any] = []
+
+    if origin == "live":
+        where.append(
+            "(components_at_entry ->> 'origin') IS DISTINCT FROM 'simulate'"
+        )
+    elif origin == "simulate":
+        where.append("(components_at_entry ->> 'origin') = 'simulate'")
+
+    if bot_id:
+        params.append(bot_id)
+        where.append(f"bot_id = ${len(params)}")
+    if since:
+        params.append(since)
+        where.append(f"closed_at >= ${len(params)}::timestamptz")
+    if until:
+        params.append(until)
+        where.append(f"closed_at < ${len(params)}::timestamptz")
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    params.append(limit)
+    limit_idx = len(params)
+    params.append(offset)
+    offset_idx = len(params)
+
+    row_sql = f"""
+        SELECT id, bot_id, underlying, opened_at, closed_at, direction,
+               strategy_type, entry_price, exit_price, quantity,
+               realized_pnl, pnl_percent, outcome, close_reason,
+               entry_conviction,
+               COALESCE(components_at_entry ->> 'origin', 'live') AS origin,
+               components_at_entry, components_at_exit
+        FROM tw_trades
+        {where_sql}
+        ORDER BY closed_at DESC
+        LIMIT ${limit_idx} OFFSET ${offset_idx}
+    """
+    summary_sql = f"""
+        SELECT COUNT(*)                                          AS n_trades,
+               COALESCE(SUM(realized_pnl), 0)                    AS sum_realized_pnl,
+               SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END)  AS n_wins,
+               SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END) AS n_losses,
+               SUM(CASE WHEN outcome = 'scratch' THEN 1 ELSE 0 END)
+                                                                 AS n_scratches
+        FROM tw_trades
+        {where_sql}
+    """
+
+    async with db.pool.acquire() as conn:
+        rows = await conn.fetch(row_sql, *params)
+        summary_params = params[:-2]  # drop limit/offset
+        summary_row = await conn.fetchrow(summary_sql, *summary_params)
+
+    def _parse_json(v: Any) -> Any:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except Exception:
+                return v
+        return v
+
+    entries: List[Dict[str, Any]] = []
+    for r in rows:
+        entries.append(
+            {
+                "id": r["id"],
+                "bot_id": r["bot_id"],
+                "underlying": r["underlying"],
+                "opened_at": r["opened_at"].isoformat() if r["opened_at"] else None,
+                "closed_at": r["closed_at"].isoformat() if r["closed_at"] else None,
+                "direction": r["direction"],
+                "strategy_type": r["strategy_type"],
+                "entry_price": float(r["entry_price"]) if r["entry_price"] is not None else None,
+                "exit_price": float(r["exit_price"]) if r["exit_price"] is not None else None,
+                "quantity": int(r["quantity"]) if r["quantity"] is not None else None,
+                "realized_pnl": float(r["realized_pnl"]) if r["realized_pnl"] is not None else None,
+                "pnl_percent": float(r["pnl_percent"]) if r["pnl_percent"] is not None else None,
+                "outcome": r["outcome"],
+                "close_reason": r["close_reason"],
+                "entry_conviction": (
+                    float(r["entry_conviction"])
+                    if r["entry_conviction"] is not None else None
+                ),
+                "origin": r["origin"],
+                "components_at_entry": _parse_json(r["components_at_entry"]),
+                "components_at_exit": _parse_json(r["components_at_exit"]),
+            }
+        )
+
+    summary = {
+        "n_trades": int(summary_row["n_trades"] or 0),
+        "sum_realized_pnl": float(summary_row["sum_realized_pnl"] or 0.0),
+        "n_wins": int(summary_row["n_wins"] or 0),
+        "n_losses": int(summary_row["n_losses"] or 0),
+        "n_scratches": int(summary_row["n_scratches"] or 0),
+    }
+
+    if format == "csv":
+        import io
+        import csv
+
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(
+            [
+                "id", "bot_id", "underlying", "origin",
+                "opened_at", "closed_at", "direction", "strategy_type",
+                "entry_price", "exit_price", "quantity",
+                "realized_pnl", "pnl_percent", "outcome",
+                "close_reason", "entry_conviction",
+            ]
+        )
+        for e in entries:
+            w.writerow(
+                [
+                    e["id"], e["bot_id"], e["underlying"], e["origin"],
+                    e["opened_at"], e["closed_at"], e["direction"],
+                    e["strategy_type"], e["entry_price"], e["exit_price"],
+                    e["quantity"], e["realized_pnl"], e["pnl_percent"],
+                    e["outcome"], e["close_reason"], e["entry_conviction"],
+                ]
+            )
+        return PlainTextResponse(
+            content=buf.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="tradeworkz-audit-'
+                    f'{origin}.csv"'
+                ),
+            },
+        )
+
+    return {
+        "entries": entries,
+        "summary": summary,
+        "filters": {
+            "origin": origin,
+            "bot_id": bot_id,
+            "since": since,
+            "until": until,
+            "limit": limit,
+            "offset": offset,
+        },
+    }
+
+
 @router.post(
     "/admin/inject-test-event",
     dependencies=[Depends(require_scopes(SIGNALS))],
