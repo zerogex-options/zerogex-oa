@@ -18,13 +18,17 @@ trade engine's semantics.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, time, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from src.signals.execution import leg_fill_price
 from src.tradeworkz import config as tw_config
 
 logger = logging.getLogger(__name__)
+
+_ET = ZoneInfo("America/New_York")
+_REGULAR_CLOSE_HHMM = time(16, 0)  # SPY regular-session settlement time
 
 
 def _parse_leg_expiration(leg: Dict[str, Any]) -> Optional[date]:
@@ -55,24 +59,40 @@ def _underlying_from_option_symbol(sym: str) -> Optional[str]:
     return root or None
 
 
-def _latest_underlying_spot(conn: Any, underlying: str) -> Optional[float]:
-    """Latest close price on ``underlying`` from ``underlying_quotes``.
+def _settlement_spot(
+    conn: Any, underlying: str, expiration: date
+) -> Optional[float]:
+    """Underlying spot at the regular-session close of ``expiration``.
 
-    Used as the intrinsic-value anchor when an expired 0DTE option has
-    no fillable option_chains quote. The underlying keeps ticking during
-    after-hours even though the options market has closed, so this is
-    the right price to settle against.
+    SPY options are American, physically-settled, and settle on the
+    4:00 PM ET equity close of their expiration day. That means an
+    option that expires today with SPY closing at $745.30 settles
+    against $745.30 — the after-hours drift down to $743.55 is
+    irrelevant to how the option is priced at settlement.
+
+    We therefore query for the last ``underlying_quotes`` tick strictly
+    BEFORE 16:00 ET on the expiration date. That excludes after-hours
+    ticks that came in later. If no such row exists (fresh DB, or the
+    expiration is somehow in the future), returns ``None`` so the
+    caller fails closed instead of intrinsic-settling against a wrong
+    price.
+
+    ``zoneinfo`` handles DST — 16:00 ET is UTC-4 in EDT (20:00 UTC)
+    and UTC-5 in EST (21:00 UTC).
     """
+    close_et = datetime.combine(expiration, _REGULAR_CLOSE_HHMM, tzinfo=_ET)
+    close_utc = close_et.astimezone(timezone.utc)
     cur = conn.cursor()
     cur.execute(
         """
         SELECT close
         FROM underlying_quotes
         WHERE symbol = %s
+          AND timestamp < %s
         ORDER BY timestamp DESC
         LIMIT 1
         """,
-        (underlying,),
+        (underlying, close_utc),
     )
     row = cur.fetchone()
     if not row or row[0] is None:
@@ -91,8 +111,15 @@ def _leg_intrinsic(conn: Any, leg: Dict[str, Any], today: date) -> Optional[floa
     the caller cannot accidentally short-circuit a live quote path
     with an ITM number that ignores time value.
 
-    For a long call: ``max(0, spot - strike)``.
-    For a long put:  ``max(0, strike - spot)``.
+    The settlement anchor is the underlying's REGULAR-SESSION close
+    price on the leg's expiration date — not the latest tick. This
+    matters when the engine settles an expired 0DTE after 4 PM ET
+    while the equity keeps drifting in after-hours: we must use the
+    16:00 ET print, not the current AH print, or we'd over-book
+    profit on a put that had already expired OTM at the actual close.
+
+    For a long call: ``max(0, close_spot - strike)``.
+    For a long put:  ``max(0, strike - close_spot)``.
     Short positions negate the intrinsic (they OWE the settlement value
     to whoever exercises).
     """
@@ -105,7 +132,7 @@ def _leg_intrinsic(conn: Any, leg: Dict[str, Any], today: date) -> Optional[floa
     underlying = _underlying_from_option_symbol(sym)
     if underlying is None:
         return None
-    spot = _latest_underlying_spot(conn, underlying)
+    spot = _settlement_spot(conn, underlying, exp)
     if spot is None:
         return None
     try:
