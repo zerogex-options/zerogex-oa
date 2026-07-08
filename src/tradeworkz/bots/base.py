@@ -207,15 +207,31 @@ class BaseBot:
 
 
 def _synthetic_option_symbol(underlying: str, opt: str, strike: float, exp: str) -> str:
-    """OSI-like synthetic symbol used inside TradeWorkz for identification.
+    """Build the option_chains ``option_symbol`` for this ATM leg.
 
-    The real fill pipeline joins on this against ``option_chains`` — the
-    format matches the format the ingest layer emits so lookups line up.
+    Must match the exact format the ingest layer writes into
+    ``option_chains.option_symbol`` — otherwise pricing.spread_price
+    returns None every tick and no trade ever opens. That format is
+    TradeStation's, not OSI/OCC:
+
+        {option_root} {YYMMDD}{C|P}{strike}
+
+    where ``strike`` is the integer strike as-is when whole
+    (``746``), or ``{strike:.2f}`` when fractional (``746.50``).
+    ``option_root`` is resolved via ``resolve_option_root`` so
+    index chains that trade under a different root (SPX → SPXW)
+    line up correctly.
     """
-    exp_compact = exp.replace("-", "")[-6:]
+    from src.symbols import resolve_option_root
+
+    root = resolve_option_root(underlying)
+    exp_compact = exp.replace("-", "")[-6:]  # YYMMDD
     right = "C" if opt.lower().startswith("c") else "P"
-    strike_int = int(round(strike * 1000))
-    return f"{underlying}{exp_compact}{right}{strike_int:08d}"
+    if float(strike).is_integer():
+        strike_str = str(int(strike))
+    else:
+        strike_str = f"{float(strike):.2f}"
+    return f"{root} {exp_compact}{right}{strike_str}"
 
 
 def _utcnow() -> datetime:
