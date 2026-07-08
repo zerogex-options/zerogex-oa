@@ -11,8 +11,9 @@ import hashlib
 import json
 import logging
 from dataclasses import asdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from src.tradeworkz import config as tw_config
 from src.tradeworkz import ml as ml_mod
@@ -22,6 +23,77 @@ from src.tradeworkz.pricing import spread_price
 from src.tradeworkz.sizing import compute_contracts
 
 logger = logging.getLogger(__name__)
+
+_ET = ZoneInfo("America/New_York")
+
+# 15:55 ET — 5 minutes before the 4 pm regular-session equity close, and
+# the last moment we can reliably get a filling option quote on the day
+# a 0DTE expires. Every open-position time_stop_at is hard-capped at
+# this instant on the earliest leg expiration so a 0DTE can never sit
+# open past the point where the options market closes and the quote
+# cache goes stale — see _cap_time_stop_at_expiration.
+_EXPIRATION_CLOSE_HHMM = time(15, 55)
+
+
+def _earliest_leg_expiration(legs: List[Dict[str, Any]]) -> Optional[date]:
+    """Earliest leg expiration date across ``legs``, or ``None``.
+
+    Structures currently trade single-leg debits, so the earliest is
+    also the only expiration; the loop handles multi-leg spreads for
+    completeness. Returns ``None`` if no leg carries a parseable ISO
+    date so callers can no-op instead of guessing.
+    """
+    earliest: Optional[date] = None
+    for leg in legs:
+        exp_str = leg.get("expiration") or ""
+        if not isinstance(exp_str, str) or len(exp_str) < 10:
+            continue
+        try:
+            exp = date.fromisoformat(exp_str[:10])
+        except ValueError:
+            continue
+        if earliest is None or exp < earliest:
+            earliest = exp
+    return earliest
+
+
+def _expiration_close_cap_utc(expiration: date) -> datetime:
+    """Return ``expiration`` at 15:55 ET converted to UTC.
+
+    ``zoneinfo`` handles DST automatically so 15:55 ET is always the
+    right wall-clock time in Eastern regardless of whether we're
+    inside EDT or EST.
+    """
+    et_dt = datetime.combine(expiration, _EXPIRATION_CLOSE_HHMM, tzinfo=_ET)
+    return et_dt.astimezone(timezone.utc)
+
+
+def _cap_time_stop_at_expiration(
+    time_stop_at: Optional[datetime], legs: List[Dict[str, Any]]
+) -> Optional[datetime]:
+    """Hard-cap ``time_stop_at`` at 15:55 ET on the earliest leg expiration.
+
+    The bots each set their own max_hold_minutes (60-90 default), which
+    is fine for a swing bot but nonsense for a 0DTE: an entry at 15:20 ET
+    with max_hold_minutes=60 would put time_stop_at at 16:20 ET, 20
+    minutes AFTER the options market closes for that expiration. The
+    reconciler would then try to close the position on an option that
+    no longer trades, spread_price would return None (quote too stale),
+    and the position would sit "open" for hours with a stale mark. This
+    cap makes sure time_stop_at cannot fire after the last moment we
+    can plausibly fill.
+
+    A ``None`` earliest-expiration (no parseable leg dates) is a no-op:
+    we can't cap what we can't see, and refusing the signal would be
+    worse than trusting the bot's own time_stop_at.
+    """
+    exp = _earliest_leg_expiration(legs)
+    if exp is None:
+        return time_stop_at
+    cap = _expiration_close_cap_utc(exp)
+    if time_stop_at is None or time_stop_at > cap:
+        return cap
+    return time_stop_at
 
 
 def _bot_lock_id(bot_id: str) -> int:
@@ -166,6 +238,12 @@ def open_position(
 
     now = datetime.now(timezone.utc)
     min_hold_until = now + timedelta(seconds=tw_config.MIN_HOLD_SECONDS)
+    # Cap the bot's requested time_stop_at at 15:55 ET on the earliest
+    # leg expiration so a 0DTE can never time-stop after the options
+    # market shuts. See _cap_time_stop_at_expiration for rationale.
+    capped_time_stop_at = _cap_time_stop_at_expiration(
+        signal.time_stop_at, legs_dicts
+    )
     payload = dict(signal.components_at_entry)
     payload.update(
         {
@@ -207,7 +285,7 @@ def open_position(
             contracts,
             signal.stop_price,
             signal.target_price,
-            signal.time_stop_at,
+            capped_time_stop_at,
             min_hold_until,
             signal.wall_ref_price,
             signal.wall_ref_side,
