@@ -45,6 +45,46 @@ def _resolve_user(request: Request) -> Optional[str]:
     return None
 
 
+def _rows_affected(command_tag: Any) -> int:
+    """Parse the ``N`` out of an asyncpg command tag like ``"UPDATE 3"``.
+
+    asyncpg's ``Connection.execute`` returns the SQL command tag as a
+    string; the trailing integer is the number of affected rows. Returns
+    0 for any tag we can't parse.
+    """
+    if isinstance(command_tag, str):
+        parts = command_tag.split()
+        if parts:
+            try:
+                return int(parts[-1])
+            except ValueError:
+                return 0
+    return 0
+
+
+async def _cancel_queued_for_disabled_channels(
+    conn: Any, user: str, bot_id: str, channels: Dict[str, Any]
+) -> int:
+    """Cancel pending queued notifications for channels no longer opted-in.
+
+    Flips ``status`` to ``'cancelled'`` for any queued ``tw_notifications_log``
+    row belonging to ``(user, bot_id)`` whose ``channel`` is not enabled in
+    the supplied ``channels`` preference set. Returns the number of rows
+    cancelled. ``in_app`` rows are written as ``'sent'`` (never ``'queued'``)
+    so this only ever touches undelivered email / webhook rows.
+    """
+    result = await conn.execute(
+        """
+        UPDATE tw_notifications_log
+        SET status = 'cancelled', error = 'channel disabled by follower'
+        WHERE end_user = $1 AND bot_id = $2 AND status = 'queued'
+          AND COALESCE(($3::jsonb ->> channel)::boolean, false) = false
+        """,
+        user, bot_id, json.dumps(channels),
+    )
+    return _rows_affected(result)
+
+
 # ---------------------------------------------------------------------------
 # Read endpoints
 # ---------------------------------------------------------------------------
@@ -509,7 +549,19 @@ async def follow_bot(
             """,
             user, bot_id, json.dumps(channels), min_confidence,
         )
-    return {"status": "ok", "bot_id": bot_id, "channels": channels, "min_confidence": min_confidence}
+        # Turning a channel OFF must take effect immediately — including for
+        # events that already fanned out to a queued (not-yet-delivered) row.
+        # Cancel any pending queued rows for this (user, bot) whose channel is
+        # not enabled in the new preference set, so e.g. disabling "email"
+        # stops the backlog the delivery worker would otherwise still ship.
+        cancelled = await _cancel_queued_for_disabled_channels(conn, user, bot_id, channels)
+    return {
+        "status": "ok",
+        "bot_id": bot_id,
+        "channels": channels,
+        "min_confidence": min_confidence,
+        "cancelled_queued": cancelled,
+    }
 
 
 @router.delete("/bots/{bot_id}/follow")
@@ -524,7 +576,24 @@ async def unfollow_bot(
             "DELETE FROM tw_bot_followers WHERE end_user = $1 AND bot_id = $2",
             user, bot_id,
         )
-    return {"status": "ok", "bot_id": bot_id}
+        # Unfollowing means "stop notifying me about this bot" — including
+        # events that already fanned out to a queued (email / webhook) row
+        # the delivery worker hasn't shipped yet. Cancel those pending rows
+        # so an unfollow reliably stops the email backlog rather than only
+        # preventing *future* events from queuing.
+        cancel_result = await conn.execute(
+            """
+            UPDATE tw_notifications_log
+            SET status = 'cancelled', error = 'follower unfollowed'
+            WHERE end_user = $1 AND bot_id = $2 AND status = 'queued'
+            """,
+            user, bot_id,
+        )
+    return {
+        "status": "ok",
+        "bot_id": bot_id,
+        "cancelled_queued": _rows_affected(cancel_result),
+    }
 
 
 @router.delete("/me/feed")
@@ -1162,6 +1231,15 @@ async def internal_queued_notifications(
     ``NOW()`` at insert time — effectively FIFO). The worker pulls
     ``limit`` at a time so a burst of hundreds of exits doesn't stall
     delivery of newer ones.
+
+    A queued row records that the follower *wanted* this channel at the
+    moment the event fanned out. Opt-in is re-checked here at delivery
+    time: a row is only handed to the worker if the recipient still
+    follows the bot with that channel enabled. This is the authoritative
+    guard behind unfollow / channel-off — it suppresses even backlog that
+    queued before the follower opted out (including rows orphaned by an
+    unfollow that removed the follower entirely), so "I unfollowed but the
+    emails keep coming" cannot happen regardless of how a row was queued.
     """
     async with db.pool.acquire() as conn:
         rows = await conn.fetch(
@@ -1174,6 +1252,12 @@ async def internal_queued_notifications(
             WHERE n.status = 'queued'
               AND ($1::text IS NULL OR n.channel = $1)
               AND n.channel IN ('email', 'webhook')
+              AND EXISTS (
+                  SELECT 1 FROM tw_bot_followers f
+                  WHERE f.end_user = n.end_user
+                    AND f.bot_id = n.bot_id
+                    AND COALESCE((f.channels ->> n.channel)::boolean, false) = true
+              )
             ORDER BY n.sent_at ASC
             LIMIT $2
             """,
