@@ -69,6 +69,8 @@ FLOW_REBUILD_END_ET ?= 16:15
 BLUE = \033[0;34m
 GREEN = \033[0;32m
 YELLOW = \033[1;33m
+# 256-color orange (208) — distinct from YELLOW, used for "running but has errors"
+ORANGE = \033[38;5;208m
 RED = \033[0;31m
 NC = \033[0m
 
@@ -860,7 +862,7 @@ help: ## Show this help message
 	@echo "  make services-stop      - Stop all (api → signals → analytics → ingestion)"
 	@echo "  make services-restart   - Restart all (stop reverse, then start in order)"
 	@echo "  make services-status    - One-line active/inactive status for all 4"
-	@echo "  make services-health    - Full health check for all 4 services"
+	@echo "  make services-health    - Full health check for all 4 + color-coded summary"
 	@echo "  make services-check [SINCE=\"1 hour ago\"] [LEVEL=errors|warnings|both]"
 	@echo "                            - Scan all 4 logs since a past time (exit 1 if errors)"
 	@echo ""
@@ -1302,6 +1304,24 @@ services-health: ## Full health check (status, uptime, memory, errors, warnings)
 	@$(MAKE) --no-print-directory signals-health
 	@echo ""
 	@$(MAKE) --no-print-directory api-health
+	@echo ""
+	@echo "$(BLUE)=== Health Summary ===$(NC)"
+	@echo "  $(GREEN)✔ green$(NC)=healthy  $(YELLOW)✔ yellow$(NC)=warnings  $(ORANGE)✔ orange$(NC)=errors  $(RED)✖ red$(NC)=down"
+	@echo "  ------------------------------------------------------------"
+	@for svc in $(SERVICES_START_ORDER); do \
+		if ! systemctl is-active --quiet $$svc; then \
+			printf "  $(RED)✖ %-26s down$(NC)\n" "$$svc"; \
+			continue; \
+		fi; \
+		LOG="$$(sudo journalctl -u $$svc -n 500 --no-pager 2>/dev/null)"; \
+		if printf '%s\n' "$$LOG" | grep -q ' - ERROR - '; then \
+			printf "  $(ORANGE)✔ %-26s running (has errors)$(NC)\n" "$$svc"; \
+		elif printf '%s\n' "$$LOG" | grep -q ' - WARNING - '; then \
+			printf "  $(YELLOW)✔ %-26s running (has warnings)$(NC)\n" "$$svc"; \
+		else \
+			printf "  $(GREEN)✔ %-26s healthy$(NC)\n" "$$svc"; \
+		fi; \
+	done
 
 .PHONY: services-check
 services-check: ## Scan all 4 services for warnings/errors since a time. SINCE="1 hour ago" LEVEL=errors|warnings|both
