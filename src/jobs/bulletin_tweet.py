@@ -79,6 +79,7 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 from src.api.database import DatabaseManager
+from src.jobs.index_projection import implied_index_spot
 from src.market_calendar import NYSE_HOLIDAYS
 
 logger = logging.getLogger("zerogex.bulletin_tweet")
@@ -231,6 +232,11 @@ class SymbolBulletin:
     put_wall: float | None = None
     max_pain: float | None = None
     net_gex: float | None = None
+    # True when ``spot`` is a futures-implied projection (a cash index
+    # outside the cash session) rather than a live cash print; ``future_symbol``
+    # is the future it was projected from (e.g. "@ES") for the indicator.
+    spot_is_projected: bool = False
+    future_symbol: str | None = None
 
     def has_any_level(self) -> bool:
         return any(
@@ -294,12 +300,21 @@ class TweetBody:
     symbols_present: list[str] = field(default_factory=list)
 
 
+def _future_label(future_symbol: str | None) -> str:
+    """UI ticker for a continuous future — "@ES" -> "ES"."""
+    return (future_symbol or "").lstrip("@").upper() or "futures"
+
+
 def _symbol_block(b: SymbolBulletin) -> str | None:
     """One symbol's level block. Returns None when nothing resolved so
     the caller can silently drop it from the tweet."""
     if not b.has_any_level() and b.spot is None:
         return None
-    lines = [f"{b.symbol} spot: ~{_fmt_price_spot(b.spot)}"]
+    spot_line = f"{b.symbol} spot: ~{_fmt_price_spot(b.spot)}"
+    if b.spot_is_projected:
+        # Make it unmistakable this is a projection, not a live cash print.
+        spot_line += f" (implied from {_future_label(b.future_symbol)} futures, cash closed)"
+    lines = [spot_line]
     if b.gamma_flip is not None:
         lines.append(f"Gamma Flip: {_fmt_price(b.gamma_flip)}")
     if b.call_wall is not None:
@@ -440,6 +455,8 @@ def _try_llm_section(
             put_wall=b.put_wall,
             max_pain=b.max_pain,
             net_gex=b.net_gex,
+            spot_is_projected=b.spot_is_projected,
+            future_symbol=b.future_symbol,
         )
         for b in present
     ]
@@ -520,7 +537,10 @@ def _build_fallback_tweet(
     lead = present[0]
     parts = [f"{header_symbols} {label}"]
     if lead.spot is not None:
-        parts.append(f"{lead.symbol} ~{_fmt_price(lead.spot)}")
+        spot_txt = f"{lead.symbol} ~{_fmt_price(lead.spot)}"
+        if lead.spot_is_projected:
+            spot_txt += f" (impl {_future_label(lead.future_symbol)})"
+        parts.append(spot_txt)
     if lead.gamma_flip is not None:
         parts.append(f"Flip {_fmt_price(lead.gamma_flip)}")
     if lead.call_wall is not None and lead.put_wall is not None:
@@ -836,7 +856,32 @@ async def _fetch_bulletins(
                 sym, exc,
             )
             row = None
-        out.append(_shape_bulletin(row, sym))
+        bulletin = _shape_bulletin(row, sym)
+        # SPX (cash index) has no live overnight print — outside the cash
+        # session its spot_price is a frozen prior 16:00 close.  Project the
+        # implied level from @ES so a pre-market bulletin shows where the
+        # index is trading now, and FLAG it as projected.  The walls / gamma
+        # flip / max pain / net GEX stay the last cash-session structure —
+        # they're strike-space quantities with no futures equivalent (mixed
+        # card: projected spot + last-session structure).  Returns None (keep
+        # the frozen cash spot) in-session, on weekends, or on an empty feed —
+        # so SPY / QQQ and mid-session fires are untouched.
+        try:
+            proj = await implied_index_spot(db, sym)
+        except Exception as exc:  # noqa: BLE001 — never let projection break the tweet
+            logger.warning("bulletin_tweet: index projection failed (%s): %s", sym, exc)
+            proj = None
+        if proj is not None:
+            bulletin.spot = proj.implied_price
+            bulletin.spot_is_projected = True
+            bulletin.future_symbol = proj.future_symbol
+            logger.info(
+                "bulletin_tweet: %s spot projected from %s — implied $%.2f "
+                "(cash close $%.2f, overnight %+.2f pts)",
+                sym, proj.future_symbol, proj.implied_price,
+                proj.cash_ref_close, proj.gap_points,
+            )
+        out.append(bulletin)
     return out
 
 

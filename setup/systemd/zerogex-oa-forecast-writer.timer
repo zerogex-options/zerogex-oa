@@ -1,14 +1,22 @@
 [Unit]
-Description=Daily trigger for ZeroGEX morning Gamma Forecast (07:00 ET Mon-Fri)
+Description=Daily trigger for ZeroGEX morning Gamma Forecast (08:30 ET Mon-Fri)
 
 [Timer]
-# Fires at 07:00 ET, well before the pre-market liquidity window heats up
-# and any opening-auction data lands.  By this time the overnight engine
-# has refreshed gex_summary, max_pain has been recomputed by the 05:00
-# job, and the underlying quote feed has the prior-day close.  Mon-Fri
-# only — the writer skips holidays internally via NYSE_HOLIDAYS so a
+# Fires at 08:30 ET — AFTER the ~07:30 ET options reset, so the GEX surface
+# the writer reads is today's positioning (not yesterday's stale chain) and
+# the dealer-gamma regime is a live read.  For cash indexes (SPX), which do
+# not trade overnight, the writer projects an implied spot from the @ES
+# future at this time instead of anchoring on the frozen prior close.
+# Mon-Fri only — the writer skips holidays internally via NYSE_HOLIDAYS so a
 # legitimate trading-day Friday-after-holiday still posts.
-OnCalendar=Mon..Fri *-*-* 07:00:00
+#
+# NOTE: this bare time is interpreted in the SYSTEM timezone, which the
+# deploy pins to America/New_York (deploy/steps/010.setup: `timedatectl
+# set-timezone America/New_York`).  That host-TZ pin is what makes it 08:30
+# *ET*.  A per-timer `OnCalendar ... America/New_York` token would be
+# cleaner but requires systemd >= 252 (Ubuntu 22.04 ships 249), so we keep
+# the host-TZ dependency and document it here.
+OnCalendar=Mon..Fri *-*-* 08:30:00
 RandomizedDelaySec=2m
 # Catch up after planned downtime — a missed morning forecast can still
 # be useful if it lands by 09:00 (pre-market).

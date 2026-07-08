@@ -108,6 +108,13 @@ STRICT RULES:
   half-day), work it into the framing naturally.
 * Match the mode: premarket = look-ahead framing; midday = mid-session
   positioning; close = look-back plus overnight-setup framing.
+* When a symbol has ``spot_is_projected: true`` (a cash index like SPX
+  outside the cash session), its ``spot`` is IMPLIED from the futures
+  (``spot_future_symbol``, e.g. "ES"), NOT a live cash quote — the index
+  itself isn't trading yet.  Frame it that way ("SPX implied ~X off the ES
+  future", "futures point to SPX near X"); never state it as a live SPX
+  print.  The gamma flip / walls / max pain for that symbol are the prior
+  cash session's structure — describe them as the standing setup, not live.
 """
 
 
@@ -127,11 +134,18 @@ class SymbolInput:
     max_pain: float | None = None
     net_gex: float | None = None
     regime: str | None = None  # "positive", "negative", "neutral", "unresolved"
+    # True when ``spot`` is a futures-implied projection (cash index outside
+    # the cash session), with the future it came from (e.g. "@ES").  The model
+    # must frame such a spot as implied/overnight, never as a live cash print.
+    spot_is_projected: bool = False
+    future_symbol: str | None = None
 
     def to_prompt_dict(self) -> dict[str, Any]:
         return {
             "symbol": self.symbol,
             "spot": self.spot,
+            "spot_is_projected": self.spot_is_projected,
+            "spot_future_symbol": (self.future_symbol or "").lstrip("@").upper() or None,
             "prior_close": self.prior_close,
             "session_open": self.session_open,
             "session_high": self.session_high,

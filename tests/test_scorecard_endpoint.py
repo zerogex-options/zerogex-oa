@@ -155,26 +155,27 @@ def test_daily_scorecard_empty_day_returns_quiet_tweet(monkeypatch: pytest.Monke
 
 
 def test_daily_scorecard_regime_label_from_composite_score(monkeypatch: pytest.MonkeyPatch):
-    """Strong positive composite → long gamma, near-zero → transition."""
+    """The composite is the 0-100 Market State Index (neutral 50): strongly
+    high → long gamma, near 50 → transition, strongly low → short gamma.
+
+    Regression for the units bug that (comparing the raw 0-100 value against
+    ±0.15) made this ALWAYS return "long gamma"."""
     app, dbmod = _build_app(monkeypatch)
 
-    # Long gamma.
-    dbmod.DatabaseManager.get_daily_scorecard = AsyncMock(return_value=_scorecard_payload(
-        regime={"timestamp": datetime(2026, 6, 29, 20, tzinfo=timezone.utc),
-                "composite_score": 0.42, "normalized_score": 42.0, "direction": "bullish"},
-    ))
-    with TestClient(app) as client:
-        r = client.get("/api/scorecard/daily?date=2026-06-29")
-    assert r.json()["regime"]["label"] == "long gamma"
+    def _label_for(composite: float) -> str:
+        dbmod.DatabaseManager.get_daily_scorecard = AsyncMock(return_value=_scorecard_payload(
+            regime={"timestamp": datetime(2026, 6, 29, 20, tzinfo=timezone.utc),
+                    "composite_score": composite,
+                    "normalized_score": composite / 100.0,
+                    "direction": "bullish"},
+        ))
+        with TestClient(app) as client:
+            r = client.get("/api/scorecard/daily?date=2026-06-29")
+        return r.json()["regime"]["label"]
 
-    # Transition (near zero).
-    dbmod.DatabaseManager.get_daily_scorecard = AsyncMock(return_value=_scorecard_payload(
-        regime={"timestamp": datetime(2026, 6, 29, 20, tzinfo=timezone.utc),
-                "composite_score": 0.08, "normalized_score": 8.0, "direction": "bullish"},
-    ))
-    with TestClient(app) as client:
-        r = client.get("/api/scorecard/daily?date=2026-06-29")
-    assert r.json()["regime"]["label"] == "transition"
+    assert _label_for(78.0) == "long gamma"     # strongly positive lean
+    assert _label_for(52.0) == "transition"     # near neutral 50
+    assert _label_for(30.0) == "short gamma"     # the bug made this impossible
 
 
 def test_daily_scorecard_rejects_invalid_date(monkeypatch: pytest.MonkeyPatch):

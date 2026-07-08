@@ -124,6 +124,17 @@ class ForecastInputs:
     gamma_flip: Optional[float] = None
     max_pain: Optional[float] = None
 
+    # Dealer-gamma regime inputs.  ``net_gex`` is the full-chain net dealer
+    # gamma exposure (sign is the regime: >0 dealers long gamma, <0 short);
+    # ``gamma_flip`` above is the price where it crosses zero.  These drive
+    # the regime label directly — the label is dealer positioning, not the
+    # MSI directional score (which stays a band-shaping input only).
+    # ``gex_surface_fresh`` is False when the GEX snapshot the writer read
+    # is stale/missing, in which case the regime degrades to "transition"
+    # rather than asserting a positioning we can't substantiate.
+    net_gex: Optional[float] = None
+    gex_surface_fresh: bool = True
+
     # Structural GEX (0DTE only — nearest expiration walls derived from
     # gex_by_strike filtered to today's expiration).  When populated,
     # OPEX Friday and post-OPEX Monday use these preferentially.
@@ -149,6 +160,13 @@ class ForecastInputs:
 
     # Overnight action.
     futures_gap_pct: Optional[float] = None      # overnight ES/NQ gap
+
+    # Spot-anchor provenance (writer metadata, not consumed by the model):
+    # "cash" when ``spot`` is the live/last cash print; "futures_implied"
+    # when a cash index was projected from its future outside the cash
+    # session.  ``open_spot_projection`` carries the projection audit dict.
+    open_spot_source: str = "cash"
+    open_spot_projection: Optional[dict[str, Any]] = None
 
     # Playbook state.
     flagship_setup: Optional[dict[str, Any]] = None
@@ -213,17 +231,45 @@ def _round_to_strike(value: float, step: float) -> float:
     return round(round(value / step) * step, 4)
 
 
-def _classify_regime(msi_composite: Optional[float]) -> str:
-    """Composite-score sign is the cleanest gamma-regime proxy in 7 AM
-    data.  Threshold is intentionally the same as v1 so history stays
-    comparable; the informativeness improvement comes from what the
-    regime label *does downstream*, not from a new label taxonomy."""
-    if msi_composite is None:
+def _classify_regime(
+    net_gex: Optional[float],
+    spot: Optional[float],
+    gamma_flip: Optional[float],
+    *,
+    surface_fresh: bool = True,
+) -> str:
+    """Dealer gamma regime from actual dealer positioning.
+
+    The regime is the *sign of net dealer gamma* — the definition of a
+    long-/short-gamma tape — not a directional-signal proxy::
+
+        net_gex > 0  -> dealers net long gamma  -> vol-suppressing -> long_gamma
+        net_gex < 0  -> dealers net short gamma -> vol-amplifying  -> short_gamma
+
+    When ``net_gex`` is unavailable we fall back to spot-vs-gamma-flip
+    (above the flip == long gamma, the same crossover ``net_gex``'s sign
+    encodes).  We return ``transition`` when the GEX surface is stale/missing
+    or no dealer-gamma signal exists at all — the forecast never asserts a
+    regime off data it can't stand behind.  (This replaces the prior
+    MSI-composite-sign proxy, which — fed the 0-100 Market State Index where
+    it expected a signed -1..+1 value — silently pinned every symbol to
+    ``long_gamma`` on every run.)
+    """
+    if not surface_fresh:
         return "transition"
-    if msi_composite > 0.15:
-        return "long_gamma"
-    if msi_composite < -0.15:
-        return "short_gamma"
+    if net_gex is not None:
+        if net_gex > 0:
+            return "long_gamma"
+        if net_gex < 0:
+            return "short_gamma"
+        return "transition"  # exactly at the flip
+    # Fallback: spot relative to the gamma-flip level.
+    if spot is not None and gamma_flip is not None and spot > 0 and gamma_flip > 0:
+        if spot > gamma_flip:
+            return "long_gamma"
+        if spot < gamma_flip:
+            return "short_gamma"
+        return "transition"
     return "transition"
 
 
@@ -618,14 +664,24 @@ def compute_forecast(inp: ForecastInputs) -> ForecastResult:
         rationale.append("No pin candidate — projected close = open spot")
     pin_tol = _pin_tolerance(spot, inp.strike_step, calibration["pin_tolerance_mult"])
 
-    # Step 9 — regime + VIX-normalized chop/trend threshold.
-    regime = _classify_regime(inp.msi_composite)
-    regime_threshold = _compute_regime_threshold(spot, inp.vix_close, inp.vxn_close)
-    rationale.append(
-        f"Regime={regime} from MSI composite={inp.msi_composite}"
-        if inp.msi_composite is not None
-        else "Regime=transition (no MSI)"
+    # Step 9 — regime (dealer gamma) + VIX-normalized chop/trend threshold.
+    regime = _classify_regime(
+        inp.net_gex, spot, inp.gamma_flip, surface_fresh=inp.gex_surface_fresh
     )
+    regime_threshold = _compute_regime_threshold(spot, inp.vix_close, inp.vxn_close)
+    if not inp.gex_surface_fresh:
+        rationale.append("Regime=transition (GEX surface stale/missing)")
+    elif inp.net_gex is not None:
+        stance = "long" if inp.net_gex > 0 else "short" if inp.net_gex < 0 else "flat"
+        rationale.append(
+            f"Regime={regime} from net_gex={inp.net_gex:.3g} (dealers {stance} gamma)"
+        )
+    elif inp.gamma_flip is not None:
+        rationale.append(
+            f"Regime={regime} from spot ${spot:.2f} vs gamma-flip ${inp.gamma_flip:.2f}"
+        )
+    else:
+        rationale.append("Regime=transition (no dealer-gamma signal)")
     rationale.append(
         f"Chop/trend threshold={regime_threshold:.4f} "
         f"({regime_threshold * 100:.2f}%)"

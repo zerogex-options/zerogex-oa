@@ -1,5 +1,5 @@
 [Unit]
-Description=ZeroGEX morning Gamma Forecast writer (07:00 ET)
+Description=ZeroGEX morning Gamma Forecast writer (08:30 ET)
 Documentation=https://github.com/zerogex-options/zerogex-oa
 After=network-online.target postgresql.service
 Wants=network-online.target
