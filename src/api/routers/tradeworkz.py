@@ -913,7 +913,7 @@ async def admin_trades(
                realized_pnl, pnl_percent, outcome, close_reason,
                entry_conviction,
                COALESCE(components_at_entry ->> 'origin', 'live') AS origin,
-               components_at_entry, components_at_exit
+               legs, components_at_entry, components_at_exit
         FROM tw_trades
         {where_sql}
         ORDER BY closed_at DESC
@@ -968,6 +968,7 @@ async def admin_trades(
                     if r["entry_conviction"] is not None else None
                 ),
                 "origin": r["origin"],
+                "legs": _parse_json(r["legs"]),
                 "components_at_entry": _parse_json(r["components_at_entry"]),
                 "components_at_exit": _parse_json(r["components_at_exit"]),
             }
@@ -991,18 +992,38 @@ async def admin_trades(
             [
                 "id", "bot_id", "underlying", "origin",
                 "opened_at", "closed_at", "direction", "strategy_type",
-                "entry_price", "exit_price", "quantity",
+                "contract", "entry_price", "exit_price", "quantity",
+                "cost_basis", "proceeds",
                 "realized_pnl", "pnl_percent", "outcome",
                 "close_reason", "entry_conviction",
             ]
         )
         for e in entries:
+            # Compact "SPY 7/8 P746" contract label from the first leg;
+            # multi-leg spreads collapse to "leg1 / leg2".
+            legs = e.get("legs") or []
+            contract_parts: List[str] = []
+            for leg in legs:
+                exp = str(leg.get("expiration") or "")
+                exp_short = exp[5:].replace("-", "/") if len(exp) >= 10 else exp
+                strike = leg.get("strike")
+                right = (leg.get("option_type") or "")[:1].upper()
+                sym = leg.get("option_symbol") or f"{e['underlying']} {exp_short}{right}{strike}"
+                contract_parts.append(str(sym))
+            contract = " / ".join(contract_parts) if contract_parts else ""
+            qty = e["quantity"] or 0
+            entry_px = e["entry_price"] or 0
+            exit_px = e["exit_price"] or 0
+            cost_basis = round(entry_px * qty * 100, 2) if qty else None
+            proceeds = round(exit_px * qty * 100, 2) if qty else None
             w.writerow(
                 [
                     e["id"], e["bot_id"], e["underlying"], e["origin"],
                     e["opened_at"], e["closed_at"], e["direction"],
-                    e["strategy_type"], e["entry_price"], e["exit_price"],
-                    e["quantity"], e["realized_pnl"], e["pnl_percent"],
+                    e["strategy_type"], contract,
+                    e["entry_price"], e["exit_price"], e["quantity"],
+                    cost_basis, proceeds,
+                    e["realized_pnl"], e["pnl_percent"],
                     e["outcome"], e["close_reason"], e["entry_conviction"],
                 ]
             )
