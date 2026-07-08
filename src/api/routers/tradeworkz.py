@@ -841,6 +841,111 @@ async def admin_reset_fleet(
 
 
 @router.get(
+    "/admin/positions",
+    dependencies=[Depends(require_scopes(SIGNALS))],
+)
+async def admin_positions(
+    db: DatabaseManager = Depends(get_db),
+):
+    """Fleet-wide currently-OPEN positions with mark-to-market.
+
+    The /admin/trades feed is a history of CLOSED trades — one row per
+    close. This endpoint fills the complementary need: what's still on
+    the book right now, per bot, with unrealized P&L, target/stop
+    levels, and time_stop_at so the operator can see at a glance how
+    long a hold has been running and where the exits would fire.
+
+    Read-only, no filters, always returns all open rows across the
+    fleet — a fleet has at most tens of concurrent positions in
+    practice, so paging isn't needed.
+    """
+    async with db.pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT p.id, p.bot_id, b.display_name AS bot_display_name,
+                   p.underlying, p.opened_at, p.updated_at, p.direction,
+                   p.strategy_type, p.legs, p.entry_price, p.current_price,
+                   p.quantity_open, p.unrealized_pnl, p.stop_price,
+                   p.target_price, p.time_stop_at, p.min_hold_until,
+                   p.wall_ref_price, p.wall_ref_side, p.entry_conviction,
+                   COALESCE(p.components_at_entry ->> 'origin', 'live') AS origin,
+                   p.components_at_entry
+            FROM tw_positions p
+            LEFT JOIN tw_bots b ON b.id = p.bot_id
+            ORDER BY p.opened_at DESC
+            """
+        )
+
+    def _parse_json(v: Any) -> Any:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except Exception:
+                return v
+        return v
+
+    entries: List[Dict[str, Any]] = []
+    for r in rows:
+        entries.append(
+            {
+                "id": r["id"],
+                "bot_id": r["bot_id"],
+                "bot_display_name": r["bot_display_name"],
+                "underlying": r["underlying"],
+                "opened_at": r["opened_at"].isoformat() if r["opened_at"] else None,
+                "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+                "direction": r["direction"],
+                "strategy_type": r["strategy_type"],
+                "legs": _parse_json(r["legs"]),
+                "entry_price": float(r["entry_price"]) if r["entry_price"] is not None else None,
+                "current_price": (
+                    float(r["current_price"]) if r["current_price"] is not None else None
+                ),
+                "quantity_open": (
+                    int(r["quantity_open"]) if r["quantity_open"] is not None else None
+                ),
+                "unrealized_pnl": (
+                    float(r["unrealized_pnl"]) if r["unrealized_pnl"] is not None else None
+                ),
+                "stop_price": (
+                    float(r["stop_price"]) if r["stop_price"] is not None else None
+                ),
+                "target_price": (
+                    float(r["target_price"]) if r["target_price"] is not None else None
+                ),
+                "time_stop_at": (
+                    r["time_stop_at"].isoformat() if r["time_stop_at"] else None
+                ),
+                "min_hold_until": (
+                    r["min_hold_until"].isoformat() if r["min_hold_until"] else None
+                ),
+                "wall_ref_price": (
+                    float(r["wall_ref_price"]) if r["wall_ref_price"] is not None else None
+                ),
+                "wall_ref_side": r["wall_ref_side"],
+                "entry_conviction": (
+                    float(r["entry_conviction"])
+                    if r["entry_conviction"] is not None else None
+                ),
+                "origin": r["origin"],
+                "components_at_entry": _parse_json(r["components_at_entry"]),
+            }
+        )
+    total_unrealized = sum(
+        (e["unrealized_pnl"] or 0.0) for e in entries
+    )
+    return {
+        "entries": entries,
+        "summary": {
+            "n_open": len(entries),
+            "total_unrealized_pnl": total_unrealized,
+        },
+    }
+
+
+@router.get(
     "/admin/trades",
     dependencies=[Depends(require_scopes(SIGNALS))],
 )
