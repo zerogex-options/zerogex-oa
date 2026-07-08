@@ -77,11 +77,21 @@ def _load_tweet_body(artifact_dir: Path, manifest: dict[str, Any]) -> TweetBody 
             artifact_dir,
         )
         return None
+    # Threaded link reply — prefer the on-disk file, fall back to the
+    # manifest field (older drafts may predate the file).  Empty string
+    # is fine: post_bulletin simply skips the reply when it's blank.
+    reply_path = artifact_dir / "tweet_reply.md"
+    if reply_path.exists():
+        reply_text = reply_path.read_text(encoding="utf-8").rstrip("\n")
+    else:
+        reply_text = manifest.get("reply_text", "") or ""
     return TweetBody(
         text=text_path.read_text(encoding="utf-8").rstrip("\n"),
         fallback=fallback_path.read_text(encoding="utf-8").rstrip("\n"),
         lead_symbol=manifest.get("lead_symbol", ""),
         symbols_present=list(manifest.get("symbols_present") or []),
+        reply_text=reply_text,
+        featured_symbol=manifest.get("featured_symbol", ""),
     )
 
 
@@ -125,6 +135,7 @@ def _update_manifest_state(
     artifact_dir: Path,
     state: str,
     posted_id: str | None = None,
+    reply_id: str | None = None,
 ) -> None:
     """Rewrite manifest.json with the new state, preserving other fields.
 
@@ -136,6 +147,8 @@ def _update_manifest_state(
     manifest["state"] = state
     if posted_id is not None:
         manifest["posted_id"] = posted_id
+    if reply_id is not None:
+        manifest["reply_id"] = reply_id
     manifest["approved_ts"] = datetime.now(tz=ET).isoformat()
     manifest_path.write_text(
         json.dumps(manifest, indent=2, default=str) + "\n", encoding="utf-8",
@@ -216,10 +229,11 @@ def _run(args: argparse.Namespace) -> int:
 
     _update_manifest_state(
         artifact_dir, state="posted", posted_id=post_result.get("id"),
+        reply_id=post_result.get("reply_id"),
     )
     logger.info(
-        "bulletin_approve[%s]: posted tweet id=%s (artifacts=%s)",
-        args.mode, post_result.get("id"), artifact_dir,
+        "bulletin_approve[%s]: posted tweet id=%s (reply=%s, artifacts=%s)",
+        args.mode, post_result.get("id"), post_result.get("reply_id"), artifact_dir,
     )
     return 0
 

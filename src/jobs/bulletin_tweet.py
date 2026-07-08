@@ -11,12 +11,22 @@ systemd timers:
   * ``--mode close`` at 16:05 ET — closing update posted 5 min after
     the cash bell.
 
+Every post FEATURES ONE symbol — the one with the cleanest setup at
+the moment the job fires (see :func:`select_featured_symbol`: the
+symbol whose spot is pressed closest to its gamma flip or a wall, the
+clearest line to narrate).  SPY / SPX / QQQ are all still fetched so
+the copy can cross-reference the other two, but the headline, the
+numeric map and the attached card all center on the featured symbol.
+
 Every post includes:
 
-  * A multi-paragraph read-out of $SPY / $SPX / $QQQ levels sourced
-    live from the same ``get_latest_gex_summary`` powering the Live
-    Bulletin admin page — so the tweet and the on-site card can never
-    contradict each other.
+  * A multi-paragraph, X-native read-out of the featured symbol's
+    levels sourced live from the same ``get_latest_gex_summary``
+    powering the Live Bulletin admin page — so the tweet and the
+    on-site card can never contradict each other.  The main post
+    carries NO site link and NO hashtags (the cashtag is in the
+    header); the ``https://zerogex.io`` link is posted separately as a
+    threaded reply so it doesn't suppress the main post's reach.
   * A PNG attachment: a screenshot of the exact ``GammaReportCard``
     component the paid /live-bulletin page renders, captured by the
     frontend Playwright helper ``scripts/render-bulletin-png.mjs``
@@ -87,7 +97,14 @@ ET = ZoneInfo("America/New_York")
 
 DEFAULT_SITE_URL = "https://zerogex.io"
 DEFAULT_SYMBOLS = ("SPY", "SPX", "QQQ")
+# Fallback symbol to feature when the "cleanest setup" selector can't pick one
+# (e.g. no symbol has both a live spot and a level).  Normally the featured
+# symbol is chosen at runtime by :func:`select_featured_symbol`.
 DEFAULT_LEAD_SYMBOL = "SPX"
+# The site link no longer rides in the main post (link-in-body suppresses X
+# reach).  Instead it's posted as a threaded reply under every bulletin tweet.
+# This is the fixed prefix; the URL is appended from ``--site-url``.
+DEFAULT_REPLY_PREFIX = "Free delayed SPY / SPX / QQQ gamma levels:"
 LONG_TWEET_MAX_LEN = 25_000  # X Premium long-form ceiling; classic 280 is the
                              # floor the fallback body targets when the caller
                              # doesn't have Premium enabled on the bot handle.
@@ -287,17 +304,23 @@ def _shape_bulletin(row: dict[str, Any] | None, symbol: str) -> SymbolBulletin:
 class TweetBody:
     """The full text of a bulletin tweet plus a shortened fallback.
 
-    ``text`` is the long-form (Premium) version — includes the intro,
-    a level block per symbol, and the site tagline. ``fallback`` is a
+    ``text`` is the long-form (Premium) version — the featured symbol's
+    intro, its numeric map, and the interpretation.  ``fallback`` is a
     280-char single-tweet compression the caller can post instead when
     the bot handle isn't Premium-enabled (or when the API rejects the
-    long text with a 403). Both share the same permalink so
-    click-through analytics survive the truncation path."""
+    long text with a 403).  Neither carries a link or hashtags.
+
+    ``reply_text`` is the threaded link comment posted *after* the main
+    tweet (``Free delayed SPY / SPX / QQQ gamma levels: …``) — kept off
+    the main post so an in-body link doesn't throttle its reach.
+    ``featured_symbol`` is the single symbol the post centers on."""
 
     text: str
     fallback: str
     lead_symbol: str
     symbols_present: list[str] = field(default_factory=list)
+    reply_text: str = ""
+    featured_symbol: str = ""
 
 
 def _future_label(future_symbol: str | None) -> str:
@@ -305,12 +328,20 @@ def _future_label(future_symbol: str | None) -> str:
     return (future_symbol or "").lstrip("@").upper() or "futures"
 
 
-def _symbol_block(b: SymbolBulletin) -> str | None:
+def _symbol_block(b: SymbolBulletin, include_prefix: bool = True) -> str | None:
     """One symbol's level block. Returns None when nothing resolved so
-    the caller can silently drop it from the tweet."""
+    the caller can silently drop it from the tweet.
+
+    ``include_prefix`` controls the spot line: ``True`` renders
+    ``SPY spot: ~744.51`` (used when a symbol is named inline), ``False``
+    renders just ``Spot: ~744.51`` (used for the featured symbol's
+    ``Current map:`` block, where the header already names the symbol)."""
     if not b.has_any_level() and b.spot is None:
         return None
-    spot_line = f"{b.symbol} spot: ~{_fmt_price_spot(b.spot)}"
+    if include_prefix:
+        spot_line = f"{b.symbol} spot: ~{_fmt_price_spot(b.spot)}"
+    else:
+        spot_line = f"Spot: ~{_fmt_price_spot(b.spot)}"
     if b.spot_is_projected:
         # Make it unmistakable this is a projection, not a live cash print.
         spot_line += f" (implied from {_future_label(b.future_symbol)} futures, cash closed)"
@@ -328,61 +359,145 @@ def _symbol_block(b: SymbolBulletin) -> str | None:
     return "\n".join(lines)
 
 
+def select_featured_symbol(
+    bulletins: list[SymbolBulletin],
+    fallback: str = DEFAULT_LEAD_SYMBOL,
+) -> SymbolBulletin | None:
+    """Pick the single symbol with the "cleanest setup" to feature.
+
+    Cleanest = spot pressed closest (in % terms) to a decision level —
+    the gamma flip, the put wall or the call wall.  That's the clearest
+    line to narrate: "price drove into the 740 put wall and ripped off
+    it" only reads that cleanly when spot is actually sitting on 740.
+
+    Only symbols with a live/implied spot AND at least one of those
+    three levels are eligible.  Ties break toward the more complete
+    data, then toward the input order, so a dry-run and the live post
+    always feature the same symbol for a given fire.
+
+    When nothing is eligible (every symbol missing spot or all three
+    levels) we fall back to the configured ``fallback`` symbol if it has
+    any renderable data, then to the first symbol that does — never
+    None unless the whole trio is empty (the caller skips before then).
+    """
+    scored: list[tuple[float, int, int, SymbolBulletin]] = []
+    for idx, b in enumerate(bulletins):
+        if b.spot is None or b.spot <= 0:
+            continue
+        levels = [lv for lv in (b.gamma_flip, b.put_wall, b.call_wall) if lv is not None]
+        if not levels:
+            continue
+        proximity = min(abs(b.spot - lv) / b.spot for lv in levels)
+        completeness = sum(
+            1
+            for v in (b.gamma_flip, b.call_wall, b.put_wall, b.max_pain, b.net_gex)
+            if v is not None
+        )
+        # (proximity asc, completeness desc, input-order asc) — the index
+        # keeps the sort total-ordered so it never compares SymbolBulletin.
+        scored.append((proximity, -completeness, idx, b))
+
+    if scored:
+        scored.sort(key=lambda t: (t[0], t[1], t[2]))
+        return scored[0][3]
+
+    by_symbol = {b.symbol: b for b in bulletins}
+    lead = by_symbol.get(fallback.upper())
+    if lead is not None and (lead.has_any_level() or lead.spot is not None):
+        return lead
+    for b in bulletins:
+        if b.has_any_level() or b.spot is not None:
+            return b
+    return None
+
+
+def _build_reply_text(site_url: str, override: str | None = None) -> str:
+    """The threaded link comment posted under the main tweet.
+
+    ``override`` (from ``BULLETIN_TWEET_REPLY_TEXT``) wins verbatim;
+    otherwise it's the fixed prefix + the site URL."""
+    if override and override.strip():
+        return override.strip()
+    return f"{DEFAULT_REPLY_PREFIX} {site_url.rstrip('/')}"
+
+
 def build_tweet_body(
     mode: str,
     day: date,
     bulletins: list[SymbolBulletin],
     site_url: str = DEFAULT_SITE_URL,
     lead_symbol: str = DEFAULT_LEAD_SYMBOL,
+    reply_text: str | None = None,
 ) -> TweetBody:
-    """Assemble the full tweet body for one mode.
+    """Assemble the full tweet body for one mode, featuring one symbol.
 
-    Layout mirrors the operator's spec:
+    Layout:
 
-        $SPY / $SPX / $QQQ <label>:
+        $<FEATURED> <label>:
 
-        <mode lead sentence>
+        <opening — the level that mattered and how price interacted>
 
-        Current ZeroGEX read:
+        Current map:
 
-        <per-symbol level block>
-        <blank line>
-        <per-symbol level block>
-        ...
+        Spot: ~…
+        Gamma Flip: …
+        Put Wall: …
+        Call Wall: …
+        Max Pain: …
+        Net GEX: …
 
-        <site tagline>
+        <clean read — regime + forward scenarios>
 
-        $SPY $SPX $QQQ <hashtags>
+        <closing takeaway (optional cross-refs to the other two)>
 
-    Symbols with no resolved GEX data are dropped from the level
-    section; if none resolve at all the caller should skip the post."""
+    No site link, no hashtags — the featured symbol's cashtag sits in
+    the header and the ``https://zerogex.io`` link goes out as a
+    separate threaded reply (``reply_text``).  If no symbol resolves at
+    all the caller should skip the post before calling this."""
     copy = MODE_COPY.get(mode)
     if copy is None:
         raise ValueError(f"Unknown mode: {mode!r}")
 
     present = [b for b in bulletins if b.has_any_level() or b.spot is not None]
     symbols_present = [b.symbol for b in present]
-    header_symbols = " / ".join(f"${b.symbol}" for b in bulletins)
+    reply = _build_reply_text(site_url, reply_text)
 
-    numeric_block = _numeric_read_block(present)
+    featured = select_featured_symbol(bulletins, fallback=lead_symbol)
+    if featured is None:
+        # Defensive: the runner skips empty days before we get here, but
+        # never emit a broken body — a header-only post is the floor.
+        featured_symbol = lead_symbol.upper()
+        header = f"${featured_symbol} {copy.label}:"
+        return TweetBody(
+            text=header,
+            fallback=header,
+            lead_symbol=featured_symbol,
+            symbols_present=symbols_present,
+            reply_text=reply,
+            featured_symbol=featured_symbol,
+        )
+
+    featured_symbol = featured.symbol
+    map_block = _symbol_block(featured, include_prefix=False) or ""
 
     # LLM-generated narrative if ANTHROPIC_API_KEY is set. Any failure
     # (no key, API down, malformed reply, invented prices) returns None
     # and we fall back to the static template below — never fail the
-    # tweet just because the LLM path had a bad day.
-    section = _try_llm_section(mode, day, present)
+    # tweet just because the LLM path had a bad day.  All present symbols
+    # are handed to the model so it can cross-reference the other two.
+    section = _try_llm_section(mode, day, present, featured_symbol)
     if section is not None:
         text = _compose_with_llm_section(
-            section, header_symbols, numeric_block, site_url,
+            section, featured_symbol, copy.label, map_block,
         )
-        fallback = _build_fallback_tweet(
-            mode, present, header_symbols, site_url, section.header_label or copy.label,
-        )
+        fallback = _build_fallback_tweet(featured, copy.label)
         return TweetBody(
             text=text,
             fallback=fallback,
-            lead_symbol=lead_symbol,
+            lead_symbol=featured_symbol,
             symbols_present=symbols_present,
+            reply_text=reply,
+            featured_symbol=featured_symbol,
         )
 
     # Static template fallback — rotates the lead sentence off a hash
@@ -393,53 +508,40 @@ def build_tweet_body(
     lead = _pick(copy.lead_variants, seed)
 
     blocks: list[str] = [
-        f"{header_symbols} {copy.label}:",
+        f"${featured_symbol} {copy.label}:",
         "",
         lead,
         "",
-        "Current ZeroGEX read:",
+        "Current map:",
         "",
-        numeric_block,
-        "",
-        site_url.rstrip("/").replace("https://", "").replace("http://", ""),
-        "",
-        "$SPY $SPX $QQQ #Gamma #GEX #OptionsTrading #0DTE",
+        map_block,
     ]
     text = "\n".join(blocks).strip()
 
-    fallback = _build_fallback_tweet(mode, present, header_symbols, site_url, copy.label)
+    fallback = _build_fallback_tweet(featured, copy.label)
     return TweetBody(
         text=text,
         fallback=fallback,
-        lead_symbol=lead_symbol,
+        lead_symbol=featured_symbol,
         symbols_present=symbols_present,
+        reply_text=reply,
+        featured_symbol=featured_symbol,
     )
 
 
-def _numeric_read_block(present: list[SymbolBulletin]) -> str:
-    """The deterministic ``Current ZeroGEX read:`` numeric block.
-
-    Extracted so both the LLM composition path and the static template
-    can share the same source of truth for the numbers — no chance the
-    two paths drift on formatting."""
-    parts: list[str] = []
-    for i, b in enumerate(present):
-        block = _symbol_block(b)
-        if block:
-            if i > 0:
-                parts.append("")
-            parts.append(block)
-    return "\n".join(parts)
-
-
 def _try_llm_section(
-    mode: str, day: date, present: list[SymbolBulletin],
+    mode: str,
+    day: date,
+    present: list[SymbolBulletin],
+    featured_symbol: str,
 ):
     """Attempt LLM narrative generation. Returns None on any failure.
 
     Imports the LLM helper lazily so a broken import (missing env
     variable dependency, network outage during module import) cannot
-    take down the static-template path."""
+    take down the static-template path.  All ``present`` symbols are
+    passed so the model can cross-reference the other two; the model is
+    told which one is ``featured_symbol`` and writes the post around it."""
     try:
         from src.jobs import bulletin_llm  # noqa: WPS433 — optional
     except Exception as exc:  # noqa: BLE001
@@ -461,7 +563,9 @@ def _try_llm_section(
         for b in present
     ]
     try:
-        return bulletin_llm.generate_narrative(mode=mode, day=day, symbols=inputs)
+        return bulletin_llm.generate_narrative(
+            mode=mode, day=day, symbols=inputs, featured_symbol=featured_symbol,
+        )
     except Exception as exc:  # noqa: BLE001 — never let the LLM path throw
         logger.warning("bulletin_tweet: LLM narrative generation failed (%s)", exc)
         return None
@@ -469,34 +573,31 @@ def _try_llm_section(
 
 def _compose_with_llm_section(
     section,
-    header_symbols: str,
-    numeric_block: str,
-    site_url: str,
+    featured_symbol: str,
+    default_label: str,
+    map_block: str,
 ) -> str:
     """Assemble the tweet body around an LLM-generated ``LlmSection``.
 
-    Layout matches the operator's spec:
+    Layout (single featured symbol, no link, no hashtags):
 
-        {header_symbols} {header_label}:
+        ${featured_symbol} {header_label}:
         <blank line>
         {opening}
         <blank line>
-        Current ZeroGEX read:
+        Current map:
         <blank line>
-        {numeric_block}
+        {map_block}
         <blank line>
         {clean_read}
         <blank line>
         {closing}
         <blank line>
         {signoff (optional)}
-        <blank line>
-        zerogex.io
-        <blank line>
-        $SPY $SPX $QQQ #Gamma #GEX #OptionsTrading #0DTE
 
-    Any section coming back empty is elided so the composed body
-    never carries a lonely trailing blank paragraph."""
+    Any section coming back empty is elided so the composed body never
+    carries a lonely trailing blank paragraph.  The link rides in the
+    threaded reply, not here."""
     def _sep(existing: list[str], value: str) -> None:
         stripped = value.strip()
         if not stripped:
@@ -505,58 +606,43 @@ def _compose_with_llm_section(
             existing.append("")
         existing.append(stripped)
 
-    header_label = section.header_label.strip() or "update"
-    blocks: list[str] = [f"{header_symbols} {header_label}:"]
+    header_label = section.header_label.strip() or default_label
+    blocks: list[str] = [f"${featured_symbol} {header_label}:"]
     _sep(blocks, section.opening)
-    _sep(blocks, "Current ZeroGEX read:")
-    _sep(blocks, numeric_block)
+    _sep(blocks, "Current map:")
+    _sep(blocks, map_block)
     _sep(blocks, section.clean_read)
     _sep(blocks, section.closing)
     _sep(blocks, section.signoff)
-    _sep(blocks, site_url.rstrip("/").replace("https://", "").replace("http://", ""))
-    _sep(blocks, "$SPY $SPX $QQQ #Gamma #GEX #OptionsTrading #0DTE")
     return "\n".join(blocks).strip()
 
 
-def _build_fallback_tweet(
-    mode: str,
-    present: list[SymbolBulletin],
-    header_symbols: str,
-    site_url: str,
-    label: str,
-) -> str:
-    """A ≤280-char compression of the long-form body.
+def _build_fallback_tweet(featured: SymbolBulletin, label: str) -> str:
+    """A ≤280-char compression of the featured symbol's read.
 
     Used when the bot handle isn't X-Premium enabled: we still want to
-    post *something* rather than silently swallowing the fire. Includes
-    the lead symbol's spot + gamma flip + walls and a permalink to the
-    on-site bulletin. Trimmed with an ellipsis if it still overflows
-    (extremely rare — the lead symbol's block fits comfortably)."""
-    if not present:
-        return f"{header_symbols} {label} — data pending. {site_url.rstrip('/')}/live-bulletin"
-    lead = present[0]
-    parts = [f"{header_symbols} {label}"]
-    if lead.spot is not None:
-        spot_txt = f"{lead.symbol} ~{_fmt_price(lead.spot)}"
-        if lead.spot_is_projected:
-            spot_txt += f" (impl {_future_label(lead.future_symbol)})"
+    post *something* rather than silently swallowing the fire.  Carries
+    the featured symbol's spot + gamma flip + walls + Net GEX and NO
+    link (the link goes out as the threaded reply).  Trimmed with an
+    ellipsis if it somehow overflows (rare — one symbol fits easily)."""
+    parts = [f"${featured.symbol} {label}"]
+    if featured.spot is not None:
+        spot_txt = f"~{_fmt_price(featured.spot)}"
+        if featured.spot_is_projected:
+            spot_txt += f" (impl {_future_label(featured.future_symbol)})"
         parts.append(spot_txt)
-    if lead.gamma_flip is not None:
-        parts.append(f"Flip {_fmt_price(lead.gamma_flip)}")
-    if lead.call_wall is not None and lead.put_wall is not None:
+    if featured.gamma_flip is not None:
+        parts.append(f"Flip {_fmt_price(featured.gamma_flip)}")
+    if featured.call_wall is not None and featured.put_wall is not None:
         parts.append(
-            f"CW {_fmt_price(lead.call_wall)} / PW {_fmt_price(lead.put_wall)}"
+            f"CW {_fmt_price(featured.call_wall)} / PW {_fmt_price(featured.put_wall)}"
         )
-    if lead.net_gex is not None:
-        parts.append(f"Net GEX {_fmt_net_gex(lead.net_gex)}")
-    body = " · ".join(parts)
-    permalink = f"{site_url.rstrip('/')}/live-bulletin"
-    text = f"{body}\n{permalink}"
+    if featured.net_gex is not None:
+        parts.append(f"Net GEX {_fmt_net_gex(featured.net_gex)}")
+    text = " · ".join(parts)
     if len(text) <= 280:
         return text
-    overflow = len(text) - 280
-    trimmed = body[: max(0, len(body) - overflow - 2)].rstrip(" ·,.") + "…"
-    return f"{trimmed}\n{permalink}"
+    return text[:279].rstrip(" ·,.") + "…"
 
 
 # ---------------------------------------------------------------------------
@@ -813,18 +899,23 @@ def post_tweet_via_x_api(
     text: str,
     bearer_token: str,
     media_ids: list[str] | None = None,
+    reply_to: str | None = None,
     timeout_seconds: int = 15,
 ) -> dict[str, Any]:
     """POST to https://api.x.com/2/tweets with optional media IDs.
 
     Mirrors :func:`src.jobs.forecast_tweet.post_tweet_via_x_api` but
     optionally attaches ``media`` when ``media_ids`` is given — the
-    v2 endpoint takes uploaded v1.1 media by ID.
+    v2 endpoint takes uploaded v1.1 media by ID — and threads the tweet
+    under ``reply_to`` (the parent tweet id) when given, which is how the
+    link comment is posted as a reply to the main bulletin.
 
     Uses urllib so we inherit no new third-party dependency."""
     payload: dict[str, Any] = {"text": text}
     if media_ids:
         payload["media"] = {"media_ids": media_ids}
+    if reply_to:
+        payload["reply"] = {"in_reply_to_tweet_id": reply_to}
     req = Request(
         "https://api.x.com/2/tweets",
         data=json.dumps(payload).encode("utf-8"),
@@ -902,6 +993,7 @@ def _write_manifest_and_text(
     bulletins: list[SymbolBulletin],
     state: str = "dry_run",
     posted_id: str | None = None,
+    reply_id: str | None = None,
 ) -> None:
     """Persist a JSON manifest + the raw tweet text next to the media.
 
@@ -912,23 +1004,29 @@ def _write_manifest_and_text(
       * posted  — the tweet was successfully sent to X
 
     Operators need to be able to open one directory and see everything
-    that would have gone out — text, PNG, clip and a small JSON with
-    the level fields sourced from the DB (so a wrong number in the
-    tweet can be traced back to the underlying summary row).  The
-    ``state`` field lets the approve command distinguish drafts that
-    are eligible to POST from ones already sent."""
+    that would have gone out — the main text, the threaded link reply,
+    PNG, clip and a small JSON with the level fields sourced from the DB
+    (so a wrong number in the tweet can be traced back to the underlying
+    summary row).  The ``state`` field lets the approve command
+    distinguish drafts that are eligible to POST from ones already
+    sent."""
     body_path = artifact_dir / "tweet_text.md"
     body_path.write_text(tweet.text + "\n", encoding="utf-8")
     fallback_path = artifact_dir / "tweet_text_fallback.md"
     fallback_path.write_text(tweet.fallback + "\n", encoding="utf-8")
+    reply_path = artifact_dir / "tweet_reply.md"
+    reply_path.write_text(tweet.reply_text + "\n", encoding="utf-8")
 
     manifest = {
         "mode": mode,
         "date": day.isoformat(),
         "state": state,
         "posted_id": posted_id,
+        "reply_id": reply_id,
         "lead_symbol": tweet.lead_symbol,
+        "featured_symbol": tweet.featured_symbol,
         "symbols_present": tweet.symbols_present,
+        "reply_text": tweet.reply_text,
         "text_len": len(tweet.text),
         "fallback_len": len(tweet.fallback),
         "media": {
@@ -1042,6 +1140,7 @@ async def _run(args: argparse.Namespace) -> int:
         bulletins=bulletins,
         site_url=args.site_url,
         lead_symbol=args.lead_symbol.upper(),
+        reply_text=os.environ.get("BULLETIN_TWEET_REPLY_TEXT", "").strip() or None,
     )
 
     artifact_dir = resolve_artifact_dir(args.artifact_dir, args.mode, day)
@@ -1103,6 +1202,7 @@ async def _run(args: argparse.Namespace) -> int:
         _write_manifest_and_text(
             artifact_dir, tweet, media, args.mode, day, bulletins,
             state="posted", posted_id=post_result.get("id"),
+            reply_id=post_result.get("reply_id"),
         )
     return 0
 
@@ -1119,7 +1219,12 @@ def post_bulletin(
     Shared between the direct-post path (``bulletin_tweet --post``) and
     the approve-a-staged-draft path (``bulletin_approve``) so both use
     identical upload + fallback + retry logic.  Returns None on failure
-    so the caller can update the manifest state accordingly."""
+    so the caller can update the manifest state accordingly.
+
+    After the main tweet lands, posts ``tweet.reply_text`` (the
+    ``Free delayed … zerogex.io`` link comment) as a threaded reply.  A
+    failed reply is logged but never fails the call — the main post is
+    already out, and the link is a nice-to-have, not load-bearing."""
     media_ids = _upload_media_files(media)
 
     text_to_post = tweet.text if long else tweet.fallback
@@ -1130,6 +1235,7 @@ def post_bulletin(
         )
         text_to_post = tweet.fallback
 
+    resp: dict[str, Any] | None = None
     try:
         resp = post_tweet_via_x_api(text_to_post, bearer, media_ids=media_ids or None)
     except (HTTPError, URLError) as exc:
@@ -1144,10 +1250,14 @@ def post_bulletin(
                 logger.warning(
                     "bulletin_tweet[%s]: fallback retry also failed (%s)", mode_label, exc2,
                 )
+                return None
         else:
             return None
     except Exception as exc:  # noqa: BLE001
         logger.warning("bulletin_tweet[%s]: unexpected X API error (%s)", mode_label, exc)
+        return None
+
+    if resp is None:
         return None
 
     tweet_id = (resp.get("data") or {}).get("id")
@@ -1155,7 +1265,43 @@ def post_bulletin(
         "bulletin_tweet[%s]: posted tweet id=%s (media=%d)",
         mode_label, tweet_id, len(media_ids),
     )
-    return {"id": tweet_id, "response": resp}
+
+    result: dict[str, Any] = {"id": tweet_id, "response": resp}
+    reply_id = _post_link_reply(tweet, tweet_id, bearer, mode_label)
+    if reply_id is not None:
+        result["reply_id"] = reply_id
+    return result
+
+
+def _post_link_reply(
+    tweet: TweetBody,
+    parent_id: str | None,
+    bearer: str,
+    mode_label: str,
+) -> str | None:
+    """Post the link comment as a threaded reply to ``parent_id``.
+
+    Best-effort: any failure (or a missing parent id / empty reply text)
+    logs and returns None without disturbing the already-posted main
+    tweet."""
+    if not parent_id or not tweet.reply_text:
+        return None
+    try:
+        reply_resp = post_tweet_via_x_api(
+            tweet.reply_text, bearer, reply_to=parent_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — reply is non-load-bearing
+        logger.warning(
+            "bulletin_tweet[%s]: link reply failed (%s) — main tweet still posted",
+            mode_label, exc,
+        )
+        return None
+    reply_id = (reply_resp.get("data") or {}).get("id")
+    logger.info(
+        "bulletin_tweet[%s]: posted link reply id=%s under %s",
+        mode_label, reply_id, parent_id,
+    )
+    return reply_id
 
 
 def _log_approval_required(mode: str, artifact_dir: Path, tweet: TweetBody) -> None:

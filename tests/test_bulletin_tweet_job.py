@@ -76,7 +76,10 @@ def test_fmt_net_gex_scales_by_magnitude():
 # ---------------------------------------------------------------------------
 
 
-def test_build_tweet_body_close_shape():
+def test_build_tweet_body_close_shape(monkeypatch):
+    # Force the deterministic static-template path so the body content is
+    # stable regardless of whether the test host has an API key/network.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     mod = _reload_module()
     bulletins = [
         mod._shape_bulletin(
@@ -99,25 +102,30 @@ def test_build_tweet_body_close_shape():
         lead_symbol="SPX",
     )
 
-    # Header + label
-    assert "$SPY / $SPX / $QQQ post-market update:" in body.text
-    # One block per symbol, in input order, with the expected fields
-    assert "SPY spot: ~744.51" in body.text
+    # SPY's spot sits exactly on its gamma flip → cleanest setup → featured.
+    assert body.featured_symbol == "SPY"
+    assert body.lead_symbol == "SPY"
+    # Header is the single featured cashtag + mode label.
+    assert "$SPY post-market update:" in body.text
+    # The featured symbol's map renders WITHOUT a symbol prefix on the spot line.
+    assert "Current map:" in body.text
+    assert "Spot: ~744.51" in body.text
     assert "Gamma Flip: 744.51" in body.text
     assert "Call Wall: 750" in body.text
     assert "Put Wall: 740" in body.text
     assert "Max Pain: 742" in body.text
     assert "Net GEX: +$72.3M" in body.text
-    assert "SPX spot: ~7,483" in body.text
-    assert "SPX" in body.text and "Net GEX: +$19.50B" in body.text
-    assert "QQQ spot: ~655.40" in body.text
-    assert "Net GEX: −$125.0M" in body.text
-    # Site tagline + hashtag row
-    assert "zerogex.io" in body.text
-    assert "$SPY $SPX $QQQ" in body.text
-    assert "#Gamma" in body.text and "#GEX" in body.text
-    # Present symbols list surfaces to caller for logging
+    # The other two symbols get NO numeric block of their own.
+    assert "SPX spot:" not in body.text
+    assert "QQQ spot:" not in body.text
+    # No site link and no hashtags in the main post.
+    assert "zerogex.io" not in body.text
+    assert "http" not in body.text
+    assert "#" not in body.text
+    # All three still count as present (fetched so the copy can cross-reference).
     assert body.symbols_present == ["SPY", "SPX", "QQQ"]
+    # The link rides in the threaded reply instead.
+    assert body.reply_text == "Free delayed SPY / SPX / QQQ gamma levels: https://zerogex.io"
 
 
 def test_build_tweet_body_labels_per_mode():
@@ -138,14 +146,15 @@ def test_build_tweet_body_labels_per_mode():
         assert expected in body.text, f"mode={mode} missing label"
 
 
-def test_build_tweet_body_elides_symbols_with_no_data():
-    """A symbol whose GEX row didn't resolve gets dropped from the level
-    section but keeps its slot in the header, so the tweet still frames
-    itself as covering the full trio for social parity."""
+def test_build_tweet_body_skips_symbols_with_no_data(monkeypatch):
+    """A symbol whose GEX row didn't resolve is never eligible to be
+    featured and never appears in the post; the symbols that DID resolve
+    are the only featuring candidates and the only ones in symbols_present."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     mod = _reload_module()
     bulletins = [
         mod._shape_bulletin(_summary_row("SPY", spot=744.51), "SPY"),
-        mod._shape_bulletin(None, "SPX"),  # no data
+        mod._shape_bulletin(None, "SPX"),  # no data → cannot be featured
         mod._shape_bulletin(_summary_row("QQQ", spot=655.4), "QQQ"),
     ]
     body = mod.build_tweet_body(
@@ -155,9 +164,9 @@ def test_build_tweet_body_elides_symbols_with_no_data():
         site_url="https://zerogex.io",
         lead_symbol="SPX",
     )
-    # Header keeps all three tickers so the read still frames as trio-wide
-    assert "$SPY / $SPX / $QQQ" in body.text
-    # But the level block for SPX is dropped
+    # The data-less SPX can't be featured and doesn't appear anywhere.
+    assert body.featured_symbol in ("SPY", "QQQ")
+    assert "$SPX" not in body.text
     assert "SPX spot:" not in body.text
     assert body.symbols_present == ["SPY", "QQQ"]
 
@@ -226,7 +235,8 @@ def test_build_tweet_body_lead_variant_deterministic_per_day():
     assert a.text == b.text
 
 
-def test_fallback_tweet_fits_in_280():
+def test_fallback_tweet_fits_in_280(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     mod = _reload_module()
     bulletins = [
         mod._shape_bulletin(_summary_row("SPY", spot=744.51,
@@ -239,8 +249,162 @@ def test_fallback_tweet_fits_in_280():
     body = mod.build_tweet_body("close", date(2026, 7, 3), bulletins,
                                 site_url="https://zerogex.io", lead_symbol="SPY")
     assert len(body.fallback) <= 280
-    assert "SPY" in body.fallback
-    assert "zerogex.io/live-bulletin" in body.fallback
+    # Featured symbol's cashtag leads the fallback body.
+    assert "$SPY" in body.fallback
+    # No link in the body — it rides in the threaded reply now.
+    assert "zerogex.io" not in body.fallback
+    assert "http" not in body.fallback
+
+
+# ---------------------------------------------------------------------------
+# Featured-symbol selection + threaded link reply
+# ---------------------------------------------------------------------------
+
+
+def test_select_featured_symbol_picks_nearest_level():
+    """The symbol whose spot is closest (in %) to a wall/flip wins."""
+    mod = _reload_module()
+    # SPY spot ~7% below its nearest level; QQQ spot right on its put wall.
+    spy = mod._shape_bulletin(
+        _summary_row("SPY", spot=744.51, gamma_flip=800.0, call_wall=820.0,
+                     put_wall=810.0, max_pain=805.0, net_gex=72_300_000.0),
+        "SPY",
+    )
+    qqq = mod._shape_bulletin(
+        _summary_row("QQQ", spot=650.2, gamma_flip=654.0, call_wall=660.0,
+                     put_wall=650.0, max_pain=653.0, net_gex=-125_000_000.0),
+        "QQQ",
+    )
+    featured = mod.select_featured_symbol([spy, qqq])
+    assert featured.symbol == "QQQ"
+
+
+def test_select_featured_symbol_falls_back_when_none_eligible():
+    """With no symbol carrying both a spot and a level, selection falls
+    back to the configured lead symbol if it has any data."""
+    mod = _reload_module()
+    only_spot = mod._shape_bulletin(None, "SPY")
+    only_spot.spot = 744.51  # spot but every level is None
+    only_levels = mod._shape_bulletin(_summary_row("SPX"), "SPX")
+    only_levels.spot = None  # levels but no spot
+    featured = mod.select_featured_symbol([only_spot, only_levels], fallback="SPX")
+    assert featured.symbol == "SPX"
+
+
+def test_reply_text_carries_the_link(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    mod = _reload_module()
+    bulletins = [mod._shape_bulletin(
+        _summary_row("SPY", spot=744.51, gamma_flip=744.51), "SPY")]
+    body = mod.build_tweet_body("midday", date(2026, 7, 3), bulletins,
+                                site_url="https://zerogex.io/", lead_symbol="SPY")
+    # Trailing slash on the site URL is trimmed.
+    assert body.reply_text == (
+        "Free delayed SPY / SPX / QQQ gamma levels: https://zerogex.io"
+    )
+
+
+def test_reply_text_env_override(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    mod = _reload_module()
+    bulletins = [mod._shape_bulletin(
+        _summary_row("SPY", spot=744.51, gamma_flip=744.51), "SPY")]
+    body = mod.build_tweet_body("midday", date(2026, 7, 3), bulletins,
+                                site_url="https://zerogex.io", lead_symbol="SPY",
+                                reply_text="Custom reply — zerogex.io")
+    assert body.reply_text == "Custom reply — zerogex.io"
+
+
+def test_post_bulletin_posts_main_then_link_reply(monkeypatch):
+    """post_bulletin posts the main tweet, then threads the link comment
+    as a reply to the returned tweet id."""
+    mod = _reload_module()
+    calls: list[dict] = []
+
+    def _fake_post(text, bearer, media_ids=None, reply_to=None, timeout_seconds=15):
+        calls.append({"text": text, "reply_to": reply_to})
+        tid = "main-123" if reply_to is None else "reply-456"
+        return {"data": {"id": tid}}
+
+    monkeypatch.setattr(mod, "post_tweet_via_x_api", _fake_post)
+    monkeypatch.setattr(mod, "_upload_media_files", lambda media: [])
+
+    tweet = mod.TweetBody(
+        text="$SPY midday update:\n\nbody",
+        fallback="$SPY midday",
+        lead_symbol="SPY",
+        symbols_present=["SPY"],
+        reply_text="Free delayed SPY / SPX / QQQ gamma levels: https://zerogex.io",
+        featured_symbol="SPY",
+    )
+    result = mod.post_bulletin(tweet, mod.MediaArtifacts(), bearer="tok",
+                               long=True, mode_label="midday")
+    assert result["id"] == "main-123"
+    assert result["reply_id"] == "reply-456"
+    # Two posts: main (reply_to None) then the link reply (reply_to = main id).
+    assert len(calls) == 2
+    assert calls[0]["reply_to"] is None
+    assert calls[1]["reply_to"] == "main-123"
+    assert calls[1]["text"].startswith("Free delayed SPY / SPX / QQQ gamma levels:")
+
+
+def test_post_bulletin_survives_failed_reply(monkeypatch):
+    """A failing link reply doesn't fail the whole post — the main tweet
+    id is still returned."""
+    mod = _reload_module()
+
+    def _fake_post(text, bearer, media_ids=None, reply_to=None, timeout_seconds=15):
+        if reply_to is not None:
+            raise RuntimeError("reply rejected")
+        return {"data": {"id": "main-789"}}
+
+    monkeypatch.setattr(mod, "post_tweet_via_x_api", _fake_post)
+    monkeypatch.setattr(mod, "_upload_media_files", lambda media: [])
+
+    tweet = mod.TweetBody(
+        text="body", fallback="body", lead_symbol="SPY", symbols_present=["SPY"],
+        reply_text="link", featured_symbol="SPY",
+    )
+    result = mod.post_bulletin(tweet, mod.MediaArtifacts(), bearer="tok",
+                               long=True, mode_label="midday")
+    assert result["id"] == "main-789"
+    assert "reply_id" not in result
+
+
+@pytest.mark.asyncio
+async def test_dry_run_persists_reply_artifact(tmp_path, monkeypatch):
+    """A dry-run writes tweet_reply.md and records the reply text +
+    featured symbol in the manifest so the operator can inspect them."""
+    mod = _reload_module()
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    db_instance = MagicMock()
+    db_instance.connect = AsyncMock()
+    db_instance.disconnect = AsyncMock()
+    db_instance.get_latest_gex_summary = AsyncMock(
+        side_effect=lambda symbol: _summary_row(symbol),
+    )
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: db_instance)
+    monkeypatch.setattr(mod, "render_bulletin_png", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "render_replay_clip", lambda *a, **k: None)
+    monkeypatch.delenv("X_BOT_BEARER_TOKEN", raising=False)
+
+    args = mod._parse_args([
+        "--mode", "close", "--date", "2026-07-06",
+        "--artifact-dir", str(tmp_path), "--allow-non-trading-day",
+    ])
+    rc = await mod._run(args)
+    assert rc == 0
+
+    day_dir = tmp_path / "close" / "2026-07-06"
+    reply_md = day_dir / "tweet_reply.md"
+    assert reply_md.exists()
+    assert "zerogex.io" in reply_md.read_text()
+    manifest = json.loads((day_dir / "manifest.json").read_text())
+    assert manifest["featured_symbol"]
+    assert manifest["reply_text"].startswith(
+        "Free delayed SPY / SPX / QQQ gamma levels:",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -508,14 +672,14 @@ def test_build_tweet_body_falls_back_to_template_without_api_key(monkeypatch):
     ]
     body = mod.build_tweet_body("close", date(2026, 7, 3), bulletins,
                                 site_url="https://zerogex.io", lead_symbol="SPX")
-    # Static template = the deterministic lead sentence + no LLM-specific
-    # "The clean read:" phrasing.
+    # Static template = the deterministic lead sentence + the featured
+    # symbol's numeric map, no LLM-specific phrasing.
     assert "post-market update:" in body.text
-    assert "Current ZeroGEX read:" in body.text
-    # And the static template's site-tag row is still there
-    assert body.text.rstrip().endswith(
-        "$SPY $SPX $QQQ #Gamma #GEX #OptionsTrading #0DTE",
-    )
+    assert "Current map:" in body.text
+    # The static template no longer appends a site link or a hashtag row.
+    assert "#Gamma" not in body.text
+    assert "zerogex.io" not in body.text
+    assert "http" not in body.text
 
 
 def test_build_tweet_body_uses_llm_when_generator_returns_section(monkeypatch):
@@ -557,17 +721,21 @@ def test_build_tweet_body_uses_llm_when_generator_returns_section(monkeypatch):
     body = mod.build_tweet_body("close", date(2026, 7, 3), bulletins,
                                 site_url="https://zerogex.io", lead_symbol="SPX")
 
+    # SPY sits on its gamma flip → it's the featured symbol.
+    assert body.featured_symbol == "SPY"
     # The LLM's narrative shows up verbatim
     assert "Interesting close into the holiday." in body.text
     assert "The clean read:" in body.text
     assert "Happy 250th, America." in body.text
-    # But the numeric block is still the deterministic Python-composed one
-    assert "SPY spot: ~744.51" in body.text
+    # But the numeric map is still the deterministic Python-composed one,
+    # rendered prefix-less under the featured header.
+    assert "Current map:" in body.text
+    assert "Spot: ~744.51" in body.text
     assert "Net GEX: +$72.3M" in body.text
-    # And the hashtag row still terminates the post
-    assert body.text.rstrip().endswith(
-        "$SPY $SPX $QQQ #Gamma #GEX #OptionsTrading #0DTE",
-    )
+    # No hashtag row / link — the post ends on the LLM's signoff.
+    assert "#Gamma" not in body.text
+    assert "zerogex.io" not in body.text
+    assert body.text.rstrip().endswith("Happy 250th, America. 🇺🇸")
 
 
 def test_llm_section_falls_back_when_generator_returns_none(monkeypatch):

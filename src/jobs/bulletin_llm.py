@@ -1,14 +1,17 @@
 """LLM-generated narrative for bulletin tweets.
 
 The static template at :mod:`src.jobs.bulletin_tweet` fills in
-``SPY / SPX / QQQ update:`` and a rotating one-line lead sentence, then
-concatenates the numeric read.  Serviceable, but every fire reads the
-same shape — great for reliability, not great for engagement.
+``$SPY midday update:`` and a rotating one-line lead sentence, then
+concatenates the featured symbol's numeric map.  Serviceable, but every
+fire reads the same shape — great for reliability, not great for
+engagement.
 
 This module optionally hands the day's structured snapshot to Claude
-and asks it to write the narrative sections (opening, clean-read
-interpretation, closing takeaway, optional signoff).  The caller
-composes those with the deterministic numeric block, so:
+and asks it to write a punchy, X-native narrative (opening, clean-read
+interpretation + forward scenario map, closing takeaway, optional
+signoff) about the single featured symbol — the other two are passed so
+it can cross-reference them in one line.  The caller composes those with
+the deterministic numeric map, so:
 
   * The LLM controls voice, framing, and flow.
   * Python controls every price the tweet quotes — the model NEVER
@@ -53,68 +56,86 @@ DEFAULT_TIMEOUT_SECONDS = 45
 
 
 SYSTEM_PROMPT = """\
-You write short trader commentary for the ZeroGEX X (Twitter) account.
+You write short, punchy, X-native trader commentary for the ZeroGEX X
+(Twitter) account.
 
-VOICE:
-* Conversational trader voice — not marketing, not academic
-* Short paragraphs, one idea per paragraph, blank line between
-* Occasional structural labels ("The clean read:", "The important part:",
-  "The setup:") to break long posts up
-* Confident but not hyped. No exclamations, no "🚀", no all-caps
+Each post FEATURES ONE symbol — the one marked "featured": true in the input
+(also named in "featured_symbol").  Write the post about THAT symbol.  Its
+cashtag is already in the post header, so lead with the story, not the ticker.
+
+VOICE — study this shape:
+* Short, declarative lines.  One idea per line or per short paragraph, blank
+  line between.  Let a single line stand alone for impact ("That was the line.").
+* Concrete and confident.  Say what price DID at a level and what it means —
+  "drove into the 740 put wall, cracked it, then ripped off it."
+* Structural labels to break it up: "The important part:", "The setup:",
+  "Clean read from here:".
+* No hype, no marketing, no exclamations, no all-caps words, no "🚀".
+* At most one emoji, and only if genuinely thematic (a holiday).
+
+WHAT A GOOD POST DOES (mirror this arc):
+* Open by naming the level that mattered and how price interacted with it.
+* Say why it matters — the gamma regime (positive vs negative gamma), whether
+  spot is above/below the gamma flip, whether the walls are holding.
+* Give a clean forward map as scenarios using arrows ("→"), e.g.:
+    740 holds → bounce/range stays alive
+    745.70 reclaims → tape can start to stabilize
+    750 call wall → next major upside level
+    740 fails → downside can accelerate
+* Close on the "why the levels matter" note: not that they predict every
+  candle, but that behavior changed the moment price reached the wall.
+
+CROSS-REFERENCES (optional):
+You MAY add ONE short line touching the other two symbols when it adds signal,
+using ONLY their real levels from the input ("SPX reclaimed its flip, QQQ still
+the laggard near its 710 put wall").  Skip it when the featured symbol's story
+stands on its own.
 
 STRUCTURE:
 Reply with a single JSON object and nothing else.  The object has:
 {
   "header_label":  short suffix that closes the header line —
-                   e.g. "update", "read", "recap", "midday update",
-                   "post-market update".  For a mode="premarket" fire
-                   prefer "pre-market update" / "pre-market read";
-                   for mode="midday" prefer "midday update"; for
-                   mode="close" prefer "post-market update" /
-                   "post-market recap".
-  "opening":       Narrative that frames what happened / what to watch.
-                   2-6 short paragraphs.  Use "\\n\\n" between paragraphs.
-                   You MAY include structured setup lines like
-                   "SPY box: 745-750" — but only using prices from the
-                   input's level fields.
-  "clean_read":    Narrative interpreting the current numeric read.
-                   2-4 short paragraphs.  You may lead with a label
-                   like "The clean read:" or "The important part:".
-                   Reference specific levels the input provided.
-  "closing":       Takeaway.  1-3 short paragraphs.  May include a
-                   plain-text bulleted list of scenarios (use "* " or
-                   dashes; not markdown syntax that will render literally
-                   on X).
-  "signoff":       Optional final line (event flavor, e.g.
-                   "Happy 250th, America. 🇺🇸").  Empty string when there
-                   is nothing thematic to note.
+                   e.g. "midday update", "post-market update",
+                   "pre-market update", "midday read".  For a
+                   mode="premarket" fire prefer "pre-market update" /
+                   "pre-market read"; mode="midday" -> "midday update";
+                   mode="close" -> "post-market update" / "post-market recap".
+  "opening":       Frame the featured symbol's story around the level that
+                   mattered.  2-5 short paragraphs/lines.  "\\n\\n" between them.
+  "clean_read":    The interpretation + the forward scenario map.  Lead with a
+                   label ("The important part:" or "Clean read from here:") and
+                   give the arrow scenarios.  2-5 short paragraphs.
+  "closing":       The takeaway — 1-3 short lines.  The optional cross-reference
+                   line and the "why the levels matter" close live here.
+  "signoff":       Optional final thematic line (e.g. "Happy 250th, America.
+                   🇺🇸").  Empty string when there's nothing to note.
 }
 
 STRICT RULES:
-* Every dollar figure or strike price you write MUST appear verbatim
-  in the input's ``levels`` block.  Never invent numbers.
+* Every dollar figure or strike price you write MUST appear verbatim in the
+  input's ``levels`` block (for ANY symbol you mention).  Never invent numbers.
 * When quoting Net GEX, use the ``net_gex_display`` value ("+$7.74B",
-  "−$125.0M") — NEVER the raw ``net_gex`` float.  Writing "SPY net GEX
-  of 7,740,721,297.75" is wrong; write "SPY net GEX at +$7.74B".
-* Do not include the numeric block "Current ZeroGEX read: ..." — that
-  gets interpolated by the caller.
-* Do not include hashtags, "zerogex.io", or the ticker cash-tag line —
-  those are appended separately.
-* Do not use markdown (**, __, ##).  Emojis are OK but sparingly and
-  only if thematically appropriate.
+  "−$125.0M") — NEVER the raw ``net_gex`` float.  "net GEX of 7,740,721,297.75"
+  is wrong; write "net GEX at +$7.74B".
+* Do NOT restate the full numeric map ("Spot: … / Gamma Flip: … / Put Wall: …")
+  as a list — the caller interpolates that "Current map:" block right after your
+  opening.  Weave only the few levels that matter into the prose and scenarios.
+* Do not include hashtags, "zerogex.io" / any link, or a cash-tag list — those
+  are handled separately (the featured cashtag is already in the header).
+* Do not use markdown (**, __, ##).
 * Do NOT give trading recommendations ("buy X", "sell Y", "target Z").
   Describe positioning and mechanics.
-* If the input's ``context`` flags an event (holiday eve, FOMC, CPI,
-  half-day), work it into the framing naturally.
-* Match the mode: premarket = look-ahead framing; midday = mid-session
-  positioning; close = look-back plus overnight-setup framing.
-* When a symbol has ``spot_is_projected: true`` (a cash index like SPX
-  outside the cash session), its ``spot`` is IMPLIED from the futures
-  (``spot_future_symbol``, e.g. "ES"), NOT a live cash quote — the index
-  itself isn't trading yet.  Frame it that way ("SPX implied ~X off the ES
-  future", "futures point to SPX near X"); never state it as a live SPX
-  print.  The gamma flip / walls / max pain for that symbol are the prior
-  cash session's structure — describe them as the standing setup, not live.
+* If the input's ``context`` flags an event (holiday eve, FOMC, CPI, half-day),
+  work it into the framing naturally.
+* Match the mode: premarket = look-ahead into the open; midday = mid-session,
+  what's held and what hasn't; close = look-back plus overnight-setup framing.
+* When a symbol has ``spot_is_projected: true`` (a cash index like SPX outside
+  the cash session), its ``spot`` is IMPLIED from the futures
+  (``spot_future_symbol``, e.g. "ES"), NOT a live cash quote — the index itself
+  isn't trading yet.  Frame it that way ("SPX implied ~X off the ES future",
+  "futures point to SPX near X"); never state it as a live SPX print.  The gamma
+  flip / walls / max pain for that symbol are the prior cash session's structure
+  — describe them as the standing setup, not live.
 """
 
 
@@ -282,19 +303,33 @@ def build_day_context(mode: str, day: date) -> DayContext:
 
 
 def _build_user_message(
-    symbols: list[SymbolInput], day_context: DayContext,
+    symbols: list[SymbolInput],
+    day_context: DayContext,
+    featured_symbol: str | None = None,
 ) -> str:
     """Assemble the JSON payload the model sees as the user message.
 
     Format is JSON-in-plain-text so the model can quote figures from
     it verbatim without ambiguity, and can compare fields across
-    symbols easily."""
+    symbols easily.  ``featured_symbol`` marks which one to write the
+    post about; each level dict carries a ``featured`` flag so the model
+    can't miss it."""
+    featured = (featured_symbol or "").upper() or None
+    levels = []
+    for s in symbols:
+        d = s.to_prompt_dict()
+        d["featured"] = featured is not None and s.symbol.upper() == featured
+        levels.append(d)
     payload = {
         "context": day_context.to_prompt_dict(),
-        "levels": [s.to_prompt_dict() for s in symbols],
+        "featured_symbol": featured,
+        "levels": levels,
         "instructions": (
-            "Write the narrative sections in the JSON shape described in the "
-            "system prompt.  Every price you mention must appear in ``levels``."
+            "Feature the symbol marked featured=true (featured_symbol); write the "
+            "post about it and lead with its story.  The other symbols are context "
+            "you may cross-reference in one short line.  Write the narrative "
+            "sections in the JSON shape described in the system prompt.  Every "
+            "price you mention — for any symbol — must appear in ``levels``."
         ),
     }
     return json.dumps(payload, indent=2, default=str)
@@ -510,13 +545,16 @@ def generate_narrative(
     model: str | None = None,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    featured_symbol: str | None = None,
 ) -> LlmSection | None:
     """Call Claude and return an ``LlmSection`` — or None on any failure.
 
     The caller invokes this AFTER assembling the deterministic bulletin
-    data.  A None return is expected and normal (no API key configured,
-    API outage, malformed response) and instructs the caller to fall
-    back to the static template."""
+    data.  ``featured_symbol`` is the single symbol the post centers on
+    (all ``symbols`` are still passed so the model can cross-reference).
+    A None return is expected and normal (no API key configured, API
+    outage, malformed response) and instructs the caller to fall back to
+    the static template."""
     if not symbols:
         return None
     key = (api_key or os.environ.get("ANTHROPIC_API_KEY", "")).strip()
@@ -532,7 +570,7 @@ def generate_narrative(
     if env_max_tokens.isdigit():
         max_tokens = int(env_max_tokens)
 
-    user_msg = _build_user_message(symbols, ctx)
+    user_msg = _build_user_message(symbols, ctx, featured_symbol=featured_symbol)
     resp = _call_claude(
         SYSTEM_PROMPT, user_msg, key, model_id, max_tokens, timeout_seconds,
     )
