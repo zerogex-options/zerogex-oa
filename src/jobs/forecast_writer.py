@@ -251,6 +251,18 @@ async def _gather_inputs(db: DatabaseManager, symbol: str) -> Optional[ForecastI
     def _tick(value: Any) -> str:
         return "✓" if value is not None and value != [] else "✗"
 
+    # Calibration label: cold when no receipts yet corrected the raw v1.2
+    # output; warm(n=X,band=Y.YY) once Layer 2 is actively applying
+    # non-neutral scalars.  Neutral state is treated as cold — a ✓ was
+    # misleading because get_forecast_calibration never returns None.
+    n_receipts = int((calibration_payload or {}).get("n_receipts_used", 0) or 0)
+    band = float((calibration_payload or {}).get("band_width_mult", 1.0) or 1.0)
+    calib_label = (
+        f"warm(n={n_receipts},band={band:.2f})"
+        if n_receipts >= 15
+        else "cold"
+    )
+
     logger.info(
         "forecast_writer: %s signals — walls=%s pcr=%s msi=%s "
         "%s=%s vix_z=%s iv_rank=%s atr=%s nodes=%d skew=%s "
@@ -266,7 +278,7 @@ async def _gather_inputs(db: DatabaseManager, symbol: str) -> Optional[ForecastI
         _tick(inputs.atr_5d),
         len(inputs.top_gamma_nodes),
         _tick(inputs.skew_delta),
-        _tick(inputs.calibration) if calibration_payload else "cold",
+        calib_label,
         _tick(inputs.flagship_setup),
         inputs.is_opex_friday, inputs.is_vix_expiration,
         inputs.is_post_opex_monday, inputs.is_event_day,
