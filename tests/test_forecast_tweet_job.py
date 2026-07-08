@@ -225,6 +225,54 @@ async def test_requires_post_flag_even_with_token(monkeypatch, caplog):
 
 
 @pytest.mark.asyncio
+async def test_morning_post_is_idempotent_per_day(monkeypatch, tmp_path):
+    """A second live fire for a (mode, symbol, day) already posted must NOT
+    re-post — the guard against a systemd Persistent= catch-up double-post.
+    --force overrides it."""
+    mod = _reload_module()
+
+    class _FakeDB:
+        async def connect(self):
+            return None
+
+        async def disconnect(self):
+            return None
+
+        async def get_daily_forecast(self, symbol, forecast_date):
+            return _morning_row()
+
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: _FakeDB())
+    monkeypatch.setenv("X_BOT_BEARER_TOKEN", "fake-token")
+    monkeypatch.setenv("FORECAST_TWEET_STATE_DIR", str(tmp_path))
+
+    calls = {"n": 0}
+
+    def _fake_post(text, bearer, **kw):
+        calls["n"] += 1
+        return {"data": {"id": f"tid-{calls['n']}"}}
+
+    monkeypatch.setattr(mod, "post_tweet_via_x_api", _fake_post)
+
+    def _args(*extra):
+        return mod._parse_args(
+            ["--mode", "morning", "--symbol", "SPY", "--date", "2026-07-01", "--post", *extra]
+        )
+
+    # First fire posts and records the marker.
+    assert await mod._run(_args()) == 0
+    assert calls["n"] == 1
+    assert (tmp_path / "morning-SPY-2026-07-01.json").is_file()
+
+    # Second fire (catch-up / manual re-run) is a no-op — no duplicate.
+    assert await mod._run(_args()) == 0
+    assert calls["n"] == 1
+
+    # --force overrides the guard and reposts.
+    assert await mod._run(_args("--force")) == 0
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
 async def test_swallows_db_failure(monkeypatch, caplog):
     mod = _reload_module()
 
