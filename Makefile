@@ -3005,6 +3005,14 @@ db-prune-legacy: ## Drop obsolete legacy refresh/materialized-view artifacts
 psql: ## Open PostgreSQL shell
 	@$(PSQL)
 
+.PHONY: tradeworkz-check
+tradeworkz-check: ## Run TradeWorkz accounting invariants (on-demand DB audit)
+	@echo "$(BLUE)=== TradeWorkz invariants ===$(NC)"
+	@echo "Each check should return 0 rows on a healthy engine."
+	@echo "Any rows below are drift — investigate."
+	@echo ""
+	@$(PSQL) -f setup/database/diagnostics/tradeworkz_invariants.sql
+
 .PHONY: query
 query: ## Run custom query (use: make query SQL="SELECT * FROM ...")
 	@$(PSQL) -c "$(SQL)"
