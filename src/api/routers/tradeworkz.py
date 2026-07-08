@@ -1311,12 +1311,20 @@ async def internal_mark_notification(
     if status not in ("sent", "failed"):
         raise HTTPException(status_code=400, detail="status must be 'sent' or 'failed'")
     async with db.pool.acquire() as conn:
+        # ``$1`` must be cast to text in BOTH uses. Postgres infers the
+        # parameter's type from every occurrence: ``status = $1`` deduces
+        # ``character varying`` (the column type) while ``$1 = 'sent'``
+        # deduces ``text`` (the untyped literal), and the two are reported
+        # as inconsistent (AmbiguousParameterError). This 500'd every
+        # mark-notification call, so the delivery worker could never flip a
+        # row out of ``queued`` — it re-sent the same email every cycle.
+        # Pinning both uses to ``$1::text`` gives the parameter one type.
         result = await conn.execute(
             """
             UPDATE tw_notifications_log
-            SET status = $1,
+            SET status = $1::text,
                 error = $2,
-                sent_at = CASE WHEN $1 = 'sent' THEN NOW() ELSE sent_at END
+                sent_at = CASE WHEN $1::text = 'sent' THEN NOW() ELSE sent_at END
             WHERE id = $3
             """,
             status, error, row_id,
