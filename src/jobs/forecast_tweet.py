@@ -30,7 +30,8 @@ import json
 import logging
 import os
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -44,6 +45,56 @@ ET = ZoneInfo("America/New_York")
 
 DEFAULT_SITE_URL = "https://zerogex.io"
 TWEET_MAX_LEN = 280
+
+# Idempotency marker directory — one file per (mode, symbol, date) recording a
+# successful live post.  Guards against a duplicate tweet when the job re-runs
+# for a day it already posted (systemd Persistent= catch-up, a manual re-run,
+# or downtime recovery).  Mirrors the bulletin-tweets state dir convention;
+# override with FORECAST_TWEET_STATE_DIR.  Best-effort: if the dir can't be
+# written the guard fails OPEN (posts proceed) — better a rare duplicate than a
+# silently-never-posted forecast.
+DEFAULT_TWEET_STATE_DIR = "/var/lib/zerogex-oa/forecast-tweets"
+
+
+def _tweet_state_dir() -> Path:
+    override = os.environ.get("FORECAST_TWEET_STATE_DIR", "").strip()
+    return Path(override) if override else Path(DEFAULT_TWEET_STATE_DIR)
+
+
+def _posted_marker_path(mode: str, symbol: str, day: date) -> Path:
+    return _tweet_state_dir() / f"{mode}-{symbol.upper()}-{day.isoformat()}.json"
+
+
+def _already_posted(mode: str, symbol: str, day: date) -> Optional[dict[str, Any]]:
+    """Return the recorded post marker for (mode, symbol, day), or None.
+
+    Read-only — never creates the state dir.  Any read error is treated as
+    'not posted' so a corrupt/unreadable marker never blocks a post."""
+    path = _posted_marker_path(mode, symbol, day)
+    try:
+        if not path.is_file():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — fail open
+        return None
+
+
+def _record_posted(mode: str, symbol: str, day: date, tweet_id: Optional[str]) -> None:
+    """Persist a marker after a successful live post.  Best-effort: a write
+    failure (unwritable dir, race) logs at DEBUG and is otherwise ignored."""
+    path = _posted_marker_path(mode, symbol, day)
+    payload = {
+        "mode": mode,
+        "symbol": symbol.upper(),
+        "date": day.isoformat(),
+        "tweet_id": tweet_id,
+        "posted_at": datetime.now(tz=timezone.utc).isoformat(),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 — best-effort; don't fail the run
+        logger.debug("forecast_tweet: could not record post marker %s (%s)", path, exc)
 
 
 def _today_et() -> date:
@@ -232,6 +283,20 @@ async def _tweet_one(
         )
         return
 
+    # Idempotency: don't re-post a (mode, symbol, day) we've already tweeted.
+    # This is the guard against a systemd Persistent= catch-up / manual re-run
+    # firing a duplicate live tweet.  --force overrides for an intentional repost.
+    if not getattr(args, "force", False):
+        prior = _already_posted(args.mode, symbol, day)
+        if prior is not None:
+            logger.info(
+                "forecast_tweet[%s]: %s %s already posted (id=%s at %s) — skipping "
+                "(use --force to repost)",
+                args.mode, symbol, day.isoformat(),
+                prior.get("tweet_id"), prior.get("posted_at"),
+            )
+            return
+
     try:
         resp = post_tweet_via_x_api(tweet_text, bearer)
     except (HTTPError, URLError) as exc:
@@ -248,6 +313,7 @@ async def _tweet_one(
         return
 
     tweet_id = (resp.get("data") or {}).get("id")
+    _record_posted(args.mode, symbol, day, tweet_id)
     logger.info(
         "forecast_tweet[%s]: posted tweet id=%s for %s %s",
         args.mode, tweet_id, symbol, day.isoformat(),
@@ -328,6 +394,12 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--allow-non-trading-day",
         action="store_true",
         help="Override the weekend/holiday skip — useful for backfill / testing.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Repost even if a (mode, symbol, date) tweet was already posted "
+        "(bypasses the idempotency guard).",
     )
     return parser.parse_args(argv)
 
