@@ -382,19 +382,44 @@ def test_resolve_artifact_dir_honors_explicit_override(tmp_path, monkeypatch):
 def test_resolve_artifact_dir_falls_back_to_home(tmp_path, monkeypatch):
     mod = _reload_module()
     monkeypatch.delenv("BULLETIN_TWEET_ARTIFACT_DIR", raising=False)
+    # Neutralize the /var/lib production primary so this test deterministically
+    # exercises the XDG/HOME fallback regardless of the host's real /var/lib
+    # state. (It used to depend on that un-controlled path: on a box where the
+    # live bulletin job had created a non-writable premarket/<date> dir mid-run,
+    # resolve_artifact_dir fell through to a /tmp tempdir and the assertion —
+    # which only allowed xdg/home/var-lib prefixes — failed. Passing in
+    # isolation but failing in the full suite was exactly that timing window.)
+    # Point the primary under a regular file so mkdir raises NotADirectoryError
+    # (an OSError) and the candidate is skipped.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    monkeypatch.setattr(mod, "PRIMARY_ARTIFACT_ROOT", blocker / "var-lib")
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    # No explicit, no env — the primary /var/lib path is unwritable
-    # inside the test sandbox, so we should get an XDG-rooted path.
+
     out = mod.resolve_artifact_dir(None, "premarket", date(2026, 7, 3))
     assert out.exists()
-    # Should be under one of the fallbacks; either xdg or home is fine.
+    # With the primary blocked and XDG writable, the XDG root wins
+    # deterministically (XDG precedes HOME in the candidate order).
     resolved = str(out)
-    assert (
-        str(tmp_path / "xdg") in resolved
-        or str(tmp_path / "home") in resolved
-        or resolved.startswith("/var/lib")  # if the CI runner happens to allow it
-    )
+    assert str(tmp_path / "xdg") in resolved or str(tmp_path / "home") in resolved
+    assert out.parts[-2:] == ("premarket", "2026-07-03")
+
+
+def test_resolve_artifact_dir_tempdir_when_all_roots_unwritable(tmp_path, monkeypatch):
+    """Every candidate unavailable -> a fresh tempdir, never an exception."""
+    mod = _reload_module()
+    monkeypatch.delenv("BULLETIN_TWEET_ARTIFACT_DIR", raising=False)
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    monkeypatch.setattr(mod, "PRIMARY_ARTIFACT_ROOT", blocker / "var-lib")
+    # Route XDG and HOME under the same file so their mkdir also fails.
+    monkeypatch.setenv("XDG_STATE_HOME", str(blocker / "xdg"))
+    monkeypatch.setenv("HOME", str(blocker / "home"))
+
+    out = mod.resolve_artifact_dir(None, "premarket", date(2026, 7, 3))
+    assert out.exists()
+    assert out.is_dir()
 
 
 # ---------------------------------------------------------------------------
