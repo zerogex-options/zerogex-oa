@@ -795,7 +795,41 @@ async def admin_simulate(
 async def admin_simulate_clear(
     body: Dict[str, Any] = Body(default_factory=dict),
 ) -> Dict[str, Any]:
-    """Wipe all synthesized (and real) trade history back to a clean fleet."""
+    """DEPRECATED alias for /admin/reset-fleet — clears sim AND live rows.
+
+    Kept for backward-compat with the existing "Clear" admin button.
+    Prefer POST /admin/reset-fleet for new call-sites; the semantics are
+    identical.
+    """
+    from src.database import db_connection
+    from src.tradeworkz.simulate import clear
+
+    bot_ids = body.get("bot_ids")
+    if bot_ids is not None and not isinstance(bot_ids, list):
+        raise HTTPException(status_code=400, detail="bot_ids must be a list of strings")
+    with db_connection() as conn:
+        return clear(conn, bot_ids=bot_ids)
+
+
+@router.post(
+    "/admin/reset-fleet",
+    dependencies=[Depends(require_scopes(SIGNALS))],
+)
+async def admin_reset_fleet(
+    body: Dict[str, Any] = Body(default_factory=dict),
+) -> Dict[str, Any]:
+    """Full fleet reset: wipe every trade / position / notification / equity
+    row and reset every sleeve to its starting_capital.
+
+    Use this after a P&L math bug, an accidental seeding run, or any time
+    the leaderboard is showing state you don't trust. The response
+    includes per-table deletion counts so you can eyeball that something
+    was actually cleared (useful when the leaderboard doesn't visibly
+    change because everything summed to zero anyway).
+
+    Body (optional):
+        bot_ids: list of bot ids to reset. Omit to reset the full fleet.
+    """
     from src.database import db_connection
     from src.tradeworkz.simulate import clear
 

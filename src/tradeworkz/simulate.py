@@ -208,20 +208,31 @@ def _sample_trade(
     }
 
 
-def _wipe_bot_history(conn: Any, bot_ids: List[str]) -> None:
-    """Delete simulated (and any real) history for the given bots.
+def _wipe_bot_history(conn: Any, bot_ids: List[str]) -> Dict[str, int]:
+    """Delete simulated AND live history for the given bots.
 
-    We wipe rather than dedupe because simulation is a re-computable view;
-    real trades from live ticks are indistinguishable at this level and if
-    the user is calling simulate they're accepting that.
+    Returns a per-table count of rows deleted so the admin surface can
+    show exactly what was wiped (useful when an operator wants to know
+    "did that clear actually do anything?"). We wipe both sim and live
+    rows in one pass — a caller invoking this is asking for a full reset
+    to the starting sleeve, not a selective purge; if we ever want
+    "delete only sim rows," add a separate helper that filters on
+    ``components_at_entry->>'origin' = 'simulate'``.
     """
     cur = conn.cursor()
-    cur.execute("DELETE FROM tw_notifications_log WHERE bot_id = ANY(%s)", (bot_ids,))
-    cur.execute("DELETE FROM tw_trades WHERE bot_id = ANY(%s)", (bot_ids,))
-    cur.execute("DELETE FROM tw_positions WHERE bot_id = ANY(%s)", (bot_ids,))
-    cur.execute("DELETE FROM tw_equity_curve_daily WHERE bot_id = ANY(%s)", (bot_ids,))
-    cur.execute("DELETE FROM tw_bot_metrics_daily WHERE bot_id = ANY(%s)", (bot_ids,))
-    cur.execute("DELETE FROM tw_ml_state WHERE bot_id = ANY(%s)", (bot_ids,))
+    tables = [
+        "tw_notifications_log",
+        "tw_trades",
+        "tw_positions",
+        "tw_equity_curve_daily",
+        "tw_bot_metrics_daily",
+        "tw_ml_state",
+    ]
+    deleted: Dict[str, int] = {}
+    for table in tables:
+        cur.execute(f"DELETE FROM {table} WHERE bot_id = ANY(%s)", (bot_ids,))
+        deleted[table] = cur.rowcount if cur.rowcount is not None else 0
+    return deleted
 
 
 def simulate(
@@ -450,10 +461,17 @@ def simulate(
 
 
 def clear(conn: Any, bot_ids: Optional[List[str]] = None) -> Dict[str, Any]:
-    """Wipe all simulated (and any real) history from the tw_ tables.
+    """Wipe ALL history (sim + live) and reset every sleeve to starting_capital.
 
-    Also resets each bot's capital sleeve back to its starting value so
-    the leaderboard returns to a clean pre-trade state.
+    Full fleet reset. After this returns, every bot in ``bot_ids`` (or
+    every bot if ``bot_ids`` is None) is at Day Zero: no trades, no
+    positions, no notifications, no equity/metrics, no ML state, and
+    capital = starting_capital. Live ticks resume immediately if the
+    engine is running — the sleeve just starts from scratch.
+
+    The response includes per-table deletion counts so callers can see
+    exactly what was removed. This is the endpoint you hit after a
+    P&L math bug corrupts the sleeve with bogus wins.
     """
     cur = conn.cursor()
     if bot_ids is None:
@@ -461,7 +479,7 @@ def clear(conn: Any, bot_ids: Optional[List[str]] = None) -> Dict[str, Any]:
         bot_ids = [row[0] for row in cur.fetchall()]
     if not bot_ids:
         return {"status": "no-op", "reason": "no bots to clear"}
-    _wipe_bot_history(conn, bot_ids)
+    deleted = _wipe_bot_history(conn, bot_ids)
     cur.execute(
         """
         UPDATE tw_bot_capital
@@ -472,4 +490,10 @@ def clear(conn: Any, bot_ids: Optional[List[str]] = None) -> Dict[str, Any]:
         """,
         (bot_ids,),
     )
-    return {"status": "ok", "cleared": bot_ids}
+    sleeves_reset = cur.rowcount if cur.rowcount is not None else 0
+    return {
+        "status": "ok",
+        "cleared": bot_ids,
+        "deleted_rows": deleted,
+        "sleeves_reset": sleeves_reset,
+    }
