@@ -50,3 +50,15 @@ _PINNED_DEFAULTS = {
 
 for _key, _default in _PINNED_DEFAULTS.items():
     os.environ[_key] = _default
+
+# External API credentials must never be live during the unit suite. Several
+# code paths (e.g. src.jobs.bulletin_tweet's LLM narrative) make a real network
+# call when their key is present — on a configured server that turns unit tests
+# into slow, non-deterministic, cost-incurring live calls (an ~3 min bulletin
+# run that flip-flops on whichever prose the model returns), while CI (no .env)
+# stays green. Blank the keys so those paths take their offline fallback. Tests
+# that deliberately exercise the credentialed path set the var per-test via
+# monkeypatch (which overrides this) and stub the network client.
+_BLANKED_CREDENTIALS = ("ANTHROPIC_API_KEY",)
+for _cred in _BLANKED_CREDENTIALS:
+    os.environ[_cred] = ""
