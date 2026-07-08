@@ -232,13 +232,27 @@ def open_position(
 
 
 def mark_position(conn: Any, pos: OpenPosition) -> Optional[float]:
-    """Mark-to-market ``pos``. Returns updated per-share liquidation value."""
+    """Mark-to-market ``pos``. Returns updated per-share liquidation value.
+
+    Every strategy in this engine trades LONG debits (BUY_CALL_DEBIT /
+    BUY_PUT_DEBIT — see the bot classes; every leg is ``side='long'``).
+    For a long option position the P&L is simply
+    ``(exit − entry) × contracts × 100``, regardless of whether the bot's
+    thesis is bullish or bearish: a put you bought at 1.80 and sold at
+    2.20 gained $0.40/share whether the intended market view was up or
+    down. The earlier code negated the P&L when ``direction == 'bearish'``,
+    which flipped every real winner into a "loss" and every real loser
+    into a "win" — the reason the leaderboard showed bearish bots
+    running the sleeve up from $111k to $4.4M in a bull market: their
+    real losses were being booked as wins. The negation is gone.
+
+    If a strategy ever adds true SHORT legs, this needs to key off the
+    per-leg ``side`` field, not ``direction``.
+    """
     mark = spread_price(conn, pos.legs, action="close")
     if mark is None:
         return None
     upnl = (mark - pos.entry_price) * pos.quantity_open * 100.0
-    if pos.direction == "bearish":
-        upnl = -upnl
     cur = conn.cursor()
     cur.execute(
         """
@@ -264,15 +278,14 @@ def close_position(
     exit_price = spread_price(conn, pos.legs, action="close")
     if exit_price is None:
         return None
+    # Long debit position — P&L is (exit − entry) × qty × 100 regardless
+    # of directional thesis. See mark_position for the full rationale on
+    # why the bearish negation was wrong.
     signed_pnl_per_contract = (exit_price - pos.entry_price) * 100.0
-    if pos.direction == "bearish":
-        signed_pnl_per_contract = -signed_pnl_per_contract
     realized = signed_pnl_per_contract * pos.quantity_open
     pnl_pct = (
         (exit_price / pos.entry_price - 1.0) if pos.entry_price > 0 else 0.0
     )
-    if pos.direction == "bearish":
-        pnl_pct = -pnl_pct
 
     if realized > 0:
         outcome = "win"
