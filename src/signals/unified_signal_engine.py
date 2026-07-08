@@ -1605,6 +1605,31 @@ class UnifiedSignalEngine:
         # Phase 3: reconcile portfolio (acquires connection for reads+writes)
         # Legacy optimizer-cache plumbing is no longer needed because MSI
         # components do not fetch option snapshots.
+        #
+        # TradeWorkz supersedes this legacy portfolio-trading path: signal
+        # scores + basic/advanced signal outputs + action cards keep
+        # publishing (/basic-signals, /advanced-signals, /cards etc. still
+        # depend on them), but the actual trade open/close writes into
+        # signal_trades / portfolio_snapshots are OFF by default. Set
+        # SIGNALS_PORTFOLIO_TRADING_ENABLED=true to re-enable if you ever
+        # want to run the two engines in parallel for comparison — but
+        # don't leave it on, because signal_trades and tw_trades will
+        # each build their own conflicting portfolio state.
+        legacy_trading_enabled = (
+            os.getenv("SIGNALS_PORTFOLIO_TRADING_ENABLED", "false").lower() == "true"
+        )
+        if not legacy_trading_enabled:
+            logger.info(
+                "UnifiedSignalEngine [%s] score=%.3f norm=%.3f dir=%s "
+                "action=<disabled: SIGNALS_PORTFOLIO_TRADING_ENABLED=false, "
+                "TradeWorkz supersedes>",
+                self.db_symbol,
+                score.composite_score,
+                score.normalized_score,
+                score.direction,
+            )
+            return True
+
         cached_option_rows = None
         if card_payload is not None:
             target = self.portfolio_engine.compute_target_with_action_card(
