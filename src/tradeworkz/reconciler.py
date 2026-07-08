@@ -172,6 +172,13 @@ def open_position(
             "conviction": signal.conviction,
             "rationale": signal.rationale,
             "size_multiplier": size_multiplier,
+            # Explicit provenance marker so the audit surface can
+            # distinguish real engine-opened positions from seeder
+            # rows without inferring from field absence. simulate.py
+            # stamps "simulate" on its rows. Any row that predates this
+            # commit will show as legacy-live (absent field → treated
+            # as live) in the audit filter.
+            "origin": "live",
         }
     )
     cur.execute(

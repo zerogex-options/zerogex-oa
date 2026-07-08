@@ -324,8 +324,17 @@ def simulate(
                         t["outcome"],
                         t["close_reason"],
                         t["entry_conviction"],
-                        json.dumps({"simulated": True}),
-                        json.dumps({"simulated": True, "reason": t["close_reason"]}),
+                        # `origin` is the canonical provenance marker the
+                        # audit surface reads; `simulated` is kept for
+                        # backward-compat with existing filters.
+                        json.dumps({"simulated": True, "origin": "simulate"}),
+                        json.dumps(
+                            {
+                                "simulated": True,
+                                "origin": "simulate",
+                                "reason": t["close_reason"],
+                            }
+                        ),
                     ),
                 )
                 session_realized += t["realized_pnl"]
