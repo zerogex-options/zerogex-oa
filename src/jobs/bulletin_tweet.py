@@ -502,9 +502,11 @@ def build_tweet_body(
 
     # Static template fallback — rotates the lead sentence off a hash
     # of (date, mode) so it varies day-to-day but stays deterministic
-    # within a given fire, so a dry-run and the live post match.
+    # within a given fire, so a dry-run and the live post match.  Use the
+    # mode's fixed position (not hash(mode), which is PYTHONHASHSEED-salted
+    # per process) so the pick is stable across separate invocations too.
     day_seed = int(day.strftime("%Y%m%d"))
-    seed = _hash_seed(day_seed, hash(mode) & 0xFFFFFFFF)
+    seed = _hash_seed(day_seed, MODES.index(mode))
     lead = _pick(copy.lead_variants, seed)
 
     blocks: list[str] = [
