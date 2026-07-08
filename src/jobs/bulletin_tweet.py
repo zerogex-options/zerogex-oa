@@ -544,13 +544,21 @@ def _build_fallback_tweet(
 # ---------------------------------------------------------------------------
 
 
+# Production default artifact root (preference #3). A module constant so tests
+# can point it at an unwritable/temp location and deterministically exercise
+# the XDG/HOME fallback, rather than depending on whatever state the host's
+# real /var/lib path happens to be in.
+PRIMARY_ARTIFACT_ROOT = Path("/var/lib/zerogex-oa/bulletin-tweets")
+
+
 def resolve_artifact_dir(explicit: str | None, mode: str, day: date) -> Path:
     """Pick the directory dry-run + media renderings are dropped into.
 
     Preference order:
       1. explicit ``--artifact-dir`` CLI value
       2. ``$BULLETIN_TWEET_ARTIFACT_DIR`` env
-      3. ``/var/lib/zerogex-oa/bulletin-tweets`` (production default)
+      3. :data:`PRIMARY_ARTIFACT_ROOT` (``/var/lib/zerogex-oa/bulletin-tweets``,
+         the production default)
       4. ``$XDG_STATE_HOME/zerogex-oa/bulletin-tweets``
       5. ``$HOME/.local/state/zerogex-oa/bulletin-tweets`` (dev)
 
@@ -563,7 +571,7 @@ def resolve_artifact_dir(explicit: str | None, mode: str, day: date) -> Path:
     env = os.environ.get("BULLETIN_TWEET_ARTIFACT_DIR", "").strip()
     if env:
         candidates.append(Path(env))
-    candidates.append(Path("/var/lib/zerogex-oa/bulletin-tweets"))
+    candidates.append(PRIMARY_ARTIFACT_ROOT)
     xdg = os.environ.get("XDG_STATE_HOME", "").strip()
     if xdg:
         candidates.append(Path(xdg) / "zerogex-oa" / "bulletin-tweets")
