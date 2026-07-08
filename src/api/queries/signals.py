@@ -288,12 +288,16 @@ class SignalsQueriesMixin:
         limit: int = 100,
     ) -> list[Dict[str, Any]]:
         """Return recent emitted signal_events rows with their realized outcomes."""
+        # signal_events stores the emit time in ``timestamp`` (see the writer
+        # in src/signals/unified_signal_engine.py); there is no ``emitted_at``
+        # column, so the previous SELECT/ORDER BY raised UndefinedColumnError
+        # on every call (swallowed -> always returned []).
         query = """
             SELECT
                 id,
                 underlying,
                 signal_name,
-                emitted_at,
+                timestamp,
                 direction,
                 score,
                 context_values,
@@ -307,7 +311,7 @@ class SignalsQueriesMixin:
             FROM signal_events
             WHERE underlying = $1
               AND ($2 = '' OR signal_name = $2)
-            ORDER BY emitted_at DESC
+            ORDER BY timestamp DESC
             LIMIT $3
         """
         try:
