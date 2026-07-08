@@ -100,8 +100,15 @@ def test_underlying_upsert_aggregates_intraminute_does_not_overwrite(monkeypatch
         }
     )
 
-    assert len(sink) == 1
-    sql, params = sink[0]
+    # The upsert also fans the tick out to WS subscribers in the same
+    # transaction (publish-before-persist NOTIFY), which issues its own
+    # SAVEPOINT / pg_notify / asset_type-lookup statements on the shared
+    # cursor — so the row write is no longer the ONLY execute. Pick the
+    # INSERT out by name and assert on it; the count check below still
+    # guarantees the row itself is written exactly once (no dual-write).
+    inserts = [(s, p) for (s, p) in sink if "INSERT INTO underlying_quotes" in s]
+    assert len(inserts) == 1, [s for s, _ in sink]
+    sql, params = inserts[0]
     norm = " ".join(sql.split())  # collapse whitespace for robust matching
 
     # The conflict clause must take the period-correct aggregate, NOT a
