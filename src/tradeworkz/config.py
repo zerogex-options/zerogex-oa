@@ -85,6 +85,15 @@ NOTIFY_MIN_CONFIDENCE: float = _getenv_float(
 NOTIFY_COOLDOWN_SECONDS: int = _getenv_int(
     "TRADEWORKZ_NOTIFY_COOLDOWN_SECONDS", 300, min=0, max=86400
 )
+# Dust filter for the EMAIL channel only. Exit-event emails whose
+# ``|payload.realized_pnl| < EMAIL_DUST_THRESHOLD`` are suppressed on
+# the email channel — the in_app row still writes so the bell / feed
+# stays complete. Risk-off exits (``reason IN ('stop', 'wall_break')``)
+# never dust-suppress even at $0.01 — the operator wants to know the
+# stop fired even if the size was tiny. Set to 0 to disable the filter.
+EMAIL_DUST_THRESHOLD: float = _getenv_float(
+    "TRADEWORKZ_EMAIL_DUST_THRESHOLD", 10.0, min=0.0, max=10_000.0
+)
 
 # ---------------------------------------------------------------------------
 # Admin scope for the FastAPI dependency guard on the admin sub-router.

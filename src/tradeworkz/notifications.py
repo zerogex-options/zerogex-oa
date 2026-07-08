@@ -56,6 +56,28 @@ def fanout_event(
 
     written = 0
     now = datetime.now(timezone.utc)
+    # Email dust suppression: for exit events where |realized_pnl| is
+    # below the operator-tunable threshold AND the exit wasn't a
+    # risk-off stop/wall_break, we skip inserting the email row entirely
+    # (in_app / webhook are unaffected). This kills the "you got emailed
+    # about a $1.20 close" complaint without ever hiding a real
+    # stop-out. Threshold source: tw_config.EMAIL_DUST_THRESHOLD.
+    dust_threshold = float(tw_config.EMAIL_DUST_THRESHOLD)
+    payload_reason = str(payload.get("reason") or "").lower()
+    is_riskoff = payload_reason in {"stop", "wall_break"}
+    realized_pnl_val = payload.get("realized_pnl")
+    try:
+        realized_abs = abs(float(realized_pnl_val)) if realized_pnl_val is not None else None
+    except (TypeError, ValueError):
+        realized_abs = None
+    email_dust_suppressed = (
+        event_type == "exit"
+        and dust_threshold > 0
+        and realized_abs is not None
+        and realized_abs < dust_threshold
+        and not is_riskoff
+    )
+
     for end_user, channels, follower_min in rows:
         if isinstance(channels, str):
             try:
@@ -69,6 +91,10 @@ def fanout_event(
             continue
         for channel, enabled in channels.items():
             if not enabled:
+                continue
+            if channel == "email" and email_dust_suppressed:
+                # Silently skip email; in_app row on this fanout still
+                # writes so the user's bell / audit trail is complete.
                 continue
             status = "sent" if channel == "in_app" else "queued"
             cur.execute(
