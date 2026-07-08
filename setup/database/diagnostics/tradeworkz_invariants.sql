@@ -22,10 +22,10 @@
 \echo ============================================================
 \echo  Invariant A: realized_pnl arithmetic is self-consistent
 \echo ============================================================
-\echo  Every closed trade's realized_pnl must equal
+\echo  Every closed-trade realized_pnl must equal
 \echo    (exit - entry) * quantity * 100
 \echo  for LONG-DEBIT positions (every current bot; check per-leg
-\echo  side if you add short structures). Live rows only — sim rows
+\echo  side if you add short structures). Live rows only - sim rows
 \echo  use a synthesized pnl_pct that does not follow this formula.
 \echo  Expected: 0 rows.
 \echo
@@ -76,7 +76,7 @@ ORDER BY drift DESC;
 \echo ============================================================
 \echo  Invariant C: outcome column matches realized_pnl sign
 \echo ============================================================
-\echo  outcome='win' iff realized_pnl > 0; 'loss' iff < 0; 'scratch' iff = 0.
+\echo  outcome=win iff realized_pnl > 0; loss iff below 0; scratch iff zero.
 \echo  If these ever mismatch, the leaderboard win-rate is wrong.
 \echo  Expected: 0 rows.
 \echo
@@ -112,8 +112,8 @@ ORDER BY p.opened_at DESC;
 \echo  Invariant E: no notification rows without a matching bot
 \echo ============================================================
 \echo  A notification row whose bot_id no longer exists in tw_bots is
-\echo  orphaned — usually the result of a manual DELETE FROM tw_bots
-\echo  that didn't cascade. Expected: 0 rows.
+\echo  orphaned - usually the result of a manual DELETE FROM tw_bots
+\echo  that never cascaded. Expected: 0 rows.
 \echo
 
 SELECT n.id, n.bot_id, n.event_type, n.sent_at
