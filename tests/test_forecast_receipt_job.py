@@ -130,7 +130,9 @@ async def test_receipt_skips_when_no_morning_row(monkeypatch, caplog):
     mod = _reload_module()
     fake = _fake_db(update_result=None)  # update returns None when no morning row
     monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
-    args = mod._parse_args(["--date", "2026-06-29"])
+    # Pin --symbol so the one-call assertion is independent of the operator's
+    # FORECAST_SYMBOLS env (which grades SPY,SPX,QQQ = 3 calls on the server).
+    args = mod._parse_args(["--date", "2026-06-29", "--symbol", "SPY"])
     with caplog.at_level("INFO"):
         rc = await mod._run(args)
     assert rc == 0

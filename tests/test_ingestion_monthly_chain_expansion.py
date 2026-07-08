@@ -29,6 +29,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from src.ingestion import stream_manager as stream_manager_module
 from src.ingestion.stream_manager import StreamManager
 from src import symbols as symbols_module
 
@@ -36,6 +37,38 @@ from src import symbols as symbols_module
 WEEKLY_TS = "$SPXW.X"
 MONTHLY_TS = "$SPX.X"
 DB_SYM = "SPX"
+
+# ``_fetch_chain_expirations`` drops any expiration before ``date.today()``.
+# The fixtures below deliberately encode real June/July 2026 calendar
+# semantics -- weekly vs monthly OPEX, and the 2026-06-18 collision that is a
+# SPXW weekly AND a Juneteenth-displaced SPX monthly OPEX -- so we can't just
+# bump the years. Freeze the reference "today" the code reads to 2026-06-01
+# (before every fixture date) so the hardcoded expirations stay in the future
+# and the calendar semantics are preserved. Without this the whole set is in
+# the past once the wall clock passes June 2026 and every expiration filters
+# out ("0 weekly"), failing these tests everywhere regardless of any .env.
+_FROZEN_TODAY = date(2026, 6, 1)
+
+
+class _FrozenDate(date):
+    """``date`` stand-in whose ``today()`` is pinned to ``_FROZEN_TODAY``.
+
+    Only ``date.today()`` is overridden; construction/comparison behave like
+    the real ``date`` so the module's expiration filtering is unaffected apart
+    from the frozen reference day. The module has no ``date(...)`` constructor
+    calls or ``isinstance(_, date)`` checks, so swapping the name is safe.
+    """
+
+    @classmethod
+    def today(cls) -> date:
+        return _FROZEN_TODAY
+
+
+@pytest.fixture(autouse=True)
+def _freeze_today(monkeypatch):
+    """Pin ``stream_manager.date.today()`` so the June/July 2026 fixtures stay
+    valid regardless of the wall-clock date."""
+    monkeypatch.setattr(stream_manager_module, "date", _FrozenDate)
 
 
 @pytest.fixture(autouse=True)

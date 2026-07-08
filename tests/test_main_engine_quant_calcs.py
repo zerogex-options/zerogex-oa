@@ -1194,12 +1194,21 @@ def test_unweighted_profile_matches_weighted_when_all_contracts_past_ref_horizon
     assert weighted == unweighted
 
 
-def test_gamma_flip_raw_is_unweighted_nearest_crossing_and_can_diverge():
+def test_gamma_flip_raw_is_unweighted_nearest_crossing_and_can_diverge(monkeypatch):
     """gamma_flip_raw is the nearest zero-crossing of the UN-DTE-weighted
     profile (the competitor "nearest crossing" convention), NOT the horizon-
     weighted structural flip. A near-dated wall above spot pulls the raw
     crossing up while the structural flip stays on the far-dated symmetric
     structure below spot — so the two land on opposite sides of spot."""
+    # This divergence exists ONLY when DTE weighting is on with the code
+    # defaults: the whole premise is that the near-dated wall is down-weighted
+    # in the structural profile but full-weight in the raw one. Pin the three
+    # DTE knobs to their in-code defaults so an operator .env that disables
+    # weighting (or retunes ref_days/shape) can't collapse the structural flip
+    # onto the raw one and fail this assertion on the server.
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_WEIGHTING", True)
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_REF_DAYS", 5.0)
+    monkeypatch.setattr(main_engine, "GAMMA_PROFILE_DTE_WEIGHT_SHAPE", "linear")
     engine = AnalyticsEngine(underlying="SPY")
     ts = datetime(2026, 4, 21, 14, 30, tzinfo=timezone.utc)
     spot = 500.0
