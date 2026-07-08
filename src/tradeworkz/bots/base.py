@@ -76,23 +76,48 @@ class BaseBot:
     def exit_criteria(
         self, snap: MarketSnapshot, position: OpenPosition
     ) -> ExitDecision:
-        """Default exit policy — target / stop / time-stop. Subclasses can extend."""
-        # Realized price movement is already in position.current_price; the
-        # engine has just marked-to-market. Apply the price-level triggers.
-        cp = position.current_price
-        if position.target_price is not None:
-            if position.direction == "bullish" and cp >= position.target_price:
+        """Default exit policy — target / stop / time-stop. Subclasses can extend.
+
+        Every bot in the fleet sets ``position.target_price`` and
+        ``position.stop_price`` at UNDERLYING-SPOT levels (e.g., "close
+        the bearish put when SPY drops to 740"), not at option-premium
+        levels. The comparison here must therefore be against
+        ``snap.spot`` — the current spot price of the underlying — NOT
+        against ``position.current_price``, which is the mark-to-market
+        option premium (e.g., $0.68).
+
+        The prior version compared the spot-level target against the
+        option premium, which was numerically absurd: for a bearish put
+        with target=740, ``option_premium (0.68) <= 740`` was trivially
+        True and the trade closed as "target" on the first tick after
+        the min-hold window — regardless of whether SPY had actually
+        moved to the target. That's why the audit showed "target" as
+        the close reason on trades that lost money and why every trade
+        held for about 90 seconds and then exited.
+
+        min_hold_until still gates the exit — a bot's price level can
+        legitimately be hit inside the first 90 seconds, but we require
+        a minimum patience window so a wick doesn't unwind the whole
+        thesis. time_stop_at forces a close after the bot's configured
+        max_hold_minutes even if neither target nor stop hit.
+        """
+        # min_hold_until: we may only take price-level exits AFTER this
+        # elapses. Time-stop is still evaluated below.
+        now = _utcnow()
+        in_min_hold = position.min_hold_until is not None and now < position.min_hold_until
+        spot = snap.spot
+        if not in_min_hold and position.target_price is not None:
+            if position.direction == "bullish" and spot >= position.target_price:
                 return ExitDecision(should_close=True, reason="target")
-            if position.direction == "bearish" and cp <= position.target_price:
+            if position.direction == "bearish" and spot <= position.target_price:
                 return ExitDecision(should_close=True, reason="target")
-        if position.stop_price is not None:
-            if position.direction == "bullish" and cp <= position.stop_price:
+        if not in_min_hold and position.stop_price is not None:
+            if position.direction == "bullish" and spot <= position.stop_price:
                 return ExitDecision(should_close=True, reason="stop")
-            if position.direction == "bearish" and cp >= position.stop_price:
+            if position.direction == "bearish" and spot >= position.stop_price:
                 return ExitDecision(should_close=True, reason="stop")
 
-        now = _utcnow()
-        if position.min_hold_until and now < position.min_hold_until:
+        if in_min_hold:
             return ExitDecision(should_close=False)
         if position.time_stop_at and now >= position.time_stop_at:
             return ExitDecision(should_close=True, reason="time_stop")
