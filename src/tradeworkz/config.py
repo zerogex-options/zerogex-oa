@@ -53,6 +53,17 @@ ENTRY_DEDUPE_WINDOW_SECONDS: int = _getenv_int(
 EXECUTION_SLIPPAGE_PCT: float = _getenv_float(
     "TRADEWORKZ_EXECUTION_SLIPPAGE_PCT", 0.02, min=0.0, max=1.0
 )
+# Premium-loss damage-control stop. Bots set structural spot-level
+# stops that invalidate the thesis, but on 0DTE ATM debits a 0.3-1%
+# adverse spot move can eat 60-80% of premium before spot reaches
+# that structural level. This is a hard second stop keyed off option
+# premium: if the mark drops below (1 - MAX_PREMIUM_LOSS_PCT) × entry,
+# the reconciler closes the position on the next tick with
+# reason='premium_stop'. Set to 0 to disable. Per-bot override via
+# params['max_premium_loss_pct'] takes precedence over this default.
+MAX_PREMIUM_LOSS_PCT: float = _getenv_float(
+    "TRADEWORKZ_MAX_PREMIUM_LOSS_PCT", 0.40, min=0.0, max=1.0
+)
 
 # ---------------------------------------------------------------------------
 # ML calibrator
