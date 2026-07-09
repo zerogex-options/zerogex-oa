@@ -88,6 +88,26 @@ class BaseBot:
             return float(self.params.get("confidence_threshold_default", 0.55))
         return float(v)
 
+    def _max_premium_loss_pct(self) -> float:
+        """Resolve the premium damage-control threshold for this bot.
+
+        Per-bot ``params['max_premium_loss_pct']`` (if set) takes
+        precedence over the fleet-wide ``tw_config.MAX_PREMIUM_LOSS_PCT``
+        so an operator can loosen the stop for high-variance strategies
+        like a straddle without touching the env var, and tighten it for
+        theta trades where the wing risk is different. A value of 0
+        disables the check for this bot.
+        """
+        from src.tradeworkz import config as tw_config
+
+        override = self.params.get("max_premium_loss_pct")
+        if override is not None:
+            try:
+                return max(0.0, min(1.0, float(override)))
+            except (TypeError, ValueError):
+                pass
+        return float(tw_config.MAX_PREMIUM_LOSS_PCT)
+
     # -- Subclass overrides ---------------------------------------------
 
     def open_criteria(self, snap: MarketSnapshot) -> Optional[TradeSignal]:
@@ -126,6 +146,30 @@ class BaseBot:
         # elapses. Time-stop is still evaluated below.
         now = _utcnow()
         in_min_hold = position.min_hold_until is not None and now < position.min_hold_until
+
+        # Premium damage-control stop. Fires REGARDLESS of min_hold —
+        # damage-control trumps patience. Spot-based structural stops
+        # invalidate the thesis, but on 0DTE ATM debits a 0.3-1% adverse
+        # spot move can eat 60-80% of premium before spot reaches the
+        # structural stop. Anything worse than a configurable premium
+        # loss threshold exits here first.
+        #
+        # Skipped when entry_price is zero or negative (defensive: never
+        # divide) and when current_price is None. Also skipped for a
+        # credit structure where entry_price could be negative — those
+        # need a wider profit-loss check the reconciler can grow into
+        # later. For now only long-debit structures (entry_price > 0)
+        # get the check, which covers every current bot.
+        pct = self._max_premium_loss_pct()
+        if (
+            pct > 0
+            and position.entry_price and position.entry_price > 0
+            and position.current_price is not None
+        ):
+            loss_pct = 1.0 - (position.current_price / position.entry_price)
+            if loss_pct >= pct:
+                return ExitDecision(should_close=True, reason="premium_stop")
+
         spot = snap.spot
         if not in_min_hold and position.target_price is not None:
             if position.direction == "bullish" and spot >= position.target_price:
