@@ -71,6 +71,24 @@ def test_fmt_net_gex_scales_by_magnitude():
     assert mod._fmt_net_gex(None) == "—"
 
 
+def test_shape_bulletin_prefers_net_gex_at_spot():
+    """The tweet's Net GEX must match the rest of the site: prefer
+    net_gex_at_spot (the regime-correct headline figure the dashboard and
+    gamma-exposure page show) over the chain-wide net_gex, which can
+    differ in magnitude — and even sign."""
+    mod = _reload_module()
+    # net_gex_at_spot present and opposite sign to the chain-wide total.
+    row = _summary_row("SPY", spot=744.51, net_gex=5_000_000_000.0)
+    row["net_gex_at_spot"] = -1_200_000_000.0
+    assert mod._shape_bulletin(row, "SPY").net_gex == pytest.approx(-1_200_000_000.0)
+    # Falls back to the chain-wide net_gex only when at-spot is absent.
+    row_no_at_spot = _summary_row("SPY", spot=744.51, net_gex=5_000_000_000.0)
+    row_no_at_spot["net_gex_at_spot"] = None
+    assert mod._shape_bulletin(row_no_at_spot, "SPY").net_gex == pytest.approx(
+        5_000_000_000.0,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tweet body builder
 # ---------------------------------------------------------------------------

@@ -281,6 +281,29 @@ def _to_float(v: Any) -> float | None:
     return f
 
 
+def _pick_net_gex(row: dict[str, Any]) -> float | None:
+    """Net GEX for the tweet — prefer ``net_gex_at_spot``.
+
+    ``get_latest_gex_summary`` exposes two different Net GEX quantities:
+    ``net_gex`` (the chain-wide total, re-derived as call+put GEX summed
+    across every strike) and ``net_gex_at_spot`` (the dealer gamma read
+    off the spot-shift profile at the current price).  The analytics
+    engine documents ``net_gex_at_spot`` as *the regime-correct headline
+    figure* and warns the two "use different bases and can legitimately
+    differ in magnitude (and occasionally sign)".
+
+    The main dashboard and the gamma-exposure page already headline
+    ``net_gex_at_spot``, so the tweet prefers it too — otherwise the
+    post's Net GEX could show a different number (or the opposite sign)
+    than the rest of the site for the same snapshot, and could even
+    contradict the tweet's own above/below-the-flip framing.  Falls back
+    to the chain-wide ``net_gex`` only when the at-spot value is absent."""
+    at_spot = _to_float(row.get("net_gex_at_spot"))
+    if at_spot is not None:
+        return at_spot
+    return _to_float(row.get("net_gex"))
+
+
 def _shape_bulletin(row: dict[str, Any] | None, symbol: str) -> SymbolBulletin:
     if not row:
         return SymbolBulletin(symbol=symbol)
@@ -291,7 +314,7 @@ def _shape_bulletin(row: dict[str, Any] | None, symbol: str) -> SymbolBulletin:
         call_wall=_to_float(row.get("call_wall")),
         put_wall=_to_float(row.get("put_wall")),
         max_pain=_to_float(row.get("max_pain")),
-        net_gex=_to_float(row.get("net_gex")),
+        net_gex=_pick_net_gex(row),
     )
 
 
