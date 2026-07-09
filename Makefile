@@ -2847,6 +2847,13 @@ gamma-flip-revalidate: ## Re-validate relative gamma-flip thresholds vs post-dep
 		--window-days $(GAMMA_FLIP_WINDOW_DAYS) \
 		$(if $(GAMMA_FLIP_STABLE_SINCE),--stable-since $(GAMMA_FLIP_STABLE_SINCE))
 
+.PHONY: regime-regrade-report
+regime-regrade-report: ## Backtest the corrected dealer-gamma regime vs stored history (read-only). Vars: REGIME_SYMBOL (optional), REGIME_JSON (optional out path)
+	@echo "$(BLUE)=== Regime regrade backtest (read-only) ===$(NC)"
+	@$(PY) -m src.tools.regime_regrade_report \
+		$(if $(REGIME_SYMBOL),--symbol $(REGIME_SYMBOL)) \
+		$(if $(REGIME_JSON),--json $(REGIME_JSON))
+
 # Override SYMBOLS to scope; the snapshot covers current + prior session
 # (everything /api/flow/series can request).
 FLOW_SERIES_SYMBOLS ?= SPY

@@ -9,6 +9,7 @@ is the canonical consumer.
 
 from __future__ import annotations
 
+import os
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -21,6 +22,38 @@ from .trade_signals import get_db
 router = APIRouter(prefix="/api/forecast", tags=["Forecast"])
 
 ET = ZoneInfo("America/New_York")
+
+# The dealer-gamma regime fix went live on this date.  Before it, a units bug
+# pinned every committed ``regime`` to ``long_gamma`` (see
+# ``forecast_range_model._classify_regime``), so grading ``regime_correct``
+# against those labels measured only the base rate of chop days.  The rolling
+# ``regime_correct_rate`` below excludes pre-fix rows so it isn't misleading;
+# since the window is rolling, this cutoff becomes a no-op once ~30 days of
+# corrected receipts accrue.  Override with ``FORECAST_REGIME_FIX_DATE``.
+_DEFAULT_REGIME_FIX_DATE = date(2026, 7, 9)
+
+
+def _regime_fix_date() -> date:
+    raw = os.environ.get("FORECAST_REGIME_FIX_DATE", "").strip()
+    if not raw:
+        return _DEFAULT_REGIME_FIX_DATE
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return _DEFAULT_REGIME_FIX_DATE
+
+
+def _as_date(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _parse_date(raw: str | None) -> date:
@@ -221,20 +254,31 @@ async def get_rolling_stats(
     scored = [r for r in rows if r.get("receipt_ts") is not None]
     n = len(scored)
 
-    def _rate(predicate) -> float | None:
-        if not scored:
-            return None
-        eligible = [r for r in scored if predicate(r) is not None]
+    def _rate(row_set, predicate) -> float | None:
+        eligible = [r for r in row_set if predicate(r) is not None]
         if not eligible:
             return None
         wins = sum(1 for r in eligible if predicate(r))
         return round(wins / len(eligible), 4)
 
+    # Regime accuracy only counts forecasts made under the corrected
+    # dealer-gamma logic; pre-fix rows are the all-``long_gamma`` units bug and
+    # would just measure the chop-day base rate (see _regime_fix_date).
+    fix_date = _regime_fix_date()
+    regime_scored = [
+        r for r in scored
+        if (d := _as_date(r.get("date"))) is not None and d >= fix_date
+    ]
+    regime_n = sum(1 for r in regime_scored if r.get("regime_correct") is not None)
+
     return {
         "symbol": symbol.upper(),
         "window": window,
         "n_scored": n,
-        "range_respected_rate": _rate(lambda r: r.get("range_respected")),
-        "pin_hit_rate": _rate(lambda r: r.get("pin_hit")),
-        "regime_correct_rate": _rate(lambda r: r.get("regime_correct")),
+        "range_respected_rate": _rate(scored, lambda r: r.get("range_respected")),
+        "pin_hit_rate": _rate(scored, lambda r: r.get("pin_hit")),
+        "regime_correct_rate": _rate(regime_scored, lambda r: r.get("regime_correct")),
+        # Transparency: regime accuracy is scoped to the corrected-logic era.
+        "regime_stats_from": fix_date.isoformat(),
+        "regime_n_scored": regime_n,
     }

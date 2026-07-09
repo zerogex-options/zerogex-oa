@@ -182,6 +182,9 @@ def test_recent_history_returns_compact_rows(monkeypatch):
 
 def test_rolling_stats_computes_only_over_scored(monkeypatch):
     app, dbmod = _build_app(monkeypatch)
+    # This test predates the fix-date cutoff and only cares about the
+    # scored-vs-unscored split, so pin the regime cutoff before its rows.
+    monkeypatch.setenv("FORECAST_REGIME_FIX_DATE", "2026-01-01")
     dbmod.DatabaseManager.get_daily_forecast_history = AsyncMock(
         return_value=[
             _with_receipt(date=date(2026, 6, 27), range_respected=True,  pin_hit=True,  regime_correct=True),
@@ -198,3 +201,64 @@ def test_rolling_stats_computes_only_over_scored(monkeypatch):
     assert body["pin_hit_rate"] == pytest.approx(2 / 3, abs=1e-4)
     # regime_correct: 2 out of 3 had a value, both True → 1.0.
     assert body["regime_correct_rate"] == pytest.approx(1.0, abs=1e-4)
+
+
+def _scored_row(d: str, regime_correct, range_respected=True, pin_hit=True):
+    """Minimal receipted-row shape the rolling-stats endpoint reads."""
+    return {
+        "date": date.fromisoformat(d),
+        "receipt_ts": datetime(2026, 7, 9, 20, 5, tzinfo=timezone.utc),
+        "range_respected": range_respected,
+        "pin_hit": pin_hit,
+        "regime_correct": regime_correct,
+    }
+
+
+def test_rolling_stats_regime_rate_excludes_pre_fix_rows(monkeypatch):
+    """The regime rate must only count corrected-era (>= fix date) forecasts;
+    the pre-fix all-long_gamma rows must not inflate it. Range/pin still count
+    every scored row."""
+    app, dbmod = _build_app(monkeypatch)
+    monkeypatch.setenv("FORECAST_REGIME_FIX_DATE", "2026-07-09")
+    dbmod.DatabaseManager.get_daily_forecast_history = AsyncMock(
+        return_value=[
+            # Pre-fix buggy rows — all "correct", must be excluded from regime rate.
+            _scored_row("2026-07-06", True),
+            _scored_row("2026-07-07", True),
+            _scored_row("2026-07-08", True),
+            # Corrected era — 1 of 2 correct.
+            _scored_row("2026-07-09", True),
+            _scored_row("2026-07-10", False, range_respected=False),
+        ]
+    )
+    with TestClient(app) as client:
+        r = client.get("/api/forecast/stats/rolling?symbol=SPY&window=30")
+    body = r.json()
+    assert body["regime_stats_from"] == "2026-07-09"
+    assert body["regime_n_scored"] == 2
+    # Only the 2 corrected-era rows count → 1/2, NOT 4/5.
+    assert body["regime_correct_rate"] == pytest.approx(0.5, abs=1e-4)
+    # Range/pin still span all 5 scored rows.
+    assert body["n_scored"] == 5
+    assert body["range_respected_rate"] == pytest.approx(0.8, abs=1e-4)
+    assert body["pin_hit_rate"] == pytest.approx(1.0, abs=1e-4)
+
+
+def test_rolling_stats_regime_rate_null_when_no_corrected_rows(monkeypatch):
+    """Before any corrected receipts accrue, the regime rate is null (renders
+    '—') rather than showing the misleading pre-fix number."""
+    app, dbmod = _build_app(monkeypatch)
+    monkeypatch.setenv("FORECAST_REGIME_FIX_DATE", "2026-07-09")
+    dbmod.DatabaseManager.get_daily_forecast_history = AsyncMock(
+        return_value=[
+            _scored_row("2026-07-06", True),
+            _scored_row("2026-07-07", True),
+        ]
+    )
+    with TestClient(app) as client:
+        r = client.get("/api/forecast/stats/rolling?symbol=SPY&window=30")
+    body = r.json()
+    assert body["regime_correct_rate"] is None
+    assert body["regime_n_scored"] == 0
+    # Range/pin are unaffected by the regime cutoff.
+    assert body["range_respected_rate"] == pytest.approx(1.0, abs=1e-4)
