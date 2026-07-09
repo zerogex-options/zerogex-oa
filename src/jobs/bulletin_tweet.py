@@ -13,8 +13,10 @@ systemd timers:
 
 Every post FEATURES ONE symbol — the one with the cleanest setup at
 the moment the job fires (see :func:`select_featured_symbol`: the
-symbol whose spot is pressed closest to its gamma flip or a wall, the
-clearest line to narrate).  SPY / SPX / QQQ are all still fetched so
+symbol whose spot is pressed closest to a decision level, with the
+gamma flip — the regime boundary — weighted above the walls, since a
+symbol straddling its flip is a stronger story than one merely pinned).
+SPY / SPX / QQQ are all still fetched so
 the copy can cross-reference the other two, but the headline, the
 numeric map and the attached card all center on the featured symbol.
 
@@ -105,6 +107,16 @@ DEFAULT_LEAD_SYMBOL = "SPX"
 # reach).  Instead it's posted as a threaded reply under every bulletin tweet.
 # This is the fixed prefix; the URL is appended from ``--site-url``.
 DEFAULT_REPLY_PREFIX = "Free delayed SPY / SPX / QQQ gamma levels:"
+# When choosing the featured symbol, proximity to the gamma flip counts more
+# than proximity to a wall: the flip is the regime boundary — where dealer
+# hedging (and therefore the tape's whole character) flips sign — so a symbol
+# straddling its flip is a stronger story than one merely pinned to a wall.
+# The flip's distance is scaled by this factor (< 1 = "counts as closer"), so a
+# symbol wins on its flip when the flip is within ~1/weight of a rival's wall
+# distance.  0.6 ⇒ the flip is worth ~1.67× a wall.  Tune toward 0 to lean
+# harder into flip/regime-transition stories, toward 1 to weight all three
+# levels equally (pure nearest-to-any-level).
+FLIP_PROXIMITY_WEIGHT = 0.6
 LONG_TWEET_MAX_LEN = 25_000  # X Premium long-form ceiling; classic 280 is the
                              # floor the fallback body targets when the caller
                              # doesn't have Premium enabled on the bot handle.
@@ -393,6 +405,13 @@ def select_featured_symbol(
     line to narrate: "price drove into the 740 put wall and ripped off
     it" only reads that cleanly when spot is actually sitting on 740.
 
+    Proximity to the **gamma flip** is weighted more heavily than
+    proximity to a wall (see :data:`FLIP_PROXIMITY_WEIGHT`): the flip is
+    the regime boundary — where dealer hedging flips sign and the tape
+    changes character — so a symbol straddling its flip is a stronger
+    story than one merely pinned to a wall, and wins when the two are
+    close.
+
     Only symbols with a live/implied spot AND at least one of those
     three levels are eligible.  Ties break toward the more complete
     data, then toward the input order, so a dry-run and the live post
@@ -407,10 +426,18 @@ def select_featured_symbol(
     for idx, b in enumerate(bulletins):
         if b.spot is None or b.spot <= 0:
             continue
-        levels = [lv for lv in (b.gamma_flip, b.put_wall, b.call_wall) if lv is not None]
-        if not levels:
+        # Distance to each decision level as a fraction of spot; the gamma
+        # flip's distance is scaled down so being near it counts for more.
+        weighted: list[float] = []
+        if b.gamma_flip is not None:
+            weighted.append(abs(b.spot - b.gamma_flip) / b.spot * FLIP_PROXIMITY_WEIGHT)
+        if b.put_wall is not None:
+            weighted.append(abs(b.spot - b.put_wall) / b.spot)
+        if b.call_wall is not None:
+            weighted.append(abs(b.spot - b.call_wall) / b.spot)
+        if not weighted:
             continue
-        proximity = min(abs(b.spot - lv) / b.spot for lv in levels)
+        proximity = min(weighted)
         completeness = sum(
             1
             for v in (b.gamma_flip, b.call_wall, b.put_wall, b.max_pain, b.net_gex)
