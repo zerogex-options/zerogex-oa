@@ -250,6 +250,24 @@ def _close_cashflow_from_series(resolved_legs, series_by_symbol, at, slip) -> Op
     return cashflow
 
 
+def _regime_tags(card: CardRow) -> tuple:
+    """(gamma_regime, msi_regime) at entry, from the Card's persisted context.
+
+    ``gamma_regime`` is the sign of net GEX — the dealer-hedging backdrop that
+    is the whole ZeroGEX thesis: positive/long-gamma (suppressive, mean-
+    reverting) vs negative/short-gamma (amplifying, trending). ``msi_regime`` is
+    the Market State Index regime label. Either is None when absent.
+    """
+    ctx = (card.payload or {}).get("context") or {}
+    ng = ctx.get("net_gex")
+    if isinstance(ng, (int, float)):
+        gamma_regime = "positive" if ng > 0 else "negative" if ng < 0 else "flat"
+    else:
+        gamma_regime = None
+    msi_regime = ctx.get("regime") or None
+    return gamma_regime, msi_regime
+
+
 def _structure_label(resolved_legs: list[dict]) -> str:
     rights = {leg["right"] for leg in resolved_legs}
     if len(resolved_legs) == 1:
@@ -812,6 +830,7 @@ def _simulate(candidates: list[dict], spec: BacktestSpec) -> RunResult:
         net = gross - comm
         cost_basis = risk_per_contract * contracts
         return_pct = (net / cost_basis * 100.0) if cost_basis > 0 else None
+        gamma_regime, msi_regime = _regime_tags(cand["card"])
 
         seq += 1
         trades.append(
@@ -841,6 +860,8 @@ def _simulate(candidates: list[dict], spec: BacktestSpec) -> RunResult:
                 legs=cand.get("legs", []),
                 net_delta=cand.get("delta_per_contract", 0.0) * contracts,
                 net_vega=cand.get("vega_per_contract", 0.0) * contracts,
+                gamma_regime=gamma_regime,
+                msi_regime=msi_regime,
             )
         )
         open_positions.append({"exit_at": cand["exited_at"], "net_pnl": net})
@@ -1254,6 +1275,34 @@ def _monte_carlo(trades: list[TradeResult], capital: float) -> Optional[dict]:
     }
 
 
+def _regime_groups(trades: list[TradeResult], key) -> list[dict]:
+    """Per-regime win rate / net P&L / expectancy, best net first.
+
+    ``key`` maps a trade to its regime label (gamma sign or MSI regime). Trades
+    with no label are bucketed as ``unknown`` so the counts always reconcile.
+    """
+    groups: dict[str, list[TradeResult]] = {}
+    for t in trades:
+        groups.setdefault(key(t) or "unknown", []).append(t)
+    out = []
+    for regime, ts in groups.items():
+        nets = [t.net_pnl for t in ts]
+        rps = [t.return_pct for t in ts if t.return_pct is not None]
+        wins = sum(1 for t in ts if t.net_pnl > 0)
+        out.append(
+            {
+                "regime": regime,
+                "n": len(ts),
+                "win_rate": round(wins / len(ts), 4) if ts else None,
+                "net_pnl": round(sum(nets), 2),
+                "expectancy": round(sum(nets) / len(ts), 2) if ts else None,
+                "avg_return_pct": round(sum(rps) / len(rps), 2) if rps else None,
+            }
+        )
+    out.sort(key=lambda d: -d["net_pnl"])
+    return out
+
+
 def _summarize(
     trades: list[TradeResult],
     equity: list[EquityPoint],
@@ -1263,6 +1312,10 @@ def _summarize(
 ) -> dict:
     risk = _risk_metrics(trades, equity, capital, start_date, end_date)
     monte_carlo = _monte_carlo(trades, capital)
+    by_regime = {
+        "gamma": _regime_groups(trades, lambda t: t.gamma_regime),
+        "msi": _regime_groups(trades, lambda t: t.msi_regime),
+    }
     n = len(trades)
     if n == 0:
         return {
@@ -1276,6 +1329,7 @@ def _summarize(
             "avg_loss_pct": None,
             "avg_hold_minutes": None,
             "by_pattern": [],
+            "by_regime": by_regime,
             "monte_carlo": monte_carlo,
             **risk,
         }
@@ -1329,6 +1383,7 @@ def _summarize(
             _avg(t.hold_minutes for t in trades if t.hold_minutes is not None) or 0.0, 1
         ),
         "by_pattern": by_pattern_list,
+        "by_regime": by_regime,
         "monte_carlo": monte_carlo,
         **risk,
     }

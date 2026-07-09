@@ -15,10 +15,13 @@ from src.backtesting.engine import (
     _exposure_pct,
     _monte_carlo,
     _percentile,
+    _regime_groups,
+    _regime_tags,
     _streaks,
     _summarize,
 )
 from src.backtesting.models import EquityPoint, TradeResult
+from src.signals.playbook.backtest import CardRow
 
 UTC = timezone.utc
 
@@ -276,3 +279,63 @@ def test_summary_includes_monte_carlo_block():
     assert summary["monte_carlo"] is not None
     assert "cone" in summary["monte_carlo"]
     assert summary["expectancy_tstat"] is not None
+
+
+# ----------------------------------------------------------------------
+# Regime conditioning
+# ----------------------------------------------------------------------
+
+
+def _card(net_gex=None, regime=None):
+    ctx = {}
+    if net_gex is not None:
+        ctx["net_gex"] = net_gex
+    if regime is not None:
+        ctx["regime"] = regime
+    return CardRow(
+        underlying="SPY",
+        timestamp=datetime(2026, 5, 1, 14, 0, tzinfo=UTC),
+        pattern="gamma_flip_break",
+        action="BUY_CALL",
+        tier="0DTE",
+        direction="bullish",
+        confidence=0.7,
+        payload={"context": ctx} if ctx else {},
+    )
+
+
+def test_regime_tags_read_gamma_sign_and_msi():
+    assert _regime_tags(_card(net_gex=5e8, regime="trend_expansion")) == (
+        "positive",
+        "trend_expansion",
+    )
+    assert _regime_tags(_card(net_gex=-3e8, regime="chop_range")) == ("negative", "chop_range")
+    assert _regime_tags(_card()) == (None, None)  # no context ⇒ untagged
+
+
+def test_regime_groups_split_and_reconcile():
+    base = datetime(2026, 5, 1, 14, 0, tzinfo=UTC)
+    trades = []
+    for i, (pnl, gr) in enumerate(
+        [(100.0, "negative"), (-50.0, "negative"), (80.0, "positive"), (-20.0, "positive")]
+    ):
+        t = mk_trade(i + 1, pnl, base + timedelta(minutes=i), base + timedelta(minutes=i + 1))
+        t.gamma_regime = gr
+        trades.append(t)
+    groups = _regime_groups(trades, lambda t: t.gamma_regime)
+    by = {g["regime"]: g for g in groups}
+    assert by["negative"]["n"] == 2 and by["negative"]["net_pnl"] == 50.0
+    assert by["positive"]["n"] == 2 and by["positive"]["net_pnl"] == 60.0
+    assert sum(g["n"] for g in groups) == len(trades)  # counts reconcile
+
+
+def test_regime_groups_buckets_missing_as_unknown():
+    base = datetime(2026, 5, 1, 14, 0, tzinfo=UTC)
+    t = mk_trade(1, 10.0, base, base + timedelta(minutes=1))
+    groups = _regime_groups([t], lambda t: t.gamma_regime)
+    assert groups[0]["regime"] == "unknown"
+
+
+def test_summary_by_regime_shape():
+    summary = _summarize([], [], 25_000.0, date(2026, 5, 1), date(2026, 5, 10))
+    assert summary["by_regime"] == {"gamma": [], "msi": []}

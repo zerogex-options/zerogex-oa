@@ -34,8 +34,12 @@ logger = logging.getLogger(__name__)
 _INDICATOR_STALENESS_MIN = 15
 
 _OPS = {
-    "<": operator.lt, "<=": operator.le, ">": operator.gt,
-    ">=": operator.ge, "==": operator.eq, "!=": operator.ne,
+    "<": operator.lt,
+    "<=": operator.le,
+    ">": operator.gt,
+    ">=": operator.ge,
+    "==": operator.eq,
+    "!=": operator.ne,
 }
 
 # Synthetic Cards all share this pattern id, so the engine's per-pattern
@@ -116,17 +120,19 @@ def load_indicator_bars(conn, underlying: str, start: datetime, end: datetime) -
             gamma_flip = _f(g[4])
             call_wall = _f(g[5])
             put_wall = _f(g[6])
-            bar.update({
-                "net_gex": net_gex,
-                "net_gex_at_spot": net_gex_at_spot,
-                "flip_distance": _f(g[3]),
-                "gamma_flip_point": gamma_flip,
-                "call_wall": call_wall,
-                "put_wall": put_wall,
-                "put_call_ratio": _f(g[7]),
-                "max_pain": _f(g[8]),
-                "convexity_risk": _f(g[9]),
-            })
+            bar.update(
+                {
+                    "net_gex": net_gex,
+                    "net_gex_at_spot": net_gex_at_spot,
+                    "flip_distance": _f(g[3]),
+                    "gamma_flip_point": gamma_flip,
+                    "call_wall": call_wall,
+                    "put_wall": put_wall,
+                    "put_call_ratio": _f(g[7]),
+                    "max_pain": _f(g[8]),
+                    "convexity_risk": _f(g[9]),
+                }
+            )
             sign_src = net_gex_at_spot if net_gex_at_spot is not None else net_gex
             if sign_src is not None:
                 bar["net_gex_sign"] = (
@@ -186,8 +192,10 @@ def _build_legs(strategy: StrategySpec, price: float, expiry: str) -> list[dict]
         return [leg(atm + w, "C", "BUY"), leg(atm - w, "P", "BUY")]
     # iron condor: short inner strangle, long outer wings → net credit.
     return [
-        leg(atm + w, "C", "SELL"), leg(atm + w + wing, "C", "BUY"),
-        leg(atm - w, "P", "SELL"), leg(atm - w - wing, "P", "BUY"),
+        leg(atm + w, "C", "SELL"),
+        leg(atm + w + wing, "C", "BUY"),
+        leg(atm - w, "P", "SELL"),
+        leg(atm - w - wing, "P", "BUY"),
     ]
 
 
@@ -202,12 +210,21 @@ def _synth_card(strategy: StrategySpec, bar: dict, *, underlying: str, max_hold:
         "entry": {"ref_price": price, "trigger": "at_market"},
         "max_hold_minutes": max_hold,
         "legs": _build_legs(strategy, price, expiry),
+        # Carry the market-structure backdrop so custom-strategy trades can be
+        # conditioned by gamma / MSI regime just like playbook Cards. Prefer the
+        # regime-correct net GEX at spot when the merge captured it.
+        "context": {
+            "net_gex": bar.get("net_gex_at_spot", bar.get("net_gex")),
+            "regime": bar.get("msi_regime"),
+            "msi": bar.get("msi"),
+        },
     }
     # Level-offset exits are directional only; neutral structures fall through
     # to non-level (premium-overlay) target/stop.
     if directional and strategy.target_offset_pct is not None:
         tgt = (
-            price * (1 + strategy.target_offset_pct) if direction == "bullish"
+            price * (1 + strategy.target_offset_pct)
+            if direction == "bullish"
             else price * (1 - strategy.target_offset_pct)
         )
         payload["target"] = {"ref_price": tgt, "kind": "level", "level_name": "custom_target"}
@@ -215,7 +232,8 @@ def _synth_card(strategy: StrategySpec, bar: dict, *, underlying: str, max_hold:
         payload["target"] = {"ref_price": None, "kind": "premium_pct"}
     if directional and strategy.stop_offset_pct is not None:
         stp = (
-            price * (1 - strategy.stop_offset_pct) if direction == "bullish"
+            price * (1 - strategy.stop_offset_pct)
+            if direction == "bullish"
             else price * (1 + strategy.stop_offset_pct)
         )
         payload["stop"] = {"ref_price": stp, "kind": "level", "level_name": "custom_stop"}
@@ -246,7 +264,5 @@ def generate_strategy_cards(conn, spec: BacktestSpec, *, max_hold: int) -> list[
         for bar in bars
         if _passes(strategy.conditions, bar)
     ]
-    logger.info(
-        "strategy backtest: %d indicator bars, %d condition matches", len(bars), len(cards)
-    )
+    logger.info("strategy backtest: %d indicator bars, %d condition matches", len(bars), len(cards))
     return cards
