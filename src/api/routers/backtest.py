@@ -59,7 +59,9 @@ async def get_pattern_insights(
     dollar economics. Optional ``underlying`` narrows to one symbol.
     """
     return await asyncio.to_thread(
-        queries.get_pattern_insights, source=source, underlying=underlying,
+        queries.get_pattern_insights,
+        source=source,
+        underlying=underlying,
     )
 
 
@@ -111,6 +113,38 @@ async def get_backtest_run(run_id: int, request: Request) -> dict:
     return run
 
 
+@router.post("/runs/{run_id}/share")
+async def share_backtest_run(run_id: int, request: Request) -> dict:
+    """Mint (or return) a public share token for a completed run.
+
+    Turns a run into a shareable "prove it" report at
+    ``/backtesting/shared/<token>``. Owner-scoped; only completed runs qualify.
+    """
+    end_user, _ = resolve_end_user(request)
+    token = await asyncio.to_thread(queries.share_run, run_id, end_user=end_user)
+    if token is None:
+        raise HTTPException(status_code=404, detail="run not found or not shareable")
+    return {"share_token": token, "path": f"/backtesting/shared/{token}"}
+
+
+@router.get("/runs/shared/{share_token}")
+async def get_shared_backtest_run(share_token: str) -> dict:
+    """Public read of a shared run's result (no owner scoping)."""
+    run = await asyncio.to_thread(queries.get_shared_run, share_token)
+    if run is None:
+        raise HTTPException(status_code=404, detail="shared run not found")
+    return run
+
+
+@router.get("/runs/shared/{share_token}/equity")
+async def get_shared_backtest_equity(share_token: str) -> list[dict]:
+    """Public equity curve for a shared run."""
+    equity = await asyncio.to_thread(queries.get_shared_equity, share_token)
+    if equity is None:
+        raise HTTPException(status_code=404, detail="shared run not found")
+    return equity
+
+
 @router.get("/runs/{run_id}/trades")
 async def get_backtest_trades(
     run_id: int,
@@ -128,11 +162,28 @@ async def get_backtest_trades(
 
 # CSV columns for the trade-blotter export (flat fields only; ``legs`` omitted).
 _CSV_COLUMNS = [
-    "seq", "structure", "pattern", "direction", "tier", "option_symbol",
-    "option_type", "strike", "expiration", "entered_at", "exited_at",
-    "entry_premium", "exit_premium", "contracts", "net_pnl", "return_pct",
-    "outcome", "hold_minutes", "net_delta", "net_vega",
-    "gamma_regime", "msi_regime",
+    "seq",
+    "structure",
+    "pattern",
+    "direction",
+    "tier",
+    "option_symbol",
+    "option_type",
+    "strike",
+    "expiration",
+    "entered_at",
+    "exited_at",
+    "entry_premium",
+    "exit_premium",
+    "contracts",
+    "net_pnl",
+    "return_pct",
+    "outcome",
+    "hold_minutes",
+    "net_delta",
+    "net_vega",
+    "gamma_regime",
+    "msi_regime",
 ]
 
 
@@ -284,14 +335,12 @@ async def delete_backtest_config(config_id: int, request: Request) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _create_sweep_sync(base_spec: BacktestSpec, axes: list,
-                       end_user: Optional[str]) -> dict:
+def _create_sweep_sync(base_spec: BacktestSpec, axes: list, end_user: Optional[str]) -> dict:
     return sweeps.create_sweep(base_spec, axes, end_user=end_user)
 
 
 @router.post("/sweeps", status_code=202)
-async def create_backtest_sweep(request: Request,
-                                background_tasks: BackgroundTasks) -> dict:
+async def create_backtest_sweep(request: Request, background_tasks: BackgroundTasks) -> dict:
     """Run a base spec across a parameter grid; one queued child run per cell."""
     try:
         body = await request.json()
@@ -308,9 +357,7 @@ async def create_backtest_sweep(request: Request,
 
     end_user, _ = resolve_end_user(request)
     try:
-        result = await asyncio.to_thread(
-            _create_sweep_sync, base_spec, axes, end_user
-        )
+        result = await asyncio.to_thread(_create_sweep_sync, base_spec, axes, end_user)
     except SweepError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except Exception:
