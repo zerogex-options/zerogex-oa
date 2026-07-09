@@ -105,6 +105,52 @@ BOT_PERSONALITY: Dict[str, Dict[str, float]] = {
         "win_stdev": 0.025,
         "loss_stdev": 0.03,
     },
+    # v2 bots — personalities picked so the leaderboard tells a coherent
+    # story: the bullish spread bot is a steady positive-EV grinder, the
+    # iron condor is high-hit-rate low-magnitude, the straddle is
+    # low-hit-rate high-magnitude, and the QQQ mirrors track their SPY
+    # siblings but with slightly different profiles reflecting QQQ's
+    # generally higher realized vol.
+    "bull_momentum_climber": {
+        "trades_per_day": 1.1,
+        "win_rate": 0.57,
+        "avg_win_pct": 0.11,
+        "avg_loss_pct": -0.09,
+        "win_stdev": 0.03,
+        "loss_stdev": 0.03,
+    },
+    "range_iron_condor": {
+        "trades_per_day": 0.8,
+        "win_rate": 0.72,
+        "avg_win_pct": 0.05,
+        "avg_loss_pct": -0.13,
+        "win_stdev": 0.015,
+        "loss_stdev": 0.04,
+    },
+    "vol_expansion_straddle": {
+        "trades_per_day": 0.6,
+        "win_rate": 0.38,
+        "avg_win_pct": 0.28,
+        "avg_loss_pct": -0.10,
+        "win_stdev": 0.12,
+        "loss_stdev": 0.03,
+    },
+    "qqq_gamma_flip_breaker": {
+        "trades_per_day": 1.5,
+        "win_rate": 0.45,
+        "avg_win_pct": 0.20,
+        "avg_loss_pct": -0.11,
+        "win_stdev": 0.08,
+        "loss_stdev": 0.035,
+    },
+    "qqq_dealer_delta_pressure_rider": {
+        "trades_per_day": 1.6,
+        "win_rate": 0.51,
+        "avg_win_pct": 0.08,
+        "avg_loss_pct": -0.09,
+        "win_stdev": 0.035,
+        "loss_stdev": 0.035,
+    },
 }
 
 _CLOSE_REASONS = ("target", "stop", "time_stop", "signal", "wall_shift")

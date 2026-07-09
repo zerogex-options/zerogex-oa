@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Dict, Iterable, Type
 
 from src.tradeworkz.bots.base import BaseBot
+from src.tradeworkz.bots.bull_momentum_climber import BullMomentumClimber
 from src.tradeworkz.bots.dealer_delta_pressure_rider import DealerDeltaPressureRider
 from src.tradeworkz.bots.eod_pin_drifter import EodPinDrifter
 from src.tradeworkz.bots.gamma_flip_breaker import GammaFlipBreaker
@@ -18,7 +19,9 @@ from src.tradeworkz.bots.gamma_flip_defender import GammaFlipDefender
 from src.tradeworkz.bots.max_pain_gravitator import MaxPainGravitator
 from src.tradeworkz.bots.opening_range_hunter import OpeningRangeHunter
 from src.tradeworkz.bots.put_call_wall_bouncer import PutCallWallBouncer
+from src.tradeworkz.bots.range_iron_condor import RangeIronCondor
 from src.tradeworkz.bots.vix_regime_breakout import VixRegimeBreakout
+from src.tradeworkz.bots.vol_expansion_straddle import VolExpansionStraddle
 from src.tradeworkz.bots.vwap_reversion_scalper import VwapReversionScalper
 from src.tradeworkz.models import BotSpec
 
@@ -32,6 +35,10 @@ STRATEGY_CLASSES: Dict[str, Type[BaseBot]] = {
     "VixRegimeBreakout": VixRegimeBreakout,
     "OpeningRangeHunter": OpeningRangeHunter,
     "MaxPainGravitator": MaxPainGravitator,
+    # v2: multi-strategy expansion — verticals, iron condors, straddles.
+    "BullMomentumClimber": BullMomentumClimber,
+    "RangeIronCondor": RangeIronCondor,
+    "VolExpansionStraddle": VolExpansionStraddle,
 }
 
 
@@ -162,6 +169,116 @@ DEFAULT_ROSTER: tuple[BotSpec, ...] = (
             "underlying is materially displaced and gamma is positive."
         ),
         params={"min_drift_pct": 0.004, "max_hold_minutes": 1440},
+    ),
+    # ── v2 additions ────────────────────────────────────────────────
+    # Purposefully differentiated by:
+    #   * DIRECTION — bull_momentum_climber is the fleet's first
+    #     dedicated bullish bot; range_iron_condor is neutral-theta;
+    #     vol_expansion_straddle is neutral-vega. Together they
+    #     rebalance the fleet's average delta away from short-only.
+    #   * STRUCTURE — verticals cap risk vs naked debits; iron condor
+    #     and straddle both use multi-leg structures the pricing
+    #     layer already supports via build_iron_condor / build_straddle.
+    #   * UNIVERSE — the QQQ variants use identical strategy classes
+    #     as their SPY siblings; the engine builds a per-underlying
+    #     snapshot at tick time so the same code trades the QQQ chain
+    #     when `universe='QQQ'`.
+    BotSpec(
+        id="bull_momentum_climber",
+        display_name="Bull Momentum Climber",
+        strategy_class="BullMomentumClimber",
+        tier="0DTE",
+        direction_mode="bullish",
+        universe="SPY",
+        tagline="Positive-γ climbing above VWAP and flip. Buy the call debit spread.",
+        description=(
+            "Fires only when spot has cleared VWAP AND gamma_flip in a "
+            "positive-γ regime with confirming 5-bar momentum. Enters a "
+            "narrow bull call debit spread targeting the call wall; stop "
+            "is a break back below the flip."
+        ),
+        params={
+            "min_trend_pct": 0.0015,
+            "min_wall_room_pct": 0.003,
+            "max_hold_minutes": 60,
+            "dte_target": 0,
+        },
+    ),
+    BotSpec(
+        id="range_iron_condor",
+        display_name="Range Iron Condor",
+        strategy_class="RangeIronCondor",
+        tier="0DTE",
+        direction_mode="neutral",
+        universe="SPY",
+        tagline="Positive-γ pin, low VIX. Sell the condor between the walls.",
+        description=(
+            "Sells a symmetric iron condor when spot is between the put "
+            "and call walls in positive-γ with subdued VIX. Non-"
+            "directional theta capture with wing-capped downside."
+        ),
+        params={
+            "max_vix": 18.0,
+            "min_wall_span_pct": 0.008,
+            "wing_width": 2,
+            "short_buffer": 2,
+            "max_hold_minutes": 180,
+            "dte_target": 0,
+        },
+    ),
+    BotSpec(
+        id="vol_expansion_straddle",
+        display_name="Vol Expansion Straddle",
+        strategy_class="VolExpansionStraddle",
+        tier="0DTE",
+        direction_mode="neutral",
+        universe="SPY",
+        tagline="Compressed vol + tight range + short γ. Buy the straddle.",
+        description=(
+            "Buys an ATM straddle when VIX is compressed, SPY has ranged "
+            "tightly, and gamma is negative — the setup where a breakout "
+            "in either direction reinforces via dealer hedging."
+        ),
+        params={
+            "max_vix": 16.0,
+            "max_range_pct": 0.006,
+            "max_hold_minutes": 120,
+            "dte_target": 0,
+        },
+    ),
+    # ── QQQ variants — same strategy class, different underlying ─────
+    BotSpec(
+        id="qqq_gamma_flip_breaker",
+        display_name="QQQ Gamma Flip Breaker",
+        strategy_class="GammaFlipBreaker",
+        tier="0DTE",
+        direction_mode="context",
+        universe="QQQ",
+        tagline="QQQ version. Ride the breakout across the flip.",
+        description=(
+            "QQQ momentum-through-flip variant of gamma_flip_breaker. "
+            "Same regime + trend-confirmation logic on the QQQ chain."
+        ),
+        params={
+            "cross_min_pct": 0.0015,
+            "flip_reentry_pct": 0.0008,
+            "max_hold_minutes": 60,
+        },
+    ),
+    BotSpec(
+        id="qqq_dealer_delta_pressure_rider",
+        display_name="QQQ Dealer Delta Pressure Rider",
+        strategy_class="DealerDeltaPressureRider",
+        tier="0DTE",
+        direction_mode="context",
+        universe="QQQ",
+        tagline="QQQ dealer-delta momentum in short-γ. Follow the hedging.",
+        description=(
+            "QQQ momentum-follow variant of dealer_delta_pressure_rider. "
+            "Fires in negative-γ when dealer delta is heavily one-sided "
+            "and recent QQQ tape agrees."
+        ),
+        params={"delta_threshold": 3.0e8, "max_hold_minutes": 60},
     ),
 )
 

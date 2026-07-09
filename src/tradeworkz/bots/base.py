@@ -17,13 +17,34 @@ helpers are shared boilerplate.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from src.tradeworkz.context import MarketSnapshot
 from src.tradeworkz.models import BotSpec, ExitDecision, Leg, OpenPosition, TradeSignal
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_expiration_iso(from_et_date: date, dte_target: int) -> str:
+    """ISO expiration date ``dte_target`` trading days after ``from_et_date``.
+
+    ``dte_target == 0`` returns ``from_et_date`` (same-day 0DTE). Positive
+    values walk forward counting only weekdays — Sat / Sun are skipped so
+    a "1DTE" entered on Friday resolves to the following Monday, matching
+    what an options chain actually offers. Holidays aren't accounted for
+    at this level; the ingest layer either has the expiration or it
+    doesn't, and the spread_price lookup fails closed if not.
+    """
+    if dte_target <= 0:
+        return from_et_date.isoformat()
+    d = from_et_date
+    counted = 0
+    while counted < dte_target:
+        d = d + timedelta(days=1)
+        if d.weekday() < 5:  # Mon..Fri
+            counted += 1
+    return d.isoformat()
 
 
 class BaseBot:
@@ -211,6 +232,120 @@ class BaseBot:
                 side="short",
                 option_type=option_type,
                 strike=short_strike,
+                expiration=expiration,
+            ),
+        ]
+
+    def build_straddle(
+        self,
+        underlying: str,
+        strike: float,
+        expiration: str,
+    ) -> List[Leg]:
+        """Long straddle — buy an ATM call and put at the same strike.
+
+        Non-directional volatility bet: profits when the underlying moves
+        far enough in EITHER direction to overcome the combined premium.
+        Sizing sees `entry_price` as the total debit paid for both legs.
+        """
+        return [
+            Leg(
+                option_symbol=_synthetic_option_symbol(underlying, "call", strike, expiration),
+                side="long",
+                option_type="call",
+                strike=strike,
+                expiration=expiration,
+            ),
+            Leg(
+                option_symbol=_synthetic_option_symbol(underlying, "put", strike, expiration),
+                side="long",
+                option_type="put",
+                strike=strike,
+                expiration=expiration,
+            ),
+        ]
+
+    def build_strangle(
+        self,
+        underlying: str,
+        call_strike: float,
+        put_strike: float,
+        expiration: str,
+    ) -> List[Leg]:
+        """Long strangle — buy an OTM call above and OTM put below spot.
+
+        Similar payoff to a straddle but cheaper because both legs start
+        OTM. ``call_strike`` should be > spot, ``put_strike`` < spot.
+        """
+        return [
+            Leg(
+                option_symbol=_synthetic_option_symbol(underlying, "call", call_strike, expiration),
+                side="long",
+                option_type="call",
+                strike=call_strike,
+                expiration=expiration,
+            ),
+            Leg(
+                option_symbol=_synthetic_option_symbol(underlying, "put", put_strike, expiration),
+                side="long",
+                option_type="put",
+                strike=put_strike,
+                expiration=expiration,
+            ),
+        ]
+
+    def build_iron_condor(
+        self,
+        underlying: str,
+        put_long_strike: float,
+        put_short_strike: float,
+        call_short_strike: float,
+        call_long_strike: float,
+        expiration: str,
+    ) -> List[Leg]:
+        """Short iron condor — sell one call and one put, buy wings for protection.
+
+        Strikes must satisfy
+        ``put_long < put_short < spot < call_short < call_long``.
+        Non-directional theta play: collects premium if the underlying
+        expires between the short strikes; maximum loss is capped at
+        (wing_width − credit) per side.
+        """
+        return [
+            Leg(
+                option_symbol=_synthetic_option_symbol(
+                    underlying, "put", put_long_strike, expiration
+                ),
+                side="long",
+                option_type="put",
+                strike=put_long_strike,
+                expiration=expiration,
+            ),
+            Leg(
+                option_symbol=_synthetic_option_symbol(
+                    underlying, "put", put_short_strike, expiration
+                ),
+                side="short",
+                option_type="put",
+                strike=put_short_strike,
+                expiration=expiration,
+            ),
+            Leg(
+                option_symbol=_synthetic_option_symbol(
+                    underlying, "call", call_short_strike, expiration
+                ),
+                side="short",
+                option_type="call",
+                strike=call_short_strike,
+                expiration=expiration,
+            ),
+            Leg(
+                option_symbol=_synthetic_option_symbol(
+                    underlying, "call", call_long_strike, expiration
+                ),
+                side="long",
+                option_type="call",
+                strike=call_long_strike,
                 expiration=expiration,
             ),
         ]
