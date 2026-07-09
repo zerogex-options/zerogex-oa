@@ -26,6 +26,7 @@ lifecycle / persistence lives in ``runner.py``.
 
 from __future__ import annotations
 
+import bisect
 import logging
 import math
 import random
@@ -524,6 +525,7 @@ def _build_candidate(
     conn,
     card: CardRow,
     spec: BacktestSpec,
+    quotes_provider: Optional[Callable[[datetime, datetime], list]] = None,
 ) -> tuple[Optional[dict], str]:
     """Resolve one Card into a priced option round-trip via a forward walk.
 
@@ -596,9 +598,14 @@ def _build_candidate(
         legs = _to_vertical(legs, direction, entry_ref, getattr(spec, "width_pct", 0.01))
 
     max_hold = int(payload.get("max_hold_minutes") or _DEFAULT_MAX_HOLD_MIN)
-    quotes = fetch_quotes(
-        conn, card.underlying, card.timestamp, card.timestamp + timedelta(minutes=max_hold)
-    )
+    window_end = card.timestamp + timedelta(minutes=max_hold)
+    # Serve the underlying window from the run-level preloaded series when the
+    # caller supplied one (one fetch per run instead of one per card); else fall
+    # back to a per-card query (direct callers / tests).
+    if quotes_provider is not None:
+        quotes = quotes_provider(card.timestamp, window_end)
+    else:
+        quotes = fetch_quotes(conn, card.underlying, card.timestamp, window_end)
     quotes = [q for q in quotes if q[0] >= card.timestamp]
     if not quotes:
         return None, "outcome:no_data"
@@ -1411,6 +1418,40 @@ def _apply_cooldown(cards: list, cooldown_minutes: int) -> list:
     return kept
 
 
+def _preload_quotes_provider(conn, underlying: str, start_dt, end_dt, cards, spec):
+    """Fetch the underlying series once for the whole run and return a slicer.
+
+    Every card needs a bar window ``[card.ts, card.ts + max_hold]``; issuing one
+    ``underlying_quotes`` query per card is the run's biggest N+1. Instead we
+    fetch once over ``[start, end + longest hold]`` (a superset of every card
+    window) and return a ``(w_start, w_end) -> bars`` closure that slices it by
+    bisect. Returns ``None`` when there are no cards. All cards in a run share
+    ``spec.underlying``, so a single series is correct.
+    """
+    if not cards:
+        return None
+
+    def _hold(card) -> int:
+        if spec.exit.max_hold_minutes is not None:
+            return spec.exit.max_hold_minutes
+        payload = getattr(card, "payload", None) or {}
+        try:
+            return int(payload.get("max_hold_minutes") or _DEFAULT_MAX_HOLD_MIN)
+        except (TypeError, ValueError):
+            return _DEFAULT_MAX_HOLD_MIN
+
+    preload_end = end_dt + timedelta(minutes=max(_hold(c) for c in cards))
+    series = fetch_quotes(conn, underlying, start_dt, preload_end)
+    ts_index = [q[0] for q in series]
+
+    def _provider(w_start: datetime, w_end: datetime) -> list:
+        lo = bisect.bisect_left(ts_index, w_start)
+        hi = bisect.bisect_right(ts_index, w_end)
+        return series[lo:hi]
+
+    return _provider
+
+
 def run_backtest(
     conn,
     spec: BacktestSpec,
@@ -1449,11 +1490,14 @@ def run_backtest(
         "priced_candidates": 0,
     }
 
+    # One underlying fetch for the whole run, sliced per card (kills the N+1).
+    quotes_provider = _preload_quotes_provider(conn, spec.underlying, start_dt, end_dt, cards, spec)
+
     candidates: list[dict] = []
     total = len(cards) or 1
     for i, card in enumerate(cards):
         try:
-            cand, reason = _build_candidate(conn, _to_card_row(card), spec)
+            cand, reason = _build_candidate(conn, _to_card_row(card), spec, quotes_provider)
         except Exception:  # pragma: no cover - defensive; one bad Card must not kill the run
             logger.warning(
                 "backtest: skipping card at %s due to pricing error",

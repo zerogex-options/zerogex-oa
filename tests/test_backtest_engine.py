@@ -86,7 +86,9 @@ def test_spec_clamps_sizing_and_fill():
 def test_spec_parses_premium_overlay():
     spec = BacktestSpec.from_dict(
         {
-            "underlying": "SPY", "start_date": "2026-05-01", "end_date": "2026-05-02",
+            "underlying": "SPY",
+            "start_date": "2026-05-01",
+            "end_date": "2026-05-02",
             "exit": {"profit_target_pct": 0.5, "stop_loss_pct": 1.5},
         }
     )
@@ -167,8 +169,15 @@ def test_select_leg_none_without_entry_ref():
 # ----------------------------------------------------------------------
 
 
-def _candidate(*, seq_pnl_per_contract: float, entry_premium: float, entered: datetime,
-               exited: datetime, pattern: str = "gamma_flip_break", outcome: str = "target_hit"):
+def _candidate(
+    *,
+    seq_pnl_per_contract: float,
+    entry_premium: float,
+    entered: datetime,
+    exited: datetime,
+    pattern: str = "gamma_flip_break",
+    outcome: str = "target_hit",
+):
     return {
         "card": _card(pattern=pattern),
         "outcome": outcome,
@@ -200,15 +209,17 @@ def test_simulate_single_winning_trade_pnl_and_commission():
     # risk/contract = $200 max loss + $2 round-trip commission = $202; 10% of
     # 10k = $1000 risk → floor(1000/202) = 4 contracts.
     cand = _candidate(
-        seq_pnl_per_contract=50.0, entry_premium=2.0,
-        entered=T0, exited=T0 + timedelta(minutes=30),
+        seq_pnl_per_contract=50.0,
+        entry_premium=2.0,
+        entered=T0,
+        exited=T0 + timedelta(minutes=30),
     )
     result = _simulate([cand], spec)
     assert len(result.trades) == 1
     tr = result.trades[0]
     assert tr.contracts == 4
     assert tr.gross_pnl == pytest.approx(200.0)  # 50 * 4
-    assert tr.commission == pytest.approx(8.0)   # 1.0 * 1 leg * 2 sides * 4
+    assert tr.commission == pytest.approx(8.0)  # 1.0 * 1 leg * 2 sides * 4
     assert tr.net_pnl == pytest.approx(192.0)
     assert result.summary["n_trades"] == 1
     assert result.summary["win_rate"] == 1.0
@@ -225,14 +236,18 @@ def test_simulate_tiny_risk_trade_is_bounded():
     """
     spec = BacktestSpec.from_dict(
         {
-            "underlying": "SPY", "start_date": "2026-05-01", "end_date": "2026-05-01",
+            "underlying": "SPY",
+            "start_date": "2026-05-01",
+            "end_date": "2026-05-01",
             "fill_model": {"slippage_pct": 0.0, "commission_per_contract": 0.65},
             "sizing": {"capital": 25_000, "risk_per_trade_pct": 2, "max_concurrent": 5},
         }
     )
     cand = _candidate(
-        seq_pnl_per_contract=-5.0, entry_premium=0.05,  # 5¢ spread, loses its $5 max
-        entered=T0, exited=T0 + timedelta(minutes=10),
+        seq_pnl_per_contract=-5.0,
+        entry_premium=0.05,  # 5¢ spread, loses its $5 max
+        entered=T0,
+        exited=T0 + timedelta(minutes=10),
     )
     cand["max_loss_per_share"] = 0.05  # $5/contract
     cand["n_legs"] = 2
@@ -255,10 +270,15 @@ def test_simulate_concurrency_cap_skips_overlap():
         }
     )
     # Two trades that overlap in time; max_concurrent=1 → second is skipped.
-    a = _candidate(seq_pnl_per_contract=20.0, entry_premium=1.0,
-                   entered=T0, exited=T0 + timedelta(minutes=60))
-    b = _candidate(seq_pnl_per_contract=20.0, entry_premium=1.0,
-                   entered=T0 + timedelta(minutes=10), exited=T0 + timedelta(minutes=70))
+    a = _candidate(
+        seq_pnl_per_contract=20.0, entry_premium=1.0, entered=T0, exited=T0 + timedelta(minutes=60)
+    )
+    b = _candidate(
+        seq_pnl_per_contract=20.0,
+        entry_premium=1.0,
+        entered=T0 + timedelta(minutes=10),
+        exited=T0 + timedelta(minutes=70),
+    )
     result = _simulate([a, b], spec)
     assert len(result.trades) == 1  # second overlapping trade skipped
 
@@ -273,10 +293,16 @@ def test_simulate_drawdown_is_negative_after_loss():
             "sizing": {"capital": 10_000, "risk_per_trade_pct": 5, "max_concurrent": 5},
         }
     )
-    win = _candidate(seq_pnl_per_contract=30.0, entry_premium=1.0,
-                     entered=T0, exited=T0 + timedelta(minutes=10))
-    loss = _candidate(seq_pnl_per_contract=-40.0, entry_premium=1.0, outcome="stop_hit",
-                      entered=T0 + timedelta(minutes=20), exited=T0 + timedelta(minutes=30))
+    win = _candidate(
+        seq_pnl_per_contract=30.0, entry_premium=1.0, entered=T0, exited=T0 + timedelta(minutes=10)
+    )
+    loss = _candidate(
+        seq_pnl_per_contract=-40.0,
+        entry_premium=1.0,
+        outcome="stop_hit",
+        entered=T0 + timedelta(minutes=20),
+        exited=T0 + timedelta(minutes=30),
+    )
     result = _simulate([win, loss], spec)
     assert result.summary["n_trades"] == 2
     assert result.summary["max_drawdown_pct"] < 0.0
@@ -388,38 +414,83 @@ def test_run_backtest_end_to_end(monkeypatch):
     assert diag["drops"] == {}
 
 
+def _count_underlying_fetches(n_cards: int):
+    """Run a backtest with ``n_cards`` and count underlying_quotes SELECTs."""
+    ts = datetime(2026, 5, 1, 14, 0, tzinfo=ET)
+    cards = [_legcard(ts=ts + timedelta(minutes=i)) for i in range(n_cards)]
+    quotes = [(ts + timedelta(minutes=m), 500.0, 503.4, 499.8, 503.1) for m in range(0, 40)]
+    leg_quote = ("SPY 260501C500", 500.0, date(2026, 5, 1), "C", 2.00, 2.10, 2.05, 2.05, ts)
+    store = {"cards": cards, "quotes": quotes, "leg_quote": leg_quote, "opt_series": []}
+    counter = {"underlying": 0}
+
+    class _CountingCursor(_FakeCursor):
+        def execute(self, sql, params=None):
+            if "FROM underlying_quotes" in " ".join(sql.split()):
+                counter["underlying"] += 1
+            super().execute(sql, params)
+
+    class _CountingConn:
+        def cursor(self):
+            return _CountingCursor(store)
+
+    result = run_backtest(_CountingConn(), _bt_spec())
+    return counter["underlying"], result.summary["n_trades"]
+
+
+def test_run_backtest_underlying_fetch_does_not_scale_with_cards():
+    """The N+1 is gone: underlying fetches are constant, not one-per-card.
+
+    (A fixed handful remain: one run-level preload + the benchmark's two.)
+    """
+    c3, n3 = _count_underlying_fetches(3)
+    c8, n8 = _count_underlying_fetches(8)
+    assert c3 == c8  # constant in card count — the whole point
+    assert n3 > 0 and n8 > 0  # cards still priced through the preloaded series
+
+
 # ----------------------------------------------------------------------
 # Cooldown / dedup
 # ----------------------------------------------------------------------
 
 
 def _bt_spec(**over):
-    base = {"underlying": "SPY", "start_date": "2026-05-01", "end_date": "2026-05-01",
-            "cooldown_minutes": 0,
-            "fill_model": {"slippage_pct": 0.0, "commission_per_contract": 0.0}}
+    base = {
+        "underlying": "SPY",
+        "start_date": "2026-05-01",
+        "end_date": "2026-05-01",
+        "cooldown_minutes": 0,
+        "fill_model": {"slippage_pct": 0.0, "commission_per_contract": 0.0},
+    }
     base.update(over)
     return BacktestSpec.from_dict(base)
 
 
 def _conn_with(cards, quotes, leg_quote, opt_series=None):
-    return _FakeConn({
-        "cards": cards, "quotes": quotes, "leg_quote": leg_quote,
-        "opt_series": opt_series or [],
-    })
+    return _FakeConn(
+        {
+            "cards": cards,
+            "quotes": quotes,
+            "leg_quote": leg_quote,
+            "opt_series": opt_series or [],
+        }
+    )
 
 
 def run_backtest_single(conn, spec=None):
     """Load the first card via the real fetch + resolve it through _build_candidate."""
     spec = spec or _bt_spec()
     cards = fetch_action_cards(
-        conn, "SPY",
-        datetime(2026, 5, 1, tzinfo=ET), datetime(2026, 5, 2, tzinfo=ET),
+        conn,
+        "SPY",
+        datetime(2026, 5, 1, tzinfo=ET),
+        datetime(2026, 5, 2, tzinfo=ET),
     )
     return _build_candidate(conn, cards[0], spec)
 
 
-def _legcard(*, direction="bullish", entry=500.0, target=503.0, stop=498.0,
-             trigger="at_market", ts=None):
+def _legcard(
+    *, direction="bullish", entry=500.0, target=503.0, stop=498.0, trigger="at_market", ts=None
+):
     ts = ts or datetime(2026, 5, 1, 14, 0, tzinfo=ET)
     payload = {
         "entry": {"ref_price": entry, "trigger": trigger},
@@ -442,23 +513,23 @@ def test_build_candidate_min_hold_no_same_bar_roundtrip():
     # Entry bar's range spans BOTH entry (500) and target (503); the next bar
     # never reaches the target.
     quotes = [
-        (ts, 500.0, 503.5, 499.8, 500.2),                       # fill bar (touches target)
+        (ts, 500.0, 503.5, 499.8, 500.2),  # fill bar (touches target)
         (ts + timedelta(minutes=5), 500.2, 501.0, 500.0, 500.5),  # later bar: no target
     ]
     leg_quote = ("SPY 260501C500", 500.0, date(2026, 5, 1), "C", 2.00, 2.10, 2.05, 2.05, ts)
     conn = _conn_with([_legcard()], quotes, leg_quote)
     cand, reason = run_backtest_single(conn)
     assert reason == "ok"
-    assert cand["outcome"] == "time_exit"          # NOT target_hit on the entry bar
+    assert cand["outcome"] == "time_exit"  # NOT target_hit on the entry bar
     assert cand["entered_at"] == ts
     assert cand["exited_at"] == ts + timedelta(minutes=5)
-    assert cand["hold_minutes"] == 5               # real hold, not 0
+    assert cand["hold_minutes"] == 5  # real hold, not 0
 
 
 def test_build_candidate_target_hit_on_later_bar():
     ts = datetime(2026, 5, 1, 14, 0, tzinfo=ET)
     quotes = [
-        (ts, 500.0, 500.5, 499.8, 500.2),                          # fill bar
+        (ts, 500.0, 500.5, 499.8, 500.2),  # fill bar
         (ts + timedelta(minutes=10), 500.2, 503.4, 500.0, 503.1),  # target hit here
     ]
     leg_quote = ("SPY 260501C500", 500.0, date(2026, 5, 1), "C", 2.00, 2.10, 2.05, 2.05, ts)
@@ -473,17 +544,17 @@ def test_build_candidate_touch_trigger_fills_at_touch_bar():
     # on_break entry at 500: bar0 never reaches 500; bar1 touches it (fill); bar2
     # hits the target. Entry must be dated to bar1, not the Card timestamp.
     quotes = [
-        (ts, 501.0, 501.5, 500.8, 501.2),                          # no fill (low 500.8 > 500)
-        (ts + timedelta(minutes=3), 500.9, 501.5, 499.9, 500.4),   # touches 500 → fill here
-        (ts + timedelta(minutes=8), 500.4, 503.6, 500.2, 503.3),   # target hit
+        (ts, 501.0, 501.5, 500.8, 501.2),  # no fill (low 500.8 > 500)
+        (ts + timedelta(minutes=3), 500.9, 501.5, 499.9, 500.4),  # touches 500 → fill here
+        (ts + timedelta(minutes=8), 500.4, 503.6, 500.2, 503.3),  # target hit
     ]
     leg_quote = ("SPY 260501C500", 500.0, date(2026, 5, 1), "C", 2.00, 2.10, 2.05, 2.05, ts)
     cand, reason = run_backtest_single(
         _conn_with([_legcard(trigger="on_break")], quotes, leg_quote)
     )
     assert reason == "ok"
-    assert cand["entered_at"] == ts + timedelta(minutes=3)   # filled at the touch bar
-    assert cand["exited_at"] == ts + timedelta(minutes=8)    # target on a later bar
+    assert cand["entered_at"] == ts + timedelta(minutes=3)  # filled at the touch bar
+    assert cand["exited_at"] == ts + timedelta(minutes=8)  # target on a later bar
     assert cand["outcome"] == "target_hit"
 
 
@@ -516,8 +587,16 @@ def _prem_card(*, ts):
         "max_hold_minutes": 120,
         "legs": [{"expiry": "2026-05-01", "strike": 500, "right": "C", "side": "BUY"}],
     }
-    return ("SPY", ts, "pin_risk_premium_sell", "BUY_CALL", "0DTE", "bullish", 0.7,
-            json.dumps(payload))
+    return (
+        "SPY",
+        ts,
+        "pin_risk_premium_sell",
+        "BUY_CALL",
+        "0DTE",
+        "bullish",
+        0.7,
+        json.dumps(payload),
+    )
 
 
 def test_premium_overlay_rescues_unresolved_card():
@@ -538,7 +617,7 @@ def test_premium_overlay_rescues_unresolved_card():
     cand, reason = run_backtest_single(
         _conn_with([_prem_card(ts=ts)], quotes, leg_quote, opt_series), spec
     )
-    assert reason == "ok"                              # no longer "unresolved"
+    assert reason == "ok"  # no longer "unresolved"
     assert cand["outcome"] == "target_hit"
     assert cand["exited_at"] == ts + timedelta(minutes=10)
     assert cand["exit_premium"] == pytest.approx(3.10)  # priced from the series row
@@ -649,7 +728,7 @@ def test_defined_risk_clamp_bounds_vertical_loss():
     ]
     # Debit 1.40 (open_cashflow −1.40) on a 5-wide: P&L bounded to [-1.40, 3.60].
     assert _defined_risk_clamp(-9.9, -1.40, legs) == pytest.approx(-1.40)  # overshoot clamped
-    assert _defined_risk_clamp(99.0, -1.40, legs) == pytest.approx(3.60)   # gain capped at width
+    assert _defined_risk_clamp(99.0, -1.40, legs) == pytest.approx(3.60)  # gain capped at width
     assert _defined_risk_clamp(-0.50, -1.40, legs) == pytest.approx(-0.50)  # within bounds
     # Credit spread (credit 1.50 ⇒ open_cashflow +1.50, 5-wide): bounded [−3.50, 1.50].
     assert _defined_risk_clamp(-9.0, 1.50, legs) == pytest.approx(-3.50)
@@ -668,26 +747,33 @@ def test_position_greeks_long_adds_short_subtracts():
         {"side": "short", "delta": 0.30, "vega": 0.08, "qty": 1},
     ]
     d, v = _position_greeks(legs)
-    assert d == pytest.approx((0.50 - 0.30) * 100.0)   # 20 net delta
-    assert v == pytest.approx((0.10 - 0.08) * 100.0)   # 2 net vega
+    assert d == pytest.approx((0.50 - 0.30) * 100.0)  # 20 net delta
+    assert v == pytest.approx((0.10 - 0.08) * 100.0)  # 2 net vega
 
 
 def test_simulate_greeks_delta_cap():
     spec = BacktestSpec.from_dict(
         {
-            "underlying": "SPY", "start_date": "2026-05-01", "end_date": "2026-05-01",
+            "underlying": "SPY",
+            "start_date": "2026-05-01",
+            "end_date": "2026-05-01",
             "fill_model": {"slippage_pct": 0.0, "commission_per_contract": 0.0},
-            "sizing": {"capital": 100_000, "risk_per_trade_pct": 50, "max_concurrent": 5,
-                       "max_net_delta": 200},
+            "sizing": {
+                "capital": 100_000,
+                "risk_per_trade_pct": 50,
+                "max_concurrent": 5,
+                "max_net_delta": 200,
+            },
         }
     )
-    cand = _candidate(seq_pnl_per_contract=10.0, entry_premium=0.5,
-                      entered=T0, exited=T0 + timedelta(minutes=10))
-    cand["max_loss_per_share"] = 0.5     # $50/contract ⇒ risk allows ~100s
-    cand["delta_per_contract"] = 50.0    # 50 deltas/contract ⇒ delta cap binds
+    cand = _candidate(
+        seq_pnl_per_contract=10.0, entry_premium=0.5, entered=T0, exited=T0 + timedelta(minutes=10)
+    )
+    cand["max_loss_per_share"] = 0.5  # $50/contract ⇒ risk allows ~100s
+    cand["delta_per_contract"] = 50.0  # 50 deltas/contract ⇒ delta cap binds
     result = _simulate([cand], spec)
     tr = result.trades[0]
-    assert tr.contracts == 4             # 200 / 50
+    assert tr.contracts == 4  # 200 / 50
     assert tr.net_delta == pytest.approx(200.0)
 
 
@@ -809,8 +895,14 @@ def test_build_candidate_neutral_straddle_prices_and_exits_on_premium():
         ],
     }
     card = CardRow(
-        underlying="SPY", timestamp=ts, pattern="custom_strategy", action="STRADDLE",
-        tier="custom", direction="neutral", confidence=0.0, payload=payload,
+        underlying="SPY",
+        timestamp=ts,
+        pattern="custom_strategy",
+        action="STRADDLE",
+        tier="custom",
+        direction="neutral",
+        confidence=0.0,
+        payload=payload,
     )
     quotes = [  # underlying barely moves; the straddle exits on premium, not level
         (ts, 500.0, 500.1, 499.9, 500.0),
@@ -832,7 +924,7 @@ def test_build_candidate_neutral_straddle_prices_and_exits_on_premium():
     assert reason == "ok"
     assert cand["structure"] == "straddle"
     assert cand["n_legs"] == 2
-    assert cand["outcome"] == "target_hit"   # premium take-profit
+    assert cand["outcome"] == "target_hit"  # premium take-profit
     assert cand["entry_premium"] == pytest.approx(4.10)  # net debit
 
 
@@ -852,8 +944,9 @@ class _CreditCur:
         elif "option_symbol = %s" in t and "timestamp > %s" in t:
             self._r = list(self._s["series"].get(params[0], []))
         elif "FROM option_chains" in t and params is not None:
-            strike = next((p for p in params if isinstance(p, (int, float)) and p in self._s["legs"]),
-                          None)
+            strike = next(
+                (p for p in params if isinstance(p, (int, float)) and p in self._s["legs"]), None
+            )
             self._r = [self._s["legs"][strike]] if strike is not None else []
         else:
             self._r = []
@@ -896,8 +989,14 @@ def test_build_candidate_credit_spread_profit_target_is_reachable():
         ],
     }
     card = CardRow(
-        underlying="SPY", timestamp=ts, pattern="custom", action="SELL_CALL_SPREAD",
-        tier="custom", direction="bearish", confidence=0.0, payload=payload,
+        underlying="SPY",
+        timestamp=ts,
+        pattern="custom",
+        action="SELL_CALL_SPREAD",
+        tier="custom",
+        direction="bearish",
+        confidence=0.0,
+        payload=payload,
     )
     quotes = [
         (ts, 500.0, 500.1, 499.9, 500.0),
@@ -922,15 +1021,15 @@ def test_build_candidate_credit_spread_profit_target_is_reachable():
     assert reason == "ok"
     assert cand["structure"] == "vertical"
     assert cand["entry_premium"] == pytest.approx(-1.40)  # net credit
-    assert cand["outcome"] == "target_hit"                 # reachable now
+    assert cand["outcome"] == "target_hit"  # reachable now
 
 
 def test_apply_cooldown_collapses_rapid_same_pattern_cards():
     cards = [
         _card(pattern="p", ts=T0),
-        _card(pattern="p", ts=T0 + timedelta(minutes=5)),    # within 30m → dropped
-        _card(pattern="p", ts=T0 + timedelta(minutes=35)),   # >=30m → kept
-        _card(pattern="q", ts=T0 + timedelta(minutes=1)),    # different pattern → kept
+        _card(pattern="p", ts=T0 + timedelta(minutes=5)),  # within 30m → dropped
+        _card(pattern="p", ts=T0 + timedelta(minutes=35)),  # >=30m → kept
+        _card(pattern="q", ts=T0 + timedelta(minutes=1)),  # different pattern → kept
     ]
     kept = _apply_cooldown(cards, cooldown_minutes=30)
     times = sorted((c.pattern, c.timestamp) for c in kept)
@@ -976,8 +1075,12 @@ def test_run_backtest_diagnostics_explains_missing_quote(monkeypatch):
             return _NoLegCursor(self._store)
 
     spec = BacktestSpec.from_dict(
-        {"underlying": "SPY", "start_date": "2026-05-01", "end_date": "2026-05-01",
-         "cooldown_minutes": 0}
+        {
+            "underlying": "SPY",
+            "start_date": "2026-05-01",
+            "end_date": "2026-05-01",
+            "cooldown_minutes": 0,
+        }
     )
     result = run_backtest(_NoLegConn(store), spec)
     assert result.summary["n_trades"] == 0
