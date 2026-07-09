@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import math
+import random
 from datetime import date, datetime, timedelta
 from typing import Callable, Optional
 
@@ -1117,6 +1118,16 @@ def _risk_metrics(
     net_all = [t.net_pnl for t in trades]
     ret_pcts = [t.return_pct for t in trades if t.return_pct is not None]
 
+    # A one-sample t-stat on per-trade P&L: is the average trade's edge
+    # distinguishable from zero? |t| ≳ 2 is the usual "not just noise" bar. Cheap
+    # and honest — a headline win rate says nothing about statistical strength.
+    net_std = _sample_std(net_all)
+    tstat = (
+        round(_mean(net_all) / (net_std / math.sqrt(len(net_all))), 2)
+        if net_std > 0 and len(net_all) > 1
+        else None
+    )
+
     return {
         "sharpe": sharpe,
         "sortino": sortino,
@@ -1125,6 +1136,7 @@ def _risk_metrics(
         "annual_volatility_pct": ann_vol,
         "expectancy": round(_mean(net_all), 2) if net_all else None,
         "expectancy_pct": round(_mean(ret_pcts), 2) if ret_pcts else None,
+        "expectancy_tstat": tstat,
         "avg_win": round(avg_win, 2) if avg_win is not None else None,
         "avg_loss": round(avg_loss, 2) if avg_loss is not None else None,
         "payoff_ratio": payoff,
@@ -1139,6 +1151,109 @@ def _risk_metrics(
     }
 
 
+# ---------------------------------------------------------------------------
+# Monte Carlo — a strategy's edge is a distribution, not a single equity line.
+# Bootstrapping the realized trade sequence (resample with replacement) answers
+# the questions a single backtest cannot: what's the *range* of outcomes, how
+# often would this have lost money, and how deep could the drawdown plausibly
+# get? Deterministic (fixed seed) so a given run reproduces its own cone.
+# ---------------------------------------------------------------------------
+_MC_ITERS = 1000
+_MC_MIN_TRADES = 8
+_MC_CONE_STEPS = 40
+_MC_SEED = 1_234_567
+
+
+def _percentile(sorted_xs: list, q: float):
+    """Linear-interpolation percentile of an already-sorted, non-empty list."""
+    if not sorted_xs:
+        return None
+    if len(sorted_xs) == 1:
+        return sorted_xs[0]
+    pos = q * (len(sorted_xs) - 1)
+    lo = math.floor(pos)
+    hi = math.ceil(pos)
+    if lo == hi:
+        return sorted_xs[lo]
+    return sorted_xs[lo] * (hi - pos) + sorted_xs[hi] * (pos - lo)
+
+
+def _monte_carlo(trades: list[TradeResult], capital: float) -> Optional[dict]:
+    """Bootstrap the trade sequence into an outcome distribution + equity cone.
+
+    Resamples per-trade P&L with replacement over ``_MC_ITERS`` paths. Returns
+    percentile terminal returns, the median / 95th-percentile max drawdown, the
+    probability of ending profitable, the risk of a ≥50% drawdown ("ruin"), and
+    a downsampled p5/p50/p95 equity cone across trade index. ``None`` when there
+    are too few trades to say anything meaningful.
+    """
+    pnls = [t.net_pnl for t in trades]
+    n = len(pnls)
+    if n < _MC_MIN_TRADES or capital <= 0:
+        return None
+    rng = random.Random(_MC_SEED)
+    cone_steps = sorted(
+        {max(1, round(i * n / _MC_CONE_STEPS)) for i in range(1, _MC_CONE_STEPS + 1)}
+    )
+    cone_acc: dict[int, list] = {k: [] for k in cone_steps}
+    terminals: list[float] = []
+    maxdds: list[float] = []
+    prof = dd20 = ruin = 0
+    for _ in range(_MC_ITERS):
+        eq = capital
+        peak = capital
+        mdd = 0.0
+        for i in range(1, n + 1):
+            eq += pnls[rng.randrange(n)]
+            if eq > peak:
+                peak = eq
+            dd = 0.0 if peak <= 0 else (eq - peak) / peak * 100.0
+            if dd < mdd:
+                mdd = dd
+            if i in cone_acc:
+                cone_acc[i].append(eq)
+        terminals.append(eq)
+        maxdds.append(mdd)
+        prof += eq > capital
+        dd20 += mdd <= -20.0
+        ruin += mdd <= -50.0
+    terminals.sort()
+    maxdds.sort()
+
+    def _ret(e):
+        return round((e - capital) / capital * 100.0, 2)
+
+    cone = []
+    for k in cone_steps:
+        vals = sorted(cone_acc[k])
+        if vals:
+            cone.append(
+                {
+                    "i": k,
+                    "p5": round(_percentile(vals, 0.05), 2),
+                    "p50": round(_percentile(vals, 0.50), 2),
+                    "p95": round(_percentile(vals, 0.95), 2),
+                }
+            )
+    return {
+        "iterations": _MC_ITERS,
+        "terminal_return_pct": {
+            "p5": _ret(_percentile(terminals, 0.05)),
+            "p50": _ret(_percentile(terminals, 0.50)),
+            "p95": _ret(_percentile(terminals, 0.95)),
+        },
+        # Drawdowns are negative; the "p95 worst" is the 5th percentile of signed dd.
+        "max_drawdown_pct": {
+            "p50": round(_percentile(maxdds, 0.50), 2),
+            "p95": round(_percentile(maxdds, 0.05), 2),
+        },
+        "prob_profit": round(prof / _MC_ITERS, 3),
+        "prob_drawdown_gt_20pct": round(dd20 / _MC_ITERS, 3),
+        "risk_of_ruin_50pct": round(ruin / _MC_ITERS, 3),
+        "cone": cone,
+    }
+
+
 def _summarize(
     trades: list[TradeResult],
     equity: list[EquityPoint],
@@ -1147,6 +1262,7 @@ def _summarize(
     end_date: Optional[date] = None,
 ) -> dict:
     risk = _risk_metrics(trades, equity, capital, start_date, end_date)
+    monte_carlo = _monte_carlo(trades, capital)
     n = len(trades)
     if n == 0:
         return {
@@ -1160,6 +1276,7 @@ def _summarize(
             "avg_loss_pct": None,
             "avg_hold_minutes": None,
             "by_pattern": [],
+            "monte_carlo": monte_carlo,
             **risk,
         }
     wins = [t for t in trades if t.net_pnl > 0]
@@ -1212,6 +1329,7 @@ def _summarize(
             _avg(t.hold_minutes for t in trades if t.hold_minutes is not None) or 0.0, 1
         ),
         "by_pattern": by_pattern_list,
+        "monte_carlo": monte_carlo,
         **risk,
     }
 
@@ -1298,6 +1416,53 @@ def run_backtest(
 
     result = _simulate(candidates, spec)
     result.summary["diagnostics"] = {**diag, **result.summary.get("diagnostics", {})}
+    bench = _benchmark(conn, spec, start_dt, end_dt)
+    if bench is not None:
+        result.summary["benchmark"] = bench
     if progress_cb is not None:
         progress_cb(1.0)
     return result
+
+
+def _benchmark(conn, spec: BacktestSpec, start_dt: datetime, end_dt: datetime) -> Optional[dict]:
+    """Buy-and-hold return of the underlying over the same window.
+
+    The honest yardstick: did the strategy beat simply owning the index it
+    trades? Returns ``{underlying, buy_hold_return_pct}`` or ``None`` when the
+    price series is unavailable. Compared against ``summary.total_return_pct``.
+    """
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT close FROM underlying_quotes
+            WHERE symbol = %s AND timestamp BETWEEN %s AND %s
+            ORDER BY timestamp ASC LIMIT 1
+            """,
+            (spec.underlying, start_dt, end_dt),
+        )
+        first = cur.fetchone()
+        cur.execute(
+            """
+            SELECT close FROM underlying_quotes
+            WHERE symbol = %s AND timestamp BETWEEN %s AND %s
+            ORDER BY timestamp DESC LIMIT 1
+            """,
+            (spec.underlying, start_dt, end_dt),
+        )
+        last = cur.fetchone()
+    except Exception:  # pragma: no cover - defensive; a benchmark is best-effort
+        logger.warning("backtest: benchmark query failed", exc_info=True)
+        return None
+    if not (first and last):
+        return None
+    try:
+        first_px, last_px = float(first[0]), float(last[0])
+    except (TypeError, ValueError):  # non-numeric (e.g. a routing fake) → skip
+        return None
+    if first_px <= 0:
+        return None
+    return {
+        "underlying": spec.underlying,
+        "buy_hold_return_pct": round((last_px - first_px) / first_px * 100.0, 2),
+    }

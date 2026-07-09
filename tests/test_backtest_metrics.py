@@ -13,6 +13,8 @@ from datetime import date, datetime, timedelta, timezone
 from src.backtesting.engine import (
     _daily_realized_equity,
     _exposure_pct,
+    _monte_carlo,
+    _percentile,
     _streaks,
     _summarize,
 )
@@ -209,3 +211,68 @@ def test_sharpe_positive_for_steady_gains():
     assert summary["cagr_pct"] is not None and summary["cagr_pct"] > 0
     assert summary["max_drawdown_pct"] == 0.0  # monotonic ⇒ calmar undefined
     assert summary["calmar"] is None
+
+
+# ----------------------------------------------------------------------
+# Monte Carlo
+# ----------------------------------------------------------------------
+
+
+def _mc_trades(pnls):
+    base = datetime(2026, 5, 4, 15, 0, tzinfo=UTC)
+    return [
+        mk_trade(
+            i + 1, float(p), base + timedelta(minutes=i), base + timedelta(minutes=i, seconds=30)
+        )
+        for i, p in enumerate(pnls)
+    ]
+
+
+def test_percentile_interpolates():
+    xs = [0.0, 10.0, 20.0, 30.0, 40.0]
+    assert _percentile(xs, 0.0) == 0.0
+    assert _percentile(xs, 1.0) == 40.0
+    assert _percentile(xs, 0.5) == 20.0
+    assert _percentile([5.0], 0.9) == 5.0
+
+
+def test_monte_carlo_none_below_min_trades():
+    assert _monte_carlo(_mc_trades([10.0] * 5), 10_000.0) is None
+
+
+def test_monte_carlo_all_winners_never_ruins():
+    mc = _monte_carlo(_mc_trades([100.0] * 20), 10_000.0)
+    assert mc is not None
+    assert mc["iterations"] == 1000
+    assert mc["prob_profit"] == 1.0
+    assert mc["risk_of_ruin_50pct"] == 0.0
+    assert mc["terminal_return_pct"]["p5"] > 0
+    # Cone ends above start and is ordered p5 ≤ p50 ≤ p95.
+    last = mc["cone"][-1]
+    assert last["p5"] <= last["p50"] <= last["p95"]
+
+
+def test_monte_carlo_all_losers_always_profitless():
+    mc = _monte_carlo(_mc_trades([-100.0] * 20), 10_000.0)
+    assert mc["prob_profit"] == 0.0
+    assert mc["terminal_return_pct"]["p95"] < 0
+
+
+def test_monte_carlo_is_deterministic():
+    trades = _mc_trades([50.0, -30.0, 80.0, -20.0, 40.0, -60.0, 20.0, 10.0, -15.0, 25.0])
+    a = _monte_carlo(trades, 10_000.0)
+    b = _monte_carlo(trades, 10_000.0)
+    assert a == b  # fixed seed ⇒ identical cone + stats
+
+
+def test_summary_includes_monte_carlo_block():
+    summary = _summarize(
+        _mc_trades([50.0, -30.0, 80.0, -20.0, 40.0, -60.0, 20.0, 10.0, -15.0, 25.0]),
+        [],
+        10_000.0,
+        date(2026, 5, 4),
+        date(2026, 5, 20),
+    )
+    assert summary["monte_carlo"] is not None
+    assert "cone" in summary["monte_carlo"]
+    assert summary["expectancy_tstat"] is not None
