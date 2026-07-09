@@ -297,6 +297,28 @@ def test_select_featured_symbol_picks_nearest_level():
     assert featured.symbol == "QQQ"
 
 
+def test_select_featured_symbol_weights_gamma_flip_over_walls():
+    """A symbol straddling its gamma flip is featured over one merely
+    pinned to a wall when the two are close — the flip is the regime
+    boundary, the higher-signal story.  Uses the real 2026-07-09 snapshot
+    where SPY sat 0.23 under its call wall (~0.031%) and QQQ sat 0.34
+    under its flip (~0.047% raw); flip-weighting tips it to QQQ."""
+    mod = _reload_module()
+    spy = mod._shape_bulletin(
+        _summary_row("SPY", spot=750.77, gamma_flip=747.77, call_wall=751.0,
+                     put_wall=750.0, max_pain=745.0, net_gex=2_530_000_000.0),
+        "SPY",
+    )
+    qqq = mod._shape_bulletin(
+        _summary_row("QQQ", spot=722.48, gamma_flip=722.82, call_wall=725.0,
+                     put_wall=715.0, max_pain=712.0, net_gex=-33_000_000.0),
+        "QQQ",
+    )
+    # Raw nearest-level distance would pick SPY (0.031% < 0.047%); the flip
+    # weight (0.6) makes QQQ's flip proximity 0.028% — so QQQ wins.
+    assert mod.select_featured_symbol([spy, qqq]).symbol == "QQQ"
+
+
 def test_select_featured_symbol_falls_back_when_none_eligible():
     """With no symbol carrying both a spot and a level, selection falls
     back to the configured lead symbol if it has any data."""
