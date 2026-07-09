@@ -182,16 +182,34 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
     sess_hi = session_row[1] if session_row else None
     sess_open = session_row[2] if session_row else None
 
-    # gex_summary — real column names differ from earlier drafts:
-    #   * total_net_gex   (not net_gex)
-    #   * gamma_flip_point (not gamma_flip)
-    #   * dealer_net_delta is not persisted, so we proxy it below using
-    #     net_gex_at_spot × 100. Signed, in the same units the
-    #     DealerDeltaPressureRider bot's threshold assumes.
+    # gex_summary columns:
+    #   * net_gex_at_spot   — DTE-horizon-occupancy-weighted gamma sampled
+    #                         at spot. This is the REGIME-CORRECT headline
+    #                         figure the rest of the site displays (see
+    #                         src/analytics/main_engine.py::_calculate_gex_summary:
+    #                         "net_gex_at_spot is the regime-correct
+    #                         headline figure; total_net_gex is retained
+    #                         as the raw chain aggregate. Downstream
+    #                         consumers must not treat them as
+    #                         interchangeable."). TradeWorkz reads it into
+    #                         snap.net_gex so bot regime gates match what
+    #                         a customer sees on /gex-heatmap and every
+    #                         other GEX-consuming page. Also used as the
+    #                         dealer_net_delta proxy since it's already
+    #                         signed and same order of magnitude.
+    #   * total_net_gex     — unweighted whole-chain sum. Kept in the
+    #                         SELECT for parity with the analytics engine
+    #                         but NOT surfaced on the MarketSnapshot.
+    #                         Occasionally disagrees in sign with the
+    #                         at-spot value when far-OTM long-dated
+    #                         strikes dominate the unweighted tail; those
+    #                         are the exact moments TradeWorkz used to
+    #                         classify the regime wrong.
+    #   * gamma_flip_point  (not gamma_flip)
     cur.execute(
         """
-        SELECT total_net_gex, gamma_flip_point, max_pain, put_call_ratio,
-               call_wall, put_wall, max_gamma_strike, net_gex_at_spot
+        SELECT net_gex_at_spot, gamma_flip_point, max_pain, put_call_ratio,
+               call_wall, put_wall, max_gamma_strike, total_net_gex
         FROM gex_summary
         WHERE underlying = %s
         ORDER BY timestamp DESC
@@ -245,19 +263,25 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
     )
     closes = [float(r[0]) for r in cur.fetchall() if r[0] is not None][::-1]
 
-    # dealer_net_delta proxy: gex_summary persists net_gex_at_spot as
-    # "cumulative dealer net GEX sampled at spot" (the value of the same
-    # curve whose zero-crossing is gamma_flip_point). Signed, same
-    # magnitude scale the DealerDeltaPressureRider bot's ~5e8 threshold
-    # is calibrated to. This is a directional proxy for aggregate dealer
-    # delta pressure — a persisted per-contract dealer delta column
-    # doesn't exist and computing it per tick would be expensive.
-    dealer_net_delta = _maybe_float(gx[7])
+    # dealer_net_delta proxy: net_gex_at_spot is the value of the
+    # spot-shift gamma profile at the current spot — signed, same order
+    # of magnitude the DealerDeltaPressureRider bot's ~5e8 threshold is
+    # calibrated to. A true dealer_net_delta isn't persisted; this is
+    # the closest directional proxy we have. Since we ALSO use
+    # net_gex_at_spot for snap.net_gex (regime), the two are the same
+    # number by construction — DealerDeltaPressureRider's own logic then
+    # filters on regime + recent_trend agreement, so the sign of
+    # dealer_net_delta only affects entries where recent_trend confirms
+    # a same-sign move.
+    dealer_net_delta = _maybe_float(gx[0])
 
     return MarketSnapshot(
         underlying=underlying,
         timestamp=ts if isinstance(ts, datetime) else datetime.utcnow(),
         spot=float(spot),
+        # gx[0] is net_gex_at_spot (regime-correct); gx[7] is the
+        # unweighted total_net_gex kept for parity with analytics but
+        # NOT surfaced. Do not swap without updating the SELECT above.
         net_gex=_maybe_float(gx[0]),
         gamma_flip=_maybe_float(gx[1]),
         max_pain=_maybe_float(gx[2]),
