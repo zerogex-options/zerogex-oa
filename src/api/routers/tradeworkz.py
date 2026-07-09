@@ -1012,16 +1012,24 @@ async def admin_trades(
     params.append(offset)
     offset_idx = len(params)
 
+    # LEFT JOIN tw_bots so the response carries the human-readable
+    # display_name alongside the bot_id — the audit UI prefers the
+    # display_name for readability, but keeps bot_id in the payload
+    # for stability across renames. Column names in the WHERE clauses
+    # above (bot_id, closed_at, components_at_entry) are unambiguous
+    # because none of those columns exist on tw_bots.
     row_sql = f"""
-        SELECT id, bot_id, underlying, opened_at, closed_at, direction,
-               strategy_type, entry_price, exit_price, quantity,
-               realized_pnl, pnl_percent, outcome, close_reason,
-               entry_conviction,
-               COALESCE(components_at_entry ->> 'origin', 'live') AS origin,
-               legs, components_at_entry, components_at_exit
-        FROM tw_trades
+        SELECT tr.id, tr.bot_id, b.display_name AS bot_display_name,
+               tr.underlying, tr.opened_at, tr.closed_at, tr.direction,
+               tr.strategy_type, tr.entry_price, tr.exit_price, tr.quantity,
+               tr.realized_pnl, tr.pnl_percent, tr.outcome, tr.close_reason,
+               tr.entry_conviction,
+               COALESCE(tr.components_at_entry ->> 'origin', 'live') AS origin,
+               tr.legs, tr.components_at_entry, tr.components_at_exit
+        FROM tw_trades tr
+        LEFT JOIN tw_bots b ON b.id = tr.bot_id
         {where_sql}
-        ORDER BY closed_at DESC
+        ORDER BY tr.closed_at DESC
         LIMIT ${limit_idx} OFFSET ${offset_idx}
     """
     summary_sql = f"""
@@ -1056,6 +1064,7 @@ async def admin_trades(
             {
                 "id": r["id"],
                 "bot_id": r["bot_id"],
+                "bot_display_name": r["bot_display_name"],
                 "underlying": r["underlying"],
                 "opened_at": r["opened_at"].isoformat() if r["opened_at"] else None,
                 "closed_at": r["closed_at"].isoformat() if r["closed_at"] else None,
@@ -1095,7 +1104,7 @@ async def admin_trades(
         w = csv.writer(buf)
         w.writerow(
             [
-                "id", "bot_id", "underlying", "origin",
+                "id", "bot_id", "bot_display_name", "underlying", "origin",
                 "opened_at", "closed_at", "direction", "strategy_type",
                 "contract", "entry_price", "exit_price", "quantity",
                 "cost_basis", "proceeds",
@@ -1123,7 +1132,8 @@ async def admin_trades(
             proceeds = round(exit_px * qty * 100, 2) if qty else None
             w.writerow(
                 [
-                    e["id"], e["bot_id"], e["underlying"], e["origin"],
+                    e["id"], e["bot_id"], e["bot_display_name"],
+                    e["underlying"], e["origin"],
                     e["opened_at"], e["closed_at"], e["direction"],
                     e["strategy_type"], contract,
                     e["entry_price"], e["exit_price"], e["quantity"],
