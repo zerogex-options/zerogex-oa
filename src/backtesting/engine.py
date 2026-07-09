@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Callable, Optional
 
 from src import config
@@ -127,10 +127,15 @@ def _select_legs(card: CardRow) -> Optional[list[dict]]:
             qty = max(1, int(leg.get("qty") or 1))
         except (TypeError, ValueError):
             qty = 1
-        legs.append({
-            "expiry": leg.get("expiry"), "strike": leg.get("strike"),
-            "right": right, "side": side, "qty": qty,
-        })
+        legs.append(
+            {
+                "expiry": leg.get("expiry"),
+                "strike": leg.get("strike"),
+                "right": right,
+                "side": side,
+                "qty": qty,
+            }
+        )
     if legs:
         return legs
     single = _select_leg(card)
@@ -139,8 +144,9 @@ def _select_legs(card: CardRow) -> Optional[list[dict]]:
     return [{**single, "side": "long", "qty": 1}]
 
 
-def _to_vertical(legs: list[dict], direction: str, entry_ref: float,
-                 width_pct: float) -> list[dict]:
+def _to_vertical(
+    legs: list[dict], direction: str, entry_ref: float, width_pct: float
+) -> list[dict]:
     """Reshape a directional single leg into a long-ATM/short-OTM debit spread.
 
     Keeps the Card's own long leg (so the comparison vs the single-leg measure
@@ -159,8 +165,11 @@ def _to_vertical(legs: list[dict], direction: str, entry_ref: float,
     offset = max(1.0, float(round(entry_ref * width_pct)))
     short_strike = base + offset if direction == "bullish" else base - offset
     short = {
-        "expiry": long.get("expiry"), "strike": short_strike,
-        "right": right, "side": "short", "qty": 1,
+        "expiry": long.get("expiry"),
+        "strike": short_strike,
+        "right": right,
+        "side": "short",
+        "qty": 1,
     }
     return [long, short]
 
@@ -180,18 +189,28 @@ def _price_legs(conn, underlying, legs, at, action, slip):
         if q is None:
             return None
         fill = leg_fill_price(
-            bid=q["bid"], ask=q["ask"], last=q["last"],
-            side=leg["side"], action=action, slippage_pct=slip,
+            bid=q["bid"],
+            ask=q["ask"],
+            last=q["last"],
+            side=leg["side"],
+            action=action,
+            slippage_pct=slip,
         )
         if fill <= 0:
             return None
         sign = -1.0 if _leg_is_buy(leg["side"], action) else 1.0
         cashflow += sign * fill * leg["qty"]
-        resolved.append({
-            **leg, "option_symbol": q["option_symbol"], "strike": q["strike"],
-            "expiry": q["expiration"], "right": q["option_type"],
-            "delta": q.get("delta", 0.0), "vega": q.get("vega", 0.0),
-        })
+        resolved.append(
+            {
+                **leg,
+                "option_symbol": q["option_symbol"],
+                "strike": q["strike"],
+                "expiry": q["expiration"],
+                "right": q["option_type"],
+                "delta": q.get("delta", 0.0),
+                "vega": q.get("vega", 0.0),
+            }
+        )
     return cashflow, resolved
 
 
@@ -218,8 +237,12 @@ def _close_cashflow_from_series(resolved_legs, series_by_symbol, at, slip) -> Op
         if row is None:
             return None
         fill = leg_fill_price(
-            bid=row["bid"], ask=row["ask"], last=row["last"],
-            side=leg["side"], action="close", slippage_pct=slip,
+            bid=row["bid"],
+            ask=row["ask"],
+            last=row["last"],
+            side=leg["side"],
+            action="close",
+            slippage_pct=slip,
         )
         sign = -1.0 if _leg_is_buy(leg["side"], "close") else 1.0
         cashflow += sign * fill * leg["qty"]
@@ -265,8 +288,11 @@ def _risk_profile(open_cashflow: float, resolved_legs: list[dict]):
     if net_debit >= 0:
         if net_debit <= 0:
             return None, None
-        is_vertical = len(resolved_legs) == 2 and len(rights) == 1 and len(by_right.get(
-            next(iter(rights)), [])) == 2
+        is_vertical = (
+            len(resolved_legs) == 2
+            and len(rights) == 1
+            and len(by_right.get(next(iter(rights)), [])) == 2
+        )
         if is_vertical:
             strikes = by_right[next(iter(rights))]
             width = max(strikes) - min(strikes)
@@ -532,9 +558,14 @@ def _build_candidate(
 
     legs = _select_legs(
         CardRow(
-            underlying=card.underlying, timestamp=card.timestamp, pattern=card.pattern,
-            action=card.action, tier=card.tier, direction=direction,
-            confidence=card.confidence, payload=payload,
+            underlying=card.underlying,
+            timestamp=card.timestamp,
+            pattern=card.pattern,
+            action=card.action,
+            tier=card.tier,
+            direction=direction,
+            confidence=card.confidence,
+            payload=payload,
         )
     )
     if not legs:
@@ -564,7 +595,7 @@ def _build_candidate(
     if opened is None:
         return None, "no_entry_quote"
     open_cashflow, resolved_legs = opened
-    net_debit = -open_cashflow              # >0 debit paid, <0 credit received
+    net_debit = -open_cashflow  # >0 debit paid, <0 credit received
     max_loss, max_gain = _risk_profile(open_cashflow, resolved_legs)
     if max_loss is None:
         return None, "bad_premium"
@@ -593,7 +624,7 @@ def _build_candidate(
     mae_pct = 0.0
     exit_ts: Optional[datetime] = None
     outcome = "time_exit"
-    for (ts, o, high, low, c) in quotes[fill_idx + 1:]:
+    for ts, o, high, low, c in quotes[fill_idx + 1 :]:
         # MFE/MAE + level target/stop are only meaningful for a directional
         # position; neutral structures (straddle/strangle/condor) exit purely on
         # the premium overlay below.
@@ -656,19 +687,22 @@ def _build_candidate(
         "structure": _structure_label(resolved_legs),
         "n_legs": len(resolved_legs),
         "legs": [
-            {"option_symbol": leg["option_symbol"], "right": leg["right"],
-             "side": leg["side"],
-             "strike": float(leg["strike"]) if leg["strike"] is not None else None,
-             "expiration": leg["expiry"].isoformat() if leg.get("expiry") else None,
-             "qty": leg["qty"]}
+            {
+                "option_symbol": leg["option_symbol"],
+                "right": leg["right"],
+                "side": leg["side"],
+                "strike": float(leg["strike"]) if leg["strike"] is not None else None,
+                "expiration": leg["expiry"].isoformat() if leg.get("expiry") else None,
+                "qty": leg["qty"],
+            }
             for leg in resolved_legs
         ],
         "option_symbol": primary["option_symbol"],
         "option_type": primary["right"],
         "strike": primary["strike"],
         "expiration": primary["expiry"],
-        "entry_premium": net_debit,            # net debit (credit if negative)
-        "exit_premium": exit_value,            # net value to close (defined-risk clamped)
+        "entry_premium": net_debit,  # net debit (credit if negative)
+        "exit_premium": exit_value,  # net value to close (defined-risk clamped)
         "max_loss_per_share": max_loss,
         "delta_per_contract": delta_per_contract,
         "vega_per_contract": vega_per_contract,
@@ -794,7 +828,7 @@ def _simulate(candidates: list[dict], spec: BacktestSpec) -> RunResult:
         sentinel = datetime.max
     _close_until(sentinel)
 
-    summary = _summarize(trades, equity, capital)
+    summary = _summarize(trades, equity, capital, spec.start_date, spec.end_date)
     summary["diagnostics"] = {
         "concurrency_skipped": concurrency_skipped,
         "sized_out": sized_out,
@@ -802,13 +836,212 @@ def _simulate(candidates: list[dict], spec: BacktestSpec) -> RunResult:
     return RunResult(trades=trades, equity=equity, summary=summary)
 
 
-def _summarize(trades: list[TradeResult], equity: list[EquityPoint], capital: float) -> dict:
+# ---------------------------------------------------------------------------
+# Risk-adjusted / institutional tearsheet metrics
+#
+# A backtest is only as credible as the statistics it reports. Win rate and raw
+# P&L overstate a strategy that wins small and loses big or sits through violent
+# drawdowns, so we add the standard risk-adjusted battery (Sharpe, Sortino,
+# Calmar, CAGR, exposure, streaks) a skeptical reader looks for first. All are
+# pure functions of the realized trades + equity curve + run window — no extra
+# DB access — and are computed from an end-of-day realized-equity series so the
+# annualization is standard (daily returns × √252).
+# ---------------------------------------------------------------------------
+_TRADING_DAYS_PER_YEAR = 252
+_RTH_MINUTES_PER_DAY = 390  # 6.5h regular session, used as the exposure denominator
+
+
+def _mean(xs: list) -> float:
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def _sample_std(xs: list) -> float:
+    """Sample standard deviation (ddof=1); 0.0 for fewer than two points."""
+    if len(xs) < 2:
+        return 0.0
+    m = _mean(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+
+
+def _daily_realized_equity(
+    trades: list[TradeResult],
+    capital: float,
+    start_date: Optional[date],
+    end_date: Optional[date],
+) -> list[tuple]:
+    """End-of-trading-day realized equity across the run window.
+
+    Steps a running equity forward one weekday at a time (a holiday-free
+    approximation of the trading calendar) applying each trade's net P&L on the
+    day it exits. This daily series is the basis for the daily-return risk
+    metrics; intra-day mark-to-market dips are a separate concern handled by the
+    equity curve's drawdown. Returns ``[(date, equity), …]``.
+    """
+    if not trades:
+        return []
+    pnl_by_day: dict = {}
+    for t in trades:
+        d = (t.exited_at or t.entered_at).date()
+        pnl_by_day[d] = pnl_by_day.get(d, 0.0) + t.net_pnl
+    first = min(t.entered_at.date() for t in trades)
+    last = max((t.exited_at or t.entered_at).date() for t in trades)
+    lo = max(start_date, first) if start_date else first
+    hi = min(end_date, last) if end_date else last
+    if hi < lo:
+        hi = lo
+    out: list[tuple] = []
+    equity = capital
+    cur = lo
+    one = timedelta(days=1)
+    while cur <= hi:
+        equity += pnl_by_day.get(cur, 0.0)  # apply (weekends carry, never plotted)
+        if cur.weekday() < 5:
+            out.append((cur, round(equity, 2)))
+        cur += one
+    return out
+
+
+def _streaks(trades: list[TradeResult]) -> tuple:
+    """(max_consecutive_wins, max_consecutive_losses), chronological."""
+    max_w = max_l = cur_w = cur_l = 0
+    for t in sorted(trades, key=lambda x: (x.entered_at, x.seq)):
+        if t.net_pnl > 0:
+            cur_w, cur_l = cur_w + 1, 0
+        elif t.net_pnl < 0:
+            cur_l, cur_w = cur_l + 1, 0
+        else:
+            cur_w = cur_l = 0
+        max_w, max_l = max(max_w, cur_w), max(max_l, cur_l)
+    return max_w, max_l
+
+
+def _exposure_pct(
+    trades: list[TradeResult], start_date: Optional[date], end_date: Optional[date]
+) -> Optional[float]:
+    """Share of available RTH minutes with at least one position open.
+
+    Merges overlapping ``[entered, exited]`` intervals so concurrent holds are
+    not double-counted, over an approximate weekday regular-session denominator.
+    """
+    ivals = []
+    for t in trades:
+        end = t.exited_at or t.entered_at
+        ivals.append((t.entered_at, max(end, t.entered_at)))
+    if not ivals:
+        return None
+    ivals.sort()
+    merged_min = 0.0
+    cs, ce = ivals[0]
+    for s, e in ivals[1:]:
+        if s <= ce:
+            ce = max(ce, e)
+        else:
+            merged_min += (ce - cs).total_seconds() / 60.0
+            cs, ce = s, e
+    merged_min += (ce - cs).total_seconds() / 60.0
+    lo = start_date or ivals[0][0].date()
+    hi = end_date or ivals[-1][1].date()
+    weekdays = 0
+    cur, one = lo, timedelta(days=1)
+    while cur <= hi:
+        if cur.weekday() < 5:
+            weekdays += 1
+        cur += one
+    denom = max(weekdays, 1) * _RTH_MINUTES_PER_DAY
+    return round(min(merged_min / denom * 100.0, 100.0), 1)
+
+
+def _risk_metrics(
+    trades: list[TradeResult],
+    equity: list[EquityPoint],
+    capital: float,
+    start_date: Optional[date],
+    end_date: Optional[date],
+) -> dict:
+    """The risk-adjusted tearsheet block merged into every run summary."""
+    daily = _daily_realized_equity(trades, capital, start_date, end_date)
+    rets = [
+        (daily[i][1] - daily[i - 1][1]) / daily[i - 1][1]
+        for i in range(1, len(daily))
+        if daily[i - 1][1] > 0
+    ]
+    ann = math.sqrt(_TRADING_DAYS_PER_YEAR)
+    mean_r, std_r = _mean(rets), _sample_std(rets)
+    downside = [r for r in rets if r < 0]
+    dd_dev = math.sqrt(sum(r * r for r in downside) / len(downside)) if downside else 0.0
+
+    sharpe = round(mean_r / std_r * ann, 2) if std_r > 0 else None
+    sortino = round(mean_r / dd_dev * ann, 2) if dd_dev > 0 else None
+    ann_vol = round(std_r * ann * 100.0, 2) if std_r > 0 else None
+
+    end_equity = daily[-1][1] if daily else capital
+    n_days = len(daily)
+    cagr = None
+    if capital > 0 and end_equity > 0 and n_days >= 2:
+        years = n_days / _TRADING_DAYS_PER_YEAR
+        if years > 0:
+            cagr = round(((end_equity / capital) ** (1.0 / years) - 1.0) * 100.0, 2)
+
+    max_dd = min((p.drawdown_pct for p in equity), default=0.0)
+    calmar = round(cagr / abs(max_dd), 2) if (cagr is not None and max_dd < 0) else None
+
+    max_w, max_l = _streaks(trades)
+    wins = [t.net_pnl for t in trades if t.net_pnl > 0]
+    losses = [t.net_pnl for t in trades if t.net_pnl < 0]
+    avg_win = _mean(wins) if wins else None
+    avg_loss = _mean(losses) if losses else None
+    payoff = (
+        round(avg_win / abs(avg_loss), 2)
+        if (avg_win is not None and avg_loss not in (None, 0.0))
+        else None
+    )
+    net_all = [t.net_pnl for t in trades]
+    ret_pcts = [t.return_pct for t in trades if t.return_pct is not None]
+
+    return {
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "calmar": calmar,
+        "cagr_pct": cagr,
+        "annual_volatility_pct": ann_vol,
+        "expectancy": round(_mean(net_all), 2) if net_all else None,
+        "expectancy_pct": round(_mean(ret_pcts), 2) if ret_pcts else None,
+        "avg_win": round(avg_win, 2) if avg_win is not None else None,
+        "avg_loss": round(avg_loss, 2) if avg_loss is not None else None,
+        "payoff_ratio": payoff,
+        "largest_win": round(max(net_all), 2) if net_all else None,
+        "largest_loss": round(min(net_all), 2) if net_all else None,
+        "max_consecutive_wins": max_w,
+        "max_consecutive_losses": max_l,
+        "exposure_pct": _exposure_pct(trades, start_date, end_date),
+        "total_commission": round(sum(t.commission for t in trades), 2),
+        "trading_days": n_days,
+        "daily_equity": [{"d": d.isoformat(), "equity": eq} for d, eq in daily],
+    }
+
+
+def _summarize(
+    trades: list[TradeResult],
+    equity: list[EquityPoint],
+    capital: float,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+) -> dict:
+    risk = _risk_metrics(trades, equity, capital, start_date, end_date)
     n = len(trades)
     if n == 0:
         return {
-            "n_trades": 0, "win_rate": None, "net_pnl": 0.0, "total_return_pct": 0.0,
-            "max_drawdown_pct": 0.0, "profit_factor": None, "avg_win_pct": None,
-            "avg_loss_pct": None, "avg_hold_minutes": None, "by_pattern": [],
+            "n_trades": 0,
+            "win_rate": None,
+            "net_pnl": 0.0,
+            "total_return_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+            "profit_factor": None,
+            "avg_win_pct": None,
+            "avg_loss_pct": None,
+            "avg_hold_minutes": None,
+            "by_pattern": [],
+            **risk,
         }
     wins = [t for t in trades if t.net_pnl > 0]
     losses = [t for t in trades if t.net_pnl < 0]
@@ -846,16 +1079,21 @@ def _summarize(trades: list[TradeResult], equity: list[EquityPoint], capital: fl
         "total_return_pct": round(net_pnl / capital * 100.0, 2) if capital else None,
         "max_drawdown_pct": round(max_dd, 2),
         "profit_factor": round(gross_win / gross_loss, 3) if gross_loss > 0 else None,
-        "avg_win_pct": round(
-            _avg(t.return_pct for t in wins if t.return_pct is not None) or 0.0, 2
-        ) if wins else None,
-        "avg_loss_pct": round(
-            _avg(t.return_pct for t in losses if t.return_pct is not None) or 0.0, 2
-        ) if losses else None,
+        "avg_win_pct": (
+            round(_avg(t.return_pct for t in wins if t.return_pct is not None) or 0.0, 2)
+            if wins
+            else None
+        ),
+        "avg_loss_pct": (
+            round(_avg(t.return_pct for t in losses if t.return_pct is not None) or 0.0, 2)
+            if losses
+            else None
+        ),
         "avg_hold_minutes": round(
             _avg(t.hold_minutes for t in trades if t.hold_minutes is not None) or 0.0, 1
         ),
         "by_pattern": by_pattern_list,
+        **risk,
     }
 
 
@@ -915,7 +1153,7 @@ def run_backtest(
         "cards_total": len(all_cards),
         "cards_in_scope": len(in_scope),
         "cards_after_cooldown": len(cards),
-        "drops": {},          # reason -> count (outcome:no_fill, no_entry_quote, …)
+        "drops": {},  # reason -> count (outcome:no_fill, no_entry_quote, …)
         "priced_candidates": 0,
     }
 
