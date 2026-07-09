@@ -610,12 +610,16 @@ def _build_candidate(
     # stop on net position P&L expressed as a fraction of capital-at-risk
     # (max_loss). For a single long this is exactly the old "mark vs entry·(1±pct)".
     deadline = card.timestamp + timedelta(minutes=max_hold)
+    # Fetch each leg's premium series once. Consumed by BOTH the Phase-2 premium
+    # exit overlay (when configured) AND the mark-to-market curve below, so a
+    # position's unrealized P&L over the hold is captured — open-position
+    # drawdown is real drawdown, not deferred to the close. (This is the extra
+    # per-leg read the forward walk pays for honest drawdown; Theme C batches it.)
     series_by_symbol: dict = {}
-    if has_premium:
-        for leg in resolved_legs:
-            series_by_symbol[leg["option_symbol"]] = _fetch_option_series(
-                conn, leg["option_symbol"], fill_ts, deadline
-            )
+    for leg in resolved_legs:
+        series_by_symbol[leg["option_symbol"]] = _fetch_option_series(
+            conn, leg["option_symbol"], fill_ts, deadline
+        )
     prem_target = profit_target_pct * target_basis if profit_target_pct else None
     prem_stop = stop_loss_pct * max_loss if stop_loss_pct else None
 
@@ -679,11 +683,31 @@ def _build_candidate(
     )
     exit_value = net_debit + pnl_per_share  # keeps (exit − entry)·100 == pnl
 
+    # Mark-to-market path: unrealized net P&L per share at each bar we can price
+    # the whole structure. Starts at 0 (entry) and is anchored to the realized
+    # exit value for continuity; _simulate turns it into a true MtM equity curve
+    # so open-position dips show up in the drawdown. Falls back to the 2-point
+    # entry→exit path in _simulate when no intra-hold quotes are available.
+    marks: list[tuple] = [(fill_ts, 0.0)]
+    priceable_ts = sorted(
+        {t for s in series_by_symbol.values() for t in s if fill_ts < t <= exit_ts}
+    )
+    for mts in priceable_ts:
+        cf = _close_cashflow_from_series(resolved_legs, series_by_symbol, mts, slip)
+        if cf is None:
+            continue
+        marks.append((mts, _defined_risk_clamp(open_cashflow + cf, open_cashflow, resolved_legs)))
+    if marks[-1][0] == exit_ts:
+        marks[-1] = (exit_ts, pnl_per_share)  # anchor to realized close
+    else:
+        marks.append((exit_ts, pnl_per_share))
+
     return {
         "card": card,
         "outcome": outcome,
         "entered_at": fill_ts,
         "exited_at": exit_ts,
+        "marks": marks,
         "structure": _structure_label(resolved_legs),
         "n_legs": len(resolved_legs),
         "legs": [
@@ -724,27 +748,26 @@ def _simulate(candidates: list[dict], spec: BacktestSpec) -> RunResult:
     candidates = sorted(candidates, key=lambda c: (c["entered_at"], c["exited_at"]))
 
     realized_equity = capital
-    peak_equity = capital
-    open_positions: list[dict] = []  # each: {exit_at, net_pnl}
+    open_positions: list[dict] = []  # each: {exit_at, net_pnl} — concurrency + sizing
+    sized: list[dict] = []  # {entered_at, exited_at, net, marks} → the MtM curve
     trades: list[TradeResult] = []
-    equity: list[EquityPoint] = []
     seq = 0
     concurrency_skipped = 0
     sized_out = 0
 
-    def _close_until(when: datetime) -> None:
-        nonlocal realized_equity, peak_equity
+    def _realize_until(when: datetime) -> None:
+        # Advance *realized* equity as positions close — this drives the sizing
+        # of later trades (risk_frac of realized equity). The equity CURVE and
+        # its drawdown are built separately from a mark-to-market walk after
+        # sizing (see _mtm_equity_curve), so open-position losses aren't lost.
+        nonlocal realized_equity
         open_positions.sort(key=lambda p: p["exit_at"])
         while open_positions and open_positions[0]["exit_at"] <= when:
-            pos = open_positions.pop(0)
-            realized_equity += pos["net_pnl"]
-            peak_equity = max(peak_equity, realized_equity)
-            dd = 0.0 if peak_equity <= 0 else (realized_equity - peak_equity) / peak_equity * 100.0
-            equity.append(EquityPoint(t=pos["exit_at"], equity=realized_equity, drawdown_pct=dd))
+            realized_equity += open_positions.pop(0)["net_pnl"]
 
     for cand in candidates:
         # Realize any positions that closed before this entry.
-        _close_until(cand["entered_at"])
+        _realize_until(cand["entered_at"])
 
         if len(open_positions) >= max_concurrent:
             concurrency_skipped += 1
@@ -821,19 +844,115 @@ def _simulate(candidates: list[dict], spec: BacktestSpec) -> RunResult:
         )
         open_positions.append({"exit_at": cand["exited_at"], "net_pnl": net})
 
-    # Close everything still open at the end of the window.
-    if candidates:
-        sentinel = datetime.max.replace(tzinfo=candidates[0]["exited_at"].tzinfo)
-    else:
-        sentinel = datetime.max
-    _close_until(sentinel)
+        # Dollar mark path for this position: per-share unrealized × 100 ×
+        # contracts, less the round-trip commission (taken at entry). The final
+        # mark equals the realized net. When the candidate has no intra-hold
+        # quotes, fall back to a 2-point entry→exit path.
+        marks_src = cand.get("marks")
+        if marks_src:
+            marks_d = [(t, ps * 100.0 * contracts - comm) for (t, ps) in marks_src]
+        else:
+            marks_d = [(cand["entered_at"], -comm), (cand["exited_at"], net)]
+        sized.append(
+            {
+                "entered_at": cand["entered_at"],
+                "exited_at": cand["exited_at"],
+                "net": net,
+                "marks": marks_d,
+            }
+        )
 
+    equity = _mtm_equity_curve(sized, capital)
     summary = _summarize(trades, equity, capital, spec.start_date, spec.end_date)
     summary["diagnostics"] = {
         "concurrency_skipped": concurrency_skipped,
         "sized_out": sized_out,
     }
     return RunResult(trades=trades, equity=equity, summary=summary)
+
+
+# Stored-curve point cap. Drawdown is computed on the FULL-resolution walk; only
+# the persisted/returned curve is thinned, and the trough is always kept so the
+# reported max drawdown stays exact.
+_MAX_EQUITY_POINTS = 2000
+
+
+def _mtm_equity_curve(sized: list[dict], capital: float) -> list[EquityPoint]:
+    """A mark-to-market equity curve over all sized positions.
+
+    A realized-only curve steps only at closes, so a position sitting in a deep
+    unrealized loss never shows up until (and unless) it is booked — drawdown is
+    understated. This instead marks every open position at each bar it can be
+    priced::
+
+        equity(t) = capital + realized_closed(t) + Σ open-position unrealized(t)
+
+    and takes drawdown peak-to-trough on that curve. A monotonic cursor per
+    position keeps the sweep near-linear (at most ``max_concurrent`` positions
+    are ever open at once).
+    """
+    if not sized:
+        return []
+    positions = [
+        {
+            "exit_at": s["exited_at"],
+            "net": s["net"],
+            "mts": [m[0] for m in s["marks"]],
+            "mval": [m[1] for m in s["marks"]],
+            "cursor": 0,
+        }
+        for s in sorted(sized, key=lambda s: s["entered_at"])
+    ]
+    timeline = sorted({t for p in positions for t in p["mts"]})
+    ptr = 0
+    active: list[dict] = []
+    realized = 0.0
+    peak = capital
+    points: list[EquityPoint] = []
+    for t in timeline:
+        # Activate positions entered by t (positions are entry-sorted; mts[0] is
+        # the entry mark).
+        while ptr < len(positions) and positions[ptr]["mts"][0] <= t:
+            active.append(positions[ptr])
+            ptr += 1
+        # Book positions closed by t into realized; the rest stay open.
+        still: list[dict] = []
+        for a in active:
+            if a["exit_at"] <= t:
+                realized += a["net"]
+            else:
+                still.append(a)
+        active = still
+        # Mark still-open positions at their last mark ≤ t (step function).
+        unreal = 0.0
+        for a in active:
+            mts, mval = a["mts"], a["mval"]
+            c = a["cursor"]
+            while c + 1 < len(mts) and mts[c + 1] <= t:
+                c += 1
+            a["cursor"] = c
+            if mts[c] <= t:
+                unreal += mval[c]
+        eq = capital + realized + unreal
+        peak = max(peak, eq)
+        dd = 0.0 if peak <= 0 else (eq - peak) / peak * 100.0
+        points.append(EquityPoint(t=t, equity=round(eq, 2), drawdown_pct=round(dd, 2)))
+    return _downsample_equity(points, _MAX_EQUITY_POINTS)
+
+
+def _downsample_equity(points: list[EquityPoint], cap: int) -> list[EquityPoint]:
+    """Thin the stored curve to ≤ ``cap`` points.
+
+    Always keeps the first point, the last point, and the max-drawdown trough so
+    the summary's ``max_drawdown_pct`` (a min over the stored curve) stays exact.
+    """
+    if len(points) <= cap:
+        return points
+    trough_i = min(range(len(points)), key=lambda i: points[i].drawdown_pct)
+    keep = {0, len(points) - 1, trough_i}
+    stride = max(1, len(points) // cap)
+    keep.update(range(0, len(points), stride))
+    return [points[i] for i in sorted(keep)]
 
 
 # ---------------------------------------------------------------------------
