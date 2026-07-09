@@ -77,13 +77,18 @@ class FillModel:
         raw = raw or {}
         return cls(
             slippage_pct=_coerce_float(
-                raw.get("slippage_pct"), field_name="fill_model.slippage_pct",
-                lo=0.0, hi=0.25, default=0.01,
+                raw.get("slippage_pct"),
+                field_name="fill_model.slippage_pct",
+                lo=0.0,
+                hi=0.25,
+                default=0.01,
             ),
             commission_per_contract=_coerce_float(
                 raw.get("commission_per_contract"),
                 field_name="fill_model.commission_per_contract",
-                lo=0.0, hi=25.0, default=0.65,
+                lo=0.0,
+                hi=25.0,
+                default=0.65,
             ),
         )
 
@@ -124,12 +129,18 @@ class Sizing:
 
         return cls(
             capital=_coerce_float(
-                raw.get("capital"), field_name="sizing.capital",
-                lo=_MIN_CAPITAL, hi=_MAX_CAPITAL, default=25_000.0,
+                raw.get("capital"),
+                field_name="sizing.capital",
+                lo=_MIN_CAPITAL,
+                hi=_MAX_CAPITAL,
+                default=25_000.0,
             ),
             risk_per_trade_pct=_coerce_float(
-                raw.get("risk_per_trade_pct"), field_name="sizing.risk_per_trade_pct",
-                lo=0.1, hi=100.0, default=2.0,
+                raw.get("risk_per_trade_pct"),
+                field_name="sizing.risk_per_trade_pct",
+                lo=0.1,
+                hi=100.0,
+                default=2.0,
             ),
             max_concurrent=min(max(max_concurrent, 1), 20),
             max_net_delta=_opt_positive("max_net_delta"),
@@ -198,9 +209,20 @@ class ExitRules:
 # underlying_quotes.
 # ---------------------------------------------------------------------------
 STRATEGY_NUMERIC_FIELDS = {
-    "price", "net_gex", "net_gex_at_spot", "flip_distance", "flip_distance_pct",
-    "gamma_flip_point", "call_wall", "put_wall", "dist_to_call_wall_pct",
-    "dist_to_put_wall_pct", "put_call_ratio", "max_pain", "convexity_risk", "msi",
+    "price",
+    "net_gex",
+    "net_gex_at_spot",
+    "flip_distance",
+    "flip_distance_pct",
+    "gamma_flip_point",
+    "call_wall",
+    "put_wall",
+    "dist_to_call_wall_pct",
+    "dist_to_put_wall_pct",
+    "put_call_ratio",
+    "max_pain",
+    "convexity_risk",
+    "msi",
 }
 STRATEGY_CATEGORICAL_FIELDS = {
     "net_gex_sign": ("positive", "negative", "zero"),
@@ -258,11 +280,11 @@ class StrategySpec:
     direction: str
     conditions: list[Condition]
     dte: int = 0
-    structure: str = "single"        # single|vertical|straddle|strangle|condor
-    width: float = 5.0               # vertical width / strangle & condor offset, pts
-    wing: float = 5.0               # condor wing width (short→long strike), pts
+    structure: str = "single"  # single|vertical|straddle|strangle|condor
+    width: float = 5.0  # vertical width / strangle & condor offset, pts
+    wing: float = 5.0  # condor wing width (short→long strike), pts
     target_offset_pct: Optional[float] = None  # fraction of entry price, favorable
-    stop_offset_pct: Optional[float] = None    # fraction of entry price, adverse
+    stop_offset_pct: Optional[float] = None  # fraction of entry price, adverse
 
     # Defined-risk structures supported. Directional ones take a bullish/bearish
     # direction; neutral ones (straddle/strangle/condor) are non-directional.
@@ -275,10 +297,7 @@ class StrategySpec:
             raise SpecError("strategy must be an object")
         structure = str(raw.get("structure") or "single").strip().lower()
         if structure not in cls.DIRECTIONAL + cls.NEUTRAL:
-            raise SpecError(
-                "strategy.structure must be one of "
-                f"{cls.DIRECTIONAL + cls.NEUTRAL}"
-            )
+            raise SpecError("strategy.structure must be one of " f"{cls.DIRECTIONAL + cls.NEUTRAL}")
         direction = str(raw.get("direction") or "").strip().lower()
         if structure in cls.NEUTRAL:
             # Non-directional structures are always neutral; accept an omitted or
@@ -483,6 +502,12 @@ class TradeResult:
     legs: list = field(default_factory=list)
     net_delta: float = 0.0
     net_vega: float = 0.0
+    # Market-structure regime at entry (from the Card's context), so results can
+    # be conditioned on the dealer-gamma backdrop — the ZeroGEX edge applied to
+    # backtesting. ``gamma_regime`` ∈ {positive, negative}; ``msi_regime`` is the
+    # MSI regime label. None when the Card carried no context.
+    gamma_regime: Optional[str] = None
+    msi_regime: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -494,6 +519,8 @@ class TradeResult:
             "legs": self.legs,
             "net_delta": round(self.net_delta, 1),
             "net_vega": round(self.net_vega, 2),
+            "gamma_regime": self.gamma_regime,
+            "msi_regime": self.msi_regime,
             "option_symbol": self.option_symbol,
             "option_type": self.option_type,
             "strike": float(self.strike) if self.strike is not None else None,

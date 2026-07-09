@@ -132,6 +132,7 @@ _CSV_COLUMNS = [
     "option_type", "strike", "expiration", "entered_at", "exited_at",
     "entry_premium", "exit_premium", "contracts", "net_pnl", "return_pct",
     "outcome", "hold_minutes", "net_delta", "net_vega",
+    "gamma_regime", "msi_regime",
 ]
 
 
