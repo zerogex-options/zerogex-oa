@@ -49,7 +49,7 @@ DEFAULT_ROSTER: tuple[BotSpec, ...] = (
         strategy_class="PutCallWallBouncer",
         tier="0DTE",
         direction_mode="context",
-        universe="SPY",
+        universe="*",
         tagline="Fade the wall. Ride the mean reversion. Cut if the wall breaks.",
         description=(
             "Enters mean-reversion trades against the nearest call or put wall "
@@ -64,7 +64,7 @@ DEFAULT_ROSTER: tuple[BotSpec, ...] = (
         strategy_class="GammaFlipDefender",
         tier="0DTE",
         direction_mode="context",
-        universe="SPY",
+        universe="*",
         tagline="Sell rallies into the flip. Buy dips into the flip. Positive-γ only.",
         description=(
             "Mean-reversion at the gamma flip line inside a positive-gamma regime. "
@@ -78,7 +78,7 @@ DEFAULT_ROSTER: tuple[BotSpec, ...] = (
         strategy_class="GammaFlipBreaker",
         tier="0DTE",
         direction_mode="context",
-        universe="SPY",
+        universe="*",
         tagline="Ride the breakout. Dealer hedging turns momentum into a wave.",
         description=(
             "Enters directional trades when price breaks through the gamma "
@@ -92,7 +92,7 @@ DEFAULT_ROSTER: tuple[BotSpec, ...] = (
         strategy_class="EodPinDrifter",
         tier="0DTE",
         direction_mode="context",
-        universe="SPY",
+        universe="*",
         tagline="Ride the last-hour pin. Dealers push spot toward max-pain.",
         description=(
             "0DTE afternoon drift bot: enters when the underlying is off "
@@ -106,7 +106,7 @@ DEFAULT_ROSTER: tuple[BotSpec, ...] = (
         strategy_class="DealerDeltaPressureRider",
         tier="0DTE",
         direction_mode="context",
-        universe="SPY",
+        universe="*",
         tagline="Ride dealer delta pressure. Momentum + short-γ regime = follow-through.",
         description=(
             "Enters directional trades in a negative-gamma regime when "
@@ -120,7 +120,7 @@ DEFAULT_ROSTER: tuple[BotSpec, ...] = (
         strategy_class="VwapReversionScalper",
         tier="0DTE",
         direction_mode="context",
-        universe="SPY",
+        universe="*",
         tagline="Fade the stretch to VWAP. Positive-γ magnet.",
         description=(
             "Small-size 0DTE scalps that fade over-extension away from "
@@ -134,7 +134,7 @@ DEFAULT_ROSTER: tuple[BotSpec, ...] = (
         strategy_class="VixRegimeBreakout",
         tier="0DTE",
         direction_mode="context",
-        universe="SPY",
+        universe="*",
         tagline="Vol is expanding. Ride the trend before the wall catches it.",
         description=(
             "Trend continuation when VIX is elevated and dealer gamma has "
@@ -148,7 +148,7 @@ DEFAULT_ROSTER: tuple[BotSpec, ...] = (
         strategy_class="OpeningRangeHunter",
         tier="0DTE",
         direction_mode="context",
-        universe="SPY",
+        universe="*",
         tagline="Break the opening range. Trend + thin γ = clean legs.",
         description=(
             "Enters trend continuation on breaks of the opening range in "
@@ -162,7 +162,7 @@ DEFAULT_ROSTER: tuple[BotSpec, ...] = (
         strategy_class="MaxPainGravitator",
         tier="1DTE",
         direction_mode="context",
-        universe="SPY",
+        universe="*",
         tagline="Distant max_pain in a pin regime. Ride the drift back.",
         description=(
             "1-2 day debit trades in the direction of max_pain when the "
@@ -179,17 +179,16 @@ DEFAULT_ROSTER: tuple[BotSpec, ...] = (
     #   * STRUCTURE — verticals cap risk vs naked debits; iron condor
     #     and straddle both use multi-leg structures the pricing
     #     layer already supports via build_iron_condor / build_straddle.
-    #   * UNIVERSE — the QQQ variants use identical strategy classes
-    #     as their SPY siblings; the engine builds a per-underlying
-    #     snapshot at tick time so the same code trades the QQQ chain
-    #     when `universe='QQQ'`.
+    # Every bot is symbol-agnostic (universe='*') — the engine loops
+    # each bot over the full fleet universe (TRADEWORKZ_UNIVERSE) at
+    # tick time and hands it the matching per-underlying snapshot.
     BotSpec(
         id="bull_momentum_climber",
         display_name="Bull Momentum Climber",
         strategy_class="BullMomentumClimber",
         tier="0DTE",
         direction_mode="bullish",
-        universe="SPY",
+        universe="*",
         tagline="Positive-γ climbing above VWAP and flip. Buy the call debit spread.",
         description=(
             "Fires only when spot has cleared VWAP AND gamma_flip in a "
@@ -210,7 +209,7 @@ DEFAULT_ROSTER: tuple[BotSpec, ...] = (
         strategy_class="RangeIronCondor",
         tier="0DTE",
         direction_mode="neutral",
-        universe="SPY",
+        universe="*",
         tagline="Positive-γ pin, low VIX. Sell the condor between the walls.",
         description=(
             "Sells a symmetric iron condor when spot is between the put "
@@ -232,7 +231,7 @@ DEFAULT_ROSTER: tuple[BotSpec, ...] = (
         strategy_class="VolExpansionStraddle",
         tier="0DTE",
         direction_mode="neutral",
-        universe="SPY",
+        universe="*",
         tagline="Compressed vol + tight range + short γ. Buy the straddle.",
         description=(
             "Buys an ATM straddle when VIX is compressed, SPY has ranged "
@@ -246,40 +245,21 @@ DEFAULT_ROSTER: tuple[BotSpec, ...] = (
             "dte_target": 0,
         },
     ),
-    # ── QQQ variants — same strategy class, different underlying ─────
-    BotSpec(
-        id="qqq_gamma_flip_breaker",
-        display_name="QQQ Gamma Flip Breaker",
-        strategy_class="GammaFlipBreaker",
-        tier="0DTE",
-        direction_mode="context",
-        universe="QQQ",
-        tagline="QQQ version. Ride the breakout across the flip.",
-        description=(
-            "QQQ momentum-through-flip variant of gamma_flip_breaker. "
-            "Same regime + trend-confirmation logic on the QQQ chain."
-        ),
-        params={
-            "cross_min_pct": 0.0015,
-            "flip_reentry_pct": 0.0008,
-            "max_hold_minutes": 60,
-        },
-    ),
-    BotSpec(
-        id="qqq_dealer_delta_pressure_rider",
-        display_name="QQQ Dealer Delta Pressure Rider",
-        strategy_class="DealerDeltaPressureRider",
-        tier="0DTE",
-        direction_mode="context",
-        universe="QQQ",
-        tagline="QQQ dealer-delta momentum in short-γ. Follow the hedging.",
-        description=(
-            "QQQ momentum-follow variant of dealer_delta_pressure_rider. "
-            "Fires in negative-γ when dealer delta is heavily one-sided "
-            "and recent QQQ tape agrees."
-        ),
-        params={"delta_threshold": 3.0e8, "max_hold_minutes": 60},
-    ),
+)
+
+
+# ── Retired bots ────────────────────────────────────────────────────
+# Bots that were once shipped but no longer belong in the fleet. The
+# engine calls ``retire_stale_bots`` on provision so historical trade
+# rows survive (audit stays intact) but the sleeve is zeroed and the
+# bot flipped to enabled=false, freeing capital for the active roster
+# on the next re-balance. Do NOT delete the id itself — foreign keys
+# from tw_trades / tw_positions point at it and the audit UI needs it.
+RETIRED_BOT_IDS: tuple[str, ...] = (
+    # Symbol-specific variants collapsed into their symbol-agnostic
+    # parents when the fleet universe expanded from SPY-only to CSV.
+    "qqq_gamma_flip_breaker",
+    "qqq_dealer_delta_pressure_rider",
 )
 
 

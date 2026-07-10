@@ -28,7 +28,7 @@ from src.tradeworkz import ml as ml_mod
 from src.tradeworkz.bots.base import BaseBot
 from src.tradeworkz.context import MarketSnapshot, build_snapshot
 from src.tradeworkz.models import BotSpec
-from src.tradeworkz.registry import get_bot_class, DEFAULT_ROSTER
+from src.tradeworkz.registry import get_bot_class, DEFAULT_ROSTER, RETIRED_BOT_IDS
 from src.tradeworkz.reconciler import (
     close_position,
     daily_realized_pnl,
@@ -64,17 +64,26 @@ def tick() -> Dict[str, Any]:
         )
         bots = cur.fetchall()
 
-    underlyings = sorted({row[5] for row in bots}) or [tw_config.UNIVERSE]
+    fleet_universes = tw_config.fleet_universes()
+    # A bot pinned to a single ticker keeps that pin; a bot with the
+    # wildcard '*' explodes into the full fleet universe on every tick.
+    # Build the union of every underlying we need a snapshot for.
+    underlyings_needed: set[str] = set()
+    for row in bots:
+        underlyings_needed.update(_bot_underlyings(row[5], fleet_universes))
+    if not underlyings_needed:
+        underlyings_needed = set(fleet_universes) or {"SPY"}
+
     snapshots: Dict[str, Optional[MarketSnapshot]] = {}
     with db_connection() as conn:
-        for u in underlyings:
+        for u in sorted(underlyings_needed):
             snapshots[u] = build_snapshot(conn, u)
 
     for row in bots:
         summary["ticks"] += 1
         bot_id = row[0]
         try:
-            per_bot = _run_bot(row, snapshots)
+            per_bot = _run_bot(row, snapshots, fleet_universes)
             summary["opened"] += per_bot.get("opened", 0)
             summary["closed"] += per_bot.get("closed", 0)
             summary["marked"] += per_bot.get("marked", 0)
@@ -87,8 +96,24 @@ def tick() -> Dict[str, Any]:
     return summary
 
 
+def _bot_underlyings(universe: str, fleet: tuple[str, ...]) -> list[str]:
+    """Resolve a bot's ``universe`` field to a concrete list of tickers.
+
+    * ``'*'`` — the fleet universe (every ticker in ``TRADEWORKZ_UNIVERSE``).
+    * comma-separated (e.g. ``'SPY,QQQ'``) — that explicit subset.
+    * bare ticker (e.g. ``'SPY'``) — pinned to that ticker only.
+    """
+    if not universe:
+        return list(fleet)
+    if universe.strip() == "*":
+        return list(fleet)
+    return [sym.strip().upper() for sym in universe.split(",") if sym.strip()]
+
+
 def _run_bot(
-    row: tuple, snapshots: Dict[str, Optional[MarketSnapshot]]
+    row: tuple,
+    snapshots: Dict[str, Optional[MarketSnapshot]],
+    fleet_universes: tuple[str, ...],
 ) -> Dict[str, int]:
     (
         bot_id,
@@ -109,58 +134,72 @@ def _run_bot(
         except Exception:
             params = {}
 
-    spec = BotSpec(
-        id=bot_id,
-        display_name=display_name,
-        strategy_class=strategy_class,
-        tier=tier,
-        direction_mode=direction_mode,
-        universe=universe,
-        tagline=tagline or "",
-        description=description or "",
-        params=dict(params or {}),
-        is_public=bool(is_public),
-        enabled=bool(enabled),
-    )
-    snap = snapshots.get(universe)
-    if snap is None:
-        return {"opened": 0, "closed": 0, "marked": 0}
-
     stats = {"opened": 0, "closed": 0, "marked": 0}
-    with db_connection() as conn:
-        capital = load_capital(conn, bot_id)
-        if capital is None:
-            return stats
-        ml_state = ml_mod.load_state(conn, bot_id)
-        bot_cls = get_bot_class(strategy_class)
-        bot: BaseBot = bot_cls(spec, ml_state=asdict(ml_state))
+    bot_universes = _bot_underlyings(universe, fleet_universes)
+    if not bot_universes:
+        return stats
 
-        # 1. Mark + evaluate exits on any open positions.
-        for pos in load_open_positions(conn, bot_id):
-            mark = mark_position(conn, pos)
-            if mark is None:
+    for u in bot_universes:
+        snap = snapshots.get(u)
+        if snap is None:
+            continue
+        # Rebuild the spec per-iteration so the bot instance sees the
+        # underlying it's actively evaluating (some bots key sizing off
+        # spec.universe or the snapshot's underlying label).
+        spec = BotSpec(
+            id=bot_id,
+            display_name=display_name,
+            strategy_class=strategy_class,
+            tier=tier,
+            direction_mode=direction_mode,
+            universe=u,
+            tagline=tagline or "",
+            description=description or "",
+            params=dict(params or {}),
+            is_public=bool(is_public),
+            enabled=bool(enabled),
+        )
+        with db_connection() as conn:
+            capital = load_capital(conn, bot_id)
+            if capital is None:
                 continue
-            stats["marked"] += 1
-            decision = bot.exit_criteria(snap, pos)
-            if decision.should_close:
-                close_position(conn, pos, reason=decision.reason or "signal")
-                stats["closed"] += 1
+            ml_state = ml_mod.load_state(conn, bot_id)
+            bot_cls = get_bot_class(strategy_class)
+            bot: BaseBot = bot_cls(spec, ml_state=asdict(ml_state))
 
-        # 2. Look for a new entry.
-        signal = bot.open_criteria(snap)
-        if signal is not None:
-            wall_strength = signal.components_at_entry.get("wall_strength") if signal.components_at_entry else None
-            realized_today = daily_realized_pnl(conn, bot_id)
-            pos_id = open_position(
-                conn,
-                signal,
-                capital,
-                size_multiplier=bot.size_multiplier(),
-                wall_strength=wall_strength,
-                daily_realized_pnl=realized_today,
-            )
-            if pos_id is not None:
-                stats["opened"] += 1
+            # 1. Mark + evaluate exits on any open positions in THIS
+            # underlying only. Positions in other underlyings for the
+            # same bot are handled on their own iteration.
+            for pos in load_open_positions(conn, bot_id):
+                if pos.underlying != u:
+                    continue
+                mark = mark_position(conn, pos)
+                if mark is None:
+                    continue
+                stats["marked"] += 1
+                decision = bot.exit_criteria(snap, pos)
+                if decision.should_close:
+                    close_position(conn, pos, reason=decision.reason or "signal")
+                    stats["closed"] += 1
+
+            # 2. Look for a new entry in this underlying.
+            signal = bot.open_criteria(snap)
+            if signal is not None:
+                wall_strength = (
+                    signal.components_at_entry.get("wall_strength")
+                    if signal.components_at_entry else None
+                )
+                realized_today = daily_realized_pnl(conn, bot_id)
+                pos_id = open_position(
+                    conn,
+                    signal,
+                    capital,
+                    size_multiplier=bot.size_multiplier(),
+                    wall_strength=wall_strength,
+                    daily_realized_pnl=realized_today,
+                )
+                if pos_id is not None:
+                    stats["opened"] += 1
     return stats
 
 
@@ -253,9 +292,22 @@ def rollup_daily(conn: Any) -> None:
 def provision_defaults(conn: Any, fleet_capital: Optional[float] = None) -> int:
     """Insert the default bot roster + slice fleet capital evenly across them.
 
-    Idempotent — bots already present in ``tw_bots`` are left alone; only
-    missing ids are inserted. Returns the number of bots newly inserted.
-    Called from the API lifespan hook so a fresh DB comes up populated.
+    Idempotent. Behavior on subsequent runs:
+
+    * Missing bot ids are inserted with a fresh capital sleeve.
+    * Existing bot rows have their ``universe``, ``display_name``,
+      ``tagline``, ``description``, and ``params`` re-synced from the
+      current roster — the operator's source of truth is the roster
+      module, not stale DB rows from a prior release.
+    * Bot ids listed in :data:`RETIRED_BOT_IDS` are flipped to
+      ``enabled=false`` and their sleeve is zeroed so the freed capital
+      shows up in the next admin-triggered rebalance.
+    * ``starting_capital`` is re-synced to ``FLEET_CAPITAL / N`` for
+      every active roster bot so shrinking or growing the roster keeps
+      the total sleeve pot at ``FLEET_CAPITAL``. ``current_capital`` /
+      ``peak_capital`` are left untouched — running P&L history is not
+      erased; hit ``/admin/reset-fleet`` to snap those back to the
+      fresh baseline.
     """
     fleet = tw_config.FLEET_CAPITAL if fleet_capital is None else float(fleet_capital)
     roster = list(DEFAULT_ROSTER)
@@ -277,7 +329,16 @@ def provision_defaults(conn: Any, fleet_capital: Optional[float] = None) -> int:
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s
             )
-            ON CONFLICT (id) DO NOTHING
+            ON CONFLICT (id) DO UPDATE SET
+                display_name  = EXCLUDED.display_name,
+                tier          = EXCLUDED.tier,
+                direction_mode = EXCLUDED.direction_mode,
+                universe      = EXCLUDED.universe,
+                tagline       = EXCLUDED.tagline,
+                description   = EXCLUDED.description,
+                params        = EXCLUDED.params,
+                enabled       = TRUE,
+                updated_at    = EXCLUDED.updated_at
             """,
             (
                 spec.id,
@@ -317,5 +378,42 @@ def provision_defaults(conn: Any, fleet_capital: Optional[float] = None) -> int:
                 tw_config.DEFAULT_DAILY_KILL_PCT,
                 now,
             ),
+        )
+
+    # Re-sync starting_capital for every active roster bot to the fresh
+    # even split. Keeps the sleeve pot equal to FLEET_CAPITAL when the
+    # roster changes size between releases. current_capital / peak
+    # are left alone so running P&L history is not lost.
+    active_ids = [spec.id for spec in roster]
+    cur.execute(
+        """
+        UPDATE tw_bot_capital
+           SET starting_capital = %s, updated_at = %s
+         WHERE bot_id = ANY(%s) AND starting_capital <> %s
+        """,
+        (slice_amount, now, active_ids, slice_amount),
+    )
+
+    # Retire bots that used to be in the roster but no longer belong.
+    # Flip enabled=false + zero the sleeve so their capital is no longer
+    # counted against the fleet total. Historical rows stay put.
+    if RETIRED_BOT_IDS:
+        cur.execute(
+            """
+            UPDATE tw_bots
+               SET enabled = FALSE, updated_at = %s
+             WHERE id = ANY(%s) AND enabled IS TRUE
+            """,
+            (now, list(RETIRED_BOT_IDS)),
+        )
+        cur.execute(
+            """
+            UPDATE tw_bot_capital
+               SET starting_capital = 0, current_capital = 0,
+                   peak_capital = 0, updated_at = %s
+             WHERE bot_id = ANY(%s)
+               AND (starting_capital <> 0 OR current_capital <> 0)
+            """,
+            (now, list(RETIRED_BOT_IDS)),
         )
     return inserted

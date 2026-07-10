@@ -1334,9 +1334,16 @@ async def admin_diagnose() -> Dict[str, Any]:
         )
         bots = cur.fetchall()
 
-        underlyings = sorted({row[5] for row in bots}) or [tw_config.UNIVERSE]
+        from src.tradeworkz.engine import _bot_underlyings
+        fleet = tw_config.fleet_universes()
+        underlyings_needed: set[str] = set()
+        for row in bots:
+            underlyings_needed.update(_bot_underlyings(row[5], fleet))
+        if not underlyings_needed:
+            underlyings_needed = set(fleet) or {"SPY"}
+
         snapshots: Dict[str, Optional[MarketSnapshot]] = {}
-        for u in underlyings:
+        for u in sorted(underlyings_needed):
             snapshots[u] = build_snapshot(conn, u)
 
         bot_reports: List[Dict[str, Any]] = []
@@ -1350,127 +1357,128 @@ async def admin_diagnose() -> Dict[str, Any]:
                     params = json.loads(params)
                 except Exception:
                     params = {}
-            snap = snapshots.get(universe)
-            report: Dict[str, Any] = {
-                "bot_id": bot_id,
-                "display_name": display_name,
-                "strategy_class": strategy_class,
-                "universe": universe,
-            }
-            if snap is None:
-                report["decision"] = "no_snapshot"
-                report["reason"] = (
-                    f"build_snapshot({universe}) returned None — no "
-                    "underlying_quotes tick or no gex_summary row."
+            for u in _bot_underlyings(universe, fleet):
+                snap = snapshots.get(u)
+                report: Dict[str, Any] = {
+                    "bot_id": bot_id,
+                    "display_name": display_name,
+                    "strategy_class": strategy_class,
+                    "universe": u,
+                }
+                if snap is None:
+                    report["decision"] = "no_snapshot"
+                    report["reason"] = (
+                        f"build_snapshot({u}) returned None — no "
+                        "underlying_quotes tick or no gex_summary row."
+                    )
+                    bot_reports.append(report)
+                    continue
+
+                spec = BotSpec(
+                    id=bot_id, display_name=display_name,
+                    strategy_class=strategy_class, tier=tier,
+                    direction_mode=direction_mode, universe=u,
+                    tagline=tagline or "", description=description or "",
+                    params=dict(params or {}),
+                    is_public=bool(is_public), enabled=bool(enabled),
                 )
-                bot_reports.append(report)
-                continue
+                ml_state = ml_mod.load_state(conn, bot_id)
+                capital = load_capital(conn, bot_id)
+                bot_cls = get_bot_class(strategy_class)
+                bot: BaseBot = bot_cls(spec, ml_state=asdict(ml_state))
 
-            spec = BotSpec(
-                id=bot_id, display_name=display_name,
-                strategy_class=strategy_class, tier=tier,
-                direction_mode=direction_mode, universe=universe,
-                tagline=tagline or "", description=description or "",
-                params=dict(params or {}),
-                is_public=bool(is_public), enabled=bool(enabled),
-            )
-            ml_state = ml_mod.load_state(conn, bot_id)
-            capital = load_capital(conn, bot_id)
-            bot_cls = get_bot_class(strategy_class)
-            bot: BaseBot = bot_cls(spec, ml_state=asdict(ml_state))
-
-            open_pos_count = 0
-            cur.execute(
-                "SELECT COUNT(1) FROM tw_positions WHERE bot_id = %s",
-                (bot_id,),
-            )
-            row_ct = cur.fetchone()
-            open_pos_count = int(row_ct[0]) if row_ct else 0
-            report["open_positions"] = open_pos_count
-            report["current_capital"] = (
-                capital.current_capital if capital else None
-            )
-            report["confidence_base"] = bot.confidence_base()
-            report["confidence_threshold"] = bot.confidence_threshold()
-            report["size_multiplier"] = bot.size_multiplier()
-
-            try:
-                signal = bot.open_criteria(snap)
-            except Exception as exc:  # noqa: BLE001
-                report["decision"] = "error"
-                report["error"] = f"{type(exc).__name__}: {exc}"
-                bot_reports.append(report)
-                continue
-
-            if signal is None:
-                report["decision"] = "no_signal"
-                report["reason"] = _explain_no_signal(bot, snap)
-                bot_reports.append(report)
-                continue
-
-            report["decision"] = "signal"
-            report["direction"] = signal.direction
-            report["strategy_type"] = signal.strategy_type
-            report["conviction"] = signal.conviction
-            report["legs"] = [
-                {
-                    "option_symbol": l.option_symbol,
-                    "side": l.side,
-                    "option_type": l.option_type,
-                    "strike": l.strike,
-                    "expiration": l.expiration,
-                }
-                for l in signal.legs
-            ]
-            report["rationale"] = signal.rationale
-
-            legs_dicts = [
-                {
-                    "option_symbol": l.option_symbol,
-                    "side": l.side,
-                    "option_type": l.option_type,
-                    "strike": l.strike,
-                    "expiration": l.expiration,
-                }
-                for l in signal.legs
-            ]
-            fill_probe: Dict[str, Any] = {}
-            for l in legs_dicts:
-                sym = l["option_symbol"]
+                open_pos_count = 0
                 cur.execute(
-                    """
-                    SELECT bid, ask, last, timestamp,
-                           EXTRACT(EPOCH FROM (NOW() - timestamp)) AS age_s
-                    FROM option_chains
-                    WHERE option_symbol = %s
-                    ORDER BY timestamp DESC
-                    LIMIT 1
-                    """,
-                    (sym,),
+                    "SELECT COUNT(1) FROM tw_positions WHERE bot_id = %s AND underlying = %s",
+                    (bot_id, u),
                 )
-                q = cur.fetchone()
-                fill_probe[sym] = (
-                    {
-                        "bid": float(q[0]) if q[0] is not None else None,
-                        "ask": float(q[1]) if q[1] is not None else None,
-                        "last": float(q[2]) if q[2] is not None else None,
-                        "quote_age_s": float(q[4]) if q[4] is not None else None,
-                    }
-                    if q
-                    else {"status": "no_row"}
+                row_ct = cur.fetchone()
+                open_pos_count = int(row_ct[0]) if row_ct else 0
+                report["open_positions"] = open_pos_count
+                report["current_capital"] = (
+                    capital.current_capital if capital else None
                 )
-            report["fill_probe"] = fill_probe
+                report["confidence_base"] = bot.confidence_base()
+                report["confidence_threshold"] = bot.confidence_threshold()
+                report["size_multiplier"] = bot.size_multiplier()
 
-            price = spread_price(conn, legs_dicts, action="open")
-            report["fill_price"] = price
-            report["fillable"] = price is not None and price > 0
-            if not report["fillable"]:
-                report["fill_block_reason"] = (
-                    "spread_price returned None or <= 0. Either no "
-                    "option_chains row exists for the ATM symbol, or "
-                    "the quote is older than OPTION_QUOTE_MAX_AGE_SECONDS."
-                )
-            bot_reports.append(report)
+                try:
+                    signal = bot.open_criteria(snap)
+                except Exception as exc:  # noqa: BLE001
+                    report["decision"] = "error"
+                    report["error"] = f"{type(exc).__name__}: {exc}"
+                    bot_reports.append(report)
+                    continue
+
+                if signal is None:
+                    report["decision"] = "no_signal"
+                    report["reason"] = _explain_no_signal(bot, snap)
+                    bot_reports.append(report)
+                    continue
+
+                report["decision"] = "signal"
+                report["direction"] = signal.direction
+                report["strategy_type"] = signal.strategy_type
+                report["conviction"] = signal.conviction
+                report["legs"] = [
+                    {
+                        "option_symbol": l.option_symbol,
+                        "side": l.side,
+                        "option_type": l.option_type,
+                        "strike": l.strike,
+                        "expiration": l.expiration,
+                    }
+                    for l in signal.legs
+                ]
+                report["rationale"] = signal.rationale
+
+                legs_dicts = [
+                    {
+                        "option_symbol": l.option_symbol,
+                        "side": l.side,
+                        "option_type": l.option_type,
+                        "strike": l.strike,
+                        "expiration": l.expiration,
+                    }
+                    for l in signal.legs
+                ]
+                fill_probe: Dict[str, Any] = {}
+                for l in legs_dicts:
+                    sym = l["option_symbol"]
+                    cur.execute(
+                        """
+                        SELECT bid, ask, last, timestamp,
+                               EXTRACT(EPOCH FROM (NOW() - timestamp)) AS age_s
+                        FROM option_chains
+                        WHERE option_symbol = %s
+                        ORDER BY timestamp DESC
+                        LIMIT 1
+                        """,
+                        (sym,),
+                    )
+                    q = cur.fetchone()
+                    fill_probe[sym] = (
+                        {
+                            "bid": float(q[0]) if q[0] is not None else None,
+                            "ask": float(q[1]) if q[1] is not None else None,
+                            "last": float(q[2]) if q[2] is not None else None,
+                            "quote_age_s": float(q[4]) if q[4] is not None else None,
+                        }
+                        if q
+                        else {"status": "no_row"}
+                    )
+                report["fill_probe"] = fill_probe
+
+                price = spread_price(conn, legs_dicts, action="open")
+                report["fill_price"] = price
+                report["fillable"] = price is not None and price > 0
+                if not report["fillable"]:
+                    report["fill_block_reason"] = (
+                        "spread_price returned None or <= 0. Either no "
+                        "option_chains row exists for the ATM symbol, or "
+                        "the quote is older than OPTION_QUOTE_MAX_AGE_SECONDS."
+                    )
+                bot_reports.append(report)
 
     scheduler = scheduler_mod.scheduler
     scheduler_status = {
