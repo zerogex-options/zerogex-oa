@@ -24,7 +24,22 @@ ENGINE_ENABLED: bool = _getenv_bool("TRADEWORKZ_ENGINE_ENABLED", True)
 ENGINE_INTERVAL_SECONDS: int = _getenv_int(
     "TRADEWORKZ_ENGINE_INTERVAL_SECONDS", 5, min=1, max=3600
 )
-UNIVERSE: str = _getenv_str("TRADEWORKZ_UNIVERSE", "SPY")
+# Comma-separated list of underlyings the fleet trades against. A bot
+# whose ``universe`` column is the wildcard ``"*"`` runs against every
+# ticker in this list every tick (one signal per (bot, underlying) pair,
+# each with its own snapshot). Legacy per-bot single-ticker rows are
+# still supported — a bot pinned to ``universe='SPY'`` will only see the
+# SPY snapshot even if the fleet universe is wider.
+UNIVERSE: str = _getenv_str("TRADEWORKZ_UNIVERSE", "SPY,QQQ,IWM")
+
+
+def fleet_universes() -> tuple[str, ...]:
+    """Parse ``TRADEWORKZ_UNIVERSE`` into a tuple of upper-cased tickers."""
+    return tuple(
+        sym.strip().upper() for sym in UNIVERSE.split(",") if sym.strip()
+    )
+
+
 RECONCILE_LOCK_ENABLED: bool = _getenv_bool("TRADEWORKZ_RECONCILE_LOCK_ENABLED", True)
 
 # ---------------------------------------------------------------------------
