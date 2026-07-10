@@ -2192,6 +2192,13 @@ CREATE INDEX IF NOT EXISTS idx_backtest_runs_user_created
 CREATE INDEX IF NOT EXISTS idx_backtest_runs_status
     ON backtest_runs(status, created_at DESC);
 
+-- Shareable run reports: a random token that makes a completed run's result
+-- publicly viewable (the "prove it" link). Mirrors backtest_configs.share_token;
+-- minted on demand, unique when present. (Idempotent add for existing DBs.)
+ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS share_token VARCHAR(32);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_backtest_runs_share_token
+    ON backtest_runs(share_token) WHERE share_token IS NOT NULL;
+
 -- One simulated trade per row. ``outcome`` mirrors the playbook backtest
 -- harness vocabulary (target_hit / stop_hit / time_exit / no_fill / no_data).
 CREATE TABLE IF NOT EXISTS backtest_trades (

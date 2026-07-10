@@ -7,9 +7,15 @@ FastAPI after an ``asyncio.to_thread`` hop.
 
 from __future__ import annotations
 
+import secrets
 from typing import Optional
 
 from src.database.connection import db_connection
+
+
+def _new_share_token() -> str:
+    """A short, URL-safe, hard-to-guess token (mirrors backtest_configs)."""
+    return secrets.token_urlsafe(16)[:22]
 
 
 def _row_to_run(row, *, include_spec: bool) -> dict:
@@ -131,8 +137,120 @@ def get_equity(run_id: int) -> list[dict]:
     with db_connection() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT t, equity, drawdown_pct FROM backtest_equity "
-            "WHERE run_id = %s ORDER BY seq",
+            "SELECT t, equity, drawdown_pct FROM backtest_equity " "WHERE run_id = %s ORDER BY seq",
+            (run_id,),
+        )
+        return [
+            {
+                "t": r[0].isoformat() if r[0] else None,
+                "equity": float(r[1]) if r[1] is not None else None,
+                "drawdown_pct": float(r[2]) if r[2] is not None else None,
+            }
+            for r in cur.fetchall()
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Shareable run reports (public "prove it" links)
+# ---------------------------------------------------------------------------
+
+
+def share_run(run_id: int, *, end_user: Optional[str]) -> Optional[str]:
+    """Mint (or return the existing) share token for a COMPLETED run.
+
+    Owner-scoped like every other run read. Only completed runs are shareable
+    (nothing to prove on a queued/failed one). Idempotent: a run keeps its first
+    token, so the link is stable. Returns the token, or None if the run is
+    missing, not owned by ``end_user``, or not completed.
+    """
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT end_user, status, share_token FROM backtest_runs WHERE id = %s",
+            (run_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        owner, status, token = row
+        if owner is not None and owner != end_user:
+            return None
+        if status != "completed":
+            return None
+        if token:
+            return token
+        token = _new_share_token()
+        cur.execute(
+            "UPDATE backtest_runs SET share_token = %s WHERE id = %s",
+            (token, run_id),
+        )
+        return token
+
+
+def _public_run(row) -> dict:
+    """Sanitized public view of a run: aggregate result + a redacted spec.
+
+    Exposes the headline result and *what kind* of thing was tested, but NOT the
+    owner and NOT a custom strategy's exact conditions (the user's edge). Enough
+    to be a credible "prove it" artifact without giving the strategy away.
+    """
+    run_id, underlying, start_date, end_date, summary, created_at, spec = row
+    spec = spec or {}
+    strat = spec.get("strategy")
+    if strat:
+        label = f"Custom strategy · {strat.get('structure', 'single')}"
+        direction = strat.get("direction")
+        structure = strat.get("structure")
+    else:
+        pats = spec.get("patterns") or []
+        label = ", ".join(pats) if pats else "All playbook patterns"
+        direction = None
+        structure = spec.get("structure")
+    return {
+        "underlying": underlying,
+        "start_date": start_date.isoformat() if start_date else None,
+        "end_date": end_date.isoformat() if end_date else None,
+        "created_at": created_at.isoformat() if created_at else None,
+        "summary": summary,
+        "strategy_label": label,
+        "is_custom": bool(strat),
+        "structure": structure,
+        "direction": direction,
+        "patterns": spec.get("patterns") or [],
+        # Enough of the spec to interpret the curve; NO custom conditions.
+        "capital": (spec.get("sizing") or {}).get("capital"),
+        "fill_model": spec.get("fill_model"),
+        "exit": spec.get("exit"),
+    }
+
+
+def get_shared_run(share_token: str) -> Optional[dict]:
+    """Public read of a shared, completed run by token (no owner scoping)."""
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, underlying, start_date, end_date, summary, created_at, spec "
+            "FROM backtest_runs WHERE share_token = %s AND status = 'completed'",
+            (share_token,),
+        )
+        row = cur.fetchone()
+        return _public_run(row) if row is not None else None
+
+
+def get_shared_equity(share_token: str) -> Optional[list[dict]]:
+    """Public equity curve for a shared run by token; None if the token is unknown."""
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id FROM backtest_runs WHERE share_token = %s AND status = 'completed'",
+            (share_token,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        run_id = int(row[0])
+        cur.execute(
+            "SELECT t, equity, drawdown_pct FROM backtest_equity " "WHERE run_id = %s ORDER BY seq",
             (run_id,),
         )
         return [
@@ -164,8 +282,11 @@ def _derive_pattern_economics(
     """
     if gross_win_pnl is None or gross_loss_pnl is None:
         return {
-            "net_pnl": None, "profit_factor": None, "expectancy": None,
-            "avg_win_pnl": None, "avg_loss_pnl": None,
+            "net_pnl": None,
+            "profit_factor": None,
+            "expectancy": None,
+            "avg_win_pnl": None,
+            "avg_loss_pnl": None,
         }
     gw = float(gross_win_pnl)
     gl = float(gross_loss_pnl)
@@ -182,7 +303,9 @@ _VALID_INSIGHT_SOURCES = ("option_pnl", "underlying_touch")
 
 
 def get_pattern_insights(
-    *, source: str = "option_pnl", underlying: Optional[str] = None,
+    *,
+    source: str = "option_pnl",
+    underlying: Optional[str] = None,
 ) -> list[dict]:
     """Latest stats row per (pattern, underlying) for the leaderboard.
 
@@ -219,10 +342,20 @@ def get_pattern_insights(
     out: list[dict] = []
     for r in rows:
         (
-            pattern, underlying_, window_start, window_end,
-            n_emitted, n_resolved, n_wins, n_losses,
-            hit_rate, proposed_base, gross_win_pnl, gross_loss_pnl,
-            row_source, computed_at,
+            pattern,
+            underlying_,
+            window_start,
+            window_end,
+            n_emitted,
+            n_resolved,
+            n_wins,
+            n_losses,
+            hit_rate,
+            proposed_base,
+            gross_win_pnl,
+            gross_loss_pnl,
+            row_source,
+            computed_at,
         ) = r
         econ = _derive_pattern_economics(
             int(n_resolved or 0),
@@ -231,27 +364,25 @@ def get_pattern_insights(
             gross_win_pnl,
             gross_loss_pnl,
         )
-        out.append({
-            "pattern": pattern,
-            "underlying": underlying_,
-            "window_start": window_start.isoformat() if window_start else None,
-            "window_end": window_end.isoformat() if window_end else None,
-            "n_emitted": int(n_emitted or 0),
-            "n_resolved": int(n_resolved or 0),
-            "n_wins": int(n_wins or 0),
-            "n_losses": int(n_losses or 0),
-            "hit_rate": float(hit_rate) if hit_rate is not None else None,
-            "proposed_base": float(proposed_base) if proposed_base is not None else None,
-            "gross_win_pnl": (
-                float(gross_win_pnl) if gross_win_pnl is not None else None
-            ),
-            "gross_loss_pnl": (
-                float(gross_loss_pnl) if gross_loss_pnl is not None else None
-            ),
-            "source": row_source,
-            "computed_at": computed_at.isoformat() if computed_at else None,
-            **econ,
-        })
+        out.append(
+            {
+                "pattern": pattern,
+                "underlying": underlying_,
+                "window_start": window_start.isoformat() if window_start else None,
+                "window_end": window_end.isoformat() if window_end else None,
+                "n_emitted": int(n_emitted or 0),
+                "n_resolved": int(n_resolved or 0),
+                "n_wins": int(n_wins or 0),
+                "n_losses": int(n_losses or 0),
+                "hit_rate": float(hit_rate) if hit_rate is not None else None,
+                "proposed_base": float(proposed_base) if proposed_base is not None else None,
+                "gross_win_pnl": (float(gross_win_pnl) if gross_win_pnl is not None else None),
+                "gross_loss_pnl": (float(gross_loss_pnl) if gross_loss_pnl is not None else None),
+                "source": row_source,
+                "computed_at": computed_at.isoformat() if computed_at else None,
+                **econ,
+            }
+        )
     # Server-side default ordering: net_pnl desc (NULLs last), then n_resolved
     # desc. Stable enough that the client can show a usable view before it
     # re-sorts.
