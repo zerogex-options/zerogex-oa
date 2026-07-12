@@ -52,8 +52,17 @@ from src.config import (
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.analytics.walls import compute_call_put_walls
 from src.greeks_fd import fd_charm, fd_vanna
+from src.analytics.forced_flow import (
+    build_legs,
+    charm_flip,
+    flow_total,
+    spot_grid,
+    vanna_flip,
+    zero_flow_level,
+)
 from src.flow_series_sql import SNAPSHOT_UPSERT_PSYCOPG2, SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2
 from src.market_calendar import (
+    ET,
     calculate_time_to_expiration,
     expiration_close_time_et,
     is_engine_run_window,
@@ -62,6 +71,12 @@ from src.market_calendar import (
     seconds_until_engine_run_window,
     settlement_close_time_for_contract,
 )
+
+# Forced-flow reprice grid (Phase 2): +/- 5% of spot in 0.5% steps. Kept modest
+# so the per-cycle reprice stays cheap; the /forced-flow API can use a finer
+# grid on demand. Vectorizing the reprice over the grid is a follow-up.
+_FORCED_FLOW_SPAN_PCT = 0.05
+_FORCED_FLOW_STEP_PCT = 0.005
 
 logger = get_logger(__name__)
 
@@ -3039,6 +3054,129 @@ class AnalyticsEngine:
             ),
         )
 
+    def _session_days_remaining(self, timestamp: datetime) -> float:
+        """Calendar-day fraction from ``timestamp`` to today's 16:00 ET cash close.
+
+        The default forced-flow horizon ("the remaining session"), floored at 0 so
+        a post-close snapshot yields no session-driven flow.
+        """
+        ts = timestamp.astimezone(ET) if timestamp.tzinfo else ET.localize(timestamp)
+        close_dt = ts.replace(hour=16, minute=0, second=0, microsecond=0)
+        return max(0.0, (close_dt - ts).total_seconds() / 86400.0)
+
+    def _calculate_forced_flow(
+        self, options: List[Dict[str, Any]], summary: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Forced-flow curve + charm/vanna/zero-flow levels for one snapshot.
+
+        Reprices aggregate dealer delta (model A -- long calls / short puts, the
+        GEX convention, so this is consistent with the shipped gamma flip) over a
+        spot grid out to the remaining-session horizon. Uses only delta. Returns
+        None on a degraded snapshot (no spot, or no priceable legs).
+        """
+        spot = summary.get("underlying_price")
+        if not spot or spot <= 0:
+            return None
+        timestamp = summary["timestamp"]
+
+        def _tte(opt: Dict[str, Any]) -> float:
+            close_t = settlement_close_time_for_contract(
+                self.db_symbol, opt.get("option_symbol"), opt["expiration"]
+            )
+            return calculate_time_to_expiration(
+                timestamp, opt["expiration"], market_close_time=close_t
+            )
+
+        legs = build_legs(options, _tte)
+        if not legs:
+            return None
+
+        r, q = self.risk_free_rate, self.dividend_yield
+        session_days = self._session_days_remaining(timestamp)
+        span, step = _FORCED_FLOW_SPAN_PCT, _FORCED_FLOW_STEP_PCT
+        curve = [
+            (level, flow_total(legs, spot, level / spot - 1.0, session_days, 0.0, r, q))
+            for level in spot_grid(spot, span, step)
+        ]
+        return {
+            "spot": float(spot),
+            "span_pct": span,
+            "session_days": session_days,
+            "charm_flip": charm_flip(legs, spot, session_days, r, q, span, step),
+            "vanna_flip": vanna_flip(legs, spot, r, q, 1.0, span, step),
+            "zero_flow_level": zero_flow_level(legs, spot, session_days, r, q, 0.0, span, step),
+            "curve": curve,
+        }
+
+    def _store_forced_flow(
+        self, summary: Dict[str, Any], forced_flow: Optional[Dict[str, Any]], cursor
+    ) -> None:
+        """Write the forced-flow curve + levels on ``cursor``. No-op when None.
+
+        Additive: does not touch the gex_summary / gex_profile contracts.
+        """
+        if not forced_flow:
+            return
+        import json as _json
+
+        payload = _json.dumps(
+            [{"price": float(s), "flow": float(f)} for s, f in forced_flow["curve"]]
+        )
+
+        def _f(x: Optional[float]) -> Optional[float]:
+            return float(x) if x is not None else None
+
+        cursor.execute(
+            """
+            INSERT INTO forced_flow_profile
+                (underlying, timestamp, spot_price, span_pct, session_days,
+                 charm_flip, vanna_flip, zero_flow_level, profile)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (underlying, timestamp) DO UPDATE SET
+                spot_price = EXCLUDED.spot_price,
+                span_pct = EXCLUDED.span_pct,
+                session_days = EXCLUDED.session_days,
+                charm_flip = EXCLUDED.charm_flip,
+                vanna_flip = EXCLUDED.vanna_flip,
+                zero_flow_level = EXCLUDED.zero_flow_level,
+                profile = EXCLUDED.profile
+            """,
+            (
+                summary["underlying"],
+                summary["timestamp"],
+                _f(forced_flow["spot"]),
+                _f(forced_flow["span_pct"]),
+                _f(forced_flow["session_days"]),
+                _f(forced_flow["charm_flip"]),
+                _f(forced_flow["vanna_flip"]),
+                _f(forced_flow["zero_flow_level"]),
+                payload,
+            ),
+        )
+
+    def _store_forced_flow_snapshot(
+        self, summary: Dict[str, Any], options: Optional[List[Dict[str, Any]]]
+    ) -> None:
+        """Compute + persist forced flow in its OWN transaction, non-fatally.
+
+        Deliberately isolated from :meth:`_store_calculation_results`' core GEX
+        write: forced flow is additive, so a compute or write failure here (or a
+        not-yet-migrated ``forced_flow_profile`` table) must never roll back or
+        drop a GEX snapshot. Failures are logged and swallowed.
+        """
+        if options is None:
+            return
+        try:
+            forced_flow = self._calculate_forced_flow(options, summary)
+            if not forced_flow:
+                return
+            with db_connection() as conn:
+                cursor = conn.cursor()
+                self._store_forced_flow(summary, forced_flow, cursor)
+                conn.commit()
+        except Exception as e:
+            logger.warning("Forced-flow snapshot skipped (non-fatal): %s", e, exc_info=True)
+
     def _store_daily_atm_iv(
         self,
         options: List[Dict[str, Any]],
@@ -3187,6 +3325,11 @@ class AnalyticsEngine:
             logger.error("Error storing calculation results: %s", e, exc_info=True)
             self.errors_count += 1
             raise
+
+        # Forced flow (Phase 2) is persisted separately and non-fatally so a
+        # forced-flow issue never rolls back the core GEX snapshot committed
+        # above. See _store_forced_flow_snapshot.
+        self._store_forced_flow_snapshot(summary, options)
 
     def _validate_gex_calculations(
         self,

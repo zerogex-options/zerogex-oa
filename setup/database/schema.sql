@@ -649,6 +649,40 @@ BEGIN
     END IF;
 END $$;
 
+-- Forced Flow profile (Phase 2). Per-snapshot dealer forced-hedging curve
+-- (dollars of stock dealers must trade to end the remaining session at each
+-- spot level) plus the three derived levels. Modeled on gex_profile: the curve
+-- is a price-ascending JSONB array [{"price": float, "flow": float}, ...] and
+-- the row is keyed by (underlying, timestamp) so /forced-flow/* can serve it
+-- without recomputing the reprice grid on every request. This is what makes the
+-- forced-flow backtest possible. The existing gamma flip stays in gex_summary
+-- and is not duplicated here.
+CREATE TABLE IF NOT EXISTS forced_flow_profile (
+    underlying VARCHAR(10) NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL,
+    spot_price NUMERIC(12, 4) NOT NULL,
+    span_pct DOUBLE PRECISION,
+    session_days DOUBLE PRECISION,       -- horizon: calendar days to the cash close
+    charm_flip DOUBLE PRECISION,         -- spot where time-decay hedging flips sign
+    vanna_flip DOUBLE PRECISION,         -- spot where vol-driven hedging flips sign
+    zero_flow_level DOUBLE PRECISION,    -- spot where total forced flow is zero
+    profile JSONB NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (underlying, timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_forced_flow_profile_underlying_timestamp
+    ON forced_flow_profile(underlying, timestamp DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_forced_flow_profile_underlying') THEN
+        ALTER TABLE forced_flow_profile
+        ADD CONSTRAINT fk_forced_flow_profile_underlying
+        FOREIGN KEY (underlying) REFERENCES symbols(symbol) ON DELETE CASCADE;
+    END IF;
+END $$;
+
 -- =============================================================================
 -- Remove legacy/non-essential objects (safe cleanup during migration)
 -- =============================================================================
