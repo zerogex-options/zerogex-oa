@@ -22,6 +22,7 @@ from src.market_calendar import (
 )
 from src.utils import get_logger
 from src.config import RISK_FREE_RATE, DIVIDEND_YIELD, IMPLIED_VOLATILITY_DEFAULT
+from src.greeks_fd import bsm_delta, fd_charm, fd_vanna
 from src.ingestion.iv_calculator import IVCalculator
 from src.config import IV_CALCULATION_ENABLED
 
@@ -148,23 +149,14 @@ class GreeksCalculator:
         Returns:
             Delta value
         """
-        # Guard degenerate inputs like the other Greeks do. Without this,
-        # _calculate_d1_d2 returns its (0, 0) sentinel and delta collapses to
-        # N(0)=0.5 (call) / -0.5 (put) — a plausible-looking but wrong value
-        # for an invalid/expired contract (sigma<=0 or T<=0). Return 0.0 so a
-        # degenerate row is clearly non-directional rather than half-delta.
-        if S <= 0 or K <= 0 or sigma <= 0 or T <= 0:
-            return 0.0
-
-        d1, _ = self._calculate_d1_d2(S, K, T, r, sigma, q)
-        discount = np.exp(-q * T)
-
-        if option_type == "C":
-            delta = discount * stats.norm.cdf(d1)
-        else:  # Put
-            delta = discount * (stats.norm.cdf(d1) - 1)
-
-        return delta  # type: ignore[no-any-return]
+        # Delegate to the shared canonical delta (src.greeks_fd.bsm_delta) so
+        # the ingestion Greeks, the analytics exposure engine, and the
+        # finite-difference charm/vanna all price delta from one implementation
+        # and cannot drift apart. bsm_delta applies the same degenerate-input
+        # guard (returns 0.0 for S/K/sigma/T <= 0), so an invalid/expired
+        # contract stays clearly non-directional rather than collapsing to a
+        # plausible-but-wrong half-delta (N(0)=0.5).
+        return bsm_delta(S, K, T, r, sigma, option_type, q)
 
     def calculate_gamma(
         self, S: float, K: float, T: float, r: float, sigma: float, q: float = 0.0
@@ -277,6 +269,53 @@ class GreeksCalculator:
 
         return vega  # type: ignore[no-any-return]
 
+    def calculate_vanna(
+        self,
+        S: float,
+        K: float,
+        T: float,
+        r: float,
+        sigma: float,
+        option_type: str = "C",
+        q: float = 0.0,
+    ) -> float:
+        """Calculate option vanna (d(delta)/d(sigma), per unit sigma).
+
+        Vanna measures how delta drifts as implied vol moves -- one of the
+        three ways a dealer's hedge goes stale. Computed by finite difference
+        against :meth:`calculate_delta` (see :mod:`src.greeks_fd`), so it
+        inherits this engine's r / q / day-count conventions exactly. Vanna is
+        the same for calls and puts; ``option_type`` is accepted for signature
+        uniformity only.
+
+        Returned per unit sigma (sigma=1.00 == 100 vol points), matching the
+        analytics exposure convention; the vol-point (0.01) scaling is applied
+        at dollar-conversion time.
+        """
+        return fd_vanna(S, K, T, r, sigma, option_type, q)
+
+    def calculate_charm(
+        self,
+        S: float,
+        K: float,
+        T: float,
+        r: float,
+        sigma: float,
+        option_type: str = "C",
+        q: float = 0.0,
+    ) -> float:
+        """Calculate option charm (d(delta)/dt, per calendar day).
+
+        Charm measures how delta drifts as time passes with spot and vol held
+        fixed -- a scheduled, direction-known flow that steepens into expiry.
+        Computed by finite difference against :meth:`calculate_delta` (see
+        :mod:`src.greeks_fd`) as ``delta(T - 1 day) - delta(T)``, so the output
+        is directly "delta per calendar day" and immune to the d(delta)/dt vs
+        d(delta)/dT sign flip. Call and put charm differ by -q*e^{-qT}; at q=0
+        they are identical.
+        """
+        return fd_charm(S, K, T, r, sigma, option_type, q)
+
     def calculate_all_greeks(
         self,
         underlying_price: float,
@@ -302,7 +341,7 @@ class GreeksCalculator:
             risk_free_rate: Risk-free rate (uses instance default if None)
 
         Returns:
-            Dictionary with delta, gamma, theta, vega
+            Dictionary with delta, gamma, theta, vega, charm, vanna
         """
         # Use defaults if not provided
         if implied_volatility is None:
@@ -322,11 +361,25 @@ class GreeksCalculator:
         # Validate inputs
         if underlying_price <= 0:
             logger.warning(f"Invalid underlying price: {underlying_price}")
-            return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+            return {
+                "delta": 0.0,
+                "gamma": 0.0,
+                "theta": 0.0,
+                "vega": 0.0,
+                "charm": 0.0,
+                "vanna": 0.0,
+            }
 
         if strike <= 0:
             logger.warning(f"Invalid strike: {strike}")
-            return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+            return {
+                "delta": 0.0,
+                "gamma": 0.0,
+                "theta": 0.0,
+                "vega": 0.0,
+                "charm": 0.0,
+                "vanna": 0.0,
+            }
 
         # Calculate Greeks
         q = self.dividend_yield
@@ -343,12 +396,21 @@ class GreeksCalculator:
             vega = self.calculate_vega(
                 underlying_price, strike, T, risk_free_rate, implied_volatility, q
             )
+            # Second-order dealer-hedging Greeks (finite difference vs delta).
+            charm = self.calculate_charm(
+                underlying_price, strike, T, risk_free_rate, implied_volatility, option_type, q
+            )
+            vanna = self.calculate_vanna(
+                underlying_price, strike, T, risk_free_rate, implied_volatility, option_type, q
+            )
 
             greeks = {
                 "delta": round(delta, 6),
                 "gamma": round(gamma, 8),
                 "theta": round(theta, 6),
                 "vega": round(vega, 6),
+                "charm": round(charm, 8),
+                "vanna": round(vanna, 8),
             }
 
             logger.debug(f"Calculated Greeks for {option_type} {strike}: {greeks}")
@@ -357,7 +419,14 @@ class GreeksCalculator:
 
         except Exception as e:
             logger.error(f"Error calculating Greeks: {e}", exc_info=True)
-            return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+            return {
+                "delta": 0.0,
+                "gamma": 0.0,
+                "theta": 0.0,
+                "vega": 0.0,
+                "charm": 0.0,
+                "vanna": 0.0,
+            }
 
     def enrich_option_data(
         self, option_data: Dict[str, Any], underlying_price: float
@@ -406,6 +475,8 @@ class GreeksCalculator:
             option_data["gamma"] = None
             option_data["theta"] = None
             option_data["vega"] = None
+            option_data["charm"] = None
+            option_data["vanna"] = None
             return option_data
 
         if not all([strike, expiration, option_type, timestamp]):
@@ -477,6 +548,8 @@ def main():
     print(f"  Gamma: {call_greeks['gamma']:8.6f}  (Γ)")
     print(f"  Theta: {call_greeks['theta']:8.6f}  (Θ) [$/day]")
     print(f"  Vega:  {call_greeks['vega']:8.6f}  (ν) [$/1% IV]")
+    print(f"  Charm: {call_greeks['charm']:8.6f}  (∂Δ/∂t) [Δ/day]")
+    print(f"  Vanna: {call_greeks['vanna']:8.6f}  (∂Δ/∂σ) [Δ/unit σ]")
     print()
 
     # Test put option
@@ -494,6 +567,8 @@ def main():
     print(f"  Gamma: {put_greeks['gamma']:8.6f}  (Γ)")
     print(f"  Theta: {put_greeks['theta']:8.6f}  (Θ) [$/day]")
     print(f"  Vega:  {put_greeks['vega']:8.6f}  (ν) [$/1% IV]")
+    print(f"  Charm: {put_greeks['charm']:8.6f}  (∂Δ/∂t) [Δ/day]")
+    print(f"  Vanna: {put_greeks['vanna']:8.6f}  (∂Δ/∂σ) [Δ/unit σ]")
     print()
 
     # Test enrich_option_data

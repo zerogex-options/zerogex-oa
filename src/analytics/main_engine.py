@@ -23,7 +23,6 @@ from typing import Dict, Any, List, Optional, Sequence, Tuple
 from collections import defaultdict
 import pytz
 import numpy as np
-from scipy import stats
 from psycopg2.extras import execute_values
 
 from src.database import db_connection, close_connection_pool
@@ -52,6 +51,7 @@ from src.config import (
 )
 from src.symbols import parse_underlyings, get_canonical_symbol
 from src.analytics.walls import compute_call_put_walls
+from src.greeks_fd import fd_charm, fd_vanna
 from src.flow_series_sql import SNAPSHOT_UPSERT_PSYCOPG2, SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2
 from src.market_calendar import (
     calculate_time_to_expiration,
@@ -1049,54 +1049,46 @@ class AnalyticsEngine:
     def _calculate_vanna(
         self, S: float, K: float, T: float, r: float, sigma: float, q: float = 0.0
     ) -> float:
+        """Vanna (d(delta)/d(sigma), per unit sigma) by finite difference.
+
+        Reconciled to the single shared FD kernel (:func:`src.greeks_fd.fd_vanna`)
+        so this aggregate exposure and the ingestion per-contract vanna are
+        computed by one implementation and cannot drift apart. Vanna is
+        option-type independent, so no ``option_type`` is needed here. ``q`` is
+        the continuous dividend yield. The per-vol-point (0.01) scaling stays
+        at the dollar-conversion step below, unchanged.
+
+        Matches the previous closed form ``-e^{-qT}*N'(d1)*d2/sigma`` to O(h^2);
+        that closed form is retained only as a validation target in the tests.
         """
-        Calculate Vanna (∂²V/∂S∂σ)
-
-        Vanna measures how delta changes with volatility.  ``q`` is the
-        continuous dividend yield (0.0 = dividend-free model).
-        """
-        if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
-            return 0.0
-
-        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-        d2 = d1 - sigma * np.sqrt(T)
-
-        vanna = -np.exp(-q * T) * stats.norm.pdf(d1) * d2 / sigma
-
-        return vanna  # type: ignore[no-any-return]
+        return fd_vanna(S, K, T, r, sigma, "C", q)
 
     def _calculate_charm(
-        self, S: float, K: float, T: float, r: float, sigma: float, q: float = 0.0
+        self,
+        S: float,
+        K: float,
+        T: float,
+        r: float,
+        sigma: float,
+        q: float = 0.0,
+        option_type: str = "C",
     ) -> float:
+        """Charm (d(delta)/dt, per calendar day) by finite difference.
+
+        Reconciled to the single shared FD kernel (:func:`src.greeks_fd.fd_charm`)
+        so this aggregate exposure and the ingestion per-contract charm are
+        computed by one implementation and cannot drift apart. ``option_type``
+        lets a put carry its correct charm: call and put charm differ by exactly
+        -q*e^{-qT}, so at q=0 (the default for index symbols) they are identical
+        and this changes nothing; only a configured non-zero dividend yield
+        makes the put form differ. ``q`` is the continuous dividend yield.
+
+        The finite-difference value is the realized one-calendar-day delta
+        change, so away from expiry it matches the previous instantaneous
+        closed form (retained as a test target); near expiry it is intentionally
+        larger, reflecting the actual decay a dealer faces into the close.
         """
-        Calculate Charm (∂²V/∂S∂T) — call charm; ``q`` is the dividend yield.
-
-        At q=0 call charm equals put charm by put-call parity
-        (Δ_put = Δ_call − 1, so ∂Δ/∂t is option-type independent), which is
-        why this takes no ``option_type``.  At q>0 the dividend carry term
-        ``q·e^{-qT}·N(d1)`` enters and the two diverge slightly; we report
-        the call form, consistent with the dealer-call-dominated GEX book.
-        """
-        if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
-            return 0.0
-
-        sqrt_T = np.sqrt(T)
-        d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
-        d2 = d1 - sigma * sqrt_T
-
-        # BSM call charm with continuous dividend yield q (per year):
-        #   q·e^{-qT}·N(d1) − e^{-qT}·N'(d1)·[2(r−q)T − d2·σ√T] / [2T·σ√T]
-        # With q=0 the carry term vanishes and this reduces to the prior
-        # dividend-free form −N'(d1)·[2rT − d2·σ√T]/[2T·σ√T].
-        disc_q = np.exp(-q * T)
-        charm = q * disc_q * stats.norm.cdf(d1) - disc_q * stats.norm.pdf(d1) * (
-            2 * (r - q) * T - d2 * sigma * sqrt_T
-        ) / (2 * T * sigma * sqrt_T)
-
-        # Convert to per day
-        charm_per_day = charm / 365.0
-
-        return charm_per_day  # type: ignore[no-any-return]
+        return fd_charm(S, K, T, r, sigma, option_type, q)
 
     def _calculate_bs_gamma(self, S, K: float, T: float, r: float, sigma: float, q: float = 0.0):
         """Black-Scholes-Merton gamma (identical for calls and puts).
@@ -1337,6 +1329,7 @@ class AnalyticsEngine:
                     self.risk_free_rate,
                     iv,
                     self.dividend_yield,
+                    option_type=opt["option_type"],
                 )
 
                 share_notional = opt["open_interest"] * 100 * underlying_price
