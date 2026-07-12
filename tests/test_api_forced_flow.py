@@ -66,7 +66,7 @@ def _app_with_loader(monkeypatch, loader=_ctx):
 def test_scenario_returns_flow_and_attribution(monkeypatch):
     app = _app_with_loader(monkeypatch)
     with TestClient(app) as c:
-        r = c.get("/forced-flow/scenario?symbol=SPY&spot_move_pct=0.01&days=0&vol_change_pts=0")
+        r = c.get("/api/forced-flow/scenario?symbol=SPY&spot_move_pct=0.01&days=0&vol_change_pts=0")
     assert r.status_code == 200
     b = r.json()
     assert b["symbol"] == "SPY" and b["spot"] == 500.0 and b["timestamp"]
@@ -85,7 +85,7 @@ def test_scenario_returns_flow_and_attribution(monkeypatch):
 def test_curve_has_attribution_bands(monkeypatch):
     app = _app_with_loader(monkeypatch)
     with TestClient(app) as c:
-        r = c.get("/forced-flow/curve?symbol=SPY&spot_range_pct=0.03")
+        r = c.get("/api/forced-flow/curve?symbol=SPY&spot_range_pct=0.03")
     assert r.status_code == 200
     b = r.json()
     assert b["spot"] == 500.0 and b["timestamp"]
@@ -97,7 +97,7 @@ def test_curve_has_attribution_bands(monkeypatch):
 def test_charm_decay_starts_at_zero(monkeypatch):
     app = _app_with_loader(monkeypatch)
     with TestClient(app) as c:
-        r = c.get("/forced-flow/charm-decay?symbol=SPY&steps=10")
+        r = c.get("/api/forced-flow/charm-decay?symbol=SPY&steps=10")
     assert r.status_code == 200
     b = r.json()
     assert len(b["curve"]) == 11
@@ -108,7 +108,7 @@ def test_charm_decay_starts_at_zero(monkeypatch):
 def test_vanna_ladder_zero_at_no_change(monkeypatch):
     app = _app_with_loader(monkeypatch)
     with TestClient(app) as c:
-        r = c.get("/forced-flow/vanna-ladder?symbol=SPY&lo_pts=-2&hi_pts=2&step_pts=1")
+        r = c.get("/api/forced-flow/vanna-ladder?symbol=SPY&lo_pts=-2&hi_pts=2&step_pts=1")
     assert r.status_code == 200
     b = r.json()
     xs = [p["vol_change_pts"] for p in b["curve"]]
@@ -120,7 +120,7 @@ def test_vanna_ladder_zero_at_no_change(monkeypatch):
 def test_surface_grid_dimensions(monkeypatch):
     app = _app_with_loader(monkeypatch)
     with TestClient(app) as c:
-        r = c.get("/forced-flow/surface?symbol=SPY&spot_range_pct=0.02&time_steps=4")
+        r = c.get("/api/forced-flow/surface?symbol=SPY&spot_range_pct=0.02&time_steps=4")
     assert r.status_code == 200
     b = r.json()
     assert len(b["times_days"]) == 5
@@ -131,7 +131,7 @@ def test_surface_grid_dimensions(monkeypatch):
 def test_levels_uses_existing_gamma_flip(monkeypatch):
     app = _app_with_loader(monkeypatch)
     with TestClient(app) as c:
-        r = c.get("/forced-flow/levels?symbol=SPY")
+        r = c.get("/api/forced-flow/levels?symbol=SPY")
     assert r.status_code == 200
     b = r.json()
     # Gamma flip comes from the persisted gex_summary (existing; not recomputed).
@@ -142,5 +142,5 @@ def test_levels_uses_existing_gamma_flip(monkeypatch):
 def test_degraded_snapshot_returns_404(monkeypatch):
     app = _app_with_loader(monkeypatch, loader=lambda symbol, expiry=None: None)
     with TestClient(app) as c:
-        r = c.get("/forced-flow/scenario?symbol=SPY")
+        r = c.get("/api/forced-flow/scenario?symbol=SPY")
     assert r.status_code == 404

@@ -3,12 +3,12 @@
 Six read endpoints over the forced-flow engine (``src.analytics.forced_flow``),
 all derived from the one ``dealer_hedge_flow`` primitive:
 
-    GET /forced-flow/curve         flow vs. spot (grid) + per-source attribution
-    GET /forced-flow/charm-decay   cumulative time-forced flow to the close
-    GET /forced-flow/vanna-ladder  flow vs. IV change (vol points)
-    GET /forced-flow/surface       spot x time-of-day -> flow (heatmap)
-    GET /forced-flow/levels        gamma / charm / vanna flip + zero-flow level
-    GET /forced-flow/scenario      one arbitrary (spot, time, vol) what-if
+    GET /api/forced-flow/curve         flow vs. spot (grid) + per-source attribution
+    GET /api/forced-flow/charm-decay   cumulative time-forced flow to the close
+    GET /api/forced-flow/vanna-ladder  flow vs. IV change (vol points)
+    GET /api/forced-flow/surface       spot x time-of-day -> flow (heatmap)
+    GET /api/forced-flow/levels        gamma / charm / vanna flip + zero-flow level
+    GET /api/forced-flow/scenario      one arbitrary (spot, time, vol) what-if
 
 Each response carries the snapshot ``timestamp`` and the ``spot`` it was computed
 against. Results are recomputed on demand from the latest chain (fresh, always
@@ -46,7 +46,7 @@ from src.analytics.main_engine import AnalyticsEngine
 from ..database import DatabaseManager
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/forced-flow", tags=["Forced Flow"])
+router = APIRouter(prefix="/api/forced-flow", tags=["Forced Flow"])
 
 # On-demand engine tuning (mirrors the gamma-flip endpoints): skip the wide
 # cold-start scan and floor the lookback so a fresh per-request engine tolerates
