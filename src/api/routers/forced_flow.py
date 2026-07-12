@@ -9,6 +9,7 @@ all derived from the one ``dealer_hedge_flow`` primitive:
     GET /api/forced-flow/surface       spot x time-of-day -> flow (heatmap)
     GET /api/forced-flow/levels        gamma / charm / vanna flip + zero-flow level
     GET /api/forced-flow/scenario      one arbitrary (spot, time, vol) what-if
+    GET /api/forced-flow/backtest      charm-into-close track record (hit rate)
 
 Each response carries the snapshot ``timestamp`` and the ``spot`` it was computed
 against. Results are recomputed on demand from the latest chain (fresh, always
@@ -31,6 +32,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from src.analytics.forced_flow import (
+    charm_backtest_summary,
     charm_flip,
     charm_into_close,
     dealer_hedge_flow,
@@ -233,6 +235,28 @@ class ScenarioResponse(_TsModel):
     charm_component: float
     vanna_component: float
     residual: float
+
+
+class BacktestRecord(BaseModel):
+    date: str
+    charm_flow: float
+    return_pct: float
+    predicted_dir: int
+    realized_dir: int
+    hit: bool
+
+
+class BacktestResponse(BaseModel):
+    symbol: str
+    lookback_days: int
+    total_sessions: int
+    evaluated_sessions: int
+    hits: int
+    hit_rate: Optional[float] = None
+    baseline_rate: Optional[float] = None
+    edge: Optional[float] = None
+    signal_mean_return: Optional[float] = None
+    records: List[BacktestRecord]
 
 
 # --------------------------------------------------------------------------- #
@@ -485,3 +509,35 @@ def _levels_sync(sym):
             ctx["legs"], ctx["spot"], ctx["session_days"], ctx["r"], ctx["q"]
         ),
     }
+
+
+@router.get("/backtest", response_model=BacktestResponse)
+async def get_backtest(
+    symbol: str = Query(default="SPY"),
+    lookback_days: int = Query(
+        default=180, ge=5, le=1000, description="Calendar days of history to score"
+    ),
+    db: DatabaseManager = Depends(get_db),
+):
+    """Charm-into-Close track record: does the morning charm-flow sign lean the
+    same way as the actual noon->close return?
+
+    Reads the persisted ``forced_flow_profile`` + ``underlying_quotes`` history
+    and reports the hit rate against a naive directional baseline -- honestly,
+    including when the sample is thin or the edge is nil. Returns 200 with zeroed
+    counts (not 404) before enough sessions have accrued, so the page can show
+    an honest "collecting" state rather than an error.
+    """
+    sym = symbol.upper()
+    key = ("backtest", sym, lookback_days)
+    cached = _cache_get(key)
+    if cached is not None:
+        return BacktestResponse(**cached)
+    try:
+        sessions = await db.get_charm_backtest_sessions(sym, lookback_days)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.error("forced-flow backtest failed for %s: %s", sym, e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+    data = {"symbol": sym, "lookback_days": lookback_days, **charm_backtest_summary(sessions)}
+    _cache_put(key, data)
+    return BacktestResponse(**data)

@@ -1671,6 +1671,87 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching forced flow: {e}", exc_info=True)
             raise
 
+    async def get_charm_backtest_sessions(
+        self, symbol: str = "SPY", lookback_days: int = 180
+    ) -> List[Dict[str, Any]]:
+        """One row per trading day for the Charm-into-Close track record.
+
+        Joins three per-session data points, all keyed on the US/Eastern
+        calendar date so DST is handled by Postgres, not us:
+
+        * the MORNING ``close_charm_flow`` -- the first ``forced_flow_profile``
+          row in the 09:35-10:30 ET window (the forecast, made before the
+          measurement window opens, so there is no look-ahead);
+        * the NOON spot -- the first ``underlying_quotes`` close in the
+          12:00-12:59 ET window;
+        * the CLOSE spot -- the last ``underlying_quotes`` close in the
+          15:55-16:05 ET window.
+
+        Only sessions with all three present are returned. The aggregation
+        (hit rate, baseline, edge) lives in
+        ``src.analytics.forced_flow.charm_backtest_summary`` so it stays a pure,
+        unit-testable function. Cached at the analytics TTL -- the newest row
+        only changes once per session.
+        """
+        symbol = symbol.upper()
+        cache_key = f"charm_backtest:{symbol}:{lookback_days}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+        query = """
+            WITH morning AS (
+                SELECT DISTINCT ON (d)
+                    (timestamp AT TIME ZONE 'America/New_York')::date AS d,
+                    close_charm_flow AS charm_flow
+                FROM forced_flow_profile
+                WHERE underlying = $1
+                  AND close_charm_flow IS NOT NULL
+                  AND timestamp >= NOW() - make_interval(days => $2)
+                  AND (timestamp AT TIME ZONE 'America/New_York')::time
+                      BETWEEN TIME '09:35' AND TIME '10:30'
+                ORDER BY d, timestamp
+            ),
+            noon AS (
+                SELECT DISTINCT ON (d)
+                    (timestamp AT TIME ZONE 'America/New_York')::date AS d,
+                    close AS noon_px
+                FROM underlying_quotes
+                WHERE symbol = $1
+                  AND timestamp >= NOW() - make_interval(days => $2)
+                  AND (timestamp AT TIME ZONE 'America/New_York')::time
+                      BETWEEN TIME '12:00' AND TIME '12:59'
+                ORDER BY d, timestamp
+            ),
+            close_px AS (
+                SELECT DISTINCT ON (d)
+                    (timestamp AT TIME ZONE 'America/New_York')::date AS d,
+                    close AS close_px
+                FROM underlying_quotes
+                WHERE symbol = $1
+                  AND timestamp >= NOW() - make_interval(days => $2)
+                  AND (timestamp AT TIME ZONE 'America/New_York')::time
+                      BETWEEN TIME '15:55' AND TIME '16:05'
+                ORDER BY d, timestamp DESC
+            )
+            SELECT m.d AS session_date,
+                   m.charm_flow,
+                   n.noon_px,
+                   c.close_px
+            FROM morning m
+            JOIN noon n ON n.d = m.d
+            JOIN close_px c ON c.d = m.d
+            ORDER BY m.d
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, lookback_days)
+                result = [dict(row) for row in rows]
+                self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
+                return result
+        except Exception as e:
+            logger.error(f"Error fetching charm backtest: {e}", exc_info=True)
+            raise
+
     async def get_gex_expirations(
         self,
         symbol: str = "SPY",

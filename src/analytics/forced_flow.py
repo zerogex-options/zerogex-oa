@@ -440,3 +440,87 @@ def combine_flow_sources(predicted: ForcedFlow, observed_signed_flow_usd: float 
     the observed term is 0; the seam exists so Phase 6 is purely additive.
     """
     return predicted.total_usd + observed_signed_flow_usd
+
+
+# --------------------------------------------------------------------------- #
+# Track record -- does the morning charm-into-close sign predict the afternoon?
+# --------------------------------------------------------------------------- #
+def _sign(x: float) -> int:
+    return 1 if x > 0 else (-1 if x < 0 else 0)
+
+
+def charm_backtest_summary(sessions: Sequence[dict], recent_limit: int = 90) -> dict:
+    """Honest hit-rate of the Charm-into-Close forecast.
+
+    The single testable claim behind the headline "time decay alone forces
+    dealers to buy/sell $X by 4pm": if the morning ``close_charm_flow`` sign
+    (dealers must BUY -> ``+``, must SELL -> ``-``) has any edge, it should lean
+    the same way as the actual noon->close return. This aggregates one row per
+    session -- each a dict with ``session_date``, ``charm_flow`` (the morning
+    read), ``noon_px`` and ``close_px`` -- into a hit rate.
+
+    It is deliberately unflattering by construction:
+
+    * ``baseline_rate`` is the naive "always guess the more common direction"
+      accuracy. A hit rate at or below it is worth nothing, and the frontend is
+      handed both numbers side by side so a coin flip cannot read as signal.
+    * ``signal_mean_return`` is the mean of ``predicted_dir * noon->close
+      return`` -- the average P&L of taking the charm sign at noon and closing
+      at the bell, before costs. It can be negative. That is the point.
+
+    Sessions with a flat charm read or an exactly-flat afternoon are counted in
+    ``total_sessions`` but excluded from ``evaluated_sessions`` (no directional
+    call to score). Pure function: no DB, no clock -- fully unit-testable.
+    """
+    decisive: List[dict] = []
+    total = 0
+    hits = 0
+    up_real = 0
+    signal_returns: List[float] = []
+
+    for row in sessions:
+        noon = float(row["noon_px"])
+        close = float(row["close_px"])
+        charm = row.get("charm_flow")
+        if noon <= 0 or charm is None:
+            continue
+        total += 1
+        ret = (close - noon) / noon
+        pred = _sign(float(charm))
+        real = _sign(ret)
+        if pred == 0 or real == 0:
+            continue
+        hit = pred == real
+        if hit:
+            hits += 1
+        if real > 0:
+            up_real += 1
+        signal_returns.append(pred * ret)
+        decisive.append(
+            {
+                "date": str(row["session_date"]),
+                "charm_flow": float(charm),
+                "return_pct": ret,
+                "predicted_dir": pred,
+                "realized_dir": real,
+                "hit": hit,
+            }
+        )
+
+    evaluated = len(decisive)
+    hit_rate = hits / evaluated if evaluated else None
+    up_rate = up_real / evaluated if evaluated else None
+    baseline = max(up_rate, 1.0 - up_rate) if up_rate is not None else None
+    signal_mean_return = sum(signal_returns) / len(signal_returns) if signal_returns else None
+    edge = hit_rate - baseline if (hit_rate is not None and baseline is not None) else None
+    return {
+        "total_sessions": total,
+        "evaluated_sessions": evaluated,
+        "hits": hits,
+        "hit_rate": hit_rate,
+        "baseline_rate": baseline,
+        "edge": edge,
+        "signal_mean_return": signal_mean_return,
+        # Most-recent first, capped -- the frontend shows a scannable ledger.
+        "records": list(reversed(decisive))[:recent_limit],
+    }
