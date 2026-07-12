@@ -164,6 +164,10 @@ def test_backtest_reports_hit_rate(monkeypatch):
     assert b["evaluated_sessions"] == 3
     assert b["hits"] == 2
     assert abs(b["hit_rate"] - (2 / 3)) < 1e-9
+    # Statistics are present and the tiny sample is not certified significant.
+    assert b["hit_rate_ci_low"] is not None and b["hit_rate_ci_high"] is not None
+    assert b["significant"] is False
+    assert "edge_p_value" in b and "signal_t_stat" in b
     assert len(b["records"]) == 3
     # Most-recent first.
     assert b["records"][0]["date"] == "2026-07-03"

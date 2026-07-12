@@ -39,6 +39,7 @@ have) slots in additively -- delta is linear, so the two sources sum. See
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -445,8 +446,79 @@ def combine_flow_sources(predicted: ForcedFlow, observed_signed_flow_usd: float 
 # --------------------------------------------------------------------------- #
 # Track record -- does the morning charm-into-close sign predict the afternoon?
 # --------------------------------------------------------------------------- #
+# 95% two-sided normal quantile -- the multiplier for the Wilson interval and
+# the threshold the significance verdict is read against.
+_Z_95 = 1.959963984540054
+# Below this many decisive sessions we refuse to call an edge "significant"
+# regardless of p-value -- a normal approximation on a handful of days lies.
+_MIN_SIGNIFICANT_N = 30
+
+
 def _sign(x: float) -> int:
     return 1 if x > 0 else (-1 if x < 0 else 0)
+
+
+def _t_stat(values: Sequence[float]) -> Optional[float]:
+    """One-sample t-statistic of ``values`` against a mean of zero.
+
+    Applied to the per-session signal returns: how many standard errors the
+    average P&L sits from break-even. |t| >~ 2 is the usual "distinguishable
+    from zero" bar. Returns None below two samples or on zero dispersion.
+    """
+    n = len(values)
+    if n < 2:
+        return None
+    mean = sum(values) / n
+    var = sum((x - mean) ** 2 for x in values) / (n - 1)
+    if var <= 0.0:
+        return None
+    return mean / math.sqrt(var / n)
+
+
+def _normal_cdf(x: float) -> float:
+    """Standard-normal CDF via the error function -- no scipy dependency."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _wilson_interval(hits: int, n: int, z: float = _Z_95) -> Tuple[float, float]:
+    """Wilson score interval for a binomial proportion.
+
+    Preferred over the normal (Wald) interval because it stays inside [0, 1]
+    and behaves at small n and extreme rates -- exactly the regime a young
+    track record lives in. Returns (low, high); (0.0, 1.0) when n == 0.
+    """
+    if n <= 0:
+        return (0.0, 1.0)
+    p = hits / n
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    center = (p + z2 / (2.0 * n)) / denom
+    half = (z * math.sqrt(p * (1.0 - p) / n + z2 / (4.0 * n * n))) / denom
+    return (max(0.0, center - half), min(1.0, center + half))
+
+
+def _accuracy_beats_baseline_p(hits: int, n: int, baseline: float) -> Optional[float]:
+    """One-sided p-value that accuracy exceeds the no-information rate.
+
+    The honest question for a directional classifier is not "beats 50%?" but
+    "beats always guessing the more common outcome?" -- the no-information rate.
+    This is the caret ``confusionMatrix`` "Accuracy > NIR" test, normal-approx:
+    p = P(observed accuracy this high | true accuracy == baseline). Small p ->
+    the edge over the naive rule is unlikely to be luck. Returns None if it
+    cannot be formed (n == 0 or a degenerate baseline of 0/1).
+    """
+    if n <= 0 or baseline is None:
+        return None
+    if baseline >= 1.0:
+        # Nothing can beat a perfect naive rule -- no edge is possible.
+        return 1.0
+    if baseline <= 0.0:
+        return None
+    se = math.sqrt(baseline * (1.0 - baseline) / n)
+    if se == 0.0:
+        return None
+    z = (hits / n - baseline) / se
+    return 1.0 - _normal_cdf(z)
 
 
 def charm_backtest_summary(sessions: Sequence[dict], recent_limit: int = 90) -> dict:
@@ -467,6 +539,12 @@ def charm_backtest_summary(sessions: Sequence[dict], recent_limit: int = 90) -> 
     * ``signal_mean_return`` is the mean of ``predicted_dir * noon->close
       return`` -- the average P&L of taking the charm sign at noon and closing
       at the bell, before costs. It can be negative. That is the point.
+    * ``hit_rate_ci_low`` / ``hit_rate_ci_high`` bound the hit rate with a 95%
+      Wilson interval; ``edge_p_value`` is the one-sided probability the
+      accuracy beats the naive baseline by luck; ``signal_t_stat`` tests the
+      per-session P&L against zero; ``significant`` is True only when the edge
+      clears 95% on a sample of at least ``_MIN_SIGNIFICANT_N`` sessions. A
+      thin or lucky record cannot pass for a real one.
 
     Sessions with a flat charm read or an exactly-flat afternoon are counted in
     ``total_sessions`` but excluded from ``evaluated_sessions`` (no directional
@@ -513,14 +591,31 @@ def charm_backtest_summary(sessions: Sequence[dict], recent_limit: int = 90) -> 
     baseline = max(up_rate, 1.0 - up_rate) if up_rate is not None else None
     signal_mean_return = sum(signal_returns) / len(signal_returns) if signal_returns else None
     edge = hit_rate - baseline if (hit_rate is not None and baseline is not None) else None
+
+    # Institutional read: a point estimate is not a result. Report a 95%
+    # confidence band on the hit rate, the p-value that it beats the naive
+    # baseline, and a t-stat on the per-session P&L -- so a thin or lucky
+    # sample cannot pass for a real edge.
+    ci_low, ci_high = _wilson_interval(hits, evaluated) if evaluated else (None, None)
+    edge_p_value = _accuracy_beats_baseline_p(hits, evaluated, baseline) if evaluated else None
+    signal_t_stat = _t_stat(signal_returns)
+    # Significant only if the edge clears 95% AND the sample is not a handful.
+    significant = bool(
+        edge_p_value is not None and edge_p_value < 0.05 and evaluated >= _MIN_SIGNIFICANT_N
+    )
     return {
         "total_sessions": total,
         "evaluated_sessions": evaluated,
         "hits": hits,
         "hit_rate": hit_rate,
+        "hit_rate_ci_low": ci_low,
+        "hit_rate_ci_high": ci_high,
         "baseline_rate": baseline,
         "edge": edge,
+        "edge_p_value": edge_p_value,
+        "significant": significant,
         "signal_mean_return": signal_mean_return,
+        "signal_t_stat": signal_t_stat,
         # Most-recent first, capped -- the frontend shows a scannable ledger.
         "records": list(reversed(decisive))[:recent_limit],
     }

@@ -31,6 +31,80 @@ def test_empty_input_is_all_none():
     assert s["edge"] is None
     assert s["signal_mean_return"] is None
     assert s["records"] == []
+    # Statistics degrade to None / not-significant on no data.
+    assert s["hit_rate_ci_low"] is None
+    assert s["hit_rate_ci_high"] is None
+    assert s["edge_p_value"] is None
+    assert s["signal_t_stat"] is None
+    assert s["significant"] is False
+
+
+def test_confidence_interval_brackets_hit_rate_and_narrows_with_n():
+    # A 60% predictor over many sessions must bracket 0.6 and get tighter as n
+    # grows. Build a repeating 3-hit / 2-miss block (60%).
+    def make(n_blocks):
+        rows = []
+        d = 1
+        for _ in range(n_blocks):
+            for up in (True, True, True, False, False):  # 3 hits, 2 misses
+                # charm says buy; realized up => hit, down => miss
+                close = 101.0 if up else 99.0
+                rows.append(_session(f"2000-01-{d:02d}", 1.0, 100.0, close))
+                d += 1
+        return rows
+
+    small = charm_backtest_summary(make(4))  # 20 sessions
+    large = charm_backtest_summary(make(40))  # 200 sessions
+    for s in (small, large):
+        assert abs(s["hit_rate"] - 0.6) < 1e-9
+        assert s["hit_rate_ci_low"] <= 0.6 <= s["hit_rate_ci_high"]
+    small_width = small["hit_rate_ci_high"] - small["hit_rate_ci_low"]
+    large_width = large["hit_rate_ci_high"] - large["hit_rate_ci_low"]
+    assert large_width < small_width  # more data -> tighter band
+
+
+def test_significance_requires_edge_and_a_real_sample():
+    # 12 sessions of a perfect predictor: real edge, but too few to certify.
+    tiny = charm_backtest_summary(
+        [_session(f"2000-02-{d:02d}", 1.0, 100.0, 101.0) for d in range(1, 13)]
+    )
+    assert tiny["significant"] is False  # n < _MIN_SIGNIFICANT_N
+
+    # A coin-flip-vs-baseline predictor over a big sample stays non-significant.
+    # Charm always says buy; afternoons split ~50/50 up and down independently
+    # of the (constant) call, so accuracy ~= baseline ~= 0.5, edge ~ 0.
+    rows = []
+    for d in range(1, 121):
+        close = 101.0 if d % 2 == 0 else 99.0
+        rows.append(_session(f"2001-{(d // 28) + 1:02d}-{(d % 28) + 1:02d}", 1.0, 100.0, close))
+    coin = charm_backtest_summary(rows)
+    assert coin["evaluated_sessions"] == 120
+    assert coin["significant"] is False
+    assert coin["edge_p_value"] is not None and coin["edge_p_value"] > 0.05
+
+
+def test_signal_t_stat_sign_tracks_pnl():
+    win = charm_backtest_summary(
+        [_session(f"2002-01-{d:02d}", 1.0, 100.0, 101.0) for d in range(1, 6)]
+    )
+    lose = charm_backtest_summary(
+        [_session(f"2002-02-{d:02d}", 1.0, 100.0, 99.0) for d in range(1, 6)]
+    )
+    # Constant win/loss magnitude -> zero dispersion -> t-stat undefined (None),
+    # but the mean return sign is unambiguous.
+    assert win["signal_mean_return"] > 0 and lose["signal_mean_return"] < 0
+    assert win["signal_t_stat"] is None and lose["signal_t_stat"] is None
+
+    # With dispersion, a consistently-positive P&L yields a positive t-stat.
+    mixed = charm_backtest_summary(
+        [
+            _session("2002-03-01", 1.0, 100.0, 101.0),
+            _session("2002-03-02", 1.0, 100.0, 100.5),
+            _session("2002-03-03", 1.0, 100.0, 102.0),
+            _session("2002-03-04", 1.0, 100.0, 100.2),
+        ]
+    )
+    assert mixed["signal_t_stat"] is not None and mixed["signal_t_stat"] > 0
 
 
 def test_perfect_predictor_scores_one():

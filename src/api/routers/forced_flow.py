@@ -253,9 +253,14 @@ class BacktestResponse(BaseModel):
     evaluated_sessions: int
     hits: int
     hit_rate: Optional[float] = None
+    hit_rate_ci_low: Optional[float] = None
+    hit_rate_ci_high: Optional[float] = None
     baseline_rate: Optional[float] = None
     edge: Optional[float] = None
+    edge_p_value: Optional[float] = None
+    significant: bool = False
     signal_mean_return: Optional[float] = None
+    signal_t_stat: Optional[float] = None
     records: List[BacktestRecord]
 
 
