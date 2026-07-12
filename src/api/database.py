@@ -1638,6 +1638,39 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching GEX summary: {e}", exc_info=True)
             raise
 
+    async def get_latest_forced_flow(self, symbol: str = "SPY") -> Optional[Dict[str, Any]]:
+        """Latest persisted forced-flow snapshot (levels + close-charm headline).
+
+        Reads the row the analytics cycle wrote to ``forced_flow_profile``.
+        ``close_charm_flow`` is the dollars dealers must trade by the bell if
+        spot holds -- the Charm-into-Close headline the Bulletin surfaces.
+        Returns None when no snapshot exists yet. Cached at the GEX-summary TTL.
+        """
+        symbol = symbol.upper()
+        cache_key = f"latest_forced_flow:{symbol}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+        query = """
+            SELECT underlying, timestamp, spot_price, session_days,
+                   charm_flip, vanna_flip, zero_flow_level, close_charm_flow
+            FROM forced_flow_profile
+            WHERE underlying = $1
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(query, symbol)
+                payload = dict(row) if row else None
+                self._cache_set(
+                    cache_key, payload, self._latest_gex_summary_cache_ttl_seconds
+                )
+                return payload
+        except Exception as e:
+            logger.error(f"Error fetching forced flow: {e}", exc_info=True)
+            raise
+
     async def get_gex_expirations(
         self,
         symbol: str = "SPY",

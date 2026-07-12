@@ -678,10 +678,14 @@ CREATE TABLE IF NOT EXISTS forced_flow_profile (
     charm_flip DOUBLE PRECISION,         -- spot where time-decay hedging flips sign
     vanna_flip DOUBLE PRECISION,         -- spot where vol-driven hedging flips sign
     zero_flow_level DOUBLE PRECISION,    -- spot where total forced flow is zero
+    close_charm_flow DOUBLE PRECISION,   -- $ dealers must trade by the close if spot holds (Bulletin headline)
     profile JSONB NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (underlying, timestamp)
 );
+
+-- Added after the table shipped; idempotent for existing deployments.
+ALTER TABLE forced_flow_profile ADD COLUMN IF NOT EXISTS close_charm_flow DOUBLE PRECISION;
 
 CREATE INDEX IF NOT EXISTS idx_forced_flow_profile_underlying_timestamp
     ON forced_flow_profile(underlying, timestamp DESC);

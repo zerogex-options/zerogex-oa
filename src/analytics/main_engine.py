@@ -63,7 +63,6 @@ from src.analytics.forced_flow import (
 )
 from src.flow_series_sql import SNAPSHOT_UPSERT_PSYCOPG2, SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2
 from src.market_calendar import (
-    ET,
     calculate_time_to_expiration,
     expiration_close_time_et,
     is_engine_run_window,
@@ -3117,6 +3116,9 @@ class AnalyticsEngine:
             "charm_flip": charm_flip(legs, spot, session_days, r, q, span, step),
             "vanna_flip": vanna_flip(legs, spot, r, q, 1.0, span, step),
             "zero_flow_level": zero_flow_level(legs, spot, session_days, r, q, 0.0, span, step),
+            # Charm-into-close headline: $ dealers must trade by the bell if spot
+            # holds (spot move = 0, only the session's time elapses).
+            "close_charm_flow": flow_total(legs, spot, 0.0, session_days, 0.0, r, q),
             "curve": curve,
         }
 
@@ -3142,8 +3144,8 @@ class AnalyticsEngine:
             """
             INSERT INTO forced_flow_profile
                 (underlying, timestamp, spot_price, span_pct, session_days,
-                 charm_flip, vanna_flip, zero_flow_level, profile)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                 charm_flip, vanna_flip, zero_flow_level, close_charm_flow, profile)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
             ON CONFLICT (underlying, timestamp) DO UPDATE SET
                 spot_price = EXCLUDED.spot_price,
                 span_pct = EXCLUDED.span_pct,
@@ -3151,6 +3153,7 @@ class AnalyticsEngine:
                 charm_flip = EXCLUDED.charm_flip,
                 vanna_flip = EXCLUDED.vanna_flip,
                 zero_flow_level = EXCLUDED.zero_flow_level,
+                close_charm_flow = EXCLUDED.close_charm_flow,
                 profile = EXCLUDED.profile
             """,
             (
@@ -3162,6 +3165,7 @@ class AnalyticsEngine:
                 _f(forced_flow["charm_flip"]),
                 _f(forced_flow["vanna_flip"]),
                 _f(forced_flow["zero_flow_level"]),
+                _f(forced_flow["close_charm_flow"]),
                 payload,
             ),
         )

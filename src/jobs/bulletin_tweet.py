@@ -118,8 +118,8 @@ DEFAULT_REPLY_PREFIX = "Free delayed SPY / SPX / QQQ gamma levels:"
 # levels equally (pure nearest-to-any-level).
 FLIP_PROXIMITY_WEIGHT = 0.6
 LONG_TWEET_MAX_LEN = 25_000  # X Premium long-form ceiling; classic 280 is the
-                             # floor the fallback body targets when the caller
-                             # doesn't have Premium enabled on the bot handle.
+# floor the fallback body targets when the caller
+# doesn't have Premium enabled on the bot handle.
 
 # Modes ---------------------------------------------------------------------
 MODES = ("premarket", "midday", "close")
@@ -239,6 +239,23 @@ def _fmt_net_gex(v: float | None) -> str:
     return f"{sign}${abs_v:.0f}"
 
 
+def _fmt_dollars(v: float) -> str:
+    """Compact UNSIGNED dollar magnitude: $1.20B / $340M / $12K / $500."""
+    a = abs(v)
+    if a >= 1e9:
+        return f"${a / 1e9:.2f}B"
+    if a >= 1e6:
+        return f"${a / 1e6:.0f}M"
+    if a >= 1e3:
+        return f"${a / 1e3:.0f}K"
+    return f"${a:.0f}"
+
+
+# Only surface the Charm-into-Close headline when it clears this floor, so a
+# quiet session doesn't render a trivial "$0" forced-flow claim.
+_CHARM_HEADLINE_MIN_USD = 1_000_000.0
+
+
 # ---------------------------------------------------------------------------
 # Bulletin data model — one per symbol
 # ---------------------------------------------------------------------------
@@ -261,6 +278,9 @@ class SymbolBulletin:
     put_wall: float | None = None
     max_pain: float | None = None
     net_gex: float | None = None
+    # Charm-into-Close headline (Phase 4): dollars of stock dealers must trade by
+    # the 4pm bell from time decay ALONE if spot holds. Positive = forced buying.
+    charm_close_flow: float | None = None
     # True when ``spot`` is a futures-implied projection (a cash index
     # outside the cash session) rather than a live cash print; ``future_symbol``
     # is the future it was projected from (e.g. "@ES") for the indicator.
@@ -391,6 +411,14 @@ def _symbol_block(b: SymbolBulletin, include_prefix: bool = True) -> str | None:
         lines.append(f"Max Pain: {_fmt_price(b.max_pain)}")
     if b.net_gex is not None:
         lines.append(f"Net GEX: {_fmt_net_gex(b.net_gex)}")
+    # Charm-into-Close (Phase 4): a forecast with a deadline. Time decay alone,
+    # no move required, forces this much dealer stock trading by the bell.
+    if b.charm_close_flow is not None and abs(b.charm_close_flow) >= _CHARM_HEADLINE_MIN_USD:
+        side = "buy" if b.charm_close_flow > 0 else "sell"
+        lines.append(
+            f"Charm into close: time decay alone forces dealers to {side} "
+            f"{_fmt_dollars(b.charm_close_flow)} by 4pm ET if {b.symbol} holds here"
+        )
     return "\n".join(lines)
 
 
@@ -538,7 +566,10 @@ def build_tweet_body(
     section = _try_llm_section(mode, day, present, featured_symbol)
     if section is not None:
         text = _compose_with_llm_section(
-            section, featured_symbol, copy.label, map_block,
+            section,
+            featured_symbol,
+            copy.label,
+            map_block,
         )
         fallback = _build_fallback_tweet(featured, copy.label)
         return TweetBody(
@@ -616,7 +647,10 @@ def _try_llm_section(
     ]
     try:
         return bulletin_llm.generate_narrative(
-            mode=mode, day=day, symbols=inputs, featured_symbol=featured_symbol,
+            mode=mode,
+            day=day,
+            symbols=inputs,
+            featured_symbol=featured_symbol,
         )
     except Exception as exc:  # noqa: BLE001 — never let the LLM path throw
         logger.warning("bulletin_tweet: LLM narrative generation failed (%s)", exc)
@@ -650,6 +684,7 @@ def _compose_with_llm_section(
     Any section coming back empty is elided so the composed body never
     carries a lonely trailing blank paragraph.  The link rides in the
     threaded reply, not here."""
+
     def _sep(existing: list[str], value: str) -> None:
         stripped = value.strip()
         if not stripped:
@@ -686,9 +721,7 @@ def _build_fallback_tweet(featured: SymbolBulletin, label: str) -> str:
     if featured.gamma_flip is not None:
         parts.append(f"Flip {_fmt_price(featured.gamma_flip)}")
     if featured.call_wall is not None and featured.put_wall is not None:
-        parts.append(
-            f"CW {_fmt_price(featured.call_wall)} / PW {_fmt_price(featured.put_wall)}"
-        )
+        parts.append(f"CW {_fmt_price(featured.call_wall)} / PW {_fmt_price(featured.put_wall)}")
     if featured.net_gex is not None:
         parts.append(f"Net GEX {_fmt_net_gex(featured.net_gex)}")
     text = " · ".join(parts)
@@ -836,14 +869,19 @@ def _run_frontend_helper(
         return None
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "bulletin_tweet: %s helper unexpected error (%s) — %s", label, cmd, exc,
+            "bulletin_tweet: %s helper unexpected error (%s) — %s",
+            label,
+            cmd,
+            exc,
         )
         return None
 
     if proc.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
         logger.warning(
             "bulletin_tweet: %s helper exited %d, stderr: %s",
-            label, proc.returncode, proc.stderr[:500],
+            label,
+            proc.returncode,
+            proc.stderr[:500],
         )
         return None
     return out_path
@@ -888,17 +926,26 @@ def render_bulletin_png(
 
     token = os.environ.get("BULLETIN_SNAPSHOT_TOKEN", "").strip()
     cmd_args = [
-        "--symbol", symbol.upper(),
-        "--mode", mode,
-        "--date", day.isoformat(),
-        "--site-url", site_url,
-        "--out", str(out_path),
+        "--symbol",
+        symbol.upper(),
+        "--mode",
+        mode,
+        "--date",
+        day.isoformat(),
+        "--site-url",
+        site_url,
+        "--out",
+        str(out_path),
     ]
     if token:
         cmd_args.extend(["--token", token])
 
     return _run_frontend_helper(
-        helper, cmd_args, out_path, timeout_seconds, label="bulletin-png",
+        helper,
+        cmd_args,
+        out_path,
+        timeout_seconds,
+        label="bulletin-png",
     )
 
 
@@ -932,13 +979,21 @@ def render_replay_clip(
         return None
 
     cmd_args = [
-        "--symbol", symbol.upper(),
-        "--date", day.isoformat(),
-        "--site-url", site_url,
-        "--out", str(out_path),
+        "--symbol",
+        symbol.upper(),
+        "--date",
+        day.isoformat(),
+        "--site-url",
+        site_url,
+        "--out",
+        str(out_path),
     ]
     return _run_frontend_helper(
-        helper, cmd_args, out_path, timeout_seconds, label="replay-clip",
+        helper,
+        cmd_args,
+        out_path,
+        timeout_seconds,
+        label="replay-clip",
     )
 
 
@@ -989,7 +1044,8 @@ def post_tweet_via_x_api(
 
 
 async def _fetch_bulletins(
-    db: DatabaseManager, symbols: list[str],
+    db: DatabaseManager,
+    symbols: list[str],
 ) -> list[SymbolBulletin]:
     """Fetch the latest GEX summary for every requested symbol.
 
@@ -1004,10 +1060,24 @@ async def _fetch_bulletins(
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "bulletin_tweet: get_latest_gex_summary(%s) failed (%s) — eliding symbol block",
-                sym, exc,
+                sym,
+                exc,
             )
             row = None
+        # Charm-into-Close headline is sourced from the persisted forced-flow
+        # snapshot; a miss just elides that one line (best-effort, never fatal).
+        try:
+            ff_row = await db.get_latest_forced_flow(sym)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "bulletin_tweet: get_latest_forced_flow(%s) failed (%s) — eliding charm line",
+                sym,
+                exc,
+            )
+            ff_row = None
         bulletin = _shape_bulletin(row, sym)
+        if ff_row is not None:
+            bulletin.charm_close_flow = _to_float(ff_row.get("close_charm_flow"))
         # SPX (cash index) has no live overnight print — outside the cash
         # session its spot_price is a frozen prior 16:00 close.  Project the
         # implied level from @ES so a pre-market bulletin shows where the
@@ -1029,8 +1099,11 @@ async def _fetch_bulletins(
             logger.info(
                 "bulletin_tweet: %s spot projected from %s — implied $%.2f "
                 "(cash close $%.2f, overnight %+.2f pts)",
-                sym, proj.future_symbol, proj.implied_price,
-                proj.cash_ref_close, proj.gap_points,
+                sym,
+                proj.future_symbol,
+                proj.implied_price,
+                proj.cash_ref_close,
+                proj.gap_points,
             )
         out.append(bulletin)
     return out
@@ -1099,7 +1172,8 @@ def _write_manifest_and_text(
         ],
     }
     (artifact_dir / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, default=str) + "\n", encoding="utf-8",
+        json.dumps(manifest, indent=2, default=str) + "\n",
+        encoding="utf-8",
     )
 
 
@@ -1119,7 +1193,8 @@ def _upload_media_files(
         creds = x_media_client.load_credentials_from_env()
     except x_media_client.MissingCredentialsError as exc:
         logger.info(
-            "bulletin_tweet: media upload skipped — %s. Text-only post.", exc,
+            "bulletin_tweet: media upload skipped — %s. Text-only post.",
+            exc,
         )
         return []
 
@@ -1131,7 +1206,8 @@ def _upload_media_files(
                 media_ids.append(mid)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "bulletin_tweet: PNG upload failed (%s) — dropping attachment", exc,
+                "bulletin_tweet: PNG upload failed (%s) — dropping attachment",
+                exc,
             )
 
     if media.clip_path is not None:
@@ -1143,7 +1219,8 @@ def _upload_media_files(
                 media_ids.append(mid)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "bulletin_tweet: clip upload failed (%s) — dropping attachment", exc,
+                "bulletin_tweet: clip upload failed (%s) — dropping attachment",
+                exc,
             )
     return media_ids
 
@@ -1153,7 +1230,8 @@ async def _run(args: argparse.Namespace) -> int:
     if not _is_trading_day(day) and not args.allow_non_trading_day:
         logger.info(
             "bulletin_tweet[%s]: skipping %s — not a trading day (weekend or NYSE holiday).",
-            args.mode, day.isoformat(),
+            args.mode,
+            day.isoformat(),
         )
         return 0
 
@@ -1167,7 +1245,9 @@ async def _run(args: argparse.Namespace) -> int:
         await db.connect()
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "bulletin_tweet[%s]: DB connect failed (%s) — exiting 0", args.mode, exc,
+            "bulletin_tweet[%s]: DB connect failed (%s) — exiting 0",
+            args.mode,
+            exc,
         )
         return 0
 
@@ -1204,17 +1284,30 @@ async def _run(args: argparse.Namespace) -> int:
     if not args.no_media:
         png_out = artifact_dir / f"bulletin-{tweet.lead_symbol.lower()}.png"
         media.png_path = render_bulletin_png(
-            tweet.lead_symbol, day, args.mode, args.site_url, png_out,
+            tweet.lead_symbol,
+            day,
+            args.mode,
+            args.site_url,
+            png_out,
         )
         # Clip lands on the same lead symbol so the visual pairing
         # (card + video) is coherent.
         clip_out = artifact_dir / f"replay-{tweet.lead_symbol.lower()}.mp4"
         media.clip_path = render_replay_clip(
-            tweet.lead_symbol, day, args.site_url, clip_out,
+            tweet.lead_symbol,
+            day,
+            args.site_url,
+            clip_out,
         )
 
     _write_manifest_and_text(
-        artifact_dir, tweet, media, args.mode, day, bulletins, state="dry_run",
+        artifact_dir,
+        tweet,
+        media,
+        args.mode,
+        day,
+        bulletins,
+        state="dry_run",
     )
 
     bearer = os.environ.get("X_BOT_BEARER_TOKEN", "").strip()
@@ -1229,7 +1322,13 @@ async def _run(args: argparse.Namespace) -> int:
 
     if effective_stage:
         _write_manifest_and_text(
-            artifact_dir, tweet, media, args.mode, day, bulletins, state="pending",
+            artifact_dir,
+            tweet,
+            media,
+            args.mode,
+            day,
+            bulletins,
+            state="pending",
         )
         _log_approval_required(args.mode, artifact_dir, tweet)
         _call_notify_hook(args.mode, artifact_dir, tweet, media)
@@ -1239,7 +1338,10 @@ async def _run(args: argparse.Namespace) -> int:
         reason = "no --post flag" if not effective_post else "X_BOT_BEARER_TOKEN unset"
         logger.info(
             "bulletin_tweet[%s]: DRY RUN (%s) — artifacts at %s\n----\n%s\n----",
-            args.mode, reason, artifact_dir, tweet.text,
+            args.mode,
+            reason,
+            artifact_dir,
+            tweet.text,
         )
         return 0
 
@@ -1252,8 +1354,14 @@ async def _run(args: argparse.Namespace) -> int:
     )
     if post_result:
         _write_manifest_and_text(
-            artifact_dir, tweet, media, args.mode, day, bulletins,
-            state="posted", posted_id=post_result.get("id"),
+            artifact_dir,
+            tweet,
+            media,
+            args.mode,
+            day,
+            bulletins,
+            state="posted",
+            posted_id=post_result.get("id"),
             reply_id=post_result.get("reply_id"),
         )
     return 0
@@ -1283,7 +1391,9 @@ def post_bulletin(
     if len(text_to_post) > LONG_TWEET_MAX_LEN:
         logger.warning(
             "bulletin_tweet[%s]: text length %d > %d — falling back to short body",
-            mode_label, len(text_to_post), LONG_TWEET_MAX_LEN,
+            mode_label,
+            len(text_to_post),
+            LONG_TWEET_MAX_LEN,
         )
         text_to_post = tweet.fallback
 
@@ -1300,7 +1410,9 @@ def post_bulletin(
                 resp = post_tweet_via_x_api(tweet.fallback, bearer, media_ids=media_ids or None)
             except Exception as exc2:  # noqa: BLE001
                 logger.warning(
-                    "bulletin_tweet[%s]: fallback retry also failed (%s)", mode_label, exc2,
+                    "bulletin_tweet[%s]: fallback retry also failed (%s)",
+                    mode_label,
+                    exc2,
                 )
                 return None
         else:
@@ -1315,7 +1427,9 @@ def post_bulletin(
     tweet_id = (resp.get("data") or {}).get("id")
     logger.info(
         "bulletin_tweet[%s]: posted tweet id=%s (media=%d)",
-        mode_label, tweet_id, len(media_ids),
+        mode_label,
+        tweet_id,
+        len(media_ids),
     )
 
     result: dict[str, Any] = {"id": tweet_id, "response": resp}
@@ -1340,18 +1454,23 @@ def _post_link_reply(
         return None
     try:
         reply_resp = post_tweet_via_x_api(
-            tweet.reply_text, bearer, reply_to=parent_id,
+            tweet.reply_text,
+            bearer,
+            reply_to=parent_id,
         )
     except Exception as exc:  # noqa: BLE001 — reply is non-load-bearing
         logger.warning(
             "bulletin_tweet[%s]: link reply failed (%s) — main tweet still posted",
-            mode_label, exc,
+            mode_label,
+            exc,
         )
         return None
     reply_id = (reply_resp.get("data") or {}).get("id")
     logger.info(
         "bulletin_tweet[%s]: posted link reply id=%s under %s",
-        mode_label, reply_id, parent_id,
+        mode_label,
+        reply_id,
+        parent_id,
     )
     return reply_id
 
@@ -1369,7 +1488,13 @@ def _log_approval_required(mode: str, artifact_dir: Path, tweet: TweetBody) -> N
         "Autopilot:    set BULLETIN_TWEET_AUTOPILOT=1 in .env\n"
         "================================================================\n"
         "----\n%s\n----",
-        mode, artifact_dir, len(tweet.text), len(tweet.fallback), mode, mode, tweet.text,
+        mode,
+        artifact_dir,
+        len(tweet.text),
+        len(tweet.fallback),
+        mode,
+        mode,
+        tweet.text,
     )
 
 
@@ -1432,7 +1557,9 @@ def _call_notify_hook(
     if proc.returncode != 0:
         logger.warning(
             "bulletin_tweet: notify hook exited %d (stdout=%r stderr=%r)",
-            proc.returncode, proc.stdout[:500], proc.stderr[:500],
+            proc.returncode,
+            proc.stdout[:500],
+            proc.stderr[:500],
         )
     else:
         logger.info(
