@@ -60,6 +60,7 @@ from .routers.backtest import router as backtest_router
 from .routers.scorecard import router as scorecard_router
 from .routers.forecast import router as forecast_router
 from .routers.replay import router as replay_router
+from .routers.forced_flow import router as forced_flow_router
 
 # Logging is configured centrally in src.utils.logging; importing
 # get_logger triggers _configure_logging which honors LOG_LEVEL and
@@ -427,6 +428,10 @@ app.include_router(forecast_router, dependencies=[_scope_signals])
 # gex_by_strike data. Read-only; no new ingestion. Scope matches the rest
 # of the GEX surface (basic + pro tiers).
 app.include_router(replay_router, dependencies=[_scope_gex])
+# Forced Flow (Phase 3) — dealers' mechanically-forced hedging under scenarios of
+# spot / time / vol, derived from the same OI the GEX surface uses. Options-flow
+# analytics, so gated on the FLOW scope (same as /api/flow/series).
+app.include_router(forced_flow_router, dependencies=[_scope_flow])
 
 # TradeWorkz™ multi-bot signaled-trading engine — admin-tier surface. The
 # frontend /trading-signals page is admin-gated in frontend/core/auth.ts so

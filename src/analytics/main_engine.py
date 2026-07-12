@@ -53,6 +53,7 @@ from src.symbols import parse_underlyings, get_canonical_symbol
 from src.analytics.walls import compute_call_put_walls
 from src.greeks_fd import fd_charm, fd_vanna
 from src.analytics.forced_flow import (
+    ContractLeg,
     build_legs,
     charm_flip,
     flow_total,
@@ -3064,6 +3065,26 @@ class AnalyticsEngine:
         close_dt = ts.replace(hour=16, minute=0, second=0, microsecond=0)
         return max(0.0, (close_dt - ts).total_seconds() / 86400.0)
 
+    def _build_forced_flow_legs(
+        self, options: List[Dict[str, Any]], timestamp: datetime
+    ) -> List[ContractLeg]:
+        """Normalize snapshot options into forced-flow ContractLegs.
+
+        Uses the same settlement-anchored TTE and null-IV/OI skip as the rest of
+        the engine, so the on-demand API path and the persisted cycle build
+        identical legs.
+        """
+
+        def _tte(opt: Dict[str, Any]) -> float:
+            close_t = settlement_close_time_for_contract(
+                self.db_symbol, opt.get("option_symbol"), opt["expiration"]
+            )
+            return calculate_time_to_expiration(
+                timestamp, opt["expiration"], market_close_time=close_t
+            )
+
+        return build_legs(options, _tte)
+
     def _calculate_forced_flow(
         self, options: List[Dict[str, Any]], summary: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
@@ -3078,16 +3099,7 @@ class AnalyticsEngine:
         if not spot or spot <= 0:
             return None
         timestamp = summary["timestamp"]
-
-        def _tte(opt: Dict[str, Any]) -> float:
-            close_t = settlement_close_time_for_contract(
-                self.db_symbol, opt.get("option_symbol"), opt["expiration"]
-            )
-            return calculate_time_to_expiration(
-                timestamp, opt["expiration"], market_close_time=close_t
-            )
-
-        legs = build_legs(options, _tte)
+        legs = self._build_forced_flow_legs(options, timestamp)
         if not legs:
             return None
 

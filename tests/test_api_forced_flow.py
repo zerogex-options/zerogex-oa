@@ -1,0 +1,146 @@
+"""API tests for the Phase 3 /forced-flow/* router.
+
+Patches the router's ``_load`` (chain -> legs) so no live Postgres/snapshot is
+needed, and mocks ``get_latest_gex_summary`` for the /levels gamma flip. Verifies
+each endpoint returns 200 with the snapshot timestamp + spot and the expected
+shape, and 404 on a degraded snapshot.
+"""
+
+from __future__ import annotations
+
+import sys
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock
+
+from fastapi.testclient import TestClient
+
+from src.analytics.forced_flow import ContractLeg
+
+
+def _build_app(monkeypatch):
+    monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    for mod in list(sys.modules):
+        if mod.startswith("src.api"):
+            sys.modules.pop(mod, None)
+    from src.api import database as dbmod
+
+    dbmod.DatabaseManager.connect = AsyncMock(return_value=None)
+    dbmod.DatabaseManager.disconnect = AsyncMock(return_value=None)
+    dbmod.DatabaseManager.check_health = AsyncMock(return_value=True)
+    dbmod.DatabaseManager.get_latest_gex_summary = AsyncMock(
+        return_value={"gamma_flip_point": 498.0}
+    )
+    from src.api.main import app
+
+    return app, dbmod
+
+
+def _ctx(symbol="SPY", expiry=None):
+    legs = [
+        ContractLeg(495, "C", 800, 0.18, 30 / 365),
+        ContractLeg(500, "C", 1500, 0.18, 30 / 365),
+        ContractLeg(505, "C", 1200, 0.18, 30 / 365),
+        ContractLeg(490, "P", 700, 0.18, 30 / 365),
+        ContractLeg(500, "P", 1400, 0.18, 30 / 365),
+        ContractLeg(505, "P", 500, 0.18, 30 / 365),
+    ]
+    return {
+        "legs": legs,
+        "spot": 500.0,
+        "timestamp": datetime(2026, 7, 13, 18, 0, tzinfo=timezone.utc),
+        "r": 0.05,
+        "q": 0.0,
+        "session_days": 0.1,
+    }
+
+
+def _app_with_loader(monkeypatch, loader=_ctx):
+    app, _ = _build_app(monkeypatch)
+    from src.api.routers import forced_flow as ff_mod
+
+    monkeypatch.setattr(ff_mod, "_load", loader)
+    return app
+
+
+def test_scenario_returns_flow_and_attribution(monkeypatch):
+    app = _app_with_loader(monkeypatch)
+    with TestClient(app) as c:
+        r = c.get("/forced-flow/scenario?symbol=SPY&spot_move_pct=0.01&days=0&vol_change_pts=0")
+    assert r.status_code == 200
+    b = r.json()
+    assert b["symbol"] == "SPY" and b["spot"] == 500.0 and b["timestamp"]
+    assert set(b) >= {
+        "total_usd",
+        "gamma_component",
+        "charm_component",
+        "vanna_component",
+        "residual",
+    }
+    # Pure spot move -> only the gamma component is non-zero.
+    assert b["charm_component"] == 0.0 and b["vanna_component"] == 0.0
+    assert b["gamma_component"] != 0.0
+
+
+def test_curve_has_attribution_bands(monkeypatch):
+    app = _app_with_loader(monkeypatch)
+    with TestClient(app) as c:
+        r = c.get("/forced-flow/curve?symbol=SPY&spot_range_pct=0.03")
+    assert r.status_code == 200
+    b = r.json()
+    assert b["spot"] == 500.0 and b["timestamp"]
+    assert len(b["curve"]) > 5
+    assert set(b["curve"][0]) == {"price", "total", "gamma", "charm", "vanna"}
+    assert "zero_flow_level" in b
+
+
+def test_charm_decay_starts_at_zero(monkeypatch):
+    app = _app_with_loader(monkeypatch)
+    with TestClient(app) as c:
+        r = c.get("/forced-flow/charm-decay?symbol=SPY&steps=10")
+    assert r.status_code == 200
+    b = r.json()
+    assert len(b["curve"]) == 11
+    assert b["curve"][0]["days_elapsed"] == 0.0 and b["curve"][0]["flow"] == 0.0
+    assert "close_flow_usd" in b
+
+
+def test_vanna_ladder_zero_at_no_change(monkeypatch):
+    app = _app_with_loader(monkeypatch)
+    with TestClient(app) as c:
+        r = c.get("/forced-flow/vanna-ladder?symbol=SPY&lo_pts=-2&hi_pts=2&step_pts=1")
+    assert r.status_code == 200
+    b = r.json()
+    xs = [p["vol_change_pts"] for p in b["curve"]]
+    assert min(xs) == -2.0 and max(xs) == 2.0
+    zero = [p["flow"] for p in b["curve"] if p["vol_change_pts"] == 0.0][0]
+    assert zero == 0.0
+
+
+def test_surface_grid_dimensions(monkeypatch):
+    app = _app_with_loader(monkeypatch)
+    with TestClient(app) as c:
+        r = c.get("/forced-flow/surface?symbol=SPY&spot_range_pct=0.02&time_steps=4")
+    assert r.status_code == 200
+    b = r.json()
+    assert len(b["times_days"]) == 5
+    assert len(b["z"]) == len(b["spots"])
+    assert all(len(row) == len(b["times_days"]) for row in b["z"])
+
+
+def test_levels_uses_existing_gamma_flip(monkeypatch):
+    app = _app_with_loader(monkeypatch)
+    with TestClient(app) as c:
+        r = c.get("/forced-flow/levels?symbol=SPY")
+    assert r.status_code == 200
+    b = r.json()
+    # Gamma flip comes from the persisted gex_summary (existing; not recomputed).
+    assert b["gamma_flip"] == 498.0
+    assert {"charm_flip", "vanna_flip", "zero_flow_level"} <= set(b)
+
+
+def test_degraded_snapshot_returns_404(monkeypatch):
+    app = _app_with_loader(monkeypatch, loader=lambda symbol, expiry=None: None)
+    with TestClient(app) as c:
+        r = c.get("/forced-flow/scenario?symbol=SPY")
+    assert r.status_code == 404
