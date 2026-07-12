@@ -138,6 +138,8 @@ def _agg(option_symbol: str, bucket: datetime, ask_volume: int, volume: int) -> 
         "gamma": 0.01,
         "theta": -0.1,
         "vega": 0.2,
+        "charm": 0.03,
+        "vanna": -0.02,
     }
 
 
@@ -319,6 +321,8 @@ def test_rollover_residual_survives_db_failure_end_to_end(monkeypatch):
             "gamma": 0.01,
             "theta": -0.1,
             "vega": 0.2,
+            "charm": 0.03,
+            "vanna": -0.02,
             "implied_volatility": 0.3,
         }
 

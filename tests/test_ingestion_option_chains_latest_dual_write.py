@@ -55,6 +55,8 @@ def _build_row(
         "gamma": 0.02,
         "theta": -0.05,
         "vega": 0.10,
+        "charm": 0.03,
+        "vanna": -0.02,
     }
 
 
@@ -341,9 +343,31 @@ def test_cache_upsert_coalesces_greeks_and_iv_to_preserve_last_good_value():
     preservation itself.
     """
     sql = IngestionEngine._OPTION_LATEST_UPSERT_SQL
-    for col in ("implied_volatility", "delta", "gamma", "theta", "vega"):
+    for col in ("implied_volatility", "delta", "gamma", "theta", "vega", "charm", "vanna"):
         assert f"COALESCE(EXCLUDED.{col}, option_chains_latest.{col})" in sql, (
             f"cache UPSERT must COALESCE {col!r} against the existing row "
             "so a NULL-Greek write does not clobber a previously-good value "
             "(off-session freeze regression)"
         )
+
+
+def test_charm_vanna_reach_both_upserts():
+    """Per-contract charm/vanna (Phase 2 persistence) are written to both the
+    history and the cache UPSERT, at the tail of each value tuple."""
+    engine = _make_engine_for_write_test()
+    cm, _, _ = _mock_db_connection()
+    row = _build_row()
+    row["charm"] = 0.0123
+    row["vanna"] = -0.0456
+
+    with (
+        patch.object(ingestion_module, "db_connection", return_value=cm),
+        patch.object(ingestion_module, "execute_values") as execute_values_mock,
+    ):
+        engine._write_option_rows([row])
+
+    calls = _execute_values_calls(execute_values_mock)
+    assert len(calls) == 2  # history + cache
+    for _, values in calls:
+        assert values[0][-2] == 0.0123, "charm must be the penultimate written field"
+        assert values[0][-1] == -0.0456, "vanna must be the last written field"

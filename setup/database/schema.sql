@@ -130,6 +130,8 @@ CREATE TABLE IF NOT EXISTS option_chains (
     gamma NUMERIC(10, 8),
     theta NUMERIC(10, 6),
     vega NUMERIC(10, 6),
+    charm NUMERIC(16, 8),
+    vanna NUMERIC(16, 8),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (option_symbol, timestamp)
 );
@@ -149,6 +151,10 @@ ALTER TABLE option_chains ADD COLUMN IF NOT EXISTS delta NUMERIC(8, 6);
 ALTER TABLE option_chains ADD COLUMN IF NOT EXISTS gamma NUMERIC(10, 8);
 ALTER TABLE option_chains ADD COLUMN IF NOT EXISTS theta NUMERIC(10, 6);
 ALTER TABLE option_chains ADD COLUMN IF NOT EXISTS vega NUMERIC(10, 6);
+-- Second-order dealer-hedging greeks (Phase 2/deferral). Wide NUMERIC so a
+-- near-expiry charm spike cannot overflow the ingestion write.
+ALTER TABLE option_chains ADD COLUMN IF NOT EXISTS charm NUMERIC(16, 8);
+ALTER TABLE option_chains ADD COLUMN IF NOT EXISTS vanna NUMERIC(16, 8);
 
 -- Column semantics (COMMENT ON is idempotent; safe to re-run).
 -- ``volume`` and the three Lee-Ready classified flow columns share the
@@ -290,8 +296,14 @@ CREATE TABLE IF NOT EXISTS option_chains_latest (
     gamma NUMERIC(10, 8),
     theta NUMERIC(10, 6),
     vega NUMERIC(10, 6),
+    charm NUMERIC(16, 8),
+    vanna NUMERIC(16, 8),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Second-order dealer-hedging greeks (Phase 2/deferral) for existing deployments.
+ALTER TABLE option_chains_latest ADD COLUMN IF NOT EXISTS charm NUMERIC(16, 8);
+ALTER TABLE option_chains_latest ADD COLUMN IF NOT EXISTS vanna NUMERIC(16, 8);
 
 -- Snapshot read path: WHERE underlying = $1 AND timestamp >= $2 AND gamma IS NOT NULL.
 -- Partial index excludes contracts whose Greeks haven't been populated
@@ -785,6 +797,8 @@ SELECT
     gamma,
     theta,
     vega,
+    charm,
+    vanna,
     updated_at
 FROM option_chains;
 
@@ -2194,9 +2208,15 @@ CREATE TABLE IF NOT EXISTS option_chains_archive (
     gamma                NUMERIC(10, 8),
     theta                NUMERIC(10, 6),
     vega                 NUMERIC(10, 6),
+    charm                NUMERIC(16, 8),
+    vanna                NUMERIC(16, 8),
     archived_at          TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
     PRIMARY KEY (option_symbol, timestamp)
 );
+
+-- Second-order dealer-hedging greeks (Phase 2/deferral) for existing archives.
+ALTER TABLE option_chains_archive ADD COLUMN IF NOT EXISTS charm NUMERIC(16, 8);
+ALTER TABLE option_chains_archive ADD COLUMN IF NOT EXISTS vanna NUMERIC(16, 8);
 
 CREATE INDEX IF NOT EXISTS idx_option_chains_archive_underlying_ts
     ON option_chains_archive(underlying, timestamp);

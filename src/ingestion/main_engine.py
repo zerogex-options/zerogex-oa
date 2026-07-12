@@ -1439,6 +1439,8 @@ class IngestionEngine:
                 "gamma": _to_db_float(last.get("gamma")),
                 "theta": _to_db_float(last.get("theta")),
                 "vega": _to_db_float(last.get("vega")),
+                "charm": _to_db_float(last.get("charm")),
+                "vanna": _to_db_float(last.get("vanna")),
             }
 
             self._log_parity_signature("option_chains", agg)
@@ -1492,7 +1494,7 @@ class IngestionEngine:
         (option_symbol, timestamp, underlying, strike, expiration, option_type,
          last, bid, ask, mid, volume, open_interest, implied_volatility,
          ask_volume, mid_volume, bid_volume,
-         delta, gamma, theta, vega)
+         delta, gamma, theta, vega, charm, vanna)
         VALUES %s
         ON CONFLICT (option_symbol) DO UPDATE SET
             timestamp = EXCLUDED.timestamp,
@@ -1514,6 +1516,8 @@ class IngestionEngine:
             gamma = COALESCE(EXCLUDED.gamma, option_chains_latest.gamma),
             theta = COALESCE(EXCLUDED.theta, option_chains_latest.theta),
             vega = COALESCE(EXCLUDED.vega, option_chains_latest.vega),
+            charm = COALESCE(EXCLUDED.charm, option_chains_latest.charm),
+            vanna = COALESCE(EXCLUDED.vanna, option_chains_latest.vanna),
             updated_at = NOW()
         WHERE EXCLUDED.timestamp >= option_chains_latest.timestamp
     """
@@ -1532,7 +1536,7 @@ class IngestionEngine:
         (option_symbol, timestamp, underlying, strike, expiration, option_type,
          last, bid, ask, mid, volume, open_interest, implied_volatility,
          ask_volume, mid_volume, bid_volume,
-         delta, gamma, theta, vega)
+         delta, gamma, theta, vega, charm, vanna)
         VALUES %s
         ON CONFLICT (option_symbol, timestamp) DO UPDATE SET
             last = COALESCE(EXCLUDED.last, option_chains.last),
@@ -1549,6 +1553,8 @@ class IngestionEngine:
             gamma = EXCLUDED.gamma,
             theta = EXCLUDED.theta,
             vega = EXCLUDED.vega,
+            charm = EXCLUDED.charm,
+            vanna = EXCLUDED.vanna,
             updated_at = NOW()
         WHERE
             COALESCE(EXCLUDED.last, option_chains.last) IS DISTINCT FROM option_chains.last
@@ -1780,6 +1786,8 @@ class IngestionEngine:
                         agg["gamma"],
                         agg["theta"],
                         agg["vega"],
+                        agg["charm"],
+                        agg["vanna"],
                     )
                     for agg in rows
                 ]

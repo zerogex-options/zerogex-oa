@@ -38,10 +38,10 @@ logger = logging.getLogger(__name__)
 _ARCHIVE_INSERT = """
     INSERT INTO option_chains_archive
         (option_symbol, timestamp, underlying, strike, expiration, option_type,
-         last, bid, ask, mid, implied_volatility, delta, gamma, theta, vega)
+         last, bid, ask, mid, implied_volatility, delta, gamma, theta, vega, charm, vanna)
     SELECT
         option_symbol, timestamp, underlying, strike, expiration, option_type,
-        last, bid, ask, mid, implied_volatility, delta, gamma, theta, vega
+        last, bid, ask, mid, implied_volatility, delta, gamma, theta, vega, charm, vanna
     FROM option_chains
     WHERE timestamp >= %s AND timestamp < %s
       {underlying_clause}
@@ -105,7 +105,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--start", help="range start ISO date (with --end)")
     parser.add_argument("--end", help="range end ISO date (with --start)")
     parser.add_argument(
-        "--underlyings", nargs="*", default=None,
+        "--underlyings",
+        nargs="*",
+        default=None,
         help="underlyings to archive (default: SIGNALS_UNDERLYINGS)",
     )
     args = parser.parse_args(argv)
