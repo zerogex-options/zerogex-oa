@@ -48,24 +48,23 @@ logger = logging.getLogger(__name__)
 # every active contract without pulling a stale prior-session quote.
 _CONTRACT_LOOKBACK = timedelta(hours=2)
 
-# The morning window the track record reads its charm forecast from. Kept in
-# lockstep with DatabaseManager.get_charm_backtest_sessions so a backfilled row
-# lands exactly where the backtest looks for it.
-_MORNING_START = "09:35"
-_MORNING_END = "10:30"
+# The morning window (ET hour, minute) the track record reads its charm forecast
+# from. Kept in lockstep with DatabaseManager.get_charm_backtest_sessions so a
+# backfilled row lands exactly where the backtest looks for it.
+_MORNING_START = (9, 35)
+_MORNING_END = (10, 30)
 
-# One row per trading day: the earliest option-chain snapshot inside the
-# morning window, per US/Eastern calendar date (DST handled by Postgres).
-_MORNING_TS_SQL = """
-    SELECT DISTINCT ON ((timestamp AT TIME ZONE 'America/New_York')::date)
-           (timestamp AT TIME ZONE 'America/New_York')::date AS d,
-           timestamp
+# Earliest snapshot inside ONE day's morning window. Plain timestamp-range MIN so
+# it rides idx_option_chains_underlying_timestamp. The functional form --
+# (timestamp AT TIME ZONE 'America/New_York')::time BETWEEN ... over a 90-day
+# span -- cannot use the timestamp index and seq-scans the whole table (that is
+# the statement-timeout you hit).
+_MIN_MORNING_TS_SQL = """
+    SELECT MIN(timestamp)
     FROM option_chains
     WHERE underlying = %s
-      AND timestamp >= %s AND timestamp < %s
-      AND (timestamp AT TIME ZONE 'America/New_York')::time
-          BETWEEN TIME %s AND TIME %s
-    ORDER BY d, timestamp
+      AND timestamp >= %s
+      AND timestamp <= %s
 """
 
 # Latest quote per contract as of the morning timestamp: the same
@@ -101,8 +100,26 @@ def _default_underlyings() -> List[str]:
 
 
 def _morning_timestamps(cursor, db_symbol: str, start: datetime, end: datetime) -> List[datetime]:
-    cursor.execute(_MORNING_TS_SQL, (db_symbol, start, end, _MORNING_START, _MORNING_END))
-    return [row[1] for row in cursor.fetchall()]
+    """Earliest option-chain timestamp in each day's 09:35-10:30 ET window.
+
+    Iterates day-by-day with tz-aware ET bounds (DST handled by pytz) and a
+    plain index-friendly MIN per day, instead of one functional-expression scan
+    across the whole span. Non-trading days return NULL and are skipped.
+    """
+    out: List[datetime] = []
+    day = start.astimezone(ET).date()
+    last = end.astimezone(ET).date()
+    while day <= last:
+        lo = ET.localize(datetime(day.year, day.month, day.day, *_MORNING_START))
+        hi = ET.localize(datetime(day.year, day.month, day.day, *_MORNING_END))
+        # Clip to the requested [start, end) so partial edge days stay in range.
+        if hi >= start and lo < end:
+            cursor.execute(_MIN_MORNING_TS_SQL, (db_symbol, lo, hi))
+            row = cursor.fetchone()
+            if row and row[0] is not None:
+                out.append(row[0])
+        day += timedelta(days=1)
+    return out
 
 
 def _asof_options(cursor, db_symbol: str, ts: datetime) -> List[Dict[str, Any]]:
@@ -211,12 +228,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     totals = {"written": 0, "skipped": 0}
     for sym in underlyings:
+        # Isolate per-symbol failures (e.g. a slow query on the largest chain)
+        # so one symbol can't abort the backfill of the others.
         try:
             engine = AnalyticsEngine(underlying=sym)
-        except Exception as e:  # pragma: no cover - defensive
-            logger.error("%s: could not init engine: %s", sym, e)
+            counts = backfill_symbol(engine, start, end, args.dry_run)
+        except Exception as e:
+            logger.error("%s: backfill failed, continuing: %s", sym, e)
             continue
-        counts = backfill_symbol(engine, start, end, args.dry_run)
         totals["written"] += counts["written"]
         totals["skipped"] += counts["skipped"]
 
