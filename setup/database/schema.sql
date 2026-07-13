@@ -2612,6 +2612,15 @@ CREATE TABLE IF NOT EXISTS daily_forecast (
     -- Immutable — the receipt grader uses this specific number so a VIX
     -- shift between morning and close doesn't rewrite the grading rule.
     regime_move_threshold NUMERIC(8,6),
+    -- v1.4 reframe: the gradeable claims that replace the pin/regime tiles on
+    -- the card. ``regime`` above is retained (it conditions these) but is no
+    -- longer surfaced as a headline claim. None of these forecast direction.
+    expected_vol_state  VARCHAR(16),   -- 'compression' | 'normal' | 'expansion'
+    expected_vol_ratio  NUMERIC(6,4),  -- predicted realized range / implied 1-day move
+    implied_move        NUMERIC(12,4), -- VIX-implied 1-day $ move; the grader denominator
+    flip_cross_prob     NUMERIC(5,4),  -- P(spot crosses the gamma flip today)
+    level_touch_probs   JSONB,         -- {"call_wall": p, "put_wall": p} committed touch odds
+    gravity_center      NUMERIC(12,4), -- max-gamma strike (long-gamma pull center; informational)
     -- Receipt — written at 16:05 ET, never rewritten.
     receipt_ts          TIMESTAMPTZ,
     actual_low          NUMERIC(12,4),
@@ -2625,6 +2634,13 @@ CREATE TABLE IF NOT EXISTS daily_forecast (
     raw_range_respected BOOLEAN,
     raw_pin_hit         BOOLEAN,
     setup_outcome       JSONB,
+    -- v1.4 receipt verdicts for the new claims, graded on magnitude not
+    -- direction. realized_vol_ratio = (actual_high - actual_low) / implied_move.
+    realized_vol_ratio   NUMERIC(6,4),
+    vol_state_correct    BOOLEAN,       -- realized volatility bucket == committed expected_vol_state
+    flip_crossed         BOOLEAN,       -- did spot cross the committed gamma flip intraday
+    level_touch_outcomes JSONB,         -- {"call_wall": bool, "put_wall": bool, "gamma_flip": bool}
+    levels_brier         NUMERIC(6,4),  -- mean Brier score across the committed level/flip probabilities
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (symbol, date)
@@ -2644,6 +2660,18 @@ ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS raw_pin_hit         BOOLEAN;
 -- (not whatever the current VIX happens to be at 4 PM).  A NULL value on
 -- legacy pre-v1.3 rows falls back to the caller default in the grader.
 ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS regime_move_threshold NUMERIC(8,6);
+-- v1.4 reframe columns (gradeable vol + level-odds claims).
+ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS expected_vol_state   VARCHAR(16);
+ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS expected_vol_ratio   NUMERIC(6,4);
+ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS implied_move         NUMERIC(12,4);
+ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS flip_cross_prob      NUMERIC(5,4);
+ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS level_touch_probs    JSONB;
+ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS gravity_center       NUMERIC(12,4);
+ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS realized_vol_ratio   NUMERIC(6,4);
+ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS vol_state_correct    BOOLEAN;
+ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS flip_crossed         BOOLEAN;
+ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS level_touch_outcomes JSONB;
+ALTER TABLE daily_forecast ADD COLUMN IF NOT EXISTS levels_brier         NUMERIC(6,4);
 
 CREATE INDEX IF NOT EXISTS idx_daily_forecast_date_desc
     ON daily_forecast(date DESC);
@@ -2671,6 +2699,11 @@ BEGIN
     IF OLD.raw_projected_high IS NOT NULL AND NEW.raw_projected_high IS DISTINCT FROM OLD.raw_projected_high THEN RAISE EXCEPTION 'daily_forecast.raw_projected_high is immutable'; END IF;
     IF OLD.forecast_inputs    IS NOT NULL AND NEW.forecast_inputs    IS DISTINCT FROM OLD.forecast_inputs    THEN RAISE EXCEPTION 'daily_forecast.forecast_inputs is immutable'; END IF;
     IF OLD.regime_move_threshold IS NOT NULL AND NEW.regime_move_threshold IS DISTINCT FROM OLD.regime_move_threshold THEN RAISE EXCEPTION 'daily_forecast.regime_move_threshold is immutable'; END IF;
+    -- v1.4 committed claims are equally immutable once written.
+    IF OLD.expected_vol_state IS NOT NULL AND NEW.expected_vol_state IS DISTINCT FROM OLD.expected_vol_state THEN RAISE EXCEPTION 'daily_forecast.expected_vol_state is immutable'; END IF;
+    IF OLD.expected_vol_ratio IS NOT NULL AND NEW.expected_vol_ratio IS DISTINCT FROM OLD.expected_vol_ratio THEN RAISE EXCEPTION 'daily_forecast.expected_vol_ratio is immutable'; END IF;
+    IF OLD.implied_move       IS NOT NULL AND NEW.implied_move       IS DISTINCT FROM OLD.implied_move       THEN RAISE EXCEPTION 'daily_forecast.implied_move is immutable'; END IF;
+    IF OLD.level_touch_probs  IS NOT NULL AND NEW.level_touch_probs  IS DISTINCT FROM OLD.level_touch_probs  THEN RAISE EXCEPTION 'daily_forecast.level_touch_probs is immutable'; END IF;
     -- Receipt columns are immutable once written.
     IF OLD.receipt_ts       IS NOT NULL AND NEW.receipt_ts       IS DISTINCT FROM OLD.receipt_ts       THEN RAISE EXCEPTION 'daily_forecast.receipt_ts is immutable once set'; END IF;
     IF OLD.actual_close     IS NOT NULL AND NEW.actual_close     IS DISTINCT FROM OLD.actual_close     THEN RAISE EXCEPTION 'daily_forecast.actual_close is immutable once set'; END IF;

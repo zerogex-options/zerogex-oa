@@ -112,6 +112,13 @@ def _shape_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
             "flagship_setup": row.get("flagship_setup"),
             "range_model": row.get("range_model"),
             "content_hash": row.get("content_hash"),
+            # v1.4 gradeable claims — the tiles that replace pin/regime.
+            "expected_vol_state": row.get("expected_vol_state"),
+            "expected_vol_ratio": _f(row.get("expected_vol_ratio")),
+            "implied_move": _f(row.get("implied_move")),
+            "flip_cross_prob": _f(row.get("flip_cross_prob")),
+            "level_touch_probs": row.get("level_touch_probs"),
+            "gravity_center": _f(row.get("gravity_center")),
         },
         "receipt": (
             {
@@ -123,6 +130,12 @@ def _shape_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
                 "pin_hit": row.get("pin_hit"),
                 "regime_correct": row.get("regime_correct"),
                 "setup_outcome": row.get("setup_outcome"),
+                # v1.4 verdicts.
+                "realized_vol_ratio": _f(row.get("realized_vol_ratio")),
+                "vol_state_correct": row.get("vol_state_correct"),
+                "flip_crossed": row.get("flip_crossed"),
+                "level_touch_outcomes": row.get("level_touch_outcomes"),
+                "levels_brier": _f(row.get("levels_brier")),
             }
             if has_receipt
             else None
@@ -155,6 +168,8 @@ async def get_available_dates(
                 "range_respected": r.get("range_respected"),
                 "pin_hit": r.get("pin_hit"),
                 "regime_correct": r.get("regime_correct"),
+                "expected_vol_state": r.get("expected_vol_state"),
+                "vol_state_correct": r.get("vol_state_correct"),
             }
             for r in rows
         ],
@@ -235,6 +250,11 @@ async def get_recent_history(
                 "range_respected": r.get("range_respected"),
                 "pin_hit": r.get("pin_hit"),
                 "regime_correct": r.get("regime_correct"),
+                "expected_vol_state": r.get("expected_vol_state"),
+                "expected_vol_ratio": _f(r.get("expected_vol_ratio")),
+                "realized_vol_ratio": _f(r.get("realized_vol_ratio")),
+                "vol_state_correct": r.get("vol_state_correct"),
+                "levels_brier": _f(r.get("levels_brier")),
                 "has_receipt": r.get("receipt_ts") is not None,
             }
             for r in rows
@@ -271,6 +291,15 @@ async def get_rolling_stats(
     ]
     regime_n = sum(1 for r in regime_scored if r.get("regime_correct") is not None)
 
+    # v1.4 claim stats. Expected-volatility accuracy is the hit rate of the
+    # committed compression/normal/expansion call; levels_brier is the mean
+    # Brier score across touch/flip probabilities (lower is better, 0 = perfect).
+    vol_scored = [r for r in scored if r.get("vol_state_correct") is not None]
+    brier_vals = [
+        float(r["levels_brier"]) for r in scored if r.get("levels_brier") is not None
+    ]
+    levels_brier_avg = round(sum(brier_vals) / len(brier_vals), 4) if brier_vals else None
+
     return {
         "symbol": symbol.upper(),
         "window": window,
@@ -281,4 +310,9 @@ async def get_rolling_stats(
         # Transparency: regime accuracy is scoped to the corrected-logic era.
         "regime_stats_from": fix_date.isoformat(),
         "regime_n_scored": regime_n,
+        # v1.4 gradeable claims.
+        "vol_state_correct_rate": _rate(vol_scored, lambda r: r.get("vol_state_correct")),
+        "vol_n_scored": len(vol_scored),
+        "levels_brier_avg": levels_brier_avg,
+        "levels_n_scored": len(brier_vals),
     }

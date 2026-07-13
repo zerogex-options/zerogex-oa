@@ -1,8 +1,23 @@
-"""Range / pin / regime model for the daily forecast writer — v1.2.
+"""Range / expected-volatility / level-odds model for the daily forecast — v1.4.
 
-This is the feature-weighted heuristic that replaces heuristic_v1's
-symmetric-around-spot band.  It folds in the signals ZeroGEX already
-computes but wasn't using for the forecast:
+v1.4 reframes the card away from price prediction.  The projected RANGE is
+kept as-is (a coverage-graded containment band), but the pin-strike and
+chop/trend-regime tiles — which implicitly claimed the market must react to
+gamma levels — are retired as headline claims and replaced by two things
+gamma structure genuinely conditions and that grade objectively on the day's
+OHLC magnitude, never on direction:
+
+  * ``expected_vol_state`` / ``expected_vol_ratio`` — realized daily range as a
+    fraction of the VIX-implied move (long gamma damps, short gamma amplifies).
+  * ``level_touch_probs`` / ``flip_cross_prob`` — reflection-principle odds that
+    price reaches each structural wall / crosses the gamma flip today.
+
+``regime`` is still computed (it conditions both of the above and tilts the
+wall odds) but is no longer surfaced as a graded tile.
+
+The range engine remains the feature-weighted heuristic that replaced
+heuristic_v1's symmetric-around-spot band.  It folds in the signals ZeroGEX
+already computes but wasn't using for the forecast:
 
   * Asymmetric structural bounds from call wall vs put wall distance
   * Wall-magnitude weighting (via top gamma nodes)
@@ -101,6 +116,50 @@ REGIME_THRESHOLD_FALLBACK = 0.005   # matches legacy 0.5% behavior when no VIX
 
 DEFAULT_STRIKE_STEP = 1.0
 
+# ---------------------------------------------------------------------------
+# v1.4 reframe — gradeable claims that replace the pin/regime tiles
+# ---------------------------------------------------------------------------
+# The card no longer asserts a pinned close or a chop/trend label graded on
+# close-vs-open.  Instead it publishes two things gamma structure genuinely
+# conditions and that can be scored objectively against the day's OHLC —
+# without ever claiming price *direction*:
+#
+#   * Expected volatility: realized daily range as a fraction of the
+#     VIX-implied 1-day move.  Long gamma damps (ratio < 1), short gamma
+#     amplifies (ratio > 1).  Graded on realized ÷ implied — path-agnostic,
+#     so a round-trip trend day that closes flat still scores as expansion.
+#   * Level touch odds: reflection-principle P(price reaches each structural
+#     level today) + P(the gamma flip is crossed).  Graded by Brier score.
+#
+# Every weight below is a PRIOR (intuition), to be replaced by the nightly
+# calibration loop once enough receipts accrue — nothing here claims measured
+# edge.  See docs/design/quantile-regression-range-model.md for the v2 plan.
+
+VOL_BASE_RATIO = 1.0
+VOL_GAMMA_WEIGHT = 0.35          # dealer-gamma sign is the dominant driver
+VOL_GEX_SATURATION = 2.0e9      # |net_gex| that saturates the damping/amplifying pull
+VOL_VIXZ_WEIGHT = 0.15          # vol-of-vol context (20d VIX z-score)
+VOL_FLIP_PROX_WEIGHT = 0.10     # nearness to the flip raises expansion odds
+VOL_FLIP_PROX_SPAN = 0.015      # |flip_distance| within this fraction counts as "near"
+VOL_LOCAL_GAMMA_WEIGHT = 0.08   # dense local gamma adds pinning — long-gamma only
+VOL_LOCAL_GEX_SATURATION = 5.0e8
+VOL_RATIO_MIN = 0.45
+VOL_RATIO_MAX = 1.90
+# Grading band, shared with the receipt grader (kept in sync there):
+#   realized ratio <= LOW  -> compression | >= HIGH -> expansion | else normal
+VOL_NORMAL_LOW = 0.85
+VOL_NORMAL_HIGH = 1.15
+
+# Level touch-probability model.  Single-barrier hitting probability over a
+# driftless 1-day horizon (reflection principle): P = 2·(1 − Φ(d/σ)), where
+# d is the distance to the level and σ the implied 1-day move.  A dealer-regime
+# tilt reflects that long-gamma walls are defended (harder to reach) while
+# short-gamma walls give way.
+LEVEL_TOUCH_MIN = 0.01
+LEVEL_TOUCH_MAX = 0.99
+LEVEL_LONG_GAMMA_DAMP = 0.90    # long gamma: walls defended -> lower touch odds
+LEVEL_SHORT_GAMMA_AMP = 1.12    # short gamma: walls give way -> higher touch odds
+
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -134,6 +193,14 @@ class ForecastInputs:
     # rather than asserting a positioning we can't substantiate.
     net_gex: Optional[float] = None
     gex_surface_fresh: bool = True
+
+    # Vol-character inputs (from gex_summary).  ``local_gex`` is the summed
+    # |net_gex| within ±1% of spot (pinning density); ``convexity_risk`` is
+    # |total_net_gex| / distance-to-flip (acceleration risk); ``flip_distance``
+    # is the signed (spot − flip)/spot.  All feed the expected-volatility call.
+    local_gex: Optional[float] = None
+    convexity_risk: Optional[float] = None
+    flip_distance: Optional[float] = None
 
     # Structural GEX (0DTE only — nearest expiration walls derived from
     # gex_by_strike filtered to today's expiration).  When populated,
@@ -210,6 +277,16 @@ class ForecastResult:
     raw_projected_low: float = 0.0
     raw_projected_high: float = 0.0
     raw_pin_strike: Optional[float] = None
+
+    # v1.4 reframe — the gradeable claims that replace the pin/regime tiles.
+    # ``regime`` above is retained internally (it conditions these) but is no
+    # longer a headline card claim.
+    expected_vol_state: str = "normal"                     # compression | normal | expansion
+    expected_vol_ratio: float = 1.0                        # predicted realized range ÷ implied move
+    implied_move: Optional[float] = None                   # VIX-implied 1-day $ move (grader denominator)
+    flip_cross_prob: Optional[float] = None                # P(spot crosses the gamma flip today)
+    level_touch_probs: dict = field(default_factory=dict)  # {"call_wall": p, "put_wall": p}
+    gravity_center: Optional[float] = None                 # max-gamma strike (long-gamma pull center)
 
     # Snapshot of the calibration scalars actually applied.  When no
     # calibration state existed, this is the neutral {1.0, 1.0, 0, 0}.
@@ -328,6 +405,185 @@ def _pin_tolerance(spot: float, strike_step: float, calibration_mult: float) -> 
     strike_based = strike_step * PIN_TOLERANCE_MIN_STRIKE_FRACTION
     spot_based = spot * PIN_TOLERANCE_MIN_SPOT_FRACTION
     return max(strike_based, spot_based) * calibration_mult
+
+
+def _normal_cdf(x: float) -> float:
+    """Standard-normal CDF via erf — no scipy dependency."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _barrier_touch_prob(distance: Optional[float], sigma: Optional[float]) -> Optional[float]:
+    """P(a driftless 1-day path touches a level ``distance`` away), given a
+    1-day stdev ``sigma``.  Reflection principle: P(max excursion ≥ d) =
+    2·(1 − Φ(d/σ)).  Returns None when inputs are unusable; clamped to a sane
+    [1%, 99%] so a level sitting on spot doesn't read as a certainty."""
+    if sigma is None or sigma <= 0 or distance is None:
+        return None
+    p = 2.0 * (1.0 - _normal_cdf(abs(distance) / sigma))
+    return _clamp(p, LEVEL_TOUCH_MIN, LEVEL_TOUCH_MAX)
+
+
+def _classify_vol_state(ratio: float) -> str:
+    """Map a realized-÷-implied ratio to compression / normal / expansion.
+    Shared shape with the receipt grader so a committed prediction and its
+    grade use identical band edges."""
+    if ratio <= VOL_NORMAL_LOW:
+        return "compression"
+    if ratio >= VOL_NORMAL_HIGH:
+        return "expansion"
+    return "normal"
+
+
+def _compute_expected_vol(inp: ForecastInputs, rationale: list[str]) -> tuple[str, float]:
+    """Predict realized daily range as a fraction of the implied 1-day move.
+
+    Dealer-gamma sign is the dominant driver: long gamma suppresses realized
+    volatility (ratio < 1), short gamma amplifies it (ratio > 1).  Dense local
+    gamma adds pinning (long-gamma only), a stretched VIX z-score lifts the
+    whole tape, and proximity to the flip raises expansion odds because the
+    regime itself is unstable there.  Makes NO claim about direction.
+    """
+    ratio = VOL_BASE_RATIO
+    if inp.gex_surface_fresh and inp.net_gex is not None:
+        g = math.tanh(inp.net_gex / VOL_GEX_SATURATION)  # +long / -short
+        ratio *= 1.0 - VOL_GAMMA_WEIGHT * g
+        if inp.net_gex > 0 and inp.local_gex is not None and inp.local_gex > 0:
+            dens = math.tanh(inp.local_gex / VOL_LOCAL_GEX_SATURATION)
+            ratio *= 1.0 - VOL_LOCAL_GAMMA_WEIGHT * dens
+    if inp.vix_z_score_20d is not None:
+        z = _clamp(inp.vix_z_score_20d / 3.0, -1.0, 1.0)
+        ratio *= 1.0 + VOL_VIXZ_WEIGHT * z
+    if inp.flip_distance is not None and VOL_FLIP_PROX_SPAN > 0:
+        prox = max(0.0, 1.0 - abs(inp.flip_distance) / VOL_FLIP_PROX_SPAN)
+        if prox > 0:
+            ratio *= 1.0 + VOL_FLIP_PROX_WEIGHT * prox
+    ratio = _clamp(ratio, VOL_RATIO_MIN, VOL_RATIO_MAX)
+    state = _classify_vol_state(ratio)
+    rationale.append(f"Expected vol={state} (realized≈{ratio:.2f}× implied)")
+    return state, round(ratio, 4)
+
+
+def _compute_level_touch_probs(
+    inp: ForecastInputs,
+    implied_move: Optional[float],
+    regime: str,
+    rationale: list[str],
+) -> tuple[dict[str, float], Optional[float]]:
+    """Reflection-principle P(touch today) for each wall + P(flip cross).
+
+    Walls are tilted by the dealer regime (long gamma defends them, short
+    gamma lets them break).  The flip-cross probability is deliberately NOT
+    regime-tilted: crossing the flip *is* the regime-change event, so tilting
+    by the current regime would double-count it.
+    """
+    spot = inp.spot
+    if implied_move is None or implied_move <= 0 or spot <= 0:
+        return {}, None
+    tilt = (
+        LEVEL_LONG_GAMMA_DAMP if regime == "long_gamma"
+        else LEVEL_SHORT_GAMMA_AMP if regime == "short_gamma"
+        else 1.0
+    )
+    probs: dict[str, float] = {}
+    for name, level in (("call_wall", inp.call_wall), ("put_wall", inp.put_wall)):
+        p = _barrier_touch_prob((level - spot) if level is not None else None, implied_move)
+        if p is not None:
+            probs[name] = round(_clamp(p * tilt, LEVEL_TOUCH_MIN, LEVEL_TOUCH_MAX), 4)
+    flip_prob = _barrier_touch_prob(
+        (inp.gamma_flip - spot) if inp.gamma_flip is not None else None, implied_move
+    )
+    if flip_prob is not None:
+        flip_prob = round(flip_prob, 4)
+    if probs or flip_prob is not None:
+        parts = [f"{k} {v:.0%}" for k, v in probs.items()]
+        if flip_prob is not None:
+            parts.append(f"flip-cross {flip_prob:.0%}")
+        rationale.append("Level touch odds: " + ", ".join(parts))
+    return probs, flip_prob
+
+
+def _select_gravity_center(inp: ForecastInputs) -> Optional[float]:
+    """The max-gamma strike price acts as a pull center while dealers are long
+    gamma.  Prefer the largest top gamma node; fall back to max_pain."""
+    for node in inp.top_gamma_nodes[:1]:
+        strike = node.get("strike")
+        if strike is not None:
+            try:
+                return float(strike)
+            except (TypeError, ValueError):
+                pass
+    return float(inp.max_pain) if inp.max_pain is not None else None
+
+
+def grade_realized_claims(
+    *,
+    open_spot: float,
+    actual_low: float,
+    actual_high: float,
+    implied_move: Optional[float],
+    expected_vol_state: Optional[str],
+    call_wall: Optional[float],
+    put_wall: Optional[float],
+    gamma_flip: Optional[float],
+    level_touch_probs: Optional[dict],
+    flip_cross_prob: Optional[float],
+) -> dict[str, Any]:
+    """Grade the v1.4 claims against the day's cash-session OHLC.
+
+    Pure + deterministic so the receipt grader in the DB layer stays a thin
+    caller and the band edges live in exactly one place.  Everything here is a
+    MAGNITUDE test — realized range, whether a level was reached, whether the
+    flip was crossed — never a direction call.  A round-trip trend day that
+    closes flat still reads as expansion because the *range* was large.
+
+    Returns ``{realized_vol_ratio, vol_state_correct, flip_crossed,
+    level_touch_outcomes, levels_brier}`` with ``None`` for any verdict whose
+    inputs weren't committed (e.g. no implied move, no walls).
+    """
+    realized_range = actual_high - actual_low
+    realized_vol_ratio: Optional[float] = None
+    vol_state_correct: Optional[bool] = None
+    if implied_move is not None and implied_move > 0:
+        realized_vol_ratio = round(realized_range / implied_move, 4)
+        realized_bucket = _classify_vol_state(realized_vol_ratio)
+        if expected_vol_state is not None:
+            vol_state_correct = realized_bucket == expected_vol_state
+
+    # Open sits on one side of the flip by definition; a cross is the intraday
+    # extreme reaching the other side.
+    flip_crossed: Optional[bool] = None
+    if gamma_flip is not None:
+        flip_crossed = (
+            (open_spot > gamma_flip and actual_low <= gamma_flip)
+            or (open_spot < gamma_flip and actual_high >= gamma_flip)
+        )
+
+    outcomes: dict[str, bool] = {}
+    if call_wall is not None:
+        outcomes["call_wall"] = actual_high >= call_wall
+    if put_wall is not None:
+        outcomes["put_wall"] = actual_low <= put_wall
+    if flip_crossed is not None:
+        outcomes["gamma_flip"] = flip_crossed
+
+    probs = level_touch_probs if isinstance(level_touch_probs, dict) else {}
+    brier_terms: list[float] = []
+    for key in ("call_wall", "put_wall"):
+        p = probs.get(key)
+        outcome = outcomes.get(key)
+        if p is not None and outcome is not None:
+            brier_terms.append((float(p) - (1.0 if outcome else 0.0)) ** 2)
+    if flip_cross_prob is not None and flip_crossed is not None:
+        brier_terms.append((float(flip_cross_prob) - (1.0 if flip_crossed else 0.0)) ** 2)
+    levels_brier = round(sum(brier_terms) / len(brier_terms), 4) if brier_terms else None
+
+    return {
+        "realized_vol_ratio": realized_vol_ratio,
+        "vol_state_correct": vol_state_correct,
+        "flip_crossed": flip_crossed,
+        "level_touch_outcomes": outcomes,
+        "levels_brier": levels_brier,
+    }
 
 
 def _structural_half_bands(inp: ForecastInputs) -> tuple[float, float, list[str]]:
@@ -687,6 +943,17 @@ def compute_forecast(inp: ForecastInputs) -> ForecastResult:
         f"({regime_threshold * 100:.2f}%)"
     )
 
+    # Step 10 — v1.4 gradeable claims.  ``regime`` conditions both: it drives
+    # the expected-vol sign and tilts the wall touch odds, but is no longer a
+    # headline claim of its own.
+    vol_proxy = inp.vix_close if inp.vix_close is not None else inp.vxn_close
+    implied_move = _vix_implied_daily_move(spot, vol_proxy)
+    expected_vol_state, expected_vol_ratio = _compute_expected_vol(inp, rationale)
+    level_touch_probs, flip_cross_prob = _compute_level_touch_probs(
+        inp, implied_move, regime, rationale
+    )
+    gravity_center = _select_gravity_center(inp)
+
     return ForecastResult(
         projected_low=projected_low,
         projected_high=projected_high,
@@ -695,10 +962,16 @@ def compute_forecast(inp: ForecastInputs) -> ForecastResult:
         pin_tolerance=round(pin_tol, 4),
         regime=regime,
         regime_move_threshold=round(regime_threshold, 6),
-        range_model="heuristic_v1_3",
+        range_model="heuristic_v1_4",
         rationale=rationale,
         raw_projected_low=raw_low,
         raw_projected_high=raw_high,
         raw_pin_strike=raw_pin,
         calibration_applied=dict(calibration),
+        expected_vol_state=expected_vol_state,
+        expected_vol_ratio=expected_vol_ratio,
+        implied_move=round(implied_move, 4) if implied_move is not None else None,
+        flip_cross_prob=flip_cross_prob,
+        level_touch_probs=level_touch_probs,
+        gravity_center=round(gravity_center, 4) if gravity_center is not None else None,
     )

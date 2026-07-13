@@ -306,6 +306,10 @@ async def _gather_inputs(db: DatabaseManager, symbol: str) -> Optional[ForecastI
         max_pain=_f(gex.get("max_pain")) if gex else None,
         net_gex=_f(gex.get("net_gex")) if gex else None,
         gex_surface_fresh=_gex_is_fresh(gex.get("timestamp")) if gex else False,
+        # Vol-character inputs for the expected-volatility claim.
+        local_gex=_f(gex.get("local_gex")) if gex else None,
+        convexity_risk=_f(gex.get("convexity_risk")) if gex else None,
+        flip_distance=_f(gex.get("flip_distance")) if gex else None,
         call_wall_0dte=call_wall_0dte,
         put_wall_0dte=put_wall_0dte,
         top_gamma_nodes=top_nodes,
@@ -385,6 +389,9 @@ def _build_payload(inputs: ForecastInputs, result: ForecastResult, open_ts: date
         "call_wall_0dte": inputs.call_wall_0dte,
         "put_wall_0dte": inputs.put_wall_0dte,
         "top_gamma_nodes": inputs.top_gamma_nodes,
+        "local_gex": inputs.local_gex,
+        "convexity_risk": inputs.convexity_risk,
+        "flip_distance": inputs.flip_distance,
         "is_opex_friday": inputs.is_opex_friday,
         "is_vix_expiration": inputs.is_vix_expiration,
         "is_post_opex_monday": inputs.is_post_opex_monday,
@@ -422,6 +429,13 @@ def _build_payload(inputs: ForecastInputs, result: ForecastResult, open_ts: date
         "raw_projected_high": result.raw_projected_high,
         "raw_pin_strike": result.raw_pin_strike,
         "forecast_inputs": inputs_snapshot,
+        # v1.4 gradeable claims (replace the pin/regime tiles on the card).
+        "expected_vol_state": result.expected_vol_state,
+        "expected_vol_ratio": result.expected_vol_ratio,
+        "implied_move": result.implied_move,
+        "flip_cross_prob": result.flip_cross_prob,
+        "level_touch_probs": result.level_touch_probs,
+        "gravity_center": result.gravity_center,
     }
     # The content hash deliberately excludes open_ts (which is recorded
     # at the moment of write and would otherwise make every dry-run

@@ -20,6 +20,8 @@ from datetime import datetime, timedelta, date, time
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
+from src.jobs.forecast_range_model import grade_realized_claims
+
 if TYPE_CHECKING:
     from contextlib import AbstractAsyncContextManager
 
@@ -1550,7 +1552,9 @@ class SignalsQueriesMixin:
                         pin_strike, pin_tolerance, regime_move_threshold,
                         flagship_setup, range_model,
                         raw_projected_low, raw_projected_high, raw_pin_strike,
-                        forecast_inputs, content_hash
+                        forecast_inputs, content_hash,
+                        expected_vol_state, expected_vol_ratio, implied_move,
+                        flip_cross_prob, level_touch_probs, gravity_center
                     )
                     VALUES (
                         $1, $2, $3, $4,
@@ -1559,7 +1563,9 @@ class SignalsQueriesMixin:
                         $13, $14, $15,
                         $16::jsonb, $17,
                         $18, $19, $20,
-                        $21::jsonb, $22
+                        $21::jsonb, $22,
+                        $23, $24, $25,
+                        $26, $27::jsonb, $28
                     )
                     ON CONFLICT (symbol, date) DO NOTHING
                     RETURNING symbol, date, open_ts, open_spot, call_wall,
@@ -1569,7 +1575,9 @@ class SignalsQueriesMixin:
                               flagship_setup, range_model,
                               raw_projected_low, raw_projected_high,
                               raw_pin_strike, forecast_inputs,
-                              content_hash, created_at
+                              content_hash, created_at,
+                              expected_vol_state, expected_vol_ratio, implied_move,
+                              flip_cross_prob, level_touch_probs, gravity_center
                     """,
                     payload["symbol"],
                     payload["date"],
@@ -1597,6 +1605,14 @@ class SignalsQueriesMixin:
                     if payload.get("forecast_inputs") is not None
                     else None,
                     payload["content_hash"],
+                    payload.get("expected_vol_state"),
+                    payload.get("expected_vol_ratio"),
+                    payload.get("implied_move"),
+                    payload.get("flip_cross_prob"),
+                    json.dumps(payload.get("level_touch_probs"), default=str)
+                    if payload.get("level_touch_probs") is not None
+                    else None,
+                    payload.get("gravity_center"),
                 )
                 if row is not None:
                     return dict(row)
@@ -1642,7 +1658,9 @@ class SignalsQueriesMixin:
                 row = await conn.fetchrow(
                     """
                     SELECT projected_low, projected_high, pin_strike, regime,
-                           open_spot, receipt_ts
+                           open_spot, receipt_ts,
+                           implied_move, expected_vol_state, flip_cross_prob,
+                           level_touch_probs, gamma_flip, call_wall, put_wall
                     FROM daily_forecast
                     WHERE symbol = $1 AND date = $2
                     """,
@@ -1730,6 +1748,38 @@ class SignalsQueriesMixin:
                 else:
                     regime_correct = None
 
+                # --- v1.4 claim grading: expected volatility + level touch odds.
+                # All magnitude, never direction. The math lives in the pure
+                # grade_realized_claims() so the band edges stay DRY with the model.
+                committed_probs = row.get("level_touch_probs")
+                if isinstance(committed_probs, str):
+                    try:
+                        committed_probs = json.loads(committed_probs)
+                    except (json.JSONDecodeError, TypeError):
+                        committed_probs = None
+
+                def _rf(key: str) -> Optional[float]:
+                    v = row.get(key)
+                    return float(v) if v is not None else None
+
+                v14 = grade_realized_claims(
+                    open_spot=open_spot,
+                    actual_low=actual_low,
+                    actual_high=actual_high,
+                    implied_move=_rf("implied_move"),
+                    expected_vol_state=row.get("expected_vol_state"),
+                    call_wall=_rf("call_wall"),
+                    put_wall=_rf("put_wall"),
+                    gamma_flip=_rf("gamma_flip"),
+                    level_touch_probs=committed_probs,
+                    flip_cross_prob=_rf("flip_cross_prob"),
+                )
+                realized_vol_ratio = v14["realized_vol_ratio"]
+                vol_state_correct = v14["vol_state_correct"]
+                flip_crossed = v14["flip_crossed"]
+                level_touch_outcomes = v14["level_touch_outcomes"]
+                levels_brier = v14["levels_brier"]
+
                 updated = await conn.fetchrow(
                     """
                     UPDATE daily_forecast
@@ -1742,7 +1792,12 @@ class SignalsQueriesMixin:
                         regime_correct = $9,
                         raw_range_respected = $10,
                         raw_pin_hit = $11,
-                        setup_outcome = $12::jsonb
+                        setup_outcome = $12::jsonb,
+                        realized_vol_ratio = $13,
+                        vol_state_correct = $14,
+                        flip_crossed = $15,
+                        level_touch_outcomes = $16::jsonb,
+                        levels_brier = $17
                     WHERE symbol = $1 AND date = $2
                     RETURNING *
                     """,
@@ -1751,6 +1806,9 @@ class SignalsQueriesMixin:
                     range_respected, pin_hit, regime_correct,
                     raw_range_respected, raw_pin_hit,
                     json.dumps(setup_outcome, default=str) if setup_outcome else None,
+                    realized_vol_ratio, vol_state_correct, flip_crossed,
+                    json.dumps(level_touch_outcomes, default=str) if level_touch_outcomes else None,
+                    levels_brier,
                 )
                 return dict(updated) if updated else None
         except Exception as exc:
@@ -1776,7 +1834,10 @@ class SignalsQueriesMixin:
                 if row is None:
                     return None
                 out = dict(row)
-                for key in ("flagship_setup", "setup_outcome"):
+                for key in (
+                    "flagship_setup", "setup_outcome",
+                    "level_touch_probs", "level_touch_outcomes",
+                ):
                     val = out.get(key)
                     if isinstance(val, str):
                         try:
@@ -1807,7 +1868,10 @@ class SignalsQueriesMixin:
                            receipt_ts IS NOT NULL AS has_receipt,
                            range_respected,
                            pin_hit,
-                           regime_correct
+                           regime_correct,
+                           expected_vol_state,
+                           vol_state_correct,
+                           levels_brier
                     FROM daily_forecast
                     WHERE symbol = $1
                     ORDER BY date DESC
@@ -1833,7 +1897,9 @@ class SignalsQueriesMixin:
                     """
                     SELECT symbol, date, open_spot, projected_low, projected_high,
                            pin_strike, regime, range_respected, pin_hit,
-                           regime_correct, actual_close, receipt_ts
+                           regime_correct, actual_close, receipt_ts,
+                           expected_vol_state, expected_vol_ratio,
+                           realized_vol_ratio, vol_state_correct, levels_brier
                     FROM daily_forecast
                     WHERE symbol = $1
                     ORDER BY date DESC

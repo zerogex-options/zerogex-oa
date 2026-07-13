@@ -47,7 +47,7 @@ def _inputs(**overrides) -> ForecastInputs:
 
 def test_range_model_tag():
     result = compute_forecast(_inputs())
-    assert result.range_model == "heuristic_v1_3"
+    assert result.range_model == "heuristic_v1_4"
 
 
 def test_asymmetric_walls_produce_asymmetric_band():
@@ -427,3 +427,202 @@ def test_deterministic_for_same_inputs():
     assert a.projected_high == b.projected_high
     assert a.pin_strike == b.pin_strike
     assert a.regime == b.regime
+
+
+# ---------------------------------------------------------------------------
+# v1.4 reframe — expected volatility + level touch odds (no direction claim)
+# ---------------------------------------------------------------------------
+
+from src.jobs.forecast_range_model import (  # noqa: E402
+    LEVEL_TOUCH_MAX,
+    LEVEL_TOUCH_MIN,
+    VOL_NORMAL_HIGH,
+    VOL_NORMAL_LOW,
+    _barrier_touch_prob,
+    _classify_vol_state,
+)
+
+
+def _vol_inputs(**overrides) -> ForecastInputs:
+    """Inputs with the vol-character fields populated (VIX + gamma fresh)."""
+    base = _inputs(
+        vix_close=15.0,
+        vix_z_score_20d=0.0,
+        gex_surface_fresh=True,
+        net_gex=0.0,
+        local_gex=0.0,
+        flip_distance=0.5,  # far from flip so proximity is a no-op
+    )
+    for k, v in overrides.items():
+        setattr(base, k, v)
+    return base
+
+
+def test_expected_vol_compression_on_strong_long_gamma():
+    r = compute_forecast(_vol_inputs(net_gex=4.0e9, local_gex=6.0e8, vix_z_score_20d=-0.8))
+    assert r.expected_vol_state == "compression"
+    assert r.expected_vol_ratio < VOL_NORMAL_LOW
+    assert r.implied_move is not None and r.implied_move > 0
+
+
+def test_expected_vol_expansion_on_short_gamma_near_flip():
+    r = compute_forecast(_vol_inputs(net_gex=-3.0e9, vix_z_score_20d=1.5, flip_distance=0.001))
+    assert r.expected_vol_state == "expansion"
+    assert r.expected_vol_ratio > VOL_NORMAL_HIGH
+
+
+def test_expected_vol_normal_without_gamma_signal():
+    # No net_gex and neutral VIX-z -> ratio stays ~1.0 -> normal (no strong call).
+    r = compute_forecast(_vol_inputs(net_gex=None, vix_z_score_20d=0.0))
+    assert r.expected_vol_state == "normal"
+    assert VOL_NORMAL_LOW < r.expected_vol_ratio < VOL_NORMAL_HIGH
+
+
+def test_expected_vol_ignores_gamma_when_surface_stale():
+    fresh = compute_forecast(_vol_inputs(net_gex=4.0e9, gex_surface_fresh=True))
+    stale = compute_forecast(_vol_inputs(net_gex=4.0e9, gex_surface_fresh=False))
+    # A stale surface must not let a big net_gex drive the vol call.
+    assert stale.expected_vol_ratio > fresh.expected_vol_ratio
+    assert stale.expected_vol_state != "compression"
+
+
+def test_level_touch_probs_present_and_bounded():
+    r = compute_forecast(_vol_inputs(net_gex=1.0e9))
+    assert set(r.level_touch_probs) == {"call_wall", "put_wall"}
+    for p in r.level_touch_probs.values():
+        assert LEVEL_TOUCH_MIN <= p <= LEVEL_TOUCH_MAX
+    assert r.flip_cross_prob is not None
+
+
+def test_level_touch_prob_decreases_with_distance():
+    near = compute_forecast(_vol_inputs(call_wall=601.0))   # 1 pt away
+    far = compute_forecast(_vol_inputs(call_wall=615.0))    # 15 pts away
+    assert near.level_touch_probs["call_wall"] > far.level_touch_probs["call_wall"]
+
+
+def test_wall_touch_odds_higher_in_short_gamma_than_long():
+    long_g = compute_forecast(_vol_inputs(net_gex=3.0e9))    # dealers defend walls
+    short_g = compute_forecast(_vol_inputs(net_gex=-3.0e9))  # walls give way
+    assert short_g.level_touch_probs["call_wall"] > long_g.level_touch_probs["call_wall"]
+
+
+def test_flip_cross_prob_not_regime_tilted():
+    # Same geometry, opposite regime — the flip-cross prob must be identical
+    # (crossing the flip IS the regime change, so it isn't regime-tilted).
+    long_g = compute_forecast(_vol_inputs(net_gex=3.0e9))
+    short_g = compute_forecast(_vol_inputs(net_gex=-3.0e9))
+    assert long_g.flip_cross_prob == pytest.approx(short_g.flip_cross_prob)
+
+
+def test_gravity_center_prefers_top_gamma_node():
+    r = compute_forecast(_vol_inputs(
+        top_gamma_nodes=[{"strike": 602.0, "net_gex": 2.0e8}], max_pain=599.0,
+    ))
+    assert r.gravity_center == pytest.approx(602.0)
+    # Falls back to max_pain when no nodes.
+    r2 = compute_forecast(_vol_inputs(top_gamma_nodes=[], max_pain=599.0))
+    assert r2.gravity_center == pytest.approx(599.0)
+
+
+def test_no_level_probs_without_implied_move():
+    # No VIX/VXN -> no implied move -> touch odds can't be computed honestly.
+    r = compute_forecast(_vol_inputs(vix_close=None, vxn_close=None))
+    assert r.level_touch_probs == {}
+    assert r.flip_cross_prob is None
+    assert r.implied_move is None
+
+
+def test_barrier_touch_prob_bounds_and_monotonic():
+    assert _barrier_touch_prob(0.0, 10.0) == LEVEL_TOUCH_MAX      # on spot -> clamped ceiling
+    assert _barrier_touch_prob(1000.0, 10.0) == LEVEL_TOUCH_MIN   # miles away -> clamped floor
+    assert _barrier_touch_prob(5.0, 10.0) > _barrier_touch_prob(15.0, 10.0)
+    assert _barrier_touch_prob(5.0, None) is None
+
+
+def test_classify_vol_state_band_edges():
+    assert _classify_vol_state(VOL_NORMAL_LOW) == "compression"
+    assert _classify_vol_state(VOL_NORMAL_HIGH) == "expansion"
+    assert _classify_vol_state(1.0) == "normal"
+
+
+# ---------------------------------------------------------------------------
+# v1.4 receipt grading — grade_realized_claims (pure, magnitude-only)
+# ---------------------------------------------------------------------------
+
+from src.jobs.forecast_range_model import grade_realized_claims  # noqa: E402
+
+
+def test_grade_vol_compression_hit():
+    g = grade_realized_claims(
+        open_spot=600.0, actual_low=585.0, actual_high=615.0,  # range 30
+        implied_move=50.0, expected_vol_state="compression",
+        call_wall=None, put_wall=None, gamma_flip=None,
+        level_touch_probs=None, flip_cross_prob=None,
+    )
+    assert g["realized_vol_ratio"] == pytest.approx(0.6)
+    assert g["vol_state_correct"] is True
+
+
+def test_grade_expansion_is_path_independent():
+    # A violent two-way day (range 60) that closes right back at the open is
+    # still graded EXPANSION — the whole point of the reframe.
+    g = grade_realized_claims(
+        open_spot=600.0, actual_low=570.0, actual_high=630.0,  # range 60
+        implied_move=50.0, expected_vol_state="expansion",
+        call_wall=None, put_wall=None, gamma_flip=None,
+        level_touch_probs=None, flip_cross_prob=None,
+    )
+    assert g["realized_vol_ratio"] == pytest.approx(1.2)
+    assert g["vol_state_correct"] is True
+
+
+def test_grade_vol_state_wrong_when_bucket_mismatches():
+    g = grade_realized_claims(
+        open_spot=600.0, actual_low=595.0, actual_high=605.0,  # range 10 -> compression
+        implied_move=50.0, expected_vol_state="expansion",
+        call_wall=None, put_wall=None, gamma_flip=None,
+        level_touch_probs=None, flip_cross_prob=None,
+    )
+    assert g["vol_state_correct"] is False
+
+
+def test_grade_levels_outcomes_and_flip_cross():
+    g = grade_realized_claims(
+        open_spot=600.0, actual_low=570.0, actual_high=615.0,
+        implied_move=50.0, expected_vol_state="expansion",
+        call_wall=610.0, put_wall=590.0, gamma_flip=595.0,
+        level_touch_probs={"call_wall": 0.3, "put_wall": 0.4},
+        flip_cross_prob=0.2,
+    )
+    assert g["level_touch_outcomes"] == {
+        "call_wall": True, "put_wall": True, "gamma_flip": True,
+    }
+    assert g["flip_crossed"] is True
+    # Brier: mean[(0.3-1)^2, (0.4-1)^2, (0.2-1)^2] = (0.49+0.36+0.64)/3
+    assert g["levels_brier"] == pytest.approx((0.49 + 0.36 + 0.64) / 3, abs=1e-4)
+
+
+def test_grade_flip_not_crossed_when_extreme_stays_one_side():
+    g = grade_realized_claims(
+        open_spot=600.0, actual_low=598.0, actual_high=615.0,
+        implied_move=50.0, expected_vol_state="normal",
+        call_wall=None, put_wall=None, gamma_flip=595.0,
+        level_touch_probs=None, flip_cross_prob=0.1,
+    )
+    assert g["flip_crossed"] is False
+    # Brier from the flip term only: (0.1 - 0)^2 = 0.01
+    assert g["levels_brier"] == pytest.approx(0.01, abs=1e-4)
+
+
+def test_grade_no_implied_move_leaves_vol_ungraded():
+    g = grade_realized_claims(
+        open_spot=600.0, actual_low=590.0, actual_high=610.0,
+        implied_move=None, expected_vol_state="compression",
+        call_wall=610.0, put_wall=590.0, gamma_flip=None,
+        level_touch_probs={"call_wall": 0.5, "put_wall": 0.5}, flip_cross_prob=None,
+    )
+    assert g["realized_vol_ratio"] is None
+    assert g["vol_state_correct"] is None
+    # Levels still grade even without an implied move.
+    assert g["level_touch_outcomes"]["call_wall"] is True
+    assert g["levels_brier"] is not None
