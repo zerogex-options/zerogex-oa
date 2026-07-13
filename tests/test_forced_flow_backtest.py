@@ -83,6 +83,36 @@ def test_significance_requires_edge_and_a_real_sample():
     assert coin["edge_p_value"] is not None and coin["edge_p_value"] > 0.05
 
 
+def test_charm_key_selects_the_predictor():
+    # Same sessions, two predictors: full says buy every day (all hits on up
+    # days), smooth says sell every day (all misses). Proves charm_key routes
+    # to the right column and the two are scored independently.
+    sessions = [
+        {
+            "session_date": "2027-01-01",
+            "charm_flow": 1.0,
+            "charm_flow_smooth": -1.0,
+            "noon_px": 100.0,
+            "close_px": 101.0,
+        },
+        {
+            "session_date": "2027-01-02",
+            "charm_flow": 1.0,
+            "charm_flow_smooth": -1.0,
+            "noon_px": 100.0,
+            "close_px": 102.0,
+        },
+    ]
+    full = charm_backtest_summary(sessions, charm_key="charm_flow")
+    smooth = charm_backtest_summary(sessions, charm_key="charm_flow_smooth")
+    assert full["hits"] == 2 and full["hit_rate"] == 1.0
+    assert smooth["hits"] == 0 and smooth["hit_rate"] == 0.0
+    # A missing smooth value on a session drops only that session from smooth.
+    sessions[0].pop("charm_flow_smooth")
+    smooth2 = charm_backtest_summary(sessions, charm_key="charm_flow_smooth")
+    assert smooth2["total_sessions"] == 1
+
+
 def test_signal_t_stat_sign_tracks_pnl():
     win = charm_backtest_summary(
         [_session(f"2002-01-{d:02d}", 1.0, 100.0, 101.0) for d in range(1, 6)]

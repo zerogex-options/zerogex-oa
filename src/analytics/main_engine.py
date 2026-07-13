@@ -56,6 +56,7 @@ from src.analytics.forced_flow import (
     ContractLeg,
     build_legs,
     charm_flip,
+    dealer_hedge_flow,
     flow_total,
     spot_grid,
     vanna_flip,
@@ -1609,9 +1610,7 @@ class AnalyticsEngine:
             cache_key = (expiration, close_t)
             T = tte_cache.get(cache_key)
             if T is None:
-                T = calculate_time_to_expiration(
-                    timestamp, expiration, market_close_time=close_t
-                )
+                T = calculate_time_to_expiration(timestamp, expiration, market_close_time=close_t)
                 tte_cache[cache_key] = T
             if T <= 0:
                 continue
@@ -2379,9 +2378,7 @@ class AnalyticsEngine:
             cache_key = (expiration, close_t)
             T = tte_cache.get(cache_key)
             if T is None:
-                T = calculate_time_to_expiration(
-                    timestamp, expiration, market_close_time=close_t
-                )
+                T = calculate_time_to_expiration(timestamp, expiration, market_close_time=close_t)
                 tte_cache[cache_key] = T
             if T <= 0:
                 continue
@@ -3109,6 +3106,16 @@ class AnalyticsEngine:
             (level, flow_total(legs, spot, level / spot - 1.0, session_days, 0.0, r, q))
             for level in spot_grid(spot, span, step)
         ]
+        # Charm-into-close, spot held (spot move = 0, only the session's time
+        # elapses). One reprice yields both readings:
+        #   * total_usd   -- the FULL time-driven flow to the bell, which on a
+        #     0DTE-heavy chain is dominated by same-day options resolving to
+        #     intrinsic (a pin/expiry effect, and pin-sensitive).
+        #   * charm_component -- the SMOOTH first-order charm drift only; the
+        #     discontinuous resolution lands in the residual. This is the
+        #     genuine "time decay alone" number and stays correctly second-order
+        #     (smaller than gamma), unlike the full total.
+        close_ff = dealer_hedge_flow(legs, spot, 0.0, session_days, 0.0, r, q)
         return {
             "spot": float(spot),
             "span_pct": span,
@@ -3116,9 +3123,8 @@ class AnalyticsEngine:
             "charm_flip": charm_flip(legs, spot, session_days, r, q, span, step),
             "vanna_flip": vanna_flip(legs, spot, r, q, 1.0, span, step),
             "zero_flow_level": zero_flow_level(legs, spot, session_days, r, q, 0.0, span, step),
-            # Charm-into-close headline: $ dealers must trade by the bell if spot
-            # holds (spot move = 0, only the session's time elapses).
-            "close_charm_flow": flow_total(legs, spot, 0.0, session_days, 0.0, r, q),
+            "close_charm_flow": close_ff.total_usd,
+            "close_charm_flow_smooth": close_ff.charm_component,
             "curve": curve,
         }
 
@@ -3144,8 +3150,9 @@ class AnalyticsEngine:
             """
             INSERT INTO forced_flow_profile
                 (underlying, timestamp, spot_price, span_pct, session_days,
-                 charm_flip, vanna_flip, zero_flow_level, close_charm_flow, profile)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                 charm_flip, vanna_flip, zero_flow_level, close_charm_flow,
+                 close_charm_flow_smooth, profile)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
             ON CONFLICT (underlying, timestamp) DO UPDATE SET
                 spot_price = EXCLUDED.spot_price,
                 span_pct = EXCLUDED.span_pct,
@@ -3154,6 +3161,7 @@ class AnalyticsEngine:
                 vanna_flip = EXCLUDED.vanna_flip,
                 zero_flow_level = EXCLUDED.zero_flow_level,
                 close_charm_flow = EXCLUDED.close_charm_flow,
+                close_charm_flow_smooth = EXCLUDED.close_charm_flow_smooth,
                 profile = EXCLUDED.profile
             """,
             (
@@ -3166,6 +3174,7 @@ class AnalyticsEngine:
                 _f(forced_flow["vanna_flip"]),
                 _f(forced_flow["zero_flow_level"]),
                 _f(forced_flow["close_charm_flow"]),
+                _f(forced_flow.get("close_charm_flow_smooth")),
                 payload,
             ),
         )

@@ -148,12 +148,32 @@ def test_degraded_snapshot_returns_404(monkeypatch):
 
 def test_backtest_reports_hit_rate(monkeypatch):
     # /backtest is a pure DB read -- no snapshot/_load needed, so mock the
-    # session-assembling query directly.
+    # session-assembling query directly. Each session carries BOTH predictors;
+    # the smooth sign is inverted from the full sign to prove the A/B scores
+    # them independently.
     app, dbmod = _build_app(monkeypatch)
     sessions = [
-        {"session_date": "2026-07-01", "charm_flow": 5.0, "noon_px": 100.0, "close_px": 101.0},
-        {"session_date": "2026-07-02", "charm_flow": -5.0, "noon_px": 100.0, "close_px": 99.0},
-        {"session_date": "2026-07-03", "charm_flow": 5.0, "noon_px": 100.0, "close_px": 99.0},
+        {
+            "session_date": "2026-07-01",
+            "charm_flow": 5.0,
+            "charm_flow_smooth": -5.0,
+            "noon_px": 100.0,
+            "close_px": 101.0,
+        },
+        {
+            "session_date": "2026-07-02",
+            "charm_flow": -5.0,
+            "charm_flow_smooth": 5.0,
+            "noon_px": 100.0,
+            "close_px": 99.0,
+        },
+        {
+            "session_date": "2026-07-03",
+            "charm_flow": 5.0,
+            "charm_flow_smooth": -5.0,
+            "noon_px": 100.0,
+            "close_px": 99.0,
+        },
     ]
     dbmod.DatabaseManager.get_charm_backtest_sessions = AsyncMock(return_value=sessions)
     with TestClient(app) as c:
@@ -161,17 +181,18 @@ def test_backtest_reports_hit_rate(monkeypatch):
     assert r.status_code == 200
     b = r.json()
     assert b["symbol"] == "SPY" and b["lookback_days"] == 90
-    assert b["evaluated_sessions"] == 3
-    assert b["hits"] == 2
-    assert abs(b["hit_rate"] - (2 / 3)) < 1e-9
-    # Statistics are present and the tiny sample is not certified significant.
-    assert b["hit_rate_ci_low"] is not None and b["hit_rate_ci_high"] is not None
-    assert b["significant"] is False
-    assert "edge_p_value" in b and "signal_t_stat" in b
-    assert len(b["records"]) == 3
-    # Most-recent first.
-    assert b["records"][0]["date"] == "2026-07-03"
-    assert set(b["records"][0]) == {
+    full, smooth = b["full"], b["smooth"]
+    assert full["evaluated_sessions"] == 3 and full["hits"] == 2
+    assert abs(full["hit_rate"] - (2 / 3)) < 1e-9
+    # Smooth sign is inverted, so it hits exactly where full misses: 1/3.
+    assert smooth["hits"] == 1 and abs(smooth["hit_rate"] - (1 / 3)) < 1e-9
+    # Statistics present on both; the tiny sample is not certified significant.
+    assert full["hit_rate_ci_low"] is not None and full["hit_rate_ci_high"] is not None
+    assert full["significant"] is False and smooth["significant"] is False
+    assert "edge_p_value" in full and "signal_t_stat" in smooth
+    assert len(full["records"]) == 3
+    assert full["records"][0]["date"] == "2026-07-03"  # most-recent first
+    assert set(full["records"][0]) == {
         "date",
         "charm_flow",
         "return_pct",
@@ -188,5 +209,6 @@ def test_backtest_empty_history_is_200_not_404(monkeypatch):
         r = c.get("/api/forced-flow/backtest?symbol=SPY")
     assert r.status_code == 200
     b = r.json()
-    assert b["total_sessions"] == 0 and b["evaluated_sessions"] == 0
-    assert b["hit_rate"] is None and b["records"] == []
+    for variant in (b["full"], b["smooth"]):
+        assert variant["total_sessions"] == 0 and variant["evaluated_sessions"] == 0
+        assert variant["hit_rate"] is None and variant["records"] == []

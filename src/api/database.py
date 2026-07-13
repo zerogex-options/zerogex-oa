@@ -1663,9 +1663,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             async with self._acquire_connection() as conn:
                 row = await conn.fetchrow(query, symbol)
                 payload = dict(row) if row else None
-                self._cache_set(
-                    cache_key, payload, self._latest_gex_summary_cache_ttl_seconds
-                )
+                self._cache_set(cache_key, payload, self._latest_gex_summary_cache_ttl_seconds)
                 return payload
         except Exception as e:
             logger.error(f"Error fetching forced flow: {e}", exc_info=True)
@@ -1702,7 +1700,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             WITH morning AS (
                 SELECT DISTINCT ON (d)
                     (timestamp AT TIME ZONE 'America/New_York')::date AS d,
-                    close_charm_flow AS charm_flow
+                    close_charm_flow AS charm_flow,
+                    close_charm_flow_smooth AS charm_flow_smooth
                 FROM forced_flow_profile
                 WHERE underlying = $1
                   AND close_charm_flow IS NOT NULL
@@ -1735,6 +1734,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             )
             SELECT m.d AS session_date,
                    m.charm_flow,
+                   m.charm_flow_smooth,
                    n.noon_px,
                    c.close_px
             FROM morning m
@@ -1878,9 +1878,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching GEX by strike: {e}", exc_info=True)
             raise
 
-    async def get_gex_summary_at_ts(
-        self, symbol: str, at_ts: datetime
-    ) -> Optional[Dict[str, Any]]:
+    async def get_gex_summary_at_ts(self, symbol: str, at_ts: datetime) -> Optional[Dict[str, Any]]:
         """Most recent ``gex_summary`` row at or before ``at_ts``.
 
         Used by the replay endpoints to anchor a per-minute frame against
@@ -1907,7 +1905,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 return dict(row) if row else None
         except Exception as e:
             logger.warning(
-                "get_gex_summary_at_ts(%s, %s) failed: %s", symbol, at_ts, e,
+                "get_gex_summary_at_ts(%s, %s) failed: %s",
+                symbol,
+                at_ts,
+                e,
             )
             return None
 
@@ -1961,12 +1962,18 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 return [dict(r) for r in rows]
         except Exception as e:
             logger.warning(
-                "get_gex_by_strike_at_ts(%s, %s) failed: %s", symbol, at_ts, e,
+                "get_gex_by_strike_at_ts(%s, %s) failed: %s",
+                symbol,
+                at_ts,
+                e,
             )
             return []
 
     async def get_gex_frames_for_session(
-        self, symbol: str, session_date: date, strike_band_pct: float = 0.04,
+        self,
+        symbol: str,
+        session_date: date,
+        strike_band_pct: float = 0.04,
     ) -> List[Dict[str, Any]]:
         """Every per-minute GEX frame for one cash-session date (09:30-16:00 ET).
 
@@ -2037,12 +2044,18 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         try:
             async with self._acquire_connection() as conn:
                 rows = await conn.fetch(
-                    query, symbol, start_utc, end_utc, float(strike_band_pct),
+                    query,
+                    symbol,
+                    start_utc,
+                    end_utc,
+                    float(strike_band_pct),
                 )
         except Exception as e:
             logger.warning(
                 "get_gex_frames_for_session(%s, %s) failed: %s",
-                symbol, session_date, e,
+                symbol,
+                session_date,
+                e,
             )
             return []
 
@@ -2057,14 +2070,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                     "strikes": [],
                 }
             if r["strike"] is not None:
-                frames[ts]["strikes"].append(
-                    {"strike": r["strike"], "net_gex": r["net_gex"]}
-                )
+                frames[ts]["strikes"].append({"strike": r["strike"], "net_gex": r["net_gex"]})
         return list(frames.values())
 
-    async def get_replay_session_dates(
-        self, symbol: str, limit: int = 30
-    ) -> List[Dict[str, Any]]:
+    async def get_replay_session_dates(self, symbol: str, limit: int = 30) -> List[Dict[str, Any]]:
         """Distinct trading dates that have ``gex_summary`` rows, newest first.
 
         Used by the replay date picker. Returns up to ``limit`` dates with
@@ -2091,12 +2100,16 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 return [dict(r) for r in rows]
         except Exception as e:
             logger.warning(
-                "get_replay_session_dates(%s) failed: %s", symbol, e,
+                "get_replay_session_dates(%s) failed: %s",
+                symbol,
+                e,
             )
             return []
 
     async def get_underlying_candles_for_session(
-        self, symbol: str, session_date: date,
+        self,
+        symbol: str,
+        session_date: date,
     ) -> List[Dict[str, Any]]:
         """Per-minute OHLC bars for the underlying over one cash session.
 
@@ -2141,7 +2154,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         except Exception as e:
             logger.warning(
                 "get_underlying_candles_for_session(%s, %s) failed: %s",
-                symbol, session_date, e,
+                symbol,
+                session_date,
+                e,
             )
             return []
 
@@ -2174,7 +2189,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         except Exception as e:
             logger.warning(
                 "get_underlying_bars_for_session(%s, %s) failed: %s",
-                symbol, session_date, e,
+                symbol,
+                session_date,
+                e,
             )
             return []
 
@@ -2422,9 +2439,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 # Index rows by (metric, window) -> {tod_bucket -> stats}.
                 by_key: Dict[Tuple[str, str], Dict[int, Dict[str, Any]]] = {}
                 for r in rows:
-                    by_key.setdefault((r["metric"], r["window_label"]), {})[
-                        r["tod_bucket"]
-                    ] = dict(r)
+                    by_key.setdefault((r["metric"], r["window_label"]), {})[r["tod_bucket"]] = dict(
+                        r
+                    )
 
                 metrics_out: Dict[str, Any] = {}
                 for metric_name in ("net_gex_at_spot", "total_net_gex"):
@@ -4160,9 +4177,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 logger.warning("Invalid date in NYSE_HALF_DAYS: %r", token)
         return out
 
-    async def compute_live_session_levels(
-        self, symbol: str, trading_date: date
-    ) -> Dict[str, Any]:
+    async def compute_live_session_levels(self, symbol: str, trading_date: date) -> Dict[str, Any]:
         """Aggregate pre-market + previous-session high/low from 1-min bars.
 
         Computes, directly from ``underlying_quotes``:
@@ -4323,9 +4338,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 )
                 asset_type = asset_row["asset_type"] if asset_row else None
                 is_index = (
-                    asset_type == "INDEX"
-                    if asset_type is not None
-                    else is_cash_index(symbol)
+                    asset_type == "INDEX" if asset_type is not None else is_cash_index(symbol)
                 )
 
                 if is_index:
@@ -4414,12 +4427,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             if live is not None:
                 live_high = _f(live.get("premarket_high"))
                 live_low = _f(live.get("premarket_low"))
-                merged_high = max(
-                    (v for v in (pm_high, live_high) if v is not None), default=None
-                )
-                merged_low = min(
-                    (v for v in (pm_low, live_low) if v is not None), default=None
-                )
+                merged_high = max((v for v in (pm_high, live_high) if v is not None), default=None)
+                merged_low = min((v for v in (pm_low, live_low) if v is not None), default=None)
                 if (merged_high, merged_low) != (pm_high, pm_low):
                     source = "captured+live"
                 pm_high, pm_low = merged_high, merged_low

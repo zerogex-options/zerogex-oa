@@ -521,15 +521,20 @@ def _accuracy_beats_baseline_p(hits: int, n: int, baseline: float) -> Optional[f
     return 1.0 - _normal_cdf(z)
 
 
-def charm_backtest_summary(sessions: Sequence[dict], recent_limit: int = 90) -> dict:
+def charm_backtest_summary(
+    sessions: Sequence[dict], recent_limit: int = 90, charm_key: str = "charm_flow"
+) -> dict:
     """Honest hit-rate of the Charm-into-Close forecast.
 
     The single testable claim behind the headline "time decay alone forces
-    dealers to buy/sell $X by 4pm": if the morning ``close_charm_flow`` sign
-    (dealers must BUY -> ``+``, must SELL -> ``-``) has any edge, it should lean
-    the same way as the actual noon->close return. This aggregates one row per
-    session -- each a dict with ``session_date``, ``charm_flow`` (the morning
-    read), ``noon_px`` and ``close_px`` -- into a hit rate.
+    dealers to buy/sell $X by 4pm": if the morning charm sign (dealers must
+    BUY -> ``+``, must SELL -> ``-``) has any edge, it should lean the same way
+    as the actual noon->close return. This aggregates one row per session --
+    each a dict with ``session_date``, the predictor under ``charm_key``,
+    ``noon_px`` and ``close_px`` -- into a hit rate. ``charm_key`` selects which
+    forecast to score: ``charm_flow`` (the full 0DTE-inclusive close flow) or
+    ``charm_flow_smooth`` (the first-order charm only), so the two definitions
+    can be A/B'd over identical sessions.
 
     It is deliberately unflattering by construction:
 
@@ -559,7 +564,7 @@ def charm_backtest_summary(sessions: Sequence[dict], recent_limit: int = 90) -> 
     for row in sessions:
         noon = float(row["noon_px"])
         close = float(row["close_px"])
-        charm = row.get("charm_flow")
+        charm = row.get(charm_key)
         if noon <= 0 or charm is None:
             continue
         total += 1

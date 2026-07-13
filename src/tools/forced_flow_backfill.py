@@ -172,12 +172,14 @@ def backfill_symbol(
                 skipped += 1
                 continue
             ccf = forced_flow.get("close_charm_flow")
+            smooth = forced_flow.get("close_charm_flow_smooth")
             logger.info(
-                "  %s: spot %.2f, %d legs, close_charm_flow %s%s",
+                "  %s: spot %.2f, %d legs, close_charm_flow %s (smooth %s)%s",
                 ts.isoformat(),
                 spot,
                 len(options),
                 f"${ccf:,.0f}" if ccf is not None else "n/a",
+                f"${smooth:,.0f}" if smooth is not None else "n/a",
                 " (dry-run)" if dry_run else "",
             )
             if not dry_run:

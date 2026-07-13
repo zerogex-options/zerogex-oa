@@ -246,9 +246,7 @@ class BacktestRecord(BaseModel):
     hit: bool
 
 
-class BacktestResponse(BaseModel):
-    symbol: str
-    lookback_days: int
+class BacktestVariant(BaseModel):
     total_sessions: int
     evaluated_sessions: int
     hits: int
@@ -262,6 +260,16 @@ class BacktestResponse(BaseModel):
     signal_mean_return: Optional[float] = None
     signal_t_stat: Optional[float] = None
     records: List[BacktestRecord]
+
+
+class BacktestResponse(BaseModel):
+    symbol: str
+    lookback_days: int
+    # Two forecast definitions scored over identical sessions, so the honest
+    # A/B is visible: ``full`` is the 0DTE-inclusive close flow (dominated by
+    # same-day expiry resolution), ``smooth`` is the first-order charm only.
+    full: BacktestVariant
+    smooth: BacktestVariant
 
 
 # --------------------------------------------------------------------------- #
@@ -529,9 +537,11 @@ async def get_backtest(
 
     Reads the persisted ``forced_flow_profile`` + ``underlying_quotes`` history
     and reports the hit rate against a naive directional baseline -- honestly,
-    including when the sample is thin or the edge is nil. Returns 200 with zeroed
-    counts (not 404) before enough sessions have accrued, so the page can show
-    an honest "collecting" state rather than an error.
+    including when the sample is thin or the edge is nil. Scores TWO forecast
+    definitions over identical sessions (``full`` = 0DTE-inclusive close flow;
+    ``smooth`` = first-order charm only) so the A/B is visible. Returns 200 with
+    zeroed counts (not 404) before enough sessions have accrued, so the page can
+    show an honest "collecting" state rather than an error.
     """
     sym = symbol.upper()
     key = ("backtest", sym, lookback_days)
@@ -543,6 +553,11 @@ async def get_backtest(
     except Exception as e:  # pragma: no cover - defensive
         logger.error("forced-flow backtest failed for %s: %s", sym, e, exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
-    data = {"symbol": sym, "lookback_days": lookback_days, **charm_backtest_summary(sessions)}
+    data = {
+        "symbol": sym,
+        "lookback_days": lookback_days,
+        "full": charm_backtest_summary(sessions, charm_key="charm_flow"),
+        "smooth": charm_backtest_summary(sessions, charm_key="charm_flow_smooth"),
+    }
     _cache_put(key, data)
     return BacktestResponse(**data)
