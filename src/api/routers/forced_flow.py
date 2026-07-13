@@ -58,6 +58,18 @@ _ENDPOINT_MIN_LOOKBACK_HOURS = 4
 _CURVE_STEP_PCT = 0.0025
 _SURFACE_STEP_PCT = 0.01
 _RESPONSE_CACHE_TTL_SECONDS = 30.0
+# Effective time-to-expiry floor (30 minutes, in years) for the SPOT-MOVE views
+# (curve / surface / levels / vanna-ladder / scenario). Standard desk
+# regularization against the T->0 gamma singularity: without it, a wide reprice
+# in the final minutes -- or off a near-close snapshot -- settles the whole 0DTE
+# book as a step function and the numbers blow up. Charm-into-Close is
+# deliberately NOT floored (it is *about* the into-the-bell resolution).
+_SCENARIO_MIN_TTE_YEARS = 30.0 / (365.0 * 24.0 * 60.0)
+# Default +/- view span for the curve / surface. Kept tight because a wide span
+# on an index walks spot far enough to settle the entire same-day book, which
+# dominates the wings; the actionable gamma structure lives near spot. Callers
+# can widen via the query param.
+_DEFAULT_VIEW_SPAN_PCT = 0.02
 
 _cache: Dict[tuple, Dict[str, Any]] = {}
 _cache_lock = threading.Lock()
@@ -279,7 +291,9 @@ class BacktestResponse(BaseModel):
 async def get_curve(
     symbol: str = Query(default="SPY", description="Underlying symbol"),
     expiry: Optional[str] = Query(default=None, description="ISO expiry to isolate, else all"),
-    spot_range_pct: float = Query(default=0.05, gt=0.0, le=0.5, description="+/- span, fraction"),
+    spot_range_pct: float = Query(
+        default=_DEFAULT_VIEW_SPAN_PCT, gt=0.0, le=0.5, description="+/- span, fraction"
+    ),
     vol_change_pts: float = Query(default=0.0, ge=-20.0, le=20.0),
     horizon_days: Optional[float] = Query(
         default=None, ge=0.0, le=30.0, description="Horizon in days; default = to today's close"
@@ -307,6 +321,7 @@ def _curve_sync(sym, expiry, spot_range_pct, vol_change_pts, horizon_days):
         ctx["q"],
         span_pct=spot_range_pct,
         step_pct=_CURVE_STEP_PCT,
+        min_tte_years=_SCENARIO_MIN_TTE_YEARS,
     )
     zfl = zero_flow_level(
         ctx["legs"],
@@ -317,6 +332,7 @@ def _curve_sync(sym, expiry, spot_range_pct, vol_change_pts, horizon_days):
         vol_change_pts,
         spot_range_pct,
         _CURVE_STEP_PCT,
+        _SCENARIO_MIN_TTE_YEARS,
     )
     return {
         "symbol": sym,
@@ -388,7 +404,16 @@ def _vanna_ladder_sync(sym, expiry, lo_pts, hi_pts, step_pts):
     ctx = _load(sym, expiry)
     if ctx is None:
         return None
-    ladder = vanna_ladder(ctx["legs"], ctx["spot"], ctx["r"], ctx["q"], lo_pts, hi_pts, step_pts)
+    ladder = vanna_ladder(
+        ctx["legs"],
+        ctx["spot"],
+        ctx["r"],
+        ctx["q"],
+        lo_pts,
+        hi_pts,
+        step_pts,
+        _SCENARIO_MIN_TTE_YEARS,
+    )
     return {
         "symbol": sym,
         "spot": ctx["spot"],
@@ -401,7 +426,7 @@ def _vanna_ladder_sync(sym, expiry, lo_pts, hi_pts, step_pts):
 async def get_surface(
     symbol: str = Query(default="SPY"),
     expiry: Optional[str] = Query(default=None),
-    spot_range_pct: float = Query(default=0.05, gt=0.0, le=0.5),
+    spot_range_pct: float = Query(default=_DEFAULT_VIEW_SPAN_PCT, gt=0.0, le=0.5),
     time_steps: int = Query(default=8, ge=1, le=48),
     db: DatabaseManager = Depends(get_db),
 ):
@@ -420,7 +445,16 @@ def _surface_sync(sym, expiry, spot_range_pct, time_steps):
     times = [ctx["session_days"] * i / time_steps for i in range(time_steps + 1)]
     z = [
         [
-            flow_total(ctx["legs"], ctx["spot"], s / ctx["spot"] - 1.0, t, 0.0, ctx["r"], ctx["q"])
+            flow_total(
+                ctx["legs"],
+                ctx["spot"],
+                s / ctx["spot"] - 1.0,
+                t,
+                0.0,
+                ctx["r"],
+                ctx["q"],
+                _SCENARIO_MIN_TTE_YEARS,
+            )
             for t in times
         ]
         for s in spots
@@ -456,7 +490,14 @@ def _scenario_sync(sym, expiry, spot_move_pct, days, vol_change_pts):
     if ctx is None:
         return None
     ff = dealer_hedge_flow(
-        ctx["legs"], ctx["spot"], spot_move_pct, days, vol_change_pts, ctx["r"], ctx["q"]
+        ctx["legs"],
+        ctx["spot"],
+        spot_move_pct,
+        days,
+        vol_change_pts,
+        ctx["r"],
+        ctx["q"],
+        _SCENARIO_MIN_TTE_YEARS,
     )
     return {
         "symbol": sym,
@@ -516,10 +557,24 @@ def _levels_sync(sym):
         "symbol": sym,
         "spot": ctx["spot"],
         "timestamp": ctx["timestamp"],
-        "charm_flip": charm_flip(ctx["legs"], ctx["spot"], ctx["session_days"], ctx["r"], ctx["q"]),
-        "vanna_flip": vanna_flip(ctx["legs"], ctx["spot"], ctx["r"], ctx["q"]),
+        "charm_flip": charm_flip(
+            ctx["legs"],
+            ctx["spot"],
+            ctx["session_days"],
+            ctx["r"],
+            ctx["q"],
+            min_tte_years=_SCENARIO_MIN_TTE_YEARS,
+        ),
+        "vanna_flip": vanna_flip(
+            ctx["legs"], ctx["spot"], ctx["r"], ctx["q"], min_tte_years=_SCENARIO_MIN_TTE_YEARS
+        ),
         "zero_flow_level": zero_flow_level(
-            ctx["legs"], ctx["spot"], ctx["session_days"], ctx["r"], ctx["q"]
+            ctx["legs"],
+            ctx["spot"],
+            ctx["session_days"],
+            ctx["r"],
+            ctx["q"],
+            min_tte_years=_SCENARIO_MIN_TTE_YEARS,
         ),
     }
 

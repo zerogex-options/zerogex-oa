@@ -120,7 +120,14 @@ def build_legs(rows: Sequence[dict], tte_of: Callable[[dict], float]) -> List[Co
 
 
 def _scenario_delta(
-    S: float, K: float, T: float, r: float, sigma: float, option_type: str, q: float
+    S: float,
+    K: float,
+    T: float,
+    r: float,
+    sigma: float,
+    option_type: str,
+    q: float,
+    min_tte_years: float = 0.0,
 ) -> float:
     """Delta under a scenario, resolving to intrinsic once the contract expires.
 
@@ -129,7 +136,16 @@ def _scenario_delta(
     the intrinsic delta of the settled contract (a call is +1 in-the-money else
     0; a put is -1 in-the-money else 0), which is the hedge a resolved position
     actually requires.
+
+    ``min_tte_years`` floors the effective time-to-expiry -- the standard desk
+    regularization against the T->0 gamma singularity. It is 0 (off) by default,
+    so the true-to-the-bell resolution above is preserved for Charm-into-Close;
+    the spot-move display endpoints pass a small floor so a wide reprice does not
+    blow up in the final minutes. When the floor binds, delta stays smooth
+    (Black-Scholes at the floor) instead of snapping to a 0/1 step.
     """
+    if min_tte_years > 0.0 and T < min_tte_years:
+        T = min_tte_years
     if T <= 0:
         if option_type == "C":
             return 1.0 if S > K else 0.0
@@ -144,11 +160,13 @@ def _aggregate_dealer_delta(
     vol_change_pts: float,
     r: float,
     q: float,
+    min_tte_years: float = 0.0,
 ) -> float:
     """Model-A aggregate dealer delta (shares) under (spot, +days, +vol points).
 
     ``sign = +1`` for calls, ``-1`` for puts -- the GEX convention, so the
-    spot-derivative of this equals the shipped dealer gamma.
+    spot-derivative of this equals the shipped dealer gamma. ``min_tte_years``
+    floors the effective time-to-expiry (see :func:`_scenario_delta`).
     """
     vol_shift = vol_change_pts * VANNA_H_VOL  # vol points -> absolute sigma
     total = 0.0
@@ -158,7 +176,7 @@ def _aggregate_dealer_delta(
             sigma = _MIN_SIGMA
         tte = leg.tte_years - days_elapsed / 365.0
         sign = 1.0 if leg.option_type == "C" else -1.0
-        delta = _scenario_delta(spot, leg.strike, tte, r, sigma, leg.option_type, q)
+        delta = _scenario_delta(spot, leg.strike, tte, r, sigma, leg.option_type, q, min_tte_years)
         total += sign * delta * leg.open_interest * CONTRACT_MULTIPLIER
     return total
 
@@ -169,29 +187,29 @@ def _dealer_greek_shares(
     greek: str,
     r: float,
     q: float,
+    min_tte_years: float = 0.0,
 ) -> float:
     """First-order model-A dealer greek in *shares per unit driver*, at the
     current state -- used only for attribution.
 
     ``greek`` is one of: 'gamma' (per $1 of spot), 'charm' (per calendar day),
-    'vanna' (per 1 vol point).
+    'vanna' (per 1 vol point). ``min_tte_years`` floors the effective
+    time-to-expiry so the greeks stay finite in the final minutes.
     """
     total = 0.0
     bump = spot * _GAMMA_BUMP_FRAC
     for leg in legs:
         sign = 1.0 if leg.option_type == "C" else -1.0
+        tte = max(leg.tte_years, min_tte_years) if min_tte_years > 0.0 else leg.tte_years
         if greek == "gamma":
-            up = bsm_delta(spot + bump, leg.strike, leg.tte_years, r, leg.iv, leg.option_type, q)
-            dn = bsm_delta(spot - bump, leg.strike, leg.tte_years, r, leg.iv, leg.option_type, q)
+            up = bsm_delta(spot + bump, leg.strike, tte, r, leg.iv, leg.option_type, q)
+            dn = bsm_delta(spot - bump, leg.strike, tte, r, leg.iv, leg.option_type, q)
             g = (up - dn) / (2.0 * bump)
         elif greek == "charm":
-            g = fd_charm(spot, leg.strike, leg.tte_years, r, leg.iv, leg.option_type, q)
+            g = fd_charm(spot, leg.strike, tte, r, leg.iv, leg.option_type, q)
         elif greek == "vanna":
             # fd_vanna is per unit sigma; scale to per one vol point.
-            g = (
-                fd_vanna(spot, leg.strike, leg.tte_years, r, leg.iv, leg.option_type, q)
-                * VANNA_H_VOL
-            )
+            g = fd_vanna(spot, leg.strike, tte, r, leg.iv, leg.option_type, q) * VANNA_H_VOL
         else:  # pragma: no cover - guarded by callers
             raise ValueError(f"unknown greek {greek!r}")
         total += sign * g * leg.open_interest * CONTRACT_MULTIPLIER
@@ -206,15 +224,20 @@ def flow_total(
     vol_change_pts: float,
     r: float,
     q: float = 0.0,
+    min_tte_years: float = 0.0,
 ) -> float:
     """Exact dealer hedge flow (USD) by full reprice, WITHOUT the attribution.
 
     The fast path for grid work (curves, flip levels) that needs only the total.
     :func:`dealer_hedge_flow` wraps this and adds the first-order breakdown.
+    ``min_tte_years`` floors the effective time-to-expiry (see
+    :func:`_scenario_delta`); 0 (off) by default.
     """
     spot_scn = spot * (1.0 + spot_move_pct)
-    dd_now = _aggregate_dealer_delta(legs, spot, 0.0, 0.0, r, q)
-    dd_scn = _aggregate_dealer_delta(legs, spot_scn, days_elapsed, vol_change_pts, r, q)
+    dd_now = _aggregate_dealer_delta(legs, spot, 0.0, 0.0, r, q, min_tte_years)
+    dd_scn = _aggregate_dealer_delta(
+        legs, spot_scn, days_elapsed, vol_change_pts, r, q, min_tte_years
+    )
     return -(dd_scn - dd_now) * spot_scn
 
 
@@ -226,6 +249,7 @@ def dealer_hedge_flow(
     vol_change_pts: float,
     r: float,
     q: float = 0.0,
+    min_tte_years: float = 0.0,
 ) -> ForcedFlow:
     """Dollars of STOCK dealers must BUY (+) or SELL (-) to stay delta-flat.
 
@@ -236,19 +260,21 @@ def dealer_hedge_flow(
         days_elapsed: scenario calendar days that pass.
         vol_change_pts: scenario IV shift in vol points (+1 == +0.01 sigma).
         r: risk-free rate. q: dividend yield.
+        min_tte_years: floor on effective time-to-expiry (see
+            :func:`_scenario_delta`); 0 (off) by default.
 
     Returns the exact total (full reprice) plus first-order attribution.
     """
     spot_scn = spot * (1.0 + spot_move_pct)
-    total = flow_total(legs, spot, spot_move_pct, days_elapsed, vol_change_pts, r, q)
+    total = flow_total(legs, spot, spot_move_pct, days_elapsed, vol_change_pts, r, q, min_tte_years)
 
     # First-order attribution around the current state. Each term is the change
     # in dealer delta along one axis, dollarized with the scenario spot so the
     # three components and the exact total share one price basis.
     d_spot = spot * spot_move_pct
-    gamma_shares = _dealer_greek_shares(legs, spot, "gamma", r, q)
-    charm_shares = _dealer_greek_shares(legs, spot, "charm", r, q)
-    vanna_shares = _dealer_greek_shares(legs, spot, "vanna", r, q)
+    gamma_shares = _dealer_greek_shares(legs, spot, "gamma", r, q, min_tte_years)
+    charm_shares = _dealer_greek_shares(legs, spot, "charm", r, q, min_tte_years)
+    vanna_shares = _dealer_greek_shares(legs, spot, "vanna", r, q, min_tte_years)
 
     gamma_component = -gamma_shares * d_spot * spot_scn
     charm_component = -charm_shares * days_elapsed * spot_scn
@@ -285,17 +311,26 @@ def forced_flow_curve(
     q: float = 0.0,
     span_pct: float = 0.05,
     step_pct: float = 0.0025,
+    min_tte_years: float = 0.0,
 ) -> List[Tuple[float, ForcedFlow]]:
     """The Forced Flow Curve: flow required to end the horizon at each spot level.
 
     Each point is the flow to move from ``spot`` to the grid level over
     ``days_elapsed`` with ``vol_change_pts``. The zero of ``total_usd`` is the
-    zero-flow level.
+    zero-flow level. ``min_tte_years`` floors the effective time-to-expiry so a
+    wide reprice stays finite in the final minutes (see :func:`_scenario_delta`).
     """
     out: List[Tuple[float, ForcedFlow]] = []
     for level in spot_grid(spot, span_pct, step_pct):
         move = level / spot - 1.0
-        out.append((level, dealer_hedge_flow(legs, spot, move, days_elapsed, vol_change_pts, r, q)))
+        out.append(
+            (
+                level,
+                dealer_hedge_flow(
+                    legs, spot, move, days_elapsed, vol_change_pts, r, q, min_tte_years
+                ),
+            )
+        )
     return out
 
 
@@ -327,13 +362,18 @@ def vanna_ladder(
     lo_pts: float = -3.0,
     hi_pts: float = 3.0,
     step_pts: float = 0.5,
+    min_tte_years: float = 0.0,
 ) -> List[Tuple[float, float]]:
-    """Vanna Ladder: flow vs. IV change (vol points), spot and time held fixed."""
+    """Vanna Ladder: flow vs. IV change (vol points), spot and time held fixed.
+
+    ``min_tte_years`` floors the effective time-to-expiry (see
+    :func:`_scenario_delta`).
+    """
     out: List[Tuple[float, float]] = []
     n = int(round((hi_pts - lo_pts) / step_pts))
     for i in range(n + 1):
         dv = lo_pts + i * step_pts
-        out.append((dv, flow_total(legs, spot, 0.0, 0.0, dv, r, q)))
+        out.append((dv, flow_total(legs, spot, 0.0, 0.0, dv, r, q, min_tte_years)))
     return out
 
 
@@ -377,12 +417,13 @@ def charm_flip(
     q: float = 0.0,
     span_pct: float = 0.05,
     step_pct: float = 0.0025,
+    min_tte_years: float = 0.0,
 ) -> Optional[float]:
     """Spot at which time-decay-driven hedging changes sign."""
     return _level_from_spot_axis(
         legs,
         spot,
-        lambda level: flow_total(legs, level, 0.0, session_days, 0.0, r, q),
+        lambda level: flow_total(legs, level, 0.0, session_days, 0.0, r, q, min_tte_years),
         span_pct,
         step_pct,
     )
@@ -396,12 +437,13 @@ def vanna_flip(
     probe_pts: float = 1.0,
     span_pct: float = 0.05,
     step_pct: float = 0.0025,
+    min_tte_years: float = 0.0,
 ) -> Optional[float]:
     """Spot at which vol-driven hedging changes sign (probed with +1 vol point)."""
     return _level_from_spot_axis(
         legs,
         spot,
-        lambda level: flow_total(legs, level, 0.0, 0.0, probe_pts, r, q),
+        lambda level: flow_total(legs, level, 0.0, 0.0, probe_pts, r, q, min_tte_years),
         span_pct,
         step_pct,
     )
@@ -416,6 +458,7 @@ def zero_flow_level(
     vol_change_pts: float = 0.0,
     span_pct: float = 0.05,
     step_pct: float = 0.0025,
+    min_tte_years: float = 0.0,
 ) -> Optional[float]:
     """Spot where TOTAL forced flow over the session is zero.
 
@@ -423,7 +466,12 @@ def zero_flow_level(
     have nothing to do. It is the zero of the Forced Flow Curve.
     """
     points = [
-        (level, flow_total(legs, spot, level / spot - 1.0, session_days, vol_change_pts, r, q))
+        (
+            level,
+            flow_total(
+                legs, spot, level / spot - 1.0, session_days, vol_change_pts, r, q, min_tte_years
+            ),
+        )
         for level in spot_grid(spot, span_pct, step_pct)
     ]
     return _nearest_crossing(points, spot)

@@ -224,3 +224,32 @@ def test_combine_flow_sources_is_additive():
     )
     assert combine_flow_sources(ff) == 1_000_000.0
     assert combine_flow_sources(ff, 250_000.0) == 1_250_000.0
+
+
+# --------------------------------------------------------------------------- #
+# Near-expiry time-to-expiry floor (the reprice regularization)
+# --------------------------------------------------------------------------- #
+from src.analytics.forced_flow import _scenario_delta, flow_total  # noqa: E402
+
+_FLOOR_30MIN = 30.0 / (365.0 * 24.0 * 60.0)
+
+
+def test_min_tte_floor_is_inert_by_default_and_for_longer_dated():
+    # No floor is the default; passing 0.0 must be identical.
+    a = flow_total(BOOK, 100.0, 0.02, 5.0, 0.0, R)
+    b = flow_total(BOOK, 100.0, 0.02, 5.0, 0.0, R, 0.0, 0.0)
+    assert a == b
+    # A 30-minute floor is EXACTLY inert on a book whose tte >> floor (30 DTE),
+    # so the regularization only ever touches near-expiry contracts.
+    c = flow_total(BOOK, 100.0, 0.02, 5.0, 0.0, R, 0.0, _FLOOR_30MIN)
+    assert a == c
+
+
+def test_min_tte_floor_smooths_the_expiry_step():
+    # At the bell (T -> 0) with spot exactly at the strike, the unfloored
+    # scenario snaps to the intrinsic 0/1 step (a knife-edge). Floored, delta
+    # stays a smooth Black-Scholes value strictly inside (0, 1).
+    resolved = _scenario_delta(100.0, 100.0, 0.0, R, 0.15, "C", 0.0)
+    floored = _scenario_delta(100.0, 100.0, 0.0, R, 0.15, "C", 0.0, _FLOOR_30MIN)
+    assert resolved == 0.0  # S is not > K -> hard 0
+    assert 0.0 < floored < 1.0  # regularized -> no step
