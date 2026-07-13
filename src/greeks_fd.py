@@ -37,8 +37,23 @@ existing GEX dollar-gamma constant so nothing is reimplemented.
 
 from __future__ import annotations
 
-import numpy as np
-from scipy import stats
+import math
+
+# 1/sqrt(2) -- precomputed for the erf-based normal CDF below.
+_INV_SQRT2: float = 1.0 / math.sqrt(2.0)
+
+
+def _norm_cdf(x: float) -> float:
+    """Standard-normal CDF via ``math.erf`` -- N(x) = 0.5*(1 + erf(x/sqrt(2))).
+
+    Accurate to ~1e-15 (identical to ``scipy.stats.norm.cdf`` to machine
+    precision) but ~50-100x faster per scalar call: no SciPy frozen-distribution
+    dispatch, no NumPy scalar boxing. This matters because :func:`bsm_delta` is
+    called hundreds of thousands of times per analytics cycle by the forced-flow
+    grid scans.
+    """
+    return 0.5 * (1.0 + math.erf(x * _INV_SQRT2))
+
 
 # Finite-difference step sizes (spec 5.1). One calendar day of time; one
 # volatility point of IV. Chosen so the *output units* are the ones we want
@@ -73,15 +88,13 @@ def bsm_delta(
     if S <= 0 or K <= 0 or sigma <= 0 or T <= 0:
         return 0.0
 
-    d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-    discount = np.exp(-q * T)
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    discount = math.exp(-q * T)
 
     if option_type == "C":
-        delta = discount * stats.norm.cdf(d1)
-    else:  # Put
-        delta = discount * (stats.norm.cdf(d1) - 1)
-
-    return float(delta)
+        return discount * _norm_cdf(d1)
+    # Put
+    return discount * (_norm_cdf(d1) - 1.0)
 
 
 def fd_vanna(

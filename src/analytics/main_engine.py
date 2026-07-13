@@ -55,12 +55,7 @@ from src.greeks_fd import fd_charm, fd_vanna
 from src.analytics.forced_flow import (
     ContractLeg,
     build_legs,
-    charm_flip,
     dealer_hedge_flow,
-    flow_total,
-    spot_grid,
-    vanna_flip,
-    zero_flow_level,
 )
 from src.flow_series_sql import SNAPSHOT_UPSERT_PSYCOPG2, SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2
 from src.market_calendar import (
@@ -72,12 +67,6 @@ from src.market_calendar import (
     seconds_until_engine_run_window,
     settlement_close_time_for_contract,
 )
-
-# Forced-flow reprice grid (Phase 2): +/- 5% of spot in 0.5% steps. Kept modest
-# so the per-cycle reprice stays cheap; the /forced-flow API can use a finer
-# grid on demand. Vectorizing the reprice over the grid is a follow-up.
-_FORCED_FLOW_SPAN_PCT = 0.05
-_FORCED_FLOW_STEP_PCT = 0.005
 
 logger = get_logger(__name__)
 
@@ -3101,31 +3090,22 @@ class AnalyticsEngine:
 
         r, q = self.risk_free_rate, self.dividend_yield
         session_days = self._session_days_remaining(timestamp)
-        span, step = _FORCED_FLOW_SPAN_PCT, _FORCED_FLOW_STEP_PCT
-        curve = [
-            (level, flow_total(legs, spot, level / spot - 1.0, session_days, 0.0, r, q))
-            for level in spot_grid(spot, span, step)
-        ]
-        # Charm-into-close, spot held (spot move = 0, only the session's time
-        # elapses). One reprice yields both readings:
-        #   * total_usd   -- the FULL time-driven flow to the bell, which on a
-        #     0DTE-heavy chain is dominated by same-day options resolving to
-        #     intrinsic (a pin/expiry effect, and pin-sensitive).
-        #   * charm_component -- the SMOOTH first-order charm drift only; the
-        #     discontinuous resolution lands in the residual. This is the
-        #     genuine "time decay alone" number and stays correctly second-order
-        #     (smaller than gamma), unlike the full total.
+        # Compute ONLY the Charm-into-Close reading -- it is the only field any
+        # consumer reads (the Bulletin and the track-record backtest use
+        # close_charm_flow / _smooth). The reprice curve and the charm/vanna/
+        # zero-flow levels are recomputed fresh, on demand, by the /forced-flow
+        # endpoints, so persisting them here was pure work nothing read and the
+        # dominant cost of the analytics cycle (four grid scans x every symbol x
+        # every cycle). One spot-held dealer_hedge_flow yields both readings:
+        #   * total_usd       -- the FULL time-driven flow to the bell (on a
+        #     0DTE-heavy chain, dominated by same-day options settling), and
+        #   * charm_component -- the SMOOTH first-order charm drift only.
         close_ff = dealer_hedge_flow(legs, spot, 0.0, session_days, 0.0, r, q)
         return {
             "spot": float(spot),
-            "span_pct": span,
             "session_days": session_days,
-            "charm_flip": charm_flip(legs, spot, session_days, r, q, span, step),
-            "vanna_flip": vanna_flip(legs, spot, r, q, 1.0, span, step),
-            "zero_flow_level": zero_flow_level(legs, spot, session_days, r, q, 0.0, span, step),
             "close_charm_flow": close_ff.total_usd,
             "close_charm_flow_smooth": close_ff.charm_component,
-            "curve": curve,
         }
 
     def _store_forced_flow(
@@ -3139,8 +3119,12 @@ class AnalyticsEngine:
             return
         import json as _json
 
+        # The curve + charm/vanna/zero-flow levels are no longer computed on the
+        # analytics path (the /forced-flow endpoints recompute them live); they
+        # persist as NULL / empty here. Only close_charm_flow(_smooth) is read
+        # downstream. Kept in the schema for compatibility and possible reuse.
         payload = _json.dumps(
-            [{"price": float(s), "flow": float(f)} for s, f in forced_flow["curve"]]
+            [{"price": float(s), "flow": float(f)} for s, f in forced_flow.get("curve", [])]
         )
 
         def _f(x: Optional[float]) -> Optional[float]:
@@ -3168,11 +3152,11 @@ class AnalyticsEngine:
                 summary["underlying"],
                 summary["timestamp"],
                 _f(forced_flow["spot"]),
-                _f(forced_flow["span_pct"]),
+                _f(forced_flow.get("span_pct")),
                 _f(forced_flow["session_days"]),
-                _f(forced_flow["charm_flip"]),
-                _f(forced_flow["vanna_flip"]),
-                _f(forced_flow["zero_flow_level"]),
+                _f(forced_flow.get("charm_flip")),
+                _f(forced_flow.get("vanna_flip")),
+                _f(forced_flow.get("zero_flow_level")),
                 _f(forced_flow["close_charm_flow"]),
                 _f(forced_flow.get("close_charm_flow_smooth")),
                 payload,

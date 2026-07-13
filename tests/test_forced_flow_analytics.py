@@ -90,22 +90,46 @@ def _snapshot():
 
 
 def test_calculate_forced_flow_shape():
+    # The analytics path computes ONLY the consumed Charm-into-Close reading;
+    # the curve + charm/vanna/zero-flow levels are recomputed live by the
+    # /forced-flow endpoints and are no longer produced here.
     eng = AnalyticsEngine("SPY")
     options, summary = _snapshot()
     ff = eng._calculate_forced_flow(options, summary)
     assert ff is not None
-    assert ff["span_pct"] == 0.05
+    assert ff["spot"] == 500.0
     assert 0.0 < ff["session_days"] < 1.0
-    assert len(ff["curve"]) == 21
-    prices = [p for p, _ in ff["curve"]]
-    assert prices == sorted(prices)
-    # levels are float or None, and within the grid span when present.
-    for key in ("charm_flip", "vanna_flip", "zero_flow_level"):
-        v = ff[key]
-        assert v is None or (500.0 * 0.95 <= v <= 500.0 * 1.05)
-    # zero-flow sits near current spot for a near-term horizon.
-    assert ff["zero_flow_level"] is not None
-    assert abs(ff["zero_flow_level"] - 500.0) < 25.0
+    # Both close-flow readings are present and finite.
+    assert isinstance(ff["close_charm_flow"], float)
+    assert isinstance(ff["close_charm_flow_smooth"], float)
+    # The retired curve/level fields are gone from the analytics payload.
+    for key in ("curve", "span_pct", "charm_flip", "vanna_flip", "zero_flow_level"):
+        assert key not in ff
+
+
+def test_store_forced_flow_tolerates_trimmed_payload():
+    # _store_forced_flow must persist the trimmed dict (no curve / levels)
+    # without KeyError; the SQL params are asserted against a fake cursor.
+    eng = AnalyticsEngine("SPY")
+    ff = {
+        "spot": 500.0,
+        "session_days": 0.1,
+        "close_charm_flow": 1.0,
+        "close_charm_flow_smooth": 2.0,
+    }
+    captured = {}
+
+    class _Cur:
+        def execute(self, sql, params):
+            captured["params"] = params
+
+    import datetime as _dt
+
+    eng._store_forced_flow(
+        {"underlying": "SPY", "timestamp": _dt.datetime(2026, 7, 13)}, ff, _Cur()
+    )
+    # profile (last param) serializes the empty curve to an empty JSON array.
+    assert captured["params"][-1] == "[]"
 
 
 def test_calculate_forced_flow_degraded_returns_none():
