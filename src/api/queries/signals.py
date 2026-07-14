@@ -1856,22 +1856,22 @@ class SignalsQueriesMixin:
     ) -> List[Dict[str, Any]]:
         """Distinct forecast dates for a symbol (newest first) — powers the
         /forecast landing-page date picker. Each row carries the metadata
-        the picker needs to badge a card: regime, whether the receipt row
-        landed, and (if it did) the top-level verdict pills so the picker
-        can render green/red at a glance without a second fetch."""
+        the picker needs to badge a card: regime / expected-vol state, whether
+        the receipt landed, and (if it did) the verdict pills so the picker can
+        render at a glance without a second fetch.
+
+        Deliberately ``SELECT *`` + ``.get()`` in the caller: the badge columns
+        are additive, so a row read must survive a column that a pending schema
+        migration hasn't applied yet — degrading to the list with blank badges
+        rather than erroring and blanking the whole landing page. (A lean
+        explicit-column SELECT is what let the missing v1.4 columns hide the
+        entire history until ``make schema-apply`` ran; the Makefile documents
+        the same failure mode for ``unusual_volume_spikes``.)"""
         try:
             async with self._acquire_connection() as conn:
                 rows = await conn.fetch(
                     """
-                    SELECT date,
-                           regime,
-                           receipt_ts IS NOT NULL AS has_receipt,
-                           range_respected,
-                           pin_hit,
-                           regime_correct,
-                           expected_vol_state,
-                           vol_state_correct,
-                           levels_brier
+                    SELECT *
                     FROM daily_forecast
                     WHERE symbol = $1
                     ORDER BY date DESC
@@ -1879,7 +1879,14 @@ class SignalsQueriesMixin:
                     """,
                     symbol, int(limit),
                 )
-                return [dict(r) for r in rows]
+                out: List[Dict[str, Any]] = []
+                for r in rows:
+                    d = dict(r)
+                    # ``has_receipt`` was a computed column; derive it in Python
+                    # so the caller contract is unchanged under SELECT *.
+                    d["has_receipt"] = d.get("receipt_ts") is not None
+                    out.append(d)
+                return out
         except Exception as exc:
             logger.warning(
                 "get_forecast_available_dates failed (%s): %s", symbol, exc,
@@ -1890,16 +1897,17 @@ class SignalsQueriesMixin:
         self, symbol: str, limit: int = 30
     ) -> List[Dict[str, Any]]:
         """Recent forecasts (newest first) — powers the stats endpoint and
-        the website's rolling hit-rate strip."""
+        the website's rolling hit-rate strip.
+
+        ``SELECT *`` + ``.get()`` (see get_forecast_available_dates) so a
+        not-yet-migrated verdict column degrades to a blank stat instead of
+        erroring the whole rolling strip. The callers only read scalar verdict
+        columns, so the extra JSONB blobs SELECT * returns are harmless."""
         try:
             async with self._acquire_connection() as conn:
                 rows = await conn.fetch(
                     """
-                    SELECT symbol, date, open_spot, projected_low, projected_high,
-                           pin_strike, regime, range_respected, pin_hit,
-                           regime_correct, actual_close, receipt_ts,
-                           expected_vol_state, expected_vol_ratio,
-                           realized_vol_ratio, vol_state_correct, levels_brier
+                    SELECT *
                     FROM daily_forecast
                     WHERE symbol = $1
                     ORDER BY date DESC
