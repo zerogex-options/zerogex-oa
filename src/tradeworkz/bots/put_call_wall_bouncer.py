@@ -18,7 +18,14 @@ from typing import Optional
 
 from src.tradeworkz.bots.base import BaseBot, _utcnow
 from src.tradeworkz.context import MarketSnapshot
-from src.tradeworkz.models import OpenPosition, TradeSignal
+from src.tradeworkz.models import TradeSignal
+
+# Floor for the session-recency term in :meth:`PutCallWallBouncer._quality`.
+# The session term is a mild "earlier is better" tilt, not a veto — see the
+# regression note in ``_quality``. Flooring it here (rather than letting it
+# decay to 0) keeps a strong-gamma wall setup tradeable in the final hour of
+# the session, prime 0DTE wall-defense time.
+_SESSION_SCORE_FLOOR = 0.5
 
 
 class PutCallWallBouncer(BaseBot):
@@ -84,7 +91,8 @@ class PutCallWallBouncer(BaseBot):
             conviction=conviction,
             target_price=target,
             stop_price=stop,
-            time_stop_at=_utcnow() + timedelta(minutes=int(self.params.get("max_hold_minutes", 90))),
+            time_stop_at=_utcnow()
+            + timedelta(minutes=int(self.params.get("max_hold_minutes", 90))),
             wall_ref_price=wall_price,
             wall_ref_side=wall_side,
             rationale=(
@@ -104,13 +112,28 @@ class PutCallWallBouncer(BaseBot):
     def _quality(self, snap: MarketSnapshot, wall_side: str) -> float:
         """Bot-authored 0..1 read of setup quality.
 
-        Rewards deeper positive-gamma, larger relative wall strength, and
-        earlier session (more time for mean reversion to play out).
+        Rewards deeper positive-gamma and — as a mild tilt — an earlier
+        session (more time for mean reversion to play out). The session
+        term is a *preference*, not a veto: a strong-gamma wall rejection
+        is a valid fade all session long, including the final hour, which
+        is prime 0DTE wall-defense time as dealers pin toward expiry.
+
+        Regression guard: the session term used to decay linearly to 0 at
+        ~15:00 ET (``mins - 30 >= 300``). At the 0.5 weight below, that
+        single term subtracted enough that ``compute_conviction`` could no
+        longer reach ``confidence_threshold`` regardless of how strong the
+        gamma / how clean the wall touch — a dead-zone in which the Bouncer
+        was *mathematically unable* to open in the last hour of the
+        session. Flooring the session term at ``_SESSION_SCORE_FLOOR``
+        preserves the earlier-is-better tilt while letting a high-gamma
+        setup still clear the bar late in the day. Weak-gamma setups are
+        unaffected — they still fall short of the threshold as intended.
         """
         gex = snap.net_gex or 0.0
         gex_score = min(1.0, max(0.0, gex / 3.0e9))
         mins = snap.minutes_since_open or 0.0
-        session_score = 1.0 - min(1.0, max(0.0, (mins - 30) / 300.0))
+        session_decay = 1.0 - min(1.0, max(0.0, (mins - 30) / 300.0))
+        session_score = max(_SESSION_SCORE_FLOOR, session_decay)
         return 0.5 * gex_score + 0.5 * session_score
 
 
