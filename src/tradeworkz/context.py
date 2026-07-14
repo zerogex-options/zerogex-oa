@@ -19,9 +19,19 @@ from datetime import date, datetime, time, timezone
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
+from src.tradeworkz.gex_stats import fetch_net_gex_pctile
+from src.tradeworkz.strikes import default_strike_increment, nearest_strike
+
 logger = logging.getLogger(__name__)
 
 _ET = ZoneInfo("America/New_York")
+
+# Percentile bands for the symbol-relative regime split (see gex_regime).
+# A reading at/above _STRONG_PCTILE of the symbol's own 30d distribution is
+# "strong"; at/below _WEAK_PCTILE on the negative side is "strong negative".
+# The sign of net_gex still fixes the positive/negative family.
+_STRONG_PCTILE = 75.0
+_WEAK_PCTILE = 25.0
 
 
 @dataclass
@@ -61,6 +71,17 @@ class MarketSnapshot:
     # Volatility regime.
     vix: Optional[float] = None
     iv_rank: Optional[float] = None
+
+    # Per-symbol normalization / instrument metadata (best-effort; None
+    # when unavailable).
+    #  * net_gex_pctile — where net_gex (net_gex_at_spot) falls in THIS
+    #    symbol's own 30d, time-of-day-bucketed distribution [0..100].
+    #    Drives the symbol-relative regime classification; see gex_regime().
+    #  * strike_increment — the underlying's listed strike grid ($1 for
+    #    ETFs, 5 for cash indices). Used by round_to_strike() so built legs
+    #    land on real, quotable strikes. None -> resolved from symbol type.
+    net_gex_pctile: Optional[float] = None
+    strike_increment: Optional[float] = None
 
     # Recent price series (oldest -> newest).
     recent_closes: list[float] = field(default_factory=list)
@@ -113,14 +134,33 @@ class MarketSnapshot:
         return (self.spot - self.put_wall) / self.spot
 
     def gex_regime(self) -> str:
-        """Coarse regime label from ``net_gex`` sign / magnitude.
+        """Coarse dealer-gamma regime label.
 
         The bots use this to gate strategies whose edge is regime-conditional
         (e.g. wall bouncing works in positive-gamma; breakout works when net
         gamma is thin or negative).
+
+        The sign of ``net_gex`` fixes the positive/negative family (dealers
+        long gamma -> pinning / mean-reversion; short gamma -> trending). The
+        strong/weak split is symbol-relative when a historical distribution
+        exists: ``net_gex_pctile`` says where today's reading sits in THIS
+        symbol's own 30d, time-of-day-bucketed history, so "strong" means
+        "large for this symbol" rather than clearing a fixed dollar line
+        tuned for one ticker (net dollar-gamma scales ~price^2 x OI, so a
+        SPY-scale ``1.5e9`` cutoff is meaningless for SPX and vice versa).
+
+        Falls back to the original absolute dollar thresholds when no
+        per-symbol percentile is available (new symbol, un-refreshed stats),
+        so behavior is unchanged until the distribution exists.
         """
         if self.net_gex is None:
             return "unknown"
+        pct = self.net_gex_pctile
+        if pct is not None:
+            if self.net_gex >= 0.0:
+                return "positive_strong" if pct >= _STRONG_PCTILE else "positive_weak"
+            return "negative_strong" if pct <= _WEAK_PCTILE else "negative_weak"
+        # Absolute fallback (pre-historical-stats behavior).
         if self.net_gex >= 1.5e9:
             return "positive_strong"
         if self.net_gex >= 0.0:
@@ -128,6 +168,20 @@ class MarketSnapshot:
         if self.net_gex > -1.5e9:
             return "negative_weak"
         return "negative_strong"
+
+    def effective_strike_increment(self) -> float:
+        """Listed strike increment for this underlying (resolved if unset)."""
+        if self.strike_increment and self.strike_increment > 0:
+            return self.strike_increment
+        return default_strike_increment(self.underlying)
+
+    def round_to_strike(self, price: float) -> float:
+        """Round ``price`` to the nearest listed strike for this underlying.
+
+        On a $1 grid (every ETF the fleet trades) this is exactly
+        ``round(price)``; on SPX's 5-point grid it snaps to a real strike.
+        """
+        return nearest_strike(price, self.effective_strike_increment())
 
 
 def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
@@ -275,9 +329,19 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
     # a same-sign move.
     dealer_net_delta = _maybe_float(gx[0])
 
+    snapshot_ts = ts if isinstance(ts, datetime) else datetime.utcnow()
+
+    # Per-symbol GEX percentile (best-effort; None -> absolute regime
+    # fallback in gex_regime). Issued LAST so a stats-table hiccup can only
+    # affect this one field — every scalar above is already extracted, and
+    # fetch_net_gex_pctile clears any aborted transaction state itself.
+    net_gex_pctile = fetch_net_gex_pctile(
+        conn, underlying, _maybe_float(gx[0]), snapshot_ts
+    )
+
     return MarketSnapshot(
         underlying=underlying,
-        timestamp=ts if isinstance(ts, datetime) else datetime.utcnow(),
+        timestamp=snapshot_ts,
         spot=float(spot),
         # gx[0] is net_gex_at_spot (regime-correct); gx[7] is the
         # unweighted total_net_gex kept for parity with analytics but
@@ -298,6 +362,8 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
         vwap=vwap_value,
         vwap_deviation_pct=vwap_deviation,
         vix=vix,
+        net_gex_pctile=net_gex_pctile,
+        strike_increment=default_strike_increment(underlying),
         recent_closes=closes,
     )
 

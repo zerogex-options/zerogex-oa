@@ -152,7 +152,7 @@ class SpecStrategyBot(BaseBot):
         if snap.spot <= 0:
             return None
         opt_type = "call" if direction == "bullish" else "put"
-        strike = round(snap.spot)
+        strike = snap.round_to_strike(snap.spot)
         dte = int(strategy.get("entry", {}).get("dte", 0) or 0)
         expiration = (snap.et_date + timedelta(days=dte)).isoformat()
 

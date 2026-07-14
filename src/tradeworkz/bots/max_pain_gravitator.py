@@ -40,7 +40,7 @@ class MaxPainGravitator(BaseBot):
 
         # 1DTE expiration — next-session date.
         exp = (snap.et_date + timedelta(days=1)).isoformat()
-        strike = round(snap.spot)
+        strike = snap.round_to_strike(snap.spot)
         opt_type = "call" if direction == "bullish" else "put"
         legs = self.build_atm_debit(snap.underlying, opt_type, strike, exp, 0.0)
         stop = snap.spot * (0.992 if direction == "bullish" else 1.008)

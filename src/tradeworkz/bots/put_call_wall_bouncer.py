@@ -72,7 +72,7 @@ class PutCallWallBouncer(BaseBot):
             return None
 
         expiration = _today_expiration(snap)
-        strike = round(snap.spot)
+        strike = snap.round_to_strike(snap.spot)
         opt_type = "call" if direction == "bullish" else "put"
         legs = self.build_atm_debit(snap.underlying, opt_type, strike, expiration, 0.0)
         stop = (wall_price or snap.spot) * (
@@ -118,6 +118,12 @@ class PutCallWallBouncer(BaseBot):
         is a valid fade all session long, including the final hour, which
         is prime 0DTE wall-defense time as dealers pin toward expiry.
 
+        The gamma component is symbol-relative when a historical
+        distribution exists — ``net_gex_pctile`` (0..100) says how strong
+        today's dealer gamma is for THIS symbol — and falls back to the old
+        absolute ``net_gex / 3e9`` scale otherwise, so a SPY-tuned constant
+        no longer has to stand in for SPX-scale (or any other) dollar-gamma.
+
         Regression guard: the session term used to decay linearly to 0 at
         ~15:00 ET (``mins - 30 >= 300``). At the 0.5 weight below, that
         single term subtracted enough that ``compute_conviction`` could no
@@ -129,8 +135,11 @@ class PutCallWallBouncer(BaseBot):
         setup still clear the bar late in the day. Weak-gamma setups are
         unaffected — they still fall short of the threshold as intended.
         """
-        gex = snap.net_gex or 0.0
-        gex_score = min(1.0, max(0.0, gex / 3.0e9))
+        if snap.net_gex_pctile is not None:
+            gex_score = min(1.0, max(0.0, snap.net_gex_pctile / 100.0))
+        else:
+            gex = snap.net_gex or 0.0
+            gex_score = min(1.0, max(0.0, gex / 3.0e9))
         mins = snap.minutes_since_open or 0.0
         session_decay = 1.0 - min(1.0, max(0.0, (mins - 30) / 300.0))
         session_score = max(_SESSION_SCORE_FLOOR, session_decay)

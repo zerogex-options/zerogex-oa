@@ -82,15 +82,19 @@ class RangeIronCondor(BaseBot):
         dte_target = int(self.params.get("dte_target", 0))
         expiration = resolve_expiration_iso(snap.et_date, dte_target)
 
-        # Strike placement: short strikes ~$2 inside each wall, long
-        # strikes another $2 outside for a $2-wide wing on each side.
-        # The ``wing_width`` param lets an operator widen for more
-        # premium at the cost of more downside per contract.
-        wing_width = int(self.params.get("wing_width", 2))
-        short_buffer = int(self.params.get("short_buffer", 2))
-        put_short_strike = round(snap.put_wall + short_buffer)
+        # Strike placement: short strikes a couple of strikes inside each
+        # wall, long strikes a couple more outside for the wings. The
+        # ``wing_width`` / ``short_buffer`` params are expressed in *strikes*
+        # and scaled to price by the symbol's grid, so a "2-wide" wing is 2
+        # points on a $1 ETF grid and 10 points on SPX's 5-wide grid. The
+        # ``wing_width`` param lets an operator widen for more premium at the
+        # cost of more downside per contract.
+        increment = snap.effective_strike_increment()
+        wing_width = int(self.params.get("wing_width", 2)) * increment
+        short_buffer = int(self.params.get("short_buffer", 2)) * increment
+        put_short_strike = snap.round_to_strike(snap.put_wall + short_buffer)
         put_long_strike = put_short_strike - wing_width
-        call_short_strike = round(snap.call_wall - short_buffer)
+        call_short_strike = snap.round_to_strike(snap.call_wall - short_buffer)
         call_long_strike = call_short_strike + wing_width
 
         # Sanity: strikes must be ordered correctly.

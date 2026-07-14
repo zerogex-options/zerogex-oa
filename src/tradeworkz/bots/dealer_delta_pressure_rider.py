@@ -53,7 +53,7 @@ class DealerDeltaPressureRider(BaseBot):
             return None
 
         expiration = snap.et_date.isoformat()
-        strike = round(snap.spot)
+        strike = snap.round_to_strike(snap.spot)
         opt_type = "call" if direction == "bullish" else "put"
         legs = self.build_atm_debit(snap.underlying, opt_type, strike, expiration, 0.0)
         return TradeSignal(

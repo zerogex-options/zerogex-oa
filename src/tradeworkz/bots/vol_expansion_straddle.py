@@ -82,7 +82,7 @@ class VolExpansionStraddle(BaseBot):
 
         dte_target = int(self.params.get("dte_target", 0))
         expiration = resolve_expiration_iso(snap.et_date, dte_target)
-        strike = round(snap.spot)
+        strike = snap.round_to_strike(snap.spot)
         legs = self.build_straddle(snap.underlying, strike, expiration)
 
         # Structural target: either wall. Whichever hits first captures

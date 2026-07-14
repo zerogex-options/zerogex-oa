@@ -89,10 +89,12 @@ class BullMomentumClimber(BaseBot):
 
         dte_target = int(self.params.get("dte_target", 0))
         expiration = resolve_expiration_iso(snap.et_date, dte_target)
-        # Long strike sits at ATM (rounded to nearest dollar); short one
-        # dollar higher for a $1-wide bull call debit.
-        long_strike = round(snap.spot)
-        short_strike = long_strike + 1
+        # Long strike sits at ATM (nearest listed strike); short one strike
+        # higher for the narrowest bull call debit on this symbol's grid
+        # ($1 wide on an ETF, 5 wide on SPX).
+        increment = snap.effective_strike_increment()
+        long_strike = snap.round_to_strike(snap.spot)
+        short_strike = long_strike + increment
         legs = self.build_vertical(
             snap.underlying, "call", long_strike, short_strike, expiration
         )

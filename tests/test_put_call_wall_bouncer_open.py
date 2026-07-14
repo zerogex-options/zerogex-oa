@@ -108,6 +108,28 @@ def test_bullish_put_wall_bounce_fires():
 
 
 # ----------------------------------------------------------------------
+# Symbol-relative gamma (percentile-driven quality)
+# ----------------------------------------------------------------------
+
+
+def test_quality_fires_on_high_pctile_small_absolute_gamma():
+    """net_gex tiny by the absolute 3e9 scale, but strong for THIS symbol."""
+    sig = _bot().open_criteria(
+        _snap(spot=755.0, call_wall=755.0, net_gex=3.0e8, net_gex_pctile=92.0)
+    )
+    assert sig is not None
+    assert sig.direction == "bearish"
+
+
+def test_quality_declines_on_low_pctile_large_absolute_gamma():
+    """net_gex huge (would saturate the old absolute score) but weak for its symbol."""
+    sig = _bot().open_criteria(
+        _snap(spot=755.0, call_wall=755.0, net_gex=2.0e10, net_gex_pctile=12.0)
+    )
+    assert sig is None
+
+
+# ----------------------------------------------------------------------
 # Regression: the late-session conviction dead-zone
 # ----------------------------------------------------------------------
 
