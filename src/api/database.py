@@ -1983,11 +1983,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         that ``get_gex_heatmap`` uses, which is why the heatmap query
         can't stand in for arbitrary date replay.
 
-        Returns chronological list of ``{timestamp, gamma_flip, strikes}``
-        rows. Each frame's ``strikes`` is a list of ``{strike, net_gex}``
-        entries filtered to a ±``strike_band_pct`` band around the bar's
-        spot so the payload stays bounded (a full session at every strike
-        would be ~40k rows for SPX).
+        Returns chronological list of
+        ``{timestamp, gamma_flip, call_wall, put_wall, strikes}`` rows. The
+        call/put walls come straight from the canonical ``gex_summary``
+        columns (same source the ``/replay/frame`` and snapshot views read),
+        so the scrubber's level lines match the shareable snapshot for the
+        same minute. Each frame's ``strikes`` is a list of ``{strike,
+        net_gex}`` entries filtered to a ±``strike_band_pct`` band around
+        the bar's spot so the payload stays bounded (a full session at every
+        strike would be ~40k rows for SPX).
 
         Returns ``[]`` on any error so the endpoint can render an empty
         state instead of crashing.
@@ -2017,7 +2021,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 LIMIT 1
             ),
             session_summary AS (
-                SELECT timestamp, gamma_flip_point AS gamma_flip
+                SELECT timestamp, gamma_flip_point AS gamma_flip,
+                       call_wall, put_wall
                 FROM gex_summary
                 WHERE underlying = $1
                   AND timestamp >= $2
@@ -2026,6 +2031,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             SELECT
                 s.timestamp,
                 s.gamma_flip,
+                s.call_wall,
+                s.put_wall,
                 gbs.strike,
                 AVG(gbs.net_gex) AS net_gex
             FROM session_summary s
@@ -2038,7 +2045,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
              -- yet) short-circuits to no-band, matching get_gex_heatmap.
              AND ABS(gbs.strike - (SELECT spot_close FROM session_spot))
                  <= (SELECT spot_close FROM session_spot) * $4
-            GROUP BY s.timestamp, s.gamma_flip, gbs.strike
+            -- call_wall / put_wall are functionally dependent on timestamp
+            -- (one gex_summary row per minute) but must be listed in GROUP BY
+            -- because they're not aggregated.
+            GROUP BY s.timestamp, s.gamma_flip, s.call_wall, s.put_wall, gbs.strike
             ORDER BY s.timestamp ASC, gbs.strike ASC
         """
         try:
@@ -2067,6 +2077,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 frames[ts] = {
                     "timestamp": ts,
                     "gamma_flip": r["gamma_flip"],
+                    "call_wall": r["call_wall"],
+                    "put_wall": r["put_wall"],
                     "strikes": [],
                 }
             if r["strike"] is not None:

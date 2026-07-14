@@ -218,6 +218,13 @@ async def get_replay_range(
         {
             "timestamp": bar["timestamp"].isoformat(),
             "gamma_flip": _f(bar.get("gamma_flip")),
+            # Canonical call/put walls for the minute — same gex_summary
+            # columns the /frame + snapshot views read, so the scrubber's
+            # level lines agree with the shareable snapshot. Null on older
+            # rows written before the wall columns were backfilled; the
+            # frontend simply omits the line when null.
+            "call_wall": _f(bar.get("call_wall")),
+            "put_wall": _f(bar.get("put_wall")),
             "strikes": [
                 {"strike": _f(s.get("strike")), "net_gex": _f(s.get("net_gex"))}
                 for s in (bar.get("strikes") or [])

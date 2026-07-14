@@ -119,8 +119,10 @@ def test_range_returns_session_frames_by_date(monkeypatch):
     bar_b = datetime(2026, 6, 29, 14, 30, tzinfo=timezone.utc)
     dbmod.DatabaseManager.get_gex_frames_for_session = AsyncMock(return_value=[
         {"timestamp": bar_a, "gamma_flip": Decimal("600.5"),
+         "call_wall": Decimal("606"), "put_wall": Decimal("594"),
          "strikes": [{"strike": Decimal("600"), "net_gex": Decimal("1234.5")}]},
         {"timestamp": bar_b, "gamma_flip": Decimal("601"),
+         "call_wall": Decimal("607"), "put_wall": Decimal("595"),
          "strikes": [{"strike": Decimal("600"), "net_gex": Decimal("2222.5")}]},
     ])
     dbmod.DatabaseManager.get_underlying_candles_for_session = AsyncMock(return_value=[
@@ -141,6 +143,12 @@ def test_range_returns_session_frames_by_date(monkeypatch):
     assert body["frames"][0]["timestamp"] == bar_a.isoformat()
     assert body["frames"][1]["timestamp"] == bar_b.isoformat()
     assert body["frames"][0]["strikes"][0]["strike"] == pytest.approx(600.0)
+    # Call/put walls ride along on each frame so the scrubber can draw the
+    # same level lines the snapshot view shows for that minute.
+    assert body["frames"][0]["call_wall"] == pytest.approx(606.0)
+    assert body["frames"][0]["put_wall"] == pytest.approx(594.0)
+    assert body["frames"][1]["call_wall"] == pytest.approx(607.0)
+    assert body["frames"][1]["put_wall"] == pytest.approx(595.0)
     # Confirm the endpoint routed to the date-scoped helper, not the
     # latest-N heatmap (the actual bug we're guarding against).
     call = dbmod.DatabaseManager.get_gex_frames_for_session.call_args
