@@ -163,6 +163,26 @@ def test_available_dates_lists_symbol_history(monkeypatch):
     assert body["dates"][1]["has_receipt"] is False
 
 
+def test_available_dates_tolerates_pre_migration_rows(monkeypatch):
+    """A row shaped like the pre-v1.4 schema (no expected_vol_state /
+    vol_state_correct keys) must still list, with null vol badges. The router
+    reads every badge via .get(), and the query uses SELECT *, so a column a
+    pending migration hasn't added yet degrades to a blank pill instead of
+    500ing — or silently blanking — the whole landing page."""
+    app, dbmod = _build_app(monkeypatch)
+    dbmod.DatabaseManager.get_forecast_available_dates = AsyncMock(return_value=[
+        {"date": date(2026, 6, 29), "regime": "long_gamma", "has_receipt": True,
+         "range_respected": True, "pin_hit": False, "regime_correct": True},
+    ])
+    with TestClient(app) as client:
+        r = client.get("/api/forecast/available-dates?symbol=SPY")
+    assert r.status_code == 200, r.text
+    row = r.json()["dates"][0]
+    assert row["range_respected"] is True
+    assert row["expected_vol_state"] is None
+    assert row["vol_state_correct"] is None
+
+
 def test_recent_history_returns_compact_rows(monkeypatch):
     app, dbmod = _build_app(monkeypatch)
     dbmod.DatabaseManager.get_daily_forecast_history = AsyncMock(
