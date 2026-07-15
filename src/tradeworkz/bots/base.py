@@ -17,6 +17,8 @@ helpers are shared boilerplate.
 from __future__ import annotations
 
 import logging
+import math
+import statistics
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -24,6 +26,39 @@ from src.tradeworkz.context import MarketSnapshot
 from src.tradeworkz.models import BotSpec, ExitDecision, Leg, OpenPosition, TradeSignal
 
 logger = logging.getLogger(__name__)
+
+# Trading minutes in a US equity RTH year — 252 sessions × 390 min. Used to
+# convert an annualized VIX into a per-1-minute sigma when realized recent
+# closes aren't available to estimate short-horizon vol directly.
+_RTH_MINUTES_PER_YEAR = 252.0 * 390.0
+
+
+def _short_horizon_sigma_pct(snap: MarketSnapshot) -> Optional[float]:
+    """Estimate the underlying's ~1-minute return sigma as a fraction.
+
+    Prefers realized vol — the population stdev of the most recent up-to-15
+    one-minute simple returns from ``snap.recent_closes`` (the snapshot
+    stores 1-minute closes oldest→newest). Falls back to a VIX-implied
+    per-minute sigma (annualized ``vix/100`` de-annualized over RTH
+    minutes) when there aren't enough closes, and to ``None`` when neither
+    source is usable — callers then apply their configured floor.
+
+    Deliberately estimates the *1-minute* sigma, not the hold-horizon move:
+    the wall-break buffer is a small multiple of it, and confirmation over
+    N one-minute closes supplies the time dimension.
+    """
+    closes = [float(c) for c in (snap.recent_closes or []) if c is not None and c > 0]
+    if len(closes) >= 6:
+        rets = [closes[i] / closes[i - 1] - 1.0 for i in range(1, len(closes))]
+        rets = rets[-15:]
+        if len(rets) >= 2:
+            sigma = statistics.pstdev(rets)
+            if sigma > 0.0:
+                return sigma
+    vix = snap.vix
+    if vix is not None and vix > 0.0:
+        return (float(vix) / 100.0) / math.sqrt(_RTH_MINUTES_PER_YEAR)
+    return None
 
 
 def resolve_expiration_iso(from_et_date: date, dte_target: int) -> str:
@@ -114,9 +149,7 @@ class BaseBot:
         """Return a signal if the bot wants to open (or add). Default: no-op."""
         return None
 
-    def exit_criteria(
-        self, snap: MarketSnapshot, position: OpenPosition
-    ) -> ExitDecision:
+    def exit_criteria(self, snap: MarketSnapshot, position: OpenPosition) -> ExitDecision:
         """Default exit policy — target / stop / time-stop. Subclasses can extend.
 
         Every bot in the fleet sets ``position.target_price`` and
@@ -163,7 +196,8 @@ class BaseBot:
         pct = self._max_premium_loss_pct()
         if (
             pct > 0
-            and position.entry_price and position.entry_price > 0
+            and position.entry_price
+            and position.entry_price > 0
             and position.current_price is not None
         ):
             loss_pct = 1.0 - (position.current_price / position.entry_price)
@@ -198,37 +232,113 @@ class BaseBot:
 
     # -- Shared helpers used by concrete bots ---------------------------
 
+    def _wall_break_buffer_pct(self, snap: MarketSnapshot, wall_strength: Optional[float]) -> float:
+        """Volatility-scaled distance past a wall that counts as a break.
+
+        A wall fade wants a stop that ``allows it to play out`` — walls get
+        pierced by noise and revert — without letting a genuine break run.
+        A flat percentage can't do both: 0.3% is a wick in a 30-VIX tape
+        and a real break in a 12-VIX one. So the buffer scales with a
+        short-horizon sigma estimate (:func:`_short_horizon_sigma_pct`):
+
+            buffer = clamp(vol_mult × sigma_1min, min_pct, max_pct)
+
+        and is widened for a historically large wall (``wall_strength`` in
+        0..1, from commit 1's sizing input) so a massive wall — which the
+        Bouncer also sizes UP into — gets correspondingly more room:
+
+            buffer ×= 1 + strength_widen × wall_strength   (pre-clamp)
+
+        Defaults are chosen so a baseline ~16-VIX tape lands near the old
+        flat 0.3% (``min_pct`` floor), so calm-market behavior is unchanged
+        and the widening only ever *loosens* into volatility / large walls,
+        never tighter than before. ``max_pct`` caps the loosening. Every
+        term is a per-bot param so this is tunable / backtestable without a
+        code change; the option-premium damage-control stop
+        (:data:`MAX_PREMIUM_LOSS_PCT`) remains the independent hard dollar
+        cap for a fast blow-through regardless of how wide this gets.
+        """
+        min_pct = max(0.0, float(self.params.get("wall_break_min_pct", 0.003)))
+        max_pct = max(min_pct, float(self.params.get("wall_break_max_pct", 0.012)))
+        vol_mult = max(0.0, float(self.params.get("wall_break_vol_mult", 6.0)))
+        strength_widen = max(0.0, float(self.params.get("wall_break_strength_widen", 0.5)))
+
+        sigma = _short_horizon_sigma_pct(snap)
+        buf = min_pct if sigma is None else vol_mult * sigma
+        if wall_strength is not None:
+            buf *= 1.0 + strength_widen * max(0.0, min(1.0, wall_strength))
+        return max(min_pct, min(max_pct, buf))
+
+    def _beyond_confirmed(self, snap: MarketSnapshot, level: float, above: bool) -> bool:
+        """True when spot has broken past ``level`` and the break is confirmed.
+
+        Confirmation filters a single-print wick through the level: the
+        current spot must be beyond it AND the most recent
+        ``wall_break_confirm_bars`` one-minute closes must all be beyond it
+        too. With ``confirm_bars <= 1`` (or too little history to confirm)
+        this degrades to the prior single-tick check, so it can only ever
+        make the stop *more* patient, never less.
+        """
+        current_beyond = snap.spot > level if above else snap.spot < level
+        if not current_beyond:
+            return False
+        n = int(self.params.get("wall_break_confirm_bars", 2))
+        closes = [float(c) for c in (snap.recent_closes or []) if c is not None]
+        if n <= 1 or len(closes) < n:
+            return True
+        recent = closes[-n:]
+        return all((c > level) if above else (c < level) for c in recent)
+
     def _wall_stop_signal(
         self, snap: MarketSnapshot, position: OpenPosition
     ) -> Optional[ExitDecision]:
-        """Cut if the trade blows through the referenced wall or the wall
-        migrates the wrong way. Return ``None`` when no wall exit fires.
+        """Cut a wall fade when the wall it references genuinely fails.
+
+        Two failure modes, both keyed off the *side* of the wall (the
+        barrier), which is what physically defines a fade — the option
+        ``direction`` is redundant with it and, worse, the prior version
+        keyed off direction and inverted the test: for the Bouncer's
+        call-wall fade (bearish) and put-wall bounce (bullish) it fired
+        ``wall_break`` when spot moved TOWARD the target, silently capping
+        winners at wall∓drift and mislabeling them, while the migration
+        branch (gated on the opposite direction) never fired at all. Only
+        the Bouncer sets ``wall_ref_side`` (call→fade-from-below,
+        put→fade-from-above), so keying off side is correct for every
+        current producer. The iron condor sets ``wall_ref_price`` but no
+        side, so it still no-ops here (its own short-strike stop governs).
+
+        * **wall_break** — spot blows THROUGH the wall away from the fade's
+          target (call wall = resistance → a push ABOVE it; put wall =
+          support → a break BELOW it), by the volatility-scaled
+          :meth:`_wall_break_buffer_pct`, and the break is
+          :meth:`_beyond_confirmed`.
+        * **wall_shift** — the referenced wall itself migrates adversely
+          (call wall rolling UP, put wall sliding DOWN) beyond
+          ``wall_shift_pct``: the structure you faded has moved, so the
+          thesis is stale. Structural, so no wick-confirmation.
+
+        Returns ``None`` when neither fires.
         """
         ref = position.wall_ref_price
         side = (position.wall_ref_side or "").lower()
         if ref is None or side not in {"call", "put"}:
             return None
-        wall_drift_pct = float(self.params.get("wall_drift_pct", 0.003))
-        spot = snap.spot
+
+        ws = (position.components_at_entry or {}).get("wall_strength")
+        wall_strength = float(ws) if isinstance(ws, (int, float)) else None
+        buf = self._wall_break_buffer_pct(snap, wall_strength)
+        shift_pct = float(self.params.get("wall_shift_pct", 0.003))
+
         if side == "call":
-            # Bullish trades fade at the call wall; bearish momentum breaks
-            # through it. Symmetry: whichever direction, blowing past the
-            # wall by wall_drift_pct is a stop event.
-            if position.direction == "bullish" and spot > ref * (1.0 + wall_drift_pct):
+            if self._beyond_confirmed(snap, ref * (1.0 + buf), above=True):
                 return ExitDecision(should_close=True, reason="wall_break")
-            if position.direction == "bearish" and spot < ref * (1.0 - wall_drift_pct):
-                return ExitDecision(should_close=True, reason="wall_break")
-            if snap.call_wall is not None and position.direction == "bullish":
-                if snap.call_wall > ref * (1.0 + wall_drift_pct):
-                    return ExitDecision(should_close=True, reason="wall_shift")
+            if snap.call_wall is not None and snap.call_wall > ref * (1.0 + shift_pct):
+                return ExitDecision(should_close=True, reason="wall_shift")
         else:  # put
-            if position.direction == "bearish" and spot < ref * (1.0 - wall_drift_pct):
+            if self._beyond_confirmed(snap, ref * (1.0 - buf), above=False):
                 return ExitDecision(should_close=True, reason="wall_break")
-            if position.direction == "bullish" and spot > ref * (1.0 + wall_drift_pct):
-                return ExitDecision(should_close=True, reason="wall_break")
-            if snap.put_wall is not None and position.direction == "bearish":
-                if snap.put_wall < ref * (1.0 - wall_drift_pct):
-                    return ExitDecision(should_close=True, reason="wall_shift")
+            if snap.put_wall is not None and snap.put_wall < ref * (1.0 - shift_pct):
+                return ExitDecision(should_close=True, reason="wall_shift")
         return None
 
     def build_atm_debit(
@@ -394,9 +504,7 @@ class BaseBot:
             ),
         ]
 
-    def compute_conviction(
-        self, snap: MarketSnapshot, quality_score: float
-    ) -> float:
+    def compute_conviction(self, snap: MarketSnapshot, quality_score: float) -> float:
         """Blend the calibrated confidence base with the per-tick quality.
 
         ``quality_score`` is a bot-authored 0..1 read of how clean the setup

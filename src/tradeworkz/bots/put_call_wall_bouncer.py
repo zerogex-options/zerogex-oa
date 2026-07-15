@@ -5,10 +5,14 @@ edge is dealer hedging: at the call wall dealers are net long gamma above
 spot and mechanically sell rallies; at the put wall they buy dips. The bot
 sizes proportional to wall strength × conviction and cuts on:
 
-* underlying blowing past the wall by ``wall_break_pct`` (default 0.3%),
+* the underlying blowing THROUGH the wall away from target by a
+  volatility-scaled, wick-confirmed buffer — wider in high vol and into a
+  historically large wall so the fade has room to play out, tighter in a
+  calm tape (BaseBot._wall_stop_signal / _wall_break_buffer_pct),
 * the wall itself migrating in the direction that disfavors the trade,
-* configured target hit (max_pain / gamma_flip),
-* configured stop or time-stop.
+* the option-premium damage-control stop (the hard dollar cap for a fast
+  blow-through) or the time-stop,
+* configured target hit (max_pain / gamma_flip).
 """
 
 from __future__ import annotations
@@ -95,11 +99,14 @@ class PutCallWallBouncer(BaseBot):
         strike = snap.round_to_strike(snap.spot)
         opt_type = "call" if direction == "bullish" else "put"
         legs = self.build_atm_debit(snap.underlying, opt_type, strike, expiration, 0.0)
-        stop = (wall_price or snap.spot) * (
-            1.0 + float(self.params.get("wall_break_pct", 0.003))
-            if direction == "bearish"
-            else 1.0 - float(self.params.get("wall_break_pct", 0.003))
-        )
+
+        # No static spot-level stop: a fixed level is checked single-tick in
+        # the base exit path and would fire on a wick, pre-empting the
+        # volatility-scaled, wick-confirmed wall-break stop that
+        # BaseBot._wall_stop_signal now owns (it reads wall_ref_side +
+        # this position's wall_strength each tick off the live snapshot).
+        # The option-premium damage-control stop remains the hard dollar
+        # cap for a fast blow-through; time_stop caps duration.
 
         return TradeSignal(
             bot_id=self.spec.id,
@@ -110,14 +117,16 @@ class PutCallWallBouncer(BaseBot):
             entry_price=0.0,  # filled by engine
             conviction=conviction,
             target_price=target,
-            stop_price=stop,
+            # Wall-break stop is dynamic (vol-scaled + confirmed) and lives
+            # in BaseBot._wall_stop_signal, keyed off wall_ref_side below.
+            stop_price=None,
             time_stop_at=_utcnow()
             + timedelta(minutes=int(self.params.get("max_hold_minutes", 90))),
             wall_ref_price=wall_price,
             wall_ref_side=wall_side,
             rationale=(
                 f"{wall_side}-wall rejection at {wall_price} in {snap.gex_regime()} gamma; "
-                f"conviction {conviction:.2f}"
+                f"conviction {conviction:.2f}; vol-scaled confirmed wall-break stop"
             ),
             components_at_entry={
                 "wall_side": wall_side,
