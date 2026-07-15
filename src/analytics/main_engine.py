@@ -50,7 +50,10 @@ from src.config import (
     GAMMA_PROFILE_DTE_WEIGHT_SHAPE,
 )
 from src.symbols import parse_underlyings, get_canonical_symbol
-from src.analytics.walls import compute_call_put_walls
+from src.analytics.walls import (
+    compute_call_put_walls,
+    compute_call_put_walls_with_strength,
+)
 from src.greeks_fd import fd_charm, fd_vanna
 from src.analytics.forced_flow import (
     ContractLeg,
@@ -2730,8 +2733,16 @@ class AnalyticsEngine:
 
         # Canonical Call/Put Wall strikes — single source of truth for every
         # downstream consumer (REST endpoints, unified signal engine, playbook
-        # patterns).  Defined in src/analytics/walls.py.
-        call_wall, put_wall = compute_call_put_walls(gex_by_strike, underlying_price)
+        # patterns).  Defined in src/analytics/walls.py.  The *_strength
+        # values are the dollar-gamma magnitude at each wall (same scale as
+        # the strike-profile abs_dollar_gex); persisted so TradeWorkz can
+        # size positions by how large a wall is relative to its own history.
+        (
+            call_wall,
+            put_wall,
+            call_wall_strength,
+            put_wall_strength,
+        ) = compute_call_put_walls_with_strength(gex_by_strike, underlying_price)
 
         summary = {
             "underlying": self.db_symbol,
@@ -2756,6 +2767,8 @@ class AnalyticsEngine:
             "net_gex_at_spot": net_gex_at_spot,
             "call_wall": call_wall,
             "put_wall": put_wall,
+            "call_wall_strength": call_wall_strength,
+            "put_wall_strength": put_wall_strength,
             "max_pain_by_expiration": max_pain_by_exp,
             # Spot-shift dealer gamma curve used to derive both
             # gamma_flip_point (zero crossing) and net_gex_at_spot
@@ -2903,6 +2916,8 @@ class AnalyticsEngine:
 
         call_wall_val = summary.get("call_wall")
         put_wall_val = summary.get("put_wall")
+        call_wall_strength_val = summary.get("call_wall_strength")
+        put_wall_strength_val = summary.get("put_wall_strength")
         mp_by_exp_raw = summary.get("max_pain_by_expiration") or {}
         # Serialize {date -> strike} into a JSON-shaped dict with
         # iso-date keys.  psycopg2 will adapt the dict to JSONB.
@@ -2927,9 +2942,10 @@ class AnalyticsEngine:
              gamma_flip_point, put_call_ratio, max_pain, total_call_volume,
              total_put_volume, total_call_oi, total_put_oi, total_net_gex,
              net_gex_at_spot, flip_distance, local_gex, convexity_risk,
-             call_wall, put_wall, max_pain_by_expiration, gamma_flip_span_used,
+             call_wall, put_wall, call_wall_strength, put_wall_strength,
+             max_pain_by_expiration, gamma_flip_span_used,
              gamma_flip_raw)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (underlying, timestamp) DO UPDATE SET
                 max_gamma_strike = EXCLUDED.max_gamma_strike,
                 max_gamma_value = EXCLUDED.max_gamma_value,
@@ -2948,6 +2964,8 @@ class AnalyticsEngine:
                 convexity_risk = EXCLUDED.convexity_risk,
                 call_wall = EXCLUDED.call_wall,
                 put_wall = EXCLUDED.put_wall,
+                call_wall_strength = EXCLUDED.call_wall_strength,
+                put_wall_strength = EXCLUDED.put_wall_strength,
                 max_pain_by_expiration = EXCLUDED.max_pain_by_expiration,
                 gamma_flip_span_used = EXCLUDED.gamma_flip_span_used
             WHERE
@@ -2967,6 +2985,8 @@ class AnalyticsEngine:
                 OR EXCLUDED.convexity_risk IS DISTINCT FROM gex_summary.convexity_risk
                 OR EXCLUDED.call_wall IS DISTINCT FROM gex_summary.call_wall
                 OR EXCLUDED.put_wall IS DISTINCT FROM gex_summary.put_wall
+                OR EXCLUDED.call_wall_strength IS DISTINCT FROM gex_summary.call_wall_strength
+                OR EXCLUDED.put_wall_strength IS DISTINCT FROM gex_summary.put_wall_strength
                 OR EXCLUDED.max_pain_by_expiration IS DISTINCT FROM gex_summary.max_pain_by_expiration
                 OR EXCLUDED.gamma_flip_span_used IS DISTINCT FROM gex_summary.gamma_flip_span_used
                 OR EXCLUDED.gamma_flip_raw IS DISTINCT FROM gex_summary.gamma_flip_raw
@@ -2990,6 +3010,8 @@ class AnalyticsEngine:
                 float(convexity_risk) if convexity_risk is not None else None,
                 float(call_wall_val) if call_wall_val is not None else None,
                 float(put_wall_val) if put_wall_val is not None else None,
+                (float(call_wall_strength_val) if call_wall_strength_val is not None else None),
+                (float(put_wall_strength_val) if put_wall_strength_val is not None else None),
                 mp_by_exp_json,
                 (float(gamma_flip_span_used) if gamma_flip_span_used is not None else None),
                 (float(gamma_flip_raw) if gamma_flip_raw is not None else None),

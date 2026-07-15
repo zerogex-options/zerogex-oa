@@ -478,6 +478,12 @@ CREATE TABLE IF NOT EXISTS gex_summary (
     -- src/analytics/walls.py.
     call_wall NUMERIC(12, 4),
     put_wall  NUMERIC(12, 4),
+    -- Dollar-gamma magnitude at each wall strike (γ_aggregate × 100 × S² ×
+    -- 0.01), the same scale as the strike-profile ``abs_dollar_gex``.
+    -- Persisted so TradeWorkz can size positions by how large a wall is
+    -- relative to its own history.  See src/analytics/walls.py.
+    call_wall_strength DOUBLE PRECISION,
+    put_wall_strength  DOUBLE PRECISION,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (underlying, timestamp)
 );
@@ -508,6 +514,9 @@ ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS local_gex DOUBLE PRECISION;
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS convexity_risk DOUBLE PRECISION;
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS call_wall NUMERIC(12, 4);
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS put_wall NUMERIC(12, 4);
+-- Dollar-gamma magnitude at each wall (see CREATE TABLE above / walls.py).
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS call_wall_strength DOUBLE PRECISION;
+ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS put_wall_strength DOUBLE PRECISION;
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS max_pain_by_expiration JSONB;
 ALTER TABLE gex_summary ADD COLUMN IF NOT EXISTS net_gex_at_spot DOUBLE PRECISION;
 -- Ladder rung (fraction of spot) the resolver used to land the

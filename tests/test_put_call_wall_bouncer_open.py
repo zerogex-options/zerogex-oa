@@ -29,11 +29,11 @@ from src.tradeworkz.context import MarketSnapshot
 from src.tradeworkz.models import BotSpec
 
 # 11:30 ET (midday) and 15:30 ET (final hour) as UTC instants.
-MIDDAY = datetime(2026, 7, 14, 15, 30, tzinfo=timezone.utc)   # mins_since_open = 120
-LATE = datetime(2026, 7, 14, 19, 30, tzinfo=timezone.utc)     # mins_since_open = 360
+MIDDAY = datetime(2026, 7, 14, 15, 30, tzinfo=timezone.utc)  # mins_since_open = 120
+LATE = datetime(2026, 7, 14, 19, 30, tzinfo=timezone.utc)  # mins_since_open = 360
 
-STRONG_GEX = 3.0e9   # gex_score saturates at 1.0
-WEAK_GEX = 4.0e8     # positive regime, but not enough conviction
+STRONG_GEX = 3.0e9  # gex_score saturates at 1.0
+WEAK_GEX = 4.0e8  # positive regime, but not enough conviction
 
 
 def _bot(**params) -> PutCallWallBouncer:
@@ -88,15 +88,15 @@ def test_bearish_call_wall_fade_fires():
     assert sig.wall_ref_side == "call"
     assert sig.wall_ref_price == 755.0
     assert sig.target_price == 752.0  # max_pain, below spot
-    assert sig.stop_price == pytest.approx(755.0 * 1.003)  # break ABOVE the wall
+    # Wall-break stop is now dynamic (vol-scaled + confirmed) in the base
+    # exit path, keyed off wall_ref_side — no static spot-level stop here.
+    assert sig.stop_price is None
     assert sig.conviction >= _bot().confidence_threshold()
 
 
 def test_bullish_put_wall_bounce_fires():
     """Spot pinned to the put wall in strong positive gamma -> long via call."""
-    sig = _bot().open_criteria(
-        _snap(spot=750.0, put_wall=750.0, call_wall=755.0, max_pain=753.0)
-    )
+    sig = _bot().open_criteria(_snap(spot=750.0, put_wall=750.0, call_wall=755.0, max_pain=753.0))
     assert sig is not None
     assert sig.direction == "bullish"
     assert sig.strategy_type == "BUY_CALL_DEBIT"
@@ -104,7 +104,7 @@ def test_bullish_put_wall_bounce_fires():
     assert sig.wall_ref_side == "put"
     assert sig.wall_ref_price == 750.0
     assert sig.target_price == 753.0
-    assert sig.stop_price == pytest.approx(750.0 * 0.997)  # break BELOW the wall
+    assert sig.stop_price is None  # dynamic vol-scaled wall-break stop instead
 
 
 # ----------------------------------------------------------------------

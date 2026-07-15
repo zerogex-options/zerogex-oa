@@ -5,10 +5,14 @@ edge is dealer hedging: at the call wall dealers are net long gamma above
 spot and mechanically sell rallies; at the put wall they buy dips. The bot
 sizes proportional to wall strength × conviction and cuts on:
 
-* underlying blowing past the wall by ``wall_break_pct`` (default 0.3%),
+* the underlying blowing THROUGH the wall away from target by a
+  volatility-scaled, wick-confirmed buffer — wider in high vol and into a
+  historically large wall so the fade has room to play out, tighter in a
+  calm tape (BaseBot._wall_stop_signal / _wall_break_buffer_pct),
 * the wall itself migrating in the direction that disfavors the trade,
-* configured target hit (max_pain / gamma_flip),
-* configured stop or time-stop.
+* the option-premium damage-control stop (the hard dollar cap for a fast
+  blow-through) or the time-stop,
+* configured target hit (max_pain / gamma_flip).
 """
 
 from __future__ import annotations
@@ -67,19 +71,50 @@ class PutCallWallBouncer(BaseBot):
             return None
 
         quality = self._quality(snap, wall_side)
-        conviction = self.compute_conviction(snap, quality)
+        # Feature blob for the ML overlay in compute_conviction — the same
+        # keys logged in components_at_entry below, so the online classifier
+        # scores this setup on the exact vector it will later train on.
+        ml_components = {
+            "net_gex": snap.net_gex,
+            "vix": snap.vix,
+            "distance_pct": call_d if wall_side == "call" else put_d,
+        }
+        conviction = self.compute_conviction(snap, quality, components=ml_components)
         if conviction < self.confidence_threshold():
             return None
+
+        # Wall-size-relative sizing input. The engine reads
+        # components_at_entry["wall_strength"] (0..1) and passes it to
+        # sizing.compute_contracts, where wall_scale = 0.5 + strength maps
+        # it to a 0.5..1.5x size knob. We feed the wall's dollar-gamma
+        # PERCENTILE (how large this wall is vs the symbol's own 30d
+        # history at this time of day), normalized to 0..1. None when
+        # history is absent -> the engine leaves wall_strength unset and
+        # sizing stays wall-agnostic (scale 1.0), exactly as before.
+        wall_strength_pctile = (
+            snap.call_wall_strength_pctile if wall_side == "call" else snap.put_wall_strength_pctile
+        )
+        wall_strength_dollar = (
+            snap.call_wall_strength if wall_side == "call" else snap.put_wall_strength
+        )
+        wall_strength_norm = (
+            max(0.0, min(1.0, wall_strength_pctile / 100.0))
+            if wall_strength_pctile is not None
+            else None
+        )
 
         expiration = _today_expiration(snap)
         strike = snap.round_to_strike(snap.spot)
         opt_type = "call" if direction == "bullish" else "put"
         legs = self.build_atm_debit(snap.underlying, opt_type, strike, expiration, 0.0)
-        stop = (wall_price or snap.spot) * (
-            1.0 + float(self.params.get("wall_break_pct", 0.003))
-            if direction == "bearish"
-            else 1.0 - float(self.params.get("wall_break_pct", 0.003))
-        )
+
+        # No static spot-level stop: a fixed level is checked single-tick in
+        # the base exit path and would fire on a wick, pre-empting the
+        # volatility-scaled, wick-confirmed wall-break stop that
+        # BaseBot._wall_stop_signal now owns (it reads wall_ref_side +
+        # this position's wall_strength each tick off the live snapshot).
+        # The option-premium damage-control stop remains the hard dollar
+        # cap for a fast blow-through; time_stop caps duration.
 
         return TradeSignal(
             bot_id=self.spec.id,
@@ -90,14 +125,16 @@ class PutCallWallBouncer(BaseBot):
             entry_price=0.0,  # filled by engine
             conviction=conviction,
             target_price=target,
-            stop_price=stop,
+            # Wall-break stop is dynamic (vol-scaled + confirmed) and lives
+            # in BaseBot._wall_stop_signal, keyed off wall_ref_side below.
+            stop_price=None,
             time_stop_at=_utcnow()
             + timedelta(minutes=int(self.params.get("max_hold_minutes", 90))),
             wall_ref_price=wall_price,
             wall_ref_side=wall_side,
             rationale=(
                 f"{wall_side}-wall rejection at {wall_price} in {snap.gex_regime()} gamma; "
-                f"conviction {conviction:.2f}"
+                f"conviction {conviction:.2f}; vol-scaled confirmed wall-break stop"
             ),
             components_at_entry={
                 "wall_side": wall_side,
@@ -106,6 +143,12 @@ class PutCallWallBouncer(BaseBot):
                 "distance_pct": call_d if wall_side == "call" else put_d,
                 "vix": snap.vix,
                 "quality": quality,
+                # 0..1 sizing input (None -> wall-agnostic); the raw dollar
+                # magnitude and its percentile are kept for the audit trail
+                # and for the wall-aware stop (commit 2 reads them at exit).
+                "wall_strength": wall_strength_norm,
+                "wall_strength_pctile": wall_strength_pctile,
+                "wall_strength_dollar": wall_strength_dollar,
             },
         )
 

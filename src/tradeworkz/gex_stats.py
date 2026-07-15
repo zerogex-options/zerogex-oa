@@ -41,6 +41,10 @@ _RTH_BUCKETS = 78  # 09:30-16:00 ET in 5-min buckets (0..77)
 _METRIC = "net_gex_at_spot"
 _WINDOW = "30d"
 
+# Wall-strength metrics, one per side — the refresh tool aggregates these
+# from the gex_summary.{call,put}_wall_strength columns. Mirrors _METRIC.
+_WALL_METRIC = {"call": "call_wall_strength", "put": "put_wall_strength"}
+
 
 def tod_bucket_for(ts: datetime) -> int:
     """5-minute ET RTH bucket index for ``ts`` (0..77), or -1 outside RTH.
@@ -59,9 +63,7 @@ def tod_bucket_for(ts: datetime) -> int:
     return minutes_since_open // 5
 
 
-def _clean_knots(
-    knots: List[Tuple[float, Any]]
-) -> List[Tuple[float, float]]:
+def _clean_knots(knots: List[Tuple[float, Any]]) -> List[Tuple[float, float]]:
     """Keep finite (pct, value) knots, enforcing a non-decreasing value axis."""
     clean: List[Tuple[float, float]] = []
     for pct, raw in knots:
@@ -94,9 +96,7 @@ def percentile_rank(
     ``None`` when there aren't at least two usable knots, and 50.0 for a
     degenerate (flat) distribution where every knot collapses to one value.
     """
-    knots = _clean_knots(
-        [(5.0, p05), (25.0, p25), (50.0, p50), (75.0, p75), (95.0, p95)]
-    )
+    knots = _clean_knots([(5.0, p05), (25.0, p25), (50.0, p50), (75.0, p75), (95.0, p95)])
     if len(knots) < 2:
         return None
     if knots[0][1] == knots[-1][1]:
@@ -155,9 +155,7 @@ def fetch_net_gex_pctile(
         )
         row = cur.fetchone()
     except Exception:  # pragma: no cover - defensive: missing table etc.
-        logger.debug(
-            "gex_historical_stats lookup failed for %s", underlying, exc_info=True
-        )
+        logger.debug("gex_historical_stats lookup failed for %s", underlying, exc_info=True)
         try:
             conn.rollback()
         except Exception:
@@ -166,3 +164,59 @@ def fetch_net_gex_pctile(
     if not row:
         return None
     return percentile_rank(net_gex_at_spot, *row)
+
+
+def fetch_wall_strength_pctile(
+    conn: Any,
+    underlying: str,
+    side: str,
+    wall_strength: Optional[float],
+    ts: datetime,
+) -> Optional[float]:
+    """Percentile (0..100) of a wall's dollar-gamma strength in the symbol's
+    30d, time-of-day-bucketed distribution — the wall analog of
+    :func:`fetch_net_gex_pctile`.
+
+    ``side`` selects the metric: ``'call'`` -> ``call_wall_strength``,
+    ``'put'`` -> ``put_wall_strength``. Best-effort like its sibling:
+    returns ``None`` — and clears any aborted transaction state so the
+    caller's next query still works — on any failure, unknown side,
+    missing value, or absent history (a brand-new column has no history
+    until the nightly refresh accumulates it), so the caller falls back to
+    neutral, wall-agnostic sizing.
+    """
+    if wall_strength is None:
+        return None
+    metric = _WALL_METRIC.get((side or "").lower())
+    if metric is None:
+        return None
+    bucket = tod_bucket_for(ts)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT p05, p25, p50, p75, p95
+            FROM gex_historical_stats
+            WHERE underlying = %s AND metric = %s AND window_label = %s
+              AND tod_bucket = ANY(%s)
+            ORDER BY (tod_bucket = %s) DESC
+            LIMIT 1
+            """,
+            (underlying, metric, _WINDOW, [bucket, -1], bucket),
+        )
+        row = cur.fetchone()
+    except Exception:  # pragma: no cover - defensive: missing table etc.
+        logger.debug(
+            "wall_strength pctile lookup failed for %s/%s",
+            underlying,
+            side,
+            exc_info=True,
+        )
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
+    if not row:
+        return None
+    return percentile_rank(wall_strength, *row)

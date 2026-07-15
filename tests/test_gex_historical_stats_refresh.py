@@ -75,10 +75,19 @@ def test_tod_bucket_outside_rth_returns_minus_one():
 
 
 def test_metric_set_matches_endpoint_contract():
-    """The endpoint hard-codes which metric names it reads back; keep both
-    sides in lockstep so the refresh tool can't silently drop a metric."""
+    """The historical-context endpoint hard-codes which metric names it
+    reads back (get_gex_historical_context, src/api/database.py: the
+    ``for metric_name in ("net_gex_at_spot", "total_net_gex")`` loop). The
+    refresh tool must keep PRODUCING those so the endpoint never reads a
+    dropped metric — but it may also produce others the endpoint ignores
+    (the TradeWorkz wall-strength metrics, consumed only by
+    src/tradeworkz/gex_stats.py). So the endpoint set must be a subset of
+    what the refresh tool writes, not equal to it."""
     metric_names = {name for name, _column in METRICS}
-    assert metric_names == {"net_gex_at_spot", "total_net_gex"}
+    endpoint_metrics = {"net_gex_at_spot", "total_net_gex"}
+    assert endpoint_metrics <= metric_names
+    # The wall-strength metrics are wired for TradeWorkz sizing.
+    assert {"call_wall_strength", "put_wall_strength"} <= metric_names
 
 
 def test_window_labels_are_unique_and_known():
