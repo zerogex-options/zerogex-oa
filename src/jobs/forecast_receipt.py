@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 from src.api.database import DatabaseManager
@@ -37,6 +40,66 @@ def _is_trading_day(day: date) -> bool:
     if day in NYSE_HOLIDAYS:
         return False
     return True
+
+
+def _revalidate_web(day: date, symbols: list[str]) -> None:
+    """Nudge the website to re-render the forecast surfaces immediately.
+
+    After the receipt columns are written, POST the website's on-demand ISR
+    revalidation endpoint so the public ``/forecast`` landing card and each
+    ``/forecast/{symbol}/{date}`` permalink flip to receipt state within
+    seconds — instead of waiting out their ISR window (up to an hour on the
+    landing card, which otherwise keeps reading "Pending 4 PM" long after the
+    grade landed).
+
+    Controlled by two env vars: ``FORECAST_REVALIDATE_URL`` (the website's
+    ``/api/revalidate/forecast`` endpoint) and ``FORECAST_REVALIDATE_TOKEN`` (a
+    shared bearer secret, mirroring the ``BULLETIN_SNAPSHOT_TOKEN`` cross-box
+    convention). If either is unset the nudge is skipped and the pages simply
+    self-heal on their normal ISR cadence.
+
+    Best-effort and never raises: the receipt is already durably committed, so
+    a failed or unconfigured ping is a cosmetic-latency issue, not a data one.
+    """
+    url = os.environ.get("FORECAST_REVALIDATE_URL", "").strip()
+    token = os.environ.get("FORECAST_REVALIDATE_TOKEN", "").strip()
+    if not url or not token:
+        logger.info(
+            "forecast_receipt: web revalidation not configured "
+            "(FORECAST_REVALIDATE_URL/TOKEN unset) — pages self-heal on ISR",
+        )
+        return
+    if not symbols:
+        return
+
+    payload = json.dumps({"date": day.isoformat(), "symbols": symbols}).encode("utf-8")
+    req = Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "zerogex-forecast-receipt/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=10) as resp:  # noqa: S310 — fixed internal URL
+            body = resp.read().decode("utf-8", errors="replace")
+        logger.info(
+            "forecast_receipt: revalidated web for %s [%s] — %s",
+            day.isoformat(), ",".join(symbols), body[:200],
+        )
+    except (HTTPError, URLError) as exc:
+        logger.warning(
+            "forecast_receipt: web revalidation POST failed (%s) — receipt is "
+            "written; pages self-heal on ISR", exc,
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort; never fail the run
+        logger.warning(
+            "forecast_receipt: unexpected web revalidation error (%s) — ignoring",
+            exc,
+        )
 
 
 async def _fetch_session_ohlc(
@@ -119,6 +182,7 @@ async def _run(args: argparse.Namespace) -> int:
 
     try:
         symbols = [s.strip().upper() for s in args.symbol.split(",") if s.strip()]
+        graded: list[str] = []
         for sym in symbols:
             ohlc = await _fetch_session_ohlc(db, sym, day)
             if ohlc is None:
@@ -149,6 +213,7 @@ async def _run(args: argparse.Namespace) -> int:
                     sym, day.isoformat(),
                 )
                 continue
+            graded.append(sym)
             logger.info(
                 "forecast_receipt: wrote receipt for %s %s — range_respected=%s pin_hit=%s regime_correct=%s",
                 sym, day.isoformat(),
@@ -156,6 +221,12 @@ async def _run(args: argparse.Namespace) -> int:
                 row.get("pin_hit"),
                 row.get("regime_correct"),
             )
+
+        # Flip the public forecast surfaces to receipt state now, rather than
+        # waiting out their ISR window. No-op unless FORECAST_REVALIDATE_URL/
+        # TOKEN are set; never raises (the receipts are already committed).
+        if graded and not args.dry_run:
+            _revalidate_web(day, graded)
         return 0
     finally:
         try:

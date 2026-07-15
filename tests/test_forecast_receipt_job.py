@@ -4,6 +4,7 @@ exists, and idempotent retries against the immutability trigger."""
 
 from __future__ import annotations
 
+import json
 import sys
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -168,3 +169,90 @@ async def test_receipt_swallows_db_failure(monkeypatch, caplog):
     with caplog.at_level("WARNING"):
         rc = await mod._run(args)
     assert rc == 0
+
+
+@pytest.mark.asyncio
+async def test_receipt_pings_web_revalidation_with_graded_symbols(monkeypatch):
+    """After writing receipts, _run nudges the website with exactly the
+    symbols that graded (update returned a row)."""
+    mod = _reload_module()
+    fake = _fake_db(update_result={
+        "range_respected": True, "pin_hit": False, "regime_correct": True,
+    })
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
+    calls: list[tuple] = []
+    monkeypatch.setattr(mod, "_revalidate_web", lambda day, syms: calls.append((day, list(syms))))
+    args = mod._parse_args(["--date", "2026-06-29", "--symbol", "SPY,QQQ"])
+    rc = await mod._run(args)
+    assert rc == 0
+    assert calls == [(date(2026, 6, 29), ["SPY", "QQQ"])]
+
+
+@pytest.mark.asyncio
+async def test_receipt_no_revalidation_on_dry_run(monkeypatch):
+    mod = _reload_module()
+    fake = _fake_db()
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
+    called: list = []
+    monkeypatch.setattr(mod, "_revalidate_web", lambda *a, **k: called.append(a))
+    args = mod._parse_args(["--date", "2026-06-29", "--dry-run"])
+    rc = await mod._run(args)
+    assert rc == 0
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_receipt_no_revalidation_when_nothing_graded(monkeypatch):
+    """No morning row → update returns None → nothing graded → no ping."""
+    mod = _reload_module()
+    fake = _fake_db(update_result=None)
+    monkeypatch.setattr(mod, "DatabaseManager", lambda: fake)
+    called: list = []
+    monkeypatch.setattr(mod, "_revalidate_web", lambda *a, **k: called.append(a))
+    args = mod._parse_args(["--date", "2026-06-29", "--symbol", "SPY"])
+    rc = await mod._run(args)
+    assert rc == 0
+    assert called == []
+
+
+def test_revalidate_web_posts_signed_payload(monkeypatch):
+    mod = _reload_module()
+    monkeypatch.setenv("FORECAST_REVALIDATE_URL", "https://example.test/api/revalidate/forecast")
+    monkeypatch.setenv("FORECAST_REVALIDATE_TOKEN", "s3cr3t")
+
+    captured: dict = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            return False
+        def read(self):
+            return b'{"revalidated":["/forecast"]}'
+
+    def _fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["method"] = req.get_method()
+        captured["headers"] = dict(req.header_items())
+        captured["body"] = req.data
+        return _Resp()
+
+    monkeypatch.setattr(mod, "urlopen", _fake_urlopen)
+    mod._revalidate_web(date(2026, 6, 29), ["SPY", "QQQ"])
+
+    assert captured["url"] == "https://example.test/api/revalidate/forecast"
+    assert captured["method"] == "POST"
+    # urllib title-cases header keys: Content-Type → Content-type, etc.
+    assert captured["headers"].get("Authorization") == "Bearer s3cr3t"
+    assert captured["headers"].get("Content-type") == "application/json"
+    assert json.loads(captured["body"]) == {"date": "2026-06-29", "symbols": ["SPY", "QQQ"]}
+
+
+def test_revalidate_web_noop_when_unconfigured(monkeypatch):
+    mod = _reload_module()
+    monkeypatch.delenv("FORECAST_REVALIDATE_URL", raising=False)
+    monkeypatch.delenv("FORECAST_REVALIDATE_TOKEN", raising=False)
+    called: list = []
+    monkeypatch.setattr(mod, "urlopen", lambda *a, **k: called.append(a))
+    mod._revalidate_web(date(2026, 6, 29), ["SPY"])
+    assert called == []
