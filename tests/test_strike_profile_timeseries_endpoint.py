@@ -173,7 +173,8 @@ def test_expirations_all_passed_as_none(monkeypatch: pytest.MonkeyPatch):
 
 def test_expirations_date_passed_through(monkeypatch: pytest.MonkeyPatch):
     """A single YYYY-MM-DD expiration must reach the DB layer as a
-    ``datetime.date`` so the SQL binds it via $3::date."""
+    one-element ``[datetime.date]`` list so the SQL binds it via
+    $3::date[] = ANY(...)."""
     client, mock = _build_app_with_mocked_method(monkeypatch, returns=[])
     with client:
         response = client.get(
@@ -183,17 +184,48 @@ def test_expirations_date_passed_through(monkeypatch: pytest.MonkeyPatch):
     assert response.status_code == 200
     mock.assert_awaited_once()
     args, _ = mock.call_args
-    assert args[3] == date(2026, 6, 19)
+    assert args[3] == [date(2026, 6, 19)]
+
+
+def test_expirations_comma_list_passed_through(monkeypatch: pytest.MonkeyPatch):
+    """A comma-separated set of YYYY-MM-DD expirations reaches the DB layer
+    as a list of ``datetime.date`` — the multi-expiration selection the
+    Strike-Profile / Gamma-Exposure charts send when the user picks more
+    than one expiry."""
+    client, mock = _build_app_with_mocked_method(monkeypatch, returns=[])
+    with client:
+        response = client.get(
+            "/api/gex/strike-profile-timeseries"
+            "?symbol=SPY&expirations=2026-06-19,2026-06-20"
+        )
+
+    assert response.status_code == 200
+    mock.assert_awaited_once()
+    args, _ = mock.call_args
+    assert args[3] == [date(2026, 6, 19), date(2026, 6, 20)]
 
 
 def test_expirations_invalid_returns_400(monkeypatch: pytest.MonkeyPatch):
-    """Anything other than ``all`` or a parseable YYYY-MM-DD date is a
-    client error.  The chart's expiry dropdown only sends valid values,
-    so this is defense-in-depth against SQL-injection-as-date — never
-    interpolate the raw string into the SQL."""
+    """Anything other than ``all`` or a parseable comma-separated list of
+    YYYY-MM-DD dates is a client error.  The chart's expiry dropdown only
+    sends valid values, so this is defense-in-depth against
+    SQL-injection-as-date — never interpolate the raw string into the SQL."""
     client, _ = _build_app_with_mocked_method(monkeypatch, returns=[])
     with client:
         response = client.get("/api/gex/strike-profile-timeseries?symbol=SPY&expirations=tomorrow")
+    assert response.status_code == 400
+    assert "expirations" in response.json()["detail"].lower()
+
+
+def test_expirations_partly_invalid_list_returns_400(monkeypatch: pytest.MonkeyPatch):
+    """One bad entry in the comma-separated list rejects the whole request —
+    a partial silent drop would show the user data for a different set than
+    they selected."""
+    client, _ = _build_app_with_mocked_method(monkeypatch, returns=[])
+    with client:
+        response = client.get(
+            "/api/gex/strike-profile-timeseries?symbol=SPY&expirations=2026-06-19,tomorrow"
+        )
     assert response.status_code == 400
     assert "expirations" in response.json()["detail"].lower()
 

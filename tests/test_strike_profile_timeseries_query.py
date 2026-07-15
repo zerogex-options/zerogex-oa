@@ -27,6 +27,8 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import date
 
+import pytest
+
 from src.api.database import DatabaseManager
 
 
@@ -52,12 +54,12 @@ def _install_conn(db, conn):
     db._acquire_connection = _acquire  # type: ignore[method-assign]
 
 
-def _run(symbol, timeframe="1min", window_units=78, expiration=None, rows=None):
+def _run(symbol, timeframe="1min", window_units=78, expirations=None, rows=None):
     db = DatabaseManager()
     conn = _RecordingConn(fetch_rows=rows or [])
     _install_conn(db, conn)
     result = asyncio.run(
-        db.get_strike_profile_timeseries(symbol, timeframe, window_units, expiration)
+        db.get_strike_profile_timeseries(symbol, timeframe, window_units, expirations)
     )
     return {
         "query": conn.queries[0] if conn.queries else "",
@@ -182,15 +184,21 @@ def test_cash_index_restricts_to_regular_session():
 
 
 def test_expiration_filter_is_fixed_shape_predicate():
-    """One SQL plan for both modes: ``$3::date IS NULL OR gbs.expiration =
-    $3::date``.  The query must look identical regardless of whether the
-    caller passed an expiration date or 'all'."""
-    captured_all = _run("SPY", expiration=None)
-    captured_one = _run("SPY", expiration=date(2026, 6, 19))
-    assert captured_all["query"] == captured_one["query"]
-    assert "$3::date IS NULL OR gbs.expiration = $3::date" in captured_all["query"]
+    """One SQL plan for every mode: ``$3::date[] IS NULL OR gbs.expiration =
+    ANY($3::date[])``.  The query must look identical whether the caller
+    passed 'all' (None) or a set of expiration dates — only the bound
+    ``date[]`` param differs.  Selecting a set binds a sorted, de-duped
+    ``date[]``; 'all' binds NULL so the IS NULL branch fires."""
+    captured_all = _run("SPY", expirations=None)
+    captured_set = _run("SPY", expirations=[date(2026, 6, 20), date(2026, 6, 19)])
+    assert captured_all["query"] == captured_set["query"]
+    assert (
+        "$3::date[] IS NULL OR gbs.expiration = ANY($3::date[])"
+        in captured_all["query"]
+    )
     assert captured_all["args"][2] is None
-    assert captured_one["args"][2] == date(2026, 6, 19)
+    # Normalised to a sorted, de-duplicated list before binding.
+    assert captured_set["args"][2] == [date(2026, 6, 19), date(2026, 6, 20)]
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +523,92 @@ def test_walls_null_when_close_is_missing():
     bucket = captured["result"][0]
     assert bucket["call_wall"] is None
     assert bucket["put_wall"] is None
+
+
+# ---------------------------------------------------------------------------
+# Gamma-flip scope follows the expiration filter
+# ---------------------------------------------------------------------------
+
+
+def _flip_rows():
+    """Three strikes around spot 100 whose cumulative net gamma
+    (call_gamma_raw - put_gamma_raw, ascending) crosses zero once:
+
+        95  -> net -40, cum -40
+        100 -> net -10, cum -50
+        105 -> net +80, cum +30   (crossing between 100 and 105)
+
+    Crossing price = 100 + 5 * 50 / 80 = 103.125.  ``gamma_flip`` on every
+    row is a deliberately-different aggregate value (510) so the test can
+    tell "kept persisted" from "recomputed from strikes" apart.
+    """
+    rows = []
+    for strike, cg, pg in ((95.0, 10.0, 50.0), (100.0, 30.0, 40.0), (105.0, 90.0, 10.0)):
+        rows.append(
+            {
+                "timestamp": "2026-06-08T14:30:00+00:00",
+                "open": 100.0,
+                "high": 100.0,
+                "low": 100.0,
+                "close": 100.0,
+                "gamma_flip": 510.0,
+                "strike": strike,
+                "call_gamma_raw": cg,
+                "put_gamma_raw": pg,
+                "call_gex": cg,
+                "put_gex": -pg,
+                "net_gex": cg - pg,
+                "call_oi": 0,
+                "put_oi": 0,
+            }
+        )
+    return rows
+
+
+def test_flip_scoped_to_subset_recomputed_from_strikes():
+    """A specific expiration set recomputes the bucket flip from the
+    summed-by-strike gamma (cumulative net-GEX zero crossing) against the
+    bucket's own close — the aggregate spot-shift flip can't be rebuilt for
+    a subset, so the persisted value must NOT leak through."""
+    bucket = _run("SPY", expirations=[date(2026, 6, 19)], rows=_flip_rows())["result"][0]
+    assert bucket["gamma_flip"] == pytest.approx(103.125)
+
+
+def test_flip_all_keeps_persisted_aggregate():
+    """``expirations=None`` (All) keeps the canonical persisted
+    ``gex_summary.gamma_flip_point`` verbatim so the chart's "All" flip
+    stays in parity with /api/gex/summary and the headline metric — no
+    regression from the subset path."""
+    bucket = _run("SPY", expirations=None, rows=_flip_rows())["result"][0]
+    assert bucket["gamma_flip"] == 510.0
+
+
+def test_flip_scoped_subset_null_when_curve_one_signed():
+    """A subset whose cumulative net-GEX curve never crosses zero (one-signed
+    book) yields a NULL flip rather than falling back to the aggregate — the
+    chart draws no flip line in that case."""
+    rows = []
+    for strike, cg, pg in ((95.0, 50.0, 0.0), (100.0, 60.0, 0.0), (105.0, 90.0, 0.0)):
+        rows.append(
+            {
+                "timestamp": "2026-06-08T14:30:00+00:00",
+                "open": 100.0,
+                "high": 100.0,
+                "low": 100.0,
+                "close": 100.0,
+                "gamma_flip": 510.0,
+                "strike": strike,
+                "call_gamma_raw": cg,
+                "put_gamma_raw": pg,
+                "call_gex": cg,
+                "put_gex": -pg,
+                "net_gex": cg - pg,
+                "call_oi": 0,
+                "put_oi": 0,
+            }
+        )
+    bucket = _run("SPY", expirations=[date(2026, 6, 19)], rows=rows)["result"][0]
+    assert bucket["gamma_flip"] is None
 
 
 # ---------------------------------------------------------------------------

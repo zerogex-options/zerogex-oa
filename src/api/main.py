@@ -657,8 +657,9 @@ async def get_strike_profile_timeseries(
         default="all",
         description=(
             "'all' to aggregate strikes across every expiration (same basis as "
-            "the live /api/gex/by-strike with Expiry All), or a single "
-            "YYYY-MM-DD expiration date to restrict the strikes payload."
+            "the live /api/gex/by-strike with Expiry All), or a comma-separated "
+            "list of YYYY-MM-DD expiration dates to restrict the strikes "
+            "payload to that set (summed across the set)."
         ),
     ),
 ):
@@ -676,34 +677,48 @@ async def get_strike_profile_timeseries(
         canonical :func:`src.analytics.walls.compute_call_put_walls`
         helper (single source of record).  ``expirations=all`` yields
         the cross-expiration aggregate walls (matches
-        ``/api/gex/summary``); ``expirations=<YYYY-MM-DD>`` yields walls
-        scoped to that expiration's gamma alone;
+        ``/api/gex/summary``); a specific set yields walls scoped to
+        that set's gamma alone;
       * every strike's gamma exposure in the same dollar-GEX units
         ``/api/gex/by-strike`` uses (``γ × OI × 100 × S² × 0.01``),
         evaluated against the bucket's own ``close`` so the surface
         matches each bucket's candlestick.
 
     ``expirations=all`` sums strike gamma / OI across all expirations per
-    (bucket, strike).  ``expirations=<YYYY-MM-DD>`` restricts the
-    strikes payload to that single expiration date.  Names in the
-    strikes payload follow the request shape (``call_gamma`` /
+    (bucket, strike).  A comma-separated list of ``YYYY-MM-DD`` dates
+    restricts the strikes payload to that set (summed across the set).
+    For a specific set the bucket ``gamma_flip`` is recomputed from the
+    summed-by-strike gamma (the aggregate spot-shift flip can't be rebuilt
+    for a subset); ``all`` keeps the canonical ``gex_summary`` flip.  Names
+    in the strikes payload follow the request shape (``call_gamma`` /
     ``put_gamma`` / ``net_gamma``) but the values are the dollar-GEX
     quantities, not raw gamma — see the per-row docstring on
-    ``StrikeProfileStrike``.
+    ``StrikeProfileStrike``.  Any unparseable entry is a 400.
     """
-    expiration_date: Optional[date_type] = None
+    expiration_dates: Optional[List[date_type]] = None
     raw = (expirations or "all").strip()
     if raw.lower() != "all":
-        try:
-            expiration_date = date_type.fromisoformat(raw)
-        except ValueError:
-            raise HTTPException(
-                status_code=400,
-                detail=("expirations must be 'all' or a YYYY-MM-DD expiration date"),
-            )
+        parsed: List[date_type] = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                parsed.append(date_type.fromisoformat(part))
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "expirations must be 'all' or a comma-separated list "
+                        "of YYYY-MM-DD expiration dates"
+                    ),
+                )
+        # An all-blank list (e.g. ``expirations=,``) collapses to All rather
+        # than a chart-blanking empty filter.
+        expiration_dates = parsed or None
 
     data = await _db().get_strike_profile_timeseries(
-        symbol, timeframe, window_units, expiration_date
+        symbol, timeframe, window_units, expiration_dates
     )
     return [StrikeProfileBucket(**row) for row in data]
 

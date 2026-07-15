@@ -292,3 +292,78 @@ def test_main_engine_summary_includes_call_put_walls():
     assert summary is not None
     assert summary["call_wall"] == 505.0
     assert summary["put_wall"] == 495.0
+
+
+# ---------------------------------------------------------------------------
+# compute_gamma_flip_from_strikes — cumulative net-GEX zero crossing
+# ---------------------------------------------------------------------------
+
+from src.analytics.walls import compute_gamma_flip_from_strikes  # noqa: E402
+
+
+def _flip_row(strike: float, call_gamma: float, put_gamma: float) -> dict:
+    return {"strike": strike, "call_gamma": call_gamma, "put_gamma": put_gamma}
+
+
+def test_flip_interpolates_single_zero_crossing():
+    """Cumulative net gamma (call_gamma - put_gamma) ascending:
+        95  -> -40, cum -40
+        100 -> -10, cum -50
+        105 -> +80, cum +30   (crosses between 100 and 105)
+    Crossing = 100 + 5 * 50 / 80 = 103.125.
+    """
+    rows = [
+        _flip_row(95.0, 10.0, 50.0),
+        _flip_row(100.0, 30.0, 40.0),
+        _flip_row(105.0, 90.0, 10.0),
+    ]
+    flip = compute_gamma_flip_from_strikes(rows, spot_price=100.0)
+    assert flip is not None
+    assert abs(flip - 103.125) < 1e-9
+
+
+def test_flip_none_when_curve_one_signed():
+    """An all-positive net-gamma book never crosses zero — no flip."""
+    rows = [
+        _flip_row(95.0, 50.0, 0.0),
+        _flip_row(100.0, 60.0, 0.0),
+        _flip_row(105.0, 90.0, 0.0),
+    ]
+    assert compute_gamma_flip_from_strikes(rows, spot_price=100.0) is None
+
+
+def test_flip_exact_zero_at_strike():
+    """When the running total lands exactly on zero at a strike, that
+    strike is the flip."""
+    rows = [
+        _flip_row(95.0, 0.0, 40.0),   # cum -40
+        _flip_row(100.0, 40.0, 0.0),  # cum 0  -> flip at 100
+        _flip_row(105.0, 20.0, 0.0),  # cum +20
+    ]
+    flip = compute_gamma_flip_from_strikes(rows, spot_price=101.0)
+    assert flip == 100.0
+
+
+def test_flip_picks_crossing_nearest_spot():
+    """A lumpy book with two crossings keeps the one nearest spot, matching
+    the canonical resolver's tie-break."""
+    # cum: 90->+10, 95->-5 (cross ~93.3), 100->+5 (cross ~97.5),
+    #      105->+15.  Spot 98 -> nearest crossing is the ~97.5 one.
+    rows = [
+        _flip_row(90.0, 10.0, 0.0),
+        _flip_row(95.0, 0.0, 15.0),
+        _flip_row(100.0, 10.0, 0.0),
+        _flip_row(105.0, 10.0, 0.0),
+    ]
+    flip = compute_gamma_flip_from_strikes(rows, spot_price=98.0)
+    assert flip is not None
+    # Second crossing sits between 95 (cum -5) and 100 (cum +5): 97.5.
+    assert abs(flip - 97.5) < 1e-9
+
+
+def test_flip_none_for_degenerate_inputs():
+    """No spot, non-positive spot, or fewer than two strikes -> None."""
+    rows = [_flip_row(100.0, 10.0, 5.0), _flip_row(105.0, 8.0, 20.0)]
+    assert compute_gamma_flip_from_strikes(rows, spot_price=0.0) is None
+    assert compute_gamma_flip_from_strikes([], spot_price=100.0) is None
+    assert compute_gamma_flip_from_strikes([_flip_row(100.0, 1.0, 2.0)], 100.0) is None
