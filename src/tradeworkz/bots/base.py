@@ -504,18 +504,72 @@ class BaseBot:
             ),
         ]
 
-    def compute_conviction(self, snap: MarketSnapshot, quality_score: float) -> float:
-        """Blend the calibrated confidence base with the per-tick quality.
+    def compute_conviction(
+        self,
+        snap: MarketSnapshot,
+        quality_score: float,
+        components: Optional[Dict[str, Any]] = None,
+    ) -> float:
+        """Blend the calibrated confidence base with the per-tick quality,
+        then nudge toward the online classifier's P(win) when it is trained.
 
         ``quality_score`` is a bot-authored 0..1 read of how clean the setup
         is right now. We linearly interpolate between the calibrated base
         and the quality reading so a bot with a strong historical hit rate
         can still fire on a marginal setup, and vice versa.
+
+        ``components`` — when a bot passes the same feature blob it will log
+        at entry — activates the ML overlay: the per-bot online
+        logistic-regression classifier (``tw_ml_state.weights``, trained one
+        SGD step per closed trade) scores this setup's P(win), and we pull
+        the blended conviction a bounded fraction toward it. This is the
+        step that makes the learned model actually *drive* trades rather
+        than only being trained and shelved. It is deliberately conservative:
+
+        * a no-op unless the bot passes ``components`` AND the model has seen
+          at least ``ml_min_samples`` trades AND has non-zero weights — so a
+          fresh or lightly-traded bot behaves exactly as before;
+        * a bounded convex nudge (``ml_conviction_weight``, default 0.25) —
+          the classifier can lean the gate, never dominate it, and the
+          result stays in [0, 1];
+        * the provisional blend is fed in as the ``conviction`` feature (the
+          real entry conviction is circular here); the pull is small enough
+          that the one-shot approximation is stable.
         """
         base = self.confidence_base()
         q = max(0.0, min(1.0, quality_score))
         blended = 0.4 * base + 0.6 * q
+        p_win = self._ml_win_prob(components, provisional=blended)
+        if p_win is not None:
+            w = max(0.0, min(1.0, float(self.params.get("ml_conviction_weight", 0.25))))
+            blended = (1.0 - w) * blended + w * p_win
         return max(0.0, min(1.0, blended))
+
+    def _ml_win_prob(
+        self, components: Optional[Dict[str, Any]], provisional: float
+    ) -> Optional[float]:
+        """Classifier P(win) for this setup, or ``None`` to skip the overlay.
+
+        Gated: needs a feature blob, at least ``ml_min_samples`` trades of
+        history, and a trained (non-zero) weight vector — otherwise the
+        blend is left untouched. The ``conviction`` feature defaults to the
+        provisional blend so training (which logs the final conviction) and
+        inference use a consistent value.
+        """
+        if components is None:
+            return None
+        try:
+            n_samples = int(self.ml_state.get("n_samples") or 0)
+        except (TypeError, ValueError):
+            n_samples = 0
+        min_samples = int(self.params.get("ml_min_samples", 20))
+        if n_samples < min_samples:
+            return None
+        feats = dict(components)
+        feats.setdefault("conviction", provisional)
+        from src.tradeworkz import ml as ml_mod
+
+        return ml_mod.predict_win_prob(self.ml_state.get("weights"), feats)
 
 
 def _synthetic_option_symbol(underlying: str, opt: str, strike: float, exp: str) -> str:

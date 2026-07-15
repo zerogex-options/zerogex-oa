@@ -71,7 +71,15 @@ class PutCallWallBouncer(BaseBot):
             return None
 
         quality = self._quality(snap, wall_side)
-        conviction = self.compute_conviction(snap, quality)
+        # Feature blob for the ML overlay in compute_conviction — the same
+        # keys logged in components_at_entry below, so the online classifier
+        # scores this setup on the exact vector it will later train on.
+        ml_components = {
+            "net_gex": snap.net_gex,
+            "vix": snap.vix,
+            "distance_pct": call_d if wall_side == "call" else put_d,
+        }
+        conviction = self.compute_conviction(snap, quality, components=ml_components)
         if conviction < self.confidence_threshold():
             return None
 

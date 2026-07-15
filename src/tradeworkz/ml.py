@@ -21,8 +21,8 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, Optional
 
 from src.tradeworkz import config as tw_config
 
@@ -143,6 +143,7 @@ def _extract_features(components: Dict[str, Any]) -> Dict[str, float]:
     still play well with the classifier — the online-update path clamps
     magnitudes to a sane range too.
     """
+
     def norm(v: Any, denom: float) -> float:
         try:
             f = float(v) if v is not None else 0.0
@@ -156,7 +157,12 @@ def _extract_features(components: Dict[str, Any]) -> Dict[str, float]:
         "net_gex_norm": norm(components.get("net_gex"), 2.0e9),
         "vix_norm": norm(components.get("vix"), 20.0),
         "minutes_since_open_norm": norm(components.get("minutes_since_open"), 60.0),
-        "spot_stretch_norm": norm(components.get("distance_pct") or components.get("stretch_pct") or components.get("drift_pct"), 0.005),
+        "spot_stretch_norm": norm(
+            components.get("distance_pct")
+            or components.get("stretch_pct")
+            or components.get("drift_pct"),
+            0.005,
+        ),
         "conviction": max(0.0, min(1.0, float(components.get("conviction") or 0.0))),
         "bias": 1.0,
     }
@@ -193,6 +199,35 @@ def online_update(state: MLState, components: Dict[str, Any], won: bool) -> MLSt
         state.n_wins += 1
     state.hit_rate = state.n_wins / max(1, state.n_samples)
     return state
+
+
+def predict_win_prob(weights: Any, components: Dict[str, Any]) -> Optional[float]:
+    """Inference counterpart of :func:`online_update`: the classifier's P(win).
+
+    Scores ``components`` under the learned ``weights`` using the *same*
+    :func:`_extract_features` vector the SGD step fits, so training and
+    inference never diverge. ``weights`` may be the ``{feature: weight}``
+    dict or its JSON string (as stored on ``tw_ml_state``).
+
+    Returns ``None`` — a signal to the caller to skip the ML overlay
+    entirely — when the model is effectively untrained: no weights, or an
+    all-zero vector (the cold-start state, where a sigmoid would return a
+    meaningless 0.5). This is what keeps a fresh bot's behavior identical to
+    the pre-ML blend until it has actually learned something.
+    """
+    if isinstance(weights, str):
+        try:
+            weights = json.loads(weights)
+        except (ValueError, TypeError):
+            return None
+    if not weights:
+        return None
+    w = {k: float(weights.get(k, 0.0)) for k in FEATURE_KEYS}
+    if not any(w[k] != 0.0 for k in FEATURE_KEYS):
+        return None
+    feats = _extract_features(components)
+    z = sum(w[k] * feats[k] for k in FEATURE_KEYS)
+    return _sigmoid(z)
 
 
 def recalibrate_bot(conn: Any, bot_id: str) -> MLState:
