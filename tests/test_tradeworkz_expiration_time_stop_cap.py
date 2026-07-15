@@ -20,8 +20,6 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-import pytest
-
 from src.tradeworkz.reconciler import (
     _cap_time_stop_at_expiration,
     _earliest_leg_expiration,
@@ -112,7 +110,15 @@ def test_cap_time_stop_swing_leg_next_month_uses_that_expiration():
     not today's 15:55 ET — otherwise a 30-DTE entry would force-close
     5 minutes before today's close and never see its intended horizon."""
     exp = date.today() + timedelta(days=30)
-    signal_ts = datetime.now(timezone.utc) + timedelta(days=30, hours=6)
+    # A swing bot's requested time_stop_at that lands AFTER the expiration-day
+    # cap. Anchored to the expiration evening (ET), not now()+6h, which made
+    # this flaky: when the suite ran early enough in the ET day, now()+6h fell
+    # BEFORE 15:55 ET on expiration day and the cap was a no-op.
+    signal_ts = (
+        datetime.combine(exp, datetime.min.time(), tzinfo=_ET)
+        .replace(hour=23)
+        .astimezone(timezone.utc)
+    )
     legs = [_leg(744, exp.isoformat())]
     capped = _cap_time_stop_at_expiration(signal_ts, legs)
     expected = datetime.combine(exp, datetime.min.time(), tzinfo=_ET).replace(
