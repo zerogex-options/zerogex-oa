@@ -170,6 +170,92 @@ def compute_call_put_walls_with_strength(
     return call_wall, put_wall, call_wall_strength, put_wall_strength
 
 
+def compute_gamma_flip_from_strikes(
+    gex_by_strike: Iterable[Mapping[str, Any]],
+    spot_price: float,
+) -> Optional[float]:
+    """Best-available gamma flip for an arbitrary expiration subset.
+
+    The canonical gamma flip
+    (:meth:`src.analytics.main_engine.AnalyticsEngine._calculate_gamma_flip_point`)
+    is the zero crossing of the **spot-shift** dealer-gamma profile — every
+    option's gamma re-priced across a hypothetical-price grid.  That needs
+    the live chain with per-strike IV, which isn't persisted in the
+    ``gex_by_strike`` snapshot, so it can't be rebuilt for an arbitrary
+    subset of expirations (or for any historical bucket).
+
+    This helper computes the pragmatic proxy the app already describes to
+    users ("the low→high cumulative curve whose zero crossing is the gamma
+    flip", see the GEX-Profile / Net-GEX-at-spot copy): accumulate net
+    dealer gamma (``call_gamma - put_gamma``) across strikes ascending and
+    return the price where the running total changes sign.  The scaling
+    constant (``100 × S² × 0.01``) that turns raw gamma into dollar GEX is
+    positive and common to every strike, so the crossing strike is
+    scale-invariant — passing raw summed gamma yields the same answer as
+    passing dollar GEX.
+
+    :param gex_by_strike: rows with at least ``strike``, ``call_gamma``,
+        ``put_gamma``.  Rows may be per-(strike, expiration) — they're
+        aggregated by strike first, same as :func:`compute_call_put_walls`.
+        Filter to the desired expiration grouping on the caller side.
+    :param spot_price: current underlying price; used only as the
+        nearest-crossing tie-break when the cumulative curve crosses zero
+        more than once (a lumpy book), matching the canonical resolver.
+    :returns: the flip price, or ``None`` when the curve is one-signed
+        across the whole chain (no crossing) or the inputs are unusable.
+    """
+    if spot_price is None or spot_price <= 0:
+        return None
+
+    agg: "defaultdict[float, float]" = defaultdict(float)
+    for row in gex_by_strike:
+        try:
+            strike = float(row["strike"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        agg[strike] += float(row.get("call_gamma") or 0.0) - float(
+            row.get("put_gamma") or 0.0
+        )
+
+    if len(agg) < 2:
+        # A single strike (or none) has no interval over which the
+        # cumulative curve can cross zero.
+        return None
+
+    # Build the ascending cumulative curve [(strike, running_net_gamma), …].
+    cumulative = 0.0
+    curve: list[Tuple[float, float]] = []
+    for strike in sorted(agg.keys()):
+        cumulative += agg[strike]
+        curve.append((strike, cumulative))
+
+    best_flip: Optional[float] = None
+    best_dist = float("inf")
+
+    def _consider(candidate: float) -> None:
+        nonlocal best_flip, best_dist
+        dist = abs(candidate - spot_price)
+        if dist < best_dist:
+            best_dist = dist
+            best_flip = candidate
+
+    # Same crossing scan the canonical resolver uses: exact zeros count, and
+    # a sign change between adjacent points is linearly interpolated.  With
+    # multiple crossings keep the one nearest spot.
+    for i in range(len(curve) - 1):
+        s1, c1 = curve[i]
+        s2, c2 = curve[i + 1]
+        if c1 == 0.0:
+            _consider(s1)
+        elif c1 * c2 < 0.0:
+            _consider(s1 + (s2 - s1) * (-c1) / (c2 - c1))
+    last_s, last_c = curve[-1]
+    if last_c == 0.0:
+        _consider(last_s)
+
+    return best_flip
+
+
 # SQL fragment exposed for callers that need to compute walls directly in
 # Postgres against ``gex_by_strike``.  Parameters: ``$strike`` column,
 # ``$call_gamma`` column, ``$put_gamma`` column, ``$spot`` numeric.  Wrap in a

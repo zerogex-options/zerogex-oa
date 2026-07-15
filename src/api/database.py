@@ -16,7 +16,10 @@ from zoneinfo import ZoneInfo
 import logging
 import json
 
-from src.analytics.walls import compute_call_put_walls
+from src.analytics.walls import (
+    compute_call_put_walls,
+    compute_gamma_flip_from_strikes,
+)
 from src.api.queries.signals import SignalsQueriesMixin
 from src.database.password_providers import resolve_db_credentials
 from src.api.queries.technicals import TechnicalsQueriesMixin
@@ -2735,7 +2738,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         symbol: str = "SPY",
         timeframe: str = "1min",
         window_units: int = 78,
-        expiration: Optional[date] = None,
+        expirations: Optional[List[date]] = None,
     ) -> List[Dict[str, Any]]:
         """Aligned per-bucket Strike-Profile timeseries used by the rewind chart.
 
@@ -2743,24 +2746,22 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         for ``symbol`` at the requested ``timeframe``.  Each bucket carries:
 
           * the underlying OHLC inside the bucket (from ``underlying_quotes``);
-          * the bucket's representative ``gex_summary`` row's
-            ``gamma_flip_point`` / ``call_wall`` / ``put_wall`` — aggregate
-            basis, matching the live ``/api/gex/summary`` regardless of any
-            per-expiration filter applied to the strikes payload (live
-            view shows aggregate walls too, so this keeps rewind in basis
-            parity with "now");
+          * the bucket's ``gamma_flip`` — see the flip-scope rules below;
+          * ``call_wall`` / ``put_wall`` computed live for the bucket from
+            the same (filtered, summed-by-strike) gamma rows the bucket's
+            bars render (see below);
           * every strike's gamma exposure in the same dollar-GEX units
             ``/api/gex/by-strike`` uses (``γ × OI × 100 × S² × 0.01``),
             evaluated against the bucket's own ``close`` so the surface
             matches each bucket's candlestick instead of being scaled by
             a single trailing spot.
 
-        ``expiration=None`` → sum strike-level gamma / OI across ALL
+        ``expirations=None`` → sum strike-level gamma / OI across ALL
         expirations per (bucket, strike) — same basis as the live
         by-strike endpoint with "Expiry All".
 
-        ``expiration=<date>`` → restrict the strikes payload to that single
-        expiration.
+        ``expirations=[d1, d2, …]`` → restrict the strikes payload to that
+        set of expirations (summed per (bucket, strike) across the set).
 
         Walls follow the request's expiration scope.  Each bucket's
         ``call_wall`` / ``put_wall`` is computed live from the same
@@ -2768,10 +2769,23 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         render — via :func:`src.analytics.walls.compute_call_put_walls`,
         the single source of record — against the bucket's own
         close.  This guarantees the wall always sits at the strike the
-        bars say it should: with ``expiration=all`` walls are the
+        bars say it should: with ``expirations=None`` walls are the
         cross-expiration aggregate (matches ``/api/gex/summary``); with
-        a specific expiration walls are scoped to that expiration's
-        gamma alone.
+        a specific set walls are scoped to that set's gamma alone.
+
+        Gamma flip scope:
+
+          * ``expirations=None`` (All) → the bucket's representative
+            ``gex_summary.gamma_flip_point`` — the canonical spot-shift
+            flip, kept verbatim so the chart's "All" flip stays in parity
+            with ``/api/gex/summary`` and the headline metric.
+          * a specific set → the spot-shift flip can't be rebuilt for a
+            subset (no per-strike IV persisted), so the flip is recomputed
+            per bucket from the same summed-by-strike gamma the bars render
+            via :func:`src.analytics.walls.compute_gamma_flip_from_strikes`
+            (cumulative net-GEX zero crossing), against the bucket's own
+            close.  ``None`` when that curve is one-signed / the bucket has
+            no close.
 
         Cash-index session filter is applied to both the window anchor
         and the bucket-rep CTE — same shape ``get_historical_gex`` uses —
@@ -2779,9 +2793,15 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         """
         symbol = symbol.upper()
         window_units = max(1, min(window_units, 480))
+        # Normalise the expiration set: drop dupes, sort, and collapse an
+        # empty list back to None (All) so the cache key and SQL predicate
+        # have a single canonical shape for "no filter".
+        exp_filter: Optional[List[date]] = (
+            sorted(set(expirations)) if expirations else None
+        )
         cache_key = (
             f"strike_profile_ts:{symbol}:{timeframe}:{window_units}:"
-            f"{expiration.isoformat() if expiration else 'all'}"
+            + (",".join(d.isoformat() for d in exp_filter) if exp_filter else "all")
         )
         cached = self._cache_get(cache_key)
         if cached is not None:
@@ -2790,11 +2810,11 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         bucket = _bucket_expr(timeframe)
 
         # Same two-template cash-index session filter pattern get_historical_gex
-        # uses, with $5 reserved for the expiration filter so the holidays array
-        # binds as $6 when applicable.
+        # uses.  Params are $1 = symbol, $2 = window_units, $3 = expirations
+        # (date[] or NULL); the holidays array binds as $4 for cash indices.
         session_filter_latest = ""
         session_filter_bucketed = ""
-        params: List[Any] = [symbol, window_units, expiration]
+        params: List[Any] = [symbol, window_units, exp_filter]
         if is_cash_index(symbol):
             session_filter_template = """
                     AND EXTRACT(DOW FROM {ts} AT TIME ZONE 'America/New_York') BETWEEN 1 AND 5
@@ -2826,7 +2846,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # OHLC is bucketed against the SAME bucket expression so it lines up
         # exactly with the GEX buckets even on holiday / half-day boundaries.
         #
-        # $1 = symbol, $2 = window_units, $3 = expiration (date or NULL),
+        # $1 = symbol, $2 = window_units, $3 = expirations (date[] or NULL),
         # $4 = NYSE_HOLIDAYS (cash indices only).
         expiration_param_idx = 3
         query = f"""
@@ -2885,9 +2905,10 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             ),
             -- gex_by_strike JOINed ONLY at the bucket representative timestamps
             -- (~window_units rows from the strike table), then SUM-aggregated
-            -- across expirations per (bucket_ts, strike) when no expiration
-            -- filter is set.  The (${expiration_param_idx}::date IS NULL OR ...)
-            -- predicate keeps a single fixed-shape SQL for both modes.
+            -- per (bucket_ts, strike) across whichever expirations the filter
+            -- admits.  The (${expiration_param_idx}::date[] IS NULL OR
+            -- gbs.expiration = ANY(...)) predicate keeps a single fixed-shape
+            -- SQL for both the "all" (NULL) and specific-set modes.
             strikes AS (
                 SELECT
                     br.bucket_ts,
@@ -2900,7 +2921,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 JOIN gex_by_strike gbs
                   ON gbs.underlying = $1
                  AND gbs.timestamp  = br.rep_ts
-                WHERE (${expiration_param_idx}::date IS NULL OR gbs.expiration = ${expiration_param_idx}::date)
+                WHERE (${expiration_param_idx}::date[] IS NULL OR gbs.expiration = ANY(${expiration_param_idx}::date[]))
                 GROUP BY br.bucket_ts, gbs.strike
             )
             SELECT
@@ -3019,16 +3040,26 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 # is the bucket's own close so the wall stays consistent
                 # with the candle in that bucket.  Buckets without a close
                 # (no underlying tape) leave both walls NULL.
+                #
+                # When a specific expiration set is requested, also override
+                # the flip: the persisted ``gamma_flip`` is aggregate-only, so
+                # recompute it from the same summed-by-strike gamma the bars
+                # render (cumulative net-GEX zero crossing).  ``expirations=None``
+                # (All) leaves the canonical spot-shift flip untouched so the
+                # chart's "All" view stays in parity with ``/api/gex/summary``.
                 for ts, bucket in grouped.items():
                     close_val = bucket.get("close")
-                    if close_val is None:
-                        continue
                     inputs = wall_inputs.get(ts, [])
-                    if not inputs:
-                        continue
-                    cw, pw = compute_call_put_walls(inputs, float(close_val))
-                    bucket["call_wall"] = cw
-                    bucket["put_wall"] = pw
+                    if close_val is not None and inputs:
+                        cw, pw = compute_call_put_walls(inputs, float(close_val))
+                        bucket["call_wall"] = cw
+                        bucket["put_wall"] = pw
+                    if exp_filter is not None:
+                        bucket["gamma_flip"] = (
+                            compute_gamma_flip_from_strikes(inputs, float(close_val))
+                            if close_val is not None and inputs
+                            else None
+                        )
                 result = list(grouped.values())
                 self._cache_set(
                     cache_key, result, self._strike_profile_timeseries_cache_ttl_seconds
