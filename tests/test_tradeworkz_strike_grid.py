@@ -107,3 +107,48 @@ def test_bouncer_emits_on_grid_spx_strike():
     # The old round(spot) would have produced 7529 — a non-existent contract.
     assert strike == 7530.0
     assert strike != round(7529.0)
+
+
+# ----------------------------------------------------------------------
+# Option-symbol root resolution (SPX 0DTE must build the SPXW contract)
+# ----------------------------------------------------------------------
+
+
+def test_spx_leg_builds_spxw_symbol_via_symbol_aliases(monkeypatch):
+    """With the documented SPX aliases, the leg matches the ingested SPXW quote."""
+    from src.tradeworkz.bots.base import _synthetic_option_symbol
+
+    monkeypatch.setenv("SYMBOL_ALIASES", "SPX=$SPXW.X")
+    monkeypatch.setenv("OPTION_ROOT_ALIASES", "$SPXW.X=SPXW,$SPX.X=SPX")
+    assert _synthetic_option_symbol("SPX", "put", 7530, "2026-07-14") == "SPXW 260714P7530"
+    # ETFs have no alias -> unchanged.
+    assert _synthetic_option_symbol("SPY", "call", 755, "2026-07-14") == "SPY 260714C755"
+
+
+def test_spx_leg_builds_spxw_symbol_via_direct_option_root_alias(monkeypatch):
+    """Alternative config: a direct SPX=SPXW option-root alias also resolves."""
+    from src.tradeworkz.bots.base import _synthetic_option_symbol
+
+    monkeypatch.delenv("SYMBOL_ALIASES", raising=False)
+    monkeypatch.setenv("OPTION_ROOT_ALIASES", "$SPXW.X=SPXW,$SPX.X=SPX,SPX=SPXW")
+    assert _synthetic_option_symbol("SPX", "put", 7530, "2026-07-14") == "SPXW 260714P7530"
+
+
+def test_bouncer_spx_leg_is_fillable_spxw_contract(monkeypatch):
+    """End-to-end: the bouncer's SPX put is a quotable SPXW contract, not bare SPX."""
+    monkeypatch.setenv("SYMBOL_ALIASES", "SPX=$SPXW.X")
+    monkeypatch.setenv("OPTION_ROOT_ALIASES", "$SPXW.X=SPXW,$SPX.X=SPX")
+    snap = MarketSnapshot(
+        underlying="SPX",
+        timestamp=MIDDAY,
+        spot=7529.0,
+        call_wall=7530.0,
+        put_wall=7500.0,
+        gamma_flip=7495.0,
+        max_pain=7520.0,
+        net_gex=2.0e10,
+        net_gex_pctile=90.0,
+    )
+    sig = _bouncer().open_criteria(snap)
+    assert sig is not None
+    assert sig.legs[0].option_symbol == "SPXW 260714P7530"

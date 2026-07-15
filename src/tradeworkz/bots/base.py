@@ -422,13 +422,19 @@ def _synthetic_option_symbol(underlying: str, opt: str, strike: float, exp: str)
 
     where ``strike`` is the integer strike as-is when whole
     (``746``), or ``{strike:.2f}`` when fractional (``746.50``).
-    ``option_root`` is resolved via ``resolve_option_root`` so
-    index chains that trade under a different root (SPX → SPXW)
-    line up correctly.
-    """
-    from src.symbols import resolve_option_root
 
-    root = resolve_option_root(underlying)
+    The root is resolved the SAME way the ingest layer resolves it:
+    underlying → ``resolve_symbol`` (SYMBOL_ALIASES) → ``resolve_option_root``
+    (OPTION_ROOT_ALIASES). This matters for cash indices whose tradeable
+    chain lists under a different TS symbol and root — e.g. SPX's 0DTE chain
+    is ``$SPXW.X`` → root ``SPXW``, so the quotable contract is
+    ``SPXW 260714P7530``, not ``SPX 260714P7530``. Building the bare-root
+    form would miss the ingested quote and no SPX trade would ever fill.
+    ETFs (no alias) pass through unchanged, so SPY/QQQ/IWM are unaffected.
+    """
+    from src.symbols import resolve_option_root, resolve_symbol
+
+    root = resolve_option_root(resolve_symbol(underlying))
     exp_compact = exp.replace("-", "")[-6:]  # YYMMDD
     right = "C" if opt.lower().startswith("c") else "P"
     if float(strike).is_integer():
