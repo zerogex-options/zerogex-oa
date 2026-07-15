@@ -44,14 +44,20 @@ from src.database.connection import db_connection
 logger = logging.getLogger(__name__)
 
 # Per-metric refresh: each maps a logical name to the gex_summary column
-# the distribution is computed over.  These two are the headline figures
-# the live MetricCards expose, so they are the "is this unusual?" questions
-# users most often want answered.  Add more by appending here — no schema
-# change required.
+# the distribution is computed over.  The first two are the headline
+# figures the live MetricCards expose ("is this unusual?").  The wall
+# strengths answer the sibling question TradeWorkz asks — "is this a
+# massive wall for THIS symbol, at THIS time of day?" — so the Bouncer can
+# size up (and give a looser stop) into a historically large wall.  Add
+# more by appending here; the only requirement is that the value is a
+# gex_summary column (the distribution is read straight from it).
 METRICS: tuple[tuple[str, str], ...] = (
     ("net_gex_at_spot", "net_gex_at_spot"),
     ("total_net_gex", "total_net_gex"),
+    ("call_wall_strength", "call_wall_strength"),
+    ("put_wall_strength", "put_wall_strength"),
 )
+
 
 # Window definitions.  ``None`` for ``rolling_days`` means all_time (no
 # trailing-window filter).
@@ -113,9 +119,7 @@ def _summarize(samples: Sequence[float]) -> Distribution | None:
 
 
 def _active_symbols(cur) -> list[str]:
-    cur.execute(
-        "SELECT symbol FROM symbols WHERE COALESCE(is_active, TRUE) = TRUE ORDER BY symbol"
-    )
+    cur.execute("SELECT symbol FROM symbols WHERE COALESCE(is_active, TRUE) = TRUE ORDER BY symbol")
     return [r[0] for r in cur.fetchall()]
 
 
@@ -296,7 +300,8 @@ def refresh(
                         metric_name,
                         window.label,
                         rows_written,
-                        rows_written - (1 if flat_dist and flat_dist.sample_size >= MIN_FLAT_SAMPLES else 0),
+                        rows_written
+                        - (1 if flat_dist and flat_dist.sample_size >= MIN_FLAT_SAMPLES else 0),
                     )
                     results[sym_upper][metric_name][window.label] = rows_written
     return results

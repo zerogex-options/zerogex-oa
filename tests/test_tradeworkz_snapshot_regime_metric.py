@@ -95,10 +95,23 @@ def _build_scripted_conn(
     # gex_summary — this is the row the test cares about. The SELECT
     # order is: net_gex_at_spot, gamma_flip_point, max_pain,
     # put_call_ratio, call_wall, put_wall, max_gamma_strike,
-    # total_net_gex.
+    # total_net_gex, call_wall_strength, put_wall_strength.
     cur.program(
         "FROM gex_summary",
-        [(net_gex_at_spot, 745.5, 745.0, 1.0, 750.0, 740.0, 745.0, total_net_gex)],
+        [
+            (
+                net_gex_at_spot,
+                745.5,
+                745.0,
+                1.0,
+                750.0,
+                740.0,
+                745.0,
+                total_net_gex,
+                1.0e9,
+                8.0e8,
+            )
+        ],
     )
     # vix_bars latest
     cur.program("FROM vix_bars", [(17.0,)])
@@ -150,7 +163,7 @@ def test_snap_net_gex_regime_negative_when_at_spot_negative():
     """Negative at-spot → negative regime, regardless of the raw
     chain aggregate value."""
     conn = _build_scripted_conn(
-        total_net_gex=+2.0e9,   # would look "positive strong" if we used this
+        total_net_gex=+2.0e9,  # would look "positive strong" if we used this
         net_gex_at_spot=-8.0e8,
     )
     snap = build_snapshot(conn, "SPY")

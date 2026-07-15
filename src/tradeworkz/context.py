@@ -19,7 +19,7 @@ from datetime import date, datetime, time, timezone
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
-from src.tradeworkz.gex_stats import fetch_net_gex_pctile
+from src.tradeworkz.gex_stats import fetch_net_gex_pctile, fetch_wall_strength_pctile
 from src.tradeworkz.strikes import default_strike_increment, nearest_strike
 
 logger = logging.getLogger(__name__)
@@ -82,6 +82,16 @@ class MarketSnapshot:
     #    land on real, quotable strikes. None -> resolved from symbol type.
     net_gex_pctile: Optional[float] = None
     strike_increment: Optional[float] = None
+
+    #  * {call,put}_wall_strength_pctile — where THIS tick's wall dollar-
+    #    gamma sits in the symbol's own 30d, time-of-day-bucketed history
+    #    [0..100]. Drives wall-size-relative position sizing (a
+    #    historically large wall gets a bigger, looser-stopped fade). None
+    #    until the nightly refresh accumulates history for the new
+    #    call_wall_strength / put_wall_strength columns, in which case
+    #    sizing falls back to wall-agnostic (neutral) — see sizing.py.
+    call_wall_strength_pctile: Optional[float] = None
+    put_wall_strength_pctile: Optional[float] = None
 
     # Recent price series (oldest -> newest).
     recent_closes: list[float] = field(default_factory=list)
@@ -263,7 +273,8 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
     cur.execute(
         """
         SELECT net_gex_at_spot, gamma_flip_point, max_pain, put_call_ratio,
-               call_wall, put_wall, max_gamma_strike, total_net_gex
+               call_wall, put_wall, max_gamma_strike, total_net_gex,
+               call_wall_strength, put_wall_strength
         FROM gex_summary
         WHERE underlying = %s
         ORDER BY timestamp DESC
@@ -276,15 +287,13 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
         gx = gex_rows[0]
         prior = gex_rows[1] if len(gex_rows) > 1 else None
     else:
-        gx = (None,) * 8
+        gx = (None,) * 10
         prior = None
 
-    cur.execute(
-        """
+    cur.execute("""
         SELECT close FROM vix_bars
         ORDER BY timestamp DESC LIMIT 1
-        """
-    )
+        """)
     vix_row = cur.fetchone()
     vix = float(vix_row[0]) if vix_row and vix_row[0] is not None else None
 
@@ -335,8 +344,19 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
     # fallback in gex_regime). Issued LAST so a stats-table hiccup can only
     # affect this one field — every scalar above is already extracted, and
     # fetch_net_gex_pctile clears any aborted transaction state itself.
-    net_gex_pctile = fetch_net_gex_pctile(
-        conn, underlying, _maybe_float(gx[0]), snapshot_ts
+    net_gex_pctile = fetch_net_gex_pctile(conn, underlying, _maybe_float(gx[0]), snapshot_ts)
+
+    # Wall-strength percentiles (best-effort, same failure semantics as
+    # net_gex_pctile). gx[8]/gx[9] are the persisted dollar-gamma
+    # magnitudes at the call/put wall; None until the analytics engine has
+    # written the new columns and the nightly refresh has history for them.
+    call_wall_strength = _maybe_float(gx[8])
+    put_wall_strength = _maybe_float(gx[9])
+    call_wall_strength_pctile = fetch_wall_strength_pctile(
+        conn, underlying, "call", call_wall_strength, snapshot_ts
+    )
+    put_wall_strength_pctile = fetch_wall_strength_pctile(
+        conn, underlying, "put", put_wall_strength, snapshot_ts
     )
 
     return MarketSnapshot(
@@ -352,6 +372,10 @@ def build_snapshot(conn: Any, underlying: str) -> Optional[MarketSnapshot]:
         put_call_ratio=_maybe_float(gx[3]),
         call_wall=_maybe_float(gx[4]),
         put_wall=_maybe_float(gx[5]),
+        call_wall_strength=call_wall_strength,
+        put_wall_strength=put_wall_strength,
+        call_wall_strength_pctile=call_wall_strength_pctile,
+        put_wall_strength_pctile=put_wall_strength_pctile,
         max_gamma_strike=_maybe_float(gx[6]),
         dealer_net_delta=dealer_net_delta,
         prior_call_wall=_maybe_float(prior[4]) if prior else None,

@@ -83,9 +83,45 @@ def compute_call_put_walls(
 
     * Call wall ties → lowest strike (nearest to spot from above).
     * Put wall ties  → highest strike (nearest to spot from below).
+
+    This is the strike-only view.  Callers that also need the wall's
+    dollar-gamma magnitude (e.g. TradeWorkz position sizing) should call
+    :func:`compute_call_put_walls_with_strength`, which shares this exact
+    ranking and additionally returns the dollar exposure at each wall.
+    """
+    call_wall, put_wall, _cw_strength, _pw_strength = compute_call_put_walls_with_strength(
+        gex_by_strike, spot_price
+    )
+    return call_wall, put_wall
+
+
+def compute_call_put_walls_with_strength(
+    gex_by_strike: Iterable[Mapping[str, Any]],
+    spot_price: float,
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """Return ``(call_wall, put_wall, call_wall_strength, put_wall_strength)``.
+
+    Same wall-selection ranking as :func:`compute_call_put_walls` (this is
+    the single implementation both share), plus the **dollar-gamma
+    magnitude at each wall strike**.  The magnitude is the OI-weighted
+    gamma aggregate the ranking selected on, converted to dollar GEX per
+    1% move via the canonical ``γ_aggregate × 100 × S² × 0.01`` formula —
+    the same convention ``AnalyticsEngine`` uses for the strike-profile
+    ``abs_dollar_gex`` and ``_calculate_gex_by_strike`` uses inline, so a
+    persisted ``call_wall_strength`` equals the timeseries wall magnitude
+    for the same tick.
+
+    Strength is ``None`` on whichever side has no wall (mirroring the
+    strike being ``None``) and ``0.0`` never appears for a real wall,
+    because a strike only becomes a wall when its gamma aggregate is
+    strictly positive.
+
+    :returns: strikes as in :func:`compute_call_put_walls`; strengths are
+        non-negative dollar magnitudes (``abs`` applied defensively) or
+        ``None`` when that side has no wall / spot is unusable.
     """
     if spot_price is None or spot_price <= 0:
-        return None, None
+        return None, None, None, None
 
     # Aggregate per-(strike, expiration) rows into per-strike sums so the
     # ranking matches the cross-expiration view consumers actually see.
@@ -126,7 +162,12 @@ def compute_call_put_walls(
                 best_put = put_gamma
                 put_wall = strike
 
-    return call_wall, put_wall
+    # OI-weighted gamma → dollar GEX per 1% move (canonical scale).
+    dollar_scale = 100.0 * spot_price * spot_price * 0.01
+    call_wall_strength = abs(best_call * dollar_scale) if call_wall is not None else None
+    put_wall_strength = abs(best_put * dollar_scale) if put_wall is not None else None
+
+    return call_wall, put_wall, call_wall_strength, put_wall_strength
 
 
 # SQL fragment exposed for callers that need to compute walls directly in

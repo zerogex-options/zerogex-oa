@@ -71,6 +71,26 @@ class PutCallWallBouncer(BaseBot):
         if conviction < self.confidence_threshold():
             return None
 
+        # Wall-size-relative sizing input. The engine reads
+        # components_at_entry["wall_strength"] (0..1) and passes it to
+        # sizing.compute_contracts, where wall_scale = 0.5 + strength maps
+        # it to a 0.5..1.5x size knob. We feed the wall's dollar-gamma
+        # PERCENTILE (how large this wall is vs the symbol's own 30d
+        # history at this time of day), normalized to 0..1. None when
+        # history is absent -> the engine leaves wall_strength unset and
+        # sizing stays wall-agnostic (scale 1.0), exactly as before.
+        wall_strength_pctile = (
+            snap.call_wall_strength_pctile if wall_side == "call" else snap.put_wall_strength_pctile
+        )
+        wall_strength_dollar = (
+            snap.call_wall_strength if wall_side == "call" else snap.put_wall_strength
+        )
+        wall_strength_norm = (
+            max(0.0, min(1.0, wall_strength_pctile / 100.0))
+            if wall_strength_pctile is not None
+            else None
+        )
+
         expiration = _today_expiration(snap)
         strike = snap.round_to_strike(snap.spot)
         opt_type = "call" if direction == "bullish" else "put"
@@ -106,6 +126,12 @@ class PutCallWallBouncer(BaseBot):
                 "distance_pct": call_d if wall_side == "call" else put_d,
                 "vix": snap.vix,
                 "quality": quality,
+                # 0..1 sizing input (None -> wall-agnostic); the raw dollar
+                # magnitude and its percentile are kept for the audit trail
+                # and for the wall-aware stop (commit 2 reads them at exit).
+                "wall_strength": wall_strength_norm,
+                "wall_strength_pctile": wall_strength_pctile,
+                "wall_strength_dollar": wall_strength_dollar,
             },
         )
 
