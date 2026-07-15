@@ -43,20 +43,26 @@ def _parse_leg_expiration(leg: Dict[str, Any]) -> Optional[date]:
 
 
 def _underlying_from_option_symbol(sym: str) -> Optional[str]:
-    """Extract the underlying root from a TradeStation option symbol.
+    """Resolve the ``underlying_quotes`` symbol from a TS option symbol.
 
-    The ingest layer writes ``option_chains.option_symbol`` in the
-    ``{root} {YYMMDD}{C|P}{strike}`` format — the token before the
-    space is the option root (e.g., ``SPY``, ``SPXW``). For our
-    single-underlying fleet this is also the underlying_quotes symbol.
-    Index chains that trade under a weekly root would need a reverse
-    OPTION_ROOT_ALIASES lookup, but nothing in the current bots hits
-    that path — SPXW → SPX would go here when we add index bots.
+    The ingest layer writes ``option_chains.option_symbol`` as
+    ``{root} {YYMMDD}{C|P}{strike}`` — the token before the space is the
+    option root (``SPY``, ``SPXW``). For settlement we need the symbol the
+    UNDERLYING price is stored under, which for an index differs from the
+    option root: SPX's 0DTE options carry root ``SPXW`` but settle against
+    the ``SPX`` cash-index close. ``resolve_underlying_from_option_root``
+    reverses the SYMBOL_ALIASES -> OPTION_ROOT_ALIASES chain so the
+    intrinsic fallback looks up ``underlying_quotes`` under ``SPX``; ETF
+    roots (already their own underlying) pass through unchanged.
     """
     if not isinstance(sym, str):
         return None
     root = sym.split(" ", 1)[0].strip()
-    return root or None
+    if not root:
+        return None
+    from src.symbols import resolve_underlying_from_option_root
+
+    return resolve_underlying_from_option_root(root)
 
 
 def _settlement_spot(

@@ -178,6 +178,49 @@ def resolve_option_root(underlying: str) -> str:
     return option_roots.get(normalized, normalized)
 
 
+def resolve_underlying_from_option_root(option_root: str) -> str:
+    """Inverse of the option-symbol root resolution.
+
+    Building an option symbol resolves the chain
+    ``underlying -> resolve_symbol (SYMBOL_ALIASES) -> TS symbol ->
+    resolve_option_root (OPTION_ROOT_ALIASES) -> root``. This reverses both
+    hops to recover the ``underlying_quotes`` symbol a contract settles
+    against — needed by the expired-leg intrinsic fallback, which prices
+    against the underlying's close, not the (non-existent) option-root quote.
+
+    Example: ``SPXW -> SPX`` (SPX's 0DTE weekly chain settles against the SPX
+    cash index). Roots that are already their own underlying (``SPY`` /
+    ``QQQ`` / ``IWM``, and the monthly ``SPX`` root) carry no alias and are
+    returned unchanged.
+    """
+    root = (option_root or "").strip().upper()
+    if not root:
+        return root
+
+    # Hop 1: option root -> TS symbol(s), via reversed OPTION_ROOT_ALIASES.
+    ts_for_root = [
+        ts
+        for ts, mapped_root in get_option_root_aliases().items()
+        if mapped_root.strip().upper() == root
+    ]
+    if not ts_for_root:
+        return root
+
+    # Hop 2: TS symbol -> canonical underlying, via reversed SYMBOL_ALIASES
+    # (plus the monthly-chain alias map that wires the AM-settled root).
+    reverse_symbol: Dict[str, str] = {}
+    for canon, ts in get_symbol_aliases().items():
+        reverse_symbol.setdefault(ts.strip().upper(), canon)
+    for canon, ts in get_monthly_underlying_aliases().items():
+        reverse_symbol.setdefault(ts.strip().upper(), canon)
+
+    for ts in ts_for_root:
+        canon = reverse_symbol.get(ts.strip().upper())
+        if canon:
+            return canon
+    return root
+
+
 def get_monthly_underlying_aliases() -> Dict[str, str]:
     """Return canonical-symbol -> TS-monthly-chain-symbol mapping.
 
