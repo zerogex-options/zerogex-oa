@@ -2810,8 +2810,8 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         bucket = _bucket_expr(timeframe)
 
         # Same two-template cash-index session filter pattern get_historical_gex
-        # uses, with $5 reserved for the expiration filter so the holidays array
-        # binds as $6 when applicable.
+        # uses.  Params are $1 = symbol, $2 = window_units, $3 = expirations
+        # (date[] or NULL); the holidays array binds as $4 for cash indices.
         session_filter_latest = ""
         session_filter_bucketed = ""
         params: List[Any] = [symbol, window_units, exp_filter]
