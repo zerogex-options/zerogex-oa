@@ -225,11 +225,18 @@ def run(
     """Reconstruct entries over ``bars`` and measure each against ``closes``.
 
     ``closes`` is the (timestamp, close) series for the symbol, ascending —
-    used to read the forward window for each entry.
+    the single source of spot: each bar's spot is the nearest-preceding
+    close (what the live snapshot reads), and the same series supplies the
+    forward window for each entry.
     """
-    enrich(bars)
     close_ts = [c[0] for c in closes]
     close_px = [c[1] for c in closes]
+    # Spot = nearest-preceding close. Done before enrich so the dollar-gamma
+    # scale and the percentiles are computed on the real spot.
+    for b in bars:
+        idx = bisect_right(close_ts, b.ts) - 1
+        b.spot = close_px[idx] if idx >= 0 else 0.0
+    enrich(bars)
     results: List[TradeResult] = []
     for b in bars:
         snap = MarketSnapshot(
@@ -268,6 +275,14 @@ def run(
 
 
 def _load_bars(conn: Any, symbol: str, days: int) -> List[Bar]:
+    """Load the negative-γ gex_summary bars + the put-gamma at each wall.
+
+    Set-based (not a per-row correlated subquery): the wall's put-gamma is a
+    single indexed JOIN of gex_by_strike onto the candidate timestamps, and
+    only negative-net-gamma rows are considered (the only ones that can
+    qualify), which is what keeps a 90-day scan under the statement timeout.
+    Spot is NOT read here — run() aligns it from the closes series.
+    """
     cur = conn.cursor()
     cur.execute(
         """
@@ -278,39 +293,36 @@ def _load_bars(conn: Any, symbol: str, days: int) -> List[Bar]:
             WHERE underlying = %s
               AND timestamp >= NOW() - (%s || ' days')::interval
               AND put_wall IS NOT NULL
+              AND net_gex_at_spot < 0
+        ),
+        wall_gamma AS (
+            SELECT gbs.timestamp AS ts, SUM(gbs.put_gamma) AS pg
+            FROM gex_by_strike gbs
+            JOIN gs
+              ON gs.underlying = gbs.underlying
+             AND gs.timestamp = gbs.timestamp
+             AND gbs.strike = gs.put_wall
+            GROUP BY gbs.timestamp
         )
-        SELECT gs.timestamp,
-               uq.close AS spot,
-               gs.net_gex_at_spot, gs.gamma_flip_point, gs.max_pain, gs.put_wall,
-               COALESCE((
-                   SELECT SUM(gbs.put_gamma) FROM gex_by_strike gbs
-                   WHERE gbs.underlying = gs.underlying
-                     AND gbs.timestamp = gs.timestamp
-                     AND gbs.strike = gs.put_wall
-               ), 0) AS put_gamma_at_wall
+        SELECT gs.timestamp, gs.net_gex_at_spot, gs.gamma_flip_point,
+               gs.max_pain, gs.put_wall, COALESCE(wg.pg, 0)
         FROM gs
-        JOIN LATERAL (
-            SELECT close FROM underlying_quotes
-            WHERE symbol = %s AND timestamp <= gs.timestamp
-            ORDER BY timestamp DESC LIMIT 1
-        ) uq ON TRUE
+        LEFT JOIN wall_gamma wg ON wg.ts = gs.timestamp
         ORDER BY gs.timestamp
         """,
-        (symbol, str(days), symbol),
+        (symbol, str(days)),
     )
     bars: List[Bar] = []
     for r in cur.fetchall():
-        if r[1] is None:
-            continue
         bars.append(
             Bar(
                 ts=r[0],
-                spot=float(r[1]),
-                net_gex=float(r[2]) if r[2] is not None else None,
-                gamma_flip=float(r[3]) if r[3] is not None else None,
-                max_pain=float(r[4]) if r[4] is not None else None,
-                put_wall=float(r[5]) if r[5] is not None else None,
-                put_gamma_at_wall=float(r[6] or 0.0),
+                spot=0.0,  # filled from the closes series in run()
+                net_gex=float(r[1]) if r[1] is not None else None,
+                gamma_flip=float(r[2]) if r[2] is not None else None,
+                max_pain=float(r[3]) if r[3] is not None else None,
+                put_wall=float(r[4]) if r[4] is not None else None,
+                put_gamma_at_wall=float(r[5] or 0.0),
             )
         )
     return bars
@@ -371,6 +383,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_hold_minutes=args.max_hold,
     )
     with db_connection() as conn:
+        # This is a one-shot analytical read over a wide gex_by_strike scan;
+        # lift the app's 90s statement timeout for this session so a long
+        # lookback isn't cut off. Best-effort — ignored if the role can't set
+        # it. The process exits after, so the pooled connection's override
+        # never affects request traffic.
+        try:
+            with conn.cursor() as c:
+                c.execute("SET statement_timeout = 600000")  # 10 minutes (ms)
+        except Exception:
+            logger.debug("could not raise statement_timeout", exc_info=True)
         for symbol in (s.upper() for s in args.symbols):
             bars = _load_bars(conn, symbol, args.days)
             closes = _load_closes(conn, symbol, args.days)

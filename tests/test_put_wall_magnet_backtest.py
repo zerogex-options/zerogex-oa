@@ -176,11 +176,14 @@ def test_enrich_lags_wall_and_ranks_strength():
 
 
 def test_run_finds_the_mega_wall_setup_and_scores_a_bounce():
-    # Ordinary bars sit far above the wall (fail proximity); only the mega
-    # bar (index 12) is pressed against it, so exactly one entry qualifies.
-    bars = [_bar(i, 500.0 + i * 200.0, spot=755.0) for i in range(25)]
-    bars[12] = _bar(12, 50_000.0, spot=749.0)
-    closes = [(TS + timedelta(minutes=i), 755.0) for i in range(13)]
+    bars = [_bar(i, 500.0 + i * 200.0) for i in range(25)]
+    bars[12] = _bar(12, 50_000.0)
+    # run() sources spot from the closes series (nearest-preceding close, as
+    # the live snapshot does). Ordinary bars align to 755 (far from the 748
+    # wall -> proximity fails); only the mega bar at minute 12 aligns to 749,
+    # pressed against the wall -> exactly one qualifying entry, which bounces.
+    closes = [(TS + timedelta(minutes=i), 755.0) for i in range(12)]
+    closes.append((TS + timedelta(minutes=12), 749.0))  # mega entry spot
     closes += [
         (TS + timedelta(minutes=13), 750.0),
         (TS + timedelta(minutes=14), 752.0),  # >= flip 751.75 -> win
@@ -188,4 +191,5 @@ def test_run_finds_the_mega_wall_setup_and_scores_a_bounce():
     trades = run("SPY", bars, closes, GateParams())
     assert len(trades) == 1
     assert trades[0].outcome == "win"
+    assert trades[0].entry_spot == pytest.approx(749.0)
     assert trades[0].put_wall_pctile >= 90.0
