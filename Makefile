@@ -1096,6 +1096,16 @@ fmt-check: ## Run black --check on src + tests (CI-style; no writes)
 type-check: ## Run mypy on src
 	$(PY) -m mypy src
 
+# =============================================================================
+# TradeWorkz thesis backtests (run against the live/analytics DB)
+# =============================================================================
+.PHONY: tw-magnet-backtest
+tw-magnet-backtest: ## Backtest the PutWallMagnetReversal thesis. Vars: SYMBOLS="SPY QQQ" DAYS=60 MINPCTILE=90
+	$(PY) -m src.tools.put_wall_magnet_backtest \
+		--symbols $(or $(SYMBOLS),SPY QQQ IWM) \
+		--days $(or $(DAYS),60) \
+		--min-pctile $(or $(MINPCTILE),90)
+
 # `ci` mirrors .github/workflows/ci.yml's bar: black --check and pytest are
 # BLOCKING; flake8 and mypy are ADVISORY (the workflow marks them
 # continue-on-error). The `-` prefix tells make to ignore their exit status so

@@ -19,6 +19,7 @@ from src.tradeworkz.bots.gamma_flip_defender import GammaFlipDefender
 from src.tradeworkz.bots.max_pain_gravitator import MaxPainGravitator
 from src.tradeworkz.bots.opening_range_hunter import OpeningRangeHunter
 from src.tradeworkz.bots.put_call_wall_bouncer import PutCallWallBouncer
+from src.tradeworkz.bots.put_wall_magnet_reversal import PutWallMagnetReversal
 from src.tradeworkz.bots.range_iron_condor import RangeIronCondor
 from src.tradeworkz.bots.vix_regime_breakout import VixRegimeBreakout
 from src.tradeworkz.bots.vol_expansion_straddle import VolExpansionStraddle
@@ -39,7 +40,35 @@ STRATEGY_CLASSES: Dict[str, Type[BaseBot]] = {
     "BullMomentumClimber": BullMomentumClimber,
     "RangeIronCondor": RangeIronCondor,
     "VolExpansionStraddle": VolExpansionStraddle,
+    # v3: negative-γ mega-put-wall reversal. Registered (runnable /
+    # backtestable) but intentionally NOT in DEFAULT_ROSTER — it stays out
+    # of the live fleet until the thesis backtest greenlights it. To enable,
+    # add the BotSpec below to DEFAULT_ROSTER and re-provision.
+    "PutWallMagnetReversal": PutWallMagnetReversal,
 }
+
+# Ready-to-enable roster entry for PutWallMagnetReversal — paste into
+# DEFAULT_ROSTER once the backtest validates the edge. Kept here (not in the
+# live tuple) so provisioning does not start it trading prematurely; the
+# bot's inverted-risk params live on the class (_DEFAULTS) so this only needs
+# the identity fields.
+PUT_WALL_MAGNET_REVERSAL_SPEC = BotSpec(
+    id="put_wall_magnet_reversal",
+    display_name="Put Wall Magnet Reversal",
+    strategy_class="PutWallMagnetReversal",
+    tier="0DTE",
+    direction_mode="bullish",
+    universe="*",
+    tagline="Negative-γ knife into a massive put wall. Fade the magnet, cut fast on a break.",
+    description=(
+        "Fades a historically large put wall in a negative-gamma regime "
+        "(max-pain / liquidity-node magnet, not a dealer-defended wall). Bull "
+        "call debit spread caps risk; a tight, single-bar-confirmed wall-break "
+        "stop cuts fast because a break in negative gamma cascades. Sizes up "
+        "into the biggest walls, never loosens the stop."
+    ),
+    params={"min_put_wall_pctile": 90.0},
+)
 
 
 DEFAULT_ROSTER: tuple[BotSpec, ...] = (
@@ -269,8 +298,7 @@ def get_bot_class(name: str) -> type[BaseBot]:
         return STRATEGY_CLASSES[name]
     except KeyError:
         raise KeyError(
-            f"Unknown TradeWorkz strategy_class {name!r}; "
-            f"known: {sorted(STRATEGY_CLASSES)}"
+            f"Unknown TradeWorkz strategy_class {name!r}; " f"known: {sorted(STRATEGY_CLASSES)}"
         ) from None
 
 
