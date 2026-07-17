@@ -26,6 +26,7 @@ from src.signals.advanced import AdvancedSignalEngine
 from src.signals.basic import BasicSignalEngine
 from src.signals.portfolio_engine import PortfolioEngine
 from src.signals.scoring_engine import ScoringEngine
+from src.signals.trade_bias import TradeBiasEngine
 from src.symbols import get_canonical_symbol, resolve_volume_proxy
 from src.utils import get_logger
 
@@ -61,6 +62,10 @@ class UnifiedSignalEngine:
         self.portfolio_engine = PortfolioEngine(self.underlying)
         self.advanced_signal_engine = AdvancedSignalEngine()
         self.basic_signal_engine = BasicSignalEngine()
+        # Trade Bias fuses this cycle's regime + signal reads into a signed
+        # directional bias and persists it to trade_bias_scores. Reuses the
+        # MSI / basic / advanced scores already computed below — no recompute.
+        self.trade_bias_engine = TradeBiasEngine(self.db_symbol)
 
         # Playbook is lazily instantiated so pattern discovery happens once
         # per process.  Disabled when PLAYBOOK_DISABLE_CYCLE_EMIT=true so
@@ -1583,6 +1588,16 @@ class UnifiedSignalEngine:
         score = self.scoring_engine.score_and_persist(market_context)
         advanced_results = self._persist_advanced_signals(market_context)
         basic_results = self._persist_basic_signals(market_context)
+
+        # Phase 2.4: Trade Bias — synthesize a directional bias from the state
+        # we just produced and persist it. Best-effort: a bias failure is
+        # logged but never breaks the cycle (mirrors the Playbook guard below).
+        try:
+            self.trade_bias_engine.compute_and_persist(
+                market_context, score, advanced_results, basic_results
+            )
+        except Exception as exc:
+            logger.warning("Trade Bias compute failed for %s: %s", self.db_symbol, exc)
 
         # Phase 2.5: Playbook — compute and persist Action Card from the
         # state we just produced.  Best-effort: persistence errors are

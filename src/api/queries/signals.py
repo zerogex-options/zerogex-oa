@@ -1024,6 +1024,69 @@ class SignalsQueriesMixin:
             return []
 
     # ------------------------------------------------------------------
+    # Trade Bias (directional regime + playbook)
+    # ------------------------------------------------------------------
+    _TRADE_BIAS_COLUMNS = (
+        "underlying, timestamp, tenor, bias_score, direction, bias_code, "
+        "market_state, state, confidence, override_active, payload"
+    )
+
+    async def get_latest_trade_bias(
+        self, symbol: str = "SPY", tenor: str = "swing"
+    ) -> Optional[Dict[str, Any]]:
+        query = f"""
+            SELECT {self._TRADE_BIAS_COLUMNS}
+            FROM trade_bias_scores
+            WHERE underlying = $1 AND tenor = $2
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                row = await conn.fetchrow(query, symbol, tenor)
+                if not row:
+                    return None
+                d = dict(row)
+                if isinstance(d.get("payload"), str):
+                    d["payload"] = json.loads(d["payload"])
+                return d
+        except Exception as e:
+            logger.error(f"get_latest_trade_bias failed ({symbol}, {tenor}): {e}")
+            return None
+
+    async def get_trade_bias_history(
+        self,
+        symbol: str = "SPY",
+        tenor: str = "swing",
+        limit: int = SIGNAL_HISTORY_LIMIT,
+        lookback_days: int = SIGNAL_HISTORY_LOOKBACK_DAYS,
+    ) -> list[Dict[str, Any]]:
+        # Trade Bias is persisted every cycle like the MSI, so bound the payload
+        # with a calendar-day lookback plus a row cap (mirrors
+        # get_signal_score_history).
+        query = f"""
+            SELECT {self._TRADE_BIAS_COLUMNS}
+            FROM trade_bias_scores
+            WHERE underlying = $1 AND tenor = $2
+              AND timestamp >= NOW() - make_interval(days => $4)
+            ORDER BY timestamp DESC
+            LIMIT $3
+        """
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, tenor, limit, lookback_days)
+                out: list[Dict[str, Any]] = []
+                for row in rows:
+                    d = dict(row)
+                    if isinstance(d.get("payload"), str):
+                        d["payload"] = json.loads(d["payload"])
+                    out.append(d)
+                return out
+        except Exception as e:
+            logger.error(f"get_trade_bias_history failed ({symbol}, {tenor}): {e}")
+            return []
+
+    # ------------------------------------------------------------------
     # Playbook Action Cards (PR-3+)
     # ------------------------------------------------------------------
 

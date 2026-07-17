@@ -581,6 +581,14 @@ purpose.
 
 - `GET /api/signals/score` — latest MSI composite score, regime label, component breakdown.
 - `GET /api/signals/score-history` — time series of composite scores + contributions.
+- `GET /api/signals/trade-bias` — latest **directional** Trade Bias: signed
+  `bias_score` (−100..+100), `direction` (long/short/neutral), regime it started
+  from, `state`, `confidence`, `setup` + `playbook`, `checklist`, and the raw
+  `inputs`. Distinct from MSI (a directionless 0-100 state magnitude). Query
+  `tenor=swing` (multi-day / structural, default) or `tenor=intraday` (0DTE;
+  populated from a later phase). Computed by the Signals Engine each cycle.
+- `GET /api/signals/trade-bias-history` — time series of the Trade Bias contract
+  (params `tenor`, `limit`, `lookback_days`); newest first.
 - `GET /api/signals/action` — Playbook Engine Action Card: single decisive trade
   instruction (or `STAND_DOWN`) fusing MSI regime + advanced/basic signals + live
   levels. See `docs/playbook_catalog.md` for the pattern catalog and Action Card
