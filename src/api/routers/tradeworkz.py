@@ -111,10 +111,16 @@ async def fleet_summary(db: DatabaseManager = Depends(get_db)) -> Dict[str, Any]
                 FROM tw_positions
             ),
             today AS (
+                -- "Today" is the ET trading day, not the UTC calendar day:
+                -- a trade closing at 20:00 ET is 00:00 UTC the NEXT day, so a
+                -- UTC bucket would file it under tomorrow's card. Bucket both
+                -- the close and "now" in America/New_York so they agree.
                 SELECT COALESCE(SUM(realized_pnl), 0) AS realized,
                        COUNT(*) AS n_closes,
                        SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) AS wins
-                FROM tw_trades WHERE closed_at::date = CURRENT_DATE
+                FROM tw_trades
+                WHERE (closed_at AT TIME ZONE 'America/New_York')::date
+                      = (NOW() AT TIME ZONE 'America/New_York')::date
             ),
             best AS (
                 SELECT bot_id, SUM(realized_pnl) AS pnl

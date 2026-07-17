@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict
-from datetime import date, datetime, time, timezone
+from datetime import datetime, time, timezone
 from typing import Any, Dict, List, Optional
 
 from src.database import db_connection
@@ -256,8 +256,13 @@ def rollup_daily(conn: Any) -> None:
 
     Idempotent — safe to call every tick. Uses UPSERT so the row is always
     up-to-date and no cron job is required.
+
+    ``session_date`` is the ET trading day (resolved off wall-clock ET, not
+    the server's local date), and trades are bucketed by the ET date of
+    ``closed_at`` to match — so an after-hours close never lands in the wrong
+    session row the way a UTC or server-local boundary would.
     """
-    today = date.today()
+    today = datetime.now(_ET).date()
     cur = conn.cursor()
     cur.execute(
         """
@@ -270,7 +275,7 @@ def rollup_daily(conn: Any) -> None:
                    COALESCE(SUM(realized_pnl), 0) AS rpnl,
                    COUNT(1)                            AS n_trades
             FROM tw_trades
-            WHERE closed_at::date = %s
+            WHERE (closed_at AT TIME ZONE 'America/New_York')::date = %s
             GROUP BY bot_id
         )
         INSERT INTO tw_equity_curve_daily (
@@ -311,7 +316,7 @@ def rollup_daily(conn: Any) -> None:
                    SUM(CASE WHEN outcome = 'win'  THEN realized_pnl ELSE 0 END) AS gross_win,
                    -SUM(CASE WHEN outcome = 'loss' THEN realized_pnl ELSE 0 END) AS gross_loss
             FROM tw_trades
-            WHERE closed_at::date = %s
+            WHERE (closed_at AT TIME ZONE 'America/New_York')::date = %s
             GROUP BY bot_id
         )
         INSERT INTO tw_bot_metrics_daily (

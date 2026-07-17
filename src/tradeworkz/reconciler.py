@@ -471,12 +471,18 @@ def close_position(conn: Any, pos: OpenPosition, reason: str) -> Optional[int]:
 
 
 def daily_realized_pnl(conn: Any, bot_id: str) -> float:
+    # Sum realized P&L over the ET trading day (the daily-kill-switch basis),
+    # NOT the UTC calendar day: a UTC boundary would reset the kill switch at
+    # 20:00 ET mid-session and mis-attribute an after-hours close to the next
+    # day. Bucket the close and "now" both in America/New_York so they agree.
     cur = conn.cursor()
     cur.execute(
         """
         SELECT COALESCE(SUM(realized_pnl), 0)
         FROM tw_trades
-        WHERE bot_id = %s AND closed_at::date = CURRENT_DATE
+        WHERE bot_id = %s
+          AND (closed_at AT TIME ZONE 'America/New_York')::date
+              = (NOW() AT TIME ZONE 'America/New_York')::date
         """,
         (bot_id,),
     )
