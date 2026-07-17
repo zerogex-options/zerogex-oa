@@ -21,9 +21,7 @@ FLEET_CAPITAL: float = _getenv_float("TRADEWORKZ_FLEET_CAPITAL", 1_000_000.0, mi
 # Engine loop
 # ---------------------------------------------------------------------------
 ENGINE_ENABLED: bool = _getenv_bool("TRADEWORKZ_ENGINE_ENABLED", True)
-ENGINE_INTERVAL_SECONDS: int = _getenv_int(
-    "TRADEWORKZ_ENGINE_INTERVAL_SECONDS", 5, min=1, max=3600
-)
+ENGINE_INTERVAL_SECONDS: int = _getenv_int("TRADEWORKZ_ENGINE_INTERVAL_SECONDS", 5, min=1, max=3600)
 # Comma-separated list of underlyings the fleet trades against. A bot
 # whose ``universe`` column is the wildcard ``"*"`` runs against every
 # ticker in this list every tick (one signal per (bot, underlying) pair,
@@ -35,9 +33,7 @@ UNIVERSE: str = _getenv_str("TRADEWORKZ_UNIVERSE", "SPY,QQQ,IWM")
 
 def fleet_universes() -> tuple[str, ...]:
     """Parse ``TRADEWORKZ_UNIVERSE`` into a tuple of upper-cased tickers."""
-    return tuple(
-        sym.strip().upper() for sym in UNIVERSE.split(",") if sym.strip()
-    )
+    return tuple(sym.strip().upper() for sym in UNIVERSE.split(",") if sym.strip())
 
 
 RECONCILE_LOCK_ENABLED: bool = _getenv_bool("TRADEWORKZ_RECONCILE_LOCK_ENABLED", True)
@@ -90,14 +86,36 @@ CALIBRATION_LOOKBACK_DAYS: int = _getenv_int(
 CALIBRATION_MIN_SAMPLES: int = _getenv_int(
     "TRADEWORKZ_CALIBRATION_MIN_SAMPLES", 20, min=1, max=100_000
 )
-CALIBRATION_FLOOR: float = _getenv_float(
-    "TRADEWORKZ_CALIBRATION_FLOOR", 0.40, min=0.0, max=1.0
-)
-CALIBRATION_CEIL: float = _getenv_float(
-    "TRADEWORKZ_CALIBRATION_CEIL", 0.85, min=0.0, max=1.0
-)
+CALIBRATION_FLOOR: float = _getenv_float("TRADEWORKZ_CALIBRATION_FLOOR", 0.40, min=0.0, max=1.0)
+CALIBRATION_CEIL: float = _getenv_float("TRADEWORKZ_CALIBRATION_CEIL", 0.85, min=0.0, max=1.0)
 CALIBRATION_LEARNING_RATE: float = _getenv_float(
     "TRADEWORKZ_CALIBRATION_LEARNING_RATE", 0.05, min=1e-6, max=1.0
+)
+# Cadence of the in-process calibration sweep (the "nightly worker"): the
+# scheduler recalibrates every enabled bot this often, in addition to the
+# defensive recompute on each trade close. Runs once on scheduler start so a
+# fresh deploy calibrates immediately. 0 disables the periodic sweep (the
+# per-close path still runs).
+CALIBRATION_SWEEP_INTERVAL_HOURS: float = _getenv_float(
+    "TRADEWORKZ_CALIBRATION_SWEEP_INTERVAL_HOURS", 24.0, min=0.0, max=8760.0
+)
+
+# ---------------------------------------------------------------------------
+# Bot governance: auto-disable a persistently losing bot
+# ---------------------------------------------------------------------------
+# Calibration flips ``tw_bots.enabled = false`` for any bot with at least
+# AUTO_DISABLE_MIN_TRADES closed trades in the calibration lookback whose hit
+# rate is below AUTO_DISABLE_MAX_HIT_RATE — a circuit breaker so a broken bot
+# stops bleeding at full size instead of only being throttled to 0.5x. This is
+# NOT permanent retirement: remove a bot from the roster (registry.py) to
+# retire it for good. provision_defaults no longer force-re-enables on
+# restart, so an auto-disable sticks until an operator re-enables it.
+AUTO_DISABLE_ENABLED: bool = _getenv_bool("TRADEWORKZ_AUTO_DISABLE_ENABLED", True)
+AUTO_DISABLE_MIN_TRADES: int = _getenv_int(
+    "TRADEWORKZ_AUTO_DISABLE_MIN_TRADES", 20, min=1, max=100_000
+)
+AUTO_DISABLE_MAX_HIT_RATE: float = _getenv_float(
+    "TRADEWORKZ_AUTO_DISABLE_MAX_HIT_RATE", 0.35, min=0.0, max=1.0
 )
 
 # ---------------------------------------------------------------------------

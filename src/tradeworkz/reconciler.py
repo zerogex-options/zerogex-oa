@@ -219,7 +219,7 @@ def open_position(
         # Only one open position per bot / underlying pair at a time.
         return None
 
-    legs_dicts = [asdict(l) for l in signal.legs]
+    legs_dicts = [asdict(leg) for leg in signal.legs]
     entry_price = spread_price(conn, legs_dicts, action="open")
     if entry_price is None or entry_price <= 0:
         logger.debug("no fillable quote for bot=%s legs=%s", signal.bot_id, legs_dicts)
@@ -241,9 +241,7 @@ def open_position(
     # Cap the bot's requested time_stop_at at 15:55 ET on the earliest
     # leg expiration so a 0DTE can never time-stop after the options
     # market shuts. See _cap_time_stop_at_expiration for rationale.
-    capped_time_stop_at = _cap_time_stop_at_expiration(
-        signal.time_stop_at, legs_dicts
-    )
+    capped_time_stop_at = _cap_time_stop_at_expiration(signal.time_stop_at, legs_dicts)
     payload = dict(signal.components_at_entry)
     payload.update(
         {
@@ -352,9 +350,7 @@ def mark_position(conn: Any, pos: OpenPosition) -> Optional[float]:
     return mark
 
 
-def close_position(
-    conn: Any, pos: OpenPosition, reason: str
-) -> Optional[int]:
+def close_position(conn: Any, pos: OpenPosition, reason: str) -> Optional[int]:
     """Close ``pos``, write an immutable tw_trades row, update capital,
     fan out notifications, and update the bot's ML state.
 
@@ -368,9 +364,7 @@ def close_position(
     # why the bearish negation was wrong.
     signed_pnl_per_contract = (exit_price - pos.entry_price) * 100.0
     realized = signed_pnl_per_contract * pos.quantity_open
-    pnl_pct = (
-        (exit_price / pos.entry_price - 1.0) if pos.entry_price > 0 else 0.0
-    )
+    pnl_pct = (exit_price / pos.entry_price - 1.0) if pos.entry_price > 0 else 0.0
 
     if realized > 0:
         outcome = "win"
@@ -433,6 +427,27 @@ def close_position(
     components["conviction"] = pos.entry_conviction or components.get("conviction")
     state = ml_mod.online_update(state, components, won=(outcome == "win"))
     ml_mod.save_state(conn, state)
+    # Defensive recompute of the rolling aggregates (hit rate -> confidence,
+    # profit factor -> size multiplier, adaptive threshold) + the auto-disable
+    # circuit breaker, right after each close. This is what keeps the ML
+    # surface live between sweeps — without it recalibrate_bot never runs and
+    # size_multiplier / profit_factor sit at their defaults forever.
+    if tw_config.CALIBRATION_ENABLED:
+        # Isolate the recompute in a SAVEPOINT: a calibration SQL failure
+        # aborts the transaction, and without this the close's own commit
+        # (and the fanout below) would roll back with it — losing the trade
+        # record. The savepoint confines a failure to the recompute alone.
+        gcur = conn.cursor()
+        try:
+            gcur.execute("SAVEPOINT tw_recalibrate")
+            ml_mod.recalibrate_bot(conn, pos.bot_id)
+            gcur.execute("RELEASE SAVEPOINT tw_recalibrate")
+        except Exception:  # pragma: no cover - calibration must not break a close
+            try:
+                gcur.execute("ROLLBACK TO SAVEPOINT tw_recalibrate")
+            except Exception:
+                pass
+            logger.warning("recalibrate_bot failed for %s after close", pos.bot_id, exc_info=True)
 
     notifications.fanout_event(
         conn,

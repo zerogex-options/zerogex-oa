@@ -41,17 +41,24 @@ STRATEGY_CLASSES: Dict[str, Type[BaseBot]] = {
     "RangeIronCondor": RangeIronCondor,
     "VolExpansionStraddle": VolExpansionStraddle,
     # v3: negative-γ mega-put-wall reversal. Registered (runnable /
-    # backtestable) but intentionally NOT in DEFAULT_ROSTER — it stays out
-    # of the live fleet until the thesis backtest greenlights it. To enable,
-    # add the BotSpec below to DEFAULT_ROSTER and re-provision.
+    # backtestable) but intentionally NOT in DEFAULT_ROSTER. SHELVED: the
+    # thesis backtest (src/tools/put_wall_magnet_backtest.py, 90d SPY/QQQ,
+    # 2026-07-16) did NOT support it. "Bigger wall bounces better" failed —
+    # on SPY expectancy INVERTED with wall size (90-95th pct +0.30R vs
+    # 99-100th -0.15R) and was ~breakeven overall; QQQ was noisy and
+    # non-monotone. And that is BEFORE 0DTE theta on a ~65%-timeout
+    # distribution, which almost certainly turns it net-negative. Kept for
+    # the record; do NOT enable without a theta-aware spread-P&L backtest
+    # that shows a real edge.
     "PutWallMagnetReversal": PutWallMagnetReversal,
 }
 
-# Ready-to-enable roster entry for PutWallMagnetReversal — paste into
-# DEFAULT_ROSTER once the backtest validates the edge. Kept here (not in the
-# live tuple) so provisioning does not start it trading prematurely; the
-# bot's inverted-risk params live on the class (_DEFAULTS) so this only needs
-# the identity fields.
+# Roster entry for PutWallMagnetReversal, deliberately kept OUT of the live
+# DEFAULT_ROSTER. SHELVED (see the note above) — the thesis backtest did not
+# support the edge, so this is NOT ready to enable. Left as scaffolding in
+# case a future, theta-aware backtest revives the idea; the bot's
+# inverted-risk params live on the class (_DEFAULTS), so enabling would only
+# need the identity fields here.
 PUT_WALL_MAGNET_REVERSAL_SPEC = BotSpec(
     id="put_wall_magnet_reversal",
     display_name="Put Wall Magnet Reversal",

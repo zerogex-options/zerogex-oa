@@ -25,6 +25,15 @@ whole risk posture is inverted from the Bouncer —
 Target is the gamma flip — the regime boundary the bounce is reverting
 toward. Only trades ``negative_weak`` (not deep ``negative_strong``): a
 steamroller in strongly-negative gamma is too large to stand in front of.
+
+Status: SHELVED (2026-07-16). The thesis backtest
+(``src/tools/put_wall_magnet_backtest.py``, 90d SPY/QQQ) did not support the
+edge — win rate and expectancy did NOT improve with wall size (SPY inverted:
+the top-percentile walls were the *worst* trades), the edge was
+thin-to-breakeven in underlying-move terms, and ~65% of setups time out, so
+0DTE theta on the debit spread almost certainly makes it a net loser. The
+bot is registered but kept OUT of DEFAULT_ROSTER; do not enable without a
+theta-aware spread-P&L backtest that shows a real edge.
 """
 
 from __future__ import annotations

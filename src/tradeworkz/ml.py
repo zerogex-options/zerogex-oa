@@ -19,12 +19,15 @@ Both surfaces read/write through :class:`MLState`.
 from __future__ import annotations
 
 import json
+import logging
 import math
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Optional
 
 from src.tradeworkz import config as tw_config
+
+logger = logging.getLogger(__name__)
 
 FEATURE_KEYS = (
     "net_gex_norm",
@@ -230,13 +233,57 @@ def predict_win_prob(weights: Any, components: Dict[str, Any]) -> Optional[float
     return _sigmoid(z)
 
 
+def apply_auto_disable_guard(
+    conn: Any, bot_id: str, n_trades: int, hit_rate: Optional[float]
+) -> bool:
+    """Circuit breaker: disable a bot that keeps losing at full size.
+
+    Flips ``tw_bots.enabled = false`` when the bot has at least
+    :data:`tw_config.AUTO_DISABLE_MIN_TRADES` closed trades in the lookback
+    and a hit rate below :data:`tw_config.AUTO_DISABLE_MAX_HIT_RATE`.
+    Calibration only throttles a bleeder to 0.5x size; this stops it
+    entirely. Returns ``True`` if it disabled the bot on this call.
+
+    Not permanent retirement — an operator (or the roster) can re-enable;
+    ``provision_defaults`` no longer force-re-enables on restart, so the
+    disable sticks. No-op when disabled by config, when the sample is too
+    small, or when the hit rate clears the bar.
+    """
+    if not tw_config.AUTO_DISABLE_ENABLED:
+        return False
+    if hit_rate is None or n_trades < tw_config.AUTO_DISABLE_MIN_TRADES:
+        return False
+    if hit_rate >= tw_config.AUTO_DISABLE_MAX_HIT_RATE:
+        return False
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE tw_bots SET enabled = FALSE, updated_at = NOW() "
+        "WHERE id = %s AND enabled IS TRUE",
+        (bot_id,),
+    )
+    disabled = bool(getattr(cur, "rowcount", 0))
+    if disabled:
+        logger.warning(
+            "Auto-disabled bot %s: hit_rate %.2f over %d trades (< %.2f). "
+            "Circuit breaker tripped; re-enable manually once fixed.",
+            bot_id,
+            hit_rate,
+            n_trades,
+            tw_config.AUTO_DISABLE_MAX_HIT_RATE,
+        )
+    return disabled
+
+
 def recalibrate_bot(conn: Any, bot_id: str) -> MLState:
     """Recompute rolling win-rate / profit-factor / size multiplier for ``bot_id``.
 
     Reads the last :data:`tw_config.CALIBRATION_LOOKBACK_DAYS` days of
-    ``tw_trades``. Called by the calibration worker and, defensively, from
-    :func:`src.tradeworkz.engine.on_trade_close` right after each close so
-    the ML surface stays fresh even without the nightly job running.
+    ``tw_trades``. Called defensively from
+    :func:`src.tradeworkz.reconciler.close_position` right after each close,
+    and periodically for every enabled bot by
+    :func:`src.tradeworkz.engine.calibration_sweep` (the scheduler's
+    in-process nightly pass). Also applies the auto-disable circuit breaker
+    (:func:`apply_auto_disable_guard`).
     """
     state = load_state(conn, bot_id)
     lookback = tw_config.CALIBRATION_LOOKBACK_DAYS
@@ -292,6 +339,9 @@ def recalibrate_bot(conn: Any, bot_id: str) -> MLState:
     state.last_win_rate_30d = win_30d
     state.last_profit_factor = profit_factor
     save_state(conn, state)
+    # Circuit breaker: disable a bot bleeding at full size (uses the same
+    # lookback hit rate / trade count just computed).
+    apply_auto_disable_guard(conn, bot_id, total, hit_rate)
     return state
 
 
