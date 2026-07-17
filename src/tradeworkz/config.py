@@ -77,6 +77,28 @@ MAX_PREMIUM_LOSS_PCT: float = _getenv_float(
 )
 
 # ---------------------------------------------------------------------------
+# Regular-trading-hours (RTH) gate on NEW opens
+# ---------------------------------------------------------------------------
+# Every fleet bot trades same-day (0DTE) debits, and the reconciler
+# hard-caps a 0DTE's time_stop at 15:55 ET (reconciler._EXPIRATION_CLOSE_HHMM).
+# A position opened OUTSIDE the cash session therefore has a time_stop that is
+# already in the past, so it dies on the very next tick for a spread/slippage
+# loss — the after-hours churn that bled the fleet on 2026-07-16 (bots gate on
+# ``minutes_since_open >= 30``, a floor with no ceiling, so at 20:00 ET
+# minutes_since_open=630 sailed through and they opened 0DTEs that instantly
+# time-stopped). When RTH_ONLY_OPENS is on, the engine refuses to open a new
+# position outside the ET cash session (weekends, NYSE holidays, pre-open,
+# after-hours) OR at/after RTH_NO_NEW_OPENS_AFTER_ET, so a position can never
+# be opened already past its own hard time_stop. Marks and EXITS on existing
+# positions are never gated — only new opens. Set RTH_ONLY_OPENS=false to
+# disable (e.g. a future extended-hours strategy). Keep
+# RTH_NO_NEW_OPENS_AFTER_ET aligned with the reconciler's 0DTE time_stop cap
+# (15:55 ET) — an "HH:MM" ET wall-clock string; a malformed value falls back
+# to 15:55.
+RTH_ONLY_OPENS: bool = _getenv_bool("TRADEWORKZ_RTH_ONLY_OPENS", True)
+RTH_NO_NEW_OPENS_AFTER_ET: str = _getenv_str("TRADEWORKZ_RTH_NO_NEW_OPENS_AFTER_ET", "15:55")
+
+# ---------------------------------------------------------------------------
 # ML calibrator
 # ---------------------------------------------------------------------------
 CALIBRATION_ENABLED: bool = _getenv_bool("TRADEWORKZ_CALIBRATION_ENABLED", True)

@@ -19,10 +19,12 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from typing import Any, Dict, List, Optional
 
 from src.database import db_connection
+from src.market_calendar import ET as _ET
+from src.market_calendar import is_market_hours
 from src.tradeworkz import config as tw_config
 from src.tradeworkz import ml as ml_mod
 from src.tradeworkz.bots.base import BaseBot
@@ -39,6 +41,40 @@ from src.tradeworkz.reconciler import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_et_hhmm(raw: str, fallback: time) -> time:
+    """Parse an ``"HH:MM"`` ET wall-clock string, falling back on garbage."""
+    try:
+        hh, mm = str(raw).strip().split(":")
+        return time(int(hh), int(mm))
+    except (ValueError, AttributeError):
+        logger.warning("Invalid TRADEWORKZ_RTH_NO_NEW_OPENS_AFTER_ET=%r; using %s", raw, fallback)
+        return fallback
+
+
+# Latest ET wall-clock at which a new position may open. Kept aligned with the
+# reconciler's 0DTE time_stop cap (15:55 ET) so we never open a position that
+# is already past its own hard time_stop. Resolved once at import.
+_NO_NEW_OPENS_AFTER: time = _parse_et_hhmm(tw_config.RTH_NO_NEW_OPENS_AFTER_ET, time(15, 55))
+
+
+def _opens_allowed(now_utc: datetime) -> bool:
+    """Whether a NEW position may be opened at wall-clock ``now_utc``.
+
+    Blocks opens outside the ET cash session — weekends, NYSE holidays,
+    pre-open, and (the money bug) after-hours — and also at/after the 0DTE
+    time_stop cap, so a position can never be opened already past its own
+    hard time_stop. Keyed off wall-clock ``now`` rather than the snapshot
+    timestamp, so a frozen or after-hours-ticking feed can't sneak a
+    stale-but-in-window snapshot past the gate. Marks and EXITS on existing
+    positions are never gated here — only new opens.
+    """
+    if not tw_config.RTH_ONLY_OPENS:
+        return True
+    if not is_market_hours(now_utc):
+        return False
+    return now_utc.astimezone(_ET).time() < _NO_NEW_OPENS_AFTER
 
 
 def tick() -> Dict[str, Any]:
@@ -77,11 +113,18 @@ def tick() -> Dict[str, Any]:
         for u in sorted(underlyings_needed):
             snapshots[u] = build_snapshot(conn, u)
 
+    # Coarse market-hours chokepoint: compute once per tick off wall-clock
+    # now (not the snapshot timestamp) so the whole fleet is gated
+    # consistently. When False, bots still mark + exit open positions this
+    # tick — only new opens are suppressed.
+    opens_allowed = _opens_allowed(datetime.now(timezone.utc))
+    summary["opens_allowed"] = opens_allowed
+
     for row in bots:
         summary["ticks"] += 1
         bot_id = row[0]
         try:
-            per_bot = _run_bot(row, snapshots, fleet_universes)
+            per_bot = _run_bot(row, snapshots, fleet_universes, opens_allowed=opens_allowed)
             summary["opened"] += per_bot.get("opened", 0)
             summary["closed"] += per_bot.get("closed", 0)
             summary["marked"] += per_bot.get("marked", 0)
@@ -112,6 +155,7 @@ def _run_bot(
     row: tuple,
     snapshots: Dict[str, Optional[MarketSnapshot]],
     fleet_universes: tuple[str, ...],
+    opens_allowed: bool = True,
 ) -> Dict[str, int]:
     (
         bot_id,
@@ -180,7 +224,12 @@ def _run_bot(
                     close_position(conn, pos, reason=decision.reason or "signal")
                     stats["closed"] += 1
 
-            # 2. Look for a new entry in this underlying.
+            # 2. Look for a new entry in this underlying — but only when the
+            # market-hours gate allows opens. Exits above always run; this
+            # skips ONLY the open path so no bot can start a 0DTE outside the
+            # cash session (which would instantly time-stop for a loss).
+            if not opens_allowed:
+                continue
             signal = bot.open_criteria(snap)
             if signal is not None:
                 wall_strength = (
