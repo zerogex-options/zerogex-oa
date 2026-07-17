@@ -749,6 +749,20 @@ db-flow-stuck-cleanup: ## One-shot cleanup for the cash-open watermark bug: drop
 		echo "$(YELLOW)  sudo systemctl restart $(INGESTION_SERVICE)$(NC)"; \
 	fi
 
+.PHONY: cash-index-open-repair
+cash-index-open-repair: ## Repair historical cash-index 09:30 ET session-open phantom candles (open=prior close). Dry-run by default; pass CONFIRM=yes to apply. Optional: SYMBOLS="SPX NDX" START=YYYY-MM-DD END=YYYY-MM-DD
+	@echo "$(BLUE)=== Cash-Index Session-Open Repair ===$(NC)"
+	@echo "$(YELLOW)Rewrites the 09:30 ET open of cash-index bars whose stored open is the$(NC)"
+	@echo "$(YELLOW)carried-forward prior close (open outside the bar's own [low,high]) to$(NC)"
+	@echo "$(YELLOW)the bar's close -- clearing the phantom full-range candle. Idempotent.$(NC)"
+	@echo "$(YELLOW)Workflow: pull + restart $(INGESTION_SERVICE) (forward fix), THEN run$(NC)"
+	@echo "$(YELLOW)         this with CONFIRM=yes to repair already-stored sessions.$(NC)"
+	@$(PY) -m src.tools.cash_index_open_repair \
+		$(if $(SYMBOLS),--symbols "$(SYMBOLS)") \
+		$(if $(START),--start $(START)) \
+		$(if $(END),--end $(END)) \
+		$(if $(filter yes,$(CONFIRM)),--execute)
+
 .PHONY: flow-explain
 flow-explain: ## Diagnose /api/flow/series query planner choice on flow_by_contract (FLOW_SYMBOL=SPY)
 	@echo "$(BLUE)=== flow_by_contract Query Planner Diagnosis ===$(NC)"
