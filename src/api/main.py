@@ -61,6 +61,7 @@ from .routers.scorecard import router as scorecard_router
 from .routers.forecast import router as forecast_router
 from .routers.replay import router as replay_router
 from .routers.forced_flow import router as forced_flow_router
+from .routers.levels import router as levels_router
 
 # Logging is configured centrally in src.utils.logging; importing
 # get_logger triggers _configure_logging which honors LOG_LEVEL and
@@ -241,6 +242,7 @@ async def lifespan(app: FastAPI):
     # Stop the meter first (cancels the loop and flushes the final window)
     # while the DB pool is still up, then drop both pool getters.
     from .quote_broadcaster import get_broadcaster as _get_bc
+
     bc = _get_bc()
     if bc is not None:
         await bc.stop()
@@ -402,6 +404,11 @@ app.include_router(
     dependencies=[_scope_signals],
 )
 # Derived analytics routers — broadly redistributable.
+# Consolidated, versioned dealer-positioning levels (gamma flip, walls,
+# max pain, per-strike gamma profile) — the stable external contract that
+# third-party charting integrations (TradingView widget, NinjaScript
+# indicator) build on. Derived-only, so it rides the GEX/analytics tier.
+app.include_router(levels_router, dependencies=[_scope_gex])
 app.include_router(volatility_gauge_router, dependencies=[_scope_gex])
 app.include_router(vol_surface_router, dependencies=[_scope_gex])
 # Options premium (extrinsic-value) surface — Beta. Derived analytics built
@@ -1217,9 +1224,7 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
         tracker.record(data.get("close"))
 
         close_data_available = await _db().has_todays_close_landed(symbol, asset_type)
-        data["session"] = get_market_session(
-            asset_type, tracker.is_stable(), close_data_available
-        )
+        data["session"] = get_market_session(asset_type, tracker.is_stable(), close_data_available)
 
         # Index→future DISPLAY swap (ADDITIVE): during the overnight futures
         # window, attach the future's price as *separate* fields. The base
@@ -1229,9 +1234,7 @@ async def get_current_quote(symbol: str = Query(default="SPY")):
         # card, and the candlestick chart read the futures_* fields. Silently
         # omitted if the futures ingester has no rows yet.
         if _index_futures_display_enabled() and should_display_future(symbol):
-            fut = await _db().get_latest_future_quote(
-                symbol, current_cash_close_reference()
-            )
+            fut = await _db().get_latest_future_quote(symbol, current_cash_close_reference())
             if fut and fut.get("close") is not None:
                 data["display_source"] = "futures"
                 data["data_symbol"] = _future_display_label(fut.get("future_symbol"))
@@ -1333,20 +1336,14 @@ async def get_historical_quotes(
         # caller opts in via allow_futures (the candle chart). Read-only from
         # futures_quotes; falls through to the index series if the ingester
         # has no rows for the requested window.
-        if (
-            allow_futures
-            and _index_futures_display_enabled()
-            and should_display_future(symbol)
-        ):
+        if allow_futures and _index_futures_display_enabled() and should_display_future(symbol):
             fut_rows = await _db().get_historical_futures(
                 symbol, start_dt, end_dt, window_units, timeframe
             )
             if fut_rows:
                 label = _future_display_label(resolve_index_future(symbol))
                 return [
-                    UnderlyingQuote(
-                        **{**row, "display_source": "futures", "data_symbol": label}
-                    )
+                    UnderlyingQuote(**{**row, "display_source": "futures", "data_symbol": label})
                     for row in fut_rows
                 ]
 
