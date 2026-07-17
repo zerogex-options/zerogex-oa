@@ -17,12 +17,29 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 from src.tradeworkz import config as tw_config
+from src.tradeworkz.engine import calibration_sweep as _calibration_sweep
 from src.tradeworkz.engine import tick as _engine_tick
 
 logger = logging.getLogger(__name__)
+
+
+def _sweep_due(last_run: Optional[datetime], now: datetime, interval_seconds: float) -> bool:
+    """Whether the calibration sweep should run now.
+
+    ``interval_seconds <= 0`` disables the periodic sweep entirely. A
+    ``None`` ``last_run`` is due immediately, so the sweep fires once on
+    scheduler start (calibrates a fresh deploy without waiting a full
+    interval).
+    """
+    if interval_seconds <= 0:
+        return False
+    if last_run is None:
+        return True
+    return (now - last_run).total_seconds() >= interval_seconds
 
 
 class TradeWorkzScheduler:
@@ -31,6 +48,7 @@ class TradeWorkzScheduler:
     def __init__(self) -> None:
         self._task: Optional[asyncio.Task] = None
         self._stop_event: Optional[asyncio.Event] = None
+        self._last_sweep_at: Optional[datetime] = None
 
     def is_running(self) -> bool:
         return self._task is not None and not self._task.done()
@@ -79,23 +97,47 @@ class TradeWorkzScheduler:
                 if errors:
                     logger.warning(
                         "TradeWorkz tick errors=%d opened=%d closed=%d %s",
-                        len(errors), opened, closed, errors[:3],
+                        len(errors),
+                        opened,
+                        closed,
+                        errors[:3],
                     )
                 elif opened or closed:
                     logger.info(
                         "TradeWorkz tick opened=%d closed=%d marked=%d",
-                        opened, closed, summary.get("marked", 0),
+                        opened,
+                        closed,
+                        summary.get("marked", 0),
                     )
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — one tick failing must not kill the loop
                 logger.exception("TradeWorkz tick failed; continuing")
+            await self._maybe_run_sweep()
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
                 # If wait() returned (rather than timing out), stop was requested.
                 return
             except asyncio.TimeoutError:
                 pass
+
+    async def _maybe_run_sweep(self) -> None:
+        """Run the calibration sweep when its interval is due.
+
+        Dispatched to a thread (the sweep uses the sync psycopg2 pool). A
+        failure is logged and swallowed so it never kills the tick loop.
+        """
+        now = datetime.now(timezone.utc)
+        interval_s = tw_config.CALIBRATION_SWEEP_INTERVAL_HOURS * 3600.0
+        if not _sweep_due(self._last_sweep_at, now, interval_s):
+            return
+        self._last_sweep_at = now
+        try:
+            await asyncio.to_thread(_calibration_sweep)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — sweep failure must not kill the loop
+            logger.exception("TradeWorkz calibration sweep failed; continuing")
 
 
 scheduler = TradeWorkzScheduler()

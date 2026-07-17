@@ -55,13 +55,11 @@ def tick() -> Dict[str, Any]:
     }
     with db_connection() as conn:
         cur = conn.cursor()
-        cur.execute(
-            """
+        cur.execute("""
             SELECT id, display_name, strategy_class, tier, direction_mode,
                    universe, tagline, description, is_public, enabled, params
             FROM tw_bots WHERE enabled = TRUE
-            """
-        )
+            """)
         bots = cur.fetchall()
 
     fleet_universes = tw_config.fleet_universes()
@@ -187,7 +185,8 @@ def _run_bot(
             if signal is not None:
                 wall_strength = (
                     signal.components_at_entry.get("wall_strength")
-                    if signal.components_at_entry else None
+                    if signal.components_at_entry
+                    else None
                 )
                 realized_today = daily_realized_pnl(conn, bot_id)
                 pos_id = open_position(
@@ -289,16 +288,75 @@ def rollup_daily(conn: Any) -> None:
     )
 
 
+def enabled_bot_ids(conn: Any) -> List[str]:
+    """Ids of every currently-enabled bot."""
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM tw_bots WHERE enabled = TRUE ORDER BY id")
+    return [r[0] for r in cur.fetchall()]
+
+
+def run_calibration_sweep(conn: Any, bot_ids: List[str]) -> int:
+    """Recalibrate each of ``bot_ids`` on ``conn``; return the count done.
+
+    Per-bot ``try`` so one bot's failure can't abort the rest. This is the
+    unit the scheduler's :func:`calibration_sweep` wraps with a connection.
+    """
+    if not tw_config.CALIBRATION_ENABLED:
+        return 0
+    done = 0
+    for bot_id in bot_ids:
+        try:
+            ml_mod.recalibrate_bot(conn, bot_id)
+            done += 1
+        except Exception:  # pragma: no cover - defensive per-bot isolation
+            logger.warning("calibration sweep: %s failed", bot_id, exc_info=True)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+    return done
+
+
+def calibration_sweep() -> int:
+    """Recalibrate every enabled bot — the in-process 'nightly' pass.
+
+    Runs each bot in its OWN transaction so a mid-sweep failure commits the
+    work already done and can't roll back healthy bots. Also runs once on
+    scheduler start, so a fresh deploy calibrates immediately instead of
+    waiting a full interval (the fix for size_multiplier / profit_factor
+    sitting at their defaults). Returns the number of bots recalibrated.
+    """
+    if not tw_config.CALIBRATION_ENABLED:
+        return 0
+    with db_connection() as conn:
+        bot_ids = enabled_bot_ids(conn)
+    done = 0
+    for bot_id in bot_ids:
+        try:
+            with db_connection() as conn:
+                ml_mod.recalibrate_bot(conn, bot_id)
+            done += 1
+        except Exception:  # pragma: no cover - defensive per-bot isolation
+            logger.warning("calibration sweep: %s failed", bot_id, exc_info=True)
+    if done:
+        logger.info("TradeWorkz calibration sweep recalibrated %d bots", done)
+    return done
+
+
 def provision_defaults(conn: Any, fleet_capital: Optional[float] = None) -> int:
     """Insert the default bot roster + slice fleet capital evenly across them.
 
     Idempotent. Behavior on subsequent runs:
 
-    * Missing bot ids are inserted with a fresh capital sleeve.
+    * Missing bot ids are inserted with a fresh capital sleeve (and
+      ``enabled`` per the roster spec — normally true).
     * Existing bot rows have their ``universe``, ``display_name``,
       ``tagline``, ``description``, and ``params`` re-synced from the
       current roster — the operator's source of truth is the roster
-      module, not stale DB rows from a prior release.
+      module, not stale DB rows from a prior release. ``enabled`` is
+      deliberately NOT re-synced, so a runtime auto-disable (the
+      governance circuit breaker) or a manual disable survives a
+      redeploy; re-enable a bot explicitly to bring it back.
     * Bot ids listed in :data:`RETIRED_BOT_IDS` are flipped to
       ``enabled=false`` and their sleeve is zeroed so the freed capital
       shows up in the next admin-triggered rebalance.
@@ -337,7 +395,6 @@ def provision_defaults(conn: Any, fleet_capital: Optional[float] = None) -> int:
                 tagline       = EXCLUDED.tagline,
                 description   = EXCLUDED.description,
                 params        = EXCLUDED.params,
-                enabled       = TRUE,
                 updated_at    = EXCLUDED.updated_at
             """,
             (
