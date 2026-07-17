@@ -1881,6 +1881,82 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
             logger.error(f"Error fetching GEX by strike: {e}", exc_info=True)
             raise
 
+    async def get_latest_strike_gamma_profile(
+        self,
+        symbol: str = "SPY",
+        strikes: int = 40,
+    ) -> List[Dict[str, Any]]:
+        """Per-strike dealer gamma profile for the latest snapshot.
+
+        Aggregates ``gex_by_strike`` (which is keyed ``(strike, expiration)``)
+        across expirations so each strike surfaces once, then returns the
+        ``strikes`` rows nearest to spot.  Dollar GEX uses the canonical
+        ``γ × OI × 100 × S² × 0.01`` convention (calls +, puts −), matching
+        ``/api/gex/by-strike`` and ``src/analytics/walls.py`` — so the profile,
+        the walls, and the flip all agree on one basis.
+
+        This is the aggregated primitive behind the versioned
+        ``/api/v1/levels`` contract, distinct from :meth:`get_gex_by_strike`
+        (per-``(strike, expiration)`` rows).  Rows come back nearest-to-spot
+        first; the caller re-sorts ascending by strike for rendering.  Cached
+        at the analytics TTL like the rest of the derived GEX surface.
+        """
+        symbol = symbol.upper()
+        cache_key = f"strike_gamma_profile:{symbol}:{strikes}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[no-any-return]
+
+        query = """
+            WITH spot AS (
+                SELECT close
+                FROM underlying_quotes
+                WHERE symbol = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            latest_ts AS (
+                SELECT timestamp
+                FROM gex_by_strike
+                WHERE underlying = $1
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ),
+            per_strike AS (
+                -- Aggregate across expirations so one strike = one row, the
+                -- same cross-expiration basis compute_call_put_walls uses.
+                SELECT
+                    g.strike,
+                    SUM(COALESCE(g.call_gamma, 0)) AS call_gamma,
+                    SUM(COALESCE(g.put_gamma, 0))  AS put_gamma
+                FROM gex_by_strike g
+                JOIN latest_ts lt ON g.timestamp = lt.timestamp
+                WHERE g.underlying = $1
+                GROUP BY g.strike
+            )
+            SELECT
+                ps.strike,
+                -- Industry-standard dollar GEX per 1% move: γ × OI × 100 × S² × 0.01.
+                (ps.call_gamma * 100 * COALESCE(s.close, 0) * COALESCE(s.close, 0) * 0.01) AS call_gex,
+                (-1 * ps.put_gamma * 100 * COALESCE(s.close, 0) * COALESCE(s.close, 0) * 0.01) AS put_gex,
+                -- net_gex == call_gex + put_gex by construction.
+                ((ps.call_gamma - ps.put_gamma) * 100 * COALESCE(s.close, 0) * COALESCE(s.close, 0) * 0.01) AS net_gex
+            FROM per_strike ps
+            CROSS JOIN spot s
+            ORDER BY ABS(ps.strike - s.close) ASC
+            LIMIT $2
+        """
+
+        try:
+            async with self._acquire_connection() as conn:
+                rows = await conn.fetch(query, symbol, strikes)
+                result = [dict(row) for row in rows]
+                self._cache_set(cache_key, result, self._analytics_cache_ttl_seconds)
+                return result
+        except Exception as e:
+            logger.error(f"Error fetching strike gamma profile: {e}", exc_info=True)
+            raise
+
     async def get_gex_summary_at_ts(self, symbol: str, at_ts: datetime) -> Optional[Dict[str, Any]]:
         """Most recent ``gex_summary`` row at or before ``at_ts``.
 
@@ -2796,12 +2872,9 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         # Normalise the expiration set: drop dupes, sort, and collapse an
         # empty list back to None (All) so the cache key and SQL predicate
         # have a single canonical shape for "no filter".
-        exp_filter: Optional[List[date]] = (
-            sorted(set(expirations)) if expirations else None
-        )
-        cache_key = (
-            f"strike_profile_ts:{symbol}:{timeframe}:{window_units}:"
-            + (",".join(d.isoformat() for d in exp_filter) if exp_filter else "all")
+        exp_filter: Optional[List[date]] = sorted(set(expirations)) if expirations else None
+        cache_key = f"strike_profile_ts:{symbol}:{timeframe}:{window_units}:" + (
+            ",".join(d.isoformat() for d in exp_filter) if exp_filter else "all"
         )
         cached = self._cache_get(cache_key)
         if cached is not None:

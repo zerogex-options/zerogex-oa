@@ -146,6 +146,58 @@ unchanged.
 
 ---
 
+## Scopes, tiers & what's redistributable
+
+Every endpoint declares a capability **scope** (`src/api/scopes.py`); each
+key is provisioned with a **tier** bundle that grants a set of scopes.
+Enforcement is opt-in (`API_SCOPE_ENFORCEMENT`) and a wildcard `*` key
+always passes, so these declarations are inert until keys are backfilled.
+
+| Scope | Covers | Redistributable? |
+| --- | --- | --- |
+| `gex` | GEX summary / by-strike / profile, walls, flip term-structure & surface, vol & premium surface, replay, and **`/api/v1/levels`** | ✅ derived |
+| `flow` | options-flow aggregates, forced flow | ✅ derived |
+| `maxpain` | max-pain analytics | ✅ derived |
+| `technicals` | VWAP / ORB / volume / momentum | ✅ derived |
+| `signals` | signal engine, backtest, scorecard, forecast, TradeWorkz | ✅ derived (premium) |
+| `market_raw` | raw per-contract quotes & underlying OHLC (`/api/market/*`, `/api/option/*`) | ❌ **withheld** |
+
+Tier bundles (the unit of commercial packaging):
+
+- **`analytics`** — `gex` + `flow` + `maxpain` + `technicals`: the clean
+  derived product for external / B2B2C consumers. **No raw data.**
+- **`signals`** — `analytics` + `signals`.
+- **`full`** — everything *including* `market_raw`; the internal website
+  backend only, never resold.
+
+`market_raw` is isolated precisely so it can be granted to the internal
+BFF and **withheld from every external customer** — the derived scopes are
+broadly redistributable, raw upstream market data is not. A third-party
+charting integration is issued an **`analytics`-tier key**.
+
+## Data freshness & update cadence
+
+The derived analytics (GEX, walls, flip, max pain, per-strike profile) are
+recomputed on the **~60-second analytics cycle** and served from a short
+TTL cache (GEX summary ~1.5 s; by-strike / profile ~5 s). This is
+**snapshot-poll, not a stream** — clients re-issue the GET at whatever
+cadence they want (1–5 s is effectively free against the cache). The only
+realtime push channel, `WS /ws`, carries **underlying quotes only**; it
+does not carry GEX / wall / flip.
+
+Levels and summary responses carry the snapshot time so a consumer can
+reason about staleness; `/api/v1/levels` additionally returns
+`age_seconds`. A future delayed-vs-live tier split (free = delayed / EOD,
+paid = realtime) is a timestamp gate on these fields, not a streaming
+change.
+
+> **Authoritative source.** This guide is the curated derived/charting
+> surface. The live, complete, always-current endpoint list is the
+> OpenAPI schema at `/openapi.json` (rendered at `/docs`); when the two
+> disagree, the schema wins.
+
+---
+
 ## Health & Status
 
 ### GET /api/health
@@ -153,7 +205,67 @@ Check API and database health.
 
 ---
 
+## Consolidated Levels (v1) — recommended for charting integrations
+
+Scope: `gex` (the `analytics` tier). Derived, redistributable.
+
+### GET /api/v1/levels/{symbol}
+
+The stable, **versioned** contract that bundles the headline
+dealer-positioning levels and the per-strike gamma profile into one
+response — the surface third-party charting integrations (a TradingView
+Charting Library widget, a NinjaScript indicator, embeddable partner
+widgets) should build on. The field names here are a committed contract;
+the internal `/api/gex/*` models can change without breaking integrations.
+It is a thin re-shape of `/api/gex/summary` + an across-expiration
+aggregate of `/api/gex/by-strike`, so a consumer needs one call, not two.
+
+**Path parameters:**
+- `symbol` — underlying, e.g. `SPY`, `SPX`, `QQQ` (1–16 chars, `[A-Za-z0-9.^-]`).
+
+**Query parameters:**
+- `strikes` (optional): number of strikes nearest to spot to include in the
+  gamma profile, aggregated across expirations. Min `1`, max `200`,
+  default `40`.
+
+**Returns `404`** when no snapshot exists for the symbol yet.
+
+**Example response:**
+```json
+{
+  "symbol": "SPY",
+  "spot": 676.04,
+  "as_of": "2026-07-06T19:30:00Z",
+  "age_seconds": 42,
+  "net_gex_at_spot": -1200000000.0,
+  "levels": {
+    "gamma_flip": 675.0,
+    "call_wall": 680.0,
+    "put_wall": 670.0,
+    "max_pain": 676.0
+  },
+  "profile": [
+    {"strike": 670.0, "net_gex": -500000000.0, "call_gex": 100000000.0, "put_gex": -600000000.0},
+    {"strike": 676.0, "net_gex":          0.0, "call_gex": 200000000.0, "put_gex": -200000000.0},
+    {"strike": 680.0, "net_gex":  400000000.0, "call_gex": 500000000.0, "put_gex": -100000000.0}
+  ]
+}
+```
+
+- `levels.*` draw as horizontal lines. Any field may be `null` when the
+  engine can't resolve it (e.g. an unresolved gamma flip on a thin chain)
+  — hide the line, don't render a `0`.
+- `profile` is ascending by strike (histogram order). `net_gex` is dollar
+  gamma per 1% move, calls positive / puts negative, and
+  `net_gex == call_gex + put_gex` by construction.
+- `as_of` / `age_seconds` describe snapshot freshness — see *Data
+  freshness & update cadence* above.
+
+---
+
 ## GEX (Gamma Exposure)
+
+Scope: `gex` (the `analytics` tier).
 
 ### GET /api/gex/summary
 Get latest GEX summary with key metrics.
@@ -190,44 +302,58 @@ Get GEX heatmap matrix (strike × time).
 
 ## Options Flow
 
-### GET /api/flow/by-type
-Get option flow by type (calls vs puts) across the full selected interval (time-series rows).
+Scope: `flow` (the `analytics` tier).
+
+### GET /api/flow/by-contract
+Per-contract option flow in 5-minute buckets with session-cumulative values.
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
-- `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `1min`
-- `window_units` (optional): max `90`, default `60`
+- `session` (optional): `current` | `prior`, default `current`
+- `intervals` (optional): trailing N 5-minute buckets, `1`–`390`; omit for the full session
 
-### GET /api/flow/by-strike
-Get option flow by strike level.
+### GET /api/flow/series
+Server-accumulated flow series — one row per 5-minute bar (cumulative call/put premium, volume, position, net volume, put/call ratio). Rows are newest→oldest.
 
 **Parameters:**
-- `symbol` (optional): default `SPY`
-- `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `1min`
-- `window_units` (optional): max `90`, default `60`
-- `limit` (optional): max `50000`, default `1000`
+- `symbol` (required): `[A-Z.]{1,10}`
+- `session` (optional): `current` | `prior`, default `current`
+- `strikes` (optional): comma-separated strikes to include; omit for all
+- `expirations` (optional): comma-separated `YYYY-MM-DD`; omit for all
+- `intervals` (optional): trailing N 5-minute bars, `1`–`390`
+
+### GET /api/flow/contracts
+Distinct strikes and expirations that traded in the resolved session (powers the Flow-page filter chips).
+
+**Parameters:**
+- `symbol` (required): `[A-Z.]{1,10}`
+- `session` (optional): `current` | `prior`, default `current`
 
 ### GET /api/flow/smart-money
-Get unusual activity / smart money flow.
+Unusual-activity / smart-money flow — 1-minute intervals (session 07:15–16:15 ET).
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
-- `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `1min`
-- `window_units` (optional): max `90`, default `60`
-- `limit` (optional): max `50000`, default `50`
+- `session` (optional): `current` | `prior`, default `current`
+- `limit` (optional): max `50`, default `50`
+
+### GET /api/flow/buying-pressure
+Underlying buying/selling pressure.
+
+**Parameters:**
+- `symbol` (optional): default `SPY`
+- `limit` (optional): `1`–`500`, default `20`
 
 ---
 
 ## Market Data
 
+Scope: `market_raw` — **raw upstream data, not redistributable.** These
+endpoints are for the internal `full`-tier BFF only and are excluded from
+the `analytics` tier issued to external customers.
+
 ### GET /api/market/quote
-Get latest underlying quote.
-
-**Parameters:**
-- `symbol` (optional): default `SPY`
-
-### GET /api/market/previous-close
-Get previous trading day close.
+Get latest underlying quote (the live tick).
 
 **Parameters:**
 - `symbol` (optional): default `SPY`
@@ -291,9 +417,26 @@ Get historical underlying quotes.
 - `window_units` (optional): max `90`, default `90`
 - `timeframe` (optional): `1min`, `5min`, `15min`, `1hr`, `1day` (also accepts `1hour`), default `1min`
 
+### GET /api/market/open-interest
+Current open interest per option contract from the most recent chain snapshot.
+
+**Parameters:**
+- `underlying` (optional): default `SPY`
+
+### GET /api/option/quote
+Most recent quote for a single option contract.
+
+**Parameters:**
+- `underlying` (optional): default `SPY`
+- `strike` (optional): strike price
+- `expiration` (optional): `YYYY-MM-DD`
+- `type` (optional): `C` (call) or `P` (put)
+
 ---
 
 ## Max Pain
+
+Scope: `maxpain` (the `analytics` tier).
 
 ### GET /api/max-pain/timeseries
 Get max pain over time (aggregated by timeframe).
@@ -313,6 +456,8 @@ Get current max pain with current underlying price, difference (`max_pain - unde
 ---
 
 ## Technicals
+
+Scope: `technicals` (the `analytics` tier).
 
 ### GET /api/technicals
 Combined per 5-minute bar timeseries of VWAP deviation, opening-range
@@ -418,6 +563,9 @@ Get momentum divergence signals.
 ---
 
 ## Signals
+
+Scope: `signals` (the `signals` tier — premium; not in the base `analytics`
+bundle).
 
 Signal endpoints surface the Market State Index composite, Advanced Signals
 (triggered events with hysteresis), and Basic Signals (continuous
