@@ -36,11 +36,17 @@ from src.validation import (
     cash_session_date,
     cash_session_start_utc,
     get_market_session,
+    is_cash_session_open_bucket,
     is_engine_run_window,
     seconds_until_engine_run_window,
     underlying_feed_expected,
 )
-from src.symbols import parse_underlyings, get_canonical_symbol, resolve_monthly_underlying
+from src.symbols import (
+    parse_underlyings,
+    get_canonical_symbol,
+    is_cash_index,
+    resolve_monthly_underlying,
+)
 from src.config import (
     _getenv_str,
     _getenv_int,
@@ -459,10 +465,26 @@ class IngestionEngine:
         # cycles. A bar stamped mid-interval floors to its own minute unchanged.
         bucket = bucket_timestamp(timestamp - timedelta(seconds=1), AGGREGATION_BUCKET_SECONDS)
 
+        open_price = data["open"]
+        # Cash-index session-open correction. A cash index (SPX, NDX, …) has no
+        # transactional tape of its own; TradeStation carries the prior
+        # session's close forward and stamps the 09:30 ET open bar's ``Open``
+        # with that prior close until the constituents actually open. Rendered
+        # as a candle that paints a phantom full-range bar from the prior close
+        # down to the real level instead of the true gap. The first genuine
+        # print of the session is the first streamed ``close`` of the 09:30 ET
+        # bucket, so use that as the open. The COALESCE(open) in
+        # _upsert_underlying_quote holds this first-written value for the rest
+        # of the minute, so later partials of the same bar can't regress it
+        # back to the carried-forward prior close. Only the 09:30 ET open bar
+        # of a cash index is affected — every other bar keeps its real open.
+        if is_cash_index(self.db_symbol) and is_cash_session_open_bucket(bucket):
+            open_price = data["close"]
+
         payload = {
             "symbol": self.db_symbol,
             "timestamp": bucket,
-            "open": data["open"],
+            "open": open_price,
             "high": data["high"],
             "low": data["low"],
             "close": data["close"],
