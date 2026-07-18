@@ -24,7 +24,15 @@ from src.signals.components.momentum import MomentumComponent
 from src.signals.components.order_flow_imbalance import OrderFlowImbalanceComponent
 from src.signals.components.swing_reversal import SwingReversalComponent
 from src.signals.trade_bias.bias import BiasInput, BiasResult, compute_bias
-from src.signals.trade_bias.fusion import FusedBias, TacticalRead, compute_tactical, fuse
+from src.signals.trade_bias.fusion import (
+    SWING_PROFILE,
+    FusedBias,
+    TacticalRead,
+    TenorProfile,
+    compute_tactical,
+    fuse,
+    profile_for,
+)
 from src.utils import get_logger
 
 logger = get_logger(__name__)
@@ -139,18 +147,30 @@ class TradeBiasEngine:
             return None
         return None if regime == "unknown" else regime
 
-    def build_tactical(self, ctx: MarketContext, inputs: BiasInput) -> TacticalRead:
+    def build_tactical(
+        self, ctx: MarketContext, inputs: BiasInput, profile: TenorProfile = SWING_PROFILE
+    ) -> TacticalRead:
         """Read the four directional pillars off the live context.
 
         price_action = swing bounce/reject; flow = smart-money order-flow
-        imbalance; tape = the premium tape lean (tape_flow_bias, one of the nine
-        inputs, rescaled to [-1, 1]); momentum = vol-normalized momentum.
+        imbalance (swing) or the 0DTE positioning tilt (intraday); tape = the
+        premium tape lean (tape_flow_bias, one of the nine inputs, rescaled to
+        [-1, 1]); momentum = vol-normalized momentum.
         """
         price_action = self._swing.compute(ctx)
         momentum = self._momentum.compute(ctx)
-        flow = self._order_flow.compute(ctx)
+        order_flow = self._order_flow.compute(ctx)
+        odte = (inputs.odtePositioning / 100.0) if inputs.odtePositioning is not None else None
+        # Intraday's flow pillar is the same-day 0DTE positioning; swing's is the
+        # all-expiry smart-money flow. Each falls back to the other if missing.
+        if profile.name == "intraday":
+            flow = odte if odte is not None else order_flow
+        else:
+            flow = order_flow
         tape = (inputs.tapeFlow / 100.0) if inputs.tapeFlow is not None else None
-        return compute_tactical(price_action=price_action, flow=flow, tape=tape, momentum=momentum)
+        return compute_tactical(
+            price_action=price_action, flow=flow, tape=tape, momentum=momentum, profile=profile
+        )
 
     def build_snapshot(
         self,
@@ -305,10 +325,11 @@ class TradeBiasEngine:
         conn=None,
         tenor: str = TENOR_SWING,
     ) -> TradeBiasSnapshot:
+        profile = profile_for(tenor)
         inputs = self.build_inputs(ctx, score, advanced_results, basic_results)
         structural = compute_bias(inputs)
-        tactical = self.build_tactical(ctx, inputs)
-        fused = fuse(structural, tactical)
+        tactical = self.build_tactical(ctx, inputs, profile)
+        fused = fuse(structural, tactical, profile)
         snapshot = self.build_snapshot(ctx, inputs, structural, tactical, fused, tenor=tenor)
         self.persist(snapshot, conn=conn)
         return snapshot
