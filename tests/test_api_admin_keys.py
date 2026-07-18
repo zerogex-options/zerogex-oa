@@ -203,8 +203,8 @@ def test_regenerate_revokes_and_increments_name(monkeypatch):
         ).json()
 
     assert first["name"] == "bob"
-    assert second["name"] == "bob1"
-    assert third["name"] == "bob2"
+    assert second["name"] == "bob-1"
+    assert third["name"] == "bob-2"
     # Each regenerate deprecated exactly one prior key.
     assert second["revoked_previous"] == 1
     assert third["revoked_previous"] == 1
@@ -212,7 +212,7 @@ def test_regenerate_revokes_and_increments_name(monkeypatch):
     assert len({first["api_key"], second["api_key"], third["api_key"]}) == 3
     # Only the newest key is active; the earlier two are revoked.
     active = [r for r in store["rows"] if r["revoked_at"] is None]
-    assert len(active) == 1 and active[0]["name"] == "bob2"
+    assert len(active) == 1 and active[0]["name"] == "bob-2"
 
 
 def test_list_active_only_returns_metadata_without_secret(monkeypatch):

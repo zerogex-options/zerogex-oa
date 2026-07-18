@@ -53,17 +53,17 @@ def next_key_name(base_name: str, existing: set) -> str:
 
     The website derives ``base_name`` from the local-part of the user's
     email (everything before ``@``). If a key with that exact name already
-    exists for the user — active or revoked — we tack on the smallest
-    positive integer that is free (``alice`` → ``alice1`` → ``alice2`` …),
-    matching the behaviour the product spec asked for.
+    exists for the user — active or revoked — we tack on a hyphen and the
+    smallest positive integer that is free (``alice`` → ``alice-1`` →
+    ``alice-2`` …), matching the behaviour the product spec asked for.
     """
     base = base_name.strip() or "key"
     if base not in existing:
         return base
     suffix = 1
-    while f"{base}{suffix}" in existing:
+    while f"{base}-{suffix}" in existing:
         suffix += 1
-    return f"{base}{suffix}"
+    return f"{base}-{suffix}"
 
 
 async def revoke_all_for_user(conn: Any, *, user_id: str) -> int:
