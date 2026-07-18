@@ -63,6 +63,7 @@ from .routers.forecast import router as forecast_router
 from .routers.replay import router as replay_router
 from .routers.forced_flow import router as forced_flow_router
 from .routers.levels import router as levels_router
+from .routers.admin_api_keys import router as admin_api_keys_router
 
 # Logging is configured centrally in src.utils.logging; importing
 # get_logger triggers _configure_logging which honors LOG_LEVEL and
@@ -449,6 +450,13 @@ app.include_router(forced_flow_router, dependencies=[_scope_flow])
 # Router-level guard is the SIGNALS scope; the /admin/* sub-endpoints add
 # an additional require_scopes check inline.
 app.include_router(tradeworkz_router, dependencies=[_scope_signals])
+
+# Admin key-administration surface — mints/revokes the per-user API keys
+# behind the website's self-service "Generate API Key" button. NOT scope-
+# gated like the data routers: the router carries its own require_admin
+# dependency (a dedicated X-Admin-Token shared secret, fail-closed) because
+# it issues credentials and must not ride on the lenient data-plane scopes.
+app.include_router(admin_api_keys_router)
 
 # ============================================================================
 # Health Check

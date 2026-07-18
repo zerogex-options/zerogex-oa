@@ -59,6 +59,18 @@ _PUBLIC_PATHS: Set[str] = {"/api/health"}
 _API_KEY: Optional[str] = (os.getenv("API_KEY") or "").strip() or None
 _ENVIRONMENT: str = _getenv_str("ENVIRONMENT", "development").lower()
 
+# Dedicated shared secret gating the key-administration endpoints
+# (/api/admin/api-keys). These mint and revoke per-user credentials, so
+# they are held to a stricter bar than the read APIs: the caller must
+# present this exact token in an ``X-Admin-Token`` header, independent of
+# API_SCOPE_ENFORCEMENT and of any per-user key's scope list. It is a
+# SEPARATE secret from the data-plane API_KEY / per-user keys on purpose —
+# the website BFF distributes its read token widely (every page load), and
+# key minting must not ride on that higher-exposure credential. When unset,
+# the admin endpoints fail closed (see ``require_admin``).
+_KEY_ADMIN_TOKEN: Optional[str] = (os.getenv("KEY_ADMIN_TOKEN") or "").strip() or None
+_ADMIN_TOKEN_HEADER = "X-Admin-Token"
+
 # Per-endpoint scope enforcement. The `api_keys.scopes` column exists but
 # every key provisioned to date defaults to `[]` (no key→tier mapping has
 # ever been backfilled — tier gating currently lives in the web proxy
@@ -350,6 +362,37 @@ async def api_key_auth(
         detail="Invalid or missing API key",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+
+async def require_admin(request: Request) -> None:
+    """Strict gate for the key-administration endpoints.
+
+    Unlike :func:`require_scopes` (which is a lenient authorization *hint*
+    that defers to ``API_SCOPE_ENFORCEMENT`` and grants static/scopeless
+    callers), this is an unconditional gate: the caller MUST present
+    ``X-Admin-Token`` matching :data:`_KEY_ADMIN_TOKEN`. It layers on top of
+    the global :func:`api_key_auth` dependency, so an admin call needs both
+    a valid API key *and* the admin token.
+
+    * ``KEY_ADMIN_TOKEN`` unset → **503**. Fail closed: a deploy that hasn't
+      provisioned the secret must never expose credential minting, not even
+      to an otherwise-authenticated caller.
+    * Header missing or mismatched → **403**.
+
+    The comparison uses :func:`hmac.compare_digest` to avoid leaking the
+    token length/prefix via timing.
+    """
+    if _KEY_ADMIN_TOKEN is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Key administration is not configured",
+        )
+    provided = request.headers.get(_ADMIN_TOKEN_HEADER)
+    if not provided or not hmac.compare_digest(provided, _KEY_ADMIN_TOKEN):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="A valid admin token is required for this endpoint",
+        )
 
 
 def require_scopes(*required: str) -> Callable:
