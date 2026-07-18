@@ -1,10 +1,10 @@
-"""Tests for the cash-index session-open phantom repair tool.
+"""Tests for the cash-index session-open phantom repair logic.
 
 The DB path needs a live connection, but the pure logic — the OHLC
-reconstruction, symbol resolution, the shared SQL (detection + rebuild), and the
-dry-run vs execute branching — is exercised here with fakes (mirroring
-test_underlying_backfill.py, which pins the same kind of DB-adjacent contract
-without a real Postgres).
+reconstruction, symbol resolution, the shared SQL, and the dry-run vs execute
+branching — is exercised here with fakes (mirroring test_underlying_backfill.py,
+which pins the same kind of DB-adjacent contract without a real Postgres). The
+values below are the real SPX bars from 2026-07-13..17.
 """
 
 from __future__ import annotations
@@ -14,61 +14,58 @@ from datetime import date, datetime, timezone
 
 from src.tools.cash_index_open_repair import (
     _SELECT_CANDIDATES_SQL,
+    _SINGLE_BAR_REPAIR_SQL,
     _TARGETS_CTE,
     _UPDATE_SQL,
     default_cash_index_symbols,
     reconstruct_session_open,
     repair,
+    repair_one_session_open,
     resolve_symbols,
 )
 
 
 # ----------------------------------------------------------------------
-# reconstruct_session_open — the OHLC rebuild
+# reconstruct_session_open — the OHLC rebuild (no prior close needed)
 # ----------------------------------------------------------------------
 def test_reconstruct_gap_down_strips_phantom_open_and_high():
-    # Jul 17 SPX: prior close 7533.77 carried into open AND high (gap down).
+    # 7/17 SPX: stale rotation value is the open AND the high (gap down).
     # Real data = close 7447.71 and low 7441.62; rebuild anchors on close.
-    assert reconstruct_session_open(7533.77, 7533.77, 7441.62, 7447.71, 7533.77) == (
-        7447.71,  # open  -> close
-        7447.71,  # high  -> close (phantom high dropped)
-        7441.62,  # low   -> real low preserved
+    assert reconstruct_session_open(7533.77, 7533.77, 7441.62, 7447.71) == (
+        7447.71,  # open -> close
+        7447.71,  # high -> close (phantom high dropped)
+        7441.62,  # low  -> real low preserved
     )
 
 
 def test_reconstruct_gap_up_strips_phantom_open_and_low():
-    # Prior close carried into open AND low (gap up): real high is preserved.
-    assert reconstruct_session_open(7515.34, 7538.83, 7515.34, 7533.00, 7515.34) == (
+    # 7/14 SPX: stale value is the open AND the low (gap up); real high kept.
+    assert reconstruct_session_open(7515.34, 7538.83, 7515.34, 7533.00) == (
         7533.00,  # open -> close
         7538.83,  # high -> real high preserved
         7533.00,  # low  -> close (phantom low dropped)
     )
 
 
-def test_reconstruct_open_strictly_outside_range_keeps_real_extremes():
-    # Phantom open above the whole real bar; high/low are both genuine here.
-    assert reconstruct_session_open(7530.0, 7490.0, 7440.0, 7480.0, 7530.0) == (
-        7480.0,  # open -> close
-        7490.0,  # high preserved
-        7440.0,  # low preserved
+def test_reconstruct_gap_up_collapses_when_only_close_is_real():
+    # 7/13 SPX: O=L=7547.53 (stale), H=C=7557.94. The real low is masked, so the
+    # bar honestly collapses to the close level.
+    assert reconstruct_session_open(7547.53, 7557.94, 7547.53, 7557.94) == (
+        7557.94,
+        7557.94,
+        7557.94,
     )
 
 
-def test_reconstruct_open_within_range_only_fixes_open():
-    # open == prior close but the first minute traded both sides of it, so the
-    # extremes are real — only the open is nudged to the close.
-    assert reconstruct_session_open(7574.73, 7576.39, 7569.59, 7572.01, 7574.73) == (
-        7572.01,
-        7576.39,
-        7569.59,
-    )
+def test_reconstruct_returns_none_when_open_inside_range():
+    # 7/15 SPX: open is strictly inside [low, high] -> small overnight move, no
+    # visible phantom, left untouched.
+    assert reconstruct_session_open(7574.73, 7576.39, 7569.59, 7572.01) is None
 
 
-def test_reconstruct_returns_none_when_not_a_phantom():
-    # open != prior close -> a genuine open, never touched.
-    assert reconstruct_session_open(7500.0, 7510.0, 7495.0, 7505.0, 7533.77) is None
-    # flat no-op: open == prior close == close -> nothing to fix.
-    assert reconstruct_session_open(7500.0, 7500.0, 7500.0, 7500.0, 7500.0) is None
+def test_reconstruct_returns_none_on_flat_bar():
+    # open == close -> nothing gapped, nothing to fix.
+    assert reconstruct_session_open(7500.0, 7500.0, 7500.0, 7500.0) is None
 
 
 # ----------------------------------------------------------------------
@@ -96,22 +93,21 @@ def test_resolve_symbols_drops_non_cash_indexes():
 
 
 # ----------------------------------------------------------------------
-# SQL contract — detection by prior close, rebuild by GREATEST/LEAST
+# SQL contract — self-contained detection (open is an extreme of a gapped bar)
 # ----------------------------------------------------------------------
 def test_targets_cte_pins_detection_and_scope():
     norm = " ".join(_TARGETS_CTE.split())
-    # Detection: open equals the prior session's close, and not a flat no-op.
-    assert "uq.open = pc.prior_close" in norm
-    assert "uq.open <> uq.close" in norm
-    # Prior close comes from the most recent row strictly before the bar.
-    assert "p.timestamp < ob.timestamp" in norm and "ORDER BY p.timestamp DESC" in norm
+    # Phantom signature: the stale open is an extreme, and the bar gapped.
+    assert "(open = high OR open = low) AND open <> close" in norm
     # Only the 09:30 ET open bar, DST-correct via the tz conversion.
     assert "(timezone('America/New_York', timestamp))::time = TIME '09:30:00'" in norm
     # Symbol + optional date bounds are parameterized.
     assert "symbol = ANY(%(symbols)s)" in norm
     assert "%(start)s::date" in norm and "%(end)s::date" in norm
-    # Rebuild uses GREATEST/LEAST over the non-phantom values.
+    # Rebuild uses GREATEST/LEAST over the non-stale values.
     assert "GREATEST(" in norm and "LEAST(" in norm
+    # No prior-close lookup anymore.
+    assert "prior_close" not in norm and "LATERAL" not in norm
 
 
 def test_select_and_update_share_the_cte():
@@ -119,19 +115,24 @@ def test_select_and_update_share_the_cte():
     assert cte in " ".join(_SELECT_CANDIDATES_SQL.split())
     assert cte in " ".join(_UPDATE_SQL.split())
     upd = " ".join(_UPDATE_SQL.split())
-    # The UPDATE writes the reconstructed open/high/low from the CTE.
     assert "UPDATE underlying_quotes u" in upd
-    assert "open = t.new_open" in upd
-    assert "high = t.new_high" in upd
-    assert "low = t.new_low" in upd
+    assert "open = t.new_open" in upd and "high = t.new_high" in upd and "low = t.new_low" in upd
+
+
+def test_single_bar_repair_sql_targets_one_bar():
+    norm = " ".join(_SINGLE_BAR_REPAIR_SQL.split())
+    assert "UPDATE underlying_quotes" in norm
+    assert "SET open = close" in norm
+    assert "WHERE symbol = %(symbol)s AND timestamp = %(ts)s" in norm
+    assert "(open = high OR open = low) AND open <> close" in norm
 
 
 # ----------------------------------------------------------------------
-# repair() dry-run vs execute branching (fake DB)
+# repair_one_session_open — the single-bar path the ingester calls
 # ----------------------------------------------------------------------
 class _FakeCursor:
-    def __init__(self, rows, rowcount):
-        self._rows = rows
+    def __init__(self, rows=None, rowcount=0):
+        self._rows = rows or []
         self.rowcount = rowcount
         self.calls = []  # (sql, params)
 
@@ -145,14 +146,31 @@ class _FakeCursor:
 class _FakeConn:
     def __init__(self, cur):
         self._cur = cur
+        self.commits = 0
 
     def cursor(self):
         return self._cur
 
     def commit(self):
-        pass
+        self.commits += 1
 
 
+def test_repair_one_session_open_executes_single_bar_update():
+    cur = _FakeCursor(rowcount=1)
+    conn = _FakeConn(cur)
+    ts = datetime(2026, 7, 17, 13, 30, tzinfo=timezone.utc)
+    n = repair_one_session_open(conn, "SPX", ts)
+
+    assert n == 1
+    assert len(cur.calls) == 1
+    sql, params = cur.calls[0]
+    assert "UPDATE underlying_quotes" in sql
+    assert params == {"symbol": "SPX", "ts": ts}
+
+
+# ----------------------------------------------------------------------
+# repair() dry-run vs execute branching (fake DB)
+# ----------------------------------------------------------------------
 def _factory(cur):
     @contextlib.contextmanager
     def _cm():
@@ -162,8 +180,8 @@ def _factory(cur):
 
 
 _TS = datetime(2026, 7, 17, 13, 30, tzinfo=timezone.utc)  # 09:30 ET on an EDT day
-# (symbol, timestamp, old_open, old_high, old_low, close, prior_close, new_open, new_high, new_low)
-_TARGET_ROW = ("SPX", _TS, 7533.77, 7533.77, 7441.62, 7447.71, 7533.77, 7447.71, 7447.71, 7441.62)
+# (symbol, timestamp, old_open, old_high, old_low, close, new_open, new_high, new_low)
+_TARGET_ROW = ("SPX", _TS, 7533.77, 7533.77, 7441.62, 7447.71, 7447.71, 7447.71, 7441.62)
 
 
 def test_repair_dry_run_selects_but_does_not_update():
@@ -175,8 +193,7 @@ def test_repair_dry_run_selects_but_does_not_update():
     assert updated == 0
     assert len(candidates) == 1
     row = candidates[0]
-    assert row["symbol"] == "SPX"
-    assert row["old_open"] == 7533.77 and row["prior_close"] == 7533.77
+    assert row["old_open"] == 7533.77
     assert (row["new_open"], row["new_high"], row["new_low"]) == (7447.71, 7447.71, 7441.62)
     # Only the SELECT ran — no UPDATE in dry-run.
     assert len(cur.calls) == 1
@@ -204,6 +221,5 @@ def test_repair_execute_skips_update_when_nothing_to_fix():
     candidates, updated = repair(["SPX"], dry_run=False, conn_factory=_factory(cur))
 
     assert candidates == [] and updated == 0
-    # A clean DB is never written to — SELECT only, no UPDATE.
     assert len(cur.calls) == 1
     assert "UPDATE" not in cur.calls[0][0]

@@ -1,43 +1,45 @@
-"""One-shot repair for the cash-index session-open phantom in ``underlying_quotes``.
+"""Repair the cash-index session-open phantom in ``underlying_quotes``.
 
-A cash index (SPX, NDX, RUT, DJX) has no transactional tape of its own, so
-TradeStation carries the prior session's close forward and stamps the 09:30 ET
-open bar's ``Open`` with that prior close until the constituents actually open.
-That carried-forward price does not just corrupt the open — TradeStation folds
-it into the bar's OHLC, so it also lands in the ``high`` (on a day the index
-gapped down, where the prior close is the highest value) or the ``low`` (gap
-up). Stored verbatim, it paints a phantom full-range candle from the prior close
-to the real level instead of the true opening gap.
+A cash index (SPX, NDX, RUT, DJX) is computed from its constituents, and at
+09:30:00 ET almost none have opened yet — so the index's opening print is the
+stale opening-rotation value (≈ the prior close) and only "catches up" to the
+real level over the first seconds as constituents open. TradeStation reports
+that stale value as the 09:30 bar's ``Open``, and folds it into the bar's OHLC,
+so it also lands in the ``high`` (gap down, where the stale value is the highest)
+or the ``low`` (gap up). Stored verbatim it paints a phantom full-range candle
+from the stale value to the real level instead of the true opening gap.
 
-Detection — the false-positive-free signature is that the 09:30 open EXACTLY
-equals the prior session's close (``underlying_quotes`` has no pre-market rows
-for a cash index, so "the bar immediately before 09:30" is the prior session's
-last print). A genuine index open never equals the prior close to the penny by
-chance, so this never touches a legitimately-formed bar — unlike an
-``open == high`` test, which also matches a real bar that opened at its high.
+Detection is self-contained — no prior close needed. For a cash index the 09:30
+open is *always* the stale rotation value (never a real traded print at
+09:30:00), so when it equals an extreme (``open == high`` on a gap down,
+``open == low`` on a gap up) and the bar gapped (``open != close``), that extreme
+IS the stale value and the bar is a phantom. When the open sits strictly inside
+``(low, high)`` the overnight move was small and there is no visible phantom, so
+the bar is left alone. Because the open is never a real print, this never
+mis-flags a legitimately-formed bar.
 
-Reconstruction — only ``close`` (the last print) and the extreme that is NOT the
-carried-forward price are real. Rebuild from those, anchored on ``close``:
+Reconstruction — the ``close`` (last print) and the extreme that is NOT the stale
+open are real. Rebuild from those, anchored on ``close``:
 
     new_open = close
-    real_high = high if high != prior_close else close
-    real_low  = low  if low  != prior_close else close
+    real_high = high if high != open else close
+    real_low  = low  if low  != open else close
     new_high = max(close, real_high, real_low)
     new_low  = min(close, real_high, real_low)
 
 The true first print and the masked extreme are not recoverable from a completed
-bar, so ``close`` is the honest proxy — it removes the phantom and preserves the
-real, non-phantom extreme (the real low on a gap down, the real high on a gap
-up). Idempotent: after the fix ``open == close``, so the ``open <> close`` guard
-excludes the row on any re-run.
+bar, so ``close`` is the honest proxy — it clears the phantom and keeps the real,
+non-stale extreme (the real low on a gap down, the real high on a gap up).
+Idempotent: after the fix ``open == close``, which the ``open <> close`` guard
+excludes on any re-run.
 
-The live ingester stores TradeStation's bar verbatim (faithful capture); this
-tool owns the correction and runs both as a one-shot over history and, via the
-``zerogex-oa-cash-index-open-repair`` timer, a few minutes after each open.
+The live ingester now runs :func:`repair_one_session_open` on each session's
+open bar the moment it is complete, so new data is correct as stored. This module
+is the shared source of that logic and also provides a one-time CLI to clean up
+rows that were stored before the ingester fix (``make cash-index-open-repair``).
 
-Dry-run by default: without ``--execute`` the tool is read-only and only reports
-what WOULD change. The Makefile wrapper (``make cash-index-open-repair``) gates
-``--execute`` behind ``CONFIRM=yes``.
+Dry-run by default: without ``--execute`` the CLI is read-only and only reports
+what WOULD change.
 
 Verify against a live database — the pure reconstruction and SQL-contract logic
 is unit-tested (``tests/test_cash_index_open_repair.py``), but the DB path needs
@@ -45,8 +47,8 @@ a real connection to exercise.
 
 Usage::
 
-    python -m src.tools.cash_index_open_repair --start 2026-07-01 --end 2026-07-17
-    python -m src.tools.cash_index_open_repair --execute        # apply
+    python -m src.tools.cash_index_open_repair              # dry-run, all history
+    python -m src.tools.cash_index_open_repair --execute    # apply
 """
 
 from __future__ import annotations
@@ -55,73 +57,62 @@ import argparse
 import json
 import logging
 import re
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.symbols import get_index_volume_proxies, is_cash_index
 
 logger = logging.getLogger(__name__)
 
-# The 09:30 ET open bars in scope, with the prior session's close attached and
-# the reconstructed OHLC computed. Shared by the dry-run SELECT and the UPDATE so
-# detection + reconstruction can never drift between preview and apply.
-#
-# ``timestamp`` is TIMESTAMPTZ, so ``timezone('America/New_York', timestamp)``
-# yields the ET wall-clock instant (DST-correct) for the 09:30 match and the ET
-# date bounds. The LATERAL picks the most recent row strictly before the bar —
-# for a cash index (no pre-market rows) that is the prior session's last print,
-# i.e. the value TradeStation carried forward. Named params are psycopg2-adapted:
-# a Python list becomes a Postgres array for ``= ANY(...)``; ``None`` start/end
-# disable that bound.
-_TARGETS_CTE = """
-    WITH open_bars AS (
-        SELECT symbol, timestamp
+# The reconstruction, as a SQL fragment over a row's own OHLC. Every RHS in an
+# UPDATE ... SET is evaluated against the pre-update row, so the ``open`` inside
+# these CASEs is always the old (stale) open even though we also set open=close.
+# The stale open equals whichever extreme is the phantom, so "extreme <> open"
+# keeps the real extreme and substitutes close for the phantom one.
+_NEW_HIGH_EXPR = (
+    "GREATEST(close, CASE WHEN high <> open THEN high ELSE close END, "
+    "CASE WHEN low <> open THEN low ELSE close END)"
+)
+_NEW_LOW_EXPR = (
+    "LEAST(close, CASE WHEN high <> open THEN high ELSE close END, "
+    "CASE WHEN low <> open THEN low ELSE close END)"
+)
+
+# The phantom signature, applied to a cash-index 09:30 ET bar: the stale open is
+# an extreme of its own bar, and the bar gapped. ``open <> close`` also makes the
+# fix idempotent (after it, open == close). ``timestamp`` is TIMESTAMPTZ, so
+# ``timezone('America/New_York', timestamp)`` is the DST-correct ET wall clock.
+_PHANTOM_WHERE = "(open = high OR open = low) AND open <> close"
+
+# ---- Batch CLI path (one-time cleanup of already-stored history) ----
+# Named params are psycopg2-adapted: a Python list becomes a Postgres array for
+# ``= ANY(...)``; ``None`` start/end disable that date bound.
+_TARGETS_CTE = f"""
+    WITH targets AS (
+        SELECT
+            symbol,
+            timestamp,
+            open  AS old_open,
+            high  AS old_high,
+            low   AS old_low,
+            close,
+            close AS new_open,
+            {_NEW_HIGH_EXPR} AS new_high,
+            {_NEW_LOW_EXPR}  AS new_low
         FROM underlying_quotes
         WHERE symbol = ANY(%(symbols)s)
           AND (timezone('America/New_York', timestamp))::time = TIME '09:30:00'
+          AND {_PHANTOM_WHERE}
           AND (%(start)s::date IS NULL
                OR (timezone('America/New_York', timestamp))::date >= %(start)s::date)
           AND (%(end)s::date IS NULL
                OR (timezone('America/New_York', timestamp))::date <= %(end)s::date)
-    ),
-    targets AS (
-        SELECT
-            uq.symbol,
-            uq.timestamp,
-            uq.open  AS old_open,
-            uq.high  AS old_high,
-            uq.low   AS old_low,
-            uq.close,
-            pc.prior_close,
-            uq.close AS new_open,
-            GREATEST(
-                uq.close,
-                CASE WHEN uq.high <> pc.prior_close THEN uq.high ELSE uq.close END,
-                CASE WHEN uq.low  <> pc.prior_close THEN uq.low  ELSE uq.close END
-            ) AS new_high,
-            LEAST(
-                uq.close,
-                CASE WHEN uq.high <> pc.prior_close THEN uq.high ELSE uq.close END,
-                CASE WHEN uq.low  <> pc.prior_close THEN uq.low  ELSE uq.close END
-            ) AS new_low
-        FROM open_bars ob
-        JOIN underlying_quotes uq
-          ON uq.symbol = ob.symbol AND uq.timestamp = ob.timestamp
-        CROSS JOIN LATERAL (
-            SELECT p.close AS prior_close
-            FROM underlying_quotes p
-            WHERE p.symbol = ob.symbol AND p.timestamp < ob.timestamp
-            ORDER BY p.timestamp DESC
-            LIMIT 1
-        ) pc
-        WHERE uq.open = pc.prior_close   -- TradeStation carried the prior close forward
-          AND uq.open <> uq.close        -- and it isn't a flat no-op bar
     )
 """
 
 _SELECT_CANDIDATES_SQL = _TARGETS_CTE + """
     SELECT symbol, timestamp, old_open, old_high, old_low, close,
-           prior_close, new_open, new_high, new_low
+           new_open, new_high, new_low
     FROM targets
     ORDER BY symbol, timestamp
 """
@@ -143,30 +134,54 @@ _CANDIDATE_COLS = (
     "old_high",
     "old_low",
     "close",
-    "prior_close",
     "new_open",
     "new_high",
     "new_low",
 )
 
+# ---- Single-bar path (the live ingester, once per session on the open bar) ----
+_SINGLE_BAR_REPAIR_SQL = f"""
+    UPDATE underlying_quotes
+    SET open = close,
+        high = {_NEW_HIGH_EXPR},
+        low  = {_NEW_LOW_EXPR},
+        updated_at = NOW()
+    WHERE symbol = %(symbol)s
+      AND timestamp = %(ts)s
+      AND {_PHANTOM_WHERE}
+"""
+
 
 def reconstruct_session_open(
-    open_: Any, high: Any, low: Any, close: Any, prior_close: Any
+    open_: Any, high: Any, low: Any, close: Any
 ) -> Optional[Tuple[Any, Any, Any]]:
     """Return the rebuilt ``(open, high, low)`` for a phantom bar, or ``None``.
 
     The Python mirror of the SQL reconstruction (single source of the rule).
-    Returns ``None`` when the bar is not a carry-forward phantom — i.e. the open
-    does not equal the prior close, or the bar is a flat no-op — so it is safe to
-    call on any bar. Works with float or Decimal.
+    Returns ``None`` when the bar is not a phantom — the open is not an extreme,
+    or the bar did not gap — so it is safe to call on any bar. Works with float
+    or Decimal.
     """
-    if open_ != prior_close or open_ == close:
+    if open_ == close or (open_ != high and open_ != low):
         return None
-    real_high = high if high != prior_close else close
-    real_low = low if low != prior_close else close
+    real_high = high if high != open_ else close
+    real_low = low if low != open_ else close
     new_high = max(close, real_high, real_low)
     new_low = min(close, real_high, real_low)
     return close, new_high, new_low
+
+
+def repair_one_session_open(conn, symbol: str, open_ts: datetime) -> int:
+    """Repair the single 09:30 ET open bar at ``open_ts`` for ``symbol``.
+
+    Runs the phantom UPDATE against an existing (psycopg2) connection and returns
+    the number of rows changed (0 if the bar is absent or not a phantom). Does
+    not commit — the caller owns the transaction. Used by the live ingester the
+    moment a session's open bar is complete.
+    """
+    cur = conn.cursor()
+    cur.execute(_SINGLE_BAR_REPAIR_SQL, {"symbol": symbol, "ts": open_ts})
+    return cur.rowcount
 
 
 def default_cash_index_symbols() -> List[str]:
@@ -212,11 +227,11 @@ def repair(
 ) -> Tuple[List[Dict[str, Any]], int]:
     """Find (and, unless ``dry_run``, repair) phantom session-open bars.
 
-    Returns ``(candidates, updated)`` where ``candidates`` is the list of
-    phantom bars found (dicts with old/new OHLC and the prior close) and
-    ``updated`` is the number of rows the UPDATE actually changed (0 in dry-run
-    mode). The UPDATE is skipped entirely when there is nothing to change, so a
-    clean database is never written to.
+    Returns ``(candidates, updated)`` where ``candidates`` is the list of phantom
+    bars found (dicts with old/new OHLC) and ``updated`` is the number of rows
+    the UPDATE actually changed (0 in dry-run mode). The UPDATE is skipped
+    entirely when there is nothing to change, so a clean database is never
+    written to.
     """
     if conn_factory is None:
         from src.database import db_connection
@@ -269,10 +284,9 @@ def _report(
     # A small before/after sample so the operator can eyeball the reconstruction.
     for row in candidates[:10]:
         logger.info(
-            "  %s %s  prior_close=%s  O/H/L %s/%s/%s -> %s/%s/%s  (close %s)",
+            "  %s %s  O/H/L %s/%s/%s -> %s/%s/%s  (close %s)",
             row["symbol"],
             row["timestamp"],
-            row["prior_close"],
             row["old_open"],
             row["old_high"],
             row["old_low"],
@@ -290,8 +304,8 @@ def _report(
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Repair the cash-index 09:30 ET session-open phantom "
-            "(carried-forward prior close) in underlying_quotes."
+            "One-time cleanup of the cash-index 09:30 ET session-open phantom "
+            "(stale opening-rotation value) in underlying_quotes."
         )
     )
     parser.add_argument(
