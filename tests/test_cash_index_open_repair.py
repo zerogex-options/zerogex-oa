@@ -1,9 +1,10 @@
 """Tests for the cash-index session-open phantom repair tool.
 
-The DB path needs a live connection, but the pure logic — phantom detection,
-symbol resolution, the shared SQL predicate, and the dry-run vs execute
-branching — is exercised here with fakes (mirroring test_underlying_backfill.py,
-which pins the same kind of DB-adjacent contract without a real Postgres).
+The DB path needs a live connection, but the pure logic — the OHLC
+reconstruction, symbol resolution, the shared SQL (detection + rebuild), and the
+dry-run vs execute branching — is exercised here with fakes (mirroring
+test_underlying_backfill.py, which pins the same kind of DB-adjacent contract
+without a real Postgres).
 """
 
 from __future__ import annotations
@@ -12,32 +13,62 @@ import contextlib
 from datetime import date, datetime, timezone
 
 from src.tools.cash_index_open_repair import (
-    _PHANTOM_PREDICATE,
     _SELECT_CANDIDATES_SQL,
+    _TARGETS_CTE,
     _UPDATE_SQL,
     default_cash_index_symbols,
-    is_phantom_session_open,
+    reconstruct_session_open,
     repair,
     resolve_symbols,
 )
 
 
 # ----------------------------------------------------------------------
-# Phantom detection
+# reconstruct_session_open — the OHLC rebuild
 # ----------------------------------------------------------------------
-def test_is_phantom_open_flags_out_of_range_open():
-    # Gap-down day: prior-close open above the bar's own high.
-    assert is_phantom_session_open(7530.0, 7490.0, 7440.0) is True
-    # Gap-up day: prior-close open below the bar's own low.
-    assert is_phantom_session_open(7400.0, 7490.0, 7440.0) is True
+def test_reconstruct_gap_down_strips_phantom_open_and_high():
+    # Jul 17 SPX: prior close 7533.77 carried into open AND high (gap down).
+    # Real data = close 7447.71 and low 7441.62; rebuild anchors on close.
+    assert reconstruct_session_open(7533.77, 7533.77, 7441.62, 7447.71, 7533.77) == (
+        7447.71,  # open  -> close
+        7447.71,  # high  -> close (phantom high dropped)
+        7441.62,  # low   -> real low preserved
+    )
 
 
-def test_is_phantom_open_accepts_in_range_open():
-    # A genuine first print is within [low, high] — not a phantom.
-    assert is_phantom_session_open(7460.0, 7490.0, 7440.0) is False
-    # Edges are in-range (the first print can be the high or the low).
-    assert is_phantom_session_open(7490.0, 7490.0, 7440.0) is False
-    assert is_phantom_session_open(7440.0, 7490.0, 7440.0) is False
+def test_reconstruct_gap_up_strips_phantom_open_and_low():
+    # Prior close carried into open AND low (gap up): real high is preserved.
+    assert reconstruct_session_open(7515.34, 7538.83, 7515.34, 7533.00, 7515.34) == (
+        7533.00,  # open -> close
+        7538.83,  # high -> real high preserved
+        7533.00,  # low  -> close (phantom low dropped)
+    )
+
+
+def test_reconstruct_open_strictly_outside_range_keeps_real_extremes():
+    # Phantom open above the whole real bar; high/low are both genuine here.
+    assert reconstruct_session_open(7530.0, 7490.0, 7440.0, 7480.0, 7530.0) == (
+        7480.0,  # open -> close
+        7490.0,  # high preserved
+        7440.0,  # low preserved
+    )
+
+
+def test_reconstruct_open_within_range_only_fixes_open():
+    # open == prior close but the first minute traded both sides of it, so the
+    # extremes are real — only the open is nudged to the close.
+    assert reconstruct_session_open(7574.73, 7576.39, 7569.59, 7572.01, 7574.73) == (
+        7572.01,
+        7576.39,
+        7569.59,
+    )
+
+
+def test_reconstruct_returns_none_when_not_a_phantom():
+    # open != prior close -> a genuine open, never touched.
+    assert reconstruct_session_open(7500.0, 7510.0, 7495.0, 7505.0, 7533.77) is None
+    # flat no-op: open == prior close == close -> nothing to fix.
+    assert reconstruct_session_open(7500.0, 7500.0, 7500.0, 7500.0, 7500.0) is None
 
 
 # ----------------------------------------------------------------------
@@ -65,25 +96,34 @@ def test_resolve_symbols_drops_non_cash_indexes():
 
 
 # ----------------------------------------------------------------------
-# SQL contract — the dry-run SELECT and the UPDATE must share one predicate
+# SQL contract — detection by prior close, rebuild by GREATEST/LEAST
 # ----------------------------------------------------------------------
-def test_predicate_pins_phantom_and_session_open_and_scope():
-    norm = " ".join(_PHANTOM_PREDICATE.split())
-    # Phantom signature: open outside the bar's own [low, high].
-    assert "(open > high OR open < low)" in norm
+def test_targets_cte_pins_detection_and_scope():
+    norm = " ".join(_TARGETS_CTE.split())
+    # Detection: open equals the prior session's close, and not a flat no-op.
+    assert "uq.open = pc.prior_close" in norm
+    assert "uq.open <> uq.close" in norm
+    # Prior close comes from the most recent row strictly before the bar.
+    assert "p.timestamp < ob.timestamp" in norm and "ORDER BY p.timestamp DESC" in norm
     # Only the 09:30 ET open bar, DST-correct via the tz conversion.
     assert "(timezone('America/New_York', timestamp))::time = TIME '09:30:00'" in norm
     # Symbol + optional date bounds are parameterized.
     assert "symbol = ANY(%(symbols)s)" in norm
     assert "%(start)s::date" in norm and "%(end)s::date" in norm
+    # Rebuild uses GREATEST/LEAST over the non-phantom values.
+    assert "GREATEST(" in norm and "LEAST(" in norm
 
 
-def test_select_and_update_share_the_predicate():
-    pred = " ".join(_PHANTOM_PREDICATE.split())
-    assert pred in " ".join(_SELECT_CANDIDATES_SQL.split())
-    assert pred in " ".join(_UPDATE_SQL.split())
-    # The repair replaces the phantom open with the bar's own close.
-    assert "SET open = close" in " ".join(_UPDATE_SQL.split())
+def test_select_and_update_share_the_cte():
+    cte = " ".join(_TARGETS_CTE.split())
+    assert cte in " ".join(_SELECT_CANDIDATES_SQL.split())
+    assert cte in " ".join(_UPDATE_SQL.split())
+    upd = " ".join(_UPDATE_SQL.split())
+    # The UPDATE writes the reconstructed open/high/low from the CTE.
+    assert "UPDATE underlying_quotes u" in upd
+    assert "open = t.new_open" in upd
+    assert "high = t.new_high" in upd
+    assert "low = t.new_low" in upd
 
 
 # ----------------------------------------------------------------------
@@ -122,23 +162,25 @@ def _factory(cur):
 
 
 _TS = datetime(2026, 7, 17, 13, 30, tzinfo=timezone.utc)  # 09:30 ET on an EDT day
-_PHANTOM_ROW = ("SPX", _TS, 7530.0, 7490.0, 7440.0, 7480.0)
+# (symbol, timestamp, old_open, old_high, old_low, close, prior_close, new_open, new_high, new_low)
+_TARGET_ROW = ("SPX", _TS, 7533.77, 7533.77, 7441.62, 7447.71, 7533.77, 7447.71, 7447.71, 7441.62)
 
 
 def test_repair_dry_run_selects_but_does_not_update():
-    cur = _FakeCursor(rows=[_PHANTOM_ROW], rowcount=0)
+    cur = _FakeCursor(rows=[_TARGET_ROW], rowcount=0)
     candidates, updated = repair(
         ["SPX"], date(2026, 7, 1), date(2026, 7, 17), dry_run=True, conn_factory=_factory(cur)
     )
 
     assert updated == 0
     assert len(candidates) == 1
-    assert candidates[0]["symbol"] == "SPX"
-    assert candidates[0]["open"] == 7530.0 and candidates[0]["close"] == 7480.0
+    row = candidates[0]
+    assert row["symbol"] == "SPX"
+    assert row["old_open"] == 7533.77 and row["prior_close"] == 7533.77
+    assert (row["new_open"], row["new_high"], row["new_low"]) == (7447.71, 7447.71, 7441.62)
     # Only the SELECT ran — no UPDATE in dry-run.
     assert len(cur.calls) == 1
-    assert "SELECT" in cur.calls[0][0] and "UPDATE" not in cur.calls[0][0]
-    # Params are threaded through verbatim.
+    assert "UPDATE" not in cur.calls[0][0]
     assert cur.calls[0][1] == {
         "symbols": ["SPX"],
         "start": date(2026, 7, 1),
@@ -147,16 +189,13 @@ def test_repair_dry_run_selects_but_does_not_update():
 
 
 def test_repair_execute_runs_update_after_select():
-    cur = _FakeCursor(rows=[_PHANTOM_ROW], rowcount=1)
+    cur = _FakeCursor(rows=[_TARGET_ROW], rowcount=1)
     candidates, updated = repair(["SPX"], dry_run=False, conn_factory=_factory(cur))
 
     assert updated == 1
     assert len(candidates) == 1
-    # SELECT first, then the UPDATE.
     assert len(cur.calls) == 2
-    assert "SELECT" in cur.calls[0][0]
     assert "UPDATE underlying_quotes" in cur.calls[1][0]
-    # No date bounds -> None passed through (predicate short-circuits them).
     assert cur.calls[1][1] == {"symbols": ["SPX"], "start": None, "end": None}
 
 
@@ -167,4 +206,4 @@ def test_repair_execute_skips_update_when_nothing_to_fix():
     assert candidates == [] and updated == 0
     # A clean DB is never written to — SELECT only, no UPDATE.
     assert len(cur.calls) == 1
-    assert "SELECT" in cur.calls[0][0]
+    assert "UPDATE" not in cur.calls[0][0]
