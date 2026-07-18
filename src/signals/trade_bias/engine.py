@@ -20,7 +20,11 @@ from datetime import datetime
 from typing import Any, Optional
 
 from src.signals.components.base import MarketContext
+from src.signals.components.momentum import MomentumComponent
+from src.signals.components.order_flow_imbalance import OrderFlowImbalanceComponent
+from src.signals.components.swing_reversal import SwingReversalComponent
 from src.signals.trade_bias.bias import BiasInput, BiasResult, compute_bias
+from src.signals.trade_bias.fusion import FusedBias, TacticalRead, compute_tactical, fuse
 from src.utils import get_logger
 
 logger = get_logger(__name__)
@@ -34,6 +38,7 @@ TENOR_SWING = "swing"
 TENOR_INTRADAY = "intraday"
 
 _TREND_TO_DIRECTION = {"bullish": "long", "bearish": "short", "neutral": "neutral"}
+_DIRECTION_TO_TREND = {"long": "bullish", "short": "bearish", "neutral": "neutral"}
 
 
 @dataclass
@@ -56,6 +61,12 @@ class TradeBiasEngine:
 
     def __init__(self, underlying: str):
         self.underlying = underlying.upper()
+        # Tactical-pillar components. Stateless — instantiate once per engine.
+        # swing_reversal + momentum are new here; order_flow_imbalance is the
+        # existing MSI component, read directly for its raw directional value.
+        self._swing = SwingReversalComponent()
+        self._momentum = MomentumComponent()
+        self._order_flow = OrderFlowImbalanceComponent()
 
     # ------------------------------------------------------------------
     # Input assembly
@@ -128,56 +139,86 @@ class TradeBiasEngine:
             return None
         return None if regime == "unknown" else regime
 
+    def build_tactical(self, ctx: MarketContext, inputs: BiasInput) -> TacticalRead:
+        """Read the four directional pillars off the live context.
+
+        price_action = swing bounce/reject; flow = smart-money order-flow
+        imbalance; tape = the premium tape lean (tape_flow_bias, one of the nine
+        inputs, rescaled to [-1, 1]); momentum = vol-normalized momentum.
+        """
+        price_action = self._swing.compute(ctx)
+        momentum = self._momentum.compute(ctx)
+        flow = self._order_flow.compute(ctx)
+        tape = (inputs.tapeFlow / 100.0) if inputs.tapeFlow is not None else None
+        return compute_tactical(price_action=price_action, flow=flow, tape=tape, momentum=momentum)
+
     def build_snapshot(
         self,
         ctx: MarketContext,
         inputs: BiasInput,
-        result: BiasResult,
+        structural: BiasResult,
+        tactical: TacticalRead,
+        fused: FusedBias,
         tenor: str = TENOR_SWING,
     ) -> TradeBiasSnapshot:
-        # Signed bias on -100..100. Phase 1 has no fused directional score yet,
-        # so derive it from the regime's trend and confidence; Phase 3 replaces
-        # this with the fused price-action/flow/tape/momentum vector.
-        trend_sign = {"bullish": 1.0, "bearish": -1.0}.get(result.trend, 0.0)
-        confidence_pct = (
-            (result.confidence / result.maxConfidence) * 100.0 if result.maxConfidence else 0.0
-        )
-        bias_score = round(trend_sign * confidence_pct, 4)
-        direction = _TREND_TO_DIRECTION.get(result.trend, "neutral")
+        # The fused layer owns the signed bias / direction / state / override;
+        # the structural baseline still owns the regime label, checklist, and
+        # the CHOP "watching" chips.
+        bias_trend = _DIRECTION_TO_TREND.get(fused.direction, "neutral")
+        pillars = {
+            k: (round(v, 4) if isinstance(v, (int, float)) else None)
+            for k, v in tactical.pillars.items()
+        }
 
         payload: dict[str, Any] = {
             "tenor": tenor,
-            "bias_score": bias_score,
-            "direction": direction,
-            # Phase 1: no fusion yet, so the read is always the structural
-            # baseline and never an override. The keys are here now so the
-            # contract stays stable when Phase 3 populates them.
-            "state": "baseline",
-            "override": {"active": False},
-            "confidence": round(confidence_pct, 2),
-            "confidence_raw": result.confidence,
-            "max_confidence_raw": result.maxConfidence,
+            "bias_score": fused.bias_score,
+            "direction": fused.direction,
+            "state": fused.state,
+            "override": {
+                "active": fused.override_active,
+                "reason": fused.override_reason,
+                "overruled_posture": fused.overruled_posture,
+            },
+            "confidence": fused.confidence,
+            "confidence_raw": structural.confidence,
+            "max_confidence_raw": structural.maxConfidence,
             "regime": {
                 "gamma": self._gamma_regime(ctx),
                 "volatility": self._volatility_regime(ctx),
             },
-            "market_state": result.marketState,
-            "regime_label": result.regimeLabel,
-            "regime_desc": result.regimeDesc,
+            "market_state": structural.marketState,
+            "regime_label": structural.regimeLabel,
+            "regime_desc": structural.regimeDesc,
             "bias": {
-                "code": result.bias,
-                "label": result.biasLabel,
-                "trend": result.trend,
+                "code": fused.bias_code,
+                "label": fused.bias_label,
+                "trend": bias_trend,
             },
-            "setup": result.setup,
-            "playbook": list(result.playbook),
-            "expected_behavior": list(result.expectedBehavior),
-            "checklist": [{"label": c.label, "passed": c.passed} for c in result.checklist],
-            "conviction_driven": result.convictionDriven,
+            "setup": fused.setup,
+            "playbook": list(fused.playbook),
+            "expected_behavior": list(fused.expected_behavior),
+            "checklist": [{"label": c.label, "passed": c.passed} for c in structural.checklist],
+            "conviction_driven": structural.convictionDriven,
             "watching": [
-                {"key": w.key, "label": w.label, "direction": w.direction} for w in result.watching
+                {"key": w.key, "label": w.label, "direction": w.direction}
+                for w in structural.watching
             ],
-            "has_data": result.hasData,
+            "has_data": structural.hasData,
+            # The tactical layer that confirmed / diverged from / overrode the
+            # structural baseline — the four pillars plus the fused vector.
+            "tactical": {
+                "direction": round(tactical.direction, 4),
+                "conviction": round(tactical.conviction, 4),
+                "aligned_count": tactical.aligned_count,
+                "available_count": tactical.available_count,
+                "pillars": pillars,
+            },
+            "structural_bias": {
+                "code": structural.bias,
+                "label": structural.biasLabel,
+                "trend": structural.trend,
+            },
             "inputs": {
                 "net_gex": inputs.netGEX,
                 "gex_gradient": inputs.gexGradient,
@@ -198,13 +239,13 @@ class TradeBiasEngine:
             timestamp=ctx.timestamp,
             underlying=getattr(ctx, "underlying", self.underlying),
             tenor=tenor,
-            bias_score=bias_score,
-            direction=direction,
-            bias_code=result.bias,
-            market_state=result.marketState,
-            state="baseline",
-            confidence=round(confidence_pct, 2),
-            override_active=False,
+            bias_score=fused.bias_score,
+            direction=fused.direction,
+            bias_code=fused.bias_code,
+            market_state=structural.marketState,
+            state=fused.state,
+            confidence=fused.confidence,
+            override_active=fused.override_active,
             payload=payload,
         )
 
@@ -265,7 +306,9 @@ class TradeBiasEngine:
         tenor: str = TENOR_SWING,
     ) -> TradeBiasSnapshot:
         inputs = self.build_inputs(ctx, score, advanced_results, basic_results)
-        result = compute_bias(inputs)
-        snapshot = self.build_snapshot(ctx, inputs, result, tenor=tenor)
+        structural = compute_bias(inputs)
+        tactical = self.build_tactical(ctx, inputs)
+        fused = fuse(structural, tactical)
+        snapshot = self.build_snapshot(ctx, inputs, structural, tactical, fused, tenor=tenor)
         self.persist(snapshot, conn=conn)
         return snapshot
