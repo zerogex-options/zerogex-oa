@@ -109,6 +109,23 @@ def _forward_returns(
     return out
 
 
+def count_with_forward(rows: list[BiasRow], horizons_min: list[int]) -> int:
+    """Rows that have a valid forward return in at least one requested horizon.
+
+    This is the sweep's real sample size — the last rows of the window (and any
+    row whose only future rows are in the next session) can't be scored.
+    """
+    if not rows:
+        return 0
+    ordered = sorted(rows, key=lambda r: r.timestamp)
+    fwd = _forward_returns(ordered, horizons_min)
+    return sum(
+        1
+        for i in range(len(ordered))
+        if any(fwd[h][i] is not None for h in horizons_min)
+    )
+
+
 @dataclass
 class ThresholdStat:
     override_d: float
@@ -288,6 +305,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="comma-separated forward horizons in minutes")
     parser.add_argument("--min-aligned", type=int, default=None,
                         help="override the aligned-pillar count for the whole sweep")
+    parser.add_argument("--min-rows", type=int, default=2,
+                        help="minimum rows-with-forward-data required before running the sweep")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     args = parser.parse_args(argv)
 
@@ -295,9 +314,28 @@ def main(argv: Optional[list[str]] = None) -> int:
     horizons = [int(x) for x in args.horizons.split(",") if x.strip()]
 
     rows = load_rows(args.symbol, args.tenor, args.days)
-    if not rows:
-        print(f"No trade_bias_scores rows for {args.symbol.upper()} "
-              f"(tenor={args.tenor}) in the last {args.days} day(s).")
+
+    # Guard: a thin window can't be scored (each row needs a later row for its
+    # forward return), so bail with a clear count instead of a table of zeros
+    # that reads like a real "no overrides" result.
+    n_forward = count_with_forward(rows, horizons)
+    if n_forward < args.min_rows:
+        msg = (
+            f"Insufficient history: {len(rows)} row(s) for {args.symbol.upper()} "
+            f"(tenor={args.tenor}) in the last {args.days} day(s), {n_forward} with "
+            f"forward data — need >= {args.min_rows} with forward data.\n"
+            f"Let the engine accumulate a session (rows land ~1/sec/tenor during the "
+            f"24x5 run window) and re-run."
+        )
+        if args.json:
+            print(json.dumps({
+                "insufficient_history": True,
+                "rows": len(rows),
+                "rows_with_forward_data": n_forward,
+                "min_rows": args.min_rows,
+            }, indent=2))
+        else:
+            print(msg)
         return 1
 
     stats = evaluate_sweep(rows, args.tenor, grid, horizons, min_aligned=args.min_aligned)

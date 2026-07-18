@@ -8,6 +8,7 @@ from src.backtesting.trade_bias_override_sweep import (
     BiasRow,
     _forward_returns,
     _row_from_payload,
+    count_with_forward,
     evaluate_sweep,
 )
 
@@ -70,6 +71,14 @@ def test_forward_return_none_at_series_end_and_across_days():
     assert fwd[-1] is None
     # The last row of day 17 (index 5) must NOT borrow day 18's open.
     assert fwd[5] is None
+
+
+def test_count_with_forward_data():
+    # A single row (Saturday's frozen upsert) has no later row => 0 scorable.
+    assert count_with_forward(_rows(1), [5]) == 0
+    assert count_with_forward([], [5]) == 0
+    # 12 one-minute rows => rows 0..6 have a +5m match => 7 scorable.
+    assert count_with_forward(_rows(12), [5]) == 7
 
 
 def test_row_from_payload_parses_contract():
