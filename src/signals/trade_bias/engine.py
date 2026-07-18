@@ -207,6 +207,10 @@ class TradeBiasEngine:
                 "gamma": self._gamma_regime(ctx),
                 "volatility": self._volatility_regime(ctx),
             },
+            # Underlying close at this tick — lets the override-threshold
+            # backtest compute forward returns straight from the dense
+            # trade_bias_scores rows, no external bars join.
+            "close": getattr(ctx, "close", None),
             "market_state": structural.marketState,
             "regime_label": structural.regimeLabel,
             "regime_desc": structural.regimeDesc,
