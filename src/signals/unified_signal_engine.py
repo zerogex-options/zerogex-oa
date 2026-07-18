@@ -1590,14 +1590,26 @@ class UnifiedSignalEngine:
         basic_results = self._persist_basic_signals(market_context)
 
         # Phase 2.4: Trade Bias — synthesize a directional bias from the state
-        # we just produced and persist it. Best-effort: a bias failure is
-        # logged but never breaks the cycle (mirrors the Playbook guard below).
-        try:
-            self.trade_bias_engine.compute_and_persist(
-                market_context, score, advanced_results, basic_results
-            )
-        except Exception as exc:
-            logger.warning("Trade Bias compute failed for %s: %s", self.db_symbol, exc)
+        # we just produced and persist it, for both horizons: 'swing' (multi-day
+        # / structural) and 'intraday' (same-day / 0DTE, tactical-led). Best-
+        # effort: a bias failure is logged but never breaks the cycle (mirrors
+        # the Playbook guard below).
+        for _bias_tenor in ("swing", "intraday"):
+            try:
+                self.trade_bias_engine.compute_and_persist(
+                    market_context,
+                    score,
+                    advanced_results,
+                    basic_results,
+                    tenor=_bias_tenor,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Trade Bias compute failed for %s (%s): %s",
+                    self.db_symbol,
+                    _bias_tenor,
+                    exc,
+                )
 
         # Phase 2.5: Playbook — compute and persist Action Card from the
         # state we just produced.  Best-effort: persistence errors are

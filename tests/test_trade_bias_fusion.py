@@ -13,7 +13,13 @@ from src.signals.components.momentum import MomentumComponent
 from src.signals.components.swing_reversal import SwingReversalComponent, swing_reversal_score
 from src.signals.trade_bias.bias import BiasInput, compute_bias
 from src.signals.trade_bias.engine import TradeBiasEngine
-from src.signals.trade_bias.fusion import compute_tactical, fuse
+from src.signals.trade_bias.fusion import (
+    INTRADAY_PROFILE,
+    SWING_PROFILE,
+    compute_tactical,
+    fuse,
+    profile_for,
+)
 
 
 # --- fixtures --------------------------------------------------------------
@@ -208,6 +214,50 @@ def test_engine_bounce_overrides_negative_gamma_playbook():
     assert snap.payload["tactical"]["direction"] > 0.5
     # structural regime detail is preserved even under override
     assert snap.payload["structural_bias"]["label"] == structural.biasLabel
+
+
+def test_intraday_profile_lowers_the_override_bar():
+    # A read that only DIVERGES under the conservative swing gate should
+    # OVERRIDE under the faster intraday gate (lower |D| + fewer pillars).
+    structural = _trend_down()  # bearish baseline
+    swing_t = compute_tactical(0.6, 0.6, 0.2, 0.1, SWING_PROFILE)
+    intraday_t = compute_tactical(0.6, 0.6, 0.2, 0.1, INTRADAY_PROFILE)
+    assert fuse(structural, swing_t, SWING_PROFILE).state == "divergent"
+    assert fuse(structural, intraday_t, INTRADAY_PROFILE).state == "override"
+
+
+def test_intraday_flow_pillar_uses_0dte_positioning():
+    # Intraday feeds its flow pillar from the 0DTE positioning input; swing uses
+    # the smart-money order-flow imbalance (here ~0 because smart_call≈smart_put).
+    ctx = _ctx(smart_call=1.0, smart_put=1.0)
+    eng = TradeBiasEngine("SPY")
+    inputs = eng.build_inputs(
+        ctx,
+        SimpleNamespace(composite_score=50.0),
+        [SimpleNamespace(name="zero_dte_position_imbalance", score=0.7)],
+        [],
+    )
+    intraday = eng.build_tactical(ctx, inputs, INTRADAY_PROFILE)
+    assert intraday.pillars["flow"] == inputs.odtePositioning / 100.0
+
+
+def test_profile_for_defaults_to_swing():
+    assert profile_for("swing").name == "swing"
+    assert profile_for("intraday").name == "intraday"
+    assert profile_for("nonsense").name == "swing"
+
+
+def test_engine_builds_intraday_snapshot():
+    ctx = _ctx()
+    eng = TradeBiasEngine("SPY")
+    # Exercise the snapshot path with the intraday profile without touching the DB.
+    inputs = eng.build_inputs(ctx, SimpleNamespace(composite_score=50.0), [], [])
+    structural = compute_bias(inputs)
+    tactical = eng.build_tactical(ctx, inputs, INTRADAY_PROFILE)
+    fused = fuse(structural, tactical, INTRADAY_PROFILE)
+    snapshot = eng.build_snapshot(ctx, inputs, structural, tactical, fused, tenor="intraday")
+    assert snapshot.tenor == "intraday"
+    assert snapshot.payload["tenor"] == "intraday"
 
 
 def test_engine_baseline_when_no_tactical_signal():

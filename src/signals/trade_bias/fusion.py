@@ -46,12 +46,70 @@ _WEAK_MIN = float(os.getenv("TRADE_BIAS_WEAK_MIN", "0.15"))
 # Minimum opposing |D| to register a divergence (caution) short of an override.
 _DIVERGENT_MIN = float(os.getenv("TRADE_BIAS_DIVERGENT_MIN", "0.25"))
 
-_PILLAR_WEIGHTS = {
-    "price_action": _W_PRICE,
-    "flow": _W_FLOW,
-    "tape": _W_TAPE,
-    "momentum": _W_MOMENTUM,
-}
+
+@dataclass
+class TenorProfile:
+    """Per-horizon calibration of the fusion.
+
+    Swing is structural / gamma-led with a conservative override bar. Intraday
+    is tactical / 0DTE-led: the same-day read carries more weight and the
+    override fires on a lower bar because 0DTE reversals happen fast. The engine
+    also feeds the intraday ``flow`` pillar from the 0DTE positioning signal
+    rather than the all-expiry smart-money flow (see engine.build_tactical).
+    """
+
+    name: str
+    override_d: float
+    override_min_aligned: int
+    weak_min: float
+    divergent_min: float
+    align_min: float
+    w_price: float
+    w_flow: float
+    w_tape: float
+    w_momentum: float
+
+    def weights(self) -> dict:
+        return {
+            "price_action": self.w_price,
+            "flow": self.w_flow,
+            "tape": self.w_tape,
+            "momentum": self.w_momentum,
+        }
+
+
+SWING_PROFILE = TenorProfile(
+    name="swing",
+    override_d=_OVERRIDE_D,
+    override_min_aligned=_OVERRIDE_MIN_ALIGNED,
+    weak_min=_WEAK_MIN,
+    divergent_min=_DIVERGENT_MIN,
+    align_min=_ALIGN_MIN,
+    w_price=_W_PRICE,
+    w_flow=_W_FLOW,
+    w_tape=_W_TAPE,
+    w_momentum=_W_MOMENTUM,
+)
+
+INTRADAY_PROFILE = TenorProfile(
+    name="intraday",
+    override_d=float(os.getenv("TRADE_BIAS_INTRADAY_OVERRIDE_D", "0.40")),
+    override_min_aligned=int(os.getenv("TRADE_BIAS_INTRADAY_OVERRIDE_MIN_ALIGNED", "2")),
+    weak_min=_WEAK_MIN,
+    divergent_min=_DIVERGENT_MIN,
+    align_min=_ALIGN_MIN,
+    w_price=float(os.getenv("TRADE_BIAS_INTRADAY_W_PRICE_ACTION", "0.30")),
+    w_flow=float(os.getenv("TRADE_BIAS_INTRADAY_W_FLOW", "0.30")),
+    w_tape=float(os.getenv("TRADE_BIAS_INTRADAY_W_TAPE", "0.25")),
+    w_momentum=float(os.getenv("TRADE_BIAS_INTRADAY_W_MOMENTUM", "0.15")),
+)
+
+PROFILES = {"swing": SWING_PROFILE, "intraday": INTRADAY_PROFILE}
+
+
+def profile_for(tenor: str) -> TenorProfile:
+    return PROFILES.get(tenor, SWING_PROFILE)
+
 
 _TREND_SIGN = {"bullish": 1, "bearish": -1, "neutral": 0}
 _SIGN_DIR = {1: "long", -1: "short", 0: "neutral"}
@@ -79,6 +137,7 @@ def compute_tactical(
     flow: Optional[float],
     tape: Optional[float],
     momentum: Optional[float],
+    profile: TenorProfile = SWING_PROFILE,
 ) -> TacticalRead:
     """Fuse the four directional pillars into a signed direction + conviction."""
     pillars = {
@@ -87,6 +146,7 @@ def compute_tactical(
         "tape": tape,
         "momentum": momentum,
     }
+    weights = profile.weights()
     num = 0.0
     den = 0.0
     available = 0
@@ -95,8 +155,8 @@ def compute_tactical(
             continue
         available += 1
         clamped = max(-1.0, min(1.0, float(value)))
-        num += _PILLAR_WEIGHTS[key] * clamped
-        den += _PILLAR_WEIGHTS[key]
+        num += weights[key] * clamped
+        den += weights[key]
     direction = (num / den) if den > 0 else 0.0
     d_sign = _sign(direction)
 
@@ -105,7 +165,7 @@ def compute_tactical(
         for value in pillars.values():
             if value is None:
                 continue
-            if abs(value) >= _ALIGN_MIN and _sign(value) == d_sign:
+            if abs(value) >= profile.align_min and _sign(value) == d_sign:
                 aligned += 1
 
     return TacticalRead(
@@ -167,7 +227,9 @@ _OVERRIDE_SHORT = {
 }
 
 
-def fuse(structural: BiasResult, tactical: TacticalRead) -> FusedBias:
+def fuse(
+    structural: BiasResult, tactical: TacticalRead, profile: TenorProfile = SWING_PROFILE
+) -> FusedBias:
     """Combine the structural baseline with the tactical read into a graded bias."""
     struct_sign = _TREND_SIGN.get(structural.trend, 0)
     struct_conf_pct = (
@@ -180,11 +242,14 @@ def fuse(structural: BiasResult, tactical: TacticalRead) -> FusedBias:
 
     d = tactical.direction
     tact_signed = d * 100.0
-    tact_sign = _sign(d) if tactical.conviction >= _WEAK_MIN else 0
+    tact_sign = _sign(d) if tactical.conviction >= profile.weak_min else 0
     aligned_frac = (
         tactical.aligned_count / tactical.available_count if tactical.available_count else 0.0
     )
-    gate = tactical.conviction >= _OVERRIDE_D and tactical.aligned_count >= _OVERRIDE_MIN_ALIGNED
+    gate = (
+        tactical.conviction >= profile.override_d
+        and tactical.aligned_count >= profile.override_min_aligned
+    )
 
     def keep_structural(state: str, confidence: float, bias_score: float) -> FusedBias:
         return FusedBias(
@@ -232,7 +297,8 @@ def fuse(structural: BiasResult, tactical: TacticalRead) -> FusedBias:
 
     # DIVERGENT — tactical leans against a directional baseline but not enough
     # to flip it. Keep the bias; attenuate score + confidence; flag caution.
-    if struct_sign != 0 and tact_sign == -struct_sign and tactical.conviction >= _DIVERGENT_MIN:
+    opposes = struct_sign != 0 and tact_sign == -struct_sign
+    if opposes and tactical.conviction >= profile.divergent_min:
         confidence = struct_conf_pct * (1.0 - 0.4 * tactical.conviction)
         bias_score = struct_signed * (1.0 - 0.5 * tactical.conviction)
         return keep_structural("divergent", confidence, bias_score)
