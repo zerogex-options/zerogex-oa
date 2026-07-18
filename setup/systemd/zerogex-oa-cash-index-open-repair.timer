@@ -1,0 +1,20 @@
+[Unit]
+Description=Post-open trigger for ZeroGEX cash-index session-open repair (09:35 ET, weekdays)
+
+[Timer]
+# Fire at 09:35 server time (timezone is America/New_York, set by
+# deploy/steps/010.setup) on weekdays. The cash-index 09:30 ET open bar is a
+# completed 1-minute bar by 09:31, so 09:35 leaves margin for it (and any late
+# partials) to be written before the repair reconstructs it. Weekdays only —
+# there is no cash open on weekends, and NYSE holidays are harmless no-ops (no
+# 09:30 bar exists to repair that day). Jitter ±1 min so it never lands exactly
+# on a busy tick boundary.
+OnCalendar=Mon-Fri *-*-* 09:35:00
+RandomizedDelaySec=1m
+# Run on next boot if the box was off when the timer should have fired. The
+# service's trailing 7-day window also backfills any skipped day, so a missed
+# fire is doubly covered.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

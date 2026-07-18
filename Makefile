@@ -750,18 +750,30 @@ db-flow-stuck-cleanup: ## One-shot cleanup for the cash-open watermark bug: drop
 	fi
 
 .PHONY: cash-index-open-repair
-cash-index-open-repair: ## Repair historical cash-index 09:30 ET session-open phantom candles (open=prior close). Dry-run by default; pass CONFIRM=yes to apply. Optional: SYMBOLS="SPX NDX" START=YYYY-MM-DD END=YYYY-MM-DD
+cash-index-open-repair: ## Repair cash-index 09:30 ET session-open phantom candles (open==prior close, rebuilt from close). Dry-run by default; pass CONFIRM=yes to apply. Optional: SYMBOLS="SPX NDX" START=YYYY-MM-DD END=YYYY-MM-DD
 	@echo "$(BLUE)=== Cash-Index Session-Open Repair ===$(NC)"
-	@echo "$(YELLOW)Rewrites the 09:30 ET open of cash-index bars whose stored open is the$(NC)"
-	@echo "$(YELLOW)carried-forward prior close (open outside the bar's own [low,high]) to$(NC)"
-	@echo "$(YELLOW)the bar's close -- clearing the phantom full-range candle. Idempotent.$(NC)"
-	@echo "$(YELLOW)Workflow: pull + restart $(INGESTION_SERVICE) (forward fix), THEN run$(NC)"
-	@echo "$(YELLOW)         this with CONFIRM=yes to repair already-stored sessions.$(NC)"
+	@echo "$(YELLOW)Rebuilds the 09:30 ET bar of cash-index sessions whose open exactly$(NC)"
+	@echo "$(YELLOW)equals the prior session's close (TradeStation's carry-forward, which$(NC)"
+	@echo "$(YELLOW)also leaks into the high on a gap down / low on a gap up). Open and the$(NC)"
+	@echo "$(YELLOW)phantom extreme are rebuilt from the real close; the real extreme is$(NC)"
+	@echo "$(YELLOW)kept. Idempotent. Dry-run by default -- pass CONFIRM=yes to apply.$(NC)"
 	@$(PY) -m src.tools.cash_index_open_repair \
 		$(if $(SYMBOLS),--symbols "$(SYMBOLS)") \
 		$(if $(START),--start $(START)) \
 		$(if $(END),--end $(END)) \
 		$(if $(filter yes,$(CONFIRM)),--execute)
+
+.PHONY: cash-index-open-repair-install
+cash-index-open-repair-install: ## Install the post-open repair timer (09:35 ET, weekdays)
+	@echo "$(BLUE)=== Installing Cash-Index Session-Open Repair Timer ===$(NC)"
+	@sudo cp setup/systemd/zerogex-oa-cash-index-open-repair.service /etc/systemd/system/
+	@sudo cp setup/systemd/zerogex-oa-cash-index-open-repair.timer /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@sudo systemctl enable --now zerogex-oa-cash-index-open-repair.timer
+	@echo "$(GREEN)✅ Cash-index-open-repair timer (09:35 ET, weekdays) installed and started$(NC)"
+	@echo "$(YELLOW)Status:   systemctl status zerogex-oa-cash-index-open-repair.timer$(NC)"
+	@echo "$(YELLOW)Next run: systemctl list-timers zerogex-oa-cash-index-open-repair.timer$(NC)"
+	@echo "$(YELLOW)Run now:  sudo systemctl start zerogex-oa-cash-index-open-repair.service$(NC)"
 
 .PHONY: flow-explain
 flow-explain: ## Diagnose /api/flow/series query planner choice on flow_by_contract (FLOW_SYMBOL=SPY)

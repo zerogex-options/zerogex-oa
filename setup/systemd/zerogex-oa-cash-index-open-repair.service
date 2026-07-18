@@ -1,0 +1,44 @@
+[Unit]
+Description=ZeroGEX post-open repair of the cash-index 09:30 ET session-open phantom
+Documentation=https://github.com/zerogex-options/zerogex-oa
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zerogex-oa
+
+# Environment
+Environment="PATH=/home/ubuntu/zerogex-oa/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zerogex-oa/.env
+
+# Rewrite the just-completed 09:30 ET open bar for every cash index whose open
+# is the carried-forward prior close (see src/tools/cash_index_open_repair.py).
+# The ingester stores TradeStation's bar verbatim, so without this the phantom
+# full-range candle shows until the next repair. Runs a few minutes after the
+# open (see the .timer) so the 09:30 bar is complete and the prior session's
+# close is present to detect against.
+#
+# Scoped to a trailing 7-day window rather than a single day so a missed run
+# (box down, transient DB error, a long holiday weekend) self-heals on the next
+# fire — the repair is idempotent, so already-fixed bars are skipped. %% is a
+# literal % escaped for systemd; date resolves in America/New_York (the box tz).
+ExecStart=/bin/bash -c '/usr/bin/make -C /home/ubuntu/zerogex-oa cash-index-open-repair START=$(date -d "7 days ago" +%%F) CONFIRM=yes'
+
+# A single filtered UPDATE over one week of 09:30 bars; generous ceiling so a
+# briefly-busy DB can't wedge the unit indefinitely.
+TimeoutStartSec=300
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/zerogex-oa
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zerogex-oa-cash-index-open-repair
