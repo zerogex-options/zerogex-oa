@@ -49,6 +49,7 @@ from .models import (
     StrikeProfileBucket,
 )
 from .routers.trade_signals import router as trade_signals_router
+from .routers.trade_bias import router as trade_bias_router
 from .routers.tradeworkz import router as tradeworkz_router
 from .routers.volatility_gauge import router as volatility_gauge_router
 from .routers.option_contract import router as option_contract_router
@@ -403,6 +404,8 @@ app.include_router(
     trade_signals_router,
     dependencies=[_scope_signals],
 )
+# Trade Bias rides the same /api/signals premium surface.
+app.include_router(trade_bias_router, dependencies=[_scope_signals])
 # Derived analytics routers — broadly redistributable.
 # Consolidated, versioned dealer-positioning levels (gamma flip, walls,
 # max pain, per-strike gamma profile) — the stable external contract that

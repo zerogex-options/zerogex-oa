@@ -1644,6 +1644,37 @@ CREATE TRIGGER lock_closed_signal_trade
     EXECUTE FUNCTION prevent_closed_signal_trade_updates();
 
 -- ---------------------------------------------------------------------------
+-- trade_bias_scores
+-- Directional Trade Bias, computed backend-side each cycle by the Signals
+-- Engine (see src/signals/trade_bias/). Distinct from the 0-100 Market State
+-- Index in signal_scores: this is a SIGNED directional call (which way / how
+-- convinced / — from Phase 3 — whether live price-action/flow/tape/momentum
+-- overrode the gamma-based posture). Keyed by tenor so the 0DTE (intraday) and
+-- multi-day (swing) reads can coexist; Phase 1 writes 'swing' only.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS trade_bias_scores (
+    underlying      VARCHAR(10)      NOT NULL REFERENCES symbols(symbol) ON DELETE CASCADE,
+    timestamp       TIMESTAMPTZ      NOT NULL,
+    tenor           VARCHAR(16)      NOT NULL DEFAULT 'swing',
+    bias_score      DOUBLE PRECISION NOT NULL,          -- signed [-100, 100]
+    direction       VARCHAR(16)      NOT NULL,          -- long / short / neutral
+    bias_code       VARCHAR(32)      NOT NULL,          -- BUY_DIPS / SELL_RIPS / FADE_* / RANGE_FADE / WAIT
+    market_state    VARCHAR(32)      NOT NULL,          -- TREND_UP / TREND_DOWN / TRAP_* / CHOP / UNKNOWN
+    state           VARCHAR(16)      NOT NULL DEFAULT 'baseline',  -- baseline / confirmed / divergent / override
+    confidence      DOUBLE PRECISION NOT NULL,          -- [0, 100]
+    override_active BOOLEAN          NOT NULL DEFAULT FALSE,
+    payload         JSONB            NOT NULL DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ      DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ      DEFAULT NOW(),
+    PRIMARY KEY (underlying, timestamp, tenor)
+);
+
+-- Latest-row and history lookups filter by (underlying, tenor) and order by
+-- timestamp DESC.
+CREATE INDEX IF NOT EXISTS idx_trade_bias_scores_latest
+    ON trade_bias_scores (underlying, tenor, timestamp DESC);
+
+-- ---------------------------------------------------------------------------
 -- signal_component_scores
 -- Stores each scoring component's individual score every cycle.
 -- ---------------------------------------------------------------------------
