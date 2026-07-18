@@ -19,6 +19,12 @@ from src.signals.trade_bias.bias import (
     compute_bias,
 )
 from src.signals.trade_bias.engine import TradeBiasEngine, TradeBiasSnapshot
+from src.signals.trade_bias.fusion import (
+    FusedBias,
+    TacticalRead,
+    compute_tactical,
+    fuse,
+)
 
 __all__ = [
     "BiasInput",
@@ -28,4 +34,8 @@ __all__ = [
     "compute_bias",
     "TradeBiasEngine",
     "TradeBiasSnapshot",
+    "TacticalRead",
+    "FusedBias",
+    "compute_tactical",
+    "fuse",
 ]
