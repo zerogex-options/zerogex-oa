@@ -170,9 +170,14 @@ def test_store_underlying_buckets_close_stamped_bar_to_its_own_minute(monkeypatc
     e = _underlying_engine()
     e.db_symbol = "SPX"
     e._last_underlying_signature = None
+    e._session_open_repaired = None
     e.latest_underlying_price = None
     e.latest_underlying_timestamp = None
     monkeypatch.setattr(e, "_log_parity_signature", lambda *a, **k: None)
+    # SPX is a cash index, so _store_underlying also fires the session-open
+    # repair; that's covered by its own tests — stub it here to keep this a
+    # focused bucketing test with no DB.
+    monkeypatch.setattr(e, "_repair_session_open_if_needed", lambda *a, **k: None)
     captured: dict = {}
     monkeypatch.setattr(e, "_upsert_underlying_quote", lambda payload: captured.update(payload))
 

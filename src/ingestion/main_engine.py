@@ -40,7 +40,13 @@ from src.validation import (
     seconds_until_engine_run_window,
     underlying_feed_expected,
 )
-from src.symbols import parse_underlyings, get_canonical_symbol, resolve_monthly_underlying
+from src.symbols import (
+    parse_underlyings,
+    get_canonical_symbol,
+    is_cash_index,
+    resolve_monthly_underlying,
+)
+from src.tools.cash_index_open_repair import repair_one_session_open
 from src.config import (
     _getenv_str,
     _getenv_int,
@@ -319,6 +325,10 @@ class IngestionEngine:
         self._pending_failed_option_rows: List[Dict[str, Any]] = []
         self._pending_failed_option_rows_max = _getenv_int("OPTION_FAILED_ROWS_RETAIN_MAX", 20000)
         self._last_underlying_signature: Optional[str] = None
+        # Cash-session date whose 09:30 ET open bar we've already de-phantomed
+        # (see _repair_session_open_if_needed). None until the first post-open
+        # bar of a session is written; reset implicitly by the date comparison.
+        self._session_open_repaired: Optional[_date] = None
         self._option_bucket_last_write: Dict[tuple[str, datetime], float] = {}
 
         # Active StreamManager during run_streaming(). Held so _signal_handler
@@ -481,6 +491,14 @@ class IngestionEngine:
         self._upsert_underlying_quote(payload)
         self._last_underlying_signature = payload_sig
 
+        # Cash indexes print a stale opening-rotation value at 09:30 ET (≈ the
+        # prior close, because the constituents haven't opened) that paints a
+        # phantom full-range candle. Once we're past the open bar, rewrite it in
+        # place from the real close so the STORED data is correct for every
+        # consumer — no post-hoc cleanup job. No-op for non-index symbols.
+        if is_cash_index(self.db_symbol):
+            self._repair_session_open_if_needed(bucket)
+
         # Track latest underlying price for Greeks calculation.  Paired
         # with the bar timestamp so _enrich_with_greeks can refuse stale
         # prices — delta/gamma are highly sensitive to S near strike and
@@ -507,6 +525,39 @@ class IngestionEngine:
                 logger.info("   Greeks calculation can now proceed for options")
             elif self.underlying_bars_stored % 10 == 0:  # Log every 10 bars
                 logger.debug(f"Underlying price updated: ${self.latest_underlying_price:.2f}")
+
+    def _repair_session_open_if_needed(self, bucket: datetime) -> None:
+        """De-phantom the cash-index 09:30 ET open bar once it's complete.
+
+        ``bucket`` is the minute we just stored. The open bar is finished only
+        when we're on a LATER bucket of the same cash session, so this fires on
+        the first post-open bar and, guarded by ``_session_open_repaired``, at
+        most once per session. The UPDATE is a no-op unless the open bar is an
+        actual phantom, so an engine that starts mid-session still self-heals on
+        its first stored bar. Best-effort and shares the DB circuit breaker — a
+        failure just leaves the bar for the next bar's retry (or the one-time
+        CLI cleanup) and never disrupts ingestion.
+        """
+        if _time.monotonic() < self._db_backoff_until:
+            return
+        session_date = cash_session_date(bucket)
+        if self._session_open_repaired == session_date:
+            return
+        open_ts = cash_session_start_utc(session_date)
+        if bucket <= open_ts:
+            return  # still on/before the open bar — not complete yet
+        try:
+            with db_connection() as conn:
+                changed = repair_one_session_open(conn, self.db_symbol, open_ts)
+                conn.commit()
+            self._session_open_repaired = session_date
+            if changed:
+                logger.info("De-phantomed %s session-open bar for %s", self.db_symbol, session_date)
+        except Exception as exc:
+            # Don't set the flag — let the next bar retry.
+            logger.warning(
+                "Session-open repair failed for %s %s: %s", self.db_symbol, session_date, exc
+            )
 
     def _upsert_underlying_quote(self, quote: Dict[str, Any]):
         """Upsert one underlying quote row for the current minute bucket."""
