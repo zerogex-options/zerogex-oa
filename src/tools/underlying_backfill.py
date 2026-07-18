@@ -31,8 +31,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from src.symbols import is_cash_index
-from src.validation import is_cash_session_open_bucket, safe_datetime, safe_float
+from src.validation import safe_datetime, safe_float
 
 logger = logging.getLogger(__name__)
 
@@ -132,28 +131,6 @@ _UPSERT_SQL = """
 """
 
 
-def _session_open_corrected(symbol: str, row: Dict[str, Any]) -> float:
-    """Return the ``open`` to persist for ``row``, cash-index-corrected.
-
-    Mirrors the live ingester (``src/ingestion/main_engine.py``): for a cash
-    index, TradeStation stamps the 09:30 ET open bar's ``Open`` with the prior
-    session's close (the index carries the prior close forward until its
-    constituents open), which paints a phantom full-range candle rather than
-    the real gap. Only the 09:30 ET open bar of a cash index is corrected.
-
-    Unlike the live stream — where the first streamed ``close`` of the forming
-    bar is the genuine first print — a backfilled bar is already complete, so
-    the true opening print is not recoverable. The bar's own ``close`` (the
-    index level at the end of the opening minute) is the closest honest proxy
-    and keeps the candle free of the phantom. In practice the upsert's
-    ``COALESCE(open)`` means this only takes effect when no live open exists
-    for the bar (a genuine gap-fill); a real streamed first print is preserved.
-    """
-    if is_cash_index(symbol) and is_cash_session_open_bucket(row["timestamp"]):
-        return row["close"]
-    return row["open"]
-
-
 def upsert_bars(conn, symbol: str, rows: List[Dict[str, Any]]) -> int:
     """Upsert parsed bars for ``symbol``; returns the number written."""
     if not rows:
@@ -165,7 +142,7 @@ def upsert_bars(conn, symbol: str, rows: List[Dict[str, Any]]) -> int:
             (
                 symbol,
                 r["timestamp"],
-                _session_open_corrected(symbol, r),
+                r["open"],
                 r["high"],
                 r["low"],
                 r["close"],

@@ -389,25 +389,3 @@ def cash_session_start_utc(session_date: _date_type) -> datetime:
         )
     )
     return open_et.astimezone(_local_tz.utc)
-
-
-def is_cash_session_open_bucket(bucket_ts: datetime) -> bool:
-    """True iff ``bucket_ts`` is exactly the 09:30 ET cash-open minute bucket.
-
-    ``bucket_ts`` is a 1-minute :func:`bucket_timestamp` value (the floor of a
-    bar's own minute).  This returns True only when that minute is the regular
-    cash-session open (09:30:00 ET) of a real trading day, comparing absolute
-    UTC instants so it is correct across DST.  It is the anchor for the
-    cash-index session-open fix: TradeStation stamps the 09:30 ET bar's ``Open``
-    with the prior session's close (a cash index carries the prior close
-    forward until its constituents open), so that one bar's ``open`` must be
-    overridden with the first genuine print.
-
-    Naive timestamps are treated as UTC, consistent with the other helpers in
-    this module.
-    """
-    from datetime import timezone as _local_tz
-
-    if bucket_ts.tzinfo is None:
-        bucket_ts = bucket_ts.replace(tzinfo=_local_tz.utc)
-    return cash_session_start_utc(cash_session_date(bucket_ts)) == bucket_ts
