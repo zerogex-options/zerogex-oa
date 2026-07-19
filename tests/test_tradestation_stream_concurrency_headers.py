@@ -1,11 +1,16 @@
 """X-Concurrency-* streaming-budget header observability in stream_manager.
 
-TradeStation exposes the per-API-key concurrent-stream budget on streaming
-responses via ``X-Concurrency-*`` headers (max streams, remaining slots,
-resource group). The stream readers now read those headers on connect and
-log the budget — the authoritative, deterministic counterpart to the
-lifetime-based cap heuristic, which can only *infer* exhaustion from a short
-connection lifetime.
+IF TradeStation emits ``X-Concurrency-*`` headers on a stream response (max
+streams, remaining slots, resource group), the stream readers parse and log
+that per-API-key concurrent-connection budget on connect — the authoritative,
+deterministic counterpart to the lifetime-based cap heuristic, which can only
+*infer* exhaustion from a short connection lifetime.
+
+Reality check (2026-07-19 live probe): a standard API key does NOT receive
+these headers — both stream resources (``quote-change-stream`` and
+``stream-barcharts``) return only ``X-Ratelimit-*``. The parser is therefore
+forward-looking and dormant on a standard key; these tests exercise it with
+synthetic headers so it is correct and safe for the day the headers appear.
 
 These tests pin two guarantees:
 
