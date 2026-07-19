@@ -8,6 +8,13 @@ backtester can reach past the ~90-day live window that today caps it.
 > quote-gated or change often. Treat them as an order-of-magnitude decision aid and confirm
 > on each vendor's page (linked) before committing. Several vendors bot-block automated
 > fetches, so these were not machine-verified here.
+>
+> **Update (2026-07 verification pass):** a multi-source, adversarially-verified research pass
+> against primary OPRA/SEC/Cboe sources confirmed the vendor picture but surfaced one correction
+> that moves the real number up materially — **the dominant cost is not the vendor, it's the
+> exchange-entitlement layer (OPRA "Non-Display Use" ≈ $2,000/mo, plus Cboe-proprietary SPX
+> licensing).** This brief originally under-counted that. See the new **§2a** for the corrected
+> two-layer cost model, and the private cost/break-even model for the scenario math.
 
 ---
 
@@ -38,7 +45,53 @@ Greeks/IV surface — we need the cheaper raw layer:
 | Greeks / IV | computed | **We generate these — do not pay for them.** |
 
 Coverage that matters for us: **SPX / SPXW (0DTE, PM-settled), SPY, QQQ**, near-the-money to
-the wings, all listed expirations. That's a narrow, liquid slice — far cheaper than "full OPRA".
+the wings, all listed expirations. That's a narrow, liquid slice — far cheaper than "full OPRA"
+*at the vendor layer* (but see §2a: the exchange layer does **not** shrink with a narrow slice).
+
+## 2a. The two-layer cost model (the part this brief originally under-counted)
+
+"A plan that lets us redistribute derived data" is not one line item — it's **two stacked
+layers**, and the expensive one is not the vendor:
+
+**Layer 1 — the vendor fee** (ThetaData / Databento / Polygon class): ~$125–400/mo for our
+narrow slice. Small, scales gently. This is what the §3 table prices.
+
+**Layer 2 — exchange entitlements that flow through regardless of vendor.** These dominate the
+budget and a narrow symbol slice does **not** reduce them:
+
+- **OPRA "Non-Display Use" fee — ≈ $2,000/mo per enterprise (Categories 1 & 2).** Computing
+  GEX/vanna/charm from a *real-time* OPRA feed is a textbook non-display use — OPRA's enumerated
+  list explicitly names "investment analysis," "research & analysis," "risk management." It is a
+  **flat** fee (identical at 35 subscribers or 35,000), so staying small does not amortize it
+  away; it's a fixed hump you clear once. A 2016 amendment (SEC Rel. 34-79153 / File
+  SR-OPRA-2016-02, eff. 2016-11-01) deliberately removed "datafeed" from the fee-schedule
+  footnotes so these fees **follow the data downstream** to derived-data operations — i.e.
+  "it's just my derived IP" is **not** a fee exemption. Current through the Dec-2025 OPRA filing.
+  - *Honest nuance:* whether our use is strictly "non-display" or falls under "redistribution"
+    is mildly contestable (the derived output *is* redistributed), but it budgets the same way —
+    real-time derived redistribution triggers OPRA/exchange obligations either way.
+- **The swing question — does the vendor bundle it?** The fee is owed by the *direct OPRA
+  data-feed recipient*. If we consume through a vendor whose commercial redistribution license
+  **bundles/covers** the entitlement, we may not owe OPRA the ~$2k separately; if we must hold
+  the OPRA agreement ourselves, we do. **This one answer is the difference between a ~$300/mo and
+  a ~$3,000/mo all-in cost, and it must be confirmed in writing with each vendor before
+  committing** (it's contractual — not answerable from a pricing page).
+- **SPX/SPXW are Cboe-proprietary, not on the OPRA tape.** Index-options entitlements are
+  licensed separately from OPRA-disseminated equity/ETF options, and the **SPX index _value_**
+  (spot) needs a separate **Cboe Global Indices Feed (CGIF)** license, ~$1,000+/mo (Cboe
+  Derivatives Market Data pricing, eff. 2026-01-01). Budget this regardless of vendor if the
+  redistributable product references SPX. SPY/QQQ ETF options *are* OPRA-disseminated and avoid
+  it — a lever if a free/public tier can lean on ETFs.
+
+**The escape hatch: delayed data.** The non-display fee is defined on data received "on a
+current basis." **15-minute-delayed** data largely sidesteps it and is broadly redistributable —
+so the cheapest legally-clean posture is *delayed derived data for free/public tiers, real-time
+reserved for paying subscribers*, exactly as the growth roadmap's `option-contracts` decision
+already leans.
+
+**Net:** the §3 table is Layer 1. The honest all-in floor for a *real-time, SPX-centric,
+redistributable* product is dominated by Layer 2 — plan for the ~$2k OPRA line and the Cboe SPX
+license **unless a vendor bundles them**.
 
 ## 3. Vendor comparison
 
@@ -50,6 +103,19 @@ the wings, all listed expirations. That's a narrow, liquid slice — far cheaper
 | **ORATS** | Higher (hundreds/mo → enterprise) | Long EOD + 1-min history | 1-min + EOD, IV-surface-grade | Yes, premium quality | Enterprise | Overkill — we'd pay for the Greeks/IV we already make. |
 | **CBOE DataShop (LiveVol)** | Per-dataset, can be pricey | Authoritative, deep | Tick/quote + minute | Yes | **Best-in-class** (direct from the exchange) | The **B2B redistribution** answer when Stream-2 goes live; heavier for a pure backtest lake. |
 | **dxFeed** | Enterprise | Deep | Tick + historical service | Yes | Strong redistribution | Institutional; best if we migrate the *live* feed too. |
+
+> **Verified 2026-07 (primary sources):** **ThetaData's** commercial-licensing program is live
+> (startup tier ~$125/mo, internet-delivered, no colo) and its options history runs OPRA NBBO +
+> trades + **daily** OI back to ~June 2012. **Cboe DataShop's "Option Quotes"** delivers 1-min /
+> custom-N-min NBBO + size, OHLC and volume with **optional OI** and Greeks as a skippable add-on,
+> depth to ~2012 — but it is **delayed** (15-min intraday, daily overnight), so it fits the
+> *historical lake + delayed SEO page*, **not** a real-time TradeStation replacement. Two claims
+> were **refuted**: Cboe depth "back to 2004" (that's platform-wide boilerplate; the product is
+> ~2012) and Cboe SPX sourced "via OPRA" (SPX is **Cboe-proprietary**). **Databento, Polygon,
+> ORATS, dxFeed** terms were **not** independently verified in that pass — get live quotes; the
+> cheapest legally-clean real-time vendor may be one of them, so don't default to ThetaData
+> without comparing. The decisive question for every row is **not** in this table — it's the
+> §2a bundling question (does the license cover OPRA non-display?), which must be gotten in writing.
 
 ## 4. Recommendation
 
@@ -69,9 +135,19 @@ the wings, all listed expirations. That's a narrow, liquid slice — far cheaper
    redistribution. TradeStation's feed is personal-use only (already flagged in the growth doc), so
    it can't back a B2B product regardless.
 
-**Rough budget:** a bounded 3-symbol, ~5-year historical options pull is typically a **few hundred
-to low-thousands of dollars one-time (or a few months of a mid-tier sub)** — small next to what it
-unlocks in conversion and the B2B asset. Confirm exact quotes before committing.
+**Before either purchase — settle the two crux questions in writing** (they gate legality *and*
+cost, and neither is answerable from a pricing page; send them to ThetaData, Databento and Polygon
+the same week and compare):
+1. Does the vendor's commercial license *explicitly* permit **real-time redistribution of derived
+   analytics** to paying subscribers and via a paid B2B API — at what tier/price?
+2. Does that license **cover the OPRA non-display entitlement**, or must we hold it directly? (The
+   ~$300 vs ~$3,000/mo fork — see §2a.)
+
+**Rough budget:** the *historical* pull — a bounded 3-symbol, ~5-year options download — is
+typically a **few hundred to low-thousands of dollars one-time (or a few months of a mid-tier
+sub)**, small next to what it unlocks. But the *live redistribution* path carries the **§2a Layer-2
+floor on top**: ~$2,000/mo OPRA non-display + ~$1,000+/mo Cboe SPX/CGIF **unless a vendor bundles
+them** — the fixed hump that dwarfs the vendor fee. Confirm exact quotes before committing.
 
 ## 5. Integration path (once data is chosen)
 
@@ -109,3 +185,16 @@ regimes, the B2B dataset — is gated on this one call.
 [ORATS](https://orats.com/) ·
 [CBOE DataShop](https://datashop.cboe.com/) ·
 [dxFeed](https://dxfeed.com/)
+
+**Verified 2026-07 (primary / authoritative):**
+[OPRA non-display amendment — SEC/Federal Register 2016-26136](https://www.federalregister.gov/documents/2016/10/31/2016-26136/options-price-reporting-authority-notice-of-filing-and-immediate-effectiveness-of-proposed-amendment) ·
+[OPRA Fee Schedule](https://cdn.opraplan.com/documents/OPRA_Fee_Schedule.pdf) ·
+[Cboe DataShop — Option Quote Intervals](https://datashop.cboe.com/option-quote-intervals) ·
+[Cboe derivatives market-data pricing (eff. 2026-01-01)](https://www.cboe.com/notices/content/?id=57029) ·
+[ThetaData commercial licensing](https://www.thetadata.net/commercial-use)
+
+**Refuted / do not rely on:** Cboe Option Quotes depth "back to 2004" (actual ~2012) · Cboe SPX
+sourced "via OPRA" (SPX is Cboe-proprietary) · a ThetaData "40 ms / 14,000-contract" performance
+benchmark (marketing). **Still unresolved (contractual, get in writing):** whether any vendor's
+commercial tier explicitly grants real-time *derived* redistribution, and who bears the OPRA
+non-display fee in a vendor-intermediated setup.
