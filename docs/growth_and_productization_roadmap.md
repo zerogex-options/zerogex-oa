@@ -248,7 +248,9 @@ There's also a **display vs. datafeed** axis: a human-readable chart of raw
 quotes ("display") is a lighter licensing category than an open consumable JSON
 feed ("datafeed") — but **both still require a license for live raw data.** A
 chart is not a loophole. Only **derived** data or **15-min-delayed** raw data is
-free-and-clear.
+free-and-clear _to redistribute_ — but "free-and-clear" is about *rights*, not *cost*:
+producing derived data from a **real-time** raw feed still triggers an OPRA exchange fee even
+though the *output* is yours to redistribute (see "The cost you can't design around" below).
 
 ### Two decisions to make
 
@@ -268,6 +270,24 @@ free-and-clear.
 - _Bonus:_ also kills the single-broker dependency (a resilience win).
 - _This unblocks Stripe metered billing_ — no point billing for data you can't
   yet legally sell.
+
+### The cost you can't design around — OPRA/exchange fees
+
+Migrating to a redistribution-licensed vendor answers the *rights* question but surfaces a
+*cost* one that a narrow symbol slice does **not** shrink (full detail + primary sources in
+`docs/design/historical-options-data-vendors.md` §2a; scenario math in the private break-even
+model):
+
+- **OPRA "Non-Display Use" ≈ $2,000/mo, flat per enterprise.** Computing GEX from a *real-time*
+  OPRA feed is a non-display use; a 2016 rule change (SR-OPRA-2016-02) made the fee follow
+  downstream to derived operations. Flat regardless of scale, so it's a one-time revenue hump,
+  not a per-subscriber cost — and it dwarfs the vendor fee.
+- **The swing question:** does the live vendor **bundle** that entitlement, or must we hold it
+  directly? That's the ~$300/mo vs ~$3,000/mo fork — confirm in writing before signing.
+- **SPX/SPXW are Cboe-proprietary** (off the OPRA tape); the SPX index *value* needs a separate
+  Cboe CGIF license (~$1,000+/mo). SPY/QQQ ETF options avoid it — a lever for a free/public tier.
+- **Delayed data is the release valve:** 15-min-delayed largely sidesteps the non-display fee, so
+  keep free/public tiers on delayed derived data and reserve real-time for paying subscribers.
 
 ---
 
