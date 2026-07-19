@@ -180,16 +180,25 @@ def _stream_retry_delay_for_429(response: Any, default_seconds: float = 30.0) ->
 
 
 def _parse_concurrency_headers(headers: Any) -> Optional[Dict[str, Any]]:
-    """Extract TradeStation's ``X-Concurrency-*`` streaming-budget headers.
+    """Extract TradeStation's ``X-Concurrency-*`` streaming-budget headers, if any.
 
-    On streaming responses TradeStation returns headers whose names begin
-    with ``X-Concurrency-`` describing the per-API-key concurrent-connection
+    When present, these headers describe the per-API-key concurrent-connection
     budget: the maximum number of simultaneous streams
     (``X-Concurrency-Limit``), how many more may still be opened
     (``X-Concurrency-Remaining``), and which streaming resource/group the
-    limit applies to (``X-Concurrency-Resource``). This is the authoritative,
+    limit applies to (``X-Concurrency-Resource``) — the authoritative,
     deterministic counterpart to the lifetime-based cap heuristic, which can
     only *infer* exhaustion from a short-lived connection.
+
+    DORMANT on a standard API key. A 2026-07-19 live probe of both stream
+    resources (``quote-change-stream`` and ``stream-barcharts``) returned only
+    ``X-Ratelimit-*`` and NO ``X-Concurrency-*`` header, so the per-account
+    concurrent-stream cap is NOT header-observable on a standard key; the cap
+    heuristic elsewhere in this module remains the only concurrency signal.
+    The ``X-Concurrency-*`` headers appear to be gated behind an explicit
+    concurrency configuration provisioned by TradeStation Client Experience.
+    This parser is therefore forward-looking: a harmless no-op today that
+    auto-arms and surfaces the budget the moment those headers ever appear.
 
     Returns a dict with parsed ``limit`` / ``remaining`` ints (``None`` when a
     header is absent or non-numeric), the raw ``resource`` string, and the
@@ -236,12 +245,16 @@ def _log_concurrency_budget(label: str, response: Any) -> Optional[Dict[str, Any
     """Observe and log the ``X-Concurrency-*`` budget on a freshly opened stream.
 
     STRICTLY observational — this never raises and never influences the
-    reader's control flow (open / close / retry). On a healthy connect it
-    logs an INFO line with the remaining/limit budget; when the budget is
-    exhausted (``remaining <= 0``) it logs a WARNING, so cap pressure is
-    named from the authoritative header instead of only inferred from a short
-    connection lifetime. Returns the parsed budget dict (or ``None``) so
-    callers may expose the last-seen value; the return is advisory only.
+    reader's control flow (open / close / retry). When the headers are present
+    it logs an INFO line with the remaining/limit budget on a healthy connect,
+    and a WARNING when the budget is exhausted (``remaining <= 0``). Returns
+    the parsed budget dict (or ``None``) so callers may expose the last-seen
+    value; the return is advisory only.
+
+    NOTE: a standard API key does not receive ``X-Concurrency-*`` headers (see
+    ``_parse_concurrency_headers``), so on a standard key this is a silent
+    no-op that emits nothing. It activates automatically if TradeStation ever
+    provisions the concurrency headers on the key.
     """
     try:
         parsed = _parse_concurrency_headers(getattr(response, "headers", None))
@@ -495,8 +508,9 @@ class OptionStreamAccumulator:
         """Most recent ``X-Concurrency-*`` budget observed on connect (or None).
 
         Populated by ``_read_stream`` from the stream response headers; purely
-        diagnostic (never used for flow control). ``None`` until the first
-        successful connect that carried the headers.
+        diagnostic (never used for flow control). Stays ``None`` on a standard
+        API key, which does not receive these headers (see
+        ``_parse_concurrency_headers``); auto-populates if they ever appear.
         """
         return getattr(self, "_last_concurrency", None)
 
@@ -659,9 +673,10 @@ class OptionStreamAccumulator:
 
         self._connected.set()
 
-        # Deterministic per-API-key concurrency budget straight from the
-        # response headers — the authoritative signal the lifetime-based cap
-        # heuristic below can only infer. Observational only; never gates I/O.
+        # Forward-looking concurrency-budget probe: surfaces the per-API-key
+        # X-Concurrency-* budget IF TradeStation emits it (dormant on standard
+        # keys today — see _parse_concurrency_headers). Observational only;
+        # never gates I/O.
         self._last_concurrency = _log_concurrency_budget(label, response)
 
         decode_tracker = _DecodeErrorTracker(label)
@@ -919,7 +934,11 @@ class UnderlyingBarAccumulator:
 
     @property
     def last_concurrency(self) -> Optional[Dict[str, Any]]:
-        """Most recent ``X-Concurrency-*`` budget observed on connect (or None)."""
+        """Most recent ``X-Concurrency-*`` budget observed on connect (or None).
+
+        ``None`` on a standard API key (headers dormant — see
+        ``_parse_concurrency_headers``); auto-populates if they ever appear.
+        """
         return getattr(self, "_last_concurrency", None)
 
     # -- public API --------------------------------------------------------
@@ -1025,8 +1044,9 @@ class UnderlyingBarAccumulator:
 
         self._connected.set()
 
-        # See OptionStreamAccumulator._read_stream — read the authoritative
-        # X-Concurrency-* budget on connect (observational only; never gates I/O).
+        # See OptionStreamAccumulator._read_stream — forward-looking
+        # X-Concurrency-* budget probe (dormant on standard keys; observational
+        # only, never gates I/O).
         self._last_concurrency = _log_concurrency_budget("Underlying bar stream", response)
 
         _heartbeat_count = 0
