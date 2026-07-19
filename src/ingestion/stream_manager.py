@@ -179,6 +179,101 @@ def _stream_retry_delay_for_429(response: Any, default_seconds: float = 30.0) ->
     return default_seconds
 
 
+def _parse_concurrency_headers(headers: Any) -> Optional[Dict[str, Any]]:
+    """Extract TradeStation's ``X-Concurrency-*`` streaming-budget headers.
+
+    On streaming responses TradeStation returns headers whose names begin
+    with ``X-Concurrency-`` describing the per-API-key concurrent-connection
+    budget: the maximum number of simultaneous streams
+    (``X-Concurrency-Limit``), how many more may still be opened
+    (``X-Concurrency-Remaining``), and which streaming resource/group the
+    limit applies to (``X-Concurrency-Resource``). This is the authoritative,
+    deterministic counterpart to the lifetime-based cap heuristic, which can
+    only *infer* exhaustion from a short-lived connection.
+
+    Returns a dict with parsed ``limit`` / ``remaining`` ints (``None`` when a
+    header is absent or non-numeric), the raw ``resource`` string, and the
+    full ``raw`` header map — or ``None`` when no such headers are present.
+    Matching is case-insensitive and defensive: any non-mapping input (or a
+    mapping whose ``items()`` misbehaves) yields ``None`` rather than raising.
+    """
+    if headers is None:
+        return None
+    try:
+        items = list(headers.items())
+    except Exception:
+        return None
+
+    matched: Dict[str, str] = {}
+    for key, value in items:
+        try:
+            lkey = str(key).lower()
+        except Exception:
+            continue
+        if lkey.startswith("x-concurrency-"):
+            matched[lkey] = value
+    if not matched:
+        return None
+
+    def _as_int(name: str) -> Optional[int]:
+        raw = matched.get(name)
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (ValueError, TypeError):
+            return None
+
+    return {
+        "limit": _as_int("x-concurrency-limit"),
+        "remaining": _as_int("x-concurrency-remaining"),
+        "resource": matched.get("x-concurrency-resource"),
+        "raw": matched,
+    }
+
+
+def _log_concurrency_budget(label: str, response: Any) -> Optional[Dict[str, Any]]:
+    """Observe and log the ``X-Concurrency-*`` budget on a freshly opened stream.
+
+    STRICTLY observational — this never raises and never influences the
+    reader's control flow (open / close / retry). On a healthy connect it
+    logs an INFO line with the remaining/limit budget; when the budget is
+    exhausted (``remaining <= 0``) it logs a WARNING, so cap pressure is
+    named from the authoritative header instead of only inferred from a short
+    connection lifetime. Returns the parsed budget dict (or ``None``) so
+    callers may expose the last-seen value; the return is advisory only.
+    """
+    try:
+        parsed = _parse_concurrency_headers(getattr(response, "headers", None))
+        if not parsed:
+            return None
+        limit = parsed.get("limit")
+        remaining = parsed.get("remaining")
+        resource = parsed.get("resource")
+        if remaining is not None and remaining <= 0:
+            logger.warning(
+                "%s: TradeStation concurrent-stream budget EXHAUSTED "
+                "(X-Concurrency-Remaining=%s of Limit=%s, Resource=%s) — further "
+                "streams will be refused/closed until slots free up.",
+                label,
+                remaining,
+                limit,
+                resource,
+            )
+        else:
+            logger.info(
+                "%s: TradeStation concurrent-stream budget "
+                "(remaining=%s of limit=%s, resource=%s)",
+                label,
+                remaining,
+                limit,
+                resource,
+            )
+        return parsed
+    except Exception:  # pragma: no cover - observability must never break I/O
+        return None
+
+
 # Possible field names for implied volatility across TradeStation payload variants
 _IV_FIELD_NAMES = ("ImpliedVolatility", "IV", "Volatility", "IVol")
 
@@ -395,6 +490,16 @@ class OptionStreamAccumulator:
     def updates_received(self) -> int:
         return self._updates_received
 
+    @property
+    def last_concurrency(self) -> Optional[Dict[str, Any]]:
+        """Most recent ``X-Concurrency-*`` budget observed on connect (or None).
+
+        Populated by ``_read_stream`` from the stream response headers; purely
+        diagnostic (never used for flow control). ``None`` until the first
+        successful connect that carried the headers.
+        """
+        return getattr(self, "_last_concurrency", None)
+
     # -- public API --------------------------------------------------------
 
     def snapshot(self) -> Dict[str, Dict[str, Any]]:
@@ -553,6 +658,11 @@ class OptionStreamAccumulator:
             self._current_responses[chunk_idx] = response
 
         self._connected.set()
+
+        # Deterministic per-API-key concurrency budget straight from the
+        # response headers — the authoritative signal the lifetime-based cap
+        # heuristic below can only infer. Observational only; never gates I/O.
+        self._last_concurrency = _log_concurrency_budget(label, response)
 
         decode_tracker = _DecodeErrorTracker(label)
         # Quote-payload counter for the cap-vs-degraded-upstream
@@ -807,6 +917,11 @@ class UnderlyingBarAccumulator:
     def updates_received(self) -> int:
         return self._updates_received
 
+    @property
+    def last_concurrency(self) -> Optional[Dict[str, Any]]:
+        """Most recent ``X-Concurrency-*`` budget observed on connect (or None)."""
+        return getattr(self, "_last_concurrency", None)
+
     # -- public API --------------------------------------------------------
 
     def drain(self) -> Optional[Dict[str, Any]]:
@@ -909,6 +1024,10 @@ class UnderlyingBarAccumulator:
             self._current_response = response
 
         self._connected.set()
+
+        # See OptionStreamAccumulator._read_stream — read the authoritative
+        # X-Concurrency-* budget on connect (observational only; never gates I/O).
+        self._last_concurrency = _log_concurrency_budget("Underlying bar stream", response)
 
         _heartbeat_count = 0
         _line_count = 0
