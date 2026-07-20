@@ -122,6 +122,27 @@ CALIBRATION_SWEEP_INTERVAL_HOURS: float = _getenv_float(
     "TRADEWORKZ_CALIBRATION_SWEEP_INTERVAL_HOURS", 24.0, min=0.0, max=8760.0
 )
 
+# Adaptive entry-conviction gate. recalibrate_bot sets each bot's
+# confidence_threshold to clamp(1 - win_30d + OFFSET, FLOOR, CEIL) — a bot
+# whose recent win rate sags gets a HIGHER bar to enter. CEIL is the critical
+# knob: a bot's conviction (base.compute_conviction) tops out around 0.76 even
+# on a flawless setup, so a CEIL at/above that silently locks the WHOLE fleet
+# out of trading — every signal scores below the gate and nothing opens. It
+# must stay below the reachable conviction ceiling so a clean setup can still
+# clear it. The default 0.60 lets high-quality (quality >= ~0.73) setups
+# through while still filtering weak ones — "more rigor," not "no trades."
+# (An earlier hard-coded 0.75 ceiling is exactly what froze the fleet after a
+# losing streak dragged every bot's win_30d down to the cap.)
+ADAPTIVE_THRESHOLD_FLOOR: float = _getenv_float(
+    "TRADEWORKZ_ADAPTIVE_THRESHOLD_FLOOR", 0.45, min=0.0, max=1.0
+)
+ADAPTIVE_THRESHOLD_CEIL: float = _getenv_float(
+    "TRADEWORKZ_ADAPTIVE_THRESHOLD_CEIL", 0.60, min=0.0, max=1.0
+)
+ADAPTIVE_THRESHOLD_OFFSET: float = _getenv_float(
+    "TRADEWORKZ_ADAPTIVE_THRESHOLD_OFFSET", 0.30, min=-1.0, max=1.0
+)
+
 # ---------------------------------------------------------------------------
 # Bot governance: auto-disable a persistently losing bot
 # ---------------------------------------------------------------------------
