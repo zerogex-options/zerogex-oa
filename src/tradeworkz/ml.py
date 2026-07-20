@@ -331,8 +331,18 @@ def recalibrate_bot(conn: Any, bot_id: str) -> MLState:
             state.size_multiplier = 1.25
 
     if win_30d is not None:
-        # Adaptive threshold: never gate above 0.75 or below 0.45.
-        state.confidence_threshold = max(0.45, min(0.75, 1.0 - win_30d + 0.30))
+        # Adaptive threshold: a sagging recent win rate lifts the entry bar,
+        # but CEIL stays below the reachable conviction ceiling (~0.76) so a
+        # clean setup can always clear it. A CEIL at/above that ceiling locks
+        # the whole fleet out — every signal scores under the gate and nothing
+        # opens (see config.ADAPTIVE_THRESHOLD_CEIL).
+        state.confidence_threshold = max(
+            tw_config.ADAPTIVE_THRESHOLD_FLOOR,
+            min(
+                tw_config.ADAPTIVE_THRESHOLD_CEIL,
+                1.0 - win_30d + tw_config.ADAPTIVE_THRESHOLD_OFFSET,
+            ),
+        )
 
     state.hit_rate = hit_rate
     state.last_win_rate_7d = win_7d

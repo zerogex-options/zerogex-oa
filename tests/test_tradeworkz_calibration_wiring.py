@@ -144,7 +144,10 @@ def test_recalibrate_throttles_and_disables_a_loser():
     assert state.last_profit_factor == pytest.approx(250.0 / 2000.0)
     assert state.size_multiplier == 0.5  # PF < 1 -> throttle
     assert state.confidence_base == pytest.approx(0.40)  # clamped to floor
-    assert state.confidence_threshold == pytest.approx(0.75)  # adaptive, capped
+    # Adaptive threshold: 1 - 0.20 + 0.30 = 1.10, clamped to the CEIL. The
+    # ceiling is 0.60 (below the ~0.76 conviction ceiling), NOT the old 0.75
+    # that locked the whole fleet out of trading.
+    assert state.confidence_threshold == pytest.approx(0.60)  # adaptive, capped at CEIL
     # Circuit breaker fired (25 trades >= 20, hit 0.20 < 0.35).
     assert conn.cursor().updates, "auto-disable UPDATE should have run"
 
