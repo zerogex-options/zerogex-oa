@@ -26,6 +26,8 @@ all-or-nothing exit for trades that go into profit.
 8. [Data-model & config changes](#8-data-model--config-changes)
 9. [Implementation plan](#9-implementation-plan)
 10. [Risks & open questions](#10-risks--open-questions)
+11. [Quant / game-theory rationale](#11-quant--game-theory-rationale)
+12. [Worked scenarios](#12-worked-scenarios)
 
 ---
 
@@ -178,13 +180,13 @@ with the sign flipped.
 | **S1** | original stop stack | — | whole-trade stop (structural stop + 25% premium + wall-break), Stage 0 |
 | **S2** | `entry + 0.75·R` | 0.75 | runner floor stop, armed once T1 fills |
 | **T1** | `entry + 0.90·R` | 0.90 | take **50%** — fires *before* the structural level |
-| **T2** | `T1 + 1.0·(T1 − entry)` = `entry + 1.8·R` | ext. mult 1.0 | take **50% of the remainder** (25% of original) |
+| **T2** | `entry + 1.5·R` | 1.5 | take **50% of the remainder** (25% of original) — half an R past the target |
 
 Worked geometry — bullish, `entry_spot = 749`, `bull_momentum_climber` call wall
 `= 750`, so **R = 1.00**:
 
 ```
-entry 749.00 (0R) ── S2 749.75 (0.75R) ── T1 749.90 (0.90R) ── [wall 750.00, 1R] ── T2 750.80 (1.8R)
+entry 749.00 (0R) ── S2 749.75 (0.75R) ── T1 749.90 (0.90R) ── [wall 750.00, 1R] ── T2 750.50 (1.5R)
                        └ runner floor        └ take 50%            (reference only)      └ take 25%
 ```
 
@@ -195,7 +197,7 @@ stateDiagram-v2
     Stage0_Full --> Closed: S1 — premium / structural stop / wall_break / time_stop
     Stage0_Full --> Stage1_Runner: spot reaches T1 (0.90R) — sell 50%
     Stage1_Runner --> Closed: S2 floor / trailing give-back / time_stop
-    Stage1_Runner --> Stage2_Runner: spot reaches T2 (1.8R) — sell 50% of remainder (25% of original)
+    Stage1_Runner --> Stage2_Runner: spot reaches T2 (1.5R) — sell 50% of remainder (25% of original)
     Stage2_Runner --> Closed: same runner stop (S2 + trailing) / time_stop / 15:55 cap
     Closed --> [*]: ONE consolidated tw_trades row (size-weighted exit)
 ```
@@ -208,7 +210,7 @@ time-stop. If any fires here, the whole position closes as it does now.
 Enter Stage 1. The taken profit is *booked* (§7) but no trade row is written yet.
 
 **Stage 1 — runner (the remaining ~50%).**
-- **Target = T2** (1.8·R), the measured extension off the new T1 (§5b).
+- **Target = T2** (1.5·R), half an R past the structural target (§5b).
 - **Stop = S2 (0.75·R) floor, ratcheting tighter** via the premium give-back
   from the runner's high-water mark (§5c–d). Effective stop = the *higher* of S2
   and the trailing level, so it can only tighten as spot extends — never looser
@@ -216,7 +218,7 @@ Enter Stage 1. The taken profit is *booked* (§7) but no trade row is written ye
   gain.
 - The premium hard-floor and time-stop remain as backstops.
 
-**T2 hit (spot reaches 1.8·R): take 50% of the remainder (25% of original).**
+**T2 hit (spot reaches 1.5·R): take 50% of the remainder (25% of original).**
 Enter Stage 2.
 
 **Stage 2 — final runner (the last ~25%).**
@@ -253,13 +255,16 @@ eighth for the next guy." Fraction is per-bot configurable (`t1_trigger_frac`,
 default 0.90). Requires storing **`entry_spot`**, which the position does not
 persist today (only `entry_price`, the option premium).
 
-**(b) T2 — measured extension off the new T1.** `T2 = T1 + m·(T1 − entry_spot)`,
-default `m = 1.0`, so with T1 at 0.90·R the extension lands at **1.8·R**. Chosen
-over "next structural level" because **not every bot has a clean second level**
-(many target max-pain / VWAP with nothing obvious beyond); a measured extension
-is universal and backtestable with one knob. `m` is per-bot configurable. *(If a
-future need calls for anchoring T2 to the structural target instead of the new
-T1, that's a one-line change to the reference term.)*
+**(b) T2 — a direct fraction of R, `entry + 1.5·R`.** The second take (25% of
+original) sits **half an R past the structural target**. Expressed as a direct
+fraction of R for consistency with T1 (0.90) and S2 (0.75), rather than as an
+extension multiplier off T1 — one uniform mental model, no anchor ambiguity.
+Chosen over "next structural level" because **not every bot has a clean second
+level** (many target max-pain / VWAP with nothing obvious beyond); a fixed
+R-multiple is universal and backtestable with one knob. 1.5 (vs an earlier 1.8)
+keeps T2 reachable intraday on 0DTE — a full extra R past the target is a big ask
+for a same-day move; half an R is a realistic stretch that still meaningfully
+rewards the runner. Per-bot configurable (`t2_target_frac`, default 1.5).
 
 **(c) S2 — the runner floor at `entry + 0.75·R`, with wiggle room.** Once T1
 fills, the remaining ~50% gets a hard floor stop **below** T1 (0.75·R vs T1's
@@ -426,7 +431,7 @@ fraction knobs change mid-session.
 | `quantity_initial` | `INTEGER` | Original contract count — tranche sizing & consolidated `quantity` |
 | `t1_trigger_price` | `NUMERIC(12,6)` | Resolved T1 take-50% level (`entry + 0.90·R`) |
 | `s2_stop_price` | `NUMERIC(12,6)` | Resolved S2 runner floor (`entry + 0.75·R`) |
-| `target2_price` | `NUMERIC(12,6)` | Resolved T2 take-25% level (`entry + 1.8·R`) |
+| `target2_price` | `NUMERIC(12,6)` | Resolved T2 take-25% level (`entry + 1.5·R`) |
 | `scale_stage` | `SMALLINT NOT NULL DEFAULT 0` | 0 = full, 1 = post-T1, 2 = post-T2 |
 | `high_water_mark` | `NUMERIC(12,6)` | Peak mark for the premium trailing give-back |
 | `realized_pnl_booked` | `NUMERIC(14,4) NOT NULL DEFAULT 0` | Accumulated realized from partial closes |
@@ -455,7 +460,7 @@ All read via `config.py` and overridable per-bot through `params[...]`, mirrorin
 | `TRADEWORKZ_S2_STOP_FRACTION` | `0.75` | S2 runner floor = `entry + this·R` |
 | `TRADEWORKZ_T1_TAKE_FRACTION` | `0.5` | Fraction of original taken at T1 |
 | `TRADEWORKZ_T2_TAKE_FRACTION` | `0.5` | Fraction of the *remainder* taken at T2 |
-| `TRADEWORKZ_T2_EXTENSION_MULT` | `1.0` | `T2 = T1 + m·(T1 − entry_spot)` |
+| `TRADEWORKZ_T2_TARGET_FRACTION` | `1.5` | T2 take-25% level = `entry + this·R` (half an R past the target) |
 | `TRADEWORKZ_RUNNER_TRAIL_GIVEBACK_PCT` | `0.30` | Premium give-back from HWM that stops the runner |
 
 `TRADEWORKZ_MAX_PREMIUM_LOSS_PCT` default changed `0.40 → 0.25` (§6.1) — done.
@@ -515,8 +520,136 @@ Ordered so each step is independently testable.
   basis see scaled profit only at final close. Acceptable for a same-day-close
   fleet; "Design 1b" is the escape hatch if not.
 - **Slippage on extra fills.** Three exits instead of one triples per-tranche
-  slippage; the min-contract floor bounds this, but the `T2_EXTENSION_MULT` and
+  slippage; the min-contract floor bounds this, but the `T2_TARGET_FRACTION` and
   give-back defaults should be validated against slippage drag in backtests
   before fleet-wide enablement.
 - **Backtest parity is load-bearing.** If `simulate.py` is not updated in
   lockstep (step 8), the leaderboard/backtests will diverge from live behaviour.
+
+---
+
+## 11. Quant / game-theory rationale
+
+**One-line verdict.** This is solid *exit hygiene*, not a source of edge. It
+reshapes the P&L distribution — higher hit rate, lower variance, and it converts
+the common "reversed just before the wall" round-trip into a booked win. Its EV
+vs. today is **positive for mean-reverting / wall-fade setups** and roughly
+**neutral-to-slightly-negative (costs) for pure-momentum setups**, so it is best
+enabled **per bot**, not blanket fleet-wide.
+
+**What scaling out actually trades.** Booking 50% at T1 lowers the mean of the
+outcome distribution *if* reaching T1 predicts reaching T2 (a trend), and raises
+it *if* it doesn't (reversion). Near a gamma wall the dealer-hedging flow is
+mean-reverting — price is *repelled* by the level — so P(continue to 1.5·R |
+tagged 0.90·R) is low and taking profit early is genuinely +EV. This is the
+game-theory crux: the wall is a Schelling point where many participants act;
+taking profit a tick *ahead* of the crowd (T1 at 0.90·R, not at the wall) is the
+dominant move.
+
+**The early T1 (0.90·R) is the biggest EV lever.** It is not primarily about
+"banking profit" — it is about *fill probability*. A target pinned exactly at the
+wall only pays when price actually tags the wall; because the wall repels, a
+large fraction of otherwise-winning moves reverse in the last tick and
+round-trip to a loss under today's logic. Pulling the take to 0.90·R captures
+those (Scenario B) — the single largest source of improvement, and it compounds
+with the tighter 25% premium stop.
+
+**The runner is a barbell.** 75% is de-risked and booked; 25% is cheap
+convexity on a trend, financed by the booked tranches. The trail is
+*premium-based* precisely because on 0DTE the runner's enemy is **theta**, not
+just adverse spot — a spot trail would let an ITM runner's mark decay while spot
+holds (Scenario D). This is the correct instrument choice.
+
+**Where it underperforms (be honest).** The ladder loses to today's
+all-out-at-the-wall exit in one band: price tags the structural level almost
+exactly and reverses immediately (Scenario E). There, the early T1 sold below
+the wall and the runner never got its extension. This band is narrower than the
+"reversed *before* the wall" band (B) precisely because walls repel, so the net
+is favorable — but it is not free.
+
+**Second-order interaction to watch.** Scaling **inflates headline win rate**
+while shrinking average win. The governance layer keys on hit rate
+(`AUTO_DISABLE_MAX_HIT_RATE`, and `confidence_base` is derived from it), so a bot
+could *look* healthier while its expectancy erodes. Profit factor / expectancy —
+not win rate — must be the metric the calibrator and any human review trust once
+scaling is on.
+
+**Spot-vs-premium nonlinearity.** All ladder levels are in **spot**; all P&L is
+in **premium**. High 0DTE gamma makes that mapping convex and time-dependent, so
+a "0.90·R spot" take books a different premium depending on delta and elapsed
+theta. Consequence: **backtests must run on option marks, not spot proxies**, or
+the EV estimate will be biased.
+
+**Net.** A professional, defensible overlay. Turn it on first for the wall /
+max-pain / VWAP reversion bots (where the thesis *is* mean reversion), measure
+profit factor and the win-rate/expectancy split against the single-target
+baseline on option-mark backtests, then decide momentum bots case by case.
+
+## 12. Worked scenarios
+
+**Setup (illustrative).** Bullish 0DTE ATM call. `entry_spot = 749`, structural
+target (call wall) `= 750`, so **R = $1.00**; ladder levels S2 = 749.75, T1 =
+749.90, T2 = 750.50. `Q = 8` contracts → tranches **4 / 2 / 2** (T1 / T2 /
+runner). Entry premium **$1.00**. Illustrative premium map for a rising-delta ATM
+0DTE call (light theta unless the path lingers): 749→1.00, 749.75→1.42,
+749.90→1.50, 750.00→1.58, 750.50→2.00, 751.20→2.70; a fade back to entry with
+decay →0.90; a 748.4 adverse print →0.75. "Today" = the current single-target
+exit (all 8 at the wall, or held to the stop/EOD if the wall never tags).
+
+Realized P&L per contract = `(exit − 1.00) × 100`. The consolidated row's
+`exit_price` is the size-weighted average, so `(VWAP − 1.00) × 8 × 100` equals
+the tranche sum exactly (Invariant A).
+
+### A — Trend winner (T1, T2, runner trails out high)
+Spot 749 → 750.50 (T2) → 751.20 peak → pulls back.
+- T1 @749.90: sell 4 @ 1.50 → **+$200**
+- T2 @750.50: sell 2 @ 2.00 → **+$200**
+- Runner (2): HWM $2.70; 30% give-back → exits @ ~1.90 → **+$180**
+- **Consolidated:** VWAP `(4·1.50+2·2.00+2·1.90)/8 = 1.725` → **+$580** (72.5%)
+- **Today:** all 8 @ wall 1.58 → **+$464.** Ladder **+$116** — the runner earns its keep.
+
+### B — Pop then fade (the headline case)
+Spot 749 → 749.95 (just past T1) → reverses → back to 749. *Never tags the wall.*
+- T1 @749.90: sell 4 @ 1.50 → **+$200**
+- Remaining 4: spot falls through S2 749.75 → runner stop → sell 4 @ 1.42 → **+$168**
+- **Consolidated:** VWAP `(4·1.50+4·1.42)/8 = 1.46` → **+$368** (46%)
+- **Today:** target (wall 750) never hits → holds to EOD/stop as spot returns to 749 → exit 8 @ 0.90 → **−$80.**
+- Ladder **+$368 vs −$80 = +$448 swing.** Early T1 converts a round-trip loss into a win.
+
+### C — Loser, never reaches T1 (downside unchanged)
+Spot 749 → 748.4 adverse; premium hits the 25% stop.
+- No scaling below T1; premium stop → sell 8 @ 0.75 → **−$200** (`premium_stop`)
+- **Today:** identical → **−$200.** Ladder does not touch losers.
+- (Aside: under the *old* 40% stop this exited @ 0.60 → −$320; the 25% change alone saved $120 here.)
+
+### D — T2 then chop into the close (premium trail earns its keep)
+Spot 749 → 750.50 (T2) → drifts 750.4–750.6; 0DTE theta erodes the mark.
+- T1 @749.90: sell 4 @ 1.50 → **+$200**
+- T2 @750.50: sell 2 @ 2.00 → **+$200**
+- Runner (2): HWM $2.05; 30% give-back → exits @ ~1.44 as theta pulls the mark down → **+$88**
+- **Consolidated:** VWAP `(4·1.50+2·2.00+2·1.44)/8 = 1.61` → **+$488** (61%)
+- **Counterfactual — no premium trail (ride to EOD):** runner decays to ~intrinsic 0.45 → −$110, total **+$288.** The premium trail saved **~$200** on the runner. Validates decision (d).
+
+### E — Tag-and-reverse at the wall (where the ladder underperforms)
+Spot 749 → 750.00 (tags wall exactly) → reverses immediately. *T2 never hits.*
+- T1 @749.90: sell 4 @ 1.50 → **+$200**
+- Remaining 4: reverse from the wall, trail/S2 out @ ~1.46 → **+$184**
+- **Consolidated:** VWAP `(4·1.50+4·1.46)/8 = 1.48` → **+$384** (48%)
+- **Today:** all 8 @ wall 1.58 → **+$464.** Ladder **−$80** — the cost of scaling when price stops exactly at the target.
+
+### Summary
+
+| Scenario | Spot path | Ladder | Today | Δ vs today |
+| --- | --- | ---: | ---: | ---: |
+| A. Trend winner | 749→750.5→751.2 ↘ | **+$580** | +$464 | **+$116** |
+| B. Pop then fade | 749→749.95 ↘ 749 | **+$368** | −$80 | **+$448** |
+| C. Loser (no T1) | 749→748.4 | −$200 | −$200 | $0 |
+| D. T2 then EOD chop | 749→750.5→chop | **+$488** | +$464 | **+$24** |
+| E. Tag-&-reverse at wall | 749→750.0 ↘ | +$384 | **+$464** | **−$80** |
+
+The ladder wins clearly when price reverses **before** the wall (B) or extends
+**past** it (A/D), and loses only in the narrow tag-the-wall-exactly band (E).
+Because walls repel, mass concentrates in the B-shaped paths — which is why the
+overlay is net-positive for reversion bots. Frequencies are what a real
+option-mark backtest must supply; these five paths only show the *mechanics* and
+the sign of each comparison.
