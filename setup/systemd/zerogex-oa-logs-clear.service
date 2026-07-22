@@ -1,5 +1,5 @@
 [Unit]
-Description=ZeroGEX nightly cleanup (logs + apt/snap/npm + build caches + auth-backup retention)
+Description=ZeroGEX nightly cleanup (logs + apt/snap/npm + build caches)
 Documentation=https://github.com/zerogex-options/zerogex-oa
 After=network-online.target
 
@@ -15,16 +15,14 @@ WorkingDirectory=/home/ubuntu/zerogex-oa
 # anyway to truncate files in /var/log, reload nginx/rsyslog, and clear the
 # system apt/snap caches.
 #
-# Three sequential phases (Type=oneshot runs ExecStart lines in order; a
+# Two sequential phases (Type=oneshot runs ExecStart lines in order; a
 # failure stops the rest, so the most important — log truncation — goes first):
 #   1. logs-clear-noconfirm  — journals + /var/log + nginx   (`make logs-clear`)
 #   2. disk-clean-noconfirm  — apt/snap/npm + build caches    (`make disk-clean`)
-#   3. auth-backups-prune    — age out old auth-DB backups, keep newest N
 # Each recipe guards its externals (command -v) and swallows per-tool errors
 # (|| true), so a missing tool or absent path can't fail the nightly run.
 ExecStart=/usr/bin/make logs-clear-noconfirm
 ExecStart=/usr/bin/make disk-clean-noconfirm
-ExecStart=/usr/bin/make auth-backups-prune
 
 # Safety: don't hold the system in degraded state if cleanup hangs (e.g.
 # journalctl --rotate stuck on a corrupt journal, or apt waiting on a lock).

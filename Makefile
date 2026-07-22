@@ -917,7 +917,6 @@ help: ## Show this help message
 	@echo "  make logs-grep PATTERN=\"text\" - Search all service logs for pattern"
 	@echo "  make logs-clear                 - Clear journals + system/nginx/etc. logs (rotated + gzipped)"
 	@echo "  make disk-clean                 - Reclaim disk: apt/snap/npm caches + .mypy_cache/htmlcov/.next (runs nightly w/ logs-clear)"
-	@echo "  make auth-backups-prune         - Prune auth-DB backups >7d, always keeping newest ZEROGEX_AUTH_BACKUP_KEEP (default 48)"
 	@echo ""
 	@echo "$(GREEN)Run Components:$(NC)"
 	@echo "  make run-auth           - Test TradeStation authentication"
@@ -1483,14 +1482,6 @@ logs-clear-noconfirm: ## Non-interactive log cleanup (driven by zerogex-oa-logs-
 ZEROGEX_APP_USER ?= ubuntu
 ZEROGEX_APP_HOME ?= /home/$(ZEROGEX_APP_USER)
 ZEROGEX_WEB_DIR  ?= $(ZEROGEX_APP_HOME)/zerogex-web
-# Auth-backup retention (see auth-backups-prune).  KEEP is a safety FLOOR: the
-# newest N archives are ALWAYS retained even if older than DAYS, so a stalled
-# `make backup-auth` (zerogex-web) can never let this prune reach zero copies
-# of the Tier-1 auth DB.  Set ZEROGEX_AUTH_BACKUP_KEEP=0 for the unguarded
-# mtime-only behavior (equivalent to a bare `find -mtime +N -delete`).
-ZEROGEX_AUTH_BACKUP_DIR  ?= $(ZEROGEX_APP_HOME)/zerogex-auth-backups
-ZEROGEX_AUTH_BACKUP_DAYS ?= 7
-ZEROGEX_AUTH_BACKUP_KEEP ?= 48
 
 .PHONY: disk-clean
 disk-clean: ## Interactive disk/cache cleanup (prompts; calls disk-clean-noconfirm)
@@ -1544,26 +1535,6 @@ disk-clean-noconfirm: ## Non-interactive disk/cache cleanup (driven by zerogex-o
 	@echo ""
 	@echo "$(BLUE)Disk usage AFTER:$(NC)"; df -h / | tail -1
 	@echo "$(GREEN)✅ Disk/cache cleanup complete$(NC)"
-
-.PHONY: auth-backups-prune
-auth-backups-prune: ## Prune auth-DB backups >N days old, ALWAYS keeping newest ZEROGEX_AUTH_BACKUP_KEEP (Tier-1 safety floor)
-	@if [ ! -d "$(ZEROGEX_AUTH_BACKUP_DIR)" ]; then \
-		echo "$(YELLOW)→ auth-backups: $(ZEROGEX_AUTH_BACKUP_DIR) not present — skipping$(NC)"; \
-	else \
-		echo "$(YELLOW)→ auth-backups: prune >$(ZEROGEX_AUTH_BACKUP_DAYS)d, always keep newest $(ZEROGEX_AUTH_BACKUP_KEEP)...$(NC)"; \
-		total=$$(find "$(ZEROGEX_AUTH_BACKUP_DIR)" -maxdepth 1 -type f -name 'auth-*.db.gz*' 2>/dev/null | wc -l); \
-		if [ "$$total" -le "$(ZEROGEX_AUTH_BACKUP_KEEP)" ]; then \
-			echo "    $$total backup(s) <= keep floor $(ZEROGEX_AUTH_BACKUP_KEEP) — nothing pruned"; \
-		else \
-			ls -1t "$(ZEROGEX_AUTH_BACKUP_DIR)"/auth-*.db.gz* 2>/dev/null | tail -n +$$(( $(ZEROGEX_AUTH_BACKUP_KEEP) + 1 )) | \
-			while read -r f; do \
-				if [ -n "$$(find "$$f" -maxdepth 0 -mtime +$(ZEROGEX_AUTH_BACKUP_DAYS) -print 2>/dev/null)" ]; then \
-					rm -f "$$f" && echo "    pruned $$f"; \
-				fi; \
-			done; \
-			echo "    done (kept newest $(ZEROGEX_AUTH_BACKUP_KEEP); older-than-$(ZEROGEX_AUTH_BACKUP_DAYS)d beyond that removed)"; \
-		fi; \
-	fi
 
 # =============================================================================
 # Run Components (from run.py)
