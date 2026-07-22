@@ -916,6 +916,8 @@ help: ## Show this help message
 	@echo "  (service = ingestion | analytics | signals | api)"
 	@echo "  make logs-grep PATTERN=\"text\" - Search all service logs for pattern"
 	@echo "  make logs-clear                 - Clear journals + system/nginx/etc. logs (rotated + gzipped)"
+	@echo "  make disk-clean                 - Reclaim disk: apt/snap/npm caches + .mypy_cache/htmlcov/.next (runs nightly w/ logs-clear)"
+	@echo "  make auth-backups-prune         - Prune auth-DB backups >7d, always keeping newest ZEROGEX_AUTH_BACKUP_KEEP (default 48)"
 	@echo ""
 	@echo "$(GREEN)Run Components:$(NC)"
 	@echo "  make run-auth           - Test TradeStation authentication"
@@ -1461,6 +1463,107 @@ logs-clear-noconfirm: ## Non-interactive log cleanup (driven by zerogex-oa-logs-
 	@echo ""
 	@echo "$(BLUE)Disk usage AFTER:$(NC)"; df -h / | tail -1
 	@echo "$(GREEN)✅ Logs cleared$(NC)"
+
+# =============================================================================
+# Disk / package-cache cleanup (companion to logs-clear, same nightly unit)
+# =============================================================================
+# Reclaims disk from OS package caches, superseded snap revisions, and
+# regenerable build/tooling caches.  Driven nightly by the SAME
+# zerogex-oa-logs-clear.service that runs logs-clear-noconfirm (wired there as
+# extra ExecStart lines) so "the nightly cleanup" stays one unit.
+#
+# Everything in disk-clean is regenerable: apt lists come back on `apt update`,
+# caches rebuild on next use.  Each external tool is guarded with `command -v`
+# and `|| true`, so a backend-only host without npm/snap still runs the rest.
+#
+# Path defaults target the ubuntu operator account because the nightly service
+# runs as ROOT (its `sudo`s become no-ops, and a bare ~ would resolve to /root,
+# not /home/ubuntu).  The user-owned npm cache is cleaned AS the app user.
+# Override for non-standard layouts, e.g. `make disk-clean ZEROGEX_APP_USER=deploy`.
+ZEROGEX_APP_USER ?= ubuntu
+ZEROGEX_APP_HOME ?= /home/$(ZEROGEX_APP_USER)
+ZEROGEX_WEB_DIR  ?= $(ZEROGEX_APP_HOME)/zerogex-web
+# Auth-backup retention (see auth-backups-prune).  KEEP is a safety FLOOR: the
+# newest N archives are ALWAYS retained even if older than DAYS, so a stalled
+# `make backup-auth` (zerogex-web) can never let this prune reach zero copies
+# of the Tier-1 auth DB.  Set ZEROGEX_AUTH_BACKUP_KEEP=0 for the unguarded
+# mtime-only behavior (equivalent to a bare `find -mtime +N -delete`).
+ZEROGEX_AUTH_BACKUP_DIR  ?= $(ZEROGEX_APP_HOME)/zerogex-auth-backups
+ZEROGEX_AUTH_BACKUP_DAYS ?= 7
+ZEROGEX_AUTH_BACKUP_KEEP ?= 48
+
+.PHONY: disk-clean
+disk-clean: ## Interactive disk/cache cleanup (prompts; calls disk-clean-noconfirm)
+	@echo "$(RED)⚠️  Reclaims disk by clearing OS package caches + regenerable build caches.$(NC)"
+	@echo "$(YELLOW)Targets:$(NC)"
+	@echo "  • apt: lists, pkgcache.bin, srcpkgcache.bin, archives (clean), autoremove --purge -y"
+	@echo "  • snap: superseded (disabled) revisions + /var/lib/snapd/cache"
+	@echo "  • npm cache (as $(ZEROGEX_APP_USER)); .mypy_cache + htmlcov (this repo); $(ZEROGEX_WEB_DIR)/frontend/.next/cache"
+	@read -p "Type 'yes' to confirm: " confirm; \
+	if [ "$$confirm" != "yes" ]; then \
+		echo "$(RED)❌ Aborted$(NC)"; exit 0; \
+	fi; \
+	$(MAKE) disk-clean-noconfirm
+
+.PHONY: disk-clean-noconfirm
+disk-clean-noconfirm: ## Non-interactive disk/cache cleanup (driven by zerogex-oa-logs-clear.service)
+	@echo "$(BLUE)Disk usage BEFORE:$(NC)"; df -h / | tail -1; echo ""
+	@echo "$(YELLOW)→ APT: clearing lists + metadata caches + archives...$(NC)"
+	@if command -v apt-get >/dev/null 2>&1; then \
+		sudo rm -rf /var/lib/apt/lists/* || true; \
+		sudo rm -f /var/cache/apt/pkgcache.bin /var/cache/apt/srcpkgcache.bin || true; \
+		sudo apt-get clean || true; \
+		echo "$(YELLOW)→ APT: autoremove --purge (unused deps + old kernels)...$(NC)"; \
+		sudo DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y || true; \
+	else echo "    apt-get not present — skipping"; fi
+	@echo "$(YELLOW)→ snap: removing superseded (disabled) revisions + cache...$(NC)"
+	@if command -v snap >/dev/null 2>&1; then \
+		snap list --all 2>/dev/null | awk '/disabled/{print $$1, $$3}' | \
+		while read -r _name _rev; do \
+			[ -n "$$_name" ] && [ -n "$$_rev" ] || continue; \
+			echo "    removing $$_name (rev $$_rev)"; \
+			sudo snap remove "$$_name" --revision="$$_rev" || true; \
+		done; \
+		sudo rm -f /var/lib/snapd/cache/* || true; \
+	else echo "    snap not present — skipping"; fi
+	@echo "$(YELLOW)→ npm: cleaning cache as $(ZEROGEX_APP_USER)...$(NC)"
+	@if command -v npm >/dev/null 2>&1; then \
+		if [ "$$(id -un)" = "$(ZEROGEX_APP_USER)" ]; then \
+			npm cache clean --force >/dev/null 2>&1 || true; \
+		else \
+			sudo -u $(ZEROGEX_APP_USER) -H npm cache clean --force >/dev/null 2>&1 || true; \
+		fi; \
+		echo "    npm cache cleaned"; \
+	else echo "    npm not present — skipping"; fi
+	@echo "$(YELLOW)→ Build/tooling caches: .mypy_cache, htmlcov, .next/cache...$(NC)"
+	@rm -rf .mypy_cache htmlcov 2>/dev/null && echo "    cleared .mypy_cache + htmlcov (zerogex-oa)" || true
+	@if [ -d "$(ZEROGEX_WEB_DIR)/frontend/.next/cache" ]; then \
+		rm -rf "$(ZEROGEX_WEB_DIR)/frontend/.next/cache" && \
+		echo "    cleared $(ZEROGEX_WEB_DIR)/frontend/.next/cache" || true; \
+	fi
+	@echo ""
+	@echo "$(BLUE)Disk usage AFTER:$(NC)"; df -h / | tail -1
+	@echo "$(GREEN)✅ Disk/cache cleanup complete$(NC)"
+
+.PHONY: auth-backups-prune
+auth-backups-prune: ## Prune auth-DB backups >N days old, ALWAYS keeping newest ZEROGEX_AUTH_BACKUP_KEEP (Tier-1 safety floor)
+	@if [ ! -d "$(ZEROGEX_AUTH_BACKUP_DIR)" ]; then \
+		echo "$(YELLOW)→ auth-backups: $(ZEROGEX_AUTH_BACKUP_DIR) not present — skipping$(NC)"; \
+	else \
+		echo "$(YELLOW)→ auth-backups: prune >$(ZEROGEX_AUTH_BACKUP_DAYS)d, always keep newest $(ZEROGEX_AUTH_BACKUP_KEEP)...$(NC)"; \
+		total=$$(find "$(ZEROGEX_AUTH_BACKUP_DIR)" -maxdepth 1 -type f -name 'auth-*.db.gz*' 2>/dev/null | wc -l); \
+		if [ "$$total" -le "$(ZEROGEX_AUTH_BACKUP_KEEP)" ]; then \
+			echo "    $$total backup(s) <= keep floor $(ZEROGEX_AUTH_BACKUP_KEEP) — nothing pruned"; \
+		else \
+			ls -1t "$(ZEROGEX_AUTH_BACKUP_DIR)"/auth-*.db.gz* 2>/dev/null | tail -n +$$(( $(ZEROGEX_AUTH_BACKUP_KEEP) + 1 )) | \
+			while read -r f; do \
+				if [ -n "$$(find "$$f" -maxdepth 0 -mtime +$(ZEROGEX_AUTH_BACKUP_DAYS) -print 2>/dev/null)" ]; then \
+					rm -f "$$f" && echo "    pruned $$f"; \
+				fi; \
+			done; \
+			echo "    done (kept newest $(ZEROGEX_AUTH_BACKUP_KEEP); older-than-$(ZEROGEX_AUTH_BACKUP_DAYS)d beyond that removed)"; \
+		fi; \
+	fi
 
 # =============================================================================
 # Run Components (from run.py)

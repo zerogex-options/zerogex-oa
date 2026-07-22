@@ -117,7 +117,13 @@ The deployment process runs these steps in order:
 - Installs nightly maintenance timers (oneshot units triggered by `.timer`):
   - `zerogex-oa-db-maintain` - prune + vacuum, daily 02:00 ET
   - `zerogex-oa-db-vacuum-full` - VACUUM FULL + REINDEX, Sundays 02:30 ET
-  - `zerogex-oa-logs-clear` - log cleanup, daily 03:30 ET
+  - `zerogex-oa-logs-clear` - nightly cleanup, daily 03:30 ET: logs
+    (`make logs-clear`), then disk/package caches — apt lists+archives,
+    `apt autoremove --purge`, superseded snap revisions, npm + build
+    caches (`make disk-clean`), then auth-DB backup retention
+    (`make auth-backups-prune`; ages out backups >7 d but always keeps
+    the newest `ZEROGEX_AUTH_BACKUP_KEEP`, default 48, so a stalled
+    backup job can't zero out the only local copy of account data)
   - `zerogex-oa-normalizer-refresh` - per-symbol normalizer cache, daily 04:30 ET
     (validates itself via `ExecStartPost=` so the unit fails atomically
     if the refresh process exits 0 without producing fresh rows)
