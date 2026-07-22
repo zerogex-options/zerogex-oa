@@ -165,37 +165,64 @@ Applies **only to positions in profit**. The existing stop-loss stack (§6)
 remains in force throughout — the ladder governs how *profits* are harvested; it
 does not loosen downside control.
 
+### Level geometry
+
+Define **R = structural_target − entry_spot** — the bot's published
+`target_price` (call wall, max pain, VWAP, …) minus the spot at entry. Every
+ladder level is a fixed fraction of R, **frozen at entry** (a later config
+change never moves an open position's levels). Bullish shown; bearish mirrors
+with the sign flipped.
+
+| Symbol | Level | Default | Role |
+| --- | --- | --- | --- |
+| **S1** | original stop stack | — | whole-trade stop (structural stop + 25% premium + wall-break), Stage 0 |
+| **S2** | `entry + 0.75·R` | 0.75 | runner floor stop, armed once T1 fills |
+| **T1** | `entry + 0.90·R` | 0.90 | take **50%** — fires *before* the structural level |
+| **T2** | `T1 + 1.0·(T1 − entry)` = `entry + 1.8·R` | ext. mult 1.0 | take **50% of the remainder** (25% of original) |
+
+Worked geometry — bullish, `entry_spot = 749`, `bull_momentum_climber` call wall
+`= 750`, so **R = 1.00**:
+
+```
+entry 749.00 (0R) ── S2 749.75 (0.75R) ── T1 749.90 (0.90R) ── [wall 750.00, 1R] ── T2 750.80 (1.8R)
+                       └ runner floor        └ take 50%            (reference only)      └ take 25%
+```
+
 ```mermaid
 stateDiagram-v2
     direction LR
     [*] --> Stage0_Full: open (100%)
-    Stage0_Full --> Closed: premium / structural stop / wall_break / time_stop
-    Stage0_Full --> Stage1_Runner: spot reaches T1 — sell 50%
-    Stage1_Runner --> Closed: trailing give-back / premium floor / time_stop
-    Stage1_Runner --> Stage2_Runner: spot reaches T2 — sell 50% of remainder (25% of original)
-    Stage2_Runner --> Closed: spot back to T1 / time_stop / 15:55 cap
+    Stage0_Full --> Closed: S1 — premium / structural stop / wall_break / time_stop
+    Stage0_Full --> Stage1_Runner: spot reaches T1 (0.90R) — sell 50%
+    Stage1_Runner --> Closed: S2 floor / trailing give-back / time_stop
+    Stage1_Runner --> Stage2_Runner: spot reaches T2 (1.8R) — sell 50% of remainder (25% of original)
+    Stage2_Runner --> Closed: same runner stop (S2 + trailing) / time_stop / 15:55 cap
     Closed --> [*]: ONE consolidated tw_trades row (size-weighted exit)
 ```
 
-**Stage 0 — full position (pre-T1).** Governed exactly as today: structural
-target = **T1**, structural stop, premium stop, wall-break, time-stop. If any
-fires here, the whole position closes as it does now.
+**Stage 0 — full position (pre-T1).** Governed exactly as today: target = **T1
+(0.90·R)**, plus the S1 stack — structural stop, premium stop, wall-break,
+time-stop. If any fires here, the whole position closes as it does now.
 
-**T1 hit (spot reaches T1): take 50%.** Sell `floor(0.5 × Q)` contracts. Enter
-Stage 1. The taken profit is *booked* (§7) but no trade row is written yet.
+**T1 hit (spot reaches 0.90·R): take 50%.** Sell `floor(0.5 × Q)` contracts.
+Enter Stage 1. The taken profit is *booked* (§7) but no trade row is written yet.
 
 **Stage 1 — runner (the remaining ~50%).**
-- **Target = T2**, a measured extension beyond T1 (§5a).
-- **Trailing stop = premium give-back** from the runner's high-water mark (§5b).
+- **Target = T2** (1.8·R), the measured extension off the new T1 (§5b).
+- **Stop = S2 (0.75·R) floor, ratcheting tighter** via the premium give-back
+  from the runner's high-water mark (§5c–d). Effective stop = the *higher* of S2
+  and the trailing level, so it can only tighten as spot extends — never looser
+  than S2. Because S2 sits above entry, even a stopped-out runner books a small
+  gain.
 - The premium hard-floor and time-stop remain as backstops.
 
-**T2 hit (spot reaches T2): take 50% of the remainder (25% of original).**
+**T2 hit (spot reaches 1.8·R): take 50% of the remainder (25% of original).**
 Enter Stage 2.
 
 **Stage 2 — final runner (the last ~25%).**
-- **Stop = original T1** (spot level): if spot falls back to T1, exit. This
-  guarantees the final tranche cannot give back below the T1-level move.
-- **Ride** until the time-stop / 15:55 ET cap.
+- **Keeps the same runner stop** (S2 floor + trailing give-back) that governed
+  Stage 1 — it simply rides until the time-stop / 15:55 ET cap or that runner
+  stop is hit.
 
 **Terminal.** When the last tranche exits by any reason, write **one**
 consolidated `tw_trades` row (§7).
@@ -203,7 +230,7 @@ consolidated `tw_trades` row (§7).
 ### Worked example (why the record stays honest)
 
 Entry premium `1.00`, `Q = 4` contracts. T1 fills 2 @ `1.60`; T2 fills 1 @
-`2.00`; the final runner stops back at T1, filling 1 @ `1.40`.
+`2.00`; the final runner stops out on the trailing give-back, filling 1 @ `1.40`.
 
 - Size-weighted exit = `(2×1.60 + 1×2.00 + 1×1.40) / 4 = 6.60 / 4 = 1.65`
 - Consolidated `realized_pnl = (1.65 − 1.00) × 4 × 100 = $260`
@@ -216,28 +243,48 @@ One `tw_trades` row: `quantity=4`, `exit_price=1.65`, `realized_pnl=260`,
 
 ## 5. Locked design decisions & rationale
 
-**(a) Where T2 sits — measured extension.** `T2 = T1 + m × (T1 − entry_spot)`
-in the favorable direction, default `m = 1.0` (i.e. a 2R move from entry, T1
-being 1R). Chosen over "next structural level" because **not every bot has a
-clean second level** (many target max-pain / VWAP with nothing obvious beyond),
-whereas a measured extension is universal and backtestable with one knob. This
-requires storing **`entry_spot`**, which the position does not persist today
-(only `entry_price`, the option premium). `m` is configurable per-bot.
+**(a) T1 fires *before* the structural level — `entry + 0.90·R`.** The first
+(largest) tranche takes profit at 90% of the way to the bot's structural target,
+not at it. Walls / max-pain / VWAP act as **magnets and resistance**: price
+routinely stalls or reverses in the last tick before touching them, so an exit
+pinned exactly at the level fills far less often. Taking 0.90·R protects the
+majority of the position with a materially higher fill rate — "leave the last
+eighth for the next guy." Fraction is per-bot configurable (`t1_trigger_frac`,
+default 0.90). Requires storing **`entry_spot`**, which the position does not
+persist today (only `entry_price`, the option premium).
 
-**(b) Trailing stop — premium give-back, not spot trail.** The Stage-1 runner
-exits when its option mark gives back `≥ runner_trail_giveback_pct` (default
-30%) from its **high-water mark**. Premium-based rather than spot-based because
-on 0DTE **theta** erodes the mark even when spot holds; a spot trail ignores
-that decay, a premium give-back captures it directly.
+**(b) T2 — measured extension off the new T1.** `T2 = T1 + m·(T1 − entry_spot)`,
+default `m = 1.0`, so with T1 at 0.90·R the extension lands at **1.8·R**. Chosen
+over "next structural level" because **not every bot has a clean second level**
+(many target max-pain / VWAP with nothing obvious beyond); a measured extension
+is universal and backtestable with one knob. `m` is per-bot configurable. *(If a
+future need calls for anchoring T2 to the structural target instead of the new
+T1, that's a one-line change to the reference term.)*
 
-**(c) Ride-to-EOD applies on all tiers, 0DTE included.** Not made
-tier-dependent. The runner is already protected by the trailing give-back
-(Stage 1) and the T1-lock (Stage 2), and the reconciler's 15:55 ET hard cap
-bounds the hold. Keeping one uniform rule is simpler and the protections make it
-safe. **Caveat:** per the user's ladder, Stage 2's only price stop is at
-original T1; a big T2 winner can still bleed some gains to theta before the T1
-stop or 15:55 cap. This is an accepted property of the specified strategy — see
-§10 for the optional Stage-2 trailing knob.
+**(c) S2 — the runner floor at `entry + 0.75·R`, with wiggle room.** Once T1
+fills, the remaining ~50% gets a hard floor stop **below** T1 (0.75·R vs T1's
+0.90·R). Deliberately *looser* than a stop parked at T1 or at the structural
+level, both of which get wicked out by ordinary noise right after the target is
+tagged. S2 sits above entry, so a stopped runner still books a small gain
+(+0.75·R of spot). Per-bot configurable (`s2_stop_frac`, default 0.75). Named
+S2 to distinguish it from **S1**, the original whole-trade stop that still
+governs Stage 0.
+
+**(d) Trailing give-back ratchets on top of S2 — premium, not spot.** The runner
+also carries a premium give-back trail: it exits if the option mark falls
+`≥ runner_trail_giveback_pct` (default 30%) from its **high-water mark**. The
+effective runner stop is the *tighter* of S2 and the trailing level, so S2 is
+the initial floor and the trail takes over as spot extends past T2. Premium-based
+rather than spot-based because on 0DTE **theta** erodes the mark even when spot
+holds — a spot trail misses that decay; a premium give-back captures it.
+
+**(e) Ride-to-EOD, uniform across tiers, final 25% keeps the runner stop.** Not
+tier-dependent. After T2, the last ~25% carries the *same* protection as
+Stage 1 (S2 floor + trailing give-back) and rides to the 15:55 ET cap. Because
+the trailing give-back is always active, a big T2 winner can't quietly bleed to
+theta — it trails out once it surrenders 30% of its peak. This resolves the
+earlier §10 concern (a final tranche stopped only at a distant fixed level)
+without pinning a hard stop that noise would trip.
 
 **Tranche fractions.** 50% at T1, then 50% of the remainder at T2 (25% of
 original), leaving 25% to ride — configurable (`t1_take_fraction`,
@@ -273,15 +320,15 @@ reconciler closes the position with `reason="premium_stop"`
 Note the interaction with the runner: the premium stop is measured from
 **entry**. Once a trade is a large winner, the `(1 − 0.25)×entry` floor sits far
 below the current mark and no longer meaningfully protects *unrealized gains* —
-that job belongs to the trailing give-back (Stage 1) and the T1-lock (Stage 2).
-The premium stop is the Stage-0 / catastrophic floor.
+that job belongs to the runner stop (S2 floor + trailing give-back, §4). The
+premium stop is the Stage-0 / catastrophic floor.
 
 ### 6.2 Structural spot stop
 
 Per-bot `stop_price` at a spot invalidation level (e.g. gamma flip). Some bots
 set `None` and rely on 6.1 + 6.3. Once the ladder passes T1, the runner's
-downside is governed by the trailing give-back / T1-lock rather than the
-original structural stop (which sat below entry).
+downside is governed by the S2 floor (0.75·R) and the trailing give-back rather
+than the original structural stop (which sat below entry).
 
 ### 6.3 Wall-break / wall-shift stop
 
@@ -327,7 +374,7 @@ When the last tranche exits, `close_position` writes a single `tw_trades` row:
 - `pnl_percent = exit_price / entry_price − 1`.
 - `outcome = sign(realized_pnl)`.
 - `close_reason =` the terminal reason of the **final** tranche (e.g.
-  `runner_time_stop`, `runner_trail_stop`, `runner_t1_lock`), or the ordinary
+  `runner_trail_stop`, `runner_s2_stop`, `runner_time_stop`), or the ordinary
   Stage-0 reason if the position never scaled.
 - `components_at_exit =` `{ exit_reason, weighted_exit, scale_stage_reached,
   tranches: [...] }` — the full per-tranche breakdown behind the consolidated
@@ -369,21 +416,28 @@ Applied as idempotent `ALTER TABLE tw_positions ADD COLUMN IF NOT EXISTS …` in
 `schema.sql` (the repo's migration convention — see the `option_chains` blocks
 around `schema.sql:145-157`; there is no separate migrations directory).
 
+The three ladder prices are **resolved at entry and stored**, not recomputed
+each tick, so an open position keeps the geometry it was opened with even if the
+fraction knobs change mid-session.
+
 | Column | Type | Purpose |
 | --- | --- | --- |
-| `entry_spot` | `NUMERIC(12,6)` | Underlying spot at entry — for T2 measured extension & audit |
+| `entry_spot` | `NUMERIC(12,6)` | Underlying spot at entry — defines `R` for all ladder levels & audit |
 | `quantity_initial` | `INTEGER` | Original contract count — tranche sizing & consolidated `quantity` |
-| `target2_price` | `NUMERIC(12,6)` | Computed T2 spot level |
+| `t1_trigger_price` | `NUMERIC(12,6)` | Resolved T1 take-50% level (`entry + 0.90·R`) |
+| `s2_stop_price` | `NUMERIC(12,6)` | Resolved S2 runner floor (`entry + 0.75·R`) |
+| `target2_price` | `NUMERIC(12,6)` | Resolved T2 take-25% level (`entry + 1.8·R`) |
 | `scale_stage` | `SMALLINT NOT NULL DEFAULT 0` | 0 = full, 1 = post-T1, 2 = post-T2 |
 | `high_water_mark` | `NUMERIC(12,6)` | Peak mark for the premium trailing give-back |
 | `realized_pnl_booked` | `NUMERIC(14,4) NOT NULL DEFAULT 0` | Accumulated realized from partial closes |
 | `exit_tranches` | `JSONB NOT NULL DEFAULT '[]'` | Per-tranche audit breakdown |
 
-`target_price` continues to hold **T1** throughout (the Stage-2 stop reads it).
-`quantity_open` continues to hold the *currently open* count. Existing rows
-migrate cleanly (all new columns nullable/defaulted); `quantity_initial` /
-`entry_spot` backfill from `quantity_open` / a null-safe default for any
-in-flight position at deploy.
+`target_price` continues to hold the **structural target** (the `R` endpoint —
+call wall, max pain, …), unchanged and still set by the bot; the ladder derives
+T1/S2/T2 from it plus `entry_spot`. `quantity_open` continues to hold the
+*currently open* count. Existing rows migrate cleanly (all new columns
+nullable/defaulted); `quantity_initial` / `entry_spot` backfill from
+`quantity_open` / a null-safe default for any in-flight position at deploy.
 
 `tw_trades` needs **no schema change** — `components_at_exit` (JSONB) already
 carries the tranche breakdown.
@@ -397,6 +451,8 @@ All read via `config.py` and overridable per-bot through `params[...]`, mirrorin
 | --- | --- | --- |
 | `TRADEWORKZ_SCALE_OUT_ENABLED` | `true` | Master switch; `false` = today's single-target exit |
 | `TRADEWORKZ_MIN_SCALE_CONTRACTS` | `4` | Below this initial size, don't scale |
+| `TRADEWORKZ_T1_TRIGGER_FRACTION` | `0.90` | T1 take-50% level = `entry + this·R` (fires before the structural target) |
+| `TRADEWORKZ_S2_STOP_FRACTION` | `0.75` | S2 runner floor = `entry + this·R` |
 | `TRADEWORKZ_T1_TAKE_FRACTION` | `0.5` | Fraction of original taken at T1 |
 | `TRADEWORKZ_T2_TAKE_FRACTION` | `0.5` | Fraction of the *remainder* taken at T2 |
 | `TRADEWORKZ_T2_EXTENSION_MULT` | `1.0` | `T2 = T1 + m·(T1 − entry_spot)` |
@@ -416,11 +472,12 @@ Ordered so each step is independently testable.
 2. **Config** — add the §8.2 knobs; add per-bot resolvers on `BaseBot`
    alongside `_max_premium_loss_pct`.
 3. **Ladder decision** — extend `BaseBot.exit_criteria` (or a new
-   `_scale_exit_decision`) to: compute/persist `entry_spot`, `target2_price`,
-   `quantity_initial`, `high_water_mark`; emit `should_cut` + `cut_fraction`
-   for T1/T2; advance `scale_stage`; apply the Stage-1 trailing give-back and
-   the Stage-2 T1-lock. Gate on `SCALE_OUT_ENABLED` and the min-contract floor —
-   when off, behaviour is byte-for-byte today's.
+   `_scale_exit_decision`) to: compute/persist `entry_spot`, `t1_trigger_price`,
+   `s2_stop_price`, `target2_price`, `quantity_initial`, `high_water_mark`; emit
+   `should_cut` + `cut_fraction` at T1/T2; advance `scale_stage`; apply the
+   runner stop (S2 floor + trailing give-back) across Stages 1 and 2. Gate on
+   `SCALE_OUT_ENABLED` and the min-contract floor — when off, behaviour is
+   byte-for-byte today's.
 4. **Wire `should_cut`** — the engine loop (`engine.py:222-225`) handles
    `decision.should_cut` → `partial_close_position`, in addition to
    `should_close`. This activates the dormant `ExitDecision` fields.
@@ -434,8 +491,9 @@ Ordered so each step is independently testable.
    rows from Invariant A's exact arithmetic).
 9. **Tests** — new cases: stage transitions; the VWAP-consolidation identity
    (Invariant A holds after a 3-tranche close); single capital credit (B);
-   single ML sample; min-contract floor skip; trailing give-back; Stage-2
-   T1-lock; integer rounding; interaction with `min_hold` and the 15:55 cap.
+   single ML sample; min-contract floor skip; S2 floor arms at T1; trailing
+   give-back ratchets above S2; T1 fires at 0.90·R (not the structural level);
+   integer rounding; interaction with `min_hold` and the 15:55 cap.
 10. **Invariant check** — run `make tradeworkz-check`; add a scale-specific
     assertion that `Σ exit_tranches.realized == realized_pnl` for scaled rows.
 
@@ -443,12 +501,16 @@ Ordered so each step is independently testable.
 
 ## 10. Risks & open questions
 
-- **0DTE theta on the Stage-2 runner.** Per the locked spec, Stage 2's only
-  price stop is at original T1. A trade that reaches T2 can still surrender part
-  of that gain to decay before the T1 stop or the 15:55 cap. *Optional mitigation
-  (not default):* a `runner_trail_in_stage2` flag that keeps the premium
-  give-back active on the final tranche too. Left off to honour the specified
-  ladder; easy to enable per-bot if backtests favour it.
+- **0DTE theta on the final runner — mitigated by design.** The premium
+  give-back trail stays active on the final ~25% (§4 Stage 2), so a T2 winner
+  can't quietly bleed to theta — it trails out after surrendering 30% of its
+  peak mark. The residual risk is only the give-back band itself (the runner can
+  give back up to `runner_trail_giveback_pct` before exiting); tighten that knob
+  per-bot if backtests show the band is too wide on 0DTE.
+- **S2 vs. trailing interaction.** The runner stop is `max(S2, trailing level)`.
+  Very early in Stage 1 (before the mark makes a new high) the trailing level can
+  sit below S2, so S2 is what protects; confirm the `max()` is applied every tick
+  so the stop only ever ratchets up, never loosens.
 - **Deferred capital credit.** §7.3 — intraday sleeve NAV and the daily-kill
   basis see scaled profit only at final close. Acceptable for a same-day-close
   fleet; "Design 1b" is the escape hatch if not.
