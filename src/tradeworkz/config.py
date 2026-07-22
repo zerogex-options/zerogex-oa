@@ -73,7 +73,7 @@ EXECUTION_SLIPPAGE_PCT: float = _getenv_float(
 # reason='premium_stop'. Set to 0 to disable. Per-bot override via
 # params['max_premium_loss_pct'] takes precedence over this default.
 MAX_PREMIUM_LOSS_PCT: float = _getenv_float(
-    "TRADEWORKZ_MAX_PREMIUM_LOSS_PCT", 0.40, min=0.0, max=1.0
+    "TRADEWORKZ_MAX_PREMIUM_LOSS_PCT", 0.25, min=0.0, max=1.0
 )
 
 # ---------------------------------------------------------------------------
