@@ -115,3 +115,21 @@ class OpenPosition:
     wall_ref_side: Optional[str]
     entry_conviction: Optional[float]
     components_at_entry: Dict[str, Any]
+    # -- Scale-out ladder state (see docs/design/tradeworkz-exit-strategy.md) --
+    # All optional/defaulted: an unarmed position (ladder disabled,
+    # non-directional, no target, or below the min-contract floor) leaves the
+    # price fields None and behaves exactly as the pre-ladder single-target
+    # exit. ``entry_spot`` anchors R = target_price - entry_spot; the three
+    # ladder prices are frozen at entry. ``quantity_initial`` is the original
+    # contract count (``quantity_open`` shrinks as tranches are taken).
+    # ``realized_pnl_booked`` / ``exit_tranches`` accumulate the partial takes
+    # that the final consolidated close folds into one tw_trades row.
+    entry_spot: Optional[float] = None
+    quantity_initial: Optional[int] = None
+    t1_trigger_price: Optional[float] = None
+    s2_stop_price: Optional[float] = None
+    target2_price: Optional[float] = None
+    scale_stage: int = 0
+    high_water_mark: Optional[float] = None
+    realized_pnl_booked: float = 0.0
+    exit_tranches: List[Dict[str, Any]] = field(default_factory=list)

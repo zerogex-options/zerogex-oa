@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 from src.tradeworkz import config as tw_config
 from src.tradeworkz import ml as ml_mod
 from src.tradeworkz import notifications
-from src.tradeworkz.models import BotCapital, OpenPosition, TradeSignal
+from src.tradeworkz.models import BotCapital, ExitDecision, OpenPosition, TradeSignal
 from src.tradeworkz.pricing import spread_price
 from src.tradeworkz.sizing import compute_contracts
 
@@ -142,7 +142,10 @@ def load_open_positions(conn: Any, bot_id: str) -> List[OpenPosition]:
                legs, entry_price, current_price, quantity_open,
                unrealized_pnl, stop_price, target_price, time_stop_at,
                min_hold_until, wall_ref_price, wall_ref_side,
-               entry_conviction, components_at_entry
+               entry_conviction, components_at_entry,
+               entry_spot, quantity_initial, t1_trigger_price, s2_stop_price,
+               target2_price, scale_stage, high_water_mark,
+               realized_pnl_booked, exit_tranches
         FROM tw_positions WHERE bot_id = %s
         """,
         (bot_id,),
@@ -155,6 +158,9 @@ def load_open_positions(conn: Any, bot_id: str) -> List[OpenPosition]:
         comp = r[18] or {}
         if isinstance(comp, str):
             comp = json.loads(comp)
+        tranches = r[27] or []
+        if isinstance(tranches, str):
+            tranches = json.loads(tranches)
         result.append(
             OpenPosition(
                 id=r[0],
@@ -176,6 +182,15 @@ def load_open_positions(conn: Any, bot_id: str) -> List[OpenPosition]:
                 wall_ref_side=r[16],
                 entry_conviction=float(r[17]) if r[17] is not None else None,
                 components_at_entry=dict(comp),
+                entry_spot=float(r[19]) if r[19] is not None else None,
+                quantity_initial=int(r[20]) if r[20] is not None else None,
+                t1_trigger_price=float(r[21]) if r[21] is not None else None,
+                s2_stop_price=float(r[22]) if r[22] is not None else None,
+                target2_price=float(r[23]) if r[23] is not None else None,
+                scale_stage=int(r[24] or 0),
+                high_water_mark=float(r[25]) if r[25] is not None else None,
+                realized_pnl_booked=float(r[26] or 0.0),
+                exit_tranches=list(tranches),
             )
         )
     return result
@@ -188,11 +203,18 @@ def open_position(
     size_multiplier: float,
     wall_strength: Optional[float] = None,
     daily_realized_pnl: float = 0.0,
+    entry_spot: Optional[float] = None,
+    scale_cfg: Optional[Dict[str, Any]] = None,
 ) -> Optional[int]:
     """Insert one row into ``tw_positions``. Returns the new position id.
 
     Skips if there is already an open position for the same bot / underlying
     within :data:`tw_config.ENTRY_DEDUPE_WINDOW_SECONDS`.
+
+    ``entry_spot`` (the underlying spot at fill) and ``scale_cfg`` (the bot's
+    resolved scale-out knobs) arm the scale-out ladder — see
+    docs/design/tradeworkz-exit-strategy.md. When omitted, or when the ladder
+    can't be armed, the position falls back to the single-target exit.
     """
     if not _acquire_lock(conn, signal.bot_id):
         logger.debug("skipping open: could not acquire lock for %s", signal.bot_id)
@@ -257,6 +279,30 @@ def open_position(
             "origin": "live",
         }
     )
+    # Arm the scale-out ladder (docs/design/tradeworkz-exit-strategy.md).
+    # entry_spot / quantity_initial / high_water_mark are always recorded; the
+    # three frozen price levels are populated only when the ladder is armable
+    # (enabled, directional, has a target, size >= the min-contract floor, and R
+    # has the profitable sign). NULL price levels => the exit path uses today's
+    # single-target behavior. scale_stage / realized_pnl_booked / exit_tranches
+    # take their column defaults (0 / 0 / []).
+    from src.tradeworkz.bots.base import compute_ladder_levels
+
+    cfg = scale_cfg or {}
+    levels: Optional[Dict[str, float]] = None
+    if cfg.get("enabled") and contracts >= int(cfg.get("min_contracts", 4)):
+        levels = compute_ladder_levels(
+            entry_spot,
+            signal.target_price,
+            signal.direction,
+            float(cfg.get("t1_frac", 0.90)),
+            float(cfg.get("s2_frac", 0.75)),
+            float(cfg.get("t2_frac", 1.5)),
+        )
+    t1_price = levels["t1_trigger_price"] if levels else None
+    s2_price = levels["s2_stop_price"] if levels else None
+    t2_price = levels["target2_price"] if levels else None
+
     cur.execute(
         """
         INSERT INTO tw_positions (
@@ -264,10 +310,13 @@ def open_position(
             strategy_type, legs, entry_price, current_price, quantity_open,
             unrealized_pnl, stop_price, target_price, time_stop_at,
             min_hold_until, wall_ref_price, wall_ref_side, entry_conviction,
-            components_at_entry
+            components_at_entry,
+            entry_spot, quantity_initial, t1_trigger_price, s2_stop_price,
+            target2_price, high_water_mark
         ) VALUES (
             %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, 0,
-            %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+            %s, %s, %s, %s, %s, %s, %s, %s::jsonb,
+            %s, %s, %s, %s, %s, %s
         ) RETURNING id
         """,
         (
@@ -289,6 +338,12 @@ def open_position(
             signal.wall_ref_side,
             signal.conviction,
             json.dumps(payload),
+            entry_spot,
+            contracts,
+            t1_price,
+            s2_price,
+            t2_price,
+            entry_price,
         ),
     )
     row = cur.fetchone()
@@ -336,18 +391,117 @@ def mark_position(conn: Any, pos: OpenPosition) -> Optional[float]:
     if mark is None:
         return None
     upnl = (mark - pos.entry_price) * pos.quantity_open * 100.0
+    # Track the mark's high-water mark for the runner's premium give-back trail
+    # (docs/design/tradeworkz-exit-strategy.md). Tracked from entry; the trail
+    # only consults it once the ladder is in Stage >= 1. GREATEST keeps it
+    # monotone even if a NULL slipped in on a pre-ladder row.
+    new_hwm = mark if pos.high_water_mark is None else max(pos.high_water_mark, mark)
     cur = conn.cursor()
     cur.execute(
         """
         UPDATE tw_positions
-        SET current_price = %s, unrealized_pnl = %s, updated_at = NOW()
+        SET current_price = %s, unrealized_pnl = %s,
+            high_water_mark = GREATEST(COALESCE(high_water_mark, %s), %s),
+            updated_at = NOW()
         WHERE id = %s
         """,
-        (mark, upnl, pos.id),
+        (mark, upnl, mark, mark, pos.id),
     )
     pos.current_price = mark
     pos.unrealized_pnl = upnl
+    pos.high_water_mark = new_hwm
     return mark
+
+
+def partial_close_position(
+    conn: Any, pos: OpenPosition, decision: ExitDecision
+) -> Optional[int]:
+    """Book a scale-out tranche onto ``pos`` WITHOUT writing a trade row.
+
+    Sells ``cut_qty`` contracts at the current close mark, accumulates the
+    realized P&L onto ``realized_pnl_booked`` and the tranche detail onto
+    ``exit_tranches``, shrinks ``quantity_open``, advances ``scale_stage``,
+    re-marks the remaining runner, and emits a ``scale`` audit event. It
+    deliberately does NOT touch ``tw_bot_capital`` or ``tw_trades`` — the final
+    :func:`close_position` folds every tranche into one size-weighted
+    consolidated trade, so Invariants A/B hold at every instant
+    (docs/design/tradeworkz-exit-strategy.md §7).
+
+    ``decision.cut_fraction`` is applied to the ORIGINAL size at T1
+    (scale_stage 0 → 1) and to the CURRENT remainder at T2 (1 → 2); at least one
+    runner contract is always left. Returns the position id, or ``None`` if the
+    tranche can't be priced or sized.
+    """
+    frac = max(0.0, min(1.0, float(decision.cut_fraction or 0.0)))
+    if frac <= 0.0 or pos.quantity_open <= 1:
+        return None
+    fill = spread_price(conn, pos.legs, action="close")
+    if fill is None:
+        return None
+
+    to_stage = int(pos.scale_stage or 0) + 1
+    # T1 takes a fraction of the ORIGINAL size; T2 a fraction of the remainder.
+    base_qty = (pos.quantity_initial or pos.quantity_open) if to_stage == 1 else pos.quantity_open
+    cut_qty = int(frac * base_qty)  # floor for positive values
+    cut_qty = max(1, min(cut_qty, pos.quantity_open - 1))  # always leave a runner
+
+    tranche_realized = (fill - pos.entry_price) * cut_qty * 100.0
+    remaining = pos.quantity_open - cut_qty
+    booked = float(pos.realized_pnl_booked or 0.0) + tranche_realized
+    upnl = (fill - pos.entry_price) * remaining * 100.0
+    tranche = {
+        "stage": to_stage,
+        "reason": decision.reason or f"scale_t{to_stage}",
+        "qty": cut_qty,
+        "price": round(float(fill), 6),
+        "realized": round(float(tranche_realized), 4),
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    tranches = list(pos.exit_tranches or [])
+    tranches.append(tranche)
+
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE tw_positions
+        SET quantity_open = %s,
+            scale_stage = %s,
+            realized_pnl_booked = %s,
+            exit_tranches = %s::jsonb,
+            current_price = %s,
+            unrealized_pnl = %s,
+            updated_at = NOW()
+        WHERE id = %s
+        """,
+        (remaining, to_stage, booked, json.dumps(tranches), fill, upnl, pos.id),
+    )
+    # Keep the in-memory position consistent for any later read this tick.
+    pos.quantity_open = remaining
+    pos.scale_stage = to_stage
+    pos.realized_pnl_booked = booked
+    pos.exit_tranches = tranches
+    pos.current_price = fill
+    pos.unrealized_pnl = upnl
+
+    notifications.fanout_event(
+        conn,
+        bot_id=pos.bot_id,
+        event_type="scale",
+        payload={
+            "underlying": pos.underlying,
+            "direction": pos.direction,
+            "reason": tranche["reason"],
+            "stage": to_stage,
+            "contracts": cut_qty,
+            "remaining": remaining,
+            "entry_price": pos.entry_price,
+            "exit_price": float(fill),
+            "realized_pnl": float(tranche_realized),
+            "booked_realized_pnl": float(booked),
+        },
+        position_id=pos.id,
+    )
+    return pos.id
 
 
 def close_position(conn: Any, pos: OpenPosition, reason: str) -> Optional[int]:
@@ -356,15 +510,36 @@ def close_position(conn: Any, pos: OpenPosition, reason: str) -> Optional[int]:
 
     Returns the ``tw_trades`` row id.
     """
-    exit_price = spread_price(conn, pos.legs, action="close")
-    if exit_price is None:
+    final_fill = spread_price(conn, pos.legs, action="close")
+    if final_fill is None:
         return None
-    # Long debit position — P&L is (exit − entry) × qty × 100 regardless
-    # of directional thesis. See mark_position for the full rationale on
-    # why the bearish negation was wrong.
-    signed_pnl_per_contract = (exit_price - pos.entry_price) * 100.0
-    realized = signed_pnl_per_contract * pos.quantity_open
-    pnl_pct = (exit_price / pos.entry_price - 1.0) if pos.entry_price > 0 else 0.0
+    # Consolidated close. Fold every scale-out tranche already booked on this
+    # position (realized_pnl_booked / exit_tranches) together with the final
+    # tranche into ONE immutable trade row. `quantity` = the ORIGINAL size;
+    # `exit_price` = the size-weighted average fill, derived from the total
+    # realized so that Invariant A — realized_pnl == (exit − entry) × qty × 100
+    # — holds by construction (docs/design/tradeworkz-exit-strategy.md §7). For
+    # an unarmed / never-scaled position (quantity_initial NULL or ==
+    # quantity_open, no booked realized) this reduces EXACTLY to the pre-ladder
+    # single close: booked=0, total_qty=quantity_open, exit_price=final_fill.
+    #
+    # Long debit position — per-contract P&L is (exit − entry) × 100 regardless
+    # of directional thesis (see mark_position for why the bearish negation was
+    # wrong); it is signed by direction only through where the spot levels sit.
+    remaining_qty = pos.quantity_open
+    final_realized = (final_fill - pos.entry_price) * remaining_qty * 100.0
+    booked = float(pos.realized_pnl_booked or 0.0)
+    realized = booked + final_realized
+    total_qty = int(pos.quantity_initial) if pos.quantity_initial else remaining_qty
+    if total_qty <= 0:
+        total_qty = remaining_qty
+    if pos.entry_price > 0 and total_qty > 0:
+        # Size-weighted exit that reproduces `realized` exactly for this qty.
+        exit_price = pos.entry_price + realized / (total_qty * 100.0)
+        pnl_pct = exit_price / pos.entry_price - 1.0
+    else:
+        exit_price = final_fill
+        pnl_pct = 0.0
 
     if realized > 0:
         outcome = "win"
@@ -373,6 +548,26 @@ def close_position(conn: Any, pos: OpenPosition, reason: str) -> Optional[int]:
     else:
         outcome = "scratch"
     now = datetime.now(timezone.utc)
+
+    # Full tranche ledger for the audit trail — every partial take plus this
+    # final tranche, behind the one consolidated number.
+    final_tranche = {
+        "stage": int(pos.scale_stage or 0),
+        "reason": reason,
+        "qty": remaining_qty,
+        "price": round(float(final_fill), 6),
+        "realized": round(float(final_realized), 4),
+        "final": True,
+    }
+    all_tranches = list(pos.exit_tranches or []) + [final_tranche]
+    components_at_exit = {
+        "exit_reason": reason,
+        "weighted_exit": round(float(exit_price), 6),
+        "final_fill": round(float(final_fill), 6),
+        "scale_stage": int(pos.scale_stage or 0),
+        "booked_realized_pnl": round(booked, 4),
+        "tranches": all_tranches,
+    }
 
     cur = conn.cursor()
     cur.execute(
@@ -397,14 +592,14 @@ def close_position(conn: Any, pos: OpenPosition, reason: str) -> Optional[int]:
             json.dumps(pos.legs),
             pos.entry_price,
             exit_price,
-            pos.quantity_open,
+            total_qty,
             realized,
             pnl_pct,
             outcome,
             reason,
             pos.entry_conviction,
             json.dumps(pos.components_at_entry),
-            json.dumps({"exit_reason": reason, "current_price": exit_price}),
+            json.dumps(components_at_exit),
         ),
     )
     row = cur.fetchone()
@@ -460,9 +655,11 @@ def close_position(conn: Any, pos: OpenPosition, reason: str) -> Optional[int]:
             "realized_pnl": realized,
             "pnl_percent": pnl_pct,
             "reason": reason,
-            "contracts": pos.quantity_open,
+            # Consolidated original size, not the final runner's remaining qty.
+            "contracts": total_qty,
             "entry_price": pos.entry_price,
             "exit_price": exit_price,
+            "scaled": bool(pos.exit_tranches),
         },
         trade_id=trade_id,
         position_id=pos.id,

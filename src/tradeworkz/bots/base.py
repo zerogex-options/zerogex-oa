@@ -82,6 +82,46 @@ def resolve_expiration_iso(from_et_date: date, dte_target: int) -> str:
     return d.isoformat()
 
 
+def compute_ladder_levels(
+    entry_spot: Optional[float],
+    target_price: Optional[float],
+    direction: str,
+    t1_frac: float,
+    s2_frac: float,
+    t2_frac: float,
+) -> Optional[Dict[str, float]]:
+    """Freeze the scale-out ladder's spot levels at entry, or ``None``.
+
+    ``R = target_price - entry_spot`` is the raw distance to the bot's
+    structural target. The ladder levels are fixed fractions of R:
+
+        T1 (take 50%)      = entry_spot + t1_frac * R   (default 0.90·R)
+        S2 (runner floor)  = entry_spot + s2_frac * R   (default 0.75·R)
+        T2 (take 25% more) = entry_spot + t2_frac * R    (default 1.5·R)
+
+    Returns ``None`` — meaning "don't arm the ladder, use the single-target
+    exit" — unless the position is directional, has both an entry spot and a
+    target, and R has the *profitable* sign for the direction (bullish target
+    above entry, bearish below). The sign guard is defensive: a misconfigured
+    signal whose target sits on the wrong side of entry would otherwise produce
+    a nonsensical ladder, so we fall back to the plain exit instead.
+    """
+    if entry_spot is None or target_price is None:
+        return None
+    if direction not in ("bullish", "bearish"):
+        return None
+    r = target_price - entry_spot
+    if direction == "bullish" and r <= 0:
+        return None
+    if direction == "bearish" and r >= 0:
+        return None
+    return {
+        "t1_trigger_price": entry_spot + t1_frac * r,
+        "s2_stop_price": entry_spot + s2_frac * r,
+        "target2_price": entry_spot + t2_frac * r,
+    }
+
+
 class BaseBot:
     """Common surface implemented by every bot."""
 
@@ -142,6 +182,87 @@ class BaseBot:
             except (TypeError, ValueError):
                 pass
         return float(tw_config.MAX_PREMIUM_LOSS_PCT)
+
+    # -- Scale-out ladder knobs -----------------------------------------
+    # Each resolves a per-bot ``params[...]`` override over the fleet-wide
+    # config default, mirroring :meth:`_max_premium_loss_pct`. See
+    # docs/design/tradeworkz-exit-strategy.md.
+
+    def _resolve_ladder_frac(
+        self, param_key: str, cfg_default: float, lo: float, hi: float
+    ) -> float:
+        val = self.params.get(param_key)
+        if val is None:
+            val = cfg_default
+        try:
+            return max(lo, min(hi, float(val)))
+        except (TypeError, ValueError):
+            return max(lo, min(hi, float(cfg_default)))
+
+    def _scale_out_enabled(self) -> bool:
+        from src.tradeworkz import config as tw_config
+
+        override = self.params.get("scale_out_enabled")
+        if override is not None:
+            return bool(override)
+        return bool(tw_config.SCALE_OUT_ENABLED)
+
+    def _min_scale_contracts(self) -> int:
+        from src.tradeworkz import config as tw_config
+
+        override = self.params.get("min_scale_contracts")
+        try:
+            v = int(override) if override is not None else int(tw_config.MIN_SCALE_CONTRACTS)
+        except (TypeError, ValueError):
+            v = int(tw_config.MIN_SCALE_CONTRACTS)
+        return max(1, v)
+
+    def _t1_trigger_fraction(self) -> float:
+        from src.tradeworkz import config as tw_config
+
+        return self._resolve_ladder_frac("t1_trigger_frac", tw_config.T1_TRIGGER_FRACTION, 0.0, 1.0)
+
+    def _s2_stop_fraction(self) -> float:
+        from src.tradeworkz import config as tw_config
+
+        return self._resolve_ladder_frac("s2_stop_frac", tw_config.S2_STOP_FRACTION, 0.0, 1.0)
+
+    def _t2_target_fraction(self) -> float:
+        from src.tradeworkz import config as tw_config
+
+        return self._resolve_ladder_frac("t2_target_frac", tw_config.T2_TARGET_FRACTION, 0.0, 10.0)
+
+    def _t1_take_fraction(self) -> float:
+        from src.tradeworkz import config as tw_config
+
+        return self._resolve_ladder_frac("t1_take_frac", tw_config.T1_TAKE_FRACTION, 0.0, 1.0)
+
+    def _t2_take_fraction(self) -> float:
+        from src.tradeworkz import config as tw_config
+
+        return self._resolve_ladder_frac("t2_take_frac", tw_config.T2_TAKE_FRACTION, 0.0, 1.0)
+
+    def _runner_trail_giveback_pct(self) -> float:
+        from src.tradeworkz import config as tw_config
+
+        return self._resolve_ladder_frac(
+            "runner_trail_giveback_pct", tw_config.RUNNER_TRAIL_GIVEBACK_PCT, 0.0, 1.0
+        )
+
+    def scale_config(self) -> Dict[str, Any]:
+        """Resolved scale-out knobs, for ``open_position`` to freeze the ladder.
+
+        The take fractions and the give-back are NOT frozen here — they are read
+        live from the bot at exit time — so only the geometry inputs (enable
+        flag, min-contract floor, and the T1/S2/T2 fractions) are returned.
+        """
+        return {
+            "enabled": self._scale_out_enabled(),
+            "min_contracts": self._min_scale_contracts(),
+            "t1_frac": self._t1_trigger_fraction(),
+            "s2_frac": self._s2_stop_fraction(),
+            "t2_frac": self._t2_target_fraction(),
+        }
 
     # -- Subclass overrides ---------------------------------------------
 
@@ -204,6 +325,14 @@ class BaseBot:
             if loss_pct >= pct:
                 return ExitDecision(should_close=True, reason="premium_stop")
 
+        # Scale-out ladder. When armed (geometry frozen at entry), this OWNS the
+        # exit — profit-taking cuts at T1/T2 plus the runner stops — so the
+        # single-target branch below runs only for unarmed positions. The
+        # premium stop above still fires first for either, as the hard floor.
+        ladder = self._scale_exit_decision(snap, position, in_min_hold, now)
+        if ladder is not None:
+            return ladder
+
         spot = snap.spot
         if not in_min_hold and position.target_price is not None:
             if position.direction == "bullish" and spot >= position.target_price:
@@ -225,6 +354,108 @@ class BaseBot:
         # wall at entry, cut when the underlying blows through it or the wall
         # itself migrates against the trade. This is the common risk logic —
         # subclasses turn it on by setting position.wall_ref_price at entry.
+        drift = self._wall_stop_signal(snap, position)
+        if drift is not None:
+            return drift
+        return ExitDecision(should_close=False)
+
+    def _scale_exit_decision(
+        self,
+        snap: MarketSnapshot,
+        position: OpenPosition,
+        in_min_hold: bool,
+        now: datetime,
+    ) -> Optional[ExitDecision]:
+        """Scale-out ladder decision, or ``None`` to fall back to single-target.
+
+        Returns ``None`` when the ladder is not armed — an unarmed position then
+        uses the default target / stop / time / wall logic in
+        :meth:`exit_criteria`. When armed (all three geometry levels were frozen
+        at open), this method OWNS the exit: T1 / T2 profit-taking cuts, the
+        runner stop (S2 spot floor OR the premium give-back trail), the Stage-0
+        structural stop, the time-stop, and wall drift. The premium
+        damage-control stop is evaluated by the caller BEFORE this, so it remains
+        the hard floor in every stage.
+
+        Stages: 0 = full position (target is T1), 1 = post-T1 runner (target is
+        T2, protected by S2 + trail), 2 = post-T2 final runner (rides under the
+        same S2 + trail to the time-stop). See
+        docs/design/tradeworkz-exit-strategy.md.
+        """
+        if not self._scale_out_enabled():
+            return None
+        # Armed iff the geometry was frozen at entry (open_position writes all
+        # three only when the ladder was armable). NULLs => not armed.
+        if (
+            position.t1_trigger_price is None
+            or position.s2_stop_price is None
+            or position.target2_price is None
+        ):
+            return None
+        if position.direction not in ("bullish", "bearish"):
+            return None
+
+        bull = position.direction == "bullish"
+        spot = snap.spot
+        stage = int(position.scale_stage or 0)
+
+        # -- Runner stops (Stage >= 1): whichever of the premium give-back trail
+        # and the S2 spot floor trips first closes the remaining runner. Only
+        # reachable after T1, which is itself min_hold-gated, so the runner is
+        # always past the patience window here.
+        if stage >= 1:
+            giveback = self._runner_trail_giveback_pct()
+            hwm = position.high_water_mark
+            if (
+                giveback > 0
+                and hwm is not None
+                and hwm > 0
+                and position.current_price is not None
+                and position.current_price <= (1.0 - giveback) * hwm
+            ):
+                return ExitDecision(should_close=True, reason="runner_trail_stop")
+            s2 = position.s2_stop_price
+            if (bull and spot <= s2) or (not bull and spot >= s2):
+                return ExitDecision(should_close=True, reason="runner_s2_stop")
+
+        # -- Profit-taking cuts (price-level; min_hold-gated like today's
+        # target). T1 in Stage 0, T2 in Stage 1. cut_fraction is applied to the
+        # right base in reconciler.partial_close_position.
+        if not in_min_hold:
+            if stage == 0:
+                t1 = position.t1_trigger_price
+                if (bull and spot >= t1) or (not bull and spot <= t1):
+                    return ExitDecision(
+                        should_close=False,
+                        should_cut=True,
+                        cut_fraction=self._t1_take_fraction(),
+                        reason="scale_t1",
+                    )
+            elif stage == 1:
+                t2 = position.target2_price
+                if (bull and spot >= t2) or (not bull and spot <= t2):
+                    return ExitDecision(
+                        should_close=False,
+                        should_cut=True,
+                        cut_fraction=self._t2_take_fraction(),
+                        reason="scale_t2",
+                    )
+
+        # -- Stage-0 structural stop (S1 spot stop), min_hold-gated. Superseded
+        # by S2 + trail once the ladder passes T1, so Stage 0 only.
+        if not in_min_hold and stage == 0 and position.stop_price is not None:
+            if (bull and spot <= position.stop_price) or (
+                not bull and spot >= position.stop_price
+            ):
+                return ExitDecision(should_close=True, reason="stop")
+
+        # Mirror today's patience window: nothing else fires during min_hold.
+        if in_min_hold:
+            return ExitDecision(should_close=False)
+
+        # -- Time-stop (all stages) and wall drift (all stages). --
+        if position.time_stop_at and now >= position.time_stop_at:
+            return ExitDecision(should_close=True, reason="time_stop")
         drift = self._wall_stop_signal(snap, position)
         if drift is not None:
             return drift

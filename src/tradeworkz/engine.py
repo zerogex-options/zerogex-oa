@@ -38,6 +38,7 @@ from src.tradeworkz.reconciler import (
     load_open_positions,
     mark_position,
     open_position,
+    partial_close_position,
 )
 
 logger = logging.getLogger(__name__)
@@ -176,7 +177,7 @@ def _run_bot(
         except Exception:
             params = {}
 
-    stats = {"opened": 0, "closed": 0, "marked": 0}
+    stats = {"opened": 0, "closed": 0, "marked": 0, "scaled": 0}
     bot_universes = _bot_underlyings(universe, fleet_universes)
     if not bot_universes:
         return stats
@@ -223,6 +224,15 @@ def _run_bot(
                 if decision.should_close:
                     close_position(conn, pos, reason=decision.reason or "signal")
                     stats["closed"] += 1
+                elif getattr(decision, "should_cut", False) and (
+                    getattr(decision, "cut_fraction", 0.0) or 0.0
+                ) > 0:
+                    # Scale-out tranche: books realized onto the position and
+                    # keeps a runner open. No tw_trades row / capital move until
+                    # the final close consolidates. See
+                    # docs/design/tradeworkz-exit-strategy.md.
+                    partial_close_position(conn, pos, decision)
+                    stats["scaled"] += 1
 
             # 2. Look for a new entry in this underlying — but only when the
             # market-hours gate allows opens. Exits above always run; this
@@ -245,6 +255,8 @@ def _run_bot(
                     size_multiplier=bot.size_multiplier(),
                     wall_strength=wall_strength,
                     daily_realized_pnl=realized_today,
+                    entry_spot=snap.spot,
+                    scale_cfg=bot.scale_config(),
                 )
                 if pos_id is not None:
                     stats["opened"] += 1
