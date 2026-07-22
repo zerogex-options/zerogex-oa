@@ -1,7 +1,10 @@
 # TradeWorkz Exit Strategy — Architecture & Design
 
-**Status:** In design. The tightened premium stop (§6.1) is **implemented**; the
-scale-out ladder (§4–§7) is **specified and pending implementation**.
+**Status:** **Implemented.** The tightened premium stop (§6.1) and the full
+scale-out ladder (§4–§8) are live — schema, config, `open_position` arming,
+`BaseBot._scale_exit_decision`, `partial_close_position`, the consolidated
+`close_position`, engine wiring, and tests (`tests/test_tradeworkz_scale_out.py`).
+§9 records the build order; §11–§12 the quant rationale and worked scenarios.
 
 **Scope:** How the TradeWorkz bot fleet decides *when and how much* to exit an
 open position — targets, stop-losses, time-stops — and the design for a
@@ -378,9 +381,9 @@ When the last tranche exits, `close_position` writes a single `tw_trades` row:
 - `realized_pnl = realized_pnl_booked + final-tranche realized`.
 - `pnl_percent = exit_price / entry_price − 1`.
 - `outcome = sign(realized_pnl)`.
-- `close_reason =` the terminal reason of the **final** tranche (e.g.
-  `runner_trail_stop`, `runner_s2_stop`, `runner_time_stop`), or the ordinary
-  Stage-0 reason if the position never scaled.
+- `close_reason =` the terminal reason of the **final** tranche
+  (`runner_trail_stop`, `runner_s2_stop`, or the shared `time_stop` /
+  `premium_stop`), or the ordinary Stage-0 reason if the position never scaled.
 - `components_at_exit =` `{ exit_reason, weighted_exit, scale_stage_reached,
   tranches: [...] }` — the full per-tranche breakdown behind the consolidated
   number.
@@ -491,9 +494,12 @@ Ordered so each step is independently testable.
    size-weighted exit and merge `realized_pnl_booked` + `exit_tranches`.
 7. **Notifications** — add the `scale` event type to `notifications.fanout_event`
    and the follower fan-out; decide dust-filter handling (treat like `exit`).
-8. **Backtest/sim parity** — mirror the ladder in `src/tradeworkz/simulate.py`
-   so backtests and live trading agree (the invariants file already exempts sim
-   rows from Invariant A's exact arithmetic).
+8. **Sim seeding is unaffected (no parity work).** `src/tradeworkz/simulate.py`
+   fabricates synthetic dashboard history from per-bot outcome distributions —
+   it never runs `exit_criteria`, so the ladder does not change it (its rows
+   stay `origin=simulate` and are already exempt from Invariant A). No backtest
+   path drives the live exit logic (`exit_criteria` is only invoked by
+   `engine.py`), so there is nothing to mirror.
 9. **Tests** — new cases: stage transitions; the VWAP-consolidation identity
    (Invariant A holds after a 3-tranche close); single capital credit (B);
    single ML sample; min-contract floor skip; S2 floor arms at T1; trailing
@@ -523,8 +529,13 @@ Ordered so each step is independently testable.
   slippage; the min-contract floor bounds this, but the `T2_TARGET_FRACTION` and
   give-back defaults should be validated against slippage drag in backtests
   before fleet-wide enablement.
-- **Backtest parity is load-bearing.** If `simulate.py` is not updated in
-  lockstep (step 8), the leaderboard/backtests will diverge from live behaviour.
+- **Backtest coverage is a gap, not a parity risk.** No backtest path currently
+  drives `exit_criteria` (see §9 step 8), so nothing diverges — but that also
+  means the ladder's EV is **not yet measured on historical option marks**. The
+  §11 recommendation (enable per-bot, validate profit factor on option-mark
+  backtests before fleet-wide) depends on building that measurement path; until
+  then, prefer enabling the ladder on a subset of reversion bots and watching
+  live profit factor.
 
 ---
 

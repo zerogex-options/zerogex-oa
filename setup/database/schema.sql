@@ -2496,6 +2496,28 @@ CREATE TABLE IF NOT EXISTS tw_positions (
 CREATE INDEX IF NOT EXISTS idx_tw_positions_bot_open ON tw_positions(bot_id, opened_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tw_positions_underlying ON tw_positions(underlying, opened_at DESC);
 
+-- 9.4.1 Scale-out ladder state (see docs/design/tradeworkz-exit-strategy.md).
+-- A position in profit is harvested in tranches: take 50% at T1 (entry+0.90*R),
+-- 50% of the remainder at T2 (entry+1.5*R), and ride the final ~25% under an S2
+-- floor (entry+0.75*R) plus a premium give-back trail. R = target_price -
+-- entry_spot. The three prices are FROZEN at entry so a later config change
+-- never moves an open position's geometry. Partial takes book realized to
+-- realized_pnl_booked / exit_tranches on THIS row and do not write tw_trades or
+-- move capital; the final close writes one size-weighted consolidated trade so
+-- Invariant A holds by construction. All columns nullable/defaulted so existing
+-- rows migrate cleanly; an unarmed position (ladder disabled, non-directional,
+-- no target, or below the min-contract floor) leaves the price columns NULL and
+-- behaves exactly as the pre-ladder single-target exit.
+ALTER TABLE tw_positions ADD COLUMN IF NOT EXISTS entry_spot NUMERIC(12,6);
+ALTER TABLE tw_positions ADD COLUMN IF NOT EXISTS quantity_initial INTEGER;
+ALTER TABLE tw_positions ADD COLUMN IF NOT EXISTS t1_trigger_price NUMERIC(12,6);
+ALTER TABLE tw_positions ADD COLUMN IF NOT EXISTS s2_stop_price NUMERIC(12,6);
+ALTER TABLE tw_positions ADD COLUMN IF NOT EXISTS target2_price NUMERIC(12,6);
+ALTER TABLE tw_positions ADD COLUMN IF NOT EXISTS scale_stage SMALLINT NOT NULL DEFAULT 0;
+ALTER TABLE tw_positions ADD COLUMN IF NOT EXISTS high_water_mark NUMERIC(12,6);
+ALTER TABLE tw_positions ADD COLUMN IF NOT EXISTS realized_pnl_booked NUMERIC(14,4) NOT NULL DEFAULT 0;
+ALTER TABLE tw_positions ADD COLUMN IF NOT EXISTS exit_tranches JSONB NOT NULL DEFAULT '[]'::jsonb;
+
 -- 9.5 Immutable trade blotter — every closed round-trip. Never updated after
 --     insert. Serves both the leaderboard aggregates and the per-bot ML
 --     calibrator's rolling win-rate windows.

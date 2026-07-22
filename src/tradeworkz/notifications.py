@@ -71,7 +71,7 @@ def fanout_event(
     except (TypeError, ValueError):
         realized_abs = None
     email_dust_suppressed = (
-        event_type == "exit"
+        event_type in ("exit", "scale")
         and dust_threshold > 0
         and realized_abs is not None
         and realized_abs < dust_threshold

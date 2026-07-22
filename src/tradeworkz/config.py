@@ -77,6 +77,45 @@ MAX_PREMIUM_LOSS_PCT: float = _getenv_float(
 )
 
 # ---------------------------------------------------------------------------
+# Scale-out ladder (profit-harvesting on positions in profit)
+# ---------------------------------------------------------------------------
+# See docs/design/tradeworkz-exit-strategy.md. When a directional position
+# goes into profit, harvest it in tranches instead of a single all-or-nothing
+# target: take T1_TAKE_FRACTION at T1 (entry + T1_TRIGGER_FRACTION*R), then
+# T2_TAKE_FRACTION of the remainder at T2 (entry + T2_TARGET_FRACTION*R), and
+# ride the final piece under an S2 floor (entry + S2_STOP_FRACTION*R) plus a
+# premium give-back trail (RUNNER_TRAIL_GIVEBACK_PCT off the runner's mark
+# high-water mark). R = target_price - entry_spot. Every knob is per-bot
+# overridable via params[...] (same pattern as max_premium_loss_pct). Set
+# SCALE_OUT_ENABLED=false (or size below MIN_SCALE_CONTRACTS, or a
+# non-directional / target-less structure) to fall back to the single-target
+# exit. The existing stop stack (premium stop, structural stop, wall-break,
+# time-stop) stays in force throughout — the ladder only governs profit-taking.
+SCALE_OUT_ENABLED: bool = _getenv_bool("TRADEWORKZ_SCALE_OUT_ENABLED", True)
+# Below this initial contract count, don't scale (splitting tiny positions into
+# 1-contract tranches just triples per-fill slippage for no diversification).
+MIN_SCALE_CONTRACTS: int = _getenv_int("TRADEWORKZ_MIN_SCALE_CONTRACTS", 4, min=1, max=100_000)
+# T1 take-profit trigger, as a fraction of R. 0.90 fires just BEFORE the
+# structural target — walls/max-pain/VWAP act as resistance and price often
+# reverses on the last tick, so taking at 0.90*R fills far more often.
+T1_TRIGGER_FRACTION: float = _getenv_float("TRADEWORKZ_T1_TRIGGER_FRACTION", 0.90, min=0.0, max=1.0)
+# S2 runner floor, as a fraction of R. 0.75 sits below T1 to give the runner
+# wiggle room while still locking a small gain (S2 is above entry).
+S2_STOP_FRACTION: float = _getenv_float("TRADEWORKZ_S2_STOP_FRACTION", 0.75, min=0.0, max=1.0)
+# T2 second take, as a fraction of R. 1.5 is half an R past the structural
+# target — a realistic 0DTE stretch that still rewards the runner.
+T2_TARGET_FRACTION: float = _getenv_float("TRADEWORKZ_T2_TARGET_FRACTION", 1.5, min=0.0, max=10.0)
+# Fraction of the ORIGINAL size taken at T1.
+T1_TAKE_FRACTION: float = _getenv_float("TRADEWORKZ_T1_TAKE_FRACTION", 0.5, min=0.0, max=1.0)
+# Fraction of the REMAINDER taken at T2.
+T2_TAKE_FRACTION: float = _getenv_float("TRADEWORKZ_T2_TAKE_FRACTION", 0.5, min=0.0, max=1.0)
+# Premium give-back off the runner's high-water mark that trails it out. On
+# 0DTE the runner's enemy is theta; a premium (not spot) trail captures that.
+RUNNER_TRAIL_GIVEBACK_PCT: float = _getenv_float(
+    "TRADEWORKZ_RUNNER_TRAIL_GIVEBACK_PCT", 0.30, min=0.0, max=1.0
+)
+
+# ---------------------------------------------------------------------------
 # Regular-trading-hours (RTH) gate on NEW opens
 # ---------------------------------------------------------------------------
 # Every fleet bot trades same-day (0DTE) debits, and the reconciler
