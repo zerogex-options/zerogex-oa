@@ -1961,22 +1961,49 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         """Most recent ``gex_summary`` row at or before ``at_ts``.
 
         Used by the replay endpoints to anchor a per-minute frame against
-        the headline GEX snapshot (spot, call_wall, put_wall, gamma_flip,
-        max_pain) closest to a user-selected scrubber timestamp. Returns
+        the headline GEX snapshot (call_wall, put_wall, gamma_flip,
+        max_pain, net_gex) closest to a user-selected scrubber timestamp.
+        Spot is not stored on ``gex_summary``; it is joined from the
+        matching ``underlying_quotes`` close at-or-before the frame
+        timestamp — the spot that drove that cycle's calculation. Returns
         None when no row at-or-before exists (e.g. requesting a moment
         before the engine first wrote for this symbol).
         """
         query = """
-            SELECT timestamp, underlying as symbol, spot_price,
-                   total_call_gex, total_put_gex, net_gex, net_gex_at_spot,
-                   gamma_flip, gamma_flip_raw, gamma_flip_span_used,
-                   flip_distance, max_pain, call_wall, put_wall,
-                   total_call_oi, total_put_oi, put_call_ratio
-            FROM gex_summary
-            WHERE underlying = $1
-              AND timestamp <= $2
-            ORDER BY timestamp DESC
-            LIMIT 1
+            WITH frame AS (
+                SELECT timestamp, underlying,
+                       total_net_gex, net_gex_at_spot,
+                       gamma_flip_point, gamma_flip_raw, gamma_flip_span_used,
+                       flip_distance, max_pain, call_wall, put_wall,
+                       total_call_oi, total_put_oi, put_call_ratio
+                FROM gex_summary
+                WHERE underlying = $1
+                  AND timestamp <= $2
+                ORDER BY timestamp DESC
+                LIMIT 1
+            )
+            SELECT
+                f.timestamp,
+                f.underlying AS symbol,
+                (SELECT uq.close
+                   FROM underlying_quotes uq
+                  WHERE uq.symbol = f.underlying
+                    AND uq.timestamp <= f.timestamp
+                  ORDER BY uq.timestamp DESC
+                  LIMIT 1) AS spot_price,
+                f.total_net_gex AS net_gex,
+                f.net_gex_at_spot,
+                f.gamma_flip_point AS gamma_flip,
+                f.gamma_flip_raw,
+                f.gamma_flip_span_used,
+                f.flip_distance,
+                f.max_pain,
+                f.call_wall,
+                f.put_wall,
+                f.total_call_oi,
+                f.total_put_oi,
+                f.put_call_ratio
+            FROM frame f
         """
         try:
             async with self._acquire_connection() as conn:
@@ -1999,18 +2026,30 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
         Like ``get_gex_by_strike`` (latest), but pinned to a user-selected
         minute and ordered by absolute impact so the replay's bar chart
         always shows the most structurally meaningful strikes for that
-        moment. Spot price is taken from the matching ``gex_summary`` row
-        rather than ``underlying_quotes`` so the historical $ GEX values
-        reflect the spot that drove the original calculation.
+        moment. Spot price is joined from the matching ``underlying_quotes``
+        close at-or-before the anchor frame (``gex_summary`` does not store
+        spot) so the historical $ GEX values reflect the spot that drove the
+        original calculation.
         """
         query = """
             WITH anchor AS (
-                SELECT timestamp, spot_price
+                SELECT timestamp
                 FROM gex_summary
                 WHERE underlying = $1
                   AND timestamp <= $2
                 ORDER BY timestamp DESC
                 LIMIT 1
+            ),
+            anchor_spot AS (
+                SELECT
+                    a.timestamp,
+                    (SELECT uq.close
+                       FROM underlying_quotes uq
+                      WHERE uq.symbol = $1
+                        AND uq.timestamp <= a.timestamp
+                      ORDER BY uq.timestamp DESC
+                      LIMIT 1) AS spot_price
+                FROM anchor a
             )
             SELECT
                 g.timestamp,
@@ -2029,7 +2068,7 @@ class DatabaseManager(SignalsQueriesMixin, TechnicalsQueriesMixin):
                 a.spot_price,
                 g.strike - a.spot_price AS distance_from_spot
             FROM gex_by_strike g
-            CROSS JOIN anchor a
+            CROSS JOIN anchor_spot a
             WHERE g.underlying = $1
               AND g.timestamp = a.timestamp
             ORDER BY ABS(g.strike - a.spot_price) ASC
