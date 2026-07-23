@@ -125,5 +125,39 @@ LIMIT 100;
 
 \echo
 \echo ============================================================
+\echo  Invariant F: scaled-close tranche ledger sums to realized_pnl
+\echo ============================================================
+\echo  For a scale-out close (components_at_exit.scale_stage > 0), the sum of
+\echo  every tranche's realized in components_at_exit.tranches MUST equal the
+\echo  consolidated realized_pnl. This is the ledger-vs-total check for the
+\echo  one-row consolidation (docs/design/tradeworkz-exit-strategy.md §7): if it
+\echo  drifts, a partial take was booked but not folded into the final row, or
+\echo  the size-weighted exit was computed from the wrong base. Live rows only.
+\echo  Expected: 0 rows.
+\echo
+
+SELECT id, bot_id, close_reason, realized_pnl,
+       (SELECT COALESCE(SUM((t->>'realized')::numeric), 0)
+        FROM jsonb_array_elements(
+          CASE WHEN jsonb_typeof(components_at_exit->'tranches') = 'array'
+               THEN components_at_exit->'tranches' ELSE '[]'::jsonb END) AS t
+       ) AS sum_tranche_realized
+FROM tw_trades
+WHERE closed_at >= NOW() - interval '90 days'
+  AND (components_at_entry ->> 'origin') IS DISTINCT FROM 'simulate'
+  AND (components_at_entry ->> 'simulated') IS DISTINCT FROM 'true'
+  AND COALESCE((components_at_exit ->> 'scale_stage')::int, 0) > 0
+  AND ABS(
+        realized_pnl
+        - (SELECT COALESCE(SUM((t->>'realized')::numeric), 0)
+           FROM jsonb_array_elements(
+             CASE WHEN jsonb_typeof(components_at_exit->'tranches') = 'array'
+                  THEN components_at_exit->'tranches' ELSE '[]'::jsonb END) AS t)
+      ) > 0.50
+ORDER BY closed_at DESC
+LIMIT 100;
+
+\echo
+\echo ============================================================
 \echo  Done. Any rows above are drift — investigate.
 \echo ============================================================
