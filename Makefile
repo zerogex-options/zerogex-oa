@@ -916,7 +916,7 @@ help: ## Show this help message
 	@echo "  (service = ingestion | analytics | signals | api)"
 	@echo "  make logs-grep PATTERN=\"text\" - Search all service logs for pattern"
 	@echo "  make logs-clear                 - Clear journals + system/nginx/etc. logs (rotated + gzipped)"
-	@echo "  make disk-clean                 - Reclaim disk: apt/snap/npm caches + .mypy_cache/htmlcov/.next (runs nightly w/ logs-clear)"
+	@echo "  make disk-clean                 - Reclaim disk: apt/snap caches + .mypy_cache/htmlcov (runs nightly w/ logs-clear)"
 	@echo ""
 	@echo "$(GREEN)Run Components:$(NC)"
 	@echo "  make run-auth           - Test TradeStation authentication"
@@ -1466,30 +1466,27 @@ logs-clear-noconfirm: ## Non-interactive log cleanup (driven by zerogex-oa-logs-
 # =============================================================================
 # Disk / package-cache cleanup (companion to logs-clear, same nightly unit)
 # =============================================================================
-# Reclaims disk from OS package caches, superseded snap revisions, and
-# regenerable build/tooling caches.  Driven nightly by the SAME
-# zerogex-oa-logs-clear.service that runs logs-clear-noconfirm (wired there as
-# extra ExecStart lines) so "the nightly cleanup" stays one unit.
+# Reclaims disk from host OS package caches (apt, snap) and this repo's own
+# regenerable build/tooling caches (.mypy_cache, htmlcov).  Driven nightly by
+# the SAME zerogex-oa-logs-clear.service that runs logs-clear-noconfirm (wired
+# there as an extra ExecStart) so "the nightly cleanup" stays one unit.
 #
-# Everything in disk-clean is regenerable: apt lists come back on `apt update`,
-# caches rebuild on next use.  Each external tool is guarded with `command -v`
-# and `|| true`, so a backend-only host without npm/snap still runs the rest.
+# Scope: this target deliberately stays inside zerogex-oa + host-level OS
+# caches.  Frontend caches (npm, zerogex-web/.next) belong to the zerogex-web
+# repo's OWN cleanup job — don't reach across repos from here.  (zerogex-oa has
+# no package.json of its own; the box's npm cache is populated by the frontend.)
 #
-# Path defaults target the ubuntu operator account because the nightly service
-# runs as ROOT (its `sudo`s become no-ops, and a bare ~ would resolve to /root,
-# not /home/ubuntu).  The user-owned npm cache is cleaned AS the app user.
-# Override for non-standard layouts, e.g. `make disk-clean ZEROGEX_APP_USER=deploy`.
-ZEROGEX_APP_USER ?= ubuntu
-ZEROGEX_APP_HOME ?= /home/$(ZEROGEX_APP_USER)
-ZEROGEX_WEB_DIR  ?= $(ZEROGEX_APP_HOME)/zerogex-web
+# Everything here is regenerable: apt lists come back on `apt update`, caches
+# rebuild on next use.  Each external tool is guarded with `command -v` and
+# `|| true`, so a host without apt/snap still runs the rest.
 
 .PHONY: disk-clean
 disk-clean: ## Interactive disk/cache cleanup (prompts; calls disk-clean-noconfirm)
-	@echo "$(RED)⚠️  Reclaims disk by clearing OS package caches + regenerable build caches.$(NC)"
+	@echo "$(RED)⚠️  Reclaims disk by clearing host OS package caches + this repo's build caches.$(NC)"
 	@echo "$(YELLOW)Targets:$(NC)"
 	@echo "  • apt: lists, pkgcache.bin, srcpkgcache.bin, archives (clean), autoremove --purge -y"
 	@echo "  • snap: superseded (disabled) revisions + /var/lib/snapd/cache"
-	@echo "  • npm cache (as $(ZEROGEX_APP_USER)); .mypy_cache + htmlcov (this repo); $(ZEROGEX_WEB_DIR)/frontend/.next/cache"
+	@echo "  • build caches: .mypy_cache + htmlcov (this repo)"
 	@read -p "Type 'yes' to confirm: " confirm; \
 	if [ "$$confirm" != "yes" ]; then \
 		echo "$(RED)❌ Aborted$(NC)"; exit 0; \
@@ -1517,21 +1514,8 @@ disk-clean-noconfirm: ## Non-interactive disk/cache cleanup (driven by zerogex-o
 		done; \
 		sudo rm -f /var/lib/snapd/cache/* || true; \
 	else echo "    snap not present — skipping"; fi
-	@echo "$(YELLOW)→ npm: cleaning cache as $(ZEROGEX_APP_USER)...$(NC)"
-	@if command -v npm >/dev/null 2>&1; then \
-		if [ "$$(id -un)" = "$(ZEROGEX_APP_USER)" ]; then \
-			npm cache clean --force >/dev/null 2>&1 || true; \
-		else \
-			sudo -u $(ZEROGEX_APP_USER) -H npm cache clean --force >/dev/null 2>&1 || true; \
-		fi; \
-		echo "    npm cache cleaned"; \
-	else echo "    npm not present — skipping"; fi
-	@echo "$(YELLOW)→ Build/tooling caches: .mypy_cache, htmlcov, .next/cache...$(NC)"
+	@echo "$(YELLOW)→ Build/tooling caches: .mypy_cache, htmlcov...$(NC)"
 	@rm -rf .mypy_cache htmlcov 2>/dev/null && echo "    cleared .mypy_cache + htmlcov (zerogex-oa)" || true
-	@if [ -d "$(ZEROGEX_WEB_DIR)/frontend/.next/cache" ]; then \
-		rm -rf "$(ZEROGEX_WEB_DIR)/frontend/.next/cache" && \
-		echo "    cleared $(ZEROGEX_WEB_DIR)/frontend/.next/cache" || true; \
-	fi
 	@echo ""
 	@echo "$(BLUE)Disk usage AFTER:$(NC)"; df -h / | tail -1
 	@echo "$(GREEN)✅ Disk/cache cleanup complete$(NC)"

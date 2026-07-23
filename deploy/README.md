@@ -118,9 +118,11 @@ The deployment process runs these steps in order:
   - `zerogex-oa-db-maintain` - prune + vacuum, daily 02:00 ET
   - `zerogex-oa-db-vacuum-full` - VACUUM FULL + REINDEX, Sundays 02:30 ET
   - `zerogex-oa-logs-clear` - nightly cleanup, daily 03:30 ET: logs
-    (`make logs-clear`), then disk/package caches — apt lists+archives,
-    `apt autoremove --purge`, superseded snap revisions, npm + build
-    caches (`make disk-clean`)
+    (`make logs-clear`), then host + this-repo caches — apt lists+archives,
+    `apt autoremove --purge`, superseded snap revisions, and this repo's
+    build caches (.mypy_cache, htmlcov) via `make disk-clean`.  Frontend
+    caches (npm, zerogex-web/.next) are intentionally left to zerogex-web's
+    own cleanup job — this unit does not reach across repos
   - `zerogex-oa-normalizer-refresh` - per-symbol normalizer cache, daily 04:30 ET
     (validates itself via `ExecStartPost=` so the unit fails atomically
     if the refresh process exits 0 without producing fresh rows)
