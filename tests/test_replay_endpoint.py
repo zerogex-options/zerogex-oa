@@ -14,7 +14,14 @@ from fastapi.testclient import TestClient
 
 
 def _build_app(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv("API_KEY", raising=False)
+    # Force anonymous auth by disabling the static-key gate. Set API_KEY to
+    # "" (which src/api/security.py normalises to None) rather than deleting
+    # it: src/config.py's module-level load_dotenv() runs on the first app
+    # import and would refill a *missing* API_KEY from an operator/server
+    # .env, 401-ing the first test on a configured box while CI (no .env)
+    # stays green. load_dotenv(override=False) leaves a present-but-empty var
+    # untouched, so "" holds.
+    monkeypatch.setenv("API_KEY", "")
     monkeypatch.setenv("ENVIRONMENT", "development")
     for mod in list(sys.modules):
         if mod.startswith("src.api") or mod.startswith("src.signals.playbook"):
