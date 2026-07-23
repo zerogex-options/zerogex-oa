@@ -128,9 +128,9 @@ LIMIT 100;
 \echo  Invariant F: scaled-close tranche ledger sums to realized_pnl
 \echo ============================================================
 \echo  For a scale-out close (components_at_exit.scale_stage > 0), the sum of
-\echo  every tranche's realized in components_at_exit.tranches MUST equal the
+\echo  every per-tranche realized in components_at_exit.tranches MUST equal the
 \echo  consolidated realized_pnl. This is the ledger-vs-total check for the
-\echo  one-row consolidation (docs/design/tradeworkz-exit-strategy.md §7): if it
+\echo  one-row consolidation (see the exit-strategy design doc, sec 7): if it
 \echo  drifts, a partial take was booked but not folded into the final row, or
 \echo  the size-weighted exit was computed from the wrong base. Live rows only.
 \echo  Expected: 0 rows.
