@@ -13,14 +13,23 @@ It reuses the same bar shape, validation, and ``underlying_quotes`` upsert as
 the live ingester (``src/ingestion/main_engine.py``), so a backfilled bar is
 indistinguishable from a streamed one. Idempotent on ``(symbol, timestamp)``.
 
+``--symbols`` takes the canonical/DB symbols (``SPY``, ``SPX``, ``QQQ``,
+``NDX``). Index symbols are resolved through ``SYMBOL_ALIASES`` for the
+TradeStation fetch (``SPX`` -> ``$SPXW.X``, ``NDX`` -> ``$NDXP.X``) exactly as
+the live ingester resolves them, while the rows are still written under the
+canonical symbol — so a backfilled index bar lands in the same
+``underlying_quotes.symbol`` the live feed and the charts use. Equities
+without an alias (``SPY`` / ``QQQ``) fetch and write under the same string,
+unchanged.
+
 Usage::
 
-    python -m src.tools.underlying_backfill --symbols SPY,QQQ \
-        --start 2022-01-01 --end 2022-12-31
+    python -m src.tools.underlying_backfill --symbols SPY,SPX,QQQ,NDX \
+        --start 2026-05-01 --end 2026-07-23
 
 Verify against a live TradeStation session + database — the pure range/parse
-logic is unit-tested (``tests/test_underlying_backfill.py``), but the HTTP and
-DB paths need real credentials to exercise.
+and alias-resolution logic is unit-tested (``tests/test_underlying_backfill.py``),
+but the HTTP and DB paths need real credentials to exercise.
 """
 
 from __future__ import annotations
@@ -31,6 +40,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from src.symbols import resolve_symbol
 from src.validation import safe_datetime, safe_float
 
 logger = logging.getLogger(__name__)
@@ -215,16 +225,35 @@ def backfill(
     client = TradeStationClient()
     written: Dict[str, int] = {}
     for symbol in symbols:
+        # Resolve the canonical/DB symbol to its TradeStation fetch symbol via
+        # SYMBOL_ALIASES (e.g. SPX -> $SPXW.X, NDX -> $NDXP.X), exactly as the
+        # live ingester does — but keep WRITING rows under the canonical symbol
+        # so a backfilled index bar lands in the same underlying_quotes.symbol
+        # the charts read. Aliasless equities (SPY/QQQ) resolve to themselves.
+        ts_symbol = resolve_symbol(symbol)
+        if ts_symbol != symbol:
+            logger.info(
+                "Resolved %s -> %s via SYMBOL_ALIASES for fetch; "
+                "writing rows under canonical '%s'",
+                symbol,
+                ts_symbol,
+                symbol,
+            )
         rows = fetch_symbol(
             client,
-            symbol,
+            ts_symbol,
             start,
             end,
             days_per_chunk=days_per_chunk,
             session_template=session_template,
         )
         if dry_run:
-            logger.info("[dry-run] %s: %d bars parsed, not written", symbol, len(rows))
+            logger.info(
+                "[dry-run] %s (%s): %d bars parsed, not written",
+                symbol,
+                ts_symbol,
+                len(rows),
+            )
             written[symbol] = 0
             continue
         with db_connection() as conn:
@@ -244,6 +273,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    # Load .env so SYMBOL_ALIASES (for index-symbol resolution) and the
+    # TradeStation credentials are available when run directly as
+    # `python -m src.tools.underlying_backfill`. load_dotenv does not override
+    # already-exported vars, so an explicit shell env still wins.
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     start = date.fromisoformat(args.start)
     end = date.fromisoformat(args.end)

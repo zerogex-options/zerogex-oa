@@ -163,3 +163,63 @@ def test_fetch_symbol_iterates_chunks_and_dedups():
     # 3 unique timestamps (the duplicate 14:31 is dropped).
     ts = {r["timestamp"] for r in rows}
     assert len(ts) == 3
+
+
+# ----------------------------------------------------------------------
+# Alias resolution: fetch via SYMBOL_ALIASES, write under the canonical symbol
+# ----------------------------------------------------------------------
+
+
+def test_backfill_resolves_alias_for_fetch_but_writes_canonical(monkeypatch):
+    """``backfill(["NDX"])`` fetches the TS chain symbol ($NDXP.X) but writes
+    rows under the canonical DB symbol ('NDX') so they land where the charts
+    read. Aliasless equities (SPY) fetch and write under the same string."""
+    import contextlib
+
+    import src.tools.underlying_backfill as ub
+
+    monkeypatch.setenv("SYMBOL_ALIASES", "SPX=$SPXW.X,NDX=$NDXP.X")
+    # backfill() calls fetch_symbol without sleep_seconds -> default 0.3s pause.
+    monkeypatch.setattr(ub.time, "sleep", lambda *_a, **_k: None)
+
+    fetched: list = []
+    written: list = []
+
+    class _Client:
+        def get_stream_bars(self, symbol, **kw):
+            fetched.append(symbol)
+            return {"Bars": [_bar(TimeStamp="2022-01-03T14:31:00Z")]}
+
+    class _Cur:
+        def executemany(self, sql, seq):
+            self.seq = list(seq)
+
+    class _Conn:
+        def __init__(self):
+            self._cur = _Cur()
+
+        def cursor(self):
+            return self._cur
+
+    @contextlib.contextmanager
+    def _fake_db():
+        conn = _Conn()
+        yield conn
+        # Capture the symbol each row was written under (params[0]).
+        written.extend(params[0] for params in conn._cur.seq)
+
+    monkeypatch.setattr(
+        "src.ingestion.tradestation_client.TradeStationClient",
+        lambda *a, **k: _Client(),
+    )
+    monkeypatch.setattr("src.database.db_connection", _fake_db)
+
+    result = ub.backfill(["NDX", "SPY"], date(2022, 1, 3), date(2022, 1, 3))
+
+    # NDX is fetched via its alias; SPY (no alias) is fetched as itself.
+    assert "$NDXP.X" in fetched
+    assert "SPY" in fetched
+    assert "NDX" not in fetched  # never fetch the canonical for an aliased index
+    # Rows are written under the CANONICAL symbols, not the TS fetch symbols.
+    assert sorted(written) == ["NDX", "SPY"]
+    assert result == {"NDX": 1, "SPY": 1}
