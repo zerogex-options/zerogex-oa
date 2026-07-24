@@ -2517,7 +2517,7 @@ class StreamManager:
                                     and oi_coverage < self.option_oi_coverage_alert_threshold
                                 ):
                                     logger.warning(
-                                        f"⚠️ Low option OI coverage: "
+                                        f"⚠️ [{self.db_underlying}] Low option OI coverage: "
                                         f"{oi_coverage:.1%} "
                                         f"(threshold "
                                         f"{self.option_oi_coverage_alert_threshold:.1%}, "
@@ -2529,7 +2529,7 @@ class StreamManager:
                                     < self.option_volume_coverage_alert_threshold
                                 ):
                                     logger.warning(
-                                        f"⚠️ Low option volume coverage: "
+                                        f"⚠️ [{self.db_underlying}] Low option volume coverage: "
                                         f"{volume_coverage:.1%} "
                                         f"(threshold "
                                         f"{self.option_volume_coverage_alert_threshold:.1%}, "
