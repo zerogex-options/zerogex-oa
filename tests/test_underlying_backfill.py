@@ -137,7 +137,7 @@ class _FakeClient:
     def __init__(self):
         self.calls = []
 
-    def get_stream_bars(self, symbol, **kw):
+    def get_bars(self, symbol, **kw):
         self.calls.append((symbol, kw["firstdate"], kw["lastdate"]))
         n = len(self.calls)
         if n == 1:
@@ -189,7 +189,7 @@ def test_backfill_resolves_alias_for_fetch_but_writes_canonical(monkeypatch):
     written: list = []
 
     class _Client:
-        def get_stream_bars(self, symbol, **kw):
+        def get_bars(self, symbol, **kw):
             fetched.append(symbol)
             return {"Bars": [_bar(TimeStamp="2022-01-03T14:31:00Z")]}
 

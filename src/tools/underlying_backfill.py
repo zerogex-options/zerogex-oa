@@ -102,8 +102,9 @@ def _bar_to_row(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     Mirrors the live ingester's validation: a full, positive OHLC set with
     ``high >= low``. Partial/degenerate bars (e.g. the current forming bar, or a
     gap) are skipped rather than allowed to violate the table's CHECK
-    constraints on insert. ``UpVolume`` / ``DownVolume`` come from the
-    stream-barcharts endpoint; a plain barchart without them yields 0/0.
+    constraints on insert. ``UpVolume`` / ``DownVolume`` are streaming-only
+    fields absent from the historical barcharts endpoint this tool uses, so
+    they yield 0/0 on a backfilled bar (OHLC is unaffected).
     """
     ts = safe_datetime(raw.get("TimeStamp"), field_name="TimeStamp")  # type: ignore[arg-type]
     if ts is None:
@@ -178,14 +179,21 @@ def fetch_symbol(
 ) -> List[Dict[str, Any]]:
     """Fetch + parse all 1-minute bars for ``symbol`` across the window.
 
-    Uses the stream-barcharts endpoint (Up/Down volume) chunked over the range.
-    Deduplicates on timestamp (chunk boundaries never overlap, but a defensive
-    dedup guards against the API returning an edge bar twice).
+    Uses the historical barcharts endpoint (``marketdata/barcharts``, via
+    ``get_bars``) chunked over the range. This is deliberately NOT the
+    streaming endpoint (``get_stream_bars`` / ``marketdata/stream/barcharts``):
+    that one is a real-time snapshot that ignores ``firstdate``/``lastdate``
+    and returns only the latest bar, so it cannot backfill a range. The trade
+    is that the historical endpoint carries no Up/Down volume split, so
+    backfilled bars land with ``up_volume=0`` / ``down_volume=0`` (OHLC — what
+    the candlestick charts draw — is exact). Deduplicates on timestamp (chunk
+    boundaries never overlap, but a defensive dedup guards against the API
+    returning an edge bar twice).
     """
     seen: set = set()
     rows: List[Dict[str, Any]] = []
     for first, last in _chunk_ranges(start, end, days_per_chunk):
-        payload = client.get_stream_bars(
+        payload = client.get_bars(
             symbol,
             interval=1,
             unit="Minute",
