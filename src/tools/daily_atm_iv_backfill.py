@@ -36,8 +36,13 @@ logger = logging.getLogger(__name__)
 
 
 # Default underlyings — matches the symbols the analytics + signals
-# engines run for in prod.  Override via --symbols.
-DEFAULT_SYMBOLS = ["SPY", "QQQ", "SPX"]
+# engines run for in prod.  Keep this in sync as symbols are added to the
+# deployment (each is a per-symbol worker); a symbol missing here is seeded
+# by neither a scheduled nor a default backfill run, so its signals engine
+# logs "iv_rank read returned null components ... historical_days=0" until
+# ~30 trading days of live daily_atm_iv rows accumulate.  Override via
+# --symbols.
+DEFAULT_SYMBOLS = ["SPY", "QQQ", "SPX", "NDX"]
 
 
 def _backfill_symbol(symbol: str, days: int, statement_timeout_ms: int) -> tuple[int, int]:
