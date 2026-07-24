@@ -179,6 +179,9 @@ def test_backfill_resolves_alias_for_fetch_but_writes_canonical(monkeypatch):
     import src.tools.underlying_backfill as ub
 
     monkeypatch.setenv("SYMBOL_ALIASES", "SPX=$SPXW.X,NDX=$NDXP.X")
+    monkeypatch.setenv("TRADESTATION_CLIENT_ID", "cid")
+    monkeypatch.setenv("TRADESTATION_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("TRADESTATION_REFRESH_TOKEN", "crt")
     # backfill() calls fetch_symbol without sleep_seconds -> default 0.3s pause.
     monkeypatch.setattr(ub.time, "sleep", lambda *_a, **_k: None)
 
@@ -208,10 +211,13 @@ def test_backfill_resolves_alias_for_fetch_but_writes_canonical(monkeypatch):
         # Capture the symbol each row was written under (params[0]).
         written.extend(params[0] for params in conn._cur.seq)
 
-    monkeypatch.setattr(
-        "src.ingestion.tradestation_client.TradeStationClient",
-        lambda *a, **k: _Client(),
-    )
+    client_ctor: dict = {}
+
+    def _make_client(*a, **k):
+        client_ctor["args"] = a
+        return _Client()
+
+    monkeypatch.setattr("src.ingestion.tradestation_client.TradeStationClient", _make_client)
     monkeypatch.setattr("src.database.db_connection", _fake_db)
 
     result = ub.backfill(["NDX", "SPY"], date(2022, 1, 3), date(2022, 1, 3))
@@ -223,3 +229,6 @@ def test_backfill_resolves_alias_for_fetch_but_writes_canonical(monkeypatch):
     # Rows are written under the CANONICAL symbols, not the TS fetch symbols.
     assert sorted(written) == ["NDX", "SPY"]
     assert result == {"NDX": 1, "SPY": 1}
+    # Regression guard: the client is built from env credentials, not the
+    # invalid no-arg TradeStationClient() the tool used to call.
+    assert client_ctor["args"] == ("cid", "csecret", "crt")

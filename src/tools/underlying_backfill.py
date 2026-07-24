@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -222,7 +223,15 @@ def backfill(
     from src.database import db_connection
     from src.ingestion.tradestation_client import TradeStationClient
 
-    client = TradeStationClient()
+    # Construct from env credentials, same as the live entrypoints
+    # (main_engine / futures ingester). The no-arg TradeStationClient() the
+    # tool used before is invalid — the constructor requires the three creds.
+    client = TradeStationClient(
+        os.getenv("TRADESTATION_CLIENT_ID"),
+        os.getenv("TRADESTATION_CLIENT_SECRET"),
+        os.getenv("TRADESTATION_REFRESH_TOKEN"),
+        sandbox=os.getenv("TRADESTATION_USE_SANDBOX", "false").lower() == "true",
+    )
     written: Dict[str, int] = {}
     for symbol in symbols:
         # Resolve the canonical/DB symbol to its TradeStation fetch symbol via
