@@ -67,7 +67,7 @@ _FLOW_SERIES_CTE_TEMPLATE = """
                             SUM(CASE WHEN option_type='P' THEN net_premium_delta ELSE 0 END)::numeric AS put_premium_delta,
                             SUM(CASE WHEN option_type='C' THEN raw_volume_delta  ELSE 0 END)::bigint  AS call_volume_delta,
                             SUM(CASE WHEN option_type='P' THEN raw_volume_delta  ELSE 0 END)::bigint  AS put_volume_delta,
-                            SUM(net_volume_delta)::bigint                                             AS net_volume_delta,
+                            SUM(CASE WHEN option_type='C' THEN net_volume_delta ELSE -net_volume_delta END)::bigint                                             AS net_volume_delta,
                             SUM(raw_volume_delta)::bigint                                             AS raw_volume_delta,
                             SUM(CASE WHEN option_type='C' THEN net_volume_delta  ELSE 0 END)::bigint  AS call_position_delta,
                             SUM(CASE WHEN option_type='P' THEN net_volume_delta  ELSE 0 END)::bigint  AS put_position_delta,
@@ -143,7 +143,7 @@ _FLOW_SERIES_CTE_TEMPLATE = """
                         SUM(call_position_delta) OVER w_cum AS call_position_cum,
                         SUM(put_position_delta)  OVER w_cum AS put_position_cum,
                         (SUM(call_premium_delta) OVER w_cum
-                         + SUM(put_premium_delta) OVER w_cum) AS net_premium_cum,
+                         - SUM(put_premium_delta) OVER w_cum) AS net_premium_cum,
                         CASE
                             WHEN SUM(call_volume_delta) OVER w_cum > 0
                             THEN (SUM(put_volume_delta) OVER w_cum)::float8
@@ -351,7 +351,7 @@ per_bar_aggregates AS (
             AS call_volume_cum,
         COALESCE(SUM(CASE WHEN fbc.option_type = 'P' THEN fbc.raw_volume ELSE 0 END), 0)::bigint
             AS put_volume_cum,
-        COALESCE(SUM(fbc.net_volume), 0)::bigint AS net_volume_cum,
+        COALESCE(SUM(CASE WHEN fbc.option_type = 'C' THEN fbc.net_volume ELSE -fbc.net_volume END), 0)::bigint AS net_volume_cum,
         COALESCE(SUM(fbc.raw_volume), 0)::bigint AS raw_volume_cum,
         COALESCE(SUM(CASE WHEN fbc.option_type = 'C' THEN fbc.net_volume ELSE 0 END), 0)::bigint
             AS call_position_cum,
@@ -405,7 +405,7 @@ SELECT
     a.raw_volume_cum,
     a.call_position_cum,
     a.put_position_cum,
-    (a.call_premium_cum + a.put_premium_cum) AS net_premium_cum,
+    (a.call_premium_cum - a.put_premium_cum) AS net_premium_cum,
     CASE
         WHEN a.call_volume_cum > 0
         THEN a.put_volume_cum::float8 / a.call_volume_cum::float8

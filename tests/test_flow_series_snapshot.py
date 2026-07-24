@@ -22,6 +22,7 @@ Two layers, mirroring the existing flow-series tests:
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import date
 
 from src.api.database import _expected_flow_series_bars
@@ -29,6 +30,7 @@ from src.flow_series_sql import (
     FLOW_SERIES_COLUMNS,
     FLOW_SERIES_CTE_ASYNCPG,
     FLOW_SERIES_CTE_PSYCOPG2,
+    SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2,
     SNAPSHOT_SELECT_ASYNCPG,
     SNAPSHOT_UPSERT_PSYCOPG2,
 )
@@ -303,3 +305,52 @@ def test_snapshot_full_window_does_not_warn(caplog):
 
     assert len(result) == 82
     assert not any("shortfall" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Directional-sign regression guard — the "flow mirror" bug (Jul 2026)
+# ---------------------------------------------------------------------------
+#
+# net_premium_cum and net_volume_cum are DIRECTIONAL: bullish flow is
+# positive, bearish flow is negative. Buying puts is bearish, so the put
+# leg must be SUBTRACTED, never added:
+#
+#     net_premium_cum = call_premium_cum - put_premium_cum
+#     net_volume_cum  = (calls bought-sold) - (puts bought-sold)
+#
+# The original code ADDED the legs, which inverted the headline whenever
+# put flow dominated — it rendered as the mirror image of the true
+# directional signal (and of the documented "Cumulative Net Premium"
+# definition). These static guards lock the sign in every rendered form so
+# the bug cannot silently return. Value-level correctness is covered by the
+# integration parity harness (tests/test_flow_series_parity.py).
+
+
+def _collapse_ws(sql: str) -> str:
+    return re.sub(r"\s+", " ", sql)
+
+
+def test_net_premium_cum_subtracts_the_put_leg_in_every_form():
+    for sql in (FLOW_SERIES_CTE_ASYNCPG, FLOW_SERIES_CTE_PSYCOPG2):
+        norm = _collapse_ws(sql)
+        assert (
+            "- SUM(put_premium_delta) OVER w_cum) AS net_premium_cum" in norm
+        ), "net_premium_cum must SUBTRACT the put premium leg (directional)"
+        assert (
+            "+ SUM(put_premium_delta) OVER w_cum) AS net_premium_cum" not in norm
+        ), "net_premium_cum must not ADD the put leg — that is the mirror bug"
+    inc = _collapse_ws(SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2)
+    assert "a.call_premium_cum - a.put_premium_cum) AS net_premium_cum" in inc
+    assert "a.call_premium_cum + a.put_premium_cum) AS net_premium_cum" not in inc
+
+
+def test_net_volume_cum_is_directional_calls_minus_puts():
+    for sql in (FLOW_SERIES_CTE_ASYNCPG, FLOW_SERIES_CTE_PSYCOPG2):
+        norm = _collapse_ws(sql)
+        assert (
+            "THEN net_volume_delta ELSE -net_volume_delta END" in norm
+        ), "net_volume_cum must negate the put leg (directional net volume)"
+    inc = _collapse_ws(SNAPSHOT_INCREMENTAL_UPSERT_PSYCOPG2)
+    assert (
+        "THEN fbc.net_volume ELSE -fbc.net_volume END" in inc
+    ), "incremental net_volume_cum must negate the put leg to match the CTE"

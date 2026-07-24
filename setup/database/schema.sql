@@ -1004,11 +1004,11 @@ CREATE TABLE IF NOT EXISTS flow_series_5min (
     put_premium_cum   NUMERIC,
     call_volume_cum   BIGINT,
     put_volume_cum    BIGINT,
-    net_volume_cum    BIGINT,
+    net_volume_cum    BIGINT,   -- directional: (calls bought-sold) - (puts bought-sold); + = call-led/bullish
     raw_volume_cum    BIGINT,
     call_position_cum BIGINT,
     put_position_cum  BIGINT,
-    net_premium_cum   NUMERIC,
+    net_premium_cum   NUMERIC,   -- directional: call_premium_cum - put_premium_cum; + = bullish
     put_call_ratio    DOUBLE PRECISION,
     underlying_price  NUMERIC(12, 4),
     contract_count    INTEGER,
