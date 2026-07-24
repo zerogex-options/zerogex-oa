@@ -101,14 +101,28 @@ def test_build_tweet_body_close_shape(monkeypatch):
     mod = _reload_module()
     bulletins = [
         mod._shape_bulletin(
-            _summary_row("SPY", spot=744.51, gamma_flip=744.51, call_wall=750.0,
-                         put_wall=740.0, max_pain=742.0, net_gex=72_300_000.0),
+            _summary_row(
+                "SPY",
+                spot=744.51,
+                gamma_flip=744.51,
+                call_wall=750.0,
+                put_wall=740.0,
+                max_pain=742.0,
+                net_gex=72_300_000.0,
+            ),
             "SPY",
         ),
         mod._shape_bulletin(_summary_row("SPX"), "SPX"),
         mod._shape_bulletin(
-            _summary_row("QQQ", spot=655.4, gamma_flip=654.0, call_wall=660.0,
-                         put_wall=650.0, max_pain=653.0, net_gex=-125_000_000.0),
+            _summary_row(
+                "QQQ",
+                spot=655.4,
+                gamma_flip=654.0,
+                call_wall=660.0,
+                put_wall=650.0,
+                max_pain=653.0,
+                net_gex=-125_000_000.0,
+            ),
             "QQQ",
         ),
     ]
@@ -123,16 +137,16 @@ def test_build_tweet_body_close_shape(monkeypatch):
     # SPY's spot sits exactly on its gamma flip → cleanest setup → featured.
     assert body.featured_symbol == "SPY"
     assert body.lead_symbol == "SPY"
-    # Header is the single featured cashtag + mode label.
-    assert "$SPY post-market update:" in body.text
-    # The featured symbol's map renders WITHOUT a symbol prefix on the spot line.
-    assert "Current map:" in body.text
-    assert "Spot: ~744.51" in body.text
-    assert "Gamma Flip: 744.51" in body.text
-    assert "Call Wall: 750" in body.text
-    assert "Put Wall: 740" in body.text
-    assert "Max Pain: 742" in body.text
-    assert "Net GEX: +$72.3M" in body.text
+    # Header is the "…Read — $SYM" format the operator specified.
+    assert "Post-Market Read — $SPY" in body.text
+    # The deterministic Key levels block (Python owns the prices).
+    assert "Key levels:" in body.text
+    assert "• 740 → Put Wall" in body.text
+    assert "• 750 → Call Wall" in body.text
+    assert "• 744.51 → Gamma Flip" in body.text
+    # Net GEX is woven into the static hook prose.
+    assert "+$72.3M" in body.text
+    assert "Bottom line:" in body.text
     # The other two symbols get NO numeric block of their own.
     assert "SPX spot:" not in body.text
     assert "QQQ spot:" not in body.text
@@ -142,7 +156,7 @@ def test_build_tweet_body_close_shape(monkeypatch):
     assert "#" not in body.text
     # All three still count as present (fetched so the copy can cross-reference).
     assert body.symbols_present == ["SPY", "SPX", "QQQ"]
-    # The link rides in the threaded reply instead.
+    # The link rides in the threaded reply instead (static fallback reply).
     assert body.reply_text == "Free delayed SPY / SPX / QQQ gamma levels: https://zerogex.io"
 
 
@@ -150,9 +164,9 @@ def test_build_tweet_body_labels_per_mode():
     mod = _reload_module()
     bulletins = [mod._shape_bulletin(_summary_row("SPY", spot=744.51), "SPY")]
     for mode, expected in (
-        ("premarket", "pre-market update"),
-        ("midday", "midday update"),
-        ("close", "post-market update"),
+        ("premarket", "Morning Read — $SPY"),
+        ("midday", "Midday Read — $SPY"),
+        ("close", "Post-Market Read — $SPY"),
     ):
         body = mod.build_tweet_body(
             mode=mode,
@@ -219,8 +233,12 @@ async def test_fetch_bulletins_projects_spx_spot(monkeypatch):
     async def _fake_projection(db, symbol, *, at=None):
         if symbol.upper() == "SPX":
             return ImpliedIndexSpot(
-                symbol="SPX", implied_price=6432.0, cash_ref_close=6400.0,
-                future_now=6450.0, future_ref=6418.0, future_symbol="@ES",
+                symbol="SPX",
+                implied_price=6432.0,
+                cash_ref_close=6400.0,
+                future_now=6450.0,
+                future_ref=6418.0,
+                future_symbol="@ES",
             )
         return None
 
@@ -230,7 +248,12 @@ async def test_fetch_bulletins_projects_spx_spot(monkeypatch):
     db.get_latest_gex_summary = AsyncMock(
         side_effect=lambda sym: _summary_row(sym, spot=6400.0 if sym == "SPX" else 744.51)
     )
-    bulletins = await mod._fetch_bulletins(db, ["SPY", "SPX"])
+    # Price-action queries added by the news/price wiring — return None so the
+    # projection assertions stay the focus (best-effort, never fatal).
+    db.get_latest_forced_flow = AsyncMock(return_value=None)
+    db.get_session_closes = AsyncMock(return_value=None)
+    db.get_intraday_ohlc = AsyncMock(return_value=None)
+    bulletins = await mod._fetch_bulletins(db, ["SPY", "SPX"], date(2026, 7, 3))
     by_sym = {b.symbol: b for b in bulletins}
     # SPX spot replaced with the implied level and flagged.
     assert by_sym["SPX"].spot == pytest.approx(6432.0)
@@ -246,10 +269,12 @@ def test_build_tweet_body_lead_variant_deterministic_per_day():
     match), so the seed is deterministic on (date, mode)."""
     mod = _reload_module()
     bulletins = [mod._shape_bulletin(_summary_row("SPY"), "SPY")]
-    a = mod.build_tweet_body("close", date(2026, 7, 3), bulletins,
-                             site_url="https://zerogex.io", lead_symbol="SPY")
-    b = mod.build_tweet_body("close", date(2026, 7, 3), bulletins,
-                             site_url="https://zerogex.io", lead_symbol="SPY")
+    a = mod.build_tweet_body(
+        "close", date(2026, 7, 3), bulletins, site_url="https://zerogex.io", lead_symbol="SPY"
+    )
+    b = mod.build_tweet_body(
+        "close", date(2026, 7, 3), bulletins, site_url="https://zerogex.io", lead_symbol="SPY"
+    )
     assert a.text == b.text
 
 
@@ -257,15 +282,23 @@ def test_fallback_tweet_fits_in_280(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     mod = _reload_module()
     bulletins = [
-        mod._shape_bulletin(_summary_row("SPY", spot=744.51,
-                                          gamma_flip=744.51, call_wall=750.0,
-                                          put_wall=740.0, net_gex=72_300_000.0),
-                            "SPY"),
+        mod._shape_bulletin(
+            _summary_row(
+                "SPY",
+                spot=744.51,
+                gamma_flip=744.51,
+                call_wall=750.0,
+                put_wall=740.0,
+                net_gex=72_300_000.0,
+            ),
+            "SPY",
+        ),
         mod._shape_bulletin(_summary_row("SPX"), "SPX"),
         mod._shape_bulletin(_summary_row("QQQ", spot=655.4), "QQQ"),
     ]
-    body = mod.build_tweet_body("close", date(2026, 7, 3), bulletins,
-                                site_url="https://zerogex.io", lead_symbol="SPY")
+    body = mod.build_tweet_body(
+        "close", date(2026, 7, 3), bulletins, site_url="https://zerogex.io", lead_symbol="SPY"
+    )
     assert len(body.fallback) <= 280
     # Featured symbol's cashtag leads the fallback body.
     assert "$SPY" in body.fallback
@@ -284,13 +317,27 @@ def test_select_featured_symbol_picks_nearest_level():
     mod = _reload_module()
     # SPY spot ~7% below its nearest level; QQQ spot right on its put wall.
     spy = mod._shape_bulletin(
-        _summary_row("SPY", spot=744.51, gamma_flip=800.0, call_wall=820.0,
-                     put_wall=810.0, max_pain=805.0, net_gex=72_300_000.0),
+        _summary_row(
+            "SPY",
+            spot=744.51,
+            gamma_flip=800.0,
+            call_wall=820.0,
+            put_wall=810.0,
+            max_pain=805.0,
+            net_gex=72_300_000.0,
+        ),
         "SPY",
     )
     qqq = mod._shape_bulletin(
-        _summary_row("QQQ", spot=650.2, gamma_flip=654.0, call_wall=660.0,
-                     put_wall=650.0, max_pain=653.0, net_gex=-125_000_000.0),
+        _summary_row(
+            "QQQ",
+            spot=650.2,
+            gamma_flip=654.0,
+            call_wall=660.0,
+            put_wall=650.0,
+            max_pain=653.0,
+            net_gex=-125_000_000.0,
+        ),
         "QQQ",
     )
     featured = mod.select_featured_symbol([spy, qqq])
@@ -305,13 +352,27 @@ def test_select_featured_symbol_weights_gamma_flip_over_walls():
     under its flip (~0.047% raw); flip-weighting tips it to QQQ."""
     mod = _reload_module()
     spy = mod._shape_bulletin(
-        _summary_row("SPY", spot=750.77, gamma_flip=747.77, call_wall=751.0,
-                     put_wall=750.0, max_pain=745.0, net_gex=2_530_000_000.0),
+        _summary_row(
+            "SPY",
+            spot=750.77,
+            gamma_flip=747.77,
+            call_wall=751.0,
+            put_wall=750.0,
+            max_pain=745.0,
+            net_gex=2_530_000_000.0,
+        ),
         "SPY",
     )
     qqq = mod._shape_bulletin(
-        _summary_row("QQQ", spot=722.48, gamma_flip=722.82, call_wall=725.0,
-                     put_wall=715.0, max_pain=712.0, net_gex=-33_000_000.0),
+        _summary_row(
+            "QQQ",
+            spot=722.48,
+            gamma_flip=722.82,
+            call_wall=725.0,
+            put_wall=715.0,
+            max_pain=712.0,
+            net_gex=-33_000_000.0,
+        ),
         "QQQ",
     )
     # Raw nearest-level distance would pick SPY (0.031% < 0.047%); the flip
@@ -334,24 +395,26 @@ def test_select_featured_symbol_falls_back_when_none_eligible():
 def test_reply_text_carries_the_link(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     mod = _reload_module()
-    bulletins = [mod._shape_bulletin(
-        _summary_row("SPY", spot=744.51, gamma_flip=744.51), "SPY")]
-    body = mod.build_tweet_body("midday", date(2026, 7, 3), bulletins,
-                                site_url="https://zerogex.io/", lead_symbol="SPY")
-    # Trailing slash on the site URL is trimmed.
-    assert body.reply_text == (
-        "Free delayed SPY / SPX / QQQ gamma levels: https://zerogex.io"
+    bulletins = [mod._shape_bulletin(_summary_row("SPY", spot=744.51, gamma_flip=744.51), "SPY")]
+    body = mod.build_tweet_body(
+        "midday", date(2026, 7, 3), bulletins, site_url="https://zerogex.io/", lead_symbol="SPY"
     )
+    # Trailing slash on the site URL is trimmed.
+    assert body.reply_text == ("Free delayed SPY / SPX / QQQ gamma levels: https://zerogex.io")
 
 
 def test_reply_text_env_override(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     mod = _reload_module()
-    bulletins = [mod._shape_bulletin(
-        _summary_row("SPY", spot=744.51, gamma_flip=744.51), "SPY")]
-    body = mod.build_tweet_body("midday", date(2026, 7, 3), bulletins,
-                                site_url="https://zerogex.io", lead_symbol="SPY",
-                                reply_text="Custom reply — zerogex.io")
+    bulletins = [mod._shape_bulletin(_summary_row("SPY", spot=744.51, gamma_flip=744.51), "SPY")]
+    body = mod.build_tweet_body(
+        "midday",
+        date(2026, 7, 3),
+        bulletins,
+        site_url="https://zerogex.io",
+        lead_symbol="SPY",
+        reply_text="Custom reply — zerogex.io",
+    )
     assert body.reply_text == "Custom reply — zerogex.io"
 
 
@@ -377,8 +440,9 @@ def test_post_bulletin_posts_main_then_link_reply(monkeypatch):
         reply_text="Free delayed SPY / SPX / QQQ gamma levels: https://zerogex.io",
         featured_symbol="SPY",
     )
-    result = mod.post_bulletin(tweet, mod.MediaArtifacts(), bearer="tok",
-                               long=True, mode_label="midday")
+    result = mod.post_bulletin(
+        tweet, mod.MediaArtifacts(), bearer="tok", long=True, mode_label="midday"
+    )
     assert result["id"] == "main-123"
     assert result["reply_id"] == "reply-456"
     # Two posts: main (reply_to None) then the link reply (reply_to = main id).
@@ -402,11 +466,16 @@ def test_post_bulletin_survives_failed_reply(monkeypatch):
     monkeypatch.setattr(mod, "_upload_media_files", lambda media: [])
 
     tweet = mod.TweetBody(
-        text="body", fallback="body", lead_symbol="SPY", symbols_present=["SPY"],
-        reply_text="link", featured_symbol="SPY",
+        text="body",
+        fallback="body",
+        lead_symbol="SPY",
+        symbols_present=["SPY"],
+        reply_text="link",
+        featured_symbol="SPY",
     )
-    result = mod.post_bulletin(tweet, mod.MediaArtifacts(), bearer="tok",
-                               long=True, mode_label="midday")
+    result = mod.post_bulletin(
+        tweet, mod.MediaArtifacts(), bearer="tok", long=True, mode_label="midday"
+    )
     assert result["id"] == "main-789"
     assert "reply_id" not in result
 
@@ -429,10 +498,17 @@ async def test_dry_run_persists_reply_artifact(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "render_replay_clip", lambda *a, **k: None)
     monkeypatch.delenv("X_BOT_BEARER_TOKEN", raising=False)
 
-    args = mod._parse_args([
-        "--mode", "close", "--date", "2026-07-06",
-        "--artifact-dir", str(tmp_path), "--allow-non-trading-day",
-    ])
+    args = mod._parse_args(
+        [
+            "--mode",
+            "close",
+            "--date",
+            "2026-07-06",
+            "--artifact-dir",
+            str(tmp_path),
+            "--allow-non-trading-day",
+        ]
+    )
     rc = await mod._run(args)
     assert rc == 0
 
@@ -476,19 +552,22 @@ async def test_dry_run_writes_artifacts_and_never_posts(tmp_path, monkeypatch):
     # Skip actual network calls to the frontend PNG endpoint and to the
     # Playwright helper.  Return None so both media renders "fail" —
     # exactly like a fresh install with no frontend reachable.
-    monkeypatch.setattr(mod, "render_bulletin_png",
-                        lambda *args, **kwargs: None)
-    monkeypatch.setattr(mod, "render_replay_clip",
-                        lambda *args, **kwargs: None)
+    monkeypatch.setattr(mod, "render_bulletin_png", lambda *args, **kwargs: None)
+    monkeypatch.setattr(mod, "render_replay_clip", lambda *args, **kwargs: None)
 
     monkeypatch.delenv("X_BOT_BEARER_TOKEN", raising=False)
 
-    args = mod._parse_args([
-        "--mode", "close",
-        "--date", "2026-07-06",  # Monday
-        "--artifact-dir", str(tmp_path),
-        "--allow-non-trading-day",
-    ])
+    args = mod._parse_args(
+        [
+            "--mode",
+            "close",
+            "--date",
+            "2026-07-06",  # Monday
+            "--artifact-dir",
+            str(tmp_path),
+            "--allow-non-trading-day",
+        ]
+    )
     rc = await mod._run(args)
     assert rc == 0
 
@@ -512,11 +591,16 @@ async def test_skips_non_trading_days(tmp_path, monkeypatch, caplog):
     db_instance.get_latest_gex_summary = AsyncMock(return_value=_summary_row("SPX"))
     monkeypatch.setattr(mod, "DatabaseManager", lambda: db_instance)
 
-    args = mod._parse_args([
-        "--mode", "midday",
-        "--date", "2026-07-04",  # Saturday
-        "--artifact-dir", str(tmp_path),
-    ])
+    args = mod._parse_args(
+        [
+            "--mode",
+            "midday",
+            "--date",
+            "2026-07-04",  # Saturday
+            "--artifact-dir",
+            str(tmp_path),
+        ]
+    )
     with caplog.at_level("INFO", logger="zerogex.bulletin_tweet"):
         rc = await mod._run(args)
     assert rc == 0
@@ -536,12 +620,17 @@ async def test_skips_when_every_symbol_missing(tmp_path, monkeypatch, caplog):
     db_instance.get_latest_gex_summary = AsyncMock(return_value=None)
     monkeypatch.setattr(mod, "DatabaseManager", lambda: db_instance)
 
-    args = mod._parse_args([
-        "--mode", "close",
-        "--date", "2026-07-06",  # Monday
-        "--artifact-dir", str(tmp_path),
-        "--allow-non-trading-day",
-    ])
+    args = mod._parse_args(
+        [
+            "--mode",
+            "close",
+            "--date",
+            "2026-07-06",  # Monday
+            "--artifact-dir",
+            str(tmp_path),
+            "--allow-non-trading-day",
+        ]
+    )
     with caplog.at_level("INFO", logger="zerogex.bulletin_tweet"):
         rc = await mod._run(args)
     assert rc == 0
@@ -558,11 +647,16 @@ async def test_never_raises_on_db_failure(tmp_path, monkeypatch, caplog):
     db_instance.disconnect = AsyncMock()
     monkeypatch.setattr(mod, "DatabaseManager", lambda: db_instance)
 
-    args = mod._parse_args([
-        "--mode", "premarket",
-        "--date", "2026-07-06",  # Monday
-        "--artifact-dir", str(tmp_path),
-    ])
+    args = mod._parse_args(
+        [
+            "--mode",
+            "premarket",
+            "--date",
+            "2026-07-06",  # Monday
+            "--artifact-dir",
+            str(tmp_path),
+        ]
+    )
     with caplog.at_level("WARNING", logger="zerogex.bulletin_tweet"):
         rc = await mod._run(args)
     assert rc == 0
@@ -682,14 +776,22 @@ def test_percent_encode_leaves_unreserved_alone():
 def test_load_credentials_from_env_reports_all_missing(monkeypatch):
     from src.jobs import x_media_client as xm
 
-    for k in ("X_BOT_API_KEY", "X_BOT_API_SECRET",
-              "X_BOT_ACCESS_TOKEN", "X_BOT_ACCESS_TOKEN_SECRET"):
+    for k in (
+        "X_BOT_API_KEY",
+        "X_BOT_API_SECRET",
+        "X_BOT_ACCESS_TOKEN",
+        "X_BOT_ACCESS_TOKEN_SECRET",
+    ):
         monkeypatch.delenv(k, raising=False)
     with pytest.raises(xm.MissingCredentialsError) as ex:
         xm.load_credentials_from_env()
     # Every missing var should be listed — operator gets a single log line
-    for k in ("X_BOT_API_KEY", "X_BOT_API_SECRET",
-              "X_BOT_ACCESS_TOKEN", "X_BOT_ACCESS_TOKEN_SECRET"):
+    for k in (
+        "X_BOT_API_KEY",
+        "X_BOT_API_SECRET",
+        "X_BOT_ACCESS_TOKEN",
+        "X_BOT_ACCESS_TOKEN_SECRET",
+    ):
         assert k in str(ex.value)
 
 
@@ -710,122 +812,152 @@ def test_build_tweet_body_falls_back_to_template_without_api_key(monkeypatch):
         mod._shape_bulletin(_summary_row("SPY", spot=744.51), "SPY"),
         mod._shape_bulletin(_summary_row("SPX"), "SPX"),
     ]
-    body = mod.build_tweet_body("close", date(2026, 7, 3), bulletins,
-                                site_url="https://zerogex.io", lead_symbol="SPX")
-    # Static template = the deterministic lead sentence + the featured
-    # symbol's numeric map, no LLM-specific phrasing.
-    assert "post-market update:" in body.text
-    assert "Current map:" in body.text
-    # The static template no longer appends a site link or a hashtag row.
+    body = mod.build_tweet_body(
+        "close", date(2026, 7, 3), bulletins, site_url="https://zerogex.io", lead_symbol="SPX"
+    )
+    # Static fallback = the deterministic "…Read — $SYM" header + hook +
+    # Key levels + Bottom line, no LLM-specific phrasing.
+    assert "Post-Market Read — $" in body.text
+    assert "Key levels:" in body.text
+    assert "Bottom line:" in body.text
+    # The static fallback never appends a site link or a hashtag row.
     assert "#Gamma" not in body.text
     assert "zerogex.io" not in body.text
     assert "http" not in body.text
 
 
-def test_build_tweet_body_uses_llm_when_generator_returns_section(monkeypatch):
-    """When bulletin_llm.generate_narrative returns a section, the composed
-    body swaps in the LLM prose but keeps the deterministic numeric block."""
+def test_build_tweet_body_uses_llm_when_generator_returns_post(monkeypatch):
+    """When bulletin_llm.generate_post returns a post, the composed body
+    swaps in the LLM prose but keeps the deterministic Key levels block, and
+    the reply carries the LLM copy + the ZeroGEX link."""
     mod = _reload_module()
     from src.jobs import bulletin_llm
 
     def _fake_generate(**kwargs):
-        return bulletin_llm.LlmSection(
-            header_label="post-market update",
+        return bulletin_llm.LlmPost(
+            header_label="Post-Market Read",
             opening=(
                 "Interesting close into the holiday.\n\n"
                 "The morning started long-gamma, then the walls broke down."
             ),
-            clean_read=(
-                "The clean read:\n\n"
-                "SPY finished pinned at the flip. SPX held its box."
+            bottom_line=(
+                "With the market closed tomorrow, this is a fitting place " "to leave it."
             ),
-            closing=(
-                "With the market closed tomorrow, this is a fitting place "
-                "to leave it."
+            reply=(
+                "Levels are zones of influence, not guarantees.\n\n"
+                "More live positioning and dealer gamma analytics:"
             ),
-            signoff="Happy 250th, America. 🇺🇸",
+            level_notes={"put_wall": "held", "gamma_flip": "the pivot"},
         )
 
-    monkeypatch.setattr(bulletin_llm, "generate_narrative", _fake_generate)
+    monkeypatch.setattr(bulletin_llm, "generate_post", _fake_generate)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
 
     bulletins = [
         mod._shape_bulletin(
-            _summary_row("SPY", spot=744.51, gamma_flip=744.51,
-                         call_wall=750.0, put_wall=740.0, max_pain=742.0,
-                         net_gex=72_300_000.0),
+            _summary_row(
+                "SPY",
+                spot=744.51,
+                gamma_flip=744.51,
+                call_wall=750.0,
+                put_wall=740.0,
+                max_pain=742.0,
+                net_gex=72_300_000.0,
+            ),
             "SPY",
         ),
         mod._shape_bulletin(_summary_row("SPX"), "SPX"),
     ]
-    body = mod.build_tweet_body("close", date(2026, 7, 3), bulletins,
-                                site_url="https://zerogex.io", lead_symbol="SPX")
+    body = mod.build_tweet_body(
+        "close", date(2026, 7, 3), bulletins, site_url="https://zerogex.io", lead_symbol="SPX"
+    )
 
     # SPY sits on its gamma flip → it's the featured symbol.
     assert body.featured_symbol == "SPY"
-    # The LLM's narrative shows up verbatim
+    # The LLM's narrative shows up verbatim, under the validated read header.
+    assert "Post-Market Read — $SPY" in body.text
     assert "Interesting close into the holiday." in body.text
-    assert "The clean read:" in body.text
-    assert "Happy 250th, America." in body.text
-    # But the numeric map is still the deterministic Python-composed one,
-    # rendered prefix-less under the featured header.
-    assert "Current map:" in body.text
-    assert "Spot: ~744.51" in body.text
-    assert "Net GEX: +$72.3M" in body.text
-    # No hashtag row / link — the post ends on the LLM's signoff.
+    assert "Bottom line: With the market closed tomorrow" in body.text
+    # The Key levels block is still the deterministic Python-composed one,
+    # with the LLM's short notes in parentheses.
+    assert "Key levels:" in body.text
+    assert "• 740 → Put Wall (held)" in body.text
+    assert "• 744.51 → Gamma Flip (the pivot)" in body.text
+    # No hashtag row / link in the main post; the link rides in the reply.
     assert "#Gamma" not in body.text
     assert "zerogex.io" not in body.text
-    assert body.text.rstrip().endswith("Happy 250th, America. 🇺🇸")
+    # The reply is the LLM copy + the appended ZeroGEX link on the CTA line.
+    assert "Levels are zones of influence" in body.reply_text
+    assert body.reply_text.endswith(
+        "More live positioning and dealer gamma analytics: https://zerogex.io"
+    )
 
 
-def test_llm_section_falls_back_when_generator_returns_none(monkeypatch):
-    """A None from the LLM path → static template composes the body.
+def test_llm_post_falls_back_when_generator_returns_none(monkeypatch):
+    """A None from the LLM path → static fallback composes the body.
 
     Covers the API-error + malformed-reply paths without needing to
     mock the whole HTTP layer."""
     mod = _reload_module()
     from src.jobs import bulletin_llm
 
-    monkeypatch.setattr(bulletin_llm, "generate_narrative", lambda **k: None)
+    monkeypatch.setattr(bulletin_llm, "generate_post", lambda **k: None)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
 
     bulletins = [mod._shape_bulletin(_summary_row("SPY", spot=744.51), "SPY")]
-    body = mod.build_tweet_body("close", date(2026, 7, 3), bulletins,
-                                site_url="https://zerogex.io", lead_symbol="SPY")
-    # Template-shape check: the one-line lead sentence variant is present
-    # somewhere in the body.
-    assert "post-market update:" in body.text
-    assert any(v in body.text for v in mod.MODE_COPY["close"].lead_variants)
+    body = mod.build_tweet_body(
+        "close", date(2026, 7, 3), bulletins, site_url="https://zerogex.io", lead_symbol="SPY"
+    )
+    # Static fallback shape: the "…Read — $SYM" header + Bottom line.
+    assert "Post-Market Read — $SPY" in body.text
+    assert "Bottom line:" in body.text
 
 
 def test_llm_invented_price_guard():
-    """Model output that quotes a fabricated price falls the section back
+    """Model output that quotes a fabricated price falls the post back
     to None — never post a wrong number."""
     from src.jobs import bulletin_llm
 
-    section = bulletin_llm.LlmSection(
-        header_label="update",
+    post = bulletin_llm.LlmPost(
+        header_label="Midday Read",
         opening="SPY looks pinned to $999.99.",  # invented — not in inputs
-        clean_read="Nothing to see here.",
-        closing="",
-        signoff="",
+        bottom_line="Nothing to see here.",
+        reply="Watch the levels:",
+        level_notes={},
     )
     inputs = [
         bulletin_llm.SymbolInput(symbol="SPY", spot=744.51, gamma_flip=744.51),
     ]
-    assert bulletin_llm._validate_no_invented_prices(section, inputs) is False
+    assert bulletin_llm._validate_no_invented_prices(post, inputs) is False
+
+
+def test_llm_invented_price_guard_scans_reply():
+    """A fabricated price hidden in the reply is caught too, not just the post."""
+    from src.jobs import bulletin_llm
+
+    post = bulletin_llm.LlmPost(
+        header_label="Midday Read",
+        opening="SPY held its structure.",
+        bottom_line="Still short gamma.",
+        reply="Watch 6,123 into the close:",  # invented — not in inputs
+        level_notes={},
+    )
+    inputs = [
+        bulletin_llm.SymbolInput(symbol="SPY", spot=744.51, gamma_flip=744.51),
+    ]
+    assert bulletin_llm._validate_no_invented_prices(post, inputs) is False
 
 
 def test_llm_validator_accepts_input_prices():
-    """A section that only quotes numbers actually in the inputs passes."""
+    """A post that only quotes numbers actually in the inputs passes."""
     from src.jobs import bulletin_llm
 
-    section = bulletin_llm.LlmSection(
-        header_label="update",
+    post = bulletin_llm.LlmPost(
+        header_label="Midday Read",
         opening="SPX sits at 7,483 with the gamma flip at 7,448.",
-        clean_read="Call wall 7,500, put wall 7,480.",
-        closing="Watch the flip.",
-        signoff="",
+        bottom_line="Call wall 7,500, put wall 7,480. Watch the flip.",
+        reply="More analytics:",
+        level_notes={},
     )
     inputs = [
         bulletin_llm.SymbolInput(
@@ -836,20 +968,19 @@ def test_llm_validator_accepts_input_prices():
             put_wall=7480.0,
         ),
     ]
-    assert bulletin_llm._validate_no_invented_prices(section, inputs) is True
+    assert bulletin_llm._validate_no_invented_prices(post, inputs) is True
 
 
 def test_llm_extract_json_block_ignores_preamble():
     from src.jobs import bulletin_llm
 
     reply = (
-        "Sure, here you go:\n"
-        '{"header_label": "update", "opening": "hello"}\n'
-        "Hope that helps."
+        "Sure, here you go:\n" '{"header_label": "update", "opening": "hello"}\n' "Hope that helps."
     )
     block = bulletin_llm._extract_json_block(reply)
     assert block is not None
     import json as _json
+
     assert _json.loads(block) == {"header_label": "update", "opening": "hello"}
 
 
@@ -858,9 +989,14 @@ def test_llm_generate_returns_none_without_api_key(monkeypatch):
 
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     inputs = [bulletin_llm.SymbolInput(symbol="SPY", spot=744.51)]
-    assert bulletin_llm.generate_narrative(
-        mode="close", day=date(2026, 7, 3), symbols=inputs,
-    ) is None
+    assert (
+        bulletin_llm.generate_post(
+            mode="close",
+            day=date(2026, 7, 3),
+            symbols=inputs,
+        )
+        is None
+    )
 
 
 def test_next_trading_day_skips_weekend():
@@ -870,6 +1006,154 @@ def test_next_trading_day_skips_weekend():
     # NYSE_HOLIDAYS is env-driven and unset in the test process, so a
     # holiday-eve assertion here would depend on production config.
     assert next_trading_day(date(2026, 1, 2)).isoformat() == "2026-01-05"
+
+
+# ---------------------------------------------------------------------------
+# New-voice compose: reply link handling, Key levels block, regime/momentum
+# ---------------------------------------------------------------------------
+
+
+def test_compose_reply_appends_link_on_cta_colon():
+    mod = _reload_module()
+    out = mod._compose_reply("More live dealer gamma analytics:", "https://zerogex.io/")
+    # CTA colon → URL on the same line; trailing slash trimmed.
+    assert out == "More live dealer gamma analytics: https://zerogex.io"
+
+
+def test_compose_reply_puts_url_on_own_paragraph_without_colon():
+    mod = _reload_module()
+    out = mod._compose_reply("Levels are zones of influence.", "https://zerogex.io")
+    assert out == "Levels are zones of influence.\n\nhttps://zerogex.io"
+
+
+def test_compose_reply_strips_model_url_and_uses_canonical():
+    mod = _reload_module()
+    out = mod._compose_reply("Follow along at https://evil.example.com now:", "https://zerogex.io")
+    assert "evil.example.com" not in out
+    assert out.endswith("https://zerogex.io")
+
+
+def test_compose_reply_override_wins():
+    mod = _reload_module()
+    out = mod._compose_reply(
+        "ignored llm reply:", "https://zerogex.io", override="Custom — zerogex.io"
+    )
+    assert out == "Custom — zerogex.io"
+
+
+def test_compose_reply_static_fallback_when_no_llm():
+    mod = _reload_module()
+    out = mod._compose_reply(None, "https://zerogex.io")
+    assert out == "Free delayed SPY / SPX / QQQ gamma levels: https://zerogex.io"
+
+
+def test_key_levels_block_orders_and_formats():
+    mod = _reload_module()
+    b = mod._shape_bulletin(
+        _summary_row(
+            "SPY",
+            spot=743.0,
+            gamma_flip=747.29,
+            call_wall=745.0,
+            put_wall=740.0,
+            max_pain=742.0,
+            net_gex=-3_400_000_000.0,
+        ),
+        "SPY",
+    )
+    block = mod._key_levels_block(b, {"put_wall": "now the level to watch"})
+    lines = block.splitlines()
+    # Order: Put Wall, Call Wall, Gamma Flip.
+    assert lines[0] == "• 740 → Put Wall (now the level to watch)"
+    assert lines[1] == "• 745 → Call Wall"
+    # Whole-dollar walls print without decimals; the flip keeps two.
+    assert lines[2] == "• 747.29 → Gamma Flip"
+
+
+def test_derive_regime_prefers_net_gex_sign():
+    mod = _reload_module()
+    assert mod._derive_regime(-3.4e9, 743.0, 747.0) == "negative"
+    assert mod._derive_regime(2.5e9, 751.0, 747.0) == "positive"
+    # No net GEX → fall back to spot vs flip.
+    assert mod._derive_regime(None, 743.0, 747.0) == "negative"
+    assert mod._derive_regime(None, 751.0, 747.0) == "positive"
+    assert mod._derive_regime(None, None, None) is None
+
+
+def test_derive_momentum_label_combines_direction_and_range():
+    mod = _reload_module()
+    b = mod.SymbolBulletin(
+        symbol="SPY",
+        spot=744.8,
+        prior_close=744.0,
+        session_open=744.1,
+        session_high=745.0,
+        session_low=740.0,
+    )
+    label = mod._derive_momentum_label(b)
+    assert "up on the day" in label
+    assert "pressing session highs" in label
+
+
+@pytest.mark.asyncio
+async def test_attach_price_action_sets_prior_close_and_regime():
+    mod = _reload_module()
+    b = mod._shape_bulletin(
+        _summary_row("SPY", spot=743.0, gamma_flip=747.0, net_gex=-3.4e9), "SPY"
+    )
+    db = MagicMock()
+    db.get_session_closes = AsyncMock(return_value={"prior_session_close": 744.0})
+    db.get_intraday_ohlc = AsyncMock(
+        return_value={
+            "session_open": 744.1,
+            "session_high": 745.0,
+            "session_low": 739.6,
+            "session_last": 743.0,
+            "bar_count": 180,
+        }
+    )
+    await mod._attach_price_action(db, b, date(2026, 7, 3))
+    assert b.prior_close == pytest.approx(744.0)
+    assert b.session_low == pytest.approx(739.6)
+    assert b.regime == "negative"  # spot below flip, net gex negative
+    assert b.momentum_label  # derived, non-empty
+
+
+def test_latest_record_roundtrip(tmp_path, monkeypatch):
+    """build_latest_record → write_latest_record → read_latest_record."""
+    mod = _reload_module()
+    monkeypatch.setenv("BULLETIN_TWEET_ARTIFACT_DIR", str(tmp_path))
+    feat = mod._shape_bulletin(
+        _summary_row(
+            "SPY", spot=744.51, gamma_flip=747.0, put_wall=740.0, call_wall=750.0, net_gex=-1.2e9
+        ),
+        "SPY",
+    )
+    tweet = mod.TweetBody(
+        text="Midday Read — $SPY\n\nbody",
+        fallback="$SPY midday",
+        lead_symbol="SPY",
+        symbols_present=["SPY"],
+        reply_text="Watch the levels: https://zerogex.io",
+        featured_symbol="SPY",
+    )
+    rec = mod.build_latest_record(
+        mode="midday",
+        day=date(2026, 7, 3),
+        tweet=tweet,
+        featured=feat,
+        headlines=[{"title": "Oil eases", "summary": "", "source": "CNBC"}],
+        generated_at="2026-07-03T12:30:00-04:00",
+    )
+    path = mod.write_latest_record(rec)
+    assert path is not None and path.exists()
+    got = mod.read_latest_record("SPY", "midday")
+    assert got["post_text"] == "Midday Read — $SPY\n\nbody"
+    assert got["reply_text"].endswith("https://zerogex.io")
+    assert got["timing_label"] == "Midday Read"
+    assert got["headlines"][0]["title"] == "Oil eases"
+    # Absent (symbol, mode) → None, not an error.
+    assert mod.read_latest_record("QQQ", "close") is None
 
 
 # ---------------------------------------------------------------------------
@@ -911,20 +1195,23 @@ async def test_stage_flag_writes_pending_and_calls_hook(tmp_path, monkeypatch):
     hook_called_marker = tmp_path / "hook_fired"
     hook_script = tmp_path / "hook.sh"
     hook_script.write_text(
-        "#!/bin/bash\n"
-        f'touch {hook_called_marker}\n'
-        f'echo "$1" > {hook_called_marker}.mode\n'
+        "#!/bin/bash\n" f"touch {hook_called_marker}\n" f'echo "$1" > {hook_called_marker}.mode\n'
     )
     hook_script.chmod(0o755)
     monkeypatch.setenv("BULLETIN_TWEET_NOTIFY_HOOK", str(hook_script))
 
-    args = mod._parse_args([
-        "--mode", "close",
-        "--date", "2026-07-06",  # Monday
-        "--artifact-dir", str(tmp_path / "artifacts"),
-        "--stage",
-        "--allow-non-trading-day",
-    ])
+    args = mod._parse_args(
+        [
+            "--mode",
+            "close",
+            "--date",
+            "2026-07-06",  # Monday
+            "--artifact-dir",
+            str(tmp_path / "artifacts"),
+            "--stage",
+            "--allow-non-trading-day",
+        ]
+    )
     rc = await mod._run(args)
     assert rc == 0
 
@@ -970,13 +1257,18 @@ async def test_autopilot_env_var_upgrades_stage_to_post(tmp_path, monkeypatch):
     monkeypatch.setenv("BULLETIN_TWEET_AUTOPILOT", "1")
     monkeypatch.delenv("BULLETIN_TWEET_NOTIFY_HOOK", raising=False)
 
-    args = mod._parse_args([
-        "--mode", "close",
-        "--date", "2026-07-06",
-        "--artifact-dir", str(tmp_path),
-        "--stage",  # would normally skip POST — but autopilot upgrades it
-        "--allow-non-trading-day",
-    ])
+    args = mod._parse_args(
+        [
+            "--mode",
+            "close",
+            "--date",
+            "2026-07-06",
+            "--artifact-dir",
+            str(tmp_path),
+            "--stage",  # would normally skip POST — but autopilot upgrades it
+            "--allow-non-trading-day",
+        ]
+    )
     rc = await mod._run(args)
     assert rc == 0
 
@@ -1002,18 +1294,22 @@ def test_approve_module_reads_pending_manifest_and_posts(tmp_path, monkeypatch):
     art_dir.mkdir(parents=True)
     (art_dir / "tweet_text.md").write_text("hello world\n")
     (art_dir / "tweet_text_fallback.md").write_text("hello\n")
-    (art_dir / "manifest.json").write_text(json.dumps({
-        "mode": "close",
-        "date": "2026-07-06",
-        "state": "pending",
-        "posted_id": None,
-        "lead_symbol": "SPX",
-        "symbols_present": ["SPY", "SPX", "QQQ"],
-        "text_len": 11,
-        "fallback_len": 5,
-        "media": {"png": None, "clip": None},
-        "bulletins": [],
-    }))
+    (art_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "mode": "close",
+                "date": "2026-07-06",
+                "state": "pending",
+                "posted_id": None,
+                "lead_symbol": "SPX",
+                "symbols_present": ["SPY", "SPX", "QQQ"],
+                "text_len": 11,
+                "fallback_len": 5,
+                "media": {"png": None, "clip": None},
+                "bulletins": [],
+            }
+        )
+    )
 
     posts: list[dict] = []
 
@@ -1024,11 +1320,16 @@ def test_approve_module_reads_pending_manifest_and_posts(tmp_path, monkeypatch):
     monkeypatch.setattr(bulletin_approve, "post_bulletin", _fake_post)
     monkeypatch.setenv("X_BOT_BEARER_TOKEN", "test-bearer")
 
-    args = bulletin_approve._parse_args([
-        "--mode", "close",
-        "--date", "2026-07-06",
-        "--artifact-dir", str(tmp_path),
-    ])
+    args = bulletin_approve._parse_args(
+        [
+            "--mode",
+            "close",
+            "--date",
+            "2026-07-06",
+            "--artifact-dir",
+            str(tmp_path),
+        ]
+    )
     rc = bulletin_approve._run(args)
     assert rc == 0
     assert len(posts) == 1
@@ -1051,29 +1352,41 @@ def test_approve_module_is_idempotent_when_already_posted(tmp_path, monkeypatch)
     art_dir.mkdir(parents=True)
     (art_dir / "tweet_text.md").write_text("hi\n")
     (art_dir / "tweet_text_fallback.md").write_text("hi\n")
-    (art_dir / "manifest.json").write_text(json.dumps({
-        "mode": "close",
-        "date": "2026-07-06",
-        "state": "posted",
-        "posted_id": "prior-tweet-id",
-        "lead_symbol": "SPX",
-        "symbols_present": ["SPX"],
-        "text_len": 3, "fallback_len": 3,
-        "media": {"png": None, "clip": None},
-        "bulletins": [],
-    }))
+    (art_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "mode": "close",
+                "date": "2026-07-06",
+                "state": "posted",
+                "posted_id": "prior-tweet-id",
+                "lead_symbol": "SPX",
+                "symbols_present": ["SPX"],
+                "text_len": 3,
+                "fallback_len": 3,
+                "media": {"png": None, "clip": None},
+                "bulletins": [],
+            }
+        )
+    )
 
     posts: list[dict] = []
     monkeypatch.setattr(
-        bulletin_approve, "post_bulletin", lambda **k: posts.append(k) or {"id": "OOPS"},
+        bulletin_approve,
+        "post_bulletin",
+        lambda **k: posts.append(k) or {"id": "OOPS"},
     )
     monkeypatch.setenv("X_BOT_BEARER_TOKEN", "test-bearer")
 
-    args = bulletin_approve._parse_args([
-        "--mode", "close",
-        "--date", "2026-07-06",
-        "--artifact-dir", str(tmp_path),
-    ])
+    args = bulletin_approve._parse_args(
+        [
+            "--mode",
+            "close",
+            "--date",
+            "2026-07-06",
+            "--artifact-dir",
+            str(tmp_path),
+        ]
+    )
     rc = bulletin_approve._run(args)
     assert rc == 0
     # post_bulletin must NEVER be called on an already-posted draft.
@@ -1088,12 +1401,22 @@ def test_approve_module_discard_marks_state_and_skips_post(tmp_path, monkeypatch
     art_dir.mkdir(parents=True)
     (art_dir / "tweet_text.md").write_text("hi\n")
     (art_dir / "tweet_text_fallback.md").write_text("hi\n")
-    (art_dir / "manifest.json").write_text(json.dumps({
-        "mode": "close", "date": "2026-07-06", "state": "pending", "posted_id": None,
-        "lead_symbol": "SPX", "symbols_present": ["SPX"],
-        "text_len": 3, "fallback_len": 3,
-        "media": {"png": None, "clip": None}, "bulletins": [],
-    }))
+    (art_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "mode": "close",
+                "date": "2026-07-06",
+                "state": "pending",
+                "posted_id": None,
+                "lead_symbol": "SPX",
+                "symbols_present": ["SPX"],
+                "text_len": 3,
+                "fallback_len": 3,
+                "media": {"png": None, "clip": None},
+                "bulletins": [],
+            }
+        )
+    )
 
     def _boom(**k):
         raise AssertionError("discard called post_bulletin!")
@@ -1101,10 +1424,17 @@ def test_approve_module_discard_marks_state_and_skips_post(tmp_path, monkeypatch
     monkeypatch.setattr(bulletin_approve, "post_bulletin", _boom)
     monkeypatch.setenv("X_BOT_BEARER_TOKEN", "test-bearer")
 
-    args = bulletin_approve._parse_args([
-        "--mode", "close", "--date", "2026-07-06",
-        "--artifact-dir", str(tmp_path), "--discard",
-    ])
+    args = bulletin_approve._parse_args(
+        [
+            "--mode",
+            "close",
+            "--date",
+            "2026-07-06",
+            "--artifact-dir",
+            str(tmp_path),
+            "--discard",
+        ]
+    )
     rc = bulletin_approve._run(args)
     assert rc == 0
 
@@ -1124,19 +1454,35 @@ def test_approve_prints_for_manual_when_bearer_unset(tmp_path, monkeypatch, caps
     art_dir.mkdir(parents=True)
     (art_dir / "tweet_text.md").write_text("full tweet body here\n")
     (art_dir / "tweet_text_fallback.md").write_text("short\n")
-    (art_dir / "manifest.json").write_text(json.dumps({
-        "mode": "close", "date": "2026-07-06", "state": "pending", "posted_id": None,
-        "lead_symbol": "SPX", "symbols_present": ["SPX"],
-        "text_len": 20, "fallback_len": 5,
-        "media": {"png": None, "clip": None}, "bulletins": [],
-    }))
+    (art_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "mode": "close",
+                "date": "2026-07-06",
+                "state": "pending",
+                "posted_id": None,
+                "lead_symbol": "SPX",
+                "symbols_present": ["SPX"],
+                "text_len": 20,
+                "fallback_len": 5,
+                "media": {"png": None, "clip": None},
+                "bulletins": [],
+            }
+        )
+    )
 
     monkeypatch.delenv("X_BOT_BEARER_TOKEN", raising=False)
 
-    args = bulletin_approve._parse_args([
-        "--mode", "close", "--date", "2026-07-06",
-        "--artifact-dir", str(tmp_path),
-    ])
+    args = bulletin_approve._parse_args(
+        [
+            "--mode",
+            "close",
+            "--date",
+            "2026-07-06",
+            "--artifact-dir",
+            str(tmp_path),
+        ]
+    )
     rc = bulletin_approve._run(args)
     assert rc == 0
 

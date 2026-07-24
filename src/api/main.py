@@ -64,6 +64,7 @@ from .routers.replay import router as replay_router
 from .routers.forced_flow import router as forced_flow_router
 from .routers.levels import router as levels_router
 from .routers.admin_api_keys import router as admin_api_keys_router
+from .routers.admin_xpost import router as admin_xpost_router
 
 # Logging is configured centrally in src.utils.logging; importing
 # get_logger triggers _configure_logging which honors LOG_LEVEL and
@@ -457,6 +458,9 @@ app.include_router(tradeworkz_router, dependencies=[_scope_signals])
 # dependency (a dedicated X-Admin-Token shared secret, fail-closed) because
 # it issues credentials and must not ride on the lenient data-plane scopes.
 app.include_router(admin_api_keys_router)
+
+# X-post review page (/admin/x-post): admin-token-gated, same rationale.
+app.include_router(admin_xpost_router)
 
 # ============================================================================
 # Health Check

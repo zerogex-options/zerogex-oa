@@ -1,21 +1,22 @@
-"""LLM-generated narrative for bulletin tweets.
+"""LLM-generated narrative for bulletin tweets — the "human wrote it" voice.
 
-The static template at :mod:`src.jobs.bulletin_tweet` fills in
-``$SPY midday update:`` and a rotating one-line lead sentence, then
-concatenates the featured symbol's numeric map.  Serviceable, but every
-fire reads the same shape — great for reliability, not great for
-engagement.
+The bulletin auto-tweet fires three times a trading day (pre-market,
+midday, close).  Each fire hands the day's structured snapshot — the
+Live-Bulletin gamma structure, the featured symbol's price action vs the
+previous close, and the day's top market headlines scraped from CNBC — to
+Claude and asks it to write a natural, human-sounding market read plus a
+threaded reply that plays off it and links back to ZeroGEX.
 
-This module optionally hands the day's structured snapshot to Claude
-and asks it to write a punchy, X-native narrative (opening, clean-read
-interpretation + forward scenario map, closing takeaway, optional
-signoff) about the single featured symbol — the other two are passed so
-it can cross-reference them in one line.  The caller composes those with
-the deterministic numeric map, so:
+Division of labour — the same discipline the old template used, kept:
 
-  * The LLM controls voice, framing, and flow.
-  * Python controls every price the tweet quotes — the model NEVER
-    invents a level, and the numeric block is untouched.
+  * The LLM controls voice, framing and flow (the opening hook, the prose
+    that weaves news + price action + dealer-gamma regime, the bottom-line
+    takeaway, and the reply).
+  * Python controls every price the post QUOTES in its ``Key levels:``
+    block — the model NEVER invents a level.  The model may *reference* a
+    level in prose ("dumped through the 740 put wall"), but a best-effort
+    validator rejects any 3+ digit number that isn't in the input, and the
+    caller falls back to a deterministic template on any failure.
 
 Contract:
   * Enabled when ``ANTHROPIC_API_KEY`` is set.  Missing key → returns
@@ -36,7 +37,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Any, Optional
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -47,96 +48,144 @@ logger = logging.getLogger("zerogex.bulletin_llm")
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MODEL = "claude-sonnet-5"
-# 2500 gives comfortable headroom over the typical output size (~1200
-# tokens for a nuanced multi-paragraph response with JSON scaffolding).
-# The static template fallback kicks in if the model still overflows,
-# but at 2500 that's a rare case rather than the default.
-DEFAULT_MAX_TOKENS = 2500
+# 3000 gives comfortable headroom over the typical output size for the
+# post + reply + JSON scaffolding.  The static template fallback kicks in
+# if the model still overflows, but at 3000 that's a rare case.
+DEFAULT_MAX_TOKENS = 3000
 DEFAULT_TIMEOUT_SECONDS = 45
+
+# The three canonical level keys the model may annotate.  Python owns the
+# actual prices and base labels; the model only supplies an optional short
+# contextual note per level ("primary support", "successfully defended").
+LEVEL_KEYS = ("put_wall", "call_wall", "gamma_flip")
+
+# Per-mode header label the model should use verbatim.  Matches the
+# operator's approved examples ("Morning Read — $SPY", etc.).
+MODE_HEADER_LABEL = {
+    "premarket": "Morning Read",
+    "midday": "Midday Read",
+    "close": "Post-Market Read",
+}
 
 
 SYSTEM_PROMPT = """\
-You write short, punchy, X-native trader commentary for the ZeroGEX X
-(Twitter) account.
+You write market commentary for the ZeroGEX X (Twitter) account.  Your job is
+to sound like a sharp human trader wrote it — natural, confident, plain-spoken
+— NOT like an automated bot or a data readout.
 
-Each post FEATURES ONE symbol — the one marked "featured": true in the input
-(also named in "featured_symbol").  Write the post about THAT symbol.  Its
-cashtag is already in the post header, so lead with the story, not the ticker.
+Each post features ONE symbol — the one marked "featured": true in the input
+(also named in "featured_symbol").  Write about THAT symbol.
 
-VOICE — study this shape:
-* Short, declarative lines.  One idea per line or per short paragraph, blank
-  line between.  Let a single line stand alone for impact ("That was the line.").
-* Concrete and confident.  Say what price DID at a level and what it means —
-  "drove into the 740 put wall, cracked it, then ripped off it."
-* Structural labels to break it up: "The important part:", "The setup:",
-  "Clean read from here:".
-* No hype, no marketing, no exclamations, no all-caps words, no "🚀".
-* At most one emoji, and only if genuinely thematic (a holiday).
+You are given three things to weave together:
+  1. HEADLINES — the day's top market news scraped from CNBC (in "headlines").
+  2. THE LIVE BULLETIN — the featured symbol's dealer-gamma structure: gamma
+     flip, call wall, put wall, max pain, and net gamma (in "levels").
+  3. PRICE ACTION — where the symbol is trading now vs the previous close, the
+     session's path (open / high / low), and momentum (in "levels").
 
-WHAT A GOOD POST DOES (mirror this arc):
-* Open by naming the level that mattered and how price interacted with it.
-* Say why it matters — the gamma regime (positive vs negative gamma), whether
-  spot is above/below the gamma flip, whether the walls are holding.
-* Give a clean forward map as scenarios using arrows ("→"), e.g.:
-    740 holds → bounce/range stays alive
-    745.70 reclaims → tape can start to stabilize
-    750 call wall → next major upside level
-    740 fails → downside can accelerate
-* Close on the "why the levels matter" note: not that they predict every
-  candle, but that behavior changed the moment price reached the wall.
+STUDY THIS VOICE — it is exactly the shape we want:
 
-CROSS-REFERENCES (optional):
-You MAY add ONE short line touching the other two symbols when it adds signal,
-using ONLY their real levels from the input ("SPX reclaimed its flip, QQQ still
-the laggard near its 710 put wall").  Skip it when the featured symbol's story
-stands on its own.
+  ---
+  The headlines changed.
 
-STRUCTURE:
-Reply with a single JSON object and nothing else.  The object has:
-{
-  "header_label":  short suffix that closes the header line —
-                   e.g. "midday update", "post-market update",
-                   "pre-market update", "midday read".  For a
-                   mode="premarket" fire prefer "pre-market update" /
-                   "pre-market read"; mode="midday" -> "midday update";
-                   mode="close" -> "post-market update" / "post-market recap".
-  "opening":       Frame the featured symbol's story around the level that
-                   mattered.  2-5 short paragraphs/lines.  "\\n\\n" between them.
-  "clean_read":    The interpretation + the forward scenario map.  Lead with a
-                   label ("The important part:" or "Clean read from here:") and
-                   give the arrow scenarios.  2-5 short paragraphs.
-  "closing":       The takeaway — 1-3 short lines.  The optional cross-reference
-                   line and the "why the levels matter" close live here.
-  "signoff":       Optional final thematic line (e.g. "Happy 250th, America.
-                   🇺🇸").  Empty string when there's nothing to note.
-}
+  The regime didn't.
+
+  SPY dumped straight through the 740 put wall this morning before news of
+  potential renewed U.S.–Iran talks sent oil lower and sparked a sharp
+  reversal.
+
+  Price ripped back through 740, but the rally stalled well short of the 745
+  call wall and has since rolled back over.
+
+  That's classic negative gamma: fast moves, sharp reversals, and little
+  follow-through.
+  ---
+
+Notice:
+* A two-line contrasting HOOK to open ("The headlines changed." / "The regime
+  didn't.").  One idea per short line, blank line between.  Vary it every time.
+* Then prose that ties the NEWS to the PRICE ACTION to the GAMMA REGIME.  Say
+  what price DID at a level ("dumped straight through the 740 put wall",
+  "stalled well short of the 745 call wall", "buyers defended 735 into the
+  bell").
+* Explain the regime plainly: whether spot is above/below the gamma flip,
+  whether net gamma is positive or negative, and what that means for the tape
+  ("negative gamma = dealer hedging amplifies moves rather than dampens them:
+  fast moves, sharp reversals, little follow-through").
+* No hype, no marketing, no exclamation points, no all-caps words, no emojis,
+  no hashtags, no markdown (**, __, ##).
+
+MATCH THE MODE:
+* premarket ("Morning Read") — look AHEAD into the open.  Frame where the
+  symbol sits vs the flip/walls going in, and what the overnight news sets up.
+* midday ("Midday Read") — mid-session.  What has held, what hasn't, what the
+  morning's path says about the regime.
+* close ("Post-Market Read") — look BACK at the session's battle around the
+  levels, then the standing structure into tomorrow.
+
+REPLY:
+Also write a short threaded reply that plays off the post's theme.  It should
+teach one idea about how levels or dealer positioning actually behave (e.g.
+"levels are zones of influence, not guarantees" or "in a short-gamma market,
+how price reacts at a level matters more than the first touch"), then end with
+a call-to-action phrase ending in a colon — for example "Follow the live dealer
+positioning and key levels:" or "More live positioning and dealer gamma
+analytics:".  Do NOT put a URL in the reply — the link is appended for you.
 
 STRICT RULES:
-* Every dollar figure or strike price you write MUST appear verbatim in the
-  input's ``levels`` block (for ANY symbol you mention).  Never invent numbers.
-* When quoting Net GEX, use the ``net_gex_display`` value ("+$7.74B",
-  "−$125.0M") — NEVER the raw ``net_gex`` float.  "net GEX of 7,740,721,297.75"
-  is wrong; write "net GEX at +$7.74B".
-* Do NOT restate the full numeric map ("Spot: … / Gamma Flip: … / Put Wall: …")
-  as a list — the caller interpolates that "Current map:" block right after your
-  opening.  Weave only the few levels that matter into the prose and scenarios.
-* Do not include hashtags, "zerogex.io" / any link, or a cash-tag list — those
-  are handled separately (the featured cashtag is already in the header).
-* Do not use markdown (**, __, ##).
-* Do NOT give trading recommendations ("buy X", "sell Y", "target Z").
-  Describe positioning and mechanics.
-* If the input's ``context`` flags an event (holiday eve, FOMC, CPI, half-day),
+* Every dollar figure or strike price you write — in the post OR the reply, for
+  ANY symbol — MUST appear verbatim in the input's "levels" block.  Never
+  invent a number.  If you are unsure of a number, describe it without quoting
+  a figure.
+* When quoting net gamma, use the "net_gex_display" value ("+$7.74B",
+  "−$125.0M") — NEVER the raw "net_gex" float.
+* Do NOT restate the levels as a bulleted list in your prose — the caller adds
+  a clean "Key levels:" block after your opening.  Weave only the few levels
+  that matter into the sentences.
+* Do NOT give trading recommendations ("buy X", "sell Y", "target Z", "long
+  here").  Describe positioning and mechanics, not what the reader should do.
+* If a symbol has "spot_is_projected": true (a cash index outside the cash
+  session), its "spot" is IMPLIED from the futures ("spot_future_symbol"), not
+  a live cash quote — frame it that way, never as a live print.
+* If the input's "context" flags an event (holiday eve, FOMC, CPI, half-day),
   work it into the framing naturally.
-* Match the mode: premarket = look-ahead into the open; midday = mid-session,
-  what's held and what hasn't; close = look-back plus overnight-setup framing.
-* When a symbol has ``spot_is_projected: true`` (a cash index like SPX outside
-  the cash session), its ``spot`` is IMPLIED from the futures
-  (``spot_future_symbol``, e.g. "ES"), NOT a live cash quote — the index itself
-  isn't trading yet.  Frame it that way ("SPX implied ~X off the ES future",
-  "futures point to SPX near X"); never state it as a live SPX print.  The gamma
-  flip / walls / max pain for that symbol are the prior cash session's structure
-  — describe them as the standing setup, not live.
+
+OUTPUT — reply with a single JSON object and NOTHING else:
+{
+  "header_label": one of "Morning Read", "Midday Read", "Post-Market Read"
+                  (match the mode; use header_label_hint from the input),
+  "opening":      the hook + the prose body, everything from the top down to
+                  just before the "Key levels:" block.  Use "\\n\\n" between
+                  short paragraphs/lines.
+  "level_notes":  an object with any of the keys "put_wall", "call_wall",
+                  "gamma_flip" mapping to a SHORT contextual note (2-5 words,
+                  no numbers) — e.g. {"put_wall": "successfully defended",
+                  "call_wall": "first resistance"}.  Omit a key or use "" when
+                  there's nothing to add.  These annotate the Key levels block.
+  "bottom_line":  the takeaway — 1-3 sentences.  Opinionated but no trade
+                  calls.  Do NOT include the words "Bottom line:" — that label
+                  is added for you.
+  "reply":        the threaded reply described above, ending in a colon, no URL.
+}
 """
+
+
+@dataclass
+class Headline:
+    """One market headline for the LLM prompt."""
+
+    title: str
+    summary: str = ""
+    source: str = "CNBC"
+    published: str | None = None
+
+    def to_prompt_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"title": self.title, "source": self.source}
+        if self.summary:
+            d["summary"] = self.summary
+        if self.published:
+            d["published"] = self.published
+        return d
 
 
 @dataclass
@@ -155,11 +204,19 @@ class SymbolInput:
     max_pain: float | None = None
     net_gex: float | None = None
     regime: str | None = None  # "positive", "negative", "neutral", "unresolved"
+    momentum_label: str | None = None  # e.g. "Rising", "Collapsing", "Stable"
+    vwap: float | None = None
+    vwap_position: str | None = None  # e.g. "Above VWAP", "Below VWAP"
     # True when ``spot`` is a futures-implied projection (cash index outside
     # the cash session), with the future it came from (e.g. "@ES").  The model
     # must frame such a spot as implied/overnight, never as a live cash print.
     spot_is_projected: bool = False
     future_symbol: str | None = None
+
+    def change_pct(self) -> float | None:
+        if self.spot is None or self.prior_close in (None, 0):
+            return None
+        return (self.spot - self.prior_close) / self.prior_close * 100
 
     def to_prompt_dict(self) -> dict[str, Any]:
         return {
@@ -168,6 +225,7 @@ class SymbolInput:
             "spot_is_projected": self.spot_is_projected,
             "spot_future_symbol": (self.future_symbol or "").lstrip("@").upper() or None,
             "prior_close": self.prior_close,
+            "change_vs_prior_close_pct": self.change_pct(),
             "session_open": self.session_open,
             "session_high": self.session_high,
             "session_low": self.session_low,
@@ -178,17 +236,12 @@ class SymbolInput:
             # Present net_gex both as raw float (for the model to reason
             # about magnitude/sign) AND pre-formatted in the short scale
             # the model MUST use verbatim if it quotes the number.
-            # Without this, the model sometimes writes "SPY's net GEX of
-            # 7,740,721,297.75" instead of "+$7.74B" — factually right
-            # but visually ugly.
             "net_gex": self.net_gex,
             "net_gex_display": _short_scale_gex(self.net_gex),
             "regime": self.regime,
-            "change_pct": (
-                None
-                if self.spot is None or self.prior_close in (None, 0)
-                else (self.spot - self.prior_close) / self.prior_close * 100
-            ),
+            "momentum": self.momentum_label,
+            "vwap": self.vwap,
+            "vwap_position": self.vwap_position,
         }
 
 
@@ -197,8 +250,8 @@ def _short_scale_gex(v: float | None) -> str | None:
     form ("+$7.74B", "−$125.0M") the tweet's numeric block uses.
 
     Duplicated here so bulletin_llm has no import dependency on
-    bulletin_tweet (which imports the LLM module lazily via
-    _try_llm_section).  Keeps them decoupled."""
+    bulletin_tweet (which imports the LLM module lazily).  Keeps them
+    decoupled."""
     if v is None:
         return None
     abs_v = abs(v)
@@ -227,6 +280,7 @@ class DayContext:
     def to_prompt_dict(self) -> dict[str, Any]:
         return {
             "mode": self.mode,
+            "header_label_hint": MODE_HEADER_LABEL.get(self.mode, "Market Read"),
             "date": self.date.isoformat(),
             "day_of_week": self.date.strftime("%A"),
             "is_holiday_eve": self.is_holiday_eve,
@@ -240,14 +294,14 @@ class DayContext:
 
 
 @dataclass
-class LlmSection:
-    """Narrative fragments the caller composes with the numeric block."""
+class LlmPost:
+    """The composed narrative fragments the caller assembles into post + reply."""
 
     header_label: str
     opening: str
-    clean_read: str
-    closing: str
-    signoff: str = ""
+    bottom_line: str
+    reply: str
+    level_notes: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -267,8 +321,7 @@ def next_trading_day(day: date, max_lookahead: int = 10) -> date | None:
     """First trading day strictly after ``day``.
 
     Used to seed the LLM's "back Tuesday" / "with the market closed
-    tomorrow" framing.  Caps at 10 days lookahead as a runaway guard
-    (a real market gap that long doesn't exist)."""
+    tomorrow" framing.  Caps at 10 days lookahead as a runaway guard."""
     cursor = day + timedelta(days=1)
     for _ in range(max_lookahead):
         if _is_trading_day(cursor):
@@ -280,12 +333,9 @@ def next_trading_day(day: date, max_lookahead: int = 10) -> date | None:
 def build_day_context(mode: str, day: date) -> DayContext:
     """Compute the non-per-symbol context flags for one fire."""
     next_td = next_trading_day(day)
-    market_closed_tomorrow = (
-        next_td is not None and next_td != day + timedelta(days=1)
-    )
+    market_closed_tomorrow = next_td is not None and next_td != day + timedelta(days=1)
     # "Holiday eve" = today's close is followed by a market-closed
-    # non-weekend day (excludes normal Friday closes).  Signal the
-    # LLM to note the pause in framing.
+    # non-weekend day (excludes normal Friday closes).
     tomorrow = day + timedelta(days=1)
     is_holiday_eve = tomorrow.weekday() < 5 and tomorrow in NYSE_HOLIDAYS
     return DayContext(
@@ -305,15 +355,14 @@ def build_day_context(mode: str, day: date) -> DayContext:
 def _build_user_message(
     symbols: list[SymbolInput],
     day_context: DayContext,
+    headlines: list[Headline] | None = None,
     featured_symbol: str | None = None,
 ) -> str:
     """Assemble the JSON payload the model sees as the user message.
 
     Format is JSON-in-plain-text so the model can quote figures from
-    it verbatim without ambiguity, and can compare fields across
-    symbols easily.  ``featured_symbol`` marks which one to write the
-    post about; each level dict carries a ``featured`` flag so the model
-    can't miss it."""
+    it verbatim without ambiguity.  ``featured_symbol`` marks which one
+    to write the post about; each level dict carries a ``featured`` flag."""
     featured = (featured_symbol or "").upper() or None
     levels = []
     for s in symbols:
@@ -323,13 +372,15 @@ def _build_user_message(
     payload = {
         "context": day_context.to_prompt_dict(),
         "featured_symbol": featured,
+        "headlines": [h.to_prompt_dict() for h in (headlines or [])],
         "levels": levels,
         "instructions": (
-            "Feature the symbol marked featured=true (featured_symbol); write the "
-            "post about it and lead with its story.  The other symbols are context "
-            "you may cross-reference in one short line.  Write the narrative "
-            "sections in the JSON shape described in the system prompt.  Every "
-            "price you mention — for any symbol — must appear in ``levels``."
+            "Feature the symbol marked featured=true (featured_symbol); write "
+            "the post about it, weaving the headlines, its price action, and its "
+            "dealer-gamma regime together in the voice described in the system "
+            "prompt.  Then write the threaded reply.  Every price you mention — "
+            "in the post or the reply, for any symbol — must appear in ``levels``. "
+            "Reply with the JSON object described in the system prompt."
         ),
     }
     return json.dumps(payload, indent=2, default=str)
@@ -339,16 +390,13 @@ def _extract_json_block(text: str) -> str | None:
     """Find the JSON object block in the model output.
 
     Uses first-``{`` to last-``}`` rather than brace counting because
-    the model's string values can contain literal braces (e.g. in a
-    bulleted item like ``* SPY {750}``) that throw off a naive depth
-    counter.  Since we ask for a JSON object as the entire response,
-    the outermost braces bracket the whole payload."""
-    # Strip common markdown code-fence wrappers first — some models
-    # add ``` ```json ... ``` `` even when told not to.
+    the model's string values can contain literal braces that throw off
+    a naive depth counter.  Since we ask for a JSON object as the entire
+    response, the outermost braces bracket the whole payload."""
     stripped = text.strip()
     for fence in ("```json", "```JSON", "```"):
         if stripped.startswith(fence):
-            stripped = stripped[len(fence):].lstrip()
+            stripped = stripped[len(fence) :].lstrip()
             break
     if stripped.endswith("```"):
         stripped = stripped[:-3].rstrip()
@@ -356,7 +404,7 @@ def _extract_json_block(text: str) -> str | None:
     end = stripped.rfind("}")
     if start == -1 or end == -1 or end < start:
         return None
-    return stripped[start:end + 1]
+    return stripped[start : end + 1]
 
 
 def _call_claude(
@@ -402,11 +450,7 @@ def _call_claude(
 
 
 def _extract_text_from_response(payload: dict[str, Any]) -> str | None:
-    """Pull the assistant's text out of the messages API response.
-
-    Shape: ``{"content": [{"type": "text", "text": "..."}, ...]}``.
-    We concatenate every text block just in case the model split the
-    reply across parts."""
+    """Pull the assistant's text out of the messages API response."""
     content = payload.get("content")
     if not isinstance(content, list):
         return None
@@ -419,19 +463,15 @@ def _extract_text_from_response(payload: dict[str, Any]) -> str | None:
     return "\n".join(chunks) if chunks else None
 
 
-def _parse_section(body_json: str) -> LlmSection | None:
-    """Parse the model's JSON body into an ``LlmSection``.
+def _parse_post(body_json: str) -> LlmPost | None:
+    """Parse the model's JSON body into an ``LlmPost``.
 
     Guards against missing fields, wrong types, and pathologically long
-    strings (a runaway model could otherwise blow past X's tweet
-    ceiling).  Returns None on any structural failure so the caller
-    falls back to the template."""
+    strings.  Returns None on any structural failure so the caller falls
+    back to the template."""
     try:
-        # strict=False accepts unescaped control chars (literal \n, \r,
-        # \t) inside string values.  Claude sometimes emits multi-para
-        # ``opening`` fields with literal newlines rather than ``\\n``
-        # escape sequences; that renders fine but breaks strict JSON.
-        # Tolerating it here saves an otherwise-good response.
+        # strict=False accepts unescaped control chars inside string values;
+        # Claude sometimes emits multi-para fields with literal newlines.
         obj = json.loads(body_json, strict=False)
     except json.JSONDecodeError as exc:
         logger.warning("bulletin_llm: model JSON did not parse (%s)", exc)
@@ -447,77 +487,91 @@ def _parse_section(body_json: str) -> LlmSection | None:
         if not isinstance(value, str):
             logger.warning(
                 "bulletin_llm: model field %r was %s, expected string",
-                name, type(value).__name__,
+                name,
+                type(value).__name__,
             )
             return None
-        # Cap at 5000 chars per section — well under X's long-form
-        # ceiling.  A runaway response gets truncated rather than
-        # crashing the composer.
+        # Cap at 5000 chars per section — well under X's long-form ceiling.
         return value.strip()[:5000]
 
     header_label = _str_field("header_label") or ""
     opening = _str_field("opening") or ""
-    clean_read = _str_field("clean_read") or ""
-    closing = _str_field("closing") or ""
-    signoff = _str_field("signoff", required=False) or ""
+    bottom_line = _str_field("bottom_line") or ""
+    reply = _str_field("reply") or ""
 
-    # The three narrative fields must all be present and non-empty for
-    # the section to be usable — an empty clean_read would leave the
-    # numeric block dangling with no interpretation.
-    if not header_label or not opening or not clean_read:
+    # level_notes is optional; tolerate absence / wrong type.
+    notes_raw = obj.get("level_notes")
+    level_notes: dict[str, str] = {}
+    if isinstance(notes_raw, dict):
+        for key in LEVEL_KEYS:
+            v = notes_raw.get(key)
+            if isinstance(v, str) and v.strip():
+                # 60-char cap keeps a runaway note from bloating the block.
+                level_notes[key] = v.strip()[:60]
+
+    # opening + reply are the load-bearing fields; without them there's no
+    # post worth composing.
+    if not opening or not reply:
         logger.warning(
-            "bulletin_llm: model output missing required narrative sections "
-            "(header=%r, opening_len=%d, clean_read_len=%d)",
-            header_label, len(opening), len(clean_read),
+            "bulletin_llm: model output missing required sections "
+            "(opening_len=%d, reply_len=%d)",
+            len(opening),
+            len(reply),
         )
         return None
 
-    return LlmSection(
+    return LlmPost(
         header_label=header_label,
         opening=opening,
-        clean_read=clean_read,
-        closing=closing,
-        signoff=signoff,
+        bottom_line=bottom_line,
+        reply=reply,
+        level_notes=level_notes,
     )
 
 
 def _validate_no_invented_prices(
-    section: LlmSection, symbols: list[SymbolInput],
+    post: LlmPost,
+    symbols: list[SymbolInput],
 ) -> bool:
     """Best-effort check that the model didn't quote a price we didn't provide.
 
-    Scans every 4+ digit number in the narrative and confirms it appears
-    (as an integer or a rounded form) in the input's ``levels`` block.
-    Not a strict guarantee — a determined model could still smuggle in
-    a wrong value — but catches the obvious "3-decimal fabricated
-    strike" case and lets us fall back to the template on any hit."""
+    Scans every 3-6 digit number in the narrative (post + reply + notes) and
+    confirms it appears (as an integer or a rounded form) in the input's
+    ``levels`` block.  Not a strict guarantee, but catches the obvious
+    fabricated-strike case and lets us fall back to the template on any hit."""
     import re
 
     known_values: set[int] = set()
     for s in symbols:
         for v in (
-            s.spot, s.prior_close, s.session_open, s.session_high, s.session_low,
-            s.gamma_flip, s.call_wall, s.put_wall, s.max_pain,
+            s.spot,
+            s.prior_close,
+            s.session_open,
+            s.session_high,
+            s.session_low,
+            s.gamma_flip,
+            s.call_wall,
+            s.put_wall,
+            s.max_pain,
+            s.vwap,
         ):
             if v is None:
                 continue
-            # Integer form + rounded to nearest 5 covers ETF strike
-            # spacing without a false-positive storm on decimal spot
-            # prices.
             for candidate in (int(round(v)), int(round(v / 5) * 5)):
                 if candidate > 0:
                     known_values.add(candidate)
-        # Net GEX in millions/billions gets separately mentioned as
-        # strings — skip numeric matching for it.
 
-    combined = "\n".join([section.opening, section.clean_read, section.closing])
-    # Collapse comma-thousands so "7,483" tokenizes as a single 4-digit
-    # number, not as "7" + "483".  We keep decimals intact so a spot
-    # like "744.51" is captured whole.
+    combined = "\n".join(
+        [
+            post.opening,
+            post.bottom_line,
+            post.reply,
+            " ".join(post.level_notes.values()),
+        ]
+    )
+    # Collapse comma-thousands so "7,483" tokenizes as one 4-digit number.
     normalized = re.sub(r"(?<=\d),(?=\d{3}\b)", "", combined)
-    # Match 3-6 digit integer parts (skip 1-2 digits — those are
-    # everywhere: "2 short paragraphs", "6.8G disk", etc.).  Decimal
-    # tail is optional.
+    # Match 3-6 digit integer parts (skip 1-2 digits — those are everywhere).
     hits = re.findall(r"(?<!\d)(\d{3,6})(?:\.\d+)?(?!\d)", normalized)
     invented: list[str] = []
     for h in hits:
@@ -536,24 +590,24 @@ def _validate_no_invented_prices(
     return True
 
 
-def generate_narrative(
+def generate_post(
     mode: str,
     day: date,
     symbols: list[SymbolInput],
     day_context: DayContext | None = None,
+    headlines: list[Headline] | None = None,
     api_key: str | None = None,
     model: str | None = None,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     featured_symbol: str | None = None,
-) -> LlmSection | None:
-    """Call Claude and return an ``LlmSection`` — or None on any failure.
+) -> LlmPost | None:
+    """Call Claude and return an ``LlmPost`` — or None on any failure.
 
     The caller invokes this AFTER assembling the deterministic bulletin
-    data.  ``featured_symbol`` is the single symbol the post centers on
-    (all ``symbols`` are still passed so the model can cross-reference).
-    A None return is expected and normal (no API key configured, API
-    outage, malformed response) and instructs the caller to fall back to
+    data + the scraped headlines.  ``featured_symbol`` is the single symbol
+    the post centers on.  A None return is expected and normal (no API key,
+    API outage, malformed response) and instructs the caller to fall back to
     the static template."""
     if not symbols:
         return None
@@ -563,16 +617,24 @@ def generate_narrative(
         return None
 
     ctx = day_context or build_day_context(mode, day)
-    model_id = (
-        model or os.environ.get("BULLETIN_TWEET_LLM_MODEL", "").strip() or DEFAULT_MODEL
-    )
+    model_id = model or os.environ.get("BULLETIN_TWEET_LLM_MODEL", "").strip() or DEFAULT_MODEL
     env_max_tokens = os.environ.get("BULLETIN_TWEET_LLM_MAX_TOKENS", "").strip()
     if env_max_tokens.isdigit():
         max_tokens = int(env_max_tokens)
 
-    user_msg = _build_user_message(symbols, ctx, featured_symbol=featured_symbol)
+    user_msg = _build_user_message(
+        symbols,
+        ctx,
+        headlines=headlines,
+        featured_symbol=featured_symbol,
+    )
     resp = _call_claude(
-        SYSTEM_PROMPT, user_msg, key, model_id, max_tokens, timeout_seconds,
+        SYSTEM_PROMPT,
+        user_msg,
+        key,
+        model_id,
+        max_tokens,
+        timeout_seconds,
     )
     if resp is None:
         return None
@@ -585,9 +647,6 @@ def generate_narrative(
     stop_reason = resp.get("stop_reason")
     json_block = _extract_json_block(text)
     if not json_block:
-        # Most common cause: max_tokens capped the response mid-JSON.
-        # Surface that explicitly so the operator knows to bump the
-        # ceiling rather than think it's a prompt problem.
         if stop_reason == "max_tokens":
             logger.warning(
                 "bulletin_llm: model output truncated at max_tokens=%d — "
@@ -599,15 +658,16 @@ def generate_narrative(
             logger.warning(
                 "bulletin_llm: could not find a JSON object in model output "
                 "(stop_reason=%s) — first 200 chars: %r",
-                stop_reason, text[:200],
+                stop_reason,
+                text[:200],
             )
         return None
 
-    section = _parse_section(json_block)
-    if section is None:
+    post = _parse_post(json_block)
+    if post is None:
         return None
 
-    if not _validate_no_invented_prices(section, symbols):
+    if not _validate_no_invented_prices(post, symbols):
         return None
 
-    return section
+    return post
